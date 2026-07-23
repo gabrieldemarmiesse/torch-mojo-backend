@@ -800,6 +800,10 @@ def _log_softmax_rows_block_kernel[
         var tail_start = head + n_vec * V  # first row-local index of the tail
 
         # ---- Pass 1: online max + sum over the row, one global read. ----
+        # Every exp(a - b) below is guarded by an a == b select: when equal the
+        # true factor is exp(0) == 1, and evaluating exp(-inf - -inf) instead
+        # would NaN-poison the sum — reached by threads/lanes that stay at the
+        # -inf init on rows shorter than threads*V, and by -inf (masked) inputs.
         var m_vec = SIMD[DType.float32, V](Float32.MIN)
         var s_vec = SIMD[DType.float32, V](0.0)
         var v = tid
@@ -808,13 +812,22 @@ def _log_softmax_rows_block_kernel[
                 vec_start + v * V
             ).cast[DType.float32]()
             var new_m = max(m_vec, x)
-            s_vec = s_vec * exp(m_vec - new_m) + exp(x - new_m)
+            var rescale = m_vec.eq(new_m).select(
+                SIMD[DType.float32, V](1.0), exp(m_vec - new_m)
+            )
+            var contrib = x.eq(new_m).select(
+                SIMD[DType.float32, V](1.0), exp(x - new_m)
+            )
+            s_vec = s_vec * rescale + contrib
             m_vec = new_m
             v += threads
 
         # Collapse the per-lane accumulator to a thread-local (m, s).
         var m_t = m_vec.reduce_max()
-        var s_t = (s_vec * exp(m_vec - m_t)).reduce_add()
+        var lane_scale = m_vec.eq(SIMD[DType.float32, V](m_t)).select(
+            SIMD[DType.float32, V](1.0), exp(m_vec - m_t)
+        )
+        var s_t = (s_vec * lane_scale).reduce_add()
 
         # Fold in the unaligned scalar head/tail (each < V elements, one thread
         # per element; no-ops when head == tail == 0).
@@ -822,20 +835,24 @@ def _log_softmax_rows_block_kernel[
         while jh < head:
             var x = in_ptr[base + jh].cast[DType.float32]()
             var nm = max(m_t, x)
-            s_t = s_t * exp(m_t - nm) + exp(x - nm)
+            var rs = Float32(1.0) if m_t == nm else exp(m_t - nm)
+            var cb = Float32(1.0) if x == nm else exp(x - nm)
+            s_t = s_t * rs + cb
             m_t = nm
             jh += threads
         var jt = tail_start + tid
         while jt < cols:
             var x = in_ptr[base + jt].cast[DType.float32]()
             var nm = max(m_t, x)
-            s_t = s_t * exp(m_t - nm) + exp(x - nm)
+            var rs = Float32(1.0) if m_t == nm else exp(m_t - nm)
+            var cb = Float32(1.0) if x == nm else exp(x - nm)
+            s_t = s_t * rs + cb
             m_t = nm
             jt += threads
 
         # ---- Block combine: global max, then rescale + global sum. ----
         var block_m = block.max[block_size=threads](m_t)
-        var s_scaled = s_t * exp(m_t - block_m)
+        var s_scaled = s_t if m_t == block_m else s_t * exp(m_t - block_m)
         var block_s = block.sum[block_size=threads](s_scaled)
         var log_denom = log(block_s)
 
