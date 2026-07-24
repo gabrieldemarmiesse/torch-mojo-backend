@@ -57,8 +57,11 @@ class _Runtime:
 
     def pump(self) -> None:
         """Execute queue items whose kernels are ready; stop at the first
-        head-of-line item still waiting on a compile."""
-        if in_replay():
+        head-of-line item still waiting on a compile. Main thread only:
+        autograd's engine thread also dispatches (and may defer), but device
+        work from two live threads is unordered on MAX, so replays stay on
+        the thread whose stream owns the episode."""
+        if in_replay() or threading.current_thread() is not threading.main_thread():
             return
         while self.queue and self.error is None:
             item = self.queue.popleft()
@@ -91,11 +94,59 @@ class _Runtime:
 
 _RT = _Runtime()
 _VERIFY: list = []  # (op name, placeholder, cpu snapshot) when TMB_VERIFY_FILL
-# Unfilled placeholders (by id): a tensor is "tainted" while its producing
-# deferred op hasn't been replayed. Ops whose inputs are all untainted can
-# run immediately (fresh output, no ordering hazard on a single thread/queue);
-# ops touching tainted tensors must defer behind their producers.
-_PENDING_PH: set[int] = set()
+# Pending-write counters keyed by STORAGE (the allocation holder shared by
+# every view of a buffer): a storage is "tainted" while a queued op will
+# still write it — either the producer of an unfilled placeholder or a
+# queued value-mutation. Ops whose inputs are all untainted can run
+# immediately (fresh output, no ordering hazard on a single thread/queue);
+# ops touching tainted storages must defer behind the queued writers.
+# Keying on the holder rather than the tensor makes views alias correctly.
+_PENDING: dict[int, int] = {}
+
+
+def _holder_key(t: object) -> int | None:
+    holder = getattr(t, "_holder", None)
+    return None if holder is None else id(holder)
+
+
+def _is_tainted(t: object) -> bool:
+    key = _holder_key(t)
+    return key is not None and _PENDING.get(key, 0) > 0
+
+
+def _taint(tensors: list) -> list[int]:
+    keys = []
+    for t in tensors:
+        key = _holder_key(t)
+        if key is not None:
+            _PENDING[key] = _PENDING.get(key, 0) + 1
+            keys.append(key)
+    return keys
+
+
+def _untaint(keys: list[int]) -> None:
+    for key in keys:
+        left = _PENDING.get(key, 0) - 1
+        if left > 0:
+            _PENDING[key] = left
+        else:
+            _PENDING.pop(key, None)
+
+
+def _written_tensors(func, args, kwargs) -> list:
+    """The tensors this op's schema declares it writes (in-place/out=)."""
+    written = []
+    schema_args = func._schema.arguments
+    for i, arg in enumerate(schema_args):
+        if arg.alias_info is None or not arg.alias_info.is_write:
+            continue
+        value = args[i] if i < len(args) else kwargs.get(arg.name)
+        if isinstance(value, torch.Tensor):
+            written.append(value)
+        elif isinstance(value, (list, tuple)):
+            written.extend(v for v in value if isinstance(v, torch.Tensor))
+    return written
+
 
 # Debug bisection: TMB_DEFER_ONLY="aten::mm,aten::add" limits which ops may
 # defer (everything else drains + runs direct). Unset = defer everything.
@@ -199,7 +250,7 @@ def _execute(item: tuple, blocking: bool = True) -> None:
     """Run one deferred op for real (main thread), then back-fill the
     placeholder outputs. Non-blocking mode propagates KernelPending so the
     pump can stop at a head-of-line item whose kernel is still compiling."""
-    func, args, kwargs, placeholders, out_spec = item
+    func, args, kwargs, placeholders, out_spec, taint_keys = item
     with _replay_scope():
         while True:
             try:
@@ -224,7 +275,6 @@ def _execute(item: tuple, blocking: bool = True) -> None:
             with _DEVICE_LOCK, torch._C._DisableTorchDispatch():
                 torch.ops.aten.copy_(ph, value)
         if isinstance(ph, torch.Tensor):
-            _PENDING_PH.discard(id(ph))
             if _os.environ.get("TMB_VERIFY_FILL"):
                 with _DEVICE_LOCK, torch._C._DisableTorchDispatch():
                     snap = value.cpu().float()
@@ -253,6 +303,7 @@ def _execute(item: tuple, blocking: bool = True) -> None:
                     file=_sys.stderr,
                     flush=True,
                 )
+    _untaint(taint_keys)
     if _os.environ.get("TMB_SYNC_AFTER_REPLAY"):
         from . import torch_mojo_device_module as _dm
 
@@ -280,17 +331,24 @@ def _meta_mirror(args, kwargs):
 
 
 def _defer(func, args, kwargs):
-    """Meta-infer outputs, allocate placeholders, queue the real execution."""
-    if any(
-        arg.alias_info is not None and arg.alias_info.is_write
-        for arg in func._schema.arguments
-    ):
-        # Mutating/out= schemas: their metadata effects (resizes) and their
-        # aliasing are exactly the cases meta inference gets wrong under
-        # deferral — always execute immediately.
-        raise _Undeferrable(func._schema.name)
+    """Meta-infer outputs, allocate placeholders, queue the real execution.
+
+    Value mutations (in-place/out= that keep their target's metadata) are
+    deferrable: FIFO orders the write after every queued reader, and the
+    taint on the written storage queues every later toucher behind it.
+    Metadata-changing mutations (resize/reallocation) are not — their
+    effects are observable synchronously — and raise _Undeferrable."""
+    written = _written_tensors(func, args, kwargs)
     meta_args, meta_kwargs, mirrors = _meta_mirror(args, kwargs)
     meta_out = func(*meta_args, **meta_kwargs)
+
+    for w in written:
+        mirror = mirrors[id(w)]
+        if tuple(mirror.shape) != tuple(w.shape) or mirror.stride() != w.stride():
+            # The op changed its written argument's metadata (e.g. the
+            # arange.start_out resize): that effect is observable NOW, so
+            # this op cannot be deferred.
+            raise _Undeferrable(func._schema.name)
 
     # Map aliasing outputs (in-place/out= schemas) back to the real inputs.
     storage_to_real = {}
@@ -329,10 +387,13 @@ def _defer(func, args, kwargs):
             ph = torch.empty(tuple(m.shape), dtype=m.dtype, device=device)
         placeholders.append(ph)
 
-    for ph in placeholders:
-        if isinstance(ph, torch.Tensor):
-            _PENDING_PH.add(id(ph))
-    _RT.submit((func, args, dict(kwargs), list(placeholders), out_spec))
+    # Pending writes: fresh placeholders AND the schema's written targets
+    # (which may not appear among the outputs at all, e.g. foreach/fused
+    # optimizer ops returning ()).
+    taint_keys = _taint(
+        [ph for ph in placeholders if isinstance(ph, torch.Tensor)] + written
+    )
+    _RT.submit((func, args, dict(kwargs), list(placeholders), out_spec, taint_keys))
     return tree_unflatten(placeholders, out_spec)
 
 
@@ -350,13 +411,18 @@ def dispatch(func, args, kwargs):
     if episode:
         _RT.pump()  # main thread advances the queue as it goes
         flat_args, _ = tree_flatten((args, kwargs))
-        tainted = any(
-            isinstance(a, torch.Tensor) and id(a) in _PENDING_PH for a in flat_args
-        )
+        tainted = any(_is_tainted(a) for a in flat_args)
         mutates = any(
             arg.alias_info is not None and arg.alias_info.is_write
             for arg in func._schema.arguments
         )
+        if name in _SYNC_OPS or overload in _SYNC_OPS:
+            # Host reads / device crossings. Only order against the queue
+            # when they actually touch pending storages.
+            if tainted:
+                _trace(f"sync-drain {name}")
+                _RT.drain()
+            return _direct_blocking(func, args, kwargs)
         if not tainted and not mutates:
             # All inputs are real (or already filled): safe to run now —
             # single thread, single queue, fresh output. This covers views
@@ -371,21 +437,18 @@ def dispatch(func, args, kwargs):
                 except Exception:
                     _RT.drain()
                     return _direct_blocking(func, args, kwargs)
-        if mutates or name in _SYNC_OPS or overload in _SYNC_OPS:
-            # Mutation (of anything a queued op might read) and host reads
-            # both order against the whole queue: flush it.
-            _trace(f"drain-direct {name}")
-            _RT.drain()
-            return _direct_blocking(func, args, kwargs)
         if _DEFER_ONLY is not None and name not in _DEFER_ONLY:
             _RT.drain()
             return _direct_blocking(func, args, kwargs)
+        # Tainted functional ops AND mutations both queue: FIFO places a
+        # mutation after every queued reader of its target, and tainting
+        # the target makes every later toucher queue behind the mutation.
         try:
             return _defer(func, args, kwargs)
         except Exception:
-            # No meta support, alias-metadata effects (views of pending
-            # tensors), or other inference issues: lose the overlap for
-            # this op but keep exact semantics.
+            # No meta support, metadata-changing mutations (resize / out=
+            # reallocation), alias-metadata effects, or other inference
+            # issues: flush and run exactly, losing overlap for this op.
             _RT.drain()
             return _direct_blocking(func, args, kwargs)
 
