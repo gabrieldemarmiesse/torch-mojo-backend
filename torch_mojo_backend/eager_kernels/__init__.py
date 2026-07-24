@@ -431,12 +431,10 @@ class _ModuleState:
             self.module is None
             and self.name not in _FULL_MODULES
             and _in_torch_dispatch()
-            and not _PREWARM.has_build_for(self.name)
         ):
             raise KernelPending(self, self.request_async(add_op=first_op))
         with self.lock:
             if self.module is None:
-                _PREWARM.wait_for(self.name)
                 profile = _PROFILE.get(self.name, {})
                 if self.name in _FULL_MODULES:
                     ops: frozenset[str] | None = None
@@ -544,92 +542,8 @@ def _pool_size() -> int:
     return max(1, min(by_mem, by_cpu, 16))
 
 
-class _Prewarm:
-    """Background builds of every profiled variant at import time, run
-    through a slot pool sized to the machine (`_pool_size`)."""
-
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.slots = _pool_size()
-        self.pending: list[tuple[str, list[str]]] = []
-        self.running: dict[str, subprocess.Popen] = {}
-        for name, entry in _PROFILE.items():
-            if name in _FULL_MODULES or name not in _MOJO_MODULES:
-                continue
-            ops = frozenset(entry.get("ops", ()))
-            if not ops:
-                continue
-            dtypes = frozenset(entry.get("dtypes", ()) or _DEFAULT_DTYPES)
-            out = _variant_path(name, ops, dtypes, 0)
-            if out.is_file():
-                continue
-            _CACHE_DIR.mkdir(exist_ok=True)
-            self.pending.append(
-                (
-                    name,
-                    _variant_cmd(name, _PACKAGE_DIR / f"{name}.mojo", ops, dtypes, out),
-                )
-            )
-        if self.pending:
-            print(
-                f"torch-mojo-backend: prewarming {len(self.pending)} kernel "
-                f"variants in the background ({self.slots} build slots)...",
-                file=sys.stderr,
-            )
-            self._pump()
-            threading.Thread(target=self._reaper, daemon=True).start()
-
-    def _pump(self) -> None:
-        with self.lock:
-            self.running = {n: p for n, p in self.running.items() if p.poll() is None}
-            while self.pending and len(self.running) < self.slots:
-                name, cmd = self.pending.pop(0)
-                self.running[name] = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=_build_env(),
-                )
-
-    def _reaper(self) -> None:
-        while True:
-            with self.lock:
-                live = any(p.poll() is None for p in self.running.values())
-                idle = not self.pending and not live
-            if idle:
-                return
-            self._pump()
-            threading.Event().wait(0.5)
-
-    def has_build_for(self, name: str) -> bool:
-        """A prewarm build for this module is pending or running (its result
-        is imminent, so first-touch should wait for it rather than defer)."""
-        with self.lock:
-            return name in self.running or any(n == name for n, _ in self.pending)
-
-    def wait_for(self, name: str) -> None:
-        """Block until this module's prewarm build (if any) has finished.
-        A still-pending build is promoted to run immediately."""
-        with self.lock:
-            for i, (n, cmd) in enumerate(self.pending):
-                if n == name:
-                    del self.pending[i]
-                    self.running[name] = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        env=_build_env(),
-                    )
-                    break
-            proc = self.running.get(name)
-        if proc is not None:
-            proc.wait()
-            self._pump()
-
-
 _PROFILE = _load_profile()
 _ASYNC_BUILD_SLOTS = threading.Semaphore(_pool_size())
-_PREWARM = _Prewarm()
 _STATES: dict[str, _ModuleState] = {n: _ModuleState(n) for n in _MOJO_MODULES}
 _PROXIES: dict[str, _ModuleProxy] = {
     n: _ModuleProxy(_STATES[n]) for n in _MOJO_MODULES if n not in _FULL_MODULES
