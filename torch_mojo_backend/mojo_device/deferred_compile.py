@@ -177,6 +177,46 @@ _DEFER_ONLY = (
     else None
 )
 
+# Debug: force every data op through the defer machinery even when its
+# kernel is warm, and never pump — the queue only empties at sync points.
+# Reproduces the maximal run-ahead regime without a cold cache. Read
+# dynamically so a harness can toggle it between passes.
+def _force_defer() -> bool:
+    return bool(_os.environ.get("TMB_FORCE_DEFER"))
+
+
+def _is_view_op(func) -> bool:
+    """Functional op whose outputs alias an input (the view family)."""
+    return any(
+        r.alias_info is not None and not r.alias_info.is_write
+        for r in func._schema.returns
+    )
+
+
+def _packed_bhtd_strides(shape: tuple) -> tuple | None:
+    if len(shape) != 4:
+        return None
+    b, h, t, d = shape
+    return (h * t * d, d, h * d, 1)
+
+
+# Ops whose BACKEND output layout deviates from the meta impl's: the fa4
+# attention kernels emit the packed (B,T,H,D)-memory layout for their
+# 4-dim outputs (so the model's transpose(1,2)+view merge is free), while
+# upstream meta says contiguous. Placeholder layouts must match the
+# backend or downstream graph structure changes (a .contiguous() clone
+# appears, autograd layout contracts copy, the fa4 backward misreads).
+# Any new deviation shows up as a fill-time "stride-mismatch" trace.
+_LAYOUT_OVERRIDES = {
+    "aten::_scaled_dot_product_flash_attention": _packed_bhtd_strides,
+    "aten::_scaled_dot_product_flash_attention_backward": _packed_bhtd_strides,
+}
+
+
+# Debug: harness-settable hook called with (schema_name, tensors) at every
+# placeholder fill during replay. None in production.
+_FILL_HOOK = None
+
 # Ops whose results the host is about to look at (or that cross devices):
 # they drain the queue and run synchronously.
 _SYNC_OPS = {
@@ -233,9 +273,28 @@ class _replay_scope:
 _DEVICE_LOCK = threading.RLock()
 
 
+# The thread whose device work was enqueued last. MAX orders device work
+# only WITHIN an enqueuing thread: work submitted from a second thread is
+# unordered with respect to the first's (verified: bit-stable stale reads).
+# A full device synchronize at each enqueuing-thread switch restores a
+# total order — switches are rare (main <-> autograd engine, per backward).
+_DEVICE_THREAD: list = [None]
+
+
+def _order_device_thread() -> None:
+    me = threading.current_thread()
+    if _DEVICE_THREAD[0] is not None and _DEVICE_THREAD[0] is not me:
+        from . import torch_mojo_device_module as _dm
+
+        _trace("thread-switch device synchronize")
+        _dm.synchronize()
+    _DEVICE_THREAD[0] = me
+
+
 def _direct(func, args, kwargs):
     """The ordinary synchronous path (what dispatch did before this layer)."""
     with _DEVICE_LOCK:
+        _order_device_thread()
         with _dispatch_scope():
             with torch._C._DisableTorchDispatch():
                 return func(*args, **kwargs)
@@ -265,7 +324,16 @@ def _trace(msg: str) -> None:
         import sys as _sys
         import time as _time
 
-        print(f"[TRACE] t={_time.monotonic():.2f} {msg}", file=_sys.stderr, flush=True)
+        thread = (
+            "main"
+            if threading.current_thread() is threading.main_thread()
+            else threading.current_thread().name
+        )
+        print(
+            f"[TRACE] t={_time.monotonic():.2f} [{thread}] {msg}",
+            file=_sys.stderr,
+            flush=True,
+        )
 
 
 def _nan_count(t: object) -> str:
@@ -279,60 +347,78 @@ def _execute(item: tuple, blocking: bool = True) -> None:
     """Run one deferred op for real (main thread), then back-fill the
     placeholder outputs. Non-blocking mode propagates KernelPending so the
     pump can stop at a head-of-line item whose kernel is still compiling."""
-    func, args, kwargs, placeholders, out_spec, taint_keys = item
-    with _replay_scope():
-        while True:
-            try:
-                real = _direct(func, args, kwargs)
-                break
-            except KernelPending as pending:
-                if not blocking and not pending.job.done.is_set():
-                    raise
-                pending.job.wait()
-    if _os.environ.get("TMB_TRACE"):
-        flat_in, _ = tree_flatten((args, kwargs))
-        ins = ",".join(_nan_count(a) for a in flat_in if isinstance(a, torch.Tensor))
-        real_flat_t, _ = tree_flatten(real)
-        outs = ",".join(
-            _nan_count(a) for a in real_flat_t if isinstance(a, torch.Tensor)
-        )
-        _trace(f"replay {func._schema.name} in-nans=[{ins}] out-nans=[{outs}]")
+    func, args, kwargs, placeholders, out_spec, taint_keys, written = item
+    depth = getattr(_TLS, "exec_depth", 0)
+    _TLS.exec_depth = depth + 1
+    _trace(f"exec-enter d={depth} {func._schema.name}")
+    try:
+        # no_grad: autograd bookkeeping for this op already happened at
+        # dispatch time (above the python key); the replay re-runs only the
+        # kernel, possibly outside the caller's original grad context (an
+        # optimizer's no_grad step replayed at a later drain would
+        # otherwise trip the in-place-on-leaf check). Version counters of
+        # the written targets are preserved for the same reason: versions
+        # are metadata, and metadata follows DISPATCH order — _defer bumped
+        # them when the mutation was queued, so a bump here (mid-drain,
+        # possibly after a later op already saved the tensor for backward)
+        # would trip the saved-variable version check.
+        with _replay_scope(), torch.no_grad():
+            with torch.autograd._unsafe_preserve_version_counter(tuple(written)):
+                while True:
+                    try:
+                        real = _direct(func, args, kwargs)
+                        break
+                    except KernelPending as pending:
+                        if not blocking and not pending.job.done.is_set():
+                            raise
+                        pending.job.wait()
+    finally:
+        _TLS.exec_depth = depth
+    # NOTE: no device reads (.cpu()/.item()) in replay instrumentation —
+    # a device read here re-enters dispatch as a sync op and recursively
+    # drains the rest of the queue BEFORE this item's fills below have
+    # run (proven: reversed replay prints + garbage reads, trace-only).
+    _trace(f"replay d={depth} {func._schema.name}")
     real_flat, _ = tree_flatten(real)
     ph_flat, _ = tree_flatten(tree_unflatten(placeholders, out_spec))
     for ph, value in zip(ph_flat, real_flat, strict=True):
         if isinstance(ph, torch.Tensor) and ph is not value:
-            with _DEVICE_LOCK, torch._C._DisableTorchDispatch():
-                torch.ops.aten.copy_(ph, value)
-        if isinstance(ph, torch.Tensor):
-            if _os.environ.get("TMB_VERIFY_FILL"):
-                with _DEVICE_LOCK, torch._C._DisableTorchDispatch():
-                    snap = value.cpu().float()
-                    diff = (ph.cpu().float() - snap).abs().max().item()
-                _VERIFY.append((func._schema.name, ph, snap))
-                import sys as _sys
-
-                extra = ""
-                if func._schema.name == "aten::add" and len(args) >= 2:
-                    with _DEVICE_LOCK, torch._C._DisableTorchDispatch():
-                        cpu_ref = args[0].cpu().float() + args[1].cpu().float()
-                    extra = f" cpu-ref-diff={(snap - cpu_ref).abs().max().item()}"
-                if func._schema.name == "aten::linear":
-                    with _DEVICE_LOCK, torch._C._DisableTorchDispatch():
-                        bias = (
-                            args[2].cpu().float()
-                            if len(args) > 2 and args[2] is not None
-                            else None
-                        )
-                        cpu_ref = torch.nn.functional.linear(
-                            args[0].cpu().float(), args[1].cpu().float(), bias
-                        )
-                    extra = f" cpu-ref-diff={(snap - cpu_ref).abs().max().item()}"
-                print(
-                    f"[FILL] {func._schema.name} diff={diff}{extra}",
-                    file=_sys.stderr,
-                    flush=True,
+            if (
+                getattr(ph, "_holder", None) is not None
+                and ph._holder is getattr(value, "_holder", None)
+                and ph._offset == value._offset
+                and ph._strides == value._strides
+            ):
+                continue  # alias output: same bytes, nothing to fill
+            if ph.stride() != value.stride():
+                # The backend impl disagrees with the meta impl about the
+                # output layout: downstream consumers already saw the meta
+                # layout, a steady run would have shown them the backend's.
+                _trace(
+                    f"stride-mismatch {func._schema.name}: "
+                    f"ph{tuple(ph.stride())} real{tuple(value.stride())} "
+                    f"shape{tuple(ph.shape)}"
                 )
+            with _DEVICE_LOCK, torch._C._DisableTorchDispatch():
+                _order_device_thread()
+                # A fill is not a semantic mutation — it completes the op
+                # that created `ph`. Autograd may already track views of the
+                # placeholder (a deferred split/view of a pending tensor),
+                # and a version bump here would trip its multi-view
+                # modified-inplace check at backward-graph construction.
+                with torch.autograd._unsafe_preserve_version_counter(ph):
+                    torch.ops.aten.copy_(ph, value)
+    _trace(f"filled d={depth} {func._schema.name}")
     _untaint(taint_keys)
+    # Hook AFTER untaint: a device read of the filled tensor from the hook
+    # re-enters dispatch as a sync op, and while still tainted that would
+    # recursively drain the rest of the queue mid-fill (the heisen-bug).
+    if _FILL_HOOK is not None:
+        _FILL_HOOK(
+            func._schema.name,
+            [p for p in ph_flat if isinstance(p, torch.Tensor)],
+            (args, kwargs),
+        )
     if _os.environ.get("TMB_SYNC_AFTER_REPLAY"):
         from . import torch_mojo_device_module as _dm
 
@@ -395,6 +481,7 @@ def _defer(func, args, kwargs):
 
     meta_flat, out_spec = tree_flatten(meta_out)
     placeholders = []
+    fresh = []
     for m in meta_flat:
         if not isinstance(m, torch.Tensor):
             placeholders.append(m)
@@ -407,27 +494,80 @@ def _defer(func, args, kwargs):
             continue
         if aliased is not None:
             # An aliasing output with different metadata is a VIEW of a
-            # pending tensor. Materializing it as a copy broke numerics in
-            # ways not yet understood (deterministic 3.4-level divergence,
-            # layout-independent) — so it stays undeferrable: the caller
-            # waits for just the producing FIFO prefix (_run_after_deps).
+            # pending tensor. Do NOT synthesize the alias from meta
+            # metadata: the backend's view impls sometimes materialize (and
+            # always own the output layout), and downstream kernel-tier
+            # selection must see exactly the layouts a steady run produces
+            # (meta-synthesized aliases measurably shift numerics).
+            # dispatch() routes view ops to _defer_view instead; reaching
+            # this branch means that path failed, so wait for the producer.
             raise _Undeferrable(func._schema.name)
+        override = _LAYOUT_OVERRIDES.get(func._schema.name)
+        strides = (override(tuple(m.shape)) if override else None) or tuple(m.stride())
         with _DEVICE_LOCK, torch._C._DisableTorchDispatch():
-            # Contiguous regardless of the meta stride: the backend's fast
-            # paths produce contiguous outputs, and downstream kernel-tier
-            # selection (hence accumulation order, hence bitwise results)
-            # must match what a non-deferred run would see.
-            ph = torch.empty(tuple(m.shape), dtype=m.dtype, device=device)
+            # META strides (with per-op backend overrides), not
+            # forced-contiguous: downstream consumers (and autograd's layout
+            # contract) react to the output layout NOW, so it must be
+            # exactly what a steady run would see — a wrong layout inserts
+            # clones/copies and changes the backward graph structurally.
+            # Fill-time verifies the backend agreed (stride-mismatch trace).
+            ph = torch.empty_strided(
+                tuple(m.shape), strides, dtype=m.dtype, device=device
+            )
         placeholders.append(ph)
+        fresh.append(ph)
+
+    if not fresh and not written:
+        # Every output is an alias of existing storage and nothing is
+        # mutated: the op is fully realized as metadata, nothing to replay.
+        return tree_unflatten(placeholders, out_spec)
 
     # Pending writes: fresh placeholders AND the schema's written targets
     # (which may not appear among the outputs at all, e.g. foreach/fused
     # optimizer ops returning ()).
-    taint_keys = _taint(
-        [ph for ph in placeholders if isinstance(ph, torch.Tensor)] + written
+    taint_keys = _taint(fresh + written)
+    _RT.submit(
+        (func, args, dict(kwargs), list(placeholders), out_spec, taint_keys, written)
     )
-    _RT.submit((func, args, dict(kwargs), list(placeholders), out_spec, taint_keys))
+    # The mutation's semantic effect on version counters belongs to NOW
+    # (dispatch order), not to the replay: later ops may save the target
+    # for backward, and their saved-version snapshot must postdate this
+    # write. The replay suppresses its own bump (_execute).
+    for w in written:
+        torch._C._increment_version(w)
     return tree_unflatten(placeholders, out_spec)
+
+
+def _defer_view(func, args, kwargs):
+    """Deferred execution for view-family ops on pending tensors.
+
+    Run the BACKEND impl immediately: pure-view impls compute metadata only
+    (shape/stride/ptr — pending bytes are irrelevant), and the result is a
+    true alias whose layout is exactly what a steady run hands downstream —
+    the backend, not this layer, owns every materialize-vs-view and layout
+    decision, which kernel-tier selection (hence bitwise results) depends
+    on. If the backend chose to MATERIALIZE (an output on fresh storage: it
+    read bytes, garbage while the input is pending), keep that output as a
+    placeholder and queue a re-execution to refill it once the producer has
+    replayed; true-alias outputs in the same item are skipped at fill time
+    (same holder/offset/strides)."""
+    result = _direct(func, args, kwargs)
+    flat_in, _ = tree_flatten((args, kwargs))
+    in_keys = {_holder_key(a) for a in flat_in if isinstance(a, torch.Tensor)}
+    out_flat, out_spec = tree_flatten(result)
+    materialized = [
+        t
+        for t in out_flat
+        if isinstance(t, torch.Tensor)
+        and _holder_key(t) is not None
+        and _holder_key(t) not in in_keys
+    ]
+    if materialized:
+        taint_keys = _taint(materialized)
+        _RT.submit(
+            (func, args, dict(kwargs), list(out_flat), out_spec, taint_keys, [])
+        )
+    return result
 
 
 def dispatch(func, args, kwargs):
@@ -440,9 +580,11 @@ def dispatch(func, args, kwargs):
     if _RT.error is not None and not in_replay():
         _RT.drain()  # re-raises the held replay error
 
-    episode = _RT.active and not in_replay()
+    force = _force_defer()
+    episode = (_RT.active or force) and not in_replay()
     if episode:
-        _RT.pump()  # main thread advances the queue as it goes
+        if not force:
+            _RT.pump()  # main thread advances the queue as it goes
         flat_args, _ = tree_flatten((args, kwargs))
         tainted = any(_is_tainted(a) for a in flat_args)
         mutates = any(
@@ -471,7 +613,7 @@ def dispatch(func, args, kwargs):
                     [a for a in flat_args if isinstance(a, torch.Tensor)]
                 )
             return _direct_blocking(func, args, kwargs)
-        if not tainted and not mutates:
+        if not tainted and not mutates and not force:
             # All inputs are real (or already filled): safe to run now —
             # single thread, single queue, fresh output. This covers views
             # of real tensors, factories, and any op off the pending chain.
@@ -487,6 +629,12 @@ def dispatch(func, args, kwargs):
         if _DEFER_ONLY is not None and name not in _DEFER_ONLY:
             _RT.drain()
             return _direct_blocking(func, args, kwargs)
+        if not mutates and _is_view_op(func):
+            _trace(f"defer-view {name}")
+            try:
+                return _defer_view(func, args, kwargs)
+            except KernelPending:
+                pass  # cold materializing impl: fall through to generic defer
         _trace(f"defer {name}")
         # Tainted functional ops AND mutations both queue: FIFO places a
         # mutation after every queued reader of its target, and tainting
@@ -522,3 +670,24 @@ def dispatch(func, args, kwargs):
 def drain() -> None:
     """Public: wait for all deferred work (used by device synchronize)."""
     _RT.drain()
+
+
+def wait_for(tensors: list) -> None:
+    """Public: wait until none of `tensors` has a pending deferred write.
+
+    For device code that reads tensor payloads OUTSIDE __torch_dispatch__
+    (e.g. the AutogradPrivateUse1 sdpa impl): such readers bypass the
+    deferred layer entirely, so they must wait out queued producers before
+    touching bytes. Views of pending tensors are only safe to hand out
+    because every in-dispatch consumer replays the producing FIFO prefix
+    first — this is the same barrier for out-of-dispatch consumers."""
+    live = [t for t in tensors if isinstance(t, torch.Tensor)]
+    if in_replay() or not any(_is_tainted(t) for t in live):
+        return
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError(
+            "deferred-compile: payload read from a non-main thread while a "
+            "producer is still queued; replays are main-thread-only"
+        )
+    _trace("wait-for out-of-dispatch reader")
+    _RT.drain_until_untainted(live)
