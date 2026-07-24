@@ -121,11 +121,14 @@ def set_device(device_idx: int):
 
 def synchronize(device=None):
     """Wait for work and release completed asynchronous transfer owners."""
+    from . import deferred_compile
     from .torch_mojo_tensor import (
         _release_synchronized_d2h_owners,
         _release_synchronized_h2d_sources,
         find_equivalent_max_device,
     )
+
+    deferred_compile.drain()
 
     if device is None:
         torch_device = torch.device(f"mojo:{_current_device}")

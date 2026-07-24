@@ -281,10 +281,12 @@ class TorchMojoTensor(torch.Tensor):
         if not all(issubclass(cls, tensor_type) for tensor_type in types):
             return NotImplemented
 
-        # Continue through the ordinary PrivateUse1 numerical path while
-        # preserving the exact overload selected by PyTorch.
-        with torch._C._DisableTorchDispatch():
-            return func(*args, **(kwargs or {}))
+        # The deferred-compile layer executes ops while kernel variants are
+        # still building in the background (and is a plain pass-through to
+        # the ordinary PrivateUse1 path when no compile is in flight).
+        from . import deferred_compile
+
+        return deferred_compile.dispatch(func, args, kwargs or {})
 
     @classmethod
     def _make(
@@ -399,6 +401,11 @@ class TorchMojoTensor(torch.Tensor):
         consuming it, matching PyTorch's asynchronous accelerator-to-CPU
         contract. Blocking and CPU-device copies are ready on return.
         """
+        # Reading device bytes is a sync point for deferred-compile episodes:
+        # every queued op must have executed before the transfer is enqueued.
+        from . import deferred_compile
+
+        deferred_compile.drain()
         src = self if self._is_contiguous else self._materialize_contiguous()
         if src._numel == 0:
             return torch.empty(self._shape, dtype=max_dtype_to_torch(self._dtype))

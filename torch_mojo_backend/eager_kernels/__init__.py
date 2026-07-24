@@ -277,6 +277,110 @@ def _load_extension(module_name: str, so_path: Path) -> ModuleType:
     return module
 
 
+class KernelPending(BaseException):
+    """The kernel the current op needs is compiling asynchronously.
+
+    Raised (instead of blocking) when a variant miss happens under
+    ``__torch_dispatch__`` and the deferred-execution layer is available.
+    Deliberately a BaseException so intermediate ``except Exception`` blocks
+    in the dispatch stack cannot swallow it; the deferred layer catches it
+    at the dispatch boundary (main thread) or in the launcher's retry loop.
+    """
+
+    def __init__(self, state: "_ModuleState", job: "_AsyncVariantJob") -> None:
+        super().__init__(f"kernel variant of {state.name} is compiling")
+        self.state = state
+        self.job = job
+
+
+_DISPATCH_TLS = threading.local()
+
+
+def _in_torch_dispatch() -> bool:
+    return getattr(_DISPATCH_TLS, "depth", 0) > 0
+
+
+class _dispatch_scope:
+    """Marks 'this extension call came through __torch_dispatch__', which is
+    the only context where a variant miss may raise KernelPending instead of
+    compiling synchronously (direct callers, e.g. tests, still block)."""
+
+    def __enter__(self) -> None:
+        _DISPATCH_TLS.depth = getattr(_DISPATCH_TLS, "depth", 0) + 1
+
+    def __exit__(self, *exc: object) -> None:
+        _DISPATCH_TLS.depth -= 1
+
+
+class _AsyncVariantJob:
+    """One background build of a wider variant for one module. Requests that
+    arrive while it runs accumulate in the state's wanted-set; a follow-up
+    job starts automatically when this one completes with wants left over."""
+
+    def __init__(self, state: "_ModuleState") -> None:
+        self.state = state
+        self.done = threading.Event()
+        self.urgent = threading.Event()
+        self.error: BaseException | None = None
+
+    def run(self) -> None:
+        state = self.state
+        try:
+            # Merge window: let demands accumulate briefly so one build
+            # covers several ops. A blocked waiter cuts the window short.
+            self.urgent.wait(timeout=0.5)
+            with _ASYNC_BUILD_SLOTS:
+                with state.lock:
+                    profile = _PROFILE.get(state.name, {})
+                    first_build = state.module is None
+                    base_ops = set(state.ops or ())
+                    if first_build:
+                        base_ops |= set(profile.get("ops", ()))
+                    target_ops = frozenset(base_ops | state.wanted_ops)
+                    if state.wanted_all_dtypes or (
+                        not first_build and state.dtypes is None
+                    ):
+                        target_dtypes: frozenset[str] | None = None
+                    elif first_build:
+                        target_dtypes = frozenset(
+                            profile.get("dtypes", ()) or _DEFAULT_DTYPES
+                        )
+                    else:
+                        target_dtypes = state.dtypes
+                    generation = state.generation + 1
+                path = _build_variant(state.name, target_ops, target_dtypes, generation)
+                with state.lock:
+                    state.generation = generation
+                    state.ops = target_ops
+                    state.dtypes = target_dtypes
+                    state.module = _load_extension(
+                        f"{__name__}._tmbv_{state.name}_g{generation}", path
+                    )
+                    state.wanted_ops -= set(target_ops)
+                    if target_dtypes is None:
+                        state.wanted_all_dtypes = False
+                    proxy = _PROXIES[state.name]
+                    proxy.__dict__.clear()
+                    proxy.__dict__["_state"] = state
+                    proxy.__dict__["__name__"] = f"{__name__}.{state.name}"
+        except BaseException as exc:  # surfaced to every waiter
+            self.error = exc
+        finally:
+            with state.lock:
+                if state.async_job is self:
+                    state.async_job = None
+                more = state.wanted_ops or state.wanted_all_dtypes
+            self.done.set()
+            if more and self.error is None:
+                state.request_async()
+
+    def wait(self) -> None:
+        self.urgent.set()  # a blocked consumer: start building now
+        self.done.wait()
+        if self.error is not None:
+            raise self.error
+
+
 class _ModuleState:
     """Loaded-variant bookkeeping for one .mojo module."""
 
@@ -288,8 +392,37 @@ class _ModuleState:
         self.dtypes: frozenset[str] | None = None  # None = all
         self.demanded_ops: set[str] = set()
         self.generation = 0
+        self.wanted_ops: set[str] = set()
+        self.wanted_all_dtypes = False
+        self.async_job: _AsyncVariantJob | None = None
+
+    def request_async(
+        self, add_op: str | None = None, all_dtypes: bool = False
+    ) -> _AsyncVariantJob:
+        """Record a demand and make sure a build covering it is in flight."""
+        if add_op is not None and add_op not in _registered_ops(self.name):
+            raise AttributeError(f"module {self.name!r} has no entry point {add_op!r}")
+        with self.lock:
+            if add_op is not None:
+                self.wanted_ops.add(add_op)
+            if all_dtypes:
+                self.wanted_all_dtypes = True
+            job = self.async_job
+            if job is None:
+                job = self.async_job = _AsyncVariantJob(self)
+                threading.Thread(
+                    target=job.run, name=f"tmb-build-{self.name}", daemon=True
+                ).start()
+            return job
 
     def ensure_loaded(self, first_op: str | None) -> ModuleType:
+        if (
+            self.module is None
+            and self.name not in _FULL_MODULES
+            and _in_torch_dispatch()
+            and not _PREWARM.has_build_for(self.name)
+        ):
+            raise KernelPending(self, self.request_async(add_op=first_op))
         with self.lock:
             if self.module is None:
                 _PREWARM.wait_for(self.name)
@@ -344,6 +477,10 @@ def _wrap_call(state: _ModuleState, attr: str, fn: object) -> object:
         except Exception as exc:  # Mojo errors surface as plain Exception
             if "unsupported dtype" not in str(exc) or state.dtypes is None:
                 raise
+            if _in_torch_dispatch():
+                raise KernelPending(
+                    state, state.request_async(all_dtypes=True)
+                ) from exc
             module = state.escalate(all_dtypes=True)
             return getattr(module, attr)(*args, **kwargs)
 
@@ -367,6 +504,8 @@ class _ModuleProxy:
         try:
             value = getattr(module, attr)
         except AttributeError:
+            if state.name not in _FULL_MODULES and _in_torch_dispatch():
+                raise KernelPending(state, state.request_async(add_op=attr)) from None
             module = state.escalate(add_op=attr)
             value = getattr(module, attr)
         state.demanded_ops.add(attr)
@@ -451,6 +590,12 @@ class _Prewarm:
             self._pump()
             threading.Event().wait(0.5)
 
+    def has_build_for(self, name: str) -> bool:
+        """A prewarm build for this module is pending or running (its result
+        is imminent, so first-touch should wait for it rather than defer)."""
+        with self.lock:
+            return name in self.running or any(n == name for n, _ in self.pending)
+
     def wait_for(self, name: str) -> None:
         """Block until this module's prewarm build (if any) has finished.
         A still-pending build is promoted to run immediately."""
@@ -472,6 +617,7 @@ class _Prewarm:
 
 
 _PROFILE = _load_profile()
+_ASYNC_BUILD_SLOTS = threading.Semaphore(_pool_size())
 _PREWARM = _Prewarm()
 _STATES: dict[str, _ModuleState] = {n: _ModuleState(n) for n in _MOJO_MODULES}
 _PROXIES: dict[str, _ModuleProxy] = {
@@ -480,7 +626,7 @@ _PROXIES: dict[str, _ModuleProxy] = {
 atexit.register(_save_profile)
 
 
-_HANDED_OUT: set[str] = set()
+_CACHED_IN_DICT: set[str] = set()
 
 
 def __getattr__(name: str) -> object:
@@ -491,21 +637,27 @@ def __getattr__(name: str) -> object:
             return holder
         proxy = _PROXIES[name]
         state = _STATES[name]
-        if name in _HANDED_OUT and state.module is not None:
-            # The cached attribute was explicitly deleted (tests use this to
-            # force a fresh import): drop the loaded module so resolution
-            # goes back through _import_mojo_module.
+        if name in _CACHED_IN_DICT and state.module is not None:
+            # A previously *successful* resolution was explicitly deleted
+            # from the package dict (tests use this to force a fresh
+            # import): drop the loaded module so resolution goes back
+            # through _import_mojo_module.
             with state.lock:
                 state.module = None
             proxy.__dict__.clear()
             proxy.__dict__["_state"] = state
             proxy.__dict__["__name__"] = f"{__name__}.{name}"
-        _HANDED_OUT.add(name)
+            _CACHED_IN_DICT.discard(name)
         # Import at resolution time, like a real module attribute: an
         # unavailable extension raises HERE and is not cached, so callers'
         # ImportError handling and failure-flag caching behave as before.
-        state.ensure_loaded(None)
-        globals()[name] = proxy
+        # Under __torch_dispatch__ resolution stays lazy instead — the first
+        # attribute access carries the op name, so the variant built covers
+        # it (resolution alone would build a useless empty variant).
+        if not _in_torch_dispatch():
+            state.ensure_loaded(None)
+            globals()[name] = proxy
+            _CACHED_IN_DICT.add(name)
         return proxy
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
