@@ -277,7 +277,9 @@ def _dyn_smem_capacity(ctx: DeviceContext) -> Int:
         if opt_in - 1024 > capacity:
             capacity = opt_in - 1024
     except:
-        pass
+        # Deliberate fallback: the attribute is unavailable on this device
+        # (e.g. AMD); keep the conservative default capacity.
+        capacity = _DEFAULT_DYN_SMEM
     return capacity
 
 
