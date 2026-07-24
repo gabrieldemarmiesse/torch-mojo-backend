@@ -45,7 +45,38 @@ from max import driver
 _PACKAGE_DIR = Path(__file__).parent
 _CACHE_DIR = _PACKAGE_DIR / "__mojocache__"
 _PROFILE_PATH = _CACHE_DIR / "demand_profile.json"
-_MOJO_EXE = Path(sys.executable).parent / "mojo"
+
+
+_MOJO_EXE_CACHE: list = []
+
+
+def _find_mojo() -> Path:
+    """The mojo CLI of the environment providing `max`. Resolved lazily at
+    first build: sys.executable can be unset during worker bootstrap
+    (pytest-xdist) at import time. `max` may be a namespace package
+    (__file__ is None), so walk up from its __path__ entries."""
+    if _MOJO_EXE_CACHE:
+        return _MOJO_EXE_CACHE[0]
+    candidates: list[Path] = []
+    if sys.executable:  # None/'' in embedded interpreters and workers
+        candidates.append(Path(sys.executable).parent / "mojo")
+    import max as _max_pkg
+
+    for base in list(getattr(_max_pkg, "__path__", ())) or (
+        [_max_pkg.__file__] if getattr(_max_pkg, "__file__", None) else []
+    ):
+        candidates.extend(parent / "bin" / "mojo" for parent in Path(base).parents)
+    for cand in candidates:
+        if cand.is_file():
+            _MOJO_EXE_CACHE.append(cand)
+            return cand
+    import shutil
+
+    which = shutil.which("mojo")
+    if which is not None:
+        _MOJO_EXE_CACHE.append(Path(which))
+        return _MOJO_EXE_CACHE[0]
+    raise FileNotFoundError("mojo executable not found for kernel builds")
 
 _MOJO_MODULES = (
     "tensor_holder",
@@ -181,7 +212,7 @@ def _variant_cmd(
     dtypes: frozenset[str] | None,
     out: Path,
 ) -> list[str]:
-    cmd = [str(_MOJO_EXE), "build", str(src), "--emit", "shared-lib"]
+    cmd = [str(_find_mojo()), "build", str(src), "--emit", "shared-lib"]
     if ops is not None:
         cmd += ["-D", f"TMB_OPS={','.join(sorted(ops)) or '__none__'}"]
     if dtypes is not None:
@@ -249,9 +280,15 @@ def _build_variant(
             + (f" t={_time.monotonic():.2f}" if os.environ.get("TMB_TRACE") else ""),
             file=sys.stderr,
         )
+        # Build to a temp path and rename into place: `mojo build -o` writes
+        # the output non-atomically, and the fast-path existence check above
+        # runs WITHOUT the lock — a reader must never see a partial .so.
+        # The temp name keeps the .so suffix (mojo normalizes others) and a
+        # leading dot so no cache scan ever picks it up.
+        tmp = out.with_name(f".tmp{os.getpid()}.{out.name}")
         try:
             proc = subprocess.run(
-                _variant_cmd(name, src, ops, dtypes, out),
+                _variant_cmd(name, src, ops, dtypes, tmp),
                 capture_output=True,
                 text=True,
                 env=_build_env(),
@@ -267,7 +304,9 @@ def _build_variant(
                     f"mojo build failed for {name} "
                     f"({_variant_tag(ops, dtypes)}):\n{proc.stderr}"
                 )
+            os.replace(tmp, out)
         finally:
+            tmp.unlink(missing_ok=True)
             if scratch is not None:
                 scratch.unlink(missing_ok=True)
         return out
