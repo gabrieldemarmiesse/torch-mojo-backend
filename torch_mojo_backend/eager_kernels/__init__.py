@@ -248,6 +248,25 @@ def _build_variant(
         return out
 
 
+def _import_mojo_module(name: str) -> ModuleType:
+    """Compatibility seam kept from the previous loader: the single point a
+    module's target variant is built (if needed) and loaded. Tests patch this
+    to simulate compiler failure / unavailable extensions."""
+    if name != "tensor_holder":
+        # tensor_holder registers the process-wide TensorHolder/TensorSpec
+        # Python types every other module's spec ops consume; it must be
+        # loaded and finalized before any kernel module.
+        _STATES["tensor_holder"].ensure_loaded(None)
+    state = _STATES[name]
+    so_path = _build_variant(state.name, state.ops, state.dtypes, state.generation)
+    suffix = (
+        state.name
+        if state.generation == 0
+        else f"_tmbv_{state.name}_g{state.generation}"
+    )
+    return _load_extension(f"{__name__}.{suffix}", so_path)
+
+
 def _load_extension(module_name: str, so_path: Path) -> ModuleType:
     loader = importlib.machinery.ExtensionFileLoader(module_name, str(so_path))
     spec = importlib.util.spec_from_file_location(
@@ -284,9 +303,8 @@ class _ModuleState:
                         wanted.add(first_op)
                     ops = frozenset(wanted)
                     dtypes = frozenset(profile.get("dtypes", ()) or _DEFAULT_DTYPES)
-                so_path = _build_variant(self.name, ops, dtypes, 0)
-                self.module = _load_extension(f"{__name__}.{self.name}", so_path)
                 self.ops, self.dtypes = ops, dtypes
+                self.module = _import_mojo_module(self.name)
             return self.module
 
     def escalate(
@@ -303,16 +321,19 @@ class _ModuleState:
             if add_op is not None:
                 ops.add(add_op)
             dtypes = None if all_dtypes else self.dtypes
+            rollback = (self.ops, self.dtypes, self.generation, self.module)
             self.generation += 1
-            so_path = _build_variant(self.name, frozenset(ops), dtypes, self.generation)
-            self.module = _load_extension(
-                f"{__name__}._tmbv_{self.name}_g{self.generation}", so_path
-            )
             self.ops = frozenset(ops)
             self.dtypes = dtypes
+            try:
+                self.module = _import_mojo_module(self.name)
+            except BaseException:
+                self.ops, self.dtypes, self.generation, self.module = rollback
+                raise
             proxy = _PROXIES[self.name]
             proxy.__dict__.clear()
             proxy.__dict__["_state"] = self
+            proxy.__dict__["__name__"] = f"{__name__}.{self.name}"
             return self.module
 
 
@@ -334,6 +355,9 @@ class _ModuleProxy:
 
     def __init__(self, state: _ModuleState) -> None:
         self.__dict__["_state"] = state
+        # Real module metadata: tests and tooling identify the extension by
+        # its canonical module name, which the proxy stands in for.
+        self.__dict__["__name__"] = f"{__name__}.{state.name}"
 
     def __getattr__(self, attr: str) -> object:
         state: _ModuleState = self.__dict__["_state"]
@@ -352,11 +376,33 @@ class _ModuleProxy:
         return value
 
 
+def _pool_size() -> int:
+    """Concurrent `mojo build` subprocesses. Each build peaks around 4.5 GB
+    RSS and uses ~2.5-3 cores, so cap by available RAM (5 GiB per slot with
+    headroom) and by cores; never fewer than 1, never more than 16."""
+    mem_gib = 8.0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable"):
+                    mem_gib = int(line.split()[1]) / (1024 * 1024)
+                    break
+    except OSError:
+        pass
+    by_mem = int(mem_gib // 5)
+    by_cpu = (os.cpu_count() or 4) // 3
+    return max(1, min(by_mem, by_cpu, 16))
+
+
 class _Prewarm:
-    """Background parallel builds of every profiled variant at import time."""
+    """Background builds of every profiled variant at import time, run
+    through a slot pool sized to the machine (`_pool_size`)."""
 
     def __init__(self) -> None:
-        self.procs: dict[str, subprocess.Popen] = {}
+        self.lock = threading.Lock()
+        self.slots = _pool_size()
+        self.pending: list[tuple[str, list[str]]] = []
+        self.running: dict[str, subprocess.Popen] = {}
         for name, entry in _PROFILE.items():
             if name in _FULL_MODULES or name not in _MOJO_MODULES:
                 continue
@@ -368,23 +414,61 @@ class _Prewarm:
             if out.is_file():
                 continue
             _CACHE_DIR.mkdir(exist_ok=True)
-            self.procs[name] = subprocess.Popen(
-                _variant_cmd(name, _PACKAGE_DIR / f"{name}.mojo", ops, dtypes, out),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=_build_env(),
+            self.pending.append(
+                (
+                    name,
+                    _variant_cmd(name, _PACKAGE_DIR / f"{name}.mojo", ops, dtypes, out),
+                )
             )
-        if self.procs:
+        if self.pending:
             print(
-                f"torch-mojo-backend: prewarming {len(self.procs)} kernel "
-                "variants in the background...",
+                f"torch-mojo-backend: prewarming {len(self.pending)} kernel "
+                f"variants in the background ({self.slots} build slots)...",
                 file=sys.stderr,
             )
+            self._pump()
+            threading.Thread(target=self._reaper, daemon=True).start()
+
+    def _pump(self) -> None:
+        with self.lock:
+            self.running = {n: p for n, p in self.running.items() if p.poll() is None}
+            while self.pending and len(self.running) < self.slots:
+                name, cmd = self.pending.pop(0)
+                self.running[name] = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=_build_env(),
+                )
+
+    def _reaper(self) -> None:
+        while True:
+            with self.lock:
+                live = any(p.poll() is None for p in self.running.values())
+                idle = not self.pending and not live
+            if idle:
+                return
+            self._pump()
+            threading.Event().wait(0.5)
 
     def wait_for(self, name: str) -> None:
-        proc = self.procs.pop(name, None)
+        """Block until this module's prewarm build (if any) has finished.
+        A still-pending build is promoted to run immediately."""
+        with self.lock:
+            for i, (n, cmd) in enumerate(self.pending):
+                if n == name:
+                    del self.pending[i]
+                    self.running[name] = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=_build_env(),
+                    )
+                    break
+            proc = self.running.get(name)
         if proc is not None:
             proc.wait()
+            self._pump()
 
 
 _PROFILE = _load_profile()
@@ -396,16 +480,31 @@ _PROXIES: dict[str, _ModuleProxy] = {
 atexit.register(_save_profile)
 
 
+_HANDED_OUT: set[str] = set()
+
+
 def __getattr__(name: str) -> object:
     if name in _MOJO_MODULES:
-        # tensor_holder must be imported and finalized before any other
-        # module: it registers the process-wide TensorHolder/TensorSpec
-        # Python types every other module's spec ops consume.
-        holder = _STATES["tensor_holder"].ensure_loaded(None)
         if name == "tensor_holder":
+            holder = _STATES["tensor_holder"].ensure_loaded(None)
             globals()[name] = holder
             return holder
         proxy = _PROXIES[name]
+        state = _STATES[name]
+        if name in _HANDED_OUT and state.module is not None:
+            # The cached attribute was explicitly deleted (tests use this to
+            # force a fresh import): drop the loaded module so resolution
+            # goes back through _import_mojo_module.
+            with state.lock:
+                state.module = None
+            proxy.__dict__.clear()
+            proxy.__dict__["_state"] = state
+            proxy.__dict__["__name__"] = f"{__name__}.{name}"
+        _HANDED_OUT.add(name)
+        # Import at resolution time, like a real module attribute: an
+        # unavailable extension raises HERE and is not cached, so callers'
+        # ImportError handling and failure-flag caching behave as before.
+        state.ensure_loaded(None)
         globals()[name] = proxy
         return proxy
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
