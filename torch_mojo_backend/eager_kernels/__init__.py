@@ -226,8 +226,11 @@ def _build_variant(
             )
             src = scratch
         scope = "full" if ops is None else f"{len(ops)} ops"
+        import time as _time
+
         print(
-            f"torch-mojo-backend: compiling {name} [{scope}] on demand...",
+            f"torch-mojo-backend: compiling {name} [{scope}] on demand..."
+            + (f" t={_time.monotonic():.2f}" if os.environ.get("TMB_TRACE") else ""),
             file=sys.stderr,
         )
         try:
@@ -237,6 +240,14 @@ def _build_variant(
                 text=True,
                 env=_build_env(),
             )
+            if os.environ.get("TMB_TRACE"):
+                import time as _time
+
+                print(
+                    f"[TRACE] built {name} t={_time.monotonic():.2f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if proc.returncode != 0:
                 raise ImportError(
                     f"mojo build failed for {name} "

@@ -91,6 +91,25 @@ class _Runtime:
         if error is not None:
             raise error
 
+    def drain_until_untainted(self, tensors: list) -> None:
+        """Execute the FIFO prefix until none of `tensors` has a pending
+        write — the minimal wait for an op that must run immediately but
+        only depends on part of the queue. Discovery continues afterward
+        with the rest of the queue (and its compiles) still in flight."""
+        if in_replay():
+            return
+        while (
+            self.queue and self.error is None and any(_is_tainted(t) for t in tensors)
+        ):
+            item = self.queue.popleft()
+            try:
+                _execute(item, blocking=True)
+            except BaseException as exc:
+                self.error = exc
+        if self.error is not None:
+            error, self.error = self.error, None
+            raise error
+
 
 _RT = _Runtime()
 _VERIFY: list = []  # (op name, placeholder, cpu snapshot) when TMB_VERIFY_FILL
@@ -232,11 +251,21 @@ def _direct_blocking(func, args, kwargs):
             pending.job.wait()
 
 
+def _run_after_deps(func, args, kwargs, flat_args):
+    """Run an op immediately and exactly, first replaying just the FIFO
+    prefix that produces its pending inputs (and written targets)."""
+    deps = [a for a in flat_args if isinstance(a, torch.Tensor)]
+    deps += _written_tensors(func, args, kwargs)
+    _RT.drain_until_untainted(deps)
+    return _direct_blocking(func, args, kwargs)
+
+
 def _trace(msg: str) -> None:
     if _os.environ.get("TMB_TRACE"):
         import sys as _sys
+        import time as _time
 
-        print(f"[TRACE] {msg}", file=_sys.stderr, flush=True)
+        print(f"[TRACE] t={_time.monotonic():.2f} {msg}", file=_sys.stderr, flush=True)
 
 
 def _nan_count(t: object) -> str:
@@ -371,14 +400,18 @@ def _defer(func, args, kwargs):
             placeholders.append(m)
             continue
         aliased = storage_to_real.get(m.untyped_storage()._cdata)
-        if aliased is not None:
-            if tuple(m.shape) != tuple(aliased.shape) or m.stride() != aliased.stride():
-                # The op resizes/restrides its aliased output (e.g. the
-                # arange.start_out decomposition): its *metadata* effect is
-                # observable immediately, so it cannot be deferred.
-                raise _Undeferrable(func._schema.name)
+        if aliased is not None and (
+            tuple(m.shape) == tuple(aliased.shape) and m.stride() == aliased.stride()
+        ):
             placeholders.append(aliased)
             continue
+        if aliased is not None:
+            # An aliasing output with different metadata is a VIEW of a
+            # pending tensor. Materializing it as a copy broke numerics in
+            # ways not yet understood (deterministic 3.4-level divergence,
+            # layout-independent) — so it stays undeferrable: the caller
+            # waits for just the producing FIFO prefix (_run_after_deps).
+            raise _Undeferrable(func._schema.name)
         with _DEVICE_LOCK, torch._C._DisableTorchDispatch():
             # Contiguous regardless of the meta stride: the backend's fast
             # paths produce contiguous outputs, and downstream kernel-tier
@@ -416,12 +449,27 @@ def dispatch(func, args, kwargs):
             arg.alias_info is not None and arg.alias_info.is_write
             for arg in func._schema.arguments
         )
-        if name in _SYNC_OPS or overload in _SYNC_OPS:
-            # Host reads / device crossings. Only order against the queue
-            # when they actually touch pending storages.
+        sync = name in _SYNC_OPS or overload in _SYNC_OPS
+        if (
+            sync
+            and not _os.environ.get("TMB_CAST_SYNC")
+            and name in ("aten::_to_copy", "aten::copy_")
+        ):
+            # Same-device copies/casts (autocast!) are ordinary data ops —
+            # only actual device crossings behave as host-visible syncs.
+            devices = {a.device.type for a in flat_args if isinstance(a, torch.Tensor)}
+            target = kwargs.get("device")
+            if target is not None:
+                devices.add(torch.device(target).type)
+            sync = len(devices) > 1
+        if sync:
+            # Host reads / device crossings: wait, but only for the FIFO
+            # prefix this op actually depends on.
             if tainted:
                 _trace(f"sync-drain {name}")
-                _RT.drain()
+                _RT.drain_until_untainted(
+                    [a for a in flat_args if isinstance(a, torch.Tensor)]
+                )
             return _direct_blocking(func, args, kwargs)
         if not tainted and not mutates:
             # All inputs are real (or already filled): safe to run now —
@@ -435,11 +483,11 @@ def dispatch(func, args, kwargs):
                 try:
                     return _defer(func, args, kwargs)
                 except Exception:
-                    _RT.drain()
-                    return _direct_blocking(func, args, kwargs)
+                    return _run_after_deps(func, args, kwargs, flat_args)
         if _DEFER_ONLY is not None and name not in _DEFER_ONLY:
             _RT.drain()
             return _direct_blocking(func, args, kwargs)
+        _trace(f"defer {name}")
         # Tainted functional ops AND mutations both queue: FIFO places a
         # mutation after every queued reader of its target, and tainting
         # the target makes every later toucher queue behind the mutation.
@@ -448,9 +496,10 @@ def dispatch(func, args, kwargs):
         except Exception:
             # No meta support, metadata-changing mutations (resize / out=
             # reallocation), alias-metadata effects, or other inference
-            # issues: flush and run exactly, losing overlap for this op.
-            _RT.drain()
-            return _direct_blocking(func, args, kwargs)
+            # issues: run this op exactly, waiting only for the FIFO prefix
+            # it depends on — discovery continues past it.
+            _trace(f"fallback-wait {name}")
+            return _run_after_deps(func, args, kwargs, flat_args)
 
     try:
         return _direct(func, args, kwargs)
