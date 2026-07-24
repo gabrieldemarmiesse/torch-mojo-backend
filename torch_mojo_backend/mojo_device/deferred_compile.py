@@ -185,6 +185,17 @@ def _force_defer() -> bool:
     return bool(_os.environ.get("TMB_FORCE_DEFER"))
 
 
+def _synchronous_mode() -> bool:
+    """Under the unit-test suite a compile miss blocks instead of
+    deferring: the suite's call-count and spy contracts assume synchronous
+    eager execution (the extension call must have happened by the time the
+    dispatch returns). Deferral is exercised by its own harnesses. Force
+    knobs win so those harnesses can still run under pytest."""
+    from torch_mojo_backend.is_running_tests import IS_RUNNING_TESTS
+
+    return IS_RUNNING_TESTS and not _force_defer()
+
+
 def _is_view_op(func) -> bool:
     """Functional op whose outputs alias an input (the view family)."""
     return any(
@@ -402,13 +413,16 @@ def _execute(item: tuple, blocking: bool = True) -> None:
                     f"ph{tuple(ph.stride())} real{tuple(value.stride())} "
                     f"shape{tuple(ph.shape)}"
                 )
-            with _DEVICE_LOCK, torch._C._DisableTorchDispatch():
+            with _DEVICE_LOCK, torch._C._DisableTorchDispatch(), torch.no_grad():
                 _order_device_thread()
                 # A fill is not a semantic mutation — it completes the op
                 # that created `ph`. Autograd may already track views of the
                 # placeholder (a deferred split/view of a pending tensor),
                 # and a version bump here would trip its multi-view
                 # modified-inplace check at backward-graph construction.
+                # no_grad because _DisableTorchDispatch does NOT disable the
+                # autograd layer: an unguarded fill on a requires-grad
+                # placeholder records CopyBackwards and hijacks its grad_fn.
                 with torch.autograd._unsafe_preserve_version_counter(ph):
                     torch.ops.aten.copy_(ph, value)
     _trace(f"filled d={depth} {func._schema.name}")
@@ -676,6 +690,7 @@ def dispatch(func, args, kwargs):
         if (
             in_replay()
             or _os.environ.get("TMB_NO_TRIGGER_DEFER")
+            or _synchronous_mode()
             or (_DEFER_ONLY is not None and name not in _DEFER_ONLY)
         ):
             pending.job.wait()

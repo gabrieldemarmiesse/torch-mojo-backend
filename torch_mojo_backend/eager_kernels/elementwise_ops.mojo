@@ -313,9 +313,9 @@ def _bin_go[
                 )
                 handled = True
     if not handled:
-        abort(
-            String("unsupported dtype for fast binary elementwise op: ", dtype)
-        )
+        # Raise (never abort): "unsupported dtype" is the loader's signal to
+        # rebuild this unit with the full dtype set and retry.
+        raise Error("unsupported dtype for fast binary elementwise op: ", dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +844,9 @@ def _arange_go(
                 )
                 handled = True
     if not handled:
-        abort(String("unsupported dtype for fast arange: ", dtype))
+        # Raise (never abort): "unsupported dtype" is the loader's signal to
+        # rebuild this unit with the full dtype set and retry.
+        raise Error("unsupported dtype for fast arange: ", dtype)
 
 
 # ---------------------------------------------------------------------------

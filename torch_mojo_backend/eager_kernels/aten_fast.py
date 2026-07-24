@@ -28,6 +28,7 @@ import torch
 from max.dtype import DType
 
 from torch_mojo_backend import eager_kernels, is_running_tests
+from torch_mojo_backend.eager_kernels import KernelPending
 from torch_mojo_backend.eager_kernels import _ctx_ptr
 from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
     _reserve_philox_state,
@@ -5519,8 +5520,14 @@ def _instrument_call_counts():
         def make_wrapper(wrapped):
             @functools.wraps(wrapped)
             def wrapper(*args, **kwargs):
+                # Count attempts, except compile-miss retries (KernelPending
+                # re-enters the same logical call after the build).
                 wrapper.call_count += 1
-                return wrapped(*args, **kwargs)
+                try:
+                    return wrapped(*args, **kwargs)
+                except KernelPending:
+                    wrapper.call_count -= 1
+                    raise
 
             wrapper.call_count = 0
             return wrapper
