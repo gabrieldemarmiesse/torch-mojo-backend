@@ -3599,14 +3599,14 @@ def test_bf16_unavailable_bridge_falls_back_before_allocation(
     if failure_mode == "missing_source":
         sources = (SimpleNamespace(is_file=lambda: False),)
 
-        def import_module(name):
+        def import_module(name, ops=None, dtypes=None):
             import_calls.append(name)
             raise AssertionError("missing BF16 source attempted a lazy import")
 
     else:
         sources = (SimpleNamespace(is_file=lambda: True),)
 
-        def import_module(name):
+        def import_module(name, ops=None, dtypes=None):
             import_calls.append(name)
             raise ImportError("synthetic Mojo compiler failure")
 
@@ -3703,14 +3703,14 @@ def test_tf32_unavailable_bridge_falls_back_before_allocation(
     if failure_mode == "missing_source":
         sources = (SimpleNamespace(is_file=lambda: False),)
 
-        def import_module(name):
+        def import_module(name, ops=None, dtypes=None):
             import_calls.append(name)
             raise AssertionError("missing TF32 source attempted a lazy import")
 
     else:
         sources = (SimpleNamespace(is_file=lambda: True),)
 
-        def import_module(name):
+        def import_module(name, ops=None, dtypes=None):
             import_calls.append(name)
             raise ImportError("synthetic Mojo compiler failure")
 
@@ -3792,7 +3792,7 @@ def test_tf32_matmul_family_highest_retains_tensorspec_fallback(monkeypatch):
     def fail_tensor_inspection(*_args, **_kwargs):
         raise AssertionError("strict FP32 inspected a TF32 operand")
 
-    def fail_tf32_import(name):
+    def fail_tf32_import(name, ops=None, dtypes=None):
         tf32_import_calls.append(name)
         raise AssertionError("strict FP32 lazily imported the TF32 extension")
 

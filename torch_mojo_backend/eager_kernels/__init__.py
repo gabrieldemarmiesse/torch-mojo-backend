@@ -1,18 +1,19 @@
 """Fast eager-mode kernels for mojo_device, compiled as CPython extensions.
 
 The `.mojo` modules in this package are built on demand with
-`mojo build --emit shared-lib` into *variants*: each variant compiles only
-the extension entry points (`-D TMB_OPS=<csv>`) and dtypes
-(`-D TMB_DTYPES=<csv>`) that the workload has actually demanded, which cuts
-zero-cache cold starts by an order of magnitude (a gated-out op or dtype is
-never elaborated, so its GPU kernels are never compiled).
+`mojo build --emit shared-lib` into per-op units: every gated .so compiles
+EXACTLY ONE extension entry point (`-D TMB_OPS=<op>`) with a dtype set
+(`-D TMB_DTYPES=<csv>`). One op per .so means every unit builds
+independently — full build parallelism across ops of the same module, no
+escalation chains, and op-granular caching (a new workload rebuilds only
+the ops it newly demands, never a whole module variant).
 
 Demand discovery is transparent to callers: `eager_kernels.<module>` returns
-a proxy whose attribute lookup escalates to a wider variant when an op is
-missing, and whose call wrappers escalate to the full dtype set when a Mojo
-kernel reports an unsupported dtype, then retry. Demanded ops/dtypes are
-persisted in `__mojocache__/demand_profile.json`; later cold starts compile
-each module's profiled variant once, in parallel, in the background.
+a proxy whose attribute lookup builds/loads the unit for that op on first
+touch, and whose call wrappers rebuild the unit with the full dtype set when
+a Mojo kernel reports an unsupported dtype, then retry. Demanded ops/dtypes
+are persisted in `__mojocache__/demand_profile.json` (telemetry, and the
+default dtype seed for first builds).
 
 An op call here is one CPython extension call that receives raw data
 pointers (from `TorchMojoTensor._ptr`) plus sizes/dtypes as plain ints, and
@@ -142,7 +143,10 @@ def _save_profile() -> None:
                 continue
             entry = merged.setdefault(name, {"ops": [], "dtypes": []})
             entry["ops"] = sorted(set(entry["ops"]) | state.demanded_ops)
-            entry["dtypes"] = sorted(set(entry["dtypes"]) | set(state.dtypes or ()))
+            dtypes: set[str] = set()
+            for unit in state.units.values():
+                dtypes |= set(unit.dtypes or ())
+            entry["dtypes"] = sorted(set(entry["dtypes"]) | dtypes)
         _PROFILE_PATH.write_text(json.dumps(merged, indent=1, sort_keys=True))
 
 
@@ -185,29 +189,42 @@ def _variant_cmd(
     return cmd + ["-o", str(out)]
 
 
+def _unit_symbol(name: str, ops: frozenset[str] | None, dtypes: frozenset[str] | None) -> str:
+    """Module name (= PyInit suffix) for a build. Full builds keep the
+    source's own symbol; gated per-op builds get a deterministic tag-based
+    mangle so every unit coexists in one process AND a cached .so is
+    loadable under the same name by any later process."""
+    if ops is None and dtypes is None:
+        return name
+    return f"_tmbv_{name}_{_variant_tag(ops, dtypes)}"
+
+
 def _variant_path(
     name: str,
     ops: frozenset[str] | None,
     dtypes: frozenset[str] | None,
-    generation: int,
 ) -> Path:
     tag = _variant_tag(ops, dtypes)
-    return _CACHE_DIR / (f"{name}.{tag}.g{generation}.hash-{_module_hash(name)}.so")
+    return _CACHE_DIR / (f"{name}.{tag}.hash-{_module_hash(name)}.so")
 
 
 def _build_variant(
     name: str,
     ops: frozenset[str] | None,
     dtypes: frozenset[str] | None,
-    generation: int,
 ) -> Path:
-    """Compile one variant .so (blocking); returns the cache path.
+    """Compile one unit .so (blocking); returns the cache path.
 
-    generation 0 keeps the source's own PyInit symbol; later generations
-    build from a copy with a renamed PyInit so multiple variants of the same
-    module can coexist in one process.
+    A gated build compiles exactly ONE op — multi-op .so files are not
+    representable in this loader. `ops is None` (with dtypes None) is the
+    full build, reserved for the type-registry module (tensor_holder).
     """
-    out = _variant_path(name, ops, dtypes, generation)
+    if ops is not None and len(ops) != 1:
+        raise ValueError(
+            f"per-op loader: a gated build must contain exactly one op, "
+            f"got {sorted(ops)!r} for {name}"
+        )
+    out = _variant_path(name, ops, dtypes)
     if out.is_file():
         return out
     _CACHE_DIR.mkdir(exist_ok=True)
@@ -217,19 +234,18 @@ def _build_variant(
             return out
         src = _PACKAGE_DIR / f"{name}.mojo"
         scratch: Path | None = None
-        if generation > 0:
-            scratch = _PACKAGE_DIR / f"_tmbv_{name}_g{generation}.mojo"
+        symbol = _unit_symbol(name, ops, dtypes)
+        if symbol != name:
+            scratch = _PACKAGE_DIR / f"{symbol}.mojo"
             scratch.write_text(
-                src.read_text().replace(
-                    f"def PyInit_{name}", f"def PyInit__tmbv_{name}_g{generation}"
-                )
+                src.read_text().replace(f"def PyInit_{name}", f"def PyInit_{symbol}")
             )
             src = scratch
-        scope = "full" if ops is None else f"{len(ops)} ops"
+        scope = "full" if ops is None else next(iter(ops))
         import time as _time
 
         print(
-            f"torch-mojo-backend: compiling {name} [{scope}] on demand..."
+            f"torch-mojo-backend: compiling {name}.{scope} on demand..."
             + (f" t={_time.monotonic():.2f}" if os.environ.get("TMB_TRACE") else ""),
             file=sys.stderr,
         )
@@ -241,10 +257,8 @@ def _build_variant(
                 env=_build_env(),
             )
             if os.environ.get("TMB_TRACE"):
-                import time as _time
-
                 print(
-                    f"[TRACE] built {name} t={_time.monotonic():.2f}",
+                    f"[TRACE] built {name}.{scope} t={_time.monotonic():.2f}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -259,23 +273,21 @@ def _build_variant(
         return out
 
 
-def _import_mojo_module(name: str) -> ModuleType:
-    """Compatibility seam kept from the previous loader: the single point a
-    module's target variant is built (if needed) and loaded. Tests patch this
-    to simulate compiler failure / unavailable extensions."""
+def _import_mojo_module(
+    name: str,
+    ops: frozenset[str] | None = None,
+    dtypes: frozenset[str] | None = None,
+) -> ModuleType:
+    """Compatibility seam kept from the previous loaders: the single point a
+    unit is built (if needed) and loaded. Tests patch this to simulate
+    compiler failure / unavailable extensions."""
     if name != "tensor_holder":
         # tensor_holder registers the process-wide TensorHolder/TensorSpec
         # Python types every other module's spec ops consume; it must be
         # loaded and finalized before any kernel module.
         _STATES["tensor_holder"].ensure_loaded(None)
-    state = _STATES[name]
-    so_path = _build_variant(state.name, state.ops, state.dtypes, state.generation)
-    suffix = (
-        state.name
-        if state.generation == 0
-        else f"_tmbv_{state.name}_g{state.generation}"
-    )
-    return _load_extension(f"{__name__}.{suffix}", so_path)
+    so_path = _build_variant(name, ops, dtypes)
+    return _load_extension(f"{__name__}.{_unit_symbol(name, ops, dtypes)}", so_path)
 
 
 def _load_extension(module_name: str, so_path: Path) -> ModuleType:
@@ -298,8 +310,8 @@ class KernelPending(BaseException):
     at the dispatch boundary (main thread) or in the launcher's retry loop.
     """
 
-    def __init__(self, state: "_ModuleState", job: "_AsyncVariantJob") -> None:
-        super().__init__(f"kernel variant of {state.name} is compiling")
+    def __init__(self, state: "_ModuleState", job: "_AsyncOpJob") -> None:
+        super().__init__(f"a kernel unit of {state.name} is compiling")
         self.state = state
         self.job = job
 
@@ -323,181 +335,170 @@ class _dispatch_scope:
         _DISPATCH_TLS.depth -= 1
 
 
-class _AsyncVariantJob:
-    """One background build of a wider variant for one module. Requests that
-    arrive while it runs accumulate in the state's wanted-set; a follow-up
-    job starts automatically when this one completes with wants left over."""
+class _AsyncOpJob:
+    """One background build of one (module, op) unit. Every unit builds
+    independently through the slot pool — full parallelism across ops."""
 
-    def __init__(self, state: "_ModuleState") -> None:
-        self.state = state
+    def __init__(self, unit: "_OpUnit") -> None:
+        self.unit = unit
         self.done = threading.Event()
-        self.urgent = threading.Event()
         self.error: BaseException | None = None
 
     def run(self) -> None:
-        state = self.state
+        unit = self.unit
         try:
-            # Merge window: let demands accumulate briefly so one build
-            # covers several ops. A blocked waiter cuts the window short.
-            self.urgent.wait(timeout=0.5)
             with _ASYNC_BUILD_SLOTS:
-                with state.lock:
-                    profile = _PROFILE.get(state.name, {})
-                    first_build = state.module is None
-                    base_ops = set(state.ops or ())
-                    if first_build:
-                        base_ops |= set(profile.get("ops", ()))
-                    target_ops = frozenset(base_ops | state.wanted_ops)
-                    if state.wanted_all_dtypes or (
-                        not first_build and state.dtypes is None
-                    ):
-                        target_dtypes: frozenset[str] | None = None
-                    elif first_build:
-                        target_dtypes = frozenset(
-                            profile.get("dtypes", ()) or _DEFAULT_DTYPES
-                        )
-                    else:
-                        target_dtypes = state.dtypes
-                    generation = state.generation + 1
-                path = _build_variant(state.name, target_ops, target_dtypes, generation)
-                with state.lock:
-                    state.generation = generation
-                    state.ops = target_ops
-                    state.dtypes = target_dtypes
-                    state.module = _load_extension(
-                        f"{__name__}._tmbv_{state.name}_g{generation}", path
-                    )
-                    state.wanted_ops -= set(target_ops)
-                    if target_dtypes is None:
-                        state.wanted_all_dtypes = False
-                    proxy = _PROXIES[state.name]
-                    proxy.__dict__.clear()
-                    proxy.__dict__["_state"] = state
-                    proxy.__dict__["__name__"] = f"{__name__}.{state.name}"
+                with unit.lock:
+                    dtypes = None if unit.want_all_dtypes else unit.dtypes
+                ext = _import_mojo_module(
+                    unit.state.name, frozenset({unit.op}), dtypes
+                )
+                with unit.lock:
+                    unit.dtypes = dtypes
+                    unit.ext = ext
+                    # Invalidate the proxy's cached resolution for this op
+                    # so the next lookup binds the fresh extension.
+                    _PROXIES[unit.state.name].__dict__.pop(unit.op, None)
         except BaseException as exc:  # surfaced to every waiter
             self.error = exc
         finally:
-            with state.lock:
-                if state.async_job is self:
-                    state.async_job = None
-                more = state.wanted_ops or state.wanted_all_dtypes
+            with unit.lock:
+                if unit.job is self:
+                    unit.job = None
+                more = unit.want_all_dtypes and unit.dtypes is not None
             self.done.set()
             if more and self.error is None:
-                state.request_async()
+                unit.request_async()  # dtype demand arrived mid-build
 
     def wait(self) -> None:
-        self.urgent.set()  # a blocked consumer: start building now
         self.done.wait()
         if self.error is not None:
             raise self.error
 
 
+class _OpUnit:
+    """Build/load bookkeeping for one (module, op) compilation unit."""
+
+    def __init__(self, state: "_ModuleState", op: str) -> None:
+        self.state = state
+        self.op = op
+        self.lock = threading.Lock()
+        self.ext: ModuleType | None = None
+        profile = _PROFILE.get(state.name, {})
+        self.dtypes: frozenset[str] | None = frozenset(
+            profile.get("dtypes", ()) or _DEFAULT_DTYPES
+        )
+        self.want_all_dtypes = False
+        self.job: _AsyncOpJob | None = None
+
+    def _satisfied(self) -> bool:
+        return self.ext is not None and not (
+            self.want_all_dtypes and self.dtypes is not None
+        )
+
+    def request_async(self, all_dtypes: bool = False) -> _AsyncOpJob:
+        """Make sure a build covering the current demand is in flight."""
+        with self.lock:
+            if all_dtypes:
+                self.want_all_dtypes = True
+            job = self.job
+            if job is None:
+                if self._satisfied():  # already loaded: a completed no-op job
+                    job = _AsyncOpJob(self)
+                    job.done.set()
+                    return job
+                job = self.job = _AsyncOpJob(self)
+                threading.Thread(
+                    target=job.run,
+                    name=f"tmb-build-{self.state.name}.{self.op}",
+                    daemon=True,
+                ).start()
+            return job
+
+    def load_blocking(self, all_dtypes: bool = False) -> ModuleType:
+        """Build (if needed) and load this unit synchronously."""
+        with self.lock:
+            if all_dtypes:
+                self.want_all_dtypes = True
+            if self._satisfied():
+                return self.ext
+            dtypes = None if self.want_all_dtypes else self.dtypes
+        ext = _import_mojo_module(self.state.name, frozenset({self.op}), dtypes)
+        with self.lock:
+            if not self._satisfied():
+                self.dtypes = dtypes
+                self.ext = ext
+                _PROXIES[self.state.name].__dict__.pop(self.op, None)
+            return self.ext
+
+
 class _ModuleState:
-    """Loaded-variant bookkeeping for one .mojo module."""
+    """Bookkeeping for one .mojo module: a unit per demanded op (gated
+    modules) or one full extension (tensor_holder)."""
 
     def __init__(self, name: str) -> None:
         self.name = name
         self.lock = threading.Lock()
-        self.module: ModuleType | None = None
-        self.ops: frozenset[str] | None = None  # None = all
-        self.dtypes: frozenset[str] | None = None  # None = all
+        self.module: ModuleType | None = None  # full modules only
+        self.units: dict[str, _OpUnit] = {}
         self.demanded_ops: set[str] = set()
-        self.generation = 0
-        self.wanted_ops: set[str] = set()
-        self.wanted_all_dtypes = False
-        self.async_job: _AsyncVariantJob | None = None
 
-    def request_async(
-        self, add_op: str | None = None, all_dtypes: bool = False
-    ) -> _AsyncVariantJob:
-        """Record a demand and make sure a build covering it is in flight."""
-        if add_op is not None and add_op not in _registered_ops(self.name):
-            raise AttributeError(f"module {self.name!r} has no entry point {add_op!r}")
+    def unit(self, op: str) -> _OpUnit:
+        """Get or create the unit for `op` (validated against the source's
+        registration list so probes fail fast instead of building)."""
+        if op not in _registered_ops(self.name):
+            raise AttributeError(f"module {self.name!r} has no entry point {op!r}")
         with self.lock:
-            if add_op is not None:
-                self.wanted_ops.add(add_op)
-            if all_dtypes:
-                self.wanted_all_dtypes = True
-            job = self.async_job
-            if job is None:
-                job = self.async_job = _AsyncVariantJob(self)
-                threading.Thread(
-                    target=job.run, name=f"tmb-build-{self.name}", daemon=True
-                ).start()
-            return job
+            unit = self.units.get(op)
+            if unit is None:
+                unit = self.units[op] = _OpUnit(self, op)
+            return unit
+
+    def any_loaded_ext(self) -> ModuleType | None:
+        with self.lock:
+            for unit in self.units.values():
+                if unit.ext is not None:
+                    return unit.ext
+        return None
 
     def ensure_loaded(self, first_op: str | None) -> ModuleType:
-        if (
-            self.module is None
-            and self.name not in _FULL_MODULES
-            and _in_torch_dispatch()
-        ):
-            raise KernelPending(self, self.request_async(add_op=first_op))
-        with self.lock:
-            if self.module is None:
-                profile = _PROFILE.get(self.name, {})
-                if self.name in _FULL_MODULES:
-                    ops: frozenset[str] | None = None
-                    dtypes: frozenset[str] | None = None
-                else:
-                    wanted = set(profile.get("ops", ()))
-                    if first_op is not None:
-                        wanted.add(first_op)
-                    ops = frozenset(wanted)
-                    dtypes = frozenset(profile.get("dtypes", ()) or _DEFAULT_DTYPES)
-                self.ops, self.dtypes = ops, dtypes
-                self.module = _import_mojo_module(self.name)
-            return self.module
-
-    def escalate(
-        self, add_op: str | None = None, all_dtypes: bool = False
-    ) -> ModuleType:
+        """Full modules: build+load the complete extension (tensor_holder).
+        Gated modules: resolve the unit for `first_op`."""
         if self.name in _FULL_MODULES:
+            with self.lock:
+                if self.module is None:
+                    self.module = _import_mojo_module(self.name)
+                return self.module
+        if first_op is None:
             raise AttributeError(
-                f"{self.name} is built complete; no attribute {add_op!r}"
+                f"{self.name} is per-op loaded; an op name is required"
             )
-        if add_op is not None and add_op not in _registered_ops(self.name):
-            raise AttributeError(f"module {self.name!r} has no entry point {add_op!r}")
-        with self.lock:
-            ops = set(self.ops or ())
-            if add_op is not None:
-                ops.add(add_op)
-            dtypes = None if all_dtypes else self.dtypes
-            rollback = (self.ops, self.dtypes, self.generation, self.module)
-            self.generation += 1
-            self.ops = frozenset(ops)
-            self.dtypes = dtypes
-            try:
-                self.module = _import_mojo_module(self.name)
-            except BaseException:
-                self.ops, self.dtypes, self.generation, self.module = rollback
-                raise
-            proxy = _PROXIES[self.name]
-            proxy.__dict__.clear()
-            proxy.__dict__["_state"] = self
-            proxy.__dict__["__name__"] = f"{__name__}.{self.name}"
-            return self.module
+        unit = self.unit(first_op)
+        if unit.ext is None and _in_torch_dispatch():
+            raise KernelPending(self, unit.request_async())
+        return unit.load_blocking()
 
 
-def _wrap_call(state: _ModuleState, attr: str, fn: object) -> object:
+def _wrap_call(unit: _OpUnit, attr: str, fn: object) -> object:
     def call(*args: object, **kwargs: object) -> object:
         try:
             return fn(*args, **kwargs)
         except Exception as exc:  # Mojo errors surface as plain Exception
-            if "unsupported dtype" not in str(exc) or state.dtypes is None:
+            if "unsupported dtype" not in str(exc) or unit.dtypes is None:
                 raise
             if _in_torch_dispatch():
                 raise KernelPending(
-                    state, state.request_async(all_dtypes=True)
+                    unit.state, unit.request_async(all_dtypes=True)
                 ) from exc
-            module = state.escalate(all_dtypes=True)
+            module = unit.load_blocking(all_dtypes=True)
             return getattr(module, attr)(*args, **kwargs)
 
     return call
 
 
 class _ModuleProxy:
-    """Stands in for one extension module; escalates variants on demand."""
+    """Stands in for one extension module; routes each attribute to its
+    per-op unit, building units on demand."""
 
     def __init__(self, state: _ModuleState) -> None:
         self.__dict__["_state"] = state
@@ -509,17 +510,26 @@ class _ModuleProxy:
         state: _ModuleState = self.__dict__["_state"]
         if attr.startswith("__"):
             raise AttributeError(attr)
-        module = state.ensure_loaded(attr)
-        try:
-            value = getattr(module, attr)
-        except AttributeError:
-            if state.name not in _FULL_MODULES and _in_torch_dispatch():
-                raise KernelPending(state, state.request_async(add_op=attr)) from None
-            module = state.escalate(add_op=attr)
-            value = getattr(module, attr)
+        if attr not in _registered_ops(state.name):
+            # Not an entry point: serve module-level symbols from any loaded
+            # unit (every unit carries the ungated module-level defs).
+            ext = state.any_loaded_ext()
+            if ext is not None and hasattr(ext, attr):
+                value = getattr(ext, attr)
+                self.__dict__[attr] = value
+                return value
+            raise AttributeError(
+                f"module {state.name!r} has no entry point {attr!r}"
+            )
+        unit = state.unit(attr)
+        if unit.ext is None:
+            if _in_torch_dispatch():
+                raise KernelPending(state, unit.request_async())
+            unit.load_blocking()
         state.demanded_ops.add(attr)
+        value = getattr(unit.ext, attr)
         if type(value).__name__ == "builtin_function_or_method":
-            value = _wrap_call(state, attr, value)
+            value = _wrap_call(unit, attr, value)
         self.__dict__[attr] = value  # later lookups skip __getattr__
         return value
 
@@ -562,25 +572,23 @@ def __getattr__(name: str) -> object:
             return holder
         proxy = _PROXIES[name]
         state = _STATES[name]
-        if name in _CACHED_IN_DICT and state.module is not None:
+        if name in _CACHED_IN_DICT and any(
+            u.ext is not None for u in state.units.values()
+        ):
             # A previously *successful* resolution was explicitly deleted
             # from the package dict (tests use this to force a fresh
-            # import): drop the loaded module so resolution goes back
+            # import): drop every loaded unit so resolution goes back
             # through _import_mojo_module.
             with state.lock:
-                state.module = None
+                state.units.clear()
             proxy.__dict__.clear()
             proxy.__dict__["_state"] = state
             proxy.__dict__["__name__"] = f"{__name__}.{name}"
             _CACHED_IN_DICT.discard(name)
-        # Import at resolution time, like a real module attribute: an
-        # unavailable extension raises HERE and is not cached, so callers'
-        # ImportError handling and failure-flag caching behave as before.
-        # Under __torch_dispatch__ resolution stays lazy instead — the first
-        # attribute access carries the op name, so the variant built covers
-        # it (resolution alone would build a useless empty variant).
+        # Resolution is always lazy: units are per-op, so nothing can be
+        # built until an attribute access names the op. Build errors
+        # therefore surface at first attribute use, not at resolution.
         if not _in_torch_dispatch():
-            state.ensure_loaded(None)
             globals()[name] = proxy
             _CACHED_IN_DICT.add(name)
         return proxy
