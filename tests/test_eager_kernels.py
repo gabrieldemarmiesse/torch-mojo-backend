@@ -522,6 +522,24 @@ def test_fast_native_layer_norm_fp32_gpu_nonfinite_rows(mojo_gpu, cols, value):
     assert torch.isnan(rstd.cpu()).all()
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cols", [5, 128, 257, 1023, 1024, 2047, 4096])
+def test_fast_log_softmax_narrow_rows_match_cpu(mojo_device, dtype, cols):
+    # Rows narrower than one full block pass (threads * simd_width) leave
+    # threads with no elements; their -inf running max must not NaN the sum.
+    x = torch.randn(8, cols).to(dtype)
+    result = torch.log_softmax(x.to(mojo_device), dim=-1)
+    torch.testing.assert_close(result.cpu(), torch.log_softmax(x, dim=-1))
+
+
+def test_fast_log_softmax_masked_rows_match_cpu(mojo_device):
+    # -inf logits (masking) must not NaN-poison the online rescale.
+    x = torch.randn(4, 512)
+    x[:, ::3] = float("-inf")
+    result = torch.log_softmax(x.to(mojo_device), dim=-1)
+    torch.testing.assert_close(result.cpu(), torch.log_softmax(x, dim=-1))
+
+
 def test_fast_native_layer_norm_bf16_gpu_preserves_generic_path(mojo_gpu):
     input = torch.randn(3, 65).bfloat16()
     weight = torch.randn(65).bfloat16()
