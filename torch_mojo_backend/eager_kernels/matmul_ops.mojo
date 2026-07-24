@@ -3275,8 +3275,8 @@ def _matmul_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _matmul_go(args[0], args[1], args[2], args[3], args[4], args[5])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -3288,8 +3288,8 @@ def _bmm_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _bmm_go(args[0], args[1], args[2], args[3], args[4], args[5])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 

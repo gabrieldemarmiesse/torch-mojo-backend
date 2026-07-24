@@ -624,12 +624,13 @@ def __getattr__(name: str) -> object:
             proxy.__dict__["_state"] = state
             proxy.__dict__["__name__"] = f"{__name__}.{name}"
             _CACHED_IN_DICT.discard(name)
-        # Resolution is always lazy: units are per-op, so nothing can be
-        # built until an attribute access names the op. Build errors
-        # therefore surface at first attribute use, not at resolution.
-        if not _in_torch_dispatch():
-            globals()[name] = proxy
-            _CACHED_IN_DICT.add(name)
+        # Resolution is always lazy: units are per-op, so nothing is built
+        # until an attribute access names the op — build errors surface at
+        # first attribute use, not at resolution. Caching the proxy is
+        # therefore free in every context (it performs no work), and keeps
+        # `eager_kernels.__dict__.get(<module>)` a valid presence probe.
+        globals()[name] = proxy
+        _CACHED_IN_DICT.add(name)
         return proxy
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

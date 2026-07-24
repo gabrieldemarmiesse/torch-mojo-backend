@@ -783,8 +783,8 @@ def _bitwise_not_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _bitwise_not_go(args[0], args[1], args[2], args[3], args[4])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -882,8 +882,8 @@ def _isin_dispatcher(
             args[6],
             args[7],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -995,8 +995,8 @@ def _clamp_scalar_dispatcher(
             args[7],
             args[8],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -1216,8 +1216,8 @@ def _ternary_bcast_dispatcher[
             args[6],
             args[7],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 

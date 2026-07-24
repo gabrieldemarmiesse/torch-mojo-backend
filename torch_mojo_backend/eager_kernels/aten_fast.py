@@ -4496,11 +4496,11 @@ def _resolve_bf16_bridge(name: str):
     """Resolve a BF16 bridge without compiling a known-incomplete module."""
     global _BF16_IMPORT_FAILED
 
+    if _BF16_IMPORT_FAILED:
+        return None
     module = eager_kernels.__dict__.get("bf16_matmul_ops")
     if module is None:
-        if _BF16_IMPORT_FAILED or not all(
-            path.is_file() for path in _BF16_SOURCE_PATHS
-        ):
+        if not all(path.is_file() for path in _BF16_SOURCE_PATHS):
             return None
         try:
             module = eager_kernels.bf16_matmul_ops
@@ -4509,7 +4509,12 @@ def _resolve_bf16_bridge(name: str):
             return None
     try:
         return getattr(module, name)
-    except (AttributeError, ImportError):
+    except ImportError:
+        # Per-op units build at attribute access: an ImportError here is a
+        # compiler/extension failure, permanent for this process.
+        _BF16_IMPORT_FAILED = True
+        return None
+    except AttributeError:
         return None
 
 
@@ -4517,11 +4522,11 @@ def _resolve_tf32_bridge(name: str):
     """Resolve a TF32 bridge without compiling a known-incomplete module."""
     global _TF32_IMPORT_FAILED
 
+    if _TF32_IMPORT_FAILED:
+        return None
     module = eager_kernels.__dict__.get("tf32_matmul_ops")
     if module is None:
-        if _TF32_IMPORT_FAILED or not all(
-            path.is_file() for path in _TF32_SOURCE_PATHS
-        ):
+        if not all(path.is_file() for path in _TF32_SOURCE_PATHS):
             return None
         try:
             module = eager_kernels.tf32_matmul_ops
@@ -4530,7 +4535,12 @@ def _resolve_tf32_bridge(name: str):
             return None
     try:
         return getattr(module, name)
-    except (AttributeError, ImportError):
+    except ImportError:
+        # Per-op units build at attribute access: an ImportError here is a
+        # compiler/extension failure, permanent for this process.
+        _TF32_IMPORT_FAILED = True
+        return None
+    except AttributeError:
         return None
 
 

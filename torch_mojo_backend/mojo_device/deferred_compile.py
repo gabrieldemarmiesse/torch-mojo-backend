@@ -347,21 +347,23 @@ def _execute(item: tuple, blocking: bool = True) -> None:
     """Run one deferred op for real (main thread), then back-fill the
     placeholder outputs. Non-blocking mode propagates KernelPending so the
     pump can stop at a head-of-line item whose kernel is still compiling."""
-    func, args, kwargs, placeholders, out_spec, taint_keys, written = item
+    func, args, kwargs, placeholders, out_spec, taint_keys, written, precision = item
     depth = getattr(_TLS, "exec_depth", 0)
     _TLS.exec_depth = depth + 1
     _trace(f"exec-enter d={depth} {func._schema.name}")
+    caller_precision = torch.get_float32_matmul_precision()
     try:
-        # no_grad: autograd bookkeeping for this op already happened at
-        # dispatch time (above the python key); the replay re-runs only the
-        # kernel, possibly outside the caller's original grad context (an
-        # optimizer's no_grad step replayed at a later drain would
-        # otherwise trip the in-place-on-leaf check). Version counters of
-        # the written targets are preserved for the same reason: versions
-        # are metadata, and metadata follows DISPATCH order — _defer bumped
-        # them when the mutation was queued, so a bump here (mid-drain,
-        # possibly after a later op already saved the tensor for backward)
-        # would trip the saved-variable version check.
+        # The replay must reproduce the DISPATCH-TIME execution environment,
+        # not the drain point's: restore the float32 matmul precision the
+        # caller had (kernel-tier gates read it at execution time), run
+        # under no_grad (autograd bookkeeping already happened above the
+        # python key; an optimizer's no_grad step replayed at a later drain
+        # would otherwise trip the in-place-on-leaf check), and preserve the
+        # written targets' version counters (versions are metadata, and
+        # metadata follows DISPATCH order — _defer bumped them when the
+        # mutation was queued; a bump here, possibly after a later op saved
+        # the tensor for backward, would trip the saved-variable check).
+        torch.set_float32_matmul_precision(precision)
         with _replay_scope(), torch.no_grad():
             with torch.autograd._unsafe_preserve_version_counter(tuple(written)):
                 while True:
@@ -373,6 +375,7 @@ def _execute(item: tuple, blocking: bool = True) -> None:
                             raise
                         pending.job.wait()
     finally:
+        torch.set_float32_matmul_precision(caller_precision)
         _TLS.exec_depth = depth
     # NOTE: no device reads (.cpu()/.item()) in replay instrumentation —
     # a device read here re-enters dispatch as a sync op and recursively
@@ -527,7 +530,16 @@ def _defer(func, args, kwargs):
     # optimizer ops returning ()).
     taint_keys = _taint(fresh + written)
     _RT.submit(
-        (func, args, dict(kwargs), list(placeholders), out_spec, taint_keys, written)
+        (
+            func,
+            args,
+            dict(kwargs),
+            list(placeholders),
+            out_spec,
+            taint_keys,
+            written,
+            torch.get_float32_matmul_precision(),
+        )
     )
     # The mutation's semantic effect on version counters belongs to NOW
     # (dispatch order), not to the replay: later ops may save the target
@@ -565,7 +577,16 @@ def _defer_view(func, args, kwargs):
     if materialized:
         taint_keys = _taint(materialized)
         _RT.submit(
-            (func, args, dict(kwargs), list(out_flat), out_spec, taint_keys, [])
+            (
+                func,
+                args,
+                dict(kwargs),
+                list(out_flat),
+                out_spec,
+                taint_keys,
+                [],
+                torch.get_float32_matmul_precision(),
+            )
         )
     return result
 

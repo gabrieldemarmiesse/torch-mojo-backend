@@ -54,6 +54,7 @@ from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.sys.info import has_accelerator
 
 from op_utils import (
+    _spec_unsupported,
     _enqueue_cached,
     _make_ptr,
     _raw_ctx,
@@ -604,8 +605,8 @@ def _nll_forward_dispatcher(
             args[7],
             args[8],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -627,8 +628,8 @@ def _nll_backward_dispatcher(
             args[7],
             args[8],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 

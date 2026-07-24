@@ -2296,8 +2296,8 @@ def _batch_norm_dispatcher(
             args[7],
             args[8],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2319,8 +2319,8 @@ def _layer_norm_dispatcher(
             args[7],
             args[8],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2342,8 +2342,8 @@ def _softmax_rows_dispatcher(
             args[7],
             args[8],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2357,8 +2357,8 @@ def _attn_decode_dispatcher(
         _attn_decode_go(
             args[0], args[1], args[2], args[3], args[4], args[5], args[6]
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2370,8 +2370,8 @@ def _max_pool2d_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _max_pool2d_go(args[0], args[1], args[2], args[3], args[4], args[5])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2383,8 +2383,8 @@ def _avg_pool2d_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _avg_pool2d_go(args[0], args[1], args[2], args[3], args[4])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2396,8 +2396,8 @@ def _adaptive_avg_pool2d_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _adaptive_avg_pool2d_go(args[0], args[1], args[2], args[3], args[4])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2419,8 +2419,8 @@ def _group_norm_dispatcher(
             args[7],
             args[8],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2432,8 +2432,8 @@ def _upsample_bilinear2d_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _upsample_bilinear2d_go(args[0], args[1], args[2], args[3], args[4])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2454,8 +2454,8 @@ def _gather0_dispatcher(
             args[6],
             args[7],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2467,8 +2467,8 @@ def _all_bool_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _all_bool_go(args[0], args[1], args[2], args[3])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -2480,8 +2480,8 @@ def _any_bool_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _any_bool_go(args[0], args[1], args[2], args[3])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 

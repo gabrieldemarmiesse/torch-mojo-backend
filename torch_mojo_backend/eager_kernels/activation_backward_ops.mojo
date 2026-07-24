@@ -30,6 +30,7 @@ from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.sys.info import has_accelerator
 
 from op_utils import (
+    _spec_unsupported,
     _enqueue_cached,
     _make_ptr,
     _raw_ctx,
@@ -363,8 +364,8 @@ def _gelu_backward_dispatcher(
             args[4],
             args[5],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -411,8 +412,8 @@ def _gelu_backward_bf16_dispatcher(
             args[4],
             args[5],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 

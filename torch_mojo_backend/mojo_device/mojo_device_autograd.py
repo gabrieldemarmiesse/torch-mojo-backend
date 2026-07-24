@@ -435,12 +435,6 @@ def _scaled_dot_product_attention_autograd(
     needs_backward = torch.is_grad_enabled() and (
         query.requires_grad or key.requires_grad or value.requires_grad
     )
-    # This impl runs ABOVE __torch_dispatch__ and (below) reads q/k/v
-    # payloads directly through aten_fast — invisible to the deferred-compile
-    # queue, so any still-pending producer must be replayed first.
-    from . import deferred_compile
-
-    deferred_compile.wait_for([query, key, value, attn_mask])
     aten_fast = _fast()
     # The eligible FA4 regime already implements PyTorch's lower flash forward
     # and backward pair. Dispatch through it so generated autograd owns the
@@ -453,9 +447,18 @@ def _scaled_dot_product_attention_autograd(
         )
         is not None
     ):
+        # Redispatches through __torch_dispatch__: the deferred-compile
+        # layer sees the flash op and orders/queues it like any other.
         return torch.ops.aten._scaled_dot_product_flash_attention.default(
             query, key, value, dropout_p, is_causal, False, scale=scale
         )[0]
+    # The remaining paths read q/k/v payloads directly through aten_fast,
+    # ABOVE __torch_dispatch__ — invisible to the deferred-compile queue —
+    # so any still-pending producer must be replayed first. (The eligibility
+    # check above is metadata-only and safe on pending tensors.)
+    from . import deferred_compile
+
+    deferred_compile.wait_for([query, key, value, attn_mask])
     if not needs_backward:
         return _require_handled(
             aten_fast.fast_aten_scaled_dot_product_attention(

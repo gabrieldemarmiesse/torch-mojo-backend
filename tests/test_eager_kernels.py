@@ -3515,9 +3515,10 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     assert [path.name for path in aten_fast._BF16_SOURCE_PATHS] == [
         "bf16_matmul_ops.mojo",
         "bf16_gemm_v3_kernels.mojo",
+        "bf16_gemm_tn_v4_kernels.mojo",
         "bf16_gemm_kernels.mojo",
     ]
-    bridge_path, v3_path, fallback_path = aten_fast._BF16_SOURCE_PATHS
+    bridge_path, v3_path, _v4_path, fallback_path = aten_fast._BF16_SOURCE_PATHS
     bridge_source = bridge_path.read_text()
     v3_source = v3_path.read_text()
     fallback_source = fallback_path.read_text()

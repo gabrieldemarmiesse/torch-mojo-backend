@@ -1450,8 +1450,8 @@ def _permute_copy_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _permute_copy_go(args[0], args[1], args[2], args[3], args[4], args[5])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -1472,8 +1472,8 @@ def _narrow_copy_dst_dispatcher(
             args[6],
             args[7],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -1487,8 +1487,8 @@ def _where_select_dispatcher(
         _where_select_go(
             args[0], args[1], args[2], args[3], args[4], args[5], args[6]
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -1502,8 +1502,8 @@ def _tile_copy_dispatcher(
         _tile_copy_go(
             args[0], args[1], args[2], args[3], args[4], args[5], args[6]
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -1525,8 +1525,8 @@ def _triangular_copy_dispatcher(
             args[7],
             args[8],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -1548,8 +1548,8 @@ def _gather_rows_dispatcher(
             args[7],
             args[8],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -1570,8 +1570,8 @@ def _scatter_dim_dispatcher(
             args[6],
             args[7],
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 

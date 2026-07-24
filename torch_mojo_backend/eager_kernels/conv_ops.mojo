@@ -16,6 +16,7 @@ from std.python.bindings import PythonModuleBuilder
 from std.utils.coord import Coord as StdCoord
 
 from op_utils import (
+    _spec_unsupported,
     FLOAT_DTYPES,
     _make_ptr,
     _parallel_for,
@@ -189,8 +190,8 @@ def _im2col_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _im2col_go(args[0], args[1], args[2], args[3], args[4])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -259,8 +260,8 @@ def _bias_add_chan_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _bias_add_chan_go(args[0], args[1], args[2], args[3], args[4])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
