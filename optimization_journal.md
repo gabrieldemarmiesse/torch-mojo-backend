@@ -1767,3 +1767,94 @@ its LDS lifetime, i.e. new kernel work inside the core rather than around it.
 Larger macro tiles are the cheap version of the same idea and were measured
 worse: 128x256 and 256x128 halve the workgroup count but take 2.2-2.8x as long
 per workgroup, because two pipeline stages of them leave one workgroup per CU.
+
+## Review finding R4 — the causal softmax's -inf sentinel, and a NaN-blind gate
+
+**Hypothesis.** `scripts/sdpa_correctness.py` (the whole-op gate against a
+PyTorch-ROCm FP32 reference) reported `nan` for the Mojo forward output and all
+three gradients on every causal case whose row count reaches the warp-softmax
+regime, while `head1_small` (129 rows, below the regime) passed. So the new
+causal row softmax produces NaN, and `bench_attention_softmax` passed it anyway.
+
+**Predicted effect.** If the cause is the online rescaling, it must involve a
+lane or vector slot with no live column, because rows whose live prefix covers
+every lane cannot have an unused accumulator.
+
+**Measured effect.** Exactly that, and it is one expression. The running maximum
+was initialized to `Float32.MIN`, which in Mojo is `-inf`, not the most negative
+finite float. A lane with no live column keeps the sentinel in both `run_max` and
+`lane_max`, so the rescaling computes `exp(run_max - lane_max)` =
+`exp(-inf - -inf)` = `exp(NaN)` = NaN, multiplies it by a zero partial sum to get
+NaN rather than 0, and the warp reduction then poisons the whole row. Every row
+with a live prefix shorter than `WARP_SIZE * VEC` = 512 columns was NaN, which at
+`q_len = 1024` is half of them. `Float32.MIN_FINITE` makes the same expression
+`exp(0) = 1` times a zero sum.
+
+**And the harness gate could not see it.** `_max_abs_diff` kept a running
+`if d > worst`, and `NaN > worst` is false, so a NaN difference was silently
+dropped; worse, the harness's own scalar reference used the same `Float32.MIN`
+sentinel, so on the rows that were NaN *both* sides were NaN. The gate now maps
+any non-finite difference, and any non-finite operand on either side, to the
+largest float, so it cannot be ignored. With that gate the reported forward error
+at the nanoGPT shape moves 8e-6 -> 3.1e-5 — the 8e-6 was the error over the
+subset of rows that were not NaN.
+
+**Decision.** Accept both fixes. The lesson for this harness family is that a
+maximum-absolute-difference gate is not a NaN detector unless it is written to
+be one, and that a reference sharing a sentinel convention with the kernel under
+test can share its bug.
+
+## End-to-end validation — 2026-07-25, SDPA target
+
+Same session, same seed, `bench_nanogpt_train.py --warmup 3 --iters 10
+--print-loss`:
+
+| backend | step median | tokens/s | final loss |
+|---|---:|---:|---:|
+| PyTorch-ROCm | 156.817 ms | 313 435 | 10.621461 |
+| eager Mojo, before this target | 661.369 ms | 74 319 | 10.636456 |
+| eager Mojo, after | **420.566 ms** | 116 871 | 10.628205 |
+
+The step improved by 240.8 ms and the loss moved from 10.6365 to 10.6282, i.e.
+*toward* PyTorch-ROCm's 10.6215 rather than away from it, which is the
+independent evidence that the rewritten kernels are not trading accuracy for
+speed. (Run-to-run loss noise on this backend is about +-0.002, so the 0.008
+move is signal.)
+
+Re-profiled with `profile_nanogpt_train_aten.py --device mojo --output-dir
+current_bench_train/mojo_v3` and compared against `current_bench_train/rocm`:
+
+| target | before | after | rocm | ratio before | ratio after |
+|---|---:|---:|---:|---:|---:|
+| SDPA (backward) | 239.279 | **66.393** | 33.953 | 7.05x | **1.96x** |
+| SDPA (forward) | 105.068 | **36.997** | 9.083 | 11.57x | **4.07x** |
+| whole step | 661.4 | 421.6 | 157.0 | 4.21x | 2.68x |
+
+Neither reaches the 1.02 acceptance ratio. The two remaining SDPA items are both
+measured:
+
+1. **`data_movement_ops__permute_copy` is 25.2 ms/step and is now the largest
+   single kernel in the SDPA backward** — larger than any of its GEMMs. It is the
+   four transposes the decomposition needs (dO^T and Q^T going in, dV^T and dK^T
+   coming out), each `[576, 1024, 64] <-> [576, 64, 1024]`, i.e. 75 MB per
+   transpose, 600 MB of traffic per layer. 7.2 GB/step in 25.2 ms is **286 GB/s**
+   on a part whose spec is 5.3 TB/s, so this is the same uncoalesced
+   element-at-a-time transpose that Change 12 fixed for the *unbatched* 2-D case
+   (141 -> 12 ms/step) with a tiled LDS staging pass. `_copy_strided`'s fast path
+   requires every leading extent to be 1, so a batched transpose does not reach
+   it and lands on `permute_copy` instead. Extending that fast path with a batch
+   axis on `block_idx.z` should take this to roughly 4 ms/step, i.e. **about
+   21 ms/step**, and would move the SDPA backward ratio from 1.96x to about
+   1.35x. Not attempted here.
+2. **The workgroup launch rate**, quantified in experiment AA. At 35-42
+   workgroups per microsecond the six batched GEMMs cost 50.3 ms/step where
+   `torch.bmm` costs 36.6, and no amount of causal skipping helps until the
+   kernel becomes persistent.
+
+Beyond those two the decomposition is at its floor: 36.997 ms of forward is
+11.4 (scores GEMM) + 9.9 (row softmax) + 7.4 (PV GEMM) + copies, against ROCm's
+single 9.1 ms fused kernel, which never materializes the 1.208 GB score matrix at
+all. The README's floor estimate of about 25 ms/step for a causal decomposition
+assumed causal skipping would work; experiment AA is why it does not, and with
+`permute_copy` fixed the honest floor for this decomposition on this hardware is
+about 75 ms/step for both directions against ROCm's 43.

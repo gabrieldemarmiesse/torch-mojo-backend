@@ -1158,10 +1158,16 @@ def _amd_dynamic_mfma_gemm[
 #                 indices from `c * BN` up, so the K loop starts late.
 #
 # The last two are exact whatever the consumer does, because the skipped
-# contraction indices multiply exact zeros.  CAUSAL_OUT leaves the masked half of
-# its output undefined, so it may only be selected when the caller knows the
-# consumer is causal-aware; `_causal_bmm_dispatch` takes that as an argument
-# rather than assuming it.
+# contraction indices multiply exact zeros, and they are what production selects.
+#
+# CAUSAL_OUT is implemented and exercised by `bench_attention_bmm --causal=1`, but
+# it is deliberately *not* selected: at the attention shapes it measures slower
+# than the dense GEMM (895.05 -> 901.91 us), because these GEMMs are bound by the
+# rate at which the hardware can launch workgroups rather than by the work inside
+# one, so removing work from a workgroup that is still launched buys nothing. See
+# optimization_journal.md, diagnostic experiment AA. It also leaves the masked
+# half of its output undefined, so a caller would additionally have to know its
+# consumer reads no more than each row's live prefix.
 comptime CAUSAL_NONE = 0
 comptime CAUSAL_OUT = 1
 comptime CAUSAL_A_ROWS = 2
@@ -1199,10 +1205,10 @@ def _amd_batched_mfma_kernel[
     var col_block = Int(block_idx.x)
     var c_ptr = c_base + z * c_bstride
 
-    # A shortened or late-starting K range, in units of elements.  BM, BN and
-    # BLOCK_K are all multiples of BLOCK_K and the dispatch guarantees
-    # `k % 32 == 0`, so every bound below stays a whole number of K tiles and
-    # the loader never reads past the operand.
+    # A shortened or late-starting K range, in elements.  BM and BN are multiples
+    # of BLOCK_K and the dispatch guarantees `k % 32 == 0`, so every bound below
+    # is a whole number of K tiles and the loader never reads past the operand:
+    # it consumes exactly `ceildiv(k_live, BLOCK_K)` tiles from the offset base.
     var k_off = 0
     var k_live = k
     comptime if CAUSAL == CAUSAL_OUT:

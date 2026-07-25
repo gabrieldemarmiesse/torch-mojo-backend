@@ -11,6 +11,15 @@ dV, at the real nanoGPT shape and at shapes that are not multiples of any tile.
 The FP32 reference deliberately uses PyTorch's math SDPA backend, so it is a
 plain ``softmax(QK^T / sqrt(d)) V`` in FP32 rather than a second fused kernel.
 
+Known result, unchanged by the causal work: the ``noncausal`` case fails on the
+output, dK and dV at 2.3-3.1x. That path does not use the causal row softmax; it
+uses MAX's ``nn.softmax`` with the scale folded into an input lambda that rounds
+``scores * scale`` back to the operand dtype before the reduction --- a second
+BF16 rounding PyTorch's math backend does not pay, because it scales Q before the
+BMM. The lambda's own comment already flags that round-trip as a known trade-off.
+Every causal case, which is what the rewritten kernel handles and which keeps the
+scaled value in float32, comes in at 0.76-1.84x.
+
 Usage:
     uv run --no-sync python scripts/sdpa_correctness.py
     uv run --no-sync python scripts/sdpa_correctness.py --case nanogpt

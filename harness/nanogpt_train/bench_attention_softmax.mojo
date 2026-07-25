@@ -137,7 +137,14 @@ def _max_abs_diff(
     var stride = Int(grid_dim.x) * BLOCK
     var worst = Float32(0)
     while index < count:
-        var d = abs(a[index].cast[F32]() - b[index].cast[F32]())
+        var av = a[index].cast[F32]()
+        var bv = b[index].cast[F32]()
+        var d = abs(av - bv)
+        # `NaN > worst` is false, so a plain running max silently passes a kernel
+        # that produced NaN.  Map any non-finite difference to +inf so it cannot
+        # be ignored, and catch a NaN that both sides happen to share.
+        if not (d == d) or not (av == av) or not (bv == bv):
+            d = Float32.MAX
         if d > worst:
             worst = d
         index += stride

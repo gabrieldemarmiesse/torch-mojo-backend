@@ -1,0 +1,72 @@
+{
+  "rocm_us_per_step": 157036.6526666666,
+  "mojo_us_per_step": 421553.5599999989,
+  "overall_ratio": 2.684427825233949,
+  "positive_gap_us_per_step": 270643.39166666666,
+  "target_ratio": 1.02,
+  "work_order": [
+    {
+      "target": "Linear GEMM (backward)",
+      "rocm_us_per_step": 43646.38133333331,
+      "mojo_us_per_step": 186521.58966666667,
+      "ratio": 4.273472026058154,
+      "gap_us_per_step": 142875.20833333337
+    },
+    {
+      "target": "Linear GEMM (forward)",
+      "rocm_us_per_step": 24031.968333333334,
+      "mojo_us_per_step": 72434.81099999997,
+      "ratio": 3.0141022988753647,
+      "gap_us_per_step": 48402.842666666635
+    },
+    {
+      "target": "SDPA (backward)",
+      "rocm_us_per_step": 33952.899000000005,
+      "mojo_us_per_step": 66393.08866666666,
+      "ratio": 1.955446828462767,
+      "gap_us_per_step": 32440.189666666658
+    },
+    {
+      "target": "SDPA (forward)",
+      "rocm_us_per_step": 9082.748333333333,
+      "mojo_us_per_step": 36997.39666666666,
+      "ratio": 4.07337022989921,
+      "gap_us_per_step": 27914.648333333327
+    },
+    {
+      "target": "Copies / dtype casts / layout",
+      "rocm_us_per_step": 11441.552000000007,
+      "mojo_us_per_step": 26010.559999999994,
+      "ratio": 2.2733419382265603,
+      "gap_us_per_step": 14569.007999999987
+    },
+    {
+      "target": "Cross entropy (backward)",
+      "rocm_us_per_step": 4419.333666666666,
+      "mojo_us_per_step": 7243.758666666666,
+      "ratio": 1.6391065289556095,
+      "gap_us_per_step": 2824.4249999999993
+    },
+    {
+      "target": "Residual / elementwise add",
+      "rocm_us_per_step": 4460.217333333333,
+      "mojo_us_per_step": 5284.006333333333,
+      "ratio": 1.1846970536263852,
+      "gap_us_per_step": 823.7889999999998
+    },
+    {
+      "target": "GELU (forward)",
+      "rocm_us_per_step": 2183.130666666667,
+      "mojo_us_per_step": 2636.123999999999,
+      "ratio": 1.2074971233971026,
+      "gap_us_per_step": 452.993333333332
+    },
+    {
+      "target": "Cross entropy (forward)",
+      "rocm_us_per_step": 4155.947666666667,
+      "mojo_us_per_step": 4496.235,
+      "ratio": 1.08187960018425,
+      "gap_us_per_step": 340.28733333333275
+    }
+  ]
+}

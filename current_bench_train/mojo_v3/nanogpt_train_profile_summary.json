@@ -1,0 +1,50 @@
+{
+  "environment": {
+    "torch": "2.11.0+rocm7.2",
+    "hip": "7.2.26015",
+    "hardware": "AMD Instinct MI300X VF",
+    "execution_backend": "Mojo/MAX (Device(type=gpu,id=0))",
+    "torch_device": "mojo"
+  },
+  "workload": {
+    "model": "nanoGPT GPT-2 124M",
+    "batch_size": 48,
+    "block_size": 1024,
+    "n_layer": 12,
+    "n_head": 12,
+    "n_embd": 768,
+    "bias": false,
+    "dtype": "bfloat16",
+    "fused_adamw": "on",
+    "grad_clip": 1.0,
+    "tokens_per_step": 49152
+  },
+  "unprofiled": {
+    "step_ms_median": 421.50705005042255,
+    "tokens_per_second": 116610.14921131264
+  },
+  "profile": {
+    "profiled_steps": 3,
+    "self_gpu_us_total": 955594.5210000012,
+    "self_gpu_us_per_step": 318531.5070000004,
+    "gpu_trace": {
+      "gpu_activity_count": 3495,
+      "span_us": 1265937.742,
+      "busy_us": 1265771.8730000018,
+      "idle_us": 165.86899999831803,
+      "idle_pct": 0.01310246108440284,
+      "gap_count": 3034,
+      "gaps_over_50us": 1,
+      "max_gap_us": 87.64000000000004
+    }
+  },
+  "phases_ms": {
+    "forward_ms": 130.44611550867558,
+    "forward_backward_ms": 419.62994495406747,
+    "through_clip_ms": 420.1633920893073,
+    "full_step_ms": 421.722681960091,
+    "backward_ms": 289.1838294453919,
+    "clip_grad_norm_ms": 0.5334471352398396,
+    "optimizer_ms": 1.5592898707836866
+  }
+}

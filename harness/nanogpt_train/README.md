@@ -9,25 +9,27 @@ Measured on an MI300X VF with PyTorch 2.11.0+rocm7.2 and MAX
 
 | backend | step | tokens/s |
 |---|---:|---:|
-| PyTorch-ROCm | 156.64 ms | 313 799 |
+| PyTorch-ROCm | 156.82 ms | 313 435 |
 | eager Mojo device, initial | 921.39 ms | 53 346 |
-| eager Mojo device, after the Linear GEMM work | 661.86 ms | 74 264 |
+| eager Mojo device, after the Linear GEMM work | 661.37 ms | 74 319 |
+| eager Mojo device, after the SDPA work | 420.57 ms | 116 871 |
 
 Both backends are GPU-bound (trace idle 0.01%), so GPU kernel time is the unit
 of comparison. Current ranked gap per step, from
-`current_bench_train/comparison_v2/nanogpt_train_kernel_gap.csv`:
+`current_bench_train/comparison_v3/nanogpt_train_kernel_gap.csv`:
 
 | target | mojo | rocm | ratio | share of gap |
 |---|---:|---:|---:|---:|
-| SDPA (backward) | 239.28 ms | 33.95 ms | 7.05x | 40.2% |
-| Linear GEMM (backward) | 186.22 ms | 43.65 ms | 4.27x | 27.9% |
-| SDPA (forward) | 105.07 ms | 9.08 ms | 11.57x | 18.8% |
-| Linear GEMM (forward) | 72.29 ms | 24.03 ms | 3.01x | 9.4% |
-| Copies / dtype casts | 26.03 ms | 11.44 ms | 2.28x | 2.9% |
-| everything else | 32.11 ms | 34.87 ms | 0.92x | 0% |
+| Linear GEMM (backward) | 186.52 ms | 43.65 ms | 4.27x | 52.8% |
+| Linear GEMM (forward) | 72.44 ms | 24.03 ms | 3.01x | 17.9% |
+| SDPA (backward) | 66.39 ms | 33.95 ms | 1.96x | 12.0% |
+| SDPA (forward) | 37.00 ms | 9.08 ms | 4.07x | 10.3% |
+| Copies / dtype casts | 26.01 ms | 11.44 ms | 2.27x | 5.4% |
+| everything else | 33.19 ms | 34.87 ms | 0.95x | 0% |
 
-The initial table, before the Linear GEMM work, was SDPA backward 239.24,
-Linear GEMM backward 346.89, Linear GEMM forward 171.84, SDPA forward 105.10.
+The initial table, before any of this work, was SDPA backward 239.24, Linear GEMM
+backward 346.89, Linear GEMM forward 171.84, SDPA forward 105.10; after the Linear
+GEMM work and before the SDPA work, SDPA backward 239.28 and SDPA forward 105.07.
 Mojo is already *faster* than PyTorch-ROCm on LayerNorm forward and backward,
 GELU backward, fused AdamW, gradient clipping and concat.
 
@@ -232,6 +234,27 @@ to compute, softmax and re-read all of it.
 | the same six, with the two accepted causal regimes | - | 50.30 ms/step |
 | forward row softmax | 41.9 ms/step | 9.98 ms/step |
 | fused softmax backward (was a 5-kernel BF16 fallback) | ~100 ms/step | 9.34 ms/step |
+| **whole SDPA forward, in situ** | **105.07 ms/step** | **37.00 ms/step** |
+| **whole SDPA backward, in situ** | **239.28 ms/step** | **66.39 ms/step** |
+| whole training step | 661.37 ms | 420.57 ms |
+
+Neither direction reaches the 1.02 acceptance ratio (4.07x forward, 1.96x
+backward against ROCm's fused kernels). The two things that stand between here
+and that, both measured:
+
+* **`data_movement_ops__permute_copy` is 25.2 ms/step** and is now the largest
+  single kernel in the SDPA backward, larger than any of its GEMMs. It is the four
+  transposes the decomposition needs (dO^T and Q^T in, dV^T and dK^T out), each
+  `[576, 1024, 64] <-> [576, 64, 1024]` — 600 MB of traffic per layer, 7.2 GB per
+  step, at **286 GB/s**. That is the same uncoalesced element-at-a-time transpose
+  Change 12 fixed for the unbatched 2-D case (141 -> 12 ms/step) with a tiled LDS
+  staging pass; `_copy_strided`'s fast path requires every leading extent to be 1,
+  so a *batched* transpose does not reach it. Extending it with a batch axis on
+  `block_idx.z` is worth about **21 ms/step** and would take the SDPA backward
+  from 1.96x to about 1.35x. Not attempted.
+* **The workgroup launch rate** (diagnostic experiment AA), which caps the six
+  batched GEMMs at 50.3 ms/step against `torch.bmm`'s 36.6 and is why causal
+  output-tile skipping buys nothing.
 
 1. **The batched GEMMs now touch the matrix cores.**
    `_amd_dynamic_mfma_dispatch` used to open with `if batch != 1 ... return

@@ -454,8 +454,13 @@ def _softmax_warp_rows[
         var base = row * cols
         var vec_limit = (limit // VEC) * VEC
 
-        # Pass 1: online max and sum over the live prefix.
-        var run_max = SIMD[F32, VEC](Float32.MIN)
+        # Pass 1: online max and sum over the live prefix.  The running max
+        # starts at the most negative *finite* float, not at -inf: a lane or a
+        # vector slot with no live column keeps the sentinel, and the rescaling
+        # below subtracts two maxima, so -inf would give `-inf - -inf = NaN` and
+        # poison the whole row through the warp reduction.  With a finite
+        # sentinel the same expression is `exp(0) = 1` times a zero sum.
+        var run_max = SIMD[F32, VEC](Float32.MIN_FINITE)
         var run_sum = SIMD[F32, VEC](0.0)
         var col = lane * VEC
         while col < vec_limit:
@@ -469,7 +474,7 @@ def _softmax_warp_rows[
             col += WARP_SIZE * VEC
         # Ragged remainder: fewer than VEC columns, at most one per lane.
         var tail = vec_limit + lane
-        var tail_max = Float32.MIN
+        var tail_max = Float32.MIN_FINITE
         var tail_sum = Float32(0.0)
         if tail < limit:
             tail_max = in_ptr[base + tail].cast[F32]() * scale
