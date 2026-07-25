@@ -83,6 +83,7 @@ from std.gpu.primitives.warp import shuffle_xor
 from std.math import ceildiv, exp, exp2
 from std.memory import bitcast, stack_allocation
 from std.sys.info import is_amd_gpu
+from std.sys.intrinsics import llvm_intrinsic
 from std.utils.static_tuple import StaticTuple
 
 comptime THREADS = 256
@@ -237,7 +238,13 @@ def _flash_attention_fwd_baseline[
 )
 @__name(t"fa_mfma_{dtype}_h{HD}_n{BN}_q{QT}_x{EXACT}")
 def _fa_mfma[
-    dtype: DType, HD: Int, BN: Int, QT: Int, EXACT: Bool, WAVES_PER_EU: Int
+    dtype: DType,
+    HD: Int,
+    BN: Int,
+    QT: Int,
+    EXACT: Bool,
+    WAVES_PER_EU: Int,
+    IGLP: Int,
 ](
     output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -424,6 +431,7 @@ def _fa_mfma[
             v_ptr += tile_step
             barrier()
 
+            llvm_intrinsic["llvm.amdgcn.iglp.opt", NoneType](Int32(IGLP))
             # ---- GEMM 1: S^T[kv, q] = sum_d K[kv, d] * Q[q, d] ----
             comptime for i in range(KVT * QT):
                 s_acc.store(i * 16, SIMD[DType.float32, 16](0))
@@ -547,6 +555,7 @@ def _enqueue_fa_mfma[
     QT: Int,
     EXACT: Bool,
     WAVES_PER_EU: Int = 1,
+    IGLP: Int = 1,
 ](
     output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -561,7 +570,7 @@ def _enqueue_fa_mfma[
     is_causal: Bool,
     ctx: DeviceContext,
 ) raises:
-    ctx.enqueue_function[_fa_mfma[dtype, HD, BN, QT, EXACT, WAVES_PER_EU]](
+    ctx.enqueue_function[_fa_mfma[dtype, HD, BN, QT, EXACT, WAVES_PER_EU, IGLP]](
         output,
         query,
         key,
