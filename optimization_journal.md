@@ -1929,3 +1929,64 @@ after the write phase so the next row tile cannot overwrite the LDS tile while a
 lane is still reading it. The nanoGPT training table is unchanged — 257.35 ms,
 ratio 3.592, both gates passing, transpose materialization 11.995 ms against the
 12.03 ms recorded before the change.
+
+## Review finding R5 — the transposed-B copy-row guard did not reproduce the kernel
+
+**Hypothesis.** Change 10's `B_COPY_ROWS` compile-time assert is the entire
+remedy chosen for the miscompiled transposed-B geometries, so it must compute the
+row count MAX's B-tile copy actually uses. It appears to get both non-`BLOCK_K`
+factors wrong. `multistage_mma` receives `num_threads_per_warp_k_part`, that is
+`config.num_threads()` divided by the partition count
+(`_multistage_gemm_gpu.mojo:757`), while the guard *multiplies* by
+`WARP_K_PARTITIONS`; and the kernel's `simd_size` is `simd_width_of[a_type]()`
+evaluated for the device (line 258), a 16-byte gfx942 vector, while the same call
+inside this host `def` returns the build machine's vector width.
+
+**Predicted effect.** Correcting both factors should change the computed value but
+not the accept/reject verdict for any geometry the production dispatch can select,
+so every harness must still build and every timing must be unchanged. If a
+production geometry were newly rejected the build would fail at the assert, which
+is the test.
+
+**Measured effect.** Both harnesses build unchanged, so no reachable geometry
+changes verdict, and the training table is unchanged. Worked example for the
+`BM=128, BN=128, WM=32, WN=64, BLOCK_K=32` large-m tile: the true row count is
+`min(4*2*64, 128*32/8) * 8 / 32 = min(512, 512) * 8 / 32 = 128`, which divides
+BN; the old expression gave `min(512, 128) * 1 = 128` by a different route. The
+guard was arriving at usable answers for the current set by coincidence rather
+than by reproducing the kernel.
+
+**Decision.** Accept the correction. The guard now uses
+`(BM // WM) * (BN // WN) * 64` with no partition factor and a device SIMD width
+of `16 // size_of[dtype]()`. Behaviour today is identical; the value of the change
+is that the next geometry added will be judged against what the kernel does.
+
+## Review finding R6 — the causal batched GEMM never declined
+
+**Hypothesis.** `_try_sdpa_causal_bmm`'s docstring promises `None` when the
+operands do not qualify, but its gates are device-agnostic and the Mojo bridge
+never signals refusal: `_causal_bmm_dispatch` sets `eligible = False` on any
+non-gfx942 target and then quietly calls `_gemm_dtype_dispatch`. If so the helper
+returns a filled tensor on every GPU, `out is None` is never true, and the
+fallback chain below it is dead code whenever `is_causal` holds -- which on sm_90a
+means the tuned BF16/TF32 batched bridges are skipped in favour of the portable
+kernel, at one forward and three backward call sites.
+
+**Predicted effect.** Numerics are unaffected either way, since the substituted
+dense GEMM is a correct superset of every causal regime, so this is invisible
+except in wall time on non-gfx942 devices. Making the bridge raise instead must
+leave gfx942 timings and correctness untouched, because every gfx942 shape the
+SDPA path uses is eligible.
+
+**Measured effect.** Confirmed by reading the chain: the bridge's only refusal
+channel is a raised `Error` turned into `NotImplementedError`, and architecture
+ineligibility never raised. After the change, gfx942 is unchanged --
+`bench_attention_bmm` 51.218 ms default and 50.448 ms causal against the 51.237
+and 50.500 recorded, all cases passing; the nanoGPT step is 420.60 ms against
+420.94. The sm_90a improvement cannot be measured on this host and is not
+claimed.
+
+**Decision.** Accept. The bridge now raises when the causal MFMA route is not
+selectable, so the caller's own chain runs. This is the difference between a
+helper that declines and a helper that answers for everyone; only the first
+composes with a fallback ladder.

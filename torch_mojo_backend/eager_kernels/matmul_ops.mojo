@@ -1001,11 +1001,20 @@ def _amd_dynamic_mfma_gemm[
         )
         # The B tile copy distributes `min(threads, BN*BLOCK_K/simd)` threads
         # over BN rows; a row count that does not divide BN drops or duplicates
-        # rows of B (observed with BM=96, BN=128).
+        # rows of B.
+        #
+        # Both factors have to be the kernel's, not this host function's.
+        # `multistage_mma` receives `num_threads_per_warp_k_part`, that is
+        # `config.num_threads()` divided by the partition count, so the
+        # partition count must not appear here at all. And its `simd_size` is
+        # `simd_width_of[a_type]()` evaluated for the *device*, a 16-byte gfx942
+        # vector, whereas the same call in this host `def` would return the
+        # build machine's vector width.
+        comptime DEVICE_SIMD = 16 // size_of[dtype]()
         comptime B_COPY_ROWS = min(
-            (BM // WM) * (BN // WN) * WARP_K_PARTITIONS * 64,
-            BN * BLOCK_K // simd_width_of[dtype](),
-        ) * simd_width_of[dtype]() // BLOCK_K
+            (BM // WM) * (BN // WN) * 64,
+            BN * BLOCK_K // DEVICE_SIMD,
+        ) * DEVICE_SIMD // BLOCK_K
         comptime assert (
             BN % B_COPY_ROWS == 0
         ), "transposed-B tile copy row count must divide BN"
@@ -1485,11 +1494,16 @@ def _causal_bmm_dispatch(
 ) raises:
     """Batched GEMM that may skip contraction indices a causal mask kills.
 
-    Falls back to the ordinary dense batched GEMM whenever the causal MFMA
-    route is not selectable, which is always a correct (merely slower) answer
-    for the two contraction-side regimes.  `CAUSAL_OUT` is different: it leaves
-    the masked half of the output unwritten, so the caller asks for it only when
-    its consumer reads the live prefix of each row -- see
+    Raises when the causal MFMA route is not selectable, rather than quietly
+    substituting the ordinary dense batched GEMM.  The substitution would be
+    numerically fine, but it would also make this the last word for every
+    device: the Python caller turns a refusal into `None` and then runs its own
+    chain, which on sm_90a reaches the tuned BF16/TF32 batched bridges that a
+    silent fallback here would preempt.  Every caller's fallback yields a dense
+    result, which is a correct superset of all three causal regimes.
+
+    `CAUSAL_OUT` leaves the masked half of the output unwritten, so the caller
+    asks for it only when its consumer reads the live prefix of each row -- see
     `_sdpa_math_forward_with_dropout` and `_ScaledDotProductAttentionAutograd`.
     """
     var eligible = False
@@ -1523,21 +1537,10 @@ def _causal_bmm_dispatch(
                     handled = True
         if handled:
             return
-    _gemm_dtype_dispatch(
-        dtype,
-        c_addr,
-        a_addr,
-        b_addr,
-        batch,
-        m,
-        n,
-        k,
-        m * k,
-        transpose_b,
-        0,
-        0,
-        0,
-        ctx,
+    raise Error(
+        "causal batched GEMM is not selectable here: it needs gfx942, batch >"
+        " 1, m and n >= 64, k % 32 == 0, and a causal mode this layout"
+        " implements"
     )
 
 
