@@ -1630,6 +1630,49 @@ def _cast_spec_go(
     )
 
 
+def _cast_spec_into_go(
+    a_o: PyObjectPtr, out_dtype_o: PyObjectPtr, out_o: PyObjectPtr
+) raises:
+    """Into-variant of _cast_spec_go: cast into a caller-allocated
+    contiguous output (call-queue mode)."""
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    var dst = _raw_dtype_int(out_dtype_o)
+    var src_ok = False
+    comptime for dt in CAST_DTYPES:
+        comptime if _dt_on[dt]():
+            if a.dtype == dt:
+                src_ok = True
+    var dst_ok = False
+    comptime for dt in CAST_DTYPES:
+        comptime if _dt_on[dt]():
+            if dst == dt:
+                dst_ok = True
+    if not (src_ok and dst_ok):
+        raise Error("mojo spec cast into: unsupported dtype pair")
+    if out.dtype != dst or out.numel != a.numel or not out.contig:
+        raise Error("mojo spec cast into: output buffer mismatch")
+    if out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec cast into: output on a different device")
+
+    var ctx = a.ctx()
+    var addr = out.ptr
+    if a.numel > 0:
+        if a.contig:
+            comptime for src_dt in CAST_DTYPES:
+                comptime if _dt_on[src_dt]():
+                    if a.dtype == src_dt:
+                        _cast_to[src_dt](dst, addr, a.ptr, a.numel, ctx)
+        else:
+            var tmp = _scratch_contig(a, ctx)
+            var tmp_addr = Int(tmp.unsafe_ptr())
+            comptime for src_dt in CAST_DTYPES:
+                comptime if _dt_on[src_dt]():
+                    if a.dtype == src_dt:
+                        _cast_to[src_dt](dst, addr, tmp_addr, a.numel, ctx)
+            _ = tmp^
+
+
 def _cast_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -1637,6 +1680,9 @@ def _cast_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 3:
+            _cast_spec_into_go(args[0], args[1], args[2])
+            return _raw_ret_none()
         return _cast_spec_go(args[0], args[1])
     except e:
         return _spec_unsupported(e)

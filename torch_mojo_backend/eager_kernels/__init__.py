@@ -610,6 +610,17 @@ class _ModuleProxy:
         return value
 
 
+def queue_spec_into(module: str, attr: str, args: tuple) -> None:
+    """Queue an Into-style spec launch (same registration name, extra
+    trailing out-spec argument; the Mojo dispatcher branches on nargs)."""
+    from . import call_queue
+
+    state = _STATES[module]
+    unit = state.unit(attr)
+    state.demanded_ops.add(attr)
+    call_queue.kernel_call_into(unit, attr, args)
+
+
 def _pool_size() -> int:
     """Concurrent `mojo build` subprocesses. Each build peaks around 4.5 GB
     RSS and uses ~2.5-3 cores, so cap by available RAM (5 GiB per slot with

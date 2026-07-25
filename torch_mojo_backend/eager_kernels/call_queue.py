@@ -212,6 +212,21 @@ def kernel_call(unit: object, attr: str, args: tuple, kwargs: dict) -> object:
     return None
 
 
+def kernel_call_into(unit: object, attr: str, args: tuple) -> None:
+    """A gated Into-style spec launch: Python pre-allocated the output, the
+    call writes into it and returns nothing — always queueable regardless
+    of the *Spec naming convention."""
+    with _LOCK:
+        _pump_locked()
+        if not _QUEUE and unit.ext is not None and not _HELD_ERROR:
+            _exec((unit, attr, args, {}))
+            return None
+        if unit.ext is None:
+            unit.request_async()
+        _QUEUE.append((unit, attr, args, {}))
+    return None
+
+
 def external_call(fn: object, args: tuple) -> None:
     """An ungated device call (fa4): always launchable, but must hold its
     FIFO position behind queued producers of its inputs."""

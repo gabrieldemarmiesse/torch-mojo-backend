@@ -556,6 +556,130 @@ def _wrap_spec_result(result, dtype, device):
     return out
 
 
+_SPEC_INTO_DTYPES = frozenset(
+    {
+        DType.float32,
+        DType.float16,
+        DType.bfloat16,
+        DType.float64,
+        DType.int8,
+        DType.int16,
+        DType.int32,
+        DType.int64,
+        DType.uint8,
+    }
+)
+_SPEC_CMP_NAMES = frozenset(
+    {"EqSpec", "NeSpec", "LtSpec", "LeSpec", "GtSpec", "GeSpec",
+     "LogicalAndSpec", "LogicalXorSpec"}
+)
+_SPEC_FLOAT_ONLY_NAMES = frozenset({"DivSpec", "PowSpec"})
+_SPEC_INT_ONLY_NAMES = frozenset(
+    {"BitwiseAndSpec", "BitwiseOrSpec", "BitwiseXorSpec"}
+)
+_SPEC_BOOL_OK_NAMES = _SPEC_CMP_NAMES | frozenset(
+    {"MulSpec", "BitwiseAndSpec", "BitwiseOrSpec", "BitwiseXorSpec"}
+)
+
+
+def _try_spec_binary_into(spec_fn_name, lhs, rhs, out_dtype):
+    """Call-queue mode: pre-allocate the output in Python and queue the
+    Into launch — allocation never forces a drain, the launch is
+    fire-and-forget. Returns the output wrapper, or None to fall back to
+    the legacy (drain + synchronous) spec path. Eligibility is replicated
+    here CONSERVATIVELY: a queued launch cannot fall back, so anything
+    uncertain declines."""
+    a = _t(lhs)
+    b = _t(rhs)
+    if a is None and b is None:
+        return None
+    if a is not None and b is not None and a._device != b._device:
+        return None
+    anchor_t = a if a is not None else b
+    device = anchor_t._device
+    dtype = anchor_t._dtype
+
+    if a is not None and b is not None:
+        if len(a._shape) > 4 or len(b._shape) > 4:
+            if tuple(a._shape) != tuple(b._shape):
+                return None
+            a = _tc(a)
+            b = _tc(b)
+        if a._dtype != b._dtype:
+            # The same promotion ladder as the legacy path; the casts queue
+            # through the Into cast (never a drain).
+            if a._dtype == DType.bool and b._dtype in _CAST_DTYPES:
+                a, dtype = _cast_tensor(a, b._dtype), b._dtype
+            elif b._dtype == DType.bool and a._dtype in _CAST_DTYPES:
+                b, dtype = _cast_tensor(b, a._dtype), a._dtype
+            elif a._dtype == DType.int32 and b._dtype == DType.int64:
+                a, dtype = _cast_tensor(a, DType.int64), DType.int64
+            elif a._dtype == DType.int64 and b._dtype == DType.int32:
+                b, dtype = _cast_tensor(b, DType.int64), DType.int64
+            elif a._dtype == DType.float32 and b._dtype in (
+                DType.float16,
+                DType.bfloat16,
+            ):
+                b, dtype = _cast_tensor(b, DType.float32), DType.float32
+            elif b._dtype == DType.float32 and a._dtype in (
+                DType.float16,
+                DType.bfloat16,
+            ):
+                a, dtype = _cast_tensor(a, DType.float32), DType.float32
+            elif {a._dtype, b._dtype} == {DType.float16, DType.bfloat16}:
+                a = _cast_tensor(a, DType.float32)
+                b = _cast_tensor(b, DType.float32)
+                dtype = DType.float32
+            else:
+                return None
+        else:
+            dtype = a._dtype
+    else:
+        # One scalar operand: embed it as a queued 0-d fill.
+        scalar = rhs if a is not None else lhs
+        value = _scalar_embed(scalar, dtype)
+        if value is None:
+            return None
+        fill = _alloc((), dtype, device)
+        eager_kernels.queue_spec_into(
+            "elementwise_ops", "FillSpec", (value, _spec_of(fill))
+        )
+        if a is not None:
+            b = fill
+        else:
+            a = fill
+
+    kdtype = DType.uint8 if dtype == DType.bool else dtype
+    if kdtype not in _SPEC_INTO_DTYPES:
+        return None
+    if dtype == DType.bool and spec_fn_name not in _SPEC_BOOL_OK_NAMES:
+        return None
+    if spec_fn_name not in _SPEC_CMP_NAMES:
+        if spec_fn_name in _SPEC_FLOAT_ONLY_NAMES and not kdtype in (
+            DType.float32,
+            DType.float16,
+            DType.bfloat16,
+            DType.float64,
+        ):
+            return None
+        if spec_fn_name in _SPEC_INT_ONLY_NAMES and kdtype in (
+            DType.float32,
+            DType.float16,
+            DType.bfloat16,
+            DType.float64,
+        ):
+            return None
+    try:
+        shape = torch.broadcast_shapes(tuple(a._shape), tuple(b._shape))
+    except RuntimeError:
+        return None
+    out = _alloc(shape, out_dtype or dtype, device)
+    eager_kernels.queue_spec_into(
+        "logic_ops", spec_fn_name, (_spec_of(a), _spec_of(b), _spec_of(out))
+    )
+    return out
+
+
 def _try_spec_binary(spec_fn_name, lhs, rhs, out_dtype=None):
     """Broadcast binary through a logic_ops spec op, or None.
 
@@ -568,6 +692,12 @@ def _try_spec_binary(spec_fn_name, lhs, rhs, out_dtype=None):
     rank>4 operands are pre-materialized (the spec's flat path needs
     contiguity there). `out_dtype` overrides the wrapper dtype for ops
     whose output differs (comparisons -> bool)."""
+    if _call_queue.enabled():
+        into = _try_spec_binary_into(spec_fn_name, lhs, rhs, out_dtype)
+        if into is not None:
+            return into
+        # Ineligible for the queued Into form: the legacy call below drains
+        # and runs synchronously (correct, just not overlapped).
     a = _t(lhs)
     b = _t(rhs)
     spec_a = spec_b = None
@@ -691,6 +821,14 @@ def _try_spec_add_f32_bf16(lhs, rhs):
         )
     ):
         return None
+    if _call_queue.enabled() and a._device.api != "cpu":
+        out = _alloc(a._shape, DType.float32, a._device)
+        eager_kernels.queue_spec_into(
+            "logic_ops",
+            "AddF32Bf16Spec",
+            (_spec_of(a), _spec_of(b), _spec_of(out)),
+        )
+        return out
     try:
         result = eager_kernels.logic_ops.AddF32Bf16Spec(_spec_of(a), _spec_of(b))
     except Exception as exc:
@@ -940,8 +1078,19 @@ def _cast_tensor(x: TorchMojoTensor, dtype: DType) -> TorchMojoTensor:
     """Dtype cast through CastSpec (strided inputs materialize Mojo-side).
 
     Callers pre-gate on _CAST_DTYPES; anything else propagates the spec's
-    NotImplementedError (the classic kernel silently wrote garbage there)."""
-    result = eager_kernels.data_movement_ops.CastSpec(_spec_of(_t(x)), dtype.value)
+    NotImplementedError (the classic kernel silently wrote garbage there).
+    Call-queue mode uses the Into form: Python allocates the contiguous
+    output, the launch queues (no drain/sync)."""
+    t = _t(x)
+    if _call_queue.enabled() and x._dtype in _CAST_DTYPES and dtype in _CAST_DTYPES:
+        out = _alloc(t._shape, dtype, t._device)
+        eager_kernels.queue_spec_into(
+            "data_movement_ops",
+            "CastSpec",
+            (_spec_of(t), dtype.value, _spec_of(out)),
+        )
+        return out
+    result = eager_kernels.data_movement_ops.CastSpec(_spec_of(t), dtype.value)
     return _wrap_spec_result(result, dtype, x._device)
 
 

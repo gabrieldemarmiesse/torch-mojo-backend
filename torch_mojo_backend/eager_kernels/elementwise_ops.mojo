@@ -1253,6 +1253,30 @@ def _fill_spec_go(
     )
 
 
+def _fill_spec_into_go(value_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+    """Into-variant of _fill_spec_go: fill a caller-allocated contiguous
+    output (call-queue mode); dtype/extent come from the output spec."""
+    ref out = _spec_ptr(out_o)[]
+    var value = _raw_f64(value_o)
+    var supported = False
+    comptime for dt in SPEC_FILL_DTYPES:
+        comptime if _dt_on[dt]():
+            if out.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec fill into: unsupported dtype ", out.dtype)
+    if not out.contig:
+        raise Error("mojo spec fill into: output must be contiguous")
+    if out.dtype == DType.bool:
+        value = Float64(1) if value != 0 else Float64(0)
+    var ctx = out.ctx()
+    if out.numel > 0:
+        comptime for dt in SPEC_FILL_DTYPES:
+            comptime if _dt_on[dt]():
+                if out.dtype == dt:
+                    _fill[dt](_make_ptr[dt](out.ptr), value, out.numel, ctx)
+
+
 def _fill_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -1260,6 +1284,9 @@ def _fill_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 2:
+            _fill_spec_into_go(args[0], args[1])
+            return _raw_ret_none()
         return _fill_spec_go(
             args[0], args[1], args[2], args[3], args[4], args[5]
         )

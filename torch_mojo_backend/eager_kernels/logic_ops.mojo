@@ -1299,6 +1299,55 @@ def _add_f32_bf16_spec_go(
     )
 
 
+def _add_f32_bf16_spec_into_go(
+    a_o: PyObjectPtr, b_o: PyObjectPtr, out_o: PyObjectPtr
+) raises:
+    """Into-variant: contiguous FP32 + BF16 -> caller-allocated FP32."""
+    ref a = _spec_ptr(a_o)[]
+    ref b = _spec_ptr(b_o)[]
+    ref out = _spec_ptr(out_o)[]
+
+    if a.ctx_ptr != b.ctx_ptr or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec add f32 bf16 into: device mismatch")
+    if not (
+        (a.dtype == DType.float32 and b.dtype == DType.bfloat16)
+        or (a.dtype == DType.bfloat16 and b.dtype == DType.float32)
+    ):
+        raise Error(
+            "mojo spec add f32 bf16 into: expected one FP32 and one BF16"
+        )
+    if not (a.contig and b.contig and out.contig):
+        raise Error("mojo spec add f32 bf16 into: tensors must be contiguous")
+    if a.rank != b.rank or a.numel != b.numel or out.numel != a.numel:
+        raise Error("mojo spec add f32 bf16 into: shapes differ")
+    for i in range(MAX_RANK):
+        if a.shape[i] != b.shape[i]:
+            raise Error("mojo spec add f32 bf16 into: shapes differ")
+    if out.dtype != DType.float32:
+        raise Error("mojo spec add f32 bf16 into: output must be FP32")
+
+    var ctx = a.ctx()
+    if ctx.api() == "cpu":
+        raise Error(
+            "mojo spec add f32 bf16 into: accelerator context required"
+        )
+
+    var fp32_addr = a.ptr if a.dtype == DType.float32 else b.ptr
+    var bf16_addr = a.ptr if a.dtype == DType.bfloat16 else b.ptr
+    if a.numel > 0:
+        _add_f32_bf16_contig(
+            _make_ptr[DType.float32](out.ptr).as_unsafe_any_origin(),
+            _make_ptr[DType.float32](fp32_addr)
+            .as_unsafe_any_origin()
+            .as_immutable(),
+            _make_ptr[DType.bfloat16](bf16_addr)
+            .as_unsafe_any_origin()
+            .as_immutable(),
+            a.numel,
+            ctx,
+        )
+
+
 def _add_f32_bf16_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -1306,6 +1355,9 @@ def _add_f32_bf16_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 3:
+            _add_f32_bf16_spec_into_go(args[0], args[1], args[2])
+            return _raw_ret_none()
         return _add_f32_bf16_spec_go(args[0], args[1])
     except e:
         return _spec_unsupported(e)
@@ -1467,6 +1519,148 @@ def _binary_spec_go[
     )
 
 
+def _binary_spec_into_go[
+    op_code: Int, is_cmp: Bool
+](a_o: PyObjectPtr, b_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+    """Into-variant of _binary_spec_go: launch into a caller-allocated
+    contiguous output. Python owns allocation and shape math (call-queue
+    mode), so the call returns nothing and can hold a FIFO slot while its
+    unit builds."""
+    ref a = _spec_ptr(a_o)[]
+    ref b = _spec_ptr(b_o)[]
+    ref out = _spec_ptr(out_o)[]
+
+    if a.dtype != b.dtype:
+        raise Error("mojo spec binary into: operand dtypes differ")
+    if a.ctx_ptr != b.ctx_ptr or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec binary into: operands on different devices")
+
+    var kdtype = a.dtype
+    if a.dtype == DType.bool:
+        comptime if (
+            is_cmp
+            or op_code == BOP_MUL
+            or op_code == BOP_AND
+            or op_code == BOP_OR
+            or op_code == BOP_XOR
+        ):
+            kdtype = DType.uint8
+        else:
+            raise Error("mojo spec binary into: bool operands not supported")
+
+    comptime if not is_cmp:
+        comptime if op_code == BOP_DIV or op_code == BOP_POW:
+            if not kdtype.is_floating_point():
+                raise Error(
+                    "mojo spec binary into: div/pow requires a float dtype"
+                )
+        comptime if (
+            op_code == BOP_AND or op_code == BOP_OR or op_code == BOP_XOR
+        ):
+            if kdtype.is_floating_point():
+                raise Error(
+                    "mojo spec binary into: bitwise requires an int dtype"
+                )
+
+    var supported = False
+    comptime for dt in SPEC_BCAST_DTYPES:
+        comptime if _dt_on[dt]():
+            if kdtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec binary into: unsupported dtype ", a.dtype)
+
+    var out_dtype = a.dtype
+    comptime if is_cmp:
+        out_dtype = DType.bool
+    if out.dtype != out_dtype:
+        raise Error("mojo spec binary into: output dtype mismatch")
+
+    var d = IndexList[4](1)
+    var ls = IndexList[4](0)
+    var rs = IndexList[4](0)
+    if a.rank > 4 or b.rank > 4:
+        if a.rank != b.rank:
+            raise Error("mojo spec binary into: rank > 4 needs equal shapes")
+        for i in range(MAX_RANK):
+            if a.shape[i] != b.shape[i]:
+                raise Error(
+                    "mojo spec binary into: rank > 4 needs equal shapes"
+                )
+        if not (a.contig and b.contig):
+            raise Error(
+                "mojo spec binary into: rank > 4 needs contiguous operands"
+            )
+        d[3] = a.numel
+        ls[3] = 1
+        rs[3] = 1
+    else:
+        for k in range(4):
+            var i = MAX_RANK - 4 + k
+            var sa = a.shape[i]
+            var sb = b.shape[i]
+            var s: Int
+            if sa == sb:
+                s = sa
+            elif sa == 1:
+                s = sb
+            elif sb == 1:
+                s = sa
+            else:
+                raise Error("mojo spec binary into: shapes do not broadcast")
+            d[k] = s
+            ls[k] = a.strides[i] if sa != 1 else 0
+            rs[k] = b.strides[i] if sb != 1 else 0
+    var numel = d[0] * d[1] * d[2] * d[3]
+    if out.numel != numel or not out.contig:
+        raise Error("mojo spec binary into: output buffer mismatch")
+
+    var ctx = a.ctx()
+    var addr = out.ptr
+    if numel > 0:
+        comptime for dt in SPEC_BCAST_DTYPES:
+            comptime if _dt_on[dt]():
+                if kdtype == dt:
+                    comptime if is_cmp:
+                        _cmp_bcast[dt, op_code](
+                            addr,
+                            a.ptr,
+                            b.ptr,
+                            d[1],
+                            d[2],
+                            d[3],
+                            ls[0],
+                            ls[1],
+                            ls[2],
+                            ls[3],
+                            rs[0],
+                            rs[1],
+                            rs[2],
+                            rs[3],
+                            numel,
+                            ctx,
+                        )
+                    else:
+                        _bin_bcast[dt, op_code](
+                            addr,
+                            a.ptr,
+                            b.ptr,
+                            d[1],
+                            d[2],
+                            d[3],
+                            ls[0],
+                            ls[1],
+                            ls[2],
+                            ls[3],
+                            rs[0],
+                            rs[1],
+                            rs[2],
+                            rs[3],
+                            numel,
+                            ctx,
+                        )
+
+
 def _binary_spec_dispatcher[
     op_code: Int, is_cmp: Bool
 ](
@@ -1476,6 +1670,9 @@ def _binary_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 3:
+            _binary_spec_into_go[op_code, is_cmp](args[0], args[1], args[2])
+            return _raw_ret_none()
         return _binary_spec_go[op_code, is_cmp](args[0], args[1])
     except e:
         return _spec_unsupported(e)
