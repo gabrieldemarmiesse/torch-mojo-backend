@@ -2181,8 +2181,11 @@ ms, ratio 3.595 -> 3.165**, fifteen of fifteen cases passing all three gates.
 `k = 49280` (1540 K tiles, divisible by 4 but not 8) every one of the 1 769 472
 outputs is wrong, while 4 slabs -- what the rule actually selects -- is correct.
 Accumulation stays FP32 from the MFMA accumulators through the workspace to the
-one rounding in the reduction, so this is not a precision trade: the single-step
-loss is unchanged to 7 digits.
+one rounding in the reduction, so this is not a precision trade; what changes is
+the summation order of the weight gradient, and it moves *toward* PyTorch-ROCm
+(13-step loss 10.631089 -> 10.621608 against ROCm's 10.621461, on a metric whose
+run-to-run spread is about 0.04, so this is agreement rather than a claim of
+improvement).
 
 **Decision.** Accept.
 
@@ -2321,3 +2324,61 @@ and every K index belongs to exactly one chunk, so the whole range is inspected.
 
 **Decision.** Accept. Run all three gates; the chunk gate is the only one that
 covers the middle of a long K.
+
+## End-to-end validation — 2026-07-25, permute gather and GEMM split-K
+
+Same session, same seed, `bench_nanogpt_train.py --warmup 3 --iters 10
+--print-loss`:
+
+| backend | step median | tokens/s | 13-step loss |
+|---|---:|---:|---:|
+| PyTorch-ROCm | 156.715 ms | 313 640 | 10.621461 |
+| eager Mojo, entry (409.34 recorded) | 409.34 ms | 120 077 | 10.631089 |
+| eager Mojo, after Change 19 | 384.665 ms | 127 779 | - |
+| eager Mojo, after Change 20 | **353.327 ms** | 139 112 | 10.621608 |
+
+The two steps sum to 56.0 ms and the harnesses predicted 25.2 + 30.7 = 55.9.
+
+Numerics, on the metric that is actually reliable: the **single-step** loss is
+10.977283478 on the Mojo device against 10.977397919 on PyTorch-ROCm, a
+difference of 1.14e-4, which is the pre-existing agreement between the two
+backends and not a regression. (The 13-step loss has about 0.04 of run-to-run
+spread, so its move from 10.6311 to 10.6216 is not evidence of anything by
+itself.)
+
+Re-profiled with `profile_nanogpt_train_aten.py --device mojo --output-dir
+current_bench_train/mojo_v6` and compared against `current_bench_train/rocm`
+(`comparison_v5`). Overall **2.61x -> 2.26x**, 203.6 ms of gap left:
+
+| target | before | after | rocm | ratio before | ratio after |
+|---|---:|---:|---:|---:|---:|
+| Linear GEMM (backward) | 186.35 | **156.09** | 43.65 | 4.27x | **3.58x** |
+| Linear GEMM (forward) | 72.26 | 72.36 | 24.03 | 3.01x | 3.01x |
+| SDPA (backward) | 66.35 | **46.14** | 33.95 | 1.95x | **1.36x** |
+| SDPA (forward) | 36.87 | **29.84** | 9.08 | 4.06x | **3.29x** |
+| Copies / casts / layout | 26.01 | **16.84** | 11.44 | 2.27x | **1.47x** |
+| whole step | 409.3 | 353.3 | 156.7 | 2.61x | 2.26x |
+
+The SDPA and copy rows move because the permutes they were paying for are the
+run-gather shapes; `data_movement_ops__permute_copy` is no longer among the top
+kernels of any target. The Linear GEMM forward row is untouched by design: its
+shapes are grid-filled already, so no slab count is selected for them.
+
+Regression re-checks, all four, after both changes:
+
+| check | recorded | now |
+|---|---|---|
+| `bench_linear_gemm` default | 257.59 ms, 3.596 | 226.837 ms, 3.166, 15/15 pass |
+| `bench_linear_gemm --pattern-check=1` | pass | 226.731 ms, 3.165, 15/15 pass |
+| `bench_linear_gemm --chunk-check=1` | (new gate) | 226.757 ms, 3.165, 15/15 pass |
+| `bench_attention_bmm` default | 51.205 ms | 51.206 ms, 6/6 pass |
+| `bench_attention_bmm --pattern-check=1` | pass | 50.993 ms, 6/6 pass |
+| `bench_attention_bmm --causal=1` | ~50.4 ms | 50.460 ms, 6/6 pass |
+| `bench_attention_softmax` | 9.98 / 9.34 ms/step | 10.014 / 9.356, 4/4 pass |
+| `scripts/sdpa_correctness.py` | 25 pass, 3 known FAIL at 2.954/3.119/2.277 | 25 pass, the same 3 FAIL at 2.954/3.119/2.277 |
+
+One cost worth recording: `matmul_ops.mojo` now instantiates the multistage core a
+second time with `c_type = float32`, which lengthens both the `__mojocache__`
+rebuild and every `mojo build` of a harness that imports `matmul_ops` from about
+two seconds to a couple of minutes. `bench_permute_copy`, which imports only
+`data_movement_ops`, still builds in seconds.

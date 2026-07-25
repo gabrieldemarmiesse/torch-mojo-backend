@@ -9,26 +9,32 @@ Measured on an MI300X VF with PyTorch 2.11.0+rocm7.2 and MAX
 
 | backend | step | tokens/s |
 |---|---:|---:|
-| PyTorch-ROCm | 156.62 ms | 313 835 |
+| PyTorch-ROCm | 156.71 ms | 313 640 |
 | eager Mojo device, initial | 921.39 ms | 53 346 |
 | eager Mojo device, after the Linear GEMM work | 661.37 ms | 74 319 |
 | eager Mojo device, after the SDPA work | 420.57 ms | 116 871 |
 | eager Mojo device, after the batched transpose | 409.34 ms | 120 077 |
 | eager Mojo device, after the permute run gather | 384.67 ms | 127 779 |
-| eager Mojo device, after the GEMM split-K | see below | |
+| eager Mojo device, after the GEMM split-K | **353.33 ms** | 139 112 |
 
 Both backends are GPU-bound (trace idle 0.01%), so GPU kernel time is the unit
 of comparison. Current ranked gap per step, from
-`current_bench_train/comparison_v3/nanogpt_train_kernel_gap.csv`:
+`current_bench_train/comparison_v5/nanogpt_train_kernel_gap.csv` (2.26x overall,
+203.6 ms of gap):
 
 | target | mojo | rocm | ratio | share of gap |
 |---|---:|---:|---:|---:|
-| Linear GEMM (backward) | 186.52 ms | 43.65 ms | 4.27x | 52.8% |
-| Linear GEMM (forward) | 72.44 ms | 24.03 ms | 3.01x | 17.9% |
-| SDPA (backward) | 66.39 ms | 33.95 ms | 1.96x | 12.0% |
-| SDPA (forward) | 37.00 ms | 9.08 ms | 4.07x | 10.3% |
-| Copies / dtype casts | 26.01 ms | 11.44 ms | 2.27x | 5.4% |
-| everything else | 33.19 ms | 34.87 ms | 0.95x | 0% |
+| Linear GEMM (backward) | 156.09 ms | 43.65 ms | 3.58x | 55.2% |
+| Linear GEMM (forward) | 72.36 ms | 24.03 ms | 3.01x | 23.7% |
+| SDPA (forward) | 29.84 ms | 9.08 ms | 3.29x | 10.2% |
+| SDPA (backward) | 46.14 ms | 33.95 ms | 1.36x | 6.0% |
+| Copies / dtype casts | 16.84 ms | 11.44 ms | 1.47x | 2.7% |
+| everything else | 32.75 ms | 34.87 ms | 0.94x | 0% |
+
+The previous revision of this table was Linear GEMM backward 186.52 (4.27x),
+forward 72.44, SDPA backward 66.39 (1.96x), forward 37.00 (4.07x), copies 26.01
+(2.27x). `data_movement_ops__permute_copy` no longer appears among the top kernels
+of any target.
 
 The initial table, before any of this work, was SDPA backward 239.24, Linear GEMM
 backward 346.89, Linear GEMM forward 171.84, SDPA forward 105.10; after the Linear
