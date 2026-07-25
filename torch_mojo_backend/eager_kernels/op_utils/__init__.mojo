@@ -9,12 +9,13 @@
 from std.algorithm.functional import elementwise
 from std.builtin.device_passable import DevicePassable
 from std.ffi import _get_global_or_null, external_call
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.host import DeviceBuffer, DeviceContext
-from std.memory import OpaquePointer, alloc
+from std.math import ceildiv
+from std.memory import OpaquePointer, alloc, stack_allocation
 from std.python import Python, PythonObject
 from std.python._cpython import PyObjectPtr
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator
+from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils import IndexList
 from std.utils.coord import Coord
 
@@ -534,6 +535,66 @@ def _copy_strided_kernel[
         i += gstride
 
 
+# A transposed 2-D read is the one strided copy that the element-at-a-time
+# kernel above handles catastrophically badly: consecutive threads touch
+# addresses `src_ld` elements apart, so every 2-byte load pulls its own cache
+# line and the copy runs at a few percent of HBM bandwidth.  Staging a square
+# tile through LDS makes both the read and the write fully coalesced.  The
+# tile edge is chosen so one LDS row is a 128-byte cache line; the +1 padding
+# column removes the bank conflict on the transposing access.
+comptime _T2D_LINE = 128
+
+
+@always_inline
+def _t2d_tile[dtype: DType]() -> Int:
+    return _T2D_LINE // size_of[dtype]()
+
+
+comptime _T2D_ROWS = 8
+
+
+def _transpose2d_kernel[
+    dtype: DType
+](
+    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    src_ld: Int,
+):
+    """`dst[r, c] = src[c, r]` for a `rows x cols` row-major destination and a
+    `cols x rows` source whose row stride is `src_ld`."""
+    comptime TILE = _t2d_tile[dtype]()
+    var tile = stack_allocation[
+        TILE * (TILE + 1), dtype, address_space=AddressSpace.SHARED
+    ]()
+    var tid = Int(thread_idx.x)
+    var tx = tid % TILE
+    var ty = tid // TILE
+    var c0 = Int(block_idx.x) * TILE
+    var r0 = Int(block_idx.y) * TILE
+
+    # Read src[c0 + y, r0 + tx]: consecutive tx are consecutive addresses.
+    var r = r0 + tx
+    if r < rows:
+        var y = ty
+        while y < TILE:
+            var c = c0 + y
+            if c < cols:
+                tile[y * (TILE + 1) + tx] = src_ptr[c * src_ld + r]
+            y += _T2D_ROWS
+    barrier()
+    # Write dst[r0 + y, c0 + tx]: consecutive tx are consecutive addresses.
+    var c = c0 + tx
+    if c < cols:
+        var y = ty
+        while y < TILE:
+            var row = r0 + y
+            if row < rows:
+                dst_ptr[row * cols + c] = tile[tx * (TILE + 1) + y]
+            y += _T2D_ROWS
+
+
 @always_inline
 def _copy_strided[
     dtype: DType
@@ -578,6 +639,40 @@ def _copy_strided[
         elementwise[func, simd_width=1](Coord(total), ctx)
     else:
         comptime if has_accelerator():
+            comptime TILE = _t2d_tile[dtype]()
+            var rows = shape[MAX_RANK - 2]
+            var cols = shape[MAX_RANK - 1]
+            # Rank-2 transposed read into a contiguous destination: every
+            # leading dim is 1, the destination is row-major (rows, cols), and
+            # the source is a (cols, rows) matrix read down its columns.
+            var leading_trivial = True
+            for d in range(MAX_RANK - 2):
+                if shape[d] != 1:
+                    leading_trivial = False
+            if (
+                leading_trivial
+                and rows > 1
+                and cols > 1
+                and total >= 1024
+                and dst_strides[MAX_RANK - 1] == 1
+                and dst_strides[MAX_RANK - 2] == cols
+                and src_strides[MAX_RANK - 2] == 1
+                and src_strides[MAX_RANK - 1] >= rows
+            ):
+                _enqueue_cached[_transpose2d_kernel[dtype]](
+                    ctx,
+                    String(t"transpose2d_{dtype}"),
+                    ceildiv(cols, TILE),
+                    ceildiv(rows, TILE),
+                    1,
+                    TILE * _T2D_ROWS,
+                    dst_ptr.as_unsafe_any_origin(),
+                    src_ptr.as_unsafe_any_origin().as_immutable(),
+                    rows,
+                    cols,
+                    src_strides[MAX_RANK - 1],
+                )
+                return
             _enqueue_cached[_copy_strided_kernel[dtype]](
                 ctx,
                 String(t"copy_strided_{dtype}"),
