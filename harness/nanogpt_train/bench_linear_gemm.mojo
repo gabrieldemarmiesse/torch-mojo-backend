@@ -24,11 +24,11 @@ Build and run:
     /tmp/bench_linear_gemm --targets harness/nanogpt_train/rocm_gemm_targets.csv
 
     # one case, more iterations, with the layout-sensitive pattern check
-    /tmp/bench_linear_gemm --case mlp_c_fc_wgrad --iterations 200 --pattern-check 1
+    /tmp/bench_linear_gemm --case=mlp_c_fc_wgrad --iterations=200 --pattern-check=1
 
 Profile a single case per kernel (durations, VGPR/LDS, counters):
     uv run --no-sync python scripts/rocprof_kernels.py -- \
-        /tmp/bench_linear_gemm --case mlp_c_fc_fwd --warmup 25 --iterations 100
+        /tmp/bench_linear_gemm --case=mlp_c_fc_fwd --warmup=25 --iterations=100
 """
 
 from std.builtin.sort import sort
@@ -520,11 +520,17 @@ def run_case(
 def _count_constant_mismatches(
     target: GemmCase, c_buf: DeviceBuffer[DType.bfloat16], ctx: DeviceContext
 ) raises -> Int:
-    """Every output must equal K exactly for the all-ones operands.
+    """Every output must equal K rounded to BF16, for the all-ones operands.
 
-    K <= 50304 is exact in BF16, so this is an equality test over the whole
-    output, which is what catches tiles that were never written, written twice,
-    or written with a truncated K loop.
+    The FP32 accumulator holds K exactly for every K here, but the BF16 *store*
+    has only 8 significand bits, so K is reproduced exactly only when it needs
+    at most 8: 768, 2304, 3072 and 49152 do, and K = 50304 does not
+    (50304 = 2^15+2^14+2^10+2^7 needs 9, and round-to-nearest-even gives
+    50176).  Comparing against the rounded value keeps this an exact equality
+    test over the whole output — which is what catches tiles that were never
+    written, written twice, or written with a truncated K loop — without
+    reporting the unavoidable BF16 rounding of the reference itself as a
+    kernel defect.
     """
     var slots = CHECK_BLOCKS * FILL_BLOCK
     var counts = ctx.enqueue_create_buffer[DType.int32](slots)
@@ -532,7 +538,7 @@ def _count_constant_mismatches(
         counts.unsafe_ptr().as_unsafe_any_origin(),
         c_buf.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
         target.m * target.n,
-        Float32(target.k),
+        Float32(target.k).cast[DType.bfloat16]().cast[DType.float32](),
         grid_dim=(CHECK_BLOCKS,),
         block_dim=(FILL_BLOCK,),
     )

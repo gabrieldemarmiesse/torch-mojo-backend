@@ -60,10 +60,12 @@ the end of a change, not per iteration.
 Both are exact equality tests, not tolerance tests, and both inspect **every**
 output element via a device-side reduction (no multi-GB host transfer):
 
-1. **Default (all ones).** `A = B = 1`, so every output must equal K exactly;
-   every K used here (768, 2304, 3072, 49152, 50304) is exact in BF16 and in
-   the FP32 accumulator. This catches a tile never written, written twice, or a
-   truncated K loop.
+1. **Default (all ones).** `A = B = 1`, so every output must equal K rounded to
+   BF16. The FP32 accumulator holds every K used here exactly; the BF16 *store*
+   keeps only 8 significand bits, so 768, 2304, 3072 and 49152 come back exact
+   while K = 50304 rounds to 50176 (it needs 9). The gate compares against the
+   rounded value, so it stays an exact equality test and still catches a tile
+   never written, written twice, or a truncated K loop.
 2. **`--pattern-check 1`.** Operands are `{-1, 0, 1}` on the first and last four
    K indices and zero elsewhere. Outputs stay small integers, so equality still
    holds exactly, while values now vary along m, n *and* k — this is what
@@ -126,12 +128,12 @@ binary and a PyTorch script:
 ```bash
 # per-kernel duration, grid/block, VGPR/SGPR, LDS, scratch
 uv run --no-sync python scripts/rocprof_kernels.py -- \
-    /tmp/bench_linear_gemm --case mlp_c_fc_fwd
+    /tmp/bench_linear_gemm --case=mlp_c_fc_fwd
 
 # hardware counters (MFMA issue, LDS conflicts, HBM traffic)
 uv run --no-sync python scripts/rocprof_kernels.py \
     --pmc "SQ_INSTS_MFMA SQ_LDS_BANK_CONFLICT FETCH_SIZE WRITE_SIZE" -- \
-    /tmp/bench_linear_gemm --case mlp_c_fc_fwd
+    /tmp/bench_linear_gemm --case=mlp_c_fc_fwd
 
 # what Tensile does for the same shape, for comparison
 uv run --no-sync python scripts/rocprof_kernels.py --filter Cijk -- \
