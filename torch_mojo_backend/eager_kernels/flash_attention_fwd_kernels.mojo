@@ -81,7 +81,7 @@ from std.gpu.memory import AddressSpace
 from std.gpu.primitives import block
 from std.gpu.primitives.warp import shuffle_xor
 from std.math import ceildiv, exp, exp2
-from std.memory import stack_allocation
+from std.memory import bitcast, stack_allocation
 from std.sys.info import is_amd_gpu
 from std.utils.static_tuple import StaticTuple
 
@@ -103,6 +103,28 @@ comptime ACC_ROWS = SIMD[DType.int32, 16](
 )
 
 comptime NEG_BIG = SIMD[DType.float32, 16](Float32.MIN_FINITE)
+
+
+@always_inline
+def _pack_half[
+    dtype: DType, w: Int
+](x: SIMD[DType.float32, w]) -> SIMD[dtype, w]:
+    """Round FP32 to `dtype` cheaply.
+
+    gfx942 has no `v_cvt_pk_bf16_f32`, so `SIMD.cast` to bfloat16 expands into
+    a six-instruction round-to-nearest-even sequence per element (NaN test,
+    tie-break bias, select, pack).  Measured in the tile loop that was 209 of
+    538 VALU instructions.  The scores here are `exp2` of a non-positive number
+    and the outputs are a convex combination of V rows, so none of them is NaN
+    and the even/away tie-break is irrelevant: adding half an ULP to the bit
+    pattern and truncating rounds to nearest for both signs and costs one add
+    plus the pack.
+    """
+    comptime if dtype == DType.bfloat16:
+        var bits = bitcast[DType.uint32, w](x) + SIMD[DType.uint32, w](0x8000)
+        return bitcast[dtype, w]((bits >> 16).cast[DType.uint16]())
+    else:
+        return x.cast[dtype]()
 
 
 @__name(t"flash_attention_fwd_baseline_{dtype}")
@@ -324,47 +346,82 @@ def _fa_mfma[
 
         var sl = scale * LOG2E
 
+        # A `head_dim` the compiler knows turns every operand offset into an
+        # immediate; a runtime one turned 41 `v_lshl_add_u64` per tile loose in
+        # the loop.  The row stride is also folded into a pointer bump so the
+        # tile index never enters an address.
+        comptime KROW_STEP = THREADS // (HD // 8)
+        comptime VKV_STEP = THREADS // HD
+        var hd = head_dim
+        comptime if EXACT:
+            hd = HD
+        var k_row0 = tid // (HD // 8)
+        var k_col = (tid % (HD // 8)) * 8
+        var v_col = tid % HD
+        var v_kvg0 = tid // HD
+        var k_ptr = key + (kv_base + k_row0 * hd + k_col)
+        var v_ptr = value + (kv_base + v_kvg0 * 4 * hd + v_col)
+        var tile_step = BN * hd
+        var k_lds0 = k_row0 * KPAD + k_col
+        var v_lds0 = v_col * VPAD + v_kvg0 * 4
+        # Beyond `seq_kv` the loaders read a clamped, in-bounds duplicate row
+        # rather than branching per lane: every such score is replaced by the
+        # mask before it reaches the running max, so the staged values are never
+        # observed. Only the final tile of a sequence takes this path.
+        var last_row = max(seq_kv - 1, 0)
+
         var t = 0
         while t < n_tiles:
             var kv0 = t * BN
             var full = kv0 + BN <= seq_kv
 
             # ---- Stage K row-major and V transposed. ----
-            comptime for ci in range(KITERS):
-                var c = tid + ci * THREADS
-                var row = c // (HD // 8)
-                var col = (c % (HD // 8)) * 8
-                var vals = SIMD[dtype, 8](0)
-                var ok = full or (kv0 + row < seq_kv)
-                comptime if not EXACT:
-                    ok = ok and col < head_dim
-                if ok:
-                    vals = key.load[width=8](
-                        kv_base + (kv0 + row) * head_dim + col
-                    )
-                k_smem.store(row * KPAD + col, vals)
-
-            comptime for vi in range(VITERS):
-                var c = tid + vi * THREADS
-                var dcol = c % HD
-                var kvg = c // HD
-                var vv = SIMD[dtype, 4](0)
-                var ok = True
-                comptime if not EXACT:
-                    ok = dcol < head_dim
-                if ok:
-                    var vp = value + (
-                        kv_base + (kv0 + kvg * 4) * head_dim + dcol
-                    )
-                    if full:
-                        comptime for j in range(4):
-                            vv[j] = vp[j * head_dim]
+            if full:
+                comptime for ci in range(KITERS):
+                    var vals = SIMD[dtype, 8](0)
+                    comptime if EXACT:
+                        vals = k_ptr.load[width=8](ci * KROW_STEP * HD)
                     else:
+                        if k_col < head_dim:
+                            vals = k_ptr.load[width=8](
+                                ci * KROW_STEP * head_dim
+                            )
+                    k_smem.store(k_lds0 + ci * KROW_STEP * KPAD, vals)
+                comptime for vi in range(VITERS):
+                    var vv = SIMD[dtype, 4](0)
+                    var live = True
+                    comptime if not EXACT:
+                        live = v_col < head_dim
+                    if live:
                         comptime for j in range(4):
-                            if kv0 + kvg * 4 + j < seq_kv:
-                                vv[j] = vp[j * head_dim]
-                v_smem.store(dcol * VPAD + kvg * 4, vv)
+                            comptime if EXACT:
+                                vv[j] = v_ptr[
+                                    (vi * VKV_STEP * 4 + j) * HD
+                                ]
+                            else:
+                                vv[j] = v_ptr[
+                                    (vi * VKV_STEP * 4 + j) * head_dim
+                                ]
+                    v_smem.store(v_lds0 + vi * VKV_STEP * 4, vv)
+            else:
+                comptime for ci in range(KITERS):
+                    var row = min(kv0 + k_row0 + ci * KROW_STEP, last_row)
+                    var vals = SIMD[dtype, 8](0)
+                    if EXACT or k_col < head_dim:
+                        vals = key.load[width=8](kv_base + row * hd + k_col)
+                    k_smem.store(k_lds0 + ci * KROW_STEP * KPAD, vals)
+                comptime for vi in range(VITERS):
+                    var vv = SIMD[dtype, 4](0)
+                    if EXACT or v_col < head_dim:
+                        var g = kv0 + (v_kvg0 + vi * VKV_STEP) * 4
+                        comptime for j in range(4):
+                            vv[j] = value[
+                                kv_base + min(g + j, last_row) * hd + v_col
+                            ]
+                    v_smem.store(v_lds0 + vi * VKV_STEP * 4, vv)
 
+            k_ptr += tile_step
+            v_ptr += tile_step
             barrier()
 
             # ---- GEMM 1: S^T[kv, q] = sum_d K[kv, d] * Q[q, d] ----
@@ -415,11 +472,10 @@ def _fa_mfma[
                         s_acc.load[width=16]((kt * QT + qt) * 16)
                         - SIMD[DType.float32, 16](nm)
                     )
-                    var pb = pv.cast[dtype]()
-                    p_frag.store((kt * QT + qt) * 16, pb)
-                    # Sum the ROUNDED weights, so the stored row is an exact
-                    # convex combination of V rows and the two roundings cancel.
-                    psum += pb.cast[DType.float32]().reduce_add()
+                    p_frag.store(
+                        (kt * QT + qt) * 16, _pack_half[dtype, 16](pv)
+                    )
+                    psum += pv.reduce_add()
                 run_s[qt] = run_s[qt] * corr + psum
                 comptime for dt in range(DT):
                     var acc = o_acc.load[width=16]((dt * QT + qt) * 16)
@@ -462,7 +518,7 @@ def _fa_mfma[
             comptime for qt in range(QT):
                 var row = wave * (32 * QT) + qt * 32 + lo
                 var acc = o_acc.load[width=16]((dt * QT + qt) * 16) * inv[qt]
-                var ob = acc.cast[dtype]()
+                var ob = _pack_half[dtype, 16](acc)
                 comptime for g in range(4):
                     smem.store(
                         row * OPAD + 8 * g + 4 * hi,
