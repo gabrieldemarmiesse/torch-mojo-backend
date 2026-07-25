@@ -29,13 +29,19 @@ from std.gpu.memory import (
     async_copy_commit_group,
     async_copy_wait_group,
 )
-from std.gpu.host import DeviceBuffer, DeviceContext, FuncAttribute
+from std.gpu.host import (
+    DeviceAttribute,
+    DeviceBuffer,
+    DeviceContext,
+    FuncAttribute,
+)
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.sys.info import (
     _accelerator_arch,
     has_accelerator,
     has_apple_gpu_accelerator,
+    simd_width_of,
     size_of,
 )
 from std.utils.coord import Coord as StdCoord
@@ -92,6 +98,7 @@ from op_utils import (
     FLOAT_DTYPES,
     MAX_RANK,
     TensorSpec,
+    _copy_strided,
     _enqueue_cached,
     _get_ctx,
     _make_ptr,
@@ -964,6 +971,7 @@ def _amd_dynamic_mfma_gemm[
     BLOCK_K: Int = 32,
     WARP_K_PARTITIONS: Int = 1,
     K_GROUP_SIZE: Int = 1,
+    STAGES: Int = 2,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -974,6 +982,34 @@ def _amd_dynamic_mfma_gemm[
     k: Int,
     ctx: DeviceContext,
 ) raises:
+    # --- gfx942 transposed-B geometry guard -------------------------------
+    # MAX's two-stage `multistage_gemm_kernel` miscompiles on gfx942 for a set
+    # of transposed-B block/warp decompositions: one MFMA k-step's contribution
+    # is dropped from part of the accumulator, and which part varies per
+    # workgroup.  It reproduces with K == BLOCK_K, where the K loop performs no
+    # global-to-LDS prefetch at all and therefore cannot race, so it is a
+    # code-generation defect and not a synchronization bug; three or four
+    # pipeline stages also make it disappear.  Every observed failure has a
+    # warp tile only one MMA wide in some dimension (WM == 16 or WN == 16),
+    # so require at least a 2x2 MMA warp tile whenever B is read transposed.
+    # See optimization_journal.md, "Change 10".
+    comptime MMA_DIM = get_mma_shape[dtype, DType.float32]()[0]
+    comptime if transpose_b:
+        comptime assert WM >= 2 * MMA_DIM and WN >= 2 * MMA_DIM, (
+            "transposed-B multistage geometries with a single-MMA warp tile are"
+            " miscompiled on gfx942; use WM, WN >= 2 * mma_dim"
+        )
+        # The B tile copy distributes `min(threads, BN*BLOCK_K/simd)` threads
+        # over BN rows; a row count that does not divide BN drops or duplicates
+        # rows of B (observed with BM=96, BN=128).
+        comptime B_COPY_ROWS = min(
+            (BM // WM) * (BN // WN) * WARP_K_PARTITIONS * 64,
+            BN * BLOCK_K // simd_width_of[dtype](),
+        ) * simd_width_of[dtype]() // BLOCK_K
+        comptime assert (
+            BN % B_COPY_ROWS == 0
+        ), "transposed-B tile copy row count must divide BN"
+
     comptime F32 = DType.float32
     var c_ptr = _make_ptr[dtype](c_addr)
     var c = TileTensor(c_ptr, row_major(Coord(m, n)))
@@ -1028,7 +1064,7 @@ def _amd_dynamic_mfma_gemm[
         block_tile_shape=Index(BM, BN, BLOCK_K),
         warp_tile_shape=Index(WM, WN, BLOCK_K),
         mma_shape=get_mma_shape[dtype, DType.float32](),
-        num_pipeline_stages=2,
+        num_pipeline_stages=STAGES,
         num_warp_k_partitions=WARP_K_PARTITIONS,
         k_group_size=K_GROUP_SIZE,
     )
@@ -1090,6 +1126,60 @@ def _amd_dynamic_mfma_gemm[
 
 
 @always_inline
+def _amd_bf16_large_m[
+    dtype: DType, transpose_b: Bool, fuse_bias: Bool
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    bias_addr: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Macro-tile selection for the many-output-rows regime.
+
+    Pick the largest macro tile whose output-tile count still fills the device:
+    a 128x128 tile has four times the arithmetic intensity of 32x128 but a
+    quarter of the tiles, so it only pays once the grid covers every CU several
+    times over.  Both the tile count and the CU count are runtime values.
+    """
+    var cus = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var tiles = ceildiv(m, 128) * ceildiv(n, 128)
+    var wide = ceildiv(n, 128) >= 12
+    if tiles >= 2 * cus or (wide and tiles >= cus):
+        _amd_dynamic_mfma_gemm[dtype, 128, 128, 32, 64, transpose_b, fuse_bias](
+            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+        )
+    elif n >= 1536:
+        _amd_dynamic_mfma_gemm[dtype, 64, 128, 32, 64, transpose_b, fuse_bias](
+            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+        )
+    else:
+        _amd_dynamic_mfma_gemm[dtype, 32, 128, 32, 64, transpose_b, fuse_bias](
+            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+        )
+
+
+@always_inline
+def _rm2(rows: Int, cols: Int) -> IndexList[MAX_RANK]:
+    """Rank-MAX_RANK padded shape for a rows x cols matrix."""
+    var out = IndexList[MAX_RANK](1)
+    out[MAX_RANK - 2] = rows
+    out[MAX_RANK - 1] = cols
+    return out
+
+
+@always_inline
+def _st2(row_stride: Int, col_stride: Int) -> IndexList[MAX_RANK]:
+    var out = IndexList[MAX_RANK](0)
+    out[MAX_RANK - 2] = row_stride
+    out[MAX_RANK - 1] = col_stride
+    return out
+
+
+@always_inline
 def _amd_dynamic_mfma_dispatch[
     dtype: DType, transpose_b: Bool, fuse_bias: Bool = False
 ](
@@ -1109,18 +1199,54 @@ def _amd_dynamic_mfma_dispatch[
     if batch != 1 or a_bstride == 0 or m < 64 or k % 32 != 0:
         return False
     comptime if dtype == DType.bfloat16:
-        comptime if not transpose_b:
-            if m >= 1024:
-                if n >= 1536:
-                    _amd_dynamic_mfma_gemm[
-                        dtype, 64, 128, 32, 64, transpose_b, fuse_bias
-                    ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-                else:
-                    _amd_dynamic_mfma_gemm[
-                        dtype, 32, 128, 32, 64, transpose_b, fuse_bias
-                    ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-                return True
+        if m >= 1024:
+            comptime if transpose_b:
+                # A [N, K] operand is read as BN rows of BLOCK_K elements, so
+                # each global load touches only BLOCK_K * 2 = 64 bytes of a
+                # 128-byte line, and the same tile is re-read by every row
+                # block.  Materializing B^T once costs 4 * n * k bytes of
+                # bandwidth -- three orders of magnitude less than the GEMM at
+                # these row counts -- and the [K, N] kernel then runs about
+                # 1.4x faster.  Below m = 1024 the GEMM is too small to
+                # amortize the copy, and that regime keeps the [N, K] kernel.
+                var bt = ctx.enqueue_create_buffer[dtype](k * n)
+                _copy_strided[dtype](
+                    Int(bt.unsafe_ptr()),
+                    b_addr,
+                    _rm2(k, n),
+                    _st2(n, 1),
+                    _st2(1, k),
+                    ctx,
+                )
+                _amd_bf16_large_m[dtype, False, fuse_bias](
+                    c_addr,
+                    a_addr,
+                    Int(bt.unsafe_ptr()),
+                    bias_addr,
+                    m,
+                    n,
+                    k,
+                    ctx,
+                )
+                _ = bt^
+            else:
+                _amd_bf16_large_m[dtype, transpose_b, fuse_bias](
+                    c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+                )
+            return True
         if k >= 2048 and k >= 2 * n:
+            # Deep-K. A wide N still has enough output columns to feed a
+            # 32x128 tile, which beats the in-workgroup K partition once the
+            # column count stops being the scarce resource.
+            if n >= 2048:
+                _amd_dynamic_mfma_gemm[
+                    dtype, 32, 128, 32, 64, transpose_b, fuse_bias
+                ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+                return True
+            # Four in-workgroup K partitions: the K loop is long and the
+            # 32x32 output grid alone leaves most SIMDs with less than one
+            # resident wave, so the extra waves hide global-load latency for
+            # more than the in-workgroup reduction costs.
             _amd_dynamic_mfma_gemm[
                 dtype,
                 32,
@@ -1130,7 +1256,7 @@ def _amd_dynamic_mfma_dispatch[
                 transpose_b,
                 fuse_bias,
                 32,
-                2,
+                4,
             ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
             return True
         comptime if not transpose_b:
@@ -1163,17 +1289,27 @@ def _amd_dynamic_mfma_dispatch[
                     4,
                 ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
             else:
+                # A 16x16 warp tile is one of the miscompiled transposed-B
+                # geometries (see the guard in `_amd_dynamic_mfma_gemm`).
                 _amd_dynamic_mfma_gemm[
-                    dtype, 32, 32, 16, 16, transpose_b, fuse_bias
+                    dtype, 32, 32, 32, 32, transpose_b, fuse_bias
                 ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
         else:
             _amd_dynamic_mfma_gemm[
                 dtype, 32, 32, 16, 16, transpose_b, fuse_bias
             ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
     else:
-        _amd_dynamic_mfma_gemm[dtype, 32, 64, 16, 32, transpose_b, fuse_bias](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
+        comptime if transpose_b:
+            # 32x64 with a 16x32 warp tile is the miscompiled transposed-B
+            # geometry that produced the silently wrong nanoGPT forward GEMMs;
+            # a 32x32 warp tile computes the same tile correctly.
+            _amd_dynamic_mfma_gemm[
+                dtype, 32, 64, 32, 32, transpose_b, fuse_bias
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        else:
+            _amd_dynamic_mfma_gemm[
+                dtype, 32, 64, 16, 32, transpose_b, fuse_bias
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
     return True
 
 
