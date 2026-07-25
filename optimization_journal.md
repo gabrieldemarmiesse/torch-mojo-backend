@@ -1387,3 +1387,21 @@ Global split-K is not expressible around the stock kernel: it derives its K
 loop from B and offers no `block_idx.z` k-slab, and separate launches serialize
 on the stream, so the extra workgroups would not be concurrent. Both are new
 kernel work and neither was attempted here.
+
+## End-to-end validation — 2026-07-25
+
+Same session, same seed, `bench_nanogpt_train.py --warmup 3 --iters 10
+--print-loss`:
+
+| backend | step median | tokens/s | final loss |
+|---|---:|---:|---:|
+| PyTorch-ROCm | 156.698 ms | 313 673 | 10.621461 |
+| eager Mojo, before | 921.39 ms | 53 346 | 10.644900 |
+| eager Mojo, after | 661.369 ms | 74 319 | 10.636456 |
+
+The step improved by 259.9 ms, which matches the harness's 249.5 ms of Linear
+GEMM saving to within run-to-run noise, and the loss moved from 10.6449 to
+10.6365 — toward PyTorch-ROCm's 10.6215, which is the independent evidence that
+the correctness fix is real and not a re-routing that hid the defect. The
+residual 0.015 is not this target's: the SDPA and copy kernels still differ in
+accumulation order and are the next two entries in the gap table.
