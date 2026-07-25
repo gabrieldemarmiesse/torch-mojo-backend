@@ -3770,6 +3770,66 @@ def fast_aten_upsample_bilinear2d(
     return NOT_HANDLED
 
 
+# Causal regimes of `matmul_ops.CausalBmm`; see the CAUSAL_* aliases there.
+SDPA_CAUSAL_NONE = 0
+SDPA_CAUSAL_OUT = 1
+SDPA_CAUSAL_A_ROWS = 2
+SDPA_CAUSAL_B_COLS = 3
+
+
+def _try_sdpa_causal_bmm(
+    a: MojoTensorLike, b: MojoTensorLike, transpose_b: bool, causal_mode: int
+) -> object:
+    """Batched GEMM that skips the contraction indices a causal mask kills.
+
+    ``a`` is ``(batch, m, k)`` and ``b`` is ``(batch, n, k)`` when
+    ``transpose_b`` else ``(batch, k, n)``; both must be dense row-major.
+    Returns ``None`` when the operands do not qualify, so the caller keeps its
+    ordinary dense chain.
+
+    ``SDPA_CAUSAL_OUT`` leaves the masked half of the output unwritten, so only
+    ask for it when the consumer reads each row's live prefix.  The other two
+    regimes are exact for any consumer: the contraction indices they skip
+    multiply exact zeros.
+    """
+    if (
+        not _on_gpu(a)
+        or a._dtype != b._dtype
+        or a._dtype not in (DType.float32, DType.bfloat16)
+        or a._device != b._device
+        or len(a._shape) != 3
+        or len(b._shape) != 3
+        or not a._is_contiguous
+        or not b._is_contiguous
+        or a._shape[0] != b._shape[0]
+    ):
+        return None
+    batch, m, k = a._shape
+    n = b._shape[1] if transpose_b else b._shape[2]
+    inner = b._shape[2] if transpose_b else b._shape[1]
+    if inner != k or min(batch, m, n, k) <= 0:
+        return None
+    try:
+        causal_bmm = eager_kernels.matmul_ops.CausalBmm
+    except (AttributeError, ImportError):
+        return None
+    out = _alloc((batch, m, n), a._dtype, a._device)
+    try:
+        causal_bmm(
+            out._ptr,
+            a._ptr,
+            b._ptr,
+            (batch, m, n, k, int(bool(transpose_b)), int(causal_mode)),
+            a._dtype.value,
+            _ctx_ptr(a._device),
+        )
+    except NotImplementedError:
+        # The bridge validates its own arguments and signals refusal this way.
+        # Discard the output so the caller's dense chain allocates a fresh one.
+        return None
+    return out
+
+
 def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout_p):
     """Decomposed SDPA returning output, pre-dropout probabilities, and mask.
 
@@ -3820,6 +3880,13 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
     v3 = _view_of(
         v, kv3_shape, _row_major_strides(kv3_shape), v._offset, contiguous=True
     )
+    # SDPA_CAUSAL_OUT would skip the fully masked output tiles of the score
+    # matrix here, and it is correct, but it is measurably *not* worth it: at
+    # these shapes the batched GEMM is bound by workgroup dispatch rather than by
+    # the work inside a workgroup, so the 44% of tiles it removes buy nothing
+    # (895.05 -> 901.77 us, against 488.42 us for a dense half-width control with
+    # the same live-tile count). See optimization_journal.md, diagnostic
+    # experiment AA.
     scores = _try_bf16_bmm(q3, k3, transpose_b=True)
     if scores is None:
         scores = _try_tf32_bmm(q3, k3, transpose_b=True)
@@ -3864,7 +3931,13 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
         effective_probs, dropout_mask = dropout_result
         del dropout_result
 
-    out = _try_bf16_bmm(effective_probs, v3)
+    out = None
+    if is_causal:
+        # P is exactly zero above the diagonal, so output row block r only needs
+        # contraction indices below its last row.  Exact for any consumer.
+        out = _try_sdpa_causal_bmm(effective_probs, v3, False, SDPA_CAUSAL_A_ROWS)
+    if out is None:
+        out = _try_bf16_bmm(effective_probs, v3)
     if out is None:
         out = _try_tf32_bmm(effective_probs, v3)
     if out is None:

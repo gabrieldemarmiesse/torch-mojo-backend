@@ -1141,13 +1141,43 @@ def _amd_dynamic_mfma_gemm[
 # ---------------------------------------------------------------------------
 
 
-@__name(t"amd_batched_mfma_{dtype}_tb{transpose_b}_{BM}x{BN}x{BLOCK_K}")
+# Causal regimes for the batched route.  A top-left-aligned causal mask makes
+# the score matrix live only where `column <= row`, which the three attention
+# GEMM shapes see in three different places:
+#
+#   CAUSAL_NONE   the ordinary dense GEMM.
+#   CAUSAL_OUT    the output itself is the masked matrix (Q @ K^T and dO @ V^T).
+#                 A whole output tile above the diagonal contributes nothing and
+#                 is not computed *or written*: its consumer reads only the live
+#                 prefix of every row.
+#   CAUSAL_A_ROWS A is the masked matrix and K is its column axis (P @ V and
+#                 dS @ K).  Output row block `r` can only see contraction
+#                 indices below `(r + 1) * BM`, so the K loop is shortened.
+#   CAUSAL_B_COLS B is the masked matrix and K is its row axis (dO^T @ P and
+#                 Q^T @ dS).  Output column block `c` can only see contraction
+#                 indices from `c * BN` up, so the K loop starts late.
+#
+# The last two are exact whatever the consumer does, because the skipped
+# contraction indices multiply exact zeros.  CAUSAL_OUT leaves the masked half of
+# its output undefined, so it may only be selected when the caller knows the
+# consumer is causal-aware; `_causal_bmm_dispatch` takes that as an argument
+# rather than assuming it.
+comptime CAUSAL_NONE = 0
+comptime CAUSAL_OUT = 1
+comptime CAUSAL_A_ROWS = 2
+comptime CAUSAL_B_COLS = 3
+
+
+@__name(
+    t"amd_batched_mfma_{dtype}_tb{transpose_b}_{BM}x{BN}x{BLOCK_K}_cz{CAUSAL}"
+)
 def _amd_batched_mfma_kernel[
     dtype: DType,
     transpose_b: Bool,
     BM: Int,
     BN: Int,
     BLOCK_K: Int,
+    CAUSAL: Int,
     config: MatmulConfig[dtype, dtype, dtype, transpose_b],
 ](
     c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
@@ -1161,13 +1191,42 @@ def _amd_batched_mfma_kernel[
     b_bstride: Int,
 ):
     """One batch element per block_idx.z, sharing the 2-D multistage core."""
+    comptime assert (
+        CAUSAL == CAUSAL_NONE or CAUSAL == CAUSAL_OUT or not transpose_b
+    ), "the contraction-side causal regimes need a [K, N] B operand"
     var z = Int(block_idx.z)
+    var row_block = Int(block_idx.y)
+    var col_block = Int(block_idx.x)
     var c_ptr = c_base + z * c_bstride
+
+    # A shortened or late-starting K range, in units of elements.  BM, BN and
+    # BLOCK_K are all multiples of BLOCK_K and the dispatch guarantees
+    # `k % 32 == 0`, so every bound below stays a whole number of K tiles and
+    # the loader never reads past the operand.
+    var k_off = 0
+    var k_live = k
+    comptime if CAUSAL == CAUSAL_OUT:
+        # Entirely above the diagonal: nothing to accumulate, and the consumer
+        # never reads it.
+        if col_block * BN >= (row_block + 1) * BM:
+            return
+    comptime if CAUSAL == CAUSAL_A_ROWS:
+        k_live = min(k, (row_block + 1) * BM)
+    comptime if CAUSAL == CAUSAL_B_COLS:
+        k_off = min(k, col_block * BN)
+        k_live = k - k_off
+
     var c = TileTensor(c_ptr, row_major(Coord(m, n)))
-    var a = TileTensor(a_base + z * a_bstride, row_major(Coord(m, k)))
+    # `multistage_gemm_kernel` takes M from C and both N and K from B, so a
+    # shortened K only has to be expressed in B's extent; A keeps its true row
+    # stride and is merely offset along the contraction axis.
+    var a = TileTensor(
+        a_base + z * a_bstride + (k_off if not transpose_b else 0),
+        row_major(Coord(m, k)),
+    )
     var b = TileTensor(
-        b_base + z * b_bstride,
-        row_major(Coord(n, k)) if transpose_b else row_major(Coord(k, n)),
+        b_base + z * b_bstride + k_off * n,
+        row_major(Coord(n, k)) if transpose_b else row_major(Coord(k_live, n)),
     )
 
     # The core's epilogue path already guards `row < m and col < n` before it
@@ -1183,6 +1242,25 @@ def _amd_batched_mfma_kernel[
             Int(coords[0]) * n + Int(coords[1]), value.cast[dtype]()
         )
 
+    comptime if CAUSAL == CAUSAL_B_COLS:
+        # A column block past the last live contraction index has an all-zero
+        # output tile.  Write it rather than skip it: unlike CAUSAL_OUT this
+        # region is inside the live part of the result.
+        if k_live <= 0:
+            var tid = Int(thread_idx.x)
+            var threads = Int(block_dim.x)
+            var row_end = min(m, (row_block + 1) * BM)
+            var col_end = min(n, (col_block + 1) * BN)
+            var index = tid
+            var total = BM * BN
+            while index < total:
+                var row = row_block * BM + index // BN
+                var col = col_block * BN + index % BN
+                if row < row_end and col < col_end:
+                    c_ptr[row * n + col] = Scalar[dtype](0)
+                index += threads
+            return
+
     multistage_gemm_kernel[
         config=config,
         elementwise_lambda_fn=Optional[elementwise_epilogue_type](_store),
@@ -1192,9 +1270,9 @@ def _amd_batched_mfma_kernel[
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(256))
 )
-@__name(t"amd_batched_mfma_edge_{dtype}_tb{transpose_b}")
+@__name(t"amd_batched_mfma_edge_{dtype}_tb{transpose_b}_cz{CAUSAL}")
 def _amd_batched_mfma_edge_kernel[
-    dtype: DType, transpose_b: Bool
+    dtype: DType, transpose_b: Bool, CAUSAL: Int
 ](
     c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -1208,7 +1286,11 @@ def _amd_batched_mfma_edge_kernel[
     col_start: Int,
     col_count: Int,
 ):
-    """Scalar cleanup for the trailing N columns of every batch element."""
+    """Scalar cleanup for the trailing N columns of every batch element.
+
+    The causal regimes are applied per element here rather than per tile, which
+    is exact and needs no divisibility between the tile and the extents.
+    """
     var idx = Int(block_idx.x) * 256 + Int(thread_idx.x)
     if idx >= m * col_count:
         return
@@ -1217,8 +1299,18 @@ def _amd_batched_mfma_edge_kernel[
     var col = col_start + idx % col_count
     var a = a_base + z * a_bstride
     var b = b_base + z * b_bstride
+    var k_begin = 0
+    var k_end = k
+    comptime if CAUSAL == CAUSAL_OUT:
+        if col > row:
+            (c_base + z * c_bstride)[row * n + col] = Scalar[dtype](0)
+            return
+    comptime if CAUSAL == CAUSAL_A_ROWS:
+        k_end = min(k, row + 1)
+    comptime if CAUSAL == CAUSAL_B_COLS:
+        k_begin = min(k, col)
     var acc = Scalar[DType.float32](0)
-    for kk in range(k):
+    for kk in range(k_begin, k_end):
         var bv = b[col * k + kk] if transpose_b else b[kk * n + col]
         acc = (
             a[row * k + kk]
@@ -1239,6 +1331,7 @@ def _amd_batched_mfma_gemm[
     BLOCK_K: Int = 32,
     WARP_K_PARTITIONS: Int = 1,
     STAGES: Int = 2,
+    CAUSAL: Int = CAUSAL_NONE,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -1280,7 +1373,7 @@ def _amd_batched_mfma_gemm[
     if n_full > 0:
         ctx.enqueue_function[
             _amd_batched_mfma_kernel[
-                dtype, transpose_b, BM, BN, BLOCK_K, config
+                dtype, transpose_b, BM, BN, BLOCK_K, CAUSAL, config
             ]
         ](
             c_ptr,
@@ -1301,9 +1394,11 @@ def _amd_batched_mfma_gemm[
         )
     if n_full < n:
         var col_count = n - n_full
-        _enqueue_cached[_amd_batched_mfma_edge_kernel[dtype, transpose_b]](
+        _enqueue_cached[
+            _amd_batched_mfma_edge_kernel[dtype, transpose_b, CAUSAL]
+        ](
             ctx,
-            String(t"amd_batched_mfma_edge_{dtype}_tb{transpose_b}"),
+            String(t"amd_batched_mfma_edge_{dtype}_tb{transpose_b}_cz{CAUSAL}"),
             ceildiv(m * col_count, 256),
             batch,
             1,
@@ -1320,6 +1415,124 @@ def _amd_batched_mfma_gemm[
             n_full,
             col_count,
         )
+
+
+@always_inline
+def _batched_mfma_tile[
+    dtype: DType, transpose_b: Bool, CAUSAL: Int = CAUSAL_NONE
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    batch: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    a_bstride: Int,
+    ctx: DeviceContext,
+) raises:
+    """Tile selection for the batched route, from the runtime operand shape.
+
+    The batch alone gives the grid several workgroups per CU at any useful tile,
+    so unlike the unbatched large-m regime the choice is not a grid-fill
+    question: take the largest macro tile that both extents admit.  A tile wider
+    than N would leave every column to the scalar cleanup kernel, which measured
+    22.2 ms against 0.9 ms for a fitting tile, so BN never exceeds N.
+
+    `BLOCK_K` is 16 for float32 rather than 32 because two pipeline stages of a
+    128x128x32 float32 tile request the entire 64 KB gfx942 LDS budget, which
+    diagnostic experiment V showed does not launch.  At 16 it is 32 KB, and it is
+    the same K depth the unbatched float32 deep-K route already uses.
+    """
+    comptime BK = 16 if dtype == DType.float32 else 32
+    if m >= 128 and n >= 128:
+        _amd_batched_mfma_gemm[
+            dtype, 128, 128, 32, 64, transpose_b, BK, 1, 2, CAUSAL
+        ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
+    elif m >= 128:
+        _amd_batched_mfma_gemm[
+            dtype, 128, 64, 32, 64, transpose_b, BK, 1, 2, CAUSAL
+        ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
+    elif n >= 128:
+        _amd_batched_mfma_gemm[
+            dtype, 64, 128, 32, 64, transpose_b, BK, 1, 2, CAUSAL
+        ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
+    else:
+        _amd_batched_mfma_gemm[
+            dtype, 64, 64, 32, 32, transpose_b, BK, 1, 2, CAUSAL
+        ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
+
+
+@always_inline
+def _causal_bmm_dispatch(
+    dtype: DType,
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    batch: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    transpose_b: Int,
+    causal: Int,
+    ctx: DeviceContext,
+) raises:
+    """Batched GEMM that may skip contraction indices a causal mask kills.
+
+    Falls back to the ordinary dense batched GEMM whenever the causal MFMA
+    route is not selectable, which is always a correct (merely slower) answer
+    for the two contraction-side regimes.  `CAUSAL_OUT` is different: it leaves
+    the masked half of the output unwritten, so the caller asks for it only when
+    its consumer reads the live prefix of each row -- see
+    `_sdpa_math_forward_with_dropout` and `_ScaledDotProductAttentionAutograd`.
+    """
+    var eligible = False
+    comptime if has_accelerator():
+        comptime if _accelerator_arch() == "amdgpu:gfx942":
+            eligible = batch > 1 and m >= 64 and n >= 64 and k % 32 == 0
+    if eligible:
+        var handled = False
+        comptime for dt in [DType.float32, DType.bfloat16]:
+            if dtype == dt:
+                if transpose_b != 0:
+                    if causal == CAUSAL_OUT:
+                        _batched_mfma_tile[dt, True, CAUSAL_OUT](
+                            c_addr, a_addr, b_addr, batch, m, n, k, m * k, ctx
+                        )
+                        handled = True
+                elif causal == CAUSAL_A_ROWS:
+                    _batched_mfma_tile[dt, False, CAUSAL_A_ROWS](
+                        c_addr, a_addr, b_addr, batch, m, n, k, m * k, ctx
+                    )
+                    handled = True
+                elif causal == CAUSAL_B_COLS:
+                    _batched_mfma_tile[dt, False, CAUSAL_B_COLS](
+                        c_addr, a_addr, b_addr, batch, m, n, k, m * k, ctx
+                    )
+                    handled = True
+                elif causal == CAUSAL_OUT:
+                    _batched_mfma_tile[dt, False, CAUSAL_OUT](
+                        c_addr, a_addr, b_addr, batch, m, n, k, m * k, ctx
+                    )
+                    handled = True
+        if handled:
+            return
+    _gemm_dtype_dispatch(
+        dtype,
+        c_addr,
+        a_addr,
+        b_addr,
+        batch,
+        m,
+        n,
+        k,
+        m * k,
+        transpose_b,
+        0,
+        0,
+        0,
+        ctx,
+    )
 
 
 @always_inline
@@ -1407,22 +1620,9 @@ def _amd_dynamic_mfma_dispatch[
         else:
             if m < 64 or n < 64:
                 return False
-            if m >= 128 and n >= 128:
-                _amd_batched_mfma_gemm[dtype, 128, 128, 32, 64, transpose_b](
-                    c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx
-                )
-            elif m >= 128:
-                _amd_batched_mfma_gemm[dtype, 128, 64, 32, 64, transpose_b](
-                    c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx
-                )
-            elif n >= 128:
-                _amd_batched_mfma_gemm[dtype, 64, 128, 32, 64, transpose_b](
-                    c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx
-                )
-            else:
-                _amd_batched_mfma_gemm[dtype, 64, 64, 32, 32, transpose_b](
-                    c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx
-                )
+            _batched_mfma_tile[dtype, transpose_b](
+                c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx
+            )
             return True
     if m < 64:
         return False
@@ -3647,6 +3847,49 @@ def _bmm_dispatcher(
     return _raw_ret_none()
 
 
+def _causal_bmm_go(
+    out_ptr: PyObjectPtr,
+    a_ptr: PyObjectPtr,
+    b_ptr: PyObjectPtr,
+    # (batch, m, n, k, transpose_b, causal_mode)
+    params: PyObjectPtr,
+    dtype_obj: PyObjectPtr,
+    device_context_ptr: PyObjectPtr,
+) raises:
+    var ctx = _raw_ctx(device_context_ptr)
+    var causal = _raw_tuple_int(params, 5)
+    if causal < CAUSAL_NONE or causal > CAUSAL_B_COLS:
+        raise Error("CausalBmm: unknown causal mode ", causal)
+    _causal_bmm_dispatch(
+        _raw_dtype_int(dtype_obj),
+        _raw_int(out_ptr),
+        _raw_int(a_ptr),
+        _raw_int(b_ptr),
+        _raw_tuple_int(params, 0),
+        _raw_tuple_int(params, 1),
+        _raw_tuple_int(params, 2),
+        _raw_tuple_int(params, 3),
+        _raw_tuple_int(params, 4),
+        causal,
+        ctx,
+    )
+
+
+def _causal_bmm_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 6:
+            raise Error("CausalBmm expects exactly 6 arguments")
+        _causal_bmm_go(args[0], args[1], args[2], args[3], args[4], args[5])
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
 # ---------------------------------------------------------------------------
 # TensorSpec entries (docs/tensor_spec_design.md): the matmul-family
 # prologue — shape/dtype/contiguity gates, m/n/k geometry, output alloc and
@@ -4072,6 +4315,18 @@ def PyInit_matmul_ops() abi("C") -> PythonObject:
             docstring=(
                 "batched C = A @ B (rank 3, optional transposed B); pure Mojo"
                 " tiled kernels on GPU, modular's linalg matmul on CPU"
+            ),
+        )
+        b.def_py_c_function(
+            _causal_bmm_dispatcher,
+            "CausalBmm",
+            docstring=(
+                "(out_ptr, a_ptr, b_ptr, (batch, m, n, k, transpose_b,"
+                " causal_mode), dtype, context_ptr); batched C = A @ B that"
+                " skips the contraction indices a top-left-aligned causal mask"
+                " kills. Mode 1 leaves the masked half of the output unwritten"
+                " (its consumer must read only each row's live prefix), modes 2"
+                " and 3 are exact for any consumer"
             ),
         )
         b.def_function[_matmul_tune_dispatcher](

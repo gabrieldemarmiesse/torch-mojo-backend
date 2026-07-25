@@ -1507,3 +1507,263 @@ predicate is whichever `(BM, BN, WM, WN)` the old dispatch selected with a warp
 tile one MMA wide in some dimension, which is a function of the branch taken
 rather than of a single interval in k, so the honest statement is the branch
 condition plus the geometry, not a k range.
+
+# nanoGPT SDPA target, MI300X — 2026-07-25
+
+Baseline for this target, from `current_bench_train/comparison_v2`: SDPA
+backward mojo 239.28 ms/step against PyTorch-ROCm's 33.95 (7.05x, 40.2% of the
+whole remaining gap) and SDPA forward 105.07 against 9.08 (11.57x, 18.8%).
+Measured standalone, ROCm's fused flash attention is 8.158 ms/step forward and
+28.966 backward.
+
+## Diagnostic experiment Z — MAX's AMD flash attention on gfx942
+
+**Hypothesis.** `max/kernels/src/nn/attention/gpu/mha.mojo` has a
+`flash_attention` with real AMD CDNA support (`has_amd_gpu_accelerator()`
+branches, "AMD bf16: 4 warps (256 threads) with 16x16 MMA", `BN = 128` for AMD).
+If its `MHAConfig`/`q_layout` can carry a runtime sequence length and batch, and
+if it reaches no vendor library, the forward half of this target is solved by
+routing to it, leaving only a fused backward to write.
+
+**Predicted effect.** Either a reachable forward at about ROCm's 8.2 ms/step, or
+a specific reason it is unreachable.
+
+**Measured effect.** Unreachable on this pin, for three independent reasons, all
+in the source:
+
+1. **Runtime extents: partly fine, partly not.** `batch`, `seq_len` and
+   `num_keys` *are* runtime (`mha.mojo:1685-1688`, plain `Int` kernel arguments),
+   but `num_heads` and `head_dim` must be comptime — `comptime assert depth ==
+   Int(q.layout.shape[q.rank - 1])` and the same for `num_heads`
+   (`mha.mojo:607-608`), and `head_depth_known` (`mha.mojo:1693`) silently
+   degrades the whole call to `mha_gpu_naive` when they are not. Under AGENTS.md
+   rule 4 head count and depth as compile-time regimes behind a runtime dispatch
+   would have been acceptable. What is not: the dense overload discards the
+   caller's strides and re-imposes contiguous BSHD (`mha.mojo:1710-1728`), and
+   the AMD kernel bakes `num_heads * depth` into comptime tile strides
+   (`amd_structured/attention.mojo:245-266`, `kv_buffer.mojo:86-91`).
+2. **gfx942 is refused, hard.** Every AMD attention path is written for gfx950.
+   `AMDStructuredConfig.get_mma_shape()` returns 32x32x16 for BF16 prefill and
+   16x16x32 for decode (`amd_structured/config.mojo:100-121`), and both land in
+   branches guarded by `comptime assert _cdna_4_or_newer()` in
+   `mma_amd.mojo:196-212`. gfx942 is CDNA3, so `_cdna_4_or_newer()` is False. The
+   V operand load uses `ds_read_tr16_b64`, itself
+   `comptime assert _cdna_4_or_newer()` (`intrinsics.mojo:1231`), and the KV DMA
+   emits a 16-byte `buffer_load_dwordx4 ... lds` that only exists on gfx950
+   (`amd_tile_io.mojo:1675-1680`). The CDNA3-legal `32x32x8bf16.1k` and
+   `16x16x16bf16.1k` shapes exist in the stdlib but no attention config selects
+   them. LDS is *not* the obstacle: at head_dim 64 that path needs about 33 KB of
+   gfx942's 64 KB.
+3. **There is no backward.** `flash_attention_bwd`, `mha_bwd`,
+   `attention_backward` and even the substring `_bwd` return zero hits over the
+   entire `/tmp/modular` tree. MAX ships forward-only attention on every
+   architecture.
+
+No vendor library is involved on that path (rocBLAS/hipBLASLt/MIOpen are lazy
+`dlopen` and unreachable from it), so the prohibition was not the blocker — the
+architecture gate was.
+
+**Decision.** Reject the fusion route. Porting `amd_structured` to CDNA3 means a
+new MFMA fragment geometry, an explicit LDS transpose to replace
+`ds_read_tr16_b64`, and a narrowed LDS DMA — a port, not a configuration — and it
+would still leave the larger half (28.97 of 37.1 ms) to write from scratch. Take
+the causal-decomposition route instead, whose floor the harness README puts near
+25 ms/step against ROCm's 37.1.
+
+## Change 15 — batched MFMA GEMM
+
+**Hypothesis.** `_amd_dynamic_mfma_dispatch` opens with `if batch != 1 ... return
+False`, so all six attention batched GEMMs fall through to the portable
+scalar-FFMA `pure_gemm_tiled` kernel: 167.07 ms/step against `torch.bmm`'s 36.60,
+at 32-36 TFLOP/s where Tensile reaches 122-178. `multistage_gemm_kernel` takes
+its output-tile coordinates from `block_idx.x` and `.y` only, so `block_idx.z` is
+free to carry the batch index — which is exactly how MAX's own
+`batched_matmul_kernel_gpu` batches it on NVIDIA (`linalg/bmm.mojo`, the
+`is_nvidia_gpu()` branch; its AMD branch routes to `AMDMatmul`, which
+experiment Y already showed needs static N and K).
+
+**Predicted effect.** The six GEMMs reach the same 73-178 TFLOP/s band the
+unbatched route reaches, i.e. roughly 50 ms/step, and `batch == 1` does not move
+at all.
+
+**Measured effect.** A wrapper kernel offsets the three operand pointers by their
+runtime batch strides and calls the same core; the trailing N columns get a
+batched scalar cleanup kernel. Geometry swept over 27 candidates at the three
+attention shapes (25 warmups, 100 synchronized iterations each), best per shape:
+
+| shape (batch,m,n,k,tb) | before | 128x128 (32x64) | 128x64 (32x64) | 64x128 (32x64) | 64x64 (32x32) |
+|---|---:|---:|---:|---:|---:|
+| 576,1024,1024,64,T | 2166.98 | **894.61** | 1243.82 | 1205.76 | 979.59 |
+| 576,1024,64,1024,N | 2373.52 | n/a (BN>n) | **648.67** | n/a | 699.98 |
+| 576,64,1024,1024,N | 2419.20 | n/a (BM>m) | 1119.15 | **590.29** | 698.73 |
+
+`n/a (BN>n)` is not a missing measurement: a tile wider than N leaves *every*
+column to the scalar cleanup kernel and measures 22.2 ms, which is how the
+dispatch rule below was found. Rejected along the way: 128x256, 256x128,
+256x64, 64x256, 128x128 with 64x64 warps, BLOCK_K 64 and three pipeline stages
+were all 13-390% slower (worst: 256x128 with 64x64 warps at 4659 us on the m=64
+shape).
+
+Production dispatch (`m >= 128` and `n >= 128` -> 128x128, else the largest tile
+that still fits both extents) gives **167.069 -> 51.220 ms/step against ROCm's
+36.604, ratio 4.564 -> 1.399**, at 86-131 TFLOP/s. All six cases pass the
+all-ones gate and all six pass `--pattern-check=1`.
+
+`batch == 1` is bit-identical by construction — the batched branch is entered
+only for `batch != 1` and the old guard's other three clauses are unchanged.
+Confirmed: `bench_linear_gemm` reports per-step 257.311 ms, ratio 3.592
+(recorded: 257.371, 3.593; the difference is under run-to-run noise), fifteen of
+fifteen cases passing both gates, transpose materialization 12.026 ms.
+
+**Decision.** Accept.
+
+## Change 16 — dtype-parameterized fused SDPA softmax backward
+
+**Hypothesis.** `sdpa_dropout_softmax_backward_kernels.mojo` was written against
+`UnsafePointer[Scalar[DType.float32]]` throughout and
+`fast_sdpa_dropout_softmax_backward` gated on `probs._dtype == DType.float32`, so
+this BF16 workload took the five-kernel fallback: `logic_ops__bin_bcast_kernel`
+50.7 ms + `logic_ops__bin_flat_vec_kernel` 23.7 + `reduce_rows_block_bfloat16`
+14.7 + `elementwise_r1_w1` 11.2, about 100 ms/step, against three passes over a
+1.208 GB tensor if fused.
+
+**Predicted effect.** Parameterizing on dtype while keeping the row reduction in
+float32 should land near 8-10 ms/step (43.5 GB/step at realistic bandwidth).
+
+**Measured effect.** One warp per row, four warps per 256-thread block, 16-byte
+vector accesses, online float32 reduction, and a causal regime whose extent is
+`min(cols, row % q_len + 1)`. New harness
+`harness/nanogpt_train/bench_attention_softmax.mojo`, 25 warmups and 100
+synchronized iterations: **778.27 us/layer, 9.34 ms/step** at the nanoGPT shape
+(589824 rows x 1024 cols).
+
+Correctness against a one-thread-per-row scalar reference in the harness that
+shares no code with the kernel: maximum absolute error over every one of the
+604 million elements is 1e-6 at the nanoGPT shape, 1e-6 at 1000 columns and 4e-6
+at 1025 columns (the scalar regime), against a two-BF16-rounding budget of
+3.9e-3.
+
+**Decision.** Accept. This was the best value-per-line item in the target.
+
+## Change 17 — causal row softmax for the forward
+
+**Hypothesis.** The forward softmax delegates to MAX's `nn.softmax` with the
+scale and the causal mask folded into an input lambda, so it reads,
+exponentiates and writes the *whole* square and only then replaces masked lanes
+with -inf: 41.9 ms/step for 43.5 GB, about 1.0 TB/s on a part whose spec is 5.3.
+A kernel whose row extent is the live prefix does the same arithmetic over half
+the bytes.
+
+**Predicted effect.** Roughly 4x, i.e. about 10 ms/step.
+
+**Measured effect.** Same warp-per-row shape as Change 16, with an online
+single-read max+sum in float32: **833.14 us/layer, 9.98 ms/step**, a 4.2x
+improvement. Maximum absolute error against the harness's scalar reference is
+8e-6 at the nanoGPT shape, 1.5e-5 at 1000 columns and 1.22e-4 at 1025 columns.
+
+The regime is selected only for causal rows with `cols <= 8192` and
+`rows >= 256`: below that a warp per row cannot fill the device and above it one
+warp per row becomes the bottleneck, and non-causal softmax — which has no
+prefix to exploit — keeps MAX's kernel untouched, so no other op moves.
+
+**Decision.** Accept.
+
+## Change 18 — contraction-side causal regimes in the batched GEMM
+
+**Hypothesis.** With `is_causal=True` the score matrix is zero above the
+diagonal, and four of the six attention GEMMs contract over one of its axes. Two
+of them (`P @ V`, `dS @ K`) can only see contraction indices below the last row
+of their output row block; the other two (`dO^T @ P`, `Q^T @ dS`) can only see
+indices from the first column of their output column block up. Skipping the rest
+multiplies exact zeros away, so it is exact for any consumer and should remove
+about 44% of the operand traffic.
+
+**Predicted effect.** Roughly 40% on those four GEMMs, i.e. about 10 ms/step.
+
+**Measured effect.** Reached through a new `matmul_ops.CausalBmm` bridge and
+`aten_fast._try_sdpa_causal_bmm`; `multistage_gemm_kernel` takes K from B only,
+so a shortened range is expressed as B's runtime extent plus a pointer offset on
+both operands, and A keeps its true row stride. 25 warmups, 100 synchronized
+iterations:
+
+| case | dense | causal | change |
+|---|---:|---:|---:|
+| fwd_out_pv (`CAUSAL_A_ROWS`) | 649.06 | 612.82 | -5.6% |
+| bwd_dq_ds_k (`CAUSAL_A_ROWS`) | 648.77 | 612.88 | -5.5% |
+| bwd_dv_dotT_p (`CAUSAL_B_COLS`) | 590.28 | 588.13 | -0.4% |
+| bwd_dk_qT_ds (`CAUSAL_B_COLS`) | 590.40 | 587.73 | -0.5% |
+
+Far below the prediction; experiment AA below is why. All four pass a new
+closed-form gate that inspects every output element: the operand the regime
+claims is causal is filled with `1` on and below the diagonal and the other with
+ones, so `CAUSAL_A_ROWS` must produce `min(k, row + 1)` and `CAUSAL_B_COLS` must
+produce `max(0, k - col)` — closed forms that vary along exactly the axis the
+regime restricts.
+
+That gate initially failed on 1/8 of elements in all four cases, and the fault
+was the gate, not the kernel: it reused `_bf16_round`, which rounds halves away
+from zero, while the store rounds half to even. The expected values here run over
+every integer up to k, so a quarter of them are exact BF16 ties and half of those
+disagree — exactly one eighth. The gate now uses the same hardware conversion the
+store uses, and all four pass.
+
+**Decision.** Accept, at 0.92 ms/step rather than the predicted 10. It is exact,
+it costs nothing at runtime, and it becomes worth much more if the barrier in
+experiment AA is ever removed.
+
+## Diagnostic experiment AA — causal output-tile skipping, and what really binds these GEMMs
+
+**Hypothesis.** The two GEMMs whose *output* is the masked matrix (`Q @ K^T`,
+`dO @ V^T`) can skip whole output tiles above the diagonal, neither computing nor
+writing them. At `m = n = 1024` with a 128x128 tile that is 28 of 64 tiles, so
+they should be about 44% faster.
+
+**Predicted effect.** 895 us -> about 500 us on both.
+
+**Measured effect.** 895.05 -> 901.91 us. A *regression*, and the tiles really
+are being skipped: a deliberately skewed shape (`batch 64, m 128, n 8192, k 64`,
+where 63 of 64 tiles are masked) goes 114.64 -> 48.50 us.
+
+The control that explains it: a **dense** GEMM at `m = 1024, n = 512` has the
+same 32 live tiles per batch as the causal one has (36), and runs in **488.42 us**
+against the causal 901.91. So the skipped tiles are not free — they cost about
+half of a working tile.
+
+Across every measurement here the time is proportional to the **workgroup count**
+and to nothing else:
+
+| case | workgroups | us | WG/us |
+|---|---:|---:|---:|
+| m1024 n1024 dense | 36864 | 884.0 | 41.7 |
+| m1024 n512 dense | 18432 | 488.4 | 37.8 |
+| m1024 n1024 causal (28/64 skipped) | 36864 | 901.9 | 40.9 |
+| skew dense | 4096 | 114.6 | 35.7 |
+| skew causal (63/64 skipped) | 4096 | 48.5 | 84.5 |
+
+35-42 workgroups per microsecond is a **workgroup launch rate**, not a bandwidth
+or a FLOP rate: a 128x128x64 tile moves 64 KB, and 64 KB per 24 ns is 2.7 TB/s,
+so at these shapes the launch rate and the bandwidth limit happen to coincide —
+which is exactly why removing work from inside a workgroup buys nothing while
+removing the workgroup itself buys everything (the skew row: an empty workgroup
+launches about twice as fast as a full one, and no faster).
+
+**Decision.** Reject `CAUSAL_OUT` for production. It stays implemented and
+exercised by the harness (`--causal=1`) because it is the evidence for this
+finding, and because it becomes valuable the moment the launch rate stops
+binding. Production selects only the two contraction-side regimes, which need no
+assumption about the consumer; that also removes the only place where an output's
+masked half would have been left undefined, and with it the eligibility
+plumbing that would have been needed to make that safe.
+
+**The barrier this identifies, measured and not addressed.** These six GEMMs
+issue 4608-36864 workgroups each and are bound by how fast the hardware can
+launch them. The fix is a persistent kernel: launch about two workgroups per CU
+and loop over output tiles inside one, so the launch rate stops mattering and a
+causal skip becomes a pure work reduction. That is not expressible around MAX's
+`multistage_gemm_kernel` as called here — it allocates its LDS with
+`external_memory` and ends its K loop without a trailing barrier, so reusing the
+same workgroup for a second output tile needs an explicit barrier and a review of
+its LDS lifetime, i.e. new kernel work inside the core rather than around it.
+Larger macro tiles are the cheap version of the same idea and were measured
+worse: 128x256 and 256x128 halve the workgroup count but take 2.2-2.8x as long
+per workgroup, because two pipeline stages of them leave one workgroup per CU.

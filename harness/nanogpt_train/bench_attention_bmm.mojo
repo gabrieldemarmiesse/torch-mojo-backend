@@ -32,7 +32,15 @@ from std.math import ceildiv
 from std.time import perf_counter_ns
 
 from internal_utils import arg_parse
-from matmul_ops import _amd_batched_mfma_gemm, _gemm_dtype_dispatch
+from matmul_ops import (
+    CAUSAL_A_ROWS,
+    CAUSAL_B_COLS,
+    CAUSAL_NONE,
+    CAUSAL_OUT,
+    _amd_batched_mfma_gemm,
+    _causal_bmm_dispatch,
+    _gemm_dtype_dispatch,
+)
 
 comptime FILL_BLOCK = 256
 comptime FILL_VEC = 4
@@ -188,6 +196,83 @@ def _count_pattern_not_equal(
     counts[Int(block_idx.x) * FILL_BLOCK + Int(thread_idx.x)] = local
 
 
+@__name("bench_bmm_fill_causal_ones_bf16")
+def _fill_causal_ones(
+    ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    batch: Int,
+    rows: Int,
+    cols: Int,
+):
+    """One where `col <= row`, zero above the diagonal, in every batch element.
+
+    This is the shape the causal contraction-side regimes claim to exploit: the
+    skipped contraction indices multiply exactly these zeros.
+    """
+    var index = Int(block_idx.x) * FILL_BLOCK + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * FILL_BLOCK
+    var per_matrix = rows * cols
+    var count = batch * per_matrix
+    while index < count:
+        var within = index % per_matrix
+        ptr[index] = Float32(
+            1.0 if within % cols <= within // cols else 0.0
+        ).cast[DType.bfloat16]()
+        index += stride
+
+
+@__name("bench_bmm_count_causal_ne_bf16")
+def _count_causal_not_equal(
+    counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    values: UnsafePointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
+    batch: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    causal: Int,
+):
+    """Closed-form gate for each causal regime, over every element.
+
+    * `CAUSAL_OUT`: operands are all ones, so every element on or below the
+      diagonal must equal K.  Above the diagonal the kernel deliberately writes
+      nothing, so those elements are not inspected.
+    * `CAUSAL_A_ROWS`: A is causal-ones and B is ones, so `C[i, j]` counts the
+      live entries of A's row i: `min(k, i + 1)`.
+    * `CAUSAL_B_COLS`: A is ones and B is causal-ones, so `C[i, j]` counts the
+      live entries of B's column j: `max(0, k - j)`.
+
+    Both closed forms vary along the axis the regime restricts, so a kernel that
+    dropped or double-counted contraction indices cannot pass.
+    """
+    var index = Int(block_idx.x) * FILL_BLOCK + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * FILL_BLOCK
+    var per_matrix = m * n
+    var count = batch * per_matrix
+    var local = Int32(0)
+    while index < count:
+        var within = index % per_matrix
+        var row = within // n
+        var col = within % n
+        var expected = -1
+        if causal == CAUSAL_OUT:
+            if col <= row:
+                expected = k
+        elif causal == CAUSAL_A_ROWS:
+            expected = min(k, row + 1)
+        else:
+            expected = max(0, k - col)
+        if expected >= 0:
+            # The expected values here run over every integer up to k, so many
+            # of them are exact ties in BF16 and the rounding mode matters:
+            # `_bf16_round`'s round-half-away would disagree with the store's
+            # round-half-to-even on exactly one eighth of them.  Use the same
+            # hardware conversion the kernel's store uses, so this stays an
+            # exact equality test.
+            if values[index] != Float32(expected).cast[DType.bfloat16]():
+                local += 1
+        index += stride
+    counts[Int(block_idx.x) * FILL_BLOCK + Int(thread_idx.x)] = local
+
+
 @always_inline
 def _enqueue_fill_const(
     ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -200,6 +285,24 @@ def _enqueue_fill_const(
         count,
         value.cast[DType.bfloat16](),
         grid_dim=(max(1, min(ceildiv(count, FILL_BLOCK * FILL_VEC), 512)),),
+        block_dim=(FILL_BLOCK,),
+    )
+
+
+@always_inline
+def _enqueue_fill_causal_ones(
+    ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    batch: Int,
+    rows: Int,
+    cols: Int,
+    ctx: DeviceContext,
+) raises:
+    ctx.enqueue_function[_fill_causal_ones](
+        ptr,
+        batch,
+        rows,
+        cols,
+        grid_dim=(max(1, min(ceildiv(batch * rows * cols, FILL_BLOCK), 512)),),
         block_dim=(FILL_BLOCK,),
     )
 
@@ -355,9 +458,10 @@ def _explicit_batched[
 
     Benchmark-only: production dispatch (`--config=0`) picks a geometry from the
     runtime shape.  Every extent stays runtime here too; only the tile is
-    compile-time.  Transposed-B geometries one MMA wide in a dimension are
-    miscompiled on gfx942 (journal Change 10), so they are only instantiated for
-    `transpose_b=False`.
+    compile-time.  These four are the survivors of a 27-candidate sweep over the
+    three attention shapes; the losers, and by how much, are recorded in
+    optimization_journal.md under "Change 15" rather than kept instantiated here,
+    because each instantiation costs about ten seconds of harness build time.
     """
     comptime DT = DType.bfloat16
     var bs = m * k
@@ -370,111 +474,31 @@ def _explicit_batched[
             c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
         )
     elif config == 3:
-        _amd_batched_mfma_gemm[DT, 128, 64, 32, 32, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 4:
         _amd_batched_mfma_gemm[DT, 64, 64, 32, 32, transpose_b](
             c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
         )
-    elif config == 5:
-        _amd_batched_mfma_gemm[DT, 64, 256, 32, 64, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 6:
-        _amd_batched_mfma_gemm[DT, 128, 128, 64, 64, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 7:
-        _amd_batched_mfma_gemm[DT, 64, 128, 32, 32, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 8:
-        _amd_batched_mfma_gemm[DT, 32, 128, 32, 64, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 9:
-        _amd_batched_mfma_gemm[DT, 128, 128, 32, 64, transpose_b, 32, 1, 3](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 10:
-        _amd_batched_mfma_gemm[DT, 64, 64, 32, 32, transpose_b, 32, 1, 3](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 11:
-        _amd_batched_mfma_gemm[DT, 128, 128, 32, 64, transpose_b, 64](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 12:
-        _amd_batched_mfma_gemm[DT, 64, 128, 32, 64, transpose_b, 64](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 13:
-        _amd_batched_mfma_gemm[DT, 256, 128, 64, 64, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 14:
-        _amd_batched_mfma_gemm[DT, 128, 256, 64, 64, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 15:
-        _amd_batched_mfma_gemm[DT, 32, 64, 32, 32, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 16:
-        _amd_batched_mfma_gemm[DT, 64, 32, 32, 32, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 17:
-        _amd_batched_mfma_gemm[DT, 32, 32, 32, 32, transpose_b, 32, 2](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 18:
-        _amd_batched_mfma_gemm[DT, 256, 64, 64, 32, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 23:
-        _amd_batched_mfma_gemm[DT, 128, 256, 32, 64, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 24:
-        _amd_batched_mfma_gemm[DT, 256, 128, 32, 64, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 25:
-        _amd_batched_mfma_gemm[DT, 128, 128, 32, 32, transpose_b](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 26:
-        _amd_batched_mfma_gemm[DT, 64, 64, 32, 32, transpose_b, 64](
-            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-        )
-    elif config == 27:
+    elif config == 4:
         _amd_batched_mfma_gemm[DT, 128, 64, 32, 64, transpose_b](
             c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
         )
     else:
-        comptime if transpose_b:
-            raise Error("config not available for transpose_b=True")
-        else:
-            if config == 19:
-                _amd_batched_mfma_gemm[DT, 128, 64, 32, 16, transpose_b](
-                    c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-                )
-            elif config == 20:
-                _amd_batched_mfma_gemm[DT, 64, 64, 16, 32, transpose_b](
-                    c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-                )
-            elif config == 21:
-                _amd_batched_mfma_gemm[DT, 32, 64, 16, 32, transpose_b](
-                    c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-                )
-            elif config == 22:
-                _amd_batched_mfma_gemm[DT, 64, 128, 16, 64, transpose_b](
-                    c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
-                )
-            else:
-                raise Error("unknown --config")
+        raise Error("unknown --config")
+
+
+def _causal_mode_for(label: String) -> Int:
+    """The causal regime each SDPA batched GEMM admits, by its role.
+
+    `fwd_scores_qkT` and `bwd_dp_do_vT` produce the masked matrix itself;
+    `fwd_out_pv` and `bwd_dq_ds_k` contract over the masked matrix's column
+    axis; `bwd_dv_dotT_p` and `bwd_dk_qT_ds` contract over its row axis.
+    """
+    if label == "fwd_scores_qkT" or label == "bwd_dp_do_vT":
+        return CAUSAL_OUT
+    if label == "fwd_out_pv" or label == "bwd_dq_ds_k":
+        return CAUSAL_A_ROWS
+    if label == "bwd_dv_dotT_p" or label == "bwd_dk_qT_ds":
+        return CAUSAL_B_COLS
+    return CAUSAL_NONE
 
 
 def run_case(
@@ -483,6 +507,7 @@ def run_case(
     iterations: Int,
     pattern_check: Bool,
     config: Int,
+    causal: Int,
     ctx: DeviceContext,
 ) raises -> CaseResult:
     var batch = target.batch
@@ -500,7 +525,19 @@ def run_case(
     var b_ptr = b_buf.unsafe_ptr().as_unsafe_any_origin()
     var c_ptr = c_buf.unsafe_ptr().as_unsafe_any_origin()
 
-    if pattern_check:
+    if causal != CAUSAL_NONE:
+        # The regime's own closed-form gate: the operand it claims is causal is
+        # filled with that structure, the other with ones.
+        if causal == CAUSAL_A_ROWS:
+            _enqueue_fill_causal_ones(a_ptr, batch, m, k, ctx)
+            _enqueue_fill_const(b_ptr, b_elements, 1.0, ctx)
+        elif causal == CAUSAL_B_COLS:
+            _enqueue_fill_const(a_ptr, a_elements, 1.0, ctx)
+            _enqueue_fill_causal_ones(b_ptr, batch, k, n, ctx)
+        else:
+            _enqueue_fill_const(a_ptr, a_elements, 1.0, ctx)
+            _enqueue_fill_const(b_ptr, b_elements, 1.0, ctx)
+    elif pattern_check:
         _enqueue_fill_pattern(a_ptr, batch, m, k, k, 1, 1, ctx)
         if target.transpose_b:
             _enqueue_fill_pattern(b_ptr, batch, n, k, k, 1, 0, ctx)
@@ -514,7 +551,21 @@ def run_case(
     @always_inline
     @parameter
     def _launch() raises:
-        if config == 0:
+        if causal != CAUSAL_NONE:
+            _causal_bmm_dispatch(
+                DType.bfloat16,
+                Int(c_buf.unsafe_ptr()),
+                Int(a_buf.unsafe_ptr()),
+                Int(b_buf.unsafe_ptr()),
+                batch,
+                m,
+                n,
+                k,
+                1 if target.transpose_b else 0,
+                causal,
+                ctx,
+            )
+        elif config == 0:
             # The exact production route: _bmm_go builds these arguments from
             # the Python-side pointers and calls this function.
             _gemm_dtype_dispatch(
@@ -573,7 +624,19 @@ def run_case(
 
     var slots = CHECK_BLOCKS * FILL_BLOCK
     var counts = ctx.enqueue_create_buffer[DType.int32](slots)
-    if pattern_check:
+    if causal != CAUSAL_NONE:
+        ctx.enqueue_function[_count_causal_not_equal](
+            counts.unsafe_ptr().as_unsafe_any_origin(),
+            c_buf.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
+            batch,
+            m,
+            n,
+            k,
+            causal,
+            grid_dim=(CHECK_BLOCKS,),
+            block_dim=(FILL_BLOCK,),
+        )
+    elif pattern_check:
         ctx.enqueue_function[_count_pattern_not_equal](
             counts.unsafe_ptr().as_unsafe_any_origin(),
             c_buf.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
@@ -636,6 +699,7 @@ def main() raises:
     var iterations = Int(arg_parse("iterations", 100))
     var pattern_check = Int(arg_parse("pattern-check", 0)) != 0
     var config = Int(arg_parse("config", 0))
+    var causal_route = Int(arg_parse("causal", 0)) != 0
     if warmup < 25 or iterations < 100:
         raise Error("protocol requires >=25 warmups and >=100 iterations")
 
@@ -651,8 +715,11 @@ def main() raises:
         for target in cases:
             if only != "all" and target.label != only:
                 continue
+            var causal = _causal_mode_for(target.label) if causal_route else (
+                CAUSAL_NONE
+            )
             var result = run_case(
-                target, warmup, iterations, pattern_check, config, ctx
+                target, warmup, iterations, pattern_check, config, causal, ctx
             )
             mojo_step_us += result.median_us * Float64(target.calls_per_step)
             rocm_step_us += target.rocm_us * Float64(target.calls_per_step)

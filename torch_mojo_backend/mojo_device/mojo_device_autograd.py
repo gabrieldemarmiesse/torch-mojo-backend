@@ -284,6 +284,15 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
         grad_key3 = None
         grad_value3 = None
 
+        # The two contraction-side causal regimes skip contraction indices that
+        # multiply exactly zero, so they are exact whatever else runs; nothing
+        # here depends on the fused softmax backward being selected. The
+        # output-side regime (which would leave dP's masked half unwritten) is
+        # deliberately not used: it is dispatch-bound at these shapes and
+        # measures slower than the dense GEMM. See optimization_journal.md,
+        # diagnostic experiment AA.
+        causal_bmm = bool(getattr(ctx, "is_causal", False))
+
         if need_value:
             effective_p3 = p3
             if ctx.has_dropout:
@@ -302,9 +311,17 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
                 "SDPA transpose output gradient",
             )
             grad_t = _contiguous_view(grad_t, (batch_heads, head_dim, query_length))
-            grad_value_t = _require_handled(
-                aten_fast.fast_aten_bmm(grad_t, effective_p3), "SDPA value gradient"
-            )
+            grad_value_t = None
+            if causal_bmm:
+                # P is exactly zero above the diagonal, so output column block c
+                # only needs contraction indices from c's first column up.
+                grad_value_t = aten_fast._try_sdpa_causal_bmm(
+                    grad_t, effective_p3, False, aten_fast.SDPA_CAUSAL_B_COLS
+                )
+            if grad_value_t is None:
+                grad_value_t = _require_handled(
+                    aten_fast.fast_aten_bmm(grad_t, effective_p3), "SDPA value gradient"
+                )
             grad_value_view = _require_handled(
                 aten_fast.fast_aten_transpose(grad_value_t, 1, 2),
                 "SDPA transpose value gradient",
@@ -382,9 +399,16 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
             if need_query:
                 k = saved.pop("key")._contig()
                 k3 = _contiguous_view(k, (batch_heads, key_length, head_dim))
-                grad_query3 = _require_handled(
-                    aten_fast.fast_aten_bmm(grad_scores, k3), "SDPA query gradient"
-                )
+                grad_query3 = None
+                if causal_bmm:
+                    # dScores is exactly zero above the diagonal.
+                    grad_query3 = aten_fast._try_sdpa_causal_bmm(
+                        grad_scores, k3, False, aten_fast.SDPA_CAUSAL_A_ROWS
+                    )
+                if grad_query3 is None:
+                    grad_query3 = _require_handled(
+                        aten_fast.fast_aten_bmm(grad_scores, k3), "SDPA query gradient"
+                    )
                 del k, k3
 
             if need_key:
@@ -397,9 +421,15 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
                     aten_fast.fast_aten_transpose(q3, 1, 2), "SDPA transpose query"
                 )
                 q_t = _contiguous_view(q_t, (batch_heads, head_dim, query_length))
-                grad_key_t = _require_handled(
-                    aten_fast.fast_aten_bmm(q_t, grad_scores), "SDPA key gradient"
-                )
+                grad_key_t = None
+                if causal_bmm:
+                    grad_key_t = aten_fast._try_sdpa_causal_bmm(
+                        q_t, grad_scores, False, aten_fast.SDPA_CAUSAL_B_COLS
+                    )
+                if grad_key_t is None:
+                    grad_key_t = _require_handled(
+                        aten_fast.fast_aten_bmm(q_t, grad_scores), "SDPA key gradient"
+                    )
                 grad_key_view = _require_handled(
                     aten_fast.fast_aten_transpose(grad_key_t, 1, 2),
                     "SDPA transpose key gradient",
