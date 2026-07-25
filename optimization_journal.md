@@ -1014,3 +1014,376 @@ eligible for consideration.
 in-core split arithmetic is not production-safe with the generic dynamic
 output layout. Further debugging was stopped at the user's request; the
 accepted runtime-dynamic Change 9 dispatch remains the best kernel.
+
+# nanoGPT training-step MI300X journal (Linear GEMM target)
+
+Second frozen workload, same machine and dependency pin: nanoGPT GPT-2 124M
+(12 layers, 12 heads, 768 embedding, `bias=False`, `vocab_size=50304`), batch
+48, block 1024, BF16 autocast, fused AdamW, gradient clipping, eager, no
+`torch.compile`. The target is every Linear GEMM the step issues: 5 forward,
+5 data-gradient and 5 weight-gradient shapes, weighted by calls per step.
+Acceptance is mojo/rocm <= 1.02 on the per-step weighted total, with both of
+`harness/nanogpt_train/bench_linear_gemm.mojo`'s exact-equality gates passing
+(all-ones, and `--pattern-check=1`).
+
+Protocol is unchanged: >= 25 warmups and >= 100 individually synchronized timed
+iterations for every number, timing from `--kernel-trace` or the harness itself
+and never from a `--pmc` run, and every tensor extent stays a runtime value.
+
+## Baseline verification — 2026-07-25
+
+`/tmp/bench_linear_gemm` at commit 0cab8db: per-step weighted total mojo
+506.905 ms, rocm 71.639 ms, **ratio 7.076**, of which 140.883 ms is the
+transposed-operand materialization that PyTorch-ROCm does not pay. Four of the
+fifteen cases fail the all-ones gate: `attn_c_attn_fwd`, `attn_c_proj_fwd`,
+`mlp_c_fc_fwd` (about 24.85% of outputs wrong each) and `lm_head_dgrad` (100%
+wrong, every output short of K by exactly 128).
+
+## Defect analysis D6 — the four wrong GEMMs are two unrelated defects
+
+**Hypothesis.** The three forward failures share a selected configuration
+(`BM=32 BN=64 WM=16 WN=32 BK=32`, four warps) and a fraction close to one
+quarter, so they are one defect tied to that geometry. `lm_head_dgrad` is a
+different one: it is the only case whose K is 50304 and the only one failing
+100%.
+
+**Predicted effect.** Diagnosis changes no runtime. If the forward defect is
+geometry-bound it must reproduce at tiny shapes with the same tile/warp
+decomposition and disappear when the decomposition changes, and if
+`lm_head_dgrad` is an expectation error rather than a kernel error it must pass
+the independent `--pattern-check` gate, which does not depend on K being
+representable.
+
+**Measured effect, `lm_head_dgrad`.** It passes `--pattern-check=1`
+unchanged. BF16 has 8 significand bits; 50304 = 2^15 + 2^14 + 2^10 + 2^7 needs
+9, and round-to-nearest-even gives 50176 — exactly the reported deficit of 128.
+`torch.tensor(50304., dtype=float32).to(bfloat16)` returns 50176.0 on this
+build. The kernel is correct; the harness's all-ones gate asserted an
+unrepresentable expectation. Every other K in the table (768, 2304, 3072,
+49152) is BF16-exact, which is why only this row failed.
+
+**Measured effect, the three forward GEMMs.** Reproduced deterministically in a
+standalone launcher at 64x64x32. With all-ones operands the wrong outputs are
+exactly `K/2` (one of the two MMA k-steps missing), confined to one warp row,
+one `n_mma` index and two of the four accumulator elements per lane. With a
+per-k-slice weighted B (`B[.,kk] = 1 << (kk/16)`) at K = 32 the wrong value is
+16, i.e. the *second* MMA's contribution is the one that vanishes. Which warp
+and which block are affected changes with K and is not uniform across
+identical blocks of the same launch.
+
+A geometry sweep at (m,n,k) = (1024,1024,64), all with `transpose_b=True`,
+`BK=32`, two pipeline stages:
+
+| BM | BN | WM | WN | warps | result |
+|---:|---:|---:|---:|---:|---|
+| 32 | 64 | 16 | 32 | 2x2 | **wrong** |
+| 32 | 64 | 32 | 16 | 1x4 | **wrong** |
+| 16 | 64 | 16 | 32 | 1x2 | **wrong** |
+| 16 | 128 | 16 | 32 | 1x4 | **wrong** |
+| 96 | 128 | 32 | 64 | 3x2 | **wrong** |
+| 32 | 32 | 16 | 32 | 2x1 | correct |
+| 32 | 128 | 16 | 32 | 2x4 | correct |
+| 32 | 256 | 16 | 32 | 2x8 | correct |
+| 64 | 64 | 16 | 32 | 4x2 | correct |
+| 32 | 64 | 16 | 16 | 2x4 | correct |
+| 32 | 64 | 16 | 64 | 2x1 | correct |
+| 32 | 64 | 32 | 32 | 1x2 | correct |
+| 64 | 128 | 16 | 32 | 4x4 | correct |
+| 64 | 128 | 32 | 32 | 2x4 | correct |
+| 128 | 128 | 16 | 64 | 8x2 | correct |
+| 32 | 128 | 16 | 64 | 2x2 | correct |
+| 64 | 64 | 16 | 64 | 4x1 | correct |
+| 64 | 64 | 32 | 32 | 2x2 | correct |
+
+Every one of the eighteen is correct with `transpose_b=False`. The failing
+`BM=32 BN=64 BK=32` block tile is correct when the *same* tile is launched with
+128 or with 512 threads and wrong with 256. Raising `num_pipeline_stages` from
+2 to 3 or to 4 makes every failing geometry correct.
+
+Decisively: the defect reproduces at `K == BLOCK_K`, where `num_iters == 1` and
+`multistage_mma`'s loop performs no global-to-LDS prefetch at all — the only
+LDS writes are the prologue's, before its barrier. There is therefore no
+possible write-after-read race, so this is a **code-generation defect in MAX's
+two-stage `multistage_gemm_kernel` on gfx942 for transposed B**, not a
+synchronization bug in the pipeline. `BM=96, BN=128` is a second, unrelated and
+much simpler defect: the B-tile copy distributes `min(threads, BN*BK/simd)`
+threads over 96 LDS rows while BN is 128, so rows of B are dropped.
+
+No single structural predicate separates the wrong geometries from the right
+ones (thread count, A/B copy coverage and warp counts all have
+counter-examples on both sides), which is itself consistent with a scheduling
+or register-allocation miscompilation rather than a logic error.
+
+**Decision.** Accept the diagnosis. Fix `lm_head_dgrad` in the gate, not the
+kernel. For the forward GEMMs, do not chase MAX's code generator: every
+observed failure has a warp tile only one MMA wide in some dimension, so make
+`WM, WN >= 2 * mma_dim` a compile-time precondition of the transposed-B route
+and select only geometries that satisfy it. This is avoidance of a documented
+dependency defect, not a workaround for a defect of ours.
+
+## Change 10 — safe transposed-B warp geometries, and a representable gate
+
+**Hypothesis.** Requiring a >= 2x2 MMA warp tile (and a B-copy row count that
+divides BN) whenever `transpose_b=True` makes the miscompiled geometries
+unreachable by construction. Comparing the all-ones gate against K rounded to
+BF16 removes the false failure without weakening it: it stays an exact equality
+over every output element.
+
+**Predicted effect.** All fifteen cases pass both gates. The three forward
+GEMMs change configuration and their timings change; nothing else moves.
+
+**Measured effect.** `_amd_dynamic_mfma_gemm` now carries two comptime asserts
+for `transpose_b`, and the two dispatch sites that violated them
+(`32x64` with a `16x32` warp tile, `32x32` with a `16x16` warp tile) use
+`32x32` warp tiles instead. Applied together with Change 11 (both touch the
+same forward shapes, so their per-shape timings are not separable): all fifteen
+cases pass the all-ones gate and all fifteen pass `--pattern-check=1`. Per-step
+weighted total 506.905 -> 413.878 ms, ratio 7.076 -> 5.777.
+
+**Decision.** Accept. This is priority (A): before it, 114.454 ms of the
+per-step total was silently wrong, including every `nn.Linear` forward at these
+shapes. Note the defect is not nanoGPT-specific — the miscompiled geometry was
+the generic `else` fallback for BF16 `transpose_b`, so any Linear forward with
+m >= 64, k % 32 == 0, k < 2048 and n < 8192 was affected.
+
+## Change 11 — device-fill-driven macro tile for the many-rows regime
+
+**Hypothesis.** The AMD dispatch never selects a macro tile larger than
+128x128x64 and picks 32x64x32 or 32x128x32 for training shapes. At m = 49152
+there are two orders of magnitude more output tiles than CUs, so the tile can
+grow until the grid stops covering the device several times over. Make the
+choice a runtime comparison between `ceildiv(m,128) * ceildiv(n,128)` and the
+runtime CU count, and share the branch between both B layouts.
+
+**Predicted effect.** A 128x128x32 tile with an 8-warp (32x64) decomposition
+for grids that cover every CU at least twice, 64x128x32 for wide-N grids that
+do not, 32x128x32 otherwise. The forward and data-gradient shapes should gain
+40-80%; GPT-2 decode (m = 512) must not change route at all.
+
+**Measured effect.** Standalone screen, BF16 TFLOP/s, 25 warmups and 100
+synchronized iterations per point (`transpose_b=True` / `transpose_b=False`):
+
+| shape (m,n,k) | 32x128 (32x64) | 64x128 (32x64) | 128x128 (32x64) | 128x128 (64x64) |
+|---|---:|---:|---:|---:|
+| 49152,2304,768 T | 110.8 | 115.0 | **123.1** | 78.8 |
+| 49152,768,768 T | 103.9 | 106.4 | **113.9** | 74.6 |
+| 49152,3072,768 T | 111.4 | 116.3 | **122.0** | 82.2 |
+| 49152,768,2304 N | 142.2 | 151.2 | **169.2** | - |
+| 49152,3072,768 N | 136.0 | 148.8 | **169.0** | - |
+| 49152,768,50304 N | 146.9 | 160.4 | **177.4** | - |
+| 4096,768,768 N | **80.8** | 71.8 | 71.0 | - |
+| 4096,2304,768 N | 107.6 | 122.6 | **133.8** | - |
+| 8192,768,768 N | 93.3 | **96.7** | 89.6 | - |
+| 16384,768,768 N | 109.7 | 113.9 | **126.2** | - |
+
+The threshold that selects the winner in every one of these rows is
+`tiles >= 2*CUs`, relaxed to `tiles >= CUs` when there are at least 12 column
+tiles. GPT-2 decode shapes keep their existing routes: (512,768,768) and
+(512,2304,768) stay on 32x32/BK32/warp-K, (512,3072,768) stays on 64x32,
+(512,50257,768) stays on 128x128x32, all because m < 1024. Prefill m = 4096
+moves to 128x128 only for n >= 2304, where it is 9-12% faster.
+
+Combined with Change 10: 506.905 -> 413.878 ms, ratio 5.777.
+
+**Decision.** Accept. The rule is a runtime comparison of a runtime tile count
+against the runtime CU count; no model dimension is compiled in.
+
+## Change 12 — tiled LDS transpose for the strided 2-D materialization
+
+**Hypothesis.** `_copy_strided`'s generic kernel walks a rank-8 index space one
+element at a time. For a transposed 2-D read consecutive threads are `src_ld`
+elements apart, so every 2-byte load pulls its own cache line: the measured
+140.883 ms/step moves 26 GB, i.e. 185 GB/s on a 5.3 TB/s part. Detecting the
+transposed-2-D case and staging a square tile through LDS makes both the read
+and the write fully coalesced.
+
+**Predicted effect.** The materialization should fall by an order of magnitude,
+from 140.9 ms to roughly 10 ms/step. The generic kernel stays for every other
+strided layout; the fast path triggers only when every leading extent is 1, the
+destination is exactly row-major, and the source is that matrix read down its
+columns.
+
+**Measured effect.** The tile edge is one 128-byte line (64 BF16 elements) with
+one padding column to remove the transposing access's bank conflict, and a
+`TILE * 8`-thread block. Per-step materialization 141.032 -> 12.003 ms, i.e.
+26 GB at 2.17 TB/s. `lm_head_wgrad`'s copy alone fell from 73.18 to 4.42 ms.
+Per-step weighted total 413.878 -> 286.000 ms, ratio 5.777 -> 3.992. All
+fifteen cases still pass both gates.
+
+**Decision.** Accept. This is lead (1) from the harness README, addressed by
+making the copy cheap rather than by removing it; a transposed-A GEMM would
+remove the remaining 12 ms and is recorded below as not attempted.
+
+## Change 13 — materialize B^T for the large-M transposed-B GEMMs
+
+**Hypothesis.** With `transpose_b=True` the B tile is BN rows of BLOCK_K
+elements, so each global load touches 64 bytes of a 128-byte line, and every
+row block re-reads it. The `[K,N]` kernel reads BLOCK_K rows of BN elements
+instead — 256-byte rows. The same screen measures the `[K,N]` route about 1.4x
+faster on identical (m,n,k). Materializing B^T costs 4*n*k bytes of bandwidth,
+which at these row counts is three orders of magnitude below the GEMM.
+
+**Predicted effect.** For m >= 1024, transpose B with the Change 12 kernel and
+run the `[K,N]` route. Forward shapes should rise from 113-127 to 153-177
+TFLOP/s; the added copy should cost well under 1% of the GEMM. Below m = 1024
+the GEMM is too small to amortize the copy and that regime keeps the `[N,K]`
+kernel.
+
+**Measured effect.** Forward shapes 123.0 -> 166.0, 113.6 -> 153.0,
+122.0 -> 167.7, 118.7 -> 168.6 and 126.7 -> 174.5 TFLOP/s. The five B
+transposes per step total about 0.05 ms (the harness's reported
+materialization total moved 12.003 -> 12.054 ms). Per-step weighted total
+286.000 -> 258.885 ms, ratio 3.992 -> 3.614. Both gates pass.
+
+**Decision.** Accept. B^T is an ordinary per-call temporary, freed on the same
+stream; nothing is cached between calls and no input buffer is written.
+
+## Change 14 — four warp-K partitions in the deep-K regime
+
+**Hypothesis.** The deep-K route (`k >= 2048 and k >= 2n`) uses a 32x32 tile
+with two in-workgroup K partitions. At k = 49152 that grid leaves most SIMDs
+with less than one resident wave, so the global-load latency of the
+synchronous LDS fill is fully exposed; doubling to four partitions doubles the
+waves per workgroup. Diagnostic experiment N measured this configuration 6.6%
+faster on the *decode* K-dominant shape and rejected it only against a stricter
+predeclared gate, so it should not regress decode either.
+
+**Predicted effect.** (768,768,49152) and (2304,768,49152) improve by >= 10%;
+the GPT-2 decode K-dominant shape (512,768,3072) must not regress.
+
+**Measured effect.** TFLOP/s, two vs four partitions: (512,768,3072)
+37.31 -> 39.98 (+7.2%), (768,768,49152) 66.63 -> 78.16 (+17.3%),
+(2304,768,49152) 75.50 -> 82.30 (+9.0%). In the harness, `attn_c_proj_wgrad`
+918.48 -> 790.40 us. Per-step weighted total 258.885 -> 257.371 ms, ratio
+3.614 -> 3.593. Both gates pass.
+
+**Decision.** Accept. It also improves, rather than degrades, the decode shape
+the earlier journal tuned.
+
+## Diagnostic experiment V — macro tiles above 128x128
+
+**Hypothesis.** Tensile picks MT256x224x64, MT256x256x32, MT192x256x32,
+MT128x512x32 and MT512x128x64 for these GEMMs, so 128x128 may still be leaving
+arithmetic intensity on the table at m = 49152, where even a 256x256 tile
+leaves thousands of workgroups.
+
+**Predicted effect.** At least one tile above 128x128 beats 128x128x32 by
+>= 10% on a grid-filled shape.
+
+**Measured effect.** TFLOP/s at m = 49152, `transpose_b=False`:
+
+| tile (warp) | n=3072,k=768 | n=768,k=3072 | n=50304,k=768 |
+|---|---:|---:|---:|
+| 128x128 (32x64) | **169.2** | **170.1** | **175.2** |
+| 128x256 (32x64) | 147.3 | 157.1 | 142.6 |
+| 256x128 (32x64) | 147.2 | 156.5 | 157.4 |
+| 224x128 (32x64) | 140.5 | 139.1 | 150.7 |
+| 160x128 (32x64) | 131.8 | 127.4 | 138.4 |
+| 128x256 (64x64) | 68.1 | 71.3 | 68.4 |
+| 128x128 (32x128) | 56.8 | 54.7 | 63.2 |
+
+256x256x32 and 256x192x32 do not launch at all: two pipeline stages of a
+256x256x32 tile request the entire 64 KB gfx942 LDS budget as dynamic shared
+memory. Every candidate above 128x128 is 13-60% slower.
+
+**Decision.** Reject. Tensile's macro tiles are not transferable to this
+kernel: they come with a data-movement pipeline this one does not have (see the
+barrier note below), and at two stages the LDS budget caps the tile at
+128x128x32 anyway.
+
+## Diagnostic experiment W — BLOCK_K = 64
+
+**Hypothesis.** A 64-deep K tile halves the number of barriers and doubles the
+bytes per global load row (128 bytes for a `[N,K]` operand), which is exactly
+the coalescing problem Change 13 works around.
+
+**Predicted effect.** BK=64 beats BK=32 on at least the `transpose_b=True`
+shapes.
+
+**Measured effect.** TFLOP/s at (49152, 2304, 768): BK=64 gives 60.0
+(128x128), 53.7 (64x128), 48.9 (64x64), 45.7 (128x64), 31.5 (32x128) against
+123.1 for 128x128 at BK=32. The whole BK=64 family measures 30-71 TFLOP/s on
+every shape tried, `transpose_b` either way.
+
+**Decision.** Reject. BK=64 doubles the LDS slab, which drops the resident
+workgroups per CU from two to one; the halved barrier count does not come close
+to paying for it.
+
+## Diagnostic experiment X — deeper pipelines for the latency-bound shapes
+
+**Hypothesis.** The weight-gradient shapes are latency-bound, not
+bandwidth-bound: (2304,768,49152) launches 432 workgroups of 128 threads, i.e.
+0.71 waves per SIMD, and spends about 1936 cycles per k-tile where the MFMA
+work is 256. A third or fourth pipeline stage prefetches further ahead.
+
+**Predicted effect.** >= 10% on the weight-gradient shapes.
+
+**Measured effect.** TFLOP/s with 32x128x32 (32x64 warps) at stages 2/3/4/6:
+(768,768,49152) 32.8/33.8/31.8/32.4; (2304,768,49152) 86.6/89.0/46.7/47.5;
+(3072,768,49152) 114.6/117.0/61.9/63.0; (768,3072,49152)
+113.3/115.3/56.5/57.3. Three stages gain 2.4-3.1%; four or six collapse.
+
+**Decision.** Reject. Three stages is below the 10% bar and costs half again
+as much LDS, which is the resource that caps the macro tile. Four stages puts
+one workgroup per CU and halves throughput.
+
+## Diagnostic experiment Y — MAX's own tuned AMD matmul entry points
+
+**Hypothesis.** MAX ships AMD-specific matmul kernels (`AMDMatmul`,
+`AMDPingPongMatmul`, `AMD4WaveMatmul`, `amd_4wave_split_k_matmul`,
+`warp_specialized_matmul`) that are tuned far better than the generic
+multistage core; one of them may be reachable from an eager backend that holds
+only device pointers and runtime extents.
+
+**Predicted effect.** If any of them accepts runtime N and K, route to it.
+
+**Measured effect.** None does. `AMDMatmul` reads M at runtime but takes N and
+K from the static shapes (`comptime K = type_of(a).static_shape[1]`,
+`comptime N = type_of(b).static_shape[0]`, `comptime assert N > 0, "N must be
+known at compile time"`), uses `comptime K` as a tile extent and a loop bound,
+and its `RegTileLoader`/`RegTileWriterLDS` bake `static_stride` into the
+instruction stream — a dynamic stride yields `UNKNOWN_VALUE` and silently wrong
+addresses rather than a compile error. Ping-pong, 4-wave and 4-wave split-K are
+CDNA4: their BF16 MMA shape is 16x16x32, which asserts `_cdna_4_or_newer()` on
+gfx942, and their default configurations need 128 KB of LDS against gfx942's
+64 KB; all three also use the `load_to_lds` path that experiments R and T
+already showed cannot lower for dynamic layouts on this pin.
+`warp_specialized_matmul` takes M, N and K as compile-time parameters.
+`_matmul_gpu` itself gates the entire tensor-core path on
+`has_static_NK` and otherwise falls back to hipBLASLt, which is prohibited.
+`multistage_gemm_kernel` is the only runtime-extent tensor-core matmul in the
+tree, and it is what this backend already uses.
+
+**Decision.** Reject. Confirms and extends the D5 addendum: on this pin there
+is no vendor-free, runtime-extent, better-tuned AMD matmul to route to.
+
+## Remaining barrier — measured, and not addressed
+
+At ratio 3.593 the gap is the data movement inside MAX's multistage core, and
+it is quantified rather than guessed. Counters on the best configuration
+(128x128x32, 32x64 warps, `transpose_b=False`, m=49152 n=768 k=3072, timed
+separately from the counter run at 169.9 TFLOP/s):
+
+    SQ_INSTS_MFMA          884736
+    SQ_INSTS_LDS          2001024      2.26 LDS instructions per MFMA
+    SQ_LDS_BANK_CONFLICT  9750528      4.87 conflict cycles per LDS instruction
+    vgpr 120, lds 32768, block 512
+
+The instruction mix is exactly what the source predicts. Per warp per k-tile
+this geometry issues 16 MFMA, 4 A-fragment `ds_read_b64`, 2 LDS stores — and
+**32 scalar LDS reads for its 8 B fragments**, because with `transpose_b=False`
+the B LDS tile is `(BK, BN)`, so each MFMA B fragment is four elements strided
+by BN and `_load_b_amd` lowers it to four 2-byte reads. Predicted 38 LDS
+instructions per 16 MFMA, measured ratio 2.26.
+
+The two operand layouts trade the two halves of the problem and the kernel
+cannot have both: `(N,K)` gives k-contiguous LDS (one `ds_read_b64` per
+fragment) but 64-byte global rows, and `(K,N)` gives 256-byte global rows but
+the 4x scalar fragment reads. Change 13 buys the better of the two. Closing the
+rest needs a kernel that transposes during the global-to-LDS store so both the
+global rows and the LDS fragments are wide, plus a global split-K for the
+weight-gradient shapes, whose 432-workgroup grids leave 0.71 waves per SIMD.
+Global split-K is not expressible around the stock kernel: it derives its K
+loop from B and offers no `block_idx.z` k-slab, and separate launches serialize
+on the stream, so the extra workgroups would not be concurrent. Both are new
+kernel work and neither was attempted here.
