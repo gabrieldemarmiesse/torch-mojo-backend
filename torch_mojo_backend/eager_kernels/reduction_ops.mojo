@@ -799,7 +799,17 @@ def _log_softmax_rows_block_kernel[
         var tail_start = head + n_vec * V  # first row-local index of the tail
 
         # ---- Pass 1: online max + sum over the row, one global read. ----
-        var m_vec = SIMD[DType.float32, V](Float32.MIN)
+        # The running max starts at the lowest FINITE float, not at
+        # `Float32.MIN`, which is -inf. A lane or thread that never runs its loop
+        # body -- any thread with `tid >= n_vec`, and there are many whenever the
+        # row has fewer vectors than the block has threads -- keeps the sentinel
+        # in both `m` and a zero `s`. The collapse below then evaluates
+        # `s * exp(m - m)`: with -inf that is `0 * exp(nan) = nan`, and the block
+        # sum turns one idle thread's nan into a nan `log_denom`, so the whole
+        # row comes out nan. With a finite sentinel the same expression is
+        # `0 * exp(0) = 0`, the identity this monoid needs. A genuine -inf input
+        # still behaves: `exp(-inf - MIN_FINITE)` is 0, not nan.
+        var m_vec = SIMD[DType.float32, V](Float32.MIN_FINITE)
         var s_vec = SIMD[DType.float32, V](0.0)
         var v = tid
         while v < n_vec:

@@ -2407,3 +2407,62 @@ is direct rather than an appeal to plausibility:
 Note also that running these two files with `-n 8` produces 39 failures rather
 than 8, including crashed workers: eight pytest workers contending for one GPU is
 not a valid configuration for the eager-device tests. Run them serially.
+
+## Defect analysis D7 — log-softmax forward returned all-NaN on most shapes
+
+**Hypothesis.** The last agent's report flagged "a live NaN in the fast log-softmax
+forward (7 failing tests)" and judged it pre-existing. A NaN in `aten::_log_softmax`
+is worth its own entry regardless of provenance, because that op backs
+`F.cross_entropy`: every training loss in the repository goes through it.
+
+The online single-read kernel seeds its running max with `Float32.MIN`, which in
+Mojo is `-inf`, not the lowest finite float. Any thread whose loop body never
+executes -- every thread with `tid >= n_vec`, and there are many whenever a row
+holds fewer 16-byte vectors than the block has threads -- keeps that sentinel
+alongside a zero running sum. The collapse then computes `s * exp(m - m_t)`, which
+with both terms `-inf` is `0 * exp(nan) = nan`; the block sum turns one idle
+thread's nan into a nan `log_denom`, so the entire row is nan.
+
+**Predicted effect.** NaN exactly when `n_vec < threads`, where
+`V = 16 / size_of[dtype]`, `n_vec ~ cols / V`, and `threads` is 1024 when
+`cols * size_of[dtype] > LSM_BIG_ROW_BYTES = 25_000` and 256 otherwise. So FP32 at
+cols = 1024 gives `n_vec = 256 = threads` and must be the *only* clean case among
+the small shapes, while BF16 at the same cols gives `n_vec = 128 < 256` and must be
+nan. The nanoGPT loss must nevertheless be correct, because autocast runs cross
+entropy in FP32 at cols = 50304, which takes the 1024-thread branch with
+`n_vec = 12576`.
+
+**Measured effect.** Every prediction held, on this branch and on `main` at
+d93fe25 with identical NaN counts, so the defect is confirmed pre-existing and not
+from this work:
+
+| dtype | (rows, cols) | before | after |
+|---|---|---|---|
+| f32 | (3, 5) | nan 15/15 | ok, 2.4e-07 |
+| f32 | (128, 128) | nan 16384/16384 | ok, 9.5e-07 |
+| f32 | (4096, 1024) | ok | ok |
+| bf16 | (4096, 1024) | nan 4194304/4194304 | ok, 0.0312 |
+| bf16 | (49152, 1024) | nan 50331648/50331648 | ok, 0.0312 |
+| f16 | (128, 128) | nan 16384/16384 | ok, 0.0038 |
+
+`softmax` was unaffected in every case, which is what isolates the fault to this
+kernel's online rescale rather than to the shared reduction machinery.
+
+**Decision.** Fix by seeding the running max with `Float32.MIN_FINITE`, so an idle
+thread's contribution is `0 * exp(0) = 0`, the identity the (max, sum) monoid needs.
+`-Float32.MAX` is *not* usable: `Float32.MAX` is `inf`, so its negation is `-inf`
+again. A genuine `-inf` input still behaves, since `exp(-inf - MIN_FINITE)` is 0.
+This is the same sentinel and the same reasoning as the SDPA causal softmax fix in
+`nn_ops.mojo`, which had hit this defect class independently.
+
+Audited the other eight `Float32.MIN` / `min_or_neg_inf` sites in the eager
+kernels. Seven are plain max-reduction identities, where `-inf` is correct and no
+rescale ever divides by it, and the eighth is `_attn_decode`'s per-thread max,
+which reaches the block reduction as a max identity and is likewise safe. Only the
+online-rescale form breaks, and only this one kernel used it with an infinite seed.
+
+Result: `tests/test_eager_kernels.py` goes to 379 passed, 15 skipped, with one
+failure remaining -- `test_bf16_v3_source_dependency_and_kernel_contract`, a source
+list-ordering assertion that also fails on `main`, verified in a clean worktree.
+The nanoGPT step is unchanged at 354.22 ms and the single-step loss is still
+bit-identical at 10.977283477783203.
