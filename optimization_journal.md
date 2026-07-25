@@ -2382,3 +2382,28 @@ second time with `c_type = float32`, which lengthens both the `__mojocache__`
 rebuild and every `mojo build` of a harness that imports `matmul_ops` from about
 two seconds to a couple of minutes. `bench_permute_copy`, which imports only
 `data_movement_ops`, still builds in seconds.
+
+## Test-visible state after this work — 2026-07-25
+
+`tests/test_eager_kernels.py` and `tests/test_mojo_device.py` run serially: 577
+passed, 8 failed, 99 skipped. None of the eight is from this work, and the check
+is direct rather than an appeal to plausibility:
+
+* Four `test_fast_log_softmax_*` and three
+  `test_fast_cross_entropy_training_uses_direct_nll_kernel[*]` failures are one
+  defect, a **NaN out of the fast log-softmax forward** (the cross-entropy tests
+  consume it). Reproduced standalone at `(65, 32)` float32: the forward and the
+  gradient are both NaN, and `TorchMojoTensor._materialize_contiguous` is called
+  **zero** times and no GEMM is issued at all, so neither the run gather nor
+  split-K can be involved. The earlier journal entry recorded four such failures
+  as pre-existing at commit `4cd5f30`; the count is seven and the symptom is a NaN,
+  which is worth someone's attention on its own. The production path is unaffected
+  at the nanoGPT shape -- `log_softmax_rows_block_bfloat16_1024` is in the profile
+  and the single-step loss agrees with PyTorch-ROCm to 1.1e-4.
+* `test_bf16_v3_source_dependency_and_kernel_contract` asserts a hardcoded list of
+  H100 BF16 GEMM source filenames in `aten_fast._BF16_SOURCE_PATHS`; this work
+  touched no file in that list.
+
+Note also that running these two files with `-n 8` produces 39 failures rather
+than 8, including crashed workers: eight pytest workers contending for one GPU is
+not a valid configuration for the eager-device tests. Run them serially.
