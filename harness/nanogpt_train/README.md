@@ -45,7 +45,7 @@ takes about **two seconds**:
 ```bash
 uv run --no-sync mojo build harness/nanogpt_train/bench_linear_gemm.mojo \
     -I torch_mojo_backend/eager_kernels -o /tmp/bench_linear_gemm
-/tmp/bench_linear_gemm --targets harness/nanogpt_train/rocm_gemm_targets.csv
+/tmp/bench_linear_gemm --targets=harness/nanogpt_train/rocm_gemm_targets.csv
 ```
 
 The harness calls the real dispatch entry points, so an accepted improvement in
@@ -77,7 +77,7 @@ output element via a device-side reduction (no multi-GB host transfer):
    while K = 50304 rounds to 50176 (it needs 9). The gate compares against the
    rounded value, so it stays an exact equality test and still catches a tile
    never written, written twice, or a truncated K loop.
-2. **`--pattern-check 1`.** Operands are `{-1, 0, 1}` on the first and last four
+2. **`--pattern-check=1`.** Operands are `{-1, 0, 1}` on the first and last four
    K indices and zero elsewhere. Outputs stay small integers, so equality still
    holds exactly, while values now vary along m, n *and* k — this is what
    catches swapped indices, wrong strides, and a transposed operand read with
@@ -85,6 +85,20 @@ output element via a device-side reduction (no multi-GB host transfer):
    the checking kernel, sharing no code with the GEMM.
 
 Run both. A case that fails either one has no meaningful timing.
+
+**Flag syntax matters, silently.** These harnesses parse arguments with
+`internal_utils.arg_parse`, whose `_get_arg` matches only `--handle=value`. A
+space-separated `--pattern-check 1` is not an error: it is ignored, and the run
+falls back to the default, so you get the weak gate while believing you ran the
+strong one. Always use `=`. Each run echoes `pattern_check= 0` or `1` on its last
+line — check it rather than trusting the command you typed.
+
+Known limitation of the all-ones gate at K = 50304: the BF16 grid spacing at
+that magnitude is 256, so any accumulator in [50048, 50304] rounds to the same
+stored value and passes. The pattern gate covers a truncated K *tail* for that
+case because its nonzero terms include the last four K indices, but a dropped or
+double-counted range in the *middle* of K, narrower than 256, would pass both
+gates for that one case. Every other K here is BF16-exact and has no such hole.
 
 ## State of the dispatch (2026-07-25)
 

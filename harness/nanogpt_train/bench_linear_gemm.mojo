@@ -21,7 +21,7 @@ removing it is a legitimate optimization and its cost belongs to the op.
 Build and run:
     uv run --no-sync mojo build harness/nanogpt_train/bench_linear_gemm.mojo \
         -I torch_mojo_backend/eager_kernels -o /tmp/bench_linear_gemm
-    /tmp/bench_linear_gemm --targets harness/nanogpt_train/rocm_gemm_targets.csv
+    /tmp/bench_linear_gemm --targets=harness/nanogpt_train/rocm_gemm_targets.csv
 
     # one case, more iterations, with the layout-sensitive pattern check
     /tmp/bench_linear_gemm --case=mlp_c_fc_wgrad --iterations=200 --pattern-check=1
@@ -659,7 +659,7 @@ def main() raises:
                 failed += 1
                 failed_us += result.median_us * Float64(target.calls_per_step)
     if rocm_step_us == 0.0:
-        raise Error("no case matched --case ", only)
+        raise Error("no case matched --case=", only)
     print()
     print(
         "per-step weighted total: mojo",
