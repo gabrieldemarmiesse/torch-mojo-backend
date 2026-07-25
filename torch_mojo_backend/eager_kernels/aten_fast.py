@@ -837,6 +837,52 @@ def _try_spec_add_f32_bf16(lhs, rhs):
     return _wrap_spec_result(result, DType.float32, a._device)
 
 
+_SPEC_UNARY_INTO_DTYPES = frozenset(
+    {DType.float32, DType.float16, DType.bfloat16, DType.float64,
+     DType.int8, DType.int16, DType.int32, DType.int64, DType.uint8}
+)
+_SPEC_FLOAT_DTYPES = frozenset(
+    {DType.float32, DType.float16, DType.bfloat16, DType.float64}
+)
+_SPEC_UNARY_DIRECT_NAMES = frozenset(
+    {"ReluSpec", "AbsSpec", "NegSpec", "SignSpec"}
+)
+# Ops eligible for the queued Into form via _try_spec_unary, with the
+# dtype rule the Mojo prologue enforces (a queued launch cannot fall back).
+_SPEC_ROWRED_INTO = frozenset(
+    {DType.float32, DType.float16, DType.bfloat16, DType.int64, DType.int32}
+)
+_SPEC_ANYALL_INTO = frozenset(
+    {DType.float32, DType.float16, DType.bfloat16, DType.int64, DType.int32,
+     DType.int16, DType.int8, DType.uint8, DType.bool}
+)
+# (module, spec name) -> (operand dtype rule, output dtype override or None)
+_SPEC_REDUCE_INTO = {
+    ("reduction_ops", "SumSpec"): (_SPEC_ROWRED_INTO, None),
+    ("reduction_ops", "AmaxSpec"): (_SPEC_ROWRED_INTO, None),
+    ("reduction_ops", "AminSpec"): (_SPEC_ROWRED_INTO, None),
+    ("reduction_ops", "ArgminSpec"): (_SPEC_ROWRED_INTO, DType.int64),
+    ("reduction_ops", "VarSpec"): (_SPEC_FLOAT_DTYPES, None),
+    ("reduction_ops", "AllSpec"): (_SPEC_ANYALL_INTO, DType.bool),
+    ("reduction_ops", "AnySpec"): (_SPEC_ANYALL_INTO, DType.bool),
+    ("nn_ops", "MeanSpec"): (_SPEC_FLOAT_DTYPES, None),
+    ("nn_ops", "MaxSpec"): (_SPEC_ROWRED_INTO, None),
+    ("nn_ops", "ArgmaxSpec"): (_SPEC_ROWRED_INTO, DType.int64),
+}
+
+
+def _reduced_shape(shape, rdims, keepdim):
+    rd = set(rdims)
+    out = []
+    for i, s in enumerate(shape):
+        if i in rd:
+            if keepdim:
+                out.append(1)
+        else:
+            out.append(s)
+    return tuple(out)
+
+
 def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_ops"):
     """Contiguous unary through a spec op, or None.
 
@@ -845,6 +891,26 @@ def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_op
     a = _t(x)
     if a is None:
         return None
+    if _call_queue.enabled():
+        if out_dtype == DType.bool and module_name == "elementwise_ops":
+            kdtype = DType.uint8 if a._dtype == DType.bool else a._dtype
+            ok = kdtype in _SPEC_UNARY_INTO_DTYPES
+        elif module_name == "elementwise_ops":
+            ok = a._dtype in (
+                _SPEC_UNARY_INTO_DTYPES
+                if spec_fn_name in _SPEC_UNARY_DIRECT_NAMES
+                else _SPEC_FLOAT_DTYPES
+            )
+        elif spec_fn_name in ("LogSoftmaxSpec", "SoftmaxSpec"):
+            ok = a._dtype in _SPEC_FLOAT_DTYPES and len(a._shape) >= 1 and a._numel > 0
+        else:
+            ok = False  # e.g. CumsumSpec: constraints not mirrored, stay sync
+        if ok:
+            out = _alloc(a._shape, out_dtype or a._dtype, a._device)
+            eager_kernels.queue_spec_into(
+                module_name, spec_fn_name, (_spec_of(a), _spec_of(out))
+            )
+            return out
     try:
         result = getattr(getattr(eager_kernels, module_name), spec_fn_name)(_spec_of(a))
     except Exception as exc:
@@ -859,6 +925,26 @@ def _try_spec_reduce(
     """Trailing-dims reduction through a spec op, or None. `a` is already a
     TorchMojoTensor (dtype promotion happened upstream); the spec op raises
     on non-trailing dims / strided input and the classic path takes over."""
+    if _call_queue.enabled():
+        rule = _SPEC_REDUCE_INTO.get((module_name, spec_fn_name))
+        rank = len(a._shape)
+        dims = [d for d in rdims]
+        if (
+            rule is not None
+            and a._numel > 0
+            and a._dtype in rule[0]
+            and dims
+            and len(set(dims)) == len(dims)
+            and all(isinstance(d, int) and 0 <= d < rank for d in dims)
+        ):
+            odtype = rule[1] or out_dtype or a._dtype
+            out = _alloc(_reduced_shape(a._shape, dims, keepdim), odtype, a._device)
+            eager_kernels.queue_spec_into(
+                module_name,
+                spec_fn_name,
+                (_spec_of(a), tuple(dims), 1 if keepdim else 0, *extra, _spec_of(out)),
+            )
+            return out
     try:
         result = getattr(getattr(eager_kernels, module_name), spec_fn_name)(
             _spec_of(a), tuple(rdims), 1 if keepdim else 0, *extra
@@ -901,12 +987,58 @@ def _raise_if_device_oom(exc):
         raise torch.OutOfMemoryError(message) from exc
 
 
+def _spec_matmul_out_shape(spec_fn_name, ts, transpose_b):
+    """Output shape for a queueable matmul spec launch, or None when any
+    Mojo-side check might fail (a queued launch cannot fall back)."""
+    a = ts[0]
+    b = ts[1]
+    if a._dtype != b._dtype or a._dtype not in _SPEC_FLOAT_DTYPES:
+        return None
+    if a._device != b._device:
+        return None
+    if not all(t._is_contiguous for t in ts):
+        return None
+    if spec_fn_name == "BmmSpec":
+        if len(a._shape) != 3 or len(b._shape) != 3:
+            return None
+        batch, m, k = a._shape
+        if b._shape[0] != batch:
+            return None
+        n, kb = (b._shape[1], b._shape[2]) if transpose_b else (b._shape[2], b._shape[1])
+        if kb != k or 0 in (batch, m, n, k):
+            return None
+        return (batch, m, n)
+    if len(a._shape) < 2 or len(b._shape) != 2:
+        return None
+    k = a._shape[-1]
+    n, kb = (b._shape[0], b._shape[1]) if transpose_b else (b._shape[1], b._shape[0])
+    if kb != k or k == 0 or n == 0 or a._numel == 0:
+        return None
+    if spec_fn_name == "MatmulBiasSpec":
+        bias = ts[2]
+        if bias._dtype != a._dtype or len(bias._shape) != 1 or bias._shape[0] != n:
+            return None
+    elif spec_fn_name != "MatmulSpec":
+        return None
+    return (*a._shape[:-1], n)
+
+
 def _try_spec_matmul(spec_fn_name, tensors, transpose_b):
     """Matmul-family spec op over already-typed operands, or None. The spec
     raises on non-contiguous operands; the classic path materializes them."""
     ts = [_t(x) for x in tensors]
     if any(t is None for t in ts):
         return None
+    if _call_queue.enabled():
+        out_shape = _spec_matmul_out_shape(spec_fn_name, ts, transpose_b)
+        if out_shape is not None:
+            out = _alloc(out_shape, ts[0]._dtype, ts[0]._device)
+            eager_kernels.queue_spec_into(
+                "matmul_ops",
+                spec_fn_name,
+                (*[_spec_of(t) for t in ts], transpose_b, _spec_of(out)),
+            )
+            return out
     try:
         result = getattr(eager_kernels.matmul_ops, spec_fn_name)(
             *[_spec_of(t) for t in ts], transpose_b
@@ -924,6 +1056,14 @@ def _try_spec_scalar(spec_fn_name, x, scalar):
     a = _t(x)
     if a is None:
         return None
+    if _call_queue.enabled() and a._dtype in _SPEC_FLOAT_DTYPES:
+        out = _alloc(a._shape, a._dtype, a._device)
+        eager_kernels.queue_spec_into(
+            "elementwise_ops",
+            spec_fn_name,
+            (_spec_of(a), float(scalar), _spec_of(out)),
+        )
+        return out
     try:
         result = getattr(eager_kernels.elementwise_ops, spec_fn_name)(
             _spec_of(a), float(scalar)
@@ -941,6 +1081,14 @@ def _try_spec_int_scalar(spec_fn_name, x, scalar):
     a = _t(x)
     if a is None:
         return None
+    if _call_queue.enabled() and a._dtype in (DType.int32, DType.int64):
+        out = _alloc(a._shape, a._dtype, a._device)
+        eager_kernels.queue_spec_into(
+            "elementwise_ops",
+            spec_fn_name,
+            (_spec_of(a), scalar, _spec_of(out)),
+        )
+        return out
     try:
         result = getattr(eager_kernels.elementwise_ops, spec_fn_name)(
             _spec_of(a), scalar
@@ -3264,6 +3412,27 @@ def fast_aten_min_dim(input, dim, keepdim=False):
     rank = len(a._shape)
     if rank == 0 or not -rank <= dim < rank:
         return NOT_HANDLED
+    if (
+        _call_queue.enabled()
+        and a._numel > 0
+        and a._dtype in _SPEC_ROWRED_INTO
+    ):
+        rdim = dim % rank
+        oshape = _reduced_shape(a._shape, (rdim,), keepdim)
+        values = _alloc(oshape, a._dtype, a._device)
+        indices = _alloc(oshape, DType.int64, a._device)
+        eager_kernels.queue_spec_into(
+            "reduction_ops",
+            "MinDimSpec",
+            (
+                _spec_of(a),
+                (rdim,),
+                1 if keepdim else 0,
+                _spec_of(values),
+                _spec_of(indices),
+            ),
+        )
+        return values, indices
     try:
         result = eager_kernels.reduction_ops.MinDimSpec(
             _spec_of(a), (dim % rank,), 1 if keepdim else 0

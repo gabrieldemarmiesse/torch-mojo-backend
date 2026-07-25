@@ -3528,6 +3528,37 @@ def _matmul_spec_go(
     )
 
 
+def _matmul_spec_into_go(
+    a_o: PyObjectPtr, b_o: PyObjectPtr, tb_o: PyObjectPtr
+, out_o: PyObjectPtr) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    ref b = _spec_ptr(b_o)[]
+    var transpose_b = _raw_int(tb_o)
+    var geom = _matmul_spec_checks(a, b, transpose_b != 0)
+    var m = geom[0]
+    var n = geom[1]
+    var k = geom[2]
+
+    var ctx = a.ctx()
+    var numel = m * n
+    var nbytes = numel * a.itemsize
+    _ = nbytes
+    if out.numel != m * n or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != a.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+
+    _matmul_spec_operands_launch(
+        a, b, 0, False, addr, 1, m, n, k, transpose_b, ctx
+    )
+
+    # out shape: a's leading dims with the last dim replaced by n.
+    var oshape = a.shape
+    oshape[MAX_RANK - 1] = n
+
+
 def _matmul_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -3535,6 +3566,9 @@ def _matmul_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 4:
+            _matmul_spec_into_go(args[0], args[1], args[2], args[3])
+            return _raw_ret_none()
         return _matmul_spec_go(args[0], args[1], args[2])
     except e:
         return _spec_unsupported(e)
@@ -3600,6 +3634,61 @@ def _matmul_bias_spec_go(
     )
 
 
+def _matmul_bias_spec_into_go(
+    a_o: PyObjectPtr,
+    b_o: PyObjectPtr,
+    bias_o: PyObjectPtr,
+    tb_o: PyObjectPtr,
+    out_o: PyObjectPtr,
+) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    ref b = _spec_ptr(b_o)[]
+    ref bias = _spec_ptr(bias_o)[]
+    var transpose_b = _raw_int(tb_o)
+    var geom = _matmul_spec_checks(a, b, transpose_b != 0)
+    var m = geom[0]
+    var n = geom[1]
+    var k = geom[2]
+    if bias.dtype != a.dtype:
+        raise Error("mojo spec matmul: bias dtype differs")
+    if bias.rank != 1 or bias.numel != n:
+        raise Error("mojo spec matmul: bias must be a length-n vector")
+
+    var ctx = a.ctx()
+    var numel = m * n
+    var nbytes = numel * a.itemsize
+    _ = nbytes
+    if out.numel != m * n or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != a.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    if bias.contig:
+        _matmul_spec_operands_launch(
+            a, b, bias.ptr, True, addr, 1, m, n, k, transpose_b, ctx
+        )
+    else:
+        var tmp_bias = _scratch_contig(bias, ctx)
+        _matmul_spec_operands_launch(
+            a,
+            b,
+            Int(tmp_bias.unsafe_ptr()),
+            True,
+            addr,
+            1,
+            m,
+            n,
+            k,
+            transpose_b,
+            ctx,
+        )
+        _ = tmp_bias^
+
+    var oshape = a.shape
+    oshape[MAX_RANK - 1] = n
+
+
 def _matmul_bias_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -3607,6 +3696,9 @@ def _matmul_bias_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 5:
+            _matmul_bias_spec_into_go(args[0], args[1], args[2], args[3], args[4])
+            return _raw_ret_none()
         return _matmul_bias_spec_go(args[0], args[1], args[2], args[3])
     except e:
         return _spec_unsupported(e)
@@ -3668,6 +3760,64 @@ def _bmm_spec_go(
     )
 
 
+def _bmm_spec_into_go(
+    a_o: PyObjectPtr, b_o: PyObjectPtr, tb_o: PyObjectPtr
+, out_o: PyObjectPtr) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    ref b = _spec_ptr(b_o)[]
+    var transpose_b = _raw_int(tb_o)
+
+    if a.dtype != b.dtype:
+        raise Error("mojo spec bmm: operand dtypes differ")
+    if a.ctx_ptr != b.ctx_ptr:
+        raise Error("mojo spec bmm: operands on different devices")
+    var supported = False
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dt_on[dt]():
+            if a.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec bmm: unsupported dtype ", a.dtype)
+    if a.rank != 3 or b.rank != 3:
+        raise Error("mojo spec bmm: rank != 3")
+    var batch = a.shape[MAX_RANK - 3]
+    var m = a.shape[MAX_RANK - 2]
+    var k = a.shape[MAX_RANK - 1]
+    if b.shape[MAX_RANK - 3] != batch:
+        raise Error("mojo spec bmm: batch dims differ")
+    var n: Int
+    var kb: Int
+    if transpose_b != 0:
+        n = b.shape[MAX_RANK - 2]
+        kb = b.shape[MAX_RANK - 1]
+    else:
+        kb = b.shape[MAX_RANK - 2]
+        n = b.shape[MAX_RANK - 1]
+    if kb != k:
+        raise Error("mojo spec bmm: inner dims differ")
+    if batch == 0 or m == 0 or n == 0 or k == 0:
+        raise Error("mojo spec bmm: zero-sized dim")
+
+    var ctx = a.ctx()
+    var numel = batch * m * n
+    var nbytes = numel * a.itemsize
+    _ = nbytes
+    if out.numel != batch * m * n or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != a.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    _matmul_spec_operands_launch(
+        a, b, 0, False, addr, batch, m, n, k, transpose_b, ctx
+    )
+
+    var oshape = IndexList[MAX_RANK](1)
+    oshape[MAX_RANK - 3] = batch
+    oshape[MAX_RANK - 2] = m
+    oshape[MAX_RANK - 1] = n
+
+
 def _bmm_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -3675,6 +3825,9 @@ def _bmm_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 4:
+            _bmm_spec_into_go(args[0], args[1], args[2], args[3])
+            return _raw_ret_none()
         return _bmm_spec_go(args[0], args[1], args[2])
     except e:
         return _spec_unsupported(e)

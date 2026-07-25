@@ -976,6 +976,67 @@ def _unary_spec_go[op_code: Int](a_o: PyObjectPtr) raises -> PyObjectPtr:
     )
 
 
+def _unary_spec_into_go[op_code: Int](a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+
+    comptime is_direct = (
+        op_code == UOP_RELU
+        or op_code == UOP_ABS
+        or op_code == UOP_NEG
+        or op_code == UOP_SIGN
+    )
+    var supported = False
+    comptime if is_direct:
+        comptime for dt in SPEC_UNARY_DTYPES:
+            comptime if _dt_on[dt]():
+                if a.dtype == dt:
+                    supported = True
+    else:
+        comptime for dt in FLOAT_DTYPES:
+            comptime if _dt_on[dt]():
+                if a.dtype == dt:
+                    supported = True
+    if not supported:
+        raise Error("mojo spec unary: unsupported dtype ", a.dtype)
+
+    var ctx = a.ctx()
+    var nbytes = a.numel * a.itemsize
+    _ = nbytes
+    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != a.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    if a.numel > 0:
+        if a.contig:
+            comptime for dt in SPEC_UNARY_DTYPES:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _unary_elementwise[dt, op_code](
+                            _make_ptr[dt](addr),
+                            _make_ptr[dt](a.ptr),
+                            a.numel,
+                            ctx,
+                        )
+        else:
+            # Mojo-side temporary (design doc §4.7): materialize the strided
+            # input into a scratch buffer inside the call — Python never
+            # mints a wrapper for it.
+            var tmp = _scratch_contig(a, ctx)
+            var tmp_addr = Int(tmp.unsafe_ptr())
+            comptime for dt in SPEC_UNARY_DTYPES:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _unary_elementwise[dt, op_code](
+                            _make_ptr[dt](addr),
+                            _make_ptr[dt](tmp_addr),
+                            a.numel,
+                            ctx,
+                        )
+            _ = tmp^
+
+
 def _unary_spec_dispatcher[
     op_code: Int
 ](
@@ -985,6 +1046,9 @@ def _unary_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 2:
+            _unary_spec_into_go[op_code](args[0], args[1])
+            return _raw_ret_none()
         return _unary_spec_go[op_code](args[0])
     except e:
         return _spec_unsupported(e)
@@ -1038,6 +1102,56 @@ def _unary_bool_spec_go[op_code: Int](a_o: PyObjectPtr) raises -> PyObjectPtr:
     )
 
 
+def _unary_bool_spec_into_go[op_code: Int](a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    # bool inputs are read through their uint8 storage (bit-compatible).
+    var kdtype = a.dtype
+    if a.dtype == DType.bool:
+        kdtype = DType.uint8
+    var supported = False
+    comptime for dt in SPEC_UNARY_DTYPES:
+        comptime if _dt_on[dt]():
+            if kdtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec unary bool: unsupported dtype ", a.dtype)
+
+    var ctx = a.ctx()
+    var nbytes = a.numel  # bool output, itemsize 1
+    _ = nbytes
+    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != DType.bool:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    if a.numel > 0:
+        if a.contig:
+            comptime for dt in SPEC_UNARY_DTYPES:
+                comptime if _dt_on[dt]():
+                    if kdtype == dt:
+                        _unary_bool[dt, op_code](
+                            _make_ptr[DType.bool](addr),
+                            _make_ptr[dt](a.ptr),
+                            a.numel,
+                            ctx,
+                        )
+        else:
+            # Mojo-side temporary; see _unary_spec_go.
+            var tmp = _scratch_contig(a, ctx)
+            var tmp_addr = Int(tmp.unsafe_ptr())
+            comptime for dt in SPEC_UNARY_DTYPES:
+                comptime if _dt_on[dt]():
+                    if kdtype == dt:
+                        _unary_bool[dt, op_code](
+                            _make_ptr[DType.bool](addr),
+                            _make_ptr[dt](tmp_addr),
+                            a.numel,
+                            ctx,
+                        )
+            _ = tmp^
+
+
 def _unary_bool_spec_dispatcher[
     op_code: Int
 ](
@@ -1047,6 +1161,9 @@ def _unary_bool_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 2:
+            _unary_bool_spec_into_go[op_code](args[0], args[1])
+            return _raw_ret_none()
         return _unary_bool_spec_go[op_code](args[0])
     except e:
         return _spec_unsupported(e)
@@ -1109,6 +1226,57 @@ def _scalar_spec_go[
     )
 
 
+def _scalar_spec_into_go[
+    op_code: Int
+](a_o: PyObjectPtr, scalar_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    var supported = False
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dt_on[dt]():
+            if a.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec scalar: unsupported dtype ", a.dtype)
+
+    var scalar = Float32(_raw_f64(scalar_o))
+    var ctx = a.ctx()
+    var nbytes = a.numel * a.itemsize
+    _ = nbytes
+    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != a.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    if a.numel > 0:
+        if a.contig:
+            comptime for dt in FLOAT_DTYPES:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _scalar_elementwise[dt, op_code](
+                            _make_ptr[dt](addr),
+                            _make_ptr[dt](a.ptr),
+                            scalar,
+                            a.numel,
+                            ctx,
+                        )
+        else:
+            # Mojo-side temporary; see _unary_spec_go.
+            var tmp = _scratch_contig(a, ctx)
+            var tmp_addr = Int(tmp.unsafe_ptr())
+            comptime for dt in FLOAT_DTYPES:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _scalar_elementwise[dt, op_code](
+                            _make_ptr[dt](addr),
+                            _make_ptr[dt](tmp_addr),
+                            scalar,
+                            a.numel,
+                            ctx,
+                        )
+            _ = tmp^
+
+
 def _scalar_spec_dispatcher[
     op_code: Int
 ](
@@ -1118,6 +1286,9 @@ def _scalar_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 3:
+            _scalar_spec_into_go[op_code](args[0], args[1], args[2])
+            return _raw_ret_none()
         return _scalar_spec_go[op_code](args[0], args[1])
     except e:
         return _spec_unsupported(e)
@@ -1180,6 +1351,57 @@ def _int_scalar_spec_go[
     )
 
 
+def _int_scalar_spec_into_go[
+    op_code: Int
+](a_o: PyObjectPtr, scalar_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    var supported = False
+    comptime for dt in [DType.int32, DType.int64]:
+        comptime if _dt_on[dt]():
+            if a.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec int scalar: unsupported dtype ", a.dtype)
+
+    var scalar = _raw_int(scalar_o)
+    var ctx = a.ctx()
+    var nbytes = a.numel * a.itemsize
+    _ = nbytes
+    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != a.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    if a.numel > 0:
+        if a.contig:
+            comptime for dt in [DType.int32, DType.int64]:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _int_scalar_elementwise[dt, op_code](
+                            _make_ptr[dt](addr),
+                            _make_ptr[dt](a.ptr),
+                            scalar,
+                            a.numel,
+                            ctx,
+                        )
+        else:
+            # Mojo-side temporary; see _unary_spec_go.
+            var tmp = _scratch_contig(a, ctx)
+            var tmp_addr = Int(tmp.unsafe_ptr())
+            comptime for dt in [DType.int32, DType.int64]:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _int_scalar_elementwise[dt, op_code](
+                            _make_ptr[dt](addr),
+                            _make_ptr[dt](tmp_addr),
+                            scalar,
+                            a.numel,
+                            ctx,
+                        )
+            _ = tmp^
+
+
 def _int_scalar_spec_dispatcher[
     op_code: Int
 ](
@@ -1189,6 +1411,9 @@ def _int_scalar_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 3:
+            _int_scalar_spec_into_go[op_code](args[0], args[1], args[2])
+            return _raw_ret_none()
         return _int_scalar_spec_go[op_code](args[0], args[1])
     except e:
         return _spec_unsupported(e)

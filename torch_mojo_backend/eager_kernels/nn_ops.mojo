@@ -2562,6 +2562,68 @@ def _mean_spec_go(
     )
 
 
+def _mean_spec_into_go(
+    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr
+, out_o: PyObjectPtr) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    var supported = False
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dt_on[dt]():
+            if a.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec mean: unsupported dtype ", a.dtype)
+    var rows = 0
+    var cols = 0
+    var out_rank = 0
+    var oshape = IndexList[MAX_RANK](1)
+    var pshape = IndexList[MAX_RANK](1)
+    var pstrides = IndexList[MAX_RANK](0)
+    var needs_copy = False
+    _reduce_spec_geom(
+        a,
+        rdims_t,
+        keepdim_o,
+        rows,
+        cols,
+        out_rank,
+        oshape,
+        pshape,
+        pstrides,
+        needs_copy,
+    )
+    if cols == 0:
+        raise Error("mojo spec mean: empty reduce dim")
+
+    var ctx = a.ctx()
+    var nbytes = rows * a.itemsize
+    _ = nbytes
+    if out.numel != rows or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != a.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    if rows > 0:
+        if needs_copy:
+            # Mojo-side temporary: materialize the permuted layout the
+            # classic path used to build with Python permute+_tc.
+            var tmp = _scratch_copy(
+                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
+            )
+            var in_addr = Int(tmp.unsafe_ptr())
+            comptime for dt in FLOAT_DTYPES:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _mean_rows[dt](addr, in_addr, rows, cols, ctx)
+            _ = tmp^
+        else:
+            comptime for dt in FLOAT_DTYPES:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _mean_rows[dt](addr, a.ptr, rows, cols, ctx)
+
+
 def _mean_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -2569,6 +2631,9 @@ def _mean_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 4:
+            _mean_spec_into_go(args[0], args[1], args[2], args[3])
+            return _raw_ret_none()
         return _mean_spec_go(args[0], args[1], args[2])
     except e:
         return _spec_unsupported(e)
@@ -2642,6 +2707,68 @@ def _max_spec_go(
     )
 
 
+def _max_spec_into_go(
+    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr
+, out_o: PyObjectPtr) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    var supported = False
+    comptime for dt in SPEC_MAXROWS_DTYPES:
+        comptime if _dt_on[dt]():
+            if a.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec max: unsupported dtype ", a.dtype)
+    if a.numel == 0:
+        raise Error("mojo spec max: empty input")
+    var rows = 0
+    var cols = 0
+    var out_rank = 0
+    var oshape = IndexList[MAX_RANK](1)
+    var pshape = IndexList[MAX_RANK](1)
+    var pstrides = IndexList[MAX_RANK](0)
+    var needs_copy = False
+    _reduce_spec_geom(
+        a,
+        rdims_t,
+        keepdim_o,
+        rows,
+        cols,
+        out_rank,
+        oshape,
+        pshape,
+        pstrides,
+        needs_copy,
+    )
+
+    var ctx = a.ctx()
+    var nbytes = rows * a.itemsize
+    _ = nbytes
+    if out.numel != rows or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != a.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    if rows > 0:
+        if needs_copy:
+            # Mojo-side temporary: materialize the permuted layout the
+            # classic path used to build with Python permute+_tc.
+            var tmp = _scratch_copy(
+                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
+            )
+            var in_addr = Int(tmp.unsafe_ptr())
+            comptime for dt in SPEC_MAXROWS_DTYPES:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _max_rows[dt](addr, in_addr, rows, cols, ctx)
+            _ = tmp^
+        else:
+            comptime for dt in SPEC_MAXROWS_DTYPES:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _max_rows[dt](addr, a.ptr, rows, cols, ctx)
+
+
 def _max_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -2649,6 +2776,9 @@ def _max_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 4:
+            _max_spec_into_go(args[0], args[1], args[2], args[3])
+            return _raw_ret_none()
         return _max_spec_go(args[0], args[1], args[2])
     except e:
         return _spec_unsupported(e)
@@ -2714,6 +2844,68 @@ def _argmax_spec_go(
     )
 
 
+def _argmax_spec_into_go(
+    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr
+, out_o: PyObjectPtr) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    var supported = False
+    comptime for dt in SPEC_MAXROWS_DTYPES:
+        comptime if _dt_on[dt]():
+            if a.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec argmax: unsupported dtype ", a.dtype)
+    if a.numel == 0:
+        raise Error("mojo spec argmax: empty input")
+    var rows = 0
+    var cols = 0
+    var out_rank = 0
+    var oshape = IndexList[MAX_RANK](1)
+    var pshape = IndexList[MAX_RANK](1)
+    var pstrides = IndexList[MAX_RANK](0)
+    var needs_copy = False
+    _reduce_spec_geom(
+        a,
+        rdims_t,
+        keepdim_o,
+        rows,
+        cols,
+        out_rank,
+        oshape,
+        pshape,
+        pstrides,
+        needs_copy,
+    )
+
+    var ctx = a.ctx()
+    var nbytes = rows * 8  # int64 output
+    _ = nbytes
+    if out.numel != rows or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != DType.int64:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    if rows > 0:
+        if needs_copy:
+            # Mojo-side temporary: materialize the permuted layout the
+            # classic path used to build with Python permute+_tc.
+            var tmp = _scratch_copy(
+                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
+            )
+            var in_addr = Int(tmp.unsafe_ptr())
+            comptime for dt in SPEC_MAXROWS_DTYPES:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _argmax_rows[dt](addr, in_addr, rows, cols, ctx)
+            _ = tmp^
+        else:
+            comptime for dt in SPEC_MAXROWS_DTYPES:
+                comptime if _dt_on[dt]():
+                    if a.dtype == dt:
+                        _argmax_rows[dt](addr, a.ptr, rows, cols, ctx)
+
+
 def _argmax_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -2721,6 +2913,9 @@ def _argmax_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 4:
+            _argmax_spec_into_go(args[0], args[1], args[2], args[3])
+            return _raw_ret_none()
         return _argmax_spec_go(args[0], args[1], args[2])
     except e:
         return _spec_unsupported(e)
@@ -2772,6 +2967,46 @@ def _cumsum_spec_go(a_o: PyObjectPtr) raises -> PyObjectPtr:
     )
 
 
+def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+    """Cumulative sum over the trailing dim; full-shape output."""
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    var supported = False
+    comptime for dt in [DType.int64, DType.int32, DType.float32]:
+        comptime if _dt_on[dt]():
+            if a.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec cumsum: unsupported dtype ", a.dtype)
+    if a.rank < 1 or a.numel == 0:
+        raise Error("mojo spec cumsum: empty or rank-0 input")
+
+    var cols = a.shape[MAX_RANK - 1]
+    var rows = a.numel // cols
+    var ctx = a.ctx()
+    var nbytes = a.numel * a.itemsize
+    _ = nbytes
+    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != a.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    if a.contig:
+        comptime for dt in [DType.int64, DType.int32, DType.float32]:
+            comptime if _dt_on[dt]():
+                if a.dtype == dt:
+                    _cumsum_rows[dt](addr, a.ptr, rows, cols, ctx)
+    else:
+        # Mojo-side temporary; see _unary_spec_go in elementwise_ops.
+        var tmp = _scratch_contig(a, ctx)
+        var tmp_addr = Int(tmp.unsafe_ptr())
+        comptime for dt in [DType.int64, DType.int32, DType.float32]:
+            comptime if _dt_on[dt]():
+                if a.dtype == dt:
+                    _cumsum_rows[dt](addr, tmp_addr, rows, cols, ctx)
+        _ = tmp^
+
+
 def _cumsum_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -2779,6 +3014,9 @@ def _cumsum_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 2:
+            _cumsum_spec_into_go(args[0], args[1])
+            return _raw_ret_none()
         return _cumsum_spec_go(args[0])
     except e:
         return _spec_unsupported(e)
@@ -2867,6 +3105,84 @@ def _batch_norm_spec_go(
     )
 
 
+def _batch_norm_spec_into_go(
+    in_o: PyObjectPtr,
+    mean_o: PyObjectPtr,
+    var_o: PyObjectPtr,
+    gamma_o: PyObjectPtr,
+    beta_o: PyObjectPtr,
+    eps_o: PyObjectPtr,
+    out_o: PyObjectPtr,
+) raises:
+    """Inference batch norm: geometry (channels/inner) derived from the
+    input spec, output alloc and launch in one boundary call, reusing the
+    `_batch_norm` kernel above."""
+    ref inp = _spec_ptr(in_o)[]
+    ref out = _spec_ptr(out_o)[]
+    ref meanp = _spec_ptr(mean_o)[]
+    ref varp = _spec_ptr(var_o)[]
+    ref gammap = _spec_ptr(gamma_o)[]
+    ref betap = _spec_ptr(beta_o)[]
+    var eps = Float32(_raw_f64(eps_o))
+
+    if inp.rank < 2:
+        raise Error("mojo spec batch_norm: input rank must be >= 2")
+    if inp.numel == 0:
+        raise Error("mojo spec batch_norm: empty input")
+    if not (
+        inp.contig
+        and meanp.contig
+        and varp.contig
+        and gammap.contig
+        and betap.contig
+    ):
+        raise Error("mojo spec batch_norm: all inputs must be contiguous")
+    if (
+        meanp.dtype != inp.dtype
+        or varp.dtype != inp.dtype
+        or gammap.dtype != inp.dtype
+        or betap.dtype != inp.dtype
+    ):
+        raise Error("mojo spec batch_norm: stat/affine dtypes must match input")
+    var supported = False
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dt_on[dt]():
+            if inp.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec batch_norm: unsupported dtype ", inp.dtype)
+
+    var channels = inp.dim(1)
+    var inner = 1
+    for i in range(MAX_RANK - inp.rank + 2, MAX_RANK):
+        inner *= inp.shape[i]
+
+    var ctx = inp.ctx()
+    var nbytes = inp.numel * inp.itemsize
+    _ = nbytes
+    if out.numel != inp.numel or not out.contig or out.ctx_ptr != inp.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != inp.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dt_on[dt]():
+            if inp.dtype == dt:
+                _batch_norm[dt](
+                    addr,
+                    inp.ptr,
+                    meanp.ptr,
+                    varp.ptr,
+                    gammap.ptr,
+                    betap.ptr,
+                    eps,
+                    channels,
+                    inner,
+                    inp.numel,
+                    ctx,
+                )
+
+
 def _batch_norm_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -2874,6 +3190,11 @@ def _batch_norm_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 7:
+            _batch_norm_spec_into_go(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6]
+            )
+            return _raw_ret_none()
         return _batch_norm_spec_go(
             args[0], args[1], args[2], args[3], args[4], args[5]
         )
@@ -2933,6 +3254,52 @@ def _softmax_spec_go(a_o: PyObjectPtr) raises -> PyObjectPtr:
     )
 
 
+def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+    """Plain softmax over the trailing dim (scale=1, no causal mask);
+    full-shape output. The non-trailing dim transpose recursion and the
+    half_to_float cast stay in Python."""
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    var supported = False
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dt_on[dt]():
+            if a.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec softmax: unsupported dtype ", a.dtype)
+    if a.rank < 1 or a.numel == 0:
+        raise Error("mojo spec softmax: empty or rank-0 input")
+
+    var cols = a.shape[MAX_RANK - 1]
+    var rows = a.numel // cols
+    var ctx = a.ctx()
+    var nbytes = a.numel * a.itemsize
+    _ = nbytes
+    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != a.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    if a.contig:
+        comptime for dt in FLOAT_DTYPES:
+            comptime if _dt_on[dt]():
+                if a.dtype == dt:
+                    _softmax_rows[dt](
+                        addr, a.ptr, rows, cols, Float32(1.0), 0, 1, ctx
+                    )
+    else:
+        # Mojo-side temporary; see _unary_spec_go in elementwise_ops.
+        var tmp = _scratch_contig(a, ctx)
+        var tmp_addr = Int(tmp.unsafe_ptr())
+        comptime for dt in FLOAT_DTYPES:
+            comptime if _dt_on[dt]():
+                if a.dtype == dt:
+                    _softmax_rows[dt](
+                        addr, tmp_addr, rows, cols, Float32(1.0), 0, 1, ctx
+                    )
+        _ = tmp^
+
+
 def _softmax_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -2940,6 +3307,9 @@ def _softmax_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 2:
+            _softmax_spec_into_go(args[0], args[1])
+            return _raw_ret_none()
         return _softmax_spec_go(args[0])
     except e:
         return _spec_unsupported(e)
@@ -3042,6 +3412,106 @@ def _attn_decode_spec_go(
     )
 
 
+def _attn_decode_spec_into_go(
+    q_o: PyObjectPtr,
+    k_o: PyObjectPtr,
+    v_o: PyObjectPtr,
+    scale_o: PyObjectPtr,
+    out_o: PyObjectPtr,
+) raises:
+    """Fused decode attention (q_len == 1, not causal), GPU only — one
+    boundary call replacing the Python gates + geometry + alloc + launch.
+    Q/K/V read through their real strides; the innermost head dimension must
+    remain contiguous for vector loads."""
+    ref q = _spec_ptr(q_o)[]
+    ref out = _spec_ptr(out_o)[]
+    ref k = _spec_ptr(k_o)[]
+    ref v = _spec_ptr(v_o)[]
+    var scale = Float32(_raw_f64(scale_o))
+
+    if q.rank != 4 or k.rank != 4 or v.rank != 4:
+        raise Error("mojo spec attn_decode: rank != 4")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise Error("mojo spec attn_decode: dtypes differ")
+    var supported = False
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dt_on[dt]():
+            if q.dtype == dt:
+                supported = True
+    if not supported:
+        raise Error("mojo spec attn_decode: unsupported dtype ", q.dtype)
+    var b = q.shape[MAX_RANK - 4]
+    var h = q.shape[MAX_RANK - 3]
+    var q_len = q.shape[MAX_RANK - 2]
+    var head_dim = q.shape[MAX_RANK - 1]
+    var kv_len = k.shape[MAX_RANK - 2]
+    if q_len != 1:
+        raise Error("mojo spec attn_decode: q_len != 1")
+    for i in range(4):
+        if k.shape[MAX_RANK - 4 + i] != v.shape[MAX_RANK - 4 + i]:
+            raise Error("mojo spec attn_decode: k/v shapes differ")
+    if (
+        b != k.shape[MAX_RANK - 4]
+        or h != k.shape[MAX_RANK - 3]
+        or head_dim != k.shape[MAX_RANK - 1]
+    ):
+        raise Error("mojo spec attn_decode: q/k shapes incompatible")
+    if b * h * kv_len * head_dim == 0:
+        raise Error("mojo spec attn_decode: empty input")
+    if (
+        q.strides[MAX_RANK - 1] != 1
+        or k.strides[MAX_RANK - 1] != 1
+        or v.strides[MAX_RANK - 1] != 1
+        or k.strides[MAX_RANK - 2] != head_dim
+        or v.strides[MAX_RANK - 2] != head_dim
+    ):
+        raise Error("mojo spec attn_decode: unsupported q/k/v strides")
+
+    var ctx = q.ctx()
+    if ctx.api() == "cpu":
+        # The CPU device takes the bmm+softmax+bmm chain today; keep it.
+        raise Error("mojo spec attn_decode: GPU only")
+    if head_dim % 4 != 0 or head_dim > ATTN_MAX_HD or kv_len > ATTN_MAX_KV:
+        raise Error("mojo spec attn_decode: size caps")
+
+    var numel = b * h * head_dim
+    var nbytes = numel * q.itemsize
+    _ = nbytes
+    if out.numel != numel or not out.contig or out.ctx_ptr != q.ctx_ptr:
+        raise Error("mojo spec into: output buffer mismatch")
+    if out.dtype != q.dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+    var addr = out.ptr
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dt_on[dt]():
+            if q.dtype == dt:
+                _attn_decode[dt](
+                    addr,
+                    q.ptr,
+                    k.ptr,
+                    v.ptr,
+                    b * h,
+                    kv_len,
+                    head_dim,
+                    scale,
+                    h,
+                    q.strides[MAX_RANK - 4],
+                    q.strides[MAX_RANK - 3],
+                    k.strides[MAX_RANK - 4],
+                    k.strides[MAX_RANK - 3],
+                    k.strides[MAX_RANK - 2],
+                    v.strides[MAX_RANK - 4],
+                    v.strides[MAX_RANK - 3],
+                    v.strides[MAX_RANK - 2],
+                    ctx,
+                )
+    var oshape = IndexList[MAX_RANK](1)
+    oshape[MAX_RANK - 4] = b
+    oshape[MAX_RANK - 3] = h
+    oshape[MAX_RANK - 2] = 1
+    oshape[MAX_RANK - 1] = head_dim
+
+
 def _attn_decode_spec_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -3049,6 +3519,9 @@ def _attn_decode_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
+        if nargs == 5:
+            _attn_decode_spec_into_go(args[0], args[1], args[2], args[3], args[4])
+            return _raw_ret_none()
         return _attn_decode_spec_go(args[0], args[1], args[2], args[3])
     except e:
         return _spec_unsupported(e)
