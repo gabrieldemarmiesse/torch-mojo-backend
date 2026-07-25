@@ -29,6 +29,17 @@ from max.dtype import DType
 
 from torch_mojo_backend import eager_kernels, is_running_tests
 from torch_mojo_backend.eager_kernels import KernelPending
+from torch_mojo_backend.eager_kernels import call_queue as _call_queue
+
+
+def _device_call(fn, *args):
+    """Launch an ungated device call (tensor_holder / fa4): when the call
+    queue is active it must hold its FIFO position behind queued producers
+    of its inputs; otherwise call directly."""
+    if _call_queue.enabled():
+        return _call_queue.external_call(fn, args)
+    return fn(*args)
+
 from torch_mojo_backend.eager_kernels import _ctx_ptr
 from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
     _reserve_philox_state,
@@ -834,8 +845,12 @@ def _copy_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     if dst._numel == 0:
         return
     if dst._is_contiguous and src._is_contiguous:
-        eager_kernels.tensor_holder.copy_d2d(
-            _ctx_ptr(dst._device), dst._ptr, src._ptr, dst._numel * dst._itemsize
+        _device_call(
+            eager_kernels.tensor_holder.copy_d2d,
+            _ctx_ptr(dst._device),
+            dst._ptr,
+            src._ptr,
+            dst._numel * dst._itemsize,
         )
     else:
         _copy_strided_into(dst, src)
@@ -1234,7 +1249,8 @@ def fast_aten_fill__scalar(input, value):
     if a._dtype == DType.float64 and a._device.api == "metal":
         return None
     if a._numel > 0:
-        eager_kernels.tensor_holder.StridedFill(
+        _device_call(
+            eager_kernels.tensor_holder.StridedFill,
             a._ptr,
             float(value),
             _pad8(a._shape, 1),
@@ -4053,7 +4069,8 @@ def fast_fa4_bf16_d64_causal_forward(
     logsumexp = _alloc((batch, heads, seqlen), DType.float32, q._device)
     scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
     if use_strided_qkv:
-        fa4_ops.flash_attention_fwd_bf16_d64_causal_strided_qkv(
+        _device_call(
+            fa4_ops.flash_attention_fwd_bf16_d64_causal_strided_qkv,
             q_native._ptr,
             *q_native._strides,
             k_native._ptr,
@@ -4069,7 +4086,8 @@ def fast_fa4_bf16_d64_causal_forward(
             _ctx_ptr(q._device),
         )
     else:
-        fa4_ops.flash_attention_fwd_bf16_d64_causal(
+        _device_call(
+            fa4_ops.flash_attention_fwd_bf16_d64_causal,
             q_native._ptr,
             k_native._ptr,
             v_native._ptr,
@@ -4123,7 +4141,8 @@ def fast_fa4_bf16_d64_causal_backward(
         (batch * heads * seqlen_padded * head_dim,), DType.float32, q_native._device
     )
     if use_strided_qkv:
-        fa4_ops.flash_attention_bwd_bf16_d64_causal_strided_qkv(
+        _device_call(
+            fa4_ops.flash_attention_bwd_bf16_d64_causal_strided_qkv,
             q_native._ptr,
             *q_native._strides,
             k_native._ptr,
@@ -4146,7 +4165,8 @@ def fast_fa4_bf16_d64_causal_backward(
             _ctx_ptr(q_native._device),
         )
     else:
-        fa4_ops.flash_attention_bwd_bf16_d64_causal(
+        _device_call(
+            fa4_ops.flash_attention_bwd_bf16_d64_causal,
             q_native._ptr,
             k_native._ptr,
             v_native._ptr,
@@ -5502,6 +5522,7 @@ def fast_aten__local_scalar_dense(tensor):
     t = _t(tensor)
     if t is None or t._numel != 1:
         return NOT_HANDLED
+    _call_queue.drain()  # host read: queued launches must land first
     return eager_kernels.tensor_holder.read_scalar(
         _ctx_ptr(t._device), t._ptr, t._dtype.value
     )

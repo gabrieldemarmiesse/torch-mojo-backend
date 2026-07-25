@@ -371,6 +371,12 @@ def _may_raise_pending() -> bool:
     force knob re-enables deferral for its dedicated harnesses."""
     from torch_mojo_backend.is_running_tests import IS_RUNNING_TESTS
 
+    from . import call_queue
+
+    if call_queue.enabled():
+        # Kernel-call-level deferral: misses queue at the CALL layer, the
+        # aten-level KernelPending machinery stays out of the way.
+        return False
     return not IS_RUNNING_TESTS or bool(os.environ.get("TMB_FORCE_DEFER"))
 
 
@@ -531,9 +537,19 @@ class _ModuleState:
 
 
 def _wrap_call(unit: _OpUnit, attr: str, fn: object) -> object:
+    """Callable for one entry point. `fn` may be None (unit not loaded yet)
+    when the call queue owns misses — the queue resolves at launch time."""
+
     def call(*args: object, **kwargs: object) -> object:
+        from . import call_queue
+
+        if call_queue.enabled():
+            return call_queue.kernel_call(unit, attr, args, kwargs)
+        bound = fn if unit.ext is not None and fn is not None else None
+        if bound is None:
+            bound = getattr(unit.load_blocking(), attr)
         try:
-            return fn(*args, **kwargs)
+            return bound(*args, **kwargs)
         except Exception as exc:  # Mojo errors surface as plain Exception
             if "unsupported dtype" not in str(exc) or unit.dtypes is None:
                 raise
@@ -576,11 +592,20 @@ class _ModuleProxy:
         if unit.ext is None:
             if _in_torch_dispatch() and _may_raise_pending():
                 raise KernelPending(state, unit.request_async())
-            unit.load_blocking()
+            from . import call_queue
+
+            if not call_queue.enabled():
+                unit.load_blocking()
         state.demanded_ops.add(attr)
-        value = getattr(unit.ext, attr)
-        if type(value).__name__ == "builtin_function_or_method":
-            value = _wrap_call(unit, attr, value)
+        if unit.ext is None:
+            # Call-queue mode: hand out the lazy callable; the queue builds
+            # and resolves at launch time. Entry points are all callables
+            # (validated against the source registration list above).
+            value = _wrap_call(unit, attr, None)
+        else:
+            value = getattr(unit.ext, attr)
+            if type(value).__name__ == "builtin_function_or_method":
+                value = _wrap_call(unit, attr, value)
         self.__dict__[attr] = value  # later lookups skip __getattr__
         return value
 

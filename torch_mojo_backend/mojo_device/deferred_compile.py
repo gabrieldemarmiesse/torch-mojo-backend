@@ -605,6 +605,35 @@ def _defer_view(func, args, kwargs):
     return result
 
 
+def _dispatch_call_queue(func, args, kwargs, name, overload, cq):
+    """Dispatch path when kernel-CALL-level deferral owns compile misses:
+    every torch-level effect happens synchronously here; only device kernel
+    launches may lag in the call queue. This layer just (a) pumps the queue,
+    (b) drains before host-visible reads, and (c) brackets the op so every
+    buffer it touches stays alive while queued calls hold raw pointers."""
+    cq.pump()
+    sync = name in _SYNC_OPS or overload in _SYNC_OPS
+    if sync and not _os.environ.get("TMB_CAST_SYNC") and name in (
+        "aten::_to_copy",
+        "aten::copy_",
+    ):
+        flat_args, _ = tree_flatten((args, kwargs))
+        devices = {a.device.type for a in flat_args if isinstance(a, torch.Tensor)}
+        target = kwargs.get("device")
+        if target is not None:
+            devices.add(torch.device(target).type)
+        sync = len(devices) > 1
+    if sync and cq.active():
+        cq.drain()
+    prev = cq.op_begin()
+    result = None
+    try:
+        result = _direct(func, args, kwargs)
+        return result
+    finally:
+        cq.op_end(prev, args, kwargs, result)
+
+
 def dispatch(func, args, kwargs):
     """Entry point called from TorchMojoTensor.__torch_dispatch__."""
     name = func._schema.name
@@ -614,6 +643,11 @@ def dispatch(func, args, kwargs):
 
     if _RT.error is not None and not in_replay():
         _RT.drain()  # re-raises the held replay error
+
+    from torch_mojo_backend.eager_kernels import call_queue as _cq
+
+    if _cq.enabled():
+        return _dispatch_call_queue(func, args, kwargs, name, overload, _cq)
 
     force = _force_defer()
     episode = (_RT.active or force) and not in_replay()
@@ -705,6 +739,10 @@ def dispatch(func, args, kwargs):
 
 def drain() -> None:
     """Public: wait for all deferred work (used by device synchronize)."""
+    from torch_mojo_backend.eager_kernels import call_queue as _cq
+
+    if _cq.enabled():
+        _cq.drain()
     _RT.drain()
 
 
@@ -717,6 +755,11 @@ def wait_for(tensors: list) -> None:
     touching bytes. Views of pending tensors are only safe to hand out
     because every in-dispatch consumer replays the producing FIFO prefix
     first — this is the same barrier for out-of-dispatch consumers."""
+    from torch_mojo_backend.eager_kernels import call_queue as _cq
+
+    if _cq.enabled():
+        _cq.drain()
+        return
     live = [t for t in tensors if isinstance(t, torch.Tensor)]
     if in_replay() or not any(_is_tainted(t) for t in live):
         return

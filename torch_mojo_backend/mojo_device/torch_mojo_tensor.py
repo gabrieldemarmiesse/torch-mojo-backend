@@ -327,7 +327,7 @@ class TorchMojoTensor(torch.Tensor):
         shape = tuple(shape)
         numel = math.prod(shape)
         holder, ptr = _holder_mod().alloc(_ctx_ptr(device), numel * dtype.size_in_bytes)
-        return cls._make(
+        result = cls._make(
             holder,
             ptr,
             shape,
@@ -337,6 +337,10 @@ class TorchMojoTensor(torch.Tensor):
             device,
             contiguous=True,
         )
+        from torch_mojo_backend.eager_kernels import call_queue as _cq
+
+        _cq.note_alloc(result)
+        return result
 
     @classmethod
     def _view_of(
@@ -396,11 +400,16 @@ class TorchMojoTensor(torch.Tensor):
     def _to_cpu_tensor(self, *, non_blocking: bool = False) -> torch.Tensor:
         """D2H into MAX-owned pinned storage exposed as a CPU tensor.
 
+        Host read: queued kernel launches must land first (call queue).
+
         With ``non_blocking=True`` on a GPU, the returned tensor aliases the
         pinned destination immediately and the caller must synchronize before
         consuming it, matching PyTorch's asynchronous accelerator-to-CPU
         contract. Blocking and CPU-device copies are ready on return.
         """
+        from torch_mojo_backend.eager_kernels import call_queue as _cq
+
+        _cq.drain()
         # Reading device bytes is a sync point for deferred-compile episodes:
         # every queued op must have executed before the transfer is enqueued.
         from . import deferred_compile
@@ -671,12 +680,38 @@ def _resize_payload(dst: TorchMojoTensor, shape) -> None:
     _rebind_payload(dst, replacement)
 
 
+def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+    """Queue the strided copy as an external call (tensor_holder is always
+    loaded, so the item is always launch-ready; it only holds FIFO order).
+    The queue holds raw pointers — the two tensors ride along for
+    keep-alive, harmlessly ignored by the trailing-args convention here."""
+    from torch_mojo_backend.eager_kernels import call_queue as _cq
+
+    holder = _holder_mod()
+    args = (
+        dst._ptr,
+        src._ptr,
+        _pad8(dst._shape, 1),
+        _pad8(dst._strides, 0),
+        _pad8(src._strides, 0),
+        dst._itemsize,
+        _ctx_ptr(dst._device),
+    )
+    _cq.external_call(lambda *a: holder.CopyStrided(*a[:7]), args + (dst, src))
+
+
 def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     """dst[coords] = src[coords]; same shape and dtype, any strides.
 
     The shared materialize/copy primitive: powers .contiguous(), copy_ into
     views, and expand materialization (src strides may contain 0s).
     """
+    from torch_mojo_backend.eager_kernels import call_queue as _cq
+
+    if _cq.enabled() and _cq.active():
+        # Hold FIFO position behind queued producers of src/dst.
+        _copy_strided_enqueue(dst, src)
+        return
     _holder_mod().CopyStrided(
         dst._ptr,
         src._ptr,
