@@ -359,8 +359,7 @@ def _split_line(line: String) -> List[String]:
 
 
 def read_targets(path: String) raises -> List[GemmCase]:
-    """Parse the ROCm reference CSV written by scripts/rocm_gemm_reference.py.
-    """
+    """Parse the ROCm reference CSV written by scripts/rocm_gemm_reference.py."""
     var text: String
     with open(path, "r") as file:
         text = file.read()
@@ -699,6 +698,25 @@ def _fixed(value: Float64, decimals: Int) -> String:
     return String(rounded)
 
 
+def _print_variant(
+    name: String, role: String, mojo_us: Float64, rocm_us: Float64
+) -> Int:
+    """One per-variant summary row; returns 1 when it exceeds the 1.03 bar."""
+    if rocm_us <= 0.0:
+        return 0
+    var ratio = mojo_us / rocm_us
+    print(
+        "  ",
+        _pad(name, 8),
+        _pad(role, 7),
+        _pad(_fixed(mojo_us / 1000.0, 3), 10),
+        _pad(_fixed(rocm_us / 1000.0, 3), 10),
+        _pad(_fixed(ratio, 3), 7),
+        "within 3%" if ratio <= 1.03 else "OVER",
+    )
+    return 0 if ratio <= 1.03 else 1
+
+
 def main() raises:
     var targets_path = String(
         arg_parse("targets", "harness/nanogpt_train/rocm_gemm_targets.csv")
@@ -724,6 +742,17 @@ def main() raises:
     var copy_step_us = Float64(0.0)
     var failed = 0
     var failed_us = Float64(0.0)
+    # Per-variant totals. The three transpose layouts are separate optimization
+    # problems -- they differ in which operand is read along its contraction
+    # axis, hence in coalescing, LDS layout and fragment gather -- so an
+    # aggregate ratio can hide one of them being far off. Index: 0 NN, 1 NT,
+    # 2 TN.
+    var nn_mojo = Float64(0.0)
+    var nn_rocm = Float64(0.0)
+    var nt_mojo = Float64(0.0)
+    var nt_rocm = Float64(0.0)
+    var tn_mojo = Float64(0.0)
+    var tn_rocm = Float64(0.0)
     with DeviceContext() as ctx:
         for target in cases:
             if only != "all" and target.label != only:
@@ -734,6 +763,18 @@ def main() raises:
             mojo_step_us += result.median_us * Float64(target.calls_per_step)
             rocm_step_us += target.rocm_us * Float64(target.calls_per_step)
             copy_step_us += result.copy_us * Float64(target.calls_per_step)
+            # ta=0 tb=0 is NN, ta=0 tb=1 is NT, ta=1 tb=0 is TN.
+            var w_mojo = result.median_us * Float64(target.calls_per_step)
+            var w_rocm = target.rocm_us * Float64(target.calls_per_step)
+            if target.transpose_a:
+                tn_mojo += w_mojo
+                tn_rocm += w_rocm
+            elif target.transpose_b:
+                nt_mojo += w_mojo
+                nt_rocm += w_rocm
+            else:
+                nn_mojo += w_mojo
+                nn_rocm += w_rocm
             print(
                 _pad(target.label, 25),
                 _pad(target.role, 6),
@@ -771,6 +812,24 @@ def main() raises:
         _fixed(copy_step_us / 1000.0, 3),
         "ms (PyTorch-ROCm pays none of this)",
     )
+    print()
+    print(
+        "per-variant, weighted by calls per step (acceptance: ratio <= 1.03):"
+    )
+    print("  variant  role    mojo_ms    rocm_ms   ratio   status")
+    var over = 0
+    over += _print_variant("NN", "dgrad", nn_mojo, nn_rocm)
+    over += _print_variant("NT", "fwd", nt_mojo, nt_rocm)
+    over += _print_variant("TN", "wgrad", tn_mojo, tn_rocm)
+    if over > 0:
+        print(
+            "  ",
+            over,
+            (
+                "variant(s) exceed 1.03. NN is A(m,k) @ B(k,n); NT reads B from"
+                " an (n,k) buffer; TN reads A from a (k,m) buffer."
+            ),
+        )
     if failed == 0:
         print(
             "correctness: all cases pass (pattern_check=",
