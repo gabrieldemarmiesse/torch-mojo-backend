@@ -9,21 +9,27 @@ Measured on an MI300X VF with PyTorch 2.11.0+rocm7.2 and MAX
 
 | backend | step | tokens/s |
 |---|---:|---:|
-| PyTorch-ROCm | 156.63 ms | 313 805 |
-| eager Mojo device | 921.39 ms | 53 346 |
+| PyTorch-ROCm | 156.64 ms | 313 799 |
+| eager Mojo device, initial | 921.39 ms | 53 346 |
+| eager Mojo device, after the Linear GEMM work | 661.86 ms | 74 264 |
 
 Both backends are GPU-bound (trace idle 0.01%), so GPU kernel time is the unit
-of comparison. Ranked gap per step, from
-`current_bench_train/comparison/nanogpt_train_kernel_gap.csv`:
+of comparison. Current ranked gap per step, from
+`current_bench_train/comparison_v2/nanogpt_train_kernel_gap.csv`:
 
 | target | mojo | rocm | ratio | share of gap |
 |---|---:|---:|---:|---:|
-| Linear GEMM (backward) | 346.89 ms | 43.65 ms | 7.95x | 39.3% |
-| SDPA (backward) | 239.24 ms | 33.95 ms | 7.05x | 26.6% |
-| Linear GEMM (forward) | 171.84 ms | 24.03 ms | 7.15x | 19.2% |
-| SDPA (forward) | 105.10 ms | 9.08 ms | 11.57x | 12.4% |
-| Copies / dtype casts | 26.00 ms | 11.44 ms | 2.27x | 1.9% |
-| everything else | 33.28 ms | 34.87 ms | 0.95x | 0% |
+| SDPA (backward) | 239.28 ms | 33.95 ms | 7.05x | 40.2% |
+| Linear GEMM (backward) | 186.22 ms | 43.65 ms | 4.27x | 27.9% |
+| SDPA (forward) | 105.07 ms | 9.08 ms | 11.57x | 18.8% |
+| Linear GEMM (forward) | 72.29 ms | 24.03 ms | 3.01x | 9.4% |
+| Copies / dtype casts | 26.03 ms | 11.44 ms | 2.28x | 2.9% |
+| everything else | 32.11 ms | 34.87 ms | 0.92x | 0% |
+
+The initial table, before the Linear GEMM work, was SDPA backward 239.24,
+Linear GEMM backward 346.89, Linear GEMM forward 171.84, SDPA forward 105.10.
+Mojo is already *faster* than PyTorch-ROCm on LayerNorm forward and backward,
+GELU backward, fused AdamW, gradient clipping and concat.
 
 Acceptance for this work: **mojo/rocm <= 1.02** on the per-step weighted total
 of a target, with every correctness case passing.
@@ -54,6 +60,11 @@ the end of a change, not per iteration.
 - `rocm_gemm_targets.csv` — PyTorch-ROCm reference times, regenerate with
   `uv run --no-sync python scripts/rocm_gemm_reference.py --output <path>`
   (25 warmups, 100 synchronized iterations each).
+- `bench_attention_bmm.mojo` — the six batched GEMMs of the eager SDPA
+  decomposition, timed against `torch.bmm` for the identical batched shape.
+- `rocm_attention_bmm_targets.csv`, `rocm_attention_targets.csv` — regenerate
+  both with `uv run --no-sync python scripts/rocm_attention_reference.py
+  --output-op <path> --output-bmm <path>`.
 
 ## Correctness gates
 
@@ -135,6 +146,86 @@ Two leads that were **closed** rather than taken:
 Note also that `_amd_dynamic_mfma_dispatch` returns `False` for `batch != 1`,
 which is why attention's batched GEMMs fall back to the scalar-FFMA
 `pure_gemm_tiled` kernel; that belongs to the SDPA target, not this one.
+
+## State of the SDPA target (2026-07-25)
+
+PyTorch-ROCm runs **one fused flash-attention kernel per direction** (AOTriton
+`attn_fwd` and `bwd_kernel_fuse`) and never materializes the score matrix.
+Measured standalone at the nanoGPT shapes: **8.158 ms/step forward, 28.966
+ms/step backward** (679.80 and 2413.83 us per layer, 12 layers). In situ the
+profile attributes 9.083 and 33.953.
+
+The eager Mojo device instead runs a **math decomposition**, because the repo's
+FA4 kernels are gated to H100: `_fa4_bf16_d64_causal_inputs` in `aten_fast.py`
+requires `device.api == "cuda"` and `architecture_name == "sm_90a"`. On gfx942
+`_sdpa_math_forward_with_dropout` runs `bmm(Q, K^T)` → `SoftmaxRows` →
+`bmm(P, V)`, materializing a `[576, 1024, 1024]` BF16 score matrix — **1.208 GB
+per layer**, twice (scores and probabilities). The backward adds four more
+batched GEMMs, two transpose materializations, and an unfused softmax-backward
+chain.
+
+Three leads, in descending measured size.
+
+**1. The batched GEMMs never touch the matrix cores.**
+`_amd_dynamic_mfma_dispatch` opens with
+`if batch != 1 or a_bstride == 0 or m < 64 or k % 32 != 0: return False`, so
+every attention BMM falls through to the portable scalar-FFMA
+`pure_gemm_tiled` kernel. `bench_attention_bmm.mojo` measures **167.06 ms/step
+against `torch.bmm`'s 36.60 ms** (4.56x), at 32-36 TFLOP/s where Tensile
+reaches 122-178. This is the largest single item and the harness for it is
+ready.
+
+**2. The fused softmax-backward kernel is FP32-only.**
+`fast_sdpa_dropout_softmax_backward` in `aten_fast.py` returns `NOT_HANDLED`
+unless `probs._dtype == DType.float32`, so this BF16 workload takes the
+five-kernel fallback: broadcast multiply, row reduction, broadcast subtract,
+multiply, scale. In the profile that is `logic_ops__bin_bcast_kernel` 50.7 ms +
+`logic_ops__bin_flat_vec_kernel` 23.7 ms + `reduce_rows_block_bfloat16`
+14.7 ms + `elementwise_r1_w1` 11.2 ms ≈ **100 ms/step**, against three passes
+over a 1.208 GB tensor if fused.
+
+**3. Neither of the above is sufficient — the full-square decomposition cannot
+reach 1.02.** Optimistic floor, using the *spec* 5.3 TB/s HBM bandwidth (real
+bandwidth is lower, so the true floor is higher):
+
+| component | floor | basis |
+|---|---:|---|
+| six batched GEMMs | 36.60 ms | measured `torch.bmm` |
+| softmax forward | 5.5 ms | read scores + write probs, 29.0 GB |
+| softmax backward, perfectly fused | 8.2 ms | read P, read dP, write dS, 43.5 GB |
+| **total** | **50.3 ms** | vs PyTorch-ROCm's **37.1 ms** |
+
+So a decomposition that materializes the whole square is stuck at about 1.36x
+even with a perfect batched GEMM and a perfect fused softmax backward. Two ways
+out, both real work:
+
+- **Fuse.** MAX has a flash-attention forward with genuine AMD CDNA support in
+  `/tmp/modular/max/kernels/src/nn/attention/gpu/mha.mojo` — `flash_attention`
+  at line 337, with `has_amd_gpu_accelerator()` branches, "AMD bf16: 4 warps
+  (256 threads) with 16x16 MMA", `BN = 128` for AMD, and a long-context CDNA
+  prefill gate. Check before committing to it: whether its `MHAConfig` and
+  `q_layout` can carry a runtime sequence length and batch (depth and head
+  count as compile-time regimes with a runtime dispatch are acceptable under
+  AGENTS.md rule 4; sequence length and batch are not), and whether it reaches
+  any vendor library. There is **no flash-attention backward anywhere in MAX** —
+  grep confirms it. The backward is the larger half (28.97 vs 8.16 ms), so a
+  fused backward is new kernel work either way; the repo's own
+  `eager_flash_attention/fa4_bwd_*.mojo` is a structural template but is written
+  against H100 wgmma/TMA.
+- **Exploit causality.** nanoGPT calls SDPA with `is_causal=True`, so half the
+  score matrix is masked, and the decomposition currently computes, softmaxes
+  and re-reads all of it. Skipping fully-masked blocks roughly halves every term
+  above, giving a floor near 25 ms — below PyTorch-ROCm's 37.1 ms. That makes a
+  causal-block-skipping decomposition viable in principle without full fusion.
+
+If you implement a fused path, wiring it into production is part of the work:
+the orchestration lives in Python (`_sdpa_math_forward_with_dropout` in
+`aten_fast.py` and `_ScaledDotProductAttentionAutograd` in
+`mojo_device/mojo_device_autograd.py`), so a fused Mojo kernel that nothing
+calls is not a result. Extend the harness with the new route rather than
+replacing the decomposed one, so both stay measurable side by side. The
+`rocm_attention_targets.csv` whole-op numbers and the correctness gates are
+frozen; the harness itself is yours to extend.
 
 ## Profiling
 
