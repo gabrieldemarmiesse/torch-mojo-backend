@@ -107,6 +107,54 @@ def _permute_copy_kernel[
         i += gstride
 
 
+# A permutation whose innermost extent is contiguous in *both* operands
+# (`s3 == 1`) is not a transpose at all: it is a gather of `d3`-element runs.
+# nanoGPT's `view(B, T, nh, hs).transpose(1, 2)` is exactly that, and it is the
+# most common permutation an attention block issues. The generic kernel above
+# copies one element per thread, so a BF16 lane uses 2 bytes of a 16-byte access
+# and pays three integer divisions for them; here consecutive lanes take
+# consecutive *vectors* of the contiguous destination, so the stores are wide and
+# contiguous, the loads are whole runs, and the three divisions are amortized
+# over a whole vector.
+def _run_gather_kernel[
+    dtype: DType, VEC: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d1: Int,
+    d2: Int,
+    spv: Int,
+    s0: Int,
+    s1: Int,
+    s2: Int,
+    slots: Int,
+):
+    """`out[i0,i1,i2,i3] = in[i0*s0 + i1*s1 + i2*s2 + i3]`, VEC elements a time.
+
+    `spv` is the number of VEC-wide vectors in one run (`d3 // VEC`) and `slots`
+    the number of vectors in the whole copy; the caller has checked that every
+    stride and the run length are multiples of VEC and that both base addresses
+    are vector-aligned.
+    """
+    comptime ALIGN = min(16, VEC * size_of[dtype]())
+    var j = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while j < slots:
+        var off = j % spv
+        var run = j // spv
+        var i2 = run % d2
+        var rest = run // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        out_ptr.store[width=VEC, alignment=ALIGN](
+            j * VEC,
+            in_ptr.load[width=VEC, alignment=ALIGN](
+                i0 * s0 + i1 * s1 + i2 * s2 + off * VEC
+            ),
+        )
+        j += gstride
+
+
 @always_inline
 def _permute_copy[
     dtype: DType
@@ -145,6 +193,57 @@ def _permute_copy[
         elementwise[func, simd_width=1](Coord(total), ctx)
     else:
         comptime if has_accelerator():
+            # The innermost extent contiguous in both operands: gather runs, in
+            # the widest vector the runtime extents, strides and addresses admit.
+            # Every candidate width is a compile-time regime; which one runs is a
+            # runtime decision, and when none fits the copy declines to the
+            # general element-at-a-time kernel below, which masks every extent.
+            @always_inline
+            @parameter
+            def _try_run_gather[VEC: Int]() raises -> Bool:
+                comptime ALIGN = min(16, VEC * size_of[dtype]())
+                if (
+                    d3 % VEC != 0
+                    or s0 % VEC != 0
+                    or s1 % VEC != 0
+                    or s2 % VEC != 0
+                    or out_addr % ALIGN != 0
+                    or in_addr % ALIGN != 0
+                ):
+                    return False
+                var slots = total // VEC
+                _enqueue_cached[_run_gather_kernel[dtype, VEC]](
+                    ctx,
+                    String(t"dm_rungather_{dtype}_v{VEC}"),
+                    _gs_blocks(slots),
+                    1,
+                    1,
+                    GS_THREADS,
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    d1,
+                    d2,
+                    d3 // VEC,
+                    s0,
+                    s1,
+                    s2,
+                    slots,
+                )
+                return True
+
+            comptime V32 = 32 // size_of[dtype]()
+            comptime V16 = 16 // size_of[dtype]()
+            comptime V8 = 8 // size_of[dtype]()
+            if s3 == 1 and d3 > 1 and total >= 1024:
+                if _try_run_gather[V32]():
+                    return
+                comptime if V16 < V32:
+                    if _try_run_gather[V16]():
+                        return
+                comptime if V8 < V16:
+                    if _try_run_gather[V8]():
+                        return
+
             # A batched transpose of the innermost two dims is by far the most
             # common permutation -- the eager SDPA backward does four per layer --
             # and the generic kernel below reads one element per thread down a
