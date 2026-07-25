@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-kernel MI300X profiling for any command, ROCm's answer to ``ncu``.
+"""Per-kernel GPU profiling for any command, ROCm's answer to ``ncu``.
 
 Wraps ``rocprofv3`` and reads its SQLite result database with the standard
 library only, so it runs under any interpreter and needs no extra packages.
