@@ -1,0 +1,19 @@
+target,rocm_kernels_per_step,mojo_kernels_per_step,rocm_us_per_step,mojo_us_per_step,ratio,gap_us_per_step,rocm_top_kernels,mojo_top_kernels
+Linear GEMM (backward),146,195,43646.4,156194.8,3.5786,112548.4,"Tensile:MT256x256x32_MI16x16x1 11.0ms, Tensile:MT128x512x32_MI16x16x1 6.0ms","multistage_gemm_kernel_bfloat16_bfloat16_bfl 93.2ms, amd_splitk_mfma_bfloat16_128x128x32 50.6ms"
+Linear GEMM (forward),49,98,24032.0,72426.0,3.0137,48394.0,"Tensile:MT256x224x64_MI16x16x1 13.2ms, Tensile:MT192x224x64_MI16x16x1 6.5ms","multistage_gemm_kernel_bfloat16_bfloat16_bfl 72.0ms, op_utils___init____transpose2d6A6A6A6A 0.5ms"
+SDPA (forward),12,72,9082.7,29854.4,3.2869,20771.6,attn_fwd 9.1ms,"amd_batched_mfma_bfloat16_tbTrue_128x128x32_ 11.1ms, softmax_rows_warp_bfloat16_cTrue_v8 9.9ms"
+SDPA (backward),12,156,33952.9,46153.5,1.3593,12200.6,bwd_kernel_fuse 34.0ms,"amd_batched_mfma_bfloat16_tbFalse_64x128x32_ 14.0ms, amd_batched_mfma_bfloat16_tbTrue_128x128x32_ 11.4ms"
+Copies / dtype casts / layout,188,222,11441.6,16845.4,1.4723,5403.8,"vectorized_elementwise_kernel<4, bfloat16_co 6.3ms, vectorized_elementwise_kernel<4, bfloat16tof 5.1ms","elementwise_r1_w1_b256_gs_False 8.0ms, elementwise_r1_w1_b256_gs_False 7.0ms"
+Cross entropy (backward),2,2,4419.3,7237.3,1.6376,2818.0," 4.1ms,  0.3ms","lsm_bwd_nosmem_bfloat16 5.3ms, nanogpt_nll_backward_vec4 2.0ms"
+Residual / elementwise add,52,127,4460.2,5297.9,1.1878,837.7,"vectorized_elementwise_kernel<4, CUDAFunctor 2.4ms, vectorized_templated_elementwise_kernel<4, C 1.9ms","logic_ops__bin_flat_vec_kernel6A6AcB 2.7ms, torch_mojo_add_f32_bf16_vec4 2.1ms"
+GELU (forward),12,12,2183.1,2650.1,1.2139,467.0,"vectorized_elementwise_kernel<8, GeluCUDAKer 2.2ms",gelu_forward_bf16_exact_vec16 2.7ms
+Cross entropy (forward),2,3,4155.9,4494.3,1.0814,338.3," 3.8ms,  0.3ms","log_softmax_rows_block_bfloat16_1024 4.5ms, nanogpt_nll_forward_mean_partial 0.0ms"
+Embedding,18,8,539.7,511.5,0.9477,-28.2," 0.2ms,  0.1ms","nanogpt_embedding_dense_backward_scatter_his 0.3ms, elementwise_r1_w1_b256_gs_False 0.1ms"
+Misc reductions / indexing,5,3,130.7,50.8,0.3883,-80.0,"vectorized_gather_kernel<16, long> 0.1ms, reduce_kernel<128, 4, ReduceOp<float, func_w 0.0ms","std_algorithm_backend_gpu_re6A6A6A6A6A6A6A6A 0.0ms, elementwise_r1_w1_b256_gs_False 0.0ms"
+Gradient clipping,18,11,583.0,466.5,0.8003,-116.4," 0.4ms,  0.2ms","foreach_mul_tensor_f32_aligned_streaming_ilp 0.3ms, foreach_l2_norm_f32_chunk_partials_v1 0.2ms"
+Concat / stack,13,111,2029.5,1824.5,0.8990,-205.0," 2.0ms,  0.0ms","data_movement_ops__narrow_copy_6A6A 1.5ms, data_movement_ops__narrow_copy_6A6A 0.4ms"
+Optimizer (fused AdamW),9,3,1230.7,1002.7,0.8148,-227.9," 1.2ms,  0.0ms",fused_adamw_f32_dynamic_multitensor 1.0ms
+GELU (backward),12,12,3319.2,2949.8,0.8887,-369.4,"vectorized_elementwise_kernel<8, GeluBackwar 3.3ms",nanogpt_gelu_backward_exact_bf16 2.9ms
+LayerNorm (forward),25,25,2515.0,1771.4,0.7044,-743.5, 2.5ms,layer_norm_forward_f32_vec4 1.8ms
+Zero / fill grads,24,0,2118.7,0.0,0.0000,-2118.7,"vectorized_elementwise_kernel<4, FillFunctor 2.0ms, vectorized_elementwise_kernel<4, FillFunctor 0.1ms",
+LayerNorm (backward),75,75,7196.2,4920.9,0.6838,-2275.2," 3.5ms,  3.5ms","nanogpt_layer_norm_backward_dx_f32_c3 2.9ms, nanogpt_layer_norm_backward_params_partial 1.9ms"

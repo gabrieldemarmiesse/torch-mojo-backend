@@ -2466,3 +2466,54 @@ failure remaining -- `test_bf16_v3_source_dependency_and_kernel_contract`, a sou
 list-ordering assertion that also fails on `main`, verified in a clean worktree.
 The nanoGPT step is unchanged at 354.22 ms and the single-step loss is still
 bit-identical at 10.977283477783203.
+
+## Review finding R8 — split-K preempted the route tuned for underfilled grids
+
+**Hypothesis.** `_splitk_parts` bounds the slab count from above (`tiles * 2 *
+parts <= 4 * cus`) but never from below. Its divisibility and slab-depth
+conditions can stop the doubling early, leaving a split whose *product*
+`tiles * parts` is a fraction of the CU count -- and the clause admitting it sits
+ahead of the 32x32 in-workgroup-partition route, which Change 14 tuned for exactly
+that underfilled regime. Change 20 measured `k = 49152` only, while the admission
+gate is `k >= 8192`, so the band in between has no measurement behind it.
+
+**Predicted effect.** A regression somewhere in `k` in [8192, 32768), where the
+2048-per-slab floor caps `parts` at 4 and then 8.
+
+**Measured effect.** Confirmed, and the first attempt to measure it was wrong in a
+way worth recording. Running the whole case list in one process gave
+`(512, 1024, 8192)` as a 49% *win*; running one case per process gave the same
+shape as a 14% *loss*. The harness allocates and frees per case, so a later case
+reads low when an earlier one has already warmed the device. Every number below is
+one case per process, against a build of the pre-split-K `matmul_ops.mojo`:
+
+| tiles*parts | (m, n, k) | pre us | with split-K | change |
+|---:|---|---:|---:|---:|
+| 24 | 128, 768, 8192 | 112.79 | 148.48 | +32.1% |
+| 72 | 768, 768, 8256 | 159.76 | 272.60 | +70.6% |
+| 128 | 512, 1024, 8192 | 129.86 | 147.67 | +13.7% |
+| 144 | 768, 768, 8192 | 134.09 | 152.88 | +14.0% |
+| 288 | 768, 768, 16384 | 253.65 | 161.27 | -36.4% |
+| 384 | 1024, 1536, 12288 | 534.07 | 367.06 | -31.3% |
+| 512 | 4096, 1024, 8192 | 701.82 | 487.35 | -30.6% |
+| 512 | 2048, 2048, 8192 | 515.06 | 484.38 | -6.0% |
+| 576 | 768, 768, 49152 | 742.33 | 380.35 | -48.8% |
+
+Neither the slab count nor the tile count separates these on its own: `parts = 2`
+loses at 72 and wins at 512, and an identical 36-tile grid loses at `k = 8192` and
+wins at `k = 16384`. Their *product* separates all nine cleanly. Every loss is
+below 0.5 workgroups per CU and every win is at or above 0.95.
+
+**Decision.** Accept and fix with a floor of three quarters of one workgroup per
+CU: `_splitk_parts` returns 1 -- no split -- when `tiles * parts * 4 < cus * 3`.
+All four regressions return to within +-0.6% of the pre-split-K route and all five
+wins are unchanged (-6.0% to -48.8%). The nanoGPT table is untouched at 226.9 ms,
+ratio 3.167, under all three gates, because every production weight-gradient shape
+that used split-K keeps it: (2304,768,49152) and (3072,768,49152) at 432 and 576,
+(768,3072,49152) at 576, (768,768,49152) at 576. The step is 353.93 ms and the
+single-step loss is still bit-identical at 10.977283477783203.
+
+Worth stating for the next reader: the harness runs its cases in one process, so
+any before/after comparison of individual cases must pass `--case=` and run one per
+process. The contaminated ordering does not affect the whole-table totals, which
+run the same cases in the same order on both sides.

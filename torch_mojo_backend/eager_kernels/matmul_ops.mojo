@@ -1202,7 +1202,7 @@ def _amd_splitk_mfma_kernel[
     def _store[
         value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
     ](coords: IndexList[2], value: SIMD[value_dtype, width]):
-        ws_ptr.store[width=width, alignment = size_of[DType.float32]()](
+        ws_ptr.store[width=width, alignment=size_of[DType.float32]()](
             Int(coords[0]) * n + Int(coords[1]),
             value.cast[DType.float32](),
         )
@@ -1230,10 +1230,10 @@ def _splitk_reduce_kernel[
     while j < vec_count:
         var acc = SIMD[DType.float32, VEC](0)
         for p in range(parts):
-            acc += ws_ptr.load[width=VEC, alignment = VEC * 4](
+            acc += ws_ptr.load[width=VEC, alignment=VEC * 4](
                 p * total + j * VEC
             )
-        c_ptr.store[width=VEC, alignment = VEC * size_of[dtype]()](
+        c_ptr.store[width=VEC, alignment=VEC * size_of[dtype]()](
             j * VEC, acc.cast[dtype]()
         )
         j += gstride
@@ -1333,6 +1333,36 @@ def _splitk_parts(tiles: Int, cus: Int, k: Int, bk: Int) -> Int:
         and k // (2 * parts) >= 2048
     ):
         parts *= 2
+    # The loop only bounds the split from above. It must also be bounded from
+    # below, because the divisibility and slab-depth conditions can stop the
+    # doubling early and leave a split whose *product* still does not fill the
+    # device -- and this clause preempts the in-workgroup-partition route, which
+    # was tuned for exactly that underfilled regime, so a short split is worse
+    # than not splitting at all.
+    #
+    # Measured against the pre-split-K dispatch, one case per process (the
+    # harness runs cases in one process and later cases read low if earlier ones
+    # warmed the device, which is how an earlier version of this table showed a
+    # 49% win that isolation turned into a 14% loss):
+    #
+    #   tiles*parts   shape (m, n, k)          change
+    #    24           128,  768,  8192         +32.1%
+    #    72           768,  768,  8256         +70.6%
+    #   128           512, 1024,  8192         +13.7%
+    #   144           768,  768,  8192         +14.0%
+    #   288           768,  768, 16384         -36.4%
+    #   384          1024, 1536, 12288         -31.3%
+    #   512          4096, 1024,  8192         -30.6%
+    #   512          2048, 2048,  8192          -6.0%
+    #   576           768,  768, 49152         -48.8%
+    #
+    # Every loss sits below 0.5 workgroups per CU and every win at or above
+    # 0.95, so the floor is three quarters of one workgroup per CU. It separates
+    # all nine, and it is the slab count rather than the tile count that decides:
+    # 768x768 loses at k = 8192 and wins at k = 16384 on an identical grid of
+    # output tiles.
+    if tiles * parts * 4 < cus * 3:
+        return 1
     return parts
 
 
