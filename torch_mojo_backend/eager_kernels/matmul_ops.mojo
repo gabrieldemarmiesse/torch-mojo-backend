@@ -1199,7 +1199,16 @@ def _amd_dynamic_mfma_dispatch[
     if batch != 1 or a_bstride == 0 or m < 64 or k % 32 != 0:
         return False
     comptime if dtype == DType.bfloat16:
-        if m >= 1024:
+        # A K-dominant shape has few output columns per row block, so the
+        # large-m macro tile has to beat the in-workgroup K partition on row
+        # count alone. That crossover is at m = 2048, not 1024: measured on
+        # transposed-B n = 768 k = 3072, the partitioned 32x32 route is 68%
+        # faster at m = 1024 and 35% faster at m = 1536, breaks even at
+        # m = 2048, and loses by 29% at m = 4096. Both branches keep every
+        # extent runtime-dynamic; only which regime is selected depends on the
+        # runtime shape.
+        var deep_k = k >= 2048 and k >= 2 * n
+        if m >= 2048 or (m >= 1024 and not deep_k):
             comptime if transpose_b:
                 # A [N, K] operand is read as BN rows of BLOCK_K elements, so
                 # each global load touches only BLOCK_K * 2 = 64 bytes of a
@@ -1243,21 +1252,44 @@ def _amd_dynamic_mfma_dispatch[
                     dtype, 32, 128, 32, 64, transpose_b, fuse_bias
                 ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
                 return True
-            # Four in-workgroup K partitions: the K loop is long and the
-            # 32x32 output grid alone leaves most SIMDs with less than one
-            # resident wave, so the extra waves hide global-load latency for
-            # more than the in-workgroup reduction costs.
-            _amd_dynamic_mfma_gemm[
-                dtype,
-                32,
-                32,
-                32,
-                32,
-                transpose_b,
-                fuse_bias,
-                32,
-                4,
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+            # In-workgroup K partitions: the K loop is long and the 32x32
+            # output grid alone can leave most SIMDs with less than one
+            # resident wave, so extra waves hide global-load latency for more
+            # than the in-workgroup reduction costs.
+            #
+            # The partition count may only divide a K the kernel can split
+            # exactly. `multistage_gemm_kernel` starts partition p at K tile
+            # `(k / BLOCK_K) // parts * p` and gives every partition
+            # `ceildiv(k / parts, BLOCK_K)` tiles, both floor divisions, so
+            # unless `(k / BLOCK_K) % parts == 0` the partitions overlap on
+            # some tiles and leave the last ones uncovered -- silently wrong
+            # output, not a crash. With BLOCK_K == 32 that means k % 128 for
+            # four partitions and k % 64 for two. Step down to a count this
+            # runtime k admits rather than restricting which k reaches here.
+            #
+            # The count is also an occupancy decision, not a fixed choice:
+            # extra partitions only pay while the output grid alone cannot keep
+            # every CU busy, and past that they add reduction work to an
+            # already-occupied device. Measured on transposed-B n = 768,
+            # k = 3072, four partitions win by 8% at m = 512 (384 tiles against
+            # 304 CUs) and lose by 6% at m = 1024 (768 tiles). Both the tile
+            # count and the CU count are runtime values.
+            var partition_cus = ctx.get_attribute(
+                DeviceAttribute.MULTIPROCESSOR_COUNT
+            )
+            var partition_tiles = ceildiv(m, 32) * ceildiv(n, 32)
+            if k % 128 == 0 and partition_tiles < 2 * partition_cus:
+                _amd_dynamic_mfma_gemm[
+                    dtype, 32, 32, 32, 32, transpose_b, fuse_bias, 32, 4
+                ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+            elif k % 64 == 0:
+                _amd_dynamic_mfma_gemm[
+                    dtype, 32, 32, 32, 32, transpose_b, fuse_bias, 32, 2
+                ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+            else:
+                _amd_dynamic_mfma_gemm[
+                    dtype, 32, 32, 32, 32, transpose_b, fuse_bias, 32, 1
+                ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
             return True
         comptime if not transpose_b:
             if n >= 512 and n <= 2304 and k >= 512 and k % 64 == 0:
@@ -1277,17 +1309,17 @@ def _amd_dynamic_mfma_dispatch[
     elif k >= 2048 and k >= 2 * n:
         comptime if transpose_b:
             comptime if dtype == DType.float32:
-                _amd_dynamic_mfma_gemm[
-                    dtype,
-                    32,
-                    32,
-                    32,
-                    32,
-                    transpose_b,
-                    fuse_bias,
-                    16,
-                    4,
-                ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+                # Same exact-split requirement as the BF16 deep-K route above,
+                # at BLOCK_K == 16: four partitions need k % 64, two need
+                # k % 32. The outer guard only promises k % 32.
+                if k % 64 == 0:
+                    _amd_dynamic_mfma_gemm[
+                        dtype, 32, 32, 32, 32, transpose_b, fuse_bias, 16, 4
+                    ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+                else:
+                    _amd_dynamic_mfma_gemm[
+                        dtype, 32, 32, 32, 32, transpose_b, fuse_bias, 16, 2
+                    ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
             else:
                 # A 16x16 warp tile is one of the miscompiled transposed-B
                 # geometries (see the guard in `_amd_dynamic_mfma_gemm`).

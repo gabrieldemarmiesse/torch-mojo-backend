@@ -1405,3 +1405,105 @@ GEMM saving to within run-to-run noise, and the loss moved from 10.6449 to
 the correctness fix is real and not a re-routing that hid the defect. The
 residual 0.015 is not this target's: the SDPA and copy kernels still differ in
 accumulation order and are the next two entries in the gap table.
+
+## Review finding R1 — four warp-K partitions on a K the kernel cannot split
+
+**Hypothesis.** Change 14 raised the BF16 deep-K route from two in-workgroup K
+partitions to four, but the only K precondition on that path is the dispatch's
+`k % 32 != 0 -> return False`. MAX's `multistage_gemm_kernel` starts partition
+`p` at K tile `(k / BLOCK_K) // parts * p` and gives every partition
+`ceildiv(k / parts, BLOCK_K)` tiles, both floor divisions, so the partitions
+cover K exactly only when `(k / BLOCK_K) % parts == 0`. At `BLOCK_K = 32` that
+is `k % 128 == 0` for four partitions where two needed only `k % 64 == 0`. If
+so, every `k` that is 64 mod 128 in this regime is silently wrong, and Change
+14 only ever measured `k = 3072` and `k = 49152`, both multiples of 128.
+
+**Predicted effect.** A BF16 GEMM with `m = 512`, `n = 1024`, `k = 2112`
+reaches this route (`m >= 64`, `m < 1024`, `k % 32 == 0`, `k >= 2048`,
+`k >= 2n`, `n < 2048`). Its four partitions should start at tiles 0/16/32/48
+and run 17 tiles each, covering `[0,17) [16,33) [32,49) [48,65)` of 66 tiles:
+tiles 16, 32 and 48 accumulated twice and tile 65 dropped. So the all-ones gate
+must fail on every output, and the same shape must pass on the pre-Change-14
+code. `k = 2048`, `2176` and `3072` (all 0 mod 128) must pass on both.
+
+**Measured effect.** Exactly that. The same harness source built against the
+pre-change kernels and against HEAD, so the only variable is the diff:
+
+| case | k mod 128 | pre-change | HEAD before fix |
+|---|---:|---|---|
+| m512 n1024 k2048 | 0 | pass, 49.75 us | pass, 45.45 us |
+| m512 n1024 k2112 | 64 | pass, 50.78 us | **FAIL 524288/524288** |
+| m512 n1024 k2240 | 64 | pass, 53.29 us | **FAIL 524288/524288** |
+| m512 n1024 k2880 | 64 | pass, 63.80 us | **FAIL 524288/524288** |
+| m512 n1024 k3072 | 0 | pass, 65.43 us | pass, 59.48 us |
+| m512 n1024 k2176 | 0 | pass, 51.24 us | pass, 46.91 us |
+
+`k = 2880` is a production hidden size, so this is not a synthetic corner.
+
+**Decision.** Accept the finding as a regression and fix it: the partition count
+now steps down to whatever the runtime `k` admits (four at `k % 128`, two at
+`k % 64`, otherwise one), and the same requirement is applied to the FP32
+transposed-B deep-K route, which has `BLOCK_K = 16` and therefore needs
+`k % 64` for four partitions. After the fix every case above passes, the
+`k % 128 == 0` cases keep the four-partition speed (2048: 45.78 us against the
+pre-change 49.75) and the `k = 64 mod 128` cases land on the two-partition
+timings they had before (2112: 50.91 against 50.78). The training-shape table is
+unchanged at 257.4 ms, ratio 3.593, both gates passing.
+
+## Review finding R2 — the large-m gate swallowed the K-dominant regime
+
+**Hypothesis.** Change 11/13's `if m >= 1024` branch is taken before the deep-K
+branch is ever considered, so a K-dominant narrow-N shape with `m >= 1024` no
+longer reaches the partitioned 32x32 route it used before. The large macro tile
+has few output columns to work with when N is narrow, so it should lose on row
+count alone until m is large enough, making `m >= 1024` the wrong boundary.
+
+**Predicted effect.** Transposed-B shapes with `n = 768` and `k >= 2048` should
+be slower than the pre-change code somewhere above `m = 1024`, and the loss
+should shrink as m grows, since more rows favour the macro tile.
+
+**Measured effect.** Confirmed, and larger than expected. Pre-change against
+HEAD-before-fix, all correct in both, so this was pure speed:
+
+| case (transpose_b) | pre-change | HEAD before fix | change |
+|---|---:|---:|---:|
+| m512 n768 k3072 | 64.18 us | 63.80 us | -0.6% |
+| m1024 n768 k2048 | 63.07 us | 107.04 us | **+69.7%** |
+| m1024 n768 k3072 | 85.77 us | 144.07 us | **+68.0%** |
+| m1024 n768 k4096 | 137.94 us | 180.96 us | **+31.2%** |
+| m1536 n768 k3072 | 107.56 us | 145.55 us | **+35.3%** |
+| m2048 n768 k3072 | 154.37 us | 154.17 us | -0.1% |
+| m4096 n768 k3072 | 263.71 us | 188.29 us | -28.6% |
+
+The crossover is at `m = 2048`, not 1024.
+
+**Decision.** Accept and fix in two parts. The large-m branch now yields to the
+deep-K branch for `1024 <= m < 2048` when `k >= 2048 and k >= 2n`; and the
+partition count in that branch became an occupancy decision using the runtime CU
+count, the same instrument Change 11 uses, because four partitions win by 8% at
+`m = 512` (384 tiles of 32x32 against 304 CUs) and lose by 6% at `m = 1024` (768
+tiles). Together these bring the whole band back to within +-0.8% of the
+pre-change timings while keeping the m = 4096 gain (-28.7%) and the m = 1024
+n = 2304 case, which the pre-change code computed wrongly and is now both
+correct and 34.6% faster. Every extent stays runtime-dynamic; only the regime
+selection reads the runtime shape and the runtime CU count.
+
+## Review finding R3 — the documented reach of the miscompile was too narrow
+
+**Measured effect.** The journal recorded the miscompiled transposed-B geometry
+as reachable for "m >= 64, k % 32 == 0, k < 2048, n < 8192". On the pre-change
+kernels, `m = 1024, n = 2304, k = 3072` transposed-B is also wrong (589824 of
+2359296 outputs), and `k = 3072` is outside that band. Controls confirm the
+shape of the real predicate: `k = 3072` with `n = 768` passes, `n >= 8192`
+passes, and `transpose_b = False` passes.
+
+Also worth stating plainly, because the earlier entry did not: `m = 512,
+n = 768, k = 768` transposed-B is GPT-2's own decode linear forward, and it was
+wrong on the pre-change code. This defect silently corrupted GPT-2 *inference*
+on gfx942, not only training.
+
+**Decision.** Correct the record here and in the harness README. The precise
+predicate is whichever `(BM, BN, WM, WN)` the old dispatch selected with a warp
+tile one MMA wide in some dimension, which is a function of the branch taken
+rather than of a single interval in k, so the honest statement is the branch
+condition plus the geometry, not a k range.

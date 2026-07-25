@@ -108,6 +108,35 @@ training-step MI300X journal"; the summary of what changed and what did not:
   kernel defect: K = 50304 is not representable in BF16 and rounds to 50176.
   See the correctness-gates section above.
 
+How far that miscompile reached, corrected after review: it is **not** confined
+to `k < 2048`. On the pre-fix kernels `m = 1024, n = 2304, k = 3072`
+transposed-B was also wrong (589824 of 2359296 outputs). The reachable set is
+whichever branch of the old dispatch selected a warp tile one MMA wide, so it is
+a property of the branch and geometry rather than a single interval in k. Most
+consequentially, `m = 512, n = 768, k = 768` transposed-B was wrong, and that is
+**GPT-2's own decode linear forward** — this defect silently corrupted GPT-2
+*inference* on gfx942, not only training.
+
+Two further defects came out of an adversarial review of that work and are also
+fixed; see `optimization_journal.md` findings R1-R3.
+
+- **R1, silent wrong answers.** Raising the deep-K route to four in-workgroup K
+  partitions requires `(k / BLOCK_K) % partitions == 0`, because MAX splits K by
+  floor division. At `BLOCK_K = 32` that is `k % 128`, but the dispatch only
+  guarded `k % 32`, so every `k` that is 64 mod 128 in that regime was silently
+  wrong — `k = 2112`, `2240`, `2880` all produced 100% wrong output and all were
+  correct before the change. `k = 2880` is a production hidden size. The
+  partition count now steps down to what the runtime `k` admits, and the same
+  requirement is enforced on the FP32 route (`BLOCK_K = 16`, so `k % 64`).
+- **R2, a 31-70% speed regression.** The `m >= 1024` large-macro-tile branch was
+  taken before the deep-K branch could be considered, so K-dominant narrow-N
+  shapes above m = 1024 lost the partitioned route. Measured crossover is
+  m = 2048, not 1024. Fixed by yielding to the deep-K branch for
+  `1024 <= m < 2048` when K dominates, and by choosing the partition count from
+  the runtime output-tile count against the runtime CU count. The whole band is
+  now within +-0.8% of its pre-change timings, with the m = 4096 gain (-28.7%)
+  intact.
+
 **Speed: per-step weighted total 506.9 -> 257.4 ms against ROCm's 71.6, ratio
 7.076 -> 3.593.** Mojo now reaches 73-178 TFLOP/s where ROCm reaches 367-612.
 What was done: a runtime-fill-driven macro tile (128x128x32 with an 8-warp
@@ -183,6 +212,13 @@ multiply, scale. In the profile that is `logic_ops__bin_bcast_kernel` 50.7 ms +
 `logic_ops__bin_flat_vec_kernel` 23.7 ms + `reduce_rows_block_bfloat16`
 14.7 ms + `elementwise_r1_w1` 11.2 ms ≈ **100 ms/step**, against three passes
 over a 1.208 GB tensor if fused.
+
+This is not a flag to relax: the kernels in
+`sdpa_dropout_softmax_backward_kernels.mojo` are written against
+`UnsafePointer[Scalar[DType.float32]]` throughout, so the work is parameterizing
+all three on dtype (keeping the FP32 accumulator for the row reduction, which
+BF16 cannot carry) and widening the Python bridge with it. Contained, and worth
+about 100 ms/step — the best value-per-line item in this target.
 
 **3. Neither of the above is sufficient — the full-square decomposition cannot
 reach 1.02.** Optimistic floor, using the *spec* 5.3 TB/s HBM bandwidth (real
