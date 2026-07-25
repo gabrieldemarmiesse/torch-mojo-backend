@@ -1858,3 +1858,37 @@ all. The README's floor estimate of about 25 ms/step for a causal decomposition
 assumed causal skipping would work; experiment AA is why it does not, and with
 `permute_copy` fixed the honest floor for this decomposition on this hardware is
 about 75 ms/step for both directions against ROCm's 43.
+
+## Test-visible changes and pre-existing failures — 2026-07-25
+
+`tests/test_eager_kernels.py::test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies`
+counts the matmuls each requested input gradient costs, and it broke on the causal
+work for a real reason: with `is_causal=True` the backward's batched GEMMs go
+through `_try_sdpa_causal_bmm` instead of `fast_aten_bmm`, so the spy saw zero.
+It now spies on both helpers and zeroes the counters between the forward and the
+backward, because the causal forward issues a batched GEMM through the same
+helper. The test's intent — one matmul per gradient, and never materializing an
+`S x L` intermediate — is unchanged and passes.
+
+Two failures on this branch are **not** from this work; both reproduce identically
+at commit `4cd5f30`, before any of it:
+
+- `tests/test_fa4_host_wiring.py::test_fa4_autograd_saves_public_inputs_without_persistent_physical_copies`
+  patches `aten_fast` with a namespace that has no `_sdpa_math_forward_with_dropout`,
+  which is fine on an H100 where the FA4 route is taken, and an `AttributeError`
+  on gfx942 where it is not.
+- Four `test_fast_log_softmax_*` tests. Unrelated to attention.
+
+`scripts/sdpa_correctness.py` reports one honest failure: the `noncausal` case, at
+2.3-3.1x the PyTorch-ROCm BF16 error on the output, dK and dV. That path does not
+use any kernel written here — it takes MAX's `nn.softmax` with the scale folded
+into an input lambda that rounds `scores * scale` back to BF16 before the
+reduction, a second rounding PyTorch's math backend avoids by scaling Q before the
+BMM (the lambda's own comment flags the round-trip as a known trade-off). The
+contrast is the evidence: every *causal* case, which uses the rewritten kernel and
+keeps the scaled value in float32, is at 0.76-1.84x. The forward output failing at
+2.95x is what makes this conclusive — the noncausal forward's only changed
+ingredient is the batched GEMM, which accumulates in float32 exactly as
+`pure_gemm_tiled` did. Fixing it means selecting the warp kernel for non-causal
+rows too, which is a change to the general `aten::_softmax` and was not attempted
+here.

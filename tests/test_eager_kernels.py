@@ -5873,6 +5873,7 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
 
     calls = {"bmm": 0, "transpose_b_bmm": 0, "fused_backward": 0}
     original_bmm = aten_fast.fast_aten_bmm
+    original_causal_bmm = aten_fast._try_sdpa_causal_bmm
     original_transpose_b_bmm = aten_fast._fast_aten_bmm_transpose_b
     original_fused_backward = aten_fast.fast_sdpa_dropout_softmax_backward
     original_materialize = TorchMojoTensor._materialize_contiguous
@@ -5881,6 +5882,16 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
     def spy_bmm(*args):
         calls["bmm"] += 1
         return original_bmm(*args)
+
+    def spy_causal_bmm(*args):
+        # With is_causal=True the backward's plain batched GEMMs are replaced by
+        # the causal ones, which skip the contraction indices the mask kills.
+        # They play exactly the same role here, so count them the same way: this
+        # test is about *how many* matmuls each requested gradient costs.
+        result = original_causal_bmm(*args)
+        if result is not None:
+            calls["bmm"] += 1
+        return result
 
     def spy_transpose_b_bmm(*args):
         calls["transpose_b_bmm"] += 1
@@ -5895,6 +5906,7 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
         return original_materialize(self)
 
     monkeypatch.setattr(aten_fast, "fast_aten_bmm", spy_bmm)
+    monkeypatch.setattr(aten_fast, "_try_sdpa_causal_bmm", spy_causal_bmm)
     monkeypatch.setattr(aten_fast, "_fast_aten_bmm_transpose_b", spy_transpose_b_bmm)
     monkeypatch.setattr(
         aten_fast, "fast_sdpa_dropout_softmax_backward", spy_fused_backward
@@ -5909,6 +5921,10 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
         *actual_inputs, dropout_p=0.0, is_causal=True
     )
     assert actual_output.grad_fn.saved_names == expected_saved
+    # The counts below are about the backward. The causal forward also issues a
+    # batched GEMM through the same helper, so zero the counters here rather than
+    # let a forward call be mistaken for a gradient's.
+    calls.update(bmm=0, transpose_b_bmm=0, fused_backward=0)
     actual_output.backward(grad_output.to(mojo_gpu))
 
     assert calls == {
