@@ -1454,28 +1454,51 @@ def _batched_mfma_tile[
     than N would leave every column to the scalar cleanup kernel, which measured
     22.2 ms against 0.9 ms for a fitting tile, so BN never exceeds N.
 
+    BN must also *divide* N, not merely fit inside it.  The MFMA core covers
+    `(n // BN) * BN` columns and the residual goes to
+    `_amd_batched_mfma_edge_kernel`, one thread per output element with a full
+    runtime K loop -- about 34x the MFMA cost per column on the same table.
+    Choosing BN by magnitude alone therefore turned any N that is not a tile
+    multiple into a cliff: at N = 96 a 64-wide tile leaves a third of every row
+    to the scalar path.  The caller guarantees `n % 32 == 0` and declines
+    otherwise, so one of the three widths always divides N and the cleanup kernel
+    handles only the M edge.
+
     `BLOCK_K` is 16 for float32 rather than 32 because two pipeline stages of a
     128x128x32 float32 tile request the entire 64 KB gfx942 LDS budget, which
     diagnostic experiment V showed does not launch.  At 16 it is 32 KB, and it is
     the same K depth the unbatched float32 deep-K route already uses.
     """
     comptime BK = 16 if dtype == DType.float32 else 32
-    if m >= 128 and n >= 128:
-        _amd_batched_mfma_gemm[
-            dtype, 128, 128, 32, 64, transpose_b, BK, 1, 2, CAUSAL
-        ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
-    elif m >= 128:
-        _amd_batched_mfma_gemm[
-            dtype, 128, 64, 32, 64, transpose_b, BK, 1, 2, CAUSAL
-        ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
-    elif n >= 128:
-        _amd_batched_mfma_gemm[
-            dtype, 64, 128, 32, 64, transpose_b, BK, 1, 2, CAUSAL
-        ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
+    var wide_m = m >= 128
+    if n % 128 == 0:
+        if wide_m:
+            _amd_batched_mfma_gemm[
+                dtype, 128, 128, 32, 64, transpose_b, BK, 1, 2, CAUSAL
+            ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
+        else:
+            _amd_batched_mfma_gemm[
+                dtype, 64, 128, 32, 64, transpose_b, BK, 1, 2, CAUSAL
+            ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
+    elif n % 64 == 0:
+        if wide_m:
+            _amd_batched_mfma_gemm[
+                dtype, 128, 64, 32, 64, transpose_b, BK, 1, 2, CAUSAL
+            ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
+        else:
+            _amd_batched_mfma_gemm[
+                dtype, 64, 64, 32, 32, transpose_b, BK, 1, 2, CAUSAL
+            ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
     else:
-        _amd_batched_mfma_gemm[
-            dtype, 64, 64, 32, 32, transpose_b, BK, 1, 2, CAUSAL
-        ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
+        # n % 32 == 0 by the caller's guarantee.
+        if wide_m:
+            _amd_batched_mfma_gemm[
+                dtype, 128, 32, 32, 32, transpose_b, BK, 1, 2, CAUSAL
+            ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
+        else:
+            _amd_batched_mfma_gemm[
+                dtype, 64, 32, 32, 32, transpose_b, BK, 1, 2, CAUSAL
+            ](c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx)
 
 
 @always_inline
@@ -1509,7 +1532,13 @@ def _causal_bmm_dispatch(
     var eligible = False
     comptime if has_accelerator():
         comptime if _accelerator_arch() == "amdgpu:gfx942":
-            eligible = batch > 1 and m >= 64 and n >= 64 and k % 32 == 0
+            eligible = (
+                batch > 1
+                and m >= 64
+                and n >= 64
+                and n % 32 == 0
+                and k % 32 == 0
+            )
     if eligible:
         var handled = False
         comptime for dt in [DType.float32, DType.bfloat16]:
@@ -1627,7 +1656,12 @@ def _amd_dynamic_mfma_dispatch[
         comptime if fuse_bias:
             return False
         else:
-            if m < 64 or n < 64:
+            # n % 32 lets `_batched_mfma_tile` pick a BN that divides N, so the
+            # scalar cleanup kernel only ever handles the M edge. Without it the
+            # residual columns cost about 34x the MFMA per column, which made a
+            # non-multiple N slower than the edge-masked tiled path this declines
+            # to.
+            if m < 64 or n < 64 or n % 32 != 0:
                 return False
             _batched_mfma_tile[dtype, transpose_b](
                 c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx

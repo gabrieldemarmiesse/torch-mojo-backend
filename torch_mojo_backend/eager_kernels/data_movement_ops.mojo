@@ -30,8 +30,12 @@ from std.python._cpython import PyObjectPtr, Py_ssize_t
 from op_utils import (
     GS_THREADS,
     MAX_RANK,
+    _MAX_GRID_Y,
+    _T2D_ROWS,
     _enqueue_cached,
     _gs_blocks,
+    _t2d_tile,
+    _transpose2d_kernel,
     _make_ptr,
     _parallel_for,
     _parallel_for_dt,
@@ -141,6 +145,47 @@ def _permute_copy[
         elementwise[func, simd_width=1](Coord(total), ctx)
     else:
         comptime if has_accelerator():
+            # A batched transpose of the innermost two dims is by far the most
+            # common permutation -- the eager SDPA backward does four per layer --
+            # and the generic kernel below reads one element per thread down a
+            # column, so it never reaches a useful fraction of bandwidth. When the
+            # permutation is exactly that, hand it to the tiled LDS transpose,
+            # which stages a TILE x TILE block through shared memory so both the
+            # reads and the writes are contiguous.
+            #
+            # `s2 == 1` says the output's row index walks the source contiguously,
+            # i.e. source columns are output rows; `s3 >= d2` says the output's
+            # column index steps by the source's row pitch. The leading pair
+            # collapses into one batch axis only if its two strides are uniform,
+            # hence `s0 == d1 * s1`.
+            comptime TILE = _t2d_tile[dtype]()
+            var batch = d0 * d1
+            if (
+                d2 > 1
+                and d3 > 1
+                and total >= 1024
+                and s2 == 1
+                and s3 >= d2
+                and (d0 == 1 or s0 == d1 * s1)
+                and (batch == 1 or s1 >= d3 * s3)
+            ):
+                _enqueue_cached[_transpose2d_kernel[dtype]](
+                    ctx,
+                    String(t"transpose2d_{dtype}"),
+                    (d3 + TILE - 1) // TILE,
+                    min((d2 + TILE - 1) // TILE, _MAX_GRID_Y),
+                    min(batch, _MAX_GRID_Y),
+                    TILE * _T2D_ROWS,
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    d2,
+                    d3,
+                    s3,
+                    batch,
+                    d2 * d3,
+                    s1 if batch > 1 else 0,
+                )
+                return
             _enqueue_cached[_permute_copy_kernel[dtype]](
                 ctx,
                 String(t"dm_permute_{dtype}"),

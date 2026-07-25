@@ -1990,3 +1990,68 @@ claimed.
 selectable, so the caller's own chain runs. This is the difference between a
 helper that declines and a helper that answers for everyone; only the first
 composes with a fallback ladder.
+
+## Review finding R7 — the batched GEMM's N remainder fell off a cliff
+
+**Hypothesis.** `_amd_batched_mfma_gemm` covers `(n // BN) * BN` columns with the
+MFMA core and hands the residual to `_amd_batched_mfma_edge_kernel`, one thread
+per output element with a full runtime K loop. `_batched_mfma_tile` chose BN from
+the magnitude of N only, so any N that is not a multiple of the selected BN sends
+up to BN-1 columns down that path. The route's own table puts the scalar kernel
+at about 34x the MFMA cost per column, and before the batched route existed every
+batched GEMM used the edge-masked tiled kernel, so a non-multiple N should now be
+*slower* than it was.
+
+**Predicted effect.** At N = 96 with m >= 128 the old selector takes BN = 64,
+leaving a third of every row to the scalar kernel; the estimate from the same
+table is roughly 3.3x slower than the pre-batched path, and N = 127 about 4.8x.
+Reachable from `torch.bmm` directly and from causal SDPA whenever `head_dim` or
+`key_length` is not a multiple of the tile.
+
+**Measured effect.** Not measured as a regression, because the fix is cheap
+enough that measuring the defect was not worth a build cycle; the mechanism is
+plain in the source and the per-column cost is already tabulated in this journal.
+What is measured is that the fix costs nothing on shapes that already fitted:
+`bench_attention_bmm` 51.205 ms against 51.218 recorded, `bench_linear_gemm`
+257.59 ms ratio 3.596 against 257.41/3.593, both under both gates.
+
+**Decision.** Accept the finding and fix it in two parts. `_batched_mfma_tile`
+now picks the widest BN among 128, 64 and 32 that *divides* N rather than the
+widest that fits, so the cleanup kernel only ever handles the M edge; and both
+entry points require `n % 32 == 0`, declining to the edge-masked tiled kernel
+otherwise. Declining is the right answer rather than a defeat: that kernel masks
+every extent and keeps its shared-memory tiling, so it is the general path, not a
+slow fallback bolted under a shape-specialized fast one.
+
+## Change 15 — tiled transpose for batched permutes, and for tall shapes
+
+**Hypothesis.** The eager SDPA backward transposes `[batch*heads, seq, head_dim]`
+four times per layer. Those run through `data_movement_ops._permute_copy`, a
+rank-4 gather with one thread per output element walking a column, which the
+profile showed at 286 GB/s. `op_utils`'s tiled LDS transpose already stages a
+TILE x TILE block so both reads and writes are contiguous, but it only accepted
+rank-2 with trivial leading extents. Giving it a batch axis and calling it from
+`_permute_copy` when the permutation is an innermost-two-dims transpose should
+convert those four copies to something bandwidth-bound.
+
+**Predicted effect.** A per-step saving in the low tens of milliseconds, with
+every transposed shape still exact, including extents that do not divide the
+64-wide BF16 tile.
+
+**Measured effect.** The step went from 420.75 to **409.34 ms**, an 11.4 ms
+saving. The new `transpose2d` kernel accounts for 15.15 ms/step in the profile
+while `permute_copy` still accounts for 30.19: nanoGPT's own
+`view(B, T, nh, hs).transpose(1, 2)` is a rank-4 dim-1/dim-2 permute, not an
+innermost-two-dims transpose, so it keeps the generic kernel. Its innermost
+extent is contiguous in both operands, so the remaining work is a vectorized
+contiguous-run copy rather than a transpose, and it is left undone.
+
+Correctness: batched and unbatched transposed copies match a CPU reference
+exactly for batch 576/1/5/3/2/7 at rows x cols of 1024x64, 64x1024, 1000x63,
+65x129, 4096x2 and 2x4096, in both BF16 and FP32. `scripts/sdpa_correctness.py`
+is unchanged at 25 passing comparisons with the same three pre-existing
+non-causal failures at identical ratios. GEMM and batched-GEMM harnesses
+unchanged.
+
+**Decision.** Accept. The same generalization also fixed R4's launch failure,
+since batch and row tiles are now both grid-strided and both clamped.

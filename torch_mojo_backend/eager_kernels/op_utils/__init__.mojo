@@ -564,9 +564,17 @@ def _transpose2d_kernel[
     rows: Int,
     cols: Int,
     src_ld: Int,
+    batch: Int,
+    dst_bstride: Int,
+    src_bstride: Int,
 ):
-    """`dst[r, c] = src[c, r]` for a `rows x cols` row-major destination and a
-    `cols x rows` source whose row stride is `src_ld`."""
+    """`dst[b, r, c] = src[b, c, r]` for `batch` independent matrices.
+
+    Each matrix has a `rows x cols` row-major destination and a `cols x rows`
+    source whose row stride is `src_ld`; `batch == 1` with zero batch strides is
+    the plain 2-D case. Batch is carried on `block_idx.z` and grid-strided, like
+    the row tiles, so the launch can clamp both dimensions.
+    """
     comptime TILE = _t2d_tile[dtype]()
     var tile = stack_allocation[
         TILE * (TILE + 1), dtype, address_space=AddressSpace.SHARED
@@ -580,35 +588,47 @@ def _transpose2d_kernel[
     # both HIP and CUDA, and rows / TILE crosses that at 1.05M rows for 8-byte
     # elements. The generic kernel this fast path replaces was already clamped,
     # so without the stride a tall-thin transpose would fail to launch where it
-    # previously worked. The trip count depends only on block_idx.y, grid_dim.y
-    # and rows, so it is uniform across the block and the barriers below stay
-    # outside divergent control flow.
+    # previously worked. Both trip counts depend only on block indices, grid
+    # dimensions and runtime scalars, so they are uniform across the block and
+    # the barriers below stay outside divergent control flow.
     var row_tile_stride = Int(grid_dim.y) * TILE
-    var r0 = Int(block_idx.y) * TILE
-    while r0 < rows:
-        # Read src[c0 + y, r0 + tx]: consecutive tx are consecutive addresses.
-        var r = r0 + tx
-        if r < rows:
-            var y = ty
-            while y < TILE:
-                var c = c0 + y
-                if c < cols:
-                    tile[y * (TILE + 1) + tx] = src_ptr[c * src_ld + r]
-                y += _T2D_ROWS
-        barrier()
-        # Write dst[r0 + y, c0 + tx]: consecutive tx are consecutive addresses.
-        var c = c0 + tx
-        if c < cols:
-            var y = ty
-            while y < TILE:
-                var row = r0 + y
-                if row < rows:
-                    dst_ptr[row * cols + c] = tile[tx * (TILE + 1) + y]
-                y += _T2D_ROWS
-        # Every lane must finish reading the LDS tile before the next row tile
-        # overwrites it.
-        barrier()
-        r0 += row_tile_stride
+    var batch_stride = Int(grid_dim.z)
+    var b = Int(block_idx.z)
+    while b < batch:
+        var dst_base = b * dst_bstride
+        var src_base = b * src_bstride
+        var r0 = Int(block_idx.y) * TILE
+        while r0 < rows:
+            # Read src[c0 + y, r0 + tx]: consecutive tx are consecutive
+            # addresses.
+            var r = r0 + tx
+            if r < rows:
+                var y = ty
+                while y < TILE:
+                    var c = c0 + y
+                    if c < cols:
+                        tile[y * (TILE + 1) + tx] = src_ptr[
+                            src_base + c * src_ld + r
+                        ]
+                    y += _T2D_ROWS
+            barrier()
+            # Write dst[r0 + y, c0 + tx]: consecutive tx are consecutive
+            # addresses.
+            var c = c0 + tx
+            if c < cols:
+                var y = ty
+                while y < TILE:
+                    var row = r0 + y
+                    if row < rows:
+                        dst_ptr[dst_base + row * cols + c] = tile[
+                            tx * (TILE + 1) + y
+                        ]
+                    y += _T2D_ROWS
+            # Every lane must finish reading the LDS tile before the next row
+            # tile overwrites it.
+            barrier()
+            r0 += row_tile_stride
+        b += batch_stride
 
 
 @always_inline
@@ -658,15 +678,21 @@ def _copy_strided[
             comptime TILE = _t2d_tile[dtype]()
             var rows = shape[MAX_RANK - 2]
             var cols = shape[MAX_RANK - 1]
-            # Rank-2 transposed read into a contiguous destination: every
-            # leading dim is 1, the destination is row-major (rows, cols), and
-            # the source is a (cols, rows) matrix read down its columns.
-            var leading_trivial = True
-            for d in range(MAX_RANK - 2):
+            # Transposed read into a contiguous destination, optionally batched:
+            # the innermost two dims are a (rows, cols) row-major destination
+            # whose source is a (cols, rows) matrix read down its columns, and at
+            # most one leading dim -- the batch -- may be non-trivial. Batching
+            # matters because the SDPA backward transposes
+            # [batch*heads, seq, head_dim] four times per layer; without it those
+            # fall to the generic strided copy and run at a fraction of
+            # bandwidth.
+            var batch = shape[MAX_RANK - 3]
+            var outer_trivial = True
+            for d in range(MAX_RANK - 3):
                 if shape[d] != 1:
-                    leading_trivial = False
+                    outer_trivial = False
             if (
-                leading_trivial
+                outer_trivial
                 and rows > 1
                 and cols > 1
                 and total >= 1024
@@ -674,21 +700,37 @@ def _copy_strided[
                 and dst_strides[MAX_RANK - 2] == cols
                 and src_strides[MAX_RANK - 2] == 1
                 and src_strides[MAX_RANK - 1] >= rows
+                # A batch of one leaves the strides unconstrained; anything more
+                # needs both operands to repeat their matrix at a fixed pitch,
+                # and the destination's must be exactly one dense matrix so the
+                # writes stay contiguous.
+                and (
+                    batch == 1
+                    or (
+                        dst_strides[MAX_RANK - 3] == rows * cols
+                        and src_strides[MAX_RANK - 3]
+                        >= cols * src_strides[MAX_RANK - 1]
+                    )
+                )
             ):
                 _enqueue_cached[_transpose2d_kernel[dtype]](
                     ctx,
                     String(t"transpose2d_{dtype}"),
                     ceildiv(cols, TILE),
-                    # gridDim.y is capped at 65535; the kernel grid-strides its
-                    # row tiles, so clamping here only costs extra iterations.
+                    # gridDim.y and .z are both capped at 65535; the kernel
+                    # grid-strides row tiles and batch, so clamping here only
+                    # costs extra iterations.
                     min(ceildiv(rows, TILE), _MAX_GRID_Y),
-                    1,
+                    min(batch, _MAX_GRID_Y),
                     TILE * _T2D_ROWS,
                     dst_ptr.as_unsafe_any_origin(),
                     src_ptr.as_unsafe_any_origin().as_immutable(),
                     rows,
                     cols,
                     src_strides[MAX_RANK - 1],
+                    batch,
+                    dst_strides[MAX_RANK - 3] if batch > 1 else 0,
+                    src_strides[MAX_RANK - 3] if batch > 1 else 0,
                 )
                 return
             _enqueue_cached[_copy_strided_kernel[dtype]](
