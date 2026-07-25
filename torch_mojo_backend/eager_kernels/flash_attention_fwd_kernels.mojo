@@ -377,137 +377,153 @@ def _fa_mfma[
         # observed. Only the final tile of a sequence takes this path.
         var last_row = max(seq_kv - 1, 0)
 
-        var t = 0
-        while t < n_tiles:
-            var kv0 = t * BN
-            var full = kv0 + BN <= seq_kv
+        # The tile loop is peeled at `n_safe`.  Below it every query in the
+        # block sees every key of the tile and the tile lies wholly inside
+        # `seq_kv`, so the causal compare, the select and the clamped loader all
+        # vanish at compile time rather than sitting behind a branch.  Leaving
+        # them behind a runtime `if` cost 70 us/layer on the nanogpt case even
+        # though only two tiles per block ever take it.
+        @always_inline
+        @parameter
+        def _tile[MASKED: Bool](t: Int):
+                var kv0 = t * BN
+                var full = True
+                comptime if MASKED:
+                    full = kv0 + BN <= seq_kv
 
-            # ---- Stage K row-major and V transposed. ----
-            if full:
-                comptime for ci in range(KITERS):
-                    var vals = SIMD[dtype, 8](0)
-                    comptime if EXACT:
-                        vals = k_ptr.load[width=8](ci * KROW_STEP * HD)
-                    else:
-                        if k_col < head_dim:
-                            vals = k_ptr.load[width=8](
-                                ci * KROW_STEP * head_dim
-                            )
-                    k_smem.store(k_lds0 + ci * KROW_STEP * KPAD, vals)
-                comptime for vi in range(VITERS):
-                    var vv = SIMD[dtype, 4](0)
-                    var live = True
-                    comptime if not EXACT:
-                        live = v_col < head_dim
-                    if live:
-                        comptime for j in range(4):
-                            comptime if EXACT:
-                                vv[j] = v_ptr[
-                                    (vi * VKV_STEP * 4 + j) * HD
+                # ---- Stage K row-major and V transposed. ----
+                if full:
+                    comptime for ci in range(KITERS):
+                        var vals = SIMD[dtype, 8](0)
+                        comptime if EXACT:
+                            vals = k_ptr.load[width=8](ci * KROW_STEP * HD)
+                        else:
+                            if k_col < head_dim:
+                                vals = k_ptr.load[width=8](
+                                    ci * KROW_STEP * head_dim
+                                )
+                        k_smem.store(k_lds0 + ci * KROW_STEP * KPAD, vals)
+                    comptime for vi in range(VITERS):
+                        var vv = SIMD[dtype, 4](0)
+                        var live = True
+                        comptime if not EXACT:
+                            live = v_col < head_dim
+                        if live:
+                            comptime for j in range(4):
+                                comptime if EXACT:
+                                    vv[j] = v_ptr[
+                                        (vi * VKV_STEP * 4 + j) * HD
+                                    ]
+                                else:
+                                    vv[j] = v_ptr[
+                                        (vi * VKV_STEP * 4 + j) * head_dim
+                                    ]
+                        v_smem.store(v_lds0 + vi * VKV_STEP * 4, vv)
+                else:
+                    comptime for ci in range(KITERS):
+                        var row = min(kv0 + k_row0 + ci * KROW_STEP, last_row)
+                        var vals = SIMD[dtype, 8](0)
+                        if EXACT or k_col < head_dim:
+                            vals = key.load[width=8](kv_base + row * hd + k_col)
+                        k_smem.store(k_lds0 + ci * KROW_STEP * KPAD, vals)
+                    comptime for vi in range(VITERS):
+                        var vv = SIMD[dtype, 4](0)
+                        if EXACT or v_col < head_dim:
+                            var g = kv0 + (v_kvg0 + vi * VKV_STEP) * 4
+                            comptime for j in range(4):
+                                vv[j] = value[
+                                    kv_base + min(g + j, last_row) * hd + v_col
                                 ]
-                            else:
-                                vv[j] = v_ptr[
-                                    (vi * VKV_STEP * 4 + j) * head_dim
-                                ]
-                    v_smem.store(v_lds0 + vi * VKV_STEP * 4, vv)
-            else:
-                comptime for ci in range(KITERS):
-                    var row = min(kv0 + k_row0 + ci * KROW_STEP, last_row)
-                    var vals = SIMD[dtype, 8](0)
-                    if EXACT or k_col < head_dim:
-                        vals = key.load[width=8](kv_base + row * hd + k_col)
-                    k_smem.store(k_lds0 + ci * KROW_STEP * KPAD, vals)
-                comptime for vi in range(VITERS):
-                    var vv = SIMD[dtype, 4](0)
-                    if EXACT or v_col < head_dim:
-                        var g = kv0 + (v_kvg0 + vi * VKV_STEP) * 4
-                        comptime for j in range(4):
-                            vv[j] = value[
-                                kv_base + min(g + j, last_row) * hd + v_col
-                            ]
-                    v_smem.store(v_lds0 + vi * VKV_STEP * 4, vv)
+                        v_smem.store(v_lds0 + vi * VKV_STEP * 4, vv)
 
-            k_ptr += tile_step
-            v_ptr += tile_step
-            barrier()
+                k_ptr += tile_step
+                v_ptr += tile_step
+                barrier()
 
-            llvm_intrinsic["llvm.amdgcn.iglp.opt", NoneType](Int32(IGLP))
-            # ---- GEMM 1: S^T[kv, q] = sum_d K[kv, d] * Q[q, d] ----
-            comptime for i in range(KVT * QT):
-                s_acc.store(i * 16, SIMD[DType.float32, 16](0))
-            var kbase = lo * KPAD + 4 * hi
-            comptime for s in range(KSTEPS):
-                var afrag = stack_allocation[KVT * 4, dtype]()
-                comptime for kt in range(KVT):
-                    afrag.store(
-                        kt * 4,
-                        k_smem.load[width=4](kbase + kt * 32 * KPAD + 8 * s),
-                    )
-                comptime for qt in range(QT):
-                    var b = q_frag.load[width=4]((qt * KSTEPS + s) * 4)
+                llvm_intrinsic["llvm.amdgcn.iglp.opt", NoneType](Int32(IGLP))
+                # ---- GEMM 1: S^T[kv, q] = sum_d K[kv, d] * Q[q, d] ----
+                comptime for i in range(KVT * QT):
+                    s_acc.store(i * 16, SIMD[DType.float32, 16](0))
+                var kbase = lo * KPAD + 4 * hi
+                comptime for s in range(KSTEPS):
+                    var afrag = stack_allocation[KVT * 4, dtype]()
                     comptime for kt in range(KVT):
-                        var d = s_acc.load[width=16]((kt * QT + qt) * 16)
-                        mma(d, afrag.load[width=4](kt * 4), b, d)
-                        s_acc.store((kt * QT + qt) * 16, d)
-
-            # ---- Online softmax, entirely within a lane plus one exchange ----
-            comptime for qt in range(QT):
-                var tmax = Float32.MIN_FINITE
-                comptime for kt in range(KVT):
-                    var v16 = s_acc.load[width=16]((kt * QT + qt) * 16) * sl
-                    if t >= n_safe:
-                        # `kv` of element p is `kv0 + 32*kt + 4*hi + ACC_ROWS[p]`
-                        # and the causal bound is one scalar per lane, so the
-                        # whole mask is one compare against a constant vector.
-                        var kvv = (
-                            SIMD[DType.int32, 16](kv0 + kt * 32 + 4 * hi)
-                            + ACC_ROWS
+                        afrag.store(
+                            kt * 4,
+                            k_smem.load[width=4](kbase + kt * 32 * KPAD + 8 * s),
                         )
-                        v16 = kvv.lt(SIMD[DType.int32, 16](qlim[qt])).select(
-                            v16, NEG_BIG
-                        )
-                    s_acc.store((kt * QT + qt) * 16, v16)
-                    tmax = max(tmax, v16.reduce_max())
-                # Lanes L and L^32 hold the same query column.
-                tmax = max(tmax, shuffle_xor(tmax, 32))
-                var nm = max(run_m[qt], tmax)
-                var corr = exp2(run_m[qt] - nm)
-                run_m[qt] = nm
+                    comptime for qt in range(QT):
+                        var b = q_frag.load[width=4]((qt * KSTEPS + s) * 4)
+                        comptime for kt in range(KVT):
+                            var d = s_acc.load[width=16]((kt * QT + qt) * 16)
+                            mma(d, afrag.load[width=4](kt * 4), b, d)
+                            s_acc.store((kt * QT + qt) * 16, d)
 
-                var psum = Float32(0)
-                comptime for kt in range(KVT):
-                    var pv = exp2(
-                        s_acc.load[width=16]((kt * QT + qt) * 16)
-                        - SIMD[DType.float32, 16](nm)
-                    )
-                    p_frag.store(
-                        (kt * QT + qt) * 16, _pack_half[dtype, 16](pv)
-                    )
-                    psum += pv.reduce_add()
-                run_s[qt] = run_s[qt] * corr + psum
-                comptime for dt in range(DT):
-                    var acc = o_acc.load[width=16]((dt * QT + qt) * 16)
-                    o_acc.store((dt * QT + qt) * 16, acc * corr)
-
-            # ---- GEMM 2: O^T[d, q] += sum_kv V^T[d, kv] * P^T[kv, q] ----
-            var vbase = lo * VPAD + 4 * hi
-            comptime for ks in range(PKS):
-                var vfrag = stack_allocation[DT * 4, dtype]()
-                comptime for dt in range(DT):
-                    vfrag.store(
-                        dt * 4,
-                        v_smem.load[width=4](vbase + dt * 32 * VPAD + 8 * ks),
-                    )
+                # ---- Online softmax, entirely within a lane plus one exchange ----
                 comptime for qt in range(QT):
-                    var b = p_frag.load[width=4](
-                        ((ks // 4) * QT + qt) * 16 + (ks % 4) * 4
-                    )
-                    comptime for dt in range(DT):
-                        var d = o_acc.load[width=16]((dt * QT + qt) * 16)
-                        mma(d, vfrag.load[width=4](dt * 4), b, d)
-                        o_acc.store((dt * QT + qt) * 16, d)
+                    var tmax = Float32.MIN_FINITE
+                    comptime for kt in range(KVT):
+                        var v16 = s_acc.load[width=16]((kt * QT + qt) * 16) * sl
+                        comptime if MASKED:
+                            # `kv` of element p is `kv0 + 32*kt + 4*hi + ACC_ROWS[p]`
+                            # and the causal bound is one scalar per lane, so the
+                            # whole mask is one compare against a constant vector.
+                            var kvv = (
+                                SIMD[DType.int32, 16](kv0 + kt * 32 + 4 * hi)
+                                + ACC_ROWS
+                            )
+                            v16 = kvv.lt(SIMD[DType.int32, 16](qlim[qt])).select(
+                                v16, NEG_BIG
+                            )
+                        s_acc.store((kt * QT + qt) * 16, v16)
+                        tmax = max(tmax, v16.reduce_max())
+                    # Lanes L and L^32 hold the same query column.
+                    tmax = max(tmax, shuffle_xor(tmax, 32))
+                    var nm = max(run_m[qt], tmax)
+                    var corr = exp2(run_m[qt] - nm)
+                    run_m[qt] = nm
 
-            barrier()
+                    var psum = Float32(0)
+                    comptime for kt in range(KVT):
+                        var pv = exp2(
+                            s_acc.load[width=16]((kt * QT + qt) * 16)
+                            - SIMD[DType.float32, 16](nm)
+                        )
+                        p_frag.store(
+                            (kt * QT + qt) * 16, _pack_half[dtype, 16](pv)
+                        )
+                        psum += pv.reduce_add()
+                    run_s[qt] = run_s[qt] * corr + psum
+                    comptime for dt in range(DT):
+                        var acc = o_acc.load[width=16]((dt * QT + qt) * 16)
+                        o_acc.store((dt * QT + qt) * 16, acc * corr)
+
+                # ---- GEMM 2: O^T[d, q] += sum_kv V^T[d, kv] * P^T[kv, q] ----
+                var vbase = lo * VPAD + 4 * hi
+                comptime for ks in range(PKS):
+                    var vfrag = stack_allocation[DT * 4, dtype]()
+                    comptime for dt in range(DT):
+                        vfrag.store(
+                            dt * 4,
+                            v_smem.load[width=4](vbase + dt * 32 * VPAD + 8 * ks),
+                        )
+                    comptime for qt in range(QT):
+                        var b = p_frag.load[width=4](
+                            ((ks // 4) * QT + qt) * 16 + (ks % 4) * 4
+                        )
+                        comptime for dt in range(DT):
+                            var d = o_acc.load[width=16]((dt * QT + qt) * 16)
+                            mma(d, vfrag.load[width=4](dt * 4), b, d)
+                            o_acc.store((dt * QT + qt) * 16, d)
+
+                barrier()
+
+        var t = 0
+        while t < n_safe:
+            _tile[False](t)
+            t += 1
+        while t < n_tiles:
+            _tile[True](t)
             t += 1
 
         # ---- Epilogue. O^T lives with one query per lane and 16 scattered
