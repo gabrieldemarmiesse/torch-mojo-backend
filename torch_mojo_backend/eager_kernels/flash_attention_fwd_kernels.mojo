@@ -1,12 +1,14 @@
 """Fused causal flash-attention forward for gfx942. THE FILE TO OPTIMIZE.
 
 The contract below is frozen; `harness/nanogpt_train/bench_flash_attention.mojo`
-calls exactly this entry point and defines acceptance. What is inside is a
-correct, deliberately unoptimized baseline: one 256-thread block per query row,
-K and V read straight from global memory, scores staged in LDS, online softmax
-with a block reduction per KV tile. It is right, and it is slow.
+calls exactly this entry point and defines acceptance.
 
-The optimization target is `enqueue_flash_attention_fwd`'s runtime, nothing else.
+`enqueue_flash_attention_fwd` dispatches between two implementations:
+
+* `_fa_mfma`, an MFMA flash-attention kernel for CDNA (gfx942), selected when
+  the device is HIP and `head_dim % 8 == 0`;
+* `_flash_attention_fwd_baseline`, the original one-block-per-query-row kernel,
+  which stays as the general correct path for every other shape and device.
 
 Invariants any replacement must keep:
 
@@ -25,14 +27,56 @@ Invariants any replacement must keep:
   query row `q` attends to key indices `0 ..= q + (seq_kv - seq_q)`. That is
   PyTorch's convention for `is_causal=True` and it matters when
   `seq_kv != seq_q`.
+
+## Why the score tile is computed transposed
+
+Everything about the MFMA kernel follows from one decision: the first GEMM
+produces `S^T = K @ Q^T` (kv along M, queries along N) rather than `S = Q @ K^T`.
+
+The `v_mfma_f32_32x32x8bf16_1k` accumulator puts, in lane `L`, register `p`,
+the element at row `8*(p//4) + (p%4) + 4*(L//32)`, column `L%32`. Its B operand
+wants, in lane `L`, `B[4*(L//32) + j, L%32]` for `j in 0..3`. So for the
+transposed tile:
+
+* a lane owns ONE query (column `L%32`) and sixteen kv rows. The online-softmax
+  state is a single scalar per lane, the causal bound is a single scalar per
+  lane, and the row reduction is `reduce_max` over 16 registers plus one
+  exchange with lane `L^32`. No LDS reduction, no block reduction.
+* accumulator register group `g` (registers `4g..4g+3`) holds rows
+  `8g + 4*(L//32) + 0..3` of column `L%32`, which is EXACTLY the B operand of
+  the next MFMA for the K-strip `[8g, 8g+8)`. `P^T` therefore feeds the second
+  GEMM straight out of the accumulator registers with a bf16 cast and a slice:
+  no shuffle, no LDS round trip. On CDNA4 (`MMA_K=16`) the same chain needs a
+  key permutation that cancels against `ds_read_b64_tr_b16`; at `MMA_K=8` the
+  permutation is the identity.
+
+The price is that the second GEMM, `O^T = V^T @ P^T`, needs V with kv
+contiguous, because an MFMA operand always holds four elements adjacent along
+K. `ds_read_b64_tr_b16` is CDNA4-only, so V is transposed on the way into LDS
+instead: each thread reads four kv values at one head-dim column (a fully
+coalesced 2-bytes-per-lane global read, 128 contiguous bytes per wavefront) and
+writes them as one 8-byte LDS store into a `[head_dim][BN]` tile.
+
+## LDS layout
+
+Both LDS tiles are row-major with the row length padded to `X + 4` elements.
+That is not arbitrary. An MFMA fragment read is `ds_read_b64` at
+`(L%32)*PAD + c`, i.e. dword `(L%32)*(PAD/2) + c/2`; the bank is that value mod
+32. `PAD/2 == 2 (mod 4)` makes `{(L%32)*(PAD/2) mod 32}` sixteen distinct even
+banks over lanes 0..15, and the second dword of each `b64` fills the odd banks,
+so a 16-lane LDS cycle covers all 32 banks exactly once. `X + 4` with `X` a
+multiple of 8 always satisfies it, and keeps rows 8-byte aligned.
 """
 
 from std.gpu import barrier, block_idx, grid_dim, thread_idx
+from std.gpu.compute.mma import mma
 from std.gpu.host import DeviceContext
 from std.gpu.memory import AddressSpace
 from std.gpu.primitives import block
-from std.math import ceildiv, exp
+from std.gpu.primitives.warp import shuffle_xor
+from std.math import ceildiv, exp, exp2
 from std.memory import stack_allocation
+from std.sys.info import is_amd_gpu
 
 comptime THREADS = 256
 # Scores for one KV tile, one per thread.
@@ -40,6 +84,18 @@ comptime BK = THREADS
 # Largest head dimension the LDS staging below is sized for. A larger runtime
 # head_dim is a legal input; the dispatch must route it somewhere correct.
 comptime MAX_HEAD_DIM = 256
+
+# log2(e): the softmax runs in log2 units so the exponential is a bare
+# `v_exp_f32`.
+comptime LOG2E = Float32(1.4426950408889634)
+
+# Row of the 32x32 MFMA accumulator held by register `p`, before the
+# `4 * (lane // 32)` half-wave shift. Hardware-determined.
+comptime ACC_ROWS = SIMD[DType.int32, 16](
+    0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27
+)
+
+comptime NEG_BIG = SIMD[DType.float32, 16](Float32.MIN_FINITE)
 
 
 @__name(t"flash_attention_fwd_baseline_{dtype}")
@@ -143,6 +199,308 @@ def _flash_attention_fwd_baseline[
         do += THREADS
 
 
+@__name(t"fa_mfma_{dtype}_h{HD}_n{BN}_q{QT}_x{EXACT}")
+def _fa_mfma[
+    dtype: DType, HD: Int, BN: Int, QT: Int, EXACT: Bool
+](
+    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    seq_q: Int,
+    seq_kv: Int,
+    head_dim: Int,
+    scale: Float32,
+    causal: Int,
+):
+    """MFMA flash-attention forward, four wave64 per workgroup.
+
+    `HD` is the compile-time padded head dimension (a runtime `head_dim <= HD`
+    is zero-filled in LDS and in the Q fragments, which contributes nothing to
+    any score and nothing to any stored output column). `BN` is the KV tile,
+    `QT` the number of 32-query MFMA tiles each wave owns, so the workgroup
+    covers `4 * 32 * QT` query rows. `EXACT` asserts `head_dim == HD` and drops
+    the per-element head-dim bound checks from the loaders.
+    """
+    comptime NW = 4
+    comptime BM = NW * 32 * QT
+    comptime KSTEPS = HD // 8  # k-steps of the Q@K^T GEMM
+    comptime KVT = BN // 32  # kv MFMA tiles per score tile
+    comptime DT = HD // 32  # head-dim MFMA tiles of the output
+    comptime PKS = BN // 8  # k-steps of the P@V GEMM
+    comptime KPAD = HD + 4  # LDS row length of the K tile
+    comptime VPAD = BN + 4  # LDS row length of the V^T tile
+    comptime OPAD = 36  # LDS row length of the output staging tile
+    comptime KITERS = BN * HD // 8 // THREADS
+    comptime VITERS = HD * (BN // 4) // THREADS
+    comptime OPASSES = BM // 64
+    comptime LDS_ELEMS = max(BN * KPAD + HD * VPAD, BM * OPAD)
+
+    comptime if is_amd_gpu():
+        var smem = stack_allocation[
+            LDS_ELEMS, dtype, address_space = AddressSpace.SHARED, alignment=16
+        ]()
+        var k_smem = smem
+        var v_smem = smem + BN * KPAD
+
+        var tid = Int(thread_idx.x)
+        var wave = tid // 64
+        var lane = tid % 64
+        var lo = lane % 32  # index along the MFMA's non-K axis
+        var hi = lane // 32  # which half-wave, i.e. which K quad
+
+        var heads = Int(grid_dim.y)
+        var bh = Int(block_idx.z) * heads + Int(block_idx.y)
+        var q_base = bh * seq_q * head_dim
+        var kv_base = bh * seq_kv * head_dim
+
+        # Heaviest query block first: under a causal mask the last block does
+        # `grid_dim.x` times the work of the first, and blocks are dispatched
+        # x-fastest, so reversing x starts the long pole at t=0.
+        var q_block = (Int(grid_dim.x) - 1 - Int(block_idx.x)) * BM
+
+        var delta = seq_kv - seq_q
+        var q_hi = min(q_block + BM - 1, seq_q - 1)
+        var lim_hi = seq_kv
+        var lim_lo = seq_kv
+        if causal != 0:
+            lim_hi = min(seq_kv, q_hi + delta + 1)
+            lim_lo = min(seq_kv, q_block + delta + 1)
+        var n_tiles = ceildiv(max(lim_hi, 0), BN)
+        # Tiles below this index are live for EVERY query in the block, so they
+        # need no mask and no bound check.
+        var n_safe = max(lim_lo, 0) // BN
+
+        # ---- Q fragments: the B operand of S^T = K @ Q^T, resident for the
+        # whole kv loop. Lane L holds query `L%32`, head-dim `8s + 4*(L//32)`.
+        var q_frag = stack_allocation[QT * KSTEPS * 4, dtype]()
+        var q_row0 = q_block + wave * (32 * QT)
+        comptime for qt in range(QT):
+            var qg = q_row0 + qt * 32 + lo
+            var live = qg < seq_q
+            var qrow = q_base + qg * head_dim + 4 * hi
+            comptime for s in range(KSTEPS):
+                var v = SIMD[dtype, 4](0)
+                comptime if EXACT:
+                    if live:
+                        v = query.load[width=4](qrow + 8 * s)
+                else:
+                    if live and 8 * s + 4 * hi < head_dim:
+                        v = query.load[width=4](qrow + 8 * s)
+                q_frag.store((qt * KSTEPS + s) * 4, v)
+
+        # ---- Online-softmax state: one scalar per lane per query tile.
+        var run_m = stack_allocation[QT, DType.float32]()
+        var run_s = stack_allocation[QT, DType.float32]()
+        var qlim = stack_allocation[QT, DType.int32]()
+        comptime for qt in range(QT):
+            run_m[qt] = Float32.MIN_FINITE
+            run_s[qt] = 0.0
+            var qg = q_row0 + qt * 32 + lo
+            var lm = seq_kv
+            if causal != 0:
+                lm = min(seq_kv, qg + delta + 1)
+            qlim[qt] = Int32(lm)
+
+        var s_acc = stack_allocation[KVT * QT * 16, DType.float32]()
+        var p_frag = stack_allocation[KVT * QT * 16, dtype]()
+        var o_acc = stack_allocation[DT * QT * 16, DType.float32]()
+        comptime for i in range(DT * QT):
+            o_acc.store(i * 16, SIMD[DType.float32, 16](0))
+
+        var sl = scale * LOG2E
+
+        var t = 0
+        while t < n_tiles:
+            var kv0 = t * BN
+            var full = kv0 + BN <= seq_kv
+
+            # ---- Stage K row-major and V transposed. ----
+            comptime for ci in range(KITERS):
+                var c = tid + ci * THREADS
+                var row = c // (HD // 8)
+                var col = (c % (HD // 8)) * 8
+                var vals = SIMD[dtype, 8](0)
+                var ok = full or (kv0 + row < seq_kv)
+                comptime if not EXACT:
+                    ok = ok and col < head_dim
+                if ok:
+                    vals = key.load[width=8](
+                        kv_base + (kv0 + row) * head_dim + col
+                    )
+                k_smem.store(row * KPAD + col, vals)
+
+            comptime for vi in range(VITERS):
+                var c = tid + vi * THREADS
+                var dcol = c % HD
+                var kvg = c // HD
+                var vv = SIMD[dtype, 4](0)
+                var ok = True
+                comptime if not EXACT:
+                    ok = dcol < head_dim
+                if ok:
+                    var vp = value + (
+                        kv_base + (kv0 + kvg * 4) * head_dim + dcol
+                    )
+                    if full:
+                        comptime for j in range(4):
+                            vv[j] = vp[j * head_dim]
+                    else:
+                        comptime for j in range(4):
+                            if kv0 + kvg * 4 + j < seq_kv:
+                                vv[j] = vp[j * head_dim]
+                v_smem.store(dcol * VPAD + kvg * 4, vv)
+
+            barrier()
+
+            # ---- GEMM 1: S^T[kv, q] = sum_d K[kv, d] * Q[q, d] ----
+            comptime for i in range(KVT * QT):
+                s_acc.store(i * 16, SIMD[DType.float32, 16](0))
+            var kbase = lo * KPAD + 4 * hi
+            comptime for s in range(KSTEPS):
+                var afrag = stack_allocation[KVT * 4, dtype]()
+                comptime for kt in range(KVT):
+                    afrag.store(
+                        kt * 4,
+                        k_smem.load[width=4](kbase + kt * 32 * KPAD + 8 * s),
+                    )
+                comptime for qt in range(QT):
+                    var b = q_frag.load[width=4]((qt * KSTEPS + s) * 4)
+                    comptime for kt in range(KVT):
+                        var d = s_acc.load[width=16]((kt * QT + qt) * 16)
+                        mma(d, afrag.load[width=4](kt * 4), b, d)
+                        s_acc.store((kt * QT + qt) * 16, d)
+
+            # ---- Online softmax, entirely within a lane plus one exchange ----
+            comptime for qt in range(QT):
+                var tmax = Float32.MIN_FINITE
+                comptime for kt in range(KVT):
+                    var v16 = s_acc.load[width=16]((kt * QT + qt) * 16) * sl
+                    if t >= n_safe:
+                        # `kv` of element p is `kv0 + 32*kt + 4*hi + ACC_ROWS[p]`
+                        # and the causal bound is one scalar per lane, so the
+                        # whole mask is one compare against a constant vector.
+                        var kvv = (
+                            SIMD[DType.int32, 16](kv0 + kt * 32 + 4 * hi)
+                            + ACC_ROWS
+                        )
+                        v16 = kvv.lt(SIMD[DType.int32, 16](qlim[qt])).select(
+                            v16, NEG_BIG
+                        )
+                    s_acc.store((kt * QT + qt) * 16, v16)
+                    tmax = max(tmax, v16.reduce_max())
+                # Lanes L and L^32 hold the same query column.
+                tmax = max(tmax, shuffle_xor(tmax, 32))
+                var nm = max(run_m[qt], tmax)
+                var corr = exp2(run_m[qt] - nm)
+                run_m[qt] = nm
+
+                var psum = Float32(0)
+                comptime for kt in range(KVT):
+                    var pv = exp2(
+                        s_acc.load[width=16]((kt * QT + qt) * 16)
+                        - SIMD[DType.float32, 16](nm)
+                    )
+                    var pb = pv.cast[dtype]()
+                    p_frag.store((kt * QT + qt) * 16, pb)
+                    # Sum the ROUNDED weights, so the stored row is an exact
+                    # convex combination of V rows and the two roundings cancel.
+                    psum += pb.cast[DType.float32]().reduce_add()
+                run_s[qt] = run_s[qt] * corr + psum
+                comptime for dt in range(DT):
+                    var acc = o_acc.load[width=16]((dt * QT + qt) * 16)
+                    o_acc.store((dt * QT + qt) * 16, acc * corr)
+
+            # ---- GEMM 2: O^T[d, q] += sum_kv V^T[d, kv] * P^T[kv, q] ----
+            var vbase = lo * VPAD + 4 * hi
+            comptime for ks in range(PKS):
+                var vfrag = stack_allocation[DT * 4, dtype]()
+                comptime for dt in range(DT):
+                    vfrag.store(
+                        dt * 4,
+                        v_smem.load[width=4](vbase + dt * 32 * VPAD + 8 * ks),
+                    )
+                comptime for qt in range(QT):
+                    var b = p_frag.load[width=4](
+                        ((ks // 4) * QT + qt) * 16 + (ks % 4) * 4
+                    )
+                    comptime for dt in range(DT):
+                        var d = o_acc.load[width=16]((dt * QT + qt) * 16)
+                        mma(d, vfrag.load[width=4](dt * 4), b, d)
+                        o_acc.store((dt * QT + qt) * 16, d)
+
+            barrier()
+            t += 1
+
+        # ---- Epilogue. O^T lives with one query per lane and 16 scattered
+        # head-dim rows, so it is staged through LDS one 32-column slab at a
+        # time and read back in row-major order for coalesced global stores.
+        var inv = stack_allocation[QT, DType.float32]()
+        comptime for qt in range(QT):
+            var tot = run_s[qt] + shuffle_xor(run_s[qt], 32)
+            var r = Float32(0)
+            if tot > 0.0 and run_m[qt] != Float32.MIN_FINITE:
+                r = 1.0 / tot
+            inv[qt] = r
+
+        comptime for dt in range(DT):
+            barrier()
+            comptime for qt in range(QT):
+                var row = wave * (32 * QT) + qt * 32 + lo
+                var acc = o_acc.load[width=16]((dt * QT + qt) * 16) * inv[qt]
+                var ob = acc.cast[dtype]()
+                comptime for g in range(4):
+                    smem.store(
+                        row * OPAD + 8 * g + 4 * hi,
+                        ob.slice[4, offset = g * 4](),
+                    )
+            barrier()
+            comptime for pz in range(OPASSES):
+                var r = pz * 64 + tid // 4
+                var cc = (tid % 4) * 8
+                var qg = q_block + r
+                var dcol = dt * 32 + cc
+                var store = qg < seq_q
+                comptime if not EXACT:
+                    store = store and dcol < head_dim
+                if store:
+                    output.store(
+                        q_base + qg * head_dim + dcol,
+                        smem.load[width=8](r * OPAD + cc),
+                    )
+
+
+def _enqueue_fa_mfma[
+    dtype: DType, HD: Int, BN: Int, QT: Int, EXACT: Bool
+](
+    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    batch: Int,
+    heads: Int,
+    seq_q: Int,
+    seq_kv: Int,
+    head_dim: Int,
+    scale: Float32,
+    is_causal: Bool,
+    ctx: DeviceContext,
+) raises:
+    ctx.enqueue_function[_fa_mfma[dtype, HD, BN, QT, EXACT]](
+        output,
+        query,
+        key,
+        value,
+        seq_q,
+        seq_kv,
+        head_dim,
+        scale,
+        1 if is_causal else 0,
+        grid_dim=(ceildiv(seq_q, 4 * 32 * QT), heads, batch),
+        block_dim=(THREADS,),
+    )
+
+
 def enqueue_flash_attention_fwd[
     dtype: DType
 ](
@@ -176,6 +534,47 @@ def enqueue_flash_attention_fwd[
             "; a replacement must either raise the staging or route this"
             " head_dim to a path that handles it",
         )
+
+    # The MFMA path needs a half-float MFMA and 8-element vector loads along
+    # head_dim. Everything else falls through to the general baseline.
+    comptime if dtype.is_half_float():
+        if ctx.api() == "hip" and head_dim % 8 == 0:
+            if head_dim == 64:
+                _enqueue_fa_mfma[dtype, 64, 64, 1, True](
+                    output, query, key, value, batch, heads, seq_q, seq_kv,
+                    head_dim, scale, is_causal, ctx,
+                )
+                return
+            if head_dim < 64:
+                _enqueue_fa_mfma[dtype, 64, 64, 1, False](
+                    output, query, key, value, batch, heads, seq_q, seq_kv,
+                    head_dim, scale, is_causal, ctx,
+                )
+                return
+            if head_dim == 128:
+                _enqueue_fa_mfma[dtype, 128, 64, 1, True](
+                    output, query, key, value, batch, heads, seq_q, seq_kv,
+                    head_dim, scale, is_causal, ctx,
+                )
+                return
+            if head_dim < 128:
+                _enqueue_fa_mfma[dtype, 128, 64, 1, False](
+                    output, query, key, value, batch, heads, seq_q, seq_kv,
+                    head_dim, scale, is_causal, ctx,
+                )
+                return
+            if head_dim == 256:
+                _enqueue_fa_mfma[dtype, 256, 32, 1, True](
+                    output, query, key, value, batch, heads, seq_q, seq_kv,
+                    head_dim, scale, is_causal, ctx,
+                )
+                return
+            _enqueue_fa_mfma[dtype, 256, 32, 1, False](
+                output, query, key, value, batch, heads, seq_q, seq_kv,
+                head_dim, scale, is_causal, ctx,
+            )
+            return
+
     ctx.enqueue_function[_flash_attention_fwd_baseline[dtype]](
         output,
         query,
