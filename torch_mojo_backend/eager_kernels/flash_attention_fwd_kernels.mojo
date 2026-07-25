@@ -103,7 +103,16 @@ comptime ACC_ROWS = SIMD[DType.int32, 16](
     0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27
 )
 
-comptime NEG_BIG = SIMD[DType.float32, 16](Float32.MIN_FINITE)
+# The running max is kept in RAW accumulator units so `scale * log2(e)` folds
+# into the exponent's `v_pk_fma_f32` instead of costing a separate multiply.
+# A masked score is set to a finite -1e30 and the max is floored at -9e29, so a
+# row with no live key at all (possible only when `seq_kv < seq_q` under a
+# causal mask) yields `exp2(-1e29 * sl)` = 0 rather than `exp2(0)` = 1: the
+# fully-masked row still reduces to an exact zero output, and no lane ever
+# evaluates `exp(-inf - -inf)`.  `run_m` is still SEEDED with
+# `Float32.MIN_FINITE`, which drives the first tile's correction to zero.
+comptime NEG_BIG = SIMD[DType.float32, 16](-1.0e30)
+comptime RAW_FLOOR = Float32(-9.0e29)
 
 
 @always_inline
@@ -123,7 +132,12 @@ def _pack_half[
     """
     comptime if dtype == DType.bfloat16:
         var bits = bitcast[DType.uint32, w](x) + SIMD[DType.uint32, w](0x8000)
-        return bitcast[dtype, w]((bits >> 16).cast[DType.uint16]())
+        # Deinterleave rather than shift-and-narrow: the high half of each
+        # little-endian pair already IS the bfloat16, so this is a pure byte
+        # selection and lowers to `v_perm_b32` instead of shift/shift/or.
+        return bitcast[dtype, w](
+            bitcast[DType.uint16, 2 * w](bits).deinterleave()[1]
+        )
     else:
         return x.cast[dtype]()
 
@@ -464,7 +478,7 @@ def _fa_mfma[
                 comptime for qt in range(QT):
                     var tmax = Float32.MIN_FINITE
                     comptime for kt in range(KVT):
-                        var v16 = s_acc.load[width=16]((kt * QT + qt) * 16) * sl
+                        var v16 = s_acc.load[width=16]((kt * QT + qt) * 16)
                         comptime if MASKED:
                             # `kv` of element p is `kv0 + 32*kt + 4*hi + ACC_ROWS[p]`
                             # and the causal bound is one scalar per lane, so the
@@ -480,15 +494,18 @@ def _fa_mfma[
                         tmax = max(tmax, v16.reduce_max())
                     # Lanes L and L^32 hold the same query column.
                     tmax = max(tmax, shuffle_xor(tmax, 32))
-                    var nm = max(run_m[qt], tmax)
-                    var corr = exp2(run_m[qt] - nm)
+                    var nm = max(max(run_m[qt], tmax), RAW_FLOOR)
+                    var corr = exp2((run_m[qt] - nm) * sl)
                     run_m[qt] = nm
+                    var negm = -nm * sl
 
                     var psum = Float32(0)
                     comptime for kt in range(KVT):
                         var pv = exp2(
-                            s_acc.load[width=16]((kt * QT + qt) * 16)
-                            - SIMD[DType.float32, 16](nm)
+                            s_acc.load[width=16]((kt * QT + qt) * 16).fma(
+                                SIMD[DType.float32, 16](sl),
+                                SIMD[DType.float32, 16](negm),
+                            )
                         )
                         p_frag.store(
                             (kt * QT + qt) * 16, _pack_half[dtype, 16](pv)
@@ -535,7 +552,7 @@ def _fa_mfma[
         comptime for qt in range(QT):
             var tot = run_s[qt] + shuffle_xor(run_s[qt], 32)
             var r = Float32(0)
-            if tot > 0.0 and run_m[qt] != Float32.MIN_FINITE:
+            if tot > 0.0 and run_m[qt] > RAW_FLOOR:
                 r = 1.0 / tot
             inv[qt] = r
 
