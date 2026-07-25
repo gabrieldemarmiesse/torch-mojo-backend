@@ -245,6 +245,7 @@ def _fa_mfma[
     EXACT: Bool,
     WAVES_PER_EU: Int,
     IGLP: Int,
+    PEEL: Bool,
 ](
     output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -519,9 +520,10 @@ def _fa_mfma[
                 barrier()
 
         var t = 0
-        while t < n_safe:
-            _tile[False](t)
-            t += 1
+        comptime if PEEL:
+            while t < n_safe:
+                _tile[False](t)
+                t += 1
         while t < n_tiles:
             _tile[True](t)
             t += 1
@@ -572,6 +574,7 @@ def _enqueue_fa_mfma[
     EXACT: Bool,
     WAVES_PER_EU: Int = 1,
     IGLP: Int = 1,
+    PEEL: Bool = True,
 ](
     output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -586,7 +589,7 @@ def _enqueue_fa_mfma[
     is_causal: Bool,
     ctx: DeviceContext,
 ) raises:
-    ctx.enqueue_function[_fa_mfma[dtype, HD, BN, QT, EXACT, WAVES_PER_EU, IGLP]](
+    ctx.enqueue_function[_fa_mfma[dtype, HD, BN, QT, EXACT, WAVES_PER_EU, IGLP, PEEL]](
         output,
         query,
         key,
@@ -652,24 +655,24 @@ def enqueue_flash_attention_fwd[
                 )
                 return
             if head_dim == 128:
-                _enqueue_fa_mfma[dtype, 128, 64, 1, True](
+                _enqueue_fa_mfma[dtype, 128, 64, 1, True, 1, 1, False](
                     output, query, key, value, batch, heads, seq_q, seq_kv,
                     head_dim, scale, is_causal, ctx,
                 )
                 return
             if head_dim < 128:
-                _enqueue_fa_mfma[dtype, 128, 64, 1, False](
+                _enqueue_fa_mfma[dtype, 128, 64, 1, False, 1, 1, False](
                     output, query, key, value, batch, heads, seq_q, seq_kv,
                     head_dim, scale, is_causal, ctx,
                 )
                 return
             if head_dim == 256:
-                _enqueue_fa_mfma[dtype, 256, 32, 1, True](
+                _enqueue_fa_mfma[dtype, 256, 32, 1, True, 1, 1, False](
                     output, query, key, value, batch, heads, seq_q, seq_kv,
                     head_dim, scale, is_causal, ctx,
                 )
                 return
-            _enqueue_fa_mfma[dtype, 256, 32, 1, False](
+            _enqueue_fa_mfma[dtype, 256, 32, 1, False, 1, 1, False](
                 output, query, key, value, batch, heads, seq_q, seq_kv,
                 head_dim, scale, is_causal, ctx,
             )
