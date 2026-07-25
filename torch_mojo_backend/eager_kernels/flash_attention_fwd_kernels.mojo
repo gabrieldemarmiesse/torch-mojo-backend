@@ -68,7 +68,13 @@ so a 16-lane LDS cycle covers all 32 banks exactly once. `X + 4` with `X` a
 multiple of 8 always satisfies it, and keeps rows 8-byte aligned.
 """
 
-from std.gpu import barrier, block_idx, grid_dim, thread_idx
+from std.gpu import (
+    MAX_THREADS_PER_BLOCK_METADATA,
+    barrier,
+    block_idx,
+    grid_dim,
+    thread_idx,
+)
 from std.gpu.compute.mma import mma
 from std.gpu.host import DeviceContext
 from std.gpu.memory import AddressSpace
@@ -77,6 +83,7 @@ from std.gpu.primitives.warp import shuffle_xor
 from std.math import ceildiv, exp, exp2
 from std.memory import stack_allocation
 from std.sys.info import is_amd_gpu
+from std.utils.static_tuple import StaticTuple
 
 comptime THREADS = 256
 # Scores for one KV tile, one per thread.
@@ -199,9 +206,16 @@ def _flash_attention_fwd_baseline[
         do += THREADS
 
 
+# Without the flat-work-group-size metadata the AMDGPU backend assumes up to
+# 1024 threads per block, which caps the kernel at 128 VGPRs and spills every
+# accumulator to scratch. 256 threads is four wave64, one per SIMD.
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(THREADS)),
+    `rocdl.waves_per_eu`=SIMDSize(WAVES_PER_EU),
+)
 @__name(t"fa_mfma_{dtype}_h{HD}_n{BN}_q{QT}_x{EXACT}")
 def _fa_mfma[
-    dtype: DType, HD: Int, BN: Int, QT: Int, EXACT: Bool
+    dtype: DType, HD: Int, BN: Int, QT: Int, EXACT: Bool, WAVES_PER_EU: Int
 ](
     output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -471,7 +485,12 @@ def _fa_mfma[
 
 
 def _enqueue_fa_mfma[
-    dtype: DType, HD: Int, BN: Int, QT: Int, EXACT: Bool
+    dtype: DType,
+    HD: Int,
+    BN: Int,
+    QT: Int,
+    EXACT: Bool,
+    WAVES_PER_EU: Int = 1,
 ](
     output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -486,7 +505,7 @@ def _enqueue_fa_mfma[
     is_causal: Bool,
     ctx: DeviceContext,
 ) raises:
-    ctx.enqueue_function[_fa_mfma[dtype, HD, BN, QT, EXACT]](
+    ctx.enqueue_function[_fa_mfma[dtype, HD, BN, QT, EXACT, WAVES_PER_EU]](
         output,
         query,
         key,
