@@ -1892,3 +1892,40 @@ ingredient is the batched GEMM, which accumulates in float32 exactly as
 `pure_gemm_tiled` did. Fixing it means selecting the warp kernel for non-causal
 rows too, which is a change to the general `aten::_softmax` and was not attempted
 here.
+
+## Review finding R4 — the tiled transpose exceeded the gridDim.y cap
+
+**Hypothesis.** Change 12's tiled-LDS transpose fast path launches
+`(ceildiv(cols, TILE), ceildiv(rows, TILE), 1)` with one block per row tile.
+`TILE = 128 / size_of[dtype]()`, so 64 for BF16 and 16 for 8-byte elements,
+while HIP and CUDA both cap gridDim.y at 65535. Above `65535 * TILE` rows the
+launch should be rejected outright. The generic `_copy_strided_kernel` this fast
+path replaces launches `(_gs_blocks(total), 1, 1)`, which is clamped to 4096, so
+this would be a regression on shapes that previously worked rather than a
+pre-existing limit.
+
+**Predicted effect.** A BF16 transposed copy of a `(3, rows)` source into a
+`(rows, 3)` destination should fail for `rows = 4_200_000`
+(`ceildiv(4200000, 64) = 65625 > 65535`) and succeed for `rows = 4_194_240`
+(exactly 65535).
+
+**Measured effect.** Confirmed with a standalone launcher calling `_copy_strided`
+directly, built against the pre-fix source and against the fix, two seconds each:
+
+| source | rows | y blocks | result |
+|---|---:|---:|---|
+| pre-fix (859d036) | 4 200 000 | 65 625 | **`HIP call failed: hipErrorInvalidValue`** |
+| post-fix | 4 200 000 | 65 625 | launch OK |
+
+Through PyTorch the same shapes now round-trip correctly:
+`rows = 4_194_240` (65535 blocks), `4_200_000` (65625) and `5_000_000` (78125)
+all match a CPU reference exactly.
+
+**Decision.** Accept and fix. The kernel now grid-strides its row tiles and the
+launch clamps the y dimension to 65535. The trip count depends only on
+`block_idx.y`, `grid_dim.y` and `rows`, so it is uniform across the block and
+both barriers stay outside divergent control flow; a second barrier was added
+after the write phase so the next row tile cannot overwrite the LDS tile while a
+lane is still reading it. The nanoGPT training table is unchanged — 257.35 ms,
+ratio 3.592, both gates passing, transpose materialization 11.995 ms against the
+12.03 ms recorded before the change.

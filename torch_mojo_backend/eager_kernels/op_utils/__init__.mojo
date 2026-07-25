@@ -552,6 +552,9 @@ def _t2d_tile[dtype: DType]() -> Int:
 
 comptime _T2D_ROWS = 8
 
+# HIP and CUDA both cap gridDim.y at 65535.
+comptime _MAX_GRID_Y = 65535
+
 
 def _transpose2d_kernel[
     dtype: DType
@@ -572,27 +575,40 @@ def _transpose2d_kernel[
     var tx = tid % TILE
     var ty = tid // TILE
     var c0 = Int(block_idx.x) * TILE
+    # Row tiles are grid-strided rather than one-to-one with block_idx.y, so
+    # the launch can clamp the y dimension: gridDim.y is capped at 65535 on
+    # both HIP and CUDA, and rows / TILE crosses that at 1.05M rows for 8-byte
+    # elements. The generic kernel this fast path replaces was already clamped,
+    # so without the stride a tall-thin transpose would fail to launch where it
+    # previously worked. The trip count depends only on block_idx.y, grid_dim.y
+    # and rows, so it is uniform across the block and the barriers below stay
+    # outside divergent control flow.
+    var row_tile_stride = Int(grid_dim.y) * TILE
     var r0 = Int(block_idx.y) * TILE
-
-    # Read src[c0 + y, r0 + tx]: consecutive tx are consecutive addresses.
-    var r = r0 + tx
-    if r < rows:
-        var y = ty
-        while y < TILE:
-            var c = c0 + y
-            if c < cols:
-                tile[y * (TILE + 1) + tx] = src_ptr[c * src_ld + r]
-            y += _T2D_ROWS
-    barrier()
-    # Write dst[r0 + y, c0 + tx]: consecutive tx are consecutive addresses.
-    var c = c0 + tx
-    if c < cols:
-        var y = ty
-        while y < TILE:
-            var row = r0 + y
-            if row < rows:
-                dst_ptr[row * cols + c] = tile[tx * (TILE + 1) + y]
-            y += _T2D_ROWS
+    while r0 < rows:
+        # Read src[c0 + y, r0 + tx]: consecutive tx are consecutive addresses.
+        var r = r0 + tx
+        if r < rows:
+            var y = ty
+            while y < TILE:
+                var c = c0 + y
+                if c < cols:
+                    tile[y * (TILE + 1) + tx] = src_ptr[c * src_ld + r]
+                y += _T2D_ROWS
+        barrier()
+        # Write dst[r0 + y, c0 + tx]: consecutive tx are consecutive addresses.
+        var c = c0 + tx
+        if c < cols:
+            var y = ty
+            while y < TILE:
+                var row = r0 + y
+                if row < rows:
+                    dst_ptr[row * cols + c] = tile[tx * (TILE + 1) + y]
+                y += _T2D_ROWS
+        # Every lane must finish reading the LDS tile before the next row tile
+        # overwrites it.
+        barrier()
+        r0 += row_tile_stride
 
 
 @always_inline
@@ -663,7 +679,9 @@ def _copy_strided[
                     ctx,
                     String(t"transpose2d_{dtype}"),
                     ceildiv(cols, TILE),
-                    ceildiv(rows, TILE),
+                    # gridDim.y is capped at 65535; the kernel grid-strides its
+                    # row tiles, so clamping here only costs extra iterations.
+                    min(ceildiv(rows, TILE), _MAX_GRID_Y),
                     1,
                     TILE * _T2D_ROWS,
                     dst_ptr.as_unsafe_any_origin(),
