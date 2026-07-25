@@ -32,7 +32,7 @@ from std.math import ceildiv
 from std.time import perf_counter_ns
 
 from internal_utils import arg_parse
-from matmul_ops import _gemm_dtype_dispatch
+from matmul_ops import _amd_batched_mfma_gemm, _gemm_dtype_dispatch
 
 comptime FILL_BLOCK = 256
 comptime FILL_VEC = 4
@@ -337,11 +337,152 @@ def _bf16_round(value: Int) -> Float32:
     return Float32(Int(magnitude + 0.5)) * scale
 
 
+@always_inline
+def _explicit_batched[
+    transpose_b: Bool
+](
+    config: Int,
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    batch: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Candidate batched-MFMA geometries, selected by `--config`.
+
+    Benchmark-only: production dispatch (`--config=0`) picks a geometry from the
+    runtime shape.  Every extent stays runtime here too; only the tile is
+    compile-time.  Transposed-B geometries one MMA wide in a dimension are
+    miscompiled on gfx942 (journal Change 10), so they are only instantiated for
+    `transpose_b=False`.
+    """
+    comptime DT = DType.bfloat16
+    var bs = m * k
+    if config == 1:
+        _amd_batched_mfma_gemm[DT, 128, 128, 32, 64, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 2:
+        _amd_batched_mfma_gemm[DT, 64, 128, 32, 64, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 3:
+        _amd_batched_mfma_gemm[DT, 128, 64, 32, 32, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 4:
+        _amd_batched_mfma_gemm[DT, 64, 64, 32, 32, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 5:
+        _amd_batched_mfma_gemm[DT, 64, 256, 32, 64, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 6:
+        _amd_batched_mfma_gemm[DT, 128, 128, 64, 64, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 7:
+        _amd_batched_mfma_gemm[DT, 64, 128, 32, 32, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 8:
+        _amd_batched_mfma_gemm[DT, 32, 128, 32, 64, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 9:
+        _amd_batched_mfma_gemm[DT, 128, 128, 32, 64, transpose_b, 32, 1, 3](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 10:
+        _amd_batched_mfma_gemm[DT, 64, 64, 32, 32, transpose_b, 32, 1, 3](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 11:
+        _amd_batched_mfma_gemm[DT, 128, 128, 32, 64, transpose_b, 64](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 12:
+        _amd_batched_mfma_gemm[DT, 64, 128, 32, 64, transpose_b, 64](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 13:
+        _amd_batched_mfma_gemm[DT, 256, 128, 64, 64, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 14:
+        _amd_batched_mfma_gemm[DT, 128, 256, 64, 64, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 15:
+        _amd_batched_mfma_gemm[DT, 32, 64, 32, 32, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 16:
+        _amd_batched_mfma_gemm[DT, 64, 32, 32, 32, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 17:
+        _amd_batched_mfma_gemm[DT, 32, 32, 32, 32, transpose_b, 32, 2](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 18:
+        _amd_batched_mfma_gemm[DT, 256, 64, 64, 32, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 23:
+        _amd_batched_mfma_gemm[DT, 128, 256, 32, 64, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 24:
+        _amd_batched_mfma_gemm[DT, 256, 128, 32, 64, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 25:
+        _amd_batched_mfma_gemm[DT, 128, 128, 32, 32, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 26:
+        _amd_batched_mfma_gemm[DT, 64, 64, 32, 32, transpose_b, 64](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    elif config == 27:
+        _amd_batched_mfma_gemm[DT, 128, 64, 32, 64, transpose_b](
+            c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+        )
+    else:
+        comptime if transpose_b:
+            raise Error("config not available for transpose_b=True")
+        else:
+            if config == 19:
+                _amd_batched_mfma_gemm[DT, 128, 64, 32, 16, transpose_b](
+                    c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+                )
+            elif config == 20:
+                _amd_batched_mfma_gemm[DT, 64, 64, 16, 32, transpose_b](
+                    c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+                )
+            elif config == 21:
+                _amd_batched_mfma_gemm[DT, 32, 64, 16, 32, transpose_b](
+                    c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+                )
+            elif config == 22:
+                _amd_batched_mfma_gemm[DT, 64, 128, 16, 64, transpose_b](
+                    c_addr, a_addr, b_addr, batch, m, n, k, bs, ctx
+                )
+            else:
+                raise Error("unknown --config")
+
+
 def run_case(
     target: BmmCase,
     warmup: Int,
     iterations: Int,
     pattern_check: Bool,
+    config: Int,
     ctx: DeviceContext,
 ) raises -> CaseResult:
     var batch = target.batch
@@ -373,24 +514,49 @@ def run_case(
     @always_inline
     @parameter
     def _launch() raises:
-        # The exact production route: _bmm_go builds these arguments from the
-        # Python-side pointers and calls this function.
-        _gemm_dtype_dispatch(
-            DType.bfloat16,
-            Int(c_buf.unsafe_ptr()),
-            Int(a_buf.unsafe_ptr()),
-            Int(b_buf.unsafe_ptr()),
-            batch,
-            m,
-            n,
-            k,
-            m * k,
-            1 if target.transpose_b else 0,
-            0,
-            0,
-            0,
-            ctx,
-        )
+        if config == 0:
+            # The exact production route: _bmm_go builds these arguments from
+            # the Python-side pointers and calls this function.
+            _gemm_dtype_dispatch(
+                DType.bfloat16,
+                Int(c_buf.unsafe_ptr()),
+                Int(a_buf.unsafe_ptr()),
+                Int(b_buf.unsafe_ptr()),
+                batch,
+                m,
+                n,
+                k,
+                m * k,
+                1 if target.transpose_b else 0,
+                0,
+                0,
+                0,
+                ctx,
+            )
+        elif target.transpose_b:
+            _explicit_batched[True](
+                config,
+                Int(c_buf.unsafe_ptr()),
+                Int(a_buf.unsafe_ptr()),
+                Int(b_buf.unsafe_ptr()),
+                batch,
+                m,
+                n,
+                k,
+                ctx,
+            )
+        else:
+            _explicit_batched[False](
+                config,
+                Int(c_buf.unsafe_ptr()),
+                Int(a_buf.unsafe_ptr()),
+                Int(b_buf.unsafe_ptr()),
+                batch,
+                m,
+                n,
+                k,
+                ctx,
+            )
 
     for _ in range(warmup):
         _launch()
@@ -469,6 +635,7 @@ def main() raises:
     var warmup = Int(arg_parse("warmup", 25))
     var iterations = Int(arg_parse("iterations", 100))
     var pattern_check = Int(arg_parse("pattern-check", 0)) != 0
+    var config = Int(arg_parse("config", 0))
     if warmup < 25 or iterations < 100:
         raise Error("protocol requires >=25 warmups and >=100 iterations")
 
@@ -485,7 +652,7 @@ def main() raises:
             if only != "all" and target.label != only:
                 continue
             var result = run_case(
-                target, warmup, iterations, pattern_check, ctx
+                target, warmup, iterations, pattern_check, config, ctx
             )
             mojo_step_us += result.median_us * Float64(target.calls_per_step)
             rocm_step_us += target.rocm_us * Float64(target.calls_per_step)

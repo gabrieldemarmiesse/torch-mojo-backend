@@ -1125,6 +1125,203 @@ def _amd_dynamic_mfma_gemm[
         )
 
 
+# ---------------------------------------------------------------------------
+# Batched MI300X MFMA GEMM.
+#
+# `multistage_gemm_kernel` derives its output-tile coordinates from block_idx.x
+# and block_idx.y only, so block_idx.z is free to carry the batch index: a thin
+# wrapper offsets the three operand pointers by their runtime batch strides and
+# calls the same core.  That is exactly how MAX's own `batched_matmul_kernel_gpu`
+# batches it (`max/kernels/src/linalg/bmm.mojo`, the `is_nvidia_gpu()` branch);
+# the AMD branch there routes to `AMDMatmul`, which needs static N/K and is
+# therefore unreachable from an eager backend holding runtime extents.
+#
+# Every extent, stride and batch stride stays a runtime value; only the tile
+# geometry is compile-time, exactly as in the unbatched dispatch above.
+# ---------------------------------------------------------------------------
+
+
+@__name(t"amd_batched_mfma_{dtype}_tb{transpose_b}_{BM}x{BN}x{BLOCK_K}")
+def _amd_batched_mfma_kernel[
+    dtype: DType,
+    transpose_b: Bool,
+    BM: Int,
+    BN: Int,
+    BLOCK_K: Int,
+    config: MatmulConfig[dtype, dtype, dtype, transpose_b],
+](
+    c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    c_bstride: Int,
+    a_bstride: Int,
+    b_bstride: Int,
+):
+    """One batch element per block_idx.z, sharing the 2-D multistage core."""
+    var z = Int(block_idx.z)
+    var c_ptr = c_base + z * c_bstride
+    var c = TileTensor(c_ptr, row_major(Coord(m, n)))
+    var a = TileTensor(a_base + z * a_bstride, row_major(Coord(m, k)))
+    var b = TileTensor(
+        b_base + z * b_bstride,
+        row_major(Coord(n, k)) if transpose_b else row_major(Coord(k, n)),
+    )
+
+    # The core's epilogue path already guards `row < m and col < n` before it
+    # calls this, and the launch only covers whole BN column tiles, so no
+    # further bound check is needed here.  It exists at all because the core's
+    # own store path assumes an NVIDIA staging layout for half-float output.
+    @always_inline
+    @parameter
+    def _store[
+        value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
+    ](coords: IndexList[2], value: SIMD[value_dtype, width]):
+        c_ptr.store[width=width, alignment=size_of[dtype]()](
+            Int(coords[0]) * n + Int(coords[1]), value.cast[dtype]()
+        )
+
+    multistage_gemm_kernel[
+        config=config,
+        elementwise_lambda_fn=Optional[elementwise_epilogue_type](_store),
+    ](c, a, b)
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(256))
+)
+@__name(t"amd_batched_mfma_edge_{dtype}_tb{transpose_b}")
+def _amd_batched_mfma_edge_kernel[
+    dtype: DType, transpose_b: Bool
+](
+    c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    c_bstride: Int,
+    a_bstride: Int,
+    b_bstride: Int,
+    col_start: Int,
+    col_count: Int,
+):
+    """Scalar cleanup for the trailing N columns of every batch element."""
+    var idx = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    if idx >= m * col_count:
+        return
+    var z = Int(block_idx.y)
+    var row = idx // col_count
+    var col = col_start + idx % col_count
+    var a = a_base + z * a_bstride
+    var b = b_base + z * b_bstride
+    var acc = Scalar[DType.float32](0)
+    for kk in range(k):
+        var bv = b[col * k + kk] if transpose_b else b[kk * n + col]
+        acc = (
+            a[row * k + kk]
+            .cast[DType.float32]()
+            .fma(bv.cast[DType.float32](), acc)
+        )
+    (c_base + z * c_bstride)[row * n + col] = acc.cast[dtype]()
+
+
+@always_inline
+def _amd_batched_mfma_gemm[
+    dtype: DType,
+    BM: Int,
+    BN: Int,
+    WM: Int,
+    WN: Int,
+    transpose_b: Bool,
+    BLOCK_K: Int = 32,
+    WARP_K_PARTITIONS: Int = 1,
+    STAGES: Int = 2,
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    batch: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    a_bstride: Int,
+    ctx: DeviceContext,
+) raises:
+    # Same gfx942 transposed-B geometry preconditions as the unbatched route;
+    # see `_amd_dynamic_mfma_gemm` and optimization_journal.md "Change 10".
+    comptime MMA_DIM = get_mma_shape[dtype, DType.float32]()[0]
+    comptime if transpose_b:
+        comptime assert WM >= 2 * MMA_DIM and WN >= 2 * MMA_DIM, (
+            "transposed-B multistage geometries with a single-MMA warp tile are"
+            " miscompiled on gfx942; use WM, WN >= 2 * mma_dim"
+        )
+        comptime B_COPY_ROWS = min(
+            (BM // WM) * (BN // WN) * WARP_K_PARTITIONS * 64,
+            BN * BLOCK_K // simd_width_of[dtype](),
+        ) * simd_width_of[dtype]() // BLOCK_K
+        comptime assert (
+            BN % B_COPY_ROWS == 0
+        ), "transposed-B tile copy row count must divide BN"
+
+    comptime config = MatmulConfig[dtype, dtype, dtype, transpose_b](
+        block_tile_shape=Index(BM, BN, BLOCK_K),
+        warp_tile_shape=Index(WM, WN, BLOCK_K),
+        mma_shape=get_mma_shape[dtype, DType.float32](),
+        num_pipeline_stages=STAGES,
+        num_warp_k_partitions=WARP_K_PARTITIONS,
+    )
+    var c_ptr = _make_ptr[dtype](c_addr).as_unsafe_any_origin()
+    var a_ptr = _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_immutable()
+    var b_ptr = _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_immutable()
+    var n_full = (n // BN) * BN
+    if n_full > 0:
+        ctx.enqueue_function[
+            _amd_batched_mfma_kernel[
+                dtype, transpose_b, BM, BN, BLOCK_K, config
+            ]
+        ](
+            c_ptr,
+            a_ptr,
+            b_ptr,
+            m,
+            n,
+            k,
+            m * n,
+            a_bstride,
+            n * k,
+            grid_dim=(n_full // BN, ceildiv(m, BM), batch),
+            block_dim=config.block_dim(),
+            shared_mem_bytes=config.shared_mem_usage(),
+            func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+                UInt32(config.shared_mem_usage())
+            ),
+        )
+    if n_full < n:
+        var col_count = n - n_full
+        _enqueue_cached[_amd_batched_mfma_edge_kernel[dtype, transpose_b]](
+            ctx,
+            String(t"amd_batched_mfma_edge_{dtype}_tb{transpose_b}"),
+            ceildiv(m * col_count, 256),
+            batch,
+            1,
+            256,
+            c_ptr,
+            a_ptr,
+            b_ptr,
+            m,
+            n,
+            k,
+            m * n,
+            a_bstride,
+            n * k,
+            n_full,
+            col_count,
+        )
+
+
 @always_inline
 def _amd_bf16_large_m[
     dtype: DType, transpose_b: Bool, fuse_bias: Bool
@@ -1196,7 +1393,38 @@ def _amd_dynamic_mfma_dispatch[
 ) raises -> Bool:
     # The cutoffs describe reusable workload regimes. All tensor dimensions
     # stay runtime-dynamic inside every selected kernel.
-    if batch != 1 or a_bstride == 0 or m < 64 or k % 32 != 0:
+    if a_bstride == 0 or k % 32 != 0:
+        return False
+    if batch != 1:
+        # Batched: block_idx.z carries the batch index (see
+        # `_amd_batched_mfma_gemm`).  The batch alone gives the grid several
+        # workgroups per CU at any useful tile, so the tile is chosen from the
+        # operand shape rather than from grid fill -- unlike the unbatched
+        # large-m regime below.  A tile wider than N would leave every column
+        # to the scalar cleanup kernel, so BN never exceeds N.
+        comptime if fuse_bias:
+            return False
+        else:
+            if m < 64 or n < 64:
+                return False
+            if m >= 128 and n >= 128:
+                _amd_batched_mfma_gemm[dtype, 128, 128, 32, 64, transpose_b](
+                    c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx
+                )
+            elif m >= 128:
+                _amd_batched_mfma_gemm[dtype, 128, 64, 32, 64, transpose_b](
+                    c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx
+                )
+            elif n >= 128:
+                _amd_batched_mfma_gemm[dtype, 64, 128, 32, 64, transpose_b](
+                    c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx
+                )
+            else:
+                _amd_batched_mfma_gemm[dtype, 64, 64, 32, 32, transpose_b](
+                    c_addr, a_addr, b_addr, batch, m, n, k, a_bstride, ctx
+                )
+            return True
+    if m < 64:
         return False
     comptime if dtype == DType.bfloat16:
         # A K-dominant shape has few output columns per row block, so the
