@@ -6024,7 +6024,7 @@ def test_sdpa_fused_backward_host_bridge_abi(mojo_gpu, monkeypatch):
     monkeypatch.setattr(
         eager_kernels,
         "sdpa_backward_ops",
-        SimpleNamespace(SDPADropoutSoftmaxBackwardF32=lambda *args: calls.append(args)),
+        SimpleNamespace(SDPADropoutSoftmaxBackward=lambda *args: calls.append(args)),
         raising=False,
     )
 
@@ -6037,8 +6037,9 @@ def test_sdpa_fused_backward_host_bridge_abi(mojo_gpu, monkeypatch):
     assert len(calls) == 1
     args = calls[0]
     assert args[:4] == (out._ptr, probabilities._ptr, grad._ptr, mask._ptr)
-    assert args[4:9] == (6, 5, 1, 1.25, -0.5)
-    assert args[9] == aten_fast._ctx_ptr(probabilities._device)
+    assert args[4:11] == (6, 5, 0, 1, 0, 1.25, -0.5)
+    assert args[11] == probabilities._dtype.value
+    assert args[12] == aten_fast._ctx_ptr(probabilities._device)
 
 
 def test_sdpa_fused_backward_materializes_strided_operands(mojo_gpu, monkeypatch):
@@ -6058,7 +6059,7 @@ def test_sdpa_fused_backward_materializes_strided_operands(mojo_gpu, monkeypatch
     monkeypatch.setattr(
         eager_kernels,
         "sdpa_backward_ops",
-        SimpleNamespace(SDPADropoutSoftmaxBackwardF32=lambda *args: calls.append(args)),
+        SimpleNamespace(SDPADropoutSoftmaxBackward=lambda *args: calls.append(args)),
         raising=False,
     )
 
@@ -6072,8 +6073,9 @@ def test_sdpa_fused_backward_materializes_strided_operands(mojo_gpu, monkeypatch
     assert len(calls) == 1
     args = calls[0]
     assert all(actual != original for actual, original in zip(args[1:4], original_ptrs))
-    assert args[4:9] == (10, 3, 1, 1.25, 0.125)
-    assert args[9] == aten_fast._ctx_ptr(probabilities._device)
+    assert args[4:11] == (10, 3, 0, 1, 0, 1.25, 0.125)
+    assert args[11] == probabilities._dtype.value
+    assert args[12] == aten_fast._ctx_ptr(probabilities._device)
 
 
 def test_sdpa_fused_backward_no_mask_ignores_dropout_scale(mojo_gpu, monkeypatch):
@@ -6084,7 +6086,7 @@ def test_sdpa_fused_backward_no_mask_ignores_dropout_scale(mojo_gpu, monkeypatch
     monkeypatch.setattr(
         eager_kernels,
         "sdpa_backward_ops",
-        SimpleNamespace(SDPADropoutSoftmaxBackwardF32=lambda *args: calls.append(args)),
+        SimpleNamespace(SDPADropoutSoftmaxBackward=lambda *args: calls.append(args)),
         raising=False,
     )
     probabilities = torch.randn(3, 7).to(mojo_gpu)
@@ -6096,7 +6098,7 @@ def test_sdpa_fused_backward_no_mask_ignores_dropout_scale(mojo_gpu, monkeypatch
 
     assert out is not aten_fast.NOT_HANDLED
     assert len(calls) == 1
-    assert calls[0][3:9] == (0, 3, 7, 0, 1.0, 0.0)
+    assert calls[0][3:11] == (0, 3, 7, 0, 0, 0, 1.0, 0.0)
 
 
 def test_sdpa_fused_backward_empty_skips_bridge(mojo_gpu, monkeypatch):
@@ -6107,7 +6109,7 @@ def test_sdpa_fused_backward_empty_skips_bridge(mojo_gpu, monkeypatch):
     monkeypatch.setattr(
         eager_kernels,
         "sdpa_backward_ops",
-        SimpleNamespace(SDPADropoutSoftmaxBackwardF32=lambda *args: calls.append(args)),
+        SimpleNamespace(SDPADropoutSoftmaxBackward=lambda *args: calls.append(args)),
         raising=False,
     )
     probabilities = torch.empty(2, 0).to(mojo_gpu)

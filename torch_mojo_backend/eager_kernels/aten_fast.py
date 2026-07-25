@@ -4367,14 +4367,25 @@ def fast_aten__scaled_dot_product_efficient_attention(
 
 
 def fast_sdpa_dropout_softmax_backward(
-    probabilities, grad_after_dropout, dropout_mask, dropout_scale, score_scale
-):
+    probabilities: object,
+    grad_after_dropout: object,
+    dropout_mask: object,
+    dropout_scale: object,
+    score_scale: object,
+    is_causal: bool = False,
+    query_length: int = 0,
+) -> object:
     """Fuse SDPA dropout backward, softmax backward, and score scaling.
 
     The helper owns public-tensor validation, ordinary output allocation, and
     the pointer-only bridge call.  Its device-kernel body remains isolated in
     the Fable-owned module.  Unsupported inputs return ``NOT_HANDLED`` before
     any operand is materialized or output is allocated.
+
+    ``is_causal`` lets the kernel skip the fully masked half of every row: the
+    forward softmax makes ``P`` exactly zero there, so ``dScores`` is exactly
+    zero and is written as such.  ``query_length`` is the row period of the
+    top-left-aligned mask (rows are ``batch * heads * query_length``).
     """
     probs = _t(probabilities)
     grad = _t(grad_after_dropout)
@@ -4384,14 +4395,21 @@ def fast_sdpa_dropout_softmax_backward(
         or grad is None
         or (dropout_mask is not None and mask is None)
         or not _on_gpu(probs)
-        or probs._dtype != DType.float32
-        or grad._dtype != DType.float32
+        or probs._dtype not in _FLOAT_DTYPES
+        or grad._dtype != probs._dtype
         or probs._device != grad._device
         or tuple(probs._shape) != tuple(grad._shape)
         or len(probs._shape) < 1
         or not isinstance(score_scale, int | float)
         or isinstance(score_scale, bool)
         or not math.isfinite(float(score_scale))
+    ):
+        return NOT_HANDLED
+    if is_causal and (
+        not isinstance(query_length, int)
+        or isinstance(query_length, bool)
+        or query_length <= 0
+        or math.prod(probs._shape[:-1]) % query_length != 0
     ):
         return NOT_HANDLED
 
@@ -4414,7 +4432,7 @@ def fast_sdpa_dropout_softmax_backward(
         return NOT_HANDLED
     try:
         sdpa_backward_ops = eager_kernels.sdpa_backward_ops
-        fused_backward = sdpa_backward_ops.SDPADropoutSoftmaxBackwardF32
+        fused_backward = sdpa_backward_ops.SDPADropoutSoftmaxBackward
     except (AttributeError, ImportError):
         return NOT_HANDLED
 
@@ -4428,7 +4446,7 @@ def fast_sdpa_dropout_softmax_backward(
     grad = _tc(grad)
     if has_mask:
         mask = _tc(mask)
-    out = _alloc(probs._shape, DType.float32, probs._device)
+    out = _alloc(probs._shape, probs._dtype, probs._device)
     if out._numel == 0:
         return out
 
@@ -4441,9 +4459,12 @@ def fast_sdpa_dropout_softmax_backward(
         mask._ptr if has_mask else 0,
         rows,
         cols,
+        int(query_length) if is_causal else 0,
         int(has_mask),
+        int(bool(is_causal)),
         bridge_dropout_scale,
         bridge_score_scale,
+        probs._dtype.value,
         _ctx_ptr(probs._device),
     )
     return out

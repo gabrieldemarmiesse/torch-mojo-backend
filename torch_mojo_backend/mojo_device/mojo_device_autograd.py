@@ -246,6 +246,7 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
         ctx.scale = (
             float(scale) if scale is not None else 1.0 / math.sqrt(query._shape[-1])
         )
+        ctx.is_causal = bool(is_causal)
         ctx.has_dropout = dropout_mask is not None
         ctx.dropout_scale = (
             (0.0 if float(dropout_p) == 1.0 else 1.0 / (1.0 - float(dropout_p)))
@@ -331,6 +332,8 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
                 mask3 if ctx.has_dropout else None,
                 ctx.dropout_scale,
                 ctx.scale,
+                ctx.is_causal,
+                query_length,
             )
             if grad_scores is aten_fast.NOT_HANDLED:
                 # Keep the pre-fusion composition as the exact compatibility

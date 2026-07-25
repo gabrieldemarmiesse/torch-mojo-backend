@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Thin eager-mode bridge for fused FP32 SDPA dropout/softmax backward.
+# Thin eager-mode bridge for fused SDPA dropout/softmax backward.
 #
 # Device-kernel bodies live in the Fable-owned internal module imported below.
 # This Python-visible module only validates and unpacks the pointer ABI, builds
@@ -13,11 +13,13 @@ from std.python.bindings import PythonModuleBuilder
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from sdpa_dropout_softmax_backward_kernels import (
-    enqueue_sdpa_dropout_softmax_backward_f32,
+    enqueue_sdpa_dropout_softmax_backward,
 )
 from op_utils import (
+    FLOAT_DTYPES,
     _make_ptr,
     _raw_ctx,
+    _raw_dtype_int,
     _raw_f64,
     _raw_int,
     _raw_ret_none,
@@ -32,49 +34,70 @@ def _sdpa_dropout_softmax_backward_go(
     mask_ptr_obj: PyObjectPtr,
     rows_obj: PyObjectPtr,
     cols_obj: PyObjectPtr,
+    q_len_obj: PyObjectPtr,
     has_mask_obj: PyObjectPtr,
+    causal_obj: PyObjectPtr,
     dropout_scale_obj: PyObjectPtr,
     score_scale_obj: PyObjectPtr,
+    dtype_obj: PyObjectPtr,
     device_context_ptr: PyObjectPtr,
 ) raises:
-    var output = _make_ptr[DType.float32](
-        _raw_int(output_ptr_obj)
-    ).as_unsafe_any_origin()
-    var probabilities = _make_ptr[DType.float32](
-        _raw_int(probabilities_ptr_obj)
-    ).as_unsafe_any_origin()
-    var grad_after_dropout = _make_ptr[DType.float32](
-        _raw_int(grad_after_dropout_ptr_obj)
-    ).as_unsafe_any_origin()
+    var dtype = _raw_dtype_int(dtype_obj)
+    var output_address = _raw_int(output_ptr_obj)
+    var probabilities_address = _raw_int(probabilities_ptr_obj)
+    var grad_address = _raw_int(grad_after_dropout_ptr_obj)
     var mask_address = _raw_int(mask_ptr_obj)
     var has_mask = _raw_int(has_mask_obj) != 0
-    var mask: Optional[UnsafePointer[Scalar[DType.bool], MutAnyOrigin]] = None
     if has_mask:
         if mask_address == 0:
             raise Error(
-                "SDPADropoutSoftmaxBackwardF32 requires a non-null mask when"
+                "SDPADropoutSoftmaxBackward requires a non-null mask when"
                 " has_mask is true"
             )
-        mask = _make_ptr[DType.bool](mask_address).as_unsafe_any_origin()
     elif mask_address != 0:
         raise Error(
-            "SDPADropoutSoftmaxBackwardF32 requires a null mask when"
-            " has_mask is false"
+            "SDPADropoutSoftmaxBackward requires a null mask when has_mask is"
+            " false"
         )
 
+    var rows = _raw_int(rows_obj)
+    var cols = _raw_int(cols_obj)
+    var q_len = _raw_int(q_len_obj)
+    var causal = _raw_int(causal_obj) != 0
+    var dropout_scale = _raw_f64(dropout_scale_obj)
+    var score_scale = _raw_f64(score_scale_obj)
     var ctx = _raw_ctx(device_context_ptr)
-    enqueue_sdpa_dropout_softmax_backward_f32(
-        output,
-        probabilities,
-        grad_after_dropout,
-        mask,
-        _raw_int(rows_obj),
-        _raw_int(cols_obj),
-        has_mask,
-        _raw_f64(dropout_scale_obj),
-        _raw_f64(score_scale_obj),
-        ctx,
-    )
+
+    var handled = False
+    comptime for dt in FLOAT_DTYPES:
+        if dtype == dt:
+            var mask: Optional[
+                UnsafePointer[Scalar[DType.bool], MutAnyOrigin]
+            ] = None
+            if has_mask:
+                mask = _make_ptr[DType.bool](
+                    mask_address
+                ).as_unsafe_any_origin()
+            enqueue_sdpa_dropout_softmax_backward[dt](
+                _make_ptr[dt](output_address).as_unsafe_any_origin(),
+                _make_ptr[dt](probabilities_address).as_unsafe_any_origin(),
+                _make_ptr[dt](grad_address).as_unsafe_any_origin(),
+                mask,
+                rows,
+                cols,
+                q_len,
+                has_mask,
+                causal,
+                dropout_scale,
+                score_scale,
+                ctx,
+            )
+            handled = True
+    if not handled:
+        raise Error(
+            "unsupported dtype for fused SDPA softmax backward: "
+            + String(dtype)
+        )
 
 
 def _sdpa_dropout_softmax_backward_dispatcher(
@@ -84,9 +107,9 @@ def _sdpa_dropout_softmax_backward_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs != 10:
+        if nargs != 13:
             raise Error(
-                "SDPADropoutSoftmaxBackwardF32 expects exactly 10 arguments"
+                "SDPADropoutSoftmaxBackward expects exactly 13 arguments"
             )
         _sdpa_dropout_softmax_backward_go(
             args[0],
@@ -99,6 +122,9 @@ def _sdpa_dropout_softmax_backward_dispatcher(
             args[7],
             args[8],
             args[9],
+            args[10],
+            args[11],
+            args[12],
         )
         return _raw_ret_none()
     except e:
@@ -111,12 +137,12 @@ def PyInit_sdpa_backward_ops() abi("C") -> PythonObject:
         var b = PythonModuleBuilder("sdpa_backward_ops")
         b.def_py_c_function(
             _sdpa_dropout_softmax_backward_dispatcher,
-            "SDPADropoutSoftmaxBackwardF32",
+            "SDPADropoutSoftmaxBackward",
             docstring=(
                 "(output_ptr, probabilities_ptr, grad_after_dropout_ptr,"
-                " mask_ptr_or_zero, rows, cols, has_mask, dropout_scale,"
-                " score_scale, context_ptr); fused FP32 SDPA dropout and"
-                " softmax backward"
+                " mask_ptr_or_zero, rows, cols, q_len, has_mask, causal,"
+                " dropout_scale, score_scale, dtype, context_ptr); fused SDPA"
+                " dropout and softmax backward, float32/bfloat16/float16"
             ),
         )
         return b.finalize()

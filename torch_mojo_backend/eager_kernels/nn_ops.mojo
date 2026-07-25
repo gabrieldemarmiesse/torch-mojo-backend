@@ -20,12 +20,17 @@
 from std.os import abort
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
+    WARP_SIZE,
     barrier,
     block_idx,
+    grid_dim,
+    lane_id,
     thread_idx,
+    warp_id,
 )
 from std.gpu.host import DeviceContext
-from std.math import sqrt, exp, floor
+from std.gpu.primitives import warp
+from std.math import ceildiv, sqrt, exp, floor
 from std.memory import alloc, stack_allocation
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
@@ -409,6 +414,151 @@ def _layer_norm_go(
 # ---------------------------------------------------------------------------
 
 
+# One warp per row, so a causal row's shorter extent costs proportionally less
+# and the hardware balances the very uneven per-row work across blocks.
+comptime _SM_WARPS_PER_BLOCK = 8 if WARP_SIZE <= 32 else 4
+comptime _SM_BLOCK = _SM_WARPS_PER_BLOCK * WARP_SIZE
+comptime _SM_MAX_GRID = 1 << 20
+comptime _SM_VECTOR_BYTES = 16
+
+
+@always_inline
+def _softmax_warp_rows[
+    dtype: DType, causal: Bool, VEC: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    scale: Float32,
+    q_len: Int,
+):
+    """Row softmax with the causal mask folded into the row extent.
+
+    A causal row's masked columns are fed `-inf` by the reference kernel and
+    come out exactly zero, so the extent `min(cols, query + 1)` carries all the
+    information: this kernel reads only that prefix and writes the zeros
+    directly.  The reduction is an online single-read max+sum in float32; the
+    store pass re-reads the row from L1/L2.
+    """
+    comptime F32 = DType.float32
+    comptime ALIGN = VEC * size_of[dtype]()
+    var lane = Int(lane_id())
+    var row = Int(block_idx.x) * _SM_WARPS_PER_BLOCK + Int(warp_id())
+    var row_stride = Int(grid_dim.x) * _SM_WARPS_PER_BLOCK
+
+    while row < rows:
+        var limit = cols
+        comptime if causal:
+            limit = min(cols, row % q_len + 1)
+        var base = row * cols
+        var vec_limit = (limit // VEC) * VEC
+
+        # Pass 1: online max and sum over the live prefix.
+        var run_max = SIMD[F32, VEC](Float32.MIN)
+        var run_sum = SIMD[F32, VEC](0.0)
+        var col = lane * VEC
+        while col < vec_limit:
+            var x = (
+                in_ptr.load[width=VEC, alignment=ALIGN](base + col).cast[F32]()
+                * scale
+            )
+            var new_max = max(run_max, x)
+            run_sum = run_sum * exp(run_max - new_max) + exp(x - new_max)
+            run_max = new_max
+            col += WARP_SIZE * VEC
+        # Ragged remainder: fewer than VEC columns, at most one per lane.
+        var tail = vec_limit + lane
+        var tail_max = Float32.MIN
+        var tail_sum = Float32(0.0)
+        if tail < limit:
+            tail_max = in_ptr[base + tail].cast[F32]() * scale
+            tail_sum = 1.0
+
+        # Lane-local then warp-wide combination of the (max, sum) pairs.
+        var lane_max = max(run_max.reduce_max(), tail_max)
+        var lane_sum = (run_sum * exp(run_max - lane_max)).reduce_add() + (
+            tail_sum * exp(tail_max - lane_max)
+        )
+        # The row bound is warp-uniform, so every lane reaches the shuffles.
+        var row_max = warp.max(lane_max)
+        var inv = 1.0 / warp.sum(lane_sum * exp(lane_max - row_max))
+
+        # Pass 2: the probabilities.  The row is L1/L2-resident from pass 1.
+        col = lane * VEC
+        while col < vec_limit:
+            var x = (
+                in_ptr.load[width=VEC, alignment=ALIGN](base + col).cast[F32]()
+                * scale
+            )
+            out_ptr.store[width=VEC, alignment=ALIGN](
+                base + col, (exp(x - row_max) * inv).cast[dtype]()
+            )
+            col += WARP_SIZE * VEC
+        if tail < limit:
+            out_ptr[base + tail] = (
+                exp(in_ptr[base + tail].cast[F32]() * scale - row_max) * inv
+            ).cast[dtype]()
+
+        comptime if causal:
+            var zero_head = min(cols, ceildiv(limit, VEC) * VEC)
+            if limit + lane < zero_head:
+                out_ptr[base + limit + lane] = Scalar[dtype](0)
+            col = zero_head + lane * VEC
+            while col + VEC <= cols:
+                out_ptr.store[width=VEC, alignment=ALIGN](
+                    base + col, SIMD[dtype, VEC](Scalar[dtype](0))
+                )
+                col += WARP_SIZE * VEC
+            # `cols` and `zero_head` are both multiples of VEC in the wide
+            # regime; VEC == 1 makes `zero_head == limit`, so nothing is left.
+        row += row_stride
+
+
+@__name(t"softmax_rows_warp_{dtype}_c{causal}_v{VEC}")
+def _softmax_warp_kernel[
+    dtype: DType, causal: Bool, VEC: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    scale: Float32,
+    q_len: Int,
+):
+    _softmax_warp_rows[dtype, causal, VEC](
+        out_ptr, in_ptr, rows, cols, scale, q_len
+    )
+
+
+@always_inline
+def _enqueue_softmax_warp[
+    dtype: DType, causal: Bool, VEC: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    scale: Float32,
+    q_len: Int,
+    ctx: DeviceContext,
+) raises:
+    _enqueue_cached[_softmax_warp_kernel[dtype, causal, VEC]](
+        ctx,
+        String(t"softmax_rows_warp_{dtype}_c{causal}_v{VEC}"),
+        min(ceildiv(rows, _SM_WARPS_PER_BLOCK), _SM_MAX_GRID),
+        1,
+        1,
+        _SM_BLOCK,
+        out_ptr,
+        in_ptr,
+        rows,
+        cols,
+        scale,
+        q_len,
+    )
+
+
 @always_inline
 def _softmax_rows[
     dtype: DType
@@ -455,6 +605,40 @@ def _softmax_rows[
         _parallel_for[func](rows, ctx)
     else:
         comptime if has_accelerator():
+            # Causal regime: half the score matrix is masked and the reference
+            # kernel still reads, exponentiates and writes all of it.  A
+            # warp-per-row kernel whose extent is the live prefix does the same
+            # arithmetic over half the bytes.  Rows must be long enough for a
+            # warp to vectorize and short enough that one warp per row is not
+            # itself the bottleneck; both are runtime comparisons.
+            comptime WIDE = _SM_VECTOR_BYTES // size_of[dtype]()
+            if causal != 0 and cols <= 8192 and rows >= 256:
+                var wide_ok = (
+                    cols % WIDE == 0
+                    and Int(out_ptr) % _SM_VECTOR_BYTES == 0
+                    and Int(in_ptr) % _SM_VECTOR_BYTES == 0
+                )
+                if wide_ok:
+                    _enqueue_softmax_warp[dtype, True, WIDE](
+                        out_ptr.as_unsafe_any_origin(),
+                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        rows,
+                        cols,
+                        scale,
+                        q_len,
+                        ctx,
+                    )
+                else:
+                    _enqueue_softmax_warp[dtype, True, 1](
+                        out_ptr.as_unsafe_any_origin(),
+                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        rows,
+                        cols,
+                        scale,
+                        q_len,
+                        ctx,
+                    )
+                return
 
             @parameter
             @always_inline
