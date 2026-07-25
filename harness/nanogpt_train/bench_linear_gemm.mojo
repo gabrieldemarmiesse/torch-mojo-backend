@@ -302,7 +302,8 @@ def _split_line(line: String) -> List[String]:
 
 
 def read_targets(path: String) raises -> List[GemmCase]:
-    """Parse the ROCm reference CSV written by scripts/rocm_gemm_reference.py."""
+    """Parse the ROCm reference CSV written by scripts/rocm_gemm_reference.py.
+    """
     var text: String
     with open(path, "r") as file:
         text = file.read()
@@ -456,8 +457,10 @@ def run_case(
                 n,
                 " k=",
                 k,
-                ". A declined shape falls back to the portable scalar kernel"
-                " in production, so it must be handled here too.",
+                (
+                    ". A declined shape falls back to the portable scalar"
+                    " kernel in production, so it must be handled here too."
+                ),
             )
 
     @always_inline
@@ -614,8 +617,10 @@ def main() raises:
     var cases = read_targets(targets_path)
     print(
         "case                      role   ",
-        "     m      n      k ta tb   mojo_us    rocm_us  ratio  TFLOP/s"
-        "   copy_us  correct",
+        (
+            "     m      n      k ta tb   mojo_us    rocm_us  ratio  TFLOP/s"
+            "   copy_us  correct"
+        ),
     )
     var mojo_step_us = Float64(0.0)
     var rocm_step_us = Float64(0.0)

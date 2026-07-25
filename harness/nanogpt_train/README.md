@@ -75,50 +75,66 @@ output element via a device-side reduction (no multi-GB host transfer):
 
 Run both. A case that fails either one has no meaningful timing.
 
-## Known defects in the current dispatch (2026-07-24)
+## State of the dispatch (2026-07-25)
 
-`_amd_dynamic_mfma_dispatch` in `matmul_ops.mojo` was tuned for GPT-2 *decode*
-shapes (M around 512). At training shapes (M = 49152) it is both wrong and slow.
+`_amd_dynamic_mfma_dispatch` in `matmul_ops.mojo` was originally tuned for GPT-2
+*decode* shapes (M around 512), and at training shapes (M = 49152) it was both
+wrong and slow. Both are recorded in `optimization_journal.md` under "nanoGPT
+training-step MI300X journal"; the summary of what changed and what did not:
 
-**Four of fifteen GEMMs compute wrong results.** These are silent: nanoGPT still
-trains and reports a plausible loss.
+**The four wrong cases are fixed.** Two unrelated defects:
 
-| case | m | n | k | ta | tb | wrong outputs | selected config |
-|---|---:|---:|---:|:-:|:-:|---:|---|
-| `attn_c_attn_fwd` | 49152 | 2304 | 768 | 0 | 1 | 24.85% | `BM=32 BN=64 WM=16 WN=32 BK=32` |
-| `attn_c_proj_fwd` | 49152 | 768 | 768 | 0 | 1 | 24.83% | same |
-| `mlp_c_fc_fwd` | 49152 | 3072 | 768 | 0 | 1 | 24.85% | same |
-| `lm_head_dgrad` | 49152 | 768 | 50304 | 0 | 0 | 100%, short by exactly 128 of K | `BM=32 BN=32 WM=32 WN=32 BK=32 WARP_K=2` |
+- `attn_c_attn_fwd`, `attn_c_proj_fwd`, `mlp_c_fc_fwd` (about 24.85% of outputs
+  wrong each) hit a code-generation defect in MAX's two-stage
+  `multistage_gemm_kernel` on gfx942 for `transpose_b=True`: one MFMA k-step's
+  contribution is dropped from part of the accumulator, non-deterministically
+  per workgroup. It reproduces at `K == BLOCK_K`, where the K loop performs no
+  global-to-LDS prefetch and no race is possible, and disappears with three or
+  four pipeline stages. `_amd_dynamic_mfma_gemm` now refuses, at compile time,
+  every transposed-B geometry whose warp tile is one MMA wide in some dimension
+  (`WM, WN >= 2 * mma_dim`) plus any whose B-copy row count does not divide BN.
+- `lm_head_dgrad` (100% wrong, "short by exactly 128") was a gate defect, not a
+  kernel defect: K = 50304 is not representable in BF16 and rounds to 50176.
+  See the correctness-gates section above.
 
-The 24.85% figure is close to one quarter, and the failing config has exactly
-four warps per block ((BM/WM) x (BN/WN) = 2 x 2), which points at one warp's
-output. `lm_head_dgrad` being short by exactly 128 = 2 x BK x WARP_K points at a
-K-tail or pipeline-drain bound. Both are hypotheses, not conclusions.
+**Speed: per-step weighted total 506.9 -> 257.4 ms against ROCm's 71.6, ratio
+7.076 -> 3.593.** Mojo now reaches 73-178 TFLOP/s where ROCm reaches 367-612.
+What was done: a runtime-fill-driven macro tile (128x128x32 with an 8-warp
+32x64 decomposition once the output-tile count covers every CU twice),
+materializing B^T for m >= 1024 so the GEMM reads 256-byte global rows, four
+in-workgroup K partitions in the deep-K regime, and a tiled LDS transpose that
+took the strided-operand materialization from 141 to 12 ms/step.
 
-**Every GEMM is far off the ROCm reference**, even the correct ones: Mojo
-reaches 38-149 TFLOP/s where ROCm reaches 367-612 TFLOP/s.
+**The remaining 3.6x is the data movement inside MAX's multistage core**, and it
+is measured rather than guessed. On the best configuration, counters give 2.26
+LDS instructions per MFMA and 4.87 bank-conflict cycles per LDS instruction.
+The reason is in the source: with `transpose_b=False` the B LDS tile is
+`(BK, BN)`, so each MFMA B fragment is four elements strided by BN and
+`_load_b_amd` lowers it to four 2-byte reads -- 32 of the 38 LDS instructions
+per warp per k-tile. The two operand layouts trade the two halves of the
+problem and this kernel cannot have both: `(N,K)` gives k-contiguous LDS (one
+`ds_read_b64` per fragment) but 64-byte global rows, `(K,N)` gives 256-byte
+global rows but the 4x scalar fragment reads. Closing it needs a kernel that
+transposes during the global-to-LDS store, plus a global split-K for the
+weight-gradient shapes, whose 432-workgroup grids leave 0.71 waves per SIMD.
+Neither is expressible around the stock kernel; both are new kernel work.
 
-Two structural leads, both visible in the harness output:
+Two leads that were **closed** rather than taken:
 
-1. **The transposed operand is materialized.** `fast_aten_linear_backward`
-   builds `grad_output.transpose(0, 1)` as a view, and
-   `_matmul_spec_operands_launch` sees a non-contiguous operand and calls
-   `_scratch_contig` -> `_copy_strided`. That copy costs **141 ms/step**, 28% of
-   all Mojo GEMM time, and PyTorch-ROCm pays none of it: Tensile reads the
-   strided view directly. `lm_head_wgrad` alone spends 73 ms of its 98 ms in the
-   copy. `bf16_gemm_tn_v4_kernels.mojo` already exists but is gated to
-   `sm_90a`; the AMD dispatch has no `transpose_a` parameter at all.
-2. **The macro tiles are far smaller than Tensile's.** The AMD dispatch never
-   selects more than `128x128x64`, and picks `32x64x32` or `32x32x32` for most
-   training shapes. For the same GEMMs Tensile selects `MT256x224x64`,
-   `MT256x256x32`, `MT192x256x32`, `MT128x512x32`, `MT512x128x64` with
-   `MI16x16x1`. At M = 49152 there is abundant parallelism, so small tiles buy
-   nothing and cost arithmetic intensity.
+1. Macro tiles above 128x128 (Tensile picks `MT256x224x64`, `MT256x256x32`,
+   `MT192x256x32`, `MT128x512x32`, `MT512x128x64`) are all 13-60% *slower*
+   here, and 256x256x32 at two pipeline stages does not launch at all: it
+   requests the whole 64 KB gfx942 LDS budget.
+2. MAX's own tuned AMD entry points are unreachable under the runtime-extent
+   rule. `AMDMatmul` takes N and K from static shapes and bakes static strides
+   into its loaders; ping-pong / 4-wave / 4-wave-split-K are CDNA4 (BF16 MMA
+   16x16x32) and want 128 KB of LDS; `warp_specialized_matmul` takes M, N, K as
+   compile-time parameters; and `_matmul_gpu` falls back to hipBLASLt when N/K
+   are not static.
 
-Nothing here is a required solution — they are the measurements. Note also that
-`_amd_dynamic_mfma_dispatch` returns `False` for `batch != 1`, which is why
-attention's batched GEMMs fall back to the scalar-FFMA `pure_gemm_tiled` kernel;
-that belongs to the SDPA target, not this one.
+Note also that `_amd_dynamic_mfma_dispatch` returns `False` for `batch != 1`,
+which is why attention's batched GEMMs fall back to the scalar-FFMA
+`pure_gemm_tiled` kernel; that belongs to the SDPA target, not this one.
 
 ## Profiling
 
