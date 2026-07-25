@@ -9,10 +9,13 @@ Measured on an MI300X VF with PyTorch 2.11.0+rocm7.2 and MAX
 
 | backend | step | tokens/s |
 |---|---:|---:|
-| PyTorch-ROCm | 156.82 ms | 313 435 |
+| PyTorch-ROCm | 156.62 ms | 313 835 |
 | eager Mojo device, initial | 921.39 ms | 53 346 |
 | eager Mojo device, after the Linear GEMM work | 661.37 ms | 74 319 |
 | eager Mojo device, after the SDPA work | 420.57 ms | 116 871 |
+| eager Mojo device, after the batched transpose | 409.34 ms | 120 077 |
+| eager Mojo device, after the permute run gather | 384.67 ms | 127 779 |
+| eager Mojo device, after the GEMM split-K | see below | |
 
 Both backends are GPU-bound (trace idle 0.01%), so GPU kernel time is the unit
 of comparison. Current ranked gap per step, from
@@ -71,6 +74,14 @@ the end of a change, not per iteration.
 - `rocm_attention_bmm_targets.csv`, `rocm_attention_targets.csv` — regenerate
   both with `uv run --no-sync python scripts/rocm_attention_reference.py
   --output-op <path> --output-bmm <path>`.
+- `bench_permute_copy.mojo` — every permute the step materializes (the five
+  distinct shape/stride pairs `TorchMojoTensor._materialize_contiguous` is asked
+  for), each timed three ways: the generic rank-4 gather, whatever the dispatch
+  selects today, and PyTorch-ROCm's own `.contiguous()` on the identical shape
+  and strides. `--sweep=1` adds the run gather at every admissible vector width.
+  The gate is exact and in two parts: no output element may still hold a sentinel
+  the source fill cannot produce, and every element must be bit-identical to the
+  generic kernel's answer.
 
 ## Correctness gates
 
@@ -90,7 +101,16 @@ output element via a device-side reduction (no multi-GB host transfer):
    the wrong layout. The reference is the pattern's closed form recomputed in
    the checking kernel, sharing no code with the GEMM.
 
-Run both. A case that fails either one has no meaningful timing.
+3. **`--chunk-check=1`.** K is split into 4096-wide chunks and one all-ones pass
+   runs per chunk, with B nonzero only on that chunk's K range; every output must
+   equal that chunk's own length. This is the only gate that covers the *middle*
+   of a long K -- see the hole below -- and it is what makes the global split-K
+   route's slab boundaries visible. Demonstrated to fail where the other two
+   pass: with one `BLOCK_K` tile deliberately dropped from split-K slab 0 at
+   K = 49152 (a 32-term deficit, which rounds back to the same BF16 value)
+   `attn_c_attn_wgrad` passes gates 1 and 2 and fails this one.
+
+Run all three. A case that fails any of them has no meaningful timing.
 
 **Flag syntax matters, silently.** These harnesses parse arguments with
 `internal_utils.arg_parse`, whose `_get_arg` matches only `--handle=value`. A
@@ -99,12 +119,16 @@ falls back to the default, so you get the weak gate while believing you ran the
 strong one. Always use `=`. Each run echoes `pattern_check= 0` or `1` on its last
 line — check it rather than trusting the command you typed.
 
-Known limitation of the all-ones gate at K = 50304: the BF16 grid spacing at
-that magnitude is 256, so any accumulator in [50048, 50304] rounds to the same
-stored value and passes. The pattern gate covers a truncated K *tail* for that
-case because its nonzero terms include the last four K indices, but a dropped or
-double-counted range in the *middle* of K, narrower than 256, would pass both
-gates for that one case. Every other K here is BF16-exact and has no such hole.
+The hole the third gate closes, stated correctly (the earlier version of this
+section understated it): with all-ones operands every output is K, and BF16's
+grid spacing is coarse at these magnitudes -- 256 at K = 50304 and **128 at
+K = 49152**, i.e. eight and four `BLOCK_K` tiles' worth of accumulation. A K range
+dropped or double-counted in the middle of K, narrower than that, rounds back to
+the same stored value and passes gate 1; and gate 2's operands are nonzero only on
+the first and last four K indices, so it catches a truncated head or tail but not
+a middle. Gate 3 fixes this by construction: a chunk's expected value is its own
+length, whose spacing at 4096 is at most 16, and every K index belongs to exactly
+one chunk.
 
 ## State of the dispatch (2026-07-25)
 
@@ -165,19 +189,45 @@ materializing B^T for m >= 1024 so the GEMM reads 256-byte global rows, four
 in-workgroup K partitions in the deep-K regime, and a tiled LDS transpose that
 took the strided-operand materialization from 141 to 12 ms/step.
 
-**The remaining 3.6x is the data movement inside MAX's multistage core**, and it
-is measured rather than guessed. On the best configuration, counters give 2.26
-LDS instructions per MFMA and 4.87 bank-conflict cycles per LDS instruction.
-The reason is in the source: with `transpose_b=False` the B LDS tile is
-`(BK, BN)`, so each MFMA B fragment is four elements strided by BN and
-`_load_b_amd` lowers it to four 2-byte reads -- 32 of the 38 LDS instructions
-per warp per k-tile. The two operand layouts trade the two halves of the
-problem and this kernel cannot have both: `(N,K)` gives k-contiguous LDS (one
-`ds_read_b64` per fragment) but 64-byte global rows, `(K,N)` gives 256-byte
-global rows but the 4x scalar fragment reads. Closing it needs a kernel that
-transposes during the global-to-LDS store, plus a global split-K for the
-weight-gradient shapes, whose 432-workgroup grids leave 0.71 waves per SIMD.
-Neither is expressible around the stock kernel; both are new kernel work.
+**A global split-K then took the weight-gradient shapes to 226.7 ms, ratio
+3.165.** Their output tiles alone could not fill the device — (2304, 768, 49152)
+is 108 workgroups of a 128x128 tile on 304 CUs — and the previous entry recorded
+global split-K as inexpressible around the stock kernel. It is expressible, for
+the same reason the batch index is: the core takes its output-tile coordinates
+from `block_idx.x`/`.y` and its K from B's runtime extent, so a slab is a pointer
+offset plus a shorter extent, accumulated in FP32 into a per-slab workspace and
+summed once. See `optimization_journal.md`, Change 20, including the slab-count
+rule (`k % (parts * BLOCK_K) == 0` is load-bearing: eight slabs at k = 49280 make
+every output wrong).
+
+**The remaining 3.17x is one resource, and it is measured.** Every one of the
+fifteen GEMMs now sits in a single 131-177 TFLOP/s band against PyTorch-ROCm's
+367-612. Counters on the winning configuration (128x128x32, 32x64 warps,
+`transpose_b=False`, m=49152 n=2304 k=768): 2.30 LDS instructions per MFMA and
+**11.08 bank-conflict cycles per MFMA**. One MFMA is 16 cycles on one SIMD and a
+CU has four SIMDs but one LDS unit, so the matrix cores need 4 cycles of CU
+throughput per MFMA while the LDS pipe spends 13.4 — **oversubscribed 3.3x**, and
+170 TFLOP/s x 3.3 is 561, which is where PyTorch-ROCm measures.
+
+It is the *conflicts*, not the instruction count, and that correction matters:
+the previous entry blamed the number of B-fragment reads and proposed
+transposing during the global-to-LDS store. A warp tile of WM=64, WN=32 issues
+39% fewer LDS instructions for the same MFMA count and is 13-19% **slower**,
+because its conflict cycles rise 45% (experiment AB). Time tracks total conflict
+cycles and nothing else.
+
+The fix is a swizzled or padded LDS layout, and both are blocked citably rather
+than merely unattempted. `multistage_mma` accepts `swizzle_a` and the A-fragment
+load applies it, but its store helper *drops* it on AMD
+(`_multistage_gemm_gpu.mojo:314-331`: `copy_dram_to_sram_async[..., swizzle=...]`
+on NVIDIA, plain `copy_dram_to_sram` on AMD), which is why
+`multistage_gemm_kernel` hardcodes `swizzle_a=is_nvidia_gpu()`; enabling it would
+read a permutation nobody wrote. Padding needs no loader change at all, only a
+row stride supplied through the iterators, but two stages of 128x128x32 are
+exactly 32 KB and gfx942 has 64 KB, so two resident workgroups per CU fit with
+zero bytes to spare and any padding costs the second one — the same cliff
+experiment W measured for BK = 64. Both are new kernel work inside a modified copy
+of `multistage_mma`.
 
 Two leads that were **closed** rather than taken:
 
@@ -192,9 +242,10 @@ Two leads that were **closed** rather than taken:
    compile-time parameters; and `_matmul_gpu` falls back to hipBLASLt when N/K
    are not static.
 
-Note also that `_amd_dynamic_mfma_dispatch` returns `False` for `batch != 1`,
-which is why attention's batched GEMMs fall back to the scalar-FFMA
-`pure_gemm_tiled` kernel; that belongs to the SDPA target, not this one.
+`_amd_dynamic_mfma_dispatch` used to return `False` for `batch != 1`, which sent
+attention's batched GEMMs to the scalar-FFMA `pure_gemm_tiled` kernel; Change 15
+carries the batch on `block_idx.z` instead, and that belongs to the SDPA target
+below rather than to this one.
 
 ## State of the SDPA target (2026-07-25, after the causal decomposition)
 
@@ -242,16 +293,12 @@ Neither direction reaches the 1.02 acceptance ratio (4.07x forward, 1.96x
 backward against ROCm's fused kernels). The two things that stand between here
 and that, both measured:
 
-* **`data_movement_ops__permute_copy` is 25.2 ms/step** and is now the largest
-  single kernel in the SDPA backward, larger than any of its GEMMs. It is the four
-  transposes the decomposition needs (dO^T and Q^T in, dV^T and dK^T out), each
-  `[576, 1024, 64] <-> [576, 64, 1024]` — 600 MB of traffic per layer, 7.2 GB per
-  step, at **286 GB/s**. That is the same uncoalesced element-at-a-time transpose
-  Change 12 fixed for the unbatched 2-D case (141 -> 12 ms/step) with a tiled LDS
-  staging pass; `_copy_strided`'s fast path requires every leading extent to be 1,
-  so a *batched* transpose does not reach it. Extending it with a batch axis on
-  `block_idx.z` is worth about **21 ms/step** and would take the SDPA backward
-  from 1.96x to about 1.35x. Not attempted.
+* **`data_movement_ops__permute_copy`**, which was 25.2 ms/step here, is **done**:
+  the batched transposes went to the tiled LDS path (Change 15) and the rank-4
+  contiguous-run permutes to a vectorized run gather (Change 19). All five permutes
+  the step issues are now at 2.2-3.3 TB/s, and three of the five are faster than
+  PyTorch-ROCm's own `.contiguous()` on the identical shape and strides. See
+  `bench_permute_copy.mojo`.
 * **The workgroup launch rate** (diagnostic experiment AA), which caps the six
   batched GEMMs at 50.3 ms/step against `torch.bmm`'s 36.6 and is why causal
   output-tile skipping buys nothing.
@@ -294,8 +341,10 @@ and that, both measured:
 
    The two used regimes are exact for any consumer: the skipped indices multiply
    exact zeros, so nothing downstream has to know. Where the causal MFMA route is
-   not selectable, `CausalBmm` falls back to the dense batched GEMM, which is a
-   correct (merely slower) answer.
+   not selectable, `_causal_bmm_dispatch` **raises** rather than substituting the
+   dense batched GEMM, so the Python caller's own fallback ladder runs — see review
+   finding R6; a silent substitution here would be correct numerically and would
+   kill the sm_90a bridges.
 
 ### Harnesses for this target
 
@@ -310,6 +359,10 @@ and that, both measured:
 
 # whole-op correctness against a PyTorch-ROCm FP32 reference
 uv run --no-sync python scripts/sdpa_correctness.py
+
+# every permute the step materializes, against PyTorch-ROCm's own .contiguous()
+/tmp/bench_permute_copy
+/tmp/bench_permute_copy --sweep=1
 ```
 
 `--causal=1` uses its own closed-form gate per regime, inspecting every output

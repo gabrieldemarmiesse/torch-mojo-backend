@@ -2055,3 +2055,269 @@ unchanged.
 
 **Decision.** Accept. The same generalization also fixed R4's launch failure,
 since batch and row tiles are now both grid-strided and both clamped.
+
+# nanoGPT training step, MI300X — permute gather and GEMM split-K, 2026-07-25
+
+Continues the two sections above. Entry state, independently re-verified at the
+start of this work: PyTorch-ROCm 156.62 ms/step, eager Mojo 409.34 ms (2.61x).
+`bench_linear_gemm` 257.543 ms against ROCm's 71.639, ratio 3.595, fifteen of
+fifteen cases passing both gates. Protocol unchanged: >= 25 warmups and >= 100
+synchronized iterations for every number, timing never from a `--pmc` run, every
+tensor extent a runtime value.
+
+## Change 19 — vectorized run gather for contiguous-innermost permutes
+
+**Hypothesis.** `data_movement_ops._permute_copy` was still 30.19 ms/step after
+Change 15 gave it a tiled path for innermost-two-dims transposes. Logging
+`TorchMojoTensor._materialize_contiguous` for one step shows exactly five
+distinct (shape, stride) pairs, and three of them -- 132 of the 180 calls,
+19.93 GB of the 27.18 GB moved -- have `s3 == 1`:
+
+    72x  out (48,12,1024,64)  src strides (2359296,64,2304,1)   q/k/v
+    48x  out (48,1024,12,64)  src strides (786432,64,65536,1)    y and dq/dk/dv
+    12x  out (48,12,1024,64)  src strides (786432,64,768,1)      dy
+    24x  out (576,1024,64)    src strides (65536,1,1024)         dO^T, Q^T
+    24x  out (576,64,1024)    src strides (65536,1,64)           dV^T, dK^T
+
+The first three are nanoGPT's `view(B, T, nh, hs).transpose(1, 2)` and its
+inverse. Their innermost extent is contiguous in *both* operands, so they are
+not transposes at all: they are gathers of 64-element runs, which the tiled LDS
+path correctly declines and the generic one-element-per-thread kernel then
+serves at 2 bytes of a 16-byte access plus three integer divisions for those two
+bytes. A whole run per thread group should be bandwidth-bound instead.
+
+**Predicted effect.** Most of the 30.19 ms. PyTorch-ROCm's own `.contiguous()`
+on the identical shapes and strides measures 55.05-55.77 us per call (2.74 TB/s)
+against a 4.15 TB/s ceiling for a plain contiguous copy of the same 75.5 MB on
+this GPU, so about 7.3 ms/step is the target.
+
+**Measured effect.** New harness `harness/nanogpt_train/bench_permute_copy.mojo`
+times all five permutes against the production entry point and against the
+generic kernel it replaces:
+
+| case | generic | now | rocm | now GB/s | ms/step before | ms/step now |
+|---|---:|---:|---:|---:|---:|---:|
+| qkv | 237.29 | **45.19** | 55.21 | 3341 | 17.08 | 3.25 |
+| heads_out | 237.09 | **47.67** | 55.77 | 3168 | 11.38 | 2.29 |
+| dy | 236.54 | **46.00** | 55.05 | 3283 | 2.84 | 0.55 |
+| bmm_seq (tiled path) | 316.42 | 67.39 | 161.93 | 2241 | 7.59 | 1.62 |
+| bmm_head (tiled path) | 295.13 | 63.44 | 256.14 | 2380 | 7.08 | 1.52 |
+
+31.30 -> 6.09 ms/step on the three run-gather shapes, against ROCm's 7.32, and
+the whole training step 409.34 -> **384.67 ms**. (The two tiled-transpose rows
+are Change 15's, unchanged here; they are in the table because the harness covers
+every permute the step issues, and they are the reason the profile's 15.15 ms of
+`transpose2d` is 3.2 ms of these plus 12.0 ms of the GEMM operand copies.)
+
+The vector width is a compile-time regime chosen at runtime: the widest of 32, 16
+and 8 bytes whose extent, strides and base addresses are all admissible.
+Measured on the q/k/v shape: 45.14 us at 32 bytes, 49.29 at 16, 70.94 at 8,
+125.08 at 4. When none fits -- `d3 = 63`, or a source displaced by one element --
+the copy declines to the general kernel, which masks every extent, and the
+harness covers both of those cases.
+
+**Decision.** Accept. This was the highest value-per-line item left: 25 ms/step
+for one kernel and one dispatch clause.
+
+## Change 20 — global split-K for the underfilled weight-gradient GEMMs
+
+**Hypothesis.** The four small-output weight-gradient shapes are latency-bound on
+grid fill, not on anything inside a workgroup: (2304, 768, 49152) is 108
+workgroups of a 128x128 tile on a 304-CU part, i.e. 0.36 workgroups per CU, and
+no tile choice fixes that because the shortage is output *area*. Partitioning K
+across `parts` workgroups per output tile is the only axis left. The previous
+agent recorded global split-K as inexpressible around the stock kernel; it is
+expressible for the same reason the batch index is, and MAX's own
+`multistage_gemm_split_k_kernel` is the proof of the shape of it (unreachable
+itself: it reads N and K from *static* shapes).
+
+**Predicted effect.** The four shapes reach the 153-177 TFLOP/s band the
+well-filled forward and data-gradient shapes already reach, i.e. roughly
+33 ms/step off the harness total. `lm_head_wgrad`, whose 2358 tiles already fill
+the device, must not move.
+
+**Measured effect.** A wrapper kernel puts the slab index on `block_idx.z`,
+offsets A along the contraction axis and gives B the slab's extent, and calls the
+same 2-D core with `c_type = float32` into that slab's own workspace slice; a
+second pass sums the slices and rounds once. Geometry swept over five tiles x
+four slab counts on all five shapes (25 warmups, 100 synchronized iterations,
+all-ones gate on every element of every configuration, A already contiguous so
+these numbers exclude the transposed-operand copy):
+
+| shape (m,n,k) | production | 2 slabs | 4 | 8 | 16 |
+|---|---:|---:|---:|---:|---:|
+| 2304,768,49152 | 2003.1 | 1615.3 | 1392.0 | **1067.9** | 1063.0 |
+| 768,768,49152 | 742.2 | 1529.4 | 785.7 | 419.3 | **380.2** |
+| 3072,768,49152 | 2022.2 | 1619.8 | 1411.5 | **1394.2** | 1403.8 |
+| 768,3072,49152 | 2046.5 | 1612.0 | 1417.2 | **1394.3** | 1395.0 |
+| 50304,768,49152 | 21125.9 | 21069.0 | 21092.7 | 20989.1 | 21285.6 |
+
+all at 128x128x32 with 32x64 warps, which won on every shape and every slab
+count. Rejected geometries at their best slab count: 64x128 (1162/407/1532/1523),
+128x64 (1179/420/1560/1550), 64x64 (1501/554/2007/1997), 128x128 with 64x64
+warps (2813/1035/3440/3419) -- 9-146% slower.
+
+The dispatch rule doubles the slab count while the grid stays under four
+workgroups per CU, while `k % (parts * BLOCK_K) == 0`, and while each slab keeps
+at least 2048 contraction indices. It selects 8, 16, 8, 8 and 1 slabs for the five
+rows above, which is the measured optimum in all five.
+
+The 2048-per-slab floor is conservative for shorter K than this workload has: at
+(2304, 768, **8192**) the rule stops at four slabs (261.1 us, the same as the
+unsplit route) where eight measured 214.4 and sixteen 232.7, so the floor that
+matches that one measurement is 1024 rather than 2048. Left at 2048 because it is
+the value every production shape here was measured under and because a single
+point is not enough to move a regime boundary; noted so the next agent does not
+have to rediscover it.
+
+In the harness, with the transposed-operand copy included: `attn_c_attn_wgrad`
+2204.65 -> 1267.92 us, `attn_c_proj_wgrad` 793.53 -> 442.70,
+`mlp_c_fc_wgrad` 2307.98 -> 1678.53, `mlp_c_proj_wgrad` 2113.71 -> 1458.84,
+`lm_head_wgrad` unchanged at 25581. **Per-step weighted total 257.543 -> 226.743
+ms, ratio 3.595 -> 3.165**, fifteen of fifteen cases passing all three gates.
+
+**The exactness requirement is real, and it is the same defect shape as R1.**
+`k % (parts * BLOCK_K) == 0` is not decoration: forced to 8 slabs at
+`k = 49280` (1540 K tiles, divisible by 4 but not 8) every one of the 1 769 472
+outputs is wrong, while 4 slabs -- what the rule actually selects -- is correct.
+Accumulation stays FP32 from the MFMA accumulators through the workspace to the
+one rounding in the reduction, so this is not a precision trade: the single-step
+loss is unchanged to 7 digits.
+
+**Decision.** Accept.
+
+## Diagnostic experiment AB — warp-tile shape against the LDS instruction count
+
+**Hypothesis.** With `transpose_b=False` an A fragment is four contiguous k
+elements (one `ds_read_b64`) and a B fragment is four elements strided by BN
+(four 2-byte reads), so per warp per k-tile the counts are `num_m_mmas *
+num_k_mmas` cheap A reads and `num_n_mmas * num_k_mmas * 4` expensive B reads for
+`num_m_mmas * num_n_mmas * num_k_mmas` MFMA. At a fixed MFMA count and a fixed
+warp count, a *taller, narrower* warp tile therefore buys cheap A reads with
+expensive B ones: 128x128 with WM=32,WN=64 issues 4 + 32 = 36 LDS reads per 16
+MFMA, and WM=64,WN=32 issues 8 + 16 = 24 for the same 16 MFMA and the same 8
+warps. If the 2.26 LDS instructions per MFMA is what binds, that is a 33% cut.
+
+**Predicted effect.** >= 10% on the forward, data-gradient and split-K
+weight-gradient shapes.
+
+**Measured effect.** The opposite, consistently. TFLOP/s (us in parentheses):
+
+| geometry | 49152,2304,768 | 49152,768,3072 | 49152,768,768 | wgrad 2304,768 |
+|---|---:|---:|---:|---:|
+| 128x128 w32x64 | **167.9** (1036) | **169.9** (1365) | **156.6** (370) | **163.0** (1067) |
+| 128x128 w64x32 | 145.5 (1195) | 143.2 (1620) | 134.0 (433) | 136.9 (1271) |
+| 128x128 w128x16 | 92.0 | 89.0 | 85.9 | 87.5 |
+| 128x64 w64x32 | 132.3 | 131.3 | 121.3 | 128.5 |
+| 256x128 w64x32 | 126.3 | 135.2 | 122.8 | 101.4 |
+| 64x128 w64x32 | 132.8 | 132.8 | 122.6 | 131.2 |
+
+**Decision.** Reject, and the reason is worth more than the experiment.
+Counters on the two 128x128 geometries at (49152, 2304, 768), timed separately
+from the counter run:
+
+| geometry | SQ_INSTS_LDS | SQ_INSTS_MFMA | LDS/MFMA | SQ_LDS_BANK_CONFLICT | conflict/LDS | us |
+|---|---:|---:|---:|---:|---:|---:|
+| w32x64 | 1 524 096 | 663 552 | 2.30 | 7 354 368 | 4.83 | 1025.5 |
+| w64x32 | 929 664 | 663 552 | 1.40 | 10 644 480 | 11.45 | 1183.2 |
+
+The instruction model was right -- 39% fewer LDS instructions, close to the
+predicted 33% -- and it does not matter. **Total bank-conflict cycles is what
+tracks the time**, and the taller tile has 45% more of them, because the reads it
+adds (A fragments) are the conflict-heavy ones and the reads it removes (B
+fragments) are nearly conflict-free.
+
+## Diagnostic experiment AC — a B tile width that changes the LDS bank pattern
+
+**Hypothesis.** Element (k, n) of the B LDS tile sits at dword `k*BN/2 + n/2`, so
+its bank is `(k*BN/2 + n/2) % 32`. At BN = 128 that is `(n/2) % 32`: every k in a
+fragment lands in the same bank, which is a 4-way conflict for the four k a
+fragment reads. At BN = 96 it is `(16k + n/2) % 32`, which alternates, halving the
+conflict -- and every N this workload uses (768, 2304, 3072, 50304) is divisible
+by 96 as well as by 128, so no edge kernel appears. Padding instead of
+re-widening is not available: 128x128x32 at two stages is exactly 32 KB, half of
+gfx942's 64 KB, so two workgroups per CU fit with zero bytes to spare, and
+padding A's rows from 32 to 40 elements and B's from 128 to 136 costs 3 KB per
+stage, which drops residency to one workgroup per CU.
+
+**Predicted effect.** >= 10% from halving the dominant conflict.
+
+**Measured effect.** 12-18% *slower* on every shape. TFLOP/s: 128x96 w32x48
+gives 146.7 / 143.6 / 132.5 / 142.0 against the 128x128 w32x64 baseline's
+167.9 / 169.9 / 156.6 / 163.0; 128x96 w64x48, 128x96 w32x96, 256x96 w64x48,
+64x96 w32x48, 128x192 w32x48 and 128x192 w64x48 are all worse still
+(91.2-145.2). A narrower B tile also cuts the MFMA work per warp (three n-MMAs
+instead of four) and leaves 384 of the 512 threads in the B copy, which is
+evidently the larger effect.
+
+**Decision.** Reject. 128x128x32 with a 32x64 warp tile survives every geometry
+axis tried in this journal.
+
+## The remaining 3.17x, quantified
+
+Every one of the fifteen Linear GEMMs now sits in a single band, 131-177
+TFLOP/s, against PyTorch-ROCm's 367-612, and the cause is one resource. From the
+counters above, per MFMA instruction the LDS pipe spends 2.30 issue cycles plus
+11.08 conflict cycles, i.e. **13.4 cycles**. One MFMA is a 16x16x16 BF16
+instruction, 16 cycles on one SIMD, and a CU has four SIMDs and *one* LDS unit,
+so MFMA needs 4 cycles of CU throughput per instruction. **The LDS pipe is
+oversubscribed 3.3x against the matrix cores**, and 170 TFLOP/s x 3.3 = 561,
+which is where PyTorch-ROCm measures (483 TFLOP/s on the same shape).
+
+The fix is a swizzled or padded LDS layout, and both are blocked in a specific,
+citable way rather than merely unattempted:
+
+* **Swizzle.** `multistage_mma` does take `swizzle_a`, and the A-fragment load
+  applies it (`make_ldmatrix_swizzle`, `mma_op.load_a[swizzle_a_pattern]`). But
+  its store helper drops it on AMD -- `_copy_tensor_to_sram` calls
+  `copy_dram_to_sram_async[..., swizzle=swizzle]` on NVIDIA and
+  `copy_dram_to_sram[thread_layout=thread_layout]`, with no swizzle at all, on
+  AMD (`_multistage_gemm_gpu.mojo:314-331`). Enabling it would read a permutation
+  that was never written, which is why `multistage_gemm_kernel` hardcodes
+  `swizzle_a=is_nvidia_gpu()`. Fixing this means a modified copy of
+  `multistage_mma`, not a parameter.
+* **Padding.** A padded LDS layout needs no loader change at all, only a row
+  stride, and the layout comes from the iterators `multistage_gemm_kernel`
+  constructs -- so a wrapper kernel calling `multistage_mma` directly could supply
+  padded ones. The LDS budget forbids it at the winning tile: two stages of
+  128x128x32 are exactly 32 768 bytes (the profiler confirms `lds 32768`), two
+  workgroups per CU is 65 536, and gfx942 has 65 536. Any padding costs the second
+  resident workgroup, which experiment W measured as a 2-4x loss when BK = 64 did
+  the same thing. Padding is only affordable under a smaller tile (128x64 padded
+  is 29.7 KB for two stages), and 128x64 unpadded is already 26% slower, so the
+  padding would have to win 1.35x just to break even.
+
+Two smaller items also measured and not taken: the A-fragment conflict is a
+function of BK alone (`(m*BK/2 + k/2) % 32` is `(m*16 + k/2) % 32` at BK = 32,
+i.e. two distinct banks for sixteen rows), and BK can only be 32 or 64 here
+because `num_k_mmas` must be even (`_multistage_gemm_gpu.mojo:385`) and 64 was
+rejected by experiment W. And `k_group_size > 1`, which the tune dispatcher
+exposes, cannot be selected at BK = 32 at all: it asserts
+`num_k_mmas % (2 * k_group_size) == 0`.
+
+## Review finding R8 — the all-ones gate's middle-of-K hole, closed
+
+**Hypothesis.** The harness README records one hole: at K = 50304 the BF16 grid
+spacing is 256, so any accumulator in [50048, 50304] passes the all-ones gate.
+The hole is wider than that entry says -- at K = 49152 the spacing is 128, four
+BLOCK_K tiles' worth of all-ones accumulation -- and the pattern gate cannot cover
+it, because its nonzero terms are the first and last four K indices only. Global
+split-K makes this a live risk rather than a theoretical one: its failure mode is
+exactly a K range dropped or double-counted at a *slab boundary*, in the middle
+of K.
+
+**Predicted effect.** Splitting K into 4096-wide chunks and running one all-ones
+pass per chunk, with B nonzero only on that chunk, must (a) pass on the shipped
+code for all fifteen cases and (b) fail on a deliberately injected one-tile slab
+drop that both existing gates pass.
+
+**Measured effect.** Both. All fifteen cases pass `--chunk-check=1`. With slab 0
+of the split-K kernel deliberately shortened by one BLOCK_K tile -- a 32-term
+deficit out of 49152, which rounds back to the same BF16 value --
+`attn_c_attn_wgrad` **passes the default all-ones gate and passes
+`--pattern-check=1`**, and fails `--chunk-check=1`. A chunk's expected value is
+its own length, whose BF16 spacing at 4096 is 16, well below one BLOCK_K tile,
+and every K index belongs to exactly one chunk, so the whole range is inspected.
+
+**Decision.** Accept. Run all three gates; the chunk gate is the only one that
+covers the middle of a long K.

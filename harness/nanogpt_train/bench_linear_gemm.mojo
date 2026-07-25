@@ -162,6 +162,41 @@ def _fill_pattern(
         index += stride
 
 
+# The chunk gate closes the one hole the two gates above share. With all-ones
+# operands every output is K, and BF16's grid spacing at that magnitude is coarse:
+# 128 at K = 49152 and 256 at K = 50304, i.e. four and eight BLOCK_K tiles' worth
+# of accumulation. A K range dropped or double-counted in the *middle* of K, of
+# less than that, rounds back to the same stored value and passes. The pattern
+# gate is nonzero only on the first and last four K indices, so it catches a
+# truncated head or tail but not a middle. Splitting K into chunks and running one
+# all-ones pass per chunk -- B nonzero only on that chunk -- restores exact
+# coverage: every output must equal the chunk's own length, whose BF16 spacing at
+# CHUNK <= 4096 is at most 16, well below one BLOCK_K tile. Every K index is
+# covered by exactly one chunk, so the whole K range is inspected.
+comptime CHUNK = 4096
+
+
+@__name("bench_gemm_fill_band_bf16")
+def _fill_band(
+    ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    k_is_column: Int,
+    lo: Int,
+    hi: Int,
+):
+    """1 where this element's contraction index is in [lo, hi), else 0."""
+    var index = Int(block_idx.x) * FILL_BLOCK + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * FILL_BLOCK
+    var count = rows * cols
+    while index < count:
+        var contraction = index % cols if k_is_column != 0 else index // cols
+        ptr[index] = Float32(
+            1.0 if contraction >= lo and contraction < hi else 0.0
+        ).cast[DType.bfloat16]()
+        index += stride
+
+
 @__name("bench_gemm_count_pattern_ne_bf16")
 def _count_pattern_not_equal(
     counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
@@ -234,6 +269,28 @@ def _enqueue_fill_const(
         count,
         value.cast[DType.bfloat16](),
         grid_dim=(_fill_blocks(count),),
+        block_dim=(FILL_BLOCK,),
+    )
+
+
+@always_inline
+def _enqueue_fill_band(
+    ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    k_is_column: Int,
+    lo: Int,
+    hi: Int,
+    ctx: DeviceContext,
+) raises:
+    ctx.enqueue_function[_fill_band](
+        ptr,
+        rows,
+        cols,
+        k_is_column,
+        lo,
+        hi,
+        grid_dim=(max(1, min(ceildiv(rows * cols, FILL_BLOCK), 512)),),
         block_dim=(FILL_BLOCK,),
     )
 
@@ -365,6 +422,7 @@ def run_case(
     warmup: Int,
     iterations: Int,
     pattern_check: Bool,
+    chunk_check: Bool,
     ctx: DeviceContext,
 ) raises -> CaseResult:
     var m = target.m
@@ -499,7 +557,23 @@ def run_case(
         sort(copy_samples)
 
     var mismatches: Int
-    if pattern_check:
+    if chunk_check:
+        # One all-ones pass per BF16-exact chunk of K, so a range dropped or
+        # double-counted anywhere in K -- not only at its head or tail -- moves an
+        # output away from that chunk's own length.  A is still all ones, so only
+        # B is refilled per chunk.
+        mismatches = 0
+        var lo = 0
+        while lo < k:
+            var hi = min(k, lo + CHUNK)
+            if target.transpose_b:
+                _enqueue_fill_band(b_ptr, n, k, 1, lo, hi, ctx)
+            else:
+                _enqueue_fill_band(b_ptr, k, n, 0, lo, hi, ctx)
+            _full()
+            mismatches += _count_chunk_mismatches(target, c_buf, hi - lo, ctx)
+            lo = hi
+    elif pattern_check:
         mismatches = _count_pattern_mismatches(target, c_buf, ctx)
     else:
         mismatches = _count_constant_mismatches(target, c_buf, ctx)
@@ -542,6 +616,28 @@ def _count_constant_mismatches(
         c_buf.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
         target.m * target.n,
         Float32(target.k).cast[DType.bfloat16]().cast[DType.float32](),
+        grid_dim=(CHECK_BLOCKS,),
+        block_dim=(FILL_BLOCK,),
+    )
+    var mismatches = _sum_counts(counts, slots, ctx)
+    _ = counts^
+    return mismatches
+
+
+def _count_chunk_mismatches(
+    target: GemmCase,
+    c_buf: DeviceBuffer[DType.bfloat16],
+    chunk_len: Int,
+    ctx: DeviceContext,
+) raises -> Int:
+    """Every output must equal this chunk's length, rounded once to BF16."""
+    var slots = CHECK_BLOCKS * FILL_BLOCK
+    var counts = ctx.enqueue_create_buffer[DType.int32](slots)
+    ctx.enqueue_function[_count_not_equal](
+        counts.unsafe_ptr().as_unsafe_any_origin(),
+        c_buf.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
+        target.m * target.n,
+        Float32(chunk_len).cast[DType.bfloat16]().cast[DType.float32](),
         grid_dim=(CHECK_BLOCKS,),
         block_dim=(FILL_BLOCK,),
     )
@@ -611,6 +707,7 @@ def main() raises:
     var warmup = Int(arg_parse("warmup", 25))
     var iterations = Int(arg_parse("iterations", 100))
     var pattern_check = Int(arg_parse("pattern-check", 0)) != 0
+    var chunk_check = Int(arg_parse("chunk-check", 0)) != 0
     if warmup < 25 or iterations < 100:
         raise Error("protocol requires >=25 warmups and >=100 iterations")
 
@@ -632,7 +729,7 @@ def main() raises:
             if only != "all" and target.label != only:
                 continue
             var result = run_case(
-                target, warmup, iterations, pattern_check, ctx
+                target, warmup, iterations, pattern_check, chunk_check, ctx
             )
             mojo_step_us += result.median_us * Float64(target.calls_per_step)
             rocm_step_us += target.rocm_us * Float64(target.calls_per_step)
@@ -678,6 +775,8 @@ def main() raises:
         print(
             "correctness: all cases pass (pattern_check=",
             Int(pattern_check),
+            ", chunk_check=",
+            Int(chunk_check),
             ")",
         )
         return

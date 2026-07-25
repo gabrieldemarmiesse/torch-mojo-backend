@@ -101,6 +101,7 @@ from op_utils import (
     _copy_strided,
     _enqueue_cached,
     _get_ctx,
+    _gs_blocks,
     _make_ptr,
     _raw_ctx,
     _raw_dtype_int,
@@ -1135,6 +1136,207 @@ def _amd_dynamic_mfma_gemm[
 
 
 # ---------------------------------------------------------------------------
+# Global split-K for the underfilled deep-K regime.
+#
+# A weight-gradient GEMM has a huge contraction extent and a small output:
+# (2304, 768, 49152) yields 108 output tiles of 128x128, which is 0.36 workgroups
+# per CU on a 304-CU part, so two thirds of the device is idle for the whole K
+# loop.  Partitioning K across `parts` workgroups per output tile multiplies the
+# grid by `parts`; each partition accumulates its own K slab in FP32 into its own
+# workspace slice, and a second pass sums the slices and rounds once to the
+# output dtype.
+#
+# This is expressible around the stock `multistage_gemm_kernel` for the same
+# reason the batch index is: the core takes its output-tile coordinates from
+# `block_idx.x`/`.y` only, so `block_idx.z` is free, and it takes K from B's
+# runtime extent, so a slab is a pointer offset plus a shorter extent -- exactly
+# what MAX's own `multistage_gemm_split_k_kernel` does (`_multistage_gemm_gpu.mojo`,
+# which is unreachable here because it reads N and K from *static* shapes).
+#
+# Only `transpose_b == False` can express a slab: a `[K, N]` operand's slab is
+# `parts` whole rows, but an `[N, K]` operand's slab is a column range of every
+# row, whose row stride is the full K and therefore not `row_major`.  The route
+# declines otherwise.
+#
+# Accumulation stays FP32 throughout: the partial sums are the multistage core's
+# own FP32 accumulators, written to an FP32 workspace, and the only rounding to
+# the output dtype is the last one in the reduction -- the same single rounding
+# the unsplit route performs.
+# ---------------------------------------------------------------------------
+
+
+@__name(t"amd_splitk_mfma_{dtype}_{BM}x{BN}x{BLOCK_K}")
+def _amd_splitk_mfma_kernel[
+    dtype: DType,
+    BM: Int,
+    BN: Int,
+    BLOCK_K: Int,
+    config: MatmulConfig[dtype, dtype, DType.float32, False],
+](
+    ws_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    k_per: Int,
+):
+    """One K slab per `block_idx.z`, into that slab's own FP32 workspace slice.
+
+    `k_per` is a multiple of `BLOCK_K` and `parts * k_per == k`, both enforced by
+    the dispatch, so every slab is a whole number of K tiles and the loader never
+    reads past an operand.
+    """
+    var z = Int(block_idx.z)
+    var k_off = z * k_per
+    var ws_ptr = ws_base + z * m * n
+    var c = TileTensor(ws_ptr, row_major(Coord(m, n)))
+    # A keeps its true row stride `k` and is merely offset along the contraction
+    # axis; B's slab is `k_per` whole rows, so its extent carries the slab length
+    # and the core's K loop follows it.
+    var a = TileTensor(a_base + k_off, row_major(Coord(m, k)))
+    var b = TileTensor(b_base + k_off * n, row_major(Coord(k_per, n)))
+
+    @always_inline
+    @parameter
+    def _store[
+        value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
+    ](coords: IndexList[2], value: SIMD[value_dtype, width]):
+        ws_ptr.store[width=width, alignment = size_of[DType.float32]()](
+            Int(coords[0]) * n + Int(coords[1]),
+            value.cast[DType.float32](),
+        )
+
+    multistage_gemm_kernel[
+        config=config,
+        elementwise_lambda_fn=Optional[elementwise_epilogue_type](_store),
+    ](c, a, b)
+
+
+@__name(t"amd_splitk_reduce_{dtype}_v{VEC}")
+def _splitk_reduce_kernel[
+    dtype: DType, VEC: Int
+](
+    c_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    total: Int,
+    parts: Int,
+    vec_count: Int,
+):
+    """`c[i] = sum over slabs of ws[slab, i]`, summed and rounded once in FP32."""
+    var index = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    var j = index
+    while j < vec_count:
+        var acc = SIMD[DType.float32, VEC](0)
+        for p in range(parts):
+            acc += ws_ptr.load[width=VEC, alignment = VEC * 4](
+                p * total + j * VEC
+            )
+        c_ptr.store[width=VEC, alignment = VEC * size_of[dtype]()](
+            j * VEC, acc.cast[dtype]()
+        )
+        j += gstride
+    var tail = vec_count * VEC + index
+    while tail < total:
+        var acc = Scalar[DType.float32](0)
+        for p in range(parts):
+            acc += ws_ptr[p * total + tail]
+        c_ptr[tail] = acc.cast[dtype]()
+        tail += gstride
+
+
+@always_inline
+def _amd_splitk_mfma_gemm[
+    dtype: DType,
+    BM: Int,
+    BN: Int,
+    WM: Int,
+    WN: Int,
+    BLOCK_K: Int = 32,
+    STAGES: Int = 2,
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    parts: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime config = MatmulConfig[dtype, dtype, DType.float32, False](
+        block_tile_shape=Index(BM, BN, BLOCK_K),
+        warp_tile_shape=Index(WM, WN, BLOCK_K),
+        mma_shape=get_mma_shape[dtype, DType.float32](),
+        num_pipeline_stages=STAGES,
+    )
+    var total = m * n
+    # Bounded by the dispatch rule: `tiles * parts` stays within a few
+    # workgroups per CU, so `parts * m * n <= 4 * CUs * BM * BN` -- under 80 MB
+    # of FP32 at any tile this route selects.  An ordinary per-call temporary,
+    # freed on the same stream.
+    var ws = ctx.enqueue_create_buffer[DType.float32](parts * total)
+    ctx.enqueue_function[
+        _amd_splitk_mfma_kernel[dtype, BM, BN, BLOCK_K, config]
+    ](
+        ws.unsafe_ptr().as_unsafe_any_origin(),
+        _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_immutable(),
+        _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_immutable(),
+        m,
+        n,
+        k,
+        k // parts,
+        grid_dim=(n // BN, ceildiv(m, BM), parts),
+        block_dim=config.block_dim(),
+        shared_mem_bytes=config.shared_mem_usage(),
+        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+            UInt32(config.shared_mem_usage())
+        ),
+    )
+    # The wide reduction needs a vector-aligned output; the caller has checked
+    # the base address, and the kernel's own scalar tail covers an element count
+    # the vector does not divide.
+    comptime VEC = 16 // size_of[DType.float32]()
+    _enqueue_cached[_splitk_reduce_kernel[dtype, VEC]](
+        ctx,
+        String(t"amd_splitk_reduce_{dtype}_v{VEC}"),
+        _gs_blocks(total // VEC),
+        1,
+        1,
+        256,
+        _make_ptr[dtype](c_addr).as_unsafe_any_origin(),
+        ws.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
+        total,
+        parts,
+        total // VEC,
+    )
+    _ = ws^
+
+
+@always_inline
+def _splitk_parts(tiles: Int, cus: Int, k: Int, bk: Int) -> Int:
+    """How many K slabs the runtime grid fill and the runtime K admit.
+
+    Doubling the slab count doubles the grid, so it pays only while the output
+    tiles alone cannot keep the CUs busy; past a few workgroups per CU the extra
+    workspace traffic is pure cost.  Every slab must be a whole number of K tiles
+    (`k % (parts * bk) == 0`) or the slabs would not cover K exactly, and each
+    slab must keep enough contraction indices that its own pipeline fill and
+    epilogue stay a small fraction of its work.
+    """
+    var parts = 1
+    while (
+        parts < 16
+        and tiles * 2 * parts <= 4 * cus
+        and k % (2 * parts * bk) == 0
+        and k // (2 * parts) >= 2048
+    ):
+        parts *= 2
+    return parts
+
+
+# ---------------------------------------------------------------------------
 # Batched MI300X MFMA GEMM.
 #
 # `multistage_gemm_kernel` derives its output-tile coordinates from block_idx.x
@@ -1679,6 +1881,38 @@ def _amd_dynamic_mfma_dispatch[
         # extent runtime-dynamic; only which regime is selected depends on the
         # runtime shape.
         var deep_k = k >= 2048 and k >= 2 * n
+        # Global split-K, for a deep contraction whose output tiles alone cannot
+        # fill the device.  This is the weight-gradient regime: at
+        # (2304, 768, 49152) the 128x128 output grid is 108 workgroups on a
+        # 304-CU part, and no tile choice fixes that because the shortage is
+        # output area, not tile size.  Slabs of K are the only axis left.
+        #
+        # Measured on the four such shapes the step issues (25 warmups, 100
+        # synchronized iterations, A already contiguous so the numbers exclude the
+        # transposed-operand copy): 2003 -> 1068 us, 742 -> 380, 2022 -> 1394 and
+        # 2046 -> 1394 us, i.e. 87-114 -> 138-166 TFLOP/s, which is the same band
+        # the well-filled forward and data-gradient shapes already reach.
+        # `lm_head_wgrad`, whose 2358 tiles already fill the device, measures
+        # 21126 us unsplit and 20989 with eight slabs, and the rule below leaves
+        # it unsplit.
+        #
+        # `fuse_bias` is excluded because a bias would be added once per slab;
+        # the reduction is where it would have to go, and no weight gradient has
+        # one.  The C alignment condition is what lets the reduction use 16-byte
+        # accesses; the `n % 128` condition removes the N-edge kernel entirely.
+        comptime if not transpose_b and not fuse_bias:
+            if k >= 8192 and m >= 128 and n % 128 == 0 and c_addr % 8 == 0:
+                var splitk_parts = _splitk_parts(
+                    ceildiv(m, 128) * (n // 128),
+                    ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT),
+                    k,
+                    32,
+                )
+                if splitk_parts > 1:
+                    _amd_splitk_mfma_gemm[dtype, 128, 128, 32, 64](
+                        c_addr, a_addr, b_addr, m, n, k, splitk_parts, ctx
+                    )
+                    return True
         if m >= 2048 or (m >= 1024 and not deep_k):
             comptime if transpose_b:
                 # A [N, K] operand is read as BN rows of BLOCK_K elements, so
