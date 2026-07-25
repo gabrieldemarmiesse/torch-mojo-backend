@@ -171,13 +171,15 @@ def drain() -> None:
 
 
 def _returns_value(attr: str) -> bool:
-    """Spec-tier entry points allocate their output inside Mojo and RETURN
-    (holder, spec, ...): the caller consumes the value immediately, so the
-    call cannot be queued. The raw tier writes into pre-allocated pointers
-    and returns None. Naming convention: spec entries end in "Spec". A
-    mis-classification is loud (the caller crashes on None), never silent.
-    Making the spec tier queueable needs Into-style entry points (Python
-    pre-allocates, Mojo writes into it) — the noted follow-up."""
+    """Spec-tier entry points called in their LEGACY form allocate their
+    output inside Mojo and RETURN (holder, spec, ...): the caller consumes
+    the value immediately, so such a call cannot be queued and instead
+    drains + executes synchronously. Hot paths avoid this entirely via the
+    Into form (`kernel_call_into`: Python pre-allocates, Mojo writes into
+    the provided out-spec) — this guard only serves remaining legacy spec
+    calls (e.g. Cumsum/BatchNorm/AttnDecode, and eligibility fallbacks).
+    Naming convention: spec entries end in "Spec"; a mis-classification is
+    loud (the caller crashes on None), never silent."""
     return attr.endswith("Spec")
 
 

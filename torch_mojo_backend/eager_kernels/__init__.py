@@ -42,6 +42,8 @@ from types import ModuleType
 
 from max import driver
 
+from . import call_queue
+
 _PACKAGE_DIR = Path(__file__).parent
 _CACHE_DIR = _PACKAGE_DIR / "__mojocache__"
 _PROFILE_PATH = _CACHE_DIR / "demand_profile.json"
@@ -339,59 +341,6 @@ def _load_extension(module_name: str, so_path: Path) -> ModuleType:
     return module
 
 
-class KernelPending(BaseException):
-    """The kernel the current op needs is compiling asynchronously.
-
-    Raised (instead of blocking) when a variant miss happens under
-    ``__torch_dispatch__`` and the deferred-execution layer is available.
-    Deliberately a BaseException so intermediate ``except Exception`` blocks
-    in the dispatch stack cannot swallow it; the deferred layer catches it
-    at the dispatch boundary (main thread) or in the launcher's retry loop.
-    """
-
-    def __init__(self, state: "_ModuleState", job: "_AsyncOpJob") -> None:
-        super().__init__(f"a kernel unit of {state.name} is compiling")
-        self.state = state
-        self.job = job
-
-
-_DISPATCH_TLS = threading.local()
-
-
-def _in_torch_dispatch() -> bool:
-    return getattr(_DISPATCH_TLS, "depth", 0) > 0
-
-
-def _may_raise_pending() -> bool:
-    """Whether a compile miss under dispatch may raise KernelPending for the
-    deferred-execution layer. Under the unit-test suite kernel loads block
-    inline instead: a KernelPending retry restarts the WHOLE aten op, so a
-    multi-kernel op with several cold units would re-run its side work
-    (duplicate casts/allocations) once per unit — test spies see those. The
-    force knob re-enables deferral for its dedicated harnesses."""
-    from torch_mojo_backend.is_running_tests import IS_RUNNING_TESTS
-
-    from . import call_queue
-
-    if call_queue.enabled():
-        # Kernel-call-level deferral: misses queue at the CALL layer, the
-        # aten-level KernelPending machinery stays out of the way.
-        return False
-    return not IS_RUNNING_TESTS or bool(os.environ.get("TMB_FORCE_DEFER"))
-
-
-class _dispatch_scope:
-    """Marks 'this extension call came through __torch_dispatch__', which is
-    the only context where a variant miss may raise KernelPending instead of
-    compiling synchronously (direct callers, e.g. tests, still block)."""
-
-    def __enter__(self) -> None:
-        _DISPATCH_TLS.depth = getattr(_DISPATCH_TLS, "depth", 0) + 1
-
-    def __exit__(self, *exc: object) -> None:
-        _DISPATCH_TLS.depth -= 1
-
-
 class _AsyncOpJob:
     """One background build of one (module, op) unit. Every unit builds
     independently through the slot pool — full parallelism across ops."""
@@ -530,10 +479,7 @@ class _ModuleState:
             raise AttributeError(
                 f"{self.name} is per-op loaded; an op name is required"
             )
-        unit = self.unit(first_op)
-        if unit.ext is None and _in_torch_dispatch() and _may_raise_pending():
-            raise KernelPending(self, unit.request_async())
-        return unit.load_blocking()
+        return self.unit(first_op).load_blocking()
 
 
 def _wrap_call(unit: _OpUnit, attr: str, fn: object) -> object:
@@ -541,8 +487,6 @@ def _wrap_call(unit: _OpUnit, attr: str, fn: object) -> object:
     when the call queue owns misses — the queue resolves at launch time."""
 
     def call(*args: object, **kwargs: object) -> object:
-        from . import call_queue
-
         if call_queue.enabled():
             return call_queue.kernel_call(unit, attr, args, kwargs)
         bound = fn if unit.ext is not None and fn is not None else None
@@ -553,10 +497,6 @@ def _wrap_call(unit: _OpUnit, attr: str, fn: object) -> object:
         except Exception as exc:  # Mojo errors surface as plain Exception
             if "unsupported dtype" not in str(exc) or unit.dtypes is None:
                 raise
-            if _in_torch_dispatch() and _may_raise_pending():
-                raise KernelPending(
-                    unit.state, unit.request_async(all_dtypes=True)
-                ) from exc
             module = unit.load_blocking(all_dtypes=True)
             return getattr(module, attr)(*args, **kwargs)
 
@@ -589,13 +529,8 @@ class _ModuleProxy:
                 f"module {state.name!r} has no entry point {attr!r}"
             )
         unit = state.unit(attr)
-        if unit.ext is None:
-            if _in_torch_dispatch() and _may_raise_pending():
-                raise KernelPending(state, unit.request_async())
-            from . import call_queue
-
-            if not call_queue.enabled():
-                unit.load_blocking()
+        if unit.ext is None and not call_queue.enabled():
+            unit.load_blocking()
         state.demanded_ops.add(attr)
         if unit.ext is None:
             # Call-queue mode: hand out the lazy callable; the queue builds
@@ -613,8 +548,6 @@ class _ModuleProxy:
 def queue_spec_into(module: str, attr: str, args: tuple) -> None:
     """Queue an Into-style spec launch (same registration name, extra
     trailing out-spec argument; the Mojo dispatcher branches on nargs)."""
-    from . import call_queue
-
     state = _STATES[module]
     unit = state.unit(attr)
     state.demanded_ops.add(attr)

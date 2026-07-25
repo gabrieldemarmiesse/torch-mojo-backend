@@ -51,18 +51,8 @@ def register_aten_op(op_name: str):
 
             @functools.wraps(func)
             def counted(*args, **kwargs):
-                # Count attempts, except compile-miss retries: KernelPending
-                # means the same logical call re-enters after the build, and
-                # counting both would double-count it. Validation errors and
-                # other failures still count as attempts (tests assert on
-                # reject-before-write paths).
                 counted.call_count += 1
-                try:
-                    return func(*args, **kwargs)
-                except BaseException as exc:
-                    if type(exc).__name__ == "KernelPending":
-                        counted.call_count -= 1
-                    raise
+                return func(*args, **kwargs)
 
             counted.call_count = 0
             EAGER_CALL_COUNTERS[op_name] = counted

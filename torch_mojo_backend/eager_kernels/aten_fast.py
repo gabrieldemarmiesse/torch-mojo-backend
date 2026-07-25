@@ -28,11 +28,10 @@ import torch
 from max.dtype import DType
 
 from torch_mojo_backend import eager_kernels, is_running_tests
-from torch_mojo_backend.eager_kernels import KernelPending
 from torch_mojo_backend.eager_kernels import call_queue as _call_queue
 
 
-def _device_call(fn, *args):
+def _device_call(fn: object, *args: object) -> object:
     """Launch an ungated device call (tensor_holder / fa4): when the call
     queue is active it must hold its FIFO position behind queued producers
     of its inputs; otherwise call directly."""
@@ -582,7 +581,9 @@ _SPEC_BOOL_OK_NAMES = _SPEC_CMP_NAMES | frozenset(
 )
 
 
-def _try_spec_binary_into(spec_fn_name, lhs, rhs, out_dtype):
+def _try_spec_binary_into(
+    spec_fn_name: str, lhs: object, rhs: object, out_dtype: DType | None
+) -> TorchMojoTensor | None:
     """Call-queue mode: pre-allocate the output in Python and queue the
     Into launch — allocation never forces a drain, the launch is
     fire-and-forget. Returns the output wrapper, or None to fall back to
@@ -871,7 +872,7 @@ _SPEC_REDUCE_INTO = {
 }
 
 
-def _reduced_shape(shape, rdims, keepdim):
+def _reduced_shape(shape: tuple, rdims: object, keepdim: bool) -> tuple:
     rd = set(rdims)
     out = []
     for i, s in enumerate(shape):
@@ -987,7 +988,9 @@ def _raise_if_device_oom(exc):
         raise torch.OutOfMemoryError(message) from exc
 
 
-def _spec_matmul_out_shape(spec_fn_name, ts, transpose_b):
+def _spec_matmul_out_shape(
+    spec_fn_name: str, ts: list, transpose_b: int
+) -> tuple | None:
     """Output shape for a queueable matmul spec launch, or None when any
     Mojo-side check might fail (a queued launch cannot fall back)."""
     a = ts[0]
@@ -5859,14 +5862,8 @@ def _instrument_call_counts():
         def make_wrapper(wrapped):
             @functools.wraps(wrapped)
             def wrapper(*args, **kwargs):
-                # Count attempts, except compile-miss retries (KernelPending
-                # re-enters the same logical call after the build).
                 wrapper.call_count += 1
-                try:
-                    return wrapped(*args, **kwargs)
-                except KernelPending:
-                    wrapper.call_count -= 1
-                    raise
+                return wrapped(*args, **kwargs)
 
             wrapper.call_count = 0
             return wrapper
