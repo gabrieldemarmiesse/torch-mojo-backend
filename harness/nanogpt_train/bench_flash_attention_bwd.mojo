@@ -429,9 +429,7 @@ struct GradCheck(ImplicitlyCopyable, Movable):
 
     def passed(self) -> Bool:
         return (
-            self.nans == 0
-            and self.infs == 0
-            and self.max_err <= self.tolerance
+            self.nans == 0 and self.infs == 0 and self.max_err <= self.tolerance
         )
 
 
@@ -719,9 +717,7 @@ def run_case[
         _ = rdk^
         _ = rdv^
 
-    var result = BwdResult(
-        _percentile(samples, 50), c_dq, c_dk, c_dv, check
-    )
+    var result = BwdResult(_percentile(samples, 50), c_dq, c_dk, c_dv, check)
     _ = qf^
     _ = kf^
     _ = vf^
@@ -858,5 +854,7 @@ def main() raises:
     if failed == 0:
         print("correctness: all cases pass on dQ, dK and dV")
         return
-    print("correctness: ", failed, "case(s) FAILED - their timings mean nothing")
+    print(
+        "correctness: ", failed, "case(s) FAILED - their timings mean nothing"
+    )
     raise Error("flash attention backward failure in ", failed, " case(s)")
