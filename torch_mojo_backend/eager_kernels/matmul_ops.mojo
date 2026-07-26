@@ -24,7 +24,9 @@ from std.gpu import (
     thread_idx,
     warp_id,
 )
+from std.gpu.compute.mma import mma
 from std.gpu.memory import (
+    AddressSpace,
     async_copy,
     async_copy_commit_group,
     async_copy_wait_group,
@@ -41,6 +43,7 @@ from std.sys.info import (
     _accelerator_arch,
     has_accelerator,
     has_apple_gpu_accelerator,
+    is_amd_gpu,
     simd_width_of,
     size_of,
 )
@@ -1803,6 +1806,388 @@ def _causal_bmm_dispatch(
         " 1, m and n >= 64, k % 32 == 0, and a causal mode this layout"
         " implements"
     )
+
+
+# ---------------------------------------------------------------------------
+# Hand-written NT (transposed-B) MFMA GEMM for gfx942 / CDNA3.
+#
+#   C[m, n] = sum_k A[m, k] * B[n, k]        A is (m, k), B is (n, k)
+#
+# Why this exists at all.  MAX's `multistage_gemm_kernel` cannot make both
+# halves of the data path wide for this layout: with `transpose_b=True` its B
+# LDS tile is (BN, BK), which gives k-contiguous LDS fragments but 64-byte
+# global rows; with `transpose_b=False` it is (BK, BN), which gives wide global
+# rows but lowers every MFMA B fragment to four 2-byte LDS reads.  Counters on
+# the best configuration of the second route measured 2.30 LDS instructions and
+# 11.08 bank-conflict cycles per MFMA against 4 cycles of per-CU MFMA
+# throughput -- the LDS pipe oversubscribed 3.3x -- and that is the whole gap.
+# See optimization_journal.md, "The remaining 3.17x, quantified".
+#
+# For NT both operands are already k-major in memory, and an MFMA operand wants
+# exactly four elements adjacent along k, so a k-major LDS tile makes BOTH the
+# global rows and the LDS fragment reads wide.  Every fragment is one
+# `ds_read_b64`; nothing is transposed anywhere.
+#
+# Layout choices, all of them forced:
+#
+# * `v_mfma_f32_32x32x8bf16_1k` puts, in lane L, register p, the element
+#   D[8*(p//4) + (p%4) + 4*(L//32), L%32]; its A operand wants
+#   A[L%32, 4*(L//32) + j] and its B operand B[4*(L//32) + j, L%32].  Feeding
+#   the A operand from the A tile and the B operand from the B tile therefore
+#   gives an accumulator whose LANE index is n and whose REGISTER index is m.
+#   A lane's sixteen values are sixteen rows of ONE column, so a store
+#   instruction covers 32 consecutive n for a fixed row: 64 contiguous bytes per
+#   half-wave, fully coalesced, with no LDS round trip in the epilogue.  The
+#   other assignment (accumulator lane = m) would store four contiguous n per
+#   lane spread over 32 rows, i.e. 16-byte fragments of 32 different cache
+#   lines.
+# * LDS rows are `BK + 4` elements.  A fragment read is `ds_read_b64` at
+#   `(L%32)*PAD + c`, i.e. dword `(L%32)*(PAD/2) + c/2`, and `PAD/2 == 2 (mod 4)`
+#   makes lanes 0..15 hit sixteen distinct even banks while the second dword of
+#   each b64 fills the odd ones, so a 16-lane LDS cycle covers all 32 banks
+#   exactly once.  `BK + 4` with `BK` a multiple of 8 always satisfies it.  This
+#   is the same derivation as `flash_attention_fwd_kernels.mojo`, which measures
+#   `SQ_LDS_BANK_CONFLICT == 0`.
+# * The k loop is a two-stage software pipeline: the next tile's global loads
+#   are issued BEFORE the current tile's MFMAs, so the load latency sits under
+#   the matrix work, and with `STAGES == 2` the LDS write goes to the other
+#   buffer so one barrier per iteration suffices.
+#
+# `EXACT` drops every edge guard when the runtime extents happen to divide the
+# tile.  The masked instantiation is the general path: out-of-range rows and k
+# columns are zero-filled in LDS, which contributes exactly nothing to any
+# accumulator, and out-of-range outputs are not stored.  Both are selected from
+# the runtime shape; no extent is ever compiled in.
+# ---------------------------------------------------------------------------
+
+@always_inline
+def _nt_sched_fence():
+    """Stop the machine scheduler moving anything across this point.
+
+    `barrier()` alone is not sufficient on this pin: with a plain `barrier()`
+    between the MFMA sequence that reads an LDS tile and the stores that refill
+    it, a single-buffered k loop returns wrong results, and adding this fence on
+    both sides of the barrier makes it correct.  Whatever the underlying defect
+    is, `s_barrier` is not ordering the LDS traffic around it, so every phase
+    boundary in the kernel below is fenced explicitly.
+    """
+    llvm_intrinsic["llvm.amdgcn.sched.barrier", NoneType](Int32(0))
+
+
+@always_inline
+def _nt_barrier():
+    """A phase boundary: no instruction and no LDS access crosses it."""
+    _nt_sched_fence()
+    barrier()
+    _nt_sched_fence()
+
+
+comptime NT_MMA = 32  # both non-contraction extents of the MFMA tile
+comptime NT_MMA_K = 8  # contraction extent of one MFMA
+comptime NT_VEC = 8  # elements per global load and per LDS write
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32((BM // WM) * (BN // WN) * 64)
+    ),
+)
+@__name(t"nt_mfma_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_l{MASK_LOAD}_t{MASK_STORE}")
+def _nt_mfma_kernel[
+    dtype: DType,
+    BM: Int,
+    BN: Int,
+    BK: Int,
+    WM: Int,
+    WN: Int,
+    STAGES: Int,
+    MASK_LOAD: Bool,
+    MASK_STORE: Bool,
+](
+    c: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    a: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    b: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+):
+    comptime WAVES_N = BN // WN
+    comptime THREADS = (BM // WM) * WAVES_N * 64
+    comptime MT = WM // NT_MMA
+    comptime NTL = WN // NT_MMA
+    comptime KSTEPS = BK // NT_MMA_K
+    comptime PAD = BK + 4
+    comptime TPR = BK // NT_VEC  # threads that cover one tile row
+    comptime ROWS = THREADS // TPR  # tile rows filled per pass
+    comptime APASS = BM // ROWS
+    comptime BPASS = BN // ROWS
+    comptime SA = BM * PAD
+    comptime SB = BN * PAD
+
+    comptime assert BK % NT_VEC == 0, "BK must be a multiple of the load width"
+    comptime assert WM % NT_MMA == 0 and WN % NT_MMA == 0, (
+        "the warp tile must be a whole number of MFMA tiles"
+    )
+    comptime assert THREADS >= TPR, "BK is wider than the block can cover"
+    comptime assert BM % ROWS == 0 and BN % ROWS == 0, (
+        "the tile-fill pass must cover BM and BN exactly"
+    )
+    comptime assert STAGES == 1 or STAGES == 2, "STAGES is 1 or 2"
+
+    comptime if is_amd_gpu():
+        var smem = stack_allocation[
+            STAGES * (SA + SB),
+            dtype,
+            address_space=AddressSpace.SHARED,
+            alignment=16,
+        ]()
+
+        var tid = Int(thread_idx.x)
+        var wave = tid // 64
+        var lane = tid % 64
+        var lo = lane % 32  # the MFMA's non-contraction index
+        var hi = lane // 32  # which half-wave, i.e. which k quad
+        var wm0 = (wave // WAVES_N) * WM
+        var wn0 = (wave % WAVES_N) * WN
+
+        var m0 = Int(block_idx.y) * BM
+        var n0 = Int(block_idx.x) * BN
+
+        # Tile fill: one thread reads NT_VEC contiguous k of one row, so a whole
+        # row of BK elements is 2*BK bytes read by TPR adjacent threads.
+        var trow = tid // TPR
+        var tcol = (tid % TPR) * NT_VEC
+        var a_ptr = a + ((m0 + trow) * k + tcol)
+        var b_ptr = b + ((n0 + trow) * k + tcol)
+        var pass_step = ROWS * k
+        var lds_off = trow * PAD + tcol
+
+        comptime LDSPtr = type_of(smem)
+
+        var acc = stack_allocation[MT * NTL * 16, DType.float32]()
+        comptime for i in range(MT * NTL):
+            acc.store(i * 16, SIMD[DType.float32, 16](0))
+
+        var areg = stack_allocation[APASS * NT_VEC, dtype]()
+        var breg = stack_allocation[BPASS * NT_VEC, dtype]()
+
+        @always_inline
+        @parameter
+        def _load(kt: Int):
+            """Global -> registers for k tile `kt`, then advance the pointers."""
+            comptime if not MASK_LOAD:
+                comptime for p in range(APASS):
+                    areg.store(
+                        p * NT_VEC, a_ptr.load[width=NT_VEC](p * pass_step)
+                    )
+                comptime for p in range(BPASS):
+                    breg.store(
+                        p * NT_VEC, b_ptr.load[width=NT_VEC](p * pass_step)
+                    )
+            else:
+                var kok = kt * BK + tcol < k
+                comptime for p in range(APASS):
+                    var v = SIMD[dtype, NT_VEC](0)
+                    if kok and m0 + trow + p * ROWS < m:
+                        v = a_ptr.load[width=NT_VEC](p * pass_step)
+                    areg.store(p * NT_VEC, v)
+                comptime for p in range(BPASS):
+                    var v = SIMD[dtype, NT_VEC](0)
+                    if kok and n0 + trow + p * ROWS < n:
+                        v = b_ptr.load[width=NT_VEC](p * pass_step)
+                    breg.store(p * NT_VEC, v)
+            a_ptr += BK
+            b_ptr += BK
+
+        @always_inline
+        @parameter
+        def _fill(pa: LDSPtr, pb: LDSPtr):
+            comptime for p in range(APASS):
+                pa.store(
+                    lds_off + p * ROWS * PAD, areg.load[width=NT_VEC](p * NT_VEC)
+                )
+            comptime for p in range(BPASS):
+                pb.store(
+                    lds_off + p * ROWS * PAD, breg.load[width=NT_VEC](p * NT_VEC)
+                )
+
+        # Every fragment of the whole k tile, read from LDS in one burst before
+        # any MFMA issues.  `MT * KSTEPS + NTL * KSTEPS` `ds_read_b64` is only
+        # (MT + NTL) * BK / 2 VGPRs -- 32 for a 64x64 warp tile at BK = 32 --
+        # and it removes the per-k-step LDS dependency entirely: without it each
+        # k step's MFMAs wait on that step's own reads, and the whole tile is a
+        # chain of four such waits.
+        var af = stack_allocation[MT * KSTEPS * 4, dtype]()
+        var bf = stack_allocation[NTL * KSTEPS * 4, dtype]()
+
+        @always_inline
+        @parameter
+        def _read_frags(pa: LDSPtr, pb: LDSPtr):
+            var abase = (wm0 + lo) * PAD + 4 * hi
+            var bbase = (wn0 + lo) * PAD + 4 * hi
+            comptime for s in range(KSTEPS):
+                comptime for i in range(MT):
+                    af.store(
+                        (s * MT + i) * 4,
+                        pa.load[width=4](
+                            abase + i * NT_MMA * PAD + s * NT_MMA_K
+                        ),
+                    )
+                comptime for j in range(NTL):
+                    bf.store(
+                        (s * NTL + j) * 4,
+                        pb.load[width=4](
+                            bbase + j * NT_MMA * PAD + s * NT_MMA_K
+                        ),
+                    )
+
+        @always_inline
+        @parameter
+        def _do_mma():
+            comptime for s in range(KSTEPS):
+                comptime for i in range(MT):
+                    comptime for j in range(NTL):
+                        var d = acc.load[width=16]((i * NTL + j) * 16)
+                        mma(
+                            d,
+                            af.load[width=4]((s * MT + i) * 4),
+                            bf.load[width=4]((s * NTL + j) * 4),
+                            d,
+                        )
+                        acc.store((i * NTL + j) * 16, d)
+
+        var ca = smem
+        var cb = smem + SA
+        var na = smem + (SA + SB if STAGES == 2 else 0)
+        var nb = na + SA
+
+        var n_kt = ceildiv(k, BK)
+        _load(0)
+        _fill(ca, cb)
+        _nt_barrier()
+
+        var kt = 0
+        while kt + 1 < n_kt:
+            # Order matters and is the whole pipeline: this tile's fragments
+            # leave LDS first, then the next tile's global loads are issued,
+            # then LDS is refilled, and only then do the MFMAs run -- so the
+            # matrix work covers both the global latency and the LDS store.
+            _read_frags(ca, cb)
+            _load(kt + 1)
+            comptime if STAGES == 1:
+                # One buffer: the reads above must finish before it is refilled.
+                _nt_barrier()
+            _fill(na, nb)
+            _do_mma()
+            _nt_barrier()
+            comptime if STAGES == 2:
+                var ta = ca
+                ca = na
+                na = ta
+                var tb = cb
+                cb = nb
+                nb = tb
+            kt += 1
+        _read_frags(ca, cb)
+        _do_mma()
+
+        # Every accumulator is read and rounded HERE, unconditionally and in
+        # straight-line code, and the fence below stops any of it from being
+        # sunk into the guarded stores.  This is not decoration.  On this pin
+        # gfx942 miscompiles a read of an MFMA destination that the scheduler
+        # has placed too close to the MFMA: with the rounding left inside the
+        # edge guard, the last two of the sixteen accumulator registers of the
+        # FIRST accumulator read back their pre-MFMA value, so every output in
+        # that 4x32 block is short by exactly one k step -- reproduced at
+        # (128, 128, 768), where every guard is trivially true, so only the
+        # branch differs.  `s_barrier` does not fix it and
+        # `llvm.amdgcn.sched.barrier` does, which is what identifies it as
+        # scheduling rather than synchronization.  It is the same defect family
+        # as optimization_journal.md "Defect analysis D6", where MAX's
+        # multistage kernel dropped one MFMA k step into two of four
+        # accumulator elements and a deeper pipeline made it vanish.
+        var out = stack_allocation[MT * NTL * 16, dtype]()
+        comptime for i in range(MT * NTL):
+            out.store(i * 16, acc.load[width=16](i * 16).cast[dtype]())
+        llvm_intrinsic["llvm.amdgcn.sched.barrier", NoneType](Int32(0))
+
+        # Register p of accumulator (i, j) is row
+        # `wm0 + 32i + 8*(p//4) + (p%4) + 4*hi`, column `wn0 + 32j + lo`, so one
+        # store instruction writes 32 consecutive columns of one row per
+        # half-wave: 64 contiguous bytes, fully coalesced.
+        var cbase = (m0 + wm0 + 4 * hi) * n + n0 + wn0 + lo
+        # Distance to the edge, so each guard is one compare against a
+        # compile-time offset instead of a recomputed address.
+        var rmax = m - (m0 + wm0 + 4 * hi)
+        var cmax = n - (n0 + wn0 + lo)
+        comptime for i in range(MT):
+            comptime for j in range(NTL):
+                comptime dc = j * NT_MMA
+                comptime if not MASK_STORE:
+                    comptime for p in range(16):
+                        comptime dr = i * NT_MMA + 8 * (p // 4) + (p % 4)
+                        c[cbase + dr * n + dc] = out[(i * NTL + j) * 16 + p]
+                else:
+                    if dc < cmax:
+                        comptime for p in range(16):
+                            comptime dr = i * NT_MMA + 8 * (p // 4) + (p % 4)
+                            if dr < rmax:
+                                c[cbase + dr * n + dc] = out[
+                                    (i * NTL + j) * 16 + p
+                                ]
+
+
+@always_inline
+def _nt_mfma_gemm[
+    dtype: DType,
+    BM: Int,
+    BN: Int,
+    BK: Int,
+    WM: Int,
+    WN: Int,
+    STAGES: Int = 2,
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Enqueue the NT MFMA GEMM, dropping the edge guards when they are unused.
+
+    Both instantiations handle every runtime shape correctly; the guarded one is
+    simply slower, so it is selected only when the runtime extents actually have
+    an edge.
+    """
+    comptime THREADS = (BM // WM) * (BN // WN) * 64
+    if m % BM == 0 and n % BN == 0 and k % BK == 0:
+        ctx.enqueue_function[
+            _nt_mfma_kernel[dtype, BM, BN, BK, WM, WN, STAGES, False, False]
+        ](
+            _make_ptr[dtype](c_addr),
+            _make_ptr[dtype](a_addr).as_immutable(),
+            _make_ptr[dtype](b_addr).as_immutable(),
+            m,
+            n,
+            k,
+            grid_dim=(ceildiv(n, BN), ceildiv(m, BM)),
+            block_dim=(THREADS,),
+        )
+    else:
+        ctx.enqueue_function[
+            _nt_mfma_kernel[dtype, BM, BN, BK, WM, WN, STAGES, True, True]
+        ](
+            _make_ptr[dtype](c_addr),
+            _make_ptr[dtype](a_addr).as_immutable(),
+            _make_ptr[dtype](b_addr).as_immutable(),
+            m,
+            n,
+            k,
+            grid_dim=(ceildiv(n, BN), ceildiv(m, BM)),
+            block_dim=(THREADS,),
+        )
 
 
 @always_inline
