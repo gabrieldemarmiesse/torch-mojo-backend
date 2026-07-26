@@ -2464,15 +2464,14 @@ def _nt_mfma_kernel[
         var kt = 0
         while kt + 1 < n_kt:
             # Order matters and is measured, not assumed.  This tile's
-            # fragments leave LDS into registers first, the next tile's global
-            # loads are ISSUED next (so their latency runs under the barrier and
-            # the refill), the refill follows -- it is what waits on them -- and
-            # the MFMAs come last, filling the gap between the refill and the
-            # barrier that publishes it.  Moving the MFMAs ahead of the refill,
-            # which looks like the textbook order, measures 25% SLOWER
-            # (301 against 379 TFLOP/s at 49152x2304x768): it leaves only the
-            # vmcnt wait and the LDS stores between the two barriers, so the
-            # whole workgroup waits there in lockstep.
+            # fragments leave LDS into registers first, in one burst, and the
+            # next tile's global loads are ISSUED next so their latency runs
+            # under the MFMAs.  Reading the fragments one k step ahead of the
+            # MFMA that needs them instead of in a burst -- which halves their
+            # peak register footprint -- measures 3.4% slower weighted, and
+            # putting the whole MFMA sequence AFTER the refill, which is what
+            # the transposed-B work measured, is what the split below improves
+            # on.
             #
             # Unrolling this by two so that both LDS stage bases become
             # compile-time offsets -- which removes all 28 `v_lshl_add_u32`
@@ -2489,8 +2488,22 @@ def _nt_mfma_kernel[
                 # One buffer: every wave must be done reading it before it is
                 # refilled.
                 _nt_barrier()
-            _fill(na, nb)
-            _do_mma[0, KSTEPS]()
+                _fill(ca, cb)
+                _do_mma[0, KSTEPS]()
+            else:
+                # The refill sits in the MIDDLE of the MFMA sequence, not before
+                # all of it.  Placed last, its three `ds_write`s and the
+                # `s_waitcnt lgkmcnt(0)` the barrier needs are a tail with only
+                # one MFMA left to cover them; placed first, the `s_waitcnt
+                # vmcnt(0)` in front of them is reached before the matrix pipe
+                # has any queued work.  Halfway, the writes issue after about
+                # 1000 cycles of MFMA -- long enough that the global loads have
+                # landed -- and retire under the remaining half.  Measured, one
+                # case per process, NN weighted: refill last 1.085, after one
+                # k step of four 1.085, after THREE 1.086, after two **1.057**.
+                _do_mma[0, KSTEPS // 2]()
+                _fill(na, nb)
+                _do_mma[KSTEPS // 2, KSTEPS]()
             _nt_barrier()
             comptime if STAGES == 2:
                 var ta = ca
