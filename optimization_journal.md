@@ -4110,3 +4110,282 @@ dQ, where an FP32 oracle says we are the closer of the two).
 is now 12.836 against ROCm's 11.422, and what remains is 174 kernels of genuine
 dtype casts, not layout. The step gap to ROCm is 9.78 ms, 88% of it the two
 Linear GEMM rows and the cross-entropy backward.
+
+# nanoGPT Linear GEMM, MI300X — the two-tile k loop, 2026-07-26
+
+Sixth pass over `harness/nanogpt_train/bench_linear_gemm.mojo`, all three
+variants at once. Entry state, re-measured this session: step **166.54 ms**
+(p10 166.11 / p90 166.75) against PyTorch-ROCm's 156.73, and one case per
+process NN 1.058, NT 1.098, TN 1.417 on the harness / 1.176 for the copy-free
+route production actually takes.
+
+**Measurement protocol, and one thing that could not be honoured.** >= 25 warmups
+and >= 100 individually synchronized iterations; one case per process; timings
+never from a `--pmc` run. Clock pinning was requested mid-pass and **is not
+available on this part**: `power_dpm_force_performance_level` is present and
+mode-writable but the driver refuses the write (`EINVAL`, value stays `auto`),
+`pp_dpm_sclk` is read-only, and `rocm-smi --setperflevel high` answers "Not
+supported on the given system". Every number below is therefore UNPINNED, and
+every before/after pair below was re-measured **interleaved case by case in one
+session** -- base binary then new binary for the same case, back to back -- so
+that both sides see the same thermal state. That is the strongest available
+substitute for a pin and it is what the tables below report.
+
+Also recorded because it invalidated an hour of numbers: a `sweep_gemm` process
+killed by a tool timeout stayed resident holding **185 GB of VRAM** without
+appearing in `ps`; the next `bench_nanogpt_train.py` died with
+`hipErrorOutOfMemory`. `rocm-smi --showpids` finds it where `ps` does not.
+
+## What actually binds these GEMMs, measured four ways
+
+The three variants differ only in operand layout, so the first thing to settle
+was what the layout costs. `_dense_mfma_route` was instantiated for all four
+combinations on ONE shape, (49152, 768, 3072), same buffers, same all-ones fill,
+only the strides the kernel is told about differing:
+
+| layout | A | B | us | TFLOP/s |
+|---|---|---|---:|---:|
+| NN | k-major `(m,k)` | native `(k,n)` | **467.4** | 496 |
+| AN | native `(k,m)` | k-major `(n,k)` | 482.2 | 481 |
+| NT | k-major | k-major | 530.2 | 437 |
+| TN | native | native | 530.6 | 437 |
+
+**Both MIXED layouts are fast and both PURE layouts are 13% slower, by the same
+amount.** That is not a resource story: counters on the three shipped
+instantiations say the pure layouts are on opposite sides of every count.
+`SQ_LDS_IDX_ACTIVE` is **identical** (2211840) for all three and
+`SQ_LDS_BANK_CONFLICT` is 0 for all three; `SQ_INSTS_LDS` is NT 331776 < NN
+414720 < TN 502272 and `SQ_INSTS_VALU` is NT 988128 < NN 1546848 < TN 2093760 --
+i.e. NT has the FEWEST LDS instructions and the FEWEST VALU instructions and is
+the slowest, and NN sits exactly at the midpoint of both counts and is the
+fastest. `SQ_INSTS_VMEM` is NT 73728 < NN 101376 < TN 139968, so there is no
+spill traffic in any loop either. The only counter that separates them the right
+way is **`SQ_WAIT_INST_LDS`: NN 982007, NT 2001499** -- the pure layout spends
+twice as long unable to issue an LDS instruction, with the same LDS work.
+
+Two independent effects were then separated.
+
+**Effect 1: a k-major operand loses ~20% per k tile when its row stride is a
+multiple of 512 bytes.** At `BK = 32` a k-major tile row is 64 bytes, exactly
+half a line, and the other half is the next k tile's. Sweeping k on
+(49152, 768, n=768) with NT, in cycles per k tile net of the epilogue:
+
+| k | row stride | stride/64 | cycles/k tile |
+|---:|---:|---:|---:|
+| 3072 | 6144 | 96 | 3580 |
+| **3104** | 6208 | 97 | **2982** |
+| **3200** | 6400 | 100 | **2989** |
+| 3328 | 6656 | 104 | 3613 |
+| 3584 | 7168 | 112 | 3654 |
+| 4096 | 8192 | 128 | 3591 |
+
+Fast exactly when the stride is NOT a multiple of 512 bytes, and k = 3104 runs
+14.5% faster than k = 3072 while doing 1% more work. `TCP_TCC_READ_REQ` is
+**identical per unit work** across the two (28311552 at k = 3072 and 28606464 at
+k = 3104, which is 97/96 of it exactly), so the L1 behaves the same; `FETCH_SIZE`
+is **482 MB against 380 MB**. The lines are fetched, evicted and refetched, and
+the eviction is an address-mapping property. It only appears when the operand
+exceeds the 256 MB Infinity Cache -- at k = 768 the same A is 75 MB and the
+penalty is absent, which is why `mlp_c_proj_fwd` (A = 302 MB) was the one NT case
+at 1.245 while the four k = 768 cases sat at 1.07-1.08.
+
+**Effect 2: the pure layouts want a different k-loop body.** Below.
+
+## Change 35 — two k tiles per trip when both operands share a layout
+
+**Hypothesis.** The one-tile body refills the stage the NEXT trip will read and
+swaps the two stage pointers, so every LDS address is a runtime value and each
+trip has one refill. A body that runs two k tiles, one out of each stage, and
+refills each stage right after the barrier that proves every wave has read it,
+keeps the barrier rate at one per k tile (each of the two barriers does double
+duty), fixes the stage pointers, and gives the scheduler a body with two
+independent halves.
+
+**Predicted effect.** Better on the layouts whose LDS issue is stalling, i.e.
+the pure ones.
+
+**Measured effect.** One shape per process, (49152, 768, 3072), and it is
+layout-selective in exactly the way the diagnosis predicts:
+
+| layout | one-tile body | two-tile body | best refill position |
+|---|---:|---:|---|
+| NT (both k-major) | 530.2 us | **460.0** | 3 of 4 k steps |
+| TN (both native) | 531.9 | **476.7** | 2 of 4 |
+| NN (mixed) | **467.4** | 477.8 | 3 of 4, still a loss |
+
+It also only pays with the refill LATE in the MFMA sequence, which is why the
+first attempt looked like a regression: at `FILL_AT = 0`, which is what the
+shipped NT route used, the two-tile body measures 141.5 -> 153.4 us on
+(49152, 768, 768) and 537.6 -> 588.0 on (49152, 3072, 768). At `FILL_AT = 3` the
+same shapes are 141.4 -> 128.8 and 537.6 -> 480.7. Each trip has two refills, and
+each needs queued matrix work in front of it.
+
+`FILL_AT` sweeps for the accepted bodies, (49152, 768, 3072): NT 476.1 / 467.7 /
+**460.0** at 1 / 2 / 3; TN 485.4 / **476.7** / 505.4; TN deep-k
+(50304, 768, 49152) 7187.5 at 2 against 7581.7 at 3. NN with the two-tile body
+was swept over all four positions (533 / 512 / 478 / 484) and never reaches its
+own one-tile 467.
+
+So `WBODY` is derived as `A_KMAJOR == B_KMAJOR`, with `FILL_AT` 3 for the
+k-major pair and 2 for the native pair, and the mixed layout keeps what it had.
+The launcher instantiates both bodies and picks at runtime, because the two-tile
+body needs an EVEN number of k tiles in every slab -- `k_per % (2 * BK) == 0` --
+which is a runtime property.
+
+**Decision.** Accept.
+
+**A defect the two-tile body introduced, and the gate that caught it.** The last
+trip's refill of stage 1 is the one LDS write in the loop with no barrier after
+it, and the tail read that stage without one. The all-ones gate passed (stale LDS
+holds the same value), the chunk gate passed, and **`--pattern-check=1` failed on
+all five NT cases**, 23.683 ms of the per-step total, because its operands are
+nonzero only on the K edges. One `_nt_barrier()` before the tail's second read
+fixes it. This is the second time this session's gate suite has caught something
+an all-ones check cannot see; the pattern gate earns its keep.
+
+## Change 36 — a wide output dtype reads one accumulator at a time
+
+`rocprofv3` on the split-K TN instantiation reported **148 bytes of scratch per
+thread** at VGPR 128. The epilogue reads all sixteen accumulators into a second
+block before storing, to keep every read of an MFMA destination away from a
+branch (journal D8); with a BF16 output that second block is 32 VGPRs on top of
+the 64 live accumulators, but the split-K workspace is FP32 and it is 64 more.
+A wide output dtype now reads ONE accumulator at a time, each read fenced on
+both sides, which preserves the invariant at a sixteenth of the peak cost.
+Scratch is 0 on that instantiation now. On its own it measured nothing (481.4 ->
+481.4 us at (2304, 768, 49152)); with change 35 the same instantiation is 445.2.
+
+## Change 37 — transpose the weight so the data gradient is a k-major pair
+
+**Hypothesis.** The data gradient is the mixed layout, so change 35 leaves it
+behind. Its B operand is the weight, `(k, n)`, and a k-major B is one transpose
+away. The transpose moves `4 * n * k` bytes and the GEMM does `2 * m * n * k`
+FLOP, so `n * k` cancels and the condition is a bound on m alone: requiring the
+transpose to cost under a hundredth of the GEMM (a quarter of the smallest
+measured gain) is `m >= 200 * GEMM_RATE / TRANSPOSE_BW`, about 30300 with the
+3.3 TB/s change 28 measured and 500 TFLOP/s for the core.
+
+**Measured effect.** This route against `_nt_mfma_route` on the same extents,
+one shape per process:
+
+| shape | mixed (NN) | k-major pair | gain |
+|---|---:|---:|---:|
+| (49152, 768, 768) | 138.9 us | 128.6 | 7.4% |
+| (49152, 768, 2304) | 353.0 | 341.4 | 3.3% |
+| (49152, 768, 3072) | 462.6 | 447.1 | 3.5% |
+| (49152, 3072, 768) | 522.4 | 481.7 | 7.8% |
+| (49152, 768, 50304) | 6729.8 | 6109.1 | **9.2%** (621.7 TFLOP/s) |
+
+The transposes cost 2-47 us against those GEMMs, i.e. 0.6-0.8% of them. Every
+harness number below has the transpose inside it. The k loop visits the same k
+in the same order, so the outputs are bit-identical to the route it replaces.
+
+**Decision.** Accept, gated on the derived bound on m, on the grid gate
+`_nt_mfma_route` itself applies, and on the divisibility the vectorized transpose
+needs. The GPT-2 prefill and decode shapes are all below the m bound and are
+untouched.
+
+## Where this pass ended
+
+Interleaved case by case, base binary then new binary, 25 warmups and 100
+synchronized iterations each, unpinned:
+
+| case | variant | base us | new us | rocm us | base | new |
+|---|---|---:|---:|---:|---:|---:|
+| attn_c_attn_fwd | NT | 431.69 | 371.45 | 382.56 | 1.128 | **0.971** |
+| attn_c_proj_fwd | NT | 142.32 | 129.14 | 158.05 | 0.900 | **0.817** |
+| mlp_c_fc_fwd | NT | 538.11 | 481.91 | 498.14 | 1.080 | **0.967** |
+| mlp_c_proj_fwd | NT | 536.02 | 447.50 | 426.62 | 1.256 | 1.049 |
+| lm_head_fwd | NT | 8275.67 | 7305.41 | 7655.58 | 1.081 | **0.954** |
+| attn_c_attn_dgrad | NN | 353.12 | 326.28 | 343.44 | 1.028 | **0.950** |
+| attn_c_proj_dgrad | NN | 139.47 | 141.66 | 141.38 | 0.986 | 1.002 |
+| mlp_c_fc_dgrad | NN | 467.71 | 414.80 | 434.10 | 1.077 | **0.955** |
+| mlp_c_proj_dgrad | NN | 521.77 | 498.86 | 467.98 | 1.115 | 1.066 |
+| lm_head_dgrad | NN | 6728.93 | 6148.95 | 6456.53 | 1.042 | **0.953** |
+| attn_c_attn_wgrad | TN | 581.07 | 582.33 | 360.16 | 1.614 | 1.617 |
+| attn_c_proj_wgrad | TN | 197.66 | 197.87 | 152.15 | 1.299 | 1.301 |
+| mlp_c_fc_wgrad | TN | 656.24 | 656.11 | 460.34 | 1.425 | 1.425 |
+| mlp_c_proj_wgrad | TN | 527.70 | 527.32 | 452.09 | 1.167 | 1.166 |
+| lm_head_wgrad | TN | 9470.84 | 9351.98 | 6203.16 | 1.527 | 1.508 |
+
+**NN 1.061 -> 0.984, NT 1.111 -> 0.969**, and the harness's TN is unchanged by
+construction: it materializes A^T first, so its TN cases are the MIXED
+instantiation, not the both-native one production runs. Timed directly, one shape
+per process, interleaved:
+
+| case | base us | new us | rocm us | base | new |
+|---|---:|---:|---:|---:|---:|
+| attn_c_attn_wgrad | 482.08 | 445.19 | 360.16 | 1.339 | 1.236 |
+| attn_c_proj_wgrad | 171.84 | 154.35 | 152.15 | 1.129 | **1.014** |
+| mlp_c_fc_wgrad | 509.11 | 490.59 | 460.34 | 1.106 | 1.066 |
+| mlp_c_proj_wgrad | 508.04 | 488.05 | 452.09 | 1.124 | 1.080 |
+| lm_head_wgrad | 7354.00 | 7191.86 | 6203.16 | 1.186 | 1.159 |
+
+**Production TN 1.176 -> 1.121.** Weighted over what the step issues, the three
+variants together are **8.34 ms of GEMM gap before and 1.68 ms after**
+(79.97 -> 73.32 ms against 71.64).
+
+Fifteen of fifteen cases pass all three gates on the whole table (default,
+`--pattern-check=1`, `--chunk-check=1`), and so do fourteen deliberately awkward
+shapes: an ODD k tile count (800, which takes the one-tile fallback), an even one
+(832), exactly one and exactly two k tiles, m and n that 256 does not divide
+(49160, 776, 1544), and the transposed-A cases of the same.
+
+## What is left, measured
+
+* **The weight gradient, 2.8 ms of the 3.3.** `attn_c_attn_wgrad` is 1.236 and
+  `rocprofv3` splits it: GEMM 382.5 us and split-K reduction 49.4 us, the
+  reduction reading 226 MB at 4.65 TB/s, which is above HBM and within 1% of what
+  change 27 measured for the same traffic. Its 27 output tiles need 32 K slabs to
+  fill the device and the slab search still says 32 is the best of the divisors of
+  the k tile count: at the measured 3600 cycles per k tile, 16 slabs cost
+  495 + 25 us and 64 cost 371 + 99 against 371 + 49 for 32. The reduction is
+  structural at this tile size, and a 128x128 tile that would need no split needs
+  2.7 GB of operand traffic in 400 us, i.e. 6.8 TB/s.
+* **`lm_head_wgrad`, 528 TFLOP/s against ROCm's 612**, both operands native,
+  591 tiles so no split. 3264 cycles per k tile against the 2048-cycle MFMA
+  floor. An XCD band sweep on it says 1 band 7085.8 us / 2 bands 7142.6 / 4
+  7139.9 / 8 7194.6 -- the shipped value (the XCD count, 8) is the worst by 1.5%,
+  which is at the edge of the run-to-run spread and was not changed on one shape's
+  evidence.
+* **The 512-byte stride penalty on k-major operands** is now half fixed by
+  accident: the two-tile body reads the same halves in the same trip. Loading them
+  in ONE 128-byte global load per row was built and measured on top of it and
+  REJECTED: 480 us against 460 for the plain two-tile body at (49152, 768, 3072),
+  because the second staging vector per operand costs more than the line reuse
+  recovers. `mlp_c_proj_fwd` at 1.049 is what remains of the effect.
+* **Grid quantization, 5.3%**, unchanged and still needing Stream-K.
+
+## Regression checks, all after both changes
+
+| check | recorded | now |
+|---|---|---|
+| `bench_attention_bmm` default / pattern / causal | 51.234 / 51.037 / 50.490 ms | 51.217 / 51.003 / 50.473, 6/6 pass |
+| `tests/test_eager_kernels.py`, serial | 553 passed, 93 skipped, 1 failed | **553 passed, 93 skipped, 1 failed** (`test_bf16_v3_source_dependency_and_kernel_contract`, pre-existing) |
+| GPT-2 decode, five shapes | - | -0.9% to +0.5% |
+| GPT-2 prefill, fifteen shapes | - | -10.4% to +0.4% |
+| fourteen edge shapes x three gates | - | all pass |
+
+## The step, and the clock that could not be pinned
+
+`bench_nanogpt_train.py --device mojo --warmup 5 --iters 20`, base source and
+HEAD measured **back to back in one session** with the eager cache rebuilt for
+each, both `clocks_pinned: false` because the pin is refused on this VF:
+
+| source | median | p10 | p90 |
+|---|---:|---:|---:|
+| base (d0fe31b) | 167.02 ms | 166.75 | 167.48 |
+| HEAD | **162.39** | 162.09 | 162.65 |
+
+**166.54 -> 162.39 ms against PyTorch-ROCm's recorded 156.73, i.e. 1.063 ->
+1.036.** Two independent measurements of each side agree: the base measured
+166.54 (p10 166.11 / p90 166.75) at the start of the session and 167.02 at the
+end of it, and HEAD measured 162.59 and then 162.39 -- so the session's own
+thermal drift on this workload is about 0.3%, which is the size of the effect the
+clock pin was meant to remove and is an order of magnitude below the change.
+
+The GEMM's own gap fell 8.34 -> 1.68 ms while the step fell 4.63 ms. The
+difference is not accounted for here: the harness synchronizes every iteration
+and the step does not, so 49 + 49 + 61 launches per step carry an overhead in the
+harness numbers that the step overlaps. What the step says is the number that
+counts.
