@@ -1969,6 +1969,19 @@ def fast_aten_alias(tensor):
     t = _t(tensor)
     if t is None:
         return NOT_HANDLED
+    # PyTorch dispatches alias on a saved tensor that was an OUTPUT of an
+    # autograd Function, which is how a saved-tensor unpack hook's result first
+    # reaches an op. A hook may hand back a TorchMojoTensor stripped of its
+    # allocation holder, and every accessor below would then fail with a bare
+    # AttributeError from deep inside a dispatch. Name the invariant here, at
+    # the boundary where such a tensor arrives, rather than on the hot accessor
+    # paths: alias is rare, so this check is free where it matters.
+    if not hasattr(t, "_holder"):
+        raise RuntimeError(
+            "saved-tensor hook returned an unusable Mojo tensor without "
+            "a TorchMojoTensor allocation holder; its unpack hook must "
+            "return a complete TorchMojoTensor or a host tensor"
+        )
     return _view_of(t, t._shape, t._strides, t._offset)
 
 

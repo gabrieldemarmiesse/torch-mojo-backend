@@ -219,6 +219,11 @@ class _FusedFlashAttentionAutograd(torch.autograd.Function):
         saved = (q_used, k_used, v_used, output, lse)
         ctx.save_for_backward(*saved)
         ctx.saved_payloads = tuple(_SavedMojoPayload(tensor) for tensor in saved)
+        # Same introspection surface as the decomposition's node, so saved-tensor
+        # hook tests and debugging tools can name what this one holds. The set
+        # differs on purpose: O(n*d) inputs plus the log-sum-exp, rather than the
+        # O(n^2) probability matrix.
+        ctx.saved_names = ("query", "key", "value", "output", "logsumexp")
         ctx.is_causal = bool(is_causal)
         ctx.scale = scale
         ctx.needed_input_gradients = tuple(

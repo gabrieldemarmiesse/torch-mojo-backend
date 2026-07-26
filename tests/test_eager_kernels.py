@@ -5848,9 +5848,21 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
     expected_transpose_b_bmm,
     expected_fused_backward,
 ):
-    """Each single-input gradient skips unrelated saves and BMM branches."""
+    """Each single-input gradient skips unrelated saves and BMM branches.
+
+    This pins the DECOMPOSITION's internals -- which tensors it saves, how many
+    batched GEMMs each requested gradient costs -- so the fused gfx942 path is
+    disabled below.  That path is a different algorithm with a deliberately
+    different profile: it saves Q/K/V/O/L, which is O(n*d) rather than the
+    decomposition's O(n^2) probability matrix, and it produces dQ, dK and dV
+    together because all three consume the same recomputed scores.  Its own
+    contract is pinned by
+    ``test_fused_flash_attention_partial_gradients_match_reference``.
+    """
     from torch_mojo_backend.eager_kernels import aten_fast
     from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
+
+    monkeypatch.setattr(aten_fast, "_fused_fa_inputs", lambda *a, **k: None)
 
     generator = torch.Generator().manual_seed(20260718)
     batch, heads, query_length, key_length, head_dim = 2, 2, 5, 7, 3
@@ -5945,8 +5957,71 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
             )
 
 
-def test_fast_sdpa_saved_tensor_hooks_own_saved_allocations(mojo_gpu):
-    """CPU pack results, not ctx payloads, own SDPA's saved activations."""
+@pytest.mark.parametrize("requires", ["query", "key", "value"])
+def test_fused_flash_attention_partial_gradients_match_reference(mojo_gpu, requires):
+    """The fused path returns exactly the requested gradient, and it is right.
+
+    Same shape as the decomposition's partial-gradient test, and deliberately
+    non-square with is_causal=True: query_length 5 against key_length 7 is where
+    top-left and bottom-right causal alignment disagree, so a kernel using the
+    wrong convention fails here rather than silently passing on square inputs.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    generator = torch.Generator().manual_seed(20260718)
+    batch, heads, query_length, key_length, head_dim = 2, 2, 5, 7, 3
+    host_inputs = [
+        torch.randn(batch, heads, query_length, head_dim, generator=generator),
+        torch.randn(batch, heads, key_length, head_dim, generator=generator),
+        torch.randn(batch, heads, key_length, head_dim, generator=generator),
+    ]
+    grad_output = torch.randn(batch, heads, query_length, head_dim, generator=generator)
+    names = ("query", "key", "value")
+
+    reference_inputs = [
+        tensor.clone().requires_grad_(name == requires)
+        for name, tensor in zip(names, host_inputs, strict=True)
+    ]
+    torch.nn.functional.scaled_dot_product_attention(
+        *reference_inputs, dropout_p=0.0, is_causal=True
+    ).backward(grad_output)
+
+    actual_inputs = [
+        tensor.to(mojo_gpu).requires_grad_(name == requires)
+        for name, tensor in zip(names, host_inputs, strict=True)
+    ]
+    # Only meaningful if the fused path actually claims these inputs.
+    assert (
+        aten_fast._fused_fa_inputs(*actual_inputs, None, 0.0, True, None, False)
+        is not None
+    ), "fused path declined the inputs this test exists to cover"
+
+    torch.nn.functional.scaled_dot_product_attention(
+        *actual_inputs, dropout_p=0.0, is_causal=True
+    ).backward(grad_output.to(mojo_gpu))
+
+    for name, actual, reference in zip(
+        names, actual_inputs, reference_inputs, strict=True
+    ):
+        assert (actual.grad is not None) == (name == requires)
+        if name == requires:
+            assert torch.isfinite(actual.grad.cpu()).all()
+            torch.testing.assert_close(
+                actual.grad.cpu(), reference.grad, atol=3e-2, rtol=3e-2
+            )
+
+
+def test_fast_sdpa_saved_tensor_hooks_own_saved_allocations(mojo_gpu, monkeypatch):
+    """CPU pack results, not ctx payloads, own SDPA's saved activations.
+
+    Pins the DECOMPOSITION's saved set, so the fused gfx942 path is disabled
+    here; the same ownership property is asserted for that path's own,
+    different saved set by the test below.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    monkeypatch.setattr(aten_fast, "_fused_fa_inputs", lambda *a, **k: None)
+
     generator = torch.Generator().manual_seed(20260718)
     batch, heads, query_length, key_length, head_dim = 1, 2, 5, 7, 4
     host_inputs = [
@@ -5988,6 +6063,78 @@ def test_fast_sdpa_saved_tensor_hooks_own_saved_allocations(mojo_gpu):
 
     saved_shapes = [tuple(tensor.shape) for tensor in host_inputs] + [
         (batch, heads, query_length, key_length)
+    ]
+    assert hook_calls == [("pack", "mojo", shape) for shape in saved_shapes] + [
+        ("unpack", "cpu", shape) for shape in saved_shapes
+    ]
+    for actual, reference in zip(actual_inputs, reference_inputs, strict=True):
+        assert actual.grad is not None
+        torch.testing.assert_close(
+            actual.grad.cpu(), reference.grad, atol=3e-2, rtol=3e-2
+        )
+
+
+def test_fused_flash_attention_saved_tensor_hooks_own_saved_allocations(mojo_gpu):
+    """The fused path's saved set is hook-owned too, and it is the smaller one.
+
+    The decomposition saves the O(n^2) probability matrix; this path saves Q, K,
+    V, the output and the per-row log-sum-exp, all O(n*d) except the scalar per
+    query.  At the shape below that is the difference between packing a
+    5x7 matrix and packing a length-5 vector, and the gap grows with sequence.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    generator = torch.Generator().manual_seed(20260718)
+    batch, heads, query_length, key_length, head_dim = 1, 2, 5, 7, 4
+    host_inputs = [
+        torch.randn(batch, heads, query_length, head_dim, generator=generator),
+        torch.randn(batch, heads, key_length, head_dim, generator=generator),
+        torch.randn(batch, heads, key_length, head_dim, generator=generator),
+    ]
+    grad_output = torch.randn(batch, heads, query_length, head_dim, generator=generator)
+    reference_inputs = [tensor.clone().requires_grad_() for tensor in host_inputs]
+    torch.nn.functional.scaled_dot_product_attention(
+        *reference_inputs, dropout_p=0.0, is_causal=False
+    ).backward(grad_output)
+
+    hook_calls = []
+
+    def pack(tensor):
+        hook_calls.append(("pack", tensor.device.type, tuple(tensor.shape)))
+        return tensor.cpu()
+
+    def unpack(tensor):
+        hook_calls.append(("unpack", tensor.device.type, tuple(tensor.shape)))
+        return tensor
+
+    actual_inputs = [tensor.to(mojo_gpu).requires_grad_() for tensor in host_inputs]
+    assert (
+        aten_fast._fused_fa_inputs(*actual_inputs, None, 0.0, False, None, False)
+        is not None
+    ), "fused path declined the inputs this test exists to cover"
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        actual_output = torch.nn.functional.scaled_dot_product_attention(
+            *actual_inputs, dropout_p=0.0, is_causal=False
+        )
+        assert actual_output.grad_fn.saved_names == (
+            "query",
+            "key",
+            "value",
+            "output",
+            "logsumexp",
+        )
+        # With hooks active the packed value owns the allocation, so no payload
+        # may retain the original holder -- that is what would defeat a
+        # CPU/offload hook.
+        assert all(
+            payload.holder is None for payload in actual_output.grad_fn.saved_payloads
+        )
+        actual_output.backward(grad_output.to(mojo_gpu))
+
+    saved_shapes = [tuple(tensor.shape) for tensor in host_inputs] + [
+        (batch, heads, query_length, head_dim),
+        (batch, heads, query_length),
     ]
     assert hook_calls == [("pack", "mojo", shape) for shape in saved_shapes] + [
         ("unpack", "cpu", shape) for shape in saved_shapes
