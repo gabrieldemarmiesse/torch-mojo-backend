@@ -1888,6 +1888,10 @@ comptime NT_MAX_PARTS = 64  # most K slabs the split-K route will consider
 comptime NT_MMA = 32  # both non-contraction extents of the MFMA tile
 comptime NT_MMA_K = 8  # contraction extent of one MFMA
 comptime NT_VEC = 8  # elements per global load and per LDS write
+# k steps of MFMA issued before the next stage's refill, at BK / NT_MMA_K == 4
+# steps per k tile.  Half is measured best for the layouts with a native
+# operand; see `FILL_AT` in the kernel.
+comptime NT_MID_FILL = 2
 
 
 @__llvm_metadata(
@@ -1914,6 +1918,7 @@ def _nt_mfma_kernel[
     SPLITK: Bool = False,
     otype: DType = dtype,
     PAIR: Bool = not A_KMAJOR and not B_KMAJOR,
+    FILL_AT: Int = 0,
 ](
     c: UnsafePointer[Scalar[otype], MutAnyOrigin],
     a: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -1993,6 +1998,9 @@ def _nt_mfma_kernel[
     comptime SA = BM * (PAD if A_KMAJOR else BK)
     comptime SB = BN * (PAD if B_KMAJOR else BK)
 
+    comptime assert (
+        0 <= FILL_AT and FILL_AT <= KSTEPS
+    ), "the refill must land on a k step of the tile"
     comptime assert BK % NT_VEC == 0, "BK must be a multiple of the load width"
     comptime assert (
         WM % NT_MMA == 0 and WN % NT_MMA == 0
@@ -2491,19 +2499,26 @@ def _nt_mfma_kernel[
                 _fill(ca, cb)
                 _do_mma[0, KSTEPS]()
             else:
-                # The refill sits in the MIDDLE of the MFMA sequence, not before
-                # all of it.  Placed last, its three `ds_write`s and the
-                # `s_waitcnt lgkmcnt(0)` the barrier needs are a tail with only
-                # one MFMA left to cover them; placed first, the `s_waitcnt
-                # vmcnt(0)` in front of them is reached before the matrix pipe
-                # has any queued work.  Halfway, the writes issue after about
-                # 1000 cycles of MFMA -- long enough that the global loads have
-                # landed -- and retire under the remaining half.  Measured, one
-                # case per process, NN weighted: refill last 1.085, after one
-                # k step of four 1.085, after THREE 1.086, after two **1.057**.
-                _do_mma[0, KSTEPS // 2]()
+                # `FILL_AT` places the refill of the next stage inside the MFMA
+                # sequence rather than in front of all of it.  At `FILL_AT = 0`
+                # the refill's three `ds_write`s and the `s_waitcnt vmcnt(0)`
+                # that precedes them run before the matrix pipe has any queued
+                # work, and the `s_waitcnt lgkmcnt(0)` the barrier needs is a
+                # tail with nothing to cover it.  Issued halfway through, they
+                # go out after about a thousand cycles of MFMA -- long enough
+                # that the global loads have landed -- and retire under the
+                # remaining half.
+                #
+                # Where the optimum is depends on the body's instruction mix,
+                # so it is a per-route parameter, measured one case per process:
+                # for NN (`_dense_mfma_route`, B native) the weighted ratio is
+                # 1.085 at 0, 1.085 after one k step of four, **1.057** after
+                # two and 1.086 after three; for NT (`_nt_mfma_route`, both
+                # operands k-major, which reads twice as many `ds_read_b64` and
+                # runs no `v_perm`) two measures 1.116 against 1.109 at 0.
+                _do_mma[0, FILL_AT]()
                 _fill(na, nb)
-                _do_mma[KSTEPS // 2, KSTEPS]()
+                _do_mma[FILL_AT, KSTEPS]()
             _nt_barrier()
             comptime if STAGES == 2:
                 var ta = ca
@@ -2582,6 +2597,7 @@ def _nt_mfma_gemm[
     SPLITK: Bool = False,
     otype: DType = dtype,
     PAIR: Bool = not A_KMAJOR and not B_KMAJOR,
+    FILL_AT: Int = 0,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -2625,6 +2641,7 @@ def _nt_mfma_gemm[
                 SPLITK,
                 otype,
                 PAIR,
+                FILL_AT,
             ]
         ](
             _make_ptr[otype](c_addr),
@@ -2656,6 +2673,7 @@ def _nt_mfma_gemm[
                 SPLITK,
                 otype,
                 PAIR,
+                FILL_AT,
             ]
         ](
             _make_ptr[otype](c_addr),
@@ -2806,6 +2824,7 @@ def _dense_mfma_route[
             False,
             dtype,
             PAIR_FILL,
+            NT_MID_FILL,
         ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
         return True
     # Underfilled output grid, deep contraction: slabs of K are the only axis
@@ -2854,6 +2873,7 @@ def _dense_mfma_route[
         True,
         DType.float32,
         PAIR_SPLIT,
+        NT_MID_FILL,
     ](
         Int(ws.unsafe_ptr()),
         a_addr,
