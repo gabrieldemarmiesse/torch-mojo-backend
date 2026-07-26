@@ -4273,10 +4273,28 @@ def fast_fa4_bf16_d64_causal_backward(
 _FUSED_FA_MAX_HEAD_DIM = 256
 
 
+def _fa_strides(t: MojoTensorLike) -> tuple[int, int, int]:
+    """``t``'s (batch, head, seq) element strides for the fused kernels.
+
+    The head_dim stride is not passed: it must be 1, and ``_fused_fa_inputs`` is
+    what guarantees that.
+    """
+    strides = t._strides
+    return (strides[0], strides[1], strides[2])
+
+
 def _fused_fa_inputs(
     query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
 ):
-    """Eligible dense BHTD inputs for the fused gfx942 kernels, or None.
+    """Eligible BHTD inputs for the fused gfx942 kernels, or None.
+
+    The kernels read Q, K and V through their own (batch, head, seq) strides, so
+    the transposed view of BTHD storage that a transformer's
+    ``q.view(B, T, H, D).transpose(1, 2)`` produces -- and that nanoGPT hands
+    over -- is taken as it stands rather than copied. The one layout that cannot
+    be expressed is a strided head_dim axis: that is the axis every vectorized
+    load and every LDS row fill runs along. It is declined here rather than
+    guessed at, and the caller falls through to the decomposition.
 
     No device work: this only inspects shape, stride, dtype and device, which
     is all an eager op is allowed to look at.
@@ -4324,6 +4342,9 @@ def _fused_fa_inputs(
         or head_dim > _FUSED_FA_MAX_HEAD_DIM
     ):
         return None
+    # The innermost axis must be contiguous; every other stride is free.
+    if q._strides[3] != 1 or k._strides[3] != 1 or v._strides[3] != 1:
+        return None
     if scale is not None and (
         not isinstance(scale, int | float)
         or isinstance(scale, bool)
@@ -4346,9 +4367,10 @@ def fast_fused_flash_attention_forward(
     """Fused forward returning ``(output, lse, q, k, v)``, or NOT_HANDLED.
 
     ``lse`` is the per-row log-sum-exp the fused backward consumes; the three
-    returned tensors are the contiguous inputs the kernel actually read, which
-    the backward must be handed rather than the originals (a non-contiguous
-    caller view was copied to get here).
+    returned tensors are exactly the tensors the kernel read, which the backward
+    must be handed rather than re-deriving, because it recomputes the scores from
+    the same bytes. Nothing is copied: each is read through its own
+    (batch, head, seq) strides.
     """
     eligible = _fused_fa_inputs(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
@@ -4356,11 +4378,6 @@ def fast_fused_flash_attention_forward(
     if eligible is None:
         return NOT_HANDLED
     q, k, v = eligible
-    q = _tc(q)
-    k = _tc(k)
-    v = _tc(v)
-    if q is None or k is None or v is None:
-        return NOT_HANDLED
     batch, heads, seq_q, head_dim = q._shape
     seq_kv = k._shape[2]
     scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
@@ -4373,6 +4390,7 @@ def fast_fused_flash_attention_forward(
         k._ptr,
         v._ptr,
         (batch, heads, seq_q, seq_kv, head_dim),
+        _fa_strides(q) + _fa_strides(k) + _fa_strides(v),
         scale_val,
         1 if is_causal else 0,
         q._dtype.value,
@@ -4387,9 +4405,12 @@ def fast_fused_flash_attention_backward(
     """Fused backward returning ``(dq, dk, dv)``, or NOT_HANDLED.
 
     ``query``/``key``/``value``/``output``/``lse`` must be exactly what the
-    fused forward read and wrote.
+    fused forward read and wrote. Like the forward, the five read operands are
+    addressed through their own strides; only a ``grad_output`` whose head_dim
+    axis is strided has to be materialized, because that is the axis the
+    vectorized loads run along.
     """
-    g = _tc(_t(grad_output))
+    g = _t(grad_output)
     q = _t(query)
     k = _t(key)
     v = _t(value)
@@ -4398,6 +4419,17 @@ def fast_fused_flash_attention_backward(
     if g is None or q is None or k is None or v is None or o is None or l is None:
         return NOT_HANDLED
     if g._dtype != q._dtype or tuple(g._shape) != tuple(q._shape):
+        return NOT_HANDLED
+    if g._strides[3] != 1:
+        g = _tc(g)
+        if g is None:
+            return NOT_HANDLED
+    if (
+        q._strides[3] != 1
+        or k._strides[3] != 1
+        or v._strides[3] != 1
+        or o._strides[3] != 1
+    ):
         return NOT_HANDLED
     batch, heads, seq_q, head_dim = q._shape
     seq_kv = k._shape[2]
@@ -4416,6 +4448,11 @@ def fast_fused_flash_attention_backward(
         o._ptr,
         l._ptr,
         (batch, heads, seq_q, seq_kv, head_dim),
+        _fa_strides(g)
+        + _fa_strides(q)
+        + _fa_strides(k)
+        + _fa_strides(v)
+        + _fa_strides(o),
         scale_val,
         1 if is_causal else 0,
         q._dtype.value,
