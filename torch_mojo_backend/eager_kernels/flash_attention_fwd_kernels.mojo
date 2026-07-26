@@ -12,9 +12,16 @@ calls exactly this entry point and defines acceptance.
 
 Invariants any replacement must keep:
 
-* `batch`, `heads`, `seq_q`, `seq_kv` and `head_dim` are RUNTIME values. Tile
-  shapes, pipeline depth and head-dim regimes may be compile-time as long as a
-  runtime dispatch picks between them and every runtime head_dim is handled.
+* `batch`, `heads`, `seq_q`, `seq_kv` and `head_dim` are RUNTIME values, and so
+  is every STRIDE. Tile shapes, pipeline depth and head-dim regimes may be
+  compile-time as long as a runtime dispatch picks between them and every
+  runtime head_dim is handled.
+* Q, K and V are read through a `RowStrides` triple rather than assumed dense,
+  because the real caller hands over `x.view(B, T, H, D).transpose(1, 2)` and
+  materializing that cost 1.83 ms/step of pure copy. `head_dim`'s stride is NOT
+  carried: it must be 1, since that is the axis the 8-element global loads and
+  the LDS tile fills run along. The output and the log-sum-exp are freshly
+  allocated by the caller and stay dense.
 * No allocation, no host transfer, no synchronization: enqueue on the caller's
   `DeviceContext` and return.
 * Never write outside `output`. Q, K and V are read-only.
@@ -93,6 +100,7 @@ the AMDGPU scheduler interleave the clusters itself (`iglp.opt`) and deleting
 instructions outright.
 """
 
+from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     barrier,
@@ -140,6 +148,52 @@ comptime NEG_BIG = SIMD[DType.float32, 16](-1.0e30)
 comptime RAW_FLOOR = Float32(-9.0e29)
 
 
+struct RowStrides(
+    DevicePassable,
+    ImplicitlyCopyable,
+    TrivialRegisterPassable,
+):
+    """Element strides of one `[batch, heads, seq, head_dim]` attention operand.
+
+    The `head_dim` stride is deliberately absent: it must be 1. Every loader
+    here reads eight contiguous head-dim elements per lane, or fills an LDS row
+    along head-dim, so a strided innermost axis is not something this kernel can
+    express -- a caller holding such a layout must decline rather than guess.
+
+    Everything else is free. The three strides are runtime values, so a dense
+    `[B, H, T, D]` tensor and the `x.view(B, T, H, D).transpose(1, 2)` a
+    transformer actually produces are the same code path.
+    """
+
+    comptime device_type: AnyType = Self
+
+    var batch: Int
+    var head: Int
+    var seq: Int
+
+    def __init__(out self, batch: Int, head: Int, seq: Int):
+        self.batch = batch
+        self.head = head
+        self.seq = seq
+
+    def _to_device_type(
+        self,
+        mut encoder: Some[DeviceTypeEncoder],
+        target: MutOpaquePointer[_],
+    ):
+        encoder.encode(self, target)
+
+    @staticmethod
+    def get_type_name() -> String:
+        return "RowStrides"
+
+
+@always_inline
+def dense_strides(heads: Int, seq: Int, head_dim: Int) -> RowStrides:
+    """The strides of a dense row-major `[batch, heads, seq, head_dim]`."""
+    return RowStrides(heads * seq * head_dim, seq * head_dim, head_dim)
+
+
 @always_inline
 def _pack_half[
     dtype: DType, w: Int
@@ -176,6 +230,9 @@ def _flash_attention_fwd_baseline[
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    q_st: RowStrides,
+    k_st: RowStrides,
+    v_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -189,10 +246,13 @@ def _flash_attention_fwd_baseline[
     var batch = Int(block_idx.z)
     var heads = Int(grid_dim.y)
 
-    # [batch, heads, seq, head_dim] row-major.
-    var qkv_head = (batch * heads + head) * head_dim
-    var q_base = qkv_head * seq_q + qi * head_dim
-    var kv_base = qkv_head * seq_kv
+    # Q, K and V are read through their own strides; the output and the
+    # log-sum-exp are dense `[batch, heads, seq_q, ...]` allocations.
+    var bh = batch * heads + head
+    var q_row = batch * q_st.batch + head * q_st.head + qi * q_st.seq
+    var k_base = batch * k_st.batch + head * k_st.head
+    var v_base = batch * v_st.batch + head * v_st.head
+    var o_row = (bh * seq_q + qi) * head_dim
 
     var q_smem = stack_allocation[
         MAX_HEAD_DIM, DType.float32, address_space=AddressSpace.SHARED
@@ -206,7 +266,7 @@ def _flash_attention_fwd_baseline[
 
     var d = tid
     while d < head_dim:
-        q_smem[d] = query[q_base + d].cast[DType.float32]()
+        q_smem[d] = query[q_row + d].cast[DType.float32]()
         acc_smem[d] = 0.0
         d += THREADS
     barrier()
@@ -224,7 +284,7 @@ def _flash_attention_fwd_baseline[
         var j = kv_start + tid
         var s = Float32.MIN_FINITE
         if j < limit:
-            var krow = kv_base + j * head_dim
+            var krow = k_base + j * k_st.seq
             var dot = Float32(0.0)
             for e in range(head_dim):
                 dot += q_smem[e] * key[krow + e].cast[DType.float32]()
@@ -253,7 +313,7 @@ def _flash_attention_fwd_baseline[
                 if jj < limit:
                     partial += (
                         s_smem[t]
-                        * value[kv_base + jj * head_dim + dd].cast[
+                        * value[v_base + jj * v_st.seq + dd].cast[
                             DType.float32
                         ]()
                     )
@@ -270,10 +330,10 @@ def _flash_attention_fwd_baseline[
         var l = Float32(0.0)
         if running_sum > 0.0 and running_max > RAW_FLOOR:
             l = running_max + log(running_sum)
-        lse[(batch * heads + head) * seq_q + qi] = l
+        lse[bh * seq_q + qi] = l
     var do = tid
     while do < head_dim:
-        output[q_base + do] = (acc_smem[do] * inv).cast[dtype]()
+        output[o_row + do] = (acc_smem[do] * inv).cast[dtype]()
         do += THREADS
 
 
@@ -284,13 +344,14 @@ def _flash_attention_fwd_baseline[
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(THREADS)),
     `rocdl.waves_per_eu`=SIMDSize(WAVES_PER_EU),
 )
-@__name(t"fa_mfma_{dtype}_h{HD}_n{BN}_q{QT}_x{EXACT}")
+@__name(t"fa_mfma_{dtype}_h{HD}_n{BN}_q{QT}_x{EXACT}_d{DENSE}")
 def _fa_mfma[
     dtype: DType,
     HD: Int,
     BN: Int,
     QT: Int,
     EXACT: Bool,
+    DENSE: Bool,
     WAVES_PER_EU: Int,
     IGLP: Int,
     PEEL: Bool,
@@ -300,6 +361,9 @@ def _fa_mfma[
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    q_st: RowStrides,
+    k_st: RowStrides,
+    v_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -314,6 +378,22 @@ def _fa_mfma[
     `QT` the number of 32-query MFMA tiles each wave owns, so the workgroup
     covers `4 * 32 * QT` query rows. `EXACT` asserts `head_dim == HD` and drops
     the per-element head-dim bound checks from the loaders.
+
+    `DENSE` asserts that `q_st`, `k_st` and `v_st` are exactly the row-major
+    strides of `[batch, heads, seq, head_dim]`, which lets every row offset in
+    the loaders go back to being a compile-time immediate. It is not cosmetic:
+    the general form measures 535.1 us/layer against 511.2 on the nanogpt case,
+    because the V loader issues sixteen scalar global reads per tile and each
+    one then needs its own address add instead of an immediate offset. The
+    dispatch picks the specialization whenever the strides happen to be dense.
+
+    The dense arm still measures 515.9 rather than 511.2, and that 0.9% is NOT
+    the indexing: a build whose body never mentions the strides at all measures
+    the same, and the gap scales with wave count rather than launch count, so it
+    is the three extra structs in the kernarg segment. Splitting into two kernel
+    entry points so the dense one keeps the old argument list does not recover
+    it either (517.8) -- the `@always_inline` body then costs what the kernargs
+    did. Both routes were measured; see the journal entry for this change.
     """
     comptime NW = 4
     comptime BM = NW * 32 * QT
@@ -343,9 +423,33 @@ def _fa_mfma[
         var hi = lane // 32  # which half-wave, i.e. which K quad
 
         var heads = Int(grid_dim.y)
-        var bh = Int(block_idx.z) * heads + Int(block_idx.y)
-        var q_base = bh * seq_q * head_dim
-        var kv_base = bh * seq_kv * head_dim
+        var bz = Int(block_idx.z)
+        var by = Int(block_idx.y)
+        var bh = bz * heads + by
+        # Read bases follow each operand's own strides; the output and the
+        # log-sum-exp are dense.
+        var q_base = bz * q_st.batch + by * q_st.head
+        var k_base = bz * k_st.batch + by * k_st.head
+        var v_base = bz * v_st.batch + by * v_st.head
+        var o_base = bh * seq_q * head_dim
+        comptime if DENSE:
+            q_base = o_base
+            k_base = bh * seq_kv * head_dim
+            v_base = k_base
+
+        # The row strides. Under `DENSE` these fold to `HD` whenever the head
+        # dimension is exact, which is what restores the immediate offsets.
+        var qss = q_st.seq
+        var kss = k_st.seq
+        var vss = v_st.seq
+        comptime if DENSE:
+            qss = head_dim
+            kss = head_dim
+            vss = head_dim
+            comptime if EXACT:
+                qss = HD
+                kss = HD
+                vss = HD
 
         # Heaviest query block first: under a causal mask the last block does
         # `grid_dim.x` times the work of the first, and blocks are dispatched
@@ -375,7 +479,7 @@ def _fa_mfma[
         comptime for qt in range(QT):
             var qg = q_row0 + qt * 32 + lo
             var live = qg < seq_q
-            var qrow = q_base + qg * head_dim + 4 * hi
+            var qrow = q_base + qg * qss + 4 * hi
             comptime for s in range(KSTEPS):
                 var v = SIMD[dtype, 4](0)
                 comptime if EXACT:
@@ -407,22 +511,22 @@ def _fa_mfma[
 
         var sl = scale * LOG2E
 
-        # A `head_dim` the compiler knows turns every operand offset into an
-        # immediate; a runtime one turned 41 `v_lshl_add_u64` per tile loose in
-        # the loop.  The row stride is also folded into a pointer bump so the
-        # tile index never enters an address.
+        # The row stride is folded into a pointer bump so the tile index never
+        # enters an address. What the loaders still pay for when it is a runtime
+        # value is the WITHIN-tile row offsets: `ci * KROW_STEP * kss` and
+        # `(4*vi_group + j) * vss` are compile-time immediates only under
+        # `DENSE`, and there are eighteen of them per tile. That is the whole of
+        # the 535.1-vs-511.2 gap, and the reason `DENSE` exists.
         comptime KROW_STEP = THREADS // (HD // 8)
         comptime VKV_STEP = THREADS // HD
-        var hd = head_dim
-        comptime if EXACT:
-            hd = HD
         var k_row0 = tid // (HD // 8)
         var k_col = (tid % (HD // 8)) * 8
         var v_col = tid % HD
         var v_kvg0 = tid // HD
-        var k_ptr = key + (kv_base + k_row0 * hd + k_col)
-        var v_ptr = value + (kv_base + v_kvg0 * 4 * hd + v_col)
-        var tile_step = BN * hd
+        var k_ptr = key + (k_base + k_row0 * kss + k_col)
+        var v_ptr = value + (v_base + v_kvg0 * 4 * vss + v_col)
+        var k_tile_step = BN * kss
+        var v_tile_step = BN * vss
         var k_lds0 = k_row0 * KPAD + k_col
         var v_lds0 = v_col * VPAD + v_kvg0 * 4
         # Beyond `seq_kv` the loaders read a clamped, in-bounds duplicate row
@@ -450,12 +554,10 @@ def _fa_mfma[
                 comptime for ci in range(KITERS):
                     var vals = SIMD[dtype, 8](0)
                     comptime if EXACT:
-                        vals = k_ptr.load[width=8](ci * KROW_STEP * HD)
+                        vals = k_ptr.load[width=8](ci * KROW_STEP * kss)
                     else:
                         if k_col < head_dim:
-                            vals = k_ptr.load[width=8](
-                                ci * KROW_STEP * head_dim
-                            )
+                            vals = k_ptr.load[width=8](ci * KROW_STEP * kss)
                     k_smem.store(k_lds0 + ci * KROW_STEP * KPAD, vals)
                 comptime for vi in range(VITERS):
                     var vv = SIMD[dtype, 4](0)
@@ -464,19 +566,14 @@ def _fa_mfma[
                         live = v_col < head_dim
                     if live:
                         comptime for j in range(4):
-                            comptime if EXACT:
-                                vv[j] = v_ptr[(vi * VKV_STEP * 4 + j) * HD]
-                            else:
-                                vv[j] = v_ptr[
-                                    (vi * VKV_STEP * 4 + j) * head_dim
-                                ]
+                            vv[j] = v_ptr[(vi * VKV_STEP * 4 + j) * vss]
                     v_smem.store(v_lds0 + vi * VKV_STEP * 4, vv)
             else:
                 comptime for ci in range(KITERS):
                     var row = min(kv0 + k_row0 + ci * KROW_STEP, last_row)
                     var vals = SIMD[dtype, 8](0)
                     if EXACT or k_col < head_dim:
-                        vals = key.load[width=8](kv_base + row * hd + k_col)
+                        vals = key.load[width=8](k_base + row * kss + k_col)
                     k_smem.store(k_lds0 + ci * KROW_STEP * KPAD, vals)
                 comptime for vi in range(VITERS):
                     var vv = SIMD[dtype, 4](0)
@@ -484,12 +581,12 @@ def _fa_mfma[
                         var g = kv0 + (v_kvg0 + vi * VKV_STEP) * 4
                         comptime for j in range(4):
                             vv[j] = value[
-                                kv_base + min(g + j, last_row) * hd + v_col
+                                v_base + min(g + j, last_row) * vss + v_col
                             ]
                     v_smem.store(v_lds0 + vi * VKV_STEP * 4, vv)
 
-            k_ptr += tile_step
-            v_ptr += tile_step
+            k_ptr += k_tile_step
+            v_ptr += v_tile_step
             barrier()
 
             llvm_intrinsic["llvm.amdgcn.iglp.opt", NoneType](Int32(IGLP))
@@ -624,9 +721,21 @@ def _fa_mfma[
                     store = store and dcol < head_dim
                 if store:
                     output.store(
-                        q_base + qg * head_dim + dcol,
+                        o_base + qg * head_dim + dcol,
                         smem.load[width=8](r * OPAD + cc),
                     )
+
+
+@always_inline
+def _is_dense(
+    st: RowStrides, heads: Int, seq: Int, head_dim: Int
+) -> Bool:
+    """Whether `st` is exactly row-major `[batch, heads, seq, head_dim]`."""
+    return (
+        st.seq == head_dim
+        and st.head == seq * head_dim
+        and st.batch == heads * seq * head_dim
+    )
 
 
 def _enqueue_fa_mfma[
@@ -644,6 +753,9 @@ def _enqueue_fa_mfma[
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    q_st: RowStrides,
+    k_st: RowStrides,
+    v_st: RowStrides,
     batch: Int,
     heads: Int,
     seq_q: Int,
@@ -653,14 +765,43 @@ def _enqueue_fa_mfma[
     is_causal: Bool,
     ctx: DeviceContext,
 ) raises:
+    var dense = (
+        _is_dense(q_st, heads, seq_q, head_dim)
+        and _is_dense(k_st, heads, seq_kv, head_dim)
+        and _is_dense(v_st, heads, seq_kv, head_dim)
+    )
+    if dense:
+        ctx.enqueue_function[
+            _fa_mfma[dtype, HD, BN, QT, EXACT, True, WAVES_PER_EU, IGLP, PEEL]
+        ](
+            output,
+            lse,
+            query,
+            key,
+            value,
+            q_st,
+            k_st,
+            v_st,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            1 if is_causal else 0,
+            grid_dim=(ceildiv(seq_q, 4 * 32 * QT), heads, batch),
+            block_dim=(THREADS,),
+        )
+        return
     ctx.enqueue_function[
-        _fa_mfma[dtype, HD, BN, QT, EXACT, WAVES_PER_EU, IGLP, PEEL]
+        _fa_mfma[dtype, HD, BN, QT, EXACT, False, WAVES_PER_EU, IGLP, PEEL]
     ](
         output,
         lse,
         query,
         key,
         value,
+        q_st,
+        k_st,
+        v_st,
         seq_q,
         seq_kv,
         head_dim,
@@ -679,6 +820,9 @@ def enqueue_flash_attention_fwd[
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    q_st: RowStrides,
+    k_st: RowStrides,
+    v_st: RowStrides,
     batch: Int,
     heads: Int,
     seq_q: Int,
@@ -688,11 +832,20 @@ def enqueue_flash_attention_fwd[
     is_causal: Bool,
     ctx: DeviceContext,
 ) raises:
-    """THE FROZEN ENTRY POINT. Q, K, V and output are `[batch, heads, seq, head_dim]`
-    row-major and dense; `seq` is `seq_q` for Q and output, `seq_kv` for K and V.
+    """THE FROZEN ENTRY POINT. Q, K, V and output are `[batch, heads, seq, head_dim]`;
+    `seq` is `seq_q` for Q and output, `seq_kv` for K and V.
 
-    Every extent is a runtime value. Dispatch on them as you like; keep this
-    signature and keep every runtime input correct.
+    Q, K and V are read through `q_st`, `k_st` and `v_st`, the element strides
+    of their batch, head and seq axes. The head_dim axis must have stride 1 --
+    it is the axis every vectorized load runs along -- and a caller holding a
+    layout where it is not must decline rather than pass one here. `output` and
+    `lse` are dense: the caller allocates them.
+
+    `dense_strides(heads, seq, head_dim)` builds the triple for a plain
+    row-major `[batch, heads, seq, head_dim]` tensor.
+
+    Every extent AND every stride is a runtime value. Dispatch on them as you
+    like; keep this signature and keep every runtime input correct.
     """
     if batch <= 0 or heads <= 0 or seq_q <= 0 or seq_kv <= 0 or head_dim <= 0:
         return
@@ -719,6 +872,9 @@ def enqueue_flash_attention_fwd[
                     query,
                     key,
                     value,
+                    q_st,
+                    k_st,
+                    v_st,
                     batch,
                     heads,
                     seq_q,
@@ -736,6 +892,9 @@ def enqueue_flash_attention_fwd[
                     query,
                     key,
                     value,
+                    q_st,
+                    k_st,
+                    v_st,
                     batch,
                     heads,
                     seq_q,
@@ -753,6 +912,9 @@ def enqueue_flash_attention_fwd[
                     query,
                     key,
                     value,
+                    q_st,
+                    k_st,
+                    v_st,
                     batch,
                     heads,
                     seq_q,
@@ -770,6 +932,9 @@ def enqueue_flash_attention_fwd[
                     query,
                     key,
                     value,
+                    q_st,
+                    k_st,
+                    v_st,
                     batch,
                     heads,
                     seq_q,
@@ -787,6 +952,9 @@ def enqueue_flash_attention_fwd[
                     query,
                     key,
                     value,
+                    q_st,
+                    k_st,
+                    v_st,
                     batch,
                     heads,
                     seq_q,
@@ -803,6 +971,9 @@ def enqueue_flash_attention_fwd[
                 query,
                 key,
                 value,
+                q_st,
+                k_st,
+                v_st,
                 batch,
                 heads,
                 seq_q,
@@ -820,6 +991,9 @@ def enqueue_flash_attention_fwd[
         query,
         key,
         value,
+        q_st,
+        k_st,
+        v_st,
         seq_q,
         seq_kv,
         head_dim,

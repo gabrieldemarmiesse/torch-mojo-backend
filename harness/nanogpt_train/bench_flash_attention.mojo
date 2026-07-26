@@ -63,7 +63,11 @@ from std.math import ceildiv, exp, sqrt
 from std.time import perf_counter_ns
 
 from internal_utils import arg_parse
-from flash_attention_fwd_kernels import enqueue_flash_attention_fwd
+from flash_attention_fwd_kernels import (
+    RowStrides,
+    dense_strides,
+    enqueue_flash_attention_fwd,
+)
 
 comptime FILL_BLOCK = 256
 comptime CHECK_BLOCKS = 512
@@ -374,6 +378,9 @@ def run_case[
     var q_count = batch * heads * seq_q * head_dim
     var kv_count = batch * heads * seq_kv * head_dim
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
+    var q_st = dense_strides(heads, seq_q, head_dim)
+    var k_st = dense_strides(heads, seq_kv, head_dim)
+    var v_st = dense_strides(heads, seq_kv, head_dim)
 
     var q_f32 = ctx.enqueue_create_buffer[DType.float32](q_count)
     var k_f32 = ctx.enqueue_create_buffer[DType.float32](kv_count)
@@ -450,6 +457,9 @@ def run_case[
             q.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
             k.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
             v.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
+            q_st,
+            k_st,
+            v_st,
             batch,
             heads,
             seq_q,
