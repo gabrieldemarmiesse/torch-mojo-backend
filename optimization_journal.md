@@ -4603,14 +4603,18 @@ binary: (2304, 1152, 49152) TN **621.6 -> 567.6 us**.
 measured back to back in one session with each side's eager cache already built
 (the cache is content addressed, so the pair costs one run each):
 
-| source | median | p10 | p90 |
-|---|---:|---:|---:|
-| base (8dd3d04) | 162.37 ms | 162.07 | 162.52 |
-| HEAD | **161.48** | 161.25 | 161.86 |
+| source | median | p10 | p90 | order |
+|---|---:|---:|---:|---|
+| base (8dd3d04) | 162.37 ms | 162.07 | 162.52 | first |
+| this pass | 161.48 | 161.25 | 161.86 | second |
+| **this pass, shipped** | **161.25** | **160.96** | **161.54** | first |
+| base (8dd3d04) | 162.40 | 162.05 | 162.79 | second |
 
-**162.37 -> 161.48 ms against PyTorch-ROCm's 156.88, i.e. 1.035 -> 1.029.** Two
-further runs of HEAD in the same session gave 161.32 and 161.70, so the spread is
-0.24% and the -0.89 ms is four times it. The GEMM's own gap fell 1.89 -> 1.09 ms,
+**162.37 -> 161.25 ms against PyTorch-ROCm's 156.88, i.e. 1.035 -> 1.028.** Both
+orders were measured, base-then-new and new-then-base, because the pin is refused
+and whichever side runs second sees the warmer part: the two base runs agree to
+0.02% and the four runs of this pass in the session span 161.25-161.70 (0.28%), so
+the -1.1 ms is four times the spread. The GEMM's own gap fell 1.89 -> 1.09 ms,
 which is the same 0.8 ms the interleaved per-case table shows.
 
 ## What is left, and why the tile shape cannot reach it
