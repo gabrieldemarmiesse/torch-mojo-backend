@@ -1884,6 +1884,7 @@ def _nt_barrier():
     _nt_sched_fence()
 
 
+comptime NT_MAX_PARTS = 64  # most K slabs the split-K route will consider
 comptime NT_MMA = 32  # both non-contraction extents of the MFMA tile
 comptime NT_MMA_K = 8  # contraction extent of one MFMA
 comptime NT_VEC = 8  # elements per global load and per LDS write
@@ -1895,7 +1896,7 @@ comptime NT_VEC = 8  # elements per global load and per LDS write
     ),
 )
 @__name(
-    t"nt_mfma_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_z{SWIZZLE}_l{MASK_LOAD}_t{MASK_STORE}_a{A_KMAJOR}_b{B_KMAJOR}"
+    t"nt_mfma_{dtype}_{otype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_z{SWIZZLE}_l{MASK_LOAD}_t{MASK_STORE}_a{A_KMAJOR}_b{B_KMAJOR}_p{SPLITK}"
 )
 def _nt_mfma_kernel[
     dtype: DType,
@@ -1910,13 +1911,16 @@ def _nt_mfma_kernel[
     MASK_STORE: Bool,
     A_KMAJOR: Bool = True,
     B_KMAJOR: Bool = True,
+    SPLITK: Bool = False,
+    otype: DType = dtype,
 ](
-    c: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    c: UnsafePointer[Scalar[otype], MutAnyOrigin],
     a: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     b: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
+    k_per: Int,
     xcds: Int,
 ):
     comptime WAVES_N = BN // WN
@@ -2019,6 +2023,10 @@ def _nt_mfma_kernel[
         var hi = lane // 32  # which half-wave, i.e. which k quad
         var wm0 = (wave // WAVES_N) * WM
         var wn0 = (wave % WAVES_N) * WN
+        # Which k slab this workgroup owns.  `k_per` is a whole number of k tiles
+        # and `parts * k_per == k`, both enforced by the dispatch, so the slabs
+        # cover K exactly once and no loader reads past an operand.
+        var slab = Int(block_idx.z) if SPLITK else 0
 
         # Output-tile coordinates.  With `xcds > 1` the linear workgroup index is
         # remapped so that each XCD receives a CONTIGUOUS band of the natural
@@ -2029,8 +2037,16 @@ def _nt_mfma_kernel[
         var n0 = Int(block_idx.x) * BN
         if xcds > 1:
             var nx = Int(grid_dim.x)
-            var total = nx * Int(grid_dim.y)
-            var wgid = Int(block_idx.y) * nx + Int(block_idx.x)
+            # With k slabs on block_idx.z the dispatch order is z-major, so the
+            # linear index the hardware maps to an XCD counts the slabs too; a
+            # remap that ignored z would scatter each output tile's slabs across
+            # XCDs and defeat the point, since those slabs share both operands'
+            # row blocks.
+            var plane = nx * Int(grid_dim.y)
+            var total = plane * Int(grid_dim.z)
+            var wgid = Int(block_idx.z) * plane + Int(
+                block_idx.y
+            ) * nx + Int(block_idx.x)
             # Unlike MAX's own `_xcd_wgm_swizzle` this handles a tile count that
             # is not a multiple of the XCD count: XCDs below the remainder take
             # one extra tile, which keeps the map a bijection for every runtime
@@ -2041,8 +2057,10 @@ def _nt_mfma_kernel[
             var slot = wgid // xcds
             var base = xcd * (per + 1) if xcd < rem else rem + xcd * per
             wgid = base + slot
-            m0 = (wgid // nx) * BM
+            m0 = ((wgid % plane) // nx) * BM
             n0 = (wgid % nx) * BN
+            comptime if SPLITK:
+                slab = wgid // plane
         comptime if not MASK_LOAD and not MASK_STORE:
             # Edge tiles are SHIFTED BACK to end at the extent rather than
             # masked.  The masked instantiation costs 120 bytes of scratch per
@@ -2074,11 +2092,16 @@ def _nt_mfma_kernel[
         var axc = (tid % XPA) * NT_VEC
         var bkr = tid // XPB
         var bxc = (tid % XPB) * NT_VEC
+        var k0 = slab * k_per
         var a_ptr = a + (
-            (m0 + trow) * k + tcol if A_KMAJOR else akr * m + m0 + axc
+            (m0 + trow) * k + tcol + k0 if A_KMAJOR else (k0 + akr) * m
+            + m0
+            + axc
         )
         var b_ptr = b + (
-            (n0 + trow) * k + tcol if B_KMAJOR else bkr * n + n0 + bxc
+            (n0 + trow) * k + tcol + k0 if B_KMAJOR else (k0 + bkr) * n
+            + n0
+            + bxc
         )
         var a_pass = pass_step if A_KMAJOR else LRA * m
         var b_pass = pass_step if B_KMAJOR else LRB * n
@@ -2114,7 +2137,7 @@ def _nt_mfma_kernel[
             """
             var kok = True
             comptime if MASK_LOAD:
-                kok = kt * BK + tcol < k
+                kok = k0 + kt * BK + tcol < k
             comptime if A_KMAJOR:
                 comptime for p in range(APASS):
                     var live = kok
@@ -2132,7 +2155,7 @@ def _nt_mfma_kernel[
                     comptime if (p + 1) * LRA > BK:
                         live = akr + p * LRA < BK
                     comptime if MASK_LOAD:
-                        live = live and kt * BK + akr + p * LRA < k
+                        live = live and k0 + kt * BK + akr + p * LRA < k
                     comptime if MASK_LOAD:
                         # `m % NT_VEC == 0` is a precondition of the native-A
                         # route, so a NT_VEC vector at a NT_VEC-aligned offset is
@@ -2162,7 +2185,7 @@ def _nt_mfma_kernel[
                     comptime if (p + 1) * LRB > BK:
                         live = bkr + p * LRB < BK
                     comptime if MASK_LOAD:
-                        live = live and kt * BK + bkr + p * LRB < k
+                        live = live and k0 + kt * BK + bkr + p * LRB < k
                     comptime if MASK_LOAD:
                         live = live and n0 + bxc < n
                     var v = SIMD[dtype, NT_VEC](0)
@@ -2333,7 +2356,7 @@ def _nt_mfma_kernel[
         var na = smem + (SA + SB if STAGES == 2 else 0)
         var nb = na + SA
 
-        var n_kt = ceildiv(k, BK)
+        var n_kt = k_per // BK if SPLITK else ceildiv(k, BK)
         _load(0)
         _fill(ca, cb)
         _nt_barrier()
@@ -2386,15 +2409,19 @@ def _nt_mfma_kernel[
         # multistage kernel dropped one MFMA k step into two of four
         # accumulator elements and a deeper pipeline made it vanish.
         _nt_sched_fence()
-        var out = stack_allocation[MT * NTL * 16, dtype]()
+        var out = stack_allocation[MT * NTL * 16, otype]()
         comptime for i in range(MT * NTL):
-            out.store(i * 16, acc.load[width=16](i * 16).cast[dtype]())
+            out.store(i * 16, acc.load[width=16](i * 16).cast[otype]())
         llvm_intrinsic["llvm.amdgcn.sched.barrier", NoneType](Int32(0))
 
         # Register p of accumulator (i, j) is row
         # `wm0 + 32i + 8*(p//4) + (p%4) + 4*hi`, column `wn0 + 32j + lo`, so one
         # store instruction writes 32 consecutive columns of one row per
         # half-wave: 64 contiguous bytes, fully coalesced.
+        # Under SPLITK each slab owns its own FP32 plane of the workspace; the
+        # only rounding to the output dtype is the one the reduction performs,
+        # exactly as in the unsplit path.
+        var cp = c + (slab * m * n if SPLITK else 0)
         var cbase = (m0 + wm0 + 4 * hi) * n + n0 + wn0 + lo
         # Distance to the edge, so each guard is one compare against a
         # compile-time offset instead of a recomputed address.
@@ -2406,13 +2433,15 @@ def _nt_mfma_kernel[
                 comptime if not MASK_STORE:
                     comptime for p in range(16):
                         comptime dr = i * NT_MMA + 8 * (p // 4) + (p % 4)
-                        c[cbase + dr * n + dc] = out[(i * NTL + j) * 16 + p]
+                        cp[cbase + dr * n + dc] = out[
+                            (i * NTL + j) * 16 + p
+                        ]
                 else:
                     if dc < cmax:
                         comptime for p in range(16):
                             comptime dr = i * NT_MMA + 8 * (p // 4) + (p % 4)
                             if dr < rmax:
-                                c[cbase + dr * n + dc] = out[
+                                cp[cbase + dr * n + dc] = out[
                                     (i * NTL + j) * 16 + p
                                 ]
 
@@ -2429,6 +2458,8 @@ def _nt_mfma_gemm[
     SWIZZLE: Bool = False,
     A_KMAJOR: Bool = True,
     B_KMAJOR: Bool = True,
+    SPLITK: Bool = False,
+    otype: DType = dtype,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -2436,20 +2467,24 @@ def _nt_mfma_gemm[
     m: Int,
     n: Int,
     k: Int,
+    parts: Int,
     xcds: Int,
     ctx: DeviceContext,
 ) raises:
-    """Enqueue the NT MFMA GEMM, dropping the edge guards when they are unused.
+    """Enqueue the MFMA GEMM, dropping the edge guards when they are unused.
 
-    Both instantiations handle every runtime shape correctly; the guarded one is
-    up to 7% slower at these sizes, so it is selected only when the runtime
-    extents actually have an edge.
+    Both instantiations handle every runtime shape correctly; the guarded one
+    spills and measures 2.2-3.2x slower, so the unguarded one shifts an edge tile
+    back to end at the extent instead (see the kernel) and the guarded one is
+    reached only by a k that BK does not divide.
+
+    Under `SPLITK` the grid gains a z dimension of `parts` k slabs and the output
+    is `parts` FP32 planes for the caller's reduction; `parts` must divide the k
+    tile count exactly.
     """
     comptime THREADS = (BM // WM) * (BN // WN) * 64
-    # The unmasked instantiation shifts an edge tile back instead of guarding it,
-    # so it covers every shape whose macro tile fits at all; only a k that BK does
-    # not divide -- which cannot be shifted, the missing k range is real -- needs
-    # the guarded one.
+    var k_per = k // parts
+    var grid = (ceildiv(n, BN), ceildiv(m, BM), parts)
     if m >= BM and n >= BN and k % BK == 0:
         ctx.enqueue_function[
             _nt_mfma_kernel[
@@ -2465,16 +2500,19 @@ def _nt_mfma_gemm[
                 False,
                 A_KMAJOR,
                 B_KMAJOR,
+                SPLITK,
+                otype,
             ]
         ](
-            _make_ptr[dtype](c_addr),
+            _make_ptr[otype](c_addr),
             _make_ptr[dtype](a_addr).as_immutable(),
             _make_ptr[dtype](b_addr).as_immutable(),
             m,
             n,
             k,
+            k_per,
             xcds,
-            grid_dim=(ceildiv(n, BN), ceildiv(m, BM)),
+            grid_dim=grid,
             block_dim=(THREADS,),
         )
     else:
@@ -2492,16 +2530,19 @@ def _nt_mfma_gemm[
                 True,
                 A_KMAJOR,
                 B_KMAJOR,
+                SPLITK,
+                otype,
             ]
         ](
-            _make_ptr[dtype](c_addr),
+            _make_ptr[otype](c_addr),
             _make_ptr[dtype](a_addr).as_immutable(),
             _make_ptr[dtype](b_addr).as_immutable(),
             m,
             n,
             k,
+            k_per,
             xcds,
-            grid_dim=(ceildiv(n, BN), ceildiv(m, BM)),
+            grid_dim=grid,
             block_dim=(THREADS,),
         )
 
@@ -2559,12 +2600,12 @@ def _nt_mfma_route[
     # values.
     if ceildiv(m, 256) * ceildiv(n, 256) >= cus:
         _nt_mfma_gemm[dtype, 256, 256, 32, 64, 64, 2, True](
-            c_addr, a_addr, b_addr, m, n, k, xcds, ctx
+            c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx
         )
         return True
     if ceildiv(m, 128) * ceildiv(n, 128) >= cus:
         _nt_mfma_gemm[dtype, 128, 128, 32, 64, 64, 2, True](
-            c_addr, a_addr, b_addr, m, n, k, xcds, ctx
+            c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx
         )
         return True
     return False
@@ -2606,12 +2647,88 @@ def _nn_mfma_route[
         return False
     var cus = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
     var xcds = max(1, cus // 38)
-    if ceildiv(m, 256) * ceildiv(n, 256) >= cus:
+    var tiles = ceildiv(m, 256) * ceildiv(n, 256)
+    if tiles >= cus:
         _nt_mfma_gemm[dtype, 256, 256, 32, 64, 64, 2, True, True, False](
-            c_addr, a_addr, b_addr, m, n, k, xcds, ctx
+            c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx
         )
         return True
-    return False
+    # Underfilled output grid, deep contraction: slabs of K are the only axis
+    # left.  Exactly ONE workgroup of this tile is resident per CU -- sixteen
+    # wave64 and the whole 64 KB of LDS -- so the split is capped at `cus`
+    # workgroups: past that a second wave of workgroups is serialized and the
+    # extra FP32 workspace traffic buys nothing.  Every slab must be a whole
+    # number of K tiles (`k % (parts * BK) == 0`), or the slabs would not cover
+    # K exactly, and deep enough that its own pipeline fill stays a small
+    # fraction of its work.
+    if m < 256 or n < 256 or c_addr % 8 != 0:
+        return False
+    # Pick the slab count by cost rather than by a fill threshold.  Slabs of a
+    # tile this large serialize in whole waves of `cus` workgroups, so the GEMM
+    # costs `ceil(tiles * parts / cus)` waves of `ktiles / parts` k tiles each --
+    # which is why a slab count that leaves a ragged last wave can beat a smaller
+    # one that fits in a single partial wave -- and the reduction costs one FP32
+    # read of the whole workspace.  `NT_KTILE_CYC` is the measured cost of one k
+    # tile in one workgroup (diagnostic experiment AD: 3995 cycles at
+    # 256x256x32), and the reduction is charged at roughly 4 TB/s spread over the
+    # device.  Every term is a runtime value.
+    comptime NT_KTILE_CYC = 4000
+    var ktiles = k // 32
+    var parts = 1
+    var best = ktiles * NT_KTILE_CYC
+    for cand in range(2, NT_MAX_PARTS + 1):
+        if ktiles % cand != 0 or k // cand < 1024:
+            continue
+        var cost = (
+            ceildiv(tiles * cand, cus) * (ktiles // cand) * NT_KTILE_CYC
+            + cand * m * n // (2 * cus)
+        )
+        if cost < best:
+            best = cost
+            parts = cand
+    if parts == 1:
+        return False
+    var ws = ctx.enqueue_create_buffer[DType.float32](parts * m * n)
+    _nt_mfma_gemm[
+        dtype,
+        256,
+        256,
+        32,
+        64,
+        64,
+        2,
+        True,
+        True,
+        False,
+        True,
+        DType.float32,
+    ](
+        Int(ws.unsafe_ptr()),
+        a_addr,
+        b_addr,
+        m,
+        n,
+        k,
+        parts,
+        xcds,
+        ctx,
+    )
+    comptime VEC = 16 // size_of[DType.float32]()
+    _enqueue_cached[_splitk_reduce_kernel[dtype, VEC]](
+        ctx,
+        String(t"amd_splitk_reduce_{dtype}_v{VEC}"),
+        _gs_blocks(m * n // VEC),
+        1,
+        1,
+        256,
+        _make_ptr[dtype](c_addr).as_unsafe_any_origin(),
+        ws.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
+        m * n,
+        parts,
+        m * n // VEC,
+    )
+    _ = ws^
+    return True
 
 
 @always_inline
