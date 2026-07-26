@@ -4424,10 +4424,7 @@ def fast_fused_flash_attention_forward(
         k._ptr,
         v._ptr,
         (batch, heads, seq_q, seq_kv, head_dim),
-        _fa_strides(q)
-        + _fa_strides(k)
-        + _fa_strides(v)
-        + _fa_strides(output),
+        _fa_strides(q) + _fa_strides(k) + _fa_strides(v) + _fa_strides(output),
         scale_val,
         1 if is_causal else 0,
         q._dtype.value,

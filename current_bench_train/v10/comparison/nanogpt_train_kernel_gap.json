@@ -1,0 +1,58 @@
+{
+  "rocm_us_per_step": 156788.48766666636,
+  "mojo_us_per_step": 166037.38033333313,
+  "overall_ratio": 1.05898961591064,
+  "positive_gap_us_per_step": 22707.158333333355,
+  "target_ratio": 1.02,
+  "work_order": [
+    {
+      "target": "Linear GEMM (backward)",
+      "rocm_us_per_step": 43545.407,
+      "mojo_us_per_step": 55646.781333333376,
+      "ratio": 1.2779024279950668,
+      "gap_us_per_step": 12101.374333333377
+    },
+    {
+      "target": "Linear GEMM (forward)",
+      "rocm_us_per_step": 23968.644666666674,
+      "mojo_us_per_step": 28374.041333333316,
+      "ratio": 1.1837983218464267,
+      "gap_us_per_step": 4405.396666666642
+    },
+    {
+      "target": "Cross entropy (backward)",
+      "rocm_us_per_step": 4424.374,
+      "mojo_us_per_step": 7262.642,
+      "ratio": 1.6415072505172483,
+      "gap_us_per_step": 2838.268
+    },
+    {
+      "target": "Copies / dtype casts / layout",
+      "rocm_us_per_step": 11421.864666666665,
+      "mojo_us_per_step": 12835.630333333334,
+      "ratio": 1.1237771334126008,
+      "gap_us_per_step": 1413.7656666666699
+    },
+    {
+      "target": "Residual / elementwise add",
+      "rocm_us_per_step": 4472.888333333333,
+      "mojo_us_per_step": 5322.638000000001,
+      "ratio": 1.1899778405675976,
+      "gap_us_per_step": 849.7496666666675
+    },
+    {
+      "target": "Cross entropy (forward)",
+      "rocm_us_per_step": 4138.537666666666,
+      "mojo_us_per_step": 4788.1303333333335,
+      "ratio": 1.1569618833963335,
+      "gap_us_per_step": 649.5926666666674
+    },
+    {
+      "target": "GELU (forward)",
+      "rocm_us_per_step": 2179.7966666666666,
+      "mojo_us_per_step": 2628.807999999999,
+      "ratio": 1.20598771445043,
+      "gap_us_per_step": 449.01133333333246
+    }
+  ]
+}

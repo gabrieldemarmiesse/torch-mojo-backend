@@ -3988,3 +3988,118 @@ report") accidentally swept up the in-progress `data_movement_ops.mojo` working
 tree from this change; `ca887dc` carries the rest. The two together are the
 whole change and HEAD is correct, but neither commit's diff is a readable unit
 on its own. Two agents sharing one checkout need to stage by path.
+
+## Change 34 — the fused attention writes BTHD, and the 48 gathers vanish (167.90 -> 166.51 ms/step)
+
+D11 said our SDPA returned a dense `[B, H, T, D]` where PyTorch returns one
+STORED `[B, T, H, D]`, and that nanoGPT's own re-assembly idiom
+
+    y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+therefore cost a real gather per layer where ROCm pays nothing. Measured: 48
+`data_movement_ops__run_gather` kernels, 1833.7 us/step, on `[48, 1024, 12, 64]`
+-- one per layer for the forward's `y`, three per layer for the backward's
+`dq`/`dk`/`dv`, which autograd reshapes through the same idiom's transpose.
+
+**Hypothesis.** Write the same values to BTHD-physical addresses and declare the
+layout truthfully. `is_contiguous()` becomes False, `o.transpose(1, 2)` becomes
+contiguous, `.contiguous()` returns its own argument, and all 48 gathers become
+views. **Predicted:** -1.84 ms/step, minus whatever the strided store costs the
+kernels.
+
+**What was changed.** The mirror of the stride-aware READ work in `a6d1b72` /
+`80e8ebc`: the forward's `output` and the backward's `dq`/`dk`/`dv` each carry a
+`RowStrides` triple now, so `enqueue_flash_attention_fwd` takes four stride
+triples and `enqueue_flash_attention_bwd` takes eight. head_dim keeps stride 1 --
+it is the axis the epilogues' 8-element vector store runs along -- so the store
+instruction itself is untouched; only its address changes. On the Python side
+`fast_fused_flash_attention_forward`/`_backward` allocate through a new
+`_alloc_bthd`: ONE dense `[B, T, H, D]` allocation with a `[B, H, T, D]` strided
+view over it. The view spans every element exactly once, so the bridge's zeroing
+of `dq`/`dk`/`dv` by element count is still exactly the buffer.
+
+`DENSE` stays a property of the READ operands only. The store address was already
+a runtime multiply by `head_dim`, so taking the row stride out of a struct
+instead costs nothing and there is no arm worth specializing.
+
+**Measured, back to back, today.**
+
+| | ROCm | before | after |
+|---|---:|---:|---:|
+| step, median of 20 | 156.73 ms | 167.90 | **166.51 (1.062x)** |
+| p10 / p90 | | 167.62 / 168.14 | 166.14 / 166.78 |
+| GPU kernel time / step | 156.79 | 167.62 | 166.04 |
+| `run_gather` kernels | 0 | 48, 1833.7 us | **0, 0 us** |
+| `Copies / dtype casts / layout` | 11.42 ms | 14.86 (1.30x) | **12.84 (1.12x)** |
+| SDPA forward | 9.07 | 6.82 | 6.84 |
+| SDPA backward | 33.96 | 28.38 | 28.57 |
+| FA forward harness | | 0.761x | 0.758x |
+| FA backward harness | | 0.997x | 0.999x |
+
+p10/p90 do not overlap, so the 1.39 ms is real. The strided store is free on the
+forward (+12 us/step over twelve layers) and costs +261 us/step on the backward's
+dQ kernel, against 1833.7 recovered.
+
+**The gfx942 masked-tile schedule is a lottery, and it is worth 10-20%.** The
+first version of this change measured the dQ kernel at 9869 us/step against
+8565 before it -- a 15% regression from adding one stride struct the tile loop
+never reads. What fixed it was writing the output base `stride * index` instead
+of `index * stride`: two commutative multiplies, identical value, identical
+instruction count, 8821 vs 9869 us/step in the production build. Seven other
+formulations were measured on the forward in a fixed harness binary, all
+semantically identical, spanning 563 to 686 us/layer, including one
+(`o_base = q_base`, adding no arithmetic at all) at 672.
+
+It is not register pressure and it is not the kernarg tax. VGPR 166 vs 164,
+neither spilling; the same kernarg present but unread measures 574, i.e. free;
+the unmasked tile loop is instruction-for-instruction identical between a fast
+and a slow build. What differs is the AMDGPU schedule of the MASKED tile -- MFMA
+placement around the barrier and the accumulator correction -- which is 2 of ~9
+tiles per block on this shape.
+
+And it re-rolls on changes that are not to the kernel at all: three harness
+binaries built from ONE kernel source, differing only in which cases their case
+list holds, run the nanogpt shape in the production layout at 562, 608 and 674
+us/layer of GPU time (rocprofv3, same kernel symbol, same launch geometry). So a
+harness A/B on the strided-read arm has a +-10% floor and cannot settle a 5%
+question; only the step time can. That is now written at the top of
+`flash_attention_fwd_kernels`, and both harnesses carry a `nanogpt_bthd` case --
+the acceptance shape in the production layout -- so a compiler release that
+re-rolls the dice is at least visible. Harness `nanogpt_bthd`: 685.7 us forward,
+2463.3 backward, in the binary built at this commit.
+
+**Proving the declared strides match the stored bytes.** The trap D11 warns about
+is that autograd checks a returned gradient's SHAPE, not its strides, so a wrong
+stride triple yields a permutation of the right values with the right shape and
+every assertion passes. `fa_layout_probe.py` therefore never asks our own strided
+copy where an element lives: it makes a rank-1 unit-stride view over the same
+holder, so the D2H reads raw memory in memory order, and checks that the value at
+the address the DECLARED layout implies is the value an independent FP32 CPU
+attention puts there. Six shapes, output and all three gradients: the BTHD
+reading is within 1.8e-02 of the FP32 reference and the DENSE reading of the same
+bytes is off by 0.5 to 6.5 -- two to three orders of magnitude apart, which is
+the separation a layout confusion would have to survive. It also asserts
+`o.is_contiguous()` is False, `o.transpose(1, 2).is_contiguous()` is True,
+`.contiguous()` returns its own argument, and `_materialize_contiguous` is never
+called during the idiom. On the two shapes where BTHD and BHTD genuinely coincide
+(`heads == 1`, `seq == 1`) the probe says so rather than claiming a check it
+cannot make.
+
+**The harness gate sees the new defect class.** Six forward cases with a strided
+output (bit 3) and six backward cases with strided gradients (bits 5/6/7), whose
+oracles are told each tensor's STORAGE LAYOUT and derive the reference's
+addresses from the definition of a row-major array -- never the stride triple the
+kernel gets, per D10. Mutation test, epilogues forced to store densely: all six
+new forward cases fail at 1.91-1.98 against a 0.031 bound, all six new backward
+cases fail by 15-30x their own bound on all three gradients, and every dense case
+still passes.
+
+**Correctness against PyTorch-ROCm** is unchanged: the fifteen shapes of
+`fa_one.py`, output and all three gradients, worst relative error 7.14e-03
+against a bf16 eps of 7.8e-03 -- the same number, on the same case (`view_hd96`
+dQ, where an FP32 oracle says we are the closer of the two).
+
+**What is left of D11.** Nothing of the gather; `Copies / dtype casts / layout`
+is now 12.836 against ROCm's 11.422, and what remains is 174 kernels of genuine
+dtype casts, not layout. The step gap to ROCm is 9.78 ms, 88% of it the two
+Linear GEMM rows and the cross-entropy backward.
