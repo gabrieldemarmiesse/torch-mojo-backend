@@ -105,6 +105,29 @@ the next K/V tile made it worse (576 vs 550), and hoisting the fragment reads
 out of the MFMA sequence made it worse (515 vs 513).  What did work was letting
 the AMDGPU scheduler interleave the clusters itself (`iglp.opt`) and deleting
 instructions outright.
+
+## The masked tile's schedule is chaotic, and it costs 10-20%
+
+BEWARE when A/B-ing the STRIDED-READ arm of this kernel or of the backward's dQ
+kernel. Their absolute time is partly a compilation lottery. Three harness
+binaries built from ONE kernel source, differing only in which cases their case
+list holds, run the nanogpt shape in the production layout at 562, 608 and 674
+us/layer of GPU time (rocprofv3, same kernel symbol, same launch geometry). The
+unmasked tile loop is instruction-for-instruction identical across those builds;
+what moves is the AMDGPU schedule of the MASKED tile -- MFMA placement around
+the barrier and the accumulator correction -- and that tile is 2 of ~9 per block
+on this shape.
+
+Two consequences, both paid for in measurements:
+
+* A harness A/B on the strided arm has a +-10% floor. Only the end-to-end step
+  time settles anything, and the step time is what the journal quotes.
+* Trivia becomes load-bearing. Writing an output base as `stride * index` rather
+  than `index * stride` -- two commutative multiplies, same value -- is worth
+  109 us/layer on the backward's dQ kernel in the production build (9869 ->
+  8821 us/step over twelve layers). Both harnesses carry a `nanogpt_bthd` case,
+  the acceptance shape in the production layout, so a compiler release that
+  re-rolls these dice is at least visible.
 """
 
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
@@ -723,20 +746,13 @@ def _fa_mfma[
                     l = run_m[qt] * scale + log(tot)
                 lse[bh * seq_q + qg_l] = l
 
-        # Read HERE, not next to the read bases: nothing about the output's
-        # layout should be live across the tile loop.
-        #
-        # BEWARE when A/B-ing this kernel on the STRIDED-READ arm. Its absolute
-        # time is a compilation lottery: three harness binaries built from this
-        # same kernel source, differing only in which cases their case list
-        # holds, run `nanogpt_bthd` at 562, 608 and 674 us/layer of GPU time
-        # (rocprofv3, same kernel symbol). The unmasked tile loop is
-        # instruction-for-instruction identical across them; what moves is the
-        # AMDGPU schedule of the MASKED tile -- MFMA placement around the barrier
-        # and the accumulator correction -- which is 2 of ~9 tiles per block on
-        # this shape. So a harness A/B on the strided arm has a +-10% floor, and
-        # only the end-to-end step time settles anything here.
-        var o_base = bz * o_st.batch + by * o_st.head
+        # STRIDE FIRST, INDEX SECOND. That reads naturally, and on this target
+        # it is also LOAD-BEARING -- see the note at the top of this file on the
+        # masked tile's schedule. Written `bz * o_st.batch + by * o_st.head`, the
+        # SAME source, the dQ backward kernel measures 109 us/layer worse in the
+        # production build. Read here rather than next to the read bases so that
+        # nothing about the output layout is live across the tile loop.
+        var o_base = o_st.batch * bz + o_st.head * by
         var oss = o_st.seq
 
         comptime for dt in range(DT):

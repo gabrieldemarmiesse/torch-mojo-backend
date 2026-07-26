@@ -25,6 +25,7 @@ import struct
 import warnings
 
 import torch
+from max.driver import Device
 from max.dtype import DType
 
 from torch_mojo_backend import eager_kernels, is_running_tests
@@ -4283,6 +4284,35 @@ def _fa_strides(t: MojoTensorLike) -> tuple[int, int, int]:
     return (strides[0], strides[1], strides[2])
 
 
+def _alloc_bthd(
+    batch: int, heads: int, seq: int, head_dim: int, dtype: DType, device: Device
+) -> TorchMojoTensor:
+    """A ``[batch, heads, seq, head_dim]`` tensor STORED ``[batch, seq, heads,
+    head_dim]``.
+
+    The layout PyTorch's own flash attention returns, and the reason its
+    ``transpose(1, 2)`` is free: ``o.transpose(1, 2)`` over these strides is
+    exactly a dense ``[batch, seq, heads, head_dim]``, so the universal
+    re-assembly idiom ``y.transpose(1, 2).contiguous().view(B, T, C)`` reduces to
+    two views. Returning a dense ``[B, H, T, D]`` instead cost nanoGPT 48
+    ``clone`` kernels and 1.84 ms/step (journal D11).
+
+    One dense allocation with a strided view over it, not a strided allocation:
+    the view spans every element exactly once, so it costs no extra memory and
+    the Mojo bridge's zeroing by element count is still exactly the buffer.
+    ``_compute_contiguous`` then reports ``False`` for it -- except when
+    ``heads == 1`` or ``seq == 1``, where the two layouts genuinely coincide and
+    ``True`` is the right answer.
+    """
+    dense = _alloc((batch, seq, heads, head_dim), dtype, device)
+    return _view_of(
+        dense,
+        (batch, heads, seq, head_dim),
+        (seq * heads * head_dim, head_dim, heads * head_dim, 1),
+        0,
+    )
+
+
 def _fused_fa_inputs(
     query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
 ):
@@ -4371,6 +4401,10 @@ def fast_fused_flash_attention_forward(
     must be handed rather than re-deriving, because it recomputes the scores from
     the same bytes. Nothing is copied: each is read through its own
     (batch, head, seq) strides.
+
+    ``output`` is ``[B, H, T, D]`` shaped and ``[B, T, H, D]`` stored, matching
+    what PyTorch's flash attention returns, so the caller's
+    ``y.transpose(1, 2).contiguous()`` is a no-op rather than a gather.
     """
     eligible = _fused_fa_inputs(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
@@ -4381,7 +4415,7 @@ def fast_fused_flash_attention_forward(
     batch, heads, seq_q, head_dim = q._shape
     seq_kv = k._shape[2]
     scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
-    output = _alloc((batch, heads, seq_q, head_dim), q._dtype, q._device)
+    output = _alloc_bthd(batch, heads, seq_q, head_dim, q._dtype, q._device)
     lse = _alloc((batch, heads, seq_q), DType.float32, q._device)
     eager_kernels.flash_attention_ops.FlashAttentionForward(
         output._ptr,
@@ -4390,7 +4424,10 @@ def fast_fused_flash_attention_forward(
         k._ptr,
         v._ptr,
         (batch, heads, seq_q, seq_kv, head_dim),
-        _fa_strides(q) + _fa_strides(k) + _fa_strides(v),
+        _fa_strides(q)
+        + _fa_strides(k)
+        + _fa_strides(v)
+        + _fa_strides(output),
         scale_val,
         1 if is_causal else 0,
         q._dtype.value,
@@ -4409,6 +4446,10 @@ def fast_fused_flash_attention_backward(
     addressed through their own strides; only a ``grad_output`` whose head_dim
     axis is strided has to be materialized, because that is the axis the
     vectorized loads run along.
+
+    The three gradients come back ``[B, H, T, D]`` shaped and ``[B, T, H, D]``
+    stored, so the ``transpose(1, 2)`` autograd runs on the way back out to
+    ``x.view(B, T, H, D)`` is a view and the reshape behind it needs no copy.
     """
     g = _t(grad_output)
     q = _t(query)
@@ -4434,9 +4475,9 @@ def fast_fused_flash_attention_backward(
     batch, heads, seq_q, head_dim = q._shape
     seq_kv = k._shape[2]
     scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
-    grad_query = _alloc((batch, heads, seq_q, head_dim), q._dtype, q._device)
-    grad_key = _alloc((batch, heads, seq_kv, head_dim), q._dtype, q._device)
-    grad_value = _alloc((batch, heads, seq_kv, head_dim), q._dtype, q._device)
+    grad_query = _alloc_bthd(batch, heads, seq_q, head_dim, q._dtype, q._device)
+    grad_key = _alloc_bthd(batch, heads, seq_kv, head_dim, q._dtype, q._device)
+    grad_value = _alloc_bthd(batch, heads, seq_kv, head_dim, q._dtype, q._device)
     eager_kernels.flash_attention_ops.FlashAttentionBackward(
         grad_query._ptr,
         grad_key._ptr,
@@ -4452,7 +4493,10 @@ def fast_fused_flash_attention_backward(
         + _fa_strides(q)
         + _fa_strides(k)
         + _fa_strides(v)
-        + _fa_strides(o),
+        + _fa_strides(o)
+        + _fa_strides(grad_query)
+        + _fa_strides(grad_key)
+        + _fa_strides(grad_value),
         scale_val,
         1 if is_causal else 0,
         q._dtype.value,

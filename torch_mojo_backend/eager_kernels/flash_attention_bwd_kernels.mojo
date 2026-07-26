@@ -488,7 +488,12 @@ def _bwd_dq_mfma[
         var bh = bz * heads + by
         # Every base follows its own operand's strides, dQ included; only the
         # log-sum-exp is dense.
-        var dq_base = bz * dq_st.batch + by * dq_st.head
+        # STRIDE FIRST, INDEX SECOND, and on this kernel that is worth 109
+        # us/layer in the production build: see "The masked tile's schedule is
+        # chaotic" in `flash_attention_fwd_kernels`. This kernel has the same
+        # peeled masked/unmasked tile structure as the fused forward and the same
+        # sensitivity.
+        var dq_base = dq_st.batch * bz + dq_st.head * by
         var dqss = dq_st.seq
         var g_base = bz * g_st.batch + by * g_st.head
         var q_base = bz * q_st.batch + by * q_st.head
@@ -870,8 +875,8 @@ def _bwd_dkv_mfma[
         var bh = bz * heads + by
         # Every base follows its own operand's strides, dK and dV included;
         # only the log-sum-exp is dense.
-        var dk_base = bz * dk_st.batch + by * dk_st.head
-        var dv_base = bz * dv_st.batch + by * dv_st.head
+        var dk_base = dk_st.batch * bz + dk_st.head * by
+        var dv_base = dv_st.batch * bz + dv_st.head * by
         var dkss = dk_st.seq
         var dvss = dv_st.seq
         var g_base = bz * g_st.batch + by * g_st.head
