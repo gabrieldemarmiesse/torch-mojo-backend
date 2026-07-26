@@ -3487,3 +3487,81 @@ of production than of the harness.
 * **The output write, 2.8 TB/s against 3.27.** Worth about 1.4% of NN and needs
   an LDS transpose in the epilogue, which is the region the gfx942 MFMA-read
   miscompile (journal D8) lives in.
+
+## Plumbing the fused attention kernels, and the defect the harness hid
+
+Both flash-attention kernels were harness-only until now: neither module was in
+`_MOJO_MODULES`, so the eager device never loaded them and SDPA ran the
+decomposition regardless of how fast the kernels were. Wiring them in took a
+Python bridge (`flash_attention_ops.mojo`), a new autograd Function, and one
+change to the forward.
+
+**The forward now emits the row log-sum-exp.** The backward needs `L` to recover
+`P = exp(S - L)` without a second normalization pass. Both halves were already
+in registers, so it costs nothing measurable (0.748x -> 0.750x). The units are
+the trap: the MFMA kernel keeps `run_m` UNSCALED and folds the scale into the
+exponent (`sl = scale * LOG2E`, `exp2`), so `L = run_m * scale + ln(tot)`, while
+the baseline kernel scales before the max, so there `L = running_max + ln(tot)`.
+Getting this wrong is invisible in the forward -- O is normalized by the same
+sum either way -- and surfaces only as wrong gradients. Checked against an
+independent FP32 reference across all four dispatch regimes: 5.7e-06 (hd64),
+7.6e-06 (hd96), 9.5e-06 (hd128), 3.8e-06 (noncausal and kv>q), 1.2e-07
+(baseline).
+
+### D10: the harness specified the wrong causal convention
+
+`kv_longer` (seq_q 256, seq_kv 1024, causal) measured ~100% wrong against
+PyTorch-ROCm while PASSING the harness at the same shape.
+
+The harness contract I wrote specified BOTTOM-RIGHT causal alignment, query `q`
+attends `0 ..= q + (seq_kv - seq_q)`. PyTorch aligns TOP-LEFT: query `q` attends
+`0 ..= q` whatever `seq_kv` is (`torch.nn.attention.bias`, "upper left causal
+bias"), confirmed empirically rather than from memory. Both agents implemented
+the spec faithfully; the spec was wrong.
+
+The fix is `delta = 0`, and `delta` was ALREADY `seq_kv - seq_q` = 0 for every
+square shape, so nanoGPT and all self-attention are provably untouched: forward
+0.748 -> 0.750x, backward 0.998 -> 0.999x, both inside the run-to-run spread.
+Correct semantics also turn out cheaper, because keys past `seq_q` are never
+attended: `cross_kv_longer` backward halved, 141.59 -> 70.17 us.
+
+**Why six mutation tests missed it.** The oracle inherited the same convention
+from the same spec. Differential testing cannot see a defect shared by both
+sides, however independent their structure -- and this oracle was as independent
+as they come: one thread per row against block-per-row, different reduction,
+different parallel axis. Mutation testing validated the gate against the spec;
+only a comparison with PyTorch could validate the spec against reality. That
+comparison belongs BEFORE handing a harness to an agent, not after wiring up its
+output. This is the second time this session the harness rather than the kernel
+was the thing that was wrong (see the order-dependence that turned a claimed 49%
+win into a 14% loss).
+
+### Where the training step stands
+
+nanoGPT 124M, batch 48, block 1024, bf16 autocast, one full step:
+
+| | PyTorch-ROCm | mojo | ratio |
+|---|---:|---:|---:|
+| step (median of 20) | 156.73 ms | 172.10 ms | 1.098 |
+| p10 / p90 | 156.50 / 156.93 | 171.73 / 172.41 | |
+| tokens/s | 313607 | 285598 | 0.911 |
+
+921.39 -> 661.86 -> 420.94 -> 409.34 -> 353.93 -> 172.10 ms over the session,
+5.88x -> 1.098x. Single-step loss agrees to 1e-5 relative (10.977398 against
+10.977295); the 25-step divergence is accumulated bf16 rounding through AdamW,
+not a defect.
+
+Component standing, all independently re-measured, per case one process each:
+
+| kernel | start | now |
+|---|---:|---:|
+| SDPA forward | 3.287x | 0.750x |
+| SDPA backward | 1.359x | 0.999x |
+| GEMM NN (dgrad) | 3.079x | 1.066x |
+| GEMM NT (fwd) | 2.855x | 1.102x |
+| GEMM TN (wgrad) | 3.600x | 1.416x harness / 1.323x production |
+
+Both attention kernels now meet or beat PyTorch-ROCm's fused equivalents. The
+remaining step-level gap is ~15 ms and lives almost entirely in the GEMMs, with
+TN the worst: A arrives m-major and Tensile consumes the strided view with no
+copy, which `_tn_mfma_route` matches only partially (1.176 for the GEMM alone).
