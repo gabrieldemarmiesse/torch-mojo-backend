@@ -4,7 +4,8 @@ Both backends spend essentially 100% of the step inside GPU kernels, so the
 trustworthy unit of comparison is GPU kernel time, not the profiler's ATen
 self-time rows.  ATen self time is also incomplete on the Mojo side: the
 eager SDPA path runs under a custom autograd function
-(``_ScaledDotProductAttentionAutograd``), which the profiler records as a
+(``_ScaledDotProductAttentionAutograd``, or ``_FusedFlashAttentionAutograd``
+once the fused gfx942 kernels claim the shape), which the profiler records as a
 ``user_annotation`` rather than an ``aten::`` row, so an ATen-only view silently
 drops it.
 
@@ -48,13 +49,16 @@ GROUPS: list[tuple[str, str, set[str], set[str]]] = [
         "SDPA (forward)",
         "any",
         {"aten::_flash_attention_forward", "aten::scaled_dot_product_attention"},
-        {"_ScaledDotProductAttentionAutograd"},
+        {"_ScaledDotProductAttentionAutograd", "_FusedFlashAttentionAutograd"},
     ),
     (
         "SDPA (backward)",
         "any",
         {"aten::_flash_attention_backward"},
-        {"_ScaledDotProductAttentionAutogradBackward"},
+        {
+            "_ScaledDotProductAttentionAutogradBackward",
+            "_FusedFlashAttentionAutogradBackward",
+        },
     ),
     (
         "Copies / dtype casts / layout",

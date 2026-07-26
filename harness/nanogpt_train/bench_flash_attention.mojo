@@ -75,7 +75,8 @@ comptime REF_THREADS = 128
 
 
 struct FaCase(ImplicitlyCopyable, Movable):
-    """One attention shape, with the PyTorch-ROCm time it is measured against."""
+    """One attention shape, with the PyTorch-ROCm time it is measured against.
+    """
 
     var label: String
     var batch: Int
@@ -339,9 +340,7 @@ def _compare_kernel[
     inf_count[slot] = infs
 
 
-def _case_strides(
-    bthd: Int, heads: Int, seq: Int, head_dim: Int
-) -> RowStrides:
+def _case_strides(bthd: Int, heads: Int, seq: Int, head_dim: Int) -> RowStrides:
     """The (batch, head, seq) strides of the case's chosen storage layout.
 
     `bthd == 0` is a dense `[B, H, T, D]` allocation; `bthd != 0` reinterprets
@@ -711,8 +710,10 @@ def main() raises:
         # kernel is only worth wiring in once it beats that; ROCm's 8.158 is the
         # target beyond it.
         print(
-            "  bar to beat (current decomposition): 29.854 ms/step -> this"
-            " kernel is",
+            (
+                "  bar to beat (current decomposition): 29.854 ms/step -> this"
+                " kernel is"
+            ),
             _fixed(mojo_step_us / 1000.0 / 29.854, 3),
             "x that",
         )

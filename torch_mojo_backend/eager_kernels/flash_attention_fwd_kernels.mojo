@@ -727,9 +727,7 @@ def _fa_mfma[
 
 
 @always_inline
-def _is_dense(
-    st: RowStrides, heads: Int, seq: Int, head_dim: Int
-) -> Bool:
+def _is_dense(st: RowStrides, heads: Int, seq: Int, head_dim: Int) -> Bool:
     """Whether `st` is exactly row-major `[batch, heads, seq, head_dim]`."""
     return (
         st.seq == head_dim

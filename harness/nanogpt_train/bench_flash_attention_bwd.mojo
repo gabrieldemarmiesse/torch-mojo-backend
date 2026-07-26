@@ -495,9 +495,7 @@ def _compare[
     inf_count[slot] = infs
 
 
-def _case_strides(
-    bthd: Int, heads: Int, seq: Int, head_dim: Int
-) -> RowStrides:
+def _case_strides(bthd: Int, heads: Int, seq: Int, head_dim: Int) -> RowStrides:
     """The (batch, head, seq) strides of the case's chosen storage layout.
 
     `bthd == 0` is a dense `[B, H, T, D]` allocation; `bthd != 0` reinterprets
@@ -1001,8 +999,10 @@ def main() raises:
         # decomposition measured at 46.153 ms/step in the production profile,
         # 1.36x ROCm; a fused kernel is worth wiring in once it beats that.
         print(
-            "  bar to beat (current decomposition): 46.153 ms/step -> this"
-            " kernel is",
+            (
+                "  bar to beat (current decomposition): 46.153 ms/step -> this"
+                " kernel is"
+            ),
             _fixed(mojo_step_us / 1000.0 / 46.153, 3),
             "x that",
         )

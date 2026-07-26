@@ -126,11 +126,7 @@ accumulator ONCE, unconditionally, in straight-line code, fenced with
 `llvm.amdgcn.sched.barrier` on both sides, before any guarded store runs.
 """
 
-from flash_attention_fwd_kernels import (
-    RowStrides,
-    _is_dense,
-    dense_strides,
-)
+from flash_attention_fwd_kernels import RowStrides, _is_dense
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     barrier,
@@ -1345,8 +1341,10 @@ def enqueue_flash_attention_bwd[
             head_dim,
             " exceeds the staged maximum ",
             MAX_HEAD_DIM,
-            "; a replacement must raise the staging or route this head_dim to a"
-            " path that handles it",
+            (
+                "; a replacement must raise the staging or route this head_dim"
+                " to a path that handles it"
+            ),
         )
     var causal = 1 if is_causal else 0
 

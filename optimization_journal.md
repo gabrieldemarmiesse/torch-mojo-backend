@@ -3565,3 +3565,173 @@ Both attention kernels now meet or beat PyTorch-ROCm's fused equivalents. The
 remaining step-level gap is ~15 ms and lives almost entirely in the GEMMs, with
 TN the worst: A arrives m-major and Tensile consumes the strided view with no
 copy, which `_tn_mfma_route` matches only partially (1.176 for the GEMM alone).
+
+# Stride-aware fused attention, MI300X — 2026-07-26
+
+## The waste, measured before touching anything
+
+nanoGPT builds its attention inputs as
+`q.view(B, T, H, D).transpose(1, 2)`, so q, k and v are logically
+`[batch, heads, seq, head_dim]` but physically strided `(T*H*D, D, H*D, 1)`.
+The fused kernels indexed densely, so `_fused_fa_inputs` called `_tc()` on each
+of them and on a non-contiguous `grad_output` in the backward. In the v7 trace
+that is:
+
+| | v7 |
+|---|---|
+| `data_movement_ops__run_gather` | 96/step, 3766.2 us/step, 39.2 us/call |
+| of which the fused-attention `_tc()` calls | 48/step, ~1923 us/step |
+
+3 per layer for q/k/v times 12 layers, plus 12 for `grad_output`. PyTorch-ROCm
+issues none of them: its fused attention takes stride arguments.
+
+The other 48 gathers per step are unrelated copies elsewhere in the step and are
+still there.
+
+## Change 32 — per-operand `RowStrides` on both fused entry points
+
+**Hypothesis.** The head_dim axis is contiguous in the caller's view, and that is
+the only axis the vectorized loads and the LDS row fills run along. So only the
+base-address arithmetic that locates a `(batch, head, seq)` row has to change,
+and the copies can go.
+
+**Predicted effect.** -1.9 ms/step of gather, no change to the kernels.
+
+**What was built.** A `RowStrides` (batch, head, seq) triple per read operand:
+q/k/v on the forward, grad_output/query/key/value/out_fwd on the backward. The
+head_dim stride is NOT carried -- it must be 1, and `_fused_fa_inputs` declines
+anything else rather than guessing, falling through to the decomposition. `dq`,
+`dk`, `dv`, the forward's `output` and `softmax_lse` stay dense, because we
+allocate them.
+
+**Measured effect on the harness (dense inputs), nanogpt case, interleaved A/B
+of two binaries, 25 warmups / 100 iterations, three rounds each:**
+
+| | before | after |
+|---|---:|---:|
+| forward us/layer | 513.06 / 513.18 / 513.19 | 518.83 / 518.22 / 518.36 |
+| forward harness ratio | 0.755 | 0.762 (+1.05%) |
+| backward us/layer | 2413.00 / 2414.14 | 2387.11 / 2385.50 |
+| backward harness ratio | 1.000 | 0.989 (-1.1%) |
+
+All 30 cases pass (15 per harness, five of them new and strided).
+
+**Measured effect in production, v7 vs v8 trace, per kernel:**
+
+| kernel | v7 | v8 | delta us/step |
+|---|---:|---:|---:|
+| `run_gather` | 96/step, 3766.2 us | 48/step, 1843.3 us | **-1922.9** |
+| `fa_mfma` fwd | 523.7 us/call | 567.2 us/call | +521.7 |
+| `fa_bwd_dkv` | 1612.1 us/call | 1646.0 us/call | +406.5 |
+| `fa_bwd_dq` | 762.2 us/call | 714.5 us/call | -572.1 |
+| net | | | **-1566.8** |
+
+Group level: SDPA forward 48 -> 12 kernels/step and 7.753 -> 6.807 ms (0.854 ->
+0.750x ROCm); SDPA backward 36 -> 24 kernels/step and 28.956 -> 28.326 ms (0.853
+-> 0.834x). Whole step, GPU kernel time summed over the comparison groups,
+171.685 -> 169.640 ms/step; wall clock median of 20, 172.10 -> 170.489 ms
+(p10/p90 170.311 / 170.776, so the distributions do not overlap). 1.098 ->
+1.088x ROCm.
+
+**Decision: keep.** The copies are worth 1.92 ms/step and the strided kernels
+cost 0.93 of it back, net 1.57 ms.
+
+### Why there is a `DENSE` compile-time arm, and what it does not fix
+
+The general form alone measured **535.1 us/layer against 511.2** on the nanogpt
+forward case, a 4.7% regression, which is well outside the 1% the task allowed.
+The cause is the V loader: it issues sixteen scalar global reads per tile at one
+head-dim column each, and their row offsets `(4*group + j) * v_seq_stride` were
+compile-time immediates when the row stride was the compile-time `HD`. With a
+runtime stride each needs its own address add. A `DENSE: Bool` parameter, chosen
+by a runtime `_is_dense` check on the strides, restores the immediates.
+
+That recovered most of it but not all: the dense arm measures **518.4 rather
+than 513.1, +1.05%**, and the following was measured rather than assumed:
+
+| variant | us/layer |
+|---|---:|
+| pre-change kernel | 513.1 |
+| `DENSE` arm, strides in the signature | 518.4 |
+| `DENSE` arm, strides in the signature, body NEVER reads them | 517.9 |
+| `DENSE` arm, strides removed from the signature entirely | 513.5 |
+| `DENSE` arm, strides moved to the END of the signature | 518.4 |
+| `RowStrides` fields narrowed to Int32 (36 bytes not 72) | 516.9 |
+| two entry points, dense one keeping the old argument list, shared
+  `@always_inline` body | 517.8 |
+
+So it is the kernarg segment, not the indexing: three extra 24-byte structs cost
+5 us/layer even when the body never touches them, the cost scales with wave
+count rather than launch count (tiny +0.55 us, head1 +0.6, nanogpt +5.5), and
+argument position does not matter. Splitting into two kernel entry points so the
+dense one keeps a byte-identical argument list does not help either, because the
+`@always_inline` body then costs what the kernargs did (517.8). This kernel is
+already documented as latency-bound with nothing overlapping, and the journal
+already records 513-vs-515 as a reportable effect here, so a 1% perturbation
+from any code motion is what this kernel does.
+
+**Rejected, with numbers:**
+
+* **Single general path, no `DENSE`.** 535.1 vs 511.2, +4.7% on the harness.
+  Rejected against the 1% budget, even though production takes the general arm
+  anyway.
+* **Int32 stride fields.** 516.9 vs 518.4 buys 0.3% and costs a silent
+  correctness cliff above 2^31 elements per stride, which would need a host-side
+  guard and a new decline path. Not worth it.
+* **Two entry points with a shared `@always_inline` body.** 517.8, no better
+  than the one-kernel form, and more code.
+
+**Not attempted, and why it is the next thing to try.** The V loader's sixteen
+scalar reads are the whole reason `DENSE` exists. The backward kernels already
+avoid the equivalent problem by staging row-major into LDS and transposing out
+of LDS (`kt_smem` from `k_smem`), which its docstring records as cheaper than a
+transposing global loader. Doing the same for V in the forward would turn
+sixteen scalar loads into two `dwordx4`, make the dense and strided paths cost
+the same, and let `DENSE` be deleted. It needs `BN*KPAD` more LDS (26 KB total
+at HD 64, 51 KB at HD 256 -- both fit) and one more barrier, and it would have
+to be measured against 511.2 rather than 518.4.
+
+## Correctness
+
+**Against PyTorch-ROCm**, two processes because two accelerators in one trip an
+autograd-engine assert, output plus all three gradients, fifteen shapes
+including hd96, hd128, non-square, non-causal, 3x3, and six where the LEAF is a
+`[B, T, H, D]` tensor and the op is handed `leaf.transpose(1, 2)` with a strided
+`grad_output` to match. All fifteen take the fused node
+(`_FusedFlashAttentionAutogradBackward`). Worst relative error 7.14e-03 against
+a bf16 eps of 7.8e-03; the previous nine shapes are unchanged at 6.21e-03.
+
+The 7.14e-03 is `view_hd96` dQ, and it is not ours. Against an FP32 CPU oracle
+recomputing that case: out 2.47e-03 both sides, dQ **rocm 5.48e-03 / mojo
+2.83e-03**, dK 3.64e-03 / 4.07e-03, dV 2.39e-03 both. The mojo-vs-rocm gap is
+two independent bf16 roundings, and on the tensor that produced the worst number
+we are the closer of the two.
+
+**The harness gate now sees stride defects.** Five BTHD cases per harness, and
+their oracles are told each operand's STORAGE LAYOUT rather than the stride
+triple the kernel gets, so they work out where `(b, h, s, d)` lives from the
+definition of a row-major array. Mutation test, kernels forced to index densely:
+all five forward cases fail at 1.95 against a 0.031 bound; all five backward
+cases fail by six to twelve orders of magnitude; every dense case still passes.
+That is the property D10 says a shared-convention oracle cannot have.
+
+## Test-visible state
+
+`tests/test_eager_kernels.py`: 509 passed, 93 skipped, 1 failed --
+`test_bf16_v3_source_dependency_and_kernel_contract`, which asserts a hardcoded
+three-entry `_BF16_SOURCE_PATHS` list that now has four entries. Identical to the
+recorded pre-existing state; unrelated to this work.
+
+Two things worth recording for the next agent:
+
+* `bf16_matmul_ops` and `tf32_matmul_ops` DO NOT COMPILE on this machine, at
+  HEAD, with or without this change: `bf16_gemm_kernels.mojo` calls
+  `mma(a=8xbfloat16, b=4xbfloat16, c=4xfloat32)`, which is the NVIDIA
+  `m16n8k16` shape and has no gfx942 implementation. `_resolve_bf16_bridge`
+  already degrades gracefully ("without compiling a known-incomplete module"),
+  and no cached `.so` for either module exists for any source hash. Any edit
+  under `eager_kernels/` invalidates the cache, so a loop that imports all of
+  `_MOJO_MODULES` will die on `bf16_matmul_ops`; skip those two.
+* `pytest -n 8` on this file fails 42 tests with `hipErrorOutOfMemory`, because
+  each worker's MAX `DeviceContext` reserves a 172 GB pool. Run this file
+  serially; it takes 4.5 s.
