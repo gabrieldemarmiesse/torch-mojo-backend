@@ -2209,6 +2209,7 @@ def _nt_mfma_kernel[
         # as optimization_journal.md "Defect analysis D6", where MAX's
         # multistage kernel dropped one MFMA k step into two of four
         # accumulator elements and a deeper pipeline made it vanish.
+        _nt_sched_fence()
         var out = stack_allocation[MT * NTL * 16, dtype]()
         comptime for i in range(MT * NTL):
             out.store(i * 16, acc.load[width=16](i * 16).cast[dtype]())
@@ -2264,8 +2265,8 @@ def _nt_mfma_gemm[
     """Enqueue the NT MFMA GEMM, dropping the edge guards when they are unused.
 
     Both instantiations handle every runtime shape correctly; the guarded one is
-    simply slower, so it is selected only when the runtime extents actually have
-    an edge.
+    up to 7% slower at these sizes, so it is selected only when the runtime
+    extents actually have an edge.
     """
     comptime THREADS = (BM // WM) * (BN // WN) * 64
     if m % BM == 0 and n % BN == 0 and k % BK == 0:
@@ -2298,6 +2299,52 @@ def _nt_mfma_gemm[
             grid_dim=(ceildiv(n, BN), ceildiv(m, BM)),
             block_dim=(THREADS,),
         )
+
+
+@always_inline
+def _nt_mfma_route[
+    dtype: DType
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """Select an NT MFMA geometry for a runtime shape, or decline.
+
+    One geometry wins on every grid-filled shape measured: 256x256x32 with a
+    64x64 warp tile, sixteen wave64 per workgroup, two swizzled LDS stages.  The
+    reason it wins is occupancy, not arithmetic intensity -- 64x64 is the widest
+    warp tile whose sixteen accumulators still fit the 128 VGPRs a wave gets at
+    four waves per SIMD, and the swizzle is what makes two stages of that tile
+    exactly 65536 bytes, the whole gfx942 LDS budget for the one resident
+    workgroup those sixteen waves already are.  Wider warp tiles measure 24-50%
+    slower (128x64: 331, 128x128: 219 TFLOP/s against 434), and one padded LDS
+    stage instead of two swizzled ones measures 13% slower.
+
+    A smaller tile is selected only when the macro tile would exceed the output,
+    and the route declines below that so the caller keeps its existing path
+    rather than launching a workgroup that computes mostly nothing.
+    """
+    # A 16-byte vector load along k needs both operands 16-byte aligned, and
+    # since the row stride IS k, `k % 8 == 0` is what makes every row of every
+    # tile start aligned too.
+    if k % NT_VEC != 0 or a_addr % 16 != 0 or b_addr % 16 != 0:
+        return False
+    if m >= 256 and n >= 256:
+        _nt_mfma_gemm[dtype, 256, 256, 32, 64, 64, 2, -1, True](
+            c_addr, a_addr, b_addr, m, n, k, ctx
+        )
+        return True
+    if m >= 128 and n >= 128:
+        _nt_mfma_gemm[dtype, 128, 128, 32, 64, 64, 2, -1, True](
+            c_addr, a_addr, b_addr, m, n, k, ctx
+        )
+        return True
+    return False
 
 
 @always_inline
@@ -2439,6 +2486,18 @@ def _amd_dynamic_mfma_dispatch[
                     )
                     return True
         if m >= 2048 or (m >= 1024 and not deep_k):
+            comptime if transpose_b and not fuse_bias:
+                # Both operands are k-major here, which is the one layout MAX's
+                # multistage core cannot serve with wide global rows AND wide
+                # LDS fragments at the same time.  `_nt_mfma_route` is a
+                # hand-written kernel that has both; it measures 397-443
+                # TFLOP/s against 152-175 for the route below, so try it first
+                # and keep the B^T materialization only for the shapes it
+                # declines.
+                if _nt_mfma_route[dtype](
+                    c_addr, a_addr, b_addr, m, n, k, ctx
+                ):
+                    return True
             comptime if transpose_b:
                 # A [N, K] operand is read as BN rows of BLOCK_K elements, so
                 # each global load touches only BLOCK_K * 2 = 64 bytes of a
