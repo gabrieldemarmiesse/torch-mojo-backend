@@ -1899,6 +1899,12 @@ comptime NT_MID_FILL = 2
 # are measured one shape per process -- see the journal.
 comptime NT_BODY2_FILL = 3
 comptime NT_BODY2_FILL_NATIVE = 2
+# Bytes per microsecond the vectorized 2-D transpose sustains (journal change 28
+# measured 3.10-3.74 TB/s on exactly these shapes) and FLOP per microsecond the
+# k-major MFMA core sustains.  Both are used only to compare two routes' costs,
+# never to predict a time.
+comptime NT_T2_BYTES_PER_US = 3_300_000
+comptime NT_GEMM_FLOP_PER_US = 500_000_000
 
 
 @__llvm_metadata(
@@ -2908,6 +2914,48 @@ def _dense_mfma_route[
     # the same bytes and the same 64-byte request count.  With BOTH operands
     # native it is worth 40% and is never in doubt; with ONE it is measured, and
     # it splits on the regime -- see the journal.
+    comptime if A_KMAJOR and not B_KMAJOR and size_of[dtype]() == 2:
+        # The MIXED layout is the one the two-tile body loses on, and a k-major B
+        # is one transpose away.  Measured one shape per process, this route
+        # against `_nt_mfma_route` on the same extents:
+        #   (49152,  768,   768)  138.9 -> 128.6 us
+        #   (49152,  768,  2304)  353.0 -> 341.4
+        #   (49152,  768,  3072)  462.6 -> 447.1
+        #   (49152, 3072,   768)  522.4 -> 481.7
+        #   (49152,  768, 50304) 6729.8 -> 6109.1
+        # i.e. 3.3-9.2%, against a transpose of `4 * n * k` bytes.  Both sides
+        # scale with `n * k`, so the whole condition reduces to a bound on m:
+        # requiring the transpose to cost under a hundredth of the GEMM (a
+        # quarter of the smallest measured gain) is
+        #   4 * n * k / T2 <= 0.01 * 2 * m * n * k / GR   <=>   m >= 200 GR / T2
+        # which is about 30300 on this part.  The arithmetic is unchanged -- the
+        # k loop visits the same k in the same order -- so the outputs are
+        # bit-identical to this route's.
+        var xcus = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+        if (
+            m * NT_T2_BYTES_PER_US >= 200 * NT_GEMM_FLOP_PER_US
+            and k % NT_VEC == 0
+            and n % NT_VEC == 0
+            and a_addr % 16 == 0
+            and b_addr % 16 == 0
+            and ceildiv(m, 256) * ceildiv(n, 256) >= xcus
+        ):
+            var bt = ctx.enqueue_create_buffer[dtype](n * k)
+            _copy_strided[DType.uint16](
+                Int(bt.unsafe_ptr()),
+                b_addr,
+                _rm2(n, k),
+                _st2(k, 1),
+                _st2(1, n),
+                ctx,
+            )
+            var handled = _nt_mfma_route[dtype](
+                c_addr, a_addr, Int(bt.unsafe_ptr()), m, n, k, ctx
+            )
+            _ = bt^
+            if handled:
+                return True
+    # Whether the native operand's LDS tile holds k PAIRS.
     comptime PAIR_FILL = not A_KMAJOR or not B_KMAJOR
     comptime PAIR_SPLIT = not A_KMAJOR and not B_KMAJOR
     # The two-tile body pays when both operands have the SAME layout and loses
