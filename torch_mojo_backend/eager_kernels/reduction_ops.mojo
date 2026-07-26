@@ -745,6 +745,21 @@ comptime LSM_L2_BUDGET = 23_000_000
 # Below it, 256-thread blocks keep every thread busy and reductions cheap.
 comptime LSM_BIG_ROW_BYTES = 25_000
 
+# Floor under the long-row grid, in blocks per CU. The L2 budget above is an
+# H100 number and it starves a wide part: at the nanoGPT logits row (50304 bf16
+# columns) it admits 228 blocks, and a gfx942 MI300X has 304 CUs. Measured
+# there, 20 launches of the kernel below at [49152, 50304] bf16, us:
+#
+#   228 blocks 4460/4459/4455   608 3536   912 3570   1216 3538/3561
+#   1824 3517   2432 3509   4096 3515/3543   8192 3494   16384 3498
+#   49152 (one block per row) 3545
+#
+# i.e. the residency the cap buys back is worth far less than the parallelism it
+# costs, and everything from 2 blocks per CU upward is within 2% of flat. 4 sits
+# inside that plateau. The cap still applies above this floor, so short rows --
+# where it admits a large grid anyway -- are unaffected.
+comptime LSM_BLOCKS_PER_CU = 4
+
 
 @always_inline
 def _lsm_store_out_16B[
@@ -907,6 +922,7 @@ def _log_softmax_rows[
         comptime if has_accelerator():
             # Cap concurrent rows so their input bytes stay resident in L2 for
             # the pass-2 re-read; grid-stride over the rest.
+            comptime FILL = LSM_BLOCKS_PER_CU * ctx.default_device_info.sm_count
             var esize = size_of[dtype]()
             var blocks = min(rows, max(1, LSM_L2_BUDGET // (cols * esize)))
             var mout = out_ptr.as_unsafe_any_origin()
@@ -914,6 +930,10 @@ def _log_softmax_rows[
             # Big rows: 1024-thread blocks so the small (L2-capped) grid still
             # saturates memory. Small rows: 256 threads keep every thread busy.
             if cols * esize > LSM_BIG_ROW_BYTES:
+                # ...but the budget alone cannot be allowed to leave the device
+                # idle. See LSM_BLOCKS_PER_CU: at the nanoGPT logits row it
+                # admits 228 blocks on a 304-CU part and that costs 27%.
+                blocks = min(rows, max(blocks, FILL))
                 _enqueue_cached[_log_softmax_rows_block_kernel[dtype, 1024]](
                     ctx,
                     String(t"log_softmax_rows_{dtype}_1024"),

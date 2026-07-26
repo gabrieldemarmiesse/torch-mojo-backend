@@ -785,6 +785,28 @@ def _try_spec_scalar(spec_fn_name, x, scalar):
     return _wrap_spec_result(result, a._dtype, a._device)
 
 
+def _try_spec_scalar_inplace(spec_fn_name: str, x, scalar) -> bool:
+    """`x op= scalar` in place through a spec op. True when it ran.
+
+    The functional spec plus `_copy_into` costs an allocation and a
+    device-to-device copy; on a one-element tensor that copy is the whole cost
+    (nanoGPT's AdamW bumps 75 scalar step counters per step).
+    """
+    if not isinstance(scalar, int | float) or isinstance(scalar, bool):
+        return False
+    a = _t(x)
+    if a is None or not a._is_contiguous or a._dtype not in _FLOAT_DTYPES:
+        return False
+    try:
+        getattr(eager_kernels.elementwise_ops, spec_fn_name)(
+            _spec_of(a), float(scalar)
+        )
+    except Exception as exc:
+        _raise_if_device_oom(exc)
+        return False
+    return True
+
+
 def _try_spec_int_scalar(spec_fn_name, x, scalar):
     """Contiguous tensor-with-int-scalar through a spec op, or None."""
     if not isinstance(scalar, int) or isinstance(scalar, bool):
@@ -1080,6 +1102,17 @@ def fast_aten_add_(input, other, alpha=1):
                 _ctx_ptr(dst._device),
             )
         return input
+    # A float scalar goes straight into `input`, with no output buffer and no
+    # copy back. `alpha` folds into the scalar exactly.
+    if (
+        b is None
+        and isinstance(other, int | float)
+        and not isinstance(other, bool)
+        and isinstance(alpha, int | float)
+        and not isinstance(alpha, bool)
+        and _try_spec_scalar_inplace("AddScalarInplace", input, other * alpha)
+    ):
+        return input
     # General path: functional result, then a (strided-safe) copy back.
     result = fast_aten_add(input, other, alpha)
     if (
@@ -1126,6 +1159,10 @@ def fast_aten_mul_(input, other):
     dst = _t(input)
     if dst is None:
         return None
+    if _t(other) is None and _try_spec_scalar_inplace(
+        "MulScalarInplace", input, other
+    ):
+        return input
     result = fast_aten_mul(input, other)
     if (
         result is NOT_HANDLED

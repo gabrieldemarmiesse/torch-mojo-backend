@@ -40,7 +40,7 @@ from std.gpu import (
 from std.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
 from std.gpu.memory import AddressSpace, external_memory
 from std.gpu.primitives import block
-from std.math import exp
+from std.math import ceildiv, exp
 from std.memory import alloc
 from std.sys.info import has_accelerator, size_of
 from std.utils.static_tuple import StaticTuple
@@ -51,7 +51,22 @@ from op_utils import _enqueue_cached
 # MAX_DYNAMIC_SHARED_SIZE_BYTES opt-in function attribute.
 comptime _DEFAULT_DYN_SMEM = 48 * 1024
 
-comptime _NOSMEM_THREADS = 256
+# Fallback block size for rows too long to stage. 1024 rather than 256 because
+# one block owns one row: at 256 threads a CU holds up to eight rows in flight
+# and their combined bytes push the second read of `grad` out of the last-level
+# cache. Measured on gfx942 at [49152, 50304] bf16, 20 launches: 5578 us at 256
+# threads against 4474 at 1024, same kernel, same grid.
+comptime _NOSMEM_THREADS = 1024
+
+# Blocks per CU for the register-staged kernel. Measured flat on gfx942 at the
+# same shape, us: 608 blocks 4178, 912 4184, 1216 4185/4183, 2432 4192, 4864
+# 4186, 9728 4193, 19456 4191, 49152 (one per row) 4176/4186.
+comptime _REG_BLOCKS_PER_CU = 4
+# 16-byte register slots per thread the staged kernel is instantiated for. The
+# staging path is only reached when shared memory cannot hold the row, i.e.
+# n_vec > 3072, so the useful arms start at 4 slots; the 1-slot arm exists for
+# the cols < VEC rows that also land here (n_vec == 0).
+comptime _REG_MAX_SLOTS = 8
 
 
 @__llvm_metadata(
@@ -197,6 +212,111 @@ def _log_softmax_bwd_nosmem_kernel[
             - exp(o[idx].cast[DType.float32]()) * srow
         ).cast[dtype]()
         j += _NOSMEM_THREADS
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(threads))
+)
+@__name(t"lsm_bwd_reg_{dtype}_{threads}_{slots}")
+def _log_softmax_bwd_reg_kernel[
+    dtype: DType, threads: Int, slots: Int
+](
+    gi: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    g: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    o: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    rows: Int,
+    cols: Int,
+):
+    # Rows whose vector body fits `slots` per-thread 16-byte registers are
+    # staged there during the rowsum pass, so the emit pass never re-reads
+    # `grad`: total traffic is the 3-stream minimum (read grad, read output,
+    # write grad_input) with no shared memory and therefore no occupancy cost.
+    # This replaces the no-staging fallback, which read `grad` twice -- four
+    # passes over the logits tensor where three will do.
+    comptime VEC = 16 // size_of[dtype]()
+    var tid = Int(thread_idx.x)
+    var row = Int(block_idx.x)
+    while row < rows:
+        var base = row * cols
+        var head = (VEC - (base % VEC)) % VEC
+        if head > cols:
+            head = cols
+        var nvec = (cols - head) // VEC
+        var tail_start = head + nvec * VEC
+
+        var cache = InlineArray[SIMD[dtype, VEC], slots](uninitialized=True)
+        var vsum = SIMD[DType.float32, VEC](0)
+        var ssum = Float32(0)
+        if tid < head:
+            ssum += g[base + tid].cast[DType.float32]()
+        comptime for u in range(slots):
+            var v = tid + u * threads
+            if v < nvec:
+                var gv = g.load[width=VEC, alignment=16](base + head + v * VEC)
+                cache[u] = gv
+                vsum += gv.cast[DType.float32]()
+        var j = tail_start + tid
+        while j < cols:
+            ssum += g[base + j].cast[DType.float32]()
+            j += threads
+        var srow = block.sum[block_size=threads, broadcast=True](
+            vsum.reduce_add() + ssum
+        )
+
+        if tid < head:
+            var idx = base + tid
+            gi[idx] = (
+                g[idx].cast[DType.float32]()
+                - exp(o[idx].cast[DType.float32]()) * srow
+            ).cast[dtype]()
+        comptime for u in range(slots):
+            var v = tid + u * threads
+            if v < nvec:
+                var idx = base + head + v * VEC
+                var gv = cache[u].cast[DType.float32]()
+                var ov = o.load[width=VEC, alignment=16](idx).cast[
+                    DType.float32
+                ]()
+                gi.store[width=VEC, alignment=16](
+                    idx, (gv - exp(ov) * srow).cast[dtype]()
+                )
+        j = tail_start + tid
+        while j < cols:
+            var idx = base + j
+            gi[idx] = (
+                g[idx].cast[DType.float32]()
+                - exp(o[idx].cast[DType.float32]()) * srow
+            ).cast[dtype]()
+            j += threads
+
+        row += Int(grid_dim.x)
+
+
+@always_inline
+def _enqueue_bwd_reg[
+    dtype: DType, slots: Int
+](
+    gi: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    g: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    o: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    blocks: Int,
+    ctx: DeviceContext,
+) raises:
+    _enqueue_cached[_log_softmax_bwd_reg_kernel[dtype, 1024, slots]](
+        ctx,
+        String(t"lsm_bwd_reg_{dtype}_1024_{slots}"),
+        blocks,
+        1,
+        1,
+        1024,
+        gi,
+        g,
+        o,
+        rows,
+        cols,
+    )
 
 
 @always_inline
@@ -359,6 +479,27 @@ def enqueue_log_softmax_backward[
                     cols,
                 )
         else:
+            # Rows too long for shared memory but short enough to stage in
+            # registers: read `grad` once, no LDS, and a device-filling grid.
+            var need = ceildiv(cols // VEC, 1024)
+            if need <= _REG_MAX_SLOTS:
+                comptime FILL = (
+                    _REG_BLOCKS_PER_CU * ctx.default_device_info.sm_count
+                )
+                var blocks = min(rows, FILL)
+                if need <= 1:
+                    _enqueue_bwd_reg[dtype, 1](
+                        gi, g, o, rows, cols, blocks, ctx
+                    )
+                elif need <= 4:
+                    _enqueue_bwd_reg[dtype, 4](
+                        gi, g, o, rows, cols, blocks, ctx
+                    )
+                else:
+                    _enqueue_bwd_reg[dtype, 8](
+                        gi, g, o, rows, cols, blocks, ctx
+                    )
+                return
             _enqueue_cached[_log_softmax_bwd_nosmem_kernel[dtype]](
                 ctx,
                 String(t"lsm_bwd_nosmem_{dtype}"),

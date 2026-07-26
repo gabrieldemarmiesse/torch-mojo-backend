@@ -2711,6 +2711,167 @@ def test_fast_log_softmax_backward_non_trailing_keeps_composed_path(
     torch.testing.assert_close(actual_half.cpu(), expected_half, atol=2e-3, rtol=2e-3)
 
 
+# Column counts that walk the wide-row log-softmax dispatch. Rows above
+# LSM_BIG_ROW_BYTES take the 1024-thread arm, whose grid is the L2 budget capped
+# below by a device-filling floor; these counts straddle the point where the
+# budget stops being the binding term. Non-multiples of every vector width are
+# deliberate, and they make the per-row head and tail non-empty.
+_WIDE_LSM_COLS = [12_501, 16_384, 16_385, 25_000, 33_000, 50_304, 70_001]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cols", _WIDE_LSM_COLS)
+@pytest.mark.parametrize("offset", [0, 1])
+def test_fast_log_softmax_wide_rows_match_cpu(mojo_gpu, dtype, cols, offset):
+    """Wide rows, both grid regimes, against CPU log_softmax.
+
+    `offset` slices the storage so the row bases stop being 16-byte aligned,
+    which is the only way to exercise the per-row scalar head and tail.
+    """
+    rows = 3
+    generator = torch.Generator().manual_seed(20260726)
+    flat = torch.randn(rows * cols + offset, generator=generator)
+    expected = torch.log_softmax(flat[offset:].view(rows, cols).to(dtype), dim=-1)
+
+    device_flat = flat.to(mojo_gpu).to(dtype)
+    actual = torch.log_softmax(device_flat[offset:].view(rows, cols), dim=-1)
+
+    assert actual.dtype == dtype
+    assert not actual.isnan().any().item()
+    tol = 3e-2 if dtype in (torch.bfloat16, torch.float16) else 2e-5
+    torch.testing.assert_close(actual.cpu(), expected, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cols", [12_501, 33_000, 50_304, 70_001])
+def test_fast_log_softmax_wide_rows_stay_finite(mojo_gpu, dtype, cols):
+    """A wide row whose maximum is huge, and one that is entirely constant.
+
+    The block maximum has to come from a finite sentinel: seeding it with
+    `Float32.MIN` (which is -inf) turns an idle thread's `0 * exp(m - m)` into
+    a NaN that the block reduction spreads over the whole row (defect D7). A
+    constant row makes every log-probability -log(cols), which is the cheapest
+    independent check that the denominator is the full row and not a fragment.
+    """
+    spiked = torch.full((1, cols), -3.0, dtype=dtype)
+    spiked[0, cols // 3] = 60.0
+    actual = torch.log_softmax(spiked.to(mojo_gpu), dim=-1)
+    assert not actual.isnan().any().item()
+    torch.testing.assert_close(
+        actual.cpu(), torch.log_softmax(spiked, dim=-1), atol=3e-2, rtol=3e-2
+    )
+
+    constant = torch.full((2, cols), 0.25, dtype=dtype)
+    flat_out = torch.log_softmax(constant.to(mojo_gpu), dim=-1).cpu().float()
+    want = torch.full((2, cols), -math.log(cols))
+    torch.testing.assert_close(flat_out, want, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cols", [3, 33_000, 50_304, 70_001])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_fast_log_softmax_backward_wide_rows(mojo_gpu, dtype, cols, offset):
+    """The register-staged backward arms, and the re-read fallback.
+
+    cols == 3 is below one 16-byte vector, so the vector body is empty and the
+    whole row is head/tail scalars (the 1-slot arm); the wide counts walk the
+    4- and 8-slot arms and, at 70001, the fallback.
+    """
+    rows = 3
+    generator = torch.Generator().manual_seed(20260726)
+    flat_source = torch.randn(rows * cols + offset, generator=generator)
+    flat_grad = torch.randn(rows * cols + offset, generator=generator)
+    source = flat_source[offset:].view(rows, cols)
+    grad = flat_grad[offset:].view(rows, cols).to(dtype)
+    output = torch.log_softmax(source, dim=-1).to(dtype)
+    expected = (
+        grad.float() - output.float().exp() * grad.float().sum(-1, keepdim=True)
+    ).to(dtype)
+
+    device_grad = flat_grad.to(mojo_gpu).to(dtype)[offset:].view(rows, cols)
+    device_output = output.reshape(-1).to(mojo_gpu).view(rows, cols)
+    actual = torch.ops.aten._log_softmax_backward_data(
+        device_grad, device_output, -1, dtype
+    )
+
+    assert actual.dtype == dtype
+    assert not actual.isnan().any().item()
+    tol = 3e-2 if dtype in (torch.bfloat16, torch.float16) else 2e-5
+    torch.testing.assert_close(actual.cpu(), expected, atol=tol, rtol=tol)
+
+
+def test_fast_binary_add_above_last_level_cache(mojo_gpu):
+    """The flat 16-byte binary kernel's streaming grid arm.
+
+    `_bw_flat_blocks` covers the vector slots exactly once the three operands
+    exceed the 256 MiB last-level cache, and keeps the 4096-block cap below it.
+    24000003 fp32 elements is 288 MB of traffic and not a multiple of the
+    4-element vector, so the scalar tail rides on the streaming grid too.
+    """
+    total = 24_000_003
+    left = torch.arange(total, dtype=torch.float32) % 1021 - 510.0
+    right = torch.arange(total, dtype=torch.float32) % 733 - 366.0
+    actual = (left.to(mojo_gpu) + right.to(mojo_gpu)).cpu()
+    torch.testing.assert_close(actual, left + right)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32]
+)
+@pytest.mark.parametrize("shape", [(), (1,), (5,), (3, 7)])
+def test_fast_scalar_inplace_add_and_mul(mojo_gpu, dtype, shape):
+    """`add_`/`mul_` with a Python scalar must write straight into the input.
+
+    The in-place spec skips the output allocation and the device-to-device copy
+    the functional-plus-copy-back path pays; the int dtype is here because it
+    has to keep falling through to that path.
+    """
+    if dtype.is_floating_point:
+        base = torch.randn(shape, dtype=torch.float32).to(dtype)
+    else:
+        base = torch.arange(1, math.prod(shape) + 1 if shape else 2).reshape(
+            shape if shape else ()
+        )[()].to(dtype)
+    # torch itself refuses a float scalar on an integer in-place op.
+    scalars = (2.5, -1, 0.0) if dtype.is_floating_point else (3, -1, 2)
+    for scalar in scalars:
+        want = base.clone()
+        got = base.clone().to(mojo_gpu)
+        keep = got
+        want.add_(scalar)
+        got.add_(scalar)
+        assert got is keep, "add_ must return the same tensor object"
+        torch.testing.assert_close(got.cpu(), want, atol=2e-2, rtol=2e-2)
+
+        want.mul_(scalar)
+        got.mul_(scalar)
+        torch.testing.assert_close(got.cpu(), want, atol=2e-2, rtol=2e-2)
+
+
+def test_fast_scalar_inplace_add_alpha_and_aliasing(mojo_gpu):
+    """alpha folds into the scalar, and a view sees the in-place write."""
+    base = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    want = base.clone()
+    got = base.clone().to(mojo_gpu)
+    want.add_(3.0, alpha=-2)
+    got.add_(3.0, alpha=-2)
+    torch.testing.assert_close(got.cpu(), want)
+
+    # A non-contiguous target must still be correct (it falls through to the
+    # functional-plus-strided-copy path, which the in-place spec declines).
+    strided_want = base.clone().t()
+    strided_got = base.clone().to(mojo_gpu).t()
+    strided_want.add_(0.5)
+    strided_got.add_(0.5)
+    torch.testing.assert_close(strided_got.cpu(), strided_want)
+
+    # The write lands in the original storage, not a copy.
+    holder = base.clone().to(mojo_gpu)
+    row = holder[1]
+    row.add_(100.0)
+    torch.testing.assert_close(holder.cpu()[1], base[1] + 100.0)
+
+
 @pytest.mark.parametrize("reduction", [0, 1, 2])
 def test_fast_nll_loss_forward_and_backward_out(mojo_gpu, reduction):
     generator = torch.Generator().manual_seed(20260718)

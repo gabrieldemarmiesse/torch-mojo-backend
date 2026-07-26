@@ -1066,6 +1066,57 @@ def _scalar_spec_dispatcher[
         return _spec_unsupported(e)
 
 
+def _scalar_inplace_go[
+    op_code: Int
+](a_o: PyObjectPtr, scalar_o: PyObjectPtr) raises -> PyObjectPtr:
+    """`a op= scalar` for a contiguous float tensor, in place.
+
+    The functional spec above allocates an output buffer, and the ATen in-place
+    wrapper then copies it back over `a` -- an allocation and a
+    device-to-device copy per call. That is invisible next to a real tensor but
+    dominates a one-element tensor: nanoGPT's fused AdamW bumps 75 scalar step
+    counters per step through `_foreach_add_.Scalar`, which ATen decomposes into
+    75 `add_.Scalar`, and the copies alone cost ~376 us/step of GPU time.
+    """
+    ref a = _spec_ptr(a_o)[]
+    var supported = False
+    comptime for dt in FLOAT_DTYPES:
+        if a.dtype == dt:
+            supported = True
+    if not supported:
+        raise Error("mojo spec scalar inplace: unsupported dtype ", a.dtype)
+    if not a.contig:
+        raise Error("mojo spec scalar inplace: input is not contiguous")
+
+    var scalar = Float32(_raw_f64(scalar_o))
+    if a.numel > 0:
+        var ctx = a.ctx()
+        comptime for dt in FLOAT_DTYPES:
+            if a.dtype == dt:
+                _scalar_elementwise[dt, op_code](
+                    _make_ptr[dt](a.ptr),
+                    _make_ptr[dt](a.ptr),
+                    scalar,
+                    a.numel,
+                    ctx,
+                )
+    return _raw_ret_none()
+
+
+def _scalar_inplace_dispatcher[
+    op_code: Int
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        return _scalar_inplace_go[op_code](args[0], args[1])
+    except e:
+        return _spec_unsupported(e)
+
+
 def _int_scalar_spec_go[
     op_code: Int
 ](a_o: PyObjectPtr, scalar_o: PyObjectPtr) raises -> PyObjectPtr:
@@ -1370,6 +1421,16 @@ def PyInit_elementwise_ops() abi("C") -> PythonObject:
             _scalar_spec_dispatcher[SOP_POW],
             "PowScalarSpec",
             docstring="(a_spec, scalar) -> (holder, spec, shape, ptr); float",
+        )
+        b.def_py_c_function(
+            _scalar_inplace_dispatcher[SOP_ADD],
+            "AddScalarInplace",
+            docstring="(a_spec, scalar) -> None; a += scalar, contiguous float",
+        )
+        b.def_py_c_function(
+            _scalar_inplace_dispatcher[SOP_MUL],
+            "MulScalarInplace",
+            docstring="(a_spec, scalar) -> None; a *= scalar, contiguous float",
         )
         b.def_py_c_function(
             _int_scalar_spec_dispatcher[IOP_ADD],

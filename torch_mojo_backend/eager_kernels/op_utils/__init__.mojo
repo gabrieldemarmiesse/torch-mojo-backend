@@ -183,6 +183,28 @@ def _bw_blocks(
 
 
 @always_inline
+def _bw_flat_blocks(slots: Int, traffic_bytes: Int) -> Int:
+    """Grid for a GS_THREADS-wide launch making one 16-byte access per operand.
+
+    The three-operand binary kernel's crossover is not the cast's -- its threads
+    move 48 bytes a slot, not 24 -- so it gets its own rule rather than
+    `_bw_blocks`. Measured on gfx942, median of 40 x 20 launches:
+
+      traffic   4096 blocks   exact grid = ceildiv(slots, 256)
+      216 MiB   4.09 TB/s     3.81 TB/s     (bf16 [48, 1024, 768] add)
+      432 MiB   121.7 us      114.0 us      (fp32 [48, 1024, 768] add)
+
+    Keep the 4096-block cap while the operands are cache-resident; cover the
+    slots exactly once they stream from HBM.
+    """
+    if traffic_bytes > _LLC_BYTES:
+        return max(
+            1, min((slots + GS_THREADS - 1) // GS_THREADS, _BW_MAX_BLOCKS)
+        )
+    return _gs_blocks(slots)
+
+
+@always_inline
 def _make_ptr[
     dtype: DType
 ](addr: Int) -> UnsafePointer[Scalar[dtype], MutUntrackedOrigin]:
