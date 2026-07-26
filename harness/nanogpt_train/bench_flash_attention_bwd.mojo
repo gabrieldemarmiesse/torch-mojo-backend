@@ -69,8 +69,9 @@ struct BwdCase(ImplicitlyCopyable, Movable):
     var causal: Bool
     var calls_per_step: Int
     var rocm_us: Float64
-    # Which READ operands the caller hands over as a BTHD view: bit 0 Q, bit 1
-    # K, bit 2 V, bit 3 dO, bit 4 O. 0 is the dense `[B, H, T, D]` layout.
+    # Which tensors are stored `[B, T, H, D]` rather than `[B, H, T, D]`:
+    # bit 0 Q, bit 1 K, bit 2 V, bit 3 dO, bit 4 O, and for the WRITTEN
+    # gradients bit 5 dQ, bit 6 dK, bit 7 dV. 0 is dense throughout.
     var bthd: Int
 
     def __init__(
@@ -129,6 +130,25 @@ def cases() -> List[BwdCase]:
     out.append(BwdCase("bthd_hd128", 2, 4, 256, 256, 128, True, 1, 0.0, 31))
     out.append(BwdCase("bthd_cross", 2, 4, 256, 1024, 64, True, 1, 0.0, 15))
     out.append(BwdCase("bthd_noncausal", 4, 8, 512, 512, 64, False, 1, 0.0, 15))
+    # Strided GRADIENTS. The `transpose(1, 2)` on the way into the attention has
+    # a backward, and a `[B, H, T, D]` gradient stored `[B, T, H, D]` makes the
+    # reshape behind it a view instead of a gather -- 1.38 ms/step on nanoGPT
+    # (journal D11). Bits 5/6/7 ask the kernel for that layout, and the oracles,
+    # told the same STORAGE LAYOUT and never the stride triple, write their
+    # references to the matching addresses; a kernel that stores densely anyway
+    # differs everywhere at once.
+    out.append(BwdCase("bthd_grads", 4, 8, 512, 512, 64, True, 1, 0.0, 224))
+    out.append(BwdCase("bthd_grads_ragged", 2, 5, 300, 300, 96, True, 1, 0.0, 224))
+    out.append(BwdCase("bthd_grads_hd128", 2, 4, 256, 256, 128, True, 1, 0.0, 224))
+    # The production layout: every read operand and all three gradients strided.
+    # `nanogpt_bthd` is the acceptance shape in exactly the layout nanoGPT hands
+    # over, so the cost of the strided reads AND the strided writes is visible
+    # next to the dense `nanogpt` row. It is not aggregated into the per-step
+    # total; that total stays the dense case's.
+    out.append(BwdCase("nanogpt_bthd", 48, 12, 1024, 1024, 64, True, 1, 0.0, 255))
+    out.append(BwdCase("bthd_all", 4, 8, 512, 512, 64, True, 1, 0.0, 255))
+    out.append(BwdCase("bthd_all_cross", 2, 4, 256, 1024, 64, True, 1, 0.0, 255))
+    out.append(BwdCase("bthd_all_noncausal", 4, 8, 512, 512, 64, False, 1, 0.0, 255))
     return out^
 
 
@@ -285,6 +305,7 @@ def _ref_dq[
     k_bthd: Int,
     v_bthd: Int,
     o_bthd: Int,
+    dq_bthd: Int,
 ):
     """dQ, one thread per query row, sequential, FP32. The oracle.
 
@@ -307,6 +328,9 @@ def _ref_dq[
     var q_row = bthd_q if q_bthd != 0 else dense_q
     var g_row = bthd_q if g_bthd != 0 else dense_q
     var o_row = bthd_q if o_bthd != 0 else dense_q
+    # dQ's own storage layout, worked out the same way, so the flat comparison
+    # compares like with like.
+    var dq_row = bthd_q if dq_bthd != 0 else dense_q
     var k_base = bh * seq_kv * head_dim
     var k_step = head_dim
     if k_bthd != 0:
@@ -327,9 +351,8 @@ def _ref_dq[
             grad_output[g_row + e].cast[DType.float32]()
             * out_fwd[o_row + e].cast[DType.float32]()
         )
-    # dQ is a dense allocation whatever the inputs look like.
     for e in range(head_dim):
-        ref_dq[dense_q + e] = 0.0
+        ref_dq[dq_row + e] = 0.0
     var l = lse[bh * seq_q + qi]
     for j in range(limit):
         var krow = k_base + j * k_step
@@ -348,7 +371,7 @@ def _ref_dq[
         var p = exp(s * scale - l)
         var ds = p * (dp - row_d)
         for e in range(head_dim):
-            ref_dq[dense_q + e] += (
+            ref_dq[dq_row + e] += (
                 ds * key[krow + e].cast[DType.float32]() * scale
             )
 
@@ -377,6 +400,8 @@ def _ref_dkv[
     k_bthd: Int,
     v_bthd: Int,
     o_bthd: Int,
+    dk_bthd: Int,
+    dv_bthd: Int,
 ):
     """dK and dV, one thread per key row, sequential, FP32. The oracle.
 
@@ -398,6 +423,9 @@ def _ref_dkv[
     var bthd_kv = ((b * seq_kv + j) * heads + head) * head_dim
     var k_row = bthd_kv if k_bthd != 0 else dense_kv
     var v_row = bthd_kv if v_bthd != 0 else dense_kv
+    # dK's and dV's own storage layouts, worked out the same way.
+    var dk_row = bthd_kv if dk_bthd != 0 else dense_kv
+    var dv_row = bthd_kv if dv_bthd != 0 else dense_kv
     var q_base = bh * seq_q * head_dim
     var q_step = head_dim
     if q_bthd != 0:
@@ -414,10 +442,9 @@ def _ref_dkv[
         o_base = (b * seq_q * heads + head) * head_dim
         o_step = heads * head_dim
 
-    # dK and dV are dense allocations whatever the inputs look like.
     for e in range(head_dim):
-        ref_dk[dense_kv + e] = 0.0
-        ref_dv[dense_kv + e] = 0.0
+        ref_dk[dk_row + e] = 0.0
+        ref_dv[dv_row + e] = 0.0
     var first_q = 0
     if causal != 0:
         first_q = j
@@ -440,10 +467,10 @@ def _ref_dkv[
         var p = exp(s * scale - lse[bh * seq_q + qi])
         var ds = p * (dp - row_d)
         for e in range(head_dim):
-            ref_dv[dense_kv + e] += (
+            ref_dv[dv_row + e] += (
                 p * grad_output[g_row + e].cast[DType.float32]()
             )
-            ref_dk[dense_kv + e] += (
+            ref_dk[dk_row + e] += (
                 ds * query[q_row + e].cast[DType.float32]() * scale
             )
 
@@ -662,11 +689,17 @@ def run_case[
     var v_bthd = (target.bthd >> 2) & 1
     var g_bthd = (target.bthd >> 3) & 1
     var o_bthd = (target.bthd >> 4) & 1
+    var dq_bthd = (target.bthd >> 5) & 1
+    var dk_bthd = (target.bthd >> 6) & 1
+    var dv_bthd = (target.bthd >> 7) & 1
     var q_st = _case_strides(q_bthd, h, sq, hd)
     var g_st = _case_strides(g_bthd, h, sq, hd)
     var o_st = _case_strides(o_bthd, h, sq, hd)
     var k_st = _case_strides(k_bthd, h, skv, hd)
     var v_st = _case_strides(v_bthd, h, skv, hd)
+    var dq_st = _case_strides(dq_bthd, h, sq, hd)
+    var dk_st = _case_strides(dk_bthd, h, skv, hd)
+    var dv_st = _case_strides(dv_bthd, h, skv, hd)
 
     var qf = ctx.enqueue_create_buffer[DType.float32](qn)
     var kf = ctx.enqueue_create_buffer[DType.float32](kn)
@@ -785,6 +818,9 @@ def run_case[
             k_st,
             v_st,
             o_st,
+            dq_st,
+            dk_st,
+            dv_st,
             b,
             h,
             sq,
@@ -836,6 +872,7 @@ def run_case[
             k_bthd,
             v_bthd,
             o_bthd,
+            dq_bthd,
             grid_dim=(ceildiv(rows, REF_THREADS),),
             block_dim=(REF_THREADS,),
         )
@@ -860,6 +897,8 @@ def run_case[
             k_bthd,
             v_bthd,
             o_bthd,
+            dk_bthd,
+            dv_bthd,
             grid_dim=(ceildiv(b * h * skv, REF_THREADS),),
             block_dim=(REF_THREADS,),
         )

@@ -20,8 +20,15 @@ Invariants any replacement must keep:
   because the real caller hands over `x.view(B, T, H, D).transpose(1, 2)` and
   materializing that cost 1.83 ms/step of pure copy. `head_dim`'s stride is NOT
   carried: it must be 1, since that is the axis the 8-element global loads and
-  the LDS tile fills run along. The output and the log-sum-exp are freshly
-  allocated by the caller and stay dense.
+  the LDS tile fills run along. The log-sum-exp is freshly allocated by the
+  caller and stays dense.
+* `output` is WRITTEN through its own `RowStrides` triple for the same reason.
+  PyTorch's own flash attention returns a tensor shaped `[B, H, T, D]` but
+  stored `[B, T, H, D]`, so the universal re-assembly idiom
+  `y.transpose(1, 2).contiguous().view(B, T, C)` is a free no-op; returning
+  dense BHSD instead cost nanoGPT 1.84 ms/step of gather (journal D11). The
+  head_dim axis must still have stride 1 -- the epilogue store is an 8-element
+  vector along it.
 * No allocation, no host transfer, no synchronization: enqueue on the caller's
   `DeviceContext` and return.
 * Never write outside `output`. Q, K and V are read-only.
@@ -157,8 +164,9 @@ struct RowStrides(
 
     The `head_dim` stride is deliberately absent: it must be 1. Every loader
     here reads eight contiguous head-dim elements per lane, or fills an LDS row
-    along head-dim, so a strided innermost axis is not something this kernel can
-    express -- a caller holding such a layout must decline rather than guess.
+    along head-dim, and the epilogue stores eight contiguous head-dim elements,
+    so a strided innermost axis is not something this kernel can express -- a
+    caller holding such a layout must decline rather than guess.
 
     Everything else is free. The three strides are runtime values, so a dense
     `[B, H, T, D]` tensor and the `x.view(B, T, H, D).transpose(1, 2)` a
@@ -192,6 +200,18 @@ struct RowStrides(
 def dense_strides(heads: Int, seq: Int, head_dim: Int) -> RowStrides:
     """The strides of a dense row-major `[batch, heads, seq, head_dim]`."""
     return RowStrides(heads * seq * head_dim, seq * head_dim, head_dim)
+
+
+@always_inline
+def bthd_strides(heads: Int, seq: Int, head_dim: Int) -> RowStrides:
+    """`[batch, heads, seq, head_dim]` logically, `[batch, seq, heads, head_dim]`
+    in memory.
+
+    The layout PyTorch's flash attention returns, and the one that makes
+    `y.transpose(1, 2).contiguous()` a no-op. Element `(b, h, s, d)` sits at
+    `((b*seq + s)*heads + h)*head_dim + d`.
+    """
+    return RowStrides(seq * heads * head_dim, head_dim, heads * head_dim)
 
 
 @always_inline
@@ -233,6 +253,7 @@ def _flash_attention_fwd_baseline[
     q_st: RowStrides,
     k_st: RowStrides,
     v_st: RowStrides,
+    o_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -246,13 +267,13 @@ def _flash_attention_fwd_baseline[
     var batch = Int(block_idx.z)
     var heads = Int(grid_dim.y)
 
-    # Q, K and V are read through their own strides; the output and the
-    # log-sum-exp are dense `[batch, heads, seq_q, ...]` allocations.
+    # Every operand, the output included, walks its own strides; only the
+    # log-sum-exp is a dense `[batch, heads, seq_q]` allocation.
     var bh = batch * heads + head
     var q_row = batch * q_st.batch + head * q_st.head + qi * q_st.seq
     var k_base = batch * k_st.batch + head * k_st.head
     var v_base = batch * v_st.batch + head * v_st.head
-    var o_row = (bh * seq_q + qi) * head_dim
+    var o_row = batch * o_st.batch + head * o_st.head + qi * o_st.seq
 
     var q_smem = stack_allocation[
         MAX_HEAD_DIM, DType.float32, address_space=AddressSpace.SHARED
@@ -364,6 +385,7 @@ def _fa_mfma[
     q_st: RowStrides,
     k_st: RowStrides,
     v_st: RowStrides,
+    o_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -381,7 +403,10 @@ def _fa_mfma[
 
     `DENSE` asserts that `q_st`, `k_st` and `v_st` are exactly the row-major
     strides of `[batch, heads, seq, head_dim]`, which lets every row offset in
-    the loaders go back to being a compile-time immediate. It is not cosmetic:
+    the loaders go back to being a compile-time immediate. It says nothing about
+    `o_st`: the epilogue's store address was already a runtime multiply by
+    `head_dim`, so reading the row stride out of `o_st` instead costs nothing
+    and there is no arm worth specializing. It is not cosmetic:
     the general form measures 535.1 us/layer against 511.2 on the nanogpt case,
     because the V loader issues sixteen scalar global reads per tile and each
     one then needs its own address add instead of an immediate offset. The
@@ -426,14 +451,13 @@ def _fa_mfma[
         var bz = Int(block_idx.z)
         var by = Int(block_idx.y)
         var bh = bz * heads + by
-        # Read bases follow each operand's own strides; the output and the
-        # log-sum-exp are dense.
+        # Every base follows its own operand's strides; only the log-sum-exp is
+        # dense.
         var q_base = bz * q_st.batch + by * q_st.head
         var k_base = bz * k_st.batch + by * k_st.head
         var v_base = bz * v_st.batch + by * v_st.head
-        var o_base = bh * seq_q * head_dim
         comptime if DENSE:
-            q_base = o_base
+            q_base = bh * seq_q * head_dim
             k_base = bh * seq_kv * head_dim
             v_base = k_base
 
@@ -699,6 +723,22 @@ def _fa_mfma[
                     l = run_m[qt] * scale + log(tot)
                 lse[bh * seq_q + qg_l] = l
 
+        # Read HERE, not next to the read bases: nothing about the output's
+        # layout should be live across the tile loop.
+        #
+        # BEWARE when A/B-ing this kernel on the STRIDED-READ arm. Its absolute
+        # time is a compilation lottery: three harness binaries built from this
+        # same kernel source, differing only in which cases their case list
+        # holds, run `nanogpt_bthd` at 562, 608 and 674 us/layer of GPU time
+        # (rocprofv3, same kernel symbol). The unmasked tile loop is
+        # instruction-for-instruction identical across them; what moves is the
+        # AMDGPU schedule of the MASKED tile -- MFMA placement around the barrier
+        # and the accumulator correction -- which is 2 of ~9 tiles per block on
+        # this shape. So a harness A/B on the strided arm has a +-10% floor, and
+        # only the end-to-end step time settles anything here.
+        var o_base = bz * o_st.batch + by * o_st.head
+        var oss = o_st.seq
+
         comptime for dt in range(DT):
             barrier()
             comptime for qt in range(QT):
@@ -721,7 +761,7 @@ def _fa_mfma[
                     store = store and dcol < head_dim
                 if store:
                     output.store(
-                        o_base + qg * head_dim + dcol,
+                        o_base + qg * oss + dcol,
                         smem.load[width=8](r * OPAD + cc),
                     )
 
@@ -754,6 +794,7 @@ def _enqueue_fa_mfma[
     q_st: RowStrides,
     k_st: RowStrides,
     v_st: RowStrides,
+    o_st: RowStrides,
     batch: Int,
     heads: Int,
     seq_q: Int,
@@ -763,6 +804,7 @@ def _enqueue_fa_mfma[
     is_causal: Bool,
     ctx: DeviceContext,
 ) raises:
+    # `DENSE` is a property of the READ operands only; see `_fa_mfma`.
     var dense = (
         _is_dense(q_st, heads, seq_q, head_dim)
         and _is_dense(k_st, heads, seq_kv, head_dim)
@@ -780,6 +822,7 @@ def _enqueue_fa_mfma[
             q_st,
             k_st,
             v_st,
+            o_st,
             seq_q,
             seq_kv,
             head_dim,
@@ -800,6 +843,7 @@ def _enqueue_fa_mfma[
         q_st,
         k_st,
         v_st,
+        o_st,
         seq_q,
         seq_kv,
         head_dim,
@@ -821,6 +865,7 @@ def enqueue_flash_attention_fwd[
     q_st: RowStrides,
     k_st: RowStrides,
     v_st: RowStrides,
+    o_st: RowStrides,
     batch: Int,
     heads: Int,
     seq_q: Int,
@@ -833,14 +878,18 @@ def enqueue_flash_attention_fwd[
     """THE FROZEN ENTRY POINT. Q, K, V and output are `[batch, heads, seq, head_dim]`;
     `seq` is `seq_q` for Q and output, `seq_kv` for K and V.
 
-    Q, K and V are read through `q_st`, `k_st` and `v_st`, the element strides
-    of their batch, head and seq axes. The head_dim axis must have stride 1 --
-    it is the axis every vectorized load runs along -- and a caller holding a
-    layout where it is not must decline rather than pass one here. `output` and
-    `lse` are dense: the caller allocates them.
+    Q, K and V are read through `q_st`, `k_st` and `v_st`, and `output` is
+    WRITTEN through `o_st`: the element strides of their batch, head and seq
+    axes. The head_dim axis must have stride 1 in all four -- it is the axis
+    every vectorized load and the epilogue's vectorized store run along -- and a
+    caller holding a layout where it is not must decline rather than pass one
+    here. `lse` is dense.
 
     `dense_strides(heads, seq, head_dim)` builds the triple for a plain
-    row-major `[batch, heads, seq, head_dim]` tensor.
+    row-major `[batch, heads, seq, head_dim]` tensor; `bthd_strides` builds the
+    one for `[batch, heads, seq, head_dim]` stored `[batch, seq, heads,
+    head_dim]`, which is what PyTorch's flash attention returns and what makes
+    `y.transpose(1, 2).contiguous()` free.
 
     Every extent AND every stride is a runtime value. Dispatch on them as you
     like; keep this signature and keep every runtime input correct.
@@ -873,6 +922,7 @@ def enqueue_flash_attention_fwd[
                     q_st,
                     k_st,
                     v_st,
+                    o_st,
                     batch,
                     heads,
                     seq_q,
@@ -893,6 +943,7 @@ def enqueue_flash_attention_fwd[
                     q_st,
                     k_st,
                     v_st,
+                    o_st,
                     batch,
                     heads,
                     seq_q,
@@ -913,6 +964,7 @@ def enqueue_flash_attention_fwd[
                     q_st,
                     k_st,
                     v_st,
+                    o_st,
                     batch,
                     heads,
                     seq_q,
@@ -933,6 +985,7 @@ def enqueue_flash_attention_fwd[
                     q_st,
                     k_st,
                     v_st,
+                    o_st,
                     batch,
                     heads,
                     seq_q,
@@ -953,6 +1006,7 @@ def enqueue_flash_attention_fwd[
                     q_st,
                     k_st,
                     v_st,
+                    o_st,
                     batch,
                     heads,
                     seq_q,
@@ -972,6 +1026,7 @@ def enqueue_flash_attention_fwd[
                 q_st,
                 k_st,
                 v_st,
+                o_st,
                 batch,
                 heads,
                 seq_q,
@@ -992,6 +1047,7 @@ def enqueue_flash_attention_fwd[
         q_st,
         k_st,
         v_st,
+        o_st,
         seq_q,
         seq_kv,
         head_dim,

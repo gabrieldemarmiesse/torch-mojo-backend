@@ -36,8 +36,15 @@ which is why `softmax_lse` is an argument.
   caller hands over `x.view(B, T, H, D).transpose(1, 2)` views and materializing
   them cost 1.83 ms/step of pure copy. `head_dim`'s stride is not carried: it
   must be 1, since that is the axis every vectorized load and every LDS row fill
-  runs along. `dq`, `dk` and `dv` are freshly allocated by the caller and stay
-  dense, as does `softmax_lse`.
+  runs along. `softmax_lse` is dense.
+* `dq`, `dk` and `dv` are WRITTEN through their own `RowStrides` for the same
+  reason, so that the `transpose(1, 2)` sitting between the attention and
+  `x.view(B, T, H, D)` on the way IN has a free backward. A `[B, H, T, D]`
+  gradient stored `[B, T, H, D]` transposes to a contiguous tensor, so the
+  reshape autograd performs on it is a view rather than a gather; three dense
+  gradients per layer cost nanoGPT 1.38 ms/step of `clone` (journal D11).
+  head_dim's stride must be 1 here too: the epilogues store eight contiguous
+  head-dim elements at a time.
 * No allocation, no host transfer, no synchronization: enqueue on the caller's
   `DeviceContext` and return. Multiple kernel launches are fine.
 * Write only to `dq`, `dk`, `dv`. Everything else is read-only. The three output
@@ -208,6 +215,7 @@ def _bwd_dq_baseline[
     k_st: RowStrides,
     v_st: RowStrides,
     o_st: RowStrides,
+    dq_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -222,13 +230,13 @@ def _bwd_dq_baseline[
     var heads = Int(grid_dim.y)
 
     var bh = batch * heads + head
-    # Each read operand walks its own strides; dQ is a dense allocation.
+    # Every operand, dQ included, walks its own strides.
     var g_row = batch * g_st.batch + head * g_st.head + qi * g_st.seq
     var q_row = batch * q_st.batch + head * q_st.head + qi * q_st.seq
     var o_row = batch * o_st.batch + head * o_st.head + qi * o_st.seq
     var k_base = batch * k_st.batch + head * k_st.head
     var v_base = batch * v_st.batch + head * v_st.head
-    var dq_row = (bh * seq_q + qi) * head_dim
+    var dq_row = batch * dq_st.batch + head * dq_st.head + qi * dq_st.seq
 
     var acc = stack_allocation[
         MAX_HEAD_DIM, DType.float32, address_space=AddressSpace.SHARED
@@ -306,6 +314,8 @@ def _bwd_dkv_baseline[
     k_st: RowStrides,
     v_st: RowStrides,
     o_st: RowStrides,
+    dk_st: RowStrides,
+    dv_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -325,13 +335,14 @@ def _bwd_dkv_baseline[
     var heads = Int(grid_dim.y)
 
     var bh = batch * heads + head
-    # Each read operand walks its own strides; dK and dV are dense allocations.
+    # Every operand, dK and dV included, walks its own strides.
     var k_row = batch * k_st.batch + head * k_st.head + j * k_st.seq
     var v_row = batch * v_st.batch + head * v_st.head + j * v_st.seq
     var g_base = batch * g_st.batch + head * g_st.head
     var q_base = batch * q_st.batch + head * q_st.head
     var o_base = batch * o_st.batch + head * o_st.head
-    var dkv_row = (bh * seq_kv + j) * head_dim
+    var dk_row = batch * dk_st.batch + head * dk_st.head + j * dk_st.seq
+    var dv_row = batch * dv_st.batch + head * dv_st.head + j * dv_st.seq
 
     var acc_k = stack_allocation[
         MAX_HEAD_DIM, DType.float32, address_space=AddressSpace.SHARED
@@ -388,8 +399,8 @@ def _bwd_dkv_baseline[
 
     var o = tid
     while o < head_dim:
-        dk[dkv_row + o] = acc_k[o].cast[dtype]()
-        dv[dkv_row + o] = acc_v[o].cast[dtype]()
+        dk[dk_row + o] = acc_k[o].cast[dtype]()
+        dv[dv_row + o] = acc_v[o].cast[dtype]()
         o += THREADS
 
 
@@ -424,6 +435,7 @@ def _bwd_dq_mfma[
     k_st: RowStrides,
     v_st: RowStrides,
     o_st: RowStrides,
+    dq_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -438,7 +450,10 @@ def _bwd_dq_mfma[
 
     `DENSE` asserts the five read operands are row-major `[b, h, seq, head_dim]`
     and restores the compile-time row offsets in the K and V loaders; see the
-    same parameter on the forward kernel for the measurement behind it.
+    same parameter on the forward kernel for the measurement behind it. It says
+    nothing about `dq_st`: the epilogue's store address was already a runtime
+    multiply by `head_dim`, so reading the row stride out of `dq_st` instead
+    costs nothing.
     """
     comptime NW = 4
     comptime BM = NW * 32 * QT
@@ -471,9 +486,10 @@ def _bwd_dq_mfma[
         var bz = Int(block_idx.z)
         var by = Int(block_idx.y)
         var bh = bz * heads + by
-        # Read bases follow each operand's own strides; dQ and the log-sum-exp
-        # are dense.
-        var dq_base = bh * seq_q * head_dim
+        # Every base follows its own operand's strides, dQ included; only the
+        # log-sum-exp is dense.
+        var dq_base = bz * dq_st.batch + by * dq_st.head
+        var dqss = dq_st.seq
         var g_base = bz * g_st.batch + by * g_st.head
         var q_base = bz * q_st.batch + by * q_st.head
         var o_base = bz * o_st.batch + by * o_st.head
@@ -485,9 +501,10 @@ def _bwd_dq_mfma[
         var kss = k_st.seq
         var vss = v_st.seq
         comptime if DENSE:
-            g_base = dq_base
-            q_base = dq_base
-            o_base = dq_base
+            var q_dense = bh * seq_q * head_dim
+            g_base = q_dense
+            q_base = q_dense
+            o_base = q_dense
             k_base = bh * seq_kv * head_dim
             v_base = k_base
             gss = head_dim
@@ -759,7 +776,7 @@ def _bwd_dq_mfma[
                     store = store and dcol < head_dim
                 if store:
                     dq.store(
-                        dq_base + qg * head_dim + dcol,
+                        dq_base + qg * dqss + dcol,
                         smem.load[width=8](r * OPAD + cc),
                     )
 
@@ -792,6 +809,8 @@ def _bwd_dkv_mfma[
     k_st: RowStrides,
     v_st: RowStrides,
     o_st: RowStrides,
+    dk_st: RowStrides,
+    dv_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -806,7 +825,9 @@ def _bwd_dkv_mfma[
 
     `DENSE` asserts the five read operands are row-major `[b, h, seq, head_dim]`
     and restores the compile-time row offsets in the Q/dO/O loader; see the same
-    parameter on the forward kernel for the measurement behind it.
+    parameter on the forward kernel for the measurement behind it. It says
+    nothing about `dk_st` and `dv_st`: the epilogue's store address was already a
+    runtime multiply by `head_dim`.
     """
     comptime NW = 4
     comptime BN = NW * 32 * KT
@@ -847,9 +868,12 @@ def _bwd_dkv_mfma[
         var bz = Int(block_idx.z)
         var by = Int(block_idx.y)
         var bh = bz * heads + by
-        # Read bases follow each operand's own strides; dK, dV and the
-        # log-sum-exp are dense.
-        var dkv_base = bh * seq_kv * head_dim
+        # Every base follows its own operand's strides, dK and dV included;
+        # only the log-sum-exp is dense.
+        var dk_base = bz * dk_st.batch + by * dk_st.head
+        var dv_base = bz * dv_st.batch + by * dv_st.head
+        var dkss = dk_st.seq
+        var dvss = dv_st.seq
         var g_base = bz * g_st.batch + by * g_st.head
         var q_base = bz * q_st.batch + by * q_st.head
         var o_base = bz * o_st.batch + by * o_st.head
@@ -861,11 +885,12 @@ def _bwd_dkv_mfma[
         var kss = k_st.seq
         var vss = v_st.seq
         comptime if DENSE:
+            var kv_dense = bh * seq_kv * head_dim
             g_base = bh * seq_q * head_dim
             q_base = g_base
             o_base = g_base
-            k_base = dkv_base
-            v_base = dkv_base
+            k_base = kv_dense
+            v_base = kv_dense
             gss = head_dim
             qss = head_dim
             oss = head_dim
@@ -1138,9 +1163,9 @@ def _bwd_dkv_mfma[
                     if store:
                         var vals = smem.load[width=8](r * OPAD + cc)
                         comptime if pass_id == 0:
-                            dv.store(dkv_base + kvg * head_dim + dcol, vals)
+                            dv.store(dv_base + kvg * dvss + dcol, vals)
                         else:
-                            dk.store(dkv_base + kvg * head_dim + dcol, vals)
+                            dk.store(dk_base + kvg * dkss + dcol, vals)
 
 
 def _enqueue_mfma_pair[
@@ -1170,6 +1195,9 @@ def _enqueue_mfma_pair[
     k_st: RowStrides,
     v_st: RowStrides,
     o_st: RowStrides,
+    dq_st: RowStrides,
+    dk_st: RowStrides,
+    dv_st: RowStrides,
     batch: Int,
     heads: Int,
     seq_q: Int,
@@ -1179,6 +1207,7 @@ def _enqueue_mfma_pair[
     causal: Int,
     ctx: DeviceContext,
 ) raises:
+    # `DENSE` is a property of the READ operands only; see `_bwd_dq_mfma`.
     var dense = (
         _is_dense(g_st, heads, seq_q, head_dim)
         and _is_dense(q_st, heads, seq_q, head_dim)
@@ -1203,6 +1232,8 @@ def _enqueue_mfma_pair[
             k_st,
             v_st,
             o_st,
+            dk_st,
+            dv_st,
             seq_q,
             seq_kv,
             head_dim,
@@ -1226,6 +1257,7 @@ def _enqueue_mfma_pair[
             k_st,
             v_st,
             o_st,
+            dq_st,
             seq_q,
             seq_kv,
             head_dim,
@@ -1251,6 +1283,8 @@ def _enqueue_mfma_pair[
         k_st,
         v_st,
         o_st,
+        dk_st,
+        dv_st,
         seq_q,
         seq_kv,
         head_dim,
@@ -1274,6 +1308,7 @@ def _enqueue_mfma_pair[
         k_st,
         v_st,
         o_st,
+        dq_st,
         seq_q,
         seq_kv,
         head_dim,
@@ -1301,6 +1336,9 @@ def enqueue_flash_attention_bwd[
     k_st: RowStrides,
     v_st: RowStrides,
     o_st: RowStrides,
+    dq_st: RowStrides,
+    dk_st: RowStrides,
+    dv_st: RowStrides,
     batch: Int,
     heads: Int,
     seq_q: Int,
@@ -1319,13 +1357,16 @@ def enqueue_flash_attention_bwd[
 
     The five READ operands are addressed through `g_st`, `q_st`, `k_st`, `v_st`
     and `o_st`, the element strides of their batch, head and seq axes, in that
-    operand order. Their head_dim axis must have stride 1 -- it is the axis every
-    vectorized load runs along -- and a caller holding a layout where it is not
-    must decline rather than pass one here. `dq`, `dk`, `dv` and `softmax_lse`
-    are dense: the caller allocates them.
+    operand order, and the three WRITTEN ones through `dq_st`, `dk_st` and
+    `dv_st`. Every head_dim axis must have stride 1 -- it is the axis every
+    vectorized load and every vectorized store runs along -- and a caller holding
+    a layout where it is not must decline rather than pass one here.
+    `softmax_lse` is dense.
 
     `dense_strides(heads, seq, head_dim)` builds the triple for a plain
-    row-major `[batch, heads, seq, head_dim]` tensor.
+    row-major `[batch, heads, seq, head_dim]` tensor; `bthd_strides` builds the
+    one for `[batch, heads, seq, head_dim]` stored `[batch, seq, heads,
+    head_dim]`, the layout that makes the caller's `transpose(1, 2)` free.
 
     `softmax_lse[i]` is the natural log of the sum of `exp(S[i, :] - max)` plus
     that max, i.e. the row log-sum-exp, so `P[i, j] = exp(S[i, j] - lse[i])`.
@@ -1368,6 +1409,9 @@ def enqueue_flash_attention_bwd[
                     k_st,
                     v_st,
                     o_st,
+                    dq_st,
+                    dk_st,
+                    dv_st,
                     batch,
                     heads,
                     seq_q,
@@ -1394,6 +1438,9 @@ def enqueue_flash_attention_bwd[
                     k_st,
                     v_st,
                     o_st,
+                    dq_st,
+                    dk_st,
+                    dv_st,
                     batch,
                     heads,
                     seq_q,
@@ -1420,6 +1467,9 @@ def enqueue_flash_attention_bwd[
                     k_st,
                     v_st,
                     o_st,
+                    dq_st,
+                    dk_st,
+                    dv_st,
                     batch,
                     heads,
                     seq_q,
@@ -1445,6 +1495,9 @@ def enqueue_flash_attention_bwd[
                 k_st,
                 v_st,
                 o_st,
+                dq_st,
+                dk_st,
+                dv_st,
                 batch,
                 heads,
                 seq_q,
@@ -1469,6 +1522,7 @@ def enqueue_flash_attention_bwd[
         k_st,
         v_st,
         o_st,
+        dq_st,
         seq_q,
         seq_kv,
         head_dim,
@@ -1491,6 +1545,8 @@ def enqueue_flash_attention_bwd[
         k_st,
         v_st,
         o_st,
+        dk_st,
+        dv_st,
         seq_q,
         seq_kv,
         head_dim,

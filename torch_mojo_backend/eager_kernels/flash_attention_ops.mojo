@@ -62,11 +62,12 @@ def _flash_attention_forward_go(
     var seq_q = _raw_tuple_int(dims_obj, 2)
     var seq_kv = _raw_tuple_int(dims_obj, 3)
     var head_dim = _raw_tuple_int(dims_obj, 4)
-    # (q, k, v), each (batch, head, seq) in elements. head_dim's stride must be
-    # 1; the Python caller declines anything else.
+    # (q, k, v, output), each (batch, head, seq) in elements. head_dim's stride
+    # must be 1; the Python caller declines anything else.
     var q_st = _raw_strides(strides_obj, 0)
     var k_st = _raw_strides(strides_obj, 1)
     var v_st = _raw_strides(strides_obj, 2)
+    var o_st = _raw_strides(strides_obj, 3)
     var scale = Float32(_raw_f64(scale_obj))
     var causal = _raw_int(causal_obj) != 0
     var dtype = _raw_dtype_int(dtype_obj)
@@ -91,6 +92,7 @@ def _flash_attention_forward_go(
                 q_st,
                 k_st,
                 v_st,
+                o_st,
                 batch,
                 heads,
                 seq_q,
@@ -130,14 +132,17 @@ def _flash_attention_backward_go(
     var seq_q = _raw_tuple_int(dims_obj, 2)
     var seq_kv = _raw_tuple_int(dims_obj, 3)
     var head_dim = _raw_tuple_int(dims_obj, 4)
-    # (grad_output, query, key, value, out_fwd), each (batch, head, seq) in
-    # elements. head_dim's stride must be 1; the Python caller declines anything
-    # else.
+    # (grad_output, query, key, value, out_fwd, dq, dk, dv), each (batch, head,
+    # seq) in elements. head_dim's stride must be 1; the Python caller declines
+    # anything else.
     var g_st = _raw_strides(strides_obj, 0)
     var q_st = _raw_strides(strides_obj, 1)
     var k_st = _raw_strides(strides_obj, 2)
     var v_st = _raw_strides(strides_obj, 3)
     var o_st = _raw_strides(strides_obj, 4)
+    var dq_st = _raw_strides(strides_obj, 5)
+    var dk_st = _raw_strides(strides_obj, 6)
+    var dv_st = _raw_strides(strides_obj, 7)
     var scale = Float32(_raw_f64(scale_obj))
     var causal = _raw_int(causal_obj) != 0
     var dtype = _raw_dtype_int(dtype_obj)
@@ -151,7 +156,11 @@ def _flash_attention_backward_go(
             var dk = _make_ptr[dt](_raw_int(dk_obj))
             var dv = _make_ptr[dt](_raw_int(dv_obj))
             # The kernel may accumulate into these; the contract is that they
-            # arrive zeroed.
+            # arrive zeroed. The zeroing is by element COUNT from the base
+            # pointer, so each gradient must span exactly its own
+            # `batch * heads * seq * head_dim` elements there -- true for a dense
+            # allocation and for any permutation of its four axes, which is all
+            # the Python caller ever hands over.
             ctx.enqueue_memset(
                 DeviceBuffer(
                     ctx,
@@ -204,6 +213,9 @@ def _flash_attention_backward_go(
                 k_st,
                 v_st,
                 o_st,
+                dq_st,
+                dk_st,
+                dv_st,
                 batch,
                 heads,
                 seq_q,
@@ -288,12 +300,12 @@ def PyInit_flash_attention_ops() abi("C") -> PythonObject:
             "FlashAttentionForward",
             docstring=(
                 "(out_ptr, lse_ptr, q_ptr, k_ptr, v_ptr, (batch, heads, seq_q,"
-                " seq_kv, head_dim), (batch, head, seq) x 3 for q, k and v,"
-                " scale, is_causal, dtype, context_ptr); fused flash-attention"
-                " forward writing the output and the per-row log-sum-exp the"
-                " backward consumes. Q, K and V are read through the given"
-                " element strides and their head_dim stride must be 1; the"
-                " output and the log-sum-exp are dense."
+                " seq_kv, head_dim), (batch, head, seq) x 4 for q, k, v and the"
+                " output, scale, is_causal, dtype, context_ptr); fused"
+                " flash-attention forward writing the output and the per-row"
+                " log-sum-exp the backward consumes. Q, K, V and the output are"
+                " addressed through the given element strides and their head_dim"
+                " stride must be 1; the log-sum-exp is dense."
             ),
         )
         b.def_py_c_function(
@@ -302,12 +314,11 @@ def PyInit_flash_attention_ops() abi("C") -> PythonObject:
             docstring=(
                 "(dq_ptr, dk_ptr, dv_ptr, grad_out_ptr, q_ptr, k_ptr, v_ptr,"
                 " out_ptr, lse_ptr, (batch, heads, seq_q, seq_kv, head_dim),"
-                " (batch, head, seq) x 5 for grad_out, q, k, v and out, scale,"
-                " is_causal, dtype, context_ptr); fused flash-attention"
-                " backward writing dQ, dK and dV. The five read operands are"
-                " addressed through the given element strides and their"
-                " head_dim stride must be 1; dQ, dK, dV and the log-sum-exp are"
-                " dense."
+                " (batch, head, seq) x 8 for grad_out, q, k, v, out, dq, dk and"
+                " dv, scale, is_causal, dtype, context_ptr); fused"
+                " flash-attention backward writing dQ, dK and dV. All eight"
+                " operands are addressed through the given element strides and"
+                " their head_dim stride must be 1; the log-sum-exp is dense."
             ),
         )
         return b.finalize()

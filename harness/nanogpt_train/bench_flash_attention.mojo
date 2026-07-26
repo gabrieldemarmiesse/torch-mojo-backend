@@ -87,8 +87,8 @@ struct FaCase(ImplicitlyCopyable, Movable):
     var causal: Bool
     var calls_per_step: Int
     var rocm_us: Float64
-    # Which operands the caller hands over as a BTHD view: bit 0 Q, bit 1 K,
-    # bit 2 V. 0 is the dense `[batch, heads, seq, head_dim]` layout.
+    # Which tensors are stored `[B, T, H, D]` rather than `[B, H, T, D]`:
+    # bit 0 Q, bit 1 K, bit 2 V, bit 3 the OUTPUT. 0 is dense throughout.
     var bthd: Int
 
     def __init__(
@@ -147,6 +147,24 @@ def cases() -> List[FaCase]:
     out.append(FaCase("bthd_hd128", 2, 4, 256, 256, 128, True, 1, 0.0, 7))
     out.append(FaCase("bthd_cross", 2, 4, 256, 1024, 64, True, 1, 0.0, 7))
     out.append(FaCase("bthd_noncausal", 4, 8, 512, 512, 64, False, 1, 0.0, 7))
+    # Strided OUTPUT. PyTorch's flash attention returns `[B, H, T, D]` stored
+    # `[B, T, H, D]` so that `y.transpose(1, 2).contiguous()` is a no-op; writing
+    # dense instead cost nanoGPT 1.84 ms/step of gather (journal D11). bit 3 asks
+    # the kernel to write that layout, and the oracle -- told the same STORAGE
+    # LAYOUT, never the stride triple -- writes its reference to the matching
+    # addresses, so a kernel that quietly stores densely differs everywhere.
+    out.append(FaCase("bthd_out", 4, 8, 512, 512, 64, True, 1, 0.0, 8))
+    out.append(FaCase("bthd_out_ragged", 2, 5, 300, 300, 96, True, 1, 0.0, 9))
+    out.append(FaCase("bthd_out_hd128", 2, 4, 256, 256, 128, True, 1, 0.0, 8))
+    # The production layout: every operand and the output stored `[B, T, H, D]`.
+    # `nanogpt_bthd` is the acceptance shape in exactly the layout nanoGPT hands
+    # over, so the cost of the strided read AND the strided write is visible next
+    # to the dense `nanogpt` row rather than inferred from small cases. It is not
+    # aggregated into the per-step total; that total stays the dense case's.
+    out.append(FaCase("nanogpt_bthd", 48, 12, 1024, 1024, 64, True, 1, 0.0, 15))
+    out.append(FaCase("bthd_all", 4, 8, 512, 512, 64, True, 1, 0.0, 15))
+    out.append(FaCase("bthd_all_cross", 2, 4, 256, 1024, 64, True, 1, 0.0, 15))
+    out.append(FaCase("bthd_all_noncausal", 4, 8, 512, 512, 64, False, 1, 0.0, 15))
     return out^
 
 
@@ -210,6 +228,7 @@ def _reference_kernel[
     q_bthd: Int,
     k_bthd: Int,
     v_bthd: Int,
+    o_bthd: Int,
 ):
     """One thread per query row, three passes, FP32, no tiling and no rescaling.
 
@@ -250,8 +269,13 @@ def _reference_kernel[
     if v_bthd != 0:
         v_base = (b * seq_kv * heads + head) * head_dim
         v_step = heads * head_dim
-    # The kernel writes a dense output whatever its inputs look like.
+    # The output's own storage layout, worked out the same way: the reference is
+    # written to the addresses the DECLARED layout says element (b, h, s, d)
+    # occupies, so the flat comparison below is a comparison of like with like
+    # and a kernel storing some other permutation fails everywhere at once.
     var o_base = (bh * seq_q + qi) * head_dim
+    if o_bthd != 0:
+        o_base = ((b * seq_q + qi) * heads + head) * head_dim
 
     var limit = seq_kv
     if causal != 0:
@@ -440,9 +464,11 @@ def run_case[
     var q_bthd = target.bthd & 1
     var k_bthd = (target.bthd >> 1) & 1
     var v_bthd = (target.bthd >> 2) & 1
+    var o_bthd = (target.bthd >> 3) & 1
     var q_st = _case_strides(q_bthd, heads, seq_q, head_dim)
     var k_st = _case_strides(k_bthd, heads, seq_kv, head_dim)
     var v_st = _case_strides(v_bthd, heads, seq_kv, head_dim)
+    var o_st = _case_strides(o_bthd, heads, seq_q, head_dim)
 
     var q_f32 = ctx.enqueue_create_buffer[DType.float32](q_count)
     var k_f32 = ctx.enqueue_create_buffer[DType.float32](kv_count)
@@ -522,6 +548,7 @@ def run_case[
             q_st,
             k_st,
             v_st,
+            o_st,
             batch,
             heads,
             seq_q,
@@ -566,6 +593,7 @@ def run_case[
             q_bthd,
             k_bthd,
             v_bthd,
+            o_bthd,
             grid_dim=(ceildiv(rows, REF_THREADS),),
             block_dim=(REF_THREADS,),
         )
