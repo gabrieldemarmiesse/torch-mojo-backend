@@ -3186,22 +3186,34 @@ def _dense_mfma_route[
     var sq_parts = _nt_best_parts(
         256, 256, m, n, size_of[dtype](), ktiles, cus, splittable, 1
     )
-    # A SECOND macro tile, 128x384, was built on top of this search and is not
-    # here, and the reason is compile time rather than speed.  It is one of only
-    # two shapes measured to reach `_nt_ktile_cyc` (diagnostic experiment AF
-    # swept fifteen), the model ranks it correctly, and where it wins it wins
-    # properly: at (2304, 1152, 49152) -- an n that 256 quantizes by 11% and 384
-    # divides -- the model picks it at eleven slabs and it measures 620.6 -> 566.9
-    # us against this route, one shape per process, interleaved.  But with the
-    # slab count free, 256x256 wins all fifteen shapes THIS workload issues, and
-    # two more instantiations of a 768-thread core take `matmul_ops` from 6m33s to
-    # over 16 minutes to compile -- a cost every eager first use pays.  Re-adding
-    # it is one `_nt_best_parts` call plus one launch arm; the journal has the
-    # whole sweep.  Two things it needs, both measured: it belongs to the PURE
-    # layouts only (in the mixed one it is 22% off its bound -- at
-    # (768, 768, 49152) the model puts it 3% ahead of 256x256 and it measures
-    # 175.2 us against 151.3), and its `min_parts` is 2.
-    var b_parts = sq_parts
+    # The second macro tile, and the two conditions the sweep put on it.
+    #
+    # 128x384 is the only other shape of fifteen swept that reaches
+    # `_nt_ktile_cyc` (diagnostic experiment AF), which is what makes it safe to
+    # rank against 256x256 with a model rather than a table.  It is offered to the
+    # PURE layouts only: in the MIXED layout, whose fill is one k tile at a time
+    # and whose refill sits mid-sequence, it is 22% off its bound, and at
+    # (768, 768, 49152) the model puts it 3% ahead of 256x256 while it measures
+    # 175.2 us against 151.3.  A cost model cannot see that; the candidate set is
+    # what carries it.  And it is offered with K SPLIT only (`min_parts = 2`),
+    # which is the form measured -- (2304, 1152, 49152), an n that 256 quantizes
+    # by 11% and 384 divides: 620.6 -> 566.9 us against this route, one shape per
+    # process, interleaved.
+    #
+    # With the slab count free, 256x256 wins every shape nanoGPT itself issues, so
+    # this tile is here for the shapes a different sequence length or hidden size
+    # brings, not for that workload.
+    var wide_parts = _nt_best_parts(
+        128, 384, m, n, size_of[dtype](), ktiles, cus, splittable, 2
+    ) if BODY2 else 0
+    var b_wide = sq_parts == 0
+    if sq_parts != 0 and wide_parts != 0:
+        b_wide = _nt_plan_cost(
+            128, 384, m, n, size_of[dtype](), ktiles, wide_parts, cus
+        ) < _nt_plan_cost(
+            256, 256, m, n, size_of[dtype](), ktiles, sq_parts, cus
+        )
+    var b_parts = wide_parts if b_wide else sq_parts
     if b_parts == 0:
         return False
 
@@ -3273,7 +3285,15 @@ def _dense_mfma_route[
         )
         _ = ws^
 
-    _launch[256, 256]()
+    # The mixed layout never selects the second tile, so it does not instantiate
+    # it either.
+    comptime if BODY2:
+        if b_wide:
+            _launch[128, 384, True]()
+        else:
+            _launch[256, 256]()
+    else:
+        _launch[256, 256]()
     return True
 
 

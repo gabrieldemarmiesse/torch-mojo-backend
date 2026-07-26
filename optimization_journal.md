@@ -4389,3 +4389,314 @@ difference is not accounted for here: the harness synchronizes every iteration
 and the step does not, so 49 + 49 + 61 launches per step carry an overhead in the
 harness numbers that the step overlaps. What the step says is the number that
 counts.
+
+# nanoGPT Linear GEMM, MI300X — macro tiles, and the slab count that was not free, 2026-07-26
+
+Seventh pass over `harness/nanogpt_train/bench_linear_gemm.mojo`. Entry state,
+re-measured: step **162.43 ms** against PyTorch-ROCm's 156.88, GEMM gap
+**+1.89 ms** of which the weight gradient (TN, the copy-free both-native route
+production takes) is +2.86 and the forward is -1.49.
+
+The brief was the tile shape: ROCm dispatches fourteen Tensile kernels over this
+step, with non-square macro tiles (MT256x224, MT192x224, MT512x128, MT128x512,
+MT192x256), while this kernel runs one 256x256x32 geometry for everything. What
+the sweep found is that the tile shape was **not** what the 5.3% grid
+quantization was costing us -- the K SLAB COUNT was, and it was costing more.
+
+**Protocol.** >= 25 warmups, >= 100 individually synchronized iterations, one
+shape per process, every before/after pair interleaved base-then-new back to
+back. Clock pinning is refused on this SR-IOV VF (`scripts/gpu_clock.py status`);
+interleaving is the substitute. Timings never taken from a `--pmc` run. The gate
+harness materializes A^T for its `transpose_a` rows, so its TN cases exercise the
+MIXED instantiation; the copy-free route production takes is measured through a
+separate driver that calls `_tn_mfma_route` directly.
+
+## Diagnostic experiment AF — eight macro tiles, and which two are real
+
+`_nt_mfma_gemm` was instantiated for fifteen (BM, BN) pairs at a constant 64x64
+warp tile, BK=32 and two swizzled LDS stages, and swept against slab count on
+(2304, 768, 49152) -- the wgrad shape whose 27 output tiles at 256x256 are the
+worst grid in the step. Two stages of a `BM x BN` tile cost `128 * (BM + BN)`
+bytes, so `BM + BN <= 512` is the whole feasible set at BK=32.
+
+Best slab count per tile, us (all pass the all-ones check):
+
+| tile | waves/wg | tiles | best us | model us | measured/model |
+|---|---:|---:|---:|---:|---:|
+| **256x256** | 16 | 27 | **443.4** (p32) | 443.8 | **1.00** |
+| **128x384** | 12 | 36 | **380.0** (p8) | 382.0 | **1.00** |
+| 256x192 | 12 | 36 | 419.3 (p8) | 370.6 | 1.13 |
+| 320x192 | 15 | 32 | 545.4 (p8) | 428 | 1.27 |
+| 192x320 | 15 | 36 | 553.2 (p8) | 428 | 1.29 |
+| 384x128 | 12 | 36 | 503.9 (p8) | 382 | 1.32 |
+| 192x256 | 12 | 36 | 489.5 (p8) | 371 | 1.32 |
+| 128x320 | 10 | 54 | 526.7 (p16) | - | - |
+| 192x192 | 9 | 48 | 801.4 (p16) | - | - |
+| 128x256 | 8 | 54 | 557.0 (p16) | - | - |
+| 128x128 | 4 | 108 | 535.4 (p16) | - | - |
+| 64x384 | 6 | 72 | 544.6 (p4) | - | - |
+| 64x448 | 7 | 72 | 611.0 (p4) | - | - |
+| 384x64 | 6 | 72 | 751.1 (p8) | - | - |
+| 64x256 | 4 | 108 | 885.9 (p8) | - | - |
+
+The model column is `_nt_ktile_cyc`, which counts one k tile of a tile from the
+geometry exactly as diagnostic experiment AD counted 256x256 (MFMA + LDS reads +
+LDS writes + VMEM = 3840 cycles against 3995 measured), plus the traffic. **Only
+256x256 and 128x384 reach it**; everything else is 13-32% short of its own bound.
+Both of the two are `BM + BN == 512`, i.e. exactly the LDS budget, and both have
+a wave count that is a multiple of four. That last point is not cosmetic: a
+15-wave workgroup issues its MFMAs in four rounds of a SIMD each, so 320x192 does
+3.75 rounds of work in 4 rounds of time, and it measures 27% off a model that
+divides instead of ceiling. But it does not explain 384x128 (12 waves, 512 sum,
+32% off) and 128x384 (same three properties, exact). That asymmetry is
+unexplained; what it means practically is that a cost model can only be trusted
+over a candidate set whose members have been measured to reach it, which is why
+the shipped set is those two and not the six the model would happily rank.
+
+**Decision.** Reject the six. Keep 256x256; add 128x384 for the pure layouts.
+
+## Change 38 — a K slab that need not divide the k tile count
+
+**Hypothesis.** `_nt_plan_cost` says the wgrad shapes are bound by grid fill, and
+the slab count that fills the grid is usually not a divisor of `k / BK`. At
+(2304, 768, 49152) the 27 output tiles want **eleven** slabs -- 297 of 304 CUs --
+and 11 divides neither 1536 nor anything near it, so change 27's search over
+divisors had to take 32 slabs (864 workgroups, three waves at 94.7%) and pay four
+times the workspace traffic.
+
+**Predicted effect.** `_nt_slab_tiles` rounds the slab up to an EVEN number of k
+tiles and the last slab takes what is left, which keeps both k-loop bodies legal
+(the two-tile body needs an even count in every slab, and an even slab length
+makes the remainder even exactly when the total is). The model then predicts 361
+us at eleven slabs against 443.8 at thirty-two.
+
+**Measured effect.** One shape per process, TN both-native, 256x256:
+
+| slabs | k tiles/slab | waves | us | model us |
+|---:|---:|---:|---:|---:|
+| 8 | 192 | 1 | 472.0 | 470.3 |
+| 9 | 172 | 1 | 433.7 | 428 |
+| 10 | 154 | 1 | 396.5 | 390 |
+| **11** | **140 + 136** | **1** | **369.8** | **361** |
+| 12 | 128 | 2 | 622.0 | 631 |
+| 32 (divisor, shipped before) | 48 | 3 | 443.4 | 443.8 |
+
+The model is within 2.5% at every point and its argmin is the measured argmin.
+Eleven slabs beat the best divisor by **16.6%**, and the reason is visible in the
+two terms: the same GEMM work in one wave instead of three ragged ones, and 155 MB
+of workspace traffic instead of 453.
+
+**Decision.** Accept. The kernel derives its own slab's tile count as
+`min(kt_per, ktiles - slab * kt_per)`, so the short slab is a runtime property of
+`block_idx.z` and nothing else changes.
+
+## Change 39 — one cost model chooses the tile and the slab count together
+
+`_nt_plan_cost(bm, bn, m, n, obytes, ktiles, parts, cus)` is
+`ceil(tiles * parts / cus) * slab_tiles * ktile_cycles + traffic / rate`, with
+every shape term a runtime value and two calibrated constants: 1.67 GHz and
+4.05 TB/s, **fitted from two points of one shape** (256x256 at 8 and at 32 slabs
+on (2304, 768, 49152), which differ 4x in workspace bytes and 3x in wave count).
+Both constants are physically sensible and consistent with what change 27
+measured for the reduction alone. Predictions against measurement, none of them
+fitted:
+
+| shape, layout | plan | model | measured |
+|---|---|---:|---:|
+| (2304, 768, 49152) TN | 128x384 p8 | 382.0 | 380.0 |
+| (3072, 768, 49152) TN | 256x256 p8 | 480.0 | 488.2 |
+| (3072, 768, 49152) TN | 128x384 p6 | 500.0 | 491.6 |
+| (768, 768, 49152) TN | 256x256 p32 | 147.9 | 152.7 |
+| (50304, 768, 49152) TN | 256x256 unsplit | 7082 | 7199.7 |
+| (49152, 768, 768) NT | 256x256 unsplit | 129.0 | 129.0 |
+
+It is 6-18% PESSIMISTIC on the well-filled NT/NN shapes with a long k, which beat
+their own resource bound (some overlap does happen there), and that is recorded
+as a known inaccuracy: it never changes a decision on those shapes because every
+alternative plan is charged the same way, and no split ever wins for them.
+
+The search offers each candidate tile every slab count up to 64, subject to three
+guards that cost silent wrong answers or measured losses before they were found:
+
+* **The last slab must be non-empty** (`(parts - 1) * slab < ktiles`). The
+  reduction reads every plane; a slab with nothing to do would feed it a plane
+  nobody wrote, and the two-tile body would run two k tiles outside its own slab.
+* **A slab of at least 8 k tiles** (`NT_MIN_SLAB`). A workgroup pays two k tiles
+  of prologue and a sixteen-accumulator epilogue that the model does not charge.
+* **At least four k tiles of total work per CU** (`NT_MIN_WORK`). Splitting K
+  cannot conjure work: measured against the routes this one declines to, the
+  256x256 tile loses at 0.5, 1.0 and 1.9 k tiles per CU ((512, 768, 768)
+  28.6 -> 48.2 us, (1024, 768, 768) 43.2 -> 51.1, (512, 3072, 768) 47.7 -> 58.3)
+  and wins from 7.6 up.
+
+That third guard replaced change 27's "a slab of at least 1024 k ELEMENTS", which
+was excluding wins as well as losses. With it, the GPT-2 prefill NN shapes -- one
+shape per process, interleaved -- go:
+
+| shape | before | after |
+|---|---:|---:|
+| (768, 768, 3072) | 97.5 us | **61.1** (declines now; the MAX multistage kernel is 50.0 of it) |
+| (1024, 768, 3072) | 99.8 | **80.6** (declines) |
+| (1536, 768, 3072) | 101.4 | **69.0** (splits 3 -> 8 slabs) |
+| (2048, 768, 3072) | 102.1 | **71.6** |
+| (4096, 768, 3072) | 109.2 | **90.9** |
+| (1024, 2304, 3072) | 105.7 | **81.3** |
+| (4096, 2304, 768) | 109.2 | **87.0** |
+| (4096, 3072, 768) | 151.1 | **131.3** |
+
+and the decode shapes are unchanged (they decline in both, +-0.5%).
+
+**Where the second tile is selected, and why it is NOT shipped.** Nowhere in this
+workload: with the slab count free, 256x256 wins all fifteen cases. It is
+selected -- correctly, and measured -- where 256 quantizes an extent that 384
+divides. At (2304, 1152, 49152) TN, one shape per process, interleaved:
+**620.6 -> 566.9 us**, and the model's pick (128x384 at eleven slabs, 564.9
+measured alone) is the best of seven plans measured on that shape, ahead of
+128x384 p5 (577.5), 256x256 p6 (622.3, which is what a divisor search would take)
+and 256x256 p11 (707.6).
+
+It is shipped with two conditions the sweep established -- **pure layouts only**
+and **split-K only** (`min_parts = 2`) -- and it was very nearly dropped instead,
+on a compile-time regression that turned out to be a warm compiler cache in the
+baseline (see the measurement note below: the base source is 13 minutes cold too,
+and both objects contain the same fourteen kernels). It costs nothing and it
+covers the shapes a different sequence length or hidden size brings; it changes
+nothing about the fifteen this workload issues, which is verified twice over --
+the gate table is identical with and without it, and `rocprofv3` shows 256x256 on
+`attn_c_attn_wgrad` and 128x384 only on (2304, 1152, 49152).
+
+## Where this pass ended, per case
+
+Production TN (the copy-free both-native route), one shape per process, base
+binary then new binary back to back, 25 warmups and 100 synchronized iterations:
+
+| case | base us | new us | rocm us | base | new |
+|---|---:|---:|---:|---:|---:|
+| attn_c_attn_wgrad (2304, 768) | 445.22 | **372.44** | 360.16 | 1.236 | **1.034** |
+| attn_c_proj_wgrad (768, 768) | 154.35 | 154.71 | 152.15 | 1.014 | 1.017 |
+| mlp_c_fc_wgrad (3072, 768) | 489.77 | 492.52 | 460.34 | 1.064 | 1.070 |
+| mlp_c_proj_wgrad (768, 3072) | 488.21 | 490.88 | 452.09 | 1.080 | 1.086 |
+| lm_head_wgrad (50304, 768) | 7196.73 | 7198.64 | 6203.16 | 1.160 | 1.161 |
+
+**Production TN 1.121 -> 1.087**, i.e. 802 us of the step, all of it on the one
+case whose plan changed. The other four keep the plan they had -- the same kernel
+symbol at the same grid, verified with `rocprofv3` on `mlp_c_fc_wgrad`
+(3072x12x8, eight slabs, 461.25 us against 458.93) -- and measure 0.2-0.6%
+slower, which is the AMDGPU codegen lottery this journal has recorded three times
+and is the reason the step, which reproduces to 0.24%, is the number quoted.
+
+The gate table, all fifteen cases, three variants (default, `--pattern-check=1`,
+`--chunk-check=1`), on the shipped source: **15/15 pass all three**, NN
+1.018/1.022/1.009, NT 0.943/0.948/0.942, TN (the harness's mixed instantiation,
+with the copy) 1.369/1.363/1.371. Chunk coverage was also run through the
+production TN route on fourteen shapes including six the workload does not have --
+an odd k tile count (49184, which forces the one-tile body in every slab), an even
+ragged one (49216), m and n that neither 256 nor 384 divides (2312, 776, 1160), and
+the three that select the second macro tile -- all 0 mismatches.
+
+The one shape whose plan the second tile changes, interleaved on the shipped
+binary: (2304, 1152, 49152) TN **621.6 -> 567.6 us**.
+
+## The step
+
+`bench_nanogpt_train.py --device mojo --warmup 5 --iters 20`, base source and HEAD
+measured back to back in one session with each side's eager cache already built
+(the cache is content addressed, so the pair costs one run each):
+
+| source | median | p10 | p90 |
+|---|---:|---:|---:|
+| base (8dd3d04) | 162.37 ms | 162.07 | 162.52 |
+| HEAD | **161.48** | 161.25 | 161.86 |
+
+**162.37 -> 161.48 ms against PyTorch-ROCm's 156.88, i.e. 1.035 -> 1.029.** Two
+further runs of HEAD in the same session gave 161.32 and 161.70, so the spread is
+0.24% and the -0.89 ms is four times it. The GEMM's own gap fell 1.89 -> 1.09 ms,
+which is the same 0.8 ms the interleaved per-case table shows.
+
+## What is left, and why the tile shape cannot reach it
+
+Every remaining GEMM gap except one is the same 5.3%, and the 5.3% has a name:
+**304 = 16 x 19, and 94.7% is 18/19 exactly.** Every macro tile whose extents are
+multiples of 64 gives these shapes a tile count of the form `2^a * 3^b` -- 576,
+1728, 2304, 27, 36, 48 -- and none of those is ever divisible by 19, so the last
+wave of workgroups is always short by the same 1/19 no matter which tile or slab
+count is chosen. It is not a tile-shape problem and no tile-shape search can
+close it.
+
+* **The two mlp weight gradients, 0.86 ms.** 36 output tiles x 8 slabs = 288 of
+  304 CUs, which is 18/19; the model's floor at that fill is 480 us against
+  ROCm's 460 and our 490.
+* **`lm_head_wgrad`, 0.99 ms.** 591 tiles, no split, 97.2% fill, 528 TFLOP/s
+  against ROCm's 612. This one is NOT fill: it is at its resource bound (3902
+  measured cycles per k tile against the model's 3840), so closing it needs the
+  bound itself to move -- fewer LDS read cycles per unit of output area, which
+  diagnostic experiment AD closed at this warp tile.
+* **Stream-K**, still the only route to the 1/19, and now with a number on it.
+  The fixup traffic is `nsplits * BM * BN * 4` bytes written and read once, which
+  for 304 workgroups of a 256x256 tile is 155 MB, i.e. about 38 us at the 4.05
+  TB/s this pass fitted. That pays only where 5.3% of the kernel exceeds 38 us,
+  i.e. above roughly 720 us per launch: of the 75 GEMM launches in a step, three
+  qualify and two of them have the fill to gain -- `lm_head_dgrad` (+288 us
+  modelled) and `lm_head_wgrad` (+164). The other 72 launches are 130-500 us and
+  would each LOSE. That is a ~0.45 ms prize for a new work decomposition, a fixup
+  kernel and three gates, and it is why this pass did not take it.
+
+## Measurement note — a compile-time "regression" that was a warm compiler cache
+
+This nearly cost the second macro tile, and it is recorded because the trap is
+cheap to fall into. `matmul_ops` is the module every eager first use compiles, so
+its build time is a real cost, and `mojo build --emit shared-lib` on the file the
+eager importer compiles said:
+
+| source | real | user |
+|---|---:|---:|
+| base (8dd3d04) | 6m33s | 7m25s |
+| this pass, second tile in both forms | 13m12s | - |
+| this pass, second tile split-only | 13m23s | 24m08s |
+| this pass, second tile removed entirely | 12m49s | 24m09s |
+| this pass, plan search capped at four slab counts | 13m23s | 24m08s |
+| this pass, ragged clamp reverted | 13m06s | 24m23s |
+| **base with ONE COMMENT LINE ADDED** | **13m04s** | 24m27s |
+
+The last row is the control and it settles it: **the base source is 13 minutes
+too.** The 6m33s was a warm compiler cache -- that exact source had been compiled
+minutes earlier in the same session by a `bench_nanogpt_train.py` run, and the
+`user`/`real` ratio gives it away (1.1 cores against 1.9 for every cold build).
+Two corroborating facts that should have been checked first: the shipped `.so` and
+the base `.so` differ by 880 bytes in 16.7 MB, and `strings` finds **the same
+fourteen `nt_mfma` kernels in both** -- the shipped source generates no new device
+code at all for the shapes the workload has.
+
+So this pass costs nothing in compile time, the second tile costs nothing either
+(13m12 against 13m04 is inside the spread of the three cold builds), and it is
+shipped. Three intermediate conclusions in the two sections above were drawn from
+the bad baseline and are wrong: the tile was never expensive, the plan search's
+trip count was never suspect, and the ragged clamp was never implicated.
+
+## Regression checks, all on the shipped source
+
+| check | recorded | now |
+|---|---|---|
+| `bench_attention_bmm` default / pattern / causal | 51.217 / 51.003 / 50.473 ms | **51.233 / 51.023 / 50.472**, 6/6 pass |
+| `tests/test_eager_kernels.py`, serial | 553 passed, 93 skipped, 1 failed | **553 passed, 93 skipped, 1 failed** (`test_bf16_v3_source_dependency_and_kernel_contract`, pre-existing), 903 s |
+| gate table x three variants | 15/15 pass | **15/15 pass** |
+| GPT-2 decode NN/NT, five shapes | - | -0.5% to +1.1%, all declining in both sources |
+| GPT-2 prefill NN, eight shapes | - | **-13% to -37%** (the table under change 39) |
+| GPT-2 prefill NT, three shapes | - | +-1.1% (`_nt_mfma_route` is untouched) |
+| production TN chunk coverage, fourteen shapes | - | 0 mismatches |
+| `matmul_ops` cold compile | 13m04s (base, cold) | **12m49-13m23s** |
+
+The test suite and the step were measured on the source without the second macro
+tile; the tile was restored afterwards on the compile-time correction above, and
+what that restores is code no shape in either run reaches (`strings` on the two
+objects finds the same fourteen kernels, the gate table is identical, and
+`rocprofv3` confirms 256x256 on every wgrad case the step issues). The gate's
+three variants and the fourteen chunk-coverage shapes were re-run on the shipped
+source.
+
+`_nt_mfma_route`, the NT (both-k-major) entry the forward and the transposed-B
+data gradient take, is deliberately NOT changed by this pass: it is at 0.943 and
+it has neither the plan search nor split-K. That is the obvious next move and it
+now has evidence behind it -- the same change on the mixed NN route, which shares
+the underfilled-grid regime, is what produced the 13-37% on the GPT-2 prefill
+shapes above. It was left out here to keep one pass to one mechanism.
