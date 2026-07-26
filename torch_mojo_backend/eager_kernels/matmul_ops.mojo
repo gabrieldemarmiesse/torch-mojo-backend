@@ -1892,6 +1892,13 @@ comptime NT_VEC = 8  # elements per global load and per LDS write
 # steps per k tile.  Half is measured best for the layouts with a native
 # operand; see `FILL_AT` in the kernel.
 comptime NT_MID_FILL = 2
+# The two-tile body (`WBODY`) wants the refill later still, and where depends on
+# the layout: with both operands k-major the refill is pure `ds_write` and three
+# k steps of four is measured best, with both native it carries the pair
+# interleave and two is.  Both are 10-13% ahead of the one-tile body, and both
+# are measured one shape per process -- see the journal.
+comptime NT_BODY2_FILL = 3
+comptime NT_BODY2_FILL_NATIVE = 2
 
 
 @__llvm_metadata(
@@ -1919,6 +1926,7 @@ def _nt_mfma_kernel[
     otype: DType = dtype,
     PAIR: Bool = not A_KMAJOR and not B_KMAJOR,
     FILL_AT: Int = 0,
+    WBODY: Bool = False,
 ](
     c: UnsafePointer[Scalar[otype], MutAnyOrigin],
     a: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -1998,6 +2006,30 @@ def _nt_mfma_kernel[
     comptime SA = BM * (PAD if A_KMAJOR else BK)
     comptime SB = BN * (PAD if B_KMAJOR else BK)
 
+    # `WBODY` runs TWO k tiles per trip, one out of each LDS stage, and refills
+    # each stage immediately after the barrier that proves every wave has read
+    # it.  The stage pointers then never swap, so both stages' `ds_read` and
+    # `ds_write` addresses are compile-time offsets from one base.  It is a
+    # per-layout choice, measured: on (49152, 768, 3072) it is worth 13.2% with
+    # both operands k-major and 10.2% with both native, and it LOSES 2% with one
+    # of each.  It is also only worth having together with `FILL_AT >= 2`: at
+    # `FILL_AT = 0` the same body measures 8.4% SLOWER than the one-tile body on
+    # (49152, 768, 768), because each trip then has two refills with no queued
+    # matrix work in front of either.
+    #
+    # Loading both k tiles in ONE global load per row -- 128 bytes, which is the
+    # whole cache line a 64-byte k-major tile row half-fills -- was built and
+    # measured on top of this and is NOT here: 480 us against 460 for the plain
+    # two-tile body at (49152, 768, 3072).  The line reuse it was meant to
+    # capture is real (`FETCH_SIZE` 482 MB at k = 3072 against 380 at k = 3104,
+    # with an identical L1 miss count), but a second staging vector per operand
+    # costs more than it recovers.
+    comptime assert not (
+        WBODY and MASK_LOAD
+    ), "the two-tile body needs BK to divide the slab exactly"
+    comptime assert (
+        not WBODY or STAGES == 2
+    ), "the two-tile body fills both pipeline stages per trip"
     comptime assert (
         0 <= FILL_AT and FILL_AT <= KSTEPS
     ), "the refill must land on a k step of the tile"
@@ -2465,71 +2497,121 @@ def _nt_mfma_kernel[
         var nb = na + SA
 
         var n_kt = k_per // BK if SPLITK else ceildiv(k, BK)
-        _load(0)
-        _fill(ca, cb)
-        _nt_barrier()
-
-        var kt = 0
-        while kt + 1 < n_kt:
-            # Order matters and is measured, not assumed.  This tile's
-            # fragments leave LDS into registers first, in one burst, and the
-            # next tile's global loads are ISSUED next so their latency runs
-            # under the MFMAs.  Reading the fragments one k step ahead of the
-            # MFMA that needs them instead of in a burst -- which halves their
-            # peak register footprint -- measures 3.4% slower weighted, and
-            # putting the whole MFMA sequence AFTER the refill, which is what
-            # the transposed-B work measured, is what the split below improves
-            # on.
-            #
-            # Unrolling this by two so that both LDS stage bases become
-            # compile-time offsets -- which removes all 28 `v_lshl_add_u32`
-            # address instructions per wave per k tile, since the whole 64 KB
-            # budget fits the 16-bit `ds_read` immediate -- measures 8-20%
-            # SLOWER on every NN shape, with or without the global loads pinned
-            # at the top of the body.  The address VALU is not on the critical
-            # path, and the tight single-body loop is what lets the scheduler
-            # issue a tile's global loads a whole body ahead of the `ds_write`
-            # that consumes them.
-            _read_frags[0, KSTEPS](ca, cb)
-            _load(kt + 1)
-            comptime if STAGES == 1:
-                # One buffer: every wave must be done reading it before it is
-                # refilled.
+        comptime if WBODY:
+            # Two k tiles per trip, one out of each LDS stage.  Each stage's
+            # refill is separated from the read of that same stage by a barrier,
+            # and from the read of the OTHER stage by the next barrier, so the
+            # two barriers per trip each do double duty and the barrier rate is
+            # one per k tile -- exactly the one-tile body's.  What changes is
+            # that a stage is refilled with the tile it will serve NEXT TRIP
+            # rather than the one it serves later this trip, so the two stage
+            # pointers are fixed and every LDS address is a compile-time offset
+            # from one base.  The MFMA sequence still straddles each refill at
+            # `FILL_AT`.
+            _load(0)
+            _fill(ca, cb)
+            _load(1)
+            _fill(na, nb)
+            _nt_barrier()
+            var wkt = 0
+            while wkt + 2 < n_kt:
+                _load(wkt + 2)
+                _read_frags[0, KSTEPS](ca, cb)
+                _do_mma[0, FILL_AT]()
+                # Every wave has now read stage 0, and stage 1's refill from the
+                # previous trip becomes visible here.
                 _nt_barrier()
                 _fill(ca, cb)
-                _do_mma[0, KSTEPS]()
-            else:
-                # `FILL_AT` places the refill of the next stage inside the MFMA
-                # sequence rather than in front of all of it.  At `FILL_AT = 0`
-                # the refill's three `ds_write`s and the `s_waitcnt vmcnt(0)`
-                # that precedes them run before the matrix pipe has any queued
-                # work, and the `s_waitcnt lgkmcnt(0)` the barrier needs is a
-                # tail with nothing to cover it.  Issued halfway through, they
-                # go out after about a thousand cycles of MFMA -- long enough
-                # that the global loads have landed -- and retire under the
-                # remaining half.
-                #
-                # Where the optimum is depends on the body's instruction mix,
-                # so it is a per-route parameter, measured one case per process:
-                # for NN (`_dense_mfma_route`, B native) the weighted ratio is
-                # 1.085 at 0, 1.085 after one k step of four, **1.057** after
-                # two and 1.086 after three; for NT (`_nt_mfma_route`, both
-                # operands k-major, which reads twice as many `ds_read_b64` and
-                # runs no `v_perm`) two measures 1.116 against 1.109 at 0.
+                _do_mma[FILL_AT, KSTEPS]()
+                # The next tile goes into the same registers stage 0's refill
+                # just consumed, and is consumed by stage 1's refill a whole
+                # MFMA group and a barrier later.
+                _load(wkt + 3)
+                _read_frags[0, KSTEPS](na, nb)
                 _do_mma[0, FILL_AT]()
+                # Every wave has now read stage 1, and stage 0's refill above
+                # becomes visible for the next trip.
+                _nt_barrier()
                 _fill(na, nb)
                 _do_mma[FILL_AT, KSTEPS]()
+                wkt += 2
+            # The last trip's refill of stage 1 is the one write in the loop with
+            # no barrier after it, so the tail needs one before it reads that
+            # stage -- a wave reads fragments its neighbours wrote.  Without it
+            # the all-ones and chunk gates still pass (stale LDS holds the same
+            # value) and `--pattern-check=1`, whose operands are nonzero only on
+            # the K edges, fails on every shape.
+            _read_frags[0, KSTEPS](ca, cb)
+            _do_mma[0, KSTEPS]()
             _nt_barrier()
-            comptime if STAGES == 2:
-                var ta = ca
-                ca = na
-                na = ta
-                var tb = cb
-                cb = nb
-                nb = tb
-            kt += 1
-        _read_frags[0, KSTEPS](ca, cb)
-        _do_mma[0, KSTEPS]()
+            _read_frags[0, KSTEPS](na, nb)
+            _do_mma[0, KSTEPS]()
+        else:
+            _load(0)
+            _fill(ca, cb)
+            _nt_barrier()
+
+            var kt = 0
+            while kt + 1 < n_kt:
+                # Order matters and is measured, not assumed.  This tile's
+                # fragments leave LDS into registers first, in one burst, and the
+                # next tile's global loads are ISSUED next so their latency runs
+                # under the MFMAs.  Reading the fragments one k step ahead of the
+                # MFMA that needs them instead of in a burst -- which halves their
+                # peak register footprint -- measures 3.4% slower weighted, and
+                # putting the whole MFMA sequence AFTER the refill, which is what
+                # the transposed-B work measured, is what the split below improves
+                # on.
+                #
+                # Unrolling this by two so that both LDS stage bases become
+                # compile-time offsets -- which removes all 28 `v_lshl_add_u32`
+                # address instructions per wave per k tile, since the whole 64 KB
+                # budget fits the 16-bit `ds_read` immediate -- measures 8-20%
+                # SLOWER on every NN shape, with or without the global loads pinned
+                # at the top of the body.  The address VALU is not on the critical
+                # path, and the tight single-body loop is what lets the scheduler
+                # issue a tile's global loads a whole body ahead of the `ds_write`
+                # that consumes them.
+                _read_frags[0, KSTEPS](ca, cb)
+                _load(kt + 1)
+                comptime if STAGES == 1:
+                    # One buffer: every wave must be done reading it before it is
+                    # refilled.
+                    _nt_barrier()
+                    _fill(ca, cb)
+                    _do_mma[0, KSTEPS]()
+                else:
+                    # `FILL_AT` places the refill of the next stage inside the MFMA
+                    # sequence rather than in front of all of it.  At `FILL_AT = 0`
+                    # the refill's three `ds_write`s and the `s_waitcnt vmcnt(0)`
+                    # that precedes them run before the matrix pipe has any queued
+                    # work, and the `s_waitcnt lgkmcnt(0)` the barrier needs is a
+                    # tail with nothing to cover it.  Issued halfway through, they
+                    # go out after about a thousand cycles of MFMA -- long enough
+                    # that the global loads have landed -- and retire under the
+                    # remaining half.
+                    #
+                    # Where the optimum is depends on the body's instruction mix,
+                    # so it is a per-route parameter, measured one case per process:
+                    # for NN (`_dense_mfma_route`, B native) the weighted ratio is
+                    # 1.085 at 0, 1.085 after one k step of four, **1.057** after
+                    # two and 1.086 after three; for NT (`_nt_mfma_route`, both
+                    # operands k-major, which reads twice as many `ds_read_b64` and
+                    # runs no `v_perm`) two measures 1.116 against 1.109 at 0.
+                    _do_mma[0, FILL_AT]()
+                    _fill(na, nb)
+                    _do_mma[FILL_AT, KSTEPS]()
+                _nt_barrier()
+                comptime if STAGES == 2:
+                    var ta = ca
+                    ca = na
+                    na = ta
+                    var tb = cb
+                    cb = nb
+                    nb = tb
+                kt += 1
+            _read_frags[0, KSTEPS](ca, cb)
+            _do_mma[0, KSTEPS]()
 
         # Every accumulator is read and rounded HERE, unconditionally and in
         # straight-line code, and the fence below stops any of it from being
@@ -2546,10 +2628,21 @@ def _nt_mfma_kernel[
         # as optimization_journal.md "Defect analysis D6", where MAX's
         # multistage kernel dropped one MFMA k step into two of four
         # accumulator elements and a deeper pipeline made it vanish.
+        # Whether the whole accumulator set can be read at once.  With a BF16
+        # output the rounded copy is 32 VGPRs on top of the 64 live
+        # accumulators; with the FP32 workspace of the split-K route it is 64
+        # more, and 64 + 64 plus the addresses does not fit 128 VGPRs -- the
+        # instantiation reported **148 bytes of scratch per thread**.  So a
+        # wide output dtype reads ONE accumulator at a time, 16 registers, each
+        # read fenced on both sides, which keeps the invariant that matters
+        # (no read of an MFMA destination adjacent to a branch) at a sixteenth
+        # of the peak register cost.
+        comptime OUT_ALL = size_of[otype]() <= size_of[dtype]()
         _nt_sched_fence()
-        var out = stack_allocation[MT * NTL * 16, otype]()
-        comptime for i in range(MT * NTL):
-            out.store(i * 16, acc.load[width=16](i * 16).cast[otype]())
+        var out = stack_allocation[(MT * NTL if OUT_ALL else 1) * 16, otype]()
+        comptime if OUT_ALL:
+            comptime for i in range(MT * NTL):
+                out.store(i * 16, acc.load[width=16](i * 16).cast[otype]())
         llvm_intrinsic["llvm.amdgcn.sched.barrier", NoneType](Int32(0))
 
         # Register p of accumulator (i, j) is row
@@ -2568,18 +2661,25 @@ def _nt_mfma_kernel[
         comptime for i in range(MT):
             comptime for j in range(NTL):
                 comptime dc = j * NT_MMA
+                comptime if not OUT_ALL:
+                    _nt_sched_fence()
+                    out.store(
+                        0, acc.load[width=16]((i * NTL + j) * 16).cast[otype]()
+                    )
+                    llvm_intrinsic["llvm.amdgcn.sched.barrier", NoneType](
+                        Int32(0)
+                    )
+                comptime OFF = (i * NTL + j) * 16 if OUT_ALL else 0
                 comptime if not MASK_STORE:
                     comptime for p in range(16):
                         comptime dr = i * NT_MMA + 8 * (p // 4) + (p % 4)
-                        cp[cbase + dr * n + dc] = out[(i * NTL + j) * 16 + p]
+                        cp[cbase + dr * n + dc] = out[OFF + p]
                 else:
                     if dc < cmax:
                         comptime for p in range(16):
                             comptime dr = i * NT_MMA + 8 * (p // 4) + (p % 4)
                             if dr < rmax:
-                                cp[cbase + dr * n + dc] = out[
-                                    (i * NTL + j) * 16 + p
-                                ]
+                                cp[cbase + dr * n + dc] = out[OFF + p]
 
 
 @always_inline
@@ -2598,6 +2698,7 @@ def _nt_mfma_gemm[
     otype: DType = dtype,
     PAIR: Bool = not A_KMAJOR and not B_KMAJOR,
     FILL_AT: Int = 0,
+    WBODY: Bool = False,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -2623,70 +2724,56 @@ def _nt_mfma_gemm[
     comptime THREADS = (BM // WM) * (BN // WN) * 64
     var k_per = k // parts
     var grid = (ceildiv(n, BN), ceildiv(m, BM), parts)
+
+    @always_inline
+    @parameter
+    def _go[MASKED: Bool, BODY2: Bool]() raises:
+        ctx.enqueue_function[
+            _nt_mfma_kernel[
+                dtype,
+                BM,
+                BN,
+                BK,
+                WM,
+                WN,
+                STAGES,
+                SWIZZLE,
+                MASKED,
+                MASKED,
+                A_KMAJOR,
+                B_KMAJOR,
+                SPLITK,
+                otype,
+                PAIR,
+                FILL_AT,
+                BODY2,
+            ]
+        ](
+            _make_ptr[otype](c_addr),
+            _make_ptr[dtype](a_addr).as_immutable(),
+            _make_ptr[dtype](b_addr).as_immutable(),
+            m,
+            n,
+            k,
+            k_per,
+            xcds,
+            grid_dim=grid,
+            block_dim=(THREADS,),
+        )
+
     if m >= BM and n >= BN and k % BK == 0:
-        ctx.enqueue_function[
-            _nt_mfma_kernel[
-                dtype,
-                BM,
-                BN,
-                BK,
-                WM,
-                WN,
-                STAGES,
-                SWIZZLE,
-                False,
-                False,
-                A_KMAJOR,
-                B_KMAJOR,
-                SPLITK,
-                otype,
-                PAIR,
-                FILL_AT,
-            ]
-        ](
-            _make_ptr[otype](c_addr),
-            _make_ptr[dtype](a_addr).as_immutable(),
-            _make_ptr[dtype](b_addr).as_immutable(),
-            m,
-            n,
-            k,
-            k_per,
-            xcds,
-            grid_dim=grid,
-            block_dim=(THREADS,),
-        )
+        # The wide-k body needs an EVEN number of k tiles in every slab, which
+        # is a runtime property of the shape, so both bodies are instantiated
+        # and the launch picks between them.
+        comptime if WBODY:
+            if k_per % (2 * BK) == 0 and k_per // BK >= 2:
+                _go[False, True]()
+            else:
+                _go[False, False]()
+        else:
+            _go[False, False]()
     else:
-        ctx.enqueue_function[
-            _nt_mfma_kernel[
-                dtype,
-                BM,
-                BN,
-                BK,
-                WM,
-                WN,
-                STAGES,
-                SWIZZLE,
-                True,
-                True,
-                A_KMAJOR,
-                B_KMAJOR,
-                SPLITK,
-                otype,
-                PAIR,
-                FILL_AT,
-            ]
-        ](
-            _make_ptr[otype](c_addr),
-            _make_ptr[dtype](a_addr).as_immutable(),
-            _make_ptr[dtype](b_addr).as_immutable(),
-            m,
-            n,
-            k,
-            k_per,
-            xcds,
-            grid_dim=grid,
-            block_dim=(THREADS,),
-        )
+        _go[True, False]()
 
 
 @always_inline
@@ -2741,14 +2828,42 @@ def _nt_mfma_route[
     # workgroups on 304 CUs.  Both the tile count and the CU count are runtime
     # values.
     if ceildiv(m, 256) * ceildiv(n, 256) >= cus:
-        _nt_mfma_gemm[dtype, 256, 256, 32, 64, 64, 2, True](
-            c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx
-        )
+        _nt_mfma_gemm[
+            dtype,
+            256,
+            256,
+            32,
+            64,
+            64,
+            2,
+            True,
+            True,
+            True,
+            False,
+            dtype,
+            False,
+            NT_BODY2_FILL,
+            True,
+        ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
         return True
     if ceildiv(m, 128) * ceildiv(n, 128) >= cus:
-        _nt_mfma_gemm[dtype, 128, 128, 32, 64, 64, 2, True](
-            c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx
-        )
+        _nt_mfma_gemm[
+            dtype,
+            128,
+            128,
+            32,
+            64,
+            64,
+            2,
+            True,
+            True,
+            True,
+            False,
+            dtype,
+            False,
+            NT_BODY2_FILL,
+            True,
+        ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
         return True
     return False
 
@@ -2795,6 +2910,13 @@ def _dense_mfma_route[
     # it splits on the regime -- see the journal.
     comptime PAIR_FILL = not A_KMAJOR or not B_KMAJOR
     comptime PAIR_SPLIT = not A_KMAJOR and not B_KMAJOR
+    # The two-tile body pays when both operands have the SAME layout and loses
+    # when they differ -- measured on (49152, 768, 3072): 530 -> 460 us with both
+    # k-major, 531 -> 477 with both native, and 468 -> 478 (best of four refill
+    # positions) with one of each.  So the mixed-layout NN keeps the one-tile
+    # body and its own refill position.
+    comptime BODY2 = A_KMAJOR == B_KMAJOR
+    comptime FILL = NT_BODY2_FILL_NATIVE if BODY2 else NT_MID_FILL
     # Each operand's 16-byte rows run along its own contiguous axis, so it is
     # that axis's length that has to keep every tile row aligned.
     var alen = k if A_KMAJOR else m
@@ -2824,7 +2946,8 @@ def _dense_mfma_route[
             False,
             dtype,
             PAIR_FILL,
-            NT_MID_FILL,
+            FILL,
+            BODY2,
         ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
         return True
     # Underfilled output grid, deep contraction: slabs of K are the only axis
@@ -2873,7 +2996,8 @@ def _dense_mfma_route[
         True,
         DType.float32,
         PAIR_SPLIT,
-        NT_MID_FILL,
+        FILL,
+        BODY2,
     ](
         Int(ws.unsafe_ptr()),
         a_addr,
