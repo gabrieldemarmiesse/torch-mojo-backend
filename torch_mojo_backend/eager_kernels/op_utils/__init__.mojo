@@ -130,6 +130,58 @@ def _gs_blocks(total: Int) -> Int:
     return max(1, min((total + GS_THREADS - 1) // GS_THREADS, 4096))
 
 
+# A bandwidth-bound kernel has two regimes and they want different grids, which
+# `_gs_blocks`'s flat 4096-block cap gets wrong at both ends. Measured on the
+# dtype cast (`_cast_vec_kernel`, one 16-byte slot per thread), TB/s of
+# read+write traffic, median of 40 x 20 launches on gfx942:
+#
+#   traffic    grid = ceildiv(slots, 256)   4096 blocks   2 blocks per CU
+#     14 MiB           2.84                    2.84            2.94
+#     54 MiB           3.30                    3.30            3.60
+#    216 MiB           4.00                    3.85            4.55
+#    288 MiB           4.20                    4.19            4.34
+#    384 MiB           3.97                    3.81            3.81
+#    576 MiB           4.03                    3.74            3.76
+#   14.8 GiB           4.06                    3.71            3.71
+#
+# The crossover sits just above the 256 MiB of Infinity Cache this part has,
+# which is the reading: while the operands are cache-resident a few long-lived
+# workgroups per CU beat many short ones, and once the copy streams from HBM
+# the grid that covers the slots exactly wins. Both arms are the same kernel --
+# the grid-stride loop just iterates more times in the resident arm.
+#
+# `resident` stays the CALLER's decision, and every caller has to measure it,
+# because the block count that wins in that arm depends on how many bytes one
+# thread moves. Two counter-examples already measured: the cast's unaligned
+# fallback, whose threads make four 4-byte accesses instead of one 16-byte one,
+# costs 98 us against 54 us in the resident arm; and the three-operand binary
+# add, at 48 bytes a thread instead of 24, loses 3.6% in it (3.94 against 4.09
+# TB/s at 216 MiB) even though the cast gains 14%.
+comptime _LLC_BYTES = 256 * 1024 * 1024
+
+# Only reached above ~1e9 slots; past it the caller's grid-stride loop iterates.
+comptime _BW_MAX_BLOCKS = 1 << 22
+
+
+@always_inline
+def _bw_blocks(
+    slots: Int, slots_per_thread: Int, resident: Bool, ctx: DeviceContext
+) -> Int:
+    """Grid for a GS_THREADS-wide, bandwidth-bound grid-stride launch.
+
+    `slots` is the number of vector slots to cover and `slots_per_thread` how
+    many of them one thread takes per grid pass (1 when a thread's single
+    access is already 16 bytes wide). `resident` asks for the cache-resident
+    arm; see above for why that is not something this helper can decide.
+    """
+    var per_block = GS_THREADS * slots_per_thread
+    var blocks = (slots + per_block - 1) // per_block
+    comptime SMALL_GRID = max(2 * ctx.default_device_info.sm_count, GS_THREADS)
+    if resident:
+        blocks = min(blocks, SMALL_GRID)
+    return max(1, min(blocks, _BW_MAX_BLOCKS))
+
+
 @always_inline
 def _make_ptr[
     dtype: DType

@@ -3792,3 +3792,199 @@ gfx942 path; `_resolve_bf16_bridge` degrades gracefully, but a loop importing al
 of `_MOJO_MODULES` dies there). And `pytest -n 8` on `test_eager_kernels.py`
 fails ~42 tests with `hipErrorOutOfMemory` because each worker's MAX
 `DeviceContext` reserves a 172 GB pool -- run that file serially, it takes 5 s.
+
+## Change 33 — the dtype cast moves a vector at a time (15.03 -> 13.03 ms/step)
+
+`_cast` in `data_movement_ops.mojo` went through `_parallel_for` ->
+`elementwise[simd_width=1]`, and its closure took a `width` parameter and
+ignored it. So a BF16 store used 2 bytes of a 16-byte access, and every element
+paid its own address arithmetic and its own grid-stride iteration. nanoGPT 124M
+issues 174 of these per step and spends 15.03 ms in them; PyTorch-ROCm's
+equivalent is literally named `vectorized_elementwise_kernel<4, ...>`.
+
+**Hypothesis.** A cast is pure bandwidth. Widen the access and the kernel
+approaches the ~4.5 TB/s a streaming copy gets on this part. **Predicted:**
+15.03 -> ~11.5 ms/step, i.e. ROCm parity.
+
+**What was changed.** A dedicated `_cast_vec_kernel[src, dst, VEC]` enqueued
+through `_enqueue_cached`, replacing the `elementwise` call on GPU (the CPU
+device keeps it). `_parallel_for`'s shared `simd_width=1` is UNTOUCHED, which
+matters: 41 call sites across seven modules pass it width-ignoring closures, and
+raising the shared default would make every one of them write one element in N
+and leave the rest uninitialized -- wrong tensors, no crash.
+
+**VEC is a compile-time regime; which one runs is a runtime decision.** The
+widest whose access is naturally aligned for BOTH base addresses, `16 //
+max(itemsize)` down to 1. It has to be the addresses, not the closure's
+`alignment` parameter: reading `_GridStrideKernel` in
+`std/algorithm/backend/gpu/elementwise.mojo`, that parameter is passed
+`Self.simd_width` -- a vector width in elements, not a promise about the
+pointer. And a tensor really can start anywhere: `x[1:]` on FP32 is 4-byte
+aligned, `a.contig` is still true, and `a.ptr` carries the offset.
+
+**Remainders, confirmed rather than assumed.** Same file: with
+`handle_uneven_simd` the packed region is still called at full width (for a
+rank-1 shape `idx*w + w <= count` always holds) and the `count % w` tail is
+called at width 1. Our kernel does its own: `nvec = size // VEC`, then at most
+VEC-1 elements finished one at a time by the leading threads, which the grid
+always has because it is at least one 256-thread block.
+
+**The bool arm.** `dst == DType.bool` still compares `!= 0` elementwise, but a
+`SIMD[bool, VEC]` store is not legal codegen -- an `i1` vector store crashes the
+Mojo backend ("failed to run the pass manager"), and so does
+`Scalar[f32].cast[DType.bool]()`. Torch's bool is one byte holding 0 or 1, so
+the vector arm selects `uint8` 1/0 and stores through a byte pointer. (Two more
+compiler landmines found on the way, recorded for whoever hits them:
+`ctx.enqueue_memset` on a `DeviceBuffer[DType.bool]` also fails to run the pass
+manager.)
+
+### Grid geometry, which turned out to matter more than the vector width
+
+A bandwidth-bound kernel has two regimes and `_gs_blocks`'s flat 4096-block cap
+gets both wrong. Median of 40 x 20 launches, TB/s of read+write traffic,
+`_cast_vec_kernel` at the widest vector:
+
+| traffic | ceildiv(slots, 256) | 4096 blocks | 2 blocks per CU |
+|---|---:|---:|---:|
+| 14 MiB | 2.84 | 2.84 | 2.94 |
+| 54 MiB | 3.30 | 3.30 | 3.60 |
+| 216 MiB | 4.00 | 3.85 | **4.55** |
+| 288 MiB | 4.20 | 4.19 | **4.34** |
+| 384 MiB | **3.97** | 3.81 | 3.81 |
+| 576 MiB | **4.03** | 3.74 | 3.76 |
+| 14.8 GiB | **4.06** | 3.71 | 3.71 |
+
+The crossover sits just above this part's 256 MiB of Infinity Cache, which is
+the reading: while the operands are cache-resident a few long-lived workgroups
+per CU beat many short ones, and once the copy streams from HBM the grid that
+covers the slots exactly wins. Both arms are the same kernel; the grid-stride
+loop just iterates more in the resident arm. It is now `_bw_blocks` in
+`op_utils`, and `resident` is the caller's flag, not the helper's decision --
+see the rejections.
+
+The vector width alone is worth much less than that table suggests. At the SAME
+grid on `[48, 1024, 768]` FP32->BF16, VEC=1 measured 49.7 us and VEC=4 measured
+66.1 us -- the scalar kernel was FASTER. Reproducible across three repeats with
+p10/p90 inside 1%. I do not have a mechanism for it: unrolling with the loads
+hoisted ahead of the stores (2, 4 and 8 slots per thread) did not reproduce the
+effect, so it is not simply memory-level parallelism per thread. Worth someone
+else's attention, because it means the grid is the lever and the width is
+mostly a way of reaching a grid that works.
+
+### Result
+
+Torch-level, both backends measured by the same script, median of 100 iterations
+of a single `x.to(dtype)` (the protocol that reproduces the numbers this change
+was scoped against), TB/s of read+write traffic:
+
+| cast | ROCm | before | after | after/ROCm |
+|---|---:|---:|---:|---:|
+| logits [49152, 50304] fp32->bf16 | 4.03 | 3.44 | 3.82 | 0.95x |
+| logits [49152, 50304] bf16->fp32 | 4.21 | 3.22 | 4.03 | 0.96x |
+| acts [48, 1024, 768] fp32->bf16 | 3.68 | 2.78 | 3.26 | 0.89x |
+| acts [48, 1024, 768] bf16->fp32 | 3.67 | 2.79 | 3.37 | 0.92x |
+
+With 10 casts enqueued between syncs, which takes the per-call host cost out and
+is closer to what a training step does:
+
+| cast | ROCm | before | after | after/ROCm |
+|---|---:|---:|---:|---:|
+| logits fp32->bf16 | 3.99 | 3.44 | 3.79 | 0.95x |
+| logits bf16->fp32 | 4.23 | 3.23 | 4.05 | 0.96x |
+| acts fp32->bf16 | 4.51 | 3.49 | 4.29 | 0.95x |
+| acts bf16->fp32 | 4.21 | 3.50 | **4.51** | 1.07x |
+
+**The target was ROCm parity on all four rows and only one row reaches it.**
+Two things are in the way and both are measured.
+
+*The kernel is not the remaining gap.* The standalone Mojo probe runs the logits
+FP32->BF16 kernel in 3650 us; rocprof puts ROCm's at 8 x 467.7 = 3741 us (it
+splits a >2^31-element tensor into eight launches). Our kernel is the faster
+one. Through torch the same cast takes 3911 us -- 261 us, 7.2%, more than the
+probe. The acts cast shows the same 6% proportional excess (52.8 vs 49.7 us), so
+it is not a fixed per-call cost; the same kernel simply runs ~7% slower inside
+the process that holds MAX's 172 GB pool than in a standalone binary. That is a
+lead for someone, not something this change can reach.
+
+*Launch cost is the rest.* At batch=1 the acts cast costs 69.5 us for a ~50 us
+kernel; ROCm's costs 61.6 us for a ~48 us kernel. ~8 us per call of ours, 148
+acts casts per step. `_enqueue_cached` already removed `elementwise`'s per-call
+`compile_function`; what is left is the spec boundary and the output allocation.
+
+In production, where the casts are enqueued back to back, the GPU time is what
+lands:
+
+| | before | after |
+|---|---:|---:|
+| `_to_copy` [49152, 50304] | 8683.7 us/step | 7671.9 |
+| `_to_copy` [48, 1024, 768] | 5384.4 | 4653.1 |
+| `_to_copy` five weight shapes | 962.4 | 704.7 |
+| **cast kernels total** | **15030.5** | **13029.7** |
+| `Copies / dtype casts / layout` group | 16.874 ms | 14.863 |
+| step, median of 20 | 170.64 ms | 168.03 (p10 167.83 / p90 168.47) |
+
+The group is 1.30x ROCm's 11.422, down from 1.48x. 1.843 ms of it is still the
+gather from nanoGPT's own `.contiguous()` (D11), so cast-to-cast it is 13.03
+against 11.42, 1.14x, down from 1.32x.
+
+### Rejections, with numbers
+
+* **Non-temporal load/store hints** (`non_temporal=True` on either side or
+  both). 3647.7 / 3650.6 / 3647.1 us against 3650.7 baseline on the logits
+  cast, 50.4 / 50.5 / 50.2 against 50.3 on the acts cast. Inside noise on all
+  six. The write-allocate pollution this was meant to avoid is not costing
+  anything measurable.
+* **Loads hoisted ahead of stores** (2, 4, 8 slots per thread into an
+  `InlineArray`, then stored). Acts 4.05 TB/s at 8 slots against 4.50 for the
+  plain loop at the tuned grid; logits 3.96 against 4.06. Rejected both ways.
+* **Wider than 16 bytes per lane** (VEC=8 on FP32, a 32-byte load). Logits 4.06
+  vs 4.06, acts 4.01 vs 4.00. No difference; not worth the extra
+  instantiations.
+* **Dropping the alignment gate and always taking the widest vector.** This is
+  worth recording carefully because it *measures better*: an unaligned
+  (`storage[1:]`) logits cast goes 3.44 -> 3.79 TB/s and the acts cast 4.17 ->
+  4.24. And it is empirically correct here -- as a mutation, with the gate
+  replaced by `if False`, all 46 cast tests still pass, because gfx942 executes
+  a `dwordx4` at a 4-byte-aligned address. Rejected anyway: `alignment=16` on a
+  4-byte-aligned pointer is a lie to LLVM that a future codegen change or a
+  2-byte-aligned address is free to punish, and the regime does not occur in the
+  target workload. **The test cannot catch this one**, which is the honest
+  statement about the gate: it is a contract, not a behaviour the suite pins.
+* **The same grid rule for the three-operand binary add** (`_bin_flat_vec_kernel`
+  in `logic_ops.mojo`, which is already 16-byte vectorized -- the residual add's
+  1.19x is NOT the scalar path, and neither is GELU forward's 1.21x
+  (`gelu_forward_bf16_exact_vec16`)). Reverted. Its threads move 48 bytes, not
+  24, and the arms land differently: at 216 MiB, which is the shape nanoGPT's
+  residuals actually have, the existing 4096-block cap gives 4.09 TB/s against
+  3.94 for two blocks per CU and 3.81 for the exact grid. The exact grid does
+  win at 432 MiB (3.86 vs 3.65) and 864 MiB (3.90 vs 3.65), so there is
+  something here, but not a rule I can defend on one shape. That is why
+  `_bw_blocks` takes `resident` from the caller.
+
+### How correctness was established
+
+`tests/test_eager_kernels.py::test_fast_cast_is_exact_for_every_dtype_pair`:
+all 7x7 `CAST_DTYPES` pairs, element for element with `torch.equal`, at counts
+1, 3, 17, 1027 and 4099 (three of which are not a multiple of any vector width
+the dispatch can pick) and base offsets 0, 1, 2 and 3 (which force the narrower
+widths and the scalar arm). The pattern steps modulo 5, coprime with every
+power-of-two width, so a vector whose lanes are rotated or whose tail is left
+unwritten cannot pass. Plus
+`test_fast_cast_float_rounding_matches_cpu`: FP32 -> BF16/FP16 of `randn` at two
+counts and three offsets, exact against the CPU including the round trip back.
+
+Mutation test of that gate: replacing the scalar tail with `if t < size and
+False` fails 12 of the 46 cast tests -- every non-multiple count and every float
+case, at every offset. The alignment gate, as above, it does not catch.
+
+Suite: 553 passed, 93 skipped, 1 failed
+(`test_bf16_v3_source_dependency_and_kernel_contract`, the recorded
+pre-existing hardcoded-source-list failure).
+
+### Operational note
+
+Commit `1ab3354` ("Note the fill_/cross-entropy attribution split in the gap
+report") accidentally swept up the in-progress `data_movement_ops.mojo` working
+tree from this change; `ca887dc` carries the rest. The two together are the
+whole change and HEAD is correct, but neither commit's diff is a readable unit
+on its own. Two agents sharing one checkout need to stage by path.
