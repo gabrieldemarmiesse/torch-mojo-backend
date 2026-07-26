@@ -1047,7 +1047,69 @@ def _where_select_go(
 
 # ---------------------------------------------------------------------------
 # Elementwise dtype cast between contiguous buffers of the same shape.
+#
+# A cast is pure bandwidth, so the only thing that matters is how many bytes a
+# lane moves. This used to go through `elementwise` with `simd_width=1`: a
+# BF16 store used 2 bytes of a 16-byte access, and every element paid its own
+# address arithmetic and loop iteration. That sustained 3.3-3.7 TB/s of the
+# ~4.1 TB/s a streaming copy gets on gfx942; one VEC-wide slot per thread with
+# the grid sized to cover the slots exactly reaches 4.0-4.4, and going through
+# `_enqueue_cached` also drops `elementwise`'s per-call `compile_function`.
+#
+# VEC is a compile-time regime and which one runs is a runtime decision: the
+# widest whose access is naturally aligned for BOTH operands, down to 1. That
+# check has to be on the addresses themselves -- a tensor can start at any
+# element offset inside its storage (`x[1:]`), and the `alignment` parameter
+# `elementwise` passes its body is the vector width, not a promise about the
+# base pointer. An element count that is not a multiple of VEC leaves at most
+# VEC-1 elements over, which the first VEC-1 threads finish one at a time.
 # ---------------------------------------------------------------------------
+
+comptime CAST_THREADS = 256
+
+# Grid cap, only reached above ~4e9 elements; past it the loop below iterates.
+comptime _CAST_MAX_BLOCKS = 1 << 22
+
+
+def _cast_vec_kernel[
+    src: DType, dst: DType, VEC: Int
+](
+    out_ptr: UnsafePointer[Scalar[dst], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[src], ImmutAnyOrigin],
+    nvec: Int,
+    size: Int,
+):
+    """`out[i] = cast(in[i])` for `size` elements, VEC of them per thread."""
+    comptime IALIGN = min(16, VEC * size_of[src]())
+    comptime OALIGN = min(16, VEC * size_of[dst]())
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    var j = tid
+    while j < nvec:
+        var v = in_ptr.load[width=VEC, alignment=IALIGN](j * VEC)
+        comptime if dst == DType.bool:
+            # An `i1` vector is not a storable value. Torch's bool is one byte
+            # holding 0 or 1, so build those bytes and store them.
+            out_ptr.bitcast[Scalar[DType.uint8]]().store[
+                width=VEC, alignment=OALIGN
+            ](
+                j * VEC,
+                v.ne(SIMD[src, VEC](0)).select(
+                    SIMD[DType.uint8, VEC](1), SIMD[DType.uint8, VEC](0)
+                ),
+            )
+        else:
+            out_ptr.store[width=VEC, alignment=OALIGN](j * VEC, v.cast[dst]())
+        j += gstride
+    # The tail is at most VEC-1 elements and the grid is never narrower than
+    # one CAST_THREADS-wide block, so the leading threads cover all of it.
+    var t = nvec * VEC + tid
+    if t < size:
+        var a = in_ptr[t]
+        comptime if dst == DType.bool:
+            out_ptr[t] = Scalar[dst](a != Scalar[src](0))
+        else:
+            out_ptr[t] = a.cast[dst]()
 
 
 @always_inline
@@ -1056,19 +1118,84 @@ def _cast[
 ](out_addr: Int, in_addr: Int, size: Int, ctx: DeviceContext) raises:
     var out_ptr = _make_ptr[dst](out_addr)
     var in_ptr = _make_ptr[src](in_addr)
+    if size == 0:
+        return
 
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr, in_ptr)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        var a = in_ptr[i]
-        comptime if dst == DType.bool:
-            out_ptr[i] = Scalar[dst](a != Scalar[src](0))
-        else:
-            out_ptr[i] = a.cast[dst]()
+    if ctx.api() == "cpu":
 
-    _parallel_for[func](size, ctx)
+        @always_inline
+        @parameter
+        @__copy_capture(out_ptr, in_ptr)
+        def func[width: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            var a = in_ptr[i]
+            comptime if dst == DType.bool:
+                out_ptr[i] = Scalar[dst](a != Scalar[src](0))
+            else:
+                out_ptr[i] = a.cast[dst]()
+
+        elementwise[func, simd_width=1](Coord(size), ctx)
+        return
+
+    comptime if not has_accelerator():
+        raise Error("no GPU accelerator available at compile time")
+    else:
+
+        @always_inline
+        @parameter
+        def _try_cast[VEC: Int]() raises -> Bool:
+            comptime IALIGN = min(16, VEC * size_of[src]())
+            comptime OALIGN = min(16, VEC * size_of[dst]())
+            if in_addr % IALIGN != 0 or out_addr % OALIGN != 0:
+                return False
+            var nvec = size // VEC
+            # One 16-byte access per thread on the wider operand. At the widest
+            # VEC that is one slot per thread and the grid covers the slots
+            # exactly; a narrower VEC (taken only when the addresses are not
+            # vector-aligned) gets proportionally more slots per thread instead
+            # of a proportionally larger grid, which measured 49.8 us against
+            # 112 us for one 4-byte element per thread on [48, 1024, 768].
+            comptime SLOTS = max(
+                1, 16 // (VEC * max(size_of[src](), size_of[dst]()))
+            )
+            var slots_per_block = CAST_THREADS * SLOTS
+            _enqueue_cached[_cast_vec_kernel[src, dst, VEC]](
+                ctx,
+                String(t"dm_cast_{src}_{dst}_v{VEC}"),
+                max(
+                    1,
+                    min(
+                        (nvec + slots_per_block - 1) // slots_per_block,
+                        _CAST_MAX_BLOCKS,
+                    ),
+                ),
+                1,
+                1,
+                CAST_THREADS,
+                out_ptr.as_unsafe_any_origin(),
+                in_ptr.as_unsafe_any_origin().as_immutable(),
+                nvec,
+                size,
+            )
+            return True
+
+        # 16 bytes per lane on the wider operand; the narrower one moves half
+        # of that. Wider than 16 measured no better on either nanoGPT shape.
+        comptime WIDEST = 16 // max(size_of[src](), size_of[dst]())
+        comptime if WIDEST >= 16:
+            if _try_cast[16]():
+                return
+        comptime if WIDEST >= 8:
+            if _try_cast[8]():
+                return
+        comptime if WIDEST >= 4:
+            if _try_cast[4]():
+                return
+        comptime if WIDEST >= 2:
+            if _try_cast[2]():
+                return
+        # VEC=1 needs no alignment, so this always launches.
+        _ = _try_cast[1]()
 
 
 # The dtypes fast cast supports on either end. Both the src and dst

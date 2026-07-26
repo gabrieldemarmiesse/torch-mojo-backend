@@ -111,6 +111,16 @@ GROUPS: list[tuple[str, str, set[str], set[str]]] = [
         {"aten::cat", "aten::stack"},
     ),
     (
+        # READ THIS TOGETHER WITH "Cross entropy (backward)". A kernel is
+        # attributed to its DEEPEST enclosing CPU range, so PyTorch-ROCm's
+        # zeroing of the logits-sized gradient -- 8 x aten::fill_ on
+        # [49152, 50304], 2006.7 us/step, nested inside aten::nll_loss_backward
+        # -- lands here rather than in cross entropy, while the Mojo device
+        # fuses the same zeroing into its nll_loss_backward kernel and so shows
+        # nothing here at all. Taken separately the two rows read as a 2.1 ms
+        # win plus a 2.8 ms loss; taken together the truth is
+        # 7253.5 us against 6431.1 (1.13x), and the only real gap is
+        # _log_softmax_backward_data at 5272.8 against 4095.2 (1.29x).
         "Zero / fill grads",
         "any",
         {"aten::fill_", "aten::zero_", "aten::zeros", "aten::zeros_like"},
