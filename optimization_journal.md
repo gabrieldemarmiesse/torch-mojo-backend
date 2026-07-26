@@ -2918,3 +2918,322 @@ vendor library is on any of these call paths.
 reason does not. The binding reasons are compile-time N/K, the silent
 static-stride bake, and an LDS fragment geometry that no CDNA3 bf16 MFMA shape
 satisfies.
+
+# nanoGPT TN (weight-gradient Linear) GEMM, MI300X — 2026-07-26
+
+Fourth pass over `harness/nanogpt_train/bench_linear_gemm.mojo`, one variant:
+**TN**, `C(m,n) = A(m,k) @ B(k,n)` with A read from a `(k, m)` buffer, the
+`wgrad` role, five shapes all with `k = 49152`. Entry state, re-verified one case
+per process: TN 83.735 ms/step against PyTorch-ROCm's 23.300, **ratio 3.594**,
+at 130-158 TFLOP/s. NN 3.075 and NT 1.111 are the regression check.
+
+Protocol: >= 25 warmups and >= 100 individually synchronized iterations, one case
+per process for every number quoted as per-case, timing never from a `--pmc` run,
+every extent a runtime value.
+
+## What the harness measures, and the floor that puts under TN
+
+`bench_linear_gemm`'s timed region for a `transpose_a` case is
+**`_copy_strided` then the GEMM**, unconditionally:
+
+```
+def _full() raises:
+    if target.transpose_a:
+        _materialize()
+    _gemm()
+```
+
+The harness is read-only for this work, so the transposed-A materialization is
+inside every TN number below whatever the dispatch learns to do. It is a full
+read and write of A -- 453 MB for `attn_c_attn_wgrad`, 9.9 GB for
+`lm_head_wgrad` -- and PyTorch-ROCm pays none of it.
+
+A contiguous 2 GB-each-way copy on this part measures **3.68 TB/s** (`/tmp/bw`
+microbenchmark, 50 synchronized iterations). At that rate the five copies cost
+123 / 41 / 164 / 41 / 2687 us, i.e. **7.12 ms/step weighted**. So even with a
+GEMM exactly as fast as PyTorch-ROCm's,
+
+    TN >= (7.12 + 23.30) / 23.30 = 1.305
+
+and the 1.03 bar is **not reachable under this harness**. That is a property of
+what is being timed, not of the kernel: the copy-free route below is measured at
+3-23% faster than copy+GEMM, and the harness cannot call it.
+
+## Change 25 — a native-layout LDS tile, so the core serves NN and TN too
+
+**Hypothesis.** NT won because both operands are k-major and an MFMA operand
+wants four elements adjacent along k. TN's post-copy GEMM is
+`A(m,k) @ B(k,n)`: A is k-major, B is not. B's global rows run along n, so
+either the transpose happens on the way into LDS -- where a lane can only fetch
+two bytes per row and the load instruction count grows eightfold, 128 wave
+instructions per k tile per operand against 16 -- or it happens on the way out of
+LDS, where the tile is read four times over (each of the four wave-rows and
+wave-columns re-reads it) but each access is cheap. Counting says the second is
+the cheap side, because LDS is a 128-byte-per-cycle pipe and 64 lanes x 2 bytes
+is exactly 128 bytes: four `ds_read_u16` move the same 512 bytes in the same
+four cycles as one `ds_read_b64`, and only the instruction count grows.
+
+**Predicted effect.** NN-layout GEMM at NT's rate, 400-450 TFLOP/s, against the
+150-170 the existing route reaches.
+
+**Measured effect.** `_nt_mfma_kernel` gained `A_KMAJOR` / `B_KMAJOR`; the NT
+instantiation is unchanged. The bank collision the layout would otherwise have
+-- the fragment's four elements are `BX` apart and `4 * BX * 2` bytes is a
+multiple of 128, so the `hi` half-wave lands on the banks the `lo` half holds --
+is removed by permuting the row as `x ^ (32 * ((k >> 2) & 1))`, which costs no
+LDS and whose key is exactly the reader's `hi`. `SQ_LDS_BANK_CONFLICT` on the
+shipped kernel: **0**.
+
+`attn_c_attn_dgrad` (49152, 768, 2304), one case per process: 1027.9 -> 361.0 us,
+169 -> 482 TFLOP/s.
+
+**Decision.** Accept, and route `transpose_b == 0` through it when its grid
+covers the device.
+
+## Change 26 — shift the edge tile instead of guarding it
+
+**Hypothesis.** `lm_head_wgrad`'s GEMM is (50304, 768, 49152) and
+`50304 % 256 == 128`, so it takes the guarded instantiation. The NT work
+recorded that as costing "up to 7%".
+
+**Measured effect.** It costs **2.2-3.2x**, not 7%, and the mechanism is
+register spill. At (50304, 768, 3072) the guarded kernel measures 159 TFLOP/s
+and reports 144 bytes of scratch per thread; the same kernel on an exact
+m = 50176 measures 501 with zero scratch. The guards and the sixteen-register
+unconditional rounding block that works around the gfx942 MFMA-read miscompile
+(journal D8) do not coexist in 128 VGPRs.
+
+Two fixes, both measured:
+
+1. The per-element tail of the masked native load -- eight predicated scalar
+   loads -- was 3.2x slower on its own. It is also dead: the route already
+   requires the operand's contiguous extent to be a multiple of the eight-element
+   vector, so a vector at an aligned offset is wholly inside the extent or wholly
+   outside it. One guard, no tail: 159 -> 227 TFLOP/s.
+2. The remaining 2.2x is the guards themselves. An edge tile is now **shifted
+   back** to end at the extent rather than masked. It recomputes rows another
+   workgroup also computes, but with the same k loop and the same MFMA order, so
+   both store bit-identical bytes; the redundant work is one tile out of
+   `ceildiv(m,BM) * ceildiv(n,BN)`. 227 -> 503 TFLOP/s, and the k edge -- which
+   cannot be shifted, the missing k range is real -- keeps the guarded kernel.
+
+This also improved NT, which had been paying it silently: `lm_head_fwd`
+8564 -> 7763 us on the table, `pre_nt_n50257` (4096, 50257, 768) 825.6 -> 764.3.
+
+**Decision.** Accept both.
+
+## Change 27 — global split-K, chosen by cost rather than by a fill threshold
+
+**Hypothesis.** The four per-layer weight gradients contract 49152 into a
+768-3072 square, so their 256x256 output grid is 9-36 workgroups on 304 CUs. No
+tile choice fixes that -- the shortage is output area -- and one workgroup of
+this tile is resident per CU, so slabs of K are the only axis left.
+
+**Predicted effect.** The four shapes reach the same rate the grid-filled ones do.
+
+**Measured effect.** The slab count matters more than expected, and the obvious
+rule (fill one wave, never overflow) is wrong. Exactly one workgroup is resident
+per CU, so `parts` slabs cost `ceil(tiles * parts / cus)` serialized waves of
+`ktiles / parts` k tiles each, and a count that leaves a ragged last wave can
+beat a smaller one that fits in a single partial wave. At (2304, 768, 49152),
+27 tiles, one case per process:
+
+| parts | workgroups | waves | total us |
+|---:|---:|---:|---:|
+| 4 | 108 | 1 | 960.9 |
+| 8 | 216 | 1 | 590.7 |
+| 16 | 432 | 2 | 608.8 |
+| **32** | **864** | **3** | **575.1** |
+| 48 | 1296 | 5 | 671.1 |
+
+32 slabs win although they write four times the workspace of 8, because 864
+workgroups use 94.7% of three waves where 216 use 71% of one. The shipped rule
+is that cost model -- `ceil(tiles*parts/cus) * (ktiles/parts) * 4000` cycles for
+the GEMM, using experiment AD's measured 3995 cycles per k tile, plus the
+workspace charged at roughly 4 TB/s -- searched over the divisors of the k tile
+count up to 64, declining when `parts == 1`. It reproduces the table above.
+
+The reduction is cheaper than the model charges: at 32 slabs it reads 226 MB and
+takes 50.0 us, i.e. 4.6 TB/s, which is above HBM because the workspace still sits
+in the 256 MB Infinity Cache the GEMM just wrote it to.
+
+TN 2.989 -> 1.623 on the table.
+
+**Decision.** Accept.
+
+## Change 28 — a register-only transpose for the materialization (2.1 -> 3.65 TB/s)
+
+**Hypothesis.** With the GEMM fixed, the copy the harness forces is 12.2 ms of
+TN's 37.8 ms and runs at 2.1-2.4 TB/s. Find out what that costs and why.
+
+**Measured effect.** Three microbenchmarks, 2 GB each way, 50 synchronized
+iterations:
+
+| access pattern | TB/s |
+|---|---:|
+| contiguous copy | 3.68 |
+| 256-byte runs strided by a matrix row, both sides | 3.62 |
+| 128-byte runs | 3.57 |
+| 64-byte runs | 2.79 |
+| 32-byte runs | 1.32 |
+
+So the access pattern a tiled transpose needs is capable of full bandwidth and
+the loss was the staging. The existing kernel moves one element per thread per
+access (64 lanes x 2 bytes = one 128-byte request) through a padded LDS tile with
+a barrier between the read and the write phases; widening the accesses to 16
+bytes and enlarging the tile to 256-byte runs got 2.08 -> 3.17 TB/s at
+(2304, 49152), and a `_T2DV_GROUP`-wide band remap of the tile order on top of
+that measured **-0.9%**, which rules out DRAM page locality across workgroups as
+the remaining cause and points at the staging itself: 32 KB of LDS is two
+workgroups per CU and the barrier leaves two tiles of memory-level parallelism in
+flight.
+
+The shipped kernel uses **no LDS and no barriers**. One thread owns a
+`VEC x VEC` element block: it reads `VEC` 16-byte pieces, one from each of `VEC`
+source rows, transposes them in registers, and writes `VEC` 16-byte pieces, one
+to each of `VEC` destination rows. Lanes are arranged 8 across the source rows by
+8 down them, which makes both sides 128-byte runs -- within 2% of 256-byte runs
+by the table above. It needs `rows % VEC`, `cols % VEC`, `src_ld % VEC` and
+16-byte bases, all properties of strides and the allocator rather than of a
+shape; the scalar tiled kernel still serves everything else.
+
+| copy | before | after | TB/s |
+|---|---:|---:|---:|
+| attn_c_attn_wgrad | 218.1 us | 142.1 | 2.08 -> 3.19 |
+| attn_c_proj_wgrad | 63.9 | 45.7 | 2.37 -> 3.31 |
+| mlp_c_fc_wgrad | 298.9 | 195.1 | 2.02 -> 3.10 |
+| lm_head_wgrad | 4502.6 | 2644.2 | 2.20 -> 3.74 |
+
+Unclamping the grid so every wave owns exactly one region (a 4096-block clamp
+gave some waves one and some two, and the makespan is the larger) is a further
+0.6-2.4%.
+
+TN 1.623 -> 1.419. `bench_permute_copy`, which shares this primitive, is within
+0.1% on all eight cases.
+
+**Decision.** Accept.
+
+## Change 29 — a k-pair native LDS tile, and the copy-free transposed-A route
+
+**Hypothesis.** With both operands native -- which is what a true TN kernel
+needs, A from its `(k, m)` buffer and B from its `(k, n)` buffer -- the
+one-element-per-row native tile needs four `ds_read_u16` per fragment for BOTH
+operands, and the packing of four halves into two dwords is VALU the k-major
+path does not pay. Counters on the both-native kernel at
+(50304, 768, 49152): **6.65 VALU per MFMA against 3.71 for one native operand
+and 3.12 for none, and 100 bytes of scratch per thread.** Hold the k PAIR
+`(2p, 2p+1)` of column `x` adjacent at `2x` instead: an MFMA operand is four
+consecutive k of one column, i.e. two adjacent pairs, so the fragment becomes two
+`ds_read_b32` whose two dwords ARE the operand register pair -- no shifting, no
+`v_perm`, no packing at all. Both accesses stay bank-optimal with no padding and
+no permutation (a fragment read is dword `p * BX + x`, so `BX` a multiple of 32
+drops the row out and the two half-waves cover all 32 banks twice, which is the
+two cycles 256 bytes take anyway).
+
+**Predicted effect.** The both-native kernel stops spilling and closes most of
+the gap to the one-native one.
+
+**Measured effect.** Both-native, one shape per process, output checked element
+by element:
+
+| shape | one per row | k pairs |
+|---|---:|---:|
+| (2304, 768, 49152) | 257 TFLOP/s | **360** |
+| (768, 768, 49152) | 255 | **337** |
+| (3072, 768, 49152) | 297 | **456** |
+| (768, 3072, 49152) | 293 | **456** |
+| (50304, 768, 49152) | 343 | **517** |
+
+Scratch 100 -> 0 bytes per thread.
+
+With only ONE native operand the same change is a wash that goes the wrong way
+on the shapes this target cares about: -0.5 to -2.9% on the grid-filling data
+gradients but **+3 to +4.9% on the split-K weight gradients** (403.6 -> 423.3 us
+of GEMM at (2304, 768, 49152), from `rocprofv3`, with no spill either way -- it
+trades one 16-byte global load for two 8-byte ones plus an interleave, to halve
+LDS reads that were not binding). Weighted over the harness that is
+TN 1.419 -> 1.457 and NN 1.098 -> 1.086, a net loss. So `PAIR` is derived as
+"both operands native" and the one-native path keeps the permuted single-element
+layout.
+
+That unlocks `_tn_mfma_route`, which reads A straight out of its `(k, m)` buffer
+with no materialization at all. `_matmul_spec_operands_launch` takes it whenever
+A's two innermost strides are `(1, m)`, B is contiguous and there is no bias.
+Measured against materializing A^T and running the dense route, one shape per
+process:
+
+| shape | copy + GEMM | direct TN | saving |
+|---|---:|---:|---:|
+| (2304, 768, 49152) | 575.8 us | 483.6 | 16.0% |
+| (768, 768, 49152) | 197.7 | 171.7 | 13.1% |
+| (3072, 768, 49152) | 661.4 | 509.1 | 23.0% |
+| (768, 3072, 49152) | 527.1 | 508.8 | 3.5% |
+| (50304, 768, 49152) | 9600.5 | 7369.0 | 23.2% |
+| (1024, 1024, 32768) | 226.5 | 203.5 | 10.2% |
+| (2312, 776, 49152) | 844.3 | 809.1 | 4.2% |
+| (50304, 776, 24576) | 6507.1 | 5439.3 | 16.4% |
+
+`bench_linear_gemm` cannot show any of this: it materializes A^T unconditionally
+before calling the dispatch. It is measured with a standalone harness that calls
+`_tn_mfma_route` directly and checks every output element.
+
+**Decision.** Accept both, with `PAIR` derived from the operand layouts.
+
+## Defect analysis D9 — a split-K slab count derived from a floored tile count
+
+The slab search used `ktiles = k // 32` and required `ktiles % parts == 0`. For a
+k that 32 does not divide, the slabs then cover `parts * (k_per // 32) * 32 < k`
+and the tail is silently dropped. Nothing shipped was wrong -- the only entry
+that reached it is gated on `k % 32 == 0` upstream in
+`_amd_dynamic_mfma_dispatch` -- but `_tn_mfma_route` is called from
+`_matmul_spec_operands_launch` with no such gate. The split-K branch now declines
+when `k % 32 != 0` and the unsplit route's guarded instantiation handles the
+partial tile; verified by the standalone harness reporting a decline at
+(2304, 768, 49168).
+
+## Where TN ended
+
+Per case, one case per process, 25 warmups and 100 synchronized iterations:
+
+| case | rocm us | before | after | ratio | copy_us | GEMM TFLOP/s |
+|---|---:|---:|---:|---:|---:|---:|
+| attn_c_attn_wgrad | 360.16 | 1270.8 | 582.0 | 1.616 | 142.1 | 396 |
+| attn_c_proj_wgrad | 152.15 | 434.3 | 197.8 | 1.300 | 46.2 | 383 |
+| mlp_c_fc_wgrad | 460.34 | 1680.0 | 656.8 | 1.427 | 195.1 | 503 |
+| mlp_c_proj_wgrad | 452.09 | 1459.5 | 525.2 | 1.162 | 45.7 | 483 |
+| lm_head_wgrad | 6203.16 | 25600.4 | 9603.8 | 1.548 | 2644.2 | 546 |
+
+**TN 3.594 -> 1.423 one case per process, 3.599 -> 1.420 on the table**
+(1.413 with `--pattern-check=1`, 1.421 with `--chunk-check=1`); 15 of 15 cases
+pass all three gates. The 1.03 bar is not met and cannot be under this harness:
+the copy alone is 30.5% of PyTorch-ROCm's entire budget at full HBM bandwidth,
+and the remaining GEMM is 25.3 ms against 23.3, i.e. **1.084**.
+
+Regression checks, all after the change, one case per process:
+
+| check | recorded | now |
+|---|---|---|
+| `bench_linear_gemm` NN | 3.075 | **1.099** |
+| `bench_linear_gemm` NT | 1.111 | 1.102 |
+| whole table | 2.552 | 1.205, 15/15 pass all three gates |
+| `bench_attention_bmm` default / pattern / causal | 51.236 / 51.040 / 50.461 ms | 51.217 / 51.022 / 50.462, 6/6 pass |
+| `bench_permute_copy`, eight cases | - | within 0.1% |
+| GPT-2 decode NT and NN, m512, four n | - | +0.0% to +1.7% |
+| GPT-2 prefill NT and NN, m4096, five n | - | -37.5% to +1.4% |
+| NT grid-fill gate shapes, four | - | -4.6% to -0.7% |
+
+What is left, in the order the evidence supports:
+
+* **The copy, 7.86 ms of the 33.1.** It is 3.10-3.74 TB/s against a 3.68 TB/s
+  ceiling, so at most 0.75 ms remains in it, and only by deleting it -- which the
+  shipped `_tn_mfma_route` does everywhere except this harness.
+* **`lm_head_wgrad`'s GEMM, 546 TFLOP/s against PyTorch-ROCm's 612.** Counters
+  say the k tile takes 3161 cycles against 2048 of MFMA, with 1280 cycles of LDS
+  traffic that is irreducible at a 64x64 warp tile (experiment AD) and zero bank
+  conflicts. A wider warp tile needs more than 64 accumulator VGPRs and loses the
+  fourth wave per SIMD.
+* **`attn_c_attn_wgrad`, 396 TFLOP/s.** Its 27 output tiles do not divide the
+  device at any slab count: the best is 864 workgroups over three waves, 94.7%.
+  A stream-K assignment, where a workgroup that draws several slabs of the SAME
+  output tile accumulates them in registers and writes one partial, would cut
+  both the workspace and the epilogue; not attempted.
