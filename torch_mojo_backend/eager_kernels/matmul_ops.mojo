@@ -2044,9 +2044,11 @@ def _nt_mfma_kernel[
             # row blocks.
             var plane = nx * Int(grid_dim.y)
             var total = plane * Int(grid_dim.z)
-            var wgid = Int(block_idx.z) * plane + Int(
-                block_idx.y
-            ) * nx + Int(block_idx.x)
+            var wgid = (
+                Int(block_idx.z) * plane
+                + Int(block_idx.y) * nx
+                + Int(block_idx.x)
+            )
             # Unlike MAX's own `_xcd_wgm_swizzle` this handles a tile count that
             # is not a multiple of the XCD count: XCDs below the remainder take
             # one extra tile, which keeps the map a bijection for every runtime
@@ -2094,12 +2096,16 @@ def _nt_mfma_kernel[
         var bxc = (tid % XPB) * NT_VEC
         var k0 = slab * k_per
         var a_ptr = a + (
-            (m0 + trow) * k + tcol + k0 if A_KMAJOR else (k0 + akr) * m
+            (m0 + trow) * k
+            + tcol
+            + k0 if A_KMAJOR else (k0 + akr) * m
             + m0
             + axc
         )
         var b_ptr = b + (
-            (n0 + trow) * k + tcol + k0 if B_KMAJOR else (k0 + bkr) * n
+            (n0 + trow) * k
+            + tcol
+            + k0 if B_KMAJOR else (k0 + bkr) * n
             + n0
             + bxc
         )
@@ -2217,7 +2223,9 @@ def _nt_mfma_kernel[
         # divides 32), so it is still one `ds_write_b128`.
         @always_inline
         @parameter
-        def _write_native(dst: LDSPtr, row: Int, xcol: Int, w: Int, regs: RegPtr, reg_off: Int):
+        def _write_native(
+            dst: LDSPtr, row: Int, xcol: Int, w: Int, regs: RegPtr, reg_off: Int
+        ):
             dst.store(
                 row * w + (xcol ^ (32 * ((row >> 2) & 1))),
                 regs.load[width=NT_VEC](reg_off),
@@ -2313,9 +2321,7 @@ def _nt_mfma_kernel[
                         )
                     else:
                         var base = (
-                            s * NT_MMA_K * BM
-                            + anb
-                            + NT_MMA * ((aq + i) ^ hi)
+                            s * NT_MMA_K * BM + anb + NT_MMA * ((aq + i) ^ hi)
                         )
                         var v = SIMD[dtype, 4]()
                         comptime for e in range(4):
@@ -2433,9 +2439,7 @@ def _nt_mfma_kernel[
                 comptime if not MASK_STORE:
                     comptime for p in range(16):
                         comptime dr = i * NT_MMA + 8 * (p // 4) + (p % 4)
-                        cp[cbase + dr * n + dc] = out[
-                            (i * NTL + j) * 16 + p
-                        ]
+                        cp[cbase + dr * n + dc] = out[(i * NTL + j) * 16 + p]
                 else:
                     if dc < cmax:
                         comptime for p in range(16):
@@ -2679,10 +2683,9 @@ def _nn_mfma_route[
     for cand in range(2, NT_MAX_PARTS + 1):
         if ktiles % cand != 0 or k // cand < 1024:
             continue
-        var cost = (
-            ceildiv(tiles * cand, cus) * (ktiles // cand) * NT_KTILE_CYC
-            + cand * m * n // (2 * cus)
-        )
+        var cost = ceildiv(tiles * cand, cus) * (
+            ktiles // cand
+        ) * NT_KTILE_CYC + cand * m * n // (2 * cus)
         if cost < best:
             best = cost
             parts = cand

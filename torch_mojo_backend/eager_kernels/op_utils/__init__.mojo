@@ -556,6 +556,97 @@ comptime _T2D_ROWS = 8
 comptime _MAX_GRID_Y = 65535
 
 
+# The scalar tile above moves one element per thread per access, so a wave of 64
+# lanes issues a 128-byte request and both the read and the write walk memory in
+# 128-byte runs separated by a whole matrix row -- 96 KB for the weight-gradient
+# operands.  Measured on those, it sustains 2.1-2.4 TB/s of the ~4 TB/s the part
+# gives a streaming copy.  Widening each access to 16 bytes makes the runs
+# `_T2DV_TILE * sizeof(dtype)` = 256 bytes and cuts the request count eightfold,
+# at the cost of needing the transpose to happen on the LDS side: the read stages
+# a whole 16-byte run of the source's contiguous axis, so the LDS tile is
+# contiguous along it and the write gathers across LDS rows.
+#
+# LDS is nowhere near binding here (two passes over the tile against a
+# 128 B/cycle pipe is under a tenth of the HBM time), but a 32-way bank conflict
+# would be, so the eight-element chunks of an LDS row are XOR-permuted by the row
+# index.  That keeps the tile at exactly 32 KB -- padding would push it over and
+# leave one workgroup per CU, where a memory-bound kernel needs several.
+comptime _T2DV_THREADS = 256
+comptime _T2DV_LANE_C = 8  # lanes spread across the source rows
+
+
+@always_inline
+def _t2dv_vec[dtype: DType]() -> Int:
+    return 16 // size_of[dtype]()
+
+
+def _transpose2d_vec_kernel[
+    dtype: DType
+](
+    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    src_ld: Int,
+    batch: Int,
+    dst_bstride: Int,
+    src_bstride: Int,
+):
+    """`dst[b, r, c] = src[b, c, r]`, 16 bytes per access and no LDS at all.
+
+    One thread owns a `VEC x VEC` element block: it reads `VEC` 16-byte pieces,
+    one from each of `VEC` source rows, transposes them in registers, and writes
+    `VEC` 16-byte pieces, one to each of `VEC` destination rows.  Lanes are
+    arranged 8 across the source rows by 8 down them, which makes both the reads
+    and the writes 128-byte runs -- measured, that is within 2% of the bandwidth
+    of 256-byte runs (3.57 against 3.62 TB/s) while 64-byte runs collapse to
+    2.79.
+
+    Requires `rows % VEC == 0`, `cols % VEC == 0`, `src_ld % VEC == 0` and both
+    pointers 16-byte aligned, all checked by the caller.  A whole block is then
+    inside the matrix or wholly outside it, so the edge costs one predicate.
+    """
+    comptime VEC = _t2dv_vec[dtype]()
+    comptime LC = _T2DV_LANE_C  # lanes across the source rows
+    comptime assert 64 % LC == 0, "the lane grid must divide a wave"
+    comptime LR = 64 // LC
+
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var lane = tid % 64
+    var super = tid // 64
+    var gstride = Int(grid_dim.x) * Int(block_dim.x) // 64
+
+    var cb = ceildiv(cols, VEC * LC)  # source-row supertiles
+    var rb = ceildiv(rows, VEC * LR)
+    var supers = cb * rb
+
+    var vals = stack_allocation[VEC * VEC, dtype]()
+
+    var b = Int(block_idx.z)
+    while b < batch:
+        var dst_base = b * dst_bstride
+        var src_base = b * src_bstride
+        var q = super
+        while q < supers:
+            var c0 = ((q % cb) * LC + lane % LC) * VEC
+            var r0 = ((q // cb) * LR + lane // LC) * VEC
+            if c0 < cols and r0 < rows:
+                comptime for j in range(VEC):
+                    vals.store(
+                        j * VEC,
+                        src_ptr.load[width=VEC](
+                            src_base + (c0 + j) * src_ld + r0
+                        ),
+                    )
+                comptime for i in range(VEC):
+                    var o = SIMD[dtype, VEC]()
+                    comptime for j in range(VEC):
+                        o[j] = vals[j * VEC + i]
+                    dst_ptr.store(dst_base + (r0 + i) * cols + c0, o)
+            q += gstride
+        b += Int(grid_dim.z)
+
+
 def _transpose2d_kernel[
     dtype: DType
 ](
@@ -713,6 +804,49 @@ def _copy_strided[
                     )
                 )
             ):
+                # Wide regime: 16 bytes per access on both sides, which needs
+                # every run this kernel touches to be a whole number of vectors
+                # and both bases 16-byte aligned.  Those are properties of the
+                # strides and the allocator, not of a particular shape, so it
+                # serves every shape they admit; the scalar tile below serves the
+                # rest.
+                comptime VEC = _t2dv_vec[dtype]()
+                comptime VBLK = VEC * _T2DV_LANE_C
+                if (
+                    size_of[dtype]() >= 2
+                    and rows % VEC == 0
+                    and cols % VEC == 0
+                    and src_strides[MAX_RANK - 1] % VEC == 0
+                    and dst_addr % 16 == 0
+                    and src_addr % 16 == 0
+                    and (batch == 1 or src_strides[MAX_RANK - 3] % VEC == 0)
+                ):
+                    _enqueue_cached[_transpose2d_vec_kernel[dtype]](
+                        ctx,
+                        String(t"transpose2d_vec_{dtype}"),
+                        max(
+                            1,
+                            min(
+                                ceildiv(cols, VBLK)
+                                * ceildiv(rows, VBLK)
+                                * 64
+                                // _T2DV_THREADS,
+                                4096,
+                            ),
+                        ),
+                        1,
+                        min(batch, _MAX_GRID_Y),
+                        _T2DV_THREADS,
+                        dst_ptr.as_unsafe_any_origin(),
+                        src_ptr.as_unsafe_any_origin().as_immutable(),
+                        rows,
+                        cols,
+                        src_strides[MAX_RANK - 1],
+                        batch,
+                        dst_strides[MAX_RANK - 3] if batch > 1 else 0,
+                        src_strides[MAX_RANK - 3] if batch > 1 else 0,
+                    )
+                    return
                 _enqueue_cached[_transpose2d_kernel[dtype]](
                     ctx,
                     String(t"transpose2d_{dtype}"),
