@@ -3735,3 +3735,60 @@ Two things worth recording for the next agent:
 * `pytest -n 8` on this file fails 42 tests with `hipErrorOutOfMemory`, because
   each worker's MAX `DeviceContext` reserves a 172 GB pool. Run this file
   serially; it takes 4.5 s.
+
+### D11: our SDPA output layout makes nanoGPT's re-assembly cost 1.84 ms
+
+The copy audit found 48 gather kernels per step, 1843 us, that PyTorch-ROCm does
+not issue. My first attribution was WRONG and worth recording as a lesson: I
+claimed they were our own `_tc()` materializations of q/k/v. They were not --
+those were counted inside the SDPA groups, because they happen under the
+`_FusedFlashAttentionAutograd` user_annotation which the SDPA rows claim.
+Removing them moved SDPA forward 7.753 -> 6.807 ms and SDPA backward 28.956 ->
+28.326, while `Copies / dtype casts / layout` barely moved, 17.036 -> 16.874.
+Attributing a kernel to a *group* is not the same as attributing it to a *cause*.
+
+The real source is `clone [[48, 1024, 12, 64]]` -- nanoGPT's own
+
+    y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+which is model code we do not control (AGENTS.md rule 5). The question is why
+ROCm's is free, and the answer is the output layout:
+
+| | output strides | `is_contiguous()` | that `.contiguous()` |
+|---|---|---|---|
+| ROCm | `(393216, 64, 768, 1)` | False | free no-op |
+| ours | `(393216, 32768, 64, 1)` | True | real copy, 1843 us/step |
+
+PyTorch's flash attention returns a BTHD-PHYSICAL tensor -- shaped `[B,H,T,D]`
+but strided so that `transpose(1, 2)` is contiguous -- precisely so the universal
+re-assembly idiom costs nothing. We return dense BHSD, so it costs a gather per
+layer.
+
+The fix is the mirror of the stride work just landed: that made the kernels READ
+strided operands, this makes the forward WRITE a BTHD-physical `output` and the
+backward write BTHD-physical `dq`/`dk`/`dv`, so the transpose on the way out and
+its backward are both free. It is the right behaviour independent of nanoGPT --
+any model using that idiom benefits, which is most of them.
+
+### Standing after the stride pass
+
+| | ROCm | before | after |
+|---|---:|---:|---:|
+| step, median of 20 | 156.73 ms | 172.10 | 170.64 (1.089x) |
+| p10 / p90 | | 171.73 / 172.41 | 170.27 / 170.75 |
+| FA forward harness | | 0.750x | 0.758x |
+| FA backward harness | | 0.999x | 0.989x |
+
+p10/p90 do not overlap the previous run, so the 1.46 ms is real. The forward's
++1% is attributed to KERNARG SIZE, not indexing: three extra 24-byte structs
+cost ~5 us/layer even when the body never reads them, scaling with wave count
+(measured across seven variants, including removing the fields entirely at 513.5
+against keeping them unread at 517.9). Worth confirming independently before
+treating as settled.
+
+Operational notes for anyone re-measuring here: `bf16_matmul_ops` and
+`tf32_matmul_ops` do not compile at HEAD (an NVIDIA `m16n8k16` MMA shape with no
+gfx942 path; `_resolve_bf16_bridge` degrades gracefully, but a loop importing all
+of `_MOJO_MODULES` dies there). And `pytest -n 8` on `test_eager_kernels.py`
+fails ~42 tests with `hipErrorOutOfMemory` because each worker's MAX
+`DeviceContext` reserves a 172 GB pool -- run that file serially, it takes 5 s.
