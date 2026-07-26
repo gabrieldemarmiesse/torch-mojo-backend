@@ -1913,6 +1913,7 @@ def _nt_mfma_kernel[
     B_KMAJOR: Bool = True,
     SPLITK: Bool = False,
     otype: DType = dtype,
+    PAIR: Bool = not A_KMAJOR and not B_KMAJOR,
 ](
     c: UnsafePointer[Scalar[otype], MutAnyOrigin],
     a: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -1977,7 +1978,6 @@ def _nt_mfma_kernel[
     # +4.9% on the split-K weight gradients (403.6 -> 423.3 us of GEMM at
     # (2304, 768, 49152)), because it trades one 16-byte global load for two
     # 8-byte ones and an interleave to halve LDS reads that were not binding.
-    comptime PAIR = not A_KMAJOR and not B_KMAJOR
     comptime NT_HVEC = NT_VEC // 2 if PAIR else NT_VEC
     comptime NROWS = 2 if PAIR else 1  # k rows one fill vector spans
     comptime XPA = BM // NT_HVEC  # threads covering one native-A fill row
@@ -2473,6 +2473,16 @@ def _nt_mfma_kernel[
             # (301 against 379 TFLOP/s at 49152x2304x768): it leaves only the
             # vmcnt wait and the LDS stores between the two barriers, so the
             # whole workgroup waits there in lockstep.
+            #
+            # Unrolling this by two so that both LDS stage bases become
+            # compile-time offsets -- which removes all 28 `v_lshl_add_u32`
+            # address instructions per wave per k tile, since the whole 64 KB
+            # budget fits the 16-bit `ds_read` immediate -- measures 8-20%
+            # SLOWER on every NN shape, with or without the global loads pinned
+            # at the top of the body.  The address VALU is not on the critical
+            # path, and the tight single-body loop is what lets the scheduler
+            # issue a tile's global loads a whole body ahead of the `ds_write`
+            # that consumes them.
             _read_frags[0, KSTEPS](ca, cb)
             _load(kt + 1)
             comptime if STAGES == 1:
@@ -2558,6 +2568,7 @@ def _nt_mfma_gemm[
     B_KMAJOR: Bool = True,
     SPLITK: Bool = False,
     otype: DType = dtype,
+    PAIR: Bool = not A_KMAJOR and not B_KMAJOR,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -2600,6 +2611,7 @@ def _nt_mfma_gemm[
                 B_KMAJOR,
                 SPLITK,
                 otype,
+                PAIR,
             ]
         ](
             _make_ptr[otype](c_addr),
@@ -2630,6 +2642,7 @@ def _nt_mfma_gemm[
                 B_KMAJOR,
                 SPLITK,
                 otype,
+                PAIR,
             ]
         ](
             _make_ptr[otype](c_addr),
@@ -2740,6 +2753,17 @@ def _dense_mfma_route[
     split along K below, and below THAT the route declines and the caller keeps
     its own.
     """
+    # Whether the native operand's LDS tile holds k PAIRS.  Pairing turns a
+    # fragment into two `ds_read_b32` whose dwords ARE the operand register
+    # pair -- half the LDS read cycles of the one-element-per-row layout, which
+    # needs four `ds_read_u16` (a two-byte read still occupies a whole bank
+    # slot, so 64 lanes take two LDS cycles for 128 bytes) plus two `v_perm_b32`
+    # to pack.  It costs one extra global load instruction per native operand,
+    # the same bytes and the same 64-byte request count.  With BOTH operands
+    # native it is worth 40% and is never in doubt; with ONE it is measured, and
+    # it splits on the regime -- see the journal.
+    comptime PAIR_FILL = not A_KMAJOR or not B_KMAJOR
+    comptime PAIR_SPLIT = not A_KMAJOR and not B_KMAJOR
     # Each operand's 16-byte rows run along its own contiguous axis, so it is
     # that axis's length that has to keep every tile row aligned.
     var alen = k if A_KMAJOR else m
@@ -2755,9 +2779,21 @@ def _dense_mfma_route[
     var xcds = max(1, cus // 38)
     var tiles = ceildiv(m, 256) * ceildiv(n, 256)
     if tiles >= cus:
-        _nt_mfma_gemm[dtype, 256, 256, 32, 64, 64, 2, True, A_KMAJOR, B_KMAJOR](
-            c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx
-        )
+        _nt_mfma_gemm[
+            dtype,
+            256,
+            256,
+            32,
+            64,
+            64,
+            2,
+            True,
+            A_KMAJOR,
+            B_KMAJOR,
+            False,
+            dtype,
+            PAIR_FILL,
+        ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
         return True
     # Underfilled output grid, deep contraction: slabs of K are the only axis
     # left.  Pick the slab count by cost rather than by a fill threshold.  Slabs
@@ -2804,6 +2840,7 @@ def _dense_mfma_route[
         B_KMAJOR,
         True,
         DType.float32,
+        PAIR_SPLIT,
     ](
         Int(ws.unsafe_ptr()),
         a_addr,
