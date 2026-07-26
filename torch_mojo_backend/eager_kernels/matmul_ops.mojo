@@ -2732,17 +2732,11 @@ def _nt_slab_tiles(ktiles: Int, parts: Int) -> Int:
     Even, because both k-loop bodies have to apply to it and the two-tile one
     needs an even count.  Rounding UP is what makes the last slab the short one;
     a `parts` whose rounded-up slab length would leave that last slab empty is
-    rejected by `_nt_slab_valid`, because the reduction reads every plane and an
-    empty slab would feed it a plane nobody wrote.
+    rejected by the plan search -- `(parts - 1) * slab >= ktiles` -- because the
+    reduction reads every plane and an empty slab would feed it a plane nobody
+    wrote, and the two-tile body would read k tiles outside its own slab.
     """
     return ktiles if parts <= 1 else max(2, 2 * ceildiv(ktiles, 2 * parts))
-
-
-@always_inline
-def _nt_slab_valid(ktiles: Int, parts: Int) -> Bool:
-    """True when `parts` slabs of `_nt_slab_tiles` length cover K, all non-empty.
-    """
-    return (parts - 1) * _nt_slab_tiles(ktiles, parts) < ktiles
 
 
 @always_inline
@@ -2800,9 +2794,15 @@ def _nt_plan_cost(
     var traffic = m * n * obytes
     if parts > 1:
         traffic += 2 * parts * m * n * 4
-    return ceildiv(tiles * parts, cus) * _nt_slab_tiles(
-        ktiles, parts
-    ) * _nt_ktile_cyc(bm, bn) + traffic // NT_BYTES_PER_CYC
+    # Scaled by `NT_BYTES_PER_CYC` so the comparison needs no division: this runs
+    # on the host once per GEMM call, and an eager step issues 75 of them.
+    return (
+        ceildiv(tiles * parts, cus)
+        * _nt_slab_tiles(ktiles, parts)
+        * _nt_ktile_cyc(bm, bn)
+        * NT_BYTES_PER_CYC
+        + traffic
+    )
 
 
 @always_inline
@@ -2815,6 +2815,7 @@ def _nt_best_parts(
     ktiles: Int,
     cus: Int,
     splittable: Bool,
+    min_parts: Int,
 ) -> Int:
     """The slab count `_nt_plan_cost` minimizes for this macro tile, or 0 if the
     tile is no candidate for this shape at all.
@@ -2824,14 +2825,16 @@ def _nt_best_parts(
     slower, so the caller is better off declining to the routes tuned for small
     grids.  `parts == 1` is likewise only offered when this tile's own output grid
     covers the device -- an unsplit wave that leaves CUs idle is exactly what
-    those other routes beat by 19-49% (change 24).
+    those other routes beat by 19-49% (change 24) -- and when the caller allows
+    it: `min_parts` is how a tile that is only instantiated in its split form
+    says so.
     """
     if m < bm or n < bn:
         return 0
     var best = 0
     var chosen = 0
     var tiles = ceildiv(m, bm) * ceildiv(n, bn)
-    var lo = 1 if tiles >= cus else 2
+    var lo = max(min_parts, 1 if tiles >= cus else 2)
     var hi = NT_MAX_PARTS if splittable else 1
     # Splitting K is what covers the device when the output grid cannot, but it
     # cannot conjure WORK: below a few k tiles per CU the whole GEMM is prologue
@@ -2843,13 +2846,20 @@ def _nt_best_parts(
     # (1024, 2304, 3072) 105.7 -> 81.3, (4096, 2304, 768) 109.2 -> 86.9).
     if lo > 1 and tiles * ktiles < NT_MIN_WORK * cus:
         return 0
+    # Everything that does not depend on `parts` is hoisted, so a candidate costs
+    # two integer divisions.
+    var unit = _nt_ktile_cyc(bm, bn) * NT_BYTES_PER_CYC
+    var store = m * n * obytes
+    var plane = m * n * 8  # FP32 workspace, written once and read once
     for parts in range(lo, hi + 1):
+        var slab = _nt_slab_tiles(ktiles, parts)
         if parts > 1 and (
-            not _nt_slab_valid(ktiles, parts)
-            or _nt_slab_tiles(ktiles, parts) < NT_MIN_SLAB
+            (parts - 1) * slab >= ktiles or slab < NT_MIN_SLAB
         ):
             continue
-        var cost = _nt_plan_cost(bm, bn, m, n, obytes, ktiles, parts, cus)
+        var cost = ceildiv(tiles * parts, cus) * slab * unit + store
+        if parts > 1:
+            cost += parts * plane
         if chosen == 0 or cost < best:
             best = cost
             chosen = parts
@@ -2873,6 +2883,7 @@ def _nt_mfma_gemm[
     PAIR: Bool = not A_KMAJOR and not B_KMAJOR,
     FILL_AT: Int = 0,
     WBODY: Bool = False,
+    NOMASK: Bool = False,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -2889,7 +2900,10 @@ def _nt_mfma_gemm[
     Both instantiations handle every runtime shape correctly; the guarded one
     spills and measures 2.2-3.2x slower, so the unguarded one shifts an edge tile
     back to end at the extent instead (see the kernel) and the guarded one is
-    reached only by a k that BK does not divide.
+    reached only by a k that BK does not divide.  `NOMASK` says the caller has
+    already established that it cannot be -- `m >= BM`, `n >= BN` and `BK` divides
+    `k` -- so it is not instantiated at all; that is worth having because every
+    instantiation of this kernel costs eager-extension compile time.
 
     Under `SPLITK` the grid gains a z dimension of `parts` k slabs and the output
     is `parts` FP32 planes for the caller's reduction.  A slab is a whole number
@@ -2943,7 +2957,7 @@ def _nt_mfma_gemm[
             block_dim=(THREADS,),
         )
 
-    if m >= BM and n >= BN and k % BK == 0:
+    if NOMASK or (m >= BM and n >= BN and k % BK == 0):
         # The wide-k body needs an EVEN number of k tiles in every slab, which
         # is a runtime property of the shape, so both bodies are instantiated
         # and the launch picks between them.  Both the full slabs and the short
@@ -2956,7 +2970,8 @@ def _nt_mfma_gemm[
         else:
             _go[False, False]()
     else:
-        _go[True, False]()
+        comptime if not NOMASK:
+            _go[True, False]()
 
 
 @always_inline
@@ -3159,62 +3174,60 @@ def _dense_mfma_route[
     # Whether K can be split at all: a slab has to be a whole number of k tiles,
     # and the reduction reads the workspace 16 bytes at a time.
     var splittable = k % 32 == 0 and c_addr % 8 == 0
-    # Plan search.  Two macro tiles are instantiated -- 256x256 and 128x384, the
-    # two shapes measured to reach `_nt_ktile_cyc` -- and for each of them every
-    # slab count up to `NT_MAX_PARTS`.  `_nt_plan_cost` ranks them on grid fill,
-    # wave quantization and traffic; the tile that wins is a property of the
-    # runtime shape, not of this workload.  A tile is only a candidate when it
-    # fits inside the output, because the edge-masked instantiation it would
-    # otherwise need spills and measures 2.2-3.2x slower (see `_nt_mfma_gemm`).
-    # `parts == 1` is only offered when that tile's own grid covers the device: a
-    # single unsplit workgroup wave that leaves CUs idle is what the routes below
-    # this one are for, and measured 19-49% better there.
+    # Plan search: for each candidate macro tile, every slab count up to
+    # `NT_MAX_PARTS`, ranked by `_nt_plan_cost` on grid fill, wave quantization
+    # and traffic.  Which plan wins is a property of the runtime shape, not of
+    # this workload.  A tile is only a candidate when it fits inside the output,
+    # because the edge-masked instantiation it would otherwise need spills and
+    # measures 2.2-3.2x slower (see `_nt_mfma_gemm`).  `parts == 1` is only offered
+    # when the tile's own grid covers the device: a single unsplit workgroup wave
+    # that leaves CUs idle is what the routes below this one are for, and measured
+    # 19-49% better there.
     var sq_parts = _nt_best_parts(
-        256, 256, m, n, size_of[dtype](), ktiles, cus, splittable
+        256, 256, m, n, size_of[dtype](), ktiles, cus, splittable, 1
     )
-    # The second tile is offered only to the PURE layouts.  It reaches
-    # `_nt_ktile_cyc` there -- measured within 0.5% at every slab count on
-    # (2304, 768, 49152) with both operands native -- but in the MIXED layout,
-    # whose fill is one k tile at a time and whose refill sits mid-sequence, it is
-    # 22% off it: at (768, 768, 49152) the model puts it 3% ahead of 256x256 and
-    # it measures 175.2 us against 151.3.  A cost model cannot see that, so the
-    # candidate set is what carries it.
-    var wide_parts = _nt_best_parts(
-        128, 384, m, n, size_of[dtype](), ktiles, cus, splittable
-    ) if BODY2 else 0
-    var b_wide = sq_parts == 0
-    if sq_parts != 0 and wide_parts != 0:
-        b_wide = _nt_plan_cost(
-            128, 384, m, n, size_of[dtype](), ktiles, wide_parts, cus
-        ) < _nt_plan_cost(
-            256, 256, m, n, size_of[dtype](), ktiles, sq_parts, cus
-        )
-    var b_parts = wide_parts if b_wide else sq_parts
+    # A SECOND macro tile, 128x384, was built on top of this search and is not
+    # here, and the reason is compile time rather than speed.  It is one of only
+    # two shapes measured to reach `_nt_ktile_cyc` (diagnostic experiment AF
+    # swept fifteen), the model ranks it correctly, and where it wins it wins
+    # properly: at (2304, 1152, 49152) -- an n that 256 quantizes by 11% and 384
+    # divides -- the model picks it at eleven slabs and it measures 620.6 -> 566.9
+    # us against this route, one shape per process, interleaved.  But with the
+    # slab count free, 256x256 wins all fifteen shapes THIS workload issues, and
+    # two more instantiations of a 768-thread core take `matmul_ops` from 6m33s to
+    # over 16 minutes to compile -- a cost every eager first use pays.  Re-adding
+    # it is one `_nt_best_parts` call plus one launch arm; the journal has the
+    # whole sweep.  Two things it needs, both measured: it belongs to the PURE
+    # layouts only (in the mixed one it is 22% off its bound -- at
+    # (768, 768, 49152) the model puts it 3% ahead of 256x256 and it measures
+    # 175.2 us against 151.3), and its `min_parts` is 2.
+    var b_parts = sq_parts
     if b_parts == 0:
         return False
 
     @always_inline
     @parameter
-    def _launch[BM: Int, BN: Int]() raises:
-        if b_parts == 1:
-            _nt_mfma_gemm[
-                dtype,
-                BM,
-                BN,
-                32,
-                64,
-                64,
-                2,
-                True,
-                A_KMAJOR,
-                B_KMAJOR,
-                False,
-                dtype,
-                PAIR_FILL,
-                FILL,
-                BODY2,
-            ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
-            return
+    def _launch[BM: Int, BN: Int, SPLIT_ONLY: Bool = False]() raises:
+        comptime if not SPLIT_ONLY:
+            if b_parts == 1:
+                _nt_mfma_gemm[
+                    dtype,
+                    BM,
+                    BN,
+                    32,
+                    64,
+                    64,
+                    2,
+                    True,
+                    A_KMAJOR,
+                    B_KMAJOR,
+                    False,
+                    dtype,
+                    PAIR_FILL,
+                    FILL,
+                    BODY2,
+                ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
+                return
         var ws = ctx.enqueue_create_buffer[DType.float32](b_parts * m * n)
         _nt_mfma_gemm[
             dtype,
@@ -3232,6 +3245,7 @@ def _dense_mfma_route[
             PAIR_SPLIT,
             FILL,
             BODY2,
+            True,  # the plan search guarantees the tile fits and BK divides k
         ](
             Int(ws.unsafe_ptr()),
             a_addr,
@@ -3259,10 +3273,7 @@ def _dense_mfma_route[
         )
         _ = ws^
 
-    if b_wide:
-        _launch[128, 384]()
-    else:
-        _launch[256, 256]()
+    _launch[256, 256]()
     return True
 
 
