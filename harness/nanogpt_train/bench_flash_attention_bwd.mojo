@@ -52,6 +52,7 @@ from std.time import perf_counter_ns
 
 from internal_utils import arg_parse
 from flash_attention_bwd_kernels import enqueue_flash_attention_bwd
+from flash_attention_fwd_kernels import RowStrides, dense_strides
 
 comptime FILL_BLOCK = 256
 comptime CHECK_BLOCKS = 512
@@ -533,6 +534,11 @@ def run_case[
     var rows = b * h * sq
     var scale = Float32(1.0) / sqrt(Float32(hd))
     var causal = 1 if target.causal else 0
+    var q_st = dense_strides(h, sq, hd)
+    var g_st = q_st
+    var o_st = q_st
+    var k_st = dense_strides(h, skv, hd)
+    var v_st = k_st
 
     var qf = ctx.enqueue_create_buffer[DType.float32](qn)
     var kf = ctx.enqueue_create_buffer[DType.float32](kn)
@@ -642,6 +648,11 @@ def run_case[
             v.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
             ofwd.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
             lse.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
+            g_st,
+            q_st,
+            k_st,
+            v_st,
+            o_st,
             b,
             h,
             sq,

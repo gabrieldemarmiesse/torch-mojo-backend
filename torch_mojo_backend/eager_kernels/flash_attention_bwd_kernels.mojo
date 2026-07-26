@@ -27,9 +27,17 @@ which is why `softmax_lse` is an argument.
 
 ## Invariants any replacement must keep
 
-* `batch`, `heads`, `seq_q`, `seq_kv` and `head_dim` are RUNTIME values. Tile
-  shapes, pipeline depth and head-dim regimes may be compile-time as long as a
-  runtime dispatch picks between them and every runtime head_dim is handled.
+* `batch`, `heads`, `seq_q`, `seq_kv` and `head_dim` are RUNTIME values, and so
+  is every STRIDE. Tile shapes, pipeline depth and head-dim regimes may be
+  compile-time as long as a runtime dispatch picks between them and every
+  runtime head_dim is handled.
+* The five READ operands -- `grad_output`, `query`, `key`, `value`, `out_fwd` --
+  each carry their own `RowStrides` (batch, head, seq) triple, because the real
+  caller hands over `x.view(B, T, H, D).transpose(1, 2)` views and materializing
+  them cost 1.83 ms/step of pure copy. `head_dim`'s stride is not carried: it
+  must be 1, since that is the axis every vectorized load and every LDS row fill
+  runs along. `dq`, `dk` and `dv` are freshly allocated by the caller and stay
+  dense, as does `softmax_lse`.
 * No allocation, no host transfer, no synchronization: enqueue on the caller's
   `DeviceContext` and return. Multiple kernel launches are fine.
 * Write only to `dq`, `dk`, `dv`. Everything else is read-only. The three output
@@ -118,6 +126,11 @@ accumulator ONCE, unconditionally, in straight-line code, fenced with
 `llvm.amdgcn.sched.barrier` on both sides, before any guarded store runs.
 """
 
+from flash_attention_fwd_kernels import (
+    RowStrides,
+    _is_dense,
+    dense_strides,
+)
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     barrier,
@@ -194,6 +207,11 @@ def _bwd_dq_baseline[
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    g_st: RowStrides,
+    q_st: RowStrides,
+    k_st: RowStrides,
+    v_st: RowStrides,
+    o_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -208,8 +226,13 @@ def _bwd_dq_baseline[
     var heads = Int(grid_dim.y)
 
     var bh = batch * heads + head
-    var q_row = bh * seq_q * head_dim + qi * head_dim
-    var kv_base = bh * seq_kv * head_dim
+    # Each read operand walks its own strides; dQ is a dense allocation.
+    var g_row = batch * g_st.batch + head * g_st.head + qi * g_st.seq
+    var q_row = batch * q_st.batch + head * q_st.head + qi * q_st.seq
+    var o_row = batch * o_st.batch + head * o_st.head + qi * o_st.seq
+    var k_base = batch * k_st.batch + head * k_st.head
+    var v_base = batch * v_st.batch + head * v_st.head
+    var dq_row = (bh * seq_q + qi) * head_dim
 
     var acc = stack_allocation[
         MAX_HEAD_DIM, DType.float32, address_space=AddressSpace.SHARED
@@ -224,7 +247,7 @@ def _bwd_dq_baseline[
     var d = tid
     while d < head_dim:
         q_s[d] = query[q_row + d].cast[DType.float32]()
-        do_s[d] = grad_output[q_row + d].cast[DType.float32]()
+        do_s[d] = grad_output[g_row + d].cast[DType.float32]()
         acc[d] = 0.0
         d += THREADS
     barrier()
@@ -233,7 +256,7 @@ def _bwd_dq_baseline[
     var partial = Float32(0.0)
     var dd = tid
     while dd < head_dim:
-        partial += do_s[dd] * out_fwd[q_row + dd].cast[DType.float32]()
+        partial += do_s[dd] * out_fwd[o_row + dd].cast[DType.float32]()
         dd += THREADS
     var row_d = block.sum[block_size=THREADS](partial)
     var row_lse = lse[bh * seq_q + qi]
@@ -245,13 +268,14 @@ def _bwd_dq_baseline[
     # Every thread walks every key, so the whole block agrees on ds; the
     # head_dim axis is what is split across threads.
     for j in range(limit):
-        var krow = kv_base + j * head_dim
+        var krow = k_base + j * k_st.seq
+        var vrow = v_base + j * v_st.seq
         var sp = Float32(0.0)
         var dp = Float32(0.0)
         var e = tid
         while e < head_dim:
             sp += q_s[e] * key[krow + e].cast[DType.float32]()
-            dp += do_s[e] * value[krow + e].cast[DType.float32]()
+            dp += do_s[e] * value[vrow + e].cast[DType.float32]()
             e += THREADS
         var s_dot = block.sum[block_size=THREADS](sp)
         var dp_dot = block.sum[block_size=THREADS](dp)
@@ -265,7 +289,7 @@ def _bwd_dq_baseline[
 
     var o = tid
     while o < head_dim:
-        dq[q_row + o] = acc[o].cast[dtype]()
+        dq[dq_row + o] = acc[o].cast[dtype]()
         o += THREADS
 
 
@@ -281,6 +305,11 @@ def _bwd_dkv_baseline[
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    g_st: RowStrides,
+    q_st: RowStrides,
+    k_st: RowStrides,
+    v_st: RowStrides,
+    o_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -300,8 +329,13 @@ def _bwd_dkv_baseline[
     var heads = Int(grid_dim.y)
 
     var bh = batch * heads + head
-    var kv_row = bh * seq_kv * head_dim + j * head_dim
-    var q_base = bh * seq_q * head_dim
+    # Each read operand walks its own strides; dK and dV are dense allocations.
+    var k_row = batch * k_st.batch + head * k_st.head + j * k_st.seq
+    var v_row = batch * v_st.batch + head * v_st.head + j * v_st.seq
+    var g_base = batch * g_st.batch + head * g_st.head
+    var q_base = batch * q_st.batch + head * q_st.head
+    var o_base = batch * o_st.batch + head * o_st.head
+    var dkv_row = (bh * seq_kv + j) * head_dim
 
     var acc_k = stack_allocation[
         MAX_HEAD_DIM, DType.float32, address_space=AddressSpace.SHARED
@@ -318,8 +352,8 @@ def _bwd_dkv_baseline[
 
     var d = tid
     while d < head_dim:
-        k_s[d] = key[kv_row + d].cast[DType.float32]()
-        v_s[d] = value[kv_row + d].cast[DType.float32]()
+        k_s[d] = key[k_row + d].cast[DType.float32]()
+        v_s[d] = value[v_row + d].cast[DType.float32]()
         acc_k[d] = 0.0
         acc_v[d] = 0.0
         d += THREADS
@@ -331,16 +365,18 @@ def _bwd_dkv_baseline[
         first_q = j
 
     for qi in range(first_q, seq_q):
-        var q_row = q_base + qi * head_dim
+        var q_row = q_base + qi * q_st.seq
+        var g_row = g_base + qi * g_st.seq
+        var o_row = o_base + qi * o_st.seq
         var sp = Float32(0.0)
         var dp = Float32(0.0)
         var dsum = Float32(0.0)
         var e = tid
         while e < head_dim:
-            var dov = grad_output[q_row + e].cast[DType.float32]()
+            var dov = grad_output[g_row + e].cast[DType.float32]()
             sp += k_s[e] * query[q_row + e].cast[DType.float32]()
             dp += dov * v_s[e]
-            dsum += dov * out_fwd[q_row + e].cast[DType.float32]()
+            dsum += dov * out_fwd[o_row + e].cast[DType.float32]()
             e += THREADS
         var s_dot = block.sum[block_size=THREADS](sp)
         var dp_dot = block.sum[block_size=THREADS](dp)
@@ -349,15 +385,15 @@ def _bwd_dkv_baseline[
         var ds = p * (dp_dot - row_d)
         var e2 = tid
         while e2 < head_dim:
-            acc_v[e2] += p * grad_output[q_row + e2].cast[DType.float32]()
+            acc_v[e2] += p * grad_output[g_row + e2].cast[DType.float32]()
             acc_k[e2] += ds * query[q_row + e2].cast[DType.float32]() * scale
             e2 += THREADS
         barrier()
 
     var o = tid
     while o < head_dim:
-        dk[kv_row + o] = acc_k[o].cast[dtype]()
-        dv[kv_row + o] = acc_v[o].cast[dtype]()
+        dk[dkv_row + o] = acc_k[o].cast[dtype]()
+        dv[dkv_row + o] = acc_v[o].cast[dtype]()
         o += THREADS
 
 
@@ -368,13 +404,14 @@ def _bwd_dkv_baseline[
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(THREADS)),
     `rocdl.waves_per_eu`=SIMDSize(WAVES_PER_EU),
 )
-@__name(t"fa_bwd_dq_mfma_{dtype}_h{HD}_n{BN}_q{QT}_x{EXACT}")
+@__name(t"fa_bwd_dq_mfma_{dtype}_h{HD}_n{BN}_q{QT}_x{EXACT}_d{DENSE}")
 def _bwd_dq_mfma[
     dtype: DType,
     HD: Int,
     BN: Int,
     QT: Int,
     EXACT: Bool,
+    DENSE: Bool,
     WAVES_PER_EU: Int,
     IGLP: Int,
     PEEL: Bool,
@@ -386,6 +423,11 @@ def _bwd_dq_mfma[
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    g_st: RowStrides,
+    q_st: RowStrides,
+    k_st: RowStrides,
+    v_st: RowStrides,
+    o_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -397,6 +439,10 @@ def _bwd_dq_mfma[
     The score tile is transposed (`S^T[kv, q]`), so a lane owns one query, `L`
     and `D` are per-lane scalars, and `dS^T` feeds the `dQ^T = K^T dS^T` GEMM
     directly out of the accumulator registers.
+
+    `DENSE` asserts the five read operands are row-major `[b, h, seq, head_dim]`
+    and restores the compile-time row offsets in the K and V loaders; see the
+    same parameter on the forward kernel for the measurement behind it.
     """
     comptime NW = 4
     comptime BM = NW * 32 * QT
@@ -426,9 +472,39 @@ def _bwd_dq_mfma[
         var hi = lane // 32  # which half-wave, i.e. which K quad
 
         var heads = Int(grid_dim.y)
-        var bh = Int(block_idx.z) * heads + Int(block_idx.y)
-        var q_base = bh * seq_q * head_dim
-        var kv_base = bh * seq_kv * head_dim
+        var bz = Int(block_idx.z)
+        var by = Int(block_idx.y)
+        var bh = bz * heads + by
+        # Read bases follow each operand's own strides; dQ and the log-sum-exp
+        # are dense.
+        var dq_base = bh * seq_q * head_dim
+        var g_base = bz * g_st.batch + by * g_st.head
+        var q_base = bz * q_st.batch + by * q_st.head
+        var o_base = bz * o_st.batch + by * o_st.head
+        var k_base = bz * k_st.batch + by * k_st.head
+        var v_base = bz * v_st.batch + by * v_st.head
+        var gss = g_st.seq
+        var qss = q_st.seq
+        var oss = o_st.seq
+        var kss = k_st.seq
+        var vss = v_st.seq
+        comptime if DENSE:
+            g_base = dq_base
+            q_base = dq_base
+            o_base = dq_base
+            k_base = bh * seq_kv * head_dim
+            v_base = k_base
+            gss = head_dim
+            qss = head_dim
+            oss = head_dim
+            kss = head_dim
+            vss = head_dim
+            comptime if EXACT:
+                gss = HD
+                qss = HD
+                oss = HD
+                kss = HD
+                vss = HD
         var lse_base = bh * seq_q
 
         # Heaviest query block first: under a causal mask the last block does
@@ -463,7 +539,9 @@ def _bwd_dq_mfma[
         comptime for qt in range(QT):
             var qg = q_row0 + qt * 32 + lo
             var live = qg < seq_q
-            var qrow = q_base + qg * head_dim + 4 * hi
+            var qrow = q_base + qg * qss + 4 * hi
+            var grow = g_base + qg * gss + 4 * hi
+            var orow = o_base + qg * oss + 4 * hi
             var dsum = Float32(0.0)
             comptime for s in range(KSTEPS):
                 var qv = SIMD[dtype, 4](0)
@@ -474,8 +552,8 @@ def _bwd_dq_mfma[
                     ok = ok and (8 * s + 4 * hi < head_dim)
                 if ok:
                     qv = query.load[width=4](qrow + 8 * s)
-                    gv = grad_output.load[width=4](qrow + 8 * s)
-                    ov = out_fwd.load[width=4](qrow + 8 * s)
+                    gv = grad_output.load[width=4](grow + 8 * s)
+                    ov = out_fwd.load[width=4](orow + 8 * s)
                 q_frag.store((qt * KSTEPS + s) * 4, qv)
                 do_frag.store((qt * KSTEPS + s) * 4, gv)
                 dsum += (
@@ -503,16 +581,14 @@ def _bwd_dq_mfma[
 
         comptime KROW_STEP = THREADS // (HD // 8)
         comptime TKV_STEP = THREADS // HD
-        var hd = head_dim
-        comptime if EXACT:
-            hd = HD
         var k_row0 = tid // (HD // 8)
         var k_col = (tid % (HD // 8)) * 8
         var t_col = tid % HD
         var t_kvg0 = tid // HD
-        var k_ptr = key + (kv_base + k_row0 * hd + k_col)
-        var v_ptr = value + (kv_base + k_row0 * hd + k_col)
-        var tile_step = BN * hd
+        var k_ptr = key + (k_base + k_row0 * kss + k_col)
+        var v_ptr = value + (v_base + k_row0 * vss + k_col)
+        var k_tile_step = BN * kss
+        var v_tile_step = BN * vss
         var k_lds0 = k_row0 * KPAD + k_col
         var t_lds0 = t_col * TPAD + t_kvg0 * 4
         var last_row = max(seq_kv - 1, 0)
@@ -535,16 +611,12 @@ def _bwd_dq_mfma[
                     var kvals = SIMD[dtype, 8](0)
                     var vvals = SIMD[dtype, 8](0)
                     comptime if EXACT:
-                        kvals = k_ptr.load[width=8](ci * KROW_STEP * HD)
-                        vvals = v_ptr.load[width=8](ci * KROW_STEP * HD)
+                        kvals = k_ptr.load[width=8](ci * KROW_STEP * kss)
+                        vvals = v_ptr.load[width=8](ci * KROW_STEP * vss)
                     else:
                         if k_col < head_dim:
-                            kvals = k_ptr.load[width=8](
-                                ci * KROW_STEP * head_dim
-                            )
-                            vvals = v_ptr.load[width=8](
-                                ci * KROW_STEP * head_dim
-                            )
+                            kvals = k_ptr.load[width=8](ci * KROW_STEP * kss)
+                            vvals = v_ptr.load[width=8](ci * KROW_STEP * vss)
                     kreg.store(ci * 8, kvals)
                     vreg.store(ci * 8, vvals)
             else:
@@ -553,8 +625,8 @@ def _bwd_dq_mfma[
                     var kvals = SIMD[dtype, 8](0)
                     var vvals = SIMD[dtype, 8](0)
                     if EXACT or k_col < head_dim:
-                        kvals = key.load[width=8](kv_base + row * hd + k_col)
-                        vvals = value.load[width=8](kv_base + row * hd + k_col)
+                        kvals = key.load[width=8](k_base + row * kss + k_col)
+                        vvals = value.load[width=8](v_base + row * vss + k_col)
                     kreg.store(ci * 8, kvals)
                     vreg.store(ci * 8, vvals)
             comptime for ci in range(KITERS):
@@ -565,8 +637,8 @@ def _bwd_dq_mfma[
                     k_lds0 + ci * KROW_STEP * KPAD, vreg.load[width=8](ci * 8)
                 )
 
-            k_ptr += tile_step
-            v_ptr += tile_step
+            k_ptr += k_tile_step
+            v_ptr += v_tile_step
             barrier()
 
             # ---- K^T comes out of the row-major K tile, not out of a second
@@ -691,7 +763,7 @@ def _bwd_dq_mfma[
                     store = store and dcol < head_dim
                 if store:
                     dq.store(
-                        q_base + qg * head_dim + dcol,
+                        dq_base + qg * head_dim + dcol,
                         smem.load[width=8](r * OPAD + cc),
                     )
 
@@ -700,13 +772,14 @@ def _bwd_dq_mfma[
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(THREADS)),
     `rocdl.waves_per_eu`=SIMDSize(WAVES_PER_EU),
 )
-@__name(t"fa_bwd_dkv_mfma_{dtype}_h{HD}_m{BM}_k{KT}_x{EXACT}")
+@__name(t"fa_bwd_dkv_mfma_{dtype}_h{HD}_m{BM}_k{KT}_x{EXACT}_d{DENSE}")
 def _bwd_dkv_mfma[
     dtype: DType,
     HD: Int,
     BM: Int,
     KT: Int,
     EXACT: Bool,
+    DENSE: Bool,
     WAVES_PER_EU: Int,
     IGLP: Int,
 ](
@@ -718,6 +791,11 @@ def _bwd_dkv_mfma[
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    g_st: RowStrides,
+    q_st: RowStrides,
+    k_st: RowStrides,
+    v_st: RowStrides,
+    o_st: RowStrides,
     seq_q: Int,
     seq_kv: Int,
     head_dim: Int,
@@ -729,6 +807,10 @@ def _bwd_dkv_mfma[
     The score tile runs the other way round from the dQ kernel (`S[q, kv]`, so a
     lane owns one KEY), because the two output GEMMs contract over q and an MFMA
     operand's `k` axis must be the accumulator's row axis.
+
+    `DENSE` asserts the five read operands are row-major `[b, h, seq, head_dim]`
+    and restores the compile-time row offsets in the Q/dO/O loader; see the same
+    parameter on the forward kernel for the measurement behind it.
     """
     comptime NW = 4
     comptime BN = NW * 32 * KT
@@ -766,9 +848,39 @@ def _bwd_dkv_mfma[
         var hi = lane // 32
 
         var heads = Int(grid_dim.y)
-        var bh = Int(block_idx.z) * heads + Int(block_idx.y)
-        var q_base = bh * seq_q * head_dim
-        var kv_base = bh * seq_kv * head_dim
+        var bz = Int(block_idx.z)
+        var by = Int(block_idx.y)
+        var bh = bz * heads + by
+        # Read bases follow each operand's own strides; dK, dV and the
+        # log-sum-exp are dense.
+        var dkv_base = bh * seq_kv * head_dim
+        var g_base = bz * g_st.batch + by * g_st.head
+        var q_base = bz * q_st.batch + by * q_st.head
+        var o_base = bz * o_st.batch + by * o_st.head
+        var k_base = bz * k_st.batch + by * k_st.head
+        var v_base = bz * v_st.batch + by * v_st.head
+        var gss = g_st.seq
+        var qss = q_st.seq
+        var oss = o_st.seq
+        var kss = k_st.seq
+        var vss = v_st.seq
+        comptime if DENSE:
+            g_base = bh * seq_q * head_dim
+            q_base = g_base
+            o_base = g_base
+            k_base = dkv_base
+            v_base = dkv_base
+            gss = head_dim
+            qss = head_dim
+            oss = head_dim
+            kss = head_dim
+            vss = head_dim
+            comptime if EXACT:
+                gss = HD
+                qss = HD
+                oss = HD
+                kss = HD
+                vss = HD
         var lse_base = bh * seq_q
 
         # Natural x order already puts the heaviest block first: under a causal
@@ -780,10 +892,6 @@ def _bwd_dkv_mfma[
         # bit-identical to before.
         var delta = 0
 
-        var hd = head_dim
-        comptime if EXACT:
-            hd = HD
-
         # ---- K and V fragments, resident. Lane L holds key
         # `kv_block + 32*(wave*KT + kt) + L%32`, head-dim `8s + 4*(L//32)`.
         var k_frag = stack_allocation[KT * KSTEPS * 4, dtype]()
@@ -792,7 +900,8 @@ def _bwd_dkv_mfma[
         comptime for kt in range(KT):
             var kvg = kv_lane + kt * 32
             var live = kvg < seq_kv
-            var krow = kv_base + kvg * hd + 4 * hi
+            var krow = k_base + kvg * kss + 4 * hi
+            var vrow = v_base + kvg * vss + 4 * hi
             comptime for s in range(KSTEPS):
                 var kv4 = SIMD[dtype, 4](0)
                 var vv4 = SIMD[dtype, 4](0)
@@ -801,7 +910,7 @@ def _bwd_dkv_mfma[
                     ok = ok and (8 * s + 4 * hi < head_dim)
                 if ok:
                     kv4 = key.load[width=4](krow + 8 * s)
-                    vv4 = value.load[width=4](krow + 8 * s)
+                    vv4 = value.load[width=4](vrow + 8 * s)
                 k_frag.store((kt * KSTEPS + s) * 4, kv4)
                 v_frag.store((kt * KSTEPS + s) * 4, vv4)
 
@@ -863,10 +972,9 @@ def _bwd_dkv_mfma[
                 comptime if not EXACT:
                     ok = r_col < head_dim
                 if ok:
-                    var off = q_base + grow * hd + r_col
-                    qv = query.load[width=8](off)
-                    gv = grad_output.load[width=8](off)
-                    ov = out_fwd.load[width=8](off)
+                    qv = query.load[width=8](q_base + grow * qss + r_col)
+                    gv = grad_output.load[width=8](g_base + grow * gss + r_col)
+                    ov = out_fwd.load[width=8](o_base + grow * oss + r_col)
                 qreg.store(ci * 8, qv)
                 greg.store(ci * 8, gv)
                 oreg.store(ci * 8, ov)
@@ -1034,9 +1142,9 @@ def _bwd_dkv_mfma[
                     if store:
                         var vals = smem.load[width=8](r * OPAD + cc)
                         comptime if pass_id == 0:
-                            dv.store(kv_base + kvg * head_dim + dcol, vals)
+                            dv.store(dkv_base + kvg * head_dim + dcol, vals)
                         else:
-                            dk.store(kv_base + kvg * head_dim + dcol, vals)
+                            dk.store(dkv_base + kvg * head_dim + dcol, vals)
 
 
 def _enqueue_mfma_pair[
@@ -1061,6 +1169,11 @@ def _enqueue_mfma_pair[
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     softmax_lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    g_st: RowStrides,
+    q_st: RowStrides,
+    k_st: RowStrides,
+    v_st: RowStrides,
+    o_st: RowStrides,
     batch: Int,
     heads: Int,
     seq_q: Int,
@@ -1070,7 +1183,65 @@ def _enqueue_mfma_pair[
     causal: Int,
     ctx: DeviceContext,
 ) raises:
-    ctx.enqueue_function[_bwd_dkv_mfma[dtype, HD, BM, KT, EXACT, WPE_KV, IGLP]](
+    var dense = (
+        _is_dense(g_st, heads, seq_q, head_dim)
+        and _is_dense(q_st, heads, seq_q, head_dim)
+        and _is_dense(o_st, heads, seq_q, head_dim)
+        and _is_dense(k_st, heads, seq_kv, head_dim)
+        and _is_dense(v_st, heads, seq_kv, head_dim)
+    )
+    if dense:
+        ctx.enqueue_function[
+            _bwd_dkv_mfma[dtype, HD, BM, KT, EXACT, True, WPE_KV, IGLP]
+        ](
+            dk,
+            dv,
+            grad_output,
+            query,
+            key,
+            value,
+            out_fwd,
+            softmax_lse,
+            g_st,
+            q_st,
+            k_st,
+            v_st,
+            o_st,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            causal,
+            grid_dim=(ceildiv(seq_kv, 4 * 32 * KT), heads, batch),
+            block_dim=(THREADS,),
+        )
+        ctx.enqueue_function[
+            _bwd_dq_mfma[dtype, HD, BN, QT, EXACT, True, WPE_Q, IGLP, PEEL]
+        ](
+            dq,
+            grad_output,
+            query,
+            key,
+            value,
+            out_fwd,
+            softmax_lse,
+            g_st,
+            q_st,
+            k_st,
+            v_st,
+            o_st,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            causal,
+            grid_dim=(ceildiv(seq_q, 4 * 32 * QT), heads, batch),
+            block_dim=(THREADS,),
+        )
+        return
+    ctx.enqueue_function[
+        _bwd_dkv_mfma[dtype, HD, BM, KT, EXACT, False, WPE_KV, IGLP]
+    ](
         dk,
         dv,
         grad_output,
@@ -1079,6 +1250,11 @@ def _enqueue_mfma_pair[
         value,
         out_fwd,
         softmax_lse,
+        g_st,
+        q_st,
+        k_st,
+        v_st,
+        o_st,
         seq_q,
         seq_kv,
         head_dim,
@@ -1088,7 +1264,7 @@ def _enqueue_mfma_pair[
         block_dim=(THREADS,),
     )
     ctx.enqueue_function[
-        _bwd_dq_mfma[dtype, HD, BN, QT, EXACT, WPE_Q, IGLP, PEEL]
+        _bwd_dq_mfma[dtype, HD, BN, QT, EXACT, False, WPE_Q, IGLP, PEEL]
     ](
         dq,
         grad_output,
@@ -1097,6 +1273,11 @@ def _enqueue_mfma_pair[
         value,
         out_fwd,
         softmax_lse,
+        g_st,
+        q_st,
+        k_st,
+        v_st,
+        o_st,
         seq_q,
         seq_kv,
         head_dim,
@@ -1119,6 +1300,11 @@ def enqueue_flash_attention_bwd[
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     softmax_lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    g_st: RowStrides,
+    q_st: RowStrides,
+    k_st: RowStrides,
+    v_st: RowStrides,
+    o_st: RowStrides,
     batch: Int,
     heads: Int,
     seq_q: Int,
@@ -1130,15 +1316,26 @@ def enqueue_flash_attention_bwd[
 ) raises:
     """THE FROZEN ENTRY POINT.
 
-    Layouts, all dense row-major:
+    Shapes:
       `dq`, `query`, `grad_output`, `out_fwd`  `[batch, heads, seq_q, head_dim]`
       `dk`, `dv`, `key`, `value`              `[batch, heads, seq_kv, head_dim]`
       `softmax_lse`                            `[batch, heads, seq_q]`, FP32
 
+    The five READ operands are addressed through `g_st`, `q_st`, `k_st`, `v_st`
+    and `o_st`, the element strides of their batch, head and seq axes, in that
+    operand order. Their head_dim axis must have stride 1 -- it is the axis every
+    vectorized load runs along -- and a caller holding a layout where it is not
+    must decline rather than pass one here. `dq`, `dk`, `dv` and `softmax_lse`
+    are dense: the caller allocates them.
+
+    `dense_strides(heads, seq, head_dim)` builds the triple for a plain
+    row-major `[batch, heads, seq, head_dim]` tensor.
+
     `softmax_lse[i]` is the natural log of the sum of `exp(S[i, :] - max)` plus
     that max, i.e. the row log-sum-exp, so `P[i, j] = exp(S[i, j] - lse[i])`.
 
-    `dq`, `dk` and `dv` arrive zeroed. Every extent is a runtime value.
+    `dq`, `dk` and `dv` arrive zeroed. Every extent AND every stride is a
+    runtime value.
     """
     if batch <= 0 or heads <= 0 or seq_q <= 0 or seq_kv <= 0 or head_dim <= 0:
         return
@@ -1168,6 +1365,11 @@ def enqueue_flash_attention_bwd[
                     value,
                     out_fwd,
                     softmax_lse,
+                    g_st,
+                    q_st,
+                    k_st,
+                    v_st,
+                    o_st,
                     batch,
                     heads,
                     seq_q,
@@ -1189,6 +1391,11 @@ def enqueue_flash_attention_bwd[
                     value,
                     out_fwd,
                     softmax_lse,
+                    g_st,
+                    q_st,
+                    k_st,
+                    v_st,
+                    o_st,
                     batch,
                     heads,
                     seq_q,
@@ -1210,6 +1417,11 @@ def enqueue_flash_attention_bwd[
                     value,
                     out_fwd,
                     softmax_lse,
+                    g_st,
+                    q_st,
+                    k_st,
+                    v_st,
+                    o_st,
                     batch,
                     heads,
                     seq_q,
@@ -1230,6 +1442,11 @@ def enqueue_flash_attention_bwd[
                 value,
                 out_fwd,
                 softmax_lse,
+                g_st,
+                q_st,
+                k_st,
+                v_st,
+                o_st,
                 batch,
                 heads,
                 seq_q,
@@ -1249,6 +1466,11 @@ def enqueue_flash_attention_bwd[
         value,
         out_fwd,
         softmax_lse,
+        g_st,
+        q_st,
+        k_st,
+        v_st,
+        o_st,
         seq_q,
         seq_kv,
         head_dim,
@@ -1266,6 +1488,11 @@ def enqueue_flash_attention_bwd[
         value,
         out_fwd,
         softmax_lse,
+        g_st,
+        q_st,
+        k_st,
+        v_st,
+        o_st,
         seq_q,
         seq_kv,
         head_dim,
