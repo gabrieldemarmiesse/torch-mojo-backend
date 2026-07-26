@@ -824,14 +824,17 @@ def _copy_strided[
                     _enqueue_cached[_transpose2d_vec_kernel[dtype]](
                         ctx,
                         String(t"transpose2d_vec_{dtype}"),
+                        # One wave per VBLK x VBLK region, unclamped.  A clamp
+                        # makes the grid-stride loop give some waves one region
+                        # and some two, and the makespan is the larger; measured
+                        # it is worth 0.6-2.4% at the weight-gradient shapes, so
+                        # it is small, but there is nothing to trade it against
+                        # -- the kernel holds no LDS and its state is per-region.
                         max(
                             1,
-                            min(
-                                ceildiv(cols, VBLK)
-                                * ceildiv(rows, VBLK)
-                                * 64
-                                // _T2DV_THREADS,
-                                4096,
+                            ceildiv(
+                                ceildiv(cols, VBLK) * ceildiv(rows, VBLK) * 64,
+                                _T2DV_THREADS,
                             ),
                         ),
                         1,
