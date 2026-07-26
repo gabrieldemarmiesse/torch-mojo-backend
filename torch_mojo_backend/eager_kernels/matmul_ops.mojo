@@ -2094,8 +2094,10 @@ def _nt_mfma_kernel[
         var wm0 = (wave // WAVES_N) * WM
         var wn0 = (wave % WAVES_N) * WN
         # Which k slab this workgroup owns.  `k_per` is a whole number of k tiles
-        # and `parts * k_per == k`, both enforced by the dispatch, so the slabs
-        # cover K exactly once and no loader reads past an operand.
+        # and `(parts - 1) * k_per < k <= parts * k_per`, both enforced by the
+        # dispatch, so the slabs cover K exactly once and no loader reads past an
+        # operand.  The LAST slab is short whenever `k_per` does not divide K; see
+        # `n_kt` below.
         var slab = Int(block_idx.z) if SPLITK else 0
 
         # Output-tile coordinates.  With `xcds > 1` the linear workgroup index is
@@ -2502,7 +2504,17 @@ def _nt_mfma_kernel[
         var na = smem + (SA + SB if STAGES == 2 else 0)
         var nb = na + SA
 
-        var n_kt = k_per // BK if SPLITK else ceildiv(k, BK)
+        # k tiles THIS workgroup runs.  Under `SPLITK` the slab length `k_per` is a
+        # whole number of k tiles but need NOT divide the tile count: the last slab
+        # takes whatever is left.  That is what frees the slab count to be chosen
+        # for grid fill instead of for divisibility -- at (2304, 768, 49152) the
+        # 27 output tiles want eleven slabs to cover 304 CUs, and 11 divides
+        # neither 1536 nor anything near it.  The dispatch guarantees the short
+        # slab is non-empty, and even whenever `WBODY` needs it to be.
+        var n_kt = ceildiv(k, BK)
+        comptime if SPLITK:
+            var kt_per = k_per // BK
+            n_kt = min(kt_per, n_kt - slab * kt_per)
         comptime if WBODY:
             # Two k tiles per trip, one out of each LDS stage.  Each stage's
             # refill is separated from the read of that same stage by a barrier,
@@ -2688,6 +2700,162 @@ def _nt_mfma_kernel[
                                 cp[cbase + dr * n + dc] = out[OFF + p]
 
 
+# Bytes per CU cycle the epilogue and the split-K workspace move.  Fitted from
+# two points of ONE shape -- 256x256 at 8 and at 32 slabs on (2304, 768, 49152),
+# which differ in workspace bytes by 4x and in wave count by 3x -- and the two
+# constants that come out are 4.05 TB/s and 1.67 GHz, both physically sensible
+# and both consistent with what change 27 measured for the reduction alone
+# (4.6 TB/s out of the Infinity Cache) and with the 1395-1700 MHz `rocm-smi`
+# reports under load.  See `_nt_ktile_cyc` for what the pair predicts.
+comptime NT_BYTES_PER_CYC = 2425
+# Fewest k tiles a split-K slab may hold.  A workgroup pays for two k tiles of
+# global loads and LDS fills before its loop and for rounding sixteen
+# accumulators after it, none of which `_nt_plan_cost` charges, so a slab of a
+# few tiles is nearly all prologue -- and at that point this tile is the wrong
+# kernel for the shape, not merely the wrong slab count.  Measured against the
+# routes this one declines to, NN, one shape per process: a slab of 4 loses at
+# (512, 3072, 768) 48.4 -> 57.5 us and at (512, 768, 768) 28.6 -> 43.5, while a
+# slab of 12 wins at (2048, 768, 3072) 102.8 -> 72.0 and of 16 at
+# (4096, 768, 3072) 109.5 -> 91.1.  The floor sits between them.  The old rule
+# here -- a slab of at least 1024 k ELEMENTS, i.e. 32 tiles -- excluded those two
+# wins along with the losses.
+comptime NT_MIN_SLAB = 8
+# Fewest k tiles of total work per CU for the split-K arm to be offered at all.
+# See `_nt_best_parts`; the measured crossover is between 1.9 and 7.6.
+comptime NT_MIN_WORK = 4
+
+
+@always_inline
+def _nt_slab_tiles(ktiles: Int, parts: Int) -> Int:
+    """k tiles in every split-K slab but the last, for `parts` slabs of K.
+
+    Even, because both k-loop bodies have to apply to it and the two-tile one
+    needs an even count.  Rounding UP is what makes the last slab the short one;
+    a `parts` whose rounded-up slab length would leave that last slab empty is
+    rejected by `_nt_slab_valid`, because the reduction reads every plane and an
+    empty slab would feed it a plane nobody wrote.
+    """
+    return ktiles if parts <= 1 else max(2, 2 * ceildiv(ktiles, 2 * parts))
+
+
+@always_inline
+def _nt_slab_valid(ktiles: Int, parts: Int) -> Bool:
+    """True when `parts` slabs of `_nt_slab_tiles` length cover K, all non-empty.
+    """
+    return (parts - 1) * _nt_slab_tiles(ktiles, parts) < ktiles
+
+
+@always_inline
+def _nt_ktile_cyc(bm: Int, bn: Int) -> Int:
+    """CU cycles one k tile of a `bm x bn` macro tile costs, at BK=32, warp 64x64.
+
+    Counted from the geometry, exactly as diagnostic experiment AD counted it for
+    256x256 (2048 MFMA + 1024 LDS read + 256 LDS write + 512 VMEM = 3840 against
+    3995 measured):
+
+    * MFMA.  A 64x64 warp tile is four 32x32x8 MFMAs per k step and four k steps,
+      i.e. 512 cycles per wave per k tile, and a CU issues them on four SIMDs --
+      so the tile costs `ceil(waves / 4)` rounds of 512.  The CEILING is not a
+      detail: a 15-wave workgroup (320x192) occupies four rounds for the work of
+      3.75 and measures exactly that, 16% off the model that divides instead.
+    * LDS reads.  Each wave reads its own A and B slab once per k tile, 16
+      `ds_read_b64` at 4 cycles.
+    * LDS writes and VMEM.  The fill moves `(bm + bn) * BK * 2` bytes through a
+      128 byte/cycle LDS port and through 64-byte global requests, which is
+      `1.5 * (bm + bn)` cycles together.
+
+    Measured against this model, one shape per process on (2304, 768, 49152),
+    net of the workspace traffic the caller charges separately: 256x256 and
+    128x384 hit it to within 0.5% at every slab count tried, and 256x192, 384x128,
+    320x192, 192x320, 128x256 and 128x128 fall 7-39% short of it.  Only the two
+    that hit it are instantiated, which is what makes the model a fair comparator
+    rather than a guess -- see the journal for the whole table.
+    """
+    var waves = (bm // 64) * (bn // 64)
+    return ceildiv(waves, 4) * 512 + waves * 64 + 3 * (bm + bn) // 2
+
+
+@always_inline
+def _nt_plan_cost(
+    bm: Int,
+    bn: Int,
+    m: Int,
+    n: Int,
+    obytes: Int,
+    ktiles: Int,
+    parts: Int,
+    cus: Int,
+) -> Int:
+    """CU cycles this (macro tile, slab count) plan costs on this runtime shape.
+
+    One workgroup of these tiles is resident per CU, so `parts` slabs of a grid of
+    `tiles` output tiles serialize in `ceil(tiles * parts / cus)` waves of
+    `_nt_slab_tiles` k tiles each -- which is why a slab count that leaves a
+    ragged last wave can beat a smaller one that fits in a single partial wave,
+    and why the grid FILL rather than the tile size is what the choice turns on.
+    The traffic term is the epilogue's store plus, when K is split, the FP32
+    workspace written once and read once.  Every term is a runtime value.
+    """
+    var tiles = ceildiv(m, bm) * ceildiv(n, bn)
+    var traffic = m * n * obytes
+    if parts > 1:
+        traffic += 2 * parts * m * n * 4
+    return ceildiv(tiles * parts, cus) * _nt_slab_tiles(
+        ktiles, parts
+    ) * _nt_ktile_cyc(bm, bn) + traffic // NT_BYTES_PER_CYC
+
+
+@always_inline
+def _nt_best_parts(
+    bm: Int,
+    bn: Int,
+    m: Int,
+    n: Int,
+    obytes: Int,
+    ktiles: Int,
+    cus: Int,
+    splittable: Bool,
+) -> Int:
+    """The slab count `_nt_plan_cost` minimizes for this macro tile, or 0 if the
+    tile is no candidate for this shape at all.
+
+    A tile is only a candidate when it fits inside the output: below that the
+    kernel needs its edge-masked instantiation, which spills and measures 2.2-3.2x
+    slower, so the caller is better off declining to the routes tuned for small
+    grids.  `parts == 1` is likewise only offered when this tile's own output grid
+    covers the device -- an unsplit wave that leaves CUs idle is exactly what
+    those other routes beat by 19-49% (change 24).
+    """
+    if m < bm or n < bn:
+        return 0
+    var best = 0
+    var chosen = 0
+    var tiles = ceildiv(m, bm) * ceildiv(n, bn)
+    var lo = 1 if tiles >= cus else 2
+    var hi = NT_MAX_PARTS if splittable else 1
+    # Splitting K is what covers the device when the output grid cannot, but it
+    # cannot conjure WORK: below a few k tiles per CU the whole GEMM is prologue
+    # and epilogue at this tile size, and the routes tuned for few output rows
+    # win instead.  Measured, NN, one shape per process, against those routes:
+    # this tile loses at 0.5, 1.0 and 1.9 k tiles per CU ((512, 768, 768)
+    # 28.6 -> 48.2 us, (1024, 768, 768) 43.2 -> 51.1, (512, 3072, 768)
+    # 47.7 -> 58.3) and wins from 7.6 up ((2048, 768, 3072) 102.1 -> 72.1,
+    # (1024, 2304, 3072) 105.7 -> 81.3, (4096, 2304, 768) 109.2 -> 86.9).
+    if lo > 1 and tiles * ktiles < NT_MIN_WORK * cus:
+        return 0
+    for parts in range(lo, hi + 1):
+        if parts > 1 and (
+            not _nt_slab_valid(ktiles, parts)
+            or _nt_slab_tiles(ktiles, parts) < NT_MIN_SLAB
+        ):
+            continue
+        var cost = _nt_plan_cost(bm, bn, m, n, obytes, ktiles, parts, cus)
+        if chosen == 0 or cost < best:
+            best = cost
+            chosen = parts
+    return chosen
+
+
 @always_inline
 def _nt_mfma_gemm[
     dtype: DType,
@@ -2724,11 +2892,19 @@ def _nt_mfma_gemm[
     reached only by a k that BK does not divide.
 
     Under `SPLITK` the grid gains a z dimension of `parts` k slabs and the output
-    is `parts` FP32 planes for the caller's reduction; `parts` must divide the k
-    tile count exactly.
+    is `parts` FP32 planes for the caller's reduction.  A slab is a whole number
+    of k tiles -- `_nt_slab_tiles` derives it -- and the last slab is short when
+    that count does not divide K; the caller must have used the same helper, so
+    that the plane count it reduces is the plane count the grid writes.
     """
     comptime THREADS = (BM // WM) * (BN // WN) * 64
-    var k_per = k // parts
+    var ktiles = ceildiv(k, BK)
+    var kt_per = _nt_slab_tiles(ktiles, parts) if SPLITK else ktiles
+    var k_per = kt_per * BK
+    # k tiles the LAST slab runs.  The two-tile body needs an even count in every
+    # slab, so it needs this one even too, and `_nt_slab_tiles` keeps `kt_per`
+    # even -- which makes the remainder even exactly when the total is.
+    var kt_last = ktiles - (parts - 1) * kt_per
     var grid = (ceildiv(n, BN), ceildiv(m, BM), parts)
 
     @always_inline
@@ -2770,9 +2946,10 @@ def _nt_mfma_gemm[
     if m >= BM and n >= BN and k % BK == 0:
         # The wide-k body needs an EVEN number of k tiles in every slab, which
         # is a runtime property of the shape, so both bodies are instantiated
-        # and the launch picks between them.
+        # and the launch picks between them.  Both the full slabs and the short
+        # last one have to qualify.
         comptime if WBODY:
-            if k_per % (2 * BK) == 0 and k_per // BK >= 2:
+            if kt_per % 2 == 0 and kt_per >= 2 and kt_last % 2 == 0:
                 _go[False, True]()
             else:
                 _go[False, False]()
@@ -2900,10 +3077,10 @@ def _dense_mfma_route[
     native, the weight gradient reading A straight out of its `(k, m)` buffer
     with no materialization at all).
 
-    One workgroup of this tile is resident per CU, so an output grid that does
-    not cover the device leaves CUs idle for the whole k loop; that regime is
-    split along K below, and below THAT the route declines and the caller keeps
-    its own.
+    One workgroup of a tile this size is resident per CU, so an output grid that
+    does not cover the device leaves CUs idle for the whole k loop.  Two macro
+    tiles and every slab count are searched together by `_nt_plan_cost`, and when
+    no plan is left the route declines and the caller keeps its own.
     """
     # Whether the native operand's LDS tile holds k PAIRS.  Pairing turns a
     # fragment into two `ds_read_b32` whose dwords ARE the operand register
@@ -2978,12 +3155,71 @@ def _dense_mfma_route[
         return False
     var cus = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
     var xcds = max(1, cus // 38)
-    var tiles = ceildiv(m, 256) * ceildiv(n, 256)
-    if tiles >= cus:
+    var ktiles = ceildiv(k, 32)
+    # Whether K can be split at all: a slab has to be a whole number of k tiles,
+    # and the reduction reads the workspace 16 bytes at a time.
+    var splittable = k % 32 == 0 and c_addr % 8 == 0
+    # Plan search.  Two macro tiles are instantiated -- 256x256 and 128x384, the
+    # two shapes measured to reach `_nt_ktile_cyc` -- and for each of them every
+    # slab count up to `NT_MAX_PARTS`.  `_nt_plan_cost` ranks them on grid fill,
+    # wave quantization and traffic; the tile that wins is a property of the
+    # runtime shape, not of this workload.  A tile is only a candidate when it
+    # fits inside the output, because the edge-masked instantiation it would
+    # otherwise need spills and measures 2.2-3.2x slower (see `_nt_mfma_gemm`).
+    # `parts == 1` is only offered when that tile's own grid covers the device: a
+    # single unsplit workgroup wave that leaves CUs idle is what the routes below
+    # this one are for, and measured 19-49% better there.
+    var sq_parts = _nt_best_parts(
+        256, 256, m, n, size_of[dtype](), ktiles, cus, splittable
+    )
+    # The second tile is offered only to the PURE layouts.  It reaches
+    # `_nt_ktile_cyc` there -- measured within 0.5% at every slab count on
+    # (2304, 768, 49152) with both operands native -- but in the MIXED layout,
+    # whose fill is one k tile at a time and whose refill sits mid-sequence, it is
+    # 22% off it: at (768, 768, 49152) the model puts it 3% ahead of 256x256 and
+    # it measures 175.2 us against 151.3.  A cost model cannot see that, so the
+    # candidate set is what carries it.
+    var wide_parts = _nt_best_parts(
+        128, 384, m, n, size_of[dtype](), ktiles, cus, splittable
+    ) if BODY2 else 0
+    var b_wide = sq_parts == 0
+    if sq_parts != 0 and wide_parts != 0:
+        b_wide = _nt_plan_cost(
+            128, 384, m, n, size_of[dtype](), ktiles, wide_parts, cus
+        ) < _nt_plan_cost(
+            256, 256, m, n, size_of[dtype](), ktiles, sq_parts, cus
+        )
+    var b_parts = wide_parts if b_wide else sq_parts
+    if b_parts == 0:
+        return False
+
+    @always_inline
+    @parameter
+    def _launch[BM: Int, BN: Int]() raises:
+        if b_parts == 1:
+            _nt_mfma_gemm[
+                dtype,
+                BM,
+                BN,
+                32,
+                64,
+                64,
+                2,
+                True,
+                A_KMAJOR,
+                B_KMAJOR,
+                False,
+                dtype,
+                PAIR_FILL,
+                FILL,
+                BODY2,
+            ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
+            return
+        var ws = ctx.enqueue_create_buffer[DType.float32](b_parts * m * n)
         _nt_mfma_gemm[
             dtype,
-            256,
-            256,
+            BM,
+            BN,
             32,
             64,
             64,
@@ -2991,87 +3227,42 @@ def _dense_mfma_route[
             True,
             A_KMAJOR,
             B_KMAJOR,
-            False,
-            dtype,
-            PAIR_FILL,
+            True,
+            DType.float32,
+            PAIR_SPLIT,
             FILL,
             BODY2,
-        ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
-        return True
-    # Underfilled output grid, deep contraction: slabs of K are the only axis
-    # left.  Pick the slab count by cost rather than by a fill threshold.  Slabs
-    # of a tile this large serialize in whole waves of `cus` workgroups, so the
-    # GEMM costs `ceil(tiles * parts / cus)` waves of `ktiles / parts` k tiles
-    # each -- which is why a slab count that leaves a ragged last wave can beat a
-    # smaller one that fits in a single partial wave -- and the reduction costs
-    # one FP32 read of the whole workspace.  `NT_KTILE_CYC` is the measured cost
-    # of one k tile in one workgroup (diagnostic experiment AD: 3995 cycles at
-    # 256x256x32) and the reduction is charged at roughly 4 TB/s spread over the
-    # device.  Every term is a runtime value, and `parts` must divide the k tile
-    # count exactly or the slabs would not cover K.
-    # Every slab must be a whole number of k tiles, which needs BK to divide k
-    # in the first place; a k it does not divide keeps the unsplit route, whose
-    # guarded instantiation handles the partial tile.
-    if m < 256 or n < 256 or c_addr % 8 != 0 or k % 32 != 0:
-        return False
-    comptime NT_KTILE_CYC = 4000
-    var ktiles = k // 32
-    var parts = 1
-    var best = ktiles * NT_KTILE_CYC
-    for cand in range(2, NT_MAX_PARTS + 1):
-        if ktiles % cand != 0 or k // cand < 1024:
-            continue
-        var cost = ceildiv(tiles * cand, cus) * (
-            ktiles // cand
-        ) * NT_KTILE_CYC + cand * m * n // (2 * cus)
-        if cost < best:
-            best = cost
-            parts = cand
-    if parts == 1:
-        return False
-    var ws = ctx.enqueue_create_buffer[DType.float32](parts * m * n)
-    _nt_mfma_gemm[
-        dtype,
-        256,
-        256,
-        32,
-        64,
-        64,
-        2,
-        True,
-        A_KMAJOR,
-        B_KMAJOR,
-        True,
-        DType.float32,
-        PAIR_SPLIT,
-        FILL,
-        BODY2,
-    ](
-        Int(ws.unsafe_ptr()),
-        a_addr,
-        b_addr,
-        m,
-        n,
-        k,
-        parts,
-        xcds,
-        ctx,
-    )
-    comptime VEC = 16 // size_of[DType.float32]()
-    _enqueue_cached[_splitk_reduce_kernel[dtype, VEC]](
-        ctx,
-        String(t"amd_splitk_reduce_{dtype}_v{VEC}"),
-        _gs_blocks(m * n // VEC),
-        1,
-        1,
-        256,
-        _make_ptr[dtype](c_addr).as_unsafe_any_origin(),
-        ws.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
-        m * n,
-        parts,
-        m * n // VEC,
-    )
-    _ = ws^
+        ](
+            Int(ws.unsafe_ptr()),
+            a_addr,
+            b_addr,
+            m,
+            n,
+            k,
+            b_parts,
+            xcds,
+            ctx,
+        )
+        comptime VEC = 16 // size_of[DType.float32]()
+        _enqueue_cached[_splitk_reduce_kernel[dtype, VEC]](
+            ctx,
+            String(t"amd_splitk_reduce_{dtype}_v{VEC}"),
+            _gs_blocks(m * n // VEC),
+            1,
+            1,
+            256,
+            _make_ptr[dtype](c_addr).as_unsafe_any_origin(),
+            ws.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
+            m * n,
+            b_parts,
+            m * n // VEC,
+        )
+        _ = ws^
+
+    if b_wide:
+        _launch[128, 384]()
+    else:
+        _launch[256, 256]()
     return True
 
 
