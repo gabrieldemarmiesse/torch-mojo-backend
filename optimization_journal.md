@@ -2517,3 +2517,404 @@ Worth stating for the next reader: the harness runs its cases in one process, so
 any before/after comparison of individual cases must pass `--case=` and run one per
 process. The contaminated ordering does not affect the whole-table totals, which
 run the same cases in the same order on both sides.
+
+# nanoGPT NT (forward Linear) GEMM, MI300X — 2026-07-26
+
+Third pass over `harness/nanogpt_train/bench_linear_gemm.mojo`, this time one
+variant only: **NT**, `C(m,n) = A(m,k) @ B(n,k)^T`, the `fwd` role, five shapes
+all with `m = 49152`. Entry state, re-verified: NT 72.062 ms/step against
+PyTorch-ROCm's 25.240, **ratio 2.855**, at 152-175 TFLOP/s against ROCm's
+367-543. NN 3.079 and TN 3.601 are the regression check and must not move.
+
+Protocol unchanged: >= 25 warmups and >= 100 individually synchronized
+iterations, timing never from a `--pmc` run, every extent a runtime value.
+
+## Measurement note that changes how the numbers below must be read
+
+`bench_linear_gemm`'s whole-table run and its `--case=` run disagree on
+**`mlp_c_proj_fwd` by 24%** once the new kernel is in place: 448 us in the table,
+525-586 us alone. This is not clock ramp -- the isolated number is stable at
+583.2-585.5 us from 100 to 3000 iterations -- and it is not the operand address:
+inserting a live dummy allocation of 1, 2, 3, 5, 8, 16 or 64 MB ahead of the
+operands moves it by less than 0.5%. It is the *case order*. Running one other
+case first, with a custom targets CSV, isolates which:
+
+| predecessor | its total allocation | `mlp_c_proj_fwd` |
+|---|---:|---:|
+| none | - | 585.53 us |
+| `attn_c_attn_fwd` | 306 MB | **446.21** |
+| `attn_c_proj_fwd` | 152 MB | **446.13** |
+| `mlp_c_fc_fwd` | 382 MB | 585.58 |
+| `mlp_c_fc_dgrad` | 382 MB | 584.79 |
+| `mlp_c_fc_wgrad` | 684 MB | 584.66 |
+| `lm_head_fwd` | 5.1 GB | 584.22 |
+| `mlp_c_proj_fwd` itself | 382 MB | 584.64 |
+
+The pre-change code has no such sensitivity: its per-case numbers equal its
+table numbers to within 0.3% on all five shapes. So the new kernel has a
+warm-allocator fast path on one shape and the old one did not, and the two
+measurements of the same work differ. **Both are reported below.** The whole-table
+figure is the harness's own acceptance number and is what the 2.855 baseline was
+also measured under; the per-case figure is the conservative one and is what the
+brief's protocol prescribes for individual shapes.
+
+A second, unrelated ordering artifact: a *multi-case* CSV comparison of two
+binaries is meaningless. In one such run `dec512_n3072_k768` -- a shape that
+cannot reach any new code, since the new route needs `m >= 1024` -- moved from
+49.45 to 137.53 us. Every regression check below is therefore one case per
+process.
+
+## Change 21 — a hand-written NT MFMA kernel
+
+**Hypothesis.** The recorded barrier is that MAX's `multistage_gemm_kernel`
+cannot make both halves of the data path wide for this layout: `(N,K)` gives
+k-contiguous LDS fragments and 64-byte global rows, `(K,N)` gives 256-byte rows
+and four 2-byte LDS reads per B fragment, and counters on the best configuration
+measured 2.30 LDS instructions plus 11.08 conflict cycles per MFMA against 4
+cycles of per-CU MFMA throughput. But NT has **both operands already k-major in
+memory**, and an MFMA operand wants exactly four elements adjacent along k. A
+k-major LDS tile for both therefore makes the global rows and the fragment reads
+wide at the same time, with nothing transposed anywhere. Write that kernel.
+
+**Predicted effect.** One `ds_read_b64` per fragment instead of four scalar
+reads, zero bank conflicts, and a rate limited by something other than the LDS
+pipe.
+
+**Measured effect.** `_nt_mfma_kernel`, and the geometry search that fixed its
+shape. Every number is TFLOP/s, 25 warmups and 100 synchronized iterations, one
+shape per process, on-device equality check over every output element:
+
+| geometry | 49152x2304x768 | 49152x768x3072 | 49152x50304x768 |
+|---|---:|---:|---:|
+| 128x128x32 w64x64 2 padded stages | 202 | 186 | 200 |
+| 128x128x32 w64x64 1 padded stage | 280 | 268 | 292 |
+| 256x256x32 w128x128 1 stage (4 waves) | 219 | - | 194 |
+| 256x256x32 w128x64 1 stage (8 waves) | 331 | 322 | 336 |
+| 256x256x32 w64x64 1 padded stage (16 waves) | 379 | 355 | 404 |
+| **256x256x32 w64x64 2 swizzled stages** | **434** | **397** | **443** |
+| 256x384x32 w64x192 1 stage | 91 | - | 104 |
+| 384x256x32 w128x128 1 stage | 32 | - | 32 |
+
+Three structural findings, in the order they were found:
+
+1. **Occupancy beats arithmetic intensity here, and the binding resource is
+   VGPRs.** A 64x64 warp tile issues twice the LDS traffic per unit of output
+   area that a 128x64 one does, and it wins by 15% and by 73% against 128x128,
+   because sixteen accumulators of sixteen registers is 64 VGPRs and that is the
+   most that still fits the 128 registers a wave gets at four waves per SIMD.
+   The two geometries above 256x256 collapse to 32-104 TFLOP/s: their
+   accumulators alone exceed the budget and spill.
+2. **Reading every fragment of the k tile in one burst, before any MFMA, is
+   worth 12-18%** (attn_c_attn 334 -> 379 at one padded stage). Per k step the
+   MFMAs depend on that step's own reads, so the per-step form makes the tile a
+   chain of four LDS waits; the burst costs `(MT+NTL)*BK/2` = 32 VGPRs and
+   removes them. Splitting it the other way -- half the reads, then half the
+   MFMAs, then the rest -- measures 4% worse, and `llvm.amdgcn.iglp.opt` 0, 1
+   and 2 measure within 0.3% of nothing.
+3. **The pipeline order is measured, and the textbook one is wrong.** With the
+   MFMAs placed *after* the LDS refill (so they fill the gap between the refill
+   and the barrier that publishes it) the kernel runs 379 TFLOP/s; moving them
+   *before* the refill, which is what "cover the global latency with matrix
+   work" would suggest, gives 301 -- 25% slower, because it leaves only the
+   vmcnt wait and the LDS stores between the two barriers and the whole
+   workgroup waits there in lockstep.
+
+**Decision.** Accept the geometry: 256x256x32, 64x64 warp tile, sixteen wave64,
+two LDS stages.
+
+## Change 22 — an XOR-swizzled LDS layout, so two stages fit
+
+**Hypothesis.** LDS rows padded to `BK + 4` give conflict-free `ds_read_b64`
+fragments (the derivation in `flash_attention_fwd_kernels.mojo`), but two stages
+of a padded 256x256x32 tile are 73728 bytes and gfx942 has 65536, so the winning
+tile could only be single-buffered -- two barriers per k tile. Permuting the
+four-element chunks within a row by XOR instead of padding costs zero bytes, and
+two unpadded stages are exactly 65536.
+
+**Predicted effect.** One barrier per k tile instead of two, at the same tile.
+
+**Measured effect.** The permutation is `chunk ^ ((row >> s) & (BK/4 - 1))`, with
+`s = 1` when a row is 16 dwords and `s = 0` when it is 32 -- a row of 16 dwords
+already splits the 32 banks by row parity, so the permutation only has to be
+injective within a parity class, while a row of 32 dwords contributes nothing and
+it must be injective over all 16 rows of an LDS cycle. Fragment reads and tile
+writes are both conflict-free by construction; the write becomes two
+`ds_write_b64` instead of one `ds_write_b128`, which is the same bytes and the
+same LDS cycles.
+
+At one stage the swizzle is a small loss (379 -> 349 TFLOP/s on attn_c_attn: the
+extra XOR and the doubled write instruction count are not free). At two stages,
+which is what it buys, attn_c_attn 379 -> 434, mlp_c_proj 355 -> 397, lm_head
+404 -> 443.
+
+**Decision.** Accept.
+
+## Change 23 — XCD band remap of the output-tile grid
+
+**Hypothesis.** gfx942 dispatches workgroup `i` to XCD `i % xcds`, and each XCD
+has its own L2. With one workgroup resident per CU and the natural row-major tile
+order, the tiles that share an A row block land on different XCDs and each
+private L2 fetches its own copy. Giving every XCD a contiguous band of the
+natural order should fix that. MAX's own `_xcd_wgm_swizzle`
+(`amd_4wave_matmul.mojo:89`) is the shape of it.
+
+**Predicted effect.** Most on the shapes with the fewest column tiles, where the
+sharing group is smallest.
+
+**Measured effect.** Bands, us, one case per process:
+
+| bands | attn_c_attn | attn_c_proj | mlp_c_fc | mlp_c_proj | lm_head |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 401.1 | 144.7 | 554.8 | 585.4 | 8564 |
+| 2 | 383.1 | 142.8 | 544.1 | 558.2 | 8601 |
+| 3 | 402.6 | 144.9 | 553.6 | 580.2 | 8780 |
+| 4 | **378.4** | 139.6 | **524.4** | 536.5 | 8678 |
+| 6 | 388.2 | 145.4 | 529.2 | 581.8 | 8768 |
+| 8 | 408.1 | **138.2** | 532.1 | **524.7** | 8600 |
+
+Only band counts that divide 8 help, which is the evidence that the mechanism is
+the XCD mapping and not merely traversal order. Adding MAX's second stage, a
+WGM row-block group, moves nothing consistently (best combination 1.099 weighted
+against 1.103 for the remap alone). Band count 4 is 0.8% better weighted than 8
+and I cannot explain why, so the shipped value is the XCD count itself, derived
+from the runtime CU count as `cus // 38` (38 CUs per CDNA3 chiplet); the map is a
+bijection for any value >= 1, so a wrong count costs locality and nothing else.
+Weighted NT, one case per process: 1.141 -> 1.106.
+
+**Decision.** Accept at `xcds`, and record that 4 measured better without a
+mechanism.
+
+## Change 24 — decline when the output grid does not cover the device
+
+**Hypothesis.** One workgroup of this tile is resident per CU -- sixteen wave64
+and the whole LDS budget -- so a grid that does not cover the device leaves CUs
+idle for the entire k loop with no second workgroup to fill them. The five
+nanoGPT NT shapes all have `m = 49152` and never expose this; other shapes in the
+same dispatch branch do.
+
+**Predicted effect.** Shapes whose grid is a fraction of 304 workgroups are
+slower than the route they replaced.
+
+**Measured effect.** Confirmed, and it was a shipped regression until gated. One
+case per process, pre-change against the ungated new route:
+
+| case (transpose_b) | tiles | pre-change | ungated | change |
+|---|---:|---:|---:|---:|
+| m4096 n768 k3072 | 48 | 189.7 us | 226.7 | **+19.5%** |
+| m2048 n768 k3072 | 24 | 154.4 | 230.1 | **+49.0%** |
+| m1024 n2304 k3072 | 36 | 176.6 | 231.9 | **+31.3%** |
+
+The gate takes the largest tile whose grid covers every CU and declines below
+that, mirroring `_amd_bf16_large_m`'s existing rule: 256x256 when
+`ceildiv(m,256)*ceildiv(n,256) >= cus`, else 128x128 when the 128 grid does, else
+the caller keeps its route. After it, one case per process:
+
+| case | pre-change | after | change |
+|---|---:|---:|---:|
+| m4096 n2304 k768 | 124.10 | 55.12 | -55.6% |
+| m4096 n3072 k768 | 159.97 | 84.87 | -46.9% |
+| m4096 n50257 k768 | 2087.68 | 826.75 | -60.4% |
+| m8192 n768 k768 | 115.11 | 51.25 | -55.5% |
+| m8192 n2304 k768 | 211.24 | 93.99 | -55.5% |
+| m16384 n768 k3072 | 545.32 | 304.05 | -44.2% |
+| m4096 n4096 k1024 | 260.61 | 137.46 | -47.3% |
+| m4096 n768 k3072 | 189.18 | 189.05 | -0.1% |
+| m2048 n768 k3072 | 153.96 | 153.67 | -0.2% |
+| m1024 n2304 k3072 | 175.12 | 174.45 | -0.4% |
+| m1024 n768 k3072 | 87.30 | 87.17 | -0.1% |
+| m1536 n768 k3072 | 108.28 | 108.39 | +0.1% |
+| m4096 n1000 k768 | 203.80 | 203.77 | 0.0% |
+| m6144 n768 k768 | 101.27 | 102.38 | +1.1% |
+| m4096 n768 k768 | 69.18 | 69.28 | +0.1% |
+| GPT-2 decode, m512, n 768/2304/3072/50257 | 33.08/40.35/49.86/659.66 | 33.14/40.29/50.29/659.73 | +-0.9% |
+
+`m4096 n1000 k768` is the cost of the gate rather than a win: its 128-tile grid
+is 256 workgroups against 304 CUs, so it declines, where the ungated route was
+62% faster. The gate is a runtime comparison of a runtime tile count against the
+runtime CU count and no model dimension is compiled in; a threshold tuned to
+recover that one point is not justified by one point.
+
+**Decision.** Accept.
+
+## Defect analysis D8 — the same gfx942 MFMA-read miscompile, minimally reproduced
+
+**Hypothesis.** Journal entry D6 recorded a gfx942 code-generation defect in
+MAX's two-stage `multistage_gemm_kernel` for transposed B: one MFMA k step's
+contribution vanishes from *part* of the accumulator ("two of the four
+accumulator elements per lane"), which warp and which block varies, three
+pipeline stages make it disappear, and no structural predicate separates the
+failing geometries. That entry concluded "do not chase MAX's code generator".
+The new kernel hit the same symptom, in code this project owns, which makes it
+reproducible and fixable rather than merely avoidable.
+
+**Predicted effect.** If it is the same defect, it must reproduce with every edge
+guard trivially true -- so that only the guard's *branch* differs -- and be
+sensitive to unrelated schedule changes.
+
+**Measured effect.** Exactly that. At `(m, n, k) = (128, 128, 768)`, where the
+128x128x32 tile divides every extent and every guard is therefore always true,
+the instantiation with the store guard present returns 760 instead of 768 for
+rows 26, 27, 30, 31 of every 32-column block of the first accumulator: short by
+exactly one k step, in registers 14 and 15 -- the last two of the sixteen -- of
+accumulator (0,0) only. Splitting the guard shows the load mask is innocent and
+the store mask alone reproduces it. `s_barrier` does **not** fix it;
+`llvm.amdgcn.sched.barrier` does, which is what identifies it as scheduling
+rather than synchronization. It also moved with things that should be
+irrelevant: single-buffered geometries failed where double-buffered ones passed,
+`BK = 64` failed where `BK = 32` passed, and a 64x128 warp tile failed where
+128x64 passed -- on shapes where all of them are exact.
+
+**Decision.** Fix it structurally rather than by avoiding geometries. The
+accumulators are read and rounded to the output dtype **once, unconditionally,
+in straight-line code**, with a `sched.barrier` on each side of that block, and
+only then do the guarded stores run -- reading plain VGPRs, with no MFMA
+destination anywhere near a branch. After that, twelve geometries (BM 64-256,
+BN 64-256, BK 32 and 64, warp tiles 64x64 to 128x128, one and two stages, padded
+and swizzled) x eleven shapes (including 1x1x32, 127x128x768, 128x127x768,
+200x100x40, 129x129x776, 513x1023x1544, 257x50304x776) x two fill patterns
+x forced-masked and unmasked instantiations all pass, where before the fix
+sixteen of those combinations failed. This is worth more than the fix: the
+defect is not confined to MAX's kernel or to transposed B, it is a hazard on any
+read of an MFMA destination that the scheduler can place too close to the MFMA,
+and the mitigation is cheap and local.
+
+## Diagnostic experiment AD — what binds the NT kernel at 434-443 TFLOP/s
+
+**Hypothesis.** With the geometry settled, the remaining gap should be
+attributable rather than guessed.
+
+**Measured effect.** `rocprofv3` on the shipped kernel at 49152x2304x768 reports
+`vgpr 128, sgpr 112, lds 36864, block 1024, scratch 0`, i.e. four waves per SIMD
+and one workgroup per CU, which is the maximum the 128-register budget allows.
+`rocm-smi` during the run reports a sustained 1395 MHz, so the achievable BF16
+peak is 304 x 2048 x 1.395e9 = **868 TFLOP/s** -- consistent with the 810
+TFLOP/s MFMA-only microbenchmark recorded for the flash-attention work, and the
+reason 443 TFLOP/s is 51% of achievable rather than 34% of the 1307 nominal.
+
+Per k tile per CU, counted from the geometry:
+
+    MFMA        256 instructions / 4 SIMDs x 32 cycles   2048 cycles
+    LDS reads   256 ds_read_b64 x 4 cycles               1024
+    LDS writes   64 ds_write_b64 x 4 cycles               256
+    VMEM        512 x 64-byte requests                   ~512
+                                                    --------
+    sum                                                  3840
+
+and the measured time is 3995 cycles per k tile (lm_head, 2985 k tiles per CU at
+1395 MHz). **The stages add; almost nothing overlaps** -- the same profile the
+flash-attention work found, and the reason `iglp.opt`, the read/MFMA split and
+the "cover the latency" reordering all did nothing or hurt. The LDS read traffic
+is irreducible at this warp tile: each wave reads its own 64x32 slab of A and of
+B once per k tile, and the four wave-columns re-read the same slab, so the tile
+is read four times over. Halving it needs a wider warp tile, which needs more
+accumulator registers, which costs the fourth wave per SIMD -- and that trade
+measures 15-73% worse.
+
+The one shape that is not near the 434-443 band is `mlp_c_proj_fwd`
+(49152x768x3072, 442 TFLOP/s in the table and 397-441 alone). It is not the
+kernel: at the same k and a wider n the same kernel reaches **492 TFLOP/s**
+(49152x3072x3072) and 416 (49152x1536x3072), and shrinking m at n = 768 tracks
+grid fill closely -- m 8192 / 16384 / 32768 / 49152 give 157 / 300 / 318 / 397
+against a fill model of 0.32 / 0.63 / 0.63 / 0.95. Three column tiles is simply
+not enough concurrency for this tile.
+
+## Where NT ended, and what it would take to close the rest
+
+| case | rocm us | before | after (per case) | after (table) | after TFLOP/s |
+|---|---:|---:|---:|---:|---:|
+| attn_c_attn_fwd | 382.56 | 1047.4 | 408.2 (1.067) | 400.9 (1.048) | 426 |
+| attn_c_proj_fwd | 158.05 | 380.3 | 137.9 (**0.873**) | 145.0 (0.917) | 420 |
+| mlp_c_fc_fwd | 498.14 | 1384.8 | 534.6 (1.073) | 516.0 (1.036) | 434 |
+| mlp_c_proj_fwd | 426.62 | 1376.1 | 525.1 (1.231) | 453.6 (1.063) | 442 |
+| lm_head_fwd | 7655.58 | 21768.2 | 8643.0 (1.129) | 8560.1 (1.118) | 439 |
+
+**NT 2.855 -> 1.060** on the harness's own per-variant table (1.064 with
+`--pattern-check=1`, 1.070 with `--chunk-check=1`), and **2.854 -> 1.106**
+measured one case per process. Fifteen of fifteen cases pass all three gates.
+The 1.03 bar is not met either way.
+
+Regression checks, all after the change:
+
+| check | recorded | now |
+|---|---|---|
+| `bench_linear_gemm` NN | 3.079 | 3.078 / 3.079 / 3.079 |
+| `bench_linear_gemm` TN | 3.601 | 3.599 / 3.586 / 3.591 |
+| whole table | 227.09 ms, 3.170 | 181.68 ms, 2.536, 15/15 pass |
+| `bench_attention_bmm` default | 51.206 ms | 51.236 ms, 6/6 pass |
+| `bench_attention_bmm --pattern-check=1` | 50.993 ms | 51.040 ms, 6/6 pass |
+| `bench_attention_bmm --causal=1` | 50.460 ms | 50.461 ms, 6/6 pass |
+| GPT-2 decode NT, m512, four n | - | +-0.9%, one case per process |
+| GPT-2 prefill NT, m4096, five n | - | -60.4% to +0.1% |
+
+What is left, in the order the evidence supports:
+
+* **The LDS read traffic, 1024 of the 3995 cycles.** Irreducible at a 64x64
+  warp tile without giving up the fourth wave per SIMD. The way out is not a
+  wider warp tile but fewer accumulator registers per unit of output area, which
+  on CDNA3 means nothing available -- 16x16x16 has the same accumulators per
+  output element as 32x32x8.
+* **The VMEM request count, ~512 of the 3995 cycles.** At `BK = 32` a tile row is
+  64 bytes, exactly one sector, so 32768 bytes per k tile is 512 requests and
+  that is a floor. Loading 64 k elements per row into registers and filling BOTH
+  double-buffer stages from one load would make the requests 128 bytes and halve
+  the count, at the same LDS budget and the same barrier count; not attempted.
+* **Narrow n.** `mlp_c_proj_fwd`'s three column tiles is the one shape-level
+  deficiency, and the same kernel reaches 492 TFLOP/s when n is wide. A
+  narrow-n regime -- a taller, narrower tile, or a global split-K to multiply the
+  grid -- is the obvious next move and is not attempted here.
+* **The measurement disagreement** on that same shape, 24% between the table and
+  the isolated run, is unexplained and worth resolving before any further tuning
+  of it: it is large enough to swamp the effects being tuned.
+
+## Diagnostic experiment AE — MAX's 4-wave and ping-pong AMD matmuls, corrected
+
+**Hypothesis.** Diagnostic experiment Y recorded these as unreachable partly
+because "their BF16 MMA shape is 16x16x32, which asserts `_cdna_4_or_newer()` on
+gfx942". That reason is wrong as stated: `mma_shape` is a config *field*
+(`amd_4wave_matmul.mojo:159`), `validate_config` (`:718-765`) contains no assert
+pinning it, and there is no `is_gfx95` or `_cdna_4_or_newer` gate anywhere in
+`amd_4wave_matmul.mojo`, `amd_ping_pong_matmul.mojo`,
+`amd_4wave_split_k_matmul.mojo`, `warp_spec_matmul.mojo` or their helpers.
+
+**Measured effect.** Unreachable anyway, for four independent reasons, and the
+LDS budget is not among them (128x128x32 bf16 is 32 KB and satisfies every
+assert in `validate_config`):
+
+1. **Compile-time N and K are mandatory, and it is a hard error.**
+   `amd_4wave_matmul.mojo:826-835` reads `comptime N = static_shape[0]` and
+   `comptime K = static_shape[1]`; a dynamic dim is `-1`, and
+   `comptime assert K_per_split % (2 * BK) == 0` then fires because Mojo's `Int`
+   has Python floor-mod semantics and `-1 % 256 == 255`. Same in ping-pong
+   (`:336-337`), split-K (`:250-257`) and `amd_matmul.mojo:188`;
+   `warp_spec_matmul` takes M, N, K as launcher *parameters* (`:572-574`) and
+   unrolls the k loop at compile time (`:436`, `:538`).
+2. **A dynamic leading stride is silently wrong.** `TileLoaderLDS` takes
+   `stride` as a compile-time struct parameter (`amd_tile_io.mojo:1223`) and
+   folds it into addresses (`:1479-1480`, `:1499`, `:1512-1513`); its nine
+   `comptime assert`s (`:1363-1397`) never validate it. This confirms the
+   earlier finding for `RegTileLoader` (`:2585`) and extends it.
+3. **`mma_shape` is settable but no CDNA3 shape is legal.** The producer writes
+   LDS lane-linearly in chunks of `WARP_SIZE * load_width` with
+   `subtile_cols = 32` hardcoded (`amd_tile_io.mojo:1271`), and the consumer
+   reads with `lds_row_stride = MMA_K` (`:936-940`) and chunk stride
+   `MMA_M * MMA_K` (`:994`). Correctness therefore requires
+   `MMA_M * MMA_K == WARP_SIZE * load_width == 512` and `MMA_M == 16`. CDNA3's
+   bf16 MFMAs give 4 elements per lane: 16x16x16 and 32x32x8 both yield 256.
+   CDNA4's 16x16x32 yields 512. The fp8 path escapes through a dedicated
+   split-LDS branch (`:920-923`); there is none for an operand *smaller* than 16
+   bytes, which is exactly the CDNA3 bf16 case. Setting 16x16x16 compiles and
+   produces garbage.
+4. **`load_to_lds` is unavoidable on that path** (`:1483`, `:1493`, `:1516`,
+   `:1523`, no register-bounce fallback), and experiments R and T recorded that
+   it cannot lower for dynamic layouts on this pin.
+
+Modular says the same thing in their own build file
+(`max/kernels/test/gpu/linalg/BUILD.bazel:133-141`, "4-wave matmul kernels are
+MI355X-specific"), and their dispatcher gates the whole family on
+`ctx.default_device_info == MI355X` (`matmul/gpu/__init__.mojo:801-805`). No
+vendor library is on any of these call paths.
+
+**Decision.** Correct the record: experiment Y's verdict stands, its stated
+reason does not. The binding reasons are compile-time N/K, the silent
+static-stride bake, and an LDS fragment geometry that no CDNA3 bf16 MFMA shape
+satisfies.

@@ -1226,7 +1226,8 @@ def _splitk_reduce_kernel[
     parts: Int,
     vec_count: Int,
 ):
-    """`c[i] = sum over slabs of ws[slab, i]`, summed and rounded once in FP32."""
+    """`c[i] = sum over slabs of ws[slab, i]`, summed and rounded once in FP32.
+    """
     var index = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     var j = index
@@ -1860,6 +1861,7 @@ def _causal_bmm_dispatch(
 # the runtime shape; no extent is ever compiled in.
 # ---------------------------------------------------------------------------
 
+
 @always_inline
 def _nt_sched_fence():
     """Stop the machine scheduler moving anything across this point.
@@ -1941,9 +1943,9 @@ def _nt_mfma_kernel[
     comptime SB = BN * PAD
 
     comptime assert BK % NT_VEC == 0, "BK must be a multiple of the load width"
-    comptime assert WM % NT_MMA == 0 and WN % NT_MMA == 0, (
-        "the warp tile must be a whole number of MFMA tiles"
-    )
+    comptime assert (
+        WM % NT_MMA == 0 and WN % NT_MMA == 0
+    ), "the warp tile must be a whole number of MFMA tiles"
     comptime assert THREADS >= TPR, "BK is wider than the block can cover"
     comptime assert STAGES == 1 or STAGES == 2, "STAGES is 1 or 2"
     comptime if SWIZZLE:
@@ -1952,13 +1954,15 @@ def _nt_mfma_kernel[
         # MFMA tile adds must be a multiple of its period for one precomputed
         # value per lane to stay valid.
         comptime SW_PERIOD = (SW_MASK + 1) << SW_SHIFT
-        comptime assert (BK // 2) % 32 == 0 or (BK // 2) % 32 == 16, (
-            "the swizzle is derived for LDS rows of 16 or 32 dwords"
-        )
-        comptime assert NT_MMA % SW_PERIOD == 0, (
-            "the MFMA tile stride must be a whole number of swizzle periods"
-        )
-        comptime assert (THREADS // TPR) % SW_PERIOD == 0, (
+        comptime assert (BK // 2) % 32 == 0 or (
+            BK // 2
+        ) % 32 == 16, "the swizzle is derived for LDS rows of 16 or 32 dwords"
+        comptime assert (
+            NT_MMA % SW_PERIOD == 0
+        ), "the MFMA tile stride must be a whole number of swizzle periods"
+        comptime assert (
+            THREADS // TPR
+        ) % SW_PERIOD == 0, (
             "the fill pass stride must be a whole number of swizzle periods"
         )
 
@@ -2088,13 +2092,17 @@ def _nt_mfma_kernel[
                     _write_row(pa, (trow + p * ROWS) * PAD, areg, p * NT_VEC)
                 else:
                     if trow + p * ROWS < BM:
-                        _write_row(pa, (trow + p * ROWS) * PAD, areg, p * NT_VEC)
+                        _write_row(
+                            pa, (trow + p * ROWS) * PAD, areg, p * NT_VEC
+                        )
             comptime for p in range(BPASS):
                 comptime if (p + 1) * ROWS <= BN:
                     _write_row(pb, (trow + p * ROWS) * PAD, breg, p * NT_VEC)
                 else:
                     if trow + p * ROWS < BN:
-                        _write_row(pb, (trow + p * ROWS) * PAD, breg, p * NT_VEC)
+                        _write_row(
+                            pb, (trow + p * ROWS) * PAD, breg, p * NT_VEC
+                        )
 
         # Every fragment of the whole k tile, read from LDS in one burst before
         # any MFMA issues.  `MT * KSTEPS + NTL * KSTEPS` `ds_read_b64` is only
@@ -2509,9 +2517,7 @@ def _amd_dynamic_mfma_dispatch[
                 # TFLOP/s against 152-175 for the route below, so try it first
                 # and keep the B^T materialization only for the shapes it
                 # declines.
-                if _nt_mfma_route[dtype](
-                    c_addr, a_addr, b_addr, m, n, k, ctx
-                ):
+                if _nt_mfma_route[dtype](c_addr, a_addr, b_addr, m, n, k, ctx):
                     return True
             comptime if transpose_b:
                 # A [N, K] operand is read as BN rows of BLOCK_K elements, so
