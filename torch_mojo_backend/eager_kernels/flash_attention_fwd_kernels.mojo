@@ -105,7 +105,7 @@ from std.gpu.host import DeviceContext
 from std.gpu.memory import AddressSpace
 from std.gpu.primitives import block
 from std.gpu.primitives.warp import shuffle_xor
-from std.math import ceildiv, exp, exp2
+from std.math import ceildiv, exp, exp2, log
 from std.memory import bitcast, stack_allocation
 from std.sys.info import is_amd_gpu
 from std.sys.intrinsics import llvm_intrinsic
@@ -172,6 +172,7 @@ def _flash_attention_fwd_baseline[
     dtype: DType
 ](
     output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    lse: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -262,6 +263,14 @@ def _flash_attention_fwd_baseline[
         kv_start += BK
 
     var inv = 1.0 / running_sum
+    if tid == 0:
+        # P = exp(S - L) with L the row log-sum-exp; `running_max` is already
+        # the scaled score's max. A fully masked row contributes no key, so its
+        # L is never read back -- store a finite 0 rather than -inf + log(0).
+        var l = Float32(0.0)
+        if running_sum > 0.0 and running_max > RAW_FLOOR:
+            l = running_max + log(running_sum)
+        lse[(batch * heads + head) * seq_q + qi] = l
     var do = tid
     while do < head_dim:
         output[q_base + do] = (acc_smem[do] * inv).cast[dtype]()
@@ -287,6 +296,7 @@ def _fa_mfma[
     PEEL: Bool,
 ](
     output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    lse: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -576,6 +586,17 @@ def _fa_mfma[
             if tot > 0.0 and run_m[qt] > RAW_FLOOR:
                 r = 1.0 / tot
             inv[qt] = r
+            # `run_m` is the max of the RAW dot product and the exponent used is
+            # `(s_raw - run_m) * scale`, so the natural-log row log-sum-exp is
+            # `run_m * scale + ln(tot)`. Lanes L and L^32 hold the same query
+            # (both `tmax` and `tot` are reduced across the pair), so exactly
+            # one half-wave stores it.
+            var qg_l = q_block + wave * (32 * QT) + qt * 32 + lo
+            if hi == 0 and qg_l < seq_q:
+                var l = Float32(0.0)
+                if tot > 0.0 and run_m[qt] > RAW_FLOOR:
+                    l = run_m[qt] * scale + log(tot)
+                lse[bh * seq_q + qg_l] = l
 
         comptime for dt in range(DT):
             barrier()
@@ -615,6 +636,7 @@ def _enqueue_fa_mfma[
     PEEL: Bool = True,
 ](
     output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    lse: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -631,6 +653,7 @@ def _enqueue_fa_mfma[
         _fa_mfma[dtype, HD, BN, QT, EXACT, WAVES_PER_EU, IGLP, PEEL]
     ](
         output,
+        lse,
         query,
         key,
         value,
@@ -648,6 +671,7 @@ def enqueue_flash_attention_fwd[
     dtype: DType
 ](
     output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    lse: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -687,6 +711,7 @@ def enqueue_flash_attention_fwd[
             if head_dim == 64:
                 _enqueue_fa_mfma[dtype, 64, 64, 1, True](
                     output,
+                    lse,
                     query,
                     key,
                     value,
@@ -703,6 +728,7 @@ def enqueue_flash_attention_fwd[
             if head_dim < 64:
                 _enqueue_fa_mfma[dtype, 64, 64, 1, False](
                     output,
+                    lse,
                     query,
                     key,
                     value,
@@ -719,6 +745,7 @@ def enqueue_flash_attention_fwd[
             if head_dim == 128:
                 _enqueue_fa_mfma[dtype, 128, 64, 1, True, 1, 1, False](
                     output,
+                    lse,
                     query,
                     key,
                     value,
@@ -735,6 +762,7 @@ def enqueue_flash_attention_fwd[
             if head_dim < 128:
                 _enqueue_fa_mfma[dtype, 128, 64, 1, False, 1, 1, False](
                     output,
+                    lse,
                     query,
                     key,
                     value,
@@ -751,6 +779,7 @@ def enqueue_flash_attention_fwd[
             if head_dim == 256:
                 _enqueue_fa_mfma[dtype, 256, 32, 1, True, 1, 1, False](
                     output,
+                    lse,
                     query,
                     key,
                     value,
@@ -766,6 +795,7 @@ def enqueue_flash_attention_fwd[
                 return
             _enqueue_fa_mfma[dtype, 256, 32, 1, False, 1, 1, False](
                 output,
+                lse,
                 query,
                 key,
                 value,
@@ -782,6 +812,7 @@ def enqueue_flash_attention_fwd[
 
     ctx.enqueue_function[_flash_attention_fwd_baseline[dtype]](
         output,
+        lse,
         query,
         key,
         value,

@@ -434,11 +434,19 @@ def run_case[
         block_dim=(FILL_BLOCK,),
     )
 
+    # The forward also emits the per-row log-sum-exp the backward consumes;
+    # this harness does not check it (bench_flash_attention_bwd.mojo does, by
+    # feeding its own L to the backward), it just supplies the buffer.
+    var lse_buf = ctx.enqueue_create_buffer[DType.float32](
+        batch * heads * seq_q
+    )
+
     @always_inline
     @parameter
     def _launch() raises:
         enqueue_flash_attention_fwd[dtype](
             out_buf.unsafe_ptr().as_unsafe_any_origin(),
+            lse_buf.unsafe_ptr().as_unsafe_any_origin(),
             q.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
             k.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
             v.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
