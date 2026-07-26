@@ -798,9 +798,7 @@ def _try_spec_scalar_inplace(spec_fn_name: str, x, scalar) -> bool:
     if a is None or not a._is_contiguous or a._dtype not in _FLOAT_DTYPES:
         return False
     try:
-        getattr(eager_kernels.elementwise_ops, spec_fn_name)(
-            _spec_of(a), float(scalar)
-        )
+        getattr(eager_kernels.elementwise_ops, spec_fn_name)(_spec_of(a), float(scalar))
     except Exception as exc:
         _raise_if_device_oom(exc)
         return False
@@ -1159,9 +1157,7 @@ def fast_aten_mul_(input, other):
     dst = _t(input)
     if dst is None:
         return None
-    if _t(other) is None and _try_spec_scalar_inplace(
-        "MulScalarInplace", input, other
-    ):
+    if _t(other) is None and _try_spec_scalar_inplace("MulScalarInplace", input, other):
         return input
     result = fast_aten_mul(input, other)
     if (

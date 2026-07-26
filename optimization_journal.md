@@ -4704,3 +4704,319 @@ it has neither the plan search nor split-K. That is the obvious next move and it
 now has evidence behind it -- the same change on the mixed NN route, which shares
 the underfilled-grid regime, is what produced the 13-37% on the GPT-2 prefill
 shapes above. It was left out here to keep one pass to one mechanism.
+
+# nanoGPT bandwidth-bound cluster, MI300X — the grid, and one re-read, 2026-07-26
+
+The five memory-bound rows of the v11 gap report were all 1.15-1.22x and the
+brief's reading was that one shared cause was likely. It is half true: two of
+the five had a shared cause (a launch geometry tuned for a 132-SM H100 running
+on a 304-CU part) and it was worth 2.70 ms; the other three did not, and two of
+them did not move at all. Everything below is measured on gfx942 with the clock
+unpinned, so every kernel number is a median of 20 launches inside one process
+and every step number is interleaved against the other binary.
+
+## Where the five rows ended
+
+Kernel-level, `current_bench_train/v13/comparison` against the same
+`v7/rocm`:
+
+| target | rocm | v11 | v13 | v11/rocm | v13/rocm |
+|---|---:|---:|---:|---:|---:|
+| Copies / dtype casts / layout | 11.422 | 13.080 | 13.162 | 1.145 | 1.152 |
+| Cross entropy (backward) | 4.424 | 7.256 | 5.839 | 1.640 | **1.320** |
+| Residual / elementwise add | 4.473 | 5.320 | 5.191 | 1.189 | **1.161** |
+| Cross entropy (forward) | 4.138 | 4.817 | 3.549 | 1.164 | **0.858** |
+| GELU (forward) | 2.180 | 2.658 | 2.658 | 1.219 | 1.219 |
+
+Per kernel, us/step in production:
+
+| kernel | v11 | v13 |
+|---|---:|---:|
+| `log_softmax_rows_block_bfloat16_1024` | 4804.7 | **3537.5** |
+| `lsm_bwd_nosmem_bfloat16` -> `lsm_bwd_reg_bfloat16_1024_8` | 5276.4 | **3843.3** |
+| `logic_ops__bin_flat_vec_kernel` (fp32 residual add, x25) | 2729.1 | **2619.9** |
+| `elementwise_r1_w1_b256` (the scalar `add_`, x76) | 401.6 | 379.4 |
+| `gpu_memcpy`, whole step | 77 x, 377.9 | **2 x, 9.4** |
+| `gelu_forward_bf16_exact_vec16` (x12) | 2658.2 | 2657.8 |
+| whole step, kernels only | 162192.4 | **159031.2** |
+
+## The step, interleaved
+
+One session, alternating binaries, 25 warmups and 100 synchronized iterations
+each, clock NOT pinned (`scripts/gpu_clock.py status`: the driver refuses):
+
+| order | binary | median | p10 | p90 |
+|---|---|---:|---:|---:|
+| 1 | new | 159.740 | 159.141 | 160.384 |
+| 2 | **base (HEAD~1)** | **162.530** | 161.749 | 163.056 |
+| 3 | new | 159.933 | 159.190 | 160.492 |
+| 4 | PyTorch-ROCm | 157.168 | 156.912 | 157.762 |
+| 5 | new | 160.021 | 159.377 | 160.771 |
+
+New median of three: 159.93. **1.0176x ROCm, from 1.0341x.** The gap went 5.36
+ms -> 2.76 ms, i.e. 2.60 ms of the 4.55 ms this pass was scoped against. The
+base measured 162.53 here against the 161.46 the brief quotes; both were taken
+without a pinned clock and the difference between them is why the interleave
+exists.
+
+## Change 40 — the log-softmax forward's L2 budget starves a 304-CU part
+
+`_log_softmax_rows` capped its grid at `LSM_L2_BUDGET // row_bytes` so that a
+row survived from its pass-1 read to its pass-2 re-read. The budget is 23 MB,
+chosen for an H100's 50 MB L2. At nanoGPT's logits row (50304 bf16 columns,
+100608 bytes) that is **228 blocks on a part with 304 CUs** — three quarters of
+one block per CU.
+
+**Hypothesis.** The re-read the cap protects is worth less than the parallelism
+it costs. **Predicted:** the same kernel at a device-filling grid runs at the
+3-stream rate instead of the 2-stream-but-starved one.
+
+Measured, same kernel, same operands, 20 launches, us:
+
+| blocks | 228 | 608 | 912 | 1216 | 1824 | 2432 | 4096 | 8192 | 16384 | 49152 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| us | 4460 | 3536 | 3570 | 3538 | 3517 | 3509 | 3515 | 3494 | 3498 | 3545 |
+
+Flat within 2% from 2 blocks per CU to 54, and 27% worse at the cap. The cap now
+has a floor of `LSM_BLOCKS_PER_CU * sm_count` = 1216 under it, applied only on
+the long-row (1024-thread) arm — the short-row arm's cap already admits >= 920
+blocks, so leaving it alone costs nothing and risks nothing. Production:
+4804.7 -> 3537.5 us/step, and the cross-entropy-forward row goes from 1.164x
+ROCm to **0.858x**.
+
+For scale, the same probe puts a plain 2-stream bf16 copy of this tensor at 2455
+us and a 3-stream add at 3942, so at 3509 the kernel is doing three streams'
+worth of traffic (its re-read partially hits cache) at close to the achievable
+rate. There is no further grid win here.
+
+### Rejected: a register-staged forward that reads the row once
+
+The obvious next step is to keep the row in registers across the max, the sum
+and the store, which makes the kernel 2-stream and removes the residency
+question entirely. It also halves the transcendentals: with x in registers the
+maximum reduces with no `exp` at all, and the sum then needs exactly one `exp`
+per element against the final block maximum, instead of the online recurrence's
+two plus a rescaling multiply.
+
+A clean draft of exactly that (`_v2` in the probe, no head/tail handling, 8
+slots of 16 bytes at 1024 threads) measured **3383 us at 4096 blocks and 3322 at
+1216** — better than the 3509 above, and a no-`exp` control measured 3006, so
+the transcendentals are worth ~380 us of it.
+
+**It did not survive being made general, and the reason is worth recording.** A
+kernel that accepts any `cols` needs a per-row scalar head and tail, and the
+natural way to write them is the grid-stride loop the rest of the file uses.
+Same arithmetic, same grid, same slots:
+
+| head/tail written as | us |
+|---|---:|
+| `while` grid-stride loops (3 pairs) | 4508 / 4546 / 4562 / 4588 |
+| `if` (they can run at most once) | 3857 / 3872 / 3924 |
+| `if`, with the two scalars also staged in registers | 4582 / 4589 / 4592 |
+| the clean draft with no head/tail at all | 3322 / 3383 |
+
+The first row is a spill: a runtime trip count between the phases makes the
+register allocator treat the 8-slot cache as live across a back edge. The second
+row fixes that — head and tail are each shorter than one 16-byte vector, so
+fewer than 32 elements against at least 256 threads, and the loop provably runs
+at most once per thread — and recovers 640 us. The third row is the surprise:
+adding **two** fp32 registers to hold the head and tail values (which removes
+four conditional global loads) puts it straight back into the spilling regime.
+
+So the general register-staged forward tops out at 3857, and the existing
+re-read kernel at a filled grid is 3509. **The register kernel was deleted.**
+The 535 us between the general version and the clean draft is entirely head/tail
+plumbing that the codegen will not absorb, and I could not find a formulation
+that keeps both. A compile-time `head == 0` arm would, but that is a fast path
+plus a fallback, which AGENTS.md rules out, and the whole prize is 350 us.
+
+## Change 41 — the log-softmax backward reads `grad` once, from registers
+
+`_log_softmax_bwd_nosmem_kernel` is the fallback for rows too long for the 64 KB
+LDS the staging variant needs, and it read `grad` twice: four passes over
+`[49152, 50304]` where three will do. It also ran at **256 threads with one
+block per row**, so a CU held up to eight 100 KB rows in flight and the second
+read had no chance of hitting cache.
+
+Two separate effects, measured separately at that shape, 20 launches:
+
+| variant | us |
+|---|---:|
+| shipped: re-read, 256 threads, grid = rows | 5558 / 5578 / 5577 |
+| re-read, **1024 threads**, grid = rows | 4473 / 4474 / 4487 |
+| register-staged, 1024 threads, grid 1216 | **4157 / 4174 / 4186** |
+
+The block size alone is worth 1100 us — the concurrent row footprint drops 4x,
+from ~243 MB (over this part's 256 MB of Infinity Cache) to ~60 MB — and staging
+the row in 8 register slots is worth another 300. The 3-stream floor here is the
+3942 us the plain 3-stream add reference gets, so the staged kernel is 6% off
+it and there is little left.
+
+The staged kernel is instantiated at 1, 4 and 8 slots; the path is only reached
+when shared memory cannot hold the row (n_vec > 3072), so 4 and 8 are the arms
+that run and the 1-slot arm exists for `cols < VEC`, which lands here with an
+empty vector body. Rows longer than 8 * 1024 vectors keep the re-read kernel,
+now at 1024 threads. Grid is flat from 608 to 49152 blocks (4178-4193 us), so it
+uses the same 4-blocks-per-CU rule.
+
+Production: 5276.4 -> 3843.3 us/step. The row is still 1.32x ROCm, but as the
+brief noted most of that row is an attribution artifact: measured directly,
+`_log_softmax_backward_data` is 4095.2 (ROCm) against 3843.3, i.e. **0.94x — we
+now win it** — and `nll_loss_backward` is 329.2 against 1996.1 because ours also
+does the zeroing ROCm spends 2006.7 us of `aten::fill_` on. Honest total for
+cross entropy backward: 6431.1 ROCm against 5839.4.
+
+## Change 42 — the scalar `add_` stops allocating and copying back
+
+Not a kernel problem. nanoGPT's fused AdamW calls `torch._foreach_add_(steps, 1)`
+twice per step; PrivateUse1 has no `_foreach_add_.Scalar`, so ATen decomposes it
+into **75 `add_.Scalar` on 0-dim fp32 tensors**. Each of those went through the
+functional spec (allocate a 4-byte output, run the op, `copy_d2d` it back), so
+the step carried 75 one-element kernels *and* 75 four-byte device-to-device
+copies. ROCm does the whole thing in two `multi_tensor_apply` launches, 10.4
+us/step.
+
+`AddScalarInplace` / `MulScalarInplace` in `elementwise_ops.mojo` write straight
+into the input when it is contiguous and floating point, and
+`_try_spec_scalar_inplace` in `aten_fast.py` reaches for them from
+`fast_aten_add_` and `fast_aten_mul_` before the functional path. `alpha` folds
+into the scalar exactly.
+
+**Measured:** `gpu_memcpy` over the whole step goes from **77 events, 377.9
+us/step, to 2 events, 9.4 us/step**. The 76 one-element kernels remain (379.4
+us/step): removing those needs a real `_foreach_add_.Scalar` registration and a
+batched-descriptor kernel, which is a bigger change than this pass took on and
+is the obvious next 370 us.
+
+Note for whoever reads the gap report: these 76 launches are attributed to
+"Residual / elementwise add" because `compare_nanogpt_train_kernels.py` charges
+a kernel to its *deepest* enclosing CPU range, and ours is the decomposed
+`aten::add_`. On ROCm the deepest range is `aten::_foreach_add_`, which the same
+script files under the optimizer. The two backends' add rows are not comparable
+as printed.
+
+## Change 43 — the flat binary kernel covers its slots above the cache
+
+`_bin_flat_vec_kernel` took `_gs_blocks`, a flat 4096-block cap. Change 33's
+rejection note measured that cap as the best choice at 216 MiB and the exact
+grid as the best at 432 MiB, and declined to pick. nanoGPT's fp32 residual add
+is 453 MB of traffic — the 432 MiB case — and the measurement reproduces:
+
+| grid | 608 | 1216 | 2432 | 4096 | 9216 | 18432 | 36864 (exact) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| us | 114.5 | 114.5 | 120.1 | 121.7 / 126.9 | 118.9 | 116.6 | **114.0** |
+
+`_bw_flat_blocks` in `op_utils` now switches on the operand traffic against the
+256 MiB last-level cache: below it, `_gs_blocks` unchanged; above it, the exact
+grid. Production: 2729.1 -> 2619.9 us/step. This is a 4-6% effect on a kernel
+with a noisy grid response, so it is the least defensible thing in this pass;
+the step-level evidence for it is only that the total moves the right way.
+
+## What did NOT move, and the measurement behind it
+
+**GELU forward, +0.478 ms, unchanged.** The asymmetry the brief pointed at
+(forward 1.22x, backward 0.93x) is real but it is not geometry and it is not the
+vector width. On `[48, 1024, 3072]` bf16, 40 launches:
+
+| variant | us |
+|---|---:|
+| shipped: 32 bytes/thread (VEC=16), one shot, 36864 blocks | 252.1 / 253.7 / 264.7 |
+| 16 bytes/thread (VEC=8), one shot, 73728 blocks | 252.0 / 254.4 |
+| VEC=8, grid-stride, 608 / 1216 / 2432 / 4096 / 9728 / 19456 blocks | 310 / 268 / **248.6** / 261.8 / 258.8 / 259.5 |
+| VEC=16, grid-stride, 1216 / 4096 / 18432 | 275.6 / 271.4 / 269.2 |
+| VEC=8, one shot, 512-thread blocks | 247.7 |
+| VEC=4, grid-stride, 4096 | 280.8 |
+
+Everything sane is within 2% of the shipped kernel, which is inside the codegen
+lottery's noise band; VEC=8 and VEC=16 are bit-identical (checked, 0 differing
+elements over 151M). The cost is `erf`. Replacing `gelu(x)` with `x * 0.5` in
+the same kernel, same grid: **175.5 us at VEC=16 and 155.8-164.1 at VEC=8**, so
+`erf` is ~90-100 us of the 252, and ROCm's whole kernel is 181.65 us. The
+stdlib's `erf` evaluates BOTH branches unconditionally (a 7-term polynomial plus
+an `exp` for |x| > 0.921875, a 6-term polynomial below it) and selects. A
+wave-uniform skip of the expensive branch is the obvious idea and it does not
+work here: the branch point is |x| > 1.3036 in GELU's argument, one wave covers
+1024 elements at VEC=16, and no wave is entirely below it. **This row needs a
+cheaper `erf`, not a different launch.** The bf16 output has 8 mantissa bits, so
+there is enormous accuracy slack to spend, but spending it changes results
+against CPU torch and that is a decision with a test contract attached.
+
+**Copies / dtype casts, +1.658 ms, unchanged (13.080 -> 13.162, noise).** I did
+not attempt this. Change 33 already established that our cast *kernel* is faster
+than ROCm's standalone (3650 vs 3741 us on the logits cast) and that the gap is
+~7% of in-process excess plus ~8 us of per-call launch cost over 148 calls.
+Nothing in this pass addresses either. One thing worth recording for the next
+reader, because it is not obvious from the report: the 7.7 ms/step of
+`_to_copy [49152, 50304]` is **autocast casting the log-probabilities to fp32
+for `nll_loss` and the gradient back to bf16**, and PyTorch-ROCm pays exactly
+the same thing (`aten::copy_ [[49152, 50304]]`, 6851.1 us/step). It is 29.6 GB
+of traffic that exists only because `_log_softmax` is called with
+`half_to_float=False`. `aten::_log_softmax(self, dim, half_to_float=True)`
+exists precisely to fuse it, and PyTorch's autocast does not use it here — so
+this is ~7 ms that BOTH backends spend and that a backend willing to implement
+the `half_to_float` arm and an `AutogradPrivateUse1` formula for
+`cross_entropy_loss` could delete outright. That is a much larger prize than the
+1.66 ms of relative gap, and it is not something a kernel change can reach.
+
+## Correctness
+
+92 new cases in `tests/test_eager_kernels.py`:
+
+* `test_fast_log_softmax_wide_rows_match_cpu` — 3 dtypes x 7 column counts
+  (12501, 16384, 16385, 25000, 33000, 50304, 70001) x base offsets 0 and 1,
+  against CPU `torch.log_softmax`. The offsets slice the storage so the row
+  bases stop being 16-byte aligned, which is the only way to make the per-row
+  scalar head and tail non-empty; four of the seven counts are not a multiple of
+  any vector width the dispatch can pick. Each asserts no NaN.
+* `test_fast_log_softmax_wide_rows_stay_finite` — a row that is constant except
+  for one +60 spike (the shape defect D7 came from: a running maximum seeded
+  with `Float32.MIN`, which is -inf, turns an idle thread's `0 * exp(m - m)`
+  into a NaN the block reduction spreads over the row), and a fully constant row
+  whose every output must be `-log(cols)`. The constant row is the cheap
+  independent check that the denominator is the whole row and not a fragment,
+  and it is not an all-ones test: the spiked row is not constant and the
+  randn rows above are not either.
+* `test_fast_log_softmax_backward_wide_rows` — 3 dtypes x cols in {3, 33000,
+  50304, 70001} x offsets 0 and 1. cols == 3 is below one 16-byte vector, so the
+  vector body is empty and the row is entirely head/tail (the 1-slot arm); 33000
+  and 50304 walk the 4- and 8-slot arms; 70001 is the re-read fallback.
+* `test_fast_scalar_inplace_add_and_mul` — 4 dtypes (including int32, which must
+  keep falling through to the functional path) x 4 shapes including 0-dim, three
+  scalars each, both `add_` and `mul_`, asserting the returned object is the
+  input.
+* `test_fast_scalar_inplace_add_alpha_and_aliasing` — `alpha` folding, a
+  non-contiguous target that must decline into the strided path, and a row view
+  whose write must land in the parent's storage.
+* `test_fast_binary_add_above_last_level_cache` — 24000003 fp32 elements, 288 MB
+  of traffic, so `_bw_flat_blocks` takes the streaming arm; the count is not a
+  multiple of the 4-element vector, so the scalar tail rides that grid too.
+
+Independent-of-the-kernel checks used while developing, in the standalone probe:
+the register-staged forward was compared bitwise against the shipped kernel at
+the same block size (0 mismatches over 2.47e9 elements at [49152, 50304], and at
+(17, 50304), (101, 1027), (3, 8191), (5, 1), (300, 129)) and against a host
+fp64 reference (max relative error 3.9e-3, which is bf16 rounding). The staged
+backward was compared bitwise against the shipped 256-thread kernel: 0
+mismatches at every shape, worst absolute difference 0.0.
+
+## Regression checks, all on the shipped source
+
+| check | recorded | now |
+|---|---|---|
+| `tests/test_eager_kernels.py`, serial | 553 passed, 93 skipped, 1 failed | **645 passed, 93 skipped, 1 failed** (`test_bf16_v3_source_dependency_and_kernel_contract`, the recorded pre-existing hardcoded-source-list failure), 88 s |
+| `bench_attention_bmm` default / pattern / causal | 51.233 / 51.023 / 50.472 ms | **51.243 / 51.014 / 50.465**, 6/6 pass |
+| gate table x three variants | 15/15 pass | **15/15 pass**, NN 1.014/1.021/1.009, NT 0.943/0.947/0.942, TN 1.368/1.361/1.370 |
+| `ruff check` / `ruff format` on the two Python files touched | - | clean |
+
+## What is left in these five rows, in order
+
+1. `erf` in the GELU forward: ~90 us x 12 = 1.1 ms of pure transcendental, of
+   which the 0.478 ms gap to ROCm is the part that is a gap. Needs a cheaper
+   polynomial and a decision about matching CPU torch bit for bit.
+2. The 76 one-element `add_` kernels, 379 us: register
+   `aten::_foreach_add_.Scalar` for PrivateUse1 with a batched-descriptor
+   kernel, modelled on `fast_aten__foreach_mul__tensor`. ROCm does it in 10.4 us.
+3. The cast group's 1.66 ms: 7% in-process excess plus ~8 us/call over 148
+   calls, both already diagnosed in change 33 and neither addressed.
+4. The 7 ms of logits casting that both backends pay for autocast's
+   `nll_loss` promotion, which `half_to_float=True` was designed to delete.

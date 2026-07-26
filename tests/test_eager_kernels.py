@@ -2829,9 +2829,11 @@ def test_fast_scalar_inplace_add_and_mul(mojo_gpu, dtype, shape):
     if dtype.is_floating_point:
         base = torch.randn(shape, dtype=torch.float32).to(dtype)
     else:
-        base = torch.arange(1, math.prod(shape) + 1 if shape else 2).reshape(
-            shape if shape else ()
-        )[()].to(dtype)
+        base = (
+            torch.arange(1, math.prod(shape) + 1 if shape else 2)
+            .reshape(shape if shape else ())[()]
+            .to(dtype)
+        )
     # torch itself refuses a float scalar on an integer in-place op.
     scalars = (2.5, -1, 0.0) if dtype.is_floating_point else (3, -1, 2)
     for scalar in scalars:
