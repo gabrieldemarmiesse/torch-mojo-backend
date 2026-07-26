@@ -1892,7 +1892,9 @@ comptime NT_VEC = 8  # elements per global load and per LDS write
         Int32((BM // WM) * (BN // WN) * 64)
     ),
 )
-@__name(t"nt_mfma_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_l{MASK_LOAD}_t{MASK_STORE}")
+@__name(
+    t"nt_mfma_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_g{IGLP}_z{SWIZZLE}_p{SPLIT}_l{MASK_LOAD}_t{MASK_STORE}"
+)
 def _nt_mfma_kernel[
     dtype: DType,
     BM: Int,
@@ -1901,6 +1903,9 @@ def _nt_mfma_kernel[
     WM: Int,
     WN: Int,
     STAGES: Int,
+    IGLP: Int,
+    SWIZZLE: Bool,
+    SPLIT: Int,
     MASK_LOAD: Bool,
     MASK_STORE: Bool,
 ](
@@ -1916,11 +1921,23 @@ def _nt_mfma_kernel[
     comptime MT = WM // NT_MMA
     comptime NTL = WN // NT_MMA
     comptime KSTEPS = BK // NT_MMA_K
-    comptime PAD = BK + 4
+    # LDS row stride.  `SWIZZLE` trades the four-element pad for an XOR
+    # permutation of the four-element chunks within a row, which costs no LDS at
+    # all and is what lets two pipeline stages of a 256x256x32 tile fit in the
+    # 64 KB budget exactly.  `SW_SHIFT`/`SW_MASK` are derived below.
+    comptime PAD = BK if SWIZZLE else BK + 4
+    comptime CHUNKS = BK // 4  # four-element (one `ds_read_b64`) chunks per row
+    # A row occupies `BK/2` dwords.  When that is 16 mod 32 the row index itself
+    # already splits the 32 banks in two halves and the permutation only has to
+    # be injective within a parity class, so it is driven by `row >> 1`; when it
+    # is 0 mod 32 the row contributes nothing and the permutation must be
+    # injective over all 16 rows of an LDS cycle.
+    comptime SW_SHIFT = 1 if (BK // 2) % 32 == 16 else 0
+    comptime SW_MASK = CHUNKS - 1
     comptime TPR = BK // NT_VEC  # threads that cover one tile row
     comptime ROWS = THREADS // TPR  # tile rows filled per pass
-    comptime APASS = BM // ROWS
-    comptime BPASS = BN // ROWS
+    comptime APASS = ceildiv(BM, ROWS)
+    comptime BPASS = ceildiv(BN, ROWS)
     comptime SA = BM * PAD
     comptime SB = BN * PAD
 
@@ -1929,10 +1946,22 @@ def _nt_mfma_kernel[
         "the warp tile must be a whole number of MFMA tiles"
     )
     comptime assert THREADS >= TPR, "BK is wider than the block can cover"
-    comptime assert BM % ROWS == 0 and BN % ROWS == 0, (
-        "the tile-fill pass must cover BM and BN exactly"
-    )
     comptime assert STAGES == 1 or STAGES == 2, "STAGES is 1 or 2"
+    comptime if SWIZZLE:
+        # The permutation is a function of `row` only through
+        # `(row >> SW_SHIFT) & SW_MASK`, so every row offset a fill pass or an
+        # MFMA tile adds must be a multiple of its period for one precomputed
+        # value per lane to stay valid.
+        comptime SW_PERIOD = (SW_MASK + 1) << SW_SHIFT
+        comptime assert (BK // 2) % 32 == 0 or (BK // 2) % 32 == 16, (
+            "the swizzle is derived for LDS rows of 16 or 32 dwords"
+        )
+        comptime assert NT_MMA % SW_PERIOD == 0, (
+            "the MFMA tile stride must be a whole number of swizzle periods"
+        )
+        comptime assert (THREADS // TPR) % SW_PERIOD == 0, (
+            "the fill pass stride must be a whole number of swizzle periods"
+        )
 
     comptime if is_amd_gpu():
         var smem = stack_allocation[
@@ -1960,7 +1989,14 @@ def _nt_mfma_kernel[
         var a_ptr = a + ((m0 + trow) * k + tcol)
         var b_ptr = b + ((n0 + trow) * k + tcol)
         var pass_step = ROWS * k
+        # Where this thread's NT_VEC elements land in an LDS row.  Unswizzled
+        # that is just the k offset; swizzled it is two four-element chunks at
+        # XOR-permuted positions, so the store below is two `ds_write_b64`
+        # instead of one `ds_write_b128` -- the same bytes and the same LDS
+        # cycles, and no conditional half-swap.
         var lds_off = trow * PAD + tcol
+        var sw_w = (trow >> SW_SHIFT) & SW_MASK
+        var chunk0 = tcol // 4
 
         comptime LDSPtr = type_of(smem)
 
@@ -1970,46 +2006,75 @@ def _nt_mfma_kernel[
 
         var areg = stack_allocation[APASS * NT_VEC, dtype]()
         var breg = stack_allocation[BPASS * NT_VEC, dtype]()
+        comptime RegPtr = type_of(areg)
 
         @always_inline
         @parameter
         def _load(kt: Int):
-            """Global -> registers for k tile `kt`, then advance the pointers."""
-            comptime if not MASK_LOAD:
-                comptime for p in range(APASS):
-                    areg.store(
-                        p * NT_VEC, a_ptr.load[width=NT_VEC](p * pass_step)
-                    )
-                comptime for p in range(BPASS):
-                    breg.store(
-                        p * NT_VEC, b_ptr.load[width=NT_VEC](p * pass_step)
-                    )
-            else:
-                var kok = kt * BK + tcol < k
-                comptime for p in range(APASS):
-                    var v = SIMD[dtype, NT_VEC](0)
-                    if kok and m0 + trow + p * ROWS < m:
-                        v = a_ptr.load[width=NT_VEC](p * pass_step)
-                    areg.store(p * NT_VEC, v)
-                comptime for p in range(BPASS):
-                    var v = SIMD[dtype, NT_VEC](0)
-                    if kok and n0 + trow + p * ROWS < n:
-                        v = b_ptr.load[width=NT_VEC](p * pass_step)
-                    breg.store(p * NT_VEC, v)
+            """Global -> registers for k tile `kt`, then advance the pointers.
+
+            A pass covers `ROWS` tile rows.  When `ROWS` does not divide the tile
+            extent the last pass is partial, and its guard is compile-time
+            selected so the full passes stay branch-free.
+            """
+            var kok = True
+            comptime if MASK_LOAD:
+                kok = kt * BK + tcol < k
+            comptime for p in range(APASS):
+                var live = kok
+                comptime if (p + 1) * ROWS > BM:
+                    live = live and trow + p * ROWS < BM
+                comptime if MASK_LOAD:
+                    live = live and m0 + trow + p * ROWS < m
+                var v = SIMD[dtype, NT_VEC](0)
+                if live:
+                    v = a_ptr.load[width=NT_VEC](p * pass_step)
+                areg.store(p * NT_VEC, v)
+            comptime for p in range(BPASS):
+                var live = kok
+                comptime if (p + 1) * ROWS > BN:
+                    live = live and trow + p * ROWS < BN
+                comptime if MASK_LOAD:
+                    live = live and n0 + trow + p * ROWS < n
+                var v = SIMD[dtype, NT_VEC](0)
+                if live:
+                    v = b_ptr.load[width=NT_VEC](p * pass_step)
+                breg.store(p * NT_VEC, v)
             a_ptr += BK
             b_ptr += BK
 
         @always_inline
         @parameter
+        def _write_row(
+            dst: LDSPtr,
+            row_base: Int,
+            regs: RegPtr,
+            reg_off: Int,
+        ):
+            comptime if SWIZZLE:
+                comptime for h in range(NT_VEC // 4):
+                    dst.store(
+                        row_base + 4 * ((chunk0 + h) ^ sw_w),
+                        regs.load[width=4](reg_off + 4 * h),
+                    )
+            else:
+                dst.store(row_base + tcol, regs.load[width=NT_VEC](reg_off))
+
+        @always_inline
+        @parameter
         def _fill(pa: LDSPtr, pb: LDSPtr):
             comptime for p in range(APASS):
-                pa.store(
-                    lds_off + p * ROWS * PAD, areg.load[width=NT_VEC](p * NT_VEC)
-                )
+                comptime if (p + 1) * ROWS <= BM:
+                    _write_row(pa, (trow + p * ROWS) * PAD, areg, p * NT_VEC)
+                else:
+                    if trow + p * ROWS < BM:
+                        _write_row(pa, (trow + p * ROWS) * PAD, areg, p * NT_VEC)
             comptime for p in range(BPASS):
-                pb.store(
-                    lds_off + p * ROWS * PAD, breg.load[width=NT_VEC](p * NT_VEC)
-                )
+                comptime if (p + 1) * ROWS <= BN:
+                    _write_row(pb, (trow + p * ROWS) * PAD, breg, p * NT_VEC)
+                else:
+                    if trow + p * ROWS < BN:
+                        _write_row(pb, (trow + p * ROWS) * PAD, breg, p * NT_VEC)
 
         # Every fragment of the whole k tile, read from LDS in one burst before
         # any MFMA issues.  `MT * KSTEPS + NTL * KSTEPS` `ds_read_b64` is only
@@ -2022,29 +2087,36 @@ def _nt_mfma_kernel[
 
         @always_inline
         @parameter
-        def _read_frags(pa: LDSPtr, pb: LDSPtr):
-            var abase = (wm0 + lo) * PAD + 4 * hi
-            var bbase = (wn0 + lo) * PAD + 4 * hi
-            comptime for s in range(KSTEPS):
+        def _read_frags[S0: Int, S1: Int](pa: LDSPtr, pb: LDSPtr):
+            # A fragment is the four k elements `8s + 4*hi ..+4` of one tile row,
+            # i.e. chunk `2s + hi`, and `2s | hi == 2s ^ hi`, so the swizzled
+            # position is `4 * ((2s) ^ (hi ^ sw))` with `2s` a compile-time
+            # constant and `hi ^ sw` one precomputed value per lane.
+            var abase = (wm0 + lo) * PAD
+            var bbase = (wn0 + lo) * PAD
+            var t0 = hi ^ ((lo >> SW_SHIFT) & SW_MASK)
+            comptime if not SWIZZLE:
+                abase += 4 * hi
+                bbase += 4 * hi
+            comptime for s in range(S0, S1):
+                var kof = s * NT_MMA_K
+                comptime if SWIZZLE:
+                    kof = 4 * ((2 * s) ^ t0)
                 comptime for i in range(MT):
                     af.store(
                         (s * MT + i) * 4,
-                        pa.load[width=4](
-                            abase + i * NT_MMA * PAD + s * NT_MMA_K
-                        ),
+                        pa.load[width=4](abase + i * NT_MMA * PAD + kof),
                     )
                 comptime for j in range(NTL):
                     bf.store(
                         (s * NTL + j) * 4,
-                        pb.load[width=4](
-                            bbase + j * NT_MMA * PAD + s * NT_MMA_K
-                        ),
+                        pb.load[width=4](bbase + j * NT_MMA * PAD + kof),
                     )
 
         @always_inline
         @parameter
-        def _do_mma():
-            comptime for s in range(KSTEPS):
+        def _do_mma[S0: Int, S1: Int]():
+            comptime for s in range(S0, S1):
                 comptime for i in range(MT):
                     comptime for j in range(NTL):
                         var d = acc.load[width=16]((i * NTL + j) * 16)
@@ -2068,17 +2140,48 @@ def _nt_mfma_kernel[
 
         var kt = 0
         while kt + 1 < n_kt:
-            # Order matters and is the whole pipeline: this tile's fragments
-            # leave LDS first, then the next tile's global loads are issued,
-            # then LDS is refilled, and only then do the MFMAs run -- so the
-            # matrix work covers both the global latency and the LDS store.
-            _read_frags(ca, cb)
-            _load(kt + 1)
-            comptime if STAGES == 1:
-                # One buffer: the reads above must finish before it is refilled.
-                _nt_barrier()
-            _fill(na, nb)
-            _do_mma()
+            # Order matters and is measured, not assumed.  This tile's
+            # fragments leave LDS into registers first, the next tile's global
+            # loads are ISSUED next (so their latency runs under the barrier and
+            # the refill), the refill follows -- it is what waits on them -- and
+            # the MFMAs come last, filling the gap between the refill and the
+            # barrier that publishes it.  Moving the MFMAs ahead of the refill,
+            # which looks like the textbook order, measures 25% SLOWER
+            # (301 against 379 TFLOP/s at 49152x2304x768): it leaves only the
+            # vmcnt wait and the LDS stores between the two barriers, so the
+            # whole workgroup waits there in lockstep.
+            comptime if IGLP >= 0:
+                llvm_intrinsic["llvm.amdgcn.iglp.opt", NoneType](Int32(IGLP))
+            comptime HALF = KSTEPS // 2
+            comptime if SPLIT == 0:
+                _read_frags[0, KSTEPS](ca, cb)
+                _load(kt + 1)
+                comptime if STAGES == 1:
+                    _nt_barrier()
+                _fill(na, nb)
+                _do_mma[0, KSTEPS]()
+            elif SPLIT == 1:
+                # Half the matrix work is issued between the fragment reads and
+                # the LDS refill, so the refill's stores queue behind MFMAs
+                # rather than behind the reads they cannot overlap.
+                _read_frags[0, KSTEPS](ca, cb)
+                _load(kt + 1)
+                comptime if STAGES == 1:
+                    _nt_barrier()
+                _do_mma[0, HALF]()
+                _fill(na, nb)
+                _do_mma[HALF, KSTEPS]()
+            else:
+                # The second half of the reads is issued before the first half's
+                # MFMAs, so the LDS pipe and the matrix pipe are busy together.
+                _read_frags[0, HALF](ca, cb)
+                _load(kt + 1)
+                comptime if STAGES == 1:
+                    _nt_barrier()
+                _fill(na, nb)
+                _read_frags[HALF, KSTEPS](ca, cb)
+                _do_mma[0, HALF]()
+                _do_mma[HALF, KSTEPS]()
             _nt_barrier()
             comptime if STAGES == 2:
                 var ta = ca
@@ -2088,8 +2191,8 @@ def _nt_mfma_kernel[
                 cb = nb
                 nb = tb
             kt += 1
-        _read_frags(ca, cb)
-        _do_mma()
+        _read_frags[0, KSTEPS](ca, cb)
+        _do_mma[0, KSTEPS]()
 
         # Every accumulator is read and rounded HERE, unconditionally and in
         # straight-line code, and the fence below stops any of it from being
@@ -2146,6 +2249,9 @@ def _nt_mfma_gemm[
     WM: Int,
     WN: Int,
     STAGES: Int = 2,
+    IGLP: Int = -1,
+    SWIZZLE: Bool = False,
+    SPLIT: Int = 0,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -2164,7 +2270,9 @@ def _nt_mfma_gemm[
     comptime THREADS = (BM // WM) * (BN // WN) * 64
     if m % BM == 0 and n % BN == 0 and k % BK == 0:
         ctx.enqueue_function[
-            _nt_mfma_kernel[dtype, BM, BN, BK, WM, WN, STAGES, False, False]
+            _nt_mfma_kernel[
+                dtype, BM, BN, BK, WM, WN, STAGES, IGLP, SWIZZLE, SPLIT, False, False
+            ]
         ](
             _make_ptr[dtype](c_addr),
             _make_ptr[dtype](a_addr).as_immutable(),
@@ -2177,7 +2285,9 @@ def _nt_mfma_gemm[
         )
     else:
         ctx.enqueue_function[
-            _nt_mfma_kernel[dtype, BM, BN, BK, WM, WN, STAGES, True, True]
+            _nt_mfma_kernel[
+                dtype, BM, BN, BK, WM, WN, STAGES, IGLP, SWIZZLE, SPLIT, True, True
+            ]
         ](
             _make_ptr[dtype](c_addr),
             _make_ptr[dtype](a_addr).as_immutable(),
