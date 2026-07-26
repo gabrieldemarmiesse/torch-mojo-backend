@@ -155,6 +155,7 @@ _FUSED_ADAMW_RECORD_FIELDS = 7
 _FOREACH_CHUNK_ELEMENTS = 65_536
 _FOREACH_NORM_RECORD_FIELDS = 3
 _FOREACH_MUL_RECORD_FIELDS = 2
+_FOREACH_ADD_RECORD_FIELDS = 2
 
 
 def _t(x) -> TorchMojoTensor | None:
@@ -300,6 +301,51 @@ def _foreach_scalar_overlap_kind(tensor, scalar) -> str:
     ):
         return "full"
     return "partial"
+
+
+def fast_aten__foreach_add__scalar(self, scalar):
+    """One launch for `t += scalar` over a whole homogeneous float tensor list.
+
+    Without this ATen runs the CompositeExplicitAutograd fallback, a sequential
+    `add_.Scalar` per element of the list. nanoGPT's fused AdamW bumps 75
+    one-element step counters per step, so that is 75 launches to add 75 floats.
+    Anything this cannot serve -- a mixed dtype, a non-float dtype, a strided
+    tensor, a list whose members alias -- returns ``NOT_HANDLED`` and keeps that
+    fallback, which is also what defines the semantics being matched.
+    """
+    if len(self) == 0:
+        return NOT_HANDLED
+    if isinstance(scalar, bool) or not isinstance(scalar, int | float):
+        return NOT_HANDLED
+    tensors = [_t(tensor) for tensor in self]
+    if any(tensor is None for tensor in tensors):
+        return NOT_HANDLED
+    device = tensors[0]._device
+    dtype = tensors[0]._dtype
+    if (
+        device.api == "cpu"
+        or dtype not in _FLOAT_DTYPES
+        or any(
+            tensor._device != device
+            or tensor._dtype != dtype
+            or not tensor._is_contiguous
+            for tensor in tensors
+        )
+        # Duplicated or aliasing entries have to be applied once each, in
+        # order; one grid over the concatenation would race instead.
+        or _foreach_tensors_overlap(tensors)
+    ):
+        return NOT_HANDLED
+
+    metadata = tuple(
+        value for tensor in tensors for value in (tensor._ptr, tensor._numel)
+    )
+    if len(metadata) != len(tensors) * _FOREACH_ADD_RECORD_FIELDS:
+        raise AssertionError("invalid foreach add metadata packing")
+    eager_kernels.elementwise_ops.ForeachAddScalar(
+        metadata, float(scalar), dtype.value, _ctx_ptr(device)
+    )
+    return None
 
 
 def fast_aten__foreach_mul__tensor(self, other):

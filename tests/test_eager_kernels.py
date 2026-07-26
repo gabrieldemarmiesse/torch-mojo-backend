@@ -1359,6 +1359,137 @@ def test_fast_foreach_norm_preserves_strided_fallback(mojo_gpu):
         torch.testing.assert_close(actual_scalar.cpu(), expected_scalar)
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["f32", "f16", "bf16"]
+)
+def test_fast_foreach_add_scalar_inplace_chunk_boundary(mojo_gpu, dtype):
+    """One launch mutates every input exactly once, across the descriptor cap.
+
+    Sixty-six entries cross ``FOREACH_DESC_CAP`` (64) so the batching loop runs
+    twice, and the last input crosses ``FOREACH_CHUNK_ELEMENTS`` (65536) so one
+    tensor spans several blocks.
+    """
+    counter, calls_before = _eager_registration_snapshot("aten::_foreach_add_.Scalar")
+    host_inputs = [torch.empty(0, dtype=dtype)] + [
+        torch.tensor([float(index), -float(index)], dtype=dtype)
+        for index in range(1, 65)
+    ]
+    host_inputs.append(torch.linspace(-3.0, 4.0, 65_537).to(dtype))
+    device_inputs = [tensor.to(mojo_gpu) for tensor in host_inputs]
+    allocation_state = [
+        (tensor._holder, tensor._ptr, tensor._version) for tensor in device_inputs
+    ]
+
+    returned = torch.ops.aten._foreach_add_.Scalar(device_inputs, 1.5)
+
+    assert returned is None
+    assert counter.call_count == calls_before + 1
+    for actual, expected, (holder, ptr, version) in zip(
+        device_inputs, host_inputs, allocation_state, strict=True
+    ):
+        assert actual._holder is holder
+        assert actual._ptr == ptr
+        assert actual._version == version + 1
+        # The kernel widens to FP32, adds, and narrows -- exactly what the
+        # per-tensor `add_.Scalar` path it replaces does.
+        torch.testing.assert_close(
+            actual.cpu(),
+            ((expected.float() + 1.5).to(dtype)),
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_fast_foreach_add_scalar_all_empty_and_integer_scalar(mojo_gpu):
+    """Zero-work lists still record the mutation; an int scalar is accepted."""
+    counter, calls_before = _eager_registration_snapshot("aten::_foreach_add_.Scalar")
+    empties = [torch.empty(0, dtype=torch.float32).to(mojo_gpu) for _ in range(65)]
+    versions = [tensor._version for tensor in empties]
+
+    assert torch.ops.aten._foreach_add_.Scalar(empties, 1) is None
+
+    assert counter.call_count == calls_before + 1
+    assert [tensor._version for tensor in empties] == [v + 1 for v in versions]
+
+    values = [torch.tensor([1.0, 2.0]).to(mojo_gpu)]
+    torch.ops.aten._foreach_add_.Scalar(values, 3)
+    torch.testing.assert_close(
+        values[0].cpu(), torch.tensor([4.0, 5.0]), rtol=0, atol=0
+    )
+
+
+def test_fast_foreach_add_scalar_falls_back_where_it_must(mojo_gpu):
+    """Aliasing, strided, mixed-dtype and integer lists keep ATen's semantics.
+
+    Each of these would be wrong under one grid over the concatenation (a
+    duplicate must be added twice, in order) or is simply outside the kernel's
+    contract, so each has to reach the CompositeExplicitAutograd fallback and
+    still produce the right answer.
+    """
+    counter, calls_before = _eager_registration_snapshot("aten::_foreach_add_.Scalar")
+
+    duplicate = torch.tensor([2.0, -3.0, 5.0]).to(mojo_gpu)
+    version = duplicate._version
+    torch.ops.aten._foreach_add_.Scalar([duplicate, duplicate], 1.0)
+    assert duplicate._version == version + 2
+    torch.testing.assert_close(
+        duplicate.cpu(), torch.tensor([4.0, -1.0, 7.0]), rtol=0, atol=0
+    )
+
+    strided = torch.arange(12, dtype=torch.float32).reshape(3, 4).to(mojo_gpu).t()
+    torch.ops.aten._foreach_add_.Scalar([strided], 0.5)
+    torch.testing.assert_close(
+        strided.cpu(),
+        torch.arange(12, dtype=torch.float32).reshape(3, 4).t() + 0.5,
+    )
+
+    mixed = [
+        torch.tensor([1.0], dtype=torch.float32).to(mojo_gpu),
+        torch.tensor([1.0], dtype=torch.bfloat16).to(mojo_gpu),
+    ]
+    torch.ops.aten._foreach_add_.Scalar(mixed, 2.0)
+    assert mixed[0].cpu().item() == 3.0
+    assert mixed[1].cpu().item() == 3.0
+
+    integers = [torch.tensor([1, 2], dtype=torch.int64).to(mojo_gpu)]
+    torch.ops.aten._foreach_add_.Scalar(integers, 3)
+    torch.testing.assert_close(
+        integers[0].cpu(), torch.tensor([4, 5], dtype=torch.int64)
+    )
+
+    # Every one of the four went through the registered op.
+    assert counter.call_count == calls_before + 4
+
+
+def test_fast_foreach_add_scalar_matches_adamw_step_counters(mojo_gpu, monkeypatch):
+    """The shape AdamW actually asks for: 75 one-element FP32 counters.
+
+    Also the guard against the whole change being a no-op -- the bridge has to
+    be entered once per call, not once per tensor.
+    """
+    from torch_mojo_backend import eager_kernels
+
+    counter, calls_before = _eager_registration_snapshot("aten::_foreach_add_.Scalar")
+    original = eager_kernels.elementwise_ops.ForeachAddScalar
+    bridge_calls = []
+
+    def spy(metadata, scalar, dtype, ctx):
+        bridge_calls.append((len(metadata), scalar, dtype))
+        return original(metadata, scalar, dtype, ctx)
+
+    monkeypatch.setattr(eager_kernels.elementwise_ops, "ForeachAddScalar", spy)
+    steps = [torch.zeros((), dtype=torch.float32).to(mojo_gpu) for _ in range(75)]
+    for _ in range(3):
+        torch.ops.aten._foreach_add_.Scalar(steps, 1)
+
+    assert counter.call_count == calls_before + 3
+    assert len(bridge_calls) == 3
+    assert all(fields == 150 for fields, _, _ in bridge_calls)
+    for step in steps:
+        assert step.shape == torch.Size([])
+        assert step.cpu().item() == 3.0
+
+
 def test_fast_foreach_mul_tensor_inplace_chunk_boundary(mojo_gpu):
     """Every input keeps its allocation and receives exactly one mutation."""
     counter, calls_before = _eager_registration_snapshot("aten::_foreach_mul_.Tensor")
@@ -1995,6 +2126,76 @@ def test_fast_gelu_forward_bf16_direct_runtime_layout(
     torch.testing.assert_close(actual.cpu(), expected, atol=2e-2, rtol=2e-2)
 
 
+def _gelu_exact_reference(x: torch.Tensor) -> torch.Tensor:
+    """FP64 exact GELU with no cancellation, for use as a test oracle.
+
+    `torch.nn.functional.gelu(x.double())` is NOT usable as an oracle in the
+    negative tail: it computes `0.5*x*(1 + erf(x/sqrt2))`, and `1 + erf` is
+    quantized by the FP64 epsilon at 1.0, so it has lost half its significant
+    bits by x = -8 and all of them by x = -8.5.  The identity
+    `gelu(x) = relu(x) - 0.5*|x|*erfc(|x|/sqrt2)` never forms `1 - (1 - eps)`,
+    and `torch.special.erfc` keeps full relative accuracy out to the FP64
+    underflow, so this stays exact over the whole BF16 range.
+    """
+    wide = x.double()
+    magnitude = wide.abs()
+    correction = 0.5 * magnitude * torch.special.erfc(magnitude / math.sqrt(2.0))
+    return wide.clamp(min=0.0) - correction
+
+
+def test_fast_gelu_forward_bf16_exact_matches_double_reference(mojo_gpu):
+    """Every finite BF16 value in [-12.5, 12.5] rounds like the true exact GELU.
+
+    The exact path evaluates `relu(x) - 0.5*|x|*erfc(|x|/sqrt2)` from a fitted
+    log2-domain polynomial and one `exp2` rather than `0.5*x*(1+erf(x/sqrt2))`,
+    so the bound that matters is not "close to the previous kernel" but "rounds
+    to the same BF16 as the true function".
+
+    12.5 is where `exp2` reaches the smallest FP32 normal, so the last twelve
+    BF16 inputs before the answer underflows BF16 altogether (|x| in
+    [12.8, 13.5], true value under 1e-36) are outside the guarantee -- and are
+    still nearer the truth than the form this replaces, which returns exactly
+    zero for everything below x = -5.2.
+    """
+    values = torch.arange(0, 1 << 16, dtype=torch.int32).to(torch.uint16)
+    grid = values.view(torch.bfloat16)
+    grid = grid[torch.isfinite(grid) & (grid.abs() <= 12.5)].contiguous()
+    assert grid.numel() > 30000
+
+    actual = torch.nn.functional.gelu(grid.to(mojo_gpu), approximate="none").cpu()
+    reference = _gelu_exact_reference(grid).bfloat16()
+
+    actual_bits = actual.view(torch.int16).int()
+    reference_bits = reference.view(torch.int16).int()
+    differing = actual_bits != reference_bits
+    worst = int((actual_bits - reference_bits).abs().max())
+    assert worst <= 1, f"a BF16 result is {worst} ULP from the true exact GELU"
+    # The survivors are genuine round-to-nearest ties, not a systematic bias.
+    assert int(differing.sum()) <= 8, (
+        f"{int(differing.sum())} of {grid.numel()} BF16 values differ by 1 ULP"
+    )
+
+
+def test_fast_gelu_forward_bf16_exact_resolves_the_negative_tail(mojo_gpu):
+    """`0.5*x*(1 + erf)` loses the whole answer below x = -5; this must not.
+
+    In FP32 `1 + erf(x/sqrt2)` is quantized by the epsilon at 1.0, so any form
+    built on it returns exactly zero once `2*Phi(x)` drops under 1.2e-7, i.e.
+    from about x = -5.2 -- while BF16 still resolves the true value down to
+    x = -13.7.  This pins the property rather than the digits.
+    """
+    x = torch.arange(-12.5, -5.0, 0.0625, dtype=torch.bfloat16)
+    actual = torch.nn.functional.gelu(x.to(mojo_gpu), approximate="none").cpu()
+
+    assert bool((actual < 0).all()), "the negative tail collapsed to zero"
+    # Strictly decreasing in x over this range, i.e. the decay has the shape of
+    # the true function and not of a floor or a plateau.
+    assert bool((actual[1:].double() < actual[:-1].double()).all())
+    torch.testing.assert_close(
+        actual.double(), _gelu_exact_reference(x), rtol=8e-3, atol=0
+    )
+
+
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
 def test_fast_gelu_forward_bf16_cuda_special_semantics(mojo_h100, approximate):
     """Signed zero, non-finites, and mode probes use frozen H100 results."""
@@ -2023,7 +2224,15 @@ def test_fast_gelu_forward_bf16_cuda_special_semantics(mojo_h100, approximate):
     assert int(actual_bits[0]) == 0x0000
     assert int(actual_bits[1]) == 0x8000
     assert torch.isposinf(actual[2])
-    assert torch.isnan(actual[3])
+    if approximate == "tanh":
+        assert torch.isnan(actual[3])
+    else:
+        # CUDA's `0.5*x*(1 + erf(x/sqrt2))` reaches `-inf * 0` here and returns
+        # NaN. The exact path no longer forms that product -- it computes
+        # `relu(x) - 0.5*|x|*erfc(...)`, whose limit at -inf is the correct
+        # -0.0 -- so this one input diverges from CUDA, deliberately, and in
+        # the direction of the true function.
+        assert int(actual_bits[3]) == 0x8000
     assert torch.isnan(actual[4])
     expected_probes = (0x4002, 0x402F) if approximate == "none" else (0x4003, 0x4030)
     assert tuple(int(value) for value in actual_bits[-2:]) == expected_probes

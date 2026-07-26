@@ -821,6 +821,24 @@ def mojo_device_min_dim_min(
 _register_fast("aten::_adaptive_avg_pool2d", "fast_aten__adaptive_avg_pool2d")
 
 
+@register_aten_op("aten::_foreach_add_.Scalar")
+def mojo_device__foreach_add__scalar(self, scalar):
+    aten_fast = _fast()
+    result = aten_fast.fast_aten__foreach_add__scalar(self, scalar)
+    if result is aten_fast.NOT_HANDLED:
+        result = torch.ops.aten._foreach_add_.Scalar.redispatch(
+            _COMPOSITE_EXPLICIT_AUTOGRAD, self, scalar
+        )
+        # The redispatch runs below ADInplaceOrView, so the wrapper subclass
+        # needs the same manual TensorList version bump the kernel path does.
+        torch.autograd.graph.increment_version(self)
+        return result
+
+    # A mutable TensorList schema returning () gets no automatic version bump.
+    torch.autograd.graph.increment_version(self)
+    return None
+
+
 @register_aten_op("aten::_foreach_mul_.Tensor")
 def mojo_device__foreach_mul__tensor(self, other):
     aten_fast = _fast()

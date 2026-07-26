@@ -27,6 +27,7 @@ from std.math import (
     acos,
     atanh,
     ceil,
+    ceildiv,
     cos,
     cosh,
     erf,
@@ -56,6 +57,14 @@ from std.utils.numerics import isnan
 
 from std.algorithm.functional import elementwise
 
+from foreach_clip_contract import (
+    FOREACH_CHUNK_ELEMENTS,
+    FOREACH_DESC_CAP,
+    FOREACH_THREADS,
+    ForeachDesc,
+    empty_foreach_desc,
+)
+from foreach_clip_kernels import _chunk_bounds
 from op_utils import (
     FLOAT_DTYPES,
     GS_THREADS,
@@ -69,6 +78,7 @@ from op_utils import (
     _raw_int,
     _raw_ret_none,
     _raw_tuple_int,
+    _raw_tuple_len,
     _scratch_contig,
     _spec_ptr,
     _spec_result,
@@ -1103,6 +1113,128 @@ def _scalar_inplace_go[
     return _raw_ret_none()
 
 
+# Ints per tensor in the `ForeachAddScalar` metadata tuple: (address, numel).
+comptime _FOREACH_ADD_FIELDS = 2
+
+
+@__name(t"foreach_add_scalar_{dtype}_v1")
+def _foreach_add_scalar_kernel[
+    dtype: DType
+](
+    descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
+    desc_count: Int,
+    scalar: Float32,
+):
+    """`t += scalar`, in place, for a whole list of tensors in one launch.
+
+    One block per fixed-size chunk across the CONCATENATION of the list, so a
+    list of 75 one-element tensors and a list of one 75-million-element tensor
+    both land on a grid that describes the work rather than the list: the
+    descriptor's `chunk_end` is a running prefix sum of chunk counts, and
+    `_chunk_bounds` walks it to turn a flat block index back into (tensor,
+    range).  The arithmetic is the same widen-add-narrow that
+    `_scalar_elementwise[dtype, SOP_ADD]` does one tensor at a time, so the
+    result is bit-identical to the `add_.Scalar` path this replaces.
+    """
+    var chunk = Int(block_idx.x)
+    var desc, begin, end = _chunk_bounds(descs, desc_count, chunk)
+    var values = _make_ptr[dtype](desc.tensor_addr)
+    var index = begin + Int(thread_idx.x)
+    while index < end:
+        values[index] = (
+            values.load[width=1](index).cast[DType.float32]() + scalar
+        ).cast[dtype]()[0]
+        index += FOREACH_THREADS
+
+
+def _foreach_add_scalar_go(
+    metadata_o: PyObjectPtr,
+    scalar_o: PyObjectPtr,
+    dtype_o: PyObjectPtr,
+    ctx_o: PyObjectPtr,
+) raises -> PyObjectPtr:
+    """`aten::_foreach_add_.Scalar` for one contiguous float dtype.
+
+    Without a PrivateUse1 entry ATen runs the CompositeExplicitAutograd
+    fallback, which is a Python-level loop of `add_.Scalar`: nanoGPT's fused
+    AdamW bumps 75 one-element step counters per step and pays 75 launches for
+    75 additions.  The whole list is one launch here.
+    """
+    var dtype = _raw_dtype_int(dtype_o)
+    var supported = False
+    comptime for dt in FLOAT_DTYPES:
+        if dtype == dt:
+            supported = True
+    if not supported:
+        raise Error("mojo foreach add scalar: unsupported dtype ", dtype)
+    var fields = _raw_tuple_len(metadata_o)
+    if fields % _FOREACH_ADD_FIELDS != 0:
+        raise Error("mojo foreach add scalar: malformed metadata tuple")
+    var record_count = fields // _FOREACH_ADD_FIELDS
+    # ATen's mutable-TensorList contract is all-or-nothing, so every record is
+    # validated before the first launch rather than as it is consumed.
+    for record in range(record_count):
+        var base = record * _FOREACH_ADD_FIELDS
+        if _raw_tuple_int(metadata_o, base + 1) < 0:
+            raise Error("mojo foreach add scalar: negative numel")
+        if (
+            _raw_tuple_int(metadata_o, base + 1) > 0
+            and _raw_tuple_int(metadata_o, base) == 0
+        ):
+            raise Error("mojo foreach add scalar: null pointer")
+    var scalar = Float32(_raw_f64(scalar_o))
+    var ctx = _raw_ctx(ctx_o)
+
+    var record = 0
+    while record < record_count:
+        # `FOREACH_DESC_CAP` bounds ONE launch argument, not the list: a longer
+        # list is several launches of the same compiled kernel.
+        var descs = InlineArray[ForeachDesc, FOREACH_DESC_CAP](
+            fill=empty_foreach_desc()
+        )
+        var desc_count = 0
+        var total_chunks = 0
+        while record < record_count and desc_count < FOREACH_DESC_CAP:
+            var base = record * _FOREACH_ADD_FIELDS
+            var numel = _raw_tuple_int(metadata_o, base + 1)
+            if numel > 0:
+                total_chunks += ceildiv(numel, FOREACH_CHUNK_ELEMENTS)
+            descs[desc_count] = ForeachDesc(
+                _raw_tuple_int(metadata_o, base), 0, numel, total_chunks
+            )
+            record += 1
+            desc_count += 1
+        if total_chunks > 0:
+            comptime for dt in FLOAT_DTYPES:
+                if dtype == dt:
+                    _enqueue_cached[_foreach_add_scalar_kernel[dt]](
+                        ctx,
+                        String(t"foreach_add_scalar_{dt}_v1"),
+                        total_chunks,
+                        1,
+                        1,
+                        FOREACH_THREADS,
+                        descs,
+                        desc_count,
+                        scalar,
+                    )
+    return _raw_ret_none()
+
+
+def _foreach_add_scalar_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 4:
+            raise Error("ForeachAddScalar expects exactly four arguments")
+        return _foreach_add_scalar_go(args[0], args[1], args[2], args[3])
+    except e:
+        return _spec_unsupported(e)
+
+
 def _scalar_inplace_dispatcher[
     op_code: Int
 ](
@@ -1431,6 +1563,14 @@ def PyInit_elementwise_ops() abi("C") -> PythonObject:
             _scalar_inplace_dispatcher[SOP_MUL],
             "MulScalarInplace",
             docstring="(a_spec, scalar) -> None; a *= scalar, contiguous float",
+        )
+        b.def_py_c_function(
+            _foreach_add_scalar_dispatcher,
+            "ForeachAddScalar",
+            docstring=(
+                "((addr, numel) * n, scalar, dtype, ctx) -> None; "
+                "aten::_foreach_add_.Scalar over one contiguous float dtype"
+            ),
         )
         b.def_py_c_function(
             _int_scalar_spec_dispatcher[IOP_ADD],
