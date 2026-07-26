@@ -4317,16 +4317,6 @@ def _fused_fa_inputs(
         or not math.isfinite(float(scale))
     ):
         return None
-    # PyTorch aligns the causal mask TOP-LEFT for a non-square score matrix --
-    # query q attends keys 0..=q whatever seq_kv is (torch.nn.attention.bias
-    # calls this the "upper left causal bias").  These kernels were specified
-    # and tuned against BOTTOM-RIGHT alignment, q attends 0..=q+(seq_kv-seq_q),
-    # so for is_causal with unequal lengths they compute a different -- and by
-    # PyTorch's definition wrong -- masking.  The two coincide exactly when
-    # seq_q == seq_kv, which is self-attention and every nanoGPT call, so
-    # decline the rest to the decomposition rather than return a wrong answer.
-    if is_causal and seq_q != seq_kv:
-        return None
     return q, k, v
 
 

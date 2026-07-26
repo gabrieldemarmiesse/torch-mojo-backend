@@ -43,8 +43,9 @@ which is why `softmax_lse` is an argument.
   defect has shipped three times in this repository. `-Float32.MAX` fails the
   same way, since `Float32.MAX` is inf.
 * `is_causal` masks strictly above the diagonal aligned to the BOTTOM right, so
-  query row `q` attends key indices `0 ..= q + (seq_kv - seq_q)`. Equivalently,
-  key `j` is attended by query rows `max(0, j - (seq_kv - seq_q)) ..< seq_q`.
+  query row `q` attends key indices `0 ..= q`, whatever `seq_kv` is --
+  PyTorch's TOP-LEFT alignment. Equivalently, key `j` is attended by query
+  rows `j ..< seq_q`.
   Both directions matter here, because dK/dV iterate the other way round.
 
 ## Why there are two kernels, and which way each one transposes its score tile
@@ -239,7 +240,7 @@ def _bwd_dq_baseline[
 
     var limit = seq_kv
     if causal != 0:
-        limit = min(seq_kv, qi + (seq_kv - seq_q) + 1)
+        limit = min(seq_kv, qi + 1)
 
     # Every thread walks every key, so the whole block agrees on ds; the
     # head_dim axis is what is split across threads.
@@ -327,7 +328,7 @@ def _bwd_dkv_baseline[
     # Key j is attended by query rows from `first_q` upward.
     var first_q = 0
     if causal != 0:
-        first_q = max(0, j - (seq_kv - seq_q))
+        first_q = j
 
     for qi in range(first_q, seq_q):
         var q_row = q_base + qi * head_dim
@@ -435,7 +436,11 @@ def _bwd_dq_mfma[
         # x-fastest, so reversing x starts the long pole at t=0.
         var q_block = (Int(grid_dim.x) - 1 - Int(block_idx.x)) * BM
 
-        var delta = seq_kv - seq_q
+        # Top-left causal alignment, matching PyTorch: the diagonal is q == kv
+        # regardless of the length difference. This is 0 whenever
+        # seq_q == seq_kv, so every square self-attention shape is
+        # bit-identical to before.
+        var delta = 0
         var q_hi = min(q_block + BM - 1, seq_q - 1)
         var lim_hi = seq_kv
         var lim_lo = seq_kv
@@ -624,7 +629,7 @@ def _bwd_dq_mfma[
 
                     # ---- GEMM 3: dQ^T[d, q] += sum_kv K^T[d, kv] * dS^T[kv, q]
                     comptime for g in range(4):
-                        var b = ds_frag.slice[4, offset = g * 4]()
+                        var b = ds_frag.slice[4, offset=g * 4]()
                         comptime for dt in range(DT):
                             var acc = dq_acc.load[width=16]((dt * QT + qt) * 16)
                             mma(
@@ -673,7 +678,7 @@ def _bwd_dq_mfma[
                 comptime for g in range(4):
                     smem.store(
                         row * OPAD + 8 * g + 4 * hi,
-                        ob.slice[4, offset = g * 4](),
+                        ob.slice[4, offset=g * 4](),
                     )
             barrier()
             comptime for pz in range(OPASSES):
@@ -769,7 +774,11 @@ def _bwd_dkv_mfma[
         # Natural x order already puts the heaviest block first: under a causal
         # mask kv tile 0 is attended by every query.
         var kv_block = Int(block_idx.x) * BN
-        var delta = seq_kv - seq_q
+        # Top-left causal alignment, matching PyTorch: the diagonal is q == kv
+        # regardless of the length difference. This is 0 whenever
+        # seq_q == seq_kv, so every square self-attention shape is
+        # bit-identical to before.
+        var delta = 0
 
         var hd = head_dim
         comptime if EXACT:
@@ -951,11 +960,9 @@ def _bwd_dkv_mfma[
                             kv_lane + kt * 32 - delta
                         )
                         s_acc = qv.ge(need).select(s_acc, NEG_BIG)
-                    var pv = exp2(
-                        s_acc.fma(SIMD[DType.float32, 16](sl), nl_v)
-                    )
-                    var dsv = pv * (p_acc - dd_v) * SIMD[DType.float32, 16](
-                        scale
+                    var pv = exp2(s_acc.fma(SIMD[DType.float32, 16](sl), nl_v))
+                    var dsv = (
+                        pv * (p_acc - dd_v) * SIMD[DType.float32, 16](scale)
                     )
                     var p_frag = _pack_half[dtype, 16](pv)
                     var ds_frag = _pack_half[dtype, 16](dsv)
@@ -963,8 +970,8 @@ def _bwd_dkv_mfma[
                     # ---- GEMM 3/4: dV^T[d, kv] += dO^T[d, q] * P[q, kv]
                     #                dK^T[d, kv] += Q^T[d, q] * dS[q, kv]
                     comptime for g in range(4):
-                        var bp = p_frag.slice[4, offset = g * 4]()
-                        var bd = ds_frag.slice[4, offset = g * 4]()
+                        var bp = p_frag.slice[4, offset=g * 4]()
+                        var bd = ds_frag.slice[4, offset=g * 4]()
                         comptime for dt in range(DT):
                             var toff = (
                                 (dt * 32 + lo) * TPAD + mt * 32 + 8 * g + 4 * hi
@@ -1013,7 +1020,7 @@ def _bwd_dkv_mfma[
                     comptime for g in range(4):
                         smem.store(
                             row * OPAD + 8 * g + 4 * hi,
-                            ob.slice[4, offset = g * 4](),
+                            ob.slice[4, offset=g * 4](),
                         )
                 barrier()
                 comptime for pz in range(OPASSES):
@@ -1063,9 +1070,7 @@ def _enqueue_mfma_pair[
     causal: Int,
     ctx: DeviceContext,
 ) raises:
-    ctx.enqueue_function[
-        _bwd_dkv_mfma[dtype, HD, BM, KT, EXACT, WPE_KV, IGLP]
-    ](
+    ctx.enqueue_function[_bwd_dkv_mfma[dtype, HD, BM, KT, EXACT, WPE_KV, IGLP]](
         dk,
         dv,
         grad_output,

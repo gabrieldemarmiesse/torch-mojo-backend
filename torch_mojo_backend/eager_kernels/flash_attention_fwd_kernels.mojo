@@ -24,7 +24,7 @@ Invariants any replacement must keep:
   through the block reduction. That defect has been shipped twice in this
   repository; the harness's NaN counter exists because of it.
 * `is_causal` masks strictly above the diagonal aligned to the BOTTOM right, so
-  query row `q` attends to key indices `0 ..= q + (seq_kv - seq_q)`. That is
+  query row `q` attends to key indices `0 ..= q`, whatever `seq_kv` is. That is
   PyTorch's convention for `is_causal=True` and it matters when
   `seq_kv != seq_q`.
 
@@ -214,7 +214,7 @@ def _flash_attention_fwd_baseline[
     # Bottom-right aligned causal mask, PyTorch's `is_causal=True` convention.
     var limit = seq_kv
     if causal != 0:
-        limit = min(seq_kv, qi + (seq_kv - seq_q) + 1)
+        limit = min(seq_kv, qi + 1)
 
     var running_max = Float32.MIN_FINITE
     var running_sum = Float32(0.0)
@@ -352,7 +352,11 @@ def _fa_mfma[
         # x-fastest, so reversing x starts the long pole at t=0.
         var q_block = (Int(grid_dim.x) - 1 - Int(block_idx.x)) * BM
 
-        var delta = seq_kv - seq_q
+        # Top-left causal alignment, matching PyTorch: the diagonal is q == kv
+        # regardless of the length difference. This is 0 whenever
+        # seq_q == seq_kv, so every square self-attention shape is
+        # bit-identical to before.
+        var delta = 0
         var q_hi = min(q_block + BM - 1, seq_q - 1)
         var lim_hi = seq_kv
         var lim_lo = seq_kv

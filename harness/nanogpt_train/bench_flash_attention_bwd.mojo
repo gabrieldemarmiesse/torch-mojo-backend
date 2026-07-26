@@ -177,7 +177,7 @@ def _setup_forward[
     var kv_base = bh * seq_kv * head_dim
     var limit = seq_kv
     if causal != 0:
-        limit = min(seq_kv, qi + (seq_kv - seq_q) + 1)
+        limit = min(seq_kv, qi + 1)
 
     var m = Float32.MIN_FINITE
     for j in range(limit):
@@ -246,7 +246,7 @@ def _ref_dq[
     var kv_base = bh * seq_kv * head_dim
     var limit = seq_kv
     if causal != 0:
-        limit = min(seq_kv, qi + (seq_kv - seq_q) + 1)
+        limit = min(seq_kv, qi + 1)
 
     var row_d = Float32(0.0)
     for e in range(head_dim):
@@ -312,7 +312,7 @@ def _ref_dkv[
         ref_dv[kv_row + e] = 0.0
     var first_q = 0
     if causal != 0:
-        first_q = max(0, j - (seq_kv - seq_q))
+        first_q = j
 
     for qi in range(first_q, seq_q):
         var q_row = q_base + qi * head_dim

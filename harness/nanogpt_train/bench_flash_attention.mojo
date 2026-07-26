@@ -206,7 +206,7 @@ def _reference_kernel[
 
     var limit = seq_kv
     if causal != 0:
-        limit = min(seq_kv, qi + (seq_kv - seq_q) + 1)
+        limit = min(seq_kv, qi + 1)
 
     # Pass 1: the maximum score.
     var m = Float32.MIN_FINITE
