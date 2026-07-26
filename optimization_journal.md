@@ -3237,3 +3237,248 @@ What is left, in the order the evidence supports:
   A stream-K assignment, where a workgroup that draws several slabs of the SAME
   output tile accumulates them in registers and writes one partial, would cut
   both the workspace and the epilogue; not attempted.
+
+# nanoGPT NN (data-gradient Linear) GEMM, MI300X — 2026-07-26
+
+Fifth pass over `harness/nanogpt_train/bench_linear_gemm.mojo`, one variant:
+**NN**, `C(m,n) = A(m,k) @ B(k,n)` with both operands in their natural dense
+row-major layout, the `dgrad` role, five shapes all with `m = 49152`. NN already
+ran on the hand-written MFMA core the NT and TN passes built, so the entry state
+was **1.098 per case** (25.366 ms/step against PyTorch-ROCm's 23.099) at 397-536
+TFLOP/s. NT 1.097 and TN 1.422 are the regression check.
+
+Protocol: >= 25 warmups and >= 100 individually synchronized iterations, one case
+per process for every number quoted as per-case (`scripts/percase_variants.py`),
+timing never from a `--pmc` run, every extent a runtime value.
+
+## What the NN kernel actually spends, measured
+
+Two things had to be established before anything could be aimed at.
+
+**The clock and the MFMA floor.** `rocm-smi` during a `lm_head_dgrad` run reports
+a sustained 1327-1396 MHz, so the cycle accounting below uses 1.395 GHz and the
+BF16 peak is 304 x 2048 x 1.395e9 = 868 TFLOP/s. Per k tile per CU the geometry
+costs 256 `v_mfma_f32_32x32x8_bf16` over 4 SIMDs at 32 cycles = **2048 cycles**;
+that is the floor.
+
+**The split between per-k-tile and per-output-tile cost.** Sweeping k at fixed
+(m, n) = (49152, 768), one case per process, gives a straight line: k = 32 / 64 /
+128 / 256 / 768 measures 42.27 / 47.26 / 55.46 / 71.90 / 139.71 us. Its slope is
+4.24 us per k tile over the two workgroup rounds this grid takes, i.e.
+**C = 2960-3070 cycles per k tile**, and its intercept is 19 us per round, i.e.
+**E = 26,500 cycles per output tile**. `rocprofv3` on the same k = 32 point gives
+a kernel time of 31.47 us against the harness's 42.65, so **every harness number
+carries about 11 us of launch-and-synchronize overhead**; `scripts/rocm_gemm_reference.py`
+times PyTorch the same way (per-iteration `torch.cuda.synchronize`), so the
+comparison is fair, but it is 8% of `attn_c_proj_dgrad`'s 139 us and worth
+knowing.
+
+E is essentially the output write and is not addressable: at k = 32 the kernel
+does one k tile of MFMA (1.5 us) and writes 38 MB per round in 15.7 us, i.e.
+2.8 TB/s, against 3.27 TB/s for the harness's own `_fill_const` on a comparable
+buffer. The whole recoverable part of E across the five shapes is about 1.4% of
+NN, and only by widening the epilogue's 64-byte stores, which the accumulator
+layout (lane = one output column) cannot do without an LDS transpose.
+
+C decomposes by ablation -- each variant keeps the register and instruction
+structure and only deletes work, so the results are wrong but the timings are
+meaningful. On (49152, 768, 12288), 384 k tiles, two rounds:
+
+| loop body | us | TFLOP/s | what it says |
+|---|---:|---:|---|
+| shipped at entry | 1774.8 | 522.7 | |
+| fragment reads halved | 1834.8 | - | LDS reads are **not** the bottleneck |
+| no `s_barrier` | 1597.5 | - | the barrier is 230 cycles/k tile |
+| no global load, no LDS refill | 1443.1 | 643 | the refill path is 431 cycles/k tile |
+| ... and no fragment reads either | 1270.6 | 730 | pure MFMA ceiling for this kernel |
+
+So the ceiling this geometry can reach is **730 TFLOP/s** at the measured 94.7%
+grid fill (771 at full fill, consistent with the 810 MFMA-only microbenchmark),
+the fragment reads cost 8% of it, and the global-load-plus-refill-plus-barrier
+group costs 20%. That last group is what the change below attacks.
+
+## Change 30 — a k-pair native LDS tile for the one-native layouts
+
+**Hypothesis.** Journal change 29 derived `PAIR` as "both operands native" because
+with only one native operand it measured +3 to +4.9% on the split-K weight
+gradients. But the same entry recorded it as **-0.5 to -2.9% on exactly the
+grid-filling data gradients this pass is about**, and the reason is countable:
+the unpaired native tile reads a fragment as four `ds_read_u16`, and a two-byte
+read still occupies a whole LDS bank slot, so 64 lanes take two LDS cycles to
+move 128 bytes -- half the rate of a `ds_read_b64`. Four of them are eight cycles
+where the journal's derivation assumed four, plus two `v_perm_b32` to pack. The
+pair layout makes the fragment two `ds_read_b32` (which LLVM merges into one
+`ds_read2_b32`), the same 512 bytes in four cycles, and no packing.
+
+**Predicted effect.** B's fragment reads drop from 1024 to 512 LDS cycles per CU
+per k tile and 16 `v_perm_b32` per wave disappear.
+
+**Measured effect.** `PAIR` became a kernel parameter instead of a derived
+constant, and `_dense_mfma_route` chooses it per branch: `PAIR_FILL` (the
+grid-filled branch, which is every NN dgrad) is "either operand native",
+`PAIR_SPLIT` (the split-K branch, which is every harness-TN wgrad) keeps "both
+native". Counters on the result: 15 LDS instructions per 16 MFMA per wave, zero
+bank conflicts, and **VGPR 128 with 20 bytes of scratch -> VGPR 120 with none**.
+
+NN 1.098 -> 1.088 per case; NT and TN unchanged (1.097 -> 1.099, 1.422 -> 1.424).
+
+**Decision.** Accept. The regime split is the one change 29 already measured; it
+is recorded here as a per-branch parameter rather than a derived constant so the
+two callers can differ.
+
+## Change 31 — refill the next LDS stage in the MIDDLE of the MFMA sequence
+
+**Hypothesis.** The ablation above says the refill path costs 431 cycles per k
+tile, and the ISA says why. With the refill placed after the fragment reads and
+before all sixteen MFMAs, the body ends with `s_waitcnt vmcnt`, three
+`ds_write`s, one MFMA, `s_waitcnt lgkmcnt(0)` and the barrier: the LDS write
+traffic and the wait for it are a **tail with nothing left to cover them**. Put
+the refill after half the MFMAs instead. A wave issues one MFMA per 128 cycles
+(four waves share a SIMD's matrix pipe at 32 cycles each), so eight MFMAs in is
+about a thousand cycles after the global loads issued -- late enough that they
+have landed -- and the writes then retire under the remaining eight.
+
+**Predicted effect.** The 431-cycle group shrinks; nothing else moves.
+
+**Measured effect.** A sharp optimum, one case per process, NN weighted:
+
+| k steps of MFMA before the refill (of four) | NN |
+|---:|---:|
+| 0 (the shipped order) | 1.085 |
+| 1 | 1.085 |
+| **2** | **1.057** |
+| 3 | 1.086 |
+
+Splitting the refill further -- A's two `ds_write_b64` at step 2 and B's
+`ds_write_b128` at step 3 -- measures 1.058, i.e. nothing. Moving `_load` to the
+top of the body or into the middle next to the refill measures within 0.3% of
+the winner in both directions: the compiler already hoists the global loads to
+the top of a tight body.
+
+The optimum is layout-dependent, so the position is a per-route parameter
+`FILL_AT`. NT (`_nt_mfma_route`, both operands k-major, twice as many
+`ds_read_b64` and no `v_perm` in the body) measures **1.116 at 2 against 1.094 at
+0**, and keeps 0. NN and TN (`_dense_mfma_route`) take 2.
+
+**Decision.** Accept, parameterized.
+
+## What was tried and rejected, with numbers
+
+Every one of these was built and measured one case per process on the five NN
+shapes; the figure is the NN weighted ratio unless stated.
+
+* **Unrolling the k loop by two so the LDS stage bases become compile-time
+  offsets.** The whole 64 KB LDS budget fits the 16-bit unsigned `ds_read`
+  immediate, so the unrolled body needs **zero** `v_lshl_add_u32` address
+  instructions against 28 per wave per k tile rolled, with no spill (VGPR 128,
+  scratch 0). It measures **1.149** rolled-1.085, and 1.235 / 1.634 for NT / TN.
+  Pinning the global loads at the top of the body with a `sched.barrier(0)` makes
+  it worse still (1.183). Retried on top of change 31 it measures 1.166 against
+  1.057. The address VALU is not on the critical path, and a single tight body is
+  what lets the scheduler place a tile's global loads a whole body ahead of the
+  `ds_write` that consumes them; in the unrolled ISA they sit two instructions in
+  front of it.
+* **Prefetching the global loads a whole k tile ahead** (the refill of stage
+  `next` consumes registers loaded in the previous trip, so the `vmcnt` wait is
+  a full k tile old). It costs 8 live VGPRs across the MFMA phase, which at 120
+  used is nominally free and in practice is not: the allocator spills **32 VGPRs
+  and 132 bytes of scratch**. Measured before change 31 it improved C by 3.7%
+  and inflated E by 19,500 cycles per output tile, for a net 1.085 -> 1.128;
+  peeling the last trip instead of guarding the pointer bump measures 1.216; on
+  top of change 31 it measures 1.190.
+* **Reading the fragments one k step ahead of the MFMA that needs them** instead
+  of in one burst, which halves their peak register footprint from 32 VGPRs to
+  16 and would have made room for the prefetch above: **1.094** against 1.057.
+* **`s_setprio(1)` around each MFMA burst and `s_setprio(0)` around the refill**,
+  which is what MAX's ping-pong matmul does: **1.223** against 1.057.
+* **XCD band count.** The shipped value is the runtime XCD count, 8. One case per
+  process, NN weighted: 1 -> 1.0919, 2 -> 1.0973, 4 -> 1.0838, 8 -> 1.0853.
+  Within the run-to-run spread; not changed.
+* **Stream-K, rejected analytically and recorded because it is the obvious
+  move.** Every NN shape has an output grid that is 94.7% of a whole number of
+  workgroup rounds -- 576 tiles on 304 CUs is 1.895, 2304 is 7.579 -- and that
+  5.3% is real: the same kernel on (51712, 768, 2304), whose 606 tiles are 99.7%
+  of two rounds, measures 501 TFLOP/s, and on (77824, 768, 2304), exactly three
+  rounds, 508, against 479 for the 49152 shape. It is also not fixable by tile
+  choice: for m = 49152, n = 768 the fraction is 94.7% for **every** tile shape
+  and residency, because halving the tile area doubles both the tile count and
+  the resident count. Stream-K is therefore the only route, and its fixup does
+  not pay at this tile: balancing 576 tiles over 304 workgroups splits about 272
+  of them, each partial is a 256x256 FP32 tile of 256 KB, and 155 MB of extra
+  write-then-read at the 4.6 TB/s change 27 measured for exactly this traffic is
+  34 us against the 19 us the balance saves.
+
+## Where NN ended
+
+Per case, one case per process, 25 warmups and 100 synchronized iterations:
+
+| case | rocm us | before | after | ratio | TFLOP/s |
+|---|---:|---:|---:|---:|---:|
+| attn_c_attn_dgrad | 343.44 | 363.31 | 359.58 | 1.047 | 484 |
+| attn_c_proj_dgrad | 141.38 | 145.91 | 139.49 | **0.987** | 416 |
+| mlp_c_fc_dgrad | 434.10 | 473.10 | 461.05 | 1.062 | 503 |
+| mlp_c_proj_dgrad | 467.98 | 541.04 | 523.19 | 1.118 | 443 |
+| lm_head_dgrad | 6456.53 | 7085.20 | 6726.87 | 1.042 | 565 |
+
+**NN 1.098 -> 1.062 per case** (1.066 with `--pattern-check=1`, 1.060 with
+`--chunk-check=1`), 1.065 on the harness's own table. Fifteen of fifteen cases
+pass all three gates on all three runs. The 1.03 bar is **not** met; the shortfall
+is 3.1%.
+
+Regression checks, all after the change, one case per process:
+
+| check | before | after |
+|---|---|---|
+| `bench_linear_gemm` NT | 1.097 | **1.094** (1.113 pattern, 1.099 chunk) |
+| `bench_linear_gemm` TN (harness) | 1.422 | **1.417** (1.412 pattern, 1.416 chunk) |
+| copy-free TN, five wgrad shapes, direct | - | -0.3% to +1.0%, all exact |
+| GPT-2 decode NN and NT, m512, six shapes | - | -5.3% to +1.0% |
+| GPT-2 prefill NN and NT, m4096, seven shapes | - | -5.2% to +0.3% |
+| NT grid-fill gate shapes, three | - | -0.3% to +0.1% |
+| ten non-multiple extents x three gates | - | all exact |
+| `bench_attention_bmm` default / pattern / causal | 51.217 / 51.022 / 50.462 ms | 51.234 / 51.037 / 50.490, 6/6 pass |
+
+## Correction to the record: what the copy-free TN route is worth
+
+The TN pass recorded "the remaining GEMM is 25.3 ms against 23.3, i.e. 1.084".
+That figure is the harness total minus the materialization, so it is the
+**materialized** GEMM (A k-major, split-K), not the copy-free route
+`_tn_mfma_route` actually takes in production. Timed directly, one shape per
+process, 25 warmups and 100 synchronized iterations, every output element
+checked:
+
+| shape | copy-free GEMM us |
+|---|---:|
+| (2304, 768, 49152) | 485.97 |
+| (768, 768, 49152) | 171.65 |
+| (3072, 768, 49152) | 507.83 |
+| (768, 3072, 49152) | 507.34 |
+| (50304, 768, 49152) | 7337.34 |
+
+Weighted by calls per step that is **27.41 ms against PyTorch-ROCm's 23.30, i.e.
+1.176** for the GEMM alone -- not 1.084. The copy-free route saves 17% against
+the harness's 33.0 ms of copy-plus-GEMM, which is consistent with the 1.422 ->
+1.323 the production measurement showed and with the copy being a smaller share
+of production than of the harness.
+
+## What is left, in the order the evidence supports
+
+* **The 20% between 537 and 672 TFLOP/s: the global load, the LDS refill and the
+  barrier.** Change 31 took part of it. The rest needs either a global-to-LDS DMA
+  (`global_load_lds`, which forces a lane-linear LDS layout the swizzled and
+  paired tiles do not have) or a deeper prefetch, and every deeper-prefetch form
+  tried runs into the 128-VGPR wall: at four waves per SIMD a 1024-thread
+  workgroup cannot exceed it, and 120 are already in use.
+* **The A tile's 64-byte global rows.** At BK = 32 an A tile row is 64 bytes,
+  half of a 128-byte line, and the other half is the next k tile's -- but the two
+  tiles' working set is 48 KB against a 32 KB vector L1, so it is evicted first.
+  NT, where BOTH operands have 64-byte rows and the working set is 64 KB,
+  measures 15% slower per k tile than NN on matched shapes, which is the
+  circumstantial evidence. Fixing it means an A tile that spans 64 k in LDS
+  (256x64x2 = 32 KB single-buffered, with B double-buffered at 32 KB), which adds
+  a third barrier per two k tiles and needs the k loop to alternate -- and every
+  alternating form measured 10-20% slower.
+* **The 5.3% of grid quantization**, closed above.
+* **The output write, 2.8 TB/s against 3.27.** Worth about 1.4% of NN and needs
+  an LDS transpose in the epilogue, which is the region the gfx942 MFMA-read
+  miscompile (journal D8) lives in.
