@@ -1944,29 +1944,52 @@ def _nt_mfma_kernel[
     comptime TPR = BK // NT_VEC  # threads that cover one tile row
     comptime ROWS = THREADS // TPR  # tile rows filled per pass
     # A NON-k-major operand lives in a `(k, X)` buffer, so its global rows run
-    # along the non-contraction axis and the LDS tile keeps that native shape:
-    # `BK` rows of `BX` elements.  The fill is then the same wide vector load and
-    # the same wide LDS store as the k-major case, and it is the MFMA fragment
-    # read that pays -- four `ds_read_u16` at stride `BX` instead of one
-    # `ds_read_b64`.  That is the cheap side of the trade: the global tile is read
-    # once per k tile while the LDS tile is read once per wave-row and once per
-    # wave-column, but a `u16` read of 64 lanes is 128 bytes and an LDS cycle is
-    # 128 bytes, so four of them move exactly the bytes one `ds_read_b64` does,
-    # in the same four cycles, and only the instruction count grows.
+    # along the non-contraction axis.  Turning its LDS tile k-major would put the
+    # transpose on the GLOBAL side, where a lane can only fetch two bytes per row
+    # and the load instruction count grows eightfold; leaving the tile native
+    # puts it on the LDS side, where the tile is read four times over but each
+    # access is cheap.
     #
-    # The two accesses would otherwise collide in the banks: the fragment's four
-    # elements are `BX` apart and `4 * BX * 2` bytes is a multiple of 128, so the
-    # `hi` half-wave (which reads `k + 4`) would land on the banks the `lo` half
-    # already holds.  Permuting the row by `x ^ (32 * ((k >> 2) & 1))` -- one XOR,
-    # no padding, no extra LDS -- makes the two halves disjoint, and because
-    # `(k >> 2) & 1` is exactly the `hi` of the fragment that reads it, the read
-    # side computes the permutation with one XOR too.
-    comptime XPA = BM // NT_VEC  # threads covering one native-A k row
-    comptime XPB = BN // NT_VEC
-    comptime LRA = THREADS // XPA if XPA <= THREADS else 1  # k rows per pass
+    # The layout is `BK/2` rows of `2 * BX` elements, holding the k PAIR
+    # `(2p, 2p+1)` of column `x` adjacent at `2x`.  That is what makes the
+    # fragment read whole: an MFMA operand is four consecutive k of one column,
+    # i.e. two adjacent pairs, so it is exactly two `ds_read_b32` whose two dwords
+    # ARE the operand register pair -- no shifting, no `v_perm`, no packing at
+    # all.  The one-element-per-row alternative needs four `ds_read_u16` and the
+    # packing to go with them; measured with both operands native, that is 1.79x
+    # the VALU count and 100 bytes of scratch per thread.
+    #
+    # Both accesses are bank-optimal with no padding and no permutation.  A
+    # fragment read is dword `p * BX + x`: `BX` is a multiple of 32 so the pair
+    # row drops out, the `lo` half-wave covers all 32 banks through `x`, and the
+    # `hi` half-wave covers them again at different addresses -- 64 dwords over
+    # 32 banks in the two cycles 256 bytes take anyway.  A fill write is
+    # `ds_write_b128` at dword `p * BX + x` with `x` a multiple of NT_HVEC, which
+    # is eight lanes per bank over 1024 bytes: also exactly the floor.
+    #
+    # Whether to pair is MEASURED, not assumed, and it splits on how many
+    # operands are native.  With both native (TN) the pair layout is worth
+    # 40%: 257 -> 360 TFLOP/s at (2304, 768, 49152) and 343 -> 517 at
+    # (50304, 768, 49152), and it is what turns the copy-free transposed-A route
+    # from 15-18% SLOWER than materializing A^T into 15-25% faster.  With one
+    # native operand it is a wash that goes the wrong way on the shapes that
+    # matter here: -0.5 to -2.9% on the grid-filling data gradients but +3 to
+    # +4.9% on the split-K weight gradients (403.6 -> 423.3 us of GEMM at
+    # (2304, 768, 49152)), because it trades one 16-byte global load for two
+    # 8-byte ones and an interleave to halve LDS reads that were not binding.
+    comptime PAIR = not A_KMAJOR and not B_KMAJOR
+    comptime NT_HVEC = NT_VEC // 2 if PAIR else NT_VEC
+    comptime NROWS = 2 if PAIR else 1  # k rows one fill vector spans
+    comptime XPA = BM // NT_HVEC  # threads covering one native-A fill row
+    comptime XPB = BN // NT_HVEC
+    comptime LRA = THREADS // XPA if XPA <= THREADS else 1  # fill rows per pass
     comptime LRB = THREADS // XPB if XPB <= THREADS else 1
-    comptime APASS = ceildiv(BM, ROWS) if A_KMAJOR else ceildiv(BK, LRA)
-    comptime BPASS = ceildiv(BN, ROWS) if B_KMAJOR else ceildiv(BK, LRB)
+    comptime APASS = (
+        ceildiv(BM, ROWS) if A_KMAJOR else ceildiv(BK // NROWS, LRA)
+    )
+    comptime BPASS = (
+        ceildiv(BN, ROWS) if B_KMAJOR else ceildiv(BK // NROWS, LRB)
+    )
     comptime SA = BM * (PAD if A_KMAJOR else BK)
     comptime SB = BN * (PAD if B_KMAJOR else BK)
 
@@ -1976,20 +1999,21 @@ def _nt_mfma_kernel[
     ), "the warp tile must be a whole number of MFMA tiles"
     comptime assert THREADS >= TPR, "BK is wider than the block can cover"
     comptime assert STAGES == 1 or STAGES == 2, "STAGES is 1 or 2"
-    comptime if not A_KMAJOR:
+    comptime if PAIR:
+        comptime assert BK % 2 == 0, "a paired native tile pairs adjacent k"
         comptime assert (
-            BM % 64 == 0
-        ), "the native-layout row permutation needs a tile of at least 64"
+            NT_MMA_K % 4 == 0
+        ), "an MFMA fragment must be a whole number of k pairs"
+    comptime if not A_KMAJOR:
+        comptime assert BM % 32 == 0, "a native tile row must span the banks"
         comptime assert (
             XPA <= THREADS and THREADS % XPA == 0
-        ), "the block must cover a whole number of native-A rows"
+        ), "the block must cover a whole number of native-A pair rows"
     comptime if not B_KMAJOR:
-        comptime assert (
-            BN % 64 == 0
-        ), "the native-layout row permutation needs a tile of at least 64"
+        comptime assert BN % 32 == 0, "a native tile row must span the banks"
         comptime assert (
             XPB <= THREADS and THREADS % XPB == 0
-        ), "the block must cover a whole number of native-B rows"
+        ), "the block must cover a whole number of native-B pair rows"
     comptime if SWIZZLE:
         # The permutation is a function of `row` only through
         # `(row >> SW_SHIFT) & SW_MASK`, so every row offset a fill pass or an
@@ -2086,31 +2110,31 @@ def _nt_mfma_kernel[
         var trow = tid // TPR
         var tcol = (tid % TPR) * NT_VEC
         var pass_step = ROWS * k
-        # Tile fill, native operand: one thread reads NT_VEC contiguous
-        # non-contraction elements of one k row, so `BX / NT_VEC` adjacent
-        # threads cover a whole tile row of 2*BX bytes and the block covers
-        # `THREADS / (BX / NT_VEC)` k rows per pass.
+        # Tile fill, native operand: one thread reads NT_HVEC contiguous
+        # non-contraction elements from EACH of the two k rows of one pair, so
+        # `BX / NT_HVEC` adjacent threads cover a whole pair row and the block
+        # covers `THREADS / (BX / NT_HVEC)` pairs per pass.
         var akr = tid // XPA
-        var axc = (tid % XPA) * NT_VEC
+        var axc = (tid % XPA) * NT_HVEC
         var bkr = tid // XPB
-        var bxc = (tid % XPB) * NT_VEC
+        var bxc = (tid % XPB) * NT_HVEC
         var k0 = slab * k_per
         var a_ptr = a + (
             (m0 + trow) * k
             + tcol
-            + k0 if A_KMAJOR else (k0 + akr) * m
+            + k0 if A_KMAJOR else (k0 + NROWS * akr) * m
             + m0
             + axc
         )
         var b_ptr = b + (
             (n0 + trow) * k
             + tcol
-            + k0 if B_KMAJOR else (k0 + bkr) * n
+            + k0 if B_KMAJOR else (k0 + NROWS * bkr) * n
             + n0
             + bxc
         )
-        var a_pass = pass_step if A_KMAJOR else LRA * m
-        var b_pass = pass_step if B_KMAJOR else LRB * n
+        var a_pass = pass_step if A_KMAJOR else NROWS * LRA * m
+        var b_pass = pass_step if B_KMAJOR else NROWS * LRB * n
         var a_step = BK if A_KMAJOR else BK * m
         var b_step = BK if B_KMAJOR else BK * n
         # Where this thread's NT_VEC elements land in an LDS row.  Unswizzled
@@ -2158,22 +2182,35 @@ def _nt_mfma_kernel[
             else:
                 comptime for p in range(APASS):
                     var live = True
-                    comptime if (p + 1) * LRA > BK:
-                        live = akr + p * LRA < BK
-                    comptime if MASK_LOAD:
-                        live = live and k0 + kt * BK + akr + p * LRA < k
+                    comptime if (p + 1) * LRA > BK // NROWS:
+                        live = akr + p * LRA < BK // NROWS
                     comptime if MASK_LOAD:
                         # `m % NT_VEC == 0` is a precondition of the native-A
-                        # route, so a NT_VEC vector at a NT_VEC-aligned offset is
-                        # wholly inside the extent or wholly outside it: one
-                        # guard, no per-element tail.  A tail written as eight
-                        # predicated scalar loads costs 144 bytes of scratch per
-                        # thread and measures 3.2x slower.
-                        live = live and m0 + axc < m
-                    var v = SIMD[dtype, NT_VEC](0)
+                        # route, so a fill vector at an aligned offset is wholly
+                        # inside the extent or wholly outside it: one guard, no
+                        # per-element tail.  A tail written as predicated scalar
+                        # loads costs 144 bytes of scratch per thread and
+                        # measures 3.2x slower.
+                        live = (
+                            live
+                            and m0 + axc < m
+                            and k0
+                            + kt * BK
+                            + NROWS * (akr + p * LRA)
+                            + NROWS
+                            - 1
+                            < k
+                        )
+                    var v0 = SIMD[dtype, NT_HVEC](0)
                     if live:
-                        v = a_ptr.load[width=NT_VEC](p * a_pass)
-                    areg.store(p * NT_VEC, v)
+                        v0 = a_ptr.load[width=NT_HVEC](p * a_pass)
+                    comptime if PAIR:
+                        var v1 = SIMD[dtype, NT_HVEC](0)
+                        if live:
+                            v1 = a_ptr.load[width=NT_HVEC](p * a_pass + m)
+                        areg.store(p * NT_VEC, v0.interleave(v1))
+                    else:
+                        areg.store(p * NT_VEC, v0)
             comptime if B_KMAJOR:
                 comptime for p in range(BPASS):
                     var live = kok
@@ -2188,16 +2225,29 @@ def _nt_mfma_kernel[
             else:
                 comptime for p in range(BPASS):
                     var live = True
-                    comptime if (p + 1) * LRB > BK:
-                        live = bkr + p * LRB < BK
+                    comptime if (p + 1) * LRB > BK // NROWS:
+                        live = bkr + p * LRB < BK // NROWS
                     comptime if MASK_LOAD:
-                        live = live and k0 + kt * BK + bkr + p * LRB < k
-                    comptime if MASK_LOAD:
-                        live = live and n0 + bxc < n
-                    var v = SIMD[dtype, NT_VEC](0)
+                        live = (
+                            live
+                            and n0 + bxc < n
+                            and k0
+                            + kt * BK
+                            + NROWS * (bkr + p * LRB)
+                            + NROWS
+                            - 1
+                            < k
+                        )
+                    var v0 = SIMD[dtype, NT_HVEC](0)
                     if live:
-                        v = b_ptr.load[width=NT_VEC](p * b_pass)
-                    breg.store(p * NT_VEC, v)
+                        v0 = b_ptr.load[width=NT_HVEC](p * b_pass)
+                    comptime if PAIR:
+                        var v1 = SIMD[dtype, NT_HVEC](0)
+                        if live:
+                            v1 = b_ptr.load[width=NT_HVEC](p * b_pass + n)
+                        breg.store(p * NT_VEC, v0.interleave(v1))
+                    else:
+                        breg.store(p * NT_VEC, v0)
             a_ptr += a_step
             b_ptr += b_step
 
@@ -2218,18 +2268,32 @@ def _nt_mfma_kernel[
             else:
                 dst.store(row_base + tcol, regs.load[width=NT_VEC](reg_off))
 
-        # A native tile row is written whole: `x ^ (32 * ((k >> 2) & 1))` keeps
-        # the NT_VEC elements contiguous (the XOR only moves bit 5 and NT_VEC
-        # divides 32), so it is still one `ds_write_b128`.
+        # The interleaved k pair lands contiguously at `2 * x` of pair row `p`,
+        # so the whole NT_VEC is still one `ds_write_b128`.
         @always_inline
         @parameter
         def _write_native(
-            dst: LDSPtr, row: Int, xcol: Int, w: Int, regs: RegPtr, reg_off: Int
+            dst: LDSPtr,
+            pair: Int,
+            xcol: Int,
+            w: Int,
+            regs: RegPtr,
+            reg_off: Int,
         ):
-            dst.store(
-                row * w + (xcol ^ (32 * ((row >> 2) & 1))),
-                regs.load[width=NT_VEC](reg_off),
-            )
+            comptime if PAIR:
+                dst.store(
+                    pair * 2 * w + 2 * xcol, regs.load[width=NT_VEC](reg_off)
+                )
+            else:
+                # Unpaired, the fragment's four elements are `BX` apart and
+                # `4 * BX * 2` bytes is a multiple of 128, so the `hi` half-wave
+                # would land on the banks the `lo` half already holds.  Permuting
+                # the row by `x ^ (32 * ((k >> 2) & 1))` costs no LDS and makes
+                # them disjoint, and `(k >> 2) & 1` is exactly the reader's `hi`.
+                dst.store(
+                    pair * w + (xcol ^ (32 * ((pair >> 2) & 1))),
+                    regs.load[width=NT_VEC](reg_off),
+                )
 
         @always_inline
         @parameter
@@ -2247,12 +2311,12 @@ def _nt_mfma_kernel[
                             )
             else:
                 comptime for p in range(APASS):
-                    comptime if (p + 1) * LRA <= BK:
+                    comptime if (p + 1) * LRA <= BK // NROWS:
                         _write_native(
                             pa, akr + p * LRA, axc, BM, areg, p * NT_VEC
                         )
                     else:
-                        if akr + p * LRA < BK:
+                        if akr + p * LRA < BK // NROWS:
                             _write_native(
                                 pa, akr + p * LRA, axc, BM, areg, p * NT_VEC
                             )
@@ -2269,12 +2333,12 @@ def _nt_mfma_kernel[
                             )
             else:
                 comptime for p in range(BPASS):
-                    comptime if (p + 1) * LRB <= BK:
+                    comptime if (p + 1) * LRB <= BK // NROWS:
                         _write_native(
                             pb, bkr + p * LRB, bxc, BN, breg, p * NT_VEC
                         )
                     else:
-                        if bkr + p * LRB < BK:
+                        if bkr + p * LRB < BK // NROWS:
                             _write_native(
                                 pb, bkr + p * LRB, bxc, BN, breg, p * NT_VEC
                             )
@@ -2301,12 +2365,12 @@ def _nt_mfma_kernel[
             comptime if not SWIZZLE:
                 abase += 4 * hi
                 bbase += 4 * hi
-            # Native side: the fragment's four elements are `BX` apart, and the
-            # row permutation puts tile `i` of this wave at 32-element block
-            # `(wx0 / 32 + i) ^ hi`.  `4 * hi * BX + lo` is the rest of the
-            # lane's offset and is loop-invariant.
-            var anb = 4 * hi * BM + lo
-            var bnb = 4 * hi * BN + lo
+            # Native side: the fragment is two adjacent k pairs of one column,
+            # so it is two `SIMD[dtype, 2]` whose concatenation IS the operand
+            # register pair.  Pair row `4s + 2*hi`, column `wx0 + 32i + lo`; the
+            # `hi` term and the lane column are loop-invariant.
+            var anb = 4 * hi * BM + (NROWS * (wm0 + lo) if PAIR else lo)
+            var bnb = 4 * hi * BN + (NROWS * (wn0 + lo) if PAIR else lo)
             var aq = wm0 // NT_MMA
             var bq = wn0 // NT_MMA
             comptime for s in range(S0, S1):
@@ -2321,12 +2385,27 @@ def _nt_mfma_kernel[
                         )
                     else:
                         var base = (
-                            s * NT_MMA_K * BM + anb + NT_MMA * ((aq + i) ^ hi)
+                            s * NT_MMA_K * BM
+                            + anb
+                            + (
+                                2
+                                * i
+                                * NT_MMA if PAIR else NT_MMA
+                                * ((aq + i) ^ hi)
+                            )
                         )
-                        var v = SIMD[dtype, 4]()
-                        comptime for e in range(4):
-                            v[e] = pa[base + e * BM]
-                        af.store((s * MT + i) * 4, v)
+                        comptime if PAIR:
+                            af.store(
+                                (s * MT + i) * 4,
+                                pa.load[width=2](base).join(
+                                    pa.load[width=2](base + 2 * BM)
+                                ),
+                            )
+                        else:
+                            var v = SIMD[dtype, 4]()
+                            comptime for e in range(4):
+                                v[e] = pa[base + e * BM]
+                            af.store((s * MT + i) * 4, v)
                 comptime for j in range(NTL):
                     comptime if B_KMAJOR:
                         bf.store(
@@ -2335,12 +2414,27 @@ def _nt_mfma_kernel[
                         )
                     else:
                         var base = (
-                            s * NT_MMA_K * BN + bnb + NT_MMA * ((bq + j) ^ hi)
+                            s * NT_MMA_K * BN
+                            + bnb
+                            + (
+                                2
+                                * j
+                                * NT_MMA if PAIR else NT_MMA
+                                * ((bq + j) ^ hi)
+                            )
                         )
-                        var v = SIMD[dtype, 4]()
-                        comptime for e in range(4):
-                            v[e] = pb[base + e * BN]
-                        bf.store((s * NTL + j) * 4, v)
+                        comptime if PAIR:
+                            bf.store(
+                                (s * NTL + j) * 4,
+                                pb.load[width=2](base).join(
+                                    pb.load[width=2](base + 2 * BN)
+                                ),
+                            )
+                        else:
+                            var v = SIMD[dtype, 4]()
+                            comptime for e in range(4):
+                                v[e] = pb[base + e * BN]
+                            bf.store((s * NTL + j) * 4, v)
 
         @always_inline
         @parameter
@@ -2616,8 +2710,8 @@ def _nt_mfma_route[
 
 
 @always_inline
-def _nn_mfma_route[
-    dtype: DType
+def _dense_mfma_route[
+    dtype: DType, A_KMAJOR: Bool, B_KMAJOR: Bool
 ](
     c_addr: Int,
     a_addr: Int,
@@ -2627,24 +2721,32 @@ def _nn_mfma_route[
     k: Int,
     ctx: DeviceContext,
 ) raises -> Bool:
-    """The same MFMA core for `C = A(m,k) @ B(k,n)`, both operands dense.
+    """The same MFMA core for any combination of dense operand layouts.
 
-    Only B changes: it lives in a `(k, n)` buffer, so its global rows run along
-    n and its LDS tile keeps that native shape instead of being turned k-major.
-    See `_nt_mfma_kernel`'s `B_KMAJOR` comment for why that costs nothing in LDS
-    bytes or cycles -- four `ds_read_u16` per fragment move the same 512 bytes in
-    the same four LDS cycles as one `ds_read_b64`, and the row permutation keeps
-    both halves of the wave in disjoint banks.
+    `A_KMAJOR` says A is `(m, k)` and `B_KMAJOR` says B is `(n, k)`; the other
+    way round the operand lives in a `(k, X)` buffer, its global rows run along
+    the non-contraction axis, and its LDS tile keeps that native shape.  See
+    `_nt_mfma_kernel` for why that costs nothing in LDS bytes or cycles -- four
+    `ds_read_u16` per fragment move the same 512 bytes in the same four LDS
+    cycles as one `ds_read_b64`, and the row permutation keeps both halves of the
+    wave in disjoint banks.  Measured with `SQ_LDS_BANK_CONFLICT`: zero.
 
-    The gate is `_nt_mfma_route`'s: one workgroup of this tile is resident per
-    CU, so a grid that does not cover the device leaves CUs idle for the whole k
-    loop and the caller's existing route is better.
+    Three layouts reach this: NT (both k-major), NN (B native) and TN (both
+    native, the weight gradient reading A straight out of its `(k, m)` buffer
+    with no materialization at all).
+
+    One workgroup of this tile is resident per CU, so an output grid that does
+    not cover the device leaves CUs idle for the whole k loop; that regime is
+    split along K below, and below THAT the route declines and the caller keeps
+    its own.
     """
-    # A's 16-byte rows run along k and B's along n, so each operand's own row
-    # length is what has to keep every tile row aligned.
+    # Each operand's 16-byte rows run along its own contiguous axis, so it is
+    # that axis's length that has to keep every tile row aligned.
+    var alen = k if A_KMAJOR else m
+    var blen = k if B_KMAJOR else n
     if (
-        k % NT_VEC != 0
-        or n % NT_VEC != 0
+        alen % NT_VEC != 0
+        or blen % NT_VEC != 0
         or a_addr % 16 != 0
         or b_addr % 16 != 0
     ):
@@ -2653,29 +2755,26 @@ def _nn_mfma_route[
     var xcds = max(1, cus // 38)
     var tiles = ceildiv(m, 256) * ceildiv(n, 256)
     if tiles >= cus:
-        _nt_mfma_gemm[dtype, 256, 256, 32, 64, 64, 2, True, True, False](
+        _nt_mfma_gemm[dtype, 256, 256, 32, 64, 64, 2, True, A_KMAJOR, B_KMAJOR](
             c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx
         )
         return True
     # Underfilled output grid, deep contraction: slabs of K are the only axis
-    # left.  Exactly ONE workgroup of this tile is resident per CU -- sixteen
-    # wave64 and the whole 64 KB of LDS -- so the split is capped at `cus`
-    # workgroups: past that a second wave of workgroups is serialized and the
-    # extra FP32 workspace traffic buys nothing.  Every slab must be a whole
-    # number of K tiles (`k % (parts * BK) == 0`), or the slabs would not cover
-    # K exactly, and deep enough that its own pipeline fill stays a small
-    # fraction of its work.
-    if m < 256 or n < 256 or c_addr % 8 != 0:
+    # left.  Pick the slab count by cost rather than by a fill threshold.  Slabs
+    # of a tile this large serialize in whole waves of `cus` workgroups, so the
+    # GEMM costs `ceil(tiles * parts / cus)` waves of `ktiles / parts` k tiles
+    # each -- which is why a slab count that leaves a ragged last wave can beat a
+    # smaller one that fits in a single partial wave -- and the reduction costs
+    # one FP32 read of the whole workspace.  `NT_KTILE_CYC` is the measured cost
+    # of one k tile in one workgroup (diagnostic experiment AD: 3995 cycles at
+    # 256x256x32) and the reduction is charged at roughly 4 TB/s spread over the
+    # device.  Every term is a runtime value, and `parts` must divide the k tile
+    # count exactly or the slabs would not cover K.
+    # Every slab must be a whole number of k tiles, which needs BK to divide k
+    # in the first place; a k it does not divide keeps the unsplit route, whose
+    # guarded instantiation handles the partial tile.
+    if m < 256 or n < 256 or c_addr % 8 != 0 or k % 32 != 0:
         return False
-    # Pick the slab count by cost rather than by a fill threshold.  Slabs of a
-    # tile this large serialize in whole waves of `cus` workgroups, so the GEMM
-    # costs `ceil(tiles * parts / cus)` waves of `ktiles / parts` k tiles each --
-    # which is why a slab count that leaves a ragged last wave can beat a smaller
-    # one that fits in a single partial wave -- and the reduction costs one FP32
-    # read of the whole workspace.  `NT_KTILE_CYC` is the measured cost of one k
-    # tile in one workgroup (diagnostic experiment AD: 3995 cycles at
-    # 256x256x32), and the reduction is charged at roughly 4 TB/s spread over the
-    # device.  Every term is a runtime value.
     comptime NT_KTILE_CYC = 4000
     var ktiles = k // 32
     var parts = 1
@@ -2701,8 +2800,8 @@ def _nn_mfma_route[
         64,
         2,
         True,
-        True,
-        False,
+        A_KMAJOR,
+        B_KMAJOR,
         True,
         DType.float32,
     ](
@@ -2732,6 +2831,39 @@ def _nn_mfma_route[
     )
     _ = ws^
     return True
+
+
+@always_inline
+def _leading_trivial(a: TensorSpec) -> Bool:
+    """True when only the two innermost dims of `a` are non-trivial."""
+    for d in range(MAX_RANK - 2):
+        if a.shape[d] != 1:
+            return False
+    return True
+
+
+@always_inline
+def _tn_mfma_route[
+    dtype: DType
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """`C(m,n) = A(m,k) @ B(k,n)` with A read straight from its `(k, m)` buffer.
+
+    This is the weight gradient, and it is the one layout where the existing
+    dispatch had no kernel at all: it materialized A^T first, which costs a full
+    read and write of A that PyTorch-ROCm never pays.  Both operands are native
+    here, which is exactly the case the LDS tile shape above was written for.
+    """
+    return _dense_mfma_route[dtype, False, False](
+        c_addr, a_addr, b_addr, m, n, k, ctx
+    )
 
 
 @always_inline
@@ -2865,7 +2997,9 @@ def _amd_dynamic_mfma_dispatch[
             # tile left native instead of turned k-major.  It declines unless its
             # output grid covers the device, so the split-K and macro-tile routes
             # below still own the underfilled shapes.
-            if _nn_mfma_route[dtype](c_addr, a_addr, b_addr, m, n, k, ctx):
+            if _dense_mfma_route[dtype, True, False](
+                c_addr, a_addr, b_addr, m, n, k, ctx
+            ):
                 return True
             if k >= 8192 and m >= 128 and n % 128 == 0 and c_addr % 8 == 0:
                 var splitk_parts = _splitk_parts(
@@ -5303,6 +5437,30 @@ def _matmul_spec_operands_launch(
         )
         _ = tmp_b^
     elif b.contig:
+        # A strided A whose two innermost strides are `(1, lda)` is a transposed
+        # view: A^T is the dense `(k, lda)` buffer, and this is the weight
+        # gradient.  The MFMA route reads it in place, which removes a full read
+        # and write of A that PyTorch-ROCm never pays -- measured against
+        # materializing A^T and running the dense route, one shape per process:
+        # (2304, 768, 49152) 575.8 -> 483.6 us, (768, 768, 49152) 197.7 -> 171.7,
+        # (3072, 768, 49152) 661.4 -> 509.1, (768, 3072, 49152) 527.1 -> 508.8,
+        # (50304, 768, 49152) 9600.5 -> 7369.0.  It declines whenever its grid
+        # cannot cover the device even split along K, and then the copy runs as
+        # before.
+        comptime if _accelerator_arch() == "amdgpu:gfx942":
+            if (
+                not has_bias
+                and batch == 1
+                and transpose_b == 0
+                and a.dtype == DType.bfloat16
+                and a.strides[MAX_RANK - 2] == 1
+                and a.strides[MAX_RANK - 1] == m
+                and _leading_trivial(a)
+            ):
+                if _tn_mfma_route[DType.bfloat16](
+                    c_addr, a.ptr, b.ptr, m, n, k, ctx
+                ):
+                    return
         var tmp_a = _scratch_contig(a, ctx)
         _matmul_spec_launch(
             a.dtype,
