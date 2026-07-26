@@ -4033,12 +4033,19 @@ instead costs nothing and there is no arm worth specializing.
 | `Copies / dtype casts / layout` | 11.42 ms | 14.86 (1.30x) | **12.84 (1.12x)** |
 | SDPA forward | 9.07 | 6.82 | 6.84 |
 | SDPA backward | 33.96 | 28.38 | 28.57 |
-| FA forward harness | | 0.761x | 0.758x |
-| FA backward harness | | 0.997x | 0.999x |
 
 p10/p90 do not overlap, so the 1.39 ms is real. The strided store is free on the
 forward (+12 us/step over twelve layers) and costs +261 us/step on the backward's
 dQ kernel, against 1833.7 recovered.
+
+The harnesses' dense `nanogpt` case, three runs each alternating between a
+binary built at HEAD and one built here: forward 517.8 / 517.9 / 518.5 against
+518.5 / 518.3 / 517.8, i.e. 0.762x either way and indistinguishable; backward
+2406.1 / 2406.7 / 2409.7 against 2411.0 / 2412.8 / 2414.4, 0.997x -> 0.999x, so
++5 us/layer for the three extra kernarg structs. (The 0.758x / 0.989x recorded in
+the previous entry were single runs from an earlier session; HEAD re-measures
+0.762x / 0.997x today, so read the pairs above rather than the difference from
+those.)
 
 **The gfx942 masked-tile schedule is a lottery, and it is worth 10-20%.** The
 first version of this change measured the dQ kernel at 9869 us/step against
