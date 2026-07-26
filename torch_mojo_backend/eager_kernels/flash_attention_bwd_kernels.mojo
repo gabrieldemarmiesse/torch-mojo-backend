@@ -507,7 +507,6 @@ def _bwd_dq_mfma[
         var t_kvg0 = tid // HD
         var k_ptr = key + (kv_base + k_row0 * hd + k_col)
         var v_ptr = value + (kv_base + k_row0 * hd + k_col)
-        var t_ptr = key + (kv_base + t_kvg0 * 4 * hd + t_col)
         var tile_step = BN * hd
         var k_lds0 = k_row0 * KPAD + k_col
         var t_lds0 = t_col * TPAD + t_kvg0 * 4
@@ -521,7 +520,11 @@ def _bwd_dq_mfma[
             comptime if MASKED:
                 full = kv0 + BN <= seq_kv
 
-            # ---- Stage K and V row-major, and K transposed. ----
+            # ---- Stage K and V row-major. Every global read of the tile is
+            # ISSUED BEFORE any of them is consumed, so the tile pays one memory
+            # round trip rather than one per load-then-write group.
+            var kreg = stack_allocation[KITERS * 8, dtype]()
+            var vreg = stack_allocation[KITERS * 8, dtype]()
             if full:
                 comptime for ci in range(KITERS):
                     var kvals = SIMD[dtype, 8](0)
@@ -537,22 +540,8 @@ def _bwd_dq_mfma[
                             vvals = v_ptr.load[width=8](
                                 ci * KROW_STEP * head_dim
                             )
-                    k_smem.store(k_lds0 + ci * KROW_STEP * KPAD, kvals)
-                    v_smem.store(k_lds0 + ci * KROW_STEP * KPAD, vvals)
-                comptime for ti in range(TITERS):
-                    var tv = SIMD[dtype, 4](0)
-                    var live = True
-                    comptime if not EXACT:
-                        live = t_col < head_dim
-                    if live:
-                        comptime for j in range(4):
-                            comptime if EXACT:
-                                tv[j] = t_ptr[(ti * TKV_STEP * 4 + j) * HD]
-                            else:
-                                tv[j] = t_ptr[
-                                    (ti * TKV_STEP * 4 + j) * head_dim
-                                ]
-                    kt_smem.store(t_lds0 + ti * TKV_STEP * 4, tv)
+                    kreg.store(ci * 8, kvals)
+                    vreg.store(ci * 8, vvals)
             else:
                 comptime for ci in range(KITERS):
                     var row = min(kv0 + k_row0 + ci * KROW_STEP, last_row)
@@ -561,21 +550,30 @@ def _bwd_dq_mfma[
                     if EXACT or k_col < head_dim:
                         kvals = key.load[width=8](kv_base + row * hd + k_col)
                         vvals = value.load[width=8](kv_base + row * hd + k_col)
-                    k_smem.store(k_lds0 + ci * KROW_STEP * KPAD, kvals)
-                    v_smem.store(k_lds0 + ci * KROW_STEP * KPAD, vvals)
-                comptime for ti in range(TITERS):
-                    var tv = SIMD[dtype, 4](0)
-                    if EXACT or t_col < head_dim:
-                        var g = kv0 + (t_kvg0 + ti * TKV_STEP) * 4
-                        comptime for j in range(4):
-                            tv[j] = key[
-                                kv_base + min(g + j, last_row) * hd + t_col
-                            ]
-                    kt_smem.store(t_lds0 + ti * TKV_STEP * 4, tv)
+                    kreg.store(ci * 8, kvals)
+                    vreg.store(ci * 8, vvals)
+            comptime for ci in range(KITERS):
+                k_smem.store(
+                    k_lds0 + ci * KROW_STEP * KPAD, kreg.load[width=8](ci * 8)
+                )
+                v_smem.store(
+                    k_lds0 + ci * KROW_STEP * KPAD, vreg.load[width=8](ci * 8)
+                )
 
             k_ptr += tile_step
             v_ptr += tile_step
-            t_ptr += tile_step
+            barrier()
+
+            # ---- K^T comes out of the row-major K tile, not out of a second
+            # pass over global memory: four `ds_read_u16` at one head-dim column
+            # are 128 contiguous bytes per wavefront and cost no memory round
+            # trip, where the transposing global loader cost four more of them.
+            comptime for ti in range(TITERS):
+                var kv0l = (t_kvg0 + ti * TKV_STEP) * 4
+                var tv = SIMD[dtype, 4](0)
+                comptime for j in range(4):
+                    tv[j] = k_smem[(kv0l + j) * KPAD + t_col]
+                kt_smem.store(t_lds0 + ti * TKV_STEP * 4, tv)
             barrier()
 
             llvm_intrinsic["llvm.amdgcn.iglp.opt", NoneType](Int32(IGLP))
@@ -836,11 +834,17 @@ def _bwd_dkv_mfma[
             comptime if MASKED:
                 full = q0 + BM <= seq_q
 
-            # ---- Stage Q and dO row-major, Q^T and dO^T transposed, and the
-            # per-row `[-lse*log2e, D]` pair.
+            # ---- Every global read of the tile is ISSUED BEFORE any of them is
+            # consumed. With one workgroup per CU and one wave per SIMD there is
+            # nothing else to hide a memory round trip behind, so a loader that
+            # interleaves loads with the LDS writes that consume them pays the
+            # full latency once per group; batching pays it once per tile.
+            var qreg = stack_allocation[QITERS * 8, dtype]()
+            var greg = stack_allocation[QITERS * 8, dtype]()
+            var oreg = stack_allocation[QITERS * 8, dtype]()
+            var lval = NEG_ROW
             comptime for ci in range(QITERS):
-                var lrow = r_row0 + ci * RSTEP
-                var grow = q0 + lrow
+                var grow = q0 + r_row0 + ci * RSTEP
                 if not full:
                     grow = min(grow, last_q)
                 var qv = SIMD[dtype, 8](0)
@@ -854,10 +858,25 @@ def _bwd_dkv_mfma[
                     qv = query.load[width=8](off)
                     gv = grad_output.load[width=8](off)
                     ov = out_fwd.load[width=8](off)
-                q_smem.store(r_lds0 + ci * RSTEP * QPAD, qv)
+                qreg.store(ci * 8, qv)
+                greg.store(ci * 8, gv)
+                oreg.store(ci * 8, ov)
+            if tid < BM:
+                var qg = q0 + tid
+                if qg < seq_q:
+                    lval = -lse[lse_base + qg] * LOG2E
+
+            # ---- Stage Q and dO row-major, and the per-row `[-lse*log2e, D]`.
+            comptime for ci in range(QITERS):
+                var lrow = r_row0 + ci * RSTEP
+                var gv = greg.load[width=8](ci * 8)
+                q_smem.store(
+                    r_lds0 + ci * RSTEP * QPAD, qreg.load[width=8](ci * 8)
+                )
                 do_smem.store(r_lds0 + ci * RSTEP * QPAD, gv)
                 var part = (
-                    gv.cast[DType.float32]() * ov.cast[DType.float32]()
+                    gv.cast[DType.float32]()
+                    * oreg.load[width=8](ci * 8).cast[DType.float32]()
                 ).reduce_add()
                 part += shuffle_xor(part, 1)
                 part += shuffle_xor(part, 2)
@@ -868,30 +887,24 @@ def _bwd_dkv_mfma[
                     part += shuffle_xor(part, 16)
                 if row_lane == 0:
                     aux[2 * lrow + 1] = part
+            if tid < BM:
+                aux[2 * tid] = lval
+            barrier()
 
+            # ---- Q^T and dO^T come out of the row-major tiles, not out of a
+            # second pass over global memory: four `ds_read_u16` at one head-dim
+            # column are 128 contiguous bytes per wavefront and cost no memory
+            # round trip at all, where the transposing global loader cost four
+            # more of them per tile.
             comptime for ti in range(TITERS):
+                var q0l = (t_qg0 + ti * TQ_STEP) * 4
                 var qv4 = SIMD[dtype, 4](0)
                 var gv4 = SIMD[dtype, 4](0)
-                var live = True
-                comptime if not EXACT:
-                    live = t_col < head_dim
-                if live:
-                    var g = q0 + (t_qg0 + ti * TQ_STEP) * 4
-                    comptime for j in range(4):
-                        var gr = g + j
-                        if not full:
-                            gr = min(gr, last_q)
-                        qv4[j] = query[q_base + gr * hd + t_col]
-                        gv4[j] = grad_output[q_base + gr * hd + t_col]
+                comptime for j in range(4):
+                    qv4[j] = q_smem[(q0l + j) * QPAD + t_col]
+                    gv4[j] = do_smem[(q0l + j) * QPAD + t_col]
                 qt_smem.store(t_lds0 + ti * TQ_STEP * 4, qv4)
                 dot_smem.store(t_lds0 + ti * TQ_STEP * 4, gv4)
-
-            if tid < BM:
-                var qg = q0 + tid
-                var nl = NEG_ROW
-                if qg < seq_q:
-                    nl = -lse[lse_base + qg] * LOG2E
-                aux[2 * tid] = nl
             barrier()
 
             llvm_intrinsic["llvm.amdgcn.iglp.opt", NoneType](Int32(IGLP))
