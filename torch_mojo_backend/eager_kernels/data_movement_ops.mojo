@@ -1070,6 +1070,28 @@ comptime CAST_THREADS = 256
 # Grid cap, only reached above ~4e9 elements; past it the loop below iterates.
 comptime _CAST_MAX_BLOCKS = 1 << 22
 
+# A cast whose whole traffic fits the part's last-level cache is a different
+# regime from one that streams, and it wants a different grid. Measured on
+# gfx942 with the widest vector, median of 40 x 20 launches, TB/s of
+# read+write traffic:
+#
+#   traffic   grid = ceildiv(slots, 256)   grid = 2 blocks per CU
+#     14 MiB            2.84                       2.94
+#     54 MiB            3.30                       3.60
+#    216 MiB            4.00                       4.55
+#    288 MiB            4.20                       4.34
+#    384 MiB            3.97                       3.81
+#    576 MiB            4.03                       3.76
+#   14.8 GiB            4.06                       3.71
+#
+# The crossover sits just above the 256 MiB of Infinity Cache this part has,
+# which is the reading: while the operands are cache-resident, few long-lived
+# waves beat many short ones, and once the copy streams from HBM the exact
+# grid wins. Both arms are the same kernel -- the grid-stride loop below just
+# iterates more times in the small-grid arm -- so this is a launch geometry
+# decision, not a second code path.
+comptime _CAST_RESIDENT_BYTES = 256 * 1024 * 1024
+
 
 def _cast_vec_kernel[
     src: DType, dst: DType, VEC: Int
@@ -1159,16 +1181,25 @@ def _cast[
                 1, 16 // (VEC * max(size_of[src](), size_of[dst]()))
             )
             var slots_per_block = CAST_THREADS * SLOTS
+            var blocks = (nvec + slots_per_block - 1) // slots_per_block
+            # Cache-resident arm: two workgroups per compute unit. Only at the
+            # widest vector (`SLOTS == 1`); the narrower ones exist to serve an
+            # unaligned base address, and for them the same grid measured 98 us
+            # against 54 us for the `SLOTS`-per-thread grid above, so the
+            # resident arm's block count is not transferable across widths.
+            comptime SMALL_GRID = max(
+                2 * ctx.default_device_info.sm_count, CAST_THREADS
+            )
+            comptime if SLOTS == 1:
+                if (
+                    size * (size_of[src]() + size_of[dst]())
+                    <= _CAST_RESIDENT_BYTES
+                ):
+                    blocks = min(blocks, SMALL_GRID)
             _enqueue_cached[_cast_vec_kernel[src, dst, VEC]](
                 ctx,
                 String(t"dm_cast_{src}_{dst}_v{VEC}"),
-                max(
-                    1,
-                    min(
-                        (nvec + slots_per_block - 1) // slots_per_block,
-                        _CAST_MAX_BLOCKS,
-                    ),
-                ),
+                max(1, min(blocks, _CAST_MAX_BLOCKS)),
                 1,
                 1,
                 CAST_THREADS,

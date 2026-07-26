@@ -2403,6 +2403,61 @@ def test_fast_cast(mojo_device):
     )
 
 
+# The dtypes `CAST_DTYPES` in data_movement_ops.mojo dispatches on, both ends.
+_FAST_CAST_DTYPES = [
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.uint8,
+    torch.bool,
+]
+
+
+@pytest.mark.parametrize("numel", [1, 3, 17, 1027, 4099])
+@pytest.mark.parametrize("offset", [0, 1, 2, 3])
+def test_fast_cast_is_exact_for_every_dtype_pair(mojo_device, numel, offset):
+    """Every `CAST_DTYPES` pair, element for element, off a shifted base.
+
+    The cast kernel moves several elements per thread in the widest vector the
+    two base addresses admit, so this pins the three things that makes fragile:
+    a count that is not a multiple of the vector (the scalar tail), a base
+    address that is not vector-aligned (`offset`, which forces a narrower
+    width or the scalar arm), and the `!= 0` bool destination. The pattern
+    steps modulo 5, coprime with every power-of-two width, so a vector whose
+    lanes are rotated or whose tail is left unwritten cannot pass.
+    """
+    values = torch.arange(numel + offset) % 5
+    for src in _FAST_CAST_DTYPES:
+        source = (values != 0) if src is torch.bool else values.to(src)
+        on_device = source.to(mojo_device)
+        view = on_device[offset : offset + numel]
+        assert view.is_contiguous()
+        expected_view = source[offset : offset + numel]
+        for dst in _FAST_CAST_DTYPES:
+            got = view.to(dst).cpu()
+            assert torch.equal(got, expected_view.to(dst)), (
+                f"{src} -> {dst}, numel={numel}, offset={offset}"
+            )
+
+
+@pytest.mark.parametrize("numel", [1027, 65_539])
+def test_fast_cast_float_rounding_matches_cpu(mojo_device, numel):
+    """Narrowing a float must round exactly as the CPU does, tail included."""
+    generator = torch.Generator().manual_seed(numel)
+    values = torch.randn(numel + 3, generator=generator)
+    for offset in (0, 1, 3):
+        on_device = values.to(mojo_device)[offset : offset + numel]
+        expected = values[offset : offset + numel]
+        for dst in (torch.bfloat16, torch.float16):
+            assert torch.equal(on_device.to(dst).cpu(), expected.to(dst)), (
+                f"float32 -> {dst}, numel={numel}, offset={offset}"
+            )
+            round_trip = on_device.to(dst).to(torch.float32).cpu()
+            assert torch.equal(round_trip, expected.to(dst).to(torch.float32))
+
+
 def test_fast_float64_factories_fill_scatter_and_arange(mojo_gpu):
     if list(get_accelerators())[0].api == "metal":
         pytest.skip("Metal does not support float64 kernels")
