@@ -54,6 +54,7 @@ _MOJO_MODULES = (
     "normalization_backward_ops",
     "optimizer_ops",
     "sdpa_backward_ops",
+    "flash_attention_ops",
 )
 
 

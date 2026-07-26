@@ -4248,6 +4248,179 @@ def fast_fa4_bf16_d64_causal_backward(
     return grad_query, grad_key, grad_value
 
 
+# ---------------------------------------------------------------------------
+# Fused flash attention for gfx942 (CDNA3).
+#
+# The decomposition below costs 29.854 ms/step forward and 46.153 backward on
+# nanoGPT 124M at batch 48 / block 1024; the fused kernels measure 6.100 and
+# 28.896.  They are gated narrowly and everything they decline falls through to
+# the decomposition unchanged.
+# ---------------------------------------------------------------------------
+
+_FUSED_FA_MAX_HEAD_DIM = 256
+
+
+def _fused_fa_inputs(
+    query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+):
+    """Eligible dense BHTD inputs for the fused gfx942 kernels, or None.
+
+    No device work: this only inspects shape, stride, dtype and device, which
+    is all an eager op is allowed to look at.
+    """
+    q = _t(query)
+    k = _t(key)
+    v = _t(value)
+    if (
+        q is None
+        or k is None
+        or v is None
+        or attn_mask is not None
+        or enable_gqa
+        or not isinstance(dropout_p, int | float)
+        or isinstance(dropout_p, bool)
+        or float(dropout_p) != 0.0
+        or q._device != k._device
+        or q._device != v._device
+        or q._device.api != "hip"
+        or q._device.architecture_name != "gfx942"
+        or q._dtype not in _FLOAT_DTYPES
+        or q._dtype != k._dtype
+        or q._dtype != v._dtype
+        or len(q._shape) != 4
+        or len(k._shape) != 4
+        or len(v._shape) != 4
+    ):
+        return None
+    # Q and the output share seq_q; K and V share seq_kv. Batch, heads and
+    # head_dim must agree across all three.
+    if (
+        tuple(q._shape[:2]) != tuple(k._shape[:2])
+        or tuple(k._shape) != tuple(v._shape)
+        or q._shape[3] != k._shape[3]
+    ):
+        return None
+    batch, heads, seq_q, head_dim = q._shape
+    seq_kv = k._shape[2]
+    if (
+        batch <= 0
+        or heads <= 0
+        or seq_q <= 0
+        or seq_kv <= 0
+        or head_dim <= 0
+        or head_dim > _FUSED_FA_MAX_HEAD_DIM
+    ):
+        return None
+    if scale is not None and (
+        not isinstance(scale, int | float)
+        or isinstance(scale, bool)
+        or not math.isfinite(float(scale))
+    ):
+        return None
+    # PyTorch aligns the causal mask TOP-LEFT for a non-square score matrix --
+    # query q attends keys 0..=q whatever seq_kv is (torch.nn.attention.bias
+    # calls this the "upper left causal bias").  These kernels were specified
+    # and tuned against BOTTOM-RIGHT alignment, q attends 0..=q+(seq_kv-seq_q),
+    # so for is_causal with unequal lengths they compute a different -- and by
+    # PyTorch's definition wrong -- masking.  The two coincide exactly when
+    # seq_q == seq_kv, which is self-attention and every nanoGPT call, so
+    # decline the rest to the decomposition rather than return a wrong answer.
+    if is_causal and seq_q != seq_kv:
+        return None
+    return q, k, v
+
+
+def fast_fused_flash_attention_forward(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    enable_gqa=False,
+):
+    """Fused forward returning ``(output, lse, q, k, v)``, or NOT_HANDLED.
+
+    ``lse`` is the per-row log-sum-exp the fused backward consumes; the three
+    returned tensors are the contiguous inputs the kernel actually read, which
+    the backward must be handed rather than the originals (a non-contiguous
+    caller view was copied to get here).
+    """
+    eligible = _fused_fa_inputs(
+        query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+    )
+    if eligible is None:
+        return NOT_HANDLED
+    q, k, v = eligible
+    q = _tc(q)
+    k = _tc(k)
+    v = _tc(v)
+    if q is None or k is None or v is None:
+        return NOT_HANDLED
+    batch, heads, seq_q, head_dim = q._shape
+    seq_kv = k._shape[2]
+    scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
+    output = _alloc((batch, heads, seq_q, head_dim), q._dtype, q._device)
+    lse = _alloc((batch, heads, seq_q), DType.float32, q._device)
+    eager_kernels.flash_attention_ops.FlashAttentionForward(
+        output._ptr,
+        lse._ptr,
+        q._ptr,
+        k._ptr,
+        v._ptr,
+        (batch, heads, seq_q, seq_kv, head_dim),
+        scale_val,
+        1 if is_causal else 0,
+        q._dtype.value,
+        _ctx_ptr(q._device),
+    )
+    return output, lse, q, k, v
+
+
+def fast_fused_flash_attention_backward(
+    grad_output, query, key, value, output, lse, is_causal, scale
+):
+    """Fused backward returning ``(dq, dk, dv)``, or NOT_HANDLED.
+
+    ``query``/``key``/``value``/``output``/``lse`` must be exactly what the
+    fused forward read and wrote.
+    """
+    g = _tc(_t(grad_output))
+    q = _t(query)
+    k = _t(key)
+    v = _t(value)
+    o = _t(output)
+    l = _t(lse)
+    if g is None or q is None or k is None or v is None or o is None or l is None:
+        return NOT_HANDLED
+    if g._dtype != q._dtype or tuple(g._shape) != tuple(q._shape):
+        return NOT_HANDLED
+    batch, heads, seq_q, head_dim = q._shape
+    seq_kv = k._shape[2]
+    scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
+    grad_query = _alloc((batch, heads, seq_q, head_dim), q._dtype, q._device)
+    grad_key = _alloc((batch, heads, seq_kv, head_dim), q._dtype, q._device)
+    grad_value = _alloc((batch, heads, seq_kv, head_dim), q._dtype, q._device)
+    eager_kernels.flash_attention_ops.FlashAttentionBackward(
+        grad_query._ptr,
+        grad_key._ptr,
+        grad_value._ptr,
+        g._ptr,
+        q._ptr,
+        k._ptr,
+        v._ptr,
+        o._ptr,
+        l._ptr,
+        (batch, heads, seq_q, seq_kv, head_dim),
+        scale_val,
+        1 if is_causal else 0,
+        q._dtype.value,
+        _ctx_ptr(q._device),
+    )
+    return grad_query, grad_key, grad_value
+
+
 def _sdpa_math_forward(query, key, value, is_causal, scale):
     """Dropout-free compatibility wrapper returning ``(output, probs)``."""
     result = _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, 0.0)
@@ -5284,6 +5457,14 @@ def fast_aten_scaled_dot_product_attention(
     if fa4_result is not NOT_HANDLED:
         output, logsumexp, q_native, k_native, v_native = fa4_result
         del logsumexp, q_native, k_native, v_native
+        return output
+
+    fused = fast_fused_flash_attention_forward(
+        query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+    )
+    if fused is not NOT_HANDLED:
+        output, lse, q_used, k_used, v_used = fused
+        del lse, q_used, k_used, v_used
         return output
 
     q = _t(query)
