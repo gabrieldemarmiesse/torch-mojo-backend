@@ -1895,7 +1895,7 @@ comptime NT_VEC = 8  # elements per global load and per LDS write
     ),
 )
 @__name(
-    t"nt_mfma_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_z{SWIZZLE}_l{MASK_LOAD}_t{MASK_STORE}"
+    t"nt_mfma_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_z{SWIZZLE}_l{MASK_LOAD}_t{MASK_STORE}_a{A_KMAJOR}_b{B_KMAJOR}"
 )
 def _nt_mfma_kernel[
     dtype: DType,
@@ -1908,6 +1908,8 @@ def _nt_mfma_kernel[
     SWIZZLE: Bool,
     MASK_LOAD: Bool,
     MASK_STORE: Bool,
+    A_KMAJOR: Bool = True,
+    B_KMAJOR: Bool = True,
 ](
     c: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     a: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -1937,10 +1939,32 @@ def _nt_mfma_kernel[
     comptime SW_MASK = CHUNKS - 1
     comptime TPR = BK // NT_VEC  # threads that cover one tile row
     comptime ROWS = THREADS // TPR  # tile rows filled per pass
-    comptime APASS = ceildiv(BM, ROWS)
-    comptime BPASS = ceildiv(BN, ROWS)
-    comptime SA = BM * PAD
-    comptime SB = BN * PAD
+    # A NON-k-major operand lives in a `(k, X)` buffer, so its global rows run
+    # along the non-contraction axis and the LDS tile keeps that native shape:
+    # `BK` rows of `BX` elements.  The fill is then the same wide vector load and
+    # the same wide LDS store as the k-major case, and it is the MFMA fragment
+    # read that pays -- four `ds_read_u16` at stride `BX` instead of one
+    # `ds_read_b64`.  That is the cheap side of the trade: the global tile is read
+    # once per k tile while the LDS tile is read once per wave-row and once per
+    # wave-column, but a `u16` read of 64 lanes is 128 bytes and an LDS cycle is
+    # 128 bytes, so four of them move exactly the bytes one `ds_read_b64` does,
+    # in the same four cycles, and only the instruction count grows.
+    #
+    # The two accesses would otherwise collide in the banks: the fragment's four
+    # elements are `BX` apart and `4 * BX * 2` bytes is a multiple of 128, so the
+    # `hi` half-wave (which reads `k + 4`) would land on the banks the `lo` half
+    # already holds.  Permuting the row by `x ^ (32 * ((k >> 2) & 1))` -- one XOR,
+    # no padding, no extra LDS -- makes the two halves disjoint, and because
+    # `(k >> 2) & 1` is exactly the `hi` of the fragment that reads it, the read
+    # side computes the permutation with one XOR too.
+    comptime XPA = BM // NT_VEC  # threads covering one native-A k row
+    comptime XPB = BN // NT_VEC
+    comptime LRA = THREADS // XPA if XPA <= THREADS else 1  # k rows per pass
+    comptime LRB = THREADS // XPB if XPB <= THREADS else 1
+    comptime APASS = ceildiv(BM, ROWS) if A_KMAJOR else ceildiv(BK, LRA)
+    comptime BPASS = ceildiv(BN, ROWS) if B_KMAJOR else ceildiv(BK, LRB)
+    comptime SA = BM * (PAD if A_KMAJOR else BK)
+    comptime SB = BN * (PAD if B_KMAJOR else BK)
 
     comptime assert BK % NT_VEC == 0, "BK must be a multiple of the load width"
     comptime assert (
@@ -1948,6 +1972,20 @@ def _nt_mfma_kernel[
     ), "the warp tile must be a whole number of MFMA tiles"
     comptime assert THREADS >= TPR, "BK is wider than the block can cover"
     comptime assert STAGES == 1 or STAGES == 2, "STAGES is 1 or 2"
+    comptime if not A_KMAJOR:
+        comptime assert (
+            BM % 64 == 0
+        ), "the native-layout row permutation needs a tile of at least 64"
+        comptime assert (
+            XPA <= THREADS and THREADS % XPA == 0
+        ), "the block must cover a whole number of native-A rows"
+    comptime if not B_KMAJOR:
+        comptime assert (
+            BN % 64 == 0
+        ), "the native-layout row permutation needs a tile of at least 64"
+        comptime assert (
+            XPB <= THREADS and THREADS % XPB == 0
+        ), "the block must cover a whole number of native-B rows"
     comptime if SWIZZLE:
         # The permutation is a function of `row` only through
         # `(row >> SW_SHIFT) & SW_MASK`, so every row offset a fill pass or an
@@ -2005,14 +2043,47 @@ def _nt_mfma_kernel[
             wgid = base + slot
             m0 = (wgid // nx) * BM
             n0 = (wgid % nx) * BN
+        comptime if not MASK_LOAD and not MASK_STORE:
+            # Edge tiles are SHIFTED BACK to end at the extent rather than
+            # masked.  The masked instantiation costs 120 bytes of scratch per
+            # thread -- the guards and the sixteen-register rounding block do not
+            # coexist in 128 VGPRs -- and measures 2.2-3.2x slower, far more than
+            # the 7% the transposed-B route recorded.  A shifted tile recomputes
+            # rows another workgroup also computes, but with the same k loop, the
+            # same MFMA order and therefore the same FP32 accumulation, so both
+            # store bit-identical bytes to the overlap and the redundant work is
+            # one tile out of `ceildiv(m, BM) * ceildiv(n, BN)`.  The caller only
+            # selects this instantiation when `m >= BM` and `n >= BN`; the k edge
+            # cannot be shifted and still selects the masked one.
+            if m0 + BM > m:
+                m0 = m - BM
+            if n0 + BN > n:
+                n0 = n - BN
 
-        # Tile fill: one thread reads NT_VEC contiguous k of one row, so a whole
-        # row of BK elements is 2*BK bytes read by TPR adjacent threads.
+        # Tile fill, k-major operand: one thread reads NT_VEC contiguous k of one
+        # row, so a whole row of BK elements is 2*BK bytes read by TPR adjacent
+        # threads.
         var trow = tid // TPR
         var tcol = (tid % TPR) * NT_VEC
-        var a_ptr = a + ((m0 + trow) * k + tcol)
-        var b_ptr = b + ((n0 + trow) * k + tcol)
         var pass_step = ROWS * k
+        # Tile fill, native operand: one thread reads NT_VEC contiguous
+        # non-contraction elements of one k row, so `BX / NT_VEC` adjacent
+        # threads cover a whole tile row of 2*BX bytes and the block covers
+        # `THREADS / (BX / NT_VEC)` k rows per pass.
+        var akr = tid // XPA
+        var axc = (tid % XPA) * NT_VEC
+        var bkr = tid // XPB
+        var bxc = (tid % XPB) * NT_VEC
+        var a_ptr = a + (
+            (m0 + trow) * k + tcol if A_KMAJOR else akr * m + m0 + axc
+        )
+        var b_ptr = b + (
+            (n0 + trow) * k + tcol if B_KMAJOR else bkr * n + n0 + bxc
+        )
+        var a_pass = pass_step if A_KMAJOR else LRA * m
+        var b_pass = pass_step if B_KMAJOR else LRB * n
+        var a_step = BK if A_KMAJOR else BK * m
+        var b_step = BK if B_KMAJOR else BK * n
         # Where this thread's NT_VEC elements land in an LDS row.  Unswizzled
         # that is just the k offset; swizzled it is two four-element chunks at
         # XOR-permuted positions, so the store below is two `ds_write_b64`
@@ -2044,28 +2115,62 @@ def _nt_mfma_kernel[
             var kok = True
             comptime if MASK_LOAD:
                 kok = kt * BK + tcol < k
-            comptime for p in range(APASS):
-                var live = kok
-                comptime if (p + 1) * ROWS > BM:
-                    live = live and trow + p * ROWS < BM
-                comptime if MASK_LOAD:
-                    live = live and m0 + trow + p * ROWS < m
-                var v = SIMD[dtype, NT_VEC](0)
-                if live:
-                    v = a_ptr.load[width=NT_VEC](p * pass_step)
-                areg.store(p * NT_VEC, v)
-            comptime for p in range(BPASS):
-                var live = kok
-                comptime if (p + 1) * ROWS > BN:
-                    live = live and trow + p * ROWS < BN
-                comptime if MASK_LOAD:
-                    live = live and n0 + trow + p * ROWS < n
-                var v = SIMD[dtype, NT_VEC](0)
-                if live:
-                    v = b_ptr.load[width=NT_VEC](p * pass_step)
-                breg.store(p * NT_VEC, v)
-            a_ptr += BK
-            b_ptr += BK
+            comptime if A_KMAJOR:
+                comptime for p in range(APASS):
+                    var live = kok
+                    comptime if (p + 1) * ROWS > BM:
+                        live = live and trow + p * ROWS < BM
+                    comptime if MASK_LOAD:
+                        live = live and m0 + trow + p * ROWS < m
+                    var v = SIMD[dtype, NT_VEC](0)
+                    if live:
+                        v = a_ptr.load[width=NT_VEC](p * pass_step)
+                    areg.store(p * NT_VEC, v)
+            else:
+                comptime for p in range(APASS):
+                    var live = True
+                    comptime if (p + 1) * LRA > BK:
+                        live = akr + p * LRA < BK
+                    comptime if MASK_LOAD:
+                        live = live and kt * BK + akr + p * LRA < k
+                    comptime if MASK_LOAD:
+                        # `m % NT_VEC == 0` is a precondition of the native-A
+                        # route, so a NT_VEC vector at a NT_VEC-aligned offset is
+                        # wholly inside the extent or wholly outside it: one
+                        # guard, no per-element tail.  A tail written as eight
+                        # predicated scalar loads costs 144 bytes of scratch per
+                        # thread and measures 3.2x slower.
+                        live = live and m0 + axc < m
+                    var v = SIMD[dtype, NT_VEC](0)
+                    if live:
+                        v = a_ptr.load[width=NT_VEC](p * a_pass)
+                    areg.store(p * NT_VEC, v)
+            comptime if B_KMAJOR:
+                comptime for p in range(BPASS):
+                    var live = kok
+                    comptime if (p + 1) * ROWS > BN:
+                        live = live and trow + p * ROWS < BN
+                    comptime if MASK_LOAD:
+                        live = live and n0 + trow + p * ROWS < n
+                    var v = SIMD[dtype, NT_VEC](0)
+                    if live:
+                        v = b_ptr.load[width=NT_VEC](p * pass_step)
+                    breg.store(p * NT_VEC, v)
+            else:
+                comptime for p in range(BPASS):
+                    var live = True
+                    comptime if (p + 1) * LRB > BK:
+                        live = bkr + p * LRB < BK
+                    comptime if MASK_LOAD:
+                        live = live and kt * BK + bkr + p * LRB < k
+                    comptime if MASK_LOAD:
+                        live = live and n0 + bxc < n
+                    var v = SIMD[dtype, NT_VEC](0)
+                    if live:
+                        v = b_ptr.load[width=NT_VEC](p * b_pass)
+                    breg.store(p * NT_VEC, v)
+            a_ptr += a_step
+            b_ptr += b_step
 
         @always_inline
         @parameter
@@ -2084,25 +2189,64 @@ def _nt_mfma_kernel[
             else:
                 dst.store(row_base + tcol, regs.load[width=NT_VEC](reg_off))
 
+        # A native tile row is written whole: `x ^ (32 * ((k >> 2) & 1))` keeps
+        # the NT_VEC elements contiguous (the XOR only moves bit 5 and NT_VEC
+        # divides 32), so it is still one `ds_write_b128`.
+        @always_inline
+        @parameter
+        def _write_native(dst: LDSPtr, row: Int, xcol: Int, w: Int, regs: RegPtr, reg_off: Int):
+            dst.store(
+                row * w + (xcol ^ (32 * ((row >> 2) & 1))),
+                regs.load[width=NT_VEC](reg_off),
+            )
+
         @always_inline
         @parameter
         def _fill(pa: LDSPtr, pb: LDSPtr):
-            comptime for p in range(APASS):
-                comptime if (p + 1) * ROWS <= BM:
-                    _write_row(pa, (trow + p * ROWS) * PAD, areg, p * NT_VEC)
-                else:
-                    if trow + p * ROWS < BM:
+            comptime if A_KMAJOR:
+                comptime for p in range(APASS):
+                    comptime if (p + 1) * ROWS <= BM:
                         _write_row(
                             pa, (trow + p * ROWS) * PAD, areg, p * NT_VEC
                         )
-            comptime for p in range(BPASS):
-                comptime if (p + 1) * ROWS <= BN:
-                    _write_row(pb, (trow + p * ROWS) * PAD, breg, p * NT_VEC)
-                else:
-                    if trow + p * ROWS < BN:
+                    else:
+                        if trow + p * ROWS < BM:
+                            _write_row(
+                                pa, (trow + p * ROWS) * PAD, areg, p * NT_VEC
+                            )
+            else:
+                comptime for p in range(APASS):
+                    comptime if (p + 1) * LRA <= BK:
+                        _write_native(
+                            pa, akr + p * LRA, axc, BM, areg, p * NT_VEC
+                        )
+                    else:
+                        if akr + p * LRA < BK:
+                            _write_native(
+                                pa, akr + p * LRA, axc, BM, areg, p * NT_VEC
+                            )
+            comptime if B_KMAJOR:
+                comptime for p in range(BPASS):
+                    comptime if (p + 1) * ROWS <= BN:
                         _write_row(
                             pb, (trow + p * ROWS) * PAD, breg, p * NT_VEC
                         )
+                    else:
+                        if trow + p * ROWS < BN:
+                            _write_row(
+                                pb, (trow + p * ROWS) * PAD, breg, p * NT_VEC
+                            )
+            else:
+                comptime for p in range(BPASS):
+                    comptime if (p + 1) * LRB <= BK:
+                        _write_native(
+                            pb, bkr + p * LRB, bxc, BN, breg, p * NT_VEC
+                        )
+                    else:
+                        if bkr + p * LRB < BK:
+                            _write_native(
+                                pb, bkr + p * LRB, bxc, BN, breg, p * NT_VEC
+                            )
 
         # Every fragment of the whole k tile, read from LDS in one burst before
         # any MFMA issues.  `MT * KSTEPS + NTL * KSTEPS` `ds_read_b64` is only
@@ -2126,20 +2270,48 @@ def _nt_mfma_kernel[
             comptime if not SWIZZLE:
                 abase += 4 * hi
                 bbase += 4 * hi
+            # Native side: the fragment's four elements are `BX` apart, and the
+            # row permutation puts tile `i` of this wave at 32-element block
+            # `(wx0 / 32 + i) ^ hi`.  `4 * hi * BX + lo` is the rest of the
+            # lane's offset and is loop-invariant.
+            var anb = 4 * hi * BM + lo
+            var bnb = 4 * hi * BN + lo
+            var aq = wm0 // NT_MMA
+            var bq = wn0 // NT_MMA
             comptime for s in range(S0, S1):
                 var kof = s * NT_MMA_K
                 comptime if SWIZZLE:
                     kof = 4 * ((2 * s) ^ t0)
                 comptime for i in range(MT):
-                    af.store(
-                        (s * MT + i) * 4,
-                        pa.load[width=4](abase + i * NT_MMA * PAD + kof),
-                    )
+                    comptime if A_KMAJOR:
+                        af.store(
+                            (s * MT + i) * 4,
+                            pa.load[width=4](abase + i * NT_MMA * PAD + kof),
+                        )
+                    else:
+                        var base = (
+                            s * NT_MMA_K * BM
+                            + anb
+                            + NT_MMA * ((aq + i) ^ hi)
+                        )
+                        var v = SIMD[dtype, 4]()
+                        comptime for e in range(4):
+                            v[e] = pa[base + e * BM]
+                        af.store((s * MT + i) * 4, v)
                 comptime for j in range(NTL):
-                    bf.store(
-                        (s * NTL + j) * 4,
-                        pb.load[width=4](bbase + j * NT_MMA * PAD + kof),
-                    )
+                    comptime if B_KMAJOR:
+                        bf.store(
+                            (s * NTL + j) * 4,
+                            pb.load[width=4](bbase + j * NT_MMA * PAD + kof),
+                        )
+                    else:
+                        var base = (
+                            s * NT_MMA_K * BN + bnb + NT_MMA * ((bq + j) ^ hi)
+                        )
+                        var v = SIMD[dtype, 4]()
+                        comptime for e in range(4):
+                            v[e] = pb[base + e * BN]
+                        bf.store((s * NTL + j) * 4, v)
 
         @always_inline
         @parameter
@@ -2255,6 +2427,8 @@ def _nt_mfma_gemm[
     WN: Int,
     STAGES: Int = 2,
     SWIZZLE: Bool = False,
+    A_KMAJOR: Bool = True,
+    B_KMAJOR: Bool = True,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -2272,10 +2446,25 @@ def _nt_mfma_gemm[
     extents actually have an edge.
     """
     comptime THREADS = (BM // WM) * (BN // WN) * 64
-    if m % BM == 0 and n % BN == 0 and k % BK == 0:
+    # The unmasked instantiation shifts an edge tile back instead of guarding it,
+    # so it covers every shape whose macro tile fits at all; only a k that BK does
+    # not divide -- which cannot be shifted, the missing k range is real -- needs
+    # the guarded one.
+    if m >= BM and n >= BN and k % BK == 0:
         ctx.enqueue_function[
             _nt_mfma_kernel[
-                dtype, BM, BN, BK, WM, WN, STAGES, SWIZZLE, False, False
+                dtype,
+                BM,
+                BN,
+                BK,
+                WM,
+                WN,
+                STAGES,
+                SWIZZLE,
+                False,
+                False,
+                A_KMAJOR,
+                B_KMAJOR,
             ]
         ](
             _make_ptr[dtype](c_addr),
@@ -2291,7 +2480,18 @@ def _nt_mfma_gemm[
     else:
         ctx.enqueue_function[
             _nt_mfma_kernel[
-                dtype, BM, BN, BK, WM, WN, STAGES, SWIZZLE, True, True
+                dtype,
+                BM,
+                BN,
+                BK,
+                WM,
+                WN,
+                STAGES,
+                SWIZZLE,
+                True,
+                True,
+                A_KMAJOR,
+                B_KMAJOR,
             ]
         ](
             _make_ptr[dtype](c_addr),
@@ -2364,6 +2564,50 @@ def _nt_mfma_route[
         return True
     if ceildiv(m, 128) * ceildiv(n, 128) >= cus:
         _nt_mfma_gemm[dtype, 128, 128, 32, 64, 64, 2, True](
+            c_addr, a_addr, b_addr, m, n, k, xcds, ctx
+        )
+        return True
+    return False
+
+
+@always_inline
+def _nn_mfma_route[
+    dtype: DType
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """The same MFMA core for `C = A(m,k) @ B(k,n)`, both operands dense.
+
+    Only B changes: it lives in a `(k, n)` buffer, so its global rows run along
+    n and its LDS tile keeps that native shape instead of being turned k-major.
+    See `_nt_mfma_kernel`'s `B_KMAJOR` comment for why that costs nothing in LDS
+    bytes or cycles -- four `ds_read_u16` per fragment move the same 512 bytes in
+    the same four LDS cycles as one `ds_read_b64`, and the row permutation keeps
+    both halves of the wave in disjoint banks.
+
+    The gate is `_nt_mfma_route`'s: one workgroup of this tile is resident per
+    CU, so a grid that does not cover the device leaves CUs idle for the whole k
+    loop and the caller's existing route is better.
+    """
+    # A's 16-byte rows run along k and B's along n, so each operand's own row
+    # length is what has to keep every tile row aligned.
+    if (
+        k % NT_VEC != 0
+        or n % NT_VEC != 0
+        or a_addr % 16 != 0
+        or b_addr % 16 != 0
+    ):
+        return False
+    var cus = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var xcds = max(1, cus // 38)
+    if ceildiv(m, 256) * ceildiv(n, 256) >= cus:
+        _nt_mfma_gemm[dtype, 256, 256, 32, 64, 64, 2, True, True, False](
             c_addr, a_addr, b_addr, m, n, k, xcds, ctx
         )
         return True
@@ -2496,6 +2740,13 @@ def _amd_dynamic_mfma_dispatch[
         # one.  The C alignment condition is what lets the reduction use 16-byte
         # accesses; the `n % 128` condition removes the N-edge kernel entirely.
         comptime if not transpose_b and not fuse_bias:
+            # Both operands dense, B in its native `(k, n)` layout: the same
+            # hand-written MFMA core the transposed-B route uses, with B's LDS
+            # tile left native instead of turned k-major.  It declines unless its
+            # output grid covers the device, so the split-K and macro-tile routes
+            # below still own the underfilled shapes.
+            if _nn_mfma_route[dtype](c_addr, a_addr, b_addr, m, n, k, ctx):
+                return True
             if k >= 8192 and m >= 128 and n % 128 == 0 and c_addr % 8 == 0:
                 var splitk_parts = _splitk_parts(
                     ceildiv(m, 128) * (n // 128),
