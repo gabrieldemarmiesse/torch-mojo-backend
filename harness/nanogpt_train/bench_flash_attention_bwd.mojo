@@ -69,6 +69,9 @@ struct BwdCase(ImplicitlyCopyable, Movable):
     var causal: Bool
     var calls_per_step: Int
     var rocm_us: Float64
+    # Which READ operands the caller hands over as a BTHD view: bit 0 Q, bit 1
+    # K, bit 2 V, bit 3 dO, bit 4 O. 0 is the dense `[B, H, T, D]` layout.
+    var bthd: Int
 
     def __init__(
         out self,
@@ -81,6 +84,7 @@ struct BwdCase(ImplicitlyCopyable, Movable):
         causal: Bool,
         calls_per_step: Int,
         rocm_us: Float64,
+        bthd: Int = 0,
     ):
         self.label = label^
         self.batch = batch
@@ -91,6 +95,7 @@ struct BwdCase(ImplicitlyCopyable, Movable):
         self.causal = causal
         self.calls_per_step = calls_per_step
         self.rocm_us = rocm_us
+        self.bthd = bthd
 
 
 def cases() -> List[BwdCase]:
@@ -114,6 +119,16 @@ def cases() -> List[BwdCase]:
     out.append(BwdCase("noncausal", 4, 8, 512, 512, 64, False, 1, 0.0))
     out.append(BwdCase("cross_kv_longer", 2, 4, 256, 1024, 64, True, 1, 0.0))
     out.append(BwdCase("tiny", 1, 1, 3, 3, 8, True, 1, 0.0))
+    # Strided callers. nanoGPT hands over `x.view(B, T, H, D).transpose(1, 2)`
+    # for Q, K and V, and a dO that inherits the same layout from the attention
+    # output's consumer; O is ours and always dense. `bthd_hd128` strides O too,
+    # because the kernel accepts a stride for it and an unexercised stride is an
+    # untested one.
+    out.append(BwdCase("bthd_qkvg", 4, 8, 512, 512, 64, True, 1, 0.0, 15))
+    out.append(BwdCase("bthd_q_only", 2, 5, 300, 300, 96, True, 1, 0.0, 1))
+    out.append(BwdCase("bthd_hd128", 2, 4, 256, 256, 128, True, 1, 0.0, 31))
+    out.append(BwdCase("bthd_cross", 2, 4, 256, 1024, 64, True, 1, 0.0, 15))
+    out.append(BwdCase("bthd_noncausal", 4, 8, 512, 512, 64, False, 1, 0.0, 15))
     return out^
 
 
@@ -163,19 +178,48 @@ def _setup_forward[
     head_dim: Int,
     scale: Float32,
     causal: Int,
+    q_bthd: Int,
+    k_bthd: Int,
+    v_bthd: Int,
+    o_bthd: Int,
 ):
     """Produce the O and L a real forward would hand the backward.
 
     One thread per query row, three passes, FP32. This is setup, not the thing
     under test, so it is written for obviousness.
+
+    The oracles are told the STORAGE LAYOUT of each operand (`*_bthd`: is the
+    allocation `[B, T, H, D]` rather than `[B, H, T, D]`?) and work out where
+    element `(b, h, s, d)` lives from the definition of a row-major array. They
+    are never handed the stride triple the kernel is given, because a wrong
+    stride would then be wrong on both sides and invisible -- which is how the
+    causal-convention defect (journal D10) survived six mutation tests.
     """
     var row = Int(block_idx.x) * REF_THREADS + Int(thread_idx.x)
     if row >= batch * heads * seq_q:
         return
     var qi = row % seq_q
     var bh = row // seq_q
-    var q_row = bh * seq_q * head_dim + qi * head_dim
-    var kv_base = bh * seq_kv * head_dim
+    var head = bh % heads
+    var b = bh // heads
+    # `[B, H, T, D]`: (b, h, s, d) is at ((b*H + h)*T + s)*D + d.
+    # `[B, T, H, D]`: (b, h, s, d) is at ((b*T + s)*H + h)*D + d.
+    var q_row = (bh * seq_q + qi) * head_dim
+    if q_bthd != 0:
+        q_row = ((b * seq_q + qi) * heads + head) * head_dim
+    var o_row = (bh * seq_q + qi) * head_dim
+    if o_bthd != 0:
+        o_row = ((b * seq_q + qi) * heads + head) * head_dim
+    var k_base = bh * seq_kv * head_dim
+    var k_step = head_dim
+    if k_bthd != 0:
+        k_base = (b * seq_kv * heads + head) * head_dim
+        k_step = heads * head_dim
+    var v_base = bh * seq_kv * head_dim
+    var v_step = head_dim
+    if v_bthd != 0:
+        v_base = (b * seq_kv * heads + head) * head_dim
+        v_step = heads * head_dim
     var limit = seq_kv
     if causal != 0:
         limit = min(seq_kv, qi + 1)
@@ -186,7 +230,7 @@ def _setup_forward[
         for e in range(head_dim):
             dot += (
                 query[q_row + e].cast[DType.float32]()
-                * key[kv_base + j * head_dim + e].cast[DType.float32]()
+                * key[k_base + j * k_step + e].cast[DType.float32]()
             )
         var s = dot * scale
         if s > m:
@@ -197,24 +241,24 @@ def _setup_forward[
         for e in range(head_dim):
             dot += (
                 query[q_row + e].cast[DType.float32]()
-                * key[kv_base + j * head_dim + e].cast[DType.float32]()
+                * key[k_base + j * k_step + e].cast[DType.float32]()
             )
         denom += exp(dot * scale - m)
     lse[bh * seq_q + qi] = m + log(denom)
     for e in range(head_dim):
-        out_fwd[q_row + e] = Scalar[dtype](0)
+        out_fwd[o_row + e] = Scalar[dtype](0)
     for j in range(limit):
         var dot = Float32(0.0)
         for e in range(head_dim):
             dot += (
                 query[q_row + e].cast[DType.float32]()
-                * key[kv_base + j * head_dim + e].cast[DType.float32]()
+                * key[k_base + j * k_step + e].cast[DType.float32]()
             )
         var p = exp(dot * scale - m) / denom
         for e in range(head_dim):
-            out_fwd[q_row + e] = (
-                out_fwd[q_row + e].cast[DType.float32]()
-                + p * value[kv_base + j * head_dim + e].cast[DType.float32]()
+            out_fwd[o_row + e] = (
+                out_fwd[o_row + e].cast[DType.float32]()
+                + p * value[v_base + j * v_step + e].cast[DType.float32]()
             ).cast[dtype]()
 
 
@@ -236,15 +280,43 @@ def _ref_dq[
     head_dim: Int,
     scale: Float32,
     causal: Int,
+    g_bthd: Int,
+    q_bthd: Int,
+    k_bthd: Int,
+    v_bthd: Int,
+    o_bthd: Int,
 ):
-    """dQ, one thread per query row, sequential, FP32. The oracle."""
+    """dQ, one thread per query row, sequential, FP32. The oracle.
+
+    The oracles are told the STORAGE LAYOUT of each operand (`*_bthd`: is the
+    allocation `[B, T, H, D]` rather than `[B, H, T, D]`?) and work out where
+    element `(b, h, s, d)` lives from the definition of a row-major array. They
+    are never handed the stride triple the kernel is given, because a wrong
+    stride would then be wrong on both sides and invisible -- which is how the
+    causal-convention defect (journal D10) survived six mutation tests.
+    """
     var row = Int(block_idx.x) * REF_THREADS + Int(thread_idx.x)
     if row >= batch * heads * seq_q:
         return
     var qi = row % seq_q
     var bh = row // seq_q
-    var q_row = bh * seq_q * head_dim + qi * head_dim
-    var kv_base = bh * seq_kv * head_dim
+    var head = bh % heads
+    var b = bh // heads
+    var dense_q = (bh * seq_q + qi) * head_dim
+    var bthd_q = ((b * seq_q + qi) * heads + head) * head_dim
+    var q_row = bthd_q if q_bthd != 0 else dense_q
+    var g_row = bthd_q if g_bthd != 0 else dense_q
+    var o_row = bthd_q if o_bthd != 0 else dense_q
+    var k_base = bh * seq_kv * head_dim
+    var k_step = head_dim
+    if k_bthd != 0:
+        k_base = (b * seq_kv * heads + head) * head_dim
+        k_step = heads * head_dim
+    var v_base = bh * seq_kv * head_dim
+    var v_step = head_dim
+    if v_bthd != 0:
+        v_base = (b * seq_kv * heads + head) * head_dim
+        v_step = heads * head_dim
     var limit = seq_kv
     if causal != 0:
         limit = min(seq_kv, qi + 1)
@@ -252,14 +324,16 @@ def _ref_dq[
     var row_d = Float32(0.0)
     for e in range(head_dim):
         row_d += (
-            grad_output[q_row + e].cast[DType.float32]()
-            * out_fwd[q_row + e].cast[DType.float32]()
+            grad_output[g_row + e].cast[DType.float32]()
+            * out_fwd[o_row + e].cast[DType.float32]()
         )
+    # dQ is a dense allocation whatever the inputs look like.
     for e in range(head_dim):
-        ref_dq[q_row + e] = 0.0
+        ref_dq[dense_q + e] = 0.0
     var l = lse[bh * seq_q + qi]
     for j in range(limit):
-        var krow = kv_base + j * head_dim
+        var krow = k_base + j * k_step
+        var vrow = v_base + j * v_step
         var s = Float32(0.0)
         var dp = Float32(0.0)
         for e in range(head_dim):
@@ -268,13 +342,13 @@ def _ref_dq[
                 * key[krow + e].cast[DType.float32]()
             )
             dp += (
-                grad_output[q_row + e].cast[DType.float32]()
-                * value[krow + e].cast[DType.float32]()
+                grad_output[g_row + e].cast[DType.float32]()
+                * value[vrow + e].cast[DType.float32]()
             )
         var p = exp(s * scale - l)
         var ds = p * (dp - row_d)
         for e in range(head_dim):
-            ref_dq[q_row + e] += (
+            ref_dq[dense_q + e] += (
                 ds * key[krow + e].cast[DType.float32]() * scale
             )
 
@@ -298,43 +372,78 @@ def _ref_dkv[
     head_dim: Int,
     scale: Float32,
     causal: Int,
+    g_bthd: Int,
+    q_bthd: Int,
+    k_bthd: Int,
+    v_bthd: Int,
+    o_bthd: Int,
 ):
-    """dK and dV, one thread per key row, sequential, FP32. The oracle."""
+    """dK and dV, one thread per key row, sequential, FP32. The oracle.
+
+    The oracles are told the STORAGE LAYOUT of each operand (`*_bthd`: is the
+    allocation `[B, T, H, D]` rather than `[B, H, T, D]`?) and work out where
+    element `(b, h, s, d)` lives from the definition of a row-major array. They
+    are never handed the stride triple the kernel is given, because a wrong
+    stride would then be wrong on both sides and invisible -- which is how the
+    causal-convention defect (journal D10) survived six mutation tests.
+    """
     var row = Int(block_idx.x) * REF_THREADS + Int(thread_idx.x)
     if row >= batch * heads * seq_kv:
         return
     var j = row % seq_kv
     var bh = row // seq_kv
-    var kv_row = bh * seq_kv * head_dim + j * head_dim
+    var head = bh % heads
+    var b = bh // heads
+    var dense_kv = (bh * seq_kv + j) * head_dim
+    var bthd_kv = ((b * seq_kv + j) * heads + head) * head_dim
+    var k_row = bthd_kv if k_bthd != 0 else dense_kv
+    var v_row = bthd_kv if v_bthd != 0 else dense_kv
     var q_base = bh * seq_q * head_dim
+    var q_step = head_dim
+    if q_bthd != 0:
+        q_base = (b * seq_q * heads + head) * head_dim
+        q_step = heads * head_dim
+    var g_base = bh * seq_q * head_dim
+    var g_step = head_dim
+    if g_bthd != 0:
+        g_base = (b * seq_q * heads + head) * head_dim
+        g_step = heads * head_dim
+    var o_base = bh * seq_q * head_dim
+    var o_step = head_dim
+    if o_bthd != 0:
+        o_base = (b * seq_q * heads + head) * head_dim
+        o_step = heads * head_dim
 
+    # dK and dV are dense allocations whatever the inputs look like.
     for e in range(head_dim):
-        ref_dk[kv_row + e] = 0.0
-        ref_dv[kv_row + e] = 0.0
+        ref_dk[dense_kv + e] = 0.0
+        ref_dv[dense_kv + e] = 0.0
     var first_q = 0
     if causal != 0:
         first_q = j
 
     for qi in range(first_q, seq_q):
-        var q_row = q_base + qi * head_dim
+        var q_row = q_base + qi * q_step
+        var g_row = g_base + qi * g_step
+        var o_row = o_base + qi * o_step
         var s = Float32(0.0)
         var dp = Float32(0.0)
         var row_d = Float32(0.0)
         for e in range(head_dim):
-            var dov = grad_output[q_row + e].cast[DType.float32]()
+            var dov = grad_output[g_row + e].cast[DType.float32]()
             s += (
                 query[q_row + e].cast[DType.float32]()
-                * key[kv_row + e].cast[DType.float32]()
+                * key[k_row + e].cast[DType.float32]()
             )
-            dp += dov * value[kv_row + e].cast[DType.float32]()
-            row_d += dov * out_fwd[q_row + e].cast[DType.float32]()
+            dp += dov * value[v_row + e].cast[DType.float32]()
+            row_d += dov * out_fwd[o_row + e].cast[DType.float32]()
         var p = exp(s * scale - lse[bh * seq_q + qi])
         var ds = p * (dp - row_d)
         for e in range(head_dim):
-            ref_dv[kv_row + e] += (
-                p * grad_output[q_row + e].cast[DType.float32]()
+            ref_dv[dense_kv + e] += (
+                p * grad_output[g_row + e].cast[DType.float32]()
             )
-            ref_dk[kv_row + e] += (
+            ref_dk[dense_kv + e] += (
                 ds * query[q_row + e].cast[DType.float32]() * scale
             )
 
@@ -384,6 +493,22 @@ def _compare[
     refmax[slot] = localmax
     nan_count[slot] = nans
     inf_count[slot] = infs
+
+
+def _case_strides(
+    bthd: Int, heads: Int, seq: Int, head_dim: Int
+) -> RowStrides:
+    """The (batch, head, seq) strides of the case's chosen storage layout.
+
+    `bthd == 0` is a dense `[B, H, T, D]` allocation; `bthd != 0` reinterprets
+    the SAME allocation as `[B, T, H, D]` and hands over the transposed view,
+    which is what `x.view(B, T, H, D).transpose(1, 2)` produces. Both are
+    `batch*heads*seq*head_dim` elements, so the buffer and the fill are
+    unchanged and only the addressing differs.
+    """
+    if bthd != 0:
+        return RowStrides(seq * heads * head_dim, head_dim, heads * head_dim)
+    return dense_strides(heads, seq, head_dim)
 
 
 def _percentile(sorted_samples: List[Float64], numerator: Int) -> Float64:
@@ -534,11 +659,16 @@ def run_case[
     var rows = b * h * sq
     var scale = Float32(1.0) / sqrt(Float32(hd))
     var causal = 1 if target.causal else 0
-    var q_st = dense_strides(h, sq, hd)
-    var g_st = q_st
-    var o_st = q_st
-    var k_st = dense_strides(h, skv, hd)
-    var v_st = k_st
+    var q_bthd = target.bthd & 1
+    var k_bthd = (target.bthd >> 1) & 1
+    var v_bthd = (target.bthd >> 2) & 1
+    var g_bthd = (target.bthd >> 3) & 1
+    var o_bthd = (target.bthd >> 4) & 1
+    var q_st = _case_strides(q_bthd, h, sq, hd)
+    var g_st = _case_strides(g_bthd, h, sq, hd)
+    var o_st = _case_strides(o_bthd, h, sq, hd)
+    var k_st = _case_strides(k_bthd, h, skv, hd)
+    var v_st = _case_strides(v_bthd, h, skv, hd)
 
     var qf = ctx.enqueue_create_buffer[DType.float32](qn)
     var kf = ctx.enqueue_create_buffer[DType.float32](kn)
@@ -627,6 +757,10 @@ def run_case[
         hd,
         scale,
         causal,
+        q_bthd,
+        k_bthd,
+        v_bthd,
+        o_bthd,
         grid_dim=(ceildiv(rows, REF_THREADS),),
         block_dim=(REF_THREADS,),
     )
@@ -699,6 +833,11 @@ def run_case[
             hd,
             scale,
             causal,
+            g_bthd,
+            q_bthd,
+            k_bthd,
+            v_bthd,
+            o_bthd,
             grid_dim=(ceildiv(rows, REF_THREADS),),
             block_dim=(REF_THREADS,),
         )
@@ -718,6 +857,11 @@ def run_case[
             hd,
             scale,
             causal,
+            g_bthd,
+            q_bthd,
+            k_bthd,
+            v_bthd,
+            o_bthd,
             grid_dim=(ceildiv(b * h * skv, REF_THREADS),),
             block_dim=(REF_THREADS,),
         )
@@ -762,8 +906,8 @@ def main() raises:
         Int(check),
     )
     print(
-        "case             b   h   sq   skv  hd c   mojo_us    rocm_us  ratio  "
-        "  dq_err     dk_err     dv_err     nan  status"
+        "case             b   h   sq   skv  hd c   in    mojo_us    rocm_us"
+        "  ratio    dq_err     dk_err     dv_err     nan  status"
     )
 
     var mojo_step_us = Float64(0.0)
@@ -792,6 +936,10 @@ def main() raises:
                 _pad(String(target.seq_kv), 5),
                 _pad(String(target.head_dim), 3),
                 Int(target.causal),
+                _pad(
+                    "dense" if target.bthd == 0 else "s" + String(target.bthd),
+                    5,
+                ),
                 _pad(_fixed(r.median_us, 2), 10),
                 _pad(_fixed(target.rocm_us, 2), 10),
                 _pad(ratio, 7),

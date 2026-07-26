@@ -86,6 +86,9 @@ struct FaCase(ImplicitlyCopyable, Movable):
     var causal: Bool
     var calls_per_step: Int
     var rocm_us: Float64
+    # Which operands the caller hands over as a BTHD view: bit 0 Q, bit 1 K,
+    # bit 2 V. 0 is the dense `[batch, heads, seq, head_dim]` layout.
+    var bthd: Int
 
     def __init__(
         out self,
@@ -98,6 +101,7 @@ struct FaCase(ImplicitlyCopyable, Movable):
         causal: Bool,
         calls_per_step: Int,
         rocm_us: Float64,
+        bthd: Int = 0,
     ):
         self.label = label^
         self.batch = batch
@@ -108,6 +112,7 @@ struct FaCase(ImplicitlyCopyable, Movable):
         self.causal = causal
         self.calls_per_step = calls_per_step
         self.rocm_us = rocm_us
+        self.bthd = bthd
 
 
 def cases() -> List[FaCase]:
@@ -131,6 +136,16 @@ def cases() -> List[FaCase]:
     out.append(FaCase("noncausal", 4, 8, 512, 512, 64, False, 1, 0.0))
     out.append(FaCase("cross_kv_longer", 2, 4, 256, 1024, 64, True, 1, 0.0))
     out.append(FaCase("tiny", 1, 1, 3, 3, 8, True, 1, 0.0))
+    # Strided callers. `q.view(B, T, H, D).transpose(1, 2)` is what nanoGPT
+    # actually hands the op: the same bytes, read through
+    # `(T*H*D, D, H*D)` instead of `(H*T*D, T*D, D)`. These allocate the same
+    # buffer and only change the stride triple, so a kernel that quietly indexes
+    # densely reads a permutation of the right values and fails loudly.
+    out.append(FaCase("bthd_qkv", 4, 8, 512, 512, 64, True, 1, 0.0, 7))
+    out.append(FaCase("bthd_q_only", 2, 5, 300, 300, 96, True, 1, 0.0, 1))
+    out.append(FaCase("bthd_hd128", 2, 4, 256, 256, 128, True, 1, 0.0, 7))
+    out.append(FaCase("bthd_cross", 2, 4, 256, 1024, 64, True, 1, 0.0, 7))
+    out.append(FaCase("bthd_noncausal", 4, 8, 512, 512, 64, False, 1, 0.0, 7))
     return out^
 
 
@@ -191,12 +206,23 @@ def _reference_kernel[
     head_dim: Int,
     scale: Float32,
     causal: Int,
+    q_bthd: Int,
+    k_bthd: Int,
+    v_bthd: Int,
 ):
     """One thread per query row, three passes, FP32, no tiling and no rescaling.
 
     Textbook softmax: max, then sum of exponentials, then the weighted sum. This
     is the independent oracle; it must not be optimized, and it must not borrow
     anything from the kernel under test.
+
+    That includes the addressing. The oracle is told the STORAGE LAYOUT of each
+    operand (`*_bthd`: is the allocation `[B, T, H, D]` rather than
+    `[B, H, T, D]`?) and works out where element `(b, h, s, d)` lives from the
+    definition of a row-major array. It is never handed the stride triple the
+    kernel is given, because a wrong stride would then be wrong on both sides
+    and invisible -- which is exactly how the causal-convention defect (journal
+    D10) survived six mutation tests.
     """
     var row = Int(block_idx.x) * REF_THREADS + Int(thread_idx.x)
     var rows = batch * heads * seq_q
@@ -205,8 +231,26 @@ def _reference_kernel[
 
     var qi = row % seq_q
     var bh = row // seq_q
-    var q_base = bh * seq_q * head_dim + qi * head_dim
-    var kv_base = bh * seq_kv * head_dim
+    var head = bh % heads
+    var b = bh // heads
+
+    # `[B, H, T, D]`: (b, h, s, d) is at ((b*H + h)*T + s)*D + d.
+    # `[B, T, H, D]`: (b, h, s, d) is at ((b*T + s)*H + h)*D + d.
+    var q_base = (bh * seq_q + qi) * head_dim
+    if q_bthd != 0:
+        q_base = ((b * seq_q + qi) * heads + head) * head_dim
+    var k_base = bh * seq_kv * head_dim
+    var k_step = head_dim
+    if k_bthd != 0:
+        k_base = (b * seq_kv * heads + head) * head_dim
+        k_step = heads * head_dim
+    var v_base = bh * seq_kv * head_dim
+    var v_step = head_dim
+    if v_bthd != 0:
+        v_base = (b * seq_kv * heads + head) * head_dim
+        v_step = heads * head_dim
+    # The kernel writes a dense output whatever its inputs look like.
+    var o_base = (bh * seq_q + qi) * head_dim
 
     var limit = seq_kv
     if causal != 0:
@@ -219,7 +263,7 @@ def _reference_kernel[
         for e in range(head_dim):
             dot += (
                 query[q_base + e].cast[DType.float32]()
-                * key[kv_base + j * head_dim + e].cast[DType.float32]()
+                * key[k_base + j * k_step + e].cast[DType.float32]()
             )
         var s = dot * scale
         if s > m:
@@ -232,24 +276,24 @@ def _reference_kernel[
         for e in range(head_dim):
             dot += (
                 query[q_base + e].cast[DType.float32]()
-                * key[kv_base + j * head_dim + e].cast[DType.float32]()
+                * key[k_base + j * k_step + e].cast[DType.float32]()
             )
         denom += exp(dot * scale - m)
 
     # Pass 3: the weighted values.
     for e in range(head_dim):
-        ref_out[q_base + e] = 0.0
+        ref_out[o_base + e] = 0.0
     for j in range(limit):
         var dot = Float32(0.0)
         for e in range(head_dim):
             dot += (
                 query[q_base + e].cast[DType.float32]()
-                * key[kv_base + j * head_dim + e].cast[DType.float32]()
+                * key[k_base + j * k_step + e].cast[DType.float32]()
             )
         var p = exp(dot * scale - m) / denom
         for e in range(head_dim):
-            ref_out[q_base + e] += (
-                p * value[kv_base + j * head_dim + e].cast[DType.float32]()
+            ref_out[o_base + e] += (
+                p * value[v_base + j * v_step + e].cast[DType.float32]()
             )
 
 
@@ -293,6 +337,22 @@ def _compare_kernel[
     worst[slot] = local
     nan_count[slot] = nans
     inf_count[slot] = infs
+
+
+def _case_strides(
+    bthd: Int, heads: Int, seq: Int, head_dim: Int
+) -> RowStrides:
+    """The (batch, head, seq) strides of the case's chosen storage layout.
+
+    `bthd == 0` is a dense `[B, H, T, D]` allocation; `bthd != 0` reinterprets
+    the SAME allocation as `[B, T, H, D]` and hands over the transposed view,
+    which is what `x.view(B, T, H, D).transpose(1, 2)` produces. Both are
+    `batch*heads*seq*head_dim` elements, so the buffer and the fill are
+    unchanged and only the addressing differs.
+    """
+    if bthd != 0:
+        return RowStrides(seq * heads * head_dim, head_dim, heads * head_dim)
+    return dense_strides(heads, seq, head_dim)
 
 
 def _percentile(sorted_samples: List[Float64], numerator: Int) -> Float64:
@@ -378,9 +438,12 @@ def run_case[
     var q_count = batch * heads * seq_q * head_dim
     var kv_count = batch * heads * seq_kv * head_dim
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
-    var q_st = dense_strides(heads, seq_q, head_dim)
-    var k_st = dense_strides(heads, seq_kv, head_dim)
-    var v_st = dense_strides(heads, seq_kv, head_dim)
+    var q_bthd = target.bthd & 1
+    var k_bthd = (target.bthd >> 1) & 1
+    var v_bthd = (target.bthd >> 2) & 1
+    var q_st = _case_strides(q_bthd, heads, seq_q, head_dim)
+    var k_st = _case_strides(k_bthd, heads, seq_kv, head_dim)
+    var v_st = _case_strides(v_bthd, heads, seq_kv, head_dim)
 
     var q_f32 = ctx.enqueue_create_buffer[DType.float32](q_count)
     var k_f32 = ctx.enqueue_create_buffer[DType.float32](kv_count)
@@ -501,6 +564,9 @@ def run_case[
             head_dim,
             scale,
             1 if target.causal else 0,
+            q_bthd,
+            k_bthd,
+            v_bthd,
             grid_dim=(ceildiv(rows, REF_THREADS),),
             block_dim=(REF_THREADS,),
         )
@@ -581,8 +647,8 @@ def main() raises:
         Int(check),
     )
     print(
-        "case             b   h   sq   skv  hd c   mojo_us    rocm_us  ratio"
-        "     max_err  tol        nan  inf  status"
+        "case             b   h   sq   skv  hd c   qkv mojo_us    rocm_us"
+        "  ratio     max_err  tol        nan  inf  status"
     )
 
     var mojo_step_us = Float64(0.0)
@@ -611,6 +677,10 @@ def main() raises:
                 _pad(String(target.seq_kv), 5),
                 _pad(String(target.head_dim), 3),
                 Int(target.causal),
+                _pad(
+                    "dense" if target.bthd == 0 else "s" + String(target.bthd),
+                    3,
+                ),
                 _pad(_fixed(r.median_us, 2), 10),
                 _pad(_fixed(target.rocm_us, 2), 10),
                 _pad(ratio, 7),
