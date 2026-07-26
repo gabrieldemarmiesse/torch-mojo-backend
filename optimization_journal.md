@@ -3425,6 +3425,11 @@ Per case, one case per process, 25 warmups and 100 synchronized iterations:
 pass all three gates on all three runs. The 1.03 bar is **not** met; the shortfall
 is 3.1%.
 
+Run-to-run spread matters at this margin and is quoted so it is not mistaken for
+an effect: four independent full per-case sweeps of the same binary give NN
+1.058 / 1.060 / 1.062 / 1.066, NT 1.094 / 1.099 / 1.106 / 1.113 and TN 1.412 /
+1.416 / 1.416 / 1.417. Nothing below 1% should be read as real.
+
 Regression checks, all after the change, one case per process:
 
 | check | before | after |
