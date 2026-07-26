@@ -1893,7 +1893,7 @@ comptime NT_VEC = 8  # elements per global load and per LDS write
     ),
 )
 @__name(
-    t"nt_mfma_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_g{IGLP}_z{SWIZZLE}_p{SPLIT}_l{MASK_LOAD}_t{MASK_STORE}"
+    t"nt_mfma_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_z{SWIZZLE}_l{MASK_LOAD}_t{MASK_STORE}"
 )
 def _nt_mfma_kernel[
     dtype: DType,
@@ -1903,9 +1903,7 @@ def _nt_mfma_kernel[
     WM: Int,
     WN: Int,
     STAGES: Int,
-    IGLP: Int,
     SWIZZLE: Bool,
-    SPLIT: Int,
     MASK_LOAD: Bool,
     MASK_STORE: Bool,
 ](
@@ -1915,6 +1913,7 @@ def _nt_mfma_kernel[
     m: Int,
     n: Int,
     k: Int,
+    xcds: Int,
 ):
     comptime WAVES_N = BN // WN
     comptime THREADS = (BM // WM) * WAVES_N * 64
@@ -1979,8 +1978,29 @@ def _nt_mfma_kernel[
         var wm0 = (wave // WAVES_N) * WM
         var wn0 = (wave % WAVES_N) * WN
 
+        # Output-tile coordinates.  With `xcds > 1` the linear workgroup index is
+        # remapped so that each XCD receives a CONTIGUOUS band of the natural
+        # ordering instead of every `xcds`-th tile: gfx942 dispatches workgroup i
+        # to XCD `i % xcds`, so without this the tiles that share an A row block
+        # land on different XCDs and each one's private L2 fetches its own copy.
         var m0 = Int(block_idx.y) * BM
         var n0 = Int(block_idx.x) * BN
+        if xcds > 1:
+            var nx = Int(grid_dim.x)
+            var total = nx * Int(grid_dim.y)
+            var wgid = Int(block_idx.y) * nx + Int(block_idx.x)
+            # Unlike MAX's own `_xcd_wgm_swizzle` this handles a tile count that
+            # is not a multiple of the XCD count: XCDs below the remainder take
+            # one extra tile, which keeps the map a bijection for every runtime
+            # grid instead of falling back to row-major.
+            var per = total // xcds
+            var rem = total % xcds
+            var xcd = wgid % xcds
+            var slot = wgid // xcds
+            var base = xcd * (per + 1) if xcd < rem else rem + xcd * per
+            wgid = base + slot
+            m0 = (wgid // nx) * BM
+            n0 = (wgid % nx) * BN
 
         # Tile fill: one thread reads NT_VEC contiguous k of one row, so a whole
         # row of BK elements is 2*BK bytes read by TPR adjacent threads.
@@ -2150,38 +2170,14 @@ def _nt_mfma_kernel[
             # (301 against 379 TFLOP/s at 49152x2304x768): it leaves only the
             # vmcnt wait and the LDS stores between the two barriers, so the
             # whole workgroup waits there in lockstep.
-            comptime if IGLP >= 0:
-                llvm_intrinsic["llvm.amdgcn.iglp.opt", NoneType](Int32(IGLP))
-            comptime HALF = KSTEPS // 2
-            comptime if SPLIT == 0:
-                _read_frags[0, KSTEPS](ca, cb)
-                _load(kt + 1)
-                comptime if STAGES == 1:
-                    _nt_barrier()
-                _fill(na, nb)
-                _do_mma[0, KSTEPS]()
-            elif SPLIT == 1:
-                # Half the matrix work is issued between the fragment reads and
-                # the LDS refill, so the refill's stores queue behind MFMAs
-                # rather than behind the reads they cannot overlap.
-                _read_frags[0, KSTEPS](ca, cb)
-                _load(kt + 1)
-                comptime if STAGES == 1:
-                    _nt_barrier()
-                _do_mma[0, HALF]()
-                _fill(na, nb)
-                _do_mma[HALF, KSTEPS]()
-            else:
-                # The second half of the reads is issued before the first half's
-                # MFMAs, so the LDS pipe and the matrix pipe are busy together.
-                _read_frags[0, HALF](ca, cb)
-                _load(kt + 1)
-                comptime if STAGES == 1:
-                    _nt_barrier()
-                _fill(na, nb)
-                _read_frags[HALF, KSTEPS](ca, cb)
-                _do_mma[0, HALF]()
-                _do_mma[HALF, KSTEPS]()
+            _read_frags[0, KSTEPS](ca, cb)
+            _load(kt + 1)
+            comptime if STAGES == 1:
+                # One buffer: every wave must be done reading it before it is
+                # refilled.
+                _nt_barrier()
+            _fill(na, nb)
+            _do_mma[0, KSTEPS]()
             _nt_barrier()
             comptime if STAGES == 2:
                 var ta = ca
@@ -2250,9 +2246,7 @@ def _nt_mfma_gemm[
     WM: Int,
     WN: Int,
     STAGES: Int = 2,
-    IGLP: Int = -1,
     SWIZZLE: Bool = False,
-    SPLIT: Int = 0,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -2260,6 +2254,7 @@ def _nt_mfma_gemm[
     m: Int,
     n: Int,
     k: Int,
+    xcds: Int,
     ctx: DeviceContext,
 ) raises:
     """Enqueue the NT MFMA GEMM, dropping the edge guards when they are unused.
@@ -2272,7 +2267,7 @@ def _nt_mfma_gemm[
     if m % BM == 0 and n % BN == 0 and k % BK == 0:
         ctx.enqueue_function[
             _nt_mfma_kernel[
-                dtype, BM, BN, BK, WM, WN, STAGES, IGLP, SWIZZLE, SPLIT, False, False
+                dtype, BM, BN, BK, WM, WN, STAGES, SWIZZLE, False, False
             ]
         ](
             _make_ptr[dtype](c_addr),
@@ -2281,13 +2276,14 @@ def _nt_mfma_gemm[
             m,
             n,
             k,
+            xcds,
             grid_dim=(ceildiv(n, BN), ceildiv(m, BM)),
             block_dim=(THREADS,),
         )
     else:
         ctx.enqueue_function[
             _nt_mfma_kernel[
-                dtype, BM, BN, BK, WM, WN, STAGES, IGLP, SWIZZLE, SPLIT, True, True
+                dtype, BM, BN, BK, WM, WN, STAGES, SWIZZLE, True, True
             ]
         ](
             _make_ptr[dtype](c_addr),
@@ -2296,6 +2292,7 @@ def _nt_mfma_gemm[
             m,
             n,
             k,
+            xcds,
             grid_dim=(ceildiv(n, BN), ceildiv(m, BM)),
             block_dim=(THREADS,),
         )
@@ -2334,14 +2331,32 @@ def _nt_mfma_route[
     # tile start aligned too.
     if k % NT_VEC != 0 or a_addr % 16 != 0 or b_addr % 16 != 0:
         return False
-    if m >= 256 and n >= 256:
-        _nt_mfma_gemm[dtype, 256, 256, 32, 64, 64, 2, -1, True](
-            c_addr, a_addr, b_addr, m, n, k, ctx
+    # gfx942 dispatches workgroup i to XCD `i % xcds`, and each XCD has its own
+    # L2, so the kernel remaps the linear workgroup index to give every XCD a
+    # contiguous band of output tiles.  CDNA3 chiplets are 38 CUs, so the runtime
+    # CU count gives the chiplet count; a wrong value costs locality only,
+    # because the remap is a bijection for any value >= 1.  Measured, one case
+    # per process: attn_c_proj 144.6 -> 138.2 us, mlp_c_proj 584.7 -> 530.2,
+    # mlp_c_fc 554.1 -> 532.2, attn_c_attn 399.8 -> 406.2, lm_head 8588 -> 8619.
+    var cus = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var xcds = max(1, cus // 38)
+    # Only one workgroup of this tile is resident per CU -- sixteen wave64 and
+    # the whole LDS budget -- so an output grid that does not cover the device
+    # leaves CUs idle for the entire k loop with no second workgroup to fill
+    # them.  Take the largest tile whose grid still covers every CU, and decline
+    # below that so the caller keeps its existing route: measured, the 256x256
+    # tile is 19-49% SLOWER than that route at (4096, 768, 3072),
+    # (2048, 768, 3072) and (1024, 2304, 3072), whose grids are 48, 24 and 36
+    # workgroups on 304 CUs.  Both the tile count and the CU count are runtime
+    # values.
+    if ceildiv(m, 256) * ceildiv(n, 256) >= cus:
+        _nt_mfma_gemm[dtype, 256, 256, 32, 64, 64, 2, True](
+            c_addr, a_addr, b_addr, m, n, k, xcds, ctx
         )
         return True
-    if m >= 128 and n >= 128:
-        _nt_mfma_gemm[dtype, 128, 128, 32, 64, 64, 2, -1, True](
-            c_addr, a_addr, b_addr, m, n, k, ctx
+    if ceildiv(m, 128) * ceildiv(n, 128) >= cus:
+        _nt_mfma_gemm[dtype, 128, 128, 32, 64, 64, 2, True](
+            c_addr, a_addr, b_addr, m, n, k, xcds, ctx
         )
         return True
     return False
