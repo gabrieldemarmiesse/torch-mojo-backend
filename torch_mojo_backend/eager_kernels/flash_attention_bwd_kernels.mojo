@@ -47,10 +47,13 @@ which is why `softmax_lse` is an argument.
   head-dim elements at a time.
 * No allocation, no host transfer, no synchronization: enqueue on the caller's
   `DeviceContext` and return. Multiple kernel launches are fine.
-* Write only to `dq`, `dk`, `dv`. Everything else is read-only. The three output
-  buffers arrive ZEROED, so a kernel may accumulate into them, but it must then
-  be launched such that no two workgroups accumulate into the same element
-  without atomics -- silently losing a contribution is the classic defect here.
+* Write only to `dq`, `dk`, `dv`. Everything else is read-only. Those three are
+  WRITE-ONLY and arrive UNINITIALIZED: a replacement must store every live
+  element, because the bridge no longer zeros them (that cost 728 us/step and
+  bought nothing). Accumulate in registers and store, as both kernels here do.
+  A kernel that genuinely needs to accumulate in global memory must zero them
+  itself AND avoid two workgroups touching one element without atomics --
+  silently losing a contribution is the classic defect in this family.
 * Accumulate in FP32, store once in `dtype`.
 * Seed any running max with `Float32.MIN_FINITE`, never `Float32.MIN` -- the
   latter is -inf, so a lane that never runs its loop body computes

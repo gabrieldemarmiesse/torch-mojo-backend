@@ -155,39 +155,22 @@ def _flash_attention_backward_go(
             var dq = _make_ptr[dt](_raw_int(dq_obj))
             var dk = _make_ptr[dt](_raw_int(dk_obj))
             var dv = _make_ptr[dt](_raw_int(dv_obj))
-            # The kernel may accumulate into these; the contract is that they
-            # arrive zeroed. The zeroing is by element COUNT from the base
-            # pointer, so each gradient must span exactly its own
-            # `batch * heads * seq * head_dim` elements there -- true for a dense
-            # allocation and for any permutation of its four axes, which is all
-            # the Python caller ever hands over.
-            ctx.enqueue_memset(
-                DeviceBuffer(
-                    ctx,
-                    dq.address_space_cast[AddressSpace.GENERIC](),
-                    batch * heads * seq_q * head_dim,
-                    owning=False,
-                ),
-                Scalar[dt](0),
-            )
-            ctx.enqueue_memset(
-                DeviceBuffer(
-                    ctx,
-                    dk.address_space_cast[AddressSpace.GENERIC](),
-                    batch * heads * seq_kv * head_dim,
-                    owning=False,
-                ),
-                Scalar[dt](0),
-            )
-            ctx.enqueue_memset(
-                DeviceBuffer(
-                    ctx,
-                    dv.address_space_cast[AddressSpace.GENERIC](),
-                    batch * heads * seq_kv * head_dim,
-                    owning=False,
-                ),
-                Scalar[dt](0),
-            )
+            # dq/dk/dv are WRITE-ONLY. This bridge used to zero all three
+            # first, because the original contract let a kernel accumulate into
+            # them -- 36 memsets and 728 us per nanoGPT step, third-largest
+            # launch cost in the whole profile. Both shipped kernels accumulate
+            # in REGISTERS and only ever store, and every store is guarded
+            # solely by tensor bounds (`row < seq`, `col < head_dim`), never by
+            # anything that could skip a live element.
+            #
+            # Verified rather than reasoned: fill all three with a poison value,
+            # run without zeroing, count survivors. Zero survivors on nanoGPT,
+            # hd96/300, hd128, seq1025, seq_kv > seq_q, and 3x3 -- see
+            # scratchpad `poison_probe.mojo` and the journal.
+            #
+            # A future kernel that accumulates must zero them itself, or restore
+            # this. Do not reintroduce the memsets speculatively; they are not
+            # free.
             enqueue_flash_attention_bwd[dt](
                 dq.as_unsafe_any_origin(),
                 dk.as_unsafe_any_origin(),
