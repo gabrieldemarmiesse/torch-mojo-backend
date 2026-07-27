@@ -821,6 +821,50 @@ def mojo_device_min_dim_min(
 _register_fast("aten::_adaptive_avg_pool2d", "fast_aten__adaptive_avg_pool2d")
 
 
+def _register_foreach_inplace(op_name: str, fast_name: str) -> None:
+    """Register a mutable ()-returning foreach op: batched fast path, with
+    ATen's exact sequential semantics as the fallback (redispatched below
+    this PrivateUse1 registration, like `_foreach_mul_.Tensor`)."""
+    packet_name, _, overload_name = op_name.removeprefix("aten::").partition(".")
+    aten_op = getattr(getattr(torch.ops.aten, packet_name), overload_name or "default")
+
+    @register_aten_op(op_name)
+    def dispatcher(self, *args, **kwargs):
+        aten_fast = _fast()
+        result = getattr(aten_fast, fast_name)(self, *args, **kwargs)
+        if result is aten_fast.NOT_HANDLED:
+            result = aten_op.redispatch(
+                _COMPOSITE_EXPLICIT_AUTOGRAD, self, *args, **kwargs
+            )
+            # This explicit redispatch runs below ADInplaceOrView, so the
+            # TensorList version update is manual on both paths (mutable
+            # TensorList schemas returning () get no automatic bump).
+            torch.autograd.graph.increment_version(self)
+            return result
+        torch.autograd.graph.increment_version(self)
+        return None
+
+
+_register_foreach_inplace(
+    "aten::_foreach_add_.Scalar", "fast_aten__foreach_add__scalar"
+)
+_register_foreach_inplace(
+    "aten::_foreach_addcdiv_.ScalarList", "fast_aten__foreach_addcdiv__scalarlist"
+)
+_register_foreach_inplace(
+    "aten::_foreach_addcmul_.Scalar", "fast_aten__foreach_addcmul__scalar"
+)
+_register_foreach_inplace(
+    "aten::_foreach_div_.ScalarList", "fast_aten__foreach_div__scalarlist"
+)
+_register_foreach_inplace(
+    "aten::_foreach_lerp_.Scalar", "fast_aten__foreach_lerp__scalar"
+)
+_register_foreach_inplace(
+    "aten::_foreach_mul_.Scalar", "fast_aten__foreach_mul__scalar"
+)
+
+
 @register_aten_op("aten::_foreach_mul_.Tensor")
 def mojo_device__foreach_mul__tensor(self, other):
     aten_fast = _fast()
@@ -851,6 +895,17 @@ def mojo_device__foreach_norm_scalar(self, ord=2, dtype=None):
             return torch.ops.aten._foreach_norm.Scalar.redispatch(
                 _COMPOSITE_EXPLICIT_AUTOGRAD, self, ord, dtype=dtype
             )
+    return result
+
+
+@register_aten_op("aten::_foreach_sqrt")
+def mojo_device__foreach_sqrt(self):
+    aten_fast = _fast()
+    result = aten_fast.fast_aten__foreach_sqrt(self)
+    if result is aten_fast.NOT_HANDLED:
+        return torch.ops.aten._foreach_sqrt.default.redispatch(
+            _COMPOSITE_EXPLICIT_AUTOGRAD, self
+        )
     return result
 
 

@@ -247,6 +247,7 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
             float(scale) if scale is not None else 1.0 / math.sqrt(query._shape[-1])
         )
         ctx.has_dropout = dropout_mask is not None
+        ctx.is_causal = bool(is_causal)
         ctx.dropout_scale = (
             (0.0 if float(dropout_p) == 1.0 else 1.0 / (1.0 - float(dropout_p)))
             if ctx.has_dropout
@@ -283,7 +284,45 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
         grad_key3 = None
         grad_value3 = None
 
-        if need_value:
+        # Fused Apple-GPU route: at most five launches, no permute copies and
+        # no dropout-backward pass (causal structure exploited end to end).
+        # Unsupported inputs fall through to the exact composed sequence.
+        fused = aten_fast.NOT_HANDLED
+        if need_query or need_key or need_value:
+            q3 = (
+                _contiguous_view(saved["query"], (batch_heads, query_length, head_dim))
+                if "query" in saved
+                else None
+            )
+            k3 = (
+                _contiguous_view(saved["key"], (batch_heads, key_length, head_dim))
+                if "key" in saved
+                else None
+            )
+            v3 = (
+                _contiguous_view(saved["value"], (batch_heads, key_length, head_dim))
+                if "value" in saved
+                else None
+            )
+            fused = aten_fast.fast_sdpa_backward(
+                p3,
+                grad3,
+                mask3,
+                q3,
+                k3,
+                v3,
+                need_query,
+                need_key,
+                need_value,
+                getattr(ctx, "is_causal", False),
+                ctx.dropout_scale,
+                ctx.scale,
+            )
+            del q3, k3, v3
+        if fused is not aten_fast.NOT_HANDLED:
+            grad_query3, grad_key3, grad_value3 = fused
+            saved.clear()
+        elif need_value:
             effective_p3 = p3
             if ctx.has_dropout:
                 effective_p3 = _require_handled(
@@ -315,7 +354,7 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
             if effective_p3 is not p3:
                 del effective_p3
 
-        if need_query or need_key:
+        if fused is aten_fast.NOT_HANDLED and (need_query or need_key):
             v = saved.pop("value")._contig()
             v3 = _contiguous_view(v, (batch_heads, key_length, head_dim))
             # dP_drop = grad @ V^T. BmmSpec's logical transpose flag keeps V

@@ -19,7 +19,7 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.host import DeviceContext
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
-from std.sys.info import has_accelerator, size_of
+from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
 from std.algorithm.functional import elementwise
@@ -103,6 +103,78 @@ def _permute_copy_kernel[
         i += gstride
 
 
+def _permute_copy_rows4_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d1: Int,
+    d2: Int,
+    d3_4: Int,
+    s0: Int,
+    s1: Int,
+    s2: Int,
+    nchunks: Int,
+):
+    # Innermost dim contiguous in BOTH buffers (s3 == 1): each thread moves
+    # one 4-element vector, so the coordinate div/mod chain runs once per 4
+    # elements and every access is a vector load/store.  This is the
+    # post-SDPA `.contiguous()` shape: a batched gather of contiguous rows.
+    comptime vec_align = 4 * size_of[dtype]()
+    var c = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while c < nchunks:
+        var j = c % d3_4
+        var rest = c // d3_4
+        var i2 = rest % d2
+        rest = rest // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        out_ptr.store[width=4, alignment=vec_align](
+            c * 4,
+            in_ptr.load[width=4, alignment=vec_align](
+                i0 * s0 + i1 * s1 + i2 * s2 + j * 4
+            ),
+        )
+        c += gstride
+
+
+def _permute_copy_rowloop_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d1: Int,
+    d2: Int,
+    d3_4: Int,
+    s0: Int,
+    s1: Int,
+    s2: Int,
+    nrows: Int,
+):
+    # One thread per (i0, i1, i2) row: the div/mod chain runs once per d3
+    # elements and the sequential vector moves give each thread load-level
+    # parallelism.  Measured ~2.5x the chunk kernel's throughput on Apple at
+    # the post-SDPA shape; only used when there are enough rows to fill the
+    # machine.
+    comptime vec_align = 4 * size_of[dtype]()
+    var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while r < nrows:
+        var i2 = r % d2
+        var rest = r // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        var src = i0 * s0 + i1 * s1 + i2 * s2
+        var dst = r * d3_4 * 4
+        for j in range(d3_4):
+            out_ptr.store[width=4, alignment=vec_align](
+                dst + j * 4,
+                in_ptr.load[width=4, alignment=vec_align](src + j * 4),
+            )
+        r += gstride
+
+
 @always_inline
 def _permute_copy[
     dtype: DType
@@ -141,6 +213,57 @@ def _permute_copy[
         elementwise[func, simd_width=1](Coord(total), ctx)
     else:
         comptime if has_accelerator():
+            # Apple fast path: strided-rows gather with vector moves when the
+            # innermost dim is contiguous on both sides and everything stays
+            # 4-element aligned (the transpose-materialize hot case).
+            comptime if has_apple_gpu_accelerator():
+                comptime vec_align = 4 * size_of[dtype]()
+                if (
+                    total > 0
+                    and s3 == 1
+                    and d3 % 4 == 0
+                    and (s0 | s1 | s2) % 4 == 0
+                    and (out_addr | in_addr) % vec_align == 0
+                ):
+                    var nrows = d0 * d1 * d2
+                    if nrows >= 4096:
+                        _enqueue_cached[_permute_copy_rowloop_kernel[dtype]](
+                            ctx,
+                            String(t"dm_permute_rowloop_{dtype}"),
+                            _gs_blocks(nrows),
+                            1,
+                            1,
+                            GS_THREADS,
+                            out_ptr.as_unsafe_any_origin(),
+                            in_ptr.as_unsafe_any_origin().as_immutable(),
+                            d1,
+                            d2,
+                            d3 // 4,
+                            s0,
+                            s1,
+                            s2,
+                            nrows,
+                        )
+                        return
+                    var nchunks = total // 4
+                    _enqueue_cached[_permute_copy_rows4_kernel[dtype]](
+                        ctx,
+                        String(t"dm_permute_rows4_{dtype}"),
+                        _gs_blocks(nchunks),
+                        1,
+                        1,
+                        GS_THREADS,
+                        out_ptr.as_unsafe_any_origin(),
+                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        d1,
+                        d2,
+                        d3 // 4,
+                        s0,
+                        s1,
+                        s2,
+                        nchunks,
+                    )
+                    return
             _enqueue_cached[_permute_copy_kernel[dtype]](
                 ctx,
                 String(t"dm_permute_{dtype}"),
@@ -365,6 +488,217 @@ def _cat2_dispatcher(
             args[5],
             args[6],
             args[7],
+        )
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+# ---------------------------------------------------------------------------
+# Fused three-input concatenation: the _cat2_kernel2d pattern extended to
+# three contiguous sources (the split-backward reassembly cat), so the
+# append pays one launch instead of three.
+# ---------------------------------------------------------------------------
+
+
+def _cat3_kernel2d[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    in2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    in3_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    len1_4: Int,
+    len2_4: Int,
+    len3_4: Int,
+):
+    comptime vec_align = 4 * size_of[dtype]()
+    var o = Int(block_idx.y)
+    var total4 = len1_4 + len2_4 + len3_4
+    var out_base = o * total4 * 4
+    var c = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var cstride = Int(grid_dim.x) * Int(block_dim.x)
+    while c < total4:
+        var v: SIMD[dtype, 4]
+        if c < len1_4:
+            v = in1_ptr.load[width=4, alignment=vec_align]((o * len1_4 + c) * 4)
+        elif c < len1_4 + len2_4:
+            v = in2_ptr.load[width=4, alignment=vec_align](
+                (o * len2_4 + c - len1_4) * 4
+            )
+        else:
+            v = in3_ptr.load[width=4, alignment=vec_align](
+                (o * len3_4 + c - len1_4 - len2_4) * 4
+            )
+        out_ptr.store[width=4, alignment=vec_align](out_base + c * 4, v)
+        c += cstride
+
+
+def _cat3_segloop_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    in2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    in3_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    len1_4: Int,
+    len2_4: Int,
+    len3_4: Int,
+    outer: Int,
+):
+    # One thread per (row, source) segment: each thread streams its
+    # segment's vectors sequentially (the access pattern this GPU streams
+    # at full rate), with the source chosen once per thread.  Threads with
+    # the same source are consecutive, so the branch is warp-uniform for
+    # outer >= warp size.
+    comptime vec_align = 4 * size_of[dtype]()
+    var total4 = len1_4 + len2_4 + len3_4
+    var nsegs = outer * 3
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while t < nsegs:
+        var o = t % outer
+        var s = t // outer
+        var seg_len: Int
+        var dst_off: Int
+        if s == 0:
+            seg_len = len1_4
+            dst_off = 0
+        elif s == 1:
+            seg_len = len2_4
+            dst_off = len1_4
+        else:
+            seg_len = len3_4
+            dst_off = len1_4 + len2_4
+        var sbase = o * seg_len * 4
+        var dbase = (o * total4 + dst_off) * 4
+        for j in range(seg_len):
+            var v: SIMD[dtype, 4]
+            if s == 0:
+                v = in1_ptr.load[width=4, alignment=vec_align](sbase + j * 4)
+            elif s == 1:
+                v = in2_ptr.load[width=4, alignment=vec_align](sbase + j * 4)
+            else:
+                v = in3_ptr.load[width=4, alignment=vec_align](sbase + j * 4)
+            out_ptr.store[width=4, alignment=vec_align](dbase + j * 4, v)
+        t += gstride
+
+
+def _cat3_go(
+    out_ptr_o: PyObjectPtr,
+    in1_ptr_o: PyObjectPtr,
+    in2_ptr_o: PyObjectPtr,
+    in3_ptr_o: PyObjectPtr,
+    outer_o: PyObjectPtr,
+    len1_o: PyObjectPtr,
+    len2_o: PyObjectPtr,
+    len3_o: PyObjectPtr,
+    itemsize_o: PyObjectPtr,
+    ctx_ptr: PyObjectPtr,
+) raises:
+    var out_addr = _raw_int(out_ptr_o)
+    var in1_addr = _raw_int(in1_ptr_o)
+    var in2_addr = _raw_int(in2_ptr_o)
+    var in3_addr = _raw_int(in3_ptr_o)
+    var outer = _raw_int(outer_o)
+    var len1 = _raw_int(len1_o)
+    var len2 = _raw_int(len2_o)
+    var len3 = _raw_int(len3_o)
+    var itemsize = _raw_int(itemsize_o)
+    var ctx = _raw_ctx(ctx_ptr)
+
+    if (
+        ctx.api() == "cpu"
+        or len1 % 4 != 0
+        or len2 % 4 != 0
+        or len3 % 4 != 0
+        or outer > 65535
+    ):
+        raise Error("cat3 fast path preconditions not met")
+    comptime if has_accelerator():
+        var total4 = (len1 + len2 + len3) // 4
+        var gx = max(1, min((total4 + GS_THREADS - 1) // GS_THREADS, 32))
+        var nsegs = outer * 3
+        var handled = False
+        comptime for dt in [
+            DType.uint32,
+            DType.uint16,
+            DType.uint64,
+            DType.uint8,
+        ]:
+            if itemsize == size_of[dt]():
+                if nsegs >= 2048:
+                    # Enough segments to fill the machine with one
+                    # sequential stream per thread.
+                    _enqueue_cached[_cat3_segloop_kernel[dt]](
+                        ctx,
+                        String(t"dm_cat3_seg_{dt}"),
+                        _gs_blocks(nsegs),
+                        1,
+                        1,
+                        GS_THREADS,
+                        _make_ptr[dt](out_addr).as_unsafe_any_origin(),
+                        _make_ptr[dt](in1_addr)
+                        .as_unsafe_any_origin()
+                        .as_immutable(),
+                        _make_ptr[dt](in2_addr)
+                        .as_unsafe_any_origin()
+                        .as_immutable(),
+                        _make_ptr[dt](in3_addr)
+                        .as_unsafe_any_origin()
+                        .as_immutable(),
+                        len1 // 4,
+                        len2 // 4,
+                        len3 // 4,
+                        outer,
+                    )
+                else:
+                    _enqueue_cached[_cat3_kernel2d[dt]](
+                        ctx,
+                        String(t"dm_cat3_{dt}"),
+                        gx,
+                        outer,
+                        1,
+                        GS_THREADS,
+                        _make_ptr[dt](out_addr).as_unsafe_any_origin(),
+                        _make_ptr[dt](in1_addr)
+                        .as_unsafe_any_origin()
+                        .as_immutable(),
+                        _make_ptr[dt](in2_addr)
+                        .as_unsafe_any_origin()
+                        .as_immutable(),
+                        _make_ptr[dt](in3_addr)
+                        .as_unsafe_any_origin()
+                        .as_immutable(),
+                        len1 // 4,
+                        len2 // 4,
+                        len3 // 4,
+                    )
+                handled = True
+        if not handled:
+            raise Error("unsupported element size for cat3")
+    else:
+        raise Error("no GPU accelerator available at compile time")
+
+
+def _cat3_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _cat3_go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+            args[9],
         )
         return _raw_ret_none()
     except e:
@@ -1633,6 +1967,14 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
             docstring=(
                 "(out, in1, in2, outer, len1, len2, itemsize, ctx); fused"
                 " two-input concat rows"
+            ),
+        )
+        b.def_py_c_function(
+            _cat3_dispatcher,
+            "Cat3",
+            docstring=(
+                "(out, in1, in2, in3, outer, len1, len2, len3, itemsize,"
+                " ctx); fused three-input concat rows"
             ),
         )
         b.def_py_c_function(

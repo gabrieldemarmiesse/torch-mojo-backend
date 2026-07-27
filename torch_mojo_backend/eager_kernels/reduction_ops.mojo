@@ -39,7 +39,7 @@ from std.sys._assembly import inlined_assembly
 from std.sys.info import has_accelerator, is_nvidia_gpu, size_of
 from std.utils.coord import Coord
 from std.utils.index import IndexList
-from std.utils.numerics import min_or_neg_inf, max_or_inf
+from std.utils.numerics import min_finite, min_or_neg_inf, max_or_inf
 from std.utils.static_tuple import StaticTuple
 
 from std.algorithm.reduction import product, sum
@@ -799,7 +799,12 @@ def _log_softmax_rows_block_kernel[
         var tail_start = head + n_vec * V  # first row-local index of the tail
 
         # ---- Pass 1: online max + sum over the row, one global read. ----
-        var m_vec = SIMD[DType.float32, V](Float32.MIN)
+        # Finite lowest, not -inf (Float32.MIN == -inf): threads with no
+        # vector work keep this initial m, and the collapse below computes
+        # s_vec * exp(m_vec - m_t) = 0 * exp(-inf - -inf) = 0 * NaN with an
+        # -inf sentinel. NVIDIA's exp lowering happens to launder that NaN;
+        # Metal propagates it into block.sum and the whole row.
+        var m_vec = SIMD[DType.float32, V](min_finite[DType.float32]())
         var s_vec = SIMD[DType.float32, V](0.0)
         var v = tid
         while v < n_vec:

@@ -23,6 +23,7 @@ backend keeps using `aten_functions` directly.
 import math
 import struct
 import warnings
+from collections.abc import Sequence
 
 import torch
 from max.dtype import DType
@@ -52,6 +53,7 @@ NOT_HANDLED = object()
 _SDPA_BACKWARD_SOURCE_PATHS = (
     eager_kernels._PACKAGE_DIR / "sdpa_backward_ops.mojo",
     eager_kernels._PACKAGE_DIR / "sdpa_dropout_softmax_backward_kernels.mojo",
+    eager_kernels._PACKAGE_DIR / "sdpa_backward_gemm_kernels.mojo",
 )
 
 # Keep the optional BF16 bridge dormant until the bridge, optimized dispatcher,
@@ -154,6 +156,17 @@ _FUSED_ADAMW_RECORD_FIELDS = 7
 _FOREACH_CHUNK_ELEMENTS = 65_536
 _FOREACH_NORM_RECORD_FIELDS = 3
 _FOREACH_MUL_RECORD_FIELDS = 2
+
+# Opcodes of the batched foreach elementwise bridge (must match
+# foreach_elementwise_kernels.mojo).
+_FOREACH_EW_MUL = 0
+_FOREACH_EW_ADD = 1
+_FOREACH_EW_DIV = 2
+_FOREACH_EW_ADDCMUL = 0
+_FOREACH_EW_ADDCDIV = 1
+
+# ATen Scalar arguments as they arrive at a PrivateUse1 registration.
+AtenScalar = int | float | bool | complex
 
 
 def _t(x) -> TorchMojoTensor | None:
@@ -347,6 +360,268 @@ def fast_aten__foreach_mul__tensor(self, other):
         metadata, scalar._ptr, _ctx_ptr(device)
     )
     return None
+
+
+def _foreach_scalar_value(scalar: AtenScalar) -> float | None:
+    """A python float for an ATen Scalar, or None when it disqualifies."""
+    if isinstance(scalar, bool) or not isinstance(scalar, int | float):
+        return None
+    return float(scalar)
+
+
+def _foreach_scalar_values(
+    scalars: Sequence[AtenScalar], count: int
+) -> list[float] | None:
+    if len(scalars) != count:
+        return None
+    values = []
+    for scalar in scalars:
+        value = _foreach_scalar_value(scalar)
+        if value is None:
+            return None
+        values.append(value)
+    return values
+
+
+def _foreach_metal_f32(
+    *lists: Sequence[torch.Tensor],
+) -> list[list[TorchMojoTensor]] | None:
+    """Unwrap parallel TensorLists for the batched Metal foreach kernels.
+
+    Qualifies only homogeneous lists: every entry a contiguous float32
+    TorchMojoTensor on one shared Metal device, with corresponding entries
+    of all lists shaped identically (the batched kernels are elementwise
+    and never broadcast). Returns None otherwise so callers fall back.
+    """
+    count = len(lists[0])
+    if count == 0:
+        return None
+    unwrapped = []
+    for tensors in lists:
+        if len(tensors) != count:
+            return None
+        wrapped = []
+        for tensor in tensors:
+            mojo_tensor = _t(tensor)
+            if mojo_tensor is None:
+                return None
+            wrapped.append(mojo_tensor)
+        unwrapped.append(wrapped)
+    device = unwrapped[0][0]._device
+    if device.api != "metal":
+        return None
+    for tensors in unwrapped:
+        for index, tensor in enumerate(tensors):
+            if (
+                tensor._device != device
+                or tensor._dtype != DType.float32
+                or not tensor._is_contiguous
+                or tensor._shape != unwrapped[0][index]._shape
+            ):
+                return None
+    return unwrapped
+
+
+def _foreach_mutation_hazard(
+    mutated: Sequence[TorchMojoTensor], operands: Sequence[Sequence[TorchMojoTensor]]
+) -> bool:
+    """Whether a mutated tensor's bytes intersect any other tensor's bytes.
+
+    One batched launch gives no ordering between slots, so any aliasing
+    that the sequential per-tensor fallback would tolerate (including exact
+    self-aliasing operands) is conservatively routed back to it. Operands
+    may freely alias each other (addcmul_(v, g, g) is the common case).
+    """
+    if _foreach_tensors_overlap(mutated):
+        return True
+    mutated_intervals = sorted(
+        (tensor._ptr, tensor._ptr + tensor._numel * tensor._itemsize)
+        for tensor in mutated
+        if tensor._numel > 0
+    )
+    operand_intervals = sorted(
+        (tensor._ptr, tensor._ptr + tensor._numel * tensor._itemsize)
+        for tensors in operands
+        for tensor in tensors
+        if tensor._numel > 0
+    )
+    merged: list[list[int]] = []
+    for begin, end in operand_intervals:
+        if merged and begin <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([begin, end])
+    mutated_index = 0
+    merged_index = 0
+    while mutated_index < len(mutated_intervals) and merged_index < len(merged):
+        mutated_begin, mutated_end = mutated_intervals[mutated_index]
+        operand_begin, operand_end = merged[merged_index]
+        if mutated_end <= operand_begin:
+            mutated_index += 1
+        elif operand_end <= mutated_begin:
+            merged_index += 1
+        else:
+            return True
+    return False
+
+
+def _foreach_scalar_inplace(
+    self: Sequence[torch.Tensor], values: Sequence[float], op_code: int
+) -> object:
+    """Shared launch path of the in-place foreach mul/add/div fast ops."""
+    lists = _foreach_metal_f32(self)
+    if lists is None:
+        return NOT_HANDLED
+    (tensors,) = lists
+    if _foreach_mutation_hazard(tensors, ()):
+        return NOT_HANDLED
+    metadata = tuple(
+        value for tensor in tensors for value in (tensor._ptr, tensor._numel)
+    )
+    eager_kernels.optimizer_ops.ForeachScalarOp(
+        op_code, metadata, tuple(values), _ctx_ptr(tensors[0]._device)
+    )
+    return None
+
+
+def fast_aten__foreach_mul__scalar(
+    self: Sequence[torch.Tensor], scalar: AtenScalar
+) -> object:
+    """Batched homogeneous FP32 in-place multiply by one host scalar."""
+    value = _foreach_scalar_value(scalar)
+    if value is None:
+        return NOT_HANDLED
+    return _foreach_scalar_inplace(self, [value] * len(self), _FOREACH_EW_MUL)
+
+
+def fast_aten__foreach_add__scalar(
+    self: Sequence[torch.Tensor], scalar: AtenScalar
+) -> object:
+    """Batched homogeneous FP32 in-place add of one host scalar."""
+    value = _foreach_scalar_value(scalar)
+    if value is None:
+        return NOT_HANDLED
+    return _foreach_scalar_inplace(self, [value] * len(self), _FOREACH_EW_ADD)
+
+
+def fast_aten__foreach_div__scalarlist(
+    self: Sequence[torch.Tensor], scalars: Sequence[AtenScalar]
+) -> object:
+    """Batched homogeneous FP32 in-place divide by one scalar per tensor."""
+    values = _foreach_scalar_values(scalars, len(self))
+    if values is None:
+        return NOT_HANDLED
+    return _foreach_scalar_inplace(self, values, _FOREACH_EW_DIV)
+
+
+def fast_aten__foreach_lerp__scalar(
+    self: Sequence[torch.Tensor], tensors1: Sequence[torch.Tensor], weight: AtenScalar
+) -> object:
+    """Batched homogeneous FP32 in-place scalar lerp toward `tensors1`.
+
+    Mirrors `fast_aten_lerp`: the weight is narrowed to float32 first and
+    selects ATen's numerically stable branch on the host, so the batched
+    kernel computes exactly what the sequential composition computes.
+    """
+    if isinstance(weight, bool) or not isinstance(weight, int | float):
+        return NOT_HANDLED
+    lists = _foreach_metal_f32(self, tensors1)
+    if lists is None:
+        return NOT_HANDLED
+    tensors, ends = lists
+    if _foreach_mutation_hazard(tensors, (ends,)):
+        return NOT_HANDLED
+    try:
+        narrowed_weight = struct.unpack("=f", struct.pack("=f", weight))[0]
+    except (OverflowError, struct.error) as exc:
+        raise RuntimeError(
+            "value cannot be converted to type float without overflow"
+        ) from exc
+    one_minus_weight = struct.unpack("=f", struct.pack("=f", 1.0 - narrowed_weight))[0]
+    metadata = tuple(
+        value
+        for tensor, end in zip(tensors, ends, strict=True)
+        for value in (tensor._ptr, end._ptr, tensor._numel)
+    )
+    eager_kernels.optimizer_ops.ForeachLerpScalar(
+        metadata,
+        narrowed_weight,
+        one_minus_weight,
+        int(abs(narrowed_weight) < 0.5),
+        _ctx_ptr(tensors[0]._device),
+    )
+    return None
+
+
+def _foreach_addc_inplace(
+    self: Sequence[torch.Tensor],
+    tensor1: Sequence[torch.Tensor],
+    tensor2: Sequence[torch.Tensor],
+    values: Sequence[float],
+    op_code: int,
+) -> object:
+    """Shared launch path of the in-place foreach addcmul/addcdiv fast ops."""
+    lists = _foreach_metal_f32(self, tensor1, tensor2)
+    if lists is None:
+        return NOT_HANDLED
+    tensors, firsts, seconds = lists
+    if _foreach_mutation_hazard(tensors, (firsts, seconds)):
+        return NOT_HANDLED
+    metadata = tuple(
+        value
+        for tensor, first, second in zip(tensors, firsts, seconds, strict=True)
+        for value in (tensor._ptr, first._ptr, second._ptr, tensor._numel)
+    )
+    eager_kernels.optimizer_ops.ForeachAddcOp(
+        op_code, metadata, tuple(values), _ctx_ptr(tensors[0]._device)
+    )
+    return None
+
+
+def fast_aten__foreach_addcmul__scalar(
+    self: Sequence[torch.Tensor],
+    tensor1: Sequence[torch.Tensor],
+    tensor2: Sequence[torch.Tensor],
+    value: AtenScalar = 1,
+) -> object:
+    """Batched homogeneous FP32 in-place self += value * (t1 * t2)."""
+    scalar = _foreach_scalar_value(value)
+    if scalar is None:
+        return NOT_HANDLED
+    return _foreach_addc_inplace(
+        self, tensor1, tensor2, [scalar] * len(self), _FOREACH_EW_ADDCMUL
+    )
+
+
+def fast_aten__foreach_addcdiv__scalarlist(
+    self: Sequence[torch.Tensor],
+    tensor1: Sequence[torch.Tensor],
+    tensor2: Sequence[torch.Tensor],
+    scalars: Sequence[AtenScalar],
+) -> object:
+    """Batched homogeneous FP32 in-place self += s[i] * (t1 / t2)."""
+    values = _foreach_scalar_values(scalars, len(self))
+    if values is None:
+        return NOT_HANDLED
+    return _foreach_addc_inplace(self, tensor1, tensor2, values, _FOREACH_EW_ADDCDIV)
+
+
+def fast_aten__foreach_sqrt(self: Sequence[torch.Tensor]) -> object:
+    """Batched homogeneous FP32 out-of-place elementwise square roots."""
+    lists = _foreach_metal_f32(self)
+    if lists is None:
+        return NOT_HANDLED
+    (tensors,) = lists
+    outputs = [
+        _alloc(tensor._shape, DType.float32, tensor._device) for tensor in tensors
+    ]
+    metadata = tuple(
+        value
+        for tensor, output in zip(tensors, outputs, strict=True)
+        for value in (tensor._ptr, output._ptr, tensor._numel)
+    )
+    eager_kernels.optimizer_ops.ForeachSqrt(metadata, _ctx_ptr(tensors[0]._device))
+    return outputs
 
 
 def _fused_adamw_scalar_tensor(value, name, device):
@@ -833,7 +1108,7 @@ def _copy_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     if dst._numel == 0:
         return
     if dst._is_contiguous and src._is_contiguous:
-        eager_kernels.tensor_holder.copy_d2d(
+        eager_kernels.tensor_holder.CopyD2D(
             _ctx_ptr(dst._device), dst._ptr, src._ptr, dst._numel * dst._itemsize
         )
     else:
@@ -2228,6 +2503,35 @@ def fast_aten_cat(tensors, dim=0):
                 return out
             except NotImplementedError:
                 pass
+    if (
+        len(ins) == 3
+        and first._device.api == "metal"
+        and all(b._is_contiguous for b in ins)
+        and outer > 0
+        and inner > 0
+    ):
+        # Metal: one fused three-source kernel (the split-backward
+        # reassembly) instead of three narrow copies and two pipeline
+        # bubbles. Raises (row lengths not vector-aligned, outer over the
+        # grid cap) -> per-input copy loop below.
+        lens = [b._shape[dim] * inner for b in ins]
+        if all(n > 0 for n in lens):
+            try:
+                eager_kernels.data_movement_ops.Cat3(
+                    out._ptr,
+                    ins[0]._ptr,
+                    ins[1]._ptr,
+                    ins[2]._ptr,
+                    outer,
+                    lens[0],
+                    lens[1],
+                    lens[2],
+                    out._itemsize,
+                    ctx,
+                )
+                return out
+            except NotImplementedError:
+                pass
     offset = 0
     for b in ins:
         copy_len = b._shape[dim] * inner
@@ -2276,6 +2580,33 @@ _SCATTER_DTYPES = _FLOAT_DTYPES + (
 )
 
 
+def _try_stack_scalars(
+    tensors: Sequence[torch.Tensor], dim: int
+) -> TorchMojoTensor | None:
+    """Batched Metal path for stacking 0-d float32 scalars (the foreach-norm
+    outputs gradient clipping aggregates): one gather launch per 8 inputs
+    instead of one copy launch per input. None -> take the generic path."""
+    if dim not in (0, -1):
+        return None
+    unwrapped = []
+    for tensor in tensors:
+        mojo_tensor = _t(tensor)
+        if mojo_tensor is None or mojo_tensor._shape != ():
+            return None
+        unwrapped.append(mojo_tensor)
+    device = unwrapped[0]._device
+    if device.api != "metal" or any(
+        tensor._device != device or tensor._dtype != DType.float32
+        for tensor in unwrapped
+    ):
+        return None
+    out = _alloc((len(unwrapped),), DType.float32, device)
+    eager_kernels.optimizer_ops.ForeachGatherScalars(
+        tuple(tensor._ptr for tensor in unwrapped), out._ptr, _ctx_ptr(device)
+    )
+    return out
+
+
 def fast_aten_stack(tensors, dim=0):
     # stack = unsqueeze each input at `dim`, then concatenate along `dim`.
     # Both helpers normalize `dim` against the SAME (rank + 1) base, so a raw
@@ -2284,6 +2615,9 @@ def fast_aten_stack(tensors, dim=0):
         return NOT_HANDLED
     if not isinstance(dim, int):
         return NOT_HANDLED
+    scalar_stack = _try_stack_scalars(tensors, dim)
+    if scalar_stack is not None:
+        return scalar_stack
     unsqueezed = []
     for x in tensors:
         u = fast_aten_unsqueeze(x, dim)
@@ -3820,33 +4154,96 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
     v3 = _view_of(
         v, kv3_shape, _row_major_strides(kv3_shape), v._offset, contiguous=True
     )
-    scores = _try_bf16_bmm(q3, k3, transpose_b=True)
-    if scores is None:
-        scores = _try_tf32_bmm(q3, k3, transpose_b=True)
-    if scores is None:
+    # Apple f32 causal specialization: BmmCausalF32 mode 1 skips (and leaves
+    # unwritten) score tiles strictly above the diagonal, which is safe only
+    # because the Metal SoftmaxRows/SoftmaxRowsDropoutF32 kernels never read
+    # past the causal boundary; mode 2 cuts the P @ V reduction at the
+    # boundary, where P's columns are exactly zero.
+    on_metal = q._dtype == DType.float32 and getattr(q._device, "api", None) == "metal"
+    metal_causal = bool(is_causal) and on_metal
+    if metal_causal:
         scores = _alloc((b * h, q_len, kv_len), q._dtype, q._device)
-        eager_kernels.matmul_ops.Bmm(
-            scores._ptr, q._ptr, k._ptr, (b * h, q_len, kv_len, head_dim, 1), dt, ctx
+        eager_kernels.matmul_ops.BmmCausalF32(
+            scores._ptr, q._ptr, k._ptr, (b * h, q_len, kv_len, head_dim, 1, 1), dt, ctx
         )
+    else:
+        scores = _try_bf16_bmm(q3, k3, transpose_b=True)
+        if scores is None:
+            scores = _try_tf32_bmm(q3, k3, transpose_b=True)
+        if scores is None:
+            scores = _alloc((b * h, q_len, kv_len), q._dtype, q._device)
+            eager_kernels.matmul_ops.Bmm(
+                scores._ptr,
+                q._ptr,
+                k._ptr,
+                (b * h, q_len, kv_len, head_dim, 1),
+                dt,
+                ctx,
+            )
     probs = _alloc((b * h, q_len, kv_len), q._dtype, q._device)
-    eager_kernels.nn_ops.SoftmaxRows(
-        probs._ptr,
-        scores._ptr,
-        b * h * q_len,
-        kv_len,
-        float(scale_val),
-        1 if is_causal else 0,
-        q_len,
-        dt,
-        ctx,
-    )
-    # All allocations use stream-ordered lifetime management, so releasing the
-    # host reference here cannot recycle scores before SoftmaxRows consumes it.
-    del scores
-
-    effective_probs = probs
-    dropout_mask = None
-    if dropout_p == 1.0:
+    # Fused softmax + dropout (Apple f32): one launch writes the pre-dropout
+    # probabilities, the dropped/rescaled probabilities, and the keep-mask,
+    # consuming the exact same Philox interval as the composed
+    # SoftmaxRows + NativeDropoutF32 path (byte-identical outputs).
+    fused_dropout = None
+    if (
+        0.0 < dropout_p < 1.0
+        and on_metal
+        and kv_len % 4 == 0
+        and kv_len <= 1024
+        and probs._ptr % 16 == 0
+        and scores._ptr % 16 == 0
+    ):
+        pdrop = _alloc((b * h, q_len, kv_len), DType.float32, q._device)
+        drop_mask = _alloc((b * h, q_len, kv_len), DType.bool, q._device)
+        if pdrop._ptr % 16 == 0 and drop_mask._ptr % 4 == 0:
+            fused_dropout = (pdrop, drop_mask)
+    if fused_dropout is not None:
+        pdrop, drop_mask = fused_dropout
+        numel = b * h * q_len * kv_len
+        seed, base_offset = _reserve_philox_state(q._torch_device, (numel + 3) // 4)
+        word_mask = (1 << 32) - 1
+        eager_kernels.nn_ops.SoftmaxRowsDropoutF32(
+            probs._ptr,
+            pdrop._ptr,
+            drop_mask._ptr,
+            scores._ptr,
+            b * h * q_len,
+            kv_len,
+            float(scale_val),
+            1 if is_causal else 0,
+            q_len,
+            float(dropout_p),
+            seed & word_mask,
+            (seed >> 32) & word_mask,
+            base_offset & word_mask,
+            (base_offset >> 32) & word_mask,
+            ctx,
+        )
+        del scores
+        effective_probs = pdrop
+        dropout_mask = drop_mask
+    else:
+        eager_kernels.nn_ops.SoftmaxRows(
+            probs._ptr,
+            scores._ptr,
+            b * h * q_len,
+            kv_len,
+            float(scale_val),
+            1 if is_causal else 0,
+            q_len,
+            dt,
+            ctx,
+        )
+        # All allocations use stream-ordered lifetime management, so releasing
+        # the host reference here cannot recycle scores before SoftmaxRows
+        # consumes it.
+        del scores
+        effective_probs = probs
+        dropout_mask = None
+    if fused_dropout is not None:
+        pass
+    elif dropout_p == 1.0:
         # SDPA's math implementation composes ``torch.dropout`` rather than
         # exposing CUDA native_dropout directly.  At the full-drop endpoint
         # that is arithmetic ``P * 0`` semantics: nonfinite probabilities
@@ -3864,19 +4261,30 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
         effective_probs, dropout_mask = dropout_result
         del dropout_result
 
-    out = _try_bf16_bmm(effective_probs, v3)
-    if out is None:
-        out = _try_tf32_bmm(effective_probs, v3)
-    if out is None:
+    if metal_causal:
         out = _alloc((b * h, q_len, head_dim), q._dtype, q._device)
-        eager_kernels.matmul_ops.Bmm(
+        eager_kernels.matmul_ops.BmmCausalF32(
             out._ptr,
             effective_probs._ptr,
             v._ptr,
-            (b * h, q_len, head_dim, kv_len, 0),
+            (b * h, q_len, head_dim, kv_len, 0, 2),
             dt,
             ctx,
         )
+    else:
+        out = _try_bf16_bmm(effective_probs, v3)
+        if out is None:
+            out = _try_tf32_bmm(effective_probs, v3)
+        if out is None:
+            out = _alloc((b * h, q_len, head_dim), q._dtype, q._device)
+            eager_kernels.matmul_ops.Bmm(
+                out._ptr,
+                effective_probs._ptr,
+                v._ptr,
+                (b * h, q_len, head_dim, kv_len, 0),
+                dt,
+                ctx,
+            )
     # P_drop is not saved: backward cheaply reconstructs it from P and the bool
     # mask, avoiding one persistent f32 (B,H,L,S) allocation per layer.
     del effective_probs
@@ -4444,9 +4852,220 @@ def fast_sdpa_dropout_softmax_backward(
         int(has_mask),
         bridge_dropout_scale,
         bridge_score_scale,
+        0,
+        0,
         _ctx_ptr(probs._device),
     )
     return out
+
+
+def fast_sdpa_backward(
+    probabilities: MojoTensorLike,
+    grad_output: MojoTensorLike,
+    dropout_mask: MojoTensorLike | None,
+    query: MojoTensorLike | None,
+    key: MojoTensorLike | None,
+    value: MojoTensorLike | None,
+    need_query: bool,
+    need_key: bool,
+    need_value: bool,
+    is_causal: bool,
+    dropout_scale: float,
+    score_scale: float,
+) -> (
+    tuple[TorchMojoTensor | None, TorchMojoTensor | None, TorchMojoTensor | None]
+    | object  # the NOT_HANDLED sentinel
+):
+    """Fused Apple-GPU FP32 SDPA backward over (batch*heads, L, S) operands.
+
+    Five launches at most, no permute copies and no dropout-backward pass:
+
+        dP = dO @ V^T          (causal mode 1: upper tiles skipped, unwritten)
+        dS = fused causal dropout+softmax+scale backward
+        dQ = dS @ K            (causal mode 2: reduction cut at the boundary)
+        dV = (P*mask*ds)^T @ dO  (transposed-A GEMM, dropout fused in A load)
+        dK = dS^T @ Q          (same transposed-A GEMM, unmasked)
+
+    The causal specializations are exact because the Apple causal forward
+    zero-fills P past the boundary and the causal dS kernel zero-fills its
+    64-aligned band. Non-causal inputs run the same sequence unspecialized.
+    Unsupported inputs return ``NOT_HANDLED`` before any device work.
+    """
+    probs = _t(probabilities)
+    grad = _t(grad_output)
+    mask = _t(dropout_mask) if dropout_mask is not None else None
+    if (
+        probs is None
+        or grad is None
+        or (dropout_mask is not None and mask is None)
+        or getattr(probs._device, "api", None) != "metal"
+        or probs._dtype != DType.float32
+        or grad._dtype != DType.float32
+        or probs._device != grad._device
+        or len(probs._shape) != 3
+        or len(grad._shape) != 3
+        or probs._shape[:2] != grad._shape[:2]
+        or not isinstance(score_scale, int | float)
+        or isinstance(score_scale, bool)
+        or not math.isfinite(float(score_scale))
+        or 0 in probs._shape
+        or 0 in grad._shape
+    ):
+        return NOT_HANDLED
+    has_mask = mask is not None
+    if has_mask and (
+        mask._device != probs._device
+        or mask._dtype != DType.bool
+        or tuple(mask._shape) != tuple(probs._shape)
+        or not isinstance(dropout_scale, int | float)
+        or isinstance(dropout_scale, bool)
+        or not math.isfinite(float(dropout_scale))
+    ):
+        return NOT_HANDLED
+
+    batch_heads, q_len, kv_len = probs._shape
+    head_dim = grad._shape[2]
+    kv3_shape = (batch_heads, kv_len, head_dim)
+    q3_shape = (batch_heads, q_len, head_dim)
+    if need_query or need_key:
+        v = _t(value)
+        if (
+            v is None
+            or v._device != probs._device
+            or v._dtype != DType.float32
+            or tuple(v._shape) != kv3_shape
+        ):
+            return NOT_HANDLED
+    if need_query:
+        k = _t(key)
+        if (
+            k is None
+            or k._device != probs._device
+            or k._dtype != DType.float32
+            or tuple(k._shape) != kv3_shape
+        ):
+            return NOT_HANDLED
+    if need_key:
+        q = _t(query)
+        if (
+            q is None
+            or q._device != probs._device
+            or q._dtype != DType.float32
+            or tuple(q._shape) != q3_shape
+        ):
+            return NOT_HANDLED
+
+    if not all(path.is_file() for path in _SDPA_BACKWARD_SOURCE_PATHS):
+        return NOT_HANDLED
+    try:
+        sdpa_backward_ops = eager_kernels.sdpa_backward_ops
+        fused_softmax_backward = sdpa_backward_ops.SDPADropoutSoftmaxBackwardF32
+        trans_a_gemm = sdpa_backward_ops.SDPATransAGemmF32
+        matmul_ops = eager_kernels.matmul_ops
+    except (AttributeError, ImportError):
+        return NOT_HANDLED
+
+    bridge_dropout_scale = float(dropout_scale) if has_mask else 1.0
+    causal = 1 if is_causal else 0
+    probs = _tc(probs)
+    grad = _tc(grad)
+    if has_mask:
+        mask = _tc(mask)
+    device = probs._device
+    ctx = _ctx_ptr(device)
+    dt = DType.float32.value
+
+    grad_value = None
+    if need_value:
+        grad_value = _alloc(kv3_shape, DType.float32, device)
+        trans_a_gemm(
+            grad_value._ptr,
+            probs._ptr,
+            grad._ptr,
+            mask._ptr if has_mask else 0,
+            (batch_heads, kv_len, head_dim, q_len, int(has_mask), causal),
+            bridge_dropout_scale,
+            ctx,
+        )
+
+    grad_query = None
+    grad_key = None
+    if need_query or need_key:
+        v = _tc(_t(value))
+        grad_probs = _alloc((batch_heads, q_len, kv_len), DType.float32, device)
+        if causal:
+            matmul_ops.BmmCausalF32(
+                grad_probs._ptr,
+                grad._ptr,
+                v._ptr,
+                (batch_heads, q_len, kv_len, head_dim, 1, 1),
+                dt,
+                ctx,
+            )
+        else:
+            matmul_ops.Bmm(
+                grad_probs._ptr,
+                grad._ptr,
+                v._ptr,
+                (batch_heads, q_len, kv_len, head_dim, 1),
+                dt,
+                ctx,
+            )
+        del v
+        grad_scores = _alloc((batch_heads, q_len, kv_len), DType.float32, device)
+        fused_softmax_backward(
+            grad_scores._ptr,
+            probs._ptr,
+            grad_probs._ptr,
+            mask._ptr if has_mask else 0,
+            batch_heads * q_len,
+            kv_len,
+            int(has_mask),
+            bridge_dropout_scale,
+            float(score_scale),
+            causal,
+            q_len,
+            ctx,
+        )
+        del grad_probs
+        if need_query:
+            k = _tc(_t(key))
+            grad_query = _alloc(q3_shape, DType.float32, device)
+            if causal:
+                matmul_ops.BmmCausalF32(
+                    grad_query._ptr,
+                    grad_scores._ptr,
+                    k._ptr,
+                    (batch_heads, q_len, head_dim, kv_len, 0, 2),
+                    dt,
+                    ctx,
+                )
+            else:
+                matmul_ops.Bmm(
+                    grad_query._ptr,
+                    grad_scores._ptr,
+                    k._ptr,
+                    (batch_heads, q_len, head_dim, kv_len, 0),
+                    dt,
+                    ctx,
+                )
+            del k
+        if need_key:
+            q = _tc(_t(query))
+            grad_key = _alloc(kv3_shape, DType.float32, device)
+            trans_a_gemm(
+                grad_key._ptr,
+                grad_scores._ptr,
+                q._ptr,
+                0,
+                (batch_heads, kv_len, head_dim, q_len, 0, causal),
+                1.0,
+                ctx,
+            )
+            del q
+        del grad_scores
+
+    return grad_query, grad_key, grad_value
 
 
 # ---------------------------------------------------------------------------

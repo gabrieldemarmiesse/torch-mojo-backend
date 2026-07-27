@@ -438,6 +438,92 @@ def _unary_contig_kernel[
 
 
 @always_inline
+def _unary_apply[
+    dtype: DType, width: Int, op_code: Int
+](a: SIMD[dtype, width]) -> SIMD[dtype, width]:
+    """One unary op on a SIMD value; the width-generic body shared by the
+    scalar and vectorized contiguous GPU kernels."""
+    var res = a
+    comptime if op_code == UOP_RELU:
+        res = max(a, SIMD[dtype, width](0))
+    comptime if op_code == UOP_ABS:
+        res = abs(a)
+    comptime if op_code == UOP_NEG:
+        # `-a` (pop.neg) wraps for unsigned/overflow exactly like torch.
+        res = -a
+    comptime if op_code == UOP_SIGN:
+        var zero = SIMD[dtype, width](0)
+        var pos = a.gt(zero).cast[dtype]()
+        var neg = a.lt(zero).cast[dtype]()
+        # NaN compares false on both sides -> 0, matching torch.
+        res = pos - neg
+    comptime is_direct = (
+        op_code == UOP_RELU
+        or op_code == UOP_ABS
+        or op_code == UOP_NEG
+        or op_code == UOP_SIGN
+    )
+    comptime if not is_direct:
+        comptime if dtype == DType.float16 or dtype == DType.bfloat16:
+            res = _float_unary[DType.float32, width, op_code](
+                a.cast[DType.float32]()
+            ).cast[dtype]()
+        elif dtype.is_floating_point():
+            res = _float_unary[dtype, width, op_code](a)
+    return res
+
+
+def _unary_contig_kernel4[
+    dtype: DType, op_code: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    size: Int,
+    vec_count: Int,
+):
+    # Vector body (4-element chunks when the host proved alignment,
+    # vec_count == 0 otherwise) plus a grid-stride scalar loop that covers
+    # the tail — or, with vec_count == 0, the entire range.  Each thread
+    # owns 4 consecutive chunks: a sequential 4*vec_align-byte stream with
+    # four independent loads in flight, which this GPU needs to stream at
+    # full rate.
+    comptime vec_align = 4 * size_of[dtype]()
+    var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    var groups = vec_count // 4
+    var g = gid
+    while g < groups:
+        var b = g * 4
+        var a0 = in_ptr.load[width=4, alignment=vec_align](b * 4)
+        var a1 = in_ptr.load[width=4, alignment=vec_align]((b + 1) * 4)
+        var a2 = in_ptr.load[width=4, alignment=vec_align]((b + 2) * 4)
+        var a3 = in_ptr.load[width=4, alignment=vec_align]((b + 3) * 4)
+        out_ptr.store[width=4, alignment=vec_align](
+            b * 4, _unary_apply[dtype, 4, op_code](a0)
+        )
+        out_ptr.store[width=4, alignment=vec_align](
+            (b + 1) * 4, _unary_apply[dtype, 4, op_code](a1)
+        )
+        out_ptr.store[width=4, alignment=vec_align](
+            (b + 2) * 4, _unary_apply[dtype, 4, op_code](a2)
+        )
+        out_ptr.store[width=4, alignment=vec_align](
+            (b + 3) * 4, _unary_apply[dtype, 4, op_code](a3)
+        )
+        g += gstride
+    var c = groups * 4 + gid
+    if c < vec_count:
+        var a = in_ptr.load[width=4, alignment=vec_align](c * 4)
+        out_ptr.store[width=4, alignment=vec_align](
+            c * 4, _unary_apply[dtype, 4, op_code](a)
+        )
+    var i = vec_count * 4 + gid
+    while i < size:
+        out_ptr[i] = _unary_apply[dtype, 1, op_code](in_ptr[i])
+        i += gstride
+
+
+@always_inline
 def _unary_elementwise[
     dtype: DType, op_code: Int
 ](
@@ -498,6 +584,32 @@ def _unary_elementwise[
         else:
             comptime if has_accelerator():
                 comptime if dtype != DType.float64:
+                    comptime if has_apple_gpu_accelerator():
+                        # Apple: 4-wide vector body when both pointers are
+                        # vector-aligned; the scalar grid-stride tail in the
+                        # same kernel keeps arbitrary sizes and unproven
+                        # alignment correct.
+                        comptime vec_align = 4 * size_of[dtype]()
+                        var aligned = (
+                            Int(out_ptr) | Int(in_ptr)
+                        ) % vec_align == 0
+                        var vec_count = size // 4 if aligned else 0
+                        var span = (
+                            max(vec_count // 4, 1) if vec_count > 0 else size
+                        )
+                        _enqueue_cached[_unary_contig_kernel4[dtype, op_code]](
+                            ctx,
+                            String(t"ew_unary4_{op_code}_{dtype}"),
+                            _gs_blocks(span),
+                            1,
+                            1,
+                            GS_THREADS,
+                            out_ptr.as_unsafe_any_origin(),
+                            in_ptr.as_unsafe_any_origin().as_immutable(),
+                            size,
+                            vec_count,
+                        )
+                        return
                     _enqueue_cached[_unary_contig_kernel[dtype, op_code]](
                         ctx,
                         String(t"ew_unary_{op_code}_{dtype}"),

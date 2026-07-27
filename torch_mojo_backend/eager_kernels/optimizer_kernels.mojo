@@ -12,7 +12,9 @@ from std.gpu import block_idx, thread_idx
 from std.gpu.host import DeviceContext
 from std.math import min, pow, sqrt
 from std.memory import alloc
+from std.sys.info import has_apple_gpu_accelerator
 
+from op_utils import _enqueue_cached
 from optimizer_contract import (
     ADAMW_CHUNK_ELEMENTS,
     ADAMW_DESC_CAP,
@@ -196,6 +198,128 @@ def _fused_adamw_f32(
         index += ADAMW_THREADS
 
 
+# Apple/Metal per-tensor variant. Metal only translates pointer-typed kernel
+# *arguments* into valid GPU addresses/bindings; the descriptor batch above
+# smuggles raw addresses as plain data, which read back zeros there. Each
+# tensor gets its own launch with real pointer arguments; chunk grid and
+# update math are unchanged. Optional pointers (lr / grad_scale / found_inf)
+# are passed as a valid dummy plus a has_* flag, never as null.
+@__name("fused_adamw_f32_tensor_apple_v1")
+def _fused_adamw_f32_tensor_apple(
+    params: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grads: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    exp_avgs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    exp_avg_sqs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    max_exp_avg_sqs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    steps: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    lr_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    grad_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    found_inf_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    numel: Int,
+    lr_scalar: Float32,
+    has_lr_ptr: Int,
+    beta1: Float32,
+    beta2: Float32,
+    weight_decay: Float32,
+    eps: Float32,
+    amsgrad_int: Int,
+    maximize_int: Int,
+    has_grad_scale: Int,
+    has_found_inf: Int,
+):
+    # found_inf must gate every mutation, including gradient writeback.
+    if has_found_inf != 0 and found_inf_ptr[0] == 1.0:
+        return
+
+    var begin = Int(block_idx.x) * ADAMW_CHUNK_ELEMENTS
+    var end = min(begin + ADAMW_CHUNK_ELEMENTS, numel)
+
+    var lr = lr_scalar
+    if has_lr_ptr != 0:
+        lr = lr_ptr[0]
+    var inv_grad_scale = Float32(1.0)
+    if has_grad_scale != 0:
+        inv_grad_scale /= grad_scale_ptr[0]
+    var grad_sign = Float32(-1.0) if maximize_int != 0 else Float32(1.0)
+    var step = steps[0]
+    var bias1 = Float32(1.0) - pow(beta1, step)
+    var sqrt_bias2 = sqrt(Float32(1.0) - pow(beta2, step))
+    var amsgrad = amsgrad_int != 0
+
+    var index = begin + Int(thread_idx.x) * _VEC
+    var stride = ADAMW_THREADS * _VEC
+    while index + _VEC <= end:
+        var p = params.load[width=_VEC, alignment=4](index)
+        var g = grads.load[width=_VEC, alignment=4](index)
+        if has_grad_scale != 0:
+            g *= inv_grad_scale
+            grads.store[width=_VEC, alignment=4](index, g)
+        g *= grad_sign
+        var m = exp_avgs.load[width=_VEC, alignment=4](index)
+        var v = exp_avg_sqs.load[width=_VEC, alignment=4](index)
+        var max_v = v
+        if amsgrad:
+            max_v = max_exp_avg_sqs.load[width=_VEC, alignment=4](index)
+        var new_p, new_m, new_v, new_max = _adamw_update[_VEC](
+            p,
+            g,
+            m,
+            v,
+            max_v,
+            lr,
+            beta1,
+            beta2,
+            weight_decay,
+            eps,
+            bias1,
+            sqrt_bias2,
+            amsgrad,
+        )
+        params.store[width=_VEC, alignment=4](index, new_p)
+        exp_avgs.store[width=_VEC, alignment=4](index, new_m)
+        exp_avg_sqs.store[width=_VEC, alignment=4](index, new_v)
+        if amsgrad:
+            max_exp_avg_sqs.store[width=_VEC, alignment=4](index, new_max)
+        index += stride
+
+    # Only the final chunk of a tensor can have a scalar tail. Starting it at
+    # the first lane after the vector region keeps stores disjoint.
+    index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
+    while index < end:
+        var p = params[index]
+        var g = grads[index]
+        if has_grad_scale != 0:
+            g *= inv_grad_scale
+            grads[index] = g
+        g *= grad_sign
+        var m = exp_avgs[index]
+        var v = exp_avg_sqs[index]
+        var max_v = v
+        if amsgrad:
+            max_v = max_exp_avg_sqs[index]
+        var new_p, new_m, new_v, new_max = _adamw_update[1](
+            p,
+            g,
+            m,
+            v,
+            max_v,
+            lr,
+            beta1,
+            beta2,
+            weight_decay,
+            eps,
+            bias1,
+            sqrt_bias2,
+            amsgrad,
+        )
+        params[index] = new_p[0]
+        exp_avgs[index] = new_m[0]
+        exp_avg_sqs[index] = new_v[0]
+        if amsgrad:
+            max_exp_avg_sqs[index] = new_max[0]
+        index += ADAMW_THREADS
+
+
 def enqueue_fused_adamw_f32(
     descs: InlineArray[AdamWDesc, ADAMW_DESC_CAP],
     desc_count: Int,
@@ -212,6 +336,56 @@ def enqueue_fused_adamw_f32(
     found_inf_ptr_addr: Int,
     ctx: DeviceContext,
 ) raises:
+    comptime if has_apple_gpu_accelerator():
+        var first_chunk = 0
+        for desc_index in range(desc_count):
+            var desc = descs[desc_index]
+            var chunk_count = desc.chunk_end - first_chunk
+            first_chunk = desc.chunk_end
+            if chunk_count <= 0:
+                continue
+            var max_addr = desc.max_exp_avg_sq_addr
+            if max_addr == 0:
+                max_addr = desc.param_addr  # unused when amsgrad == 0
+            var lr_addr = lr_ptr_addr if lr_ptr_addr != 0 else desc.param_addr
+            var gs_addr = (
+                grad_scale_ptr_addr if grad_scale_ptr_addr
+                != 0 else desc.param_addr
+            )
+            var fi_addr = (
+                found_inf_ptr_addr if found_inf_ptr_addr
+                != 0 else desc.param_addr
+            )
+            _enqueue_cached[_fused_adamw_f32_tensor_apple](
+                ctx,
+                String("FUSED_ADAMW_TENSOR_APPLE_F32_V1"),
+                chunk_count,
+                1,
+                1,
+                ADAMW_THREADS,
+                _ptr(desc.param_addr).as_unsafe_any_origin(),
+                _ptr(desc.grad_addr).as_unsafe_any_origin(),
+                _ptr(desc.exp_avg_addr).as_unsafe_any_origin(),
+                _ptr(desc.exp_avg_sq_addr).as_unsafe_any_origin(),
+                _ptr(max_addr).as_unsafe_any_origin(),
+                _ptr(desc.step_addr).as_unsafe_any_origin().as_immutable(),
+                _ptr(lr_addr).as_unsafe_any_origin().as_immutable(),
+                _ptr(gs_addr).as_unsafe_any_origin().as_immutable(),
+                _ptr(fi_addr).as_unsafe_any_origin().as_immutable(),
+                desc.numel,
+                lr_scalar,
+                1 if lr_ptr_addr != 0 else 0,
+                beta1,
+                beta2,
+                weight_decay,
+                eps,
+                amsgrad_int,
+                maximize_int,
+                1 if grad_scale_ptr_addr != 0 else 0,
+                1 if found_inf_ptr_addr != 0 else 0,
+            )
+        return
+
     # compile_function is cached explicitly per context and kernel ABI. No
     # runtime shape, descriptor count, or tensor address participates in this
     # key, so dynamic input sizes never trigger recompilation.

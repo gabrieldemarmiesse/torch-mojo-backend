@@ -88,6 +88,15 @@ from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from std.utils.index import Index, IndexList
 
+from apple_gemm_nn_kernels import (
+    apple_nn_direct_enqueue,
+    apple_nn_smem_enqueue,
+)
+from apple_gemm_nt_kernels import (
+    apple_nt_direct_enqueue,
+    apple_nt_smem_enqueue,
+)
+from apple_gemm_tn_kernels import apple_tn_gemm_enqueue
 from op_utils import (
     FLOAT_DTYPES,
     MAX_RANK,
@@ -1179,7 +1188,11 @@ def _amd_dynamic_mfma_dispatch[
 
 # Benchmark-only MFMA configuration sweep. This is deliberately not called by
 # eager dispatch: it allows reusable runtime-shape schedules to be compared in
-# one extension build before a single winning hypothesis changes production.
+# one compiled extension build before a single winning hypothesis changes
+# production. The body is gated on gfx942 at compile time: this function is
+# non-parameterized, so it is always codegen'd, and instantiating the MFMA
+# multistage GEMM on non-AMD targets (Apple in particular has no `mma`)
+# breaks the whole module build.
 def _amd_bf16_tune_dispatcher(
     c_obj: PythonObject,
     a_obj: PythonObject,
@@ -1189,90 +1202,93 @@ def _amd_bf16_tune_dispatcher(
     params: PythonObject,
     device_context_ptr: PythonObject,
 ) raises:
-    var c_addr = Int(py=c_obj)
-    var a_addr = Int(py=a_obj)
-    var b_addr = Int(py=b_obj)
-    var bias_addr = Int(py=bias_obj)
-    var m = Int(py=params[0])
-    var n = Int(py=params[1])
-    var k = Int(py=params[2])
-    var cfg = Int(py=params[3])
-    var ctx = _get_ctx(device_context_ptr)
-
-    if cfg == 0:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 32, 64, 16, 32, False, True](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
-    elif cfg == 1:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 32, 128, 16, 64, False, True](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
-    elif cfg == 2:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 32, 128, 32, 64, False, True](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
-    elif cfg == 3:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 64, 64, 32, 32, False, True](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
-    elif cfg == 4:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 64, 128, 32, 64, False, True](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
-    elif cfg == 5:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 96, 64, 48, 32, False, True, 64](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
-    elif cfg == 6:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 128, 64, 64, 32, False, True](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
-    elif cfg == 7:
-        _amd_dynamic_mfma_gemm[
-            DType.bfloat16, 32, 32, 32, 32, False, True, 64, 2
-        ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-    elif cfg == 8:
-        _amd_dynamic_mfma_gemm[
-            DType.bfloat16, 32, 64, 32, 32, False, True, 64, 2
-        ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-    elif cfg == 9:
-        _amd_dynamic_mfma_gemm[
-            DType.bfloat16, 64, 32, 32, 32, False, True, 64, 2
-        ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-    elif cfg == 15:
-        _amd_dynamic_mfma_gemm[
-            DType.bfloat16, 32, 32, 32, 32, False, True, 32, 2
-        ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-    elif cfg == 16:
-        _amd_dynamic_mfma_gemm[
-            DType.bfloat16, 32, 32, 32, 32, False, True, 64, 4
-        ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-    elif cfg == 17:
-        _amd_dynamic_mfma_gemm[
-            DType.bfloat16, 32, 32, 32, 32, False, True, 64, 2, 2
-        ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-    elif cfg == 21:
-        _amd_dynamic_mfma_gemm[
-            DType.bfloat16, 32, 64, 16, 32, False, True, 64, 1, 2
-        ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-    elif cfg == 18:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 16, 32, 16, 32, False, True](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
-    elif cfg == 19:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 16, 64, 16, 32, False, True](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
-    elif cfg == 20:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 64, 32, 32, 32, False, True](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
-    elif cfg == 22:
-        _amd_dynamic_mfma_gemm[DType.bfloat16, 128, 32, 64, 32, False, True](
-            c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-        )
+    comptime if _accelerator_arch() != "amdgpu:gfx942":
+        raise Error("AmdBf16Tune requires an AMD gfx942 accelerator")
     else:
-        raise Error("unknown AMD BF16 MFMA tune config")
+        var c_addr = Int(py=c_obj)
+        var a_addr = Int(py=a_obj)
+        var b_addr = Int(py=b_obj)
+        var bias_addr = Int(py=bias_obj)
+        var m = Int(py=params[0])
+        var n = Int(py=params[1])
+        var k = Int(py=params[2])
+        var cfg = Int(py=params[3])
+        var ctx = _get_ctx(device_context_ptr)
+
+        if cfg == 0:
+            _amd_dynamic_mfma_gemm[DType.bfloat16, 32, 64, 16, 32, False, True](
+                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+            )
+        elif cfg == 1:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 32, 128, 16, 64, False, True
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 2:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 32, 128, 32, 64, False, True
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 3:
+            _amd_dynamic_mfma_gemm[DType.bfloat16, 64, 64, 32, 32, False, True](
+                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+            )
+        elif cfg == 4:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 64, 128, 32, 64, False, True
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 5:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 96, 64, 48, 32, False, True, 64
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 6:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 128, 64, 64, 32, False, True
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 7:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 32, 32, 32, 32, False, True, 64, 2
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 8:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 32, 64, 32, 32, False, True, 64, 2
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 9:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 64, 32, 32, 32, False, True, 64, 2
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 15:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 32, 32, 32, 32, False, True, 32, 2
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 16:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 32, 32, 32, 32, False, True, 64, 4
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 17:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 32, 32, 32, 32, False, True, 64, 2, 2
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 21:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 32, 64, 16, 32, False, True, 64, 1, 2
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        elif cfg == 18:
+            _amd_dynamic_mfma_gemm[DType.bfloat16, 16, 32, 16, 32, False, True](
+                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+            )
+        elif cfg == 19:
+            _amd_dynamic_mfma_gemm[DType.bfloat16, 16, 64, 16, 32, False, True](
+                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+            )
+        elif cfg == 20:
+            _amd_dynamic_mfma_gemm[DType.bfloat16, 64, 32, 32, 32, False, True](
+                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+            )
+        elif cfg == 22:
+            _amd_dynamic_mfma_gemm[
+                DType.bfloat16, 128, 32, 64, 32, False, True
+            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+        else:
+            raise Error("unknown AMD BF16 MFMA tune config")
 
 
 # ---------------------------------------------------------------------------
@@ -1548,6 +1564,103 @@ def _gemm_enqueue[
         # GPT-2 decode shapes. For transposed-B (linear/lm_head), compute
         # C^T = B @ A^T instead so B streams via cp.async at full rate.
         comptime if dtype == DType.float32:
+            # Apple: everything fatter than the skinny band runs the 64x64
+            # simdgroup-matrix tile — the SIMT pipe kernels below are tuned
+            # for NVIDIA and run 3-15x behind torch MPS on Metal. Shapes with
+            # enough K-depth and mostly-interior tiles take the threadgroup-
+            # staged variant (single wide load per element per block); short-K
+            # or edge-dominated shapes keep the leaner direct-load kernel.
+            # Degenerate n stays on the SIMT path (a 64-wide tile would be
+            # mostly idle).
+            comptime if has_apple_gpu_accelerator():
+                if m > 32 and n >= 16:
+                    comptime if not transpose_b:
+                        # NN layout: dedicated kernels (see
+                        # apple_gemm_nn_kernels.mojo). Both use supertile
+                        # rasterization (SWIZZLE=4) — without it these
+                        # DRAM-bound shapes are bimodal, allocation-address
+                        # dependent, up to 2x slower. Mid-K keeps the
+                        # direct-load kernel (staging store/barrier overhead
+                        # outweighs once-per-block loads until the K loop is
+                        # long); deep-K takes the staged kernel.
+                        if k >= 192 and m >= 96 and n >= 96:
+                            if k <= 640:
+                                apple_nn_direct_enqueue[64, 64, 2, 2, 4](
+                                    c_addr,
+                                    a_addr,
+                                    b_addr,
+                                    batch,
+                                    m,
+                                    n,
+                                    k,
+                                    a_bstride,
+                                    ctx,
+                                )
+                            else:
+                                apple_nn_smem_enqueue[
+                                    64, 64, 16, 2, 2, 2, True, 4
+                                ](
+                                    c_addr,
+                                    a_addr,
+                                    b_addr,
+                                    batch,
+                                    m,
+                                    n,
+                                    k,
+                                    a_bstride,
+                                    ctx,
+                                )
+                        else:
+                            _apple8_fat_enqueue[transpose_b](
+                                c_addr,
+                                a_addr,
+                                b_addr,
+                                batch,
+                                m,
+                                n,
+                                k,
+                                a_bstride,
+                                ctx,
+                            )
+                        return
+                    # NT layout (linear forward x @ W^T, SDPA's Q @ K^T):
+                    # dedicated kernels, see apple_gemm_nt_kernels.mojo.
+                    # Staging pays off from k = 256 up for every MN tile
+                    # shape, narrow N included (2048x65x384 runs 25% faster
+                    # staged): B's k-contiguous rows come in as float4s and
+                    # are transposed on the threadgroup store, so the mma
+                    # sweep never issues the stride-k scalar pairs the direct
+                    # kernel needs for B fragments. Below that the K loop is
+                    # too short to amortize the staging barriers and the
+                    # direct-load kernel wins (SDPA head dims land there).
+                    # Unlike NN, supertile rasterization loses here — see the
+                    # NT file header.
+                    comptime if transpose_b:
+                        if k >= 256:
+                            apple_nt_smem_enqueue[64, 64, 16, 2, 2, 2, True, 0](
+                                c_addr,
+                                a_addr,
+                                b_addr,
+                                batch,
+                                m,
+                                n,
+                                k,
+                                a_bstride,
+                                ctx,
+                            )
+                        else:
+                            apple_nt_direct_enqueue[64, 64, 2, 2, 0](
+                                c_addr,
+                                a_addr,
+                                b_addr,
+                                batch,
+                                m,
+                                n,
+                                k,
+                                a_bstride,
+                                ctx,
+                            )
+                    return
             comptime if transpose_b:
                 # Apple M1-M4's stock 8x8 simdgroup-matrix kernel uses a
                 # 64-row tile. The 32-row variant keeps all four simdgroups
@@ -2154,6 +2267,661 @@ def _apple8_enqueue[
         ksplits,
     )
     _ = ws^  # dropped now: the stream-ordered free lands after the reduce
+
+
+# ---------------------------------------------------------------------------
+# Fat-tile Apple 8x8 simdgroup-matrix GEMM: the m > 32 float32 workhorse on
+# Metal (the NVIDIA SIMT pipe kernels above run 3-15x behind torch MPS
+# there). 64x64 block, 4 simdgroups each owning a 32x32 subtile (4x4 grid of
+# 8x8 fragments). Operands stream DRAM -> registers directly — no
+# threadgroup staging, which measurably degrades matmul on Apple GPUs —
+# with a pointer-increment unguarded loop for fully-interior subtiles and a
+# guarded slab for ragged M/N edges and the K tail (any m/n/k works).
+# Batched via block_idx.z; split-K over grid.z like `_gemm_tiled_kernel`
+# (partials to a workspace, summed by `_ksplit_reduce_kernel`).
+#
+# TRANSPOSE_A reads A stored (K, M) row-major — C = A^T @ B without ever
+# materializing the transpose (the layout `mm` with a transposed-view LHS,
+# i.e. linear-backward's dW = dY^T @ X, has on hand). The logical transpose
+# lives in the fragment loads: per-lane scalar pairs a whole stored row
+# apart, the same pattern TRANSPOSE_B uses for B.
+# ---------------------------------------------------------------------------
+
+
+def _apple8_fat_kernel[
+    SPLIT: Bool,
+    TRANSPOSE_B: Bool,
+    BLOCK_M: Int = 64,
+    BLOCK_N: Int = 64,
+    SG_ROWS: Int = 2,
+    SG_COLS: Int = 2,
+    CAUSAL: Int = 0,
+    TRANSPOSE_A: Bool = False,
+](
+    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    a_bstride: Int,
+    ksplits: Int,
+):
+    comptime SG_M = BLOCK_M // SG_ROWS
+    comptime SG_N = BLOCK_N // SG_COLS
+    comptime NT_M = SG_M // MMA8_DIM
+    comptime NT_N = SG_N // MMA8_DIM
+
+    var bz = Int(block_idx.z) // ksplits
+    var ks = Int(block_idx.z) % ksplits
+    # Round the k-chunk to whole 8-slabs so only the last split sees a tail.
+    var kchunk = ceildiv(ceildiv(k, ksplits), MMA8_DIM) * MMA8_DIM
+    var k_start = min(k, ks * kchunk)
+    var k_end = min(k, k_start + kchunk)
+
+    # With ksplits > 1, C is a [batch * ksplits, m, n] workspace and each
+    # split writes its own slice. a_bstride is 0 when A is batch-shared.
+    var c_ptr = c_base + Int(block_idx.z) * m * n
+    var a_ptr = a_base + bz * a_bstride
+    var b_ptr = b_base + bz * k * n
+
+    var lane = Int(lane_id())
+    var fl = _frag8_layout(lane)
+    var frow = fl[0]
+    var fcol = fl[1]
+    var sg = Int(warp_id())
+    var row_base = Int(block_idx.y) * BLOCK_M + (sg // SG_COLS) * SG_M
+    var col_base = Int(block_idx.x) * BLOCK_N + (sg % SG_COLS) * SG_N
+    var interior = (row_base + SG_M <= m) and (col_base + SG_N <= n)
+
+    # SDPA causal specializations (row i of a batch slice only interacts with
+    # columns/positions j <= i; see `_bmm_causal_go`):
+    #   CAUSAL == 1 (scores = Q @ K^T): simdgroup tiles strictly above the
+    #   diagonal are fully masked downstream — skip them entirely, leaving
+    #   that part of C unwritten (the Apple row-softmax never reads past the
+    #   causal boundary).
+    #   CAUSAL == 2 (out = P @ V): P's columns past the boundary are exactly
+    #   zero, so the K loop can stop at the tile's last row + 1. SG_M is a
+    #   multiple of MMA8_DIM, so the cut point stays 8-slab-aligned and never
+    #   creates a new K tail.
+    comptime if CAUSAL == 1:
+        if col_base >= row_base + SG_M:
+            return
+    comptime if CAUSAL == 2:
+        k_end = max(k_start, min(k_end, row_base + SG_M))
+
+    var accum = InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N](
+        fill=SIMD[DType.float32, FRAG8](0)
+    )
+
+    # One 8-slab with every bound checked: ragged M/N subtiles and the K
+    # tail (kk + 8 > k_end). Interior full slabs never come through here.
+    @always_inline
+    @parameter
+    def _slab_guarded(
+        kk: Int, mut acc: InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N]
+    ):
+        var afrag = InlineArray[SIMD[DType.float32, FRAG8], NT_M](
+            uninitialized=True
+        )
+        comptime for mi in range(NT_M):
+            var grow = row_base + mi * MMA8_DIM + frow
+            var af = SIMD[DType.float32, FRAG8](0)
+            if grow < m:
+                comptime for s in range(FRAG8):
+                    if kk + fcol + s < k_end:
+                        comptime if TRANSPOSE_A:
+                            # A (K, M): logical row = stored column.
+                            af[s] = a_ptr[(kk + fcol + s) * m + grow]
+                        else:
+                            af[s] = a_ptr[grow * k + kk + fcol + s]
+            afrag[mi] = af
+        var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
+            uninitialized=True
+        )
+        comptime for ni in range(NT_N):
+            var bf = SIMD[DType.float32, FRAG8](0)
+            comptime if TRANSPOSE_B:
+                if kk + frow < k_end:
+                    comptime for s in range(FRAG8):
+                        var gj = col_base + ni * MMA8_DIM + fcol + s
+                        if gj < n:
+                            bf[s] = b_ptr[gj * k + kk + frow]
+            else:
+                if kk + frow < k_end:
+                    comptime for s in range(FRAG8):
+                        var gj = col_base + ni * MMA8_DIM + fcol + s
+                        if gj < n:
+                            bf[s] = b_ptr[(kk + frow) * n + gj]
+            bfrag[ni] = bf
+        comptime for mi in range(NT_M):
+            comptime for ni in range(NT_N):
+                acc[mi * NT_N + ni] = _mma8x8(
+                    afrag[mi], bfrag[ni], acc[mi * NT_N + ni]
+                )
+
+    # Unguarded fragment loads for one 8-slab: vector A loads, vector B loads
+    # for (K, N) storage, per-n-row scalar pairs for transposed (N, K).
+    @always_inline
+    @parameter
+    def _load_a_fast(
+        ap0: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    ) -> InlineArray[SIMD[DType.float32, FRAG8], NT_M]:
+        var afrag = InlineArray[SIMD[DType.float32, FRAG8], NT_M](
+            uninitialized=True
+        )
+        comptime for mi in range(NT_M):
+            comptime if TRANSPOSE_A:
+                # A (K, M): the fragment's two slots differ by one stored
+                # row (stride m) — per-lane scalar pairs, like transposed B.
+                var p = ap0 + mi * MMA8_DIM
+                var af = SIMD[DType.float32, FRAG8](0)
+                comptime for s in range(FRAG8):
+                    af[s] = p[s * m]
+                afrag[mi] = af
+            else:
+                afrag[mi] = (ap0 + mi * MMA8_DIM * k).load[width=FRAG8]()
+        return afrag
+
+    @always_inline
+    @parameter
+    def _load_b_fast(
+        bp0: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    ) -> InlineArray[SIMD[DType.float32, FRAG8], NT_N]:
+        var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
+            uninitialized=True
+        )
+        comptime for ni in range(NT_N):
+            comptime if TRANSPOSE_B:
+                # B is (N, K): the fragment's two slots differ in n-row.
+                var p = bp0 + ni * MMA8_DIM * k
+                var bf = SIMD[DType.float32, FRAG8](0)
+                bf[0] = p[0]
+                bf[1] = p[k]
+                bfrag[ni] = bf
+            else:
+                bfrag[ni] = (bp0 + ni * MMA8_DIM).load[width=FRAG8]()
+        return bfrag
+
+    @always_inline
+    @parameter
+    def _mma_block(
+        afrag: InlineArray[SIMD[DType.float32, FRAG8], NT_M],
+        bfrag: InlineArray[SIMD[DType.float32, FRAG8], NT_N],
+        mut acc: InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N],
+    ):
+        comptime for mi in range(NT_M):
+            comptime for ni in range(NT_N):
+                acc[mi * NT_N + ni] = _mma8x8(
+                    afrag[mi], bfrag[ni], acc[mi * NT_N + ni]
+                )
+
+    var full_end = k_start + ((k_end - k_start) // MMA8_DIM) * MMA8_DIM
+    if interior:
+        # Software-pipelined pointer-increment loop: the next slab's
+        # fragments are in flight while the current slab's mmas issue, so a
+        # single simdgroup hides most of the device-load latency itself.
+        var ap: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
+        var astep: Int
+        comptime if TRANSPOSE_A:
+            ap = a_ptr + (k_start + fcol) * m + row_base + frow
+            astep = MMA8_DIM * m
+        else:
+            ap = a_ptr + (row_base + frow) * k + fcol + k_start
+            astep = MMA8_DIM
+        var bp: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
+        var bstep: Int
+        comptime if TRANSPOSE_B:
+            bp = b_ptr + (col_base + fcol) * k + frow + k_start
+            bstep = MMA8_DIM
+        else:
+            bp = b_ptr + (k_start + frow) * n + col_base + fcol
+            bstep = MMA8_DIM * n
+        var nslabs = (k_end - k_start) // MMA8_DIM
+        if nslabs > 0:
+            var cura = _load_a_fast(ap)
+            var curb = _load_b_fast(bp)
+            for _ in range(nslabs - 1):
+                ap += astep
+                bp += bstep
+                var nxta = _load_a_fast(ap)
+                var nxtb = _load_b_fast(bp)
+                _mma_block(cura, curb, accum)
+                cura = nxta
+                curb = nxtb
+            _mma_block(cura, curb, accum)
+        if full_end < k_end:
+            _slab_guarded(full_end, accum)
+    else:
+        var kk = k_start
+        while kk < k_end:
+            _slab_guarded(kk, accum)
+            kk += MMA8_DIM
+
+    comptime for mi in range(NT_M):
+        var grow = row_base + mi * MMA8_DIM + frow
+        if grow < m:
+            comptime for ni in range(NT_N):
+                var gcol = col_base + ni * MMA8_DIM + fcol
+                var frag = accum[mi * NT_N + ni]
+                if gcol + FRAG8 <= n:
+                    c_ptr.store(grow * n + gcol, frag)
+                elif gcol < n:
+                    c_ptr[grow * n + gcol] = frag[0]
+
+
+@always_inline
+def _apple8_fat_enqueue[
+    TRANSPOSE_B: Bool,
+    BLOCK_M: Int = 64,
+    BLOCK_N: Int = 64,
+    SG_ROWS: Int = 2,
+    SG_COLS: Int = 2,
+    STAGED: Bool = False,
+    CAUSAL: Int = 0,
+    TRANSPOSE_A: Bool = False,
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    batch: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    a_bstride: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime assert (not STAGED) or (
+        BLOCK_M == 64 and BLOCK_N == 64 and SG_ROWS == 2 and SG_COLS == 2
+    ), "the staged kernel is fixed at the 64x64 / 4-simdgroup geometry"
+    comptime assert (
+        not STAGED
+    ) or CAUSAL == 0, (
+        "causal specializations exist only for the direct-load kernel"
+    )
+    comptime assert not (
+        TRANSPOSE_A and TRANSPOSE_B
+    ), "transposed-A GEMM reads B as (K, N) row-major"
+    comptime assert (
+        not TRANSPOSE_A
+    ) or CAUSAL == 0, "causal specializations exist only for the dense-A kernel"
+    comptime THREADS = SG_ROWS * SG_COLS * 32
+    var gx = ceildiv(n, BLOCK_N)
+    var gy = ceildiv(m, BLOCK_M)
+    var blocks = gx * gy * batch
+    var slabs = ceildiv(k, MMA8_DIM)
+    var ksplits = 1
+    # Split K only when the MN grid alone cannot keep ~2 threadgroups per
+    # core busy; each shard costs an m*n partials round-trip.
+    if blocks < TARGET_BLOCKS // 2:
+        ksplits = min(min(ceildiv(TARGET_BLOCKS, blocks), slabs), 8)
+    var a = (
+        _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
+    )
+    var b = (
+        _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
+    )
+    if ksplits == 1:
+        var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
+        comptime if STAGED:
+            _enqueue_cached[
+                _apple8_smem_kernel[False, TRANSPOSE_B, TRANSPOSE_A]
+            ](
+                ctx,
+                String(t"apple8_smem_tb{TRANSPOSE_B}_ta{TRANSPOSE_A}"),
+                gx,
+                gy,
+                batch,
+                THREADS,
+                c,
+                a,
+                b,
+                m,
+                n,
+                k,
+                a_bstride,
+                1,
+            )
+        else:
+            _enqueue_cached[
+                _apple8_fat_kernel[
+                    False,
+                    TRANSPOSE_B,
+                    BLOCK_M,
+                    BLOCK_N,
+                    SG_ROWS,
+                    SG_COLS,
+                    CAUSAL,
+                    TRANSPOSE_A,
+                ]
+            ](
+                ctx,
+                String(
+                    t"apple8_fat_tb{TRANSPOSE_B}_{BLOCK_M}x{BLOCK_N}"
+                    t"_c{CAUSAL}_ta{TRANSPOSE_A}"
+                ),
+                gx,
+                gy,
+                batch,
+                THREADS,
+                c,
+                a,
+                b,
+                m,
+                n,
+                k,
+                a_bstride,
+                1,
+            )
+        return
+    var ws = ctx.enqueue_create_buffer[DType.float32](batch * ksplits * m * n)
+    var ws_mut = UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin](
+        unsafe_from_address=Int(ws.unsafe_ptr())
+    ).as_unsafe_any_origin()
+    comptime if STAGED:
+        _enqueue_cached[_apple8_smem_kernel[True, TRANSPOSE_B, TRANSPOSE_A]](
+            ctx,
+            String(t"apple8_smem_split_tb{TRANSPOSE_B}_ta{TRANSPOSE_A}"),
+            gx,
+            gy,
+            batch * ksplits,
+            THREADS,
+            ws_mut,
+            a,
+            b,
+            m,
+            n,
+            k,
+            a_bstride,
+            ksplits,
+        )
+    else:
+        _enqueue_cached[
+            _apple8_fat_kernel[
+                True,
+                TRANSPOSE_B,
+                BLOCK_M,
+                BLOCK_N,
+                SG_ROWS,
+                SG_COLS,
+                CAUSAL,
+                TRANSPOSE_A,
+            ]
+        ](
+            ctx,
+            String(
+                t"apple8_fat_split_tb{TRANSPOSE_B}_{BLOCK_M}x{BLOCK_N}"
+                t"_c{CAUSAL}_ta{TRANSPOSE_A}"
+            ),
+            gx,
+            gy,
+            batch * ksplits,
+            THREADS,
+            ws_mut,
+            a,
+            b,
+            m,
+            n,
+            k,
+            a_bstride,
+            ksplits,
+        )
+    var total = batch * m * n
+    var c_out = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
+    _enqueue_cached[_ksplit_reduce_kernel](
+        ctx,
+        String("ksplit_reduce"),
+        ceildiv(total, 1024),
+        1,
+        1,
+        256,
+        c_out,
+        ws_mut.as_immutable(),
+        m * n,
+        ksplits,
+        total,
+    )
+    _ = ws^  # dropped now: the stream-ordered free lands after the reduce
+
+
+# ---------------------------------------------------------------------------
+# Threadgroup-staged variant of the fat Apple simdgroup-matrix GEMM: 64x64
+# block, BK=16 K-stages double-buffered through threadgroup memory. Each
+# element is loaded from device memory once per block (the direct-load
+# kernel above loads A and B twice each — once per simdgroup row/column)
+# with wide float4 accesses, and the store->barrier->compute pipeline keeps
+# the next stage's device loads in flight during the current stage's mmas
+# with a single barrier per stage. Edge guards live only in the cooperative
+# fill (OOB elements are zeroed), so the mma loop is always unguarded.
+#
+# TRANSPOSE_A reads A stored (K, M) row-major (C = A^T @ B, no materialized
+# transpose): the fill loads wide k-row segments of A and scatters them
+# transposed into the same threadgroup layout the mma sweep always reads —
+# so unlike the direct-load kernel, every A element still moves from device
+# memory in a single float4 load.
+# ---------------------------------------------------------------------------
+
+
+def _apple8_smem_kernel[
+    SPLIT: Bool, TRANSPOSE_B: Bool, TRANSPOSE_A: Bool = False
+](
+    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    a_bstride: Int,
+    ksplits: Int,
+):
+    comptime BLOCK_M = 64
+    comptime BLOCK_N = 64
+    comptime BK = 16
+    comptime THREADS = 128
+    # Pad the A row stride (and B for symmetry) to stagger threadgroup
+    # banks across the 8 fragment rows.
+    comptime LDA = BK + 2
+    comptime LDB = BLOCK_N + 2
+    comptime SG_M = BLOCK_M // 2
+    comptime SG_N = BLOCK_N // 2
+    comptime NT_M = SG_M // MMA8_DIM  # 4
+    comptime NT_N = SG_N // MMA8_DIM  # 4
+    comptime AV = (BLOCK_M * BK) // (THREADS * 4)  # float4 fills per thread
+    comptime BV = (BK * BLOCK_N) // (THREADS * 4)
+
+    var bz = Int(block_idx.z) // ksplits
+    var ks = Int(block_idx.z) % ksplits
+    var kchunk = ceildiv(ceildiv(k, ksplits), BK) * BK
+    var k_start = min(k, ks * kchunk)
+    var k_end = min(k, k_start + kchunk)
+
+    var c_ptr = c_base + Int(block_idx.z) * m * n
+    var a_ptr = a_base + bz * a_bstride
+    var b_ptr = b_base + bz * k * n
+
+    var bm = Int(block_idx.y) * BLOCK_M
+    var bn = Int(block_idx.x) * BLOCK_N
+    var tid = Int(thread_idx.x)
+
+    var a_smem = stack_allocation[
+        2 * BLOCK_M * LDA, DType.float32, address_space=AddressSpace.SHARED
+    ]()
+    var b_smem = stack_allocation[
+        2 * BK * LDB, DType.float32, address_space=AddressSpace.SHARED
+    ]()
+
+    var lane = Int(lane_id())
+    var fl = _frag8_layout(lane)
+    var frow = fl[0]
+    var fcol = fl[1]
+    var sg = Int(warp_id())
+    var sgm = (sg // 2) * SG_M
+    var sgn = (sg % 2) * SG_N
+
+    var accum = InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N](
+        fill=SIMD[DType.float32, FRAG8](0)
+    )
+
+    # Device -> register fill for one BK stage at k-offset kt (OOB -> 0).
+    @always_inline
+    @parameter
+    def _fill_regs(
+        kt: Int,
+        mut a_regs: InlineArray[SIMD[DType.float32, 4], AV],
+        mut b_regs: InlineArray[SIMD[DType.float32, 4], BV],
+    ):
+        comptime for q in range(AV):
+            var fid = q * THREADS + tid
+            comptime if TRANSPOSE_A:
+                # A (K, M): a straight m-run of this k-row; scattered
+                # transposed on store.
+                var kk = fid >> 4
+                var mq = (fid & 15) * 4
+                var row = kt + kk
+                var col = bm + mq
+                if row < k_end and col + 4 <= m:
+                    a_regs[q] = (a_ptr + row * m + col).load[width=4]()
+                else:
+                    var v = SIMD[DType.float32, 4](0)
+                    if row < k_end:
+                        comptime for j in range(4):
+                            if col + j < m:
+                                v[j] = a_ptr[row * m + col + j]
+                    a_regs[q] = v
+            else:
+                var mm = fid >> 2
+                var kq = (fid & 3) * 4
+                var row = bm + mm
+                var col = kt + kq
+                if row < m and col + 4 <= k_end:
+                    a_regs[q] = (a_ptr + row * k + col).load[width=4]()
+                else:
+                    var v = SIMD[DType.float32, 4](0)
+                    if row < m:
+                        comptime for j in range(4):
+                            if col + j < k_end:
+                                v[j] = a_ptr[row * k + col + j]
+                    a_regs[q] = v
+        comptime for q in range(BV):
+            var fid = q * THREADS + tid
+            comptime if TRANSPOSE_B:
+                # B (N, K): read a k-run of this n-row; scattered on store.
+                var nn = fid >> 2
+                var kq = (fid & 3) * 4
+                var row = bn + nn
+                var col = kt + kq
+                if row < n and col + 4 <= k_end:
+                    b_regs[q] = (b_ptr + row * k + col).load[width=4]()
+                else:
+                    var v = SIMD[DType.float32, 4](0)
+                    if row < n:
+                        comptime for j in range(4):
+                            if col + j < k_end:
+                                v[j] = b_ptr[row * k + col + j]
+                    b_regs[q] = v
+            else:
+                # B (K, N): a straight row-segment copy.
+                var kk = fid >> 4
+                var nq = (fid & 15) * 4
+                var row = kt + kk
+                var col = bn + nq
+                if row < k_end and col + 4 <= n:
+                    b_regs[q] = (b_ptr + row * n + col).load[width=4]()
+                else:
+                    var v = SIMD[DType.float32, 4](0)
+                    if row < k_end:
+                        comptime for j in range(4):
+                            if col + j < n:
+                                v[j] = b_ptr[row * n + col + j]
+                    b_regs[q] = v
+
+    # Register -> threadgroup store for buffer `buf`.
+    @always_inline
+    @parameter
+    def _store_smem(
+        buf: Int,
+        a_regs: InlineArray[SIMD[DType.float32, 4], AV],
+        b_regs: InlineArray[SIMD[DType.float32, 4], BV],
+    ):
+        var a_dst = a_smem + buf * BLOCK_M * LDA
+        var b_dst = b_smem + buf * BK * LDB
+        comptime for q in range(AV):
+            var fid = q * THREADS + tid
+            comptime if TRANSPOSE_A:
+                var kk = fid >> 4
+                var mq = (fid & 15) * 4
+                comptime for j in range(4):
+                    a_dst[(mq + j) * LDA + kk] = a_regs[q][j]
+            else:
+                var mm = fid >> 2
+                var kq = (fid & 3) * 4
+                a_dst.store(mm * LDA + kq, a_regs[q])
+        comptime for q in range(BV):
+            var fid = q * THREADS + tid
+            comptime if TRANSPOSE_B:
+                var nn = fid >> 2
+                var kq = (fid & 3) * 4
+                comptime for j in range(4):
+                    b_dst[(kq + j) * LDB + nn] = b_regs[q][j]
+            else:
+                var kk = fid >> 4
+                var nq = (fid & 15) * 4
+                b_dst.store(kk * LDB + nq, b_regs[q])
+
+    # Two 8-slab mma sweeps over threadgroup buffer `buf`.
+    @always_inline
+    @parameter
+    def _compute(
+        buf: Int,
+        mut acc: InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N],
+    ):
+        var a_src = a_smem + buf * BLOCK_M * LDA + (sgm + frow) * LDA + fcol
+        var b_src = b_smem + buf * BK * LDB + frow * LDB + sgn + fcol
+        comptime for kc in range(BK // MMA8_DIM):
+            var afrag = InlineArray[SIMD[DType.float32, FRAG8], NT_M](
+                uninitialized=True
+            )
+            comptime for mi in range(NT_M):
+                afrag[mi] = (a_src + mi * MMA8_DIM * LDA + kc * MMA8_DIM).load[
+                    width=FRAG8
+                ]()
+            var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
+                uninitialized=True
+            )
+            comptime for ni in range(NT_N):
+                bfrag[ni] = (b_src + kc * MMA8_DIM * LDB + ni * MMA8_DIM).load[
+                    width=FRAG8
+                ]()
+            comptime for mi in range(NT_M):
+                comptime for ni in range(NT_N):
+                    acc[mi * NT_N + ni] = _mma8x8(
+                        afrag[mi], bfrag[ni], acc[mi * NT_N + ni]
+                    )
+
+    var stages = ceildiv(k_end - k_start, BK)
+    var a_regs = InlineArray[SIMD[DType.float32, 4], AV](uninitialized=True)
+    var b_regs = InlineArray[SIMD[DType.float32, 4], BV](uninitialized=True)
+    if stages > 0:
+        _fill_regs(k_start, a_regs, b_regs)
+    for t in range(stages):
+        # Writing buffer t%2 is safe without a leading barrier: its previous
+        # readers all passed the barrier below in iteration t-1.
+        _store_smem(t & 1, a_regs, b_regs)
+        barrier()
+        if t + 1 < stages:
+            _fill_regs(k_start + (t + 1) * BK, a_regs, b_regs)
+        _compute(t & 1, accum)
+
+    comptime for mi in range(NT_M):
+        var grow = bm + sgm + mi * MMA8_DIM + frow
+        if grow < m:
+            comptime for ni in range(NT_N):
+                var gcol = bn + sgn + ni * MMA8_DIM + fcol
+                var frag = accum[mi * NT_N + ni]
+                if gcol + FRAG8 <= n:
+                    c_ptr.store(grow * n + gcol, frag)
+                elif gcol < n:
+                    c_ptr[grow * n + gcol] = frag[0]
 
 
 def _tune_enqueue[
@@ -3052,6 +3820,85 @@ def _bmm_go(
 
 
 # ---------------------------------------------------------------------------
+# Causal-aware float32 batched GEMMs for the Apple SDPA forward: identical
+# math to Bmm on the positions that matter, but exploiting the causal
+# structure of the (batch, q_len, kv_len) score/probability matrices. Row i
+# of each batch slice only attends to columns j <= i, so
+#   mode 1 (scores = Q @ K^T, transpose_b): tiles strictly above the diagonal
+#     are skipped and left UNWRITTEN — callers must never read C past the
+#     causal boundary (the Apple row-softmax doesn't);
+#   mode 2 (out = P @ V): P's columns past the boundary are exactly zero, so
+#     the reduction stops at the tile's last row + 1.
+# Roughly halves both FLOPs and traffic at q_len == kv_len. Apple GPU only —
+# other targets raise and the Python caller keeps the plain Bmm path.
+# ---------------------------------------------------------------------------
+
+
+def _bmm_causal_go(
+    out_ptr: PyObjectPtr,
+    a_ptr: PyObjectPtr,
+    b_ptr: PyObjectPtr,
+    # (batch, m, n, k, transpose_b, causal_mode)
+    params: PyObjectPtr,
+    dtype_obj: PyObjectPtr,
+    device_context_ptr: PyObjectPtr,
+) raises:
+    var dtype = _raw_dtype_int(dtype_obj)
+    var c_addr = _raw_int(out_ptr)
+    var a_addr = _raw_int(a_ptr)
+    var b_addr = _raw_int(b_ptr)
+    var batch = _raw_tuple_int(params, 0)
+    var m = _raw_tuple_int(params, 1)
+    var n = _raw_tuple_int(params, 2)
+    var k = _raw_tuple_int(params, 3)
+    var transpose_b = _raw_tuple_int(params, 4)
+    var causal_mode = _raw_tuple_int(params, 5)
+    var ctx = _raw_ctx(device_context_ptr)
+
+    comptime if has_apple_gpu_accelerator():
+        if (
+            dtype != DType.float32
+            or ctx.api() == "cpu"
+            or causal_mode < 1
+            or causal_mode > 2
+        ):
+            raise Error("BmmCausalF32: unsupported configuration")
+        if causal_mode == 1:
+            if transpose_b != 0:
+                _apple8_fat_enqueue[True, 64, 64, 2, 2, False, 1](
+                    c_addr, a_addr, b_addr, batch, m, n, k, m * k, ctx
+                )
+            else:
+                _apple8_fat_enqueue[False, 64, 64, 2, 2, False, 1](
+                    c_addr, a_addr, b_addr, batch, m, n, k, m * k, ctx
+                )
+        else:
+            if transpose_b != 0:
+                _apple8_fat_enqueue[True, 64, 64, 2, 2, False, 2](
+                    c_addr, a_addr, b_addr, batch, m, n, k, m * k, ctx
+                )
+            else:
+                _apple8_fat_enqueue[False, 64, 64, 2, 2, False, 2](
+                    c_addr, a_addr, b_addr, batch, m, n, k, m * k, ctx
+                )
+    else:
+        raise Error("BmmCausalF32 is Apple-GPU only")
+
+
+def _bmm_causal_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _bmm_causal_go(args[0], args[1], args[2], args[3], args[4], args[5])
+    except:
+        pass
+    return _raw_ret_none()
+
+
+# ---------------------------------------------------------------------------
 # In-place row-broadcast bias add: out[i] += bias[i % cols]. Used as the
 # addmm / conv-bias epilogue.
 # ---------------------------------------------------------------------------
@@ -3145,6 +3992,19 @@ def _matmul_bias_run(
             _apple8_enqueue[True](
                 c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
             )
+            return
+        # Fat tiles: the simdgroup-matrix GEMM plus a separate row-broadcast
+        # bias pass still beats the NVIDIA-tuned fused-bias pipe3 tile here.
+        if dtype == DType.float32 and m > 32 and n >= 16:
+            if transpose_b != 0:
+                _gemm_enqueue[DType.float32, True](
+                    c_addr, a_addr, b_addr, 1, m, n, k, m * k, ctx
+                )
+            else:
+                _gemm_enqueue[DType.float32, False](
+                    c_addr, a_addr, b_addr, 1, m, n, k, m * k, ctx
+                )
+            _bias_add_row[DType.float32](c_addr, bias_addr, m * n, n, ctx)
             return
 
     # Large-M gfx942 workloads use the dynamic pure-Mojo MFMA kernels and
@@ -3362,6 +4222,44 @@ def _matmul_spec_launch(
 
 
 @always_inline
+def _apple_ta_spec_route(
+    a: TensorSpec,
+    b_addr: Int,
+    has_bias: Bool,
+    c_addr: Int,
+    batch: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    transpose_b: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """Apple f32 fast path for a strided `a` that is exactly the 2D
+    transpose view of a contiguous (k, m) matrix — strides (1, m), i.e.
+    linear-backward's dW = dY^T @ X. The transposed-A simdgroup-matrix GEMM
+    consumes the stored (k, m) layout directly, so the permute-copy
+    materialization (a full extra pass over A plus a launch) is skipped.
+    Returns False when the operand isn't that pattern (caller keeps the
+    scratch-copy fallback)."""
+    if (
+        has_bias
+        or batch != 1
+        or transpose_b != 0
+        or a.dtype != DType.float32
+        or a.rank != 2
+        or a.strides[MAX_RANK - 2] != 1
+        or a.strides[MAX_RANK - 1] != m
+        or ctx.api() == "cpu"
+    ):
+        return False
+    # Dedicated TN kernels: same 8x8-fragment design as the shared fat
+    # kernel, with the block height picked from the reduction depth and the
+    # grid size (see apple_gemm_tn_kernels.mojo for the measurements).
+    apple_tn_gemm_enqueue(c_addr, a.ptr, b_addr, 1, m, n, k, m * k, ctx)
+    return True
+
+
+@always_inline
 def _matmul_spec_operands_launch(
     a: TensorSpec,
     b: TensorSpec,
@@ -3411,6 +4309,11 @@ def _matmul_spec_operands_launch(
         )
         _ = tmp_b^
     elif b.contig:
+        comptime if has_apple_gpu_accelerator():
+            if _apple_ta_spec_route(
+                a, b.ptr, has_bias, c_addr, batch, m, n, k, transpose_b, ctx
+            ):
+                return
         var tmp_a = _scratch_contig(a, ctx)
         _matmul_spec_launch(
             a.dtype,
@@ -3676,6 +4579,15 @@ def PyInit_matmul_ops() abi("C") -> PythonObject:
             docstring=(
                 "batched C = A @ B (rank 3, optional transposed B); pure Mojo"
                 " tiled kernels on GPU, modular's linalg matmul on CPU"
+            ),
+        )
+        b.def_py_c_function(
+            _bmm_causal_dispatcher,
+            "BmmCausalF32",
+            docstring=(
+                "causal-structured batched f32 GEMM for SDPA on Apple GPUs:"
+                " mode 1 skips (and leaves unwritten) score tiles above the"
+                " diagonal, mode 2 cuts the reduction at the causal boundary"
             ),
         )
         b.def_function[_matmul_tune_dispatcher](

@@ -20,14 +20,14 @@
 # once on the store.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import block_idx, grid_dim, thread_idx
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.host import DeviceContext
 from std.math import ceildiv, erf, exp, tanh
 from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.python._cpython import PyObjectPtr, Py_ssize_t
-from std.sys.info import has_accelerator
+from std.sys.info import has_accelerator, has_apple_gpu_accelerator
 
 from op_utils import (
     _enqueue_cached,
@@ -115,6 +115,71 @@ def _gelu_backward_tanh(
         i += stride
 
 
+@always_inline
+def _grad_val[
+    width: Int, tanh_mode: Bool
+](x: SIMD[DType.float32, width], g: SIMD[DType.float32, width]) -> SIMD[
+    DType.float32, width
+]:
+    comptime if tanh_mode:
+        return _tanh_grad[width](x, g)
+    else:
+        return _exact_grad[width](x, g)
+
+
+def _gelu_backward_f32_g4[
+    tanh_mode: Bool
+](
+    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    elements: Int,
+    vec_count: Int,
+):
+    # Apple variant: each thread owns 4 consecutive 16-byte chunks (one
+    # sequential 64-byte stream per operand with the loads issued together),
+    # which this GPU needs to stream at full rate.  The trailing chunk and
+    # the scalar tail (or, unaligned, the whole range) ride the same launch.
+    var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    var groups = vec_count // 4
+    var g = gid
+    while g < groups:
+        var b = g * 4
+        var x0 = input.load[width=_VEC, alignment=16](b * 4)
+        var x1 = input.load[width=_VEC, alignment=16]((b + 1) * 4)
+        var x2 = input.load[width=_VEC, alignment=16]((b + 2) * 4)
+        var x3 = input.load[width=_VEC, alignment=16]((b + 3) * 4)
+        var g0 = grad_output.load[width=_VEC, alignment=16](b * 4)
+        var g1 = grad_output.load[width=_VEC, alignment=16]((b + 1) * 4)
+        var g2 = grad_output.load[width=_VEC, alignment=16]((b + 2) * 4)
+        var g3 = grad_output.load[width=_VEC, alignment=16]((b + 3) * 4)
+        output.store[width=_VEC, alignment=16](
+            b * 4, _grad_val[_VEC, tanh_mode](x0, g0)
+        )
+        output.store[width=_VEC, alignment=16](
+            (b + 1) * 4, _grad_val[_VEC, tanh_mode](x1, g1)
+        )
+        output.store[width=_VEC, alignment=16](
+            (b + 2) * 4, _grad_val[_VEC, tanh_mode](x2, g2)
+        )
+        output.store[width=_VEC, alignment=16](
+            (b + 3) * 4, _grad_val[_VEC, tanh_mode](x3, g3)
+        )
+        g += gstride
+    var c = groups * 4 + gid
+    if c < vec_count:
+        var x = input.load[width=_VEC, alignment=16](c * 4)
+        var gg = grad_output.load[width=_VEC, alignment=16](c * 4)
+        output.store[width=_VEC, alignment=16](
+            c * 4, _grad_val[_VEC, tanh_mode](x, gg)
+        )
+    var i = vec_count * _VEC + gid
+    while i < elements:
+        output[i] = _grad_val[1, tanh_mode](input[i], grad_output[i])
+        i += gstride
+
+
 @__name("nanogpt_gelu_backward_exact_bf16")
 def _gelu_backward_exact_bf16(
     output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -190,6 +255,40 @@ def enqueue_gelu_backward_f32(
             return
         var aligned = (Int(output) | Int(grad_output) | Int(input)) % 16 == 0
         var vec_count = elements // _VEC if aligned else 0
+        comptime if has_apple_gpu_accelerator():
+            # Apple: grouped sequential-stream kernel (see
+            # _gelu_backward_f32_g4).
+            var span = max(vec_count // 4, 1) if vec_count > 0 else elements
+            var grid_g4 = max(1, min(ceildiv(span, _BLOCK), 4096))
+            if tanh_approx:
+                _enqueue_cached[_gelu_backward_f32_g4[True]](
+                    ctx,
+                    "gelu_bwd_tanh_g4",
+                    grid_g4,
+                    1,
+                    1,
+                    _BLOCK,
+                    output,
+                    grad_output,
+                    input,
+                    elements,
+                    vec_count,
+                )
+            else:
+                _enqueue_cached[_gelu_backward_f32_g4[False]](
+                    ctx,
+                    "gelu_bwd_exact_g4",
+                    grid_g4,
+                    1,
+                    1,
+                    _BLOCK,
+                    output,
+                    grad_output,
+                    input,
+                    elements,
+                    vec_count,
+                )
+            return
         # The grid covers the vector body; the <=3-element aligned tail rides
         # on the same launch via the scalar loop. With vec_count == 0 the grid
         # covers every element for the scalar path.
