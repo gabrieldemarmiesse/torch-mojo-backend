@@ -5251,3 +5251,58 @@ not affected by this pass.
    FMA off and is worth about 7% of the compute.
 2. The step counters are one launch. What the fused-AdamW row still spends is
    its own kernel, already at 0.81x.
+
+## Faster than PyTorch-ROCm at batch 12
+
+nanoGPT GPT-2 124M, block 1024, bf16 autocast, AdamW, grad clipping, one full
+training step. Five interleaved pairs, 8 warmups / 30 timed iterations each,
+alternating which backend runs first so a heating trend cannot favour either
+side. Clocks are NOT pinned -- the driver refuses `setperflevel` on this SR-IOV
+VF -- which is exactly why the protocol is interleaving rather than sweeping.
+
+| round | PyTorch-ROCm | mojo | ratio |
+|---|---:|---:|---:|
+| 1 | 47.031 | 46.956 | 0.9984 |
+| 2 | 47.025 | 46.563 | 0.9902 |
+| 3 | 47.032 | 46.969 | 0.9987 |
+| 4 | 47.106 | 46.809 | 0.9937 |
+| 5 | 47.036 | 46.693 | 0.9927 |
+| **mean** | **47.046** | **46.798** | **0.9947** |
+
+Every mojo sample (46.563-46.969) is below every ROCm sample (47.025-47.106);
+the distributions do not overlap. Loss after one step agrees to 8.68e-07
+relative, against a bf16 epsilon of 7.8e-03.
+
+Ratio across the batch sweep, same protocol, one pair each:
+
+| batch | rocm | mojo | ratio | tiles at n=768 | fill of 304 CUs |
+|---|---:|---:|---:|---:|---:|
+| 8 | 34.76 | 38.06 | 1.0949 | 96 | 32% |
+| 12 | 47.04 | 46.74 | 0.9936 | 144 | 47% |
+| 16 | 58.58 | 61.81 | 1.0551 | 192 | 63% |
+| 24 | 83.27 | 85.59 | 1.0279 | 288 | 95% |
+| 32 | 106.94 | 113.39 | 1.0603 | 384 | 1.26 waves |
+| 48 | 157.01 | 158.39 | 1.0088 | 576 | 1.90 waves |
+
+The shape of that curve is not allocator pressure -- it is not monotonic in the
+working set. It tracks how the output tile grid lands against 304 CUs, which is
+where our two macro tiles lose to hipBLASLt's fourteen.
+
+### The MAX pool reservation costs nothing (hypothesis rejected)
+
+MAX reserves ~84% of the 205.8 GB card by default via
+`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT`, and change 33 had recorded
+the same cast kernel running ~7% slower in-process than standalone. Sweeping the
+knob at batch 48: 25% -> 159.07, 50% -> 158.07, default -> 158.41 and 158.27,
+99% -> 158.22 ms. All within ~1 ms and the SMALLEST pool is the SLOWEST, so the
+reservation is not the cost. The standalone probe reuses its buffers every
+iteration and is TLB-warm in a way the real step is not; that is the whole
+discrepancy. Recorded so nobody re-runs it.
+
+### A measurement bug that wasted wall-clock, worth not repeating
+
+Two queued sweeps never ran. `until ! pgrep -f "bench_nanogpt|..."` matches its
+OWN command line, so the wait loop waited on itself; then `pkill -f "until !
+pgrep"` matched the command line doing the killing and killed the job it had just
+launched. `pgrep`/`pkill -f` see the whole command line including your wrapper.
+Match the script path, not a substring you are also typing.
