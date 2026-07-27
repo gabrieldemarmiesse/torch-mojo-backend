@@ -119,6 +119,33 @@ def set_device(device_idx: int):
     _current_device = device_idx
 
 
+class device:
+    """Context manager that swaps the current mojo device, mirroring
+    ``torch.cuda.device``. ``torch.serialization`` requires it on the backend
+    module when loading a checkpoint with ``map_location="mojo"``
+    (``torch._utils._to`` enters ``device_module.device(...)``)."""
+
+    def __init__(self, device: "int | str | torch.device | None") -> None:
+        if device is None:
+            self.idx = -1
+            return
+        if isinstance(device, int):
+            self.idx = device
+            return
+        torch_device = torch.device(device)
+        self.idx = -1 if torch_device.index is None else torch_device.index
+
+    def __enter__(self) -> None:
+        self.prev_idx = _current_device
+        if self.idx >= 0 and self.idx != _current_device:
+            set_device(self.idx)
+
+    def __exit__(self, *exc_info: object) -> bool:
+        if self.idx >= 0 and self.prev_idx != _current_device:
+            set_device(self.prev_idx)
+        return False
+
+
 def synchronize(device=None):
     """Wait for work and release completed asynchronous transfer owners."""
     from .torch_mojo_tensor import (
