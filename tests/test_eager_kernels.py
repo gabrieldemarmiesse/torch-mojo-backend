@@ -1393,10 +1393,7 @@ def test_fast_foreach_add_scalar_inplace_chunk_boundary(mojo_gpu, dtype):
         # The kernel widens to FP32, adds, and narrows -- exactly what the
         # per-tensor `add_.Scalar` path it replaces does.
         torch.testing.assert_close(
-            actual.cpu(),
-            ((expected.float() + 1.5).to(dtype)),
-            rtol=0,
-            atol=0,
+            actual.cpu(), ((expected.float() + 1.5).to(dtype)), rtol=0, atol=0
         )
 
 
@@ -1439,8 +1436,7 @@ def test_fast_foreach_add_scalar_falls_back_where_it_must(mojo_gpu):
     strided = torch.arange(12, dtype=torch.float32).reshape(3, 4).to(mojo_gpu).t()
     torch.ops.aten._foreach_add_.Scalar([strided], 0.5)
     torch.testing.assert_close(
-        strided.cpu(),
-        torch.arange(12, dtype=torch.float32).reshape(3, 4).t() + 0.5,
+        strided.cpu(), torch.arange(12, dtype=torch.float32).reshape(3, 4).t() + 0.5
     )
 
     mixed = [

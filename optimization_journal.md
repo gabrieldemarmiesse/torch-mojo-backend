@@ -5020,3 +5020,234 @@ mismatches at every shape, worst absolute difference 0.0.
    calls, both already diagnosed in change 33 and neither addressed.
 4. The 7 ms of logits casting that both backends pay for autocast's
    `nll_loss` promotion, which `half_to_float=True` was designed to delete.
+
+# nanoGPT GELU and AdamW step counters, MI300X — 2026-07-26
+
+Three targets were briefed with a measured value each: an NT plan search
+(+2.49 ms), a cheaper exact GELU (+0.48) and a batched `_foreach_add_`
+(+0.35). Two of the three paid. The first is a dead end and this pass has the
+measurement that closes it rather than the argument that suggests it.
+
+Entry state, re-measured interleaved in this session: **158.82 ms** against
+PyTorch-ROCm's **156.88** (two runs each, both orders). Protocol throughout:
+>= 25 warmups, >= 100 synchronized iterations for kernel numbers, every
+before/after pair interleaved, never a `--pmc` run. `clocks_pinned: false`.
+
+## Change 44 — the exact GELU in one branch, no divide (252 -> 197 us)
+
+**Hypothesis.** The brief attributed ~90-100 us of the 252 us kernel to
+`std.math.erf` and had already excluded every launch geometry (VEC 4/8/16,
+grid-stride, 512 threads: all within 2%). Reading the stdlib source adds a
+second culprit the brief did not have: `nn.activations.gelu` computes
+`x / 1.4142135623730951`, and `pop.div` carries no `arcp`, so LLVM may not fold
+a divide by a non-power-of-two into a multiply and gfx942 expands it to the
+IEEE `v_div_scale` / `v_rcp` / 3x`v_fma` / `v_div_fmas` / `v_div_fixup`
+sequence -- about ten instructions per lane, sixteen lanes per thread. And
+`erf` evaluates BOTH polynomial branches unconditionally and selects with
+`v_cndmask`; a wave-uniform skip cannot fire because the branch point is
+|x| > 0.921875 and one wave covers 1024 elements. Counted per lane, the shipped
+path is ~34 VALU ops plus one `v_exp_f32`.
+
+**The reformulation.** Not the `tanh` approximation -- nanoGPT asks for
+`nn.GELU()` and must get the exact erf form. What changes is how it is
+evaluated:
+
+    gelu(x) = relu(x) - 0.5 * |x| * erfc(|x| / sqrt(2))
+
+For `x >= 0` the second term is `x - x*Phi(x)`; for `x < 0` it is `-x*Phi(x)`
+with `relu` contributing nothing. One branch of `erfc` therefore serves both
+signs, and writing that `erfc` as `exp2(-a * R(a))` and fitting `R` directly in
+the log2 domain absorbs the `sqrt(2)`. What is left per lane is 8 FMAs, one
+`v_exp_f32` and five other VALU ops: the divide, the second polynomial, the
+select, the `copysign` and the `1 - exp(...)` are all gone.
+
+`R(a) = -log2(erfc(a/sqrt2))/a` is fitted degree 8 over `a` in [0, 12.75] by
+IRLS in a Chebyshev basis against 50-digit `mpmath`, weighted by `a` because
+the error that matters is `a * dR` -- an absolute error in the exponent is a
+relative error in the answer. 12.75 is placed where accuracy stops mattering,
+not where the inputs stop: `gelu(-13.9)` is 4e-43, under the smallest BF16
+subnormal. Past the clamp the polynomial argument saturates while the exponent
+keeps the unclamped `a`, so the tail keeps decaying, and the clamped prefactor
+is what makes `gelu(+inf) == +inf` fall out with no guard.
+
+**Measured effect.** Standalone probe, production shape (49152 x 3072 =
+151003136 elements), 25 warmups / 100 iterations, both orders:
+
+| order | shipped `gelu` | this | ratio |
+|---|---:|---:|---:|
+| old first | 268.54 us | 197.50 | 0.735 |
+| new first | 257.27 | 201.79 | 0.784 |
+
+i.e. **~262 -> ~200 us**, against a measured memory floor of 175.5 us for the
+same kernel with `gelu(x)` replaced by `x*0.5`. Twelve calls a step.
+
+**Accuracy.** The device writes its FP32 result for every one of the 65536 BF16
+bit patterns to a file and the host compares against 50-digit `mpmath`.
+
+| range | this: max abs | max rel | wrong BF16 | shipped: max abs | max rel | wrong BF16 |
+|---|---:|---:|---:|---:|---:|---:|
+| all finite BF16 | 2.476e-6 | 15.3 (at x=-13.19) | **14** / 65280 | 3.831e-7 | 1.000 | **198** / 65280 |
+| `|x| <= 12.5` | 2.476e-6 | 2.001e-5 | 2 | 3.831e-7 | 1.000 | 186 |
+| `|x| <= 3.1` (the whole observed input range) | 2.476e-6 | 1.544e-5 | 2 / 32910 | 2.109e-7 | 1.779e-5 | 1 / 32910 |
+
+The last row is the one that decides it, and the range in it is measured, not
+assumed: a forward hook on all twelve `mlp.gelu` modules over 75497472 real
+activations gives min -3.078, max 3.078, std 0.553, and **zero** samples past
+|x| = 5. Inside that range the two are equivalent to within round-to-nearest
+ties -- 2 BF16 values against 1, of 32910 -- and this one has the SMALLER worst
+relative error.
+
+Outside it, this form is the more accurate one, by a lot, and for a structural
+reason: `0.5*x*(1 + erf(x/sqrt2))` forms `1 - (1 - eps)`. `1 + erf` is
+quantized by the FP32 epsilon at 1.0, so the shipped path collapses to exactly
+zero below about x = -5.2, while BF16 still resolves the true value down to
+x = -13.7. That is where 95 of its 198 wrong roundings live. This form never
+forms that difference; it computes the small quantity directly.
+
+Two deliberate divergences, both recorded:
+
+* `gelu(-inf)` is `-0.0` here and NaN on CUDA (and in the shipped path), because
+  CUDA reaches `-inf * 0`. `-0.0` is the limit of the true function. The frozen
+  H100 special-semantics test is updated for the exact mode and left alone for
+  the tanh mode; it cannot run on this part.
+* Twelve BF16 inputs near x = -13 (true value under 1e-36) are less accurate
+  than the fit is, because `exp2` bottoms out at the smallest FP32 normal and
+  the AMD `v_exp_f32` clamps rather than returning a subnormal, so those come
+  out too LARGE. See the rejection below.
+
+### Rejected: an exponent bias to reach the last twelve values
+
+`exp2` bottoms out at 2^-126, which this expression reaches at about x = -12.7.
+Moving 24 binades out of the exponent and into the prefactor costs nothing --
+the multiply that forms the exponent becomes an FMA -- and it did fix those
+twelve. It also **broke 2304 others**: scaling the prefactor by 2^-24
+underflows it for a SUBNORMAL input, where `0.5*|x|` IS the answer, so every
+BF16 input around 1e-39 returned `x` instead of `x/2`. Measured 2330 wrong BF16
+values against 14. Reverted; the twelve stay wrong and the comment says why.
+
+## Change 45 — `aten::_foreach_add_.Scalar`, 75 launches to one
+
+**Hypothesis.** There is no PrivateUse1 entry, so ATen runs the
+CompositeExplicitAutograd fallback, which is a sequential `add_.Scalar` per list
+element. `torch.optim.AdamW(fused=True)` calls
+`torch._foreach_add_(device_state_steps, 1)` once per param group; nanoGPT's two
+groups hold 50 and 25 one-element FP32 step counters, so a step pays 75 launches
+to add 75 floats. Change 42 already removed the allocation and the 4-byte D2D
+copy from each of them; the launches themselves remained, at 379 us/step against
+ROCm's 10.4.
+
+**Implementation.** `fast_aten__foreach_add__scalar` validates the whole list
+before anything is enqueued (ATen's mutable-TensorList contract is
+all-or-nothing), flattens it to a tuple of `(address, numel)` ints -- no host or
+device array is allocated -- and `ForeachAddScalar` in `elementwise_ops` batches
+it into `InlineArray[ForeachDesc, FOREACH_DESC_CAP]` and launches one grid over
+the CONCATENATION of the list, one block per 65536-element chunk, with
+`_chunk_bounds` walking the descriptors' prefix sums to turn a flat block index
+back into (tensor, range). The arithmetic is the same widen-add-narrow as
+`_scalar_elementwise[dtype, SOP_ADD]`, so the result is bit-identical to the
+`add_.Scalar` path it replaces, and the descriptor cap bounds one launch
+argument rather than the list.
+
+Four things return `NOT_HANDLED` and keep the fallback, which is also what
+defines the semantics: a non-float or mixed dtype, a strided tensor, a bool
+scalar, and **a list whose members alias** -- a duplicate entry has to be added
+twice, in order, and one grid over the concatenation would race instead.
+
+**Measured effect.** Not separable from change 44 at the step level; the two
+were measured together. The launch count is verified directly: a spy on the
+bridge sees exactly one call for a 75-tensor list, three calls for three steps.
+
+## The step, interleaved
+
+`bench_nanogpt_train.py --device mojo --warmup 5 --iters 20`, alternating the
+two sources with the base cache pre-built (the eager cache is content
+addressed, so both survive):
+
+| order | source | median | p10 | p90 |
+|---|---|---:|---:|---:|
+| 1 | this pass | 157.87 ms | 157.55 | 158.22 |
+| 2 | base (9ad8c86) | 158.86 | 158.43 | 159.30 |
+| 3 | this pass | 157.64 | 157.29 | 157.98 |
+| 4 | base (9ad8c86) | 158.78 | 158.39 | 159.08 |
+
+and PyTorch-ROCm re-measured in the same session, interleaved against this
+pass: **156.82 / 156.93** (with this pass at 157.99 between them).
+
+**158.82 -> 157.79 ms against 156.88, i.e. 1.0124 -> 1.0058.** The two base runs
+agree to 0.05% and the three runs of this pass span 157.64-157.99 (0.22%), so
+the -1.03 ms is five times the spread. The remaining deficit is **0.91 ms**.
+
+## Target rejected — the NT route's missing plan search is worth zero here
+
+The brief's largest target was `_nt_mfma_route`, which has no plan search and no
+split-K, on the reading that the same change on the NN route produced 13-37% on
+the GPT-2 prefill shapes. It cannot pay on THIS workload, and the reason is the
+shapes: the NT forward is `(m=49152, n, k)` with k = 768 or 3072, so `m` alone
+gives 192 tile rows and every one of the five shapes ALREADY covers the device
+at 256x256 (576 to 37824 tiles against 304 CUs). Splitting K there cannot reduce
+total k work, only add workspace traffic, which is R8.
+
+Measured rather than argued. A probe calls `_nt_mfma_gemm` directly at the only
+two macro tiles that reach `_nt_ktile_cyc` (diagnostic experiment AF), 256x256
+measured on both sides of 128x384 so neither ordering gets the warmer part, 25
+warmups / 100 iterations:
+
+| shape | 256x256 p1 | 128x384 p1 | model 256 | model 384 | search picks |
+|---|---:|---:|---:|---:|---|
+| attn_c_attn_fwd (49152, 2304, 768) | **365.88** us | 402.05 | 387 us | 409 | 256x256, p=1 |
+| attn_c_proj_fwd (49152, 768, 768) | **128.83** | 153.68 | 129 | 151 | 256x256, p=1 |
+| mlp_c_fc_fwd (49152, 3072, 768) | **482.06** | 548.14 | 516 | 560 | 256x256, p=1 |
+| mlp_c_proj_fwd (49152, 768, 3072) | **445.89** | 501.79 | 460 | 548 | 256x256, p=1 |
+| lm_head_fwd (49152, 50304, 768) | **7304.06** | 8586.69 | 8119 | 8549 | 256x256, p=1 |
+
+256x256 wins every shape by 9.9-19.3%, the two tiles agree bit for bit on a
+sparse signed pattern (0 mismatches of up to 2.47e9 outputs), and
+`_nt_best_parts` returns `parts = 1` for BOTH tiles on every shape. So the plan
+search, wired in, would select exactly what `_nt_mfma_route` already ships. The
+model was re-validated on this regime as the brief required: it is 0-11%
+pessimistic on 256x256 and within 2% on 128x384, i.e. it UNDER-states the
+winner's margin, so its ranking here is conservative in the right direction.
+
+This does not say the plan search is worthless -- it says it is worthless for
+nanoGPT. `_nt_mfma_route` still DECLINES outright whenever
+`ceildiv(m,256)*ceildiv(n,256) < cus`, which is the GPT-2 prefill NT regime the
+journal records at +-1.1%, and that is where the NN route's 13-37% came from.
+It is a real target for a different workload and it is not this one.
+
+### The 2.49 ms the brief attributed to the forward, and where it actually is
+
+Worth recording because it is where the +2.49 came from. The v13 gap report has
+`Linear GEMM (forward)` at 26.459 ms for us against ROCm's 23.969, over 49
+kernels each. The gate, on the same 49 launches, has us at **23.771 ms** and
+ROCm at 25.240 -- i.e. 0.942, and we WIN. Both cannot be right about the same
+kernels. Clustering the 441 `nt_mfma` durations in the v13 trace puts the whole
+in-situ excess on the two lm_head GEMMs (7732 + 8994 us in the trace against
+7301 + 6143 in the gate, +24%) while the other 96 launches are within 3% of the
+gate. Our totals across the two instruments agree (78.8 ms profile against 79.3
+gate for all fifteen cases); ROCm's do not (67.5 against 71.6). So the
+forward/backward SPLIT of that report is not measuring what the gate measures,
+and 2.49 ms of "forward gap" is not a number a forward-route change can collect.
+Not chased further -- it needs a fresh profile, not a kernel change.
+
+## Regression checks, all on the shipped source
+
+| check | recorded | now |
+|---|---|---|
+| gate table x three variants | 15/15, NN 1.014/1.021/1.009, NT 0.943/0.947/0.942, TN 1.368/1.361/1.370 | **15/15 pass**, NN 1.020/1.025/1.016, NT **0.942**/0.952/0.942, TN 1.368/1.362/1.369 |
+| `tests/test_eager_kernels.py`, serial | 645 passed, 93 skipped, 1 failed | see below |
+| `matmul_ops` | untouched by this pass | untouched |
+
+`bf16_matmul_ops` does not compile on this toolchain
+(`no valid implementation of mma for a=8xbfloat16, b=4xbfloat16, c=4xfloat32` in
+`bf16_gemm_kernels.mojo`); it has never been in this cache and is the
+pre-existing `test_bf16_v3_source_dependency_and_kernel_contract` failure. It is
+not affected by this pass.
+
+## What is left in these two rows
+
+1. GELU forward is now ~2.0 ms/step against ROCm's 2.18, i.e. it has crossed.
+   The floor is 175.5 us/call and we are at ~200, so ~0.3 ms of ALU remains
+   above the memory bound; a degree-7 fit over a shorter range would take one
+   FMA off and is worth about 7% of the compute.
+2. The step counters are one launch. What the fused-AdamW row still spends is
+   its own kernel, already at 0.81x.
