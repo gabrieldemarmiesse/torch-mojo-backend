@@ -11,13 +11,14 @@ Reuses the frozen workload from ``bench_nanogpt_train.py``: nanoGPT's GPT-2
   step time, GPU idle statistics and a forward/backward/clip/optimizer split
   measured by synchronized subtraction outside the profiler.
 
-On ROCm, PyTorch still names the profiler activity and columns "CUDA"; both
-CPU and CUDA activities are required so GPU kernels correlate back to their
-ATen ranges.
+Runs on either vendor.  ``--device cuda`` means the vendor's own backend, which
+is ROCm on a HIP build and CUDA on a CUDA one; PyTorch names the profiler
+activity and columns "CUDA" in both cases.  Both CPU and CUDA activities are
+required so GPU kernels correlate back to their ATen ranges.
 
 Usage:
     uv run --no-sync python profile_nanogpt_train_aten.py --device cuda \
-        --output-dir current_bench_train/rocm
+        --output-dir current_bench_train/vendor
     uv run --no-sync python profile_nanogpt_train_aten.py --device mojo \
         --output-dir current_bench_train/mojo
 """
@@ -323,16 +324,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if torch.version.hip is None:
-        raise RuntimeError(
-            f"A ROCm PyTorch build is required; found torch {torch.__version__}"
-        )
     if not torch.cuda.is_available():
-        raise RuntimeError("PyTorch cannot access the ROCm GPU")
+        raise RuntimeError("PyTorch cannot access the GPU")
     hardware_name = torch.cuda.get_device_name(0)
+    # `--device cuda` is the vendor's own backend, whichever vendor that is:
+    # a ROCm build answers to the same `torch.cuda` API as a CUDA one, so the
+    # only difference is what to call it in the report.
+    vendor = "ROCm" if torch.version.hip is not None else "CUDA"
 
     if args.device == "cuda":
-        execution_backend = "PyTorch ROCm"
+        execution_backend = f"PyTorch {vendor}"
     else:
         from torch_mojo_backend import get_accelerators, register_mojo_devices
 
@@ -349,7 +350,8 @@ def main() -> None:
 
     print(
         "Environment: "
-        f"torch={torch.__version__}, hip={torch.version.hip}, "
+        f"torch={torch.__version__}, "
+        f"{vendor.lower()}={torch.version.hip or torch.version.cuda}, "
         f"hardware={hardware_name}, execution_backend={execution_backend}"
     )
     model, optimizer = build_model(args.nanogpt_path, args, args.device)
@@ -457,6 +459,7 @@ def main() -> None:
         "environment": {
             "torch": torch.__version__,
             "hip": torch.version.hip,
+            "cuda": torch.version.cuda,
             "hardware": hardware_name,
             "execution_backend": execution_backend,
             "torch_device": args.device,
