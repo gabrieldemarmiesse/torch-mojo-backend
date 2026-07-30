@@ -2467,6 +2467,18 @@ list-ordering assertion that also fails on `main`, verified in a clean worktree.
 The nanoGPT step is unchanged at 354.22 ms and the single-step loss is still
 bit-identical at 10.977283477783203.
 
+**Superseded by the merge of `main` at 547ad6d.** `main` reached the same defect
+independently (#319) and fixed it the other way: keep the `-inf` seed, and guard
+every `exp(a - b)` in the kernel with an `a == b` select, so the equal case
+contributes the true factor `exp(0) == 1` and `exp(-inf - -inf)` is never
+evaluated. The merge took `main`'s form and dropped the `MIN_FINITE` seed. With
+the guards in place the seed no longer decides correctness -- both fixes are
+complete on their own -- and keeping both would have left a redundant second fix
+shadowing the reviewed one, so a later reader could not tell which was load
+bearing. The guards do add two vector compares and selects per trip of the pass-1
+loop; that was not re-measured, and this kernel runs at memory bandwidth, so the
+step above is quoted for the `MIN_FINITE` form, not for what is now in the tree.
+
 ## Review finding R8 — split-K preempted the route tuned for underfilled grids
 
 **Hypothesis.** `_splitk_parts` bounds the slab count from above (`tiles * 2 *
