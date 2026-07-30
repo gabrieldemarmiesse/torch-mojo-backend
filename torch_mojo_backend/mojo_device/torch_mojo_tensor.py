@@ -10,7 +10,7 @@ from max.driver import CPU
 from max.dtype import DType
 from max.experimental.torch import max_dtype_to_torch
 
-from torch_mojo_backend.mojo_device import torch_mojo_device_module
+from torch_mojo_backend.mojo_device import objc_autorelease, torch_mojo_device_module
 
 # The Mojo extension module (torch_mojo_backend.eager_kernels.tensor_holder),
 # resolved lazily so that importing torch_mojo_backend never triggers a Mojo
@@ -280,6 +280,11 @@ class TorchMojoTensor(torch.Tensor):
         # FunctionalTensor their opportunity to handle mixed-subclass calls.
         if not all(issubclass(cls, tensor_type) for tensor_type in types):
             return NotImplemented
+
+        # The MAX Metal runtime autoreleases ObjC objects per kernel launch;
+        # without a periodically drained pool they leak until macOS SIGKILLs
+        # the process (see objc_autorelease.py). No-op off macOS.
+        objc_autorelease.note_op_dispatched()
 
         # Continue through the ordinary PrivateUse1 numerical path while
         # preserving the exact overload selected by PyTorch.
