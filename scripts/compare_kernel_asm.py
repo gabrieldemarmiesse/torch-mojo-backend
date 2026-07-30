@@ -140,10 +140,15 @@ def main() -> int:
         module = args.kernel_dir / f"{stem}.mojo"
         sides = {}
         errors = {}
-        for side, tree in (("before", args.before), ("after", args.after)):
-            if not (tree / module).is_file():
-                errors[side] = "module absent"
-                continue
+        # A module present on one side only is an added or deleted file, not a
+        # failure: the PR that introduces a kernel module is the common case,
+        # and every kernel in it is new for this architecture.
+        present = {
+            side: tree
+            for side, tree in (("before", args.before), ("after", args.after))
+            if (tree / module).is_file()
+        }
+        for side, tree in present.items():
             error = emit_asm(
                 tree, module, args.accelerator, args.work_dir / side / stem
             )
@@ -157,7 +162,22 @@ def main() -> int:
             failed.append(stem)
             continue
 
-        before, after = sides["before"], sides["after"]
+        before = sides.get("before", {})
+        after = sides.get("after", {})
+        if "before" not in present or "after" not in present:
+            note = "NEW module" if "before" not in present else "REMOVED module"
+            total_changed += len(after) + len(before)
+            rows.append(
+                (
+                    stem,
+                    str(len(after)),
+                    "-",
+                    f"+{len(after)}/-{len(before)}",
+                    f"{note}, every kernel is new for {args.accelerator}",
+                )
+            )
+            continue
+
         changed = sorted(
             k for k in before.keys() & after.keys() if before[k] != after[k]
         )
