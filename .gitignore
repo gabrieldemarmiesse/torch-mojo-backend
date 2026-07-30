@@ -33,3 +33,9 @@ __mojocache__/
 trace_*.json
 .rocprofv3/
 rocprof_out/
+
+# Benchmark and profile output. profile_nanogpt_train_aten.py and
+# compare_nanogpt_train_kernels.py write their runs here; the summaries are
+# measurements of one machine at one commit, so they are quoted in the journal
+# rather than tracked.
+current_bench_train/

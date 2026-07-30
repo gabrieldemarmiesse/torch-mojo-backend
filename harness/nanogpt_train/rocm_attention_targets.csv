@@ -1,3 +1,0 @@
-label,batch,heads,seq,head_dim,calls_per_step,rocm_us,rocm_us_p10,rocm_us_p90
-sdpa_forward,48,12,1024,64,12,679.80,676.26,682.83
-sdpa_backward,48,12,1024,64,12,2413.83,2400.78,2426.61

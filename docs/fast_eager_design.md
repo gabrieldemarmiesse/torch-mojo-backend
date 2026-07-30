@@ -433,7 +433,6 @@ extension has no rocBLAS/hipBLAS dependency.
 - In-place variants (`add_`, `relu_`) are trivial: write to the input
   buffer.
 - First-import compile UX for the test suite: `mojo.importer` has no
-  cross-process lock; warm the cache once (e.g. in
-  `scripts/populate_cache_for_tests.py`) before `pytest -n`.
+  cross-process lock; warm the cache once before `pytest -n`.
 - Shave the remaining per-call overhead (TorchMojoTensor creation goes
   through a meta tensor + `__init__` per op; beartype on hot wrappers).
