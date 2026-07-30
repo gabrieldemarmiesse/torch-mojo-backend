@@ -109,6 +109,80 @@ def _permute_copy_kernel[
         i += gstride
 
 
+def _permute_copy_rows4_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d1: Int,
+    d2: Int,
+    d3_4: Int,
+    s0: Int,
+    s1: Int,
+    s2: Int,
+    nchunks: Int,
+):
+    # Innermost dim contiguous in BOTH buffers (s3 == 1): each thread moves
+    # one 4-element vector, so the coordinate div/mod chain runs once per 4
+    # elements and every access is a vector load/store.  This is the
+    # post-SDPA `.contiguous()` shape: a batched gather of contiguous rows.
+    comptime vec_align = 4 * size_of[dtype]()
+    var c = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while c < nchunks:
+        var j = c % d3_4
+        var rest = c // d3_4
+        var i2 = rest % d2
+        rest = rest // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        out_ptr.store[width=4, alignment=vec_align](
+            c * 4,
+            in_ptr.load[width=4, alignment=vec_align](
+                i0 * s0 + i1 * s1 + i2 * s2 + j * 4
+            ),
+        )
+        c += gstride
+
+
+def _permute_copy_rowloop_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d1: Int,
+    d2: Int,
+    d3_4: Int,
+    s0: Int,
+    s1: Int,
+    s2: Int,
+    nrows: Int,
+):
+    # One thread per (i0, i1, i2) row: the div/mod chain runs once per d3
+    # elements and the sequential vector moves give each thread load-level
+    # parallelism.  Measured ~2.5x the chunk kernel's throughput on Apple at
+    # the post-SDPA shape; only used when there are enough rows to fill the
+    # machine.
+    comptime vec_align = 4 * size_of[dtype]()
+    var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while r < nrows:
+        var i2 = r % d2
+        var rest = r // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        var src = i0 * s0 + i1 * s1 + i2 * s2
+        var dst = r * d3_4 * 4
+        for j in range(d3_4):
+            out_ptr.store[width=4, alignment=vec_align](
+                dst + j * 4,
+                in_ptr.load[width=4, alignment=vec_align](src + j * 4),
+            )
+        r += gstride
+
+
+@always_inline
+
 # A permutation whose innermost extent is contiguous in *both* operands
 # (`s3 == 1`) is not a transpose at all: it is a gather of `d3`-element runs.
 # nanoGPT's `view(B, T, nh, hs).transpose(1, 2)` is exactly that, and it is the
@@ -232,6 +306,58 @@ def _permute_copy[
                     slots,
                 )
                 return True
+
+            # Apple: the measured rows4/rowloop kernels beat the generic
+            # gather on the transpose-materialize hot case (0.39 vs 0.52 ms
+            # at the post-SDPA clone shape, pinned clocks); keep them first.
+            comptime if has_apple_gpu_accelerator():
+                comptime apple_vec_align = 4 * size_of[dtype]()
+                if (
+                    total > 0
+                    and s3 == 1
+                    and d3 % 4 == 0
+                    and (s0 | s1 | s2) % 4 == 0
+                    and (out_addr | in_addr) % apple_vec_align == 0
+                ):
+                    var nrows = d0 * d1 * d2
+                    if nrows >= 4096:
+                        _enqueue_cached[_permute_copy_rowloop_kernel[dtype]](
+                            ctx,
+                            String(t"dm_permute_rowloop_{dtype}"),
+                            _gs_blocks(nrows),
+                            1,
+                            1,
+                            GS_THREADS,
+                            out_ptr.as_unsafe_any_origin(),
+                            in_ptr.as_unsafe_any_origin().as_immutable(),
+                            d1,
+                            d2,
+                            d3 // 4,
+                            s0,
+                            s1,
+                            s2,
+                            nrows,
+                        )
+                        return
+                    var nchunks = total // 4
+                    _enqueue_cached[_permute_copy_rows4_kernel[dtype]](
+                        ctx,
+                        String(t"dm_permute_rows4_{dtype}"),
+                        _gs_blocks(nchunks),
+                        1,
+                        1,
+                        GS_THREADS,
+                        out_ptr.as_unsafe_any_origin(),
+                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        d1,
+                        d2,
+                        d3 // 4,
+                        s0,
+                        s1,
+                        s2,
+                        nchunks,
+                    )
+                    return
 
             comptime V32 = 32 // size_of[dtype]()
             comptime V16 = 16 // size_of[dtype]()
