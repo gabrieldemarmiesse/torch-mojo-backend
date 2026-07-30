@@ -197,3 +197,47 @@ Read this especially if you're an agent doing code review.
 4) Do not write kernels that work only for a very specific shape. Input shapes should be dynamic to avoid recompiles. While it's tempting to make things faster, a user trying a slightly different shape will not benefit from the optimisations of this kernels. It's fine to write different kernels for different regimes (e.g. a kernel for big shape, small shapes, square shapes, rectangular, power of two, etc...) and then do dynamic dispatch based on the input shapes. It's not because we optimize for a given model that we can hardcode at compile-time all the shapes of the kenels to make it faster. So do multiple flexible kernels + dispatch, do not do kernels for hardcoded shapes + fallback.
 5) When asked to optimize a model, the answer should never be "change the code of the model". The model is user-defined, we have no control over it. We just control what we do with the tensors we're given by pytorch.
 6) Do not over-allocate or write your own memory allocation. It's the job of Modular to write a good memory allocator. Allocate normally what you need, and do not write in the memory of the input tensors, unless the signature of the aten function specifies that it's what we should do. For example, at::add_ expects us to write in the input tensor memory, and it's a valid use case to re-use the inputs. Our ops should not read the refcounts and try to use this information to change the logic of the kernel. A refcount is only there to free the memory when needed.
+
+## To check a kernel change against a GPU you do not have
+
+You will normally be optimizing on whatever GPU is in the machine, but the
+kernels are one source compiled for every backend, so a change tuned on one
+architecture can silently retarget another that you cannot benchmark. Do not
+guess and do not assume "I only touched the AMD path" — check it, because
+Mojo cross-compiles and the check is cheap:
+
+```bash
+uv run python scripts/compare_kernel_asm.py \
+    --before /path/to/baseline_worktree --after . --accelerator sm_90a
+```
+
+`mojo build --emit asm --target-accelerator <arch>` needs no such device
+present. It writes host assembly to `-o` and one sidecar per GPU kernel beside
+it (`.ptx` for NVIDIA, `.amdgcn` for AMD, `.ll` for Metal). The script builds
+both trees, pairs kernels by name, masks the mangling hash and reports which
+ones differ. It takes about a minute per module against roughly ten for one
+end-to-end benchmark leg. `mojo --print-supported-accelerators` lists the
+architecture names.
+
+Read the result as follows:
+
+- **No kernel differs** — the change cannot have moved that architecture's
+  device code, and no measurement there is owed. This is the common answer when
+  a new route is properly gated behind
+  `comptime if _accelerator_arch() == "amdgpu:gfx942"`.
+- **Some kernel differs** — that architecture is in scope. Either gate the
+  change, or say plainly in the PR that its effect there is unmeasured. A
+  reviewer with the other card can then measure exactly those kernels.
+
+**This covers device code only, and that is the trap.** Launch geometry lives in
+host code: grid size, block count, and the thresholds that choose between
+kernels. Anything keyed off `sm_count`, an L2 budget or a blocks-per-CU constant
+can retarget a GPU while emitting byte-identical assembly. A real example from
+this repo: flooring the log-softmax forward grid at `4 * sm_count` moved an H100
+from 114 blocks to 528 without changing one PTX instruction. So diff the
+assembly *and* read the dispatch by hand; a clean assembly diff is not a clean
+bill of health.
+
+When a tuning constant was measured on one architecture, say so where it is
+defined, the way `LSM_BLOCKS_PER_CU` and `LSM_L2_BUDGET` do. The next agent
+needs to know which numbers are portable and which were fitted to one card.

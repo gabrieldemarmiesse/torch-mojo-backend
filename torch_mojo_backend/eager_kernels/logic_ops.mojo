@@ -38,6 +38,7 @@ from std.utils import IndexList
 from op_utils import (
     GS_THREADS,
     MAX_RANK,
+    _bw_flat_blocks,
     _enqueue_cached,
     _gs_blocks,
     _make_ptr,
@@ -454,7 +455,9 @@ def _bin_bcast[
                             ](
                                 ctx,
                                 String(t"lg_bcast_fv_{op_code}_{dtype}"),
-                                _gs_blocks(max(1, total // VW)),
+                                _bw_flat_blocks(
+                                    max(1, total // VW), 3 * total * itemsize
+                                ),
                                 1,
                                 1,
                                 GS_THREADS,

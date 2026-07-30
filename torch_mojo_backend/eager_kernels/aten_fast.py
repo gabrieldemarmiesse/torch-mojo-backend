@@ -26,6 +26,7 @@ import warnings
 from collections.abc import Sequence
 
 import torch
+from max.driver import Device
 from max.dtype import DType
 
 from torch_mojo_backend import eager_kernels, is_running_tests
@@ -156,6 +157,7 @@ _FUSED_ADAMW_RECORD_FIELDS = 7
 _FOREACH_CHUNK_ELEMENTS = 65_536
 _FOREACH_NORM_RECORD_FIELDS = 3
 _FOREACH_MUL_RECORD_FIELDS = 2
+_FOREACH_ADD_RECORD_FIELDS = 2
 
 # Opcodes of the batched foreach elementwise bridge (must match
 # foreach_elementwise_kernels.mojo).
@@ -312,6 +314,51 @@ def _foreach_scalar_overlap_kind(tensor, scalar) -> str:
     ):
         return "full"
     return "partial"
+
+
+def _fast__foreach_add__scalar_generic(self, scalar):
+    """One launch for `t += scalar` over a whole homogeneous float tensor list.
+
+    Without this ATen runs the CompositeExplicitAutograd fallback, a sequential
+    `add_.Scalar` per element of the list. nanoGPT's fused AdamW bumps 75
+    one-element step counters per step, so that is 75 launches to add 75 floats.
+    Anything this cannot serve -- a mixed dtype, a non-float dtype, a strided
+    tensor, a list whose members alias -- returns ``NOT_HANDLED`` and keeps that
+    fallback, which is also what defines the semantics being matched.
+    """
+    if len(self) == 0:
+        return NOT_HANDLED
+    if isinstance(scalar, bool) or not isinstance(scalar, int | float):
+        return NOT_HANDLED
+    tensors = [_t(tensor) for tensor in self]
+    if any(tensor is None for tensor in tensors):
+        return NOT_HANDLED
+    device = tensors[0]._device
+    dtype = tensors[0]._dtype
+    if (
+        device.api == "cpu"
+        or dtype not in _FLOAT_DTYPES
+        or any(
+            tensor._device != device
+            or tensor._dtype != dtype
+            or not tensor._is_contiguous
+            for tensor in tensors
+        )
+        # Duplicated or aliasing entries have to be applied once each, in
+        # order; one grid over the concatenation would race instead.
+        or _foreach_tensors_overlap(tensors)
+    ):
+        return NOT_HANDLED
+
+    metadata = tuple(
+        value for tensor in tensors for value in (tensor._ptr, tensor._numel)
+    )
+    if len(metadata) != len(tensors) * _FOREACH_ADD_RECORD_FIELDS:
+        raise AssertionError("invalid foreach add metadata packing")
+    eager_kernels.elementwise_ops.ForeachAddScalar(
+        metadata, float(scalar), dtype.value, _ctx_ptr(device)
+    )
+    return None
 
 
 def fast_aten__foreach_mul__tensor(self, other):
@@ -494,7 +541,7 @@ def fast_aten__foreach_mul__scalar(
     return _foreach_scalar_inplace(self, [value] * len(self), _FOREACH_EW_MUL)
 
 
-def fast_aten__foreach_add__scalar(
+def _fast__foreach_add__scalar_metal(
     self: Sequence[torch.Tensor], scalar: AtenScalar
 ) -> object:
     """Batched homogeneous FP32 in-place add of one host scalar."""
@@ -502,6 +549,17 @@ def fast_aten__foreach_add__scalar(
     if value is None:
         return NOT_HANDLED
     return _foreach_scalar_inplace(self, [value] * len(self), _FOREACH_EW_ADD)
+
+
+def fast_aten__foreach_add__scalar(
+    self: Sequence[torch.Tensor], scalar: AtenScalar
+) -> object:
+    """Batched in-place `t += scalar`: Metal 8-slot path first, then the
+    generic single-launch path (measured on gfx942), else NOT_HANDLED."""
+    result = _fast__foreach_add__scalar_metal(self, scalar)
+    if result is NOT_HANDLED:
+        result = _fast__foreach_add__scalar_generic(self, scalar)
+    return result
 
 
 def fast_aten__foreach_div__scalarlist(
@@ -1059,6 +1117,26 @@ def _try_spec_scalar(spec_fn_name, x, scalar):
     return _wrap_spec_result(result, a._dtype, a._device)
 
 
+def _try_spec_scalar_inplace(spec_fn_name: str, x, scalar) -> bool:
+    """`x op= scalar` in place through a spec op. True when it ran.
+
+    The functional spec plus `_copy_into` costs an allocation and a
+    device-to-device copy; on a one-element tensor that copy is the whole cost
+    (nanoGPT's AdamW bumps 75 scalar step counters per step).
+    """
+    if not isinstance(scalar, int | float) or isinstance(scalar, bool):
+        return False
+    a = _t(x)
+    if a is None or not a._is_contiguous or a._dtype not in _FLOAT_DTYPES:
+        return False
+    try:
+        getattr(eager_kernels.elementwise_ops, spec_fn_name)(_spec_of(a), float(scalar))
+    except Exception as exc:
+        _raise_if_device_oom(exc)
+        return False
+    return True
+
+
 def _try_spec_int_scalar(spec_fn_name, x, scalar):
     """Contiguous tensor-with-int-scalar through a spec op, or None."""
     if not isinstance(scalar, int) or isinstance(scalar, bool):
@@ -1354,6 +1432,17 @@ def fast_aten_add_(input, other, alpha=1):
                 _ctx_ptr(dst._device),
             )
         return input
+    # A float scalar goes straight into `input`, with no output buffer and no
+    # copy back. `alpha` folds into the scalar exactly.
+    if (
+        b is None
+        and isinstance(other, int | float)
+        and not isinstance(other, bool)
+        and isinstance(alpha, int | float)
+        and not isinstance(alpha, bool)
+        and _try_spec_scalar_inplace("AddScalarInplace", input, other * alpha)
+    ):
+        return input
     # General path: functional result, then a (strided-safe) copy back.
     result = fast_aten_add(input, other, alpha)
     if (
@@ -1400,6 +1489,8 @@ def fast_aten_mul_(input, other):
     dst = _t(input)
     if dst is None:
         return None
+    if _t(other) is None and _try_spec_scalar_inplace("MulScalarInplace", input, other):
+        return input
     result = fast_aten_mul(input, other)
     if (
         result is NOT_HANDLED
@@ -2244,6 +2335,19 @@ def fast_aten_alias(tensor):
     t = _t(tensor)
     if t is None:
         return NOT_HANDLED
+    # PyTorch dispatches alias on a saved tensor that was an OUTPUT of an
+    # autograd Function, which is how a saved-tensor unpack hook's result first
+    # reaches an op. A hook may hand back a TorchMojoTensor stripped of its
+    # allocation holder, and every accessor below would then fail with a bare
+    # AttributeError from deep inside a dispatch. Name the invariant here, at
+    # the boundary where such a tensor arrives, rather than on the hot accessor
+    # paths: alias is rare, so this check is free where it matters.
+    if not hasattr(t, "_holder"):
+        raise RuntimeError(
+            "saved-tensor hook returned an unusable Mojo tensor without "
+            "a TorchMojoTensor allocation holder; its unpack hook must "
+            "return a complete TorchMojoTensor or a host tensor"
+        )
     return _view_of(t, t._shape, t._strides, t._offset)
 
 
@@ -4104,6 +4208,66 @@ def fast_aten_upsample_bilinear2d(
     return NOT_HANDLED
 
 
+# Causal regimes of `matmul_ops.CausalBmm`; see the CAUSAL_* aliases there.
+SDPA_CAUSAL_NONE = 0
+SDPA_CAUSAL_OUT = 1
+SDPA_CAUSAL_A_ROWS = 2
+SDPA_CAUSAL_B_COLS = 3
+
+
+def _try_sdpa_causal_bmm(
+    a: MojoTensorLike, b: MojoTensorLike, transpose_b: bool, causal_mode: int
+) -> object:
+    """Batched GEMM that skips the contraction indices a causal mask kills.
+
+    ``a`` is ``(batch, m, k)`` and ``b`` is ``(batch, n, k)`` when
+    ``transpose_b`` else ``(batch, k, n)``; both must be dense row-major.
+    Returns ``None`` when the operands do not qualify, so the caller keeps its
+    ordinary dense chain.
+
+    ``SDPA_CAUSAL_OUT`` leaves the masked half of the output unwritten, so only
+    ask for it when the consumer reads each row's live prefix.  The other two
+    regimes are exact for any consumer: the contraction indices they skip
+    multiply exact zeros.
+    """
+    if (
+        not _on_gpu(a)
+        or a._dtype != b._dtype
+        or a._dtype not in (DType.float32, DType.bfloat16)
+        or a._device != b._device
+        or len(a._shape) != 3
+        or len(b._shape) != 3
+        or not a._is_contiguous
+        or not b._is_contiguous
+        or a._shape[0] != b._shape[0]
+    ):
+        return None
+    batch, m, k = a._shape
+    n = b._shape[1] if transpose_b else b._shape[2]
+    inner = b._shape[2] if transpose_b else b._shape[1]
+    if inner != k or min(batch, m, n, k) <= 0:
+        return None
+    try:
+        causal_bmm = eager_kernels.matmul_ops.CausalBmm
+    except (AttributeError, ImportError):
+        return None
+    out = _alloc((batch, m, n), a._dtype, a._device)
+    try:
+        causal_bmm(
+            out._ptr,
+            a._ptr,
+            b._ptr,
+            (batch, m, n, k, int(bool(transpose_b)), int(causal_mode)),
+            a._dtype.value,
+            _ctx_ptr(a._device),
+        )
+    except NotImplementedError:
+        # The bridge validates its own arguments and signals refusal this way.
+        # Discard the output so the caller's dense chain allocates a fresh one.
+        return None
+    return out
+
+
 def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout_p):
     """Decomposed SDPA returning output, pre-dropout probabilities, and mask.
 
@@ -4167,6 +4331,13 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
             scores._ptr, q._ptr, k._ptr, (b * h, q_len, kv_len, head_dim, 1, 1), dt, ctx
         )
     else:
+        # Off Metal, SDPA_CAUSAL_OUT would skip the fully masked output tiles
+        # of the score matrix here, and it is correct, but it is measurably
+        # *not* worth it: at these shapes the batched GEMM is bound by
+        # workgroup dispatch rather than by the work inside a workgroup, so
+        # the 44% of tiles it removes buy nothing (895.05 -> 901.77 us,
+        # against 488.42 us for a dense half-width control with the same
+        # live-tile count). See optimization_journal.md, experiment AA.
         scores = _try_bf16_bmm(q3, k3, transpose_b=True)
         if scores is None:
             scores = _try_tf32_bmm(q3, k3, transpose_b=True)
@@ -4272,7 +4443,14 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
             ctx,
         )
     else:
-        out = _try_bf16_bmm(effective_probs, v3)
+        out = None
+        if is_causal:
+            # P is exactly zero above the diagonal, so output row block r
+            # only needs contraction indices below its last row.  Exact for
+            # any consumer.
+            out = _try_sdpa_causal_bmm(effective_probs, v3, False, SDPA_CAUSAL_A_ROWS)
+        if out is None:
+            out = _try_bf16_bmm(effective_probs, v3)
         if out is None:
             out = _try_tf32_bmm(effective_probs, v3)
         if out is None:
@@ -4583,6 +4761,246 @@ def fast_fa4_bf16_d64_causal_backward(
     return grad_query, grad_key, grad_value
 
 
+# ---------------------------------------------------------------------------
+# Fused flash attention for gfx942 (CDNA3).
+#
+# The decomposition below costs 29.854 ms/step forward and 46.153 backward on
+# nanoGPT 124M at batch 48 / block 1024; the fused kernels measure 6.100 and
+# 28.896.  They are gated narrowly and everything they decline falls through to
+# the decomposition unchanged.
+# ---------------------------------------------------------------------------
+
+_FUSED_FA_MAX_HEAD_DIM = 256
+
+
+def _fa_strides(t: MojoTensorLike) -> tuple[int, int, int]:
+    """``t``'s (batch, head, seq) element strides for the fused kernels.
+
+    The head_dim stride is not passed: it must be 1, and ``_fused_fa_inputs`` is
+    what guarantees that.
+    """
+    strides = t._strides
+    return (strides[0], strides[1], strides[2])
+
+
+def _alloc_bthd(
+    batch: int, heads: int, seq: int, head_dim: int, dtype: DType, device: Device
+) -> TorchMojoTensor:
+    """A ``[batch, heads, seq, head_dim]`` tensor STORED ``[batch, seq, heads,
+    head_dim]``.
+
+    The layout PyTorch's own flash attention returns, and the reason its
+    ``transpose(1, 2)`` is free: ``o.transpose(1, 2)`` over these strides is
+    exactly a dense ``[batch, seq, heads, head_dim]``, so the universal
+    re-assembly idiom ``y.transpose(1, 2).contiguous().view(B, T, C)`` reduces to
+    two views. Returning a dense ``[B, H, T, D]`` instead cost nanoGPT 48
+    ``clone`` kernels and 1.84 ms/step (journal D11).
+
+    One dense allocation with a strided view over it, not a strided allocation:
+    the view spans every element exactly once, so it costs no extra memory and
+    the Mojo bridge's zeroing by element count is still exactly the buffer.
+    ``_compute_contiguous`` then reports ``False`` for it -- except when
+    ``heads == 1`` or ``seq == 1``, where the two layouts genuinely coincide and
+    ``True`` is the right answer.
+    """
+    dense = _alloc((batch, seq, heads, head_dim), dtype, device)
+    return _view_of(
+        dense,
+        (batch, heads, seq, head_dim),
+        (seq * heads * head_dim, head_dim, heads * head_dim, 1),
+        0,
+    )
+
+
+def _fused_fa_inputs(
+    query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+):
+    """Eligible BHTD inputs for the fused gfx942 kernels, or None.
+
+    The kernels read Q, K and V through their own (batch, head, seq) strides, so
+    the transposed view of BTHD storage that a transformer's
+    ``q.view(B, T, H, D).transpose(1, 2)`` produces -- and that nanoGPT hands
+    over -- is taken as it stands rather than copied. The one layout that cannot
+    be expressed is a strided head_dim axis: that is the axis every vectorized
+    load and every LDS row fill runs along. It is declined here rather than
+    guessed at, and the caller falls through to the decomposition.
+
+    No device work: this only inspects shape, stride, dtype and device, which
+    is all an eager op is allowed to look at.
+    """
+    q = _t(query)
+    k = _t(key)
+    v = _t(value)
+    if (
+        q is None
+        or k is None
+        or v is None
+        or attn_mask is not None
+        or enable_gqa
+        or not isinstance(dropout_p, int | float)
+        or isinstance(dropout_p, bool)
+        or float(dropout_p) != 0.0
+        or q._device != k._device
+        or q._device != v._device
+        or q._device.api != "hip"
+        or q._device.architecture_name != "gfx942"
+        or q._dtype not in _FLOAT_DTYPES
+        or q._dtype != k._dtype
+        or q._dtype != v._dtype
+        or len(q._shape) != 4
+        or len(k._shape) != 4
+        or len(v._shape) != 4
+    ):
+        return None
+    # Q and the output share seq_q; K and V share seq_kv. Batch, heads and
+    # head_dim must agree across all three.
+    if (
+        tuple(q._shape[:2]) != tuple(k._shape[:2])
+        or tuple(k._shape) != tuple(v._shape)
+        or q._shape[3] != k._shape[3]
+    ):
+        return None
+    batch, heads, seq_q, head_dim = q._shape
+    seq_kv = k._shape[2]
+    if (
+        batch <= 0
+        or heads <= 0
+        or seq_q <= 0
+        or seq_kv <= 0
+        or head_dim <= 0
+        or head_dim > _FUSED_FA_MAX_HEAD_DIM
+    ):
+        return None
+    # The innermost axis must be contiguous; every other stride is free.
+    if q._strides[3] != 1 or k._strides[3] != 1 or v._strides[3] != 1:
+        return None
+    if scale is not None and (
+        not isinstance(scale, int | float)
+        or isinstance(scale, bool)
+        or not math.isfinite(float(scale))
+    ):
+        return None
+    return q, k, v
+
+
+def fast_fused_flash_attention_forward(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    enable_gqa=False,
+):
+    """Fused forward returning ``(output, lse, q, k, v)``, or NOT_HANDLED.
+
+    ``lse`` is the per-row log-sum-exp the fused backward consumes; the three
+    returned tensors are exactly the tensors the kernel read, which the backward
+    must be handed rather than re-deriving, because it recomputes the scores from
+    the same bytes. Nothing is copied: each is read through its own
+    (batch, head, seq) strides.
+
+    ``output`` is ``[B, H, T, D]`` shaped and ``[B, T, H, D]`` stored, matching
+    what PyTorch's flash attention returns, so the caller's
+    ``y.transpose(1, 2).contiguous()`` is a no-op rather than a gather.
+    """
+    eligible = _fused_fa_inputs(
+        query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+    )
+    if eligible is None:
+        return NOT_HANDLED
+    q, k, v = eligible
+    batch, heads, seq_q, head_dim = q._shape
+    seq_kv = k._shape[2]
+    scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
+    output = _alloc_bthd(batch, heads, seq_q, head_dim, q._dtype, q._device)
+    lse = _alloc((batch, heads, seq_q), DType.float32, q._device)
+    eager_kernels.flash_attention_ops.FlashAttentionForward(
+        output._ptr,
+        lse._ptr,
+        q._ptr,
+        k._ptr,
+        v._ptr,
+        (batch, heads, seq_q, seq_kv, head_dim),
+        _fa_strides(q) + _fa_strides(k) + _fa_strides(v) + _fa_strides(output),
+        scale_val,
+        1 if is_causal else 0,
+        q._dtype.value,
+        _ctx_ptr(q._device),
+    )
+    return output, lse, q, k, v
+
+
+def fast_fused_flash_attention_backward(
+    grad_output, query, key, value, output, lse, is_causal, scale
+):
+    """Fused backward returning ``(dq, dk, dv)``, or NOT_HANDLED.
+
+    ``query``/``key``/``value``/``output``/``lse`` must be exactly what the
+    fused forward read and wrote. Like the forward, the five read operands are
+    addressed through their own strides; only a ``grad_output`` whose head_dim
+    axis is strided has to be materialized, because that is the axis the
+    vectorized loads run along.
+
+    The three gradients come back ``[B, H, T, D]`` shaped and ``[B, T, H, D]``
+    stored, so the ``transpose(1, 2)`` autograd runs on the way back out to
+    ``x.view(B, T, H, D)`` is a view and the reshape behind it needs no copy.
+    """
+    g = _t(grad_output)
+    q = _t(query)
+    k = _t(key)
+    v = _t(value)
+    o = _t(output)
+    l = _t(lse)
+    if g is None or q is None or k is None or v is None or o is None or l is None:
+        return NOT_HANDLED
+    if g._dtype != q._dtype or tuple(g._shape) != tuple(q._shape):
+        return NOT_HANDLED
+    if g._strides[3] != 1:
+        g = _tc(g)
+        if g is None:
+            return NOT_HANDLED
+    if (
+        q._strides[3] != 1
+        or k._strides[3] != 1
+        or v._strides[3] != 1
+        or o._strides[3] != 1
+    ):
+        return NOT_HANDLED
+    batch, heads, seq_q, head_dim = q._shape
+    seq_kv = k._shape[2]
+    scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
+    grad_query = _alloc_bthd(batch, heads, seq_q, head_dim, q._dtype, q._device)
+    grad_key = _alloc_bthd(batch, heads, seq_kv, head_dim, q._dtype, q._device)
+    grad_value = _alloc_bthd(batch, heads, seq_kv, head_dim, q._dtype, q._device)
+    eager_kernels.flash_attention_ops.FlashAttentionBackward(
+        grad_query._ptr,
+        grad_key._ptr,
+        grad_value._ptr,
+        g._ptr,
+        q._ptr,
+        k._ptr,
+        v._ptr,
+        o._ptr,
+        l._ptr,
+        (batch, heads, seq_q, seq_kv, head_dim),
+        _fa_strides(g)
+        + _fa_strides(q)
+        + _fa_strides(k)
+        + _fa_strides(v)
+        + _fa_strides(o)
+        + _fa_strides(grad_query)
+        + _fa_strides(grad_key)
+        + _fa_strides(grad_value),
+        scale_val,
+        1 if is_causal else 0,
+        q._dtype.value,
+        _ctx_ptr(q._device),
+    )
+    return grad_query, grad_key, grad_value
+
+
 def _sdpa_math_forward(query, key, value, is_causal, scale):
     """Dropout-free compatibility wrapper returning ``(output, probs)``."""
     result = _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, 0.0)
@@ -4775,14 +5193,25 @@ def fast_aten__scaled_dot_product_efficient_attention(
 
 
 def fast_sdpa_dropout_softmax_backward(
-    probabilities, grad_after_dropout, dropout_mask, dropout_scale, score_scale
-):
+    probabilities: object,
+    grad_after_dropout: object,
+    dropout_mask: object,
+    dropout_scale: object,
+    score_scale: object,
+    is_causal: bool = False,
+    query_length: int = 0,
+) -> object:
     """Fuse SDPA dropout backward, softmax backward, and score scaling.
 
     The helper owns public-tensor validation, ordinary output allocation, and
     the pointer-only bridge call.  Its device-kernel body remains isolated in
     the Fable-owned module.  Unsupported inputs return ``NOT_HANDLED`` before
     any operand is materialized or output is allocated.
+
+    ``is_causal`` lets the kernel skip the fully masked half of every row: the
+    forward softmax makes ``P`` exactly zero there, so ``dScores`` is exactly
+    zero and is written as such.  ``query_length`` is the row period of the
+    top-left-aligned mask (rows are ``batch * heads * query_length``).
     """
     probs = _t(probabilities)
     grad = _t(grad_after_dropout)
@@ -4792,14 +5221,21 @@ def fast_sdpa_dropout_softmax_backward(
         or grad is None
         or (dropout_mask is not None and mask is None)
         or not _on_gpu(probs)
-        or probs._dtype != DType.float32
-        or grad._dtype != DType.float32
+        or probs._dtype not in _FLOAT_DTYPES
+        or grad._dtype != probs._dtype
         or probs._device != grad._device
         or tuple(probs._shape) != tuple(grad._shape)
         or len(probs._shape) < 1
         or not isinstance(score_scale, int | float)
         or isinstance(score_scale, bool)
         or not math.isfinite(float(score_scale))
+    ):
+        return NOT_HANDLED
+    if is_causal and (
+        not isinstance(query_length, int)
+        or isinstance(query_length, bool)
+        or query_length <= 0
+        or math.prod(probs._shape[:-1]) % query_length != 0
     ):
         return NOT_HANDLED
 
@@ -4822,7 +5258,7 @@ def fast_sdpa_dropout_softmax_backward(
         return NOT_HANDLED
     try:
         sdpa_backward_ops = eager_kernels.sdpa_backward_ops
-        fused_backward = sdpa_backward_ops.SDPADropoutSoftmaxBackwardF32
+        fused_backward = sdpa_backward_ops.SDPADropoutSoftmaxBackward
     except (AttributeError, ImportError):
         return NOT_HANDLED
 
@@ -4836,7 +5272,7 @@ def fast_sdpa_dropout_softmax_backward(
     grad = _tc(grad)
     if has_mask:
         mask = _tc(mask)
-    out = _alloc(probs._shape, DType.float32, probs._device)
+    out = _alloc(probs._shape, probs._dtype, probs._device)
     if out._numel == 0:
         return out
 
@@ -4849,11 +5285,12 @@ def fast_sdpa_dropout_softmax_backward(
         mask._ptr if has_mask else 0,
         rows,
         cols,
+        int(query_length) if is_causal else 0,
         int(has_mask),
+        int(bool(is_causal)),
         bridge_dropout_scale,
         bridge_score_scale,
-        0,
-        0,
+        probs._dtype.value,
         _ctx_ptr(probs._device),
     )
     return out
@@ -5809,6 +6246,14 @@ def fast_aten_scaled_dot_product_attention(
     if fa4_result is not NOT_HANDLED:
         output, logsumexp, q_native, k_native, v_native = fa4_result
         del logsumexp, q_native, k_native, v_native
+        return output
+
+    fused = fast_fused_flash_attention_forward(
+        query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+    )
+    if fused is not NOT_HANDLED:
+        output, lse, q_used, k_used, v_used = fused
+        del lse, q_used, k_used, v_used
         return output
 
     q = _t(query)

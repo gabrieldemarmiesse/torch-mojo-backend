@@ -27,3 +27,15 @@ gemma-3-270m-it/
 # Agent documentation files (use AGENTS.md instead)
 skills
 __mojocache__/
+
+# Profiler artifacts: chrome traces are tens of MB, rocprofv3 writes SQLite
+# databases next to wherever it was invoked.
+trace_*.json
+.rocprofv3/
+rocprof_out/
+
+# Benchmark and profile output. profile_nanogpt_train_aten.py and
+# compare_nanogpt_train_kernels.py write their runs here; the summaries are
+# measurements of one machine at one commit, so they are quoted in the journal
+# rather than tracked.
+current_bench_train/
