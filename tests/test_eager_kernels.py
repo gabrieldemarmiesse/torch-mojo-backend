@@ -540,6 +540,24 @@ def test_fast_log_softmax_masked_rows_match_cpu(mojo_device):
     torch.testing.assert_close(result.cpu(), torch.log_softmax(x, dim=-1))
 
 
+def test_fast_log_softmax_positive_inf_rows_match_cpu(mojo_gpu):
+    # A +inf logit makes torch's denominator NaN, so the whole row is NaN. The
+    # forward must not launder that away: guarding exp(a - b) with an a == b
+    # select turns exp(inf - inf) into 1.0, which returns -inf for the finite
+    # entries instead. The finite-sentinel seed keeps torch's answer, so compare
+    # with equal_nan: where the NaNs land is the whole point of the case.
+    #
+    # GPU only. The CPU branch of this kernel (and of softmax) has the same
+    # divergence for an unrelated reason -- its exp() does not propagate a NaN
+    # argument -- which predates both fixes and wants its own change.
+    x = torch.randn(4, 512)
+    x[:, 7] = float("inf")
+    result = torch.log_softmax(x.to(mojo_gpu), dim=-1)
+    torch.testing.assert_close(
+        result.cpu(), torch.log_softmax(x, dim=-1), equal_nan=True
+    )
+
+
 def test_fast_native_layer_norm_bf16_gpu_preserves_generic_path(mojo_gpu):
     input = torch.randn(3, 65).bfloat16()
     weight = torch.randn(65).bfloat16()

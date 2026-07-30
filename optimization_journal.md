@@ -2467,17 +2467,76 @@ list-ordering assertion that also fails on `main`, verified in a clean worktree.
 The nanoGPT step is unchanged at 354.22 ms and the single-step loss is still
 bit-identical at 10.977283477783203.
 
-**Superseded by the merge of `main` at 547ad6d.** `main` reached the same defect
-independently (#319) and fixed it the other way: keep the `-inf` seed, and guard
-every `exp(a - b)` in the kernel with an `a == b` select, so the equal case
-contributes the true factor `exp(0) == 1` and `exp(-inf - -inf)` is never
-evaluated. The merge took `main`'s form and dropped the `MIN_FINITE` seed. With
-the guards in place the seed no longer decides correctness -- both fixes are
-complete on their own -- and keeping both would have left a redundant second fix
-shadowing the reviewed one, so a later reader could not tell which was load
-bearing. The guards do add two vector compares and selects per trip of the pass-1
-loop; that was not re-measured, and this kernel runs at memory bandwidth, so the
-step above is quoted for the `MIN_FINITE` form, not for what is now in the tree.
+### The merge of `main` at 547ad6d proposed the other fix, and it is worse twice
+
+`main` reached this defect independently (#319) and fixed it the other way: keep
+the `-inf` seed, and guard every `exp(a - b)` with an `a == b` select, so the
+equal case contributes the true factor `exp(0) == 1` and `exp(-inf - -inf)` is
+never evaluated. Both fixes are complete on their own, so the merge had to pick
+one rather than carry both. Measured, guards against this entry's finite seed,
+`us` per launch, best of 9 reps, the two builds interleaved case by case:
+
+| case | guards (#319) | `MIN_FINITE` | guards cost |
+|---|---:|---:|---:|
+| bf16 12288x50304, 1024-thread arm | 1034.2 | 890.0 | +16.2% |
+| bf16 49152x1024, 256-thread arm, half the block idle | 149.4 | 133.2 | +12.2% |
+| f32 12288x50304, the autocast cross-entropy row | 1686.9 | 1660.9 | +1.6% |
+| f32 16384x4096 | 168.8 | 163.8 | +3.1% |
+| f32 128x128, dispatch-bound control | 16.0 | 16.0 | none |
+
+The guards add two vector compare-selects per trip and change no `exp` count, so
+the asymmetry is the point: bf16 packs 8 fp32 lanes per 16-byte load against
+f32's 4, twice the lane work per byte moved with half the memory time to hide it
+behind. Against Change 40's roofline probes scaled to 12288 rows -- 2-stream copy
+~614 us, 3-stream add ~986 us -- the finite seed at 890 is still under the
+3-stream add while guards at 1034 is above it, i.e. the guarded form has left the
+bandwidth-bound regime that made this kernel's cost predictable.
+
+**The schedule lottery does not explain it.** Mojo compilation here is
+deterministic (same source, byte-identical `.so`), so repeated rounds re-measure
+one binary and cannot sample the scheduler. Bit-neutral twins do: commuting the
+two addends on one side and swapping the two independent guard computations on
+the other leaves semantics identical while giving the scheduler a different input
+order. Each twin landed on its own family within 0.5% (guards 1034-1042, finite
+seed 890-895), so schedule luck is under 1% here against a 12-16% gap.
+
+**And the guards are less faithful to torch.** The `x == new_m` select turns
+`exp(inf - inf)` into 1.0, so a `+inf` element contributes a finite 1 to the sum
+instead of poisoning it, `log_denom` becomes `log(1) = 0`, and the row's finite
+entries come out `-inf`:
+
+| input `[1, inf, 2, 3]` | output |
+|---|---|
+| torch | `[nan, nan, nan, nan]` |
+| guards (#319) | `[-inf, nan, -inf, -inf]` |
+| `MIN_FINITE` | `[nan, nan, nan, nan]` |
+
+The pre-#319 unguarded code produced torch's answer here, so #319 traded a `+inf`
+divergence for the idle-thread fix, and no test covered it. The finite seed needs
+no guard at all, because it is never an operand of a subtraction that can reach
+`inf - inf`. Kept this entry's fix, added
+`test_fast_log_softmax_positive_inf_rows_match_cpu` to pin the `+inf` row, and
+kept both of `main`'s new tests, which pass unchanged on the finite seed (120
+log-softmax tests pass). `main` still carries the guards, so #319 wants
+revisiting there; until it is, this line will conflict on every merge.
+
+**Defect D12, found by that new test and left for its own change.** The test was
+written against `mojo_device`, so it also ran the kernel's CPU branch, which fails
+the same way for an unrelated reason:
+
+| `[1, inf, 2, 3]`, CPU-backed `mojo:1` | mojo | torch |
+|---|---|---|
+| `log_softmax` | `[-inf, nan, -inf, -inf]` | `[nan, nan, nan, nan]` |
+| `softmax` | `[0, nan, 0, 0]` | `[nan, nan, nan, nan]` |
+
+The CPU branch is a plain three-pass max/denominator/store with no guard anywhere,
+so nothing selects the nan away; the arithmetic implies `denom` should be nan and
+it is not, which means the CPU `exp` does not propagate a nan argument (a clamp
+before the polynomial would explain a nan folding to `exp(0) = 1`, and the
+observed `log_denom = 0` is exactly that). Unverified beyond these two ops, but
+both share the shape, so treat it as the CPU `exp` and not as two bugs. It
+predates both fixes and both branches. The regression test is scoped to
+`mojo_gpu` until this is fixed rather than left failing.
 
 ## Review finding R8 — split-K preempted the route tuned for underfilled grids
 
