@@ -109,6 +109,10 @@ _FULL_MODULES = frozenset({"tensor_holder"})
 # Dtypes a first-touch variant compiles when the profile has none recorded:
 # what every torch workload touches (bf16/f32 compute, i64 indices, masks).
 _DEFAULT_DTYPES = ("bfloat16", "bool", "float32", "int64", "uint8")
+# Part of every extension cache key. Bump whenever the loader ABI changes
+# without necessarily changing a Mojo source file. Version 2 keeps each
+# source's original PyInit_<module> symbol instead of compiling a mangled copy.
+_VARIANT_CACHE_ABI = b"fixed-pyinit-v2"
 
 _IMPORT_RE = re.compile(r"^(?:from|import)\s+(\w+)", re.M)
 _REGISTRATION_RE = re.compile(
@@ -155,6 +159,7 @@ def _dep_closure(name: str) -> list[Path]:
 
 def _module_hash(name: str) -> str:
     hasher = hashlib.sha256()
+    hasher.update(_VARIANT_CACHE_ABI)
     for path in _dep_closure(name):
         hasher.update(path.name.encode())
         hasher.update(path.read_bytes())
@@ -224,18 +229,6 @@ def _variant_cmd(
     return cmd + ["-o", str(out)]
 
 
-def _unit_symbol(
-    name: str, ops: frozenset[str] | None, dtypes: frozenset[str] | None
-) -> str:
-    """Module name (= PyInit suffix) for a build. Full builds keep the
-    source's own symbol; gated per-op builds get a deterministic tag-based
-    mangle so every unit coexists in one process AND a cached .so is
-    loadable under the same name by any later process."""
-    if ops is None and dtypes is None:
-        return name
-    return f"_tmbv_{name}_{_variant_tag(ops, dtypes)}"
-
-
 def _variant_path(
     name: str, ops: frozenset[str] | None, dtypes: frozenset[str] | None
 ) -> Path:
@@ -266,14 +259,6 @@ def _build_variant(
         if out.is_file():
             return out
         src = _PACKAGE_DIR / f"{name}.mojo"
-        scratch: Path | None = None
-        symbol = _unit_symbol(name, ops, dtypes)
-        if symbol != name:
-            scratch = _PACKAGE_DIR / f"{symbol}.mojo"
-            scratch.write_text(
-                src.read_text().replace(f"def PyInit_{name}", f"def PyInit_{symbol}")
-            )
-            src = scratch
         scope = "full" if ops is None else next(iter(ops))
         import time as _time
 
@@ -309,8 +294,6 @@ def _build_variant(
             os.replace(tmp, out)
         finally:
             tmp.unlink(missing_ok=True)
-            if scratch is not None:
-                scratch.unlink(missing_ok=True)
         return out
 
 
@@ -326,7 +309,10 @@ def _import_mojo_module(
         # loaded and finalized before any kernel module.
         _STATES["tensor_holder"].ensure_loaded(None)
     so_path = _build_variant(name, ops, dtypes)
-    return _load_extension(f"{__name__}.{_unit_symbol(name, ops, dtypes)}", so_path)
+    # All variants of one source retain its original PyInit_<name> symbol.
+    # Their content-addressed .so paths keep the native extensions distinct,
+    # while _OpUnit retains each returned module object independently.
+    return _load_extension(f"{__name__}.{name}", so_path)
 
 
 def _load_extension(module_name: str, so_path: Path) -> ModuleType:
