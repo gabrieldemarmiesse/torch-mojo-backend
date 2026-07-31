@@ -27,6 +27,7 @@ from std.math import (
     acos,
     atanh,
     ceil,
+    ceildiv,
     cos,
     cosh,
     erf,
@@ -56,6 +57,14 @@ from std.utils.numerics import isnan
 
 from std.algorithm.functional import elementwise
 
+from foreach_clip_contract import (
+    FOREACH_CHUNK_ELEMENTS,
+    FOREACH_DESC_CAP,
+    FOREACH_THREADS,
+    ForeachDesc,
+    empty_foreach_desc,
+)
+from foreach_clip_kernels import _chunk_bounds
 from op_utils import (
     FLOAT_DTYPES,
     GS_THREADS,
@@ -69,6 +78,7 @@ from op_utils import (
     _raw_int,
     _raw_ret_none,
     _raw_tuple_int,
+    _raw_tuple_len,
     _scratch_contig,
     _spec_ptr,
     _spec_result,
@@ -477,6 +487,92 @@ def _unary_contig_kernel[
 
 
 @always_inline
+def _unary_apply[
+    dtype: DType, width: Int, op_code: Int
+](a: SIMD[dtype, width]) -> SIMD[dtype, width]:
+    """One unary op on a SIMD value; the width-generic body shared by the
+    scalar and vectorized contiguous GPU kernels."""
+    var res = a
+    comptime if op_code == UOP_RELU:
+        res = max(a, SIMD[dtype, width](0))
+    comptime if op_code == UOP_ABS:
+        res = abs(a)
+    comptime if op_code == UOP_NEG:
+        # `-a` (pop.neg) wraps for unsigned/overflow exactly like torch.
+        res = -a
+    comptime if op_code == UOP_SIGN:
+        var zero = SIMD[dtype, width](0)
+        var pos = a.gt(zero).cast[dtype]()
+        var neg = a.lt(zero).cast[dtype]()
+        # NaN compares false on both sides -> 0, matching torch.
+        res = pos - neg
+    comptime is_direct = (
+        op_code == UOP_RELU
+        or op_code == UOP_ABS
+        or op_code == UOP_NEG
+        or op_code == UOP_SIGN
+    )
+    comptime if not is_direct:
+        comptime if dtype == DType.float16 or dtype == DType.bfloat16:
+            res = _float_unary[DType.float32, width, op_code](
+                a.cast[DType.float32]()
+            ).cast[dtype]()
+        elif dtype.is_floating_point():
+            res = _float_unary[dtype, width, op_code](a)
+    return res
+
+
+def _unary_contig_kernel4[
+    dtype: DType, op_code: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    size: Int,
+    vec_count: Int,
+):
+    # Vector body (4-element chunks when the host proved alignment,
+    # vec_count == 0 otherwise) plus a grid-stride scalar loop that covers
+    # the tail — or, with vec_count == 0, the entire range.  Each thread
+    # owns 4 consecutive chunks: a sequential 4*vec_align-byte stream with
+    # four independent loads in flight, which this GPU needs to stream at
+    # full rate.
+    comptime vec_align = 4 * size_of[dtype]()
+    var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    var groups = vec_count // 4
+    var g = gid
+    while g < groups:
+        var b = g * 4
+        var a0 = in_ptr.load[width=4, alignment=vec_align](b * 4)
+        var a1 = in_ptr.load[width=4, alignment=vec_align]((b + 1) * 4)
+        var a2 = in_ptr.load[width=4, alignment=vec_align]((b + 2) * 4)
+        var a3 = in_ptr.load[width=4, alignment=vec_align]((b + 3) * 4)
+        out_ptr.store[width=4, alignment=vec_align](
+            b * 4, _unary_apply[dtype, 4, op_code](a0)
+        )
+        out_ptr.store[width=4, alignment=vec_align](
+            (b + 1) * 4, _unary_apply[dtype, 4, op_code](a1)
+        )
+        out_ptr.store[width=4, alignment=vec_align](
+            (b + 2) * 4, _unary_apply[dtype, 4, op_code](a2)
+        )
+        out_ptr.store[width=4, alignment=vec_align](
+            (b + 3) * 4, _unary_apply[dtype, 4, op_code](a3)
+        )
+        g += gstride
+    var c = groups * 4 + gid
+    if c < vec_count:
+        var a = in_ptr.load[width=4, alignment=vec_align](c * 4)
+        out_ptr.store[width=4, alignment=vec_align](
+            c * 4, _unary_apply[dtype, 4, op_code](a)
+        )
+    var i = vec_count * 4 + gid
+    while i < size:
+        out_ptr[i] = _unary_apply[dtype, 1, op_code](in_ptr[i])
+        i += gstride
+
+
+@always_inline
 def _unary_elementwise[
     dtype: DType, op_code: Int
 ](
@@ -537,6 +633,32 @@ def _unary_elementwise[
         else:
             comptime if has_accelerator():
                 comptime if dtype != DType.float64:
+                    comptime if has_apple_gpu_accelerator():
+                        # Apple: 4-wide vector body when both pointers are
+                        # vector-aligned; the scalar grid-stride tail in the
+                        # same kernel keeps arbitrary sizes and unproven
+                        # alignment correct.
+                        comptime vec_align = 4 * size_of[dtype]()
+                        var aligned = (
+                            Int(out_ptr) | Int(in_ptr)
+                        ) % vec_align == 0
+                        var vec_count = size // 4 if aligned else 0
+                        var span = (
+                            max(vec_count // 4, 1) if vec_count > 0 else size
+                        )
+                        _enqueue_cached[_unary_contig_kernel4[dtype, op_code]](
+                            ctx,
+                            String(t"ew_unary4_{op_code}_{dtype}"),
+                            _gs_blocks(span),
+                            1,
+                            1,
+                            GS_THREADS,
+                            out_ptr.as_unsafe_any_origin(),
+                            in_ptr.as_unsafe_any_origin().as_immutable(),
+                            size,
+                            vec_count,
+                        )
+                        return
                     _enqueue_cached[_unary_contig_kernel[dtype, op_code]](
                         ctx,
                         String(t"ew_unary_{op_code}_{dtype}"),
@@ -976,7 +1098,9 @@ def _unary_spec_go[op_code: Int](a_o: PyObjectPtr) raises -> PyObjectPtr:
     )
 
 
-def _unary_spec_into_go[op_code: Int](a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+def _unary_spec_into_go[
+    op_code: Int
+](a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
 
@@ -1102,7 +1226,9 @@ def _unary_bool_spec_go[op_code: Int](a_o: PyObjectPtr) raises -> PyObjectPtr:
     )
 
 
-def _unary_bool_spec_into_go[op_code: Int](a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+def _unary_bool_spec_into_go[
+    op_code: Int
+](a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
     # bool inputs are read through their uint8 storage (bit-compatible).
@@ -1290,6 +1416,179 @@ def _scalar_spec_dispatcher[
             _scalar_spec_into_go[op_code](args[0], args[1], args[2])
             return _raw_ret_none()
         return _scalar_spec_go[op_code](args[0], args[1])
+    except e:
+        return _spec_unsupported(e)
+
+
+def _scalar_inplace_go[
+    op_code: Int
+](a_o: PyObjectPtr, scalar_o: PyObjectPtr) raises -> PyObjectPtr:
+    """`a op= scalar` for a contiguous float tensor, in place.
+
+    The functional spec above allocates an output buffer, and the ATen in-place
+    wrapper then copies it back over `a` -- an allocation and a
+    device-to-device copy per call. That is invisible next to a real tensor but
+    dominates a one-element tensor: nanoGPT's fused AdamW bumps 75 scalar step
+    counters per step through `_foreach_add_.Scalar`, which ATen decomposes into
+    75 `add_.Scalar`, and the copies alone cost ~376 us/step of GPU time.
+    """
+    ref a = _spec_ptr(a_o)[]
+    var supported = False
+    comptime for dt in FLOAT_DTYPES:
+        if a.dtype == dt:
+            supported = True
+    if not supported:
+        raise Error("mojo spec scalar inplace: unsupported dtype ", a.dtype)
+    if not a.contig:
+        raise Error("mojo spec scalar inplace: input is not contiguous")
+
+    var scalar = Float32(_raw_f64(scalar_o))
+    if a.numel > 0:
+        var ctx = a.ctx()
+        comptime for dt in FLOAT_DTYPES:
+            if a.dtype == dt:
+                _scalar_elementwise[dt, op_code](
+                    _make_ptr[dt](a.ptr),
+                    _make_ptr[dt](a.ptr),
+                    scalar,
+                    a.numel,
+                    ctx,
+                )
+    return _raw_ret_none()
+
+
+# Ints per tensor in the `ForeachAddScalar` metadata tuple: (address, numel).
+comptime _FOREACH_ADD_FIELDS = 2
+
+
+@__name(t"foreach_add_scalar_{dtype}_v1")
+def _foreach_add_scalar_kernel[
+    dtype: DType
+](
+    descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
+    desc_count: Int,
+    scalar: Float32,
+):
+    """`t += scalar`, in place, for a whole list of tensors in one launch.
+
+    One block per fixed-size chunk across the CONCATENATION of the list, so a
+    list of 75 one-element tensors and a list of one 75-million-element tensor
+    both land on a grid that describes the work rather than the list: the
+    descriptor's `chunk_end` is a running prefix sum of chunk counts, and
+    `_chunk_bounds` walks it to turn a flat block index back into (tensor,
+    range).  The arithmetic is the same widen-add-narrow that
+    `_scalar_elementwise[dtype, SOP_ADD]` does one tensor at a time, so the
+    result is bit-identical to the `add_.Scalar` path this replaces.
+    """
+    var chunk = Int(block_idx.x)
+    var desc, begin, end = _chunk_bounds(descs, desc_count, chunk)
+    var values = _make_ptr[dtype](desc.tensor_addr)
+    var index = begin + Int(thread_idx.x)
+    while index < end:
+        values[index] = (
+            values.load[width=1](index).cast[DType.float32]() + scalar
+        ).cast[dtype]()[0]
+        index += FOREACH_THREADS
+
+
+def _foreach_add_scalar_go(
+    metadata_o: PyObjectPtr,
+    scalar_o: PyObjectPtr,
+    dtype_o: PyObjectPtr,
+    ctx_o: PyObjectPtr,
+) raises -> PyObjectPtr:
+    """`aten::_foreach_add_.Scalar` for one contiguous float dtype.
+
+    Without a PrivateUse1 entry ATen runs the CompositeExplicitAutograd
+    fallback, which is a Python-level loop of `add_.Scalar`: nanoGPT's fused
+    AdamW bumps 75 one-element step counters per step and pays 75 launches for
+    75 additions.  The whole list is one launch here.
+    """
+    var dtype = _raw_dtype_int(dtype_o)
+    var supported = False
+    comptime for dt in FLOAT_DTYPES:
+        if dtype == dt:
+            supported = True
+    if not supported:
+        raise Error("mojo foreach add scalar: unsupported dtype ", dtype)
+    var fields = _raw_tuple_len(metadata_o)
+    if fields % _FOREACH_ADD_FIELDS != 0:
+        raise Error("mojo foreach add scalar: malformed metadata tuple")
+    var record_count = fields // _FOREACH_ADD_FIELDS
+    # ATen's mutable-TensorList contract is all-or-nothing, so every record is
+    # validated before the first launch rather than as it is consumed.
+    for record in range(record_count):
+        var base = record * _FOREACH_ADD_FIELDS
+        if _raw_tuple_int(metadata_o, base + 1) < 0:
+            raise Error("mojo foreach add scalar: negative numel")
+        if (
+            _raw_tuple_int(metadata_o, base + 1) > 0
+            and _raw_tuple_int(metadata_o, base) == 0
+        ):
+            raise Error("mojo foreach add scalar: null pointer")
+    var scalar = Float32(_raw_f64(scalar_o))
+    var ctx = _raw_ctx(ctx_o)
+
+    var record = 0
+    while record < record_count:
+        # `FOREACH_DESC_CAP` bounds ONE launch argument, not the list: a longer
+        # list is several launches of the same compiled kernel.
+        var descs = InlineArray[ForeachDesc, FOREACH_DESC_CAP](
+            fill=empty_foreach_desc()
+        )
+        var desc_count = 0
+        var total_chunks = 0
+        while record < record_count and desc_count < FOREACH_DESC_CAP:
+            var base = record * _FOREACH_ADD_FIELDS
+            var numel = _raw_tuple_int(metadata_o, base + 1)
+            if numel > 0:
+                total_chunks += ceildiv(numel, FOREACH_CHUNK_ELEMENTS)
+            descs[desc_count] = ForeachDesc(
+                _raw_tuple_int(metadata_o, base), 0, numel, total_chunks
+            )
+            record += 1
+            desc_count += 1
+        if total_chunks > 0:
+            comptime for dt in FLOAT_DTYPES:
+                if dtype == dt:
+                    _enqueue_cached[_foreach_add_scalar_kernel[dt]](
+                        ctx,
+                        String(t"foreach_add_scalar_{dt}_v1"),
+                        total_chunks,
+                        1,
+                        1,
+                        FOREACH_THREADS,
+                        descs,
+                        desc_count,
+                        scalar,
+                    )
+    return _raw_ret_none()
+
+
+def _foreach_add_scalar_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 4:
+            raise Error("ForeachAddScalar expects exactly four arguments")
+        return _foreach_add_scalar_go(args[0], args[1], args[2], args[3])
+    except e:
+        return _spec_unsupported(e)
+
+
+def _scalar_inplace_dispatcher[
+    op_code: Int
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        return _scalar_inplace_go[op_code](args[0], args[1])
     except e:
         return _spec_unsupported(e)
 
@@ -1722,6 +2021,31 @@ def PyInit_elementwise_ops() abi("C") -> PythonObject:
                 "PowScalarSpec",
                 docstring=(
                     "(a_spec, scalar) -> (holder, spec, shape, ptr); float"
+                ),
+            )
+        comptime if _op_on["AddScalarInplace"]():
+            b.def_py_c_function(
+                _scalar_inplace_dispatcher[SOP_ADD],
+                "AddScalarInplace",
+                docstring=(
+                    "(a_spec, scalar) -> None; a += scalar, contiguous float"
+                ),
+            )
+        comptime if _op_on["MulScalarInplace"]():
+            b.def_py_c_function(
+                _scalar_inplace_dispatcher[SOP_MUL],
+                "MulScalarInplace",
+                docstring=(
+                    "(a_spec, scalar) -> None; a *= scalar, contiguous float"
+                ),
+            )
+        comptime if _op_on["ForeachAddScalar"]():
+            b.def_py_c_function(
+                _foreach_add_scalar_dispatcher,
+                "ForeachAddScalar",
+                docstring=(
+                    "((addr, numel) * n, scalar, dtype, ctx) -> None; "
+                    "aten::_foreach_add_.Scalar over one contiguous float dtype"
                 ),
             )
         comptime if _op_on["AddScalarIntSpec"]():

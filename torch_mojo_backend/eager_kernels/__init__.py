@@ -80,6 +80,7 @@ def _find_mojo() -> Path:
         return _MOJO_EXE_CACHE[0]
     raise FileNotFoundError("mojo executable not found for kernel builds")
 
+
 _MOJO_MODULES = (
     "tensor_holder",
     "activation_backward_ops",
@@ -101,6 +102,7 @@ _MOJO_MODULES = (
     "normalization_backward_ops",
     "optimizer_ops",
     "sdpa_backward_ops",
+    "flash_attention_ops",
 )
 # Owns the process-wide Python type registry: always full, never escalated.
 _FULL_MODULES = frozenset({"tensor_holder"})
@@ -222,7 +224,9 @@ def _variant_cmd(
     return cmd + ["-o", str(out)]
 
 
-def _unit_symbol(name: str, ops: frozenset[str] | None, dtypes: frozenset[str] | None) -> str:
+def _unit_symbol(
+    name: str, ops: frozenset[str] | None, dtypes: frozenset[str] | None
+) -> str:
     """Module name (= PyInit suffix) for a build. Full builds keep the
     source's own symbol; gated per-op builds get a deterministic tag-based
     mangle so every unit coexists in one process AND a cached .so is
@@ -233,18 +237,14 @@ def _unit_symbol(name: str, ops: frozenset[str] | None, dtypes: frozenset[str] |
 
 
 def _variant_path(
-    name: str,
-    ops: frozenset[str] | None,
-    dtypes: frozenset[str] | None,
+    name: str, ops: frozenset[str] | None, dtypes: frozenset[str] | None
 ) -> Path:
     tag = _variant_tag(ops, dtypes)
     return _CACHE_DIR / (f"{name}.{tag}.hash-{_module_hash(name)}.so")
 
 
 def _build_variant(
-    name: str,
-    ops: frozenset[str] | None,
-    dtypes: frozenset[str] | None,
+    name: str, ops: frozenset[str] | None, dtypes: frozenset[str] | None
 ) -> Path:
     """Compile one unit .so (blocking); returns the cache path.
 
@@ -315,9 +315,7 @@ def _build_variant(
 
 
 def _import_mojo_module(
-    name: str,
-    ops: frozenset[str] | None = None,
-    dtypes: frozenset[str] | None = None,
+    name: str, ops: frozenset[str] | None = None, dtypes: frozenset[str] | None = None
 ) -> ModuleType:
     """Compatibility seam kept from the previous loaders: the single point a
     unit is built (if needed) and loaded. Tests patch this to simulate
@@ -356,9 +354,7 @@ class _AsyncOpJob:
             with _ASYNC_BUILD_SLOTS:
                 with unit.lock:
                     dtypes = None if unit.want_all_dtypes else unit.dtypes
-                ext = _import_mojo_module(
-                    unit.state.name, frozenset({unit.op}), dtypes
-                )
+                ext = _import_mojo_module(unit.state.name, frozenset({unit.op}), dtypes)
                 with unit.lock:
                     unit.dtypes = dtypes
                     unit.ext = ext
@@ -525,9 +521,7 @@ class _ModuleProxy:
                 value = getattr(ext, attr)
                 self.__dict__[attr] = value
                 return value
-            raise AttributeError(
-                f"module {state.name!r} has no entry point {attr!r}"
-            )
+            raise AttributeError(f"module {state.name!r} has no entry point {attr!r}")
         unit = state.unit(attr)
         if unit.ext is None and not call_queue.enabled():
             unit.load_blocking()

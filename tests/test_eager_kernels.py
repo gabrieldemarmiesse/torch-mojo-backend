@@ -540,6 +540,24 @@ def test_fast_log_softmax_masked_rows_match_cpu(mojo_device):
     torch.testing.assert_close(result.cpu(), torch.log_softmax(x, dim=-1))
 
 
+def test_fast_log_softmax_positive_inf_rows_match_cpu(mojo_gpu):
+    # A +inf logit makes torch's denominator NaN, so the whole row is NaN. The
+    # forward must not launder that away: guarding exp(a - b) with an a == b
+    # select turns exp(inf - inf) into 1.0, which returns -inf for the finite
+    # entries instead. The finite-sentinel seed keeps torch's answer, so compare
+    # with equal_nan: where the NaNs land is the whole point of the case.
+    #
+    # GPU only. The CPU branch of this kernel (and of softmax) has the same
+    # divergence for an unrelated reason -- its exp() does not propagate a NaN
+    # argument -- which predates both fixes and wants its own change.
+    x = torch.randn(4, 512)
+    x[:, 7] = float("inf")
+    result = torch.log_softmax(x.to(mojo_gpu), dim=-1)
+    torch.testing.assert_close(
+        result.cpu(), torch.log_softmax(x, dim=-1), equal_nan=True
+    )
+
+
 def test_fast_native_layer_norm_bf16_gpu_preserves_generic_path(mojo_gpu):
     input = torch.randn(3, 65).bfloat16()
     weight = torch.randn(65).bfloat16()
@@ -1377,6 +1395,133 @@ def test_fast_foreach_norm_preserves_strided_fallback(mojo_gpu):
         torch.testing.assert_close(actual_scalar.cpu(), expected_scalar)
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["f32", "f16", "bf16"]
+)
+def test_fast_foreach_add_scalar_inplace_chunk_boundary(mojo_gpu, dtype):
+    """One launch mutates every input exactly once, across the descriptor cap.
+
+    Sixty-six entries cross ``FOREACH_DESC_CAP`` (64) so the batching loop runs
+    twice, and the last input crosses ``FOREACH_CHUNK_ELEMENTS`` (65536) so one
+    tensor spans several blocks.
+    """
+    counter, calls_before = _eager_registration_snapshot("aten::_foreach_add_.Scalar")
+    host_inputs = [torch.empty(0, dtype=dtype)] + [
+        torch.tensor([float(index), -float(index)], dtype=dtype)
+        for index in range(1, 65)
+    ]
+    host_inputs.append(torch.linspace(-3.0, 4.0, 65_537).to(dtype))
+    device_inputs = [tensor.to(mojo_gpu) for tensor in host_inputs]
+    allocation_state = [
+        (tensor._holder, tensor._ptr, tensor._version) for tensor in device_inputs
+    ]
+
+    returned = torch.ops.aten._foreach_add_.Scalar(device_inputs, 1.5)
+
+    assert returned is None
+    assert counter.call_count == calls_before + 1
+    for actual, expected, (holder, ptr, version) in zip(
+        device_inputs, host_inputs, allocation_state, strict=True
+    ):
+        assert actual._holder is holder
+        assert actual._ptr == ptr
+        assert actual._version == version + 1
+        # The kernel widens to FP32, adds, and narrows -- exactly what the
+        # per-tensor `add_.Scalar` path it replaces does.
+        torch.testing.assert_close(
+            actual.cpu(), ((expected.float() + 1.5).to(dtype)), rtol=0, atol=0
+        )
+
+
+def test_fast_foreach_add_scalar_all_empty_and_integer_scalar(mojo_gpu):
+    """Zero-work lists still record the mutation; an int scalar is accepted."""
+    counter, calls_before = _eager_registration_snapshot("aten::_foreach_add_.Scalar")
+    empties = [torch.empty(0, dtype=torch.float32).to(mojo_gpu) for _ in range(65)]
+    versions = [tensor._version for tensor in empties]
+
+    assert torch.ops.aten._foreach_add_.Scalar(empties, 1) is None
+
+    assert counter.call_count == calls_before + 1
+    assert [tensor._version for tensor in empties] == [v + 1 for v in versions]
+
+    values = [torch.tensor([1.0, 2.0]).to(mojo_gpu)]
+    torch.ops.aten._foreach_add_.Scalar(values, 3)
+    torch.testing.assert_close(
+        values[0].cpu(), torch.tensor([4.0, 5.0]), rtol=0, atol=0
+    )
+
+
+def test_fast_foreach_add_scalar_falls_back_where_it_must(mojo_gpu):
+    """Aliasing, strided, mixed-dtype and integer lists keep ATen's semantics.
+
+    Each of these would be wrong under one grid over the concatenation (a
+    duplicate must be added twice, in order) or is simply outside the kernel's
+    contract, so each has to reach the CompositeExplicitAutograd fallback and
+    still produce the right answer.
+    """
+    counter, calls_before = _eager_registration_snapshot("aten::_foreach_add_.Scalar")
+
+    duplicate = torch.tensor([2.0, -3.0, 5.0]).to(mojo_gpu)
+    version = duplicate._version
+    torch.ops.aten._foreach_add_.Scalar([duplicate, duplicate], 1.0)
+    assert duplicate._version == version + 2
+    torch.testing.assert_close(
+        duplicate.cpu(), torch.tensor([4.0, -1.0, 7.0]), rtol=0, atol=0
+    )
+
+    strided = torch.arange(12, dtype=torch.float32).reshape(3, 4).to(mojo_gpu).t()
+    torch.ops.aten._foreach_add_.Scalar([strided], 0.5)
+    torch.testing.assert_close(
+        strided.cpu(), torch.arange(12, dtype=torch.float32).reshape(3, 4).t() + 0.5
+    )
+
+    mixed = [
+        torch.tensor([1.0], dtype=torch.float32).to(mojo_gpu),
+        torch.tensor([1.0], dtype=torch.bfloat16).to(mojo_gpu),
+    ]
+    torch.ops.aten._foreach_add_.Scalar(mixed, 2.0)
+    assert mixed[0].cpu().item() == 3.0
+    assert mixed[1].cpu().item() == 3.0
+
+    integers = [torch.tensor([1, 2], dtype=torch.int64).to(mojo_gpu)]
+    torch.ops.aten._foreach_add_.Scalar(integers, 3)
+    torch.testing.assert_close(
+        integers[0].cpu(), torch.tensor([4, 5], dtype=torch.int64)
+    )
+
+    # Every one of the four went through the registered op.
+    assert counter.call_count == calls_before + 4
+
+
+def test_fast_foreach_add_scalar_matches_adamw_step_counters(mojo_gpu, monkeypatch):
+    """The shape AdamW actually asks for: 75 one-element FP32 counters.
+
+    Also the guard against the whole change being a no-op -- the bridge has to
+    be entered once per call, not once per tensor.
+    """
+    from torch_mojo_backend import eager_kernels
+
+    counter, calls_before = _eager_registration_snapshot("aten::_foreach_add_.Scalar")
+    original = eager_kernels.elementwise_ops.ForeachAddScalar
+    bridge_calls = []
+
+    def spy(metadata, scalar, dtype, ctx):
+        bridge_calls.append((len(metadata), scalar, dtype))
+        return original(metadata, scalar, dtype, ctx)
+
+    monkeypatch.setattr(eager_kernels.elementwise_ops, "ForeachAddScalar", spy)
+    steps = [torch.zeros((), dtype=torch.float32).to(mojo_gpu) for _ in range(75)]
+    for _ in range(3):
+        torch.ops.aten._foreach_add_.Scalar(steps, 1)
+
+    assert counter.call_count == calls_before + 3
+    assert len(bridge_calls) == 3
+    assert all(fields == 150 for fields, _, _ in bridge_calls)
+    for step in steps:
+        assert step.shape == torch.Size([])
+        assert step.cpu().item() == 3.0
+
+
 def test_fast_foreach_mul_tensor_inplace_chunk_boundary(mojo_gpu):
     """Every input keeps its allocation and receives exactly one mutation."""
     counter, calls_before = _eager_registration_snapshot("aten::_foreach_mul_.Tensor")
@@ -2013,6 +2158,76 @@ def test_fast_gelu_forward_bf16_direct_runtime_layout(
     torch.testing.assert_close(actual.cpu(), expected, atol=2e-2, rtol=2e-2)
 
 
+def _gelu_exact_reference(x: torch.Tensor) -> torch.Tensor:
+    """FP64 exact GELU with no cancellation, for use as a test oracle.
+
+    `torch.nn.functional.gelu(x.double())` is NOT usable as an oracle in the
+    negative tail: it computes `0.5*x*(1 + erf(x/sqrt2))`, and `1 + erf` is
+    quantized by the FP64 epsilon at 1.0, so it has lost half its significant
+    bits by x = -8 and all of them by x = -8.5.  The identity
+    `gelu(x) = relu(x) - 0.5*|x|*erfc(|x|/sqrt2)` never forms `1 - (1 - eps)`,
+    and `torch.special.erfc` keeps full relative accuracy out to the FP64
+    underflow, so this stays exact over the whole BF16 range.
+    """
+    wide = x.double()
+    magnitude = wide.abs()
+    correction = 0.5 * magnitude * torch.special.erfc(magnitude / math.sqrt(2.0))
+    return wide.clamp(min=0.0) - correction
+
+
+def test_fast_gelu_forward_bf16_exact_matches_double_reference(mojo_gpu):
+    """Every finite BF16 value in [-12.5, 12.5] rounds like the true exact GELU.
+
+    The exact path evaluates `relu(x) - 0.5*|x|*erfc(|x|/sqrt2)` from a fitted
+    log2-domain polynomial and one `exp2` rather than `0.5*x*(1+erf(x/sqrt2))`,
+    so the bound that matters is not "close to the previous kernel" but "rounds
+    to the same BF16 as the true function".
+
+    12.5 is where `exp2` reaches the smallest FP32 normal, so the last twelve
+    BF16 inputs before the answer underflows BF16 altogether (|x| in
+    [12.8, 13.5], true value under 1e-36) are outside the guarantee -- and are
+    still nearer the truth than the form this replaces, which returns exactly
+    zero for everything below x = -5.2.
+    """
+    values = torch.arange(0, 1 << 16, dtype=torch.int32).to(torch.uint16)
+    grid = values.view(torch.bfloat16)
+    grid = grid[torch.isfinite(grid) & (grid.abs() <= 12.5)].contiguous()
+    assert grid.numel() > 30000
+
+    actual = torch.nn.functional.gelu(grid.to(mojo_gpu), approximate="none").cpu()
+    reference = _gelu_exact_reference(grid).bfloat16()
+
+    actual_bits = actual.view(torch.int16).int()
+    reference_bits = reference.view(torch.int16).int()
+    differing = actual_bits != reference_bits
+    worst = int((actual_bits - reference_bits).abs().max())
+    assert worst <= 1, f"a BF16 result is {worst} ULP from the true exact GELU"
+    # The survivors are genuine round-to-nearest ties, not a systematic bias.
+    assert int(differing.sum()) <= 8, (
+        f"{int(differing.sum())} of {grid.numel()} BF16 values differ by 1 ULP"
+    )
+
+
+def test_fast_gelu_forward_bf16_exact_resolves_the_negative_tail(mojo_gpu):
+    """`0.5*x*(1 + erf)` loses the whole answer below x = -5; this must not.
+
+    In FP32 `1 + erf(x/sqrt2)` is quantized by the epsilon at 1.0, so any form
+    built on it returns exactly zero once `2*Phi(x)` drops under 1.2e-7, i.e.
+    from about x = -5.2 -- while BF16 still resolves the true value down to
+    x = -13.7.  This pins the property rather than the digits.
+    """
+    x = torch.arange(-12.5, -5.0, 0.0625, dtype=torch.bfloat16)
+    actual = torch.nn.functional.gelu(x.to(mojo_gpu), approximate="none").cpu()
+
+    assert bool((actual < 0).all()), "the negative tail collapsed to zero"
+    # Strictly decreasing in x over this range, i.e. the decay has the shape of
+    # the true function and not of a floor or a plateau.
+    assert bool((actual[1:].double() < actual[:-1].double()).all())
+    torch.testing.assert_close(
+        actual.double(), _gelu_exact_reference(x), rtol=8e-3, atol=0
+    )
+
+
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
 def test_fast_gelu_forward_bf16_cuda_special_semantics(mojo_h100, approximate):
     """Signed zero, non-finites, and mode probes use frozen H100 results."""
@@ -2041,7 +2256,15 @@ def test_fast_gelu_forward_bf16_cuda_special_semantics(mojo_h100, approximate):
     assert int(actual_bits[0]) == 0x0000
     assert int(actual_bits[1]) == 0x8000
     assert torch.isposinf(actual[2])
-    assert torch.isnan(actual[3])
+    if approximate == "tanh":
+        assert torch.isnan(actual[3])
+    else:
+        # CUDA's `0.5*x*(1 + erf(x/sqrt2))` reaches `-inf * 0` here and returns
+        # NaN. The exact path no longer forms that product -- it computes
+        # `relu(x) - 0.5*|x|*erfc(...)`, whose limit at -inf is the correct
+        # -0.0 -- so this one input diverges from CUDA, deliberately, and in
+        # the direction of the true function.
+        assert int(actual_bits[3]) == 0x8000
     assert torch.isnan(actual[4])
     expected_probes = (0x4002, 0x402F) if approximate == "none" else (0x4003, 0x4030)
     assert tuple(int(value) for value in actual_bits[-2:]) == expected_probes
@@ -2421,6 +2644,61 @@ def test_fast_cast(mojo_device):
     )
 
 
+# The dtypes `CAST_DTYPES` in data_movement_ops.mojo dispatches on, both ends.
+_FAST_CAST_DTYPES = [
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.uint8,
+    torch.bool,
+]
+
+
+@pytest.mark.parametrize("numel", [1, 3, 17, 1027, 4099])
+@pytest.mark.parametrize("offset", [0, 1, 2, 3])
+def test_fast_cast_is_exact_for_every_dtype_pair(mojo_device, numel, offset):
+    """Every `CAST_DTYPES` pair, element for element, off a shifted base.
+
+    The cast kernel moves several elements per thread in the widest vector the
+    two base addresses admit, so this pins the three things that makes fragile:
+    a count that is not a multiple of the vector (the scalar tail), a base
+    address that is not vector-aligned (`offset`, which forces a narrower
+    width or the scalar arm), and the `!= 0` bool destination. The pattern
+    steps modulo 5, coprime with every power-of-two width, so a vector whose
+    lanes are rotated or whose tail is left unwritten cannot pass.
+    """
+    values = torch.arange(numel + offset) % 5
+    for src in _FAST_CAST_DTYPES:
+        source = (values != 0) if src is torch.bool else values.to(src)
+        on_device = source.to(mojo_device)
+        view = on_device[offset : offset + numel]
+        assert view.is_contiguous()
+        expected_view = source[offset : offset + numel]
+        for dst in _FAST_CAST_DTYPES:
+            got = view.to(dst).cpu()
+            assert torch.equal(got, expected_view.to(dst)), (
+                f"{src} -> {dst}, numel={numel}, offset={offset}"
+            )
+
+
+@pytest.mark.parametrize("numel", [1027, 65_539])
+def test_fast_cast_float_rounding_matches_cpu(mojo_device, numel):
+    """Narrowing a float must round exactly as the CPU does, tail included."""
+    generator = torch.Generator().manual_seed(numel)
+    values = torch.randn(numel + 3, generator=generator)
+    for offset in (0, 1, 3):
+        on_device = values.to(mojo_device)[offset : offset + numel]
+        expected = values[offset : offset + numel]
+        for dst in (torch.bfloat16, torch.float16):
+            assert torch.equal(on_device.to(dst).cpu(), expected.to(dst)), (
+                f"float32 -> {dst}, numel={numel}, offset={offset}"
+            )
+            round_trip = on_device.to(dst).to(torch.float32).cpu()
+            assert torch.equal(round_trip, expected.to(dst).to(torch.float32))
+
+
 def test_fast_float64_factories_fill_scatter_and_arange(mojo_gpu):
     if list(get_accelerators())[0].api == "metal":
         pytest.skip("Metal does not support float64 kernels")
@@ -2672,6 +2950,169 @@ def test_fast_log_softmax_backward_non_trailing_keeps_composed_path(
     )
     assert actual_half.dtype == torch.float16
     torch.testing.assert_close(actual_half.cpu(), expected_half, atol=2e-3, rtol=2e-3)
+
+
+# Column counts that walk the wide-row log-softmax dispatch. Rows above
+# LSM_BIG_ROW_BYTES take the 1024-thread arm, whose grid is the L2 budget capped
+# below by a device-filling floor; these counts straddle the point where the
+# budget stops being the binding term. Non-multiples of every vector width are
+# deliberate, and they make the per-row head and tail non-empty.
+_WIDE_LSM_COLS = [12_501, 16_384, 16_385, 25_000, 33_000, 50_304, 70_001]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cols", _WIDE_LSM_COLS)
+@pytest.mark.parametrize("offset", [0, 1])
+def test_fast_log_softmax_wide_rows_match_cpu(mojo_gpu, dtype, cols, offset):
+    """Wide rows, both grid regimes, against CPU log_softmax.
+
+    `offset` slices the storage so the row bases stop being 16-byte aligned,
+    which is the only way to exercise the per-row scalar head and tail.
+    """
+    rows = 3
+    generator = torch.Generator().manual_seed(20260726)
+    flat = torch.randn(rows * cols + offset, generator=generator)
+    expected = torch.log_softmax(flat[offset:].view(rows, cols).to(dtype), dim=-1)
+
+    device_flat = flat.to(mojo_gpu).to(dtype)
+    actual = torch.log_softmax(device_flat[offset:].view(rows, cols), dim=-1)
+
+    assert actual.dtype == dtype
+    assert not actual.isnan().any().item()
+    tol = 3e-2 if dtype in (torch.bfloat16, torch.float16) else 2e-5
+    torch.testing.assert_close(actual.cpu(), expected, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cols", [12_501, 33_000, 50_304, 70_001])
+def test_fast_log_softmax_wide_rows_stay_finite(mojo_gpu, dtype, cols):
+    """A wide row whose maximum is huge, and one that is entirely constant.
+
+    The block maximum has to come from a finite sentinel: seeding it with
+    `Float32.MIN` (which is -inf) turns an idle thread's `0 * exp(m - m)` into
+    a NaN that the block reduction spreads over the whole row (defect D7). A
+    constant row makes every log-probability -log(cols), which is the cheapest
+    independent check that the denominator is the full row and not a fragment.
+    """
+    spiked = torch.full((1, cols), -3.0, dtype=dtype)
+    spiked[0, cols // 3] = 60.0
+    actual = torch.log_softmax(spiked.to(mojo_gpu), dim=-1)
+    assert not actual.isnan().any().item()
+    torch.testing.assert_close(
+        actual.cpu(), torch.log_softmax(spiked, dim=-1), atol=3e-2, rtol=3e-2
+    )
+
+    constant = torch.full((2, cols), 0.25, dtype=dtype)
+    flat_out = torch.log_softmax(constant.to(mojo_gpu), dim=-1).cpu().float()
+    want = torch.full((2, cols), -math.log(cols))
+    torch.testing.assert_close(flat_out, want, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cols", [3, 33_000, 50_304, 70_001])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_fast_log_softmax_backward_wide_rows(mojo_gpu, dtype, cols, offset):
+    """The register-staged backward arms, and the re-read fallback.
+
+    cols == 3 is below one 16-byte vector, so the vector body is empty and the
+    whole row is head/tail scalars (the 1-slot arm); the wide counts walk the
+    4- and 8-slot arms and, at 70001, the fallback.
+    """
+    rows = 3
+    generator = torch.Generator().manual_seed(20260726)
+    flat_source = torch.randn(rows * cols + offset, generator=generator)
+    flat_grad = torch.randn(rows * cols + offset, generator=generator)
+    source = flat_source[offset:].view(rows, cols)
+    grad = flat_grad[offset:].view(rows, cols).to(dtype)
+    output = torch.log_softmax(source, dim=-1).to(dtype)
+    expected = (
+        grad.float() - output.float().exp() * grad.float().sum(-1, keepdim=True)
+    ).to(dtype)
+
+    device_grad = flat_grad.to(mojo_gpu).to(dtype)[offset:].view(rows, cols)
+    device_output = output.reshape(-1).to(mojo_gpu).view(rows, cols)
+    actual = torch.ops.aten._log_softmax_backward_data(
+        device_grad, device_output, -1, dtype
+    )
+
+    assert actual.dtype == dtype
+    assert not actual.isnan().any().item()
+    tol = 3e-2 if dtype in (torch.bfloat16, torch.float16) else 2e-5
+    torch.testing.assert_close(actual.cpu(), expected, atol=tol, rtol=tol)
+
+
+def test_fast_binary_add_above_last_level_cache(mojo_gpu):
+    """The flat 16-byte binary kernel's streaming grid arm.
+
+    `_bw_flat_blocks` covers the vector slots exactly once the three operands
+    exceed the 256 MiB last-level cache, and keeps the 4096-block cap below it.
+    24000003 fp32 elements is 288 MB of traffic and not a multiple of the
+    4-element vector, so the scalar tail rides on the streaming grid too.
+    """
+    total = 24_000_003
+    left = torch.arange(total, dtype=torch.float32) % 1021 - 510.0
+    right = torch.arange(total, dtype=torch.float32) % 733 - 366.0
+    actual = (left.to(mojo_gpu) + right.to(mojo_gpu)).cpu()
+    torch.testing.assert_close(actual, left + right)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32]
+)
+@pytest.mark.parametrize("shape", [(), (1,), (5,), (3, 7)])
+def test_fast_scalar_inplace_add_and_mul(mojo_gpu, dtype, shape):
+    """`add_`/`mul_` with a Python scalar must write straight into the input.
+
+    The in-place spec skips the output allocation and the device-to-device copy
+    the functional-plus-copy-back path pays; the int dtype is here because it
+    has to keep falling through to that path.
+    """
+    if dtype.is_floating_point:
+        base = torch.randn(shape, dtype=torch.float32).to(dtype)
+    else:
+        base = (
+            torch.arange(1, math.prod(shape) + 1 if shape else 2)
+            .reshape(shape if shape else ())[()]
+            .to(dtype)
+        )
+    # torch itself refuses a float scalar on an integer in-place op.
+    scalars = (2.5, -1, 0.0) if dtype.is_floating_point else (3, -1, 2)
+    for scalar in scalars:
+        want = base.clone()
+        got = base.clone().to(mojo_gpu)
+        keep = got
+        want.add_(scalar)
+        got.add_(scalar)
+        assert got is keep, "add_ must return the same tensor object"
+        torch.testing.assert_close(got.cpu(), want, atol=2e-2, rtol=2e-2)
+
+        want.mul_(scalar)
+        got.mul_(scalar)
+        torch.testing.assert_close(got.cpu(), want, atol=2e-2, rtol=2e-2)
+
+
+def test_fast_scalar_inplace_add_alpha_and_aliasing(mojo_gpu):
+    """alpha folds into the scalar, and a view sees the in-place write."""
+    base = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    want = base.clone()
+    got = base.clone().to(mojo_gpu)
+    want.add_(3.0, alpha=-2)
+    got.add_(3.0, alpha=-2)
+    torch.testing.assert_close(got.cpu(), want)
+
+    # A non-contiguous target must still be correct (it falls through to the
+    # functional-plus-strided-copy path, which the in-place spec declines).
+    strided_want = base.clone().t()
+    strided_got = base.clone().to(mojo_gpu).t()
+    strided_want.add_(0.5)
+    strided_got.add_(0.5)
+    torch.testing.assert_close(strided_got.cpu(), strided_want)
+
+    # The write lands in the original storage, not a copy.
+    holder = base.clone().to(mojo_gpu)
+    row = holder[1]
+    row.add_(100.0)
+    torch.testing.assert_close(holder.cpu()[1], base[1] + 100.0)
 
 
 @pytest.mark.parametrize("reduction", [0, 1, 2])
@@ -3536,13 +3977,15 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
         "bf16_gemm_tn_v4_kernels.mojo",
         "bf16_gemm_kernels.mojo",
     ]
-    bridge_path, v3_path, _v4_path, fallback_path = aten_fast._BF16_SOURCE_PATHS
+    bridge_path, v3_path, tn_v4_path, fallback_path = aten_fast._BF16_SOURCE_PATHS
     bridge_source = bridge_path.read_text()
     v3_source = v3_path.read_text()
+    tn_v4_source = tn_v4_path.read_text()
     fallback_source = fallback_path.read_text()
 
     assert "from bf16_gemm_v3_kernels import" in bridge_source
     assert "from bf16_gemm_kernels import (" in v3_source
+    assert "from bf16_gemm_tn_v4_kernels import" in v3_source
     for kernel_name in (
         "nanogpt_bf16_gemm_v3_nn_ws_m64n128_tma_s3",
         "nanogpt_bf16_gemm_v3_nn_ws_m128n256_tma_s3",
@@ -3576,7 +4019,7 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     ):
         assert scratch_only not in v3_source
 
-    for source in (bridge_source, v3_source, fallback_source):
+    for source in (bridge_source, v3_source, tn_v4_source, fallback_source):
         for forbidden in (
             ".synchronize(",
             "devicecontext(",
@@ -5867,9 +6310,21 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
     expected_transpose_b_bmm,
     expected_fused_backward,
 ):
-    """Each single-input gradient skips unrelated saves and BMM branches."""
+    """Each single-input gradient skips unrelated saves and BMM branches.
+
+    This pins the DECOMPOSITION's internals -- which tensors it saves, how many
+    batched GEMMs each requested gradient costs -- so the fused gfx942 path is
+    disabled below.  That path is a different algorithm with a deliberately
+    different profile: it saves Q/K/V/O/L, which is O(n*d) rather than the
+    decomposition's O(n^2) probability matrix, and it produces dQ, dK and dV
+    together because all three consume the same recomputed scores.  Its own
+    contract is pinned by
+    ``test_fused_flash_attention_partial_gradients_match_reference``.
+    """
     from torch_mojo_backend.eager_kernels import aten_fast
     from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
+
+    monkeypatch.setattr(aten_fast, "_fused_fa_inputs", lambda *a, **k: None)
 
     generator = torch.Generator().manual_seed(20260718)
     batch, heads, query_length, key_length, head_dim = 2, 2, 5, 7, 3
@@ -5892,14 +6347,27 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
 
     calls = {"bmm": 0, "transpose_b_bmm": 0, "fused_backward": 0}
     original_bmm = aten_fast.fast_aten_bmm
+    original_causal_bmm = aten_fast._try_sdpa_causal_bmm
     original_transpose_b_bmm = aten_fast._fast_aten_bmm_transpose_b
     original_fused_backward = aten_fast.fast_sdpa_dropout_softmax_backward
+    original_fused_route = aten_fast.fast_sdpa_backward
     original_materialize = TorchMojoTensor._materialize_contiguous
     materialized_shapes = []
+    fused_route_handled = []
 
     def spy_bmm(*args):
         calls["bmm"] += 1
         return original_bmm(*args)
+
+    def spy_causal_bmm(*args):
+        # With is_causal=True the backward's plain batched GEMMs are replaced by
+        # the causal ones, which skip the contraction indices the mask kills.
+        # They play exactly the same role here, so count them the same way: this
+        # test is about *how many* matmuls each requested gradient costs.
+        result = original_causal_bmm(*args)
+        if result is not None:
+            calls["bmm"] += 1
+        return result
 
     def spy_transpose_b_bmm(*args):
         calls["transpose_b_bmm"] += 1
@@ -5909,15 +6377,22 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
         calls["fused_backward"] += 1
         return original_fused_backward(*args)
 
+    def spy_fused_route(*args, **kwargs):
+        result = original_fused_route(*args, **kwargs)
+        fused_route_handled.append(result is not aten_fast.NOT_HANDLED)
+        return result
+
     def spy_materialize(self):
         materialized_shapes.append(tuple(self._shape))
         return original_materialize(self)
 
     monkeypatch.setattr(aten_fast, "fast_aten_bmm", spy_bmm)
+    monkeypatch.setattr(aten_fast, "_try_sdpa_causal_bmm", spy_causal_bmm)
     monkeypatch.setattr(aten_fast, "_fast_aten_bmm_transpose_b", spy_transpose_b_bmm)
     monkeypatch.setattr(
         aten_fast, "fast_sdpa_dropout_softmax_backward", spy_fused_backward
     )
+    monkeypatch.setattr(aten_fast, "fast_sdpa_backward", spy_fused_route)
     monkeypatch.setattr(TorchMojoTensor, "_materialize_contiguous", spy_materialize)
 
     actual_inputs = [
@@ -5928,13 +6403,22 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
         *actual_inputs, dropout_p=0.0, is_causal=True
     )
     assert actual_output.grad_fn.saved_names == expected_saved
+    # The counts below are about the backward. The causal forward also issues a
+    # batched GEMM through the same helper, so zero the counters here rather than
+    # let a forward call be mistaken for a gradient's.
+    calls.update(bmm=0, transpose_b_bmm=0, fused_backward=0)
     actual_output.backward(grad_output.to(mojo_gpu))
 
-    assert calls == {
-        "bmm": expected_bmm,
-        "transpose_b_bmm": expected_transpose_b_bmm,
-        "fused_backward": expected_fused_backward,
-    }
+    if fused_route_handled == [True]:
+        # The Apple fused route replaces every composed branch outright; its
+        # own launches respect the same dependency pruning by construction.
+        assert calls == {"bmm": 0, "transpose_b_bmm": 0, "fused_backward": 0}
+    else:
+        assert calls == {
+            "bmm": expected_bmm,
+            "transpose_b_bmm": expected_transpose_b_bmm,
+            "fused_backward": expected_fused_backward,
+        }
     # Neither the old P^T nor dScores^T (both SxL) may be materialized.
     assert (batch * heads, key_length, query_length) not in materialized_shapes
     for name, actual, reference in zip(
@@ -5948,8 +6432,71 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
             )
 
 
-def test_fast_sdpa_saved_tensor_hooks_own_saved_allocations(mojo_gpu):
-    """CPU pack results, not ctx payloads, own SDPA's saved activations."""
+@pytest.mark.parametrize("requires", ["query", "key", "value"])
+def test_fused_flash_attention_partial_gradients_match_reference(mojo_gpu, requires):
+    """The fused path returns exactly the requested gradient, and it is right.
+
+    Same shape as the decomposition's partial-gradient test, and deliberately
+    non-square with is_causal=True: query_length 5 against key_length 7 is where
+    top-left and bottom-right causal alignment disagree, so a kernel using the
+    wrong convention fails here rather than silently passing on square inputs.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    generator = torch.Generator().manual_seed(20260718)
+    batch, heads, query_length, key_length, head_dim = 2, 2, 5, 7, 3
+    host_inputs = [
+        torch.randn(batch, heads, query_length, head_dim, generator=generator),
+        torch.randn(batch, heads, key_length, head_dim, generator=generator),
+        torch.randn(batch, heads, key_length, head_dim, generator=generator),
+    ]
+    grad_output = torch.randn(batch, heads, query_length, head_dim, generator=generator)
+    names = ("query", "key", "value")
+
+    reference_inputs = [
+        tensor.clone().requires_grad_(name == requires)
+        for name, tensor in zip(names, host_inputs, strict=True)
+    ]
+    torch.nn.functional.scaled_dot_product_attention(
+        *reference_inputs, dropout_p=0.0, is_causal=True
+    ).backward(grad_output)
+
+    actual_inputs = [
+        tensor.to(mojo_gpu).requires_grad_(name == requires)
+        for name, tensor in zip(names, host_inputs, strict=True)
+    ]
+    # Only meaningful if the fused path actually claims these inputs.
+    assert (
+        aten_fast._fused_fa_inputs(*actual_inputs, None, 0.0, True, None, False)
+        is not None
+    ), "fused path declined the inputs this test exists to cover"
+
+    torch.nn.functional.scaled_dot_product_attention(
+        *actual_inputs, dropout_p=0.0, is_causal=True
+    ).backward(grad_output.to(mojo_gpu))
+
+    for name, actual, reference in zip(
+        names, actual_inputs, reference_inputs, strict=True
+    ):
+        assert (actual.grad is not None) == (name == requires)
+        if name == requires:
+            assert torch.isfinite(actual.grad.cpu()).all()
+            torch.testing.assert_close(
+                actual.grad.cpu(), reference.grad, atol=3e-2, rtol=3e-2
+            )
+
+
+def test_fast_sdpa_saved_tensor_hooks_own_saved_allocations(mojo_gpu, monkeypatch):
+    """CPU pack results, not ctx payloads, own SDPA's saved activations.
+
+    Pins the DECOMPOSITION's saved set, so the fused gfx942 path is disabled
+    here; the same ownership property is asserted for that path's own,
+    different saved set by the test below.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    monkeypatch.setattr(aten_fast, "_fused_fa_inputs", lambda *a, **k: None)
+
     generator = torch.Generator().manual_seed(20260718)
     batch, heads, query_length, key_length, head_dim = 1, 2, 5, 7, 4
     host_inputs = [
@@ -6002,6 +6549,78 @@ def test_fast_sdpa_saved_tensor_hooks_own_saved_allocations(mojo_gpu):
         )
 
 
+def test_fused_flash_attention_saved_tensor_hooks_own_saved_allocations(mojo_gpu):
+    """The fused path's saved set is hook-owned too, and it is the smaller one.
+
+    The decomposition saves the O(n^2) probability matrix; this path saves Q, K,
+    V, the output and the per-row log-sum-exp, all O(n*d) except the scalar per
+    query.  At the shape below that is the difference between packing a
+    5x7 matrix and packing a length-5 vector, and the gap grows with sequence.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    generator = torch.Generator().manual_seed(20260718)
+    batch, heads, query_length, key_length, head_dim = 1, 2, 5, 7, 4
+    host_inputs = [
+        torch.randn(batch, heads, query_length, head_dim, generator=generator),
+        torch.randn(batch, heads, key_length, head_dim, generator=generator),
+        torch.randn(batch, heads, key_length, head_dim, generator=generator),
+    ]
+    grad_output = torch.randn(batch, heads, query_length, head_dim, generator=generator)
+    reference_inputs = [tensor.clone().requires_grad_() for tensor in host_inputs]
+    torch.nn.functional.scaled_dot_product_attention(
+        *reference_inputs, dropout_p=0.0, is_causal=False
+    ).backward(grad_output)
+
+    hook_calls = []
+
+    def pack(tensor):
+        hook_calls.append(("pack", tensor.device.type, tuple(tensor.shape)))
+        return tensor.cpu()
+
+    def unpack(tensor):
+        hook_calls.append(("unpack", tensor.device.type, tuple(tensor.shape)))
+        return tensor
+
+    actual_inputs = [tensor.to(mojo_gpu).requires_grad_() for tensor in host_inputs]
+    assert (
+        aten_fast._fused_fa_inputs(*actual_inputs, None, 0.0, False, None, False)
+        is not None
+    ), "fused path declined the inputs this test exists to cover"
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        actual_output = torch.nn.functional.scaled_dot_product_attention(
+            *actual_inputs, dropout_p=0.0, is_causal=False
+        )
+        assert actual_output.grad_fn.saved_names == (
+            "query",
+            "key",
+            "value",
+            "output",
+            "logsumexp",
+        )
+        # With hooks active the packed value owns the allocation, so no payload
+        # may retain the original holder -- that is what would defeat a
+        # CPU/offload hook.
+        assert all(
+            payload.holder is None for payload in actual_output.grad_fn.saved_payloads
+        )
+        actual_output.backward(grad_output.to(mojo_gpu))
+
+    saved_shapes = [tuple(tensor.shape) for tensor in host_inputs] + [
+        (batch, heads, query_length, head_dim),
+        (batch, heads, query_length),
+    ]
+    assert hook_calls == [("pack", "mojo", shape) for shape in saved_shapes] + [
+        ("unpack", "cpu", shape) for shape in saved_shapes
+    ]
+    for actual, reference in zip(actual_inputs, reference_inputs, strict=True):
+        assert actual.grad is not None
+        torch.testing.assert_close(
+            actual.grad.cpu(), reference.grad, atol=3e-2, rtol=3e-2
+        )
+
+
 def test_fast_sdpa_saved_tensor_hook_rejects_holderless_mojo_result(mojo_gpu):
     """A malformed Mojo unpack result fails before any dangling pointer use."""
     shape = (1, 1, 3, 4)
@@ -6043,7 +6662,7 @@ def test_sdpa_fused_backward_host_bridge_abi(mojo_gpu, monkeypatch):
     monkeypatch.setattr(
         eager_kernels,
         "sdpa_backward_ops",
-        SimpleNamespace(SDPADropoutSoftmaxBackwardF32=lambda *args: calls.append(args)),
+        SimpleNamespace(SDPADropoutSoftmaxBackward=lambda *args: calls.append(args)),
         raising=False,
     )
 
@@ -6056,8 +6675,9 @@ def test_sdpa_fused_backward_host_bridge_abi(mojo_gpu, monkeypatch):
     assert len(calls) == 1
     args = calls[0]
     assert args[:4] == (out._ptr, probabilities._ptr, grad._ptr, mask._ptr)
-    assert args[4:9] == (6, 5, 1, 1.25, -0.5)
-    assert args[9] == aten_fast._ctx_ptr(probabilities._device)
+    assert args[4:11] == (6, 5, 0, 1, 0, 1.25, -0.5)
+    assert args[11] == probabilities._dtype.value
+    assert args[12] == aten_fast._ctx_ptr(probabilities._device)
 
 
 def test_sdpa_fused_backward_materializes_strided_operands(mojo_gpu, monkeypatch):
@@ -6077,7 +6697,7 @@ def test_sdpa_fused_backward_materializes_strided_operands(mojo_gpu, monkeypatch
     monkeypatch.setattr(
         eager_kernels,
         "sdpa_backward_ops",
-        SimpleNamespace(SDPADropoutSoftmaxBackwardF32=lambda *args: calls.append(args)),
+        SimpleNamespace(SDPADropoutSoftmaxBackward=lambda *args: calls.append(args)),
         raising=False,
     )
 
@@ -6091,8 +6711,9 @@ def test_sdpa_fused_backward_materializes_strided_operands(mojo_gpu, monkeypatch
     assert len(calls) == 1
     args = calls[0]
     assert all(actual != original for actual, original in zip(args[1:4], original_ptrs))
-    assert args[4:9] == (10, 3, 1, 1.25, 0.125)
-    assert args[9] == aten_fast._ctx_ptr(probabilities._device)
+    assert args[4:11] == (10, 3, 0, 1, 0, 1.25, 0.125)
+    assert args[11] == probabilities._dtype.value
+    assert args[12] == aten_fast._ctx_ptr(probabilities._device)
 
 
 def test_sdpa_fused_backward_no_mask_ignores_dropout_scale(mojo_gpu, monkeypatch):
@@ -6103,7 +6724,7 @@ def test_sdpa_fused_backward_no_mask_ignores_dropout_scale(mojo_gpu, monkeypatch
     monkeypatch.setattr(
         eager_kernels,
         "sdpa_backward_ops",
-        SimpleNamespace(SDPADropoutSoftmaxBackwardF32=lambda *args: calls.append(args)),
+        SimpleNamespace(SDPADropoutSoftmaxBackward=lambda *args: calls.append(args)),
         raising=False,
     )
     probabilities = torch.randn(3, 7).to(mojo_gpu)
@@ -6115,7 +6736,7 @@ def test_sdpa_fused_backward_no_mask_ignores_dropout_scale(mojo_gpu, monkeypatch
 
     assert out is not aten_fast.NOT_HANDLED
     assert len(calls) == 1
-    assert calls[0][3:9] == (0, 3, 7, 0, 1.0, 0.0)
+    assert calls[0][3:11] == (0, 3, 7, 0, 0, 0, 1.0, 0.0)
 
 
 def test_sdpa_fused_backward_empty_skips_bridge(mojo_gpu, monkeypatch):
@@ -6126,7 +6747,7 @@ def test_sdpa_fused_backward_empty_skips_bridge(mojo_gpu, monkeypatch):
     monkeypatch.setattr(
         eager_kernels,
         "sdpa_backward_ops",
-        SimpleNamespace(SDPADropoutSoftmaxBackwardF32=lambda *args: calls.append(args)),
+        SimpleNamespace(SDPADropoutSoftmaxBackward=lambda *args: calls.append(args)),
         raising=False,
     )
     probabilities = torch.empty(2, 0).to(mojo_gpu)

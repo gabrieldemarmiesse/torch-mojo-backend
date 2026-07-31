@@ -36,18 +36,29 @@ alignment); no shape is compiled in:
     single 128-bit vector reduction per 4 columns on sm_90+ NVIDIA
     (compile-time guarded, with a portable 4x scalar-atomic fallback);
     anything else takes the scalar variant.
+  * ownership (Apple only, small tables): Metal has no threadgroup float
+    atomics and its device-scope float atomics serialize badly on
+    collision-heavy tables, so each thread instead *owns* one
+    (row, column-chunk) output cell, scans the (threadgroup-staged) index
+    list, accumulates matching grad_output rows in registers, and writes
+    its cell with one plain store.  No atomics, no zero pass; work scales
+    with num_weights * num_indices, so the regime is gated to small
+    tables and index lists.
 
 Empty logical outputs return before any launch, and empty `indices` still
 zeroes the complete output.
 """
 
 from std.atomic import Atomic, Ordering
+from std.ffi import _get_global_or_null, external_call
 from std.gpu import barrier, block_idx, grid_dim, thread_idx
 from std.gpu.host import DeviceAttribute, DeviceContext
 from std.math import ceildiv
-from std.memory import AddressSpace, stack_allocation
+from std.memory import AddressSpace, alloc, stack_allocation
 from std.sys import inlined_assembly, is_amd_gpu, is_nvidia_gpu
-from std.sys.info import _is_sm_9x_or_newer
+from std.sys.info import _is_sm_9x_or_newer, has_apple_gpu_accelerator
+
+from op_utils import _enqueue_cached, _enqueue_cached_2d
 
 comptime _BLOCK = 256
 comptime _VEC = 4
@@ -62,6 +73,38 @@ comptime _RED_TX = 64
 comptime _RED_TY = 4
 # Histogram pays two extra small launches; only large outputs amortize them.
 comptime _HIST_MIN_OUT = 1 << 22
+# Ownership regime (Apple): every thread owns one (row, column-chunk) output
+# cell and scans the complete index list, so compare work grows with
+# num_weights * num_indices; both dimensions are capped to keep that scan
+# cheaper than the atomic scatter it replaces.
+comptime _OWN_TX = 32
+comptime _OWN_TY = 8
+comptime _OWN_TILE = _OWN_TX * _OWN_TY
+comptime _OWN_MAX_ROWS = 1024
+comptime _OWN_MAX_INDICES = 16384
+
+
+def _cached_max_grid(ctx: DeviceContext) raises -> Int:
+    """max_grid (16 blocks per SM) with the device query cached per context.
+
+    `ctx.get_attribute` costs ~1 ms per call on Metal — it must never sit on
+    the per-op path.
+    """
+    var name = String(t"TMB_EMB_BWD_MAXGRID_{ctx.id()}")
+    if global_ptr := _get_global_or_null(name):
+        return global_ptr.value().bitcast[Int]()[]
+    var sm_count: Int
+    try:
+        sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    except:
+        sm_count = 64
+    var value = max(1, sm_count) * 16
+    var cached = alloc[Int](1)
+    cached[] = value
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), cached.bitcast[NoneType]()
+    )
+    return value
 
 
 @always_inline
@@ -271,6 +314,91 @@ def _scatter_hist_vec4(
         row += row_stride
 
 
+@__name("nanogpt_embedding_dense_backward_owner_vec4")
+def _owner_vec4(
+    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    num_indices: Int,
+    vec_cols: Int,
+    num_weights: Int,
+    padding_idx: Int,
+):
+    # Thread (tx, ty) owns output cell (row block_y*_OWN_TY + ty, vec column
+    # block_x*_OWN_TX + tx).  Index tiles are staged in threadgroup memory as
+    # int32 (valid targets fit: the regime caps num_weights; padding rows are
+    # encoded -1, which no owned row matches).  Inactive threads still run
+    # every tile iteration so the barriers stay uniform.
+    var tile = stack_allocation[
+        _OWN_TILE, DType.int32, address_space=AddressSpace.SHARED
+    ]()
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var tid = ty * _OWN_TX + tx
+    var col = Int(block_idx.x) * _OWN_TX + tx
+    var row = Int(block_idx.y) * _OWN_TY + ty
+    var active = row < num_weights and col < vec_cols
+    var acc = SIMD[DType.float32, _VEC](0.0)
+    var base = 0
+    while base < num_indices:
+        var count = min(_OWN_TILE, num_indices - base)
+        if tid < count:
+            var t = Int(indices[base + tid])
+            tile[tid] = Int32(-1) if t == padding_idx else Int32(t)
+        barrier()
+        if active:
+            for k in range(count):
+                if Int(tile[k]) == row:
+                    acc += grad_output.load[width=_VEC, alignment=16](
+                        ((base + k) * vec_cols + col) * _VEC
+                    )
+        barrier()
+        base += _OWN_TILE
+    if active:
+        # Full ownership: the plain store doubles as the zero pass for rows
+        # no index touched.
+        grad_weight.store[width=_VEC, alignment=16](
+            (row * vec_cols + col) * _VEC, acc
+        )
+
+
+@__name("nanogpt_embedding_dense_backward_owner_scalar")
+def _owner_scalar(
+    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    num_indices: Int,
+    embedding_dim: Int,
+    num_weights: Int,
+    padding_idx: Int,
+):
+    var tile = stack_allocation[
+        _OWN_TILE, DType.int32, address_space=AddressSpace.SHARED
+    ]()
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var tid = ty * _OWN_TX + tx
+    var col = Int(block_idx.x) * _OWN_TX + tx
+    var row = Int(block_idx.y) * _OWN_TY + ty
+    var active = row < num_weights and col < embedding_dim
+    var acc = Float32(0.0)
+    var base = 0
+    while base < num_indices:
+        var count = min(_OWN_TILE, num_indices - base)
+        if tid < count:
+            var t = Int(indices[base + tid])
+            tile[tid] = Int32(-1) if t == padding_idx else Int32(t)
+        barrier()
+        if active:
+            for k in range(count):
+                if Int(tile[k]) == row:
+                    acc += grad_output[(base + k) * embedding_dim + col]
+        barrier()
+        base += _OWN_TILE
+    if active:
+        grad_weight[row * embedding_dim + col] = acc
+
+
 @__name("nanogpt_embedding_dense_backward_table_accum")
 def _table_accum(
     scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -447,24 +575,69 @@ def enqueue_embedding_dense_backward_f32_i64(
         # Empty logical output: nothing to zero and nothing to scatter.
         return
 
-    var sm_count: Int
-    try:
-        sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
-    except:
-        sm_count = 64
-    var max_grid = max(1, sm_count) * 16
+    var max_grid = _cached_max_grid(ctx)
+    var sm_count = max_grid // 16
     var out_addr = Int(grad_weight)
     var vec_ok = (
         embedding_dim % _VEC == 0 and (Int(grad_output) | out_addr) % 16 == 0
     )
 
+    # Ownership regime (Apple): no float atomics at all — each thread owns
+    # one output cell, scans the staged index list, and writes once.  The
+    # store pass covers the complete output, so no zero pass either.  Gated
+    # to small tables/index lists because compare work is
+    # num_weights * num_indices per column chunk.
+    comptime if has_apple_gpu_accelerator():
+        if num_weights <= _OWN_MAX_ROWS and num_indices <= _OWN_MAX_INDICES:
+            var blocks_y = ceildiv(num_weights, _OWN_TY)
+            if vec_ok:
+                var vec_cols = embedding_dim // _VEC
+                _enqueue_cached_2d[_owner_vec4](
+                    ctx,
+                    "emb_bwd_owner_vec4",
+                    ceildiv(vec_cols, _OWN_TX),
+                    blocks_y,
+                    1,
+                    _OWN_TX,
+                    _OWN_TY,
+                    grad_weight,
+                    grad_output,
+                    indices,
+                    num_indices,
+                    vec_cols,
+                    num_weights,
+                    padding_idx,
+                )
+            else:
+                _enqueue_cached_2d[_owner_scalar](
+                    ctx,
+                    "emb_bwd_owner_scalar",
+                    ceildiv(embedding_dim, _OWN_TX),
+                    blocks_y,
+                    1,
+                    _OWN_TX,
+                    _OWN_TY,
+                    grad_weight,
+                    grad_output,
+                    indices,
+                    num_indices,
+                    embedding_dim,
+                    num_weights,
+                    padding_idx,
+                )
+            return
+
     # Table regime: the whole weight table fits a 48 KiB shared block and
     # duplicates are expected, so shared-memory pre-aggregation avoids the
     # L2 same-address atomic serialization that dominates collision-heavy
     # scatters.  Stage B rewrites the complete output, replacing the zero
-    # pass.
+    # pass.  Apple GPUs have no threadgroup (local) float atomics — Metal
+    # rejects the pipeline at compile time — so they always take the
+    # device-scope-atomic regimes below instead.
+    comptime table_regime_supported = not has_apple_gpu_accelerator()
     if (
-        num_weights <= _TABLE_MAX_ROWS
+        table_regime_supported
+        and num_weights <= _TABLE_MAX_ROWS
         and num_indices >= 2 * num_weights
         and num_indices >= 128
     ):
@@ -483,7 +656,14 @@ def enqueue_embedding_dense_backward_f32_i64(
             blocks_y * num_weights * dim_pad
         )
         var scratch_ptr = scratch.unsafe_ptr().as_unsafe_any_origin()
-        ctx.enqueue_function[_table_accum](
+        _enqueue_cached_2d[_table_accum](
+            ctx,
+            "emb_bwd_table_accum",
+            col_chunks,
+            blocks_y,
+            1,
+            _TABLE_COLS,
+            _TABLE_ROWG,
             scratch_ptr,
             grad_output,
             indices,
@@ -493,14 +673,19 @@ def enqueue_embedding_dense_backward_f32_i64(
             padding_idx,
             dim_pad,
             rows_per_block,
-            grid_dim=(col_chunks, blocks_y),
-            block_dim=(_TABLE_COLS, _TABLE_ROWG),
         )
         var out_vec_ok = 1 if (
             embedding_dim % _VEC == 0 and out_addr % 16 == 0
         ) else 0
         var total_vec = num_weights * (dim_pad // _VEC)
-        ctx.enqueue_function[_table_reduce](
+        _enqueue_cached_2d[_table_reduce](
+            ctx,
+            "emb_bwd_table_reduce",
+            max(1, min(ceildiv(total_vec, _RED_TX), max_grid)),
+            1,
+            1,
+            _RED_TX,
+            _RED_TY,
             grad_weight,
             scratch_ptr,
             num_weights,
@@ -508,8 +693,6 @@ def enqueue_embedding_dense_backward_f32_i64(
             dim_pad,
             blocks_y,
             out_vec_ok,
-            grid_dim=(max(1, min(ceildiv(total_vec, _RED_TX), max_grid)),),
-            block_dim=(_RED_TX, _RED_TY),
         )
         # Normal release after both stream-ordered consumers are enqueued.
         _ = scratch^
@@ -522,30 +705,48 @@ def enqueue_embedding_dense_backward_f32_i64(
         var vec_cols = embedding_dim // _VEC
         var counts = ctx.enqueue_create_buffer[DType.int32](num_weights)
         var counts_ptr = counts.unsafe_ptr().as_unsafe_any_origin()
-        ctx.enqueue_function[_count_zero](
+        _enqueue_cached[_count_zero](
+            ctx,
+            "emb_bwd_count_zero",
+            max(1, min(ceildiv(num_weights, _BLOCK), max_grid)),
+            1,
+            1,
+            _BLOCK,
             counts_ptr,
             num_weights,
-            grid_dim=(max(1, min(ceildiv(num_weights, _BLOCK), max_grid)),),
-            block_dim=(_BLOCK,),
         )
-        ctx.enqueue_function[_count](
+        _enqueue_cached[_count](
+            ctx,
+            "emb_bwd_count",
+            max(1, min(ceildiv(num_indices, _BLOCK), max_grid)),
+            1,
+            1,
+            _BLOCK,
             counts_ptr,
             indices,
             num_indices,
             padding_idx,
-            grid_dim=(max(1, min(ceildiv(num_indices, _BLOCK), max_grid)),),
-            block_dim=(_BLOCK,),
         )
         var col_blocks = ceildiv(vec_cols, _BLOCK)
-        ctx.enqueue_function[_zero_untouched](
+        _enqueue_cached[_zero_untouched](
+            ctx,
+            "emb_bwd_zero_untouched",
+            col_blocks,
+            min(num_weights, _MAX_GRID_Y),
+            1,
+            _BLOCK,
             grad_weight,
             counts_ptr,
             num_weights,
             vec_cols,
-            grid_dim=(col_blocks, min(num_weights, _MAX_GRID_Y)),
-            block_dim=(_BLOCK,),
         )
-        ctx.enqueue_function[_scatter_hist_vec4](
+        _enqueue_cached[_scatter_hist_vec4](
+            ctx,
+            "emb_bwd_scatter_hist_vec4",
+            col_blocks,
+            min(num_indices, _MAX_GRID_Y),
+            1,
+            _BLOCK,
             grad_weight,
             grad_output,
             indices,
@@ -553,8 +754,6 @@ def enqueue_embedding_dense_backward_f32_i64(
             num_indices,
             vec_cols,
             padding_idx,
-            grid_dim=(col_blocks, min(num_indices, _MAX_GRID_Y)),
-            block_dim=(_BLOCK,),
         )
         _ = counts^
         return
@@ -568,21 +767,29 @@ def enqueue_embedding_dense_backward_f32_i64(
         var vec_count = body // _VEC
         var tail = body - vec_count * _VEC
         var grid = max(1, min(ceildiv(vec_count, _BLOCK), max_grid))
-        ctx.enqueue_function[_zero_vec4](
+        _enqueue_cached[_zero_vec4](
+            ctx,
+            "emb_bwd_zero_vec4",
+            grid,
+            1,
+            1,
+            _BLOCK,
             grad_weight,
             head,
             vec_count,
             tail,
-            grid_dim=(grid,),
-            block_dim=(_BLOCK,),
         )
     else:
         var grid = max(1, min(ceildiv(output_elements, _BLOCK), max_grid))
-        ctx.enqueue_function[_zero_scalar](
+        _enqueue_cached[_zero_scalar](
+            ctx,
+            "emb_bwd_zero_scalar",
+            grid,
+            1,
+            1,
+            _BLOCK,
             grad_weight,
             output_elements,
-            grid_dim=(grid,),
-            block_dim=(_BLOCK,),
         )
 
     if num_indices <= 0:
@@ -595,26 +802,34 @@ def enqueue_embedding_dense_backward_f32_i64(
         var vec_cols = embedding_dim // _VEC
         var total = num_indices * vec_cols
         var grid = max(1, min(ceildiv(total, _BLOCK), max_grid))
-        ctx.enqueue_function[_scatter_vec4](
+        _enqueue_cached[_scatter_vec4](
+            ctx,
+            "emb_bwd_scatter_vec4",
+            grid,
+            1,
+            1,
+            _BLOCK,
             grad_weight,
             grad_output,
             indices,
             num_indices,
             vec_cols,
             padding_idx,
-            grid_dim=(grid,),
-            block_dim=(_BLOCK,),
         )
     else:
         var total = num_indices * embedding_dim
         var grid = max(1, min(ceildiv(total, _BLOCK), max_grid))
-        ctx.enqueue_function[_scatter_scalar](
+        _enqueue_cached[_scatter_scalar](
+            ctx,
+            "emb_bwd_scatter_scalar",
+            grid,
+            1,
+            1,
+            _BLOCK,
             grad_weight,
             grad_output,
             indices,
             num_indices,
             embedding_dim,
             padding_idx,
-            grid_dim=(grid,),
-            block_dim=(_BLOCK,),
         )

@@ -38,6 +38,7 @@ from std.utils import IndexList
 from op_utils import (
     GS_THREADS,
     MAX_RANK,
+    _bw_flat_blocks,
     _enqueue_cached,
     _gs_blocks,
     _make_ptr,
@@ -491,7 +492,9 @@ def _bin_bcast[
                             ](
                                 ctx,
                                 String(t"lg_bcast_fv_{op_code}_{dtype}"),
-                                _gs_blocks(max(1, total // VW)),
+                                _bw_flat_blocks(
+                                    max(1, total // VW), 3 * total * itemsize
+                                ),
                                 1,
                                 1,
                                 GS_THREADS,
@@ -1328,9 +1331,7 @@ def _add_f32_bf16_spec_into_go(
 
     var ctx = a.ctx()
     if ctx.api() == "cpu":
-        raise Error(
-            "mojo spec add f32 bf16 into: accelerator context required"
-        )
+        raise Error("mojo spec add f32 bf16 into: accelerator context required")
 
     var fp32_addr = a.ptr if a.dtype == DType.float32 else b.ptr
     var bf16_addr = a.ptr if a.dtype == DType.bfloat16 else b.ptr

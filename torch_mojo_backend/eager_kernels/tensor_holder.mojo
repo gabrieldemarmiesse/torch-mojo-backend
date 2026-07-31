@@ -21,6 +21,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.memory import memcpy
 from std.python import Python, PythonObject
@@ -28,15 +29,18 @@ from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.python.bindings import PythonModuleBuilder
 from std.utils.coord import Coord
 
-from std.sys.info import size_of
+from std.sys.info import has_apple_gpu_accelerator, size_of
 from std.utils import IndexList
 
 from op_utils import (
+    GS_THREADS,
     MAX_RANK,
     TensorHolder,
     TensorSpec,
     _copy_strided,
+    _enqueue_cached,
     _get_ctx,
+    _gs_blocks,
     _make_ptr,
     _parallel_for_dt,
     _raw_ctx,
@@ -257,6 +261,44 @@ def copy_to_pinned_host(
         raise e^
 
 
+def _d2d_copy_vec4_kernel(
+    dst_ptr: UnsafePointer[Scalar[DType.uint32], MutAnyOrigin],
+    src_ptr: UnsafePointer[Scalar[DType.uint32], ImmutAnyOrigin],
+    vec_count: Int,
+    tail_words: Int,
+):
+    # 16-byte vector moves over the u32-viewed buffers plus a scalar-word
+    # tail; the host guarantees 16-byte-aligned bases and nbytes % 4 == 0.
+    # Wider (32-byte) vectors measured slightly faster but intermittently
+    # wedge this Metal driver's queue; 16 bytes is what every stable kernel
+    # in this package uses.  The 4-deep unrolled body issues four
+    # independent loads before the stores, which is what this GPU needs to
+    # stream at full rate (sequential-per-thread access measured ~2x the
+    # one-chunk-per-thread grid-stride loop).
+    var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    if gid < tail_words:
+        dst_ptr[vec_count * 4 + gid] = src_ptr[vec_count * 4 + gid]
+    # Each thread owns a group of 16 consecutive 16-byte chunks — one
+    # sequential 256-byte stream per thread, the length the strided-permute
+    # rowloop kernel measured streaming at ~2x the one-chunk-per-thread
+    # rate on this GPU.
+    var groups = vec_count // 16
+    var g = gid
+    while g < groups:
+        var b = g * 16
+        for j in range(16):
+            dst_ptr.store[width=4, alignment=16](
+                (b + j) * 4, src_ptr.load[width=4, alignment=16]((b + j) * 4)
+            )
+        g += gstride
+    var c = groups * 16 + gid
+    if c < vec_count:
+        dst_ptr.store[width=4, alignment=16](
+            c * 4, src_ptr.load[width=4, alignment=16](c * 4)
+        )
+
+
 def copy_d2d(
     ctx_ptr: PythonObject,
     dst_ptr: PythonObject,
@@ -270,15 +312,63 @@ def copy_d2d(
     copy must complete before returning or a later kernel writing the same
     buffer can be overwritten by it (seen as select_scatter flakes under
     parallel test load)."""
-    var n = Int(py=nbytes)
+    _copy_d2d_raw(
+        _get_ctx(ctx_ptr), Int(py=dst_ptr), Int(py=src_ptr), Int(py=nbytes)
+    )
+
+
+def _copy_d2d_raw(
+    ctx: DeviceContext, dst_addr: Int, src_addr: Int, n: Int
+) raises:
+    """The copy_d2d body over raw ints (shared by both entry points)."""
     if n == 0:
         return
-    var ctx = _get_ctx(ctx_ptr)
-    var dst = _wrap_raw(ctx, Int(py=dst_ptr), n)
-    var src = _wrap_raw(ctx, Int(py=src_ptr), n)
+    comptime if has_apple_gpu_accelerator():
+        if (
+            ctx.api() != "cpu"
+            and n % 4 == 0
+            and (dst_addr | src_addr) % 16 == 0
+        ):
+            var words = n // 4
+            var vec_count = words // 4
+            _enqueue_cached[_d2d_copy_vec4_kernel](
+                ctx,
+                "th_d2d_copy_vec4",
+                _gs_blocks(max(vec_count // 16, 1)),
+                1,
+                1,
+                GS_THREADS,
+                _make_ptr[DType.uint32](dst_addr).as_unsafe_any_origin(),
+                _make_ptr[DType.uint32](src_addr)
+                .as_unsafe_any_origin()
+                .as_immutable(),
+                vec_count,
+                words - vec_count * 4,
+            )
+            return
+    var dst = _wrap_raw(ctx, dst_addr, n)
+    var src = _wrap_raw(ctx, src_addr, n)
     dst.enqueue_copy_from(src)
     if ctx.api() == "cpu":
         ctx.synchronize()
+
+
+def _copy_d2d_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _copy_d2d_raw(
+            _raw_ctx(args[0]),
+            _raw_int(args[1]),
+            _raw_int(args[2]),
+            _raw_int(args[3]),
+        )
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
 
 
 def synchronize(ctx_ptr: PythonObject) raises:
@@ -562,6 +652,14 @@ def PyInit_tensor_holder() abi("C") -> PythonObject:
         m.def_function[copy_to_host]("copy_to_host")
         m.def_function[copy_to_pinned_host]("copy_to_pinned_host")
         m.def_function[copy_d2d]("copy_d2d")
+        m.def_py_c_function(
+            _copy_d2d_dispatcher,
+            "CopyD2D",
+            docstring=(
+                "(ctx_ptr, dst_ptr, src_ptr, nbytes); raw fastcall"
+                " device-to-device copy"
+            ),
+        )
         m.def_function[synchronize]("synchronize")
         m.def_function[read_scalar]("read_scalar")
         m.def_py_c_function(

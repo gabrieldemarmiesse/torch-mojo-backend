@@ -134,10 +134,21 @@ def test_launch_time_dtype_escalation(mojo_gpu, forced_queue):
     assert unit.dtypes is None  # escalated to the full set
 
 
-@pytest.mark.parametrize("case", [
-    "binary", "binary_broadcast", "comparison", "mixed_dtype", "scalar",
-    "unary", "reduce", "min_dim", "matmul", "bmm",
-])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "binary",
+        "binary_broadcast",
+        "comparison",
+        "mixed_dtype",
+        "scalar",
+        "unary",
+        "reduce",
+        "min_dim",
+        "matmul",
+        "bmm",
+    ],
+)
 def test_into_family_parity(mojo_gpu, forced_queue, case):
     """Every Into family computes the same values as CPU eager."""
     g = torch.Generator().manual_seed(20260725)

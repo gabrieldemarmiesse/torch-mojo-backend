@@ -36,7 +36,12 @@ from std.memory.unsafe import bitcast
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.sys._assembly import inlined_assembly
-from std.sys.info import has_accelerator, is_nvidia_gpu, size_of
+from std.sys.info import (
+    has_apple_gpu_accelerator,
+    has_accelerator,
+    is_nvidia_gpu,
+    size_of,
+)
 from std.utils.coord import Coord
 from std.utils.index import IndexList
 from std.utils.numerics import min_or_neg_inf, max_or_inf
@@ -783,6 +788,21 @@ comptime LSM_L2_BUDGET = 23_000_000
 # Below it, 256-thread blocks keep every thread busy and reductions cheap.
 comptime LSM_BIG_ROW_BYTES = 25_000
 
+# Floor under the long-row grid, in blocks per CU. The L2 budget above is an
+# H100 number and it starves a wide part: at the nanoGPT logits row (50304 bf16
+# columns) it admits 228 blocks, and a gfx942 MI300X has 304 CUs. Measured
+# there, 20 launches of the kernel below at [49152, 50304] bf16, us:
+#
+#   228 blocks 4460/4459/4455   608 3536   912 3570   1216 3538/3561
+#   1824 3517   2432 3509   4096 3515/3543   8192 3494   16384 3498
+#   49152 (one block per row) 3545
+#
+# i.e. the residency the cap buys back is worth far less than the parallelism it
+# costs, and everything from 2 blocks per CU upward is within 2% of flat. 4 sits
+# inside that plateau. The cap still applies above this floor, so short rows --
+# where it admits a large grid anyway -- are unaffected.
+comptime LSM_BLOCKS_PER_CU = 4
+
 
 @always_inline
 def _lsm_store_out_16B[
@@ -837,11 +857,27 @@ def _log_softmax_rows_block_kernel[
         var tail_start = head + n_vec * V  # first row-local index of the tail
 
         # ---- Pass 1: online max + sum over the row, one global read. ----
-        # Every exp(a - b) below is guarded by an a == b select: when equal the
-        # true factor is exp(0) == 1, and evaluating exp(-inf - -inf) instead
-        # would NaN-poison the sum — reached by threads/lanes that stay at the
-        # -inf init on rows shorter than threads*V, and by -inf (masked) inputs.
-        var m_vec = SIMD[DType.float32, V](Float32.MIN)
+        # The running max starts at the lowest FINITE float, not at
+        # `Float32.MIN`, which is -inf. A lane or thread that never runs its loop
+        # body -- any thread with `tid >= n_vec`, and there are many whenever the
+        # row has fewer vectors than the block has threads -- keeps the sentinel
+        # in both `m` and a zero `s`. The collapse below then evaluates
+        # `s * exp(m - m)`: with -inf that is `0 * exp(nan) = nan`, and the block
+        # sum turns one idle thread's nan into a nan `log_denom`, so the whole
+        # row comes out nan. With a finite sentinel the same expression is
+        # `0 * exp(0) = 0`, the identity this monoid needs. A genuine -inf input
+        # still behaves: `exp(-inf - MIN_FINITE)` is 0, not nan.
+        #
+        # Do NOT replace this with an `-inf` seed plus an `a == b` select on every
+        # `exp(a - b)`, which fixes the same nan and is what `main` carries as of
+        # #319. Measured here, that form costs 12-16% on bf16 rows (bf16
+        # 12288x50304: 1034 us against 890), because the two extra vector
+        # compare-selects per trip do not hide behind bf16's halved byte count.
+        # It is also less faithful to torch: the `x == new_m` guard turns
+        # `exp(inf - inf)` into 1.0, so a row holding `+inf` returns -inf for its
+        # finite entries where torch returns nan. The finite seed needs no guard,
+        # since it is never an operand of a subtraction that can reach inf - inf.
+        var m_vec = SIMD[DType.float32, V](Float32.MIN_FINITE)
         var s_vec = SIMD[DType.float32, V](0.0)
         var v = tid
         while v < n_vec:
@@ -849,22 +885,13 @@ def _log_softmax_rows_block_kernel[
                 vec_start + v * V
             ).cast[DType.float32]()
             var new_m = max(m_vec, x)
-            var rescale = m_vec.eq(new_m).select(
-                SIMD[DType.float32, V](1.0), exp(m_vec - new_m)
-            )
-            var contrib = x.eq(new_m).select(
-                SIMD[DType.float32, V](1.0), exp(x - new_m)
-            )
-            s_vec = s_vec * rescale + contrib
+            s_vec = s_vec * exp(m_vec - new_m) + exp(x - new_m)
             m_vec = new_m
             v += threads
 
         # Collapse the per-lane accumulator to a thread-local (m, s).
         var m_t = m_vec.reduce_max()
-        var lane_scale = m_vec.eq(SIMD[DType.float32, V](m_t)).select(
-            SIMD[DType.float32, V](1.0), exp(m_vec - m_t)
-        )
-        var s_t = (s_vec * lane_scale).reduce_add()
+        var s_t = (s_vec * exp(m_vec - m_t)).reduce_add()
 
         # Fold in the unaligned scalar head/tail (each < V elements, one thread
         # per element; no-ops when head == tail == 0).
@@ -872,24 +899,20 @@ def _log_softmax_rows_block_kernel[
         while jh < head:
             var x = in_ptr[base + jh].cast[DType.float32]()
             var nm = max(m_t, x)
-            var rs = Float32(1.0) if m_t == nm else exp(m_t - nm)
-            var cb = Float32(1.0) if x == nm else exp(x - nm)
-            s_t = s_t * rs + cb
+            s_t = s_t * exp(m_t - nm) + exp(x - nm)
             m_t = nm
             jh += threads
         var jt = tail_start + tid
         while jt < cols:
             var x = in_ptr[base + jt].cast[DType.float32]()
             var nm = max(m_t, x)
-            var rs = Float32(1.0) if m_t == nm else exp(m_t - nm)
-            var cb = Float32(1.0) if x == nm else exp(x - nm)
-            s_t = s_t * rs + cb
+            s_t = s_t * exp(m_t - nm) + exp(x - nm)
             m_t = nm
             jt += threads
 
         # ---- Block combine: global max, then rescale + global sum. ----
         var block_m = block.max[block_size=threads](m_t)
-        var s_scaled = s_t if m_t == block_m else s_t * exp(m_t - block_m)
+        var s_scaled = s_t * exp(m_t - block_m)
         var block_s = block.sum[block_size=threads](s_scaled)
         var log_denom = log(block_s)
 
@@ -952,6 +975,7 @@ def _log_softmax_rows[
         comptime if has_accelerator():
             # Cap concurrent rows so their input bytes stay resident in L2 for
             # the pass-2 re-read; grid-stride over the rest.
+            comptime FILL = LSM_BLOCKS_PER_CU * ctx.default_device_info.sm_count
             var esize = size_of[dtype]()
             var blocks = min(rows, max(1, LSM_L2_BUDGET // (cols * esize)))
             var mout = out_ptr.as_unsafe_any_origin()
@@ -959,6 +983,10 @@ def _log_softmax_rows[
             # Big rows: 1024-thread blocks so the small (L2-capped) grid still
             # saturates memory. Small rows: 256 threads keep every thread busy.
             if cols * esize > LSM_BIG_ROW_BYTES:
+                # ...but the budget alone cannot be allowed to leave the device
+                # idle. See LSM_BLOCKS_PER_CU: at the nanoGPT logits row it
+                # admits 228 blocks on a 304-CU part and that costs 27%.
+                blocks = min(rows, max(blocks, FILL))
                 _enqueue_cached[_log_softmax_rows_block_kernel[dtype, 1024]](
                     ctx,
                     String(t"log_softmax_rows_{dtype}_1024"),
@@ -1247,7 +1275,9 @@ def _rowred_spec_go[
 def _rowred_spec_into_go[
     op_code: Int
 ](
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr,
+    a_o: PyObjectPtr,
+    rdims_t: PyObjectPtr,
+    keepdim_o: PyObjectPtr,
     out_o: PyObjectPtr,
 ) raises:
     ref a = _spec_ptr(a_o)[]
@@ -1415,7 +1445,9 @@ def _argmin_spec_go(
 
 
 def _argmin_spec_into_go(
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr,
+    a_o: PyObjectPtr,
+    rdims_t: PyObjectPtr,
+    keepdim_o: PyObjectPtr,
     out_o: PyObjectPtr,
 ) raises:
     ref a = _spec_ptr(a_o)[]
@@ -1578,7 +1610,9 @@ def _min_dim_spec_go(
 
 
 def _min_dim_spec_into_go(
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr,
+    a_o: PyObjectPtr,
+    rdims_t: PyObjectPtr,
+    keepdim_o: PyObjectPtr,
     out_v_o: PyObjectPtr,
     out_i_o: PyObjectPtr,
 ) raises:
@@ -1662,9 +1696,7 @@ def _min_dim_spec_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         if nargs == 5:
-            _min_dim_spec_into_go(
-                args[0], args[1], args[2], args[3], args[4]
-            )
+            _min_dim_spec_into_go(args[0], args[1], args[2], args[3], args[4])
             return _raw_ret_none()
         return _min_dim_spec_go(args[0], args[1], args[2])
     except e:
@@ -1891,7 +1923,9 @@ def _anyall_spec_go[
 def _anyall_spec_into_go[
     is_all: Bool
 ](
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr,
+    a_o: PyObjectPtr,
+    rdims_t: PyObjectPtr,
+    keepdim_o: PyObjectPtr,
     out_o: PyObjectPtr,
 ) raises:
     ref a = _spec_ptr(a_o)[]
@@ -1987,7 +2021,15 @@ def _log_softmax_spec_go(a_o: PyObjectPtr) raises -> PyObjectPtr:
     var nbytes = a.numel * a.itemsize
     var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
     var addr = Int(buf.unsafe_ptr())
-    if a.contig:
+    # The row kernel's scalar head/tail corrects per-row phase but assumes a
+    # 16-byte-aligned base: its vector loads claim that alignment. A sliced
+    # (contiguous, base-misaligned) input silently violates the claim — the
+    # MI300X path tolerates it, Metal returns wrong lanes — so Apple routes
+    # misaligned bases through the aligned scratch copy below.
+    var base_aligned = True
+    comptime if has_apple_gpu_accelerator():
+        base_aligned = a.ptr % 16 == 0
+    if a.contig and base_aligned:
         comptime for dt in FLOAT_DTYPES:
             comptime if _dt_on[dt]():
                 if a.dtype == dt:

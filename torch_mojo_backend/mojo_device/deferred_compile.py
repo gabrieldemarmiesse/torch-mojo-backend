@@ -77,9 +77,10 @@ def dispatch(func: object, args: tuple, kwargs: dict) -> object:
     call_queue.pump()
     name = func._schema.name
     sync = name in _SYNC_OPS
-    if sync and not os.environ.get("TMB_CAST_SYNC") and name in (
-        "aten::_to_copy",
-        "aten::copy_",
+    if (
+        sync
+        and not os.environ.get("TMB_CAST_SYNC")
+        and name in ("aten::_to_copy", "aten::copy_")
     ):
         # Same-device copies/casts (autocast!) are ordinary data ops —
         # only actual device crossings behave as host-visible syncs.

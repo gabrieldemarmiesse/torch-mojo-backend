@@ -47,7 +47,7 @@ from std.gpu.memory import load as global_load
 from std.gpu.primitives import block, warp
 from std.math import ceildiv
 from std.memory import AddressSpace, stack_allocation
-from std.sys.info import has_accelerator
+from std.sys.info import has_accelerator, has_apple_gpu_accelerator
 
 from op_utils import _enqueue_cached
 
@@ -95,8 +95,9 @@ def _dx_warp_rows[
     # Streaming (evict-first) reads help while the per-SM working set of
     # concurrent rows is small enough that L2 capacity is better spent
     # buffering dx writebacks; measured on H100, that holds for the small-row
-    # regimes and reverses once rows get wide (chunks > 4).
-    comptime stream_loads = chunks <= 4
+    # regimes and reverses once rows get wide (chunks > 4).  Apple has no
+    # cache-policy loads: the STREAMING lowering crashes the Metal compiler.
+    comptime stream_loads = chunks <= 4 and not has_apple_gpu_accelerator()
     comptime q_slots = _WARPS_PER_BLOCK * chunks * WARP_SIZE * _VEC
     comptime xh_slots = q_slots if stage_xh else _VEC
     var q_shared = stack_allocation[
