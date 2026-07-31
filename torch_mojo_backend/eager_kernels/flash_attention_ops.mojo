@@ -287,8 +287,8 @@ def PyInit_flash_attention_ops() abi("C") -> PythonObject:
                 " output, scale, is_causal, dtype, context_ptr); fused"
                 " flash-attention forward writing the output and the per-row"
                 " log-sum-exp the backward consumes. Q, K, V and the output are"
-                " addressed through the given element strides and their head_dim"
-                " stride must be 1; the log-sum-exp is dense."
+                " addressed through the given element strides and their"
+                " head_dim stride must be 1; the log-sum-exp is dense."
             ),
         )
         b.def_py_c_function(

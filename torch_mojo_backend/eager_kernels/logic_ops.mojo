@@ -264,9 +264,9 @@ def _bin_vec_op[
         return a // b
     comptime if op_code == BOP_POW:
         comptime if dtype == DType.float16 or dtype == DType.bfloat16:
-            return pow(
-                a.cast[DType.float32](), b.cast[DType.float32]()
-            ).cast[dtype]()
+            return pow(a.cast[DType.float32](), b.cast[DType.float32]()).cast[
+                dtype
+            ]()
         elif dtype.is_floating_point():
             return pow(a, b)
     return a
@@ -468,9 +468,7 @@ def _bin_bcast[
                             )
                         elif aligned16 and rows_aligned:
                             var rows = total // d3
-                            _enqueue_cached[
-                                _bin_rowvec_kernel[dtype, op_code]
-                            ](
+                            _enqueue_cached[_bin_rowvec_kernel[dtype, op_code]](
                                 ctx,
                                 String(t"lg_bcast_rv_{op_code}_{dtype}"),
                                 max(1, min(rows, 65535)),
