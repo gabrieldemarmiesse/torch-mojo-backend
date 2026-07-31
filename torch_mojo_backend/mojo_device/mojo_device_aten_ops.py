@@ -341,35 +341,16 @@ def mojo_device_empty_memory_format(
     )
 
 
-def _contiguous_strides_of(size: tuple) -> tuple:
-    strides = []
-    running = 1
-    for s in reversed(size):
-        strides.append(running)
-        running *= max(s, 1)
-    return tuple(reversed(strides))
-
-
 @register_aten_op("aten::empty_strided.memory_format")
 @register_aten_op("aten::empty_strided")
 def empty_strided(
     size, stride, *, dtype=None, layout=None, device=None, pin_memory=None
 ) -> TorchMojoTensor:
-    # Honor the requested strides: callers depend on fresh-tensor layouts
-    # (autograd's layout contract via new_empty_strided, deferred-compile
-    # placeholders matching backend kernel output layouts). Allocate the
-    # exact span the strided layout addresses and mint the tensor over it.
+    # The requested strides are ignored: allocation is always contiguous
+    # (matching the previous behavior; our metadata is self-consistent).
     dtype = torch.get_default_dtype() if dtype is None else dtype
-    size = tuple(size)
-    stride = tuple(stride)
-    max_dtype = torch_dtype_to_max(dtype)
-    max_device = find_equivalent_max_device(device)
-    if stride == _contiguous_strides_of(size):
-        return TorchMojoTensor._alloc(size, max_dtype, max_device)
-    span = 0 if 0 in size else 1 + sum((s - 1) * st for s, st in zip(size, stride))
-    flat = TorchMojoTensor._alloc((span,), max_dtype, max_device)
-    return TorchMojoTensor._make(
-        flat._holder, flat._ptr, size, stride, 0, max_dtype, max_device
+    return TorchMojoTensor._alloc(
+        tuple(size), torch_dtype_to_max(dtype), find_equivalent_max_device(device)
     )
 
 

@@ -18,8 +18,6 @@ from std.gpu.memory import AddressSpace
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.python._cpython import PyObjectPtr, Py_ssize_t
-from std.sys.defines import get_defined_string
-
 from flash_attention_bwd_kernels import enqueue_flash_attention_bwd
 from flash_attention_fwd_kernels import RowStrides, enqueue_flash_attention_fwd
 from op_utils import (
@@ -34,36 +32,7 @@ from op_utils import (
     _spec_unsupported,
 )
 
-# --- TMB variant gates -------------------------------------------------------
-comptime _TMB_OPS = get_defined_string["TMB_OPS", "all"]()
-comptime _TMB_DTYPES = get_defined_string["TMB_DTYPES", "all"]()
-
-
-@always_inline
-def _tmb_csv_has(csv: StaticString, name: String) -> Bool:
-    if csv == "all":
-        return True
-    var padded = String(",") + String(csv) + ","
-    return padded.find(String(",") + name + ",") != -1
-
-
-@always_inline
-def _op_on[name: StaticString]() -> Bool:
-    comptime if _tmb_csv_has(_TMB_OPS, String(name)):
-        return True
-    else:
-        return False
-
-
-@always_inline
-def _dt_on[dt: DType]() -> Bool:
-    comptime if _tmb_csv_has(_TMB_DTYPES, String(dt)):
-        return True
-    else:
-        return False
-
-
-# -----------------------------------------------------------------------------
+from variant_gates import _dt_on, _op_on
 
 
 @always_inline
