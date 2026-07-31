@@ -1,6 +1,9 @@
-"""Unit tests for the per-operation Mojo extension loader."""
+"""Unit tests for stateless, exactly specialized Mojo extensions."""
 
+import inspect
 import subprocess
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
@@ -9,7 +12,68 @@ import pytest
 from torch_mojo_backend import eager_kernels
 
 
-def test_build_variant_compiles_original_source(
+def test_defines_are_canonical_independent_of_mapping_order() -> None:
+    first = {
+        "OP": "AddSpec",
+        "DTYPE_ARG_1": "bfloat16",
+        "INPLACE": False,
+        "DTYPE_ARG_0": "float32",
+    }
+    second = {
+        "DTYPE_ARG_0": "float32",
+        "INPLACE": False,
+        "DTYPE_ARG_1": "bfloat16",
+        "OP": "AddSpec",
+    }
+
+    expected = (
+        ("DTYPE_ARG_0", "float32"),
+        ("DTYPE_ARG_1", "bfloat16"),
+        ("INPLACE", "0"),
+        ("OP", "AddSpec"),
+    )
+    assert eager_kernels.normalize_defines(first) == expected
+    assert eager_kernels.normalize_defines(second) == expected
+    assert eager_kernels.defines_cache_string(
+        first
+    ) == eager_kernels.defines_cache_string(second)
+
+
+def test_exact_call_defines_use_ordered_argument_and_output_roles() -> None:
+    defines = eager_kernels.exact_call_defines(
+        "WhereSelect",
+        ("bool", "float32", "bfloat16"),
+        output_dtypes=("float32",),
+        flags={"INPLACE": False},
+    )
+
+    assert defines == {
+        "DTYPE_ARG_0": "bool",
+        "DTYPE_ARG_1": "float32",
+        "DTYPE_ARG_2": "bfloat16",
+        "DTYPE_OUT": "float32",
+        "INPLACE": "0",
+        "OP": "WhereSelect",
+    }
+    assert not any(name.startswith("DTYPE_COMPILE") for name in defines)
+
+
+@pytest.mark.parametrize("name", ["op", "HAS-DASH", "1_DTYPE", ""])
+def test_define_names_must_be_explicit_compiler_identifiers(name: str) -> None:
+    with pytest.raises(ValueError, match="define name"):
+        eager_kernels.normalize_defines({name: "value"})
+
+
+@pytest.mark.parametrize("value", [None, 1.5, object()])
+def test_define_values_reject_types_outside_the_compiler_contract(
+    value: object,
+) -> None:
+    normalize_value = inspect.unwrap(eager_kernels._normalize_define_value)
+    with pytest.raises(TypeError, match="must be bool, int, or str"):
+        normalize_value(value)
+
+
+def test_build_extension_compiles_original_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     package_dir = tmp_path / "eager_kernels"
@@ -35,52 +99,86 @@ def test_build_variant_compiles_original_source(
     monkeypatch.setattr(eager_kernels, "_find_mojo", fake_find_mojo)
     monkeypatch.setattr(eager_kernels.subprocess, "run", fake_run)
 
-    result = eager_kernels._build_variant(
-        "sample_ops", frozenset({"SampleOp"}), frozenset({"float32"})
+    defines = eager_kernels.normalize_defines(
+        {
+            "OP": "AddSpec",
+            "DTYPE_ARG_1": "float32",
+            "INPLACE": False,
+            "DTYPE_ARG_0": "float32",
+        }
     )
+    result = eager_kernels._build_extension(source, defines)
 
     assert result.is_file()
     assert len(commands) == 1
     assert commands[0][2] == str(source)
+    define_args = [
+        commands[0][index + 1]
+        for index, value in enumerate(commands[0][:-1])
+        if value == "-D"
+    ]
+    assert define_args == [
+        "DTYPE_ARG_0=float32",
+        "DTYPE_ARG_1=float32",
+        "INPLACE=0",
+        "OP=AddSpec",
+    ]
     assert source.read_text() == source_text
     assert not list(package_dir.glob("_tmbv_*.mojo"))
 
 
-def test_variants_load_with_original_pyinit_name(
+def test_loader_reuses_canonical_variant_and_separates_defines(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    loaded: list[tuple[str, Path]] = []
+    source = tmp_path / "elementwise_ops.mojo"
+    source.write_text("def PyInit_elementwise_ops():\n    pass\n")
+    builds: list[tuple[Path, eager_kernels.CanonicalDefines | None]] = []
+    loaded: list[ModuleType] = []
 
-    def fake_build_variant(
-        name: str, ops: frozenset[str] | None, dtypes: frozenset[str] | None
+    def fake_build_extension(
+        mojo_file: Path, defines: eager_kernels.CanonicalDefines | None
     ) -> Path:
-        assert name == "elementwise_ops"
-        assert ops is not None
-        assert dtypes == frozenset({"float32"})
-        return tmp_path / f"{next(iter(ops))}.so"
+        builds.append((mojo_file, defines))
+        return tmp_path / f"variant-{len(builds)}.so"
 
     def fake_load_extension(module_name: str, so_path: Path) -> ModuleType:
-        loaded.append((module_name, so_path))
-        return ModuleType(f"loaded_{so_path.stem}")
+        module = ModuleType(f"loaded_{so_path.stem}")
+        module.call = lambda: so_path.name  # type: ignore[attr-defined]
+        loaded.append(module)
+        return module
 
-    holder_state = eager_kernels._STATES["tensor_holder"]
-    monkeypatch.setattr(holder_state, "module", ModuleType("tensor_holder"))
-    monkeypatch.setattr(eager_kernels, "_build_variant", fake_build_variant)
+    def fake_holder() -> ModuleType:
+        return ModuleType("tensor_holder")
+
+    monkeypatch.setattr(eager_kernels, "_ensure_tensor_holder", fake_holder)
+    monkeypatch.setattr(eager_kernels, "_build_extension", fake_build_extension)
     monkeypatch.setattr(eager_kernels, "_load_extension", fake_load_extension)
 
-    first = eager_kernels._import_mojo_module(
-        "elementwise_ops", frozenset({"ReluSpec"}), frozenset({"float32"})
+    loader = eager_kernels.MojoExtensionLoader()
+    base = loader.load(
+        source, {"OP": "AddSpec", "DTYPE_ARG_0": "float32", "INPLACE": False}
     )
-    second = eager_kernels._import_mojo_module(
-        "elementwise_ops", frozenset({"ExpSpec"}), frozenset({"float32"})
+    same_defines_different_order = loader.load(
+        source, {"INPLACE": False, "DTYPE_ARG_0": "float32", "OP": "AddSpec"}
+    )
+    different_dtype = loader.load(
+        source, {"OP": "AddSpec", "DTYPE_ARG_0": "bfloat16", "INPLACE": False}
+    )
+    different_flag = loader.load(
+        source, {"OP": "AddSpec", "DTYPE_ARG_0": "float32", "INPLACE": True}
+    )
+    different_op = loader.load(
+        source, {"OP": "MulSpec", "DTYPE_ARG_0": "float32", "INPLACE": False}
     )
 
-    expected_name = f"{eager_kernels.__name__}.elementwise_ops"
-    assert loaded == [
-        (expected_name, tmp_path / "ReluSpec.so"),
-        (expected_name, tmp_path / "ExpSpec.so"),
-    ]
-    assert first is not second
+    assert same_defines_different_order is base
+    assert all(
+        module is not base for module in (different_dtype, different_flag, different_op)
+    )
+    assert len(builds) == 4
+    assert len(loaded) == 4
+    assert callable(base.call)
+    assert not hasattr(base, "AddSpec")
 
 
 def test_module_hash_includes_loader_cache_abi(
@@ -94,3 +192,246 @@ def test_module_hash_includes_loader_cache_abi(
     monkeypatch.setattr(eager_kernels, "_VARIANT_CACHE_ABI", b"next-loader-abi")
 
     assert eager_kernels._module_hash("sample_ops") != initial
+
+
+def test_module_hash_includes_compiler_toolchain_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "sample_ops.mojo"
+    source.write_text("def PyInit_sample_ops():\n    pass\n")
+    monkeypatch.setattr(eager_kernels, "_PACKAGE_DIR", tmp_path)
+
+    initial = eager_kernels._module_hash("sample_ops")
+    monkeypatch.setattr(eager_kernels, "_TOOLCHAIN_IDENTITY", b"another-compiler")
+
+    assert eager_kernels._module_hash("sample_ops") != initial
+
+
+def test_nested_module_hash_includes_private_and_shared_dependencies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    package_dir = tmp_path / "eager_kernels"
+    operation_dir = package_dir / "sample_ops"
+    operation_dir.mkdir(parents=True)
+    source = operation_dir / "sample_ops.mojo"
+    private_helper = operation_dir / "private_helper.mojo"
+    shared_helper = package_dir / "shared_helper.mojo"
+    source.write_text(
+        "from private_helper import private_call\n"
+        "from shared_helper import shared_call\n"
+    )
+    private_helper.write_text("fn private_call():\n    pass\n")
+    shared_helper.write_text("fn shared_call():\n    pass\n")
+    monkeypatch.setattr(eager_kernels, "_PACKAGE_DIR", package_dir)
+
+    initial = eager_kernels._source_hash(source)
+    private_helper.write_text("fn private_call():\n    return\n")
+    after_private_change = eager_kernels._source_hash(source)
+    shared_helper.write_text("fn shared_call():\n    return\n")
+
+    assert after_private_change != initial
+    assert eager_kernels._source_hash(source) != after_private_change
+
+
+def test_defined_unit_memoizes_one_failed_build_across_all_waiters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "elementwise_ops.mojo"
+    source.write_text("def PyInit_elementwise_ops():\n    pass\n")
+    defines = eager_kernels.normalize_defines(
+        {"OP": "AddSpec", "DTYPE_ARG_0": "float32"}
+    )
+    failure = ImportError("compiler failed once")
+    attempts = 0
+
+    def fail_build(
+        mojo_file: Path, call_defines: eager_kernels.CanonicalDefines | None
+    ) -> Path:
+        nonlocal attempts
+        assert mojo_file == source
+        assert call_defines == defines
+        attempts += 1
+        raise failure
+
+    def fake_holder() -> ModuleType:
+        return ModuleType("tensor_holder")
+
+    monkeypatch.setattr(eager_kernels, "_ensure_tensor_holder", fake_holder)
+    monkeypatch.setattr(eager_kernels, "_build_extension", fail_build)
+    unit = eager_kernels._DefinedUnit(source, defines)
+
+    job = unit.request_async()
+    with pytest.raises(ImportError) as first:
+        job.wait()
+    assert first.value is failure
+    assert unit.request_async() is job
+    with pytest.raises(ImportError) as second:
+        unit.request_async().wait()
+    assert second.value is failure
+    with pytest.raises(ImportError) as blocking:
+        unit.load_blocking()
+    assert blocking.value is failure
+    assert attempts == 1
+
+
+@dataclass(frozen=True)
+class _TensorMetadata:
+    shape: tuple[int, ...]
+    dtype: str
+
+
+class _ElementwiseAdd(eager_kernels.MojoExtension[_TensorMetadata, _TensorMetadata]):
+    MOJO_FILE = Path("elementwise_ops.mojo")
+
+    @classmethod
+    def make_defines(
+        cls, left: _TensorMetadata, right: _TensorMetadata, *, inplace: bool = False
+    ) -> dict[str, eager_kernels.DefineValue]:
+        return {
+            "OP": "AddSpec",
+            "DTYPE_ARG_0": left.dtype,
+            "DTYPE_ARG_1": right.dtype,
+            "DTYPE_OUT": left.dtype,
+            "INPLACE": inplace,
+        }
+
+    @classmethod
+    def expected_output_specs(
+        cls, left: _TensorMetadata, right: _TensorMetadata, *, inplace: bool = False
+    ) -> _TensorMetadata:
+        del right, inplace
+        return _TensorMetadata(left.shape, left.dtype)
+
+    @classmethod
+    def call_extension(
+        cls,
+        extension: ModuleType,
+        output_specs: _TensorMetadata,
+        left: _TensorMetadata,
+        right: _TensorMetadata,
+        *,
+        inplace: bool = False,
+    ) -> _TensorMetadata:
+        return extension.call(  # type: ignore[attr-defined, no-any-return]
+            left, right, output_specs, inplace
+        )
+
+
+def test_descriptor_prepares_output_metadata_without_loading_and_has_no_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_build(
+        source: Path, defines: eager_kernels.CanonicalDefines | None
+    ) -> Path:
+        raise AssertionError(f"prepare compiled {source} with {defines}")
+
+    monkeypatch.setattr(eager_kernels, "_build_extension", unexpected_build)
+    class_attributes = set(_ElementwiseAdd.__dict__)
+    small = _ElementwiseAdd.prepare(
+        _TensorMetadata((2, 3), "float32"), _TensorMetadata((2, 3), "bfloat16")
+    )
+    large = _ElementwiseAdd.prepare(
+        _TensorMetadata((128, 256), "float32"), _TensorMetadata((128, 256), "bfloat16")
+    )
+
+    assert _ElementwiseAdd.MOJO_FILE == Path("elementwise_ops.mojo")
+    assert small.extension is _ElementwiseAdd
+    assert small.output_specs == _TensorMetadata((2, 3), "float32")
+    assert large.output_specs == _TensorMetadata((128, 256), "float32")
+    assert small.defines == large.defines
+    loader = eager_kernels.MojoExtensionLoader()
+    assert loader._unit(_ElementwiseAdd.MOJO_FILE, small.defines) is loader._unit(
+        _ElementwiseAdd.MOJO_FILE, large.defines
+    )
+    assert set(_ElementwiseAdd.__dict__) == class_attributes
+    with pytest.raises(TypeError, match="stateless descriptor"):
+        _ElementwiseAdd()
+
+
+def test_prepared_call_invokes_only_constant_call_entrypoint() -> None:
+    calls: list[tuple[object, ...]] = []
+    module = ModuleType("defined_elementwise_add")
+
+    def call(*args: object) -> _TensorMetadata:
+        calls.append(args)
+        output = args[2]
+        assert isinstance(output, _TensorMetadata)
+        return output
+
+    module.call = call  # type: ignore[attr-defined]
+
+    class FakeLoader(eager_kernels.MojoExtensionLoader):
+        def load_canonical(
+            self, mojo_file: Path, defines: eager_kernels.CanonicalDefines
+        ) -> ModuleType:
+            assert mojo_file == _ElementwiseAdd.MOJO_FILE
+            assert ("OP", "AddSpec") in defines
+            return module
+
+    left = _TensorMetadata((4, 8), "float32")
+    right = _TensorMetadata((4, 8), "float32")
+    prepared = _ElementwiseAdd.prepare(left, right, inplace=True)
+
+    assert prepared.execute(FakeLoader()) == _TensorMetadata((4, 8), "float32")
+    assert calls == [(left, right, prepared.output_specs, True)]
+    assert not hasattr(module, "AddSpec")
+
+
+def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    launches: list[str] = []
+
+    class FakeJob:
+        def wait(self) -> None:
+            return None
+
+    class QueuedUnit:
+        def __init__(self) -> None:
+            self.ext = None
+            self.job = FakeJob()
+
+        def request_async(self) -> FakeJob:
+            return self.job
+
+        def resolve(self, attr: str) -> object:
+            assert attr == "call"
+            assert self.ext is not None
+            return self.ext.call
+
+    unit = QueuedUnit()
+
+    class FakeLoader(eager_kernels.MojoExtensionLoader):
+        def unit_canonical(
+            self, mojo_file: Path, defines: eager_kernels.CanonicalDefines
+        ) -> object:
+            assert mojo_file == _ElementwiseAdd.MOJO_FILE
+            assert ("OP", "AddSpec") in defines
+            return unit
+
+    queue = eager_kernels.call_queue
+    monkeypatch.setattr(queue, "_QUEUE", deque())
+    monkeypatch.setattr(queue, "_KEEPALIVE", [])
+    monkeypatch.setattr(queue, "_HELD_ERROR", [])
+    monkeypatch.setattr(queue, "_EXEC_THREAD", [None])
+
+    loader = FakeLoader()
+    first = _ElementwiseAdd.prepare(
+        _TensorMetadata((2,), "float32"), _TensorMetadata((2,), "float32")
+    )
+    second = _ElementwiseAdd.prepare(
+        _TensorMetadata((9,), "float32"), _TensorMetadata((9,), "float32")
+    )
+    assert first.enqueue_into(("first",), loader) == first.output_specs
+    assert second.enqueue_into(("second",), loader) == second.output_specs
+    assert queue.active()
+
+    module = ModuleType("queued_elementwise_add")
+
+    def call(label: str) -> None:
+        launches.append(label)
+
+    module.call = call  # type: ignore[attr-defined]
+    unit.ext = module
+    queue.drain()
+
+    assert launches == ["first", "second"]
+    assert not queue.active()

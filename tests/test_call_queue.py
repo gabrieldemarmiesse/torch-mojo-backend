@@ -4,7 +4,7 @@ The suite runs with queueing disabled (synchronous contracts); these tests
 opt back in per-test via TMB_FORCE_KERNEL_QUEUE and exercise the queue's
 own guarantees: FIFO ordering across cold and warm units, drain-on-read,
 keep-alive of buffers referenced only by queued launches, launch-time
-dtype escalation, and value parity of every Into family against the
+error propagation, and value parity of every Into family against the
 synchronous path.
 """
 
@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from torch_mojo_backend import eager_kernels, get_accelerators, register_mojo_devices
-from torch_mojo_backend.eager_kernels import call_queue
+from torch_mojo_backend.eager_kernels import aten_fast, call_queue
 
 
 @pytest.fixture
@@ -40,22 +40,26 @@ class _StalledBuild:
     """Make one loaded unit look like it is still compiling, releasable on
     demand — a deterministic stand-in for a slow `mojo build`."""
 
-    def __init__(self, module: str, op: str) -> None:
-        unit = eager_kernels._STATES[module].unit(op)
-        unit.load_blocking()  # make sure the real extension exists
+    def __init__(
+        self, prepared: eager_kernels.PreparedExtensionCall[object, object]
+    ) -> None:
+        unit = eager_kernels.MOJO_EXTENSION_LOADER.unit_canonical(
+            prepared.extension.MOJO_FILE, prepared.defines
+        )
+        unit.load_blocking()  # make sure the real defined extension exists
         self._unit = unit
-        self._ext = unit.ext
-        unit.ext = None
+        self._module = unit.module
+        unit.module = None
         unit.request_async = self._request  # type: ignore[method-assign]
         self._job = _FakeJob(self)
 
-    def _request(self, all_dtypes: bool = False) -> "_FakeJob":
+    def _request(self) -> "_FakeJob":
         return self._job
 
     def release(self) -> None:
         unit = self._unit
-        if unit.ext is None:
-            unit.ext = self._ext
+        if unit.module is None:
+            unit.module = self._module
             del unit.request_async  # restore the class method
             self._job.done.set()
 
@@ -71,12 +75,21 @@ class _FakeJob:
         self._stall.release()
 
 
+def _prepare_add(
+    lhs: object, rhs: object
+) -> eager_kernels.PreparedExtensionCall[object, object]:
+    return aten_fast._BinarySpecExtension.prepare(
+        "AddSpec", lhs, rhs, aten_fast.DType.float32
+    )
+
+
 def test_warm_calls_queue_behind_a_cold_unit(mojo_gpu, forced_queue):
     """FIFO: once one launch waits on a build, later launches (warm or not)
     hold their position behind it, and a host read drains in order."""
     a = torch.full((64,), 3.0, device=mojo_gpu)
     b = torch.full((64,), 4.0, device=mojo_gpu)
-    stall = _StalledBuild("logic_ops", "AddSpec")
+    call_queue.drain()
+    stall = _StalledBuild(_prepare_add(a, b))
     try:
         y = a + b  # Into launch on the stalled unit: must queue
         z = y * y  # warm MulSpec: must queue BEHIND the stalled add
@@ -92,7 +105,8 @@ def test_keepalive_survives_dropped_intermediates(mojo_gpu, forced_queue):
     """Queued launches hold raw pointers; dropping every Python reference
     to an intermediate before the drain must not recycle its buffer."""
     a = torch.full((256,), 2.0, device=mojo_gpu)
-    stall = _StalledBuild("logic_ops", "AddSpec")
+    call_queue.drain()
+    stall = _StalledBuild(_prepare_add(a, a))
     try:
         y = a + a
         z = y * 3.0
@@ -109,7 +123,8 @@ def test_keepalive_survives_dropped_intermediates(mojo_gpu, forced_queue):
 
 def test_sync_read_drains_the_queue(mojo_gpu, forced_queue):
     a = torch.full((8,), 5.0, device=mojo_gpu)
-    stall = _StalledBuild("logic_ops", "AddSpec")
+    call_queue.drain()
+    stall = _StalledBuild(_prepare_add(a, a))
     try:
         y = a + a
         assert call_queue.active()
@@ -119,19 +134,29 @@ def test_sync_read_drains_the_queue(mojo_gpu, forced_queue):
     assert not call_queue.active()
 
 
-def test_launch_time_dtype_escalation(mojo_gpu, forced_queue):
-    """A queued launch hitting a gated-out dtype rebuilds its unit with the
-    full dtype set and retries — no error surfaces to the caller."""
-    unit = eager_kernels._STATES["logic_ops"].unit("AddSpec")
-    unit.load_blocking()
-    original = unit.dtypes
-    if original is None:
-        pytest.skip("unit already built with every dtype")
-    assert "float64" not in original  # default set has no f64
-    a = torch.full((16,), 1.5, dtype=torch.float64, device=mojo_gpu)
-    y = a + a  # Into launch; f64 is outside the unit's dtype gate
-    torch.testing.assert_close(y.cpu(), torch.full((16,), 3.0, dtype=torch.float64))
-    assert unit.dtypes is None  # escalated to the full set
+def test_launch_error_is_not_retried() -> None:
+    """An exact variant is called once; launch errors surface unchanged."""
+
+    class FailingExtension:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def call(self) -> None:
+            self.calls += 1
+            raise RuntimeError("exact variant rejected its arguments")
+
+    class LoadedUnit:
+        def __init__(self) -> None:
+            self.ext = FailingExtension()
+
+        def resolve(self, attr: str) -> object:
+            assert attr == "call"
+            return self.ext.call
+
+    unit = LoadedUnit()
+    with pytest.raises(RuntimeError, match="exact variant rejected"):
+        call_queue._exec((unit, "call", (), {}))
+    assert unit.ext.calls == 1
 
 
 @pytest.mark.parametrize(
@@ -147,6 +172,7 @@ def test_launch_time_dtype_escalation(mojo_gpu, forced_queue):
         "min_dim",
         "matmul",
         "bmm",
+        "permute_copy",
     ],
 )
 def test_into_family_parity(mojo_gpu, forced_queue, case):
@@ -184,6 +210,8 @@ def test_into_family_parity(mojo_gpu, forced_queue, case):
         x = torch.randn(4, 5, 9, generator=g)
         y = torch.randn(4, 9, 3, generator=g)
         out, ref = torch.bmm(x.to(mojo_gpu), y.to(mojo_gpu)), torch.bmm(x, y)
+    elif case == "permute_copy":
+        out, ref = da.t().contiguous(), a.t().contiguous()
     if out.dtype == torch.bool:
         assert torch.equal(out.cpu(), ref)
     else:

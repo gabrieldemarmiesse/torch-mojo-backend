@@ -17,8 +17,8 @@ Correctness rules:
   touched while the queue is non-empty is retained in `_KEEPALIVE` (op
   scopes feed it: dispatch brackets each aten op and collects its args,
   results, and every `_alloc` made inside) until the queue empties.
-- A call raising "unsupported dtype" at launch time rebuilds its unit
-  with the full dtype set and retries that one call.
+- Every queued item already names an exact dtype/flag specialization. A Mojo
+  dtype error is therefore a bridge bug and surfaces without a retry build.
 - Launch-time errors surface at the next drain, CUDA-style.
 """
 
@@ -107,14 +107,8 @@ def _exec(item: tuple) -> None:
     if unit is None:
         attr(*args, **kwargs)  # external (e.g. fa4): attr is the callable
         return
-    fn = getattr(unit.ext, attr)
-    try:
-        fn(*args, **kwargs)
-    except Exception as exc:  # Mojo errors surface as plain Exception
-        if "unsupported dtype" not in str(exc) or unit.dtypes is None:
-            raise
-        ext = unit.load_blocking(all_dtypes=True)
-        getattr(ext, attr)(*args, **kwargs)
+    fn = unit.resolve(attr)
+    fn(*args, **kwargs)
 
 
 def _pump_locked() -> None:
@@ -170,52 +164,8 @@ def drain() -> None:
 # Entry points for callers
 
 
-def _returns_value(attr: str) -> bool:
-    """Spec-tier entry points called in their LEGACY form allocate their
-    output inside Mojo and RETURN (holder, spec, ...): the caller consumes
-    the value immediately, so such a call cannot be queued and instead
-    drains + executes synchronously. Hot paths avoid this entirely via the
-    Into form (`kernel_call_into`: Python pre-allocates, Mojo writes into
-    the provided out-spec) — this guard only serves remaining legacy spec
-    calls (e.g. Cumsum/BatchNorm/AttnDecode, and eligibility fallbacks).
-    Naming convention: spec entries end in "Spec"; a mis-classification is
-    loud (the caller crashes on None), never silent."""
-    return attr.endswith("Spec")
-
-
-def kernel_call(unit: object, attr: str, args: tuple, kwargs: dict) -> object:
-    """A gated extension call (from the module proxy's wrapper)."""
-    with _LOCK:
-        _pump_locked()
-        if _returns_value(attr):
-            # Value-returning call: must execute NOW, and device ordering
-            # requires every queued launch to land first.
-            if _QUEUE:
-                drain()
-            if _HELD_ERROR:
-                raise _HELD_ERROR.pop()
-            if unit.ext is None:
-                unit.load_blocking()
-            _order_exec_thread()
-            fn = getattr(unit.ext, attr)
-            try:
-                return fn(*args, **kwargs)
-            except Exception as exc:
-                if "unsupported dtype" not in str(exc) or unit.dtypes is None:
-                    raise
-                ext = unit.load_blocking(all_dtypes=True)
-                return getattr(ext, attr)(*args, **kwargs)
-        if not _QUEUE and unit.ext is not None and not _HELD_ERROR:
-            _exec((unit, attr, args, kwargs))
-            return None
-        if unit.ext is None:
-            unit.request_async()
-        _QUEUE.append((unit, attr, args, kwargs))
-    return None
-
-
 def kernel_call_into(unit: object, attr: str, args: tuple) -> None:
-    """A gated Into-style spec launch: Python pre-allocated the output, the
+    """Queue a descriptor call whose outputs were preallocated in Python. The
     call writes into it and returns nothing — always queueable regardless
     of the *Spec naming convention."""
     with _LOCK:

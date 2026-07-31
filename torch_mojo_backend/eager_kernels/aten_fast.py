@@ -24,6 +24,10 @@ import math
 import struct
 import warnings
 from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
+from typing import ClassVar
 
 import torch
 from max.driver import Device
@@ -31,6 +35,60 @@ from max.dtype import DType
 
 from torch_mojo_backend import eager_kernels, is_running_tests
 from torch_mojo_backend.eager_kernels import call_queue as _call_queue
+from torch_mojo_backend.eager_kernels.activation_backward_ops import (
+    ActivationBackwardExtension as _ActivationBackwardExtension,
+)
+from torch_mojo_backend.eager_kernels.activation_forward_ops import (
+    ActivationForwardExtension as _ActivationForwardExtension,
+)
+from torch_mojo_backend.eager_kernels.bf16_matmul_ops import (
+    BF16MatmulExtension as _Bf16MatmulExtension,
+)
+from torch_mojo_backend.eager_kernels.conv_ops import ConvExtension as _ConvExtension
+from torch_mojo_backend.eager_kernels.data_movement_ops import (
+    DataMovementExtension as _DataMovementExtension,
+)
+from torch_mojo_backend.eager_kernels.dropout_ops import (
+    DropoutExtension as _DropoutExtension,
+)
+from torch_mojo_backend.eager_kernels.elementwise_ops import (
+    ElementwiseExtension as _ElementwiseExtension,
+)
+from torch_mojo_backend.eager_kernels.embedding_backward_ops import (
+    EmbeddingBackwardExtension as _EmbeddingBackwardExtension,
+)
+from torch_mojo_backend.eager_kernels.flash_attention_ops import (
+    FlashAttentionExtension as _FlashAttentionExtension,
+)
+from torch_mojo_backend.eager_kernels.logic_ops import LogicExtension as _LogicExtension
+from torch_mojo_backend.eager_kernels.loss_ops import LossExtension as _LossExtension
+from torch_mojo_backend.eager_kernels.matmul_ops import (
+    MatmulExtension as _MatmulExtension,
+)
+from torch_mojo_backend.eager_kernels.nn_ops import NNExtension as _NNExtension
+from torch_mojo_backend.eager_kernels.normalization_backward_ops import (
+    NormalizationBackwardExtension as _NormalizationBackwardExtension,
+)
+from torch_mojo_backend.eager_kernels.normalization_forward_ops import (
+    NormalizationForwardExtension as _NormalizationForwardExtension,
+)
+from torch_mojo_backend.eager_kernels.optimizer_ops import (
+    OptimizerExtension as _OptimizerExtension,
+)
+from torch_mojo_backend.eager_kernels.reduction_ops import (
+    ReductionExtension as _ReductionExtension,
+)
+from torch_mojo_backend.eager_kernels.sdpa_backward_ops import (
+    SDPABackwardExtension as _SdpaBackwardExtension,
+)
+from torch_mojo_backend.eager_kernels.softmax_backward_ops import (
+    SoftmaxBackwardExtension as _SoftmaxBackwardExtension,
+)
+from torch_mojo_backend.eager_kernels.tf32_matmul_ops import (
+    TF32MatmulExtension as _Tf32MatmulExtension,
+)
+
+_VariantFlag = bool | int | str
 
 
 def _device_call(fn: object, *args: object) -> object:
@@ -40,6 +98,31 @@ def _device_call(fn: object, *args: object) -> object:
     if _call_queue.enabled():
         return _call_queue.external_call(fn, args)
     return fn(*args)
+
+
+def _call_mojo(
+    extension: type[eager_kernels.MojoFileExtension],
+    op: str,
+    extension_args: tuple[object, ...],
+    *,
+    arg_dtypes: tuple[DType, ...],
+    output_dtypes: tuple[DType, ...] = (),
+    flags: dict[str, _VariantFlag] | None = None,
+    result_specs: object = None,
+) -> object:
+    """Invoke one exact, shape-independent stateless Mojo extension."""
+    try:
+        return extension.invoke(
+            op,
+            extension_args,
+            arg_dtypes=arg_dtypes,
+            output_dtypes=output_dtypes,
+            flags=flags,
+            result_specs=result_specs,
+        )
+    except Exception as exc:
+        _raise_if_device_oom(exc)
+        raise
 
 
 from torch_mojo_backend.eager_kernels import _ctx_ptr
@@ -64,31 +147,30 @@ NOT_HANDLED = object()
 # it imports exists; a missing optional source would otherwise make ordinary
 # eager SDPA backward pay for a predictably failing compiler subprocess.
 _SDPA_BACKWARD_SOURCE_PATHS = (
-    eager_kernels._PACKAGE_DIR / "sdpa_backward_ops.mojo",
-    eager_kernels._PACKAGE_DIR / "sdpa_dropout_softmax_backward_kernels.mojo",
-    eager_kernels._PACKAGE_DIR / "sdpa_backward_gemm_kernels.mojo",
+    eager_kernels._PACKAGE_DIR / _SdpaBackwardExtension.MOJO_FILE,
+    eager_kernels._PACKAGE_DIR
+    / "sdpa_backward_ops/sdpa_dropout_softmax_backward_kernels.mojo",
+    eager_kernels._PACKAGE_DIR / "sdpa_backward_ops/sdpa_backward_gemm_kernels.mojo",
 )
 
 # Keep the optional BF16 bridge dormant until the bridge, optimized dispatcher,
 # and accepted fallback all exist. A partial dependency closure would otherwise
 # launch a predictably failing compile before an ordinary eager matmul.
 _BF16_SOURCE_PATHS = (
-    eager_kernels._PACKAGE_DIR / "bf16_matmul_ops.mojo",
-    eager_kernels._PACKAGE_DIR / "bf16_gemm_v3_kernels.mojo",
-    eager_kernels._PACKAGE_DIR / "bf16_gemm_tn_v4_kernels.mojo",
-    eager_kernels._PACKAGE_DIR / "bf16_gemm_kernels.mojo",
+    eager_kernels._PACKAGE_DIR / _Bf16MatmulExtension.MOJO_FILE,
+    eager_kernels._PACKAGE_DIR / "bf16_matmul_ops/bf16_gemm_v3_kernels.mojo",
+    eager_kernels._PACKAGE_DIR / "bf16_matmul_ops/bf16_gemm_tn_v4_kernels.mojo",
+    eager_kernels._PACKAGE_DIR / "bf16_matmul_ops/bf16_gemm_kernels.mojo",
 )
-_BF16_IMPORT_FAILED = False
 
 # The TF32 host route is useful before the separately profiled Fable kernel is
 # installed, but the thin bridge imports that kernel unconditionally.  Avoid a
 # predictably failing lazy compile (and an unnecessary output allocation) while
 # either source is absent from a source checkout or wheel.
 _TF32_SOURCE_PATHS = (
-    eager_kernels._PACKAGE_DIR / "tf32_matmul_ops.mojo",
-    eager_kernels._PACKAGE_DIR / "tf32_gemm_kernels.mojo",
+    eager_kernels._PACKAGE_DIR / _Tf32MatmulExtension.MOJO_FILE,
+    eager_kernels._PACKAGE_DIR / "tf32_matmul_ops/tf32_gemm_kernels.mojo",
 )
-_TF32_IMPORT_FAILED = False
 
 # The Mojo kernels raise (instead of falling back) on dtypes they don't
 # support; gate float-only ops here.
@@ -241,8 +323,12 @@ def fast_aten__foreach_norm(self, ord=2, dtype=None):
         for tensor in tensors
     )
     partials = _alloc((max(total_chunks, 1),), DType.float32, device)
-    eager_kernels.optimizer_ops.ForeachL2Norm(
-        metadata, partials._ptr, partials._numel, _ctx_ptr(device)
+    _call_mojo(
+        _OptimizerExtension,
+        "ForeachL2Norm",
+        (metadata, partials._ptr, partials._numel, _ctx_ptr(device)),
+        arg_dtypes=(DType.float32, DType.float32, DType.float32),
+        output_dtypes=(DType.float32,),
     )
     return outputs
 
@@ -367,8 +453,13 @@ def _fast__foreach_add__scalar_generic(self, scalar):
     )
     if len(metadata) != len(tensors) * _FOREACH_ADD_RECORD_FIELDS:
         raise AssertionError("invalid foreach add metadata packing")
-    eager_kernels.elementwise_ops.ForeachAddScalar(
-        metadata, float(scalar), dtype.value, _ctx_ptr(device)
+    _call_mojo(
+        _ElementwiseExtension,
+        "ForeachAddScalar",
+        (metadata, float(scalar), dtype.value, _ctx_ptr(device)),
+        arg_dtypes=(dtype,),
+        output_dtypes=(dtype,),
+        flags={"INPLACE": True},
     )
     return None
 
@@ -415,8 +506,13 @@ def fast_aten__foreach_mul__tensor(self, other):
     )
     if len(metadata) != len(tensors) * _FOREACH_MUL_RECORD_FIELDS:
         raise AssertionError("invalid foreach multiply metadata packing")
-    eager_kernels.optimizer_ops.ForeachMulTensor(
-        metadata, scalar._ptr, _ctx_ptr(device)
+    _call_mojo(
+        _OptimizerExtension,
+        "ForeachMulTensor",
+        (metadata, scalar._ptr, _ctx_ptr(device)),
+        arg_dtypes=(DType.float32, DType.float32),
+        output_dtypes=(DType.float32,),
+        flags={"INPLACE": True},
     )
     return None
 
@@ -537,8 +633,13 @@ def _foreach_scalar_inplace(
     metadata = tuple(
         value for tensor in tensors for value in (tensor._ptr, tensor._numel)
     )
-    eager_kernels.optimizer_ops.ForeachScalarOp(
-        op_code, metadata, tuple(values), _ctx_ptr(tensors[0]._device)
+    _call_mojo(
+        _OptimizerExtension,
+        "ForeachScalarOp",
+        (op_code, metadata, tuple(values), _ctx_ptr(tensors[0]._device)),
+        arg_dtypes=(DType.float32,),
+        output_dtypes=(DType.float32,),
+        flags={"INPLACE": True, "OP_CODE": op_code},
     )
     return None
 
@@ -613,12 +714,19 @@ def fast_aten__foreach_lerp__scalar(
         for tensor, end in zip(tensors, ends, strict=True)
         for value in (tensor._ptr, end._ptr, tensor._numel)
     )
-    eager_kernels.optimizer_ops.ForeachLerpScalar(
-        metadata,
-        narrowed_weight,
-        one_minus_weight,
-        int(abs(narrowed_weight) < 0.5),
-        _ctx_ptr(tensors[0]._device),
+    _call_mojo(
+        _OptimizerExtension,
+        "ForeachLerpScalar",
+        (
+            metadata,
+            narrowed_weight,
+            one_minus_weight,
+            int(abs(narrowed_weight) < 0.5),
+            _ctx_ptr(tensors[0]._device),
+        ),
+        arg_dtypes=(DType.float32, DType.float32),
+        output_dtypes=(DType.float32,),
+        flags={"INPLACE": True, "SMALL_WEIGHT": abs(narrowed_weight) < 0.5},
     )
     return None
 
@@ -642,8 +750,13 @@ def _foreach_addc_inplace(
         for tensor, first, second in zip(tensors, firsts, seconds, strict=True)
         for value in (tensor._ptr, first._ptr, second._ptr, tensor._numel)
     )
-    eager_kernels.optimizer_ops.ForeachAddcOp(
-        op_code, metadata, tuple(values), _ctx_ptr(tensors[0]._device)
+    _call_mojo(
+        _OptimizerExtension,
+        "ForeachAddcOp",
+        (op_code, metadata, tuple(values), _ctx_ptr(tensors[0]._device)),
+        arg_dtypes=(DType.float32, DType.float32, DType.float32),
+        output_dtypes=(DType.float32,),
+        flags={"INPLACE": True, "OP_CODE": op_code},
     )
     return None
 
@@ -690,7 +803,13 @@ def fast_aten__foreach_sqrt(self: Sequence[torch.Tensor]) -> object:
         for tensor, output in zip(tensors, outputs, strict=True)
         for value in (tensor._ptr, output._ptr, tensor._numel)
     )
-    eager_kernels.optimizer_ops.ForeachSqrt(metadata, _ctx_ptr(tensors[0]._device))
+    _call_mojo(
+        _OptimizerExtension,
+        "ForeachSqrt",
+        (metadata, _ctx_ptr(tensors[0]._device)),
+        arg_dtypes=(DType.float32,),
+        output_dtypes=(DType.float32,),
+    )
     return outputs
 
 
@@ -834,15 +953,34 @@ def fast_aten__fused_adamw(
     if len(metadata) != tensor_count * _FUSED_ADAMW_RECORD_FIELDS:
         raise AssertionError("invalid fused AdamW metadata packing")
 
-    eager_kernels.optimizer_ops.FusedAdamW(
-        metadata,
-        (lr_scalar, float(beta1), float(beta2), float(weight_decay), float(eps)),
-        0,  # homogeneous FP32 parameters, gradients, and optimizer state
-        int(bool(amsgrad)) | (int(bool(maximize)) << 1),
-        lr_ptr,
-        grad_scale_ptr,
-        found_inf_ptr,
-        _ctx_ptr(device),
+    _call_mojo(
+        _OptimizerExtension,
+        "FusedAdamW",
+        (
+            metadata,
+            (lr_scalar, float(beta1), float(beta2), float(weight_decay), float(eps)),
+            0,  # homogeneous FP32 parameters, gradients, and optimizer state
+            int(bool(amsgrad)) | (int(bool(maximize)) << 1),
+            lr_ptr,
+            grad_scale_ptr,
+            found_inf_ptr,
+            _ctx_ptr(device),
+        ),
+        arg_dtypes=(
+            DType.float32,
+            DType.float32,
+            DType.float32,
+            DType.float32,
+            DType.float32,
+        ),
+        output_dtypes=(DType.float32,),
+        flags={
+            "AMSGRAD": bool(amsgrad),
+            "MAXIMIZE": bool(maximize),
+            "TENSOR_LR": bool(lr_ptr),
+            "GRAD_SCALE": bool(grad_scale_ptr),
+            "FOUND_INF": bool(found_inf_ptr),
+        },
     )
     return None
 
@@ -887,6 +1025,227 @@ def _wrap_spec_result(result, dtype, device):
     )
     out._spec = spec
     return out
+
+
+@dataclass(frozen=True)
+class _TensorOutputSpec:
+    """Shape/type/device metadata inferred without loading a Mojo module."""
+
+    shape: tuple[int, ...]
+    dtype: DType
+    device: Device
+
+
+def _allocate_output_spec(spec: _TensorOutputSpec) -> TorchMojoTensor:
+    return _alloc(spec.shape, spec.dtype, spec.device)
+
+
+def _submit_prepared_into(
+    prepared: eager_kernels.PreparedExtensionCall[_TensorOutputSpec, TorchMojoTensor],
+    *,
+    force_sync: bool = False,
+) -> TorchMojoTensor:
+    """Allocate from inferred metadata and queue, or execute synchronously."""
+    if force_sync and _call_queue.enabled():
+        _call_queue.drain()
+    if force_sync or not _call_queue.enabled():
+        return prepared.execute()
+    out = _allocate_output_spec(prepared.output_specs)
+    extension_args = prepared.extension.extension_args(
+        out, *prepared.args, **dict(prepared.kwargs)
+    )
+    prepared.enqueue_into(extension_args)
+    return out
+
+
+class _FillSpecExtension(
+    eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
+):
+    MOJO_FILE: ClassVar[Path] = _ElementwiseExtension.MOJO_FILE
+
+    @classmethod
+    def make_defines(
+        cls, shape: Sequence[int], value: float, dtype: DType, device: Device
+    ) -> dict[str, bool | int | str]:
+        return {"OP": "FillSpec", "DTYPE_OUT": dtype.name}
+
+    @classmethod
+    def expected_output_specs(
+        cls, shape: Sequence[int], value: float, dtype: DType, device: Device
+    ) -> _TensorOutputSpec:
+        return _TensorOutputSpec(tuple(shape), dtype, device)
+
+    @classmethod
+    def extension_args(
+        cls,
+        out: TorchMojoTensor,
+        shape: Sequence[int],
+        value: float,
+        dtype: DType,
+        device: Device,
+    ) -> tuple[object, ...]:
+        return (value, _spec_of(out))
+
+    @classmethod
+    def call_extension(
+        cls,
+        extension: ModuleType,
+        output_specs: _TensorOutputSpec,
+        shape: Sequence[int],
+        value: float,
+        dtype: DType,
+        device: Device,
+    ) -> TorchMojoTensor:
+        out = _allocate_output_spec(output_specs)
+        extension.call(*cls.extension_args(out, shape, value, dtype, device))
+        return out
+
+
+class _CastSpecExtension(
+    eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
+):
+    MOJO_FILE: ClassVar[Path] = _DataMovementExtension.MOJO_FILE
+
+    @classmethod
+    def make_defines(
+        cls, tensor: MojoTensorLike, dtype: DType
+    ) -> dict[str, bool | int | str]:
+        return {
+            "OP": "CastSpec",
+            "DTYPE_ARG_0": tensor._dtype.name,
+            "DTYPE_OUT": dtype.name,
+        }
+
+    @classmethod
+    def expected_output_specs(
+        cls, tensor: MojoTensorLike, dtype: DType
+    ) -> _TensorOutputSpec:
+        return _TensorOutputSpec(tuple(tensor._shape), dtype, tensor._device)
+
+    @classmethod
+    def extension_args(
+        cls, out: TorchMojoTensor, tensor: MojoTensorLike, dtype: DType
+    ) -> tuple[object, ...]:
+        return (_spec_of(tensor), dtype.value, _spec_of(out))
+
+    @classmethod
+    def call_extension(
+        cls,
+        extension: ModuleType,
+        output_specs: _TensorOutputSpec,
+        tensor: MojoTensorLike,
+        dtype: DType,
+    ) -> TorchMojoTensor:
+        out = _allocate_output_spec(output_specs)
+        extension.call(*cls.extension_args(out, tensor, dtype))
+        return out
+
+
+class _BinarySpecExtension(
+    eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
+):
+    MOJO_FILE: ClassVar[Path] = _LogicExtension.MOJO_FILE
+
+    @classmethod
+    def make_defines(
+        cls, op: str, lhs: MojoTensorLike, rhs: MojoTensorLike, out_dtype: DType
+    ) -> dict[str, bool | int | str]:
+        return {
+            "OP": op,
+            "DTYPE_ARG_0": lhs._dtype.name,
+            "DTYPE_ARG_1": rhs._dtype.name,
+            "DTYPE_OUT": out_dtype.name,
+        }
+
+    @classmethod
+    def expected_output_specs(
+        cls, op: str, lhs: MojoTensorLike, rhs: MojoTensorLike, out_dtype: DType
+    ) -> _TensorOutputSpec:
+        shape = torch.broadcast_shapes(tuple(lhs._shape), tuple(rhs._shape))
+        return _TensorOutputSpec(tuple(shape), out_dtype, lhs._device)
+
+    @classmethod
+    def extension_args(
+        cls,
+        out: TorchMojoTensor,
+        op: str,
+        lhs: MojoTensorLike,
+        rhs: MojoTensorLike,
+        out_dtype: DType,
+    ) -> tuple[object, ...]:
+        return (_spec_of(lhs), _spec_of(rhs), _spec_of(out))
+
+    @classmethod
+    def call_extension(
+        cls,
+        extension: ModuleType,
+        output_specs: _TensorOutputSpec,
+        op: str,
+        lhs: MojoTensorLike,
+        rhs: MojoTensorLike,
+        out_dtype: DType,
+    ) -> TorchMojoTensor:
+        out = _allocate_output_spec(output_specs)
+        extension.call(*cls.extension_args(out, op, lhs, rhs, out_dtype))
+        return out
+
+
+class _UnarySpecExtension(
+    eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
+):
+    @classmethod
+    def make_defines(
+        cls, op: str, tensor: MojoTensorLike, out_dtype: DType
+    ) -> dict[str, bool | int | str]:
+        return {
+            "OP": op,
+            "DTYPE_ARG_0": tensor._dtype.name,
+            "DTYPE_OUT": out_dtype.name,
+        }
+
+    @classmethod
+    def expected_output_specs(
+        cls, op: str, tensor: MojoTensorLike, out_dtype: DType
+    ) -> _TensorOutputSpec:
+        return _TensorOutputSpec(tuple(tensor._shape), out_dtype, tensor._device)
+
+    @classmethod
+    def extension_args(
+        cls, out: TorchMojoTensor, op: str, tensor: MojoTensorLike, out_dtype: DType
+    ) -> tuple[object, ...]:
+        return (_spec_of(tensor), _spec_of(out))
+
+    @classmethod
+    def call_extension(
+        cls,
+        extension: ModuleType,
+        output_specs: _TensorOutputSpec,
+        op: str,
+        tensor: MojoTensorLike,
+        out_dtype: DType,
+    ) -> TorchMojoTensor:
+        out = _allocate_output_spec(output_specs)
+        extension.call(*cls.extension_args(out, op, tensor, out_dtype))
+        return out
+
+
+class _ElementwiseUnarySpecExtension(_UnarySpecExtension):
+    MOJO_FILE: ClassVar[Path] = _ElementwiseExtension.MOJO_FILE
+
+
+class _ReductionUnarySpecExtension(_UnarySpecExtension):
+    MOJO_FILE: ClassVar[Path] = _ReductionExtension.MOJO_FILE
+
+
+class _NNUnarySpecExtension(_UnarySpecExtension):
+    MOJO_FILE: ClassVar[Path] = _NNExtension.MOJO_FILE
+
+
+_UNARY_SPEC_EXTENSIONS = {
+    "elementwise_ops": _ElementwiseUnarySpecExtension,
+    "reduction_ops": _ReductionUnarySpecExtension,
+    "nn_ops": _NNUnarySpecExtension,
+}
 
 
 _SPEC_INTO_DTYPES = frozenset(
@@ -981,9 +1340,8 @@ def _try_spec_binary_into(
         value = _scalar_embed(scalar, dtype)
         if value is None:
             return None
-        fill = _alloc((), dtype, device)
-        eager_kernels.queue_spec_into(
-            "elementwise_ops", "FillSpec", (value, _spec_of(fill))
+        fill = _submit_prepared_into(
+            _FillSpecExtension.prepare((), value, dtype, device)
         )
         if a is not None:
             b = fill
@@ -1011,14 +1369,12 @@ def _try_spec_binary_into(
         ):
             return None
     try:
-        shape = torch.broadcast_shapes(tuple(a._shape), tuple(b._shape))
+        torch.broadcast_shapes(tuple(a._shape), tuple(b._shape))
     except RuntimeError:
         return None
-    out = _alloc(shape, out_dtype or dtype, device)
-    eager_kernels.queue_spec_into(
-        "logic_ops", spec_fn_name, (_spec_of(a), _spec_of(b), _spec_of(out))
+    return _submit_prepared_into(
+        _BinarySpecExtension.prepare(spec_fn_name, a, b, out_dtype or dtype)
     )
-    return out
 
 
 def _try_spec_binary(spec_fn_name, lhs, rhs, out_dtype=None):
@@ -1079,20 +1435,24 @@ def _try_spec_binary(spec_fn_name, lhs, rhs, out_dtype=None):
                 return None
             try:
                 if cast_both:
-                    keep_a, spec_a, _, _ = eager_kernels.data_movement_ops.CastSpec(
-                        _spec_of(a), dtype.value
+                    keep_a = _submit_prepared_into(
+                        _CastSpecExtension.prepare(a, dtype), force_sync=True
                     )
-                    keep_b, spec_b, _, _ = eager_kernels.data_movement_ops.CastSpec(
-                        _spec_of(b), dtype.value
+                    keep_b = _submit_prepared_into(
+                        _CastSpecExtension.prepare(b, dtype), force_sync=True
                     )
+                    spec_a = _spec_of(keep_a)
+                    spec_b = _spec_of(keep_b)
                 elif cast_a:
-                    keep_a, spec_a, _, _ = eager_kernels.data_movement_ops.CastSpec(
-                        _spec_of(a), dtype.value
+                    keep_a = _submit_prepared_into(
+                        _CastSpecExtension.prepare(a, dtype), force_sync=True
                     )
+                    spec_a = _spec_of(keep_a)
                 else:
-                    keep_b, spec_b, _, _ = eager_kernels.data_movement_ops.CastSpec(
-                        _spec_of(b), dtype.value
+                    keep_b = _submit_prepared_into(
+                        _CastSpecExtension.prepare(b, dtype), force_sync=True
                     )
+                    spec_b = _spec_of(keep_b)
             except Exception as exc:
                 _raise_if_device_oom(exc)
                 return None
@@ -1103,9 +1463,10 @@ def _try_spec_binary(spec_fn_name, lhs, rhs, out_dtype=None):
         if value is None:
             return None
         try:
-            keep_b, spec_b, _, _ = eager_kernels.elementwise_ops.FillSpec(
-                _pad8((), 1), 0, 1, value, dtype.value, _ctx_ptr(device)
+            keep_b = _submit_prepared_into(
+                _FillSpecExtension.prepare((), value, dtype, device), force_sync=True
             )
+            spec_b = _spec_of(keep_b)
         except Exception as exc:
             _raise_if_device_oom(exc)
             return None
@@ -1117,24 +1478,30 @@ def _try_spec_binary(spec_fn_name, lhs, rhs, out_dtype=None):
         if value is None:
             return None
         try:
-            keep_a, spec_a, _, _ = eager_kernels.elementwise_ops.FillSpec(
-                _pad8((), 1), 0, 1, value, dtype.value, _ctx_ptr(device)
+            keep_a = _submit_prepared_into(
+                _FillSpecExtension.prepare((), value, dtype, device), force_sync=True
             )
+            spec_a = _spec_of(keep_a)
         except Exception as exc:
             _raise_if_device_oom(exc)
             return None
     else:
         return None
     try:
-        result = getattr(eager_kernels.logic_ops, spec_fn_name)(
-            spec_a if spec_a is not None else _spec_of(a),
-            spec_b if spec_b is not None else _spec_of(b),
+        result = _submit_prepared_into(
+            _BinarySpecExtension.prepare(
+                spec_fn_name,
+                keep_a if keep_a is not None else a,
+                keep_b if keep_b is not None else b,
+                out_dtype or dtype,
+            ),
+            force_sync=True,
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
-    _ = keep_a, keep_b  # intermediates must outlive the enqueued launch
-    return _wrap_spec_result(result, out_dtype or dtype, device)
+    _ = spec_a, spec_b  # keep explicit spec construction covered above
+    return result
 
 
 def _try_spec_add_f32_bf16(lhs, rhs):
@@ -1163,17 +1530,17 @@ def _try_spec_add_f32_bf16(lhs, rhs):
     ):
         return None
     if _call_queue.enabled() and a._device.api != "cpu":
-        out = _alloc(a._shape, DType.float32, a._device)
-        eager_kernels.queue_spec_into(
-            "logic_ops", "AddF32Bf16Spec", (_spec_of(a), _spec_of(b), _spec_of(out))
+        return _submit_prepared_into(
+            _BinarySpecExtension.prepare("AddF32Bf16Spec", a, b, DType.float32)
         )
-        return out
     try:
-        result = eager_kernels.logic_ops.AddF32Bf16Spec(_spec_of(a), _spec_of(b))
+        return _submit_prepared_into(
+            _BinarySpecExtension.prepare("AddF32Bf16Spec", a, b, DType.float32),
+            force_sync=True,
+        )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
-    return _wrap_spec_result(result, DType.float32, a._device)
 
 
 _SPEC_UNARY_INTO_DTYPES = frozenset(
@@ -1238,6 +1605,170 @@ def _reduced_shape(shape: tuple, rdims: object, keepdim: bool) -> tuple:
     return tuple(out)
 
 
+class _ReductionSpecExtension(
+    eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
+):
+    @classmethod
+    def make_defines(
+        cls,
+        op: str,
+        tensor: MojoTensorLike,
+        rdims: tuple[int, ...],
+        keepdim: bool,
+        extra: tuple[object, ...],
+        out_dtype: DType,
+    ) -> dict[str, bool | int | str]:
+        return {
+            "OP": op,
+            "DTYPE_ARG_0": tensor._dtype.name,
+            "DTYPE_OUT": out_dtype.name,
+        }
+
+    @classmethod
+    def expected_output_specs(
+        cls,
+        op: str,
+        tensor: MojoTensorLike,
+        rdims: tuple[int, ...],
+        keepdim: bool,
+        extra: tuple[object, ...],
+        out_dtype: DType,
+    ) -> _TensorOutputSpec:
+        shape = _reduced_shape(tuple(tensor._shape), rdims, keepdim)
+        return _TensorOutputSpec(shape, out_dtype, tensor._device)
+
+    @classmethod
+    def extension_args(
+        cls,
+        out: TorchMojoTensor,
+        op: str,
+        tensor: MojoTensorLike,
+        rdims: tuple[int, ...],
+        keepdim: bool,
+        extra: tuple[object, ...],
+        out_dtype: DType,
+    ) -> tuple[object, ...]:
+        return (_spec_of(tensor), rdims, 1 if keepdim else 0, *extra, _spec_of(out))
+
+    @classmethod
+    def call_extension(
+        cls,
+        extension: ModuleType,
+        output_specs: _TensorOutputSpec,
+        op: str,
+        tensor: MojoTensorLike,
+        rdims: tuple[int, ...],
+        keepdim: bool,
+        extra: tuple[object, ...],
+        out_dtype: DType,
+    ) -> TorchMojoTensor:
+        out = _allocate_output_spec(output_specs)
+        extension.call(
+            *cls.extension_args(out, op, tensor, rdims, keepdim, extra, out_dtype)
+        )
+        return out
+
+
+class _ReductionOpsSpecExtension(_ReductionSpecExtension):
+    MOJO_FILE: ClassVar[Path] = _ReductionExtension.MOJO_FILE
+
+
+class _NNReductionSpecExtension(_ReductionSpecExtension):
+    MOJO_FILE: ClassVar[Path] = _NNExtension.MOJO_FILE
+
+
+_REDUCTION_SPEC_EXTENSIONS = {
+    "reduction_ops": _ReductionOpsSpecExtension,
+    "nn_ops": _NNReductionSpecExtension,
+}
+
+
+class _MinDimSpecExtension(
+    eager_kernels.MojoExtension[
+        tuple[_TensorOutputSpec, _TensorOutputSpec],
+        tuple[TorchMojoTensor, TorchMojoTensor],
+    ]
+):
+    MOJO_FILE: ClassVar[Path] = _ReductionExtension.MOJO_FILE
+
+    @classmethod
+    def make_defines(
+        cls, tensor: MojoTensorLike, dim: int, keepdim: bool
+    ) -> dict[str, bool | int | str]:
+        return {
+            "OP": "MinDimSpec",
+            "DTYPE_ARG_0": tensor._dtype.name,
+            "DTYPE_OUT_0": tensor._dtype.name,
+            "DTYPE_OUT_1": DType.int64.name,
+        }
+
+    @classmethod
+    def expected_output_specs(
+        cls, tensor: MojoTensorLike, dim: int, keepdim: bool
+    ) -> tuple[_TensorOutputSpec, _TensorOutputSpec]:
+        shape = _reduced_shape(tuple(tensor._shape), (dim,), keepdim)
+        return (
+            _TensorOutputSpec(shape, tensor._dtype, tensor._device),
+            _TensorOutputSpec(shape, DType.int64, tensor._device),
+        )
+
+    @classmethod
+    def extension_args(
+        cls,
+        outputs: tuple[TorchMojoTensor, TorchMojoTensor],
+        tensor: MojoTensorLike,
+        dim: int,
+        keepdim: bool,
+    ) -> tuple[object, ...]:
+        return (
+            _spec_of(tensor),
+            (dim,),
+            1 if keepdim else 0,
+            _spec_of(outputs[0]),
+            _spec_of(outputs[1]),
+        )
+
+    @classmethod
+    def call_extension(
+        cls,
+        extension: ModuleType,
+        output_specs: tuple[_TensorOutputSpec, _TensorOutputSpec],
+        tensor: MojoTensorLike,
+        dim: int,
+        keepdim: bool,
+    ) -> tuple[TorchMojoTensor, TorchMojoTensor]:
+        outputs = (
+            _allocate_output_spec(output_specs[0]),
+            _allocate_output_spec(output_specs[1]),
+        )
+        extension.call(*cls.extension_args(outputs, tensor, dim, keepdim))
+        return outputs
+
+
+def _submit_min_dim(
+    prepared: eager_kernels.PreparedExtensionCall[
+        tuple[_TensorOutputSpec, _TensorOutputSpec],
+        tuple[TorchMojoTensor, TorchMojoTensor],
+    ],
+    *,
+    force_sync: bool = False,
+) -> tuple[TorchMojoTensor, TorchMojoTensor]:
+    if force_sync and _call_queue.enabled():
+        _call_queue.drain()
+    if force_sync or not _call_queue.enabled():
+        return prepared.execute()
+    outputs = (
+        _allocate_output_spec(prepared.output_specs[0]),
+        _allocate_output_spec(prepared.output_specs[1]),
+    )
+    prepared.enqueue_into(
+        prepared.extension.extension_args(
+            outputs, *prepared.args, **dict(prepared.kwargs)
+        )
+    )
+    return outputs
+
+
 def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_ops"):
     """Contiguous unary through a spec op, or None.
 
@@ -1246,9 +1777,9 @@ def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_op
     a = _t(x)
     if a is None:
         return None
+    kdtype = DType.uint8 if a._dtype == DType.bool else a._dtype
     if _call_queue.enabled():
         if out_dtype == DType.bool and module_name == "elementwise_ops":
-            kdtype = DType.uint8 if a._dtype == DType.bool else a._dtype
             ok = kdtype in _SPEC_UNARY_INTO_DTYPES
         elif module_name == "elementwise_ops":
             ok = a._dtype in (
@@ -1261,17 +1792,18 @@ def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_op
         else:
             ok = False  # e.g. CumsumSpec: constraints not mirrored, stay sync
         if ok:
-            out = _alloc(a._shape, out_dtype or a._dtype, a._device)
-            eager_kernels.queue_spec_into(
-                module_name, spec_fn_name, (_spec_of(a), _spec_of(out))
+            extension = _UNARY_SPEC_EXTENSIONS[module_name]
+            return _submit_prepared_into(
+                extension.prepare(spec_fn_name, a, out_dtype or a._dtype)
             )
-            return out
     try:
-        result = getattr(getattr(eager_kernels, module_name), spec_fn_name)(_spec_of(a))
+        extension = _UNARY_SPEC_EXTENSIONS[module_name]
+        return _submit_prepared_into(
+            extension.prepare(spec_fn_name, a, out_dtype or a._dtype), force_sync=True
+        )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
-    return _wrap_spec_result(result, out_dtype or a._dtype, a._device)
 
 
 def _try_spec_reduce(
@@ -1280,10 +1812,11 @@ def _try_spec_reduce(
     """Trailing-dims reduction through a spec op, or None. `a` is already a
     TorchMojoTensor (dtype promotion happened upstream); the spec op raises
     on non-trailing dims / strided input and the classic path takes over."""
+    dims = tuple(rdims)
+    extras = tuple(extra)
     if _call_queue.enabled():
         rule = _SPEC_REDUCE_INTO.get((module_name, spec_fn_name))
         rank = len(a._shape)
-        dims = [d for d in rdims]
         if (
             rule is not None
             and a._numel > 0
@@ -1293,21 +1826,21 @@ def _try_spec_reduce(
             and all(isinstance(d, int) and 0 <= d < rank for d in dims)
         ):
             odtype = rule[1] or out_dtype or a._dtype
-            out = _alloc(_reduced_shape(a._shape, dims, keepdim), odtype, a._device)
-            eager_kernels.queue_spec_into(
-                module_name,
-                spec_fn_name,
-                (_spec_of(a), tuple(dims), 1 if keepdim else 0, *extra, _spec_of(out)),
+            extension = _REDUCTION_SPEC_EXTENSIONS[module_name]
+            return _submit_prepared_into(
+                extension.prepare(spec_fn_name, a, dims, keepdim, extras, odtype)
             )
-            return out
     try:
-        result = getattr(getattr(eager_kernels, module_name), spec_fn_name)(
-            _spec_of(a), tuple(rdims), 1 if keepdim else 0, *extra
+        extension = _REDUCTION_SPEC_EXTENSIONS[module_name]
+        return _submit_prepared_into(
+            extension.prepare(
+                spec_fn_name, a, dims, keepdim, extras, out_dtype or a._dtype
+            ),
+            force_sync=True,
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
-    return _wrap_spec_result(result, out_dtype or a._dtype, a._device)
 
 
 def _wrap_spec_pair(result, dtype0, dtype1, device):
@@ -1382,30 +1915,73 @@ def _spec_matmul_out_shape(
     return (*a._shape[:-1], n)
 
 
+class _MatmulSpecExtension(
+    eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
+):
+    MOJO_FILE: ClassVar[Path] = _MatmulExtension.MOJO_FILE
+
+    @classmethod
+    def make_defines(
+        cls, op: str, tensors: tuple[MojoTensorLike, ...], transpose_b: int
+    ) -> dict[str, bool | int | str]:
+        defines = {
+            "OP": op,
+            "DTYPE_OUT": tensors[0]._dtype.name,
+            "TRANSPOSE_B": bool(transpose_b),
+        }
+        defines.update(
+            (f"DTYPE_ARG_{index}", tensor._dtype.name)
+            for index, tensor in enumerate(tensors)
+        )
+        return defines
+
+    @classmethod
+    def expected_output_specs(
+        cls, op: str, tensors: tuple[MojoTensorLike, ...], transpose_b: int
+    ) -> _TensorOutputSpec:
+        shape = _spec_matmul_out_shape(op, list(tensors), transpose_b)
+        if shape is None:
+            raise ValueError("matmul metadata is not eligible for the spec path")
+        return _TensorOutputSpec(tuple(shape), tensors[0]._dtype, tensors[0]._device)
+
+    @classmethod
+    def extension_args(
+        cls,
+        out: TorchMojoTensor,
+        op: str,
+        tensors: tuple[MojoTensorLike, ...],
+        transpose_b: int,
+    ) -> tuple[object, ...]:
+        return (*(_spec_of(tensor) for tensor in tensors), transpose_b, _spec_of(out))
+
+    @classmethod
+    def call_extension(
+        cls,
+        extension: ModuleType,
+        output_specs: _TensorOutputSpec,
+        op: str,
+        tensors: tuple[MojoTensorLike, ...],
+        transpose_b: int,
+    ) -> TorchMojoTensor:
+        out = _allocate_output_spec(output_specs)
+        extension.call(*cls.extension_args(out, op, tensors, transpose_b))
+        return out
+
+
 def _try_spec_matmul(spec_fn_name, tensors, transpose_b):
     """Matmul-family spec op over already-typed operands, or None. The spec
     raises on non-contiguous operands; the classic path materializes them."""
-    ts = [_t(x) for x in tensors]
+    ts = tuple(_t(x) for x in tensors)
     if any(t is None for t in ts):
         return None
-    if _call_queue.enabled():
-        out_shape = _spec_matmul_out_shape(spec_fn_name, ts, transpose_b)
-        if out_shape is not None:
-            out = _alloc(out_shape, ts[0]._dtype, ts[0]._device)
-            eager_kernels.queue_spec_into(
-                "matmul_ops",
-                spec_fn_name,
-                (*[_spec_of(t) for t in ts], transpose_b, _spec_of(out)),
-            )
-            return out
     try:
-        result = getattr(eager_kernels.matmul_ops, spec_fn_name)(
-            *[_spec_of(t) for t in ts], transpose_b
+        return _submit_prepared_into(
+            _MatmulSpecExtension.prepare(spec_fn_name, ts, transpose_b),
+            force_sync=not _call_queue.enabled(),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
-    return _wrap_spec_result(result, ts[0]._dtype, ts[0]._device)
 
 
 def _try_spec_scalar(spec_fn_name, x, scalar):
@@ -1413,22 +1989,22 @@ def _try_spec_scalar(spec_fn_name, x, scalar):
     if not isinstance(scalar, int | float) or isinstance(scalar, bool):
         return None
     a = _t(x)
-    if a is None:
+    if a is None or a._dtype not in _SPEC_FLOAT_DTYPES:
         return None
-    if _call_queue.enabled() and a._dtype in _SPEC_FLOAT_DTYPES:
-        out = _alloc(a._shape, a._dtype, a._device)
-        eager_kernels.queue_spec_into(
-            "elementwise_ops", spec_fn_name, (_spec_of(a), float(scalar), _spec_of(out))
-        )
-        return out
+    out = _alloc(a._shape, a._dtype, a._device)
     try:
-        result = getattr(eager_kernels.elementwise_ops, spec_fn_name)(
-            _spec_of(a), float(scalar)
+        _call_mojo(
+            _ElementwiseExtension,
+            spec_fn_name,
+            (_spec_of(a), float(scalar), _spec_of(out)),
+            arg_dtypes=(a._dtype,),
+            output_dtypes=(out._dtype,),
+            result_specs=_TensorOutputSpec(a._shape, a._dtype, a._device),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
-    return _wrap_spec_result(result, a._dtype, a._device)
+    return out
 
 
 def _try_spec_scalar_inplace(spec_fn_name: str, x, scalar) -> bool:
@@ -1444,7 +2020,14 @@ def _try_spec_scalar_inplace(spec_fn_name: str, x, scalar) -> bool:
     if a is None or not a._is_contiguous or a._dtype not in _FLOAT_DTYPES:
         return False
     try:
-        getattr(eager_kernels.elementwise_ops, spec_fn_name)(_spec_of(a), float(scalar))
+        _call_mojo(
+            _ElementwiseExtension,
+            spec_fn_name,
+            (_spec_of(a), float(scalar)),
+            arg_dtypes=(a._dtype,),
+            output_dtypes=(a._dtype,),
+            flags={"INPLACE": True},
+        )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return False
@@ -1456,22 +2039,22 @@ def _try_spec_int_scalar(spec_fn_name, x, scalar):
     if not isinstance(scalar, int) or isinstance(scalar, bool):
         return None
     a = _t(x)
-    if a is None:
+    if a is None or a._dtype not in (DType.int32, DType.int64):
         return None
-    if _call_queue.enabled() and a._dtype in (DType.int32, DType.int64):
-        out = _alloc(a._shape, a._dtype, a._device)
-        eager_kernels.queue_spec_into(
-            "elementwise_ops", spec_fn_name, (_spec_of(a), scalar, _spec_of(out))
-        )
-        return out
+    out = _alloc(a._shape, a._dtype, a._device)
     try:
-        result = getattr(eager_kernels.elementwise_ops, spec_fn_name)(
-            _spec_of(a), scalar
+        _call_mojo(
+            _ElementwiseExtension,
+            spec_fn_name,
+            (_spec_of(a), scalar, _spec_of(out)),
+            arg_dtypes=(a._dtype,),
+            output_dtypes=(out._dtype,),
+            result_specs=_TensorOutputSpec(a._shape, a._dtype, a._device),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
-    return _wrap_spec_result(result, a._dtype, a._device)
+    return out
 
 
 def _on_gpu(t: MojoTensorLike) -> bool:
@@ -1591,10 +2174,9 @@ def _bcast_meta(*tensors):
 
 def _scalar_tensor_0d(value, dtype, device) -> TorchMojoTensor:
     """A 0-d tensor holding `value`, for stride-0 broadcast operands."""
-    result = eager_kernels.elementwise_ops.FillSpec(
-        _pad8((), 1), 0, 1, float(value), dtype.value, _ctx_ptr(device)
+    return _submit_prepared_into(
+        _FillSpecExtension.prepare((), float(value), dtype, device)
     )
-    return _wrap_spec_result(result, dtype, device)
 
 
 def _cast_tensor(x: TorchMojoTensor, dtype: DType) -> TorchMojoTensor:
@@ -1605,14 +2187,7 @@ def _cast_tensor(x: TorchMojoTensor, dtype: DType) -> TorchMojoTensor:
     Call-queue mode uses the Into form: Python allocates the contiguous
     output, the launch queues (no drain/sync)."""
     t = _t(x)
-    if _call_queue.enabled() and x._dtype in _CAST_DTYPES and dtype in _CAST_DTYPES:
-        out = _alloc(t._shape, dtype, t._device)
-        eager_kernels.queue_spec_into(
-            "data_movement_ops", "CastSpec", (_spec_of(t), dtype.value, _spec_of(out))
-        )
-        return out
-    result = eager_kernels.data_movement_ops.CastSpec(_spec_of(t), dtype.value)
-    return _wrap_spec_result(result, dtype, x._device)
+    return _submit_prepared_into(_CastSpecExtension.prepare(t, dtype))
 
 
 def _promoted_pair(a: TorchMojoTensor, b: TorchMojoTensor):
@@ -1663,15 +2238,26 @@ def _resolve_scalar(value, dtype: DType, device) -> TorchMojoTensor | None:
     return _scalar_tensor_0d(v, dtype, device)
 
 
-def _launch_bcast(kernel, out, operands, meta, dtype):
+def _launch_where_bcast(
+    out: TorchMojoTensor,
+    operands: tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor],
+    meta: tuple[list[int], list[int], list[list[int]]],
+    dtype: DType,
+) -> None:
     out_shape, dims, strides = meta
     params = tuple(dims) + tuple(s for st in strides for s in st)
-    kernel(
-        out._ptr,
-        *[t._ptr for t in operands],
-        params,
-        dtype.value,
-        _ctx_ptr(out._device),
+    _call_mojo(
+        _DataMovementExtension,
+        "WhereSelect",
+        (
+            out._ptr,
+            *[tensor._ptr for tensor in operands],
+            params,
+            dtype.value,
+            _ctx_ptr(out._device),
+        ),
+        arg_dtypes=tuple(tensor._dtype for tensor in operands),
+        output_dtypes=(out._dtype,),
     )
 
 
@@ -1731,8 +2317,20 @@ def fast_aten_add_apple(input, other, alpha=1):
     ):
         out = _alloc(a._shape, a._dtype, a._device)
         if a._numel > 0:
-            eager_kernels.elementwise_ops.Add(
-                out._ptr, a._ptr, b._ptr, a._numel, a._dtype.value, _ctx_ptr(a._device)
+            _call_mojo(
+                _ElementwiseExtension,
+                "Add",
+                (
+                    out._ptr,
+                    a._ptr,
+                    b._ptr,
+                    a._numel,
+                    a._dtype.value,
+                    _ctx_ptr(a._device),
+                ),
+                arg_dtypes=(a._dtype, b._dtype),
+                output_dtypes=(out._dtype,),
+                flags={"INPLACE": False},
             )
         return out
     return _fast_aten_add_default(input, other, alpha)
@@ -1756,13 +2354,20 @@ def fast_aten_add_(input, other, alpha=1):
         and dst._device == b._device
     ):
         if dst._numel > 0:
-            eager_kernels.elementwise_ops.Add(
-                dst._ptr,
-                dst._ptr,
-                b._ptr,
-                dst._numel,
-                dst._dtype.value,
-                _ctx_ptr(dst._device),
+            _call_mojo(
+                _ElementwiseExtension,
+                "Add",
+                (
+                    dst._ptr,
+                    dst._ptr,
+                    b._ptr,
+                    dst._numel,
+                    dst._dtype.value,
+                    _ctx_ptr(dst._device),
+                ),
+                arg_dtypes=(dst._dtype, b._dtype),
+                output_dtypes=(dst._dtype,),
+                flags={"INPLACE": True},
             )
         return input
     # A float scalar goes straight into `input`, with no output buffer and no
@@ -2099,12 +2704,19 @@ def fast_aten_gelu(input, approximate="none"):
     if a is not None and a._dtype == DType.bfloat16 and _on_gpu(a) and a._is_contiguous:
         out = _alloc(a._shape, a._dtype, a._device)
         if out._numel > 0:
-            eager_kernels.activation_forward_ops.GeluForwardBF16(
-                out._ptr,
-                a._ptr,
-                out._numel,
-                int(approximate == "tanh"),
-                _ctx_ptr(a._device),
+            _call_mojo(
+                _ActivationForwardExtension,
+                "GeluForwardBF16",
+                (
+                    out._ptr,
+                    a._ptr,
+                    out._numel,
+                    int(approximate == "tanh"),
+                    _ctx_ptr(a._device),
+                ),
+                arg_dtypes=(a._dtype,),
+                output_dtypes=(out._dtype,),
+                flags={"APPROXIMATE": approximate},
             )
         return out
     return _unary_spec_op(spec, input)
@@ -2131,18 +2743,21 @@ def fast_aten_gelu_backward(grad_output, self, *, approximate="none"):
     input = _tc(input)
     out = _alloc(input._shape, dtype, input._device)
     if out._numel > 0:
-        kernel = (
-            eager_kernels.activation_backward_ops.GeluBackwardBF16
-            if dtype == DType.bfloat16
-            else eager_kernels.activation_backward_ops.GeluBackwardF32
-        )
-        kernel(
-            out._ptr,
-            grad._ptr,
-            input._ptr,
-            out._numel,
-            int(approximate == "tanh"),
-            _ctx_ptr(input._device),
+        op = "GeluBackwardBF16" if dtype == DType.bfloat16 else "GeluBackwardF32"
+        _call_mojo(
+            _ActivationBackwardExtension,
+            op,
+            (
+                out._ptr,
+                grad._ptr,
+                input._ptr,
+                out._numel,
+                int(approximate == "tanh"),
+                _ctx_ptr(input._device),
+            ),
+            arg_dtypes=(grad._dtype, input._dtype),
+            output_dtypes=(out._dtype,),
+            flags={"APPROXIMATE": approximate},
         )
     return out
 
@@ -2219,13 +2834,18 @@ def fast_aten_bitwise_not(input):
         return fast_aten_logical_not(a)
     out = _alloc(a._shape, a._dtype, a._device)
     if out._numel > 0:
-        eager_kernels.logic_ops.BitwiseNot(
-            out._ptr, a._ptr, out._numel, a._dtype.value, _ctx_ptr(a._device)
+        _call_mojo(
+            _LogicExtension,
+            "BitwiseNot",
+            (out._ptr, a._ptr, out._numel, a._dtype.value, _ctx_ptr(a._device)),
+            arg_dtypes=(a._dtype,),
+            output_dtypes=(out._dtype,),
         )
     return out
 
 
 def fast_aten_isin(elements, test_elements, *, assume_unique=False, invert=False):
+    del assume_unique
     el = _tc(elements)
     te = _tc(test_elements)
     if (
@@ -2241,15 +2861,22 @@ def fast_aten_isin(elements, test_elements, *, assume_unique=False, invert=False
         return fast_filled(el._shape, 1.0 if invert else 0.0, DType.bool, el._device)
     out = _alloc(el._shape, DType.bool, el._device)
     if el._numel > 0:
-        eager_kernels.logic_ops.IsIn(
-            out._ptr,
-            el._ptr,
-            te._ptr,
-            el._numel,
-            te._numel,
-            1 if invert else 0,
-            el._dtype.value,
-            _ctx_ptr(el._device),
+        _call_mojo(
+            _LogicExtension,
+            "IsIn",
+            (
+                out._ptr,
+                el._ptr,
+                te._ptr,
+                el._numel,
+                te._numel,
+                1 if invert else 0,
+                el._dtype.value,
+                _ctx_ptr(el._device),
+            ),
+            arg_dtypes=(el._dtype, te._dtype),
+            output_dtypes=(out._dtype,),
+            flags={"INVERT": bool(invert)},
         )
     return out
 
@@ -2295,26 +2922,15 @@ def _try_logical(spec_fn_name, input, other):
         return None
     if a._dtype not in _CAST_DTYPES or b._dtype not in _CAST_DTYPES:
         return None
-    keep_a = keep_b = None
     try:
-        if a._dtype == DType.bool:
-            spec_a = _spec_of(a)
-        else:
-            keep_a, spec_a, _, _ = eager_kernels.data_movement_ops.CastSpec(
-                _spec_of(a), DType.bool.value
-            )
-        if b._dtype == DType.bool:
-            spec_b = _spec_of(b)
-        else:
-            keep_b, spec_b, _, _ = eager_kernels.data_movement_ops.CastSpec(
-                _spec_of(b), DType.bool.value
-            )
-        result = getattr(eager_kernels.logic_ops, spec_fn_name)(spec_a, spec_b)
+        bool_a = a if a._dtype == DType.bool else _cast_tensor(a, DType.bool)
+        bool_b = b if b._dtype == DType.bool else _cast_tensor(b, DType.bool)
+        return _submit_prepared_into(
+            _BinarySpecExtension.prepare(spec_fn_name, bool_a, bool_b, DType.bool)
+        )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
-    _ = keep_a, keep_b  # intermediates must outlive the enqueued launch
-    return _wrap_spec_result(result, DType.bool, a._device)
 
 
 def fast_aten_logical_and(input, other):
@@ -2346,16 +2962,23 @@ def fast_aten_clamp(input, min=None, max=None):
     hi = float(max) if has_max else 0.0
     out = _alloc(a._shape, a._dtype, a._device)
     if out._numel > 0:
-        eager_kernels.logic_ops.ClampScalar(
-            out._ptr,
-            a._ptr,
-            lo,
-            hi,
-            1 if has_min else 0,
-            1 if has_max else 0,
-            out._numel,
-            a._dtype.value,
-            _ctx_ptr(a._device),
+        _call_mojo(
+            _LogicExtension,
+            "ClampScalar",
+            (
+                out._ptr,
+                a._ptr,
+                lo,
+                hi,
+                1 if has_min else 0,
+                1 if has_max else 0,
+                out._numel,
+                a._dtype.value,
+                _ctx_ptr(a._device),
+            ),
+            arg_dtypes=(a._dtype,),
+            output_dtypes=(out._dtype,),
+            flags={"HAS_MIN": has_min, "HAS_MAX": has_max},
         )
     return out
 
@@ -2392,15 +3015,21 @@ def _try_addc(kernel_name, self, tensor1, tensor2, value, allow_int):
     out = _alloc(out_shape, dtype, a._device)
     if out._numel > 0:
         params = tuple(dims) + tuple(s for st in strides for s in st)
-        getattr(eager_kernels.logic_ops, kernel_name)(
-            out._ptr,
-            a._ptr,
-            b._ptr,
-            c._ptr,
-            params,
-            float(value),
-            dtype.value,
-            _ctx_ptr(a._device),
+        _call_mojo(
+            _LogicExtension,
+            kernel_name,
+            (
+                out._ptr,
+                a._ptr,
+                b._ptr,
+                c._ptr,
+                params,
+                float(value),
+                dtype.value,
+                _ctx_ptr(a._device),
+            ),
+            arg_dtypes=(a._dtype, b._dtype, c._dtype),
+            output_dtypes=(out._dtype,),
         )
     return out
 
@@ -2448,13 +3077,7 @@ def fast_aten_where(condition, input, other):
         return NOT_HANDLED
     out = _alloc(meta[0], a._dtype, a._device)
     if out._numel > 0:
-        _launch_bcast(
-            eager_kernels.data_movement_ops.WhereSelect,
-            out,
-            (cond, a, b),
-            meta,
-            a._dtype,
-        )
+        _launch_where_bcast(out, (cond, a, b), meta, a._dtype)
     return out
 
 
@@ -2503,13 +3126,7 @@ def fast_aten_masked_fill(input, mask, value):
     a, m, val, meta = resolved
     out = _alloc(a._shape, a._dtype, a._device)
     if out._numel > 0:
-        _launch_bcast(
-            eager_kernels.data_movement_ops.WhereSelect,
-            out,
-            (m, val, a),
-            meta,
-            a._dtype,
-        )
+        _launch_where_bcast(out, (m, val, a), meta, a._dtype)
     return out
 
 
@@ -2523,13 +3140,7 @@ def fast_aten_masked_fill_(input, mask, value):
         if a._is_contiguous:
             # Writing out == a is safe: each element reads and writes the
             # same index (a's strides are the output layout).
-            _launch_bcast(
-                eager_kernels.data_movement_ops.WhereSelect,
-                a,
-                (m, val, a),
-                meta,
-                a._dtype,
-            )
+            _launch_where_bcast(a, (m, val, a), meta, a._dtype)
         else:
             result = fast_aten_masked_fill(input, mask, value)
             if result is NOT_HANDLED:
@@ -2926,9 +3537,18 @@ def fast_aten_cat(tensors, dim=0):
         # over the grid cap, CPU device) -> per-input copy loop below.
         len1 = ins[0]._shape[dim] * inner
         len2 = ins[1]._shape[dim] * inner
-        if len1 > 0 and len2 > 0:
-            try:
-                eager_kernels.data_movement_ops.Cat2(
+        if (
+            first._device.api != "cpu"
+            and 0 < outer <= 65535
+            and len1 > 0
+            and len2 > 0
+            and len1 % 4 == 0
+            and len2 % 4 == 0
+        ):
+            _call_mojo(
+                _DataMovementExtension,
+                "Cat2",
+                (
                     out._ptr,
                     ins[0]._ptr,
                     ins[1]._ptr,
@@ -2937,10 +3557,11 @@ def fast_aten_cat(tensors, dim=0):
                     len2,
                     out._itemsize,
                     ctx,
-                )
-                return out
-            except NotImplementedError:
-                pass
+                ),
+                arg_dtypes=(ins[0]._dtype, ins[1]._dtype),
+                output_dtypes=(out._dtype,),
+            )
+            return out
     if (
         len(ins) == 3
         and first._device.api == "metal"
@@ -2953,9 +3574,15 @@ def fast_aten_cat(tensors, dim=0):
         # bubbles. Raises (row lengths not vector-aligned, outer over the
         # grid cap) -> per-input copy loop below.
         lens = [b._shape[dim] * inner for b in ins]
-        if all(n > 0 for n in lens):
-            try:
-                eager_kernels.data_movement_ops.Cat3(
+        if (
+            0 < outer <= 65535
+            and all(n > 0 for n in lens)
+            and all(n % 4 == 0 for n in lens)
+        ):
+            _call_mojo(
+                _DataMovementExtension,
+                "Cat3",
+                (
                     out._ptr,
                     ins[0]._ptr,
                     ins[1]._ptr,
@@ -2966,24 +3593,31 @@ def fast_aten_cat(tensors, dim=0):
                     lens[2],
                     out._itemsize,
                     ctx,
-                )
-                return out
-            except NotImplementedError:
-                pass
+                ),
+                arg_dtypes=tuple(tensor._dtype for tensor in ins),
+                output_dtypes=(out._dtype,),
+            )
+            return out
     offset = 0
     for b in ins:
         copy_len = b._shape[dim] * inner
         if copy_len > 0 and outer > 0:
             if b._is_contiguous:
-                eager_kernels.data_movement_ops.NarrowCopyDst(
-                    out._ptr,
-                    b._ptr,
-                    outer,
-                    dst_stride,
-                    copy_len,
-                    offset,
-                    out._itemsize,
-                    ctx,
+                _call_mojo(
+                    _DataMovementExtension,
+                    "NarrowCopyDst",
+                    (
+                        out._ptr,
+                        b._ptr,
+                        outer,
+                        dst_stride,
+                        copy_len,
+                        offset,
+                        out._itemsize,
+                        ctx,
+                    ),
+                    arg_dtypes=(b._dtype,),
+                    output_dtypes=(out._dtype,),
                 )
             else:
                 # Strided input (e.g. the new-token K/V head-transpose in a
@@ -3039,8 +3673,12 @@ def _try_stack_scalars(
     ):
         return None
     out = _alloc((len(unwrapped),), DType.float32, device)
-    eager_kernels.optimizer_ops.ForeachGatherScalars(
-        tuple(tensor._ptr for tensor in unwrapped), out._ptr, _ctx_ptr(device)
+    _call_mojo(
+        _OptimizerExtension,
+        "ForeachGatherScalars",
+        (tuple(tensor._ptr for tensor in unwrapped), out._ptr, _ctx_ptr(device)),
+        arg_dtypes=(DType.float32,),
+        output_dtypes=(out._dtype,),
     )
     return out
 
@@ -3085,14 +3723,20 @@ def fast_aten_repeat(input, repeats):
     padded_strides = _row_major_strides(padded_shape)
     out = _alloc(out_shape, t._dtype, t._device)
     if out._numel > 0:
-        eager_kernels.data_movement_ops.TileCopy(
-            out._ptr,
-            t._ptr,
-            _pad8(out_shape, 1),
-            _pad8(padded_shape, 1),
-            _pad8(padded_strides, 0),
-            out._itemsize,
-            _ctx_ptr(t._device),
+        _call_mojo(
+            _DataMovementExtension,
+            "TileCopy",
+            (
+                out._ptr,
+                t._ptr,
+                _pad8(out_shape, 1),
+                _pad8(padded_shape, 1),
+                _pad8(padded_strides, 0),
+                out._itemsize,
+                _ctx_ptr(t._device),
+            ),
+            arg_dtypes=(t._dtype,),
+            output_dtypes=(out._dtype,),
         )
     return out
 
@@ -3110,16 +3754,23 @@ def _fast_triangular(input, diagonal, upper):
         rows = t._shape[-2]
         cols = t._shape[-1]
         batch = t._numel // (rows * cols)
-        eager_kernels.data_movement_ops.TriangularCopy(
-            out._ptr,
-            t._ptr,
-            batch,
-            rows,
-            cols,
-            diagonal,
-            upper,
-            out._itemsize,
-            _ctx_ptr(t._device),
+        _call_mojo(
+            _DataMovementExtension,
+            "TriangularCopy",
+            (
+                out._ptr,
+                t._ptr,
+                batch,
+                rows,
+                cols,
+                diagonal,
+                upper,
+                out._itemsize,
+                _ctx_ptr(t._device),
+            ),
+            arg_dtypes=(t._dtype,),
+            output_dtypes=(out._dtype,),
+            flags={"UPPER": bool(upper)},
         )
     return out
 
@@ -3156,16 +3807,22 @@ def fast_aten_index(input, indices):
         out_shape = tuple(idx_c._shape) + tuple(src._shape[1:])
         out = _alloc(out_shape, src._dtype, src._device)
         if out._numel > 0:
-            eager_kernels.data_movement_ops.GatherRows(
-                out._ptr,
-                src._ptr,
-                idx_c._ptr,
-                idx_c._dtype.value,
-                idx_c._numel,
-                row_len,
-                src._shape[0],
-                out._itemsize,
-                _ctx_ptr(src._device),
+            _call_mojo(
+                _DataMovementExtension,
+                "GatherRows",
+                (
+                    out._ptr,
+                    src._ptr,
+                    idx_c._ptr,
+                    idx_c._dtype.value,
+                    idx_c._numel,
+                    row_len,
+                    src._shape[0],
+                    out._itemsize,
+                    _ctx_ptr(src._device),
+                ),
+                arg_dtypes=(src._dtype, idx_c._dtype),
+                output_dtypes=(out._dtype,),
             )
         return out
 
@@ -3240,15 +3897,26 @@ def _fast_scatter(input, dim, index, src, value):
         + (dim_padded,)
     )
     if idx_c._numel > 0:
-        eager_kernels.data_movement_ops.ScatterDim(
-            out._ptr,
-            idx_c._ptr,
-            src_ptr,
-            params,
-            is_value,
-            value_f,
-            a._dtype.value,
-            _ctx_ptr(a._device),
+        _call_mojo(
+            _DataMovementExtension,
+            "ScatterDim",
+            (
+                out._ptr,
+                idx_c._ptr,
+                src_ptr,
+                params,
+                is_value,
+                value_f,
+                a._dtype.value,
+                _ctx_ptr(a._device),
+            ),
+            arg_dtypes=(
+                a._dtype,
+                idx_c._dtype,
+                s._dtype if src is not None else a._dtype,
+            ),
+            output_dtypes=(out._dtype,),
+            flags={"VALUE_MODE": bool(is_value)},
         )
     return out
 
@@ -3302,27 +3970,43 @@ def fast_aten_nonzero(input):
 def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, eps):
     a = _t(input)
     stats = [_t(x) for x in (running_mean, running_var, weight, bias)]
-    if a is not None and all(s is not None for s in stats):
-        try:
-            result = eager_kernels.nn_ops.BatchNormSpec(
+    if (
+        a is not None
+        and all(stat is not None for stat in stats)
+        and a._dtype in _FLOAT_DTYPES
+        and len(a._shape) >= 2
+        and a._numel > 0
+        and a._is_contiguous
+        and all(
+            stat._device == a._device
+            and stat._dtype == a._dtype
+            and stat._is_contiguous
+            for stat in stats
+        )
+    ):
+        out = _alloc(a._shape, a._dtype, a._device)
+        _call_mojo(
+            _NNExtension,
+            "BatchNormSpec",
+            (
                 _spec_of(a),
                 _spec_of(stats[0]),
                 _spec_of(stats[1]),
                 _spec_of(stats[2]),
                 _spec_of(stats[3]),
                 float(eps),
-            )
-        except Exception as exc:
-            _raise_if_device_oom(exc)
-            pass
-        else:
-            out = _wrap_spec_result(result, a._dtype, a._device)
-            # Inference mode returns empty (0,) tensors for the saved stats.
-            return (
-                out,
-                _alloc((0,), a._dtype, a._device),
-                _alloc((0,), a._dtype, a._device),
-            )
+                _spec_of(out),
+            ),
+            arg_dtypes=(a._dtype, *(stat._dtype for stat in stats)),
+            output_dtypes=(out._dtype,),
+            result_specs=_TensorOutputSpec(a._shape, a._dtype, a._device),
+        )
+        # Inference mode returns empty (0,) tensors for the saved stats.
+        return (
+            out,
+            _alloc((0,), a._dtype, a._device),
+            _alloc((0,), a._dtype, a._device),
+        )
     a = _tc(input)
     if a is None or a._dtype not in _FLOAT_DTYPES or len(a._shape) < 2:
         return NOT_HANDLED
@@ -3335,16 +4019,28 @@ def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, e
     channels = a._shape[1]
     inner = math.prod(a._shape[2:])
     out = _alloc(a._shape, a._dtype, a._device)
-    eager_kernels.nn_ops.BatchNormInference(
-        out._ptr,
-        a._ptr,
-        mean_t._ptr,
-        var_t._ptr,
-        gamma_t._ptr,
-        beta_t._ptr,
-        (float(eps), channels, inner, a._numel),
-        a._dtype.value,
-        _ctx_ptr(a._device),
+    _call_mojo(
+        _NNExtension,
+        "BatchNormInference",
+        (
+            out._ptr,
+            a._ptr,
+            mean_t._ptr,
+            var_t._ptr,
+            gamma_t._ptr,
+            beta_t._ptr,
+            (float(eps), channels, inner, a._numel),
+            a._dtype.value,
+            _ctx_ptr(a._device),
+        ),
+        arg_dtypes=(
+            a._dtype,
+            mean_t._dtype,
+            var_t._dtype,
+            gamma_t._dtype,
+            beta_t._dtype,
+        ),
+        output_dtypes=(out._dtype,),
     )
     # Inference mode returns empty (0,) tensors for the saved stats.
     return (out, _alloc((0,), a._dtype, a._device), _alloc((0,), a._dtype, a._device))
@@ -3423,20 +4119,25 @@ def fast_aten_native_dropout(input, p, train):
     a = _tc(a)
     output = _alloc(a._shape, DType.float32, a._device)
     mask = _alloc(a._shape, DType.bool, a._device)
-    kernel = eager_kernels.dropout_ops.NativeDropoutF32
     seed, base_offset = _reserve_philox_state(a._torch_device, (a._numel + 3) // 4)
     word_mask = (1 << 32) - 1
-    kernel(
-        output._ptr,
-        mask._ptr,
-        a._ptr,
-        a._numel,
-        p,
-        seed & word_mask,
-        (seed >> 32) & word_mask,
-        base_offset & word_mask,
-        (base_offset >> 32) & word_mask,
-        _ctx_ptr(a._device),
+    _call_mojo(
+        _DropoutExtension,
+        "NativeDropoutF32",
+        (
+            output._ptr,
+            mask._ptr,
+            a._ptr,
+            a._numel,
+            p,
+            seed & word_mask,
+            (seed >> 32) & word_mask,
+            base_offset & word_mask,
+            (base_offset >> 32) & word_mask,
+            _ctx_ptr(a._device),
+        ),
+        arg_dtypes=(a._dtype,),
+        output_dtypes=(output._dtype, mask._dtype),
     )
     return output, mask
 
@@ -3461,14 +4162,19 @@ def fast_aten_native_dropout_backward(grad_output, mask, scale):
     keep = _tc(keep)
     grad_input = _alloc(grad._shape, DType.float32, grad._device)
     if grad._numel > 0:
-        kernel = eager_kernels.dropout_ops.NativeDropoutBackwardF32
-        kernel(
-            grad_input._ptr,
-            grad._ptr,
-            keep._ptr,
-            grad._numel,
-            float(scale),
-            _ctx_ptr(grad._device),
+        _call_mojo(
+            _DropoutExtension,
+            "NativeDropoutBackwardF32",
+            (
+                grad_input._ptr,
+                grad._ptr,
+                keep._ptr,
+                grad._numel,
+                float(scale),
+                _ctx_ptr(grad._device),
+            ),
+            arg_dtypes=(grad._dtype, keep._dtype),
+            output_dtypes=(grad_input._dtype,),
         )
     return grad_input
 
@@ -3532,19 +4238,30 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
     # zero pointer is safe because the runtime flags prevent any corresponding
     # device load; this avoids allocating and filling synthetic ones/zeros.
     if a._dtype == DType.float32 and _on_gpu(a):
-        eager_kernels.normalization_forward_ops.LayerNormForwardF32(
-            out._ptr,
-            mean._ptr,
-            rstd._ptr,
-            a._ptr,
-            gamma._ptr if weight is not None else 0,
-            beta._ptr if bias is not None else 0,
-            rows,
-            cols,
-            eps_value,
-            int(weight is not None),
-            int(bias is not None),
-            _ctx_ptr(a._device),
+        _call_mojo(
+            _NormalizationForwardExtension,
+            "LayerNormForwardF32",
+            (
+                out._ptr,
+                mean._ptr,
+                rstd._ptr,
+                a._ptr,
+                gamma._ptr if weight is not None else 0,
+                beta._ptr if bias is not None else 0,
+                rows,
+                cols,
+                eps_value,
+                int(weight is not None),
+                int(bias is not None),
+                _ctx_ptr(a._device),
+            ),
+            arg_dtypes=(
+                a._dtype,
+                gamma._dtype if gamma is not None else a._dtype,
+                beta._dtype if beta is not None else a._dtype,
+            ),
+            output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
+            flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
         )
         return out, mean, rstd
 
@@ -3552,16 +4269,23 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
         gamma = fast_filled((cols,), 1.0, a._dtype, a._device)
     if bias is None:
         beta = fast_filled((cols,), 0.0, a._dtype, a._device)
-    eager_kernels.nn_ops.LayerNorm(
-        out._ptr,
-        mean._ptr,
-        rstd._ptr,
-        a._ptr,
-        gamma._ptr,
-        beta._ptr,
-        (eps_value, rows, cols),
-        a._dtype.value,
-        _ctx_ptr(a._device),
+    _call_mojo(
+        _NNExtension,
+        "LayerNorm",
+        (
+            out._ptr,
+            mean._ptr,
+            rstd._ptr,
+            a._ptr,
+            gamma._ptr,
+            beta._ptr,
+            (eps_value, rows, cols),
+            a._dtype.value,
+            _ctx_ptr(a._device),
+        ),
+        arg_dtypes=(a._dtype, gamma._dtype, beta._dtype),
+        output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
+        flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
     )
     return out, mean, rstd
 
@@ -3668,19 +4392,36 @@ def fast_aten_native_layer_norm_backward(
     )
     grad_bias = _alloc(normalized_shape, DType.float32, a._device) if mask[2] else None
     mask_bits = int(mask[0]) | (int(mask[1]) << 1) | (int(mask[2]) << 2)
-    eager_kernels.normalization_backward_ops.LayerNormBackwardF32(
-        grad_input._ptr if grad_input is not None else 0,
-        grad_weight._ptr if grad_weight is not None else 0,
-        grad_bias._ptr if grad_bias is not None else 0,
-        grad._ptr,
-        a._ptr,
-        saved_mean._ptr,
-        saved_rstd._ptr,
-        gamma._ptr if gamma is not None else 0,
-        rows,
-        cols,
-        mask_bits,
-        _ctx_ptr(a._device),
+    _call_mojo(
+        _NormalizationBackwardExtension,
+        "LayerNormBackwardF32",
+        (
+            grad_input._ptr if grad_input is not None else 0,
+            grad_weight._ptr if grad_weight is not None else 0,
+            grad_bias._ptr if grad_bias is not None else 0,
+            grad._ptr,
+            a._ptr,
+            saved_mean._ptr,
+            saved_rstd._ptr,
+            gamma._ptr if gamma is not None else 0,
+            rows,
+            cols,
+            mask_bits,
+            _ctx_ptr(a._device),
+        ),
+        arg_dtypes=(
+            grad._dtype,
+            a._dtype,
+            saved_mean._dtype,
+            saved_rstd._dtype,
+            gamma._dtype if gamma is not None else a._dtype,
+        ),
+        output_dtypes=(
+            grad_input._dtype if grad_input is not None else a._dtype,
+            grad_weight._dtype if grad_weight is not None else a._dtype,
+            grad_bias._dtype if grad_bias is not None else a._dtype,
+        ),
+        flags={"OUTPUT_MASK": mask_bits},
     )
     return grad_input, grad_weight, grad_bias
 
@@ -3870,32 +4611,15 @@ def fast_aten_min_dim(input, dim, keepdim=False):
     rank = len(a._shape)
     if rank == 0 or not -rank <= dim < rank:
         return NOT_HANDLED
+    rdim = dim % rank
     if _call_queue.enabled() and a._numel > 0 and a._dtype in _SPEC_ROWRED_INTO:
-        rdim = dim % rank
-        oshape = _reduced_shape(a._shape, (rdim,), keepdim)
-        values = _alloc(oshape, a._dtype, a._device)
-        indices = _alloc(oshape, DType.int64, a._device)
-        eager_kernels.queue_spec_into(
-            "reduction_ops",
-            "MinDimSpec",
-            (
-                _spec_of(a),
-                (rdim,),
-                1 if keepdim else 0,
-                _spec_of(values),
-                _spec_of(indices),
-            ),
-        )
-        return values, indices
+        return _submit_min_dim(_MinDimSpecExtension.prepare(a, rdim, bool(keepdim)))
     try:
-        result = eager_kernels.reduction_ops.MinDimSpec(
-            _spec_of(a), (dim % rank,), 1 if keepdim else 0
+        return _submit_min_dim(
+            _MinDimSpecExtension.prepare(a, rdim, bool(keepdim)), force_sync=True
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
-        result = None
-    if result is not None:
-        return _wrap_spec_pair(result, a._dtype, DType.int64, a._device)
     return NOT_HANDLED
 
 
@@ -3965,10 +4689,13 @@ def _any_all(input, dim, keepdim, is_all):
         c = _tc(a)
         if 0 < c._numel < (1 << 22):
             out = _alloc((), DType.bool, a._device)
-            fn = (
-                eager_kernels.nn_ops.AllBool if is_all else eager_kernels.nn_ops.AnyBool
+            _call_mojo(
+                _NNExtension,
+                "AllBool" if is_all else "AnyBool",
+                (out._ptr, c._ptr, c._numel, _ctx_ptr(a._device)),
+                arg_dtypes=(c._dtype,),
+                output_dtypes=(out._dtype,),
             )
-            fn(out._ptr, c._ptr, c._numel, _ctx_ptr(a._device))
             return out
     rdims = _norm_reduce_dims(dim, rank, empty_is_all=False)
     if rdims is None:
@@ -4089,14 +4816,20 @@ def fast_aten__log_softmax_backward_data(
             if rows < 2**31:
                 grad_input = _alloc(grad._shape, target_dtype, grad._device)
                 if grad_input._ptr % 16 == 0:
-                    eager_kernels.softmax_backward_ops.LogSoftmaxBackwardData(
-                        grad_input._ptr,
-                        grad._ptr,
-                        saved_output._ptr,
-                        rows,
-                        cols,
-                        grad._dtype.value,
-                        _ctx_ptr(grad._device),
+                    _call_mojo(
+                        _SoftmaxBackwardExtension,
+                        "LogSoftmaxBackwardData",
+                        (
+                            grad_input._ptr,
+                            grad._ptr,
+                            saved_output._ptr,
+                            rows,
+                            cols,
+                            grad._dtype.value,
+                            _ctx_ptr(grad._device),
+                        ),
+                        arg_dtypes=(grad._dtype, saved_output._dtype),
+                        output_dtypes=(grad_input._dtype,),
                     )
                     return grad_input
                 # Unaligned fresh allocation (never expected): fall through
@@ -4217,16 +4950,23 @@ def fast_aten_nll_loss_forward_output(
             fast_aten_fill__scalar(write_output, math.nan if reduction == 1 else 0.0)
     else:
         labels_c = _tc(labels)
-        eager_kernels.loss_ops.NllLossForwardF32(
-            write_output._ptr,
-            write_total_weight._ptr,
-            log_probs._ptr,
-            labels_c._ptr,
-            rows,
-            classes,
-            reduction,
-            ignore_index,
-            _ctx_ptr(log_probs._device),
+        _call_mojo(
+            _LossExtension,
+            "NllLossForwardF32",
+            (
+                write_output._ptr,
+                write_total_weight._ptr,
+                log_probs._ptr,
+                labels_c._ptr,
+                rows,
+                classes,
+                reduction,
+                ignore_index,
+                _ctx_ptr(log_probs._device),
+            ),
+            arg_dtypes=(log_probs._dtype, labels_c._dtype),
+            output_dtypes=(write_output._dtype, write_total_weight._dtype),
+            flags={"REDUCTION": reduction},
         )
 
     if write_output is not output:
@@ -4278,16 +5018,23 @@ def fast_aten_nll_loss_backward_grad_input(
         labels_c = _tc(labels)
         grad_c = _tc(grad)
         weight_sum_c = _tc(weight_sum)
-        eager_kernels.loss_ops.NllLossBackwardF32(
-            write_grad_input._ptr,
-            grad_c._ptr,
-            labels_c._ptr,
-            weight_sum_c._ptr,
-            rows,
-            classes,
-            reduction,
-            ignore_index,
-            _ctx_ptr(log_probs._device),
+        _call_mojo(
+            _LossExtension,
+            "NllLossBackwardF32",
+            (
+                write_grad_input._ptr,
+                grad_c._ptr,
+                labels_c._ptr,
+                weight_sum_c._ptr,
+                rows,
+                classes,
+                reduction,
+                ignore_index,
+                _ctx_ptr(log_probs._device),
+            ),
+            arg_dtypes=(grad_c._dtype, labels_c._dtype, weight_sum_c._dtype),
+            output_dtypes=(write_grad_input._dtype,),
+            flags={"REDUCTION": reduction},
         )
 
     if write_grad_input is not grad_input:
@@ -4355,13 +5102,19 @@ def fast_aten_max_pool2d_with_indices(
         if out_h > 0 and out_w > 0:
             out = _alloc((n, c, out_h, out_w), a._dtype, a._device)
             indices = _alloc((n, c, out_h, out_w), DType.int64, a._device)
-            eager_kernels.nn_ops.MaxPool2dWithIndices(
-                out._ptr,
-                indices._ptr,
-                a._ptr,
-                (in_h, in_w, out_h, out_w, kh, kw, sh, sw, ph, pw, dh, dw, n * c),
-                a._dtype.value,
-                _ctx_ptr(a._device),
+            _call_mojo(
+                _NNExtension,
+                "MaxPool2dWithIndices",
+                (
+                    out._ptr,
+                    indices._ptr,
+                    a._ptr,
+                    (in_h, in_w, out_h, out_w, kh, kw, sh, sw, ph, pw, dh, dw, n * c),
+                    a._dtype.value,
+                    _ctx_ptr(a._device),
+                ),
+                arg_dtypes=(a._dtype,),
+                output_dtypes=(out._dtype, indices._dtype),
             )
             return out, indices
     return NOT_HANDLED
@@ -4407,26 +5160,36 @@ def fast_aten_avg_pool2d(
         if out_h > 0 and out_w > 0:
             out = _alloc((n, c, out_h, out_w), a._dtype, a._device)
             div = divisor_override if divisor_override is not None else 0
-            eager_kernels.nn_ops.AvgPool2d(
-                out._ptr,
-                a._ptr,
+            _call_mojo(
+                _NNExtension,
+                "AvgPool2d",
                 (
-                    in_h,
-                    in_w,
-                    out_h,
-                    out_w,
-                    kh,
-                    kw,
-                    sh,
-                    sw,
-                    ph,
-                    pw,
-                    1 if count_include_pad else 0,
-                    div,
-                    n * c,
+                    out._ptr,
+                    a._ptr,
+                    (
+                        in_h,
+                        in_w,
+                        out_h,
+                        out_w,
+                        kh,
+                        kw,
+                        sh,
+                        sw,
+                        ph,
+                        pw,
+                        1 if count_include_pad else 0,
+                        div,
+                        n * c,
+                    ),
+                    a._dtype.value,
+                    _ctx_ptr(a._device),
                 ),
-                a._dtype.value,
-                _ctx_ptr(a._device),
+                arg_dtypes=(a._dtype,),
+                output_dtypes=(out._dtype,),
+                flags={
+                    "COUNT_INCLUDE_PAD": count_include_pad,
+                    "HAS_DIVISOR_OVERRIDE": divisor_override is not None,
+                },
             )
             return out
     return NOT_HANDLED
@@ -4446,12 +5209,18 @@ def fast_aten__adaptive_avg_pool2d(input, output_size):
         out_h, out_w = osize
         if out_h > 0 and out_w > 0:
             out = _alloc((n, c, out_h, out_w), a._dtype, a._device)
-            eager_kernels.nn_ops.AdaptiveAvgPool2d(
-                out._ptr,
-                a._ptr,
-                (in_h, in_w, out_h, out_w, n * c),
-                a._dtype.value,
-                _ctx_ptr(a._device),
+            _call_mojo(
+                _NNExtension,
+                "AdaptiveAvgPool2d",
+                (
+                    out._ptr,
+                    a._ptr,
+                    (in_h, in_w, out_h, out_w, n * c),
+                    a._dtype.value,
+                    _ctx_ptr(a._device),
+                ),
+                arg_dtypes=(a._dtype,),
+                output_dtypes=(out._dtype,),
             )
             return out
     return NOT_HANDLED
@@ -4497,16 +5266,23 @@ def fast_aten_native_group_norm(input, weight, bias, N, C, HxW, group, eps):
         out = _alloc(a._shape, a._dtype, a._device)
         mean = _alloc((N, group), DType.float32, a._device)
         rstd = _alloc((N, group), DType.float32, a._device)
-        eager_kernels.nn_ops.GroupNorm(
-            out._ptr,
-            mean._ptr,
-            rstd._ptr,
-            a._ptr,
-            gamma._ptr,
-            beta._ptr,
-            (float(eps), rows, cols, HxW, group, cpg),
-            a._dtype.value,
-            _ctx_ptr(a._device),
+        _call_mojo(
+            _NNExtension,
+            "GroupNorm",
+            (
+                out._ptr,
+                mean._ptr,
+                rstd._ptr,
+                a._ptr,
+                gamma._ptr,
+                beta._ptr,
+                (float(eps), rows, cols, HxW, group, cpg),
+                a._dtype.value,
+                _ctx_ptr(a._device),
+            ),
+            arg_dtypes=(a._dtype, gamma._dtype, beta._dtype),
+            output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
+            flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
         )
         return out, mean, rstd
     return NOT_HANDLED
@@ -4539,21 +5315,28 @@ def fast_aten_upsample_bilinear2d(
             ratio_h = _area_pixel_scale(in_h, out_h, align_corners, scales_h)
             ratio_w = _area_pixel_scale(in_w, out_w, align_corners, scales_w)
             out = _alloc((n, c, out_h, out_w), a._dtype, a._device)
-            eager_kernels.nn_ops.UpsampleBilinear2d(
-                out._ptr,
-                a._ptr,
+            _call_mojo(
+                _NNExtension,
+                "UpsampleBilinear2d",
                 (
-                    float(ratio_h),
-                    float(ratio_w),
-                    in_h,
-                    in_w,
-                    out_h,
-                    out_w,
-                    n * c,
-                    1 if align_corners else 0,
+                    out._ptr,
+                    a._ptr,
+                    (
+                        float(ratio_h),
+                        float(ratio_w),
+                        in_h,
+                        in_w,
+                        out_h,
+                        out_w,
+                        n * c,
+                        1 if align_corners else 0,
+                    ),
+                    a._dtype.value,
+                    _ctx_ptr(a._device),
                 ),
-                a._dtype.value,
-                _ctx_ptr(a._device),
+                arg_dtypes=(a._dtype,),
+                output_dtypes=(out._dtype,),
+                flags={"ALIGN_CORNERS": bool(align_corners)},
             )
             return out
     return NOT_HANDLED
@@ -4596,26 +5379,36 @@ def _try_sdpa_causal_bmm(
     batch, m, k = a._shape
     n = b._shape[1] if transpose_b else b._shape[2]
     inner = b._shape[2] if transpose_b else b._shape[1]
-    if inner != k or min(batch, m, n, k) <= 0:
-        return None
-    try:
-        causal_bmm = eager_kernels.matmul_ops.CausalBmm
-    except (AttributeError, ImportError):
+    mode_supported = causal_mode == SDPA_CAUSAL_OUT or (
+        not transpose_b and causal_mode in (SDPA_CAUSAL_A_ROWS, SDPA_CAUSAL_B_COLS)
+    )
+    if (
+        inner != k
+        or batch <= 1
+        or m < 64
+        or n < 64
+        or n % 32 != 0
+        or k % 32 != 0
+        or a._device.architecture_name != "gfx942"
+        or not mode_supported
+    ):
         return None
     out = _alloc((batch, m, n), a._dtype, a._device)
-    try:
-        causal_bmm(
+    _call_mojo(
+        _MatmulExtension,
+        "CausalBmm",
+        (
             out._ptr,
             a._ptr,
             b._ptr,
             (batch, m, n, k, int(bool(transpose_b)), int(causal_mode)),
             a._dtype.value,
             _ctx_ptr(a._device),
-        )
-    except NotImplementedError:
-        # The bridge validates its own arguments and signals refusal this way.
-        # Discard the output so the caller's dense chain allocates a fresh one.
-        return None
+        ),
+        arg_dtypes=(a._dtype, b._dtype),
+        output_dtypes=(out._dtype,),
+        flags={"TRANSPOSE_B": transpose_b, "CAUSAL_MODE": causal_mode},
+    )
     return out
 
 
@@ -4678,8 +5471,20 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
     metal_causal = bool(is_causal) and on_metal
     if metal_causal:
         scores = _alloc((b * h, q_len, kv_len), q._dtype, q._device)
-        eager_kernels.matmul_ops.BmmCausalF32(
-            scores._ptr, q._ptr, k._ptr, (b * h, q_len, kv_len, head_dim, 1, 1), dt, ctx
+        _call_mojo(
+            _MatmulExtension,
+            "BmmCausalF32",
+            (
+                scores._ptr,
+                q._ptr,
+                k._ptr,
+                (b * h, q_len, kv_len, head_dim, 1, 1),
+                dt,
+                ctx,
+            ),
+            arg_dtypes=(q._dtype, k._dtype),
+            output_dtypes=(scores._dtype,),
+            flags={"TRANSPOSE_B": True, "CAUSAL_MODE": SDPA_CAUSAL_OUT},
         )
     else:
         # Off Metal, SDPA_CAUSAL_OUT would skip the fully masked output tiles
@@ -4694,13 +5499,20 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
             scores = _try_tf32_bmm(q3, k3, transpose_b=True)
         if scores is None:
             scores = _alloc((b * h, q_len, kv_len), q._dtype, q._device)
-            eager_kernels.matmul_ops.Bmm(
-                scores._ptr,
-                q._ptr,
-                k._ptr,
-                (b * h, q_len, kv_len, head_dim, 1),
-                dt,
-                ctx,
+            _call_mojo(
+                _MatmulExtension,
+                "Bmm",
+                (
+                    scores._ptr,
+                    q._ptr,
+                    k._ptr,
+                    (b * h, q_len, kv_len, head_dim, 1),
+                    dt,
+                    ctx,
+                ),
+                arg_dtypes=(q._dtype, k._dtype),
+                output_dtypes=(scores._dtype,),
+                flags={"TRANSPOSE_B": True},
             )
     probs = _alloc((b * h, q_len, kv_len), q._dtype, q._device)
     # Fused softmax + dropout (Apple f32): one launch writes the pre-dropout
@@ -4725,37 +5537,51 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
         numel = b * h * q_len * kv_len
         seed, base_offset = _reserve_philox_state(q._torch_device, (numel + 3) // 4)
         word_mask = (1 << 32) - 1
-        eager_kernels.nn_ops.SoftmaxRowsDropoutF32(
-            probs._ptr,
-            pdrop._ptr,
-            drop_mask._ptr,
-            scores._ptr,
-            b * h * q_len,
-            kv_len,
-            float(scale_val),
-            1 if is_causal else 0,
-            q_len,
-            float(dropout_p),
-            seed & word_mask,
-            (seed >> 32) & word_mask,
-            base_offset & word_mask,
-            (base_offset >> 32) & word_mask,
-            ctx,
+        _call_mojo(
+            _NNExtension,
+            "SoftmaxRowsDropoutF32",
+            (
+                probs._ptr,
+                pdrop._ptr,
+                drop_mask._ptr,
+                scores._ptr,
+                b * h * q_len,
+                kv_len,
+                float(scale_val),
+                1 if is_causal else 0,
+                q_len,
+                float(dropout_p),
+                seed & word_mask,
+                (seed >> 32) & word_mask,
+                base_offset & word_mask,
+                (base_offset >> 32) & word_mask,
+                ctx,
+            ),
+            arg_dtypes=(scores._dtype,),
+            output_dtypes=(probs._dtype, pdrop._dtype, drop_mask._dtype),
+            flags={"CAUSAL": bool(is_causal)},
         )
         del scores
         effective_probs = pdrop
         dropout_mask = drop_mask
     else:
-        eager_kernels.nn_ops.SoftmaxRows(
-            probs._ptr,
-            scores._ptr,
-            b * h * q_len,
-            kv_len,
-            float(scale_val),
-            1 if is_causal else 0,
-            q_len,
-            dt,
-            ctx,
+        _call_mojo(
+            _NNExtension,
+            "SoftmaxRows",
+            (
+                probs._ptr,
+                scores._ptr,
+                b * h * q_len,
+                kv_len,
+                float(scale_val),
+                1 if is_causal else 0,
+                q_len,
+                dt,
+                ctx,
+            ),
+            arg_dtypes=(scores._dtype,),
+            output_dtypes=(probs._dtype,),
+            flags={"CAUSAL": bool(is_causal)},
         )
         # All allocations use stream-ordered lifetime management, so releasing
         # the host reference here cannot recycle scores before SoftmaxRows
@@ -4785,13 +5611,20 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
 
     if metal_causal:
         out = _alloc((b * h, q_len, head_dim), q._dtype, q._device)
-        eager_kernels.matmul_ops.BmmCausalF32(
-            out._ptr,
-            effective_probs._ptr,
-            v._ptr,
-            (b * h, q_len, head_dim, kv_len, 0, 2),
-            dt,
-            ctx,
+        _call_mojo(
+            _MatmulExtension,
+            "BmmCausalF32",
+            (
+                out._ptr,
+                effective_probs._ptr,
+                v._ptr,
+                (b * h, q_len, head_dim, kv_len, 0, 2),
+                dt,
+                ctx,
+            ),
+            arg_dtypes=(effective_probs._dtype, v._dtype),
+            output_dtypes=(out._dtype,),
+            flags={"TRANSPOSE_B": False, "CAUSAL_MODE": SDPA_CAUSAL_A_ROWS},
         )
     else:
         out = None
@@ -4806,13 +5639,20 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
             out = _try_tf32_bmm(effective_probs, v3)
         if out is None:
             out = _alloc((b * h, q_len, head_dim), q._dtype, q._device)
-            eager_kernels.matmul_ops.Bmm(
-                out._ptr,
-                effective_probs._ptr,
-                v._ptr,
-                (b * h, q_len, head_dim, kv_len, 0),
-                dt,
-                ctx,
+            _call_mojo(
+                _MatmulExtension,
+                "Bmm",
+                (
+                    out._ptr,
+                    effective_probs._ptr,
+                    v._ptr,
+                    (b * h, q_len, head_dim, kv_len, 0),
+                    dt,
+                    ctx,
+                ),
+                arg_dtypes=(effective_probs._dtype, v._dtype),
+                output_dtypes=(out._dtype,),
+                flags={"TRANSPOSE_B": False},
             )
     # P_drop is not saved: backward cheaply reconstructs it from P and the bool
     # mask, avoiding one persistent f32 (B,H,L,S) allocation per layer.
@@ -5271,18 +6111,25 @@ def fast_fused_flash_attention_forward(
     scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
     output = _alloc_bthd(batch, heads, seq_q, head_dim, q._dtype, q._device)
     lse = _alloc((batch, heads, seq_q), DType.float32, q._device)
-    eager_kernels.flash_attention_ops.FlashAttentionForward(
-        output._ptr,
-        lse._ptr,
-        q._ptr,
-        k._ptr,
-        v._ptr,
-        (batch, heads, seq_q, seq_kv, head_dim),
-        _fa_strides(q) + _fa_strides(k) + _fa_strides(v) + _fa_strides(output),
-        scale_val,
-        1 if is_causal else 0,
-        q._dtype.value,
-        _ctx_ptr(q._device),
+    _call_mojo(
+        _FlashAttentionExtension,
+        "FlashAttentionForward",
+        (
+            output._ptr,
+            lse._ptr,
+            q._ptr,
+            k._ptr,
+            v._ptr,
+            (batch, heads, seq_q, seq_kv, head_dim),
+            _fa_strides(q) + _fa_strides(k) + _fa_strides(v) + _fa_strides(output),
+            scale_val,
+            1 if is_causal else 0,
+            q._dtype.value,
+            _ctx_ptr(q._device),
+        ),
+        arg_dtypes=(q._dtype, k._dtype, v._dtype),
+        output_dtypes=(output._dtype, lse._dtype),
+        flags={"CAUSAL": bool(is_causal)},
     )
     return output, lse, q, k, v
 
@@ -5329,29 +6176,36 @@ def fast_fused_flash_attention_backward(
     grad_query = _alloc_bthd(batch, heads, seq_q, head_dim, q._dtype, q._device)
     grad_key = _alloc_bthd(batch, heads, seq_kv, head_dim, q._dtype, q._device)
     grad_value = _alloc_bthd(batch, heads, seq_kv, head_dim, q._dtype, q._device)
-    eager_kernels.flash_attention_ops.FlashAttentionBackward(
-        grad_query._ptr,
-        grad_key._ptr,
-        grad_value._ptr,
-        g._ptr,
-        q._ptr,
-        k._ptr,
-        v._ptr,
-        o._ptr,
-        l._ptr,
-        (batch, heads, seq_q, seq_kv, head_dim),
-        _fa_strides(g)
-        + _fa_strides(q)
-        + _fa_strides(k)
-        + _fa_strides(v)
-        + _fa_strides(o)
-        + _fa_strides(grad_query)
-        + _fa_strides(grad_key)
-        + _fa_strides(grad_value),
-        scale_val,
-        1 if is_causal else 0,
-        q._dtype.value,
-        _ctx_ptr(q._device),
+    _call_mojo(
+        _FlashAttentionExtension,
+        "FlashAttentionBackward",
+        (
+            grad_query._ptr,
+            grad_key._ptr,
+            grad_value._ptr,
+            g._ptr,
+            q._ptr,
+            k._ptr,
+            v._ptr,
+            o._ptr,
+            l._ptr,
+            (batch, heads, seq_q, seq_kv, head_dim),
+            _fa_strides(g)
+            + _fa_strides(q)
+            + _fa_strides(k)
+            + _fa_strides(v)
+            + _fa_strides(o)
+            + _fa_strides(grad_query)
+            + _fa_strides(grad_key)
+            + _fa_strides(grad_value),
+            scale_val,
+            1 if is_causal else 0,
+            q._dtype.value,
+            _ctx_ptr(q._device),
+        ),
+        arg_dtypes=(g._dtype, q._dtype, k._dtype, v._dtype, o._dtype, l._dtype),
+        output_dtypes=(grad_query._dtype, grad_key._dtype, grad_value._dtype),
+        flags={"CAUSAL": bool(is_causal)},
     )
     return grad_query, grad_key, grad_value
 
@@ -5606,15 +6460,9 @@ def fast_sdpa_dropout_softmax_backward(
         return NOT_HANDLED
 
     # The Fable-owned production kernel is ported separately from this host
-    # wiring.  Keep the eager decomposition usable while that optional module
-    # is absent, and resolve it before materializing inputs or allocating an
-    # output so a missing bridge has no device-side cost.
+    # wiring. Keep the eager decomposition usable while that optional module
+    # is absent.
     if not all(path.is_file() for path in _SDPA_BACKWARD_SOURCE_PATHS):
-        return NOT_HANDLED
-    try:
-        sdpa_backward_ops = eager_kernels.sdpa_backward_ops
-        fused_backward = sdpa_backward_ops.SDPADropoutSoftmaxBackward
-    except (AttributeError, ImportError):
         return NOT_HANDLED
 
     # In the no-dropout path the scale is semantically dead.  Canonicalizing
@@ -5633,20 +6481,27 @@ def fast_sdpa_dropout_softmax_backward(
 
     rows = math.prod(probs._shape[:-1])
     cols = probs._shape[-1]
-    fused_backward(
-        out._ptr,
-        probs._ptr,
-        grad._ptr,
-        mask._ptr if has_mask else 0,
-        rows,
-        cols,
-        int(query_length) if is_causal else 0,
-        int(has_mask),
-        int(bool(is_causal)),
-        bridge_dropout_scale,
-        bridge_score_scale,
-        probs._dtype.value,
-        _ctx_ptr(probs._device),
+    _call_mojo(
+        _SdpaBackwardExtension,
+        "SDPADropoutSoftmaxBackward",
+        (
+            out._ptr,
+            probs._ptr,
+            grad._ptr,
+            mask._ptr if has_mask else 0,
+            rows,
+            cols,
+            int(query_length) if is_causal else 0,
+            int(has_mask),
+            int(bool(is_causal)),
+            bridge_dropout_scale,
+            bridge_score_scale,
+            probs._dtype.value,
+            _ctx_ptr(probs._device),
+        ),
+        arg_dtypes=(probs._dtype, grad._dtype) + ((mask._dtype,) if has_mask else ()),
+        output_dtypes=(out._dtype,),
+        flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
     )
     return out
 
@@ -5749,13 +6604,6 @@ def fast_sdpa_backward(
 
     if not all(path.is_file() for path in _SDPA_BACKWARD_SOURCE_PATHS):
         return NOT_HANDLED
-    try:
-        sdpa_backward_ops = eager_kernels.sdpa_backward_ops
-        fused_softmax_backward = sdpa_backward_ops.SDPADropoutSoftmaxBackwardF32
-        trans_a_gemm = sdpa_backward_ops.SDPATransAGemmF32
-        matmul_ops = eager_kernels.matmul_ops
-    except (AttributeError, ImportError):
-        return NOT_HANDLED
 
     bridge_dropout_scale = float(dropout_scale) if has_mask else 1.0
     causal = 1 if is_causal else 0
@@ -5770,14 +6618,22 @@ def fast_sdpa_backward(
     grad_value = None
     if need_value:
         grad_value = _alloc(kv3_shape, DType.float32, device)
-        trans_a_gemm(
-            grad_value._ptr,
-            probs._ptr,
-            grad._ptr,
-            mask._ptr if has_mask else 0,
-            (batch_heads, kv_len, head_dim, q_len, int(has_mask), causal),
-            bridge_dropout_scale,
-            ctx,
+        _call_mojo(
+            _SdpaBackwardExtension,
+            "SDPATransAGemmF32",
+            (
+                grad_value._ptr,
+                probs._ptr,
+                grad._ptr,
+                mask._ptr if has_mask else 0,
+                (batch_heads, kv_len, head_dim, q_len, int(has_mask), causal),
+                bridge_dropout_scale,
+                ctx,
+            ),
+            arg_dtypes=(probs._dtype, grad._dtype)
+            + ((mask._dtype,) if has_mask else ()),
+            output_dtypes=(grad_value._dtype,),
+            flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
         )
 
     grad_query = None
@@ -5786,73 +6642,116 @@ def fast_sdpa_backward(
         v = _tc(_t(value))
         grad_probs = _alloc((batch_heads, q_len, kv_len), DType.float32, device)
         if causal:
-            matmul_ops.BmmCausalF32(
-                grad_probs._ptr,
-                grad._ptr,
-                v._ptr,
-                (batch_heads, q_len, kv_len, head_dim, 1, 1),
-                dt,
-                ctx,
+            _call_mojo(
+                _MatmulExtension,
+                "BmmCausalF32",
+                (
+                    grad_probs._ptr,
+                    grad._ptr,
+                    v._ptr,
+                    (batch_heads, q_len, kv_len, head_dim, 1, 1),
+                    dt,
+                    ctx,
+                ),
+                arg_dtypes=(grad._dtype, v._dtype),
+                output_dtypes=(grad_probs._dtype,),
+                flags={"TRANSPOSE_B": True, "CAUSAL_MODE": SDPA_CAUSAL_OUT},
             )
         else:
-            matmul_ops.Bmm(
-                grad_probs._ptr,
-                grad._ptr,
-                v._ptr,
-                (batch_heads, q_len, kv_len, head_dim, 1),
-                dt,
-                ctx,
+            _call_mojo(
+                _MatmulExtension,
+                "Bmm",
+                (
+                    grad_probs._ptr,
+                    grad._ptr,
+                    v._ptr,
+                    (batch_heads, q_len, kv_len, head_dim, 1),
+                    dt,
+                    ctx,
+                ),
+                arg_dtypes=(grad._dtype, v._dtype),
+                output_dtypes=(grad_probs._dtype,),
+                flags={"TRANSPOSE_B": True},
             )
         del v
         grad_scores = _alloc((batch_heads, q_len, kv_len), DType.float32, device)
-        fused_softmax_backward(
-            grad_scores._ptr,
-            probs._ptr,
-            grad_probs._ptr,
-            mask._ptr if has_mask else 0,
-            batch_heads * q_len,
-            kv_len,
-            int(has_mask),
-            bridge_dropout_scale,
-            float(score_scale),
-            causal,
-            q_len,
-            ctx,
+        _call_mojo(
+            _SdpaBackwardExtension,
+            "SDPADropoutSoftmaxBackwardF32",
+            (
+                grad_scores._ptr,
+                probs._ptr,
+                grad_probs._ptr,
+                mask._ptr if has_mask else 0,
+                batch_heads * q_len,
+                kv_len,
+                int(has_mask),
+                bridge_dropout_scale,
+                float(score_scale),
+                causal,
+                q_len,
+                ctx,
+            ),
+            arg_dtypes=(probs._dtype, grad_probs._dtype)
+            + ((mask._dtype,) if has_mask else ()),
+            output_dtypes=(grad_scores._dtype,),
+            flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
         )
         del grad_probs
         if need_query:
             k = _tc(_t(key))
             grad_query = _alloc(q3_shape, DType.float32, device)
             if causal:
-                matmul_ops.BmmCausalF32(
-                    grad_query._ptr,
-                    grad_scores._ptr,
-                    k._ptr,
-                    (batch_heads, q_len, head_dim, kv_len, 0, 2),
-                    dt,
-                    ctx,
+                _call_mojo(
+                    _MatmulExtension,
+                    "BmmCausalF32",
+                    (
+                        grad_query._ptr,
+                        grad_scores._ptr,
+                        k._ptr,
+                        (batch_heads, q_len, head_dim, kv_len, 0, 2),
+                        dt,
+                        ctx,
+                    ),
+                    arg_dtypes=(grad_scores._dtype, k._dtype),
+                    output_dtypes=(grad_query._dtype,),
+                    flags={"TRANSPOSE_B": False, "CAUSAL_MODE": SDPA_CAUSAL_A_ROWS},
                 )
             else:
-                matmul_ops.Bmm(
-                    grad_query._ptr,
-                    grad_scores._ptr,
-                    k._ptr,
-                    (batch_heads, q_len, head_dim, kv_len, 0),
-                    dt,
-                    ctx,
+                _call_mojo(
+                    _MatmulExtension,
+                    "Bmm",
+                    (
+                        grad_query._ptr,
+                        grad_scores._ptr,
+                        k._ptr,
+                        (batch_heads, q_len, head_dim, kv_len, 0),
+                        dt,
+                        ctx,
+                    ),
+                    arg_dtypes=(grad_scores._dtype, k._dtype),
+                    output_dtypes=(grad_query._dtype,),
+                    flags={"TRANSPOSE_B": False},
                 )
             del k
         if need_key:
             q = _tc(_t(query))
             grad_key = _alloc(kv3_shape, DType.float32, device)
-            trans_a_gemm(
-                grad_key._ptr,
-                grad_scores._ptr,
-                q._ptr,
-                0,
-                (batch_heads, kv_len, head_dim, q_len, 0, causal),
-                1.0,
-                ctx,
+            _call_mojo(
+                _SdpaBackwardExtension,
+                "SDPATransAGemmF32",
+                (
+                    grad_key._ptr,
+                    grad_scores._ptr,
+                    q._ptr,
+                    0,
+                    (batch_heads, kv_len, head_dim, q_len, 0, causal),
+                    1.0,
+                    ctx,
+                ),
+                arg_dtypes=(grad_scores._dtype, q._dtype),
+                output_dtypes=(grad_key._dtype,),
+                flags={"HAS_MASK": False, "CAUSAL": bool(is_causal)},
             )
             del q
         del grad_scores
@@ -5903,56 +6802,14 @@ def _tf32_dense_batched_layout(tensor: MojoTensorLike) -> tuple[bool, int] | Non
     return physical_transpose, batch_stride
 
 
-def _resolve_bf16_bridge(name: str):
-    """Resolve a BF16 bridge without compiling a known-incomplete module."""
-    global _BF16_IMPORT_FAILED
-
-    if _BF16_IMPORT_FAILED:
-        return None
-    module = eager_kernels.__dict__.get("bf16_matmul_ops")
-    if module is None:
-        if not all(path.is_file() for path in _BF16_SOURCE_PATHS):
-            return None
-        try:
-            module = eager_kernels.bf16_matmul_ops
-        except (AttributeError, ImportError):
-            _BF16_IMPORT_FAILED = True
-            return None
-    try:
-        return getattr(module, name)
-    except ImportError:
-        # Per-op units build at attribute access: an ImportError here is a
-        # compiler/extension failure, permanent for this process.
-        _BF16_IMPORT_FAILED = True
-        return None
-    except AttributeError:
-        return None
+def _bf16_bridge_available() -> bool:
+    """Whether the optional BF16 bridge and all of its sources are present."""
+    return all(path.is_file() for path in _BF16_SOURCE_PATHS)
 
 
-def _resolve_tf32_bridge(name: str):
-    """Resolve a TF32 bridge without compiling a known-incomplete module."""
-    global _TF32_IMPORT_FAILED
-
-    if _TF32_IMPORT_FAILED:
-        return None
-    module = eager_kernels.__dict__.get("tf32_matmul_ops")
-    if module is None:
-        if not all(path.is_file() for path in _TF32_SOURCE_PATHS):
-            return None
-        try:
-            module = eager_kernels.tf32_matmul_ops
-        except (AttributeError, ImportError):
-            _TF32_IMPORT_FAILED = True
-            return None
-    try:
-        return getattr(module, name)
-    except ImportError:
-        # Per-op units build at attribute access: an ImportError here is a
-        # compiler/extension failure, permanent for this process.
-        _TF32_IMPORT_FAILED = True
-        return None
-    except AttributeError:
-        return None
+def _tf32_bridge_available() -> bool:
+    """Whether the optional TF32 bridge and all of its sources are present."""
+    return all(path.is_file() for path in _TF32_SOURCE_PATHS)
 
 
 def _try_bf16_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
@@ -6002,22 +6859,29 @@ def _try_bf16_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         or math.prod(logical_output_shape) != m * n
     ):
         return None
-    bridge = _resolve_bf16_bridge("Bf16GemmBF16")
-    if bridge is None:
+    if not _bf16_bridge_available():
         return None
     out = _alloc(logical_output_shape, DType.bfloat16, lhs._device)
-    bridge(
-        out._ptr,
-        lhs._ptr,
-        rhs._ptr,
-        bias_tensor._ptr if bias_tensor is not None else out._ptr,
-        m,
-        n,
-        k,
-        int(lhs_layout),
-        int(rhs_layout) ^ int(bool(transpose_b)),
-        int(bias_tensor is not None),
-        _ctx_ptr(lhs._device),
+    _call_mojo(
+        _Bf16MatmulExtension,
+        "Bf16GemmBF16",
+        (
+            out._ptr,
+            lhs._ptr,
+            rhs._ptr,
+            bias_tensor._ptr if bias_tensor is not None else out._ptr,
+            m,
+            n,
+            k,
+            int(lhs_layout),
+            int(rhs_layout) ^ int(bool(transpose_b)),
+            int(bias_tensor is not None),
+            _ctx_ptr(lhs._device),
+        ),
+        arg_dtypes=(lhs._dtype, rhs._dtype)
+        + ((bias_tensor._dtype,) if bias_tensor is not None else ()),
+        output_dtypes=(out._dtype,),
+        flags={"TRANSPOSE_B": bool(transpose_b), "HAS_BIAS": bias_tensor is not None},
     )
     return out
 
@@ -6071,22 +6935,29 @@ def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         or math.prod(logical_output_shape) != m * n
     ):
         return None
-    bridge = _resolve_tf32_bridge("Tf32GemmF32")
-    if bridge is None:
+    if not _tf32_bridge_available():
         return None
     out = _alloc(logical_output_shape, DType.float32, lhs._device)
-    bridge(
-        out._ptr,
-        lhs._ptr,
-        rhs._ptr,
-        bias_tensor._ptr if bias_tensor is not None else out._ptr,
-        m,
-        n,
-        k,
-        int(lhs_layout),
-        int(rhs_layout) ^ int(bool(transpose_b)),
-        int(bias_tensor is not None),
-        _ctx_ptr(lhs._device),
+    _call_mojo(
+        _Tf32MatmulExtension,
+        "Tf32GemmF32",
+        (
+            out._ptr,
+            lhs._ptr,
+            rhs._ptr,
+            bias_tensor._ptr if bias_tensor is not None else out._ptr,
+            m,
+            n,
+            k,
+            int(lhs_layout),
+            int(rhs_layout) ^ int(bool(transpose_b)),
+            int(bias_tensor is not None),
+            _ctx_ptr(lhs._device),
+        ),
+        arg_dtypes=(lhs._dtype, rhs._dtype)
+        + ((bias_tensor._dtype,) if bias_tensor is not None else ()),
+        output_dtypes=(out._dtype,),
+        flags={"TRANSPOSE_B": bool(transpose_b), "HAS_BIAS": bias_tensor is not None},
     )
     return out
 
@@ -6121,24 +6992,30 @@ def _try_bf16_bmm(a, b, *, transpose_b=False):
     lhs_transposed, lhs_batch_stride = lhs_layout
     rhs_transposed, rhs_batch_stride = rhs_layout
     output_batch_stride = m * n
-    bridge = _resolve_bf16_bridge("Bf16BmmBF16")
-    if bridge is None:
+    if not _bf16_bridge_available():
         return None
     out = _alloc((batch, m, n), DType.bfloat16, lhs._device)
-    bridge(
-        out._ptr,
-        lhs._ptr,
-        rhs._ptr,
-        batch,
-        m,
-        n,
-        k,
-        output_batch_stride,
-        lhs_batch_stride,
-        rhs_batch_stride,
-        int(lhs_transposed),
-        int(rhs_transposed) ^ int(bool(transpose_b)),
-        _ctx_ptr(lhs._device),
+    _call_mojo(
+        _Bf16MatmulExtension,
+        "Bf16BmmBF16",
+        (
+            out._ptr,
+            lhs._ptr,
+            rhs._ptr,
+            batch,
+            m,
+            n,
+            k,
+            output_batch_stride,
+            lhs_batch_stride,
+            rhs_batch_stride,
+            int(lhs_transposed),
+            int(rhs_transposed) ^ int(bool(transpose_b)),
+            _ctx_ptr(lhs._device),
+        ),
+        arg_dtypes=(lhs._dtype, rhs._dtype),
+        output_dtypes=(out._dtype,),
+        flags={"TRANSPOSE_B": bool(transpose_b)},
     )
     return out
 
@@ -6181,24 +7058,30 @@ def _try_tf32_bmm(a, b, *, transpose_b=False):
     lhs_transposed, lhs_batch_stride = lhs_layout
     rhs_transposed, rhs_batch_stride = rhs_layout
     output_batch_stride = m * n
-    bridge = _resolve_tf32_bridge("Tf32BmmF32")
-    if bridge is None:
+    if not _tf32_bridge_available():
         return None
     out = _alloc((batch, m, n), DType.float32, lhs._device)
-    bridge(
-        out._ptr,
-        lhs._ptr,
-        rhs._ptr,
-        batch,
-        m,
-        n,
-        k,
-        output_batch_stride,
-        lhs_batch_stride,
-        rhs_batch_stride,
-        int(lhs_transposed),
-        int(rhs_transposed) ^ int(bool(transpose_b)),
-        _ctx_ptr(lhs._device),
+    _call_mojo(
+        _Tf32MatmulExtension,
+        "Tf32BmmF32",
+        (
+            out._ptr,
+            lhs._ptr,
+            rhs._ptr,
+            batch,
+            m,
+            n,
+            k,
+            output_batch_stride,
+            lhs_batch_stride,
+            rhs_batch_stride,
+            int(lhs_transposed),
+            int(rhs_transposed) ^ int(bool(transpose_b)),
+            _ctx_ptr(lhs._device),
+        ),
+        arg_dtypes=(lhs._dtype, rhs._dtype),
+        output_dtypes=(out._dtype,),
+        flags={"TRANSPOSE_B": bool(transpose_b)},
     )
     return out
 
@@ -6531,23 +7414,51 @@ def fast_aten_convolution(
                 col_ptr = a._ptr
             else:
                 col = _alloc((n, ckk, cols), a._dtype, a._device)
-                eager_kernels.conv_ops.Im2col(
-                    col._ptr,
-                    a._ptr,
-                    (in_h, in_w, out_h, out_w, kh, kw, sh, sw, ph, pw, dh, dw, c, n),
-                    a._dtype.value,
-                    ctx,
+                _call_mojo(
+                    _ConvExtension,
+                    "Im2col",
+                    (
+                        col._ptr,
+                        a._ptr,
+                        (
+                            in_h,
+                            in_w,
+                            out_h,
+                            out_w,
+                            kh,
+                            kw,
+                            sh,
+                            sw,
+                            ph,
+                            pw,
+                            dh,
+                            dw,
+                            c,
+                            n,
+                        ),
+                        a._dtype.value,
+                        ctx,
+                    ),
+                    arg_dtypes=(a._dtype,),
+                    output_dtypes=(col._dtype,),
                 )
                 col_ptr = col._ptr
             out = _alloc((n, out_c, cols), a._dtype, a._device)
             if groups == 1:
-                eager_kernels.matmul_ops.Bmm(
-                    out._ptr,
-                    w._ptr,
-                    col_ptr,
-                    (n, out_c, cols, ckk, 0, 1),  # a_shared=1: broadcast weights
-                    a._dtype.value,
-                    ctx,
+                _call_mojo(
+                    _MatmulExtension,
+                    "Bmm",
+                    (
+                        out._ptr,
+                        w._ptr,
+                        col_ptr,
+                        (n, out_c, cols, ckk, 0, 1),
+                        a._dtype.value,
+                        ctx,
+                    ),
+                    arg_dtypes=(w._dtype, a._dtype),
+                    output_dtypes=(out._dtype,),
+                    flags={"TRANSPOSE_B": False, "A_SHARED": True},
                 )
             else:
                 # Channel-major im2col rows make each group a contiguous
@@ -6556,29 +7467,42 @@ def fast_aten_convolution(
                 oc_g = out_c // groups
                 for s in range(n):
                     for g in range(groups):
-                        eager_kernels.matmul_ops.Matmul(
-                            out._ptr,
-                            w._ptr,
-                            col_ptr,
+                        _call_mojo(
+                            _MatmulExtension,
+                            "Matmul",
                             (
-                                oc_g,
-                                cols,
-                                crs_g,
-                                0,
-                                (s * out_c + g * oc_g) * cols,
-                                g * oc_g * crs_g,
-                                (s * c + g * c_per_group) * kh * kw * cols,
+                                out._ptr,
+                                w._ptr,
+                                col_ptr,
+                                (
+                                    oc_g,
+                                    cols,
+                                    crs_g,
+                                    0,
+                                    (s * out_c + g * oc_g) * cols,
+                                    g * oc_g * crs_g,
+                                    (s * c + g * c_per_group) * kh * kw * cols,
+                                ),
+                                a._dtype.value,
+                                ctx,
                             ),
-                            a._dtype.value,
-                            ctx,
+                            arg_dtypes=(w._dtype, a._dtype),
+                            output_dtypes=(out._dtype,),
+                            flags={"TRANSPOSE_B": False},
                         )
             if bias_t is not None:
-                eager_kernels.conv_ops.BiasAddChan(
-                    out._ptr,
-                    bias_t._ptr,
-                    (cols, out_c, n * out_c * cols),
-                    a._dtype.value,
-                    ctx,
+                _call_mojo(
+                    _ConvExtension,
+                    "BiasAddChan",
+                    (
+                        out._ptr,
+                        bias_t._ptr,
+                        (cols, out_c, n * out_c * cols),
+                        a._dtype.value,
+                        ctx,
+                    ),
+                    arg_dtypes=(out._dtype, bias_t._dtype),
+                    output_dtypes=(out._dtype,),
                 )
             return _view_of(
                 out,
@@ -6651,8 +7575,6 @@ def fast_aten_scaled_dot_product_attention(
         b, h, q_len, head_dim = q._shape
         kv_len = k._shape[2]
         scale_val = scale if scale is not None else 1.0 / math.sqrt(head_dim)
-        ctx = _ctx_ptr(q._device)
-        dtype_val = q._dtype.value
         if (
             dropout_p == 0.0
             and _on_gpu(q)
@@ -6670,38 +7592,20 @@ def fast_aten_scaled_dot_product_attention(
             # q reads through its (batch, head) strides, so the per-head
             # transpose view of the fused qkv projection is NOT
             # materialized first.
-            try:
-                result = eager_kernels.nn_ops.AttnDecodeSpec(
-                    _spec_of(q), _spec_of(k), _spec_of(v), float(scale_val)
-                )
-            except Exception as exc:
-                _raise_if_device_oom(exc)
-                result = None
-            if result is not None:
-                return _wrap_spec_result(result, q._dtype, q._device)
             out = _alloc((b, h, 1, head_dim), q._dtype, q._device)
-            eager_kernels.nn_ops.AttnDecode(
-                out._ptr,
-                q._ptr,
-                k._ptr,
-                v._ptr,
+            _call_mojo(
+                _NNExtension,
+                "AttnDecodeSpec",
                 (
-                    b * h,
-                    kv_len,
-                    head_dim,
+                    _spec_of(q),
+                    _spec_of(k),
+                    _spec_of(v),
                     float(scale_val),
-                    h,
-                    q._strides[0],
-                    q._strides[1],
-                    k._strides[0],
-                    k._strides[1],
-                    k._strides[2],
-                    v._strides[0],
-                    v._strides[1],
-                    v._strides[2],
+                    _spec_of(out),
                 ),
-                dtype_val,
-                ctx,
+                arg_dtypes=(q._dtype, k._dtype, v._dtype),
+                output_dtypes=(out._dtype,),
+                result_specs=_TensorOutputSpec(out._shape, out._dtype, out._device),
             )
             return out
         result = _sdpa_math_forward_with_dropout(
@@ -6787,15 +7691,21 @@ def fast_aten_embedding(
     out_shape = tuple(idx._shape) + (row_len,)
     out = _alloc(out_shape, table._dtype, table._device)
     if out._numel > 0:
-        eager_kernels.nn_ops.Gather0(
-            out._ptr,
-            table._ptr,
-            idx._ptr,
-            idx._dtype.value,
-            idx._numel,
-            row_len,
-            table._dtype.value,
-            _ctx_ptr(table._device),
+        _call_mojo(
+            _NNExtension,
+            "Gather0",
+            (
+                out._ptr,
+                table._ptr,
+                idx._ptr,
+                idx._dtype.value,
+                idx._numel,
+                row_len,
+                table._dtype.value,
+                _ctx_ptr(table._device),
+            ),
+            arg_dtypes=(table._dtype, idx._dtype),
+            output_dtypes=(out._dtype,),
         )
     return out
 
@@ -6843,16 +7753,22 @@ def fast_aten_embedding_dense_backward(
     if grad_weight._numel > 0:
         # This call includes complete output zeroing and accumulation, stays on
         # the tensor's supplied context, and returns asynchronously.
-        eager_kernels.embedding_backward_ops.EmbeddingDenseBackwardF32I64(
-            grad_weight._ptr,
-            grad._ptr,
-            idx._ptr,
-            idx._numel,
-            embedding_dim,
-            num_weights,
-            padding_idx,
-            0,
-            _ctx_ptr(grad._device),
+        _call_mojo(
+            _EmbeddingBackwardExtension,
+            "EmbeddingDenseBackwardF32I64",
+            (
+                grad_weight._ptr,
+                grad._ptr,
+                idx._ptr,
+                idx._numel,
+                embedding_dim,
+                num_weights,
+                padding_idx,
+                0,
+                _ctx_ptr(grad._device),
+            ),
+            arg_dtypes=(grad._dtype, idx._dtype),
+            output_dtypes=(grad_weight._dtype,),
         )
     return grad_weight
 
@@ -6876,15 +7792,9 @@ def fast_filled(shape, value, dtype: DType, device):
     if dtype == DType.float64 and device.api == "metal":
         return None
     shape = tuple(shape)
-    result = eager_kernels.elementwise_ops.FillSpec(
-        _pad8(shape, 1),
-        len(shape),
-        math.prod(shape),
-        float(value),
-        dtype.value,
-        _ctx_ptr(device),
+    return _submit_prepared_into(
+        _FillSpecExtension.prepare(shape, float(value), dtype, device)
     )
-    return _wrap_spec_result(result, dtype, device)
 
 
 # What the Arange kernel dispatches on (_FILL_DTYPES minus bool, which
@@ -6905,8 +7815,12 @@ def fast_arange(numel, start, step, dtype: DType, device):
         return None
     out = _alloc((numel,), dtype, device)
     if numel > 0:
-        eager_kernels.elementwise_ops.Arange(
-            out._ptr, float(start), float(step), numel, dtype.value, _ctx_ptr(device)
+        _call_mojo(
+            _ElementwiseExtension,
+            "Arange",
+            (out._ptr, float(start), float(step), numel, dtype.value, _ctx_ptr(device)),
+            arg_dtypes=(),
+            output_dtypes=(out._dtype,),
         )
     return out
 

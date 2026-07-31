@@ -1,107 +1,161 @@
-# The kernel-call queue and the Into protocol
+# Mojo extensions and the kernel-call queue
 
-## Problem
+## Why calls are prepared before an extension is compiled
 
-Eager-mode kernels are Mojo CPython extensions compiled on demand, one op
-per `.so`. A cold start therefore interleaves *discovering* which kernels a
-workload needs with *building* them. If a compile miss blocks the
-dispatching thread, discovery serializes behind every build and a zero-cache
-GPT-2 training step pays for each unit's build latency in sequence.
+Eager-mode kernels are Mojo CPython extensions compiled on demand. A cold
+workload discovers new operations while it runs, so blocking at each cache miss
+would serialize graph discovery behind every compiler invocation.
 
-## Design
+The Python operation descriptor therefore performs all metadata work before it
+loads the extension:
 
-The deferral boundary is the **extension call**: the point where an op is
-nothing but raw pointers, shapes, dtypes and a `DeviceContext`. Everything
-above it — autograd graph recording, version counters, view metadata,
-layouts, output allocation — executes synchronously in Python at dispatch
-time. Only the device kernel **launch** may lag, waiting in a FIFO
-(`eager_kernels/call_queue.py`) while its unit builds in the background
-pool. This is CUDA's async-stream model applied to kernel *compilation*:
-the host runs ahead; reads synchronize.
+1. validate the call and infer its output tensor specifications;
+2. allocate those outputs in Python;
+3. derive the compile-time definitions from the input and output metadata;
+4. request the exact compiled extension;
+5. queue its single `ext.call(...)` entry point with the runtime arguments.
 
-Choosing this boundary is what keeps the machinery small. An earlier
-prototype deferred whole aten ops and had to reconstruct torch-level
-semantics at replay (meta-inferred placeholders, alias maps, version
-fix-ups, backend-vs-meta layout mismatches); at the call boundary none of
-those exist, because torch-level semantics were never deferred.
+This lets later operations inspect the already-known shapes and dtypes of the
+outputs and request their own compilations. Only the device launch waits for
+the extension build. Operations whose output metadata depends on tensor data
+cannot use this asynchronous path without synchronizing first.
 
-### Rules
+## Stateless operation descriptors
 
-1. **Strict FIFO.** Once any launch is queued (a compile miss), every
-   subsequent launch queues behind it, warm or not: device work must land
-   in program order. `pump()` — called at every dispatch entry — launches
-   the longest ready prefix.
-2. **Host reads drain.** D2H transfers, `read_scalar`, the `_SYNC_OPS` set
-   (`item`, `equal`, `nonzero`, device-crossing copies …) and device
-   `synchronize()` call `drain()` first. Out-of-dispatch payload readers
-   (the AutogradPrivateUse1 sdpa impl) use `deferred_compile.wait_for`.
-3. **Keep-alive.** Queued items hold raw pointers, not references. The
-   dispatch layer brackets each aten op (`op_begin`/`op_end`) and retains
-   its arguments, results and every allocation made inside
-   (`TorchMojoTensor._alloc` reports into the bracket) while the queue is
-   non-empty. The keep-alive list releases only from `drain()`: holder
-   frees are stream-ordered per enqueuing thread, so they must follow the
-   launches on the draining thread.
-4. **Thread order.** Device work is ordered only within an enqueuing
-   thread (verified empirically: cross-thread enqueues read stale data).
-   `_direct` and the queue executor synchronize the device whenever the
-   enqueuing thread changes — rare (main ↔ autograd engine).
-5. **Launch-time dtype escalation.** A queued launch that raises
-   "unsupported dtype" rebuilds its unit with the full dtype set and
-   retries that one call. Errors of any other kind are held and re-raised
-   at the next drain, CUDA-style.
-6. **Ungated device calls ride the queue.** fa4 attention, `copy_d2d`,
-   `StridedFill` and strided copies are always launch-ready but must hold
-   their FIFO position (`external_call`), or they would read queued
-   producers' outputs early.
+Each operation is represented by a stateless `MojoExtension` subclass. Its
+Mojo source path is a class attribute; per-invocation values never live on the
+class or an instance. The descriptor provides three pieces of operation
+semantics:
 
-## The Into protocol
+- `expected_output_specs(...)` validates metadata and describes every output;
+- `make_defines(...)` returns the exact compile-time specialization;
+- call preparation converts inputs and preallocated outputs into the runtime
+  arguments accepted by the extension.
 
-Spec-tier entry points historically allocate their output inside Mojo and
-return `(holder, spec, …)` — a value the caller consumes immediately, which
-makes the call impossible to queue. The **Into** form removes the
-allocation from Mojo: Python computes the output metadata (broadcast
-shapes, dtype promotion, reduced shapes), allocates via
-`tensor_holder.alloc` (kernel-free, never a drain), and passes the
-out-spec as one extra trailing argument. The launch writes into it and
-returns nothing.
+Output descriptions include shape, dtype, device, and layout information
+needed for allocation. Operations that alias an input, mutate in place, use an
+`out=` argument, or return multiple tensors must describe those facts as well.
 
-Conventions:
+All state belongs to the shared infrastructure: compiled-module caches, build
+locks and futures, the FIFO launch queue, and tensor keep-alives. This avoids a
+race where simultaneous calls with different dtypes overwrite a descriptor's
+"current" specialization.
 
-- **Same registration name, `nargs`-branched dispatcher.** `AddSpec(a, b)`
-  is the legacy allocate-and-return form; `AddSpec(a, b, out)` is Into.
-  Adding a spec op means adding both forms (the hygiene of one entry name
-  per op is preserved; nothing about gating or the demand profile changes).
-- **Eligibility is replicated in Python, conservatively.** A queued launch
-  cannot fall back, so `aten_fast` mirrors each family's Mojo prologue
-  (dtype sets, dim validity, matmul contiguity/rank rules) and anything
-  uncertain declines to the legacy synchronous call. The Into go-functions
-  still validate (extent, dtype, device, contiguity) and raise loudly.
-- Converted families: binary logic (all 20), the fused f32+bf16 add,
-  `CastSpec`, `FillSpec`, elementwise unary/unary-bool/scalar/int-scalar,
-  rowred/`Argmin`/`Var`/`Any`/`All`/`LogSoftmax` and the two-output
-  `MinDim`, nn `Mean`/`Max`/`Argmax`/`Softmax`, and
-  `Matmul`/`MatmulBias`/`Bmm`. Deliberately legacy-only: `Cumsum`,
-  `BatchNorm`, `AttnDecode` (geometry gates not Python-mirrored; their
-  calls drain and run synchronously).
+## One compiled function per variant
+
+Every specialized `.so` exposes one Python-callable function with a constant
+name:
+
+```python
+extension.call(runtime_arguments...)
+```
+
+A Mojo source file may implement many operations, but its compile-time
+definitions select only one of them for a particular `.so`. There is no Python
+entry-point name in the cache identity and no attribute lookup for individual
+operations. `tensor_holder` remains a special process-wide module because it
+owns the shared Python tensor types.
+
+## Compile-time definitions and cache identity
+
+`make_defines(...)` returns a dictionary such as:
+
+```python
+{
+    "OP": "AddSpec",
+    "DTYPE_ARG_0": "float32",
+    "DTYPE_ARG_1": "bfloat16",
+    "DTYPE_OUT": "float32",
+    "INPLACE": False,
+}
+```
+
+The loader normalizes values and sorts entries by key. The same canonical
+ordered representation generates both the compiler arguments and the defines
+portion of the cache key, so dictionary insertion order cannot create duplicate
+variants. Argument positions remain explicit: exchanging `DTYPE_ARG_0` and
+`DTYPE_ARG_1` is a different specialization.
+
+The compiler receives the normalized entries directly:
+
+```text
+-D DTYPE_ARG_0=float32
+-D DTYPE_ARG_1=bfloat16
+-D DTYPE_OUT=float32
+-D INPLACE=0
+-D OP=AddSpec
+```
+
+Every relevant flag is always present with a canonical default. Dtypes,
+operation mode, output dtype, and implementation-selecting flags belong in the
+definitions. Shapes, strides, pointers, scalar values, and device contexts are
+runtime data unless they truly select different generated code. Consequently,
+the same operation, dtypes, and flags reuse one `.so` across different shapes.
+
+The full build identity also includes the Mojo source and dependency hashes,
+the compiler/toolchain and host ABI identity, and the loader ABI version. The
+canonical defines are serialized unambiguously and hashed for filenames; raw
+`key=value-key=value` strings are not safe when string values contain
+separators.
+
+Each identity is immutable. A cache hit loads that exact `.so`; a miss builds
+it. An unsupported dtype or flag reported by Mojo indicates a bug in Python's
+definition mapping and is surfaced directly. There is no widening, dtype
+escalation, fallback build, or launch-time retry.
+
+Builds are protected by a process-level lock and written to temporary files
+before an atomic rename. Concurrent requests for one identity compile it once,
+and an interrupted compiler cannot leave a partial file that looks valid.
+
+## Queue ordering
+
+The deferral boundary is the extension call: everything above it—autograd
+recording, version counters, view metadata, output inference, and allocation—
+runs synchronously in Python. Only the device launch may wait in
+`eager_kernels/call_queue.py` for its exact extension to finish compiling.
+
+The queue follows these rules:
+
+1. **Strict FIFO.** Once a launch is queued, subsequent launches remain behind
+   it even if their extensions are already warm. `pump()` launches the longest
+   ready prefix.
+2. **Host reads drain.** D2H transfers, scalar reads, synchronization, and
+   operations whose result is needed by Python drain pending launches first.
+3. **Keep-alive.** Queued raw pointers do not own their tensors, so prepared
+   calls retain every input, output, and intermediate allocation until the
+   queue drains.
+4. **Thread order.** Device work is ordered within an enqueuing thread. The
+   direct path and queue executor synchronize when execution changes threads.
+5. **Errors are deferred, not repaired.** A launch error is retained and
+   re-raised at the next drain. The queue never changes definitions, rebuilds a
+   broader module, or retries a failed call.
+6. **Always-available device calls still use FIFO.** Ungated copies and other
+   warm calls must retain their queue position so they cannot observe an output
+   before its queued producer launches.
+
+## Into-style ABI
+
+Asynchronous preparation requires Python to know and allocate outputs before
+the extension exists. Queueable extensions therefore use an Into-style ABI:
+
+```python
+extension.call(input_specs..., output_specs..., runtime_parameters...)
+```
+
+The call writes into the supplied outputs and returns no newly allocated tensor.
+Multiple-output operations receive all output specs. In-place and `out=`
+operations pass the appropriate existing tensors, and zero-sized outputs may
+complete without launching a kernel.
+
+The Python descriptor mirrors only the metadata-level eligibility checks needed
+to prepare a safe call. The Mojo implementation still validates the runtime
+arguments and raises on disagreement.
 
 ## Modes
 
 | Mode | How | Behavior |
 |---|---|---|
-| default | — | call queue on: misses queue, builds pool, reads drain |
+| default | — | misses build in parallel; launches queue; reads drain |
 | sequential | `TMB_NO_TRIGGER_DEFER=1` | every miss blocks inline |
 | kill switch | `TMB_KERNEL_QUEUE=0` | same as sequential |
-| test suite | `TORCH_MOJO_BACKEND_TESTING=1` | queue off (synchronous call-count/spy contracts); `TMB_FORCE_KERNEL_QUEUE=1` re-enables per-test (see `tests/test_call_queue.py`) |
-
-## Measured (GPT-2 124M b32, one training step, zero kernel cache, H100)
-
-| Transform cache | sequential | call queue + Into |
-|---|---|---|
-| warm | 74.1 s | **26.4 s** |
-| cold (fresh `MODULAR_CACHE_DIR`) | 295.9 s | **129.9 s** |
-
-With the `.so` files present no builds happen at all (~8 s total).
-
-Known issue: the full nanoGPT loop's step-1 evaluation differs from the
-sequential oracle by ±1e-4 on one of train/val loss.
+| test suite | `TORCH_MOJO_BACKEND_TESTING=1` | queue off; `TMB_FORCE_KERNEL_QUEUE=1` enables it for focused queue tests |

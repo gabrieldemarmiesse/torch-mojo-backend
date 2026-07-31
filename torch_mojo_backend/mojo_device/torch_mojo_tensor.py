@@ -2,6 +2,8 @@ import functools
 import math
 import threading
 from collections import deque
+from dataclasses import dataclass
+from types import ModuleType
 from typing import Protocol, runtime_checkable
 
 import max.driver
@@ -10,6 +12,8 @@ from max.driver import CPU
 from max.dtype import DType
 from max.experimental.torch import max_dtype_to_torch
 
+from torch_mojo_backend import eager_kernels
+from torch_mojo_backend.eager_kernels.data_movement_ops import DataMovementExtension
 from torch_mojo_backend.mojo_device import objc_autorelease, torch_mojo_device_module
 
 # The Mojo extension module (torch_mojo_backend.eager_kernels.tensor_holder),
@@ -21,13 +25,9 @@ _tensor_holder = None
 def _holder_mod():
     global _tensor_holder
     if _tensor_holder is None:
-        from torch_mojo_backend import eager_kernels
-
         _tensor_holder = eager_kernels.tensor_holder
     return _tensor_holder
 
-
-_data_movement = None
 
 # GPU H2D copies consume a MAX-owned pinned staging allocation asynchronously.
 # Keep that transfer owner alive until an event recorded behind its DMA
@@ -54,15 +54,6 @@ _FAILED_TRANSFER_OWNERS_LOCK = threading.Lock()
 # bookkeeping device, as ``_acc.create_empty_tensor`` did. ``_torch_device`` and
 # the public ``device`` property continue to carry the real Mojo device.
 _WRAPPER_TENSORIMPL_DEVICE = torch.device("privateuseone:0")
-
-
-def _data_movement_mod():
-    global _data_movement
-    if _data_movement is None:
-        from torch_mojo_backend import eager_kernels
-
-        _data_movement = eager_kernels.data_movement_ops
-    return _data_movement
 
 
 def _ctx_ptr(device):
@@ -455,27 +446,16 @@ class TorchMojoTensor(torch.Tensor):
 
     def _materialize_contiguous(self) -> "TorchMojoTensor":
         """A new contiguous tensor with this tensor's (strided) contents."""
+        rank = len(self._shape)
+        if self._numel > 0 and rank <= 4:
+            # Hot path (attention q/k/v transposes, expand): the rank-4
+            # PermuteCopy gathers a strided source into a contiguous
+            # destination with no destination index math and half the
+            # coordinate math of the generic rank-8 CopyStrided.
+            return _materialize_permute_copy(self)
         out = TorchMojoTensor._alloc(self._shape, self._dtype, self._device)
         if self._numel > 0:
-            rank = len(self._shape)
-            if rank <= 4:
-                # Hot path (attention q/k/v transposes, expand): the rank-4
-                # PermuteCopy gathers a strided source into a contiguous
-                # destination with no destination index math and half the
-                # coordinate math of the generic rank-8 CopyStrided.
-                pad = 4 - rank
-                dims4 = (1,) * pad + tuple(self._shape)
-                strides4 = (0,) * pad + tuple(self._strides)
-                _data_movement_mod().PermuteCopy(
-                    out._ptr,
-                    self._ptr,
-                    dims4,
-                    strides4,
-                    self._itemsize,
-                    _ctx_ptr(self._device),
-                )
-            else:
-                _copy_strided_into(out, self)
+            _copy_strided_into(out, self)
         return out
 
     def _contig(self) -> "TorchMojoTensor":
@@ -607,6 +587,72 @@ class TorchMojoTensor(torch.Tensor):
         return super().device
 
     __torch_function__ = torch._C._disabled_torch_function_impl
+
+
+@dataclass(frozen=True)
+class _PermuteCopyOutputSpec:
+    shape: tuple[int, ...]
+    dtype: DType
+    device: max.driver.Device
+
+
+class _PermuteCopyExtension(DataMovementExtension):
+    """Stateless descriptor for rank-at-most-four strided materialization."""
+
+    @classmethod
+    def make_defines(cls, tensor: MojoTensorLike) -> dict[str, bool | int | str]:
+        return {
+            "OP": "PermuteCopy",
+            "DTYPE_ARG_0": tensor._dtype.name,
+            "DTYPE_OUT": tensor._dtype.name,
+        }
+
+    @classmethod
+    def expected_output_specs(cls, tensor: MojoTensorLike) -> _PermuteCopyOutputSpec:
+        return _PermuteCopyOutputSpec(
+            tuple(tensor._shape), tensor._dtype, tensor._device
+        )
+
+    @classmethod
+    def extension_args(
+        cls, out: TorchMojoTensor, tensor: MojoTensorLike
+    ) -> tuple[object, ...]:
+        rank = len(tensor._shape)
+        pad = 4 - rank
+        return (
+            out._ptr,
+            tensor._ptr,
+            (1,) * pad + tuple(tensor._shape),
+            (0,) * pad + tuple(tensor._strides),
+            tensor._dtype.size_in_bytes,
+            _ctx_ptr(tensor._device),
+        )
+
+    @classmethod
+    def call_extension(
+        cls,
+        extension: ModuleType,
+        output_specs: _PermuteCopyOutputSpec,
+        tensor: MojoTensorLike,
+    ) -> TorchMojoTensor:
+        out = TorchMojoTensor._alloc(
+            output_specs.shape, output_specs.dtype, output_specs.device
+        )
+        if math.prod(output_specs.shape) > 0:
+            extension.call(*cls.extension_args(out, tensor))
+        return out
+
+
+def _materialize_permute_copy(tensor: TorchMojoTensor) -> TorchMojoTensor:
+    """Allocate the inferred output and launch/queue its defined extension."""
+    prepared = _PermuteCopyExtension.prepare(tensor)
+    if not eager_kernels.call_queue.enabled():
+        return prepared.execute()
+    spec = prepared.output_specs
+    out = TorchMojoTensor._alloc(spec.shape, spec.dtype, spec.device)
+    if tensor._numel > 0:
+        prepared.enqueue_into(prepared.extension.extension_args(out, *prepared.args))
+    return out
 
 
 def _rebind_payload(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:

@@ -43,7 +43,9 @@ SIDECAR_SUFFIXES = (".ptx", ".amdgcn", ".ll")
 HASH_RE = re.compile(r"_[0-9a-f]{8}\b")
 
 
-def emit_asm(tree: Path, module: Path, accelerator: str, out_dir: Path) -> str | None:
+def emit_asm(
+    tree: Path, kernel_dir: Path, module: Path, accelerator: str, out_dir: Path
+) -> str | None:
     """Build one module for ``accelerator``; return an error line, or None.
 
     Both trees are built with this interpreter's Mojo, so the comparison
@@ -58,6 +60,10 @@ def emit_asm(tree: Path, module: Path, accelerator: str, out_dir: Path) -> str |
         [
             "build",
             str(module),
+            "-I",
+            str(module.parent),
+            "-I",
+            str(kernel_dir),
             "--emit",
             "asm",
             "--target-accelerator",
@@ -73,6 +79,21 @@ def emit_asm(tree: Path, module: Path, accelerator: str, out_dir: Path) -> str |
         message = (result.stderr or result.stdout).strip().splitlines()
         return message[-1][:160] if message else f"exit {result.returncode}"
     return None
+
+
+def find_entry_module(tree: Path, kernel_dir: Path, stem: str) -> Path | None:
+    """Find an entry module by stem across flat and nested source layouts."""
+    candidates = [
+        path
+        for path in (tree / kernel_dir).rglob(f"{stem}.mojo")
+        if "def PyInit_" in path.read_text()
+    ]
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        paths = ", ".join(str(path.relative_to(tree)) for path in candidates)
+        raise ValueError(f"multiple entry modules named {stem!r}: {paths}")
+    return candidates[0].relative_to(tree)
 
 
 def collect(out_dir: Path) -> dict[str, str]:
@@ -129,7 +150,7 @@ def main() -> int:
         # theirs, and building one in isolation emits no sidecars at all.
         stems = sorted(
             path.stem
-            for path in (args.after / args.kernel_dir).glob("*.mojo")
+            for path in (args.after / args.kernel_dir).rglob("*.mojo")
             if "def PyInit_" in path.read_text()
         )
 
@@ -137,20 +158,23 @@ def main() -> int:
     total_changed = 0
     failed = []
     for stem in stems:
-        module = args.kernel_dir / f"{stem}.mojo"
         sides = {}
         errors = {}
         # A module present on one side only is an added or deleted file, not a
         # failure: the PR that introduces a kernel module is the common case,
         # and every kernel in it is new for this architecture.
-        present = {
-            side: tree
-            for side, tree in (("before", args.before), ("after", args.after))
-            if (tree / module).is_file()
-        }
-        for side, tree in present.items():
+        present = {}
+        for side, tree in (("before", args.before), ("after", args.after)):
+            module = find_entry_module(tree, args.kernel_dir, stem)
+            if module is not None:
+                present[side] = (tree, module)
+        for side, (tree, module) in present.items():
             error = emit_asm(
-                tree, module, args.accelerator, args.work_dir / side / stem
+                tree,
+                args.kernel_dir,
+                module,
+                args.accelerator,
+                args.work_dir / side / stem,
             )
             if error:
                 errors[side] = error

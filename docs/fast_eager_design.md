@@ -21,7 +21,7 @@ with a content-addressed disk cache — in the productized form that MAX
 itself already uses internally for its eager interpreter
 (`max/_interpreter_ops/*.mojo` + `mojo.importer`):
 
-- `torch_mojo_backend/eager_kernels/elementwise_ops.mojo` implements
+- `torch_mojo_backend/eager_kernels/elementwise_ops/elementwise_ops.mojo` implements
   Add/Sub/Mul/Div/Max/Min/Relu/Exp as Mojo kernels over **contiguous
   buffers with fully dynamic shapes**. Dtype dispatch happens at
   **runtime inside Mojo** (every dtype specialization is compiled into
@@ -163,9 +163,11 @@ indices (the graph path duplicates the values).
 
 ### How the op set is organized
 
-Five lazily-imported extension modules under `eager_kernels/` (a module
-only compiles on the first call of an op in its category), plus an
-`op_utils` Mojo sibling package mirroring `max/_interpreter_ops/op_utils`:
+Each lazily compiled entry point lives in its own directory under
+`eager_kernels/`: `<family>/<family>.mojo` sits beside
+`<family>/<family>.py`, which owns that file's `MojoExtension` descriptor.
+Family-private Mojo helpers live in the same directory; helpers shared by
+multiple families and the `op_utils` Mojo package remain at the package root.
 
 - `elementwise_ops.mojo` — binary/unary ops + Python-scalar variants
   (`x * 0.5`, `x ** 3`, int `x + 1`), tanh; contiguous, dtype dispatch at

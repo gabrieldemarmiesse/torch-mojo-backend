@@ -1,24 +1,53 @@
 """Host-only regression tests for TensorSpec allocator-error propagation."""
 
-from types import SimpleNamespace
+import math
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
+from max.driver import CPU
 
 from torch_mojo_backend import eager_kernels
 from torch_mojo_backend.eager_kernels import aten_fast
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 _CUDA_OOM = "CUDA call failed: CUDA_ERROR_OUT_OF_MEMORY (out of memory)"
 
 
-def _tensor(device, *, dtype=aten_fast.DType.float32, shape=(2, 3), strides=(3, 1)):
-    return SimpleNamespace(
-        _device=device,
-        _dtype=dtype,
-        _shape=shape,
-        _strides=strides,
-        _is_contiguous=True,
+def _tensor(
+    device: object,
+    *,
+    dtype: aten_fast.DType = aten_fast.DType.float32,
+    shape: tuple[int, ...] = (2, 3),
+    strides: tuple[int, ...] = (3, 1),
+) -> TorchMojoTensor:
+    torch_dtype = {
+        aten_fast.DType.bool: torch.bool,
+        aten_fast.DType.float32: torch.float32,
+        aten_fast.DType.int64: torch.int64,
+    }[dtype]
+    tensor = torch.Tensor._make_wrapper_subclass(
+        TorchMojoTensor,
+        shape,
+        strides=strides,
+        storage_offset=0,
+        dtype=torch_dtype,
+        layout=torch.strided,
+        device="cpu",
+        requires_grad=False,
     )
+    tensor._holder = object()
+    tensor._ptr = 1
+    tensor._device = device
+    tensor._dtype = dtype
+    tensor._shape = shape
+    tensor._strides = strides
+    tensor._offset = 0
+    tensor._itemsize = dtype.size_in_bytes
+    tensor._numel = math.prod(shape)
+    tensor._is_contiguous = True
+    return tensor
 
 
 @pytest.mark.parametrize(
@@ -41,64 +70,60 @@ def _tensor(device, *, dtype=aten_fast.DType.float32, shape=(2, 3), strides=(3, 
 )
 def test_tensor_spec_fallbacks_propagate_device_oom(monkeypatch, path):
     """Fallback-only errors stay recoverable, but allocator OOM never does."""
-    device = SimpleNamespace(label="gpu")
+    device = CPU()
+    attention_device = device
     lhs = _tensor(device)
     rhs = _tensor(device)
+    matmul_rhs = _tensor(device, shape=(3, 2), strides=(2, 1))
     bool_lhs = _tensor(device, dtype=aten_fast.DType.bool)
-    query = _tensor(device, shape=(1, 1, 1, 4), strides=(4, 4, 4, 1))
-    key = _tensor(device, shape=(1, 1, 2, 4), strides=(8, 8, 4, 1))
-    value = _tensor(device, shape=(1, 1, 2, 4), strides=(8, 8, 4, 1))
-    tensors = (lhs, rhs, bool_lhs, query, key, value)
+    int_lhs = _tensor(device, dtype=aten_fast.DType.int64)
+    query = _tensor(attention_device, shape=(1, 1, 1, 4), strides=(4, 4, 4, 1))
+    key = _tensor(attention_device, shape=(1, 1, 2, 4), strides=(8, 8, 4, 1))
+    value = _tensor(attention_device, shape=(1, 1, 2, 4), strides=(8, 8, 4, 1))
+    tensors = (lhs, rhs, matmul_rhs, bool_lhs, int_lhs, query, key, value)
 
-    def as_tensor(candidate):
+    def as_tensor(candidate: object) -> object | None:
         return candidate if any(candidate is tensor for tensor in tensors) else None
 
-    def raise_allocator_oom(*_args):
+    def raise_allocator_oom(*_args: object, **_kwargs: object) -> None:
         raise NotImplementedError(_CUDA_OOM)
 
+    def load_oom_module(
+        _mojo_file: Path, _defines: eager_kernels.CanonicalDefines
+    ) -> ModuleType:
+        module = ModuleType("oom_test_extension")
+        module.call = raise_allocator_oom
+        return module
+
+    def fake_allocate_output(
+        output_spec: aten_fast._TensorOutputSpec,
+    ) -> TorchMojoTensor:
+        return _tensor(
+            output_spec.device,
+            dtype=output_spec.dtype,
+            shape=output_spec.shape,
+            strides=aten_fast._row_major_strides(output_spec.shape),
+        )
+
+    def fake_alloc(
+        shape: tuple[int, ...], dtype: aten_fast.DType, actual_device: object
+    ) -> TorchMojoTensor:
+        return _tensor(
+            actual_device,
+            dtype=dtype,
+            shape=shape,
+            strides=aten_fast._row_major_strides(shape),
+        )
+
     monkeypatch.setattr(aten_fast, "_t", as_tensor)
+    monkeypatch.setattr(aten_fast, "_on_gpu", lambda _tensor: True)
     monkeypatch.setattr(aten_fast, "_spec_of", lambda tensor: tensor)
     monkeypatch.setattr(aten_fast, "_ctx_ptr", lambda _device: 1)
-    monkeypatch.setitem(
-        eager_kernels.__dict__,
-        "logic_ops",
-        SimpleNamespace(
-            SubSpec=raise_allocator_oom, LogicalAndSpec=raise_allocator_oom
-        ),
+    monkeypatch.setattr(aten_fast, "_allocate_output_spec", fake_allocate_output)
+    monkeypatch.setattr(aten_fast, "_alloc", fake_alloc)
+    monkeypatch.setattr(
+        eager_kernels.MOJO_EXTENSION_LOADER, "load_canonical", load_oom_module
     )
-    monkeypatch.setitem(
-        eager_kernels.__dict__,
-        "data_movement_ops",
-        SimpleNamespace(CastSpec=raise_allocator_oom),
-    )
-    monkeypatch.setitem(
-        eager_kernels.__dict__,
-        "elementwise_ops",
-        SimpleNamespace(
-            FillSpec=raise_allocator_oom,
-            NegSpec=raise_allocator_oom,
-            AddScalarSpec=raise_allocator_oom,
-            AddScalarIntSpec=raise_allocator_oom,
-        ),
-    )
-    monkeypatch.setitem(
-        eager_kernels.__dict__,
-        "reduction_ops",
-        SimpleNamespace(SumSpec=raise_allocator_oom, MinDimSpec=raise_allocator_oom),
-    )
-    monkeypatch.setitem(
-        eager_kernels.__dict__,
-        "matmul_ops",
-        SimpleNamespace(MatmulSpec=raise_allocator_oom),
-    )
-    monkeypatch.setitem(
-        eager_kernels.__dict__,
-        "nn_ops",
-        SimpleNamespace(
-            BatchNormSpec=raise_allocator_oom, AttnDecodeSpec=raise_allocator_oom
-        ),
-    )
-
     calls = {
         "binary": lambda: aten_fast._try_spec_binary("SubSpec", lhs, rhs),
         "binary_cast": lambda: aten_fast._try_spec_binary("SubSpec", bool_lhs, rhs),
@@ -106,10 +131,12 @@ def test_tensor_spec_fallbacks_propagate_device_oom(monkeypatch, path):
         "binary_fill_lhs": lambda: aten_fast._try_spec_binary("SubSpec", 1.0, rhs),
         "unary": lambda: aten_fast._try_spec_unary("NegSpec", lhs),
         "reduce": lambda: aten_fast._try_spec_reduce("SumSpec", lhs, (1,), False),
-        "matmul": lambda: aten_fast._try_spec_matmul("MatmulSpec", (lhs, rhs), 0),
+        "matmul": lambda: aten_fast._try_spec_matmul(
+            "MatmulSpec", (lhs, matmul_rhs), 0
+        ),
         "scalar": lambda: aten_fast._try_spec_scalar("AddScalarSpec", lhs, 1.0),
         "int_scalar": lambda: aten_fast._try_spec_int_scalar(
-            "AddScalarIntSpec", lhs, 1
+            "AddScalarIntSpec", int_lhs, 1
         ),
         "logical": lambda: aten_fast._try_logical("LogicalAndSpec", bool_lhs, bool_lhs),
         "batch_norm": lambda: aten_fast._fast_batch_norm_inference(
@@ -126,18 +153,34 @@ def test_tensor_spec_fallbacks_propagate_device_oom(monkeypatch, path):
 
 
 def test_tensor_spec_unsupported_metadata_still_uses_fallback(monkeypatch):
-    device = object()
+    device = CPU()
     tensor = _tensor(device)
 
-    def raise_unsupported(*_args):
+    def raise_unsupported(*_args: object, **_kwargs: object) -> None:
         raise NotImplementedError("mojo spec neg: strided input is unsupported")
+
+    def load_unsupported_module(
+        _mojo_file: Path, _defines: eager_kernels.CanonicalDefines
+    ) -> ModuleType:
+        module = ModuleType("unsupported_test_extension")
+        module.call = raise_unsupported
+        return module
+
+    def fake_allocate_output(
+        output_spec: aten_fast._TensorOutputSpec,
+    ) -> TorchMojoTensor:
+        return _tensor(
+            output_spec.device,
+            dtype=output_spec.dtype,
+            shape=output_spec.shape,
+            strides=aten_fast._row_major_strides(output_spec.shape),
+        )
 
     monkeypatch.setattr(aten_fast, "_t", lambda _candidate: tensor)
     monkeypatch.setattr(aten_fast, "_spec_of", lambda _tensor: object())
-    monkeypatch.setitem(
-        eager_kernels.__dict__,
-        "elementwise_ops",
-        SimpleNamespace(NegSpec=raise_unsupported),
+    monkeypatch.setattr(aten_fast, "_allocate_output_spec", fake_allocate_output)
+    monkeypatch.setattr(
+        eager_kernels.MOJO_EXTENSION_LOADER, "load_canonical", load_unsupported_module
     )
 
     assert aten_fast._try_spec_unary("NegSpec", tensor) is None
