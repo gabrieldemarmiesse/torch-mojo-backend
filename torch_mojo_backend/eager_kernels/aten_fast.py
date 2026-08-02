@@ -1231,6 +1231,8 @@ _UNARY_SPEC_EXTENSIONS = {
 }
 
 
+# Mirrors logic_ops.mojo's SPEC_BCAST_DTYPES — the Mojo-side source of
+# truth for which dtypes the Into spec kernels are compiled for.
 _SPEC_INTO_DTYPES = frozenset(
     {
         DType.float32,
@@ -1492,33 +1494,18 @@ def _try_spec_add_f32_bf16(lhs, rhs):
         )
     ):
         return None
-    if _call_queue.enabled() and a._device.api != "cpu":
+    try:
+        # The CPU device was already rejected above, so the metadata is always
+        # queue-eligible; the submit helper runs it synchronously by itself
+        # whenever the queue is disabled.
         return _submit_prepared_into(
             _BinarySpecExtension.prepare("AddF32Bf16Spec", a, b, DType.float32)
-        )
-    try:
-        return _submit_prepared_into(
-            _BinarySpecExtension.prepare("AddF32Bf16Spec", a, b, DType.float32),
-            force_sync=True,
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
 
 
-_SPEC_UNARY_INTO_DTYPES = frozenset(
-    {
-        DType.float32,
-        DType.float16,
-        DType.bfloat16,
-        DType.float64,
-        DType.int8,
-        DType.int16,
-        DType.int32,
-        DType.int64,
-        DType.uint8,
-    }
-)
 _SPEC_FLOAT_DTYPES = frozenset(
     {DType.float32, DType.float16, DType.bfloat16, DType.float64}
 )
@@ -1732,28 +1719,26 @@ def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_op
     if a is None:
         return None
     kdtype = DType.uint8 if a._dtype == DType.bool else a._dtype
-    if _call_queue.enabled():
-        if out_dtype == DType.bool and module_name == "elementwise_ops":
-            ok = kdtype in _SPEC_UNARY_INTO_DTYPES
-        elif module_name == "elementwise_ops":
-            ok = a._dtype in (
-                _SPEC_UNARY_INTO_DTYPES
-                if spec_fn_name in _SPEC_UNARY_DIRECT_NAMES
-                else _SPEC_FLOAT_DTYPES
-            )
-        elif spec_fn_name in ("LogSoftmaxSpec", "SoftmaxSpec"):
-            ok = a._dtype in _SPEC_FLOAT_DTYPES and len(a._shape) >= 1 and a._numel > 0
-        else:
-            ok = False  # e.g. CumsumSpec: constraints not mirrored, stay sync
-        if ok:
-            extension = _UNARY_SPEC_EXTENSIONS[module_name]
-            return _submit_prepared_into(
-                extension.prepare(spec_fn_name, a, out_dtype or a._dtype)
-            )
+    if not _call_queue.enabled():
+        ok = False
+    elif out_dtype == DType.bool and module_name == "elementwise_ops":
+        ok = kdtype in _SPEC_INTO_DTYPES
+    elif module_name == "elementwise_ops":
+        ok = a._dtype in (
+            _SPEC_INTO_DTYPES
+            if spec_fn_name in _SPEC_UNARY_DIRECT_NAMES
+            else _SPEC_FLOAT_DTYPES
+        )
+    elif spec_fn_name in ("LogSoftmaxSpec", "SoftmaxSpec"):
+        ok = a._dtype in _SPEC_FLOAT_DTYPES and len(a._shape) >= 1 and a._numel > 0
+    else:
+        ok = False  # e.g. CumsumSpec: constraints not mirrored, stay sync
     try:
-        extension = _UNARY_SPEC_EXTENSIONS[module_name]
         return _submit_prepared_into(
-            extension.prepare(spec_fn_name, a, out_dtype or a._dtype), force_sync=True
+            _UNARY_SPEC_EXTENSIONS[module_name].prepare(
+                spec_fn_name, a, out_dtype or a._dtype
+            ),
+            force_sync=not ok,
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -1768,6 +1753,8 @@ def _try_spec_reduce(
     on non-trailing dims / strided input and the classic path takes over."""
     dims = tuple(rdims)
     extras = tuple(extra)
+    ok = False
+    odtype = out_dtype or a._dtype
     if _call_queue.enabled():
         rule = _SPEC_REDUCE_INTO.get((module_name, spec_fn_name))
         rank = len(a._shape)
@@ -1779,18 +1766,14 @@ def _try_spec_reduce(
             and len(set(dims)) == len(dims)
             and all(isinstance(d, int) and 0 <= d < rank for d in dims)
         ):
-            odtype = rule[1] or out_dtype or a._dtype
-            extension = _REDUCTION_SPEC_EXTENSIONS[module_name]
-            return _submit_prepared_into(
-                extension.prepare(spec_fn_name, a, dims, keepdim, extras, odtype)
-            )
+            ok = True
+            odtype = rule[1] or odtype
     try:
-        extension = _REDUCTION_SPEC_EXTENSIONS[module_name]
         return _submit_prepared_into(
-            extension.prepare(
-                spec_fn_name, a, dims, keepdim, extras, out_dtype or a._dtype
+            _REDUCTION_SPEC_EXTENSIONS[module_name].prepare(
+                spec_fn_name, a, dims, keepdim, extras, odtype
             ),
-            force_sync=True,
+            force_sync=not ok,
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
