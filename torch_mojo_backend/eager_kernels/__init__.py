@@ -838,7 +838,6 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
         """
 
     @classmethod
-    @abstractmethod
     def call_extension(
         cls,
         extension: ModuleType,
@@ -846,7 +845,16 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
         *args: object,
         **kwargs: object,
     ) -> _ExtensionResult:
-        """Invoke extension.call using the same explicit operation arguments."""
+        """Allocate the outputs, invoke ``extension.call``, return them.
+
+        The synchronous twin of the queued path: the same
+        ``allocate_outputs`` allocation and ``extension_args`` serialization,
+        executed inline. Descriptors with a different call ABI
+        (``MojoFileExtension``) override it.
+        """
+        out = cls.allocate_outputs(output_specs)
+        extension.call(*cls.extension_args(out, *args, **kwargs))  # type: ignore[attr-defined]
+        return out
 
     @classmethod
     def allocate_outputs(cls, output_specs: _OutputSpecs) -> _ExtensionResult:

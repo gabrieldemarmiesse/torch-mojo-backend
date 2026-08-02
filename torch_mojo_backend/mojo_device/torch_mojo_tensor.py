@@ -3,7 +3,6 @@ import math
 import threading
 from collections import deque
 from pathlib import Path
-from types import ModuleType
 from typing import ClassVar, Protocol, runtime_checkable
 
 import max.driver
@@ -15,7 +14,6 @@ from max.experimental.torch import max_dtype_to_torch
 from torch_mojo_backend import eager_kernels
 from torch_mojo_backend.eager_kernels.data_movement_ops import DataMovementExtension
 from torch_mojo_backend.eager_kernels.output_specs import (
-    _allocate_output_spec,
     _submit_prepared_into,
     _TensorOutputSpec,
 )
@@ -604,17 +602,6 @@ class _PermuteCopyExtension(
             tensor._dtype.size_in_bytes,
             _ctx_ptr(tensor._device),
         )
-
-    @classmethod
-    def call_extension(
-        cls,
-        extension: ModuleType,
-        output_specs: _TensorOutputSpec,
-        tensor: MojoTensorLike,
-    ) -> TorchMojoTensor:
-        out = _allocate_output_spec(output_specs)
-        extension.call(*cls.extension_args(out, tensor))
-        return out
 
 
 def _rebind_payload(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:

@@ -450,3 +450,42 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
 
     assert launches == ["first", "second"]
     assert not queue.active()
+
+
+def test_spec_descriptor_canonical_defines_match_make_defines() -> None:
+    """The memoized canonical defines must stay field-for-field equal to the
+    literal ``make_defines`` dicts: the define-gate scanner reads the dicts,
+    the hot path uses the memo, and the two must never drift."""
+    from dataclasses import dataclass, field
+
+    from max.driver import CPU
+    from max.dtype import DType
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    cpu = CPU()
+
+    @dataclass
+    class _FakePayload:
+        _dtype: DType
+        _shape: tuple[int, ...] = (2, 3)
+        _strides: tuple[int, ...] = (3, 1)
+        _device: object = field(default_factory=lambda: cpu)
+
+    a = _FakePayload(DType.float32)
+    b = _FakePayload(DType.bfloat16)
+    cases = [
+        (aten_fast._FillSpecExtension, ((4,), 1.0, DType.float32, cpu)),
+        (aten_fast._CastSpecExtension, (a, DType.bfloat16)),
+        (aten_fast._BinarySpecExtension, ("AddSpec", a, b, DType.float32)),
+        (aten_fast._ElementwiseUnarySpecExtension, ("ReluSpec", a, DType.float32)),
+        (
+            aten_fast._ReductionOpsSpecExtension,
+            ("SumSpec", a, (1,), False, (), DType.float32),
+        ),
+        (aten_fast._MinDimSpecExtension, (a, 1, False)),
+        (aten_fast._MatmulSpecExtension, ("MatmulSpec", (a, b), 1)),
+    ]
+    for extension, args in cases:
+        expected = eager_kernels.normalize_defines(extension.make_defines(*args))
+        assert extension.make_canonical_defines(*args) == expected, extension.__name__

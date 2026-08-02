@@ -25,7 +25,6 @@ import struct
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
-from types import ModuleType
 from typing import ClassVar, Protocol, runtime_checkable
 
 import torch
@@ -1060,14 +1059,6 @@ def _spec_of(t):
     return spec
 
 
-# The canonical defines of a spec launch are a pure function of the operation
-# name and the dtypes involved, yet `make_canonical_defines` re-validates and
-# re-sorts them on every warm launch (~2.4 µs). Each *SpecExtension overrides
-# it to hand back the memoized tuple; the class object is part of the key so
-# subclasses that share a `make_defines` cannot collide.
-_SPEC_DEFINES_CACHE: dict[tuple[object, ...], "eager_kernels.CanonicalDefines"] = {}
-
-
 class _FillSpecExtension(
     eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
 ):
@@ -1083,13 +1074,7 @@ class _FillSpecExtension(
     def make_canonical_defines(
         cls, shape: Sequence[int], value: float, dtype: DType, device: Device
     ) -> "eager_kernels.CanonicalDefines":
-        key = (cls, dtype)
-        cached = _SPEC_DEFINES_CACHE.get(key)
-        if cached is None:
-            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
-                cls.make_defines(shape, value, dtype, device)
-            )
-        return cached
+        return eager_kernels._canonical_call_defines("FillSpec", (), (dtype,), ())
 
     @classmethod
     def expected_output_specs(
@@ -1107,20 +1092,6 @@ class _FillSpecExtension(
         device: Device,
     ) -> tuple[object, ...]:
         return (value, _spec_of(out))
-
-    @classmethod
-    def call_extension(
-        cls,
-        extension: ModuleType,
-        output_specs: _TensorOutputSpec,
-        shape: Sequence[int],
-        value: float,
-        dtype: DType,
-        device: Device,
-    ) -> TorchMojoTensor:
-        out = _allocate_output_spec(output_specs)
-        extension.call(*cls.extension_args(out, shape, value, dtype, device))
-        return out
 
 
 class _CastSpecExtension(
@@ -1142,13 +1113,9 @@ class _CastSpecExtension(
     def make_canonical_defines(
         cls, tensor: MojoTensorLike, dtype: DType
     ) -> "eager_kernels.CanonicalDefines":
-        key = (cls, tensor._dtype, dtype)
-        cached = _SPEC_DEFINES_CACHE.get(key)
-        if cached is None:
-            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
-                cls.make_defines(tensor, dtype)
-            )
-        return cached
+        return eager_kernels._canonical_call_defines(
+            "CastSpec", (tensor._dtype,), (dtype,), ()
+        )
 
     @classmethod
     def expected_output_specs(
@@ -1161,18 +1128,6 @@ class _CastSpecExtension(
         cls, out: TorchMojoTensor, tensor: MojoTensorLike, dtype: DType
     ) -> tuple[object, ...]:
         return (_spec_of(tensor), dtype.value, _spec_of(out))
-
-    @classmethod
-    def call_extension(
-        cls,
-        extension: ModuleType,
-        output_specs: _TensorOutputSpec,
-        tensor: MojoTensorLike,
-        dtype: DType,
-    ) -> TorchMojoTensor:
-        out = _allocate_output_spec(output_specs)
-        extension.call(*cls.extension_args(out, tensor, dtype))
-        return out
 
 
 class _BinarySpecExtension(
@@ -1195,13 +1150,9 @@ class _BinarySpecExtension(
     def make_canonical_defines(
         cls, op: str, lhs: MojoTensorLike, rhs: MojoTensorLike, out_dtype: DType
     ) -> "eager_kernels.CanonicalDefines":
-        key = (cls, op, lhs._dtype, rhs._dtype, out_dtype)
-        cached = _SPEC_DEFINES_CACHE.get(key)
-        if cached is None:
-            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
-                cls.make_defines(op, lhs, rhs, out_dtype)
-            )
-        return cached
+        return eager_kernels._canonical_call_defines(
+            op, (lhs._dtype, rhs._dtype), (out_dtype,), ()
+        )
 
     @classmethod
     def expected_output_specs(
@@ -1226,20 +1177,6 @@ class _BinarySpecExtension(
     ) -> tuple[object, ...]:
         return (_spec_of(lhs), _spec_of(rhs), _spec_of(out))
 
-    @classmethod
-    def call_extension(
-        cls,
-        extension: ModuleType,
-        output_specs: _TensorOutputSpec,
-        op: str,
-        lhs: MojoTensorLike,
-        rhs: MojoTensorLike,
-        out_dtype: DType,
-    ) -> TorchMojoTensor:
-        out = _allocate_output_spec(output_specs)
-        extension.call(*cls.extension_args(out, op, lhs, rhs, out_dtype))
-        return out
-
 
 class _UnarySpecExtension(
     eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
@@ -1258,13 +1195,9 @@ class _UnarySpecExtension(
     def make_canonical_defines(
         cls, op: str, tensor: MojoTensorLike, out_dtype: DType
     ) -> "eager_kernels.CanonicalDefines":
-        key = (cls, op, tensor._dtype, out_dtype)
-        cached = _SPEC_DEFINES_CACHE.get(key)
-        if cached is None:
-            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
-                cls.make_defines(op, tensor, out_dtype)
-            )
-        return cached
+        return eager_kernels._canonical_call_defines(
+            op, (tensor._dtype,), (out_dtype,), ()
+        )
 
     @classmethod
     def expected_output_specs(
@@ -1277,19 +1210,6 @@ class _UnarySpecExtension(
         cls, out: TorchMojoTensor, op: str, tensor: MojoTensorLike, out_dtype: DType
     ) -> tuple[object, ...]:
         return (_spec_of(tensor), _spec_of(out))
-
-    @classmethod
-    def call_extension(
-        cls,
-        extension: ModuleType,
-        output_specs: _TensorOutputSpec,
-        op: str,
-        tensor: MojoTensorLike,
-        out_dtype: DType,
-    ) -> TorchMojoTensor:
-        out = _allocate_output_spec(output_specs)
-        extension.call(*cls.extension_args(out, op, tensor, out_dtype))
-        return out
 
 
 class _ElementwiseUnarySpecExtension(_UnarySpecExtension):
@@ -1677,13 +1597,9 @@ class _ReductionSpecExtension(
         extra: tuple[object, ...],
         out_dtype: DType,
     ) -> "eager_kernels.CanonicalDefines":
-        key = (cls, op, tensor._dtype, out_dtype)
-        cached = _SPEC_DEFINES_CACHE.get(key)
-        if cached is None:
-            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
-                cls.make_defines(op, tensor, rdims, keepdim, extra, out_dtype)
-            )
-        return cached
+        return eager_kernels._canonical_call_defines(
+            op, (tensor._dtype,), (out_dtype,), ()
+        )
 
     @classmethod
     def expected_output_specs(
@@ -1710,24 +1626,6 @@ class _ReductionSpecExtension(
         out_dtype: DType,
     ) -> tuple[object, ...]:
         return (_spec_of(tensor), rdims, 1 if keepdim else 0, *extra, _spec_of(out))
-
-    @classmethod
-    def call_extension(
-        cls,
-        extension: ModuleType,
-        output_specs: _TensorOutputSpec,
-        op: str,
-        tensor: MojoTensorLike,
-        rdims: tuple[int, ...],
-        keepdim: bool,
-        extra: tuple[object, ...],
-        out_dtype: DType,
-    ) -> TorchMojoTensor:
-        out = _allocate_output_spec(output_specs)
-        extension.call(
-            *cls.extension_args(out, op, tensor, rdims, keepdim, extra, out_dtype)
-        )
-        return out
 
 
 class _ReductionOpsSpecExtension(_ReductionSpecExtension):
@@ -1767,13 +1665,9 @@ class _MinDimSpecExtension(
     def make_canonical_defines(
         cls, tensor: MojoTensorLike, dim: int, keepdim: bool
     ) -> "eager_kernels.CanonicalDefines":
-        key = (cls, tensor._dtype)
-        cached = _SPEC_DEFINES_CACHE.get(key)
-        if cached is None:
-            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
-                cls.make_defines(tensor, dim, keepdim)
-            )
-        return cached
+        return eager_kernels._canonical_call_defines(
+            "MinDimSpec", (tensor._dtype,), (tensor._dtype, DType.int64), ()
+        )
 
     @classmethod
     def expected_output_specs(
@@ -1809,22 +1703,6 @@ class _MinDimSpecExtension(
             _spec_of(outputs[0]),
             _spec_of(outputs[1]),
         )
-
-    @classmethod
-    def call_extension(
-        cls,
-        extension: ModuleType,
-        output_specs: tuple[_TensorOutputSpec, _TensorOutputSpec],
-        tensor: MojoTensorLike,
-        dim: int,
-        keepdim: bool,
-    ) -> tuple[TorchMojoTensor, TorchMojoTensor]:
-        outputs = (
-            _allocate_output_spec(output_specs[0]),
-            _allocate_output_spec(output_specs[1]),
-        )
-        extension.call(*cls.extension_args(outputs, tensor, dim, keepdim))
-        return outputs
 
 
 def _try_spec_min_dim(
@@ -2020,13 +1898,12 @@ class _MatmulSpecExtension(
     def make_canonical_defines(
         cls, op: str, tensors: tuple[MojoTensorLike, ...], transpose_b: int
     ) -> "eager_kernels.CanonicalDefines":
-        key = (cls, op, tuple(t._dtype for t in tensors), bool(transpose_b))
-        cached = _SPEC_DEFINES_CACHE.get(key)
-        if cached is None:
-            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
-                cls.make_defines(op, tensors, transpose_b)
-            )
-        return cached
+        return eager_kernels._canonical_call_defines(
+            op,
+            tuple(t._dtype for t in tensors),
+            (tensors[0]._dtype,),
+            (("TRANSPOSE_B", bool(transpose_b)),),
+        )
 
     @classmethod
     def expected_output_specs(
@@ -2046,19 +1923,6 @@ class _MatmulSpecExtension(
         transpose_b: int,
     ) -> tuple[object, ...]:
         return (*(_spec_of(tensor) for tensor in tensors), transpose_b, _spec_of(out))
-
-    @classmethod
-    def call_extension(
-        cls,
-        extension: ModuleType,
-        output_specs: _TensorOutputSpec,
-        op: str,
-        tensors: tuple[MojoTensorLike, ...],
-        transpose_b: int,
-    ) -> TorchMojoTensor:
-        out = _allocate_output_spec(output_specs)
-        extension.call(*cls.extension_args(out, op, tensors, transpose_b))
-        return out
 
 
 def _submit_spec_matmul(
