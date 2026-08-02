@@ -18,6 +18,8 @@ from op_utils import (
     _raw_ctx,
     _raw_int,
     _raw_ret_none,
+    _spec_dispatcher11,
+    _spec_dispatcher13,
     _spec_unsupported,
 )
 
@@ -65,33 +67,6 @@ def _bf16_gemm_go(
     )
 
 
-def _bf16_gemm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 11:
-            raise Error("Bf16GemmBF16 expects exactly 11 arguments")
-        _bf16_gemm_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _bf16_bmm_go(
     output_ptr_obj: PyObjectPtr,
     a_ptr_obj: PyObjectPtr,
@@ -134,35 +109,6 @@ def _bf16_bmm_go(
     )
 
 
-def _bf16_bmm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 13:
-            raise Error("Bf16BmmBF16 expects exactly 13 arguments")
-        _bf16_bmm_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
-            args[12],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 @export
 def PyInit_bf16_matmul_ops() abi("C") -> PythonObject:
     try:
@@ -170,7 +116,7 @@ def PyInit_bf16_matmul_ops() abi("C") -> PythonObject:
         comptime if _op_on["Bf16BmmBF16"]():
             _register_call(
                 b,
-                _bf16_bmm_dispatcher,
+                _spec_dispatcher13[_bf16_bmm_go, "Bf16BmmBF16"],
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, batch_count, m, n, k,"
                     " output_batch_stride, a_batch_stride, b_batch_stride,"
@@ -181,7 +127,7 @@ def PyInit_bf16_matmul_ops() abi("C") -> PythonObject:
         comptime if _op_on["Bf16GemmBF16"]():
             _register_call(
                 b,
-                _bf16_gemm_dispatcher,
+                _spec_dispatcher11[_bf16_gemm_go, "Bf16GemmBF16"],
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, bias_ptr, m, n, k, transpose_a,"
                     " transpose_b, has_bias, context_ptr); BF16 2-D GEMM"

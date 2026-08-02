@@ -21,8 +21,8 @@ from op_utils import (
     _raw_ctx,
     _raw_f64,
     _raw_int,
-    _raw_ret_none,
-    _spec_unsupported,
+    _spec_dispatcher6,
+    _spec_dispatcher10,
 )
 
 from variant_gates import _op_on, _register_call
@@ -71,36 +71,6 @@ def _native_dropout_go(
     )
 
 
-def _native_dropout_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 10:
-            raise Error("NativeDropoutF32 expects exactly 10 arguments")
-        _native_dropout_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-        )
-        return _raw_ret_none()
-    except e:
-        # Python validates the public ATen contract before entering the raw
-        # bridge, but candidate-side guards and enqueue failures must still be
-        # visible rather than returning an apparently valid uninitialized
-        # result.
-        return _spec_unsupported(e)
-
-
 def _native_dropout_backward_go(
     grad_input_ptr_obj: PyObjectPtr,
     grad_output_ptr_obj: PyObjectPtr,
@@ -129,25 +99,6 @@ def _native_dropout_backward_go(
     )
 
 
-def _native_dropout_backward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 6:
-            raise Error("NativeDropoutBackwardF32 expects exactly 6 arguments")
-        _native_dropout_backward_go(
-            args[0], args[1], args[2], args[3], args[4], args[5]
-        )
-        return _raw_ret_none()
-    except e:
-        # See the forward dispatcher: raw bridge failures are part of the
-        # operation contract and cannot be silently converted into success.
-        return _spec_unsupported(e)
-
-
 @export
 def PyInit_dropout_ops() abi("C") -> PythonObject:
     try:
@@ -155,7 +106,7 @@ def PyInit_dropout_ops() abi("C") -> PythonObject:
         comptime if _op_on["NativeDropoutF32"]():
             _register_call(
                 b,
-                _native_dropout_dispatcher,
+                _spec_dispatcher10[_native_dropout_go, "NativeDropoutF32"],
                 docstring=(
                     "(output_ptr, mask_ptr, input_ptr, elements, p, seed_lo,"
                     " seed_hi, offset_lo, offset_hi, context_ptr); float32"
@@ -165,7 +116,9 @@ def PyInit_dropout_ops() abi("C") -> PythonObject:
         comptime if _op_on["NativeDropoutBackwardF32"]():
             _register_call(
                 b,
-                _native_dropout_backward_dispatcher,
+                _spec_dispatcher6[
+                    _native_dropout_backward_go, "NativeDropoutBackwardF32"
+                ],
                 docstring=(
                     "(grad_input_ptr, grad_output_ptr, mask_ptr, elements,"
                     " scale, context_ptr); float32 native dropout backward"

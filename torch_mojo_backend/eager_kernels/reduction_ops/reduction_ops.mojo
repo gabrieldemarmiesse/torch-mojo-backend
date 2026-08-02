@@ -67,6 +67,9 @@ from op_utils import (
     _reduce_spec_geom,
     _scratch_contig,
     _scratch_copy,
+    _spec_dispatcher2,
+    _spec_dispatcher4,
+    _spec_dispatcher5,
     _spec_ptr,
     _raw_ret_none,
     _spec_unsupported,
@@ -1297,26 +1300,6 @@ def _rowred_spec_into_go[
                         _reduce_rows[dt, op_code](addr, a.ptr, rows, cols, ctx)
 
 
-def _rowred_spec_dispatcher[
-    op_code: Int
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error(
-                "a row-reduction spec op expects exactly 4 arguments (a_spec,"
-                " rdims, keepdim, out_spec)"
-            )
-        _rowred_spec_into_go[op_code](args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _argmin_spec_into_go(
     a_o: PyObjectPtr,
     rdims_t: PyObjectPtr,
@@ -1375,24 +1358,6 @@ def _argmin_spec_into_go(
                 comptime if _dtype_arg_on[0, dt]():
                     if a.dtype == dt:
                         _argmin_rows[dt](addr, a.ptr, rows, cols, ctx)
-
-
-def _argmin_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error(
-                "ArgminSpec expects exactly 4 arguments (a_spec, rdims,"
-                " keepdim, out_spec)"
-            )
-        _argmin_spec_into_go(args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
 
 
 def _min_dim_spec_into_go(
@@ -1470,24 +1435,6 @@ def _min_dim_spec_into_go(
                         )
 
 
-def _min_dim_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 5:
-            raise Error(
-                "MinDimSpec expects exactly 5 arguments (a_spec, rdims,"
-                " keepdim, values_spec, indices_spec)"
-            )
-        _min_dim_spec_into_go(args[0], args[1], args[2], args[3], args[4])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _var_spec_into_go(
     a_o: PyObjectPtr,
     rdims_t: PyObjectPtr,
@@ -1552,24 +1499,6 @@ def _var_spec_into_go(
                         _var_rows[dt](addr, a.ptr, rows, cols, correction, ctx)
 
 
-def _var_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 5:
-            raise Error(
-                "VarSpec expects exactly 5 arguments (a_spec, rdims, keepdim,"
-                " correction, out_spec)"
-            )
-        _var_spec_into_go(args[0], args[1], args[2], args[3], args[4])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _anyall_spec_into_go[
     is_all: Bool
 ](
@@ -1629,26 +1558,6 @@ def _anyall_spec_into_go[
                         _anyall_rows[dt, is_all](addr, a.ptr, rows, cols, ctx)
 
 
-def _anyall_spec_dispatcher[
-    is_all: Bool
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error(
-                "an any/all spec op expects exactly 4 arguments (a_spec, rdims,"
-                " keepdim, out_spec)"
-            )
-        _anyall_spec_into_go[is_all](args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     """log_softmax over the trailing dim; full-shape output. The non-trailing
     dim transpose recursion stays in Python (view ops)."""
@@ -1684,23 +1593,6 @@ def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
         _ = tmp^
 
 
-def _log_softmax_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 2:
-            raise Error(
-                "LogSoftmaxSpec expects exactly 2 arguments (a_spec, out_spec)"
-            )
-        _log_softmax_spec_into_go(args[0], args[1])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -1713,55 +1605,65 @@ def PyInit_reduction_ops() abi("C") -> PythonObject:
         comptime if _op_on["SumSpec"]():
             _register_call(
                 b,
-                _rowred_spec_dispatcher[RED_SUM],
+                _spec_dispatcher4[
+                    _rowred_spec_into_go[RED_SUM], "a row-reduction spec op"
+                ],
                 docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["AmaxSpec"]():
             _register_call(
                 b,
-                _rowred_spec_dispatcher[RED_MAX],
+                _spec_dispatcher4[
+                    _rowred_spec_into_go[RED_MAX], "a row-reduction spec op"
+                ],
                 docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["AminSpec"]():
             _register_call(
                 b,
-                _rowred_spec_dispatcher[RED_MIN],
+                _spec_dispatcher4[
+                    _rowred_spec_into_go[RED_MIN], "a row-reduction spec op"
+                ],
                 docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["ArgminSpec"]():
             _register_call(
                 b,
-                _argmin_spec_dispatcher,
+                _spec_dispatcher4[_argmin_spec_into_go, "ArgminSpec"],
                 docstring="(a_spec, rdims, keepdim, out_spec); int64 indices",
             )
         comptime if _op_on["MinDimSpec"]():
             _register_call(
                 b,
-                _min_dim_spec_dispatcher,
+                _spec_dispatcher5[_min_dim_spec_into_go, "MinDimSpec"],
                 docstring="(a_spec, rdims, keepdim, values_spec, indices_spec)",
             )
         comptime if _op_on["VarSpec"]():
             _register_call(
                 b,
-                _var_spec_dispatcher,
+                _spec_dispatcher5[_var_spec_into_go, "VarSpec"],
                 docstring="(a_spec, rdims, keepdim, correction, out_spec)",
             )
         comptime if _op_on["AnySpec"]():
             _register_call(
                 b,
-                _anyall_spec_dispatcher[False],
+                _spec_dispatcher4[
+                    _anyall_spec_into_go[False], "an any/all spec op"
+                ],
                 docstring="(a_spec, rdims, keepdim, out_spec); bool",
             )
         comptime if _op_on["AllSpec"]():
             _register_call(
                 b,
-                _anyall_spec_dispatcher[True],
+                _spec_dispatcher4[
+                    _anyall_spec_into_go[True], "an any/all spec op"
+                ],
                 docstring="(a_spec, rdims, keepdim, out_spec); bool",
             )
         comptime if _op_on["LogSoftmaxSpec"]():
             _register_call(
                 b,
-                _log_softmax_spec_dispatcher,
+                _spec_dispatcher2[_log_softmax_spec_into_go, "LogSoftmaxSpec"],
                 docstring="(a_spec, out_spec); trailing dim",
             )
         return b.finalize()

@@ -74,6 +74,10 @@ from op_utils import (
     _reduce_spec_geom,
     _scratch_contig,
     _scratch_copy,
+    _spec_dispatcher2,
+    _spec_dispatcher4,
+    _spec_dispatcher5,
+    _spec_dispatcher7,
     _spec_ptr,
     _spec_unsupported,
     ieee_sqrt,
@@ -3260,24 +3264,6 @@ def _mean_spec_into_go(
                         _mean_rows[dt](addr, a.ptr, rows, cols, ctx)
 
 
-def _mean_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error(
-                "MeanSpec expects exactly 4 arguments (a_spec, rdims, keepdim,"
-                " out_spec)"
-            )
-        _mean_spec_into_go(args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _max_spec_into_go(
     a_o: PyObjectPtr,
     rdims_t: PyObjectPtr,
@@ -3333,24 +3319,6 @@ def _max_spec_into_go(
                 comptime if _dtype_arg_on[0, dt]():
                     if a.dtype == dt:
                         _max_rows[dt](addr, a.ptr, rows, cols, ctx)
-
-
-def _max_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error(
-                "MaxSpec expects exactly 4 arguments (a_spec, rdims, keepdim,"
-                " out_spec)"
-            )
-        _max_spec_into_go(args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
 
 
 def _argmax_spec_into_go(
@@ -3410,24 +3378,6 @@ def _argmax_spec_into_go(
                         _argmax_rows[dt](addr, a.ptr, rows, cols, ctx)
 
 
-def _argmax_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error(
-                "ArgmaxSpec expects exactly 4 arguments (a_spec, rdims,"
-                " keepdim, out_spec)"
-            )
-        _argmax_spec_into_go(args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     """Cumulative sum over the trailing dim; full-shape output."""
     ref a = _spec_ptr(a_o)[]
@@ -3460,23 +3410,6 @@ def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
                 if a.dtype == dt:
                     _cumsum_rows[dt](addr, tmp_addr, rows, cols, ctx)
         _ = tmp^
-
-
-def _cumsum_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 2:
-            raise Error(
-                "CumsumSpec expects exactly 2 arguments (a_spec, out_spec)"
-            )
-        _cumsum_spec_into_go(args[0], args[1])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
 
 
 def _batch_norm_spec_into_go(
@@ -3549,27 +3482,6 @@ def _batch_norm_spec_into_go(
                 )
 
 
-def _batch_norm_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 7:
-            raise Error(
-                "BatchNormSpec expects exactly 7 arguments (in_spec,"
-                " mean_spec, var_spec, gamma_spec, beta_spec, eps,"
-                " out_spec)"
-            )
-        _batch_norm_spec_into_go(
-            args[0], args[1], args[2], args[3], args[4], args[5], args[6]
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     """Plain softmax over the trailing dim (scale=1, no causal mask);
     full-shape output. The non-trailing dim transpose recursion and the
@@ -3608,23 +3520,6 @@ def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
                         addr, tmp_addr, rows, cols, Float32(1.0), 0, 1, ctx
                     )
         _ = tmp^
-
-
-def _softmax_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 2:
-            raise Error(
-                "SoftmaxSpec expects exactly 2 arguments (a_spec, out_spec)"
-            )
-        _softmax_spec_into_go(args[0], args[1])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
 
 
 def _attn_decode_spec_into_go(
@@ -3719,24 +3614,6 @@ def _attn_decode_spec_into_go(
     oshape[MAX_RANK - 1] = head_dim
 
 
-def _attn_decode_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 5:
-            raise Error(
-                "AttnDecodeSpec expects exactly 5 arguments (q_spec, k_spec,"
-                " v_spec, scale, out_spec)"
-            )
-        _attn_decode_spec_into_go(args[0], args[1], args[2], args[3], args[4])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -3749,31 +3626,31 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
         comptime if _op_on["MeanSpec"]():
             _register_call(
                 b,
-                _mean_spec_dispatcher,
+                _spec_dispatcher4[_mean_spec_into_go, "MeanSpec"],
                 docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["MaxSpec"]():
             _register_call(
                 b,
-                _max_spec_dispatcher,
+                _spec_dispatcher4[_max_spec_into_go, "MaxSpec"],
                 docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["ArgmaxSpec"]():
             _register_call(
                 b,
-                _argmax_spec_dispatcher,
+                _spec_dispatcher4[_argmax_spec_into_go, "ArgmaxSpec"],
                 docstring="(a_spec, rdims, keepdim, out_spec); int64 indices",
             )
         comptime if _op_on["CumsumSpec"]():
             _register_call(
                 b,
-                _cumsum_spec_dispatcher,
+                _spec_dispatcher2[_cumsum_spec_into_go, "CumsumSpec"],
                 docstring="(a_spec, out_spec); trailing dim",
             )
         comptime if _op_on["BatchNormSpec"]():
             _register_call(
                 b,
-                _batch_norm_spec_dispatcher,
+                _spec_dispatcher7[_batch_norm_spec_into_go, "BatchNormSpec"],
                 docstring=(
                     "(in, mean, var, gamma, beta specs, eps, out_spec);"
                     " inference batch norm, geometry from specs"
@@ -3782,13 +3659,13 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
         comptime if _op_on["SoftmaxSpec"]():
             _register_call(
                 b,
-                _softmax_spec_dispatcher,
+                _spec_dispatcher2[_softmax_spec_into_go, "SoftmaxSpec"],
                 docstring="(a_spec, out_spec); trailing dim",
             )
         comptime if _op_on["AttnDecodeSpec"]():
             _register_call(
                 b,
-                _attn_decode_spec_dispatcher,
+                _spec_dispatcher5[_attn_decode_spec_into_go, "AttnDecodeSpec"],
                 docstring="(q, k, v specs, scale, out_spec); q_len==1, GPU",
             )
         comptime if _op_on["BatchNormInference"]():

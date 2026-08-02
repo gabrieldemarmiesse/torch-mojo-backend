@@ -21,8 +21,7 @@ from op_utils import (
     _raw_ctx,
     _raw_dtype_int,
     _raw_int,
-    _raw_ret_none,
-    _spec_unsupported,
+    _spec_dispatcher7,
 )
 
 from variant_gates import _dtype_arg_on, _op_on, _register_call
@@ -69,33 +68,6 @@ def _log_softmax_backward_go(
         )
 
 
-def _log_softmax_backward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 7:
-            raise Error("LogSoftmaxBackwardData expects exactly 7 arguments")
-        _log_softmax_backward_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-        )
-        return _raw_ret_none()
-    except e:
-        # Python validates the public ATen contract before entering the raw
-        # bridge, but candidate-side guards and enqueue failures must still
-        # be visible rather than returning an apparently valid uninitialized
-        # result.
-        return _spec_unsupported(e)
-
-
 @export
 def PyInit_softmax_backward_ops() abi("C") -> PythonObject:
     try:
@@ -103,7 +75,9 @@ def PyInit_softmax_backward_ops() abi("C") -> PythonObject:
         comptime if _op_on["LogSoftmaxBackwardData"]():
             _register_call(
                 b,
-                _log_softmax_backward_dispatcher,
+                _spec_dispatcher7[
+                    _log_softmax_backward_go, "LogSoftmaxBackwardData"
+                ],
                 docstring=(
                     "(grad_input_ptr, grad_output_ptr, output_ptr, rows, cols,"
                     " dtype, context_ptr); fused trailing-dim log_softmax"

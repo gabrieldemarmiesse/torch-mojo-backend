@@ -48,6 +48,7 @@ from op_utils import (
     _raw_int,
     _raw_ret_none,
     _raw_tuple_int,
+    _spec_dispatcher3,
     _spec_ptr,
     _spec_unsupported,
 )
@@ -2051,24 +2052,6 @@ def _cast_spec_into_go(
             _ = tmp^
 
 
-def _cast_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 3:
-            raise Error(
-                "CastSpec expects exactly 3 arguments (a_spec, out_dtype,"
-                " out_spec)"
-            )
-        _cast_spec_into_go(args[0], args[1], args[2])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -2307,7 +2290,7 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
         comptime if _op_on["CastSpec"]():
             _register_call(
                 b,
-                _cast_spec_dispatcher,
+                _spec_dispatcher3[_cast_spec_into_go, "CastSpec"],
                 docstring="(a_spec, out_dtype, out_spec)",
             )
         comptime if _op_on["PermuteCopy"]():

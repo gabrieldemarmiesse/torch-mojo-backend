@@ -16,8 +16,7 @@ from op_utils import (
     _make_ptr,
     _raw_ctx,
     _raw_int,
-    _raw_ret_none,
-    _spec_unsupported,
+    _spec_dispatcher5,
 )
 
 from variant_gates import _op_on, _register_call
@@ -52,21 +51,6 @@ def _gelu_forward_bf16_go(
     )
 
 
-def _gelu_forward_bf16_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 5:
-            raise Error("GeluForwardBF16 expects exactly five arguments")
-        _gelu_forward_bf16_go(args[0], args[1], args[2], args[3], args[4])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 @export
 def PyInit_activation_forward_ops() abi("C") -> PythonObject:
     try:
@@ -74,7 +58,7 @@ def PyInit_activation_forward_ops() abi("C") -> PythonObject:
         comptime if _op_on["GeluForwardBF16"]():
             _register_call(
                 builder,
-                _gelu_forward_bf16_dispatcher,
+                _spec_dispatcher5[_gelu_forward_bf16_go, "GeluForwardBF16"],
                 docstring=(
                     "(output, input, elements, tanh_approx, context); "
                     "runtime-dynamic BF16 GELU forward"

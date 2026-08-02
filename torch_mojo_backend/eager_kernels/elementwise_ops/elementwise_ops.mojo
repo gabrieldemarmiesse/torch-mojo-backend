@@ -81,6 +81,8 @@ from op_utils import (
     _raw_tuple_int,
     _raw_tuple_len,
     _scratch_contig,
+    _spec_dispatcher2,
+    _spec_dispatcher3,
     _spec_ptr,
     _spec_unsupported,
     ieee_sqrt,
@@ -1058,25 +1060,6 @@ def _unary_spec_into_go[
             _ = tmp^
 
 
-def _unary_spec_dispatcher[
-    op_code: Int
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 2:
-            raise Error(
-                "a unary spec op expects exactly 2 arguments (a_spec, out_spec)"
-            )
-        _unary_spec_into_go[op_code](args[0], args[1])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _unary_bool_spec_into_go[
     op_code: Int
 ](a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
@@ -1128,26 +1111,6 @@ def _unary_bool_spec_into_go[
             _ = tmp^
 
 
-def _unary_bool_spec_dispatcher[
-    op_code: Int
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 2:
-            raise Error(
-                "a bool-output unary spec op expects exactly 2 arguments"
-                " (a_spec, out_spec)"
-            )
-        _unary_bool_spec_into_go[op_code](args[0], args[1])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _scalar_spec_into_go[
     op_code: Int
 ](a_o: PyObjectPtr, scalar_o: PyObjectPtr, out_o: PyObjectPtr) raises:
@@ -1191,26 +1154,6 @@ def _scalar_spec_into_go[
                             ctx,
                         )
             _ = tmp^
-
-
-def _scalar_spec_dispatcher[
-    op_code: Int
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 3:
-            raise Error(
-                "a float-scalar spec op expects exactly 3 arguments (a_spec,"
-                " scalar, out_spec)"
-            )
-        _scalar_spec_into_go[op_code](args[0], args[1], args[2])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
 
 
 def _scalar_inplace_go[
@@ -1431,26 +1374,6 @@ def _int_scalar_spec_into_go[
             _ = tmp^
 
 
-def _int_scalar_spec_dispatcher[
-    op_code: Int
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 3:
-            raise Error(
-                "an int-scalar spec op expects exactly 3 arguments (a_spec,"
-                " scalar, out_spec)"
-            )
-        _int_scalar_spec_into_go[op_code](args[0], args[1], args[2])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 comptime SPEC_FILL_DTYPES = [
     DType.float32,
     DType.float16,
@@ -1489,23 +1412,6 @@ def _fill_spec_into_go(value_o: PyObjectPtr, out_o: PyObjectPtr) raises:
                     _fill[dt](_make_ptr[dt](out.ptr), value, out.numel, ctx)
 
 
-def _fill_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 2:
-            raise Error(
-                "FillSpec expects exactly 2 arguments (value, out_spec)"
-            )
-        _fill_spec_into_go(args[0], args[1])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -1518,187 +1424,251 @@ def PyInit_elementwise_ops() abi("C") -> PythonObject:
         comptime if _op_on["ReluSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_RELU],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_RELU], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); relu",
             )
         comptime if _op_on["ExpSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_EXP],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_EXP], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); exp",
             )
         comptime if _op_on["TanhSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_TANH],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_TANH], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); tanh",
             )
         comptime if _op_on["AbsSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_ABS],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_ABS], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); abs",
             )
         comptime if _op_on["NegSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_NEG],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_NEG], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); neg",
             )
         comptime if _op_on["SignSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_SIGN],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_SIGN], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); sign",
             )
         comptime if _op_on["CeilSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_CEIL],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_CEIL], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); ceil",
             )
         comptime if _op_on["FloorSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_FLOOR],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_FLOOR], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); floor",
             )
         comptime if _op_on["AcosSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_ACOS],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_ACOS], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); acos",
             )
         comptime if _op_on["AsinhSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_ASINH],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_ASINH], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); asinh",
             )
         comptime if _op_on["AtanhSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_ATANH],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_ATANH], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); atanh",
             )
         comptime if _op_on["CosSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_COS],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_COS], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); cos",
             )
         comptime if _op_on["CoshSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_COSH],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_COSH], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); cosh",
             )
         comptime if _op_on["ErfSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_ERF],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_ERF], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); erf",
             )
         comptime if _op_on["LogSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_LOG],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_LOG], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); log",
             )
         comptime if _op_on["Log1pSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_LOG1P],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_LOG1P], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); log1p",
             )
         comptime if _op_on["ReciprocalSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_RECIPROCAL],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_RECIPROCAL], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); reciprocal",
             )
         comptime if _op_on["RsqrtSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_RSQRT],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_RSQRT], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); rsqrt",
             )
         comptime if _op_on["SigmoidSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_SIGMOID],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_SIGMOID], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); sigmoid",
             )
         comptime if _op_on["SiluSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_SILU],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_SILU], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); silu",
             )
         comptime if _op_on["SinSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_SIN],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_SIN], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); sin",
             )
         comptime if _op_on["SinhSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_SINH],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_SINH], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); sinh",
             )
         comptime if _op_on["SqrtSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_SQRT],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_SQRT], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); sqrt",
             )
         comptime if _op_on["TanSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_TAN],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_TAN], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); tan",
             )
         comptime if _op_on["GeluNoneSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_GELU_NONE],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_GELU_NONE], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); gelunone",
             )
         comptime if _op_on["GeluTanhSpec"]():
             _register_call(
                 b,
-                _unary_spec_dispatcher[UOP_GELU_TANH],
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_GELU_TANH], "a unary spec op"
+                ],
                 docstring="(a_spec, out_spec); gelutanh",
             )
         comptime if _op_on["IsNanSpec"]():
             _register_call(
                 b,
-                _unary_bool_spec_dispatcher[BUOP_ISNAN],
+                _spec_dispatcher2[
+                    _unary_bool_spec_into_go[BUOP_ISNAN],
+                    "a bool-output unary spec op",
+                ],
                 docstring="(a_spec, out_spec); isnan -> bool",
             )
         comptime if _op_on["LogicalNotSpec"]():
             _register_call(
                 b,
-                _unary_bool_spec_dispatcher[BUOP_LOGICAL_NOT],
+                _spec_dispatcher2[
+                    _unary_bool_spec_into_go[BUOP_LOGICAL_NOT],
+                    "a bool-output unary spec op",
+                ],
                 docstring="(a_spec, out_spec); logicalnot -> bool",
             )
         comptime if _op_on["AddScalarSpec"]():
             _register_call(
                 b,
-                _scalar_spec_dispatcher[SOP_ADD],
+                _spec_dispatcher3[
+                    _scalar_spec_into_go[SOP_ADD], "a float-scalar spec op"
+                ],
                 docstring="(a_spec, scalar, out_spec); float",
             )
         comptime if _op_on["MulScalarSpec"]():
             _register_call(
                 b,
-                _scalar_spec_dispatcher[SOP_MUL],
+                _spec_dispatcher3[
+                    _scalar_spec_into_go[SOP_MUL], "a float-scalar spec op"
+                ],
                 docstring="(a_spec, scalar, out_spec); float",
             )
         comptime if _op_on["PowScalarSpec"]():
             _register_call(
                 b,
-                _scalar_spec_dispatcher[SOP_POW],
+                _spec_dispatcher3[
+                    _scalar_spec_into_go[SOP_POW], "a float-scalar spec op"
+                ],
                 docstring="(a_spec, scalar, out_spec); float",
             )
         comptime if _op_on["AddScalarInplace"]():
@@ -1729,19 +1699,23 @@ def PyInit_elementwise_ops() abi("C") -> PythonObject:
         comptime if _op_on["AddScalarIntSpec"]():
             _register_call(
                 b,
-                _int_scalar_spec_dispatcher[IOP_ADD],
+                _spec_dispatcher3[
+                    _int_scalar_spec_into_go[IOP_ADD], "an int-scalar spec op"
+                ],
                 docstring="(a_spec, scalar, out_spec); int",
             )
         comptime if _op_on["MulScalarIntSpec"]():
             _register_call(
                 b,
-                _int_scalar_spec_dispatcher[IOP_MUL],
+                _spec_dispatcher3[
+                    _int_scalar_spec_into_go[IOP_MUL], "an int-scalar spec op"
+                ],
                 docstring="(a_spec, scalar, out_spec); int",
             )
         comptime if _op_on["FillSpec"]():
             _register_call(
                 b,
-                _fill_spec_dispatcher,
+                _spec_dispatcher2[_fill_spec_into_go, "FillSpec"],
                 docstring=(
                     "(value, out_spec); dtype and extent come from out_spec"
                 ),

@@ -122,6 +122,9 @@ from op_utils import (
     _raw_tuple_int,
     _raw_tuple_len,
     _scratch_contig,
+    _spec_dispatcher4,
+    _spec_dispatcher5,
+    _spec_dispatcher6,
     _spec_ptr,
     _spec_unsupported,
 )
@@ -6630,21 +6633,6 @@ def _causal_bmm_go(
     )
 
 
-def _causal_bmm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 6:
-            raise Error("CausalBmm expects exactly 6 arguments")
-        _causal_bmm_go(args[0], args[1], args[2], args[3], args[4], args[5])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 # ---------------------------------------------------------------------------
 # TensorSpec entries (docs/tensor_spec_design.md): the matmul-family
 # prologue — shape/dtype/contiguity gates, m/n/k geometry, output alloc and
@@ -6936,24 +6924,6 @@ def _matmul_spec_into_go(
     oshape[MAX_RANK - 1] = n
 
 
-def _matmul_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error(
-                "MatmulSpec expects exactly 4 arguments (a_spec, b_spec,"
-                " transpose_b, out_spec)"
-            )
-        _matmul_spec_into_go(args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _matmul_bias_spec_into_go(
     a_o: PyObjectPtr,
     b_o: PyObjectPtr,
@@ -7009,24 +6979,6 @@ def _matmul_bias_spec_into_go(
     oshape[MAX_RANK - 1] = n
 
 
-def _matmul_bias_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 5:
-            raise Error(
-                "MatmulBiasSpec expects exactly 5 arguments (a_spec, b_spec,"
-                " bias_spec, transpose_b, out_spec)"
-            )
-        _matmul_bias_spec_into_go(args[0], args[1], args[2], args[3], args[4])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _bmm_spec_into_go(
     a_o: PyObjectPtr, b_o: PyObjectPtr, tb_o: PyObjectPtr, out_o: PyObjectPtr
 ) raises:
@@ -7080,24 +7032,6 @@ def _bmm_spec_into_go(
     oshape[MAX_RANK - 1] = n
 
 
-def _bmm_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error(
-                "BmmSpec expects exactly 4 arguments (a_spec, b_spec,"
-                " transpose_b, out_spec)"
-            )
-        _bmm_spec_into_go(args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -7110,19 +7044,19 @@ def PyInit_matmul_ops() abi("C") -> PythonObject:
         comptime if _op_on["MatmulSpec"]():
             _register_call(
                 b,
-                _matmul_spec_dispatcher,
+                _spec_dispatcher4[_matmul_spec_into_go, "MatmulSpec"],
                 docstring="(a_spec, b_spec, transpose_b, out_spec)",
             )
         comptime if _op_on["MatmulBiasSpec"]():
             _register_call(
                 b,
-                _matmul_bias_spec_dispatcher,
+                _spec_dispatcher5[_matmul_bias_spec_into_go, "MatmulBiasSpec"],
                 docstring="(a_spec, b_spec, bias_spec, transpose_b, out_spec)",
             )
         comptime if _op_on["BmmSpec"]():
             _register_call(
                 b,
-                _bmm_spec_dispatcher,
+                _spec_dispatcher4[_bmm_spec_into_go, "BmmSpec"],
                 docstring="(a_spec, b_spec, transpose_b, out_spec)",
             )
         comptime if _op_on["Matmul"]():
@@ -7157,7 +7091,7 @@ def PyInit_matmul_ops() abi("C") -> PythonObject:
         comptime if _op_on["CausalBmm"]():
             _register_call(
                 b,
-                _causal_bmm_dispatcher,
+                _spec_dispatcher6[_causal_bmm_go, "CausalBmm"],
                 docstring=(
                     "(out_ptr, a_ptr, b_ptr, (batch, m, n, k, transpose_b,"
                     " causal_mode), dtype, context_ptr); batched C = A @ B that"

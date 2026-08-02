@@ -18,6 +18,8 @@ from op_utils import (
     _raw_ctx,
     _raw_int,
     _raw_ret_none,
+    _spec_dispatcher11,
+    _spec_dispatcher13,
     _spec_unsupported,
 )
 
@@ -61,33 +63,6 @@ def _tf32_gemm_go(
     )
 
 
-def _tf32_gemm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 11:
-            raise Error("Tf32GemmF32 expects exactly 11 arguments")
-        _tf32_gemm_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _tf32_bmm_go(
     output_ptr_obj: PyObjectPtr,
     a_ptr_obj: PyObjectPtr,
@@ -126,35 +101,6 @@ def _tf32_bmm_go(
     )
 
 
-def _tf32_bmm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 13:
-            raise Error("Tf32BmmF32 expects exactly 13 arguments")
-        _tf32_bmm_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
-            args[12],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 @export
 def PyInit_tf32_matmul_ops() abi("C") -> PythonObject:
     try:
@@ -162,7 +108,7 @@ def PyInit_tf32_matmul_ops() abi("C") -> PythonObject:
         comptime if _op_on["Tf32BmmF32"]():
             _register_call(
                 b,
-                _tf32_bmm_dispatcher,
+                _spec_dispatcher13[_tf32_bmm_go, "Tf32BmmF32"],
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, batch_count, m, n, k,"
                     " output_batch_stride, a_batch_stride, b_batch_stride,"
@@ -173,7 +119,7 @@ def PyInit_tf32_matmul_ops() abi("C") -> PythonObject:
         comptime if _op_on["Tf32GemmF32"]():
             _register_call(
                 b,
-                _tf32_gemm_dispatcher,
+                _spec_dispatcher11[_tf32_gemm_go, "Tf32GemmF32"],
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, bias_ptr, m, n, k, transpose_a,"
                     " transpose_b, has_bias, context_ptr); opt-in FP32/TF32 2-D"

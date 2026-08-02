@@ -17,8 +17,7 @@ from op_utils import (
     _raw_ctx,
     _raw_f64,
     _raw_int,
-    _raw_ret_none,
-    _spec_unsupported,
+    _spec_dispatcher12,
 )
 
 from variant_gates import _op_on, _register_call
@@ -76,34 +75,6 @@ def _layer_norm_forward_go(
     )
 
 
-def _layer_norm_forward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 12:
-            raise Error("LayerNormForwardF32 expects exactly twelve arguments")
-        _layer_norm_forward_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 @export
 def PyInit_normalization_forward_ops() abi("C") -> PythonObject:
     try:
@@ -111,7 +82,9 @@ def PyInit_normalization_forward_ops() abi("C") -> PythonObject:
         comptime if _op_on["LayerNormForwardF32"]():
             _register_call(
                 builder,
-                _layer_norm_forward_dispatcher,
+                _spec_dispatcher12[
+                    _layer_norm_forward_go, "LayerNormForwardF32"
+                ],
                 docstring=(
                     "(output, mean, rstd, input, weight, bias, rows, cols, "
                     "epsilon, has_weight, has_bias, context); runtime-dynamic "

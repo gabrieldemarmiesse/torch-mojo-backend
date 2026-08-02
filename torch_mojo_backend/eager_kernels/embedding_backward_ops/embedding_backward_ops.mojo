@@ -19,8 +19,7 @@ from op_utils import (
     _make_ptr,
     _raw_ctx,
     _raw_int,
-    _raw_ret_none,
-    _spec_unsupported,
+    _spec_dispatcher9,
 )
 
 from variant_gates import _op_on, _register_call
@@ -60,37 +59,6 @@ def _embedding_dense_backward_go(
     )
 
 
-def _embedding_dense_backward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 9:
-            raise Error(
-                "EmbeddingDenseBackwardF32I64 expects exactly 9 arguments"
-            )
-        _embedding_dense_backward_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-        )
-        return _raw_ret_none()
-    except e:
-        # Python validates the public ATen contract before entering the raw
-        # bridge, but candidate-side guards and enqueue failures must still be
-        # visible rather than returning an apparently valid uninitialized
-        # result.
-        return _spec_unsupported(e)
-
-
 @export
 def PyInit_embedding_backward_ops() abi("C") -> PythonObject:
     try:
@@ -98,7 +66,10 @@ def PyInit_embedding_backward_ops() abi("C") -> PythonObject:
         comptime if _op_on["EmbeddingDenseBackwardF32I64"]():
             _register_call(
                 b,
-                _embedding_dense_backward_dispatcher,
+                _spec_dispatcher9[
+                    _embedding_dense_backward_go,
+                    "EmbeddingDenseBackwardF32I64",
+                ],
                 docstring=(
                     "(grad_weight_ptr, grad_output_ptr, indices_ptr,"
                     " num_indices, embedding_dim, num_weights, padding_idx,"

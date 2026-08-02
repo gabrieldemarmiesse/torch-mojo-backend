@@ -21,6 +21,11 @@ from op_utils import (
     _raw_tuple_f64,
     _raw_tuple_int,
     _raw_tuple_len,
+    _spec_dispatcher2,
+    _spec_dispatcher3,
+    _spec_dispatcher4,
+    _spec_dispatcher5,
+    _spec_dispatcher8,
     _spec_unsupported,
 )
 from optimizer_contract import (
@@ -149,30 +154,6 @@ def _fused_adamw_go(
                 found_inf_ptr,
                 ctx,
             )
-
-
-def _fused_adamw_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 8:
-            raise Error("FusedAdamW expects exactly eight arguments")
-        _fused_adamw_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
 
 
 def _foreach_l2_norm_go(
@@ -606,111 +587,6 @@ def _foreach_gather_scalars_go(
         enqueue_foreach_gather_scalars_f32(out_addr, in_addrs, base, count, ctx)
 
 
-def _foreach_gather_scalars_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 3:
-            raise Error("ForeachGatherScalars expects exactly three arguments")
-        _foreach_gather_scalars_go(args[0], args[1], args[2])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
-def _foreach_scalar_op_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error("ForeachScalarOp expects exactly four arguments")
-        _foreach_scalar_op_go(args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
-def _foreach_lerp_scalar_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 5:
-            raise Error("ForeachLerpScalar expects exactly five arguments")
-        _foreach_lerp_scalar_go(args[0], args[1], args[2], args[3], args[4])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
-def _foreach_addc_op_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error("ForeachAddcOp expects exactly four arguments")
-        _foreach_addc_op_go(args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
-def _foreach_sqrt_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 2:
-            raise Error("ForeachSqrt expects exactly two arguments")
-        _foreach_sqrt_go(args[0], args[1])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
-def _foreach_l2_norm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error("ForeachL2Norm expects exactly four arguments")
-        _foreach_l2_norm_go(args[0], args[1], args[2], args[3])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
-def _foreach_mul_tensor_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 3:
-            raise Error("ForeachMulTensor expects exactly three arguments")
-        _foreach_mul_tensor_go(args[0], args[1], args[2])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 @export
 def PyInit_optimizer_ops() abi("C") -> PythonObject:
     try:
@@ -718,7 +594,7 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
         comptime if _op_on["FusedAdamW"]():
             _register_call(
                 builder,
-                _fused_adamw_dispatcher,
+                _spec_dispatcher8[_fused_adamw_go, "FusedAdamW"],
                 docstring=(
                     "(metadata, scalars, dtype_mode, flags, lr_ptr,"
                     " grad_scale_ptr, found_inf_ptr, context_ptr); fused FP32"
@@ -728,7 +604,7 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
         comptime if _op_on["ForeachL2Norm"]():
             _register_call(
                 builder,
-                _foreach_l2_norm_dispatcher,
+                _spec_dispatcher4[_foreach_l2_norm_go, "ForeachL2Norm"],
                 docstring=(
                     "(metadata, partials_ptr, partials_numel, context_ptr); "
                     "runtime-dynamic FP32 foreach L2 norms"
@@ -737,7 +613,7 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
         comptime if _op_on["ForeachMulTensor"]():
             _register_call(
                 builder,
-                _foreach_mul_tensor_dispatcher,
+                _spec_dispatcher3[_foreach_mul_tensor_go, "ForeachMulTensor"],
                 docstring=(
                     "(metadata, scalar_ptr, context_ptr); runtime-dynamic FP32 "
                     "foreach in-place device-scalar multiply"
@@ -746,7 +622,7 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
         comptime if _op_on["ForeachScalarOp"]():
             _register_call(
                 builder,
-                _foreach_scalar_op_dispatcher,
+                _spec_dispatcher4[_foreach_scalar_op_go, "ForeachScalarOp"],
                 docstring=(
                     "(op_code, metadata, scalars, context_ptr); batched FP32 "
                     "in-place foreach mul/add/div by one host scalar per tensor"
@@ -755,7 +631,7 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
         comptime if _op_on["ForeachLerpScalar"]():
             _register_call(
                 builder,
-                _foreach_lerp_scalar_dispatcher,
+                _spec_dispatcher5[_foreach_lerp_scalar_go, "ForeachLerpScalar"],
                 docstring=(
                     "(metadata, weight, one_minus_weight, low_branch, "
                     "context_ptr); batched FP32 in-place foreach scalar lerp"
@@ -764,7 +640,7 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
         comptime if _op_on["ForeachAddcOp"]():
             _register_call(
                 builder,
-                _foreach_addc_op_dispatcher,
+                _spec_dispatcher4[_foreach_addc_op_go, "ForeachAddcOp"],
                 docstring=(
                     "(op_code, metadata, scalars, context_ptr); batched FP32 "
                     "in-place foreach addcmul/addcdiv with per-tensor scalars"
@@ -773,7 +649,9 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
         comptime if _op_on["ForeachGatherScalars"]():
             _register_call(
                 builder,
-                _foreach_gather_scalars_dispatcher,
+                _spec_dispatcher3[
+                    _foreach_gather_scalars_go, "ForeachGatherScalars"
+                ],
                 docstring=(
                     "(in_ptrs, out_ptr, context_ptr); batched FP32 gather of "
                     "one scalar per input tensor into a contiguous output"
@@ -782,7 +660,7 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
         comptime if _op_on["ForeachSqrt"]():
             _register_call(
                 builder,
-                _foreach_sqrt_dispatcher,
+                _spec_dispatcher2[_foreach_sqrt_go, "ForeachSqrt"],
                 docstring=(
                     "(metadata, context_ptr); batched FP32 out-of-place "
                     "foreach sqrt"

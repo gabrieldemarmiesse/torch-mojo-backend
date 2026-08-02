@@ -24,9 +24,10 @@ from op_utils import (
     _raw_dtype_int,
     _raw_f64,
     _raw_int,
-    _raw_ret_none,
     _raw_tuple_int,
-    _spec_unsupported,
+    _spec_dispatcher12,
+    _spec_dispatcher13,
+    _spec_dispatcher7,
 )
 
 from variant_gates import _op_on, _register_call
@@ -105,37 +106,6 @@ def _sdpa_dropout_softmax_backward_go(
         )
 
 
-def _sdpa_dropout_softmax_backward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 13:
-            raise Error(
-                "SDPADropoutSoftmaxBackward expects exactly 13 arguments"
-            )
-        _sdpa_dropout_softmax_backward_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
-            args[12],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _sdpa_dsb_f32_go(
     output_ptr_obj: PyObjectPtr,
     probabilities_ptr_obj: PyObjectPtr,
@@ -190,36 +160,6 @@ def _sdpa_dsb_f32_go(
         causal=_raw_int(causal_obj) != 0,
         q_len=_raw_int(q_len_obj),
     )
-
-
-def _sdpa_dsb_f32_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 12:
-            raise Error(
-                "SDPADropoutSoftmaxBackwardF32 expects exactly 12 arguments"
-            )
-        _sdpa_dsb_f32_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
 
 
 def _sdpa_ta_gemm_go(
@@ -278,23 +218,6 @@ def _sdpa_ta_gemm_go(
     )
 
 
-def _sdpa_ta_gemm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 7:
-            raise Error("SDPATransAGemmF32 expects exactly 7 arguments")
-        _sdpa_ta_gemm_go(
-            args[0], args[1], args[2], args[3], args[4], args[5], args[6]
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 @export
 def PyInit_sdpa_backward_ops() abi("C") -> PythonObject:
     try:
@@ -302,7 +225,10 @@ def PyInit_sdpa_backward_ops() abi("C") -> PythonObject:
         comptime if _op_on["SDPADropoutSoftmaxBackward"]():
             _register_call(
                 b,
-                _sdpa_dropout_softmax_backward_dispatcher,
+                _spec_dispatcher13[
+                    _sdpa_dropout_softmax_backward_go,
+                    "SDPADropoutSoftmaxBackward",
+                ],
                 docstring=(
                     "(output_ptr, probabilities_ptr, grad_after_dropout_ptr,"
                     " mask_ptr_or_zero, rows, cols, q_len, has_mask, causal,"
@@ -314,7 +240,9 @@ def PyInit_sdpa_backward_ops() abi("C") -> PythonObject:
         comptime if _op_on["SDPADropoutSoftmaxBackwardF32"]():
             _register_call(
                 b,
-                _sdpa_dsb_f32_dispatcher,
+                _spec_dispatcher12[
+                    _sdpa_dsb_f32_go, "SDPADropoutSoftmaxBackwardF32"
+                ],
                 docstring=(
                     "(output_ptr, probabilities_ptr, grad_after_dropout_ptr,"
                     " mask_ptr_or_zero, rows, cols, has_mask, dropout_scale,"
@@ -327,7 +255,7 @@ def PyInit_sdpa_backward_ops() abi("C") -> PythonObject:
         comptime if _op_on["SDPATransAGemmF32"]():
             _register_call(
                 b,
-                _sdpa_ta_gemm_dispatcher,
+                _spec_dispatcher7[_sdpa_ta_gemm_go, "SDPATransAGemmF32"],
                 docstring=(
                     "(c_ptr, a_ptr, b_ptr, mask_ptr_or_zero, (batch, m, n, k,"
                     " has_mask, causal), drop_scale, context_ptr); Apple-only"

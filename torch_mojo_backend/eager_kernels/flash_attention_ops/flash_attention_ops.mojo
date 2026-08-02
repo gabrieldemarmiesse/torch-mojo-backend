@@ -27,9 +27,9 @@ from op_utils import (
     _raw_dtype_int,
     _raw_f64,
     _raw_int,
-    _raw_ret_none,
     _raw_tuple_int,
-    _spec_unsupported,
+    _spec_dispatcher11,
+    _spec_dispatcher15,
 )
 
 from variant_gates import _dtype_arg_on, _op_on, _register_call
@@ -220,64 +220,6 @@ def _flash_attention_backward_go(
         )
 
 
-def _flash_attention_forward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 11:
-            raise Error("FlashAttentionForward expects exactly 11 arguments")
-        _flash_attention_forward_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
-def _flash_attention_backward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 15:
-            raise Error("FlashAttentionBackward expects exactly 15 arguments")
-        _flash_attention_backward_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
-            args[12],
-            args[13],
-            args[14],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 @export
 def PyInit_flash_attention_ops() abi("C") -> PythonObject:
     try:
@@ -285,7 +227,9 @@ def PyInit_flash_attention_ops() abi("C") -> PythonObject:
         comptime if _op_on["FlashAttentionForward"]():
             _register_call(
                 b,
-                _flash_attention_forward_dispatcher,
+                _spec_dispatcher11[
+                    _flash_attention_forward_go, "FlashAttentionForward"
+                ],
                 docstring=(
                     "(out_ptr, lse_ptr, q_ptr, k_ptr, v_ptr, (batch, heads,"
                     " seq_q, seq_kv, head_dim), (batch, head, seq) x 4 for q,"
@@ -300,7 +244,9 @@ def PyInit_flash_attention_ops() abi("C") -> PythonObject:
         comptime if _op_on["FlashAttentionBackward"]():
             _register_call(
                 b,
-                _flash_attention_backward_dispatcher,
+                _spec_dispatcher15[
+                    _flash_attention_backward_go, "FlashAttentionBackward"
+                ],
                 docstring=(
                     "(dq_ptr, dk_ptr, dv_ptr, grad_out_ptr, q_ptr, k_ptr,"
                     " v_ptr, out_ptr, lse_ptr, (batch, heads, seq_q, seq_kv,"

@@ -49,6 +49,7 @@ from op_utils import (
     _raw_int,
     _raw_ret_none,
     _raw_tuple_int,
+    _spec_dispatcher3,
     _spec_ptr,
     _spec_unsupported,
 )
@@ -1261,24 +1262,6 @@ def _add_f32_bf16_spec_into_go(
         )
 
 
-def _add_f32_bf16_spec_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 3:
-            raise Error(
-                "AddF32Bf16Spec expects exactly 3 arguments (a_spec, b_spec,"
-                " out_spec)"
-            )
-        _add_f32_bf16_spec_into_go(args[0], args[1], args[2])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 def _binary_spec_into_go[
     op_code: Int, is_cmp: Bool
 ](a_o: PyObjectPtr, b_o: PyObjectPtr, out_o: PyObjectPtr) raises:
@@ -1420,26 +1403,6 @@ def _binary_spec_into_go[
                         )
 
 
-def _binary_spec_dispatcher[
-    op_code: Int, is_cmp: Bool
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        if nargs != 3:
-            raise Error(
-                "a binary spec op expects exactly 3 arguments (a_spec, b_spec,"
-                " out_spec)"
-            )
-        _binary_spec_into_go[op_code, is_cmp](args[0], args[1], args[2])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -1452,7 +1415,7 @@ def PyInit_logic_ops() abi("C") -> PythonObject:
         comptime if _op_on["AddF32Bf16Spec"]():
             _register_call(
                 b,
-                _add_f32_bf16_spec_dispatcher,
+                _spec_dispatcher3[_add_f32_bf16_spec_into_go, "AddF32Bf16Spec"],
                 docstring=(
                     "(a_spec, b_spec, out_spec); contiguous FP32 + BF16 -> FP32"
                 ),
@@ -1460,121 +1423,163 @@ def PyInit_logic_ops() abi("C") -> PythonObject:
         comptime if _op_on["AddSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_ADD, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_ADD, False], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); + ",
             )
         comptime if _op_on["SubSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_SUB, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_SUB, False], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); - ",
             )
         comptime if _op_on["MulSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_MUL, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_MUL, False], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); * ",
             )
         comptime if _op_on["DivSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_DIV, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_DIV, False], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); / float",
             )
         comptime if _op_on["MaximumSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_MAX, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_MAX, False], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); max",
             )
         comptime if _op_on["MinimumSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_MIN, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_MIN, False], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); min",
             )
         comptime if _op_on["PowSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_POW, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_POW, False], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); ** float",
             )
         comptime if _op_on["RemainderSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_REMAINDER, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_REMAINDER, False],
+                    "a binary spec op",
+                ],
                 docstring="(a_spec, b_spec, out_spec); %",
             )
         comptime if _op_on["FloorDivSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_FLOORDIV, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_FLOORDIV, False],
+                    "a binary spec op",
+                ],
                 docstring="(a_spec, b_spec, out_spec); //",
             )
         comptime if _op_on["BitwiseAndSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_AND, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_AND, False], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); & int/bool",
             )
         comptime if _op_on["BitwiseOrSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_OR, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_OR, False], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); | int/bool",
             )
         comptime if _op_on["BitwiseXorSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[BOP_XOR, False],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_XOR, False], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); ^ int/bool",
             )
         comptime if _op_on["EqSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[COP_EQ, True],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[COP_EQ, True], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); == -> bool",
             )
         comptime if _op_on["NeSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[COP_NE, True],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[COP_NE, True], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); != -> bool",
             )
         comptime if _op_on["LtSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[COP_LT, True],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[COP_LT, True], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); < -> bool",
             )
         comptime if _op_on["LeSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[COP_LE, True],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[COP_LE, True], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); <= -> bool",
             )
         comptime if _op_on["GtSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[COP_GT, True],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[COP_GT, True], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); > -> bool",
             )
         comptime if _op_on["GeSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[COP_GE, True],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[COP_GE, True], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); >= -> bool",
             )
         comptime if _op_on["LogicalAndSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[COP_LAND, True],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[COP_LAND, True], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); and -> bool",
             )
         comptime if _op_on["LogicalXorSpec"]():
             _register_call(
                 b,
-                _binary_spec_dispatcher[COP_LXOR, True],
+                _spec_dispatcher3[
+                    _binary_spec_into_go[COP_LXOR, True], "a binary spec op"
+                ],
                 docstring="(a_spec, b_spec, out_spec); xor -> bool",
             )
         comptime if _op_on["BitwiseNot"]():
