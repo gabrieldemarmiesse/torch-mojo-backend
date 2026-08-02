@@ -1205,6 +1205,20 @@ different kind of item.
 ### P4
 **Cold start is 11.6 s for the first nanoGPT step, and `__mojocache__` cannot be shipped**
 
+> **Hazard found 2026-08-02 (pre-existing, reproduced on the pre-cleanup
+> tree).** With a fully cold `__mojocache__` and a workload that performs
+> no host reads (e.g. `bench_nanogpt_train.py`'s warmup loop), the queue's
+> run-ahead is unbounded: rule 3 retains every input, output, and
+> intermediate while any build is still in flight, so several warm-up
+> steps of transients stay live at once — observed 71.5 GB across 3,244
+> blocks at batch 12 before a 36 MB `memAlloc` failed and the process
+> aborted. Real training loops survive because their eval/logging reads
+> drain the queue. Workarounds: prime the cache first with
+> `TORCH_MOJO_BACKEND_KERNEL_QUEUE=0` (builds block inline, memory stays
+> bounded), or add any host read to the warm-up loop. The real fix is a
+> run-ahead bound — drain when the retained set crosses a budget —
+> which composes with this entry's cold-start work.
+
 * **What.** `docs/fast_eager_design.md`, "Measured (H100 PCIe, 24-core host)":
   11.6 s first step with the build pool, 56.3 s without.
 * **Current implementation.** One `.so` per exact specialization, built on demand
