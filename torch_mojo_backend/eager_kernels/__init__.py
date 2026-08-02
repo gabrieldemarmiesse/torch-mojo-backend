@@ -379,11 +379,17 @@ _MOJO_IMPORT_BLOCK_RE = re.compile(
 _OP_GATE_RE = re.compile(r"_op_on\s*\[\s*([^\],]+)")
 _ARG_GATE_RE = re.compile(r"_dtype_arg(?:_abi|_width)?_on\s*\[\s*([^\],]+)")
 _OUT_GATE_RE = re.compile(r"_dtype_out_on\s*\[\s*([^\],]+)")
+# The shared support-check helper reads DTYPE_ARG_<index> through the gate
+# library (which this scanner skips), so its call sites must count as reads:
+# `_dtype_supported[SOME_DTYPES]` -> index 0, `_dtype_supported[SOME_DTYPES, 1]`
+# -> index 1.
+_ARG_SUPPORTED_RE = re.compile(r"_dtype_supported\s*\[([^\]]*)\]")
 _DEFINE_READ_RE = re.compile(r"(?:get_defined_\w+|is_defined)\s*\[\s*([^\],]+)")
 # Bare mentions of the same names, used to detect a helper that is passed
 # around instead of being called with literal parameters.
 _GATE_HELPER_RE = re.compile(
-    r"_(?:op_on|dtype_arg_on|dtype_arg_abi_on|dtype_arg_width_on|dtype_out_on)\b"
+    r"_(?:op_on|dtype_arg_on|dtype_arg_abi_on|dtype_arg_width_on|dtype_out_on"
+    r"|dtype_supported)\b"
 )
 _DEFINE_READER_RE = re.compile(r"\b(?:get_defined_\w+|is_defined)\b")
 
@@ -422,6 +428,20 @@ def _scan_define_names(files: tuple[Path, ...]) -> frozenset[str] | None:
                     return None
                 names.add(template.format(int(index)))
                 gate_calls += 1
+        for params in _ARG_SUPPORTED_RE.findall(text):
+            if "[" in params:
+                return None  # an inline list literal defeats this parse
+            parts = [part.strip() for part in params.split(",")]
+            if len(parts) == 1:
+                index = "0"
+            elif len(parts) == 2:
+                index = parts[1]
+            else:
+                return None
+            if not index.isdigit():
+                return None
+            names.add(f"DTYPE_ARG_{int(index)}")
+            gate_calls += 1
         read_calls = 0
         for name in _DEFINE_READ_RE.findall(text):
             name = name.strip()

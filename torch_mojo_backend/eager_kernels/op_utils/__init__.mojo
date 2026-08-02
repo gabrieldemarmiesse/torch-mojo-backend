@@ -489,6 +489,36 @@ struct TensorSpec(Movable, Writable):
 
 
 @always_inline
+def _check_into_sized(
+    a: TensorSpec, dst: TensorSpec, expected_numel: Int, expected_dtype: DType
+) raises:
+    """Validate an Into-ABI output whose element count the op computes.
+
+    Reductions and shape-changing ops pass the count they derived (rows,
+    m*n, ...); same-shape ops go through ``_check_into``.
+    (``dst``, not ``out``: that name is Mojo's result-argument keyword.)
+    """
+    if (
+        dst.numel != expected_numel
+        or not dst.contig
+        or dst.ctx_ptr != a.ctx_ptr
+    ):
+        raise Error("mojo spec into: output buffer mismatch")
+    if dst.dtype != expected_dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+
+
+@always_inline
+def _check_into(a: TensorSpec, dst: TensorSpec, expected_dtype: DType) raises:
+    """Validate an Into-ABI output against its input's buffer geometry.
+
+    The shared form of every bridge's preallocated-output check: same element
+    count, contiguous, same device, and exactly the dtype Python inferred.
+    """
+    _check_into_sized(a, dst, a.numel, expected_dtype)
+
+
+@always_inline
 def _spec_ptr(o: PyObjectPtr) -> UnsafePointer[TensorSpec, MutAnyOrigin]:
     """The TensorSpec behind a borrowed spec argument — a pure pointer cast.
 

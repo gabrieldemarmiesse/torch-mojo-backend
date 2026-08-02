@@ -321,3 +321,51 @@ def test_python_sends_exactly_the_defines_each_module_reads() -> None:
         assert {name for name, _ in key} == read & entry.names, (
             f"{source}: the build key does not match the gates it reads"
         )
+
+
+def test_dtype_supported_call_sites_count_as_argument_gate_reads(
+    tmp_path: Path,
+) -> None:
+    """`_dtype_supported[DTYPES]` reads DTYPE_ARG_0 (and `..., N]` reads
+    DTYPE_ARG_N) through the gate library, which the scanner skips — so its
+    call sites must keep those defines in the key."""
+    source = tmp_path / "helper_ops.mojo"
+    source.write_text(
+        "from variant_gates import _op_on, _dtype_supported\n"
+        "\n"
+        "def PyInit_helper_ops():\n"
+        '    comptime if _op_on["AddSpec"]():\n'
+        "        if not _dtype_supported[SPEC_DTYPES](a.dtype):\n"
+        "            raise Error('unsupported')\n"
+        "        if not _dtype_supported[SPEC_DTYPES, 1](b.dtype):\n"
+        "            raise Error('unsupported')\n"
+    )
+
+    names = eager_kernels._scan_define_names((source,))
+    assert names is not None
+    assert {"OP", "DTYPE_ARG_0", "DTYPE_ARG_1"} <= names
+
+
+def test_an_aliased_or_computed_dtype_supported_keeps_every_define(
+    tmp_path: Path,
+) -> None:
+    """The conservative fallback covers the new helper too: an aliased
+    mention or a non-literal index defeats the scan and keeps all defines."""
+    aliased = tmp_path / "aliased_ops.mojo"
+    aliased.write_text(
+        "from variant_gates import _dtype_supported\n"
+        "\n"
+        "def PyInit_aliased_ops():\n"
+        "    check = _dtype_supported\n"
+    )
+    computed_index = tmp_path / "computed_index_ops.mojo"
+    computed_index.write_text(
+        "from variant_gates import _dtype_supported\n"
+        "\n"
+        "def PyInit_computed_index_ops():\n"
+        "    if not _dtype_supported[SPEC_DTYPES, which](a.dtype):\n"
+        "        pass\n"
+    )
+
+    assert eager_kernels._scan_define_names((aliased,)) is None
+    assert eager_kernels._scan_define_names((computed_index,)) is None

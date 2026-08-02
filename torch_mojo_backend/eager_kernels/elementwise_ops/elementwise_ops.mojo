@@ -69,6 +69,7 @@ from op_utils import (
     FLOAT_DTYPES,
     GS_THREADS,
     MAX_RANK,
+    _check_into,
     _enqueue_cached,
     _gs_blocks,
     _make_ptr,
@@ -89,6 +90,7 @@ from variant_gates import (
     _dtype_arg_abi_on,
     _dtype_arg_on,
     _dtype_out_on,
+    _dtype_supported,
     _op_on,
     _register_call,
 )
@@ -987,6 +989,8 @@ def _arange_dispatcher(
 # Dtypes the unary spec entries dispatch on for the "direct" (in-dtype) ops
 # and the bool-output ops; the transcendental ops gate down to FLOAT_DTYPES.
 # float64 works on the CPU device (the kernels comptime-refuse it on GPU).
+comptime INT_SCALAR_DTYPES = [DType.int32, DType.int64]
+
 comptime SPEC_UNARY_DTYPES = [
     DType.float32,
     DType.float16,
@@ -1014,25 +1018,16 @@ def _unary_spec_into_go[
     )
     var supported = False
     comptime if is_direct:
-        comptime for dt in SPEC_UNARY_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    supported = True
+        supported = _dtype_supported[SPEC_UNARY_DTYPES](a.dtype)
     else:
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    supported = True
+        supported = _dtype_supported[FLOAT_DTYPES](a.dtype)
     if not supported:
         raise Error("mojo spec unary: unsupported dtype ", a.dtype)
 
     var ctx = a.ctx()
     var nbytes = a.numel * a.itemsize
     _ = nbytes
-    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != a.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into(a, out, a.dtype)
     var addr = out.ptr
     if a.numel > 0:
         if a.contig:
@@ -1102,10 +1097,7 @@ def _unary_bool_spec_into_go[
     var ctx = a.ctx()
     var nbytes = a.numel  # bool output, itemsize 1
     _ = nbytes
-    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != DType.bool:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into(a, out, DType.bool)
     var addr = out.ptr
     if a.numel > 0:
         if a.contig:
@@ -1161,22 +1153,14 @@ def _scalar_spec_into_go[
 ](a_o: PyObjectPtr, scalar_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
         raise Error("mojo spec scalar: unsupported dtype ", a.dtype)
 
     var scalar = Float32(_raw_f64(scalar_o))
     var ctx = a.ctx()
     var nbytes = a.numel * a.itemsize
     _ = nbytes
-    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != a.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into(a, out, a.dtype)
     var addr = out.ptr
     if a.numel > 0:
         if a.contig:
@@ -1407,22 +1391,14 @@ def _int_scalar_spec_into_go[
 ](a_o: PyObjectPtr, scalar_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in [DType.int32, DType.int64]:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[INT_SCALAR_DTYPES](a.dtype):
         raise Error("mojo spec int scalar: unsupported dtype ", a.dtype)
 
     var scalar = _raw_int(scalar_o)
     var ctx = a.ctx()
     var nbytes = a.numel * a.itemsize
     _ = nbytes
-    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != a.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into(a, out, a.dtype)
     var addr = out.ptr
     if a.numel > 0:
         if a.contig:

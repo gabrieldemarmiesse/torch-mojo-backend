@@ -126,7 +126,12 @@ from op_utils import (
     _spec_unsupported,
 )
 
-from variant_gates import _dtype_arg_on, _op_on, _register_call
+from variant_gates import (
+    _dtype_arg_on,
+    _dtype_supported,
+    _op_on,
+    _register_call,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -6661,12 +6666,7 @@ def _matmul_spec_checks(
         raise Error("mojo spec matmul: operand dtypes differ")
     if a.ctx_ptr != b.ctx_ptr:
         raise Error("mojo spec matmul: operands on different devices")
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
         raise Error("mojo spec matmul: unsupported dtype ", a.dtype)
     if a.rank < 2 or b.rank != 2:
         raise Error("mojo spec matmul: bad ranks")
@@ -7039,12 +7039,7 @@ def _bmm_spec_into_go(
         raise Error("mojo spec bmm: operand dtypes differ")
     if a.ctx_ptr != b.ctx_ptr:
         raise Error("mojo spec bmm: operands on different devices")
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
         raise Error("mojo spec bmm: unsupported dtype ", a.dtype)
     if a.rank != 3 or b.rank != 3:
         raise Error("mojo spec bmm: rank != 3")

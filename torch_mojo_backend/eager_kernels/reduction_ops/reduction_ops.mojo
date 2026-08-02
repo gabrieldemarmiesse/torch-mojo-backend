@@ -57,6 +57,7 @@ from op_utils import (
     FLOAT_DTYPES,
     MAX_RANK,
     TensorSpec,
+    _check_into,
     _enqueue_cached,
     _make_ptr,
     _parallel_for,
@@ -71,7 +72,12 @@ from op_utils import (
     _spec_unsupported,
 )
 
-from variant_gates import _dtype_arg_on, _op_on, _register_call
+from variant_gates import (
+    _dtype_arg_on,
+    _dtype_supported,
+    _op_on,
+    _register_call,
+)
 
 
 comptime ROWRED_THREADS = 256
@@ -1211,12 +1217,7 @@ def _rowred_spec_into_go[
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in SPEC_ROWRED_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[SPEC_ROWRED_DTYPES](a.dtype):
         raise Error("mojo spec reduce: unsupported dtype ", a.dtype)
     if a.numel == 0:
         # sum-of-empty is a Python-side fill; amax/amin reject empty dims.
@@ -1324,12 +1325,7 @@ def _argmin_spec_into_go(
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in SPEC_ROWRED_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[SPEC_ROWRED_DTYPES](a.dtype):
         raise Error("mojo spec argmin: unsupported dtype ", a.dtype)
     if a.numel == 0:
         raise Error("mojo spec argmin: empty input")
@@ -1412,12 +1408,7 @@ def _min_dim_spec_into_go(
     ref a = _spec_ptr(a_o)[]
     ref out_v = _spec_ptr(out_v_o)[]
     ref out_i = _spec_ptr(out_i_o)[]
-    var supported = False
-    comptime for dt in SPEC_ROWRED_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[SPEC_ROWRED_DTYPES](a.dtype):
         raise Error("mojo spec min.dim: unsupported dtype ", a.dtype)
     if a.numel == 0:
         raise Error("mojo spec min.dim: empty input")
@@ -1506,12 +1497,7 @@ def _var_spec_into_go(
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
         raise Error("mojo spec var: unsupported dtype ", a.dtype)
     if a.numel == 0:
         raise Error("mojo spec var: empty input")
@@ -1594,12 +1580,7 @@ def _anyall_spec_into_go[
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in SPEC_ANYALL_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[SPEC_ANYALL_DTYPES](a.dtype):
         raise Error("mojo spec any/all: unsupported dtype ", a.dtype)
     var rows = 0
     var cols = 0
@@ -1673,12 +1654,7 @@ def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     dim transpose recursion stays in Python (view ops)."""
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
         raise Error("mojo spec log_softmax: unsupported dtype ", a.dtype)
     if a.rank < 1 or a.numel == 0:
         raise Error("mojo spec log_softmax: empty or rank-0 input")
@@ -1688,10 +1664,7 @@ def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     var ctx = a.ctx()
     var nbytes = a.numel * a.itemsize
     _ = nbytes
-    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != a.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into(a, out, a.dtype)
     var addr = out.ptr
     if a.contig:
         comptime for dt in FLOAT_DTYPES:

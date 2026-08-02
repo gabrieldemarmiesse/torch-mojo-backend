@@ -59,6 +59,8 @@ from std.python._cpython import PyObjectPtr, Py_ssize_t
 from op_utils import (
     FLOAT_DTYPES,
     MAX_RANK,
+    _check_into,
+    _check_into_sized,
     _enqueue_cached,
     _make_ptr,
     _parallel_for,
@@ -77,7 +79,12 @@ from op_utils import (
     ieee_sqrt,
 )
 
-from variant_gates import _dtype_arg_on, _op_on, _register_call
+from variant_gates import (
+    _dtype_arg_on,
+    _dtype_supported,
+    _op_on,
+    _register_call,
+)
 
 
 @always_inline
@@ -3185,6 +3192,8 @@ def _any_bool_dispatcher(
     return _raw_ret_none()
 
 
+comptime SPEC_CUMSUM_DTYPES = [DType.int64, DType.int32, DType.float32]
+
 comptime SPEC_MAXROWS_DTYPES = [
     DType.float32,
     DType.float16,
@@ -3202,12 +3211,7 @@ def _mean_spec_into_go(
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
         raise Error("mojo spec mean: unsupported dtype ", a.dtype)
     var rows = 0
     var cols = 0
@@ -3234,10 +3238,7 @@ def _mean_spec_into_go(
     var ctx = a.ctx()
     var nbytes = rows * a.itemsize
     _ = nbytes
-    if out.numel != rows or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != a.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into_sized(a, out, rows, a.dtype)
     var addr = out.ptr
     if rows > 0:
         if needs_copy:
@@ -3285,12 +3286,7 @@ def _max_spec_into_go(
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in SPEC_MAXROWS_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[SPEC_MAXROWS_DTYPES](a.dtype):
         raise Error("mojo spec max: unsupported dtype ", a.dtype)
     if a.numel == 0:
         raise Error("mojo spec max: empty input")
@@ -3317,10 +3313,7 @@ def _max_spec_into_go(
     var ctx = a.ctx()
     var nbytes = rows * a.itemsize
     _ = nbytes
-    if out.numel != rows or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != a.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into_sized(a, out, rows, a.dtype)
     var addr = out.ptr
     if rows > 0:
         if needs_copy:
@@ -3368,12 +3361,7 @@ def _argmax_spec_into_go(
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in SPEC_MAXROWS_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[SPEC_MAXROWS_DTYPES](a.dtype):
         raise Error("mojo spec argmax: unsupported dtype ", a.dtype)
     if a.numel == 0:
         raise Error("mojo spec argmax: empty input")
@@ -3400,10 +3388,7 @@ def _argmax_spec_into_go(
     var ctx = a.ctx()
     var nbytes = rows * 8  # int64 output
     _ = nbytes
-    if out.numel != rows or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != DType.int64:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into_sized(a, out, rows, DType.int64)
     var addr = out.ptr
     if rows > 0:
         if needs_copy:
@@ -3447,12 +3432,7 @@ def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     """Cumulative sum over the trailing dim; full-shape output."""
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in [DType.int64, DType.int32, DType.float32]:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[SPEC_CUMSUM_DTYPES](a.dtype):
         raise Error("mojo spec cumsum: unsupported dtype ", a.dtype)
     if a.rank < 1 or a.numel == 0:
         raise Error("mojo spec cumsum: empty or rank-0 input")
@@ -3462,10 +3442,7 @@ def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     var ctx = a.ctx()
     var nbytes = a.numel * a.itemsize
     _ = nbytes
-    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != a.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into(a, out, a.dtype)
     var addr = out.ptr
     if a.contig:
         comptime for dt in [DType.int64, DType.int32, DType.float32]:
@@ -3541,12 +3518,7 @@ def _batch_norm_spec_into_go(
         or betap.dtype != inp.dtype
     ):
         raise Error("mojo spec batch_norm: stat/affine dtypes must match input")
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if inp.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[FLOAT_DTYPES](inp.dtype):
         raise Error("mojo spec batch_norm: unsupported dtype ", inp.dtype)
 
     var channels = inp.dim(1)
@@ -3557,10 +3529,7 @@ def _batch_norm_spec_into_go(
     var ctx = inp.ctx()
     var nbytes = inp.numel * inp.itemsize
     _ = nbytes
-    if out.numel != inp.numel or not out.contig or out.ctx_ptr != inp.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != inp.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into(inp, out, inp.dtype)
     var addr = out.ptr
     comptime for dt in FLOAT_DTYPES:
         comptime if _dtype_arg_on[0, dt]():
@@ -3607,12 +3576,7 @@ def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     half_to_float cast stay in Python."""
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
         raise Error("mojo spec softmax: unsupported dtype ", a.dtype)
     if a.rank < 1 or a.numel == 0:
         raise Error("mojo spec softmax: empty or rank-0 input")
@@ -3622,10 +3586,7 @@ def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     var ctx = a.ctx()
     var nbytes = a.numel * a.itemsize
     _ = nbytes
-    if out.numel != a.numel or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != a.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into(a, out, a.dtype)
     var addr = out.ptr
     if a.contig:
         comptime for dt in FLOAT_DTYPES:
@@ -3687,12 +3648,7 @@ def _attn_decode_spec_into_go(
         raise Error("mojo spec attn_decode: rank != 4")
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise Error("mojo spec attn_decode: dtypes differ")
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if q.dtype == dt:
-                supported = True
-    if not supported:
+    if not _dtype_supported[FLOAT_DTYPES](q.dtype):
         raise Error("mojo spec attn_decode: unsupported dtype ", q.dtype)
     var b = q.shape[MAX_RANK - 4]
     var h = q.shape[MAX_RANK - 3]
@@ -3731,10 +3687,7 @@ def _attn_decode_spec_into_go(
     var numel = b * h * head_dim
     var nbytes = numel * q.itemsize
     _ = nbytes
-    if out.numel != numel or not out.contig or out.ctx_ptr != q.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != q.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
+    _check_into_sized(q, out, numel, q.dtype)
     var addr = out.ptr
     comptime for dt in FLOAT_DTYPES:
         comptime if _dtype_arg_on[0, dt]():

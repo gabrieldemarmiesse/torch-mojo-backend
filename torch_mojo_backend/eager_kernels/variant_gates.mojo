@@ -40,6 +40,25 @@ def _dtype_out_on[index: Int, dt: DType]() -> Bool:
 
 
 @always_inline
+def _dtype_supported[dtypes: List[DType], index: Int = 0](d: DType) -> Bool:
+    """Whether ``d`` is in ``dtypes`` AND the compiled-in dtype of tensor
+    argument ``index`` — the shared form of every bridge's support-check
+    ladder (``var supported = False; comptime for dt ...``).
+
+    Lives in this file on purpose: the define-name scanner
+    (``eager_kernels._scan_define_names``) skips the gate library and instead
+    recognizes ``_dtype_supported[...]`` call sites as reads of
+    ``DTYPE_ARG_<index>``, so a bridge whose only argument gate is this check
+    still keeps that define in its cache key and compile line.
+    """
+    comptime for dt in dtypes:
+        comptime if _dtype_arg_on[index, dt]():
+            if d == dt:
+                return True
+    return False
+
+
+@always_inline
 def _dtype_arg_abi_on[index: Int, dt: DType]() -> Bool:
     """Exact argument gate with bool payloads represented as uint8 storage."""
     comptime if _dtype_arg_on[index, dt]():
