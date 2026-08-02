@@ -107,7 +107,6 @@ def _call_mojo(
     arg_dtypes: tuple[DType, ...],
     output_dtypes: tuple[DType, ...] = (),
     flags: dict[str, _VariantFlag] | None = None,
-    result_specs: object = None,
 ) -> object:
     """Invoke one exact, shape-independent stateless Mojo extension."""
     try:
@@ -117,7 +116,6 @@ def _call_mojo(
             arg_dtypes=arg_dtypes,
             output_dtypes=output_dtypes,
             flags=flags,
-            result_specs=result_specs,
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -1062,16 +1060,6 @@ def _spec_of(t):
     return spec
 
 
-def _wrap_spec_result(result, dtype, device):
-    """Mint the torch wrapper for a spec op's (holder, spec, shape, ptr)."""
-    holder, spec, shape, ptr = result
-    out = TorchMojoTensor._make(
-        holder, ptr, shape, _row_major_strides(shape), 0, dtype, device, contiguous=True
-    )
-    out._spec = spec
-    return out
-
-
 # The canonical defines of a spec launch are a pure function of the operation
 # name and the dtypes involved, yet `make_canonical_defines` re-validates and
 # re-sorts them on every warm launch (~2.4 µs). Each *SpecExtension overrides
@@ -1846,11 +1834,7 @@ def _submit_min_dim(
         _allocate_output_spec(prepared.output_specs[0]),
         _allocate_output_spec(prepared.output_specs[1]),
     )
-    prepared.enqueue_into(
-        prepared.extension.extension_args(
-            outputs, *prepared.args, **dict(prepared.kwargs)
-        )
-    )
+    prepared.enqueue_into(prepared.extension.extension_args(outputs, *prepared.args))
     return outputs
 
 
@@ -1926,14 +1910,6 @@ def _try_spec_reduce(
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
-
-
-def _wrap_spec_pair(result, dtype0, dtype1, device):
-    """Mint two torch wrappers from a two-group spec result."""
-    return (
-        _wrap_spec_result(result[0], dtype0, device),
-        _wrap_spec_result(result[1], dtype1, device),
-    )
 
 
 _DEVICE_OOM_MARKERS = (
@@ -2087,9 +2063,10 @@ def _submit_spec_matmul(
     device allocator failure still propagates as ``torch.OutOfMemoryError``.
     """
     try:
+        # No force_sync needed: _submit_prepared_into already executes
+        # synchronously whenever the queue is disabled.
         return _submit_prepared_into(
-            _MatmulSpecExtension.prepare(spec_fn_name, ts, transpose_b),
-            force_sync=not _call_queue.enabled(),
+            _MatmulSpecExtension.prepare(spec_fn_name, ts, transpose_b)
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -2157,7 +2134,6 @@ def _try_spec_scalar(spec_fn_name, x, scalar):
             (_spec_of(a), float(scalar), _spec_of(out)),
             arg_dtypes=(a._dtype,),
             output_dtypes=(out._dtype,),
-            result_specs=_TensorOutputSpec(a._shape, a._dtype, a._device),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -2207,7 +2183,6 @@ def _try_spec_int_scalar(spec_fn_name, x, scalar):
             (_spec_of(a), scalar, _spec_of(out)),
             arg_dtypes=(a._dtype,),
             output_dtypes=(out._dtype,),
-            result_specs=_TensorOutputSpec(a._shape, a._dtype, a._device),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -4159,7 +4134,6 @@ def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, e
             ),
             arg_dtypes=(a._dtype, *(stat._dtype for stat in stats)),
             output_dtypes=(out._dtype,),
-            result_specs=_TensorOutputSpec(a._shape, a._dtype, a._device),
         )
         # Inference mode returns empty (0,) tensors for the saved stats.
         return (
@@ -7879,7 +7853,6 @@ def fast_aten_scaled_dot_product_attention(
                 ),
                 arg_dtypes=(q._dtype, k._dtype, v._dtype),
                 output_dtypes=(out._dtype,),
-                result_specs=_TensorOutputSpec(out._shape, out._dtype, out._device),
             )
             return out
         result = _sdpa_math_forward_with_dropout(

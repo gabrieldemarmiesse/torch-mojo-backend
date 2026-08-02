@@ -770,7 +770,6 @@ class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
     defines: CanonicalDefines
     output_specs: _OutputSpecs
     args: tuple[object, ...]
-    kwargs: tuple[tuple[str, object], ...]
 
     def get_loaded_module(
         self, loader: MojoExtensionLoader | None = None
@@ -780,20 +779,17 @@ class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
 
     def execute(self, loader: MojoExtensionLoader | None = None) -> _ExtensionResult:
         module = self.get_loaded_module(loader)
-        return self.extension.call_extension(
-            module, self.output_specs, *self.args, **dict(self.kwargs)
-        )
+        return self.extension.call_extension(module, self.output_specs, *self.args)
 
     def enqueue_into(
         self,
         extension_args: tuple[object, ...],
         loader: MojoExtensionLoader | None = None,
-    ) -> _OutputSpecs:
-        """Queue a non-returning `call(..., out)` and return inferred outputs."""
+    ) -> None:
+        """Queue a non-returning `call(..., out)` into preallocated outputs."""
         selected_loader = loader or MOJO_EXTENSION_LOADER
         unit = selected_loader.unit_canonical(self.extension.MOJO_FILE, self.defines)
         call_queue.kernel_call_into(unit, extension_args)
-        return self.output_specs
 
 
 class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
@@ -858,9 +854,10 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
     ) -> PreparedExtensionCall[_OutputSpecs, _ExtensionResult]:
         output_specs = cls.expected_output_specs(*args, **kwargs)
         defines = cls.make_canonical_defines(*args, **kwargs)
-        return PreparedExtensionCall(
-            cls, defines, output_specs, args, tuple(kwargs.items())
-        )
+        # Keyword arguments (MojoFileExtension's dtype/flag declarations) are
+        # consumed above, by spec inference and the defines; the prepared call
+        # itself carries only the positional runtime arguments.
+        return PreparedExtensionCall(cls, defines, output_specs, args)
 
 
 class MojoFileExtension(MojoExtension[object, object]):
@@ -939,10 +936,12 @@ class MojoFileExtension(MojoExtension[object, object]):
         op: str,
         extension_args: tuple[object, ...],
         *,
-        arg_dtypes: tuple[DType | str, ...],
+        arg_dtypes: tuple[DType | str, ...] = (),
         output_dtypes: tuple[DType | str, ...] = (),
         flags: Mapping[str, DefineValue] | None = None,
     ) -> object:
+        # The dtype/flag declarations select the variant at prepare() time;
+        # execution needs only the runtime arguments, so they default empty.
         del output_specs, op, arg_dtypes, output_dtypes, flags
         return extension.call(*extension_args)  # type: ignore[attr-defined, no-any-return]
 
@@ -955,13 +954,8 @@ class MojoFileExtension(MojoExtension[object, object]):
         arg_dtypes: tuple[DType | str, ...],
         output_dtypes: tuple[DType | str, ...] = (),
         flags: Mapping[str, DefineValue] | None = None,
-        result_specs: object = None,
     ) -> object:
         """Compile/load this exact variant, preserving the launch FIFO."""
-        # result_specs is accepted and ignored: the outputs are allocated and
-        # returned by the caller. Delete the parameter once the aten_fast
-        # call sites stop passing it.
-        del result_specs
         prepared = cls.prepare(
             op,
             extension_args,

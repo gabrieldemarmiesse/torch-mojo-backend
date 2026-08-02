@@ -302,7 +302,7 @@ class _ElementwiseAdd(eager_kernels.MojoExtension[_TensorMetadata, _TensorMetada
 
     @classmethod
     def make_defines(
-        cls, left: _TensorMetadata, right: _TensorMetadata, *, inplace: bool = False
+        cls, left: _TensorMetadata, right: _TensorMetadata, inplace: bool = False
     ) -> dict[str, eager_kernels.DefineValue]:
         return {
             "OP": "AddSpec",
@@ -314,7 +314,7 @@ class _ElementwiseAdd(eager_kernels.MojoExtension[_TensorMetadata, _TensorMetada
 
     @classmethod
     def expected_output_specs(
-        cls, left: _TensorMetadata, right: _TensorMetadata, *, inplace: bool = False
+        cls, left: _TensorMetadata, right: _TensorMetadata, inplace: bool = False
     ) -> _TensorMetadata:
         del right, inplace
         return _TensorMetadata(left.shape, left.dtype)
@@ -326,7 +326,6 @@ class _ElementwiseAdd(eager_kernels.MojoExtension[_TensorMetadata, _TensorMetada
         output_specs: _TensorMetadata,
         left: _TensorMetadata,
         right: _TensorMetadata,
-        *,
         inplace: bool = False,
     ) -> _TensorMetadata:
         return extension.call(  # type: ignore[attr-defined, no-any-return]
@@ -387,7 +386,7 @@ def test_prepared_call_invokes_only_constant_call_entrypoint() -> None:
 
     left = _TensorMetadata((4, 8), "float32")
     right = _TensorMetadata((4, 8), "float32")
-    prepared = _ElementwiseAdd.prepare(left, right, inplace=True)
+    prepared = _ElementwiseAdd.prepare(left, right, True)
 
     assert prepared.execute(FakeLoader()) == _TensorMetadata((4, 8), "float32")
     assert calls == [(left, right, prepared.output_specs, True)]
@@ -436,8 +435,8 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
     second = _ElementwiseAdd.prepare(
         _TensorMetadata((9,), "float32"), _TensorMetadata((9,), "float32")
     )
-    assert first.enqueue_into(("first",), loader) == first.output_specs
-    assert second.enqueue_into(("second",), loader) == second.output_specs
+    first.enqueue_into(("first",), loader)
+    second.enqueue_into(("second",), loader)
     assert queue.active()
 
     module = ModuleType("queued_elementwise_add")

@@ -62,8 +62,6 @@ def _submit_prepared_into(
     if force_sync or not _call_queue.enabled():
         return prepared.execute()
     out = _allocate_output_spec(prepared.output_specs)
-    extension_args = prepared.extension.extension_args(
-        out, *prepared.args, **dict(prepared.kwargs)
-    )
+    extension_args = prepared.extension.extension_args(out, *prepared.args)
     prepared.enqueue_into(extension_args)
     return out
