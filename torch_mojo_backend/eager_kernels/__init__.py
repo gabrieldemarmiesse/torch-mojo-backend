@@ -849,6 +849,16 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
         """Invoke extension.call using the same explicit operation arguments."""
 
     @classmethod
+    def allocate_outputs(cls, output_specs: _OutputSpecs) -> _ExtensionResult:
+        """Allocate this descriptor's outputs from their inferred specs.
+
+        The default covers every single-output family: one tensor from one
+        spec. Descriptors with several outputs override this with the same
+        allocation their ``call_extension`` performs.
+        """
+        return _allocate_single_output(output_specs)  # type: ignore[return-value]
+
+    @classmethod
     def prepare(
         cls, *args: object, **kwargs: object
     ) -> PreparedExtensionCall[_OutputSpecs, _ExtensionResult]:
@@ -858,6 +868,21 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
         # consumed above, by spec inference and the defines; the prepared call
         # itself carries only the positional runtime arguments.
         return PreparedExtensionCall(cls, defines, output_specs, args)
+
+
+def _allocate_single_output(spec: object) -> object:
+    """``output_specs._allocate_output_spec``, resolved on first use.
+
+    ``output_specs`` imports this package, so it cannot be imported at module
+    scope here; rebinding the global on the first allocation leaves the
+    steady state at one plain lookup (the same trick as ``output_specs``'s
+    own ``_alloc``).
+    """
+    global _allocate_single_output
+    from torch_mojo_backend.eager_kernels.output_specs import _allocate_output_spec
+
+    _allocate_single_output = _allocate_output_spec
+    return _allocate_output_spec(spec)
 
 
 class MojoFileExtension(MojoExtension[object, object]):

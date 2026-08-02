@@ -1786,6 +1786,15 @@ class _MinDimSpecExtension(
         )
 
     @classmethod
+    def allocate_outputs(
+        cls, output_specs: tuple[_TensorOutputSpec, _TensorOutputSpec]
+    ) -> tuple[TorchMojoTensor, TorchMojoTensor]:
+        return (
+            _allocate_output_spec(output_specs[0]),
+            _allocate_output_spec(output_specs[1]),
+        )
+
+    @classmethod
     def extension_args(
         cls,
         outputs: tuple[TorchMojoTensor, TorchMojoTensor],
@@ -1818,24 +1827,22 @@ class _MinDimSpecExtension(
         return outputs
 
 
-def _submit_min_dim(
-    prepared: eager_kernels.PreparedExtensionCall[
-        tuple[_TensorOutputSpec, _TensorOutputSpec],
-        tuple[TorchMojoTensor, TorchMojoTensor],
-    ],
-    *,
-    force_sync: bool = False,
-) -> tuple[TorchMojoTensor, TorchMojoTensor]:
-    if force_sync and _call_queue.enabled():
-        _call_queue.drain()
-    if force_sync or not _call_queue.enabled():
-        return prepared.execute()
-    outputs = (
-        _allocate_output_spec(prepared.output_specs[0]),
-        _allocate_output_spec(prepared.output_specs[1]),
-    )
-    prepared.enqueue_into(prepared.extension.extension_args(outputs, *prepared.args))
-    return outputs
+def _try_spec_min_dim(
+    a: TorchMojoTensor, dim: int, keepdim: bool
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | None:
+    """min.dim through the two-output spec op, or None.
+
+    Same shape as every sibling `_try_spec_*` route: queue-eligible metadata
+    submits into the queue, everything else drains and runs synchronously.
+    """
+    ok = _call_queue.enabled() and a._numel > 0 and a._dtype in _SPEC_ROWRED_INTO
+    try:
+        return _submit_prepared_into(
+            _MinDimSpecExtension.prepare(a, dim, keepdim), force_sync=not ok
+        )
+    except Exception as exc:
+        _raise_if_device_oom(exc)
+        return None
 
 
 def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_ops"):
@@ -4748,15 +4755,8 @@ def fast_aten_min_dim(input, dim, keepdim=False):
     if rank == 0 or not -rank <= dim < rank:
         return NOT_HANDLED
     rdim = dim % rank
-    if _call_queue.enabled() and a._numel > 0 and a._dtype in _SPEC_ROWRED_INTO:
-        return _submit_min_dim(_MinDimSpecExtension.prepare(a, rdim, bool(keepdim)))
-    try:
-        return _submit_min_dim(
-            _MinDimSpecExtension.prepare(a, rdim, bool(keepdim)), force_sync=True
-        )
-    except Exception as exc:
-        _raise_if_device_oom(exc)
-    return NOT_HANDLED
+    result = _try_spec_min_dim(a, rdim, bool(keepdim))
+    return result if result is not None else NOT_HANDLED
 
 
 def _argreduce(input, dim, keepdim, is_min):

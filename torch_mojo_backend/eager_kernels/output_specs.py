@@ -13,6 +13,7 @@ imports ``aten_fast``.
 """
 
 from dataclasses import dataclass
+from typing import TypeVar
 
 import torch
 from max.driver import Device
@@ -20,6 +21,9 @@ from max.dtype import DType
 
 from torch_mojo_backend import eager_kernels
 from torch_mojo_backend.eager_kernels import call_queue as _call_queue
+
+_Specs = TypeVar("_Specs")
+_Result = TypeVar("_Result")
 
 
 @dataclass(frozen=True)
@@ -52,16 +56,19 @@ def _allocate_output_spec(spec: _TensorOutputSpec) -> torch.Tensor:
 
 
 def _submit_prepared_into(
-    prepared: eager_kernels.PreparedExtensionCall[_TensorOutputSpec, torch.Tensor],
+    prepared: "eager_kernels.PreparedExtensionCall[_Specs, _Result]",
     *,
     force_sync: bool = False,
-) -> torch.Tensor:
-    """Allocate from inferred metadata and queue, or execute synchronously."""
+) -> _Result:
+    """Allocate from inferred metadata and queue, or execute synchronously.
+
+    Output arity is the descriptor's business: ``allocate_outputs`` returns
+    whatever container ``extension_args`` accepts as its ``out``.
+    """
     if force_sync and _call_queue.enabled():
         _call_queue.drain()
     if force_sync or not _call_queue.enabled():
         return prepared.execute()
-    out = _allocate_output_spec(prepared.output_specs)
-    extension_args = prepared.extension.extension_args(out, *prepared.args)
-    prepared.enqueue_into(extension_args)
+    out = prepared.extension.allocate_outputs(prepared.output_specs)
+    prepared.enqueue_into(prepared.extension.extension_args(out, *prepared.args))
     return out
