@@ -1,4 +1,6 @@
+import math
 import os
+from collections.abc import Callable
 
 os.environ["MODULAR_TELEMETRY_ENABLED"] = "0"
 os.environ["MAX_USE_EAGER_INTERPRETER"] = "1"
@@ -12,6 +14,8 @@ pytest.register_assert_rewrite("torch_mojo_backend.testing")
 
 
 import torch
+from max.driver import Device
+from max.dtype import DType
 from mojo.paths import _build_mojo_source_package
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
@@ -101,6 +105,70 @@ def mojo_device(request, mojo_gpu_available: bool):
         yield ("mojo:0")
 
 
+@pytest.fixture
+def mojo_gpu(mojo_gpu_available: bool) -> str:
+    """GPU mojo device only — for ops whose fast path is GPU-gated.
+
+    Shared by every module that needs one: four copies of this fixture used
+    to disagree about whether they registered the devices first.
+    """
+    if not mojo_gpu_available:
+        pytest.skip("You do not have a GPU supported by MAX")
+    register_mojo_devices()  # idempotent; some callers have no autouse setup
+    return "mojo:0"
+
+
+@pytest.fixture
+def fake_mojo_tensor() -> Callable[..., torch.Tensor]:
+    """Build a `TorchMojoTensor` whose payload metadata is pure fiction.
+
+    Host-only tests of the kernel wiring need a tensor that answers every
+    metadata question `aten_fast` asks (`_shape`, `_dtype`, `_ptr`, ...)
+    without owning device memory, so the prologue of a kernel route can be
+    exercised on a machine with no GPU. The pointer is never dereferenced:
+    such tests replace the native `call` entry point.
+    """
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+        TorchMojoTensor,
+        _row_major_strides,
+        _torch_dtype_of,
+    )
+
+    def make(
+        device: Device,
+        *,
+        dtype: DType = DType.float32,
+        shape: tuple[int, ...] = (2, 3),
+        strides: tuple[int, ...] | None = None,
+        ptr: int = 1,
+    ) -> torch.Tensor:
+        shape = tuple(shape)
+        strides = _row_major_strides(shape) if strides is None else tuple(strides)
+        tensor = torch.Tensor._make_wrapper_subclass(
+            TorchMojoTensor,
+            shape,
+            strides=strides,
+            storage_offset=0,
+            dtype=_torch_dtype_of(dtype),
+            layout=torch.strided,
+            device="cpu",
+            requires_grad=False,
+        )
+        tensor._holder = object()
+        tensor._ptr = ptr
+        tensor._device = device
+        tensor._dtype = dtype
+        tensor._shape = shape
+        tensor._strides = strides
+        tensor._offset = 0
+        tensor._itemsize = dtype.size_in_bytes
+        tensor._numel = math.prod(shape)
+        tensor._is_contiguous = True
+        return tensor
+
+    return make
+
+
 def pytest_make_parametrize_id(val):
     """Custom ID generation for parametrized tests"""
 
@@ -117,3 +185,33 @@ def call_checker():
     call_checker_instance = CallChecker()
     yield call_checker_instance
     call_checker_instance.check_was_called()
+
+
+def require_cuda_autograd(device: str) -> None:
+    """Skip when this process can no longer run a CUDA backward.
+
+    `at::getAccelerator()` names exactly one accelerator device type, and it
+    returns PrivateUse1 as soon as a PrivateUse1 backend is registered --
+    which `register_mojo_devices()` does, process-wide and with no way to
+    undo it. From then on `Node::stream()` finds no input metadata on the
+    accelerator device type for a CUDA node and returns nullopt, so the
+    autograd engine trips
+    `TORCH_INTERNAL_ASSERT(opt_ready_stream && opt_parent_stream)`
+    (engine.cpp) for *any* backward over CUDA tensors. Verified with no
+    compilation involved: after `register_mojo_devices()`, a bare
+    `(torch.randn(4, 4, device="cuda", requires_grad=True) * 2).sum()
+    .backward()` raises that assert.
+
+    So a test that runs or traces a CUDA backward -- which every compile of
+    an `nn.Module` with trainable parameters does, via AOTAutograd's joint
+    graph -- needs a process where CUDA is still torch's accelerator.
+    """
+    if device != "cuda":
+        return
+    accelerator = torch.accelerator.current_accelerator()
+    if accelerator is not None and accelerator.type != "cuda":
+        pytest.skip(
+            f"torch's accelerator is {accelerator.type!r}, not 'cuda': a "
+            "PrivateUse1 backend (the mojo device) was registered earlier in "
+            "this process, which breaks CUDA autograd inside PyTorch itself."
+        )

@@ -20,6 +20,15 @@ outputs and request their own compilations. Only the device launch waits for
 the extension build. Operations whose output metadata depends on tensor data
 cannot use this asynchronous path without synchronizing first.
 
+Requested builds run on a bounded background pool (`_ASYNC_BUILD_SLOTS` in
+`eager_kernels/__init__.py`, sized by `_pool_size()`: available RAM / 5 GiB
+and cores / 3, capped at 16), so a cold workload compiles many variants
+concurrently while it keeps discovering operations. The measurements that
+motivated this design — including the pool-size sweep and the warm-path
+regression it currently costs — are recorded in
+[docs/fast_eager_design.md](fast_eager_design.md) under "Compile
+granularity".
+
 ## Stateless operation descriptors
 
 Each operation is represented by a stateless `MojoExtension` subclass. Its
@@ -103,9 +112,10 @@ it. An unsupported dtype or flag reported by Mojo indicates a bug in Python's
 definition mapping and is surfaced directly. There is no widening, dtype
 escalation, fallback build, or launch-time retry.
 
-Builds are protected by a process-level lock and written to temporary files
-before an atomic rename. Concurrent requests for one identity compile it once,
-and an interrupted compiler cannot leave a partial file that looks valid.
+Builds are protected by a per-identity file lock (`flock`) and written to a
+temporary file before an atomic rename. Concurrent requests for one identity,
+in this process or another, compile it once, and an interrupted compiler
+cannot leave a partial file that looks valid.
 
 ## Queue ordering
 
@@ -124,8 +134,14 @@ The queue follows these rules:
 3. **Keep-alive.** Queued raw pointers do not own their tensors, so prepared
    calls retain every input, output, and intermediate allocation until the
    queue drains.
-4. **Thread order.** Device work is ordered within an enqueuing thread. The
-   direct path and queue executor synchronize when execution changes threads.
+4. **Thread order.** Direct launches are ordered by their issuing thread and
+   cross no barrier between threads (the same regime eager mode has always
+   run forward and backward under). Queue launches replay work other threads
+   enqueued, which is the empirically unsafe pattern: the queue synchronizes
+   the device before launching when the launcher differs from an item's
+   enqueuer or from the last thread to issue device work, and the first
+   direct launch after a cross-thread queue launch synchronizes once more.
+   In steady state (empty queue) no synchronization happens at all.
 5. **Errors are deferred, not repaired.** A launch error is retained and
    re-raised at the next drain. The queue never changes definitions, rebuilds a
    broader module, or retries a failed call.
@@ -155,7 +171,13 @@ arguments and raises on disagreement.
 
 | Mode | How | Behavior |
 |---|---|---|
-| default | — | misses build in parallel; launches queue; reads drain |
-| sequential | `TMB_NO_TRIGGER_DEFER=1` | every miss blocks inline |
-| kill switch | `TMB_KERNEL_QUEUE=0` | same as sequential |
-| test suite | `TORCH_MOJO_BACKEND_TESTING=1` | queue off; `TMB_FORCE_KERNEL_QUEUE=1` enables it for focused queue tests |
+| default | — | misses build on the background pool; launches queue; host reads drain |
+| kill switch | `TORCH_MOJO_BACKEND_KERNEL_QUEUE=0` | no queue: every miss blocks inline at its call site and every launch happens immediately |
+| test suite | `TORCH_MOJO_BACKEND_TESTING=1` | queue off, because most tests assert synchronous contracts; `TORCH_MOJO_BACKEND_FORCE_KERNEL_QUEUE=1` turns it back on for the focused queue tests |
+
+Two further knobs, for debugging rather than mode selection:
+
+| Variable | Effect |
+|---|---|
+| `TORCH_MOJO_BACKEND_CAST_SYNC=1` | treat every `aten::_to_copy` / `aten::copy_` as a host-visible synchronization point and drain before it, instead of only those that actually cross devices. Conservative fallback if the same-device-cast heuristic ever proves wrong. |
+| `TORCH_MOJO_BACKEND_TRACE=1` | print a timestamp when each variant build starts and finishes, on stderr. |

@@ -560,7 +560,7 @@ def _strided_fill_dispatcher(
 # ===========================================================================
 # TensorSpec constructor (`make_spec`, the one Python-facing spec
 # constructor). The shared infrastructure (TensorSpec/TensorHolder structs,
-# _spec_ptr, _spec_result, _spec_unsupported) lives in `op_utils`; spec ops
+# _spec_ptr, _spec_unsupported) lives in `op_utils`; spec ops
 # live next to their kernels (see docs/tensor_spec_design.md §3).
 # ===========================================================================
 

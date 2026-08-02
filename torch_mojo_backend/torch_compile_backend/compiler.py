@@ -554,6 +554,14 @@ def _data_ptr_of(t: torch.Tensor) -> int:
 
 
 def _cached_buffer_for(t: torch.Tensor):
+    if not t.is_contiguous():
+        # A MAX Buffer is dense row-major, and the graph input type only
+        # carries a shape, so a strided input has to be materialized. The
+        # copy is a fresh allocation on every call and is deliberately NOT
+        # cached: the cache exists to alias input memory so that in-place
+        # updates stay visible, which a frozen copy could not honor.
+        return fast_from_dlpack(t.detach().contiguous())
+
     key = id(t)
     entry = _buffer_cache.get(key)
     if entry is not None:

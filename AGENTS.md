@@ -41,6 +41,12 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
 - **Debugging Tools**:
   - Environment variables for profiling and verbose output
   - Graph visualization when `TORCH_MOJO_BACKEND_VERBOSE=1`
+  - Eager-mode kernel builds and launches are described in
+    `docs/kernel_call_queue.md`. `TORCH_MOJO_BACKEND_KERNEL_QUEUE=0` is the kill
+    switch (every kernel builds and launches inline),
+    `TORCH_MOJO_BACKEND_FORCE_KERNEL_QUEUE=1` turns the queue back on under the
+    test suite, `TORCH_MOJO_BACKEND_CAST_SYNC=1` drains before every
+    `_to_copy`/`copy_`, and `TORCH_MOJO_BACKEND_TRACE=1` prints build timings.
 - **Model Examples**: `demo_scripts/` contains examples showing real-world usage:
   - GPT-2, Gemma3 (LLM models)
   - VGG, DenseNet (vision models)

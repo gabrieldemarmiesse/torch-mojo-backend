@@ -50,7 +50,6 @@ from op_utils import (
     _raw_ret_none,
     _raw_tuple_int,
     _spec_ptr,
-    _spec_result,
     _spec_unsupported,
 )
 
@@ -1215,67 +1214,10 @@ comptime SPEC_BCAST_DTYPES = [
 ]
 
 
-def _add_f32_bf16_spec_go(
-    a_o: PyObjectPtr, b_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    """Contiguous FP32 + BF16 -> FP32 without a promoted temporary."""
-    ref a = _spec_ptr(a_o)[]
-    ref b = _spec_ptr(b_o)[]
-
-    if a.ctx_ptr != b.ctx_ptr:
-        raise Error("mojo spec add f32 bf16: operands on different devices")
-    if not (
-        (a.dtype == DType.float32 and b.dtype == DType.bfloat16)
-        or (a.dtype == DType.bfloat16 and b.dtype == DType.float32)
-    ):
-        raise Error("mojo spec add f32 bf16: expected one FP32 and one BF16")
-    if not (a.contig and b.contig):
-        raise Error("mojo spec add f32 bf16: operands must be contiguous")
-    if a.rank != b.rank or a.numel != b.numel:
-        raise Error("mojo spec add f32 bf16: operand shapes differ")
-    for i in range(MAX_RANK):
-        if a.shape[i] != b.shape[i]:
-            raise Error("mojo spec add f32 bf16: operand shapes differ")
-
-    var ctx = a.ctx()
-    if ctx.api() == "cpu":
-        raise Error("mojo spec add f32 bf16: accelerator context required")
-
-    var fp32_addr = a.ptr if a.dtype == DType.float32 else b.ptr
-    var bf16_addr = a.ptr if a.dtype == DType.bfloat16 else b.ptr
-    var nbytes = a.numel * 4
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if a.numel > 0:
-        _add_f32_bf16_contig(
-            _make_ptr[DType.float32](addr).as_unsafe_any_origin(),
-            _make_ptr[DType.float32](fp32_addr)
-            .as_unsafe_any_origin()
-            .as_immutable(),
-            _make_ptr[DType.bfloat16](bf16_addr)
-            .as_unsafe_any_origin()
-            .as_immutable(),
-            a.numel,
-            ctx,
-        )
-
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        a.rank,
-        a.shape,
-        DType.float32,
-        4,
-        a.numel,
-        a.ctx_ptr,
-    )
-
-
 def _add_f32_bf16_spec_into_go(
     a_o: PyObjectPtr, b_o: PyObjectPtr, out_o: PyObjectPtr
 ) raises:
-    """Into-variant: contiguous FP32 + BF16 -> caller-allocated FP32."""
+    """Contiguous FP32 + BF16 -> caller-allocated FP32."""
     ref a = _spec_ptr(a_o)[]
     ref b = _spec_ptr(b_o)[]
     ref out = _spec_ptr(out_o)[]
@@ -1326,177 +1268,23 @@ def _add_f32_bf16_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 3:
-            _add_f32_bf16_spec_into_go(args[0], args[1], args[2])
-            return _raw_ret_none()
-        return _add_f32_bf16_spec_go(args[0], args[1])
+        if nargs != 3:
+            raise Error(
+                "AddF32Bf16Spec expects exactly 3 arguments (a_spec, b_spec,"
+                " out_spec)"
+            )
+        _add_f32_bf16_spec_into_go(args[0], args[1], args[2])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _binary_spec_go[
-    op_code: Int, is_cmp: Bool
-](a_o: PyObjectPtr, b_o: PyObjectPtr) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    ref b = _spec_ptr(b_o)[]
-
-    if a.dtype != b.dtype:
-        raise Error("mojo spec binary: operand dtypes differ")
-    if a.ctx_ptr != b.ctx_ptr:
-        raise Error("mojo spec binary: operands on different devices")
-
-    # Kernel dispatch dtype: bool operands are read through uint8
-    # (bit-compatible; torch bool is one byte holding 0/1). Only comparisons,
-    # logical combinators and bitwise ops accept bool operands.
-    var kdtype = a.dtype
-    if a.dtype == DType.bool:
-        comptime if (
-            is_cmp
-            or op_code == BOP_MUL
-            or op_code == BOP_AND
-            or op_code == BOP_OR
-            or op_code == BOP_XOR
-        ):
-            # bool * bool is logical AND on the 0/1 uint8 storage.
-            kdtype = DType.uint8
-        else:
-            raise Error("mojo spec binary: bool operands not supported")
-
-    # Pre-gate the per-op dtype restrictions with spec-protocol messages so
-    # the kernel-level comptime raises never fire.
-    comptime if not is_cmp:
-        comptime if op_code == BOP_DIV or op_code == BOP_POW:
-            if not kdtype.is_floating_point():
-                raise Error("mojo spec binary: div/pow requires a float dtype")
-        comptime if (
-            op_code == BOP_AND or op_code == BOP_OR or op_code == BOP_XOR
-        ):
-            if kdtype.is_floating_point():
-                raise Error("mojo spec binary: bitwise requires an int dtype")
-
-    var supported = False
-    comptime for dt in SPEC_BCAST_DTYPES:
-        comptime if _dtype_arg_abi_on[0, dt]():
-            if kdtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec binary: unsupported dtype ", a.dtype)
-
-    # Comparisons/logical write a bool output regardless of operand dtype.
-    var out_dtype = a.dtype
-    var out_itemsize = a.itemsize
-    comptime if is_cmp:
-        out_dtype = DType.bool
-        out_itemsize = 1
-
-    var d = IndexList[4](1)
-    var ls = IndexList[4](0)
-    var rs = IndexList[4](0)
-    var out_rank = max(a.rank, b.rank)
-    var oshape = IndexList[MAX_RANK](1)
-    if a.rank > 4 or b.rank > 4:
-        # Same-shape flat treatment only (broadcasting stays rank <= 4);
-        # the Python hook pre-materializes rank>4 strided operands.
-        if a.rank != b.rank:
-            raise Error("mojo spec binary: rank > 4 needs equal shapes")
-        for i in range(MAX_RANK):
-            if a.shape[i] != b.shape[i]:
-                raise Error("mojo spec binary: rank > 4 needs equal shapes")
-        if not (a.contig and b.contig):
-            raise Error("mojo spec binary: rank > 4 needs contiguous operands")
-        d[3] = a.numel
-        ls[3] = 1
-        rs[3] = 1
-        oshape = a.shape
-    else:
-        # Broadcast over the trailing 4 slots; leading padding aligns ranks.
-        for k in range(4):
-            var i = MAX_RANK - 4 + k
-            var sa = a.shape[i]
-            var sb = b.shape[i]
-            var s: Int
-            if sa == sb:
-                s = sa
-            elif sa == 1:
-                s = sb
-            elif sb == 1:
-                s = sa
-            else:
-                raise Error("mojo spec binary: shapes do not broadcast")
-            d[k] = s
-            ls[k] = a.strides[i] if sa != 1 else 0
-            rs[k] = b.strides[i] if sb != 1 else 0
-        for k in range(4):
-            oshape[MAX_RANK - 4 + k] = d[k]
-    var numel = d[0] * d[1] * d[2] * d[3]
-    var nbytes = numel * out_itemsize
-    var ctx = a.ctx()
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-
-    if numel > 0:
-        comptime for dt in SPEC_BCAST_DTYPES:
-            comptime if _dtype_arg_abi_on[0, dt]():
-                if kdtype == dt:
-                    comptime if is_cmp:
-                        _cmp_bcast[dt, op_code](
-                            addr,
-                            a.ptr,
-                            b.ptr,
-                            d[1],
-                            d[2],
-                            d[3],
-                            ls[0],
-                            ls[1],
-                            ls[2],
-                            ls[3],
-                            rs[0],
-                            rs[1],
-                            rs[2],
-                            rs[3],
-                            numel,
-                            ctx,
-                        )
-                    else:
-                        _bin_bcast[dt, op_code](
-                            addr,
-                            a.ptr,
-                            b.ptr,
-                            d[1],
-                            d[2],
-                            d[3],
-                            ls[0],
-                            ls[1],
-                            ls[2],
-                            ls[3],
-                            rs[0],
-                            rs[1],
-                            rs[2],
-                            rs[3],
-                            numel,
-                            ctx,
-                        )
-
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        out_rank,
-        oshape,
-        out_dtype,
-        out_itemsize,
-        numel,
-        a.ctx_ptr,
-    )
 
 
 def _binary_spec_into_go[
     op_code: Int, is_cmp: Bool
 ](a_o: PyObjectPtr, b_o: PyObjectPtr, out_o: PyObjectPtr) raises:
-    """Into-variant of _binary_spec_go: launch into a caller-allocated
-    contiguous output. Python owns allocation and shape math (call-queue
-    mode), so the call returns nothing and can hold a FIFO slot while its
-    unit builds."""
+    """Launch into a caller-allocated contiguous output. Python owns
+    allocation and shape math, so the call returns nothing and can hold a
+    FIFO slot while its unit builds."""
     ref a = _spec_ptr(a_o)[]
     ref b = _spec_ptr(b_o)[]
     ref out = _spec_ptr(out_o)[]
@@ -1641,10 +1429,13 @@ def _binary_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 3:
-            _binary_spec_into_go[op_code, is_cmp](args[0], args[1], args[2])
-            return _raw_ret_none()
-        return _binary_spec_go[op_code, is_cmp](args[0], args[1])
+        if nargs != 3:
+            raise Error(
+                "a binary spec op expects exactly 3 arguments (a_spec, b_spec,"
+                " out_spec)"
+            )
+        _binary_spec_into_go[op_code, is_cmp](args[0], args[1], args[2])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
 
@@ -1662,213 +1453,158 @@ def PyInit_logic_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _add_f32_bf16_spec_dispatcher,
-                "AddF32Bf16Spec",
                 docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); "
-                    "contiguous FP32 + BF16 -> FP32"
+                    "(a_spec, b_spec, out_spec); contiguous FP32 + BF16 -> FP32"
                 ),
             )
         comptime if _op_on["AddSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_ADD, False],
-                "AddSpec",
-                docstring="(a_spec, b_spec) -> (holder, spec, shape, ptr); + ",
+                docstring="(a_spec, b_spec, out_spec); + ",
             )
         comptime if _op_on["SubSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_SUB, False],
-                "SubSpec",
-                docstring="(a_spec, b_spec) -> (holder, spec, shape, ptr); - ",
+                docstring="(a_spec, b_spec, out_spec); - ",
             )
         comptime if _op_on["MulSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_MUL, False],
-                "MulSpec",
-                docstring="(a_spec, b_spec) -> (holder, spec, shape, ptr); * ",
+                docstring="(a_spec, b_spec, out_spec); * ",
             )
         comptime if _op_on["DivSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_DIV, False],
-                "DivSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); / float"
-                ),
+                docstring="(a_spec, b_spec, out_spec); / float",
             )
         comptime if _op_on["MaximumSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_MAX, False],
-                "MaximumSpec",
-                docstring="(a_spec, b_spec) -> (holder, spec, shape, ptr); max",
+                docstring="(a_spec, b_spec, out_spec); max",
             )
         comptime if _op_on["MinimumSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_MIN, False],
-                "MinimumSpec",
-                docstring="(a_spec, b_spec) -> (holder, spec, shape, ptr); min",
+                docstring="(a_spec, b_spec, out_spec); min",
             )
         comptime if _op_on["PowSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_POW, False],
-                "PowSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); ** float"
-                ),
+                docstring="(a_spec, b_spec, out_spec); ** float",
             )
         comptime if _op_on["RemainderSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_REMAINDER, False],
-                "RemainderSpec",
-                docstring="(a_spec, b_spec) -> (holder, spec, shape, ptr); %",
+                docstring="(a_spec, b_spec, out_spec); %",
             )
         comptime if _op_on["FloorDivSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_FLOORDIV, False],
-                "FloorDivSpec",
-                docstring="(a_spec, b_spec) -> (holder, spec, shape, ptr); //",
+                docstring="(a_spec, b_spec, out_spec); //",
             )
         comptime if _op_on["BitwiseAndSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_AND, False],
-                "BitwiseAndSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); & int/bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); & int/bool",
             )
         comptime if _op_on["BitwiseOrSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_OR, False],
-                "BitwiseOrSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); | int/bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); | int/bool",
             )
         comptime if _op_on["BitwiseXorSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[BOP_XOR, False],
-                "BitwiseXorSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); ^ int/bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); ^ int/bool",
             )
         comptime if _op_on["EqSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[COP_EQ, True],
-                "EqSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); == -> bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); == -> bool",
             )
         comptime if _op_on["NeSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[COP_NE, True],
-                "NeSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); != -> bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); != -> bool",
             )
         comptime if _op_on["LtSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[COP_LT, True],
-                "LtSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); < -> bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); < -> bool",
             )
         comptime if _op_on["LeSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[COP_LE, True],
-                "LeSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); <= -> bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); <= -> bool",
             )
         comptime if _op_on["GtSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[COP_GT, True],
-                "GtSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); > -> bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); > -> bool",
             )
         comptime if _op_on["GeSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[COP_GE, True],
-                "GeSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); >= -> bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); >= -> bool",
             )
         comptime if _op_on["LogicalAndSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[COP_LAND, True],
-                "LogicalAndSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); and ->"
-                    " bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); and -> bool",
             )
         comptime if _op_on["LogicalXorSpec"]():
             _register_call(
                 b,
                 _binary_spec_dispatcher[COP_LXOR, True],
-                "LogicalXorSpec",
-                docstring=(
-                    "(a_spec, b_spec) -> (holder, spec, shape, ptr); xor ->"
-                    " bool"
-                ),
+                docstring="(a_spec, b_spec, out_spec); xor -> bool",
             )
         comptime if _op_on["BitwiseNot"]():
             _register_call(
                 b,
                 _bitwise_not_dispatcher,
-                "BitwiseNot",
                 docstring="out = ~x (bool/int, contiguous)",
             )
         comptime if _op_on["IsIn"]():
             _register_call(
                 b,
                 _isin_dispatcher,
-                "IsIn",
                 docstring="out[i] = x[i] in test (int dtypes) ^ invert",
             )
         comptime if _op_on["ClampScalar"]():
             _register_call(
                 b,
                 _clamp_scalar_dispatcher,
-                "ClampScalar",
                 docstring="out = min(max(x, lo), hi) with optional bounds",
             )
         comptime if _op_on["AddcmulBcast"]():
             _register_call(
                 b,
                 _ternary_bcast_dispatcher[TOP_ADDCMUL],
-                "AddcmulBcast",
                 docstring="out = self + value * (t1 * t2) (broadcast strides)",
             )
         comptime if _op_on["AddcdivBcast"]():
             _register_call(
                 b,
                 _ternary_bcast_dispatcher[TOP_ADDCDIV],
-                "AddcdivBcast",
                 docstring="out = self + value * (t1 / t2) (broadcast strides)",
             )
         return b.finalize()

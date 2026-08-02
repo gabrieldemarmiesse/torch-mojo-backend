@@ -16,11 +16,11 @@ from std.gpu import (
 )
 from std.gpu.host import DeviceContext
 from std.gpu.primitives import block, warp
-from std.math import ceildiv, min, sqrt
+from std.math import ceildiv, min
 from std.memory import alloc
 from std.sys.info import has_apple_gpu_accelerator
 
-from op_utils import _enqueue_cached
+from op_utils import _enqueue_cached, ieee_sqrt
 
 
 comptime _BLOCK = 256
@@ -78,7 +78,7 @@ def _ln_fwd_warp_rows[
                 var centered = x[u] - row_mean
                 vacc = centered.fma(centered, vacc)
         var variance = warp.sum(vacc.reduce_add()) * inv_cols
-        var row_rstd = 1.0 / sqrt(variance + epsilon)
+        var row_rstd = 1.0 / ieee_sqrt(variance + epsilon)
         # Match ATen: NaN/inf rows report NaN for both statistics (the
         # centered-square reduction is nonnegative for finite rows).
         if variance != variance:
@@ -326,7 +326,7 @@ def _layer_norm_forward_f32_vec4[
         var variance = block.sum[block_size=_VEC_BLOCK, broadcast=True](
             thread_variance
         ) / Float32(cols)
-        var row_rstd = 1.0 / sqrt(variance + epsilon)
+        var row_rstd = 1.0 / ieee_sqrt(variance + epsilon)
         # A centered-square reduction is nonnegative for every finite row, so
         # no clamp is needed.  Preserve a non-finite reduction as NaN and use
         # it for both statistics: ATen reports NaN mean/rstd for rows that
@@ -391,7 +391,7 @@ def _layer_norm_forward_f32_baseline(
         var variance = block.sum[block_size=_BLOCK, broadcast=True](
             thread_variance
         ) / Float32(cols)
-        var row_rstd = 1.0 / sqrt(variance + epsilon)
+        var row_rstd = 1.0 / ieee_sqrt(variance + epsilon)
         if variance != variance:
             row_mean = variance
         if tid == 0:

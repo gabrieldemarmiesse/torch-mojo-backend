@@ -1,23 +1,24 @@
 # ===----------------------------------------------------------------------=== #
 # Fast eager-mode elementwise kernels for mojo_device.
 #
-# This module is imported from Python through `mojo.importer`: the first
-# import runs `mojo build --emit shared-lib` and caches the resulting
-# CPython extension under `__mojocache__/` next to this file (content
-# addressed, so editing this file triggers exactly one recompile).
+# This module is built on demand by `eager_kernels.MojoExtensionLoader`, one
+# `mojo build --emit shared-lib` per specialization: the `OP` and `DTYPE_*`
+# compiler defines pick exactly one registration below (see variant_gates.mojo)
+# and every .so exposes that single entry point under the constant name
+# `call`. Dtype selection is therefore *compile time*, not a runtime switch
+# over every dtype; a different dtype tuple is a different .so.
 #
 # The design mirrors `max._interpreter_ops.elementwise_binary_ops` (the MO
 # interpreter's own op bindings): each Python-visible function receives raw
-# tensor-data pointers (plain ints, storage offset already applied) plus
-# explicit numel/dtype ints and the device's DeviceContext pointer — there
-# are no `max.driver.Buffer` objects and no attribute access at all —
-# dispatches on dtype at *runtime* (all dtype specializations are compiled
-# into this one extension), and enqueues the kernel on MAX's own device
-# context — so ordering with regular MAX driver operations (copies, other
-# kernels) comes for free.
+# tensor metadata (`TensorSpec` handles, or plain ints with the storage offset
+# already applied) plus the device's DeviceContext pointer — there are no
+# `max.driver.Buffer` objects and no attribute access at all — and enqueues the
+# kernel on MAX's own device context, so ordering with regular MAX driver
+# operations (copies, other kernels) comes for free.
 #
 # Every kernel here works on *contiguous* buffers with fully dynamic sizes:
-# one compiled extension serves every shape with zero recompilation.
+# shapes and strides are runtime arguments and never enter the specialization
+# key, so one compiled variant serves every shape with zero recompilation.
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
@@ -38,7 +39,6 @@ from std.math import (
     pow,
     sin,
     sinh,
-    sqrt,
     tanh,
 )
 from std.python import PythonObject
@@ -81,8 +81,8 @@ from op_utils import (
     _raw_tuple_len,
     _scratch_contig,
     _spec_ptr,
-    _spec_result,
     _spec_unsupported,
+    ieee_sqrt,
 )
 
 from variant_gates import (
@@ -363,7 +363,7 @@ def _float_unary[
         res = acos(a)
     comptime if op_code == UOP_ASINH:
         # asinh(x) = log(x + sqrt(x^2 + 1)); std.math.asinh is libm/CPU-only.
-        res = log(a + sqrt(a * a + 1))
+        res = log(a + ieee_sqrt(a * a + 1))
     comptime if op_code == UOP_ATANH:
         res = atanh(a)
     comptime if op_code == UOP_COS:
@@ -389,7 +389,7 @@ def _float_unary[
     comptime if op_code == UOP_RECIPROCAL:
         res = 1 / a
     comptime if op_code == UOP_RSQRT:
-        res = 1 / sqrt(a)
+        res = 1 / ieee_sqrt(a)
     comptime if op_code == UOP_SIGMOID:
         res = 1 / (1 + exp(-a))
     comptime if op_code == UOP_SILU:
@@ -399,7 +399,7 @@ def _float_unary[
     comptime if op_code == UOP_SINH:
         res = sinh(a)
     comptime if op_code == UOP_SQRT:
-        res = sqrt(a)
+        res = ieee_sqrt(a)
     comptime if op_code == UOP_TAN:
         # tan(x) = sin(x)/cos(x); std.math.tan is libm/CPU-only.
         res = sin(a) / cos(a)
@@ -1000,73 +1000,6 @@ comptime SPEC_UNARY_DTYPES = [
 ]
 
 
-def _unary_spec_go[op_code: Int](a_o: PyObjectPtr) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-
-    comptime is_direct = (
-        op_code == UOP_RELU
-        or op_code == UOP_ABS
-        or op_code == UOP_NEG
-        or op_code == UOP_SIGN
-    )
-    var supported = False
-    comptime if is_direct:
-        comptime for dt in SPEC_UNARY_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    supported = True
-    else:
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    supported = True
-    if not supported:
-        raise Error("mojo spec unary: unsupported dtype ", a.dtype)
-
-    var ctx = a.ctx()
-    var nbytes = a.numel * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if a.numel > 0:
-        if a.contig:
-            comptime for dt in SPEC_UNARY_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _unary_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](a.ptr),
-                            a.numel,
-                            ctx,
-                        )
-        else:
-            # Mojo-side temporary (design doc §4.7): materialize the strided
-            # input into a scratch buffer inside the call — Python never
-            # mints a wrapper for it.
-            var tmp = _scratch_contig(a, ctx)
-            var tmp_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_UNARY_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _unary_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](tmp_addr),
-                            a.numel,
-                            ctx,
-                        )
-            _ = tmp^
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        a.rank,
-        a.shape,
-        a.dtype,
-        a.itemsize,
-        a.numel,
-        a.ctx_ptr,
-    )
-
-
 def _unary_spec_into_go[
     op_code: Int
 ](a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
@@ -1139,60 +1072,14 @@ def _unary_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 2:
-            _unary_spec_into_go[op_code](args[0], args[1])
-            return _raw_ret_none()
-        return _unary_spec_go[op_code](args[0])
+        if nargs != 2:
+            raise Error(
+                "a unary spec op expects exactly 2 arguments (a_spec, out_spec)"
+            )
+        _unary_spec_into_go[op_code](args[0], args[1])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _unary_bool_spec_go[op_code: Int](a_o: PyObjectPtr) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    # bool inputs are read through their uint8 storage (bit-compatible).
-    var kdtype = a.dtype
-    if a.dtype == DType.bool:
-        kdtype = DType.uint8
-    var supported = False
-    comptime for dt in SPEC_UNARY_DTYPES:
-        comptime if _dtype_arg_abi_on[0, dt]():
-            if kdtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec unary bool: unsupported dtype ", a.dtype)
-
-    var ctx = a.ctx()
-    var nbytes = a.numel  # bool output, itemsize 1
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if a.numel > 0:
-        if a.contig:
-            comptime for dt in SPEC_UNARY_DTYPES:
-                comptime if _dtype_arg_abi_on[0, dt]():
-                    if kdtype == dt:
-                        _unary_bool[dt, op_code](
-                            _make_ptr[DType.bool](addr),
-                            _make_ptr[dt](a.ptr),
-                            a.numel,
-                            ctx,
-                        )
-        else:
-            # Mojo-side temporary; see _unary_spec_go.
-            var tmp = _scratch_contig(a, ctx)
-            var tmp_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_UNARY_DTYPES:
-                comptime if _dtype_arg_abi_on[0, dt]():
-                    if kdtype == dt:
-                        _unary_bool[dt, op_code](
-                            _make_ptr[DType.bool](addr),
-                            _make_ptr[dt](tmp_addr),
-                            a.numel,
-                            ctx,
-                        )
-            _ = tmp^
-    return _spec_result(
-        buf^, addr, nbytes, a.rank, a.shape, DType.bool, 1, a.numel, a.ctx_ptr
-    )
 
 
 def _unary_bool_spec_into_go[
@@ -1232,7 +1119,9 @@ def _unary_bool_spec_into_go[
                             ctx,
                         )
         else:
-            # Mojo-side temporary; see _unary_spec_go.
+            # Mojo-side temporary (design doc §4.7): materialize the strided
+            # input into a scratch buffer inside the call — Python never
+            # mints a wrapper for it.
             var tmp = _scratch_contig(a, ctx)
             var tmp_addr = Int(tmp.unsafe_ptr())
             comptime for dt in SPEC_UNARY_DTYPES:
@@ -1256,69 +1145,15 @@ def _unary_bool_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 2:
-            _unary_bool_spec_into_go[op_code](args[0], args[1])
-            return _raw_ret_none()
-        return _unary_bool_spec_go[op_code](args[0])
+        if nargs != 2:
+            raise Error(
+                "a bool-output unary spec op expects exactly 2 arguments"
+                " (a_spec, out_spec)"
+            )
+        _unary_bool_spec_into_go[op_code](args[0], args[1])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _scalar_spec_go[
-    op_code: Int
-](a_o: PyObjectPtr, scalar_o: PyObjectPtr) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec scalar: unsupported dtype ", a.dtype)
-
-    var scalar = Float32(_raw_f64(scalar_o))
-    var ctx = a.ctx()
-    var nbytes = a.numel * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if a.numel > 0:
-        if a.contig:
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _scalar_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](a.ptr),
-                            scalar,
-                            a.numel,
-                            ctx,
-                        )
-        else:
-            # Mojo-side temporary; see _unary_spec_go.
-            var tmp = _scratch_contig(a, ctx)
-            var tmp_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _scalar_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](tmp_addr),
-                            scalar,
-                            a.numel,
-                            ctx,
-                        )
-            _ = tmp^
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        a.rank,
-        a.shape,
-        a.dtype,
-        a.itemsize,
-        a.numel,
-        a.ctx_ptr,
-    )
 
 
 def _scalar_spec_into_go[
@@ -1356,7 +1191,9 @@ def _scalar_spec_into_go[
                             ctx,
                         )
         else:
-            # Mojo-side temporary; see _unary_spec_go.
+            # Mojo-side temporary (design doc §4.7): materialize the strided
+            # input into a scratch buffer inside the call — Python never
+            # mints a wrapper for it.
             var tmp = _scratch_contig(a, ctx)
             var tmp_addr = Int(tmp.unsafe_ptr())
             comptime for dt in FLOAT_DTYPES:
@@ -1381,10 +1218,13 @@ def _scalar_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 3:
-            _scalar_spec_into_go[op_code](args[0], args[1], args[2])
-            return _raw_ret_none()
-        return _scalar_spec_go[op_code](args[0], args[1])
+        if nargs != 3:
+            raise Error(
+                "a float-scalar spec op expects exactly 3 arguments (a_spec,"
+                " scalar, out_spec)"
+            )
+        _scalar_spec_into_go[op_code](args[0], args[1], args[2])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
 
@@ -1562,63 +1402,6 @@ def _scalar_inplace_dispatcher[
         return _spec_unsupported(e)
 
 
-def _int_scalar_spec_go[
-    op_code: Int
-](a_o: PyObjectPtr, scalar_o: PyObjectPtr) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in [DType.int32, DType.int64]:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec int scalar: unsupported dtype ", a.dtype)
-
-    var scalar = _raw_int(scalar_o)
-    var ctx = a.ctx()
-    var nbytes = a.numel * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if a.numel > 0:
-        if a.contig:
-            comptime for dt in [DType.int32, DType.int64]:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _int_scalar_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](a.ptr),
-                            scalar,
-                            a.numel,
-                            ctx,
-                        )
-        else:
-            # Mojo-side temporary; see _unary_spec_go.
-            var tmp = _scratch_contig(a, ctx)
-            var tmp_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in [DType.int32, DType.int64]:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _int_scalar_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](tmp_addr),
-                            scalar,
-                            a.numel,
-                            ctx,
-                        )
-            _ = tmp^
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        a.rank,
-        a.shape,
-        a.dtype,
-        a.itemsize,
-        a.numel,
-        a.ctx_ptr,
-    )
-
-
 def _int_scalar_spec_into_go[
     op_code: Int
 ](a_o: PyObjectPtr, scalar_o: PyObjectPtr, out_o: PyObjectPtr) raises:
@@ -1654,7 +1437,9 @@ def _int_scalar_spec_into_go[
                             ctx,
                         )
         else:
-            # Mojo-side temporary; see _unary_spec_go.
+            # Mojo-side temporary (design doc §4.7): materialize the strided
+            # input into a scratch buffer inside the call — Python never
+            # mints a wrapper for it.
             var tmp = _scratch_contig(a, ctx)
             var tmp_addr = Int(tmp.unsafe_ptr())
             comptime for dt in [DType.int32, DType.int64]:
@@ -1679,10 +1464,13 @@ def _int_scalar_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 3:
-            _int_scalar_spec_into_go[op_code](args[0], args[1], args[2])
-            return _raw_ret_none()
-        return _int_scalar_spec_go[op_code](args[0], args[1])
+        if nargs != 3:
+            raise Error(
+                "an int-scalar spec op expects exactly 3 arguments (a_spec,"
+                " scalar, out_spec)"
+            )
+        _int_scalar_spec_into_go[op_code](args[0], args[1], args[2])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
 
@@ -1701,54 +1489,9 @@ comptime SPEC_FILL_DTYPES = [
 ]
 
 
-def _fill_spec_go(
-    shape_t: PyObjectPtr,
-    rank_o: PyObjectPtr,
-    numel_o: PyObjectPtr,
-    value_o: PyObjectPtr,
-    dtype_o: PyObjectPtr,
-    ctx_o: PyObjectPtr,
-) raises -> PyObjectPtr:
-    """Filled-tensor construction: alloc + fill in one boundary call (the
-    classic path is a Python-side _alloc plus a Fill call)."""
-    var rank = _raw_int(rank_o)
-    var numel = _raw_int(numel_o)
-    var value = _raw_f64(value_o)
-    var dtype = _raw_dtype_int(dtype_o)
-    var shape = IndexList[MAX_RANK](1)
-    for i in range(MAX_RANK):
-        shape[i] = _raw_tuple_int(shape_t, i)
-
-    var supported = False
-    var itemsize = 0
-    comptime for dt in SPEC_FILL_DTYPES:
-        comptime if _dtype_out_on[0, dt]():
-            if dtype == dt:
-                supported = True
-                itemsize = size_of[dt]()
-    if not supported:
-        raise Error("mojo spec fill: unsupported dtype ", dtype)
-    # bool fill must store exactly 0/1.
-    if dtype == DType.bool:
-        value = Float64(1) if value != 0 else Float64(0)
-
-    var ctx = _raw_ctx(ctx_o)
-    var nbytes = numel * itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if numel > 0:
-        comptime for dt in SPEC_FILL_DTYPES:
-            comptime if _dtype_out_on[0, dt]():
-                if dtype == dt:
-                    _fill[dt](_make_ptr[dt](addr), value, numel, ctx)
-    return _spec_result(
-        buf^, addr, nbytes, rank, shape, dtype, itemsize, numel, _raw_int(ctx_o)
-    )
-
-
 def _fill_spec_into_go(value_o: PyObjectPtr, out_o: PyObjectPtr) raises:
-    """Into-variant of _fill_spec_go: fill a caller-allocated contiguous
-    output (call-queue mode); dtype/extent come from the output spec."""
+    """Fill a caller-allocated contiguous output; dtype/extent come from the
+    output spec."""
     ref out = _spec_ptr(out_o)[]
     var value = _raw_f64(value_o)
     var supported = False
@@ -1777,12 +1520,12 @@ def _fill_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 2:
-            _fill_spec_into_go(args[0], args[1])
-            return _raw_ret_none()
-        return _fill_spec_go(
-            args[0], args[1], args[2], args[3], args[4], args[5]
-        )
+        if nargs != 2:
+            raise Error(
+                "FillSpec expects exactly 2 arguments (value, out_spec)"
+            )
+        _fill_spec_into_go(args[0], args[1])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
 
@@ -1800,234 +1543,192 @@ def PyInit_elementwise_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_RELU],
-                "ReluSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); relu",
+                docstring="(a_spec, out_spec); relu",
             )
         comptime if _op_on["ExpSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_EXP],
-                "ExpSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); exp",
+                docstring="(a_spec, out_spec); exp",
             )
         comptime if _op_on["TanhSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_TANH],
-                "TanhSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); tanh",
+                docstring="(a_spec, out_spec); tanh",
             )
         comptime if _op_on["AbsSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_ABS],
-                "AbsSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); abs",
+                docstring="(a_spec, out_spec); abs",
             )
         comptime if _op_on["NegSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_NEG],
-                "NegSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); neg",
+                docstring="(a_spec, out_spec); neg",
             )
         comptime if _op_on["SignSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_SIGN],
-                "SignSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); sign",
+                docstring="(a_spec, out_spec); sign",
             )
         comptime if _op_on["CeilSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_CEIL],
-                "CeilSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); ceil",
+                docstring="(a_spec, out_spec); ceil",
             )
         comptime if _op_on["FloorSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_FLOOR],
-                "FloorSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); floor",
+                docstring="(a_spec, out_spec); floor",
             )
         comptime if _op_on["AcosSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_ACOS],
-                "AcosSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); acos",
+                docstring="(a_spec, out_spec); acos",
             )
         comptime if _op_on["AsinhSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_ASINH],
-                "AsinhSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); asinh",
+                docstring="(a_spec, out_spec); asinh",
             )
         comptime if _op_on["AtanhSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_ATANH],
-                "AtanhSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); atanh",
+                docstring="(a_spec, out_spec); atanh",
             )
         comptime if _op_on["CosSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_COS],
-                "CosSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); cos",
+                docstring="(a_spec, out_spec); cos",
             )
         comptime if _op_on["CoshSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_COSH],
-                "CoshSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); cosh",
+                docstring="(a_spec, out_spec); cosh",
             )
         comptime if _op_on["ErfSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_ERF],
-                "ErfSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); erf",
+                docstring="(a_spec, out_spec); erf",
             )
         comptime if _op_on["LogSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_LOG],
-                "LogSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); log",
+                docstring="(a_spec, out_spec); log",
             )
         comptime if _op_on["Log1pSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_LOG1P],
-                "Log1pSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); log1p",
+                docstring="(a_spec, out_spec); log1p",
             )
         comptime if _op_on["ReciprocalSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_RECIPROCAL],
-                "ReciprocalSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); reciprocal",
+                docstring="(a_spec, out_spec); reciprocal",
             )
         comptime if _op_on["RsqrtSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_RSQRT],
-                "RsqrtSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); rsqrt",
+                docstring="(a_spec, out_spec); rsqrt",
             )
         comptime if _op_on["SigmoidSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_SIGMOID],
-                "SigmoidSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); sigmoid",
+                docstring="(a_spec, out_spec); sigmoid",
             )
         comptime if _op_on["SiluSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_SILU],
-                "SiluSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); silu",
+                docstring="(a_spec, out_spec); silu",
             )
         comptime if _op_on["SinSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_SIN],
-                "SinSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); sin",
+                docstring="(a_spec, out_spec); sin",
             )
         comptime if _op_on["SinhSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_SINH],
-                "SinhSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); sinh",
+                docstring="(a_spec, out_spec); sinh",
             )
         comptime if _op_on["SqrtSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_SQRT],
-                "SqrtSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); sqrt",
+                docstring="(a_spec, out_spec); sqrt",
             )
         comptime if _op_on["TanSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_TAN],
-                "TanSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); tan",
+                docstring="(a_spec, out_spec); tan",
             )
         comptime if _op_on["GeluNoneSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_GELU_NONE],
-                "GeluNoneSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); gelunone",
+                docstring="(a_spec, out_spec); gelunone",
             )
         comptime if _op_on["GeluTanhSpec"]():
             _register_call(
                 b,
                 _unary_spec_dispatcher[UOP_GELU_TANH],
-                "GeluTanhSpec",
-                docstring="(a_spec) -> (holder, spec, shape, ptr); gelutanh",
+                docstring="(a_spec, out_spec); gelutanh",
             )
         comptime if _op_on["IsNanSpec"]():
             _register_call(
                 b,
                 _unary_bool_spec_dispatcher[BUOP_ISNAN],
-                "IsNanSpec",
-                docstring=(
-                    "(a_spec) -> (holder, spec, shape, ptr); isnan -> bool"
-                ),
+                docstring="(a_spec, out_spec); isnan -> bool",
             )
         comptime if _op_on["LogicalNotSpec"]():
             _register_call(
                 b,
                 _unary_bool_spec_dispatcher[BUOP_LOGICAL_NOT],
-                "LogicalNotSpec",
-                docstring=(
-                    "(a_spec) -> (holder, spec, shape, ptr); logicalnot -> bool"
-                ),
+                docstring="(a_spec, out_spec); logicalnot -> bool",
             )
         comptime if _op_on["AddScalarSpec"]():
             _register_call(
                 b,
                 _scalar_spec_dispatcher[SOP_ADD],
-                "AddScalarSpec",
-                docstring=(
-                    "(a_spec, scalar) -> (holder, spec, shape, ptr); float"
-                ),
+                docstring="(a_spec, scalar, out_spec); float",
             )
         comptime if _op_on["MulScalarSpec"]():
             _register_call(
                 b,
                 _scalar_spec_dispatcher[SOP_MUL],
-                "MulScalarSpec",
-                docstring=(
-                    "(a_spec, scalar) -> (holder, spec, shape, ptr); float"
-                ),
+                docstring="(a_spec, scalar, out_spec); float",
             )
         comptime if _op_on["PowScalarSpec"]():
             _register_call(
                 b,
                 _scalar_spec_dispatcher[SOP_POW],
-                "PowScalarSpec",
-                docstring=(
-                    "(a_spec, scalar) -> (holder, spec, shape, ptr); float"
-                ),
+                docstring="(a_spec, scalar, out_spec); float",
             )
         comptime if _op_on["AddScalarInplace"]():
             _register_call(
                 b,
                 _scalar_inplace_dispatcher[SOP_ADD],
-                "AddScalarInplace",
                 docstring=(
                     "(a_spec, scalar) -> None; a += scalar, contiguous float"
                 ),
@@ -2036,7 +1737,6 @@ def PyInit_elementwise_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _scalar_inplace_dispatcher[SOP_MUL],
-                "MulScalarInplace",
                 docstring=(
                     "(a_spec, scalar) -> None; a *= scalar, contiguous float"
                 ),
@@ -2045,7 +1745,6 @@ def PyInit_elementwise_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _foreach_add_scalar_dispatcher,
-                "ForeachAddScalar",
                 docstring=(
                     "((addr, numel) * n, scalar, dtype, ctx) -> None; "
                     "aten::_foreach_add_.Scalar over one contiguous float dtype"
@@ -2055,37 +1754,32 @@ def PyInit_elementwise_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _int_scalar_spec_dispatcher[IOP_ADD],
-                "AddScalarIntSpec",
-                docstring="(a_spec, scalar) -> (holder, spec, shape, ptr); int",
+                docstring="(a_spec, scalar, out_spec); int",
             )
         comptime if _op_on["MulScalarIntSpec"]():
             _register_call(
                 b,
                 _int_scalar_spec_dispatcher[IOP_MUL],
-                "MulScalarIntSpec",
-                docstring="(a_spec, scalar) -> (holder, spec, shape, ptr); int",
+                docstring="(a_spec, scalar, out_spec); int",
             )
         comptime if _op_on["FillSpec"]():
             _register_call(
                 b,
                 _fill_spec_dispatcher,
-                "FillSpec",
                 docstring=(
-                    "(shape8, rank, numel, value, dtype, ctx) -> result group"
+                    "(value, out_spec); dtype and extent come from out_spec"
                 ),
             )
         comptime if _op_on["Add"]():
             _register_call(
                 b,
                 _bin_dispatcher[OP_ADD],
-                "Add",
                 docstring="out = lhs + rhs (contiguous, dtype dispatch)",
             )
         comptime if _op_on["Arange"]():
             _register_call(
                 b,
                 _arange_dispatcher,
-                "Arange",
                 docstring="out[i] = start + i * step (contiguous, int/float)",
             )
         return b.finalize()

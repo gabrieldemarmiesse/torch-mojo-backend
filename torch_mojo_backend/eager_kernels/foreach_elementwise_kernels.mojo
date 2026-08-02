@@ -19,10 +19,10 @@ bit-compatible with the sequential per-tensor decomposition.
 from std.collections import InlineArray
 from std.gpu import block_idx, thread_idx
 from std.gpu.host import DeviceContext
-from std.math import min, sqrt
+from std.math import min
 from std.sys.info import has_accelerator
 
-from op_utils import _enqueue_cached
+from op_utils import _enqueue_cached, ieee_sqrt
 
 
 comptime FOREACH_EW_SLOTS = 8
@@ -361,12 +361,12 @@ def _foreach_sqrt_kernel(
     var stride = FOREACH_EW_THREADS * _VEC
     while index + _VEC <= end:
         var value = in_values.load[width=_VEC, alignment=4](index)
-        out_values.store[width=_VEC, alignment=4](index, sqrt(value))
+        out_values.store[width=_VEC, alignment=4](index, ieee_sqrt(value))
         index += stride
 
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
-        out_values[index] = sqrt(in_values[index])
+        out_values[index] = ieee_sqrt(in_values[index])
         index += FOREACH_EW_THREADS
 
 

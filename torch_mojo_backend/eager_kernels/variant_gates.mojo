@@ -1,35 +1,10 @@
 """Compile-time operation/dtype gates and the specialized-module ABI."""
 
 from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import (
-    PyCFunction,
-    PyCFunctionFast,
-    PyCFunctionWithKeywords,
-)
+from std.python._cpython import PyCFunctionFast
 from std.sys.defines import get_defined_string
 
 comptime _OP = get_defined_string["OP", ""]()
-comptime _DTYPE_ARG_0 = get_defined_string["DTYPE_ARG_0", ""]()
-comptime _DTYPE_ARG_1 = get_defined_string["DTYPE_ARG_1", ""]()
-comptime _DTYPE_ARG_2 = get_defined_string["DTYPE_ARG_2", ""]()
-comptime _DTYPE_ARG_3 = get_defined_string["DTYPE_ARG_3", ""]()
-comptime _DTYPE_ARG_4 = get_defined_string["DTYPE_ARG_4", ""]()
-comptime _DTYPE_ARG_5 = get_defined_string["DTYPE_ARG_5", ""]()
-comptime _DTYPE_ARG_6 = get_defined_string["DTYPE_ARG_6", ""]()
-comptime _DTYPE_ARG_7 = get_defined_string["DTYPE_ARG_7", ""]()
-comptime _DTYPE_ARG_8 = get_defined_string["DTYPE_ARG_8", ""]()
-comptime _DTYPE_ARG_9 = get_defined_string["DTYPE_ARG_9", ""]()
-comptime _DTYPE_ARG_10 = get_defined_string["DTYPE_ARG_10", ""]()
-comptime _DTYPE_ARG_11 = get_defined_string["DTYPE_ARG_11", ""]()
-comptime _DTYPE_ARG_12 = get_defined_string["DTYPE_ARG_12", ""]()
-comptime _DTYPE_ARG_13 = get_defined_string["DTYPE_ARG_13", ""]()
-comptime _DTYPE_ARG_14 = get_defined_string["DTYPE_ARG_14", ""]()
-comptime _DTYPE_ARG_15 = get_defined_string["DTYPE_ARG_15", ""]()
-comptime _DTYPE_OUT = get_defined_string["DTYPE_OUT", ""]()
-comptime _DTYPE_OUT_0 = get_defined_string["DTYPE_OUT_0", ""]()
-comptime _DTYPE_OUT_1 = get_defined_string["DTYPE_OUT_1", ""]()
-comptime _DTYPE_OUT_2 = get_defined_string["DTYPE_OUT_2", ""]()
-comptime _DTYPE_OUT_3 = get_defined_string["DTYPE_OUT_3", ""]()
 
 
 @always_inline
@@ -44,41 +19,10 @@ def _op_on[name: StaticString]() -> Bool:
 @always_inline
 def _dtype_arg_on[index: Int, dt: DType]() -> Bool:
     """Whether ``dt`` is the exact dtype of tensor argument ``index``."""
-    comptime name = String(dt)
-    comptime if index == 0:
-        return _DTYPE_ARG_0 == name
-    elif index == 1:
-        return _DTYPE_ARG_1 == name
-    elif index == 2:
-        return _DTYPE_ARG_2 == name
-    elif index == 3:
-        return _DTYPE_ARG_3 == name
-    elif index == 4:
-        return _DTYPE_ARG_4 == name
-    elif index == 5:
-        return _DTYPE_ARG_5 == name
-    elif index == 6:
-        return _DTYPE_ARG_6 == name
-    elif index == 7:
-        return _DTYPE_ARG_7 == name
-    elif index == 8:
-        return _DTYPE_ARG_8 == name
-    elif index == 9:
-        return _DTYPE_ARG_9 == name
-    elif index == 10:
-        return _DTYPE_ARG_10 == name
-    elif index == 11:
-        return _DTYPE_ARG_11 == name
-    elif index == 12:
-        return _DTYPE_ARG_12 == name
-    elif index == 13:
-        return _DTYPE_ARG_13 == name
-    elif index == 14:
-        return _DTYPE_ARG_14 == name
-    elif index == 15:
-        return _DTYPE_ARG_15 == name
-    else:
-        return False
+    # The define name is built at compile time, so there is no index ceiling:
+    # an argument whose define was never passed reads back as "" and gates off.
+    comptime defined = get_defined_string["DTYPE_ARG_" + String(index), ""]()
+    return defined == String(dt)
 
 
 @always_inline
@@ -87,15 +31,12 @@ def _dtype_out_on[index: Int, dt: DType]() -> Bool:
     comptime name = String(dt)
     comptime if index == 0:
         # DTYPE_OUT is retained as the canonical spelling for one-output ops.
-        return _DTYPE_OUT == name or _DTYPE_OUT_0 == name
-    elif index == 1:
-        return _DTYPE_OUT_1 == name
-    elif index == 2:
-        return _DTYPE_OUT_2 == name
-    elif index == 3:
-        return _DTYPE_OUT_3 == name
+        return (
+            get_defined_string["DTYPE_OUT", ""]() == name
+            or get_defined_string["DTYPE_OUT_0", ""]() == name
+        )
     else:
-        return False
+        return get_defined_string["DTYPE_OUT_" + String(index), ""]() == name
 
 
 @always_inline
@@ -111,7 +52,14 @@ def _dtype_arg_abi_on[index: Int, dt: DType]() -> Bool:
 
 @always_inline
 def _dtype_arg_width_on[index: Int, bits: Int]() -> Bool:
-    """Whether an argument's logical dtype has the selected storage width."""
+    """Whether an argument's logical dtype has the selected storage width.
+
+    Only the width selects generated code here, so a caller that specializes
+    exclusively through this gate may pass the canonical unsigned
+    representative of the width (uint8/uint16/uint32/uint64) as
+    ``DTYPE_ARG_<index>`` and share one build across every dtype of that
+    width, instead of compiling a byte-identical .so per dtype name.
+    """
     comptime if bits == 8:
         return (
             _dtype_arg_on[index, DType.bool]()
@@ -143,29 +91,14 @@ def _dtype_arg_width_on[index: Int, bits: Int]() -> Bool:
 
 def _register_call(
     mut builder: PythonModuleBuilder,
-    function: PyCFunction,
-    _operation_name: StaticString,
-    docstring: StaticString = "",
-):
-    """Register the one callable exposed by a specialized extension module."""
-    builder.def_py_c_function(function, "call", docstring)
-
-
-def _register_call(
-    mut builder: PythonModuleBuilder,
-    function: PyCFunctionWithKeywords,
-    _operation_name: StaticString,
-    docstring: StaticString = "",
-):
-    """Register the one callable exposed by a specialized extension module."""
-    builder.def_py_c_function(function, "call", docstring)
-
-
-def _register_call(
-    mut builder: PythonModuleBuilder,
     function: PyCFunctionFast,
-    _operation_name: StaticString,
     docstring: StaticString = "",
 ):
-    """Register the one callable exposed by a specialized extension module."""
+    """Register the one callable exposed by a specialized extension module.
+
+    Every dispatcher in this package is a `METH_FASTCALL` entry point, and the
+    operation it serves is already named by the enclosing
+    `comptime if _op_on["..."]()` gate, so neither a second name argument nor
+    the `PyCFunction`/`PyCFunctionWithKeywords` shapes are needed here.
+    """
     builder.def_py_c_function(function, "call", docstring)

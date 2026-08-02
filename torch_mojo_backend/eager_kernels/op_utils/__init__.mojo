@@ -11,11 +11,17 @@ from std.builtin.device_passable import DevicePassable
 from std.ffi import _get_global_or_null, external_call
 from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.host import DeviceBuffer, DeviceContext
-from std.math import ceildiv
+from std.math import ceildiv, sqrt
 from std.memory import OpaquePointer, alloc, stack_allocation
 from std.python import Python, PythonObject
 from std.python._cpython import PyObjectPtr
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
+from std.sys import llvm_intrinsic
+from std.sys.info import (
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    is_nvidia_gpu,
+    size_of,
+)
 from std.utils import IndexList
 from std.utils.coord import Coord
 
@@ -25,6 +31,64 @@ from std.utils.coord import Coord
 # runtime dtype, which unrolls into the same `if dtype == ...` chain without
 # repeating the call site once per dtype.
 comptime FLOAT_DTYPES = [DType.float32, DType.float16, DType.bfloat16]
+
+
+# ===========================================================================
+# Correctly rounded square root
+# ===========================================================================
+#
+# `std.math.sqrt` is not IEEE-754 on NVIDIA. Its NVIDIA arm routes every float
+# dtype through `_sqrt_nvvm`, i.e. `llvm.nvvm.sqrt.approx.ftz.f`
+# (`mojo/stdlib/std/math/math.mojo`), and that is a property of the stdlib,
+# not of any fast-math flag we could turn off. PTX documents `sqrt.approx` at
+# up to 2 ulp, and `.ftz` flushes denormals to zero on input AND output, so a
+# value whose true root is denormal comes back as exactly 0. Neither is a
+# precision preference: a zeroed AdamW denominator is a wrong answer, and a
+# 1-2 ulp drift means no eager op that returns a square root can be compared
+# bit-for-bit against ATen on CPU or CUDA.
+#
+# `llvm.sqrt` lowers to `sqrt.rn.f32` / `sqrt.rn.f64` on NVPTX -- correctly
+# rounded and denormal preserving -- so the override is a plain intrinsic
+# swap; no inline PTX is needed. Every other target already reaches the right
+# instruction through `std.math.sqrt` itself, which is why the fast path stays
+# gated on `is_nvidia_gpu()`: AMD expands `llvm.sqrt` to `v_sqrt_f32` plus the
+# denormal rescale and the +-1 ulp fma correction (verified in the emitted
+# gfx942 assembly), and Apple uses `llvm.air.sqrt`.
+@always_inline
+def ieee_sqrt[
+    dtype: DType, width: SIMDSize, //
+](x: SIMD[dtype, width]) -> SIMD[dtype, width]:
+    """Elementwise square root that is correctly rounded on every backend.
+
+    Use this, not `std.math.sqrt`, wherever the root reaches a user-visible
+    result. `std.math.sqrt` remains the right call only where the value feeds
+    a heuristic that never leaves the kernel.
+
+    Parameters:
+        dtype: Element type of the input and output vector.
+        width: SIMD width of the input and output vector.
+
+    Args:
+        x: Vector to take the square root of.
+
+    Returns:
+        The elementwise square root of `x`.
+    """
+    comptime if is_nvidia_gpu() and dtype.is_floating_point():
+        comptime if dtype in (DType.float16, DType.bfloat16):
+            # Widening is exact, and f32 carries at least 2p+2 bits for both
+            # 16-bit formats (24 >= 2*11+2 for f16, 24 >= 2*8+2 for bf16), so
+            # rounding a correctly rounded f32 root back down is itself
+            # correctly rounded -- the classic no-double-rounding bound.
+            return llvm_intrinsic[
+                "llvm.sqrt", SIMD[DType.float32, width], has_side_effect=False
+            ](x.cast[DType.float32]()).cast[dtype]()
+        else:
+            return llvm_intrinsic[
+                "llvm.sqrt", SIMD[dtype, width], has_side_effect=False
+            ](x)
+    else:
+        return sqrt(x)
 
 
 @always_inline
@@ -310,8 +374,9 @@ def _raw_tuple_len(t: PyObjectPtr) -> Int:
 # silent memory corruption.
 #
 # Spec ops (see docs/tensor_spec_design.md) do the whole op prologue in one
-# boundary call: input checks, geometry, output alloc, kernel launch, and
-# return `(holder, out_spec, shape_tuple, data_ptr)` via `_spec_result`.
+# boundary call: input checks, geometry, and the kernel launch. The output is
+# always allocated by Python and handed in as a trailing spec, so a spec op
+# writes into it and returns None — there is no allocating return ABI.
 # Errors are REAL: dispatchers catch Mojo errors and return
 # `_spec_unsupported(e)`, which raises NotImplementedError into Python;
 # the Python callers treat that as "take the classic path".
@@ -458,100 +523,6 @@ def _row_major8(shape: IndexList[MAX_RANK], rank: Int) -> IndexList[MAX_RANK]:
         strides[i] = acc
         acc *= shape[i]
     return strides
-
-
-@always_inline
-def _spec_group(
-    var buf: DeviceBuffer[DType.uint8],
-    addr: Int,
-    nbytes: Int,
-    rank: Int,
-    shape: IndexList[MAX_RANK],
-    dtype: DType,
-    itemsize: Int,
-    numel: Int,
-    ctx_ptr: Int,
-) raises -> PythonObject:
-    """One (holder, out_spec, shape_tuple, data_ptr) group for a fresh
-    contiguous output — everything Python needs to mint the torch wrapper."""
-    var spec_obj = PythonObject(
-        alloc=TensorSpec(
-            ptr=addr,
-            rank=rank,
-            shape=shape,
-            strides=_row_major8(shape, rank),
-            offset=0,
-            dtype=dtype,
-            itemsize=itemsize,
-            numel=numel,
-            contig=True,
-            ctx_ptr=ctx_ptr,
-        )
-    )
-    var holder_obj = PythonObject(alloc=TensorHolder(buf=buf^, nbytes=nbytes))
-    ref cpy = Python().cpython()
-    var shape_tuple = cpy.PyTuple_New(rank)
-    for i in range(rank):
-        _ = cpy.PyTuple_SetItem(
-            shape_tuple, i, cpy.PyLong_FromSsize_t(shape[MAX_RANK - rank + i])
-        )
-    return Python.tuple(
-        holder_obj^,
-        spec_obj^,
-        PythonObject(from_owned=shape_tuple),
-        PythonObject(addr),
-    )
-
-
-@always_inline
-def _spec_result(
-    var buf: DeviceBuffer[DType.uint8],
-    addr: Int,
-    nbytes: Int,
-    rank: Int,
-    shape: IndexList[MAX_RANK],
-    dtype: DType,
-    itemsize: Int,
-    numel: Int,
-    ctx_ptr: Int,
-) raises -> PyObjectPtr:
-    """Single-output spec-op result: one (holder, spec, shape, ptr) tuple."""
-    var group = _spec_group(
-        buf^, addr, nbytes, rank, shape, dtype, itemsize, numel, ctx_ptr
-    )
-    return group^.steal_data()
-
-
-@always_inline
-def _spec_result2(
-    var buf1: DeviceBuffer[DType.uint8],
-    addr1: Int,
-    nbytes1: Int,
-    rank1: Int,
-    shape1: IndexList[MAX_RANK],
-    dtype1: DType,
-    itemsize1: Int,
-    numel1: Int,
-    var buf2: DeviceBuffer[DType.uint8],
-    addr2: Int,
-    nbytes2: Int,
-    rank2: Int,
-    shape2: IndexList[MAX_RANK],
-    dtype2: DType,
-    itemsize2: Int,
-    numel2: Int,
-    ctx_ptr: Int,
-) raises -> PyObjectPtr:
-    """Two-output spec-op result: ((holder, spec, shape, ptr) x 2) in ONE
-    tuple, so multi-output ops stay one boundary call."""
-    var g1 = _spec_group(
-        buf1^, addr1, nbytes1, rank1, shape1, dtype1, itemsize1, numel1, ctx_ptr
-    )
-    var g2 = _spec_group(
-        buf2^, addr2, nbytes2, rank2, shape2, dtype2, itemsize2, numel2, ctx_ptr
-    )
-    var result = Python.tuple(g1^, g2^)
-    return result^.steal_data()
 
 
 @always_inline

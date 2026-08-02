@@ -99,11 +99,13 @@ def test_build_extension_compiles_original_source(
     monkeypatch.setattr(eager_kernels, "_find_mojo", fake_find_mojo)
     monkeypatch.setattr(eager_kernels.subprocess, "run", fake_run)
 
+    # As they arrive here: already canonical and already reduced to the
+    # defines the source reads (see `_live_defines`).
     defines = eager_kernels.normalize_defines(
         {
             "OP": "AddSpec",
             "DTYPE_ARG_1": "float32",
-            "INPLACE": False,
+            "DTYPE_OUT": "bfloat16",
             "DTYPE_ARG_0": "float32",
         }
     )
@@ -120,18 +122,35 @@ def test_build_extension_compiles_original_source(
     assert define_args == [
         "DTYPE_ARG_0=float32",
         "DTYPE_ARG_1=float32",
-        "INPLACE=0",
+        "DTYPE_OUT=bfloat16",
         "OP=AddSpec",
     ]
     assert source.read_text() == source_text
     assert not list(package_dir.glob("_tmbv_*.mojo"))
 
 
-def test_loader_reuses_canonical_variant_and_separates_defines(
+# A source whose gates read OP and DTYPE_ARG_0 and nothing else, so the
+# loader can tell which defines select its generated code.
+_GATED_SOURCE = (
+    "from variant_gates import _op_on, _dtype_arg_on, _register_call\n"
+    "\n"
+    "def PyInit_elementwise_ops():\n"
+    '    comptime if _op_on["AddSpec"]() and _dtype_arg_on[0, DType.float32]():\n'
+    "        pass\n"
+)
+
+
+def test_loader_reuses_canonical_variant_and_ignores_unread_defines(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """One .so per *distinguishable* specialization.
+
+    A define no `comptime` gate in the source reads cannot change the
+    generated code, so it must not fork a second, byte-identical build — nor
+    reach the compiler command line.
+    """
     source = tmp_path / "elementwise_ops.mojo"
-    source.write_text("def PyInit_elementwise_ops():\n    pass\n")
+    source.write_text(_GATED_SOURCE)
     builds: list[tuple[Path, eager_kernels.CanonicalDefines | None]] = []
     loaded: list[ModuleType] = []
 
@@ -155,56 +174,54 @@ def test_loader_reuses_canonical_variant_and_separates_defines(
     monkeypatch.setattr(eager_kernels, "_load_extension", fake_load_extension)
 
     loader = eager_kernels.MojoExtensionLoader()
-    base = loader.load(
-        source, {"OP": "AddSpec", "DTYPE_ARG_0": "float32", "INPLACE": False}
+
+    def load(**defines: eager_kernels.DefineValue) -> ModuleType:
+        return loader.load_canonical(source, eager_kernels.normalize_defines(defines))
+
+    base = load(OP="AddSpec", DTYPE_ARG_0="float32", INPLACE=False)
+    same_defines_different_order = load(
+        INPLACE=False, DTYPE_ARG_0="float32", OP="AddSpec"
     )
-    same_defines_different_order = loader.load(
-        source, {"INPLACE": False, "DTYPE_ARG_0": "float32", "OP": "AddSpec"}
-    )
-    different_dtype = loader.load(
-        source, {"OP": "AddSpec", "DTYPE_ARG_0": "bfloat16", "INPLACE": False}
-    )
-    different_flag = loader.load(
-        source, {"OP": "AddSpec", "DTYPE_ARG_0": "float32", "INPLACE": True}
-    )
-    different_op = loader.load(
-        source, {"OP": "MulSpec", "DTYPE_ARG_0": "float32", "INPLACE": False}
-    )
+    unread_define_differs = load(OP="AddSpec", DTYPE_ARG_0="float32", INPLACE=True)
+    different_dtype = load(OP="AddSpec", DTYPE_ARG_0="bfloat16", INPLACE=False)
+    different_op = load(OP="MulSpec", DTYPE_ARG_0="float32", INPLACE=False)
 
     assert same_defines_different_order is base
-    assert all(
-        module is not base for module in (different_dtype, different_flag, different_op)
+    assert unread_define_differs is base  # INPLACE gates nothing in this source
+    assert all(module is not base for module in (different_dtype, different_op))
+    assert len(builds) == 3
+    assert len(loaded) == 3
+    assert not any(
+        name == "INPLACE" for _, defines in builds for name, _ in defines or ()
     )
-    assert len(builds) == 4
-    assert len(loaded) == 4
     assert callable(base.call)
     assert not hasattr(base, "AddSpec")
 
 
-def test_module_hash_includes_loader_cache_abi(
+def test_source_hash_includes_loader_cache_abi(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = tmp_path / "sample_ops.mojo"
     source.write_text("def PyInit_sample_ops():\n    pass\n")
     monkeypatch.setattr(eager_kernels, "_PACKAGE_DIR", tmp_path)
 
-    initial = eager_kernels._module_hash("sample_ops")
+    initial = eager_kernels._source_hash(source)
     monkeypatch.setattr(eager_kernels, "_VARIANT_CACHE_ABI", b"next-loader-abi")
 
-    assert eager_kernels._module_hash("sample_ops") != initial
+    assert eager_kernels._source_hash(source) != initial
 
 
-def test_module_hash_includes_compiler_toolchain_identity(
+def test_source_hash_includes_compiler_toolchain_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = tmp_path / "sample_ops.mojo"
     source.write_text("def PyInit_sample_ops():\n    pass\n")
     monkeypatch.setattr(eager_kernels, "_PACKAGE_DIR", tmp_path)
 
-    initial = eager_kernels._module_hash("sample_ops")
+    initial = eager_kernels._source_hash(source)
     monkeypatch.setattr(eager_kernels, "_TOOLCHAIN_IDENTITY", b"another-compiler")
 
-    assert eager_kernels._module_hash("sample_ops") != initial
+    assert eager_kernels._source_hash(source) != initial
 
 
 def test_nested_module_hash_includes_private_and_shared_dependencies(
@@ -385,17 +402,15 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
             return None
 
     class QueuedUnit:
+        """The whole contract the queue needs of a unit: a module once its
+        build lands, and a job to wait on until then."""
+
         def __init__(self) -> None:
-            self.ext = None
+            self.ext: ModuleType | None = None
             self.job = FakeJob()
 
         def request_async(self) -> FakeJob:
             return self.job
-
-        def resolve(self, attr: str) -> object:
-            assert attr == "call"
-            assert self.ext is not None
-            return self.ext.call
 
     unit = QueuedUnit()
 
@@ -411,7 +426,8 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(queue, "_QUEUE", deque())
     monkeypatch.setattr(queue, "_KEEPALIVE", [])
     monkeypatch.setattr(queue, "_HELD_ERROR", [])
-    monkeypatch.setattr(queue, "_EXEC_THREAD", [None])
+    monkeypatch.setattr(queue, "_DEVICE_THREAD", [None])
+    monkeypatch.setattr(queue, "_QUEUE_LAUNCH_THREAD", [None])
 
     loader = FakeLoader()
     first = _ElementwiseAdd.prepare(

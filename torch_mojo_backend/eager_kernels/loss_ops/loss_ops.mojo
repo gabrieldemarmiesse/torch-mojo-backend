@@ -611,7 +611,6 @@ def PyInit_loss_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _nll_forward_dispatcher,
-                "NllLossForwardF32",
                 docstring=(
                     "(output_ptr, total_weight_ptr, log_probs_ptr, target_ptr,"
                     " rows, classes, reduction, ignore_index, context_ptr);"
@@ -622,7 +621,6 @@ def PyInit_loss_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _nll_backward_dispatcher,
-                "NllLossBackwardF32",
                 docstring=(
                     "(grad_input_ptr, grad_output_ptr, target_ptr,"
                     " total_weight_ptr, rows, classes, reduction, ignore_index,"

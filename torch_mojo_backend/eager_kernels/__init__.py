@@ -7,6 +7,12 @@ such as `OP`, `DTYPE_ARG_0`, and `DTYPE_OUT` select the operation, ordered
 argument dtypes, and compile-time flags for one GPU-call family. Shapes and
 strides are runtime arguments and never enter the specialization key.
 
+A specialization is identified by the defines its Mojo sources actually
+read (`_live_defines`): a define no `comptime` gate consumes cannot change
+the generated code, so keeping it in the key would fork a second,
+byte-identical `mojo build`. The source hash is part of the same key, so
+adding a gate later invalidates every cached variant.
+
 Each Python operation descriptor is a stateless `MojoExtension` class. It
 selects one immutable specialization and invokes that extension's constant
 `call` entry point. A different shape reuses the same .so; a different dtype
@@ -36,6 +42,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -84,10 +91,19 @@ def _find_mojo() -> Path:
     raise FileNotFoundError("mojo executable not found for kernel builds")
 
 
-# Part of every extension cache key. Bump whenever the loader ABI changes
-# without necessarily changing a Mojo source file. Version 2 keeps each
-# source's original PyInit_<module> symbol instead of compiling a mangled copy.
-_VARIANT_CACHE_ABI = b"stateless-mojo-extension-v5"
+# Part of every extension cache key. Bump whenever the loader changes what a
+# cached .so means without necessarily changing a Mojo source file — the
+# current value covers one `call` entry point per .so, keeping each source's
+# original PyInit_<module> symbol, and a specialization key restricted to the
+# defines the Mojo sources read.
+_VARIANT_CACHE_ABI = b"stateless-mojo-extension-v6"
+
+# Loaded .so modules are registered under this prefix rather than under
+# `torch_mojo_backend.eager_kernels`, whose `<op>_ops` names belong to the
+# Python packages holding the descriptor classes: CPython inserts
+# single-phase extension modules into sys.modules under the requested name,
+# so sharing a name would replace the package with the native module.
+_VARIANT_NAMESPACE = "torch_mojo_backend._mojo_kernels"
 
 
 def _toolchain_identity() -> bytes:
@@ -119,9 +135,15 @@ _TOOLCHAIN_IDENTITY = _toolchain_identity()
 
 _IMPORT_RE = re.compile(r"^(?:from|import)\s+(\w+)", re.M)
 
+# Compiled once: these run on every specialization key built for a launch.
+_DEFINE_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*")
+_DTYPE_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
 
 DefineValue = bool | int | str
 CanonicalDefines = tuple[tuple[str, str], ...]
+
+_DTYPE_NAMES: dict[DType, str] = {dtype: dtype.name for dtype in DType}
 
 
 def _normalize_define_value(value: DefineValue) -> str:
@@ -142,7 +164,7 @@ def normalize_defines(defines: Mapping[str, DefineValue]) -> CanonicalDefines:
     """Validate and canonicalize compiler defines independently of dict order."""
     normalized: list[tuple[str, str]] = []
     for name, value in defines.items():
-        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+        if not _DEFINE_NAME_RE.fullmatch(name):
             raise ValueError(f"invalid compiler define name {name!r}")
         normalized.append((name, _normalize_define_value(value)))
     normalized.sort()
@@ -154,14 +176,15 @@ def defines_cache_string(defines: Mapping[str, DefineValue]) -> str:
     return json.dumps(normalize_defines(defines), separators=(",", ":"))
 
 
-def exact_call_defines(
+_CALL_DEFINES_CACHE: dict[tuple[object, ...], CanonicalDefines] = {}
+
+
+def _build_call_defines(
     op: str,
     arg_dtypes: tuple[DType | str, ...],
-    *,
-    output_dtypes: tuple[DType | str, ...] = (),
-    flags: Mapping[str, DefineValue] | None = None,
-) -> dict[str, DefineValue]:
-    """Build the shape-independent compiler definitions for one exact call."""
+    output_dtypes: tuple[DType | str, ...],
+    flag_items: tuple[tuple[str, DefineValue], ...],
+) -> CanonicalDefines:
     values: dict[str, DefineValue] = {"OP": op}
     values.update(
         (f"DTYPE_ARG_{index}", _dtype_name(dtype))
@@ -174,15 +197,57 @@ def exact_call_defines(
             (f"DTYPE_OUT_{index}", _dtype_name(dtype))
             for index, dtype in enumerate(output_dtypes)
         )
-    for name, value in (flags or {}).items():
+    for name, value in flag_items:
         define_name = name.upper()
         if define_name in values:
             raise ValueError(f"duplicate specialization define {define_name!r}")
         values[define_name] = value
     # Validate here so malformed values fail while the call is prepared, not
-    # in a background compiler thread. The returned mapping remains convenient
-    # for MojoExtension.make_defines().
-    return dict(normalize_defines(values))
+    # in a background compiler thread.
+    return normalize_defines(values)
+
+
+def _canonical_call_defines(
+    op: str,
+    arg_dtypes: tuple[DType | str, ...],
+    output_dtypes: tuple[DType | str, ...],
+    flag_items: tuple[tuple[str, DefineValue], ...],
+) -> CanonicalDefines:
+    """Memoized canonical key for one exact call.
+
+    A launch repeats the same (op, dtypes, flags) combination for the whole
+    life of the process, so the regex validation and the sort below run once
+    per specialization instead of once per kernel call.
+    """
+    key = (op, arg_dtypes, output_dtypes, flag_items)
+    try:
+        cached = _CALL_DEFINES_CACHE.get(key)
+    except TypeError:
+        # An unhashable define value: skip the memo so the build below
+        # rejects it with the documented TypeError.
+        return _build_call_defines(op, arg_dtypes, output_dtypes, flag_items)
+    if cached is None:
+        cached = _build_call_defines(op, arg_dtypes, output_dtypes, flag_items)
+        _CALL_DEFINES_CACHE[key] = cached
+    return cached
+
+
+def exact_call_defines(
+    op: str,
+    arg_dtypes: tuple[DType | str, ...],
+    *,
+    output_dtypes: tuple[DType | str, ...] = (),
+    flags: Mapping[str, DefineValue] | None = None,
+) -> dict[str, DefineValue]:
+    """Build the shape-independent compiler definitions for one exact call."""
+    return dict(
+        _canonical_call_defines(
+            op,
+            tuple(arg_dtypes),
+            tuple(output_dtypes),
+            tuple(flags.items()) if flags else (),
+        )
+    )
 
 
 def _canonical_cache_string(defines: CanonicalDefines) -> str:
@@ -190,10 +255,11 @@ def _canonical_cache_string(defines: CanonicalDefines) -> str:
 
 
 def _dtype_name(dtype: DType | str) -> str:
-    name = dtype if isinstance(dtype, str) else dtype.name
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name):
-        raise ValueError(f"invalid specialization dtype {name!r}")
-    return name
+    if isinstance(dtype, DType):
+        return _DTYPE_NAMES[dtype]  # enum member names are valid by construction
+    if not _DTYPE_NAME_RE.fullmatch(dtype):
+        raise ValueError(f"invalid specialization dtype {dtype!r}")
+    return dtype
 
 
 def _dep_closure(source: Path) -> list[Path]:
@@ -234,22 +300,168 @@ def _dep_closure(source: Path) -> list[Path]:
     return files
 
 
-def _module_hash(name: str) -> str:
-    return _source_hash(_PACKAGE_DIR / f"{name}.mojo")
+SourceStamp = tuple[str, int, int]
+
+_CLOSURE_CACHE: dict[Path, tuple[tuple[Path, ...], tuple[SourceStamp, ...]]] = {}
+_SOURCE_HASH_CACHE: dict[tuple[object, ...], str] = {}
+
+
+def _source_stamps(files: tuple[Path, ...]) -> tuple[SourceStamp, ...]:
+    """Cheap change detector for a dependency closure: one stat per file."""
+    stamps: list[SourceStamp] = []
+    for path in files:
+        try:
+            info = path.stat()
+        except OSError:
+            stamps.append((str(path), -1, -1))
+        else:
+            stamps.append((str(path), info.st_mtime_ns, info.st_size))
+    return tuple(stamps)
+
+
+def _closure_of(source: Path) -> tuple[tuple[Path, ...], tuple[SourceStamp, ...]]:
+    """The dependency closure of an already resolved source, cached per path.
+
+    Every consumer below (hashing, gate analysis) reads the whole closure,
+    which costs milliseconds per source; the cached list is reused only while
+    every file in it still has the same size and mtime, so editing any of
+    them — including editing one to add an import — invalidates the entry.
+    An edit that preserves both size and mtime is invisible, the same
+    trade-off every build cache makes.
+    """
+    cached = _CLOSURE_CACHE.get(source)
+    if cached is not None:
+        files, stamps = cached
+        if _source_stamps(files) == stamps:
+            return files, stamps
+    files = tuple(_dep_closure(source))
+    stamps = _source_stamps(files)
+    _CLOSURE_CACHE[source] = (files, stamps)
+    return files, stamps
 
 
 def _source_hash(source: Path) -> str:
+    resolved = source.resolve()
+    files, stamps = _closure_of(resolved)
+    key = (resolved, _PACKAGE_DIR, _VARIANT_CACHE_ABI, _TOOLCHAIN_IDENTITY, stamps)
+    cached = _SOURCE_HASH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    package_dir = _PACKAGE_DIR.resolve()
     hasher = hashlib.sha256()
     hasher.update(_VARIANT_CACHE_ABI)
     hasher.update(_TOOLCHAIN_IDENTITY)
-    for path in _dep_closure(source):
+    for path in files:
         try:
-            relative_path = path.relative_to(_PACKAGE_DIR.resolve())
+            relative_path = path.relative_to(package_dir)
         except ValueError:
-            relative_path = path.relative_to(source.resolve().parent)
+            relative_path = path.relative_to(resolved.parent)
         hasher.update(str(relative_path).encode())
         hasher.update(path.read_bytes())
-    return hasher.hexdigest()[:16]
+    digest = hasher.hexdigest()[:16]
+    _SOURCE_HASH_CACHE[key] = digest
+    return digest
+
+
+# ---------------------------------------------------------------------------
+# Which defines a source actually reads
+#
+# `variant_gates.mojo` is the only file that touches `get_defined_*`; every
+# operation source reaches a define through one of its gate helpers, always
+# with a literal operation name or argument index. Scanning for those calls
+# tells us exactly which defines can change the generated code — the rest are
+# dropped from both the cache key and the compiler command line.
+
+_GATE_LIBRARY_NAME = "variant_gates.mojo"
+_MOJO_IMPORT_BLOCK_RE = re.compile(
+    r"^[ \t]*(?:from[ \t]+\S+[ \t]+)?import[ \t]+(?:\([^)]*\)|[^\n]*)", re.M
+)
+_OP_GATE_RE = re.compile(r"_op_on\s*\[\s*([^\],]+)")
+_ARG_GATE_RE = re.compile(r"_dtype_arg(?:_abi|_width)?_on\s*\[\s*([^\],]+)")
+_OUT_GATE_RE = re.compile(r"_dtype_out_on\s*\[\s*([^\],]+)")
+_DEFINE_READ_RE = re.compile(r"(?:get_defined_\w+|is_defined)\s*\[\s*([^\],]+)")
+# Bare mentions of the same names, used to detect a helper that is passed
+# around instead of being called with literal parameters.
+_GATE_HELPER_RE = re.compile(
+    r"_(?:op_on|dtype_arg_on|dtype_arg_abi_on|dtype_arg_width_on|dtype_out_on)\b"
+)
+_DEFINE_READER_RE = re.compile(r"\b(?:get_defined_\w+|is_defined)\b")
+
+_DEFINE_NAMES_CACHE: dict[
+    tuple[Path, tuple[SourceStamp, ...]], frozenset[str] | None
+] = {}
+
+
+def _scan_define_names(files: tuple[Path, ...]) -> frozenset[str] | None:
+    """Every define name the given Mojo sources can read.
+
+    Returns None when the sources cannot be analysed conservatively — a gate
+    called with a non-literal name or index, or a gate helper named without
+    being called — in which case the caller must keep every define.
+    """
+    names: set[str] = set()
+    for path in files:
+        if path.name == _GATE_LIBRARY_NAME:
+            continue  # the gate library declares every canonical name
+        try:
+            text = _MOJO_IMPORT_BLOCK_RE.sub("", path.read_text())
+        except OSError:
+            return None
+        gate_calls = 0
+        for operation in _OP_GATE_RE.findall(text):
+            if not operation.startswith('"'):
+                return None
+            names.add("OP")
+            gate_calls += 1
+        for pattern, template in (
+            (_ARG_GATE_RE, "DTYPE_ARG_{}"),
+            (_OUT_GATE_RE, "DTYPE_OUT_{}"),
+        ):
+            for index in pattern.findall(text):
+                if not index.strip().isdigit():
+                    return None
+                names.add(template.format(int(index)))
+                gate_calls += 1
+        read_calls = 0
+        for name in _DEFINE_READ_RE.findall(text):
+            name = name.strip()
+            if not (name.startswith('"') and name.endswith('"')):
+                return None
+            names.add(name[1:-1])
+            read_calls += 1
+        # A helper that is aliased or passed around instead of being called
+        # with literal parameters escapes the scans above; refuse to guess.
+        if len(_GATE_HELPER_RE.findall(text)) != gate_calls:
+            return None
+        if len(_DEFINE_READER_RE.findall(text)) != read_calls:
+            return None
+    if "DTYPE_OUT_0" in names:
+        names.add("DTYPE_OUT")  # variant_gates spells output 0 both ways
+    return frozenset(names)
+
+
+def _define_names_read_by(source: Path) -> frozenset[str] | None:
+    """Cached `_scan_define_names` over one resolved source's closure."""
+    files, stamps = _closure_of(source)
+    key = (source, stamps)
+    if key not in _DEFINE_NAMES_CACHE:
+        _DEFINE_NAMES_CACHE[key] = _scan_define_names(files)
+    return _DEFINE_NAMES_CACHE[key]
+
+
+def _live_defines(source: Path, defines: CanonicalDefines) -> CanonicalDefines:
+    """Drop the defines no gate in `source`'s closure consumes.
+
+    A define nothing reads cannot change the generated code, so two calls
+    that differ only in such a define must share one build instead of forking
+    a second, byte-identical .so. Dropping is safe in both directions because
+    `_source_hash` covers the same closure: adding a gate for a define
+    invalidates every cached variant of that source.
+    """
+    names = _define_names_read_by(source)
+    if names is None:
+        return defines
+    return tuple(item for item in defines if item[0] in names)
 
 
 def _defines_tag(defines: CanonicalDefines | None) -> str:
@@ -290,6 +502,36 @@ def _extension_path(src: Path, defines: CanonicalDefines | None) -> Path:
     )
 
 
+_BUILD_NOTICE_LOCK = threading.Lock()
+_BUILD_NOTICE_SHOWN = False
+
+
+def _trace(message: str) -> None:
+    """Timestamped build tracing, off unless TORCH_MOJO_BACKEND_TRACE is set."""
+    if os.environ.get("TORCH_MOJO_BACKEND_TRACE"):
+        sys.stderr.write(f"[TRACE] {message} t={time.monotonic():.2f}\n")
+
+
+def _announce_build() -> None:
+    """One notice per process, not one per specialization.
+
+    A cold process compiles dozens of variants across up to `_pool_size()`
+    threads; naming each one buries the only thing a user needs to know,
+    which is that the wait happens once and is cached. Per-variant lines
+    live behind TORCH_MOJO_BACKEND_TRACE. A single write keeps concurrent
+    builder threads from splicing their lines together.
+    """
+    global _BUILD_NOTICE_SHOWN
+    with _BUILD_NOTICE_LOCK:
+        if _BUILD_NOTICE_SHOWN:
+            return
+        _BUILD_NOTICE_SHOWN = True
+    sys.stderr.write(
+        "torch-mojo-backend: compiling eager Mojo kernels on demand "
+        "(first use only, cached afterwards in __mojocache__)...\n"
+    )
+
+
 def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
     """Compile one immutable defined extension and return its cache path."""
     out = _extension_path(src, defines)
@@ -301,13 +543,8 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
         if out.is_file():
             return out
         scope = "full" if defines is None else dict(defines).get("OP", "defined")
-        import time as _time
-
-        print(
-            f"torch-mojo-backend: compiling {src.stem}.{scope} on demand..."
-            + (f" t={_time.monotonic():.2f}" if os.environ.get("TMB_TRACE") else ""),
-            file=sys.stderr,
-        )
+        _announce_build()
+        _trace(f"building {src.stem}.{scope}")
         # Build to a temp path and rename into place: `mojo build -o` writes
         # the output non-atomically, and the fast-path existence check above
         # runs WITHOUT the lock — a reader must never see a partial .so.
@@ -321,12 +558,7 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
                 text=True,
                 env=_build_env(),
             )
-            if os.environ.get("TMB_TRACE"):
-                print(
-                    f"[TRACE] built {src.stem}.{scope} t={_time.monotonic():.2f}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            _trace(f"built {src.stem}.{scope}")
             if proc.returncode != 0:
                 raise ImportError(
                     f"mojo build failed for {src.stem} "
@@ -336,6 +568,18 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
         finally:
             tmp.unlink(missing_ok=True)
         return out
+
+
+def _variant_module_name(src: Path, defines: CanonicalDefines | None) -> str:
+    """sys.modules name for one loaded .so.
+
+    CPython derives the init symbol from the last dotted component only, so
+    the stem must stay last; the specialization tag in front gives every
+    variant of a source its own entry instead of each one replacing the
+    previous, and `_VARIANT_NAMESPACE` keeps all of them clear of the
+    importable `<op>_ops` packages.
+    """
+    return f"{_VARIANT_NAMESPACE}.{_defines_tag(defines)}.{src.stem}"
 
 
 def _load_extension(module_name: str, so_path: Path) -> ModuleType:
@@ -348,35 +592,33 @@ def _load_extension(module_name: str, so_path: Path) -> ModuleType:
     return module
 
 
-_FULL_MODULE_LOCK = threading.Lock()
-_FULL_MODULE_CACHE: dict[str, ModuleType] = {}
-_FULL_MODULE_FAILURES: dict[str, BaseException] = {}
-
-
-def _load_full_module(name: str) -> ModuleType:
-    """Load a deliberately ungated singleton extension exactly once."""
-    with _FULL_MODULE_LOCK:
-        module = _FULL_MODULE_CACHE.get(name)
-        if module is not None:
-            return module
-        failure = _FULL_MODULE_FAILURES.get(name)
-        if failure is not None:
-            raise failure
-        try:
-            source = _PACKAGE_DIR / f"{name}.mojo"
-            module = _load_extension(
-                f"{__name__}.{name}", _build_extension(source, None)
-            )
-        except BaseException as exc:
-            _FULL_MODULE_FAILURES[name] = exc
-            raise
-        _FULL_MODULE_CACHE[name] = module
-        return module
+_TENSOR_HOLDER_LOCK = threading.Lock()
+_TENSOR_HOLDER: list[ModuleType | BaseException] = []
 
 
 def _ensure_tensor_holder() -> ModuleType:
-    """Register the process-wide TensorHolder/TensorSpec Python types."""
-    return _load_full_module("tensor_holder")
+    """Register the process-wide TensorHolder/TensorSpec Python types.
+
+    Deliberately ungated and loaded exactly once: a second `add_type` of the
+    same name aborts the process, and the file lock in `_build_extension`
+    guards the build but not the dlopen.
+    """
+    with _TENSOR_HOLDER_LOCK:
+        if _TENSOR_HOLDER:
+            loaded = _TENSOR_HOLDER[0]
+            if isinstance(loaded, BaseException):
+                raise loaded
+            return loaded
+        source = _PACKAGE_DIR / "tensor_holder.mojo"
+        try:
+            module = _load_extension(
+                _variant_module_name(source, None), _build_extension(source, None)
+            )
+        except BaseException as exc:
+            _TENSOR_HOLDER.append(exc)
+            raise
+        _TENSOR_HOLDER.append(module)
+        return module
 
 
 def _resolve_mojo_file(mojo_file: Path) -> Path:
@@ -431,7 +673,9 @@ class _DefinedUnit:
                 if self.mojo_file.stem != "tensor_holder":
                     _ensure_tensor_holder()
                 so_path = _build_extension(self.mojo_file, self.defines)
-                module = _load_extension(f"{__name__}.{self.mojo_file.stem}", so_path)
+                module = _load_extension(
+                    _variant_module_name(self.mojo_file, self.defines), so_path
+                )
                 if not callable(getattr(module, "call", None)):
                     raise ImportError(
                         f"specialized extension {self.mojo_file.stem!r} does "
@@ -449,14 +693,9 @@ class _DefinedUnit:
 
     @property
     def ext(self) -> ModuleType | None:
-        """Queue-unit compatibility: the native loaded module, if ready."""
+        """The loaded native module, or None while it is still building.
+        `call_queue` reads this to decide whether an item can launch."""
         return self.module
-
-    def resolve(self, attr: str) -> object:
-        if attr != "call":
-            raise AttributeError(f"specialized modules expose call(), not {attr!r}")
-        module = self.load_blocking() if self.module is None else self.module
-        return getattr(module, "call")
 
     def request_async(self) -> _AsyncLoadJob:
         with self.lock:
@@ -485,31 +724,34 @@ class MojoExtensionLoader:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._units: dict[tuple[Path, CanonicalDefines], _DefinedUnit] = {}
+        self._requests: dict[tuple[Path, CanonicalDefines], _DefinedUnit] = {}
 
     def _unit(self, mojo_file: Path, defines: CanonicalDefines) -> _DefinedUnit:
+        """The unit for one requested specialization.
+
+        This is on the path of every kernel launch, so a repeated request is
+        one dict lookup and nothing else. Everything that turns a request
+        into a build identity — resolving the source path, reading its
+        dependency closure, dropping the defines it does not read — happens
+        once per distinct (file, defines) pair on the miss path below.
+        """
+        unit = self._requests.get((mojo_file, defines))
+        if unit is None:
+            unit = self._resolve_unit(mojo_file, defines)
+        return unit
+
+    def _resolve_unit(self, mojo_file: Path, defines: CanonicalDefines) -> _DefinedUnit:
         source = _resolve_mojo_file(mojo_file).resolve()
-        key = (source, defines)
+        key = (source, _live_defines(source, defines))
         with self._lock:
             unit = self._units.get(key)
             if unit is None:
-                unit = self._units[key] = _DefinedUnit(source, defines)
+                unit = self._units[key] = _DefinedUnit(*key)
+            self._requests[(mojo_file, defines)] = unit
             return unit
-
-    def load(self, mojo_file: Path, defines: Mapping[str, DefineValue]) -> ModuleType:
-        return self._unit(mojo_file, normalize_defines(defines)).load_blocking()
 
     def load_canonical(self, mojo_file: Path, defines: CanonicalDefines) -> ModuleType:
         return self._unit(mojo_file, defines).load_blocking()
-
-    def request_async(
-        self, mojo_file: Path, defines: Mapping[str, DefineValue]
-    ) -> _AsyncLoadJob:
-        return self._unit(mojo_file, normalize_defines(defines)).request_async()
-
-    def request_canonical_async(
-        self, mojo_file: Path, defines: CanonicalDefines
-    ) -> _AsyncLoadJob:
-        return self._unit(mojo_file, defines).request_async()
 
     def unit_canonical(
         self, mojo_file: Path, defines: CanonicalDefines
@@ -529,14 +771,6 @@ class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
     output_specs: _OutputSpecs
     args: tuple[object, ...]
     kwargs: tuple[tuple[str, object], ...]
-
-    def request_module_async(
-        self, loader: MojoExtensionLoader | None = None
-    ) -> _AsyncLoadJob:
-        selected_loader = loader or MOJO_EXTENSION_LOADER
-        return selected_loader.request_canonical_async(
-            self.extension.MOJO_FILE, self.defines
-        )
 
     def get_loaded_module(
         self, loader: MojoExtensionLoader | None = None
@@ -558,7 +792,7 @@ class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
         """Queue a non-returning `call(..., out)` and return inferred outputs."""
         selected_loader = loader or MOJO_EXTENSION_LOADER
         unit = selected_loader.unit_canonical(self.extension.MOJO_FILE, self.defines)
-        call_queue.kernel_call_into(unit, "call", extension_args)
+        call_queue.kernel_call_into(unit, extension_args)
         return self.output_specs
 
 
@@ -573,19 +807,39 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
             f"{cls.__name__} is a stateless descriptor and cannot be instantiated"
         )
 
-    @staticmethod
-    def str_from_defined_dict(defines: Mapping[str, DefineValue]) -> str:
-        return defines_cache_string(defines)
-
     @classmethod
     @abstractmethod
     def make_defines(cls, *args: object, **kwargs: object) -> Mapping[str, DefineValue]:
         """Capture every compile-time value; never include shapes or strides."""
 
     @classmethod
+    def make_canonical_defines(
+        cls, *args: object, **kwargs: object
+    ) -> CanonicalDefines:
+        """The specialization key, canonical and validated exactly once.
+
+        Descriptors whose `make_defines` already returns a validated mapping
+        override this to hand the canonical form straight over instead of
+        having it re-validated per launch.
+        """
+        return normalize_defines(cls.make_defines(*args, **kwargs))
+
+    @classmethod
     @abstractmethod
     def expected_output_specs(cls, *args: object, **kwargs: object) -> _OutputSpecs:
         """Infer output metadata without compiling or executing the extension."""
+
+    @classmethod
+    @abstractmethod
+    def extension_args(
+        cls, out: object, *args: object, **kwargs: object
+    ) -> tuple[object, ...]:
+        """The native argument tuple for `call`, given the allocated outputs.
+
+        This is the per-operation contract the queue depends on: a queued
+        launch is serialized here, from Python-side allocated outputs, and
+        never goes through `call_extension`.
+        """
 
     @classmethod
     @abstractmethod
@@ -603,19 +857,10 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
         cls, *args: object, **kwargs: object
     ) -> PreparedExtensionCall[_OutputSpecs, _ExtensionResult]:
         output_specs = cls.expected_output_specs(*args, **kwargs)
-        defines = normalize_defines(cls.make_defines(*args, **kwargs))
+        defines = cls.make_canonical_defines(*args, **kwargs)
         return PreparedExtensionCall(
             cls, defines, output_specs, args, tuple(kwargs.items())
         )
-
-    @classmethod
-    def get_loaded_module(cls, *args: object, **kwargs: object) -> ModuleType:
-        defines = normalize_defines(cls.make_defines(*args, **kwargs))
-        return MOJO_EXTENSION_LOADER.load_canonical(cls.MOJO_FILE, defines)
-
-    @classmethod
-    def execute(cls, *args: object, **kwargs: object) -> _ExtensionResult:
-        return cls.prepare(*args, **kwargs).execute()
 
 
 class MojoFileExtension(MojoExtension[object, object]):
@@ -635,11 +880,28 @@ class MojoFileExtension(MojoExtension[object, object]):
         arg_dtypes: tuple[DType | str, ...],
         output_dtypes: tuple[DType | str, ...] = (),
         flags: Mapping[str, DefineValue] | None = None,
-        result_specs: object = None,
     ) -> Mapping[str, DefineValue]:
-        del extension_args, result_specs
+        del extension_args
         return exact_call_defines(
             op, arg_dtypes, output_dtypes=output_dtypes, flags=flags
+        )
+
+    @classmethod
+    def make_canonical_defines(
+        cls,
+        op: str,
+        extension_args: tuple[object, ...],
+        *,
+        arg_dtypes: tuple[DType | str, ...],
+        output_dtypes: tuple[DType | str, ...] = (),
+        flags: Mapping[str, DefineValue] | None = None,
+    ) -> CanonicalDefines:
+        del extension_args
+        return _canonical_call_defines(
+            op,
+            tuple(arg_dtypes),
+            tuple(output_dtypes),
+            tuple(flags.items()) if flags else (),
         )
 
     @classmethod
@@ -651,10 +913,23 @@ class MojoFileExtension(MojoExtension[object, object]):
         arg_dtypes: tuple[DType | str, ...],
         output_dtypes: tuple[DType | str, ...] = (),
         flags: Mapping[str, DefineValue] | None = None,
-        result_specs: object = None,
     ) -> object:
         del op, extension_args, arg_dtypes, output_dtypes, flags
-        return result_specs
+        return None  # this family's outputs are allocated by its caller
+
+    @classmethod
+    def extension_args(
+        cls,
+        out: object,
+        op: str,
+        extension_args: tuple[object, ...],
+        *,
+        arg_dtypes: tuple[DType | str, ...],
+        output_dtypes: tuple[DType | str, ...] = (),
+        flags: Mapping[str, DefineValue] | None = None,
+    ) -> tuple[object, ...]:
+        del out, op, arg_dtypes, output_dtypes, flags
+        return extension_args  # already built by the caller, outputs included
 
     @classmethod
     def call_extension(
@@ -667,9 +942,8 @@ class MojoFileExtension(MojoExtension[object, object]):
         arg_dtypes: tuple[DType | str, ...],
         output_dtypes: tuple[DType | str, ...] = (),
         flags: Mapping[str, DefineValue] | None = None,
-        result_specs: object = None,
     ) -> object:
-        del (output_specs, op, arg_dtypes, output_dtypes, flags, result_specs)
+        del output_specs, op, arg_dtypes, output_dtypes, flags
         return extension.call(*extension_args)  # type: ignore[attr-defined, no-any-return]
 
     @classmethod
@@ -684,13 +958,16 @@ class MojoFileExtension(MojoExtension[object, object]):
         result_specs: object = None,
     ) -> object:
         """Compile/load this exact variant, preserving the launch FIFO."""
+        # result_specs is accepted and ignored: the outputs are allocated and
+        # returned by the caller. Delete the parameter once the aten_fast
+        # call sites stop passing it.
+        del result_specs
         prepared = cls.prepare(
             op,
             extension_args,
             arg_dtypes=arg_dtypes,
             output_dtypes=output_dtypes,
             flags=flags,
-            result_specs=result_specs,
         )
         if call_queue.enabled():
             prepared.enqueue_into(extension_args)
@@ -701,21 +978,35 @@ class MojoFileExtension(MojoExtension[object, object]):
 MOJO_EXTENSION_LOADER = MojoExtensionLoader()
 
 
+def _available_memory_gib() -> float | None:
+    """Memory the build pool may assume, or None when the host cannot say.
+
+    Linux answers with MemAvailable; macOS has no procfs, so fall back to
+    total physical memory through sysconf, which overestimates but still
+    scales with the machine. Returning None rather than a fixed guess is what
+    lets the caller fall back to the core count instead of silently
+    serializing every build on hosts neither source covers.
+    """
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except OSError:
+        pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def _pool_size() -> int:
     """Concurrent `mojo build` subprocesses. Each build peaks around 4.5 GB
     RSS and uses ~2.5-3 cores, so cap by available RAM (5 GiB per slot with
     headroom) and by cores; never fewer than 1, never more than 16."""
-    mem_gib = 8.0
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable"):
-                    mem_gib = int(line.split()[1]) / (1024 * 1024)
-                    break
-    except OSError:
-        pass
-    by_mem = int(mem_gib // 5)
     by_cpu = (os.cpu_count() or 4) // 3
+    memory_gib = _available_memory_gib()
+    by_mem = by_cpu if memory_gib is None else int(memory_gib // 5)
     return max(1, min(by_mem, by_cpu, 16))
 
 

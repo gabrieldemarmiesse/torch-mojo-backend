@@ -2,9 +2,9 @@ import functools
 import math
 import threading
 from collections import deque
-from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 import max.driver
 import torch
@@ -14,6 +14,11 @@ from max.experimental.torch import max_dtype_to_torch
 
 from torch_mojo_backend import eager_kernels
 from torch_mojo_backend.eager_kernels.data_movement_ops import DataMovementExtension
+from torch_mojo_backend.eager_kernels.output_specs import (
+    _allocate_output_spec,
+    _submit_prepared_into,
+    _TensorOutputSpec,
+)
 from torch_mojo_backend.mojo_device import objc_autorelease, torch_mojo_device_module
 
 # The Mojo extension module (torch_mojo_backend.eager_kernels.tensor_holder),
@@ -181,6 +186,22 @@ class MojoTensorLike(Protocol):
     _device: object
 
 
+def _dispatch_entry(func: object, args: tuple, kwargs: dict) -> object:
+    """``deferred_compile.dispatch``, resolved on first use.
+
+    ``deferred_compile`` imports the call queue this module feeds, so it
+    cannot be imported at module scope. Rebinding the global on the first
+    dispatch keeps that direction intact and leaves the steady state at one
+    plain global lookup instead of a per-op ``sys.modules`` hit (the same
+    trick as ``output_specs._alloc``).
+    """
+    global _dispatch_entry
+    from . import deferred_compile
+
+    _dispatch_entry = deferred_compile.dispatch
+    return _dispatch_entry(func, args, kwargs)
+
+
 def _row_major_strides(shape) -> tuple[int, ...]:
     strides = [1] * len(shape)
     for i in range(len(shape) - 2, -1, -1):
@@ -280,9 +301,7 @@ class TorchMojoTensor(torch.Tensor):
         # The deferred-compile layer executes ops while kernel variants are
         # still building in the background (and is a plain pass-through to
         # the ordinary PrivateUse1 path when no compile is in flight).
-        from . import deferred_compile
-
-        return deferred_compile.dispatch(func, args, kwargs or {})
+        return _dispatch_entry(func, args, kwargs or {})
 
     @classmethod
     def _make(
@@ -403,15 +422,13 @@ class TorchMojoTensor(torch.Tensor):
         consuming it, matching PyTorch's asynchronous accelerator-to-CPU
         contract. Blocking and CPU-device copies are ready on return.
         """
-        from torch_mojo_backend.eager_kernels import call_queue as _cq
-
-        _cq.drain()
-        # Reading device bytes is a sync point for deferred-compile episodes:
-        # every queued op must have executed before the transfer is enqueued.
         from . import deferred_compile
 
-        deferred_compile.drain()
         src = self if self._is_contiguous else self._materialize_contiguous()
+        # Reading device bytes is a host read: every queued launch must have
+        # executed before the transfer is enqueued -- INCLUDING the strided
+        # materialization just queued above, whose output is what this reads.
+        deferred_compile.drain()
         if src._numel == 0:
             return torch.empty(self._shape, dtype=max_dtype_to_torch(self._dtype))
 
@@ -452,7 +469,7 @@ class TorchMojoTensor(torch.Tensor):
             # PermuteCopy gathers a strided source into a contiguous
             # destination with no destination index math and half the
             # coordinate math of the generic rank-8 CopyStrided.
-            return _materialize_permute_copy(self)
+            return _submit_prepared_into(_PermuteCopyExtension.prepare(self))
         out = TorchMojoTensor._alloc(self._shape, self._dtype, self._device)
         if self._numel > 0:
             _copy_strided_into(out, self)
@@ -471,10 +488,18 @@ class TorchMojoTensor(torch.Tensor):
         and the capsule pins the (materialized) tensor's holder. `stream` is
         ignored: producers and consumers share the device's default stream
         (the same assumption the eager kernels make).
+
+        Publishing a raw pointer is a payload read from outside
+        `__torch_dispatch__`, so it drains the call queue: the consumer must
+        not see a buffer whose producing launches -- including the copy a
+        strided export just queued -- are still waiting on a compile.
         """
         from torch_mojo_backend.mojo_device import dlpack
 
+        from . import deferred_compile
+
         src = self._contig()
+        deferred_compile.drain()
         return dlpack.make_capsule(
             src._holder, src._ptr, src._shape, src._dtype, src._device
         )
@@ -514,69 +539,19 @@ class TorchMojoTensor(torch.Tensor):
             return f"TorchMojoTensor({self._to_cpu_tensor()!r}, device='{self.device}')"
         return super().__repr__()
 
-    @property
-    def shape(self):
-        """Logical eager shape, including an out= resize rebind.
-
-        The lightweight PrivateUse1 TensorImpl used as the Python wrapper has
-        no backend storage to resize. Eager kernels therefore keep their
-        authoritative metadata in Python; expose that same metadata through
-        the normal tensor API after a sanctioned payload rebind.
-        """
-        if hasattr(self, "_shape"):
-            return torch.Size(self._shape)
-        return super().shape
-
-    @property
-    def ndim(self):
-        if hasattr(self, "_shape"):
-            return len(self._shape)
-        return super().ndim
-
-    def dim(self):
-        if hasattr(self, "_shape"):
-            return len(self._shape)
-        return super().dim()
-
-    ndimension = dim
-
-    def size(self, dim=None):
-        if not hasattr(self, "_shape"):
-            return super().size() if dim is None else super().size(dim)
-        size = torch.Size(self._shape)
-        return size if dim is None else size[dim]
-
-    def stride(self, dim=None):
-        if not hasattr(self, "_strides"):
-            return super().stride() if dim is None else super().stride(dim)
-        strides = tuple(self._strides)
-        return strides if dim is None else strides[dim]
-
-    def is_contiguous(self, memory_format=torch.contiguous_format):
-        if not hasattr(self, "_is_contiguous"):
-            return super().is_contiguous(memory_format=memory_format)
-        if memory_format in (torch.contiguous_format, torch.preserve_format):
-            return self._is_contiguous
-        # A meta tensor gives PyTorch's exact channels-last layout answer
-        # without touching device data or requiring a GPU-enabled torch build.
-        return torch.empty_strided(
-            self._shape,
-            self._strides,
-            dtype=_torch_dtype_of(self._dtype),
-            device="meta",
-        ).is_contiguous(memory_format=memory_format)
-
-    def numel(self):
-        if hasattr(self, "_numel"):
-            return self._numel
-        return super().numel()
-
-    nelement = numel
-
-    def storage_offset(self):
-        if hasattr(self, "_offset"):
-            return self._offset
-        return super().storage_offset()
+    # NOTE: shape/ndim/dim/size/stride/is_contiguous/numel/storage_offset are
+    # deliberately NOT overridden. ``_make_wrapper_subclass`` records the same
+    # sizes, strides and storage offset on the TensorImpl that ``_make`` stores
+    # in the Python payload, and ``_rebind_payload`` resizes the TensorImpl
+    # alongside a payload swap, so the C++ accessors are already authoritative
+    # (they were only shadowed while the wrapper was a contiguous-only
+    # ``_acc.create_empty_tensor``). Re-adding a Python override would break
+    # torch.compile: dynamo models a tensor subclass through
+    # ``TensorWithTFOverrideVariable``, which INLINES Python-level metadata
+    # overrides -- so ``x.shape[0]`` would be traced as a read of the
+    # ``_shape`` tuple, specializing the shape as a constant and, once dynamic,
+    # minting a symbol unrelated to the tensor's size symbol (a graph input the
+    # MAX backend cannot supply). It is also slower than the C++ accessor.
 
     @property
     def device(self):
@@ -589,15 +564,19 @@ class TorchMojoTensor(torch.Tensor):
     __torch_function__ = torch._C._disabled_torch_function_impl
 
 
-@dataclass(frozen=True)
-class _PermuteCopyOutputSpec:
-    shape: tuple[int, ...]
-    dtype: DType
-    device: max.driver.Device
+class _PermuteCopyExtension(
+    eager_kernels.MojoExtension[_TensorOutputSpec, "TorchMojoTensor"]
+):
+    """Stateless descriptor for rank-at-most-four strided materialization.
 
+    It borrows data_movement_ops' source but not `MojoFileExtension`'s ABI:
+    that base takes the specialization apart from `(op, arg_dtypes, flags)`
+    call arguments, while this descriptor names its own defines. Deriving
+    from it would shadow `make_defines` with the base's
+    `make_canonical_defines` and never call the override.
+    """
 
-class _PermuteCopyExtension(DataMovementExtension):
-    """Stateless descriptor for rank-at-most-four strided materialization."""
+    MOJO_FILE: ClassVar[Path] = DataMovementExtension.MOJO_FILE
 
     @classmethod
     def make_defines(cls, tensor: MojoTensorLike) -> dict[str, bool | int | str]:
@@ -608,10 +587,8 @@ class _PermuteCopyExtension(DataMovementExtension):
         }
 
     @classmethod
-    def expected_output_specs(cls, tensor: MojoTensorLike) -> _PermuteCopyOutputSpec:
-        return _PermuteCopyOutputSpec(
-            tuple(tensor._shape), tensor._dtype, tensor._device
-        )
+    def expected_output_specs(cls, tensor: MojoTensorLike) -> _TensorOutputSpec:
+        return _TensorOutputSpec(tuple(tensor._shape), tensor._dtype, tensor._device)
 
     @classmethod
     def extension_args(
@@ -632,27 +609,12 @@ class _PermuteCopyExtension(DataMovementExtension):
     def call_extension(
         cls,
         extension: ModuleType,
-        output_specs: _PermuteCopyOutputSpec,
+        output_specs: _TensorOutputSpec,
         tensor: MojoTensorLike,
     ) -> TorchMojoTensor:
-        out = TorchMojoTensor._alloc(
-            output_specs.shape, output_specs.dtype, output_specs.device
-        )
-        if math.prod(output_specs.shape) > 0:
-            extension.call(*cls.extension_args(out, tensor))
+        out = _allocate_output_spec(output_specs)
+        extension.call(*cls.extension_args(out, tensor))
         return out
-
-
-def _materialize_permute_copy(tensor: TorchMojoTensor) -> TorchMojoTensor:
-    """Allocate the inferred output and launch/queue its defined extension."""
-    prepared = _PermuteCopyExtension.prepare(tensor)
-    if not eager_kernels.call_queue.enabled():
-        return prepared.execute()
-    spec = prepared.output_specs
-    out = TorchMojoTensor._alloc(spec.shape, spec.dtype, spec.device)
-    if tensor._numel > 0:
-        prepared.enqueue_into(prepared.extension.extension_args(out, *prepared.args))
-    return out
 
 
 def _rebind_payload(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
@@ -734,8 +696,8 @@ def _resize_payload(dst: TorchMojoTensor, shape) -> None:
 def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     """Queue the strided copy as an external call (tensor_holder is always
     loaded, so the item is always launch-ready; it only holds FIFO order).
-    The queue holds raw pointers — the two tensors ride along for
-    keep-alive, harmlessly ignored by the trailing-args convention here."""
+    The queue holds raw pointers, so both tensors are handed over as the
+    item's keep-alive: their buffers must outlive the launch."""
     from torch_mojo_backend.eager_kernels import call_queue as _cq
 
     holder = _holder_mod()
@@ -748,7 +710,7 @@ def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
         dst._itemsize,
         _ctx_ptr(dst._device),
     )
-    _cq.external_call(lambda *a: holder.CopyStrided(*a[:7]), args + (dst, src))
+    _cq.external_call(holder.CopyStrided, args, keepalive=(dst, src))
 
 
 def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:

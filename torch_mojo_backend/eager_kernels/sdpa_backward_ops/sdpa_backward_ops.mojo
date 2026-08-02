@@ -303,7 +303,6 @@ def PyInit_sdpa_backward_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _sdpa_dropout_softmax_backward_dispatcher,
-                "SDPADropoutSoftmaxBackward",
                 docstring=(
                     "(output_ptr, probabilities_ptr, grad_after_dropout_ptr,"
                     " mask_ptr_or_zero, rows, cols, q_len, has_mask, causal,"
@@ -316,7 +315,6 @@ def PyInit_sdpa_backward_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _sdpa_dsb_f32_dispatcher,
-                "SDPADropoutSoftmaxBackwardF32",
                 docstring=(
                     "(output_ptr, probabilities_ptr, grad_after_dropout_ptr,"
                     " mask_ptr_or_zero, rows, cols, has_mask, dropout_scale,"
@@ -330,7 +328,6 @@ def PyInit_sdpa_backward_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _sdpa_ta_gemm_dispatcher,
-                "SDPATransAGemmF32",
                 docstring=(
                     "(c_ptr, a_ptr, b_ptr, mask_ptr_or_zero, (batch, m, n, k,"
                     " has_mask, causal), drop_scale, context_ptr); Apple-only"

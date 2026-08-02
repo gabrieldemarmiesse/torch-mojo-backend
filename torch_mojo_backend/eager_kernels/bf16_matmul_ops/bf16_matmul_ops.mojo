@@ -171,7 +171,6 @@ def PyInit_bf16_matmul_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _bf16_bmm_dispatcher,
-                "Bf16BmmBF16",
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, batch_count, m, n, k,"
                     " output_batch_stride, a_batch_stride, b_batch_stride,"
@@ -183,7 +182,6 @@ def PyInit_bf16_matmul_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _bf16_gemm_dispatcher,
-                "Bf16GemmBF16",
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, bias_ptr, m, n, k, transpose_a,"
                     " transpose_b, has_bias, context_ptr); BF16 2-D GEMM"

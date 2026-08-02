@@ -11,7 +11,7 @@ from std.ffi import _get_global_or_null, external_call
 from std.gpu import block_idx, thread_idx
 from std.gpu.host import DeviceContext
 from std.gpu.primitives import block
-from std.math import min, sqrt
+from std.math import min
 from std.memory import alloc
 from std.sys.info import has_apple_gpu_accelerator
 
@@ -28,7 +28,7 @@ from foreach_elementwise_kernels import (
     _pick_mut,
     _slot_begin,
 )
-from op_utils import _enqueue_cached
+from op_utils import _enqueue_cached, ieee_sqrt
 
 
 comptime _VEC = 4
@@ -113,7 +113,7 @@ def _norm_finalize(
         accum += _ptr(partials_addr)[chunk]
     var total = block.sum[block_size=FOREACH_THREADS, broadcast=False](accum)
     if thread_idx.x == 0:
-        _ptr(desc.output_addr)[0] = sqrt(total)
+        _ptr(desc.output_addr)[0] = ieee_sqrt(total)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ def _norm_finalize_batched_apple(
     var total = block.sum[block_size=FOREACH_THREADS, broadcast=False](accum)
     if thread_idx.x == 0:
         var out_ptr = _pick_mut(slot, o0, o1, o2, o3, o4, o5, o6, o7)
-        out_ptr[0] = sqrt(total)
+        out_ptr[0] = ieee_sqrt(total)
 
 
 def _mul_tensor_batched_apple(

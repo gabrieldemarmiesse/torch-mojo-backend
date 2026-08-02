@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from torch_mojo_backend.eager_kernels import aten_fast
 from torch_mojo_backend.mojo_device import mojo_device_autograd as autograd
@@ -719,40 +720,50 @@ def test_fa4_canonical_fused_qkv_uses_strided_backward_bridge(
     ]
 
 
-def test_fa4_autograd_saves_public_inputs_without_persistent_physical_copies(
+def test_fa4_eligible_backward_routes_to_native_flash_with_public_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An eligible FA4 call that needs gradients goes to the lower ATen pair.
+
+    The custom SDPA Function used to own the FA4 saves itself; PyTorch's
+    generated autograd owns them now, so the eligibility gate must hand the
+    *public* BHTD q/k/v to ``aten::_scaled_dot_product_flash_attention`` (the
+    physical BTHD copies are made inside the kernel bridge and are not what
+    gets saved) and neither custom Function may be entered.
+    """
     public = tuple(_tensor(name, ptr=index) for index, name in enumerate("qkv", 1))
-    native = tuple(
-        _tensor(f"{name}_native", shape=(2, 128, 4, 64), ptr=100 + index)
-        for index, name in enumerate("qkv", 1)
-    )
+    for tensor in public:
+        tensor.requires_grad = True
     output = _tensor("output", ptr=200)
     lse = _tensor("lse", shape=(2, 4, 128), dtype=aten_fast.DType.float32, ptr=201)
-    not_handled = object()
-    fake_fast = SimpleNamespace(
-        NOT_HANDLED=not_handled,
-        fast_fa4_bf16_d64_causal_forward=lambda *_args: (output, lse, *native),
-    )
-    saved = []
-    ctx = SimpleNamespace(
-        needs_input_grad=(True, True, True, False, False, False, False, False),
-        save_for_backward=lambda *tensors: saved.extend(tensors),
-        set_materialize_grads=lambda value: setattr(ctx, "materialize", value),
-    )
-    monkeypatch.setattr(autograd, "_fast", lambda: fake_fast)
-    monkeypatch.setattr(autograd, "_SavedMojoPayload", lambda tensor: tensor.name)
+    eligible_with = []
+    flash_calls = []
 
-    actual = autograd._ScaledDotProductAttentionAutograd.forward(
-        ctx, *public, None, 0.0, True, None, False
+    def eligible(*args):
+        eligible_with.append(args)
+        return public
+
+    def flash(*args, **kwargs):
+        flash_calls.append((args, kwargs))
+        return (output, lse)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("an eligible FA4 call built a custom autograd node")
+
+    monkeypatch.setattr(aten_fast, "_fa4_bf16_d64_causal_inputs", eligible)
+    monkeypatch.setattr(
+        torch.ops.aten._scaled_dot_product_flash_attention, "default", flash
+    )
+    monkeypatch.setattr(autograd._ScaledDotProductAttentionAutograd, "apply", forbidden)
+    monkeypatch.setattr(autograd._FusedFlashAttentionAutograd, "apply", forbidden)
+
+    actual = autograd._scaled_dot_product_attention_autograd(
+        *public, None, 0.0, True, scale=0.125
     )
 
     assert actual is output
-    assert saved == [*public, output, lse]
-    assert ctx.saved_names[:3] == ("query", "key", "value")
-    assert ctx.saved_names[-2:] == ("output", "logsumexp")
-    assert ctx.fa4 is True
-    assert ctx.materialize is False
+    assert eligible_with == [(*public, None, 0.0, True, 0.125, False)]
+    assert flash_calls == [((*public, 0.0, True, False), {"scale": 0.125})]
 
 
 def test_vendored_fa4_sources_have_no_torch_cuda_or_internal_sync() -> None:

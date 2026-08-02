@@ -30,7 +30,7 @@ from std.gpu import (
 )
 from std.gpu.host import DeviceContext
 from std.gpu.primitives import block, warp
-from std.math import ceildiv, sqrt, exp, floor
+from std.math import ceildiv, exp, floor
 from std.memory import alloc, stack_allocation
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
@@ -73,8 +73,8 @@ from op_utils import (
     _scratch_contig,
     _scratch_copy,
     _spec_ptr,
-    _spec_result,
     _spec_unsupported,
+    ieee_sqrt,
 )
 
 from variant_gates import _dtype_arg_on, _op_on, _register_call
@@ -144,7 +144,7 @@ def _batch_norm[
         var v = var_ptr[c].cast[DType.float32]()
         var g = gamma_ptr[c].cast[DType.float32]()
         var b = beta_ptr[c].cast[DType.float32]()
-        var scale = g / sqrt(v + eps)
+        var scale = g / ieee_sqrt(v + eps)
         var a = in_ptr[i].cast[DType.float32]()
         out_ptr[i] = ((a - m) * scale + b).cast[dtype]()
 
@@ -269,7 +269,7 @@ def _layer_norm_block_kernel[
         barrier()
         stride //= 2
     if tid == 0:
-        var rstd0 = 1.0 / sqrt(red[0] / Float32(cols) + eps)
+        var rstd0 = 1.0 / ieee_sqrt(red[0] / Float32(cols) + eps)
         bcast[1] = rstd0
         mean_out_ptr[r] = mean
         rstd_out_ptr[r] = rstd0
@@ -323,7 +323,7 @@ def _layer_norm[
             for j in range(cols):
                 var d = in_ptr[base + j].cast[DType.float32]() - mean
                 var_sum += d * d
-            var rstd = 1.0 / sqrt(var_sum / Float32(cols) + eps)
+            var rstd = 1.0 / ieee_sqrt(var_sum / Float32(cols) + eps)
             for j in range(cols):
                 var x = in_ptr[base + j].cast[DType.float32]()
                 var g = gamma_ptr[j].cast[DType.float32]()
@@ -1694,72 +1694,6 @@ def _attn_decode[
         raise Error("no GPU accelerator available at compile time")
 
 
-def _attn_decode_go(
-    out_ptr_obj: PyObjectPtr,
-    q_ptr_obj: PyObjectPtr,
-    k_ptr_obj: PyObjectPtr,
-    v_ptr_obj: PyObjectPtr,
-    # (geometry/scale, q batch/head strides, k/v batch/head/seq strides)
-    params: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
-) raises:
-    var dtype = _raw_dtype_int(dtype_obj)
-    var out_addr = _raw_int(out_ptr_obj)
-    var q_addr = _raw_int(q_ptr_obj)
-    var k_addr = _raw_int(k_ptr_obj)
-    var v_addr = _raw_int(v_ptr_obj)
-    var bh = _raw_tuple_int(params, 0)
-    var kv_len = _raw_tuple_int(params, 1)
-    var head_dim = _raw_tuple_int(params, 2)
-    var scale = Float32(_raw_tuple_f64(params, 3))
-    var heads = _raw_tuple_int(params, 4)
-    var q_b_stride = _raw_tuple_int(params, 5)
-    var q_h_stride = _raw_tuple_int(params, 6)
-    var k_b_stride = _raw_tuple_int(params, 7)
-    var k_h_stride = _raw_tuple_int(params, 8)
-    var k_s_stride = _raw_tuple_int(params, 9)
-    var v_b_stride = _raw_tuple_int(params, 10)
-    var v_h_stride = _raw_tuple_int(params, 11)
-    var v_s_stride = _raw_tuple_int(params, 12)
-    var ctx = _raw_ctx(device_context_ptr)
-
-    # The GPU kernel stages scores/Q in fixed-size shared memory; the CPU
-    # path below has no such limit, so the size caps only gate the GPU
-    # launch (and its vectorized 4-wide K loads, hence head_dim % 4).
-    if ctx.api() != "cpu":
-        if kv_len > ATTN_MAX_KV or head_dim > ATTN_MAX_HD or head_dim % 4 != 0:
-            raise Error("attn_decode size caps violated")
-
-    var handled = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if dtype == dt:
-                _attn_decode[dt](
-                    out_addr,
-                    q_addr,
-                    k_addr,
-                    v_addr,
-                    bh,
-                    kv_len,
-                    head_dim,
-                    scale,
-                    heads,
-                    q_b_stride,
-                    q_h_stride,
-                    k_b_stride,
-                    k_h_stride,
-                    k_s_stride,
-                    v_b_stride,
-                    v_h_stride,
-                    v_s_stride,
-                    ctx,
-                )
-                handled = True
-    if not handled:
-        raise Error("unsupported dtype for fast attn_decode: " + String(dtype))
-
-
 # ---------------------------------------------------------------------------
 # Mean over the trailing dims: input viewed as (rows, cols), out has `rows`
 # elements. Covers aten.mean.dim over the last dims (e.g. global avg pool).
@@ -2741,7 +2675,7 @@ def _group_norm_block_kernel[
         barrier()
         stride //= 2
     if tid == 0:
-        var rstd0 = 1.0 / sqrt(red[0] / Float32(cols) + eps)
+        var rstd0 = 1.0 / ieee_sqrt(red[0] / Float32(cols) + eps)
         bcast[1] = rstd0
         mean_out_ptr[r] = mean
         rstd_out_ptr[r] = rstd0
@@ -2800,7 +2734,7 @@ def _group_norm[
             for j in range(cols):
                 var d = in_ptr[base + j].cast[DType.float32]() - mean
                 var_sum += d * d
-            var rstd = 1.0 / sqrt(var_sum / Float32(cols) + eps)
+            var rstd = 1.0 / ieee_sqrt(var_sum / Float32(cols) + eps)
             for j in range(cols):
                 var c = g * cpg + j // hxw
                 var x = in_ptr[base + j].cast[DType.float32]()
@@ -3128,21 +3062,6 @@ def _softmax_rows_dropout_dispatcher(
     return _raw_ret_none()
 
 
-def _attn_decode_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        _attn_decode_go(
-            args[0], args[1], args[2], args[3], args[4], args[5], args[6]
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
-
-
 def _max_pool2d_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -3275,74 +3194,6 @@ comptime SPEC_MAXROWS_DTYPES = [
 ]
 
 
-def _mean_spec_go(
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec mean: unsupported dtype ", a.dtype)
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
-    if cols == 0:
-        raise Error("mojo spec mean: empty reduce dim")
-
-    var ctx = a.ctx()
-    var nbytes = rows * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _mean_rows[dt](addr, in_addr, rows, cols, ctx)
-            _ = tmp^
-        else:
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _mean_rows[dt](addr, a.ptr, rows, cols, ctx)
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        out_rank,
-        oshape,
-        a.dtype,
-        a.itemsize,
-        rows,
-        a.ctx_ptr,
-    )
-
-
 def _mean_spec_into_go(
     a_o: PyObjectPtr,
     rdims_t: PyObjectPtr,
@@ -3415,80 +3266,15 @@ def _mean_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 4:
-            _mean_spec_into_go(args[0], args[1], args[2], args[3])
-            return _raw_ret_none()
-        return _mean_spec_go(args[0], args[1], args[2])
+        if nargs != 4:
+            raise Error(
+                "MeanSpec expects exactly 4 arguments (a_spec, rdims, keepdim,"
+                " out_spec)"
+            )
+        _mean_spec_into_go(args[0], args[1], args[2], args[3])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _max_spec_go(
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in SPEC_MAXROWS_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec max: unsupported dtype ", a.dtype)
-    if a.numel == 0:
-        raise Error("mojo spec max: empty input")
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
-
-    var ctx = a.ctx()
-    var nbytes = rows * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_MAXROWS_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _max_rows[dt](addr, in_addr, rows, cols, ctx)
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_MAXROWS_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _max_rows[dt](addr, a.ptr, rows, cols, ctx)
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        out_rank,
-        oshape,
-        a.dtype,
-        a.itemsize,
-        rows,
-        a.ctx_ptr,
-    )
 
 
 def _max_spec_into_go(
@@ -3563,72 +3349,15 @@ def _max_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 4:
-            _max_spec_into_go(args[0], args[1], args[2], args[3])
-            return _raw_ret_none()
-        return _max_spec_go(args[0], args[1], args[2])
+        if nargs != 4:
+            raise Error(
+                "MaxSpec expects exactly 4 arguments (a_spec, rdims, keepdim,"
+                " out_spec)"
+            )
+        _max_spec_into_go(args[0], args[1], args[2], args[3])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _argmax_spec_go(
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in SPEC_MAXROWS_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec argmax: unsupported dtype ", a.dtype)
-    if a.numel == 0:
-        raise Error("mojo spec argmax: empty input")
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
-
-    var ctx = a.ctx()
-    var nbytes = rows * 8  # int64 output
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_MAXROWS_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _argmax_rows[dt](addr, in_addr, rows, cols, ctx)
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_MAXROWS_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _argmax_rows[dt](addr, a.ptr, rows, cols, ctx)
-    return _spec_result(
-        buf^, addr, nbytes, out_rank, oshape, DType.int64, 8, rows, a.ctx_ptr
-    )
 
 
 def _argmax_spec_into_go(
@@ -3703,58 +3432,15 @@ def _argmax_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 4:
-            _argmax_spec_into_go(args[0], args[1], args[2], args[3])
-            return _raw_ret_none()
-        return _argmax_spec_go(args[0], args[1], args[2])
+        if nargs != 4:
+            raise Error(
+                "ArgmaxSpec expects exactly 4 arguments (a_spec, rdims,"
+                " keepdim, out_spec)"
+            )
+        _argmax_spec_into_go(args[0], args[1], args[2], args[3])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _cumsum_spec_go(a_o: PyObjectPtr) raises -> PyObjectPtr:
-    """Cumulative sum over the trailing dim; full-shape output."""
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in [DType.int64, DType.int32, DType.float32]:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec cumsum: unsupported dtype ", a.dtype)
-    if a.rank < 1 or a.numel == 0:
-        raise Error("mojo spec cumsum: empty or rank-0 input")
-
-    var cols = a.shape[MAX_RANK - 1]
-    var rows = a.numel // cols
-    var ctx = a.ctx()
-    var nbytes = a.numel * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if a.contig:
-        comptime for dt in [DType.int64, DType.int32, DType.float32]:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _cumsum_rows[dt](addr, a.ptr, rows, cols, ctx)
-    else:
-        # Mojo-side temporary; see _unary_spec_go in elementwise_ops.
-        var tmp = _scratch_contig(a, ctx)
-        var tmp_addr = Int(tmp.unsafe_ptr())
-        comptime for dt in [DType.int64, DType.int32, DType.float32]:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _cumsum_rows[dt](addr, tmp_addr, rows, cols, ctx)
-        _ = tmp^
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        a.rank,
-        a.shape,
-        a.dtype,
-        a.itemsize,
-        a.numel,
-        a.ctx_ptr,
-    )
 
 
 def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
@@ -3787,7 +3473,9 @@ def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
                 if a.dtype == dt:
                     _cumsum_rows[dt](addr, a.ptr, rows, cols, ctx)
     else:
-        # Mojo-side temporary; see _unary_spec_go in elementwise_ops.
+        # Mojo-side temporary (design doc §4.7): materialize the strided
+        # input into a scratch buffer inside the call — Python never
+        # mints a wrapper for it.
         var tmp = _scratch_contig(a, ctx)
         var tmp_addr = Int(tmp.unsafe_ptr())
         comptime for dt in [DType.int64, DType.int32, DType.float32]:
@@ -3804,95 +3492,14 @@ def _cumsum_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 2:
-            _cumsum_spec_into_go(args[0], args[1])
-            return _raw_ret_none()
-        return _cumsum_spec_go(args[0])
+        if nargs != 2:
+            raise Error(
+                "CumsumSpec expects exactly 2 arguments (a_spec, out_spec)"
+            )
+        _cumsum_spec_into_go(args[0], args[1])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _batch_norm_spec_go(
-    in_o: PyObjectPtr,
-    mean_o: PyObjectPtr,
-    var_o: PyObjectPtr,
-    gamma_o: PyObjectPtr,
-    beta_o: PyObjectPtr,
-    eps_o: PyObjectPtr,
-) raises -> PyObjectPtr:
-    """Inference batch norm: geometry (channels/inner) derived from the
-    input spec, output alloc and launch in one boundary call, reusing the
-    `_batch_norm` kernel above."""
-    ref inp = _spec_ptr(in_o)[]
-    ref meanp = _spec_ptr(mean_o)[]
-    ref varp = _spec_ptr(var_o)[]
-    ref gammap = _spec_ptr(gamma_o)[]
-    ref betap = _spec_ptr(beta_o)[]
-    var eps = Float32(_raw_f64(eps_o))
-
-    if inp.rank < 2:
-        raise Error("mojo spec batch_norm: input rank must be >= 2")
-    if inp.numel == 0:
-        raise Error("mojo spec batch_norm: empty input")
-    if not (
-        inp.contig
-        and meanp.contig
-        and varp.contig
-        and gammap.contig
-        and betap.contig
-    ):
-        raise Error("mojo spec batch_norm: all inputs must be contiguous")
-    if (
-        meanp.dtype != inp.dtype
-        or varp.dtype != inp.dtype
-        or gammap.dtype != inp.dtype
-        or betap.dtype != inp.dtype
-    ):
-        raise Error("mojo spec batch_norm: stat/affine dtypes must match input")
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if inp.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec batch_norm: unsupported dtype ", inp.dtype)
-
-    var channels = inp.dim(1)
-    var inner = 1
-    for i in range(MAX_RANK - inp.rank + 2, MAX_RANK):
-        inner *= inp.shape[i]
-
-    var ctx = inp.ctx()
-    var nbytes = inp.numel * inp.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if inp.dtype == dt:
-                _batch_norm[dt](
-                    addr,
-                    inp.ptr,
-                    meanp.ptr,
-                    varp.ptr,
-                    gammap.ptr,
-                    betap.ptr,
-                    eps,
-                    channels,
-                    inner,
-                    inp.numel,
-                    ctx,
-                )
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        inp.rank,
-        inp.shape,
-        inp.dtype,
-        inp.itemsize,
-        inp.numel,
-        inp.ctx_ptr,
-    )
 
 
 def _batch_norm_spec_into_go(
@@ -3980,68 +3587,18 @@ def _batch_norm_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 7:
-            _batch_norm_spec_into_go(
-                args[0], args[1], args[2], args[3], args[4], args[5], args[6]
+        if nargs != 7:
+            raise Error(
+                "BatchNormSpec expects exactly 7 arguments (in_spec,"
+                " mean_spec, var_spec, gamma_spec, beta_spec, eps,"
+                " out_spec)"
             )
-            return _raw_ret_none()
-        return _batch_norm_spec_go(
-            args[0], args[1], args[2], args[3], args[4], args[5]
+        _batch_norm_spec_into_go(
+            args[0], args[1], args[2], args[3], args[4], args[5], args[6]
         )
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _softmax_spec_go(a_o: PyObjectPtr) raises -> PyObjectPtr:
-    """Plain softmax over the trailing dim (scale=1, no causal mask);
-    full-shape output. The non-trailing dim transpose recursion and the
-    half_to_float cast stay in Python."""
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec softmax: unsupported dtype ", a.dtype)
-    if a.rank < 1 or a.numel == 0:
-        raise Error("mojo spec softmax: empty or rank-0 input")
-
-    var cols = a.shape[MAX_RANK - 1]
-    var rows = a.numel // cols
-    var ctx = a.ctx()
-    var nbytes = a.numel * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if a.contig:
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _softmax_rows[dt](
-                        addr, a.ptr, rows, cols, Float32(1.0), 0, 1, ctx
-                    )
-    else:
-        # Mojo-side temporary; see _unary_spec_go in elementwise_ops.
-        var tmp = _scratch_contig(a, ctx)
-        var tmp_addr = Int(tmp.unsafe_ptr())
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _softmax_rows[dt](
-                        addr, tmp_addr, rows, cols, Float32(1.0), 0, 1, ctx
-                    )
-        _ = tmp^
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        a.rank,
-        a.shape,
-        a.dtype,
-        a.itemsize,
-        a.numel,
-        a.ctx_ptr,
-    )
 
 
 def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
@@ -4078,7 +3635,9 @@ def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
                         addr, a.ptr, rows, cols, Float32(1.0), 0, 1, ctx
                     )
     else:
-        # Mojo-side temporary; see _unary_spec_go in elementwise_ops.
+        # Mojo-side temporary (design doc §4.7): materialize the strided
+        # input into a scratch buffer inside the call — Python never
+        # mints a wrapper for it.
         var tmp = _scratch_contig(a, ctx)
         var tmp_addr = Int(tmp.unsafe_ptr())
         comptime for dt in FLOAT_DTYPES:
@@ -4097,109 +3656,14 @@ def _softmax_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 2:
-            _softmax_spec_into_go(args[0], args[1])
-            return _raw_ret_none()
-        return _softmax_spec_go(args[0])
+        if nargs != 2:
+            raise Error(
+                "SoftmaxSpec expects exactly 2 arguments (a_spec, out_spec)"
+            )
+        _softmax_spec_into_go(args[0], args[1])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _attn_decode_spec_go(
-    q_o: PyObjectPtr,
-    k_o: PyObjectPtr,
-    v_o: PyObjectPtr,
-    scale_o: PyObjectPtr,
-) raises -> PyObjectPtr:
-    """Fused decode attention (q_len == 1, not causal), GPU only — one
-    boundary call replacing the Python gates + geometry + alloc + launch.
-    Q/K/V read through their real strides; the innermost head dimension must
-    remain contiguous for vector loads."""
-    ref q = _spec_ptr(q_o)[]
-    ref k = _spec_ptr(k_o)[]
-    ref v = _spec_ptr(v_o)[]
-    var scale = Float32(_raw_f64(scale_o))
-
-    if q.rank != 4 or k.rank != 4 or v.rank != 4:
-        raise Error("mojo spec attn_decode: rank != 4")
-    if q.dtype != k.dtype or q.dtype != v.dtype:
-        raise Error("mojo spec attn_decode: dtypes differ")
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if q.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec attn_decode: unsupported dtype ", q.dtype)
-    var b = q.shape[MAX_RANK - 4]
-    var h = q.shape[MAX_RANK - 3]
-    var q_len = q.shape[MAX_RANK - 2]
-    var head_dim = q.shape[MAX_RANK - 1]
-    var kv_len = k.shape[MAX_RANK - 2]
-    if q_len != 1:
-        raise Error("mojo spec attn_decode: q_len != 1")
-    for i in range(4):
-        if k.shape[MAX_RANK - 4 + i] != v.shape[MAX_RANK - 4 + i]:
-            raise Error("mojo spec attn_decode: k/v shapes differ")
-    if (
-        b != k.shape[MAX_RANK - 4]
-        or h != k.shape[MAX_RANK - 3]
-        or head_dim != k.shape[MAX_RANK - 1]
-    ):
-        raise Error("mojo spec attn_decode: q/k shapes incompatible")
-    if b * h * kv_len * head_dim == 0:
-        raise Error("mojo spec attn_decode: empty input")
-    if (
-        q.strides[MAX_RANK - 1] != 1
-        or k.strides[MAX_RANK - 1] != 1
-        or v.strides[MAX_RANK - 1] != 1
-        or k.strides[MAX_RANK - 2] != head_dim
-        or v.strides[MAX_RANK - 2] != head_dim
-    ):
-        raise Error("mojo spec attn_decode: unsupported q/k/v strides")
-
-    var ctx = q.ctx()
-    if ctx.api() == "cpu":
-        # The CPU device takes the bmm+softmax+bmm chain today; keep it.
-        raise Error("mojo spec attn_decode: GPU only")
-    if head_dim % 4 != 0 or head_dim > ATTN_MAX_HD or kv_len > ATTN_MAX_KV:
-        raise Error("mojo spec attn_decode: size caps")
-
-    var numel = b * h * head_dim
-    var nbytes = numel * q.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if q.dtype == dt:
-                _attn_decode[dt](
-                    addr,
-                    q.ptr,
-                    k.ptr,
-                    v.ptr,
-                    b * h,
-                    kv_len,
-                    head_dim,
-                    scale,
-                    h,
-                    q.strides[MAX_RANK - 4],
-                    q.strides[MAX_RANK - 3],
-                    k.strides[MAX_RANK - 4],
-                    k.strides[MAX_RANK - 3],
-                    k.strides[MAX_RANK - 2],
-                    v.strides[MAX_RANK - 4],
-                    v.strides[MAX_RANK - 3],
-                    v.strides[MAX_RANK - 2],
-                    ctx,
-                )
-    var oshape = IndexList[MAX_RANK](1)
-    oshape[MAX_RANK - 4] = b
-    oshape[MAX_RANK - 3] = h
-    oshape[MAX_RANK - 2] = 1
-    oshape[MAX_RANK - 1] = head_dim
-    return _spec_result(
-        buf^, addr, nbytes, 4, oshape, q.dtype, q.itemsize, numel, q.ctx_ptr
-    )
 
 
 def _attn_decode_spec_into_go(
@@ -4309,12 +3773,13 @@ def _attn_decode_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 5:
-            _attn_decode_spec_into_go(
-                args[0], args[1], args[2], args[3], args[4]
+        if nargs != 5:
+            raise Error(
+                "AttnDecodeSpec expects exactly 5 arguments (q_spec, k_spec,"
+                " v_spec, scale, out_spec)"
             )
-            return _raw_ret_none()
-        return _attn_decode_spec_go(args[0], args[1], args[2], args[3])
+        _attn_decode_spec_into_go(args[0], args[1], args[2], args[3], args[4])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
 
@@ -4332,69 +3797,51 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _mean_spec_dispatcher,
-                "MeanSpec",
-                docstring=(
-                    "(a_spec, rdims, keepdim) -> (holder, spec, shape, ptr)"
-                ),
+                docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["MaxSpec"]():
             _register_call(
                 b,
                 _max_spec_dispatcher,
-                "MaxSpec",
-                docstring=(
-                    "(a_spec, rdims, keepdim) -> (holder, spec, shape, ptr)"
-                ),
+                docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["ArgmaxSpec"]():
             _register_call(
                 b,
                 _argmax_spec_dispatcher,
-                "ArgmaxSpec",
-                docstring="(a_spec, rdims, keepdim) -> int64 result group",
+                docstring="(a_spec, rdims, keepdim, out_spec); int64 indices",
             )
         comptime if _op_on["CumsumSpec"]():
             _register_call(
                 b,
                 _cumsum_spec_dispatcher,
-                "CumsumSpec",
-                docstring=(
-                    "(a_spec) -> (holder, spec, shape, ptr); trailing dim"
-                ),
+                docstring="(a_spec, out_spec); trailing dim",
             )
         comptime if _op_on["BatchNormSpec"]():
             _register_call(
                 b,
                 _batch_norm_spec_dispatcher,
-                "BatchNormSpec",
                 docstring=(
-                    "(in, mean, var, gamma, beta specs, eps) -> (holder, spec,"
-                    " shape, ptr); inference batch norm, geometry from specs"
+                    "(in, mean, var, gamma, beta specs, eps, out_spec);"
+                    " inference batch norm, geometry from specs"
                 ),
             )
         comptime if _op_on["SoftmaxSpec"]():
             _register_call(
                 b,
                 _softmax_spec_dispatcher,
-                "SoftmaxSpec",
-                docstring=(
-                    "(a_spec) -> (holder, spec, shape, ptr); trailing dim"
-                ),
+                docstring="(a_spec, out_spec); trailing dim",
             )
         comptime if _op_on["AttnDecodeSpec"]():
             _register_call(
                 b,
                 _attn_decode_spec_dispatcher,
-                "AttnDecodeSpec",
-                docstring=(
-                    "(q, k, v specs, scale) -> result group; q_len==1, GPU"
-                ),
+                docstring="(q, k, v specs, scale, out_spec); q_len==1, GPU",
             )
         comptime if _op_on["BatchNormInference"]():
             _register_call(
                 b,
                 _batch_norm_dispatcher,
-                "BatchNormInference",
                 docstring=(
                     "out = (x - mean[c]) * gamma[c] / sqrt(var[c] + eps) +"
                     " beta[c] (NC..., contiguous)"
@@ -4404,7 +3851,6 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _layer_norm_dispatcher,
-                "LayerNorm",
                 docstring=(
                     "layer norm over the last dim; also writes float32"
                     " mean/rstd per row"
@@ -4414,36 +3860,22 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _softmax_rows_dispatcher,
-                "SoftmaxRows",
                 docstring="row softmax of scale*x with optional causal mask",
             )
         comptime if _op_on["SoftmaxRowsDropoutF32"]():
             _register_call(
                 b,
                 _softmax_rows_dropout_dispatcher,
-                "SoftmaxRowsDropoutF32",
                 docstring=(
                     "fused causal row softmax + Philox native dropout (Apple"
                     " GPU f32): writes pre-dropout probs, dropped probs, and"
                     " the bool keep-mask in one pass"
                 ),
             )
-        comptime if _op_on["AttnDecode"]():
-            _register_call(
-                b,
-                _attn_decode_dispatcher,
-                "AttnDecode",
-                docstring=(
-                    "fused q_len==1 attention: softmax(scale * q @ K^T) @ V,"
-                    " one block per batch*head (block launch on GPU, plain"
-                    " loops on CPU)"
-                ),
-            )
         comptime if _op_on["MaxPool2dWithIndices"]():
             _register_call(
                 b,
                 _max_pool2d_dispatcher,
-                "MaxPool2dWithIndices",
                 docstring=(
                     "max pool over NCHW contiguous input, returns values and"
                     " int64 plane indices"
@@ -4453,7 +3885,6 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _avg_pool2d_dispatcher,
-                "AvgPool2d",
                 docstring=(
                     "average pool over NCHW contiguous input (count_include_pad"
                     " / divisor_override honored)"
@@ -4463,14 +3894,12 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _adaptive_avg_pool2d_dispatcher,
-                "AdaptiveAvgPool2d",
                 docstring="adaptive average pool over NCHW contiguous input",
             )
         comptime if _op_on["GroupNorm"]():
             _register_call(
                 b,
                 _group_norm_dispatcher,
-                "GroupNorm",
                 docstring=(
                     "group norm over NC(HxW) contiguous input; writes float32"
                     " mean/rstd per (sample, group)"
@@ -4480,28 +3909,24 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _upsample_bilinear2d_dispatcher,
-                "UpsampleBilinear2d",
                 docstring="bilinear upsample over NCHW contiguous input",
             )
         comptime if _op_on["Gather0"]():
             _register_call(
                 b,
                 _gather0_dispatcher,
-                "Gather0",
                 docstring="embedding lookup: gather rows of a 2D table",
             )
         comptime if _op_on["AllBool"]():
             _register_call(
                 b,
                 _all_bool_dispatcher,
-                "AllBool",
                 docstring="all() over a bool tensor -> scalar bool",
             )
         comptime if _op_on["AnyBool"]():
             _register_call(
                 b,
                 _any_bool_dispatcher,
-                "AnyBool",
                 docstring="any() over a bool tensor -> scalar bool",
             )
         return b.finalize()

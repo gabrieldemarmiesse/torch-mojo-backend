@@ -243,7 +243,6 @@ def PyInit_conv_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _im2col_dispatcher,
-                "Im2col",
                 docstring=(
                     "batched NCHW im2col -> (N, C*KH*KW, OH*OW) patch matrix"
                 ),
@@ -252,7 +251,6 @@ def PyInit_conv_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _bias_add_chan_dispatcher,
-                "BiasAddChan",
                 docstring=(
                     "in-place out[i] += bias[(i // plane) % channels] on a"
                     " (batch, channels, plane) tensor"

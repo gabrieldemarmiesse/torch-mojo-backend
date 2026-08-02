@@ -71,10 +71,23 @@ def _declare_mojo_tensor_as_plain_tensor():
       fakeified rather than executing a real PrivateUse1 kernel — hit when
       dynamo lifts a mojo tensor constant created mid-trace (e.g.
       `torch.tensor([], device="mojo")` in HF generate).
+    - Functionalization has the same gate twice (on `FunctionalTensor` and
+      on `FunctionalTensorMode`), and it is not an allowlist we can append
+      to, so the mojo wrapper is presented to those two gates as the plain
+      tensor it behaves like. Without it, AOTAutograd tracing a graph that
+      mixes a functional tensor with a real mojo constant dies with
+      "unsupported operand type(s) for +: 'FunctionalTensor' and
+      'TorchMojoTensor'".
     """
+    from collections.abc import Sequence
+
     import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
     import torch._subclasses.fake_tensor as fake_tensor_module
     import torch.fx.experimental.proxy_tensor as proxy_tensor
+    from torch._subclasses.functional_tensor import (
+        FunctionalTensor,
+        FunctionalTensorMode,
+    )
 
     from .torch_mojo_tensor import TorchMojoTensor
 
@@ -105,6 +118,69 @@ def _declare_mojo_tensor_as_plain_tensor():
     fake_tensor_module.FakeTensorMode._dispatch_impl = (
         dispatch_impl_lifting_mojo_constants
     )
+
+    def as_plain_tensor_types(types: Sequence[type]) -> tuple[type, ...]:
+        return tuple(torch.Tensor if t is TorchMojoTensor else t for t in types)
+
+    original_tensor_dispatch = FunctionalTensor.__torch_dispatch__
+
+    def functional_tensor_dispatch(
+        self: object,
+        func: object,
+        types: Sequence[type],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        return original_tensor_dispatch(
+            self, func, as_plain_tensor_types(types), args, kwargs
+        )
+
+    FunctionalTensor.__torch_dispatch__ = functional_tensor_dispatch
+
+    original_mode_dispatch = FunctionalTensorMode.__torch_dispatch__
+
+    def functional_mode_dispatch(
+        self: object,
+        func: object,
+        types: Sequence[type],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        return original_mode_dispatch(
+            self, func, as_plain_tensor_types(types), args, kwargs
+        )
+
+    FunctionalTensorMode.__torch_dispatch__ = functional_mode_dispatch
+
+
+def _trace_mojo_tensor_as_a_plain_tensor_in_dynamo() -> None:
+    """Let TorchDynamo model a mojo tensor as an ordinary device tensor.
+
+    ``VariableBuilder`` only builds a ``TensorVariable`` for a tensor
+    subclass that either leaves ``__torch_dispatch__`` untouched or is a
+    *traceable wrapper subclass* (``__tensor_flatten__`` /
+    ``__tensor_unflatten__``, i.e. a wrapper holding inner tensors that
+    AOTAutograd desugars into separate graph inputs).
+
+    TorchMojoTensor is neither, by design: its ``__torch_dispatch__`` is
+    only a bracket around a redispatch to the PrivateUse1 kernels, and it
+    holds no inner tensors -- its payload is a device allocation, exactly
+    like a cuda tensor's. Left alone, dynamo models every mojo tensor as a
+    ``UserDefinedObjectVariable`` and refuses to trace ``x * y``.
+
+    ``VariableBuilder._type_dispatch`` is the exact-type table consulted
+    before any of those checks; it is where torch itself routes
+    ``Parameter``, ``FakeTensor`` and ``FunctionalTensor`` to
+    ``wrap_tensor``. Add the mojo wrapper there. The table is memoized per
+    ``config.trace_numpy`` value, so populate both.
+    """
+    from torch._dynamo.variables.builder import VariableBuilder
+
+    from .torch_mojo_tensor import TorchMojoTensor
+
+    for trace_numpy in (False, True):
+        table = VariableBuilder._type_dispatch_impl(trace_numpy)
+        table[TorchMojoTensor] = VariableBuilder.wrap_tensor
 
 
 def _keep_mojo_kernels_out_of_fake_tensor_construction():
@@ -189,6 +265,7 @@ def register_mojo_devices():
     register_autocast_ops()
 
     _declare_mojo_tensor_as_plain_tensor()
+    _trace_mojo_tensor_as_a_plain_tensor_in_dynamo()
     _keep_mojo_kernels_out_of_fake_tensor_construction()
 
     from .apple_optimizations import register_apple_optimizations

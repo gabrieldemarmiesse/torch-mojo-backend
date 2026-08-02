@@ -24,10 +24,9 @@ import math
 import struct
 import warnings
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import ClassVar
+from typing import ClassVar, Protocol, runtime_checkable
 
 import torch
 from max.driver import Device
@@ -126,6 +125,11 @@ def _call_mojo(
 
 
 from torch_mojo_backend.eager_kernels import _ctx_ptr
+from torch_mojo_backend.eager_kernels.output_specs import (
+    _allocate_output_spec,
+    _submit_prepared_into,
+    _TensorOutputSpec,
+)
 from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
     _reserve_philox_state,
 )
@@ -171,6 +175,47 @@ _TF32_SOURCE_PATHS = (
     eager_kernels._PACKAGE_DIR / _Tf32MatmulExtension.MOJO_FILE,
     eager_kernels._PACKAGE_DIR / "tf32_matmul_ops/tf32_gemm_kernels.mojo",
 )
+
+
+@runtime_checkable
+class _OptionalSource(Protocol):
+    """One source file of an optional bridge (tests substitute stand-ins)."""
+
+    def is_file(self) -> bool: ...
+
+
+# One `is_file()` answer per source tuple, not one per call: these guards sit
+# in front of every bf16/tf32 matmul and every SDPA backward, where re-stat'ing
+# the sources costs more than all the metadata checks around them (~9 us
+# measured for the four-path bf16 tuple). Keyed on the IDENTITY of the tuple,
+# so a test that swaps in a synthetic tuple gets a fresh answer rather than a
+# stale latch.
+_BRIDGE_AVAILABILITY: dict[str, tuple[object, bool]] = {}
+
+
+def _bridge_available(name: str, paths: tuple[_OptionalSource, ...]) -> bool:
+    cached = _BRIDGE_AVAILABILITY.get(name)
+    if cached is not None and cached[0] is paths:
+        return cached[1]
+    available = all(path.is_file() for path in paths)
+    _BRIDGE_AVAILABILITY[name] = (paths, available)
+    return available
+
+
+def _bf16_bridge_available() -> bool:
+    """Whether the optional BF16 bridge and all of its sources are present."""
+    return _bridge_available("bf16", _BF16_SOURCE_PATHS)
+
+
+def _tf32_bridge_available() -> bool:
+    """Whether the optional TF32 bridge and all of its sources are present."""
+    return _bridge_available("tf32", _TF32_SOURCE_PATHS)
+
+
+def _sdpa_backward_bridge_available() -> bool:
+    """Whether the optional SDPA backward bridge and its sources are present."""
+    return _bridge_available("sdpa_backward", _SDPA_BACKWARD_SOURCE_PATHS)
+
 
 # The Mojo kernels raise (instead of falling back) on dtypes they don't
 # support; gate float-only ops here.
@@ -1027,35 +1072,12 @@ def _wrap_spec_result(result, dtype, device):
     return out
 
 
-@dataclass(frozen=True)
-class _TensorOutputSpec:
-    """Shape/type/device metadata inferred without loading a Mojo module."""
-
-    shape: tuple[int, ...]
-    dtype: DType
-    device: Device
-
-
-def _allocate_output_spec(spec: _TensorOutputSpec) -> TorchMojoTensor:
-    return _alloc(spec.shape, spec.dtype, spec.device)
-
-
-def _submit_prepared_into(
-    prepared: eager_kernels.PreparedExtensionCall[_TensorOutputSpec, TorchMojoTensor],
-    *,
-    force_sync: bool = False,
-) -> TorchMojoTensor:
-    """Allocate from inferred metadata and queue, or execute synchronously."""
-    if force_sync and _call_queue.enabled():
-        _call_queue.drain()
-    if force_sync or not _call_queue.enabled():
-        return prepared.execute()
-    out = _allocate_output_spec(prepared.output_specs)
-    extension_args = prepared.extension.extension_args(
-        out, *prepared.args, **dict(prepared.kwargs)
-    )
-    prepared.enqueue_into(extension_args)
-    return out
+# The canonical defines of a spec launch are a pure function of the operation
+# name and the dtypes involved, yet `make_canonical_defines` re-validates and
+# re-sorts them on every warm launch (~2.4 µs). Each *SpecExtension overrides
+# it to hand back the memoized tuple; the class object is part of the key so
+# subclasses that share a `make_defines` cannot collide.
+_SPEC_DEFINES_CACHE: dict[tuple[object, ...], "eager_kernels.CanonicalDefines"] = {}
 
 
 class _FillSpecExtension(
@@ -1068,6 +1090,18 @@ class _FillSpecExtension(
         cls, shape: Sequence[int], value: float, dtype: DType, device: Device
     ) -> dict[str, bool | int | str]:
         return {"OP": "FillSpec", "DTYPE_OUT": dtype.name}
+
+    @classmethod
+    def make_canonical_defines(
+        cls, shape: Sequence[int], value: float, dtype: DType, device: Device
+    ) -> "eager_kernels.CanonicalDefines":
+        key = (cls, dtype)
+        cached = _SPEC_DEFINES_CACHE.get(key)
+        if cached is None:
+            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
+                cls.make_defines(shape, value, dtype, device)
+            )
+        return cached
 
     @classmethod
     def expected_output_specs(
@@ -1117,6 +1151,18 @@ class _CastSpecExtension(
         }
 
     @classmethod
+    def make_canonical_defines(
+        cls, tensor: MojoTensorLike, dtype: DType
+    ) -> "eager_kernels.CanonicalDefines":
+        key = (cls, tensor._dtype, dtype)
+        cached = _SPEC_DEFINES_CACHE.get(key)
+        if cached is None:
+            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
+                cls.make_defines(tensor, dtype)
+            )
+        return cached
+
+    @classmethod
     def expected_output_specs(
         cls, tensor: MojoTensorLike, dtype: DType
     ) -> _TensorOutputSpec:
@@ -1158,11 +1204,28 @@ class _BinarySpecExtension(
         }
 
     @classmethod
+    def make_canonical_defines(
+        cls, op: str, lhs: MojoTensorLike, rhs: MojoTensorLike, out_dtype: DType
+    ) -> "eager_kernels.CanonicalDefines":
+        key = (cls, op, lhs._dtype, rhs._dtype, out_dtype)
+        cached = _SPEC_DEFINES_CACHE.get(key)
+        if cached is None:
+            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
+                cls.make_defines(op, lhs, rhs, out_dtype)
+            )
+        return cached
+
+    @classmethod
     def expected_output_specs(
         cls, op: str, lhs: MojoTensorLike, rhs: MojoTensorLike, out_dtype: DType
     ) -> _TensorOutputSpec:
-        shape = torch.broadcast_shapes(tuple(lhs._shape), tuple(rhs._shape))
-        return _TensorOutputSpec(tuple(shape), out_dtype, lhs._device)
+        lhs_shape = tuple(lhs._shape)
+        rhs_shape = tuple(rhs._shape)
+        if lhs_shape != rhs_shape:
+            # Equal shapes dominate (residual adds, grad accumulation) and
+            # torch.broadcast_shapes costs ~7 µs per call.
+            lhs_shape = tuple(torch.broadcast_shapes(lhs_shape, rhs_shape))
+        return _TensorOutputSpec(lhs_shape, out_dtype, lhs._device)
 
     @classmethod
     def extension_args(
@@ -1202,6 +1265,18 @@ class _UnarySpecExtension(
             "DTYPE_ARG_0": tensor._dtype.name,
             "DTYPE_OUT": out_dtype.name,
         }
+
+    @classmethod
+    def make_canonical_defines(
+        cls, op: str, tensor: MojoTensorLike, out_dtype: DType
+    ) -> "eager_kernels.CanonicalDefines":
+        key = (cls, op, tensor._dtype, out_dtype)
+        cached = _SPEC_DEFINES_CACHE.get(key)
+        if cached is None:
+            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
+                cls.make_defines(op, tensor, out_dtype)
+            )
+        return cached
 
     @classmethod
     def expected_output_specs(
@@ -1280,6 +1355,34 @@ _SPEC_BOOL_OK_NAMES = _SPEC_CMP_NAMES | frozenset(
 )
 
 
+def _binary_promotion(
+    a_dtype: DType, b_dtype: DType
+) -> tuple[bool, bool, DType] | None:
+    """torch's promotion for a binary pair as (cast lhs?, cast rhs?, dtype).
+
+    The only pairs the eager loops hit, and the single source of truth for
+    both spec-binary paths (queued and drain-and-execute). None means the
+    pair has no supported promotion, i.e. decline the op.
+    """
+    if a_dtype == b_dtype:
+        return False, False, a_dtype
+    if a_dtype == DType.bool and b_dtype in _CAST_DTYPES:
+        return True, False, b_dtype
+    if b_dtype == DType.bool and a_dtype in _CAST_DTYPES:
+        return False, True, a_dtype
+    if a_dtype == DType.int32 and b_dtype == DType.int64:
+        return True, False, DType.int64
+    if a_dtype == DType.int64 and b_dtype == DType.int32:
+        return False, True, DType.int64
+    if a_dtype == DType.float32 and b_dtype in (DType.float16, DType.bfloat16):
+        return False, True, DType.float32
+    if b_dtype == DType.float32 and a_dtype in (DType.float16, DType.bfloat16):
+        return True, False, DType.float32
+    if {a_dtype, b_dtype} == {DType.float16, DType.bfloat16}:
+        return True, True, DType.float32
+    return None
+
+
 def _try_spec_binary_into(
     spec_fn_name: str, lhs: object, rhs: object, out_dtype: DType | None
 ) -> TorchMojoTensor | None:
@@ -1305,35 +1408,16 @@ def _try_spec_binary_into(
                 return None
             a = _tc(a)
             b = _tc(b)
-        if a._dtype != b._dtype:
-            # The same promotion ladder as the legacy path; the casts queue
-            # through the Into cast (never a drain).
-            if a._dtype == DType.bool and b._dtype in _CAST_DTYPES:
-                a, dtype = _cast_tensor(a, b._dtype), b._dtype
-            elif b._dtype == DType.bool and a._dtype in _CAST_DTYPES:
-                b, dtype = _cast_tensor(b, a._dtype), a._dtype
-            elif a._dtype == DType.int32 and b._dtype == DType.int64:
-                a, dtype = _cast_tensor(a, DType.int64), DType.int64
-            elif a._dtype == DType.int64 and b._dtype == DType.int32:
-                b, dtype = _cast_tensor(b, DType.int64), DType.int64
-            elif a._dtype == DType.float32 and b._dtype in (
-                DType.float16,
-                DType.bfloat16,
-            ):
-                b, dtype = _cast_tensor(b, DType.float32), DType.float32
-            elif b._dtype == DType.float32 and a._dtype in (
-                DType.float16,
-                DType.bfloat16,
-            ):
-                a, dtype = _cast_tensor(a, DType.float32), DType.float32
-            elif {a._dtype, b._dtype} == {DType.float16, DType.bfloat16}:
-                a = _cast_tensor(a, DType.float32)
-                b = _cast_tensor(b, DType.float32)
-                dtype = DType.float32
-            else:
-                return None
-        else:
-            dtype = a._dtype
+        promotion = _binary_promotion(a._dtype, b._dtype)
+        if promotion is None:
+            return None
+        # Same ladder as the legacy path; here the casts queue through the
+        # Into cast (never a drain).
+        cast_a, cast_b, dtype = promotion
+        if cast_a:
+            a = _cast_tensor(a, dtype)
+        if cast_b:
+            b = _cast_tensor(b, dtype)
     else:
         # One scalar operand: embed it as a queued 0-d fill.
         scalar = rhs if a is not None else lhs
@@ -1368,10 +1452,13 @@ def _try_spec_binary_into(
             DType.float64,
         ):
             return None
-    try:
-        torch.broadcast_shapes(tuple(a._shape), tuple(b._shape))
-    except RuntimeError:
-        return None
+    if a._shape != b._shape:
+        # Equal shapes (the residual/grad-sum hot path) skip torch's
+        # broadcast machinery, which costs ~7 µs per probe.
+        try:
+            torch.broadcast_shapes(tuple(a._shape), tuple(b._shape))
+        except RuntimeError:
+            return None
     return _submit_prepared_into(
         _BinarySpecExtension.prepare(spec_fn_name, a, b, out_dtype or dtype)
     )
@@ -1402,60 +1489,28 @@ def _try_spec_binary(spec_fn_name, lhs, rhs, out_dtype=None):
     if a is not None and b is not None:
         if a._device != b._device:
             return None
-        device = a._device
-        dtype = a._dtype
         if len(a._shape) > 4 or len(b._shape) > 4:
             a = _tc(a)
             b = _tc(b)
-        if a._dtype != b._dtype:
-            # torch's promotion rules (the only pairs the loops hit).
-            cast_both = False
-            if a._dtype == DType.bool and b._dtype in _CAST_DTYPES:
-                cast_a, dtype = True, b._dtype
-            elif b._dtype == DType.bool and a._dtype in _CAST_DTYPES:
-                cast_a, dtype = False, a._dtype
-            elif a._dtype == DType.int32 and b._dtype == DType.int64:
-                cast_a, dtype = True, DType.int64
-            elif a._dtype == DType.int64 and b._dtype == DType.int32:
-                cast_a, dtype = False, DType.int64
-            elif a._dtype == DType.float32 and b._dtype in (
-                DType.float16,
-                DType.bfloat16,
-            ):
-                cast_a, dtype = False, DType.float32
-            elif b._dtype == DType.float32 and a._dtype in (
-                DType.float16,
-                DType.bfloat16,
-            ):
-                cast_a, dtype = True, DType.float32
-            elif {a._dtype, b._dtype} == {DType.float16, DType.bfloat16}:
-                cast_both = True
-                dtype = DType.float32
-            else:
-                return None
-            try:
-                if cast_both:
-                    keep_a = _submit_prepared_into(
-                        _CastSpecExtension.prepare(a, dtype), force_sync=True
-                    )
-                    keep_b = _submit_prepared_into(
-                        _CastSpecExtension.prepare(b, dtype), force_sync=True
-                    )
-                    spec_a = _spec_of(keep_a)
-                    spec_b = _spec_of(keep_b)
-                elif cast_a:
-                    keep_a = _submit_prepared_into(
-                        _CastSpecExtension.prepare(a, dtype), force_sync=True
-                    )
-                    spec_a = _spec_of(keep_a)
-                else:
-                    keep_b = _submit_prepared_into(
-                        _CastSpecExtension.prepare(b, dtype), force_sync=True
-                    )
-                    spec_b = _spec_of(keep_b)
-            except Exception as exc:
-                _raise_if_device_oom(exc)
-                return None
+        promotion = _binary_promotion(a._dtype, b._dtype)
+        if promotion is None:
+            return None
+        # Same ladder as the queued path; here the casts drain and execute.
+        cast_a, cast_b, dtype = promotion
+        try:
+            if cast_a:
+                keep_a = _submit_prepared_into(
+                    _CastSpecExtension.prepare(a, dtype), force_sync=True
+                )
+                spec_a = _spec_of(keep_a)
+            if cast_b:
+                keep_b = _submit_prepared_into(
+                    _CastSpecExtension.prepare(b, dtype), force_sync=True
+                )
+                spec_b = _spec_of(keep_b)
+        except Exception as exc:
+            _raise_if_device_oom(exc)
+            return None
     elif a is not None:
         device = a._device
         dtype = a._dtype
@@ -1625,6 +1680,24 @@ class _ReductionSpecExtension(
         }
 
     @classmethod
+    def make_canonical_defines(
+        cls,
+        op: str,
+        tensor: MojoTensorLike,
+        rdims: tuple[int, ...],
+        keepdim: bool,
+        extra: tuple[object, ...],
+        out_dtype: DType,
+    ) -> "eager_kernels.CanonicalDefines":
+        key = (cls, op, tensor._dtype, out_dtype)
+        cached = _SPEC_DEFINES_CACHE.get(key)
+        if cached is None:
+            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
+                cls.make_defines(op, tensor, rdims, keepdim, extra, out_dtype)
+            )
+        return cached
+
+    @classmethod
     def expected_output_specs(
         cls,
         op: str,
@@ -1701,6 +1774,18 @@ class _MinDimSpecExtension(
             "DTYPE_OUT_0": tensor._dtype.name,
             "DTYPE_OUT_1": DType.int64.name,
         }
+
+    @classmethod
+    def make_canonical_defines(
+        cls, tensor: MojoTensorLike, dim: int, keepdim: bool
+    ) -> "eager_kernels.CanonicalDefines":
+        key = (cls, tensor._dtype)
+        cached = _SPEC_DEFINES_CACHE.get(key)
+        if cached is None:
+            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
+                cls.make_defines(tensor, dim, keepdim)
+            )
+        return cached
 
     @classmethod
     def expected_output_specs(
@@ -1860,7 +1945,7 @@ _DEVICE_OOM_MARKERS = (
 )
 
 
-def _raise_if_device_oom(exc):
+def _raise_if_device_oom(exc: BaseException) -> None:
     """Keep TensorSpec fallbacks from disguising allocator exhaustion.
 
     Mojo TensorSpec dispatch reports both unsupported metadata and runtime
@@ -1875,18 +1960,31 @@ def _raise_if_device_oom(exc):
         raise torch.OutOfMemoryError(message) from exc
 
 
+# A queued launch fails inside `call_queue.drain()`, far from the `_call_mojo`
+# try/except that translates allocator exhaustion into `torch.OutOfMemoryError`.
+# Give the queue the same translation so the exception TYPE a caller catches
+# does not depend on whether the launch happened to be deferred.
+_call_queue.set_error_translator(_raise_if_device_oom)
+
+
 def _spec_matmul_out_shape(
-    spec_fn_name: str, ts: list, transpose_b: int
+    spec_fn_name: str, ts: list, transpose_b: int, require_contiguous: bool = True
 ) -> tuple | None:
     """Output shape for a queueable matmul spec launch, or None when any
-    Mojo-side check might fail (a queued launch cannot fall back)."""
+    Mojo-side check might fail (a queued launch cannot fall back).
+
+    ``require_contiguous=False`` answers the *different* question "would this
+    launch be eligible if every operand were materialized contiguous?".  It is
+    only used to decide whether a copy is worth making; every actual launch is
+    prepared with the default, so no strided operand can reach the kernel.
+    """
     a = ts[0]
     b = ts[1]
     if a._dtype != b._dtype or a._dtype not in _SPEC_FLOAT_DTYPES:
         return None
     if a._device != b._device:
         return None
-    if not all(t._is_contiguous for t in ts):
+    if require_contiguous and not all(t._is_contiguous for t in ts):
         return None
     if spec_fn_name == "BmmSpec":
         if len(a._shape) != 3 or len(b._shape) != 3:
@@ -1936,6 +2034,18 @@ class _MatmulSpecExtension(
         return defines
 
     @classmethod
+    def make_canonical_defines(
+        cls, op: str, tensors: tuple[MojoTensorLike, ...], transpose_b: int
+    ) -> "eager_kernels.CanonicalDefines":
+        key = (cls, op, tuple(t._dtype for t in tensors), bool(transpose_b))
+        cached = _SPEC_DEFINES_CACHE.get(key)
+        if cached is None:
+            cached = _SPEC_DEFINES_CACHE[key] = eager_kernels.normalize_defines(
+                cls.make_defines(op, tensors, transpose_b)
+            )
+        return cached
+
+    @classmethod
     def expected_output_specs(
         cls, op: str, tensors: tuple[MojoTensorLike, ...], transpose_b: int
     ) -> _TensorOutputSpec:
@@ -1968,12 +2078,14 @@ class _MatmulSpecExtension(
         return out
 
 
-def _try_spec_matmul(spec_fn_name, tensors, transpose_b):
-    """Matmul-family spec op over already-typed operands, or None. The spec
-    raises on non-contiguous operands; the classic path materializes them."""
-    ts = tuple(_t(x) for x in tensors)
-    if any(t is None for t in ts):
-        return None
+def _submit_spec_matmul(
+    spec_fn_name: str, ts: tuple[MojoTensorLike, ...], transpose_b: int
+) -> torch.Tensor | None:
+    """One matmul spec launch over already-typed operands, or None.
+
+    Declines (ineligible metadata, a Mojo-side refusal) come back as None; a
+    device allocator failure still propagates as ``torch.OutOfMemoryError``.
+    """
     try:
         return _submit_prepared_into(
             _MatmulSpecExtension.prepare(spec_fn_name, ts, transpose_b),
@@ -1982,6 +2094,52 @@ def _try_spec_matmul(spec_fn_name, tensors, transpose_b):
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
+
+
+def _try_spec_matmul(spec_fn_name, tensors, transpose_b):
+    """Matmul-family spec op over already-typed operands, or None.
+
+    The spec kernels read row-major memory, so a strided operand is declined.
+    This is the last step of every matmul-family entry point (``fast_aten_mm``,
+    ``fast_aten_addmm``, ``fast_aten_linear``, ``fast_aten_bmm``,
+    ``_fast_aten_bmm_transpose_b``), so the copy backstop below covers all of
+    them at once and only ever runs after their bridges have declined.
+    """
+    ts = tuple(_t(x) for x in tensors)
+    if any(t is None for t in ts):
+        return None
+    out = _submit_spec_matmul(spec_fn_name, ts, transpose_b)
+    if out is not None or all(t._is_contiguous for t in ts):
+        return out
+
+    # Last-resort correctness backstop, not the intended path: it costs a
+    # materialization of the offending operand.  It runs only when every
+    # layout-capable GEMM bridge has already declined and the spec path's ONLY
+    # objection is that an operand is a view -- asking `_spec_matmul_out_shape`
+    # again with the contiguity check removed proves nothing else is wrong.
+    # Without it a strided operand is a hard NOT_HANDLED, and inside a native
+    # autograd node NOT_HANDLED becomes a NotImplementedError raised under
+    # `Engine::evaluate_function`, which aborts the process instead of raising.
+    # A plain fp32 `nn.Linear` backward hits exactly that, because
+    # `fast_aten_linear_backward` forms the weight gradient as
+    # `mm(grad.transpose(0, 1), input)`.
+    # Two things would remove this copy: an fp32 GEMM that reads a strided A
+    # (the BF16 bridge already does, which is why bf16 autocast never hit the
+    # abort), or the TF32 bridge not being gated off at the default
+    # `float32_matmul_precision == "highest"`.  Do NOT take the second route by
+    # relaxing that gate: TF32 drops mantissa bits, and "highest" is the user
+    # asking for full fp32 -- see the note on the gate in `_try_tf32_gemm`.
+    if (
+        _spec_matmul_out_shape(
+            spec_fn_name, list(ts), transpose_b, require_contiguous=False
+        )
+        is None
+    ):
+        return None
+    contiguous = tuple(_tc(t) for t in ts)
+    if any(t is None for t in contiguous):
+        return None
+    return _submit_spec_matmul(spec_fn_name, contiguous, transpose_b)
 
 
 def _try_spec_scalar(spec_fn_name, x, scalar):
@@ -2194,7 +2352,9 @@ def _promoted_pair(a: TorchMojoTensor, b: TorchMojoTensor):
     """Same-dtype tensor pair following torch's promotion, or None.
 
     Only the promotions the generation loops hit: bool combined with any
-    castable dtype, and int32 with int64.
+    castable dtype, and int32 with int64. Deliberately a SUBSET of
+    `_binary_promotion`: its callers (where / masked_fill) must keep
+    declining mixed float widths rather than silently widening them here.
     """
     if a._dtype == b._dtype:
         return a, b
@@ -4197,6 +4357,8 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
         cols *= s
     rows = a._numel // cols
     # weight/bias are optional (no-affine layer norm): default to 1s / 0s.
+    gamma = None
+    beta = None
     if weight is not None:
         gamma = _t(weight)
         if (
@@ -5678,6 +5840,108 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
     return out4, probs4, mask4
 
 
+def _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale):
+    """Decomposed SDPA with an explicit attention mask -> ``(output, probs)``.
+
+    ATen turns the mask into an additive bias on the *already scaled* scores: a
+    float mask is added as-is, a bool mask keeps its ``True`` positions and
+    drives the rest to ``-inf`` before the row softmax.  Both forms broadcast up
+    to ``(batch, heads, query, key)``, including the per-head ``(H, L, S)`` and
+    per-row ``(L, S)`` shapes, so the bias is applied on the 4-D view of the
+    score matrix rather than the folded 3-D one the batched GEMM works on.
+
+    ``is_causal`` is rejected because ATen itself refuses an explicit mask
+    together with causal masking, so the combination has no reference to match.
+    """
+    q = _t(query)
+    k = _t(key)
+    v = _t(value)
+    mask = _t(attn_mask)
+    if (
+        q is None
+        or k is None
+        or v is None
+        or mask is None
+        or is_causal
+        or q._device != k._device
+        or q._device != v._device
+        or q._device != mask._device
+        or q._dtype != k._dtype
+        or q._dtype != v._dtype
+        or q._dtype not in _FLOAT_DTYPES
+        or len(q._shape) != 4
+        or tuple(k._shape) != tuple(v._shape)
+        or tuple(q._shape[:2]) != tuple(k._shape[:2])
+        or q._shape[3] != k._shape[3]
+        or 0 in q._shape
+        or 0 in k._shape
+    ):
+        return NOT_HANDLED
+    # A promoting mask dtype would widen the result behind the caller's back,
+    # so only an exact float bias or a bool keep-mask is served here.
+    if mask._dtype != DType.bool and mask._dtype != q._dtype:
+        return NOT_HANDLED
+
+    b, h, q_len, head_dim = q._shape
+    kv_len = k._shape[2]
+    q = _tc(q)
+    k = _tc(k)
+    v = _tc(v)
+    q3_shape = (b * h, q_len, head_dim)
+    kv3_shape = (b * h, kv_len, head_dim)
+    q3 = _view_of(q, q3_shape, _row_major_strides(q3_shape), q._offset, contiguous=True)
+    k3 = _view_of(
+        k, kv3_shape, _row_major_strides(kv3_shape), k._offset, contiguous=True
+    )
+    v3 = _view_of(
+        v, kv3_shape, _row_major_strides(kv3_shape), v._offset, contiguous=True
+    )
+    scores3 = _fast_aten_bmm_transpose_b(q3, k3)
+    if scores3 is NOT_HANDLED:
+        return NOT_HANDLED
+    score_shape = (b, h, q_len, kv_len)
+    scores4 = _view_of(
+        scores3, score_shape, _row_major_strides(score_shape), scores3._offset
+    )
+    scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
+    scaled = fast_aten_mul(scores4, scale_val)
+    del scores3, scores4
+    if scaled is NOT_HANDLED:
+        return NOT_HANDLED
+    if mask._dtype == DType.bool:
+        biased = fast_aten_where(mask, scaled, float("-inf"))
+    else:
+        biased = fast_aten_add(scaled, mask)
+    del scaled
+    if biased is NOT_HANDLED:
+        return NOT_HANDLED
+    # A mask that broadcasts to anything other than the score matrix is not a
+    # valid SDPA mask; the elementwise kernels would silently expand instead.
+    if tuple(biased._shape) != score_shape:
+        return NOT_HANDLED
+    probs4 = fast_aten__softmax(biased, -1, False)
+    del biased
+    if probs4 is NOT_HANDLED or not probs4._is_contiguous:
+        return NOT_HANDLED
+    probs3_shape = (b * h, q_len, kv_len)
+    probs3 = _view_of(
+        probs4,
+        probs3_shape,
+        _row_major_strides(probs3_shape),
+        probs4._offset,
+        contiguous=True,
+    )
+    out3 = fast_aten_bmm(probs3, v3)
+    del probs3, q3, k3, v3
+    if out3 is NOT_HANDLED:
+        return NOT_HANDLED
+    out_shape = (b, h, q_len, head_dim)
+    out4 = _view_of(
+        out3, out_shape, _row_major_strides(out_shape), out3._offset, contiguous=True
+    )
+    return out4, probs4
+
+
 def _fa4_bf16_d64_causal_inputs(
     query,
     key,
@@ -6231,13 +6495,10 @@ def fast_aten__scaled_dot_product_attention_math(
     scale=None,
     enable_gqa=False,
 ):
-    if (
-        dropout_p != 0.0
-        or dropout_mask is not None
-        or attn_mask is not None
-        or enable_gqa
-    ):
+    if dropout_p != 0.0 or dropout_mask is not None or enable_gqa:
         return NOT_HANDLED
+    if attn_mask is not None:
+        return _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale)
     result = _sdpa_math_forward(query, key, value, is_causal, scale)
     if result is NOT_HANDLED:
         return NOT_HANDLED
@@ -6462,7 +6723,7 @@ def fast_sdpa_dropout_softmax_backward(
     # The Fable-owned production kernel is ported separately from this host
     # wiring. Keep the eager decomposition usable while that optional module
     # is absent.
-    if not all(path.is_file() for path in _SDPA_BACKWARD_SOURCE_PATHS):
+    if not _sdpa_backward_bridge_available():
         return NOT_HANDLED
 
     # In the no-dropout path the scale is semantically dead.  Canonicalizing
@@ -6602,7 +6863,7 @@ def fast_sdpa_backward(
         ):
             return NOT_HANDLED
 
-    if not all(path.is_file() for path in _SDPA_BACKWARD_SOURCE_PATHS):
+    if not _sdpa_backward_bridge_available():
         return NOT_HANDLED
 
     bridge_dropout_scale = float(dropout_scale) if has_mask else 1.0
@@ -6802,16 +7063,6 @@ def _tf32_dense_batched_layout(tensor: MojoTensorLike) -> tuple[bool, int] | Non
     return physical_transpose, batch_stride
 
 
-def _bf16_bridge_available() -> bool:
-    """Whether the optional BF16 bridge and all of its sources are present."""
-    return all(path.is_file() for path in _BF16_SOURCE_PATHS)
-
-
-def _tf32_bridge_available() -> bool:
-    """Whether the optional TF32 bridge and all of its sources are present."""
-    return all(path.is_file() for path in _TF32_SOURCE_PATHS)
-
-
 def _try_bf16_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     """Enqueue the dense H100 BF16 GEMM, or return ``None``.
 
@@ -6893,6 +7144,12 @@ def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     the Fable-owned module owns every device-kernel body.  Unsupported layouts
     and strict FP32 retain the existing pure-Mojo SIMT path.
     """
+    # This gate is a numerics decision, not a capability one: TF32 drops
+    # mantissa bits, and "highest" (PyTorch's default) is the user asking for
+    # full FP32.  Do not relax it to widen layout support -- that would change
+    # results silently.  It does mean the one bridge that accepts an arbitrary
+    # 2D layout is off by default for FP32; `_try_spec_matmul` owns the
+    # copy-and-retry backstop that keeps strided FP32 operands working.
     if torch.get_float32_matmul_precision() == "highest":
         return None
     lhs = _t(a)
@@ -7458,7 +7715,11 @@ def fast_aten_convolution(
                     ),
                     arg_dtypes=(w._dtype, a._dtype),
                     output_dtypes=(out._dtype,),
-                    flags={"TRANSPOSE_B": False, "A_SHARED": True},
+                    # Same define shape as every other Bmm site: the shared-A
+                    # broadcast is RUNTIME data (the trailing 1 in the params
+                    # tuple, matmul_ops._bmm_go), so naming it here would only
+                    # fork this call site onto a second .so of identical code.
+                    flags={"TRANSPOSE_B": False},
                 )
             else:
                 # Channel-major im2col rows make each group a contiguous
@@ -7529,6 +7790,19 @@ def fast_aten_scaled_dot_product_attention(
     scale=None,
     enable_gqa=False,
 ):
+    if attn_mask is not None:
+        # None of the fused attention kernels take a mask operand, so a masked
+        # call goes straight to the decomposed masked forward.
+        if enable_gqa or dropout_p != 0.0:
+            return NOT_HANDLED
+        result = _sdpa_masked_math_forward(
+            query, key, value, attn_mask, is_causal, scale
+        )
+        if result is NOT_HANDLED:
+            return NOT_HANDLED
+        out, _ = result
+        return out
+
     fa4_result = fast_fa4_bf16_d64_causal_forward(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
     )

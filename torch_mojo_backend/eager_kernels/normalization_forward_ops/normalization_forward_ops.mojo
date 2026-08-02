@@ -112,7 +112,6 @@ def PyInit_normalization_forward_ops() abi("C") -> PythonObject:
             _register_call(
                 builder,
                 _layer_norm_forward_dispatcher,
-                "LayerNormForwardF32",
                 docstring=(
                     "(output, mean, rstd, input, weight, bias, rows, cols, "
                     "epsilon, has_weight, has_bias, context); runtime-dynamic "

@@ -286,7 +286,6 @@ def PyInit_flash_attention_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _flash_attention_forward_dispatcher,
-                "FlashAttentionForward",
                 docstring=(
                     "(out_ptr, lse_ptr, q_ptr, k_ptr, v_ptr, (batch, heads,"
                     " seq_q, seq_kv, head_dim), (batch, head, seq) x 4 for q,"
@@ -302,7 +301,6 @@ def PyInit_flash_attention_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _flash_attention_backward_dispatcher,
-                "FlashAttentionBackward",
                 docstring=(
                     "(dq_ptr, dk_ptr, dv_ptr, grad_out_ptr, q_ptr, k_ptr,"
                     " v_ptr, out_ptr, lse_ptr, (batch, heads, seq_q, seq_kv,"

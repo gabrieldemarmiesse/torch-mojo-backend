@@ -75,7 +75,6 @@ def PyInit_activation_forward_ops() abi("C") -> PythonObject:
             _register_call(
                 builder,
                 _gelu_forward_bf16_dispatcher,
-                "GeluForwardBF16",
                 docstring=(
                     "(output, input, elements, tanh_approx, context); "
                     "runtime-dynamic BF16 GELU forward"

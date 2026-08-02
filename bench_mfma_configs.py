@@ -6,7 +6,9 @@ import math
 import statistics
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 
 import torch
 
@@ -55,7 +57,39 @@ def percentile(samples: list[float], fraction: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def measure(fn, synchronize, warmup: int, iterations: int):
+def load_tuning_extension() -> ModuleType:
+    """The matmul_ops extension built with no OP define, for `AmdBf16Tune`.
+
+    Operations are compiled one at a time: the loader builds a `.so` per
+    `-D OP=<name>` and renames that one operation to `call()`, so
+    `MatmulExtension.invoke("AmdBf16Tune", ...)` cannot reach this function --
+    there is no `_op_on["AmdBf16Tune"]` gate for it to select, and the loader
+    rejects a module without `call()`.  `MatmulTune` and `AmdBf16Tune` are
+    registered under their own names outside every gate (see
+    `PyInit_matmul_ops`), so the undefined build of the module carries exactly
+    those two and none of the production kernels.  Building it here keeps this
+    tuning harness off the dispatch path it is meant to measure.
+    """
+    from torch_mojo_backend.eager_kernels import (
+        _build_extension,
+        _load_extension,
+        _resolve_mojo_file,
+        _variant_module_name,
+    )
+    from torch_mojo_backend.eager_kernels.matmul_ops import MatmulExtension
+
+    source = _resolve_mojo_file(MatmulExtension.MOJO_FILE)
+    return _load_extension(
+        _variant_module_name(source, None), _build_extension(source, None)
+    )
+
+
+def measure(
+    fn: Callable[[], None],
+    synchronize: Callable[[], None],
+    warmup: int,
+    iterations: int,
+) -> tuple[float, float, float]:
     for _ in range(warmup):
         fn()
     synchronize()
@@ -73,7 +107,7 @@ def measure(fn, synchronize, warmup: int, iterations: int):
     )
 
 
-def rocm_smi(label: str):
+def rocm_smi(label: str) -> None:
     result = subprocess.run(
         ["rocm-smi", "--showclocks", "--showtemp", "--showuse", "--showpower"],
         check=False,
@@ -84,7 +118,7 @@ def rocm_smi(label: str):
     print(result.stdout)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--iterations", type=int, default=100)
@@ -99,12 +133,13 @@ def main():
     device = list(get_accelerators())[0]
     from max.dtype import DType
 
-    from torch_mojo_backend.eager_kernels import _ctx_ptr, matmul_ops, tensor_holder
+    from torch_mojo_backend.eager_kernels import _ctx_ptr, tensor_holder
     from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
     ctx = _ctx_ptr(device)
+    tuning = load_tuning_extension()
 
-    def synchronize():
+    def synchronize() -> None:
         tensor_holder.synchronize(ctx)
 
     configs = args.config or list(CONFIGS)
@@ -146,8 +181,8 @@ def main():
             if cfg not in CONFIGS:
                 raise ValueError(f"unknown config {cfg}")
 
-            def launch():
-                matmul_ops.AmdBf16Tune(
+            def launch() -> None:
+                tuning.AmdBf16Tune(
                     out._ptr, a._ptr, b._ptr, bias._ptr, (m, n, k, cfg), ctx
                 )
 

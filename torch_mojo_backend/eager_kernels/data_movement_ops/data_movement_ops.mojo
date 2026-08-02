@@ -49,7 +49,6 @@ from op_utils import (
     _raw_ret_none,
     _raw_tuple_int,
     _spec_ptr,
-    _spec_result,
     _spec_unsupported,
 )
 
@@ -2010,66 +2009,10 @@ def _scatter_dim_dispatcher(
     return _raw_ret_none()
 
 
-def _cast_spec_go(
-    a_o: PyObjectPtr, out_dtype_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    """Contiguous dtype cast: checks + output alloc + launch in one call
-    (docs/tensor_spec_design.md; the classic path is Python-side _alloc +
-    Cast). Raises a real NotImplementedError on unsupported inputs."""
-    ref a = _spec_ptr(a_o)[]
-    var dst = _raw_dtype_int(out_dtype_o)
-    var src_ok = False
-    comptime for dt in CAST_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                src_ok = True
-    var dst_ok = False
-    var dst_itemsize = 0
-    comptime for dt in CAST_DTYPES:
-        comptime if _dtype_out_on[0, dt]():
-            if dst == dt:
-                dst_ok = True
-                dst_itemsize = size_of[dt]()
-    if not (src_ok and dst_ok):
-        raise Error("mojo spec cast: unsupported dtype pair")
-
-    var ctx = a.ctx()
-    var nbytes = a.numel * dst_itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if a.numel > 0:
-        if a.contig:
-            comptime for src_dt in CAST_DTYPES:
-                comptime if _dtype_arg_on[0, src_dt]():
-                    if a.dtype == src_dt:
-                        _cast_to[src_dt](dst, addr, a.ptr, a.numel, ctx)
-        else:
-            # Mojo-side temporary; see _unary_spec_go in elementwise_ops.
-            var tmp = _scratch_contig(a, ctx)
-            var tmp_addr = Int(tmp.unsafe_ptr())
-            comptime for src_dt in CAST_DTYPES:
-                comptime if _dtype_arg_on[0, src_dt]():
-                    if a.dtype == src_dt:
-                        _cast_to[src_dt](dst, addr, tmp_addr, a.numel, ctx)
-            _ = tmp^
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        a.rank,
-        a.shape,
-        dst,
-        dst_itemsize,
-        a.numel,
-        a.ctx_ptr,
-    )
-
-
 def _cast_spec_into_go(
     a_o: PyObjectPtr, out_dtype_o: PyObjectPtr, out_o: PyObjectPtr
 ) raises:
-    """Into-variant of _cast_spec_go: cast into a caller-allocated
-    contiguous output (call-queue mode)."""
+    """Cast into a caller-allocated contiguous output."""
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
     var dst = _raw_dtype_int(out_dtype_o)
@@ -2115,10 +2058,13 @@ def _cast_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 3:
-            _cast_spec_into_go(args[0], args[1], args[2])
-            return _raw_ret_none()
-        return _cast_spec_go(args[0], args[1])
+        if nargs != 3:
+            raise Error(
+                "CastSpec expects exactly 3 arguments (a_spec, out_dtype,"
+                " out_spec)"
+            )
+        _cast_spec_into_go(args[0], args[1], args[2])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
 
@@ -2362,14 +2308,12 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _cast_spec_dispatcher,
-                "CastSpec",
-                docstring="(a_spec, out_dtype) -> (holder, spec, shape, ptr)",
+                docstring="(a_spec, out_dtype, out_spec)",
             )
         comptime if _op_on["PermuteCopy"]():
             _register_call(
                 b,
                 _permute_copy_dispatcher,
-                "PermuteCopy",
                 docstring=(
                     "materialize a permutation of a contiguous tensor (rank"
                     " <= 4)"
@@ -2379,7 +2323,6 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _narrow_copy_dst_dispatcher,
-                "NarrowCopyDst",
                 docstring=(
                     "copy `outer` contiguous blocks of `copy_len` elements to a"
                     " destination stride/offset (concatenation)"
@@ -2389,7 +2332,6 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _cat2_dispatcher,
-                "Cat2",
                 docstring=(
                     "(out, in1, in2, outer, len1, len2, itemsize, ctx); fused"
                     " two-input concat rows"
@@ -2399,14 +2341,12 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _where_select_dispatcher,
-                "WhereSelect",
                 docstring="out = cond ? a : b (broadcast strides, any dtype)",
             )
         comptime if _op_on["TileCopy"]():
             _register_call(
                 b,
                 _tile_copy_dispatcher,
-                "TileCopy",
                 docstring=(
                     "out[coords] = in[coords % in_shape] over a rank-8-padded"
                     " index space (aten::repeat; element-size dispatch)"
@@ -2416,7 +2356,6 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _triangular_copy_dispatcher,
-                "TriangularCopy",
                 docstring=(
                     "out = in on the kept side of the diagonal, else 0"
                     " (aten::tril/triu; element-size dispatch)"
@@ -2426,7 +2365,6 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _gather_rows_dispatcher,
-                "GatherRows",
                 docstring=(
                     "out[i] = in[wrap(idx[i // row_len]) * row_len + i %"
                     " row_len] (gather rows along dim 0; element-size +"
@@ -2437,7 +2375,6 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _scatter_dim_dispatcher,
-                "ScatterDim",
                 docstring=(
                     "out[coord with dim := index[coord]] = src[coord] or value"
                     " (aten::scatter.src/value, rank <= 4; dtype dispatch)"
@@ -2447,7 +2384,6 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _cat3_dispatcher,
-                "Cat3",
                 docstring=(
                     "(out, in1, in2, in3, outer, len1, len2, len3, itemsize,"
                     " ctx); fused three-input concat rows"

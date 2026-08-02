@@ -494,7 +494,6 @@ def PyInit_activation_backward_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _gelu_backward_dispatcher,
-                "GeluBackwardF32",
                 docstring=(
                     "(output_ptr, grad_output_ptr, input_ptr, elements,"
                     " tanh_mode, context_ptr); float32 GELU backward,"
@@ -505,7 +504,6 @@ def PyInit_activation_backward_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _gelu_backward_bf16_dispatcher,
-                "GeluBackwardBF16",
                 docstring=(
                     "(output_ptr, grad_output_ptr, input_ptr, elements,"
                     " tanh_mode, context_ptr); bfloat16 GELU backward,"

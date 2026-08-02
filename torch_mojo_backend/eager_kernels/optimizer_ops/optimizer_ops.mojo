@@ -719,7 +719,6 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
             _register_call(
                 builder,
                 _fused_adamw_dispatcher,
-                "FusedAdamW",
                 docstring=(
                     "(metadata, scalars, dtype_mode, flags, lr_ptr,"
                     " grad_scale_ptr, found_inf_ptr, context_ptr); fused FP32"
@@ -730,7 +729,6 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
             _register_call(
                 builder,
                 _foreach_l2_norm_dispatcher,
-                "ForeachL2Norm",
                 docstring=(
                     "(metadata, partials_ptr, partials_numel, context_ptr); "
                     "runtime-dynamic FP32 foreach L2 norms"
@@ -740,7 +738,6 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
             _register_call(
                 builder,
                 _foreach_mul_tensor_dispatcher,
-                "ForeachMulTensor",
                 docstring=(
                     "(metadata, scalar_ptr, context_ptr); runtime-dynamic FP32 "
                     "foreach in-place device-scalar multiply"
@@ -750,7 +747,6 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
             _register_call(
                 builder,
                 _foreach_scalar_op_dispatcher,
-                "ForeachScalarOp",
                 docstring=(
                     "(op_code, metadata, scalars, context_ptr); batched FP32 "
                     "in-place foreach mul/add/div by one host scalar per tensor"
@@ -760,7 +756,6 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
             _register_call(
                 builder,
                 _foreach_lerp_scalar_dispatcher,
-                "ForeachLerpScalar",
                 docstring=(
                     "(metadata, weight, one_minus_weight, low_branch, "
                     "context_ptr); batched FP32 in-place foreach scalar lerp"
@@ -770,7 +765,6 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
             _register_call(
                 builder,
                 _foreach_addc_op_dispatcher,
-                "ForeachAddcOp",
                 docstring=(
                     "(op_code, metadata, scalars, context_ptr); batched FP32 "
                     "in-place foreach addcmul/addcdiv with per-tensor scalars"
@@ -780,7 +774,6 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
             _register_call(
                 builder,
                 _foreach_gather_scalars_dispatcher,
-                "ForeachGatherScalars",
                 docstring=(
                     "(in_ptrs, out_ptr, context_ptr); batched FP32 gather of "
                     "one scalar per input tensor into a contiguous output"
@@ -790,7 +783,6 @@ def PyInit_optimizer_ops() abi("C") -> PythonObject:
             _register_call(
                 builder,
                 _foreach_sqrt_dispatcher,
-                "ForeachSqrt",
                 docstring=(
                     "(metadata, context_ptr); batched FP32 out-of-place "
                     "foreach sqrt"

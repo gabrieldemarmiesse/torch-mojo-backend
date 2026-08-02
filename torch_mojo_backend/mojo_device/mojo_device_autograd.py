@@ -595,11 +595,14 @@ def _scaled_dot_product_attention_autograd(
         )[0]
     # The remaining paths read q/k/v payloads directly through aten_fast,
     # ABOVE __torch_dispatch__ — invisible to the deferred-compile queue —
-    # so any still-pending producer must be replayed first. (The eligibility
-    # check above is metadata-only and safe on pending tensors.)
+    # so every still-pending producer must land first (FIFO granularity: the
+    # whole queue drains, which covers q/k/v/attn_mask). The eligibility
+    # check above is metadata-only and safe on pending tensors. Buffers
+    # these paths allocate afterwards are retained by `call_queue.note_alloc`,
+    # which has no op bracket to feed here.
     from . import deferred_compile
 
-    deferred_compile.wait_for([query, key, value, attn_mask])
+    deferred_compile.drain()
     if not needs_backward:
         return _require_handled(
             aten_fast.fast_aten_scaled_dot_product_attention(

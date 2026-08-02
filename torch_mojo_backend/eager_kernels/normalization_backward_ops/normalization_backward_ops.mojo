@@ -168,7 +168,6 @@ def PyInit_normalization_backward_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _layer_norm_backward_dispatcher,
-                "LayerNormBackwardF32",
                 docstring=(
                     "(grad_input_ptr, grad_weight_ptr, grad_bias_ptr,"
                     " grad_output_ptr, input_ptr, mean_ptr, rstd_ptr,"

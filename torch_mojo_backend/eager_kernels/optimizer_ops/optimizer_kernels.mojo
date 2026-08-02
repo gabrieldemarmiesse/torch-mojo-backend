@@ -10,11 +10,11 @@ from std.collections import InlineArray
 from std.ffi import _get_global_or_null, external_call
 from std.gpu import block_idx, thread_idx
 from std.gpu.host import DeviceContext
-from std.math import min, pow, sqrt
+from std.math import min, pow
 from std.memory import alloc
 from std.sys.info import has_apple_gpu_accelerator
 
-from op_utils import _enqueue_cached
+from op_utils import _enqueue_cached, ieee_sqrt
 from optimizer_contract import (
     ADAMW_CHUNK_ELEMENTS,
     ADAMW_DESC_CAP,
@@ -69,7 +69,7 @@ def _adamw_update[
     if amsgrad:
         updated_max = max(updated_max, updated_avg_sq)
         denominator_v = updated_max
-    var denominator = sqrt(denominator_v) / sqrt_bias2 + eps
+    var denominator = ieee_sqrt(denominator_v) / sqrt_bias2 + eps
     updated_param -= (lr / bias1) * updated_avg / denominator
     return updated_param, updated_avg, updated_avg_sq, updated_max
 
@@ -121,7 +121,7 @@ def _fused_adamw_f32(
     var grad_sign = Float32(-1.0) if maximize_int != 0 else Float32(1.0)
     var step = steps[0]
     var bias1 = Float32(1.0) - pow(beta1, step)
-    var sqrt_bias2 = sqrt(Float32(1.0) - pow(beta2, step))
+    var sqrt_bias2 = ieee_sqrt(Float32(1.0) - pow(beta2, step))
     var amsgrad = amsgrad_int != 0
 
     var index = begin + Int(thread_idx.x) * _VEC
@@ -243,7 +243,7 @@ def _fused_adamw_f32_tensor_apple(
     var grad_sign = Float32(-1.0) if maximize_int != 0 else Float32(1.0)
     var step = steps[0]
     var bias1 = Float32(1.0) - pow(beta1, step)
-    var sqrt_bias2 = sqrt(Float32(1.0) - pow(beta2, step))
+    var sqrt_bias2 = ieee_sqrt(Float32(1.0) - pow(beta2, step))
     var amsgrad = amsgrad_int != 0
 
     var index = begin + Int(thread_idx.x) * _VEC

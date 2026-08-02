@@ -163,7 +163,6 @@ def PyInit_tf32_matmul_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _tf32_bmm_dispatcher,
-                "Tf32BmmF32",
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, batch_count, m, n, k,"
                     " output_batch_stride, a_batch_stride, b_batch_stride,"
@@ -175,7 +174,6 @@ def PyInit_tf32_matmul_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _tf32_gemm_dispatcher,
-                "Tf32GemmF32",
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, bias_ptr, m, n, k, transpose_a,"
                     " transpose_b, has_bias, context_ptr); opt-in FP32/TF32 2-D"

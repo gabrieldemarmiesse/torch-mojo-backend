@@ -117,10 +117,13 @@ def test_fast_path_is_used(mojo_device, monkeypatch):
     Apple flat kernel selected during Metal device registration."""
     x = torch.randn(8, 8).to(mojo_device)
     y = torch.randn(8, 8).to(mojo_device)
-    target = ("logic_ops.mojo", "AddSpec")
-    native_calls = _spy_defined_native_calls(monkeypatch, {target})
+    # Metal registration swaps fast_aten_add for the Apple flat kernel, so
+    # watch both entry points and require exactly one of them to run.
+    spec = ("logic_ops.mojo", "AddSpec")
+    apple = ("elementwise_ops.mojo", "Add")
+    native_calls = _spy_defined_native_calls(monkeypatch, {spec, apple})
     _ = x + y
-    assert len(native_calls[target]) == 1
+    assert len(native_calls[spec]) + len(native_calls[apple]) == 1
 
 
 @pytest.mark.parametrize(
@@ -271,14 +274,6 @@ def test_fast_add_f32_bf16_strided_preserves_general_fallback(mojo_gpu, monkeypa
     torch.testing.assert_close(actual.cpu(), fp32.t() + bf16.t(), atol=0, rtol=0)
     assert not calls[fused_target]
     assert len(calls[cast_target]) == 1
-
-
-@pytest.fixture
-def mojo_gpu(mojo_gpu_available: bool):
-    """GPU mojo device only — for ops whose fast path is GPU-gated."""
-    if not mojo_gpu_available:
-        pytest.skip("You do not have a GPU supported by MAX")
-    return "mojo:0"
 
 
 @pytest.fixture
@@ -463,6 +458,77 @@ def test_fast_native_layer_norm_fp32_gpu_optional_affine_without_fill(
     for got, want, tolerance in zip(actual, expected, (1e-5, 1e-5, 1e-4), strict=True):
         torch.testing.assert_close(got.cpu(), want, atol=tolerance, rtol=tolerance)
     torch.testing.assert_close(device_storage.cpu(), input_storage, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("has_weight", "has_bias"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_fast_native_layer_norm_fp32_gpu_prologue_runs_without_a_gpu(
+    monkeypatch, has_weight, has_bias
+):
+    """The FP32 GPU launch arguments must build for every affine combination.
+
+    Every other test of this route needs the `mojo_gpu` fixture, which skips
+    on any host without a MAX GPU -- CI included. That is how a name bound
+    only inside the affine branch reached the launch-argument tuple. This
+    runs the same prologue with no device at all, so the whole matrix is
+    checked everywhere the suite runs.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    device = SimpleNamespace(label="gpu")
+    next_ptr = iter(range(300, 400))
+
+    def tensor(shape, dtype=None):
+        shape = tuple(shape)
+        return SimpleNamespace(
+            _shape=shape,
+            _strides=aten_fast._row_major_strides(shape),
+            _offset=0,
+            _dtype=aten_fast.DType.float32 if dtype is None else dtype,
+            _device=device,
+            _ptr=next(next_ptr),
+            _itemsize=4,
+            _numel=math.prod(shape),
+            _is_contiguous=True,
+        )
+
+    input = tensor((3, 7))
+    weight = tensor((7,)) if has_weight else None
+    bias = tensor((7,)) if has_bias else None
+    calls = []
+
+    def reject_affine_stand_in(*_args, **_kwargs):
+        raise AssertionError("optional LayerNorm affine tensor was materialized")
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_tc", lambda value: value)
+    monkeypatch.setattr(
+        aten_fast, "_alloc", lambda shape, dtype, _device: tensor(shape, dtype)
+    )
+    monkeypatch.setattr(aten_fast, "_ctx_ptr", lambda _device: 1234)
+    monkeypatch.setattr(aten_fast, "fast_filled", reject_affine_stand_in)
+    _replace_defined_native_calls(
+        monkeypatch,
+        {
+            ("normalization_forward_ops.mojo", "LayerNormForwardF32"): (
+                lambda *args: calls.append(args)
+            )
+        },
+    )
+
+    actual = aten_fast.fast_aten_native_layer_norm(input, (7,), weight, bias, 1e-5)
+
+    assert actual is not aten_fast.NOT_HANDLED
+    out, mean, rstd = actual
+    assert (out._shape, mean._shape, rstd._shape) == ((3, 7), (3, 1), (3, 1))
+    assert len(calls) == 1
+    launch = calls[0]
+    assert launch[4] == (weight._ptr if has_weight else 0)
+    assert launch[5] == (bias._ptr if has_bias else 0)
+    assert launch[6:8] == (3, 7)
+    assert launch[9:11] == (int(has_weight), int(has_bias))
 
 
 def test_fast_native_layer_norm_fp32_gpu_noncontiguous_inputs(mojo_gpu):
@@ -4211,40 +4277,20 @@ def test_tf32_matmul_family_highest_retains_tensorspec_fallback(monkeypatch):
     assert tf32_import_calls == []
 
 
-def test_matmul_spec_device_oom_is_not_disguised_as_unsupported(monkeypatch):
+def test_matmul_spec_device_oom_is_not_disguised_as_unsupported(
+    monkeypatch, fake_mojo_tensor
+):
     from torch_mojo_backend import eager_kernels
     from torch_mojo_backend.eager_kernels import aten_fast
     from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
     device = CPU()
 
-    def fake_tensor(
-        shape: tuple[int, ...], strides: tuple[int, ...]
-    ) -> TorchMojoTensor:
-        tensor = torch.Tensor._make_wrapper_subclass(
-            TorchMojoTensor,
-            shape,
-            strides=strides,
-            storage_offset=0,
-            dtype=torch.float32,
-            layout=torch.strided,
-            device="cpu",
-            requires_grad=False,
-        )
-        tensor._holder = object()
-        tensor._ptr = 1
-        tensor._dtype = aten_fast.DType.float32
-        tensor._device = device
-        tensor._shape = shape
-        tensor._strides = strides
-        tensor._offset = 0
-        tensor._itemsize = 4
-        tensor._numel = math.prod(shape)
-        tensor._is_contiguous = True
-        return tensor
+    def fake_tensor(shape: tuple[int, ...]) -> TorchMojoTensor:
+        return fake_mojo_tensor(device, shape=shape)
 
-    lhs = fake_tensor((2, 3), (3, 1))
-    rhs = fake_tensor((3, 4), (4, 1))
+    lhs = fake_tensor((2, 3))
+    rhs = fake_tensor((3, 4))
 
     def raise_allocator_oom(*_args: object, **_kwargs: object) -> None:
         raise NotImplementedError(
@@ -4261,9 +4307,7 @@ def test_matmul_spec_device_oom_is_not_disguised_as_unsupported(monkeypatch):
     def fake_allocate_output(
         output_spec: aten_fast._TensorOutputSpec,
     ) -> TorchMojoTensor:
-        return fake_tensor(
-            output_spec.shape, aten_fast._row_major_strides(output_spec.shape)
-        )
+        return fake_tensor(output_spec.shape)
 
     monkeypatch.setattr(aten_fast, "_t", lambda tensor: tensor)
     monkeypatch.setattr(aten_fast, "_spec_of", lambda tensor: tensor)
@@ -4740,7 +4784,7 @@ def test_bf16_gemm_rejects_invalid_metadata_before_resolve_or_allocation(
         raise AssertionError("invalid BF16 GEMM metadata reached a late path")
 
     monkeypatch.setattr(aten_fast, "_t", as_tensor)
-    monkeypatch.setattr(aten_fast, "_resolve_bf16_bridge", fail_late_path)
+    monkeypatch.setattr(aten_fast, "_call_mojo", fail_late_path)
     monkeypatch.setattr(aten_fast, "_alloc", fail_late_path)
     monkeypatch.setattr(aten_fast, "_ctx_ptr", fail_late_path)
 
@@ -4959,7 +5003,7 @@ def test_bf16_bmm_rejects_invalid_metadata_before_resolve_or_allocation(
         raise AssertionError("invalid BF16 BMM metadata reached a late path")
 
     monkeypatch.setattr(aten_fast, "_t", lambda value: value)
-    monkeypatch.setattr(aten_fast, "_resolve_bf16_bridge", fail_late_path)
+    monkeypatch.setattr(aten_fast, "_call_mojo", fail_late_path)
     monkeypatch.setattr(aten_fast, "_alloc", fail_late_path)
     monkeypatch.setattr(aten_fast, "_ctx_ptr", fail_late_path)
 
@@ -4991,14 +5035,14 @@ def test_bf16_bridge_error_propagates_without_retry(monkeypatch, operation):
         allocations.append((tuple(shape), dtype, actual_device))
         return tensor(shape, 9000)
 
-    def fail_bridge(*args):
-        bridge_calls.append(args)
+    def fail_bridge(*args, **kwargs):
+        bridge_calls.append((args, kwargs))
         raise RuntimeError("synthetic BF16 enqueue failure")
 
     monkeypatch.setattr(aten_fast, "_t", lambda value: value)
     monkeypatch.setattr(aten_fast, "_alloc", allocate)
     monkeypatch.setattr(aten_fast, "_ctx_ptr", lambda actual_device: 7007)
-    monkeypatch.setattr(aten_fast, "_resolve_bf16_bridge", lambda _name: fail_bridge)
+    monkeypatch.setattr(aten_fast, "_call_mojo", fail_bridge)
 
     with pytest.raises(RuntimeError, match="synthetic BF16 enqueue failure"):
         if operation == "gemm":
@@ -5042,7 +5086,7 @@ def test_bf16_helpers_reject_cross_device_before_resolve_or_allocation(
         raise AssertionError("cross-device BF16 input reached resolve/allocation")
 
     monkeypatch.setattr(aten_fast, "_t", lambda value: value)
-    monkeypatch.setattr(aten_fast, "_resolve_bf16_bridge", fail_late_path)
+    monkeypatch.setattr(aten_fast, "_call_mojo", fail_late_path)
     monkeypatch.setattr(aten_fast, "_alloc", fail_late_path)
     monkeypatch.setattr(aten_fast, "_ctx_ptr", fail_late_path)
 
@@ -6332,6 +6376,9 @@ def test_fused_flash_attention_partial_gradients_match_reference(mojo_gpu, requi
     top-left and bottom-right causal alignment disagree, so a kernel using the
     wrong convention fails here rather than silently passing on square inputs.
     """
+    if list(get_accelerators())[0].architecture_name != "gfx942":
+        pytest.skip("the fused flash-attention kernels target gfx942")
+
     from torch_mojo_backend.eager_kernels import aten_fast
 
     generator = torch.Generator().manual_seed(20260718)
@@ -6448,6 +6495,9 @@ def test_fused_flash_attention_saved_tensor_hooks_own_saved_allocations(mojo_gpu
     query.  At the shape below that is the difference between packing a
     5x7 matrix and packing a length-5 vector, and the gap grows with sequence.
     """
+    if list(get_accelerators())[0].architecture_name != "gfx942":
+        pytest.skip("the fused flash-attention kernels target gfx942")
+
     from torch_mojo_backend.eager_kernels import aten_fast
 
     generator = torch.Generator().manual_seed(20260718)
@@ -6960,8 +7010,19 @@ def test_fast_log_softmax_does_not_retain_python_output_cycle(mojo_gpu):
     output = torch.nn.functional.log_softmax(input, dim=-1)
     output_ref = weakref.ref(output)
 
+    # Drop the reference the kernel-call queue is *entitled* to hold first: a
+    # queued launch names its operands by raw pointer, so `_KEEPALIVE` keeps
+    # every tensor of an in-flight op alive until the launch has run. That
+    # retention is not the cycle under test -- it ends at the synchronize --
+    # and without this the assertion below would pass or fail on whether the
+    # queue happened to be empty rather than on the Python graph.
+    torch.accelerator.synchronize()
+
     del output
 
+    # The backward node saves the OUTPUT, so a node held by the tensor that
+    # also holds that tensor is the classic collectable cycle; refcounting
+    # alone must be enough to free it.
     assert output_ref() is None
 
 

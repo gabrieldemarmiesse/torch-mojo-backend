@@ -3,18 +3,9 @@
 import pytest
 import torch
 
-from torch_mojo_backend import register_mojo_devices
 from torch_mojo_backend.testing import CallChecker
 
 pytestmark = pytest.mark.xdist_group(name="group1")
-
-
-@pytest.fixture
-def mojo_gpu(mojo_gpu_available: bool) -> str:
-    if not mojo_gpu_available:
-        pytest.skip("requires a MAX GPU")
-    register_mojo_devices()
-    return "mojo:0"
 
 
 def _watch_eager_op(call_checker: CallChecker, op_name: str) -> None:

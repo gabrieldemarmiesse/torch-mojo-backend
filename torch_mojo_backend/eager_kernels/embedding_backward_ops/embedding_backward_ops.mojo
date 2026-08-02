@@ -99,7 +99,6 @@ def PyInit_embedding_backward_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _embedding_dense_backward_dispatcher,
-                "EmbeddingDenseBackwardF32I64",
                 docstring=(
                     "(grad_weight_ptr, grad_output_ptr, indices_ptr,"
                     " num_indices, embedding_dim, num_weights, padding_idx,"

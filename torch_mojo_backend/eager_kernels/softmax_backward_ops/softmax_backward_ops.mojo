@@ -104,7 +104,6 @@ def PyInit_softmax_backward_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _log_softmax_backward_dispatcher,
-                "LogSoftmaxBackwardData",
                 docstring=(
                     "(grad_input_ptr, grad_output_ptr, output_ptr, rows, cols,"
                     " dtype, context_ptr); fused trailing-dim log_softmax"

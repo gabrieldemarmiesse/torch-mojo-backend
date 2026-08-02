@@ -67,9 +67,7 @@ from op_utils import (
     _scratch_contig,
     _scratch_copy,
     _spec_ptr,
-    _spec_result,
     _raw_ret_none,
-    _spec_result2,
     _spec_unsupported,
 )
 
@@ -788,12 +786,33 @@ def _lsm_store_out_16B[
         ptr.store[width=width, alignment=vec_align](val)
 
 
+@always_inline
+def _lsm_vec_phase[dtype: DType](addr: Int) -> Int:
+    """Element offset of `addr` inside its own 16-byte block, or -1 when `addr`
+    is not even element-aligned.
+
+    A 128-bit access is legal only at an address that is a multiple of 16, so
+    this — and not the column index — is what decides where a row's vectorized
+    body may start: element index `j` of a buffer sits at a 16-byte boundary iff
+    `(phase + j) % V == 0`, which collapses to `j % V == 0` only for a buffer
+    whose own base is 16-byte aligned.
+    """
+    comptime esize = size_of[dtype]()
+    if addr % esize != 0:
+        return -1
+    return (addr % 16) // esize
+
+
 # Fused online (single-read) log-softmax. The reduction reads each row ONCE
 # (vectorized 16-byte loads; per-lane running max m + running sum s rescaled on
 # a new max), then the output pass re-reads that row — kept resident in L2 by
 # the grid cap in `_log_softmax_rows` — and writes with a streaming store.
-# Odd cols: a per-row scalar head reaches a 16-byte-aligned element index, plus
-# a scalar tail. Correct for any rows/cols >= 1, bf16/f16/f32.
+# Unaligned rows: a per-row scalar head walks each buffer up to a genuinely
+# 16-byte-aligned ADDRESS, plus a scalar tail. Input and output are independent
+# allocations with independent 16-byte phases (a sliced input can sit at
+# `ptr % 16 == 4` while its freshly allocated output sits at 0), so each buffer
+# gets its own head/body/tail split. Correct for any rows/cols >= 1,
+# bf16/f16/f32.
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(threads))
 )
@@ -810,16 +829,41 @@ def _log_softmax_rows_block_kernel[
     comptime vec_align = V * size_of[dtype]()  # 16 bytes
     var tid = Int(thread_idx.x)
 
+    # 16-byte phase of each buffer, folded into the per-row head length below so
+    # every vectorized access lands on a real 16-byte boundary. Loop-invariant.
+    var in_phase = _lsm_vec_phase[dtype](Int(in_ptr))
+    var out_phase = _lsm_vec_phase[dtype](Int(out_ptr))
+    # Pass 2 loads and stores the SAME row-local index, so it can keep the
+    # 16-byte load only when both buffers share a phase (the aligned hot path
+    # has both at 0). Otherwise it keeps the aligned streaming store and gathers
+    # the input element-wise.
+    var pass2_vec_load = in_phase >= 0 and in_phase == out_phase
+
     var row = Int(block_idx.x)
     while row < rows:
         var base = row * cols
 
-        var head = (V - (base % V)) % V
-        if head > cols:
-            head = cols
-        var n_vec = (cols - head) // V
-        var vec_start = base + head  # element index, V-aligned
+        # Input split — pass 1 reads only the input.
+        var head = cols
+        var n_vec = 0
+        if in_phase >= 0:
+            head = (V - (in_phase + base) % V) % V
+            if head > cols:
+                head = cols
+            n_vec = (cols - head) // V
+        var vec_start = base + head  # 16-byte-aligned address in `in_ptr`
         var tail_start = head + n_vec * V  # first row-local index of the tail
+
+        # Output split — pass 2 stores here; its phase is independent.
+        var head_o = cols
+        var n_vec_o = 0
+        if out_phase >= 0:
+            head_o = (V - (out_phase + base) % V) % V
+            if head_o > cols:
+                head_o = cols
+            n_vec_o = (cols - head_o) // V
+        var vec_start_o = base + head_o  # 16-byte-aligned address in `out_ptr`
+        var tail_start_o = head_o + n_vec_o * V
 
         # ---- Pass 1: online max + sum over the row, one global read. ----
         # The running max starts at the lowest FINITE float, not at
@@ -883,22 +927,40 @@ def _log_softmax_rows_block_kernel[
 
         # ---- Pass 2: output = x - max - log_denom. Input read hits L2; the
         # streaming store keeps the writes from evicting it. ----
-        var vo = tid
-        while vo < n_vec:
-            var x = in_ptr.load[width=V, alignment=vec_align](
-                vec_start + vo * V
-            ).cast[DType.float32]()
-            var y = (x - block_m - log_denom).cast[dtype]()
-            _lsm_store_out_16B[vec_align=vec_align](
-                out_ptr + (vec_start + vo * V), y
-            )
-            vo += threads
+        if pass2_vec_load:
+            # Aligned hot path: both buffers share a phase, so `vec_start_o`
+            # names a 16-byte boundary in each.
+            var vo = tid
+            while vo < n_vec_o:
+                var x = in_ptr.load[width=V, alignment=vec_align](
+                    vec_start_o + vo * V
+                ).cast[DType.float32]()
+                var y = (x - block_m - log_denom).cast[dtype]()
+                _lsm_store_out_16B[vec_align=vec_align](
+                    out_ptr + (vec_start_o + vo * V), y
+                )
+                vo += threads
+        else:
+            # Phases disagree: the store stays 16-byte aligned and vectorized,
+            # the input is gathered one element at a time (still fully
+            # coalesced across the lanes of a warp).
+            var vo = tid
+            while vo < n_vec_o:
+                var off = vec_start_o + vo * V
+                var x = SIMD[DType.float32, V](0.0)
+
+                @parameter
+                for k in range(V):
+                    x[k] = in_ptr[off + k].cast[DType.float32]()
+                var y = (x - block_m - log_denom).cast[dtype]()
+                _lsm_store_out_16B[vec_align=vec_align](out_ptr + off, y)
+                vo += threads
         var jho = tid
-        while jho < head:
+        while jho < head_o:
             var x = in_ptr[base + jho].cast[DType.float32]()
             out_ptr[base + jho] = (x - block_m - log_denom).cast[dtype]()
             jho += threads
-        var jto = tail_start + tid
+        var jto = tail_start_o + tid
         while jto < cols:
             var x = in_ptr[base + jto].cast[DType.float32]()
             out_ptr[base + jto] = (x - block_m - log_denom).cast[dtype]()
@@ -1139,104 +1201,6 @@ comptime SPEC_ANYALL_DTYPES = [
 ]
 
 
-def _rowred_spec_go[
-    op_code: Int
-](
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in SPEC_ROWRED_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec reduce: unsupported dtype ", a.dtype)
-    if a.numel == 0:
-        # sum-of-empty is a Python-side fill; amax/amin reject empty dims.
-        raise Error("mojo spec reduce: empty input")
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
-
-    var ctx = a.ctx()
-    var nbytes = rows * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if rows > 0:
-        var outer_elements = 0
-        var reduce_elements = 0
-        var inner_elements = 0
-        var direct_middle_sum = False
-        comptime if op_code == RED_SUM:
-            if a.dtype == DType.float32 and needs_copy and ctx.api() != "cpu":
-                direct_middle_sum = _adjacent_reduce_geom(
-                    a,
-                    rdims_t,
-                    outer_elements,
-                    reduce_elements,
-                    inner_elements,
-                )
-        if direct_middle_sum:
-            comptime if has_accelerator():
-                _sum_contiguous_middle_f32(
-                    addr,
-                    a.ptr,
-                    outer_elements,
-                    reduce_elements,
-                    inner_elements,
-                    ctx,
-                )
-            else:
-                raise Error("no GPU accelerator available at compile time")
-        elif needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _reduce_rows[dt, op_code](
-                            addr, in_addr, rows, cols, ctx
-                        )
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _reduce_rows[dt, op_code](addr, a.ptr, rows, cols, ctx)
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        out_rank,
-        oshape,
-        a.dtype,
-        a.itemsize,
-        rows,
-        a.ctx_ptr,
-    )
-
-
 def _rowred_spec_into_go[
     op_code: Int
 ](
@@ -1341,72 +1305,15 @@ def _rowred_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 4:
-            _rowred_spec_into_go[op_code](args[0], args[1], args[2], args[3])
-            return _raw_ret_none()
-        return _rowred_spec_go[op_code](args[0], args[1], args[2])
+        if nargs != 4:
+            raise Error(
+                "a row-reduction spec op expects exactly 4 arguments (a_spec,"
+                " rdims, keepdim, out_spec)"
+            )
+        _rowred_spec_into_go[op_code](args[0], args[1], args[2], args[3])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _argmin_spec_go(
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in SPEC_ROWRED_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec argmin: unsupported dtype ", a.dtype)
-    if a.numel == 0:
-        raise Error("mojo spec argmin: empty input")
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
-
-    var ctx = a.ctx()
-    var nbytes = rows * 8  # int64 output
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _argmin_rows[dt](addr, in_addr, rows, cols, ctx)
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _argmin_rows[dt](addr, a.ptr, rows, cols, ctx)
-    return _spec_result(
-        buf^, addr, nbytes, out_rank, oshape, DType.int64, 8, rows, a.ctx_ptr
-    )
 
 
 def _argmin_spec_into_go(
@@ -1481,97 +1388,15 @@ def _argmin_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 4:
-            _argmin_spec_into_go(args[0], args[1], args[2], args[3])
-            return _raw_ret_none()
-        return _argmin_spec_go(args[0], args[1], args[2])
+        if nargs != 4:
+            raise Error(
+                "ArgminSpec expects exactly 4 arguments (a_spec, rdims,"
+                " keepdim, out_spec)"
+            )
+        _argmin_spec_into_go(args[0], args[1], args[2], args[3])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _min_dim_spec_go(
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    """aten::min.dim values+indices in one call — the multi-output protocol
-    (`_spec_result2`): two (holder, spec, shape, ptr) groups in one tuple."""
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in SPEC_ROWRED_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec min.dim: unsupported dtype ", a.dtype)
-    if a.numel == 0:
-        raise Error("mojo spec min.dim: empty input")
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
-
-    var ctx = a.ctx()
-    var nbytes_v = rows * a.itemsize
-    var buf_v = ctx.enqueue_create_buffer[DType.uint8](max(nbytes_v, 1))
-    var addr_v = Int(buf_v.unsafe_ptr())
-    var nbytes_i = rows * 8  # int64 indices
-    var buf_i = ctx.enqueue_create_buffer[DType.uint8](max(nbytes_i, 1))
-    var addr_i = Int(buf_i.unsafe_ptr())
-    if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _minmax_idx_rows[dt, True](
-                            addr_v, addr_i, in_addr, rows, cols, ctx
-                        )
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _minmax_idx_rows[dt, True](
-                            addr_v, addr_i, a.ptr, rows, cols, ctx
-                        )
-    return _spec_result2(
-        buf_v^,
-        addr_v,
-        nbytes_v,
-        out_rank,
-        oshape,
-        a.dtype,
-        a.itemsize,
-        rows,
-        buf_i^,
-        addr_i,
-        nbytes_i,
-        out_rank,
-        oshape,
-        DType.int64,
-        8,
-        rows,
-        a.ctx_ptr,
-    )
 
 
 def _min_dim_spec_into_go(
@@ -1581,8 +1406,9 @@ def _min_dim_spec_into_go(
     out_v_o: PyObjectPtr,
     out_i_o: PyObjectPtr,
 ) raises:
-    """aten::min.dim values+indices in one call — the multi-output protocol
-    (`_spec_result2`): two (holder, spec, shape, ptr) groups in one tuple."""
+    """aten::min.dim values+indices in one call — the multi-output protocol:
+    Python allocates both outputs and passes their specs as the last two
+    arguments, so one boundary call still fills both."""
     ref a = _spec_ptr(a_o)[]
     ref out_v = _spec_ptr(out_v_o)[]
     ref out_i = _spec_ptr(out_i_o)[]
@@ -1660,86 +1486,15 @@ def _min_dim_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 5:
-            _min_dim_spec_into_go(args[0], args[1], args[2], args[3], args[4])
-            return _raw_ret_none()
-        return _min_dim_spec_go(args[0], args[1], args[2])
+        if nargs != 5:
+            raise Error(
+                "MinDimSpec expects exactly 5 arguments (a_spec, rdims,"
+                " keepdim, values_spec, indices_spec)"
+            )
+        _min_dim_spec_into_go(args[0], args[1], args[2], args[3], args[4])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _var_spec_go(
-    a_o: PyObjectPtr,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
-    corr_o: PyObjectPtr,
-) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec var: unsupported dtype ", a.dtype)
-    if a.numel == 0:
-        raise Error("mojo spec var: empty input")
-    var correction = Float32(_raw_f64(corr_o))
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
-
-    var ctx = a.ctx()
-    var nbytes = rows * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _var_rows[dt](
-                            addr, in_addr, rows, cols, correction, ctx
-                        )
-            _ = tmp^
-        else:
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _var_rows[dt](addr, a.ptr, rows, cols, correction, ctx)
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        out_rank,
-        oshape,
-        a.dtype,
-        a.itemsize,
-        rows,
-        a.ctx_ptr,
-    )
 
 
 def _var_spec_into_go(
@@ -1818,71 +1573,15 @@ def _var_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 5:
-            _var_spec_into_go(args[0], args[1], args[2], args[3], args[4])
-            return _raw_ret_none()
-        return _var_spec_go(args[0], args[1], args[2], args[3])
+        if nargs != 5:
+            raise Error(
+                "VarSpec expects exactly 5 arguments (a_spec, rdims, keepdim,"
+                " correction, out_spec)"
+            )
+        _var_spec_into_go(args[0], args[1], args[2], args[3], args[4])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _anyall_spec_go[
-    is_all: Bool
-](
-    a_o: PyObjectPtr, rdims_t: PyObjectPtr, keepdim_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in SPEC_ANYALL_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec any/all: unsupported dtype ", a.dtype)
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
-    var ctx = a.ctx()
-    var nbytes = rows  # bool output
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_ANYALL_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _anyall_rows[dt, is_all](addr, in_addr, rows, cols, ctx)
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_ANYALL_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _anyall_rows[dt, is_all](addr, a.ptr, rows, cols, ctx)
-    return _spec_result(
-        buf^, addr, nbytes, out_rank, oshape, DType.bool, 1, rows, a.ctx_ptr
-    )
 
 
 def _anyall_spec_into_go[
@@ -1958,67 +1657,15 @@ def _anyall_spec_dispatcher[
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 4:
-            _anyall_spec_into_go[is_all](args[0], args[1], args[2], args[3])
-            return _raw_ret_none()
-        return _anyall_spec_go[is_all](args[0], args[1], args[2])
+        if nargs != 4:
+            raise Error(
+                "an any/all spec op expects exactly 4 arguments (a_spec, rdims,"
+                " keepdim, out_spec)"
+            )
+        _anyall_spec_into_go[is_all](args[0], args[1], args[2], args[3])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _log_softmax_spec_go(a_o: PyObjectPtr) raises -> PyObjectPtr:
-    """log_softmax over the trailing dim; full-shape output. The non-trailing
-    dim transpose recursion stays in Python (view ops)."""
-    ref a = _spec_ptr(a_o)[]
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec log_softmax: unsupported dtype ", a.dtype)
-    if a.rank < 1 or a.numel == 0:
-        raise Error("mojo spec log_softmax: empty or rank-0 input")
-
-    var cols = a.shape[MAX_RANK - 1]
-    var rows = a.numel // cols
-    var ctx = a.ctx()
-    var nbytes = a.numel * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    # The row kernel's scalar head/tail corrects per-row phase but assumes a
-    # 16-byte-aligned base: its vector loads claim that alignment. A sliced
-    # (contiguous, base-misaligned) input silently violates the claim — the
-    # MI300X path tolerates it, Metal returns wrong lanes — so Apple routes
-    # misaligned bases through the aligned scratch copy below.
-    var base_aligned = True
-    comptime if has_apple_gpu_accelerator():
-        base_aligned = a.ptr % 16 == 0
-    if a.contig and base_aligned:
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _log_softmax_rows[dt](addr, a.ptr, rows, cols, ctx)
-    else:
-        # Mojo-side temporary; see _unary_spec_go in elementwise_ops.
-        var tmp = _scratch_contig(a, ctx)
-        var tmp_addr = Int(tmp.unsafe_ptr())
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _log_softmax_rows[dt](addr, tmp_addr, rows, cols, ctx)
-        _ = tmp^
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        a.rank,
-        a.shape,
-        a.dtype,
-        a.itemsize,
-        a.numel,
-        a.ctx_ptr,
-    )
 
 
 def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
@@ -2052,7 +1699,9 @@ def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
                 if a.dtype == dt:
                     _log_softmax_rows[dt](addr, a.ptr, rows, cols, ctx)
     else:
-        # Mojo-side temporary; see _unary_spec_go in elementwise_ops.
+        # Mojo-side temporary (design doc §4.7): materialize the strided
+        # input into a scratch buffer inside the call — Python never
+        # mints a wrapper for it.
         var tmp = _scratch_contig(a, ctx)
         var tmp_addr = Int(tmp.unsafe_ptr())
         comptime for dt in FLOAT_DTYPES:
@@ -2069,10 +1718,12 @@ def _log_softmax_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 2:
-            _log_softmax_spec_into_go(args[0], args[1])
-            return _raw_ret_none()
-        return _log_softmax_spec_go(args[0])
+        if nargs != 2:
+            raise Error(
+                "LogSoftmaxSpec expects exactly 2 arguments (a_spec, out_spec)"
+            )
+        _log_softmax_spec_into_go(args[0], args[1])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
 
@@ -2090,76 +1741,55 @@ def PyInit_reduction_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _rowred_spec_dispatcher[RED_SUM],
-                "SumSpec",
-                docstring=(
-                    "(a_spec, rdims, keepdim) -> (holder, spec, shape, ptr)"
-                ),
+                docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["AmaxSpec"]():
             _register_call(
                 b,
                 _rowred_spec_dispatcher[RED_MAX],
-                "AmaxSpec",
-                docstring=(
-                    "(a_spec, rdims, keepdim) -> (holder, spec, shape, ptr)"
-                ),
+                docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["AminSpec"]():
             _register_call(
                 b,
                 _rowred_spec_dispatcher[RED_MIN],
-                "AminSpec",
-                docstring=(
-                    "(a_spec, rdims, keepdim) -> (holder, spec, shape, ptr)"
-                ),
+                docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["ArgminSpec"]():
             _register_call(
                 b,
                 _argmin_spec_dispatcher,
-                "ArgminSpec",
-                docstring="(a_spec, rdims, keepdim) -> int64 result group",
+                docstring="(a_spec, rdims, keepdim, out_spec); int64 indices",
             )
         comptime if _op_on["MinDimSpec"]():
             _register_call(
                 b,
                 _min_dim_spec_dispatcher,
-                "MinDimSpec",
-                docstring=(
-                    "(a_spec, rdims, keepdim) -> (values group, indices group)"
-                ),
+                docstring="(a_spec, rdims, keepdim, values_spec, indices_spec)",
             )
         comptime if _op_on["VarSpec"]():
             _register_call(
                 b,
                 _var_spec_dispatcher,
-                "VarSpec",
-                docstring=(
-                    "(a_spec, rdims, keepdim, correction) -> result group"
-                ),
+                docstring="(a_spec, rdims, keepdim, correction, out_spec)",
             )
         comptime if _op_on["AnySpec"]():
             _register_call(
                 b,
                 _anyall_spec_dispatcher[False],
-                "AnySpec",
-                docstring="(a_spec, rdims, keepdim) -> bool result group",
+                docstring="(a_spec, rdims, keepdim, out_spec); bool",
             )
         comptime if _op_on["AllSpec"]():
             _register_call(
                 b,
                 _anyall_spec_dispatcher[True],
-                "AllSpec",
-                docstring="(a_spec, rdims, keepdim) -> bool result group",
+                docstring="(a_spec, rdims, keepdim, out_spec); bool",
             )
         comptime if _op_on["LogSoftmaxSpec"]():
             _register_call(
                 b,
                 _log_softmax_spec_dispatcher,
-                "LogSoftmaxSpec",
-                docstring=(
-                    "(a_spec) -> (holder, spec, shape, ptr); trailing dim"
-                ),
+                docstring="(a_spec, out_spec); trailing dim",
             )
         return b.finalize()
     except e:

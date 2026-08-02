@@ -1,6 +1,5 @@
 """Host-only regression tests for TensorSpec allocator-error propagation."""
 
-import math
 from pathlib import Path
 from types import ModuleType
 
@@ -13,41 +12,6 @@ from torch_mojo_backend.eager_kernels import aten_fast
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 _CUDA_OOM = "CUDA call failed: CUDA_ERROR_OUT_OF_MEMORY (out of memory)"
-
-
-def _tensor(
-    device: object,
-    *,
-    dtype: aten_fast.DType = aten_fast.DType.float32,
-    shape: tuple[int, ...] = (2, 3),
-    strides: tuple[int, ...] = (3, 1),
-) -> TorchMojoTensor:
-    torch_dtype = {
-        aten_fast.DType.bool: torch.bool,
-        aten_fast.DType.float32: torch.float32,
-        aten_fast.DType.int64: torch.int64,
-    }[dtype]
-    tensor = torch.Tensor._make_wrapper_subclass(
-        TorchMojoTensor,
-        shape,
-        strides=strides,
-        storage_offset=0,
-        dtype=torch_dtype,
-        layout=torch.strided,
-        device="cpu",
-        requires_grad=False,
-    )
-    tensor._holder = object()
-    tensor._ptr = 1
-    tensor._device = device
-    tensor._dtype = dtype
-    tensor._shape = shape
-    tensor._strides = strides
-    tensor._offset = 0
-    tensor._itemsize = dtype.size_in_bytes
-    tensor._numel = math.prod(shape)
-    tensor._is_contiguous = True
-    return tensor
 
 
 @pytest.mark.parametrize(
@@ -68,18 +32,20 @@ def _tensor(
         "attention_decode",
     ],
 )
-def test_tensor_spec_fallbacks_propagate_device_oom(monkeypatch, path):
+def test_tensor_spec_fallbacks_propagate_device_oom(
+    monkeypatch, path, fake_mojo_tensor
+):
     """Fallback-only errors stay recoverable, but allocator OOM never does."""
     device = CPU()
-    attention_device = device
+    _tensor = fake_mojo_tensor
     lhs = _tensor(device)
     rhs = _tensor(device)
-    matmul_rhs = _tensor(device, shape=(3, 2), strides=(2, 1))
+    matmul_rhs = _tensor(device, shape=(3, 2))
     bool_lhs = _tensor(device, dtype=aten_fast.DType.bool)
     int_lhs = _tensor(device, dtype=aten_fast.DType.int64)
-    query = _tensor(attention_device, shape=(1, 1, 1, 4), strides=(4, 4, 4, 1))
-    key = _tensor(attention_device, shape=(1, 1, 2, 4), strides=(8, 8, 4, 1))
-    value = _tensor(attention_device, shape=(1, 1, 2, 4), strides=(8, 8, 4, 1))
+    query = _tensor(device, shape=(1, 1, 1, 4), strides=(4, 4, 4, 1))
+    key = _tensor(device, shape=(1, 1, 2, 4), strides=(8, 8, 4, 1))
+    value = _tensor(device, shape=(1, 1, 2, 4), strides=(8, 8, 4, 1))
     tensors = (lhs, rhs, matmul_rhs, bool_lhs, int_lhs, query, key, value)
 
     def as_tensor(candidate: object) -> object | None:
@@ -99,21 +65,13 @@ def test_tensor_spec_fallbacks_propagate_device_oom(monkeypatch, path):
         output_spec: aten_fast._TensorOutputSpec,
     ) -> TorchMojoTensor:
         return _tensor(
-            output_spec.device,
-            dtype=output_spec.dtype,
-            shape=output_spec.shape,
-            strides=aten_fast._row_major_strides(output_spec.shape),
+            output_spec.device, dtype=output_spec.dtype, shape=output_spec.shape
         )
 
     def fake_alloc(
         shape: tuple[int, ...], dtype: aten_fast.DType, actual_device: object
     ) -> TorchMojoTensor:
-        return _tensor(
-            actual_device,
-            dtype=dtype,
-            shape=shape,
-            strides=aten_fast._row_major_strides(shape),
-        )
+        return _tensor(actual_device, dtype=dtype, shape=shape)
 
     monkeypatch.setattr(aten_fast, "_t", as_tensor)
     monkeypatch.setattr(aten_fast, "_on_gpu", lambda _tensor: True)
@@ -152,9 +110,11 @@ def test_tensor_spec_fallbacks_propagate_device_oom(monkeypatch, path):
         calls[path]()
 
 
-def test_tensor_spec_unsupported_metadata_still_uses_fallback(monkeypatch):
+def test_tensor_spec_unsupported_metadata_still_uses_fallback(
+    monkeypatch, fake_mojo_tensor
+):
     device = CPU()
-    tensor = _tensor(device)
+    tensor = fake_mojo_tensor(device)
 
     def raise_unsupported(*_args: object, **_kwargs: object) -> None:
         raise NotImplementedError("mojo spec neg: strided input is unsupported")
@@ -169,11 +129,8 @@ def test_tensor_spec_unsupported_metadata_still_uses_fallback(monkeypatch):
     def fake_allocate_output(
         output_spec: aten_fast._TensorOutputSpec,
     ) -> TorchMojoTensor:
-        return _tensor(
-            output_spec.device,
-            dtype=output_spec.dtype,
-            shape=output_spec.shape,
-            strides=aten_fast._row_major_strides(output_spec.shape),
+        return fake_mojo_tensor(
+            output_spec.device, dtype=output_spec.dtype, shape=output_spec.shape
         )
 
     monkeypatch.setattr(aten_fast, "_t", lambda _candidate: tensor)

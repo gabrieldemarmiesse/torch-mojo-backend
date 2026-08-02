@@ -156,7 +156,6 @@ def PyInit_dropout_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _native_dropout_dispatcher,
-                "NativeDropoutF32",
                 docstring=(
                     "(output_ptr, mask_ptr, input_ptr, elements, p, seed_lo,"
                     " seed_hi, offset_lo, offset_hi, context_ptr); float32"
@@ -167,7 +166,6 @@ def PyInit_dropout_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _native_dropout_backward_dispatcher,
-                "NativeDropoutBackwardF32",
                 docstring=(
                     "(grad_input_ptr, grad_output_ptr, mask_ptr, elements,"
                     " scale, context_ptr); float32 native dropout backward"

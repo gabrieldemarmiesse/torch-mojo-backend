@@ -123,7 +123,6 @@ from op_utils import (
     _raw_tuple_len,
     _scratch_contig,
     _spec_ptr,
-    _spec_result,
     _spec_unsupported,
 )
 
@@ -6906,43 +6905,6 @@ def _matmul_spec_operands_launch(
         _ = tmp_b^
 
 
-def _matmul_spec_go(
-    a_o: PyObjectPtr, b_o: PyObjectPtr, tb_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    ref b = _spec_ptr(b_o)[]
-    var transpose_b = _raw_int(tb_o)
-    var geom = _matmul_spec_checks(a, b, transpose_b != 0)
-    var m = geom[0]
-    var n = geom[1]
-    var k = geom[2]
-
-    var ctx = a.ctx()
-    var numel = m * n
-    var nbytes = numel * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-
-    _matmul_spec_operands_launch(
-        a, b, 0, False, addr, 1, m, n, k, transpose_b, ctx
-    )
-
-    # out shape: a's leading dims with the last dim replaced by n.
-    var oshape = a.shape
-    oshape[MAX_RANK - 1] = n
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        a.rank,
-        oshape,
-        a.dtype,
-        a.itemsize,
-        numel,
-        a.ctx_ptr,
-    )
-
-
 def _matmul_spec_into_go(
     a_o: PyObjectPtr, b_o: PyObjectPtr, tb_o: PyObjectPtr, out_o: PyObjectPtr
 ) raises:
@@ -6981,72 +6943,15 @@ def _matmul_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 4:
-            _matmul_spec_into_go(args[0], args[1], args[2], args[3])
-            return _raw_ret_none()
-        return _matmul_spec_go(args[0], args[1], args[2])
+        if nargs != 4:
+            raise Error(
+                "MatmulSpec expects exactly 4 arguments (a_spec, b_spec,"
+                " transpose_b, out_spec)"
+            )
+        _matmul_spec_into_go(args[0], args[1], args[2], args[3])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _matmul_bias_spec_go(
-    a_o: PyObjectPtr,
-    b_o: PyObjectPtr,
-    bias_o: PyObjectPtr,
-    tb_o: PyObjectPtr,
-) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    ref b = _spec_ptr(b_o)[]
-    ref bias = _spec_ptr(bias_o)[]
-    var transpose_b = _raw_int(tb_o)
-    var geom = _matmul_spec_checks(a, b, transpose_b != 0)
-    var m = geom[0]
-    var n = geom[1]
-    var k = geom[2]
-    if bias.dtype != a.dtype:
-        raise Error("mojo spec matmul: bias dtype differs")
-    if bias.rank != 1 or bias.numel != n:
-        raise Error("mojo spec matmul: bias must be a length-n vector")
-
-    var ctx = a.ctx()
-    var numel = m * n
-    var nbytes = numel * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    if bias.contig:
-        _matmul_spec_operands_launch(
-            a, b, bias.ptr, True, addr, 1, m, n, k, transpose_b, ctx
-        )
-    else:
-        var tmp_bias = _scratch_contig(bias, ctx)
-        _matmul_spec_operands_launch(
-            a,
-            b,
-            Int(tmp_bias.unsafe_ptr()),
-            True,
-            addr,
-            1,
-            m,
-            n,
-            k,
-            transpose_b,
-            ctx,
-        )
-        _ = tmp_bias^
-
-    var oshape = a.shape
-    oshape[MAX_RANK - 1] = n
-    return _spec_result(
-        buf^,
-        addr,
-        nbytes,
-        a.rank,
-        oshape,
-        a.dtype,
-        a.itemsize,
-        numel,
-        a.ctx_ptr,
-    )
 
 
 def _matmul_bias_spec_into_go(
@@ -7111,70 +7016,15 @@ def _matmul_bias_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 5:
-            _matmul_bias_spec_into_go(
-                args[0], args[1], args[2], args[3], args[4]
+        if nargs != 5:
+            raise Error(
+                "MatmulBiasSpec expects exactly 5 arguments (a_spec, b_spec,"
+                " bias_spec, transpose_b, out_spec)"
             )
-            return _raw_ret_none()
-        return _matmul_bias_spec_go(args[0], args[1], args[2], args[3])
+        _matmul_bias_spec_into_go(args[0], args[1], args[2], args[3], args[4])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
-
-
-def _bmm_spec_go(
-    a_o: PyObjectPtr, b_o: PyObjectPtr, tb_o: PyObjectPtr
-) raises -> PyObjectPtr:
-    ref a = _spec_ptr(a_o)[]
-    ref b = _spec_ptr(b_o)[]
-    var transpose_b = _raw_int(tb_o)
-
-    if a.dtype != b.dtype:
-        raise Error("mojo spec bmm: operand dtypes differ")
-    if a.ctx_ptr != b.ctx_ptr:
-        raise Error("mojo spec bmm: operands on different devices")
-    var supported = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if a.dtype == dt:
-                supported = True
-    if not supported:
-        raise Error("mojo spec bmm: unsupported dtype ", a.dtype)
-    if a.rank != 3 or b.rank != 3:
-        raise Error("mojo spec bmm: rank != 3")
-    var batch = a.shape[MAX_RANK - 3]
-    var m = a.shape[MAX_RANK - 2]
-    var k = a.shape[MAX_RANK - 1]
-    if b.shape[MAX_RANK - 3] != batch:
-        raise Error("mojo spec bmm: batch dims differ")
-    var n: Int
-    var kb: Int
-    if transpose_b != 0:
-        n = b.shape[MAX_RANK - 2]
-        kb = b.shape[MAX_RANK - 1]
-    else:
-        kb = b.shape[MAX_RANK - 2]
-        n = b.shape[MAX_RANK - 1]
-    if kb != k:
-        raise Error("mojo spec bmm: inner dims differ")
-    if batch == 0 or m == 0 or n == 0 or k == 0:
-        raise Error("mojo spec bmm: zero-sized dim")
-
-    var ctx = a.ctx()
-    var numel = batch * m * n
-    var nbytes = numel * a.itemsize
-    var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
-    var addr = Int(buf.unsafe_ptr())
-    _matmul_spec_operands_launch(
-        a, b, 0, False, addr, batch, m, n, k, transpose_b, ctx
-    )
-
-    var oshape = IndexList[MAX_RANK](1)
-    oshape[MAX_RANK - 3] = batch
-    oshape[MAX_RANK - 2] = m
-    oshape[MAX_RANK - 1] = n
-    return _spec_result(
-        buf^, addr, nbytes, 3, oshape, a.dtype, a.itemsize, numel, a.ctx_ptr
-    )
 
 
 def _bmm_spec_into_go(
@@ -7242,10 +7092,13 @@ def _bmm_spec_dispatcher(
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        if nargs == 4:
-            _bmm_spec_into_go(args[0], args[1], args[2], args[3])
-            return _raw_ret_none()
-        return _bmm_spec_go(args[0], args[1], args[2])
+        if nargs != 4:
+            raise Error(
+                "BmmSpec expects exactly 4 arguments (a_spec, b_spec,"
+                " transpose_b, out_spec)"
+            )
+        _bmm_spec_into_go(args[0], args[1], args[2], args[3])
+        return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
 
@@ -7263,30 +7116,24 @@ def PyInit_matmul_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _matmul_spec_dispatcher,
-                "MatmulSpec",
-                docstring="(a_spec, b_spec, transpose_b) -> result group",
+                docstring="(a_spec, b_spec, transpose_b, out_spec)",
             )
         comptime if _op_on["MatmulBiasSpec"]():
             _register_call(
                 b,
                 _matmul_bias_spec_dispatcher,
-                "MatmulBiasSpec",
-                docstring=(
-                    "(a_spec, b_spec, bias_spec, transpose_b) -> result group"
-                ),
+                docstring="(a_spec, b_spec, bias_spec, transpose_b, out_spec)",
             )
         comptime if _op_on["BmmSpec"]():
             _register_call(
                 b,
                 _bmm_spec_dispatcher,
-                "BmmSpec",
-                docstring="(a_spec, b_spec, transpose_b) -> result group",
+                docstring="(a_spec, b_spec, transpose_b, out_spec)",
             )
         comptime if _op_on["Matmul"]():
             _register_call(
                 b,
                 _matmul_dispatcher,
-                "Matmul",
                 docstring=(
                     "C = A @ B (row-major, optional transposed B); pure Mojo"
                     " tiled kernels on GPU, modular's linalg matmul on CPU"
@@ -7296,7 +7143,6 @@ def PyInit_matmul_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _bmm_dispatcher,
-                "Bmm",
                 docstring=(
                     "batched C = A @ B (rank 3, optional transposed B); pure"
                     " Mojo tiled kernels on GPU, modular's linalg matmul on CPU"
@@ -7306,7 +7152,6 @@ def PyInit_matmul_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _bmm_causal_dispatcher,
-                "BmmCausalF32",
                 docstring=(
                     "causal-structured batched f32 GEMM for SDPA on Apple GPUs:"
                     " mode 1 skips (and leaves unwritten) score tiles above the"
@@ -7318,7 +7163,6 @@ def PyInit_matmul_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _causal_bmm_dispatcher,
-                "CausalBmm",
                 docstring=(
                     "(out_ptr, a_ptr, b_ptr, (batch, m, n, k, transpose_b,"
                     " causal_mode), dtype, context_ptr); batched C = A @ B that"

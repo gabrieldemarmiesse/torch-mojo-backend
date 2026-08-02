@@ -9,18 +9,33 @@ compiled units are still building — those wait in the kernel-call queue
 kernel compilation. This layer contributes exactly three things:
 
 - pump the call queue at every dispatch entry (launch the ready prefix);
-- drain it before host-visible reads (``_SYNC_OPS``, device crossings);
+- drain it before device work that would bypass the queue (see below);
 - bracket each op so every buffer it touches is kept alive while queued
   launches still hold raw pointers to it (``op_begin``/``op_end``).
 
-Device work is ordered only within an enqueuing thread (verified
-empirically: cross-thread enqueues read stale data), so `_direct`
-synchronizes the device whenever the enqueuing thread changes — switches
-are rare (main <-> autograd engine, per backward pass).
+Host reads drain where they touch bytes — ``_to_cpu_tensor``,
+``read_scalar`` behind ``aten::_local_scalar_dense``, ``__dlpack__`` — not
+from a list of op names here. What the dispatcher must still cover is the
+opposite direction: device WRITES that never enter the queue at all, namely
+the H2D ``copy_from_host`` behind a cross-device ``aten::_to_copy`` /
+``aten::copy_``. Those would land in a buffer a queued launch is about to
+overwrite. Every other candidate is inert and deliberately absent:
+``aten::item`` and ``aten::allclose`` decompose to ``_local_scalar_dense``,
+which drains itself; ``aten::nonzero`` drains through ``_to_cpu_tensor``;
+``aten::cpu`` is not an operator; ``aten::equal`` and ``aten::masked_select``
+have no PrivateUse1 kernel and raise. Adding a fast kernel for a
+value-reading op means adding its drain next to the read, not a name here.
+
+Direct launches are ordered by their issuing thread and need no
+cross-thread barrier — ``main`` has always interleaved the forward (main)
+and backward (autograd engine) threads without one. What was verified
+empirically as unsafe is a *queue* launch replaying another thread's work,
+so ``_direct`` calls ``call_queue.order_direct_launch()``, which is a
+plain tracker update unless the queue recently launched from another
+thread (then it synchronizes once and clears).
 """
 
 import os
-import threading
 
 import torch
 from torch.utils._pytree import tree_flatten
@@ -28,45 +43,37 @@ from torch.utils._pytree import tree_flatten
 from torch_mojo_backend.eager_kernels import call_queue
 
 # MAX's DeviceContext is not documented thread-safe: serialize every
-# device-touching call.
-_DEVICE_LOCK = threading.RLock()
-
-# The thread whose device work was enqueued last (see module docstring).
-_DEVICE_THREAD: list = [None]
-
-
-def _order_device_thread() -> None:
-    me = threading.current_thread()
-    if _DEVICE_THREAD[0] is not None and _DEVICE_THREAD[0] is not me:
-        from . import torch_mojo_device_module as _dm
-
-        _dm.synchronize()
-    _DEVICE_THREAD[0] = me
+# device-touching call. This is the SAME re-entrant mutex the queue uses, so
+# a drain on one thread cannot overlap a direct launch on another — and
+# there is no second lock for `_direct` -> `kernel_call_into` to invert
+# against.
+_DEVICE_LOCK = call_queue._LOCK
 
 
 def _direct(func: object, args: tuple, kwargs: dict) -> object:
     """Execute one aten op through the PrivateUse1 kernels."""
     with _DEVICE_LOCK:
-        _order_device_thread()
+        call_queue.order_direct_launch()
         with torch._C._DisableTorchDispatch():
             return func(*args, **kwargs)
 
 
-# Ops whose results the host is about to look at (or that cross devices):
-# they drain the call queue first so every pending launch has landed.
-_SYNC_OPS = frozenset(
-    {
-        "aten::_local_scalar_dense",
-        "aten::equal",
-        "aten::allclose",
-        "aten::_to_copy",
-        "aten::copy_",
-        "aten::item",
-        "aten::cpu",
-        "aten::nonzero",
-        "aten::masked_select",
-    }
-)
+# The only ops whose PrivateUse1 kernels touch the device outside the queue.
+_DEVICE_CROSSING_OPS = frozenset({"aten::_to_copy", "aten::copy_"})
+
+
+def _crosses_device(args: tuple, kwargs: dict) -> bool:
+    """True when a copy/cast actually moves bytes between devices. A
+    same-device cast (autocast!) is an ordinary data op that stays in the
+    queue; only a real crossing runs an out-of-queue H2D/D2H transfer."""
+    if os.environ.get("TORCH_MOJO_BACKEND_CAST_SYNC", "") == "1":
+        return True  # conservative fallback if the heuristic ever proves wrong
+    flat_args, _ = tree_flatten((args, kwargs))
+    devices = {a.device.type for a in flat_args if isinstance(a, torch.Tensor)}
+    target = kwargs.get("device")
+    if target is not None:
+        devices.add(torch.device(target).type)
+    return len(devices) > 1
 
 
 def dispatch(func: object, args: tuple, kwargs: dict) -> object:
@@ -75,22 +82,11 @@ def dispatch(func: object, args: tuple, kwargs: dict) -> object:
         return _direct(func, args, kwargs)
 
     call_queue.pump()
-    name = func._schema.name
-    sync = name in _SYNC_OPS
     if (
-        sync
-        and not os.environ.get("TMB_CAST_SYNC")
-        and name in ("aten::_to_copy", "aten::copy_")
+        call_queue.active()
+        and func._schema.name in _DEVICE_CROSSING_OPS
+        and _crosses_device(args, kwargs)
     ):
-        # Same-device copies/casts (autocast!) are ordinary data ops —
-        # only actual device crossings behave as host-visible syncs.
-        flat_args, _ = tree_flatten((args, kwargs))
-        devices = {a.device.type for a in flat_args if isinstance(a, torch.Tensor)}
-        target = kwargs.get("device")
-        if target is not None:
-            devices.add(torch.device(target).type)
-        sync = len(devices) > 1
-    if sync and call_queue.active():
         call_queue.drain()
 
     prev = call_queue.op_begin()
@@ -103,16 +99,11 @@ def dispatch(func: object, args: tuple, kwargs: dict) -> object:
 
 
 def drain() -> None:
-    """Public: wait for all pending kernel launches (device synchronize)."""
+    """Public: wait for all pending kernel launches (device synchronize).
+
+    The single façade for the queue's drain — device code that reads tensor
+    payloads outside ``__torch_dispatch__`` (the AutogradPrivateUse1 sdpa
+    impl, ``_to_cpu_tensor``) calls this before it touches bytes. FIFO
+    granularity: the whole queue drains, not just one tensor's producers.
+    """
     call_queue.drain()
-
-
-def wait_for(tensors: list) -> None:
-    """Public: barrier for device code that reads tensor payloads OUTSIDE
-    __torch_dispatch__ (e.g. the AutogradPrivateUse1 sdpa impl). Such
-    readers bypass the dispatch layer entirely, so every queued launch —
-    including the producers of `tensors` — must land before they touch
-    bytes."""
-    _ = tensors  # FIFO granularity: the full queue drains
-    if call_queue.active():
-        call_queue.drain()
