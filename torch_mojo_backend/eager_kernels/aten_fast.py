@@ -1806,15 +1806,6 @@ def _try_spec_reduce(
         return None
 
 
-_DEVICE_OOM_MARKERS = (
-    "cuda_error_out_of_memory",
-    "hiperroroutofmemory",
-    "out of memory",
-    "failed to allocate device memory",
-    "halerror (code = -13",
-)
-
-
 def _raise_if_device_oom(exc: BaseException) -> None:
     """Keep TensorSpec fallbacks from disguising allocator exhaustion.
 
@@ -1824,10 +1815,8 @@ def _raise_if_device_oom(exc: BaseException) -> None:
     OOM only replaces the useful allocator error with a misleading
     ``aten::<op> is not supported`` message.
     """
-    message = str(exc)
-    folded = message.casefold()
-    if any(marker in folded for marker in _DEVICE_OOM_MARKERS):
-        raise torch.OutOfMemoryError(message) from exc
+    if eager_kernels.is_device_oom(exc):
+        raise torch.OutOfMemoryError(str(exc)) from exc
 
 
 # A queued launch fails inside `call_queue.drain()`, far from the `_call_mojo`

@@ -420,6 +420,70 @@ def test_a_cold_launch_retains_the_output_it_writes_into(isolated_queue) -> None
     assert retained() is None  # released right after its launch
 
 
+def test_failed_allocation_drains_synchronizes_and_retries_once(
+    isolated_queue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reactive layer under the budget: a device-OOM allocation drains
+    the queue (releasing what its items retain), synchronizes the device so
+    the stream-ordered frees land, and retries exactly once. Non-OOM errors
+    and a second failure propagate untouched."""
+    from types import SimpleNamespace
+
+    from torch_mojo_backend.mojo_device import torch_mojo_tensor
+
+    synced: list[bool] = []
+    device = SimpleNamespace(
+        default_stream=SimpleNamespace(synchronize=lambda: synced.append(True))
+    )
+    monkeypatch.setattr(torch_mojo_tensor, "_ctx_ptr", lambda _device: 7)
+
+    oom = Exception("CUDA call failed: CUDA_ERROR_OUT_OF_MEMORY (out of memory)")
+
+    class _FlakyHolder:
+        def __init__(self, failures: list[BaseException]) -> None:
+            self.failures = failures
+            self.calls = 0
+
+        def alloc(self, ctx_ptr: int, nbytes: int) -> tuple[object, int]:
+            self.calls += 1
+            if self.failures:
+                raise self.failures.pop(0)
+            return (object(), 0x1000)
+
+    log: list[str] = []
+
+    # OOM once -> drain (launches the queued item), sync, retry succeeds.
+    holder = _FlakyHolder([oom])
+    monkeypatch.setattr(torch_mojo_tensor, "_holder_mod", lambda: holder)
+    call_queue.kernel_call_into(_FakeUnit(log), ("pending",), ())
+    call_queue._QUEUE[0][0].ready()
+    result = torch_mojo_tensor._alloc_with_recovery(device, 4096)
+    assert result[1] == 0x1000
+    assert holder.calls == 2
+    assert log == ["pending"]  # the drain launched what the queue held
+    assert synced == [True]
+    assert not call_queue.active()
+
+    # A non-OOM failure propagates immediately: no drain, no sync, no retry.
+    synced.clear()
+    holder = _FlakyHolder([ValueError("not a memory problem")])
+    monkeypatch.setattr(torch_mojo_tensor, "_holder_mod", lambda: holder)
+    with pytest.raises(ValueError, match="not a memory problem"):
+        torch_mojo_tensor._alloc_with_recovery(device, 4096)
+    assert holder.calls == 1
+    assert synced == []
+
+    # Two OOMs: one recovery attempt, then the second failure surfaces.
+    holder = _FlakyHolder(
+        [oom, Exception("CUDA call failed: CUDA_ERROR_OUT_OF_MEMORY (out of memory)")]
+    )
+    monkeypatch.setattr(torch_mojo_tensor, "_holder_mod", lambda: holder)
+    with pytest.raises(Exception, match="OUT_OF_MEMORY"):
+        torch_mojo_tensor._alloc_with_recovery(device, 4096)
+    assert holder.calls == 2
+    assert synced == [True]
+
+
 def test_budget_is_computed_from_free_device_memory(
     isolated_queue, monkeypatch: pytest.MonkeyPatch
 ) -> None:

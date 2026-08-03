@@ -176,6 +176,24 @@ def defines_cache_string(defines: Mapping[str, DefineValue]) -> str:
     return json.dumps(normalize_defines(defines), separators=(",", ":"))
 
 
+# Substrings that identify device-memory exhaustion across backends. Mojo
+# reports launch and allocation failures as generic exceptions, so the
+# message text is the only portable signal.
+_DEVICE_OOM_MARKERS = (
+    "cuda_error_out_of_memory",
+    "hiperroroutofmemory",
+    "out of memory",
+    "failed to allocate device memory",
+    "halerror (code = -13",
+)
+
+
+def is_device_oom(exc: BaseException) -> bool:
+    """Whether an exception reports device-memory exhaustion (any backend)."""
+    folded = str(exc).casefold()
+    return any(marker in folded for marker in _DEVICE_OOM_MARKERS)
+
+
 _CALL_DEFINES_CACHE: dict[tuple[object, ...], CanonicalDefines] = {}
 
 

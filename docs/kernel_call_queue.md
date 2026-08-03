@@ -142,7 +142,10 @@ The queue follows these rules:
    budget (computed from free device memory at first use; env-overridable) drains — waiting builds out — before
    returning. A cold, read-free loop therefore stalls at the budget
    instead of retaining a whole warm-up phase of transients; warm calls
-   run inline and never touch the meter.
+   run inline and never touch the meter. Beneath the budget sits one
+   reactive layer: a device allocation that still fails drains the queue,
+   synchronizes the device so the stream-ordered frees land, and retries
+   exactly once before the error surfaces.
 4. **Thread order.** Direct launches are ordered by their issuing thread and
    cross no barrier between threads (the same regime eager mode has always
    run forward and backward under). Queue launches replay work other threads

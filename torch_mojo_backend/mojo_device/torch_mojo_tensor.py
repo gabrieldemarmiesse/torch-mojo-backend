@@ -1,5 +1,6 @@
 import functools
 import math
+import sys
 import threading
 from collections import deque
 from pathlib import Path
@@ -200,6 +201,49 @@ def _dispatch_entry(func: object, args: tuple, kwargs: dict) -> object:
     return _dispatch_entry(func, args, kwargs)
 
 
+@runtime_checkable
+class _SynchronizableDevice(Protocol):
+    """What allocation recovery needs from a device: a default stream it can
+    synchronize. ``max.driver.Device`` satisfies it; host-contract tests use
+    lightweight stand-ins."""
+
+    default_stream: object
+
+
+def _alloc_with_recovery(
+    device: _SynchronizableDevice, nbytes: int
+) -> tuple[object, int]:
+    """One device allocation, with the reactive last resort under the budget.
+
+    When the allocator refuses, the largest reclaimable set is whatever the
+    kernel-call queue still retains: drain it (launching every pending item,
+    waiting builds out), synchronize the device so the stream-ordered frees
+    actually land, and retry exactly once. This cannot defeat size-class
+    carve-up — the arena never splits or merges, which is what the proactive
+    run-ahead budget prevents — but it converts pressure the budget cannot
+    see (a model simply large for the card, external processes) into a
+    stall instead of a failure. Non-OOM errors and a second failure
+    propagate untouched.
+    """
+    holder_mod = _holder_mod()
+    ctx_ptr = _ctx_ptr(device)
+    try:
+        return holder_mod.alloc(ctx_ptr, nbytes)
+    except Exception as exc:
+        from torch_mojo_backend.eager_kernels import call_queue, is_device_oom
+
+        if not is_device_oom(exc):
+            raise
+        sys.stderr.write(
+            f"torch-mojo-backend: device allocation of {nbytes} bytes failed; "
+            f"draining {len(call_queue._QUEUE)} queued launch(es), "
+            "synchronizing, and retrying once...\n"
+        )
+        call_queue.drain()
+        device.default_stream.synchronize()
+        return holder_mod.alloc(ctx_ptr, nbytes)
+
+
 def _row_major_strides(shape) -> tuple[int, ...]:
     strides = [1] * len(shape)
     for i in range(len(shape) - 2, -1, -1):
@@ -339,7 +383,7 @@ class TorchMojoTensor(torch.Tensor):
         """A new contiguous uninitialized tensor (one device allocation)."""
         shape = tuple(shape)
         numel = math.prod(shape)
-        holder, ptr = _holder_mod().alloc(_ctx_ptr(device), numel * dtype.size_in_bytes)
+        holder, ptr = _alloc_with_recovery(device, numel * dtype.size_in_bytes)
         result = cls._make(
             holder,
             ptr,
