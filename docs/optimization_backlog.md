@@ -1213,11 +1213,13 @@ different kind of item.
 > steps of transients stay live at once — observed 71.5 GB across 3,244
 > blocks at batch 12 before a 36 MB `memAlloc` failed and the process
 > aborted. Real training loops survive because their eval/logging reads
-> drain the queue. Workarounds: prime the cache first with
-> `TORCH_MOJO_BACKEND_KERNEL_QUEUE=0` (builds block inline, memory stays
-> bounded), or add any host read to the warm-up loop. The real fix is a
-> run-ahead bound — drain when the retained set crosses a budget —
-> which composes with this entry's cold-start work.
+> drain the queue. **Fixed 2026-08-03**: the queue now meters each item's
+> retained device bytes and the enqueue that crosses the budget
+> (`TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB`, default 8192; 0 disables) drains
+> first, waiting builds out. The same cold read-free loop now completes
+> in 22 s with an 18.6 GB peak (was: abort at 71.5 GB retained), and the
+> warm path is untouched — the meter runs only on the queued branch,
+> which a warm pass never takes.
 
 * **What.** `docs/fast_eager_design.md`, "Measured (H100 PCIe, 24-core host)":
   11.6 s first step with the build pool, 56.3 s without.

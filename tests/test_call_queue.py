@@ -62,9 +62,11 @@ def isolated_queue(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(call_queue, "_HELD_ERROR", [])
     monkeypatch.setattr(call_queue, "_DEVICE_THREAD", [None])
     monkeypatch.setattr(call_queue, "_QUEUE_LAUNCH_THREAD", [None])
+    monkeypatch.setattr(call_queue, "_RETAINED_BYTES", [0])
     yield
     assert not call_queue._QUEUE
     assert not call_queue._HELD_ERROR
+    assert call_queue._RETAINED_BYTES[0] == 0
 
 
 class _StalledBuild:
@@ -416,6 +418,66 @@ def test_a_cold_launch_retains_the_output_it_writes_into(isolated_queue) -> None
     call_queue.drain()
     assert log == ["cold"]
     assert retained() is None  # released right after its launch
+
+
+def test_retention_budget_bounds_cold_run_ahead(
+    isolated_queue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rule 3's bound: a read-free cold storm may not retain unbounded
+    bytes. The enqueue that crosses the budget waits the builds out and
+    launches everything, releasing the retention — the fix for the 70+ GB
+    warm-up abort. Under budget, nothing drains and nothing blocks."""
+
+    class _Payload:
+        _numel = 512
+        _itemsize = 4  # 2 KiB per queued item
+
+    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [3 * 2048])
+
+    log: list[str] = []
+    units = [_FakeUnit(log) for _ in range(4)]
+    retained = []
+    for index, unit in enumerate(units):
+        buf = _Payload()
+        retained.append(weakref.ref(buf))
+        call_queue.kernel_call_into(unit, (f"cold{index}",), (buf,))
+        del buf
+        if index < 3:
+            # At or under budget: still queued, still retained, not blocked.
+            assert call_queue.active()
+            assert retained[index]() is not None
+
+    # The fourth enqueue pushed retention to 8 KiB > 6 KiB: the budget drain
+    # waited out every build and launched the whole queue in FIFO order.
+    assert log == ["cold0", "cold1", "cold2", "cold3"]
+    assert not call_queue.active()
+    assert call_queue._RETAINED_BYTES[0] == 0
+    assert all(ref() is None for ref in retained)
+
+
+def test_retention_budget_holds_launch_errors_for_the_next_drain(
+    isolated_queue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The budget drain serves memory, not a value: a launch failure inside
+    it is held and raised by the next real drain(), per rule 5."""
+
+    class _Payload:
+        _numel = 1024
+        _itemsize = 1
+
+    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [1024])
+
+    log: list[str] = []
+    failure = RuntimeError("exact variant rejected its arguments")
+    failing = _FakeUnit(log, error=failure)
+    call_queue.kernel_call_into(failing, ("failing",), (_Payload(),))
+    call_queue.kernel_call_into(_FakeUnit(log), ("successor",), (_Payload(),))
+
+    assert log == ["failing"]  # the budget drain launched and failed it
+    assert not call_queue.active()  # rule 5 dropped the successor
+    assert call_queue._RETAINED_BYTES[0] == 0
+    with pytest.raises(RuntimeError, match="exact variant rejected"):
+        call_queue.drain()
 
 
 @pytest.mark.parametrize(

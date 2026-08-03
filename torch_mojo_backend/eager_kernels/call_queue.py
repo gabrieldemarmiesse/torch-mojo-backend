@@ -83,10 +83,11 @@ class _QueueUnit(Protocol):
 # A queued launch: exactly one of `unit` (a specialization whose constant
 # `call` entry point writes into preallocated outputs) and `fn` (an
 # always-loaded device call, e.g. tensor_holder's CopyStrided or fa4) is
-# set; then the enqueuing thread (rule 4) and the objects whose buffers the
-# raw `args` name, retained until the item launches (rule 3).
+# set; then the enqueuing thread (rule 4), the objects whose buffers the
+# raw `args` name — retained until the item launches (rule 3) — and the
+# device bytes that retention holds, pre-computed for the run-ahead budget.
 _QueueItem = tuple[
-    _QueueUnit | None, Callable[..., object] | None, tuple, threading.Thread, tuple
+    _QueueUnit | None, Callable[..., object] | None, tuple, threading.Thread, tuple, int
 ]
 
 _LOCK = threading.RLock()  # queue + every device touch (see rule 6)
@@ -96,7 +97,16 @@ _DEVICE_THREAD: list = [None]  # last thread to issue device work (rule 4)
 _QUEUE_LAUNCH_THREAD: list = [None]  # last thread to launch FROM the queue
 _ERROR_TRANSLATOR: list = [None]
 _ENABLED: list = [None]  # memoized enabled(); refresh() invalidates
+_RETAINED_BYTES: list[int] = [0]  # bytes held by queued items (rule 3 budget)
+_BUDGET_BYTES: list = [None]  # memoized budget; refresh() invalidates
 _TLS = threading.local()  # .in_launch
+
+# Default run-ahead bound. During a cold storm the host can enqueue whole
+# training steps ahead of the still-compiling launches, and rule 3 retains
+# every buffer those launches name — unbounded, that carved 70+ GB out of an
+# H100 on a read-free warm-up loop. 8 GiB keeps any current device alive
+# while still allowing thousands of cold launches in flight.
+_DEFAULT_BUDGET_MB = 8192
 
 
 def _compute_enabled() -> bool:
@@ -126,6 +136,35 @@ def enabled() -> bool:
 def refresh() -> None:
     """Re-read the mode environment variables on the next `enabled()`."""
     _ENABLED[0] = None
+    _BUDGET_BYTES[0] = None
+
+
+def _budget_bytes() -> int:
+    """The run-ahead retention bound, in bytes; 0 disables it."""
+    cached = _BUDGET_BYTES[0]
+    if cached is None:
+        raw = os.environ.get("TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB", "")
+        try:
+            megabytes = int(raw) if raw else _DEFAULT_BUDGET_MB
+        except ValueError:
+            megabytes = _DEFAULT_BUDGET_MB
+        cached = _BUDGET_BYTES[0] = max(0, megabytes) * 1024 * 1024
+    return cached
+
+
+def _keepalive_bytes(keepalive: object) -> int:
+    """Device bytes reachable from one item's keep-alive.
+
+    Payload wrappers all expose `_numel`/`_itemsize`; containers are walked;
+    scalars, specs and everything else count zero. Runs once per *queued*
+    item — the warm inline path never calls it.
+    """
+    numel = getattr(keepalive, "_numel", None)
+    if numel is not None:
+        return numel * getattr(keepalive, "_itemsize", 1)
+    if isinstance(keepalive, tuple | list):
+        return sum(_keepalive_bytes(entry) for entry in keepalive)
+    return 0
 
 
 def active() -> bool:
@@ -211,11 +250,18 @@ def _order_queue_launch_locked() -> None:
 
 
 def _exec(item: _QueueItem) -> None:
-    unit, fn, args, _enqueuer, _keepalive = item
+    unit, fn, args, _enqueuer, _keepalive, _nbytes = item
     if unit is None:
         fn(*args)  # type: ignore[misc]  # exactly one of unit/fn is set
         return
     unit.ext.call(*args)  # type: ignore[union-attr]  # readiness checked by caller
+
+
+def _pop_locked() -> _QueueItem:
+    """Pop the head and release its bytes from the retention counter."""
+    item = _QUEUE.popleft()
+    _RETAINED_BYTES[0] -= item[5]
+    return item
 
 
 def _abandon_locked(exc: BaseException) -> BaseException:
@@ -224,6 +270,7 @@ def _abandon_locked(exc: BaseException) -> BaseException:
     item takes its retained references with it), and hand back the
     exception to raise or hold."""
     _QUEUE.clear()
+    _RETAINED_BYTES[0] = 0
     return _translate(exc)
 
 
@@ -246,10 +293,50 @@ def _pump_locked() -> None:
             # The popped item is an unnamed temporary: its retained
             # references drop the moment _exec returns — on this thread,
             # under _LOCK, stream-ordered behind the launch it protected.
-            _exec(_QUEUE.popleft())
+            _exec(_pop_locked())
         except BaseException as exc:
             _HELD_ERROR.append(_abandon_locked(exc))
             return
+
+
+def _drain_over_budget_locked() -> None:
+    """Rule 3's bound: queued items retain more device bytes than the budget
+    allows, so stop running ahead — wait builds out and launch until the
+    retention is released. This drain serves memory, not a value: a launch
+    failure is held for the next real `drain()` exactly as `pump()` holds
+    it, and when an error is already held the queue is a dead episode
+    (rule 5) whose items would never launch — dropping them is what
+    releases their retention. Runs under `_LOCK` with `in_launch` set by
+    the caller."""
+    if _HELD_ERROR:
+        _QUEUE.clear()
+        _RETAINED_BYTES[0] = 0
+        return
+    _order_queue_launch_locked()
+    while _QUEUE:
+        unit = _QUEUE[0][0]
+        try:
+            if unit is not None and unit.ext is None:
+                unit.request_async().wait()  # raises on build failure
+            _exec(_pop_locked())
+        except BaseException as exc:
+            _HELD_ERROR.append(_abandon_locked(exc))
+            return
+
+
+def _enforce_budget_locked() -> None:
+    """Drain when the just-appended item pushed retention past the budget.
+    Skipped inside a launch (a reentrant enqueue must never re-enter the
+    queue) — the outer launch path is already emptying it."""
+    if (
+        _RETAINED_BYTES[0] > _budget_bytes() > 0  # noqa: SIM300 — 0 disables
+        and not getattr(_TLS, "in_launch", False)
+    ):
+        _TLS.in_launch = True
+        try:
+            _drain_over_budget_locked()
+        finally:
+            _TLS.in_launch = False
 
 
 def pump() -> None:
@@ -282,6 +369,7 @@ def drain() -> None:
                 # belongs to the dead episode and goes with it.
                 exc = _HELD_ERROR.pop()
                 _QUEUE.clear()
+                _RETAINED_BYTES[0] = 0
                 raise exc
             if _QUEUE:
                 _order_queue_launch_locked()
@@ -290,7 +378,7 @@ def drain() -> None:
                     try:
                         if unit is not None and unit.ext is None:
                             unit.request_async().wait()  # raises on build failure
-                        _exec(_QUEUE.popleft())
+                        _exec(_pop_locked())
                     except BaseException as exc:
                         raise _abandon_locked(exc)
     finally:
@@ -331,11 +419,14 @@ def kernel_call_into(unit: _QueueUnit, args: tuple, keepalive: tuple) -> None:
     what its pointers depend on."""
     with _LOCK:
         if _launch_prefix(unit):
-            _exec((unit, None, args, threading.current_thread(), keepalive))
+            _exec((unit, None, args, threading.current_thread(), keepalive, 0))
             return
         if unit.ext is None:
             unit.request_async()
-        _QUEUE.append((unit, None, args, threading.current_thread(), keepalive))
+        nbytes = _keepalive_bytes(keepalive)
+        _RETAINED_BYTES[0] += nbytes
+        _QUEUE.append((unit, None, args, threading.current_thread(), keepalive, nbytes))
+        _enforce_budget_locked()
 
 
 def external_call(fn: Callable[..., object], args: tuple, keepalive: tuple) -> None:
@@ -348,4 +439,7 @@ def external_call(fn: Callable[..., object], args: tuple, keepalive: tuple) -> N
         if _launch_prefix(None):
             fn(*args)
             return
-        _QUEUE.append((None, fn, args, threading.current_thread(), keepalive))
+        nbytes = _keepalive_bytes(keepalive)
+        _RETAINED_BYTES[0] += nbytes
+        _QUEUE.append((None, fn, args, threading.current_thread(), keepalive, nbytes))
+        _enforce_budget_locked()
