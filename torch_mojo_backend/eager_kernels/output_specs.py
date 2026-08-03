@@ -70,5 +70,10 @@ def _submit_prepared_into(
     if force_sync or not _call_queue.enabled():
         return prepared.execute()
     out = prepared.extension.allocate_outputs(prepared.output_specs)
-    prepared.enqueue_into(prepared.extension.extension_args(out, *prepared.args))
+    # (out, prepared.args) is the item's keep-alive: every tensor whose
+    # pointer extension_args serialized is reachable through those two
+    # references, including intermediates living only in prepared.args.
+    prepared.enqueue_into(
+        prepared.extension.extension_args(out, *prepared.args), (out, prepared.args)
+    )
     return out

@@ -131,9 +131,13 @@ The queue follows these rules:
    ready prefix.
 2. **Host reads drain.** D2H transfers, scalar reads, synchronization, and
    operations whose result is needed by Python drain pending launches first.
-3. **Keep-alive.** Queued raw pointers do not own their tensors, so prepared
-   calls retain every input, output, and intermediate allocation until the
-   queue drains.
+3. **Keep-alive.** Queued raw pointers do not own their tensors, so every
+   queued item carries the tensors its pointers name and retains them until
+   it launches (or until an error abandons the episode). Each enqueue site
+   states its own retention — the spec route passes its output and prepared
+   arguments, the raw routes name theirs explicitly — and a launched item's
+   references drop on the launching thread, keeping frees stream-ordered
+   behind the launch.
 4. **Thread order.** Direct launches are ordered by their issuing thread and
    cross no barrier between threads (the same regime eager mode has always
    run forward and backward under). Queue launches replay work other threads

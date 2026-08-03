@@ -598,8 +598,8 @@ def _scaled_dot_product_attention_autograd(
     # so every still-pending producer must land first (FIFO granularity: the
     # whole queue drains, which covers q/k/v/attn_mask). The eligibility
     # check above is metadata-only and safe on pending tensors. Buffers
-    # these paths allocate afterwards are retained by `call_queue.note_alloc`,
-    # which has no op bracket to feed here.
+    # these paths allocate afterwards are retained per queued item (queue
+    # rule 3), so no extra bookkeeping is owed here.
     from . import deferred_compile
 
     deferred_compile.drain()

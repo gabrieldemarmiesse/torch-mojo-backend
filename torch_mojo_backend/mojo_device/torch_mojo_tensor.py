@@ -350,9 +350,6 @@ class TorchMojoTensor(torch.Tensor):
             device,
             contiguous=True,
         )
-        from torch_mojo_backend.eager_kernels import call_queue as _cq
-
-        _cq.note_alloc(result)
         return result
 
     @classmethod

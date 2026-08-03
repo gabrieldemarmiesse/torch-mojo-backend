@@ -16,12 +16,14 @@ Correctness rules:
 2. **Host reads drain.** D2H transfers, scalar reads and synchronization
    `drain()` before they touch bytes.
 3. **Keep-alive.** Queued items reference raw pointers, not tensors, so
-   every buffer touched while the queue is non-empty is retained in
-   `_KEEPALIVE` until the queue empties. `dispatch()` brackets each aten op
-   and feeds it that op's args, results and `_alloc`s; `note_alloc` retains
-   directly for the routes that run ABOVE `__torch_dispatch__` (the SDPA /
-   flash-attention autograd nodes), which have no bracket; `external_call`
-   takes an explicit `keepalive` for buffers only its raw pointers name.
+   each item carries the tensors its pointers name and retains them until
+   it launches (or until rule 5 abandons it). Every enqueue names its own
+   retention: the spec route threads `(out, prepared.args)` at its one
+   submit choke point, and the raw routes (`_call_mojo` / `external_call`)
+   pass theirs explicitly — there is no global registry, no dispatch
+   bracket, and no dependence on WHERE the call came from. A launched
+   item's references drop on the launching thread, under `_LOCK`, right
+   after its launch, so the frees stay stream-ordered behind it.
 4. **Thread order.** Direct launches are issued by the thread that runs
    the op and are ordered against that thread's own prior work by
    construction; direct-to-direct launches across threads need no barrier
@@ -81,20 +83,20 @@ class _QueueUnit(Protocol):
 # A queued launch: exactly one of `unit` (a specialization whose constant
 # `call` entry point writes into preallocated outputs) and `fn` (an
 # always-loaded device call, e.g. tensor_holder's CopyStrided or fa4) is
-# set; the trailing element is the enqueuing thread (rule 4).
+# set; then the enqueuing thread (rule 4) and the objects whose buffers the
+# raw `args` name, retained until the item launches (rule 3).
 _QueueItem = tuple[
-    _QueueUnit | None, Callable[..., object] | None, tuple, threading.Thread
+    _QueueUnit | None, Callable[..., object] | None, tuple, threading.Thread, tuple
 ]
 
 _LOCK = threading.RLock()  # queue + every device touch (see rule 6)
 _QUEUE: deque[_QueueItem] = deque()
-_KEEPALIVE: list = []
 _HELD_ERROR: list[BaseException] = []
 _DEVICE_THREAD: list = [None]  # last thread to issue device work (rule 4)
 _QUEUE_LAUNCH_THREAD: list = [None]  # last thread to launch FROM the queue
 _ERROR_TRANSLATOR: list = [None]
 _ENABLED: list = [None]  # memoized enabled(); refresh() invalidates
-_TLS = threading.local()  # .scope, .unscoped, .in_launch
+_TLS = threading.local()  # .in_launch
 
 
 def _compute_enabled() -> bool:
@@ -148,77 +150,6 @@ def _translate(exc: BaseException) -> BaseException:
     except BaseException as better:
         return better
     return exc
-
-
-# ---------------------------------------------------------------------------
-# Keep-alive: queued items hold raw pointers, so the tensors whose buffers
-# they reference must outlive the queue. `dispatch()` brackets every aten op
-# and `_alloc` reports each allocation into the current scope; the routes
-# that run above `__torch_dispatch__` have no bracket and are covered by
-# `note_alloc`'s unscoped path.
-
-
-def op_begin() -> list | None:
-    scope = getattr(_TLS, "scope", None)
-    _TLS.scope = []
-    return scope  # previous scope (restored at op_end; dispatch can nest)
-
-
-def note_alloc(tensor: object) -> None:
-    scope = getattr(_TLS, "scope", None)
-    if scope is not None:
-        scope.append(tensor)
-        return
-    # No dispatch bracket. The SDPA / flash-attention autograd nodes run on
-    # the autograd thread ABOVE __torch_dispatch__, allocate intermediates,
-    # queue launches against their pointers and then drop them immediately.
-    with _LOCK:
-        if _QUEUE:
-            _KEEPALIVE.append(tensor)
-            return
-        # The queue is empty *now*, but the very next call may be the cold
-        # one that starts an episode — and its output is allocated before it
-        # is queued. Park the allocation until that decision is taken
-        # (`_retain_unscoped_locked`) or until another empty-queue
-        # allocation shows the episode never started.
-        pending = getattr(_TLS, "unscoped", None)
-        if pending is None:
-            pending = _TLS.unscoped = []
-        elif pending and _may_release_locked():
-            pending.clear()
-        pending.append(tensor)
-
-
-def _retain_unscoped_locked() -> None:
-    """A launch is about to be queued: adopt the un-bracketed allocations
-    this thread made just before it, which its raw pointers may name."""
-    pending = getattr(_TLS, "unscoped", None)
-    if pending:
-        _KEEPALIVE.extend(pending)
-        pending.clear()
-
-
-def _may_release_locked() -> bool:
-    """True when dropping holders here enqueues their frees behind every
-    launch that could reference them: releasing is stream-ordered on the
-    current thread, so only the thread that issued the launches may do it."""
-    last = _DEVICE_THREAD[0]
-    return last is None or last is threading.current_thread()
-
-
-def op_end(prev: list | None, args: tuple, kwargs: dict, result: object) -> None:
-    scope = getattr(_TLS, "scope", None)
-    _TLS.scope = prev
-    if not _QUEUE:
-        return
-    import torch
-    from torch.utils._pytree import tree_flatten
-
-    flat, _ = tree_flatten((args, kwargs, result))
-    with _LOCK:
-        if scope:
-            _KEEPALIVE.extend(scope)
-        _KEEPALIVE.extend(t for t in flat if isinstance(t, torch.Tensor))
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +211,7 @@ def _order_queue_launch_locked() -> None:
 
 
 def _exec(item: _QueueItem) -> None:
-    unit, fn, args, _enqueuer = item
+    unit, fn, args, _enqueuer, _keepalive = item
     if unit is None:
         fn(*args)  # type: ignore[misc]  # exactly one of unit/fn is set
         return
@@ -289,11 +220,10 @@ def _exec(item: _QueueItem) -> None:
 
 def _abandon_locked(exc: BaseException) -> BaseException:
     """Rule 5: a launch failed, so the episode is over. Everything still
-    queued consumes buffers its producer never wrote — drop the tail and its
-    keep-alive here, under the same lock, and hand back the exception to
-    raise or hold."""
+    queued consumes buffers its producer never wrote — drop the tail (each
+    item takes its retained references with it), and hand back the
+    exception to raise or hold."""
     _QUEUE.clear()
-    _KEEPALIVE.clear()
     return _translate(exc)
 
 
@@ -311,17 +241,15 @@ def _pump_locked() -> None:
     while _QUEUE:
         unit = _QUEUE[0][0]
         if unit is not None and unit.ext is None:
-            return  # still building; the tail keeps its keep-alive
+            return  # still building; unlaunched items keep their references
         try:
+            # The popped item is an unnamed temporary: its retained
+            # references drop the moment _exec returns — on this thread,
+            # under _LOCK, stream-ordered behind the launch it protected.
             _exec(_QUEUE.popleft())
         except BaseException as exc:
             _HELD_ERROR.append(_abandon_locked(exc))
             return
-    # The queue emptied through pump, and reaching here means this thread
-    # both launched every item and is the current device thread, so the
-    # frees released now are stream-ordered behind those launches — the same
-    # state drain() clears in.
-    _KEEPALIVE.clear()
 
 
 def pump() -> None:
@@ -354,7 +282,6 @@ def drain() -> None:
                 # belongs to the dead episode and goes with it.
                 exc = _HELD_ERROR.pop()
                 _QUEUE.clear()
-                _KEEPALIVE.clear()
                 raise exc
             if _QUEUE:
                 _order_queue_launch_locked()
@@ -366,17 +293,6 @@ def drain() -> None:
                         _exec(_QUEUE.popleft())
                     except BaseException as exc:
                         raise _abandon_locked(exc)
-            _KEEPALIVE.clear()
-            # Nothing is queued any more, so no raw pointer can still name a
-            # parked allocation. Releasing it here is what bounds the park:
-            # `note_alloc` otherwise drops it only when the *next* unscoped
-            # allocation arrives, so the most recent one per thread would
-            # outlive every synchronize. With the queue disabled that park is
-            # the only retention there is, and `_KEEPALIVE.clear()` alone
-            # would never free it.
-            pending = getattr(_TLS, "unscoped", None)
-            if pending:
-                pending.clear()
     finally:
         _TLS.in_launch = False
 
@@ -404,34 +320,32 @@ def _launch_prefix(unit: _QueueUnit | None) -> bool:
     return True
 
 
-def kernel_call_into(unit: _QueueUnit, args: tuple) -> None:
+def kernel_call_into(unit: _QueueUnit, args: tuple, keepalive: tuple) -> None:
     """Queue a descriptor call whose outputs were preallocated in Python.
     The call writes into them and returns nothing — always queueable
-    regardless of the *Spec naming convention."""
+    regardless of the *Spec naming convention.
+
+    `keepalive` names the objects whose buffers the raw `args` reference
+    (outputs and inputs; containers are fine — retention chains through
+    them). It is required, not defaulted: every enqueue site must state
+    what its pointers depend on."""
     with _LOCK:
         if _launch_prefix(unit):
-            _exec((unit, None, args, threading.current_thread()))
+            _exec((unit, None, args, threading.current_thread(), keepalive))
             return
         if unit.ext is None:
             unit.request_async()
-        _retain_unscoped_locked()
-        _QUEUE.append((unit, None, args, threading.current_thread()))
+        _QUEUE.append((unit, None, args, threading.current_thread(), keepalive))
 
 
-def external_call(
-    fn: Callable[..., object], args: tuple, keepalive: tuple = ()
-) -> None:
+def external_call(fn: Callable[..., object], args: tuple, keepalive: tuple) -> None:
     """An ungated device call (tensor_holder, fa4): always launchable, but
     must hold its FIFO position behind queued producers of its inputs.
 
     `args` are raw pointers and scalars; `keepalive` names the tensors those
-    pointers belong to, retained until the queue empties (callers above
-    `__torch_dispatch__` have no op bracket to retain them for us)."""
+    pointers belong to, retained on the queued item until it launches."""
     with _LOCK:
         if _launch_prefix(None):
             fn(*args)
             return
-        _retain_unscoped_locked()
-        if keepalive:
-            _KEEPALIVE.extend(keepalive)
-        _QUEUE.append((None, fn, args, threading.current_thread()))
+        _QUEUE.append((None, fn, args, threading.current_thread(), keepalive))

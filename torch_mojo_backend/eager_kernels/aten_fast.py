@@ -89,12 +89,13 @@ from torch_mojo_backend.eager_kernels.tf32_matmul_ops import (
 _VariantFlag = bool | int | str
 
 
-def _device_call(fn: object, *args: object) -> object:
+def _device_call(fn: object, *args: object, keepalive: tuple[object, ...]) -> object:
     """Launch an ungated device call (tensor_holder / fa4): when the call
     queue is active it must hold its FIFO position behind queued producers
-    of its inputs; otherwise call directly."""
+    of its inputs; otherwise call directly. `keepalive` names the tensors
+    whose buffers the raw `args` reference (queue rule 3)."""
     if _call_queue.enabled():
-        return _call_queue.external_call(fn, args)
+        return _call_queue.external_call(fn, args, keepalive)
     return fn(*args)
 
 
@@ -106,8 +107,14 @@ def _call_mojo(
     arg_dtypes: tuple[DType, ...],
     output_dtypes: tuple[DType, ...] = (),
     flags: dict[str, _VariantFlag] | None = None,
+    keepalive: tuple[object, ...],
 ) -> object:
-    """Invoke one exact, shape-independent stateless Mojo extension."""
+    """Invoke one exact, shape-independent stateless Mojo extension.
+
+    `keepalive` names every tensor whose `_spec_of(...)` / raw pointer went
+    into `extension_args`; a queued launch retains them until it runs
+    (queue rule 3). Required and keyword-only so no call site can forget
+    it."""
     try:
         return extension.invoke(
             op,
@@ -115,6 +122,7 @@ def _call_mojo(
             arg_dtypes=arg_dtypes,
             output_dtypes=output_dtypes,
             flags=flags,
+            keepalive=keepalive,
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -371,6 +379,7 @@ def fast_aten__foreach_norm(self, ord=2, dtype=None):
         (metadata, partials._ptr, partials._numel, _ctx_ptr(device)),
         arg_dtypes=(DType.float32, DType.float32, DType.float32),
         output_dtypes=(DType.float32,),
+        keepalive=(partials,),
     )
     return outputs
 
@@ -502,6 +511,7 @@ def _fast__foreach_add__scalar_generic(self, scalar):
         arg_dtypes=(dtype,),
         output_dtypes=(dtype,),
         flags={"INPLACE": True},
+        keepalive=(tensors,),
     )
     return None
 
@@ -555,6 +565,7 @@ def fast_aten__foreach_mul__tensor(self, other):
         arg_dtypes=(DType.float32, DType.float32),
         output_dtypes=(DType.float32,),
         flags={"INPLACE": True},
+        keepalive=(scalar,),
     )
     return None
 
@@ -682,6 +693,7 @@ def _foreach_scalar_inplace(
         arg_dtypes=(DType.float32,),
         output_dtypes=(DType.float32,),
         flags={"INPLACE": True, "OP_CODE": op_code},
+        keepalive=(tensors,),
     )
     return None
 
@@ -769,6 +781,7 @@ def fast_aten__foreach_lerp__scalar(
         arg_dtypes=(DType.float32, DType.float32),
         output_dtypes=(DType.float32,),
         flags={"INPLACE": True, "SMALL_WEIGHT": abs(narrowed_weight) < 0.5},
+        keepalive=(tensors, ends),
     )
     return None
 
@@ -799,6 +812,7 @@ def _foreach_addc_inplace(
         arg_dtypes=(DType.float32, DType.float32, DType.float32),
         output_dtypes=(DType.float32,),
         flags={"INPLACE": True, "OP_CODE": op_code},
+        keepalive=(tensors, firsts, seconds),
     )
     return None
 
@@ -851,6 +865,7 @@ def fast_aten__foreach_sqrt(self: Sequence[torch.Tensor]) -> object:
         (metadata, _ctx_ptr(tensors[0]._device)),
         arg_dtypes=(DType.float32,),
         output_dtypes=(DType.float32,),
+        keepalive=(tensors, outputs),
     )
     return outputs
 
@@ -1023,6 +1038,17 @@ def fast_aten__fused_adamw(
             "GRAD_SCALE": bool(grad_scale_ptr),
             "FOUND_INF": bool(found_inf_ptr),
         },
+        keepalive=(
+            parameters,
+            grads,
+            exp_avgs,
+            exp_avg_sqs,
+            max_exp_avg_sqs,
+            state_steps,
+            lr,
+            grad_scale,
+            found_inf,
+        ),
     )
     return None
 
@@ -1988,6 +2014,7 @@ def _try_spec_scalar(spec_fn_name, x, scalar):
             (_spec_of(a), float(scalar), _spec_of(out)),
             arg_dtypes=(a._dtype,),
             output_dtypes=(out._dtype,),
+            keepalive=(a, out),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -2015,6 +2042,7 @@ def _try_spec_scalar_inplace(spec_fn_name: str, x, scalar) -> bool:
             arg_dtypes=(a._dtype,),
             output_dtypes=(a._dtype,),
             flags={"INPLACE": True},
+            keepalive=(a,),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -2037,6 +2065,7 @@ def _try_spec_int_scalar(spec_fn_name, x, scalar):
             (_spec_of(a), scalar, _spec_of(out)),
             arg_dtypes=(a._dtype,),
             output_dtypes=(out._dtype,),
+            keepalive=(a, out),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -2082,6 +2111,7 @@ def _copy_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
             dst._ptr,
             src._ptr,
             dst._numel * dst._itemsize,
+            keepalive=(dst, src),
         )
     else:
         _copy_strided_into(dst, src)
@@ -2247,6 +2277,7 @@ def _launch_where_bcast(
         ),
         arg_dtypes=tuple(tensor._dtype for tensor in operands),
         output_dtypes=(out._dtype,),
+        keepalive=(out, operands),
     )
 
 
@@ -2320,6 +2351,7 @@ def fast_aten_add_apple(input, other, alpha=1):
                 arg_dtypes=(a._dtype, b._dtype),
                 output_dtypes=(out._dtype,),
                 flags={"INPLACE": False},
+                keepalive=(out, a, b),
             )
         return out
     return _fast_aten_add_default(input, other, alpha)
@@ -2357,6 +2389,7 @@ def fast_aten_add_(input, other, alpha=1):
                 arg_dtypes=(dst._dtype, b._dtype),
                 output_dtypes=(dst._dtype,),
                 flags={"INPLACE": True},
+                keepalive=(dst, b),
             )
         return input
     # A float scalar goes straight into `input`, with no output buffer and no
@@ -2534,6 +2567,7 @@ def fast_aten_fill__scalar(input, value):
             _pad8(a._strides, 0),
             a._dtype.value,
             _ctx_ptr(a._device),
+            keepalive=(a,),
         )
     return input
 
@@ -2706,6 +2740,7 @@ def fast_aten_gelu(input, approximate="none"):
                 arg_dtypes=(a._dtype,),
                 output_dtypes=(out._dtype,),
                 flags={"APPROXIMATE": approximate},
+                keepalive=(out, a),
             )
         return out
     return _unary_spec_op(spec, input)
@@ -2747,6 +2782,7 @@ def fast_aten_gelu_backward(grad_output, self, *, approximate="none"):
             arg_dtypes=(grad._dtype, input._dtype),
             output_dtypes=(out._dtype,),
             flags={"APPROXIMATE": approximate},
+            keepalive=(out, grad, input),
         )
     return out
 
@@ -2829,6 +2865,7 @@ def fast_aten_bitwise_not(input):
             (out._ptr, a._ptr, out._numel, a._dtype.value, _ctx_ptr(a._device)),
             arg_dtypes=(a._dtype,),
             output_dtypes=(out._dtype,),
+            keepalive=(out, a),
         )
     return out
 
@@ -2866,6 +2903,7 @@ def fast_aten_isin(elements, test_elements, *, assume_unique=False, invert=False
             arg_dtypes=(el._dtype, te._dtype),
             output_dtypes=(out._dtype,),
             flags={"INVERT": bool(invert)},
+            keepalive=(out, el, te),
         )
     return out
 
@@ -2968,6 +3006,7 @@ def fast_aten_clamp(input, min=None, max=None):
             arg_dtypes=(a._dtype,),
             output_dtypes=(out._dtype,),
             flags={"HAS_MIN": has_min, "HAS_MAX": has_max},
+            keepalive=(out, a),
         )
     return out
 
@@ -3019,6 +3058,7 @@ def _try_addc(kernel_name, self, tensor1, tensor2, value, allow_int):
             ),
             arg_dtypes=(a._dtype, b._dtype, c._dtype),
             output_dtypes=(out._dtype,),
+            keepalive=(out, a, b, c),
         )
     return out
 
@@ -3549,6 +3589,7 @@ def fast_aten_cat(tensors, dim=0):
                 ),
                 arg_dtypes=(ins[0]._dtype, ins[1]._dtype),
                 output_dtypes=(out._dtype,),
+                keepalive=(out, ins[0], ins[1]),
             )
             return out
     if (
@@ -3585,6 +3626,7 @@ def fast_aten_cat(tensors, dim=0):
                 ),
                 arg_dtypes=tuple(tensor._dtype for tensor in ins),
                 output_dtypes=(out._dtype,),
+                keepalive=(out, ins[0], ins[1], ins[2]),
             )
             return out
     offset = 0
@@ -3607,6 +3649,7 @@ def fast_aten_cat(tensors, dim=0):
                     ),
                     arg_dtypes=(b._dtype,),
                     output_dtypes=(out._dtype,),
+                    keepalive=(out, b),
                 )
             else:
                 # Strided input (e.g. the new-token K/V head-transpose in a
@@ -3668,6 +3711,7 @@ def _try_stack_scalars(
         (tuple(tensor._ptr for tensor in unwrapped), out._ptr, _ctx_ptr(device)),
         arg_dtypes=(DType.float32,),
         output_dtypes=(out._dtype,),
+        keepalive=(tensor, out),
     )
     return out
 
@@ -3726,6 +3770,7 @@ def fast_aten_repeat(input, repeats):
             ),
             arg_dtypes=(t._dtype,),
             output_dtypes=(out._dtype,),
+            keepalive=(out, t),
         )
     return out
 
@@ -3760,6 +3805,7 @@ def _fast_triangular(input, diagonal, upper):
             arg_dtypes=(t._dtype,),
             output_dtypes=(out._dtype,),
             flags={"UPPER": bool(upper)},
+            keepalive=(out, t),
         )
     return out
 
@@ -3812,6 +3858,7 @@ def fast_aten_index(input, indices):
                 ),
                 arg_dtypes=(src._dtype, idx_c._dtype),
                 output_dtypes=(out._dtype,),
+                keepalive=(out, src, idx_c),
             )
         return out
 
@@ -3906,6 +3953,7 @@ def _fast_scatter(input, dim, index, src, value):
             ),
             output_dtypes=(out._dtype,),
             flags={"VALUE_MODE": bool(is_value)},
+            keepalive=(out, idx_c),
         )
     return out
 
@@ -3988,6 +4036,7 @@ def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, e
             ),
             arg_dtypes=(a._dtype, *(stat._dtype for stat in stats)),
             output_dtypes=(out._dtype,),
+            keepalive=(a, stats, out),
         )
         # Inference mode returns empty (0,) tensors for the saved stats.
         return (
@@ -4029,6 +4078,7 @@ def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, e
             beta_t._dtype,
         ),
         output_dtypes=(out._dtype,),
+        keepalive=(out, a, mean_t, var_t, gamma_t, beta_t),
     )
     # Inference mode returns empty (0,) tensors for the saved stats.
     return (out, _alloc((0,), a._dtype, a._device), _alloc((0,), a._dtype, a._device))
@@ -4126,6 +4176,7 @@ def fast_aten_native_dropout(input, p, train):
         ),
         arg_dtypes=(a._dtype,),
         output_dtypes=(output._dtype, mask._dtype),
+        keepalive=(output, mask, a),
     )
     return output, mask
 
@@ -4163,6 +4214,7 @@ def fast_aten_native_dropout_backward(grad_output, mask, scale):
             ),
             arg_dtypes=(grad._dtype, keep._dtype),
             output_dtypes=(grad_input._dtype,),
+            keepalive=(grad_input, grad, keep),
         )
     return grad_input
 
@@ -4252,6 +4304,7 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
             ),
             output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
             flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
+            keepalive=(out, mean, rstd, a, gamma, beta),
         )
         return out, mean, rstd
 
@@ -4276,6 +4329,7 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
         arg_dtypes=(a._dtype, gamma._dtype, beta._dtype),
         output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
         flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
+        keepalive=(out, mean, rstd, a, gamma, beta),
     )
     return out, mean, rstd
 
@@ -4412,6 +4466,16 @@ def fast_aten_native_layer_norm_backward(
             grad_bias._dtype if grad_bias is not None else a._dtype,
         ),
         flags={"OUTPUT_MASK": mask_bits},
+        keepalive=(
+            grad_input,
+            grad_weight,
+            grad_bias,
+            grad,
+            a,
+            saved_mean,
+            saved_rstd,
+            gamma,
+        ),
     )
     return grad_input, grad_weight, grad_bias
 
@@ -4678,6 +4742,7 @@ def _any_all(input, dim, keepdim, is_all):
                 (out._ptr, c._ptr, c._numel, _ctx_ptr(a._device)),
                 arg_dtypes=(c._dtype,),
                 output_dtypes=(out._dtype,),
+                keepalive=(out, c),
             )
             return out
     rdims = _norm_reduce_dims(dim, rank, empty_is_all=False)
@@ -4813,6 +4878,7 @@ def fast_aten__log_softmax_backward_data(
                         ),
                         arg_dtypes=(grad._dtype, saved_output._dtype),
                         output_dtypes=(grad_input._dtype,),
+                        keepalive=(grad_input, grad, saved_output),
                     )
                     return grad_input
                 # Unaligned fresh allocation (never expected): fall through
@@ -4950,6 +5016,7 @@ def fast_aten_nll_loss_forward_output(
             arg_dtypes=(log_probs._dtype, labels_c._dtype),
             output_dtypes=(write_output._dtype, write_total_weight._dtype),
             flags={"REDUCTION": reduction},
+            keepalive=(write_output, write_total_weight, log_probs, labels_c),
         )
 
     if write_output is not output:
@@ -5018,6 +5085,7 @@ def fast_aten_nll_loss_backward_grad_input(
             arg_dtypes=(grad_c._dtype, labels_c._dtype, weight_sum_c._dtype),
             output_dtypes=(write_grad_input._dtype,),
             flags={"REDUCTION": reduction},
+            keepalive=(write_grad_input, grad_c, labels_c, weight_sum_c),
         )
 
     if write_grad_input is not grad_input:
@@ -5098,6 +5166,7 @@ def fast_aten_max_pool2d_with_indices(
                 ),
                 arg_dtypes=(a._dtype,),
                 output_dtypes=(out._dtype, indices._dtype),
+                keepalive=(out, indices, a),
             )
             return out, indices
     return NOT_HANDLED
@@ -5173,6 +5242,7 @@ def fast_aten_avg_pool2d(
                     "COUNT_INCLUDE_PAD": count_include_pad,
                     "HAS_DIVISOR_OVERRIDE": divisor_override is not None,
                 },
+                keepalive=(out, a),
             )
             return out
     return NOT_HANDLED
@@ -5204,6 +5274,7 @@ def fast_aten__adaptive_avg_pool2d(input, output_size):
                 ),
                 arg_dtypes=(a._dtype,),
                 output_dtypes=(out._dtype,),
+                keepalive=(out, a),
             )
             return out
     return NOT_HANDLED
@@ -5266,6 +5337,7 @@ def fast_aten_native_group_norm(input, weight, bias, N, C, HxW, group, eps):
             arg_dtypes=(a._dtype, gamma._dtype, beta._dtype),
             output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
             flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
+            keepalive=(out, mean, rstd, a, gamma, beta),
         )
         return out, mean, rstd
     return NOT_HANDLED
@@ -5320,6 +5392,7 @@ def fast_aten_upsample_bilinear2d(
                 arg_dtypes=(a._dtype,),
                 output_dtypes=(out._dtype,),
                 flags={"ALIGN_CORNERS": bool(align_corners)},
+                keepalive=(out, a),
             )
             return out
     return NOT_HANDLED
@@ -5391,6 +5464,7 @@ def _try_sdpa_causal_bmm(
         arg_dtypes=(a._dtype, b._dtype),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": transpose_b, "CAUSAL_MODE": causal_mode},
+        keepalive=(out, a, b),
     )
     return out
 
@@ -5468,6 +5542,7 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
             arg_dtypes=(q._dtype, k._dtype),
             output_dtypes=(scores._dtype,),
             flags={"TRANSPOSE_B": True, "CAUSAL_MODE": SDPA_CAUSAL_OUT},
+            keepalive=(scores, q, k),
         )
     else:
         # Off Metal, SDPA_CAUSAL_OUT would skip the fully masked output tiles
@@ -5496,6 +5571,7 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
                 arg_dtypes=(q._dtype, k._dtype),
                 output_dtypes=(scores._dtype,),
                 flags={"TRANSPOSE_B": True},
+                keepalive=(scores, q, k),
             )
     probs = _alloc((b * h, q_len, kv_len), q._dtype, q._device)
     # Fused softmax + dropout (Apple f32): one launch writes the pre-dropout
@@ -5543,6 +5619,7 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
             arg_dtypes=(scores._dtype,),
             output_dtypes=(probs._dtype, pdrop._dtype, drop_mask._dtype),
             flags={"CAUSAL": bool(is_causal)},
+            keepalive=(probs, pdrop, drop_mask, scores),
         )
         del scores
         effective_probs = pdrop
@@ -5565,6 +5642,7 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
             arg_dtypes=(scores._dtype,),
             output_dtypes=(probs._dtype,),
             flags={"CAUSAL": bool(is_causal)},
+            keepalive=(probs, scores),
         )
         # All allocations use stream-ordered lifetime management, so releasing
         # the host reference here cannot recycle scores before SoftmaxRows
@@ -5608,6 +5686,7 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
             arg_dtypes=(effective_probs._dtype, v._dtype),
             output_dtypes=(out._dtype,),
             flags={"TRANSPOSE_B": False, "CAUSAL_MODE": SDPA_CAUSAL_A_ROWS},
+            keepalive=(out, effective_probs, v),
         )
     else:
         out = None
@@ -5636,6 +5715,7 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
                 arg_dtypes=(effective_probs._dtype, v._dtype),
                 output_dtypes=(out._dtype,),
                 flags={"TRANSPOSE_B": False},
+                keepalive=(out, effective_probs, v),
             )
     # P_drop is not saved: backward cheaply reconstructs it from P and the bool
     # mask, avoiding one persistent f32 (B,H,L,S) allocation per layer.
@@ -5929,6 +6009,7 @@ def fast_fa4_bf16_d64_causal_forward(
             heads,
             scale_value,
             _ctx_ptr(q._device),
+            keepalive=(q_native, k_native, v_native, out_native, logsumexp),
         )
     else:
         _device_call(
@@ -5943,6 +6024,7 @@ def fast_fa4_bf16_d64_causal_forward(
             heads,
             scale_value,
             _ctx_ptr(q._device),
+            keepalive=(q_native, k_native, v_native, out_native, logsumexp),
         )
     output = fast_aten_transpose(out_native, 1, 2)
     if output is NOT_HANDLED:
@@ -6008,6 +6090,20 @@ def fast_fa4_bf16_d64_causal_backward(
             heads,
             float(scale),
             _ctx_ptr(q_native._device),
+            keepalive=(
+                q_native,
+                k_native,
+                v_native,
+                out_native,
+                dout_native,
+                logsumexp,
+                dq_native,
+                dk_native,
+                dv_native,
+                dpsum,
+                lse_log2,
+                dq_accum,
+            ),
         )
     else:
         _device_call(
@@ -6029,6 +6125,20 @@ def fast_fa4_bf16_d64_causal_backward(
             heads,
             float(scale),
             _ctx_ptr(q_native._device),
+            keepalive=(
+                q_native,
+                k_native,
+                v_native,
+                out_native,
+                dout_native,
+                logsumexp,
+                dq_native,
+                dk_native,
+                dv_native,
+                dpsum,
+                lse_log2,
+                dq_accum,
+            ),
         )
     # TensorHolder destruction enqueues frees after the three kernels on the
     # same context; releasing scratch here never synchronizes the CPU.
@@ -6215,6 +6325,7 @@ def fast_fused_flash_attention_forward(
         arg_dtypes=(q._dtype, k._dtype, v._dtype),
         output_dtypes=(output._dtype, lse._dtype),
         flags={"CAUSAL": bool(is_causal)},
+        keepalive=(output, lse, q, k, v),
     )
     return output, lse, q, k, v
 
@@ -6291,6 +6402,7 @@ def fast_fused_flash_attention_backward(
         arg_dtypes=(g._dtype, q._dtype, k._dtype, v._dtype, o._dtype, l._dtype),
         output_dtypes=(grad_query._dtype, grad_key._dtype, grad_value._dtype),
         flags={"CAUSAL": bool(is_causal)},
+        keepalive=(grad_query, grad_key, grad_value, g, q, k, v, o, l),
     )
     return grad_query, grad_key, grad_value
 
@@ -6584,6 +6696,7 @@ def fast_sdpa_dropout_softmax_backward(
         arg_dtypes=(probs._dtype, grad._dtype) + ((mask._dtype,) if has_mask else ()),
         output_dtypes=(out._dtype,),
         flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
+        keepalive=(out, probs, grad, mask),
     )
     return out
 
@@ -6716,6 +6829,7 @@ def fast_sdpa_backward(
             + ((mask._dtype,) if has_mask else ()),
             output_dtypes=(grad_value._dtype,),
             flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
+            keepalive=(grad_value, probs, grad, mask),
         )
 
     grad_query = None
@@ -6738,6 +6852,7 @@ def fast_sdpa_backward(
                 arg_dtypes=(grad._dtype, v._dtype),
                 output_dtypes=(grad_probs._dtype,),
                 flags={"TRANSPOSE_B": True, "CAUSAL_MODE": SDPA_CAUSAL_OUT},
+                keepalive=(grad_probs, grad, v),
             )
         else:
             _call_mojo(
@@ -6754,6 +6869,7 @@ def fast_sdpa_backward(
                 arg_dtypes=(grad._dtype, v._dtype),
                 output_dtypes=(grad_probs._dtype,),
                 flags={"TRANSPOSE_B": True},
+                keepalive=(grad_probs, grad, v),
             )
         del v
         grad_scores = _alloc((batch_heads, q_len, kv_len), DType.float32, device)
@@ -6778,6 +6894,7 @@ def fast_sdpa_backward(
             + ((mask._dtype,) if has_mask else ()),
             output_dtypes=(grad_scores._dtype,),
             flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
+            keepalive=(grad_scores, probs, grad_probs, mask),
         )
         del grad_probs
         if need_query:
@@ -6798,6 +6915,7 @@ def fast_sdpa_backward(
                     arg_dtypes=(grad_scores._dtype, k._dtype),
                     output_dtypes=(grad_query._dtype,),
                     flags={"TRANSPOSE_B": False, "CAUSAL_MODE": SDPA_CAUSAL_A_ROWS},
+                    keepalive=(grad_query, grad_scores, k),
                 )
             else:
                 _call_mojo(
@@ -6814,6 +6932,7 @@ def fast_sdpa_backward(
                     arg_dtypes=(grad_scores._dtype, k._dtype),
                     output_dtypes=(grad_query._dtype,),
                     flags={"TRANSPOSE_B": False},
+                    keepalive=(grad_query, grad_scores, k),
                 )
             del k
         if need_key:
@@ -6834,6 +6953,7 @@ def fast_sdpa_backward(
                 arg_dtypes=(grad_scores._dtype, q._dtype),
                 output_dtypes=(grad_key._dtype,),
                 flags={"HAS_MASK": False, "CAUSAL": bool(is_causal)},
+                keepalive=(grad_key, grad_scores, q),
             )
             del q
         del grad_scores
@@ -6954,6 +7074,7 @@ def _try_bf16_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         + ((bias_tensor._dtype,) if bias_tensor is not None else ()),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": bool(transpose_b), "HAS_BIAS": bias_tensor is not None},
+        keepalive=(out, lhs, rhs, bias_tensor),
     )
     return out
 
@@ -7036,6 +7157,7 @@ def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         + ((bias_tensor._dtype,) if bias_tensor is not None else ()),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": bool(transpose_b), "HAS_BIAS": bias_tensor is not None},
+        keepalive=(out, lhs, rhs, bias_tensor),
     )
     return out
 
@@ -7094,6 +7216,7 @@ def _try_bf16_bmm(a, b, *, transpose_b=False):
         arg_dtypes=(lhs._dtype, rhs._dtype),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": bool(transpose_b)},
+        keepalive=(out, lhs, rhs),
     )
     return out
 
@@ -7160,6 +7283,7 @@ def _try_tf32_bmm(a, b, *, transpose_b=False):
         arg_dtypes=(lhs._dtype, rhs._dtype),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": bool(transpose_b)},
+        keepalive=(out, lhs, rhs),
     )
     return out
 
@@ -7519,6 +7643,7 @@ def fast_aten_convolution(
                     ),
                     arg_dtypes=(a._dtype,),
                     output_dtypes=(col._dtype,),
+                    keepalive=(col, a),
                 )
                 col_ptr = col._ptr
             out = _alloc((n, out_c, cols), a._dtype, a._device)
@@ -7541,6 +7666,7 @@ def fast_aten_convolution(
                     # tuple, matmul_ops._bmm_go), so naming it here would only
                     # fork this call site onto a second .so of identical code.
                     flags={"TRANSPOSE_B": False},
+                    keepalive=(out, w),
                 )
             else:
                 # Channel-major im2col rows make each group a contiguous
@@ -7571,6 +7697,7 @@ def fast_aten_convolution(
                             arg_dtypes=(w._dtype, a._dtype),
                             output_dtypes=(out._dtype,),
                             flags={"TRANSPOSE_B": False},
+                            keepalive=(out, w),
                         )
             if bias_t is not None:
                 _call_mojo(
@@ -7585,6 +7712,7 @@ def fast_aten_convolution(
                     ),
                     arg_dtypes=(out._dtype, bias_t._dtype),
                     output_dtypes=(out._dtype,),
+                    keepalive=(out, bias_t),
                 )
             return _view_of(
                 out,
@@ -7700,6 +7828,7 @@ def fast_aten_scaled_dot_product_attention(
                 ),
                 arg_dtypes=(q._dtype, k._dtype, v._dtype),
                 output_dtypes=(out._dtype,),
+                keepalive=(q, k, v, out),
             )
             return out
         result = _sdpa_math_forward_with_dropout(
@@ -7800,6 +7929,7 @@ def fast_aten_embedding(
             ),
             arg_dtypes=(table._dtype, idx._dtype),
             output_dtypes=(out._dtype,),
+            keepalive=(out, table, idx),
         )
     return out
 
@@ -7863,6 +7993,7 @@ def fast_aten_embedding_dense_backward(
             ),
             arg_dtypes=(grad._dtype, idx._dtype),
             output_dtypes=(grad_weight._dtype,),
+            keepalive=(grad_weight, grad, idx),
         )
     return grad_weight
 
@@ -7915,6 +8046,7 @@ def fast_arange(numel, start, step, dtype: DType, device):
             (out._ptr, float(start), float(step), numel, dtype.value, _ctx_ptr(device)),
             arg_dtypes=(),
             output_dtypes=(out._dtype,),
+            keepalive=(out,),
         )
     return out
 

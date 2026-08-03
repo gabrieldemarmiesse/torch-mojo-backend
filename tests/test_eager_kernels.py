@@ -7011,11 +7011,11 @@ def test_fast_log_softmax_does_not_retain_python_output_cycle(mojo_gpu):
     output_ref = weakref.ref(output)
 
     # Drop the reference the kernel-call queue is *entitled* to hold first: a
-    # queued launch names its operands by raw pointer, so `_KEEPALIVE` keeps
-    # every tensor of an in-flight op alive until the launch has run. That
-    # retention is not the cycle under test -- it ends at the synchronize --
-    # and without this the assertion below would pass or fail on whether the
-    # queue happened to be empty rather than on the Python graph.
+    # queued launch names its operands by raw pointer, so its item retains
+    # every tensor it touches until the launch has run. That retention is
+    # not the cycle under test -- it ends at the synchronize -- and without
+    # this the assertion below would pass or fail on whether the queue
+    # happened to be empty rather than on the Python graph.
     torch.accelerator.synchronize()
 
     del output

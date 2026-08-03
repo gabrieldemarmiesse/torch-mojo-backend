@@ -423,7 +423,6 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
 
     queue = eager_kernels.call_queue
     monkeypatch.setattr(queue, "_QUEUE", deque())
-    monkeypatch.setattr(queue, "_KEEPALIVE", [])
     monkeypatch.setattr(queue, "_HELD_ERROR", [])
     monkeypatch.setattr(queue, "_DEVICE_THREAD", [None])
     monkeypatch.setattr(queue, "_QUEUE_LAUNCH_THREAD", [None])
@@ -435,8 +434,8 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
     second = _ElementwiseAdd.prepare(
         _TensorMetadata((9,), "float32"), _TensorMetadata((9,), "float32")
     )
-    first.enqueue_into(("first",), loader)
-    second.enqueue_into(("second",), loader)
+    first.enqueue_into(("first",), (), loader)
+    second.enqueue_into(("second",), (), loader)
     assert queue.active()
 
     module = ModuleType("queued_elementwise_add")

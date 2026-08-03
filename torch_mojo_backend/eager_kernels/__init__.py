@@ -804,12 +804,17 @@ class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
     def enqueue_into(
         self,
         extension_args: tuple[object, ...],
+        keepalive: tuple[object, ...],
         loader: MojoExtensionLoader | None = None,
     ) -> None:
-        """Queue a non-returning `call(..., out)` into preallocated outputs."""
+        """Queue a non-returning `call(..., out)` into preallocated outputs.
+
+        `keepalive` names the objects whose buffers `extension_args`'
+        raw pointers reference; the queued item retains them until it
+        launches (queue rule 3)."""
         selected_loader = loader or MOJO_EXTENSION_LOADER
         unit = selected_loader.unit_canonical(self.extension.MOJO_FILE, self.defines)
-        call_queue.kernel_call_into(unit, extension_args)
+        call_queue.kernel_call_into(unit, extension_args, keepalive)
 
 
 class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
@@ -1007,8 +1012,13 @@ class MojoFileExtension(MojoExtension[object, object]):
         arg_dtypes: tuple[DType | str, ...],
         output_dtypes: tuple[DType | str, ...] = (),
         flags: Mapping[str, DefineValue] | None = None,
+        keepalive: tuple[object, ...],
     ) -> object:
-        """Compile/load this exact variant, preserving the launch FIFO."""
+        """Compile/load this exact variant, preserving the launch FIFO.
+
+        `keepalive` names the tensors whose buffers `extension_args`' raw
+        specs and pointers reference (queue rule 3). Required and
+        keyword-only so no call site can forget it."""
         prepared = cls.prepare(
             op,
             extension_args,
@@ -1017,7 +1027,7 @@ class MojoFileExtension(MojoExtension[object, object]):
             flags=flags,
         )
         if call_queue.enabled():
-            prepared.enqueue_into(extension_args)
+            prepared.enqueue_into(extension_args, keepalive)
             return None
         return prepared.execute()
 

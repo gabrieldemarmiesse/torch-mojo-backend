@@ -9,9 +9,11 @@ compiled units are still building — those wait in the kernel-call queue
 kernel compilation. This layer contributes exactly three things:
 
 - pump the call queue at every dispatch entry (launch the ready prefix);
-- drain it before device work that would bypass the queue (see below);
-- bracket each op so every buffer it touches is kept alive while queued
-  launches still hold raw pointers to it (``op_begin``/``op_end``).
+- drain it before device work that would bypass the queue (see below).
+
+Buffer retention is not this layer's job: every queued item carries the
+tensors its raw pointers name (queue rule 3), stated explicitly at each
+enqueue site.
 
 Host reads drain where they touch bytes — ``_to_cpu_tensor``,
 ``read_scalar`` behind ``aten::_local_scalar_dense``, ``__dlpack__`` — not
@@ -89,13 +91,7 @@ def dispatch(func: object, args: tuple, kwargs: dict) -> object:
     ):
         call_queue.drain()
 
-    prev = call_queue.op_begin()
-    result = None
-    try:
-        result = _direct(func, args, kwargs)
-        return result
-    finally:
-        call_queue.op_end(prev, args, kwargs, result)
+    return _direct(func, args, kwargs)
 
 
 def drain() -> None:

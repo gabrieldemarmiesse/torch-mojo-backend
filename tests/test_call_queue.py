@@ -17,6 +17,7 @@ is what the queue does *around* a launch.
 import copy
 import gc
 import threading
+import weakref
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
@@ -58,15 +59,9 @@ def isolated_queue(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     swapped for a fresh object, so nothing leaks into the process-wide queue
     (and no device is needed)."""
     monkeypatch.setattr(call_queue, "_QUEUE", deque())
-    monkeypatch.setattr(call_queue, "_KEEPALIVE", [])
     monkeypatch.setattr(call_queue, "_HELD_ERROR", [])
     monkeypatch.setattr(call_queue, "_DEVICE_THREAD", [None])
     monkeypatch.setattr(call_queue, "_QUEUE_LAUNCH_THREAD", [None])
-    # Per-thread state too: an earlier GPU test on this worker may have
-    # parked an un-bracketed allocation that the first queued launch here
-    # would otherwise adopt into the keep-alive list.
-    monkeypatch.setattr(call_queue._TLS, "scope", None, raising=False)
-    monkeypatch.setattr(call_queue._TLS, "unscoped", [], raising=False)
     yield
     assert not call_queue._QUEUE
     assert not call_queue._HELD_ERROR
@@ -204,6 +199,10 @@ class _FakeUnit:
         self.ext = self.extension
 
 
+class _Buffer:
+    """A weakref-able stand-in for a tensor a queued item retains."""
+
+
 # ---------------------------------------------------------------------------
 # Queue contracts, host-only
 
@@ -220,14 +219,15 @@ def test_launch_error_ends_the_episode_at_the_next_drain(isolated_queue) -> None
     first = _FakeUnit(log)
     failing = _FakeUnit(log, error=failure)
     successor = _FakeUnit(log)
-    buffer = object()
+    buffer = _Buffer()
+    retained = weakref.ref(buffer)
 
-    call_queue.kernel_call_into(first, ("first",))
-    call_queue.kernel_call_into(failing, ("failing",))
-    call_queue.kernel_call_into(successor, ("successor",))
-    call_queue.note_alloc(buffer)
+    call_queue.kernel_call_into(first, ("first",), ())
+    call_queue.kernel_call_into(failing, ("failing",), ())
+    call_queue.kernel_call_into(successor, ("successor",), (buffer,))
+    del buffer
     assert call_queue.active()
-    assert call_queue._KEEPALIVE == [buffer]
+    assert retained() is not None  # the queued item retains its operands
 
     call_queue.pump()  # head still building: nothing launches, nothing raises
     assert log == []
@@ -237,7 +237,7 @@ def test_launch_error_ends_the_episode_at_the_next_drain(isolated_queue) -> None
     call_queue.pump()  # launch error is held, not raised here
     assert log == ["first", "failing"]
     assert not call_queue.active()
-    assert call_queue._KEEPALIVE == []
+    assert retained() is None  # abandoned items drop their references
 
     with pytest.raises(RuntimeError, match="exact variant rejected"):
         call_queue.drain()
@@ -247,7 +247,7 @@ def test_launch_error_ends_the_episode_at_the_next_drain(isolated_queue) -> None
     call_queue.drain()  # the episode is over: a clean, silent no-op
     assert log == ["first", "failing"]
 
-    call_queue.kernel_call_into(_FakeUnit(log, ready=True), ("after",))
+    call_queue.kernel_call_into(_FakeUnit(log, ready=True), ("after",), ())
     assert log == ["first", "failing", "after"]
 
 
@@ -260,15 +260,18 @@ def test_build_failure_behind_a_queued_launch_surfaces_from_drain(
     doomed = _FakeUnit(log, build_error=failure)
     successor = _FakeUnit(log)
 
-    call_queue.kernel_call_into(doomed, ("doomed",))
-    call_queue.kernel_call_into(successor, ("successor",))
+    buffer = _Buffer()
+    retained = weakref.ref(buffer)
+    call_queue.kernel_call_into(doomed, ("doomed",), ())
+    call_queue.kernel_call_into(successor, ("successor",), (buffer,))
+    del buffer
 
     with pytest.raises(ImportError, match="mojo build failed"):
         call_queue.drain()
 
     assert log == []
     assert not call_queue.active()
-    assert call_queue._KEEPALIVE == []
+    assert retained() is None  # the abandoned tail released its references
 
 
 def test_queued_launch_out_of_memory_is_still_reported_as_such(isolated_queue) -> None:
@@ -282,7 +285,7 @@ def test_queued_launch_out_of_memory_is_still_reported_as_such(isolated_queue) -
     )
     unit = _FakeUnit(log, error=oom)
 
-    call_queue.kernel_call_into(unit, ("oom",))
+    call_queue.kernel_call_into(unit, ("oom",), ())
     unit.ready()
     call_queue.pump()
 
@@ -305,14 +308,14 @@ def test_thread_switch_synchronizes_once_and_keeps_fifo(
     log: list[str] = []
 
     warm = _FakeUnit(log, ready=True)
-    call_queue.kernel_call_into(warm, ("warm",))  # runs inline on this thread
+    call_queue.kernel_call_into(warm, ("warm",), ())  # runs inline on this thread
     assert log == ["warm"]
     assert syncs == []  # first device work of the episode: no switch yet
 
     first = _FakeUnit(log)
     second = _FakeUnit(log)
-    call_queue.kernel_call_into(first, ("first",))
-    call_queue.kernel_call_into(second, ("second",))
+    call_queue.kernel_call_into(first, ("first",), ())
+    call_queue.kernel_call_into(second, ("second",), ())
     first.ready()
     second.ready()
 
@@ -340,32 +343,35 @@ def test_a_drain_reached_from_inside_a_launch_does_not_reorder(isolated_queue) -
     no-op, or the item already popped launches after its successors and
     against a keep-alive list the nested drain has cleared."""
     log: list[str] = []
+    in_flight = weakref.ref(buffer := _Buffer())
+    queued = weakref.ref(follower_buffer := _Buffer())
 
     class _ReentrantExtension:
         def call(self, label: str) -> None:
             log.append(f"{label}:enter")
             call_queue.drain()
             call_queue.pump()
-            # This launch is still in flight: freeing its buffers here is
-            # exactly the use-after-free the keep-alive list exists to stop.
-            assert call_queue._KEEPALIVE == [buffer]
+            # This launch is still in flight: its item (a popped temporary on
+            # the launching frame) must still retain its buffers, and the
+            # nested no-op drain must not have released the follower's.
+            assert in_flight() is not None
+            assert queued() is not None
             log.append(f"{label}:exit")
 
     reentrant = _FakeUnit(log)
     reentrant.extension = _ReentrantExtension()  # type: ignore[assignment]
     follower = _FakeUnit(log)
-    buffer = object()
 
-    call_queue.kernel_call_into(reentrant, ("first",))
-    call_queue.kernel_call_into(follower, ("second",))
-    call_queue.note_alloc(buffer)
+    call_queue.kernel_call_into(reentrant, ("first",), (buffer,))
+    call_queue.kernel_call_into(follower, ("second",), (follower_buffer,))
+    del buffer, follower_buffer
     reentrant.ready()
     follower.ready()
     call_queue.drain()
 
     assert log == ["first:enter", "first:exit", "second"]
     assert not call_queue.active()
-    assert call_queue._KEEPALIVE == []  # released once, at the end
+    assert in_flight() is None and queued() is None  # released at launch
 
 
 def test_external_calls_hold_their_fifo_position(isolated_queue) -> None:
@@ -374,42 +380,42 @@ def test_external_calls_hold_their_fifo_position(isolated_queue) -> None:
     inputs, and its keep-alive is explicit."""
     log: list[str] = []
     producer = _FakeUnit(log)
-    buffer = object()
+    retained = weakref.ref(buffer := _Buffer())
 
-    call_queue.kernel_call_into(producer, ("producer",))
-    call_queue.external_call(log.append, ("consumer",), keepalive=(buffer,))
+    call_queue.kernel_call_into(producer, ("producer",), ())
+    call_queue.external_call(log.append, ("consumer",), (buffer,))
+    del buffer
     assert log == []
-    assert call_queue._KEEPALIVE == [buffer]
+    assert retained() is not None  # the queued item retains it
 
     producer.ready()
     call_queue.drain()
     assert log == ["producer", "consumer"]
-    assert call_queue._KEEPALIVE == []
+    assert retained() is None  # released once its launch ran
 
 
 def test_external_call_runs_inline_when_nothing_is_queued(isolated_queue) -> None:
     log: list[str] = []
-    call_queue.external_call(log.append, ("now",))
+    call_queue.external_call(log.append, ("now",), ())
     assert log == ["now"]
     assert not call_queue.active()
 
 
-def test_unscoped_allocations_are_retained_for_the_launch_they_precede(
-    isolated_queue,
-) -> None:
-    """The SDPA/flash-attention autograd nodes run above __torch_dispatch__,
-    so there is no op bracket: an output allocated just before a cold launch
-    would otherwise be freed while the queue still holds its pointer."""
+def test_a_cold_launch_retains_the_output_it_writes_into(isolated_queue) -> None:
+    """Rule 3, per item: the SDPA/flash-attention autograd nodes run above
+    __torch_dispatch__ and drop their intermediates as soon as they queue a
+    launch against them — the queued item itself must keep them alive."""
     log: list[str] = []
-    out = object()
+    retained = weakref.ref(out := _Buffer())
 
-    call_queue.note_alloc(out)  # queue empty at allocation time
-    call_queue.kernel_call_into(_FakeUnit(log), ("cold",))
+    call_queue.kernel_call_into(_FakeUnit(log), ("cold",), (out,))
+    del out
 
-    assert call_queue._KEEPALIVE == [out]
+    assert retained() is not None  # only the queued item holds it now
     call_queue._QUEUE[0][0].ready()
     call_queue.drain()
-    assert call_queue._KEEPALIVE == []
+    assert log == ["cold"]
+    assert retained() is None  # released right after its launch
 
 
 @pytest.mark.parametrize(
