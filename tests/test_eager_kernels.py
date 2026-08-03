@@ -2726,6 +2726,74 @@ def test_fast_mm_addmm(mojo_gpu):
     torch.testing.assert_close(dev, a @ b, atol=5e-2, rtol=5e-2)
 
 
+# Every layout arm of `_matmul_spec_operands_launch`: Python hands strided
+# operands straight to it, so a copy-free route reading the wrong strides -- or
+# a missing scratch copy -- shows up here rather than as a wrong training loss.
+# Queued and inline launches both, because a queued launch cannot fall back.
+def _strided_matmul_cases(device: torch.device) -> list[tuple[str, object, object]]:
+    def to(x: torch.Tensor) -> torch.Tensor:
+        return x.to(device)
+
+    dense_a = torch.randn(64, 48)
+    dense_b = torch.randn(48, 32)
+    wide = torch.randn(48, 128)
+    batched = torch.randn(4, 24, 32)
+    batched_b = torch.randn(4, 24, 16)
+    return [
+        # arm 2: contiguous A, strided B
+        ("strided_b", to(dense_a), to(wide)[:, ::2]),
+        # arm 3: strided A, contiguous B -- the weight-gradient shape, and the
+        # one the gfx942 TN and Apple TA routes claim
+        ("transposed_a", to(torch.randn(48, 64)).t(), to(dense_b)),
+        # arm 3 with an offset view, so the route may not assume offset 0
+        ("narrowed_a", to(torch.randn(80, 64))[8:56].t(), to(dense_b)),
+        # arm 4: both strided
+        ("both_strided", to(torch.randn(48, 64)).t(), to(wide)[:, ::2]),
+        # stride-0 broadcast reads
+        ("expanded_a", to(torch.randn(1, 48)).expand(64, 48), to(dense_b)),
+        # rank>2 activation with a strided leading dim
+        ("rank3_strided", to(torch.randn(8, 64, 48))[::2], to(dense_b)),
+        # batched, with the two matmul dims transposed
+        ("bmm_transposed", to(batched).transpose(1, 2), to(batched_b)),
+    ]
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_matmul_every_strided_layout_arm(mojo_gpu, monkeypatch, queued):
+    monkeypatch.setenv("TORCH_MOJO_BACKEND_KERNEL_QUEUE", "1" if queued else "0")
+    for label, a, b in _strided_matmul_cases(mojo_gpu):
+        expected = a.cpu() @ b.cpu()
+        got = (a @ b).cpu()
+        torch.testing.assert_close(
+            got,
+            expected,
+            atol=5e-2,
+            rtol=5e-2,
+            msg=lambda m, label=label: f"{label}: {m}",
+        )
+
+
+def test_addmm_strided_bias_and_operands(mojo_gpu):
+    a = torch.randn(48, 64).to(mojo_gpu).t()
+    b = torch.randn(48, 32).to(mojo_gpu)
+    bias = torch.randn(64).to(mojo_gpu)[::2]
+    got = torch.addmm(bias, a, b).cpu()
+    torch.testing.assert_close(
+        got, torch.addmm(bias.cpu(), a.cpu(), b.cpu()), atol=5e-2, rtol=5e-2
+    )
+
+
+def test_matmul_float64_raises_at_the_call_and_not_at_the_drain(mojo_gpu):
+    # The Mojo matmul carries no float64 instantiation.  Declining it in Python
+    # turns what used to be a plausible-looking tensor plus an "unsupported
+    # dtype" raised much later, at the next drain, into an error at the call
+    # that caused it.
+    a = torch.randn(32, 24, dtype=torch.float64).to(mojo_gpu)
+    b = torch.randn(24, 16, dtype=torch.float64).to(mojo_gpu)
+    with pytest.raises(NotImplementedError, match="aten::mm"):
+        (a @ b).cpu()
+
+
 @pytest.mark.parametrize(
     "in_features,out_features", [(768, 2304), (4096, 1024), (992, 3001), (768, 50257)]
 )

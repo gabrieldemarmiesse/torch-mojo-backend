@@ -65,6 +65,10 @@ comptime _MAX_GRID = 65535
 # Every staging decision below is sized against this budget instead of the
 # 48 KiB footprint that fits the other targets.
 comptime _SMEM_BUDGET = 32 * 1024 if has_apple_gpu_accelerator() else 64 * 1024
+# The 64 KiB arm is a ceiling for AMD's LDS, not a licence: NVIDIA caps *static*
+# shared memory at 48 KiB, and this budget only stays under it because the
+# `chunks <= 6` conjunct below caps staging at 48 KiB.  Raising that conjunct
+# without lowering this number would emit a block NVIDIA refuses to launch.
 # The widest warp-per-row chunk count whose staging fits the budget: c8 stages
 # 32 KiB of `q` alone, which leaves Apple no room for even the unstaged `xh`
 # stub, so rows that wide take `_dx_generic` there.

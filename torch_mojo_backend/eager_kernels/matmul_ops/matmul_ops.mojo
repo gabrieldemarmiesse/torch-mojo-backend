@@ -6639,8 +6639,9 @@ def _causal_bmm_go(
 # tier dispatch — in one boundary call. The GEMV-vs-GEMM tier ladder stays
 # in the shared dispatch helpers below (tier choice on scalar fields is
 # Mojo's job); the FAMILY choice (matmul vs linear-with-bias vs bmm) stays
-# in Python. Failed checks raise a real NotImplementedError ("take the
-# classic path", which materializes non-contiguous operands).
+# in Python. Failed checks raise a real NotImplementedError, which declines
+# the spec route; operand layout is not one of those checks, since
+# `_matmul_spec_operands_launch` handles strided operands itself.
 # ---------------------------------------------------------------------------
 
 
@@ -6843,8 +6844,13 @@ def _matmul_spec_operands_launch(
         # cannot cover the device even split along K, and then the copy runs as
         # before.
         comptime if _accelerator_arch() == "amdgpu:gfx942":
+            # `_accelerator_arch()` is the build target, not the context: a
+            # gfx942 build also serves the CPU mojo device, whose context has
+            # no multiprocessor count and cannot take a GPU launch.  The Apple
+            # route above declines CPU for the same reason.
             if (
-                not has_bias
+                ctx.api() != "cpu"
+                and not has_bias
                 and batch == 1
                 and transpose_b == 0
                 and a.dtype == DType.bfloat16

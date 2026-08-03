@@ -1599,6 +1599,10 @@ def _try_spec_add_f32_bf16(lhs, rhs):
 _SPEC_FLOAT_DTYPES = frozenset(
     {DType.float32, DType.float16, DType.bfloat16, DType.float64}
 )
+# The matmul bridges instantiate `op_utils.FLOAT_DTYPES`, which has no float64
+# entry, so an f64 matmul reaches the kernel only to raise "unsupported dtype"
+# at launch -- and a queued launch cannot fall back.  Decline it in Python.
+_SPEC_MATMUL_DTYPES = _SPEC_FLOAT_DTYPES - {DType.float64}
 _SPEC_UNARY_DIRECT_NAMES = frozenset({"ReluSpec", "AbsSpec", "NegSpec", "SignSpec"})
 # Ops eligible for the queued Into form via _try_spec_unary, with the
 # dtype rule the Mojo prologue enforces (a queued launch cannot fall back).
@@ -1936,7 +1940,7 @@ def _spec_matmul_out_shape(
     """
     a = ts[0]
     b = ts[1]
-    if a._dtype != b._dtype or a._dtype not in _SPEC_FLOAT_DTYPES:
+    if a._dtype != b._dtype or a._dtype not in _SPEC_MATMUL_DTYPES:
         return None
     if a._device != b._device:
         return None
@@ -7147,9 +7151,10 @@ def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     # This gate is a numerics decision, not a capability one: TF32 drops
     # mantissa bits, and "highest" (PyTorch's default) is the user asking for
     # full FP32.  Do not relax it to widen layout support -- that would change
-    # results silently.  It does mean the one bridge that accepts an arbitrary
-    # 2D layout is off by default for FP32; `_try_spec_matmul` owns the
-    # copy-and-retry backstop that keeps strided FP32 operands working.
+    # results silently.  It does mean this bridge is off by default for FP32,
+    # so a strided FP32 operand falls through to the spec path, where
+    # `_matmul_spec_operands_launch` reads it in place on the targets that
+    # have a route for it and scratch-copies on the rest.
     if torch.get_float32_matmul_precision() == "highest":
         return None
     lhs = _t(a)
