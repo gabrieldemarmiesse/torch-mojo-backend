@@ -420,6 +420,48 @@ def test_a_cold_launch_retains_the_output_it_writes_into(isolated_queue) -> None
     assert retained() is None  # released right after its launch
 
 
+def test_budget_is_computed_from_free_device_memory(
+    isolated_queue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the env override, the bound adapts to the device: half the
+    smallest free-VRAM figure across the accelerators, floored at 1 GiB,
+    falling back to 8 GiB when nothing can report memory statistics."""
+    import torch_mojo_backend
+
+    class _FakeAccelerator:
+        def __init__(self, free: int) -> None:
+            self.stats = {"free_memory": free, "total_memory": free}
+
+    gib = 1024 * 1024 * 1024
+    monkeypatch.delenv("TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB", raising=False)
+
+    monkeypatch.setattr(
+        torch_mojo_backend,
+        "get_accelerators",
+        lambda: [_FakeAccelerator(60 * gib), _FakeAccelerator(20 * gib)],
+    )
+    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [None])
+    assert call_queue._budget_bytes() == 10 * gib  # half the smallest
+
+    monkeypatch.setattr(
+        torch_mojo_backend, "get_accelerators", lambda: [_FakeAccelerator(gib)]
+    )
+    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [None])
+    assert call_queue._budget_bytes() == gib  # floored at 1 GiB
+
+    def _no_accelerators() -> list[object]:
+        raise RuntimeError("no driver on this host")
+
+    monkeypatch.setattr(torch_mojo_backend, "get_accelerators", _no_accelerators)
+    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [None])
+    assert call_queue._budget_bytes() == 8192 * 1024 * 1024  # fallback
+
+    monkeypatch.setenv("TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB", "256")
+    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [None])
+    assert call_queue._budget_bytes() == 256 * 1024 * 1024  # override wins
+    call_queue.refresh()
+
+
 def test_retention_budget_bounds_cold_run_ahead(
     isolated_queue, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -139,7 +139,7 @@ The queue follows these rules:
    references drop on the launching thread, keeping frees stream-ordered
    behind the launch. Retention is bounded: each item's device bytes are
    metered at enqueue, and the enqueue that pushes the total past the
-   budget (8 GiB by default) drains — waiting builds out — before
+   budget (computed from free device memory at first use; env-overridable) drains — waiting builds out — before
    returning. A cold, read-free loop therefore stalls at the budget
    instead of retaining a whole warm-up phase of transients; warm calls
    run inline and never touch the meter.
@@ -188,6 +188,6 @@ Two further knobs, for debugging rather than mode selection:
 
 | Variable | Effect |
 |---|---|
-| `TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB` | run-ahead retention bound in MB (default 8192). The enqueue that pushes the queue's retained device bytes past it drains first. `0` disables the bound (the pre-budget behavior). |
+| `TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB` | run-ahead retention bound in MB. Unset, the bound is computed from the device at the first queued launch: half the smallest free-VRAM figure across the accelerators (weights are already resident by then), floored at 1 GiB, falling back to 8 GiB when no device reports memory statistics. Set, the value wins; `0` disables the bound (the pre-budget behavior). |
 | `TORCH_MOJO_BACKEND_CAST_SYNC=1` | treat every `aten::_to_copy` / `aten::copy_` as a host-visible synchronization point and drain before it, instead of only those that actually cross devices. Conservative fallback if the same-device-cast heuristic ever proves wrong. |
 | `TORCH_MOJO_BACKEND_TRACE=1` | print a timestamp when each variant build starts and finishes, on stderr. |

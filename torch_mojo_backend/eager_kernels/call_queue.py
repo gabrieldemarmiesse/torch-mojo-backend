@@ -101,12 +101,15 @@ _RETAINED_BYTES: list[int] = [0]  # bytes held by queued items (rule 3 budget)
 _BUDGET_BYTES: list = [None]  # memoized budget; refresh() invalidates
 _TLS = threading.local()  # .in_launch
 
-# Default run-ahead bound. During a cold storm the host can enqueue whole
-# training steps ahead of the still-compiling launches, and rule 3 retains
-# every buffer those launches name — unbounded, that carved 70+ GB out of an
-# H100 on a read-free warm-up loop. 8 GiB keeps any current device alive
-# while still allowing thousands of cold launches in flight.
-_DEFAULT_BUDGET_MB = 8192
+# Run-ahead bound. During a cold storm the host can enqueue whole training
+# steps ahead of the still-compiling launches, and rule 3 retains every
+# buffer those launches name — unbounded, that carved 70+ GB out of an H100
+# on a read-free warm-up loop. The bound is computed from the device when
+# possible (half the smallest free-VRAM figure at the moment the first
+# launch queues, floored at 1 GiB); these constants are the floor and the
+# fallback for hosts whose devices report no memory statistics.
+_FALLBACK_BUDGET_MB = 8192
+_MIN_AUTO_BUDGET_MB = 1024
 
 
 def _compute_enabled() -> bool:
@@ -139,16 +142,44 @@ def refresh() -> None:
     _BUDGET_BYTES[0] = None
 
 
+def _free_device_memory() -> int | None:
+    """The smallest free-memory figure across the registered accelerators,
+    or None when no accelerator can report one (CPU-only hosts, backends
+    without memory statistics)."""
+    try:
+        from torch_mojo_backend import get_accelerators
+
+        frees = [device.stats["free_memory"] for device in get_accelerators()]
+    except Exception:
+        return None
+    return min(frees, default=None)
+
+
 def _budget_bytes() -> int:
-    """The run-ahead retention bound, in bytes; 0 disables it."""
+    """The run-ahead retention bound, in bytes; 0 disables it.
+
+    ``TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB`` wins when set. Otherwise the
+    bound is computed once from the device: half the smallest free-VRAM
+    figure across the accelerators at the moment the first launch queues
+    (model weights are already resident by then, so this adapts to what
+    the workload actually left available), floored at 1 GiB. Hosts whose
+    devices report no memory statistics fall back to 8 GiB.
+    """
     cached = _BUDGET_BYTES[0]
     if cached is None:
         raw = os.environ.get("TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB", "")
-        try:
-            megabytes = int(raw) if raw else _DEFAULT_BUDGET_MB
-        except ValueError:
-            megabytes = _DEFAULT_BUDGET_MB
-        cached = _BUDGET_BYTES[0] = max(0, megabytes) * 1024 * 1024
+        if raw:
+            try:
+                cached = max(0, int(raw)) * 1024 * 1024
+            except ValueError:
+                cached = _FALLBACK_BUDGET_MB * 1024 * 1024
+        else:
+            free = _free_device_memory()
+            if free is None:
+                cached = _FALLBACK_BUDGET_MB * 1024 * 1024
+            else:
+                cached = max(free // 2, _MIN_AUTO_BUDGET_MB * 1024 * 1024)
+        _BUDGET_BYTES[0] = cached
     return cached
 
 
