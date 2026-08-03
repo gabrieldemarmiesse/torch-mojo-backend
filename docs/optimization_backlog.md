@@ -624,6 +624,23 @@ different kind of item.
 ### R1
 **Non-trailing reductions materialize a full permuted copy of the input**
 
+> **Scratch moved to Python (2026-08-03).** The input-sized Mojo-side
+> scratch copies are gone: the reduce family (rowred/argmin/min.dim/var/
+> anyall/mean/max/argmax) and the strided unary/scalar/softmax/cumsum/
+> log_softmax paths now have their operands permuted and materialized in
+> Python (`aten_fast._reduce_ready_operand`, `_contig()`), through the
+> queued strided copy — so those transients are budget-metered, covered by
+> the allocation retry, and retained per queued item. The bridges refuse
+> non-trailing/strided layouts instead of copying. **Kept deliberately**:
+> the contiguous-fp32 adjacent-interval direct sum kernel (zero-copy
+> non-trailing sums) — it allocates nothing, and nanoGPT's positional-
+> embedding gradient takes it every step; replacing it with permute +
+> row-reduce measured ~3 ms/step slower (rows huge, cols tiny). Python
+> mirrors its gate exactly (`_sum_middle_direct_ok`). **Still Mojo-side**
+> (deferred): matmul's strided-operand copies (entangled with G1's stranded
+> strided routes), conv's im2col workspace (algorithmic, needs a scratch
+> ABI or an op split), and data_movement's two small sites.
+
 * **What.** `_rowred_spec_into_go` and its siblings,
   `reduction_ops/reduction_ops.mojo:1140`; the `_scratch_copy` calls at `:1217`,
   `:1304`, `:1398`, `:1487`, `:1571` (row-reduce, argmin, min-with-index,

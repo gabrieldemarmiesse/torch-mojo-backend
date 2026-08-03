@@ -1459,21 +1459,17 @@ def _reduce_spec_geom(
     mut cols: Int,
     mut out_rank: Int,
     mut oshape: IndexList[MAX_RANK],
-    mut pshape: IndexList[MAX_RANK],
-    mut pstrides: IndexList[MAX_RANK],
-    mut needs_copy: Bool,
 ) raises:
-    """Geometry for a reduction spec op over arbitrary (sorted, normalized)
-    reduce dims — Python only parses the dim spec.
+    """Geometry for a reduction spec op over trailing reduce dims of a
+    contiguous operand — Python parses the dim spec AND pre-materializes.
 
-    (pshape, pstrides) is the permuted logical layout — kept dims ascending,
-    then reduce dims ascending, trailing-aligned — i.e. the layout the
-    Python classic path used to build with permute+materialize. When the
-    input is contiguous with trailing reduce dims (the hot path) it is
-    already exactly that layout and `needs_copy` stays False; otherwise the
-    caller materializes it via `_scratch_copy` inside the call. The output
-    shape is leading-padded for `out_rank`: keepdim puts 1s at the original
-    reduce positions; otherwise the kept dims pack the trailing slots.
+    Any other layout raises: the Python routes permute+materialize through
+    the queued strided copy (aten_fast._reduce_ready_operand), so the
+    transient is allocated by `_alloc` — metered by the run-ahead budget
+    and covered by the allocation retry — instead of by an invisible
+    Mojo-side scratch buffer. The output shape is leading-padded for
+    `out_rank`: keepdim puts 1s at the original reduce positions;
+    otherwise the kept dims pack the trailing slots.
     """
     var n = _raw_tuple_len(rdims_t)
     if n > a.rank:
@@ -1485,28 +1481,25 @@ def _reduce_spec_geom(
             raise Error("mojo spec reduce: reduce dim out of range")
         is_red[MAX_RANK - a.rank + d] = 1
 
-    pshape = IndexList[MAX_RANK](1)
-    pstrides = IndexList[MAX_RANK](0)
-    var w = MAX_RANK - a.rank
-    rows = 1
-    for i in range(MAX_RANK - a.rank, MAX_RANK):
-        if is_red[i] == 0:
-            pshape[w] = a.shape[i]
-            pstrides[w] = a.strides[i]
-            rows *= a.shape[i]
-            w += 1
-    cols = 1
-    for i in range(MAX_RANK - a.rank, MAX_RANK):
-        if is_red[i] == 1:
-            pshape[w] = a.shape[i]
-            pstrides[w] = a.strides[i]
-            cols *= a.shape[i]
-            w += 1
-
-    needs_copy = not a.contig
+    if not a.contig:
+        raise Error(
+            "mojo spec reduce: operand must be contiguous (Python"
+            " pre-materializes)"
+        )
     for k in range(n):
         if _raw_tuple_int(rdims_t, k) != a.rank - n + k:
-            needs_copy = True
+            raise Error(
+                "mojo spec reduce: reduce dims must be trailing (Python"
+                " pre-materializes)"
+            )
+
+    rows = 1
+    cols = 1
+    for i in range(MAX_RANK - a.rank, MAX_RANK):
+        if is_red[i] == 0:
+            rows *= a.shape[i]
+        else:
+            cols *= a.shape[i]
 
     oshape = IndexList[MAX_RANK](1)
     if _raw_int(keepdim_o) != 0:

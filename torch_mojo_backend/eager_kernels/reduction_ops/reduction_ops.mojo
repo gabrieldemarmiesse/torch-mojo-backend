@@ -1,11 +1,12 @@
 # ===----------------------------------------------------------------------=== #
 # Fast eager-mode reduction kernels for mojo_device: row-wise sum / max /
 # min / prod / argmin / min-with-index / variance / log-softmax / any / all
-# over the trailing dimension of a contiguous tensor. Contiguous FP32 sums over
-# one adjacent, non-trailing dimension interval use a direct runtime
-# (outer, reduce, inner) kernel. Other dim sets are materialized into a
-# row-major (rows, cols) layout, so the generic kernels only ever see a
-# contiguous buffer and reduce each row to one output element.
+# over the trailing dimension of a contiguous tensor. Any other layout is
+# permuted and materialized in PYTHON before the call (through the queued
+# strided copy, so the transient is budget-metered and covered by the
+# allocation retry); the bridges here refuse non-trailing dims or strided
+# operands rather than scratch-copying, and the kernels only ever see a
+# contiguous (rows, cols) buffer reducing each row to one output element.
 #
 # Raw-pointer calling convention (see elementwise_ops.mojo / nn_ops.mojo):
 # tensor operands arrive as element-aligned int addresses, sizes and dtypes as
@@ -65,8 +66,6 @@ from op_utils import (
     _raw_tuple_int,
     _raw_tuple_len,
     _reduce_spec_geom,
-    _scratch_contig,
-    _scratch_copy,
     _spec_dispatcher2,
     _spec_dispatcher4,
     _spec_dispatcher5,
@@ -288,6 +287,17 @@ def _reduce_rows[
 # ---------------------------------------------------------------------------
 
 
+@always_inline
+# ---------------------------------------------------------------------------
+# Direct contiguous adjacent-dimension FP32 sum. Presenting a row-major input
+# as (outer, reduce, inner) lets the pinned stdlib's saturated reduction path
+# SIMD-pack adjacent inner values and read the source directly. This avoids the
+# full-tensor permutation scratch required by the generic non-trailing path.
+# All dimensions remain runtime values; unsupported layouts keep the existing
+# materialize-and-reduce fallback.
+# ---------------------------------------------------------------------------
+
+
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
 )
@@ -407,7 +417,6 @@ def _adjacent_reduce_geom(
     return True
 
 
-@always_inline
 # ---------------------------------------------------------------------------
 # Row-wise argmin: input viewed as (rows, cols), out is `rows` int64 indices
 # (first occurrence wins, matching torch). Mirror of nn_ops' ArgmaxRows with
@@ -1225,25 +1234,62 @@ def _rowred_spec_into_go[
     if a.numel == 0:
         # sum-of-empty is a Python-side fill; amax/amin reject empty dims.
         raise Error("mojo spec reduce: empty input")
+    var ctx0 = a.ctx()
+    # Zero-copy direct path, kept deliberately: a contiguous fp32 sum over
+    # one adjacent NON-trailing dim interval allocates nothing, so it stays
+    # in Mojo — only layouts that would scratch-COPY are refused by the
+    # geometry below (Python pre-materializes those). nanoGPT's positional-
+    # embedding gradient (sum over dim 0) takes this every step; the
+    # permute + row-reduce replacement measured ~3 ms/step slower there
+    # (rows huge, cols tiny).
+    comptime if op_code == RED_SUM:
+        if a.dtype == DType.float32 and ctx0.api() != "cpu":
+            var n_red = _raw_tuple_len(rdims_t)
+            var trailing = True
+            for k in range(n_red):
+                if _raw_tuple_int(rdims_t, k) != a.rank - n_red + k:
+                    trailing = False
+            if not trailing:
+                var outer_elements = 0
+                var reduce_elements = 0
+                var inner_elements = 0
+                if _adjacent_reduce_geom(
+                    a,
+                    rdims_t,
+                    outer_elements,
+                    reduce_elements,
+                    inner_elements,
+                ):
+                    var direct_rows = outer_elements * inner_elements
+                    if (
+                        out.numel != direct_rows
+                        or not out.contig
+                        or out.ctx_ptr != a.ctx_ptr
+                    ):
+                        raise Error("mojo spec into: output buffer mismatch")
+                    if out.dtype != a.dtype:
+                        raise Error("mojo spec into: output dtype mismatch")
+                    if direct_rows > 0:
+                        comptime if has_accelerator():
+                            _sum_contiguous_middle_f32(
+                                out.ptr,
+                                a.ptr,
+                                outer_elements,
+                                reduce_elements,
+                                inner_elements,
+                                ctx0,
+                            )
+                        else:
+                            raise Error(
+                                "no GPU accelerator available at compile time"
+                            )
+                    return
+
     var rows = 0
     var cols = 0
     var out_rank = 0
     var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
+    _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
 
     var ctx = a.ctx()
     var nbytes = rows * a.itemsize
@@ -1254,50 +1300,10 @@ def _rowred_spec_into_go[
         raise Error("mojo spec into: output dtype mismatch")
     var addr = out.ptr
     if rows > 0:
-        var outer_elements = 0
-        var reduce_elements = 0
-        var inner_elements = 0
-        var direct_middle_sum = False
-        comptime if op_code == RED_SUM:
-            if a.dtype == DType.float32 and needs_copy and ctx.api() != "cpu":
-                direct_middle_sum = _adjacent_reduce_geom(
-                    a,
-                    rdims_t,
-                    outer_elements,
-                    reduce_elements,
-                    inner_elements,
-                )
-        if direct_middle_sum:
-            comptime if has_accelerator():
-                _sum_contiguous_middle_f32(
-                    addr,
-                    a.ptr,
-                    outer_elements,
-                    reduce_elements,
-                    inner_elements,
-                    ctx,
-                )
-            else:
-                raise Error("no GPU accelerator available at compile time")
-        elif needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _reduce_rows[dt, op_code](
-                            addr, in_addr, rows, cols, ctx
-                        )
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _reduce_rows[dt, op_code](addr, a.ptr, rows, cols, ctx)
+        comptime for dt in SPEC_ROWRED_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _reduce_rows[dt, op_code](addr, a.ptr, rows, cols, ctx)
 
 
 def _argmin_spec_into_go(
@@ -1316,21 +1322,7 @@ def _argmin_spec_into_go(
     var cols = 0
     var out_rank = 0
     var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
+    _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
 
     var ctx = a.ctx()
     var nbytes = rows * 8  # int64 output
@@ -1341,23 +1333,10 @@ def _argmin_spec_into_go(
         raise Error("mojo spec into: output dtype mismatch")
     var addr = out.ptr
     if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _argmin_rows[dt](addr, in_addr, rows, cols, ctx)
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _argmin_rows[dt](addr, a.ptr, rows, cols, ctx)
+        comptime for dt in SPEC_ROWRED_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _argmin_rows[dt](addr, a.ptr, rows, cols, ctx)
 
 
 def _min_dim_spec_into_go(
@@ -1381,21 +1360,7 @@ def _min_dim_spec_into_go(
     var cols = 0
     var out_rank = 0
     var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
+    _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
 
     var ctx = a.ctx()
     if (
@@ -1412,27 +1377,12 @@ def _min_dim_spec_into_go(
     var addr_v = out_v.ptr
     var addr_i = out_i.ptr
     if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _minmax_idx_rows[dt, True](
-                            addr_v, addr_i, in_addr, rows, cols, ctx
-                        )
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_ROWRED_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _minmax_idx_rows[dt, True](
-                            addr_v, addr_i, a.ptr, rows, cols, ctx
-                        )
+        comptime for dt in SPEC_ROWRED_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _minmax_idx_rows[dt, True](
+                        addr_v, addr_i, a.ptr, rows, cols, ctx
+                    )
 
 
 def _var_spec_into_go(
@@ -1453,21 +1403,7 @@ def _var_spec_into_go(
     var cols = 0
     var out_rank = 0
     var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
+    _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
 
     var ctx = a.ctx()
     var nbytes = rows * a.itemsize
@@ -1478,25 +1414,10 @@ def _var_spec_into_go(
         raise Error("mojo spec into: output dtype mismatch")
     var addr = out.ptr
     if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _var_rows[dt](
-                            addr, in_addr, rows, cols, correction, ctx
-                        )
-            _ = tmp^
-        else:
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _var_rows[dt](addr, a.ptr, rows, cols, correction, ctx)
+        comptime for dt in FLOAT_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _var_rows[dt](addr, a.ptr, rows, cols, correction, ctx)
 
 
 def _anyall_spec_into_go[
@@ -1515,21 +1436,7 @@ def _anyall_spec_into_go[
     var cols = 0
     var out_rank = 0
     var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-        pshape,
-        pstrides,
-        needs_copy,
-    )
+    _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
     var ctx = a.ctx()
     var nbytes = rows  # bool output
     _ = nbytes
@@ -1539,23 +1446,10 @@ def _anyall_spec_into_go[
         raise Error("mojo spec into: output dtype mismatch")
     var addr = out.ptr
     if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_ANYALL_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _anyall_rows[dt, is_all](addr, in_addr, rows, cols, ctx)
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_ANYALL_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _anyall_rows[dt, is_all](addr, a.ptr, rows, cols, ctx)
+        comptime for dt in SPEC_ANYALL_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _anyall_rows[dt, is_all](addr, a.ptr, rows, cols, ctx)
 
 
 def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
@@ -1581,16 +1475,10 @@ def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
                 if a.dtype == dt:
                     _log_softmax_rows[dt](addr, a.ptr, rows, cols, ctx)
     else:
-        # Mojo-side temporary (design doc §4.7): materialize the strided
-        # input into a scratch buffer inside the call — Python never
-        # mints a wrapper for it.
-        var tmp = _scratch_contig(a, ctx)
-        var tmp_addr = Int(tmp.unsafe_ptr())
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _log_softmax_rows[dt](addr, tmp_addr, rows, cols, ctx)
-        _ = tmp^
+        raise Error(
+            "mojo spec log_softmax: input must be contiguous"
+            " (Python pre-materializes)"
+        )
 
 
 # ---------------------------------------------------------------------------

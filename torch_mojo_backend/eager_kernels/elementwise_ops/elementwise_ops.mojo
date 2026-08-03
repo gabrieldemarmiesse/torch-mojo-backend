@@ -80,7 +80,6 @@ from op_utils import (
     _raw_ret_none,
     _raw_tuple_int,
     _raw_tuple_len,
-    _scratch_contig,
     _spec_dispatcher2,
     _spec_dispatcher3,
     _spec_ptr,
@@ -1032,32 +1031,20 @@ def _unary_spec_into_go[
     _check_into(a, out, a.dtype)
     var addr = out.ptr
     if a.numel > 0:
-        if a.contig:
-            comptime for dt in SPEC_UNARY_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _unary_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](a.ptr),
-                            a.numel,
-                            ctx,
-                        )
-        else:
-            # Mojo-side temporary (design doc §4.7): materialize the strided
-            # input into a scratch buffer inside the call — Python never
-            # mints a wrapper for it.
-            var tmp = _scratch_contig(a, ctx)
-            var tmp_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_UNARY_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _unary_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](tmp_addr),
-                            a.numel,
-                            ctx,
-                        )
-            _ = tmp^
+        if not a.contig:
+            raise Error(
+                "mojo spec unary: input must be contiguous (Python"
+                " pre-materializes)"
+            )
+        comptime for dt in SPEC_UNARY_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _unary_elementwise[dt, op_code](
+                        _make_ptr[dt](addr),
+                        _make_ptr[dt](a.ptr),
+                        a.numel,
+                        ctx,
+                    )
 
 
 def _unary_bool_spec_into_go[
@@ -1083,32 +1070,20 @@ def _unary_bool_spec_into_go[
     _check_into(a, out, DType.bool)
     var addr = out.ptr
     if a.numel > 0:
-        if a.contig:
-            comptime for dt in SPEC_UNARY_DTYPES:
-                comptime if _dtype_arg_abi_on[0, dt]():
-                    if kdtype == dt:
-                        _unary_bool[dt, op_code](
-                            _make_ptr[DType.bool](addr),
-                            _make_ptr[dt](a.ptr),
-                            a.numel,
-                            ctx,
-                        )
-        else:
-            # Mojo-side temporary (design doc §4.7): materialize the strided
-            # input into a scratch buffer inside the call — Python never
-            # mints a wrapper for it.
-            var tmp = _scratch_contig(a, ctx)
-            var tmp_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_UNARY_DTYPES:
-                comptime if _dtype_arg_abi_on[0, dt]():
-                    if kdtype == dt:
-                        _unary_bool[dt, op_code](
-                            _make_ptr[DType.bool](addr),
-                            _make_ptr[dt](tmp_addr),
-                            a.numel,
-                            ctx,
-                        )
-            _ = tmp^
+        if not a.contig:
+            raise Error(
+                "mojo spec unary bool: input must be contiguous (Python"
+                " pre-materializes)"
+            )
+        comptime for dt in SPEC_UNARY_DTYPES:
+            comptime if _dtype_arg_abi_on[0, dt]():
+                if kdtype == dt:
+                    _unary_bool[dt, op_code](
+                        _make_ptr[DType.bool](addr),
+                        _make_ptr[dt](a.ptr),
+                        a.numel,
+                        ctx,
+                    )
 
 
 def _scalar_spec_into_go[
@@ -1126,34 +1101,21 @@ def _scalar_spec_into_go[
     _check_into(a, out, a.dtype)
     var addr = out.ptr
     if a.numel > 0:
-        if a.contig:
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _scalar_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](a.ptr),
-                            scalar,
-                            a.numel,
-                            ctx,
-                        )
-        else:
-            # Mojo-side temporary (design doc §4.7): materialize the strided
-            # input into a scratch buffer inside the call — Python never
-            # mints a wrapper for it.
-            var tmp = _scratch_contig(a, ctx)
-            var tmp_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _scalar_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](tmp_addr),
-                            scalar,
-                            a.numel,
-                            ctx,
-                        )
-            _ = tmp^
+        if not a.contig:
+            raise Error(
+                "mojo spec scalar: input must be contiguous (Python"
+                " pre-materializes)"
+            )
+        comptime for dt in FLOAT_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _scalar_elementwise[dt, op_code](
+                        _make_ptr[dt](addr),
+                        _make_ptr[dt](a.ptr),
+                        scalar,
+                        a.numel,
+                        ctx,
+                    )
 
 
 def _scalar_inplace_go[
@@ -1344,34 +1306,21 @@ def _int_scalar_spec_into_go[
     _check_into(a, out, a.dtype)
     var addr = out.ptr
     if a.numel > 0:
-        if a.contig:
-            comptime for dt in [DType.int32, DType.int64]:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _int_scalar_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](a.ptr),
-                            scalar,
-                            a.numel,
-                            ctx,
-                        )
-        else:
-            # Mojo-side temporary (design doc §4.7): materialize the strided
-            # input into a scratch buffer inside the call — Python never
-            # mints a wrapper for it.
-            var tmp = _scratch_contig(a, ctx)
-            var tmp_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in [DType.int32, DType.int64]:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _int_scalar_elementwise[dt, op_code](
-                            _make_ptr[dt](addr),
-                            _make_ptr[dt](tmp_addr),
-                            scalar,
-                            a.numel,
-                            ctx,
-                        )
-            _ = tmp^
+        if not a.contig:
+            raise Error(
+                "mojo spec int scalar: input must be contiguous (Python"
+                " pre-materializes)"
+            )
+        comptime for dt in [DType.int32, DType.int64]:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _int_scalar_elementwise[dt, op_code](
+                        _make_ptr[dt](addr),
+                        _make_ptr[dt](a.ptr),
+                        scalar,
+                        a.numel,
+                        ctx,
+                    )
 
 
 comptime SPEC_FILL_DTYPES = [

@@ -331,6 +331,70 @@ _alloc = TorchMojoTensor._alloc
 _view_of = TorchMojoTensor._view_of
 
 
+def _reduce_ready_operand(
+    a: TorchMojoTensor, dims: tuple[int, ...]
+) -> tuple[TorchMojoTensor, tuple[int, ...]]:
+    """``(operand, dims)`` with any strided or non-trailing layout
+    materialized HERE, in Python.
+
+    The Mojo reduce bridges refuse layouts they would previously have
+    copied into a scratch buffer: materializing through the queued strided
+    copy instead means the transient is allocated by ``_alloc`` — metered
+    by the run-ahead budget, covered by the allocation retry, and retained
+    per queued item like every other buffer. The permuted layout is kept
+    dims ascending then reduce dims ascending (the same layout the bridge
+    geometry derives), so the reduce dims become the trailing ones. The
+    hot path — contiguous input, trailing dims in order — returns the pair
+    unchanged, and a permutation that is already contiguous (reordered
+    trailing dims) costs a zero-copy view.
+    """
+    rank = len(a._shape)
+    trailing = tuple(range(rank - len(dims), rank))
+    if a._is_contiguous and dims == trailing:
+        return a, dims
+    reduced = frozenset(dims)
+    perm = [d for d in range(rank) if d not in reduced] + sorted(reduced)
+    view = _view_of(
+        a,
+        tuple(a._shape[d] for d in perm),
+        tuple(a._strides[d] for d in perm),
+        a._offset,
+    )
+    return view._contig(), trailing
+
+
+def _sum_middle_direct_ok(
+    spec_fn_name: str, module_name: str, a: TorchMojoTensor, dims: tuple[int, ...]
+) -> bool:
+    """Whether the bridge's zero-copy direct kernel takes this reduction.
+
+    Mirrors reduction_ops' early exit exactly: a contiguous fp32 SumSpec
+    over one adjacent, ascending, NON-trailing dim interval on an
+    accelerator. Those calls skip Python-side materialization — the direct
+    kernel reads the source in place and allocates nothing."""
+    if spec_fn_name != "SumSpec" or module_name != "reduction_ops":
+        return False
+    if a._dtype != DType.float32 or not a._is_contiguous:
+        return False
+    if getattr(a._device, "api", "cpu") == "cpu":
+        return False
+    rank = len(a._shape)
+    if dims == tuple(range(rank - len(dims), rank)):
+        return False  # trailing: the ordinary rows/cols path is the fast one
+    return dims == tuple(range(dims[0], dims[0] + len(dims)))
+
+
+def _reduce_keepdim_shape(
+    result: TorchMojoTensor, shape: tuple[int, ...]
+) -> TorchMojoTensor:
+    """Reshape a contiguous reduce result to its keepdim shape (free view).
+
+    Needed only when the reduce dims were re-pointed at the trailing slots:
+    the buffer is identical, but keepdim's 1s belong at the ORIGINAL dim
+    positions, not the trailing ones the bridge wrote."""
+    return _view_of(result, shape, _row_major_strides(shape), result._offset)
+
+
 def fast_aten__foreach_norm(self, ord=2, dtype=None):
     """Fast homogeneous FP32 L2 norms with one independent scalar output.
 
@@ -1727,13 +1791,22 @@ def _try_spec_min_dim(
     submits into the queue, everything else drains and runs synchronously.
     """
     ok = _call_queue.enabled() and a._numel > 0 and a._dtype in _SPEC_ROWRED_INTO
+    original_shape = tuple(a._shape)
+    a, ready_dims = _reduce_ready_operand(a, (dim,))
     try:
-        return _submit_prepared_into(
-            _MinDimSpecExtension.prepare(a, dim, keepdim), force_sync=not ok
+        outputs = _submit_prepared_into(
+            _MinDimSpecExtension.prepare(a, ready_dims[0], keepdim), force_sync=not ok
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
+    if keepdim and ready_dims != (dim,):
+        shape = _reduced_shape(original_shape, (dim,), True)
+        outputs = (
+            _reduce_keepdim_shape(outputs[0], shape),
+            _reduce_keepdim_shape(outputs[1], shape),
+        )
+    return outputs
 
 
 def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_ops"):
@@ -1744,6 +1817,11 @@ def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_op
     a = _t(x)
     if a is None:
         return None
+    if not a._is_contiguous:
+        # Materialize here, through the queued strided copy: metered by the
+        # budget and covered by the allocation retry. The Mojo bridges no
+        # longer scratch-copy strided operands.
+        a = a._contig()
     kdtype = DType.uint8 if a._dtype == DType.bool else a._dtype
     if not _call_queue.enabled():
         ok = False
@@ -1781,9 +1859,9 @@ def _try_spec_reduce(
     extras = tuple(extra)
     ok = False
     odtype = out_dtype or a._dtype
+    rank = len(a._shape)
     if _call_queue.enabled():
         rule = _SPEC_REDUCE_INTO.get((module_name, spec_fn_name))
-        rank = len(a._shape)
         if (
             rule is not None
             and a._numel > 0
@@ -1794,16 +1872,32 @@ def _try_spec_reduce(
         ):
             ok = True
             odtype = rule[1] or odtype
+    if not (
+        dims
+        and len(set(dims)) == len(dims)
+        and all(isinstance(d, int) and 0 <= d < rank for d in dims)
+    ):
+        return None  # the bridge would reject the dim spec anyway
+    original_shape = tuple(a._shape)
+    if _sum_middle_direct_ok(spec_fn_name, module_name, a, dims):
+        ready_dims = dims  # zero-copy direct kernel reads the source in place
+    else:
+        a, ready_dims = _reduce_ready_operand(a, dims)
     try:
-        return _submit_prepared_into(
+        result = _submit_prepared_into(
             _REDUCTION_SPEC_EXTENSIONS[module_name].prepare(
-                spec_fn_name, a, dims, keepdim, extras, odtype
+                spec_fn_name, a, ready_dims, keepdim, extras, odtype
             ),
             force_sync=not ok,
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
+    if keepdim and ready_dims != dims:
+        result = _reduce_keepdim_shape(
+            result, _reduced_shape(original_shape, dims, True)
+        )
+    return result
 
 
 def _raise_if_device_oom(exc: BaseException) -> None:
@@ -1995,6 +2089,8 @@ def _try_spec_scalar(spec_fn_name, x, scalar):
     a = _t(x)
     if a is None or a._dtype not in _SPEC_FLOAT_DTYPES:
         return None
+    if not a._is_contiguous:
+        a = a._contig()  # queued materialize: metered + covered by the retry
     out = _alloc(a._shape, a._dtype, a._device)
     try:
         _call_mojo(
@@ -2046,6 +2142,8 @@ def _try_spec_int_scalar(spec_fn_name, x, scalar):
     a = _t(x)
     if a is None or a._dtype not in (DType.int32, DType.int64):
         return None
+    if not a._is_contiguous:
+        a = a._contig()  # queued materialize: metered + covered by the retry
     out = _alloc(a._shape, a._dtype, a._device)
     try:
         _call_mojo(

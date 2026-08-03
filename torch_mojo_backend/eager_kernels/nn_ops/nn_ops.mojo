@@ -72,8 +72,6 @@ from op_utils import (
     _raw_tuple_f64,
     _raw_tuple_int,
     _reduce_spec_geom,
-    _scratch_contig,
-    _scratch_copy,
     _spec_dispatcher2,
     _spec_dispatcher4,
     _spec_dispatcher5,
@@ -3221,9 +3219,6 @@ def _mean_spec_into_go(
     var cols = 0
     var out_rank = 0
     var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
     _reduce_spec_geom(
         a,
         rdims_t,
@@ -3232,9 +3227,6 @@ def _mean_spec_into_go(
         cols,
         out_rank,
         oshape,
-        pshape,
-        pstrides,
-        needs_copy,
     )
     if cols == 0:
         raise Error("mojo spec mean: empty reduce dim")
@@ -3245,23 +3237,10 @@ def _mean_spec_into_go(
     _check_into_sized(a, out, rows, a.dtype)
     var addr = out.ptr
     if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _mean_rows[dt](addr, in_addr, rows, cols, ctx)
-            _ = tmp^
-        else:
-            comptime for dt in FLOAT_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _mean_rows[dt](addr, a.ptr, rows, cols, ctx)
+        comptime for dt in FLOAT_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _mean_rows[dt](addr, a.ptr, rows, cols, ctx)
 
 
 def _max_spec_into_go(
@@ -3280,9 +3259,6 @@ def _max_spec_into_go(
     var cols = 0
     var out_rank = 0
     var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
     _reduce_spec_geom(
         a,
         rdims_t,
@@ -3291,9 +3267,6 @@ def _max_spec_into_go(
         cols,
         out_rank,
         oshape,
-        pshape,
-        pstrides,
-        needs_copy,
     )
 
     var ctx = a.ctx()
@@ -3302,23 +3275,10 @@ def _max_spec_into_go(
     _check_into_sized(a, out, rows, a.dtype)
     var addr = out.ptr
     if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_MAXROWS_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _max_rows[dt](addr, in_addr, rows, cols, ctx)
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_MAXROWS_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _max_rows[dt](addr, a.ptr, rows, cols, ctx)
+        comptime for dt in SPEC_MAXROWS_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _max_rows[dt](addr, a.ptr, rows, cols, ctx)
 
 
 def _argmax_spec_into_go(
@@ -3337,9 +3297,6 @@ def _argmax_spec_into_go(
     var cols = 0
     var out_rank = 0
     var oshape = IndexList[MAX_RANK](1)
-    var pshape = IndexList[MAX_RANK](1)
-    var pstrides = IndexList[MAX_RANK](0)
-    var needs_copy = False
     _reduce_spec_geom(
         a,
         rdims_t,
@@ -3348,9 +3305,6 @@ def _argmax_spec_into_go(
         cols,
         out_rank,
         oshape,
-        pshape,
-        pstrides,
-        needs_copy,
     )
 
     var ctx = a.ctx()
@@ -3359,23 +3313,10 @@ def _argmax_spec_into_go(
     _check_into_sized(a, out, rows, DType.int64)
     var addr = out.ptr
     if rows > 0:
-        if needs_copy:
-            # Mojo-side temporary: materialize the permuted layout the
-            # classic path used to build with Python permute+_tc.
-            var tmp = _scratch_copy(
-                a.ptr, pshape, pstrides, a.rank, a.numel, a.itemsize, ctx
-            )
-            var in_addr = Int(tmp.unsafe_ptr())
-            comptime for dt in SPEC_MAXROWS_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _argmax_rows[dt](addr, in_addr, rows, cols, ctx)
-            _ = tmp^
-        else:
-            comptime for dt in SPEC_MAXROWS_DTYPES:
-                comptime if _dtype_arg_on[0, dt]():
-                    if a.dtype == dt:
-                        _argmax_rows[dt](addr, a.ptr, rows, cols, ctx)
+        comptime for dt in SPEC_MAXROWS_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _argmax_rows[dt](addr, a.ptr, rows, cols, ctx)
 
 
 def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
@@ -3400,16 +3341,10 @@ def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
                 if a.dtype == dt:
                     _cumsum_rows[dt](addr, a.ptr, rows, cols, ctx)
     else:
-        # Mojo-side temporary (design doc §4.7): materialize the strided
-        # input into a scratch buffer inside the call — Python never
-        # mints a wrapper for it.
-        var tmp = _scratch_contig(a, ctx)
-        var tmp_addr = Int(tmp.unsafe_ptr())
-        comptime for dt in [DType.int64, DType.int32, DType.float32]:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _cumsum_rows[dt](addr, tmp_addr, rows, cols, ctx)
-        _ = tmp^
+        raise Error(
+            "mojo spec cumsum: input must be contiguous"
+            " (Python pre-materializes)"
+        )
 
 
 def _batch_norm_spec_into_go(
@@ -3508,18 +3443,10 @@ def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
                         addr, a.ptr, rows, cols, Float32(1.0), 0, 1, ctx
                     )
     else:
-        # Mojo-side temporary (design doc §4.7): materialize the strided
-        # input into a scratch buffer inside the call — Python never
-        # mints a wrapper for it.
-        var tmp = _scratch_contig(a, ctx)
-        var tmp_addr = Int(tmp.unsafe_ptr())
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _softmax_rows[dt](
-                        addr, tmp_addr, rows, cols, Float32(1.0), 0, 1, ctx
-                    )
-        _ = tmp^
+        raise Error(
+            "mojo spec softmax: input must be contiguous"
+            " (Python pre-materializes)"
+        )
 
 
 def _attn_decode_spec_into_go(
