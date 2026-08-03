@@ -32,7 +32,7 @@ from std.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
 from std.gpu.host import DeviceContext
 from std.gpu.primitives import block, warp
 from std.math import ceildiv
-from std.sys.info import has_accelerator, size_of
+from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.static_tuple import StaticTuple
 
 from op_utils import _enqueue_cached
@@ -397,7 +397,13 @@ comptime _ZPAD = 64
 # Warp-per-row causal kernel geometry (mirrors the Apple forward softmax
 # warp kernel: whole allowed prefix in registers, one read, warp shuffles).
 comptime _APPLE_WARPS_PER_BLOCK = 8
-comptime _MAX_VPT = 8  # per-lane register slots
+# Metal demotes the per-lane staging tuples to threadgroup memory rather than
+# keeping them in registers: at 8 warps per block each VPT slot costs 6 KiB of
+# threadgroup memory (49152 B observed at VPT=8 on macOS 26.3), over Apple's
+# 32 KiB cap, so pipeline creation fails outright.  VPT stops at 4 there
+# (24 KiB); longer rows take the block-per-row kernels below.  Other targets
+# keep true register staging and the measured VPT=8 ladder.
+comptime _MAX_VPT = 4 if has_apple_gpu_accelerator() else 8  # per-lane slots
 comptime _CVEC = 4  # float4 loads; requires 16B-aligned rows
 
 

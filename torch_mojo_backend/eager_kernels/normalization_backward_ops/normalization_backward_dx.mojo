@@ -47,7 +47,7 @@ from std.gpu.memory import load as global_load
 from std.gpu.primitives import block, warp
 from std.math import ceildiv
 from std.memory import AddressSpace, stack_allocation
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator
+from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 
 from op_utils import _enqueue_cached
 
@@ -60,6 +60,15 @@ comptime _WARPS_PER_BLOCK = 8 if WARP_SIZE <= 32 else 4
 comptime _GEN_BLOCK = 256
 comptime _VEC = 4
 comptime _MAX_GRID = 65535
+# Apple caps threadgroup memory at 32 KiB, half of what a CUDA or ROCm block
+# gets, and exceeding it fails pipeline creation at launch rather than at build.
+# Every staging decision below is sized against this budget instead of the
+# 48 KiB footprint that fits the other targets.
+comptime _SMEM_BUDGET = 32 * 1024 if has_apple_gpu_accelerator() else 64 * 1024
+# The widest warp-per-row chunk count whose staging fits the budget: c8 stages
+# 32 KiB of `q` alone, which leaves Apple no room for even the unstaged `xh`
+# stub, so rows that wide take `_dx_generic` there.
+comptime _MAX_WARP_CHUNKS = 6 if has_apple_gpu_accelerator() else 8
 
 
 @always_inline
@@ -90,8 +99,13 @@ def _dx_warp_rows[
     # while the combined footprint stays small enough not to gate occupancy
     # below the register limit (2 * _WARPS_PER_BLOCK * WARP_SIZE * 16 B per
     # chunk per block, i.e. 48 KiB at c6 for both the 8-warp/32-wide and the
-    # 4-warp/64-wide configurations).
-    comptime stage_xh = chunks <= 6
+    # 4-warp/64-wide configurations) — and, on Apple, small enough to exist at
+    # all: 48 KiB is over that target's 32 KiB threadgroup cap, so c5 and c6
+    # there stage q only and re-read xh.
+    comptime q_bytes = (
+        _WARPS_PER_BLOCK * chunks * WARP_SIZE * _VEC * size_of[DType.float32]()
+    )
+    comptime stage_xh = chunks <= 6 and 2 * q_bytes <= _SMEM_BUDGET
     # Streaming (evict-first) reads help while the per-SM working set of
     # concurrent rows is small enough that L2 capacity is better spent
     # buffering dx writebacks; measured on H100, that holds for the small-row
@@ -415,7 +429,7 @@ def enqueue_layer_norm_backward_dx_f32(
         if aligned and cols % _VEC == 0:
             var vec_cols = cols // _VEC
             var needed = ceildiv(vec_cols, WARP_SIZE)
-            if needed <= 8:
+            if needed <= _MAX_WARP_CHUNKS:
                 var grid = min(ceildiv(rows, _WARPS_PER_BLOCK), _MAX_GRID)
                 var block_dim = _WARPS_PER_BLOCK * WARP_SIZE
                 if needed <= 1:

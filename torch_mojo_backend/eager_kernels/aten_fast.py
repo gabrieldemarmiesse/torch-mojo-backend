@@ -1921,23 +1921,24 @@ _call_queue.set_error_translator(_raise_if_device_oom)
 
 
 def _spec_matmul_out_shape(
-    spec_fn_name: str, ts: list, transpose_b: int, require_contiguous: bool = True
+    spec_fn_name: str, ts: list, transpose_b: int
 ) -> tuple | None:
     """Output shape for a queueable matmul spec launch, or None when any
     Mojo-side check might fail (a queued launch cannot fall back).
 
-    ``require_contiguous=False`` answers the *different* question "would this
-    launch be eligible if every operand were materialized contiguous?".  It is
-    only used to decide whether a copy is worth making; every actual launch is
-    prepared with the default, so no strided operand can reach the kernel.
+    Operand layout is deliberately not checked here.  ``TensorSpec`` carries
+    shape and strides, and `_matmul_spec_operands_launch` covers all four
+    layout combinations: it routes a strided operand to a copy-free kernel
+    where one exists for the target (the gfx942 TN MFMA route reads a
+    transposed weight-gradient A in place, and Apple has the TA route) and
+    materializes a scratch copy otherwise.  Declining strided operands here
+    would strand those routes and force a transpose the kernel does not need.
     """
     a = ts[0]
     b = ts[1]
     if a._dtype != b._dtype or a._dtype not in _SPEC_FLOAT_DTYPES:
         return None
     if a._device != b._device:
-        return None
-    if require_contiguous and not all(t._is_contiguous for t in ts):
         return None
     if spec_fn_name == "BmmSpec":
         if len(a._shape) != 3 or len(b._shape) != 3:
@@ -2039,47 +2040,17 @@ def _submit_spec_matmul(
 def _try_spec_matmul(spec_fn_name, tensors, transpose_b):
     """Matmul-family spec op over already-typed operands, or None.
 
-    The spec kernels read row-major memory, so a strided operand is declined.
-    This is the last step of every matmul-family entry point (``fast_aten_mm``,
-    ``fast_aten_addmm``, ``fast_aten_linear``, ``fast_aten_bmm``,
-    ``_fast_aten_bmm_transpose_b``), so the copy backstop below covers all of
-    them at once and only ever runs after their bridges have declined.
+    Strided operands are passed through: `_matmul_spec_operands_launch` reads
+    the strides off the spec and picks a copy-free route when the target has
+    one, so materializing here would only hide those routes behind a transpose
+    the kernel does not need.  This is the last step of every matmul-family
+    entry point (``fast_aten_mm``, ``fast_aten_addmm``, ``fast_aten_linear``,
+    ``fast_aten_bmm``, ``_fast_aten_bmm_transpose_b``).
     """
     ts = tuple(_t(x) for x in tensors)
     if any(t is None for t in ts):
         return None
-    out = _submit_spec_matmul(spec_fn_name, ts, transpose_b)
-    if out is not None or all(t._is_contiguous for t in ts):
-        return out
-
-    # Last-resort correctness backstop, not the intended path: it costs a
-    # materialization of the offending operand.  It runs only when every
-    # layout-capable GEMM bridge has already declined and the spec path's ONLY
-    # objection is that an operand is a view -- asking `_spec_matmul_out_shape`
-    # again with the contiguity check removed proves nothing else is wrong.
-    # Without it a strided operand is a hard NOT_HANDLED, and inside a native
-    # autograd node NOT_HANDLED becomes a NotImplementedError raised under
-    # `Engine::evaluate_function`, which aborts the process instead of raising.
-    # A plain fp32 `nn.Linear` backward hits exactly that, because
-    # `fast_aten_linear_backward` forms the weight gradient as
-    # `mm(grad.transpose(0, 1), input)`.
-    # Two things would remove this copy: an fp32 GEMM that reads a strided A
-    # (the BF16 bridge already does, which is why bf16 autocast never hit the
-    # abort), or the TF32 bridge not being gated off at the default
-    # `float32_matmul_precision == "highest"`.  Do NOT take the second route by
-    # relaxing that gate: TF32 drops mantissa bits, and "highest" is the user
-    # asking for full fp32 -- see the note on the gate in `_try_tf32_gemm`.
-    if (
-        _spec_matmul_out_shape(
-            spec_fn_name, list(ts), transpose_b, require_contiguous=False
-        )
-        is None
-    ):
-        return None
-    contiguous = tuple(_tc(t) for t in ts)
-    if any(t is None for t in contiguous):
-        return None
-    return _submit_spec_matmul(spec_fn_name, contiguous, transpose_b)
+    return _submit_spec_matmul(spec_fn_name, ts, transpose_b)
 
 
 def _try_spec_scalar(spec_fn_name, x, scalar):
