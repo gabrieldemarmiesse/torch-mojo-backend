@@ -527,8 +527,9 @@ _BUILD_NOTICE_SHOWN = False
 
 
 def _trace(message: str) -> None:
-    """Timestamped build tracing, off unless TORCH_MOJO_BACKEND_TRACE is set."""
-    if os.environ.get("TORCH_MOJO_BACKEND_TRACE"):
+    """Timestamped build tracing, on by default; TORCH_MOJO_BACKEND_TRACE=0
+    silences it."""
+    if os.environ.get("TORCH_MOJO_BACKEND_TRACE", "1") != "0":
         sys.stderr.write(f"[TRACE] {message} t={time.monotonic():.2f}\n")
 
 
@@ -537,8 +538,8 @@ def _announce_build() -> None:
 
     A cold process compiles dozens of variants across up to `_pool_size()`
     threads; naming each one buries the only thing a user needs to know,
-    which is that the wait happens once and is cached. Per-variant lines
-    live behind TORCH_MOJO_BACKEND_TRACE. A single write keeps concurrent
+    which is that the wait happens once and is cached. The per-variant
+    detail is the [TRACE] lines (on by default). A single write keeps concurrent
     builder threads from splicing their lines together.
     """
     global _BUILD_NOTICE_SHOWN

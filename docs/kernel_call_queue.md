@@ -184,10 +184,9 @@ arguments and raises on disagreement.
 | kill switch | `TORCH_MOJO_BACKEND_KERNEL_QUEUE=0` | no queue: every miss blocks inline at its call site and every launch happens immediately |
 | test suite | `TORCH_MOJO_BACKEND_TESTING=1` | queue off, because most tests assert synchronous contracts; `TORCH_MOJO_BACKEND_FORCE_KERNEL_QUEUE=1` turns it back on for the focused queue tests |
 
-Two further knobs, for debugging rather than mode selection:
+Two further knobs:
 
 | Variable | Effect |
 |---|---|
 | `TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB` | run-ahead retention bound in MB. Unset, the bound is computed from the device at the first queued launch: half the smallest free-VRAM figure across the accelerators (weights are already resident by then), floored at 1 GiB, falling back to 8 GiB when no device reports memory statistics. Set, the value wins; `0` disables the bound (the pre-budget behavior). |
-| `TORCH_MOJO_BACKEND_CAST_SYNC=1` | treat every `aten::_to_copy` / `aten::copy_` as a host-visible synchronization point and drain before it, instead of only those that actually cross devices. Conservative fallback if the same-device-cast heuristic ever proves wrong. |
-| `TORCH_MOJO_BACKEND_TRACE=1` | print a timestamp when each variant build starts and finishes, on stderr. |
+| `TORCH_MOJO_BACKEND_TRACE` | timestamped `[TRACE]` lines on stderr when each variant build starts and finishes. On by default; `0` silences them. |

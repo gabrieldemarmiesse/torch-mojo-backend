@@ -37,8 +37,6 @@ plain tracker update unless the queue recently launched from another
 thread (then it synchronizes once and clears).
 """
 
-import os
-
 import torch
 from torch.utils._pytree import tree_flatten
 
@@ -68,8 +66,6 @@ def _crosses_device(args: tuple, kwargs: dict) -> bool:
     """True when a copy/cast actually moves bytes between devices. A
     same-device cast (autocast!) is an ordinary data op that stays in the
     queue; only a real crossing runs an out-of-queue H2D/D2H transfer."""
-    if os.environ.get("TORCH_MOJO_BACKEND_CAST_SYNC", "") == "1":
-        return True  # conservative fallback if the heuristic ever proves wrong
     flat_args, _ = tree_flatten((args, kwargs))
     devices = {a.device.type for a in flat_args if isinstance(a, torch.Tensor)}
     target = kwargs.get("device")
