@@ -1,0 +1,1178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The kernel-call queue</title>
+<style>
+  :root {
+    --bg: #F2F4F8;
+    --panel: #FFFFFF;
+    --panel-2: #E9EDF4;
+    --line: #D6DDE9;
+    --line-soft: #E3E8F1;
+    --ink: #1A2233;
+    --muted: #5A6780;
+    --amber: #B87514;
+    --amber-soft: #E9D9BC;
+    --go: #0F8F76;
+    --mm: #2F6FD6;
+    --ew: #148578;
+    --norm: #7A4FD0;
+    --loss: #C24E7A;
+    --cast: #66738F;
+    --opt: #A67A10;
+    --drain: #C2543C;
+    --code-bg: #EDF0F6;
+    --shadow: 0 1px 2px rgba(20, 30, 55, .06), 0 8px 24px rgba(20, 30, 55, .07);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0D1220;
+      --panel: #131A2C;
+      --panel-2: #182136;
+      --line: #263049;
+      --line-soft: #1D2740;
+      --ink: #E8ECF6;
+      --muted: #93A0BC;
+      --amber: #F0A63C;
+      --amber-soft: #4a3a1c;
+      --go: #45C6B8;
+      --mm: #6FA8FF;
+      --ew: #43C2B0;
+      --norm: #B08CFF;
+      --loss: #E58FB1;
+      --cast: #8B98B8;
+      --opt: #E8C268;
+      --drain: #FF7A63;
+      --code-bg: #101728;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 10px 30px rgba(0, 0, 0, .35);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #F2F4F8; --panel: #FFFFFF; --panel-2: #E9EDF4; --line: #D6DDE9;
+    --line-soft: #E3E8F1; --ink: #1A2233; --muted: #5A6780;
+    --amber: #B87514; --amber-soft: #E9D9BC; --go: #0F8F76;
+    --mm: #2F6FD6; --ew: #148578; --norm: #7A4FD0; --loss: #C24E7A;
+    --cast: #66738F; --opt: #A67A10; --drain: #C2543C; --code-bg: #EDF0F6;
+    --shadow: 0 1px 2px rgba(20,30,55,.06), 0 8px 24px rgba(20,30,55,.07);
+  }
+  :root[data-theme="dark"] {
+    --bg: #0D1220; --panel: #131A2C; --panel-2: #182136; --line: #263049;
+    --line-soft: #1D2740; --ink: #E8ECF6; --muted: #93A0BC;
+    --amber: #F0A63C; --amber-soft: #4a3a1c; --go: #45C6B8;
+    --mm: #6FA8FF; --ew: #43C2B0; --norm: #B08CFF; --loss: #E58FB1;
+    --cast: #8B98B8; --opt: #E8C268; --drain: #FF7A63; --code-bg: #101728;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1500px; margin: 0 auto; padding: 18px 20px 40px; }
+
+  .stage-card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .stage-wrap { position: relative; }
+  canvas#stage { display: block; width: 100%; height: 620px; }
+  @media (max-width: 900px) { canvas#stage { height: 480px; } }
+
+  /* fullscreen (native, plus a fixed-position fallback when the iframe
+     denies the Fullscreen API) — the canvas relayouts and rescales itself */
+  .stage-card:fullscreen { display: flex; flex-direction: column; border-radius: 0; border: none; }
+  .stage-card:fullscreen .stage-wrap { flex: 1 1 auto; min-height: 0; }
+  .stage-card:fullscreen canvas#stage { height: 100%; }
+  .stage-card:fullscreen .hud { font-size: 14px; }
+  .stage-card.pseudo-full { position: fixed; inset: 0; z-index: 60;
+    display: flex; flex-direction: column; border-radius: 0; }
+  .stage-card.pseudo-full .stage-wrap { flex: 1 1 auto; min-height: 0; }
+  .stage-card.pseudo-full canvas#stage { height: 100%; }
+  .stage-card.pseudo-full .hud { font-size: 14px; }
+
+  .hud {
+    position: absolute; top: 10px; right: 16px;
+    display: flex; gap: 18px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11.5px; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    pointer-events: none;
+    flex-wrap: wrap;
+  }
+  .hud span b { color: var(--ink); font-weight: 600; margin-left: 6px; }
+
+  .play-overlay {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--bg) 55%, transparent);
+    backdrop-filter: blur(2px);
+  }
+  .play-overlay.visible { display: flex; }
+  .play-overlay button {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 15px; padding: 12px 22px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel);
+    color: var(--ink); cursor: pointer; box-shadow: var(--shadow);
+  }
+  .play-overlay p { position: absolute; bottom: 18px; font-size: 12.5px; color: var(--muted); margin: 0; }
+
+  .stage-controls {
+    border-top: 1px solid var(--line);
+    padding: 10px 16px;
+    display: flex; gap: 8px; align-items: center;
+  }
+  .stage-controls .spacer { flex: 1 1 auto; }
+  .stage-controls .note {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px; color: var(--muted);
+  }
+  .controls { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
+  .controls button {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    border: 1px solid var(--line); background: var(--panel);
+    color: var(--muted); border-radius: 8px;
+    padding: 6px 10px; cursor: pointer;
+    transition: color .15s ease, border-color .15s ease, background .15s ease;
+  }
+  .controls button:hover { color: var(--ink); border-color: var(--muted); }
+  .controls button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  .controls button[aria-pressed="true"] { color: var(--ink); border-color: var(--amber); background: var(--amber-soft); }
+
+  .legend {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px; color: var(--muted);
+    margin: 14px 2px 0;
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .sw { width: 13px; height: 13px; border-radius: 4px; display: inline-block; }
+  .sw.hollow { background: transparent; border: 1.5px dashed var(--amber); }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="stage-card" id="stageCard">
+    <div class="stage-wrap">
+      <canvas id="stage" aria-label="Animated diagram: an inlined GPT-2 training script executes line by line in a scrolling code panel on the left; every operation flows right through preparation and the variant cache; misses spawn compile jobs in the builder pool while their launches wait in a FIFO queue; released launches enter the device stream and travel right to the GPU, which executes them one at a time with a circular progress ring."></canvas>
+      <div class="hud" id="hud" aria-hidden="true">
+        <span>queue<b id="hud-q">0</b></span>
+        <span>retained<b id="hud-r">0 MB</b></span>
+        <span>building<b id="hud-b">0</b></span>
+        <span>cached variants<b id="hud-c">0</b></span>
+        <span>launched<b id="hud-l">0</b></span>
+      </div>
+      <div class="play-overlay" id="playOverlay">
+        <button id="bigPlay" type="button">▶&nbsp; play animation</button>
+        <p>Paused because your system prefers reduced motion.</p>
+      </div>
+    </div>
+    <div class="stage-controls">
+      <span class="note" id="stageNote">step 1 · cold cache</span>
+      <span class="spacer"></span>
+      <div class="controls">
+        <button id="btnPlay" type="button" aria-pressed="true" title="play / pause">⏸ pause</button>
+        <button id="btnSpeed" type="button" title="animation speed">1×</button>
+        <button id="btnRestart" type="button" title="restart from a cold cache">↺ restart</button>
+        <button id="btnFull" type="button" title="fullscreen — best for recording">⛶ fullscreen</button>
+      </div>
+    </div>
+  </div>
+  <div class="legend">
+    <span><span class="sw" style="background:var(--mm)"></span>matmul</span>
+    <span><span class="sw" style="background:var(--ew)"></span>elementwise</span>
+    <span><span class="sw" style="background:var(--norm)"></span>norm</span>
+    <span><span class="sw" style="background:var(--loss)"></span>softmax / loss</span>
+    <span><span class="sw" style="background:var(--cast)"></span>gather · scatter</span>
+    <span><span class="sw" style="background:var(--opt)"></span>optimizer</span>
+    <span><span class="sw hollow"></span>launch waiting for its .so</span>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------- theme tokens ---------- */
+  const canvas = document.getElementById("stage");
+  const ctx = canvas.getContext("2d");
+  let T = {};
+  function readTokens() {
+    const s = getComputedStyle(document.documentElement);
+    const g = (n) => s.getPropertyValue(n).trim();
+    T = {
+      bg: g("--panel"), panel2: g("--panel-2"), line: g("--line"),
+      lineSoft: g("--line-soft"), ink: g("--ink"), muted: g("--muted"),
+      amber: g("--amber"), amberSoft: g("--amber-soft"), go: g("--go"),
+      drain: g("--drain"), codeBg: g("--code-bg"),
+      fam: { mm: g("--mm"), ew: g("--ew"), norm: g("--norm"), loss: g("--loss"), cast: g("--cast"), opt: g("--opt") },
+    };
+  }
+  readTokens();
+  new MutationObserver(readTokens).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  if (window.matchMedia) {
+    try { window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", readTokens); } catch (e) {}
+  }
+
+  /* ---------- helpers ---------- */
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const easeInOut = (t) => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+  const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+  const glide = (cur, target, dt, rate) => cur + (target - cur) * (1 - Math.exp(-dt * rate));
+  const qBezier = (p0, p1, p2, t) => {
+    const u = 1 - t;
+    return { x: u * u * p0.x + 2 * u * t * p1.x + t * t * p2.x,
+             y: u * u * p0.y + 2 * u * t * p1.y + t * t * p2.y };
+  };
+  function withAlpha(hex, a) {
+    if (hex[0] !== "#") return hex;
+    let h = hex.slice(1);
+    if (h.length === 3) h = h.split("").map(c => c + c).join("");
+    const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
+    return `rgba(${r},${g},${b},${a})`;
+  }
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    if (ctx.roundRect) { ctx.roundRect(x, y, w, h, r); return; }
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  // scaled monospace font: everything drawn follows L.s so fullscreen is
+  // genuinely bigger, not the same small stage with more empty space
+  const MONO = "px ui-monospace, Menlo, Consolas, monospace";
+  const fpx = (n, w) => (w ? w + " " : "") + (n * L.s).toFixed(2) + MONO;
+
+  /* ---------- layout: one row, left to right ----------
+     code | prepare | variant | launch queue (pool above) | device stream | GPU */
+  let W = 0, H = 0, dpr = 1;
+  const L = {};
+  function relayout() {
+    const rect = canvas.getBoundingClientRect();
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = rect.width; H = rect.height;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const s = clamp(W / 1250, 0.7, 1.9);
+    L.s = s;
+    L.lineH = 14 * s;
+    const band = H * 0.58;            // the pipeline row
+    L.band = band;
+    L.code = { x0: W * 0.015, x1: W * 0.175, y0: H * 0.07, y1: H * 0.93 };
+    L.code.arrowY = L.code.y0 + (L.code.y1 - L.code.y0) * 0.40;
+    L.prepare = { x: W * 0.223, y: band, w: 84 * s, h: 46 * s };
+    L.cache   = { x: W * 0.306, y: band, w: 72 * s, h: 46 * s };
+    const slots = 6;
+    L.pool = { x0: W * 0.355, x1: W * 0.560, y: H * 0.30, slots, r: 11 * s };
+    L.poolSlot = (i) => ({ x: L.pool.x0 + (L.pool.x1 - L.pool.x0) * (i / (slots - 1)), y: L.pool.y });
+    L.queue = { x0: W * 0.352, x1: W * 0.565, y: band, cap: 8 };
+    // head at the RIGHT end: chips enter at the left tail and travel rightward
+    L.queueSlot = (i, n) => {
+      const vis = Math.min(n, L.queue.cap);
+      const step = Math.min(40 * s, (L.queue.x1 - L.queue.x0) / Math.max(vis - 1, 1));
+      return { x: L.queue.x1 - Math.min(i, L.queue.cap - 1) * step, y: L.queue.y };
+    };
+    L.gpu = { cx: W * 0.958, cy: band, w: 62 * s, h: 60 * s };
+    L.device = { x0: W * 0.588, x1: L.gpu.cx - L.gpu.w / 2 - 6 * s, y: band, h: 26 * s };
+    L.entry = { x: L.device.x0 + 8 * s, y: band };
+  }
+  relayout();
+  if (window.ResizeObserver) new ResizeObserver(relayout).observe(canvas);
+  else window.addEventListener("resize", relayout);
+
+  /* ---------- the inlined program ---------- */
+  // op catalog: one entry per kernel variant this training step ever needs
+  const OP = {
+    gather:  { label: "gather",   fam: "cast", cost: 0.7 },
+    add:     { label: "add",      fam: "ew",   cost: 0.6 },
+    ln:      { label: "ln",       fam: "norm", cost: 0.8 },
+    mm:      { label: "matmul",   fam: "mm",   cost: 1.6 },
+    sdpa:    { label: "sdpa",     fam: "mm",   cost: 1.9 },
+    gelu:    { label: "gelu",     fam: "ew",   cost: 0.7 },
+    xent:    { label: "xent",     fam: "loss", cost: 1.0 },
+    xent_b:  { label: "xent_bwd", fam: "loss", cost: 1.0 },
+    mm_tn:   { label: "mm_tn",    fam: "mm",   cost: 1.7 },
+    sdpa_b:  { label: "sdpa_bwd", fam: "mm",   cost: 2.0 },
+    gelu_b:  { label: "gelu_bwd", fam: "ew",   cost: 0.7 },
+    ln_b:    { label: "ln_bwd",   fam: "norm", cost: 0.9 },
+    scat:    { label: "scatter",  fam: "cast", cost: 0.8 },
+    adamw:   { label: "adamw",    fam: "opt",  cost: 1.1 },
+  };
+  const vkey = (op) => op.label;
+
+  // Every line that touches tensor data emits exactly one kernel.  The only
+  // silent lines are comments, blanks, and pure shape/metadata work
+  // (aliasing, .split views) — those never reach the device.
+  const LINES = [];
+  const line = (text, k) => LINES.push({ text, k: k || null });
+  line("# gpt-2 124M training step");
+  line("# every layer inlined");
+  line("x, y = next(batch)");
+  line("tok = wte[x]", OP.gather);
+  line("h = tok + wpe[:T]", OP.add);
+  for (let i = 1; i <= 12; i++) {
+    line("");
+    line(`# ── layer ${i}/12 ──`);
+    line("r = h");
+    line(`h = ln(h, g1_${i}, b1_${i})`, OP.ln);
+    line(`qkv = h @ w_qkv_${i}`, OP.mm);
+    line("q, k, v = qkv.split(3)");
+    line("a = sdpa(q, k, v)", OP.sdpa);
+    line(`h = a @ w_proj_${i}`, OP.mm);
+    line("h = r + h", OP.add);
+    line("r = h");
+    line(`h = ln(h, g2_${i}, b2_${i})`, OP.ln);
+    line(`u = h @ w_fc_${i}`, OP.mm);
+    line("u = gelu(u)", OP.gelu);
+    line(`h = u @ w_out_${i}`, OP.mm);
+    line("h = r + h", OP.add);
+  }
+  line("");
+  line("h = ln(h, g_f, b_f)", OP.ln);
+  line("logits = h @ wte.T", OP.mm);
+  line("loss = xent(logits, y)", OP.xent);
+  line("");
+  line("# ── backward, inlined ──");
+  line("dlg = xent_bwd(logits,y)", OP.xent_b);
+  line("dh = dlg @ wte", OP.mm_tn);
+  line("d_wte = dlg.T @ h", OP.mm_tn);
+  for (let i = 12; i >= 1; i--) {
+    line("");
+    line(`# ── layer ${i} · bwd ──`);
+    line(`du = dh @ w_out_${i}.T`, OP.mm_tn);
+    line(`d_out_${i} = u.T @ dh`, OP.mm_tn);
+    line("du = gelu_bwd(du, u)", OP.gelu_b);
+    line(`dh2 = du @ w_fc_${i}.T`, OP.mm_tn);
+    line(`dh = ln_bwd(dh2, g2_${i})`, OP.ln_b);
+    line(`da = dh @ w_proj_${i}.T`, OP.mm_tn);
+    line("dq,dk,dv = sdpa_bwd(a)", OP.sdpa_b);
+    line(`dh = dqkv @ w_qkv_${i}.T`, OP.mm_tn);
+    line(`dh = ln_bwd(dh, g1_${i})`, OP.ln_b);
+  }
+  line("");
+  line("d_wte += scatter(dtok)", OP.scat);
+  line("");
+  line("# ── adamw update ──");
+  line("adamw(wte, m0, v0)", OP.adamw);
+  for (let i = 1; i <= 12; i++) line(`adamw(layer_${i}.params)`, OP.adamw);
+  line("adamw(ln_f.params)", OP.adamw);
+  line("");
+  line("print(loss.item())", "HOSTREAD");
+
+  /* ---------- pacing ---------- */
+  // The python thread is serial: while an op walks through prepare -> variant
+  // the code arrow HOLDS on its line (world.pyChip).  Every op line emits a
+  // chip, so line rate == pipeline rate.
+  const PACE = {
+    pipeMiss: { toPrep: 0.10, dwell: 0.30, toCache: 0.12 }, // first-ever variant: linger
+    pipeHit:  { toPrep: 0.05, dwell: 0.05, toCache: 0.05 }, // pass 1, variant known
+    pipeWarm: { toPrep: 0.04, dwell: 0.03, toCache: 0.04 }, // pass 2
+    aux: 0.035,       // comments / views / blanks, pass 1
+    warmAux: 0.022,   // pass 2
+  };
+
+  /* ---------- world ---------- */
+  let world;
+  function freshWorld() {
+    return {
+      time: 0,
+      chips: [], builds: [], queue: [], stream: [], sparks: [],
+      cache: new Set(), requested: new Set(),
+      launched: 0, pyChip: null,
+      drainActive: false, drainX: 0,
+      gpu: { busy: null, flash: 0, flashFam: null },
+      prog: { idx: 0, wait: 0.7, pass: 1, blocked: false, holding: false,
+              scroll: 12 * L.s - (L.code.arrowY - L.code.y0), itemFlash: 0, unhold: 0 },
+      fade: 0, fading: false, fadeDir: 0,
+    };
+  }
+  world = freshWorld();
+
+  let chipSeq = 0;
+  function makeChip(op, opts) {
+    const c = {
+      id: ++chipSeq, label: op.label, fam: op.fam, cost: op.cost,
+      mb: Math.round(12 + op.cost * 22),
+      x: L.code.x1 - 4, y: L.code.arrowY,
+      scale: 0, alpha: 0, hollow: false, fillPulse: 0, qHidden: false,
+      state: "toPrepare", dwell: 0, launchDelay: 0, path: null,
+      ...opts,
+    };
+    world.chips.push(c);
+    return c;
+  }
+  function startPath(c, from, to, arc, dur) {
+    c.path = { p0: { x: from.x, y: from.y },
+               p1: { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 - arc },
+               p2: { x: to.x, y: to.y }, t: 0, dur };
+  }
+  function freeSlot() {
+    const used = new Set(world.builds.filter(b => b.slot >= 0 && !b.done).map(b => b.slot));
+    for (let i = 0; i < L.pool.slots; i++) if (!used.has(i)) return i;
+    return -1;
+  }
+  function makeBuild(key, fam) {
+    const slot = freeSlot();
+    const b = { key, fam, progress: 0, shown: 0,
+                dur: 6.0 + Math.random() * 3.5, slot,
+                waiting: slot < 0, done: false, pulse: 0 };
+    world.builds.push(b);
+    return b;
+  }
+  function enqueue(chip, ready) {
+    chip.state = "queued";
+    chip.hollow = !ready;
+    world.queue.push({ chip, ready });
+    const idx = world.queue.length - 1;
+    chip.qHidden = idx >= L.queue.cap;
+    const slot = L.queueSlot(idx, world.queue.length);
+    startPath(chip, chip, slot, 20 * L.s, 0.4);
+  }
+  function spawnSpark(x, y, tx, ty) {
+    world.sparks.push({ x, y, tx, ty, t: 0, dur: 0.5 });
+  }
+
+  /* ---------- program execution ---------- */
+  function lineDur(l) {
+    const p = world.prog;
+    if (!l.k) return p.pass === 1 ? PACE.aux : PACE.warmAux;
+    return 0.2; // HOSTREAD; op lines are paced by their pipeline hold instead
+  }
+  function chipPipe(isMiss) {
+    if (world.prog.pass === 2) return PACE.pipeWarm;
+    return isMiss ? PACE.pipeMiss : PACE.pipeHit;
+  }
+  function execLine(l) {
+    const p = world.prog;
+    if (l.k === "HOSTREAD") {
+      p.blocked = true;
+      startDrain();
+      return;
+    }
+    if (!l.k) return;
+    const key = vkey(l.k);
+    const isMiss = !world.cache.has(key) && !world.requested.has(key);
+    if (isMiss) world.requested.add(key);
+    const pipe = chipPipe(isMiss);
+    const c = makeChip(l.k, {});
+    c.needsBuild = isMiss;
+    c.isMiss = isMiss;
+    // one python thread: the arrow holds on this line until its op has
+    // cleared prepare + variant — never two ops in the python section
+    world.pyChip = c;
+    p.holding = true;
+    startPath(c, c, { x: L.prepare.x, y: L.prepare.y }, 12 * L.s, pipe.toPrep);
+  }
+  function releaseHold(c) {
+    if (world.pyChip !== c) return;
+    world.pyChip = null;
+    const p = world.prog;
+    if (p.holding) { p.holding = false; p.idx += 1; p.wait = 0.015; }
+  }
+  function startDrain() {
+    world.drainActive = true;
+    world.drainX = L.queue.x0 - 60;
+    for (const b of world.builds) if (!b.done) b.dur = Math.min(b.dur, (b.progress + 0.3) * b.dur + 0.4);
+  }
+
+  /* ---------- status note ---------- */
+  const noteEl = document.getElementById("stageNote");
+  let noteCur = "";
+  function setNote(s) { if (s !== noteCur) { noteCur = s; noteEl.textContent = s; } }
+
+  /* ---------- update ---------- */
+  function update(dt) {
+    world.time += dt;
+    const p = world.prog;
+
+    // fade-out / reset / fade-in loop
+    if (world.fading) {
+      world.fade = clamp(world.fade + world.fadeDir * dt * 1.3, 0, 1);
+      if (world.fade >= 1 && world.fadeDir > 0) {
+        const keep = world.fade;
+        world = freshWorld();
+        world.fade = keep; world.fading = true; world.fadeDir = -1;
+        setNote("loop · restarting with a cold cache");
+      } else if (world.fade <= 0 && world.fadeDir < 0) {
+        world.fading = false; world.fadeDir = 0;
+      }
+    }
+
+    // ---- program ----
+    if (p.unhold > 0) {
+      p.unhold -= dt;
+      if (p.unhold <= 0) {
+        if (p.pass === 1) {
+          p.pass = 2; p.idx = 0; p.blocked = false; p.wait = 0.6;
+        } else if (!world.fading) {
+          world.fading = true; world.fadeDir = 1;
+        }
+      }
+    } else if (p.blocked) {
+      const flushed = world.chips.length === 0 && world.queue.length === 0 &&
+                      world.stream.length === 0 && !world.gpu.busy;
+      if (flushed && !world.drainActive) {
+        p.itemFlash = 1.4;
+        p.unhold = p.pass === 1 ? 1.6 : 2.2;
+      }
+    } else if (!world.fading || world.fadeDir < 0) {
+      if (!p.holding) {
+        p.wait -= dt;
+        let guard = 6;
+        while (p.wait <= 0 && !p.blocked && !p.holding && guard-- > 0) {
+          if (p.idx >= LINES.length) break;
+          const l = LINES[p.idx];
+          execLine(l);
+          if (p.blocked || p.holding) break;
+          p.idx += 1; p.wait += lineDur(l);
+        }
+      }
+    }
+    p.itemFlash = Math.max(0, p.itemFlash - dt);
+
+    // scroll the code panel so the current line sits under the fixed arrow
+    const target = 12 * L.s + p.idx * L.lineH - (L.code.arrowY - L.code.y0);
+    p.scroll = glide(p.scroll, target, dt, 9);
+
+    // ---- builds ----
+    for (const b of world.builds) {
+      if (b.done) { b.pulse = Math.max(0, b.pulse - dt * 1.4); continue; }
+      if (b.waiting) { const s = freeSlot(); if (s >= 0) { b.slot = s; b.waiting = false; } else continue; }
+      b.progress = clamp(b.progress + dt / b.dur, 0, 1);
+      b.shown = glide(b.shown, b.progress, dt, 6);
+      if (b.progress >= 1) {
+        b.done = true; b.pulse = 1;
+        world.cache.add(b.key);
+        const sl = L.poolSlot(b.slot);
+        let first = true;
+        for (const q of world.queue) {
+          if (vkey(q.chip) === b.key && !q.ready) {
+            q.ready = true; q.chip.hollow = false; q.chip.fillPulse = 1;
+            if (first && !q.chip.qHidden) { spawnSpark(sl.x, sl.y, q.chip.x, q.chip.y); first = false; }
+          }
+        }
+        if (first) spawnSpark(sl.x, sl.y, L.cache.x, L.cache.y);
+      }
+    }
+    world.builds = world.builds.filter(b => !b.done || b.pulse > 0);
+
+    // ---- queue pump: release the longest ready prefix, head first ----
+    let stagger = 0;
+    while (world.queue.length && world.queue[0].ready) {
+      const item = world.queue.shift();
+      item.chip.state = "releasing";
+      item.chip.qHidden = false;
+      item.chip.launchDelay = stagger;
+      stagger = Math.min(stagger + 0.08, 2.4);
+    }
+    world.queue.forEach((item, i) => {
+      const c = item.chip;
+      c.qHidden = i >= L.queue.cap;
+      if (c.path) return;
+      const slot = L.queueSlot(i, world.queue.length);
+      c.x = glide(c.x, slot.x, dt, 7);
+      c.y = glide(c.y, slot.y, dt, 7);
+    });
+
+    // ---- drain sweep (left to right, pushing launches out the head) ----
+    if (world.drainActive) {
+      world.drainX = glide(world.drainX, L.queue.x1 + 80, dt, 0.9);
+      if (world.queue.length === 0) world.drainActive = false;
+    }
+
+    // ---- chips in flight ----
+    for (const c of world.chips) {
+      c.scale = glide(c.scale, 1, dt, 8);
+      if (c.state !== "dead") c.alpha = glide(c.alpha, c.qHidden ? 0 : 1, dt, 8);
+      if (c.fillPulse) c.fillPulse = Math.max(0, c.fillPulse - dt * 1.6);
+
+      if (c.path) {
+        c.path.t += dt / c.path.dur;
+        const t = easeInOut(clamp(c.path.t, 0, 1));
+        const pt = qBezier(c.path.p0, c.path.p1, c.path.p2, t);
+        c.x = pt.x; c.y = pt.y;
+        if (c.path.t >= 1) {
+          // carry the sub-frame overshoot into the next pipeline segment so
+          // the serialized python section runs at its nominal speed
+          c.spill = (c.path.t - 1) * c.path.dur;
+          c.path = null;
+          onArrive(c);
+        }
+        continue;
+      }
+      if (c.state === "toPrepare") {
+        c.state = "preparing";
+        c.dwell = chipPipe(c.isMiss).dwell - (c.spill || 0);
+        c.spill = 0;
+      }
+      else if (c.state === "preparing") {
+        c.dwell -= dt;
+        if (c.dwell <= 0) {
+          c.state = "toCache";
+          startPath(c, c, { x: L.cache.x, y: L.cache.y }, 8 * L.s, chipPipe(c.isMiss).toCache);
+          c.path.t = clamp(-c.dwell / c.path.dur, 0, 0.9);
+        }
+      } else if (c.state === "releasing") {
+        c.launchDelay -= dt;
+        if (c.launchDelay <= 0) {
+          c.state = "toStream";
+          startPath(c, c, L.entry, -14 * L.s, 0.3);
+        }
+      }
+    }
+    function onArrive(c) {
+      if (c.state === "toCache") {
+        const key = vkey(c);
+        if (c.needsBuild && !world.builds.some(b => !b.done && b.key === key) && !world.cache.has(key)) {
+          makeBuild(key, c.fam);
+        }
+        if (world.cache.has(key) && world.queue.length === 0 && !world.drainActive) {
+          // already compiled and nothing queued: launch straight onto the stream
+          c.state = "toStream"; c.hit = true;
+          startPath(c, c, L.entry, -46 * L.s, world.prog.pass === 1 ? 0.42 : 0.3);
+        } else if (world.cache.has(key)) {
+          enqueue(c, true);
+        } else {
+          enqueue(c, false);
+        }
+        releaseHold(c);   // the python thread moves on once the variant decision is made
+      } else if (c.state === "toStream") {
+        world.launched++;
+        // enter behind the tail of the pack; if the lane is backed up all the
+        // way to the entry, materialize just outside it (clipped) and slide in
+        const tail = world.stream[world.stream.length - 1];
+        const kw = Math.max(26, c.label.length * 5.6 + 10) * L.s;
+        const x0 = tail ? Math.min(L.entry.x, tail.x - tail.w - 4 * L.s) : L.entry.x;
+        world.stream.push({ label: c.label, fam: c.fam, cost: c.cost, w: kw, x: x0, alpha: 0 });
+        c.state = "dead";
+      }
+    }
+    world.chips = world.chips.filter(c => c.state !== "dead");
+
+    // ---- device stream: kernels travel right and pack against the GPU ----
+    let edge = L.device.x1 - 4;
+    let ahead = null;
+    for (const k of world.stream) {      // stream[0] is the front (right-most)
+      k.w = Math.max(26, k.label.length * 5.6 + 10) * L.s;
+      k.txRight = edge;
+      edge -= k.w + 4 * L.s;
+      // move right toward the target, but never into the kernel ahead and
+      // never backward — the pack accumulates without overlapping
+      const cap = ahead ? ahead.x - ahead.w - 4 * L.s : Infinity;
+      k.x = Math.max(k.x, Math.min(k.x + W * 0.4 * dt, k.txRight, cap));
+      k.alpha = glide(k.alpha, 1, dt, 8);
+      ahead = k;
+    }
+
+    // ---- GPU: one kernel at a time ----
+    const gpu = world.gpu;
+    if (!gpu.busy && world.stream.length) {
+      const front = world.stream[0];
+      if (front.x >= front.txRight - 1 && front.txRight >= L.device.x1 - 5) {
+        world.stream.shift();
+        gpu.busy = { label: front.label, fam: front.fam, t: 0,
+                     dur: (0.16 + front.cost * 0.16) / (1 + 0.35 * world.stream.length) };
+      }
+    }
+    if (gpu.busy) {
+      gpu.busy.t += dt;
+      if (gpu.busy.t >= gpu.busy.dur) {
+        gpu.flash = 1; gpu.flashFam = gpu.busy.fam;
+        gpu.busy = null;
+      }
+    }
+    gpu.flash = Math.max(0, gpu.flash - dt * 2.2);
+
+    // ---- sparks ----
+    for (const s of world.sparks) s.t += dt / s.dur;
+    world.sparks = world.sparks.filter(s => s.t < 1);
+
+    // ---- status note ----
+    if (!world.fading) {
+      if (p.blocked && !p.unhold) setNote("blocked in loss.item() — drain: launches flush, builds are waited out");
+      else if (p.itemFlash > 0 || p.unhold > 0) setNote("value returned ✓");
+      else if (p.pass === 1) setNote("step 1 · cold cache — python runs ahead of the compilers");
+      else setNote("step 2 · every variant cached — direct dispatch");
+    }
+
+    // ---- HUD ----
+    hudQ.textContent = world.queue.length;
+    hudR.textContent = world.queue.reduce((sum, item) => sum + item.chip.mb, 0) + " MB";
+    hudB.textContent = world.builds.filter(b => !b.done).length;
+    hudC.textContent = world.cache.size;
+    hudL.textContent = world.launched;
+  }
+
+  /* ---------- draw ---------- */
+  function drawStationBox(st, title, sub) {
+    ctx.fillStyle = T.panel2;
+    ctx.strokeStyle = T.line;
+    ctx.lineWidth = Math.max(1, L.s);
+    rr(st.x - st.w / 2, st.y - st.h / 2, st.w, st.h, 9 * L.s);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = T.ink;
+    ctx.font = fpx(10, "600");
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(title, st.x, st.y - (sub ? 6 * L.s : 0));
+    if (sub) {
+      ctx.fillStyle = T.muted;
+      ctx.font = fpx(8.5);
+      ctx.fillText(sub, st.x, st.y + 8 * L.s);
+    }
+  }
+  function drawLabel(x, y, text, align) {
+    ctx.fillStyle = T.muted;
+    ctx.font = fpx(9, "600");
+    ctx.textAlign = align || "center"; ctx.textBaseline = "alphabetic";
+    ctx.fillText(text.toUpperCase(), x, y);
+  }
+  function drawRail(p0, p1, arc) {
+    ctx.strokeStyle = T.lineSoft;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([1, 5]);
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y);
+    ctx.quadraticCurveTo((p0.x + p1.x) / 2, (p0.y + p1.y) / 2 - arc, p1.x, p1.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawCodePanel() {
+    const C = L.code, p = world.prog, s = L.s;
+    const lineH = L.lineH;
+    ctx.fillStyle = T.codeBg;
+    ctx.strokeStyle = T.line;
+    ctx.lineWidth = Math.max(1, s);
+    rr(C.x0, C.y0, C.x1 - C.x0, C.y1 - C.y0, 10 * s);
+    ctx.fill(); ctx.stroke();
+    drawLabel((C.x0 + C.x1) / 2, C.y0 - 8 * s, "pytorch · eager");
+
+    ctx.save();
+    rr(C.x0 + 1, C.y0 + 1, C.x1 - C.x0 - 2, C.y1 - C.y0 - 2, 9 * s);
+    ctx.clip();
+
+    const first = Math.max(0, Math.floor(p.scroll / lineH) - 1);
+    const last = Math.min(LINES.length - 1, Math.ceil((p.scroll + (C.y1 - C.y0)) / lineH) + 1);
+    const blocked = p.blocked && p.unhold <= 0;
+
+    // current-line highlight (moves with the text, converges under the arrow)
+    const curY = C.y0 + 12 * s + p.idx * lineH - p.scroll;
+    if (p.idx < LINES.length) {
+      ctx.fillStyle = blocked ? withAlpha(T.drain, 0.14) : T.amberSoft;
+      rr(C.x0 + 4 * s, curY - lineH / 2 + 1, C.x1 - C.x0 - 8 * s, lineH - 1, 4 * s);
+      ctx.fill();
+    }
+
+    ctx.textBaseline = "middle";
+    for (let i = first; i <= last; i++) {
+      const y = C.y0 + 12 * s + i * lineH - p.scroll;
+      if (y < C.y0 - lineH || y > C.y1 + lineH) continue;
+      const l = LINES[i];
+      const isCur = i === p.idx;
+      const a = isCur ? 1 : i < p.idx ? 0.45 : 0.8;
+      // gutter number
+      ctx.fillStyle = T.muted;
+      ctx.font = fpx(7);
+      ctx.textAlign = "right";
+      ctx.globalAlpha = a * 0.55;
+      ctx.fillText(String(i + 1), C.x0 + 20 * s, y);
+      ctx.globalAlpha = a;
+      // kernel family dot
+      if (l.k && l.k !== "HOSTREAD") {
+        ctx.beginPath();
+        ctx.arc(C.x0 + 25 * s, y, 2 * s, 0, Math.PI * 2);
+        ctx.fillStyle = T.fam[l.k.fam];
+        ctx.fill();
+      }
+      // text
+      const isComment = l.text.startsWith("#");
+      ctx.fillStyle = l.k === "HOSTREAD" && (blocked || p.itemFlash > 0)
+        ? (blocked ? T.drain : T.go)
+        : isComment ? T.muted : T.ink;
+      ctx.font = fpx(9.5, isCur ? "600" : "");
+      ctx.textAlign = "left";
+      ctx.fillText(l.text, C.x0 + 30 * s, y);
+      // value-returned flash beside the host read
+      if (l.k === "HOSTREAD" && p.itemFlash > 0 && isCur) {
+        ctx.globalAlpha = clamp(p.itemFlash, 0, 1);
+        ctx.fillStyle = T.go;
+        ctx.font = fpx(9, "600");
+        ctx.fillText("value ✓", C.x0 + (30 + l.text.length * 5.8 + 8) * s, y);
+      }
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+
+    // fixed execution arrow
+    ctx.fillStyle = blocked ? T.drain : T.amber;
+    ctx.beginPath();
+    ctx.moveTo(C.x0 + 6 * s, C.arrowY - 4.5 * s);
+    ctx.lineTo(C.x0 + 14 * s, C.arrowY);
+    ctx.lineTo(C.x0 + 6 * s, C.arrowY + 4.5 * s);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawChip(c) {
+    if (c.qHidden && c.alpha < 0.05) return;
+    const s = L.s;
+    const w = Math.max(28, c.label.length * 6 + 12) * c.scale * s;
+    const h = 18 * c.scale * s;
+    const color = T.fam[c.fam] || T.muted;
+    ctx.globalAlpha = c.alpha;
+    if (c.hollow) {
+      ctx.fillStyle = withAlpha(color, 0.10);
+      ctx.strokeStyle = T.amber;
+      ctx.lineWidth = 1.3 * s;
+      ctx.setLineDash([4 * s, 3 * s]);
+      ctx.lineDashOffset = -world.time * 14 * s;
+      rr(c.x - w / 2, c.y - h / 2, w, h, 6 * s);
+      ctx.fill(); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = T.muted;
+    } else {
+      if (c.fillPulse) {
+        ctx.shadowColor = T.amber;
+        ctx.shadowBlur = 14 * c.fillPulse * s;
+      }
+      ctx.fillStyle = color;
+      rr(c.x - w / 2, c.y - h / 2, w, h, 6 * s);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = "#fff";
+    }
+    ctx.font = fpx(9, "600");
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(c.label, c.x, c.y + 0.5);
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = T.bg;
+    ctx.fillRect(0, 0, W, H);
+    const S = L.s;
+
+    // rails
+    drawRail({ x: L.code.x1 - 4, y: L.code.arrowY }, L.prepare, 12 * S);
+    drawRail(L.prepare, L.cache, 7 * S);
+    drawRail(L.cache, { x: L.queue.x0, y: L.queue.y }, 18 * S);
+    drawRail({ x: L.queue.x1, y: L.queue.y }, L.entry, -14 * S);
+    drawRail(L.cache, L.entry, -46 * S);
+
+    drawCodePanel();
+
+    // stations
+    drawStationBox(L.prepare, "prepare", "specs · alloc · -D");
+    drawStationBox(L.cache, "variant", "cache");
+    drawLabel((L.prepare.x + L.cache.x) / 2, L.prepare.y - 38 * S, "python · synchronous");
+
+    // builder pool (above the launch queue)
+    drawLabel((L.pool.x0 + L.pool.x1) / 2, L.pool.y - 26 * S, "builder pool · mojo build");
+    for (let i = 0; i < L.pool.slots; i++) {
+      const pt = L.poolSlot(i);
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, L.pool.r, 0, Math.PI * 2);
+      ctx.strokeStyle = T.line; ctx.lineWidth = 2 * S; ctx.stroke();
+    }
+    for (const b of world.builds) {
+      if (b.slot < 0) continue;
+      const pt = L.poolSlot(b.slot);
+      if (!b.done) {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, L.pool.r, -Math.PI / 2, -Math.PI / 2 + b.shown * Math.PI * 2);
+        ctx.strokeStyle = T.amber; ctx.lineWidth = 2.6 * S; ctx.lineCap = "round"; ctx.stroke();
+        ctx.lineCap = "butt";
+        const spin = world.time * 2.1;
+        ctx.beginPath();
+        ctx.arc(pt.x + Math.cos(spin) * (L.pool.r - 5 * S), pt.y + Math.sin(spin) * (L.pool.r - 5 * S), 1.4 * S, 0, Math.PI * 2);
+        ctx.fillStyle = T.amber; ctx.fill();
+        ctx.fillStyle = T.muted;
+        ctx.font = fpx(7.5);
+        ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+        ctx.fillText(b.key, pt.x, pt.y + L.pool.r + 11 * S);
+      } else if (b.pulse > 0) {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, L.pool.r + (1 - b.pulse) * 12 * S, 0, Math.PI * 2);
+        ctx.strokeStyle = withAlpha(T.amber, b.pulse * 0.8); ctx.lineWidth = 2 * S; ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, L.pool.r, 0, Math.PI * 2);
+        ctx.strokeStyle = withAlpha(T.go, b.pulse); ctx.lineWidth = 2 * S; ctx.stroke();
+      }
+    }
+    const waitingBuilds = world.builds.filter(b => b.waiting).length;
+    if (waitingBuilds > 0) {
+      ctx.fillStyle = T.muted;
+      ctx.font = fpx(8.5);
+      ctx.textAlign = "left";
+      ctx.fillText(`+${waitingBuilds} waiting for a slot`, L.pool.x0 - L.pool.r, L.pool.y + L.pool.r + 24 * S);
+    }
+
+    // launch queue lane (tail at the left, head at the right)
+    drawLabel((L.queue.x0 + L.queue.x1) / 2, L.queue.y - 26 * S, "launch queue · strict fifo");
+    ctx.strokeStyle = T.line;
+    ctx.lineWidth = Math.max(1, S);
+    rr(L.queue.x0 - 26 * S, L.queue.y - 14 * S, (L.queue.x1 - L.queue.x0) + 52 * S, 28 * S, 14 * S);
+    ctx.stroke();
+    ctx.fillStyle = T.muted;
+    ctx.font = fpx(8);
+    ctx.textAlign = "center";
+    ctx.fillText("head →", L.queue.x1 + 4, L.queue.y + 26 * S);
+    const hidden = Math.max(0, world.queue.length - L.queue.cap);
+    if (hidden > 0) {
+      const tail = L.queueSlot(L.queue.cap - 1, world.queue.length);
+      ctx.fillStyle = T.muted;
+      ctx.font = fpx(8.5, "600");
+      ctx.textAlign = "right";
+      ctx.fillText(`+${hidden} more`, tail.x - 24 * S, L.queue.y + 3 * S);
+    }
+    if (world.queue.length === 0 && !world.drainActive) {
+      ctx.fillStyle = T.muted;
+      ctx.globalAlpha = 0.7;
+      ctx.font = fpx(8.5);
+      ctx.textAlign = "center";
+      ctx.fillText(world.cache.size >= 10 ? "empty — direct dispatch" : "empty",
+        (L.queue.x0 + L.queue.x1) / 2, L.queue.y + 3 * S);
+      ctx.globalAlpha = 1;
+    }
+
+    // drain sweep
+    if (world.drainActive) {
+      const grad = ctx.createLinearGradient(world.drainX - 50 * S, 0, world.drainX, 0);
+      grad.addColorStop(0, withAlpha(T.drain, 0));
+      grad.addColorStop(1, withAlpha(T.drain, 0.16));
+      ctx.fillStyle = grad;
+      ctx.fillRect(world.drainX - 50 * S, L.queue.y - 22 * S, 50 * S, 44 * S);
+      ctx.strokeStyle = withAlpha(T.drain, 0.9);
+      ctx.lineWidth = 1.5 * S;
+      ctx.beginPath();
+      ctx.moveTo(world.drainX, L.queue.y - 22 * S);
+      ctx.lineTo(world.drainX, L.queue.y + 22 * S);
+      ctx.stroke();
+      ctx.fillStyle = T.drain;
+      ctx.font = fpx(8.5, "600");
+      ctx.textAlign = "center";
+      ctx.fillText("drain()", world.drainX, L.queue.y - 28 * S);
+    }
+
+    // device stream lane
+    drawLabel(L.device.x0, L.device.y - 22 * S, "device stream", "left");
+    ctx.strokeStyle = T.line;
+    ctx.lineWidth = Math.max(1, S);
+    rr(L.device.x0, L.device.y - L.device.h / 2, L.device.x1 - L.device.x0, L.device.h, 7 * S);
+    ctx.stroke();
+    // entry marker
+    const g2 = (Math.sin(world.time * 3.1) + 1) / 2;
+    ctx.beginPath();
+    ctx.arc(L.entry.x, L.entry.y, (2.5 + g2 * 1.2) * S, 0, Math.PI * 2);
+    ctx.fillStyle = withAlpha(T.go, 0.5 + g2 * 0.4);
+    ctx.fill();
+    // kernels in the stream — every kernel shows its name
+    ctx.save();
+    ctx.beginPath();
+    rr(L.device.x0 + 1, L.device.y - L.device.h / 2 + 1, L.device.x1 - L.device.x0 - 2, L.device.h - 2, 6 * S);
+    ctx.clip();
+    for (const k of world.stream) {
+      ctx.globalAlpha = k.alpha * 0.94;
+      ctx.fillStyle = T.fam[k.fam] || T.muted;
+      rr(k.x - k.w, L.device.y - 8 * S, k.w, 16 * S, 4 * S);
+      ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.font = fpx(7.5, "600");
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(k.label, k.x - k.w / 2, L.device.y + 0.5);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // GPU
+    const G = L.gpu, gpu = world.gpu;
+    ctx.fillStyle = T.panel2;
+    ctx.strokeStyle = T.line;
+    ctx.lineWidth = 1.2 * S;
+    rr(G.cx - G.w / 2, G.cy - G.h / 2, G.w, G.h, 10 * S);
+    ctx.fill(); ctx.stroke();
+    const ringY = G.cy - 9 * S, ringR = 11 * S;
+    ctx.beginPath();
+    ctx.arc(G.cx, ringY, ringR, 0, Math.PI * 2);
+    ctx.strokeStyle = T.line; ctx.lineWidth = 2.6 * S; ctx.stroke();
+    if (gpu.busy) {
+      const fr = clamp(gpu.busy.t / gpu.busy.dur, 0, 1);
+      const col = T.fam[gpu.busy.fam] || T.go;
+      ctx.beginPath();
+      ctx.arc(G.cx, ringY, ringR, -Math.PI / 2, -Math.PI / 2 + fr * Math.PI * 2);
+      ctx.strokeStyle = col; ctx.lineWidth = 3 * S; ctx.lineCap = "round"; ctx.stroke();
+      ctx.lineCap = "butt";
+      const spin = world.time * 5;
+      ctx.beginPath();
+      ctx.arc(G.cx + Math.cos(spin) * (ringR - 4.5 * S), ringY + Math.sin(spin) * (ringR - 4.5 * S), 1.5 * S, 0, Math.PI * 2);
+      ctx.fillStyle = col; ctx.fill();
+      ctx.beginPath();
+      ctx.arc(G.cx, ringY, 3 * S, 0, Math.PI * 2);
+      ctx.fillStyle = col; ctx.fill();
+    } else {
+      const idlePulse = (Math.sin(world.time * 2.2) + 1) / 2;
+      ctx.beginPath();
+      ctx.arc(G.cx, ringY, 3 * S, 0, Math.PI * 2);
+      ctx.fillStyle = withAlpha(T.muted, 0.3 + idlePulse * 0.3);
+      ctx.fill();
+    }
+    if (gpu.flash > 0) {
+      ctx.beginPath();
+      ctx.arc(G.cx, ringY, ringR + (1 - gpu.flash) * 10 * S, 0, Math.PI * 2);
+      ctx.strokeStyle = withAlpha(T.fam[gpu.flashFam] || T.go, gpu.flash * 0.8);
+      ctx.lineWidth = 2 * S; ctx.stroke();
+    }
+    // the op being executed
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    if (gpu.busy) {
+      ctx.fillStyle = T.fam[gpu.busy.fam] || T.ink;
+      ctx.font = fpx(7.5, "600");
+      ctx.fillText(gpu.busy.label, G.cx, G.cy + 9 * S);
+    } else {
+      ctx.fillStyle = T.muted;
+      ctx.font = fpx(7.5);
+      ctx.fillText("idle", G.cx, G.cy + 9 * S);
+    }
+    ctx.fillStyle = T.ink;
+    ctx.font = fpx(9.5, "700");
+    ctx.fillText("GPU", G.cx, G.cy + G.h / 2 - 9 * S);
+
+    // sparks (.so delivery)
+    for (const s of world.sparks) {
+      const t = easeOut(clamp(s.t, 0, 1));
+      const pt = qBezier({ x: s.x, y: s.y }, { x: (s.x + s.tx) / 2 + 12 * L.s, y: (s.y + s.ty) / 2 - 20 * L.s }, { x: s.tx, y: s.ty }, t);
+      ctx.globalAlpha = 1 - t * 0.4;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, 2.6 * L.s, 0, Math.PI * 2);
+      ctx.fillStyle = T.amber; ctx.fill();
+      ctx.font = fpx(7.5);
+      ctx.fillStyle = T.amber;
+      ctx.textAlign = "left";
+      ctx.fillText(".so", pt.x + 5 * L.s, pt.y + 3 * L.s);
+      ctx.globalAlpha = 1;
+    }
+
+    // chips in flight / queued (queued drawn tail→head so the head sits on top)
+    const queued = world.chips.filter(c => c.state === "queued");
+    const flying = world.chips.filter(c => c.state !== "queued");
+    for (let i = queued.length - 1; i >= 0; i--) drawChip(queued[i]);
+    for (const c of flying) drawChip(c);
+
+    // loop fade
+    if (world.fade > 0) {
+      ctx.fillStyle = withAlpha(T.bg[0] === "#" ? T.bg : "#000000", world.fade);
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+
+  /* ---------- loop / controls ---------- */
+  const hudQ = document.getElementById("hud-q"), hudB = document.getElementById("hud-b"),
+        hudC = document.getElementById("hud-c"), hudL = document.getElementById("hud-l"),
+        hudR = document.getElementById("hud-r");
+  const btnPlay = document.getElementById("btnPlay");
+  const btnSpeed = document.getElementById("btnSpeed");
+  const btnRestart = document.getElementById("btnRestart");
+  const overlay = document.getElementById("playOverlay");
+
+  const SPEEDS = [1, 1.6, 0.6, 0.2];
+  let speedIdx = 0;
+  btnSpeed.addEventListener("click", () => {
+    speedIdx = (speedIdx + 1) % SPEEDS.length;
+    btnSpeed.textContent = SPEEDS[speedIdx] + "×";
+  });
+  btnRestart.addEventListener("click", () => {
+    world = freshWorld();
+    setNote("step 1 · cold cache — python runs ahead of the compilers");
+    if (!running) { draw(); }
+  });
+
+  // fullscreen: native when the environment allows it, otherwise a
+  // fixed-position fallback that fills the viewport
+  const btnFull = document.getElementById("btnFull");
+  const stageCard = document.getElementById("stageCard");
+  function fullIsOn() {
+    return !!document.fullscreenElement || stageCard.classList.contains("pseudo-full");
+  }
+  function syncFullBtn() {
+    btnFull.textContent = fullIsOn() ? "✕ exit fullscreen" : "⛶ fullscreen";
+  }
+  btnFull.addEventListener("click", async () => {
+    if (fullIsOn()) {
+      if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch (e) {} }
+      stageCard.classList.remove("pseudo-full");
+      syncFullBtn();
+      return;
+    }
+    let native = false;
+    if (stageCard.requestFullscreen) {
+      try { await stageCard.requestFullscreen(); native = true; } catch (e) {}
+    }
+    if (!native) stageCard.classList.add("pseudo-full");
+    syncFullBtn();
+  });
+  document.addEventListener("fullscreenchange", syncFullBtn);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && stageCard.classList.contains("pseudo-full")) {
+      stageCard.classList.remove("pseudo-full");
+      syncFullBtn();
+    }
+  });
+
+  let running = true, last = null, raf = 0;
+  function frame(ts) {
+    if (last == null) last = ts;
+    let dt = Math.min((ts - last) / 1000, 0.05) * SPEEDS[speedIdx];
+    last = ts;
+    update(dt);
+    draw();
+    if (running) raf = requestAnimationFrame(frame);
+  }
+  function togglePlay(force) {
+    running = force !== undefined ? force : !running;
+    btnPlay.textContent = running ? "⏸ pause" : "▶ play";
+    btnPlay.setAttribute("aria-pressed", String(running));
+    overlay.classList.toggle("visible", !running && neverStarted);
+    if (running) { neverStarted = false; overlay.classList.remove("visible"); last = null; raf = requestAnimationFrame(frame); }
+    else cancelAnimationFrame(raf);
+  }
+  btnPlay.addEventListener("click", () => togglePlay());
+  document.getElementById("bigPlay").addEventListener("click", () => togglePlay(true));
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && running) { cancelAnimationFrame(raf); }
+    else if (!document.hidden && running) { last = null; raf = requestAnimationFrame(frame); }
+  });
+
+  let neverStarted = false;
+  const reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduced) {
+    neverStarted = true;
+    running = false;
+    btnPlay.textContent = "▶ play";
+    btnPlay.setAttribute("aria-pressed", "false");
+    overlay.classList.add("visible");
+    draw(); // static first frame
+  } else {
+    raf = requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
