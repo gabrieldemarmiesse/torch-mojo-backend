@@ -478,7 +478,8 @@
     // cleared prepare + variant — never two ops in the python section
     world.pyChip = c;
     p.holding = true;
-    startPath(c, c, { x: L.prepare.x, y: L.prepare.y }, 12 * L.s, pipe.toPrep);
+    // land just under the station title so the box stays readable
+    startPath(c, c, { x: L.prepare.x, y: L.prepare.y + 13 * L.s }, 12 * L.s, pipe.toPrep);
   }
   function releaseHold(c) {
     if (world.pyChip !== c) return;
@@ -626,7 +627,7 @@
         c.dwell -= dt;
         if (c.dwell <= 0) {
           c.state = "toCache";
-          startPath(c, c, { x: L.cache.x, y: L.cache.y }, 8 * L.s, chipPipe(c.isMiss).toCache);
+          startPath(c, c, { x: L.cache.x, y: L.cache.y + 13 * L.s }, 8 * L.s, chipPipe(c.isMiss).toCache);
           c.path.t = clamp(-c.dwell / c.path.dur, 0, 0.9);
         }
       } else if (c.state === "releasing") {
@@ -833,8 +834,8 @@
   function drawChip(c) {
     if (c.qHidden && c.alpha < 0.05) return;
     const s = L.s;
-    const w = Math.max(28, c.label.length * 6 + 12) * c.scale * s;
-    const h = 18 * c.scale * s;
+    const w = Math.max(26, c.label.length * 5.6 + 10) * c.scale * s;
+    const h = 17 * c.scale * s;
     const color = T.fam[c.fam] || T.muted;
     ctx.globalAlpha = c.alpha;
     if (c.hollow) {
@@ -858,7 +859,7 @@
       ctx.shadowBlur = 0;
       ctx.fillStyle = "#fff";
     }
-    ctx.font = fpx(9, "600");
+    ctx.font = fpx(8.5, "600");
     ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText(c.label, c.x, c.y + 0.5);
     ctx.globalAlpha = 1;
@@ -937,11 +938,10 @@
     ctx.fillText("head →", L.queue.x1 + 4, L.queue.y + 26 * S);
     const hidden = Math.max(0, world.queue.length - L.queue.cap);
     if (hidden > 0) {
-      const tail = L.queueSlot(L.queue.cap - 1, world.queue.length);
       ctx.fillStyle = T.muted;
       ctx.font = fpx(8.5, "600");
-      ctx.textAlign = "right";
-      ctx.fillText(`+${hidden} more`, tail.x - 24 * S, L.queue.y + 3 * S);
+      ctx.textAlign = "left";
+      ctx.fillText(`+${hidden} more waiting`, L.queue.x0 - 24 * S, L.queue.y + 26 * S);
     }
     if (world.queue.length === 0 && !world.drainActive) {
       ctx.fillStyle = T.muted;
