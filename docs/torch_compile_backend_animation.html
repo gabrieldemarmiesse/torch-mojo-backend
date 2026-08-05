@@ -1,0 +1,988 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mojo_backend for torch.compile — from dynamo to a MAX graph</title>
+<style>
+  :root {
+    --bg: #F2F4F8;
+    --panel: #FFFFFF;
+    --panel-2: #E9EDF4;
+    --line: #D6DDE9;
+    --line-soft: #E3E8F1;
+    --ink: #1A2233;
+    --muted: #5A6780;
+    --amber: #B87514;
+    --amber-soft: #E9D9BC;
+    --go: #0F8F76;
+    --mm: #2F6FD6;
+    --norm: #7A4FD0;
+    --drain: #C2543C;
+    --code-bg: #EDF0F6;
+    --shadow: 0 1px 2px rgba(20, 30, 55, .06), 0 8px 24px rgba(20, 30, 55, .07);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0D1220; --panel: #131A2C; --panel-2: #182136; --line: #263049;
+      --line-soft: #1D2740; --ink: #E8ECF6; --muted: #93A0BC;
+      --amber: #F0A63C; --amber-soft: #4a3a1c; --go: #45C6B8;
+      --mm: #6FA8FF; --norm: #B08CFF; --drain: #FF7A63; --code-bg: #101728;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #F2F4F8; --panel: #FFFFFF; --panel-2: #E9EDF4; --line: #D6DDE9;
+    --line-soft: #E3E8F1; --ink: #1A2233; --muted: #5A6780;
+    --amber: #B87514; --amber-soft: #E9D9BC; --go: #0F8F76;
+    --mm: #2F6FD6; --norm: #7A4FD0; --drain: #C2543C; --code-bg: #EDF0F6;
+    --shadow: 0 1px 2px rgba(20,30,55,.06), 0 8px 24px rgba(20,30,55,.07);
+  }
+  :root[data-theme="dark"] {
+    --bg: #0D1220; --panel: #131A2C; --panel-2: #182136; --line: #263049;
+    --line-soft: #1D2740; --ink: #E8ECF6; --muted: #93A0BC;
+    --amber: #F0A63C; --amber-soft: #4a3a1c; --go: #45C6B8;
+    --mm: #6FA8FF; --norm: #B08CFF; --drain: #FF7A63; --code-bg: #101728;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1500px; margin: 0 auto; padding: 18px 20px 40px; }
+
+  .stage-card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; box-shadow: var(--shadow); overflow: hidden;
+  }
+  .stage-wrap { position: relative; }
+  canvas#stage { display: block; width: 100%; height: 620px; }
+  @media (max-width: 900px) { canvas#stage { height: 480px; } }
+
+  .stage-card:fullscreen { display: flex; flex-direction: column; border-radius: 0; border: none; }
+  .stage-card:fullscreen .stage-wrap { flex: 1 1 auto; min-height: 0; }
+  .stage-card:fullscreen canvas#stage { height: 100%; }
+  .stage-card:fullscreen .hud { font-size: 14px; }
+  .stage-card.pseudo-full { position: fixed; inset: 0; z-index: 60;
+    display: flex; flex-direction: column; border-radius: 0; }
+  .stage-card.pseudo-full .stage-wrap { flex: 1 1 auto; min-height: 0; }
+  .stage-card.pseudo-full canvas#stage { height: 100%; }
+  .stage-card.pseudo-full .hud { font-size: 14px; }
+
+  .hud {
+    position: absolute; top: 10px; right: 16px;
+    display: flex; gap: 18px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11.5px; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    pointer-events: none; flex-wrap: wrap;
+  }
+  .hud span b { color: var(--ink); font-weight: 600; margin-left: 6px; }
+
+  .play-overlay {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--bg) 55%, transparent);
+    backdrop-filter: blur(2px);
+  }
+  .play-overlay.visible { display: flex; }
+  .play-overlay button {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 15px; padding: 12px 22px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel);
+    color: var(--ink); cursor: pointer; box-shadow: var(--shadow);
+  }
+  .play-overlay p { position: absolute; bottom: 18px; font-size: 12.5px; color: var(--muted); margin: 0; }
+
+  .stage-controls {
+    border-top: 1px solid var(--line);
+    padding: 10px 16px;
+    display: flex; gap: 8px; align-items: center;
+  }
+  .stage-controls .spacer { flex: 1 1 auto; }
+  .stage-controls .note {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px; color: var(--muted);
+  }
+  .controls { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
+  .controls button {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    border: 1px solid var(--line); background: var(--panel);
+    color: var(--muted); border-radius: 8px;
+    padding: 6px 10px; cursor: pointer;
+    transition: color .15s ease, border-color .15s ease, background .15s ease;
+  }
+  .controls button:hover { color: var(--ink); border-color: var(--muted); }
+  .controls button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  .controls button[aria-pressed="true"] { color: var(--ink); border-color: var(--amber); background: var(--amber-soft); }
+
+  .legend {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px; color: var(--muted);
+    margin: 14px 2px 0;
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .sw { width: 13px; height: 13px; border-radius: 4px; display: inline-block; }
+  .sw.halo { background: transparent; border: 1.5px solid var(--go); box-shadow: 0 0 5px var(--go); }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="stage-card" id="stageCard">
+    <div class="stage-wrap">
+      <canvas id="stage" aria-label="Animated diagram: torch.compile with backend=mojo_backend. On the first call dynamo traces python bytecode into an FX graph and installs guards; aot_autograd decomposes ops to core aten, except ops the backend implements natively, whose decompositions were removed so they stay whole; each aten node is looked up in MAPPING_TORCH_ATEN_TO_MOJO and becomes a MAX graph op with symbolic dims; session.load compiles the graph and fuses adjacent elementwise ops into single kernels. At run time, inputs are imported once through DLPack into cached MAX buffers that alias the torch memory, the compiled model executes on the GPU, and outputs come back zero-copy via torch.from_dlpack. Later calls pass the guards and skip straight to execution, including with a new sequence length thanks to symbolic dimensions."></canvas>
+      <div class="hud" id="hud" aria-hidden="true">
+        <span>fx nodes<b id="hud-fx">0</b></span>
+        <span>max ops<b id="hud-maxops">0</b></span>
+        <span>graphs compiled<b id="hud-compiles">0</b></span>
+        <span>dlpack imports<b id="hud-dlpack">0</b></span>
+        <span>buffer-cache hits<b id="hud-hits">0</b></span>
+      </div>
+      <div class="play-overlay" id="playOverlay">
+        <button id="bigPlay" type="button">▶&nbsp; play animation</button>
+        <p>Paused because your system prefers reduced motion.</p>
+      </div>
+    </div>
+    <div class="stage-controls">
+      <span class="note" id="stageNote">first call — dynamo hands us an FX graph</span>
+      <span class="spacer"></span>
+      <div class="controls">
+        <button id="btnPlay" type="button" aria-pressed="true" title="play / pause">⏸ pause</button>
+        <button id="btnSpeed" type="button" title="animation speed">1×</button>
+        <button id="btnRestart" type="button" title="restart from the first call">↺ restart</button>
+        <button id="btnFull" type="button" title="fullscreen — best for recording">⛶ fullscreen</button>
+      </div>
+    </div>
+  </div>
+  <div class="legend">
+    <span><span class="sw" style="background:var(--norm)"></span>aten op (fx node)</span>
+    <span><span class="sw" style="background:var(--mm)"></span>max graph op</span>
+    <span><span class="sw" style="background:var(--amber)"></span>compile · session.load</span>
+    <span><span class="sw" style="background:var(--go)"></span>dlpack · zero-copy runtime</span>
+    <span><span class="sw halo"></span>kept whole — decomposition removed</span>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------- theme tokens ---------- */
+  const canvas = document.getElementById("stage");
+  const ctx = canvas.getContext("2d");
+  let T = {};
+  function readTokens() {
+    const s = getComputedStyle(document.documentElement);
+    const g = (n) => s.getPropertyValue(n).trim();
+    T = {
+      bg: g("--panel"), panel2: g("--panel-2"), line: g("--line"),
+      lineSoft: g("--line-soft"), ink: g("--ink"), muted: g("--muted"),
+      amber: g("--amber"), amberSoft: g("--amber-soft"), go: g("--go"),
+      drain: g("--drain"), codeBg: g("--code-bg"),
+      mm: g("--mm"), norm: g("--norm"),
+    };
+  }
+  readTokens();
+  new MutationObserver(readTokens).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  if (window.matchMedia) {
+    try { window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", readTokens); } catch (e) {}
+  }
+
+  /* ---------- helpers ---------- */
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const easeInOut = (t) => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+  const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+  const glide = (cur, target, dt, rate) => cur + (target - cur) * (1 - Math.exp(-dt * rate));
+  const qBezier = (p0, p1, p2, t) => {
+    const u = 1 - t;
+    return { x: u * u * p0.x + 2 * u * t * p1.x + t * t * p2.x,
+             y: u * u * p0.y + 2 * u * t * p1.y + t * t * p2.y };
+  };
+  function withAlpha(hex, a) {
+    if (hex[0] !== "#") return hex;
+    let h = hex.slice(1);
+    if (h.length === 3) h = h.split("").map(c => c + c).join("");
+    const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
+    return `rgba(${r},${g},${b},${a})`;
+  }
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    if (ctx.roundRect) { ctx.roundRect(x, y, w, h, r); return; }
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  const MONO = "px ui-monospace, Menlo, Consolas, monospace";
+  const fpx = (n, w) => (w ? w + " " : "") + (n * L.s).toFixed(2) + MONO;
+
+  /* ---------- layout ----------
+     code | top band: dynamo -> decompose -> find equivalent -> max graph -> engine
+            bottom band: buffer cache -> dlpack -> model.execute -> from_dlpack   */
+  let W = 0, H = 0, dpr = 1;
+  const L = {};
+  function relayout() {
+    const rect = canvas.getBoundingClientRect();
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = rect.width; H = rect.height;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const s = clamp(W / 1250, 0.7, 1.9);
+    L.s = s;
+    L.lineH = 15 * s;
+    L.code = { x0: W * 0.015, x1: W * 0.185, y0: H * 0.10 };
+    L.code.y1 = Math.min(H * 0.92, L.code.y0 + (10 * 15 + 30) * s);
+    const topY = H * 0.26, runY = H * 0.76;
+    L.topY = topY; L.runY = runY;
+    L.dynamo  = { x: W * 0.258, y: topY, w: 92 * s, h: 46 * s };
+    L.guards  = { x: W * 0.258, y: topY + 58 * s, w: 128 * s, h: 28 * s };
+    L.decomp  = { x: W * 0.388, y: topY, w: 106 * s, h: 46 * s };
+    L.mapping = { x: W * 0.522, y: topY, w: 112 * s, h: 46 * s };
+    L.mgpanel = { x0: W * 0.592, x1: W * 0.742, y0: H * 0.13, y1: H * 0.49 };
+    L.engine  = { x: W * 0.85, y: topY, r: 16 * s };
+    L.bcache  = { x: W * 0.315, y: runY, w: 120 * s, h: 48 * s };
+    L.exec    = { x: W * 0.565, y: runY, w: 168 * s, h: 64 * s };
+    L.fromdl  = { x: W * 0.805, y: runY, w: 126 * s, h: 48 * s };
+  }
+  relayout();
+  if (window.ResizeObserver) new ResizeObserver(relayout).observe(canvas);
+  else window.addEventListener("resize", relayout);
+
+  /* ---------- the script ---------- */
+  const CODE = [
+    "model = GPT2(config)",
+    "model = torch.compile(model,",
+    "  backend=mojo_backend)",
+    "",
+    "y = model(x)      # call 1",
+    "",
+    "y = model(x)      # call 2",
+    "",
+    "x2 = batch(seqlen=2048)",
+    "y = model(x2)     # call 3",
+  ];
+  const N_ROWS = 9;   // max-graph panel rows (0 = input type, 8 = "… ×12 layers")
+
+  /* ---------- world ---------- */
+  let world;
+  function freshWorld() {
+    return {
+      time: 0, clock: 0, si: 0,
+      flyers: [], sparks: [],
+      mgRows: new Array(N_ROWS).fill(null),  // {label, cls:"in"|"op"|"fused"|"more", on, pop}
+      guards: { on: false, flash: 0, flashCol: null },
+      dynamoPulse: 0, decompPulse: 0, mappingPulse: 0, fromdlPulse: 0,
+      engine: { active: false, start: 0, dur: 0 },
+      exec: { loaded: false, pulse: 0, running: null },  // running: {t,dur,kernels}
+      bcache: { n: 0, flash: 0, flashCol: null },
+      cur: 0, blocked: false, ann: {},
+      counters: { fx: 0, maxops: 0, compiles: 0, dlpack: 0, hits: 0 },
+      fade: 0, fading: false, fadeDir: 0,
+    };
+  }
+  world = freshWorld();
+
+  function fly(label, color, from, to, arc, dur, onArrive, opts) {
+    const f = {
+      label, color, x: from.x, y: from.y, alpha: 0, scale: 0.4,
+      small: opts && opts.small, halo: opts && opts.halo,
+      delay: (opts && opts.delay) || 0,
+      path: { p0: { x: from.x, y: from.y },
+              p1: { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 - arc },
+              p2: { x: to.x, y: to.y }, t: 0, dur },
+      onArrive, dead: false,
+    };
+    world.flyers.push(f);
+    return f;
+  }
+  function spawnSpark(x, y, tx, ty, text) {
+    world.sparks.push({ x, y, tx, ty, t: 0, dur: 0.55, text: text || "" });
+  }
+  function annotate(lineIdx, text, color) {
+    world.ann[lineIdx] = { text, color, alpha: 0 };
+  }
+  const codeLineY = (i) => L.code.y0 + 14 * L.s + i * L.lineH;
+  const arrowPt = () => ({ x: L.code.x1 - 4, y: codeLineY(world.cur) });
+  const rowPos = (i) => ({ x: (L.mgpanel.x0 + L.mgpanel.x1) / 2,
+                           y: L.mgpanel.y0 + 26 * L.s + i * 17 * L.s });
+  function addRowGhost(i, label, cls) {
+    world.mgRows[i] = { label, cls: cls || "op", on: false, pop: 0 };
+  }
+  function rowOn(i) {
+    const r = world.mgRows[i];
+    if (r) { r.on = true; r.pop = 1; world.counters.maxops += r.cls === "op" ? 1 : 0; }
+  }
+
+  /* ---------- director ---------- */
+  const noteEl = document.getElementById("stageNote");
+  let noteCur = "";
+  function setNote(s) { if (s !== noteCur) { noteCur = s; noteEl.textContent = s; } }
+
+  let STEPS = [], TOTAL = 0, _cursor = 0;
+  function buildTimeline() {
+    STEPS = []; _cursor = 0;
+    const at = (fn) => STEPS.push({ t: _cursor, fn });
+    const wait = (d) => { _cursor += d; };
+
+    // one aten node's journey: dynamo -> decompose (maybe split, maybe whole)
+    // -> mapping -> a row in the max graph panel.  Chained via onArrive.
+    function sendAten(label, opts) {
+      at(() => {
+        world.counters.fx += 1;
+        fly(label, T.norm, { x: L.dynamo.x + L.dynamo.w / 2 - 6 * L.s, y: L.dynamo.y },
+            { x: L.decomp.x, y: L.decomp.y + 13 * L.s }, 16 * L.s, 0.55, (f) => {
+          f.dead = true;
+          world.decompPulse = 1;
+          const outs = opts.split || [label];
+          outs.forEach((lab, i) => {
+            if (opts.split && i > 0) world.counters.fx += 1;
+            fly(lab, T.norm, L.decomp, { x: L.mapping.x, y: L.mapping.y + 13 * L.s }, 14 * L.s, 0.5, (g) => {
+              g.dead = true;
+              world.mappingPulse = 1;
+              const row = opts.rows[i];
+              addRowGhost(row, opts.max[i], "op");
+              fly(opts.max[i], T.mm, L.mapping, rowPos(row), 22 * L.s, 0.55, (h) => {
+                h.dead = true;
+                rowOn(row);
+              }, { small: true });
+            }, { delay: i * 0.28, halo: opts.whole });
+          });
+        }, { halo: opts.whole });
+      });
+      wait(opts.gap != null ? opts.gap : 0.85);
+    }
+
+    function runBeat(kind) {
+      // kind: "cold" | "warm" | "dyn"
+      if (kind === "cold") {
+        at(() => {
+          fly("x", T.norm, arrowPt(), L.bcache, -30 * L.s, 0.6, (f) => { f.dead = true; });
+          fly("params ×148", T.norm, arrowPt(), L.bcache, -44 * L.s, 0.7, (f) => { f.dead = true; }, { delay: 0.18 });
+        });
+        wait(1.0);
+        at(() => {
+          world.bcache = { n: 149, flash: 1, flashCol: T.drain };
+          world.counters.dlpack += 149;
+          setNote("149 tensors → __dlpack__ capsules, once — cached by id(tensor), aliasing the torch memory");
+        });
+        wait(0.9);
+      } else {
+        at(() => {
+          fly(kind === "dyn" ? "x2" : "x", T.norm, arrowPt(), L.bcache, -30 * L.s, 0.6, (f) => {
+            f.dead = true;
+            world.bcache.flash = 1; world.bcache.flashCol = T.go;
+            world.counters.hits += 148;
+            world.counters.dlpack += 1;
+          });
+        });
+        wait(0.8);
+        at(() => setNote(kind === "dyn"
+          ? "params: buffer-cache hit — only x2 goes through dlpack"
+          : "params: buffer-cache hit — in-place optimizer updates stay visible (buffers alias memory)"));
+      }
+      at(() => {
+        fly("capsules + cuda stream", T.go, L.bcache, { x: L.exec.x - 30 * L.s, y: L.exec.y - 8 * L.s },
+            -26 * L.s, 0.55, (f) => {
+          f.dead = true;
+          world.exec.pulse = 1;
+        }, { small: true });
+      });
+      wait(0.7);
+      at(() => {
+        world.exec.running = { t: 0, dur: kind === "cold" ? 2.6 : 1.8,
+          kernels: ["fused: emb·ln", "matmul", "attention", "fused: gelu·add", "lm_head"] };
+        if (kind === "cold") setNote("model.execute — the fused kernels run back to back on the gpu");
+      });
+      wait(kind === "cold" ? 2.8 : 2.0);
+      at(() => {
+        fly("out buffers", T.go, { x: L.exec.x + L.exec.w / 2 - 8 * L.s, y: L.exec.y },
+            L.fromdl, -18 * L.s, 0.5, (f) => {
+          f.dead = true; world.fromdlPulse = 1;
+        }, { small: true });
+      });
+      wait(0.6);
+      at(() => {
+        fly("y", T.go, L.fromdl, arrowPt(), 110 * L.s, 0.8, (f) => { f.dead = true; });
+      });
+      wait(1.0);
+    }
+
+    /* ---- boot ---- */
+    at(() => { world.cur = 0; setNote("backend=mojo_backend — dynamo will hand us every traced graph"); });
+    wait(0.6);
+    at(() => { world.cur = 1; }); wait(0.4);
+    at(() => { world.cur = 2; }); wait(0.6);
+
+    /* ---- act 1: first call — trace, lower, compile, run ---- */
+    at(() => {
+      world.cur = 4; world.blocked = true;
+      fly("model(x)", T.muted, arrowPt(), { x: L.dynamo.x, y: L.dynamo.y + 13 * L.s }, 22 * L.s, 0.6, (f) => {
+        f.dead = true;
+        world.dynamoPulse = 1;
+      });
+      setNote("call 1 — dynamo traces the python bytecode into an FX graph");
+    });
+    wait(1.3);
+    at(() => {
+      world.guards.on = true; world.guards.flash = 1; world.guards.flashCol = T.amber;
+      setNote("guards installed: input types, dtypes, … — they decide when this graph can be reused");
+    });
+    wait(1.0);
+    at(() => {
+      addRowGhost(0, "in: [s0, 1024, 768] · bf16", "in");
+      rowOn(0);
+      setNote("aot_autograd re-traces to aten — the seqlen becomes a symbolic dim s0 in the graph input");
+    });
+    wait(1.1);
+    sendAten("embedding", { max: ["ops.gather"], rows: [1] });
+    sendAten("layer_norm", { whole: true, max: ["ops.layer_norm"], rows: [2], gap: 1.15 });
+    at(() => setNote("layer_norm is implemented natively — its decomposition was removed, the op stays whole"));
+    wait(0.2);
+    sendAten("linear", { split: ["t", "addmm"], max: ["ops.transpose", "ops.matmul"], rows: [3, 4], gap: 1.35 });
+    at(() => setNote("no native linear — aot_autograd decomposes it into core aten: t + addmm"));
+    wait(0.3);
+    sendAten("sdpa", { whole: true, max: ["ops.attention"], rows: [5], gap: 1.15 });
+    at(() => setNote("sdpa stays whole and maps to MAX's fused attention — never decomposed into softmax·matmul"));
+    wait(0.3);
+    sendAten("gelu", { whole: true, max: ["ops.gelu"], rows: [6] });
+    sendAten("add", { max: ["ops.add"], rows: [7], gap: 1.2 });
+    at(() => {
+      addRowGhost(8, "… ×12 layers", "more");
+      rowOn(8);
+    });
+    wait(1.0);
+    at(() => {
+      world.engine = { active: true, start: world.clock, dur: 3.8 };
+      setNote("session.load(graph) — the MAX engine compiles the whole graph at once");
+    });
+    wait(2.0);
+    at(() => setNote("…and fuses adjacent elementwise ops into single kernels along the way"));
+    wait(1.9);
+    at(() => {
+      world.engine.active = false;
+      world.counters.compiles += 1;
+      // fusion becomes visible in the graph panel: gelu + add collapse
+      world.mgRows[6] = { label: "fused: gelu·add ✦", cls: "fused", on: true, pop: 1 };
+      world.mgRows.splice(7, 1);
+      spawnSpark(L.engine.x, L.engine.y, L.exec.x, L.exec.y - L.exec.h / 2, "compiled model");
+    });
+    wait(0.8);
+    at(() => {
+      world.exec.loaded = true; world.exec.pulse = 1;
+      setNote("the compiled model is ready — now the data has to reach it");
+    });
+    wait(0.8);
+    runBeat("cold");
+    at(() => { world.blocked = false; annotate(4, "3.2 s", T.amber); });
+    wait(1.6);
+
+    /* ---- act 2: warm call — guards pass, straight to execution ---- */
+    at(() => {
+      world.cur = 6;
+      fly("model(x)", T.muted, arrowPt(), L.guards, 30 * L.s, 0.55, (f) => {
+        f.dead = true;
+        world.guards.flash = 1; world.guards.flashCol = T.go;
+      });
+      setNote("call 2 — the guards pass: no re-trace, no re-compile");
+    });
+    wait(0.9);
+    runBeat("warm");
+    at(() => { annotate(6, "410 µs", T.go); });
+    wait(1.5);
+
+    /* ---- act 3: new seqlen — symbolic dim, same model ---- */
+    at(() => { world.cur = 8; setNote("a new batch with seqlen 2048"); });
+    wait(0.6);
+    at(() => {
+      world.cur = 9;
+      fly("model(x2)", T.muted, arrowPt(), L.guards, 30 * L.s, 0.55, (f) => {
+        f.dead = true;
+        world.guards.flash = 1; world.guards.flashCol = T.go;
+      });
+      setNote("seqlen is the symbolic dim s0 — the guards still pass, the SAME compiled model runs");
+    });
+    wait(0.9);
+    runBeat("dyn");
+    at(() => { annotate(9, "415 µs", T.go); });
+    wait(1.6);
+    at(() => setNote("one MAX graph per dynamo graph — fused, dynamic-shaped, zero-copy in and out"));
+    wait(2.4);
+
+    STEPS.sort((a, b) => a.t - b.t);
+    TOTAL = _cursor + 0.4;
+  }
+  buildTimeline();
+
+  /* ---------- update ---------- */
+  function update(dt) {
+    world.time += dt;
+
+    if (world.fading) {
+      world.fade = clamp(world.fade + world.fadeDir * dt * 1.3, 0, 1);
+      if (world.fade >= 1 && world.fadeDir > 0) {
+        const keep = world.fade;
+        world = freshWorld();
+        world.fade = keep; world.fading = true; world.fadeDir = -1;
+        setNote("loop · back to the first call");
+      } else if (world.fade <= 0 && world.fadeDir < 0) {
+        world.fading = false; world.fadeDir = 0;
+      }
+    } else {
+      world.clock += dt;
+      while (world.si < STEPS.length && world.clock >= STEPS[world.si].t) {
+        STEPS[world.si].fn();
+        world.si += 1;
+      }
+      if (world.clock >= TOTAL && !world.fading) {
+        world.fading = true; world.fadeDir = 1;
+      }
+    }
+
+    for (const f of world.flyers) {
+      if (f.delay > 0) { f.delay -= dt; continue; }
+      f.alpha = glide(f.alpha, 1, dt, 8);
+      f.scale = glide(f.scale, 1, dt, 8);
+      if (f.path) {
+        f.path.t += dt / f.path.dur;
+        const t = easeInOut(clamp(f.path.t, 0, 1));
+        const pt = qBezier(f.path.p0, f.path.p1, f.path.p2, t);
+        f.x = pt.x; f.y = pt.y;
+        if (f.path.t >= 1) {
+          f.path = null;
+          if (f.onArrive) f.onArrive(f);
+        }
+      }
+    }
+    world.flyers = world.flyers.filter(f => !f.dead);
+
+    for (const r of world.mgRows) if (r && r.pop) r.pop = Math.max(0, r.pop - dt * 2.0);
+    world.guards.flash = Math.max(0, world.guards.flash - dt * 1.4);
+    world.dynamoPulse = Math.max(0, world.dynamoPulse - dt * 1.4);
+    world.decompPulse = Math.max(0, world.decompPulse - dt * 2.2);
+    world.mappingPulse = Math.max(0, world.mappingPulse - dt * 2.2);
+    world.fromdlPulse = Math.max(0, world.fromdlPulse - dt * 2.0);
+    world.exec.pulse = Math.max(0, world.exec.pulse - dt * 1.8);
+    world.bcache.flash = Math.max(0, world.bcache.flash - dt * 1.4);
+
+    if (world.exec.running) {
+      const r = world.exec.running;
+      r.t += dt;
+      if (r.t >= r.dur) world.exec.running = null;
+    }
+
+    for (const s of world.sparks) s.t += dt / s.dur;
+    world.sparks = world.sparks.filter(s => s.t < 1);
+    for (const k in world.ann) world.ann[k].alpha = glide(world.ann[k].alpha, 1, dt, 5);
+
+    hudFx.textContent = world.counters.fx;
+    hudMaxops.textContent = world.counters.maxops;
+    hudCompiles.textContent = world.counters.compiles;
+    hudDlpack.textContent = world.counters.dlpack;
+    hudHits.textContent = world.counters.hits;
+  }
+
+  /* ---------- draw ---------- */
+  function drawStationBox(st, title, sub, pulse, pulseCol) {
+    const s = L.s;
+    ctx.fillStyle = T.panel2;
+    ctx.strokeStyle = T.line;
+    ctx.lineWidth = Math.max(1, s);
+    if (pulse) { ctx.shadowColor = pulseCol || T.amber; ctx.shadowBlur = 16 * pulse * s; }
+    rr(st.x - st.w / 2, st.y - st.h / 2, st.w, st.h, 9 * s);
+    ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = T.ink;
+    ctx.font = fpx(10, "600");
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(title, st.x, st.y - (sub ? 6 * s : 0));
+    if (sub) {
+      ctx.fillStyle = T.muted;
+      ctx.font = fpx(7.6);
+      ctx.fillText(sub, st.x, st.y + 8 * s);
+    }
+  }
+  function drawLabel(x, y, text, align) {
+    ctx.fillStyle = T.muted;
+    ctx.font = fpx(9, "600");
+    ctx.textAlign = align || "center"; ctx.textBaseline = "alphabetic";
+    ctx.fillText(text.toUpperCase(), x, y);
+  }
+  function drawRail(p0, p1, arc) {
+    ctx.strokeStyle = T.lineSoft;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([1, 5]);
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y);
+    ctx.quadraticCurveTo((p0.x + p1.x) / 2, (p0.y + p1.y) / 2 - arc, p1.x, p1.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawCode() {
+    const C = L.code, s = L.s;
+    ctx.fillStyle = T.codeBg;
+    ctx.strokeStyle = T.line;
+    ctx.lineWidth = Math.max(1, s);
+    rr(C.x0, C.y0, C.x1 - C.x0, C.y1 - C.y0, 10 * s);
+    ctx.fill(); ctx.stroke();
+    drawLabel((C.x0 + C.x1) / 2, C.y0 - 8 * s, "pytorch");
+
+    ctx.textBaseline = "middle";
+    for (let i = 0; i < CODE.length; i++) {
+      const y = codeLineY(i);
+      const isCur = i === world.cur;
+      if (isCur) {
+        ctx.fillStyle = world.blocked ? withAlpha(T.drain, 0.14) : T.amberSoft;
+        rr(C.x0 + 4 * s, y - L.lineH / 2 + 1, C.x1 - C.x0 - 8 * s, L.lineH - 1, 4 * s);
+        ctx.fill();
+        ctx.fillStyle = world.blocked ? T.drain : T.amber;
+        ctx.beginPath();
+        ctx.moveTo(C.x0 + 6 * s, y - 4 * s);
+        ctx.lineTo(C.x0 + 13 * s, y);
+        ctx.lineTo(C.x0 + 6 * s, y + 4 * s);
+        ctx.closePath();
+        ctx.fill();
+      }
+      const isComment = CODE[i].startsWith("#");
+      ctx.globalAlpha = isCur ? 1 : 0.82;
+      ctx.fillStyle = isComment ? T.muted : T.ink;
+      ctx.font = fpx(9, isCur ? "600" : "");
+      ctx.textAlign = "left";
+      ctx.fillText(CODE[i], C.x0 + 18 * s, y);
+      ctx.globalAlpha = 1;
+      const a = world.ann[i];
+      if (a) {
+        ctx.globalAlpha = a.alpha;
+        ctx.fillStyle = a.color;
+        ctx.font = fpx(8.5, "600");
+        ctx.textAlign = "right";
+        ctx.fillText(a.text, C.x1 - 8 * s, y);
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function drawGuards() {
+    const G = L.guards, s = L.s;
+    if (!world.guards.on) return;
+    ctx.fillStyle = T.panel2;
+    ctx.strokeStyle = world.guards.flash > 0 ? (world.guards.flashCol || T.amber) : T.line;
+    ctx.lineWidth = (world.guards.flash > 0 ? 1.8 : 1) * s;
+    if (world.guards.flash > 0) {
+      ctx.shadowColor = world.guards.flashCol || T.amber;
+      ctx.shadowBlur = 12 * world.guards.flash * s;
+    }
+    rr(G.x - G.w / 2, G.y - G.h / 2, G.w, G.h, 7 * s);
+    ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = T.muted;
+    ctx.font = fpx(7.4, "600");
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("guards: types · dtypes · …", G.x, G.y + 0.5);
+  }
+
+  function drawMgPanel() {
+    const P = L.mgpanel, s = L.s;
+    ctx.fillStyle = withAlpha(T.panel2, 0.5);
+    ctx.strokeStyle = T.line;
+    ctx.lineWidth = Math.max(1, s);
+    rr(P.x0, P.y0, P.x1 - P.x0, P.y1 - P.y0, 9 * s);
+    ctx.fill(); ctx.stroke();
+    drawLabel((P.x0 + P.x1) / 2, P.y0 - 8 * s, "max graph");
+    let shown = 0;
+    for (let i = 0; i < world.mgRows.length; i++) {
+      const r = world.mgRows[i];
+      if (!r) continue;
+      const p = rowPos(i);
+      const a = r.on ? 1 : 0.25;
+      const pop = 1 + (r.pop || 0) * 0.12;
+      ctx.globalAlpha = a;
+      if (r.cls === "op" || r.cls === "fused") {
+        const col = r.cls === "fused" ? T.amber : T.mm;
+        const w = (r.label.length * 4.8 + 12) * s * pop;
+        ctx.fillStyle = withAlpha(col, 0.12);
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 1.1 * s;
+        rr(p.x - w / 2, p.y - 7 * s * pop, w, 14 * s * pop, 5 * s);
+        ctx.fill(); ctx.stroke();
+        ctx.fillStyle = col;
+        ctx.font = fpx(7.2, "600");
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(r.label, p.x, p.y + 0.5);
+      } else {
+        ctx.fillStyle = T.muted;
+        ctx.font = fpx(7.2, r.cls === "in" ? "600" : "");
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(r.label, p.x, p.y + 0.5);
+      }
+      ctx.globalAlpha = 1;
+      shown++;
+    }
+    if (!shown) {
+      ctx.fillStyle = T.muted;
+      ctx.globalAlpha = 0.55;
+      ctx.font = fpx(8);
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("empty", (P.x0 + P.x1) / 2, (P.y0 + P.y1) / 2);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawEngine() {
+    const E = L.engine, s = L.s, en = world.engine;
+    drawLabel(E.x, E.y - E.r - 12 * s, "max graph engine compilation");
+    ctx.beginPath();
+    ctx.arc(E.x, E.y, E.r, 0, Math.PI * 2);
+    ctx.strokeStyle = T.line; ctx.lineWidth = 2.6 * s; ctx.stroke();
+    if (en.active) {
+      const fr = clamp((world.clock - en.start) / en.dur, 0, 1);
+      ctx.beginPath();
+      ctx.arc(E.x, E.y, E.r, -Math.PI / 2, -Math.PI / 2 + fr * Math.PI * 2);
+      ctx.strokeStyle = T.amber; ctx.lineWidth = 3 * s; ctx.lineCap = "round"; ctx.stroke();
+      ctx.lineCap = "butt";
+      const spin = world.time * 2.1;
+      ctx.beginPath();
+      ctx.arc(E.x + Math.cos(spin) * (E.r - 5 * s), E.y + Math.sin(spin) * (E.r - 5 * s), 1.5 * s, 0, Math.PI * 2);
+      ctx.fillStyle = T.amber; ctx.fill();
+      ctx.fillStyle = T.muted;
+      ctx.font = fpx(7.5);
+      ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+      ctx.fillText("session.load(graph)", E.x, E.y + E.r + 14 * s);
+      ctx.fillText("kernel fusion", E.x, E.y + E.r + 25 * s);
+    }
+  }
+
+  function drawExec() {
+    const E = L.exec, s = L.s, ex = world.exec;
+    ctx.fillStyle = T.panel2;
+    ctx.strokeStyle = ex.loaded ? T.mm : T.line;
+    ctx.lineWidth = (ex.loaded ? 1.6 : 1) * s;
+    if (ex.pulse > 0) { ctx.shadowColor = T.mm; ctx.shadowBlur = 16 * ex.pulse * s; }
+    rr(E.x - E.w / 2, E.y - E.h / 2, E.w, E.h, 10 * s);
+    ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = T.ink;
+    ctx.font = fpx(10, "600");
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("model.execute · gpu", E.x, E.y - E.h / 2 + 13 * s);
+    // inner ring
+    const ringX = E.x - E.w / 2 + 26 * s, ringY = E.y + 8 * s, ringR = 11 * s;
+    ctx.beginPath();
+    ctx.arc(ringX, ringY, ringR, 0, Math.PI * 2);
+    ctx.strokeStyle = T.line; ctx.lineWidth = 2.4 * s; ctx.stroke();
+    if (ex.running) {
+      const r = ex.running;
+      const per = r.dur / r.kernels.length;
+      const idx = Math.min(r.kernels.length - 1, Math.floor(r.t / per));
+      const fr = clamp((r.t - idx * per) / per, 0, 1);
+      ctx.beginPath();
+      ctx.arc(ringX, ringY, ringR, -Math.PI / 2, -Math.PI / 2 + fr * Math.PI * 2);
+      ctx.strokeStyle = T.mm; ctx.lineWidth = 3 * s; ctx.lineCap = "round"; ctx.stroke();
+      ctx.lineCap = "butt";
+      ctx.beginPath();
+      ctx.arc(ringX, ringY, 3 * s, 0, Math.PI * 2);
+      ctx.fillStyle = T.mm; ctx.fill();
+      ctx.fillStyle = T.mm;
+      ctx.font = fpx(7.6, "600");
+      ctx.textAlign = "left";
+      ctx.fillText(r.kernels[idx], ringX + ringR + 8 * s, ringY);
+    } else {
+      const idlePulse = (Math.sin(world.time * 2.2) + 1) / 2;
+      ctx.beginPath();
+      ctx.arc(ringX, ringY, 3 * s, 0, Math.PI * 2);
+      ctx.fillStyle = withAlpha(T.muted, 0.3 + idlePulse * 0.3);
+      ctx.fill();
+      ctx.fillStyle = T.muted;
+      ctx.font = fpx(7.6);
+      ctx.textAlign = "left";
+      ctx.fillText(ex.loaded ? "idle" : "waiting for a compiled model", ringX + ringR + 8 * s, ringY);
+    }
+  }
+
+  function drawFlyer(f) {
+    if (f.delay > 0) return;
+    const s = L.s;
+    const w = Math.max(26, f.label.length * (f.small ? 4.4 : 5.4) + 10) * f.scale * s;
+    const h = (f.small ? 13 : 16) * f.scale * s;
+    ctx.globalAlpha = f.alpha;
+    if (f.halo) { ctx.shadowColor = T.go; ctx.shadowBlur = 9 * s; }
+    ctx.fillStyle = withAlpha(f.color, 0.13);
+    ctx.strokeStyle = f.halo ? T.go : f.color;
+    ctx.lineWidth = 1.2 * s;
+    rr(f.x - w / 2, f.y - h / 2, w, h, 5 * s);
+    ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = f.color;
+    ctx.font = fpx(f.small ? 6.8 : 7.6, "600");
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(f.label, f.x, f.y + 0.5);
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = T.bg;
+    ctx.fillRect(0, 0, W, H);
+    const s = L.s;
+
+    // rails
+    drawRail({ x: L.code.x1 - 4, y: codeLineY(4) }, L.dynamo, 16 * s);
+    drawRail(L.dynamo, L.decomp, 8 * s);
+    drawRail(L.decomp, L.mapping, 7 * s);
+    drawRail(L.mapping, { x: L.mgpanel.x0, y: L.topY }, 10 * s);
+    drawRail({ x: L.mgpanel.x1, y: L.topY }, L.engine, 10 * s);
+    drawRail(L.engine, { x: L.exec.x, y: L.exec.y - L.exec.h / 2 }, 70 * s);
+    drawRail({ x: L.code.x1 - 4, y: codeLineY(6) }, L.bcache, -40 * s);
+    drawRail(L.bcache, L.exec, -20 * s);
+    drawRail(L.exec, L.fromdl, -14 * s);
+    drawRail(L.fromdl, { x: L.code.x1 - 4, y: codeLineY(4) }, 130 * s);
+
+    drawCode();
+    drawStationBox(L.dynamo, "dynamo", "traces bytecode", world.dynamoPulse, T.norm);
+    drawGuards();
+    drawStationBox(L.decomp, "decompose", "core aten − native ops", world.decompPulse, T.norm);
+    drawStationBox(L.mapping, "find equivalent", "MAPPING_ATEN_TO_MOJO", world.mappingPulse, T.mm);
+    drawLabel((L.dynamo.x + L.mapping.x) / 2, L.topY - 42 * s, "compile path · first call only");
+    drawMgPanel();
+    drawEngine();
+    drawLabel((L.bcache.x + L.fromdl.x) / 2, L.runY - 48 * s, "executing the compiled max graph");
+    drawStationBox(L.bcache, "buffer cache", "dlpack once per tensor", null, null);
+    if (world.bcache.flash > 0) {
+      ctx.strokeStyle = withAlpha(world.bcache.flashCol || T.go, world.bcache.flash);
+      ctx.lineWidth = 2.4 * s;
+      rr(L.bcache.x - L.bcache.w / 2 - 3 * s, L.bcache.y - L.bcache.h / 2 - 3 * s,
+         L.bcache.w + 6 * s, L.bcache.h + 6 * s, 11 * s);
+      ctx.stroke();
+    }
+    drawExec();
+    drawStationBox(L.fromdl, "torch.from_dlpack", "zero-copy → torch", world.fromdlPulse, T.go);
+
+    for (const sp of world.sparks) {
+      const t = easeOut(clamp(sp.t, 0, 1));
+      const pt = qBezier({ x: sp.x, y: sp.y }, { x: (sp.x + sp.tx) / 2 + 12 * s, y: (sp.y + sp.ty) / 2 - 20 * s }, { x: sp.tx, y: sp.ty }, t);
+      ctx.globalAlpha = 1 - t * 0.4;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, 2.6 * s, 0, Math.PI * 2);
+      ctx.fillStyle = T.amber; ctx.fill();
+      if (sp.text) {
+        ctx.font = fpx(7.5);
+        ctx.fillStyle = T.amber;
+        ctx.textAlign = "left";
+        ctx.fillText(sp.text, pt.x + 5 * s, pt.y + 3 * s);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    for (const f of world.flyers) drawFlyer(f);
+
+    if (world.fade > 0) {
+      ctx.fillStyle = withAlpha(T.bg[0] === "#" ? T.bg : "#000000", world.fade);
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+
+  /* ---------- loop / controls ---------- */
+  const hudFx = document.getElementById("hud-fx"),
+        hudMaxops = document.getElementById("hud-maxops"),
+        hudCompiles = document.getElementById("hud-compiles"),
+        hudDlpack = document.getElementById("hud-dlpack"),
+        hudHits = document.getElementById("hud-hits");
+  const btnPlay = document.getElementById("btnPlay");
+  const btnSpeed = document.getElementById("btnSpeed");
+  const btnRestart = document.getElementById("btnRestart");
+  const overlay = document.getElementById("playOverlay");
+
+  const SPEEDS = [1, 1.6, 0.6, 0.2];
+  let speedIdx = 0;
+  btnSpeed.addEventListener("click", () => {
+    speedIdx = (speedIdx + 1) % SPEEDS.length;
+    btnSpeed.textContent = SPEEDS[speedIdx] + "×";
+  });
+  btnRestart.addEventListener("click", () => {
+    world = freshWorld();
+    setNote("first call — dynamo hands us an FX graph");
+    if (!running) { draw(); }
+  });
+
+  const btnFull = document.getElementById("btnFull");
+  const stageCard = document.getElementById("stageCard");
+  function fullIsOn() {
+    return !!document.fullscreenElement || stageCard.classList.contains("pseudo-full");
+  }
+  function syncFullBtn() {
+    btnFull.textContent = fullIsOn() ? "✕ exit fullscreen" : "⛶ fullscreen";
+  }
+  btnFull.addEventListener("click", async () => {
+    if (fullIsOn()) {
+      if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch (e) {} }
+      stageCard.classList.remove("pseudo-full");
+      syncFullBtn();
+      return;
+    }
+    let native = false;
+    if (stageCard.requestFullscreen) {
+      try { await stageCard.requestFullscreen(); native = true; } catch (e) {}
+    }
+    if (!native) stageCard.classList.add("pseudo-full");
+    syncFullBtn();
+  });
+  document.addEventListener("fullscreenchange", syncFullBtn);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && stageCard.classList.contains("pseudo-full")) {
+      stageCard.classList.remove("pseudo-full");
+      syncFullBtn();
+    }
+  });
+
+  let running = true, last = null, raf = 0;
+  function frame(ts) {
+    if (last == null) last = ts;
+    let dt = Math.min((ts - last) / 1000, 0.05) * SPEEDS[speedIdx];
+    last = ts;
+    update(dt);
+    draw();
+    if (running) raf = requestAnimationFrame(frame);
+  }
+  function togglePlay(force) {
+    running = force !== undefined ? force : !running;
+    btnPlay.textContent = running ? "⏸ pause" : "▶ play";
+    btnPlay.setAttribute("aria-pressed", String(running));
+    overlay.classList.toggle("visible", !running && neverStarted);
+    if (running) { neverStarted = false; overlay.classList.remove("visible"); last = null; raf = requestAnimationFrame(frame); }
+    else cancelAnimationFrame(raf);
+  }
+  btnPlay.addEventListener("click", () => togglePlay());
+  document.getElementById("bigPlay").addEventListener("click", () => togglePlay(true));
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && running) { cancelAnimationFrame(raf); }
+    else if (!document.hidden && running) { last = null; raf = requestAnimationFrame(frame); }
+  });
+
+  let neverStarted = false;
+  const reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduced) {
+    neverStarted = true;
+    running = false;
+    btnPlay.textContent = "▶ play";
+    btnPlay.setAttribute("aria-pressed", "false");
+    overlay.classList.add("visible");
+    draw();
+  } else {
+    raf = requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
