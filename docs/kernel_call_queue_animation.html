@@ -280,9 +280,9 @@
     L.prepare = { x: W * 0.223, y: band, w: 84 * s, h: 46 * s };
     L.cache   = { x: W * 0.306, y: band, w: 72 * s, h: 46 * s };
     const slots = 6;
-    L.pool = { x0: W * 0.355, x1: W * 0.560, y: H * 0.30, slots, r: 11 * s };
+    L.pool = { x0: W * 0.368, x1: W * 0.555, y: H * 0.30, slots, r: 11 * s };
     L.poolSlot = (i) => ({ x: L.pool.x0 + (L.pool.x1 - L.pool.x0) * (i / (slots - 1)), y: L.pool.y });
-    L.queue = { x0: W * 0.352, x1: W * 0.565, y: band, cap: 8 };
+    L.queue = { x0: W * 0.368, x1: W * 0.555, y: band, cap: 7 };
     // head at the RIGHT end: chips enter at the left tail and travel rightward
     L.queueSlot = (i, n) => {
       const vis = Math.min(n, L.queue.cap);
@@ -290,7 +290,7 @@
       return { x: L.queue.x1 - Math.min(i, L.queue.cap - 1) * step, y: L.queue.y };
     };
     L.gpu = { cx: W * 0.958, cy: band, w: 62 * s, h: 60 * s };
-    L.device = { x0: W * 0.588, x1: L.gpu.cx - L.gpu.w / 2 - 6 * s, y: band, h: 26 * s };
+    L.device = { x0: W * 0.600, x1: L.gpu.cx - L.gpu.w / 2 - 6 * s, y: band, h: 26 * s };
     L.entry = { x: L.device.x0 + 8 * s, y: band };
   }
   relayout();
@@ -395,8 +395,8 @@
       time: 0,
       chips: [], builds: [], queue: [], stream: [], sparks: [],
       cache: new Set(), requested: new Set(),
-      launched: 0, pyChip: null,
-      drainActive: false, drainX: 0,
+      launched: 0, pyChip: null, lastRelease: -9, relSeq: 0,
+      drainActive: false, drainFade: 0, drainLine: 0,
       gpu: { busy: null, flash: 0, flashFam: null },
       prog: { idx: 0, wait: 0.7, pass: 1, blocked: false, holding: false,
               scroll: 12 * L.s - (L.code.arrowY - L.code.y0), itemFlash: 0, unhold: 0 },
@@ -445,8 +445,8 @@
     const slot = L.queueSlot(idx, world.queue.length);
     startPath(chip, chip, slot, 20 * L.s, 0.4);
   }
-  function spawnSpark(x, y, tx, ty) {
-    world.sparks.push({ x, y, tx, ty, t: 0, dur: 0.5 });
+  function spawnSpark(x, y, tx, ty, onArrive) {
+    world.sparks.push({ x, y, tx, ty, t: 0, dur: 0.5, onArrive, fired: false });
   }
 
   /* ---------- program execution ---------- */
@@ -478,7 +478,8 @@
     // cleared prepare + variant — never two ops in the python section
     world.pyChip = c;
     p.holding = true;
-    startPath(c, c, { x: L.prepare.x, y: L.prepare.y }, 12 * L.s, pipe.toPrep);
+    // land just under the station title so the box stays readable
+    startPath(c, c, { x: L.prepare.x, y: L.prepare.y + 13 * L.s }, 12 * L.s, pipe.toPrep);
   }
   function releaseHold(c) {
     if (world.pyChip !== c) return;
@@ -488,7 +489,7 @@
   }
   function startDrain() {
     world.drainActive = true;
-    world.drainX = L.queue.x0 - 60;
+    world.drainLine = world.prog.idx;
     for (const b of world.builds) if (!b.done) b.dur = Math.min(b.dur, (b.progress + 0.3) * b.dur + 0.4);
   }
 
@@ -528,7 +529,8 @@
     } else if (p.blocked) {
       const flushed = world.chips.length === 0 && world.queue.length === 0 &&
                       world.stream.length === 0 && !world.gpu.busy;
-      if (flushed && !world.drainActive) {
+      if (flushed) {
+        world.drainActive = false;
         p.itemFlash = 1.4;
         p.unhold = p.pass === 1 ? 1.6 : 2.2;
       }
@@ -559,28 +561,40 @@
       b.shown = glide(b.shown, b.progress, dt, 6);
       if (b.progress >= 1) {
         b.done = true; b.pulse = 1;
-        world.cache.add(b.key);
         const sl = L.poolSlot(b.slot);
-        let first = true;
-        for (const q of world.queue) {
-          if (vkey(q.chip) === b.key && !q.ready) {
-            q.ready = true; q.chip.hollow = false; q.chip.fillPulse = 1;
-            if (first && !q.chip.qHidden) { spawnSpark(sl.x, sl.y, q.chip.x, q.chip.y); first = false; }
+        const key = b.key;
+        // the .so dot IS the delivery: nothing turns solid, ready, or
+        // launchable until it lands on the waiting kernel
+        const target = world.queue.find(q => vkey(q.chip) === key && !q.ready && !q.chip.qHidden);
+        const tx = target ? target.chip.x : L.cache.x;
+        const ty = target ? target.chip.y : L.cache.y;
+        spawnSpark(sl.x, sl.y, tx, ty, () => {
+          world.cache.add(key);
+          for (const q of world.queue) {
+            if (vkey(q.chip) === key && !q.ready) {
+              q.ready = true; q.chip.hollow = false; q.chip.fillPulse = 1;
+            }
           }
-        }
-        if (first) spawnSpark(sl.x, sl.y, L.cache.x, L.cache.y);
+        });
       }
     }
     world.builds = world.builds.filter(b => !b.done || b.pulse > 0);
 
-    // ---- queue pump: release the longest ready prefix, head first ----
-    let stagger = 0;
-    while (world.queue.length && world.queue[0].ready) {
+    // ---- queue pump: strict FIFO, one launch leaves the head at a time ----
+    // The chip flies the moment it is released (no parked, delayed chips:
+    // the queue must never glide underneath an already-released launch).
+    if (world.queue.length && world.queue[0].ready &&
+        world.time - world.lastRelease >= 0.09) {
       const item = world.queue.shift();
-      item.chip.state = "releasing";
-      item.chip.qHidden = false;
-      item.chip.launchDelay = stagger;
-      stagger = Math.min(stagger + 0.08, 2.4);
+      const c = item.chip;
+      c.qHidden = false;
+      c.state = "toStream";
+      c.relSeq = ++world.relSeq;
+      // constant SPEED, not constant duration: a chip released farther from
+      // the entry must not overtake one already in flight
+      const dist = Math.hypot(L.entry.x - c.x, L.entry.y - c.y);
+      startPath(c, c, L.entry, -14 * L.s, clamp(dist / (W * 0.5), 0.1, 0.55));
+      world.lastRelease = world.time;
     }
     world.queue.forEach((item, i) => {
       const c = item.chip;
@@ -591,11 +605,10 @@
       c.y = glide(c.y, slot.y, dt, 7);
     });
 
-    // ---- drain sweep (left to right, pushing launches out the head) ----
-    if (world.drainActive) {
-      world.drainX = glide(world.drainX, L.queue.x1 + 80, dt, 0.9);
-      if (world.queue.length === 0) world.drainActive = false;
-    }
+    // ---- drain tethers: visible while .item() waits, fading once flushed ----
+    world.drainFade = glide(world.drainFade,
+      world.prog.blocked && world.prog.unhold <= 0 ? 1 : 0,
+      dt, world.prog.blocked && world.prog.unhold <= 0 ? 10 : 2.2);
 
     // ---- chips in flight ----
     for (const c of world.chips) {
@@ -626,14 +639,8 @@
         c.dwell -= dt;
         if (c.dwell <= 0) {
           c.state = "toCache";
-          startPath(c, c, { x: L.cache.x, y: L.cache.y }, 8 * L.s, chipPipe(c.isMiss).toCache);
+          startPath(c, c, { x: L.cache.x, y: L.cache.y + 13 * L.s }, 8 * L.s, chipPipe(c.isMiss).toCache);
           c.path.t = clamp(-c.dwell / c.path.dur, 0, 0.9);
-        }
-      } else if (c.state === "releasing") {
-        c.launchDelay -= dt;
-        if (c.launchDelay <= 0) {
-          c.state = "toStream";
-          startPath(c, c, L.entry, -14 * L.s, 0.3);
         }
       }
     }
@@ -643,9 +650,12 @@
         if (c.needsBuild && !world.builds.some(b => !b.done && b.key === key) && !world.cache.has(key)) {
           makeBuild(key, c.fam);
         }
-        if (world.cache.has(key) && world.queue.length === 0 && !world.drainActive) {
-          // already compiled and nothing queued: launch straight onto the stream
+        const inFlight = world.chips.some(o => o !== c && o.state === "toStream");
+        if (world.cache.has(key) && world.queue.length === 0 && !world.drainActive && !inFlight) {
+          // already compiled, nothing queued, nothing in flight:
+          // launch straight onto the stream
           c.state = "toStream"; c.hit = true;
+          c.relSeq = ++world.relSeq;
           startPath(c, c, L.entry, -46 * L.s, world.prog.pass === 1 ? 0.42 : 0.3);
         } else if (world.cache.has(key)) {
           enqueue(c, true);
@@ -660,7 +670,8 @@
         const tail = world.stream[world.stream.length - 1];
         const kw = Math.max(26, c.label.length * 5.6 + 10) * L.s;
         const x0 = tail ? Math.min(L.entry.x, tail.x - tail.w - 4 * L.s) : L.entry.x;
-        world.stream.push({ label: c.label, fam: c.fam, cost: c.cost, w: kw, x: x0, alpha: 0 });
+        world.stream.push({ label: c.label, fam: c.fam, cost: c.cost, w: kw, x: x0,
+                            alpha: 0, seq: c.relSeq });
         c.state = "dead";
       }
     }
@@ -701,7 +712,10 @@
     gpu.flash = Math.max(0, gpu.flash - dt * 2.2);
 
     // ---- sparks ----
-    for (const s of world.sparks) s.t += dt / s.dur;
+    for (const s of world.sparks) {
+      s.t += dt / s.dur;
+      if (s.t >= 1 && !s.fired) { s.fired = true; if (s.onArrive) s.onArrive(); }
+    }
     world.sparks = world.sparks.filter(s => s.t < 1);
 
     // ---- status note ----
@@ -833,8 +847,8 @@
   function drawChip(c) {
     if (c.qHidden && c.alpha < 0.05) return;
     const s = L.s;
-    const w = Math.max(28, c.label.length * 6 + 12) * c.scale * s;
-    const h = 18 * c.scale * s;
+    const w = Math.max(26, c.label.length * 5.6 + 10) * c.scale * s;
+    const h = 17 * c.scale * s;
     const color = T.fam[c.fam] || T.muted;
     ctx.globalAlpha = c.alpha;
     if (c.hollow) {
@@ -858,7 +872,7 @@
       ctx.shadowBlur = 0;
       ctx.fillStyle = "#fff";
     }
-    ctx.font = fpx(9, "600");
+    ctx.font = fpx(8.5, "600");
     ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.fillText(c.label, c.x, c.y + 0.5);
     ctx.globalAlpha = 1;
@@ -929,7 +943,7 @@
     drawLabel((L.queue.x0 + L.queue.x1) / 2, L.queue.y - 26 * S, "launch queue · strict fifo");
     ctx.strokeStyle = T.line;
     ctx.lineWidth = Math.max(1, S);
-    rr(L.queue.x0 - 26 * S, L.queue.y - 14 * S, (L.queue.x1 - L.queue.x0) + 52 * S, 28 * S, 14 * S);
+    rr(L.queue.x0 - 20 * S, L.queue.y - 14 * S, (L.queue.x1 - L.queue.x0) + 40 * S, 28 * S, 14 * S);
     ctx.stroke();
     ctx.fillStyle = T.muted;
     ctx.font = fpx(8);
@@ -937,13 +951,13 @@
     ctx.fillText("head →", L.queue.x1 + 4, L.queue.y + 26 * S);
     const hidden = Math.max(0, world.queue.length - L.queue.cap);
     if (hidden > 0) {
-      const tail = L.queueSlot(L.queue.cap - 1, world.queue.length);
       ctx.fillStyle = T.muted;
       ctx.font = fpx(8.5, "600");
-      ctx.textAlign = "right";
-      ctx.fillText(`+${hidden} more`, tail.x - 24 * S, L.queue.y + 3 * S);
+      ctx.textAlign = "left";
+      ctx.fillText(`+${hidden} more waiting`, L.queue.x0 - 24 * S, L.queue.y + 26 * S);
     }
-    if (world.queue.length === 0 && !world.drainActive) {
+    const launchesInFlight = world.chips.some((c) => c.state === "toStream");
+    if (world.queue.length === 0 && !world.drainActive && !launchesInFlight) {
       ctx.fillStyle = T.muted;
       ctx.globalAlpha = 0.7;
       ctx.font = fpx(8.5);
@@ -951,25 +965,6 @@
       ctx.fillText(world.cache.size >= 10 ? "empty — direct dispatch" : "empty",
         (L.queue.x0 + L.queue.x1) / 2, L.queue.y + 3 * S);
       ctx.globalAlpha = 1;
-    }
-
-    // drain sweep
-    if (world.drainActive) {
-      const grad = ctx.createLinearGradient(world.drainX - 50 * S, 0, world.drainX, 0);
-      grad.addColorStop(0, withAlpha(T.drain, 0));
-      grad.addColorStop(1, withAlpha(T.drain, 0.16));
-      ctx.fillStyle = grad;
-      ctx.fillRect(world.drainX - 50 * S, L.queue.y - 22 * S, 50 * S, 44 * S);
-      ctx.strokeStyle = withAlpha(T.drain, 0.9);
-      ctx.lineWidth = 1.5 * S;
-      ctx.beginPath();
-      ctx.moveTo(world.drainX, L.queue.y - 22 * S);
-      ctx.lineTo(world.drainX, L.queue.y + 22 * S);
-      ctx.stroke();
-      ctx.fillStyle = T.drain;
-      ctx.font = fpx(8.5, "600");
-      ctx.textAlign = "center";
-      ctx.fillText("drain()", world.drainX, L.queue.y - 28 * S);
     }
 
     // device stream lane
@@ -1054,6 +1049,55 @@
     ctx.fillStyle = T.ink;
     ctx.font = fpx(9.5, "700");
     ctx.fillText("GPU", G.cx, G.cy + G.h / 2 - 9 * S);
+
+    // drain tethers: .item() holds a red line to everything it waits on;
+    // each target turns red the moment it has drained, then all of it fades
+    if (world.drainFade > 0.02) {
+      const a = world.drainFade;
+      const inFlight = world.chips.some((c) => c.state === "toStream");
+      const qDone = world.queue.length === 0;
+      const sDone = qDone && !inFlight && world.stream.length === 0;
+      const gDone = sDone && !world.gpu.busy;
+      const origin = { x: L.code.x1 - 2, y: L.code.arrowY };
+      const targets = [
+        { p: { x: (L.queue.x0 + L.queue.x1) / 2, y: L.queue.y + 16 * S }, done: qDone },
+        { p: { x: (L.device.x0 + L.device.x1) / 2, y: L.device.y + 15 * S }, done: sDone },
+        { p: { x: L.gpu.cx, y: L.gpu.cy + L.gpu.h / 2 + 2 }, done: gDone },
+      ];
+      ctx.setLineDash([6 * S, 4 * S]);
+      ctx.lineDashOffset = -world.time * 30 * S;
+      for (const t of targets) {
+        ctx.strokeStyle = withAlpha(T.drain, (t.done ? 0.9 : 0.55) * a);
+        ctx.lineWidth = 1.5 * S;
+        ctx.beginPath();
+        ctx.moveTo(origin.x, origin.y);
+        ctx.quadraticCurveTo((origin.x + t.p.x) / 2,
+          Math.max(origin.y, t.p.y) + 55 * S, t.p.x, t.p.y);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(origin.x, origin.y, 3 * S, 0, Math.PI * 2);
+      ctx.fillStyle = withAlpha(T.drain, a);
+      ctx.fill();
+      // drained targets turn red
+      ctx.lineWidth = 1.8 * S;
+      if (qDone) {
+        ctx.strokeStyle = withAlpha(T.drain, a);
+        rr(L.queue.x0 - 20 * S, L.queue.y - 14 * S, (L.queue.x1 - L.queue.x0) + 40 * S, 28 * S, 14 * S);
+        ctx.stroke();
+      }
+      if (sDone) {
+        ctx.strokeStyle = withAlpha(T.drain, a);
+        rr(L.device.x0, L.device.y - L.device.h / 2, L.device.x1 - L.device.x0, L.device.h, 7 * S);
+        ctx.stroke();
+      }
+      if (gDone) {
+        ctx.strokeStyle = withAlpha(T.drain, a);
+        rr(L.gpu.cx - L.gpu.w / 2, L.gpu.cy - L.gpu.h / 2, L.gpu.w, L.gpu.h, 10 * S);
+        ctx.stroke();
+      }
+    }
 
     // sparks (.so delivery)
     for (const s of world.sparks) {
