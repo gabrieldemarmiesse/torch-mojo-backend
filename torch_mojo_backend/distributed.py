@@ -20,6 +20,7 @@ import torch
 from max.driver import Device as MaxDevice
 from max.dtype import DType
 
+from torch_mojo_backend.mojo_device import deferred_compile
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     TorchMojoTensor,
     peer_access_enabled,
@@ -66,8 +67,10 @@ class _Signals:
             torch.ops.aten.zero_(buffer)
         # The barrier protocol requires every rank's counters to be zero
         # before ANY rank's first collective kernel can run; a peer would
-        # otherwise read garbage through P2P. One synchronize per device at
-        # allocation time guarantees it.
+        # otherwise read garbage through P2P. The zero_ above may still sit
+        # in the kernel-call queue behind a compile — drain before the
+        # stream synchronize, or the synchronize covers nothing.
+        deferred_compile.drain()
         for buffer in self.buffers:
             buffer._device.default_stream.synchronize()
 
@@ -163,6 +166,10 @@ def _all_reduce_into(
     devices = tuple(t._device for t in srcs)
     numel = srcs[0]._numel
     nbytes = numel * srcs[0]._itemsize
+    # The collective reads every rank's src pointer OUTSIDE the kernel-call
+    # queue: producers still queued behind a compile on any shard must land
+    # first (stream ordering cannot cover never-launched kernels).
+    deferred_compile.drain()
     with _launch_lock:
         signals = _signals_for(devices, nbytes)
         eager_kernels.comm_ops.all_reduce(
@@ -276,6 +283,10 @@ def _all_reduce_async_launch(
     devices = tuple(t._device for t in srcs)
     numel = srcs[0]._numel
     nbytes = numel * srcs[0]._itemsize
+    # As in _all_reduce_into: queued-but-unlaunched producers of any rank's
+    # src are invisible to stream ordering; land them before the comm
+    # streams start reading.
+    deferred_compile.drain()
     with _launch_lock:
         signals = _signals_for(devices, nbytes, channel="async")
         streams = _comm_streams_for(devices)

@@ -240,10 +240,10 @@ def _alloc_with_recovery(
             raise
         sys.stderr.write(
             f"torch-mojo-backend: device allocation of {nbytes} bytes failed; "
-            f"draining {len(call_queue._QUEUE)} queued launch(es), "
-            "synchronizing, and retrying once...\n"
+            f"draining {len(call_queue.shard_for(device).queue)} queued "
+            "launch(es), synchronizing, and retrying once...\n"
         )
-        call_queue.drain()
+        call_queue.drain(device)
         device.default_stream.synchronize()
         return holder_mod.alloc(ctx_ptr, nbytes)
 
@@ -469,10 +469,11 @@ class TorchMojoTensor(torch.Tensor):
         from . import deferred_compile
 
         src = self if self._is_contiguous else self._materialize_contiguous()
-        # Reading device bytes is a host read: every queued launch must have
-        # executed before the transfer is enqueued -- INCLUDING the strided
-        # materialization just queued above, whose output is what this reads.
-        deferred_compile.drain()
+        # Reading device bytes is a host read: every queued launch on THIS
+        # device must have executed before the transfer is enqueued --
+        # INCLUDING the strided materialization just queued above, whose
+        # output is what this reads.
+        deferred_compile.drain(src._device)
         if src._numel == 0:
             return torch.empty(self._shape, dtype=max_dtype_to_torch(self._dtype))
 
@@ -543,7 +544,7 @@ class TorchMojoTensor(torch.Tensor):
         from . import deferred_compile
 
         src = self._contig()
-        deferred_compile.drain()
+        deferred_compile.drain(src._device)
         return dlpack.make_capsule(
             src._holder, src._ptr, src._shape, src._dtype, src._device
         )
@@ -743,7 +744,9 @@ def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
         dst._itemsize,
         _ctx_ptr(dst._device),
     )
-    _cq.external_call(holder.CopyStrided, args, keepalive=(dst, src))
+    _cq.external_call(
+        holder.CopyStrided, args, keepalive=(dst, src), device=dst._device
+    )
 
 
 def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:

@@ -227,8 +227,14 @@ def _peer_replica(src: TorchMojoTensor, target: MaxDevice) -> TorchMojoTensor:
     no host synchronization and no transfer-owner tracking.
     """
     from torch_mojo_backend import eager_kernels
+    from torch_mojo_backend.mojo_device import deferred_compile
 
     src = src._contig()
+    # The peer copy reads src's bytes OUTSIDE the kernel-call queue; its
+    # stream-event ordering cannot cover launches still waiting on a
+    # compile, so src's queued producers must land first. (The dispatcher
+    # already drains for device-crossing ops — this guards direct callers.)
+    deferred_compile.drain(src._device)
     out = TorchMojoTensor._alloc(src._shape, src._dtype, target)
     if src._numel > 0:
         eager_kernels.tensor_holder.copy_d2d_peer(
@@ -259,7 +265,12 @@ def _try_peer_copy_into(dest: TorchMojoTensor, src: TorchMojoTensor) -> bool:
     ):
         if src._numel > 0:
             from torch_mojo_backend import eager_kernels
+            from torch_mojo_backend.mojo_device import deferred_compile
 
+            # Out-of-queue transfer: queued producers of src and queued
+            # writers of dest must land first (see _peer_replica).
+            deferred_compile.drain(src._device)
+            deferred_compile.drain(dest._device)
             eager_kernels.tensor_holder.copy_d2d_peer(
                 eager_kernels._ctx_ptr(dest._device),
                 dest._ptr,

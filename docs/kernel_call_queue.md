@@ -124,7 +124,21 @@ recording, version counters, view metadata, output inference, and allocation—
 runs synchronously in Python. Only the device launch may wait in
 `eager_kernels/call_queue.py` for its exact extension to finish compiling.
 
-The queue follows these rules:
+The queue is sharded per device: each mojo device owns a `_Shard` with its
+own FIFO, re-entrant mutex, thread-order trackers, and run-ahead budget
+(half *that* device's free VRAM, not the minimum across devices). Every
+enqueue names its device — the spec route takes it from the inferred output
+spec, the raw routes from the first payload in their keep-alive — and the
+dispatch layer holds the lock of exactly the device(s) an op touches, in
+ascending index order when a cross-device copy touches two. Rank threads of
+single-process data parallelism therefore dispatch concurrently instead of
+serializing on one process mutex, and a barrier or drain for one device
+never waits on another's compile storm (`drain(device)` drains one shard;
+`drain()` drains all — used by public synchronize, device-crossing copies,
+and collective launches, which read pointers outside the queue and must not
+overtake queued producers on any shard).
+
+Each shard's queue follows these rules:
 
 1. **Strict FIFO.** Once a launch is queued, subsequent launches remain behind
    it even if their extensions are already warm. `pump()` launches the longest

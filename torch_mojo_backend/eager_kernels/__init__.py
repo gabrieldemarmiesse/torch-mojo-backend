@@ -903,16 +903,47 @@ class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
         self,
         extension_args: tuple[object, ...],
         keepalive: tuple[object, ...],
+        device: object = None,
         loader: MojoExtensionLoader | None = None,
     ) -> None:
         """Queue a non-returning `call(..., out)` into preallocated outputs.
 
         `keepalive` names the objects whose buffers `extension_args`'
         raw pointers reference; the queued item retains them until it
-        launches (queue rule 3)."""
+        launches (queue rule 3). `device` selects the per-device queue
+        shard; when None it is derived from the keepalive — the first
+        payload's `._device` is the launch device at every enqueue site
+        (out/dst/self first, by the descriptors' own argument order)."""
         selected_loader = loader or MOJO_EXTENSION_LOADER
         unit = selected_loader.unit_canonical(self.extension.MOJO_FILE, self.defines)
-        call_queue.kernel_call_into(unit, extension_args, keepalive)
+        if device is None:
+            device = _device_of_keepalive(keepalive)
+        call_queue.kernel_call_into(unit, extension_args, keepalive, device)
+
+
+def _device_of_keepalive(keepalive: object) -> object:
+    """The launch device named by an enqueue's keep-alive.
+
+    Every payload wrapper carries `._device` (the same objects
+    `_keepalive_bytes` walks for `_numel`), and every enqueue site lists
+    the tensor the call launches on first — the allocated output on the
+    spec route, dst/self/q on the raw routes — so the first `._device`
+    found IS the device whose context the raw args reference. Raising on
+    a keepalive with no payload is deliberate: an enqueue whose device
+    cannot be named must say it explicitly (queue rule 6).
+    """
+    stack = [keepalive]
+    while stack:
+        entry = stack.pop()
+        found = getattr(entry, "_device", None)
+        if found is not None:
+            return found
+        if isinstance(entry, tuple | list):
+            stack.extend(reversed(entry))
+    raise ValueError(
+        "enqueue keepalive names no tensor with a ._device; pass device= "
+        "explicitly at this call site"
+    )
 
 
 class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):

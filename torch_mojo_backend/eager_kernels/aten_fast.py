@@ -93,9 +93,13 @@ def _device_call(fn: object, *args: object, keepalive: tuple[object, ...]) -> ob
     """Launch an ungated device call (tensor_holder / fa4): when the call
     queue is active it must hold its FIFO position behind queued producers
     of its inputs; otherwise call directly. `keepalive` names the tensors
-    whose buffers the raw `args` reference (queue rule 3)."""
+    whose buffers the raw `args` reference (queue rule 3); its first
+    payload's device selects the queue shard — dst/self/q first at every
+    call site, matching the context the call launches on."""
     if _call_queue.enabled():
-        return _call_queue.external_call(fn, args, keepalive)
+        return _call_queue.external_call(
+            fn, args, keepalive, eager_kernels._device_of_keepalive(keepalive)
+        )
     return fn(*args)
 
 
@@ -8145,7 +8149,8 @@ def fast_aten__local_scalar_dense(tensor):
     t = _t(tensor)
     if t is None or t._numel != 1:
         return NOT_HANDLED
-    _call_queue.drain()  # host read: queued launches must land first
+    # Host read: this device's queued launches must land first.
+    _call_queue.drain(t._device)
     return eager_kernels.tensor_holder.read_scalar(
         _ctx_ptr(t._device), t._ptr, t._dtype.value
     )

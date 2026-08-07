@@ -212,11 +212,19 @@ def synchronize(device: "int | str | torch.device | None" = None) -> None:
     """Public: wait for work and release completed asynchronous transfer
     owners. Pending kernel launches count as work, so the queue drains
     first — a caller of ``torch.mojo.synchronize()`` is entitled to assume
-    every op it issued has actually run on the device."""
+    every op it issued has actually run on the device. Only the named
+    device's shard drains (like ``torch.cuda.synchronize``, this is a
+    per-device barrier): one rank synchronizing must not wait out another
+    rank's compile storm."""
     from . import deferred_compile
 
-    deferred_compile.drain()
-    _device_synchronize(device)
+    resolved = _resolve_sync_device(device)
+    deferred_compile.drain(
+        resolved.index
+        if resolved.type == "mojo" and resolved.index is not None
+        else None
+    )
+    _device_synchronize(resolved)
 
 
 def get_amp_supported_dtype():
