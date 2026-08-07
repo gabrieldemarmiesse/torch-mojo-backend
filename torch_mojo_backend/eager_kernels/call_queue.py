@@ -63,14 +63,24 @@ Correctness rules (each scoped to one shard = one device):
    specialization, so a Mojo dtype error is a bridge bug and surfaces
    as-is (modulo `set_error_translator`, which only retypes it).
 6. **One mutex per device.** The shard lock guards that device's queue
-   *and* every touch of that device: `deferred_compile._direct` routes
-   each op through `device_lock(index)` (the same re-entrant object), so a
-   drain from any thread cannot overlap a direct launch on the same
-   device, and the re-entrant `_direct` -> queue ordering has no second
-   lock to invert against. Distinct devices proceed concurrently by
-   design; work that spans several devices (peer copies, collectives)
-   must drain the source shards first and take the locks it needs in
-   ascending index order.
+   *and* every DISPATCHED touch of that device: `deferred_compile._direct`
+   routes each op through `device_lock(index)` (the same re-entrant
+   object), so a drain from any thread cannot overlap a direct launch on
+   the same device, and the re-entrant `_direct` -> queue ordering has no
+   second lock to invert against. Distinct devices proceed concurrently by
+   design. Cross-device COPIES stay inside this regime: the dispatcher
+   drains both sides, then holds both locks in ascending index order.
+   COLLECTIVE launches (distributed.py) are the documented exception —
+   they touch every device's context under their own `_launch_lock`, with
+   no shard locks. Their producers-land-first guarantee is not a lock: it
+   is `deferred_compile.drain()` before the launch plus the rendezvous
+   parking (every rank has finished enqueueing and is parked in
+   `_Collective.join` before the last-arriving rank drains and launches),
+   and their concurrent-context-touch safety rests on AsyncRT enqueues
+   being empirically thread-safe — the regime the pre-queue branch always
+   ran collectives under. Code that lets a rank leave the rendezvous
+   before the launch, or a completion callback that enqueues compute,
+   breaks the first argument and must revisit this rule.
 """
 
 import _thread
@@ -563,10 +573,17 @@ def order_direct_launch(device: DeviceKey) -> None:
     shard_for(device).order_direct_launch()
 
 
-def pump() -> None:
-    """Launch whatever is ready on every device. Non-blocking: never waits
-    on a build. Each shard is pumped under its own lock, so devices make
-    progress independently."""
+def pump(device: DeviceKey | None = None) -> None:
+    """Launch whatever is ready. Non-blocking: never waits on a build.
+
+    With a device, pumps only that shard — the dispatch hot path pumps the
+    shard(s) of the op it is routing, so a rank never becomes another
+    device's queue launcher (and never pays another device's rule-4
+    synchronize) just by dispatching its own work. With None, pumps every
+    shard."""
+    if device is not None:
+        shard_for(device).pump()
+        return
     for shard in _SHARD_SNAPSHOT:
         shard.pump()
 

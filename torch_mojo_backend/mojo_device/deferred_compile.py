@@ -100,7 +100,9 @@ def _op_device_indices(args: tuple, kwargs: dict) -> list[int]:
     return indices
 
 
-def _direct(func: object, args: tuple, kwargs: dict) -> object:
+def _direct(
+    func: object, args: tuple, kwargs: dict, indices: list[int] | None = None
+) -> object:
     """Execute one aten op through the PrivateUse1 kernels.
 
     MAX's DeviceContext is not documented thread-safe: every touch of one
@@ -110,7 +112,8 @@ def _direct(func: object, args: tuple, kwargs: dict) -> object:
     -> `kernel_call_into` to invert against. Ops spanning several devices
     take every lock, in ascending index order (see module docstring).
     """
-    indices = _op_device_indices(args, kwargs)
+    if indices is None:
+        indices = _op_device_indices(args, kwargs)
     if len(indices) == 1:
         with call_queue.device_lock(indices[0]):
             call_queue.order_direct_launch(indices[0])
@@ -155,7 +158,17 @@ def dispatch(func: object, args: tuple, kwargs: dict) -> object:
     if not call_queue.enabled():
         return _direct(func, args, kwargs)
 
-    call_queue.pump()
+    # Pump only the shards this op touches. Pumping every shard here would
+    # let one rank's dispatch become ANOTHER device's queue launcher during
+    # a compile storm — paying that device's rule-4 synchronize while
+    # holding its lock, and flipping its launcher identity so the owning
+    # rank pays a second one: exactly the cross-rank latency coupling the
+    # sharding exists to remove. A shard whose owner went quiet still
+    # launches at its next drain (host read, synchronize, collective) —
+    # pump is opportunistic, drain is the correctness point.
+    indices = _op_device_indices(args, kwargs)
+    for index in indices:
+        call_queue.pump(index)
     if (
         call_queue.active()
         and func._schema.name in _DEVICE_CROSSING_OPS
@@ -166,7 +179,7 @@ def dispatch(func: object, args: tuple, kwargs: dict) -> object:
         # must land first.
         call_queue.drain()
 
-    return _direct(func, args, kwargs)
+    return _direct(func, args, kwargs, indices)
 
 
 def drain(device: call_queue.DeviceKey | None = None) -> None:
