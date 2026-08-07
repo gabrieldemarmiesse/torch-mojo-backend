@@ -51,6 +51,47 @@ free-threaded Python would attack the right layer but is blocked upstream
 (§4), and more lock-sharding on our side is done — there are no shared
 backend locks left between ranks.
 
+## 1b. Head-to-head vs torch-cuda DDP (torchrun + NCCL, 1 process/GPU)
+
+`demo_scripts/cuda_ddp_baseline.py` mirrors the mojo DDP demo exactly
+(same 1024→4096→4096→1024 GELU MLP, fp32, AdamW, per-rank batch 2048,
+20 timed steps, warmup excluded, wall = slowest rank) and runs it the
+standard PyTorch way — one process per GPU, NCCL allreduce — from a
+cu128 venv (`~/.cache/claude-cuda-baseline/venv`; the project venv's
+cu130 torch cannot initialize this 12.8 driver). Same node, same H100s,
+torch 2.11.0 on both sides, default matmul precision on both sides:
+
+| stack                          | GPUs | wall (20 steps) | samples/s | per-GPU  |
+|--------------------------------|-----:|----------------:|----------:|---------:|
+| torch-cuda NCCL (1 proc/GPU)   |    1 |          0.135s |   302,346 |  302,346 |
+| torch-cuda NCCL                |    2 |          0.147s |   558,048 |  279,024 |
+| torch-cuda NCCL                |    8 |          0.150s | 2,188,090 |  273,511 |
+| mojo DDP (thread-per-rank)     |    2 |          0.284s |   288,607 |  144,304 |
+| mojo DDP, comm-stream async    |    2 |          0.286s |   286,582 |  143,291 |
+| mojo DDP                       |    8 |          1.713s |   191,343 |   23,918 |
+| mojo DDP, comm-stream async    |    8 |          1.887s |   173,627 |   21,703 |
+
+Decomposition:
+
+- **Per-GPU compute (the 2-GPU column, where our scaling is still ~1.0):
+  ~2.1× slower than cuBLAS** on this fp32 MLP (14.2 ms/step vs
+  6.8–7.4 ms). A kernel-level gap, not a dispatch gap — and fp32-specific
+  context: the bf16 GEMM family is currently unbuildable on sm_90a (§6),
+  so the dtype where the eager kernels are closest to parity is
+  unavailable on H100 today.
+- **Scaling: NCCL holds 0.90 at 8 GPUs; thread-per-rank collapses to
+  ~0.17** (24k per-GPU at 8 vs 144k at 2). Worse than the raw dispatch
+  bench's 0.34 because DDP adds per-bucket work the bench doesn't have:
+  7 bucket rendezvous per step (park/wake 8 threads on condition
+  variables under the GIL), the collective `_launch_lock`, and a
+  drain-all before each launch.
+- **Net: ~1.9× slower at 2 GPUs, ~11× at 8 GPUs.** The 8-GPU number is
+  the interpreter ceiling made concrete: NCCL's processes each own a
+  GIL; our eight rank threads share one. This is the gap the SPMD
+  replicated-tensor direction (§3.1) exists to close — one thread
+  issuing, fan-out in Mojo — with the per-GPU kernel gap as the second,
+  independent term.
+
 ## 2. Priority comm streams: unblocked today (probe result)
 
 The M3 overlap path uses a second `DeviceContext` per device because the
