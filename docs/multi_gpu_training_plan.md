@@ -221,6 +221,26 @@ Missing (the work):
    DGX/MI300X-class boxes; document it. Non-P2P topologies fall back to the
    slow staged path.
 
+## Implementation status (updated 2026-08-07)
+
+### Merge with main's kernel-call queue — done
+
+`main` (whose kernel-call queue and gated-extension build system landed
+after this branch forked) is merged in. The queue arrived single-device —
+one process-wide lock around every op, one global FIFO, a run-ahead
+budget keyed off the minimum free VRAM across all GPUs — and was **sharded
+per device** for thread-per-rank DDP: each mojo device owns its FIFO,
+mutex, thread-order trackers and budget (its own free VRAM), dispatch
+holds only the lock(s) of the device(s) an op touches, and host reads
+drain only their own shard (`docs/kernel_call_queue.md`). Out-of-queue
+transfers were made queue-correct at the same time: cross-device copies
+(`_to_copy`/`copy_`/`_copy_from`, compared by (type, index)) and both
+collective launch paths drain queued producers before touching raw
+pointers. `comm_ops` loads through the new build system as an ungated
+always-complete module (it registers the `CommStream`/`CommWork` Python
+types), next to `tensor_holder`. Validated on H100s: all multi-GPU tests
+plus the DDP demo with the queue ON, sync and async paths.
+
 ## Implementation status (2026-07)
 
 ### M0 — done

@@ -45,7 +45,13 @@ def child(steps: int, batch: int, dim: int) -> None:
 
     register_mojo_devices()
     state = make_state("mojo:0", batch, dim)
-    step(state)
+    # A fresh process pays per-variant .so loads, allocator growth and
+    # first-launch device sync on its first pass — run a whole warmup
+    # round so the timed section measures steady-state dispatch only
+    # (the in-process modes get the same treatment from the parent's
+    # warmup + earlier legs).
+    for _ in range(max(5, steps // 5)):
+        step(state)
     sync_all(1)
     print("READY", flush=True)
     if sys.stdin.readline().strip() != "GO":
