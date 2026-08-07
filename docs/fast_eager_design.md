@@ -21,20 +21,26 @@ with a content-addressed disk cache — in the productized form that MAX
 itself already uses internally for its eager interpreter
 (`max/_interpreter_ops/*.mojo` + `mojo.importer`):
 
-- `torch_mojo_backend/eager_kernels/elementwise_ops.mojo` implements
+- `torch_mojo_backend/eager_kernels/elementwise_ops/elementwise_ops.mojo` implements
   Add/Sub/Mul/Div/Max/Min/Relu/Exp as Mojo kernels over **contiguous
-  buffers with fully dynamic shapes**. Dtype dispatch happens at
-  **runtime inside Mojo** (every dtype specialization is compiled into
-  the one extension), so one `.so` serves every shape and dtype with
-  zero recompilation.
-- The module is imported through `mojo.importer` (official Mojo import
-  hook): first import runs `mojo build --emit shared-lib`, caches under
-  `__mojocache__/elementwise_ops.hash-<h>.so`, and every later import
-  (any process) just dlopens it. The import itself is **deferred to the
-  first fast-path op call** (`_eager_impl` in `mojo_device_aten_ops.py`),
-  so `import torch_mojo_backend` and torch.compile-only workloads never
-  pay the compile; a process that never touches mojo_device eager mode
-  compiles nothing.
+  buffers with fully dynamic shapes**. Shapes and strides never enter the
+  specialization key, so one `.so` serves every shape with zero
+  recompilation. Dtype was a *runtime* dispatch inside Mojo in the
+  original PoC; it is now a compile-time define (`DTYPE_ARG_0`,
+  `DTYPE_OUT`, ...) so each `.so` carries exactly one instantiation —
+  see "Compile granularity" below for the measurement that reversed that
+  choice.
+- Extensions are built by the loader in `eager_kernels/__init__.py`
+  (`mojo build --emit shared-lib`, one gated entry point named `call`)
+  and cached under
+  `__mojocache__/<family>.<defines-hash>.hash-<source-hash>.so`; every
+  later process just dlopens the hit. A build is **deferred to the first
+  call that needs that exact specialization**, so `import
+  torch_mojo_backend` and torch.compile-only workloads compile nothing,
+  and neither does a process that never touches mojo_device eager mode.
+  (The PoC used the `mojo.importer` hook; the loader replaced it when
+  compilation moved to variant granularity — `mojo.importer` still serves
+  `eager_flash_attention`.)
 - Python-visible functions receive the `max.driver.Buffer` objects
   directly plus `device._device_context_ptr()`. The kernel is enqueued
   on **MAX's own DeviceContext** (same device queue the MAX driver
@@ -64,57 +70,109 @@ End-to-end speedup today: **~50×**; the remaining ~24 µs over the bare
 call is the PyTorch dispatcher + `TorchMojoTensor` wrapping + beartype,
 which can be shaved independently.
 
-## Scaling analysis ("how many extensions is too many?")
+## Compile granularity: one `.so` per variant, built in the background
 
-Measured on this machine:
+This section used to be a "scaling analysis" arguing for compilation at
+*module* granularity and against one `.so` per variant, on the grounds
+that per-variant builds multiply total compile time ~40×. That
+recommendation has been reversed by measurement and the shipped design
+is the opposite one: **one `.so` per exact specialization, built on
+demand in a background pool, with only the device launch waiting.**
+The queue that makes the waiting invisible is documented in
+[docs/kernel_call_queue.md](kernel_call_queue.md).
 
-- **Loading**: first extension load pays ~55 ms (shared Mojo runtime
-  libraries); each additional extension costs **~0.07 ms and ~0.1 MB
-  RSS** (1.5 MB `.so`, lazily mapped). 300 extensions would load in
-  well under 100 ms total — loading is a non-issue.
-- **Size**: ~0.15 MB of `.so` per op (all dtypes, CPU+GPU kernels).
-  Full ATen coverage (~200 ops) ≈ 30–60 MB. For calibration, MAX's own
-  interpreter op set is 58 MB across 25 extensions. Note the MAX wheel
-  ships only the `.mojo` *sources* (verified: no `__mojocache__` entry
-  in any dist-info RECORD): the 58 MB cache is compiled **locally on
-  first import** — measured here, 25 modules over ~10 min, silently,
-  the first time the current eager mode runs on a fresh venv. Our
-  fast path's compile-on-first-use behavior is therefore the same
-  deployment model MAX already imposes, at a smaller scale per module.
-- **Compile time** (the real cost): ~10 s fixed per module + ~2.3 s
-  per op (op = ~10 kernel instantiations: 5 dtypes × CPU+GPU). An
-  8-op module cold-compiles in ~30 s. Editing a module recompiles the
-  whole module (~30–40 s). `mojo build` keeps its own internal cache,
-  so rebuilding previously-seen content is several times faster.
+The old argument measured the wrong quantity — total compiler *work*
+rather than the wall-clock a cold workload waits. Two things changed it:
 
-Consequences for the design:
+- **Compile-time gates.** `variant_gates.mojo` reads `OP`, the
+  `DTYPE_ARG_*` and the `DTYPE_OUT*` defines, and every registration and
+  dtype-parametric launch sits behind a `comptime if`. A per-variant
+  build therefore compiles roughly one kernel, not the family's ~150
+  instantiations, so a variant build is a fraction of a module build
+  rather than a repeat of it.
+- **Nothing waits for the build.** Variant builds run on a background
+  thread pool (`_ASYNC_BUILD_SLOTS`, sized by `_pool_size()`: available
+  RAM / 5 GiB and cores / 3, capped at 16) while Python keeps
+  discovering ops and requesting further compilations. Total compiler
+  work went up; wall-clock went down, because the work is now parallel
+  and overlapped with discovery.
 
-- **Compile on first use, but at module granularity, not per-variant.**
-  causal-conv1d-mojo compiles one `.so` per comptime config on first
-  use because its variant space is combinatorial (dtype × width × 8
-  bools) and sparsely used. Our variant space is the opposite — small
-  (op × dtype) and dense — and the fixed cost dominates: a single
-  (op, dtype, GPU-only) variant compiles in **8.5 s** on this machine,
-  while the 8-op × 9-dtype × CPU+GPU module compiles ~150 kernel
-  instantiations in 31 s. Per-variant lazy compilation would multiply
-  total compile time ~40× (full coverage: hours instead of ~10 min)
-  and re-pay ~8.5 s every time a new (op, dtype) pair first appears.
-  First-use compilation at module granularity (what `_eager_impl`'s
-  lazy import does) keeps the lazy behavior with none of that cost.
-- **Don't do one extension per op** (200 modules × 10 s fixed ≈ +30 min
-  of avoidable fixed compile cost, and 200 files to manage). Group ops
-  by category into modules of ~10–20 ops (elementwise_binary,
-  elementwise_unary, reductions, matmul, data_movement, ...) exactly
-  like `max/_interpreter_ops` does (~25 modules). Full cold build of
-  ~20 modules ≈ 10 min sequential, parallelizable across modules. With
-  multiple category modules, import each lazily on the first call of an
-  op in that category, so a given workload only compiles the categories
-  it actually uses.
-- **Don't do one extension per dtype** — dtype dispatch at runtime in
-  Mojo costs one branch chain per call (~ns) and collapses the
-  extension count by ~10×.
-- Editing one op costs one module rebuild (~30–60 s), which argues for
-  keeping modules from growing past ~20 ops.
+### Measured (H100 PCIe, 24-core host; nanoGPT 124M, batch 12 × 1024, BF16)
+
+Cold cache (empty `__mojocache__`):
+
+| scenario | time |
+|---|---|
+| first training step, kernel-call queue + build pool (8 slots) | **11.6 s** |
+| first training step, pool disabled (`TORCH_MOJO_BACKEND_KERNEL_QUEUE=0`) | 56.3 s |
+| whole script, pre-PR module-granularity design | 8 min 34 s |
+
+The third row is the whole script rather than one step, because on the old
+design the module builds all land before the first step completes; it is the
+"how long until anything happens on a fresh checkout" number, not a
+step-for-step comparison with the first two rows.
+
+Pool-size sweep on the same first step (slots → time): 1 → 56.6 s,
+2 → 30.1 s, 4 → 16.5 s, 8 → 11.7 s, 16 → 10.5 s, 24 → 10.4 s. One slot
+reproduces the pool-disabled number, as it should. Returns flatten past
+~8 slots on this 24-core host, and memory rather than cores is the binding
+constraint (each `mojo build` peaks around 4.5 GB RSS), which is what
+`_pool_size()`'s two caps encode.
+
+**The warm path was a regression; most of it has been recovered.** The
+first measurement on this branch was **101 ms/step vs 60 ms on main**
+(batch 12 × 1024). Three rounds of fixes brought it down (all H100 PCIe,
+`bench_nanogpt_train.py`, warm `__mojocache__`, medians over 20–30 steady
+steps, measured 2026-08-02):
+
+| workload | main | branch before | branch after |
+|---|---|---|---|
+| batch 48 (default) | 193.8 ms | 195.1 ms | **193.6 ms — parity** |
+| batch 12 (host-bound) | 60.0 ms | 66.5 ms | **63.6 ms** |
+
+What was fixed, in order of measured size (py-spy at batch 12):
+
+1. **Thread-switch device synchronize (~9 ms/step).** Rule 4 used to fully
+   synchronize the device on *every* enqueuing-thread change, including
+   pure direct launches — twice per training step (forward→backward,
+   backward→optimizer). The barrier now applies only where the empirical
+   hazard was ever observed: queue launches replaying another thread's
+   work. Steady state performs no synchronizes at all.
+2. **`torch.broadcast_shapes` twice per binary op (14.2 µs/call).** The
+   eligibility probe and `expected_output_specs` both called it; equal
+   shapes (residual adds, grad accumulation) now skip both.
+3. **Defines re-canonicalization (2.4 µs/call).** Every `*SpecExtension`
+   now memoizes its canonical defines per (op, dtypes) key, the same
+   pattern `_CALL_DEFINES_CACHE` already used for `MojoFileExtension`.
+
+The remaining ~3.6 ms/step at batch 12 (~6%) is the structural cost of
+the Into ABI and the dispatch bracket, spread thin: Python-side output
+allocation (+0.7 ms vs main's Mojo-side alloc), the per-op dispatch
+bracket (+0.94 µs/op), `kernel_call_into` (+0.55 µs/launch), and
+prepare/submit machinery (a warm binary add is ~13 µs of Python vs ~4 µs
+on main). At batch 48 this is fully hidden under GPU time. The cold-start
+numbers above still must not be read as an overall speedup.
+
+### What still holds from the original analysis
+
+- **Loading many `.so` files is cheap.** First extension load pays
+  ~55 ms (shared Mojo runtime libraries); each additional extension
+  costs **~0.07 ms and ~0.1 MB RSS**, lazily mapped. That is what makes
+  one `.so` per variant affordable at load time despite there being many
+  more of them than modules.
+- **Sources stay grouped by family**, one directory per family under
+  `eager_kernels/` (elementwise, reductions, matmul, data movement, ...),
+  not one file per op — for shared helpers and reviewability. Grouping is
+  now purely a source-organization decision: it no longer determines what
+  a build compiles, since the defines gate everything else out.
+- **Disk grows with the specializations a workload actually uses**, not
+  with ATen coverage. For calibration, MAX's own interpreter op set is
+  58 MB across 25 extensions, and the MAX wheel ships only the `.mojo`
+  *sources* (verified: no `__mojocache__` entry in any dist-info
+  RECORD) — that 58 MB is compiled locally on first import, 25 modules
+  over ~10 min, the first time MAX's eager interpreter runs on a fresh
+  venv. Compile-on-first-use is the deployment model MAX already
+  imposes; we pay it in much smaller increments.
 - **Caches are per-machine; don't plan on shipping them in wheels.**
   Modular doesn't ship prebuilt `__mojocache__/` (sources only), and
   for good reason: `mojo build` defaults to `-march=native` host
@@ -122,13 +180,15 @@ Consequences for the design:
   `.so` can SIGILL on an older CPU or carry the wrong GPU target
   (causal-conv1d-mojo keys its cache by CPU brand + GPU arch for
   exactly this). Realistic options: per-machine compile on first use
-  (what this PoC does), an explicit warmup command for
+  (what the loader does), an explicit warmup command for
   container/production images, and CI caching of `__mojocache__`
   keyed on source hash + toolchain version **+ runner hardware**.
-  Caveat to document: `mojo.importer`'s cache key covers source
-  content only — moving a venv/checkout between machines with
-  different CPUs or GPUs can load a stale-for-this-hardware `.so`;
-  wipe `__mojocache__/` when that happens.
+  Caveat to document: the loader's cache key covers the source
+  dependency closure, the canonical defines, the MAX/Mojo package
+  versions, the CPython ABI and `platform.machine()` — but no CPU brand
+  and, deliberately, no accelerator identity. Moving a venv/checkout
+  between machines with different CPUs or GPUs can therefore load a
+  stale-for-this-hardware `.so`; wipe `__mojocache__/` when that happens.
 
 ## Milestone 2: full models (resnet-18, gpt2) at CUDA-comparable latency
 
@@ -163,13 +223,19 @@ indices (the graph path duplicates the values).
 
 ### How the op set is organized
 
-Five lazily-imported extension modules under `eager_kernels/` (a module
-only compiles on the first call of an op in its category), plus an
-`op_utils` Mojo sibling package mirroring `max/_interpreter_ops/op_utils`:
+Each lazily compiled entry point lives in its own directory under
+`eager_kernels/`: `<family>/<family>.mojo` sits beside
+`<family>/<family>.py`, which owns that file's `MojoExtension` descriptor.
+Family-private Mojo helpers live in the same directory; helpers shared by
+multiple families and the `op_utils` Mojo package remain at the package root.
+A family source file is the compilation *input*, not the compilation unit:
+each `.so` built from it is gated down to one operation and one dtype tuple
+(see "Compile granularity" above and
+[docs/kernel_call_queue.md](kernel_call_queue.md)).
 
 - `elementwise_ops.mojo` — binary/unary ops + Python-scalar variants
-  (`x * 0.5`, `x ** 3`, int `x + 1`), tanh; contiguous, dtype dispatch at
-  runtime.
+  (`x * 0.5`, `x ** 3`, int `x + 1`), tanh; contiguous, dtypes selected by
+  compile-time define.
 - `nn_ops.mojo` — batch-norm inference (NCHW), layer-norm (last dim, also
   emits float32 mean/rstd like `aten.native_layer_norm`), row softmax with
   fused scale + causal mask, trailing-dims mean, max-pool2d with torch
@@ -432,8 +498,10 @@ extension has no rocBLAS/hipBLAS dependency.
   kernels.
 - In-place variants (`add_`, `relu_`) are trivial: write to the input
   buffer.
-- First-import compile UX for the test suite: `mojo.importer` has no
-  cross-process lock; warm the cache once (e.g. in
-  `scripts/populate_cache_for_tests.py`) before `pytest -n`.
+- First-build UX for the test suite: the loader takes a per-identity
+  `flock`, so `pytest -n` workers no longer race on one variant, but they
+  still each wait on it; warming the cache once up front is still faster.
 - Shave the remaining per-call overhead (TorchMojoTensor creation goes
-  through a meta tensor + `__init__` per op; beartype on hot wrappers).
+  through a meta tensor + `__init__` per op; beartype on hot wrappers),
+  which is where the warm-path regression recorded under "Compile
+  granularity" is being tracked down.

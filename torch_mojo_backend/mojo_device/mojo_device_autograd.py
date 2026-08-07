@@ -191,6 +191,75 @@ def _restore_saved_mojo_tensors(ctx):
     )
 
 
+class _FusedFlashAttentionAutograd(torch.autograd.Function):
+    """gfx942 fused flash attention, forward and backward in one kernel each.
+
+    The generic node below saves the whole probability matrix; this one saves Q,
+    K, V, the output and the per-row log-sum-exp, and the backward recomputes
+    the scores.  At nanoGPT 124M / batch 48 / block 1024 that is 6.100 ms/step
+    forward against the decomposition's 29.854, and 28.896 against 46.153.
+    """
+
+    @staticmethod
+    def forward(
+        ctx, query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+    ):
+        aten_fast = _fast()
+        result = aten_fast.fast_fused_flash_attention_forward(
+            query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+        )
+        if result is aten_fast.NOT_HANDLED:
+            raise NotImplementedError(
+                "fused gfx942 flash attention declined these inputs"
+            )
+        output, lse, q_used, k_used, v_used = result
+        # Save what the KERNEL read, not the caller's views: a non-contiguous
+        # input was copied on the way in, and the backward must recompute the
+        # scores from the same bytes the forward saw.
+        saved = (q_used, k_used, v_used, output, lse)
+        ctx.save_for_backward(*saved)
+        ctx.saved_payloads = tuple(_SavedMojoPayload(tensor) for tensor in saved)
+        # Same introspection surface as the decomposition's node, so saved-tensor
+        # hook tests and debugging tools can name what this one holds. The set
+        # differs on purpose: O(n*d) inputs plus the log-sum-exp, rather than the
+        # O(n^2) probability matrix.
+        ctx.saved_names = ("query", "key", "value", "output", "logsumexp")
+        ctx.is_causal = bool(is_causal)
+        ctx.scale = scale
+        ctx.needed_input_gradients = tuple(
+            bool(ctx.needs_input_grad[index]) for index in range(3)
+        )
+        ctx.set_materialize_grads(False)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return (None,) * 8
+        aten_fast = _fast()
+        q, k, v, output, lse = _restore_saved_mojo_tensors(ctx)
+        result = aten_fast.fast_fused_flash_attention_backward(
+            grad_output, q, k, v, output, lse, ctx.is_causal, ctx.scale
+        )
+        if result is aten_fast.NOT_HANDLED:
+            raise RuntimeError(
+                "fused gfx942 flash attention backward declined inputs its "
+                "own forward accepted"
+            )
+        grad_query, grad_key, grad_value = result
+        need_query, need_key, need_value = ctx.needed_input_gradients
+        return (
+            grad_query if need_query else None,
+            grad_key if need_key else None,
+            grad_value if need_value else None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 # Eligible FA4 calls are routed through PyTorch's native lower flash pair below.
 # This custom node remains only for the generic math/dropout implementation,
 # whose fused intermediate-saving backward has no native ATen schema.
@@ -246,7 +315,9 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
         ctx.scale = (
             float(scale) if scale is not None else 1.0 / math.sqrt(query._shape[-1])
         )
+        ctx.is_causal = bool(is_causal)
         ctx.has_dropout = dropout_mask is not None
+        ctx.is_causal = bool(is_causal)
         ctx.dropout_scale = (
             (0.0 if float(dropout_p) == 1.0 else 1.0 / (1.0 - float(dropout_p)))
             if ctx.has_dropout
@@ -283,7 +354,54 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
         grad_key3 = None
         grad_value3 = None
 
-        if need_value:
+        # The two contraction-side causal regimes skip contraction indices that
+        # multiply exactly zero, so they are exact whatever else runs; nothing
+        # here depends on the fused softmax backward being selected. The
+        # output-side regime (which would leave dP's masked half unwritten) is
+        # deliberately not used: it is dispatch-bound at these shapes and
+        # measures slower than the dense GEMM. See optimization_journal.md,
+        # diagnostic experiment AA.
+        causal_bmm = bool(getattr(ctx, "is_causal", False))
+
+        # Fused Apple-GPU route: at most five launches, no permute copies and
+        # no dropout-backward pass (causal structure exploited end to end).
+        # Unsupported inputs fall through to the exact composed sequence.
+        fused = aten_fast.NOT_HANDLED
+        if need_query or need_key or need_value:
+            q3 = (
+                _contiguous_view(saved["query"], (batch_heads, query_length, head_dim))
+                if "query" in saved
+                else None
+            )
+            k3 = (
+                _contiguous_view(saved["key"], (batch_heads, key_length, head_dim))
+                if "key" in saved
+                else None
+            )
+            v3 = (
+                _contiguous_view(saved["value"], (batch_heads, key_length, head_dim))
+                if "value" in saved
+                else None
+            )
+            fused = aten_fast.fast_sdpa_backward(
+                p3,
+                grad3,
+                mask3,
+                q3,
+                k3,
+                v3,
+                need_query,
+                need_key,
+                need_value,
+                getattr(ctx, "is_causal", False),
+                ctx.dropout_scale,
+                ctx.scale,
+            )
+            del q3, k3, v3
+        if fused is not aten_fast.NOT_HANDLED:
+            grad_query3, grad_key3, grad_value3 = fused
+            saved.clear()
+        elif need_value:
             effective_p3 = p3
             if ctx.has_dropout:
                 effective_p3 = _require_handled(
@@ -301,9 +419,17 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
                 "SDPA transpose output gradient",
             )
             grad_t = _contiguous_view(grad_t, (batch_heads, head_dim, query_length))
-            grad_value_t = _require_handled(
-                aten_fast.fast_aten_bmm(grad_t, effective_p3), "SDPA value gradient"
-            )
+            grad_value_t = None
+            if causal_bmm:
+                # P is exactly zero above the diagonal, so output column block c
+                # only needs contraction indices from c's first column up.
+                grad_value_t = aten_fast._try_sdpa_causal_bmm(
+                    grad_t, effective_p3, False, aten_fast.SDPA_CAUSAL_B_COLS
+                )
+            if grad_value_t is None:
+                grad_value_t = _require_handled(
+                    aten_fast.fast_aten_bmm(grad_t, effective_p3), "SDPA value gradient"
+                )
             grad_value_view = _require_handled(
                 aten_fast.fast_aten_transpose(grad_value_t, 1, 2),
                 "SDPA transpose value gradient",
@@ -315,7 +441,7 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
             if effective_p3 is not p3:
                 del effective_p3
 
-        if need_query or need_key:
+        if fused is aten_fast.NOT_HANDLED and (need_query or need_key):
             v = saved.pop("value")._contig()
             v3 = _contiguous_view(v, (batch_heads, key_length, head_dim))
             # dP_drop = grad @ V^T. BmmSpec's logical transpose flag keeps V
@@ -331,6 +457,8 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
                 mask3 if ctx.has_dropout else None,
                 ctx.dropout_scale,
                 ctx.scale,
+                ctx.is_causal,
+                query_length,
             )
             if grad_scores is aten_fast.NOT_HANDLED:
                 # Keep the pre-fusion composition as the exact compatibility
@@ -379,9 +507,16 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
             if need_query:
                 k = saved.pop("key")._contig()
                 k3 = _contiguous_view(k, (batch_heads, key_length, head_dim))
-                grad_query3 = _require_handled(
-                    aten_fast.fast_aten_bmm(grad_scores, k3), "SDPA query gradient"
-                )
+                grad_query3 = None
+                if causal_bmm:
+                    # dScores is exactly zero above the diagonal.
+                    grad_query3 = aten_fast._try_sdpa_causal_bmm(
+                        grad_scores, k3, False, aten_fast.SDPA_CAUSAL_A_ROWS
+                    )
+                if grad_query3 is None:
+                    grad_query3 = _require_handled(
+                        aten_fast.fast_aten_bmm(grad_scores, k3), "SDPA query gradient"
+                    )
                 del k, k3
 
             if need_key:
@@ -394,9 +529,15 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
                     aten_fast.fast_aten_transpose(q3, 1, 2), "SDPA transpose query"
                 )
                 q_t = _contiguous_view(q_t, (batch_heads, head_dim, query_length))
-                grad_key_t = _require_handled(
-                    aten_fast.fast_aten_bmm(q_t, grad_scores), "SDPA key gradient"
-                )
+                grad_key_t = None
+                if causal_bmm:
+                    grad_key_t = aten_fast._try_sdpa_causal_bmm(
+                        q_t, grad_scores, False, aten_fast.SDPA_CAUSAL_B_COLS
+                    )
+                if grad_key_t is None:
+                    grad_key_t = _require_handled(
+                        aten_fast.fast_aten_bmm(q_t, grad_scores), "SDPA key gradient"
+                    )
                 grad_key_view = _require_handled(
                     aten_fast.fast_aten_transpose(grad_key_t, 1, 2),
                     "SDPA transpose key gradient",
@@ -447,15 +588,36 @@ def _scaled_dot_product_attention_autograd(
         )
         is not None
     ):
+        # Redispatches through __torch_dispatch__: the deferred-compile
+        # layer sees the flash op and orders/queues it like any other.
         return torch.ops.aten._scaled_dot_product_flash_attention.default(
             query, key, value, dropout_p, is_causal, False, scale=scale
         )[0]
+    # The remaining paths read q/k/v payloads directly through aten_fast,
+    # ABOVE __torch_dispatch__ — invisible to the deferred-compile queue —
+    # so every still-pending producer must land first (FIFO granularity: the
+    # whole queue drains, which covers q/k/v/attn_mask). The eligibility
+    # check above is metadata-only and safe on pending tensors. Buffers
+    # these paths allocate afterwards are retained per queued item (queue
+    # rule 3), so no extra bookkeeping is owed here.
+    from . import deferred_compile
+
+    deferred_compile.drain()
     if not needs_backward:
         return _require_handled(
             aten_fast.fast_aten_scaled_dot_product_attention(
                 query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
             ),
             "aten::scaled_dot_product_attention",
+        )
+    if (
+        aten_fast._fused_fa_inputs(
+            query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+        )
+        is not None
+    ):
+        return _FusedFlashAttentionAutograd.apply(
+            query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
         )
     return _ScaledDotProductAttentionAutograd.apply(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa

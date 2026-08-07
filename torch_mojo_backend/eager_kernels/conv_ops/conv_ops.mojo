@@ -1,0 +1,261 @@
+# ===----------------------------------------------------------------------=== #
+# Fast eager-mode conv2d support kernels for mojo_device — pure Mojo, no
+# cuDNN. Convolution is lowered to (batched) im2col + the pure-Mojo GEMM in
+# `matmul_ops`: the torch (K, C, R, S) weight is used as-is (the im2col row
+# order matches its reduction order) and the matmul output is already NCHW.
+#
+# Both GPU and CPU MAX devices are supported: `_parallel_for` runs the
+# `elementwise` framework on the host when `ctx.api() == "cpu"`.
+# ===----------------------------------------------------------------------=== #
+
+from std.os import abort
+from std.gpu.host import DeviceContext
+from std.python import PythonObject
+from std.python._cpython import PyObjectPtr, Py_ssize_t
+from std.python.bindings import PythonModuleBuilder
+from std.utils.coord import Coord as StdCoord
+
+from op_utils import (
+    _spec_unsupported,
+    FLOAT_DTYPES,
+    _make_ptr,
+    _parallel_for,
+    _raw_ctx,
+    _raw_dtype_int,
+    _raw_int,
+    _raw_ret_none,
+    _raw_tuple_int,
+    _raw_tuple_len,
+)
+
+from variant_gates import _dtype_arg_on, _op_on, _register_call
+
+
+# ---------------------------------------------------------------------------
+# Batched im2col for NCHW input: builds the (N, C*KH*KW, OH*OW) patch
+# matrix so that conv = weight.view(K, C*KH*KW) @ col[s]. Row order matches
+# the reduction order of torch's (K, C, KH, KW) filter, so the weight can
+# be used as-is (zero copy) and the matmul output is already NCHW. Rows are
+# channel-major, so grouped convolution can slice the row range of each
+# group with a plain element offset.
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _im2col[
+    dtype: DType
+](
+    out_addr: Int,
+    in_addr: Int,
+    in_h: Int,
+    in_w: Int,
+    out_h: Int,
+    out_w: Int,
+    kh: Int,
+    kw: Int,
+    stride_h: Int,
+    stride_w: Int,
+    pad_h: Int,
+    pad_w: Int,
+    dil_h: Int,
+    dil_w: Int,
+    channels: Int,
+    batch: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var in_ptr = _make_ptr[dtype](in_addr)
+
+    @always_inline
+    @parameter
+    @__copy_capture(out_ptr, in_ptr)
+    def func[width: Int, alignment: Int = 1](idx: StdCoord):
+        var i = Int(idx[0].value())
+        var cols = out_h * out_w
+        var crs = channels * kh * kw
+        var s = i // (crs * cols)
+        var r = (i // cols) % crs
+        var j = i % cols
+        var fw = r % kw
+        var fh = (r // kw) % kh
+        var c = r // (kw * kh)
+        var oh = j // out_w
+        var ow = j % out_w
+        var ih = oh * stride_h - pad_h + fh * dil_h
+        var iw = ow * stride_w - pad_w + fw * dil_w
+        if ih < 0 or ih >= in_h or iw < 0 or iw >= in_w:
+            out_ptr[i] = Scalar[dtype](0)
+        else:
+            out_ptr[i] = in_ptr[((s * channels + c) * in_h + ih) * in_w + iw]
+
+    _parallel_for[func](batch * channels * kh * kw * out_h * out_w, ctx)
+
+
+def _im2col_go(
+    col_ptr: PyObjectPtr,
+    in_ptr: PyObjectPtr,
+    # (in_h, in_w, out_h, out_w, kh, kw, stride_h, stride_w, pad_h, pad_w,
+    #  dil_h, dil_w, channels, batch); batch defaults to 1 when omitted.
+    params: PyObjectPtr,
+    dtype_obj: PyObjectPtr,
+    device_context_ptr: PyObjectPtr,
+) raises:
+    var dtype = _raw_dtype_int(dtype_obj)
+    var out_addr = _raw_int(col_ptr)
+    var in_addr = _raw_int(in_ptr)
+    var in_h = _raw_tuple_int(params, 0)
+    var in_w = _raw_tuple_int(params, 1)
+    var out_h = _raw_tuple_int(params, 2)
+    var out_w = _raw_tuple_int(params, 3)
+    var kh = _raw_tuple_int(params, 4)
+    var kw = _raw_tuple_int(params, 5)
+    var stride_h = _raw_tuple_int(params, 6)
+    var stride_w = _raw_tuple_int(params, 7)
+    var pad_h = _raw_tuple_int(params, 8)
+    var pad_w = _raw_tuple_int(params, 9)
+    var dil_h = _raw_tuple_int(params, 10)
+    var dil_w = _raw_tuple_int(params, 11)
+    var channels = _raw_tuple_int(params, 12)
+    var batch = _raw_tuple_int(params, 13) if _raw_tuple_len(params) > 13 else 1
+    var ctx = _raw_ctx(device_context_ptr)
+
+    var handled = False
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                _im2col[dt](
+                    out_addr,
+                    in_addr,
+                    in_h,
+                    in_w,
+                    out_h,
+                    out_w,
+                    kh,
+                    kw,
+                    stride_h,
+                    stride_w,
+                    pad_h,
+                    pad_w,
+                    dil_h,
+                    dil_w,
+                    channels,
+                    batch,
+                    ctx,
+                )
+                handled = True
+    if not handled:
+        raise Error("unsupported dtype for fast im2col: " + String(dtype))
+
+
+def _im2col_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _im2col_go(args[0], args[1], args[2], args[3], args[4])
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
+# ---------------------------------------------------------------------------
+# In-place per-channel bias add on a (batch, channels, plane) tensor:
+# out[i] += bias[(i // plane) % channels].
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _bias_add_chan[
+    dtype: DType
+](
+    out_addr: Int,
+    bias_addr: Int,
+    total: Int,
+    plane: Int,
+    channels: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var bias_ptr = _make_ptr[dtype](bias_addr)
+
+    @always_inline
+    @parameter
+    @__copy_capture(out_ptr, bias_ptr)
+    def func[width: Int, alignment: Int = 1](idx: StdCoord):
+        var i = Int(idx[0].value())
+        out_ptr[i] = out_ptr[i] + bias_ptr[(i // plane) % channels]
+
+    _parallel_for[func](total, ctx)
+
+
+def _bias_add_chan_go(
+    out_ptr: PyObjectPtr,
+    bias_ptr: PyObjectPtr,
+    params: PyObjectPtr,  # (plane, channels, total_elements)
+    dtype_obj: PyObjectPtr,
+    device_context_ptr: PyObjectPtr,
+) raises:
+    var dtype = _raw_dtype_int(dtype_obj)
+    var out_addr = _raw_int(out_ptr)
+    var bias_addr = _raw_int(bias_ptr)
+    var plane_val = _raw_tuple_int(params, 0)
+    var channels = _raw_tuple_int(params, 1)
+    var total = _raw_tuple_int(params, 2)
+    var ctx = _raw_ctx(device_context_ptr)
+
+    var handled = False
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                _bias_add_chan[dt](
+                    out_addr, bias_addr, total, plane_val, channels, ctx
+                )
+                handled = True
+    if not handled:
+        raise Error("unsupported dtype for fast bias add: " + String(dtype))
+
+
+def _bias_add_chan_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _bias_add_chan_go(args[0], args[1], args[2], args[3], args[4])
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
+# ---------------------------------------------------------------------------
+# Python module definition
+# ---------------------------------------------------------------------------
+
+
+@export
+def PyInit_conv_ops() abi("C") -> PythonObject:
+    try:
+        var b = PythonModuleBuilder("conv_ops")
+        comptime if _op_on["Im2col"]():
+            _register_call(
+                b,
+                _im2col_dispatcher,
+                docstring=(
+                    "batched NCHW im2col -> (N, C*KH*KW, OH*OW) patch matrix"
+                ),
+            )
+        comptime if _op_on["BiasAddChan"]():
+            _register_call(
+                b,
+                _bias_add_chan_dispatcher,
+                docstring=(
+                    "in-place out[i] += bias[(i // plane) % channels] on a"
+                    " (batch, channels, plane) tensor"
+                ),
+            )
+        return b.finalize()
+    except e:
+        abort(t"failed to create conv_ops python module: {e}")

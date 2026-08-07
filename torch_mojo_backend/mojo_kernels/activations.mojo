@@ -8,7 +8,7 @@ struct GeluBackwardNoneKernel(ElementwiseBinaryOp):
     @staticmethod
     def elementwise[
         dtype: DType,
-        width: SIMDSize,
+        width: SIMDLength,
     ](grad_output: SIMD[dtype, width], input: SIMD[dtype, width]) -> SIMD[
         dtype, width
     ]:
@@ -44,7 +44,7 @@ struct GeluBackwardTanhKernel(ElementwiseBinaryOp):
     @staticmethod
     def elementwise[
         dtype: DType,
-        width: SIMDSize,
+        width: SIMDLength,
     ](grad_output: SIMD[dtype, width], input: SIMD[dtype, width]) -> SIMD[
         dtype, width
     ]:

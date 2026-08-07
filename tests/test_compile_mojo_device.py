@@ -106,7 +106,12 @@ def test_compile_nn_module(mojo_device):
         torch.nn.Linear(8, 16), torch.nn.ReLU(), torch.nn.Linear(16, 4)
     )
     x = torch.randn(3, 8)
-    ref = model(x)
+    # No autograd graph: `register_mojo_devices` turns on
+    # `set_swap_module_params_on_conversion` (needed to preserve tied
+    # weights), and swapping a parameter that a live backward graph still
+    # references is rejected by torch itself -- identically for `.to("cuda")`.
+    with torch.no_grad():
+        ref = model(x)
     model_dev = model.to(mojo_device)
     compiled = torch.compile(model_dev, backend=mojo_backend, fullgraph=True)
     out = compiled(x.to(mojo_device))

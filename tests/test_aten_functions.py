@@ -21,16 +21,25 @@ from torch_mojo_backend.testing import (
 def test_scaled_dot_product_flash_attention_basic(
     conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
-    """Test _scaled_dot_product_flash_attention basic functionality"""
-    call_checker.register(aten_functions.aten__scaled_dot_product_flash_attention)
-    # Flash attention only works on CUDA
-    # if conf.device != "cuda:0":
-    #    pytest.skip("Flash attention is only supported on CUDA")
+    """Half-precision scaled dot product attention through the public API.
+
+    The op the backend serves this with depends on the device: the compile path
+    lowers to ``aten::_scaled_dot_product_flash_attention``, while mojo eager
+    keeps the high-level ``aten::scaled_dot_product_attention`` and only reaches
+    a flash kernel inside it on the architectures that have one (FA4 is CUDA
+    sm_90a / BF16 / head_dim 64 only). Both twins are registered so the
+    assertion is "a Mojo SDPA implementation ran", whichever variant the device
+    routes to.
+    """
+    call_checker.register(
+        aten_functions.aten__scaled_dot_product_flash_attention,
+        aten_functions.aten_scaled_dot_product_attention,
+    )
 
     def fn(q, k, v):
         return torch.nn.functional.scaled_dot_product_attention(
             q, k, v, dropout_p=0.0, is_causal=False
-        )[0]  # For the moment we support only training
+        )
 
     batch_size, num_heads, seq_len, head_dim = 2, 4, 8, 16
     q = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=dtype)
@@ -199,6 +208,30 @@ def test_scaled_dot_product_attention_bool_mask(conf: Conf, call_checker: CallCh
     k = torch.randn(batch_size, num_heads, seq_len, head_dim)
     v = torch.randn(batch_size, num_heads, seq_len, head_dim)
     attn_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+    check_outputs(fn, conf, [q, k, v, attn_mask], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("mask_batch", [1, 2])
+def test_scaled_dot_product_attention_cross_attention_4d_mask(
+    conf: Conf, call_checker: CallChecker, mask_batch: int
+) -> None:
+    """Cross attention (key length != query length) with a rank-4 mask.
+
+    ``mask_batch=1`` additionally exercises a mask that broadcasts over the
+    batch dimension of the score matrix rather than matching it exactly.
+    """
+    call_checker.register(aten_functions.aten_scaled_dot_product_attention)
+
+    def fn(q, k, v, attn_mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=0.0
+        )
+
+    batch_size, num_heads, q_len, kv_len, head_dim = 2, 4, 6, 11, 16
+    q = torch.randn(batch_size, num_heads, q_len, head_dim)
+    k = torch.randn(batch_size, num_heads, kv_len, head_dim)
+    v = torch.randn(batch_size, num_heads, kv_len, head_dim)
+    attn_mask = torch.randn(mask_batch, num_heads, q_len, kv_len)
     check_outputs(fn, conf, [q, k, v, attn_mask], atol=1e-4, rtol=1e-4)
 
 

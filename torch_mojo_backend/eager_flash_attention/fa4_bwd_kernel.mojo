@@ -253,14 +253,14 @@ def bwd_main_kernel[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
         alignment=128,
-    ](k_base)
+    ]((k_base).as_unsafe_any_origin())
     var v_smem = LayoutTensor[
         dtype,
         kv_smem_layout,
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
         alignment=128,
-    ](v_base)
+    ]((v_base).as_unsafe_any_origin())
     # ---- mbarriers.
     var mbar_k = stack_allocation[
         1, SharedMemBarrier, address_space=AddressSpace.SHARED, alignment=8
@@ -459,7 +459,7 @@ def bwd_main_kernel[
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](ring_base + slot * q_slot_size)
+                    ]((ring_base + slot * q_slot_size).as_unsafe_any_origin())
                     full[slot].expect_bytes(
                         Int32(BM * D * size_of[dtype]() + BM * 4)
                     )
@@ -487,7 +487,7 @@ def bwd_main_kernel[
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](ring_base + (slot + 1) * q_slot_size)
+                    ]((ring_base + (slot + 1) * q_slot_size).as_unsafe_any_origin())
                     full[slot + 1].expect_bytes(
                         Int32(BM * D * size_of[dtype]() + BM * 4)
                     )
@@ -723,28 +723,28 @@ def bwd_main_kernel[
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ](ring_base + slot * q_slot_size)
+        ]((ring_base + slot * q_slot_size).as_unsafe_any_origin())
         var qt_view = LayoutTensor[
             dtype,
             qt_view_layout,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ](ring_base + slot * q_slot_size)
+        ]((ring_base + slot * q_slot_size).as_unsafe_any_origin())
         var do_view = LayoutTensor[
             dtype,
             q_smem_layout,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ](ring_base + (slot + 1) * q_slot_size)
+        ]((ring_base + (slot + 1) * q_slot_size).as_unsafe_any_origin())
         var dot_view = LayoutTensor[
             dtype,
             qt_view_layout,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ](ring_base + (slot + 1) * q_slot_size)
+        ]((ring_base + (slot + 1) * q_slot_size).as_unsafe_any_origin())
 
         # Launder the K/V tile pointers through a no-op asm so the
         # A-operand wgmma descriptors are REBUILT here every
@@ -774,14 +774,14 @@ def bwd_main_kernel[
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ](k_base_l)
+        ]((k_base_l).as_unsafe_any_origin())
         var v_smem_l = LayoutTensor[
             dtype,
             kv_smem_layout,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ](v_base_l)
+        ]((v_base_l).as_unsafe_any_origin())
 
         # S^T = K · Q^T
         full[slot].wait(phase)
@@ -1447,7 +1447,7 @@ def bwd_main_kernel[
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ](v_base)
+        ]((v_base).as_unsafe_any_origin())
         dv_tma.async_store_3d(dv_st, (0, h_idx // gqa_ratio, kv_row))
         dv_tma.commit_group()
 
@@ -1507,7 +1507,7 @@ def bwd_main_kernel[
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ](k_base)
+        ]((k_base).as_unsafe_any_origin())
         dk_tma.async_store_3d(dk_st, (0, h_idx // gqa_ratio, kv_row))
         dk_tma.commit_group()
         dk_tma.wait_group()

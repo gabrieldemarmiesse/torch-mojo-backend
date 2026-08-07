@@ -1,0 +1,180 @@
+# ===----------------------------------------------------------------------=== #
+# Thin eager-mode LayerNorm-backward bridge for mojo_device (float32 GPU).
+#
+# Device-kernel bodies live in the two Fable-owned internal modules imported
+# below.  This Python-visible module only unpacks the pointer ABI, selects the
+# requested ATen outputs, and enqueues work on the caller's DeviceContext.
+# It performs no host reads or synchronization.
+# ===----------------------------------------------------------------------=== #
+
+from std.gpu.host import DeviceContext
+from std.os import abort
+from std.python import PythonObject
+from std.python.bindings import PythonModuleBuilder
+from std.python._cpython import PyObjectPtr, Py_ssize_t
+
+from normalization_backward_dx import enqueue_layer_norm_backward_dx_f32
+from normalization_backward_params import (
+    enqueue_layer_norm_backward_params_f32,
+)
+from op_utils import (
+    _make_ptr,
+    _raw_ctx,
+    _raw_int,
+    _raw_ret_none,
+    _spec_unsupported,
+)
+
+from variant_gates import _op_on, _register_call
+
+
+def enqueue_layer_norm_backward_f32(
+    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    output_mask: Int,
+    ctx: DeviceContext,
+) raises:
+    if rows <= 0 or cols <= 0:
+        return
+
+    var want_input = (output_mask & 1) != 0
+    var want_weight = (output_mask & 2) != 0
+    var want_bias = (output_mask & 4) != 0
+
+    if want_input:
+        enqueue_layer_norm_backward_dx_f32(
+            grad_input,
+            grad_output,
+            input,
+            mean,
+            rstd,
+            weight,
+            rows,
+            cols,
+            Int(weight) != 0,
+            ctx,
+        )
+
+    if want_weight or want_bias:
+        enqueue_layer_norm_backward_params_f32(
+            grad_weight,
+            grad_bias,
+            grad_output,
+            input,
+            mean,
+            rstd,
+            rows,
+            cols,
+            want_weight,
+            want_bias,
+            ctx,
+        )
+
+
+def _layer_norm_backward_go(
+    grad_input_ptr_obj: PyObjectPtr,
+    grad_weight_ptr_obj: PyObjectPtr,
+    grad_bias_ptr_obj: PyObjectPtr,
+    grad_output_ptr_obj: PyObjectPtr,
+    input_ptr_obj: PyObjectPtr,
+    mean_ptr_obj: PyObjectPtr,
+    rstd_ptr_obj: PyObjectPtr,
+    weight_ptr_obj: PyObjectPtr,
+    rows_obj: PyObjectPtr,
+    cols_obj: PyObjectPtr,
+    output_mask_obj: PyObjectPtr,
+    device_context_ptr: PyObjectPtr,
+) raises:
+    var grad_input = _make_ptr[DType.float32](
+        _raw_int(grad_input_ptr_obj)
+    ).as_unsafe_any_origin()
+    var grad_weight = _make_ptr[DType.float32](
+        _raw_int(grad_weight_ptr_obj)
+    ).as_unsafe_any_origin()
+    var grad_bias = _make_ptr[DType.float32](
+        _raw_int(grad_bias_ptr_obj)
+    ).as_unsafe_any_origin()
+    var grad_output = _make_ptr[DType.float32](
+        _raw_int(grad_output_ptr_obj)
+    ).as_unsafe_any_origin()
+    var input = _make_ptr[DType.float32](
+        _raw_int(input_ptr_obj)
+    ).as_unsafe_any_origin()
+    var mean = _make_ptr[DType.float32](
+        _raw_int(mean_ptr_obj)
+    ).as_unsafe_any_origin()
+    var rstd = _make_ptr[DType.float32](
+        _raw_int(rstd_ptr_obj)
+    ).as_unsafe_any_origin()
+    var weight = _make_ptr[DType.float32](
+        _raw_int(weight_ptr_obj)
+    ).as_unsafe_any_origin()
+    var ctx = _raw_ctx(device_context_ptr)
+    enqueue_layer_norm_backward_f32(
+        grad_input,
+        grad_weight,
+        grad_bias,
+        grad_output,
+        input,
+        mean,
+        rstd,
+        weight,
+        _raw_int(rows_obj),
+        _raw_int(cols_obj),
+        _raw_int(output_mask_obj),
+        ctx,
+    )
+
+
+def _layer_norm_backward_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _layer_norm_backward_go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+            args[9],
+            args[10],
+            args[11],
+        )
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
+@export
+def PyInit_normalization_backward_ops() abi("C") -> PythonObject:
+    try:
+        var b = PythonModuleBuilder("normalization_backward_ops")
+        comptime if _op_on["LayerNormBackwardF32"]():
+            _register_call(
+                b,
+                _layer_norm_backward_dispatcher,
+                docstring=(
+                    "(grad_input_ptr, grad_weight_ptr, grad_bias_ptr,"
+                    " grad_output_ptr, input_ptr, mean_ptr, rstd_ptr,"
+                    " weight_ptr, rows, cols, output_mask, context_ptr);"
+                    " float32 native LayerNorm backward"
+                ),
+            )
+        return b.finalize()
+    except e:
+        abort(t"failed to create normalization_backward_ops python module: {e}")

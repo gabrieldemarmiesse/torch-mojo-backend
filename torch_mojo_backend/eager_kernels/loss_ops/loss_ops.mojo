@@ -1,0 +1,632 @@
+# ===----------------------------------------------------------------------=== #
+# Fast eager-mode NLL loss kernels for mojo_device (float32 log-probs, int64
+# targets, no class weights), ported from the validated Fable candidate.
+#
+# Same architecture as nn_ops.mojo: Python-visible functions get raw integer
+# pointers (tensor `._ptr`, offset pre-applied) plus shape/mode ints and the
+# device's DeviceContext pointer, and enqueue work on the device queue (fire
+# and forget, no sync, no host reads, no host allocation).
+#
+# Forward:
+#   - reduction=0 (none): grid-stride kernel, one loss per row, total_weight=0.
+#   - reduction=1 (mean): a single 1024-thread block reduces the gathered
+#     losses and valid-row count for small row counts; larger row counts use a
+#     two-kernel scheme (per-block partials into a stream-ordered scratch
+#     buffer, then a one-block finalize) to spread the gathers across SMs
+#     without an extra zero-initialization launch.
+#   - reduction=2 (sum): the reference sum is a serial fp32 accumulation whose
+#     absolute tolerance is below one ulp of the result, so the kernel loads
+#     row losses cooperatively into shared memory and one thread accumulates
+#     them in row order, reproducing the reference rounding bit-for-bit.
+#
+# Backward writes the whole dense gradient, zero except target slots. For
+# `classes % 4 == 0`, classes >= 1024, and a 16-byte-aligned grad_input base
+# pointer a 2D strip-mapped kernel issues 16-byte vector stores (block_idx.y
+# is the row, so no integer division and no wave tail); otherwise a
+# warp-per-row kernel issues coalesced scalar stores. The raw ATen out
+# pointer only guarantees element alignment (a contiguous tensor may start at
+# a storage offset), so the vector regime is gated on the runtime pointer and
+# the Int64 target loads use element alignment.
+#
+# Supported contract: non-ignore targets must lie in [0, classes). Out-of-
+# range targets are skipped like ignore_index rather than trapped: Mojo has
+# no asynchronous device-side assert that would not poison the shared device
+# context, and these kernels never synchronize to check on the host.
+# ===----------------------------------------------------------------------=== #
+
+from std.gpu import (
+    WARP_SIZE,
+    barrier,
+    block_idx,
+    grid_dim,
+    lane_id,
+    thread_idx,
+    warp_id,
+)
+from std.gpu.host import DeviceContext
+from std.gpu.primitives import block
+from std.math import ceildiv
+from std.memory import stack_allocation
+from std.os import abort
+from std.python import PythonObject
+from std.python.bindings import PythonModuleBuilder
+from std.python._cpython import PyObjectPtr, Py_ssize_t
+from std.sys.info import has_accelerator
+
+from op_utils import (
+    _spec_unsupported,
+    _enqueue_cached,
+    _make_ptr,
+    _raw_ctx,
+    _raw_int,
+    _raw_ret_none,
+)
+
+from variant_gates import _op_on, _register_call
+
+
+comptime _NONE_BLOCK = 256
+comptime _MEAN_BLOCK = 1024
+comptime _MEAN_ILP = 8
+comptime _MEAN_CHUNK = _MEAN_BLOCK * _MEAN_ILP
+comptime _MEAN_SINGLE_MAX_ROWS = 4096
+comptime _PARTIAL_BLOCK = 256
+comptime _SUM_BLOCK = 256
+comptime _BWD_BLOCK = 256
+comptime _VEC_UNROLL = 8
+comptime _VEC_MIN_CLASSES = 4 * _BWD_BLOCK
+
+
+@__name("nanogpt_nll_forward_none")
+def _nll_forward_none(
+    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    rows: Int,
+    classes: Int,
+    ignore_index: Int,
+):
+    var row = Int(block_idx.x) * _NONE_BLOCK + Int(thread_idx.x)
+    if row == 0:
+        total_weight[0] = 0.0
+    var stride = Int(grid_dim.x) * _NONE_BLOCK
+    while row < rows:
+        var t = Int(target[row])
+        var loss = Float32(0.0)
+        if t != ignore_index and t >= 0 and t < classes:
+            loss = -log_probs[row * classes + t]
+        output[row] = loss
+        row += stride
+
+
+@__name("nanogpt_nll_forward_mean")
+def _nll_forward_mean(
+    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    rows: Int,
+    classes: Int,
+    ignore_index: Int,
+):
+    # Single block on one SM: use wide target loads and independent
+    # accumulator lanes so enough gathers stay in flight to hide latency.
+    # The wide load only claims element alignment: the target base pointer
+    # may sit at any 8-byte boundary (storage offset).
+    var tid = Int(thread_idx.x)
+    var acc = SIMD[DType.float32, _MEAN_ILP](0.0)
+    var count = SIMD[DType.float32, _MEAN_ILP](0.0)
+    var base = 0
+    while base + _MEAN_CHUNK <= rows:
+        var r = base + tid * _MEAN_ILP
+        var tv = target.load[width=_MEAN_ILP, alignment=8](r)
+        comptime for lane in range(_MEAN_ILP):
+            var t = Int(tv[lane])
+            if t != ignore_index and t >= 0 and t < classes:
+                acc[lane] += log_probs[(r + lane) * classes + t]
+                count[lane] += 1.0
+        base += _MEAN_CHUNK
+    var row = base + tid
+    while row < rows:
+        var t = Int(target[row])
+        if t != ignore_index and t >= 0 and t < classes:
+            acc[0] += log_probs[row * classes + t]
+            count[0] += 1.0
+        row += _MEAN_BLOCK
+    var total = block.sum[block_size=_MEAN_BLOCK, broadcast=False](
+        acc.reduce_add()
+    )
+    var valid = block.sum[block_size=_MEAN_BLOCK, broadcast=False](
+        count.reduce_add()
+    )
+    if tid == 0:
+        output[0] = -total / valid
+        total_weight[0] = valid
+
+
+@__name("nanogpt_nll_forward_mean_partial")
+def _nll_forward_mean_partial(
+    scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    rows: Int,
+    classes: Int,
+    ignore_index: Int,
+):
+    var acc = Float32(0.0)
+    var count = Float32(0.0)
+    var row = Int(block_idx.x) * _PARTIAL_BLOCK + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * _PARTIAL_BLOCK
+    while row < rows:
+        var t = Int(target[row])
+        if t != ignore_index and t >= 0 and t < classes:
+            acc += log_probs[row * classes + t]
+            count += 1.0
+        row += stride
+    var total = block.sum[block_size=_PARTIAL_BLOCK, broadcast=False](acc)
+    var valid = block.sum[block_size=_PARTIAL_BLOCK, broadcast=False](count)
+    if thread_idx.x == 0:
+        var b = Int(block_idx.x)
+        scratch[2 * b] = total
+        scratch[2 * b + 1] = valid
+
+
+@__name("nanogpt_nll_forward_mean_final")
+def _nll_forward_mean_final(
+    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    partials: Int,
+):
+    var acc = Float32(0.0)
+    var count = Float32(0.0)
+    var i = Int(thread_idx.x)
+    while i < partials:
+        acc += scratch[2 * i]
+        count += scratch[2 * i + 1]
+        i += _PARTIAL_BLOCK
+    var total = block.sum[block_size=_PARTIAL_BLOCK, broadcast=False](acc)
+    var valid = block.sum[block_size=_PARTIAL_BLOCK, broadcast=False](count)
+    if thread_idx.x == 0:
+        output[0] = -total / valid
+        total_weight[0] = valid
+
+
+@__name("nanogpt_nll_forward_sum")
+def _nll_forward_sum(
+    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    rows: Int,
+    classes: Int,
+    ignore_index: Int,
+):
+    var losses = stack_allocation[
+        _SUM_BLOCK, DType.float32, address_space=AddressSpace.SHARED
+    ]()
+    var tid = Int(thread_idx.x)
+    var acc = Float32(0.0)
+    var count = Float32(0.0)
+    var base = 0
+    while base < rows:
+        var row = base + tid
+        var loss = Float32(0.0)
+        if row < rows:
+            var t = Int(target[row])
+            if t != ignore_index and t >= 0 and t < classes:
+                loss = -log_probs[row * classes + t]
+                count += 1.0
+        losses[tid] = loss
+        barrier()
+        if tid == 0:
+            # Serial fp32 accumulation in row order; ignored rows contribute
+            # an exact 0.0 so the rounding sequence matches a reference that
+            # skips them.
+            var limit = min(_SUM_BLOCK, rows - base)
+            for i in range(limit):
+                acc += losses[i]
+        barrier()
+        base += _SUM_BLOCK
+    var valid = block.sum[block_size=_SUM_BLOCK, broadcast=False](count)
+    if tid == 0:
+        output[0] = acc
+        total_weight[0] = valid
+
+
+@__name("nanogpt_nll_backward_vec4")
+def _nll_backward_vec4(
+    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    rows: Int,
+    classes: Int,
+    reduction: Int,
+    ignore_index: Int,
+):
+    # 2D strip mapping: block_idx.y selects the row (grid-stride for very
+    # large row counts) and block_idx.x selects a strip of _VEC_UNROLL
+    # 16-byte chunks per thread, so no integer division and no wave tail.
+    # The host only routes here when the grad_input base pointer is 16-byte
+    # aligned (classes % 4 == 0 keeps every row base on that boundary).
+    var vec_cols = classes // 4
+    var tid = Int(thread_idx.x)
+    var strip = Int(block_idx.x) * (_BWD_BLOCK * _VEC_UNROLL)
+    var scale = Float32(0.0)
+    if reduction == 1:
+        scale = grad_output[0] / total_weight[0]
+    elif reduction == 2:
+        scale = grad_output[0]
+    var row = Int(block_idx.y)
+    while row < rows:
+        var t = Int(target[row])
+        var valid = t != ignore_index and t >= 0 and t < classes
+        var grad = Float32(0.0)
+        if valid:
+            grad = -(grad_output[row] if reduction == 0 else scale)
+        var base = row * classes
+        comptime for u in range(_VEC_UNROLL):
+            var v = strip + u * _BWD_BLOCK + tid
+            if v < vec_cols:
+                var col = v * 4
+                var chunk = SIMD[DType.float32, 4](0.0)
+                # Comptime lane indices keep the vector in registers; a
+                # runtime lane index would demote it to local memory.
+                comptime for lane in range(4):
+                    if valid and t == col + lane:
+                        chunk[lane] = grad
+                grad_input.store[width=4, alignment=16](base + col, chunk)
+        row += Int(grid_dim.y)
+
+
+@__name("nanogpt_nll_backward_scalar")
+def _nll_backward_scalar(
+    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    rows: Int,
+    classes: Int,
+    reduction: Int,
+    ignore_index: Int,
+):
+    var lane = Int(lane_id())
+    var warp_stride = Int(grid_dim.x) * (_BWD_BLOCK // WARP_SIZE)
+    var scale = Float32(0.0)
+    if reduction == 1:
+        scale = grad_output[0] / total_weight[0]
+    elif reduction == 2:
+        scale = grad_output[0]
+    var row = Int(block_idx.x) * (_BWD_BLOCK // WARP_SIZE) + Int(warp_id())
+    while row < rows:
+        var t = Int(target[row])
+        var valid = t != ignore_index and t >= 0 and t < classes
+        var grad = Float32(0.0)
+        if valid:
+            grad = -(grad_output[row] if reduction == 0 else scale)
+        var base = row * classes
+        var col = lane
+        while col < classes:
+            grad_input[base + col] = grad if (valid and col == t) else 0.0
+            col += WARP_SIZE
+        row += warp_stride
+
+
+def enqueue_nll_forward_f32(
+    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    rows: Int,
+    classes: Int,
+    reduction: Int,
+    ignore_index: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime if not has_accelerator():
+        raise Error("no GPU accelerator available at compile time")
+    else:
+        if reduction == 0:
+            var grid = min(ceildiv(rows, _NONE_BLOCK), 4096)
+            _enqueue_cached[_nll_forward_none](
+                ctx,
+                "nll_fwd_none",
+                grid,
+                1,
+                1,
+                _NONE_BLOCK,
+                output,
+                total_weight,
+                log_probs,
+                target,
+                rows,
+                classes,
+                ignore_index,
+            )
+        elif reduction == 1:
+            if rows <= _MEAN_SINGLE_MAX_ROWS:
+                _enqueue_cached[_nll_forward_mean](
+                    ctx,
+                    "nll_fwd_mean_single",
+                    1,
+                    1,
+                    1,
+                    _MEAN_BLOCK,
+                    output,
+                    total_weight,
+                    log_probs,
+                    target,
+                    rows,
+                    classes,
+                    ignore_index,
+                )
+            else:
+                var grid = min(ceildiv(rows, _PARTIAL_BLOCK), 1024)
+                var scratch = ctx.enqueue_create_buffer[DType.float32](2 * grid)
+                var scratch_ptr = scratch.unsafe_ptr().as_unsafe_any_origin()
+                _enqueue_cached[_nll_forward_mean_partial](
+                    ctx,
+                    "nll_fwd_mean_partial",
+                    grid,
+                    1,
+                    1,
+                    _PARTIAL_BLOCK,
+                    scratch_ptr,
+                    log_probs,
+                    target,
+                    rows,
+                    classes,
+                    ignore_index,
+                )
+                _enqueue_cached[_nll_forward_mean_final](
+                    ctx,
+                    "nll_fwd_mean_final",
+                    1,
+                    1,
+                    1,
+                    _PARTIAL_BLOCK,
+                    output,
+                    total_weight,
+                    scratch_ptr,
+                    grid,
+                )
+                # Dropping `scratch` schedules a stream-ordered free after
+                # the enqueued kernels complete.
+                _ = scratch^
+        elif reduction == 2:
+            _enqueue_cached[_nll_forward_sum](
+                ctx,
+                "nll_fwd_sum",
+                1,
+                1,
+                1,
+                _SUM_BLOCK,
+                output,
+                total_weight,
+                log_probs,
+                target,
+                rows,
+                classes,
+                ignore_index,
+            )
+        else:
+            raise Error("reduction must be 0, 1, or 2")
+
+
+def enqueue_nll_backward_f32(
+    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    rows: Int,
+    classes: Int,
+    reduction: Int,
+    ignore_index: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime if not has_accelerator():
+        raise Error("no GPU accelerator available at compile time")
+    else:
+        if reduction < 0 or reduction > 2:
+            raise Error("reduction must be 0, 1, or 2")
+        if (
+            classes % 4 == 0
+            and classes >= _VEC_MIN_CLASSES
+            and Int(grad_input) % 16 == 0
+        ):
+            var strips = ceildiv(classes // 4, _BWD_BLOCK * _VEC_UNROLL)
+            _enqueue_cached[_nll_backward_vec4](
+                ctx,
+                "nll_bwd_vec4",
+                strips,
+                min(rows, 65535),
+                1,
+                _BWD_BLOCK,
+                grad_input,
+                grad_output,
+                target,
+                total_weight,
+                rows,
+                classes,
+                reduction,
+                ignore_index,
+            )
+        else:
+            var grid = min(ceildiv(rows, _BWD_BLOCK // WARP_SIZE), 8192)
+            _enqueue_cached[_nll_backward_scalar](
+                ctx,
+                "nll_bwd_scalar",
+                grid,
+                1,
+                1,
+                _BWD_BLOCK,
+                grad_input,
+                grad_output,
+                target,
+                total_weight,
+                rows,
+                classes,
+                reduction,
+                ignore_index,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Raw CPython entry points
+# ---------------------------------------------------------------------------
+
+
+def _nll_forward_go(
+    output_ptr_obj: PyObjectPtr,
+    total_weight_ptr_obj: PyObjectPtr,
+    log_probs_ptr_obj: PyObjectPtr,
+    target_ptr_obj: PyObjectPtr,
+    rows_obj: PyObjectPtr,
+    classes_obj: PyObjectPtr,
+    reduction_obj: PyObjectPtr,
+    ignore_index_obj: PyObjectPtr,
+    device_context_ptr: PyObjectPtr,
+) raises:
+    var output = _make_ptr[DType.float32](
+        _raw_int(output_ptr_obj)
+    ).as_unsafe_any_origin()
+    var total_weight = _make_ptr[DType.float32](
+        _raw_int(total_weight_ptr_obj)
+    ).as_unsafe_any_origin()
+    var log_probs = _make_ptr[DType.float32](
+        _raw_int(log_probs_ptr_obj)
+    ).as_unsafe_any_origin()
+    var target = _make_ptr[DType.int64](
+        _raw_int(target_ptr_obj)
+    ).as_unsafe_any_origin()
+    var ctx = _raw_ctx(device_context_ptr)
+    enqueue_nll_forward_f32(
+        output,
+        total_weight,
+        log_probs,
+        target,
+        _raw_int(rows_obj),
+        _raw_int(classes_obj),
+        _raw_int(reduction_obj),
+        _raw_int(ignore_index_obj),
+        ctx,
+    )
+
+
+def _nll_backward_go(
+    grad_input_ptr_obj: PyObjectPtr,
+    grad_output_ptr_obj: PyObjectPtr,
+    target_ptr_obj: PyObjectPtr,
+    total_weight_ptr_obj: PyObjectPtr,
+    rows_obj: PyObjectPtr,
+    classes_obj: PyObjectPtr,
+    reduction_obj: PyObjectPtr,
+    ignore_index_obj: PyObjectPtr,
+    device_context_ptr: PyObjectPtr,
+) raises:
+    var grad_input = _make_ptr[DType.float32](
+        _raw_int(grad_input_ptr_obj)
+    ).as_unsafe_any_origin()
+    var grad_output = _make_ptr[DType.float32](
+        _raw_int(grad_output_ptr_obj)
+    ).as_unsafe_any_origin()
+    var target = _make_ptr[DType.int64](
+        _raw_int(target_ptr_obj)
+    ).as_unsafe_any_origin()
+    var total_weight = _make_ptr[DType.float32](
+        _raw_int(total_weight_ptr_obj)
+    ).as_unsafe_any_origin()
+    var ctx = _raw_ctx(device_context_ptr)
+    enqueue_nll_backward_f32(
+        grad_input,
+        grad_output,
+        target,
+        total_weight,
+        _raw_int(rows_obj),
+        _raw_int(classes_obj),
+        _raw_int(reduction_obj),
+        _raw_int(ignore_index_obj),
+        ctx,
+    )
+
+
+def _nll_forward_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _nll_forward_go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+        )
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
+def _nll_backward_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _nll_backward_go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+        )
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
+# ---------------------------------------------------------------------------
+# Python module definition
+# ---------------------------------------------------------------------------
+
+
+@export
+def PyInit_loss_ops() abi("C") -> PythonObject:
+    try:
+        var b = PythonModuleBuilder("loss_ops")
+        comptime if _op_on["NllLossForwardF32"]():
+            _register_call(
+                b,
+                _nll_forward_dispatcher,
+                docstring=(
+                    "(output_ptr, total_weight_ptr, log_probs_ptr, target_ptr,"
+                    " rows, classes, reduction, ignore_index, context_ptr);"
+                    " float32 NLL forward, reduction 0=none/1=mean/2=sum"
+                ),
+            )
+        comptime if _op_on["NllLossBackwardF32"]():
+            _register_call(
+                b,
+                _nll_backward_dispatcher,
+                docstring=(
+                    "(grad_input_ptr, grad_output_ptr, target_ptr,"
+                    " total_weight_ptr, rows, classes, reduction, ignore_index,"
+                    " context_ptr); float32 NLL backward, writes the dense grad"
+                ),
+            )
+        return b.finalize()
+    except e:
+        abort(t"failed to create loss_ops python module: {e}")

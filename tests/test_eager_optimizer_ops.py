@@ -3,18 +3,9 @@
 import pytest
 import torch
 
-from torch_mojo_backend import register_mojo_devices
 from torch_mojo_backend.testing import CallChecker
 
 pytestmark = pytest.mark.xdist_group(name="group1")
-
-
-@pytest.fixture
-def mojo_gpu(mojo_gpu_available: bool) -> str:
-    if not mojo_gpu_available:
-        pytest.skip("requires a MAX GPU")
-    register_mojo_devices()
-    return "mojo:0"
 
 
 def _watch_eager_op(call_checker: CallChecker, op_name: str) -> None:
@@ -482,6 +473,119 @@ def test_fused_adamw_optimizer_found_inf_rolls_back_step(
             atol=2e-7,
         )
     assert mojo_state["step"].item() == 1
+
+
+def _foreach_lists(device: str) -> list[list[torch.Tensor]]:
+    """Deterministic nonuniform FP32 lists for the batched foreach ops.
+
+    Shapes cover empties, multi-dim tensors, and one tensor crossing the
+    65_536-element chunk boundary. The third list (divisors for addcdiv)
+    stays bounded away from zero.
+    """
+    shapes = ((7,), (17, 65), (0,), (5, 3, 2), (65_539,))
+
+    def values(shape, *, scale: float, offset: float) -> torch.Tensor:
+        numel = torch.empty(shape).numel()
+        return (
+            torch.arange(numel, dtype=torch.float32)
+            .mul(scale)
+            .add(offset)
+            .reshape(shape)
+        )
+
+    mutated = [
+        values(shape, scale=0.003, offset=-0.4 + index * 0.1)
+        for index, shape in enumerate(shapes)
+    ]
+    operands = [
+        values(shape, scale=-0.0007, offset=0.3 - index * 0.02)
+        for index, shape in enumerate(shapes)
+    ]
+    divisors = [
+        values(shape, scale=0.0002, offset=-0.08 + index * 0.01).abs().add(0.5)
+        for index, shape in enumerate(shapes)
+    ]
+    return [
+        [tensor.to(device) for tensor in group]
+        for group in (mutated, operands, divisors)
+    ]
+
+
+_FOREACH_BATCHED_SCALARS = [0.5, -1.5, 2.0, 0.25, -0.125]
+_FOREACH_BATCHED_OPS = [
+    ("aten::_foreach_add_.Scalar", lambda a, b, c: torch._foreach_add_(a, 1e-3)),
+    (
+        "aten::_foreach_addcdiv_.ScalarList",
+        lambda a, b, c: torch._foreach_addcdiv_(a, b, c, _FOREACH_BATCHED_SCALARS),
+    ),
+    (
+        "aten::_foreach_addcmul_.Scalar",
+        lambda a, b, c: torch._foreach_addcmul_(a, b, c, value=0.01),
+    ),
+    (
+        "aten::_foreach_div_.ScalarList",
+        lambda a, b, c: torch._foreach_div_(a, _FOREACH_BATCHED_SCALARS),
+    ),
+    ("aten::_foreach_lerp_.Scalar", lambda a, b, c: torch._foreach_lerp_(a, b, 0.1)),
+    ("aten::_foreach_mul_.Scalar", lambda a, b, c: torch._foreach_mul_(a, 0.998)),
+]
+
+
+@pytest.mark.parametrize(("op_name", "apply"), _FOREACH_BATCHED_OPS)
+def test_batched_foreach_elementwise_matches_cpu(
+    mojo_gpu: str, call_checker: CallChecker, op_name: str, apply
+):
+    """The exact batched in-place registration runs and matches CPU."""
+    _watch_eager_op(call_checker, op_name)
+    cpu_lists = _foreach_lists("cpu")
+    mojo_lists = _foreach_lists(mojo_gpu)
+    versions_before = [tensor._version for tensor in mojo_lists[0]]
+    apply(*cpu_lists)
+    apply(*mojo_lists)
+    for expected, actual in zip(cpu_lists[0], mojo_lists[0], strict=True):
+        torch.testing.assert_close(actual.cpu(), expected, rtol=2e-6, atol=2e-7)
+    for tensor, version in zip(mojo_lists[0], versions_before, strict=True):
+        assert tensor._version > version
+
+
+def test_batched_foreach_sqrt_matches_cpu(mojo_gpu: str, call_checker: CallChecker):
+    _watch_eager_op(call_checker, "aten::_foreach_sqrt")
+    cpu_inputs = [tensor.abs() for tensor in _foreach_lists("cpu")[0]]
+    mojo_inputs = [tensor.abs() for tensor in _foreach_lists(mojo_gpu)[0]]
+    # The reference is the CORRECTLY ROUNDED float32 square root, computed in
+    # float64 and rounded once -- not `torch._foreach_sqrt` on the CPU tensors.
+    # torch's CPU float32 sqrt is itself not correctly rounded: contiguous runs
+    # go through `vml::vsqrt` (ATen/cpu/vml.h), i.e. MKL `vsSqrt` at VML_HA,
+    # which is documented at <=1 ulp. Measured on this box, it disagrees with
+    # the correctly rounded result on 207780 of 1048576 uniform draws, so it
+    # cannot serve as a bit-exact oracle. Rounding twice (f32 -> f64 -> f32) is
+    # safe here because 53 >= 2*24 + 2.
+    expected = [tensor.double().sqrt().to(tensor.dtype) for tensor in cpu_inputs]
+    actual = torch._foreach_sqrt(mojo_inputs)
+    for expected_out, actual_out in zip(expected, actual, strict=True):
+        # IEEE-754 square root is correctly rounded, so the device must hit the
+        # exact result bit for bit. Do not loosen this: a mismatch is a real
+        # codegen finding (a non-conforming sqrt), not tolerance noise. It
+        # caught one -- Mojo's `std.math.sqrt` lowered to `sqrt.approx.ftz.f32`
+        # on NVIDIA, ~2 ulp and flushing subnormals to zero, which is why the
+        # eager kernels call `ieee_sqrt` from op_utils instead.
+        torch.testing.assert_close(actual_out.cpu(), expected_out, rtol=0, atol=0)
+    for original, actual_out in zip(mojo_inputs, actual, strict=True):
+        if original.numel() > 0:
+            assert actual_out._ptr != original._ptr
+
+
+def test_batched_foreach_falls_back_for_non_f32(
+    mojo_gpu: str, call_checker: CallChecker
+):
+    """Unsupported regimes reach ATen's sequential semantics unchanged."""
+    _watch_eager_op(call_checker, "aten::_foreach_mul_.Scalar")
+    cpu_tensors = [torch.arange(5), torch.arange(3)]
+    mojo_tensors = [tensor.to(mojo_gpu) for tensor in cpu_tensors]
+    torch._foreach_mul_(cpu_tensors, 3)
+    torch._foreach_mul_(mojo_tensors, 3)
+    for expected, actual in zip(cpu_tensors, mojo_tensors, strict=True):
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
 def test_lerp_scalar_broadcast_uses_narrowed_fp32_branch(

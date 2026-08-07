@@ -19,8 +19,32 @@ from torch_mojo_backend import (
 )
 from torch_mojo_backend.testing import check_functions_are_equivalent
 
+from .conftest import require_cuda_autograd
+
+
+# MAX lowers an fp32 matmul to TF32 tensor cores on NVIDIA GPUs while torch
+# eager defaults to full fp32, so a graph containing a matmul cannot be
+# compared against eager at assert_close's fp32 defaults on GPU
+# (`test_compile_matmul` in test_compile_mojo_device.py makes the same
+# allowance). Verified exactly: for `x @ w + b` on cuda the backend's output
+# is bit-identical to torch's own `allow_tf32=True` result.
+#
+# The numbers below are the measured tf32-vs-fp32 envelope for these shapes
+# over 2000 random draws: max absolute gap 4.8e-3 for one matmul and 1.5e-2
+# for the chained pair in `test_get_attr_multiple_parameters`. The relative
+# gap is unbounded (outputs cancel to near zero), which is why atol carries
+# the tolerance. atol=2e-2 is ~1.3x the measured worst case and still ~50x
+# below the O(1) error an actually wrong matmul produces on N(0, 1) data.
+# CPU keeps assert_close's exact fp32 defaults.
+def matmul_tolerance(device: str) -> dict[str, float]:
+    if device == "cpu":
+        return {}
+    return {"rtol": 1e-2, "atol": 2e-2}
+
 
 def test_basic_training(device: str):
+    require_cuda_autograd(device)
+
     class MyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -89,6 +113,7 @@ def test_basic_training(device: str):
 
 def test_get_attr_parameter(device: str):
     """Test get_attr node with parameter access"""
+    require_cuda_autograd(device)
 
     class ParameterModule(torch.nn.Module):
         def __init__(self):
@@ -116,11 +141,12 @@ def test_get_attr_parameter(device: str):
     assert "weight" in targets
     assert "bias" in targets
 
-    check_functions_are_equivalent(module, device, [x])
+    check_functions_are_equivalent(module, device, [x], **matmul_tolerance(device))
 
 
 def test_get_attr_nested_parameter(device: str):
     """Test get_attr node with nested module parameter access"""
+    require_cuda_autograd(device)
 
     class NestedModule(torch.nn.Module):
         def __init__(self):
@@ -144,11 +170,12 @@ def test_get_attr_nested_parameter(device: str):
     targets = [node.target for node in get_attr_nodes]
     assert "scale" in targets
 
-    check_functions_are_equivalent(module, device, [x])
+    check_functions_are_equivalent(module, device, [x], **matmul_tolerance(device))
 
 
 def test_get_attr_buffer(device: str):
     """Test get_attr node with buffer access"""
+    require_cuda_autograd(device)
 
     class ModuleWithBuffer(torch.nn.Module):
         def __init__(self):
@@ -177,6 +204,7 @@ def test_get_attr_buffer(device: str):
 
 def test_get_attr_multiple_parameters(device: str):
     """Test get_attr nodes with multiple parameters"""
+    require_cuda_autograd(device)
 
     class MultiParamModule(torch.nn.Module):
         def __init__(self):
@@ -195,11 +223,12 @@ def test_get_attr_multiple_parameters(device: str):
 
     x = torch.randn(2, 3)
 
-    check_functions_are_equivalent(module, device, [x])
+    check_functions_are_equivalent(module, device, [x], **matmul_tolerance(device))
 
 
 def test_get_attr_with_arithmetic(device: str):
     """Test get_attr nodes combined with arithmetic operations"""
+    require_cuda_autograd(device)
 
     class ArithmeticModule(torch.nn.Module):
         def __init__(self):
@@ -243,6 +272,7 @@ def test_get_attr_constant_tensor(device: str):
 
 def test_get_attr_deeply_nested(device: str):
     """Test get_attr node with deeply nested module hierarchy"""
+    require_cuda_autograd(device)
 
     class InnerModule(torch.nn.Module):
         def __init__(self):
@@ -268,11 +298,12 @@ def test_get_attr_deeply_nested(device: str):
 
     x = torch.randn(2, 3)
 
-    check_functions_are_equivalent(module, device, [x])
+    check_functions_are_equivalent(module, device, [x], **matmul_tolerance(device))
 
 
 def test_get_attr_mixed_with_functions(device: str):
     """Test get_attr nodes mixed with function calls"""
+    require_cuda_autograd(device)
 
     class MixedModule(torch.nn.Module):
         def __init__(self):
@@ -288,11 +319,12 @@ def test_get_attr_mixed_with_functions(device: str):
 
     x = torch.randn(2, 3)
 
-    check_functions_are_equivalent(module, device, [x])
+    check_functions_are_equivalent(module, device, [x], **matmul_tolerance(device))
 
 
 def test_get_attr_simple_constant(device: str):
     """Test get_attr with a simple constant parameter"""
+    require_cuda_autograd(device)
 
     class SimpleConstantModule(torch.nn.Module):
         def __init__(self):

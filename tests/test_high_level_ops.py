@@ -12,6 +12,66 @@ from torch_mojo_backend.testing import (
     check_outputs,
 )
 
+# torch.testing.assert_close's defaults for float32.
+_FP32_RTOL = 1.3e-6
+_FP32_ATOL = 1e-5
+
+# TF32 keeps 10 explicit mantissa bits, so its unit roundoff is 2**-11.
+_TF32_UNIT_ROUNDOFF = 2.0**-11
+
+
+def tf32_gemm_atol(k: int, *, scale: float = 1.0) -> float:
+    """Absolute error budget for one float32 GEMM of inner size ``k`` executed
+    on TF32 tensor cores, for the unit-normal operands these tests use.
+
+    MAX lowers a float32 ``mm``/``bmm`` to ``rmo.matmul``, whose GPU kernel
+    rounds both operands to TF32 and accumulates in fp32. There is no opt-out
+    to reach for: ``max/kernels/src/linalg/matmul/gpu/__init__.mojo``
+    compile-asserts that ``use_tf32=False`` is wired up for the SM100 dispatch
+    only, and ``max.graph.ops.matmul`` takes no precision argument at all.
+    torch eager meanwhile keeps ``torch.get_float32_matmul_precision() ==
+    "highest"``, i.e. IEEE fp32, so the two are *expected* to disagree on an
+    NVIDIA GPU. The compiled result is in fact bit-identical (0 ulp, measured
+    on H100 for several shapes) to torch's own output once
+    ``torch.backends.cuda.matmul.allow_tf32`` is turned on, which is what says
+    the lowering is right and only the arithmetic is coarser.
+
+    Rounding both operands bounds one output element's error by
+    ``2 * u * sum_k |a_ik * b_kj|`` with ``u = 2**-11 = 4.9e-4``; the fp32
+    accumulation contributes a further ``~k * 6e-8``, which is negligible
+    beside it. ``|a*b|`` for unit normals has mean ``2/pi`` and standard
+    deviation ``sqrt(1 - (2/pi)**2)``, so that sum stays under its mean plus
+    five standard deviations for any draw of these (unseeded) inputs.
+    ``scale`` is whatever constant multiplies the product afterwards: addmm's
+    ``alpha``, attention's ``1/sqrt(head_dim)``.
+
+    Measured over 300 random draws per shape, the budget lands 2.6x-4.2x above
+    the worst error actually observed. It stays tight enough to fail on a bug:
+    replaying the same draws through a broken addmm exceeds it by 70x (dropped
+    ``beta``), 409x (dropped ``alpha``) or 634x (the two swapped), and even a
+    silent downgrade of the GEMM from TF32 to bfloat16 overshoots by 2.9x.
+    """
+    mean_abs = 2.0 / math.pi
+    sd_abs = math.sqrt(1.0 - mean_abs**2)
+    sum_abs_products = mean_abs * k + 5.0 * sd_abs * math.sqrt(k)
+    return 2.0 * _TF32_UNIT_ROUNDOFF * scale * sum_abs_products
+
+
+def gemm_tolerances(
+    device: str, k: int, *, scale: float = 1.0
+) -> tuple[float | None, float | None]:
+    """``(rtol, atol)`` for a comparison whose result goes through a float32 GEMM.
+
+    Only the NVIDIA path is loosened, and only through ``atol``: cancellation
+    leaves the *relative* error of a near-zero output element unbounded (a
+    64x64x64 product shows 54% on one element), so ``rtol`` keeps torch's fp32
+    default and the whole TF32 budget goes into ``atol``. On CPU nothing is
+    truncated, so ``None, None`` leaves the strict defaults in force.
+    """
+    if not device.startswith("cuda"):
+        return None, None
+    return _FP32_RTOL, max(_FP32_ATOL, tf32_gemm_atol(k, scale=scale))
+
 
 def test_basic_addition(conf: Conf):
     def fn(x, y):
@@ -4313,7 +4373,9 @@ def test_addmm_basic(device: str):
     bias = torch.randn(3, 4)
     mat1 = torch.randn(3, 5)
     mat2 = torch.randn(5, 4)
-    check_functions_are_equivalent(fn, device, [bias, mat1, mat2])
+    # `beta * bias` is exact; only `mat1 @ mat2` (inner size 5) is truncated.
+    rtol, atol = gemm_tolerances(device, 5)
+    check_functions_are_equivalent(fn, device, [bias, mat1, mat2], rtol=rtol, atol=atol)
 
 
 def test_addmm_with_alpha_beta(device: str):
@@ -4325,7 +4387,10 @@ def test_addmm_with_alpha_beta(device: str):
     bias = torch.randn(3, 4)
     mat1 = torch.randn(3, 5)
     mat2 = torch.randn(5, 4)
-    check_functions_are_equivalent(fn, device, [bias, mat1, mat2])
+    # `alpha` multiplies the truncated product, so it scales the budget too.
+    # `beta = 0.5` is a power of two, so `beta * bias` stays exact.
+    rtol, atol = gemm_tolerances(device, 5, scale=2.0)
+    check_functions_are_equivalent(fn, device, [bias, mat1, mat2], rtol=rtol, atol=atol)
 
 
 def test_addmm_different_shapes(device: str):
@@ -4337,7 +4402,8 @@ def test_addmm_different_shapes(device: str):
     bias = torch.randn(2, 8)
     mat1 = torch.randn(2, 6)
     mat2 = torch.randn(6, 8)
-    check_functions_are_equivalent(fn, device, [bias, mat1, mat2])
+    rtol, atol = gemm_tolerances(device, 6)
+    check_functions_are_equivalent(fn, device, [bias, mat1, mat2], rtol=rtol, atol=atol)
 
 
 def test_addmm_broadcast_bias(conf: Conf):
@@ -4828,7 +4894,19 @@ def test_scaled_dot_product_attention_small_dimensions(device: str):
     key = torch.randn(batch_size, seq_len, embed_dim)
     value = torch.randn(batch_size, seq_len, embed_dim)
 
-    check_functions_are_equivalent(fn, device, [query, key, value])
+    # A 3D sdpa decomposes to two `bmm`s. At batch size 1 MAX takes the TF32
+    # tensor-core GEMM for them (see `tf32_gemm_atol`); the batched shapes in
+    # the neighbouring tests land on a MAX kernel that stays in fp32, which is
+    # why only this one needs a budget. The budget is the `q @ k^T` error --
+    # inner size `embed_dim`, scaled by `1/sqrt(embed_dim)` -- doubled:
+    # perturbing the scores by `d` moves `softmax` by at most `2*d` in l1, and
+    # the value `bmm` then averages rows of `value` with weights summing to
+    # one rather than amplifying. Worst error over 300 draws: 1.5e-3 against
+    # the 1.25e-2 budget.
+    rtol, atol = gemm_tolerances(device, embed_dim, scale=2.0 / math.sqrt(embed_dim))
+    check_functions_are_equivalent(
+        fn, device, [query, key, value], rtol=rtol, atol=atol
+    )
 
 
 def test_scaled_dot_product_attention_single_token(device: str):

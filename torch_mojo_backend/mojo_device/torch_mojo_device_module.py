@@ -132,27 +132,80 @@ def set_device(device_idx: int):
     _current_device.index = device_idx
 
 
-def synchronize(device=None):
-    """Wait for work and release completed asynchronous transfer owners."""
+class device:
+    """Context manager that swaps the current mojo device, mirroring
+    ``torch.cuda.device``. ``torch.serialization`` requires it on the backend
+    module when loading a checkpoint with ``map_location="mojo"``
+    (``torch._utils._to`` enters ``device_module.device(...)``)."""
+
+    def __init__(self, device: "int | str | torch.device | None") -> None:
+        if device is None:
+            self.idx = -1
+            return
+        if isinstance(device, int):
+            self.idx = device
+            return
+        torch_device = torch.device(device)
+        self.idx = -1 if torch_device.index is None else torch_device.index
+
+    def __enter__(self) -> None:
+        self.prev_idx = _current_device.index
+        if self.idx >= 0 and self.idx != _current_device.index:
+            set_device(self.idx)
+
+    def __exit__(self, *exc_info: object) -> bool:
+        if self.idx >= 0 and self.prev_idx != _current_device.index:
+            set_device(self.prev_idx)
+        return False
+
+
+def _resolve_sync_device(device: "int | str | torch.device | None") -> torch.device:
+    if device is None:
+        return torch.device(f"mojo:{_current_device.index}")
+    if isinstance(device, int):
+        return torch.device(f"mojo:{device}")
+    torch_device = torch.device(device)
+    if torch_device.type == "mojo" and torch_device.index is None:
+        return torch.device(f"mojo:{_current_device.index}")
+    return torch_device
+
+
+def _device_synchronize(device: "int | str | torch.device | None" = None) -> None:
+    """Device-only barrier: wait for already-launched work and release the
+    completed asynchronous transfer owners.
+
+    Deliberately does NOT drain the kernel-call queue. This is the ordering
+    primitive the queue itself uses when a launch must be barriered against
+    another thread's device work (``call_queue._device_only_synchronize``,
+    reached from ``order_direct_launch`` / ``_order_queue_launch_locked``),
+    where a drain would re-enter the queue in the middle of a launch —
+    running items 2..N before the item already popped, and freeing its
+    keep-alive. It is also what that path
+    actually needs: the queued items have not been launched at all, so there
+    is nothing of theirs to wait for; only the *other* thread's issued work
+    must land first, which is exactly a stream synchronize.
+    """
     from .torch_mojo_tensor import (
         _release_synchronized_d2h_owners,
         _release_synchronized_h2d_sources,
         find_equivalent_max_device,
     )
 
-    if device is None:
-        torch_device = torch.device(f"mojo:{_current_device.index}")
-    elif isinstance(device, int):
-        torch_device = torch.device(f"mojo:{device}")
-    else:
-        torch_device = torch.device(device)
-        if torch_device.type == "mojo" and torch_device.index is None:
-            torch_device = torch.device(f"mojo:{_current_device.index}")
-
-    max_device = find_equivalent_max_device(torch_device)
+    max_device = find_equivalent_max_device(_resolve_sync_device(device))
     max_device.default_stream.synchronize()
     _release_synchronized_h2d_sources(max_device)
     _release_synchronized_d2h_owners(max_device)
+
+
+def synchronize(device: "int | str | torch.device | None" = None) -> None:
+    """Public: wait for work and release completed asynchronous transfer
+    owners. Pending kernel launches count as work, so the queue drains
+    first — a caller of ``torch.mojo.synchronize()`` is entitled to assume
+    every op it issued has actually run on the device."""
+    from . import deferred_compile
+
+    deferred_compile.drain()
+    _device_synchronize(device)
 
 
 def get_amp_supported_dtype():

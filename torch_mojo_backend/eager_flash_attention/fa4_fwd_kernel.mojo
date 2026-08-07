@@ -159,7 +159,7 @@ def fwd_fa4_kernel[
         MutAnyOrigin,
         address_space=AddressSpace.SHARED,
         alignment=128,
-    ](smem_base)
+    ]((smem_base).as_unsafe_any_origin())
     var kv_smem_base = smem_base + q_smem_size
 
     var mbar_q = stack_allocation[
@@ -383,7 +383,7 @@ def fwd_fa4_kernel[
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ](kv_smem_base + slot * kv_slot_size)
+                ]((kv_smem_base + slot * kv_slot_size).as_unsafe_any_origin())
                 full[slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
                 k_tma.async_copy_3d(
                     k_st, full[slot], (0, h_idx // gqa_ratio, row)
@@ -396,7 +396,7 @@ def fwd_fa4_kernel[
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ](kv_smem_base + (slot + 1) * kv_slot_size)
+                ]((kv_smem_base + (slot + 1) * kv_slot_size).as_unsafe_any_origin())
                 full[slot + 1].expect_bytes(Int32(BN * D * size_of[dtype]()))
                 v_tma.async_copy_3d(
                     v_st, full[slot + 1], (0, h_idx // gqa_ratio, row)
@@ -517,7 +517,7 @@ def fwd_fa4_kernel[
         address_space=AddressSpace.SHARED,
         alignment=128,
     ]:
-        return {kv_smem_base + slot * kv_slot_size}
+        return {(kv_smem_base + slot * kv_slot_size).as_unsafe_any_origin()}
 
     @parameter
     @always_inline
@@ -528,7 +528,7 @@ def fwd_fa4_kernel[
         address_space=AddressSpace.SHARED,
         alignment=128,
     ]:
-        return {kv_smem_base + slot * kv_slot_size}
+        return {(kv_smem_base + slot * kv_slot_size).as_unsafe_any_origin()}
 
     # fp16 RS fork: the stdlib's register-A wgmma overload is
     # bf16-only (hardcoded .bf16.bf16 asm); the vendored
@@ -990,7 +990,7 @@ def fwd_fa4_kernel[
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ](smem_base)
+        ]((smem_base).as_unsafe_any_origin())
         comptime if qo_rank == 4:
             # S its own dim: the partial tail tile clamps in hardware.
             o_tma.async_store_4d(
