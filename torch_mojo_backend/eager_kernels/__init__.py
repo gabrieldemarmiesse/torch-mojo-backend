@@ -684,6 +684,29 @@ def _ensure_tensor_holder() -> ModuleType:
         return module
 
 
+def preload_tensor_holder_if_cached() -> None:
+    """Load ``tensor_holder`` now if (and only if) its .so is already cached
+    — a ~50ms dlopen, never a compile.
+
+    Workaround for the pinned MAX nightly: importing ``max.nn`` before any
+    mojo-built CPython extension has been dlopened leaves the process in a
+    state where every later extension load segfaults inside its ``PyInit``
+    (``PyModule_Create`` fails and the bindings hand the NULL module to
+    ``PyModule_AddFunctions``). Loading one extension first pins the
+    runtime and every later load works, so ``torch_mojo_backend.__init__``
+    calls this before anything can import ``max.nn``. A cold cache skips
+    the preload rather than block the import on a ~15s build — the SDPA
+    accessor that performs the only ``max.nn`` import in this package
+    forces ``_ensure_tensor_holder()`` first instead. See
+    upstream_issues/modular-5-max-nn-import-breaks-mojo-extension-load.md.
+    """
+    if _TENSOR_HOLDER:
+        return
+    source = _PACKAGE_DIR / "tensor_holder.mojo"
+    if _extension_path(source, None).is_file():
+        _ensure_tensor_holder()
+
+
 _COMM_OPS_LOCK = threading.Lock()
 _COMM_OPS: list[ModuleType | BaseException] = []
 

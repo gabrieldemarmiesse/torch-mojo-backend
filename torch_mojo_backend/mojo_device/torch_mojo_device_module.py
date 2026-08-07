@@ -118,6 +118,17 @@ def is_available():
     return True
 
 
+# Data attribute mirroring torch.cuda._initialized, which torch reads as
+# `getattr(device_module, "_initialized", False)` — NOT via is_initialized().
+# torch.utils.checkpoint (both reentrant and non-reentrant paths) only saves
+# and restores device RNG state around recomputation when this is truthy;
+# without it, a checkpointed model with dropout silently recomputes with a
+# fresh mask and trains on wrong gradients. This backend has no lazy init
+# (RNG state is host-side and devices need no setup), so True from import
+# time is exact.
+_initialized = True
+
+
 def is_initialized():
     return True
 

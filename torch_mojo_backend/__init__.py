@@ -8,6 +8,13 @@ if os.environ.get("TORCH_MOJO_BACKEND_BEARTYPE", "0") == "1":
     beartype_this_package()
 
 
+# Before anything that can import max.nn: pin the mojo runtime by loading a
+# mojo extension first when one is cached (see preload_tensor_holder_if_cached
+# and upstream_issues/modular-5-max-nn-import-breaks-mojo-extension-load.md).
+from torch_mojo_backend.eager_kernels import preload_tensor_holder_if_cached
+
+preload_tensor_holder_if_cached()
+
 from torch_mojo_backend.custom_torch_ops_in_mojo.torch_custom_ops import (
     make_torch_op_from_mojo,
 )
