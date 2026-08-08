@@ -281,16 +281,23 @@ needs to know which numbers are portable and which were fitted to one card.
 ## Optimizing a kernel
 
 When optimizing a kernel, you should make a harness for a subagent A to work on. The harness should include:
-- Unit tests for the kernels (outside the main test suite)
-- A benchmark script in pure mojo, that measures the performance of the kernel on different input shapes (no more than 6). The benchmark should lock the GPU frequency if possible.
+- Unit tests for the kernels (outside the main test suite), the unit tests should acquire the flock `/tmp/gpu_lock_{gpu_id}.lock`.
+- A benchmark script in pure mojo, that measures the performance of the kernel on different input shapes (no more than 6), requiring at least one non-round/awkward shape (e.g. 357×789). The benchmark should lock the GPU frequency if possible. The benchmark should use a flock in /tmp/gpu_lock_{gpu_id}.lock to avoid using the gpu at the same time as other benchmarks. `ncu` or rocprof or equivalent should be given to the agent.
 - The harness should only measure the total gpu time, not the wall time as the wall time can be worked on later on.
 - The harness should also include reference numbers, so roofline estimate, and the performance of stock pytorch on the same input shapes (device time too, not wall time).
-- The scope of the agent should be as limited as possible, for example, if writing a gemm, the agent should only take care of the TN variant, or NT but not all variants. 
+- The scope of the agent should be as limited as possible, for example, if writing a gemm, the agent should only take care of the TN variant, or NT but not all variants. It should only focus on one dtype. (if multiple dtypes are needed, we'll do the dance Agent A, Agent B for dtype1 and then Agent A Agent B for dtype2, etc..., with a bit of luck for dtype2, agent A can reuse the code of dtype1 and just change the dtype, which will be easy to integrate later by agent B by parametrizing the code).
 - The agent should write the kernel outside the codebase, but the agent can import code from it, or import code from the modular repo. This is to avoid having the agent work on integrating the kernel into the codebase, the agent should only focus on the kernel itself. 
-- The performance work is done when 1) The kernel is within 2% of the stock pytorch performance on the same input shapes, 2) The kernel is within 20% of the roofline estimate.
+- The performance work is done when 1) The kernel is within 2% of the stock pytorch performance on the same input shapes AND 2) The kernel is within 20% of the roofline estimate.
+
+A small agent A2 should be used for a quick code review, notably just check that the kernel respects the rules of the eager mode and the tests are passing. No need for a very smart model here.
 
 When subagent A is done, a subagent B should start to integrate the kernel into the codebase. The subagent B should first:
-- Add those harness tests in the `tests/test_aten_functions.py` file.
-- Add benchmarks for the `benchmarks/` directory.
+- Add those harness tests in the ` tests/test_eager_kernels.py` file.
+- Add benchmarks for the `benchmarks/` directory.  `ncu` or rocprof or equivalent should be given to the agent.
 - Export the ptx/asm of the kernel into a temporary directory.
-- Then integrate the kernel into the codebase, make sure the tests are passing and the benchmarks are as good as before. The subagent B can also generate the ptx/asm of its implementation to make sure it matches the ptx/asm of the agent A kernel. The subagent B should take the decision to either use metaprogramming to adapt a kernel already in the codebase to perform the work of the new kernel given some specific parameter, or to write new code. Duplication should be avoided if possible so if the agent find out that some function/piece of code is already used in the codebase, the agent should perform a refactoring to reuse this code. 
+- Then integrate the kernel into the codebase, make sure the tests are passing and the benchmarks are as good as before. The subagent B can also generate the ptx/asm of its implementation to help, even if it doesn't need to match exactly the ptx/asm of the agent A kernel. The subagent B should take the decision to either use metaprogramming to adapt a kernel already in the codebase to perform the work of the new kernel given some specific parameter, or to write new code. Duplication should be avoided if possible so if the agent find out that some function/piece of code is already used in the codebase, the agent should perform a refactoring to reuse this code.
+- The agent B should not degrade the performance of existing kernels, dtypes, shapes, other gpus, etc...
+
+When subagent B is done, a subagent C should do a code review of B and run benchmarks to make sure that the performance has not regressed for other dtypes, shapes, similar kernels, other gpus etc... Cross-compilation can be used to check that the assembly/ptx didn't change much. But worst case scenario, other gpus are available to run benchmarks through ssh.
+
+When agents A, B and C are all done, all the temporary files of agent A should be removed and a commit should be made.
