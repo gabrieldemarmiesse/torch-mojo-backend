@@ -1933,10 +1933,11 @@ def _spec_matmul_out_shape(
     Operand layout is deliberately not checked here.  ``TensorSpec`` carries
     shape and strides, and `_matmul_spec_operands_launch` covers all four
     layout combinations: it routes a strided operand to a copy-free kernel
-    where one exists for the target (the gfx942 TN MFMA route reads a
-    transposed weight-gradient A in place, and Apple has the TA route) and
-    materializes a scratch copy otherwise.  Declining strided operands here
-    would strand those routes and force a transpose the kernel does not need.
+    where one exists for the target (the gfx942 TN MFMA route and the NVIDIA
+    sm_90 strict-fp32 TN route both read a transposed weight-gradient A in
+    place, and Apple has the TA route) and materializes a scratch copy
+    otherwise.  Declining strided operands here would strand those routes and
+    force a transpose the kernel does not need.
     """
     a = ts[0]
     b = ts[1]

@@ -5844,6 +5844,174 @@ def test_bf16_real_linear_forward_backward_uses_three_gemm_routes(
         _assert_bf16_fp32_accumulation_close(actual.cpu(), expected)
 
 
+# ---------------------------------------------------------------------------
+# Strict-fp32 TN GEMM (NVIDIA sm_90): a transposed-dense A — strides (1, m),
+# linear-backward's dW = dY^T @ X — is read in place by the dedicated FFMA
+# kernels (matmul_ops/tn_f32_gemm_kernels.mojo) instead of being materialized
+# into a contiguous scratch first.  Python routing is unchanged: fp32 mm at
+# "highest" precision reaches MatmulSpec and the Mojo side decides, so these
+# tests only pin correctness per dispatch regime plus the regimes the route
+# declines back to the copy path.
+# ---------------------------------------------------------------------------
+
+
+def _f32_transposed_dense_pair(
+    generator: torch.Generator, m: int, k: int, offset: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Matching CPU/Mojo (m, k) views stored transposed-dense — strides
+    (1, m) over a row-major (k, m) buffer — with a storage offset (offset 1
+    makes the base pointer 16B-misaligned, forcing the 4-byte staging
+    variants)."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    storage = torch.randn(offset + m * k + 4, generator=generator)
+    host = torch.as_strided(storage, (m, k), (1, m), offset)
+    dev = aten_fast._view_of(storage.to(device), (m, k), (1, m), offset)
+    return host, dev
+
+
+def _assert_f32_seq_k_close(
+    actual: torch.Tensor, expected: torch.Tensor, k: int
+) -> None:
+    """Compare an fp32 GEMM against an fp64 oracle with the sequential-over-k
+    fp32 accumulation tolerance (random-walk rounding grows ~sqrt(k))."""
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(
+        actual.double(), expected, atol=5e-5 * math.sqrt(k), rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k", "offset"),
+    [
+        (768, 768, 2048, 0),
+        (768, 767, 1024, 0),
+        (357, 789, 1571, 0),
+        (256, 256, 512, 1),
+        (128, 128, 40000, 0),
+        (64, 48, 129, 0),
+        (65, 63, 640, 0),
+        (2, 4096, 64, 0),
+        (127, 255, 63, 2),
+    ],
+    ids=[
+        "aligned_fat_tile_split_core",
+        "n_misaligned_quadrant_core",
+        "awkward_vec1_quadrant_core",
+        "misaligned_base_offset_view",
+        "deepk_splitk_wide_reduce",
+        "small_t64_k_tail",
+        "small_t64_ragged_splitk",
+        "tiny_m_t64",
+        "ragged_offset_t64",
+    ],
+)
+def test_f32_tn_transposed_a_route_matches_fp64_oracle(
+    mojo_h100: str, monkeypatch: pytest.MonkeyPatch, m: int, n: int, k: int, offset: int
+) -> None:
+    """Every dispatch regime of the sm_90 fp32 TN route against fp64."""
+    generator = torch.Generator().manual_seed(20260808)
+    host_a, mojo_a = _f32_transposed_dense_pair(generator, m, k, offset, mojo_h100)
+    host_b = torch.randn(k, n, generator=generator)
+    mojo_b = host_b.to(mojo_h100)
+    expected = torch.mm(host_a.double(), host_b.double())
+
+    target = ("matmul_ops.mojo", "MatmulSpec")
+    calls = _spy_defined_native_calls(monkeypatch, {target})
+    old_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        actual = torch.mm(mojo_a, mojo_b)
+    finally:
+        torch.set_float32_matmul_precision(old_precision)
+
+    # fp32 mm reached MatmulSpec with no Python-side routing change; the
+    # Mojo dispatch decides between the in-place TN kernels and the copy.
+    assert len(calls[target]) == 1
+    _assert_f32_seq_k_close(actual.cpu(), expected, k)
+
+
+def test_f32_tn_route_declined_regimes_stay_correct(mojo_h100: str) -> None:
+    """Regimes the TN route declines (m == 1, bias, TT, bmm) keep the
+    scratch-copy path and stay correct."""
+    generator = torch.Generator().manual_seed(20260808)
+    old_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        # m == 1 stays on the GEMV-after-copy path.
+        host_a, mojo_a = _f32_transposed_dense_pair(generator, 1, 512, 0, mojo_h100)
+        host_b = torch.randn(512, 384, generator=generator)
+        _assert_f32_seq_k_close(
+            torch.mm(mojo_a, host_b.to(mojo_h100)).cpu(),
+            torch.mm(host_a.double(), host_b.double()),
+            512,
+        )
+
+        # A bias (addmm -> MatmulBiasSpec) falls back to the copy path.
+        host_a, mojo_a = _f32_transposed_dense_pair(generator, 96, 512, 0, mojo_h100)
+        host_b = torch.randn(512, 128, generator=generator)
+        bias = torch.randn(128, generator=generator)
+        _assert_f32_seq_k_close(
+            torch.addmm(bias.to(mojo_h100), mojo_a, host_b.to(mojo_h100)).cpu(),
+            torch.addmm(bias.double(), host_a.double(), host_b.double()),
+            512,
+        )
+
+        # TT (B strided too) falls back to the both-scratch path.
+        host_bt = torch.randn(128, 384, generator=generator)
+        host_a, mojo_a = _f32_transposed_dense_pair(generator, 96, 384, 0, mojo_h100)
+        _assert_f32_seq_k_close(
+            torch.mm(mojo_a, host_bt.to(mojo_h100).t()).cpu(),
+            torch.mm(host_a.double(), host_bt.double().t()),
+            384,
+        )
+
+        # Batched (bmm) falls back: the route only claims batch == 1.
+        host_ab = torch.randn(3, 128, 64, generator=generator)
+        host_bb = torch.randn(3, 128, 96, generator=generator)
+        _assert_f32_seq_k_close(
+            torch.bmm(
+                host_ab.to(mojo_h100).transpose(1, 2), host_bb.to(mojo_h100)
+            ).cpu(),
+            torch.bmm(host_ab.double().transpose(1, 2), host_bb.double()),
+            128,
+        )
+    finally:
+        torch.set_float32_matmul_precision(old_precision)
+
+
+def test_f32_tn_route_linear_weight_gradient(mojo_h100: str) -> None:
+    """nn.Linear backward produces the dW = dY^T @ X layout the route claims;
+    the full autograd round trip must stay correct."""
+    generator = torch.Generator().manual_seed(20260808)
+    host_input = torch.randn(512, 384, generator=generator)
+    host_weight = torch.randn(768, 384, generator=generator)
+    host_grad = torch.randn(512, 768, generator=generator)
+
+    reference = host_input.clone().requires_grad_()
+    ref_weight = host_weight.clone().requires_grad_()
+    torch.nn.functional.linear(reference, ref_weight).backward(host_grad)
+
+    mojo_input = host_input.to(mojo_h100).requires_grad_()
+    mojo_weight = host_weight.to(mojo_h100).requires_grad_()
+    old_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        output = torch.nn.functional.linear(mojo_input, mojo_weight)
+        output.backward(host_grad.to(mojo_h100))
+    finally:
+        torch.set_float32_matmul_precision(old_precision)
+
+    assert mojo_weight.grad is not None and mojo_input.grad is not None
+    assert ref_weight.grad is not None and reference.grad is not None
+    torch.testing.assert_close(
+        mojo_weight.grad.cpu(), ref_weight.grad, atol=5e-3, rtol=5e-4
+    )
+    torch.testing.assert_close(
+        mojo_input.grad.cpu(), reference.grad, atol=5e-3, rtol=5e-4
+    )
+
+
 def _tf32_dense_matrix_pair(generator, shape, transposed, offset, mojo_h100):
     """Create matching CPU/Mojo dense views with a nonzero storage offset."""
     from torch_mojo_backend.eager_kernels import aten_fast

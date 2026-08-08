@@ -41,6 +41,7 @@ from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.sys.info import (
     _accelerator_arch,
+    _has_sm_9x,
     has_accelerator,
     has_apple_gpu_accelerator,
     is_amd_gpu,
@@ -106,6 +107,8 @@ from apple_gemm_nt_kernels import (
     apple_nt_smem_enqueue,
 )
 from apple_gemm_tn_kernels import apple_tn_gemm_enqueue
+from gemm_splitk_common import TARGET_BLOCKS, _ksplit_reduce_kernel
+from tn_f32_gemm_kernels import try_enqueue_tn_f32_gemm
 from op_utils import (
     FLOAT_DTYPES,
     MAX_RANK,
@@ -151,47 +154,9 @@ from variant_gates import (
 # MN-poor shapes convolution lowers to (e.g. 512x49 @ k=4608).
 # ---------------------------------------------------------------------------
 
-# Aim for a few blocks per SM when choosing split-K factors (H100: 114 SMs).
-# Blocks-in-flight target for the split-K heuristic. NVIDIA/AMD parts want
-# a few hundred blocks to hide latency; Apple's 8-40 core GPUs saturate far
-# earlier, and every extra split-K shard costs an m*n float32 workspace
-# write plus a read-back in the reduce pass, so oversplitting turns small-M
-# GEMMs bandwidth-bound on partials.
-comptime TARGET_BLOCKS = 80 if has_apple_gpu_accelerator() else 342
-
-
-@__name("pure_ksplit_reduce")
-def _ksplit_reduce_kernel(
-    out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    mn: Int,
-    ksplits: Int,
-    total: Int,
-):
-    # 4 outputs per thread: one div/mod chain + vector loads per chunk.
-    var i = (block_idx.x * 256 + thread_idx.x) * 4
-    if i >= total:
-        return
-    var bz = i // mn
-    var off = i % mn
-    if off + 4 <= mn and i + 4 <= total:
-        var base = bz * ksplits * mn + off
-        var acc = SIMD[DType.float32, 4](0)
-        for st in range(ksplits):
-            acc += ws_ptr.load[width=4](base + st * mn)
-        out_ptr.store(i, acc)
-    else:
-        for u in range(4):
-            var iu = i + u
-            if iu >= total:
-                return
-            var bzu = iu // mn
-            var offu = iu % mn
-            var baseu = bzu * ksplits * mn + offu
-            var accu = Scalar[DType.float32](0)
-            for st in range(ksplits):
-                accu += ws_ptr[baseu + st * mn]
-            out_ptr[iu] = accu
+# `TARGET_BLOCKS` (the blocks-in-flight target for the split-K heuristics
+# below) and the split-K reduce kernel live in `gemm_splitk_common.mojo`,
+# shared with the NVIDIA fp32 TN dispatch (`tn_f32_gemm_kernels.mojo`).
 
 
 @__llvm_metadata(
@@ -6862,6 +6827,32 @@ def _matmul_spec_operands_launch(
                     c_addr, a.ptr, b.ptr, m, n, k, ctx
                 ):
                     return
+        # NVIDIA sm_90, strict fp32: the same transposed-dense-A trigger as
+        # the two routes above (linear-backward's dW = dY^T @ X).  The
+        # dedicated CUDA-core FFMA kernels (tn_f32_gemm_kernels.mojo) read
+        # the stored (k, m) layout in place, skipping the `_scratch_contig`
+        # materialization (a full extra pass over A plus a launch).  Gated
+        # at runtime to compute capability 9.0 exactly inside
+        # `try_enqueue_tn_f32_gemm` — its tile/wave constants are fitted to
+        # H100's 114 SMs — so every other NVIDIA part keeps the copy path
+        # below, and it declines regimes where the copy path is better
+        # (m == 1 stays on the GEMV-after-copy route).
+        comptime if _has_sm_9x():
+            comptime if _dtype_arg_on[0, DType.float32]():
+                if (
+                    ctx.api() == "cuda"
+                    and not has_bias
+                    and batch == 1
+                    and transpose_b == 0
+                    and a.dtype == DType.float32
+                    and a.strides[MAX_RANK - 2] == 1
+                    and a.strides[MAX_RANK - 1] == m
+                    and _leading_trivial(a)
+                ):
+                    if try_enqueue_tn_f32_gemm(
+                        c_addr, a.ptr, b.ptr, m, n, k, ctx
+                    ):
+                        return
         var tmp_a = _scratch_contig(a, ctx)
         _matmul_spec_launch(
             a.dtype,
