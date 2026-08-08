@@ -126,7 +126,7 @@ When there is no MAX alternative, the best alternative would be to migrate to Mo
 
 Write the ATen operation implementation in `torch_mojo_backend/aten_functions.py` using MAX functions.
 
-**Important**: Implementation must support **both** graph mode (`TensorValue`) and eager mode (`MaxEagerTensor`). Use `MaxTensor` type hint for dual-mode support.
+**Important**: `aten_functions.py` serves the torch.compile backend only (the mojo-device eager mode is Step 7). The implementation must still accept both `TensorValue` (graph building) and `MaxEagerTensor` (MAX's eager interpreter, enabled in tests via `MAX_USE_EAGER_INTERPRETER=1`). Use the `MaxTensor` type hint.
 
 Example:
 ```python
@@ -137,15 +137,15 @@ def aten_cat(tensors: list[MaxTensor], dim: int = 0) -> MaxTensor:
 
 ### Step 7: Register for Eager Mode
 
-Add registration in `torch_mojo_backend/mojo_device/mojo_device_aten_ops.py`:
+Eager mode has no graph fallback (the old `wrap_for_mojo_device` wrapper no longer exists): every op is either bound to a fast implementation or raises `NotImplementedError`.
+
+Write a fast implementation `fast_aten_cat` in `torch_mojo_backend/eager_kernels/aten_fast.py` — it operates on `TorchMojoTensor`s (raw pointer + shape/strides/offset/dtype/device) and calls Mojo kernels from an `eager_kernels/<family>/` extension; return the `NOT_HANDLED` sentinel to decline unsupported inputs. Then bind it in `torch_mojo_backend/mojo_device/mojo_device_aten_ops.py`:
 
 ```python
-register_aten_op("aten::cat")(
-    wrap_for_mojo_device(aten_functions.aten_cat)
-)
+_register_fast("aten::cat", "fast_aten_cat")
 ```
 
-Place in alphabetical order. The wrapper handles tensor conversion automatically.
+Place in alphabetical order. Ops needing custom device handling use `@register_aten_op("aten::<op>")` on a hand-written function directly; `_out_variant(...)` wraps a functional fast impl as an `out=` variant.
 
 ### Step 8: Verify Implementation
 

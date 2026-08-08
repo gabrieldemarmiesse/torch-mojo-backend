@@ -114,9 +114,13 @@ Ask a subagent to explore the directory `../modular/max` to find:
 ### Step 6: Implement the Operation
 Write the ATen operation implementation in `aten_functions.py` just below the signature comment:
 
-**Important**: The implementation must support **both execution modes**:
-- **Graph Mode**: Works with `TensorValue` (symbolic tensors)
-- **Eager Mode**: Works with `MaxEagerTensor` (actual tensors)
+**Important**: `aten_functions.py` serves the **torch.compile backend only**
+(the mojo-device eager mode has its own fast implementations — see Step 7).
+The implementation must still accept both value types the compile backend can
+feed it:
+- `TensorValue` (symbolic tensors, real graph building)
+- `MaxEagerTensor` (MAX's eager interpreter — the test suite runs with
+  `MAX_USE_EAGER_INTERPRETER=1`)
 
 Use the type hint `MaxTensor = TensorValue | MaxEagerTensor` for tensor parameters.
 
@@ -131,17 +135,40 @@ def aten__log_softmax(
 ```
 
 ### Step 7: Register for Eager Mode Execution
-Add the operation to `torch_mojo_backend/mojo_device/mojo_device_aten_ops.py`:
+Eager mode has **no graph fallback**: every op is either bound to a fast
+implementation (Mojo kernels over raw pointers) or raises
+`NotImplementedError`. (The old `wrap_for_mojo_device` wrapper no longer
+exists.) Two places are involved:
 
-You'll likely need to write mojo code, even if it's only to import `from nn import ...`. If a fully dynamic function to handle the aten op is not available in the modular repo, write it yourself.
+1. Write the fast implementation `fast_aten_<op>` in
+   `torch_mojo_backend/eager_kernels/aten_fast.py`. It receives
+   `TorchMojoTensor`s (a Mojo `TensorHolder` ownership token plus `_ptr` /
+   `_shape` / `_strides` / `_offset` / `_dtype` / `_device`) and runs one or
+   a few kernel calls from an `eager_kernels/<family>/` extension. View ops
+   are zero-copy wrapper math (no kernel at all). Return the `NOT_HANDLED`
+   sentinel to decline inputs you don't handle — the registration turns it
+   into an actionable `NotImplementedError`.
+2. Bind it in `torch_mojo_backend/mojo_device/mojo_device_aten_ops.py`, in
+   alphabetical order within the file:
+
+   ```python
+   _register_fast("aten::<op>", "fast_aten_<op>")
+   ```
+
+   Related helpers: `_out_variant(...)` wraps a functional fast impl as an
+   `out=` variant; `_register_foreach_inplace(...)` covers `_foreach_*_`
+   ops; operations requiring custom device handling (like
+   `aten::_copy_from`) use `@register_aten_op("aten::<op>")` on a
+   hand-written function directly.
+
+If the op needs a new Mojo kernel, add it to the matching
+`eager_kernels/<family>/<family>.mojo` (variant-gated: the loader compiles
+one specialization per (OP, DTYPE) on first use and caches it in
+`__mojocache__`). You may import kernels from the modular repo inside the
+`.mojo` file (`from nn import ...`) only if they don't call
+CuBLAS/CuDNN/rocBLAS underneath. If a fully dynamic-shape function is not
+available in the modular repo, write the kernel yourself.
 If you have access to multiple gpus, the aten function should work on all those gpus.
-
-Place the registration in alphabetical order within the file. The `wrap_for_mojo_device` wrapper automatically:
-- Converts `TorchMojoTensor` inputs to `MaxEagerTensor`
-- Executes the operation
-- Converts results back to `TorchMojoTensor`
-
-**Note**: For operations requiring custom device handling (like `aten::_copy_from`), you can implement a custom function directly instead of using `wrap_for_mojo_device`.
 
 ### Step 8: Re-run Tests
 Run the unit tests again and verify they pass:
@@ -161,10 +188,12 @@ uvx pre-commit run --all-files
 
 **Do not run the whole test suite** as it takes too long. Only run tests for the specific operation you added.
 
-### Summary: Two-Part Implementation
-When adding an operation, you need to update **two files**:
-1. **`aten_functions.py`**: Core implementation (works for both modes)
-2. **`mojo_device_aten_ops.py`**: Registration for eager mode execution
+### Summary: Implementation Checklist
+When adding an operation, you typically update **three places**:
+1. **`aten_functions.py`**: torch.compile backend implementation (MAX ops composition)
+2. **`eager_kernels/aten_fast.py`**: fast eager implementation over
+   `TorchMojoTensor` (plus a Mojo kernel in `eager_kernels/<family>/` when needed)
+3. **`mojo_device_aten_ops.py`**: the `_register_fast(...)` binding for eager mode
 
 This ensures the operation works in both `torch.compile()` and on the `mojo` device.
 
