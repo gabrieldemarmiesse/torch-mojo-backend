@@ -276,3 +276,21 @@ bill of health.
 When a tuning constant was measured on one architecture, say so where it is
 defined, the way `LSM_BLOCKS_PER_CU` and `LSM_L2_BUDGET` do. The next agent
 needs to know which numbers are portable and which were fitted to one card.
+
+
+## Optimizing a kernel
+
+When optimizing a kernel, you should make a harness for a subagent A to work on. The harness should include:
+- Unit tests for the kernels (outside the main test suite)
+- A benchmark script in pure mojo, that measures the performance of the kernel on different input shapes (no more than 6). The benchmark should lock the GPU frequency if possible.
+- The harness should only measure the total gpu time, not the wall time as the wall time can be worked on later on.
+- The harness should also include reference numbers, so roofline estimate, and the performance of stock pytorch on the same input shapes (device time too, not wall time).
+- The scope of the agent should be as limited as possible, for example, if writing a gemm, the agent should only take care of the TN variant, or NT but not all variants. 
+- The agent should write the kernel outside the codebase, but the agent can import code from it, or import code from the modular repo. This is to avoid having the agent work on integrating the kernel into the codebase, the agent should only focus on the kernel itself. 
+- The performance work is done when 1) The kernel is within 2% of the stock pytorch performance on the same input shapes, 2) The kernel is within 20% of the roofline estimate.
+
+When subagent A is done, a subagent B should start to integrate the kernel into the codebase. The subagent B should first:
+- Add those harness tests in the `tests/test_aten_functions.py` file.
+- Add benchmarks for the `benchmarks/` directory.
+- Export the ptx/asm of the kernel into a temporary directory.
+- Then integrate the kernel into the codebase, make sure the tests are passing and the benchmarks are as good as before. The subagent B can also generate the ptx/asm of its implementation to make sure it matches the ptx/asm of the agent A kernel. The subagent B should take the decision to either use metaprogramming to adapt a kernel already in the codebase to perform the work of the new kernel given some specific parameter, or to write new code. Duplication should be avoided if possible so if the agent find out that some function/piece of code is already used in the codebase, the agent should perform a refactoring to reuse this code. 
