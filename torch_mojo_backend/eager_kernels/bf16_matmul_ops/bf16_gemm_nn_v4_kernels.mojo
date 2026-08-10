@@ -237,7 +237,8 @@ def _v4_nn_persistent_ws[
     # ceil-div, the B TMA reads clamp past the n edge (zero-fill, zero
     # contributions) and the C TMA store's partial last column box clips
     # against the (m, n) descriptor -- the same machinery the ragged-m path
-    # uses, on the other axis.  Only the TT route instantiates it.
+    # uses, on the other axis.  The TT and TN routes both instantiate it;
+    # NN does not yet, which is why NN still declines a ragged n.
     ragged_n: Bool = False,
     a_tile_shape: IndexList[2] = Index(_V4_BK, bm) if col_a else Index(
         bm, _V4_BK
@@ -825,7 +826,11 @@ def maybe_enqueue_bf16_gemm_tn_v4_persistent[
     shape measured; see try_enqueue_bf16_gemm_tt_v4), and ragged_n=True so
     n % 256 != 0 multi-wave shapes (n % 64 == 0, guaranteed by its gate)
     reach the body's n-clip instantiation instead of falling off to the far
-    slower one-CTA-per-tile grid.
+    slower one-CTA-per-tile grid.  The TN dispatcher calls twice: once with
+    the defaults (exact n, its pre-existing rung) and -- when n % 256 != 0
+    -- once more with ragged_n=True, so multi-wave half-tile-n wgrad shapes
+    (GPT-2's padded vocab 50304 has n % 256 == 128) stop falling through to
+    the one-CTA-per-tile v3 grid, which loses ~2x there.
 
     Precondition: m % 128 == 0, k % 64 == 0, and n % 256 == 0 unless
     ragged_n (then n % 64 == 0).  Both callers
@@ -871,9 +876,16 @@ def maybe_enqueue_bf16_gemm_tn_v4_persistent[
     if sm_count < _V4_PROD_CLUSTER_M:
         return False
     comptime if not any_wave:
-        # Strictly multi-wave 128x256 grid only (see docstring).
+        # Strictly multi-wave 128x256 grid only (see docstring).  Under
+        # ragged_n the trailing partial 256-column tile is a real work item
+        # the persistent scheduler will execute, so the wave census
+        # ceil-divides n; the exact-n instantiation keeps its pre-existing
+        # floor division (equal when n % 256 == 0).
         var blocks_m = (m + _V4_PROD_BM - 1) // _V4_PROD_BM
-        if blocks_m * (n // _V4_PROD_BN) <= sm_count:
+        var blocks_n = n // _V4_PROD_BN
+        comptime if ragged_n:
+            blocks_n = (n + _V4_PROD_BN - 1) // _V4_PROD_BN
+        if blocks_m * blocks_n <= sm_count:
             return False
     _v4_enqueue_nn_persistent[
         _V4_PROD_STAGES,

@@ -880,6 +880,28 @@ def try_enqueue_bf16_gemm_tn_v4(
     if maybe_enqueue_bf16_gemm_tn_v4_persistent(output, a, b, m, n, k, ctx):
         return True
 
+    # Same rung for n % 256 != 0 (n % 64 == 0, gated in the helper): the
+    # ragged-n instantiation of the same body, the one the TT dispatcher
+    # already uses.  Without it every multi-wave half-tile-n wgrad shape
+    # fell past the whole v4 ladder: n % 128 == 0 shapes onto the v3
+    # 64x128 one-CTA-per-tile grid -- GPT-2's padded vocab gives
+    # n = 50304, n % 256 == 128, and 768x50304x49152 lost ~1.9x to stock
+    # there (H100 PCIe sweep vs b99e74e: 15.5 ms -> 9.0 with this rung)
+    # -- and n % 128 == 64 shapes all the way to the non-TMA wide
+    # fallback, a ~6x cliff (1536x4160x1024: 185 us -> 31).  The helper
+    # keeps the multi-wave-only engagement, with a ceil-div census so the
+    # trailing partial tile column counts; the census edge sits right at
+    # the measured crossing (768x4992x1024, 120 census tiles on 114 SMs,
+    # engages and wins 28.8 us vs 31.4 on v3; one step below,
+    # 768x4224x1024 at 102 tiles, declines to v3's 24.7 us, which the
+    # persistent body's per-tile rate would only tie).  Single-wave
+    # ragged shapes therefore keep the narrow-tile / v3 routes below.
+    if n % 256 != 0:
+        if maybe_enqueue_bf16_gemm_tn_v4_persistent[False, False, True](
+            output, a, b, m, n, k, ctx
+        ):
+            return True
+
     # Narrow-tile regime: 192-wide tiles trade 33% more CTAs for fuller
     # waves.  Per-CTA time is proportional to BN at fixed BM/BK, so compare
     # wave-quantized cost (waves x BN) and pick 192 when it wins; e.g. 72
