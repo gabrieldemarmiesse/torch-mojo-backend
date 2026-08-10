@@ -1831,8 +1831,11 @@ def enqueue_bf16_gemm(
         #   - Shallow K (kt 6..7): only TN profits (-5% to -20% at 64..81
         #     blocks); NN loses +4% to +15% (500x500x200, this defect's
         #     corner, was a wash: 8.04 vs 8.14 us) and NT loses up to +44%
-        #     (500x500x200: 6.86 vs 4.77 us).  TT never reaches here (it is
-        #     rewritten as NN upstream).  From kt = 8 up, every layout wins
+        #     (500x500x200: 6.86 vs 4.77 us).  TT was not in that sweep: at
+        #     the time it was rewritten as NN upstream, and it now arrives
+        #     directly only when the aligned v4 TT routes decline, so it
+        #     rides the generic kt >= 8 arm unfitted.  From kt = 8 up, every
+        #     swept layout wins
         #     at <= 81 blocks (-6% to -34%), except NN 550x550x320 (+4.3%),
         #     the one loss this fit knowingly keeps: excluding it needs a
         #     tighter grid cutoff that costs the larger TN wins next to it.

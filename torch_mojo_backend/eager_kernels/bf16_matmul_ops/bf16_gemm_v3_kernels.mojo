@@ -50,6 +50,7 @@ from bf16_gemm_nt_v4_kernels import maybe_enqueue_bf16_gemm_nt_v4
 from bf16_gemm_tn_v4_kernels import (
     try_enqueue_bf16_gemm_splitk_rm_v4,
     try_enqueue_bf16_gemm_tn_v4,
+    try_enqueue_bf16_gemm_tt_v4,
 )
 
 
@@ -1404,11 +1405,11 @@ def enqueue_bf16_gemm(
                 # route below serves better (m % 64 == 0 and its whole
                 # grid fits one wave); it returns False for those, in
                 # which case the v3 NN paths below remain the fallback.
-                # Deep-K split-K route for NN (and TT, which aten_fast.py
-                # rewrites into NN): checked before the persistent kernel
-                # because a persistent CTA serializes its tiles' whole K
-                # depth -- few output macro-tiles plus deep K leaves most
-                # SMs idle.  The helper gates itself on that regime.
+                # Deep-K split-K route for NN: checked before the
+                # persistent kernel because a persistent CTA serializes its
+                # tiles' whole K depth -- few output macro-tiles plus deep K
+                # leaves most SMs idle.  The helper gates itself on that
+                # regime.
                 if not transpose_a and not transpose_b and not has_bias:
                     if try_enqueue_bf16_gemm_splitk_rm_v4[False](
                         output, a, b, m, n, k, ctx
@@ -1435,6 +1436,18 @@ def enqueue_bf16_gemm(
                 # fallback.
                 if transpose_a and not transpose_b and not has_bias:
                     if try_enqueue_bf16_gemm_tn_v4(output, a, b, m, n, k, ctx):
+                        return
+                # V4 TT route: the (COL_A, KMAJ_B) = (True, True)
+                # instantiations of the shared warp-specialized body
+                # (split-K, persistent, direct; see
+                # bf16_gemm_tn_v4_kernels.mojo), so a TT mm writes C
+                # directly into the caller's contiguous row-major (m, n)
+                # buffer -- the same strides CUDA torch returns.  The
+                # dispatcher gates its own aligned regime and returns False
+                # otherwise, in which case the all-layout v2 fallback below
+                # serves the call.
+                if transpose_a and transpose_b and not has_bias:
+                    if try_enqueue_bf16_gemm_tt_v4(output, a, b, m, n, k, ctx):
                         return
                 # A 64x128 tile preserves the prior aligned-NN coverage and
                 # increases available CTAs when the 128x256 grid would be

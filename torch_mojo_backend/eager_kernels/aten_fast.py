@@ -7126,49 +7126,11 @@ def _try_bf16_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         return None
     if not _bf16_bridge_available():
         return None
-    if (
-        lhs_layout
-        and (rhs_layout ^ bool(transpose_b))
-        and bias_tensor is None
-        and logical_output_shape == (m, n)
-    ):
-        # TT -> NN swap.  A TT call hands us a (k, m) row-major buffer Ap
-        # (lhs is its transposed view) and an (n, k) row-major buffer Bp,
-        # and C[i, j] = sum_k Ap[k, i] * Bp[j, k] means
-        # C^T = Bp @ Ap -- a plain NN GEMM with lhs' = Bp (m' = n) and
-        # rhs' = Ap (n' = m).  Every NN route (v2/v3/v4) writes its output
-        # as a dense row-major (m', n') buffer -- v3/v4 raw-store
-        # `(m0+row)*n + n0+col` and the v4 TMA C descriptor is (m, n) with
-        # strides (n, 1) -- so the dense (n, m) allocation below holds
-        # C^T, and the zero-copy (m, n) view with strides (1, m) IS C
-        # (the `_alloc_bthd` idiom).  This unlocks the v3/v4 NN kernels
-        # for TT, which has no warp-specialized route of its own.  The
-        # per-column bias epilogue cannot express the swapped (per-row)
-        # bias, and a rank != 2 logical output cannot carry these strides,
-        # so both fall through to the direct TT path below.
-        out = _alloc((n, m), DType.bfloat16, lhs._device)
-        _call_mojo(
-            _Bf16MatmulExtension,
-            "Bf16GemmBF16",
-            (
-                out._ptr,
-                rhs._ptr,
-                lhs._ptr,
-                out._ptr,
-                n,
-                m,
-                k,
-                0,
-                0,
-                0,
-                _ctx_ptr(lhs._device),
-            ),
-            arg_dtypes=(rhs._dtype, lhs._dtype),
-            output_dtypes=(out._dtype,),
-            flags={"TRANSPOSE_B": False, "HAS_BIAS": False},
-            keepalive=(out, lhs, rhs),
-        )
-        return _view_of(out, (m, n), (1, m), 0)
+    # TT (both flags set below) is launched directly, not operand-swapped
+    # into NN: the extension's TT routes compute C straight into this
+    # contiguous row-major buffer, so `.stride()` matches what CUDA torch
+    # returns for the identical call (a swapped NN kernel would hand back a
+    # column-major C).
     out = _alloc(logical_output_shape, DType.bfloat16, lhs._device)
     _call_mojo(
         _Bf16MatmulExtension,

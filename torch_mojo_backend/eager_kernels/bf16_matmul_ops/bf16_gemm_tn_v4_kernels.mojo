@@ -77,12 +77,14 @@ comptime _V4_MAX_WS_BYTES = 256 * 1024 * 1024
 # B is physically (N, K) (an NT weight reached through .t()) and loaded
 # K-major for WGMMA's "col" B mode; otherwise B is physically (K, N) and
 # loaded MN-major for the "row" mode.  TN = (True, False), NT = (False,
-# True), NN = (False, False).  TT never reaches this file: aten_fast.py
-# rewrites it as an NN GEMM on the swapped operands.
-def _v4_a_smem_layout[COL_A: Bool]() -> Layout:
+# True), NN = (False, False), TT = (True, True).  The TT instantiations
+# compute C directly into a contiguous row-major (m, n) buffer, so a TT mm
+# returns the same strides CUDA torch does (an operand-swapped NN kernel
+# would be equally fast but hand back a column-major C).
+def _v4_a_smem_layout[COL_A: Bool, BM: Int = _V4_BM]() -> Layout:
     comptime if COL_A:
-        return tile_layout_mn_major[_V4_BF16, _V4_BM, _V4_BK, _V4_SWIZZLE]()
-    return tile_layout_k_major[_V4_BF16, _V4_BM, _V4_BK, _V4_SWIZZLE]()
+        return tile_layout_mn_major[_V4_BF16, BM, _V4_BK, _V4_SWIZZLE]()
+    return tile_layout_k_major[_V4_BF16, BM, _V4_BK, _V4_SWIZZLE]()
 
 
 def _v4_b_smem_layout[BN: Int, KMAJ_B: Bool]() -> Layout:
@@ -116,6 +118,11 @@ def _v4_tn_ws_body[
     GROUP_ROWS: Int,
     COL_A: Bool = True,
     KMAJ_B: Bool = False,
+    # BM = 64 with CONSUMERS = 1 is the v3-small-kernel geometry (one
+    # 64-row WGMMA warp group, 256 threads); the defaults keep every
+    # pre-existing 128-row two-consumer instantiation unchanged.
+    BM: Int = _V4_BM,
+    CONSUMERS: Int = _V4_CONSUMERS,
 ](
     a_tma: TMATensorTile[_V4_BF16, 2, a_tile, a_desc],
     b_tma: TMATensorTile[_V4_BF16, 2, b_tile, b_desc],
@@ -127,9 +134,9 @@ def _v4_tn_ws_body[
     chunk_tiles: Int,
 ):
     comptime if _is_sm_9x():
-        comptime A_LAYOUT = _v4_a_smem_layout[COL_A]()
+        comptime A_LAYOUT = _v4_a_smem_layout[COL_A, BM]()
         comptime B_LAYOUT = _v4_b_smem_layout[BN, KMAJ_B]()
-        comptime A_PIPE_LAYOUT = Layout.row_major(STAGES, _V4_BM * _V4_BK)
+        comptime A_PIPE_LAYOUT = Layout.row_major(STAGES, BM * _V4_BK)
         comptime B_PIPE_LAYOUT = Layout.row_major(STAGES, BN * _V4_BK)
 
         var a_pipeline = LayoutTensor[
@@ -161,7 +168,7 @@ def _v4_tn_ws_body[
         if thread_idx.x == 0:
             comptime for stage in range(STAGES):
                 full_barriers[stage].init()
-                empty_barriers[stage].init(Int32(_V4_CONSUMERS))
+                empty_barriers[stage].init(Int32(CONSUMERS))
             a_tma.prefetch_descriptor()
             b_tma.prefetch_descriptor()
         # Order barrier initialization before cross-warp-group arrivals.
@@ -170,14 +177,14 @@ def _v4_tn_ws_body[
         comptime CFRAG = 64 * BN // 128
         var warp_group_idx = Int(thread_idx.x) // 128
         var warp_group_thread_idx = Int(thread_idx.x) % 128
-        var blocks_m = (m + _V4_BM - 1) // _V4_BM
+        var blocks_m = (m + BM - 1) // BM
         var blocks_n = (n + BN - 1) // BN
         var lin = Int(block_idx.x)
         var group_span = GROUP_ROWS * blocks_n
         var group = lin // group_span
         var rem = lin % group_span
         var rows_in_group = min(GROUP_ROWS, blocks_m - group * GROUP_ROWS)
-        var m0 = (group * GROUP_ROWS + rem % rows_in_group) * _V4_BM
+        var m0 = (group * GROUP_ROWS + rem % rows_in_group) * BM
         var n0 = (rem // rows_in_group) * BN
 
         # K range handled by this CTA (whole K unless split-K).
@@ -188,7 +195,7 @@ def _v4_tn_ws_body[
             my_tiles = min(chunk_tiles, k // _V4_BK - tile_start)
             if my_tiles < 0:
                 my_tiles = 0
-        comptime TMA_BYTES = (_V4_BM + BN) * _V4_BK * 2
+        comptime TMA_BYTES = (BM + BN) * _V4_BK * 2
 
         # Initially release every pipeline slot to the producer.  Thereafter
         # both consumer warp groups arrive only after their WGMMA reads
@@ -214,7 +221,7 @@ def _v4_tn_ws_body[
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](a_pipeline.ptr + stage * _V4_BM * _V4_BK)
+                    ](a_pipeline.ptr + stage * BM * _V4_BK)
                     var b_tile = LayoutTensor[
                         _V4_BF16,
                         B_LAYOUT,
@@ -255,7 +262,7 @@ def _v4_tn_ws_body[
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ](a_pipeline.ptr + stage * _V4_BM * _V4_BK)
+                ](a_pipeline.ptr + stage * BM * _V4_BK)
                 var b_tile = LayoutTensor[
                     _V4_BF16,
                     B_LAYOUT,
@@ -326,11 +333,11 @@ def _v4_tn_splitk_m128n256_s4(
     )
 
 
-# Split-K specializations for the row-major-A layouts.  Same body, same
+# Split-K specializations for the remaining layouts.  Same body, same
 # tile/stage/raster configuration as the TN split-K kernel; only the operand
 # majorness comptimes differ.  NT reads B through a K-major (N, K) buffer;
-# NN reads it MN-major like TN.  TT is rewritten as NN by aten_fast.py, so
-# the NN kernel serves it too.
+# NN reads it MN-major like TN; TT combines TN's col-major A with NT's
+# K-major B.
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
 @__llvm_metadata(
@@ -380,6 +387,26 @@ def _v4_nn_splitk_m128n256_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
+@__name("bf16_gemm_tt_v4_splitk_m128n256_s4")
+def _v4_tt_splitk_m128n256_s4(
+    a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_BF16, 2, Index(256, _V4_BK), Index(256, _V4_BK)],
+    ws: _V4_F32_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    chunk_tiles: Int,
+):
+    _v4_tn_ws_body[256, 4, True, 8, True, True](
+        a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
+    )
+
+
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
 @__name("bf16_gemm_tn_v4_direct_m128n192_s4")
 def _v4_tn_direct_m128n192_s4(
     a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
@@ -412,6 +439,55 @@ def _v4_tn_direct_m128n192_s3g16(
     k: Int,
 ):
     _v4_tn_ws_body[192, 3, False, 16](
+        a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
+    )
+
+
+# Small-tile direct TT kernel, one CTA per 128x64 output tile.  This is the
+# same per-CTA geometry the swap-era TT route reached: the v3 NN m64n128
+# small-tile kernel tiling C^T is exactly a 128x64 tiling of C.  It exists
+# because the 256-wide kernels above lose 1.5-2.2x to that route on
+# single-wave grids (too few CTAs) and cannot serve n % 256 != 0 at all;
+# the 64-wide tile needs only n % 64 == 0 and quadruples the CTA count.
+# Same warp-group structure as every other v4 entry (BM=128, 2 consumers);
+# only BN shrinks.
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
+@__name("bf16_gemm_tt_v4_direct_m128n64_s4")
+def _v4_tt_direct_m128n64_s4(
+    a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_BF16, 2, Index(64, _V4_BK), Index(64, _V4_BK)],
+    output: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+):
+    _v4_tn_ws_body[64, 4, False, 8, True, True](
+        a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
+    )
+
+
+# 64-row single-consumer TT instantiation of the same shared body (256
+# threads, 3 stages): byte-for-byte the v3 NN small kernel's geometry, with
+# the TT operand modes.
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(256))
+)
+@__name("bf16_gemm_tt_v4_direct_m64n128_s3")
+def _v4_tt_direct_m64n128_s3(
+    a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 64), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_BF16, 2, Index(128, _V4_BK), Index(128, _V4_BK)],
+    output: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+):
+    _v4_tn_ws_body[128, 3, False, 8, True, True, 64, 1](
         a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
     )
 
@@ -473,10 +549,10 @@ def _v4_tn_splitk_reduce(
 # ============================================================================
 # Enqueue helpers
 # ============================================================================
-def _v4_make_a_tma(
-    a: _V4_PTR, m: Int, k: Int, ctx: DeviceContext
-) raises -> TMATensorTile[
-    _V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)
+def _v4_make_a_tma[
+    BM: Int = _V4_BM
+](a: _V4_PTR, m: Int, k: Int, ctx: DeviceContext) raises -> TMATensorTile[
+    _V4_BF16, 2, Index(_V4_BK, BM), Index(_V4_BK, 64)
 ]:
     var a_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
         DeviceBuffer(
@@ -489,7 +565,7 @@ def _v4_make_a_tma(
         IndexList[2](m, 1),
         IndexList[2](_V4_BK, 64),
     )
-    return TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)](
+    return TMATensorTile[_V4_BF16, 2, Index(_V4_BK, BM), Index(_V4_BK, 64)](
         a_desc
     )
 
@@ -616,7 +692,17 @@ def _v4_enqueue_splitk_m128n256[
             block_dim=(_V4_THREADS,),
         )
     else:
-        comptime assert False, "TT is rewritten as NN before reaching here"
+        ctx.enqueue_function[_v4_tt_splitk_m128n256_s4](
+            _v4_make_a_tma(a, m, k, ctx),
+            _v4_make_b_kmaj_tma[256](b, n, k, ctx),
+            ws_ptr,
+            m,
+            n,
+            k,
+            chunk_tiles,
+            grid_dim=(grid_x, splits),
+            block_dim=(_V4_THREADS,),
+        )
     ctx.enqueue_function[_v4_tn_splitk_reduce](
         output,
         ws_ptr,
@@ -677,6 +763,50 @@ def _v4_enqueue_direct_m128n192(
             grid_dim=(grid_x,),
             block_dim=(_V4_THREADS,),
         )
+
+
+def _v4_enqueue_tt_direct_m128n64(
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    grid_x: Int,
+    ctx: DeviceContext,
+) raises:
+    ctx.enqueue_function[_v4_tt_direct_m128n64_s4](
+        _v4_make_a_tma(a, m, k, ctx),
+        _v4_make_b_kmaj_tma[64](b, n, k, ctx),
+        output,
+        m,
+        n,
+        k,
+        grid_dim=(grid_x,),
+        block_dim=(_V4_THREADS,),
+    )
+
+
+def _v4_enqueue_tt_direct_m64n128(
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    grid_x: Int,
+    ctx: DeviceContext,
+) raises:
+    ctx.enqueue_function[_v4_tt_direct_m64n128_s3](
+        _v4_make_a_tma[64](a, m, k, ctx),
+        _v4_make_b_kmaj_tma[128](b, n, k, ctx),
+        output,
+        m,
+        n,
+        k,
+        grid_dim=(grid_x,),
+        block_dim=(256,),
+    )
 
 
 # ============================================================================
@@ -777,8 +907,161 @@ def try_enqueue_bf16_gemm_tn_v4(
     return False
 
 
-# Split-K engagement for the row-major-A layouts (NT and NN; TT arrives
-# here as NN after aten_fast.py's operand swap).  Unlike TN, whose
+# ============================================================================
+# TT regime dispatch.  Returns True when a v4 kernel handled the call.
+# Caller guarantees: TT (transpose_a and transpose_b), no bias.
+#
+# TT is served by the (COL_A, KMAJ_B) = (True, True) instantiations of the
+# shared body -- TN's col-major A combined with NT's K-major B -- so C lands
+# directly in a contiguous row-major (m, n) buffer with the same strides
+# CUDA torch returns.  Ladder: split-K for deep-K underfilled grids, the
+# persistent clustered body (ragged-n instantiation) for multi-wave
+# m % 256 == 0 grids, and the 128x64 small-tile one-CTA-per-tile kernel for
+# everything else -- all single-wave grids, n % 256 != 0 with m % 256 != 0,
+# and m == 128.  Everything declined falls back to the v2 all-layout
+# dispatcher.
+# ============================================================================
+def try_enqueue_bf16_gemm_tt_v4(
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    comptime if not _has_sm_9x():
+        return False
+    if ctx.api() != "cuda":
+        return False
+    var cc_major = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MAJOR)
+    var cc_minor = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR)
+    if cc_major != 9 or cc_minor != 0:
+        return False
+    # Aligned regime with machine-width-safe products (mirrors the TN
+    # dispatcher above).  n only needs to tile by 64: the small 128x64
+    # kernel serves any n % 64 == 0, and the 256-wide split-K / persistent
+    # rungs additionally gate n % 256 == 0 themselves below.
+    if (
+        m < _V4_BM
+        or k < _V4_BK
+        or m % _V4_BM != 0
+        or k % _V4_BK != 0
+        or n < 64
+        or n % 64 != 0
+        or Int(output) % 16 != 0
+        or Int(a) % 16 != 0
+        or Int(b) % 16 != 0
+        or m > 2_147_483_647
+        or n > 2_147_483_647
+        or k > 2_147_483_647
+        or k > 9_223_372_036_854_775_807 // m
+        or k > 9_223_372_036_854_775_807 // n
+        or n > 9_223_372_036_854_775_807 // m
+    ):
+        return False
+    var sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var max_grid_x = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
+    if sm_count <= 0 or max_grid_x <= 0:
+        return False
+    # One-wave coverage of the 128x64 small-tile grid decides the ladder:
+    # it is the same tile count as the swap-era v3 NN m64n128 route (a
+    # 64x128 tiling of C^T is a 128x64 tiling of C), whose one-CTA-per-tile
+    # geometry wins every single-wave shape but loses multi-wave regimes to
+    # the persistent body.  Strict <, mirroring the NN dispatcher's
+    # small_tile_covers crossing (fitted on H100 PCIe, 114 SMs).
+    var small_tiles = (m // _V4_BM) * (n // 64)
+    if small_tiles <= 0 or small_tiles > max_grid_x:
+        return False
+    var small_covers = small_tiles < sm_count
+
+    if n % 256 == 0:
+        var tiles = (m // _V4_BM) * (n // 256)
+        # Split-K for deep-K underfilled grids.  The trigger reuses TN's
+        # H100 PCIe fit (splits = min(sm // tiles, 8, k_tiles // 16) >= 2
+        # with at least two K-chunks per SM wave); it was not re-swept for
+        # TT.  On the deep-K harness shape it lands where the swap-era NN
+        # split-K did (1024x1024x8192: 41.3 us vs 41.0), so the crossing
+        # carried over.  In the small-tile-covered regime a shallow split
+        # loses to the one-wave small kernel just as it did for NN, so it
+        # keeps NN's covered-regime floor of
+        # _V4_SPLITK_RM_COVERED_MIN_SPLITS (H100 PCIe fit).
+        if tiles > 0 and 2 * tiles <= sm_count:
+            var splits = sm_count // tiles
+            if splits > _V4_MAX_SPLITS:
+                splits = _V4_MAX_SPLITS
+            var max_by_depth = (k // _V4_BK) // _V4_MIN_CHUNK_TILES
+            if splits > max_by_depth:
+                splits = max_by_depth
+            var min_splits = _V4_SPLITK_RM_MIN_SPLITS
+            if small_covers:
+                min_splits = _V4_SPLITK_RM_COVERED_MIN_SPLITS
+            if (
+                splits >= min_splits
+                and m * n <= _V4_MAX_WS_BYTES // 4 // splits
+            ):
+                _v4_enqueue_splitk_m128n256[True, True](
+                    output, a, b, m, n, k, tiles, splits, ctx
+                )
+                return True
+
+    # Multi-wave regimes: persistent clustered body (shared with NN and TN)
+    # in its col-major-A + K-major-B + ragged-n mode (any_wave=True because
+    # the wave decision was already taken via small_covers above; ragged_n
+    # because our gate only guarantees n % 64 == 0, and the body's n-clip
+    # path recovers the swap-era route's numbers there -- the swap put the
+    # ragged dimension on the persistent body's clippable row side, and
+    # this puts it on the column side of the direct instantiation).  The
+    # extra m % 256 == 0 gate keeps the 256-row cluster macro-tiles exact:
+    # at m % 256 == 128 the trailing half-empty macro row underfills the
+    # persistent grid and the small kernel wins (896x1280x704: 9.3 us small
+    # vs 12.6 persistent, H100 PCIe) -- the same regime split the swap-era
+    # route produced.
+    #
+    # KNOWN RESIDUALS vs the swap era (H100 PCIe), the price of computing C
+    # directly into a contiguous buffer instead of handing back the swap's
+    # column-major view:
+    #   - The TT-mode instantiation of this shared body (raw _v4_mma_tile
+    #     col-A + K-major-B path) runs ~1-2% behind the NN-mode one the
+    #     swap reached, worst on sustained multi-wave shapes
+    #     (4096x4096x1024: 77.5 us vs 75.9 at the 25ffbbf baseline;
+    #     1024x1024x1024 +0.8%, 1024x1024x8192 split-K +0.9%).
+    #   - The persistent body prefers tall-M outputs, and the swap used to
+    #     flip which orientation pays for that: direct TT is faster on
+    #     8192x2048x2048 (146.9 us vs 151.6) and slower on 2048x8192x2048
+    #     (152.6 vs 146.7) -- a zero-sum trade across the transposed pair,
+    #     and both cells stay within 2% of stock PyTorch.
+    if not small_covers and m % 256 == 0:
+        if maybe_enqueue_bf16_gemm_tn_v4_persistent[True, True, True](
+            output, a, b, m, n, k, ctx
+        ):
+            return True
+
+    # Everything else: one CTA per small tile.  Single-wave grids (where
+    # the 256-wide kernels lose 1.5-2.2x to this geometry, e.g.
+    # 512x768x640: 11.8 us persistent vs 6.5 at the swap-era baseline),
+    # n % 256 != 0 at any wave count when the persistent rung declines
+    # (1024x576x512 was a 22 us v2-fallback cliff vs 6.0 at baseline), and
+    # m == 128 wide-n grids the persistent macro-tile cannot serve.
+    #
+    # Two tile aspects of the same geometry, equal tile counts when both
+    # fit.  The 128x64 four-stage two-consumer kernel wins once the
+    # mainloop has depth (H100 PCIe: 512x768x640 5.9 us vs 6.3,
+    # 512x256x2048 10.6 vs 12.6); at k <= 2 BK-tiles there is no mainloop
+    # to pipeline, launch overhead dominates, and the 256-thread 64x128
+    # v3-small geometry keeps its edge (256x256x64: 3.6 us vs 3.75, the
+    # swap-era route's own number).  Crossing fitted on H100 PCIe;
+    # 384x512x192 (3 K-tiles) measured a tie on both sides of it.
+    if k <= 2 * _V4_BK and n % 128 == 0:
+        var tiles64 = (m // 64) * (n // 128)
+        if tiles64 <= max_grid_x:
+            _v4_enqueue_tt_direct_m64n128(output, a, b, m, n, k, tiles64, ctx)
+            return True
+    _v4_enqueue_tt_direct_m128n64(output, a, b, m, n, k, small_tiles, ctx)
+    return True
+
+
+# Split-K engagement for the row-major-A layouts (NT and NN).  Unlike TN, whose
 # non-split alternative is a one-CTA-per-output-tile kernel, these layouts
 # fall back to persistent v4 kernels that keep every SM busy regardless of
 # tile count -- but a persistent CTA still serializes its tiles' full K

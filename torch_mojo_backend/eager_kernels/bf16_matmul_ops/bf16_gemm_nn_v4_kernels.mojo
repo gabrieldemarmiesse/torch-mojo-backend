@@ -169,12 +169,30 @@ def _v4_mma_tile[
 
 
 # Kernel-symbol layout tag for the persistent body: col_a selects the TN
-# (wgrad) instantiation, plain NN (dgrad) otherwise.
+# (wgrad) instantiation, col_a + kmaj_b the TT one, plain NN (dgrad)
+# otherwise.  (kmaj_b alone would be NT, which has its own dedicated
+# persistent kernel in bf16_gemm_nt_v4_kernels.mojo and is never
+# instantiated here.)
 @always_inline
-def _v4_persistent_layout_tag[col_a: Bool]() -> StaticString:
+def _v4_persistent_layout_tag[col_a: Bool, kmaj_b: Bool]() -> StaticString:
+    comptime if col_a and kmaj_b:
+        return "tt"
     comptime if col_a:
         return "tn"
+    comptime if kmaj_b:
+        return "nt"
     return "nn"
+
+
+# Kernel-symbol tag for the ragged-n instantiation (the TT route uses it
+# for n % 256 != 0): a suffix so profiles and the by-name kernel pairing of
+# scripts/compare_kernel_asm.py can tell it apart from the exact-n
+# instantiations, which keep their pre-existing bare names.
+@always_inline
+def _v4_persistent_ragged_tag[ragged_n: Bool]() -> StaticString:
+    comptime if ragged_n:
+        return "_nclip"
+    return ""
 
 
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
@@ -191,8 +209,12 @@ def _v4_persistent_layout_tag[col_a: Bool]() -> StaticString:
 # One kernel symbol per layout: the TN and NN instantiations of this body
 # would otherwise share one base name (differing only by mangling hash), so
 # GPU profiles could not tell them apart and scripts/compare_kernel_asm.py --
-# which pairs kernels by hash-stripped name -- would collide them.
-@__name(t"bf16_gemm_{_v4_persistent_layout_tag[col_a]()}_v4_persistent")
+# which pairs kernels by hash-stripped name -- would collide them.  The
+# ragged tag does the same for the n-clip TT instantiation while keeping
+# every exact-n symbol byte-identical to its pre-existing name.
+@__name(
+    t"bf16_gemm_{_v4_persistent_layout_tag[col_a, kmaj_b]()}_v4_persistent{_v4_persistent_ragged_tag[ragged_n]()}"
+)
 def _v4_nn_persistent_ws[
     stages: Int,
     cluster_m: Int,
@@ -202,20 +224,36 @@ def _v4_nn_persistent_ws[
     tma_store: Bool,
     # col_a extends the persistent body to the TN (wgrad) layout: A is
     # physically (K, M), TMA-loaded into an MN-major shared tile and
-    # consumed through WGMMA's col-major A mode via _v4_mma_tile.  The
-    # trailing shape parameters exist because the A TMA box follows the
-    # majorness; their defaults keep every pre-existing NN instantiation
-    # (and its generated code) unchanged.
+    # consumed through WGMMA's col-major A mode via _v4_mma_tile.  kmaj_b
+    # does the same for B: physically (N, K), TMA-loaded into a K-major
+    # shared tile for WGMMA's col-major B mode; col_a + kmaj_b is the TT
+    # instantiation.  The trailing shape parameters exist because the TMA
+    # boxes follow each operand's majorness; their defaults keep every
+    # pre-existing NN and TN instantiation (and its generated code)
+    # unchanged.
     col_a: Bool = False,
+    kmaj_b: Bool = False,
+    # ragged_n admits n % bn != 0 (still n % 64 == 0): blocks_n becomes a
+    # ceil-div, the B TMA reads clamp past the n edge (zero-fill, zero
+    # contributions) and the C TMA store's partial last column box clips
+    # against the (m, n) descriptor -- the same machinery the ragged-m path
+    # uses, on the other axis.  Only the TT route instantiates it.
+    ragged_n: Bool = False,
     a_tile_shape: IndexList[2] = Index(_V4_BK, bm) if col_a else Index(
         bm, _V4_BK
     ),
     a_desc_shape: IndexList[2] = Index(_V4_BK, 64) if col_a else Index(
         bm, _V4_BK
     ),
+    b_tile_shape: IndexList[2] = Index(64, _V4_BK) if kmaj_b else Index(
+        _V4_BK, 64
+    ),
+    b_desc_shape: IndexList[2] = Index(64, _V4_BK) if kmaj_b else Index(
+        _V4_BK, 64
+    ),
 ](
     a_tma: TMATensorTile[_V4_BF16, 2, a_tile_shape, a_desc_shape],
-    b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 64), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_BF16, 2, b_tile_shape, b_desc_shape],
     c_tma: TMATensorTile[_V4_BF16, 2, Index(bm, 64), Index(bm, 64)],
     output: _V4_PTR,
     m: Int,
@@ -228,10 +266,19 @@ def _v4_nn_persistent_ws[
         ]() if col_a else tile_layout_k_major[
             _V4_BF16, bm, _V4_BK, _V4_SWIZZLE
         ]()
-        comptime B_LAYOUT = tile_layout_mn_major[
+        comptime B_LAYOUT = tile_layout_k_major[
+            _V4_BF16, bn, _V4_BK, _V4_SWIZZLE
+        ]() if kmaj_b else tile_layout_mn_major[
             _V4_BF16, bn, _V4_BK, _V4_SWIZZLE
         ]()
-        comptime B_CHUNK_LAYOUT = tile_layout_mn_major[
+        # For both majornesses a 64-row chunk of the bn-row tile is one
+        # contiguous 64 * BK block at offset chunk * 64 * BK (BK = 64 bf16 is
+        # exactly one 128B swizzle atom row, so the K-major layout is a plain
+        # stack of 8-row atoms; the NT kernel's half-tile multicast relies on
+        # the same decomposition).
+        comptime B_CHUNK_LAYOUT = tile_layout_k_major[
+            _V4_BF16, 64, _V4_BK, _V4_SWIZZLE
+        ]() if kmaj_b else tile_layout_mn_major[
             _V4_BF16, 64, _V4_BK, _V4_SWIZZLE
         ]()
         comptime A_PIPE_LAYOUT = Layout.row_major(stages, bm * _V4_BK)
@@ -299,9 +346,12 @@ def _v4_nn_persistent_ws[
         var cluster_id = Int(block_idx.x) // cluster_m
         var num_clusters = Int(grid_dim.x) // cluster_m
         # m may be ragged: TMA A reads clamp out-of-bounds rows and the
-        # epilogue stores are row-predicated.
+        # epilogue stores are row-predicated.  With ragged_n, n may be too
+        # (see the parameter comment above).
         var macro_rows = (m + MACRO_BM - 1) // MACRO_BM
         var blocks_n = n // bn
+        comptime if ragged_n:
+            blocks_n = (n + bn - 1) // bn
         var total_works = macro_rows * blocks_n
         var num_tiles = k // _V4_BK
         var group_span = _V4_GROUP * blocks_n
@@ -371,19 +421,38 @@ def _v4_nn_persistent_ws[
                                 + stage * bn * _V4_BK
                                 + cc * 64 * _V4_BK
                             )
+                            # B TMA coordinates follow the descriptor's
+                            # global tensor: (k, n) for the K-major (N, K)
+                            # kmaj_b operand, (n, k) for the row-major
+                            # (K, N) one.
                             comptime if cluster_m > 1:
-                                b_tma.async_multicast_load(
-                                    b_chunk,
-                                    full_barriers[stage],
-                                    (n0 + cc * 64, k0),
-                                    MCAST_MASK,
-                                )
+                                comptime if kmaj_b:
+                                    b_tma.async_multicast_load(
+                                        b_chunk,
+                                        full_barriers[stage],
+                                        (k0, n0 + cc * 64),
+                                        MCAST_MASK,
+                                    )
+                                else:
+                                    b_tma.async_multicast_load(
+                                        b_chunk,
+                                        full_barriers[stage],
+                                        (n0 + cc * 64, k0),
+                                        MCAST_MASK,
+                                    )
                             else:
-                                b_tma.async_copy(
-                                    b_chunk,
-                                    full_barriers[stage],
-                                    (n0 + cc * 64, k0),
-                                )
+                                comptime if kmaj_b:
+                                    b_tma.async_copy(
+                                        b_chunk,
+                                        full_barriers[stage],
+                                        (k0, n0 + cc * 64),
+                                    )
+                                else:
+                                    b_tma.async_copy(
+                                        b_chunk,
+                                        full_barriers[stage],
+                                        (n0 + cc * 64, k0),
+                                    )
                             cc += 1
                         t += 1
                         gt += 1
@@ -442,10 +511,12 @@ def _v4_nn_persistent_ws[
                         address_space=AddressSpace.SHARED,
                         alignment=128,
                     ](b_pipeline.ptr + stage * bn * _V4_BK)
-                    comptime if col_a:
+                    comptime if col_a or kmaj_b:
                         # Raw descriptor path: TensorCoreAsync has no
-                        # col-major A mode.
-                        _v4_mma_tile[bn, True, False, A_LAYOUT, B_LAYOUT](
+                        # col-major A mode (and the TT instantiation's
+                        # K-major B rides the same majorness-generic
+                        # helper).
+                        _v4_mma_tile[bn, col_a, kmaj_b, A_LAYOUT, B_LAYOUT](
                             a_tile.ptr, b_tile.ptr, accum, warp_group_idx
                         )
                     else:
@@ -546,6 +617,8 @@ def _v4_enqueue_nn_persistent[
     consumers: Int,
     tma_store: Bool = False,
     col_a: Bool = False,
+    kmaj_b: Bool = False,
+    ragged_n: Bool = False,
 ](
     output: _V4_PTR,
     a: _V4_PTR,
@@ -556,11 +629,14 @@ def _v4_enqueue_nn_persistent[
     sm_count: Int,
     ctx: DeviceContext,
 ) raises:
-    # A descriptor follows the operand's physical layout: (M, K) row-major
-    # with a whole-tile box, or -- for the TN/wgrad col_a route -- (K, M)
-    # row-major with a (BK, 64) box feeding the MN-major shared tile.
+    # Each descriptor follows its operand's physical layout: (M, K) row-major
+    # with a whole-tile box, or -- for the TN/wgrad and TT col_a routes --
+    # (K, M) row-major with a (BK, 64) box feeding the MN-major shared tile;
+    # likewise (K, N) row-major for B, or -- for the TT kmaj_b route --
+    # (N, K) row-major with a (64, BK) box feeding the K-major shared tile.
     comptime A_TILE = Index(_V4_BK, bm) if col_a else Index(bm, _V4_BK)
     comptime A_DESC = Index(_V4_BK, 64) if col_a else Index(bm, _V4_BK)
+    comptime B_TILE = Index(64, _V4_BK) if kmaj_b else Index(_V4_BK, 64)
     var a_dim0 = k if col_a else m
     var a_dim1 = m if col_a else k
     var a_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
@@ -574,6 +650,8 @@ def _v4_enqueue_nn_persistent[
         IndexList[2](a_dim1, 1),
         IndexList[2](A_DESC[0], A_DESC[1]),
     )
+    var b_dim0 = n if kmaj_b else k
+    var b_dim1 = k if kmaj_b else n
     var b_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
@@ -581,9 +659,9 @@ def _v4_enqueue_nn_persistent[
             1,
             owning=False,
         ),
-        IndexList[2](k, n),
-        IndexList[2](n, 1),
-        IndexList[2](_V4_BK, 64),
+        IndexList[2](b_dim0, b_dim1),
+        IndexList[2](b_dim1, 1),
+        IndexList[2](B_TILE[0], B_TILE[1]),
     )
     var c_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
         DeviceBuffer(
@@ -597,17 +675,26 @@ def _v4_enqueue_nn_persistent[
         IndexList[2](bm, 64),
     )
     var a_tma = TMATensorTile[_V4_BF16, 2, A_TILE, A_DESC](a_desc)
-    var b_tma = TMATensorTile[
-        _V4_BF16, 2, Index(_V4_BK, 64), Index(_V4_BK, 64)
-    ](b_desc)
+    var b_tma = TMATensorTile[_V4_BF16, 2, B_TILE, B_TILE](b_desc)
     var c_tma = TMATensorTile[_V4_BF16, 2, Index(bm, 64), Index(bm, 64)](c_desc)
     var macro_rows = (m + bm * cluster_m - 1) // (bm * cluster_m)
-    var total_works = macro_rows * (n // bn)
+    var blocks_n = n // bn
+    comptime if ragged_n:
+        blocks_n = (n + bn - 1) // bn
+    var total_works = macro_rows * blocks_n
     var num_clusters = min(sm_count // cluster_m, total_works)
     var grid_x = num_clusters * cluster_m
     ctx.enqueue_function[
         _v4_nn_persistent_ws[
-            stages, cluster_m, bm, bn, consumers, tma_store, col_a
+            stages,
+            cluster_m,
+            bm,
+            bn,
+            consumers,
+            tma_store,
+            col_a,
+            kmaj_b,
+            ragged_n,
         ]
     ](
         a_tma,
@@ -709,7 +796,9 @@ def maybe_enqueue_bf16_gemm_nn_v4(
     return False
 
 
-def maybe_enqueue_bf16_gemm_tn_v4_persistent(
+def maybe_enqueue_bf16_gemm_tn_v4_persistent[
+    kmaj_b: Bool = False, any_wave: Bool = False, ragged_n: Bool = False
+](
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
@@ -718,23 +807,31 @@ def maybe_enqueue_bf16_gemm_tn_v4_persistent(
     k: Int,
     ctx: DeviceContext,
 ) raises -> Bool:
-    """Route a multi-wave TN (wgrad) GEMM to the persistent clustered v4
-    body in its col-major-A mode.
+    """Route a multi-wave TN (wgrad) GEMM -- or, with kmaj_b, a TT one --
+    to the persistent clustered v4 body in its col-major-A mode.
 
-    Called by the TN dispatcher in bf16_gemm_tn_v4_kernels.mojo AFTER its
-    split-K attempt (deep-K underfilled outputs stay on split-K) and BEFORE
-    the narrow-tile / v3 one-CTA-per-tile routes.  Engages only when the
-    128x256 tiling of the output is strictly multi-wave on the current GPU:
-    that is the regime where the one-CTA-per-tile kernels pay a per-wave
-    pipeline refill plus a serialized scalar epilogue, and where this body's
-    persistent scheduler, cluster B multicast and background TMA-store
-    epilogue were measured to win (H100 PCIe; same regime split as the NN
-    dispatcher above).  Single-wave shapes keep the pre-existing routes.
+    Called by the TN and TT dispatchers in bf16_gemm_tn_v4_kernels.mojo
+    AFTER their split-K attempt (deep-K underfilled outputs stay on split-K)
+    and BEFORE the remaining one-CTA-per-tile routes.  By default it engages
+    only when the 128x256 tiling of the output is strictly multi-wave on the
+    current GPU: that is the regime where the one-CTA-per-tile kernels pay a
+    per-wave pipeline refill plus a serialized scalar epilogue, and where
+    this body's persistent scheduler, cluster B multicast and background
+    TMA-store epilogue were measured to win (H100 PCIe; same regime split as
+    the NN dispatcher above).  Single-wave TN shapes keep the pre-existing
+    narrow-tile / v3 routes, which beat the persistent body there.  The TT
+    dispatcher passes any_wave=True because it makes its own wave decision
+    (its 128x64 small-tile kernel beats this body on every single-wave
+    shape measured; see try_enqueue_bf16_gemm_tt_v4), and ragged_n=True so
+    n % 256 != 0 multi-wave shapes (n % 64 == 0, guaranteed by its gate)
+    reach the body's n-clip instantiation instead of falling off to the far
+    slower one-CTA-per-tile grid.
 
-    Precondition: m % 128 == 0, n % 256 == 0 and k % 64 == 0.  The only
-    caller (try_enqueue_bf16_gemm_tn_v4) gates m % 128 == 0 before calling,
+    Precondition: m % 128 == 0, k % 64 == 0, and n % 256 == 0 unless
+    ragged_n (then n % 64 == 0).  Both callers
+    (try_enqueue_bf16_gemm_tn_v4 / _tt_v4) gate m % 128 == 0 before calling,
     so the kernel body's ragged-m clip path (TMA read clamp + store clip) is
-    unreachable and untested on the TN route.
+    unreachable and untested on these routes.
     Returns False when the caller must fall back."""
     comptime if not _has_sm_9x():
         return False
@@ -752,11 +849,12 @@ def maybe_enqueue_bf16_gemm_tn_v4_persistent(
     # (2900x1280x192 measured 48 us on its fallback route vs 11.3 us for the
     # 128-aligned neighbour).  That is new work needing its own correctness
     # and perf pass on the TN clip path, which is untested in tree today.
+    comptime N_MOD = 64 if ragged_n else _V4_PROD_BN
     if (
         m < _V4_PROD_BM * _V4_PROD_CLUSTER_M
         or n < _V4_PROD_BN
         or k < _V4_BK
-        or n % _V4_PROD_BN != 0
+        or n % N_MOD != 0
         or k % _V4_BK != 0
         or Int(output) % 16 != 0
         or Int(a) % 16 != 0
@@ -772,10 +870,11 @@ def maybe_enqueue_bf16_gemm_tn_v4_persistent(
     var sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
     if sm_count < _V4_PROD_CLUSTER_M:
         return False
-    # Strictly multi-wave 128x256 grid only (see docstring).
-    var blocks_m = (m + _V4_PROD_BM - 1) // _V4_PROD_BM
-    if blocks_m * (n // _V4_PROD_BN) <= sm_count:
-        return False
+    comptime if not any_wave:
+        # Strictly multi-wave 128x256 grid only (see docstring).
+        var blocks_m = (m + _V4_PROD_BM - 1) // _V4_PROD_BM
+        if blocks_m * (n // _V4_PROD_BN) <= sm_count:
+            return False
     _v4_enqueue_nn_persistent[
         _V4_PROD_STAGES,
         _V4_PROD_CLUSTER_M,
@@ -784,5 +883,7 @@ def maybe_enqueue_bf16_gemm_tn_v4_persistent(
         _V4_PROD_CONSUMERS,
         _V4_PROD_TMA_STORE,
         True,
+        kmaj_b,
+        ragged_n,
     ](output, a, b, m, n, k, sm_count, ctx)
     return True
