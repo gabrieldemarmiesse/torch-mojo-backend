@@ -287,7 +287,7 @@ When optimizing a kernel, you should make a harness for a subagent A to work on.
 - The harness should also include reference numbers, so roofline estimate, and the performance of stock pytorch on the same input shapes (device time too, not wall time).
 - The scope of the agent should be as limited as possible, for example, if writing a gemm, the agent should only take care of the TN variant, or NT but not all variants. It should only focus on one dtype. (if multiple dtypes are needed, we'll do the dance Agent A, Agent B for dtype1 and then Agent A Agent B for dtype2, etc..., with a bit of luck for dtype2, agent A can reuse the code of dtype1 and just change the dtype, which will be easy to integrate later by agent B by parametrizing the code).
 - The agent should write the kernel outside the codebase, but the agent can import code from it, or import code from the modular repo. This is to avoid having the agent work on integrating the kernel into the codebase, the agent should only focus on the kernel itself. 
-- The performance work is done when 1) The kernel is within 2% of the stock pytorch performance on the same input shapes AND 2) The kernel is within 20% of the roofline estimate.
+- The performance work is done when the kernel is within 10% of the speed of stock pytorch on the same input shapes (device time). Keep the roofline estimate in the harness as a diagnostic: it tells the agent whether the remaining gap is physics or engineering.
 
 A small agent A2 should be used for a quick code review, notably just check that the kernel respects the rules of the eager mode and the tests are passing. No need for a very smart model here.
 
@@ -301,3 +301,97 @@ When subagent A is done, a subagent B should start to integrate the kernel into 
 When subagent B is done, a subagent C should do a code review of B and run benchmarks to make sure that the performance has not regressed for other dtypes, shapes, similar kernels, other gpus etc... Cross-compilation can be used to check that the assembly/ptx didn't change much. But worst case scenario, other gpus are available to run benchmarks through ssh.
 
 When agents A, B and C are all done, all the temporary files of agent A should be removed and a commit should be made.
+
+## Benchmark harness notes
+
+Hard-won facts from previous kernel-optimization engagements on this codebase.
+Believe them before rediscovering them at GPU-hour prices.
+
+### Measuring
+
+- One GPU, many agents: EVERY GPU-touching command (harness runs, `ncu`,
+  `pytest`, one-off probes) goes through `flock /tmp/gpu_lock_{gpu_id}.lock`.
+  Never compile under the lock — `mojo build` takes minutes and needs no GPU;
+  build first, then take the lock to run.
+- Lock the clocks before taking reference numbers (`nvidia-smi -lgc` on
+  NVIDIA; pick a sustainable frequency below max so power throttling cannot
+  bite mid-suite). Record the chosen clock next to the numbers, recompute the
+  roofline at that clock, and reset with `nvidia-smi -rgc` when the
+  engagement ends.
+- Time two ways: per-launch (sync every iteration; includes host enqueue
+  overhead) and streamed (N back-to-back launches, one sync). The streamed
+  number is the one comparable to torch-profiler GPU time and to the stock
+  pytorch reference.
+- Thermal ordering bias is real on power-limited cards: a config benchmarked
+  later in a hot run can read several percent slower (~8% observed on hot
+  GEMM shapes). Never conclude from a single in-run ordering — alternate
+  baseline/candidate order between runs, or compare both against an absolute
+  reference.
+- Before optimizing anything, the harness baseline leg must call the actual
+  production entry points and reproduce the in-process production numbers
+  (within ~1%). If it does not, the harness is measuring something else and
+  every later conclusion is suspect.
+- Fill inputs with a deterministic hash (not an RNG) so the host-side
+  correctness check can recompute exact expected values on sampled output
+  elements. Accumulate the host reference in fp64 and calibrate the tolerance
+  to fp32 accumulation error (grows roughly like sqrt(k) for tiled sums).
+  A tolerance failure after a restructured accumulation is a kernel bug, not
+  a tolerance bug.
+- `ncu` replays kernels: keep iteration counts tiny under profiling, and
+  prefer a short `--metrics` list (stall ratios, registers per thread,
+  pipe/memory pct-of-peak) over `--set full` while iterating.
+- A negative result ("this approach cannot go faster") needs the same rigor
+  as a positive one: profiler evidence for the limiter and the measured
+  numbers of each failed variant, recorded so the next agent does not
+  re-explore them.
+
+### Writing kernels (Mojo/GPU gotchas)
+
+- GPU closures capture module-local `var`s BY REFERENCE = garbage on device.
+  Everything a kernel reads must be a function parameter or `@__copy_capture`.
+  This has produced flaky, mostly-wrong outputs that PASSED a standalone
+  repro.
+- Mojo shared-memory vector loads/stores default to align-4 and can reach PTX
+  as scalar `ld.shared.b32`. Pass `alignment=16` explicitly on 16-byte
+  accesses, then check the PTX actually vectorized.
+- cp.async needs 16B-aligned SOURCES. Gate the 16B path on the runtime base
+  pointer alignment, not just on `dim % 4 == 0` — offset views break the
+  latter-only reasoning — and fall back to 4-byte variants, or it silently
+  corrupts.
+- Fully comptime-unrolled inner loops blow past the register budget and
+  collapse occupancy. Use runtime loops plus launch-bounds metadata
+  (`@__llvm_metadata(MAX_THREADS_PER_BLOCK_METADATA=...)`, `nvvm.minctasm`).
+- `Atomic.fetch_add` defaults to sequential ordering (catastrophic on hot
+  paths). For split-K, prefer a workspace plus a separate reduce kernel:
+  deterministic, and measured several times faster than atomics on deep-K
+  shapes.
+- Deep-K, L2-resident shapes want 3-4 pipeline stages, not 2.
+- Grid and split-K choices should fill whole waves: a partial extra wave can
+  cost far more than it computes. Derive wave sizes from the runtime SM count
+  and document, next to its definition, every constant that was fitted to one
+  card (per the cross-compilation section above).
+
+### Build & integration gotchas
+
+- Define-gating silently no-ops standalone builds: the gates in
+  `variant_gates.mojo` (`_op_on`, `_dtype_arg_on`, ...) read compiler defines
+  and gate OFF when the define is absent. A standalone harness binary that
+  calls a define-gated dispatcher (e.g. `_matmul_spec_launch`) without the
+  matching `-D DTYPE_ARG_0=<dtype>` will decline or raise at runtime. Either
+  pass the defines, or call the comptime-parameterized functions directly
+  (e.g. `_gemm_enqueue[dtype, ...]`), which need no defines.
+- Directory shadows module on the import path: with
+  `-I torch_mojo_backend/eager_kernels`, a family directory such as
+  `matmul_ops/` resolves as a package and shadows the `matmul_ops.mojo` file
+  inside it. Import as `from matmul_ops.matmul_ops import ...`.
+- Cache/source registration for new `.mojo` files: the extension loader
+  hashes the import closure of each extension's entry `.mojo` file, so a new
+  file imported (even transitively) from the entry module invalidates the
+  compile cache automatically. Verify it anyway: touch the new file and
+  confirm the source hash changes and a recompile happens. Only optional
+  bridges enumerated in explicit `*_SOURCE_PATHS` lists in `aten_fast.py`
+  need manual registration.
+- `ctx.enqueue_function[f]` re-runs `compile_function` on every call (tens to
+  hundreds of microseconds for large kernels). That is acceptable in a
+  throwaway harness; production code must use the `_enqueue_cached` pattern
+  from `op_utils`, like the rest of the eager kernels.
