@@ -5795,6 +5795,60 @@ def test_bf16_real_tn_wgrad_ragged_n_persistent_route(mojo_h100, monkeypatch, m,
     _assert_bf16_fp32_accumulation_close(actual.cpu(), expected)
 
 
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    [
+        # Smallest NN engage-side shape of the lm_head dgrad class:
+        # n % 256 == 128 with 60 macro-work clusters = 120 CTAs of
+        # persistent fill >= 9/16 of 114 SMs, so the ragged-n NN rung takes
+        # it (CUPTI on H100: bf16_gemm_nn_v4_persistent_nclip -- the same
+        # route 768x50304x49152 takes).  One census step down (768x2432,
+        # 60 CTAs) declines to the v3 small tile instead.
+        (768, 4992, 1024),
+        # n % 128 == 64: before the ragged rung this fell past the v3
+        # small tile's n % 128 == 0 gate onto the non-TMA wide fallback (a
+        # ~4.6x cliff on H100), so it must always engage regardless of
+        # fill.
+        (1536, 4160, 1024),
+        # Ragged m AND ragged n at once: m % 64 != 0 rows exercise the
+        # persistent body's row-clamp/row-predicated path inside the
+        # n-clip instantiation (the v3 small tile cannot serve m % 64 !=
+        # 0, so this engages on the m-gate alone).
+        (300, 12928, 1024),
+    ],
+)
+def test_bf16_real_nn_dgrad_ragged_n_persistent_route(mojo_h100, monkeypatch, m, n, k):
+    """NN dgrad with n % 256 != 0: the ragged-n persistent rung.
+
+    The n-clip instantiation of the shared persistent body (the one TN and
+    TT already used) serves NN here; its B TMA loads clamp past the n edge
+    and the C TMA store clips the partial last 64-column chunk, so
+    correctness at the ragged edge is exactly what this test guards.
+    Correctness only; timings live in the perf harness and benchmarks.
+    """
+    _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    generator = torch.Generator().manual_seed(20260812)
+    lhs, mojo_lhs = _bf16_dense_matrix_pair(generator, (m, k), False, 0, mojo_h100)
+    rhs, mojo_rhs = _bf16_dense_matrix_pair(generator, (k, n), False, 0, mojo_h100)
+    expected = torch.mm(lhs.float(), rhs.float()).to(torch.bfloat16)
+
+    def fail_later_route(*_args, **_kwargs):
+        raise AssertionError("eligible BF16 NN GEMM reached TF32 or TensorSpec")
+
+    monkeypatch.setattr(aten_fast, "_try_tf32_gemm", fail_later_route)
+    monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
+    old_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        actual = torch.mm(mojo_lhs, mojo_rhs)
+    finally:
+        torch.set_float32_matmul_precision(old_precision)
+
+    _assert_bf16_fp32_accumulation_close(actual.cpu(), expected)
+
+
 @pytest.mark.parametrize("operation", ["mm", "addmm"])
 @pytest.mark.parametrize("lhs_transposed", [False, True])
 @pytest.mark.parametrize("rhs_transposed", [False, True])

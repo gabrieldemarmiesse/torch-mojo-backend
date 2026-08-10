@@ -23,10 +23,12 @@ Design, motivated by ncu on the nanogpt dgrad shapes (m=32768, short k):
   - A 192x192 / 3-consumer tile (nvjet's pick) was also implemented and
     benched; 128x256 with 2 consumers won on every nanogpt dgrad shape.
 
-Dynamic shapes: any problem in the tall-m NN regime with n % BN == 0 and
+Dynamic shapes: any problem in the tall-m NN regime with n % 64 == 0 and
 k % BK == 0 is handled (m may be ragged: TMA clamps loads and clips
-stores); everything else must be routed to the existing v3 dispatcher by
-the caller (`maybe_enqueue_...` returns False in that case).
+stores; n % BN != 0 selects the ragged_n `_nclip` instantiation, which
+clips the trailing partial column of tiles the same way); everything else
+must be routed to the existing v3 dispatcher by the caller
+(`maybe_enqueue_...` returns False in that case).
 """
 
 from std.gpu import (
@@ -72,6 +74,8 @@ from layout.tensor_core_async import (
     warpgroup_fence,
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
+
+from bf16_gemm_kernels import _pick_regime
 
 comptime _V4_BF16 = DType.bfloat16
 comptime _V4_F32 = DType.float32
@@ -237,8 +241,8 @@ def _v4_nn_persistent_ws[
     # ceil-div, the B TMA reads clamp past the n edge (zero-fill, zero
     # contributions) and the C TMA store's partial last column box clips
     # against the (m, n) descriptor -- the same machinery the ragged-m path
-    # uses, on the other axis.  The TT and TN routes both instantiate it;
-    # NN does not yet, which is why NN still declines a ragged n.
+    # uses, on the other axis.  The NN, TN and TT routes all instantiate
+    # it.
     ragged_n: Bool = False,
     a_tile_shape: IndexList[2] = Index(_V4_BK, bm) if col_a else Index(
         bm, _V4_BK
@@ -735,8 +739,19 @@ def maybe_enqueue_bf16_gemm_nn_v4(
             )
             if cc_major == 9 and cc_minor == 0:
                 # Aligned NN regime, any aspect ratio.  m may be ragged (TMA
-                # clamps reads, stores are predicated); n and k must tile
-                # exactly.  The ordered bounds make all descriptor and
+                # clamps reads, stores are predicated), and so may n down to
+                # a multiple of 64: n % 256 == 0 launches the pre-existing
+                # exact instantiation, anything else the ragged_n (_nclip)
+                # one, whose B TMA reads clamp past the n edge and whose C
+                # store clips the partial last column box -- the same rung
+                # the TN and TT dispatchers already use.  Without it every
+                # NN dgrad shape with n % 256 != 0 fell down the ladder:
+                # n % 128 == 0 (GPT-2's padded vocab 50304 has
+                # n % 256 == 128) onto the 64x128 one-CTA-per-tile v3 grid,
+                # a ~1.9x loss to stock on 768x50304x49152, and
+                # n % 128 == 64 all the way to the non-TMA wide fallback, a
+                # ~4.6x cliff (1536x4160x1024: 141 us -> 31).  k must still
+                # tile exactly.  The ordered bounds make all descriptor and
                 # address products machine-width safe.
                 if (
                     not transpose_a
@@ -745,7 +760,7 @@ def maybe_enqueue_bf16_gemm_nn_v4(
                     and m >= _V4_PROD_BM * _V4_PROD_CLUSTER_M
                     and n >= _V4_PROD_BN
                     and k >= _V4_BK
-                    and n % _V4_PROD_BN == 0
+                    and n % 64 == 0
                     and k % _V4_BK == 0
                     and Int(output) % 16 == 0
                     and Int(a) % 16 == 0
@@ -780,19 +795,89 @@ def maybe_enqueue_bf16_gemm_nn_v4(
                     # 128x256 fallback's 12.74 us.
                     var macro_span = _V4_PROD_BM * _V4_PROD_CLUSTER_M
                     var macro_rows = (m + macro_span - 1) // macro_span
-                    var total_works = macro_rows * (n // _V4_PROD_BN)
-                    var small_tile_covers = (
-                        m % 64 == 0 and total_works * 8 < sm_count
-                    )
-                    if sm_count >= _V4_PROD_CLUSTER_M and not small_tile_covers:
-                        _v4_enqueue_nn_persistent[
-                            _V4_PROD_STAGES,
-                            _V4_PROD_CLUSTER_M,
-                            _V4_PROD_BM,
-                            _V4_PROD_BN,
-                            _V4_PROD_CONSUMERS,
-                            _V4_PROD_TMA_STORE,
-                        ](output, a, b, m, n, k, sm_count, ctx)
+                    # Under a ragged n the trailing partial 256-column tile
+                    # is a real work item the persistent scheduler will
+                    # execute, so the census ceil-divides n; exact-n shapes
+                    # keep the pre-existing floor division (equal when
+                    # n % 256 == 0), and their dispatch below is unchanged.
+                    var blocks_n = n // _V4_PROD_BN
+                    if n % _V4_PROD_BN != 0:
+                        blocks_n = (n + _V4_PROD_BN - 1) // _V4_PROD_BN
+                    var total_works = macro_rows * blocks_n
+                    # Exact n keeps the pre-existing *8 single-wave fit (see
+                    # above).  The ragged rung declines to two real
+                    # alternatives below it on the ladder:
+                    #
+                    # 1. The 64x64 s64 route at the bottom of the ladder
+                    #    (bf16_gemm_kernels.mojo).  Its own dispatcher
+                    #    engages it exactly when _pick_regime returns the
+                    #    64x64 regime, so the same call is the coverage
+                    #    condition here and the two cannot drift apart.  A
+                    #    covered shape has blocks_s64 <= sm_count, i.e. at
+                    #    most ~sm_count/16 of these 256-wide macro-tiles --
+                    #    far below the ~9/16 fill crossing -- and the s64
+                    #    grid (plus its split-K arm for deep K) was measured
+                    #    ~1.3-2x faster than this body on every covered
+                    #    shape, any n % 64 == 0 raggedness, m ragged or not
+                    #    (H100 PCIe: 256x320x64 3.3 us vs 5.5; 256x320x1024
+                    #    8.1 vs 15.8; 300x640x512 8.9 vs 10.3; k = 64..4096
+                    #    swept).  Without this term those small-fill shapes
+                    #    were stolen from the s64 route and lost ~2x.
+                    #
+                    # 2. The 64x128 v3 small tile, which only exists when it
+                    #    can serve the shape at all (m % 64 == 0 and
+                    #    n % 128 == 0; an n % 128 == 64 shape beyond s64
+                    #    coverage has nowhere better to go than the non-TMA
+                    #    wide fallback, so it must engage here): the
+                    #    persistent grid runs total_works clusters, and when
+                    #    that fills under ~9/16 of the machine the idle SMs
+                    #    cost more than this body's multicast + TMA-store
+                    #    epilogue saves.  Fitted over a 13-shape
+                    #    n % 256 == 128 band on an H100 PCIe (114 SMs),
+                    #    k = 512..4096 -- the crossing is K-independent: at
+                    #    60 CTAs of fill (768x2432x1024) the v3 small tile
+                    #    wins 14.1 us vs 16.0, and its deep-K neighbours
+                    #    below the cut (640x2176x4096, 54 CTAs, 32.3 vs
+                    #    49.2) agree; at 72 CTAs (704x2944x1024) the
+                    #    persistent body wins 16.2 us vs 19.8, likewise at
+                    #    k = 4096 (49.9 vs 60.1), and its margin only grows
+                    #    with fill (768x4224x1024: 17.7 vs 24.6).
+                    var small_route_wins = False
+                    if n % _V4_PROD_BN == 0:
+                        small_route_wins = (
+                            m % 64 == 0 and total_works * 8 < sm_count
+                        )
+                    else:
+                        small_route_wins = _pick_regime(
+                            m, n, 1, sm_count
+                        ) == 3 or (
+                            m % 64 == 0
+                            and n % 128 == 0
+                            and total_works * _V4_PROD_CLUSTER_M * 16
+                            < sm_count * 9
+                        )
+                    if sm_count >= _V4_PROD_CLUSTER_M and not small_route_wins:
+                        if n % _V4_PROD_BN == 0:
+                            _v4_enqueue_nn_persistent[
+                                _V4_PROD_STAGES,
+                                _V4_PROD_CLUSTER_M,
+                                _V4_PROD_BM,
+                                _V4_PROD_BN,
+                                _V4_PROD_CONSUMERS,
+                                _V4_PROD_TMA_STORE,
+                            ](output, a, b, m, n, k, sm_count, ctx)
+                        else:
+                            _v4_enqueue_nn_persistent[
+                                _V4_PROD_STAGES,
+                                _V4_PROD_CLUSTER_M,
+                                _V4_PROD_BM,
+                                _V4_PROD_BN,
+                                _V4_PROD_CONSUMERS,
+                                _V4_PROD_TMA_STORE,
+                                False,
+                                False,
+                                True,
+                            ](output, a, b, m, n, k, sm_count, ctx)
                         return True
     return False
 

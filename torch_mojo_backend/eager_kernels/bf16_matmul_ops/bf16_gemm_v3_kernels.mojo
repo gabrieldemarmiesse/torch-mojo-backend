@@ -1400,11 +1400,15 @@ def enqueue_bf16_gemm(
                 # NN dgrad route (v4): persistent warp-specialized kernel
                 # with 2-CTA-cluster B multicast and a TMA-store epilogue
                 # (bf16_gemm_nn_v4_kernels.mojo).  It gates itself on the
-                # aligned NN regime (n % 256 == 0, k % 64 == 0; m may be
-                # ragged) and declines only shapes the 64x128 small-tile
-                # route below serves better (m % 64 == 0 and its whole
-                # grid fits one wave); it returns False for those, in
-                # which case the v3 NN paths below remain the fallback.
+                # aligned NN regime (n % 64 == 0, k % 64 == 0; m may be
+                # ragged, and n % 256 != 0 selects the ragged_n _nclip
+                # instantiation) and declines only shapes a smaller route
+                # below serves better: the 64x128 small tile (m % 64 == 0,
+                # n % 128 == 0 and its whole grid fits one wave) or, for
+                # ragged n, the bottom-of-ladder 64x64 s64 route whenever
+                # _pick_regime would select it; it returns False for
+                # those, in which case the v3 NN paths below remain the
+                # fallback.
                 # Deep-K split-K route for NN: checked before the
                 # persistent kernel because a persistent CTA serializes its
                 # tiles' whole K depth -- few output macro-tiles plus deep K
