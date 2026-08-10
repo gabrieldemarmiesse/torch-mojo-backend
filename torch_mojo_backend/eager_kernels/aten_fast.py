@@ -4971,6 +4971,16 @@ def fast_aten__log_softmax_backward_data(
         work_dim = 1
         restore_shape = grad._shape
 
+    if grad._dtype in (DType.float16, DType.bfloat16):
+        # Reduced-precision inputs compute in fp32 and round once at the final
+        # cast, like the fused GPU kernel and the ATen reference. Composing in
+        # bf16 rounds three intermediates (rowsum, exp, addcmul) and the
+        # compounded error can reach tens of bf16 ulps on ~normal inputs.
+        work_grad = _cast_tensor(work_grad, DType.float32)
+        work_output = _cast_tensor(work_output, DType.float32)
+        if summed is not None:
+            summed = _cast_tensor(summed, DType.float32)
+
     if summed is None:
         summed = fast_aten_sum(work_grad, dim=[work_dim], keepdim=True)
         if summed is NOT_HANDLED:
