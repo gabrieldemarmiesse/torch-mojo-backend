@@ -495,7 +495,8 @@ def maybe_enqueue_bf16_gemm_nn_v4(
     ctx: DeviceContext,
 ) raises -> Bool:
     """Route an NN GEMM to the persistent clustered v4 kernel if it fits the
-    tall-m aligned regime.  Returns False when the caller must fall back."""
+    aligned regime and fills the persistent grid.  Returns False when the
+    caller must fall back."""
     comptime if _has_sm_9x():
         if ctx.api() == "cuda":
             var cc_major = ctx.get_attribute(
@@ -505,10 +506,10 @@ def maybe_enqueue_bf16_gemm_nn_v4(
                 DeviceAttribute.COMPUTE_CAPABILITY_MINOR
             )
             if cc_major == 9 and cc_minor == 0:
-                # Same tall-m NN regime as the v3 dispatcher.  m may be
-                # ragged (TMA clamps reads, stores are predicated); n and k
-                # must tile exactly.  The ordered bounds make all descriptor
-                # and address products machine-width safe.
+                # Aligned NN regime, any aspect ratio.  m may be ragged (TMA
+                # clamps reads, stores are predicated); n and k must tile
+                # exactly.  The ordered bounds make all descriptor and
+                # address products machine-width safe.
                 if (
                     not transpose_a
                     and not transpose_b
@@ -516,7 +517,6 @@ def maybe_enqueue_bf16_gemm_nn_v4(
                     and m >= _V4_PROD_BM * _V4_PROD_CLUSTER_M
                     and n >= _V4_PROD_BN
                     and k >= _V4_BK
-                    and m // n >= 8
                     and n % _V4_PROD_BN == 0
                     and k % _V4_BK == 0
                     and Int(output) % 16 == 0
@@ -532,7 +532,31 @@ def maybe_enqueue_bf16_gemm_nn_v4(
                     var sm_count = ctx.get_attribute(
                         DeviceAttribute.MULTIPROCESSOR_COUNT
                     )
-                    if sm_count >= _V4_PROD_CLUSTER_M:
+                    # Wave-fill predicate: decline v4 only when the v3
+                    # 64x128 one-CTA-per-tile kernel both (a) accepts the
+                    # shape -- it additionally needs m % 64 == 0, while v4
+                    # tolerates ragged m; without that guard a declined
+                    # ragged-m shape falls through to the far slower wide
+                    # fallback -- and (b) covers the whole output in a
+                    # single wave: each 256x256 macro-tile is eight of its
+                    # 64x128 tiles, so that is total_works * 8 < sm_count
+                    # (strict, mirroring the v3 dispatcher's own
+                    # use_small_tile inequality).  Everything else,
+                    # including deep-K underfilled shapes such as
+                    # 1024x1024x8192, keeps the persistent v4 kernel.
+                    # Empirical device-time crossing, fitted on an H100
+                    # PCIe (114 SMs): at total_works = 14 (3584x256x512)
+                    # v3-small wins 6.95 us vs v4's 10.49 us; at
+                    # total_works = 15 (3840x256x512) the small tile no
+                    # longer fits one wave and v4 wins 10.48 us vs the
+                    # 128x256 fallback's 12.74 us.
+                    var macro_span = _V4_PROD_BM * _V4_PROD_CLUSTER_M
+                    var macro_rows = (m + macro_span - 1) // macro_span
+                    var total_works = macro_rows * (n // _V4_PROD_BN)
+                    var small_tile_covers = (
+                        m % 64 == 0 and total_works * 8 < sm_count
+                    )
+                    if sm_count >= _V4_PROD_CLUSTER_M and not small_tile_covers:
                         _v4_enqueue_nn_persistent[
                             _V4_PROD_STAGES,
                             _V4_PROD_CLUSTER_M,

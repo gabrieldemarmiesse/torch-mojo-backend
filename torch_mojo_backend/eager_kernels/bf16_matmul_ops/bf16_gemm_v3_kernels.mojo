@@ -1389,10 +1389,11 @@ def enqueue_bf16_gemm(
                 # NN dgrad route (v4): persistent warp-specialized kernel
                 # with 2-CTA-cluster B multicast and a TMA-store epilogue
                 # (bf16_gemm_nn_v4_kernels.mojo).  It gates itself on the
-                # same tall-m aligned NN regime (m // n >= 8, n % 256 == 0,
-                # k % 64 == 0; m may be ragged) and returns False for
-                # anything else, in which case the pre-existing NN paths
-                # below remain the fallback.
+                # aligned NN regime (n % 256 == 0, k % 64 == 0; m may be
+                # ragged) and declines only shapes the 64x128 small-tile
+                # route below serves better (m % 64 == 0 and its whole
+                # grid fits one wave); it returns False for those, in
+                # which case the v3 NN paths below remain the fallback.
                 if maybe_enqueue_bf16_gemm_nn_v4(
                     output,
                     a,
@@ -1426,7 +1427,6 @@ def enqueue_bf16_gemm(
                     and m >= _V3_NN_SMALL_BM
                     and n >= _V3_NN_SMALL_BN
                     and k >= _V3_NN_SMALL_BK
-                    and m // n >= 8
                     and m % _V3_NN_SMALL_BM == 0
                     and n % _V3_NN_SMALL_BN == 0
                     and k % _V3_NN_SMALL_BK == 0
@@ -1478,7 +1478,6 @@ def enqueue_bf16_gemm(
                     and m >= _V3_NN_BM
                     and n >= _V3_NN_BN
                     and k >= _V3_NN_BK
-                    and m // n >= 8
                     and m % _V3_NN_BM == 0
                     and n % _V3_NN_BN == 0
                     and k % _V3_NN_BK == 0

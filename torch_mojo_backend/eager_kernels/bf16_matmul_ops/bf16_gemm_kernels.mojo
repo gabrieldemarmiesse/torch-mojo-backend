@@ -1,8 +1,10 @@
 """Candidate H100 BF16 GEMM/BMM built on mma.sync m16n8k16 tensor cores.
 
-Three shared-memory tile regimes (128x128x32, 128x64x32, 64x128x32) serve
-every runtime shape, layout, and batch; the host picks per launch from
-runtime dims only (narrow tiles when one extent is <= 64, wide otherwise).
+Four shared-memory tile regimes (128x128x32, 128x64x32, 64x128x32, 64x64x32)
+serve every runtime shape, layout, and batch; the host picks per launch from
+runtime dims and the SM count only (narrow tiles when one extent is <= 64,
+64x64 when the full tile underfills the GPU but a 64x64 grid still fits one
+wave, wide otherwise).
 Eight warps own 32-row m16n8k16 fragment grids with FP32 accumulators that
 live across the entire K loop; the only BF16 rounding is the single final
 store (plus optional FP32 bias add before it). A two-stage pipeline
@@ -43,7 +45,7 @@ addressing product cannot fit in machine Int.
 from std.collections import InlineArray
 from std.gpu import barrier, block_idx, grid_dim, thread_idx
 from std.gpu.compute.mma import mma
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceAttribute, DeviceContext
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 
@@ -538,13 +540,18 @@ def _gemm_layout_tag[TA: Bool, TB: Bool]() -> StaticString:
 
 @always_inline
 def _gemm_regime_tag[BM: Int, BN: Int]() -> StaticString:
-    comptime if BN == 64:
-        return "_w64"
+    # The 64x64 case must be tested first: testing BN or BM alone is not
+    # injective at (64, 64) and would collide with the _w64 tag.
+    comptime if BM == 64 and BN == 64:
+        return "_s64"
     else:
-        comptime if BM == 64:
-            return "_m64"
+        comptime if BN == 64:
+            return "_w64"
         else:
-            return ""
+            comptime if BM == 64:
+                return "_m64"
+            else:
+                return ""
 
 
 @always_inline
@@ -609,9 +616,13 @@ def _bmm_layout_tag[TA: Bool, TB: Bool]() -> StaticString:
 
 @always_inline
 def _bmm_regime_tag[BM: Int, BN: Int]() -> StaticString:
-    # The three tile regimes: 128x128 unsuffixed, 128x64 narrow-N, 64x128
-    # narrow-M.
-    comptime if BN == 64:
+    # The four tile regimes: 128x128 unsuffixed, 128x64 narrow-N, 64x128
+    # narrow-M, 64x64 small.  The 64x64 case must be tested first: testing
+    # BN or BM alone is not injective at (64, 64) and would collide with
+    # the _w64 tag.
+    comptime if BM == 64 and BN == 64:
+        return "_s64"
+    elif BN == 64:
         return "_w64"
     elif BM == 64:
         return "_m64"
@@ -1150,16 +1161,59 @@ def _fast_proof(
 
 
 @always_inline
-def _pick_regime(m: Int, n: Int) -> Int:
-    # 0: 128x128, 1: 128x64, 2: 64x128. Narrow tiles only where the wide
-    # tile wastes at least half of one extent (small n or small m); the wide
-    # tile's compute-to-traffic ratio wins elsewhere, including long-K
-    # weight-gradient shapes where halving a tile doubles operand re-reads.
+def _pick_regime(m: Int, n: Int, batch_count: Int, sm_count: Int) -> Int:
+    # 0: 128x128, 1: 128x64, 2: 64x128, 3: 64x64. Narrow tiles only where
+    # the wide tile wastes at least half of one extent (small n or small m);
+    # the wide tile's compute-to-traffic ratio wins elsewhere, including
+    # long-K weight-gradient shapes where halving a tile doubles operand
+    # re-reads.
     if n <= 64:
         return 1
     if m <= 64:
         return 2
+    # Small/awkward regime, keyed on shape, batch count, and SM count only:
+    # take 64x64 tiles when the whole 128x128 grid -- blocks per matrix
+    # times the batch count, since batched launches run one grid.z slice
+    # per batch -- cannot fill the GPU (fewer blocks than SMs) AND the
+    # 64x64 grid still fits in a single wave, so the 4x CTA count is pure
+    # occupancy with no extra wave of operand re-reads. Shapes whose 64x64
+    # grid would spill past one wave (e.g. deep-K 1024x1024, or attention
+    # -prefill bmm batches whose per-matrix underfill is already covered by
+    # grid.z) keep the wide tile's better compute-to-traffic ratio. The
+    # non-batched GEMM path passes batch_count=1.
+    # The one-wave bound was fitted on an H100 PCIe (114 SMs).  The
+    # batch_count <= sm_count and _I32_MAX guards keep the block products
+    # far from machine-Int wrap; anything larger fails the Int32 proof and
+    # takes the wide fallback regardless of regime.
+    if (
+        sm_count > 0
+        and batch_count > 0
+        and batch_count <= sm_count
+        and m <= _I32_MAX
+        and n <= _I32_MAX
+    ):
+        var blocks_full = (
+            ((m - 1) // _BM + 1) * ((n - 1) // _BN + 1) * batch_count
+        )
+        var blocks_s64 = ((m - 1) // 64 + 1) * ((n - 1) // 64 + 1) * batch_count
+        if blocks_full < sm_count and blocks_s64 <= sm_count:
+            return 3
     return 0
+
+
+@always_inline
+def _regime_bm(regime: Int) -> Int:
+    # Single source of truth for the regime -> (BM, BN) tile mapping
+    # (0: 128x128, 1: 128x64, 2: 64x128, 3: 64x64), shared by the runtime
+    # dispatch prologues and the comptime instantiation ladders so the two
+    # cannot drift apart.
+    return 64 if (regime == 2 or regime == 3) else 128
+
+
+@always_inline
+def _regime_bn(regime: Int) -> Int:
+    # See _regime_bm: the BN half of the shared regime -> tile mapping.
+    return 64 if (regime == 1 or regime == 3) else 128
 
 
 @always_inline
@@ -1384,9 +1438,10 @@ def enqueue_bf16_gemm(
     var b_fast = _b_fast_flag(n, k, transpose_b)
     var c_pair = 1 if n % 2 == 0 else 0
     var hb = 1 if has_bias else 0
-    var regime = _pick_regime(m, n)
-    var bm = 64 if regime == 2 else 128
-    var bn = 64 if regime == 1 else 128
+    var sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var regime = _pick_regime(m, n, 1, sm_count)
+    var bm = _regime_bm(regime)
+    var bn = _regime_bn(regime)
     # The Int32 kernels are legal only under the machine-width proof; a zero
     # grid means some narrowed value could wrap, so route to the full-width
     # fallback instead.
@@ -1425,9 +1480,9 @@ def enqueue_bf16_gemm(
     comptime for fi in range(2):
         comptime FASTK = fi == 1
         if fastk == FASTK:
-            comptime for ri in range(3):
-                comptime BM = 64 if ri == 2 else 128
-                comptime BN = 64 if ri == 1 else 128
+            comptime for ri in range(4):
+                comptime BM = _regime_bm(ri)
+                comptime BN = _regime_bn(ri)
                 if bm == BM and bn == BN:
                     comptime for li in range(4):
                         comptime TA = li >= 2
@@ -1471,9 +1526,10 @@ def enqueue_bf16_bmm(
     var a_fast = _a_fast_flag(m, k, transpose_a)
     var b_fast = _b_fast_flag(n, k, transpose_b)
     var c_pair = 1 if n % 2 == 0 else 0
-    var regime = _pick_regime(m, n)
-    var bm = 64 if regime == 2 else 128
-    var bn = 64 if regime == 1 else 128
+    var sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var regime = _pick_regime(m, n, batch_count, sm_count)
+    var bm = _regime_bm(regime)
+    var bn = _regime_bn(regime)
     var grid_x = 0
     var grid_z = 0
     var opt_ok = False
@@ -1545,9 +1601,9 @@ def enqueue_bf16_bmm(
     # else-catch-all: anything that is not the narrow-N or narrow-M regime
     # runs the 128x128 tiles.
     @parameter
-    for RI in range(3):
-        comptime BM = 64 if RI == 2 else 128
-        comptime BN = 64 if RI == 1 else 128
+    for RI in range(4):
+        comptime BM = _regime_bm(RI)
+        comptime BN = _regime_bn(RI)
 
         @parameter
         for FI in range(2):
