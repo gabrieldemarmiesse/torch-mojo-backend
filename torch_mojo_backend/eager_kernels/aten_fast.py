@@ -1933,10 +1933,11 @@ def _spec_matmul_out_shape(
     Operand layout is deliberately not checked here.  ``TensorSpec`` carries
     shape and strides, and `_matmul_spec_operands_launch` covers all four
     layout combinations: it routes a strided operand to a copy-free kernel
-    where one exists for the target (the gfx942 TN MFMA route reads a
-    transposed weight-gradient A in place, and Apple has the TA route) and
-    materializes a scratch copy otherwise.  Declining strided operands here
-    would strand those routes and force a transpose the kernel does not need.
+    where one exists for the target (the gfx942 TN MFMA route and the NVIDIA
+    sm_90 strict-fp32 TN route both read a transposed weight-gradient A in
+    place, and Apple has the TA route) and materializes a scratch copy
+    otherwise.  Declining strided operands here would strand those routes and
+    force a transpose the kernel does not need.
     """
     a = ts[0]
     b = ts[1]
@@ -4970,6 +4971,16 @@ def fast_aten__log_softmax_backward_data(
             return NOT_HANDLED
         work_dim = 1
         restore_shape = grad._shape
+
+    if grad._dtype in (DType.float16, DType.bfloat16):
+        # Reduced-precision inputs compute in fp32 and round once at the final
+        # cast, like the fused GPU kernel and the ATen reference. Composing in
+        # bf16 rounds three intermediates (rowsum, exp, addcmul) and the
+        # compounded error can reach tens of bf16 ulps on ~normal inputs.
+        work_grad = _cast_tensor(work_grad, DType.float32)
+        work_output = _cast_tensor(work_output, DType.float32)
+        if summed is not None:
+            summed = _cast_tensor(summed, DType.float32)
 
     if summed is None:
         summed = fast_aten_sum(work_grad, dim=[work_dim], keepdim=True)

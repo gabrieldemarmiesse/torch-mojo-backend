@@ -1928,7 +1928,12 @@ def test_aten__log_softmax_backward_data_autograd(
 
     x = torch.randn(shape, dtype=dtype)
     grad_output = torch.randn(shape, dtype=dtype)
-    tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-3
+    # bf16 mismatch is dominated by the CPU reference's own rounding: a 1-ulp
+    # wobble in its forward output scales with |rowsum(grad_output)|, which is
+    # unbounded for unseeded inputs (worst mismatch ~0.04 over 2000 seeds while
+    # our side stays within 1 ulp of the fp64 ground truth; a broken backward
+    # shows O(1) errors).
+    tolerance = 6e-2 if dtype == torch.bfloat16 else 2e-3
     check_outputs(fn, conf, [x, grad_output], atol=tolerance, rtol=tolerance)
 
 
