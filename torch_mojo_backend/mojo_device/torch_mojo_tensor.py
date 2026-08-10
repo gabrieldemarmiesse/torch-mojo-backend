@@ -2,6 +2,7 @@ import functools
 import math
 import sys
 import threading
+import warnings
 from collections import deque
 from pathlib import Path
 from typing import ClassVar, Protocol, runtime_checkable
@@ -53,11 +54,14 @@ _PENDING_D2H_LOCK = threading.Lock()
 _FAILED_TRANSFER_OWNERS: dict[max.driver.Device, list[tuple[object, object]]] = {}
 _FAILED_TRANSFER_OWNERS_LOCK = threading.Lock()
 
-# PyTorch's Python PrivateUse1 guard currently advertises one C++ autograd
-# device queue, at index zero. Keep the storage-less wrapper TensorImpl on that
-# bookkeeping device, as ``_acc.create_empty_tensor`` did. ``_torch_device`` and
-# the public ``device`` property continue to carry the real Mojo device.
-_WRAPPER_TENSORIMPL_DEVICE = torch.device("privateuseone:0")
+# The storage-less wrapper TensorImpl carries the tensor's real device index
+# (``privateuseone:i``): C++ consumers that read the TensorImpl device — most
+# importantly DDP's Reducer, which allocates its gradient buckets from
+# ``params[0].options()`` — must land on the tensor's actual GPU, not a
+# phantom index zero. PyTorch's Python PrivateUse1 guard advertises a single
+# autograd device queue, so with more than one accelerator ``register.py``
+# turns off autograd engine multithreading (backward then runs on the calling
+# thread, which never touches the per-device queues).
 
 
 def _ctx_ptr(device):
@@ -236,10 +240,10 @@ def _alloc_with_recovery(
             raise
         sys.stderr.write(
             f"torch-mojo-backend: device allocation of {nbytes} bytes failed; "
-            f"draining {len(call_queue._QUEUE)} queued launch(es), "
-            "synchronizing, and retrying once...\n"
+            f"draining {len(call_queue.shard_for(device).queue)} queued "
+            "launch(es), synchronizing, and retrying once...\n"
         )
-        call_queue.drain()
+        call_queue.drain(device)
         device.default_stream.synchronize()
         return holder_mod.alloc(ctx_ptr, nbytes)
 
@@ -351,6 +355,7 @@ class TorchMojoTensor(torch.Tensor):
     ) -> "TorchMojoTensor":
         shape = tuple(shape)
         strides = tuple(strides)
+        torch_device = _torch_device_of(device)
         res = torch.Tensor._make_wrapper_subclass(
             cls,
             shape,
@@ -358,7 +363,7 @@ class TorchMojoTensor(torch.Tensor):
             storage_offset=offset,
             dtype=_torch_dtype_of(dtype),
             layout=torch.strided,
-            device=_WRAPPER_TENSORIMPL_DEVICE,
+            device=torch_device,
             requires_grad=False,
         )
         res._holder = holder
@@ -370,7 +375,7 @@ class TorchMojoTensor(torch.Tensor):
         res._itemsize = dtype.size_in_bytes
         res._numel = math.prod(shape)
         res._device = device
-        res._torch_device = _torch_device_of(device)
+        res._torch_device = torch_device
         res._is_contiguous = (
             _compute_contiguous(shape, strides) if contiguous is None else contiguous
         )
@@ -464,10 +469,11 @@ class TorchMojoTensor(torch.Tensor):
         from . import deferred_compile
 
         src = self if self._is_contiguous else self._materialize_contiguous()
-        # Reading device bytes is a host read: every queued launch must have
-        # executed before the transfer is enqueued -- INCLUDING the strided
-        # materialization just queued above, whose output is what this reads.
-        deferred_compile.drain()
+        # Reading device bytes is a host read: every queued launch on THIS
+        # device must have executed before the transfer is enqueued --
+        # INCLUDING the strided materialization just queued above, whose
+        # output is what this reads.
+        deferred_compile.drain(src._device)
         if src._numel == 0:
             return torch.empty(self._shape, dtype=max_dtype_to_torch(self._dtype))
 
@@ -538,7 +544,7 @@ class TorchMojoTensor(torch.Tensor):
         from . import deferred_compile
 
         src = self._contig()
-        deferred_compile.drain()
+        deferred_compile.drain(src._device)
         return dlpack.make_capsule(
             src._holder, src._ptr, src._shape, src._dtype, src._device
         )
@@ -738,7 +744,9 @@ def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
         dst._itemsize,
         _ctx_ptr(dst._device),
     )
-    _cq.external_call(holder.CopyStrided, args, keepalive=(dst, src))
+    _cq.external_call(
+        holder.CopyStrided, args, keepalive=(dst, src), device=dst._device
+    )
 
 
 def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
@@ -764,6 +772,12 @@ def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     )
 
 
+# Whether direct GPU-to-GPU memory access is enabled between every GPU pair.
+# Set once by get_ordered_accelerators(); cross-device copies fall back to a
+# host bounce when False.
+_peer_access_enabled = False
+
+
 @functools.cache
 def get_ordered_accelerators():
     """Get accelerators ordered with GPUs first, then CPU last"""
@@ -775,8 +789,34 @@ def get_ordered_accelerators():
     gpu_accelerators = [acc for acc in accelerators if acc.label == "gpu"]
     cpu_accelerators = [acc for acc in accelerators if acc.label == "cpu"]
 
+    global _peer_access_enabled
+    if len(gpu_accelerators) >= 2:
+        try:
+            if all(
+                a.can_access(b)
+                for a in gpu_accelerators
+                for b in gpu_accelerators
+                if a is not b
+            ):
+                max.driver.enable_all_peer_access()
+                _peer_access_enabled = True
+            else:
+                warnings.warn(
+                    "peer-to-peer access is not available between all GPU "
+                    "pairs; cross-device mojo copies will bounce through "
+                    "host memory"
+                )
+        except Exception as exc:
+            warnings.warn(f"could not enable GPU peer-to-peer access: {exc}")
+
     # Order: GPUs first, then CPU last
     return gpu_accelerators + cpu_accelerators
+
+
+def peer_access_enabled() -> bool:
+    """Whether every GPU pair has direct peer memory access enabled."""
+    get_ordered_accelerators()
+    return _peer_access_enabled
 
 
 def find_equivalent_max_device(device: torch.device) -> max.driver.Device:

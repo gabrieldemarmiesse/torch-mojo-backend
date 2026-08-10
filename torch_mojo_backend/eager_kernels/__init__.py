@@ -30,6 +30,7 @@ process), so it is always built complete and never escalated — which also
 means direct references to its functions stay valid forever.
 """
 
+import errno
 import fcntl
 import hashlib
 import importlib.machinery
@@ -571,6 +572,29 @@ def _announce_build() -> None:
     )
 
 
+def _flock_with_retry(lock_file: object, deadline_seconds: float = 120.0) -> None:
+    """flock that rides out transient NFS 'No locks available' errors.
+
+    Concurrent builder threads (and rank threads of single-process data
+    parallelism hitting a cold cache) each hold their own lock file; stacking
+    flock calls on an NFS home directory can exhaust its lock service
+    (ENOLCK), which is transient — back off and retry instead of failing the
+    build."""
+    start = time.monotonic()
+    delay = 0.05
+    while True:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            return
+        except OSError as exc:
+            if exc.errno != errno.ENOLCK:
+                raise
+            if time.monotonic() - start > deadline_seconds:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 2.0)
+
+
 def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
     """Compile one immutable defined extension and return its cache path."""
     out = _extension_path(src, defines)
@@ -578,7 +602,7 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
         return out
     _CACHE_DIR.mkdir(exist_ok=True)
     with open(_CACHE_DIR / f".{out.stem}.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock_with_retry(lock)
         if out.is_file():
             return out
         scope = "full" if defines is None else dict(defines).get("OP", "defined")
@@ -657,6 +681,61 @@ def _ensure_tensor_holder() -> ModuleType:
             _TENSOR_HOLDER.append(exc)
             raise
         _TENSOR_HOLDER.append(module)
+        return module
+
+
+def preload_tensor_holder_if_cached() -> None:
+    """Load ``tensor_holder`` now if (and only if) its .so is already cached
+    — a ~50ms dlopen, never a compile.
+
+    Workaround for the pinned MAX nightly: importing ``max.nn`` before any
+    mojo-built CPython extension has been dlopened leaves the process in a
+    state where every later extension load segfaults inside its ``PyInit``
+    (``PyModule_Create`` fails and the bindings hand the NULL module to
+    ``PyModule_AddFunctions``). Loading one extension first pins the
+    runtime and every later load works, so ``torch_mojo_backend.__init__``
+    calls this before anything can import ``max.nn``. A cold cache skips
+    the preload rather than block the import on a ~15s build — the SDPA
+    accessor that performs the only ``max.nn`` import in this package
+    forces ``_ensure_tensor_holder()`` first instead. See
+    upstream_issues/modular-5-max-nn-import-breaks-mojo-extension-load.md.
+    """
+    if _TENSOR_HOLDER:
+        return
+    source = _PACKAGE_DIR / "tensor_holder.mojo"
+    if _extension_path(source, None).is_file():
+        _ensure_tensor_holder()
+
+
+_COMM_OPS_LOCK = threading.Lock()
+_COMM_OPS: list[ModuleType | BaseException] = []
+
+
+def _ensure_comm_ops() -> ModuleType:
+    """Load the multi-GPU collective extension (`comm_ops.mojo`).
+
+    Ungated and loaded exactly once, like `tensor_holder`: it registers the
+    process-wide `CommStream`/`CommWork` Python types, and a second
+    `add_type` of the same name aborts the process. Its entry points are
+    module-level functions (not one gated `call`), so it is always built
+    complete.
+    """
+    with _COMM_OPS_LOCK:
+        if _COMM_OPS:
+            loaded = _COMM_OPS[0]
+            if isinstance(loaded, BaseException):
+                raise loaded
+            return loaded
+        _ensure_tensor_holder()
+        source = _PACKAGE_DIR / "comm_ops.mojo"
+        try:
+            module = _load_extension(
+                _variant_module_name(source, None), _build_extension(source, None)
+            )
+        except BaseException as exc:
+            _COMM_OPS.append(exc)
+            raise
+        _COMM_OPS.append(module)
         return module
 
 
@@ -824,16 +903,47 @@ class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
         self,
         extension_args: tuple[object, ...],
         keepalive: tuple[object, ...],
+        device: object = None,
         loader: MojoExtensionLoader | None = None,
     ) -> None:
         """Queue a non-returning `call(..., out)` into preallocated outputs.
 
         `keepalive` names the objects whose buffers `extension_args`'
         raw pointers reference; the queued item retains them until it
-        launches (queue rule 3)."""
+        launches (queue rule 3). `device` selects the per-device queue
+        shard; when None it is derived from the keepalive — the first
+        payload's `._device` is the launch device at every enqueue site
+        (out/dst/self first, by the descriptors' own argument order)."""
         selected_loader = loader or MOJO_EXTENSION_LOADER
         unit = selected_loader.unit_canonical(self.extension.MOJO_FILE, self.defines)
-        call_queue.kernel_call_into(unit, extension_args, keepalive)
+        if device is None:
+            device = _device_of_keepalive(keepalive)
+        call_queue.kernel_call_into(unit, extension_args, keepalive, device)
+
+
+def _device_of_keepalive(keepalive: object) -> object:
+    """The launch device named by an enqueue's keep-alive.
+
+    Every payload wrapper carries `._device` (the same objects
+    `_keepalive_bytes` walks for `_numel`), and every enqueue site lists
+    the tensor the call launches on first — the allocated output on the
+    spec route, dst/self/q on the raw routes — so the first `._device`
+    found IS the device whose context the raw args reference. Raising on
+    a keepalive with no payload is deliberate: an enqueue whose device
+    cannot be named must say it explicitly (queue rule 6).
+    """
+    stack = [keepalive]
+    while stack:
+        entry = stack.pop()
+        found = getattr(entry, "_device", None)
+        if found is not None:
+            return found
+        if isinstance(entry, tuple | list):
+            stack.extend(reversed(entry))
+    raise ValueError(
+        "enqueue keepalive names no tensor with a ._device; pass device= "
+        "explicitly at this call site"
+    )
 
 
 class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
@@ -1094,6 +1204,10 @@ def __getattr__(name: str) -> object:
         holder = _ensure_tensor_holder()
         globals()[name] = holder
         return holder
+    if name == "comm_ops":
+        module = _ensure_comm_ops()
+        globals()[name] = module
+        return module
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

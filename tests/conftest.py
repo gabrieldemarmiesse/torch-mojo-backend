@@ -1,6 +1,9 @@
+import fcntl
+import importlib.metadata
 import math
 import os
 from collections.abc import Callable
+from pathlib import Path
 
 os.environ["MODULAR_TELEMETRY_ENABLED"] = "0"
 os.environ["MAX_USE_EAGER_INTERPRETER"] = "1"
@@ -24,9 +27,67 @@ from torch_mojo_backend.torch_compile_backend import compiler
 
 os.environ["TORCH_MOJO_BACKEND_VERBOSE"] = "1"
 
+
 # TODO: remove this when
 # https://github.com/modular/modular/issues/5495 is fixed
-compiler.paths_to_mojo_kernels[0] = _build_mojo_source_package(
+def _mojo_source_package_stamp(source: Path) -> str:
+    """Identity of one precompiled source package: toolchain + sources."""
+    import hashlib
+
+    try:
+        toolchain = importlib.metadata.version("mojo-compiler")
+    except importlib.metadata.PackageNotFoundError:
+        toolchain = "unknown"
+    digest = hashlib.sha256(toolchain.encode())
+    for path in sorted(source.rglob("*.mojo")):
+        info = path.stat()
+        digest.update(
+            f"{path.relative_to(source)}:{info.st_mtime_ns}:{info.st_size}".encode()
+        )
+    return digest.hexdigest()
+
+
+def _build_mojo_source_package_once(source: Path) -> Path:
+    """`_build_mojo_source_package` with the concurrency it is missing.
+
+    Upstream precompiles to one fixed path derived from the SOURCE PATH
+    hash only — no content or toolchain identity, no lock, no atomic
+    rename — and rebuilds unconditionally. Under pytest-xdist every worker
+    rewrites the same .mojoc while other workers' engine sessions import
+    it, which surfaces as "MAXG_addKernelPackage: failed to import
+    kernels" on a torn read; after a nightly bump, a node's stale package
+    is equally torn between toolchains. Serialize builders with an flock
+    and rebuild only when the sidecar stamp (toolchain + source mtimes)
+    does not match, so exactly one worker builds and everyone else reuses.
+    """
+    stamp = _mojo_source_package_stamp(source)
+    lock_path = (
+        Path(os.environ.get("TMPDIR", "/tmp")) / f".modular_{os.getuid()}_mojo_pkg.lock"
+    )
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        import hashlib
+        import tempfile
+
+        path_hash = hashlib.md5(str(source.absolute()).encode()).hexdigest()
+        package = (
+            Path(tempfile.gettempdir())
+            / f".modular_{os.getuid()}"
+            / "mojo_pkg"
+            / f"mojo_pkg_{path_hash}.mojoc"
+        )
+        sidecar = Path(str(package) + ".stamp")
+        try:
+            if package.exists() and sidecar.read_text() == stamp:
+                return package
+        except OSError:
+            pass
+        built = _build_mojo_source_package(source)
+        sidecar.write_text(stamp)
+        return built
+
+
+compiler.paths_to_mojo_kernels[0] = _build_mojo_source_package_once(
     compiler.paths_to_mojo_kernels[0]
 )
 

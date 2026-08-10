@@ -11,6 +11,7 @@ import itertools
 import math
 import operator
 import os
+from collections.abc import Callable
 from typing import Literal
 
 import max.driver as max_driver
@@ -23,8 +24,6 @@ from max.experimental.random import gaussian as max_gaussian
 from max.experimental.torch.torch import max_device_ref, torch_dtype_to_max
 from max.graph import Dim, StaticDim
 from max.graph.type import DeviceRef
-from max.nn.attention import MHAMaskVariant
-from max.nn.kernels import flash_attention_gpu
 from torch._decomp import core_aten_decompositions
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.ops import aten
@@ -35,7 +34,33 @@ from torch_mojo_backend.flags import verbose_enabled
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import get_ordered_accelerators
 from torch_mojo_backend.types import MaxTensor, Scalar, SymIntType
 
-flash_attention_gpu = F.functional(flash_attention_gpu)
+_MAX_NN_FLASH_ATTENTION: list[tuple[type, Callable]] = []
+
+
+def _max_nn_flash_attention() -> "tuple[type, Callable]":
+    """``(MHAMaskVariant, functional flash_attention_gpu)``, imported on
+    first SDPA use.
+
+    ``max.nn`` must not be imported at module scope: on the pinned nightly,
+    importing it before any mojo-built CPython extension has been dlopened
+    leaves the process in a state where every later extension load
+    segfaults inside its ``PyInit`` (see upstream_issues/
+    modular-5-max-nn-import-breaks-mojo-extension-load.md). Loading one
+    extension first pins the runtime, so this accessor forces
+    ``tensor_holder`` resident before touching ``max.nn``.
+    """
+    if not _MAX_NN_FLASH_ATTENTION:
+        from torch_mojo_backend.eager_kernels import _ensure_tensor_holder
+
+        _ensure_tensor_holder()
+        from max.nn.attention import MHAMaskVariant
+        from max.nn.kernels import flash_attention_gpu
+
+        _MAX_NN_FLASH_ATTENTION.append(
+            (MHAMaskVariant, F.functional(flash_attention_gpu))
+        )
+    return _MAX_NN_FLASH_ATTENTION[0]
+
 
 # MAX made the `functional` reduction helpers (mean/sum/argmax/argmin and the
 # reduction forms of max/min) eager-only: they assert their input is an eager
@@ -566,7 +591,10 @@ def aten__scaled_dot_product_flash_attention(
         scale = 1.0 / math.sqrt(float(head_dim_value))
 
     # Choose mask variant based on is_causal flag
-    mask_variant = MHAMaskVariant.CAUSAL_MASK if is_causal else MHAMaskVariant.NULL_MASK
+    mha_mask_variant, flash_attention_gpu = _max_nn_flash_attention()
+    mask_variant = (
+        mha_mask_variant.CAUSAL_MASK if is_causal else mha_mask_variant.NULL_MASK
+    )
 
     # Flash attention kernels are currently only valid on GPU. Use a fake matmul-based
     # implementation on CPU to keep correctness on CPU-backed execution.

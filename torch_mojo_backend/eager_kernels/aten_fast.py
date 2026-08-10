@@ -93,9 +93,13 @@ def _device_call(fn: object, *args: object, keepalive: tuple[object, ...]) -> ob
     """Launch an ungated device call (tensor_holder / fa4): when the call
     queue is active it must hold its FIFO position behind queued producers
     of its inputs; otherwise call directly. `keepalive` names the tensors
-    whose buffers the raw `args` reference (queue rule 3)."""
+    whose buffers the raw `args` reference (queue rule 3); its first
+    payload's device selects the queue shard — dst/self/q first at every
+    call site, matching the context the call launches on."""
     if _call_queue.enabled():
-        return _call_queue.external_call(fn, args, keepalive)
+        return _call_queue.external_call(
+            fn, args, keepalive, eager_kernels._device_of_keepalive(keepalive)
+        )
     return fn(*args)
 
 
@@ -3389,6 +3393,28 @@ def fast_aten_alias(tensor):
 
 
 fast_aten_detach = fast_aten_alias
+
+
+def fast_aten_as_strided(tensor, size, stride, storage_offset=None):
+    t = _t(tensor)
+    if t is None or not isinstance(size, list | tuple):
+        return NOT_HANDLED
+    if not isinstance(stride, list | tuple) or len(size) != len(stride):
+        return NOT_HANDLED
+    sizes = tuple(int(s) for s in size)
+    strides = tuple(int(s) for s in stride)
+    if any(s < 0 for s in sizes) or any(s < 0 for s in strides):
+        return NOT_HANDLED
+    offset = t._offset if storage_offset is None else int(storage_offset)
+    if offset < 0:
+        return NOT_HANDLED
+    # The requested window must stay inside the owning allocation.
+    capacity = int(t._holder.get_nbytes()) // t._itemsize
+    if math.prod(sizes) > 0:
+        last = offset + sum((sz - 1) * st for sz, st in zip(sizes, strides))
+        if last + 1 > capacity:
+            return NOT_HANDLED
+    return _view_of(t, sizes, strides, offset)
 
 
 def fast_aten_permute(input, dims):
@@ -8134,7 +8160,8 @@ def fast_aten__local_scalar_dense(tensor):
     t = _t(tensor)
     if t is None or t._numel != 1:
         return NOT_HANDLED
-    _call_queue.drain()  # host read: queued launches must land first
+    # Host read: this device's queued launches must land first.
+    _call_queue.drain(t._device)
     return eager_kernels.tensor_holder.read_scalar(
         _ctx_ptr(t._device), t._ptr, t._dtype.value
     )

@@ -4,7 +4,19 @@ import torch
 
 from ..torch_compile_backend.utils import get_accelerators
 
-_current_device = 0
+
+class _CurrentDevice(threading.local):
+    """Per-thread current mojo device index.
+
+    Thread-local (like torch.cuda's TLS current device) so that each rank
+    thread of single-process data parallelism can pin itself to its own
+    device without racing the other ranks' dispatch.
+    """
+
+    index: int = 0
+
+
+_current_device = _CurrentDevice()
 _UINT64_MASK = (1 << 64) - 1
 _DEFAULT_RNG_SEED = 67_280_421_310_721
 _rng_default_seed = _DEFAULT_RNG_SEED
@@ -29,14 +41,16 @@ def _normalize_rng_seed(seed) -> int:
 
 def _rng_device_index(device=None) -> int:
     if device is None:
-        index = _current_device
+        index = _current_device.index
     elif isinstance(device, int):
         index = device
     else:
         torch_device = torch.device(device)
         if torch_device.type != "mojo":
             raise ValueError(f"expected a mojo RNG device, got {torch_device}")
-        index = _current_device if torch_device.index is None else torch_device.index
+        index = (
+            _current_device.index if torch_device.index is None else torch_device.index
+        )
     if index < 0 or index >= device_count():
         raise ValueError(f"Invalid device index {index}")
     return index
@@ -104,19 +118,29 @@ def is_available():
     return True
 
 
+# Data attribute mirroring torch.cuda._initialized, which torch reads as
+# `getattr(device_module, "_initialized", False)` — NOT via is_initialized().
+# torch.utils.checkpoint (both reentrant and non-reentrant paths) only saves
+# and restores device RNG state around recomputation when this is truthy;
+# without it, a checkpointed model with dropout silently recomputes with a
+# fresh mask and trains on wrong gradients. This backend has no lazy init
+# (RNG state is host-side and devices need no setup), so True from import
+# time is exact.
+_initialized = True
+
+
 def is_initialized():
     return True
 
 
 def current_device():
-    return _current_device
+    return _current_device.index
 
 
 def set_device(device_idx: int):
-    global _current_device
     if device_idx < 0 or device_idx >= device_count():
         raise ValueError(f"Invalid device index {device_idx}")
-    _current_device = device_idx
+    _current_device.index = device_idx
 
 
 class device:
@@ -136,24 +160,24 @@ class device:
         self.idx = -1 if torch_device.index is None else torch_device.index
 
     def __enter__(self) -> None:
-        self.prev_idx = _current_device
-        if self.idx >= 0 and self.idx != _current_device:
+        self.prev_idx = _current_device.index
+        if self.idx >= 0 and self.idx != _current_device.index:
             set_device(self.idx)
 
     def __exit__(self, *exc_info: object) -> bool:
-        if self.idx >= 0 and self.prev_idx != _current_device:
+        if self.idx >= 0 and self.prev_idx != _current_device.index:
             set_device(self.prev_idx)
         return False
 
 
 def _resolve_sync_device(device: "int | str | torch.device | None") -> torch.device:
     if device is None:
-        return torch.device(f"mojo:{_current_device}")
+        return torch.device(f"mojo:{_current_device.index}")
     if isinstance(device, int):
         return torch.device(f"mojo:{device}")
     torch_device = torch.device(device)
     if torch_device.type == "mojo" and torch_device.index is None:
-        return torch.device(f"mojo:{_current_device}")
+        return torch.device(f"mojo:{_current_device.index}")
     return torch_device
 
 
@@ -188,11 +212,19 @@ def synchronize(device: "int | str | torch.device | None" = None) -> None:
     """Public: wait for work and release completed asynchronous transfer
     owners. Pending kernel launches count as work, so the queue drains
     first — a caller of ``torch.mojo.synchronize()`` is entitled to assume
-    every op it issued has actually run on the device."""
+    every op it issued has actually run on the device. Only the named
+    device's shard drains (like ``torch.cuda.synchronize``, this is a
+    per-device barrier): one rank synchronizing must not wait out another
+    rank's compile storm."""
     from . import deferred_compile
 
-    deferred_compile.drain()
-    _device_synchronize(device)
+    resolved = _resolve_sync_device(device)
+    deferred_compile.drain(
+        resolved.index
+        if resolved.type == "mojo" and resolved.index is not None
+        else None
+    )
+    _device_synchronize(resolved)
 
 
 def get_amp_supported_dtype():

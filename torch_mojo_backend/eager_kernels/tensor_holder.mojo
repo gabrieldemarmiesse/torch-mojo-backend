@@ -353,6 +353,30 @@ def _copy_d2d_raw(
         ctx.synchronize()
 
 
+def copy_d2d_peer(
+    dst_ctx_ptr: PythonObject,
+    dst_ptr: PythonObject,
+    src_ctx_ptr: PythonObject,
+    src_ptr: PythonObject,
+    nbytes: PythonObject,
+) raises:
+    """Device-to-device copy across two GPU contexts (peer access enabled).
+
+    Enqueued on the destination context; the AsyncRT DtoD path inserts the
+    events that order the copy against both devices' default streams, so a
+    later stream-ordered free of the source allocation cannot run before the
+    copy has read it, and later destination-stream kernels observe the data.
+    """
+    var n = Int(py=nbytes)
+    if n == 0:
+        return
+    var dst_ctx = _get_ctx(dst_ctx_ptr)
+    var src_ctx = _get_ctx(src_ctx_ptr)
+    var dst = _wrap_raw(dst_ctx, Int(py=dst_ptr), n)
+    var src = _wrap_raw(src_ctx, Int(py=src_ptr), n)
+    dst_ctx.enqueue_copy(dst, src)
+
+
 def _copy_d2d_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -652,6 +676,7 @@ def PyInit_tensor_holder() abi("C") -> PythonObject:
         m.def_function[copy_to_host]("copy_to_host")
         m.def_function[copy_to_pinned_host]("copy_to_pinned_host")
         m.def_function[copy_d2d]("copy_d2d")
+        m.def_function[copy_d2d_peer]("copy_d2d_peer")
         m.def_py_c_function(
             _copy_d2d_dispatcher,
             "CopyD2D",

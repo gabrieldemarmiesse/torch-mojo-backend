@@ -338,6 +338,57 @@ def test_fast_view_aliases_storage(mojo_device):
     torch.testing.assert_close(v.cpu(), torch.ones(16))
 
 
+def test_fast_as_strided_matches_cpu(mojo_device):
+    x = torch.arange(24, dtype=torch.float32)
+    dev = x.to(mojo_device)
+    for size, stride, offset in [
+        ((3, 4), (4, 1), 0),
+        ((2, 3), (1, 2), 5),
+        ((4,), (0,), 7),
+        ((2, 2, 2), (8, 2, 1), 2),
+        ((0, 3), (3, 1), 0),
+    ]:
+        expected = torch.as_strided(x, size, stride, offset)
+        actual = torch.as_strided(dev, size, stride, offset)
+        assert actual.shape == expected.shape
+        torch.testing.assert_close(actual.contiguous().cpu(), expected.contiguous())
+
+
+def test_fast_as_strided_aliases_storage(mojo_device):
+    """as_strided views alias: DDP's Reducer reads gradients through them."""
+    base = torch.zeros(8).to(mojo_device)
+    window = torch.as_strided(base, (2, 2), (2, 1), 1)
+    base.fill_(3.0)
+    torch.testing.assert_close(window.cpu(), torch.full((2, 2), 3.0))
+
+
+def test_fast_as_strided_rejects_out_of_bounds(mojo_device):
+    base = torch.zeros(8).to(mojo_device)
+    with pytest.raises(NotImplementedError):
+        torch.as_strided(base, (3, 3), (3, 1), 2)
+
+
+def test_fast_as_strided_backward_non_overlapping(mojo_device):
+    x_cpu = torch.arange(8, dtype=torch.float32, requires_grad=True)
+    x = x_cpu.detach().to(mojo_device).requires_grad_(True)
+    torch.as_strided(x, (2, 2), (4, 1), 1).sum().backward()
+    torch.as_strided(x_cpu, (2, 2), (4, 1), 1).sum().backward()
+    torch.testing.assert_close(x.grad.cpu(), x_cpu.grad)
+
+
+def test_fast_as_strided_overlapping_grad_rejected_at_forward(mojo_device):
+    """Overlapping-view backward needs index_add_ (unimplemented); a raise
+    inside a backward node would abort the process, so the recording is
+    rejected at forward time with a catchable error."""
+    x = torch.arange(8, dtype=torch.float32).to(mojo_device).requires_grad_(True)
+    with pytest.raises(NotImplementedError, match="overlap"):
+        torch.as_strided(x, (3, 3), (1, 1), 0)
+    # Without grad recording the same geometry is fine.
+    with torch.no_grad():
+        view = torch.as_strided(x, (3, 3), (1, 1), 0)
+    assert view.shape == (3, 3)
+
+
 @pytest.mark.parametrize("dims", [(0, 1), (1, 2), (-1, -2)])
 def test_fast_transpose(mojo_device, dims, monkeypatch):
     target = ("data_movement_ops.mojo", "PermuteCopy")

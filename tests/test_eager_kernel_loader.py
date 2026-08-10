@@ -2,7 +2,6 @@
 
 import inspect
 import subprocess
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -422,10 +421,8 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
             return unit
 
     queue = eager_kernels.call_queue
-    monkeypatch.setattr(queue, "_QUEUE", deque())
-    monkeypatch.setattr(queue, "_HELD_ERROR", [])
-    monkeypatch.setattr(queue, "_DEVICE_THREAD", [None])
-    monkeypatch.setattr(queue, "_QUEUE_LAUNCH_THREAD", [None])
+    monkeypatch.setattr(queue, "_SHARDS", {})
+    monkeypatch.setattr(queue, "_SHARD_SNAPSHOT", ())
 
     loader = FakeLoader()
     first = _ElementwiseAdd.prepare(
@@ -434,8 +431,8 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
     second = _ElementwiseAdd.prepare(
         _TensorMetadata((9,), "float32"), _TensorMetadata((9,), "float32")
     )
-    first.enqueue_into(("first",), (), loader)
-    second.enqueue_into(("second",), (), loader)
+    first.enqueue_into(("first",), (), 0, loader)
+    second.enqueue_into(("second",), (), 0, loader)
     assert queue.active()
 
     module = ModuleType("queued_elementwise_add")

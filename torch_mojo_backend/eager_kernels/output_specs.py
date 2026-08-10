@@ -55,6 +55,20 @@ def _allocate_output_spec(spec: _TensorOutputSpec) -> torch.Tensor:
     return _alloc(spec.shape, spec.dtype, spec.device)
 
 
+def _spec_device(specs: object) -> Device | None:
+    """The device of the first `_TensorOutputSpec` in a spec container —
+    the device the queued launch targets, known by contract before any
+    output is allocated."""
+    stack = [specs]
+    while stack:
+        entry = stack.pop()
+        if isinstance(entry, _TensorOutputSpec):
+            return entry.device
+        if isinstance(entry, tuple | list):
+            stack.extend(reversed(entry))
+    return None
+
+
 def _submit_prepared_into(
     prepared: "eager_kernels.PreparedExtensionCall[_Specs, _Result]",
     *,
@@ -66,7 +80,9 @@ def _submit_prepared_into(
     whatever container ``extension_args`` accepts as its ``out``.
     """
     if force_sync and _call_queue.enabled():
-        _call_queue.drain()
+        # Synchronous execution must not overtake queued producers of its
+        # inputs; they all live on the output's device (spec route).
+        _call_queue.drain(_spec_device(prepared.output_specs))
     if force_sync or not _call_queue.enabled():
         return prepared.execute()
     out = prepared.extension.allocate_outputs(prepared.output_specs)
@@ -74,6 +90,8 @@ def _submit_prepared_into(
     # pointer extension_args serialized is reachable through those two
     # references, including intermediates living only in prepared.args.
     prepared.enqueue_into(
-        prepared.extension.extension_args(out, *prepared.args), (out, prepared.args)
+        prepared.extension.extension_args(out, *prepared.args),
+        (out, prepared.args),
+        device=_spec_device(prepared.output_specs),
     )
     return out

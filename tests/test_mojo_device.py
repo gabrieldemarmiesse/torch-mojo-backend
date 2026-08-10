@@ -668,6 +668,41 @@ def test_torch_fork_rng_restores_mojo_counter(mojo_device):
     torch.testing.assert_close(torch.mojo.get_rng_state(device), before)
 
 
+def test_checkpoint_sees_initialized_device_module(mojo_device):
+    """torch.utils.checkpoint reads the _initialized DATA attribute (not
+    is_initialized()); without it, device RNG state is silently never saved
+    or restored around recomputation."""
+    assert getattr(torch.mojo, "_initialized", False)
+
+    x = torch.ones(4, device=mojo_device)
+    devices, states = torch.utils.checkpoint.get_device_states(x)
+    assert devices == [torch.device(mojo_device).index]
+    assert len(states) == 1 and states[0].numel() == 16
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_checkpoint_replays_dropout_mask_in_backward(mojo_gpu, use_reentrant):
+    """A checkpointed dropout must recompute with the forward's mask.
+
+    Self-consistent check: with p=0.5 the gradient of sum(dropout(x)) is
+    exactly 2.0 where the forward kept an element and 0.0 where it dropped
+    it — but only if the recomputation replays the forward's Philox state.
+    With the RNG bug, backward draws a fresh mask and the pattern disagrees
+    (silently wrong gradients)."""
+    torch.mojo.manual_seed_all(1234)
+    x = torch.ones(512, device=mojo_gpu, requires_grad=True)
+    y = torch.utils.checkpoint.checkpoint(
+        lambda t: torch.nn.functional.dropout(t, p=0.5, training=True),
+        x,
+        use_reentrant=use_reentrant,
+    )
+    kept = y.detach().cpu() != 0
+    assert kept.any() and not kept.all()  # a degenerate mask proves nothing
+    y.sum().backward()
+    expected = torch.where(kept, 2.0, 0.0)
+    torch.testing.assert_close(x.grad.cpu(), expected)
+
+
 def test_dtype_preservation(mojo_device):
     """Test that dtypes are preserved during conversion"""
     for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:

@@ -12,6 +12,7 @@ import math
 from collections.abc import Callable
 
 import torch
+from max.driver import Device as MaxDevice
 from max.experimental.torch.torch import torch_dtype_to_max
 
 import torch_mojo_backend.is_running_tests
@@ -21,6 +22,7 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     _record_h2d_source,
     _resize_payload,
     find_equivalent_max_device,
+    peer_access_enabled,
 )
 
 # Global registry for functions to register
@@ -212,6 +214,77 @@ def _out_variant(op_name: str, fast_name: str, *, dtype_policy: str = "safe_cast
 # ----------------------------------------------------------------------------------
 
 
+def _is_peer_gpu_pair(a: MaxDevice, b: MaxDevice) -> bool:
+    """Whether a direct device-to-device copy between ``a`` and ``b`` works."""
+    return a.label == "gpu" and b.label == "gpu" and peer_access_enabled()
+
+
+def _peer_replica(src: TorchMojoTensor, target: MaxDevice) -> TorchMojoTensor:
+    """A contiguous replica of ``src`` on ``target`` via direct peer copy.
+
+    The caller must have verified ``_is_peer_gpu_pair(src._device, target)``.
+    The copy is stream-ordered on both devices' default streams, so it needs
+    no host synchronization and no transfer-owner tracking.
+    """
+    from torch_mojo_backend import eager_kernels
+    from torch_mojo_backend.mojo_device import deferred_compile
+
+    src = src._contig()
+    # The peer copy reads src's bytes OUTSIDE the kernel-call queue; its
+    # stream-event ordering cannot cover launches still waiting on a
+    # compile, so src's queued producers must land first. (The dispatcher
+    # already drains for device-crossing ops — this guards direct callers.)
+    deferred_compile.drain(src._device)
+    out = TorchMojoTensor._alloc(src._shape, src._dtype, target)
+    if src._numel > 0:
+        eager_kernels.tensor_holder.copy_d2d_peer(
+            eager_kernels._ctx_ptr(target),
+            out._ptr,
+            eager_kernels._ctx_ptr(src._device),
+            src._ptr,
+            src._numel * src._itemsize,
+        )
+    return out
+
+
+def _try_peer_copy_into(dest: TorchMojoTensor, src: TorchMojoTensor) -> bool:
+    """Copy ``src`` into ``dest`` across two GPUs via direct peer access.
+
+    Returns False when the devices are not a peer-enabled GPU pair, leaving
+    the caller to bounce through the host. Dtype casts and broadcasts run on
+    the destination device after a compact raw transfer.
+    """
+    if not _is_peer_gpu_pair(src._device, dest._device):
+        return False
+
+    if (
+        src._is_contiguous
+        and dest._is_contiguous
+        and src._dtype == dest._dtype
+        and tuple(src._shape) == tuple(dest._shape)
+    ):
+        if src._numel > 0:
+            from torch_mojo_backend import eager_kernels
+            from torch_mojo_backend.mojo_device import deferred_compile
+
+            # Out-of-queue transfer: queued producers of src and queued
+            # writers of dest must land first (see _peer_replica).
+            deferred_compile.drain(src._device)
+            deferred_compile.drain(dest._device)
+            eager_kernels.tensor_holder.copy_d2d_peer(
+                eager_kernels._ctx_ptr(dest._device),
+                dest._ptr,
+                eager_kernels._ctx_ptr(src._device),
+                src._ptr,
+                src._numel * src._itemsize,
+            )
+        return True
+
+    staged = _peer_replica(src, dest._device)
+    _copy_into_tensor(dest, staged)
+    return True
+
+
 @register_aten_op("aten::_copy_from")
 def mojo_device__copy_from(self, dest, non_blocking: bool = False):
     src_is_mojo = isinstance(self, TorchMojoTensor)
@@ -219,7 +292,9 @@ def mojo_device__copy_from(self, dest, non_blocking: bool = False):
 
     if src_is_mojo and dest_is_mojo:
         if self._device != dest._device:
-            # Cross mojo-device: bounce through the host.
+            if _try_peer_copy_into(dest, self):
+                return dest
+            # No peer access between the devices: bounce through the host.
             bounced = TorchMojoTensor._from_cpu(
                 self._to_cpu_tensor(), dest._device, non_blocking=non_blocking
             )
@@ -317,6 +392,8 @@ def mojo_device__to_copy(
     if device is not None:
         target = find_equivalent_max_device(device)
         if target != result._device:
+            if _is_peer_gpu_pair(result._device, target):
+                return _peer_replica(result, target)
             return TorchMojoTensor._from_cpu(
                 result._to_cpu_tensor(), target, non_blocking=non_blocking
             )
@@ -381,16 +458,19 @@ def mojo_device_empty_like(
 
 
 def _new_factory_device(self: TorchMojoTensor, device):
-    """Target MAX device for a `new_*` factory. torch passes `self`'s device
-    (whose torch-side index is the phantom 0) when the caller doesn't
-    override it, so default to `self`'s real MAX device; only an explicit
-    CPU request is honored differently."""
+    """Target MAX device for a `new_*` factory.
+
+    Wrapper TensorImpls carry the tensor's real device index, so the device
+    argument torch passes (defaulted to `self`'s device or caller-supplied)
+    is trustworthy and honored. An indexless "mojo" keeps `self`'s device,
+    matching `Tensor.new_*` semantics rather than the current-device
+    default."""
     if device is None:
         return self._device
     torch_dev = torch.device(device) if not isinstance(device, torch.device) else device
-    if torch_dev.type == "cpu":
-        return find_equivalent_max_device(torch_dev)
-    return self._device
+    if torch_dev.type == "mojo" and torch_dev.index is None:
+        return self._device
+    return find_equivalent_max_device(torch_dev)
 
 
 @register_aten_op("aten::new_empty")
@@ -662,6 +742,50 @@ def mojo_device_embedding(
     )
     if result is aten_fast.NOT_HANDLED:
         raise _unsupported("aten::embedding", (weight, indices))
+    return result
+
+
+def _maybe_overlapping_memory(sizes, strides) -> bool:
+    """Whether the strided geometry can map two indices to one element.
+
+    Mirror of torch's ``_maybe_overlapping_memory`` (FunctionsManual.cpp):
+    walking dims by ascending stride, a dim whose stride does not clear the
+    largest reachable index so far can revisit memory.
+    """
+    max_index = 0
+    for stride, size in sorted(zip(strides, sizes)):
+        if size < 2:
+            continue
+        if stride <= max_index:
+            return True
+        max_index += stride * (size - 1)
+    return False
+
+
+@register_aten_op("aten::as_strided")
+def mojo_device_as_strided(
+    self: TorchMojoTensor, size, stride, storage_offset=None
+) -> TorchMojoTensor:
+    """as_strided with a forward-time autograd-mode preflight.
+
+    The backward for a maybe-overlapping geometry calls
+    ``storage.index_add_`` (unimplemented here), and an exception raised
+    inside a backward node aborts the process on this backend (see
+    mojo_device_embedding). Reject the recording at forward time instead.
+    """
+    if (
+        torch.is_grad_enabled()
+        and self.requires_grad
+        and _maybe_overlapping_memory(tuple(size), tuple(stride))
+    ):
+        raise NotImplementedError(
+            "Mojo eager autograd does not support as_strided views that may "
+            "overlap memory (their backward needs aten::index_add_)"
+        )
+    aten_fast = _fast()
+    result = aten_fast.fast_aten_as_strided(self, size, stride, storage_offset)
+    if result is aten_fast.NOT_HANDLED:
+        raise _unsupported("aten::as_strided", (self,))
     return result
 
 

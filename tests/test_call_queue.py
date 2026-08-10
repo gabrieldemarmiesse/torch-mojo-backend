@@ -18,7 +18,6 @@ import copy
 import gc
 import threading
 import weakref
-from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -55,18 +54,17 @@ def forced_queue(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 @pytest.fixture
 def isolated_queue(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """A private queue for the host-only tests: every piece of queue state is
-    swapped for a fresh object, so nothing leaks into the process-wide queue
-    (and no device is needed)."""
-    monkeypatch.setattr(call_queue, "_QUEUE", deque())
-    monkeypatch.setattr(call_queue, "_HELD_ERROR", [])
-    monkeypatch.setattr(call_queue, "_DEVICE_THREAD", [None])
-    monkeypatch.setattr(call_queue, "_QUEUE_LAUNCH_THREAD", [None])
-    monkeypatch.setattr(call_queue, "_RETAINED_BYTES", [0])
+    """A private queue for the host-only tests: the shard registry (and the
+    snapshot pump()/active()/drain(None) iterate) is swapped for a fresh,
+    empty one, so every `_shard(index)` lookup builds a fresh shard and
+    nothing leaks into the process-wide queue (and no device is needed)."""
+    monkeypatch.setattr(call_queue, "_SHARDS", {})
+    monkeypatch.setattr(call_queue, "_SHARD_SNAPSHOT", ())
     yield
-    assert not call_queue._QUEUE
-    assert not call_queue._HELD_ERROR
-    assert call_queue._RETAINED_BYTES[0] == 0
+    for shard in call_queue._SHARDS.values():
+        assert not shard.queue
+        assert not shard.held_error
+        assert shard.retained_bytes == 0
 
 
 class _StalledBuild:
@@ -224,9 +222,9 @@ def test_launch_error_ends_the_episode_at_the_next_drain(isolated_queue) -> None
     buffer = _Buffer()
     retained = weakref.ref(buffer)
 
-    call_queue.kernel_call_into(first, ("first",), ())
-    call_queue.kernel_call_into(failing, ("failing",), ())
-    call_queue.kernel_call_into(successor, ("successor",), (buffer,))
+    call_queue.kernel_call_into(first, ("first",), (), 0)
+    call_queue.kernel_call_into(failing, ("failing",), (), 0)
+    call_queue.kernel_call_into(successor, ("successor",), (buffer,), 0)
     del buffer
     assert call_queue.active()
     assert retained() is not None  # the queued item retains its operands
@@ -249,7 +247,7 @@ def test_launch_error_ends_the_episode_at_the_next_drain(isolated_queue) -> None
     call_queue.drain()  # the episode is over: a clean, silent no-op
     assert log == ["first", "failing"]
 
-    call_queue.kernel_call_into(_FakeUnit(log, ready=True), ("after",), ())
+    call_queue.kernel_call_into(_FakeUnit(log, ready=True), ("after",), (), 0)
     assert log == ["first", "failing", "after"]
 
 
@@ -264,8 +262,8 @@ def test_build_failure_behind_a_queued_launch_surfaces_from_drain(
 
     buffer = _Buffer()
     retained = weakref.ref(buffer)
-    call_queue.kernel_call_into(doomed, ("doomed",), ())
-    call_queue.kernel_call_into(successor, ("successor",), (buffer,))
+    call_queue.kernel_call_into(doomed, ("doomed",), (), 0)
+    call_queue.kernel_call_into(successor, ("successor",), (buffer,), 0)
     del buffer
 
     with pytest.raises(ImportError, match="mojo build failed"):
@@ -287,7 +285,7 @@ def test_queued_launch_out_of_memory_is_still_reported_as_such(isolated_queue) -
     )
     unit = _FakeUnit(log, error=oom)
 
-    call_queue.kernel_call_into(unit, ("oom",), ())
+    call_queue.kernel_call_into(unit, ("oom",), (), 0)
     unit.ready()
     call_queue.pump()
 
@@ -310,14 +308,14 @@ def test_thread_switch_synchronizes_once_and_keeps_fifo(
     log: list[str] = []
 
     warm = _FakeUnit(log, ready=True)
-    call_queue.kernel_call_into(warm, ("warm",), ())  # runs inline on this thread
+    call_queue.kernel_call_into(warm, ("warm",), (), 0)  # runs inline on this thread
     assert log == ["warm"]
     assert syncs == []  # first device work of the episode: no switch yet
 
     first = _FakeUnit(log)
     second = _FakeUnit(log)
-    call_queue.kernel_call_into(first, ("first",), ())
-    call_queue.kernel_call_into(second, ("second",), ())
+    call_queue.kernel_call_into(first, ("first",), (), 0)
+    call_queue.kernel_call_into(second, ("second",), (), 0)
     first.ready()
     second.ready()
 
@@ -336,7 +334,7 @@ def test_thread_switch_synchronizes_once_and_keeps_fifo(
     assert failures == []
     assert log == ["warm", "first", "second"]
     assert syncs == [worker]
-    assert call_queue._DEVICE_THREAD[0] is worker
+    assert call_queue._shard(0).device_thread is worker
 
 
 def test_a_drain_reached_from_inside_a_launch_does_not_reorder(isolated_queue) -> None:
@@ -364,8 +362,8 @@ def test_a_drain_reached_from_inside_a_launch_does_not_reorder(isolated_queue) -
     reentrant.extension = _ReentrantExtension()  # type: ignore[assignment]
     follower = _FakeUnit(log)
 
-    call_queue.kernel_call_into(reentrant, ("first",), (buffer,))
-    call_queue.kernel_call_into(follower, ("second",), (follower_buffer,))
+    call_queue.kernel_call_into(reentrant, ("first",), (buffer,), 0)
+    call_queue.kernel_call_into(follower, ("second",), (follower_buffer,), 0)
     del buffer, follower_buffer
     reentrant.ready()
     follower.ready()
@@ -384,8 +382,8 @@ def test_external_calls_hold_their_fifo_position(isolated_queue) -> None:
     producer = _FakeUnit(log)
     retained = weakref.ref(buffer := _Buffer())
 
-    call_queue.kernel_call_into(producer, ("producer",), ())
-    call_queue.external_call(log.append, ("consumer",), (buffer,))
+    call_queue.kernel_call_into(producer, ("producer",), (), 0)
+    call_queue.external_call(log.append, ("consumer",), (buffer,), 0)
     del buffer
     assert log == []
     assert retained() is not None  # the queued item retains it
@@ -398,7 +396,7 @@ def test_external_calls_hold_their_fifo_position(isolated_queue) -> None:
 
 def test_external_call_runs_inline_when_nothing_is_queued(isolated_queue) -> None:
     log: list[str] = []
-    call_queue.external_call(log.append, ("now",), ())
+    call_queue.external_call(log.append, ("now",), (), 0)
     assert log == ["now"]
     assert not call_queue.active()
 
@@ -410,11 +408,11 @@ def test_a_cold_launch_retains_the_output_it_writes_into(isolated_queue) -> None
     log: list[str] = []
     retained = weakref.ref(out := _Buffer())
 
-    call_queue.kernel_call_into(_FakeUnit(log), ("cold",), (out,))
+    call_queue.kernel_call_into(_FakeUnit(log), ("cold",), (out,), 0)
     del out
 
     assert retained() is not None  # only the queued item holds it now
-    call_queue._QUEUE[0][0].ready()
+    call_queue._shard(0).queue[0][0].ready()
     call_queue.drain()
     assert log == ["cold"]
     assert retained() is None  # released right after its launch
@@ -432,9 +430,15 @@ def test_failed_allocation_drains_synchronizes_and_retries_once(
     from torch_mojo_backend.mojo_device import torch_mojo_tensor
 
     synced: list[bool] = []
-    device = SimpleNamespace(
-        default_stream=SimpleNamespace(synchronize=lambda: synced.append(True))
-    )
+
+    class _FakeDevice:
+        """Hashable by identity (unlike SimpleNamespace), so the device-index
+        cache can map it to shard 0."""
+
+        default_stream = SimpleNamespace(synchronize=lambda: synced.append(True))
+
+    device = _FakeDevice()
+    monkeypatch.setitem(call_queue._DEVICE_INDEX_CACHE, device, 0)
     monkeypatch.setattr(torch_mojo_tensor, "_ctx_ptr", lambda _device: 7)
 
     oom = Exception("CUDA call failed: CUDA_ERROR_OUT_OF_MEMORY (out of memory)")
@@ -455,8 +459,8 @@ def test_failed_allocation_drains_synchronizes_and_retries_once(
     # OOM once -> drain (launches the queued item), sync, retry succeeds.
     holder = _FlakyHolder([oom])
     monkeypatch.setattr(torch_mojo_tensor, "_holder_mod", lambda: holder)
-    call_queue.kernel_call_into(_FakeUnit(log), ("pending",), ())
-    call_queue._QUEUE[0][0].ready()
+    call_queue.kernel_call_into(_FakeUnit(log), ("pending",), (), 0)
+    call_queue._shard(0).queue[0][0].ready()
     result = torch_mojo_tensor._alloc_with_recovery(device, 4096)
     assert result[1] == 0x1000
     assert holder.calls == 2
@@ -487,10 +491,12 @@ def test_failed_allocation_drains_synchronizes_and_retries_once(
 def test_budget_is_computed_from_free_device_memory(
     isolated_queue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Without the env override, the bound adapts to the device: half the
-    smallest free-VRAM figure across the accelerators, floored at 1 GiB,
-    falling back to 8 GiB when nothing can report memory statistics."""
-    import torch_mojo_backend
+    """Without the env override, the bound adapts per shard to ITS device:
+    half that device's free-VRAM figure — not the minimum across all devices,
+    so rank threads never throttle each other on the emptiest GPU — floored
+    at 1 GiB, falling back to 8 GiB when the device reports no memory
+    statistics."""
+    from torch_mojo_backend.mojo_device import torch_mojo_tensor
 
     class _FakeAccelerator:
         def __init__(self, free: int) -> None:
@@ -500,35 +506,33 @@ def test_budget_is_computed_from_free_device_memory(
     monkeypatch.delenv("TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB", raising=False)
 
     monkeypatch.setattr(
-        torch_mojo_backend,
-        "get_accelerators",
+        torch_mojo_tensor,
+        "get_ordered_accelerators",
         lambda: [_FakeAccelerator(60 * gib), _FakeAccelerator(20 * gib)],
     )
-    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [None])
-    assert call_queue._budget_bytes() == 10 * gib  # half the smallest
+    assert call_queue._shard(0)._budget() == 30 * gib  # half ITS device's free
+    assert call_queue._shard(1)._budget() == 10 * gib  # per shard, not the min
 
     monkeypatch.setattr(
-        torch_mojo_backend, "get_accelerators", lambda: [_FakeAccelerator(gib)]
+        torch_mojo_tensor, "get_ordered_accelerators", lambda: [_FakeAccelerator(gib)]
     )
-    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [None])
-    assert call_queue._budget_bytes() == gib  # floored at 1 GiB
+    call_queue.refresh()  # clears every shard's memoized budget
+    assert call_queue._shard(0)._budget() == gib  # floored at 1 GiB
 
     def _no_accelerators() -> list[object]:
         raise RuntimeError("no driver on this host")
 
-    monkeypatch.setattr(torch_mojo_backend, "get_accelerators", _no_accelerators)
-    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [None])
-    assert call_queue._budget_bytes() == 8192 * 1024 * 1024  # fallback
+    monkeypatch.setattr(torch_mojo_tensor, "get_ordered_accelerators", _no_accelerators)
+    call_queue.refresh()
+    assert call_queue._shard(0)._budget() == 8192 * 1024 * 1024  # fallback
 
     monkeypatch.setenv("TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB", "256")
-    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [None])
-    assert call_queue._budget_bytes() == 256 * 1024 * 1024  # override wins
+    call_queue.refresh()
+    assert call_queue._shard(0)._budget() == 256 * 1024 * 1024  # override wins
     call_queue.refresh()
 
 
-def test_retention_budget_bounds_cold_run_ahead(
-    isolated_queue, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_retention_budget_bounds_cold_run_ahead(isolated_queue) -> None:
     """Rule 3's bound: a read-free cold storm may not retain unbounded
     bytes. The enqueue that crosses the budget waits the builds out and
     launches everything, releasing the retention — the fix for the 70+ GB
@@ -538,7 +542,7 @@ def test_retention_budget_bounds_cold_run_ahead(
         _numel = 512
         _itemsize = 4  # 2 KiB per queued item
 
-    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [3 * 2048])
+    call_queue._shard(0).budget_bytes = 3 * 2048
 
     log: list[str] = []
     units = [_FakeUnit(log) for _ in range(4)]
@@ -546,7 +550,7 @@ def test_retention_budget_bounds_cold_run_ahead(
     for index, unit in enumerate(units):
         buf = _Payload()
         retained.append(weakref.ref(buf))
-        call_queue.kernel_call_into(unit, (f"cold{index}",), (buf,))
+        call_queue.kernel_call_into(unit, (f"cold{index}",), (buf,), 0)
         del buf
         if index < 3:
             # At or under budget: still queued, still retained, not blocked.
@@ -557,12 +561,12 @@ def test_retention_budget_bounds_cold_run_ahead(
     # waited out every build and launched the whole queue in FIFO order.
     assert log == ["cold0", "cold1", "cold2", "cold3"]
     assert not call_queue.active()
-    assert call_queue._RETAINED_BYTES[0] == 0
+    assert call_queue._shard(0).retained_bytes == 0
     assert all(ref() is None for ref in retained)
 
 
 def test_retention_budget_holds_launch_errors_for_the_next_drain(
-    isolated_queue, monkeypatch: pytest.MonkeyPatch
+    isolated_queue,
 ) -> None:
     """The budget drain serves memory, not a value: a launch failure inside
     it is held and raised by the next real drain(), per rule 5."""
@@ -571,17 +575,17 @@ def test_retention_budget_holds_launch_errors_for_the_next_drain(
         _numel = 1024
         _itemsize = 1
 
-    monkeypatch.setattr(call_queue, "_BUDGET_BYTES", [1024])
+    call_queue._shard(0).budget_bytes = 1024
 
     log: list[str] = []
     failure = RuntimeError("exact variant rejected its arguments")
     failing = _FakeUnit(log, error=failure)
-    call_queue.kernel_call_into(failing, ("failing",), (_Payload(),))
-    call_queue.kernel_call_into(_FakeUnit(log), ("successor",), (_Payload(),))
+    call_queue.kernel_call_into(failing, ("failing",), (_Payload(),), 0)
+    call_queue.kernel_call_into(_FakeUnit(log), ("successor",), (_Payload(),), 0)
 
     assert log == ["failing"]  # the budget drain launched and failed it
     assert not call_queue.active()  # rule 5 dropped the successor
-    assert call_queue._RETAINED_BYTES[0] == 0
+    assert call_queue._shard(0).retained_bytes == 0
     with pytest.raises(RuntimeError, match="exact variant rejected"):
         call_queue.drain()
 
@@ -628,7 +632,7 @@ def test_warm_calls_queue_behind_a_cold_unit(mojo_gpu, forced_queue):
         y = a + b  # Into launch on the stalled unit: must queue
         z = y * y  # warm MulSpec: must queue BEHIND the stalled add
         assert call_queue.active()
-        assert len(call_queue._QUEUE) == 2
+        assert len(call_queue._shard(0).queue) == 2
     finally:
         stall.release()
     torch.testing.assert_close(z.cpu(), torch.full((64,), 49.0))
@@ -731,7 +735,7 @@ def test_strided_materialization_keeps_its_place(mojo_gpu, forced_queue):
     try:
         y = a + a
         z = y.t().contiguous()
-        assert len(call_queue._QUEUE) >= 2
+        assert len(call_queue._shard(0).queue) >= 2
     finally:
         stall.release()
     torch.testing.assert_close(
@@ -989,3 +993,109 @@ def test_queued_and_synchronous_paths_match_bitwise(mojo_gpu, monkeypatch):
     queued_result = compute()
     call_queue.drain()
     assert torch.equal(sync_result, queued_result)
+
+
+# ---------------------------------------------------------------------------
+# per-device sharding
+
+
+def test_shards_are_independent_fifos(isolated_queue) -> None:
+    """Strict FIFO (rule 1) is per device, not global: a launch stuck behind
+    a build on one shard must not hold back another shard's ready work."""
+    log: list[str] = []
+    blocked = _FakeUnit(log)
+    other = _FakeUnit(log)
+    call_queue.kernel_call_into(blocked, ("shard0",), (), 0)
+    call_queue.kernel_call_into(other, ("shard1",), (), 1)
+    assert len(call_queue._shard(0).queue) == 1
+    assert len(call_queue._shard(1).queue) == 1
+
+    other.ready()
+    call_queue.pump()  # shard 1's head is ready; shard 0's is still building
+    assert log == ["shard1"]
+    assert len(call_queue._shard(0).queue) == 1  # still queued, in order
+    assert not call_queue._shard(1).queue
+    assert call_queue.active()  # shard 0 still holds work
+
+    blocked.ready()
+    call_queue.drain()
+    assert log == ["shard1", "shard0"]
+
+
+def test_targeted_drain_leaves_other_shards(isolated_queue) -> None:
+    """`drain(device)` lands exactly that shard: one rank's host read must
+    not wait out — or launch — another rank's queue."""
+    log: list[str] = []
+    keep = _FakeUnit(log)
+    go = _FakeUnit(log)
+    call_queue.kernel_call_into(keep, ("shard0",), (), 0)  # not ready: can't launch
+    call_queue.kernel_call_into(go, ("shard1",), (), 1)
+
+    call_queue.drain(1)  # waits shard 1's build out and launches it
+    assert log == ["shard1"]
+    assert not call_queue._shard(1).queue
+    assert len(call_queue._shard(0).queue) == 1  # untouched by the targeted drain
+    assert call_queue.active()
+
+    keep.ready()
+    call_queue.drain(0)
+    assert log == ["shard1", "shard0"]
+
+
+def test_held_error_is_per_shard(isolated_queue) -> None:
+    """Rule 5 ends ONE device's episode: the failing shard's next drain
+    raises exactly once, and the other shard's drains stay clean."""
+    log: list[str] = []
+    failure = RuntimeError("exact variant rejected its arguments")
+    failing = _FakeUnit(log, error=failure)
+    call_queue.kernel_call_into(failing, ("failing",), (), 0)
+    failing.ready()
+    call_queue.pump()  # the launch fails; the error is held on shard 0
+    assert call_queue._shard(0).held_error
+
+    call_queue.drain(1)  # the other shard's drain is clean
+    assert not call_queue._shard(1).held_error
+
+    with pytest.raises(RuntimeError, match="exact variant rejected"):
+        call_queue.drain(0)
+    call_queue.drain(0)  # raised exactly once: the episode is over
+
+
+def test_budget_is_per_shard(isolated_queue) -> None:
+    """Rule 3's bound is metered per device: crossing one shard's budget
+    drains that shard only, and the same bytes queued under another shard's
+    roomier budget stay retained and unlaunched."""
+
+    class _Payload:
+        _numel = 512
+        _itemsize = 4  # 2 KiB per queued item
+
+    call_queue._shard(0).budget_bytes = 1024  # one 2 KiB item overflows it
+    call_queue._shard(1).budget_bytes = 1024 * 1024  # roomy: nothing drains
+
+    log: list[str] = []
+    call_queue.kernel_call_into(_FakeUnit(log), ("shard0",), (_Payload(),), 0)
+    call_queue.kernel_call_into(_FakeUnit(log), ("shard1",), (_Payload(),), 1)
+
+    # Shard 0's enqueue crossed ITS budget: the budget drain waited the
+    # build out and launched it. Shard 1 retains the same bytes under a
+    # budget that allows them: still queued, still retained, not launched.
+    assert log == ["shard0"]
+    assert not call_queue._shard(0).queue
+    assert call_queue._shard(0).retained_bytes == 0
+    assert len(call_queue._shard(1).queue) == 1
+    assert call_queue._shard(1).retained_bytes == 2048
+
+    call_queue.drain(1)
+    assert log == ["shard0", "shard1"]
+    assert call_queue._shard(1).retained_bytes == 0
+
+
+def test_device_lock_is_per_device(isolated_queue) -> None:
+    """Rule 6: one re-entrant mutex per device — stable across lookups,
+    never shared between devices."""
+    assert call_queue.device_lock(0) is call_queue.device_lock(0)
+    assert call_queue.device_lock(1) is call_queue.device_lock(1)
+    assert call_queue.device_lock(0) is not call_queue.device_lock(1)
+    assert call_queue.device_lock(0) is call_queue._shard(0).lock
+    assert call_queue.device_lock(1) is call_queue._shard(1).lock
