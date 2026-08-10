@@ -37,12 +37,6 @@ from std.gpu.host.nvidia.tma import (
     TensorMapSwizzle,
     create_tma_descriptor,
 )
-from std.gpu.compute.mma import (
-    wgmma_async,
-    wgmma_commit_group_sync,
-    wgmma_fence_aligned,
-    wgmma_wait_group_sync,
-)
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
@@ -51,16 +45,13 @@ from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
 
 from layout import Layout, LayoutTensor
-from layout.tensor_core_async import (
-    _convert_cfrags_to_simd,
-    _convert_cfrags_to_tuple,
-    _wgmma_descriptor,
-    tile_layout_k_major,
-    tile_layout_mn_major,
-    tile_to_descriptor,
-    warpgroup_fence,
-)
+from layout.tensor_core_async import tile_layout_k_major, tile_layout_mn_major
 from layout.tma_async import SharedMemBarrier, TMATensorTile
+
+from bf16_gemm_nn_v4_kernels import (
+    _v4_mma_tile,
+    maybe_enqueue_bf16_gemm_tn_v4_persistent,
+)
 
 
 comptime _V4_BF16 = DType.bfloat16
@@ -253,27 +244,6 @@ def _v4_tn_ws_body[
             ].stack_allocation()
             _ = accum.fill(0.0)
 
-            # Canonical descriptor layouts follow each operand's majorness
-            # (MN-major for WGMMA's "col" A / "row" B modes, K-major for
-            # "row" A / "col" B).  The second consumer advances by one
-            # 64-row WGMMA tile within the shared A tile; the stride
-            # formulas below are majorness-generic (they mirror
-            # TensorCoreAsync.wgmma).
-            comptime a_canonical_layout = tile_to_descriptor[
-                _V4_BF16, A_LAYOUT, not COL_A
-            ]()
-            comptime b_canonical_layout = tile_to_descriptor[
-                _V4_BF16, B_LAYOUT, KMAJ_B
-            ]()
-            comptime a_shape00 = a_canonical_layout[0].shape[0].value()
-            comptime a_stride01 = a_canonical_layout[0].stride[1].value()
-            comptime a_stride11 = a_canonical_layout[1].stride[1].value()
-            comptime b_stride11 = b_canonical_layout[1].stride[1].value()
-            comptime a_m_stride = a_stride01 * (64 // a_shape00) * 2
-            comptime a_k_stride = a_stride11 * 2 * 2
-            comptime b_k_stride = b_stride11 * 2 * 2
-            comptime NUM_K_MMAS = _V4_BK // 16
-
             var it = 0
             while it < my_tiles:
                 var stage = it % STAGES
@@ -293,37 +263,11 @@ def _v4_tn_ws_body[
                     address_space=AddressSpace.SHARED,
                     alignment=128,
                 ](b_pipeline.ptr + stage * BN * _V4_BK)
-                var a_desc = _wgmma_descriptor[
-                    a_canonical_layout, not COL_A, _V4_SWIZZLE
-                ](a_tile.ptr)
-                var b_desc = _wgmma_descriptor[
-                    b_canonical_layout, KMAJ_B, _V4_SWIZZLE
-                ](b_tile.ptr)
-                a_desc += a_m_stride * (warp_group_idx - 1)
-
-                warpgroup_fence(accum)
-                wgmma_fence_aligned()
-                comptime for k_mma in range(NUM_K_MMAS):
-                    var c_tuple = _convert_cfrags_to_tuple[_V4_F32, CFRAG](
-                        accum
-                    )
-                    var c_out = wgmma_async[
-                        64,
-                        BN,
-                        16,
-                        a_type=_V4_BF16,
-                        b_type=_V4_BF16,
-                        layout_a="col" if COL_A else "row",
-                        layout_b="col" if KMAJ_B else "row",
-                    ](
-                        a_desc + k_mma * a_k_stride,
-                        b_desc + k_mma * b_k_stride,
-                        c_tuple,
-                    )
-                    _convert_cfrags_to_simd[_V4_F32, CFRAG](c_out, accum)
-                wgmma_commit_group_sync()
-                warpgroup_fence(accum)
-                wgmma_wait_group_sync()
+                # Majorness-generic raw WGMMA slab, shared with the
+                # persistent body in bf16_gemm_nn_v4_kernels.mojo.
+                _v4_mma_tile[BN, COL_A, KMAJ_B, A_LAYOUT, B_LAYOUT](
+                    a_tile.ptr, b_tile.ptr, accum, warp_group_idx
+                )
                 if warp_group_thread_idx == 0:
                     _ = empty_barriers[stage].arrive()
                 it += 1
@@ -799,6 +743,13 @@ def try_enqueue_bf16_gemm_tn_v4(
                     )
                     return True
 
+    # Multi-wave regime: the persistent clustered body (shared with NN)
+    # in its col-major-A mode.  Gated inside the helper; it declines
+    # single-wave and unaligned shapes, which fall through to the
+    # narrow-tile / v3 routes below.
+    if maybe_enqueue_bf16_gemm_tn_v4_persistent(output, a, b, m, n, k, ctx):
+        return True
+
     # Narrow-tile regime: 192-wide tiles trade 33% more CTAs for fuller
     # waves.  Per-CTA time is proportional to BN at fixed BM/BK, so compare
     # wave-quantized cost (waves x BN) and pick 192 when it wins; e.g. 72
@@ -843,7 +794,7 @@ def try_enqueue_bf16_gemm_tn_v4(
 #     Engaged cells win 0.42x-0.97x of the persistent kernel's time
 #     (e.g. NT tiles=16 k=8192: 29.5 vs 70.3 us; NN tiles=32 k=8192:
 #     40.9 vs 91.4 us); cells with sm // tiles < 2 cannot split and the
-#     persistent kernels already sit within ~10% of cuBLAS there.
+#     persistent kernels already sit within ~10% of stock PyTorch there.
 #   - NT refinement: at sm // tiles == 2 with only the minimum chunk
 #     depth (k_tiles < 64, so 16-tile chunks), the split pays workspace
 #     + reduce overhead for a wave that was nearly full anyway and

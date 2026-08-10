@@ -60,6 +60,7 @@ comptime _GROUP_M = 8
 comptime _BF16 = DType.bfloat16
 comptime _F32 = DType.float32
 comptime _Ptr = UnsafePointer[Scalar[_BF16], MutAnyOrigin]
+comptime _F32Ptr = UnsafePointer[Scalar[_F32], MutAnyOrigin]
 comptime _I32_MAX = 2_147_483_647
 comptime _I64_MAX = 9_223_372_036_854_775_807
 
@@ -126,7 +127,7 @@ def _g2r_kc[
 
 @always_inline
 def _g2r_mc[
-    CH: Int, FAST: Bool
+    CH: Int, FAST: Bool, QUAD: Bool = False
 ](
     src: _Ptr,
     row0: Int32,
@@ -138,11 +139,28 @@ def _g2r_mc[
     mut regs: InlineArray[SIMD[_BF16, 8], CH],
 ):
     # Row-contiguous operand: element (r, kk) lives at src[kk * rows + r].
+    #
+    # QUAD assigns the four lanes of a quad to the four consecutive 8-element
+    # chunks of one k-row (32 contiguous elements, 64 bytes) instead of
+    # giving each lane its own k-row.  The guarded loads of an awkward shape
+    # scalarize (2B element alignment only), and under the default mapping
+    # every lane then owns a private 32B sector (~3 of 32 bytes used); the
+    # quad mapping packs four lanes into each pair of sectors.  Used by the
+    # small-tile guarded builds together with the k-major staging stores in
+    # store_tile, whose addressing must match this mapping exactly.
     @parameter
     for it in range(CH):
-        var item = tid + Int32(it * _THREADS)
-        var kr = item % _BK
-        var rc = (item // _BK) * 8
+        var kr: Int32
+        var rc: Int32
+
+        @parameter
+        if QUAD:
+            kr = (tid // 4) % Int32(_BK)
+            rc = (tid % 4) * 8 + (tid // 128) * 32 + Int32(it * 64)
+        else:
+            var item = tid + Int32(it * _THREADS)
+            kr = item % _BK
+            rc = (item // _BK) * 8
         var gk = k0 + kr
         var gr = row0 + rc
         var v = SIMD[_BF16, 8]()
@@ -181,7 +199,13 @@ def _g2r_mc[
 
 @always_inline
 def _mma_tile_impl[
-    TA: Bool, TB: Bool, BM: Int, BN: Int, FASTK: Bool, BATCHED: Bool
+    TA: Bool,
+    TB: Bool,
+    BM: Int,
+    BN: Int,
+    FASTK: Bool,
+    BATCHED: Bool,
+    SPLITK: Bool = False,
 ](
     output: _Ptr,
     a: _Ptr,
@@ -198,7 +222,19 @@ def _mma_tile_impl[
     b_fast: Int,
     c_pair: Int,
     batch_count: Int,
+    ws: _F32Ptr,
+    chunk_tiles: Int,
+    ws_pitch: Int,
 ):
+    # SPLITK builds tile the K loop over grid.y: block (x, s) computes the
+    # partial product of its output tile over K tiles [s * chunk_tiles,
+    # (s + 1) * chunk_tiles) and stores FP32 partials to workspace slice s
+    # (ws + s * ws_pitch, one m*n image per slice, pitch rounded so every
+    # slice keeps 16B alignment for the reduce).  bias / c_pair / batching
+    # are not part of this mode: the reduce kernel owns the bias add and the
+    # bf16 store, and the host only routes non-batched GEMM launches here.
+    comptime assert not (SPLITK and BATCHED), "split-K GEMM is not batched"
+    comptime assert not (SPLITK and FASTK), "split-K uses the guarded loads"
     # Eight warps arrange as (BM/32) x (8/(BM/32)); each owns a 32-row by
     # 8*NT-column fragment grid. ACH/BCH: 8-element staging chunks per thread.
     comptime WARPS_M = BM // 32
@@ -269,12 +305,22 @@ def _mma_tile_impl[
     var va = InlineArray[SIMD[_BF16, 8], ACH](fill=SIMD[_BF16, 8]())
     var vb = InlineArray[SIMD[_BF16, 8], BCH](fill=SIMD[_BF16, 8]())
 
+    # QKMAJ: in the guarded small-tile regime, m/n-contiguous operands use
+    # the quad load mapping (see _g2r_mc) plus k-major staging with one 16B
+    # conflict-free vector store per chunk, and the k-major fragment gathers
+    # in compute_tile.  This quarters the global load sectors of the
+    # scalarized guarded loads and removes the same-word conflicts of the
+    # dim-major scalar staging stores.  Measured on H100 PCIe for the
+    # latency-bound 64x64 regime; the larger-tile and FASTK kernels keep
+    # their existing layouts byte-for-byte.
+    comptime QKMAJ = (not FASTK) and BM == 64 and BN == 64
+
     @parameter
     @always_inline
     def load_tile(k0: Int32):
         @parameter
         if TA:
-            _g2r_mc[ACH, FASTK](ap, bm0, mi, k0, ki, tid, af, va)
+            _g2r_mc[ACH, FASTK, QKMAJ](ap, bm0, mi, k0, ki, tid, af, va)
         else:
             _g2r_kc[ACH, FASTK](ap, bm0, mi, k0, ki, tid, af, va)
 
@@ -282,7 +328,7 @@ def _mma_tile_impl[
         if TB:
             _g2r_kc[BCH, FASTK](bp, bn0, ni, k0, ki, tid, bf, vb)
         else:
-            _g2r_mc[BCH, FASTK](bp, bn0, ni, k0, ki, tid, bf, vb)
+            _g2r_mc[BCH, FASTK, QKMAJ](bp, bn0, ni, k0, ki, tid, bf, vb)
 
     @parameter
     @always_inline
@@ -298,6 +344,16 @@ def _mma_tile_impl[
                 var item = tid + Int32(it * _THREADS)
                 var kr = item % _BK
                 var rc = (item // _BK) * 8
+                smem_a.store[alignment=16](
+                    Int(base_a + kr * Int32(LDA_K) + rc), va[it]
+                )
+        elif TA and QKMAJ:
+            # Must mirror the QUAD mapping in _g2r_mc.  rc is a multiple of
+            # 8 and the pitch is 144B, so every store keeps 16B alignment.
+            @parameter
+            for it in range(ACH):
+                var kr = (tid // 4) % Int32(_BK)
+                var rc = (tid % 4) * 8 + (tid // 128) * 32 + Int32(it * 64)
                 smem_a.store[alignment=16](
                     Int(base_a + kr * Int32(LDA_K) + rc), va[it]
                 )
@@ -346,6 +402,15 @@ def _mma_tile_impl[
                 smem_b.store[alignment=16](
                     Int(base_b + kr * Int32(LDB_K) + rc), vb[it]
                 )
+        elif QKMAJ:
+            # Must mirror the QUAD mapping in _g2r_mc (see the A branch).
+            @parameter
+            for it in range(BCH):
+                var kr = (tid // 4) % Int32(_BK)
+                var rc = (tid % 4) * 8 + (tid // 128) * 32 + Int32(it * 64)
+                smem_b.store[alignment=16](
+                    Int(base_b + kr * Int32(LDB_K) + rc), vb[it]
+                )
         else:
 
             @parameter
@@ -376,7 +441,7 @@ def _mma_tile_impl[
                 var row = wm + Int32(mt * 16) + g
 
                 @parameter
-                if TA and FASTK:
+                if TA and (FASTK or QKMAJ):
                     var c0 = Int(base_a + kb * Int32(LDA_K) + row)
                     afr[mt] = SIMD[_BF16, 8](
                         smem_a[c0],
@@ -409,7 +474,7 @@ def _mma_tile_impl[
                 var bfr = SIMD[_BF16, 4]()
 
                 @parameter
-                if TB or not FASTK:
+                if TB or not (FASTK or QKMAJ):
                     var b01 = smem_b.load[width=2, alignment=4](
                         Int(base_b + nr * Int32(_LDS) + kb)
                     )
@@ -431,6 +496,15 @@ def _mma_tile_impl[
                     mma(acc[mt * NT + nt], afr[mt], bfr, acc[mt * NT + nt])
 
     var kt = (ki + Int32(_BK - 1)) // Int32(_BK)
+    # Non-SPLITK builds keep (t0, t_end) = (0, kt): both stay compile-time
+    # constants after inlining, so the pre-existing kernels are unchanged.
+    var t0: Int32 = 0
+    var t_end: Int32 = kt
+
+    @parameter
+    if SPLITK:
+        t0 = Int32(Int(block_idx.y)) * Int32(chunk_tiles)
+        t_end = min(kt, t0 + Int32(chunk_tiles))
 
     @parameter
     @always_inline
@@ -439,12 +513,12 @@ def _mma_tile_impl[
         for i in range(2 * NT):
             acc[i] = SIMD[_F32, 4]()
 
-        load_tile(0)
+        load_tile(t0 * Int32(_BK))
         store_tile(0)
         barrier()
         var cur = 0
-        var t: Int32 = 1
-        while t < kt:
+        var t: Int32 = t0 + 1
+        while t < t_end:
             load_tile(t * Int32(_BK))
             compute_tile(cur)
             # The other stage was last read before the previous barrier, and
@@ -455,6 +529,38 @@ def _mma_tile_impl[
             cur = 1 - cur
             t += 1
         compute_tile(cur)
+
+        @parameter
+        if SPLITK:
+            # Tile-blocked FP32 partial store: each block owns a private
+            # BM x BN image at (slice, logical row-major tile id), so every
+            # pair store is 8B-aligned and fully coalesced no matter how
+            # awkward n is.  The reduce kernel owns the bounds masking, the
+            # bias add and the bf16 rounding, so no clipping happens here;
+            # out-of-range lanes hold zeros (their staged loads zero-fill).
+            var blocks_n_t = (ni + Int32(BN - 1)) // Int32(BN)
+            var tile_id = (bm0 // Int32(BM)) * blocks_n_t + bn0 // Int32(BN)
+            var sp = (
+                ws
+                + Int(Int32(Int(block_idx.y))) * ws_pitch
+                + Int(tile_id) * (BM * BN)
+            )
+
+            @parameter
+            for mt in range(2):
+                var r0 = wm + Int32(mt * 16) + g
+
+                @parameter
+                for nt in range(NT):
+                    var c = wn + Int32(nt * 8) + 2 * tg
+                    var frag = acc[mt * NT + nt]
+
+                    @parameter
+                    for h in range(2):
+                        var r = r0 + Int32(h * 8)
+                        var pair = SIMD[_F32, 2](frag[2 * h], frag[2 * h + 1])
+                        sp.store[alignment=8](Int(r) * BN + Int(c), pair)
+            return
 
         @parameter
         for mt in range(2):
@@ -587,6 +693,8 @@ def _gemm_entry[
     c_pair: Int,
     batch_count: Int,
 ):
+    # The trailing FP32 pointer is the split-K workspace, unread outside
+    # SPLITK builds; `output` stands in as the dummy.
     _mma_tile_impl[TA, TB, BM, BN, FASTK, not FASTK](
         output,
         a,
@@ -603,7 +711,147 @@ def _gemm_entry[
         b_fast,
         c_pair,
         batch_count,
+        output.bitcast[Scalar[_F32]](),
+        0,
+        0,
     )
+
+
+# Split-K entry for underfilled small grids: same guarded body and tile
+# regimes as _gemm_entry, but grid.y slices the K loop and each block writes
+# FP32 partials to its workspace slice.  Instantiated for the 128x128 and
+# 64x64 regimes only (the ones _pick_regime can select for a small grid with
+# both extents above 64); narrow-extent shapes keep their existing routes.
+@__name(
+    t"bf16_gemm_{_gemm_layout_tag[TA, TB]()}{_gemm_regime_tag[BM, BN]()}_splitk"
+)
+def _gemm_splitk_entry[
+    TA: Bool, TB: Bool, BM: Int, BN: Int
+](
+    ws: _F32Ptr,
+    a: _Ptr,
+    b: _Ptr,
+    m: Int,
+    n: Int,
+    k: Int,
+    chunk_tiles: Int,
+    ws_pitch: Int,
+    a_fast: Int,
+    b_fast: Int,
+):
+    # `output`/`bias` are unread under SPLITK; the workspace and `a` stand in
+    # as dummies the same way BMM reuses `a` for its unread bias pointer.
+    _mma_tile_impl[TA, TB, BM, BN, False, False, SPLITK=True](
+        ws.bitcast[Scalar[_BF16]](),
+        a,
+        b,
+        a,
+        m,
+        n,
+        k,
+        0,
+        0,
+        0,
+        0,
+        a_fast,
+        b_fast,
+        0,
+        1,
+        ws,
+        chunk_tiles,
+        ws_pitch,
+    )
+
+
+# Reduction of the split-K FP32 workspace slices into the bf16 output, with
+# the optional bias add folded in.  The workspace is tile-blocked (see the
+# SPLITK epilogue in _mma_tile_impl): slice s starts at s * pitch and holds
+# one contiguous BM x BN FP32 image per logical row-major output tile, so
+# every vector load here is 16B-aligned regardless of how awkward m and n
+# are.  Block (t, q) owns a slab of tile t; each thread sums one vec4 lane
+# per group across the slices with two accumulators (paired slice loads in
+# flight), then scatters the clipped bf16 result (plus bias) into the
+# row-major output.  On H100 PCIe one group of 256x4 elements per block was
+# fastest (2 groups halves the grid and lost ~15%); the kernel is launch- and
+# L2-latency-bound at these sizes, not bandwidth-bound.
+comptime _SPLITK_RED_THREADS = 256
+comptime _SPLITK_RED_GROUPS = 1
+
+
+@__name(t"bf16_gemm_splitk_reduce{_gemm_regime_tag[BM, BN]()}")
+def _gemm_splitk_reduce[
+    BM: Int, BN: Int
+](
+    output: _Ptr,
+    ws: _F32Ptr,
+    bias: _Ptr,
+    m: Int,
+    n: Int,
+    pitch: Int,
+    splits: Int,
+    has_bias: Int,
+):
+    comptime TILE = BM * BN
+    comptime GSTRIDE = _SPLITK_RED_THREADS * 4
+    var blocks_n = (n - 1) // BN + 1
+    var t = Int(block_idx.x)
+    var idx0 = (
+        Int(block_idx.y) * (GSTRIDE * _SPLITK_RED_GROUPS)
+        + Int(thread_idx.x) * 4
+    )
+    var acc = InlineArray[SIMD[_F32, 4], _SPLITK_RED_GROUPS](
+        fill=SIMD[_F32, 4]()
+    )
+    var acc_b = InlineArray[SIMD[_F32, 4], _SPLITK_RED_GROUPS](
+        fill=SIMD[_F32, 4]()
+    )
+
+    @parameter
+    for gr in range(_SPLITK_RED_GROUPS):
+        acc[gr] = ws.load[width=4, alignment=16](t * TILE + idx0 + gr * GSTRIDE)
+    # Two accumulators per group keep pairs of slice loads in flight instead
+    # of one serial load-add chain.
+    var s = 1
+    while s + 1 < splits:
+
+        @parameter
+        for gr in range(_SPLITK_RED_GROUPS):
+            var base = t * TILE + idx0 + gr * GSTRIDE
+            acc[gr] += ws.load[width=4, alignment=16](s * pitch + base)
+            acc_b[gr] += ws.load[width=4, alignment=16]((s + 1) * pitch + base)
+        s += 2
+    if s < splits:
+
+        @parameter
+        for gr in range(_SPLITK_RED_GROUPS):
+            acc[gr] += ws.load[width=4, alignment=16](
+                s * pitch + t * TILE + idx0 + gr * GSTRIDE
+            )
+
+    @parameter
+    for gr in range(_SPLITK_RED_GROUPS):
+        var idx = idx0 + gr * GSTRIDE
+        var acc4 = acc[gr] + acc_b[gr]
+        # idx is a multiple of 4 and BN is a multiple of 4, so the vec4
+        # never crosses a tile row: one (row, col0) pair covers all lanes.
+        var row = (t // blocks_n) * BM + idx // BN
+        var col0 = (t % blocks_n) * BN + idx % BN
+        if row < m:
+            if has_bias != 0:
+
+                @parameter
+                for e in range(4):
+                    if col0 + e < n:
+                        acc4[e] += bias[col0 + e].cast[_F32]()
+            var obase = row * n + col0
+            if col0 + 4 <= n:
+                output.store[alignment=2](obase, acc4.cast[_BF16]())
+            else:
+
+                @parameter
+                for e in range(4):
+                    if col0 + e < n:
+                        output[obase + e] = acc4[e].cast[_BF16]()
 
 
 @always_inline
@@ -664,7 +912,8 @@ def _bmm_entry[
     batch_count: Int,
 ):
     # BMM carries no bias: `a` stands in as an unread bias pointer under
-    # has_bias = 0, and the batch strides are the real ones.
+    # has_bias = 0, and the batch strides are the real ones.  The trailing
+    # FP32 pointer is the split-K workspace, unread outside SPLITK builds.
     _mma_tile_impl[TA, TB, BM, BN, FASTK, not FASTK](
         output,
         a,
@@ -681,6 +930,9 @@ def _bmm_entry[
         b_fast,
         c_pair,
         batch_count,
+        output.bitcast[Scalar[_F32]](),
+        0,
+        0,
     )
 
 
@@ -1421,6 +1673,94 @@ def _enqueue_bmm_wide(
             return
 
 
+def _enqueue_gemm_splitk(
+    output: _Ptr,
+    a: _Ptr,
+    b: _Ptr,
+    bias: _Ptr,
+    m: Int,
+    n: Int,
+    k: Int,
+    hb: Int,
+    a_fast: Int,
+    b_fast: Int,
+    bm: Int,
+    bn: Int,
+    grid_x: Int,
+    splits_in: Int,
+    transpose_a: Bool,
+    transpose_b: Bool,
+    ctx: DeviceContext,
+) raises:
+    # Recompute splits from the rounded-up chunk so no grid.y slice is empty
+    # (e.g. kt = 5 with splits_in = 4 collapses to 3 slices of 2, 2, 1).
+    var kt = (k - 1) // _BK + 1
+    var chunk_tiles = (kt + splits_in - 1) // splits_in
+    var splits = (kt + chunk_tiles - 1) // chunk_tiles
+
+    comptime for ri in range(4):
+        comptime if ri == 0 or ri == 3:
+            comptime BM = _regime_bm(ri)
+            comptime BN = _regime_bn(ri)
+            if bm == BM and bn == BN:
+                # One contiguous BM x BN FP32 image per (slice, tile); the
+                # tile-blocked layout keeps both the epilogue stores and the
+                # reduce loads aligned and coalesced (see the SPLITK
+                # epilogue in _mma_tile_impl).
+                var pitch = grid_x * (BM * BN)
+                var ws = ctx.enqueue_create_buffer[DType.float32](
+                    splits * pitch
+                )
+                var ws_ptr = ws.unsafe_ptr().as_unsafe_any_origin()
+
+                comptime for li in range(4):
+                    comptime TA = li >= 2
+                    comptime TB = li % 2 == 1
+                    if transpose_a == TA and transpose_b == TB:
+                        ctx.enqueue_function[
+                            _gemm_splitk_entry[TA, TB, BM, BN]
+                        ](
+                            ws_ptr,
+                            a,
+                            b,
+                            m,
+                            n,
+                            k,
+                            chunk_tiles,
+                            pitch,
+                            a_fast,
+                            b_fast,
+                            grid_dim=(grid_x, splits),
+                            block_dim=(_THREADS,),
+                        )
+                ctx.enqueue_function[_gemm_splitk_reduce[BM, BN]](
+                    output,
+                    ws_ptr,
+                    bias,
+                    m,
+                    n,
+                    pitch,
+                    splits,
+                    hb,
+                    grid_dim=(
+                        grid_x,
+                        (BM * BN)
+                        // (_SPLITK_RED_THREADS * 4 * _SPLITK_RED_GROUPS),
+                    ),
+                    block_dim=(_SPLITK_RED_THREADS,),
+                )
+                # Normal release after both stream-ordered consumers are
+                # enqueued.
+                _ = ws^
+                return
+    # Only the 128x128 and 64x64 regimes are instantiated above; falling
+    # through would enqueue nothing and return with the output buffer
+    # unwritten -- a silent wrong result.  Unreachable while the caller
+    # restricts this route to regimes 0 and 3, but refuse loudly if the
+    # dispatch and the instantiation ladder ever drift apart.
+    raise Error("bf16 gemm split-K: no kernel instantiated for this tile")
+
+
 def enqueue_bf16_gemm(
     output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     a: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -1464,6 +1804,75 @@ def enqueue_bf16_gemm(
             ctx,
         )
         return
+    # Split-K route for underfilled small grids: with fewer blocks than SMs
+    # every CTA runs alone on its SM and the whole K loop is one serial
+    # latency chain, so slicing K over grid.y multiplies both the block
+    # count and the number of chains in flight.  Applied only when both
+    # extents exceed 64 (the 128x128 and 64x64 regimes; narrow-extent
+    # shapes keep their existing routes) and when at least two slices of
+    # two K tiles each exist.  The 3x-SMs block target and the cap of 8
+    # slices were fitted on an H100 PCIe (114 SMs, 50 MB L2: the FP32
+    # workspace round-trip stays L2-resident); stock PyTorch picks the
+    # same split=4 shape for 357x789x333.
+    if (regime == 0 or regime == 3) and sm_count > 0 and grid_x < sm_count:
+        var kt_total = (k - 1) // _BK + 1
+        # The 64x64 regime profits when K is deep enough for at least two
+        # slices of three tiles AND the direct 64x64 grid leaves a good
+        # chunk of the GPU idle (measured on H100 PCIe: 500x500x123 at kt=4
+        # loses ~7% to the workspace round-trip, 357x789x333 at kt=11 wins
+        # 1.4-1.6x).  Two refinements from a 3-round interleaved A/B sweep
+        # of m,n in [450, 600] x k in [160, 320], all four layouts, on an
+        # H100 PCIe (114 SMs):
+        #   - Near-full grids: at 100 direct blocks (600x600, 88% of one
+        #     wave) the split loses every cell, both layouts, +13% to +47%;
+        #     at 81 blocks (550x550) it is mixed and at <= 72 it wins.
+        #     Hence engage only while the direct grid is under 3/4 of the
+        #     SM count.
+        #   - Shallow K (kt 6..7): only TN profits (-5% to -20% at 64..81
+        #     blocks); NN loses +4% to +15% (500x500x200, this defect's
+        #     corner, was a wash: 8.04 vs 8.14 us) and NT loses up to +44%
+        #     (500x500x200: 6.86 vs 4.77 us).  TT never reaches here (it is
+        #     rewritten as NN upstream).  From kt = 8 up, every layout wins
+        #     at <= 81 blocks (-6% to -34%), except NN 550x550x320 (+4.3%),
+        #     the one loss this fit knowingly keeps: excluding it needs a
+        #     tighter grid cutoff that costs the larger TN wins next to it.
+        var split_ok = (
+            regime == 3
+            and 4 * grid_x <= 3 * sm_count
+            and (
+                kt_total >= 8
+                or (transpose_a and not transpose_b and kt_total >= 6)
+            )
+        ) or (
+            regime == 0
+            and ((2 * grid_x <= sm_count and kt_total >= 8) or kt_total >= 64)
+        )
+        var splits = (3 * sm_count) // grid_x
+        if splits > (kt_total + 1) // 2:
+            splits = (kt_total + 1) // 2
+        if splits > 8:
+            splits = 8
+        if split_ok and splits >= 2:
+            _enqueue_gemm_splitk(
+                output,
+                a,
+                b,
+                bias,
+                m,
+                n,
+                k,
+                hb,
+                a_fast,
+                b_fast,
+                bm,
+                bn,
+                grid_x,
+                splits,
+                transpose_a,
+                transpose_b,
+                ctx,
+            )
+            return
     var fastk = _fast_proof(
         output, a, b, m, n, k, 0, 0, 0, transpose_a, transpose_b
     )

@@ -35,6 +35,12 @@ from std.gpu import (
     grid_dim,
     thread_idx,
 )
+from std.gpu.compute.mma import (
+    wgmma_async,
+    wgmma_commit_group_sync,
+    wgmma_fence_aligned,
+    wgmma_wait_group_sync,
+)
 from std.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
 from std.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
@@ -57,8 +63,12 @@ from std.utils.static_tuple import StaticTuple
 from layout import Layout, LayoutTensor
 from layout.tensor_core_async import (
     TensorCoreAsync,
+    _convert_cfrags_to_simd,
+    _convert_cfrags_to_tuple,
+    _wgmma_descriptor,
     tile_layout_k_major,
     tile_layout_mn_major,
+    tile_to_descriptor,
     warpgroup_fence,
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
@@ -82,6 +92,91 @@ comptime _V4_PROD_CONSUMERS = 2
 comptime _V4_PROD_TMA_STORE = True
 
 
+# One (64 x BN x BK) slab of WGMMA work per consumer warp group through the
+# raw descriptor path, fence to fence.  TensorCoreAsync has no col-major A
+# mode, so operand majorness is expressed with COL_A / KMAJ_B exactly like
+# the non-persistent shared body in bf16_gemm_tn_v4_kernels.mojo (which
+# calls this helper too): canonical descriptor layouts follow each
+# operand's majorness and the stride formulas are majorness-generic (they
+# mirror TensorCoreAsync.wgmma).  The second consumer warp group advances
+# by one 64-row WGMMA tile within the shared A tile.
+@always_inline
+def _v4_mma_tile[
+    BN: Int,
+    COL_A: Bool,
+    KMAJ_B: Bool,
+    A_LAYOUT: Layout,
+    B_LAYOUT: Layout,
+](
+    a_smem: UnsafePointer[
+        Scalar[_V4_BF16], MutAnyOrigin, address_space=AddressSpace.SHARED
+    ],
+    b_smem: UnsafePointer[
+        Scalar[_V4_BF16], MutAnyOrigin, address_space=AddressSpace.SHARED
+    ],
+    accum: LayoutTensor[
+        _V4_F32,
+        Layout.row_major(1, 64 * BN // 128),
+        MutAnyOrigin,
+        address_space=AddressSpace.LOCAL,
+    ],
+    warp_group_idx: Int,
+):
+    comptime CFRAG = 64 * BN // 128
+    comptime a_canonical_layout = tile_to_descriptor[
+        _V4_BF16, A_LAYOUT, not COL_A
+    ]()
+    comptime b_canonical_layout = tile_to_descriptor[
+        _V4_BF16, B_LAYOUT, KMAJ_B
+    ]()
+    comptime a_shape00 = a_canonical_layout[0].shape[0].value()
+    comptime a_stride01 = a_canonical_layout[0].stride[1].value()
+    comptime a_stride11 = a_canonical_layout[1].stride[1].value()
+    comptime b_stride11 = b_canonical_layout[1].stride[1].value()
+    comptime a_m_stride = a_stride01 * (64 // a_shape00) * 2
+    comptime a_k_stride = a_stride11 * 2 * 2
+    comptime b_k_stride = b_stride11 * 2 * 2
+    comptime NUM_K_MMAS = _V4_BK // 16
+    var a_desc = _wgmma_descriptor[a_canonical_layout, not COL_A, _V4_SWIZZLE](
+        a_smem
+    )
+    var b_desc = _wgmma_descriptor[b_canonical_layout, KMAJ_B, _V4_SWIZZLE](
+        b_smem
+    )
+    a_desc += a_m_stride * (warp_group_idx - 1)
+
+    warpgroup_fence(accum)
+    wgmma_fence_aligned()
+    comptime for k_mma in range(NUM_K_MMAS):
+        var c_tuple = _convert_cfrags_to_tuple[_V4_F32, CFRAG](accum)
+        var c_out = wgmma_async[
+            64,
+            BN,
+            16,
+            a_type=_V4_BF16,
+            b_type=_V4_BF16,
+            layout_a="col" if COL_A else "row",
+            layout_b="col" if KMAJ_B else "row",
+        ](
+            a_desc + k_mma * a_k_stride,
+            b_desc + k_mma * b_k_stride,
+            c_tuple,
+        )
+        _convert_cfrags_to_simd[_V4_F32, CFRAG](c_out, accum)
+    wgmma_commit_group_sync()
+    warpgroup_fence(accum)
+    wgmma_wait_group_sync()
+
+
+# Kernel-symbol layout tag for the persistent body: col_a selects the TN
+# (wgrad) instantiation, plain NN (dgrad) otherwise.
+@always_inline
+def _v4_persistent_layout_tag[col_a: Bool]() -> StaticString:
+    comptime if col_a:
+        return "tn"
+    return "nn"
+
+
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
@@ -93,6 +188,11 @@ comptime _V4_PROD_TMA_STORE = True
         Int32(cluster_m), Int32(1), Int32(1)
     ),
 )
+# One kernel symbol per layout: the TN and NN instantiations of this body
+# would otherwise share one base name (differing only by mangling hash), so
+# GPU profiles could not tell them apart and scripts/compare_kernel_asm.py --
+# which pairs kernels by hash-stripped name -- would collide them.
+@__name(t"bf16_gemm_{_v4_persistent_layout_tag[col_a]()}_v4_persistent")
 def _v4_nn_persistent_ws[
     stages: Int,
     cluster_m: Int,
@@ -100,8 +200,21 @@ def _v4_nn_persistent_ws[
     bn: Int,
     consumers: Int,
     tma_store: Bool,
+    # col_a extends the persistent body to the TN (wgrad) layout: A is
+    # physically (K, M), TMA-loaded into an MN-major shared tile and
+    # consumed through WGMMA's col-major A mode via _v4_mma_tile.  The
+    # trailing shape parameters exist because the A TMA box follows the
+    # majorness; their defaults keep every pre-existing NN instantiation
+    # (and its generated code) unchanged.
+    col_a: Bool = False,
+    a_tile_shape: IndexList[2] = Index(_V4_BK, bm) if col_a else Index(
+        bm, _V4_BK
+    ),
+    a_desc_shape: IndexList[2] = Index(_V4_BK, 64) if col_a else Index(
+        bm, _V4_BK
+    ),
 ](
-    a_tma: TMATensorTile[_V4_BF16, 2, Index(bm, _V4_BK), Index(bm, _V4_BK)],
+    a_tma: TMATensorTile[_V4_BF16, 2, a_tile_shape, a_desc_shape],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 64), Index(_V4_BK, 64)],
     c_tma: TMATensorTile[_V4_BF16, 2, Index(bm, 64), Index(bm, 64)],
     output: _V4_PTR,
@@ -110,7 +223,9 @@ def _v4_nn_persistent_ws[
     k: Int,
 ):
     comptime if _is_sm_9x():
-        comptime A_LAYOUT = tile_layout_k_major[
+        comptime A_LAYOUT = tile_layout_mn_major[
+            _V4_BF16, bm, _V4_BK, _V4_SWIZZLE
+        ]() if col_a else tile_layout_k_major[
             _V4_BF16, bm, _V4_BK, _V4_SWIZZLE
         ]()
         comptime B_LAYOUT = tile_layout_mn_major[
@@ -226,7 +341,17 @@ def _v4_nn_persistent_ws[
                             alignment=128,
                         ](a_pipeline.ptr + stage * bm * _V4_BK)
                         var k0 = t * _V4_BK
-                        a_tma.async_copy(a_tile, full_barriers[stage], (k0, m0))
+                        # TMA coordinates are (fastest dim, slower dim) of
+                        # the global tensor the descriptor was built over:
+                        # (m, k) for the col-major (K, M) wgrad operand.
+                        comptime if col_a:
+                            a_tma.async_copy(
+                                a_tile, full_barriers[stage], (m0, k0)
+                            )
+                        else:
+                            a_tma.async_copy(
+                                a_tile, full_barriers[stage], (k0, m0)
+                            )
                         # Cooperative B load: each cluster rank reads its
                         # share of the 64-column chunks once from L2 and
                         # multicasts it to every peer, so the per-SM TMA
@@ -317,14 +442,21 @@ def _v4_nn_persistent_ws[
                         address_space=AddressSpace.SHARED,
                         alignment=128,
                     ](b_pipeline.ptr + stage * bn * _V4_BK)
-                    warpgroup_fence(accum)
-                    wgmma.arrive()
-                    wgmma.wgmma[consumers](
-                        a_tile, b_tile, accum, warp_group_idx - 1
-                    )
-                    wgmma.commit_group()
-                    warpgroup_fence(accum)
-                    wgmma.wait_group()
+                    comptime if col_a:
+                        # Raw descriptor path: TensorCoreAsync has no
+                        # col-major A mode.
+                        _v4_mma_tile[bn, True, False, A_LAYOUT, B_LAYOUT](
+                            a_tile.ptr, b_tile.ptr, accum, warp_group_idx
+                        )
+                    else:
+                        warpgroup_fence(accum)
+                        wgmma.arrive()
+                        wgmma.wgmma[consumers](
+                            a_tile, b_tile, accum, warp_group_idx - 1
+                        )
+                        wgmma.commit_group()
+                        warpgroup_fence(accum)
+                        wgmma.wait_group()
                     if warp_group_thread_idx < cluster_m:
                         empty_barriers[stage].arrive_cluster(
                             UInt32(warp_group_thread_idx)
@@ -413,6 +545,7 @@ def _v4_enqueue_nn_persistent[
     bn: Int,
     consumers: Int,
     tma_store: Bool = False,
+    col_a: Bool = False,
 ](
     output: _V4_PTR,
     a: _V4_PTR,
@@ -423,6 +556,13 @@ def _v4_enqueue_nn_persistent[
     sm_count: Int,
     ctx: DeviceContext,
 ) raises:
+    # A descriptor follows the operand's physical layout: (M, K) row-major
+    # with a whole-tile box, or -- for the TN/wgrad col_a route -- (K, M)
+    # row-major with a (BK, 64) box feeding the MN-major shared tile.
+    comptime A_TILE = Index(_V4_BK, bm) if col_a else Index(bm, _V4_BK)
+    comptime A_DESC = Index(_V4_BK, 64) if col_a else Index(bm, _V4_BK)
+    var a_dim0 = k if col_a else m
+    var a_dim1 = m if col_a else k
     var a_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
@@ -430,9 +570,9 @@ def _v4_enqueue_nn_persistent[
             1,
             owning=False,
         ),
-        IndexList[2](m, k),
-        IndexList[2](k, 1),
-        IndexList[2](bm, _V4_BK),
+        IndexList[2](a_dim0, a_dim1),
+        IndexList[2](a_dim1, 1),
+        IndexList[2](A_DESC[0], A_DESC[1]),
     )
     var b_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
         DeviceBuffer(
@@ -456,9 +596,7 @@ def _v4_enqueue_nn_persistent[
         IndexList[2](n, 1),
         IndexList[2](bm, 64),
     )
-    var a_tma = TMATensorTile[
-        _V4_BF16, 2, Index(bm, _V4_BK), Index(bm, _V4_BK)
-    ](a_desc)
+    var a_tma = TMATensorTile[_V4_BF16, 2, A_TILE, A_DESC](a_desc)
     var b_tma = TMATensorTile[
         _V4_BF16, 2, Index(_V4_BK, 64), Index(_V4_BK, 64)
     ](b_desc)
@@ -468,7 +606,9 @@ def _v4_enqueue_nn_persistent[
     var num_clusters = min(sm_count // cluster_m, total_works)
     var grid_x = num_clusters * cluster_m
     ctx.enqueue_function[
-        _v4_nn_persistent_ws[stages, cluster_m, bm, bn, consumers, tma_store]
+        _v4_nn_persistent_ws[
+            stages, cluster_m, bm, bn, consumers, tma_store, col_a
+        ]
     ](
         a_tma,
         b_tma,
@@ -567,3 +707,82 @@ def maybe_enqueue_bf16_gemm_nn_v4(
                         ](output, a, b, m, n, k, sm_count, ctx)
                         return True
     return False
+
+
+def maybe_enqueue_bf16_gemm_tn_v4_persistent(
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """Route a multi-wave TN (wgrad) GEMM to the persistent clustered v4
+    body in its col-major-A mode.
+
+    Called by the TN dispatcher in bf16_gemm_tn_v4_kernels.mojo AFTER its
+    split-K attempt (deep-K underfilled outputs stay on split-K) and BEFORE
+    the narrow-tile / v3 one-CTA-per-tile routes.  Engages only when the
+    128x256 tiling of the output is strictly multi-wave on the current GPU:
+    that is the regime where the one-CTA-per-tile kernels pay a per-wave
+    pipeline refill plus a serialized scalar epilogue, and where this body's
+    persistent scheduler, cluster B multicast and background TMA-store
+    epilogue were measured to win (H100 PCIe; same regime split as the NN
+    dispatcher above).  Single-wave shapes keep the pre-existing routes.
+
+    Precondition: m % 128 == 0, n % 256 == 0 and k % 64 == 0.  The only
+    caller (try_enqueue_bf16_gemm_tn_v4) gates m % 128 == 0 before calling,
+    so the kernel body's ragged-m clip path (TMA read clamp + store clip) is
+    unreachable and untested on the TN route.
+    Returns False when the caller must fall back."""
+    comptime if not _has_sm_9x():
+        return False
+    if ctx.api() != "cuda":
+        return False
+    var cc_major = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MAJOR)
+    var cc_minor = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR)
+    if cc_major != 9 or cc_minor != 0:
+        return False
+    # Aligned TN regime: n and k must tile exactly, and m arrives a multiple
+    # of 128 (the caller's gate; see the docstring).  The ordered bounds make
+    # all descriptor and address products machine-width safe.
+    # OPPORTUNITY (not taken here): the body itself could clip a ragged m,
+    # and lifting the caller's m % 128 gate is worth ~4x on ragged-m TN
+    # (2900x1280x192 measured 48 us on its fallback route vs 11.3 us for the
+    # 128-aligned neighbour).  That is new work needing its own correctness
+    # and perf pass on the TN clip path, which is untested in tree today.
+    if (
+        m < _V4_PROD_BM * _V4_PROD_CLUSTER_M
+        or n < _V4_PROD_BN
+        or k < _V4_BK
+        or n % _V4_PROD_BN != 0
+        or k % _V4_BK != 0
+        or Int(output) % 16 != 0
+        or Int(a) % 16 != 0
+        or Int(b) % 16 != 0
+        or m > 2_147_483_647
+        or n > 2_147_483_647
+        or k > 2_147_483_647
+        or k > 9_223_372_036_854_775_807 // m
+        or k > 9_223_372_036_854_775_807 // n
+        or n > 9_223_372_036_854_775_807 // m
+    ):
+        return False
+    var sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    if sm_count < _V4_PROD_CLUSTER_M:
+        return False
+    # Strictly multi-wave 128x256 grid only (see docstring).
+    var blocks_m = (m + _V4_PROD_BM - 1) // _V4_PROD_BM
+    if blocks_m * (n // _V4_PROD_BN) <= sm_count:
+        return False
+    _v4_enqueue_nn_persistent[
+        _V4_PROD_STAGES,
+        _V4_PROD_CLUSTER_M,
+        _V4_PROD_BM,
+        _V4_PROD_BN,
+        _V4_PROD_CONSUMERS,
+        _V4_PROD_TMA_STORE,
+        True,
+    ](output, a, b, m, n, k, sm_count, ctx)
+    return True
