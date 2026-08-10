@@ -424,7 +424,7 @@ def _tile_body[
             bz += Int(grid_dim.z)
 
 
-@__name("nanogpt_tf32_gemm_tile")
+@__name("tf32_gemm_tile")
 def _gemm_tile[
     TA: Bool,
     TB: Bool,
@@ -452,7 +452,7 @@ def _gemm_tile[
     )
 
 
-@__name("nanogpt_tf32_bmm_tile")
+@__name("tf32_bmm_tile")
 def _bmm_tile[
     TA: Bool,
     TB: Bool,

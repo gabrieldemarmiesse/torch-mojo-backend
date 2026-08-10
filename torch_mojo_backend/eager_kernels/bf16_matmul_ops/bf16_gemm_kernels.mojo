@@ -562,7 +562,7 @@ def _gemm_fastk_tag[FASTK: Bool]() -> StaticString:
 # once) and the FASTK builds take the one-batch-per-grid.z body, so BATCHED is
 # exactly the complement of FASTK here.
 @__name(
-    t"nanogpt_bf16_gemm_{_gemm_layout_tag[TA, TB]()}{_gemm_regime_tag[BM, BN]()}{_gemm_fastk_tag[FASTK]()}"
+    t"bf16_gemm_{_gemm_layout_tag[TA, TB]()}{_gemm_regime_tag[BM, BN]()}{_gemm_fastk_tag[FASTK]()}"
 )
 def _gemm_entry[
     TA: Bool, TB: Bool, BM: Int, BN: Int, FASTK: Bool
@@ -633,7 +633,7 @@ def _bmm_fastk_tag[FASTK: Bool]() -> StaticString:
 # one batch per grid.z block, so it never runs the kernel's batch loop, while
 # a guarded launch grid-strides batches through it.
 @__name(
-    t"nanogpt_bf16_bmm_{_bmm_layout_tag[TA, TB]()}{_bmm_regime_tag[BM, BN]()}{_bmm_fastk_tag[FASTK]()}"
+    t"bf16_bmm_{_bmm_layout_tag[TA, TB]()}{_bmm_regime_tag[BM, BN]()}{_bmm_fastk_tag[FASTK]()}"
 )
 def _bmm_entry[
     TA: Bool, TB: Bool, BM: Int, BN: Int, FASTK: Bool
@@ -1031,7 +1031,7 @@ def _wide_layout_tag[TA: Bool, TB: Bool]() -> StaticString:
         return "nt" if TB else "nn"
 
 
-@__name(t"nanogpt_bf16_gemm_{_wide_layout_tag[TA, TB]()}_wide")
+@__name(t"bf16_gemm_{_wide_layout_tag[TA, TB]()}_wide")
 def _gemm_wide[
     TA: Bool, TB: Bool
 ](
@@ -1067,7 +1067,7 @@ def _gemm_wide[
     )
 
 
-@__name(t"nanogpt_bf16_bmm_{_wide_layout_tag[TA, TB]()}_wide")
+@__name(t"bf16_bmm_{_wide_layout_tag[TA, TB]()}_wide")
 def _bmm_wide[
     TA: Bool, TB: Bool
 ](

@@ -219,7 +219,7 @@ comptime _V3_TN_SMALL_B_PIPE_LAYOUT = Layout.row_major(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V3_NN_THREADS))
 )
-@__name("nanogpt_bf16_gemm_v3_nn_ws_m128n256_tma_s3")
+@__name("bf16_gemm_v3_nn_ws_m128n256_tma_s3")
 def _v3_nn_ws_m128n256_tma_s3(
     a_tma: _V3_NN_A_TMA,
     b_tma: _V3_NN_B_TMA,
@@ -433,7 +433,7 @@ def _v3_enqueue_nn_ws_m128n256_tma_s3(
         Int32(_V3_NN_SMALL_THREADS)
     )
 )
-@__name("nanogpt_bf16_gemm_v3_nn_ws_m64n128_tma_s3")
+@__name("bf16_gemm_v3_nn_ws_m64n128_tma_s3")
 def _v3_nn_ws_m64n128_tma_s3(
     a_tma: _V3_NN_SMALL_A_TMA,
     b_tma: _V3_NN_SMALL_B_TMA,
@@ -650,7 +650,7 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V3_NT_THREADS))
 )
-@__name("nanogpt_bf16_gemm_v3_nt_ws_m128n256_tma_s3")
+@__name("bf16_gemm_v3_nt_ws_m128n256_tma_s3")
 def _v3_nt_ws_m128n256_tma_s3(
     a_tma: _V3_NT_A_TMA,
     b_tma: _V3_B_K_TMA,
@@ -862,7 +862,7 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
         Int32(_V3_TN_SMALL_THREADS)
     )
 )
-@__name("nanogpt_bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3")
+@__name("bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3")
 def _v3_tn_ws_m64n128_tma_col_a_s3(
     a_tma: _V3_TN_SMALL_A_TMA,
     b_tma: _V3_TN_SMALL_B_TMA,
@@ -1110,7 +1110,7 @@ def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
         Int32(_V3_TN_WS_THREADS)
     )
 )
-@__name("nanogpt_bf16_gemm_v3_tn_ws_m128n256_tma_col_a_s3")
+@__name("bf16_gemm_v3_tn_ws_m128n256_tma_col_a_s3")
 def _v3_tn_ws_m128n256_tma_col_a_s3(
     a_tma: _V3_TN_WS_A_TMA,
     b_tma: _V3_TN_WS_B_TMA,

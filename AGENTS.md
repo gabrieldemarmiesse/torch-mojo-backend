@@ -170,6 +170,15 @@ CuBLAS/CuDNN/rocBLAS underneath. If a fully dynamic-shape function is not
 available in the modular repo, write the kernel yourself.
 If you have access to multiple gpus, the aten function should work on all those gpus.
 
+Name kernels after the algorithm, never after a model or a workload. The
+`@__name` string is what CUPTI, torch.profiler, Nsight and rocprof print, so a
+user profiling their own model reads it: `bf16_gemm_tn_ws_m64n128_tma_col_a_s3`
+tells them what ran, `nanogpt_bf16_gemm_...` tells them something false. The
+house grammar is `<algorithm-or-route>_<layout/regime>_<dtype>_<tuning params>`
+with no project prefix — `pure_gemm_pipe3_...`, `amd_splitk_mfma_...`,
+`fa_mfma_...`, `lsm_bwd_...`. Recording the workload a tuning constant was
+fitted to belongs in a comment next to the constant, not in the kernel name.
+
 ### Step 8: Re-run Tests
 Run the unit tests again and verify they pass:
 ```bash

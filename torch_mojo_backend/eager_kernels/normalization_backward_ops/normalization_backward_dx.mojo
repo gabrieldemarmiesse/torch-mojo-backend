@@ -193,7 +193,7 @@ def _dx_warp_rows[
         row += row_stride
 
 
-@__name("nanogpt_layer_norm_backward_dx_f32_c1")
+@__name("layer_norm_backward_dx_f32_c1")
 def _dx_c1(
     dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -220,7 +220,7 @@ def _dx_c1(
     )
 
 
-@__name("nanogpt_layer_norm_backward_dx_f32_c2")
+@__name("layer_norm_backward_dx_f32_c2")
 def _dx_c2(
     dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -247,7 +247,7 @@ def _dx_c2(
     )
 
 
-@__name("nanogpt_layer_norm_backward_dx_f32_c3")
+@__name("layer_norm_backward_dx_f32_c3")
 def _dx_c3(
     dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -274,7 +274,7 @@ def _dx_c3(
     )
 
 
-@__name("nanogpt_layer_norm_backward_dx_f32_c4")
+@__name("layer_norm_backward_dx_f32_c4")
 def _dx_c4(
     dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -301,7 +301,7 @@ def _dx_c4(
     )
 
 
-@__name("nanogpt_layer_norm_backward_dx_f32_c6")
+@__name("layer_norm_backward_dx_f32_c6")
 def _dx_c6(
     dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -328,7 +328,7 @@ def _dx_c6(
     )
 
 
-@__name("nanogpt_layer_norm_backward_dx_f32_c8")
+@__name("layer_norm_backward_dx_f32_c8")
 def _dx_c8(
     dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -355,7 +355,7 @@ def _dx_c8(
     )
 
 
-@__name("nanogpt_layer_norm_backward_dx_f32_generic")
+@__name("layer_norm_backward_dx_f32_generic")
 def _dx_generic(
     dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -439,7 +439,7 @@ def enqueue_layer_norm_backward_dx_f32(
                 if needed <= 1:
                     _enqueue_cached[_dx_c1](
                         ctx,
-                        "nanogpt_layer_norm_backward_dx_f32_c1",
+                        "layer_norm_backward_dx_f32_c1",
                         grid,
                         1,
                         1,
@@ -458,7 +458,7 @@ def enqueue_layer_norm_backward_dx_f32(
                 elif needed <= 2:
                     _enqueue_cached[_dx_c2](
                         ctx,
-                        "nanogpt_layer_norm_backward_dx_f32_c2",
+                        "layer_norm_backward_dx_f32_c2",
                         grid,
                         1,
                         1,
@@ -477,7 +477,7 @@ def enqueue_layer_norm_backward_dx_f32(
                 elif needed <= 3:
                     _enqueue_cached[_dx_c3](
                         ctx,
-                        "nanogpt_layer_norm_backward_dx_f32_c3",
+                        "layer_norm_backward_dx_f32_c3",
                         grid,
                         1,
                         1,
@@ -496,7 +496,7 @@ def enqueue_layer_norm_backward_dx_f32(
                 elif needed <= 4:
                     _enqueue_cached[_dx_c4](
                         ctx,
-                        "nanogpt_layer_norm_backward_dx_f32_c4",
+                        "layer_norm_backward_dx_f32_c4",
                         grid,
                         1,
                         1,
@@ -515,7 +515,7 @@ def enqueue_layer_norm_backward_dx_f32(
                 elif needed <= 6:
                     _enqueue_cached[_dx_c6](
                         ctx,
-                        "nanogpt_layer_norm_backward_dx_f32_c6",
+                        "layer_norm_backward_dx_f32_c6",
                         grid,
                         1,
                         1,
@@ -534,7 +534,7 @@ def enqueue_layer_norm_backward_dx_f32(
                 else:
                     _enqueue_cached[_dx_c8](
                         ctx,
-                        "nanogpt_layer_norm_backward_dx_f32_c8",
+                        "layer_norm_backward_dx_f32_c8",
                         grid,
                         1,
                         1,
@@ -554,7 +554,7 @@ def enqueue_layer_norm_backward_dx_f32(
         var grid = min(rows, _MAX_GRID)
         _enqueue_cached[_dx_generic](
             ctx,
-            "nanogpt_layer_norm_backward_dx_f32_generic",
+            "layer_norm_backward_dx_f32_generic",
             grid,
             1,
             1,

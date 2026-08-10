@@ -4020,11 +4020,11 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     assert "from bf16_gemm_kernels import (" in v3_source
     assert "from bf16_gemm_tn_v4_kernels import" in v3_source
     for kernel_name in (
-        "nanogpt_bf16_gemm_v3_nn_ws_m64n128_tma_s3",
-        "nanogpt_bf16_gemm_v3_nn_ws_m128n256_tma_s3",
-        "nanogpt_bf16_gemm_v3_nt_ws_m128n256_tma_s3",
-        "nanogpt_bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3",
-        "nanogpt_bf16_gemm_v3_tn_ws_m128n256_tma_col_a_s3",
+        "bf16_gemm_v3_nn_ws_m64n128_tma_s3",
+        "bf16_gemm_v3_nn_ws_m128n256_tma_s3",
+        "bf16_gemm_v3_nt_ws_m128n256_tma_s3",
+        "bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3",
+        "bf16_gemm_v3_tn_ws_m128n256_tma_col_a_s3",
     ):
         assert f'@__name("{kernel_name}")' in v3_source
 
@@ -4034,17 +4034,15 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     ):
         assert v3_source.count(f"{helper_name}(") == 2
 
-    nt_kernel_start = v3_source.index(
-        '@__name("nanogpt_bf16_gemm_v3_nt_ws_m128n256_tma_s3")'
-    )
+    nt_kernel_start = v3_source.index('@__name("bf16_gemm_v3_nt_ws_m128n256_tma_s3")')
     nt_kernel_end = v3_source.index(
-        '@__name("nanogpt_bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3")'
+        '@__name("bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3")'
     )
     nt_source = v3_source[nt_kernel_start:nt_kernel_end]
     assert "b_tma.prefetch_descriptor()\n        barrier()" in nt_source
     assert "DeviceAttribute.MULTIPROCESSOR_COUNT" in v3_source
     for scratch_only in (
-        "nanogpt_bf16_gemm_v3_nn_wgmma_tma_s2",
+        "bf16_gemm_v3_nn_wgmma_tma_s2",
         "_v3_enqueue_nt_ws_m128n256_tma_s4",
         "candidate_bf16_gemm_accepted_v2",
         "GPT-5.6-SOL",

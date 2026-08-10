@@ -157,9 +157,7 @@ def _fused_rows[
         row += row_stride
 
 
-@__name(
-    t"nanogpt_sdpa_dropout_softmax_bwd_{dtype}_m{has_mask}_c{causal}_v{VEC}"
-)
+@__name(t"sdpa_dropout_softmax_bwd_{dtype}_m{has_mask}_c{causal}_v{VEC}")
 def _fused_kernel[
     dtype: DType, has_mask: Bool, causal: Bool, VEC: Int
 ](
@@ -204,7 +202,7 @@ def _enqueue_one[
     _enqueue_cached[_fused_kernel[dtype, has_mask, causal, VEC]](
         ctx,
         String(
-            t"nanogpt_sdpa_dropout_softmax_bwd_{dtype}_m{has_mask}_c{causal}_v{VEC}"
+            t"sdpa_dropout_softmax_bwd_{dtype}_m{has_mask}_c{causal}_v{VEC}"
         ),
         min(ceildiv(rows, _WARPS_PER_BLOCK), _MAX_GRID),
         1,
@@ -407,7 +405,7 @@ comptime _MAX_VPT = 4 if has_apple_gpu_accelerator() else 8  # per-lane slots
 comptime _CVEC = 4  # float4 loads; requires 16B-aligned rows
 
 
-@__name("nanogpt_sdpa_dropout_softmax_backward_masked_f32")
+@__name("sdpa_dropout_softmax_backward_masked_f32")
 def _masked_f32(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -458,7 +456,7 @@ def _masked_f32(
         row += row_stride
 
 
-@__name("nanogpt_sdpa_dropout_softmax_backward_unmasked_f32")
+@__name("sdpa_dropout_softmax_backward_unmasked_f32")
 def _unmasked_f32(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -628,7 +626,7 @@ def _unmasked_causal_warp_f32[
         row += row_stride
 
 
-@__name("nanogpt_sdpa_dropout_softmax_backward_masked_causal_f32")
+@__name("sdpa_dropout_softmax_backward_masked_causal_f32")
 def _masked_causal_f32(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -681,7 +679,7 @@ def _masked_causal_f32(
         row += row_stride
 
 
-@__name("nanogpt_sdpa_dropout_softmax_backward_unmasked_causal_f32")
+@__name("sdpa_dropout_softmax_backward_unmasked_causal_f32")
 def _unmasked_causal_f32(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -834,7 +832,7 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
         elif causal and has_mask:
             _enqueue_cached[_masked_causal_f32](
                 ctx,
-                "nanogpt_sdpa_dropout_softmax_backward_masked_causal_f32",
+                "sdpa_dropout_softmax_backward_masked_causal_f32",
                 grid,
                 1,
                 1,
@@ -852,7 +850,7 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
         elif causal:
             _enqueue_cached[_unmasked_causal_f32](
                 ctx,
-                "nanogpt_sdpa_dropout_softmax_backward_unmasked_causal_f32",
+                "sdpa_dropout_softmax_backward_unmasked_causal_f32",
                 grid,
                 1,
                 1,
@@ -869,7 +867,7 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
             var mask_ptr = mask.value()
             _enqueue_cached[_masked_f32](
                 ctx,
-                "nanogpt_sdpa_dropout_softmax_backward_masked_f32",
+                "sdpa_dropout_softmax_backward_masked_f32",
                 grid,
                 1,
                 1,
@@ -886,7 +884,7 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
         else:
             _enqueue_cached[_unmasked_f32](
                 ctx,
-                "nanogpt_sdpa_dropout_softmax_backward_unmasked_f32",
+                "sdpa_dropout_softmax_backward_unmasked_f32",
                 grid,
                 1,
                 1,

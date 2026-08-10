@@ -148,7 +148,7 @@ def _atomic_add_f32_vec4(
             _atomic_add_f32(ptr + k, value[k])
 
 
-@__name("nanogpt_embedding_dense_backward_zero_vec4")
+@__name("embedding_dense_backward_zero_vec4")
 def _zero_vec4(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     head: Int,
@@ -169,7 +169,7 @@ def _zero_vec4(
         v += stride
 
 
-@__name("nanogpt_embedding_dense_backward_zero_scalar")
+@__name("embedding_dense_backward_zero_scalar")
 def _zero_scalar(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     elements: Int,
@@ -181,7 +181,7 @@ def _zero_scalar(
         index += stride
 
 
-@__name("nanogpt_embedding_dense_backward_scatter_vec4")
+@__name("embedding_dense_backward_scatter_vec4")
 def _scatter_vec4(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -205,7 +205,7 @@ def _scatter_vec4(
         e += stride
 
 
-@__name("nanogpt_embedding_dense_backward_scatter_scalar")
+@__name("embedding_dense_backward_scatter_scalar")
 def _scatter_scalar(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -228,7 +228,7 @@ def _scatter_scalar(
         e += stride
 
 
-@__name("nanogpt_embedding_dense_backward_count_zero")
+@__name("embedding_dense_backward_count_zero")
 def _count_zero(
     counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
     num_weights: Int,
@@ -240,7 +240,7 @@ def _count_zero(
         index += stride
 
 
-@__name("nanogpt_embedding_dense_backward_count")
+@__name("embedding_dense_backward_count")
 def _count(
     counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
     indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
@@ -258,7 +258,7 @@ def _count(
         index += stride
 
 
-@__name("nanogpt_embedding_dense_backward_zero_untouched")
+@__name("embedding_dense_backward_zero_untouched")
 def _zero_untouched(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
@@ -283,7 +283,7 @@ def _zero_untouched(
         row += row_stride
 
 
-@__name("nanogpt_embedding_dense_backward_scatter_hist_vec4")
+@__name("embedding_dense_backward_scatter_hist_vec4")
 def _scatter_hist_vec4(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -314,7 +314,7 @@ def _scatter_hist_vec4(
         row += row_stride
 
 
-@__name("nanogpt_embedding_dense_backward_owner_vec4")
+@__name("embedding_dense_backward_owner_vec4")
 def _owner_vec4(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -362,7 +362,7 @@ def _owner_vec4(
         )
 
 
-@__name("nanogpt_embedding_dense_backward_owner_scalar")
+@__name("embedding_dense_backward_owner_scalar")
 def _owner_scalar(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -399,7 +399,7 @@ def _owner_scalar(
         grad_weight[row * embedding_dim + col] = acc
 
 
-@__name("nanogpt_embedding_dense_backward_table_accum")
+@__name("embedding_dense_backward_table_accum")
 def _table_accum(
     scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -476,7 +476,7 @@ def _table_accum(
             r += _TABLE_ROWG
 
 
-@__name("nanogpt_embedding_dense_backward_table_reduce")
+@__name("embedding_dense_backward_table_reduce")
 def _table_reduce(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -568,7 +568,7 @@ def enqueue_embedding_dense_backward_f32_i64(
     if scale_grad_by_freq:
         raise Error(
             "embedding_dense_backward candidate: scale_grad_by_freq=True is"
-            " unsupported in the initial nanoGPT contract"
+            " unsupported"
         )
     var output_elements = num_weights * embedding_dim
     if output_elements <= 0:

@@ -87,7 +87,7 @@ def _philox4x32_10(counter: UInt64, seed: UInt64) -> SIMD[DType.uint32, 4]:
     return SIMD[DType.uint32, 4](c0, c1, c2, c3)
 
 
-@__name("nanogpt_native_dropout_forward_philox_vec4")
+@__name("native_dropout_forward_philox_vec4")
 def _forward_vec4(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
@@ -126,7 +126,7 @@ def _forward_vec4(
                 mask[idx] = Scalar[DType.bool](keep_bit != 0)
 
 
-@__name("nanogpt_native_dropout_forward_philox_generic")
+@__name("native_dropout_forward_philox_generic")
 def _forward_generic(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
@@ -151,7 +151,7 @@ def _forward_generic(
             mask[idx] = Scalar[DType.bool](keep_bit != 0)
 
 
-@__name("nanogpt_native_dropout_forward_zero_fill")
+@__name("native_dropout_forward_zero_fill")
 def _forward_zero_fill(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
@@ -166,7 +166,7 @@ def _forward_zero_fill(
             mask[idx] = Scalar[DType.bool](False)
 
 
-@__name("nanogpt_native_dropout_backward_vec4")
+@__name("native_dropout_backward_vec4")
 def _backward_vec4(
     grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -194,7 +194,7 @@ def _backward_vec4(
                 )
 
 
-@__name("nanogpt_native_dropout_backward_generic")
+@__name("native_dropout_backward_generic")
 def _backward_generic(
     grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],

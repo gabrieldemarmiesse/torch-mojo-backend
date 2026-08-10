@@ -323,7 +323,7 @@ def _v4_tn_ws_body[
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name("nanogpt_bf16_gemm_tn_v4_splitk_m128n256_s4")
+@__name("bf16_gemm_tn_v4_splitk_m128n256_s4")
 def _v4_tn_splitk_m128n256_s4(
     a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)],
@@ -343,7 +343,7 @@ def _v4_tn_splitk_m128n256_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name("nanogpt_bf16_gemm_tn_v4_direct_m128n192_s4")
+@__name("bf16_gemm_tn_v4_direct_m128n192_s4")
 def _v4_tn_direct_m128n192_s4(
     a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
@@ -365,7 +365,7 @@ def _v4_tn_direct_m128n192_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name("nanogpt_bf16_gemm_tn_v4_direct_m128n192_s3g16")
+@__name("bf16_gemm_tn_v4_direct_m128n192_s3g16")
 def _v4_tn_direct_m128n192_s3g16(
     a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
@@ -391,7 +391,7 @@ comptime _V4_RED_SPAN = _V4_RED_THREADS * _V4_RED_GROUPS * 4
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_RED_THREADS))
 )
-@__name("nanogpt_bf16_gemm_tn_v4_splitk_reduce")
+@__name("bf16_gemm_tn_v4_splitk_reduce")
 def _v4_tn_splitk_reduce(
     output: _V4_PTR,
     ws: _V4_F32_PTR,
