@@ -47,7 +47,10 @@ from bf16_gemm_kernels import (
 )
 from bf16_gemm_nn_v4_kernels import maybe_enqueue_bf16_gemm_nn_v4
 from bf16_gemm_nt_v4_kernels import maybe_enqueue_bf16_gemm_nt_v4
-from bf16_gemm_tn_v4_kernels import try_enqueue_bf16_gemm_tn_v4
+from bf16_gemm_tn_v4_kernels import (
+    try_enqueue_bf16_gemm_splitk_rm_v4,
+    try_enqueue_bf16_gemm_tn_v4,
+)
 
 
 comptime _V3_BF16 = DType.bfloat16
@@ -1375,6 +1378,13 @@ def enqueue_bf16_gemm(
     # n/k, TMA-compatible sizes) and returns False otherwise, in which case
     # the pre-existing NT path below remains the fallback.
     if not transpose_a and transpose_b and not has_bias:
+        # Deep-K split-K route first: the persistent kernel below keeps all
+        # SMs resident but cannot parallelize over K, so an output with few
+        # macro-tiles and a deep reduction leaves most of the GPU idle.
+        # The helper gates itself on that regime (see
+        # bf16_gemm_tn_v4_kernels.mojo) and returns False otherwise.
+        if try_enqueue_bf16_gemm_splitk_rm_v4[True](output, a, b, m, n, k, ctx):
+            return
         if maybe_enqueue_bf16_gemm_nt_v4(output, a, b, m, n, k, ctx):
             return
     comptime if _has_sm_9x():
@@ -1394,6 +1404,16 @@ def enqueue_bf16_gemm(
                 # route below serves better (m % 64 == 0 and its whole
                 # grid fits one wave); it returns False for those, in
                 # which case the v3 NN paths below remain the fallback.
+                # Deep-K split-K route for NN (and TT, which aten_fast.py
+                # rewrites into NN): checked before the persistent kernel
+                # because a persistent CTA serializes its tiles' whole K
+                # depth -- few output macro-tiles plus deep K leaves most
+                # SMs idle.  The helper gates itself on that regime.
+                if not transpose_a and not transpose_b and not has_bias:
+                    if try_enqueue_bf16_gemm_splitk_rm_v4[False](
+                        output, a, b, m, n, k, ctx
+                    ):
+                        return
                 if maybe_enqueue_bf16_gemm_nn_v4(
                     output,
                     a,

@@ -55,6 +55,7 @@ from layout.tensor_core_async import (
     _convert_cfrags_to_simd,
     _convert_cfrags_to_tuple,
     _wgmma_descriptor,
+    tile_layout_k_major,
     tile_layout_mn_major,
     tile_to_descriptor,
     warpgroup_fence,
@@ -78,19 +79,55 @@ comptime _V4_MAX_SPLITS = 8
 comptime _V4_MAX_WS_BYTES = 256 * 1024 * 1024
 
 
+# Operand-layout parametrization of the shared body.  COL_A means A is
+# physically (K, M) -- the wgrad/TN operand read column-major -- and is
+# loaded into an MN-major shared tile for WGMMA's "col" A mode; otherwise A
+# is physically (M, K) and loaded K-major for the "row" mode.  KMAJ_B means
+# B is physically (N, K) (an NT weight reached through .t()) and loaded
+# K-major for WGMMA's "col" B mode; otherwise B is physically (K, N) and
+# loaded MN-major for the "row" mode.  TN = (True, False), NT = (False,
+# True), NN = (False, False).  TT never reaches this file: aten_fast.py
+# rewrites it as an NN GEMM on the swapped operands.
+def _v4_a_smem_layout[COL_A: Bool]() -> Layout:
+    comptime if COL_A:
+        return tile_layout_mn_major[_V4_BF16, _V4_BM, _V4_BK, _V4_SWIZZLE]()
+    return tile_layout_k_major[_V4_BF16, _V4_BM, _V4_BK, _V4_SWIZZLE]()
+
+
+def _v4_b_smem_layout[BN: Int, KMAJ_B: Bool]() -> Layout:
+    comptime if KMAJ_B:
+        return tile_layout_k_major[_V4_BF16, BN, _V4_BK, _V4_SWIZZLE]()
+    return tile_layout_mn_major[_V4_BF16, BN, _V4_BK, _V4_SWIZZLE]()
+
+
 # ============================================================================
 # Shared warp-specialized TMA + WGMMA body.
 #
 # SPLITK=True : accumulates BK-tiles [tile_start, tile_start + chunk) and
 #               stores the fp32 partial tile into ws at slice block_idx.y.
 # SPLITK=False: accumulates the whole K range and stores bf16 into out.
+#
+# The TMA tile/descriptor shapes are infer-only: each concrete entry point
+# passes descriptors matching its operand majorness (built by the enqueue
+# helpers below), and COL_A / KMAJ_B select the matching shared-memory
+# layouts, TMA coordinate order and WGMMA modes.
 # ============================================================================
 @always_inline
 def _v4_tn_ws_body[
-    BN: Int, STAGES: Int, SPLITK: Bool, GROUP_ROWS: Int
+    a_tile: IndexList[2],
+    a_desc: IndexList[2],
+    b_tile: IndexList[2],
+    b_desc: IndexList[2],
+    //,
+    BN: Int,
+    STAGES: Int,
+    SPLITK: Bool,
+    GROUP_ROWS: Int,
+    COL_A: Bool = True,
+    KMAJ_B: Bool = False,
 ](
-    a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
-    b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, BN), Index(_V4_BK, 64)],
+    a_tma: TMATensorTile[_V4_BF16, 2, a_tile, a_desc],
+    b_tma: TMATensorTile[_V4_BF16, 2, b_tile, b_desc],
     output: _V4_PTR,
     ws: _V4_F32_PTR,
     m: Int,
@@ -99,12 +136,8 @@ def _v4_tn_ws_body[
     chunk_tiles: Int,
 ):
     comptime if _is_sm_9x():
-        comptime A_LAYOUT = tile_layout_mn_major[
-            _V4_BF16, _V4_BM, _V4_BK, _V4_SWIZZLE
-        ]()
-        comptime B_LAYOUT = tile_layout_mn_major[
-            _V4_BF16, BN, _V4_BK, _V4_SWIZZLE
-        ]()
+        comptime A_LAYOUT = _v4_a_smem_layout[COL_A]()
+        comptime B_LAYOUT = _v4_b_smem_layout[BN, KMAJ_B]()
         comptime A_PIPE_LAYOUT = Layout.row_major(STAGES, _V4_BM * _V4_BK)
         comptime B_PIPE_LAYOUT = Layout.row_major(STAGES, BN * _V4_BK)
 
@@ -199,8 +232,16 @@ def _v4_tn_ws_body[
                         alignment=128,
                     ](b_pipeline.ptr + stage * BN * _V4_BK)
                     var k0 = (tile_start + it) * _V4_BK
-                    a_tma.async_copy(a_tile, full_barriers[stage], (m0, k0))
-                    b_tma.async_copy(b_tile, full_barriers[stage], (n0, k0))
+                    # TMA coordinates are (fastest dim, slower dim) of the
+                    # global tensor each descriptor was built over.
+                    comptime if COL_A:
+                        a_tma.async_copy(a_tile, full_barriers[stage], (m0, k0))
+                    else:
+                        a_tma.async_copy(a_tile, full_barriers[stage], (k0, m0))
+                    comptime if KMAJ_B:
+                        b_tma.async_copy(b_tile, full_barriers[stage], (k0, n0))
+                    else:
+                        b_tma.async_copy(b_tile, full_barriers[stage], (n0, k0))
                     it += 1
         else:
             warpgroup_reg_alloc[232]()
@@ -212,14 +253,17 @@ def _v4_tn_ws_body[
             ].stack_allocation()
             _ = accum.fill(0.0)
 
-            # MN-major descriptors are required for WGMMA's column-major A
-            # and row-major B modes.  The second consumer advances by one
-            # 64-row WGMMA tile within the shared A tile.
+            # Canonical descriptor layouts follow each operand's majorness
+            # (MN-major for WGMMA's "col" A / "row" B modes, K-major for
+            # "row" A / "col" B).  The second consumer advances by one
+            # 64-row WGMMA tile within the shared A tile; the stride
+            # formulas below are majorness-generic (they mirror
+            # TensorCoreAsync.wgmma).
             comptime a_canonical_layout = tile_to_descriptor[
-                _V4_BF16, A_LAYOUT, False
+                _V4_BF16, A_LAYOUT, not COL_A
             ]()
             comptime b_canonical_layout = tile_to_descriptor[
-                _V4_BF16, B_LAYOUT, False
+                _V4_BF16, B_LAYOUT, KMAJ_B
             ]()
             comptime a_shape00 = a_canonical_layout[0].shape[0].value()
             comptime a_stride01 = a_canonical_layout[0].stride[1].value()
@@ -250,10 +294,10 @@ def _v4_tn_ws_body[
                     alignment=128,
                 ](b_pipeline.ptr + stage * BN * _V4_BK)
                 var a_desc = _wgmma_descriptor[
-                    a_canonical_layout, False, _V4_SWIZZLE
+                    a_canonical_layout, not COL_A, _V4_SWIZZLE
                 ](a_tile.ptr)
                 var b_desc = _wgmma_descriptor[
-                    b_canonical_layout, False, _V4_SWIZZLE
+                    b_canonical_layout, KMAJ_B, _V4_SWIZZLE
                 ](b_tile.ptr)
                 a_desc += a_m_stride * (warp_group_idx - 1)
 
@@ -269,8 +313,8 @@ def _v4_tn_ws_body[
                         16,
                         a_type=_V4_BF16,
                         b_type=_V4_BF16,
-                        layout_a="col",
-                        layout_b="row",
+                        layout_a="col" if COL_A else "row",
+                        layout_b="col" if KMAJ_B else "row",
                     ](
                         a_desc + k_mma * a_k_stride,
                         b_desc + k_mma * b_k_stride,
@@ -334,6 +378,55 @@ def _v4_tn_splitk_m128n256_s4(
     chunk_tiles: Int,
 ):
     _v4_tn_ws_body[256, 4, True, 8](
+        a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
+    )
+
+
+# Split-K specializations for the row-major-A layouts.  Same body, same
+# tile/stage/raster configuration as the TN split-K kernel; only the operand
+# majorness comptimes differ.  NT reads B through a K-major (N, K) buffer;
+# NN reads it MN-major like TN.  TT is rewritten as NN by aten_fast.py, so
+# the NN kernel serves it too.
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
+@__name("bf16_gemm_nt_v4_splitk_m128n256_s4")
+def _v4_nt_splitk_m128n256_s4(
+    a_tma: TMATensorTile[
+        _V4_BF16, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+    ],
+    b_tma: TMATensorTile[_V4_BF16, 2, Index(256, _V4_BK), Index(256, _V4_BK)],
+    ws: _V4_F32_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    chunk_tiles: Int,
+):
+    _v4_tn_ws_body[256, 4, True, 8, False, True](
+        a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
+    )
+
+
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
+@__name("bf16_gemm_nn_v4_splitk_m128n256_s4")
+def _v4_nn_splitk_m128n256_s4(
+    a_tma: TMATensorTile[
+        _V4_BF16, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+    ],
+    b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)],
+    ws: _V4_F32_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    chunk_tiles: Int,
+):
+    _v4_tn_ws_body[256, 4, True, 8, False, False](
         a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
     )
 
@@ -457,18 +550,35 @@ def _v4_make_a_tma(
     )
 
 
-def _v4_enqueue_splitk_m128n256(
-    output: _V4_PTR,
-    a: _V4_PTR,
-    b: _V4_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
-    grid_x: Int,
-    splits: Int,
-    ctx: DeviceContext,
-) raises:
-    var a_tma = _v4_make_a_tma(a, m, k, ctx)
+# A physically (M, K) row-major, whole (BM, BK) box (the K-major operand of
+# the NT / NN split-K kernels).
+def _v4_make_a_row_tma(
+    a: _V4_PTR, m: Int, k: Int, ctx: DeviceContext
+) raises -> TMATensorTile[
+    _V4_BF16, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+]:
+    var a_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+        DeviceBuffer(
+            ctx,
+            a.address_space_cast[AddressSpace.GENERIC](),
+            1,
+            owning=False,
+        ),
+        IndexList[2](m, k),
+        IndexList[2](k, 1),
+        IndexList[2](_V4_BM, _V4_BK),
+    )
+    return TMATensorTile[
+        _V4_BF16, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+    ](a_desc)
+
+
+# B physically (K, N) row-major, MN-major shared tile (TN and NN).
+def _v4_make_b_mn_tma[
+    BN: Int
+](b: _V4_PTR, n: Int, k: Int, ctx: DeviceContext) raises -> TMATensorTile[
+    _V4_BF16, 2, Index(_V4_BK, BN), Index(_V4_BK, 64)
+]:
     var b_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
@@ -480,25 +590,89 @@ def _v4_enqueue_splitk_m128n256(
         IndexList[2](n, 1),
         IndexList[2](_V4_BK, 64),
     )
-    var b_tma = TMATensorTile[
-        _V4_BF16, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)
-    ](b_desc)
+    return TMATensorTile[_V4_BF16, 2, Index(_V4_BK, BN), Index(_V4_BK, 64)](
+        b_desc
+    )
+
+
+# B physically (N, K) row-major (an NT weight), K-major shared tile.
+def _v4_make_b_kmaj_tma[
+    BN: Int
+](b: _V4_PTR, n: Int, k: Int, ctx: DeviceContext) raises -> TMATensorTile[
+    _V4_BF16, 2, Index(BN, _V4_BK), Index(BN, _V4_BK)
+]:
+    var b_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+        DeviceBuffer(
+            ctx,
+            b.address_space_cast[AddressSpace.GENERIC](),
+            1,
+            owning=False,
+        ),
+        IndexList[2](n, k),
+        IndexList[2](k, 1),
+        IndexList[2](BN, _V4_BK),
+    )
+    return TMATensorTile[_V4_BF16, 2, Index(BN, _V4_BK), Index(BN, _V4_BK)](
+        b_desc
+    )
+
+
+def _v4_enqueue_splitk_m128n256[
+    COL_A: Bool = True, KMAJ_B: Bool = False
+](
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    grid_x: Int,
+    splits: Int,
+    ctx: DeviceContext,
+) raises:
     var total_tiles = k // _V4_BK
     var chunk_tiles = (total_tiles + splits - 1) // splits
     var count = m * n
     var ws = ctx.enqueue_create_buffer[DType.float32](splits * count)
     var ws_ptr = ws.unsafe_ptr().as_unsafe_any_origin()
-    ctx.enqueue_function[_v4_tn_splitk_m128n256_s4](
-        a_tma,
-        b_tma,
-        ws_ptr,
-        m,
-        n,
-        k,
-        chunk_tiles,
-        grid_dim=(grid_x, splits),
-        block_dim=(_V4_THREADS,),
-    )
+    comptime if COL_A and not KMAJ_B:
+        ctx.enqueue_function[_v4_tn_splitk_m128n256_s4](
+            _v4_make_a_tma(a, m, k, ctx),
+            _v4_make_b_mn_tma[256](b, n, k, ctx),
+            ws_ptr,
+            m,
+            n,
+            k,
+            chunk_tiles,
+            grid_dim=(grid_x, splits),
+            block_dim=(_V4_THREADS,),
+        )
+    elif not COL_A and KMAJ_B:
+        ctx.enqueue_function[_v4_nt_splitk_m128n256_s4](
+            _v4_make_a_row_tma(a, m, k, ctx),
+            _v4_make_b_kmaj_tma[256](b, n, k, ctx),
+            ws_ptr,
+            m,
+            n,
+            k,
+            chunk_tiles,
+            grid_dim=(grid_x, splits),
+            block_dim=(_V4_THREADS,),
+        )
+    elif not COL_A and not KMAJ_B:
+        ctx.enqueue_function[_v4_nn_splitk_m128n256_s4](
+            _v4_make_a_row_tma(a, m, k, ctx),
+            _v4_make_b_mn_tma[256](b, n, k, ctx),
+            ws_ptr,
+            m,
+            n,
+            k,
+            chunk_tiles,
+            grid_dim=(grid_x, splits),
+            block_dim=(_V4_THREADS,),
+        )
+    else:
+        comptime assert False, "TT is rewritten as NN before reaching here"
     ctx.enqueue_function[_v4_tn_splitk_reduce](
         output,
         ws_ptr,
@@ -650,3 +824,117 @@ def try_enqueue_bf16_gemm_tn_v4(
                 return True
 
     return False
+
+
+# Split-K engagement for the row-major-A layouts (NT and NN; TT arrives
+# here as NN after aten_fast.py's operand swap).  Unlike TN, whose
+# non-split alternative is a one-CTA-per-output-tile kernel, these layouts
+# fall back to persistent v4 kernels that keep every SM busy regardless of
+# tile count -- but a persistent CTA still serializes its tiles' full K
+# depth, so when the output has far fewer macro-tiles than SMs and K is
+# deep, most SMs idle for the whole GEMM.  Split-K restores parallelism by
+# partitioning K.
+#
+# Regime edges, fitted on an H100 PCIe (114 SMs) by sweeping tiles in
+# {16, 32, 56, 64, 96} x k in {1024, 2048, 4096, 8192} (device us,
+# split-K vs the best pre-existing route on the same shape):
+#
+#   - Base predicate: splits = min(sm // tiles, 8, k_tiles // 16) >= 2.
+#     Engaged cells win 0.42x-0.97x of the persistent kernel's time
+#     (e.g. NT tiles=16 k=8192: 29.5 vs 70.3 us; NN tiles=32 k=8192:
+#     40.9 vs 91.4 us); cells with sm // tiles < 2 cannot split and the
+#     persistent kernels already sit within ~10% of cuBLAS there.
+#   - NT refinement: at sm // tiles == 2 with only the minimum chunk
+#     depth (k_tiles < 64, so 16-tile chunks), the split pays workspace
+#     + reduce overhead for a wave that was nearly full anyway and
+#     LOSES: tiles=56 k=2048 measured 24.9 vs 23.2 us.  One step deeper
+#     (k=4096, 32-tile chunks) it wins 38.4 vs 39.5, and at k=8192 it
+#     wins 61.5 vs 76.0.  Hence: engage at sm // tiles >= 3, or at 2
+#     with k_tiles >= _V4_SPLITK_RM_DEEP_TILES.
+#   - NN refinement: when the v3 64x128 small-tile kernel covers the
+#     output in a single wave (4 * tiles < sm, the same inequality the
+#     v3 dispatcher uses) it beats a shallow split: tiles=16 k=2048
+#     measured 13.2 us (v3-small) vs 17.7 us (2-way split).  A deep
+#     split still wins: k=4096 (4 splits) 19.8 vs 22.8, k=8192 (7
+#     splits) 28.7 vs 43.0.  Hence: in the small-tile-covered regime,
+#     engage only with splits >= _V4_SPLITK_RM_COVERED_MIN_SPLITS.
+comptime _V4_SPLITK_RM_MIN_SPLITS = 2
+comptime _V4_SPLITK_RM_DEEP_TILES = 64  # k BK-tiles; H100 PCIe fit
+comptime _V4_SPLITK_RM_COVERED_MIN_SPLITS = 4  # H100 PCIe fit
+
+
+def try_enqueue_bf16_gemm_splitk_rm_v4[
+    KMAJ_B: Bool
+](
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    comptime if not _has_sm_9x():
+        return False
+    if ctx.api() != "cuda":
+        return False
+    var cc_major = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MAJOR)
+    var cc_minor = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR)
+    if cc_major != 9 or cc_minor != 0:
+        return False
+    # Aligned full-tile regime with machine-width-safe products (same gates
+    # as the TN dispatcher above, plus the 256-wide n requirement of the
+    # only tile shape the split-K kernels come in).
+    if (
+        m < _V4_BM
+        or k < _V4_BK
+        or m % _V4_BM != 0
+        or k % _V4_BK != 0
+        or n <= 0
+        or n % 256 != 0
+        or Int(output) % 16 != 0
+        or Int(a) % 16 != 0
+        or Int(b) % 16 != 0
+        or m > 2_147_483_647
+        or n > 2_147_483_647
+        or k > 2_147_483_647
+        or k > 9_223_372_036_854_775_807 // m
+        or k > 9_223_372_036_854_775_807 // n
+        or n > 9_223_372_036_854_775_807 // m
+    ):
+        return False
+    var sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var max_grid_x = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
+    if sm_count <= 0 or max_grid_x <= 0:
+        return False
+    var tiles = (m // _V4_BM) * (n // 256)
+    if tiles <= 0 or tiles > max_grid_x:
+        return False
+    var cap = sm_count // tiles
+    if cap < _V4_SPLITK_RM_MIN_SPLITS:
+        return False
+    var k_tiles = k // _V4_BK
+    var splits = cap
+    if splits > _V4_MAX_SPLITS:
+        splits = _V4_MAX_SPLITS
+    var max_by_depth = k_tiles // _V4_MIN_CHUNK_TILES
+    if splits > max_by_depth:
+        splits = max_by_depth
+    if splits < _V4_SPLITK_RM_MIN_SPLITS:
+        return False
+    comptime if KMAJ_B:
+        # NT: a marginal 2-way split of a minimum-depth K loses to the
+        # persistent kernel's nearly-full wave (see the fit above).
+        if cap == 2 and k_tiles < _V4_SPLITK_RM_DEEP_TILES:
+            return False
+    else:
+        # NN: when the v3 small-tile kernel covers the output in one wave,
+        # only a deep split beats it (see the fit above).
+        if 4 * tiles < sm_count and splits < _V4_SPLITK_RM_COVERED_MIN_SPLITS:
+            return False
+    if m * n > _V4_MAX_WS_BYTES // 4 // splits:
+        return False
+    _v4_enqueue_splitk_m128n256[False, KMAJ_B](
+        output, a, b, m, n, k, tiles, splits, ctx
+    )
+    return True
