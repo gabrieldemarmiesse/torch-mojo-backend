@@ -81,8 +81,16 @@ from pathlib import Path
 
 DEFAULT_KERNEL_DIR = Path("torch_mojo_backend/eager_kernels")
 SIDECAR_SUFFIXES = (".ptx", ".amdgcn", ".ll")
-# Trailing mangling hash, on the file name and on every symbol inside it.
-HASH_RE = re.compile(r"_[0-9a-f]{8}\b")
+# Mangling hash, on the file name and on every symbol inside it. The hash is
+# derived from the Mojo symbol, so it moves whenever a function is renamed --
+# including when named wrappers are replaced by one parametrized entry, which
+# is device-code-neutral. Masking it is what makes such a refactor checkable.
+# `\b` is wrong here: it never fires between a hex digit and the `_` of
+# `<kernel>_<hash>_param_0` or `<kernel>_<hash>_$__global_alloc_...`, so those
+# occurrences leaked into the diff and reported every renamed kernel as
+# changed. Match exactly eight hex digits not followed by a ninth, which also
+# leaves longer auto-mangled hashes alone rather than truncating them.
+HASH_RE = re.compile(r"_[0-9a-f]{8}(?![0-9a-f])")
 # The compile-time gates of variant_gates.mojo, as written at the call sites.
 OP_GATE_RE = re.compile(r'_op_on\["(\w+)"\]')
 ARG_GATE_RE = re.compile(r"_dtype_arg(?:_abi|_width)?_on\[\s*(\d+)")
