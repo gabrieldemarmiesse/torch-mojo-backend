@@ -4025,7 +4025,6 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
         "nanogpt_bf16_gemm_v3_nt_ws_m128n256_tma_s3",
         "nanogpt_bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3",
         "nanogpt_bf16_gemm_v3_tn_ws_m128n256_tma_col_a_s3",
-        "nanogpt_bf16_gemm_v3_tn_wgmma_tma_transpose_s2",
     ):
         assert f'@__name("{kernel_name}")' in v3_source
 

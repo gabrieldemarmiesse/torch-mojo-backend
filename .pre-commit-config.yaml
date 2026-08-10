@@ -22,3 +22,9 @@ repos:
       # Preserve vendored FA4 source formatting so its recorded upstream hashes
       # remain auditable; backend-owned Mojo files are still formatted normally.
       exclude: ^torch_mojo_backend/eager_flash_attention/
+    - id: mojo-gate-subsumption
+      name: Check for unreachable Mojo dispatch gates
+      entry: uv run python scripts/check_gate_subsumption.py
+      language: system
+      types: [file]
+      files: \.mojo$
