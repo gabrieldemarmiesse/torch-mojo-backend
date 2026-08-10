@@ -2533,8 +2533,19 @@ def _mma_tile_wide[
         lin += gdx
 
 
-@__name("nanogpt_bf16_gemm_nn_wide")
-def _gemm_nn_wide(
+@always_inline
+def _wide_layout_tag[TA: Bool, TB: Bool]() -> StaticString:
+    # Kernel-symbol layout suffix: A then B, "t" transposed, "n" not.
+    comptime if TA:
+        return "tt" if TB else "tn"
+    else:
+        return "nt" if TB else "nn"
+
+
+@__name(t"nanogpt_bf16_gemm_{_wide_layout_tag[TA, TB]()}_wide")
+def _gemm_wide[
+    TA: Bool, TB: Bool
+](
     output: _Ptr,
     a: _Ptr,
     b: _Ptr,
@@ -2548,7 +2559,7 @@ def _gemm_nn_wide(
     c_pair: Int,
     batch_count: Int,
 ):
-    _mma_tile_wide[False, False](
+    _mma_tile_wide[TA, TB](
         output,
         a,
         b,
@@ -2567,110 +2578,10 @@ def _gemm_nn_wide(
     )
 
 
-@__name("nanogpt_bf16_gemm_nt_wide")
-def _gemm_nt_wide(
-    output: _Ptr,
-    a: _Ptr,
-    b: _Ptr,
-    bias: _Ptr,
-    m: Int,
-    n: Int,
-    k: Int,
-    has_bias: Int,
-    a_fast: Int,
-    b_fast: Int,
-    c_pair: Int,
-    batch_count: Int,
-):
-    _mma_tile_wide[False, True](
-        output,
-        a,
-        b,
-        bias,
-        m,
-        n,
-        k,
-        0,
-        0,
-        0,
-        has_bias,
-        a_fast,
-        b_fast,
-        c_pair,
-        batch_count,
-    )
-
-
-@__name("nanogpt_bf16_gemm_tn_wide")
-def _gemm_tn_wide(
-    output: _Ptr,
-    a: _Ptr,
-    b: _Ptr,
-    bias: _Ptr,
-    m: Int,
-    n: Int,
-    k: Int,
-    has_bias: Int,
-    a_fast: Int,
-    b_fast: Int,
-    c_pair: Int,
-    batch_count: Int,
-):
-    _mma_tile_wide[True, False](
-        output,
-        a,
-        b,
-        bias,
-        m,
-        n,
-        k,
-        0,
-        0,
-        0,
-        has_bias,
-        a_fast,
-        b_fast,
-        c_pair,
-        batch_count,
-    )
-
-
-@__name("nanogpt_bf16_gemm_tt_wide")
-def _gemm_tt_wide(
-    output: _Ptr,
-    a: _Ptr,
-    b: _Ptr,
-    bias: _Ptr,
-    m: Int,
-    n: Int,
-    k: Int,
-    has_bias: Int,
-    a_fast: Int,
-    b_fast: Int,
-    c_pair: Int,
-    batch_count: Int,
-):
-    _mma_tile_wide[True, True](
-        output,
-        a,
-        b,
-        bias,
-        m,
-        n,
-        k,
-        0,
-        0,
-        0,
-        has_bias,
-        a_fast,
-        b_fast,
-        c_pair,
-        batch_count,
-    )
-
-
-@__name("nanogpt_bf16_bmm_nn_wide")
-def _bmm_nn_wide(
+@__name(t"nanogpt_bf16_bmm_{_wide_layout_tag[TA, TB]()}_wide")
+def _bmm_wide[
+    TA: Bool, TB: Bool
+](
     output: _Ptr,
     a: _Ptr,
     b: _Ptr,
@@ -2685,112 +2596,7 @@ def _bmm_nn_wide(
     c_pair: Int,
     batch_count: Int,
 ):
-    _mma_tile_wide[False, False](
-        output,
-        a,
-        b,
-        a,
-        m,
-        n,
-        k,
-        c_bstride,
-        a_bstride,
-        b_bstride,
-        0,
-        a_fast,
-        b_fast,
-        c_pair,
-        batch_count,
-    )
-
-
-@__name("nanogpt_bf16_bmm_nt_wide")
-def _bmm_nt_wide(
-    output: _Ptr,
-    a: _Ptr,
-    b: _Ptr,
-    m: Int,
-    n: Int,
-    k: Int,
-    c_bstride: Int,
-    a_bstride: Int,
-    b_bstride: Int,
-    a_fast: Int,
-    b_fast: Int,
-    c_pair: Int,
-    batch_count: Int,
-):
-    _mma_tile_wide[False, True](
-        output,
-        a,
-        b,
-        a,
-        m,
-        n,
-        k,
-        c_bstride,
-        a_bstride,
-        b_bstride,
-        0,
-        a_fast,
-        b_fast,
-        c_pair,
-        batch_count,
-    )
-
-
-@__name("nanogpt_bf16_bmm_tn_wide")
-def _bmm_tn_wide(
-    output: _Ptr,
-    a: _Ptr,
-    b: _Ptr,
-    m: Int,
-    n: Int,
-    k: Int,
-    c_bstride: Int,
-    a_bstride: Int,
-    b_bstride: Int,
-    a_fast: Int,
-    b_fast: Int,
-    c_pair: Int,
-    batch_count: Int,
-):
-    _mma_tile_wide[True, False](
-        output,
-        a,
-        b,
-        a,
-        m,
-        n,
-        k,
-        c_bstride,
-        a_bstride,
-        b_bstride,
-        0,
-        a_fast,
-        b_fast,
-        c_pair,
-        batch_count,
-    )
-
-
-@__name("nanogpt_bf16_bmm_tt_wide")
-def _bmm_tt_wide(
-    output: _Ptr,
-    a: _Ptr,
-    b: _Ptr,
-    m: Int,
-    n: Int,
-    k: Int,
-    c_bstride: Int,
-    a_bstride: Int,
-    b_bstride: Int,
-    a_fast: Int,
-    b_fast: Int,
-    c_pair: Int,
-    batch_count: Int,
-):
-    _mma_tile_wide[True, True](
+    _mma_tile_wide[TA, TB](
         output,
         a,
         b,
@@ -2996,9 +2802,14 @@ def _enqueue_gemm_wide(
     ctx: DeviceContext,
 ) raises:
     var grid_x = _wide_grid_x(m, n, k, 1, 0, 0, 0)
-    if transpose_a:
-        if transpose_b:
-            ctx.enqueue_function[_gemm_tt_wide](
+
+    # One leaf per layout: the launch arguments are the same for all four, so
+    # only the comptime (TA, TB) specialization varies.
+    comptime for layout in range(4):
+        comptime TA = layout >= 2
+        comptime TB = layout % 2 == 1
+        if transpose_a == TA and transpose_b == TB:
+            ctx.enqueue_function[_gemm_wide[TA, TB]](
                 output,
                 a,
                 b,
@@ -3014,58 +2825,7 @@ def _enqueue_gemm_wide(
                 grid_dim=(grid_x,),
                 block_dim=(_THREADS,),
             )
-        else:
-            ctx.enqueue_function[_gemm_tn_wide](
-                output,
-                a,
-                b,
-                bias,
-                m,
-                n,
-                k,
-                hb,
-                a_fast,
-                b_fast,
-                c_pair,
-                1,
-                grid_dim=(grid_x,),
-                block_dim=(_THREADS,),
-            )
-    else:
-        if transpose_b:
-            ctx.enqueue_function[_gemm_nt_wide](
-                output,
-                a,
-                b,
-                bias,
-                m,
-                n,
-                k,
-                hb,
-                a_fast,
-                b_fast,
-                c_pair,
-                1,
-                grid_dim=(grid_x,),
-                block_dim=(_THREADS,),
-            )
-        else:
-            ctx.enqueue_function[_gemm_nn_wide](
-                output,
-                a,
-                b,
-                bias,
-                m,
-                n,
-                k,
-                hb,
-                a_fast,
-                b_fast,
-                c_pair,
-                1,
-                grid_dim=(grid_x,),
-                block_dim=(_THREADS,),
-            )
+            return
 
 
 def _enqueue_bmm_wide(
@@ -3091,9 +2851,14 @@ def _enqueue_bmm_wide(
     )
     # CUDA grid.z tops out at 65,535; blocks grid-stride over extra batches.
     var grid_z = min(batch_count, 65535)
-    if transpose_a:
-        if transpose_b:
-            ctx.enqueue_function[_bmm_tt_wide](
+
+    # One leaf per layout: the launch arguments are the same for all four, so
+    # only the comptime (TA, TB) specialization varies.
+    comptime for layout in range(4):
+        comptime TA = layout >= 2
+        comptime TB = layout % 2 == 1
+        if transpose_a == TA and transpose_b == TB:
+            ctx.enqueue_function[_bmm_wide[TA, TB]](
                 output,
                 a,
                 b,
@@ -3110,61 +2875,7 @@ def _enqueue_bmm_wide(
                 grid_dim=(grid_x, 1, grid_z),
                 block_dim=(_THREADS,),
             )
-        else:
-            ctx.enqueue_function[_bmm_tn_wide](
-                output,
-                a,
-                b,
-                m,
-                n,
-                k,
-                c_bstride,
-                a_bstride,
-                b_bstride,
-                a_fast,
-                b_fast,
-                c_pair,
-                batch_count,
-                grid_dim=(grid_x, 1, grid_z),
-                block_dim=(_THREADS,),
-            )
-    else:
-        if transpose_b:
-            ctx.enqueue_function[_bmm_nt_wide](
-                output,
-                a,
-                b,
-                m,
-                n,
-                k,
-                c_bstride,
-                a_bstride,
-                b_bstride,
-                a_fast,
-                b_fast,
-                c_pair,
-                batch_count,
-                grid_dim=(grid_x, 1, grid_z),
-                block_dim=(_THREADS,),
-            )
-        else:
-            ctx.enqueue_function[_bmm_nn_wide](
-                output,
-                a,
-                b,
-                m,
-                n,
-                k,
-                c_bstride,
-                a_bstride,
-                b_bstride,
-                a_fast,
-                b_fast,
-                c_pair,
-                batch_count,
-                grid_dim=(grid_x, 1, grid_z),
-                block_dim=(_THREADS,),
-            )
+            return
 
 
 def enqueue_bf16_gemm(
