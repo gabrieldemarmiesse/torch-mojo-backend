@@ -53,7 +53,7 @@ different kind of item.
 | [C2](#c2) | Grouped convolution issues `N × groups` GEMM launches from a Python loop | Conv | Medium for depthwise/grouped nets | Medium | — |
 | [C1](#c1) | Convolution is im2col + GEMM with a full `(N, C·kh·kw, out_h·out_w)` temporary | Conv | Medium (memory-bound at large spatial) | High | no conv benchmark exists |
 | [N1](#n1) | LayerNorm backward is fp32-only and GPU-only; the forward accepts fp16/bf16 | Normalization | Medium (blocks pure-bf16 training) | Medium | — |
-| [D3](#d3) | Fused 3-way `cat` is Metal-only | Data movement | Low–Medium | Low | — |
+| [D3](#d3) | ~~Fused 3-way `cat` is Metal-only~~ **DONE**: batched N-input `CatN` | Data movement | Low–Medium | Low | — |
 | [E1](#e1) | Divide-by-scalar has no scalar spec: costs an extra 0-d fill allocation + launch | Elementwise | Low–Medium (very high call count) | **Low** | — |
 | [D2](#d2) | The generic rank≤8 strided copy is a scalar kernel with an 8-deep div/mod chain and no dimension collapsing | Data movement | Medium for rank>4 workloads | Medium | — |
 | [X1](#x1) | Launch-geometry constants fitted to one card and applied to all (`_LLC_BYTES`, `TARGET_BLOCKS`, `_TARGET_BLOCKS`) | Cross-cutting | UNMEASURED off gfx942 | Low–Medium | needs the other cards |
@@ -779,25 +779,28 @@ different kind of item.
   materialization all use, so a regression here is broad — keep the scalar arm.
 
 ### D3
-**The fused three-source `cat` is Metal-only**
+**The fused three-source `cat` is Metal-only** — **DONE** (batched `CatN`)
 
-* **What.** `fast_aten_cat`, `aten_fast.py:3551`; the `Cat2` arm (`:3582`,
-  kernel at `:3604`) is device-general (non-CPU); the `Cat3` arm requires
-  `first._device.api == "metal"` (`:3621`, kernel at `:3638`).
-* **Current implementation.** Two inputs → one fused kernel everywhere. Three
-  inputs → one fused kernel on Metal, three `NarrowCopyDst` launches everywhere
-  else (loop at `aten_fast.py:3655`, kernel at `:3662`).
-* **Why it is not optimal.** The three-way case is named in the source as "the
-  split-backward reassembly" — the qkv concat in every transformer backward. On
-  CUDA/ROCm it costs three launches and two pipeline bubbles per layer.
-* **What the optimized version looks like.** `Cat3` un-gated (nothing in the
-  kernel's shape is Metal-specific — it is a row fill from three sources), or
-  better an N-source variant taking a runtime descriptor array, the way the
-  foreach kernels already take batched descriptors
-  (`optimizer_ops/optimizer_ops.mojo`).
-* **Expected win.** **UNMEASURED** off Metal. Two launches saved per concat.
-* **How to measure it.** `compare_nanogpt_train_kernels.py` (the `cat` group), or
-  `bench_gpt2_kernels.py` for the KV-cache append shape.
+* **What it was.** `fast_aten_cat` fused exactly two contiguous inputs
+  (`Cat2`) everywhere and three (`Cat3`) on Metal only; every other input
+  count cost one `NarrowCopyDst` launch per input.
+* **What replaced it.** The N-source variant this entry asked for:
+  `CatN` in `data_movement_ops.mojo`, one launch per `CAT_SEG_CAP` (64)
+  inputs, taking the runtime descriptor array the foreach kernels take, with
+  Apple on the pointer-argument variant the Metal ABI requires. `Cat2` and
+  `Cat3` are gone; the per-input loop remains only for non-contiguous inputs
+  (the KV-cache gather) and the CPU device. The vector width now follows the
+  dtype and the runtime alignment (16 bytes: 8 bf16 elements, 4 fp32) rather
+  than a fixed four elements, so bf16 stopped copying at half rate.
+* **Measured** (H100 PCIe, `benchmarks/test_data_movement.py`, ours/stock
+  device time): `cat` 64x262144 bf16 9.347 → 0.988, 2x8388608 bf16
+  7.087 → 0.991, 64x262144 f32 5.435 → 0.982, 2x8388608 f32
+  4.117 → 0.997; `stack` improved with it (16.086 → 1.311,
+  7.969 → 1.085). ~1.75 TB/s of this card's 2.04 TB/s peak.
+* **What is still open.** Input lists longer than 64 pay one launch per 64
+  (512 x 2048 bf16: 2.7x stock, launch-latency bound), and lists whose row
+  lengths are not 16-byte multiples run the element-wise instantiation
+  (37 x 12345 bf16: 1.4x). Both are small-tensor regimes.
 
 ### D4
 **`nonzero` round-trips through the host**
