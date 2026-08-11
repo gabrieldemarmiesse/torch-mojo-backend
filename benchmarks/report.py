@@ -1,6 +1,6 @@
 """Where are we far behind stock PyTorch? Sort baselines by ratio.
 
-Reads only benchmarks/baselines.json — no accelerator needed.
+Reads only benchmarks/baselines.html — no accelerator needed.
 
     uv run python benchmarks/report.py                # every hardware config
     uv run python benchmarks/report.py --hw H100      # configs matching a substring
@@ -9,11 +9,16 @@ Reads only benchmarks/baselines.json — no accelerator needed.
 
 Entries print as their baseline tree path dtype/op/shape/layout, so -k
 matches any axis ("bf16", "mm", "S7", "TN") or a path fragment ("tf32/mm").
+
+For the same data as a collapsible tree with per-branch min/median/max,
+open that same benchmarks/baselines.html in a browser: it carries both the
+ratios and the viewer that renders them.
 """
 
 from __future__ import annotations
 
 import argparse
+import statistics
 import sys
 from pathlib import Path
 
@@ -54,15 +59,22 @@ def main() -> int:
         versions_per_hw[hw_part or key] = versions_per_hw.get(hw_part or key, 0) + 1
 
     for key, cfg in configs.items():
+        leaves = cfg.leaves()
         results = {
             str(bench_key): ratio
-            for bench_key, ratio in cfg.leaves().items()
+            for bench_key, ratio in leaves.items()
             if args.k.lower() in str(bench_key).lower()
         }
-        agg = cfg.aggregate
+        # min/median/max are derived, so they are computed here rather than
+        # stored in the file (see bench_lib/baselines.py).
+        ratios = list(leaves.values())
+        if not ratios:
+            print(f"\n{key}  (block holds no ratio leaf at all)")
+            continue
         print(
             f"\n{key}  ({len(results)} entries; all-leaf min/median/max "
-            f"{agg.min:.3f}/{agg.median:.3f}/{agg.max:.3f})"
+            f"{min(ratios):.3f}/{statistics.median(ratios):.3f}/"
+            f"{max(ratios):.3f})"
         )
         hw_part, _, _ = key.rpartition(" | torch ")
         if versions_per_hw.get(hw_part or key, 0) > 1:

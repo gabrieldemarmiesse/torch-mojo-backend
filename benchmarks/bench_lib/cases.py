@@ -8,7 +8,7 @@ data-dependent kernel timing then cancels out of the ratio.
 The op axis of a family test is a parametrize axis whose params carry a
 @pytest.mark.bench_op mark (see op_params), so one test function can
 cover a whole family while every node still stores its ratio under its
-own aten op token in baselines.json.
+own aten op token in baselines.html.
 """
 
 from __future__ import annotations

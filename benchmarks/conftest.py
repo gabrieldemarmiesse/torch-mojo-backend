@@ -1,7 +1,7 @@
 """Performance-regression benchmark suite: pytest wiring.
 
 One pytest test node per benchmark case.  The ratio against stock
-PyTorch is stored in benchmarks/baselines.json under the axis-tree path
+PyTorch is stored in benchmarks/baselines.html under the axis-tree path
 hardware -> dtype -> op -> shape -> layout, derived from the node's own
 axes (bench_lib/check.py:_bench_key): op from the test function name
 (overridable with @pytest.mark.bench_op), dtype/shape from the
@@ -31,7 +31,7 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "bench_op(name): store this benchmark under the given op token in "
-        "baselines.json instead of the test function name (needed when the "
+        "baselines.html instead of the test function name (needed when the "
         'aten name is not a Python identifier, e.g. "add.Tensor")',
     )
 
@@ -44,7 +44,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         choices=("improve", "force"),
         help=(
-            "Write measured ratios into benchmarks/baselines.json: new entries "
+            "Write measured ratios into benchmarks/baselines.html: new entries "
             "and >4%% improvements. '=force' also accepts >4%% regressions "
             "(after an intentional performance trade-off)."
         ),
@@ -100,5 +100,5 @@ def pytest_terminal_summary(
         terminalreporter.write_line(
             "hint: rerun with --update-baselines (or "
             "TORCH_MOJO_BACKEND_BENCH_UPDATE=1) to write these into "
-            "benchmarks/baselines.json"
+            "benchmarks/baselines.html"
         )

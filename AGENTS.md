@@ -57,10 +57,12 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
 
 `benchmarks/` is a pytest suite that measures the mojo device against stock
 PyTorch (CUDA on NVIDIA, ROCm on AMD, MPS on Apple) and compares the
-device-time ratio ours/stock against `benchmarks/baselines.json` — one
+device-time ratio ours/stock against `benchmarks/baselines.html` — one
 git-tracked file holding the baselines of every hardware configuration side
-by side. Each (op, shape, layout, dtype) case is its own test node and the
-node id is its key in the JSON, so the list of failing test names is the
+by side, **and** the viewer that renders them (open it in a browser, off
+disk: the data is a JSON block inside the page, so there is nothing to
+fetch and nothing to serve). Each (op, shape, layout, dtype) case is its own
+test node and the node id is its key in the JSON, so the list of failing test names is the
 list of regressed kernel regimes. A test fails when its ratio regresses more
 than 4% versus the recorded baseline, passes when this hardware has never
 been measured, and the whole suite skips cleanly when there is no
@@ -87,8 +89,27 @@ uv run pytest benchmarks/ -k "..." --update-baselines=force
 uv run python benchmarks/report.py --worst 20
 ```
 
+`baselines.html` is one file with two halves. The `<script
+type="application/json" id="baselines">` block at the bottom is the data,
+machine-written by `--update-baselines`; everything above it is the viewer,
+hand-written source you edit like any other file. Writes splice only the
+block, so a benchmark run never touches the viewer and a viewer change
+never touches the numbers.
+
+The data is **measurements only** — one ratio per dtype/op/shape/layout
+leaf, nothing derived from them. Per-branch min/median/max are computed
+while reading: the viewer prints them on every row of its collapsible tree
+(click a branch to open it), and `report.py` prints them in the terminal.
+The page also takes another baselines file as a query parameter —
+`baselines.html?url=<url>` — so one machine's file renders another
+machine's numbers (a raw file URL, a CI artifact, another branch) without a
+checkout, and accepts a dropped `baselines.html` or raw `.json` too. Note
+that github.com shows `.html` as source rather than rendering it: download
+the file, or route it through a raw-HTML viewer such as
+`htmlpreview.github.io`.
+
 Updates merge per entry: a run that measured three cases changes those
-three lines of `baselines.json` and nothing else, so a PR touching one op
+three lines of `baselines.html` and nothing else, so a PR touching one op
 updates that op's numbers without rerunning the rest. Do not gate CI on
 this suite: CI machines may have no GPU.
 

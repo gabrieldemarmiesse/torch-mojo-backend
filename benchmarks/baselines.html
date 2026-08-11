@@ -1,0 +1,4513 @@
+<meta charset="utf-8">
+<title>torch-mojo-backend benchmark baselines</title>
+<!--
+  This file IS the baseline data, and the explorer for it.
+
+  benchmarks/baselines.html is the git-tracked source of truth of the
+  performance-regression suite: the ratios live in the #baselines JSON block
+  at the bottom of this file, and the markup above them is the viewer that
+  renders them.  Open the file in a browser — from disk, no server, no
+  network — and you get the tree.
+
+  Who writes what: the JSON block is machine-written (pytest benchmarks/
+  --update-baselines, through bench_lib/baselines.py, which rewrites ONLY
+  that block and leaves every other byte of this file alone).  Everything
+  else here is hand-written; edit it as you would any other source file.
+  The file contract, the merge discipline and the reason there are no
+  stored aggregates are documented in benchmarks/bench_lib/baselines.py.
+-->
+
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --plane: #f9f9f7;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --rule: #c3c2b7;
+    --ring: rgba(11, 11, 11, 0.10);
+    --good: #0ca30c;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
+    --on-light-band: #0b0b0b;
+    --on-critical: #ffffff;
+    --accent: #2a78d6;
+    --hover: rgba(11, 11, 11, 0.045);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface: #1a1a19;
+      --plane: #0d0d0d;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --rule: #383835;
+      --ring: rgba(255, 255, 255, 0.10);
+      --accent: #3987e5;
+      --hover: rgba(255, 255, 255, 0.06);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #1a1a19;
+    --plane: #0d0d0d;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --rule: #383835;
+    --ring: rgba(255, 255, 255, 0.10);
+    --accent: #3987e5;
+    --hover: rgba(255, 255, 255, 0.06);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--plane);
+    color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 24px 20px 64px;
+  }
+  /* Tree paths and shapes are identifiers; they get the utility face. */
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  h1 { font-size: 21px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 14px; margin: 0 0 10px; color: var(--ink-2); font-weight: 600; }
+  .sub { color: var(--ink-2); margin: 0 0 20px; font-size: 14px; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--ring);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  label.fld { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  select, input[type="search"], button {
+    font: inherit;
+    font-size: 13px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+    padding: 6px 9px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+
+  /* stat tiles */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 13px 15px; }
+  .tile .k { font-size: 12px; color: var(--muted); }
+  .tile .v { font-size: 25px; font-weight: 600; margin-top: 3px; letter-spacing: -0.02em; }
+  .tile .n { font-size: 12px; color: var(--ink-2); margin-top: 2px; overflow-wrap: anywhere; }
+
+  /* chips */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--rule); background: transparent; color: var(--ink-2); cursor: pointer;
+  }
+  .chip[aria-pressed="true"] { background: var(--accent); border-color: transparent; color: #fff; }
+  .grp { display: flex; gap: 8px; align-items: baseline; margin-bottom: 8px; flex-wrap: wrap; }
+  .grp > .lbl { font-size: 12px; color: var(--muted); min-width: 56px; }
+
+  /* status pills (shared by tree, matrix and table) */
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .b-good { background: var(--good); color: var(--on-light-band); }
+  .b-warning { background: var(--warning); color: var(--on-light-band); }
+  .b-serious { background: var(--serious); color: var(--on-light-band); }
+  .b-critical { background: var(--critical); color: var(--on-critical); }
+
+  /* tree */
+  .tree { font-size: 13px; }
+  .thead, .trow {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 58px 72px 72px 104px;
+    gap: 8px; align-items: center;
+  }
+  .thead {
+    font-size: 12px; color: var(--muted); font-weight: 600;
+    padding: 2px 8px 6px; border-bottom: 1px solid var(--grid); margin-bottom: 2px;
+  }
+  .trow { padding: 3px 8px; border-radius: 6px; }
+  .trow.cat { cursor: pointer; }
+  .trow.cat:hover { background: var(--hover); }
+  .trow .name { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+  .trow .label { overflow-wrap: anywhere; }
+  .trow .count { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .caret {
+    flex: none; width: 14px; color: var(--muted); font-size: 11px;
+    transition: transform 0.12s; transform: rotate(0deg); align-self: center;
+  }
+  .trow[aria-expanded="true"] > .name > .caret { transform: rotate(90deg); }
+  .trow.leaf .caret { visibility: hidden; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .trow .dim { color: var(--muted); }
+  .worstcell { text-align: right; }
+  .kids { border-left: 1px solid var(--grid); margin-left: 14px; }
+  .lvl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+
+  /* matrix */
+  .scroll { overflow-x: auto; }
+  table { border-collapse: separate; border-spacing: 2px; font-variant-numeric: tabular-nums; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; text-align: left; padding: 4px 8px; white-space: nowrap; }
+  td.cell {
+    min-width: 74px; text-align: right; padding: 6px 10px; border-radius: 4px;
+    font-size: 13px; cursor: pointer; white-space: nowrap;
+  }
+  td.cell .g { float: left; font-weight: 700; opacity: 0.85; margin-right: 8px; }
+  td.empty { background: transparent; color: var(--muted); text-align: center; cursor: default; }
+  th.rowhead { color: var(--ink); font-weight: 600; padding-right: 12px; }
+
+  /* legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--ink-2); margin-top: 12px; }
+  .legend span.sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+
+  /* worst-first table */
+  table.list { border-spacing: 0; width: 100%; font-size: 13px; }
+  table.list th { border-bottom: 1px solid var(--grid); }
+  table.list td { padding: 5px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  table.list td.path { white-space: normal; overflow-wrap: anywhere; color: var(--ink-2); font-size: 12px; }
+
+  .empty-state { text-align: center; padding: 48px 20px; color: var(--ink-2); }
+  .empty-state code, .hint code { background: var(--plane); padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  .drop { outline: 2px dashed var(--accent); outline-offset: -6px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .err { color: var(--critical); font-size: 13px; margin-top: 8px; }
+</style>
+
+<div class="wrap">
+  <h1>Benchmark baselines</h1>
+  <p class="sub">
+    Every number is <strong>our device time &divide; stock PyTorch device time</strong> on the same shape.
+    Above 1.00 means we are slower. The acceptance bar is <strong>1.10</strong>.
+    The data is inside this file &mdash; nothing is fetched.
+  </p>
+
+  <div class="card" id="loader">
+    <div class="row">
+      <label class="fld">Search the tree
+        <input type="search" id="q" class="mono" placeholder="e.g. bf16/mm, S7, softmax, TN" style="min-width:240px">
+      </label>
+      <button class="chip" id="missonly" aria-pressed="false" style="align-self:flex-end">only misses &gt;1.10</button>
+      <span style="flex:1"></span>
+      <button id="pick" style="align-self:flex-end">Compare another file&hellip;</button>
+      <input type="file" id="file" accept=".html,.json,text/html,application/json" hidden>
+    </div>
+    <div id="dtchips"></div>
+    <div class="hint" id="src" hidden></div>
+    <div class="hint" id="howto">
+      To read another machine's numbers instead of this file's own, drop its <code>baselines.html</code>
+      (or a raw <code>.json</code>) anywhere on this page, or pass it as a query parameter &mdash;
+      <code>?url=&lt;url of a baselines file&gt;</code>, which makes the loaded view a shareable link.
+      A <code>github.com/&hellip;/blob/&hellip;</code> URL is rewritten to its raw form for you.
+    </div>
+    <div class="err" id="err" hidden></div>
+  </div>
+
+  <div id="app" hidden>
+    <div class="tiles" style="margin-bottom:16px">
+      <div class="tile"><div class="k">Cases shown</div><div class="v" id="t-n">&ndash;</div><div class="n" id="t-n-sub"></div></div>
+      <div class="tile"><div class="k">Meet the 1.10 bar</div><div class="v" id="t-pass">&ndash;</div><div class="n" id="t-pass-sub"></div></div>
+      <div class="tile"><div class="k">Median ratio</div><div class="v" id="t-med">&ndash;</div><div class="n">half are better than this</div></div>
+      <div class="tile" style="border-color:var(--critical)"><div class="k">Worst case</div><div class="v" id="t-max">&ndash;</div><div class="n mono" id="t-max-sub"></div></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:8px">
+        <h2 style="margin:0">The tree &mdash; worst first at every level</h2>
+        <span style="flex:1"></span>
+        <button id="expand">Expand all</button>
+        <button id="collapse">Collapse all</button>
+      </div>
+      <div class="hint" style="margin:0 0 10px">
+        hardware &rarr; dtype &rarr; aten op &rarr; shape &rarr; layout. A collapsed row already shows the
+        worst ratio under it &mdash; open the red ones. Click a row (or press Enter on it) to toggle.
+      </div>
+      <div class="tree" id="tree">
+        <div class="thead">
+          <div>branch</div><div class="num">cases</div><div class="num">min</div><div class="num">median</div><div class="worstcell">max (worst)</div>
+        </div>
+        <div id="treebody"></div>
+      </div>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--good)"></span>&check; meets bar &le;1.10</span>
+        <span><span class="sw" style="background:var(--warning)"></span>! near miss &le;1.5</span>
+        <span><span class="sw" style="background:var(--serious)"></span>!! serious &le;3</span>
+        <span><span class="sw" style="background:var(--critical)"></span>!!! critical &gt;3</span>
+        <span style="color:var(--muted)">Every row prints its numbers &mdash; colour is a second cue, never the only one.</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Op &times; dtype at a glance</h2>
+      <div class="row" style="margin-bottom:12px">
+        <label class="fld">Cell shows
+          <select id="agg">
+            <option value="max">worst ratio</option>
+            <option value="median">median ratio</option>
+          </select>
+        </label>
+        <span class="hint" style="margin:0">Click a cell to focus the tree on that op and dtype.</span>
+      </div>
+      <div class="scroll"><div id="matrix"></div></div>
+    </div>
+
+    <div class="card">
+      <h2>Worst first</h2>
+      <div class="scroll">
+        <table class="list" id="list">
+          <thead><tr>
+            <th class="num">ratio</th><th>dtype</th><th>op</th><th>shape</th><th>layout</th><th>hardware</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="hint" id="listnote"></div>
+    </div>
+  </div>
+
+  <div class="empty-state" id="blank">
+    <p>No data loaded.</p>
+    <p class="hint">
+      This file should carry its own baselines in a <code>&lt;script id="baselines"&gt;</code> block
+      at the end &mdash; it seems to be missing or unreadable. Drop a <code>baselines.html</code>
+      onto this page to read one anyway.
+    </p>
+  </div>
+</div>
+
+<script>
+"use strict";
+const BAR = 1.10;
+const BANDS = [
+  { id: "good",     max: BAR,      glyph: "✓" },
+  { id: "warning",  max: 1.5,      glyph: "!" },
+  { id: "serious",  max: 3,        glyph: "!!" },
+  { id: "critical", max: Infinity, glyph: "!!!" },
+];
+const band = r => BANDS.find(b => r <= b.max);
+const fmt = r => (r >= 10 ? r.toFixed(0) : r.toFixed(2));
+const median = a => {
+  if (!a.length) return NaN;
+  const s = [...a].sort((x, y) => x - y), h = s.length >> 1;
+  return s.length % 2 ? s[h] : (s[h - 1] + s[h]) / 2;
+};
+const pill = r => {
+  const b = band(r);
+  return `<span class="tag b-${b.id}">${b.glyph} ${fmt(r)}×</span>`;
+};
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+const LEVELS = ["hardware", "dtype", "op", "shape", "layout"];   // display names per depth
+const KEYS = ["hw", "dtype", "op", "shape"];                     // leaf properties per category depth
+const SEP = "";
+
+let LEAVES = [];                 // {hw, dtype, op, shape, layout, ratio, path}
+let SELDT = new Set();           // dtype chip selection (empty = all)
+let MISSONLY = false;
+let EXPANDED = new Set();        // node paths (SEP-joined prefixes)
+let PENDING_EXPAND = null;       // "all" | null — applied on next tree build
+
+// ---- ingest: the axis tree -> flat leaves ---------------------------------
+// Only the ratio LEAVES are read. Every min/median/max on this page is
+// computed here, in the browser, from the leaves below each branch — the
+// file stores measurements only. (Format 3 also stored those aggregates;
+// they are ignored, so a file from either format renders identically.)
+const READABLE_FORMATS = [3, 4];
+
+function ingest(obj, srcLabel) {
+  if (!obj || typeof obj !== "object" || !obj.configs)
+    throw new Error('Not a baselines file: expected a top-level "configs" object.');
+  if (!READABLE_FORMATS.includes(obj.format))
+    throw new Error(`Unsupported baselines format ${JSON.stringify(obj.format)}; `
+      + `this page reads format ${READABLE_FORMATS.join(" and ")}.`);
+  const leaves = [];
+  for (const [hw, cfg] of Object.entries(obj.configs)) {
+    for (const [dtype, dt] of Object.entries(cfg.dtypes || {})) {
+      for (const [op, o] of Object.entries(dt.ops || {})) {
+        for (const [shape, sh] of Object.entries(o.shapes || {})) {
+          for (const [layout, ratio] of Object.entries(sh.layouts || {})) {
+            leaves.push({ hw, dtype, op, shape, layout, ratio: +ratio,
+                          path: [hw, dtype, op, shape, layout].join("/").toLowerCase() });
+          }
+        }
+      }
+    }
+  }
+  if (!leaves.length) throw new Error("The file parsed but holds no benchmark leaves.");
+  LEAVES = leaves;
+  SELDT = new Set();
+  EXPANDED = new Set(new Set(leaves.map(l => l.hw)));  // hardware level open by default
+  buildDtypeChips();
+  const src = document.getElementById("src");
+  src.textContent = srcLabel + ` — ${leaves.length} ratios.`;
+  src.hidden = false;
+  document.getElementById("err").hidden = true;
+  document.getElementById("blank").hidden = true;
+  document.getElementById("app").hidden = false;
+  render();
+}
+
+function buildDtypeChips() {
+  const host = document.getElementById("dtchips");
+  host.innerHTML = "";
+  const g = document.createElement("div");
+  g.className = "grp"; g.style.marginTop = "10px"; g.style.marginBottom = "0";
+  g.innerHTML = `<span class="lbl">dtype</span>`;
+  const chips = document.createElement("div"); chips.className = "chips";
+  for (const v of [...new Set(LEAVES.map(l => l.dtype))].sort()) {
+    const b = document.createElement("button");
+    b.className = "chip"; b.type = "button"; b.textContent = v;
+    b.setAttribute("aria-pressed", "false");
+    b.onclick = () => {
+      SELDT.has(v) ? SELDT.delete(v) : SELDT.add(v);
+      b.setAttribute("aria-pressed", SELDT.has(v));
+      render();
+    };
+    chips.append(b);
+  }
+  g.append(chips); host.append(g);
+}
+
+function filtered() {
+  const q = document.getElementById("q").value.trim().toLowerCase();
+  return LEAVES.filter(l =>
+    (!SELDT.size || SELDT.has(l.dtype)) &&
+    (!MISSONLY || l.ratio > BAR) &&
+    (!q || l.path.includes(q)));
+}
+
+// ---- tree ----------------------------------------------------------------
+function buildTree(leaves) {
+  // Nested {name, path, depth, leaves:[], kids:Map} — aggregates computed per node.
+  const root = { kids: new Map(), leaves };
+  for (const l of leaves) {
+    let node = root, prefix = "";
+    for (const key of KEYS) {                          // category levels
+      const name = l[key];
+      prefix = prefix ? prefix + SEP + name : name;
+      if (!node.kids.has(name))
+        node.kids.set(name, { name, path: prefix, depth: prefix.split(SEP).length - 1, leaves: [], kids: new Map() });
+      node = node.kids.get(name);
+      node.leaves.push(l);
+    }
+    node.kids.set(l.layout, { name: l.layout, leaf: l });
+  }
+  return root;
+}
+
+function nodeStats(node) {
+  const rs = node.leaves.map(l => l.ratio);
+  return { min: Math.min(...rs), med: median(rs), max: Math.max(...rs), n: rs.length };
+}
+
+function allCategoryPaths(node, out) {
+  for (const kid of node.kids.values()) {
+    if (kid.leaf) continue;
+    out.push(kid.path);
+    allCategoryPaths(kid, out);
+  }
+  return out;
+}
+
+function drawTree(leaves) {
+  const root = buildTree(leaves);
+  if (PENDING_EXPAND === "all") EXPANDED = new Set(allCategoryPaths(root, []));
+  PENDING_EXPAND = null;
+
+  const host = document.getElementById("treebody");
+  host.innerHTML = "";
+  if (!leaves.length) {
+    host.innerHTML = `<p class="hint">Nothing matches the current filters.</p>`;
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  emitKids(root, frag, 0);
+  host.append(frag);
+}
+
+function sortedKids(node) {
+  // Worst-first: a branch's max decides its place; leaves sort by their ratio.
+  return [...node.kids.values()].sort((a, b) =>
+    (b.leaf ? b.leaf.ratio : nodeStats(b).max) - (a.leaf ? a.leaf.ratio : nodeStats(a).max));
+}
+
+function emitKids(node, host, depth) {
+  for (const kid of sortedKids(node)) {
+    if (kid.leaf) { host.append(leafRow(kid.leaf, depth)); continue; }
+    const s = nodeStats(kid);
+    const open = EXPANDED.has(kid.path);
+    const row = document.createElement("div");
+    row.className = "trow cat";
+    row.setAttribute("role", "button");
+    row.setAttribute("aria-expanded", String(open));
+    row.dataset.path = kid.path;
+    row.tabIndex = 0;
+    row.innerHTML =
+      `<div class="name"><span class="caret">▶</span>` +
+      `<span class="label${depth >= 2 ? " mono" : ""}">${esc(kid.name)}</span>` +
+      `<span class="lvl">${LEVELS[depth]}</span></div>` +
+      `<div class="num count">${s.n}</div>` +
+      `<div class="num${s.min > BAR ? "" : " dim"}">${fmt(s.min)}×</div>` +
+      `<div class="num">${fmt(s.med)}×</div>` +
+      `<div class="worstcell">${pill(s.max)}</div>`;
+    const toggle = () => {
+      EXPANDED.has(kid.path) ? EXPANDED.delete(kid.path) : EXPANDED.add(kid.path);
+      render();
+      // The tree is rebuilt; put keyboard focus back on the toggled row.
+      const again = document.querySelector(`.trow[data-path="${CSS.escape(kid.path)}"]`);
+      if (again && document.activeElement === document.body) again.focus();
+    };
+    row.onclick = toggle;
+    row.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
+    host.append(row);
+    if (open) {
+      const kids = document.createElement("div");
+      kids.className = "kids";
+      emitKids(kid, kids, depth + 1);
+      host.append(kids);
+    }
+  }
+}
+
+function leafRow(l, depth) {
+  const row = document.createElement("div");
+  row.className = "trow leaf";
+  row.innerHTML =
+    `<div class="name"><span class="caret">▶</span>` +
+    `<span class="label mono">${esc(l.layout)}</span>` +
+    `<span class="lvl">${LEVELS[depth]}</span></div>` +
+    `<div class="num count">1</div><div class="num dim"></div><div class="num dim"></div>` +
+    `<div class="worstcell">${pill(l.ratio)}</div>`;
+  return row;
+}
+
+// ---- tiles / matrix / list ----------------------------------------------
+function render() {
+  const rows = filtered();
+  const ratios = rows.map(r => r.ratio);
+  const pass = rows.filter(r => r.ratio <= BAR).length;
+  const worst = rows.length ? rows.reduce((a, b) => (a.ratio > b.ratio ? a : b)) : null;
+
+  document.getElementById("t-n").textContent = rows.length;
+  document.getElementById("t-n-sub").textContent = `of ${LEAVES.length} recorded`;
+  document.getElementById("t-pass").textContent = rows.length ? `${Math.round(pass / rows.length * 100)}%` : "–";
+  document.getElementById("t-pass-sub").textContent = rows.length ? `${pass} of ${rows.length}` : "";
+  document.getElementById("t-med").textContent = rows.length ? fmt(median(ratios)) + "×" : "–";
+  document.getElementById("t-max").textContent = worst ? fmt(worst.ratio) + "×" : "–";
+  document.getElementById("t-max-sub").textContent =
+    worst ? `${worst.dtype}/${worst.op}/${worst.shape}/${worst.layout}` : "";
+
+  drawTree(rows);
+  drawMatrix(rows);
+  drawList(rows);
+}
+
+function drawMatrix(rows) {
+  const agg = document.getElementById("agg").value;
+  const host = document.getElementById("matrix");
+  const dtypes = [...new Set(rows.map(r => r.dtype))].sort();
+  const byOp = new Map();
+  for (const r of rows) {
+    if (!byOp.has(r.op)) byOp.set(r.op, new Map());
+    const m = byOp.get(r.op);
+    if (!m.has(r.dtype)) m.set(r.dtype, []);
+    m.get(r.dtype).push(r.ratio);
+  }
+  const ops = [...byOp.keys()].sort((a, b) =>
+    Math.max(...[].concat(...byOp.get(b).values())) - Math.max(...[].concat(...byOp.get(a).values())));
+
+  const t = document.createElement("table");
+  const head = t.insertRow();
+  head.append(document.createElement("th"));
+  for (const d of dtypes) { const th = document.createElement("th"); th.textContent = d; head.append(th); }
+
+  for (const op of ops) {
+    const tr = t.insertRow();
+    const th = document.createElement("th"); th.className = "rowhead mono"; th.textContent = op; tr.append(th);
+    for (const d of dtypes) {
+      const vals = byOp.get(op).get(d);
+      const td = tr.insertCell();
+      if (!vals) { td.className = "empty"; td.textContent = "–"; continue; }
+      const v = agg === "max" ? Math.max(...vals) : median(vals);
+      const b = band(v);
+      td.className = "cell b-" + b.id;
+      td.innerHTML = `<span class="g">${b.glyph}</span>${fmt(v)}×`;
+      td.title = `${op} × ${d}\n${vals.length} case${vals.length > 1 ? "s" : ""}`
+        + `\nworst ${fmt(Math.max(...vals))}×, median ${fmt(median(vals))}×`;
+      td.onclick = () => focusTreeOn(op, d);
+      td.setAttribute("role", "button");
+      td.tabIndex = 0;
+      td.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); focusTreeOn(op, d); } };
+    }
+  }
+  host.innerHTML = ""; host.append(t);
+}
+
+function focusTreeOn(op, dtype) {
+  SELDT = new Set([dtype]);
+  for (const btn of document.querySelectorAll("#dtchips .chip"))
+    btn.setAttribute("aria-pressed", String(btn.textContent === dtype));
+  document.getElementById("q").value = `/${op}/`;
+  PENDING_EXPAND = "all";
+  render();
+  document.getElementById("tree").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function drawList(rows) {
+  const tb = document.querySelector("#list tbody");
+  const sorted = [...rows].sort((a, b) => b.ratio - a.ratio);
+  const show = sorted.slice(0, 200);
+  tb.innerHTML = "";
+  for (const r of show) {
+    const tr = tb.insertRow();
+    tr.innerHTML =
+      `<td class="num">${pill(r.ratio)}</td>` +
+      `<td>${esc(r.dtype)}</td><td class="mono">${esc(r.op)}</td>` +
+      `<td class="mono">${esc(r.shape)}</td><td class="mono">${esc(r.layout)}</td>` +
+      `<td class="path">${esc(r.hw)}</td>`;
+  }
+  document.getElementById("listnote").textContent =
+    show.length < sorted.length ? `Showing the worst ${show.length} of ${sorted.length}. Narrow the filters to see the rest.` : "";
+}
+
+// ---- wiring --------------------------------------------------------------
+document.getElementById("q").oninput = () => { PENDING_EXPAND = "all"; render(); };
+document.getElementById("agg").onchange = render;
+document.getElementById("missonly").onclick = e => {
+  MISSONLY = !MISSONLY;
+  e.target.setAttribute("aria-pressed", String(MISSONLY));
+  render();
+};
+document.getElementById("expand").onclick = () => { PENDING_EXPAND = "all"; render(); };
+document.getElementById("collapse").onclick = () => { EXPANDED = new Set(); render(); };
+document.getElementById("pick").onclick = () => document.getElementById("file").click();
+document.getElementById("file").onchange = e => {
+  const f = e.target.files[0]; if (f) readFile(f);
+};
+
+function fail(msg) {
+  const el = document.getElementById("err");
+  el.textContent = msg; el.hidden = false;
+}
+// A baselines source is either a whole baselines.html carrying the data in
+// its #baselines block, or the bare JSON of that block.  Both are accepted
+// everywhere a file can come from, so "send me your baselines" needs no
+// instructions about which of the two you send.
+const DATA_ID = "baselines";
+
+function parseSource(text) {
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    const block = new DOMParser().parseFromString(text, "text/html").getElementById(DATA_ID);
+    if (!block) throw new Error(
+      `not a baselines file: it is neither JSON (${err.message}) nor an HTML `
+      + `document with a <script id="${DATA_ID}"> block`);
+    return JSON.parse(block.textContent);
+  }
+}
+
+function readFile(f) {
+  const fr = new FileReader();
+  fr.onload = () => {
+    try { ingest(parseSource(fr.result), `Loaded ${f.name}`); }
+    catch (err) { fail(`${f.name}: ${err.message}`); }
+  };
+  fr.readAsText(f);
+}
+
+// ---- loading from a URL ---------------------------------------------------
+// ?url=<url of a baselines file> reads someone else's numbers with this
+// file's viewer, and the address of the page is then itself the shareable
+// link to that view.
+const URL_PARAM = "url";
+
+// A github.com blob URL serves an HTML *page around* the file (and no CORS
+// header); the raw host serves the file itself with Access-Control-Allow-Origin: *.
+function resolveUrl(raw) {
+  const m = raw.trim().match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/(?:blob|raw)\/(.+)$/);
+  return m ? `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}` : raw.trim();
+}
+
+function loadUrl(raw) {
+  const url = resolveUrl(raw);
+  if (!url) return;
+  document.getElementById("err").hidden = true;
+  fetch(url)
+    .then(r => r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status} ${r.statusText}`)))
+    .then(text => ingest(parseSource(text), `Loaded ${url}`))
+    .catch(err => fail(
+      err instanceof TypeError
+        ? `Could not fetch ${url}: the server is unreachable, or it does not `
+          + `allow this page to read it (no CORS header). Raw file hosts such as `
+          + `raw.githubusercontent.com do allow it; a plain github.com page does not. `
+          + `Downloading the file and dropping it here always works.`
+        : `Could not load ${url}: ${err.message}`));
+}
+addEventListener("dragover", e => { e.preventDefault(); document.body.classList.add("drop"); });
+addEventListener("dragleave", () => document.body.classList.remove("drop"));
+addEventListener("drop", e => {
+  e.preventDefault(); document.body.classList.remove("drop");
+  const f = e.dataTransfer.files[0]; if (f) readFile(f);
+});
+
+// ---- boot ----------------------------------------------------------------
+// The data is in this document, so there is nothing to fetch and nothing to
+// serve: opening the file off disk works.  The #baselines block sits AFTER
+// this script (the data is the long part; the viewer reads better first),
+// so wait for the parser to reach it.
+function boot() {
+  const requested = new URLSearchParams(location.search).get(URL_PARAM);
+  if (requested) {
+    loadUrl(requested);   // an explicit ?url= wins: it is what the link promised
+    return;
+  }
+  const block = document.getElementById(DATA_ID);
+  if (!block) return;                      // stripped copy: the empty state explains it
+  try { ingest(JSON.parse(block.textContent), "This file's own baselines"); }
+  catch (err) { fail(`The #${DATA_ID} block in this file did not parse: ${err.message}`); }
+}
+document.addEventListener("DOMContentLoaded", boot);
+</script>
+
+<!-- The baselines themselves: machine-written by `pytest benchmarks/ --update-baselines`.
+     One ratio per dtype/op/shape/layout leaf, canonical (sorted keys, indent 2, one entry
+     per line) so a run that measured three cases changes three lines here and nothing else.
+     Nothing derived is stored: the viewer above computes every min/median/max from these
+     leaves. Do not hand-edit — see benchmarks/bench_lib/baselines.py. -->
+<script type="application/json" id="baselines">
+{
+  "configs": {
+    "NVIDIA H100 PCIe | cuda | kineto-device-time@1395MHz | torch 2.11.0+cu130": {
+      "dtypes": {
+        "bf16": {
+          "ops": {
+            "_adaptive_avg_pool2d": {
+              "shapes": {
+                "N32xC512x28x28_o7": {
+                  "layouts": {
+                    "contig": 0.417
+                  }
+                },
+                "N8xC64x112x112_o1": {
+                  "layouts": {
+                    "contig": 2.984
+                  }
+                }
+              }
+            },
+            "_log_softmax": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.602
+                  }
+                },
+                "S32768x1024": {
+                  "layouts": {
+                    "contig": 2.314
+                  }
+                },
+                "S768x50304": {
+                  "layouts": {
+                    "contig": 0.997
+                  }
+                }
+              }
+            },
+            "_log_softmax_backward_data": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.986
+                  }
+                },
+                "S32768x1024": {
+                  "layouts": {
+                    "contig": 0.86
+                  }
+                },
+                "S768x50304": {
+                  "layouts": {
+                    "contig": 0.764
+                  }
+                }
+              }
+            },
+            "_scaled_dot_product_attention_math": {
+              "shapes": {
+                "B1H16S4096D128": {
+                  "layouts": {
+                    "contig": 0.19
+                  }
+                },
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 0.205
+                  }
+                }
+              }
+            },
+            "_scaled_dot_product_efficient_attention": {
+              "shapes": {
+                "B1H16S4096D128": {
+                  "layouts": {
+                    "contig": 3.147
+                  }
+                },
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 0.724
+                  }
+                }
+              }
+            },
+            "_scaled_dot_product_flash_attention": {
+              "shapes": {
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 1.365
+                  }
+                }
+              }
+            },
+            "_scaled_dot_product_flash_attention_backward": {
+              "shapes": {
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 0.716
+                  }
+                }
+              }
+            },
+            "_softmax": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.237
+                  }
+                },
+                "S32768x1024": {
+                  "layouts": {
+                    "contig": 3.436
+                  }
+                },
+                "S768x50304": {
+                  "layouts": {
+                    "contig": 3.315
+                  }
+                }
+              }
+            },
+            "_to_copy": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.601
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.868
+                  }
+                }
+              }
+            },
+            "abs": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.425
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.43
+                  }
+                }
+              }
+            },
+            "acos": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.296
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.591
+                  }
+                }
+              }
+            },
+            "add.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.257,
+                    "contig": 1.051
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.59,
+                    "contig": 1.004
+                  }
+                }
+              }
+            },
+            "add_.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.436
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.007
+                  }
+                }
+              }
+            },
+            "addcdiv": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 3.771
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 4.451
+                  }
+                }
+              }
+            },
+            "addcmul": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 4.421
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 4.41
+                  }
+                }
+              }
+            },
+            "addmm": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 5.158,
+                    "NT": 3.933,
+                    "TN": 6.646,
+                    "TT": 4.842
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 5.09,
+                    "NT": 3.735,
+                    "TN": 6.393,
+                    "TT": 4.675
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 4.949,
+                    "NT": 3.888,
+                    "TN": 6.285,
+                    "TT": 4.806
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 9.298,
+                    "NT": 5.959,
+                    "TN": 10.535,
+                    "TT": 8.787
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 2.735,
+                    "NT": 2.479,
+                    "TN": 3.381,
+                    "TT": 2.829
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 5.004,
+                    "NT": 3.92,
+                    "TN": 6.368,
+                    "TT": 4.882
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 5.057,
+                    "NT": 3.028,
+                    "TN": 6.651,
+                    "TT": 4.791
+                  }
+                }
+              }
+            },
+            "amax": {
+              "shapes": {
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.975
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.907
+                  }
+                }
+              }
+            },
+            "amin": {
+              "shapes": {
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.945
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.894
+                  }
+                }
+              }
+            },
+            "asinh": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.041
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.34
+                  }
+                }
+              }
+            },
+            "atanh": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.177
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.479
+                  }
+                }
+              }
+            },
+            "avg_pool2d": {
+              "shapes": {
+                "N32xC64x112x112_k2s2": {
+                  "layouts": {
+                    "contig": 1.525
+                  }
+                },
+                "N8xC256x28x28_k3s2": {
+                  "layouts": {
+                    "contig": 1.368
+                  }
+                }
+              }
+            },
+            "bmm": {
+              "shapes": {
+                "S1_8x4096x4096x4096": {
+                  "layouts": {
+                    "NN": 5.369,
+                    "NT": 3.763,
+                    "TN": 6.88,
+                    "TT": 4.062
+                  }
+                },
+                "S2_8x8192x2048x2048": {
+                  "layouts": {
+                    "NN": 5.223,
+                    "NT": 3.557,
+                    "TN": 6.833,
+                    "TT": 5.039
+                  }
+                },
+                "S3_8x2048x8192x2048": {
+                  "layouts": {
+                    "NN": 5.249,
+                    "NT": 3.55,
+                    "TN": 6.794,
+                    "TT": 5.091
+                  }
+                },
+                "S4_8x1024x1024x8192": {
+                  "layouts": {
+                    "NN": 5.158,
+                    "NT": 4.179,
+                    "TN": 6.725,
+                    "TT": 4.972
+                  }
+                },
+                "S5_8x357x789x333": {
+                  "layouts": {
+                    "NN": 2.359,
+                    "NT": 1.793,
+                    "TN": 3.041,
+                    "TT": 2.302
+                  }
+                },
+                "S6_8x32768x768x768": {
+                  "layouts": {
+                    "NN": 4.415,
+                    "NT": 3.799,
+                    "TN": 6.259,
+                    "TT": 4.346
+                  }
+                }
+              }
+            },
+            "cat": {
+              "shapes": {
+                "P2x8388608": {
+                  "layouts": {
+                    "contig": 7.087
+                  }
+                },
+                "P64x262144": {
+                  "layouts": {
+                    "contig": 9.347
+                  }
+                }
+              }
+            },
+            "ceil": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.381
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.442
+                  }
+                }
+              }
+            },
+            "clamp": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 2.189
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 2.166
+                  }
+                }
+              }
+            },
+            "clone": {
+              "shapes": {
+                "S4096x4096": {
+                  "layouts": {
+                    "sliced": 0.643
+                  }
+                }
+              }
+            },
+            "convolution": {
+              "shapes": {
+                "N32xC64x56x56_K64k3s1": {
+                  "layouts": {
+                    "contig": 24.351
+                  }
+                },
+                "N8xC3x224x224_K64k7s2": {
+                  "layouts": {
+                    "contig": 4.701
+                  }
+                }
+              }
+            },
+            "cos": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.001
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.419
+                  }
+                }
+              }
+            },
+            "cosh": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.256
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.533
+                  }
+                }
+              }
+            },
+            "div.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.189,
+                    "contig": 1.071
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.565,
+                    "contig": 1.007
+                  }
+                }
+              }
+            },
+            "embedding": {
+              "shapes": {
+                "V1000xD64_T4096": {
+                  "layouts": {
+                    "contig": 0.962
+                  }
+                },
+                "V50304xD768_T49152": {
+                  "layouts": {
+                    "contig": 2.703
+                  }
+                }
+              }
+            },
+            "erf": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.296
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.552
+                  }
+                }
+              }
+            },
+            "exp": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.259
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.446
+                  }
+                }
+              }
+            },
+            "fill_.Scalar": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 9.267
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 41.26
+                  }
+                }
+              }
+            },
+            "floor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.373
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.445
+                  }
+                }
+              }
+            },
+            "gelu": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.005
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.965
+                  }
+                }
+              }
+            },
+            "gelu_backward": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.91
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.987
+                  }
+                }
+              }
+            },
+            "index.Tensor": {
+              "shapes": {
+                "R1000x64_I4096": {
+                  "layouts": {
+                    "contig": 0.976
+                  }
+                },
+                "R262144x64_I1048576": {
+                  "layouts": {
+                    "contig": 0.49
+                  }
+                }
+              }
+            },
+            "isnan": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 2.053
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 2.544
+                  }
+                }
+              }
+            },
+            "linear": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 3.923
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 3.746
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 3.871
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 6.018
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 2.494
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 3.94
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 3.248
+                  }
+                }
+              }
+            },
+            "linear_backward": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 2.99
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 3.32
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 4.224
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 3.2
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 3.765
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 1.499
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 2.344
+                  }
+                }
+              }
+            },
+            "log": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.122
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.456
+                  }
+                }
+              }
+            },
+            "log1p": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.91
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 3.696
+                  }
+                }
+              }
+            },
+            "max": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 28.958
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 8.236
+                  }
+                }
+              }
+            },
+            "max_pool2d_with_indices": {
+              "shapes": {
+                "N32xC64x112x112_k2s2": {
+                  "layouts": {
+                    "contig": 2.35
+                  }
+                },
+                "N8xC256x28x28_k3s2": {
+                  "layouts": {
+                    "contig": 2.301
+                  }
+                }
+              }
+            },
+            "maximum": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.824
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 0.996
+                  }
+                }
+              }
+            },
+            "mean": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 13.333
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 5.627
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 3.765
+                  }
+                }
+              }
+            },
+            "min": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 28.878
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 8.16
+                  }
+                }
+              }
+            },
+            "min.dim": {
+              "shapes": {
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 1.299
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.331
+                  }
+                }
+              }
+            },
+            "minimum": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.827
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 0.993
+                  }
+                }
+              }
+            },
+            "mm": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 5.165,
+                    "NT": 1.078,
+                    "TN": 1.129,
+                    "TT": 4.843
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 5.168,
+                    "NT": 1.111,
+                    "TN": 1.238,
+                    "TT": 4.788
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 4.912,
+                    "NT": 1.061,
+                    "TN": 1.225,
+                    "TT": 4.638
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 9.317,
+                    "NT": 2.211,
+                    "TN": 1.151,
+                    "TT": 9.027
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 2.711,
+                    "NT": 2.261,
+                    "TN": 3.266,
+                    "TT": 2.826
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 1.055,
+                    "NT": 1.151,
+                    "TN": 1.626,
+                    "TT": 5.073
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 4.178,
+                    "NT": 1.014,
+                    "TN": 1.892,
+                    "TT": 4.05
+                  }
+                }
+              }
+            },
+            "mul.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.272,
+                    "contig": 1.001
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.591,
+                    "contig": 1.006
+                  }
+                }
+              }
+            },
+            "mul_.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.042
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.997
+                  }
+                }
+              }
+            },
+            "native_group_norm": {
+              "shapes": {
+                "N32xC64xH56xW56_G32": {
+                  "layouts": {
+                    "contig": 1.042
+                  }
+                },
+                "N8xC256xH14xW14_G32": {
+                  "layouts": {
+                    "contig": 0.813
+                  }
+                }
+              }
+            },
+            "native_layer_norm": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.76
+                  }
+                },
+                "B32768xD1024": {
+                  "layouts": {
+                    "contig": 3.108
+                  }
+                }
+              }
+            },
+            "neg": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.427
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.432
+                  }
+                }
+              }
+            },
+            "pow": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 1.081,
+                    "Tensor": 0.755
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 1.082,
+                    "Tensor": 0.65
+                  }
+                }
+              }
+            },
+            "reciprocal": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.239
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.497
+                  }
+                }
+              }
+            },
+            "relu": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.305
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.423
+                  }
+                }
+              }
+            },
+            "relu_": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.354
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 2.548
+                  }
+                }
+              }
+            },
+            "repeat": {
+              "shapes": {
+                "S1024x1024_r4x4": {
+                  "layouts": {
+                    "contig": 15.66
+                  }
+                },
+                "S357x789_r3x5": {
+                  "layouts": {
+                    "contig": 15.759
+                  }
+                }
+              }
+            },
+            "rsqrt": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.497
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.591
+                  }
+                }
+              }
+            },
+            "scaled_dot_product_attention": {
+              "shapes": {
+                "B1H16S4096D128": {
+                  "layouts": {
+                    "contig": 10.75
+                  }
+                },
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 2.255
+                  }
+                }
+              }
+            },
+            "scatter.src": {
+              "shapes": {
+                "R1000x64_S512": {
+                  "layouts": {
+                    "contig": 0.961
+                  }
+                },
+                "R262144x64_S65536": {
+                  "layouts": {
+                    "contig": 1.161
+                  }
+                }
+              }
+            },
+            "scatter.value": {
+              "shapes": {
+                "R1000x64_S512": {
+                  "layouts": {
+                    "contig": 1.217
+                  }
+                },
+                "R262144x64_S65536": {
+                  "layouts": {
+                    "contig": 1.202
+                  }
+                }
+              }
+            },
+            "sigmoid": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.066
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.513
+                  }
+                }
+              }
+            },
+            "sign": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.365
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.455
+                  }
+                }
+              }
+            },
+            "silu": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.095
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.502
+                  }
+                }
+              }
+            },
+            "sin": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.014
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.421
+                  }
+                }
+              }
+            },
+            "sinh": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.295
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.695
+                  }
+                }
+              }
+            },
+            "sqrt": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.225
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.48
+                  }
+                }
+              }
+            },
+            "stack": {
+              "shapes": {
+                "P32x65536": {
+                  "layouts": {
+                    "contig": 16.086
+                  }
+                },
+                "P8x1048576": {
+                  "layouts": {
+                    "contig": 7.969
+                  }
+                }
+              }
+            },
+            "sub.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.254,
+                    "contig": 0.99
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.588,
+                    "contig": 1.005
+                  }
+                }
+              }
+            },
+            "sum.dim_IntList": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 13.547
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 5.95
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 4.095
+                  }
+                }
+              }
+            },
+            "tan": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.079
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.504
+                  }
+                }
+              }
+            },
+            "tanh": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.171
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.441
+                  }
+                }
+              }
+            },
+            "tril": {
+              "shapes": {
+                "S8192x8192": {
+                  "layouts": {
+                    "contig": 2.686
+                  }
+                }
+              }
+            },
+            "triu": {
+              "shapes": {
+                "S8192x8192": {
+                  "layouts": {
+                    "contig": 2.683
+                  }
+                }
+              }
+            },
+            "upsample_bilinear2d": {
+              "shapes": {
+                "N2xC3x256x256_x2": {
+                  "layouts": {
+                    "contig": 2.745
+                  }
+                },
+                "N8xC64x56x56_x2": {
+                  "layouts": {
+                    "contig": 1.05
+                  }
+                }
+              }
+            },
+            "var.correction": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 1149.008
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 2.541
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.663
+                  }
+                }
+              }
+            },
+            "where.self": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 5.327
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 2.918
+                  }
+                }
+              }
+            }
+          }
+        },
+        "bool": {
+          "ops": {
+            "all": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 8.563
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.477
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.807
+                  }
+                }
+              }
+            },
+            "any": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 8.335
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.791
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.519
+                  }
+                }
+              }
+            },
+            "logical_and": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 3.771
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 8.801
+                  }
+                }
+              }
+            },
+            "logical_not": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.884
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 4.157
+                  }
+                }
+              }
+            },
+            "logical_xor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 3.775
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 8.726
+                  }
+                }
+              }
+            }
+          }
+        },
+        "f16": {
+          "ops": {
+            "_scaled_dot_product_efficient_attention": {
+              "shapes": {
+                "B1H16S4096D128": {
+                  "layouts": {
+                    "contig": 17.509
+                  }
+                },
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 14.496
+                  }
+                }
+              }
+            },
+            "addmm": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 33.959,
+                    "NT": 33.967,
+                    "TN": 35.023,
+                    "TT": 34.756
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 33.59,
+                    "NT": 34.148,
+                    "TN": 35.286,
+                    "TT": 35.739
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 34.691,
+                    "NT": 34.66,
+                    "TN": 34.481,
+                    "TT": 35.095
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 66.147,
+                    "NT": 67.502,
+                    "TN": 62.6,
+                    "TT": 68.907
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 2.726,
+                    "NT": 3.263,
+                    "TN": 2.739,
+                    "TT": 3.238
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 33.221,
+                    "NT": 33.806,
+                    "TN": 35.129,
+                    "TT": 35.89
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 32.349,
+                    "NT": 35.524,
+                    "TN": 32.415,
+                    "TT": 34.739
+                  }
+                }
+              }
+            },
+            "bmm": {
+              "shapes": {
+                "S1_8x4096x4096x4096": {
+                  "layouts": {
+                    "NN": 35.209,
+                    "NT": 35.483,
+                    "TN": 35.568,
+                    "TT": 35.878
+                  }
+                },
+                "S2_8x8192x2048x2048": {
+                  "layouts": {
+                    "NN": 35.445,
+                    "NT": 34.797,
+                    "TN": 36.675,
+                    "TT": 37.144
+                  }
+                },
+                "S3_8x2048x8192x2048": {
+                  "layouts": {
+                    "NN": 36.003,
+                    "NT": 36.413,
+                    "TN": 32.73,
+                    "TT": 33.798
+                  }
+                },
+                "S4_8x1024x1024x8192": {
+                  "layouts": {
+                    "NN": 35.004,
+                    "NT": 35.699,
+                    "TN": 35.754,
+                    "TT": 36.702
+                  }
+                },
+                "S5_8x357x789x333": {
+                  "layouts": {
+                    "NN": 6.238,
+                    "NT": 5.675,
+                    "TN": 7.452,
+                    "TT": 6.522
+                  }
+                },
+                "S6_8x32768x768x768": {
+                  "layouts": {
+                    "NN": 30.949,
+                    "NT": 31.324,
+                    "TN": 30.721,
+                    "TT": 33.116
+                  }
+                }
+              }
+            },
+            "linear": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 38.926
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 38.898
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 39.753
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 80.871
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 3.482
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 39.18
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 38.805
+                  }
+                }
+              }
+            },
+            "linear_backward": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 32.599
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 36.686
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 38.386
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 31.146
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 4.528
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 39.5
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 31.725
+                  }
+                }
+              }
+            },
+            "mm": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 34.509,
+                    "NT": 34.241,
+                    "TN": 34.446,
+                    "TT": 34.591
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 33.705,
+                    "NT": 34.198,
+                    "TN": 35.299,
+                    "TT": 35.77
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 32.985,
+                    "NT": 33.679,
+                    "TN": 33.545,
+                    "TT": 33.854
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 67.151,
+                    "NT": 68.072,
+                    "TN": 63.666,
+                    "TT": 70.091
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 2.525,
+                    "NT": 3.097,
+                    "TN": 3.356,
+                    "TT": 2.968
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 33.395,
+                    "NT": 33.405,
+                    "TN": 34.895,
+                    "TT": 35.426
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 34.061,
+                    "NT": 35.223,
+                    "TN": 32.341,
+                    "TT": 34.768
+                  }
+                }
+              }
+            },
+            "scaled_dot_product_attention": {
+              "shapes": {
+                "B1H16S4096D128": {
+                  "layouts": {
+                    "contig": 59.274
+                  }
+                },
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 46.149
+                  }
+                }
+              }
+            }
+          }
+        },
+        "f32": {
+          "ops": {
+            "_adaptive_avg_pool2d": {
+              "shapes": {
+                "N32xC512x28x28_o7": {
+                  "layouts": {
+                    "contig": 0.466
+                  }
+                },
+                "N8xC64x112x112_o1": {
+                  "layouts": {
+                    "contig": 2.347
+                  }
+                }
+              }
+            },
+            "_foreach_add_.Scalar": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 1.95
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 1.845
+                  }
+                }
+              }
+            },
+            "_foreach_addcdiv_.ScalarList": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 3.36
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 2.364
+                  }
+                }
+              }
+            },
+            "_foreach_addcmul_.Scalar": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 4.549
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 2.431
+                  }
+                }
+              }
+            },
+            "_foreach_div_.ScalarList": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 4.431
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 5.237
+                  }
+                }
+              }
+            },
+            "_foreach_lerp_.Scalar": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 6.884
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 4.554
+                  }
+                }
+              }
+            },
+            "_foreach_mul_.Scalar": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 6.911
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 8.026
+                  }
+                }
+              }
+            },
+            "_foreach_mul_.Tensor": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 2.044
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 1.935
+                  }
+                }
+              }
+            },
+            "_foreach_norm.Scalar": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 1.044
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 0.971
+                  }
+                }
+              }
+            },
+            "_foreach_sqrt": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 1.571
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 1.05
+                  }
+                }
+              }
+            },
+            "_fused_adamw_": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 2.395
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 1.825
+                  }
+                }
+              }
+            },
+            "_log_softmax": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.88
+                  }
+                },
+                "S32768x1024": {
+                  "layouts": {
+                    "contig": 1.374
+                  }
+                },
+                "S768x50304": {
+                  "layouts": {
+                    "contig": 0.637
+                  }
+                }
+              }
+            },
+            "_log_softmax_backward_data": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.144
+                  }
+                },
+                "S32768x1024": {
+                  "layouts": {
+                    "contig": 1.071
+                  }
+                },
+                "S768x50304": {
+                  "layouts": {
+                    "contig": 0.741
+                  }
+                }
+              }
+            },
+            "_native_batch_norm_legit_no_training": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 1.87
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 2.717
+                  }
+                }
+              }
+            },
+            "_scaled_dot_product_attention_math": {
+              "shapes": {
+                "B1H16S4096D128": {
+                  "layouts": {
+                    "contig": 0.861
+                  }
+                },
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 0.757
+                  }
+                }
+              }
+            },
+            "_softmax": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.407
+                  }
+                },
+                "S32768x1024": {
+                  "layouts": {
+                    "contig": 2.09
+                  }
+                },
+                "S768x50304": {
+                  "layouts": {
+                    "contig": 1.542
+                  }
+                }
+              }
+            },
+            "_to_copy": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.146
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.171
+                  }
+                }
+              }
+            },
+            "abs": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.341
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.114
+                  }
+                }
+              }
+            },
+            "acos": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.247
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.14
+                  }
+                }
+              }
+            },
+            "add.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.468,
+                    "contig": 1.023
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.916,
+                    "contig": 1.002
+                  }
+                }
+              }
+            },
+            "add_.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.297
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.001
+                  }
+                }
+              }
+            },
+            "addcdiv": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 3.346
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 2.22
+                  }
+                }
+              }
+            },
+            "addcmul": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 3.818
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 2.238
+                  }
+                }
+              }
+            },
+            "addmm": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 1.496,
+                    "NT": 1.376,
+                    "TN": 1.563,
+                    "TT": 1.354
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 1.379,
+                    "NT": 1.368,
+                    "TN": 1.545,
+                    "TT": 1.398
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 1.388,
+                    "NT": 1.389,
+                    "TN": 1.52,
+                    "TT": 1.36
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 1.903,
+                    "NT": 1.707,
+                    "TN": 2.047,
+                    "TT": 2.057
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 1.958,
+                    "NT": 2.028,
+                    "TN": 2.177,
+                    "TT": 2.269
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 1.369,
+                    "NT": 1.471,
+                    "TN": 1.599,
+                    "TT": 1.574
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 1.488,
+                    "NT": 1.6,
+                    "TN": 1.544,
+                    "TT": 1.547
+                  }
+                }
+              }
+            },
+            "amax": {
+              "shapes": {
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.424
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.454
+                  }
+                }
+              }
+            },
+            "amin": {
+              "shapes": {
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.425
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.454
+                  }
+                }
+              }
+            },
+            "arange": {
+              "shapes": {
+                "N16777216": {
+                  "layouts": {
+                    "contig": 0.264
+                  }
+                }
+              }
+            },
+            "argmax": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 308.997
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 1.59
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.457
+                  }
+                }
+              }
+            },
+            "argmin": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 615.415
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 1.506
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.229
+                  }
+                }
+              }
+            },
+            "asinh": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.997
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.137
+                  }
+                }
+              }
+            },
+            "atanh": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.173
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.152
+                  }
+                }
+              }
+            },
+            "avg_pool2d": {
+              "shapes": {
+                "N32xC64x112x112_k2s2": {
+                  "layouts": {
+                    "contig": 1.5
+                  }
+                },
+                "N8xC256x28x28_k3s2": {
+                  "layouts": {
+                    "contig": 1.363
+                  }
+                }
+              }
+            },
+            "bmm": {
+              "shapes": {
+                "S1_8x4096x4096x4096": {
+                  "layouts": {
+                    "NN": 1.399,
+                    "NT": 1.486,
+                    "TN": 1.353,
+                    "TT": 1.405
+                  }
+                },
+                "S2_8x8192x2048x2048": {
+                  "layouts": {
+                    "NN": 1.319,
+                    "NT": 1.48,
+                    "TN": 1.379,
+                    "TT": 1.424
+                  }
+                },
+                "S3_8x2048x8192x2048": {
+                  "layouts": {
+                    "NN": 1.408,
+                    "NT": 1.511,
+                    "TN": 1.355,
+                    "TT": 1.416
+                  }
+                },
+                "S4_8x1024x1024x8192": {
+                  "layouts": {
+                    "NN": 1.391,
+                    "NT": 1.326,
+                    "TN": 1.492,
+                    "TT": 1.529
+                  }
+                },
+                "S5_8x357x789x333": {
+                  "layouts": {
+                    "NN": 2.741,
+                    "NT": 2.789,
+                    "TN": 2.888,
+                    "TT": 3.093
+                  }
+                },
+                "S6_8x32768x768x768": {
+                  "layouts": {
+                    "NN": 1.363,
+                    "NT": 1.476,
+                    "TN": 1.436,
+                    "TT": 1.492
+                  }
+                }
+              }
+            },
+            "cat": {
+              "shapes": {
+                "P2x8388608": {
+                  "layouts": {
+                    "contig": 4.117
+                  }
+                },
+                "P64x262144": {
+                  "layouts": {
+                    "contig": 5.435
+                  }
+                }
+              }
+            },
+            "ceil": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.332
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.131
+                  }
+                }
+              }
+            },
+            "clamp": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 2.193
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 1.231
+                  }
+                }
+              }
+            },
+            "clone": {
+              "shapes": {
+                "S4096x4096": {
+                  "layouts": {
+                    "sliced": 0.918
+                  }
+                }
+              }
+            },
+            "convolution": {
+              "shapes": {
+                "N32xC64x56x56_K64k3s1": {
+                  "layouts": {
+                    "contig": 12.456
+                  }
+                },
+                "N8xC3x224x224_K64k7s2": {
+                  "layouts": {
+                    "contig": 4.138
+                  }
+                }
+              }
+            },
+            "cos": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.998
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.124
+                  }
+                }
+              }
+            },
+            "cosh": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.185
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.143
+                  }
+                }
+              }
+            },
+            "cumsum": {
+              "shapes": {
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 7.081
+                  }
+                }
+              }
+            },
+            "div.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.434,
+                    "contig": 1.0
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.902,
+                    "contig": 1.01
+                  }
+                }
+              }
+            },
+            "embedding": {
+              "shapes": {
+                "V1000xD64_T4096": {
+                  "layouts": {
+                    "contig": 0.972
+                  }
+                },
+                "V50304xD768_T49152": {
+                  "layouts": {
+                    "contig": 1.431
+                  }
+                }
+              }
+            },
+            "embedding_dense_backward": {
+              "shapes": {
+                "V1000xD64_T4096": {
+                  "layouts": {
+                    "contig": 0.037
+                  }
+                },
+                "V50304xD768_T49152": {
+                  "layouts": {
+                    "contig": 0.246
+                  }
+                }
+              }
+            },
+            "eq": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.741,
+                    "Tensor": 3.583
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 5.51,
+                    "Tensor": 3.179
+                  }
+                }
+              }
+            },
+            "erf": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.201
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.147
+                  }
+                }
+              }
+            },
+            "exp": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.271
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.129
+                  }
+                }
+              }
+            },
+            "fill_.Scalar": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 8.866
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 16.172
+                  }
+                }
+              }
+            },
+            "floor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.326
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.129
+                  }
+                }
+              }
+            },
+            "floor_divide": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 2.456,
+                    "Tensor": 0.369
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 3.502,
+                    "Tensor": 0.941
+                  }
+                }
+              }
+            },
+            "ge": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.784,
+                    "Tensor": 3.556
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 5.521,
+                    "Tensor": 3.136
+                  }
+                }
+              }
+            },
+            "gelu": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.224
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.153
+                  }
+                }
+              }
+            },
+            "gelu_backward": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.744
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.003
+                  }
+                }
+              }
+            },
+            "gt": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.748,
+                    "Tensor": 3.569
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 5.513,
+                    "Tensor": 3.129
+                  }
+                }
+              }
+            },
+            "index.Tensor": {
+              "shapes": {
+                "R1000x64_I4096": {
+                  "layouts": {
+                    "contig": 0.991
+                  }
+                },
+                "R262144x64_I1048576": {
+                  "layouts": {
+                    "contig": 0.522
+                  }
+                }
+              }
+            },
+            "isnan": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.903
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.505
+                  }
+                }
+              }
+            },
+            "le": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.747,
+                    "Tensor": 3.583
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 5.499,
+                    "Tensor": 3.133
+                  }
+                }
+              }
+            },
+            "lerp.Scalar": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 3.874
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 2.803
+                  }
+                }
+              }
+            },
+            "linalg_vector_norm": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 37.141
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 6.238
+                  }
+                }
+              }
+            },
+            "linear": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 1.409
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 1.508
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 1.39
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 2.587
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 2.22
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 1.961
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 1.451
+                  }
+                }
+              }
+            },
+            "linear_backward": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 1.265
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 1.293
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 1.528
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 1.263
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 2.438
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 1.275
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 1.252
+                  }
+                }
+              }
+            },
+            "log": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.053
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.13
+                  }
+                }
+              }
+            },
+            "log1p": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.941
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.934
+                  }
+                }
+              }
+            },
+            "lt": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.728,
+                    "Tensor": 3.548
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 5.537,
+                    "Tensor": 3.181
+                  }
+                }
+              }
+            },
+            "masked_fill": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 6.197,
+                    "Tensor": 5.443
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 2.276,
+                    "Tensor": 2.278
+                  }
+                }
+              }
+            },
+            "masked_fill_": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 5.88,
+                    "Tensor": 5.201
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "Scalar": 2.27,
+                    "Tensor": 2.263
+                  }
+                }
+              }
+            },
+            "max": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 31.686
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 4.465
+                  }
+                }
+              }
+            },
+            "max_pool2d_with_indices": {
+              "shapes": {
+                "N32xC64x112x112_k2s2": {
+                  "layouts": {
+                    "contig": 2.377
+                  }
+                },
+                "N8xC256x28x28_k3s2": {
+                  "layouts": {
+                    "contig": 2.371
+                  }
+                }
+              }
+            },
+            "maximum": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.916
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 1.005
+                  }
+                }
+              }
+            },
+            "mean": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 4.67
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.418
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.369
+                  }
+                }
+              }
+            },
+            "min": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 31.717
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 4.483
+                  }
+                }
+              }
+            },
+            "min.dim": {
+              "shapes": {
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 1.536
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.221
+                  }
+                }
+              }
+            },
+            "minimum": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.909
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 1.005
+                  }
+                }
+              }
+            },
+            "mm": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 1.396,
+                    "NT": 1.355,
+                    "TN": 1.105,
+                    "TT": 1.504
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 1.407,
+                    "NT": 1.357,
+                    "TN": 1.094,
+                    "TT": 1.503
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 1.408,
+                    "NT": 1.382,
+                    "TN": 1.029,
+                    "TT": 1.349
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 1.868,
+                    "NT": 1.887,
+                    "TN": 1.054,
+                    "TT": 1.882
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 1.732,
+                    "NT": 1.815,
+                    "TN": 3.524,
+                    "TT": 2.064
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 1.413,
+                    "NT": 1.475,
+                    "TN": 1.064,
+                    "TT": 1.498
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 1.439,
+                    "NT": 1.523,
+                    "TN": 1.112,
+                    "TT": 1.499
+                  }
+                }
+              }
+            },
+            "mul.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.48,
+                    "contig": 1.031
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.918,
+                    "contig": 1.008
+                  }
+                }
+              }
+            },
+            "mul_.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.03
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.019
+                  }
+                }
+              }
+            },
+            "native_dropout": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.392
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.935
+                  }
+                }
+              }
+            },
+            "native_dropout_backward": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.074
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.996
+                  }
+                }
+              }
+            },
+            "native_group_norm": {
+              "shapes": {
+                "N32xC64xH56xW56_G32": {
+                  "layouts": {
+                    "contig": 1.091
+                  }
+                },
+                "N8xC256xH14xW14_G32": {
+                  "layouts": {
+                    "contig": 0.815
+                  }
+                }
+              }
+            },
+            "native_layer_norm": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.504
+                  }
+                },
+                "B32768xD1024": {
+                  "layouts": {
+                    "contig": 0.881
+                  }
+                }
+              }
+            },
+            "native_layer_norm_backward": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.248
+                  }
+                },
+                "B32768xD1024": {
+                  "layouts": {
+                    "contig": 0.904
+                  }
+                }
+              }
+            },
+            "ne": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.765,
+                    "Tensor": 3.621
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 5.516,
+                    "Tensor": 3.055
+                  }
+                }
+              }
+            },
+            "neg": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.345
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.131
+                  }
+                }
+              }
+            },
+            "nll_loss_backward": {
+              "shapes": {
+                "N12288xC50304": {
+                  "layouts": {
+                    "contig": 0.983
+                  }
+                },
+                "N4096xC1000": {
+                  "layouts": {
+                    "contig": 0.441
+                  }
+                }
+              }
+            },
+            "nll_loss_forward": {
+              "shapes": {
+                "N12288xC50304": {
+                  "layouts": {
+                    "contig": 0.287
+                  }
+                },
+                "N4096xC1000": {
+                  "layouts": {
+                    "contig": 0.544
+                  }
+                }
+              }
+            },
+            "pow": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 1.075,
+                    "Tensor": 0.658
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 1.172,
+                    "Tensor": 0.988
+                  }
+                }
+              }
+            },
+            "reciprocal": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.169
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.141
+                  }
+                }
+              }
+            },
+            "relu": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.26
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.124
+                  }
+                }
+              }
+            },
+            "relu_": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.324
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.134
+                  }
+                }
+              }
+            },
+            "remainder": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 2.902,
+                    "Tensor": 0.75
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 3.633,
+                    "Tensor": 0.999
+                  }
+                }
+              }
+            },
+            "repeat": {
+              "shapes": {
+                "S1024x1024_r4x4": {
+                  "layouts": {
+                    "contig": 14.761
+                  }
+                },
+                "S357x789_r3x5": {
+                  "layouts": {
+                    "contig": 15.295
+                  }
+                }
+              }
+            },
+            "rsqrt": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.447
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.154
+                  }
+                }
+              }
+            },
+            "scatter.src": {
+              "shapes": {
+                "R1000x64_S512": {
+                  "layouts": {
+                    "contig": 0.946
+                  }
+                },
+                "R262144x64_S65536": {
+                  "layouts": {
+                    "contig": 1.17
+                  }
+                }
+              }
+            },
+            "scatter.value": {
+              "shapes": {
+                "R1000x64_S512": {
+                  "layouts": {
+                    "contig": 1.217
+                  }
+                },
+                "R262144x64_S65536": {
+                  "layouts": {
+                    "contig": 1.183
+                  }
+                }
+              }
+            },
+            "sigmoid": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.103
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.145
+                  }
+                }
+              }
+            },
+            "sign": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.319
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.128
+                  }
+                }
+              }
+            },
+            "silu": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.137
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.143
+                  }
+                }
+              }
+            },
+            "sin": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.01
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.125
+                  }
+                }
+              }
+            },
+            "sinh": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.238
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.16
+                  }
+                }
+              }
+            },
+            "sqrt": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.217
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.137
+                  }
+                }
+              }
+            },
+            "stack": {
+              "shapes": {
+                "P32x65536": {
+                  "layouts": {
+                    "contig": 11.659
+                  }
+                },
+                "P8x1048576": {
+                  "layouts": {
+                    "contig": 4.268
+                  }
+                }
+              }
+            },
+            "sub.Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.506,
+                    "contig": 1.029
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.916,
+                    "contig": 1.007
+                  }
+                }
+              }
+            },
+            "sum.dim_IntList": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 4.818
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.258
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.416
+                  }
+                }
+              }
+            },
+            "tan": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.039
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.139
+                  }
+                }
+              }
+            },
+            "tanh": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.168
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.129
+                  }
+                }
+              }
+            },
+            "tril": {
+              "shapes": {
+                "S8192x8192": {
+                  "layouts": {
+                    "contig": 1.911
+                  }
+                }
+              }
+            },
+            "triu": {
+              "shapes": {
+                "S8192x8192": {
+                  "layouts": {
+                    "contig": 1.908
+                  }
+                }
+              }
+            },
+            "upsample_bilinear2d": {
+              "shapes": {
+                "N2xC3x256x256_x2": {
+                  "layouts": {
+                    "contig": 2.817
+                  }
+                },
+                "N8xC64x56x56_x2": {
+                  "layouts": {
+                    "contig": 0.938
+                  }
+                }
+              }
+            },
+            "var.correction": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 1208.487
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 1.4
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.673
+                  }
+                }
+              }
+            },
+            "where.self": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 4.88
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 1.643
+                  }
+                }
+              }
+            }
+          }
+        },
+        "i32": {
+          "ops": {
+            "bitwise_and": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.705,
+                    "Tensor": 1.031
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 3.483,
+                    "Tensor": 1.007
+                  }
+                }
+              }
+            },
+            "bitwise_not": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.986
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.14
+                  }
+                }
+              }
+            },
+            "bitwise_or": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.751,
+                    "Tensor": 1.037
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 3.467,
+                    "Tensor": 1.004
+                  }
+                }
+              }
+            },
+            "bitwise_xor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.708,
+                    "Tensor": 1.021
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 3.461,
+                    "Tensor": 1.006
+                  }
+                }
+              }
+            }
+          }
+        },
+        "i64": {
+          "ops": {
+            "arange": {
+              "shapes": {
+                "N16777216": {
+                  "layouts": {
+                    "contig": 0.351
+                  }
+                }
+              }
+            },
+            "isin.Tensor_Tensor": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.721
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 1.348
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tf32": {
+          "ops": {
+            "addmm": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 3.501,
+                    "NT": 4.187,
+                    "TN": 2.326,
+                    "TT": 3.312
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 3.49,
+                    "NT": 4.143,
+                    "TN": 2.283,
+                    "TT": 3.528
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 3.537,
+                    "NT": 4.387,
+                    "TN": 2.28,
+                    "TT": 3.586
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 4.773,
+                    "NT": 5.195,
+                    "TN": 3.542,
+                    "TT": 4.474
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 2.372,
+                    "NT": 2.502,
+                    "TN": 2.461,
+                    "TT": 2.3
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 3.139,
+                    "NT": 4.264,
+                    "TN": 2.147,
+                    "TT": 3.491
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 2.81,
+                    "NT": 3.424,
+                    "TN": 2.246,
+                    "TT": 2.555
+                  }
+                }
+              }
+            },
+            "bmm": {
+              "shapes": {
+                "S1_8x4096x4096x4096": {
+                  "layouts": {
+                    "NN": 3.062,
+                    "NT": 2.818,
+                    "TN": 2.423,
+                    "TT": 3.596
+                  }
+                },
+                "S2_8x8192x2048x2048": {
+                  "layouts": {
+                    "NN": 4.035,
+                    "NT": 3.224,
+                    "TN": 2.658,
+                    "TT": 4.26
+                  }
+                },
+                "S3_8x2048x8192x2048": {
+                  "layouts": {
+                    "NN": 4.054,
+                    "NT": 3.981,
+                    "TN": 2.65,
+                    "TT": 4.076
+                  }
+                },
+                "S4_8x1024x1024x8192": {
+                  "layouts": {
+                    "NN": 3.982,
+                    "NT": 3.156,
+                    "TN": 2.204,
+                    "TT": 3.621
+                  }
+                },
+                "S5_8x357x789x333": {
+                  "layouts": {
+                    "NN": 2.076,
+                    "NT": 1.973,
+                    "TN": 2.007,
+                    "TT": 2.084
+                  }
+                },
+                "S6_8x32768x768x768": {
+                  "layouts": {
+                    "NN": 2.315,
+                    "NT": 1.729,
+                    "TN": 1.951,
+                    "TT": 1.849
+                  }
+                }
+              }
+            },
+            "linear": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 4.252
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 4.177
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 4.271
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 5.215
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 2.521
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 4.318
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 3.449
+                  }
+                }
+              }
+            },
+            "linear_backward": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 2.874
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 3.052
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 3.178
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 2.447
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 2.849
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 3.94
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 2.454
+                  }
+                }
+              }
+            },
+            "mm": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 3.419,
+                    "NT": 3.72,
+                    "TN": 2.485,
+                    "TT": 3.936
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 3.503,
+                    "NT": 4.19,
+                    "TN": 2.392,
+                    "TT": 3.523
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 3.456,
+                    "NT": 4.309,
+                    "TN": 2.394,
+                    "TT": 3.579
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 5.459,
+                    "NT": 5.713,
+                    "TN": 3.793,
+                    "TT": 5.226
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 2.406,
+                    "NT": 2.55,
+                    "TN": 2.423,
+                    "TT": 2.378
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 3.101,
+                    "NT": 4.305,
+                    "TN": 2.31,
+                    "TT": 3.46
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 2.842,
+                    "NT": 3.137,
+                    "TN": 2.355,
+                    "TT": 2.531
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "format": 4
+}
+</script>

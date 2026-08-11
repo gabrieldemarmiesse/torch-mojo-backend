@@ -41,6 +41,7 @@ rocprof_out/
 current_bench_train/
 
 # Benchmark-baseline write machinery: the flock file and the atomic-replace
-# temp next to benchmarks/baselines.json (the json itself IS tracked).
-benchmarks/baselines.json.lock
-benchmarks/baselines.json.tmp
+# temp next to benchmarks/baselines.html (the html itself IS tracked — it is
+# both the data and the viewer for it).
+benchmarks/baselines.html.lock
+benchmarks/baselines.html.tmp
