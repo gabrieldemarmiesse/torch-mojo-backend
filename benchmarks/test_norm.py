@@ -17,7 +17,7 @@ from bench_lib.hw import Hardware
 
 LN_SHAPES: dict[str, tuple[int, int]] = {
     "B32768xD1024": (32768, 1024),
-    "A357x789": (357, 789),
+    "A_357x789": (357, 789),
 }
 BN_SHAPES: dict[str, tuple[int, int, int, int]] = {
     "N32xC64xH112xW112": (32, 64, 112, 112),

@@ -20,7 +20,10 @@ from bench_lib.cases import DTYPES, both, unit_interval
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
-SHAPES: dict[str, tuple[int, ...]] = {"C16777216": (16777216,), "A357x789": (357, 789)}
+SHAPES: dict[str, tuple[int, ...]] = {
+    "C_16777216": (16777216,),
+    "A_357x789": (357, 789),
+}
 
 COVERS: dict[str, str] = {
     "aten::add_.Tensor": "test_add_",

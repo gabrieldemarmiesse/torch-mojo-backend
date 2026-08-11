@@ -1,8 +1,8 @@
 """Reduction benchmarks.
 
 The reduced-dim axis is folded into the shape token (design rule: any
-extra axis an op needs goes into the shape id): S4096x4096_d0 reduces
-the strided dim, S4096x4096_d1 the contiguous dim, C16777216_all is the
+extra axis an op needs goes into the shape id): S_4096x4096_d0 reduces
+the strided dim, S_4096x4096_d1 the contiguous dim, C_16777216_all is the
 full reduction of a large vector.  all/any's .dim/.dims overloads and
 mean.dim are covered by the same fold.
 
@@ -21,17 +21,17 @@ from bench_lib.hw import Hardware
 
 # shape id -> (tensor shape, reduced dim or None for a full reduction)
 DIM_SHAPES: dict[str, tuple[tuple[int, ...], int | None]] = {
-    "S4096x4096_d0": ((4096, 4096), 0),
-    "S4096x4096_d1": ((4096, 4096), 1),
-    "C16777216_all": ((16777216,), None),
+    "S_4096x4096_d0": ((4096, 4096), 0),
+    "S_4096x4096_d1": ((4096, 4096), 1),
+    "C_16777216_all": ((16777216,), None),
 }
 FULL_SHAPES: dict[str, tuple[int, ...]] = {
-    "C16777216": (16777216,),
-    "A357x789": (357, 789),
+    "C_16777216": (16777216,),
+    "A_357x789": (357, 789),
 }
 LASTDIM_SHAPES: dict[str, tuple[tuple[int, ...], int]] = {
-    "S4096x4096_d0": ((4096, 4096), 0),
-    "S4096x4096_d1": ((4096, 4096), 1),
+    "S_4096x4096_d0": ((4096, 4096), 0),
+    "S_4096x4096_d1": ((4096, 4096), 1),
 }
 
 COVERS: dict[str, str] = {

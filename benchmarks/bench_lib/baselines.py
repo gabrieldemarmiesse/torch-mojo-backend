@@ -181,9 +181,26 @@ class BenchKey(typing.NamedTuple):
     Axis order follows the tree: op -> dtype -> shape -> layout, so
     str(key) is the tree path and every reader can print, match and sort
     on the same string.  The op token is the aten base name with the
-    overload variant folded in ("mm", "add.Tensor"); any extra axis an op
-    needs is folded into the shape token; ops without a layout notion use
-    the fixed sentinel "contig" so every path has the same rank.
+    overload variant folded in ("mm", "add.Tensor"); ops without a layout
+    notion use the fixed sentinel "contig" so every path has the same
+    rank.
+
+    Shape tokens name a regime rather than only its numbers:
+
+    * A leading letter tags the whole shape and is SEPARATED from the
+      dims by an underscore — "C_16777216" (contiguous vector),
+      "S_4096x4096" (standard/square), "A_357x789" (awkward), "L_4x…"
+      (list of 4), "P_2x…" (pieces), "R_1000x64" (row table), and the
+      numbered GEMM regimes "S7_768x50304x49152".
+    * When the letters instead label individual dimensions they stay
+      attached to their own number: "N8xC64x112x112" (NCHW),
+      "B8H12S1024D64" (batch/heads/seq/head-dim), "V50304xD768_T49152".
+    * Any extra axis the op needs is folded on as a trailing "_suffix"
+      ("_all" full reduction, "_d0" reduced dim, "_o7" output size), the
+      baseline path having no separate axis to put it on.
+
+    Renaming a shape token renames a baseline key: rename the recorded
+    entries in the same commit or the ratios orphan and re-measure as new.
     """
 
     op: str

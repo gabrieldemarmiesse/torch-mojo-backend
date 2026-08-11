@@ -2,8 +2,8 @@
 
 These are the optimizer-step ops: one node measures the whole list call
 (the subject is the horizontally-fused launch, not one tensor).  Shape
-tokens name the list: L4x1048576 is four 1M-element tensors (few big
-params), L16x65536 is sixteen 64k tensors (many small params — the
+tokens name the list: L_4x1048576 is four 1M-element tensors (few big
+params), L_16x65536 is sixteen 64k tensors (many small params — the
 launch-overhead regime).  All f32, matching optimizer state in practice.
 
 In-place list ops mutate their operands across iterations; operand
@@ -20,8 +20,8 @@ from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
 LISTS: dict[str, list[tuple[int, ...]]] = {
-    "L4x1048576": [(1048576,)] * 4,
-    "L16x65536": [(65536,)] * 16,
+    "L_4x1048576": [(1048576,)] * 4,
+    "L_16x65536": [(65536,)] * 16,
 }
 
 COVERS: dict[str, str] = {

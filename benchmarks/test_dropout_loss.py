@@ -21,8 +21,8 @@ from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
 DROPOUT_SHAPES: dict[str, tuple[int, ...]] = {
-    "C16777216": (16777216,),
-    "A357x789": (357, 789),
+    "C_16777216": (16777216,),
+    "A_357x789": (357, 789),
 }
 # (batch, classes)
 NLL_SHAPES: dict[str, tuple[int, int]] = {

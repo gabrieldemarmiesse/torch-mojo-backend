@@ -20,19 +20,19 @@ from bench_lib.hw import Hardware
 
 # (pieces, elements per piece)
 CAT_SHAPES: dict[str, tuple[int, int]] = {
-    "P2x8388608": (2, 8388608),
-    "P64x262144": (64, 262144),
+    "P_2x8388608": (2, 8388608),
+    "P_64x262144": (64, 262144),
 }
 STACK_SHAPES: dict[str, tuple[int, int]] = {
-    "P8x1048576": (8, 1048576),
-    "P32x65536": (32, 65536),
+    "P_8x1048576": (8, 1048576),
+    "P_32x65536": (32, 65536),
 }
 # (rows, cols, repeats)
 REPEAT_SHAPES: dict[str, tuple[int, int, tuple[int, int]]] = {
-    "S1024x1024_r4x4": (1024, 1024, (4, 4)),
-    "S357x789_r3x5": (357, 789, (3, 5)),
+    "S_1024x1024_r4x4": (1024, 1024, (4, 4)),
+    "S_357x789_r3x5": (357, 789, (3, 5)),
 }
-TRI_SHAPES: dict[str, tuple[int, int]] = {"S8192x8192": (8192, 8192)}
+TRI_SHAPES: dict[str, tuple[int, int]] = {"S_8192x8192": (8192, 8192)}
 ARANGE_N = 16777216
 
 COVERS: dict[str, str] = {
@@ -103,7 +103,7 @@ def test_repeat(
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("layout", ("T", "sliced"))
-@pytest.mark.parametrize("shape_id", ("S4096x4096",))
+@pytest.mark.parametrize("shape_id", ("S_4096x4096",))
 def test_clone(
     shape_id: str,
     layout: str,
@@ -169,12 +169,12 @@ CAST_TARGETS: dict[str, tuple[str, torch.dtype]] = {
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
-@pytest.mark.parametrize("shape_id", ("C16777216", "A357x789"))
+@pytest.mark.parametrize("shape_id", ("C_16777216", "A_357x789"))
 @pytest.mark.bench_op("_to_copy")
 def test_to_copy_cast(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ) -> None:
-    shape = (16777216,) if shape_id == "C16777216" else (357, 789)
+    shape = (16777216,) if shape_id == "C_16777216" else (357, 789)
     _, target = CAST_TARGETS[dtype_id]
     x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
     bench.run(

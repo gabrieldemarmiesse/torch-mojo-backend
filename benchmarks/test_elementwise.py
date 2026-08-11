@@ -1,13 +1,13 @@
 """Elementwise unary benchmarks: one node per (op, dtype, shape).
 
 Every op here is a single memory-bound kernel; two shapes cover the two
-regimes that matter: C16777216 is a large contiguous vector (bandwidth
-bound) and A357x789 is small and awkward (launch/tail bound).  Operands
+regimes that matter: C_16777216 is a large contiguous vector (bandwidth
+bound) and A_357x789 is small and awkward (launch/tail bound).  Operands
 live in (0.05, 0.95) so one generator serves every op's domain
 (acos/atanh need |x| < 1, log/rsqrt need x > 0).
 
 The op axis carries a bench_op mark per param, so the baseline tree path
-of node test_unary[abs-C16777216-bf16] is bf16/abs/C16777216/contig.
+of node test_unary[abs-C_16777216-bf16] is bf16/abs/C_16777216/contig.
 """
 
 from __future__ import annotations
@@ -21,7 +21,10 @@ from bench_lib.cases import DTYPES, both, op_params, unit_interval
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
-SHAPES: dict[str, tuple[int, ...]] = {"C16777216": (16777216,), "A357x789": (357, 789)}
+SHAPES: dict[str, tuple[int, ...]] = {
+    "C_16777216": (16777216,),
+    "A_357x789": (357, 789),
+}
 
 UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "abs": torch.abs,

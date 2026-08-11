@@ -18,13 +18,13 @@ from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
 SHAPES: dict[str, tuple[int, int]] = {
-    "S32768x1024": (32768, 1024),
-    "S768x50304": (768, 50304),
-    "A357x789": (357, 789),
+    "S_32768x1024": (32768, 1024),
+    "S_768x50304": (768, 50304),
+    "A_357x789": (357, 789),
 }
 ELEM_SHAPES: dict[str, tuple[int, ...]] = {
-    "C16777216": (16777216,),
-    "A357x789": (357, 789),
+    "C_16777216": (16777216,),
+    "A_357x789": (357, 789),
 }
 
 COVERS: dict[str, str] = {

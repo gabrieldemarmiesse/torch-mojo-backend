@@ -18,8 +18,8 @@ from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
 SHAPES: dict[str, tuple[int, ...]] = {
-    "C4096x4096": (4096, 4096),
-    "A357x789": (357, 789),
+    "C_4096x4096": (4096, 4096),
+    "A_357x789": (357, 789),
 }
 
 ARITH_OPS = {

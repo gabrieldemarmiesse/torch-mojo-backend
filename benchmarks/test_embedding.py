@@ -22,13 +22,13 @@ EMB_SHAPES: dict[str, tuple[int, int, int]] = {
 }
 # (rows, row_width, gathered)
 INDEX_SHAPES: dict[str, tuple[int, int, int]] = {
-    "R262144x64_I1048576": (262144, 64, 1048576),
-    "R1000x64_I4096": (1000, 64, 4096),
+    "R_262144x64_I1048576": (262144, 64, 1048576),
+    "R_1000x64_I4096": (1000, 64, 4096),
 }
 # (rows, row_width, scattered_rows)
 SCATTER_SHAPES: dict[str, tuple[int, int, int]] = {
-    "R262144x64_S65536": (262144, 64, 65536),
-    "R1000x64_S512": (1000, 64, 512),
+    "R_262144x64_S65536": (262144, 64, 65536),
+    "R_1000x64_S512": (1000, 64, 512),
 }
 # (outer, rows, cols)
 SELECT_SCATTER_SHAPES: dict[str, tuple[int, int, int]] = {
