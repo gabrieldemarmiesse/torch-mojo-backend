@@ -15,6 +15,8 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
+from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
+from std.collections import InlineArray
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.python import PythonObject
@@ -48,6 +50,7 @@ from op_utils import (
     _raw_int,
     _raw_ret_none,
     _raw_tuple_int,
+    _raw_tuple_len,
     _spec_dispatcher3,
     _spec_ptr,
     _spec_unsupported,
@@ -539,170 +542,474 @@ def _permute_copy_go(
 
 
 # ---------------------------------------------------------------------------
-# Fused two-input concatenation: out rows are `len1 + len2` contiguous
-# elements, filled from in1's and in2's contiguous rows in one launch (the
-# common cat([a, b], dim) case after outer/inner flattening). One grid row
-# per outer block; threads grid-stride the output row's float4 chunks and
-# pick their source by column, so the append never pays two kernel
-# launches and a pipeline bubble between them.
+# Batched N-input concatenation: ONE launch fills the output from every
+# contiguous input, whatever the input count (two, three, or the sixty-four
+# of a split-backward reassembly).
+#
+# After the caller flattens the cat dim, the output is `outer` rows of
+# `dst_stride` elements and input k contributes `row_len_k` contiguous
+# elements at `dst_off_k` inside every row, read from
+# `src_k[o * row_len_k ...]`. Work is cut into fixed-size tiles, so wildly
+# unequal input sizes stay balanced and no block is ever launched over an
+# input that has no work for it: block (x, y) takes tile x of row y, then
+# grid-strides over both. The input owning a tile is found by binary search
+# over the per-input tile prefix sums -- once per tile per block,
+# warp-uniformly, against a parameter array.
+#
+# `width` is a runtime-dispatched comptime parameter, not a hardcoded 4: the
+# caller passes the element count that makes one access 16 bytes wide (8 for
+# bf16, 4 for f32, 2 for f64) when every base address, row length and row
+# stride is 16-byte aligned, and 1 otherwise -- the same kernel then runs
+# element-wise, so no shape is excluded from the batched path.
 # ---------------------------------------------------------------------------
 
+# Inputs covered by one launch: 64 descriptors x 32 bytes = 2 KiB of kernel
+# parameters, inside every backend's parameter budget (CUDA's is 4 KiB).
+# Longer tensor lists are launched in batches of this many; nothing about the
+# kernel changes.
+comptime CAT_SEG_CAP = 64
 
-def _cat2_kernel2d[
-    dtype: DType
+# Metal translates only pointer-TYPED kernel arguments into GPU addresses; a
+# raw address smuggled as data reads back zeros (see the header of
+# foreach_elementwise_kernels.mojo, where the same constraint is documented
+# and verified). Apple therefore takes a variant with real pointer arguments,
+# and correspondingly fewer inputs per launch. `_cat_slots_kernel` and
+# `_cat_pick` write those arguments out one by one, so this count and their
+# parameter lists move together.
+comptime CAT_PTR_SLOTS = 8
+
+# Widest access every backend supports, and the contract with the caller:
+# `aten_fast._cat_vector_width` passes the element count that fills this many
+# bytes only when every address, row length and row stride in the call is
+# aligned to it, and 1 otherwise.
+comptime CAT_VECTOR_BYTES = 16
+
+comptime CAT_CAP = CAT_PTR_SLOTS if has_apple_gpu_accelerator() else CAT_SEG_CAP
+
+# Bytes one thread copies per tile. A tile is the granule the owning input
+# is looked up for, so this is what amortizes that lookup, and it is
+# expressed in BYTES rather than slots so the element path gets the same
+# amortization as the 16-byte one instead of a slice of work 8x thinner.
+#
+# Fitted on an H100 PCIe at the benchmark suite's pinned 1395MHz;
+# ours/stock device time, one launch in every cell:
+#
+#   bytes per thread            32      64     128     256
+#   64 x 262144      bf16    1.034   1.024   1.024   1.033
+#   2 x 8388608      bf16    1.012   0.989   1.003   0.990
+#   64 x [357,789]   bf16    1.044   1.059   1.093   1.280
+#   37 x 12345       bf16    1.430   1.355   1.856   2.660
+#   8 x [2048,1024]  f32     1.005   1.003   1.143   1.551
+#
+# The 16-byte path is DRAM bound and flat (~1.75 TB/s of this card's 2.04);
+# what moves is the two ends. Too little work per thread leaves the lookup
+# exposed -- at ONE slot a thread (16 bytes wide, 2 element-wise) the same
+# rows read 1.146 and 4.26. Too much wastes the tail: rows shorter than a
+# tile idle the surplus threads, which is the [2048,1024] row (its 1024
+# elements are a quarter of a 128-byte tile). 32 is the balance point on
+# this card; the two ends are architectural, so the balance may not be.
+comptime CAT_BYTES_PER_THREAD = 32
+
+
+@always_inline
+def _cat_tile_slots[dtype: DType, width: Int]() -> Int:
+    """Vector slots one block covers per tile: CAT_BYTES_PER_THREAD each."""
+    return GS_THREADS * max(
+        1, CAT_BYTES_PER_THREAD // (width * size_of[dtype]())
+    )
+
+
+# Bound on the blocks of one launch. A concatenation is pure streaming
+# traffic, so the grid covers the tiles exactly (op_utils' "cover the slots
+# exactly once the copy streams from HBM"); this cap only keeps a
+# pathological tile count from overflowing the grid.
+comptime CAT_MAX_BLOCKS = 1 << 22
+
+
+struct CatSeg(DevicePassable, ImplicitlyCopyable, TrivialRegisterPassable):
+    """One input's contribution to every output row.
+
+    `tile_end` is the exclusive prefix sum of per-row tiles over the inputs
+    of this launch, which is what makes the owner of a tile a binary search.
+    An input with no elements keeps the previous `tile_end` and is therefore
+    never selected.
+    """
+
+    comptime device_type: AnyType = Self
+
+    var src_addr: Int  # element-aligned base address (unused on Metal)
+    var nvec: Int  # vector slots this input contributes per output row
+    var dst_off: Int  # element offset of this input inside an output row
+    var tile_end: Int  # exclusive prefix sum of tiles over the launch's inputs
+
+    def __init__(
+        out self, src_addr: Int, nvec: Int, dst_off: Int, tile_end: Int
+    ):
+        self.src_addr = src_addr
+        self.nvec = nvec
+        self.dst_off = dst_off
+        self.tile_end = tile_end
+
+    def _to_device_type(
+        self,
+        mut encoder: Some[DeviceTypeEncoder],
+        target: MutOpaquePointer[_],
+    ):
+        encoder.encode(self, target)
+
+    @staticmethod
+    def get_type_name() -> String:
+        return "CatSeg"
+
+
+@always_inline
+def _cat_owner(
+    segs: InlineArray[CatSeg, CAT_CAP], nseg: Int, tile: Int
+) -> Tuple[Int, Int]:
+    """(input owning `tile`, first tile of that input): the smallest index
+    whose exclusive tile prefix sum is past `tile`."""
+    var lo = 0
+    var hi = nseg - 1
+    while lo < hi:
+        var mid = (lo + hi) // 2
+        if segs[mid].tile_end <= tile:
+            lo = mid + 1
+        else:
+            hi = mid
+    var first = 0
+    if lo != 0:
+        first = segs[lo - 1].tile_end
+    return lo, first
+
+
+@always_inline
+def _cat_copy_rows[
+    dtype: DType, width: Int
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    in2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    len1_4_arg: Int64,
-    len2_4_arg: Int64,
+    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    seg: CatSeg,
+    slot: Int,
+    outer: Int,
+    dst_stride: Int,
+):
+    """Copy this thread's slots of `seg` out of every output row.
+
+    The slots are `GS_THREADS` apart so each of the unrolled accesses stays
+    coalesced across the block, and the loads of one row are independent of
+    each other, which is what gives a thread its memory-level parallelism.
+    """
+    comptime align = width * size_of[dtype]()
+    comptime ilp = _cat_tile_slots[dtype, width]() // GS_THREADS
+    var row_len = seg.nvec * width
+    var src_index = slot * width
+    var dst_index = seg.dst_off + slot * width
+    var row = Int(block_idx.y)
+    src_index += row * row_len
+    dst_index += row * dst_stride
+    while row < outer:
+
+        @parameter
+        for step in range(ilp):
+            if slot + step * GS_THREADS < seg.nvec:
+                out_ptr.store[width=width, alignment=align](
+                    dst_index + step * GS_THREADS * width,
+                    src_ptr.load[width=width, alignment=align](
+                        src_index + step * GS_THREADS * width
+                    ),
+                )
+        row += Int(grid_dim.y)
+        src_index += Int(grid_dim.y) * row_len
+        dst_index += Int(grid_dim.y) * dst_stride
+
+
+def _cat_batched_kernel[
+    dtype: DType, width: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    segs: InlineArray[CatSeg, CAT_CAP],
+    nseg_arg: Int64,
+    tiles_arg: Int64,
+    outer_arg: Int64,
+    dst_stride_arg: Int64,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
-    var len1_4 = Int(len1_4_arg)
-    var len2_4 = Int(len2_4_arg)
-    comptime vec_align = 4 * size_of[dtype]()
-    var o = Int(block_idx.y)
-    var total4 = len1_4 + len2_4
-    var out_base = o * total4 * 4
-    var in1_base = o * len1_4 * 4
-    var in2_base = o * len2_4 * 4
-    var c = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
-    var cstride = Int(grid_dim.x) * Int(block_dim.x)
-    while c < total4:
-        var j = c * 4
-        if c < len1_4:
-            out_ptr.store[width=4, alignment=vec_align](
-                out_base + j,
-                in1_ptr.load[width=4, alignment=vec_align](in1_base + j),
+    var nseg = Int(nseg_arg)
+    var tiles = Int(tiles_arg)
+    var outer = Int(outer_arg)
+    var dst_stride = Int(dst_stride_arg)
+    var lane = Int(thread_idx.x)
+    var tile = Int(block_idx.x)
+    while tile < tiles:
+        var owner, first = _cat_owner(segs, nseg, tile)
+        var seg = segs[owner]
+        var slot = (tile - first) * _cat_tile_slots[dtype, width]() + lane
+        if slot < seg.nvec:
+            _cat_copy_rows[dtype, width](
+                out_ptr,
+                _make_ptr[dtype](seg.src_addr)
+                .as_unsafe_any_origin()
+                .as_immutable(),
+                seg,
+                slot,
+                outer,
+                dst_stride,
+            )
+        tile += Int(grid_dim.x)
+
+
+@always_inline
+def _cat_pick[
+    dtype: DType
+](
+    slot: Int,
+    p0: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p1: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p2: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p3: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p4: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p5: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p6: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p7: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+) -> UnsafePointer[Scalar[dtype], ImmutAnyOrigin]:
+    """Select one of the pointer ARGUMENTS (copying them into an array and
+    indexing that miscompiles on Metal -- see foreach_elementwise_kernels)."""
+    var selected = p0
+    if slot == 1:
+        selected = p1
+    elif slot == 2:
+        selected = p2
+    elif slot == 3:
+        selected = p3
+    elif slot == 4:
+        selected = p4
+    elif slot == 5:
+        selected = p5
+    elif slot == 6:
+        selected = p6
+    elif slot == 7:
+        selected = p7
+    return selected
+
+
+def _cat_slots_kernel[
+    dtype: DType, width: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    p0: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p1: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p2: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p3: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p4: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p5: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p6: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p7: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    segs: InlineArray[CatSeg, CAT_CAP],
+    nseg_arg: Int64,
+    tiles_arg: Int64,
+    outer_arg: Int64,
+    dst_stride_arg: Int64,
+):
+    """`_cat_batched_kernel` with the sources as pointer arguments (Apple)."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var nseg = Int(nseg_arg)
+    var tiles = Int(tiles_arg)
+    var outer = Int(outer_arg)
+    var dst_stride = Int(dst_stride_arg)
+    var lane = Int(thread_idx.x)
+    var tile = Int(block_idx.x)
+    while tile < tiles:
+        var owner, first = _cat_owner(segs, nseg, tile)
+        var seg = segs[owner]
+        var slot = (tile - first) * _cat_tile_slots[dtype, width]() + lane
+        if slot < seg.nvec:
+            _cat_copy_rows[dtype, width](
+                out_ptr,
+                _cat_pick[dtype](owner, p0, p1, p2, p3, p4, p5, p6, p7),
+                seg,
+                slot,
+                outer,
+                dst_stride,
+            )
+        tile += Int(grid_dim.x)
+
+
+@always_inline
+def _cat_slot_ptr[
+    dtype: DType
+](segs: InlineArray[CatSeg, CAT_CAP], nseg: Int, index: Int) -> UnsafePointer[
+    Scalar[dtype], ImmutAnyOrigin
+]:
+    """A translatable pointer for every pointer argument: padding slots
+    repeat the first real source and are never dereferenced (their `nvec`
+    is zero and no tile selects them)."""
+    var addr = segs[0].src_addr
+    if index < nseg:
+        addr = segs[index].src_addr
+    return _make_ptr[dtype](addr).as_unsafe_any_origin().as_immutable()
+
+
+@always_inline
+def _cat_launch_width[
+    dtype: DType, width: Int
+](
+    out_addr: Int,
+    srcs: PyObjectPtr,
+    lens: PyObjectPtr,
+    n: Int,
+    outer: Int,
+    dst_stride: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime tile_slots = _cat_tile_slots[dtype, width]()
+    var out_ptr = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
+    var dst_off = 0
+    var index = 0
+    while index < n:
+        var segs = InlineArray[CatSeg, CAT_CAP](fill=CatSeg(0, 0, 0, 0))
+        var tiles = 0
+        var nseg = 0
+        while index < n and nseg < CAT_CAP:
+            var row_len = _raw_tuple_int(lens, index)
+            var nvec = row_len // width
+            tiles += (nvec + tile_slots - 1) // tile_slots
+            segs[nseg] = CatSeg(
+                _raw_tuple_int(srcs, index), nvec, dst_off, tiles
+            )
+            dst_off += row_len
+            nseg += 1
+            index += 1
+        if tiles == 0:
+            continue
+        var gy = min(outer, _MAX_GRID_Y)
+        var gx = min(tiles, max(1, CAT_MAX_BLOCKS // gy))
+        comptime if has_apple_gpu_accelerator():
+            _enqueue_cached[_cat_slots_kernel[dtype, width]](
+                ctx,
+                String(t"dm_cat_slots_{dtype}_{width}"),
+                gx,
+                gy,
+                1,
+                GS_THREADS,
+                out_ptr,
+                _cat_slot_ptr[dtype](segs, nseg, 0),
+                _cat_slot_ptr[dtype](segs, nseg, 1),
+                _cat_slot_ptr[dtype](segs, nseg, 2),
+                _cat_slot_ptr[dtype](segs, nseg, 3),
+                _cat_slot_ptr[dtype](segs, nseg, 4),
+                _cat_slot_ptr[dtype](segs, nseg, 5),
+                _cat_slot_ptr[dtype](segs, nseg, 6),
+                _cat_slot_ptr[dtype](segs, nseg, 7),
+                segs,
+                Int64(nseg),
+                Int64(tiles),
+                Int64(outer),
+                Int64(dst_stride),
             )
         else:
-            var j2 = (c - len1_4) * 4
-            out_ptr.store[width=4, alignment=vec_align](
-                out_base + j,
-                in2_ptr.load[width=4, alignment=vec_align](in2_base + j2),
+            _enqueue_cached[_cat_batched_kernel[dtype, width]](
+                ctx,
+                String(t"dm_cat_batched_{dtype}_{width}"),
+                gx,
+                gy,
+                1,
+                GS_THREADS,
+                out_ptr,
+                segs,
+                Int64(nseg),
+                Int64(tiles),
+                Int64(outer),
+                Int64(dst_stride),
             )
-        c += cstride
 
 
-def _cat2_go(
+@always_inline
+def _cat_launch[
+    dtype: DType
+](
+    out_addr: Int,
+    srcs: PyObjectPtr,
+    lens: PyObjectPtr,
+    n: Int,
+    outer: Int,
+    dst_stride: Int,
+    width: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime WIDE = CAT_VECTOR_BYTES // size_of[dtype]()
+    if width == WIDE:
+        _cat_launch_width[dtype, WIDE](
+            out_addr, srcs, lens, n, outer, dst_stride, ctx
+        )
+    elif width == 1:
+        _cat_launch_width[dtype, 1](
+            out_addr, srcs, lens, n, outer, dst_stride, ctx
+        )
+    else:
+        raise Error("unsupported vector width for batched cat")
+
+
+def _cat_n_go(
     out_ptr_o: PyObjectPtr,
-    in1_ptr_o: PyObjectPtr,
-    in2_ptr_o: PyObjectPtr,
+    srcs_o: PyObjectPtr,
+    lens_o: PyObjectPtr,
     outer_o: PyObjectPtr,
-    len1_o: PyObjectPtr,
-    len2_o: PyObjectPtr,
+    dst_stride_o: PyObjectPtr,
     itemsize_o: PyObjectPtr,
+    width_o: PyObjectPtr,
     ctx_ptr: PyObjectPtr,
 ) raises:
     var out_addr = _raw_int(out_ptr_o)
-    var in1_addr = _raw_int(in1_ptr_o)
-    var in2_addr = _raw_int(in2_ptr_o)
     var outer = _raw_int(outer_o)
-    var len1 = _raw_int(len1_o)
-    var len2 = _raw_int(len2_o)
+    var dst_stride = _raw_int(dst_stride_o)
     var itemsize = _raw_int(itemsize_o)
+    var width = _raw_int(width_o)
     var ctx = _raw_ctx(ctx_ptr)
+    var n = _raw_tuple_len(srcs_o)
 
-    if ctx.api() == "cpu" or len1 % 4 != 0 or len2 % 4 != 0 or outer > 65535:
-        raise Error("cat2 fast path preconditions not met")
+    if ctx.api() == "cpu" or n <= 0 or outer <= 0 or dst_stride <= 0:
+        raise Error("batched cat preconditions not met")
     comptime if has_accelerator():
-        var total4 = (len1 + len2) // 4
-        var gx = max(1, min((total4 + GS_THREADS - 1) // GS_THREADS, 32))
         comptime if _dtype_arg_width_on[0, 32]():
             if itemsize != 4:
-                raise Error("cat2 specialization/itemsize mismatch")
-            _enqueue_cached[_cat2_kernel2d[DType.uint32]](
-                ctx,
-                String("dm_cat2_u32"),
-                gx,
-                outer,
-                1,
-                GS_THREADS,
-                _make_ptr[DType.uint32](out_addr).as_unsafe_any_origin(),
-                _make_ptr[DType.uint32](in1_addr)
-                .as_unsafe_any_origin()
-                .as_immutable(),
-                _make_ptr[DType.uint32](in2_addr)
-                .as_unsafe_any_origin()
-                .as_immutable(),
-                Int64(len1 // 4),
-                Int64(len2 // 4),
+                raise Error("cat specialization/itemsize mismatch")
+            _cat_launch[DType.uint32](
+                out_addr, srcs_o, lens_o, n, outer, dst_stride, width, ctx
             )
         elif _dtype_arg_width_on[0, 16]():
             if itemsize != 2:
-                raise Error("cat2 specialization/itemsize mismatch")
-            _enqueue_cached[_cat2_kernel2d[DType.uint16]](
-                ctx,
-                String("dm_cat2_u16"),
-                gx,
-                outer,
-                1,
-                GS_THREADS,
-                _make_ptr[DType.uint16](out_addr).as_unsafe_any_origin(),
-                _make_ptr[DType.uint16](in1_addr)
-                .as_unsafe_any_origin()
-                .as_immutable(),
-                _make_ptr[DType.uint16](in2_addr)
-                .as_unsafe_any_origin()
-                .as_immutable(),
-                Int64(len1 // 4),
-                Int64(len2 // 4),
+                raise Error("cat specialization/itemsize mismatch")
+            _cat_launch[DType.uint16](
+                out_addr, srcs_o, lens_o, n, outer, dst_stride, width, ctx
             )
         elif _dtype_arg_width_on[0, 64]():
             if itemsize != 8:
-                raise Error("cat2 specialization/itemsize mismatch")
-            _enqueue_cached[_cat2_kernel2d[DType.uint64]](
-                ctx,
-                String("dm_cat2_u64"),
-                gx,
-                outer,
-                1,
-                GS_THREADS,
-                _make_ptr[DType.uint64](out_addr).as_unsafe_any_origin(),
-                _make_ptr[DType.uint64](in1_addr)
-                .as_unsafe_any_origin()
-                .as_immutable(),
-                _make_ptr[DType.uint64](in2_addr)
-                .as_unsafe_any_origin()
-                .as_immutable(),
-                Int64(len1 // 4),
-                Int64(len2 // 4),
+                raise Error("cat specialization/itemsize mismatch")
+            _cat_launch[DType.uint64](
+                out_addr, srcs_o, lens_o, n, outer, dst_stride, width, ctx
             )
         elif _dtype_arg_width_on[0, 8]():
             if itemsize != 1:
-                raise Error("cat2 specialization/itemsize mismatch")
-            _enqueue_cached[_cat2_kernel2d[DType.uint8]](
-                ctx,
-                String("dm_cat2_u8"),
-                gx,
-                outer,
-                1,
-                GS_THREADS,
-                _make_ptr[DType.uint8](out_addr).as_unsafe_any_origin(),
-                _make_ptr[DType.uint8](in1_addr)
-                .as_unsafe_any_origin()
-                .as_immutable(),
-                _make_ptr[DType.uint8](in2_addr)
-                .as_unsafe_any_origin()
-                .as_immutable(),
-                Int64(len1 // 4),
-                Int64(len2 // 4),
+                raise Error("cat specialization/itemsize mismatch")
+            _cat_launch[DType.uint8](
+                out_addr, srcs_o, lens_o, n, outer, dst_stride, width, ctx
             )
         else:
-            raise Error("unsupported element size for cat2")
+            raise Error("unsupported element size for batched cat")
     else:
         raise Error("no GPU accelerator available at compile time")
 
 
-def _cat2_dispatcher(
+def _cat_n_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
     var args = UnsafePointer(args_safe)
     try:
-        _cat2_go(
+        _cat_n_go(
             args[0],
             args[1],
             args[2],
@@ -2123,243 +2430,6 @@ def _cast_spec_into_go(
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Fused three-input concatenation: the _cat2_kernel2d pattern extended to
-# three contiguous sources (the split-backward reassembly cat), so the
-# append pays one launch instead of three.
-# ---------------------------------------------------------------------------
-
-
-def _cat3_kernel2d[
-    dtype: DType
-](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    in2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    in3_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    len1_4_arg: Int64,
-    len2_4_arg: Int64,
-    len3_4_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var len1_4 = Int(len1_4_arg)
-    var len2_4 = Int(len2_4_arg)
-    var len3_4 = Int(len3_4_arg)
-    comptime vec_align = 4 * size_of[dtype]()
-    var o = Int(block_idx.y)
-    var total4 = len1_4 + len2_4 + len3_4
-    var out_base = o * total4 * 4
-    var c = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
-    var cstride = Int(grid_dim.x) * Int(block_dim.x)
-    while c < total4:
-        var v: SIMD[dtype, 4]
-        if c < len1_4:
-            v = in1_ptr.load[width=4, alignment=vec_align]((o * len1_4 + c) * 4)
-        elif c < len1_4 + len2_4:
-            v = in2_ptr.load[width=4, alignment=vec_align](
-                (o * len2_4 + c - len1_4) * 4
-            )
-        else:
-            v = in3_ptr.load[width=4, alignment=vec_align](
-                (o * len3_4 + c - len1_4 - len2_4) * 4
-            )
-        out_ptr.store[width=4, alignment=vec_align](out_base + c * 4, v)
-        c += cstride
-
-
-def _cat3_segloop_kernel[
-    dtype: DType
-](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    in2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    in3_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    len1_4_arg: Int64,
-    len2_4_arg: Int64,
-    len3_4_arg: Int64,
-    outer_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var len1_4 = Int(len1_4_arg)
-    var len2_4 = Int(len2_4_arg)
-    var len3_4 = Int(len3_4_arg)
-    var outer = Int(outer_arg)
-    # One thread per (row, source) segment: each thread streams its
-    # segment's vectors sequentially (the access pattern this GPU streams
-    # at full rate), with the source chosen once per thread.  Threads with
-    # the same source are consecutive, so the branch is warp-uniform for
-    # outer >= warp size.
-    comptime vec_align = 4 * size_of[dtype]()
-    var total4 = len1_4 + len2_4 + len3_4
-    var nsegs = outer * 3
-    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
-    var gstride = Int(grid_dim.x) * Int(block_dim.x)
-    while t < nsegs:
-        var o = t % outer
-        var s = t // outer
-        var seg_len: Int
-        var dst_off: Int
-        if s == 0:
-            seg_len = len1_4
-            dst_off = 0
-        elif s == 1:
-            seg_len = len2_4
-            dst_off = len1_4
-        else:
-            seg_len = len3_4
-            dst_off = len1_4 + len2_4
-        var sbase = o * seg_len * 4
-        var dbase = (o * total4 + dst_off) * 4
-        for j in range(seg_len):
-            var v: SIMD[dtype, 4]
-            if s == 0:
-                v = in1_ptr.load[width=4, alignment=vec_align](sbase + j * 4)
-            elif s == 1:
-                v = in2_ptr.load[width=4, alignment=vec_align](sbase + j * 4)
-            else:
-                v = in3_ptr.load[width=4, alignment=vec_align](sbase + j * 4)
-            out_ptr.store[width=4, alignment=vec_align](dbase + j * 4, v)
-        t += gstride
-
-
-def _cat3_go(
-    out_ptr_o: PyObjectPtr,
-    in1_ptr_o: PyObjectPtr,
-    in2_ptr_o: PyObjectPtr,
-    in3_ptr_o: PyObjectPtr,
-    outer_o: PyObjectPtr,
-    len1_o: PyObjectPtr,
-    len2_o: PyObjectPtr,
-    len3_o: PyObjectPtr,
-    itemsize_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
-) raises:
-    var out_addr = _raw_int(out_ptr_o)
-    var in1_addr = _raw_int(in1_ptr_o)
-    var in2_addr = _raw_int(in2_ptr_o)
-    var in3_addr = _raw_int(in3_ptr_o)
-    var outer = _raw_int(outer_o)
-    var len1 = _raw_int(len1_o)
-    var len2 = _raw_int(len2_o)
-    var len3 = _raw_int(len3_o)
-    var itemsize = _raw_int(itemsize_o)
-    var ctx = _raw_ctx(ctx_ptr)
-
-    if (
-        ctx.api() == "cpu"
-        or len1 % 4 != 0
-        or len2 % 4 != 0
-        or len3 % 4 != 0
-        or outer > 65535
-    ):
-        raise Error("cat3 fast path preconditions not met")
-    comptime if has_accelerator():
-        var total4 = (len1 + len2 + len3) // 4
-        var gx = max(1, min((total4 + GS_THREADS - 1) // GS_THREADS, 32))
-        var nsegs = outer * 3
-        var handled = False
-        comptime for dt in [
-            DType.uint32,
-            DType.uint16,
-            DType.uint64,
-            DType.uint8,
-        ]:
-            comptime if (
-                (dt == DType.uint32 and _dtype_arg_width_on[0, 32]())
-                or (dt == DType.uint16 and _dtype_arg_width_on[0, 16]())
-                or (dt == DType.uint64 and _dtype_arg_width_on[0, 64]())
-                or (dt == DType.uint8 and _dtype_arg_width_on[0, 8]())
-            ):
-                if itemsize != size_of[dt]():
-                    raise Error("cat3 specialization/itemsize mismatch")
-                if nsegs >= 2048:
-                    # Enough segments to fill the machine with one
-                    # sequential stream per thread.
-                    _enqueue_cached[_cat3_segloop_kernel[dt]](
-                        ctx,
-                        String(t"dm_cat3_seg_{dt}"),
-                        _gs_blocks(nsegs),
-                        1,
-                        1,
-                        GS_THREADS,
-                        _make_ptr[dt](out_addr).as_unsafe_any_origin(),
-                        _make_ptr[dt](in1_addr)
-                        .as_unsafe_any_origin()
-                        .as_immutable(),
-                        _make_ptr[dt](in2_addr)
-                        .as_unsafe_any_origin()
-                        .as_immutable(),
-                        _make_ptr[dt](in3_addr)
-                        .as_unsafe_any_origin()
-                        .as_immutable(),
-                        Int64(len1 // 4),
-                        Int64(len2 // 4),
-                        Int64(len3 // 4),
-                        Int64(outer),
-                    )
-                else:
-                    _enqueue_cached[_cat3_kernel2d[dt]](
-                        ctx,
-                        String(t"dm_cat3_{dt}"),
-                        gx,
-                        outer,
-                        1,
-                        GS_THREADS,
-                        _make_ptr[dt](out_addr).as_unsafe_any_origin(),
-                        _make_ptr[dt](in1_addr)
-                        .as_unsafe_any_origin()
-                        .as_immutable(),
-                        _make_ptr[dt](in2_addr)
-                        .as_unsafe_any_origin()
-                        .as_immutable(),
-                        _make_ptr[dt](in3_addr)
-                        .as_unsafe_any_origin()
-                        .as_immutable(),
-                        Int64(len1 // 4),
-                        Int64(len2 // 4),
-                        Int64(len3 // 4),
-                    )
-                handled = True
-        if not handled:
-            raise Error("unsupported element size for cat3")
-    else:
-        raise Error("no GPU accelerator available at compile time")
-
-
-def _cat3_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
-    try:
-        _cat3_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
-
-
-# ---------------------------------------------------------------------------
-# Narrow copy, destination-strided: the
-# *source* is fully contiguous (`outer` blocks of `copy_len` elements) and
-# lands in the destination at `outer_index * dst_stride + dst_offset`.
-# Looping this over the inputs implements concatenation along any dim.
-# ---------------------------------------------------------------------------
-
-
 @export
 def PyInit_data_movement_ops() abi("C") -> PythonObject:
     try:
@@ -2388,13 +2458,14 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
                     " destination stride/offset (concatenation)"
                 ),
             )
-        comptime if _op_on["Cat2"]():
+        comptime if _op_on["CatN"]():
             _register_call(
                 b,
-                _cat2_dispatcher,
+                _cat_n_dispatcher,
                 docstring=(
-                    "(out, in1, in2, outer, len1, len2, itemsize, ctx); fused"
-                    " two-input concat rows"
+                    "(out, src_addrs, row_lens, outer, dst_stride, itemsize,"
+                    " width, ctx); batched N-input concat rows, one launch per"
+                    " CAT_SEG_CAP inputs"
                 ),
             )
         comptime if _op_on["WhereSelect"]():
@@ -2438,15 +2509,6 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
                 docstring=(
                     "out[coord with dim := index[coord]] = src[coord] or value"
                     " (aten::scatter.src/value, rank <= 4; dtype dispatch)"
-                ),
-            )
-        comptime if _op_on["Cat3"]():
-            _register_call(
-                b,
-                _cat3_dispatcher,
-                docstring=(
-                    "(out, in1, in2, in3, outer, len1, len2, len3, itemsize,"
-                    " ctx); fused three-input concat rows"
                 ),
             )
         return b.finalize()

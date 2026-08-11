@@ -370,6 +370,111 @@ def test_fast_cat_skips_legacy_empty(mojo_device):
     torch.testing.assert_close(result.cpu(), torch.cat([empty, x], dim=-2))
 
 
+# (label, per-input shapes, dim) for the batched N-input cat kernel. The
+# input counts straddle the Mojo side's CAT_SEG_CAP (64 inputs per launch),
+# and the odd lengths are the ones that cannot be copied 16 bytes at a time,
+# exercising the element-wise instantiation of the same kernel.
+_CAT_CASES = [
+    ("single input", [(1000,)], 0),
+    ("two aligned", [(4096,), (4096,)], 0),
+    ("three", [(777,), (777,), (777,)], 0),
+    ("full batch", [(5000,)] * 64, 0),
+    ("past one batch", [(311,)] * 70, 0),
+    ("past two batches", [(37,)] * 130, 0),
+    ("wildly unequal", [(1,), (7,), (4096,), (3,), (100000,)], 0),
+    ("odd lengths", [(12345,), (7,), (999,)], 0),
+    ("zero along dim", [(0, 5), (3, 5)], 0),
+    ("3-D middle dim", [(5, 2, 7), (5, 3, 7), (5, 4, 7)], 1),
+    ("3-D trailing dim", [(5, 6, 2), (5, 6, 3), (5, 6, 4)], 2),
+    ("3-D negative dim", [(5, 6, 2), (5, 6, 3)], -1),
+    ("4-D middle dim", [(2, 3, 5, 64), (2, 3, 1, 64), (2, 3, 9, 64)], 2),
+]
+
+
+@pytest.mark.parametrize(
+    "shapes,dim",
+    [case[1:] for case in _CAT_CASES],
+    ids=[case[0] for case in _CAT_CASES],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_fast_cat_batched(mojo_device, shapes, dim, dtype):
+    host = [torch.randn(shape).to(dtype) for shape in shapes]
+    device = [x.to(mojo_device) for x in host]
+    torch.testing.assert_close(
+        torch.cat(device, dim).cpu(), torch.cat(host, dim), rtol=0, atol=0
+    )
+
+
+def test_fast_cat_batches_every_input_count_into_one_bridge_call(mojo_gpu, monkeypatch):
+    """One bridge call whatever the input count: the Mojo side cuts the
+    inputs into launches itself, so 130 inputs never mean 130 calls."""
+    target = ("data_movement_ops.mojo", "CatN")
+    calls = _spy_defined_native_calls(monkeypatch, {target})
+    for count in (2, 3, 64, 130):
+        host = [torch.randn(1024) for _ in range(count)]
+        device = [x.to(mojo_gpu) for x in host]
+        torch.testing.assert_close(
+            torch.cat(device).cpu(), torch.cat(host), rtol=0, atol=0
+        )
+    assert len(calls[target]) == 4
+
+
+def test_fast_cat_strided_inputs_gather_without_materializing(mojo_gpu, monkeypatch):
+    """A non-contiguous input keeps the per-input gather path (the KV-cache
+    head transpose); the batched kernel never sees a strided source."""
+    target = ("data_movement_ops.mojo", "CatN")
+    calls = _spy_defined_native_calls(monkeypatch, {target})
+    host = [torch.randn(64, 32), torch.randn(64, 32)]
+    device = [x.to(mojo_gpu).t() for x in host]
+    torch.testing.assert_close(
+        torch.cat(device, 0).cpu(), torch.cat([x.t() for x in host], 0), rtol=0, atol=0
+    )
+    # Mixed contiguity takes the same per-input path.
+    mixed_host = [torch.randn(32, 64), torch.randn(64, 32), torch.randn(32, 64)]
+    mixed = [
+        mixed_host[0].to(mojo_gpu),
+        mixed_host[1].to(mojo_gpu).t(),
+        mixed_host[2].to(mojo_gpu),
+    ]
+    torch.testing.assert_close(
+        torch.cat(mixed, 0).cpu(),
+        torch.cat([mixed_host[0], mixed_host[1].t(), mixed_host[2]], 0),
+        rtol=0,
+        atol=0,
+    )
+    assert calls[target] == []
+
+
+def test_fast_cat_offset_views_and_legacy_empty(mojo_gpu):
+    """Offset views (whose base address carries a misalignment the shapes do
+    not show) and a legacy empty in the middle of the list."""
+    host = [torch.randn(2048) for _ in range(4)]
+    device = [x.to(mojo_gpu) for x in host]
+    torch.testing.assert_close(
+        torch.cat([x[3:1000] for x in device]).cpu(),
+        torch.cat([x[3:1000] for x in host]),
+        rtol=0,
+        atol=0,
+    )
+    empty = torch.empty(0)
+    mid = [torch.randn(4, 8), empty, torch.randn(3, 8)]
+    torch.testing.assert_close(
+        torch.cat([x.to(mojo_gpu) for x in mid], 0).cpu(),
+        torch.cat(mid, 0),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_fast_stack_uses_the_batched_cat(mojo_gpu, dim):
+    host = [torch.randn(1024) for _ in range(33)]
+    device = [x.to(mojo_gpu) for x in host]
+    torch.testing.assert_close(
+        torch.stack(device, dim).cpu(), torch.stack(host, dim), rtol=0, atol=0
+    )
+
+
 def test_fast_batch_norm_inference(mojo_device):
     x = torch.randn(2, 64, 14, 14)
     bn = torch.nn.BatchNorm2d(64).eval()

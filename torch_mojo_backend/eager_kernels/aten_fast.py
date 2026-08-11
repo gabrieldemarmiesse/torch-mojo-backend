@@ -3576,14 +3576,49 @@ def fast_aten_clone(input, *, memory_format=None):
 
 
 # ---------------------------------------------------------------------------
-# Concatenation along any dim: one destination-strided narrow copy per
-# input into the output's slot for that input.
+# Concatenation along any dim: ONE batched launch over every contiguous
+# input (`CatN`), whatever the input count; a destination-strided narrow
+# copy or a strided gather per input only when the inputs are not all
+# contiguous (or the device is the CPU).
 # ---------------------------------------------------------------------------
+
+# Widest access every backend supports (data_movement_ops.mojo's
+# CAT_VECTOR_BYTES). The batched kernel takes the element count that fills it
+# as a comptime parameter (8 for bf16, 4 for f32), so the vector width
+# follows the dtype instead of a fixed element count.
+_VECTOR_BYTES = 16
 
 
 def _is_legacy_empty(t) -> bool:
     x = _t(t)
     return x is not None and len(x._shape) == 1 and x._numel == 0
+
+
+def _cat_vector_width(
+    out: TorchMojoTensor, ins: list[TorchMojoTensor], lens: list[int], dst_stride: int
+) -> int:
+    """Elements per access for the batched cat: the 16-byte width when every
+    RUNTIME base address, row length and output row stride is 16-byte
+    aligned, else 1.
+
+    Divisibility of the shapes is not enough on its own: an input can be an
+    offset view whose base address carries the misalignment, so the addresses
+    are checked as addresses. `lens` divisibility is what keeps each input's
+    slot -- and therefore the next one's offset -- vector-aligned inside the
+    output row.
+    """
+    itemsize = out._itemsize
+    width = _VECTOR_BYTES // itemsize
+    if width <= 1 or width * itemsize != _VECTOR_BYTES:
+        return 1
+    if out._ptr % _VECTOR_BYTES or (dst_stride * itemsize) % _VECTOR_BYTES:
+        return 1
+    for b, copy_len in zip(ins, lens, strict=True):
+        if copy_len == 0:
+            continue  # contributes no slot; its address is never read
+        if b._ptr % _VECTOR_BYTES or (copy_len * itemsize) % _VECTOR_BYTES:
+            return 1
+    return width
 
 
 def fast_aten_cat(tensors, dim=0):
@@ -3617,81 +3652,35 @@ def fast_aten_cat(tensors, dim=0):
     dst_stride = out_shape[dim] * inner
     ctx = _ctx_ptr(first._device)
     if (
-        len(ins) == 2
-        and ins[0]._is_contiguous
-        and ins[1]._is_contiguous
+        first._device.api != "cpu"
         and outer > 0
-        and inner > 0
-    ):
-        # Both source rows contiguous: one fused kernel fills each output
-        # row from both inputs (no second launch, no bubble between the
-        # two copies). Raises (e.g. row lengths not vector-aligned, outer
-        # over the grid cap, CPU device) -> per-input copy loop below.
-        len1 = ins[0]._shape[dim] * inner
-        len2 = ins[1]._shape[dim] * inner
-        if (
-            first._device.api != "cpu"
-            and 0 < outer <= 65535
-            and len1 > 0
-            and len2 > 0
-            and len1 % 4 == 0
-            and len2 % 4 == 0
-        ):
-            _call_mojo(
-                _DataMovementExtension,
-                "Cat2",
-                (
-                    out._ptr,
-                    ins[0]._ptr,
-                    ins[1]._ptr,
-                    outer,
-                    len1,
-                    len2,
-                    out._itemsize,
-                    ctx,
-                ),
-                arg_dtypes=(ins[0]._dtype, ins[1]._dtype),
-                output_dtypes=(out._dtype,),
-                keepalive=(out, ins[0], ins[1]),
-            )
-            return out
-    if (
-        len(ins) == 3
-        and first._device.api == "metal"
+        and dst_stride > 0
         and all(b._is_contiguous for b in ins)
-        and outer > 0
-        and inner > 0
     ):
-        # Metal: one fused three-source kernel (the split-backward
-        # reassembly) instead of three narrow copies and two pipeline
-        # bubbles. Raises (row lengths not vector-aligned, outer over the
-        # grid cap) -> per-input copy loop below.
+        # Every source row contiguous: one batched kernel fills the whole
+        # output, however many inputs there are (the Mojo side launches once
+        # per CAT_SEG_CAP of them). No per-input launch, no pipeline bubble
+        # between the copies, and the vector width follows the dtype and the
+        # runtime alignment rather than a fixed element count.
         lens = [b._shape[dim] * inner for b in ins]
-        if (
-            0 < outer <= 65535
-            and all(n > 0 for n in lens)
-            and all(n % 4 == 0 for n in lens)
-        ):
-            _call_mojo(
-                _DataMovementExtension,
-                "Cat3",
-                (
-                    out._ptr,
-                    ins[0]._ptr,
-                    ins[1]._ptr,
-                    ins[2]._ptr,
-                    outer,
-                    lens[0],
-                    lens[1],
-                    lens[2],
-                    out._itemsize,
-                    ctx,
-                ),
-                arg_dtypes=tuple(tensor._dtype for tensor in ins),
-                output_dtypes=(out._dtype,),
-                keepalive=(out, ins[0], ins[1], ins[2]),
-            )
-            return out
+        _call_mojo(
+            _DataMovementExtension,
+            "CatN",
+            (
+                out._ptr,
+                tuple(b._ptr for b in ins),
+                tuple(lens),
+                outer,
+                dst_stride,
+                out._itemsize,
+                _cat_vector_width(out, ins, lens, dst_stride),
+                ctx,
+            ),
+            arg_dtypes=(first._dtype,),
+            output_dtypes=(out._dtype,),
+            keepalive=(out, *ins),
+        )
+        return out
     offset = 0
     for b in ins:
         copy_len = b._shape[dim] * inner
