@@ -13,12 +13,26 @@ Rules this module enforces (they were learned painfully):
 * Every leg is pre-warmed before anything is timed, so JIT kernel builds
   and clock ramp never land inside a timed region (an under-warmed probe
   once read 1.43x where the truth was 1.02x).
-* The two legs are interleaved burst by burst (ref, ours, ref, ours, ...)
-  so clock/thermal drift hits both sides symmetrically.  The reported
-  ratio is the MEDIAN OF PER-PAIR RATIOS (ours burst / adjacent ref
-  burst): throttle drift moves both bursts of a pair together, so pair
-  ratios stay stable even when absolute per-leg times swing hard (the S7
-  lm_head shapes throttle the card by ~30% across a run).
+* The two legs are interleaved burst by burst, and the order FLIPS every
+  pair — ref, ours | ours, ref | ref, ours ... — so consecutive pairs are
+  an ABBA quartet.  The reported ratio is the MEDIAN OF PER-PAIR RATIOS
+  (ours burst / adjacent ref burst): throttle drift moves both bursts of
+  a pair together, so pair ratios stay stable even when absolute per-leg
+  times swing hard (the S7 lm_head shapes throttle the card by ~30%
+  across a run).
+
+  The flip is what makes a MONOTONIC ramp cancel.  Under fixed ABAB order
+  the "ours" burst always sits one burst later than the ref it is divided
+  by, so a steady drift of rate r biases every pair by about r * (settle
+  + burst) in the SAME direction; a median over pairs cannot remove a
+  bias that every pair shares.  Worse, the bias is invisible to this
+  module's own stopping rule, which watches scatter — a constant offset
+  contributes none, so the sampler happily reports 0.3% uncertainty on a
+  number carrying a systematic tilt.  Flipping the order puts the "ours"
+  burst before its ref in every other pair, so the two lags are equal and
+  opposite and the first-order term cancels across the quartet.  Higher
+  orders (curvature of the ramp) survive; the core-clock pin in clock.py
+  is what keeps those small.
 * Sampling is spread-aware: burst pairs keep being added until the
   uncertainty of the median pair ratio (robust scatter / sqrt(n)) drops
   under TARGET_UNCERTAINTY_PCT, capped at MAX_BURSTS so the suite always
@@ -48,7 +62,11 @@ from collections.abc import Callable, Iterator
 from torch.profiler import ProfilerActivity, profile
 
 WARMUP_ITERS = 6
-MIN_BURSTS = 3  # burst pairs; a quiet case stops here
+# Burst pairs, always sampled in ABBA quartets: both bounds are EVEN and the
+# sampler only stops on an even count, because it takes two oppositely
+# ordered pairs to cancel a monotonic ramp.  Stopping at 3 would leave a
+# third of the drift bias in the reported number.
+MIN_BURSTS = 4  # a quiet case stops here
 MAX_BURSTS = 12  # hard cap so the suite terminates on a noisy case
 
 # Convergence is judged on the sampling uncertainty of the REPORTED number
@@ -233,14 +251,26 @@ def measure(
     uncertainty = float("inf")
     iters_now = iters
     while True:
-        ref_us.append(settled_burst(ref_fn, iters_now, ref_sync))
-        our_us.append(settled_burst(our_fn, iters_now, our_sync))
+        # ABBA: flip which leg leads on every pair, so the lag between a
+        # pair's two bursts alternates sign and a monotonic ramp cancels
+        # between consecutive pairs (see the module docstring).
+        if len(pair_ratios) % 2:
+            our_us.append(settled_burst(our_fn, iters_now, our_sync))
+            ref_us.append(settled_burst(ref_fn, iters_now, ref_sync))
+        else:
+            ref_us.append(settled_burst(ref_fn, iters_now, ref_sync))
+            our_us.append(settled_burst(our_fn, iters_now, our_sync))
         pair_ratios.append(our_us[-1] / ref_us[-1])
         spread = _robust_spread_pct(pair_ratios)
         uncertainty = spread / math.sqrt(len(pair_ratios))
-        if len(pair_ratios) >= min_bursts and uncertainty <= target_uncertainty_pct:
+        complete_quartets = len(pair_ratios) % 2 == 0
+        if (
+            len(pair_ratios) >= min_bursts
+            and complete_quartets
+            and uncertainty <= target_uncertainty_pct
+        ):
             break
-        if len(pair_ratios) >= min_bursts:
+        if len(pair_ratios) >= min_bursts and complete_quartets:
             longer = _longer_iters(iters_now, ref_us, our_us)
             if longer is not None:
                 # Short noisy bursts: lengthen them so each one averages a

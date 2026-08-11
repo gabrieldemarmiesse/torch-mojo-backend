@@ -66,9 +66,10 @@ test node and the node id is its key in the JSON, so the list of failing test na
 list of regressed kernel regimes. A test fails when its ratio regresses more
 than 4% versus the recorded baseline, passes when this hardware has never
 been measured, and the whole suite skips cleanly when there is no
-accelerator. GPU **device time only** is measured (never wall time), legs
-are interleaved, every case is pre-warmed, and `/tmp/gpu_lock_0.lock` is
-flocked around GPU work.
+accelerator. GPU **device time only** is measured (never wall time), the
+two legs are interleaved in ABBA order (ref,ours | ours,ref) so a monotonic
+clock ramp cancels to first order, every case is pre-warmed, and
+`/tmp/gpu_lock_0.lock` is flocked around GPU work.
 
 ```bash
 # Full suite (read-only: never writes baselines). Run serially, never -n.
@@ -397,7 +398,12 @@ Believe them before rediscovering them at GPU-hour prices.
   later in a hot run can read several percent slower (~8% observed on hot
   GEMM shapes). Never conclude from a single in-run ordering — alternate
   baseline/candidate order between runs, or compare both against an absolute
-  reference.
+  reference. Inside one case `benchmarks/` already does this (ABBA), and the
+  reason is worth borrowing for hand-rolled harnesses: under a fixed A,B,A,B
+  order the second leg is always measured one burst later than the first, so
+  a steady ramp tilts every pair the same way. That bias is invisible to any
+  scatter-based error bar — a measured example converged to "0.000%
+  uncertainty" on a number 2% wrong.
 - Before optimizing anything, the harness baseline leg must call the actual
   production entry points and reproduce the in-process production numbers
   (within ~1%). If it does not, the harness is measuring something else and
