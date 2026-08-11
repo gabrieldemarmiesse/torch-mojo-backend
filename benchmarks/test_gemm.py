@@ -50,6 +50,16 @@ DTYPES = {
     "tf32": (torch.float32, "high"),
 }
 
+COVERS: dict[str, str] = {
+    "aten::mm": "test_mm",
+    "aten::bmm": "test_bmm",
+    "aten::addmm": "test_addmm",
+    "aten::linear": "test_linear",
+    "aten::linear_backward": "test_linear_backward",
+}
+
+SKIPPED: dict[str, str] = {}
+
 BMM_BATCH = 8
 # S7 batched would need ~40 GB per leg; every other shape fits everywhere.
 BMM_SHAPES = {
@@ -197,4 +207,35 @@ def test_linear(
             lambda: torch.nn.functional.linear(x_ref, w_ref, bias_ref),
             lambda: torch.nn.functional.linear(x_our, w_our, bias_our),
             flops=2.0 * m * n * k,
+        )
+
+
+# aten::linear_backward has no CUDA registration in stock PyTorch (CUDA
+# decomposes linear to addmm, so its backward is matmul nodes); the stock
+# reference leg therefore composes the exact equivalent three-op sequence:
+# dgrad g @ w, wgrad g.t() @ x, bgrad g.sum(0).
+@pytest.mark.parametrize("dtype_id", DTYPES)
+@pytest.mark.parametrize("shape_id", SHAPES)
+def test_linear_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    m, n, k = SHAPES[shape_id]
+    dtype, precision = DTYPES[dtype_id]
+    with matmul_precision(precision):
+        x_ref = torch.randn(m, k, dtype=dtype, device=hw.stock_device)
+        w_ref = torch.randn(n, k, dtype=dtype, device=hw.stock_device)
+        g_ref = torch.randn(m, n, dtype=dtype, device=hw.stock_device)
+        x_our = torch.randn(m, k, dtype=dtype, device=mojo_device)
+        w_our = torch.randn(n, k, dtype=dtype, device=mojo_device)
+        g_our = torch.randn(m, n, dtype=dtype, device=mojo_device)
+
+        def ref_leg() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return g_ref @ w_ref, g_ref.t() @ x_ref, g_ref.sum(0)
+
+        bench.run(
+            ref_leg,
+            lambda: torch.ops.aten.linear_backward(
+                x_our, g_our, w_our, [True, True, True]
+            ),
+            flops=4.0 * m * n * k,
         )

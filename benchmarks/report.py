@@ -5,7 +5,10 @@ Reads only benchmarks/baselines.json — no accelerator needed.
     uv run python benchmarks/report.py                # every hardware config
     uv run python benchmarks/report.py --hw H100      # configs matching a substring
     uv run python benchmarks/report.py --worst 20     # top offenders only
-    uv run python benchmarks/report.py -k tf32        # entries matching a substring
+    uv run python benchmarks/report.py -k tf32/mm     # entry paths matching a substring
+
+Entries print as their baseline tree path dtype/op/shape/layout, so -k
+matches any axis ("bf16", "mm", "S7", "TN") or a path fragment ("tf32/mm").
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ def main() -> int:
     data = baselines.load()
     configs = {
         key: cfg
-        for key, cfg in sorted(data.get("configs", {}).items())
+        for key, cfg in sorted(data.configs.items())
         if args.hw.lower() in key.lower()
     }
     if not configs:
@@ -52,11 +55,15 @@ def main() -> int:
 
     for key, cfg in configs.items():
         results = {
-            entry: ratio
-            for entry, ratio in cfg.get("results", {}).items()
-            if args.k.lower() in entry.lower()
+            str(bench_key): ratio
+            for bench_key, ratio in cfg.leaves().items()
+            if args.k.lower() in str(bench_key).lower()
         }
-        print(f"\n{key}  ({len(results)} entries)")
+        agg = cfg.aggregate
+        print(
+            f"\n{key}  ({len(results)} entries; all-leaf min/median/max "
+            f"{agg.min:.3f}/{agg.median:.3f}/{agg.max:.3f})"
+        )
         hw_part, _, _ = key.rpartition(" | torch ")
         if versions_per_hw.get(hw_part or key, 0) > 1:
             print(

@@ -1,0 +1,182 @@
+"""Data-movement kernels: cat / stack / repeat / strided clone / tril /
+triu / arange / dtype cast.
+
+clone is benchmarked on STRIDED inputs only: a contiguous clone is a
+device memcpy, which measure.py excludes from device time by design (the
+node would raise NoDeviceKernels).  _to_copy is benchmarked only in its
+on-device dtype-cast regime (the vectorized cast kernel); its device-
+move regimes are memcpys and unmeasurable here for the same reason.
+arange runs entirely on-device (the fast_arange kernel, hot in HF decode
+loops) — the mojo leg builds the tensor on the mojo device directly.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+from bench_lib.cases import DTYPES, both
+from bench_lib.check import Bench
+from bench_lib.hw import Hardware
+
+# (pieces, elements per piece)
+CAT_SHAPES: dict[str, tuple[int, int]] = {
+    "P2x8388608": (2, 8388608),
+    "P64x262144": (64, 262144),
+}
+STACK_SHAPES: dict[str, tuple[int, int]] = {
+    "P8x1048576": (8, 1048576),
+    "P32x65536": (32, 65536),
+}
+# (rows, cols, repeats)
+REPEAT_SHAPES: dict[str, tuple[int, int, tuple[int, int]]] = {
+    "S1024x1024_r4x4": (1024, 1024, (4, 4)),
+    "S357x789_r3x5": (357, 789, (3, 5)),
+}
+TRI_SHAPES: dict[str, tuple[int, int]] = {"S8192x8192": (8192, 8192)}
+ARANGE_N = 16777216
+
+COVERS: dict[str, str] = {
+    "aten::cat": "test_cat",
+    "aten::stack": "test_stack",
+    "aten::repeat": "test_repeat",
+    "aten::clone": "test_clone (strided inputs; contiguous clone is a memcpy)",
+    "aten::tril": "test_tril",
+    "aten::triu": "test_triu",
+    "aten::arange": "test_arange",
+    "aten::_to_copy": "test_to_copy_cast (dtype-cast regime only)",
+}
+
+SKIPPED: dict[str, str] = {}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", CAT_SHAPES)
+def test_cat(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    pieces, elems = CAT_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    refs, ours = [], []
+    for _ in range(pieces):
+        ref, our = both(torch.randn(elems, dtype=dtype), hw, mojo_device)
+        refs.append(ref)
+        ours.append(our)
+    bench.run(
+        lambda: torch.cat(refs), lambda: torch.cat(ours), flops=float(pieces * elems)
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", STACK_SHAPES)
+def test_stack(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    pieces, elems = STACK_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    refs, ours = [], []
+    for _ in range(pieces):
+        ref, our = both(torch.randn(elems, dtype=dtype), hw, mojo_device)
+        refs.append(ref)
+        ours.append(our)
+    bench.run(
+        lambda: torch.stack(refs),
+        lambda: torch.stack(ours),
+        flops=float(pieces * elems),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", REPEAT_SHAPES)
+def test_repeat(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    rows, cols, reps = REPEAT_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(rows, cols, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: x_ref.repeat(*reps),
+        lambda: x_our.repeat(*reps),
+        flops=float(rows * cols * reps[0] * reps[1]),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("layout", ("T", "sliced"))
+@pytest.mark.parametrize("shape_id", ("S4096x4096",))
+def test_clone(
+    shape_id: str,
+    layout: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+) -> None:
+    dtype = DTYPES[dtype_id]
+    if layout == "T":
+        base_ref, base_our = both(torch.randn(4096, 4096, dtype=dtype), hw, mojo_device)
+        x_ref, x_our = base_ref.t(), base_our.t()
+    else:
+        base_ref, base_our = both(torch.randn(8192, 4096, dtype=dtype), hw, mojo_device)
+        x_ref, x_our = base_ref[::2], base_our[::2]
+    bench.run(lambda: x_ref.clone(), lambda: x_our.clone(), flops=float(x_ref.numel()))
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", TRI_SHAPES)
+def test_tril(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    x_ref, x_our = both(
+        torch.randn(TRI_SHAPES[shape_id], dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.tril(x_ref), lambda: torch.tril(x_our), flops=float(x_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", TRI_SHAPES)
+def test_triu(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    x_ref, x_our = both(
+        torch.randn(TRI_SHAPES[shape_id], dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.triu(x_ref), lambda: torch.triu(x_our), flops=float(x_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32", "i64"))
+@pytest.mark.parametrize("shape_id", (f"N{ARANGE_N}",))
+def test_arange(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    dtype = DTYPES[dtype_id]
+    bench.run(
+        lambda: torch.arange(ARANGE_N, dtype=dtype, device=hw.stock_device),
+        lambda: torch.arange(ARANGE_N, dtype=dtype, device=mojo_device),
+        flops=float(ARANGE_N),
+    )
+
+
+# source dtype axis; the cast target is folded into the layout token.
+CAST_TARGETS: dict[str, tuple[str, torch.dtype]] = {
+    "bf16": ("to_f32", torch.float32),
+    "f32": ("to_bf16", torch.bfloat16),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", ("C16777216", "A357x789"))
+@pytest.mark.bench_op("_to_copy")
+def test_to_copy_cast(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    shape = (16777216,) if shape_id == "C16777216" else (357, 789)
+    _, target = CAST_TARGETS[dtype_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: x_ref.to(target), lambda: x_our.to(target), flops=float(x_ref.numel())
+    )

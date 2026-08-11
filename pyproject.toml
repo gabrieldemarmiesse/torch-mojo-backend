@@ -104,4 +104,5 @@ dev = [
     "matplotlib>=3.10.6",
     "pytest-random-order>=1.2.0",
     "setuptools>=80.9.0",
+    "pydantic>=2.9",
 ]

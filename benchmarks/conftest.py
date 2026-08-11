@@ -1,11 +1,15 @@
 """Performance-regression benchmark suite: pytest wiring.
 
-One pytest test node per benchmark case; the node id is the key under
-which the ratio against stock PyTorch is stored in
-benchmarks/baselines.json.  Selection is plain pytest (-k, node ids, file
-paths) — there is no marker taxonomy here.  Pass/fail and update rules
-live in bench_lib/check.py; measurement discipline in bench_lib/measure.py;
-the baseline file contract in bench_lib/baselines.py.
+One pytest test node per benchmark case.  The ratio against stock
+PyTorch is stored in benchmarks/baselines.json under the axis-tree path
+hardware -> dtype -> op -> shape -> layout, derived from the node's own
+axes (bench_lib/check.py:_bench_key): op from the test function name
+(overridable with @pytest.mark.bench_op), dtype/shape from the
+parametrize ids, layout from the layout axis or the sentinel "contig".
+Selection is plain pytest (-k, node ids, file paths) — there is no
+marker taxonomy here.  Pass/fail and update rules live in
+bench_lib/check.py; measurement discipline in bench_lib/measure.py; the
+baseline file contract in bench_lib/baselines.py.
 
 Run it serially (no -n): every case takes the GPU flock and interleaves
 two legs on the device, so parallel workers would only fight each other.
@@ -21,6 +25,15 @@ import pytest
 import torch
 from bench_lib.check import Bench, update_mode
 from bench_lib.hw import Hardware, detect
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "bench_op(name): store this benchmark under the given op token in "
+        "baselines.json instead of the test function name (needed when the "
+        'aten name is not a Python identifier, e.g. "add.Tensor")',
+    )
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

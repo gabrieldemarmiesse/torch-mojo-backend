@@ -1,0 +1,592 @@
+<meta charset="utf-8">
+<title>Benchmark explorer</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --plane: #f9f9f7;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --rule: #c3c2b7;
+    --ring: rgba(11, 11, 11, 0.10);
+    --good: #0ca30c;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
+    --on-light-band: #0b0b0b;
+    --on-critical: #ffffff;
+    --accent: #2a78d6;
+    --hover: rgba(11, 11, 11, 0.045);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface: #1a1a19;
+      --plane: #0d0d0d;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --rule: #383835;
+      --ring: rgba(255, 255, 255, 0.10);
+      --accent: #3987e5;
+      --hover: rgba(255, 255, 255, 0.06);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #1a1a19;
+    --plane: #0d0d0d;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --rule: #383835;
+    --ring: rgba(255, 255, 255, 0.10);
+    --accent: #3987e5;
+    --hover: rgba(255, 255, 255, 0.06);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--plane);
+    color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 24px 20px 64px;
+  }
+  /* Tree paths and shapes are identifiers; they get the utility face. */
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  h1 { font-size: 21px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 14px; margin: 0 0 10px; color: var(--ink-2); font-weight: 600; }
+  .sub { color: var(--ink-2); margin: 0 0 20px; font-size: 14px; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--ring);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  label.fld { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  select, input[type="search"], button {
+    font: inherit;
+    font-size: 13px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+    padding: 6px 9px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+
+  /* stat tiles */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 13px 15px; }
+  .tile .k { font-size: 12px; color: var(--muted); }
+  .tile .v { font-size: 25px; font-weight: 600; margin-top: 3px; letter-spacing: -0.02em; }
+  .tile .n { font-size: 12px; color: var(--ink-2); margin-top: 2px; overflow-wrap: anywhere; }
+
+  /* chips */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--rule); background: transparent; color: var(--ink-2); cursor: pointer;
+  }
+  .chip[aria-pressed="true"] { background: var(--accent); border-color: transparent; color: #fff; }
+  .grp { display: flex; gap: 8px; align-items: baseline; margin-bottom: 8px; flex-wrap: wrap; }
+  .grp > .lbl { font-size: 12px; color: var(--muted); min-width: 56px; }
+
+  /* status pills (shared by tree, matrix and table) */
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .b-good { background: var(--good); color: var(--on-light-band); }
+  .b-warning { background: var(--warning); color: var(--on-light-band); }
+  .b-serious { background: var(--serious); color: var(--on-light-band); }
+  .b-critical { background: var(--critical); color: var(--on-critical); }
+
+  /* tree */
+  .tree { font-size: 13px; }
+  .thead, .trow {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 58px 72px 72px 104px;
+    gap: 8px; align-items: center;
+  }
+  .thead {
+    font-size: 12px; color: var(--muted); font-weight: 600;
+    padding: 2px 8px 6px; border-bottom: 1px solid var(--grid); margin-bottom: 2px;
+  }
+  .trow { padding: 3px 8px; border-radius: 6px; }
+  .trow.cat { cursor: pointer; }
+  .trow.cat:hover { background: var(--hover); }
+  .trow .name { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+  .trow .label { overflow-wrap: anywhere; }
+  .trow .count { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .caret {
+    flex: none; width: 14px; color: var(--muted); font-size: 11px;
+    transition: transform 0.12s; transform: rotate(0deg); align-self: center;
+  }
+  .trow[aria-expanded="true"] > .name > .caret { transform: rotate(90deg); }
+  .trow.leaf .caret { visibility: hidden; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .trow .dim { color: var(--muted); }
+  .worstcell { text-align: right; }
+  .kids { border-left: 1px solid var(--grid); margin-left: 14px; }
+  .lvl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+
+  /* matrix */
+  .scroll { overflow-x: auto; }
+  table { border-collapse: separate; border-spacing: 2px; font-variant-numeric: tabular-nums; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; text-align: left; padding: 4px 8px; white-space: nowrap; }
+  td.cell {
+    min-width: 74px; text-align: right; padding: 6px 10px; border-radius: 4px;
+    font-size: 13px; cursor: pointer; white-space: nowrap;
+  }
+  td.cell .g { float: left; font-weight: 700; opacity: 0.85; margin-right: 8px; }
+  td.empty { background: transparent; color: var(--muted); text-align: center; cursor: default; }
+  th.rowhead { color: var(--ink); font-weight: 600; padding-right: 12px; }
+
+  /* legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--ink-2); margin-top: 12px; }
+  .legend span.sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+
+  /* worst-first table */
+  table.list { border-spacing: 0; width: 100%; font-size: 13px; }
+  table.list th { border-bottom: 1px solid var(--grid); }
+  table.list td { padding: 5px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  table.list td.path { white-space: normal; overflow-wrap: anywhere; color: var(--ink-2); font-size: 12px; }
+
+  .empty-state { text-align: center; padding: 48px 20px; color: var(--ink-2); }
+  .empty-state code, .hint code { background: var(--plane); padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  .drop { outline: 2px dashed var(--accent); outline-offset: -6px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .err { color: var(--critical); font-size: 13px; margin-top: 8px; }
+</style>
+
+<div class="wrap">
+  <h1>Benchmark explorer</h1>
+  <p class="sub">
+    Every number is <strong>our device time &divide; stock PyTorch device time</strong> on the same shape.
+    Above 1.00 means we are slower. The acceptance bar is <strong>1.10</strong>.
+  </p>
+
+  <div class="card" id="loader">
+    <div class="row">
+      <label class="fld">Search the tree
+        <input type="search" id="q" class="mono" placeholder="e.g. bf16/mm, S7, softmax, TN" style="min-width:240px">
+      </label>
+      <button class="chip" id="missonly" aria-pressed="false" style="align-self:flex-end">only misses &gt;1.10</button>
+      <span style="flex:1"></span>
+      <button id="pick">Load baselines.json&hellip;</button>
+      <input type="file" id="file" accept=".json,application/json" hidden>
+    </div>
+    <div id="dtchips"></div>
+    <div class="hint" id="src">Drop <code>baselines.json</code> anywhere on this page, or use the button.</div>
+    <div class="err" id="err" hidden></div>
+  </div>
+
+  <div id="app" hidden>
+    <div class="tiles" style="margin-bottom:16px">
+      <div class="tile"><div class="k">Cases shown</div><div class="v" id="t-n">&ndash;</div><div class="n" id="t-n-sub"></div></div>
+      <div class="tile"><div class="k">Meet the 1.10 bar</div><div class="v" id="t-pass">&ndash;</div><div class="n" id="t-pass-sub"></div></div>
+      <div class="tile"><div class="k">Median ratio</div><div class="v" id="t-med">&ndash;</div><div class="n">half are better than this</div></div>
+      <div class="tile" style="border-color:var(--critical)"><div class="k">Worst case</div><div class="v" id="t-max">&ndash;</div><div class="n mono" id="t-max-sub"></div></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:8px">
+        <h2 style="margin:0">The tree &mdash; worst first at every level</h2>
+        <span style="flex:1"></span>
+        <button id="expand">Expand all</button>
+        <button id="collapse">Collapse all</button>
+      </div>
+      <div class="hint" style="margin:0 0 10px">
+        hardware &rarr; dtype &rarr; aten op &rarr; shape &rarr; layout. A collapsed row already shows the
+        worst ratio under it &mdash; open the red ones. Click a row (or press Enter on it) to toggle.
+      </div>
+      <div class="tree" id="tree">
+        <div class="thead">
+          <div>branch</div><div class="num">cases</div><div class="num">min</div><div class="num">median</div><div class="worstcell">worst</div>
+        </div>
+        <div id="treebody"></div>
+      </div>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--good)"></span>&check; meets bar &le;1.10</span>
+        <span><span class="sw" style="background:var(--warning)"></span>! near miss &le;1.5</span>
+        <span><span class="sw" style="background:var(--serious)"></span>!! serious &le;3</span>
+        <span><span class="sw" style="background:var(--critical)"></span>!!! critical &gt;3</span>
+        <span style="color:var(--muted)">Every row prints its numbers &mdash; colour is a second cue, never the only one.</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Op &times; dtype at a glance</h2>
+      <div class="row" style="margin-bottom:12px">
+        <label class="fld">Cell shows
+          <select id="agg">
+            <option value="max">worst ratio</option>
+            <option value="median">median ratio</option>
+          </select>
+        </label>
+        <span class="hint" style="margin:0">Click a cell to focus the tree on that op and dtype.</span>
+      </div>
+      <div class="scroll"><div id="matrix"></div></div>
+    </div>
+
+    <div class="card">
+      <h2>Worst first</h2>
+      <div class="scroll">
+        <table class="list" id="list">
+          <thead><tr>
+            <th class="num">ratio</th><th>dtype</th><th>op</th><th>shape</th><th>layout</th><th>hardware</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="hint" id="listnote"></div>
+    </div>
+  </div>
+
+  <div class="empty-state" id="blank">
+    <p>No data loaded yet.</p>
+    <p class="hint">
+      Serve this directory (<code>python -m http.server</code>) and it loads
+      <code>baselines.json</code> automatically &mdash; or drop the file onto this page.
+    </p>
+  </div>
+</div>
+
+<script>
+"use strict";
+const BAR = 1.10;
+const BANDS = [
+  { id: "good",     max: BAR,      glyph: "✓" },
+  { id: "warning",  max: 1.5,      glyph: "!" },
+  { id: "serious",  max: 3,        glyph: "!!" },
+  { id: "critical", max: Infinity, glyph: "!!!" },
+];
+const band = r => BANDS.find(b => r <= b.max);
+const fmt = r => (r >= 10 ? r.toFixed(0) : r.toFixed(2));
+const median = a => {
+  if (!a.length) return NaN;
+  const s = [...a].sort((x, y) => x - y), h = s.length >> 1;
+  return s.length % 2 ? s[h] : (s[h - 1] + s[h]) / 2;
+};
+const pill = r => {
+  const b = band(r);
+  return `<span class="tag b-${b.id}">${b.glyph} ${fmt(r)}×</span>`;
+};
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+const LEVELS = ["hardware", "dtype", "op", "shape", "layout"];   // display names per depth
+const KEYS = ["hw", "dtype", "op", "shape"];                     // leaf properties per category depth
+const SEP = "";
+
+let LEAVES = [];                 // {hw, dtype, op, shape, layout, ratio, path}
+let SELDT = new Set();           // dtype chip selection (empty = all)
+let MISSONLY = false;
+let EXPANDED = new Set();        // node paths (SEP-joined prefixes)
+let PENDING_EXPAND = null;       // "all" | null — applied on next tree build
+
+// ---- ingest: format-3 tree -> flat leaves --------------------------------
+function ingest(obj, srcLabel) {
+  if (!obj || typeof obj !== "object" || !obj.configs)
+    throw new Error('Not a baselines file: expected a top-level "configs" object.');
+  if (obj.format !== 3)
+    throw new Error(`Unsupported baselines format ${JSON.stringify(obj.format)}; this page reads format 3.`);
+  const leaves = [];
+  for (const [hw, cfg] of Object.entries(obj.configs)) {
+    for (const [dtype, dt] of Object.entries(cfg.dtypes || {})) {
+      for (const [op, o] of Object.entries(dt.ops || {})) {
+        for (const [shape, sh] of Object.entries(o.shapes || {})) {
+          for (const [layout, ratio] of Object.entries(sh.layouts || {})) {
+            leaves.push({ hw, dtype, op, shape, layout, ratio: +ratio,
+                          path: [hw, dtype, op, shape, layout].join("/").toLowerCase() });
+          }
+        }
+      }
+    }
+  }
+  if (!leaves.length) throw new Error("The file parsed but holds no benchmark leaves.");
+  LEAVES = leaves;
+  SELDT = new Set();
+  EXPANDED = new Set(new Set(leaves.map(l => l.hw)));  // hardware level open by default
+  buildDtypeChips();
+  document.getElementById("src").textContent = srcLabel;
+  document.getElementById("blank").hidden = true;
+  document.getElementById("app").hidden = false;
+  render();
+}
+
+function buildDtypeChips() {
+  const host = document.getElementById("dtchips");
+  host.innerHTML = "";
+  const g = document.createElement("div");
+  g.className = "grp"; g.style.marginTop = "10px"; g.style.marginBottom = "0";
+  g.innerHTML = `<span class="lbl">dtype</span>`;
+  const chips = document.createElement("div"); chips.className = "chips";
+  for (const v of [...new Set(LEAVES.map(l => l.dtype))].sort()) {
+    const b = document.createElement("button");
+    b.className = "chip"; b.type = "button"; b.textContent = v;
+    b.setAttribute("aria-pressed", "false");
+    b.onclick = () => {
+      SELDT.has(v) ? SELDT.delete(v) : SELDT.add(v);
+      b.setAttribute("aria-pressed", SELDT.has(v));
+      render();
+    };
+    chips.append(b);
+  }
+  g.append(chips); host.append(g);
+}
+
+function filtered() {
+  const q = document.getElementById("q").value.trim().toLowerCase();
+  return LEAVES.filter(l =>
+    (!SELDT.size || SELDT.has(l.dtype)) &&
+    (!MISSONLY || l.ratio > BAR) &&
+    (!q || l.path.includes(q)));
+}
+
+// ---- tree ----------------------------------------------------------------
+function buildTree(leaves) {
+  // Nested {name, path, depth, leaves:[], kids:Map} — aggregates computed per node.
+  const root = { kids: new Map(), leaves };
+  for (const l of leaves) {
+    let node = root, prefix = "";
+    for (const key of KEYS) {                          // category levels
+      const name = l[key];
+      prefix = prefix ? prefix + SEP + name : name;
+      if (!node.kids.has(name))
+        node.kids.set(name, { name, path: prefix, depth: prefix.split(SEP).length - 1, leaves: [], kids: new Map() });
+      node = node.kids.get(name);
+      node.leaves.push(l);
+    }
+    node.kids.set(l.layout, { name: l.layout, leaf: l });
+  }
+  return root;
+}
+
+function nodeStats(node) {
+  const rs = node.leaves.map(l => l.ratio);
+  return { min: Math.min(...rs), med: median(rs), max: Math.max(...rs), n: rs.length };
+}
+
+function allCategoryPaths(node, out) {
+  for (const kid of node.kids.values()) {
+    if (kid.leaf) continue;
+    out.push(kid.path);
+    allCategoryPaths(kid, out);
+  }
+  return out;
+}
+
+function drawTree(leaves) {
+  const root = buildTree(leaves);
+  if (PENDING_EXPAND === "all") EXPANDED = new Set(allCategoryPaths(root, []));
+  PENDING_EXPAND = null;
+
+  const host = document.getElementById("treebody");
+  host.innerHTML = "";
+  if (!leaves.length) {
+    host.innerHTML = `<p class="hint">Nothing matches the current filters.</p>`;
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  emitKids(root, frag, 0);
+  host.append(frag);
+}
+
+function sortedKids(node) {
+  // Worst-first: a branch's max decides its place; leaves sort by their ratio.
+  return [...node.kids.values()].sort((a, b) =>
+    (b.leaf ? b.leaf.ratio : nodeStats(b).max) - (a.leaf ? a.leaf.ratio : nodeStats(a).max));
+}
+
+function emitKids(node, host, depth) {
+  for (const kid of sortedKids(node)) {
+    if (kid.leaf) { host.append(leafRow(kid.leaf, depth)); continue; }
+    const s = nodeStats(kid);
+    const open = EXPANDED.has(kid.path);
+    const row = document.createElement("div");
+    row.className = "trow cat";
+    row.setAttribute("role", "button");
+    row.setAttribute("aria-expanded", String(open));
+    row.dataset.path = kid.path;
+    row.tabIndex = 0;
+    row.innerHTML =
+      `<div class="name"><span class="caret">▶</span>` +
+      `<span class="label${depth >= 2 ? " mono" : ""}">${esc(kid.name)}</span>` +
+      `<span class="lvl">${LEVELS[depth]}</span></div>` +
+      `<div class="num count">${s.n}</div>` +
+      `<div class="num${s.min > BAR ? "" : " dim"}">${fmt(s.min)}×</div>` +
+      `<div class="num">${fmt(s.med)}×</div>` +
+      `<div class="worstcell">${pill(s.max)}</div>`;
+    const toggle = () => {
+      EXPANDED.has(kid.path) ? EXPANDED.delete(kid.path) : EXPANDED.add(kid.path);
+      render();
+      // The tree is rebuilt; put keyboard focus back on the toggled row.
+      const again = document.querySelector(`.trow[data-path="${CSS.escape(kid.path)}"]`);
+      if (again && document.activeElement === document.body) again.focus();
+    };
+    row.onclick = toggle;
+    row.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
+    host.append(row);
+    if (open) {
+      const kids = document.createElement("div");
+      kids.className = "kids";
+      emitKids(kid, kids, depth + 1);
+      host.append(kids);
+    }
+  }
+}
+
+function leafRow(l, depth) {
+  const row = document.createElement("div");
+  row.className = "trow leaf";
+  row.innerHTML =
+    `<div class="name"><span class="caret">▶</span>` +
+    `<span class="label mono">${esc(l.layout)}</span>` +
+    `<span class="lvl">${LEVELS[depth]}</span></div>` +
+    `<div class="num count">1</div><div class="num dim"></div><div class="num dim"></div>` +
+    `<div class="worstcell">${pill(l.ratio)}</div>`;
+  return row;
+}
+
+// ---- tiles / matrix / list ----------------------------------------------
+function render() {
+  const rows = filtered();
+  const ratios = rows.map(r => r.ratio);
+  const pass = rows.filter(r => r.ratio <= BAR).length;
+  const worst = rows.length ? rows.reduce((a, b) => (a.ratio > b.ratio ? a : b)) : null;
+
+  document.getElementById("t-n").textContent = rows.length;
+  document.getElementById("t-n-sub").textContent = `of ${LEAVES.length} recorded`;
+  document.getElementById("t-pass").textContent = rows.length ? `${Math.round(pass / rows.length * 100)}%` : "–";
+  document.getElementById("t-pass-sub").textContent = rows.length ? `${pass} of ${rows.length}` : "";
+  document.getElementById("t-med").textContent = rows.length ? fmt(median(ratios)) + "×" : "–";
+  document.getElementById("t-max").textContent = worst ? fmt(worst.ratio) + "×" : "–";
+  document.getElementById("t-max-sub").textContent =
+    worst ? `${worst.dtype}/${worst.op}/${worst.shape}/${worst.layout}` : "";
+
+  drawTree(rows);
+  drawMatrix(rows);
+  drawList(rows);
+}
+
+function drawMatrix(rows) {
+  const agg = document.getElementById("agg").value;
+  const host = document.getElementById("matrix");
+  const dtypes = [...new Set(rows.map(r => r.dtype))].sort();
+  const byOp = new Map();
+  for (const r of rows) {
+    if (!byOp.has(r.op)) byOp.set(r.op, new Map());
+    const m = byOp.get(r.op);
+    if (!m.has(r.dtype)) m.set(r.dtype, []);
+    m.get(r.dtype).push(r.ratio);
+  }
+  const ops = [...byOp.keys()].sort((a, b) =>
+    Math.max(...[].concat(...byOp.get(b).values())) - Math.max(...[].concat(...byOp.get(a).values())));
+
+  const t = document.createElement("table");
+  const head = t.insertRow();
+  head.append(document.createElement("th"));
+  for (const d of dtypes) { const th = document.createElement("th"); th.textContent = d; head.append(th); }
+
+  for (const op of ops) {
+    const tr = t.insertRow();
+    const th = document.createElement("th"); th.className = "rowhead mono"; th.textContent = op; tr.append(th);
+    for (const d of dtypes) {
+      const vals = byOp.get(op).get(d);
+      const td = tr.insertCell();
+      if (!vals) { td.className = "empty"; td.textContent = "–"; continue; }
+      const v = agg === "max" ? Math.max(...vals) : median(vals);
+      const b = band(v);
+      td.className = "cell b-" + b.id;
+      td.innerHTML = `<span class="g">${b.glyph}</span>${fmt(v)}×`;
+      td.title = `${op} × ${d}\n${vals.length} case${vals.length > 1 ? "s" : ""}`
+        + `\nworst ${fmt(Math.max(...vals))}×, median ${fmt(median(vals))}×`;
+      td.onclick = () => focusTreeOn(op, d);
+      td.setAttribute("role", "button");
+      td.tabIndex = 0;
+      td.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); focusTreeOn(op, d); } };
+    }
+  }
+  host.innerHTML = ""; host.append(t);
+}
+
+function focusTreeOn(op, dtype) {
+  SELDT = new Set([dtype]);
+  for (const btn of document.querySelectorAll("#dtchips .chip"))
+    btn.setAttribute("aria-pressed", String(btn.textContent === dtype));
+  document.getElementById("q").value = `/${op}/`;
+  PENDING_EXPAND = "all";
+  render();
+  document.getElementById("tree").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function drawList(rows) {
+  const tb = document.querySelector("#list tbody");
+  const sorted = [...rows].sort((a, b) => b.ratio - a.ratio);
+  const show = sorted.slice(0, 200);
+  tb.innerHTML = "";
+  for (const r of show) {
+    const tr = tb.insertRow();
+    tr.innerHTML =
+      `<td class="num">${pill(r.ratio)}</td>` +
+      `<td>${esc(r.dtype)}</td><td class="mono">${esc(r.op)}</td>` +
+      `<td class="mono">${esc(r.shape)}</td><td class="mono">${esc(r.layout)}</td>` +
+      `<td class="path">${esc(r.hw)}</td>`;
+  }
+  document.getElementById("listnote").textContent =
+    show.length < sorted.length ? `Showing the worst ${show.length} of ${sorted.length}. Narrow the filters to see the rest.` : "";
+}
+
+// ---- wiring --------------------------------------------------------------
+document.getElementById("q").oninput = () => { PENDING_EXPAND = "all"; render(); };
+document.getElementById("agg").onchange = render;
+document.getElementById("missonly").onclick = e => {
+  MISSONLY = !MISSONLY;
+  e.target.setAttribute("aria-pressed", String(MISSONLY));
+  render();
+};
+document.getElementById("expand").onclick = () => { PENDING_EXPAND = "all"; render(); };
+document.getElementById("collapse").onclick = () => { EXPANDED = new Set(); render(); };
+document.getElementById("pick").onclick = () => document.getElementById("file").click();
+document.getElementById("file").onchange = e => {
+  const f = e.target.files[0]; if (f) readFile(f);
+};
+
+function fail(msg) {
+  const el = document.getElementById("err");
+  el.textContent = msg; el.hidden = false;
+}
+function readFile(f) {
+  const fr = new FileReader();
+  fr.onload = () => {
+    try { document.getElementById("err").hidden = true; ingest(JSON.parse(fr.result), `Loaded ${f.name}`); }
+    catch (err) { fail(err.message); }
+  };
+  fr.readAsText(f);
+}
+addEventListener("dragover", e => { e.preventDefault(); document.body.classList.add("drop"); });
+addEventListener("dragleave", () => document.body.classList.remove("drop"));
+addEventListener("drop", e => {
+  e.preventDefault(); document.body.classList.remove("drop");
+  const f = e.dataTransfer.files[0]; if (f) readFile(f);
+});
+
+// Auto-load when served over http(s); file:// is blocked by CORS, hence the picker.
+if (location.protocol.startsWith("http")) {
+  fetch("baselines.json")
+    .then(r => r.ok ? r.json() : Promise.reject(new Error(r.status + " fetching baselines.json")))
+    .then(j => ingest(j, "Loaded baselines.json from this directory"))
+    .catch(() => { /* stay on the empty state; the picker still works */ });
+}
+if (window.EMBEDDED_BASELINES) {
+  try { ingest(window.EMBEDDED_BASELINES, "Embedded snapshot"); } catch (err) { fail(err.message); }
+}
+</script>

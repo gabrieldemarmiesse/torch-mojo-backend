@@ -70,11 +70,37 @@ def _sync_for(device: str) -> Callable[[], None]:
     return lambda: None
 
 
-def _normalize_nodeid(nodeid: str) -> str:
-    # Keys are relative to benchmarks/ so they do not depend on the
-    # directory pytest was invoked from.
-    prefix = "benchmarks/"
-    return nodeid[len(prefix) :] if nodeid.startswith(prefix) else nodeid
+def _bench_key(request: pytest.FixtureRequest) -> baselines.BenchKey:
+    """The baseline tree path of this test node: dtype/op/shape/layout.
+
+    Derived from the test's own axes, never parsed out of the node id:
+    the op token is the test function name minus "test_" (override with
+    @pytest.mark.bench_op("add.Tensor") when the aten name cannot be a
+    Python identifier), dtype and shape come from the parametrize ids,
+    and a test without a layout axis gets the fixed sentinel "contig" so
+    every path has the same rank.
+    """
+    node = request.node
+    marker = node.get_closest_marker("bench_op")
+    op = marker.args[0] if marker else node.originalname.removeprefix("test_")
+    callspec = getattr(node, "callspec", None)
+    params = callspec.params if callspec is not None else {}
+    missing = [axis for axis in ("dtype_id", "shape_id") if axis not in params]
+    if missing:
+        pytest.fail(
+            f"benchmark {node.nodeid} lacks the {missing} parametrize "
+            "axes: every benchmark must be parametrized with dtype_id and "
+            "shape_id (fold any extra axis into the shape token), plus an "
+            "optional layout axis, so its baseline path "
+            "dtype/op/shape/layout is derivable.",
+            pytrace=False,
+        )
+    return baselines.BenchKey(
+        dtype=params["dtype_id"],
+        op=op,
+        shape=params["shape_id"],
+        layout=params.get("layout", "contig"),
+    )
 
 
 class Bench:
@@ -91,7 +117,7 @@ class Bench:
         self, ref_fn: Callable[[], object], our_fn: Callable[[], object], flops: float
     ) -> None:
         hw = self._hw
-        entry_key = _normalize_nodeid(self._request.node.nodeid)
+        entry_key = _bench_key(self._request)
         iters = iters_for_flops(flops)
         try:
             for attempt in range(1 + NOISE_RETRIES):
@@ -133,7 +159,9 @@ class Bench:
             )
         self._check(entry_key, result, attempts=attempt + 1)
 
-    def _check(self, entry_key: str, result: Measurement, attempts: int = 1) -> None:
+    def _check(
+        self, entry_key: baselines.BenchKey, result: Measurement, attempts: int = 1
+    ) -> None:
         mode = update_mode(self._request.config)
         data = baselines.load()
         base = baselines.lookup(data, self._hw.key, entry_key)
@@ -192,7 +220,11 @@ class Bench:
         # else: dead band, nothing to write, no churn.
 
     def _record_or_hint(
-        self, mode: str | None, entry_key: str, ratio: float, message: str
+        self,
+        mode: str | None,
+        entry_key: baselines.BenchKey,
+        ratio: float,
+        message: str,
     ) -> None:
         if mode is not None:
             self._record(entry_key, ratio)
@@ -202,7 +234,7 @@ class Bench:
                 f"NOT recorded (rerun with --update-baselines) {entry_key}: {message}"
             )
 
-    def _record(self, entry_key: str, ratio: float) -> None:
+    def _record(self, entry_key: baselines.BenchKey, ratio: float) -> None:
         baselines.merge_write(self._hw.key, {entry_key: ratio})
 
     def _note(self, message: str) -> None:
