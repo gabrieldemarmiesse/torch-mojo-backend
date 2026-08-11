@@ -788,6 +788,59 @@ def mojo_device_linear(
     return result
 
 
+@register_aten_op("aten::native_batch_norm")
+def mojo_device_native_batch_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    running_mean: torch.Tensor | None,
+    running_var: torch.Tensor | None,
+    training: bool,
+    momentum: float,
+    eps: float,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor]:
+    """Batch norm with a forward-time preflight of its native autograd node.
+
+    The training forward exists here; `aten::native_batch_norm_backward` does
+    not (docs/optimization_backlog.md N2). Letting the forward record
+    NativeBatchNormBackward anyway would move the failure into the autograd
+    engine, where an exception aborts the process on this backend rather than
+    raising — the same unwind hazard `mojo_device_linear` above documents — so
+    a training call that would need a gradient is refused here, from the
+    forward, with a traceback that names the op.
+
+    Inference needs no preflight: `training=False` records a backward this
+    backend never has to run.
+    """
+    if (
+        training
+        and torch.is_grad_enabled()
+        and (
+            input.requires_grad
+            or (weight is not None and weight.requires_grad)
+            or (bias is not None and bias.requires_grad)
+        )
+    ):
+        raise NotImplementedError(
+            "aten::native_batch_norm (training=True) would record an autograd "
+            "node (aten::native_batch_norm_backward) that mojo eager mode "
+            f"does not implement (input {tuple(input.shape)} {input.dtype}, "
+            f"device {input.device}). The forward itself is supported: run it "
+            "under torch.no_grad(), or put the module in eval() mode. Raised "
+            "from the forward on purpose: raised from the backward node "
+            "instead, this aborts the process without a traceback."
+        )
+    aten_fast = _fast()
+    result = aten_fast.fast_aten_native_batch_norm(
+        input, weight, bias, running_mean, running_var, training, momentum, eps
+    )
+    if result is aten_fast.NOT_HANDLED:
+        raise _unsupported(
+            "aten::native_batch_norm", (input, weight, bias, running_mean, running_var)
+        )
+    return result
+
+
 @register_aten_op("aten::normal_")
 def mojo_device_normal_(
     self: TorchMojoTensor, mean: float = 0.0, std: float = 1.0, generator=None
@@ -1151,7 +1204,10 @@ _register_fast("aten::min", "fast_aten_min")
 _register_fast("aten::minimum", "fast_aten_minimum")
 _register_fast("aten::mm", "fast_aten_mm")
 _register_fast("aten::mul.Tensor", "fast_aten_mul")
-_register_fast("aten::native_batch_norm", "fast_aten_native_batch_norm")
+# aten::native_batch_norm is registered above as mojo_device_native_batch_norm:
+# its training form records a native autograd node whose backward this backend
+# does not implement, and a raise from inside the engine aborts the process
+# instead of raising, so the refusal has to happen in the forward.
 _register_fast("aten::native_dropout", "fast_aten_native_dropout")
 _register_fast("aten::native_dropout_backward", "fast_aten_native_dropout_backward")
 _register_fast("aten::native_group_norm", "fast_aten_native_group_norm")
