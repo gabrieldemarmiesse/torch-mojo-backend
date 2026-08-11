@@ -39,3 +39,8 @@ rocprof_out/
 # measurements of one machine at one commit, so they are quoted in the journal
 # rather than tracked.
 current_bench_train/
+
+# Benchmark-baseline write machinery: the flock file and the atomic-replace
+# temp next to benchmarks/baselines.json (the json itself IS tracked).
+benchmarks/baselines.json.lock
+benchmarks/baselines.json.tmp

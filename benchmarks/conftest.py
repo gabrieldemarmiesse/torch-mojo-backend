@@ -1,0 +1,91 @@
+"""Performance-regression benchmark suite: pytest wiring.
+
+One pytest test node per benchmark case; the node id is the key under
+which the ratio against stock PyTorch is stored in
+benchmarks/baselines.json.  Selection is plain pytest (-k, node ids, file
+paths) — there is no marker taxonomy here.  Pass/fail and update rules
+live in bench_lib/check.py; measurement discipline in bench_lib/measure.py;
+the baseline file contract in bench_lib/baselines.py.
+
+Run it serially (no -n): every case takes the GPU flock and interleaves
+two legs on the device, so parallel workers would only fight each other.
+"""
+
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("MODULAR_TELEMETRY_ENABLED", "0")
+
+import pytest
+import torch
+from bench_lib.check import Bench, update_mode
+from bench_lib.hw import Hardware, detect
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--update-baselines",
+        nargs="?",
+        const="improve",
+        default=None,
+        choices=("improve", "force"),
+        help=(
+            "Write measured ratios into benchmarks/baselines.json: new entries "
+            "and >4%% improvements. '=force' also accepts >4%% regressions "
+            "(after an intentional performance trade-off)."
+        ),
+    )
+
+
+@pytest.fixture(scope="session")
+def hw() -> Hardware:
+    hardware = detect()
+    if hardware is None:
+        pytest.skip(
+            "no accelerator available (set TORCH_MOJO_BACKEND_BENCH_CPU=1 "
+            "to benchmark the CPU configuration)"
+        )
+    return hardware
+
+
+@pytest.fixture(scope="session")
+def mojo_device(hw: Hardware) -> torch.device:
+    from torch_mojo_backend import register_mojo_devices
+
+    register_mojo_devices()
+    return torch.device("mojo")
+
+
+@pytest.fixture(autouse=True)
+def deterministic_operands() -> None:
+    # Same operand data in every process: a reproducible measurement should
+    # feed reproducible inputs.  Tested on S1-tf32: data content is NOT the
+    # driver of the residual ~2% between-process drift (that is allocator /
+    # memory-layout state), but seeding removes it as a variable for the
+    # power-bound cases where GEMM device time is weakly data-dependent.
+    torch.manual_seed(0)
+
+
+@pytest.fixture
+def bench(
+    request: pytest.FixtureRequest, hw: Hardware, mojo_device: torch.device
+) -> Bench:
+    return Bench(request, hw, mojo_device)
+
+
+def pytest_terminal_summary(
+    terminalreporter, exitstatus: int, config: pytest.Config
+) -> None:
+    notes = getattr(config, "_bench_notes", [])
+    if not notes:
+        return
+    terminalreporter.section("benchmark baselines")
+    for note in notes:
+        terminalreporter.write_line(note)
+    if update_mode(config) is None and any("NOT recorded" in n for n in notes):
+        terminalreporter.write_line(
+            "hint: rerun with --update-baselines (or "
+            "TORCH_MOJO_BACKEND_BENCH_UPDATE=1) to write these into "
+            "benchmarks/baselines.json"
+        )

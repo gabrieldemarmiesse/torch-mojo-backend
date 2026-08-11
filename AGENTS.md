@@ -53,6 +53,45 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   - `no_graph_breaks.py` (example demonstrating graph compilation without breaks)
 
 
+## Performance-regression benchmarks (`benchmarks/`)
+
+`benchmarks/` is a pytest suite that measures the mojo device against stock
+PyTorch (CUDA on NVIDIA, ROCm on AMD, MPS on Apple) and compares the
+device-time ratio ours/stock against `benchmarks/baselines.json` — one
+git-tracked file holding the baselines of every hardware configuration side
+by side. Each (op, shape, layout, dtype) case is its own test node and the
+node id is its key in the JSON, so the list of failing test names is the
+list of regressed kernel regimes. A test fails when its ratio regresses more
+than 4% versus the recorded baseline, passes when this hardware has never
+been measured, and the whole suite skips cleanly when there is no
+accelerator. GPU **device time only** is measured (never wall time), legs
+are interleaved, every case is pre-warmed, and `/tmp/gpu_lock_0.lock` is
+flocked around GPU work.
+
+```bash
+# Full suite (read-only: never writes baselines). Run serially, never -n.
+uv run pytest benchmarks/
+
+# Subsets are ordinary pytest selection — no markers, no custom taxonomy
+uv run pytest benchmarks/test_gemm.py -k "TN and bf16"
+uv run pytest "benchmarks/test_gemm.py::test_mm[S7_768x50304x49152-TN-bf16]"
+
+# Record a baseline on new hardware, or update after an optimization
+# (writes new entries and >4% improvements; +/-4% dead band never churns)
+uv run pytest benchmarks/ --update-baselines
+
+# Accept a >4% regression after an INTENTIONAL trade-off, for chosen nodes only
+uv run pytest benchmarks/ -k "..." --update-baselines=force
+
+# Where are we far behind stock PyTorch? (reads only the JSON, no GPU needed)
+uv run python benchmarks/report.py --worst 20
+```
+
+Updates merge per entry: a run that measured three cases changes those
+three lines of `baselines.json` and nothing else, so a PR touching one op
+updates that op's numbers without rerunning the rest. Do not gate CI on
+this suite: CI machines may have no GPU.
+
 
 ## To add support for an op
 
