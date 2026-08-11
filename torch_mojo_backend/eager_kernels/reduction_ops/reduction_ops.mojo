@@ -7,6 +7,10 @@
 # allocation retry); the bridges here refuse non-trailing dims or strided
 # operands rather than scratch-copying, and the kernels only ever see a
 # contiguous (rows, cols) buffer reducing each row to one output element.
+# Two ops opt out of that materialization for an ADJACENT non-trailing reduce
+# interval, which they reduce in place from a contiguous (outer, reduce, inner)
+# view: the fp32 middle sum and the variance moment reduction. Python mirrors
+# the condition in `aten_fast._reduce_middle_direct_ok`.
 #
 # Raw-pointer calling convention (see elementwise_ops.mojo / nn_ops.mojo):
 # tensor operands arrive as element-aligned int addresses, sizes and dtypes as
@@ -31,7 +35,7 @@ from std.gpu import (
 )
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
-from std.math import exp, log
+from std.math import ceildiv, exp, log
 from std.memory import stack_allocation
 from std.memory.unsafe import bitcast
 from std.python import PythonObject
@@ -123,6 +127,26 @@ comptime LIB_MAX_ROWS = 128
 @always_inline
 def _use_library_reduce(rows: Int, cols: Int) -> Bool:
     return rows <= LIB_MAX_ROWS and cols >= LIB_MIN_COLS
+
+
+@always_inline
+def _vec16_phase[dtype: DType](addr: Int) -> Int:
+    """Element offset of `addr` inside its own 16-byte block, or -1 when `addr`
+    is not even element-aligned.
+
+    A 128-bit access is legal only at an address that is a multiple of 16, so
+    this — and not the column index — is what decides where a row's vectorized
+    body may start: element index `j` of a buffer sits at a 16-byte boundary iff
+    `(phase + j) % V == 0`, which collapses to `j % V == 0` only for a buffer
+    whose own base is 16-byte aligned.
+
+    Shared by the log-softmax row pass and the moment reduction below; both
+    walk a runtime sub-range of a buffer whose base phase they do not control.
+    """
+    comptime esize = size_of[dtype]()
+    if addr % esize != 0:
+        return -1
+    return (addr % 16) // esize
 
 
 @always_inline
@@ -655,84 +679,603 @@ def _minmax_idx_rows[
             raise Error("no GPU accelerator available at compile time")
 
 
+# ---------------------------------------------------------------------------
+# Variance: a single generic (outer, reduce, inner) moment reduction.
+# Covers aten.var.correction for every layout and regime with ONE mechanism
+# rather than a kernel per benchmark shape.
+#
+# The reduced axis is an arbitrary interval of a contiguous tensor, so element
+# (o, r, i) sits at `(o * reduce + r) * inner + i` and output (o, i) at
+# `o * inner + i`. `inner == 1` is a reduction over the trailing dims (rows of
+# a (rows, cols) buffer, full reductions being rows == 1); `inner > 1` is a
+# reduction over an interior/leading interval, which used to cost a full
+# permuted materialization in Python before the kernel even started.
+#
+# Three axes of genericity, all comptime or runtime parameters — no shape is
+# ever baked in:
+#
+#   * dtype       — bf16 / f16 / f32 (comptime), accumulating in float32.
+#   * layout      — `_moments_contig_kernel` when the reduced axis is the
+#                   contiguous one (16-byte vector loads, one block per
+#                   (output, split)); `_moments_strided_kernel` when it is
+#                   not (one thread per output column, so the loads coalesce
+#                   along `inner` and no transpose is materialized).
+#   * split count — chosen at launch from the RUNTIME sm count so a reduction
+#                   with too few outputs to fill the device (the extreme being
+#                   a full reduction: one output) still runs on the whole GPU.
+#                   splits == 1 finalizes inside stage 1 and launches nothing
+#                   else; splits > 1 writes partials to a workspace that a
+#                   merge kernel reduces. A workspace + a separate reduce is
+#                   preferred to `Atomic.fetch_add` (sequentially consistent by
+#                   default) and is deterministic.
+#
+# Both stage-1 kernels read the input exactly ONCE, accumulating the moment
+# pair (sum of deviations, sum of squared deviations) about an assumed mean K
+# — the first element of the reduced slice, which every split of the same
+# output re-reads so partials merge by plain addition:
+#
+#   s = sum(x - K)   q = sum((x - K)^2)   M2 = q - s^2/n   var = M2/(n - corr)
+#
+# The shift is what makes one pass safe: with K = 0 the two terms of `M2`
+# cancel catastrophically on data with a large mean (x ~ 1e6 + noise loses
+# every significant digit in float32 — measured 3.5e4 relative error for the
+# two-pass predecessor, which suffered the same thing in its float32 mean),
+# while shifting by any value near the mean leaves `q` the same order as the
+# answer. It costs one broadcast load and one subtract per element, and unlike
+# Welford it needs no per-element division and no count bookkeeping in the
+# merge (an empty split contributes the additive identity, 0). Accumulation
+# stays float32, matching torch's accumulator; the finalize deliberately does
+# NOT use float64, which Apple GPUs cannot execute.
+#
+# Choosing K from the data is what makes it cheap and also what makes it
+# fallible: an element is *usually* near the mean, but if the slice's first
+# element happens to be a wild outlier then K is the worst shift available and
+# `M2` cancels just as badly as K = 0 would (a slice of N(0,1) whose x[0] is
+# 1e6 measured 37% error). So the moments are **adaptive**: the point where
+# the merged (s, q) for an output first exists is also the point where the
+# accurate mean `K + s/n` first exists, and `_moment_cancels` tests right
+# there whether the subtraction kept enough bits. If it did not, that output —
+# and only that output — is read a second time about the accurate mean, which
+# leaves no cancellation at all. Well-conditioned data never pays it (the
+# check is a compare on values already in registers), the pathological case
+# pays exactly 2x bandwidth, and the decision is made entirely on the device:
+# for a single-split reduction the block already holds its whole slice and
+# simply scans again, and for a split reduction the merge records a per-output
+# flag that a second scan+merge pair consumes.
+# ---------------------------------------------------------------------------
+
+comptime MOMENT_THREADS = 256
+
+# Stage-1 blocks in flight targeted when the reduction has too few outputs to
+# fill the device on its own. FITTED ON AN H100 PCIe (132 SMs) and nowhere
+# else; scaling by the runtime `sm_count` keeps the shape of the grid — not
+# its absolute size — portable, but the position of the optimum below is this
+# card's. Device us over blocks/SM of 1/2/4/8/16:
+#
+#   16.7M full reduction   f32  73.8 48.9 44.5 46.8 46.2
+#                          bf16 15.6 14.5 14.1 18.4 25.3
+#   4096x4096 var(dim=0)   f32    -  50.6 45.6 51.3   -
+#                          bf16   -  25.1 22.7 30.5   -
+#
+# i.e. both layouts and both dtypes bottom out at 4: below it the device is
+# starved, above it the workspace the extra shards write (and stage 2 reads
+# back) costs more than the parallelism buys.
+comptime MOMENT_BLOCKS_PER_SM = 4
+
+# Floor on the reduce extent handed to one split of the strided kernel. Below
+# a few rows the workspace slot costs more than the shard computes.
+comptime MOMENT_MIN_ROWS_PER_SPLIT = 8
+
+# Cancellation budget for `M2 = q - s^2/n`: re-read a slice about its accurate
+# mean once `q / M2` exceeds this, i.e. once more than 4 of float32's 24
+# significand bits have been eaten by the subtraction. Not fitted to any card
+# — it is a property of the float32 format, and the two ends of the trade are:
+#
+#   * how often the second read is paid. `q/M2 = 1 + (K - mean)^2 / var`, so
+#     tripping 16 needs the slice's FIRST element to sit 3.9 standard
+#     deviations from its mean. Uniform data (every benchmarked case) tops out
+#     at q/M2 = 4 and never re-passes; Gaussian data re-passes one slice in
+#     ~1e4.
+#   * the error left when it does not trip. Bounded by 16x the accumulator's
+#     own relative error (~4e-7 measured at n = 2^22), i.e. ~6e-6 — still an
+#     order of magnitude better than torch's own worst measured case (2.2e-4,
+#     a 2048x2048 dim=0 reduction of N(1e4,1)).
+comptime MOMENT_CANCEL_RATIO = Float32(16)
+
+
 @always_inline
-# ---------------------------------------------------------------------------
-# Row-wise variance (two-pass mean then squared deviations, float32 accum),
-# divided by (cols - correction). Covers aten.var.correction.
-# ---------------------------------------------------------------------------
+def _moment_finish[
+    dtype: DType
+](s: Float32, q: Float32, n: Int, correction: Float32) -> Scalar[dtype]:
+    """(sum of deviations, sum of squared deviations) about an assumed mean,
+    over `n` elements -> the corrected variance.
+
+    `max(n - correction, 0)` and the resulting inf/nan for a divisor of zero
+    are torch's own rule (`WelfordOps::project` in SharedReduceOps.h): a
+    1-element sample with correction=1 is nan there and nan here. M2 is
+    clamped at 0 because the subtraction can land a few ulps below zero on a
+    constant slice, and a negative variance would poison a downstream sqrt.
+    """
+    var nf = Float32(n)
+    var m2 = q - s * s / nf
+    if m2 < 0:  # a few ulps below zero on a constant slice; nan passes through
+        m2 = Float32(0)
+    var divisor = nf - correction
+    if divisor < 0:
+        divisor = Float32(0)
+    return (m2 / divisor).cast[dtype]()
+
+
+@always_inline
+def _moment_cancels(s: Float32, q: Float32, n: Int) -> Bool:
+    """Did `M2 = q - s^2/n` lose too much of the significand to be trusted?
+
+    `q >= s^2/n` always (Cauchy-Schwarz), so the subtraction is pure
+    cancellation and destroys about `log2(q / M2)` bits. `q / M2` equals
+    `1 + (K - mean)^2 / var`, so it is a direct measure of how bad the assumed
+    mean K was: it stays near 1 for any K within a standard deviation of the
+    mean and explodes when K is an outlier — which is exactly the case a
+    single-pass shifted formulation cannot survive on its own (a slice whose
+    FIRST element is 1e6 while the rest are N(0,1) reaches q/M2 = 4e6, i.e.
+    22 of float32's 24 bits gone and a 37% error). The caller answers a true
+    here by re-reading the slice about the now-known accurate mean, which
+    leaves no cancellation at all.
+
+    A `q` of exactly 0 (constant slice) reports false and stays exact; a nan
+    reports true and re-passes to the same nan.
+    """
+    return not ((q - s * s / Float32(n)) * MOMENT_CANCEL_RATIO >= q)
+
+
+@always_inline
+def _moment_flag_repass[
+    dtype: DType
+](
+    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    o: Int,
+    outputs: Int,
+    meta: Int,
+    reduce_n: Int,
+    inner: Int,
+    s: Float32,
+    q: Float32,
+):
+    """Record, for output `o`, whether its merged moments need a second read
+    and what shift that read should use.
+
+    The two meta slots live past the partials: `ws[meta + o]` is the accurate
+    mean (the old shift plus `s / n`) and `ws[meta + outputs + o]` is the
+    flag. The old shift is not carried through the workspace — it is the first
+    element of the slice, one broadcast load away.
+    """
+    if _moment_cancels(s, q, reduce_n):
+        var base = _moment_slice_base(o, reduce_n, inner)
+        ws_ptr[meta + o] = in_ptr[base].cast[DType.float32]() + s / Float32(
+            reduce_n
+        )
+        ws_ptr[meta + outputs + o] = Float32(1)
+    else:
+        ws_ptr[meta + outputs + o] = Float32(0)
+
+
+@always_inline
+def _moment_slice_base(o: Int, reduce_n: Int, inner: Int) -> Int:
+    """Flat index of the first element of output `o`'s reduced slice.
+
+    Collapses to `o * reduce_n` when the reduced axis is the contiguous one.
+    """
+    return (o // inner) * reduce_n * inner + (o % inner)
+
+
+@always_inline
+def _moments_scan_contig[
+    dtype: DType, //, V: Int, vec_align: Int
+](
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    start: Int,
+    n: Int,
+    head: Int,
+    n_vec: Int,
+    vec_start: Int,
+    tail_start: Int,
+    tid: Int,
+    shift: Float32,
+    mut s_t: Float32,
+    mut q_t: Float32,
+):
+    """One thread's share of a contiguous shard, as moments about `shift`.
+
+    16-byte vector body plus the scalar head and tail the buffer's own
+    alignment phase leaves over. The partition arguments are shift-independent
+    so a caller that has to re-scan about a corrected shift passes the same
+    ones back in.
+    """
+    s_t = Float32(0)
+    q_t = Float32(0)
+    if n <= 0:
+        return
+    var s_vec = SIMD[DType.float32, V](0)
+    var q_vec = SIMD[DType.float32, V](0)
+    var v = tid
+    while v < n_vec:
+        var d = (
+            in_ptr.load[width=V, alignment=vec_align](vec_start + v * V).cast[
+                DType.float32
+            ]()
+            - shift
+        )
+        s_vec += d
+        q_vec = d.fma(d, q_vec)
+        v += MOMENT_THREADS
+    s_t = s_vec.reduce_add()
+    q_t = q_vec.reduce_add()
+
+    var jh = tid
+    while jh < head:
+        var d = in_ptr[start + jh].cast[DType.float32]() - shift
+        s_t += d
+        q_t += d * d
+        jh += MOMENT_THREADS
+    var jt = tail_start + tid
+    while jt < n:
+        var d = in_ptr[start + jt].cast[DType.float32]() - shift
+        s_t += d
+        q_t += d * d
+        jt += MOMENT_THREADS
 
 
 @__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(MOMENT_THREADS))
 )
-@__name(t"var_rows_block_{dtype}")
-def _var_rows_block_kernel[
+@__name(t"shifted_moments_contig_{dtype}")
+def _moments_contig_kernel[
     dtype: DType
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     cols_arg: Int64,
+    outputs_arg: Int64,
+    splits_arg: Int64,
+    repass_arg: Int64,
     correction: Float32,
 ):
+    """Reduced axis contiguous: block (x=output, y=split) walks its shard of
+    one row with 16-byte vector loads and block-reduces the moment pair.
+
+    `ws_ptr` is only touched when splits > 1; the launcher passes a null
+    pointer for the fused single-split case, which writes the finished
+    variance straight to `out_ptr` and needs no second launch. That fused case
+    also handles its own cancellation re-pass in-block, for free — the block
+    owns the whole slice, so it just scans it again about the corrected shift.
+
+    `repass_arg != 0` is the split case's second read: the shift comes from
+    the meta slots the merge kernel filled in, and a block whose output was
+    not flagged exits without reading anything else.
+    """
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
     var cols = Int(cols_arg)
-    var r = block_idx.x
-    var tid = thread_idx.x
-    var base = r * cols
+    var outputs = Int(outputs_arg)
+    var splits = Int(splits_arg)
+    var repass = Int(repass_arg) != 0
+    comptime V = 16 // size_of[dtype]()
+    comptime vec_align = V * size_of[dtype]()  # 16 bytes
+    var tid = Int(thread_idx.x)
+    var row = Int(block_idx.x)
+    var split = Int(block_idx.y)
+    var base = row * cols
 
-    var red = stack_allocation[
-        ROWRED_THREADS, DType.float32, address_space=AddressSpace.SHARED
-    ]()
-    var bcast = stack_allocation[
-        1, DType.float32, address_space=AddressSpace.SHARED
-    ]()
+    # Assumed mean: the row's first element, identical in every split of this
+    # row so the partial moment pairs merge by addition. On a re-pass it is
+    # the accurate mean instead, which leaves no cancellation to correct.
+    var shift = in_ptr[base].cast[DType.float32]()
+    if repass:
+        # Uniform across the block: an early exit here cannot desynchronize
+        # the barriers inside `block.sum` below.
+        if ws_ptr[2 * splits * outputs + outputs + row] == 0:
+            return
+        shift = ws_ptr[2 * splits * outputs + row]
+
+    # This split's shard of the row. The last shard may be empty (splits does
+    # not divide cols); an empty shard contributes (0, 0), the identity.
+    var chunk = ceildiv(cols, splits)
+    var j0 = split * chunk
+    var j1 = min(cols, j0 + chunk)
+    var fused = splits == 1 and not repass
+
+    # Head/body/tail split on the ADDRESS, not on the column index: the shard
+    # start has whatever 16-byte phase `in_ptr` and `j0` give it. None of it
+    # depends on the shift, so it is computed once and the re-pass below
+    # re-walks the same partition.
+    var start = base + j0
+    var n = j1 - j0
+    var phase = _vec16_phase[dtype](Int(in_ptr))
+    var head = n
+    var n_vec = 0
+    if phase >= 0:
+        head = (V - (phase + start) % V) % V
+        if head > n:
+            head = n
+        n_vec = (n - head) // V
+    var vec_start = start + head
+    var tail_start = head + n_vec * V
+
+    var s_t = Float32(0)
+    var q_t = Float32(0)
+    _moments_scan_contig[V=V, vec_align=vec_align](
+        in_ptr,
+        start,
+        n,
+        head,
+        n_vec,
+        vec_start,
+        tail_start,
+        tid,
+        shift,
+        s_t,
+        q_t,
+    )
+    # The block reductions are outside the shard guard inside the scan: every
+    # thread of the block must reach them (they barrier internally).
+    var bs = block.sum[block_size=MOMENT_THREADS](s_t)
+    var bq = block.sum[block_size=MOMENT_THREADS](q_t)
+
+    # Cold path, kept off the straight line above: `block.sum` broadcasts, so
+    # the whole block agrees, and a second read about the now-known accurate
+    # mean removes the cancellation entirely.
+    if fused and _moment_cancels(bs, bq, cols):
+        _moments_scan_contig[V=V, vec_align=vec_align](
+            in_ptr,
+            start,
+            n,
+            head,
+            n_vec,
+            vec_start,
+            tail_start,
+            tid,
+            shift + bs / Float32(cols),
+            s_t,
+            q_t,
+        )
+        bs = block.sum[block_size=MOMENT_THREADS](s_t)
+        bq = block.sum[block_size=MOMENT_THREADS](q_t)
+
+    if tid == 0:
+        if fused:
+            out_ptr[row] = _moment_finish[dtype](bs, bq, cols, correction)
+        else:
+            ws_ptr[split * outputs + row] = bs
+            ws_ptr[(splits + split) * outputs + row] = bq
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(MOMENT_THREADS))
+)
+@__name(t"shifted_moments_strided_{dtype}")
+def _moments_strided_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    reduce_arg: Int64,
+    inner_arg: Int64,
+    outputs_arg: Int64,
+    splits_arg: Int64,
+    repass_arg: Int64,
+    correction: Float32,
+):
+    """Reduced axis strided: one thread per output column, walking down the
+    reduced axis with stride `inner`.
+
+    Consecutive threads read consecutive addresses, so every step of the walk
+    is a fully coalesced load — which is the whole point: reducing a leading
+    dimension in place costs one pass over the input instead of a permuted
+    copy plus a trailing-dim reduction. Block (x = outer * column-tile,
+    y = split); no block reduction is needed because a thread owns its output
+    outright, so the cancellation re-pass of the fused single-split case is a
+    per-thread decision with no barrier to respect.
+    """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var reduce_n = Int(reduce_arg)
+    var inner = Int(inner_arg)
+    var outputs = Int(outputs_arg)
+    var splits = Int(splits_arg)
+    var repass = Int(repass_arg) != 0
+
+    var tiles = ceildiv(inner, MOMENT_THREADS)
+    var blk = Int(block_idx.x)
+    var outer_index = blk // tiles
+    var i = (blk % tiles) * MOMENT_THREADS + Int(thread_idx.x)
+    if i >= inner:
+        return
+
+    var chunk = ceildiv(reduce_n, splits)
+    var split = Int(block_idx.y)
+    var r0 = split * chunk
+    var r1 = min(reduce_n, r0 + chunk)
+
+    var base = outer_index * reduce_n * inner + i
+    var out_index = outer_index * inner + i
+    var shift = in_ptr[base].cast[DType.float32]()
+    if repass:
+        if ws_ptr[2 * splits * outputs + outputs + out_index] == 0:
+            return
+        shift = ws_ptr[2 * splits * outputs + out_index]
+    var fused = splits == 1 and not repass
 
     var s = Float32(0)
-    for j in range(tid, cols, ROWRED_THREADS):
-        s += in_ptr[base + j].cast[DType.float32]()
-    red[tid] = s
-    barrier()
-    var stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            red[tid] += red[tid + stride]
-        barrier()
-        stride //= 2
-    if tid == 0:
-        bcast[0] = red[0] / Float32(cols)
-    barrier()
-    var mean = bcast[0]
+    var q = Float32(0)
+    for r in range(r0, r1):
+        var d = in_ptr[base + r * inner].cast[DType.float32]() - shift
+        s += d
+        q += d * d
 
-    var vs = Float32(0)
-    for j in range(tid, cols, ROWRED_THREADS):
-        var d = in_ptr[base + j].cast[DType.float32]() - mean
-        vs += d * d
-    red[tid] = vs
-    barrier()
-    stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            red[tid] += red[tid + stride]
-        barrier()
-        stride //= 2
+    # Cold path: a second read about the now-known accurate mean, for the rare
+    # column whose first element was a poor stand-in for its own mean.
+    if fused and _moment_cancels(s, q, reduce_n):
+        shift += s / Float32(reduce_n)
+        s = Float32(0)
+        q = Float32(0)
+        for r in range(r0, r1):
+            var d = in_ptr[base + r * inner].cast[DType.float32]() - shift
+            s += d
+            q += d * d
+
+    if fused:
+        out_ptr[out_index] = _moment_finish[dtype](s, q, reduce_n, correction)
+    else:
+        ws_ptr[split * outputs + out_index] = s
+        ws_ptr[(splits + split) * outputs + out_index] = q
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(MOMENT_THREADS))
+)
+@__name(t"shifted_moments_merge_thread_{dtype}")
+def _moments_merge_thread_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    outputs_arg: Int64,
+    splits_arg: Int64,
+    reduce_arg: Int64,
+    inner_arg: Int64,
+    repass_arg: Int64,
+    correction: Float32,
+):
+    """Stage 2 for many outputs: one thread per output sums its `splits`
+    partials. The workspace is laid out split-major, so the threads of a warp
+    read consecutive addresses at every step.
+
+    On the first merge this is also where the split path decides whether its
+    assumed mean was good enough: an output whose moments cancelled gets its
+    flag set and the accurate mean written beside it, and the re-pass launch
+    that follows re-reads only those slices. On the second merge
+    (`repass_arg != 0`) an unflagged output is left exactly as the first merge
+    wrote it."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var outputs = Int(outputs_arg)
+    var splits = Int(splits_arg)
+    var reduce_n = Int(reduce_arg)
+    var meta = 2 * splits * outputs
+    var o = Int(block_idx.x) * MOMENT_THREADS + Int(thread_idx.x)
+    if o >= outputs:
+        return
+    if Int(repass_arg) != 0 and ws_ptr[meta + outputs + o] == 0:
+        return
+    var s = Float32(0)
+    var q = Float32(0)
+    for k in range(splits):
+        s += ws_ptr[k * outputs + o]
+        q += ws_ptr[(splits + k) * outputs + o]
+    out_ptr[o] = _moment_finish[dtype](s, q, reduce_n, correction)
+    if Int(repass_arg) == 0:
+        _moment_flag_repass[dtype](
+            ws_ptr, in_ptr, o, outputs, meta, reduce_n, Int(inner_arg), s, q
+        )
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(MOMENT_THREADS))
+)
+@__name(t"shifted_moments_merge_block_{dtype}")
+def _moments_merge_block_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    outputs_arg: Int64,
+    splits_arg: Int64,
+    reduce_arg: Int64,
+    inner_arg: Int64,
+    repass_arg: Int64,
+    correction: Float32,
+):
+    """Stage 2 for few outputs (the full-reduction end of the range): one
+    block per output tree-reduces the split partials, because a single thread
+    walking hundreds of them would serialize the tail of the launch. Flags the
+    cancellation re-pass exactly like the thread-per-output merge above."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var outputs = Int(outputs_arg)
+    var splits = Int(splits_arg)
+    var reduce_n = Int(reduce_arg)
+    var meta = 2 * splits * outputs
+    var o = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    # Uniform across the block (every thread reads the same flag), so this
+    # early exit cannot desynchronize the barriers inside `block.sum`.
+    if Int(repass_arg) != 0 and ws_ptr[meta + outputs + o] == 0:
+        return
+    var s = Float32(0)
+    var q = Float32(0)
+    for k in range(tid, splits, MOMENT_THREADS):
+        s += ws_ptr[k * outputs + o]
+        q += ws_ptr[(splits + k) * outputs + o]
+    var bs = block.sum[block_size=MOMENT_THREADS](s)
+    var bq = block.sum[block_size=MOMENT_THREADS](q)
     if tid == 0:
-        out_ptr[r] = (red[0] / (Float32(cols) - correction)).cast[dtype]()
+        out_ptr[o] = _moment_finish[dtype](bs, bq, reduce_n, correction)
+        if Int(repass_arg) == 0:
+            _moment_flag_repass[dtype](
+                ws_ptr,
+                in_ptr,
+                o,
+                outputs,
+                meta,
+                reduce_n,
+                Int(inner_arg),
+                bs,
+                bq,
+            )
 
 
 @always_inline
-def _var_rows[
+def _moment_splits(
+    base_blocks: Int, reduce_n: Int, min_per_split: Int, target: Int
+) -> Int:
+    """How many ways to split the reduced axis so the grid fills the device.
+
+    `base_blocks` is the grid the layout produces with no splitting at all
+    (one block per output for the contiguous kernel, one per column tile for
+    the strided one). Splitting is pure overhead once that already fills the
+    device, so it only kicks in below `target` — derived by the caller from
+    the runtime sm count — and never shards the reduced axis finer than
+    `min_per_split` elements.
+    """
+    if base_blocks >= target or reduce_n < 2 * min_per_split:
+        return 1
+    var by_fill = ceildiv(target, base_blocks)
+    var by_work = reduce_n // min_per_split
+    var splits = min(by_fill, by_work)
+    return max(splits, 1)
+
+
+@always_inline
+def _var_moments[
     dtype: DType
 ](
     out_addr: Int,
     in_addr: Int,
-    rows: Int,
-    cols: Int,
+    outer: Int,
+    reduce_n: Int,
+    inner: Int,
     correction: Float32,
     ctx: DeviceContext,
 ) raises:
+    """Variance of `in` viewed as (outer, reduce_n, inner) into `outer*inner`
+    contiguous outputs."""
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
+    var outputs = outer * inner
 
     if ctx.api() == "cpu":
 
@@ -740,35 +1283,184 @@ def _var_rows[
         @parameter
         @__copy_capture(out_ptr, in_ptr)
         def func[width: Int, alignment: Int = 1](idx: Coord):
-            var r = Int(idx[0].value())
-            var base = r * cols
-            var total = Float32(0)
-            for j in range(cols):
-                total += in_ptr[base + j].cast[DType.float32]()
-            var mean = total / Float32(cols)
-            var var_sum = Float32(0)
-            for j in range(cols):
-                var d = in_ptr[base + j].cast[DType.float32]() - mean
-                var_sum += d * d
-            out_ptr[r] = (var_sum / (Float32(cols) - correction)).cast[dtype]()
+            var o = Int(idx[0].value())
+            var base = _moment_slice_base(o, reduce_n, inner)
+            var shift = in_ptr[base].cast[DType.float32]()
+            var s = Float32(0)
+            var q = Float32(0)
+            # Same adaptive re-pass as the GPU path: a second read only when
+            # the first element turned out to be a poor stand-in for the mean.
+            for _ in range(2):
+                s = Float32(0)
+                q = Float32(0)
+                for r in range(reduce_n):
+                    var d = (
+                        in_ptr[base + r * inner].cast[DType.float32]() - shift
+                    )
+                    s += d
+                    q += d * d
+                if not _moment_cancels(s, q, reduce_n):
+                    break
+                shift += s / Float32(reduce_n)
+            out_ptr[o] = _moment_finish[dtype](s, q, reduce_n, correction)
 
-        _parallel_for[func](rows, ctx)
+        _parallel_for[func](outputs, ctx)
+        return
+
+    comptime if has_accelerator():
+        comptime sm_count = ctx.default_device_info.sm_count
+        var target = MOMENT_BLOCKS_PER_SM * sm_count
+        var mout = out_ptr.as_unsafe_any_origin()
+        var min_ = in_ptr.as_unsafe_any_origin().as_immutable()
+
+        var base_blocks = outputs
+        # The contiguous kernel wants a whole 16-byte vector per thread before
+        # a shard is worth its own block; the strided kernel wants a few rows.
+        var min_per_split = MOMENT_THREADS * (16 // size_of[dtype]())
+        if inner != 1:
+            base_blocks = outer * ceildiv(inner, MOMENT_THREADS)
+            min_per_split = MOMENT_MIN_ROWS_PER_SPLIT
+        var splits = _moment_splits(
+            base_blocks, reduce_n, min_per_split, target
+        )
+
+        if splits == 1:
+            # Fused: stage 1 writes the finished variance -- including its own
+            # cancellation re-pass, which the block can do in place because it
+            # owns the whole slice. `ws` is never touched.
+            var no_ws = _make_ptr[DType.float32](0).as_unsafe_any_origin()
+            if inner == 1:
+                _enqueue_cached[_moments_contig_kernel[dtype]](
+                    ctx,
+                    String(t"moments_contig_{dtype}"),
+                    base_blocks,
+                    1,
+                    1,
+                    MOMENT_THREADS,
+                    mout,
+                    no_ws,
+                    min_,
+                    Int64(reduce_n),
+                    Int64(outputs),
+                    Int64(1),
+                    Int64(0),
+                    correction,
+                )
+            else:
+                _enqueue_cached[_moments_strided_kernel[dtype]](
+                    ctx,
+                    String(t"moments_strided_{dtype}"),
+                    base_blocks,
+                    1,
+                    1,
+                    MOMENT_THREADS,
+                    mout,
+                    no_ws,
+                    min_,
+                    Int64(reduce_n),
+                    Int64(inner),
+                    Int64(outputs),
+                    Int64(1),
+                    Int64(0),
+                    correction,
+                )
+            return
+
+        # Split: partials to a stream-ordered workspace, merged by stage 2.
+        # Two meta slots per output sit past the partials: the accurate mean
+        # and the cancellation flag the merge writes.
+        var ws = ctx.enqueue_create_buffer[DType.float32](
+            2 * outputs * splits + 2 * outputs
+        )
+        var ws_ptr = ws.unsafe_ptr().as_unsafe_any_origin()
+        # Pass 0 assumes each slice's first element is a usable mean; its merge
+        # flags the outputs where `q - s^2/n` cancelled and records the mean it
+        # now knows exactly, and pass 1 re-reads ONLY those slices. Both passes
+        # are enqueued unconditionally because the decision is made on the
+        # device — testing it on the host would need a sync. With nothing
+        # flagged (every benchmarked case, and any data whose first element is
+        # within 3.9 sigma of its mean) pass 1 is two launches whose blocks
+        # read one float and exit.
+        for repass in range(2):
+            if inner == 1:
+                _enqueue_cached[_moments_contig_kernel[dtype]](
+                    ctx,
+                    String(t"moments_contig_{dtype}"),
+                    base_blocks,
+                    splits,
+                    1,
+                    MOMENT_THREADS,
+                    mout,
+                    ws_ptr,
+                    min_,
+                    Int64(reduce_n),
+                    Int64(outputs),
+                    Int64(splits),
+                    Int64(repass),
+                    correction,
+                )
+            else:
+                _enqueue_cached[_moments_strided_kernel[dtype]](
+                    ctx,
+                    String(t"moments_strided_{dtype}"),
+                    base_blocks,
+                    splits,
+                    1,
+                    MOMENT_THREADS,
+                    mout,
+                    ws_ptr,
+                    min_,
+                    Int64(reduce_n),
+                    Int64(inner),
+                    Int64(outputs),
+                    Int64(splits),
+                    Int64(repass),
+                    correction,
+                )
+
+            # Few outputs cannot keep the device busy one thread each, so they
+            # get a block apiece; many outputs would waste 255 of every 256
+            # threads that way and get a thread apiece instead.
+            if outputs <= sm_count:
+                _enqueue_cached[_moments_merge_block_kernel[dtype]](
+                    ctx,
+                    String(t"moments_merge_block_{dtype}"),
+                    outputs,
+                    1,
+                    1,
+                    MOMENT_THREADS,
+                    mout,
+                    ws_ptr,
+                    min_,
+                    Int64(outputs),
+                    Int64(splits),
+                    Int64(reduce_n),
+                    Int64(inner),
+                    Int64(repass),
+                    correction,
+                )
+            else:
+                _enqueue_cached[_moments_merge_thread_kernel[dtype]](
+                    ctx,
+                    String(t"moments_merge_thread_{dtype}"),
+                    ceildiv(outputs, MOMENT_THREADS),
+                    1,
+                    1,
+                    MOMENT_THREADS,
+                    mout,
+                    ws_ptr,
+                    min_,
+                    Int64(outputs),
+                    Int64(splits),
+                    Int64(reduce_n),
+                    Int64(inner),
+                    Int64(repass),
+                    correction,
+                )
+        # Dropping `ws` schedules a stream-ordered free after the kernels.
+        _ = ws^
     else:
-        comptime if has_accelerator():
-            _enqueue_cached[_var_rows_block_kernel[dtype]](
-                ctx,
-                String(t"var_rows_{dtype}"),
-                rows,
-                1,
-                1,
-                ROWRED_THREADS,
-                out_ptr.as_unsafe_any_origin(),
-                in_ptr.as_unsafe_any_origin().as_immutable(),
-                Int64(cols),
-                correction,
-            )
-        else:
-            raise Error("no GPU accelerator available at compile time")
+        raise Error("no GPU accelerator available at compile time")
 
 
 # ---------------------------------------------------------------------------
@@ -820,23 +1512,6 @@ def _lsm_store_out_16B[
         ptr.store[width=width, alignment=vec_align](val)
 
 
-@always_inline
-def _lsm_vec_phase[dtype: DType](addr: Int) -> Int:
-    """Element offset of `addr` inside its own 16-byte block, or -1 when `addr`
-    is not even element-aligned.
-
-    A 128-bit access is legal only at an address that is a multiple of 16, so
-    this — and not the column index — is what decides where a row's vectorized
-    body may start: element index `j` of a buffer sits at a 16-byte boundary iff
-    `(phase + j) % V == 0`, which collapses to `j % V == 0` only for a buffer
-    whose own base is 16-byte aligned.
-    """
-    comptime esize = size_of[dtype]()
-    if addr % esize != 0:
-        return -1
-    return (addr % 16) // esize
-
-
 # Fused online (single-read) log-softmax. The reduction reads each row ONCE
 # (vectorized 16-byte loads; per-lane running max m + running sum s rescaled on
 # a new max), then the output pass re-reads that row — kept resident in L2 by
@@ -869,8 +1544,8 @@ def _log_softmax_rows_block_kernel[
 
     # 16-byte phase of each buffer, folded into the per-row head length below so
     # every vectorized access lands on a real 16-byte boundary. Loop-invariant.
-    var in_phase = _lsm_vec_phase[dtype](Int(in_ptr))
-    var out_phase = _lsm_vec_phase[dtype](Int(out_ptr))
+    var in_phase = _vec16_phase[dtype](Int(in_ptr))
+    var out_phase = _vec16_phase[dtype](Int(out_ptr))
     # Pass 2 loads and stores the SAME row-local index, so it can keep the
     # 16-byte load only when both buffers share a phase (the aligned hot path
     # has both at 0). Otherwise it keeps the aligned streaming store and gathers
@@ -1426,25 +2101,40 @@ def _var_spec_into_go(
     if a.numel == 0:
         raise Error("mojo spec var: empty input")
     var correction = Float32(_raw_f64(corr_o))
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
+    # One geometry for every layout: an adjacent ascending reduce interval of
+    # a contiguous operand collapses to (outer, reduce, inner), with inner == 1
+    # for the trailing-dims case. A non-adjacent interval never reaches here
+    # with its original dims — Python permutes and materializes first — so the
+    # geometry helper below only has to reproduce the rejection message.
+    var outer = 0
+    var reduce_n = 0
+    var inner = 0
+    if not _adjacent_reduce_geom(a, rdims_t, outer, reduce_n, inner):
+        var rows = 0
+        var cols = 0
+        var out_rank = 0
+        var oshape = IndexList[MAX_RANK](1)
+        _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
+        outer = rows
+        reduce_n = cols
+        inner = 1
 
     var ctx = a.ctx()
-    var nbytes = rows * a.itemsize
+    var outputs = outer * inner
+    var nbytes = outputs * a.itemsize
     _ = nbytes
-    if out.numel != rows or not out.contig or out.ctx_ptr != a.ctx_ptr:
+    if out.numel != outputs or not out.contig or out.ctx_ptr != a.ctx_ptr:
         raise Error("mojo spec into: output buffer mismatch")
     if out.dtype != a.dtype:
         raise Error("mojo spec into: output dtype mismatch")
     var addr = out.ptr
-    if rows > 0:
+    if outputs > 0:
         comptime for dt in FLOAT_DTYPES:
             comptime if _dtype_arg_on[0, dt]():
                 if a.dtype == dt:
-                    _var_rows[dt](addr, a.ptr, rows, cols, correction, ctx)
+                    _var_moments[dt](
+                        addr, a.ptr, outer, reduce_n, inner, correction, ctx
+                    )
 
 
 def _anyall_spec_into_go[

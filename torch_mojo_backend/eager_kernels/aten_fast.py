@@ -363,18 +363,28 @@ def _reduce_ready_operand(
     return view._contig(), trailing
 
 
-def _sum_middle_direct_ok(
+# Reduce specs whose Mojo bridge reduces an adjacent NON-trailing dim interval
+# in place, mapped to the operand dtypes that route there: reduction_ops'
+# SumSpec has a direct fp32 middle-sum kernel, VarSpec a strided-axis moment
+# kernel for every float dtype.  Everything else still pays the Python-side
+# permute + materialize.
+_REDUCE_MIDDLE_DIRECT: dict[tuple[str, str], frozenset[DType]] = {
+    ("reduction_ops", "SumSpec"): frozenset({DType.float32}),
+    ("reduction_ops", "VarSpec"): frozenset(_FLOAT_DTYPES),
+}
+
+
+def _reduce_middle_direct_ok(
     spec_fn_name: str, module_name: str, a: TorchMojoTensor, dims: tuple[int, ...]
 ) -> bool:
     """Whether the bridge's zero-copy direct kernel takes this reduction.
 
-    Mirrors reduction_ops' early exit exactly: a contiguous fp32 SumSpec
-    over one adjacent, ascending, NON-trailing dim interval on an
-    accelerator. Those calls skip Python-side materialization — the direct
-    kernel reads the source in place and allocates nothing."""
-    if spec_fn_name != "SumSpec" or module_name != "reduction_ops":
-        return False
-    if a._dtype != DType.float32 or not a._is_contiguous:
+    Mirrors the bridges' early exits exactly: a contiguous operand of a
+    supported dtype reduced over one adjacent, ascending, NON-trailing dim
+    interval on an accelerator. Those calls skip Python-side materialization
+    — the direct kernel reads the source in place and allocates nothing."""
+    dtypes = _REDUCE_MIDDLE_DIRECT.get((module_name, spec_fn_name))
+    if dtypes is None or a._dtype not in dtypes or not a._is_contiguous:
         return False
     if getattr(a._device, "api", "cpu") == "cpu":
         return False
@@ -1883,7 +1893,7 @@ def _try_spec_reduce(
     ):
         return None  # the bridge would reject the dim spec anyway
     original_shape = tuple(a._shape)
-    if _sum_middle_direct_ok(spec_fn_name, module_name, a, dims):
+    if _reduce_middle_direct_ok(spec_fn_name, module_name, a, dims):
         ready_dims = dims  # zero-copy direct kernel reads the source in place
     else:
         a, ready_dims = _reduce_ready_operand(a, dims)
