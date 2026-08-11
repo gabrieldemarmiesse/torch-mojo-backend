@@ -23,7 +23,7 @@
 
 from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import (
     acos,
     atanh,
@@ -55,7 +55,7 @@ from std.utils.index import IndexList
 from std.utils.coord import Coord
 from std.utils.numerics import isnan
 
-from std.algorithm.functional import elementwise
+from max.algorithm import elementwise
 
 from foreach_clip_contract import (
     FOREACH_CHUNK_ELEMENTS,
@@ -127,8 +127,11 @@ def _bin_contig_kernel4[
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     lhs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     rhs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    n4: Int,
+    n4_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var n4 = Int(n4_arg)
     comptime vec_align = 4 * size_of[dtype]()
     var c = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
@@ -158,8 +161,11 @@ def _bin_contig_kernel[
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     lhs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     rhs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    size: Int,
+    size_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var size = Int(size_arg)
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while i < size:
@@ -236,7 +242,7 @@ def _bin_elementwise[
                             out_ptr.as_unsafe_any_origin(),
                             lhs_ptr.as_unsafe_any_origin().as_immutable(),
                             rhs_ptr.as_unsafe_any_origin().as_immutable(),
-                            n4,
+                            Int64(n4),
                         )
                         return
                     _enqueue_cached[_bin_contig_kernel[dtype, op_code]](
@@ -249,7 +255,7 @@ def _bin_elementwise[
                         out_ptr.as_unsafe_any_origin(),
                         lhs_ptr.as_unsafe_any_origin().as_immutable(),
                         rhs_ptr.as_unsafe_any_origin().as_immutable(),
-                        size,
+                        Int64(size),
                     )
                 else:
                     raise Error("float64 is not supported on GPU")
@@ -423,8 +429,11 @@ def _unary_contig_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    size: Int,
+    size_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var size = Int(size_arg)
     comptime is_direct = (
         op_code == UOP_RELU
         or op_code == UOP_ABS
@@ -500,9 +509,13 @@ def _unary_contig_kernel4[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    size: Int,
-    vec_count: Int,
+    size_arg: Int64,
+    vec_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var size = Int(size_arg)
+    var vec_count = Int(vec_count_arg)
     # Vector body (4-element chunks when the host proved alignment,
     # vec_count == 0 otherwise) plus a grid-stride scalar loop that covers
     # the tail — or, with vec_count == 0, the entire range.  Each thread
@@ -628,8 +641,8 @@ def _unary_elementwise[
                             GS_THREADS,
                             out_ptr.as_unsafe_any_origin(),
                             in_ptr.as_unsafe_any_origin().as_immutable(),
-                            size,
-                            vec_count,
+                            Int64(size),
+                            Int64(vec_count),
                         )
                         return
                     _enqueue_cached[_unary_contig_kernel[dtype, op_code]](
@@ -641,7 +654,7 @@ def _unary_elementwise[
                         GS_THREADS,
                         out_ptr.as_unsafe_any_origin(),
                         in_ptr.as_unsafe_any_origin().as_immutable(),
-                        size,
+                        Int64(size),
                     )
                 else:
                     raise Error("float64 is not supported on GPU")
@@ -990,9 +1003,11 @@ def _arange_dispatcher(
 # Dtypes the unary spec entries dispatch on for the "direct" (in-dtype) ops
 # and the bool-output ops; the transcendental ops gate down to FLOAT_DTYPES.
 # float64 works on the CPU device (the kernels comptime-refuse it on GPU).
-comptime INT_SCALAR_DTYPES = [DType.int32, DType.int64]
+# Annotated List[DType]: rc1 infers bare `[...]` literals as Array, which no
+# longer binds to variant_gates._dtype_supported's `List[DType]` parameter.
+comptime INT_SCALAR_DTYPES: List[DType] = [DType.int32, DType.int64]
 
-comptime SPEC_UNARY_DTYPES = [
+comptime SPEC_UNARY_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
@@ -1021,7 +1036,7 @@ def _unary_spec_into_go[
     comptime if is_direct:
         supported = _dtype_supported[SPEC_UNARY_DTYPES](a.dtype)
     else:
-        supported = _dtype_supported[FLOAT_DTYPES](a.dtype)
+        supported = _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype)
     if not supported:
         raise Error("mojo spec unary: unsupported dtype ", a.dtype)
 
@@ -1091,7 +1106,7 @@ def _scalar_spec_into_go[
 ](a_o: PyObjectPtr, scalar_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
+    if not _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype):
         raise Error("mojo spec scalar: unsupported dtype ", a.dtype)
 
     var scalar = Float32(_raw_f64(scalar_o))
@@ -1164,7 +1179,7 @@ def _foreach_add_scalar_kernel[
     dtype: DType
 ](
     descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
-    desc_count: Int,
+    desc_count_arg: Int64,
     scalar: Float32,
 ):
     """`t += scalar`, in place, for a whole list of tensors in one launch.
@@ -1178,6 +1193,9 @@ def _foreach_add_scalar_kernel[
     `_scalar_elementwise[dtype, SOP_ADD]` does one tensor at a time, so the
     result is bit-identical to the `add_.Scalar` path this replaces.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var desc_count = Int(desc_count_arg)
     var chunk = Int(block_idx.x)
     var desc, begin, end = _chunk_bounds(descs, desc_count, chunk)
     var values = _make_ptr[dtype](desc.tensor_addr)
@@ -1257,7 +1275,7 @@ def _foreach_add_scalar_go(
                         1,
                         FOREACH_THREADS,
                         descs,
-                        desc_count,
+                        Int64(desc_count),
                         scalar,
                     )
     return _raw_ret_none()

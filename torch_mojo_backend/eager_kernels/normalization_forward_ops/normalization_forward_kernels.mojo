@@ -6,16 +6,10 @@ The frozen contract and harness, not this editable file, define acceptance.
 """
 
 from std.ffi import _get_global_or_null, external_call
-from std.gpu import (
-    WARP_SIZE,
-    block_idx,
-    grid_dim,
-    lane_id,
-    thread_idx,
-    warp_id,
-)
-from std.gpu.host import DeviceContext
-from std.gpu.primitives import block, warp
+from std.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
+from max.gpu.host import DeviceContext
+from max.gpu.primitives import block
+from std.gpu.primitives import warp
 from std.math import ceildiv, min
 from std.memory import alloc
 from std.sys.info import has_apple_gpu_accelerator
@@ -106,13 +100,20 @@ def _ln_fwd_warp_c1(
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
     epsilon: Float32,
-    has_weight: Int,
-    has_bias: Int,
+    has_weight_arg: Int64,
+    has_bias_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
+    var has_bias = Int(has_bias_arg)
     _ln_fwd_warp_rows[1](
         output,
         mean,
@@ -137,13 +138,20 @@ def _ln_fwd_warp_c2(
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
     epsilon: Float32,
-    has_weight: Int,
-    has_bias: Int,
+    has_weight_arg: Int64,
+    has_bias_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
+    var has_bias = Int(has_bias_arg)
     _ln_fwd_warp_rows[2](
         output,
         mean,
@@ -168,13 +176,20 @@ def _ln_fwd_warp_c3(
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
     epsilon: Float32,
-    has_weight: Int,
-    has_bias: Int,
+    has_weight_arg: Int64,
+    has_bias_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
+    var has_bias = Int(has_bias_arg)
     _ln_fwd_warp_rows[3](
         output,
         mean,
@@ -199,13 +214,20 @@ def _ln_fwd_warp_c4(
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
     epsilon: Float32,
-    has_weight: Int,
-    has_bias: Int,
+    has_weight_arg: Int64,
+    has_bias_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
+    var has_bias = Int(has_bias_arg)
     _ln_fwd_warp_rows[4](
         output,
         mean,
@@ -230,13 +252,20 @@ def _ln_fwd_warp_c6(
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
     epsilon: Float32,
-    has_weight: Int,
-    has_bias: Int,
+    has_weight_arg: Int64,
+    has_bias_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
+    var has_bias = Int(has_bias_arg)
     _ln_fwd_warp_rows[6](
         output,
         mean,
@@ -261,13 +290,20 @@ def _ln_fwd_warp_c8(
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
     epsilon: Float32,
-    has_weight: Int,
-    has_bias: Int,
+    has_weight_arg: Int64,
+    has_bias_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
+    var has_bias = Int(has_bias_arg)
     _ln_fwd_warp_rows[8](
         output,
         mean,
@@ -294,11 +330,15 @@ def _layer_norm_forward_f32_vec4[
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
     epsilon: Float32,
 ):
     """Retain up to two aligned vectors per lane across both reductions."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
     var tid = Int(thread_idx.x)
     var row = Int(block_idx.x)
     var row_stride = Int(grid_dim.x)
@@ -362,12 +402,18 @@ def _layer_norm_forward_f32_baseline(
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
     epsilon: Float32,
-    has_weight: Int,
-    has_bias: Int,
+    has_weight_arg: Int64,
+    has_bias_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var has_weight = Int(has_weight_arg)
+    var has_bias = Int(has_bias_arg)
     var tid = Int(thread_idx.x)
     var row = Int(block_idx.x)
     var row_stride = Int(grid_dim.x)
@@ -442,8 +488,8 @@ def _enqueue_vec4_cached[
             input,
             weight,
             bias,
-            rows,
-            cols,
+            Int64(rows),
+            Int64(cols),
             epsilon,
             grid_dim=(min(rows, _MAX_GRID),),
             block_dim=(_VEC_BLOCK,),
@@ -465,8 +511,8 @@ def _enqueue_vec4_cached[
         input,
         weight,
         bias,
-        rows,
-        cols,
+        Int64(rows),
+        Int64(cols),
         epsilon,
         grid_dim=(min(rows, _MAX_GRID),),
         block_dim=(_VEC_BLOCK,),
@@ -501,11 +547,11 @@ def _enqueue_baseline_cached(
             input,
             weight,
             bias,
-            rows,
-            cols,
+            Int64(rows),
+            Int64(cols),
             epsilon,
-            has_weight,
-            has_bias,
+            Int64(has_weight),
+            Int64(has_bias),
             grid_dim=(min(rows, _MAX_GRID),),
             block_dim=(_BLOCK,),
         )
@@ -524,11 +570,11 @@ def _enqueue_baseline_cached(
         input,
         weight,
         bias,
-        rows,
-        cols,
+        Int64(rows),
+        Int64(cols),
         epsilon,
-        has_weight,
-        has_bias,
+        Int64(has_weight),
+        Int64(has_bias),
         grid_dim=(min(rows, _MAX_GRID),),
         block_dim=(_BLOCK,),
     )
@@ -577,12 +623,12 @@ def enqueue_layer_norm_forward_f32(
                     input,
                     weight,
                     bias,
-                    rows,
-                    cols,
-                    vec_cols,
+                    Int64(rows),
+                    Int64(cols),
+                    Int64(vec_cols),
                     epsilon,
-                    hw,
-                    hb,
+                    Int64(hw),
+                    Int64(hb),
                 )
             elif chunks <= 2:
                 _enqueue_cached[_ln_fwd_warp_c2](
@@ -598,12 +644,12 @@ def enqueue_layer_norm_forward_f32(
                     input,
                     weight,
                     bias,
-                    rows,
-                    cols,
-                    vec_cols,
+                    Int64(rows),
+                    Int64(cols),
+                    Int64(vec_cols),
                     epsilon,
-                    hw,
-                    hb,
+                    Int64(hw),
+                    Int64(hb),
                 )
             elif chunks <= 3:
                 _enqueue_cached[_ln_fwd_warp_c3](
@@ -619,12 +665,12 @@ def enqueue_layer_norm_forward_f32(
                     input,
                     weight,
                     bias,
-                    rows,
-                    cols,
-                    vec_cols,
+                    Int64(rows),
+                    Int64(cols),
+                    Int64(vec_cols),
                     epsilon,
-                    hw,
-                    hb,
+                    Int64(hw),
+                    Int64(hb),
                 )
             elif chunks <= 4:
                 _enqueue_cached[_ln_fwd_warp_c4](
@@ -640,12 +686,12 @@ def enqueue_layer_norm_forward_f32(
                     input,
                     weight,
                     bias,
-                    rows,
-                    cols,
-                    vec_cols,
+                    Int64(rows),
+                    Int64(cols),
+                    Int64(vec_cols),
                     epsilon,
-                    hw,
-                    hb,
+                    Int64(hw),
+                    Int64(hb),
                 )
             elif chunks <= 6:
                 _enqueue_cached[_ln_fwd_warp_c6](
@@ -661,12 +707,12 @@ def enqueue_layer_norm_forward_f32(
                     input,
                     weight,
                     bias,
-                    rows,
-                    cols,
-                    vec_cols,
+                    Int64(rows),
+                    Int64(cols),
+                    Int64(vec_cols),
                     epsilon,
-                    hw,
-                    hb,
+                    Int64(hw),
+                    Int64(hb),
                 )
             else:
                 _enqueue_cached[_ln_fwd_warp_c8](
@@ -682,12 +728,12 @@ def enqueue_layer_norm_forward_f32(
                     input,
                     weight,
                     bias,
-                    rows,
-                    cols,
-                    vec_cols,
+                    Int64(rows),
+                    Int64(cols),
+                    Int64(vec_cols),
                     epsilon,
-                    hw,
-                    hb,
+                    Int64(hw),
+                    Int64(hb),
                 )
             return
     if aligned and cols % _VEC == 0 and cols <= 2 * _VEC_BLOCK * _VEC:

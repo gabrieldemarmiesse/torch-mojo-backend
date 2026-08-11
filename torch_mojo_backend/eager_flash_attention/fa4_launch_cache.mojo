@@ -3,8 +3,8 @@
 from std.builtin.device_passable import DevicePassable
 from std.collections import OptionalReg
 from std.ffi import _get_global_or_null, external_call
-from std.gpu.host import DeviceContext, FuncAttribute
-from std.gpu.host.device_context import _DumpPath
+from max.gpu.host import DeviceContext, FuncAttribute
+from max.gpu.host.device_context import _DumpPath
 from std.memory import OpaquePointer, alloc
 
 

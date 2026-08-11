@@ -22,15 +22,15 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
+from max.gpu.sync import barrier
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
     block_idx,
     grid_dim,
     thread_idx,
 )
-from std.gpu.host import DeviceContext
-from std.gpu.primitives import block
+from max.gpu.host import DeviceContext
+from max.gpu.primitives import block
 from std.math import exp, log
 from std.memory import stack_allocation
 from std.memory.unsafe import bitcast
@@ -48,9 +48,9 @@ from std.utils.index import IndexList
 from std.utils.numerics import min_or_neg_inf, max_or_inf
 from std.utils.static_tuple import StaticTuple
 
-from std.algorithm.reduction import product, sum
-from std.algorithm.reduction import max as reduce_max
-from std.algorithm.reduction import min as reduce_min
+from max.algorithm.reduction import product, sum
+from max.algorithm.reduction import max as reduce_max
+from max.algorithm.reduction import min as reduce_min
 
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 
@@ -177,10 +177,13 @@ def _reduce_block_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols: Int,
+    cols_arg: Int64,
 ):
     """One block per row (grid.x = rows); lanes stride over the row and
     tree-reduce their partials in shared memory."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
     comptime acc_dtype = _accum_dtype[dtype]()
     var r = block_idx.x
     var tid = thread_idx.x
@@ -271,7 +274,7 @@ def _reduce_rows[
                     ROWRED_THREADS,
                     out_ptr.as_unsafe_any_origin(),
                     in_ptr.as_unsafe_any_origin().as_immutable(),
-                    cols,
+                    Int64(cols),
                 )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -305,10 +308,14 @@ def _reduce_rows[
 def _sum_middle_few_outputs_kernel(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     input: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    reduce_elements: Int,
-    inner_elements: Int,
+    reduce_elements_arg: Int64,
+    inner_elements_arg: Int64,
 ):
     """One cooperative block per output for the stdlib's scratch regime."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var reduce_elements = Int(reduce_elements_arg)
+    var inner_elements = Int(inner_elements_arg)
     var output_index = Int(block_idx.x)
     var outer_index = output_index // inner_elements
     var inner_index = output_index % inner_elements
@@ -348,8 +355,8 @@ def _sum_contiguous_middle_f32(
             ROWRED_THREADS,
             output.as_unsafe_any_origin(),
             input.as_unsafe_any_origin().as_immutable(),
-            reduce_elements,
-            inner_elements,
+            Int64(reduce_elements),
+            Int64(inner_elements),
         )
         return
 
@@ -433,11 +440,14 @@ def _argmin_rows_block_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols: Int,
+    cols_arg: Int64,
 ):
     """One block per row; lanes pick their own first-min (value, index) with
     strict `<`, then a shared-memory tree reduction combines lanes with a
     lower-index tiebreak on equal values — torch's first-occurrence-wins."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
     var r = block_idx.x
     var tid = thread_idx.x
     var base = r * cols
@@ -517,7 +527,7 @@ def _argmin_rows[
                 ROWRED_THREADS,
                 out_ptr.as_unsafe_any_origin(),
                 in_ptr.as_unsafe_any_origin().as_immutable(),
-                cols,
+                Int64(cols),
             )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -539,8 +549,11 @@ def _minmax_idx_block_kernel[
     val_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     idx_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols: Int,
+    cols_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
     var r = block_idx.x
     var tid = thread_idx.x
     var base = r * cols
@@ -636,7 +649,7 @@ def _minmax_idx_rows[
                 val_ptr.as_unsafe_any_origin(),
                 idx_ptr.as_unsafe_any_origin(),
                 in_ptr.as_unsafe_any_origin().as_immutable(),
-                cols,
+                Int64(cols),
             )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -658,9 +671,12 @@ def _var_rows_block_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols: Int,
+    cols_arg: Int64,
     correction: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
     var r = block_idx.x
     var tid = thread_idx.x
     var base = r * cols
@@ -748,7 +764,7 @@ def _var_rows[
                 ROWRED_THREADS,
                 out_ptr.as_unsafe_any_origin(),
                 in_ptr.as_unsafe_any_origin().as_immutable(),
-                cols,
+                Int64(cols),
                 correction,
             )
         else:
@@ -840,9 +856,13 @@ def _log_softmax_rows_block_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols: Int,
-    rows: Int,
+    cols_arg: Int64,
+    rows_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
+    var rows = Int(rows_arg)
     comptime V = 16 // size_of[dtype]()
     comptime vec_align = V * size_of[dtype]()  # 16 bytes
     var tid = Int(thread_idx.x)
@@ -1041,8 +1061,8 @@ def _log_softmax_rows[
                     1024,
                     mout,
                     min_,
-                    cols,
-                    rows,
+                    Int64(cols),
+                    Int64(rows),
                 )
             else:
                 _enqueue_cached[_log_softmax_rows_block_kernel[dtype, 256]](
@@ -1054,8 +1074,8 @@ def _log_softmax_rows[
                     256,
                     mout,
                     min_,
-                    cols,
-                    rows,
+                    Int64(cols),
+                    Int64(rows),
                 )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -1080,8 +1100,11 @@ def _anyall_rows_block_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols: Int,
+    cols_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
     var r = block_idx.x
     var tid = thread_idx.x
     var base = r * cols
@@ -1182,7 +1205,7 @@ def _anyall_rows[
                     ROWRED_THREADS,
                     out_ptr.as_unsafe_any_origin(),
                     in_ptr.as_unsafe_any_origin().as_immutable(),
-                    cols,
+                    Int64(cols),
                 )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -1198,7 +1221,9 @@ def _anyall_rows[
 # NotImplementedError into Python ("take the classic path").
 # ---------------------------------------------------------------------------
 
-comptime SPEC_ROWRED_DTYPES = [
+# Annotated List[DType]: rc1 infers bare `[...]` literals as Array, which no
+# longer binds to variant_gates._dtype_supported's `List[DType]` parameter.
+comptime SPEC_ROWRED_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
@@ -1206,7 +1231,7 @@ comptime SPEC_ROWRED_DTYPES = [
     DType.int32,
 ]
 
-comptime SPEC_ANYALL_DTYPES = [
+comptime SPEC_ANYALL_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
@@ -1394,7 +1419,9 @@ def _var_spec_into_go(
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
+    # List[DType](...) wrap: op_utils.FLOAT_DTYPES is an rc1 Array literal and
+    # _dtype_supported takes List[DType] (scanner still reads index 0 here).
+    if not _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype):
         raise Error("mojo spec var: unsupported dtype ", a.dtype)
     if a.numel == 0:
         raise Error("mojo spec var: empty input")
@@ -1457,7 +1484,8 @@ def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     dim transpose recursion stays in Python (view ops)."""
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
+    # List[DType](...) wrap: see _var_spec_into_go above.
+    if not _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype):
         raise Error("mojo spec log_softmax: unsupported dtype ", a.dtype)
     if a.rank < 1 or a.numel == 0:
         raise Error("mojo spec log_softmax: empty or rank-0 input")

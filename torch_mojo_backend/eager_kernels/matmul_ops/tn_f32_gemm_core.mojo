@@ -69,19 +69,15 @@
 # numerics as ordinary two-way split-K.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import (
-    MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
-    block_idx,
-    thread_idx,
-)
-from std.gpu.memory import (
-    AddressSpace,
+from max.gpu.sync import barrier
+from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, thread_idx
+from max.gpu.memory import (
     async_copy,
     async_copy_commit_group,
     async_copy_wait_group,
 )
-from std.gpu.sync import named_barrier
+from std.memory import AddressSpace
+from max.gpu.sync import named_barrier
 from std.math import ceildiv
 from std.memory import stack_allocation
 from std.utils.static_tuple import StaticTuple
@@ -112,11 +108,18 @@ def _tn_core_kernel[
     c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var ksplits = Int(ksplits_arg)
+
     comptime F32 = DType.float32
     comptime WARPS_M = BM // WM
     comptime WARPS_N = BN // WN
@@ -409,11 +412,18 @@ def _tn_split_kernel[
     c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var ksplits = Int(ksplits_arg)
+
     comptime F32 = DType.float32
     comptime TG = 128  # threads per warp group (4 warps)
     # Warp grid within a group: 2x2 warps of 64x64; lanes LR=8 x LC=4;

@@ -35,16 +35,13 @@ from std.gpu import (
     grid_dim,
     thread_idx,
 )
-from std.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
-from std.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
+from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
-from std.gpu.memory import (
-    AddressSpace,
-    fence_async_view_proxy,
-    fence_mbarrier_init,
-)
-from std.gpu.sync import named_barrier
-from std.gpu.primitives.cluster import (
+from max.gpu.memory import fence_async_view_proxy, fence_mbarrier_init
+from std.memory import AddressSpace
+from max.gpu.sync import named_barrier
+from max.gpu.primitives import (
     block_rank_in_cluster,
     cluster_sync,
     cluster_sync_relaxed,
@@ -105,10 +102,15 @@ def _v4_nn_persistent_ws[
     b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 64), Index(_V4_BK, 64)],
     c_tma: TMATensorTile[_V4_BF16, 2, Index(bm, 64), Index(bm, 64)],
     output: _V4_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     comptime if _is_sm_9x():
         comptime A_LAYOUT = tile_layout_k_major[
             _V4_BF16, bm, _V4_BK, _V4_SWIZZLE
@@ -474,9 +476,9 @@ def _v4_enqueue_nn_persistent[
         b_tma,
         c_tma,
         output,
-        m,
-        n,
-        k,
+        Int64(m),
+        Int64(n),
+        Int64(k),
         grid_dim=(grid_x,),
         block_dim=(128 * (consumers + 1),),
     )

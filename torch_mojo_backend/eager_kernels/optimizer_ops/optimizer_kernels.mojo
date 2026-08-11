@@ -9,7 +9,7 @@ sizes and addresses are runtime data and never compilation keys.
 from std.collections import InlineArray
 from std.ffi import _get_global_or_null, external_call
 from std.gpu import block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import min, pow
 from std.memory import alloc
 from std.sys.info import has_apple_gpu_accelerator
@@ -77,18 +77,26 @@ def _adamw_update[
 @__name("fused_adamw_f32_dynamic_multitensor")
 def _fused_adamw_f32(
     descs: InlineArray[AdamWDesc, ADAMW_DESC_CAP],
-    desc_count: Int,
+    desc_count_arg: Int64,
     lr_scalar: Float32,
-    lr_ptr_addr: Int,
+    lr_ptr_addr_arg: Int64,
     beta1: Float32,
     beta2: Float32,
     weight_decay: Float32,
     eps: Float32,
-    amsgrad_int: Int,
-    maximize_int: Int,
-    grad_scale_ptr_addr: Int,
-    found_inf_ptr_addr: Int,
+    amsgrad_int_arg: Int64,
+    maximize_int_arg: Int64,
+    grad_scale_ptr_addr_arg: Int64,
+    found_inf_ptr_addr_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var desc_count = Int(desc_count_arg)
+    var lr_ptr_addr = Int(lr_ptr_addr_arg)
+    var amsgrad_int = Int(amsgrad_int_arg)
+    var maximize_int = Int(maximize_int_arg)
+    var grad_scale_ptr_addr = Int(grad_scale_ptr_addr_arg)
+    var found_inf_ptr_addr = Int(found_inf_ptr_addr_arg)
     # found_inf must gate every mutation, including gradient writeback.
     if found_inf_ptr_addr != 0 and _ptr(found_inf_ptr_addr)[0] == 1.0:
         return
@@ -215,18 +223,26 @@ def _fused_adamw_f32_tensor_apple(
     lr_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     grad_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     found_inf_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    numel: Int,
+    numel_arg: Int64,
     lr_scalar: Float32,
-    has_lr_ptr: Int,
+    has_lr_ptr_arg: Int64,
     beta1: Float32,
     beta2: Float32,
     weight_decay: Float32,
     eps: Float32,
-    amsgrad_int: Int,
-    maximize_int: Int,
-    has_grad_scale: Int,
-    has_found_inf: Int,
+    amsgrad_int_arg: Int64,
+    maximize_int_arg: Int64,
+    has_grad_scale_arg: Int64,
+    has_found_inf_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var numel = Int(numel_arg)
+    var has_lr_ptr = Int(has_lr_ptr_arg)
+    var amsgrad_int = Int(amsgrad_int_arg)
+    var maximize_int = Int(maximize_int_arg)
+    var has_grad_scale = Int(has_grad_scale_arg)
+    var has_found_inf = Int(has_found_inf_arg)
     # found_inf must gate every mutation, including gradient writeback.
     if has_found_inf != 0 and found_inf_ptr[0] == 1.0:
         return
@@ -372,17 +388,17 @@ def enqueue_fused_adamw_f32(
                 _ptr(lr_addr).as_unsafe_any_origin().as_immutable(),
                 _ptr(gs_addr).as_unsafe_any_origin().as_immutable(),
                 _ptr(fi_addr).as_unsafe_any_origin().as_immutable(),
-                desc.numel,
+                Int64(desc.numel),
                 lr_scalar,
-                1 if lr_ptr_addr != 0 else 0,
+                Int64(1 if lr_ptr_addr != 0 else 0),
                 beta1,
                 beta2,
                 weight_decay,
                 eps,
-                amsgrad_int,
-                maximize_int,
-                1 if grad_scale_ptr_addr != 0 else 0,
-                1 if found_inf_ptr_addr != 0 else 0,
+                Int64(amsgrad_int),
+                Int64(maximize_int),
+                Int64(1 if grad_scale_ptr_addr != 0 else 0),
+                Int64(1 if found_inf_ptr_addr != 0 else 0),
             )
         return
 
@@ -396,17 +412,17 @@ def enqueue_fused_adamw_f32(
         ctx.enqueue_function(
             cached[],
             descs,
-            desc_count,
+            Int64(desc_count),
             lr_scalar,
-            lr_ptr_addr,
+            Int64(lr_ptr_addr),
             beta1,
             beta2,
             weight_decay,
             eps,
-            amsgrad_int,
-            maximize_int,
-            grad_scale_ptr_addr,
-            found_inf_ptr_addr,
+            Int64(amsgrad_int),
+            Int64(maximize_int),
+            Int64(grad_scale_ptr_addr),
+            Int64(found_inf_ptr_addr),
             grid_dim=(total_chunks,),
             block_dim=(ADAMW_THREADS,),
         )
@@ -422,17 +438,17 @@ def enqueue_fused_adamw_f32(
     ctx.enqueue_function(
         cached[],
         descs,
-        desc_count,
+        Int64(desc_count),
         lr_scalar,
-        lr_ptr_addr,
+        Int64(lr_ptr_addr),
         beta1,
         beta2,
         weight_decay,
         eps,
-        amsgrad_int,
-        maximize_int,
-        grad_scale_ptr_addr,
-        found_inf_ptr_addr,
+        Int64(amsgrad_int),
+        Int64(maximize_int),
+        Int64(grad_scale_ptr_addr),
+        Int64(found_inf_ptr_addr),
         grid_dim=(total_chunks,),
         block_dim=(ADAMW_THREADS,),
     )

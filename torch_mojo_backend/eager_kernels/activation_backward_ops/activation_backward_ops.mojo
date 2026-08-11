@@ -21,7 +21,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import ceildiv, erf, exp, tanh
 from std.os import abort
 from std.python import PythonObject
@@ -82,9 +82,13 @@ def _gelu_backward_exact(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    elements: Int,
-    vec_count: Int,
+    elements_arg: Int64,
+    vec_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
+    var vec_count = Int(vec_count_arg)
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC
@@ -103,9 +107,13 @@ def _gelu_backward_tanh(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    elements: Int,
-    vec_count: Int,
+    elements_arg: Int64,
+    vec_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
+    var vec_count = Int(vec_count_arg)
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC
@@ -137,9 +145,13 @@ def _gelu_backward_f32_g4[
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    elements: Int,
-    vec_count: Int,
+    elements_arg: Int64,
+    vec_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
+    var vec_count = Int(vec_count_arg)
     # Apple variant: each thread owns 4 consecutive 16-byte chunks (one
     # sequential 64-byte stream per operand with the loads issued together),
     # which this GPU needs to stream at full rate.  The trailing chunk and
@@ -189,9 +201,13 @@ def _gelu_backward_exact_bf16(
     output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    elements: Int,
-    vec_count: Int,
+    elements_arg: Int64,
+    vec_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
+    var vec_count = Int(vec_count_arg)
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC_BF16
@@ -219,9 +235,13 @@ def _gelu_backward_tanh_bf16(
     output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    elements: Int,
-    vec_count: Int,
+    elements_arg: Int64,
+    vec_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
+    var vec_count = Int(vec_count_arg)
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC_BF16
@@ -275,8 +295,8 @@ def enqueue_gelu_backward_f32(
                     output,
                     grad_output,
                     input,
-                    elements,
-                    vec_count,
+                    Int64(elements),
+                    Int64(vec_count),
                 )
             else:
                 _enqueue_cached[_gelu_backward_f32_g4[False]](
@@ -289,8 +309,8 @@ def enqueue_gelu_backward_f32(
                     output,
                     grad_output,
                     input,
-                    elements,
-                    vec_count,
+                    Int64(elements),
+                    Int64(vec_count),
                 )
             return
         # The grid covers the vector body; the <=3-element aligned tail rides
@@ -310,8 +330,8 @@ def enqueue_gelu_backward_f32(
                 output,
                 grad_output,
                 input,
-                elements,
-                vec_count,
+                Int64(elements),
+                Int64(vec_count),
             )
         else:
             _enqueue_cached[_gelu_backward_exact](
@@ -324,8 +344,8 @@ def enqueue_gelu_backward_f32(
                 output,
                 grad_output,
                 input,
-                elements,
-                vec_count,
+                Int64(elements),
+                Int64(vec_count),
             )
 
 
@@ -361,8 +381,8 @@ def enqueue_gelu_backward_bf16(
                 output,
                 grad_output,
                 input,
-                elements,
-                vec_count,
+                Int64(elements),
+                Int64(vec_count),
             )
         else:
             _enqueue_cached[_gelu_backward_exact_bf16](
@@ -375,8 +395,8 @@ def enqueue_gelu_backward_bf16(
                 output,
                 grad_output,
                 input,
-                elements,
-                vec_count,
+                Int64(elements),
+                Int64(vec_count),
             )
 
 

@@ -22,7 +22,7 @@
 
 from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.memory import memcpy
 from std.python import Python, PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
@@ -264,9 +264,13 @@ def copy_to_pinned_host(
 def _d2d_copy_vec4_kernel(
     dst_ptr: UnsafePointer[Scalar[DType.uint32], MutAnyOrigin],
     src_ptr: UnsafePointer[Scalar[DType.uint32], ImmutAnyOrigin],
-    vec_count: Int,
-    tail_words: Int,
+    vec_count_arg: Int64,
+    tail_words_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var vec_count = Int(vec_count_arg)
+    var tail_words = Int(tail_words_arg)
     # 16-byte vector moves over the u32-viewed buffers plus a scalar-word
     # tail; the host guarantees 16-byte-aligned bases and nbytes % 4 == 0.
     # Wider (32-byte) vectors measured slightly faster but intermittently
@@ -342,8 +346,8 @@ def _copy_d2d_raw(
                 _make_ptr[DType.uint32](src_addr)
                 .as_unsafe_any_origin()
                 .as_immutable(),
-                vec_count,
-                words - vec_count * 4,
+                Int64(vec_count),
+                Int64(words - vec_count * 4),
             )
             return
     var dst = _wrap_raw(ctx, dst_addr, n)

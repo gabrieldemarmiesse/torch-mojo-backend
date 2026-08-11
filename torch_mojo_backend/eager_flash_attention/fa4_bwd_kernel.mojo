@@ -50,32 +50,17 @@ from std.sys import size_of
 from std.utils.index import StaticTuple, IndexList
 
 from std.sys._assembly import inlined_assembly
-from std.gpu import (
-    MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
-    block_idx,
-    grid_dim,
-    lane_id,
-    thread_idx,
-    warp_id,
-)
+from max.gpu.sync import barrier
+from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, grid_dim, lane_id, thread_idx, warp_id
 import std.gpu.primitives.warp as warp
-from std.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
-from std.gpu.memory import (
-    AddressSpace,
-    external_memory,
-    fence_async_view_proxy,
-)
-from std.gpu.sync import (
-    cp_async_bulk_commit_group,
-    cp_async_bulk_wait_group,
-    named_barrier,
-    named_barrier_arrive,
-)
+from max.gpu.memory import external_memory, fence_async_view_proxy
+from std.memory import AddressSpace
+from max.gpu.sync import cp_async_bulk_commit_group, cp_async_bulk_wait_group, named_barrier, named_barrier_arrive
 from std.memory import bitcast, stack_allocation
 
-from std.gpu.compute.mma import st_matrix, wgmma_async
+from max.gpu.compute.mma import st_matrix, wgmma_async
 
 from layout import Layout, LayoutTensor
 from layout.tensor_core_async import (
@@ -156,9 +141,12 @@ def bwd_main_kernel[
     dq_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
     dk_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
     dv_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
-    seq_len: Int,
+    seq_len_arg: Int64,
     softmax_scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var seq_len = Int(seq_len_arg)
     # Causal uses FA4's tile_m=64 (_tile_size_bwd_sm90: 64/128 with
     # dQ_swapAB=False; v0 keeps our swapped dQ — valid algebra, the
     # mailbox/convert layouts are BM-parametric).
@@ -1540,9 +1528,13 @@ def bwd_preprocess_kernel[
     dq_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
     dk_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
     dv_accum_ptr: UnsafePointer[Float32, MutAnyOrigin],
-    seq_len: Int,
-    nheads: Int,
+    seq_len_arg: Int64,
+    nheads_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var seq_len = Int(seq_len_arg)
+    var nheads = Int(nheads_arg)
     comptime D: Int = head_dim
     comptime BM: Int = kBwdPreBlockM
 
@@ -1727,8 +1719,8 @@ def bwd_convert_kernel[
 ](
     dq_accum_ptr: UnsafePointer[Float32, ImmutAnyOrigin],
     dq_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    seq_len: Int,
-    nheads: Int,
+    seq_len_arg: Int64,
+    nheads_arg: Int64,
     softmax_scale: Float32,
 ):
     """dq[b,s,h,d] = scale * decode(dq_accum) via a (q, d) smem tile.
@@ -1739,6 +1731,10 @@ def bwd_convert_kernel[
     bank-conflict-free (banks = lane_group + 8*lane_pair cover all
     32). Phase 2: each thread emits contiguous 16-elem (32B) d-slices
     so every warp store covers full 256B rows (full 32B sectors)."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var seq_len = Int(seq_len_arg)
+    var nheads = Int(nheads_arg)
     comptime D: Int = head_dim
     comptime BM: Int = kBwdTileM(head_dim, causal)
     comptime PAD: Int = 4  # pad smem rows to dodge bank conflicts

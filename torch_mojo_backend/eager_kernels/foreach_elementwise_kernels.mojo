@@ -18,7 +18,7 @@ bit-compatible with the sequential per-tensor decomposition.
 
 from std.collections import InlineArray
 from std.gpu import block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import min
 from std.sys.info import has_accelerator
 
@@ -226,7 +226,7 @@ def _foreach_lerp_kernel(
     numels: InlineArray[Int, FOREACH_EW_SLOTS],
     weight: Float32,
     one_minus_weight: Float32,
-    low_branch: Int,
+    low_branch_arg: Int64,
 ):
     """In-place scalar lerp: self = self + weight * (end - self).
 
@@ -234,6 +234,9 @@ def _foreach_lerp_kernel(
     way the sequential fallback composes them (sub, scale, add/sub), with
     the branch selected on the host exactly like `fast_aten_lerp`.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var low_branch = Int(low_branch_arg)
     var slot, begin = _slot_begin(chunk_ends, Int(block_idx.x))
     var end = min(begin + FOREACH_EW_CHUNK, numels[slot])
     var self_values = _pick_mut(slot, a0, a1, a2, a3, a4, a5, a6, a7)
@@ -380,11 +383,15 @@ def _gather_scalars_kernel(
     s5: _ImmutPtr,
     s6: _ImmutPtr,
     s7: _ImmutPtr,
-    base: Int,
-    count: Int,
+    base_arg: Int64,
+    count_arg: Int64,
 ):
     """out[base + i] = s_i[0]: one batched launch replaces per-scalar copies
     (the `stack` of foreach-norm outputs in gradient clipping)."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var base = Int(base_arg)
+    var count = Int(count_arg)
     var i = Int(thread_idx.x)
     if i < count:
         out_ptr[base + i] = _pick_immut(i, s0, s1, s2, s3, s4, s5, s6, s7)[0]
@@ -414,8 +421,8 @@ def enqueue_foreach_gather_scalars_f32(
             _addr_ptr(in_addrs[5]).as_immutable(),
             _addr_ptr(in_addrs[6]).as_immutable(),
             _addr_ptr(in_addrs[7]).as_immutable(),
-            base,
-            count,
+            Int64(base),
+            Int64(count),
         )
     else:
         raise Error("no GPU accelerator available at compile time")
@@ -494,7 +501,7 @@ def enqueue_foreach_lerp_f32(
             numels,
             weight,
             one_minus_weight,
-            low_branch,
+            Int64(low_branch),
         )
     else:
         raise Error("no GPU accelerator available at compile time")

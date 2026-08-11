@@ -39,7 +39,7 @@ from std.gpu import (
     thread_idx,
     warp_id,
 )
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import ceildiv
 from std.sys import llvm_intrinsic
 from std.sys.info import has_apple_gpu_accelerator
@@ -98,11 +98,16 @@ def _sdpa_ta_gemm_kernel[
     a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     mask_base: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
     drop_scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     comptime F32 = DType.float32
 
     var bz = Int(block_idx.z)
@@ -191,7 +196,7 @@ def _sdpa_ta_gemm_kernel[
                 comptime for s in range(FRAG8):
                     af[s] = af[s] * mp[s * m].cast[F32]() * drop_scale
             afrag[mi] = af
-        return afrag
+        return afrag^
 
     @always_inline
     @parameter
@@ -201,7 +206,7 @@ def _sdpa_ta_gemm_kernel[
         var bfrag = InlineArray[SIMD[F32, FRAG8], _NT_N](uninitialized=True)
         comptime for ni in range(_NT_N):
             bfrag[ni] = (bp0 + ni * MMA8_DIM).load[width=FRAG8]()
-        return bfrag
+        return bfrag^
 
     @always_inline
     @parameter
@@ -234,8 +239,8 @@ def _sdpa_ta_gemm_kernel[
                 var nxta = _load_a_fast(ap, mp)
                 var nxtb = _load_b_fast(bp)
                 _mma_block(cura, curb, accum)
-                cura = nxta
-                curb = nxtb
+                cura = nxta^
+                curb = nxtb^
             _mma_block(cura, curb, accum)
         if full_end < k:
             _slab_guarded(full_end, accum)
@@ -303,9 +308,9 @@ def enqueue_sdpa_ta_gemm_f32(
                     a_ptr,
                     b_ptr,
                     mask_arg,
-                    m,
-                    n,
-                    k,
+                    Int64(m),
+                    Int64(n),
+                    Int64(k),
                     scale_f32,
                 )
             else:
@@ -320,9 +325,9 @@ def enqueue_sdpa_ta_gemm_f32(
                     a_ptr,
                     b_ptr,
                     mask_arg,
-                    m,
-                    n,
-                    k,
+                    Int64(m),
+                    Int64(n),
+                    Int64(k),
                     scale_f32,
                 )
         elif causal:
@@ -337,9 +342,9 @@ def enqueue_sdpa_ta_gemm_f32(
                 a_ptr,
                 b_ptr,
                 mask_arg,
-                m,
-                n,
-                k,
+                Int64(m),
+                Int64(n),
+                Int64(k),
                 scale_f32,
             )
         else:
@@ -354,8 +359,8 @@ def enqueue_sdpa_ta_gemm_f32(
                 a_ptr,
                 b_ptr,
                 mask_arg,
-                m,
-                n,
-                k,
+                Int64(m),
+                Int64(n),
+                Int64(k),
                 scale_f32,
             )

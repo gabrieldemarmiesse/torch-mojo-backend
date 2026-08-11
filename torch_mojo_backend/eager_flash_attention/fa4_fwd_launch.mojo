@@ -10,13 +10,9 @@ function's PTX is written to <path> at first-call JIT time via
 kernel module name.
 """
 
-from std.gpu.host import DeviceContext, FuncAttribute
-from std.gpu.host.device_context import (
-    _DeviceContextPtr,
-    _DeviceContextCpp,
-    _DumpPath,
-)
-from std.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.host import DeviceContext, FuncAttribute
+from max.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp, _DumpPath
+from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.math import ceildiv
 from std.memory import OpaquePointer
 from std.sys import get_defined_string, size_of
@@ -295,12 +291,12 @@ def launch_fwd_fa4[
             v_tma,
             o_tma,
             lse_ptr,
-            seqlen_int,
+            Int64(seqlen_int),
             softmax_scale,
-            nheads_int,
-            sched_swizzle,
-            sched_num_hb_q,
-            sched_residual,
+            Int64(nheads_int),
+            Int64(sched_swizzle),
+            Int64(sched_num_hb_q),
+            Int64(sched_residual),
         )
         return
 
@@ -392,10 +388,10 @@ def launch_fwd_fa4[
         v_tma,
         o_tma,
         lse_ptr,
-        seq_len_arg,
+        Int64(seq_len_arg),
         softmax_scale,
-        nheads_int,
-        sched_swizzle_arg,
-        sched_num_hb_q_arg,
-        sched_residual,
+        Int64(nheads_int),
+        Int64(sched_swizzle_arg),
+        Int64(sched_num_hb_q_arg),
+        Int64(sched_residual),
     )

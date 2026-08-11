@@ -18,9 +18,10 @@ depends only on (rows, cols), so repeated invocations produce identical f32
 bit patterns.
 """
 
-from std.gpu import barrier, block_idx, thread_idx
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from std.gpu import block_idx, thread_idx
+from max.gpu.host import DeviceContext
+from std.memory import AddressSpace
 from std.math import ceildiv
 from std.memory import stack_allocation
 from std.sys.info import has_accelerator
@@ -45,11 +46,17 @@ def _direct_kernel(
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    want_weight: Int,
-    want_bias: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    want_weight_arg: Int64,
+    want_bias_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var want_weight = Int(want_weight_arg)
+    var want_bias = Int(want_bias_arg)
     var col = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if col >= cols:
         return
@@ -80,12 +87,19 @@ def _partial_kernel(
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    chunk_rows: Int,
-    want_weight: Int,
-    want_bias: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    chunk_rows_arg: Int64,
+    want_weight_arg: Int64,
+    want_bias_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var chunk_rows = Int(chunk_rows_arg)
+    var want_weight = Int(want_weight_arg)
+    var want_bias = Int(want_bias_arg)
     var col = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if col >= cols:
         return
@@ -132,11 +146,17 @@ def _final_kernel(
     grad_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     partial_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     partial_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    cols: Int,
-    num_chunks: Int,
-    want_weight: Int,
-    want_bias: Int,
+    cols_arg: Int64,
+    num_chunks_arg: Int64,
+    want_weight_arg: Int64,
+    want_bias_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
+    var num_chunks = Int(num_chunks_arg)
+    var want_weight = Int(want_weight_arg)
+    var want_bias = Int(want_bias_arg)
     var tx = Int(thread_idx.x)
     var ty = Int(thread_idx.y)
     var col = Int(block_idx.x) * _FINAL_TX + tx
@@ -212,10 +232,10 @@ def enqueue_layer_norm_backward_params_f32(
                 input,
                 mean,
                 rstd,
-                rows,
-                cols,
-                weight_flag,
-                bias_flag,
+                Int64(rows),
+                Int64(cols),
+                Int64(weight_flag),
+                Int64(bias_flag),
             )
             return
 
@@ -244,10 +264,10 @@ def enqueue_layer_norm_backward_params_f32(
                 input,
                 mean,
                 rstd,
-                rows,
-                cols,
-                weight_flag,
-                bias_flag,
+                Int64(rows),
+                Int64(cols),
+                Int64(weight_flag),
+                Int64(bias_flag),
             )
             return
         var lane = num_chunks * cols
@@ -270,11 +290,11 @@ def enqueue_layer_norm_backward_params_f32(
             input,
             mean,
             rstd,
-            rows,
-            cols,
-            chunk_rows,
-            weight_flag,
-            bias_flag,
+            Int64(rows),
+            Int64(cols),
+            Int64(chunk_rows),
+            Int64(weight_flag),
+            Int64(bias_flag),
         )
         _enqueue_cached_2d[_final_kernel](
             ctx,
@@ -288,10 +308,10 @@ def enqueue_layer_norm_backward_params_f32(
             grad_bias,
             partial_weight,
             partial_bias,
-            cols,
-            num_chunks,
-            weight_flag,
-            bias_flag,
+            Int64(cols),
+            Int64(num_chunks),
+            Int64(weight_flag),
+            Int64(bias_flag),
         )
         # Normal release after both queued consumers are enqueued in stream order.
         _ = scratch^

@@ -23,7 +23,7 @@
 
 from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import ceildiv, pow
 from std.python import PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
@@ -31,7 +31,7 @@ from std.python.bindings import PythonModuleBuilder
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
-from std.algorithm.functional import elementwise
+from max.algorithm import elementwise
 
 from std.utils import IndexList
 
@@ -91,10 +91,14 @@ def _add_f32_bf16_contig_kernel(
     output_f32: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     input_f32: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     input_bf16: UnsafePointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
-    elements: Int,
-    vec_count: Int,
+    elements_arg: Int64,
+    vec_count_arg: Int64,
 ):
     """One-launch contiguous mixed add with in-register BF16 widening."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
+    var vec_count = Int(vec_count_arg)
     var gid = Int(block_idx.x) * _ADD_F32_BF16_BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _ADD_F32_BF16_VEC
@@ -141,8 +145,8 @@ def _add_f32_bf16_contig(
             output_f32,
             input_f32,
             input_bf16,
-            elements,
-            vec_count,
+            Int64(elements),
+            Int64(vec_count),
         )
     else:
         raise Error("mixed FP32/BF16 add requires an accelerator build")
@@ -206,19 +210,33 @@ def _bin_bcast_kernel[
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d1: Int,
-    d2: Int,
-    d3: Int,
-    ls0: Int,
-    ls1: Int,
-    ls2: Int,
-    ls3: Int,
-    rs0: Int,
-    rs1: Int,
-    rs2: Int,
-    rs3: Int,
-    total: Int,
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    ls3_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rs3_arg: Int64,
+    total_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var d1 = Int(d1_arg)
+    var d2 = Int(d2_arg)
+    var d3 = Int(d3_arg)
+    var ls0 = Int(ls0_arg)
+    var ls1 = Int(ls1_arg)
+    var ls2 = Int(ls2_arg)
+    var ls3 = Int(ls3_arg)
+    var rs0 = Int(rs0_arg)
+    var rs1 = Int(rs1_arg)
+    var rs2 = Int(rs2_arg)
+    var rs3 = Int(rs3_arg)
+    var total = Int(total_arg)
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while i < total:
@@ -285,13 +303,16 @@ def _bin_flat_vec_kernel[
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    total: Int,
+    total_arg: Int64,
 ):
     """16-byte-vectorized binary op for the no-broadcast, all-contiguous
     case (both operands and the output flat over the same extent). The
     launcher guarantees 16B base alignment."""
     comptime VW = 16 // size_of[dtype]()
     comptime vec_align = VW * size_of[dtype]()
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var total = Int(total_arg)
     var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     var nvec = total // VW
@@ -316,16 +337,16 @@ def _bin_rowvec_kernel[
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d1: Int,
-    d2: Int,
-    d3: Int,
-    ls0: Int,
-    ls1: Int,
-    ls2: Int,
-    rs0: Int,
-    rs1: Int,
-    rs2: Int,
-    rows: Int,
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rows_arg: Int64,
 ):
     """Vectorized along a stride-1 innermost dim; outer dims may be strided
     or broadcast (stride 0). One block per row (grid-stride over rows); the
@@ -333,6 +354,18 @@ def _bin_rowvec_kernel[
     launcher guarantees d3 % VW == 0 and 16B alignment of every row base."""
     comptime VW = 16 // size_of[dtype]()
     comptime vec_align = VW * size_of[dtype]()
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var d1 = Int(d1_arg)
+    var d2 = Int(d2_arg)
+    var d3 = Int(d3_arg)
+    var ls0 = Int(ls0_arg)
+    var ls1 = Int(ls1_arg)
+    var ls2 = Int(ls2_arg)
+    var rs0 = Int(rs0_arg)
+    var rs1 = Int(rs1_arg)
+    var rs2 = Int(rs2_arg)
+    var rows = Int(rows_arg)
     var row = Int(block_idx.x)
     while row < rows:
         var i2 = row % d2
@@ -471,7 +504,7 @@ def _bin_bcast[
                                 out_ptr.as_unsafe_any_origin(),
                                 l_ptr.as_unsafe_any_origin().as_immutable(),
                                 r_ptr.as_unsafe_any_origin().as_immutable(),
-                                total,
+                                Int64(total),
                             )
                         elif aligned16 and rows_aligned:
                             var rows = total // d3
@@ -485,16 +518,16 @@ def _bin_bcast[
                                 out_ptr.as_unsafe_any_origin(),
                                 l_ptr.as_unsafe_any_origin().as_immutable(),
                                 r_ptr.as_unsafe_any_origin().as_immutable(),
-                                d1,
-                                d2,
-                                d3,
-                                ls0,
-                                ls1,
-                                ls2,
-                                rs0,
-                                rs1,
-                                rs2,
-                                rows,
+                                Int64(d1),
+                                Int64(d2),
+                                Int64(d3),
+                                Int64(ls0),
+                                Int64(ls1),
+                                Int64(ls2),
+                                Int64(rs0),
+                                Int64(rs1),
+                                Int64(rs2),
+                                Int64(rows),
                             )
                         else:
                             _enqueue_cached[_bin_bcast_kernel[dtype, op_code]](
@@ -507,18 +540,18 @@ def _bin_bcast[
                                 out_ptr.as_unsafe_any_origin(),
                                 l_ptr.as_unsafe_any_origin().as_immutable(),
                                 r_ptr.as_unsafe_any_origin().as_immutable(),
-                                d1,
-                                d2,
-                                d3,
-                                ls0,
-                                ls1,
-                                ls2,
-                                ls3,
-                                rs0,
-                                rs1,
-                                rs2,
-                                rs3,
-                                total,
+                                Int64(d1),
+                                Int64(d2),
+                                Int64(d3),
+                                Int64(ls0),
+                                Int64(ls1),
+                                Int64(ls2),
+                                Int64(ls3),
+                                Int64(rs0),
+                                Int64(rs1),
+                                Int64(rs2),
+                                Int64(rs3),
+                                Int64(total),
                             )
                     else:
                         raise Error(
@@ -580,19 +613,33 @@ def _cmp_bcast_kernel[
     out_ptr: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
     l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d1: Int,
-    d2: Int,
-    d3: Int,
-    ls0: Int,
-    ls1: Int,
-    ls2: Int,
-    ls3: Int,
-    rs0: Int,
-    rs1: Int,
-    rs2: Int,
-    rs3: Int,
-    total: Int,
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    ls3_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rs3_arg: Int64,
+    total_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var d1 = Int(d1_arg)
+    var d2 = Int(d2_arg)
+    var d3 = Int(d3_arg)
+    var ls0 = Int(ls0_arg)
+    var ls1 = Int(ls1_arg)
+    var ls2 = Int(ls2_arg)
+    var ls3 = Int(ls3_arg)
+    var rs0 = Int(rs0_arg)
+    var rs1 = Int(rs1_arg)
+    var rs2 = Int(rs2_arg)
+    var rs3 = Int(rs3_arg)
+    var total = Int(total_arg)
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while i < total:
@@ -668,18 +715,18 @@ def _cmp_bcast[
                     out_ptr.as_unsafe_any_origin(),
                     l_ptr.as_unsafe_any_origin().as_immutable(),
                     r_ptr.as_unsafe_any_origin().as_immutable(),
-                    d1,
-                    d2,
-                    d3,
-                    ls0,
-                    ls1,
-                    ls2,
-                    ls3,
-                    rs0,
-                    rs1,
-                    rs2,
-                    rs3,
-                    total,
+                    Int64(d1),
+                    Int64(d2),
+                    Int64(d3),
+                    Int64(ls0),
+                    Int64(ls1),
+                    Int64(ls2),
+                    Int64(ls3),
+                    Int64(rs0),
+                    Int64(rs1),
+                    Int64(rs2),
+                    Int64(rs3),
+                    Int64(total),
                 )
             else:
                 raise Error("no GPU accelerator available at compile time")

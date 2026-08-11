@@ -37,9 +37,10 @@ from std.gpu import (
     grid_dim,
     thread_idx,
 )
-from std.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
-from std.gpu.memory import AddressSpace, external_memory
-from std.gpu.primitives import block
+from max.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
+from max.gpu.memory import external_memory
+from std.memory import AddressSpace
+from max.gpu.primitives import block
 from std.math import ceildiv, exp
 from std.memory import alloc
 from std.sys.info import has_accelerator, size_of
@@ -79,8 +80,8 @@ def _log_softmax_bwd_smem_kernel[
     gi: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     g: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     o: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
 ):
     # One row per block. Phase 1 stages the vectorized body of the grad row
     # into dynamic shared memory while accumulating the fp32 rowsum, so
@@ -89,6 +90,11 @@ def _log_softmax_bwd_smem_kernel[
     # same v-loop), so the staging itself needs no barrier. The (at most
     # VEC-1) head/tail scalars of unaligned rows re-read global memory and
     # hit L1/L2.
+    #
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int. (`rows_arg` is
+    # unused in the body: one block per row.)
+    var cols = Int(cols_arg)
     comptime VEC = 16 // size_of[dtype]()
     var smem_g = external_memory[
         Scalar[dtype], address_space=AddressSpace.SHARED, alignment=16
@@ -157,11 +163,16 @@ def _log_softmax_bwd_nosmem_kernel[
     gi: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     g: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     o: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
 ):
     # Fallback for rows whose vector body exceeds the dynamic shared-memory
     # capacity: same structure, but phase 2 re-reads grad through L2/DRAM.
+    #
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int. (`rows_arg` is
+    # unused in the body: one block per row.)
+    var cols = Int(cols_arg)
     comptime VEC = 16 // size_of[dtype]()
     var tid = Int(thread_idx.x)
     var row = Int(block_idx.x)
@@ -224,8 +235,8 @@ def _log_softmax_bwd_reg_kernel[
     gi: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     g: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     o: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
 ):
     # Rows whose vector body fits `slots` per-thread 16-byte registers are
     # staged there during the rowsum pass, so the emit pass never re-reads
@@ -233,6 +244,11 @@ def _log_softmax_bwd_reg_kernel[
     # write grad_input) with no shared memory and therefore no occupancy cost.
     # This replaces the no-staging fallback, which read `grad` twice -- four
     # passes over the logits tensor where three will do.
+    #
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
     comptime VEC = 16 // size_of[dtype]()
     var tid = Int(thread_idx.x)
     var row = Int(block_idx.x)
@@ -314,8 +330,8 @@ def _enqueue_bwd_reg[
         gi,
         g,
         o,
-        rows,
-        cols,
+        Int64(rows),
+        Int64(cols),
     )
 
 
@@ -449,8 +465,8 @@ def enqueue_log_softmax_backward[
                     gi,
                     g,
                     o,
-                    rows,
-                    cols,
+                    Int64(rows),
+                    Int64(cols),
                 )
             elif nvec_max >= 1024:
                 _enqueue_cached_smem[_log_softmax_bwd_smem_kernel[dtype, 512]](
@@ -463,8 +479,8 @@ def enqueue_log_softmax_backward[
                     gi,
                     g,
                     o,
-                    rows,
-                    cols,
+                    Int64(rows),
+                    Int64(cols),
                 )
             else:
                 _enqueue_cached_smem[_log_softmax_bwd_smem_kernel[dtype, 256]](
@@ -477,8 +493,8 @@ def enqueue_log_softmax_backward[
                     gi,
                     g,
                     o,
-                    rows,
-                    cols,
+                    Int64(rows),
+                    Int64(cols),
                 )
         else:
             # Rows too long for shared memory but short enough to stage in
@@ -512,6 +528,6 @@ def enqueue_log_softmax_backward[
                 gi,
                 g,
                 o,
-                rows,
-                cols,
+                Int64(rows),
+                Int64(cols),
             )

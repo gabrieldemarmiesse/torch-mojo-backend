@@ -40,9 +40,10 @@
 # loop is always unguarded, and stores are edge-masked.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import barrier, block_idx, lane_id, thread_idx, warp_id
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from std.gpu import block_idx, lane_id, thread_idx, warp_id
+from max.gpu.host import DeviceContext
+from std.memory import AddressSpace
 from std.math import ceildiv
 from std.memory import stack_allocation
 from std.sys import llvm_intrinsic
@@ -83,10 +84,16 @@ def _nn_mma8x8(
 def _nn_ksplit_reduce_kernel(
     out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    mn: Int,
-    ksplits: Int,
-    total: Int,
+    mn_arg: Int64,
+    ksplits_arg: Int64,
+    total_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var mn = Int(mn_arg)
+    var ksplits = Int(ksplits_arg)
+    var total = Int(total_arg)
+
     # 4 outputs per thread: one div/mod chain + vector loads per chunk.
     var i = (Int(block_idx.x) * 256 + Int(thread_idx.x)) * 4
     if i >= total:
@@ -140,12 +147,20 @@ def _apple8_nn_smem_kernel[
     c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    a_bstride: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    a_bstride_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var ksplits = Int(ksplits_arg)
+
     comptime THREADS = SGR * SGC * 32
     # Pad the A row stride (and B for symmetry) to stagger threadgroup
     # banks across the 8 fragment rows. PAD = 0 shrinks the footprint to
@@ -413,11 +428,11 @@ def apple_nn_smem_enqueue[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            a_bstride,
-            1,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(a_bstride),
+            Int64(1),
         )
         return
     var ws = ctx.enqueue_create_buffer[DType.float32](batch * ksplits * m * n)
@@ -439,11 +454,11 @@ def apple_nn_smem_enqueue[
         ws_mut,
         a,
         b,
-        m,
-        n,
-        k,
-        a_bstride,
-        ksplits,
+        Int64(m),
+        Int64(n),
+        Int64(k),
+        Int64(a_bstride),
+        Int64(ksplits),
     )
     var total = batch * m * n
     var c_out = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
@@ -456,9 +471,9 @@ def apple_nn_smem_enqueue[
         256,
         c_out,
         ws_mut.as_immutable(),
-        m * n,
-        ksplits,
-        total,
+        Int64(m * n),
+        Int64(ksplits),
+        Int64(total),
     )
     _ = ws^  # dropped now: the stream-ordered free lands after the reduce
 
@@ -485,12 +500,20 @@ def _apple8_nn_direct_kernel[
     c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    a_bstride: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    a_bstride_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var ksplits = Int(ksplits_arg)
+
     comptime SG_M = BM // SGR
     comptime SG_N = BN // SGC
     comptime NT_M = SG_M // NN_MMA8_DIM
@@ -584,7 +607,7 @@ def _apple8_nn_direct_kernel[
         )
         comptime for mi in range(NT_M):
             afrag[mi] = (ap0 + mi * NN_MMA8_DIM * k).load[width=NN_FRAG8]()
-        return afrag
+        return afrag^
 
     @always_inline
     @parameter
@@ -596,7 +619,7 @@ def _apple8_nn_direct_kernel[
         )
         comptime for ni in range(NT_N):
             bfrag[ni] = (bp0 + ni * NN_MMA8_DIM).load[width=NN_FRAG8]()
-        return bfrag
+        return bfrag^
 
     @always_inline
     @parameter
@@ -627,8 +650,8 @@ def _apple8_nn_direct_kernel[
                 var nxta = _load_a_fast(ap)
                 var nxtb = _load_b_fast(bp)
                 _mma_block(cura, curb, accum)
-                cura = nxta
-                curb = nxtb
+                cura = nxta^
+                curb = nxtb^
             _mma_block(cura, curb, accum)
         if full_end < k_end:
             _slab_guarded(full_end, accum)
@@ -701,11 +724,11 @@ def apple_nn_direct_enqueue[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            a_bstride,
-            1,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(a_bstride),
+            Int64(1),
         )
         return
     var ws = ctx.enqueue_create_buffer[DType.float32](batch * ksplits * m * n)
@@ -722,11 +745,11 @@ def apple_nn_direct_enqueue[
         ws_mut,
         a,
         b,
-        m,
-        n,
-        k,
-        a_bstride,
-        ksplits,
+        Int64(m),
+        Int64(n),
+        Int64(k),
+        Int64(a_bstride),
+        Int64(ksplits),
     )
     var total = batch * m * n
     var c_out = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
@@ -739,8 +762,8 @@ def apple_nn_direct_enqueue[
         256,
         c_out,
         ws_mut.as_immutable(),
-        m * n,
-        ksplits,
-        total,
+        Int64(m * n),
+        Int64(ksplits),
+        Int64(total),
     )
     _ = ws^  # dropped now: the stream-ordered free lands after the reduce

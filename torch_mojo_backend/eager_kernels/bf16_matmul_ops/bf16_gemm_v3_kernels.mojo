@@ -4,25 +4,18 @@ The accepted-v2 implementation remains the fallback for every regime not
 handled by the optimized NN, NT, and TN routes in this module.
 """
 
-from std.gpu import (
-    MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
-    block_idx,
-    thread_idx,
-)
-from std.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
-from std.gpu.host.nvidia.tma import (
-    TensorMapSwizzle,
-    create_tma_descriptor,
-)
-from std.gpu.compute.mma import (
+from max.gpu.sync import barrier
+from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, thread_idx
+from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
+from max.gpu.compute.mma import (
     wgmma_async,
     wgmma_commit_group_sync,
     wgmma_fence_aligned,
     wgmma_wait_group_sync,
 )
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
-from std.gpu.memory import AddressSpace
+from std.memory import AddressSpace
 from std.memory import stack_allocation
 from std.sys.info import _has_sm_9x, _is_sm_9x
 from std.utils.index import Index, IndexList
@@ -224,10 +217,15 @@ def _v3_nn_ws_m128n256_tma_s3(
     a_tma: _V3_NN_A_TMA,
     b_tma: _V3_NN_B_TMA,
     output: _V3_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     comptime if _is_sm_9x():
         var a_pipeline = LayoutTensor[
             _V3_BF16,
@@ -418,9 +416,9 @@ def _v3_enqueue_nn_ws_m128n256_tma_s3(
         a_tma,
         b_tma,
         output,
-        m,
-        n,
-        k,
+        Int64(m),
+        Int64(n),
+        Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_NN_THREADS,),
     )
@@ -438,10 +436,15 @@ def _v3_nn_ws_m64n128_tma_s3(
     a_tma: _V3_NN_SMALL_A_TMA,
     b_tma: _V3_NN_SMALL_B_TMA,
     output: _V3_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     comptime if _is_sm_9x():
         var a_pipeline = LayoutTensor[
             _V3_BF16,
@@ -637,9 +640,9 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
         a_tma,
         b_tma,
         output,
-        m,
-        n,
-        k,
+        Int64(m),
+        Int64(n),
+        Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_NN_SMALL_THREADS,),
     )
@@ -655,10 +658,15 @@ def _v3_nt_ws_m128n256_tma_s3(
     a_tma: _V3_NT_A_TMA,
     b_tma: _V3_B_K_TMA,
     output: _V3_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     comptime if _is_sm_9x():
         var a_pipeline = LayoutTensor[
             _V3_BF16,
@@ -847,9 +855,9 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
         a_tma,
         b_tma,
         output,
-        m,
-        n,
-        k,
+        Int64(m),
+        Int64(n),
+        Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_NT_THREADS,),
     )
@@ -867,10 +875,15 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
     a_tma: _V3_TN_SMALL_A_TMA,
     b_tma: _V3_TN_SMALL_B_TMA,
     output: _V3_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     comptime if _is_sm_9x():
         var a_pipeline = LayoutTensor[
             _V3_BF16,
@@ -1095,9 +1108,9 @@ def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
         a_tma,
         b_tma,
         output,
-        m,
-        n,
-        k,
+        Int64(m),
+        Int64(n),
+        Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_TN_SMALL_THREADS,),
     )
@@ -1115,10 +1128,15 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
     a_tma: _V3_TN_WS_A_TMA,
     b_tma: _V3_TN_WS_B_TMA,
     output: _V3_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     comptime if _is_sm_9x():
         # A is physical row-major (K, M).  TMA writes each (K, M) box
         # directly into an MN-major shared layout, which is exactly the
@@ -1348,9 +1366,9 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
         a_tma,
         b_tma,
         output,
-        m,
-        n,
-        k,
+        Int64(m),
+        Int64(n),
+        Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_TN_WS_THREADS,),
     )

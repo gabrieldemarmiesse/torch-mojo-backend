@@ -51,8 +51,9 @@ zeroes the complete output.
 
 from std.atomic import Atomic, Ordering
 from std.ffi import _get_global_or_null, external_call
-from std.gpu import barrier, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceAttribute, DeviceContext
+from max.gpu.sync import barrier
+from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu.host import DeviceAttribute, DeviceContext
 from std.math import ceildiv
 from std.memory import AddressSpace, alloc, stack_allocation
 from std.sys import inlined_assembly, is_amd_gpu, is_nvidia_gpu
@@ -151,10 +152,15 @@ def _atomic_add_f32_vec4(
 @__name("embedding_dense_backward_zero_vec4")
 def _zero_vec4(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    head: Int,
-    vec_count: Int,
-    tail: Int,
+    head_arg: Int64,
+    vec_count_arg: Int64,
+    tail_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var head = Int(head_arg)
+    var vec_count = Int(vec_count_arg)
+    var tail = Int(tail_arg)
     var tid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * _BLOCK
     # head/tail are < _VEC scalars around the 16-byte-aligned body.
@@ -172,8 +178,11 @@ def _zero_vec4(
 @__name("embedding_dense_backward_zero_scalar")
 def _zero_scalar(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    elements: Int,
+    elements_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
     var index = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * _BLOCK
     while index < elements:
@@ -186,10 +195,15 @@ def _scatter_vec4(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    num_indices: Int,
-    vec_cols: Int,
-    padding_idx: Int,
+    num_indices_arg: Int64,
+    vec_cols_arg: Int64,
+    padding_idx_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var num_indices = Int(num_indices_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var padding_idx = Int(padding_idx_arg)
     var e = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * _BLOCK
     var total = num_indices * vec_cols
@@ -210,10 +224,15 @@ def _scatter_scalar(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    num_indices: Int,
-    embedding_dim: Int,
-    padding_idx: Int,
+    num_indices_arg: Int64,
+    embedding_dim_arg: Int64,
+    padding_idx_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var num_indices = Int(num_indices_arg)
+    var embedding_dim = Int(embedding_dim_arg)
+    var padding_idx = Int(padding_idx_arg)
     var e = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * _BLOCK
     var total = num_indices * embedding_dim
@@ -231,8 +250,11 @@ def _scatter_scalar(
 @__name("embedding_dense_backward_count_zero")
 def _count_zero(
     counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
-    num_weights: Int,
+    num_weights_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var num_weights = Int(num_weights_arg)
     var index = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * _BLOCK
     while index < num_weights:
@@ -244,9 +266,13 @@ def _count_zero(
 def _count(
     counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
     indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    num_indices: Int,
-    padding_idx: Int,
+    num_indices_arg: Int64,
+    padding_idx_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var num_indices = Int(num_indices_arg)
+    var padding_idx = Int(padding_idx_arg)
     var index = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * _BLOCK
     while index < num_indices:
@@ -262,13 +288,17 @@ def _count(
 def _zero_untouched(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
-    num_weights: Int,
-    vec_cols: Int,
+    num_weights_arg: Int64,
+    vec_cols_arg: Int64,
 ):
     # Rows hit exactly once are fully overwritten by the histogram scatter's
     # plain stores, so only every other row needs the zero pass.  The 2D
     # (column chunk, row) grid replaces the flat form's per-element integer
     # division, which cost half the SM issue slots.
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var num_weights = Int(num_weights_arg)
+    var vec_cols = Int(vec_cols_arg)
     var col = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var row = Int(block_idx.y)
     var row_stride = Int(grid_dim.y)
@@ -289,10 +319,15 @@ def _scatter_hist_vec4(
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
     counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
-    num_indices: Int,
-    vec_cols: Int,
-    padding_idx: Int,
+    num_indices_arg: Int64,
+    vec_cols_arg: Int64,
+    padding_idx_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var num_indices = Int(num_indices_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var padding_idx = Int(padding_idx_arg)
     var col = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var row = Int(block_idx.y)
     var row_stride = Int(grid_dim.y)
@@ -319,16 +354,22 @@ def _owner_vec4(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    num_indices: Int,
-    vec_cols: Int,
-    num_weights: Int,
-    padding_idx: Int,
+    num_indices_arg: Int64,
+    vec_cols_arg: Int64,
+    num_weights_arg: Int64,
+    padding_idx_arg: Int64,
 ):
     # Thread (tx, ty) owns output cell (row block_y*_OWN_TY + ty, vec column
     # block_x*_OWN_TX + tx).  Index tiles are staged in threadgroup memory as
     # int32 (valid targets fit: the regime caps num_weights; padding rows are
     # encoded -1, which no owned row matches).  Inactive threads still run
     # every tile iteration so the barriers stay uniform.
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var num_indices = Int(num_indices_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var num_weights = Int(num_weights_arg)
+    var padding_idx = Int(padding_idx_arg)
     var tile = stack_allocation[
         _OWN_TILE, DType.int32, address_space=AddressSpace.SHARED
     ]()
@@ -367,11 +408,17 @@ def _owner_scalar(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    num_indices: Int,
-    embedding_dim: Int,
-    num_weights: Int,
-    padding_idx: Int,
+    num_indices_arg: Int64,
+    embedding_dim_arg: Int64,
+    num_weights_arg: Int64,
+    padding_idx_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var num_indices = Int(num_indices_arg)
+    var embedding_dim = Int(embedding_dim_arg)
+    var num_weights = Int(num_weights_arg)
+    var padding_idx = Int(padding_idx_arg)
     var tile = stack_allocation[
         _OWN_TILE, DType.int32, address_space=AddressSpace.SHARED
     ]()
@@ -404,13 +451,21 @@ def _table_accum(
     scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    num_indices: Int,
-    embedding_dim: Int,
-    num_weights: Int,
-    padding_idx: Int,
-    dim_pad: Int,
-    rows_per_block: Int,
+    num_indices_arg: Int64,
+    embedding_dim_arg: Int64,
+    num_weights_arg: Int64,
+    padding_idx_arg: Int64,
+    dim_pad_arg: Int64,
+    rows_per_block_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var num_indices = Int(num_indices_arg)
+    var embedding_dim = Int(embedding_dim_arg)
+    var num_weights = Int(num_weights_arg)
+    var padding_idx = Int(padding_idx_arg)
+    var dim_pad = Int(dim_pad_arg)
+    var rows_per_block = Int(rows_per_block_arg)
     var table = stack_allocation[
         _TABLE_MAX_ROWS * _TABLE_COLS,
         DType.float32,
@@ -480,15 +535,22 @@ def _table_accum(
 def _table_reduce(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    num_weights: Int,
-    embedding_dim: Int,
-    dim_pad: Int,
-    chunks: Int,
-    out_vec_ok: Int,
+    num_weights_arg: Int64,
+    embedding_dim_arg: Int64,
+    dim_pad_arg: Int64,
+    chunks_arg: Int64,
+    out_vec_ok_arg: Int64,
 ):
     # thread_idx.y splits the chunk dimension so the small output space still
     # produces enough in-flight loads; a shared tile folds the _RED_TY
     # partials before one thread row stores the row.
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var num_weights = Int(num_weights_arg)
+    var embedding_dim = Int(embedding_dim_arg)
+    var dim_pad = Int(dim_pad_arg)
+    var chunks = Int(chunks_arg)
+    var out_vec_ok = Int(out_vec_ok_arg)
     var partials = stack_allocation[
         _RED_TX * _RED_TY * _VEC,
         DType.float32,
@@ -603,10 +665,10 @@ def enqueue_embedding_dense_backward_f32_i64(
                     grad_weight,
                     grad_output,
                     indices,
-                    num_indices,
-                    vec_cols,
-                    num_weights,
-                    padding_idx,
+                    Int64(num_indices),
+                    Int64(vec_cols),
+                    Int64(num_weights),
+                    Int64(padding_idx),
                 )
             else:
                 _enqueue_cached_2d[_owner_scalar](
@@ -620,10 +682,10 @@ def enqueue_embedding_dense_backward_f32_i64(
                     grad_weight,
                     grad_output,
                     indices,
-                    num_indices,
-                    embedding_dim,
-                    num_weights,
-                    padding_idx,
+                    Int64(num_indices),
+                    Int64(embedding_dim),
+                    Int64(num_weights),
+                    Int64(padding_idx),
                 )
             return
 
@@ -667,12 +729,12 @@ def enqueue_embedding_dense_backward_f32_i64(
             scratch_ptr,
             grad_output,
             indices,
-            num_indices,
-            embedding_dim,
-            num_weights,
-            padding_idx,
-            dim_pad,
-            rows_per_block,
+            Int64(num_indices),
+            Int64(embedding_dim),
+            Int64(num_weights),
+            Int64(padding_idx),
+            Int64(dim_pad),
+            Int64(rows_per_block),
         )
         var out_vec_ok = 1 if (
             embedding_dim % _VEC == 0 and out_addr % 16 == 0
@@ -688,11 +750,11 @@ def enqueue_embedding_dense_backward_f32_i64(
             _RED_TY,
             grad_weight,
             scratch_ptr,
-            num_weights,
-            embedding_dim,
-            dim_pad,
-            blocks_y,
-            out_vec_ok,
+            Int64(num_weights),
+            Int64(embedding_dim),
+            Int64(dim_pad),
+            Int64(blocks_y),
+            Int64(out_vec_ok),
         )
         # Normal release after both stream-ordered consumers are enqueued.
         _ = scratch^
@@ -713,7 +775,7 @@ def enqueue_embedding_dense_backward_f32_i64(
             1,
             _BLOCK,
             counts_ptr,
-            num_weights,
+            Int64(num_weights),
         )
         _enqueue_cached[_count](
             ctx,
@@ -724,8 +786,8 @@ def enqueue_embedding_dense_backward_f32_i64(
             _BLOCK,
             counts_ptr,
             indices,
-            num_indices,
-            padding_idx,
+            Int64(num_indices),
+            Int64(padding_idx),
         )
         var col_blocks = ceildiv(vec_cols, _BLOCK)
         _enqueue_cached[_zero_untouched](
@@ -737,8 +799,8 @@ def enqueue_embedding_dense_backward_f32_i64(
             _BLOCK,
             grad_weight,
             counts_ptr,
-            num_weights,
-            vec_cols,
+            Int64(num_weights),
+            Int64(vec_cols),
         )
         _enqueue_cached[_scatter_hist_vec4](
             ctx,
@@ -751,9 +813,9 @@ def enqueue_embedding_dense_backward_f32_i64(
             grad_output,
             indices,
             counts_ptr,
-            num_indices,
-            vec_cols,
-            padding_idx,
+            Int64(num_indices),
+            Int64(vec_cols),
+            Int64(padding_idx),
         )
         _ = counts^
         return
@@ -775,9 +837,9 @@ def enqueue_embedding_dense_backward_f32_i64(
             1,
             _BLOCK,
             grad_weight,
-            head,
-            vec_count,
-            tail,
+            Int64(head),
+            Int64(vec_count),
+            Int64(tail),
         )
     else:
         var grid = max(1, min(ceildiv(output_elements, _BLOCK), max_grid))
@@ -789,7 +851,7 @@ def enqueue_embedding_dense_backward_f32_i64(
             1,
             _BLOCK,
             grad_weight,
-            output_elements,
+            Int64(output_elements),
         )
 
     if num_indices <= 0:
@@ -812,9 +874,9 @@ def enqueue_embedding_dense_backward_f32_i64(
             grad_weight,
             grad_output,
             indices,
-            num_indices,
-            vec_cols,
-            padding_idx,
+            Int64(num_indices),
+            Int64(vec_cols),
+            Int64(padding_idx),
         )
     else:
         var total = num_indices * embedding_dim
@@ -829,7 +891,7 @@ def enqueue_embedding_dense_backward_f32_i64(
             grad_weight,
             grad_output,
             indices,
-            num_indices,
-            embedding_dim,
-            padding_idx,
+            Int64(num_indices),
+            Int64(embedding_dim),
+            Int64(padding_idx),
         )

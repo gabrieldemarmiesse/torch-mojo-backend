@@ -16,13 +16,13 @@
 
 from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
-from std.algorithm.functional import elementwise
+from max.algorithm import elementwise
 from std.utils import IndexList
 
 from std.python._cpython import PyObjectPtr, Py_ssize_t
@@ -96,15 +96,25 @@ def _permute_copy_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d1: Int,
-    d2: Int,
-    d3: Int,
-    s0: Int,
-    s1: Int,
-    s2: Int,
-    s3: Int,
-    total: Int,
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    s0_arg: Int64,
+    s1_arg: Int64,
+    s2_arg: Int64,
+    s3_arg: Int64,
+    total_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var d1 = Int(d1_arg)
+    var d2 = Int(d2_arg)
+    var d3 = Int(d3_arg)
+    var s0 = Int(s0_arg)
+    var s1 = Int(s1_arg)
+    var s2 = Int(s2_arg)
+    var s3 = Int(s3_arg)
+    var total = Int(total_arg)
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while i < total:
@@ -123,14 +133,23 @@ def _permute_copy_rows4_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d1: Int,
-    d2: Int,
-    d3_4: Int,
-    s0: Int,
-    s1: Int,
-    s2: Int,
-    nchunks: Int,
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_4_arg: Int64,
+    s0_arg: Int64,
+    s1_arg: Int64,
+    s2_arg: Int64,
+    nchunks_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var d1 = Int(d1_arg)
+    var d2 = Int(d2_arg)
+    var d3_4 = Int(d3_4_arg)
+    var s0 = Int(s0_arg)
+    var s1 = Int(s1_arg)
+    var s2 = Int(s2_arg)
+    var nchunks = Int(nchunks_arg)
     # Innermost dim contiguous in BOTH buffers (s3 == 1): each thread moves
     # one 4-element vector, so the coordinate div/mod chain runs once per 4
     # elements and every access is a vector load/store.  This is the
@@ -159,14 +178,23 @@ def _permute_copy_rowloop_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d1: Int,
-    d2: Int,
-    d3_4: Int,
-    s0: Int,
-    s1: Int,
-    s2: Int,
-    nrows: Int,
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_4_arg: Int64,
+    s0_arg: Int64,
+    s1_arg: Int64,
+    s2_arg: Int64,
+    nrows_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var d1 = Int(d1_arg)
+    var d2 = Int(d2_arg)
+    var d3_4 = Int(d3_4_arg)
+    var s0 = Int(s0_arg)
+    var s1 = Int(s1_arg)
+    var s2 = Int(s2_arg)
+    var nrows = Int(nrows_arg)
     # One thread per (i0, i1, i2) row: the div/mod chain runs once per d3
     # elements and the sequential vector moves give each thread load-level
     # parallelism.  Measured ~2.5x the chunk kernel's throughput on Apple at
@@ -206,13 +234,13 @@ def _run_gather_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d1: Int,
-    d2: Int,
-    spv: Int,
-    s0: Int,
-    s1: Int,
-    s2: Int,
-    slots: Int,
+    d1_arg: Int64,
+    d2_arg: Int64,
+    spv_arg: Int64,
+    s0_arg: Int64,
+    s1_arg: Int64,
+    s2_arg: Int64,
+    slots_arg: Int64,
 ):
     """`out[i0,i1,i2,i3] = in[i0*s0 + i1*s1 + i2*s2 + i3]`, VEC elements a time.
 
@@ -221,6 +249,15 @@ def _run_gather_kernel[
     stride and the run length are multiples of VEC and that both base addresses
     are vector-aligned.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var d1 = Int(d1_arg)
+    var d2 = Int(d2_arg)
+    var spv = Int(spv_arg)
+    var s0 = Int(s0_arg)
+    var s1 = Int(s1_arg)
+    var s2 = Int(s2_arg)
+    var slots = Int(slots_arg)
     comptime ALIGN = min(16, VEC * size_of[dtype]())
     var j = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
@@ -306,13 +343,13 @@ def _permute_copy[
                     GS_THREADS,
                     out_ptr.as_unsafe_any_origin(),
                     in_ptr.as_unsafe_any_origin().as_immutable(),
-                    d1,
-                    d2,
-                    d3 // VEC,
-                    s0,
-                    s1,
-                    s2,
-                    slots,
+                    Int64(d1),
+                    Int64(d2),
+                    Int64(d3 // VEC),
+                    Int64(s0),
+                    Int64(s1),
+                    Int64(s2),
+                    Int64(slots),
                 )
                 return True
 
@@ -339,13 +376,13 @@ def _permute_copy[
                             GS_THREADS,
                             out_ptr.as_unsafe_any_origin(),
                             in_ptr.as_unsafe_any_origin().as_immutable(),
-                            d1,
-                            d2,
-                            d3 // 4,
-                            s0,
-                            s1,
-                            s2,
-                            nrows,
+                            Int64(d1),
+                            Int64(d2),
+                            Int64(d3 // 4),
+                            Int64(s0),
+                            Int64(s1),
+                            Int64(s2),
+                            Int64(nrows),
                         )
                         return
                     var nchunks = total // 4
@@ -358,13 +395,13 @@ def _permute_copy[
                         GS_THREADS,
                         out_ptr.as_unsafe_any_origin(),
                         in_ptr.as_unsafe_any_origin().as_immutable(),
-                        d1,
-                        d2,
-                        d3 // 4,
-                        s0,
-                        s1,
-                        s2,
-                        nchunks,
+                        Int64(d1),
+                        Int64(d2),
+                        Int64(d3 // 4),
+                        Int64(s0),
+                        Int64(s1),
+                        Int64(s2),
+                        Int64(nchunks),
                     )
                     return
 
@@ -418,12 +455,12 @@ def _permute_copy[
                     TILE * _T2D_ROWS,
                     out_ptr.as_unsafe_any_origin(),
                     in_ptr.as_unsafe_any_origin().as_immutable(),
-                    d2,
-                    d3,
-                    s3,
-                    batch,
-                    d2 * d3,
-                    s1 if batch > 1 else 0,
+                    Int64(d2),
+                    Int64(d3),
+                    Int64(s3),
+                    Int64(batch),
+                    Int64(d2 * d3),
+                    Int64(s1 if batch > 1 else 0),
                 )
                 return
             _enqueue_cached[_permute_copy_kernel[dtype]](
@@ -435,14 +472,14 @@ def _permute_copy[
                 GS_THREADS,
                 out_ptr.as_unsafe_any_origin(),
                 in_ptr.as_unsafe_any_origin().as_immutable(),
-                d1,
-                d2,
-                d3,
-                s0,
-                s1,
-                s2,
-                s3,
-                total,
+                Int64(d1),
+                Int64(d2),
+                Int64(d3),
+                Int64(s0),
+                Int64(s1),
+                Int64(s2),
+                Int64(s3),
+                Int64(total),
             )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -517,9 +554,13 @@ def _cat2_kernel2d[
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     in2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    len1_4: Int,
-    len2_4: Int,
+    len1_4_arg: Int64,
+    len2_4_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var len1_4 = Int(len1_4_arg)
+    var len2_4 = Int(len2_4_arg)
     comptime vec_align = 4 * size_of[dtype]()
     var o = Int(block_idx.y)
     var total4 = len1_4 + len2_4
@@ -585,8 +626,8 @@ def _cat2_go(
                 _make_ptr[DType.uint32](in2_addr)
                 .as_unsafe_any_origin()
                 .as_immutable(),
-                len1 // 4,
-                len2 // 4,
+                Int64(len1 // 4),
+                Int64(len2 // 4),
             )
         elif _dtype_arg_width_on[0, 16]():
             if itemsize != 2:
@@ -605,8 +646,8 @@ def _cat2_go(
                 _make_ptr[DType.uint16](in2_addr)
                 .as_unsafe_any_origin()
                 .as_immutable(),
-                len1 // 4,
-                len2 // 4,
+                Int64(len1 // 4),
+                Int64(len2 // 4),
             )
         elif _dtype_arg_width_on[0, 64]():
             if itemsize != 8:
@@ -625,8 +666,8 @@ def _cat2_go(
                 _make_ptr[DType.uint64](in2_addr)
                 .as_unsafe_any_origin()
                 .as_immutable(),
-                len1 // 4,
-                len2 // 4,
+                Int64(len1 // 4),
+                Int64(len2 // 4),
             )
         elif _dtype_arg_width_on[0, 8]():
             if itemsize != 1:
@@ -645,8 +686,8 @@ def _cat2_go(
                 _make_ptr[DType.uint8](in2_addr)
                 .as_unsafe_any_origin()
                 .as_immutable(),
-                len1 // 4,
-                len2 // 4,
+                Int64(len1 // 4),
+                Int64(len2 // 4),
             )
         else:
             raise Error("unsupported element size for cat2")
@@ -689,10 +730,15 @@ def _narrow_copy_dst_kernel2d[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dst_stride: Int,
-    copy_len4: Int,
-    dst_offset: Int,
+    dst_stride_arg: Int64,
+    copy_len4_arg: Int64,
+    dst_offset_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var dst_stride = Int(dst_stride_arg)
+    var copy_len4 = Int(copy_len4_arg)
+    var dst_offset = Int(dst_offset_arg)
     comptime vec_align = 4 * size_of[dtype]()
     var o = Int(block_idx.y)
     var src_base = o * copy_len4 * 4
@@ -713,11 +759,17 @@ def _narrow_copy_dst_kernel4[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dst_stride: Int,
-    copy_len: Int,
-    dst_offset: Int,
-    nchunks: Int,
+    dst_stride_arg: Int64,
+    copy_len_arg: Int64,
+    dst_offset_arg: Int64,
+    nchunks_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var dst_stride = Int(dst_stride_arg)
+    var copy_len = Int(copy_len_arg)
+    var dst_offset = Int(dst_offset_arg)
+    var nchunks = Int(nchunks_arg)
     comptime vec_align = 4 * size_of[dtype]()
     var c = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
@@ -737,11 +789,17 @@ def _narrow_copy_dst_kernel1[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    dst_stride: Int,
-    copy_len: Int,
-    dst_offset: Int,
-    total: Int,
+    dst_stride_arg: Int64,
+    copy_len_arg: Int64,
+    dst_offset_arg: Int64,
+    total_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var dst_stride = Int(dst_stride_arg)
+    var copy_len = Int(copy_len_arg)
+    var dst_offset = Int(dst_offset_arg)
+    var total = Int(total_arg)
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while i < total:
@@ -791,9 +849,9 @@ def _narrow_copy_dst[
                         GS_THREADS,
                         out_ptr.as_unsafe_any_origin(),
                         in_ptr.as_unsafe_any_origin().as_immutable(),
-                        dst_stride,
-                        copy_len4,
-                        dst_offset,
+                        Int64(dst_stride),
+                        Int64(copy_len4),
+                        Int64(dst_offset),
                     )
                     return
                 var nchunks = outer * copy_len4
@@ -806,10 +864,10 @@ def _narrow_copy_dst[
                     GS_THREADS,
                     out_ptr.as_unsafe_any_origin(),
                     in_ptr.as_unsafe_any_origin().as_immutable(),
-                    dst_stride,
-                    copy_len,
-                    dst_offset,
-                    nchunks,
+                    Int64(dst_stride),
+                    Int64(copy_len),
+                    Int64(dst_offset),
+                    Int64(nchunks),
                 )
             else:
                 var total = outer * copy_len
@@ -822,10 +880,10 @@ def _narrow_copy_dst[
                     GS_THREADS,
                     out_ptr.as_unsafe_any_origin(),
                     in_ptr.as_unsafe_any_origin().as_immutable(),
-                    dst_stride,
-                    copy_len,
-                    dst_offset,
-                    total,
+                    Int64(dst_stride),
+                    Int64(copy_len),
+                    Int64(dst_offset),
+                    Int64(total),
                 )
             return
         else:
@@ -1251,10 +1309,14 @@ def _cast_vec_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dst], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[src], ImmutAnyOrigin],
-    nvec: Int,
-    size: Int,
+    nvec_arg: Int64,
+    size_arg: Int64,
 ):
     """`out[i] = cast(in[i])` for `size` elements, VEC of them per thread."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var nvec = Int(nvec_arg)
+    var size = Int(size_arg)
     comptime IALIGN = min(16, VEC * size_of[src]())
     comptime OALIGN = min(16, VEC * size_of[dst]())
     var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
@@ -1282,7 +1344,9 @@ def _cast_vec_kernel[
     if t < size:
         var a = in_ptr[t]
         comptime if dst == DType.bool:
-            out_ptr[t] = Scalar[dst](a != Scalar[src](0))
+            # rc1: Scalar[dst](Bool) requires an integral dtype; build the
+            # concrete bool scalar first (cast is the identity here).
+            out_ptr[t] = Scalar[DType.bool](a != Scalar[src](0)).cast[dst]()
         else:
             out_ptr[t] = a.cast[dst]()
 
@@ -1305,7 +1369,9 @@ def _cast[
             var i = Int(idx[0].value())
             var a = in_ptr[i]
             comptime if dst == DType.bool:
-                out_ptr[i] = Scalar[dst](a != Scalar[src](0))
+                # rc1: Scalar[dst](Bool) requires an integral dtype; build the
+                # concrete bool scalar first (cast is the identity here).
+                out_ptr[i] = Scalar[DType.bool](a != Scalar[src](0)).cast[dst]()
             else:
                 out_ptr[i] = a.cast[dst]()
 
@@ -1348,8 +1414,8 @@ def _cast[
                 CAST_THREADS,
                 out_ptr.as_unsafe_any_origin(),
                 in_ptr.as_unsafe_any_origin().as_immutable(),
-                nvec,
-                size,
+                Int64(nvec),
+                Int64(size),
             )
             return True
 
@@ -2071,10 +2137,15 @@ def _cat3_kernel2d[
     in1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     in2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     in3_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    len1_4: Int,
-    len2_4: Int,
-    len3_4: Int,
+    len1_4_arg: Int64,
+    len2_4_arg: Int64,
+    len3_4_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var len1_4 = Int(len1_4_arg)
+    var len2_4 = Int(len2_4_arg)
+    var len3_4 = Int(len3_4_arg)
     comptime vec_align = 4 * size_of[dtype]()
     var o = Int(block_idx.y)
     var total4 = len1_4 + len2_4 + len3_4
@@ -2104,11 +2175,17 @@ def _cat3_segloop_kernel[
     in1_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     in2_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     in3_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    len1_4: Int,
-    len2_4: Int,
-    len3_4: Int,
-    outer: Int,
+    len1_4_arg: Int64,
+    len2_4_arg: Int64,
+    len3_4_arg: Int64,
+    outer_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var len1_4 = Int(len1_4_arg)
+    var len2_4 = Int(len2_4_arg)
+    var len3_4 = Int(len3_4_arg)
+    var outer = Int(outer_arg)
     # One thread per (row, source) segment: each thread streams its
     # segment's vectors sequentially (the access pattern this GPU streams
     # at full rate), with the source chosen once per thread.  Threads with
@@ -2217,10 +2294,10 @@ def _cat3_go(
                         _make_ptr[dt](in3_addr)
                         .as_unsafe_any_origin()
                         .as_immutable(),
-                        len1 // 4,
-                        len2 // 4,
-                        len3 // 4,
-                        outer,
+                        Int64(len1 // 4),
+                        Int64(len2 // 4),
+                        Int64(len3 // 4),
+                        Int64(outer),
                     )
                 else:
                     _enqueue_cached[_cat3_kernel2d[dt]](
@@ -2240,9 +2317,9 @@ def _cat3_go(
                         _make_ptr[dt](in3_addr)
                         .as_unsafe_any_origin()
                         .as_immutable(),
-                        len1 // 4,
-                        len2 // 4,
-                        len3 // 4,
+                        Int64(len1 // 4),
+                        Int64(len2 // 4),
+                        Int64(len3 // 4),
                     )
                 handled = True
         if not handled:

@@ -14,9 +14,9 @@
 from std.math import ceildiv
 from std.memory import alloc, stack_allocation
 from std.os import abort
+from max.gpu.sync import barrier
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
     block_dim,
     block_idx,
     grid_dim,
@@ -24,14 +24,14 @@ from std.gpu import (
     thread_idx,
     warp_id,
 )
-from std.gpu.compute.mma import mma
-from std.gpu.memory import (
-    AddressSpace,
+from max.gpu.compute.mma import mma
+from max.gpu.memory import (
     async_copy,
     async_copy_commit_group,
     async_copy_wait_group,
 )
-from std.gpu.host import (
+from std.memory import AddressSpace
+from max.gpu.host import (
     DeviceAttribute,
     DeviceBuffer,
     DeviceContext,
@@ -51,7 +51,7 @@ from std.sys.info import (
 from std.utils.coord import Coord as StdCoord
 from std.utils.static_tuple import StaticTuple
 
-from std.algorithm.functional import elementwise, parallelize
+from max.algorithm import elementwise, parallelize
 
 from layout import Coord, TileTensor, row_major
 from layout.tensor_core import get_mma_shape
@@ -92,7 +92,7 @@ def _mma8x8(
     ](a, b, c)
 
 
-from std.gpu.primitives.grid_controls import PDLLevel
+from max.gpu.primitives import PDLLevel
 
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 
@@ -178,12 +178,20 @@ def _gemm_tiled_kernel[
     c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    a_bstride: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    a_bstride_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var ksplits = Int(ksplits_arg)
+
     comptime THREADS = (BM // TM) * (BN // TN)
     comptime assert (BM * BK) % THREADS == 0, "A tile not evenly loadable"
     comptime assert (BK * BN) % THREADS == 0, "B tile not evenly loadable"
@@ -317,12 +325,20 @@ def _gemm_pipe_kernel[
     c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    a_bstride: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    a_bstride_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var ksplits = Int(ksplits_arg)
+
     comptime F32 = DType.float32
     comptime THREADS = (BM // TM) * (BN // TN)
     comptime LA = (BM * BK) // THREADS  # A elements per thread per slab
@@ -546,9 +562,14 @@ comptime PIPE3_STAGES = 4
 def _transpose_small_kernel(
     out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m: Int,
-    k: Int,
+    m_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var k = Int(k_arg)
+
     var i = block_idx.x * 256 + thread_idx.x
     if i >= m * k:
         return
@@ -587,13 +608,21 @@ def _gemm_pipe3_kernel[
     c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    a_bstride: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    a_bstride_arg: Int64,
+    ksplits_arg: Int64,
     bias_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var ksplits = Int(ksplits_arg)
+
     comptime F32 = DType.float32
     comptime THREADS = (BM // TM) * (BN // TN)
     comptime NA = (BM * BK) // (THREADS * VEC_A)
@@ -819,12 +848,20 @@ def _gemm_smallm_kernel[
     c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    a_bstride: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    a_bstride_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var ksplits = Int(ksplits_arg)
+
     var col = block_idx.x * SMALLM_THREADS + thread_idx.x
     if col >= n:
         return
@@ -905,18 +942,27 @@ def _amd_dynamic_mfma_edge_kernel[
     a: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     b: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     bias: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    n: Int,
-    k: Int,
-    row_start: Int,
-    row_count: Int,
-    col_start: Int,
-    col_count: Int,
+    n_arg: Int64,
+    k_arg: Int64,
+    row_start_arg: Int64,
+    row_count_arg: Int64,
+    col_start_arg: Int64,
+    col_count_arg: Int64,
 ):
     """Compute a partial M/N edge without padding or a workspace.
 
     The MFMA launch handles only complete BMxBN tiles. At most one thin row
     strip and one thin column strip remain for this scalar cleanup kernel.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var row_start = Int(row_start_arg)
+    var row_count = Int(row_count_arg)
+    var col_start = Int(col_start_arg)
+    var col_count = Int(col_count_arg)
+
     var idx = block_idx.x * 256 + thread_idx.x
     if idx >= row_count * col_count:
         return
@@ -1112,12 +1158,12 @@ def _amd_dynamic_mfma_gemm[
             a_raw,
             b_raw,
             bias_ptr.as_unsafe_any_origin(),
-            n,
-            k,
-            0,
-            m,
-            n_full,
-            col_count,
+            Int64(n),
+            Int64(k),
+            Int64(0),
+            Int64(m),
+            Int64(n_full),
+            Int64(col_count),
         )
 
 
@@ -1162,10 +1208,10 @@ def _amd_splitk_mfma_kernel[
     ws_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    k_per: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    k_per_arg: Int64,
 ):
     """One K slab per `block_idx.z`, into that slab's own FP32 workspace slice.
 
@@ -1173,6 +1219,13 @@ def _amd_splitk_mfma_kernel[
     the dispatch, so every slab is a whole number of K tiles and the loader never
     reads past an operand.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var k_per = Int(k_per_arg)
+
     var z = Int(block_idx.z)
     var k_off = z * k_per
     var ws_ptr = ws_base + z * m * n
@@ -1205,12 +1258,18 @@ def _splitk_reduce_kernel[
 ](
     c_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    total: Int,
-    parts: Int,
-    vec_count: Int,
+    total_arg: Int64,
+    parts_arg: Int64,
+    vec_count_arg: Int64,
 ):
     """`c[i] = sum over slabs of ws[slab, i]`, summed and rounded once in FP32.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var total = Int(total_arg)
+    var parts = Int(parts_arg)
+    var vec_count = Int(vec_count_arg)
+
     var index = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     var j = index
@@ -1270,10 +1329,10 @@ def _amd_splitk_mfma_gemm[
         ws.unsafe_ptr().as_unsafe_any_origin(),
         _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_immutable(),
         _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_immutable(),
-        m,
-        n,
-        k,
-        k // parts,
+        Int64(m),
+        Int64(n),
+        Int64(k),
+        Int64(k // parts),
         grid_dim=(n // BN, ceildiv(m, BM), parts),
         block_dim=config.block_dim(),
         shared_mem_bytes=config.shared_mem_usage(),
@@ -1294,9 +1353,9 @@ def _amd_splitk_mfma_gemm[
         256,
         _make_ptr[dtype](c_addr).as_unsafe_any_origin(),
         ws.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
-        total,
-        parts,
-        total // VEC,
+        Int64(total),
+        Int64(parts),
+        Int64(total // VEC),
     )
     _ = ws^
 
@@ -1417,17 +1476,26 @@ def _amd_batched_mfma_kernel[
     c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    c_bstride: Int,
-    a_bstride: Int,
-    b_bstride: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    c_bstride_arg: Int64,
+    a_bstride_arg: Int64,
+    b_bstride_arg: Int64,
 ):
     """One batch element per block_idx.z, sharing the 2-D multistage core."""
     comptime assert (
         CAUSAL == CAUSAL_NONE or CAUSAL == CAUSAL_OUT or not transpose_b
     ), "the contraction-side causal regimes need a [K, N] B operand"
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var c_bstride = Int(c_bstride_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var b_bstride = Int(b_bstride_arg)
+
     var z = Int(block_idx.z)
     var row_block = Int(block_idx.y)
     var col_block = Int(block_idx.x)
@@ -1511,20 +1579,31 @@ def _amd_batched_mfma_edge_kernel[
     c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    c_bstride: Int,
-    a_bstride: Int,
-    b_bstride: Int,
-    col_start: Int,
-    col_count: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    c_bstride_arg: Int64,
+    a_bstride_arg: Int64,
+    b_bstride_arg: Int64,
+    col_start_arg: Int64,
+    col_count_arg: Int64,
 ):
     """Scalar cleanup for the trailing N columns of every batch element.
 
     The causal regimes are applied per element here rather than per tile, which
     is exact and needs no divisibility between the tile and the extents.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var c_bstride = Int(c_bstride_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var b_bstride = Int(b_bstride_arg)
+    var col_start = Int(col_start_arg)
+    var col_count = Int(col_count_arg)
+
     var idx = Int(block_idx.x) * 256 + Int(thread_idx.x)
     if idx >= m * col_count:
         return
@@ -1613,12 +1692,12 @@ def _amd_batched_mfma_gemm[
             c_ptr,
             a_ptr,
             b_ptr,
-            m,
-            n,
-            k,
-            m * n,
-            a_bstride,
-            n * k,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(m * n),
+            Int64(a_bstride),
+            Int64(n * k),
             grid_dim=(n_full // BN, ceildiv(m, BM), batch),
             block_dim=config.block_dim(),
             shared_mem_bytes=config.shared_mem_usage(),
@@ -1640,14 +1719,14 @@ def _amd_batched_mfma_gemm[
             c_ptr,
             a_ptr,
             b_ptr,
-            m,
-            n,
-            k,
-            m * n,
-            a_bstride,
-            n * k,
-            n_full,
-            col_count,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(m * n),
+            Int64(a_bstride),
+            Int64(n * k),
+            Int64(n_full),
+            Int64(col_count),
         )
 
 
@@ -1955,12 +2034,20 @@ def _nt_mfma_kernel[
     c: UnsafePointer[Scalar[otype], MutAnyOrigin],
     a: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     b: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    k_per: Int,
-    xcds: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    k_per_arg: Int64,
+    xcds_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var k_per = Int(k_per_arg)
+    var xcds = Int(xcds_arg)
+
     comptime WAVES_N = BN // WN
     comptime THREADS = (BM // WM) * WAVES_N * 64
     comptime MT = WM // NT_MMA
@@ -2964,11 +3051,11 @@ def _nt_mfma_gemm[
             _make_ptr[otype](c_addr),
             _make_ptr[dtype](a_addr).as_immutable(),
             _make_ptr[dtype](b_addr).as_immutable(),
-            m,
-            n,
-            k,
-            k_per,
-            xcds,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(k_per),
+            Int64(xcds),
             grid_dim=grid,
             block_dim=(THREADS,),
         )
@@ -3295,9 +3382,9 @@ def _dense_mfma_route[
             256,
             _make_ptr[dtype](c_addr).as_unsafe_any_origin(),
             ws.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
-            m * n,
-            b_parts,
-            m * n // VEC,
+            Int64(m * n),
+            Int64(b_parts),
+            Int64(m * n // VEC),
         )
         _ = ws^
 
@@ -3789,11 +3876,11 @@ def _enqueue_pipe[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
             )
         else:
             _enqueue_cached[_gemm_pipe_kernel[BM, BN, BK, TM, TN, 1, 1, True]](
@@ -3806,11 +3893,11 @@ def _enqueue_pipe[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
             )
     elif BM >= 128:
         # Compute-bound fat tiles: 2-stage with transposed-A vector frags.
@@ -3826,11 +3913,11 @@ def _enqueue_pipe[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
             )
         elif va4:
             _enqueue_cached[_gemm_pipe_kernel[BM, BN, BK, TM, TN, 4, 1, False]](
@@ -3843,11 +3930,11 @@ def _enqueue_pipe[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
             )
         elif vb4:
             _enqueue_cached[_gemm_pipe_kernel[BM, BN, BK, TM, TN, 1, 4, False]](
@@ -3860,11 +3947,11 @@ def _enqueue_pipe[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
             )
         else:
             _enqueue_cached[_gemm_pipe_kernel[BM, BN, BK, TM, TN, 1, 1, False]](
@@ -3877,11 +3964,11 @@ def _enqueue_pipe[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
             )
     else:
         # Latency-bound thin tiles: 3-stage cp.async pipeline.
@@ -3901,11 +3988,11 @@ def _enqueue_pipe[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
                 a,
             )
         elif va4:
@@ -3923,11 +4010,11 @@ def _enqueue_pipe[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
                 a,
             )
         elif vb4:
@@ -3945,11 +4032,11 @@ def _enqueue_pipe[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
                 a,
             )
         else:
@@ -3967,11 +4054,11 @@ def _enqueue_pipe[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
                 a,
             )
 
@@ -4259,11 +4346,11 @@ def _gemm_enqueue[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
             )
         elif use_t128:
             comptime if dtype == DType.float32:
@@ -4294,11 +4381,11 @@ def _gemm_enqueue[
                     c,
                     a,
                     b,
-                    m,
-                    n,
-                    k,
-                    a_bstride,
-                    ksplits,
+                    Int64(m),
+                    Int64(n),
+                    Int64(k),
+                    Int64(a_bstride),
+                    Int64(ksplits),
                 )
         elif use_n32:
             comptime if dtype == DType.float32:
@@ -4345,11 +4432,11 @@ def _gemm_enqueue[
                     c,
                     a,
                     b,
-                    m,
-                    n,
-                    k,
-                    a_bstride,
-                    ksplits,
+                    Int64(m),
+                    Int64(n),
+                    Int64(k),
+                    Int64(a_bstride),
+                    Int64(ksplits),
                 )
         if ksplits > 1:
             var total = batch * m * n
@@ -4368,9 +4455,9 @@ def _gemm_enqueue[
                 256,
                 c_out,
                 ws_ptr,
-                m * n,
-                ksplits,
-                total,
+                Int64(m * n),
+                Int64(ksplits),
+                Int64(total),
             )
         # Keep the workspace alive until its free is enqueued after the
         # reduce (stream-ordered).
@@ -4526,11 +4613,18 @@ def _apple8_gemm_kernel[
     a_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     b_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     bias_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var ksplits = Int(ksplits_arg)
+
     comptime BLOCK_M = 32
     comptime BLOCK_N = 64
     comptime SG_M = BLOCK_M // 2
@@ -4618,10 +4712,16 @@ def _apple8_reduce_kernel[
     c_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     bias_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    mn: Int,
-    n: Int,
-    ksplits: Int,
+    mn_arg: Int64,
+    n_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var mn = Int(mn_arg)
+    var n = Int(n_arg)
+    var ksplits = Int(ksplits_arg)
+
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while i < mn:
@@ -4680,10 +4780,10 @@ def _apple8_enqueue[
             a,
             b,
             bias,
-            m,
-            n,
-            k,
-            1,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(1),
         )
         return
     var ws = ctx.enqueue_create_buffer[DType.float32](ksplits * m * n)
@@ -4701,10 +4801,10 @@ def _apple8_enqueue[
         a,
         b,
         bias,
-        m,
-        n,
-        k,
-        ksplits,
+        Int64(m),
+        Int64(n),
+        Int64(k),
+        Int64(ksplits),
     )
     var mn = m * n
     _enqueue_cached[_apple8_reduce_kernel[HAS_BIAS]](
@@ -4717,9 +4817,9 @@ def _apple8_enqueue[
         c,
         ws_mut.as_immutable(),
         bias,
-        mn,
-        n,
-        ksplits,
+        Int64(mn),
+        Int64(n),
+        Int64(ksplits),
     )
     _ = ws^  # dropped now: the stream-ordered free lands after the reduce
 
@@ -4756,12 +4856,20 @@ def _apple8_fat_kernel[
     c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    a_bstride: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    a_bstride_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var ksplits = Int(ksplits_arg)
+
     comptime SG_M = BLOCK_M // SG_ROWS
     comptime SG_N = BLOCK_N // SG_COLS
     comptime NT_M = SG_M // MMA8_DIM
@@ -4876,7 +4984,7 @@ def _apple8_fat_kernel[
                 afrag[mi] = af
             else:
                 afrag[mi] = (ap0 + mi * MMA8_DIM * k).load[width=FRAG8]()
-        return afrag
+        return afrag^
 
     @always_inline
     @parameter
@@ -4896,7 +5004,7 @@ def _apple8_fat_kernel[
                 bfrag[ni] = bf
             else:
                 bfrag[ni] = (bp0 + ni * MMA8_DIM).load[width=FRAG8]()
-        return bfrag
+        return bfrag^
 
     @always_inline
     @parameter
@@ -4942,8 +5050,8 @@ def _apple8_fat_kernel[
                 var nxta = _load_a_fast(ap)
                 var nxtb = _load_b_fast(bp)
                 _mma_block(cura, curb, accum)
-                cura = nxta
-                curb = nxtb
+                cura = nxta^
+                curb = nxtb^
             _mma_block(cura, curb, accum)
         if full_end < k_end:
             _slab_guarded(full_end, accum)
@@ -5031,11 +5139,11 @@ def _apple8_fat_enqueue[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                1,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(1),
             )
         else:
             _enqueue_cached[
@@ -5062,11 +5170,11 @@ def _apple8_fat_enqueue[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                1,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(1),
             )
         return
     var ws = ctx.enqueue_create_buffer[DType.float32](batch * ksplits * m * n)
@@ -5084,11 +5192,11 @@ def _apple8_fat_enqueue[
             ws_mut,
             a,
             b,
-            m,
-            n,
-            k,
-            a_bstride,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(a_bstride),
+            Int64(ksplits),
         )
     else:
         _enqueue_cached[
@@ -5115,11 +5223,11 @@ def _apple8_fat_enqueue[
             ws_mut,
             a,
             b,
-            m,
-            n,
-            k,
-            a_bstride,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(a_bstride),
+            Int64(ksplits),
         )
     var total = batch * m * n
     var c_out = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
@@ -5132,9 +5240,9 @@ def _apple8_fat_enqueue[
         256,
         c_out,
         ws_mut.as_immutable(),
-        m * n,
-        ksplits,
-        total,
+        Int64(m * n),
+        Int64(ksplits),
+        Int64(total),
     )
     _ = ws^  # dropped now: the stream-ordered free lands after the reduce
 
@@ -5163,12 +5271,20 @@ def _apple8_smem_kernel[
     c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
     b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    a_bstride: Int,
-    ksplits: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    a_bstride_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var ksplits = Int(ksplits_arg)
+
     comptime BLOCK_M = 64
     comptime BLOCK_N = 64
     comptime BK = 16
@@ -5454,11 +5570,11 @@ def _tune_enqueue[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
                 bias,
             )
         else:
@@ -5474,11 +5590,11 @@ def _tune_enqueue[
                 c,
                 a,
                 b,
-                m,
-                n,
-                k,
-                a_bstride,
-                ksplits,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(a_bstride),
+                Int64(ksplits),
             )
         if ksplits > 1:
             var total = batch * m * n
@@ -5497,9 +5613,9 @@ def _tune_enqueue[
                 256,
                 c_out,
                 ws_ptr,
-                m * n,
-                ksplits,
-                total,
+                Int64(m * n),
+                Int64(ksplits),
+                Int64(total),
             )
         _ = ws^
     else:
@@ -5547,8 +5663,8 @@ def _ct_enqueue[
             256,
             at_out,
             a_in,
-            m,
-            k,
+            Int64(m),
+            Int64(k),
         )
         var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
         var wa = (
@@ -5576,11 +5692,11 @@ def _ct_enqueue[
             c,
             wa,
             at,
-            n,
-            m,
-            k,
-            n * k,
-            1,
+            Int64(n),
+            Int64(m),
+            Int64(k),
+            Int64(n * k),
+            Int64(1),
             at,
         )
         _ = at_buf^
@@ -5623,8 +5739,8 @@ def _pipe3t_enqueue[
             256,
             at_out,
             a_in,
-            m,
-            k,
+            Int64(m),
+            Int64(k),
         )
         var gx = ceildiv(n, BN)
         var gy = ceildiv(m, BM)
@@ -5663,11 +5779,11 @@ def _pipe3t_enqueue[
             c,
             at,
             b,
-            m,
-            n,
-            k,
-            m * k,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(m * k),
+            Int64(ksplits),
             at,
         )
         if ksplits > 1:
@@ -5687,9 +5803,9 @@ def _pipe3t_enqueue[
                 256,
                 c_out,
                 ws_ptr,
-                m * n,
-                ksplits,
-                total,
+                Int64(m * n),
+                Int64(ksplits),
+                Int64(total),
             )
         _ = ws^
         _ = at_buf^
@@ -6620,7 +6736,7 @@ def _matmul_spec_checks(
         raise Error("mojo spec matmul: operand dtypes differ")
     if a.ctx_ptr != b.ctx_ptr:
         raise Error("mojo spec matmul: operands on different devices")
-    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
+    if not _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype):
         raise Error("mojo spec matmul: unsupported dtype ", a.dtype)
     if a.rank < 2 or b.rank != 2:
         raise Error("mojo spec matmul: bad ranks")
@@ -6988,7 +7104,7 @@ def _bmm_spec_into_go(
         raise Error("mojo spec bmm: operand dtypes differ")
     if a.ctx_ptr != b.ctx_ptr:
         raise Error("mojo spec bmm: operands on different devices")
-    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
+    if not _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype):
         raise Error("mojo spec bmm: unsupported dtype ", a.dtype)
     if a.rank != 3 or b.rank != 3:
         raise Error("mojo spec bmm: rank != 3")

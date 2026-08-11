@@ -137,17 +137,17 @@ accumulator ONCE, unconditionally, in straight-line code, fenced with
 """
 
 from flash_attention_fwd_kernels import RowStrides, _is_dense
+from max.gpu.sync import barrier
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
     block_idx,
     grid_dim,
     thread_idx,
 )
-from std.gpu.compute.mma import mma
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
-from std.gpu.primitives import block
+from max.gpu.compute.mma import mma
+from max.gpu.host import DeviceContext
+from std.memory import AddressSpace
+from max.gpu.primitives import block
 from std.gpu.primitives.warp import shuffle_xor
 from std.math import ceildiv, exp, exp2
 from std.memory import bitcast, stack_allocation
@@ -219,13 +219,19 @@ def _bwd_dq_baseline[
     v_st: RowStrides,
     o_st: RowStrides,
     dq_st: RowStrides,
-    seq_q: Int,
-    seq_kv: Int,
-    head_dim: Int,
+    seq_q_arg: Int64,
+    seq_kv_arg: Int64,
+    head_dim_arg: Int64,
     scale: Float32,
-    causal: Int,
+    causal_arg: Int64,
 ):
     """One block per (batch, head, query row) accumulating dQ for that row."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var seq_q = Int(seq_q_arg)
+    var seq_kv = Int(seq_kv_arg)
+    var head_dim = Int(head_dim_arg)
+    var causal = Int(causal_arg)
     var tid = Int(thread_idx.x)
     var qi = Int(block_idx.x)
     var head = Int(block_idx.y)
@@ -319,11 +325,11 @@ def _bwd_dkv_baseline[
     o_st: RowStrides,
     dk_st: RowStrides,
     dv_st: RowStrides,
-    seq_q: Int,
-    seq_kv: Int,
-    head_dim: Int,
+    seq_q_arg: Int64,
+    seq_kv_arg: Int64,
+    head_dim_arg: Int64,
     scale: Float32,
-    causal: Int,
+    causal_arg: Int64,
 ):
     """One block per (batch, head, key row) accumulating dK and dV for that row.
 
@@ -331,6 +337,12 @@ def _bwd_dkv_baseline[
     without atomics: every contribution to `dk[j]` and `dv[j]` comes from this
     block alone.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var seq_q = Int(seq_q_arg)
+    var seq_kv = Int(seq_kv_arg)
+    var head_dim = Int(head_dim_arg)
+    var causal = Int(causal_arg)
     var tid = Int(thread_idx.x)
     var j = Int(block_idx.x)
     var head = Int(block_idx.y)
@@ -439,11 +451,11 @@ def _bwd_dq_mfma[
     v_st: RowStrides,
     o_st: RowStrides,
     dq_st: RowStrides,
-    seq_q: Int,
-    seq_kv: Int,
-    head_dim: Int,
+    seq_q_arg: Int64,
+    seq_kv_arg: Int64,
+    head_dim_arg: Int64,
     scale: Float32,
-    causal: Int,
+    causal_arg: Int64,
 ):
     """dQ only: one workgroup owns `4 * 32 * QT` query rows and walks kv tiles.
 
@@ -458,6 +470,12 @@ def _bwd_dq_mfma[
     multiply by `head_dim`, so reading the row stride out of `dq_st` instead
     costs nothing.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var seq_q = Int(seq_q_arg)
+    var seq_kv = Int(seq_kv_arg)
+    var head_dim = Int(head_dim_arg)
+    var causal = Int(causal_arg)
     comptime NW = 4
     comptime BM = NW * 32 * QT
     comptime KSTEPS = HD // 8  # k-steps of the score / dP GEMMs (over d)
@@ -819,11 +837,11 @@ def _bwd_dkv_mfma[
     o_st: RowStrides,
     dk_st: RowStrides,
     dv_st: RowStrides,
-    seq_q: Int,
-    seq_kv: Int,
-    head_dim: Int,
+    seq_q_arg: Int64,
+    seq_kv_arg: Int64,
+    head_dim_arg: Int64,
     scale: Float32,
-    causal: Int,
+    causal_arg: Int64,
 ):
     """dK and dV: one workgroup owns `4 * 32 * KT` key rows and walks q tiles.
 
@@ -837,6 +855,12 @@ def _bwd_dkv_mfma[
     nothing about `dk_st` and `dv_st`: the epilogue's store address was already a
     runtime multiply by `head_dim`.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var seq_q = Int(seq_q_arg)
+    var seq_kv = Int(seq_kv_arg)
+    var head_dim = Int(head_dim_arg)
+    var causal = Int(causal_arg)
     comptime NW = 4
     comptime BN = NW * 32 * KT
     comptime MT = BM // 32  # query MFMA tiles per score tile
@@ -1242,11 +1266,11 @@ def _enqueue_mfma_pair[
             o_st,
             dk_st,
             dv_st,
-            seq_q,
-            seq_kv,
-            head_dim,
+            Int64(seq_q),
+            Int64(seq_kv),
+            Int64(head_dim),
             scale,
-            causal,
+            Int64(causal),
             grid_dim=(ceildiv(seq_kv, 4 * 32 * KT), heads, batch),
             block_dim=(THREADS,),
         )
@@ -1266,11 +1290,11 @@ def _enqueue_mfma_pair[
             v_st,
             o_st,
             dq_st,
-            seq_q,
-            seq_kv,
-            head_dim,
+            Int64(seq_q),
+            Int64(seq_kv),
+            Int64(head_dim),
             scale,
-            causal,
+            Int64(causal),
             grid_dim=(ceildiv(seq_q, 4 * 32 * QT), heads, batch),
             block_dim=(THREADS,),
         )
@@ -1293,11 +1317,11 @@ def _enqueue_mfma_pair[
         o_st,
         dk_st,
         dv_st,
-        seq_q,
-        seq_kv,
-        head_dim,
+        Int64(seq_q),
+        Int64(seq_kv),
+        Int64(head_dim),
         scale,
-        causal,
+        Int64(causal),
         grid_dim=(ceildiv(seq_kv, 4 * 32 * KT), heads, batch),
         block_dim=(THREADS,),
     )
@@ -1317,11 +1341,11 @@ def _enqueue_mfma_pair[
         v_st,
         o_st,
         dq_st,
-        seq_q,
-        seq_kv,
-        head_dim,
+        Int64(seq_q),
+        Int64(seq_kv),
+        Int64(head_dim),
         scale,
-        causal,
+        Int64(causal),
         grid_dim=(ceildiv(seq_q, 4 * 32 * QT), heads, batch),
         block_dim=(THREADS,),
     )
@@ -1531,11 +1555,11 @@ def enqueue_flash_attention_bwd[
         v_st,
         o_st,
         dq_st,
-        seq_q,
-        seq_kv,
-        head_dim,
+        Int64(seq_q),
+        Int64(seq_kv),
+        Int64(head_dim),
         scale,
-        causal,
+        Int64(causal),
         grid_dim=(seq_q, heads, batch),
         block_dim=(THREADS,),
     )
@@ -1555,11 +1579,11 @@ def enqueue_flash_attention_bwd[
         o_st,
         dk_st,
         dv_st,
-        seq_q,
-        seq_kv,
-        head_dim,
+        Int64(seq_q),
+        Int64(seq_kv),
+        Int64(head_dim),
         scale,
-        causal,
+        Int64(causal),
         grid_dim=(seq_kv, heads, batch),
         block_dim=(THREADS,),
     )

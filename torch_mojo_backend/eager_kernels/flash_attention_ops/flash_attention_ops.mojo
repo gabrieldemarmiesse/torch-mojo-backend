@@ -12,9 +12,9 @@
 # inside the measured 0.998x: the harness zeroes on every timed iteration too.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu.host import DeviceBuffer
+from max.gpu.host import DeviceBuffer
 from std.os import abort
-from std.gpu.memory import AddressSpace
+from std.memory import AddressSpace
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.python._cpython import PyObjectPtr, Py_ssize_t

@@ -50,9 +50,10 @@
 # path (`try_enqueue_tn_f32_gemm` declines off sm_90).
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import barrier, block_idx, thread_idx
-from std.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
-from std.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from std.gpu import block_idx, thread_idx
+from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+from std.memory import AddressSpace
 from std.math import ceildiv
 from std.memory import stack_allocation
 from std.sys.info import _has_sm_9x
@@ -101,9 +102,14 @@ comptime DEEPK_MAX_BASE = 7
 def _tn_ksplit_reduce_wide_kernel(
     c_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    mn: Int,
-    ksplits: Int,
+    mn_arg: Int64,
+    ksplits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var mn = Int(mn_arg)
+    var ksplits = Int(ksplits_arg)
+
     var tid = Int(thread_idx.x)
     var j = tid // 32
     var lane = tid % 32
@@ -193,10 +199,10 @@ def _tn_core_launch[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(ksplits),
         )
     elif va4:
         _enqueue_cached[
@@ -211,10 +217,10 @@ def _tn_core_launch[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(ksplits),
         )
     elif vb4:
         _enqueue_cached[
@@ -229,10 +235,10 @@ def _tn_core_launch[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(ksplits),
         )
     else:
         _enqueue_cached[
@@ -247,10 +253,10 @@ def _tn_core_launch[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(ksplits),
         )
 
 
@@ -298,10 +304,10 @@ def _tn_split_launch[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(ksplits),
         )
     elif va4:
         _enqueue_cached[_tn_split_kernel[BM, BN, BK, 4, 1, STAGES, LR, SERP]](
@@ -314,10 +320,10 @@ def _tn_split_launch[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(ksplits),
         )
     elif vb4:
         _enqueue_cached[_tn_split_kernel[BM, BN, BK, 1, 4, STAGES, LR, SERP]](
@@ -330,10 +336,10 @@ def _tn_split_launch[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(ksplits),
         )
     else:
         _enqueue_cached[_tn_split_kernel[BM, BN, BK, 1, 1, STAGES, LR, SERP]](
@@ -346,10 +352,10 @@ def _tn_split_launch[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            ksplits,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(ksplits),
         )
 
 
@@ -584,8 +590,8 @@ def try_enqueue_tn_f32_gemm(
                 256,
                 c_out,
                 ws_ptr,
-                total,
-                ksplits,
+                Int64(total),
+                Int64(ksplits),
             )
         else:
             _enqueue_cached[_ksplit_reduce_kernel](
@@ -597,9 +603,9 @@ def try_enqueue_tn_f32_gemm(
                 256,
                 c_out,
                 ws_ptr,
-                m * n,
-                ksplits,
-                total,
+                Int64(m * n),
+                Int64(ksplits),
+                Int64(total),
             )
     _ = ws^
     return True

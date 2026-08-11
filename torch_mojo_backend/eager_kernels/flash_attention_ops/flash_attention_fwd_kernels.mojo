@@ -131,17 +131,17 @@ Two consequences, both paid for in measurements:
 """
 
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
+from max.gpu.sync import barrier
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
     block_idx,
     grid_dim,
     thread_idx,
 )
-from std.gpu.compute.mma import mma
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
-from std.gpu.primitives import block
+from max.gpu.compute.mma import mma
+from max.gpu.host import DeviceContext
+from std.memory import AddressSpace
+from max.gpu.primitives import block
 from std.gpu.primitives.warp import shuffle_xor
 from std.math import ceildiv, exp, exp2, log
 from std.memory import bitcast, stack_allocation
@@ -277,13 +277,19 @@ def _flash_attention_fwd_baseline[
     k_st: RowStrides,
     v_st: RowStrides,
     o_st: RowStrides,
-    seq_q: Int,
-    seq_kv: Int,
-    head_dim: Int,
+    seq_q_arg: Int64,
+    seq_kv_arg: Int64,
+    head_dim_arg: Int64,
     scale: Float32,
-    causal: Int,
+    causal_arg: Int64,
 ):
     """One block per (batch, head, query row). Correct, not fast."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var seq_q = Int(seq_q_arg)
+    var seq_kv = Int(seq_kv_arg)
+    var head_dim = Int(head_dim_arg)
+    var causal = Int(causal_arg)
     var tid = Int(thread_idx.x)
     var qi = Int(block_idx.x)
     var head = Int(block_idx.y)
@@ -409,11 +415,11 @@ def _fa_mfma[
     k_st: RowStrides,
     v_st: RowStrides,
     o_st: RowStrides,
-    seq_q: Int,
-    seq_kv: Int,
-    head_dim: Int,
+    seq_q_arg: Int64,
+    seq_kv_arg: Int64,
+    head_dim_arg: Int64,
     scale: Float32,
-    causal: Int,
+    causal_arg: Int64,
 ):
     """MFMA flash-attention forward, four wave64 per workgroup.
 
@@ -443,6 +449,12 @@ def _fa_mfma[
     it either (517.8) -- the `@always_inline` body then costs what the kernargs
     did. Both routes were measured; see the journal entry for this change.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var seq_q = Int(seq_q_arg)
+    var seq_kv = Int(seq_kv_arg)
+    var head_dim = Int(head_dim_arg)
+    var causal = Int(causal_arg)
     comptime NW = 4
     comptime BM = NW * 32 * QT
     comptime KSTEPS = HD // 8  # k-steps of the Q@K^T GEMM
@@ -839,11 +851,11 @@ def _enqueue_fa_mfma[
             k_st,
             v_st,
             o_st,
-            seq_q,
-            seq_kv,
-            head_dim,
+            Int64(seq_q),
+            Int64(seq_kv),
+            Int64(head_dim),
             scale,
-            1 if is_causal else 0,
+            Int64(1 if is_causal else 0),
             grid_dim=(ceildiv(seq_q, 4 * 32 * QT), heads, batch),
             block_dim=(THREADS,),
         )
@@ -860,11 +872,11 @@ def _enqueue_fa_mfma[
         k_st,
         v_st,
         o_st,
-        seq_q,
-        seq_kv,
-        head_dim,
+        Int64(seq_q),
+        Int64(seq_kv),
+        Int64(head_dim),
         scale,
-        1 if is_causal else 0,
+        Int64(1 if is_causal else 0),
         grid_dim=(ceildiv(seq_q, 4 * 32 * QT), heads, batch),
         block_dim=(THREADS,),
     )
@@ -1064,11 +1076,11 @@ def enqueue_flash_attention_fwd[
         k_st,
         v_st,
         o_st,
-        seq_q,
-        seq_kv,
-        head_dim,
+        Int64(seq_q),
+        Int64(seq_kv),
+        Int64(head_dim),
         scale,
-        1 if is_causal else 0,
+        Int64(1 if is_causal else 0),
         grid_dim=(seq_q, heads, batch),
         block_dim=(THREADS,),
     )

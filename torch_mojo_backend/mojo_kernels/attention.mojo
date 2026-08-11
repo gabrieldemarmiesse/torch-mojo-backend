@@ -1,11 +1,7 @@
-from std.gpu import (
-    MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
-    block_idx,
-    thread_idx,
-)
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, thread_idx
+from max.gpu.host import DeviceContext
+from std.memory import AddressSpace
 from std.math import exp, sqrt
 from std.memory import stack_allocation
 from std.sys.info import size_of
@@ -37,12 +33,18 @@ def _gpt2_decode_attention_kernel[
     key: LayoutTensor[dtype, k_layout, MutAnyOrigin],
     value: LayoutTensor[dtype, v_layout, MutAnyOrigin],
     mask: LayoutTensor[dtype, mask_layout, MutAnyOrigin],
-    kv_len: Int,
-    head_dim: Int,
-    heads: Int,
-    mask_batch: Int,
+    kv_len_arg: Int64,
+    head_dim_arg: Int64,
+    heads_arg: Int64,
+    mask_batch_arg: Int64,
 ):
     """Single-query attention for contiguous [B, H, S, D] tensors."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var kv_len = Int(kv_len_arg)
+    var head_dim = Int(head_dim_arg)
+    var heads = Int(heads_arg)
+    var mask_batch = Int(mask_batch_arg)
     comptime vec_align = 4 * size_of[dtype]()
     var bh = block_idx.x
     var tid = thread_idx.x
@@ -182,10 +184,10 @@ struct GPT2DecodeAttention:
             k,
             v,
             m,
-            kv_len,
-            head_dim,
-            heads,
-            mask_shape[0],
+            Int64(kv_len),
+            Int64(head_dim),
+            Int64(heads),
+            Int64(mask_shape[0]),
             grid_dim=batch * heads,
             block_dim=THREADS,
         )

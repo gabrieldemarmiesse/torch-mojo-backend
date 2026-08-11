@@ -47,7 +47,7 @@ identical index->lane mapping runs.
 """
 
 from std.gpu import block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import ceildiv
 
 
@@ -92,12 +92,15 @@ def _forward_vec4(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    elements: Int,
+    elements_arg: Int64,
     seed: UInt64,
     base_offset: UInt64,
     threshold: UInt64,
     scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
     var group = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var base = group * 4
     if base >= elements:
@@ -131,12 +134,15 @@ def _forward_generic(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
     input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    elements: Int,
+    elements_arg: Int64,
     seed: UInt64,
     base_offset: UInt64,
     threshold: UInt64,
     scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
     var group = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var base = group * 4
     if base >= elements:
@@ -155,8 +161,11 @@ def _forward_generic(
 def _forward_zero_fill(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    elements: Int,
+    elements_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
     var base = (Int(block_idx.x) * _BLOCK + Int(thread_idx.x)) * 4
 
     comptime for lane in range(4):
@@ -171,9 +180,12 @@ def _backward_vec4(
     grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    elements: Int,
+    elements_arg: Int64,
     scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
     var base = (Int(block_idx.x) * _BLOCK + Int(thread_idx.x)) * 4
     if base >= elements:
         return
@@ -199,9 +211,12 @@ def _backward_generic(
     grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    elements: Int,
+    elements_arg: Int64,
     scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
     var base = (Int(block_idx.x) * _BLOCK + Int(thread_idx.x)) * 4
     if base >= elements:
         return
@@ -248,7 +263,7 @@ def enqueue_native_dropout_f32(
         ctx.enqueue_function[_forward_zero_fill](
             output,
             mask,
-            elements,
+            Int64(elements),
             grid_dim=(grid,),
             block_dim=(_BLOCK,),
         )
@@ -267,7 +282,7 @@ def enqueue_native_dropout_f32(
             output,
             mask,
             input,
-            elements,
+            Int64(elements),
             seed,
             base_offset,
             threshold,
@@ -280,7 +295,7 @@ def enqueue_native_dropout_f32(
             output,
             mask,
             input,
-            elements,
+            Int64(elements),
             seed,
             base_offset,
             threshold,
@@ -314,7 +329,7 @@ def enqueue_native_dropout_backward_f32(
             grad_input,
             grad_output,
             mask,
-            elements,
+            Int64(elements),
             scale_f32,
             grid_dim=(grid,),
             block_dim=(_BLOCK,),
@@ -324,7 +339,7 @@ def enqueue_native_dropout_backward_f32(
             grad_input,
             grad_output,
             mask,
-            elements,
+            Int64(elements),
             scale_f32,
             grid_dim=(grid,),
             block_dim=(_BLOCK,),

@@ -17,8 +17,8 @@ described without materializing dense copies; they return the same
 specializations are shared.
 """
 
-from std.gpu.host import DeviceContext
-from std.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.host import DeviceContext
+from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.utils.index import IndexList
 
 from layout import (

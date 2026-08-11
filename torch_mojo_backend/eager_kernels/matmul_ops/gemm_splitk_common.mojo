@@ -24,10 +24,16 @@ comptime TARGET_BLOCKS = 80 if has_apple_gpu_accelerator() else 342
 def _ksplit_reduce_kernel(
     out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    mn: Int,
-    ksplits: Int,
-    total: Int,
+    mn_arg: Int64,
+    ksplits_arg: Int64,
+    total_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var mn = Int(mn_arg)
+    var ksplits = Int(ksplits_arg)
+    var total = Int(total_arg)
+
     # 4 outputs per thread: one div/mod chain + vector loads per chunk.
     var i = (block_idx.x * 256 + thread_idx.x) * 4
     if i >= total:

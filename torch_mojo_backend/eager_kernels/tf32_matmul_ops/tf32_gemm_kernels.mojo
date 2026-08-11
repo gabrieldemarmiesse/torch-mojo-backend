@@ -37,10 +37,11 @@ target predicate; production gating routes those targets to the existing
 strict fallback before this candidate is reached.
 """
 
-from std.gpu import barrier, block_idx, grid_dim, thread_idx
-from std.gpu.compute.mma import mma
-from std.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
-from std.gpu.memory import (
+from max.gpu.sync import barrier
+from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu.compute.mma import mma
+from max.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
+from max.gpu.memory import (
     async_copy,
     async_copy_commit_group,
     async_copy_wait_group,
@@ -439,14 +440,23 @@ def _gemm_tile[
     a: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     b: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    has_bias: Int,
-    a_vec: Int,
-    b_vec: Int,
-    c_vec: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    has_bias_arg: Int64,
+    a_vec_arg: Int64,
+    b_vec_arg: Int64,
+    c_vec_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var has_bias = Int(has_bias_arg)
+    var a_vec = Int(a_vec_arg)
+    var b_vec = Int(b_vec_arg)
+    var c_vec = Int(c_vec_arg)
     _tile_body[TA, TB, BM, BN, WM, WN, THREADS, STAGES](
         c, a, b, bias, m, n, k, 1, 0, 0, 0, has_bias, a_vec, b_vec, c_vec
     )
@@ -466,17 +476,29 @@ def _bmm_tile[
     c: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     a: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     b: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    m: Int,
-    n: Int,
-    k: Int,
-    batch_count: Int,
-    c_bs: Int,
-    a_bs: Int,
-    b_bs: Int,
-    a_vec: Int,
-    b_vec: Int,
-    c_vec: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    batch_count_arg: Int64,
+    c_bs_arg: Int64,
+    a_bs_arg: Int64,
+    b_bs_arg: Int64,
+    a_vec_arg: Int64,
+    b_vec_arg: Int64,
+    c_vec_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var batch_count = Int(batch_count_arg)
+    var c_bs = Int(c_bs_arg)
+    var a_bs = Int(a_bs_arg)
+    var b_bs = Int(b_bs_arg)
+    var a_vec = Int(a_vec_arg)
+    var b_vec = Int(b_vec_arg)
+    var c_vec = Int(c_vec_arg)
     _tile_body[TA, TB, BM, BN, WM, WN, THREADS, STAGES](
         c,
         a,
@@ -544,16 +566,16 @@ def _launch_tile[
             c,
             a,
             b,
-            m,
-            n,
-            k,
-            batch_count,
-            c_bs,
-            a_bs,
-            b_bs,
-            a_vec,
-            b_vec,
-            c_vec,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(batch_count),
+            Int64(c_bs),
+            Int64(a_bs),
+            Int64(b_bs),
+            Int64(a_vec),
+            Int64(b_vec),
+            Int64(c_vec),
             grid_dim=(tiles, 1, gz),
             block_dim=(THREADS,),
             shared_mem_bytes=SMEM_BYTES,
@@ -569,13 +591,13 @@ def _launch_tile[
             a,
             b,
             bias,
-            m,
-            n,
-            k,
-            1 if has_bias else 0,
-            a_vec,
-            b_vec,
-            c_vec,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(1 if has_bias else 0),
+            Int64(a_vec),
+            Int64(b_vec),
+            Int64(c_vec),
             grid_dim=(tiles, 1, 1),
             block_dim=(THREADS,),
             shared_mem_bytes=SMEM_BYTES,

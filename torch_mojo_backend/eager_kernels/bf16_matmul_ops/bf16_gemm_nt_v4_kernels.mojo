@@ -30,20 +30,21 @@ model dimensions).  Partial edge tiles are handled by TMA out-of-bounds
 clipping on both loads (zero-fill) and stores (write suppression).
 """
 
+from max.gpu.sync import barrier
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
     block_idx,
     grid_dim,
     thread_idx,
 )
-from std.gpu.compute.mma import st_matrix
-from std.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
-from std.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
+from max.gpu.compute.mma import st_matrix
+from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
-from std.gpu.primitives.cluster import block_rank_in_cluster, cluster_sync
-from std.gpu.memory import AddressSpace, fence_async_view_proxy
-from std.gpu.sync import named_barrier
+from max.gpu.primitives import block_rank_in_cluster, cluster_sync
+from max.gpu.memory import fence_async_view_proxy
+from std.memory import AddressSpace
+from max.gpu.sync import named_barrier
 from std.memory import bitcast, stack_allocation
 from std.sys.info import _has_sm_9x, _is_sm_9x
 from std.utils.index import Index, IndexList
@@ -179,9 +180,9 @@ def _v4c_nt_persistent[
     c_tma: TMATensorTile[
         _V4_BF16, 2, Index(_V4_WG_ROWS, bn), Index(_V4_WG_ROWS, _V4_C_BOX_N)
     ],
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
     """Clustered persistent NT kernel with TMA multicast of B.
 
@@ -193,6 +194,11 @@ def _v4c_nt_persistent[
     the work list, ranks clamp to a common valid tile / load B privately, so
     both CTAs always execute identical barrier trip counts.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     comptime B_HALF = bn // _V4_CLUSTER
     comptime B_LAYOUT = _v4_b_layout[bn]()
     comptime B_HALF_LAYOUT = _v4_b_half_layout[bn]()
@@ -553,9 +559,9 @@ def _v4c_enqueue_nt_persistent[
         a_tma,
         b_tma,
         c_tma,
-        m,
-        n,
-        k,
+        Int64(m),
+        Int64(n),
+        Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V4_THREADS,),
     )

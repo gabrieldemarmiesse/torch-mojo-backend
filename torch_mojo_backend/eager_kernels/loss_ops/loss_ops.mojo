@@ -34,17 +34,10 @@
 # context, and these kernels never synchronize to check on the host.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import (
-    WARP_SIZE,
-    barrier,
-    block_idx,
-    grid_dim,
-    lane_id,
-    thread_idx,
-    warp_id,
-)
-from std.gpu.host import DeviceContext
-from std.gpu.primitives import block
+from max.gpu.sync import barrier
+from std.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
+from max.gpu.host import DeviceContext
+from max.gpu.primitives import block
 from std.math import ceildiv
 from std.memory import stack_allocation
 from std.os import abort
@@ -83,10 +76,15 @@ def _nll_forward_none(
     total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    rows: Int,
-    classes: Int,
-    ignore_index: Int,
+    rows_arg: Int64,
+    classes_arg: Int64,
+    ignore_index_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var classes = Int(classes_arg)
+    var ignore_index = Int(ignore_index_arg)
     var row = Int(block_idx.x) * _NONE_BLOCK + Int(thread_idx.x)
     if row == 0:
         total_weight[0] = 0.0
@@ -106,10 +104,15 @@ def _nll_forward_mean(
     total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    rows: Int,
-    classes: Int,
-    ignore_index: Int,
+    rows_arg: Int64,
+    classes_arg: Int64,
+    ignore_index_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var classes = Int(classes_arg)
+    var ignore_index = Int(ignore_index_arg)
     # Single block on one SM: use wide target loads and independent
     # accumulator lanes so enough gathers stay in flight to hide latency.
     # The wide load only claims element alignment: the target base pointer
@@ -150,10 +153,15 @@ def _nll_forward_mean_partial(
     scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    rows: Int,
-    classes: Int,
-    ignore_index: Int,
+    rows_arg: Int64,
+    classes_arg: Int64,
+    ignore_index_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var classes = Int(classes_arg)
+    var ignore_index = Int(ignore_index_arg)
     var acc = Float32(0.0)
     var count = Float32(0.0)
     var row = Int(block_idx.x) * _PARTIAL_BLOCK + Int(thread_idx.x)
@@ -177,8 +185,11 @@ def _nll_forward_mean_final(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    partials: Int,
+    partials_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var partials = Int(partials_arg)
     var acc = Float32(0.0)
     var count = Float32(0.0)
     var i = Int(thread_idx.x)
@@ -199,10 +210,15 @@ def _nll_forward_sum(
     total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    rows: Int,
-    classes: Int,
-    ignore_index: Int,
+    rows_arg: Int64,
+    classes_arg: Int64,
+    ignore_index_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var classes = Int(classes_arg)
+    var ignore_index = Int(ignore_index_arg)
     var losses = stack_allocation[
         _SUM_BLOCK, DType.float32, address_space=AddressSpace.SHARED
     ]()
@@ -241,11 +257,17 @@ def _nll_backward_vec4(
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
     total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    classes: Int,
-    reduction: Int,
-    ignore_index: Int,
+    rows_arg: Int64,
+    classes_arg: Int64,
+    reduction_arg: Int64,
+    ignore_index_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var classes = Int(classes_arg)
+    var reduction = Int(reduction_arg)
+    var ignore_index = Int(ignore_index_arg)
     # 2D strip mapping: block_idx.y selects the row (grid-stride for very
     # large row counts) and block_idx.x selects a strip of _VEC_UNROLL
     # 16-byte chunks per thread, so no integer division and no wave tail.
@@ -287,11 +309,17 @@ def _nll_backward_scalar(
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
     total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    classes: Int,
-    reduction: Int,
-    ignore_index: Int,
+    rows_arg: Int64,
+    classes_arg: Int64,
+    reduction_arg: Int64,
+    ignore_index_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var classes = Int(classes_arg)
+    var reduction = Int(reduction_arg)
+    var ignore_index = Int(ignore_index_arg)
     var lane = Int(lane_id())
     var warp_stride = Int(grid_dim.x) * (_BWD_BLOCK // WARP_SIZE)
     var scale = Float32(0.0)
@@ -341,9 +369,9 @@ def enqueue_nll_forward_f32(
                 total_weight,
                 log_probs,
                 target,
-                rows,
-                classes,
-                ignore_index,
+                Int64(rows),
+                Int64(classes),
+                Int64(ignore_index),
             )
         elif reduction == 1:
             if rows <= _MEAN_SINGLE_MAX_ROWS:
@@ -358,9 +386,9 @@ def enqueue_nll_forward_f32(
                     total_weight,
                     log_probs,
                     target,
-                    rows,
-                    classes,
-                    ignore_index,
+                    Int64(rows),
+                    Int64(classes),
+                    Int64(ignore_index),
                 )
             else:
                 var grid = min(ceildiv(rows, _PARTIAL_BLOCK), 1024)
@@ -376,9 +404,9 @@ def enqueue_nll_forward_f32(
                     scratch_ptr,
                     log_probs,
                     target,
-                    rows,
-                    classes,
-                    ignore_index,
+                    Int64(rows),
+                    Int64(classes),
+                    Int64(ignore_index),
                 )
                 _enqueue_cached[_nll_forward_mean_final](
                     ctx,
@@ -390,7 +418,7 @@ def enqueue_nll_forward_f32(
                     output,
                     total_weight,
                     scratch_ptr,
-                    grid,
+                    Int64(grid),
                 )
                 # Dropping `scratch` schedules a stream-ordered free after
                 # the enqueued kernels complete.
@@ -407,9 +435,9 @@ def enqueue_nll_forward_f32(
                 total_weight,
                 log_probs,
                 target,
-                rows,
-                classes,
-                ignore_index,
+                Int64(rows),
+                Int64(classes),
+                Int64(ignore_index),
             )
         else:
             raise Error("reduction must be 0, 1, or 2")
@@ -448,10 +476,10 @@ def enqueue_nll_backward_f32(
                 grad_output,
                 target,
                 total_weight,
-                rows,
-                classes,
-                reduction,
-                ignore_index,
+                Int64(rows),
+                Int64(classes),
+                Int64(reduction),
+                Int64(ignore_index),
             )
         else:
             var grid = min(ceildiv(rows, _BWD_BLOCK // WARP_SIZE), 8192)
@@ -466,10 +494,10 @@ def enqueue_nll_backward_f32(
                 grad_output,
                 target,
                 total_weight,
-                rows,
-                classes,
-                reduction,
-                ignore_index,
+                Int64(rows),
+                Int64(classes),
+                Int64(reduction),
+                Int64(ignore_index),
             )
 
 

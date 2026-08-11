@@ -18,18 +18,19 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
+from max.gpu.sync import barrier
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
-    barrier,
     block_idx,
     grid_dim,
     lane_id,
     thread_idx,
     warp_id,
 )
-from std.gpu.host import DeviceContext
-from std.gpu.primitives import block, warp
+from max.gpu.host import DeviceContext
+from max.gpu.primitives import block
+from std.gpu.primitives import warp
 from std.math import ceildiv, exp, floor
 from std.memory import alloc, stack_allocation
 from std.python import PythonObject
@@ -45,10 +46,10 @@ from std.utils.index import IndexList
 from std.utils.numerics import min_finite, min_or_neg_inf
 from std.utils.static_tuple import StaticTuple
 
-from std.algorithm.functional import elementwise
-from std.algorithm.reduction import mean
-from std.algorithm.reduction import max as reduce_max
-from std.algorithm.reduction import min as reduce_min
+from max.algorithm import elementwise
+from max.algorithm.reduction import mean
+from max.algorithm.reduction import max as reduce_max
+from max.algorithm.reduction import min as reduce_min
 
 from layout import TileTensor, row_major
 from native_dropout_kernels import _philox4x32_10
@@ -233,11 +234,14 @@ def _layer_norm_block_kernel[
     gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     eps: Float32,
-    cols: Int,
+    cols_arg: Int64,
 ):
     """One block per row (grid.x = rows); lanes stride over the row and
     tree-reduce the sum and squared-deviation partials in shared memory —
     the same two-pass mean/variance the CPU path computes."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
     var r = block_idx.x
     var tid = thread_idx.x
     var base = r * cols
@@ -358,7 +362,7 @@ def _layer_norm[
                 gamma_ptr.as_unsafe_any_origin().as_immutable(),
                 beta_ptr.as_unsafe_any_origin().as_immutable(),
                 eps,
-                cols,
+                Int64(cols),
             )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -459,17 +463,23 @@ def _softmax_rows_warp_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
     scale: Float32,
-    causal: Int,
-    q_len: Int,
+    causal_arg: Int64,
+    q_len_arg: Int64,
 ):
     # One warp per row; requires cols % V == 0 and
     # cols <= WARP_SIZE * _APPLE_SM_MAX_VPT * V (host-checked). Lanes at or past
     # the causal boundary carry min_finite (finite, so `exp` below stays in
     # range even when the row max is tiny) and are explicitly zeroed before
     # the sum, so no sentinel arithmetic can leak into the result.
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var causal = Int(causal_arg)
+    var q_len = Int(q_len_arg)
     var lane = Int(lane_id())
     var row = Int(block_idx.x) * _APPLE_SM_WARPS_PER_BLOCK + Int(warp_id())
     var row_stride = Int(grid_dim.x) * _APPLE_SM_WARPS_PER_BLOCK
@@ -538,16 +548,22 @@ def _softmax_rows_block_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
     scale: Float32,
-    causal: Int,
-    q_len: Int,
+    causal_arg: Int64,
+    q_len_arg: Int64,
 ):
     # One thread block per row (grid-stride over rows), any rows/cols >= 1.
     # `vec = True` requires 16B-aligned base pointers (host-checked); rows
     # whose start is then still unaligned get a scalar head, exactly like
     # `_log_softmax_rows_block_kernel`.
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var causal = Int(causal_arg)
+    var q_len = Int(q_len_arg)
     comptime V = 16 // size_of[dtype]()
     var tid = Int(thread_idx.x)
     var row = Int(block_idx.x)
@@ -704,11 +720,11 @@ def _softmax_rows_apple[
             _APPLE_SM_WARPS_PER_BLOCK * WARP_SIZE,
             mout,
             min_,
-            rows,
-            cols,
+            Int64(rows),
+            Int64(cols),
             scale,
-            causal,
-            q_len,
+            Int64(causal),
+            Int64(q_len),
         )
     elif cols <= WARP_SIZE * _APPLE_SM_MAX_VPT:
         _enqueue_cached[_softmax_rows_warp_kernel[dtype, 1]](
@@ -720,11 +736,11 @@ def _softmax_rows_apple[
             _APPLE_SM_WARPS_PER_BLOCK * WARP_SIZE,
             mout,
             min_,
-            rows,
-            cols,
+            Int64(rows),
+            Int64(cols),
             scale,
-            causal,
-            q_len,
+            Int64(causal),
+            Int64(q_len),
         )
     else:
         var block_grid = min(rows, 32768)
@@ -739,11 +755,11 @@ def _softmax_rows_apple[
                     1024,
                     mout,
                     min_,
-                    rows,
-                    cols,
+                    Int64(rows),
+                    Int64(cols),
                     scale,
-                    causal,
-                    q_len,
+                    Int64(causal),
+                    Int64(q_len),
                 )
             else:
                 _enqueue_cached[_softmax_rows_block_kernel[dtype, 1024, False]](
@@ -755,11 +771,11 @@ def _softmax_rows_apple[
                     1024,
                     mout,
                     min_,
-                    rows,
-                    cols,
+                    Int64(rows),
+                    Int64(cols),
                     scale,
-                    causal,
-                    q_len,
+                    Int64(causal),
+                    Int64(q_len),
                 )
         else:
             if aligned:
@@ -772,11 +788,11 @@ def _softmax_rows_apple[
                     256,
                     mout,
                     min_,
-                    rows,
-                    cols,
+                    Int64(rows),
+                    Int64(cols),
                     scale,
-                    causal,
-                    q_len,
+                    Int64(causal),
+                    Int64(q_len),
                 )
             else:
                 _enqueue_cached[_softmax_rows_block_kernel[dtype, 256, False]](
@@ -788,11 +804,11 @@ def _softmax_rows_apple[
                     256,
                     mout,
                     min_,
-                    rows,
-                    cols,
+                    Int64(rows),
+                    Int64(cols),
                     scale,
-                    causal,
-                    q_len,
+                    Int64(causal),
+                    Int64(q_len),
                 )
 
 
@@ -825,11 +841,11 @@ def _softmax_rows_dropout_warp_kernel(
     pdrop_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask_ptr: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
     scale: Float32,
-    causal: Int,
-    q_len: Int,
+    causal_arg: Int64,
+    q_len_arg: Int64,
     seed: UInt64,
     base_offset: UInt64,
     threshold: UInt64,
@@ -837,6 +853,12 @@ def _softmax_rows_dropout_warp_kernel(
 ):
     # Same structure as `_softmax_rows_warp_kernel[float32, 4]` (see there
     # for the masking rationale), plus the Philox dropout epilogue.
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var causal = Int(causal_arg)
+    var q_len = Int(q_len_arg)
     var lane = Int(lane_id())
     var row = Int(block_idx.x) * _APPLE_SM_WARPS_PER_BLOCK + Int(warp_id())
     var row_stride = Int(grid_dim.x) * _APPLE_SM_WARPS_PER_BLOCK
@@ -1003,11 +1025,11 @@ def enqueue_softmax_rows_dropout_f32(
             _make_ptr[DType.float32](in_addr)
             .as_unsafe_any_origin()
             .as_immutable(),
-            rows,
-            cols,
+            Int64(rows),
+            Int64(cols),
             scale,
-            causal,
-            q_len,
+            Int64(causal),
+            Int64(q_len),
             seed,
             base_offset,
             threshold,
@@ -1129,11 +1151,16 @@ def _softmax_warp_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
     scale: Float32,
-    q_len: Int,
+    q_len_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var q_len = Int(q_len_arg)
     _softmax_warp_rows[dtype, causal, VEC](
         out_ptr, in_ptr, rows, cols, scale, q_len
     )
@@ -1160,10 +1187,10 @@ def _enqueue_softmax_warp[
         _SM_BLOCK,
         out_ptr,
         in_ptr,
-        rows,
-        cols,
+        Int64(rows),
+        Int64(cols),
         scale,
-        q_len,
+        Int64(q_len),
     )
 
 
@@ -1363,18 +1390,18 @@ def _attn_decode_kernel[
     q_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     k_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     v_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    kv_len: Int,
-    head_dim: Int,
+    kv_len_arg: Int64,
+    head_dim_arg: Int64,
     scale: Float32,
-    heads: Int,
-    q_b_stride: Int,
-    q_h_stride: Int,
-    k_b_stride: Int,
-    k_h_stride: Int,
-    k_s_stride: Int,
-    v_b_stride: Int,
-    v_h_stride: Int,
-    v_s_stride: Int,
+    heads_arg: Int64,
+    q_b_stride_arg: Int64,
+    q_h_stride_arg: Int64,
+    k_b_stride_arg: Int64,
+    k_h_stride_arg: Int64,
+    k_s_stride_arg: Int64,
+    v_b_stride_arg: Int64,
+    v_h_stride_arg: Int64,
+    v_s_stride_arg: Int64,
 ):
     """out is (BH, 1, head_dim) contiguous. Q/K/V have unit head-dimension
     stride and explicit batch/head/sequence strides; this consumes both the
@@ -1383,6 +1410,19 @@ def _attn_decode_kernel[
     ATTN_MAX_KV cap), softmax uses f32 max/sum shared-memory tree reductions,
     and the V pass has lane d accumulate output element d so V reads coalesce
     across lanes."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var kv_len = Int(kv_len_arg)
+    var head_dim = Int(head_dim_arg)
+    var heads = Int(heads_arg)
+    var q_b_stride = Int(q_b_stride_arg)
+    var q_h_stride = Int(q_h_stride_arg)
+    var k_b_stride = Int(k_b_stride_arg)
+    var k_h_stride = Int(k_h_stride_arg)
+    var k_s_stride = Int(k_s_stride_arg)
+    var v_b_stride = Int(v_b_stride_arg)
+    var v_h_stride = Int(v_h_stride_arg)
+    var v_s_stride = Int(v_s_stride_arg)
     comptime vec_align = 4 * size_of[dtype]()
     var bh = block_idx.x
     var tid = thread_idx.x
@@ -1661,18 +1701,18 @@ def _attn_decode[
                     _make_ptr[dtype](v_addr)
                     .as_unsafe_any_origin()
                     .as_immutable(),
-                    kv_len,
-                    head_dim,
+                    Int64(kv_len),
+                    Int64(head_dim),
                     scale,
-                    heads,
-                    q_b_stride,
-                    q_h_stride,
-                    k_b_stride,
-                    k_h_stride,
-                    k_s_stride,
-                    v_b_stride,
-                    v_h_stride,
-                    v_s_stride,
+                    Int64(heads),
+                    Int64(q_b_stride),
+                    Int64(q_h_stride),
+                    Int64(k_b_stride),
+                    Int64(k_h_stride),
+                    Int64(k_s_stride),
+                    Int64(v_b_stride),
+                    Int64(v_h_stride),
+                    Int64(v_s_stride),
                 )
                 return
         _enqueue_cached[_attn_decode_kernel[dtype]](
@@ -1686,18 +1726,18 @@ def _attn_decode[
             _make_ptr[dtype](q_addr).as_unsafe_any_origin().as_immutable(),
             _make_ptr[dtype](k_addr).as_unsafe_any_origin().as_immutable(),
             _make_ptr[dtype](v_addr).as_unsafe_any_origin().as_immutable(),
-            kv_len,
-            head_dim,
+            Int64(kv_len),
+            Int64(head_dim),
             scale,
-            heads,
-            q_b_stride,
-            q_h_stride,
-            k_b_stride,
-            k_h_stride,
-            k_s_stride,
-            v_b_stride,
-            v_h_stride,
-            v_s_stride,
+            Int64(heads),
+            Int64(q_b_stride),
+            Int64(q_h_stride),
+            Int64(k_b_stride),
+            Int64(k_h_stride),
+            Int64(k_s_stride),
+            Int64(v_b_stride),
+            Int64(v_h_stride),
+            Int64(v_s_stride),
         )
     else:
         raise Error("no GPU accelerator available at compile time")
@@ -2006,8 +2046,11 @@ def _bool_full_block_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
-    size: Int,
+    size_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var size = Int(size_arg)
     var tid = Int(thread_idx.x)
     var acc = is_all
     for j in range(tid, size, ROWRED_THREADS):
@@ -2087,7 +2130,7 @@ def _bool_full_reduce[
                     ROWRED_THREADS,
                     out_ptr.as_unsafe_any_origin(),
                     in_ptr.as_unsafe_any_origin().as_immutable(),
-                    size,
+                    Int64(size),
                 )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -2169,7 +2212,7 @@ def _argmax_rows_block_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols: Int,
+    cols_arg: Int64,
 ):
     """One block per row (grid.x = rows); ARGMAX_THREADS lanes each stride
     over the row picking their own best (value, index) with strict `>` (so
@@ -2178,6 +2221,9 @@ def _argmax_rows_block_kernel[
     values. Together these preserve torch's first-occurrence-wins argmax
     semantics regardless of how work is split across lanes.
     """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
     var r = block_idx.x
     var tid = thread_idx.x
     var base = r * cols
@@ -2259,7 +2305,7 @@ def _argmax_rows[
                 ARGMAX_THREADS,
                 out_p,
                 in_p,
-                cols,
+                Int64(cols),
             )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -2284,8 +2330,11 @@ def _max_rows_block_kernel[
 ](
     out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols: Int,
+    cols_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
     comptime acc_dtype = _accum_dtype[dtype]()
     var r = block_idx.x
     var tid = thread_idx.x
@@ -2365,7 +2414,7 @@ def _max_rows[
                     ROWRED_THREADS,
                     out_ptr.as_unsafe_any_origin(),
                     in_ptr.as_unsafe_any_origin().as_immutable(),
-                    cols,
+                    Int64(cols),
                 )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -2635,14 +2684,20 @@ def _group_norm_block_kernel[
     gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     eps: Float32,
-    cols: Int,
-    hxw: Int,
-    group: Int,
-    cpg: Int,
+    cols_arg: Int64,
+    hxw_arg: Int64,
+    group_arg: Int64,
+    cpg_arg: Int64,
 ):
     """One block per (sample, group) row (grid.x = N*group). Same shared-memory
     mean/variance reduction as `_layer_norm_block_kernel`; the affine is applied
     per channel, where channel = (row % group) * cpg + (position // hxw)."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
+    var hxw = Int(hxw_arg)
+    var group = Int(group_arg)
+    var cpg = Int(cpg_arg)
     var r = block_idx.x
     var tid = thread_idx.x
     var g = Int(r) % group
@@ -2770,10 +2825,10 @@ def _group_norm[
                 gamma_ptr.as_unsafe_any_origin().as_immutable(),
                 beta_ptr.as_unsafe_any_origin().as_immutable(),
                 eps,
-                cols,
-                hxw,
-                group,
-                cpg,
+                Int64(cols),
+                Int64(hxw),
+                Int64(group),
+                Int64(cpg),
             )
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -3194,9 +3249,13 @@ def _any_bool_dispatcher(
     return _raw_ret_none()
 
 
-comptime SPEC_CUMSUM_DTYPES = [DType.int64, DType.int32, DType.float32]
+comptime SPEC_CUMSUM_DTYPES: List[DType] = [
+    DType.int64,
+    DType.int32,
+    DType.float32,
+]
 
-comptime SPEC_MAXROWS_DTYPES = [
+comptime SPEC_MAXROWS_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
@@ -3213,7 +3272,7 @@ def _mean_spec_into_go(
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
+    if not _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype):
         raise Error("mojo spec mean: unsupported dtype ", a.dtype)
     var rows = 0
     var cols = 0
@@ -3386,7 +3445,7 @@ def _batch_norm_spec_into_go(
         or betap.dtype != inp.dtype
     ):
         raise Error("mojo spec batch_norm: stat/affine dtypes must match input")
-    if not _dtype_supported[FLOAT_DTYPES](inp.dtype):
+    if not _dtype_supported[List[DType](FLOAT_DTYPES)](inp.dtype):
         raise Error("mojo spec batch_norm: unsupported dtype ", inp.dtype)
 
     var channels = inp.dim(1)
@@ -3423,7 +3482,7 @@ def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     half_to_float cast stay in Python."""
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[FLOAT_DTYPES](a.dtype):
+    if not _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype):
         raise Error("mojo spec softmax: unsupported dtype ", a.dtype)
     if a.rank < 1 or a.numel == 0:
         raise Error("mojo spec softmax: empty or rank-0 input")
@@ -3470,7 +3529,7 @@ def _attn_decode_spec_into_go(
         raise Error("mojo spec attn_decode: rank != 4")
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise Error("mojo spec attn_decode: dtypes differ")
-    if not _dtype_supported[FLOAT_DTYPES](q.dtype):
+    if not _dtype_supported[List[DType](FLOAT_DTYPES)](q.dtype):
         raise Error("mojo spec attn_decode: unsupported dtype ", q.dtype)
     var b = q.shape[MAX_RANK - 4]
     var h = q.shape[MAX_RANK - 3]

@@ -29,8 +29,9 @@ asynchronously on the caller's ``DeviceContext``.
 """
 
 from std.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
-from std.gpu.host import DeviceContext
-from std.gpu.primitives import block, warp
+from max.gpu.host import DeviceContext
+from max.gpu.primitives import block
+from std.gpu.primitives import warp
 from std.math import ceildiv
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.static_tuple import StaticTuple
@@ -165,12 +166,17 @@ def _fused_kernel[
     probabilities: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     grad_after_dropout: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    q_len: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    q_len_arg: Int64,
     dropout_scale: Float32,
     score_scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var q_len = Int(q_len_arg)
     _fused_rows[dtype, has_mask, causal, VEC](
         output,
         probabilities,
@@ -212,9 +218,9 @@ def _enqueue_one[
         probabilities,
         grad_after_dropout,
         mask,
-        rows,
-        cols,
-        q_len,
+        Int64(rows),
+        Int64(cols),
+        Int64(q_len),
         dropout_scale,
         score_scale,
     )
@@ -411,11 +417,15 @@ def _masked_f32(
     probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
     dropout_scale: Float32,
     score_scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
     var tid = Int(thread_idx.x)
     var row = Int(block_idx.x)
     var row_stride = Int(grid_dim.x)
@@ -461,10 +471,14 @@ def _unmasked_f32(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
     score_scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
     var tid = Int(thread_idx.x)
     var row = Int(block_idx.x)
     var row_stride = Int(grid_dim.x)
@@ -513,12 +527,17 @@ def _masked_causal_warp_f32[
     probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    q_len: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    q_len_arg: Int64,
     dropout_scale: Float32,
     score_scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var q_len = Int(q_len_arg)
     # One warp per row; requires cols % V == 0 and
     # cols <= WARP_SIZE * VPT * V (host-checked).
     var lane = Int(lane_id())
@@ -579,11 +598,16 @@ def _unmasked_causal_warp_f32[
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    q_len: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    q_len_arg: Int64,
     score_scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var q_len = Int(q_len_arg)
     var lane = Int(lane_id())
     var row = Int(block_idx.x) * _APPLE_WARPS_PER_BLOCK + Int(warp_id())
     var row_stride = Int(grid_dim.x) * _APPLE_WARPS_PER_BLOCK
@@ -632,12 +656,17 @@ def _masked_causal_f32(
     probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    q_len: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    q_len_arg: Int64,
     dropout_scale: Float32,
     score_scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var q_len = Int(q_len_arg)
     var tid = Int(thread_idx.x)
     var row = Int(block_idx.x)
     var row_stride = Int(grid_dim.x)
@@ -684,11 +713,16 @@ def _unmasked_causal_f32(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    q_len: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    q_len_arg: Int64,
     score_scale: Float32,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var q_len = Int(q_len_arg)
     var tid = Int(thread_idx.x)
     var row = Int(block_idx.x)
     var row_stride = Int(grid_dim.x)
@@ -790,9 +824,9 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
                     probabilities,
                     grad_after_dropout,
                     mask.value(),
-                    rows,
-                    cols,
-                    q_len,
+                    Int64(rows),
+                    Int64(cols),
+                    Int64(q_len),
                     Float32(dropout_scale),
                     score_scale_f32,
                 )
@@ -807,9 +841,9 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
                     output,
                     probabilities,
                     grad_after_dropout,
-                    rows,
-                    cols,
-                    q_len,
+                    Int64(rows),
+                    Int64(cols),
+                    Int64(q_len),
                     score_scale_f32,
                 )
 
@@ -841,9 +875,9 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
                 probabilities,
                 grad_after_dropout,
                 mask.value(),
-                rows,
-                cols,
-                q_len,
+                Int64(rows),
+                Int64(cols),
+                Int64(q_len),
                 Float32(dropout_scale),
                 score_scale_f32,
             )
@@ -858,9 +892,9 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
                 output,
                 probabilities,
                 grad_after_dropout,
-                rows,
-                cols,
-                q_len,
+                Int64(rows),
+                Int64(cols),
+                Int64(q_len),
                 score_scale_f32,
             )
         elif has_mask:
@@ -876,8 +910,8 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
                 probabilities,
                 grad_after_dropout,
                 mask_ptr,
-                rows,
-                cols,
+                Int64(rows),
+                Int64(cols),
                 Float32(dropout_scale),
                 score_scale_f32,
             )
@@ -892,8 +926,8 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
                 output,
                 probabilities,
                 grad_after_dropout,
-                rows,
-                cols,
+                Int64(rows),
+                Int64(cols),
                 score_scale_f32,
             )
     else:

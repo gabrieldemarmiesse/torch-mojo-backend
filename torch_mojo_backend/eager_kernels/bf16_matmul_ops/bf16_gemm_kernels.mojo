@@ -41,10 +41,11 @@ addressing product cannot fit in machine Int.
 """
 
 from std.collections import InlineArray
-from std.gpu import barrier, block_idx, grid_dim, thread_idx
-from std.gpu.compute.mma import mma
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu.compute.mma import mma
+from max.gpu.host import DeviceContext
+from std.memory import AddressSpace
 from std.memory import stack_allocation
 
 comptime _BM = 128
@@ -571,15 +572,25 @@ def _gemm_entry[
     a: _Ptr,
     b: _Ptr,
     bias: _Ptr,
-    m: Int,
-    n: Int,
-    k: Int,
-    has_bias: Int,
-    a_fast: Int,
-    b_fast: Int,
-    c_pair: Int,
-    batch_count: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    has_bias_arg: Int64,
+    a_fast_arg: Int64,
+    b_fast_arg: Int64,
+    c_pair_arg: Int64,
+    batch_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var has_bias = Int(has_bias_arg)
+    var a_fast = Int(a_fast_arg)
+    var b_fast = Int(b_fast_arg)
+    var c_pair = Int(c_pair_arg)
+    var batch_count = Int(batch_count_arg)
     _mma_tile_impl[TA, TB, BM, BN, FASTK, not FASTK](
         output,
         a,
@@ -641,17 +652,29 @@ def _bmm_entry[
     output: _Ptr,
     a: _Ptr,
     b: _Ptr,
-    m: Int,
-    n: Int,
-    k: Int,
-    c_bstride: Int,
-    a_bstride: Int,
-    b_bstride: Int,
-    a_fast: Int,
-    b_fast: Int,
-    c_pair: Int,
-    batch_count: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    c_bstride_arg: Int64,
+    a_bstride_arg: Int64,
+    b_bstride_arg: Int64,
+    a_fast_arg: Int64,
+    b_fast_arg: Int64,
+    c_pair_arg: Int64,
+    batch_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var c_bstride = Int(c_bstride_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var b_bstride = Int(b_bstride_arg)
+    var a_fast = Int(a_fast_arg)
+    var b_fast = Int(b_fast_arg)
+    var c_pair = Int(c_pair_arg)
+    var batch_count = Int(batch_count_arg)
     # BMM carries no bias: `a` stands in as an unread bias pointer under
     # has_bias = 0, and the batch strides are the real ones.
     _mma_tile_impl[TA, TB, BM, BN, FASTK, not FASTK](
@@ -1039,15 +1062,25 @@ def _gemm_wide[
     a: _Ptr,
     b: _Ptr,
     bias: _Ptr,
-    m: Int,
-    n: Int,
-    k: Int,
-    has_bias: Int,
-    a_fast: Int,
-    b_fast: Int,
-    c_pair: Int,
-    batch_count: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    has_bias_arg: Int64,
+    a_fast_arg: Int64,
+    b_fast_arg: Int64,
+    c_pair_arg: Int64,
+    batch_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var has_bias = Int(has_bias_arg)
+    var a_fast = Int(a_fast_arg)
+    var b_fast = Int(b_fast_arg)
+    var c_pair = Int(c_pair_arg)
+    var batch_count = Int(batch_count_arg)
     _mma_tile_wide[TA, TB](
         output,
         a,
@@ -1074,17 +1107,29 @@ def _bmm_wide[
     output: _Ptr,
     a: _Ptr,
     b: _Ptr,
-    m: Int,
-    n: Int,
-    k: Int,
-    c_bstride: Int,
-    a_bstride: Int,
-    b_bstride: Int,
-    a_fast: Int,
-    b_fast: Int,
-    c_pair: Int,
-    batch_count: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    c_bstride_arg: Int64,
+    a_bstride_arg: Int64,
+    b_bstride_arg: Int64,
+    a_fast_arg: Int64,
+    b_fast_arg: Int64,
+    c_pair_arg: Int64,
+    batch_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var c_bstride = Int(c_bstride_arg)
+    var a_bstride = Int(a_bstride_arg)
+    var b_bstride = Int(b_bstride_arg)
+    var a_fast = Int(a_fast_arg)
+    var b_fast = Int(b_fast_arg)
+    var c_pair = Int(c_pair_arg)
+    var batch_count = Int(batch_count_arg)
     _mma_tile_wide[TA, TB](
         output,
         a,
@@ -1303,14 +1348,14 @@ def _enqueue_gemm_wide(
                 a,
                 b,
                 bias,
-                m,
-                n,
-                k,
-                hb,
-                a_fast,
-                b_fast,
-                c_pair,
-                1,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(hb),
+                Int64(a_fast),
+                Int64(b_fast),
+                Int64(c_pair),
+                Int64(1),
                 grid_dim=(grid_x,),
                 block_dim=(_THREADS,),
             )
@@ -1351,16 +1396,16 @@ def _enqueue_bmm_wide(
                 output,
                 a,
                 b,
-                m,
-                n,
-                k,
-                c_bstride,
-                a_bstride,
-                b_bstride,
-                a_fast,
-                b_fast,
-                c_pair,
-                batch_count,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(c_bstride),
+                Int64(a_bstride),
+                Int64(b_bstride),
+                Int64(a_fast),
+                Int64(b_fast),
+                Int64(c_pair),
+                Int64(batch_count),
                 grid_dim=(grid_x, 1, grid_z),
                 block_dim=(_THREADS,),
             )
@@ -1440,14 +1485,14 @@ def enqueue_bf16_gemm(
                                 a,
                                 b,
                                 bias,
-                                m,
-                                n,
-                                k,
-                                hb,
-                                a_fast,
-                                b_fast,
-                                c_pair,
-                                1,
+                                Int64(m),
+                                Int64(n),
+                                Int64(k),
+                                Int64(hb),
+                                Int64(a_fast),
+                                Int64(b_fast),
+                                Int64(c_pair),
+                                Int64(1),
                                 grid_dim=(grid_x,),
                                 block_dim=(_THREADS,),
                             )
@@ -1571,16 +1616,16 @@ def enqueue_bf16_bmm(
                             output,
                             a,
                             b,
-                            m,
-                            n,
-                            k,
-                            output_batch_stride,
-                            a_batch_stride,
-                            b_batch_stride,
-                            a_fast,
-                            b_fast,
-                            c_pair,
-                            batch_count,
+                            Int64(m),
+                            Int64(n),
+                            Int64(k),
+                            Int64(output_batch_stride),
+                            Int64(a_batch_stride),
+                            Int64(b_batch_stride),
+                            Int64(a_fast),
+                            Int64(b_fast),
+                            Int64(c_pair),
+                            Int64(batch_count),
                             grid_dim=(grid_x, 1, grid_z),
                             block_dim=(_THREADS,),
                         )

@@ -9,7 +9,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.python import PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.python.bindings import PythonModuleBuilder

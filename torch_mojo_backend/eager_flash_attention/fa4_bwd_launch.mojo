@@ -10,13 +10,9 @@ Spad = ceil(S / kBwdBlockM) * kBwdBlockM):
 PTX dump: `-D MOJO_DUMP_PTX=<path>` dumps the *main* kernel's PTX.
 """
 
-from std.gpu.host import DeviceContext, FuncAttribute
-from std.gpu.host.device_context import (
-    _DeviceContextPtr,
-    _DeviceContextCpp,
-    _DumpPath,
-)
-from std.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.host import DeviceContext, FuncAttribute
+from max.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp, _DumpPath
+from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.math import ceildiv
 from std.memory import OpaquePointer
 from std.sys import get_defined_string, size_of
@@ -171,8 +167,8 @@ def launch_bwd_preprocess[
         dq_accum_ptr,
         dk_accum_ptr,
         dv_accum_ptr,
-        seq_len_arg,
-        nheads_arg,
+        Int64(seq_len_arg),
+        Int64(nheads_arg),
     )
 
 
@@ -446,7 +442,7 @@ def launch_bwd_main[
         dq_accum_ptr,
         dk_accum_ptr,
         dv_accum_ptr,
-        seq_len_arg,
+        Int64(seq_len_arg),
         softmax_scale,
     )
 
@@ -528,7 +524,7 @@ def launch_bwd_convert[
         ),
         dq_accum_ptr,
         dq_ptr,
-        seq_len_arg,
-        nheads_arg,
+        Int64(seq_len_arg),
+        Int64(nheads_arg),
         softmax_scale,
     )

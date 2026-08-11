@@ -1,5 +1,5 @@
 import extensibility as compiler
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, OutputTensor, foreach
 from std.utils.index import IndexList
 from std.utils.coord import Coord

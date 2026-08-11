@@ -9,8 +9,8 @@ runtime chunk descriptors and applies the device-resident scalar in place.
 from std.collections import InlineArray
 from std.ffi import _get_global_or_null, external_call
 from std.gpu import block_idx, thread_idx
-from std.gpu.host import DeviceContext
-from std.gpu.primitives import block
+from max.gpu.host import DeviceContext
+from max.gpu.primitives import block
 from std.math import min
 from std.memory import alloc
 from std.sys.info import has_apple_gpu_accelerator
@@ -63,9 +63,13 @@ def _chunk_bounds(
 @__name("foreach_l2_norm_f32_chunk_partials_v1")
 def _norm_chunk_partials(
     descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
-    desc_count: Int,
-    partials_addr: Int,
+    desc_count_arg: Int64,
+    partials_addr_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var desc_count = Int(desc_count_arg)
+    var partials_addr = Int(partials_addr_arg)
     var chunk = Int(block_idx.x)
     var desc, begin, end = _chunk_bounds(descs, desc_count, chunk)
     var values = _ptr(desc.tensor_addr)
@@ -96,9 +100,13 @@ def _norm_chunk_partials(
 @__name("foreach_l2_norm_f32_finalize_v1")
 def _norm_finalize(
     descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
-    desc_count: Int,
-    partials_addr: Int,
+    desc_count_arg: Int64,
+    partials_addr_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var desc_count = Int(desc_count_arg)
+    var partials_addr = Int(partials_addr_arg)
     var desc_index = Int(block_idx.x)
     if desc_index >= desc_count:
         return
@@ -184,8 +192,11 @@ def _norm_finalize_batched_apple(
     o7: _MutPtr,
     partials_ptr: _ImmutPtr,
     chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    used_slots: Int,
+    used_slots_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var used_slots = Int(used_slots_arg)
     var slot = Int(block_idx.x)
     if slot >= used_slots:
         return
@@ -236,9 +247,13 @@ def _mul_tensor_batched_apple(
 @__name("foreach_mul_tensor_f32_aligned_streaming_ilp8_t128_v8")
 def _mul_aligned_streaming_ilp8_t128(
     descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
-    desc_count: Int,
-    scalar_addr: Int,
+    desc_count_arg: Int64,
+    scalar_addr_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var desc_count = Int(desc_count_arg)
+    var scalar_addr = Int(scalar_addr_arg)
     var chunk = Int(block_idx.x)
     var desc, begin, end = _chunk_bounds(descs, desc_count, chunk)
     var values = _ptr(desc.tensor_addr)
@@ -310,8 +325,8 @@ def _enqueue_norm_partials_cached(
         ctx.enqueue_function(
             cached[],
             descs,
-            desc_count,
-            partials_addr,
+            Int64(desc_count),
+            Int64(partials_addr),
             grid_dim=(total_chunks,),
             block_dim=(FOREACH_THREADS,),
         )
@@ -325,8 +340,8 @@ def _enqueue_norm_partials_cached(
     ctx.enqueue_function(
         cached[],
         descs,
-        desc_count,
-        partials_addr,
+        Int64(desc_count),
+        Int64(partials_addr),
         grid_dim=(total_chunks,),
         block_dim=(FOREACH_THREADS,),
     )
@@ -345,8 +360,8 @@ def _enqueue_norm_finalize_cached(
         ctx.enqueue_function(
             cached[],
             descs,
-            desc_count,
-            partials_addr,
+            Int64(desc_count),
+            Int64(partials_addr),
             grid_dim=(desc_count,),
             block_dim=(FOREACH_THREADS,),
         )
@@ -360,8 +375,8 @@ def _enqueue_norm_finalize_cached(
     ctx.enqueue_function(
         cached[],
         descs,
-        desc_count,
-        partials_addr,
+        Int64(desc_count),
+        Int64(partials_addr),
         grid_dim=(desc_count,),
         block_dim=(FOREACH_THREADS,),
     )
@@ -383,8 +398,8 @@ def _enqueue_mul_cached(
         ctx.enqueue_function(
             cached[],
             descs,
-            desc_count,
-            scalar_addr,
+            Int64(desc_count),
+            Int64(scalar_addr),
             grid_dim=(total_chunks,),
             block_dim=(_MUL_THREADS,),
         )
@@ -398,8 +413,8 @@ def _enqueue_mul_cached(
     ctx.enqueue_function(
         cached[],
         descs,
-        desc_count,
-        scalar_addr,
+        Int64(desc_count),
+        Int64(scalar_addr),
         grid_dim=(total_chunks,),
         block_dim=(_MUL_THREADS,),
     )
@@ -486,7 +501,7 @@ def enqueue_foreach_l2_norm_f32(
                 _ptr(out_addrs[7]).as_unsafe_any_origin(),
                 partials.as_immutable(),
                 chunk_ends,
-                used_slots,
+                Int64(used_slots),
             )
     else:
         if total_chunks > 0:

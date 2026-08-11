@@ -33,18 +33,12 @@ resident) to write dx.  Both kernels handle arbitrary positive rows/cols and
 grid-stride over rows.
 """
 
-from std.gpu import (
-    WARP_SIZE,
-    block_idx,
-    grid_dim,
-    lane_id,
-    thread_idx,
-    warp_id,
-)
-from std.gpu.host import DeviceContext
-from std.gpu.memory import CacheOperation
-from std.gpu.memory import load as global_load
-from std.gpu.primitives import block, warp
+from std.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
+from max.gpu.host import DeviceContext
+from std.gpu.intrinsics import CacheOperation
+from max.gpu.memory import load as global_load
+from max.gpu.primitives import block
+from std.gpu.primitives import warp
 from std.math import ceildiv
 from std.memory import AddressSpace, stack_allocation
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
@@ -201,11 +195,17 @@ def _dx_c1(
     mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
-    has_weight: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
+    has_weight_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
     _dx_warp_rows[1](
         dx,
         grad_output,
@@ -228,11 +228,17 @@ def _dx_c2(
     mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
-    has_weight: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
+    has_weight_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
     _dx_warp_rows[2](
         dx,
         grad_output,
@@ -255,11 +261,17 @@ def _dx_c3(
     mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
-    has_weight: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
+    has_weight_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
     _dx_warp_rows[3](
         dx,
         grad_output,
@@ -282,11 +294,17 @@ def _dx_c4(
     mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
-    has_weight: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
+    has_weight_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
     _dx_warp_rows[4](
         dx,
         grad_output,
@@ -309,11 +327,17 @@ def _dx_c6(
     mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
-    has_weight: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
+    has_weight_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
     _dx_warp_rows[6](
         dx,
         grad_output,
@@ -336,11 +360,17 @@ def _dx_c8(
     mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    vec_cols: Int,
-    has_weight: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
+    has_weight_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var vec_cols = Int(vec_cols_arg)
+    var has_weight = Int(has_weight_arg)
     _dx_warp_rows[8](
         dx,
         grad_output,
@@ -363,10 +393,15 @@ def _dx_generic(
     mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    has_weight: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    has_weight_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var has_weight = Int(has_weight_arg)
     var tid = Int(thread_idx.x)
     var row = Int(block_idx.x)
     var row_stride = Int(grid_dim.x)
@@ -450,10 +485,10 @@ def enqueue_layer_norm_backward_dx_f32(
                         mean,
                         rstd,
                         weight,
-                        rows,
-                        cols,
-                        vec_cols,
-                        hw,
+                        Int64(rows),
+                        Int64(cols),
+                        Int64(vec_cols),
+                        Int64(hw),
                     )
                 elif needed <= 2:
                     _enqueue_cached[_dx_c2](
@@ -469,10 +504,10 @@ def enqueue_layer_norm_backward_dx_f32(
                         mean,
                         rstd,
                         weight,
-                        rows,
-                        cols,
-                        vec_cols,
-                        hw,
+                        Int64(rows),
+                        Int64(cols),
+                        Int64(vec_cols),
+                        Int64(hw),
                     )
                 elif needed <= 3:
                     _enqueue_cached[_dx_c3](
@@ -488,10 +523,10 @@ def enqueue_layer_norm_backward_dx_f32(
                         mean,
                         rstd,
                         weight,
-                        rows,
-                        cols,
-                        vec_cols,
-                        hw,
+                        Int64(rows),
+                        Int64(cols),
+                        Int64(vec_cols),
+                        Int64(hw),
                     )
                 elif needed <= 4:
                     _enqueue_cached[_dx_c4](
@@ -507,10 +542,10 @@ def enqueue_layer_norm_backward_dx_f32(
                         mean,
                         rstd,
                         weight,
-                        rows,
-                        cols,
-                        vec_cols,
-                        hw,
+                        Int64(rows),
+                        Int64(cols),
+                        Int64(vec_cols),
+                        Int64(hw),
                     )
                 elif needed <= 6:
                     _enqueue_cached[_dx_c6](
@@ -526,10 +561,10 @@ def enqueue_layer_norm_backward_dx_f32(
                         mean,
                         rstd,
                         weight,
-                        rows,
-                        cols,
-                        vec_cols,
-                        hw,
+                        Int64(rows),
+                        Int64(cols),
+                        Int64(vec_cols),
+                        Int64(hw),
                     )
                 else:
                     _enqueue_cached[_dx_c8](
@@ -545,10 +580,10 @@ def enqueue_layer_norm_backward_dx_f32(
                         mean,
                         rstd,
                         weight,
-                        rows,
-                        cols,
-                        vec_cols,
-                        hw,
+                        Int64(rows),
+                        Int64(cols),
+                        Int64(vec_cols),
+                        Int64(hw),
                     )
                 return
         var grid = min(rows, _MAX_GRID)
@@ -565,9 +600,9 @@ def enqueue_layer_norm_backward_dx_f32(
             mean,
             rstd,
             weight,
-            rows,
-            cols,
-            hw,
+            Int64(rows),
+            Int64(cols),
+            Int64(hw),
         )
     else:
         raise Error("no GPU accelerator available at compile time")

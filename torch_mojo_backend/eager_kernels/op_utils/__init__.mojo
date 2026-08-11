@@ -6,11 +6,12 @@
 # pointer that `device._device_context_ptr()` hands us on the Python side.
 # ===----------------------------------------------------------------------=== #
 
-from std.algorithm.functional import elementwise
+from max.algorithm import elementwise
 from std.builtin.device_passable import DevicePassable
 from std.ffi import _get_global_or_null, external_call
-from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.sync import barrier
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu.host import DeviceBuffer, DeviceContext
 from std.math import ceildiv, sqrt
 from std.memory import OpaquePointer, alloc, stack_allocation
 from std.python import Python, PythonObject
@@ -1026,8 +1027,11 @@ def _copy_strided_kernel[
     shape: IndexList[MAX_RANK],
     dst_strides: IndexList[MAX_RANK],
     src_strides: IndexList[MAX_RANK],
-    total: Int,
+    total_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var total = Int(total_arg)
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while i < total:
@@ -1096,12 +1100,12 @@ def _transpose2d_vec_kernel[
 ](
     dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    src_ld: Int,
-    batch: Int,
-    dst_bstride: Int,
-    src_bstride: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    src_ld_arg: Int64,
+    batch_arg: Int64,
+    dst_bstride_arg: Int64,
+    src_bstride_arg: Int64,
 ):
     """`dst[b, r, c] = src[b, c, r]`, 16 bytes per access and no LDS at all.
 
@@ -1121,6 +1125,15 @@ def _transpose2d_vec_kernel[
     comptime LC = _T2DV_LANE_C  # lanes across the source rows
     comptime assert 64 % LC == 0, "the lane grid must divide a wave"
     comptime LR = 64 // LC
+
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var src_ld = Int(src_ld_arg)
+    var batch = Int(batch_arg)
+    var dst_bstride = Int(dst_bstride_arg)
+    var src_bstride = Int(src_bstride_arg)
 
     var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var lane = tid % 64
@@ -1163,12 +1176,12 @@ def _transpose2d_kernel[
 ](
     dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    rows: Int,
-    cols: Int,
-    src_ld: Int,
-    batch: Int,
-    dst_bstride: Int,
-    src_bstride: Int,
+    rows_arg: Int64,
+    cols_arg: Int64,
+    src_ld_arg: Int64,
+    batch_arg: Int64,
+    dst_bstride_arg: Int64,
+    src_bstride_arg: Int64,
 ):
     """`dst[b, r, c] = src[b, c, r]` for `batch` independent matrices.
 
@@ -1181,6 +1194,14 @@ def _transpose2d_kernel[
     var tile = stack_allocation[
         TILE * (TILE + 1), dtype, address_space=AddressSpace.SHARED
     ]()
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var src_ld = Int(src_ld_arg)
+    var batch = Int(batch_arg)
+    var dst_bstride = Int(dst_bstride_arg)
+    var src_bstride = Int(src_bstride_arg)
     var tid = Int(thread_idx.x)
     var tx = tid % TILE
     var ty = tid // TILE
@@ -1353,12 +1374,12 @@ def _copy_strided[
                         _T2DV_THREADS,
                         dst_ptr.as_unsafe_any_origin(),
                         src_ptr.as_unsafe_any_origin().as_immutable(),
-                        rows,
-                        cols,
-                        src_strides[MAX_RANK - 1],
-                        batch,
-                        dst_strides[MAX_RANK - 3] if batch > 1 else 0,
-                        src_strides[MAX_RANK - 3] if batch > 1 else 0,
+                        Int64(rows),
+                        Int64(cols),
+                        Int64(src_strides[MAX_RANK - 1]),
+                        Int64(batch),
+                        Int64(dst_strides[MAX_RANK - 3] if batch > 1 else 0),
+                        Int64(src_strides[MAX_RANK - 3] if batch > 1 else 0),
                     )
                     return
                 _enqueue_cached[_transpose2d_kernel[dtype]](
@@ -1373,12 +1394,12 @@ def _copy_strided[
                     TILE * _T2D_ROWS,
                     dst_ptr.as_unsafe_any_origin(),
                     src_ptr.as_unsafe_any_origin().as_immutable(),
-                    rows,
-                    cols,
-                    src_strides[MAX_RANK - 1],
-                    batch,
-                    dst_strides[MAX_RANK - 3] if batch > 1 else 0,
-                    src_strides[MAX_RANK - 3] if batch > 1 else 0,
+                    Int64(rows),
+                    Int64(cols),
+                    Int64(src_strides[MAX_RANK - 1]),
+                    Int64(batch),
+                    Int64(dst_strides[MAX_RANK - 3] if batch > 1 else 0),
+                    Int64(src_strides[MAX_RANK - 3] if batch > 1 else 0),
                 )
                 return
             _enqueue_cached[_copy_strided_kernel[dtype]](
@@ -1393,7 +1414,7 @@ def _copy_strided[
                 shape,
                 dst_strides,
                 src_strides,
-                total,
+                Int64(total),
             )
         else:
             raise Error("no GPU accelerator available at compile time")

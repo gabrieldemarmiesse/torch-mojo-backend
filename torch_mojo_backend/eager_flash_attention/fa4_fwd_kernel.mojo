@@ -39,26 +39,17 @@ from std.math.constants import log2e
 from std.sys import size_of
 from std.utils.index import StaticTuple, IndexList
 
-from std.gpu import (
-    MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
-    block_idx,
-    lane_id,
-    thread_idx,
-    warp_id,
-)
+from max.gpu.sync import barrier
+from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, lane_id, thread_idx, warp_id
 import std.gpu.primitives.warp as warp
-from std.gpu.host.nvidia.tma import TensorMapSwizzle
+from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
-from std.gpu.memory import (
-    AddressSpace,
-    external_memory,
-    fence_async_view_proxy,
-)
-from std.gpu.sync import named_barrier, named_barrier_arrive
+from max.gpu.memory import external_memory, fence_async_view_proxy
+from std.memory import AddressSpace
+from max.gpu.sync import named_barrier, named_barrier_arrive
 from std.memory import bitcast, stack_allocation
 
-from std.gpu.compute.mma import st_matrix
+from max.gpu.compute.mma import st_matrix
 
 from layout import Layout, LayoutTensor
 from layout.tensor_core_async import (
@@ -118,13 +109,20 @@ def fwd_fa4_kernel[
     v_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
     o_tma: TMATensorTile[dtype, qo_rank, o_tile_shape, o_desc_shape],
     lse_ptr: UnsafePointer[Float32, MutAnyOrigin],
-    seq_len: Int,
+    seq_len_arg: Int64,
     softmax_scale: Float32,
-    nheads: Int,
-    sched_swizzle: Int,
-    sched_num_hb_q: Int,
-    sched_residual: Int,
+    nheads_arg: Int64,
+    sched_swizzle_arg: Int64,
+    sched_num_hb_q_arg: Int64,
+    sched_residual_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var seq_len = Int(seq_len_arg)
+    var nheads = Int(nheads_arg)
+    var sched_swizzle = Int(sched_swizzle_arg)
+    var sched_num_hb_q = Int(sched_num_hb_q_arg)
+    var sched_residual = Int(sched_residual_arg)
     comptime BM: Int = kFa4BlockM(head_dim)
     comptime BN: Int = kFa4BlockN
     comptime D: Int = head_dim

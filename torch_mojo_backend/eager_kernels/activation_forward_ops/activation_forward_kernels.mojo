@@ -9,7 +9,7 @@ and rounds once on return.  Device functions are cached per supplied context.
 from nn.activations import gelu_tanh
 from std.ffi import _get_global_or_null, external_call
 from std.gpu import block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import ceildiv, exp2
 from std.math.polynomial import polynomial_evaluate
 from std.memory import alloc, bitcast
@@ -116,9 +116,13 @@ def _gelu_exact_bf16[
 def _gelu_forward_bf16_exact(
     output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    elements: Int,
-    vec_count: Int,
+    elements_arg: Int64,
+    vec_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
+    var vec_count = Int(vec_count_arg)
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC
@@ -135,9 +139,13 @@ def _gelu_forward_bf16_exact(
 def _gelu_forward_bf16_tanh(
     output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    elements: Int,
-    vec_count: Int,
+    elements_arg: Int64,
+    vec_count_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var elements = Int(elements_arg)
+    var vec_count = Int(vec_count_arg)
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC
@@ -166,8 +174,8 @@ def _enqueue_exact_cached(
             cached[],
             output,
             input,
-            elements,
-            vec_count,
+            Int64(elements),
+            Int64(vec_count),
             grid_dim=(blocks,),
             block_dim=(_BLOCK,),
         )
@@ -182,8 +190,8 @@ def _enqueue_exact_cached(
         cached[],
         output,
         input,
-        elements,
-        vec_count,
+        Int64(elements),
+        Int64(vec_count),
         grid_dim=(blocks,),
         block_dim=(_BLOCK,),
     )
@@ -205,8 +213,8 @@ def _enqueue_tanh_cached(
             cached[],
             output,
             input,
-            elements,
-            vec_count,
+            Int64(elements),
+            Int64(vec_count),
             grid_dim=(blocks,),
             block_dim=(_BLOCK,),
         )
@@ -221,8 +229,8 @@ def _enqueue_tanh_cached(
         cached[],
         output,
         input,
-        elements,
-        vec_count,
+        Int64(elements),
+        Int64(vec_count),
         grid_dim=(blocks,),
         block_dim=(_BLOCK,),
     )
