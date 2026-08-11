@@ -77,7 +77,7 @@ def _tanh_grad[
     return g * derivative
 
 
-@__name("nanogpt_gelu_backward_exact")
+@__name("gelu_backward_exact")
 def _gelu_backward_exact(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -98,7 +98,7 @@ def _gelu_backward_exact(
         i += stride
 
 
-@__name("nanogpt_gelu_backward_tanh")
+@__name("gelu_backward_tanh")
 def _gelu_backward_tanh(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -184,7 +184,7 @@ def _gelu_backward_f32_g4[
         i += gstride
 
 
-@__name("nanogpt_gelu_backward_exact_bf16")
+@__name("gelu_backward_exact_bf16")
 def _gelu_backward_exact_bf16(
     output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -214,7 +214,7 @@ def _gelu_backward_exact_bf16(
         i += stride
 
 
-@__name("nanogpt_gelu_backward_tanh_bf16")
+@__name("gelu_backward_tanh_bf16")
 def _gelu_backward_tanh_bf16(
     output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],

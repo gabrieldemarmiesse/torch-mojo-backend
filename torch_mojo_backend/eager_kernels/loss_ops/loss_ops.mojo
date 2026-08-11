@@ -77,7 +77,7 @@ comptime _VEC_UNROLL = 8
 comptime _VEC_MIN_CLASSES = 4 * _BWD_BLOCK
 
 
-@__name("nanogpt_nll_forward_none")
+@__name("nll_forward_none")
 def _nll_forward_none(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -100,7 +100,7 @@ def _nll_forward_none(
         row += stride
 
 
-@__name("nanogpt_nll_forward_mean")
+@__name("nll_forward_mean")
 def _nll_forward_mean(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -145,7 +145,7 @@ def _nll_forward_mean(
         total_weight[0] = valid
 
 
-@__name("nanogpt_nll_forward_mean_partial")
+@__name("nll_forward_mean_partial")
 def _nll_forward_mean_partial(
     scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -172,7 +172,7 @@ def _nll_forward_mean_partial(
         scratch[2 * b + 1] = valid
 
 
-@__name("nanogpt_nll_forward_mean_final")
+@__name("nll_forward_mean_final")
 def _nll_forward_mean_final(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -193,7 +193,7 @@ def _nll_forward_mean_final(
         total_weight[0] = valid
 
 
-@__name("nanogpt_nll_forward_sum")
+@__name("nll_forward_sum")
 def _nll_forward_sum(
     output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -235,7 +235,7 @@ def _nll_forward_sum(
         total_weight[0] = valid
 
 
-@__name("nanogpt_nll_backward_vec4")
+@__name("nll_backward_vec4")
 def _nll_backward_vec4(
     grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -281,7 +281,7 @@ def _nll_backward_vec4(
         row += Int(grid_dim.y)
 
 
-@__name("nanogpt_nll_backward_scalar")
+@__name("nll_backward_scalar")
 def _nll_backward_scalar(
     grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],

@@ -37,7 +37,7 @@ comptime _FINAL_TX = 32
 comptime _FINAL_TY = 32
 
 
-@__name("nanogpt_layer_norm_backward_params_direct")
+@__name("layer_norm_backward_params_direct")
 def _direct_kernel(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -72,7 +72,7 @@ def _direct_kernel(
         grad_bias[col] = bias_acc
 
 
-@__name("nanogpt_layer_norm_backward_params_partial")
+@__name("layer_norm_backward_params_partial")
 def _partial_kernel(
     partial_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     partial_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -126,7 +126,7 @@ def _partial_kernel(
         partial_bias[chunk * cols + col] = bias_acc
 
 
-@__name("nanogpt_layer_norm_backward_params_final")
+@__name("layer_norm_backward_params_final")
 def _final_kernel(
     grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
     grad_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
@@ -201,7 +201,7 @@ def enqueue_layer_norm_backward_params_f32(
         if rows <= _DIRECT_MAX_ROWS:
             _enqueue_cached[_direct_kernel](
                 ctx,
-                "nanogpt_layer_norm_backward_params_direct",
+                "layer_norm_backward_params_direct",
                 col_blocks,
                 1,
                 1,
@@ -233,7 +233,7 @@ def enqueue_layer_norm_backward_params_f32(
             # A single chunk degenerates to the direct regime: no scratch needed.
             _enqueue_cached[_direct_kernel](
                 ctx,
-                "nanogpt_layer_norm_backward_params_direct",
+                "layer_norm_backward_params_direct",
                 col_blocks,
                 1,
                 1,
@@ -259,7 +259,7 @@ def enqueue_layer_norm_backward_params_f32(
 
         _enqueue_cached[_partial_kernel](
             ctx,
-            "nanogpt_layer_norm_backward_params_partial",
+            "layer_norm_backward_params_partial",
             col_blocks,
             num_chunks,
             1,
@@ -278,7 +278,7 @@ def enqueue_layer_norm_backward_params_f32(
         )
         _enqueue_cached_2d[_final_kernel](
             ctx,
-            "nanogpt_layer_norm_backward_params_final",
+            "layer_norm_backward_params_final",
             ceildiv(cols, _FINAL_TX),
             1,
             1,

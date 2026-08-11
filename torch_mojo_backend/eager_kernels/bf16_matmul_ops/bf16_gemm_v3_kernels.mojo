@@ -47,7 +47,11 @@ from bf16_gemm_kernels import (
 )
 from bf16_gemm_nn_v4_kernels import maybe_enqueue_bf16_gemm_nn_v4
 from bf16_gemm_nt_v4_kernels import maybe_enqueue_bf16_gemm_nt_v4
-from bf16_gemm_tn_v4_kernels import try_enqueue_bf16_gemm_tn_v4
+from bf16_gemm_tn_v4_kernels import (
+    try_enqueue_bf16_gemm_splitk_rm_v4,
+    try_enqueue_bf16_gemm_tn_v4,
+    try_enqueue_bf16_gemm_tt_v4,
+)
 
 
 comptime _V3_BF16 = DType.bfloat16
@@ -219,7 +223,7 @@ comptime _V3_TN_SMALL_B_PIPE_LAYOUT = Layout.row_major(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V3_NN_THREADS))
 )
-@__name("nanogpt_bf16_gemm_v3_nn_ws_m128n256_tma_s3")
+@__name("bf16_gemm_v3_nn_ws_m128n256_tma_s3")
 def _v3_nn_ws_m128n256_tma_s3(
     a_tma: _V3_NN_A_TMA,
     b_tma: _V3_NN_B_TMA,
@@ -433,7 +437,7 @@ def _v3_enqueue_nn_ws_m128n256_tma_s3(
         Int32(_V3_NN_SMALL_THREADS)
     )
 )
-@__name("nanogpt_bf16_gemm_v3_nn_ws_m64n128_tma_s3")
+@__name("bf16_gemm_v3_nn_ws_m64n128_tma_s3")
 def _v3_nn_ws_m64n128_tma_s3(
     a_tma: _V3_NN_SMALL_A_TMA,
     b_tma: _V3_NN_SMALL_B_TMA,
@@ -650,7 +654,7 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V3_NT_THREADS))
 )
-@__name("nanogpt_bf16_gemm_v3_nt_ws_m128n256_tma_s3")
+@__name("bf16_gemm_v3_nt_ws_m128n256_tma_s3")
 def _v3_nt_ws_m128n256_tma_s3(
     a_tma: _V3_NT_A_TMA,
     b_tma: _V3_B_K_TMA,
@@ -862,7 +866,7 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
         Int32(_V3_TN_SMALL_THREADS)
     )
 )
-@__name("nanogpt_bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3")
+@__name("bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3")
 def _v3_tn_ws_m64n128_tma_col_a_s3(
     a_tma: _V3_TN_SMALL_A_TMA,
     b_tma: _V3_TN_SMALL_B_TMA,
@@ -1110,7 +1114,7 @@ def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
         Int32(_V3_TN_WS_THREADS)
     )
 )
-@__name("nanogpt_bf16_gemm_v3_tn_ws_m128n256_tma_col_a_s3")
+@__name("bf16_gemm_v3_tn_ws_m128n256_tma_col_a_s3")
 def _v3_tn_ws_m128n256_tma_col_a_s3(
     a_tma: _V3_TN_WS_A_TMA,
     b_tma: _V3_TN_WS_B_TMA,
@@ -1375,6 +1379,13 @@ def enqueue_bf16_gemm(
     # n/k, TMA-compatible sizes) and returns False otherwise, in which case
     # the pre-existing NT path below remains the fallback.
     if not transpose_a and transpose_b and not has_bias:
+        # Deep-K split-K route first: the persistent kernel below keeps all
+        # SMs resident but cannot parallelize over K, so an output with few
+        # macro-tiles and a deep reduction leaves most of the GPU idle.
+        # The helper gates itself on that regime (see
+        # bf16_gemm_tn_v4_kernels.mojo) and returns False otherwise.
+        if try_enqueue_bf16_gemm_splitk_rm_v4[True](output, a, b, m, n, k, ctx):
+            return
         if maybe_enqueue_bf16_gemm_nt_v4(output, a, b, m, n, k, ctx):
             return
     comptime if _has_sm_9x():
@@ -1389,10 +1400,25 @@ def enqueue_bf16_gemm(
                 # NN dgrad route (v4): persistent warp-specialized kernel
                 # with 2-CTA-cluster B multicast and a TMA-store epilogue
                 # (bf16_gemm_nn_v4_kernels.mojo).  It gates itself on the
-                # same tall-m aligned NN regime (m // n >= 8, n % 256 == 0,
-                # k % 64 == 0; m may be ragged) and returns False for
-                # anything else, in which case the pre-existing NN paths
-                # below remain the fallback.
+                # aligned NN regime (n % 64 == 0, k % 64 == 0; m may be
+                # ragged, and n % 256 != 0 selects the ragged_n _nclip
+                # instantiation) and declines only shapes a smaller route
+                # below serves better: the 64x128 small tile (m % 64 == 0,
+                # n % 128 == 0 and its whole grid fits one wave) or, for
+                # ragged n, the bottom-of-ladder 64x64 s64 route whenever
+                # _pick_regime would select it; it returns False for
+                # those, in which case the v3 NN paths below remain the
+                # fallback.
+                # Deep-K split-K route for NN: checked before the
+                # persistent kernel because a persistent CTA serializes its
+                # tiles' whole K depth -- few output macro-tiles plus deep K
+                # leaves most SMs idle.  The helper gates itself on that
+                # regime.
+                if not transpose_a and not transpose_b and not has_bias:
+                    if try_enqueue_bf16_gemm_splitk_rm_v4[False](
+                        output, a, b, m, n, k, ctx
+                    ):
+                        return
                 if maybe_enqueue_bf16_gemm_nn_v4(
                     output,
                     a,
@@ -1415,6 +1441,18 @@ def enqueue_bf16_gemm(
                 if transpose_a and not transpose_b and not has_bias:
                     if try_enqueue_bf16_gemm_tn_v4(output, a, b, m, n, k, ctx):
                         return
+                # V4 TT route: the (COL_A, KMAJ_B) = (True, True)
+                # instantiations of the shared warp-specialized body
+                # (split-K, persistent, direct; see
+                # bf16_gemm_tn_v4_kernels.mojo), so a TT mm writes C
+                # directly into the caller's contiguous row-major (m, n)
+                # buffer -- the same strides CUDA torch returns.  The
+                # dispatcher gates its own aligned regime and returns False
+                # otherwise, in which case the all-layout v2 fallback below
+                # serves the call.
+                if transpose_a and transpose_b and not has_bias:
+                    if try_enqueue_bf16_gemm_tt_v4(output, a, b, m, n, k, ctx):
+                        return
                 # A 64x128 tile preserves the prior aligned-NN coverage and
                 # increases available CTAs when the 128x256 grid would be
                 # severely underfilled on the current GPU.  This predicate is
@@ -1426,7 +1464,6 @@ def enqueue_bf16_gemm(
                     and m >= _V3_NN_SMALL_BM
                     and n >= _V3_NN_SMALL_BN
                     and k >= _V3_NN_SMALL_BK
-                    and m // n >= 8
                     and m % _V3_NN_SMALL_BM == 0
                     and n % _V3_NN_SMALL_BN == 0
                     and k % _V3_NN_SMALL_BK == 0
@@ -1478,7 +1515,6 @@ def enqueue_bf16_gemm(
                     and m >= _V3_NN_BM
                     and n >= _V3_NN_BN
                     and k >= _V3_NN_BK
-                    and m // n >= 8
                     and m % _V3_NN_BM == 0
                     and n % _V3_NN_BN == 0
                     and k % _V3_NN_BK == 0
