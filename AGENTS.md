@@ -96,8 +96,9 @@ hand-written source you edit like any other file. Writes splice only the
 block, so a benchmark run never touches the viewer and a viewer change
 never touches the numbers.
 
-The data is **measurements only** — one ratio per dtype/op/shape/layout
-leaf, nothing derived from them. Per-branch min/median/max are computed
+The tree is hardware → aten op → dtype → shape → layout, and the data is
+**measurements only** — one ratio per op/dtype/shape/layout leaf, nothing
+derived from them. Per-branch min/median/max are computed
 while reading: the viewer prints them on every row of its collapsible tree
 (click a branch to open it), and `report.py` prints them in the terminal.
 The page also takes another baselines file as a query parameter —

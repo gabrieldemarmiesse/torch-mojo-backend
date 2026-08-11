@@ -5,10 +5,10 @@ Reads only benchmarks/baselines.html — no accelerator needed.
     uv run python benchmarks/report.py                # every hardware config
     uv run python benchmarks/report.py --hw H100      # configs matching a substring
     uv run python benchmarks/report.py --worst 20     # top offenders only
-    uv run python benchmarks/report.py -k tf32/mm     # entry paths matching a substring
+    uv run python benchmarks/report.py -k mm/tf32     # entry paths matching a substring
 
-Entries print as their baseline tree path dtype/op/shape/layout, so -k
-matches any axis ("bf16", "mm", "S7", "TN") or a path fragment ("tf32/mm").
+Entries print as their baseline tree path op/dtype/shape/layout, so -k
+matches any axis ("bf16", "mm", "S7", "TN") or a path fragment ("mm/tf32").
 
 For the same data as a collapsible tree with per-branch min/median/max,
 open that same benchmarks/baselines.html in a browser: it carries both the

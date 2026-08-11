@@ -23,16 +23,16 @@ byte-identical halves.  The viewer is hand-written source like any other
 file in the repo; the block is machine-written and must not be
 hand-edited.
 
-Layout of the data block (format 4, the axis tree):
+Layout of the data block (format 5, the axis tree):
 
     {
-      "format": 4,
+      "format": 5,
       "configs": {
         "NVIDIA H100 PCIe | cuda | kineto-device-time@1395MHz | torch 2.11.0+cu130": {
-          "dtypes": {
-            "bf16": {
-              "ops": {
-                "mm": {
+          "ops": {
+            "mm": {
+              "dtypes": {
+                "bf16": {
                   "shapes": {
                     "S1_4096x4096x4096": {
                       "layouts": {"NN": 5.158, "NT": 3.933, ...}
@@ -46,10 +46,16 @@ Layout of the data block (format 4, the axis tree):
       }
     }
 
-The tree path is hardware -> dtype -> op -> shape -> layout -> ratio.  A
-leaf is addressed by a BenchKey (dtype, op, shape, layout); pytest derives
-it from the test's own axes (see bench_lib/check.py), so the failing test
-and its baseline entry still name the same kernel regime.
+The tree path is hardware -> aten op -> dtype -> shape -> layout -> ratio.
+A leaf is addressed by a BenchKey (op, dtype, shape, layout); pytest
+derives it from the test's own axes (see bench_lib/check.py), so the
+failing test and its baseline entry still name the same kernel regime.
+
+Op above dtype, not the other way round: work is scoped by op (an
+engagement optimizes one kernel family across its dtypes), so that order
+puts everything one change can move under a single branch, and reading
+one op's dtypes side by side is what tells you whether a regression is
+dtype-specific.
 
 Why this shape:
 
@@ -74,8 +80,8 @@ Why this shape:
   diff whenever any leaf below them moves, and any of which can go stale
   under a hand edit or a bad merge (a whole validate/repair path existed
   for exactly that).  Derived data belongs in the reader.
-* At each level the children live under a NAMED container key ("dtypes" /
-  "ops" / "shapes" / "layouts"), so a leaf is always a bare number inside
+* At each level the children live under a NAMED container key ("ops" /
+  "dtypes" / "shapes" / "layouts"), so a leaf is always a bare number inside
   "layouts", every other value is an object, and the two can never be
   confused.
 * Serialization is canonical (sorted keys, indent 2, one entry per line).
@@ -123,9 +129,10 @@ then re-canonicalize so the next writer diffs cleanly:
         from bench_lib import baselines; baselines.rebuild()"
 
 rebuild() only ever rewrites the data block, so it is also safe to run
-after a merge that touched the viewer.  It is the migration path for a
-format-3 block too: it drops the derived "aggregate" objects that format
-carried and rewrites canonically.
+after a merge that touched the viewer.  It is the migration path for an
+older block too: it drops the derived "aggregate" objects format 3
+carried, transposes the dtype/op nesting formats 3 and 4 used, and
+rewrites canonically.
 """
 
 from __future__ import annotations
@@ -139,7 +146,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 
 BASELINES_PATH = Path(__file__).resolve().parent.parent / "baselines.html"
 
@@ -150,7 +157,7 @@ BLOCK_OPEN = '<script type="application/json" id="baselines">'
 BLOCK_CLOSE = "</script>"
 
 # Format 3 stored a derived min/median/max object beside every container,
-# under this key.  Format 4 stores measurements only; rebuild() drops them.
+# under this key.  Later formats store measurements only; rebuild() drops them.
 LEGACY_AGGREGATE_KEY = "aggregate"
 
 # Used only when the file does not exist yet (a scratch path, or a deleted
@@ -171,20 +178,21 @@ data block of benchmarks/baselines.html into here to get the viewer back.</p>
 class BenchKey(typing.NamedTuple):
     """Address of one ratio leaf inside a hardware config's axis tree.
 
-    Axis order follows the tree: dtype -> op -> shape -> layout.  The op
-    token is the aten base name with the overload variant folded in
-    ("mm", "add.Tensor"); any extra axis an op needs is folded into the
-    shape token; ops without a layout notion use the fixed sentinel
-    "contig" so every path has the same rank.
+    Axis order follows the tree: op -> dtype -> shape -> layout, so
+    str(key) is the tree path and every reader can print, match and sort
+    on the same string.  The op token is the aten base name with the
+    overload variant folded in ("mm", "add.Tensor"); any extra axis an op
+    needs is folded into the shape token; ops without a layout notion use
+    the fixed sentinel "contig" so every path has the same rank.
     """
 
-    dtype: str
     op: str
+    dtype: str
     shape: str
     layout: str
 
     def __str__(self) -> str:
-        return f"{self.dtype}/{self.op}/{self.shape}/{self.layout}"
+        return f"{self.op}/{self.dtype}/{self.shape}/{self.layout}"
 
 
 def _check_ratio(value: float, where: str) -> None:
@@ -212,37 +220,37 @@ class ShapeBlock(BaseModel):
         return value
 
 
-class OpBlock(BaseModel):
-    """One aten op's shapes."""
+class DtypeBlock(BaseModel):
+    """One dtype's shapes."""
 
     model_config = ConfigDict(extra="forbid")
 
     shapes: dict[str, ShapeBlock] = Field(default_factory=dict)
 
 
-class DtypeBlock(BaseModel):
-    """One dtype's ops."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    ops: dict[str, OpBlock] = Field(default_factory=dict)
-
-
-class ConfigBlock(BaseModel):
-    """One hardware configuration's axis tree: dtype -> op -> shape -> layout."""
+class OpBlock(BaseModel):
+    """One aten op's dtypes."""
 
     model_config = ConfigDict(extra="forbid")
 
     dtypes: dict[str, DtypeBlock] = Field(default_factory=dict)
 
+
+class ConfigBlock(BaseModel):
+    """One hardware configuration's axis tree: op -> dtype -> shape -> layout."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ops: dict[str, OpBlock] = Field(default_factory=dict)
+
     def leaves(self) -> dict[BenchKey, float]:
         """Every ratio leaf under this config, addressed by BenchKey."""
         out: dict[BenchKey, float] = {}
-        for dtype, dtype_block in self.dtypes.items():
-            for op, op_block in dtype_block.ops.items():
-                for shape, shape_block in op_block.shapes.items():
+        for op, op_block in self.ops.items():
+            for dtype, dtype_block in op_block.dtypes.items():
+                for shape, shape_block in dtype_block.shapes.items():
                     for layout, ratio in shape_block.layouts.items():
-                        out[BenchKey(dtype, op, shape, layout)] = ratio
+                        out[BenchKey(op, dtype, shape, layout)] = ratio
         return out
 
 
@@ -261,9 +269,11 @@ class BaselinesFile(BaseModel):
             hint = {
                 2: " (format 2 was the flat node-id layout; migrate it with "
                 "the axis-tree migration before loading)",
-                3: " (format 3 stored a derived min/median/max object beside "
-                "every container; run bench_lib.baselines.rebuild() to drop "
-                "them — the readers compute those on the fly now)",
+                3: " (format 3 nested dtype above op and stored a derived "
+                "min/median/max beside every container; run "
+                "bench_lib.baselines.rebuild() to migrate it)",
+                4: " (format 4 nested dtype above op; run "
+                "bench_lib.baselines.rebuild() to transpose it)",
             }.get(value, "")
             raise ValueError(
                 f"unknown baseline format {value!r}, expected {FORMAT_VERSION!r}{hint}"
@@ -279,15 +289,17 @@ def prune_empty(data: BaselinesFile) -> BaselinesFile:
     call this through canonical_dump.
     """
     for config in data.configs.values():
-        for dtype_block in config.dtypes.values():
-            for op_block in dtype_block.ops.values():
-                for shape in [s for s, b in op_block.shapes.items() if not b.layouts]:
-                    del op_block.shapes[shape]
-            for op in [o for o, b in dtype_block.ops.items() if not b.shapes]:
-                del dtype_block.ops[op]
-        for dtype in [d for d, b in config.dtypes.items() if not b.ops]:
-            del config.dtypes[dtype]
-    for config_key in [k for k, c in data.configs.items() if not c.dtypes]:
+        for op_block in config.ops.values():
+            for dtype_block in op_block.dtypes.values():
+                for shape in [
+                    s for s, b in dtype_block.shapes.items() if not b.layouts
+                ]:
+                    del dtype_block.shapes[shape]
+            for dtype in [d for d, b in op_block.dtypes.items() if not b.shapes]:
+                del op_block.dtypes[dtype]
+        for op in [o for o, b in config.ops.items() if not b.dtypes]:
+            del config.ops[op]
+    for config_key in [k for k, c in data.configs.items() if not c.ops]:
         del data.configs[config_key]
     return data
 
@@ -342,13 +354,13 @@ def lookup(data: BaselinesFile, hw_key: str, bench_key: BenchKey) -> float | Non
     config = data.configs.get(hw_key)
     if config is None:
         return None
-    dtype_block = config.dtypes.get(bench_key.dtype)
-    if dtype_block is None:
-        return None
-    op_block = dtype_block.ops.get(bench_key.op)
+    op_block = config.ops.get(bench_key.op)
     if op_block is None:
         return None
-    shape_block = op_block.shapes.get(bench_key.shape)
+    dtype_block = op_block.dtypes.get(bench_key.dtype)
+    if dtype_block is None:
+        return None
+    shape_block = dtype_block.shapes.get(bench_key.shape)
     if shape_block is None:
         return None
     return shape_block.layouts.get(bench_key.layout)
@@ -396,9 +408,9 @@ def merge_write(
             data = load(path)  # fresh read under the lock, not a cached copy
             config = data.configs.setdefault(hw_key, ConfigBlock())
             for key, ratio in entries.items():
-                dtype_block = config.dtypes.setdefault(key.dtype, DtypeBlock())
-                op_block = dtype_block.ops.setdefault(key.op, OpBlock())
-                shape_block = op_block.shapes.setdefault(key.shape, ShapeBlock())
+                op_block = config.ops.setdefault(key.op, OpBlock())
+                dtype_block = op_block.dtypes.setdefault(key.dtype, DtypeBlock())
+                shape_block = dtype_block.shapes.setdefault(key.shape, ShapeBlock())
                 shape_block.layouts[key.layout] = round(float(ratio), 3)
             write(data, path)
         finally:
@@ -406,7 +418,7 @@ def merge_write(
 
 
 def _without_legacy_aggregates(node: dict[str, object]) -> dict[str, object]:
-    """The format-3 tree minus its derived "aggregate" objects, recursively."""
+    """A format-3 tree minus its derived "aggregate" objects, recursively."""
     return {
         key: _without_legacy_aggregates(child) if isinstance(child, dict) else child
         for key, child in node.items()
@@ -414,15 +426,39 @@ def _without_legacy_aggregates(node: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _transposed(configs: dict[str, dict]) -> dict[str, dict]:
+    """Formats 3 and 4 nested dtype above op; format 5 nests op above dtype.
+
+    Rebuilds each config as ops -> dtypes -> shapes, carrying the shape
+    blocks across whole: no ratio is read or rewritten, so the migration
+    cannot alter a measurement.
+    """
+    out = {}
+    for config_key, config in configs.items():
+        ops = {}
+        for dtype, dtype_block in config.get("dtypes", {}).items():
+            for op, op_block in dtype_block.get("ops", {}).items():
+                ops.setdefault(op, {})[dtype] = {"shapes": op_block.get("shapes", {})}
+        out[config_key] = {
+            "ops": {op: {"dtypes": dtypes} for op, dtypes in ops.items()}
+        }
+    return out
+
+
 def rebuild(path: Path = BASELINES_PATH) -> None:
     """Re-canonicalize the data block: prune empty blocks, sort, rewrite.
 
     The escape hatch for the two documented manual situations — resolving
-    a git merge of two added blocks, and migrating a format-3 block, whose
-    stored aggregates this format drops.  The viewer is left alone.
+    a git merge of two added blocks, and migrating a block written by an
+    older format (3 also stored aggregates; 3 and 4 both nested dtype
+    above op).  The viewer is left alone.
     """
     _, block, _ = split_document(path.read_text(), path)
     raw = json.loads(block)
-    if isinstance(raw, dict) and raw.get("format") == 3:
-        raw = _without_legacy_aggregates(raw) | {"format": FORMAT_VERSION}
+    if isinstance(raw, dict) and raw.get("format") in (3, 4):
+        stripped = _without_legacy_aggregates(raw)
+        raw = {
+            "configs": _transposed(stripped.get("configs", {})),
+            "format": FORMAT_VERSION,
+        }
     write(_parse(raw, path), path)

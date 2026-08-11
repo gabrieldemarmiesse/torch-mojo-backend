@@ -2,7 +2,7 @@
 
 One pytest test node per benchmark case.  The ratio against stock
 PyTorch is stored in benchmarks/baselines.html under the axis-tree path
-hardware -> dtype -> op -> shape -> layout, derived from the node's own
+hardware -> aten op -> dtype -> shape -> layout, derived from the node's own
 axes (bench_lib/check.py:_bench_key): op from the test function name
 (overridable with @pytest.mark.bench_op), dtype/shape from the
 parametrize ids, layout from the layout axis or the sentinel "contig".

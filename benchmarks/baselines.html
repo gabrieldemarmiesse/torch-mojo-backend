@@ -195,7 +195,7 @@
   <div class="card" id="loader">
     <div class="row">
       <label class="fld">Search the tree
-        <input type="search" id="q" class="mono" placeholder="e.g. bf16/mm, S7, softmax, TN" style="min-width:240px">
+        <input type="search" id="q" class="mono" placeholder="e.g. mm/bf16, S7, softmax, TN" style="min-width:240px">
       </label>
       <button class="chip" id="missonly" aria-pressed="false" style="align-self:flex-end">only misses &gt;1.10</button>
       <span style="flex:1"></span>
@@ -229,7 +229,7 @@
         <button id="collapse">Collapse all</button>
       </div>
       <div class="hint" style="margin:0 0 10px">
-        hardware &rarr; dtype &rarr; aten op &rarr; shape &rarr; layout. A collapsed row already shows the
+        hardware &rarr; aten op &rarr; dtype &rarr; shape &rarr; layout. A collapsed row already shows the
         worst ratio under it &mdash; open the red ones. Click a row (or press Enter on it) to toggle.
       </div>
       <div class="tree" id="tree">
@@ -266,7 +266,7 @@
       <div class="scroll">
         <table class="list" id="list">
           <thead><tr>
-            <th class="num">ratio</th><th>dtype</th><th>op</th><th>shape</th><th>layout</th><th>hardware</th>
+            <th class="num">ratio</th><th>op</th><th>dtype</th><th>shape</th><th>layout</th><th>hardware</th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -307,11 +307,12 @@ const pill = r => {
 };
 const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-const LEVELS = ["hardware", "dtype", "op", "shape", "layout"];   // display names per depth
-const KEYS = ["hw", "dtype", "op", "shape"];                     // leaf properties per category depth
+const LEVELS = ["hardware", "op", "dtype", "shape", "layout"];   // display names per depth
+const KEYS = ["hw", "op", "dtype", "shape"];                     // leaf properties per category depth
+const MONO = new Set(["op", "shape", "layout"]);                 // levels named by identifiers
 const SEP = "";
 
-let LEAVES = [];                 // {hw, dtype, op, shape, layout, ratio, path}
+let LEAVES = [];                 // {hw, op, dtype, shape, layout, ratio, path}
 let SELDT = new Set();           // dtype chip selection (empty = all)
 let MISSONLY = false;
 let EXPANDED = new Set();        // node paths (SEP-joined prefixes)
@@ -320,24 +321,24 @@ let PENDING_EXPAND = null;       // "all" | null — applied on next tree build
 // ---- ingest: the axis tree -> flat leaves ---------------------------------
 // Only the ratio LEAVES are read. Every min/median/max on this page is
 // computed here, in the browser, from the leaves below each branch — the
-// file stores measurements only. (Format 3 also stored those aggregates;
-// they are ignored, so a file from either format renders identically.)
-const READABLE_FORMATS = [3, 4];
+// file stores measurements only.
+const READABLE_FORMAT = 5;
 
 function ingest(obj, srcLabel) {
   if (!obj || typeof obj !== "object" || !obj.configs)
     throw new Error('Not a baselines file: expected a top-level "configs" object.');
-  if (!READABLE_FORMATS.includes(obj.format))
+  if (obj.format !== READABLE_FORMAT)
     throw new Error(`Unsupported baselines format ${JSON.stringify(obj.format)}; `
-      + `this page reads format ${READABLE_FORMATS.join(" and ")}.`);
+      + `this page reads format ${READABLE_FORMAT}. Formats 3 and 4 nested dtype `
+      + `above op — run bench_lib.baselines.rebuild() on that file to migrate it.`);
   const leaves = [];
   for (const [hw, cfg] of Object.entries(obj.configs)) {
-    for (const [dtype, dt] of Object.entries(cfg.dtypes || {})) {
-      for (const [op, o] of Object.entries(dt.ops || {})) {
-        for (const [shape, sh] of Object.entries(o.shapes || {})) {
+    for (const [op, o] of Object.entries(cfg.ops || {})) {
+      for (const [dtype, dt] of Object.entries(o.dtypes || {})) {
+        for (const [shape, sh] of Object.entries(dt.shapes || {})) {
           for (const [layout, ratio] of Object.entries(sh.layouts || {})) {
-            leaves.push({ hw, dtype, op, shape, layout, ratio: +ratio,
-                          path: [hw, dtype, op, shape, layout].join("/").toLowerCase() });
+            leaves.push({ hw, op, dtype, shape, layout, ratio: +ratio,
+                          path: [hw, op, dtype, shape, layout].join("/").toLowerCase() });
           }
         }
       }
@@ -454,7 +455,7 @@ function emitKids(node, host, depth) {
     row.tabIndex = 0;
     row.innerHTML =
       `<div class="name"><span class="caret">▶</span>` +
-      `<span class="label${depth >= 2 ? " mono" : ""}">${esc(kid.name)}</span>` +
+      `<span class="label${MONO.has(LEVELS[depth]) ? " mono" : ""}">${esc(kid.name)}</span>` +
       `<span class="lvl">${LEVELS[depth]}</span></div>` +
       `<div class="num count">${s.n}</div>` +
       `<div class="num${s.min > BAR ? "" : " dim"}">${fmt(s.min)}×</div>` +
@@ -505,7 +506,7 @@ function render() {
   document.getElementById("t-med").textContent = rows.length ? fmt(median(ratios)) + "×" : "–";
   document.getElementById("t-max").textContent = worst ? fmt(worst.ratio) + "×" : "–";
   document.getElementById("t-max-sub").textContent =
-    worst ? `${worst.dtype}/${worst.op}/${worst.shape}/${worst.layout}` : "";
+    worst ? `${worst.op}/${worst.dtype}/${worst.shape}/${worst.layout}` : "";
 
   drawTree(rows);
   drawMatrix(rows);
@@ -572,7 +573,7 @@ function drawList(rows) {
     const tr = tb.insertRow();
     tr.innerHTML =
       `<td class="num">${pill(r.ratio)}</td>` +
-      `<td>${esc(r.dtype)}</td><td class="mono">${esc(r.op)}</td>` +
+      `<td class="mono">${esc(r.op)}</td><td>${esc(r.dtype)}</td>` +
       `<td class="mono">${esc(r.shape)}</td><td class="mono">${esc(r.layout)}</td>` +
       `<td class="path">${esc(r.hw)}</td>`;
   }
@@ -681,7 +682,7 @@ document.addEventListener("DOMContentLoaded", boot);
 </script>
 
 <!-- The baselines themselves: machine-written by `pytest benchmarks/ --update-baselines`.
-     One ratio per dtype/op/shape/layout leaf, canonical (sorted keys, indent 2, one entry
+     One ratio per op/dtype/shape/layout leaf, canonical (sorted keys, indent 2, one entry
      per line) so a run that measured three cases changes three lines here and nothing else.
      Nothing derived is stored: the viewer above computes every min/median/max from these
      leaves. Do not hand-edit — see benchmarks/bench_lib/baselines.py. -->
@@ -689,10 +690,10 @@ document.addEventListener("DOMContentLoaded", boot);
 {
   "configs": {
     "NVIDIA H100 PCIe | cuda | kineto-device-time@1395MHz | torch 2.11.0+cu130": {
-      "dtypes": {
-        "bf16": {
-          "ops": {
-            "_adaptive_avg_pool2d": {
+      "ops": {
+        "_adaptive_avg_pool2d": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "N32xC512x28x28_o7": {
                   "layouts": {
@@ -706,7 +707,205 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "_log_softmax": {
+            "f32": {
+              "shapes": {
+                "N32xC512x28x28_o7": {
+                  "layouts": {
+                    "contig": 0.466
+                  }
+                },
+                "N8xC64x112x112_o1": {
+                  "layouts": {
+                    "contig": 2.347
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_foreach_add_.Scalar": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 1.95
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 1.845
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_foreach_addcdiv_.ScalarList": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 3.36
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 2.364
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_foreach_addcmul_.Scalar": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 4.549
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 2.431
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_foreach_div_.ScalarList": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 4.431
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 5.237
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_foreach_lerp_.Scalar": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 6.884
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 4.554
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_foreach_mul_.Scalar": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 6.911
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 8.026
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_foreach_mul_.Tensor": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 2.044
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 1.935
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_foreach_norm.Scalar": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 1.044
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 0.971
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_foreach_sqrt": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 1.571
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 1.05
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_fused_adamw_": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L16x65536": {
+                  "layouts": {
+                    "contig": 2.395
+                  }
+                },
+                "L4x1048576": {
+                  "layouts": {
+                    "contig": 1.825
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_log_softmax": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -725,7 +924,30 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "_log_softmax_backward_data": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.88
+                  }
+                },
+                "S32768x1024": {
+                  "layouts": {
+                    "contig": 1.374
+                  }
+                },
+                "S768x50304": {
+                  "layouts": {
+                    "contig": 0.637
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_log_softmax_backward_data": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -744,7 +966,48 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "_scaled_dot_product_attention_math": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.144
+                  }
+                },
+                "S32768x1024": {
+                  "layouts": {
+                    "contig": 1.071
+                  }
+                },
+                "S768x50304": {
+                  "layouts": {
+                    "contig": 0.741
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_native_batch_norm_legit_no_training": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 1.87
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 2.717
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_scaled_dot_product_attention_math": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "B1H16S4096D128": {
                   "layouts": {
@@ -758,7 +1021,25 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "_scaled_dot_product_efficient_attention": {
+            "f32": {
+              "shapes": {
+                "B1H16S4096D128": {
+                  "layouts": {
+                    "contig": 0.861
+                  }
+                },
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 0.757
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_scaled_dot_product_efficient_attention": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "B1H16S4096D128": {
                   "layouts": {
@@ -772,7 +1053,25 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "_scaled_dot_product_flash_attention": {
+            "f16": {
+              "shapes": {
+                "B1H16S4096D128": {
+                  "layouts": {
+                    "contig": 17.509
+                  }
+                },
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 14.496
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_scaled_dot_product_flash_attention": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "B8H12S1024D64": {
                   "layouts": {
@@ -780,8 +1079,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "_scaled_dot_product_flash_attention_backward": {
+            }
+          }
+        },
+        "_scaled_dot_product_flash_attention_backward": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "B8H12S1024D64": {
                   "layouts": {
@@ -789,8 +1092,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "_softmax": {
+            }
+          }
+        },
+        "_softmax": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -809,7 +1116,30 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "_to_copy": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.407
+                  }
+                },
+                "S32768x1024": {
+                  "layouts": {
+                    "contig": 2.09
+                  }
+                },
+                "S768x50304": {
+                  "layouts": {
+                    "contig": 1.542
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_to_copy": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -823,7 +1153,25 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "abs": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.146
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.171
+                  }
+                }
+              }
+            }
+          }
+        },
+        "abs": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -837,7 +1185,25 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "acos": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.341
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.114
+                  }
+                }
+              }
+            }
+          }
+        },
+        "acos": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -851,7 +1217,25 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "add.Tensor": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.247
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.14
+                  }
+                }
+              }
+            }
+          }
+        },
+        "add.Tensor": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -867,7 +1251,27 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "add_.Tensor": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.468,
+                    "contig": 1.023
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.916,
+                    "contig": 1.002
+                  }
+                }
+              }
+            }
+          }
+        },
+        "add_.Tensor": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -881,7 +1285,25 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "addcdiv": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.297
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.001
+                  }
+                }
+              }
+            }
+          }
+        },
+        "addcdiv": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -895,7 +1317,25 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "addcmul": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 3.346
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 2.22
+                  }
+                }
+              }
+            }
+          }
+        },
+        "addcmul": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -909,7 +1349,25 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "addmm": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 3.818
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 2.238
+                  }
+                }
+              }
+            }
+          }
+        },
+        "addmm": {
+          "dtypes": {
+            "bf16": {
               "shapes": {
                 "S1_4096x4096x4096": {
                   "layouts": {
@@ -969,1161 +1427,7 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "amax": {
-              "shapes": {
-                "S4096x4096_d0": {
-                  "layouts": {
-                    "contig": 3.975
-                  }
-                },
-                "S4096x4096_d1": {
-                  "layouts": {
-                    "contig": 1.907
-                  }
-                }
-              }
-            },
-            "amin": {
-              "shapes": {
-                "S4096x4096_d0": {
-                  "layouts": {
-                    "contig": 3.945
-                  }
-                },
-                "S4096x4096_d1": {
-                  "layouts": {
-                    "contig": 1.894
-                  }
-                }
-              }
-            },
-            "asinh": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.041
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.34
-                  }
-                }
-              }
-            },
-            "atanh": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.177
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.479
-                  }
-                }
-              }
-            },
-            "avg_pool2d": {
-              "shapes": {
-                "N32xC64x112x112_k2s2": {
-                  "layouts": {
-                    "contig": 1.525
-                  }
-                },
-                "N8xC256x28x28_k3s2": {
-                  "layouts": {
-                    "contig": 1.368
-                  }
-                }
-              }
-            },
-            "bmm": {
-              "shapes": {
-                "S1_8x4096x4096x4096": {
-                  "layouts": {
-                    "NN": 5.369,
-                    "NT": 3.763,
-                    "TN": 6.88,
-                    "TT": 4.062
-                  }
-                },
-                "S2_8x8192x2048x2048": {
-                  "layouts": {
-                    "NN": 5.223,
-                    "NT": 3.557,
-                    "TN": 6.833,
-                    "TT": 5.039
-                  }
-                },
-                "S3_8x2048x8192x2048": {
-                  "layouts": {
-                    "NN": 5.249,
-                    "NT": 3.55,
-                    "TN": 6.794,
-                    "TT": 5.091
-                  }
-                },
-                "S4_8x1024x1024x8192": {
-                  "layouts": {
-                    "NN": 5.158,
-                    "NT": 4.179,
-                    "TN": 6.725,
-                    "TT": 4.972
-                  }
-                },
-                "S5_8x357x789x333": {
-                  "layouts": {
-                    "NN": 2.359,
-                    "NT": 1.793,
-                    "TN": 3.041,
-                    "TT": 2.302
-                  }
-                },
-                "S6_8x32768x768x768": {
-                  "layouts": {
-                    "NN": 4.415,
-                    "NT": 3.799,
-                    "TN": 6.259,
-                    "TT": 4.346
-                  }
-                }
-              }
-            },
-            "cat": {
-              "shapes": {
-                "P2x8388608": {
-                  "layouts": {
-                    "contig": 7.087
-                  }
-                },
-                "P64x262144": {
-                  "layouts": {
-                    "contig": 9.347
-                  }
-                }
-              }
-            },
-            "ceil": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.381
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.442
-                  }
-                }
-              }
-            },
-            "clamp": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 2.189
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "contig": 2.166
-                  }
-                }
-              }
-            },
-            "clone": {
-              "shapes": {
-                "S4096x4096": {
-                  "layouts": {
-                    "sliced": 0.643
-                  }
-                }
-              }
-            },
-            "convolution": {
-              "shapes": {
-                "N32xC64x56x56_K64k3s1": {
-                  "layouts": {
-                    "contig": 24.351
-                  }
-                },
-                "N8xC3x224x224_K64k7s2": {
-                  "layouts": {
-                    "contig": 4.701
-                  }
-                }
-              }
-            },
-            "cos": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.001
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.419
-                  }
-                }
-              }
-            },
-            "cosh": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.256
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.533
-                  }
-                }
-              }
-            },
-            "div.Tensor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "bcast": 2.189,
-                    "contig": 1.071
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "bcast": 0.565,
-                    "contig": 1.007
-                  }
-                }
-              }
-            },
-            "embedding": {
-              "shapes": {
-                "V1000xD64_T4096": {
-                  "layouts": {
-                    "contig": 0.962
-                  }
-                },
-                "V50304xD768_T49152": {
-                  "layouts": {
-                    "contig": 2.703
-                  }
-                }
-              }
-            },
-            "erf": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.296
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.552
-                  }
-                }
-              }
-            },
-            "exp": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.259
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.446
-                  }
-                }
-              }
-            },
-            "fill_.Scalar": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 9.267
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 41.26
-                  }
-                }
-              }
-            },
-            "floor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.373
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.445
-                  }
-                }
-              }
-            },
-            "gelu": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.005
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 0.965
-                  }
-                }
-              }
-            },
-            "gelu_backward": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 0.91
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 0.987
-                  }
-                }
-              }
-            },
-            "index.Tensor": {
-              "shapes": {
-                "R1000x64_I4096": {
-                  "layouts": {
-                    "contig": 0.976
-                  }
-                },
-                "R262144x64_I1048576": {
-                  "layouts": {
-                    "contig": 0.49
-                  }
-                }
-              }
-            },
-            "isnan": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 2.053
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 2.544
-                  }
-                }
-              }
-            },
-            "linear": {
-              "shapes": {
-                "S1_4096x4096x4096": {
-                  "layouts": {
-                    "contig": 3.923
-                  }
-                },
-                "S2_8192x2048x2048": {
-                  "layouts": {
-                    "contig": 3.746
-                  }
-                },
-                "S3_2048x8192x2048": {
-                  "layouts": {
-                    "contig": 3.871
-                  }
-                },
-                "S4_1024x1024x8192": {
-                  "layouts": {
-                    "contig": 6.018
-                  }
-                },
-                "S5_357x789x333": {
-                  "layouts": {
-                    "contig": 2.494
-                  }
-                },
-                "S6_32768x768x768": {
-                  "layouts": {
-                    "contig": 3.94
-                  }
-                },
-                "S7_768x50304x49152": {
-                  "layouts": {
-                    "contig": 3.248
-                  }
-                }
-              }
-            },
-            "linear_backward": {
-              "shapes": {
-                "S1_4096x4096x4096": {
-                  "layouts": {
-                    "contig": 2.99
-                  }
-                },
-                "S2_8192x2048x2048": {
-                  "layouts": {
-                    "contig": 3.32
-                  }
-                },
-                "S3_2048x8192x2048": {
-                  "layouts": {
-                    "contig": 4.224
-                  }
-                },
-                "S4_1024x1024x8192": {
-                  "layouts": {
-                    "contig": 3.2
-                  }
-                },
-                "S5_357x789x333": {
-                  "layouts": {
-                    "contig": 3.765
-                  }
-                },
-                "S6_32768x768x768": {
-                  "layouts": {
-                    "contig": 1.499
-                  }
-                },
-                "S7_768x50304x49152": {
-                  "layouts": {
-                    "contig": 2.344
-                  }
-                }
-              }
-            },
-            "log": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.122
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.456
-                  }
-                }
-              }
-            },
-            "log1p": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.91
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 3.696
-                  }
-                }
-              }
-            },
-            "max": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 28.958
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 8.236
-                  }
-                }
-              }
-            },
-            "max_pool2d_with_indices": {
-              "shapes": {
-                "N32xC64x112x112_k2s2": {
-                  "layouts": {
-                    "contig": 2.35
-                  }
-                },
-                "N8xC256x28x28_k3s2": {
-                  "layouts": {
-                    "contig": 2.301
-                  }
-                }
-              }
-            },
-            "maximum": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 0.824
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "contig": 0.996
-                  }
-                }
-              }
-            },
-            "mean": {
-              "shapes": {
-                "C16777216_all": {
-                  "layouts": {
-                    "contig": 13.333
-                  }
-                },
-                "S4096x4096_d0": {
-                  "layouts": {
-                    "contig": 5.627
-                  }
-                },
-                "S4096x4096_d1": {
-                  "layouts": {
-                    "contig": 3.765
-                  }
-                }
-              }
-            },
-            "min": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 28.878
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 8.16
-                  }
-                }
-              }
-            },
-            "min.dim": {
-              "shapes": {
-                "S4096x4096_d0": {
-                  "layouts": {
-                    "contig": 1.299
-                  }
-                },
-                "S4096x4096_d1": {
-                  "layouts": {
-                    "contig": 1.331
-                  }
-                }
-              }
-            },
-            "minimum": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 0.827
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "contig": 0.993
-                  }
-                }
-              }
-            },
-            "mm": {
-              "shapes": {
-                "S1_4096x4096x4096": {
-                  "layouts": {
-                    "NN": 5.165,
-                    "NT": 1.078,
-                    "TN": 1.129,
-                    "TT": 4.843
-                  }
-                },
-                "S2_8192x2048x2048": {
-                  "layouts": {
-                    "NN": 5.168,
-                    "NT": 1.111,
-                    "TN": 1.238,
-                    "TT": 4.788
-                  }
-                },
-                "S3_2048x8192x2048": {
-                  "layouts": {
-                    "NN": 4.912,
-                    "NT": 1.061,
-                    "TN": 1.225,
-                    "TT": 4.638
-                  }
-                },
-                "S4_1024x1024x8192": {
-                  "layouts": {
-                    "NN": 9.317,
-                    "NT": 2.211,
-                    "TN": 1.151,
-                    "TT": 9.027
-                  }
-                },
-                "S5_357x789x333": {
-                  "layouts": {
-                    "NN": 2.711,
-                    "NT": 2.261,
-                    "TN": 3.266,
-                    "TT": 2.826
-                  }
-                },
-                "S6_32768x768x768": {
-                  "layouts": {
-                    "NN": 1.055,
-                    "NT": 1.151,
-                    "TN": 1.626,
-                    "TT": 5.073
-                  }
-                },
-                "S7_768x50304x49152": {
-                  "layouts": {
-                    "NN": 4.178,
-                    "NT": 1.014,
-                    "TN": 1.892,
-                    "TT": 4.05
-                  }
-                }
-              }
-            },
-            "mul.Tensor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "bcast": 2.272,
-                    "contig": 1.001
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "bcast": 0.591,
-                    "contig": 1.006
-                  }
-                }
-              }
-            },
-            "mul_.Tensor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.042
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 0.997
-                  }
-                }
-              }
-            },
-            "native_group_norm": {
-              "shapes": {
-                "N32xC64xH56xW56_G32": {
-                  "layouts": {
-                    "contig": 1.042
-                  }
-                },
-                "N8xC256xH14xW14_G32": {
-                  "layouts": {
-                    "contig": 0.813
-                  }
-                }
-              }
-            },
-            "native_layer_norm": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 0.76
-                  }
-                },
-                "B32768xD1024": {
-                  "layouts": {
-                    "contig": 3.108
-                  }
-                }
-              }
-            },
-            "neg": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.427
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.432
-                  }
-                }
-              }
-            },
-            "pow": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "Scalar": 1.081,
-                    "Tensor": 0.755
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "Scalar": 1.082,
-                    "Tensor": 0.65
-                  }
-                }
-              }
-            },
-            "reciprocal": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.239
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.497
-                  }
-                }
-              }
-            },
-            "relu": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.305
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.423
-                  }
-                }
-              }
-            },
-            "relu_": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.354
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 2.548
-                  }
-                }
-              }
-            },
-            "repeat": {
-              "shapes": {
-                "S1024x1024_r4x4": {
-                  "layouts": {
-                    "contig": 15.66
-                  }
-                },
-                "S357x789_r3x5": {
-                  "layouts": {
-                    "contig": 15.759
-                  }
-                }
-              }
-            },
-            "rsqrt": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.497
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.591
-                  }
-                }
-              }
-            },
-            "scaled_dot_product_attention": {
-              "shapes": {
-                "B1H16S4096D128": {
-                  "layouts": {
-                    "contig": 10.75
-                  }
-                },
-                "B8H12S1024D64": {
-                  "layouts": {
-                    "contig": 2.255
-                  }
-                }
-              }
-            },
-            "scatter.src": {
-              "shapes": {
-                "R1000x64_S512": {
-                  "layouts": {
-                    "contig": 0.961
-                  }
-                },
-                "R262144x64_S65536": {
-                  "layouts": {
-                    "contig": 1.161
-                  }
-                }
-              }
-            },
-            "scatter.value": {
-              "shapes": {
-                "R1000x64_S512": {
-                  "layouts": {
-                    "contig": 1.217
-                  }
-                },
-                "R262144x64_S65536": {
-                  "layouts": {
-                    "contig": 1.202
-                  }
-                }
-              }
-            },
-            "sigmoid": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.066
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.513
-                  }
-                }
-              }
-            },
-            "sign": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.365
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.455
-                  }
-                }
-              }
-            },
-            "silu": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.095
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.502
-                  }
-                }
-              }
-            },
-            "sin": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.014
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.421
-                  }
-                }
-              }
-            },
-            "sinh": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.295
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.695
-                  }
-                }
-              }
-            },
-            "sqrt": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.225
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.48
-                  }
-                }
-              }
-            },
-            "stack": {
-              "shapes": {
-                "P32x65536": {
-                  "layouts": {
-                    "contig": 16.086
-                  }
-                },
-                "P8x1048576": {
-                  "layouts": {
-                    "contig": 7.969
-                  }
-                }
-              }
-            },
-            "sub.Tensor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "bcast": 2.254,
-                    "contig": 0.99
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "bcast": 0.588,
-                    "contig": 1.005
-                  }
-                }
-              }
-            },
-            "sum.dim_IntList": {
-              "shapes": {
-                "C16777216_all": {
-                  "layouts": {
-                    "contig": 13.547
-                  }
-                },
-                "S4096x4096_d0": {
-                  "layouts": {
-                    "contig": 5.95
-                  }
-                },
-                "S4096x4096_d1": {
-                  "layouts": {
-                    "contig": 4.095
-                  }
-                }
-              }
-            },
-            "tan": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.079
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.504
-                  }
-                }
-              }
-            },
-            "tanh": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.171
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.441
-                  }
-                }
-              }
-            },
-            "tril": {
-              "shapes": {
-                "S8192x8192": {
-                  "layouts": {
-                    "contig": 2.686
-                  }
-                }
-              }
-            },
-            "triu": {
-              "shapes": {
-                "S8192x8192": {
-                  "layouts": {
-                    "contig": 2.683
-                  }
-                }
-              }
-            },
-            "upsample_bilinear2d": {
-              "shapes": {
-                "N2xC3x256x256_x2": {
-                  "layouts": {
-                    "contig": 2.745
-                  }
-                },
-                "N8xC64x56x56_x2": {
-                  "layouts": {
-                    "contig": 1.05
-                  }
-                }
-              }
-            },
-            "var.correction": {
-              "shapes": {
-                "C16777216_all": {
-                  "layouts": {
-                    "contig": 1149.008
-                  }
-                },
-                "S4096x4096_d0": {
-                  "layouts": {
-                    "contig": 2.541
-                  }
-                },
-                "S4096x4096_d1": {
-                  "layouts": {
-                    "contig": 1.663
-                  }
-                }
-              }
-            },
-            "where.self": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 5.327
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "contig": 2.918
-                  }
-                }
-              }
-            }
-          }
-        },
-        "bool": {
-          "ops": {
-            "all": {
-              "shapes": {
-                "C16777216_all": {
-                  "layouts": {
-                    "contig": 8.563
-                  }
-                },
-                "S4096x4096_d0": {
-                  "layouts": {
-                    "contig": 3.477
-                  }
-                },
-                "S4096x4096_d1": {
-                  "layouts": {
-                    "contig": 1.807
-                  }
-                }
-              }
-            },
-            "any": {
-              "shapes": {
-                "C16777216_all": {
-                  "layouts": {
-                    "contig": 8.335
-                  }
-                },
-                "S4096x4096_d0": {
-                  "layouts": {
-                    "contig": 3.791
-                  }
-                },
-                "S4096x4096_d1": {
-                  "layouts": {
-                    "contig": 1.519
-                  }
-                }
-              }
-            },
-            "logical_and": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 3.771
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "contig": 8.801
-                  }
-                }
-              }
-            },
-            "logical_not": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.884
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 4.157
-                  }
-                }
-              }
-            },
-            "logical_xor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 3.775
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "contig": 8.726
-                  }
-                }
-              }
-            }
-          }
-        },
-        "f16": {
-          "ops": {
-            "_scaled_dot_product_efficient_attention": {
-              "shapes": {
-                "B1H16S4096D128": {
-                  "layouts": {
-                    "contig": 17.509
-                  }
-                },
-                "B8H12S1024D64": {
-                  "layouts": {
-                    "contig": 14.496
-                  }
-                }
-              }
-            },
-            "addmm": {
+            "f16": {
               "shapes": {
                 "S1_4096x4096x4096": {
                   "layouts": {
@@ -2183,554 +1487,7 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "bmm": {
-              "shapes": {
-                "S1_8x4096x4096x4096": {
-                  "layouts": {
-                    "NN": 35.209,
-                    "NT": 35.483,
-                    "TN": 35.568,
-                    "TT": 35.878
-                  }
-                },
-                "S2_8x8192x2048x2048": {
-                  "layouts": {
-                    "NN": 35.445,
-                    "NT": 34.797,
-                    "TN": 36.675,
-                    "TT": 37.144
-                  }
-                },
-                "S3_8x2048x8192x2048": {
-                  "layouts": {
-                    "NN": 36.003,
-                    "NT": 36.413,
-                    "TN": 32.73,
-                    "TT": 33.798
-                  }
-                },
-                "S4_8x1024x1024x8192": {
-                  "layouts": {
-                    "NN": 35.004,
-                    "NT": 35.699,
-                    "TN": 35.754,
-                    "TT": 36.702
-                  }
-                },
-                "S5_8x357x789x333": {
-                  "layouts": {
-                    "NN": 6.238,
-                    "NT": 5.675,
-                    "TN": 7.452,
-                    "TT": 6.522
-                  }
-                },
-                "S6_8x32768x768x768": {
-                  "layouts": {
-                    "NN": 30.949,
-                    "NT": 31.324,
-                    "TN": 30.721,
-                    "TT": 33.116
-                  }
-                }
-              }
-            },
-            "linear": {
-              "shapes": {
-                "S1_4096x4096x4096": {
-                  "layouts": {
-                    "contig": 38.926
-                  }
-                },
-                "S2_8192x2048x2048": {
-                  "layouts": {
-                    "contig": 38.898
-                  }
-                },
-                "S3_2048x8192x2048": {
-                  "layouts": {
-                    "contig": 39.753
-                  }
-                },
-                "S4_1024x1024x8192": {
-                  "layouts": {
-                    "contig": 80.871
-                  }
-                },
-                "S5_357x789x333": {
-                  "layouts": {
-                    "contig": 3.482
-                  }
-                },
-                "S6_32768x768x768": {
-                  "layouts": {
-                    "contig": 39.18
-                  }
-                },
-                "S7_768x50304x49152": {
-                  "layouts": {
-                    "contig": 38.805
-                  }
-                }
-              }
-            },
-            "linear_backward": {
-              "shapes": {
-                "S1_4096x4096x4096": {
-                  "layouts": {
-                    "contig": 32.599
-                  }
-                },
-                "S2_8192x2048x2048": {
-                  "layouts": {
-                    "contig": 36.686
-                  }
-                },
-                "S3_2048x8192x2048": {
-                  "layouts": {
-                    "contig": 38.386
-                  }
-                },
-                "S4_1024x1024x8192": {
-                  "layouts": {
-                    "contig": 31.146
-                  }
-                },
-                "S5_357x789x333": {
-                  "layouts": {
-                    "contig": 4.528
-                  }
-                },
-                "S6_32768x768x768": {
-                  "layouts": {
-                    "contig": 39.5
-                  }
-                },
-                "S7_768x50304x49152": {
-                  "layouts": {
-                    "contig": 31.725
-                  }
-                }
-              }
-            },
-            "mm": {
-              "shapes": {
-                "S1_4096x4096x4096": {
-                  "layouts": {
-                    "NN": 34.509,
-                    "NT": 34.241,
-                    "TN": 34.446,
-                    "TT": 34.591
-                  }
-                },
-                "S2_8192x2048x2048": {
-                  "layouts": {
-                    "NN": 33.705,
-                    "NT": 34.198,
-                    "TN": 35.299,
-                    "TT": 35.77
-                  }
-                },
-                "S3_2048x8192x2048": {
-                  "layouts": {
-                    "NN": 32.985,
-                    "NT": 33.679,
-                    "TN": 33.545,
-                    "TT": 33.854
-                  }
-                },
-                "S4_1024x1024x8192": {
-                  "layouts": {
-                    "NN": 67.151,
-                    "NT": 68.072,
-                    "TN": 63.666,
-                    "TT": 70.091
-                  }
-                },
-                "S5_357x789x333": {
-                  "layouts": {
-                    "NN": 2.525,
-                    "NT": 3.097,
-                    "TN": 3.356,
-                    "TT": 2.968
-                  }
-                },
-                "S6_32768x768x768": {
-                  "layouts": {
-                    "NN": 33.395,
-                    "NT": 33.405,
-                    "TN": 34.895,
-                    "TT": 35.426
-                  }
-                },
-                "S7_768x50304x49152": {
-                  "layouts": {
-                    "NN": 34.061,
-                    "NT": 35.223,
-                    "TN": 32.341,
-                    "TT": 34.768
-                  }
-                }
-              }
-            },
-            "scaled_dot_product_attention": {
-              "shapes": {
-                "B1H16S4096D128": {
-                  "layouts": {
-                    "contig": 59.274
-                  }
-                },
-                "B8H12S1024D64": {
-                  "layouts": {
-                    "contig": 46.149
-                  }
-                }
-              }
-            }
-          }
-        },
-        "f32": {
-          "ops": {
-            "_adaptive_avg_pool2d": {
-              "shapes": {
-                "N32xC512x28x28_o7": {
-                  "layouts": {
-                    "contig": 0.466
-                  }
-                },
-                "N8xC64x112x112_o1": {
-                  "layouts": {
-                    "contig": 2.347
-                  }
-                }
-              }
-            },
-            "_foreach_add_.Scalar": {
-              "shapes": {
-                "L16x65536": {
-                  "layouts": {
-                    "contig": 1.95
-                  }
-                },
-                "L4x1048576": {
-                  "layouts": {
-                    "contig": 1.845
-                  }
-                }
-              }
-            },
-            "_foreach_addcdiv_.ScalarList": {
-              "shapes": {
-                "L16x65536": {
-                  "layouts": {
-                    "contig": 3.36
-                  }
-                },
-                "L4x1048576": {
-                  "layouts": {
-                    "contig": 2.364
-                  }
-                }
-              }
-            },
-            "_foreach_addcmul_.Scalar": {
-              "shapes": {
-                "L16x65536": {
-                  "layouts": {
-                    "contig": 4.549
-                  }
-                },
-                "L4x1048576": {
-                  "layouts": {
-                    "contig": 2.431
-                  }
-                }
-              }
-            },
-            "_foreach_div_.ScalarList": {
-              "shapes": {
-                "L16x65536": {
-                  "layouts": {
-                    "contig": 4.431
-                  }
-                },
-                "L4x1048576": {
-                  "layouts": {
-                    "contig": 5.237
-                  }
-                }
-              }
-            },
-            "_foreach_lerp_.Scalar": {
-              "shapes": {
-                "L16x65536": {
-                  "layouts": {
-                    "contig": 6.884
-                  }
-                },
-                "L4x1048576": {
-                  "layouts": {
-                    "contig": 4.554
-                  }
-                }
-              }
-            },
-            "_foreach_mul_.Scalar": {
-              "shapes": {
-                "L16x65536": {
-                  "layouts": {
-                    "contig": 6.911
-                  }
-                },
-                "L4x1048576": {
-                  "layouts": {
-                    "contig": 8.026
-                  }
-                }
-              }
-            },
-            "_foreach_mul_.Tensor": {
-              "shapes": {
-                "L16x65536": {
-                  "layouts": {
-                    "contig": 2.044
-                  }
-                },
-                "L4x1048576": {
-                  "layouts": {
-                    "contig": 1.935
-                  }
-                }
-              }
-            },
-            "_foreach_norm.Scalar": {
-              "shapes": {
-                "L16x65536": {
-                  "layouts": {
-                    "contig": 1.044
-                  }
-                },
-                "L4x1048576": {
-                  "layouts": {
-                    "contig": 0.971
-                  }
-                }
-              }
-            },
-            "_foreach_sqrt": {
-              "shapes": {
-                "L16x65536": {
-                  "layouts": {
-                    "contig": 1.571
-                  }
-                },
-                "L4x1048576": {
-                  "layouts": {
-                    "contig": 1.05
-                  }
-                }
-              }
-            },
-            "_fused_adamw_": {
-              "shapes": {
-                "L16x65536": {
-                  "layouts": {
-                    "contig": 2.395
-                  }
-                },
-                "L4x1048576": {
-                  "layouts": {
-                    "contig": 1.825
-                  }
-                }
-              }
-            },
-            "_log_softmax": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.88
-                  }
-                },
-                "S32768x1024": {
-                  "layouts": {
-                    "contig": 1.374
-                  }
-                },
-                "S768x50304": {
-                  "layouts": {
-                    "contig": 0.637
-                  }
-                }
-              }
-            },
-            "_log_softmax_backward_data": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.144
-                  }
-                },
-                "S32768x1024": {
-                  "layouts": {
-                    "contig": 1.071
-                  }
-                },
-                "S768x50304": {
-                  "layouts": {
-                    "contig": 0.741
-                  }
-                }
-              }
-            },
-            "_native_batch_norm_legit_no_training": {
-              "shapes": {
-                "N32xC64xH112xW112": {
-                  "layouts": {
-                    "contig": 1.87
-                  }
-                },
-                "N8xC256xH28xW28": {
-                  "layouts": {
-                    "contig": 2.717
-                  }
-                }
-              }
-            },
-            "_scaled_dot_product_attention_math": {
-              "shapes": {
-                "B1H16S4096D128": {
-                  "layouts": {
-                    "contig": 0.861
-                  }
-                },
-                "B8H12S1024D64": {
-                  "layouts": {
-                    "contig": 0.757
-                  }
-                }
-              }
-            },
-            "_softmax": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.407
-                  }
-                },
-                "S32768x1024": {
-                  "layouts": {
-                    "contig": 2.09
-                  }
-                },
-                "S768x50304": {
-                  "layouts": {
-                    "contig": 1.542
-                  }
-                }
-              }
-            },
-            "_to_copy": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.146
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.171
-                  }
-                }
-              }
-            },
-            "abs": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.341
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.114
-                  }
-                }
-              }
-            },
-            "acos": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.247
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.14
-                  }
-                }
-              }
-            },
-            "add.Tensor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "bcast": 2.468,
-                    "contig": 1.023
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "bcast": 0.916,
-                    "contig": 1.002
-                  }
-                }
-              }
-            },
-            "add_.Tensor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.297
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.001
-                  }
-                }
-              }
-            },
-            "addcdiv": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 3.346
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "contig": 2.22
-                  }
-                }
-              }
-            },
-            "addcmul": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 3.818
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "contig": 2.238
-                  }
-                }
-              }
-            },
-            "addmm": {
+            "f32": {
               "shapes": {
                 "S1_4096x4096x4096": {
                   "layouts": {
@@ -2790,7 +1547,108 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "amax": {
+            "tf32": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 3.501,
+                    "NT": 4.187,
+                    "TN": 2.326,
+                    "TT": 3.312
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 3.49,
+                    "NT": 4.143,
+                    "TN": 2.283,
+                    "TT": 3.528
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 3.537,
+                    "NT": 4.387,
+                    "TN": 2.28,
+                    "TT": 3.586
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 4.773,
+                    "NT": 5.195,
+                    "TN": 3.542,
+                    "TT": 4.474
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 2.372,
+                    "NT": 2.502,
+                    "TN": 2.461,
+                    "TT": 2.3
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 3.139,
+                    "NT": 4.264,
+                    "TN": 2.147,
+                    "TT": 3.491
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 2.81,
+                    "NT": 3.424,
+                    "TN": 2.246,
+                    "TT": 2.555
+                  }
+                }
+              }
+            }
+          }
+        },
+        "all": {
+          "dtypes": {
+            "bool": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 8.563
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.477
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.807
+                  }
+                }
+              }
+            }
+          }
+        },
+        "amax": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.975
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.907
+                  }
+                }
+              }
+            },
+            "f32": {
               "shapes": {
                 "S4096x4096_d0": {
                   "layouts": {
@@ -2803,8 +1661,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "amin": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.945
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.894
+                  }
+                }
+              }
             },
-            "amin": {
+            "f32": {
               "shapes": {
                 "S4096x4096_d0": {
                   "layouts": {
@@ -2817,8 +1693,35 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "arange": {
+            }
+          }
+        },
+        "any": {
+          "dtypes": {
+            "bool": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 8.335
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.791
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.519
+                  }
+                }
+              }
+            }
+          }
+        },
+        "arange": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "N16777216": {
                   "layouts": {
@@ -2827,7 +1730,20 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "argmax": {
+            "i64": {
+              "shapes": {
+                "N16777216": {
+                  "layouts": {
+                    "contig": 0.351
+                  }
+                }
+              }
+            }
+          }
+        },
+        "argmax": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "C16777216_all": {
                   "layouts": {
@@ -2845,8 +1761,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "argmin": {
+            }
+          }
+        },
+        "argmin": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "C16777216_all": {
                   "layouts": {
@@ -2864,8 +1784,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "asinh": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.041
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.34
+                  }
+                }
+              }
             },
-            "asinh": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -2878,8 +1816,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "atanh": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.177
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.479
+                  }
+                }
+              }
             },
-            "atanh": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -2892,8 +1848,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "avg_pool2d": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64x112x112_k2s2": {
+                  "layouts": {
+                    "contig": 1.525
+                  }
+                },
+                "N8xC256x28x28_k3s2": {
+                  "layouts": {
+                    "contig": 1.368
+                  }
+                }
+              }
             },
-            "avg_pool2d": {
+            "f32": {
               "shapes": {
                 "N32xC64x112x112_k2s2": {
                   "layouts": {
@@ -2906,8 +1880,194 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "bitwise_and": {
+          "dtypes": {
+            "i32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.705,
+                    "Tensor": 1.031
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 3.483,
+                    "Tensor": 1.007
+                  }
+                }
+              }
+            }
+          }
+        },
+        "bitwise_not": {
+          "dtypes": {
+            "i32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.986
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.14
+                  }
+                }
+              }
+            }
+          }
+        },
+        "bitwise_or": {
+          "dtypes": {
+            "i32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.751,
+                    "Tensor": 1.037
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 3.467,
+                    "Tensor": 1.004
+                  }
+                }
+              }
+            }
+          }
+        },
+        "bitwise_xor": {
+          "dtypes": {
+            "i32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.708,
+                    "Tensor": 1.021
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 3.461,
+                    "Tensor": 1.006
+                  }
+                }
+              }
+            }
+          }
+        },
+        "bmm": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S1_8x4096x4096x4096": {
+                  "layouts": {
+                    "NN": 5.369,
+                    "NT": 3.763,
+                    "TN": 6.88,
+                    "TT": 4.062
+                  }
+                },
+                "S2_8x8192x2048x2048": {
+                  "layouts": {
+                    "NN": 5.223,
+                    "NT": 3.557,
+                    "TN": 6.833,
+                    "TT": 5.039
+                  }
+                },
+                "S3_8x2048x8192x2048": {
+                  "layouts": {
+                    "NN": 5.249,
+                    "NT": 3.55,
+                    "TN": 6.794,
+                    "TT": 5.091
+                  }
+                },
+                "S4_8x1024x1024x8192": {
+                  "layouts": {
+                    "NN": 5.158,
+                    "NT": 4.179,
+                    "TN": 6.725,
+                    "TT": 4.972
+                  }
+                },
+                "S5_8x357x789x333": {
+                  "layouts": {
+                    "NN": 2.359,
+                    "NT": 1.793,
+                    "TN": 3.041,
+                    "TT": 2.302
+                  }
+                },
+                "S6_8x32768x768x768": {
+                  "layouts": {
+                    "NN": 4.415,
+                    "NT": 3.799,
+                    "TN": 6.259,
+                    "TT": 4.346
+                  }
+                }
+              }
             },
-            "bmm": {
+            "f16": {
+              "shapes": {
+                "S1_8x4096x4096x4096": {
+                  "layouts": {
+                    "NN": 35.209,
+                    "NT": 35.483,
+                    "TN": 35.568,
+                    "TT": 35.878
+                  }
+                },
+                "S2_8x8192x2048x2048": {
+                  "layouts": {
+                    "NN": 35.445,
+                    "NT": 34.797,
+                    "TN": 36.675,
+                    "TT": 37.144
+                  }
+                },
+                "S3_8x2048x8192x2048": {
+                  "layouts": {
+                    "NN": 36.003,
+                    "NT": 36.413,
+                    "TN": 32.73,
+                    "TT": 33.798
+                  }
+                },
+                "S4_8x1024x1024x8192": {
+                  "layouts": {
+                    "NN": 35.004,
+                    "NT": 35.699,
+                    "TN": 35.754,
+                    "TT": 36.702
+                  }
+                },
+                "S5_8x357x789x333": {
+                  "layouts": {
+                    "NN": 6.238,
+                    "NT": 5.675,
+                    "TN": 7.452,
+                    "TT": 6.522
+                  }
+                },
+                "S6_8x32768x768x768": {
+                  "layouts": {
+                    "NN": 30.949,
+                    "NT": 31.324,
+                    "TN": 30.721,
+                    "TT": 33.116
+                  }
+                }
+              }
+            },
+            "f32": {
               "shapes": {
                 "S1_8x4096x4096x4096": {
                   "layouts": {
@@ -2959,7 +2119,77 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "cat": {
+            "tf32": {
+              "shapes": {
+                "S1_8x4096x4096x4096": {
+                  "layouts": {
+                    "NN": 3.062,
+                    "NT": 2.818,
+                    "TN": 2.423,
+                    "TT": 3.596
+                  }
+                },
+                "S2_8x8192x2048x2048": {
+                  "layouts": {
+                    "NN": 4.035,
+                    "NT": 3.224,
+                    "TN": 2.658,
+                    "TT": 4.26
+                  }
+                },
+                "S3_8x2048x8192x2048": {
+                  "layouts": {
+                    "NN": 4.054,
+                    "NT": 3.981,
+                    "TN": 2.65,
+                    "TT": 4.076
+                  }
+                },
+                "S4_8x1024x1024x8192": {
+                  "layouts": {
+                    "NN": 3.982,
+                    "NT": 3.156,
+                    "TN": 2.204,
+                    "TT": 3.621
+                  }
+                },
+                "S5_8x357x789x333": {
+                  "layouts": {
+                    "NN": 2.076,
+                    "NT": 1.973,
+                    "TN": 2.007,
+                    "TT": 2.084
+                  }
+                },
+                "S6_8x32768x768x768": {
+                  "layouts": {
+                    "NN": 2.315,
+                    "NT": 1.729,
+                    "TN": 1.951,
+                    "TT": 1.849
+                  }
+                }
+              }
+            }
+          }
+        },
+        "cat": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "P2x8388608": {
+                  "layouts": {
+                    "contig": 7.087
+                  }
+                },
+                "P64x262144": {
+                  "layouts": {
+                    "contig": 9.347
+                  }
+                }
+              }
+            },
+            "f32": {
               "shapes": {
                 "P2x8388608": {
                   "layouts": {
@@ -2972,8 +2202,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "ceil": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.381
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.442
+                  }
+                }
+              }
             },
-            "ceil": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -2986,8 +2234,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "clamp": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 2.189
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 2.166
+                  }
+                }
+              }
             },
-            "clamp": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3000,8 +2266,21 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "clone": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S4096x4096": {
+                  "layouts": {
+                    "sliced": 0.643
+                  }
+                }
+              }
             },
-            "clone": {
+            "f32": {
               "shapes": {
                 "S4096x4096": {
                   "layouts": {
@@ -3009,8 +2288,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "convolution": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64x56x56_K64k3s1": {
+                  "layouts": {
+                    "contig": 24.351
+                  }
+                },
+                "N8xC3x224x224_K64k7s2": {
+                  "layouts": {
+                    "contig": 4.701
+                  }
+                }
+              }
             },
-            "convolution": {
+            "f32": {
               "shapes": {
                 "N32xC64x56x56_K64k3s1": {
                   "layouts": {
@@ -3023,8 +2320,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "cos": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.001
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.419
+                  }
+                }
+              }
             },
-            "cos": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3037,8 +2352,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "cosh": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.256
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.533
+                  }
+                }
+              }
             },
-            "cosh": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3051,8 +2384,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "cumsum": {
+            }
+          }
+        },
+        "cumsum": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "S4096x4096_d1": {
                   "layouts": {
@@ -3060,8 +2397,28 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "div.Tensor": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.189,
+                    "contig": 1.071
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.565,
+                    "contig": 1.007
+                  }
+                }
+              }
             },
-            "div.Tensor": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3076,8 +2433,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "embedding": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "V1000xD64_T4096": {
+                  "layouts": {
+                    "contig": 0.962
+                  }
+                },
+                "V50304xD768_T49152": {
+                  "layouts": {
+                    "contig": 2.703
+                  }
+                }
+              }
             },
-            "embedding": {
+            "f32": {
               "shapes": {
                 "V1000xD64_T4096": {
                   "layouts": {
@@ -3090,8 +2465,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "embedding_dense_backward": {
+            }
+          }
+        },
+        "embedding_dense_backward": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "V1000xD64_T4096": {
                   "layouts": {
@@ -3104,8 +2483,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "eq": {
+            }
+          }
+        },
+        "eq": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3120,8 +2503,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "erf": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.296
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.552
+                  }
+                }
+              }
             },
-            "erf": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3134,8 +2535,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "exp": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.259
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.446
+                  }
+                }
+              }
             },
-            "exp": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3148,8 +2567,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "fill_.Scalar": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 9.267
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 41.26
+                  }
+                }
+              }
             },
-            "fill_.Scalar": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3162,8 +2599,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "floor": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.373
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.445
+                  }
+                }
+              }
             },
-            "floor": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3176,8 +2631,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "floor_divide": {
+            }
+          }
+        },
+        "floor_divide": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3192,8 +2651,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "ge": {
+            }
+          }
+        },
+        "ge": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3208,8 +2671,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "gelu": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.005
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.965
+                  }
+                }
+              }
             },
-            "gelu": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3222,8 +2703,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "gelu_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.91
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.987
+                  }
+                }
+              }
             },
-            "gelu_backward": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3236,8 +2735,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "gt": {
+            }
+          }
+        },
+        "gt": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3252,8 +2755,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "index.Tensor": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R1000x64_I4096": {
+                  "layouts": {
+                    "contig": 0.976
+                  }
+                },
+                "R262144x64_I1048576": {
+                  "layouts": {
+                    "contig": 0.49
+                  }
+                }
+              }
             },
-            "index.Tensor": {
+            "f32": {
               "shapes": {
                 "R1000x64_I4096": {
                   "layouts": {
@@ -3266,8 +2787,44 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "isin.Tensor_Tensor": {
+          "dtypes": {
+            "i64": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.721
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 1.348
+                  }
+                }
+              }
+            }
+          }
+        },
+        "isnan": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 2.053
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 2.544
+                  }
+                }
+              }
             },
-            "isnan": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3280,8 +2837,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "le": {
+            }
+          }
+        },
+        "le": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3296,8 +2857,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "lerp.Scalar": {
+            }
+          }
+        },
+        "lerp.Scalar": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3310,8 +2875,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "linalg_vector_norm": {
+            }
+          }
+        },
+        "linalg_vector_norm": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3324,8 +2893,90 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "linear": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 3.923
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 3.746
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 3.871
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 6.018
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 2.494
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 3.94
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 3.248
+                  }
+                }
+              }
             },
-            "linear": {
+            "f16": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 38.926
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 38.898
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 39.753
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 80.871
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 3.482
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 39.18
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 38.805
+                  }
+                }
+              }
+            },
+            "f32": {
               "shapes": {
                 "S1_4096x4096x4096": {
                   "layouts": {
@@ -3364,7 +3015,128 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "linear_backward": {
+            "tf32": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 4.252
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 4.177
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 4.271
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 5.215
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 2.521
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 4.318
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 3.449
+                  }
+                }
+              }
+            }
+          }
+        },
+        "linear_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 2.99
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 3.32
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 4.224
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 3.2
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 3.765
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 1.499
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 2.344
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 32.599
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 36.686
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 38.386
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 31.146
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 4.528
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 39.5
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 31.725
+                  }
+                }
+              }
+            },
+            "f32": {
               "shapes": {
                 "S1_4096x4096x4096": {
                   "layouts": {
@@ -3403,7 +3175,64 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "log": {
+            "tf32": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "contig": 2.874
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "contig": 3.052
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "contig": 3.178
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "contig": 2.447
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "contig": 2.849
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "contig": 3.94
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "contig": 2.454
+                  }
+                }
+              }
+            }
+          }
+        },
+        "log": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.122
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.456
+                  }
+                }
+              }
+            },
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3416,8 +3245,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "log1p": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.91
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 3.696
+                  }
+                }
+              }
             },
-            "log1p": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3430,8 +3277,66 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "lt": {
+            }
+          }
+        },
+        "logical_and": {
+          "dtypes": {
+            "bool": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 3.771
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 8.801
+                  }
+                }
+              }
+            }
+          }
+        },
+        "logical_not": {
+          "dtypes": {
+            "bool": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.884
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 4.157
+                  }
+                }
+              }
+            }
+          }
+        },
+        "logical_xor": {
+          "dtypes": {
+            "bool": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 3.775
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 8.726
+                  }
+                }
+              }
+            }
+          }
+        },
+        "lt": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3446,8 +3351,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "masked_fill": {
+            }
+          }
+        },
+        "masked_fill": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3462,8 +3371,12 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
-            },
-            "masked_fill_": {
+            }
+          }
+        },
+        "masked_fill_": {
+          "dtypes": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3478,8 +3391,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "max": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 28.958
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 8.236
+                  }
+                }
+              }
             },
-            "max": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3492,8 +3423,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "max_pool2d_with_indices": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64x112x112_k2s2": {
+                  "layouts": {
+                    "contig": 2.35
+                  }
+                },
+                "N8xC256x28x28_k3s2": {
+                  "layouts": {
+                    "contig": 2.301
+                  }
+                }
+              }
             },
-            "max_pool2d_with_indices": {
+            "f32": {
               "shapes": {
                 "N32xC64x112x112_k2s2": {
                   "layouts": {
@@ -3506,8 +3455,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "maximum": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.824
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 0.996
+                  }
+                }
+              }
             },
-            "maximum": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3520,8 +3487,31 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "mean": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 13.333
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 5.627
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 3.765
+                  }
+                }
+              }
             },
-            "mean": {
+            "f32": {
               "shapes": {
                 "C16777216_all": {
                   "layouts": {
@@ -3539,8 +3529,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "min": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 28.878
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 8.16
+                  }
+                }
+              }
             },
-            "min": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3553,8 +3561,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "min.dim": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 1.299
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.331
+                  }
+                }
+              }
             },
-            "min.dim": {
+            "f32": {
               "shapes": {
                 "S4096x4096_d0": {
                   "layouts": {
@@ -3567,8 +3593,26 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "minimum": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.827
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 0.993
+                  }
+                }
+              }
             },
-            "minimum": {
+            "f32": {
               "shapes": {
                 "A357x789": {
                   "layouts": {
@@ -3581,8 +3625,132 @@ document.addEventListener("DOMContentLoaded", boot);
                   }
                 }
               }
+            }
+          }
+        },
+        "mm": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 5.165,
+                    "NT": 1.078,
+                    "TN": 1.129,
+                    "TT": 4.843
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 5.168,
+                    "NT": 1.111,
+                    "TN": 1.238,
+                    "TT": 4.788
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 4.912,
+                    "NT": 1.061,
+                    "TN": 1.225,
+                    "TT": 4.638
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 9.317,
+                    "NT": 2.211,
+                    "TN": 1.151,
+                    "TT": 9.027
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 2.711,
+                    "NT": 2.261,
+                    "TN": 3.266,
+                    "TT": 2.826
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 1.055,
+                    "NT": 1.151,
+                    "TN": 1.626,
+                    "TT": 5.073
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 4.178,
+                    "NT": 1.014,
+                    "TN": 1.892,
+                    "TT": 4.05
+                  }
+                }
+              }
             },
-            "mm": {
+            "f16": {
+              "shapes": {
+                "S1_4096x4096x4096": {
+                  "layouts": {
+                    "NN": 34.509,
+                    "NT": 34.241,
+                    "TN": 34.446,
+                    "TT": 34.591
+                  }
+                },
+                "S2_8192x2048x2048": {
+                  "layouts": {
+                    "NN": 33.705,
+                    "NT": 34.198,
+                    "TN": 35.299,
+                    "TT": 35.77
+                  }
+                },
+                "S3_2048x8192x2048": {
+                  "layouts": {
+                    "NN": 32.985,
+                    "NT": 33.679,
+                    "TN": 33.545,
+                    "TT": 33.854
+                  }
+                },
+                "S4_1024x1024x8192": {
+                  "layouts": {
+                    "NN": 67.151,
+                    "NT": 68.072,
+                    "TN": 63.666,
+                    "TT": 70.091
+                  }
+                },
+                "S5_357x789x333": {
+                  "layouts": {
+                    "NN": 2.525,
+                    "NT": 3.097,
+                    "TN": 3.356,
+                    "TT": 2.968
+                  }
+                },
+                "S6_32768x768x768": {
+                  "layouts": {
+                    "NN": 33.395,
+                    "NT": 33.405,
+                    "TN": 34.895,
+                    "TT": 35.426
+                  }
+                },
+                "S7_768x50304x49152": {
+                  "layouts": {
+                    "NN": 34.061,
+                    "NT": 35.223,
+                    "TN": 32.341,
+                    "TT": 34.768
+                  }
+                }
+              }
+            },
+            "f32": {
               "shapes": {
                 "S1_4096x4096x4096": {
                   "layouts": {
@@ -3642,808 +3810,7 @@ document.addEventListener("DOMContentLoaded", boot);
                 }
               }
             },
-            "mul.Tensor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "bcast": 2.48,
-                    "contig": 1.031
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "bcast": 0.918,
-                    "contig": 1.008
-                  }
-                }
-              }
-            },
-            "mul_.Tensor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.03
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.019
-                  }
-                }
-              }
-            },
-            "native_dropout": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 0.392
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 0.935
-                  }
-                }
-              }
-            },
-            "native_dropout_backward": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.074
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 0.996
-                  }
-                }
-              }
-            },
-            "native_group_norm": {
-              "shapes": {
-                "N32xC64xH56xW56_G32": {
-                  "layouts": {
-                    "contig": 1.091
-                  }
-                },
-                "N8xC256xH14xW14_G32": {
-                  "layouts": {
-                    "contig": 0.815
-                  }
-                }
-              }
-            },
-            "native_layer_norm": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 0.504
-                  }
-                },
-                "B32768xD1024": {
-                  "layouts": {
-                    "contig": 0.881
-                  }
-                }
-              }
-            },
-            "native_layer_norm_backward": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.248
-                  }
-                },
-                "B32768xD1024": {
-                  "layouts": {
-                    "contig": 0.904
-                  }
-                }
-              }
-            },
-            "ne": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "Scalar": 4.765,
-                    "Tensor": 3.621
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "Scalar": 5.516,
-                    "Tensor": 3.055
-                  }
-                }
-              }
-            },
-            "neg": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.345
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.131
-                  }
-                }
-              }
-            },
-            "nll_loss_backward": {
-              "shapes": {
-                "N12288xC50304": {
-                  "layouts": {
-                    "contig": 0.983
-                  }
-                },
-                "N4096xC1000": {
-                  "layouts": {
-                    "contig": 0.441
-                  }
-                }
-              }
-            },
-            "nll_loss_forward": {
-              "shapes": {
-                "N12288xC50304": {
-                  "layouts": {
-                    "contig": 0.287
-                  }
-                },
-                "N4096xC1000": {
-                  "layouts": {
-                    "contig": 0.544
-                  }
-                }
-              }
-            },
-            "pow": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "Scalar": 1.075,
-                    "Tensor": 0.658
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "Scalar": 1.172,
-                    "Tensor": 0.988
-                  }
-                }
-              }
-            },
-            "reciprocal": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.169
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.141
-                  }
-                }
-              }
-            },
-            "relu": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.26
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.124
-                  }
-                }
-              }
-            },
-            "relu_": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.324
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.134
-                  }
-                }
-              }
-            },
-            "remainder": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "Scalar": 2.902,
-                    "Tensor": 0.75
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "Scalar": 3.633,
-                    "Tensor": 0.999
-                  }
-                }
-              }
-            },
-            "repeat": {
-              "shapes": {
-                "S1024x1024_r4x4": {
-                  "layouts": {
-                    "contig": 14.761
-                  }
-                },
-                "S357x789_r3x5": {
-                  "layouts": {
-                    "contig": 15.295
-                  }
-                }
-              }
-            },
-            "rsqrt": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.447
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.154
-                  }
-                }
-              }
-            },
-            "scatter.src": {
-              "shapes": {
-                "R1000x64_S512": {
-                  "layouts": {
-                    "contig": 0.946
-                  }
-                },
-                "R262144x64_S65536": {
-                  "layouts": {
-                    "contig": 1.17
-                  }
-                }
-              }
-            },
-            "scatter.value": {
-              "shapes": {
-                "R1000x64_S512": {
-                  "layouts": {
-                    "contig": 1.217
-                  }
-                },
-                "R262144x64_S65536": {
-                  "layouts": {
-                    "contig": 1.183
-                  }
-                }
-              }
-            },
-            "sigmoid": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.103
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.145
-                  }
-                }
-              }
-            },
-            "sign": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.319
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.128
-                  }
-                }
-              }
-            },
-            "silu": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.137
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.143
-                  }
-                }
-              }
-            },
-            "sin": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.01
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.125
-                  }
-                }
-              }
-            },
-            "sinh": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.238
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.16
-                  }
-                }
-              }
-            },
-            "sqrt": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.217
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.137
-                  }
-                }
-              }
-            },
-            "stack": {
-              "shapes": {
-                "P32x65536": {
-                  "layouts": {
-                    "contig": 11.659
-                  }
-                },
-                "P8x1048576": {
-                  "layouts": {
-                    "contig": 4.268
-                  }
-                }
-              }
-            },
-            "sub.Tensor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "bcast": 2.506,
-                    "contig": 1.029
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "bcast": 0.916,
-                    "contig": 1.007
-                  }
-                }
-              }
-            },
-            "sum.dim_IntList": {
-              "shapes": {
-                "C16777216_all": {
-                  "layouts": {
-                    "contig": 4.818
-                  }
-                },
-                "S4096x4096_d0": {
-                  "layouts": {
-                    "contig": 3.258
-                  }
-                },
-                "S4096x4096_d1": {
-                  "layouts": {
-                    "contig": 1.416
-                  }
-                }
-              }
-            },
-            "tan": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.039
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.139
-                  }
-                }
-              }
-            },
-            "tanh": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.168
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.129
-                  }
-                }
-              }
-            },
-            "tril": {
-              "shapes": {
-                "S8192x8192": {
-                  "layouts": {
-                    "contig": 1.911
-                  }
-                }
-              }
-            },
-            "triu": {
-              "shapes": {
-                "S8192x8192": {
-                  "layouts": {
-                    "contig": 1.908
-                  }
-                }
-              }
-            },
-            "upsample_bilinear2d": {
-              "shapes": {
-                "N2xC3x256x256_x2": {
-                  "layouts": {
-                    "contig": 2.817
-                  }
-                },
-                "N8xC64x56x56_x2": {
-                  "layouts": {
-                    "contig": 0.938
-                  }
-                }
-              }
-            },
-            "var.correction": {
-              "shapes": {
-                "C16777216_all": {
-                  "layouts": {
-                    "contig": 1208.487
-                  }
-                },
-                "S4096x4096_d0": {
-                  "layouts": {
-                    "contig": 1.4
-                  }
-                },
-                "S4096x4096_d1": {
-                  "layouts": {
-                    "contig": 1.673
-                  }
-                }
-              }
-            },
-            "where.self": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 4.88
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "contig": 1.643
-                  }
-                }
-              }
-            }
-          }
-        },
-        "i32": {
-          "ops": {
-            "bitwise_and": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "Scalar": 4.705,
-                    "Tensor": 1.031
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "Scalar": 3.483,
-                    "Tensor": 1.007
-                  }
-                }
-              }
-            },
-            "bitwise_not": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 1.986
-                  }
-                },
-                "C16777216": {
-                  "layouts": {
-                    "contig": 1.14
-                  }
-                }
-              }
-            },
-            "bitwise_or": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "Scalar": 4.751,
-                    "Tensor": 1.037
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "Scalar": 3.467,
-                    "Tensor": 1.004
-                  }
-                }
-              }
-            },
-            "bitwise_xor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "Scalar": 4.708,
-                    "Tensor": 1.021
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "Scalar": 3.461,
-                    "Tensor": 1.006
-                  }
-                }
-              }
-            }
-          }
-        },
-        "i64": {
-          "ops": {
-            "arange": {
-              "shapes": {
-                "N16777216": {
-                  "layouts": {
-                    "contig": 0.351
-                  }
-                }
-              }
-            },
-            "isin.Tensor_Tensor": {
-              "shapes": {
-                "A357x789": {
-                  "layouts": {
-                    "contig": 0.721
-                  }
-                },
-                "C4096x4096": {
-                  "layouts": {
-                    "contig": 1.348
-                  }
-                }
-              }
-            }
-          }
-        },
-        "tf32": {
-          "ops": {
-            "addmm": {
-              "shapes": {
-                "S1_4096x4096x4096": {
-                  "layouts": {
-                    "NN": 3.501,
-                    "NT": 4.187,
-                    "TN": 2.326,
-                    "TT": 3.312
-                  }
-                },
-                "S2_8192x2048x2048": {
-                  "layouts": {
-                    "NN": 3.49,
-                    "NT": 4.143,
-                    "TN": 2.283,
-                    "TT": 3.528
-                  }
-                },
-                "S3_2048x8192x2048": {
-                  "layouts": {
-                    "NN": 3.537,
-                    "NT": 4.387,
-                    "TN": 2.28,
-                    "TT": 3.586
-                  }
-                },
-                "S4_1024x1024x8192": {
-                  "layouts": {
-                    "NN": 4.773,
-                    "NT": 5.195,
-                    "TN": 3.542,
-                    "TT": 4.474
-                  }
-                },
-                "S5_357x789x333": {
-                  "layouts": {
-                    "NN": 2.372,
-                    "NT": 2.502,
-                    "TN": 2.461,
-                    "TT": 2.3
-                  }
-                },
-                "S6_32768x768x768": {
-                  "layouts": {
-                    "NN": 3.139,
-                    "NT": 4.264,
-                    "TN": 2.147,
-                    "TT": 3.491
-                  }
-                },
-                "S7_768x50304x49152": {
-                  "layouts": {
-                    "NN": 2.81,
-                    "NT": 3.424,
-                    "TN": 2.246,
-                    "TT": 2.555
-                  }
-                }
-              }
-            },
-            "bmm": {
-              "shapes": {
-                "S1_8x4096x4096x4096": {
-                  "layouts": {
-                    "NN": 3.062,
-                    "NT": 2.818,
-                    "TN": 2.423,
-                    "TT": 3.596
-                  }
-                },
-                "S2_8x8192x2048x2048": {
-                  "layouts": {
-                    "NN": 4.035,
-                    "NT": 3.224,
-                    "TN": 2.658,
-                    "TT": 4.26
-                  }
-                },
-                "S3_8x2048x8192x2048": {
-                  "layouts": {
-                    "NN": 4.054,
-                    "NT": 3.981,
-                    "TN": 2.65,
-                    "TT": 4.076
-                  }
-                },
-                "S4_8x1024x1024x8192": {
-                  "layouts": {
-                    "NN": 3.982,
-                    "NT": 3.156,
-                    "TN": 2.204,
-                    "TT": 3.621
-                  }
-                },
-                "S5_8x357x789x333": {
-                  "layouts": {
-                    "NN": 2.076,
-                    "NT": 1.973,
-                    "TN": 2.007,
-                    "TT": 2.084
-                  }
-                },
-                "S6_8x32768x768x768": {
-                  "layouts": {
-                    "NN": 2.315,
-                    "NT": 1.729,
-                    "TN": 1.951,
-                    "TT": 1.849
-                  }
-                }
-              }
-            },
-            "linear": {
-              "shapes": {
-                "S1_4096x4096x4096": {
-                  "layouts": {
-                    "contig": 4.252
-                  }
-                },
-                "S2_8192x2048x2048": {
-                  "layouts": {
-                    "contig": 4.177
-                  }
-                },
-                "S3_2048x8192x2048": {
-                  "layouts": {
-                    "contig": 4.271
-                  }
-                },
-                "S4_1024x1024x8192": {
-                  "layouts": {
-                    "contig": 5.215
-                  }
-                },
-                "S5_357x789x333": {
-                  "layouts": {
-                    "contig": 2.521
-                  }
-                },
-                "S6_32768x768x768": {
-                  "layouts": {
-                    "contig": 4.318
-                  }
-                },
-                "S7_768x50304x49152": {
-                  "layouts": {
-                    "contig": 3.449
-                  }
-                }
-              }
-            },
-            "linear_backward": {
-              "shapes": {
-                "S1_4096x4096x4096": {
-                  "layouts": {
-                    "contig": 2.874
-                  }
-                },
-                "S2_8192x2048x2048": {
-                  "layouts": {
-                    "contig": 3.052
-                  }
-                },
-                "S3_2048x8192x2048": {
-                  "layouts": {
-                    "contig": 3.178
-                  }
-                },
-                "S4_1024x1024x8192": {
-                  "layouts": {
-                    "contig": 2.447
-                  }
-                },
-                "S5_357x789x333": {
-                  "layouts": {
-                    "contig": 2.849
-                  }
-                },
-                "S6_32768x768x768": {
-                  "layouts": {
-                    "contig": 3.94
-                  }
-                },
-                "S7_768x50304x49152": {
-                  "layouts": {
-                    "contig": 2.454
-                  }
-                }
-              }
-            },
-            "mm": {
+            "tf32": {
               "shapes": {
                 "S1_4096x4096x4096": {
                   "layouts": {
@@ -4504,10 +3871,1112 @@ document.addEventListener("DOMContentLoaded", boot);
               }
             }
           }
+        },
+        "mul.Tensor": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.272,
+                    "contig": 1.001
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.591,
+                    "contig": 1.006
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.48,
+                    "contig": 1.031
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.918,
+                    "contig": 1.008
+                  }
+                }
+              }
+            }
+          }
+        },
+        "mul_.Tensor": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.042
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.997
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.03
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.019
+                  }
+                }
+              }
+            }
+          }
+        },
+        "native_dropout": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.392
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.935
+                  }
+                }
+              }
+            }
+          }
+        },
+        "native_dropout_backward": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.074
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 0.996
+                  }
+                }
+              }
+            }
+          }
+        },
+        "native_group_norm": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64xH56xW56_G32": {
+                  "layouts": {
+                    "contig": 1.042
+                  }
+                },
+                "N8xC256xH14xW14_G32": {
+                  "layouts": {
+                    "contig": 0.813
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC64xH56xW56_G32": {
+                  "layouts": {
+                    "contig": 1.091
+                  }
+                },
+                "N8xC256xH14xW14_G32": {
+                  "layouts": {
+                    "contig": 0.815
+                  }
+                }
+              }
+            }
+          }
+        },
+        "native_layer_norm": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.76
+                  }
+                },
+                "B32768xD1024": {
+                  "layouts": {
+                    "contig": 3.108
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 0.504
+                  }
+                },
+                "B32768xD1024": {
+                  "layouts": {
+                    "contig": 0.881
+                  }
+                }
+              }
+            }
+          }
+        },
+        "native_layer_norm_backward": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.248
+                  }
+                },
+                "B32768xD1024": {
+                  "layouts": {
+                    "contig": 0.904
+                  }
+                }
+              }
+            }
+          }
+        },
+        "ne": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 4.765,
+                    "Tensor": 3.621
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 5.516,
+                    "Tensor": 3.055
+                  }
+                }
+              }
+            }
+          }
+        },
+        "neg": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.427
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.432
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.345
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.131
+                  }
+                }
+              }
+            }
+          }
+        },
+        "nll_loss_backward": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "N12288xC50304": {
+                  "layouts": {
+                    "contig": 0.983
+                  }
+                },
+                "N4096xC1000": {
+                  "layouts": {
+                    "contig": 0.441
+                  }
+                }
+              }
+            }
+          }
+        },
+        "nll_loss_forward": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "N12288xC50304": {
+                  "layouts": {
+                    "contig": 0.287
+                  }
+                },
+                "N4096xC1000": {
+                  "layouts": {
+                    "contig": 0.544
+                  }
+                }
+              }
+            }
+          }
+        },
+        "pow": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 1.081,
+                    "Tensor": 0.755
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 1.082,
+                    "Tensor": 0.65
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 1.075,
+                    "Tensor": 0.658
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 1.172,
+                    "Tensor": 0.988
+                  }
+                }
+              }
+            }
+          }
+        },
+        "reciprocal": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.239
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.497
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.169
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.141
+                  }
+                }
+              }
+            }
+          }
+        },
+        "relu": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.305
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.423
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.26
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.124
+                  }
+                }
+              }
+            }
+          }
+        },
+        "relu_": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.354
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 2.548
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.324
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.134
+                  }
+                }
+              }
+            }
+          }
+        },
+        "remainder": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "Scalar": 2.902,
+                    "Tensor": 0.75
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "Scalar": 3.633,
+                    "Tensor": 0.999
+                  }
+                }
+              }
+            }
+          }
+        },
+        "repeat": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S1024x1024_r4x4": {
+                  "layouts": {
+                    "contig": 15.66
+                  }
+                },
+                "S357x789_r3x5": {
+                  "layouts": {
+                    "contig": 15.759
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "S1024x1024_r4x4": {
+                  "layouts": {
+                    "contig": 14.761
+                  }
+                },
+                "S357x789_r3x5": {
+                  "layouts": {
+                    "contig": 15.295
+                  }
+                }
+              }
+            }
+          }
+        },
+        "rsqrt": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.497
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.591
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.447
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.154
+                  }
+                }
+              }
+            }
+          }
+        },
+        "scaled_dot_product_attention": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "B1H16S4096D128": {
+                  "layouts": {
+                    "contig": 10.75
+                  }
+                },
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 2.255
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "B1H16S4096D128": {
+                  "layouts": {
+                    "contig": 59.274
+                  }
+                },
+                "B8H12S1024D64": {
+                  "layouts": {
+                    "contig": 46.149
+                  }
+                }
+              }
+            }
+          }
+        },
+        "scatter.src": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R1000x64_S512": {
+                  "layouts": {
+                    "contig": 0.961
+                  }
+                },
+                "R262144x64_S65536": {
+                  "layouts": {
+                    "contig": 1.161
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R1000x64_S512": {
+                  "layouts": {
+                    "contig": 0.946
+                  }
+                },
+                "R262144x64_S65536": {
+                  "layouts": {
+                    "contig": 1.17
+                  }
+                }
+              }
+            }
+          }
+        },
+        "scatter.value": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R1000x64_S512": {
+                  "layouts": {
+                    "contig": 1.217
+                  }
+                },
+                "R262144x64_S65536": {
+                  "layouts": {
+                    "contig": 1.202
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R1000x64_S512": {
+                  "layouts": {
+                    "contig": 1.217
+                  }
+                },
+                "R262144x64_S65536": {
+                  "layouts": {
+                    "contig": 1.183
+                  }
+                }
+              }
+            }
+          }
+        },
+        "sigmoid": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.066
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.513
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.103
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.145
+                  }
+                }
+              }
+            }
+          }
+        },
+        "sign": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.365
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.455
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.319
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.128
+                  }
+                }
+              }
+            }
+          }
+        },
+        "silu": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.095
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.502
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.137
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.143
+                  }
+                }
+              }
+            }
+          }
+        },
+        "sin": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.014
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.421
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.01
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.125
+                  }
+                }
+              }
+            }
+          }
+        },
+        "sinh": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.295
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.695
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.238
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.16
+                  }
+                }
+              }
+            }
+          }
+        },
+        "sqrt": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.225
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.48
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.217
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.137
+                  }
+                }
+              }
+            }
+          }
+        },
+        "stack": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "P32x65536": {
+                  "layouts": {
+                    "contig": 16.086
+                  }
+                },
+                "P8x1048576": {
+                  "layouts": {
+                    "contig": 7.969
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "P32x65536": {
+                  "layouts": {
+                    "contig": 11.659
+                  }
+                },
+                "P8x1048576": {
+                  "layouts": {
+                    "contig": 4.268
+                  }
+                }
+              }
+            }
+          }
+        },
+        "sub.Tensor": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.254,
+                    "contig": 0.99
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.588,
+                    "contig": 1.005
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "bcast": 2.506,
+                    "contig": 1.029
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "bcast": 0.916,
+                    "contig": 1.007
+                  }
+                }
+              }
+            }
+          }
+        },
+        "sum.dim_IntList": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 13.547
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 5.95
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 4.095
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 4.818
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 3.258
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.416
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tan": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.079
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.504
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.039
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.139
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tanh": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.171
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.441
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 1.168
+                  }
+                },
+                "C16777216": {
+                  "layouts": {
+                    "contig": 1.129
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tril": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S8192x8192": {
+                  "layouts": {
+                    "contig": 2.686
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "S8192x8192": {
+                  "layouts": {
+                    "contig": 1.911
+                  }
+                }
+              }
+            }
+          }
+        },
+        "triu": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S8192x8192": {
+                  "layouts": {
+                    "contig": 2.683
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "S8192x8192": {
+                  "layouts": {
+                    "contig": 1.908
+                  }
+                }
+              }
+            }
+          }
+        },
+        "upsample_bilinear2d": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N2xC3x256x256_x2": {
+                  "layouts": {
+                    "contig": 2.745
+                  }
+                },
+                "N8xC64x56x56_x2": {
+                  "layouts": {
+                    "contig": 1.05
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2xC3x256x256_x2": {
+                  "layouts": {
+                    "contig": 2.817
+                  }
+                },
+                "N8xC64x56x56_x2": {
+                  "layouts": {
+                    "contig": 0.938
+                  }
+                }
+              }
+            }
+          }
+        },
+        "var.correction": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 1149.008
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 2.541
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.663
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "C16777216_all": {
+                  "layouts": {
+                    "contig": 1208.487
+                  }
+                },
+                "S4096x4096_d0": {
+                  "layouts": {
+                    "contig": 1.4
+                  }
+                },
+                "S4096x4096_d1": {
+                  "layouts": {
+                    "contig": 1.673
+                  }
+                }
+              }
+            }
+          }
+        },
+        "where.self": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 5.327
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 2.918
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A357x789": {
+                  "layouts": {
+                    "contig": 4.88
+                  }
+                },
+                "C4096x4096": {
+                  "layouts": {
+                    "contig": 1.643
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }
   },
-  "format": 4
+  "format": 5
 }
 </script>

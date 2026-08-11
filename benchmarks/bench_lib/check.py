@@ -71,7 +71,7 @@ def _sync_for(device: str) -> Callable[[], None]:
 
 
 def _bench_key(request: pytest.FixtureRequest) -> baselines.BenchKey:
-    """The baseline tree path of this test node: dtype/op/shape/layout.
+    """The baseline tree path of this test node: op/dtype/shape/layout.
 
     Derived from the test's own axes, never parsed out of the node id:
     the op token is the test function name minus "test_" (override with
@@ -92,7 +92,7 @@ def _bench_key(request: pytest.FixtureRequest) -> baselines.BenchKey:
             "axes: every benchmark must be parametrized with dtype_id and "
             "shape_id (fold any extra axis into the shape token), plus an "
             "optional layout axis, so its baseline path "
-            "dtype/op/shape/layout is derivable.",
+            "op/dtype/shape/layout is derivable.",
             pytrace=False,
         )
     return baselines.BenchKey(
