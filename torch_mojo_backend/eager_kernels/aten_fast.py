@@ -7126,6 +7126,11 @@ def _try_bf16_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         return None
     if not _bf16_bridge_available():
         return None
+    # TT (both flags set below) is launched directly, not operand-swapped
+    # into NN: the extension's TT routes compute C straight into this
+    # contiguous row-major buffer, so `.stride()` matches what CUDA torch
+    # returns for the identical call (a swapped NN kernel would hand back a
+    # column-major C).
     out = _alloc(logical_output_shape, DType.bfloat16, lhs._device)
     _call_mojo(
         _Bf16MatmulExtension,

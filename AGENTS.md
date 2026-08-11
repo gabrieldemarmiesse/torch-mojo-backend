@@ -289,6 +289,18 @@ needs to know which numbers are portable and which were fitted to one card.
 
 ## Optimizing a kernel
 
+**The acceptance bar is 10%.** A kernel is done when its device time is
+within 10% of stock PyTorch on the same shape — i.e. `ours / torch <= 1.10`.
+That is the only pass/fail criterion. It is not 2%: an earlier revision of
+this file said 2%, it was too strict, and agents have since quoted the old
+number from memory and reported passing cells as failures. If you are about
+to judge a result against any threshold other than 10%, re-read this line.
+
+The roofline is a **diagnostic, not a gate**. It tells you whether a
+remaining gap is physics or engineering; it never decides whether the work is
+done. A kernel inside 10% of PyTorch is finished even at 50% of roofline,
+because PyTorch itself is often nowhere near roofline.
+
 When optimizing a kernel, you should make a harness for a subagent A to work on. The harness should include:
 - Unit tests for the kernels (outside the main test suite), the unit tests should acquire the flock `/tmp/gpu_lock_{gpu_id}.lock`.
 - A benchmark script in pure mojo, that measures the performance of the kernel on different input shapes (no more than 6), requiring at least one non-round/awkward shape (e.g. 357×789). The benchmark should lock the GPU frequency if possible. The benchmark should use a flock in /tmp/gpu_lock_{gpu_id}.lock to avoid using the gpu at the same time as other benchmarks. `ncu` or rocprof or equivalent should be given to the agent.
@@ -296,7 +308,7 @@ When optimizing a kernel, you should make a harness for a subagent A to work on.
 - The harness should also include reference numbers, so roofline estimate, and the performance of stock pytorch on the same input shapes (device time too, not wall time).
 - The scope of the agent should be as limited as possible, for example, if writing a gemm, the agent should only take care of the TN variant, or NT but not all variants. It should only focus on one dtype. (if multiple dtypes are needed, we'll do the dance Agent A, Agent B for dtype1 and then Agent A Agent B for dtype2, etc..., with a bit of luck for dtype2, agent A can reuse the code of dtype1 and just change the dtype, which will be easy to integrate later by agent B by parametrizing the code).
 - The agent should write the kernel outside the codebase, but the agent can import code from it, or import code from the modular repo. This is to avoid having the agent work on integrating the kernel into the codebase, the agent should only focus on the kernel itself. 
-- The performance work is done when the kernel is within 10% of the speed of stock pytorch on the same input shapes (device time). Keep the roofline estimate in the harness as a diagnostic: it tells the agent whether the remaining gap is physics or engineering.
+- The performance work is done when the kernel is within 10% of the speed of stock pytorch on the same input shapes (device time), as stated at the top of this section. Keep the roofline estimate in the harness as a diagnostic only.
 
 A small agent A2 should be used for a quick code review, notably just check that the kernel respects the rules of the eager mode and the tests are passing. No need for a very smart model here.
 
