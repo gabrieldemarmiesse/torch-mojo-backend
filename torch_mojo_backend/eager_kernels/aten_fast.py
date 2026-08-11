@@ -297,6 +297,19 @@ _BCAST_DTYPES = _FLOAT_DTYPES + (
     DType.uint8,
 )
 
+# Smallest contiguous inner extent that makes the strided arg-reduction kernel
+# (one thread per output column) worth taking over materializing a transposed
+# copy.  Swept on an H100 PCIe, f32, 4.2M elements reducing dim 0, device time
+# in us of the whole op:
+#   inner              2       4       8      16      32      64
+#   direct         296.2   156.6    81.5    44.3    25.4    16.4
+#   materialized   280.1   147.2    81.4    48.5    32.4    31.9
+# The crossover is between 8 and 16 lanes: below it the column kernel leaves
+# most of each warp idle and the transposing copy is worth its extra pass.
+# Fitted on this card; both routes are far off stock torch in that tall-skinny
+# corner (3-13x) and neither is what fixes it.
+_ARG_DIRECT_MIN_INNER = 16
+
 _FUSED_ADAMW_RECORD_FIELDS = 7
 _FOREACH_CHUNK_ELEMENTS = 65_536
 _FOREACH_NORM_RECORD_FIELDS = 3
@@ -392,6 +405,38 @@ def _reduce_middle_direct_ok(
     if dims == tuple(range(rank - len(dims), rank)):
         return False  # trailing: the ordinary rows/cols path is the fast one
     return dims == tuple(range(dims[0], dims[0] + len(dims)))
+
+
+def _arg_strided_direct_ok(
+    spec_fn_name: str, a: TorchMojoTensor, dims: tuple[int, ...]
+) -> bool:
+    """Whether argmin/argmax reduces a NON-trailing dim interval in place.
+
+    The arg-reduction bridge has a strided-axis kernel (`_argreduce_cols` in
+    argreduce_kernels.mojo): one thread per output column, walking the reduce
+    axis while neighbouring lanes read neighbouring elements of the
+    contiguous inner axis. It reads the source where it lies, so this route
+    skips the transposed full-tensor copy `_reduce_ready_operand` would
+    otherwise materialize — the whole cost of a `dim=0` arg-reduction.
+
+    The gate is the kernel's own regime and the Mojo side accepts whatever it
+    is handed here (a queued launch cannot fall back), so the two must agree:
+    contiguous operand, one adjacent ascending dim interval that is not the
+    trailing one, on an accelerator, and enough inner elements for the lanes
+    to coalesce."""
+    if spec_fn_name not in ("ArgminSpec", "ArgmaxSpec"):
+        return False
+    if not a._is_contiguous or getattr(a._device, "api", "cpu") == "cpu":
+        return False
+    rank = len(a._shape)
+    if dims != tuple(range(dims[0], dims[0] + len(dims))):
+        return False  # not one adjacent ascending interval
+    if dims == tuple(range(rank - len(dims), rank)):
+        return False  # trailing: the contiguous-axis row kernels own it
+    inner = 1
+    for size in a._shape[dims[-1] + 1 :]:
+        inner *= size
+    return inner >= _ARG_DIRECT_MIN_INNER
 
 
 def _reduce_keepdim_shape(
@@ -1893,7 +1938,9 @@ def _try_spec_reduce(
     ):
         return None  # the bridge would reject the dim spec anyway
     original_shape = tuple(a._shape)
-    if _reduce_middle_direct_ok(spec_fn_name, module_name, a, dims):
+    if _reduce_middle_direct_ok(spec_fn_name, module_name, a, dims) or (
+        _arg_strided_direct_ok(spec_fn_name, a, dims)
+    ):
         ready_dims = dims  # zero-copy direct kernel reads the source in place
     else:
         a, ready_dims = _reduce_ready_operand(a, dims)

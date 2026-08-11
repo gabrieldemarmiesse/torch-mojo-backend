@@ -11,10 +11,12 @@
 # Most kernels here are written as a parallel-for over independent output
 # elements or rows (`elementwise` with an inner sequential loop), so the same
 # code runs on CPU and GPU with fully dynamic shapes. The row-reduction ops
-# (layer norm, argmax/max) additionally have explicit GPU kernels that
+# (layer norm, max) additionally have explicit GPU kernels that
 # launch one thread block per row: their row counts are far too small
 # (batch * seq_len) for a thread-per-row launch to fill the GPU. Row softmax
-# instead delegates its GPU path to modular's nn.softmax grid-stride kernels.
+# instead delegates its GPU path to modular's nn.softmax grid-stride kernels,
+# and argmax to `argreduce_kernels.mojo`, shared with reduction_ops' argmin,
+# which splits the reduce axis when the rows alone cannot fill the device.
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
@@ -51,6 +53,7 @@ from max.algorithm.reduction import mean
 from max.algorithm.reduction import max as reduce_max
 from max.algorithm.reduction import min as reduce_min
 
+from argreduce_kernels import _argreduce_spec_into
 from layout import TileTensor, row_major
 from native_dropout_kernels import _philox4x32_10
 from nn.softmax import softmax
@@ -2188,127 +2191,10 @@ def _any_bool_go(
     )
 
 
-# ---------------------------------------------------------------------------
-# Row-wise argmax: input viewed as (rows, cols), out is `rows` int64
-# indices (first occurrence wins, matching torch). Covers argmax over the
-# vocab dim in greedy decoding, where rows=1 and cols can be > 50000 —
-# a single sequential task per row would leave the GPU almost idle, so the
-# GPU path launches one thread block per row and reduces across the row in
-# parallel. CPU keeps the original single-task-per-row scalar scan.
-# ---------------------------------------------------------------------------
-
-comptime ARGMAX_THREADS = 512
-# log2(ARGMAX_THREADS): number of halving steps in the shared-memory
-# reduction tree below.
-comptime ARGMAX_STAGES = 9
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ARGMAX_THREADS))
-)
-@__name(t"argmax_rows_block_{dtype}")
-def _argmax_rows_block_kernel[
-    dtype: DType
-](
-    out_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols_arg: Int64,
-):
-    """One block per row (grid.x = rows); ARGMAX_THREADS lanes each stride
-    over the row picking their own best (value, index) with strict `>` (so
-    ties keep the lane's earliest index), then a shared-memory tree
-    reduction combines lanes with an explicit lower-index tiebreak on equal
-    values. Together these preserve torch's first-occurrence-wins argmax
-    semantics regardless of how work is split across lanes.
-    """
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var cols = Int(cols_arg)
-    var r = block_idx.x
-    var tid = thread_idx.x
-    var base = r * cols
-
-    var best_val = min_or_neg_inf[dtype]()
-    var best_idx = Int64(-1)
-    for j in range(tid, cols, ARGMAX_THREADS):
-        var v = in_ptr[base + j]
-        if v > best_val:
-            best_val = v
-            best_idx = Int64(j)
-
-    var val_smem = stack_allocation[
-        ARGMAX_THREADS, dtype, address_space=AddressSpace.SHARED
-    ]()
-    var idx_smem = stack_allocation[
-        ARGMAX_THREADS, DType.int64, address_space=AddressSpace.SHARED
-    ]()
-    val_smem[tid] = best_val
-    idx_smem[tid] = best_idx
-    barrier()
-
-    var stride = ARGMAX_THREADS // 2
-    for _ in range(ARGMAX_STAGES):
-        if tid < stride:
-            var other_val = val_smem[tid + stride]
-            var other_idx = idx_smem[tid + stride]
-            var cur_val = val_smem[tid]
-            var cur_idx = idx_smem[tid]
-            if other_val > cur_val or (
-                other_val == cur_val
-                and other_idx != Int64(-1)
-                and (cur_idx == Int64(-1) or other_idx < cur_idx)
-            ):
-                val_smem[tid] = other_val
-                idx_smem[tid] = other_idx
-        barrier()
-        stride //= 2
-
-    if tid == 0:
-        out_ptr[r] = idx_smem[0]
-
-
-@always_inline
-def _argmax_rows[
-    dtype: DType
-](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
-    var out_ptr = _make_ptr[DType.int64](out_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var r = Int(idx[0].value())
-            var base = r * cols
-            var best = in_ptr[base]
-            var best_idx = 0
-            for j in range(1, cols):
-                var v = in_ptr[base + j]
-                if v > best:
-                    best = v
-                    best_idx = j
-            out_ptr[r] = Int64(best_idx)
-
-        _parallel_for[func](rows, ctx)
-    else:
-        comptime if has_accelerator():
-            var out_p = out_ptr.as_unsafe_any_origin()
-            var in_p = in_ptr.as_unsafe_any_origin().as_immutable()
-            _enqueue_cached[_argmax_rows_block_kernel[dtype]](
-                ctx,
-                String(t"argmax_rows_{dtype}"),
-                rows,
-                1,
-                1,
-                ARGMAX_THREADS,
-                out_p,
-                in_p,
-                Int64(cols),
-            )
-        else:
-            raise Error("no GPU accelerator available at compile time")
+# Row-wise argmax lives in `argreduce_kernels.mojo` (`_argreduce_rows`,
+# with `_argreduce_cols` for a strided reduce axis): one
+# comptime-parametrized mechanism shared with reduction_ops' argmin, so
+# the two ops cannot drift apart in semantics or launch geometry.
 
 
 # ---------------------------------------------------------------------------
@@ -3352,30 +3238,7 @@ def _argmax_spec_into_go(
         raise Error("mojo spec argmax: unsupported dtype ", a.dtype)
     if a.numel == 0:
         raise Error("mojo spec argmax: empty input")
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-    )
-
-    var ctx = a.ctx()
-    var nbytes = rows * 8  # int64 output
-    _ = nbytes
-    _check_into_sized(a, out, rows, DType.int64)
-    var addr = out.ptr
-    if rows > 0:
-        comptime for dt in SPEC_MAXROWS_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _argmax_rows[dt](addr, a.ptr, rows, cols, ctx)
+    _argreduce_spec_into[SPEC_MAXROWS_DTYPES, False](a, out, rdims_t, a.ctx())
 
 
 def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:

@@ -7,10 +7,12 @@
 # allocation retry); the bridges here refuse non-trailing dims or strided
 # operands rather than scratch-copying, and the kernels only ever see a
 # contiguous (rows, cols) buffer reducing each row to one output element.
-# Two ops opt out of that materialization for an ADJACENT non-trailing reduce
-# interval, which they reduce in place from a contiguous (outer, reduce, inner)
-# view: the fp32 middle sum and the variance moment reduction. Python mirrors
-# the condition in `aten_fast._reduce_middle_direct_ok`.
+# Three routes opt out of that materialization and read a non-trailing reduce
+# axis where it lies, allocating nothing: the fp32 middle sum and the variance
+# moment reduction, both of which take a contiguous (outer, reduce, inner) view
+# of an ADJACENT reduce interval, and ArgminSpec's strided-axis kernel in
+# `argreduce_kernels.mojo`. Python mirrors the first two in
+# `aten_fast._reduce_middle_direct_ok` and the third in `_arg_strided_direct_ok`.
 #
 # Raw-pointer calling convention (see elementwise_ops.mojo / nn_ops.mojo):
 # tensor operands arrive as element-aligned int addresses, sizes and dtypes as
@@ -57,6 +59,8 @@ from max.algorithm.reduction import max as reduce_max
 from max.algorithm.reduction import min as reduce_min
 
 from std.python._cpython import PyObjectPtr, Py_ssize_t
+
+from argreduce_kernels import _argreduce_spec_into
 
 from op_utils import (
     FLOAT_DTYPES,
@@ -448,113 +452,10 @@ def _adjacent_reduce_geom(
     return True
 
 
-# ---------------------------------------------------------------------------
-# Row-wise argmin: input viewed as (rows, cols), out is `rows` int64 indices
-# (first occurrence wins, matching torch). Mirror of nn_ops' ArgmaxRows with
-# the comparison flipped.
-# ---------------------------------------------------------------------------
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
-)
-@__name(t"argmin_rows_block_{dtype}")
-def _argmin_rows_block_kernel[
-    dtype: DType
-](
-    out_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols_arg: Int64,
-):
-    """One block per row; lanes pick their own first-min (value, index) with
-    strict `<`, then a shared-memory tree reduction combines lanes with a
-    lower-index tiebreak on equal values — torch's first-occurrence-wins."""
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var cols = Int(cols_arg)
-    var r = block_idx.x
-    var tid = thread_idx.x
-    var base = r * cols
-
-    var best_val = max_or_inf[dtype]()
-    var best_idx = Int64(-1)
-    for j in range(tid, cols, ROWRED_THREADS):
-        var v = in_ptr[base + j]
-        if v < best_val:
-            best_val = v
-            best_idx = Int64(j)
-
-    var val_smem = stack_allocation[
-        ROWRED_THREADS, dtype, address_space=AddressSpace.SHARED
-    ]()
-    var idx_smem = stack_allocation[
-        ROWRED_THREADS, DType.int64, address_space=AddressSpace.SHARED
-    ]()
-    val_smem[tid] = best_val
-    idx_smem[tid] = best_idx
-    barrier()
-
-    var stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            var other_val = val_smem[tid + stride]
-            var other_idx = idx_smem[tid + stride]
-            var cur_val = val_smem[tid]
-            var cur_idx = idx_smem[tid]
-            if other_val < cur_val or (
-                other_val == cur_val
-                and other_idx != Int64(-1)
-                and (cur_idx == Int64(-1) or other_idx < cur_idx)
-            ):
-                val_smem[tid] = other_val
-                idx_smem[tid] = other_idx
-        barrier()
-        stride //= 2
-
-    if tid == 0:
-        out_ptr[r] = idx_smem[0]
-
-
-@always_inline
-def _argmin_rows[
-    dtype: DType
-](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
-    var out_ptr = _make_ptr[DType.int64](out_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var r = Int(idx[0].value())
-            var base = r * cols
-            var best = in_ptr[base]
-            var best_idx = 0
-            for j in range(1, cols):
-                var v = in_ptr[base + j]
-                if v < best:
-                    best = v
-                    best_idx = j
-            out_ptr[r] = Int64(best_idx)
-
-        _parallel_for[func](rows, ctx)
-    else:
-        comptime if has_accelerator():
-            _enqueue_cached[_argmin_rows_block_kernel[dtype]](
-                ctx,
-                String(t"argmin_rows_{dtype}"),
-                rows,
-                1,
-                1,
-                ROWRED_THREADS,
-                out_ptr.as_unsafe_any_origin(),
-                in_ptr.as_unsafe_any_origin().as_immutable(),
-                Int64(cols),
-            )
-        else:
-            raise Error("no GPU accelerator available at compile time")
+# Row-wise argmin lives in `argreduce_kernels.mojo` (`_argreduce_rows`, with
+# `_argreduce_cols` for a strided reduce axis): one comptime-parametrized
+# mechanism shared with nn_ops' argmax, so the two ops cannot drift apart in
+# either semantics or launch geometry.
 
 
 # ---------------------------------------------------------------------------
@@ -2018,25 +1919,7 @@ def _argmin_spec_into_go(
         raise Error("mojo spec argmin: unsupported dtype ", a.dtype)
     if a.numel == 0:
         raise Error("mojo spec argmin: empty input")
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
-
-    var ctx = a.ctx()
-    var nbytes = rows * 8  # int64 output
-    _ = nbytes
-    if out.numel != rows or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != DType.int64:
-        raise Error("mojo spec into: output dtype mismatch")
-    var addr = out.ptr
-    if rows > 0:
-        comptime for dt in SPEC_ROWRED_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _argmin_rows[dt](addr, a.ptr, rows, cols, ctx)
+    _argreduce_spec_into[SPEC_ROWRED_DTYPES, True](a, out, rdims_t, a.ctx())
 
 
 def _min_dim_spec_into_go(
