@@ -19,6 +19,41 @@ jobs:
         run: |
           uvx pre-commit run --all-files
 
+  # The one part of benchmarks/ that CI can gate on: it reconciles the
+  # suite's bookkeeping — every registered op benchmarked or skipped with a
+  # reason, every recorded baseline still addressed by a test node — without
+  # running a benchmark, touching a device or needing an accelerator. Both
+  # failures it catches are silent ones: an unclassified op becomes a
+  # coverage gap, and an orphaned baseline stops protecting its kernel
+  # regime. The MEASURING part of benchmarks/ must never gate CI (no GPU
+  # here) — see AGENTS.md.
+  benchmark-bookkeeping:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Modular directory
+        uses: actions/cache@v4
+        with:
+          path: /tmp/modular/
+          key: modular-bench-bookkeeping-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            modular-bench-bookkeeping-
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: |
+          uv run echo hello
+
+      - name: Reconcile benchmark coverage and recorded baselines
+        env:
+          MODULAR_HOME: /tmp/modular/
+        run: |
+          uv run pytest benchmarks/test_coverage.py -v
+
   test:
     runs-on: ubuntu-latest
     
