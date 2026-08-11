@@ -149,7 +149,7 @@ def test_triu(
 
 
 @pytest.mark.parametrize("dtype_id", ("f32", "i64"))
-@pytest.mark.parametrize("shape_id", (f"N{ARANGE_N}",))
+@pytest.mark.parametrize("shape_id", (f"N_{ARANGE_N}",))
 def test_arange(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ) -> None:
