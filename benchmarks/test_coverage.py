@@ -1,17 +1,38 @@
-"""Reconciliation: every op the mojo device registers is either
-benchmarked or explicitly skipped with a reason.
+"""Two reconciliations, both GPU-free and both about things that fail
+SILENTLY rather than loudly.
 
-Each family module declares COVERS (aten op -> the test that measures
-it) and may declare module-local SKIPPED entries; suite-wide skips whose
-reasons span families live here.  This test compares the union against
-the live registration table, so a newly registered op that nobody
-classified fails the suite instead of silently becoming a coverage gap,
-and a deregistered op cannot leave a stale classification behind.
+1. Every op the mojo device registers is either benchmarked or
+   explicitly skipped with a reason.  Each family module declares COVERS
+   (aten op -> the test that measures it) and may declare module-local
+   SKIPPED entries; suite-wide skips whose reasons span families live
+   here.  The union is compared against the live registration table, so a
+   newly registered op that nobody classified fails the suite instead of
+   becoming a coverage gap, and a deregistered op cannot leave a stale
+   classification behind.
+
+2. Every recorded baseline is still addressed by a test node.  A key
+   whose node disappeared — renamed shape token, dropped parametrize
+   case, deleted test — never fails anything: it just stops protecting
+   its kernel regime, and the op silently re-measures as a "new entry" on
+   the machine that owns the baselines.  Nothing else in the suite
+   notices, which is exactly why this check exists.
 """
 
 from __future__ import annotations
 
 import importlib
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from bench_lib import baselines
+from conftest import KEY_DUMP_ENV
+
+BENCH_DIR = Path(__file__).resolve().parent
 
 FAMILY_MODULES = (
     "test_gemm",
@@ -131,4 +152,93 @@ def test_every_registered_op_is_classified() -> None:
     assert not stale, (
         f"classified ops that are no longer registered: {stale}. Remove the "
         "stale COVERS/SKIPPED entries (and any benchmark of a dropped op)."
+    )
+
+
+def _addressable_keys() -> set[str]:
+    """Every baseline path the suite can produce, from a collection run.
+
+    Collection only — no benchmark runs, no GPU, no device touched.  It
+    happens in a SUBPROCESS over the whole benchmarks/ directory on
+    purpose: reading this session's own items would make the answer depend
+    on how the suite was selected, and `-k something` would then report
+    every unselected baseline as an orphan.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        dump = Path(tmp) / "keys.txt"
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", str(BENCH_DIR), "--collect-only", "-q"],
+            env={**os.environ, KEY_DUMP_ENV: str(dump)},
+            cwd=BENCH_DIR.parent,
+            capture_output=True,
+            text=True,
+        )
+        assert dump.exists(), (
+            "collecting the benchmark suite in a subprocess produced no key "
+            f"dump (exit {proc.returncode}).\nstdout:\n{proc.stdout[-2000:]}\n"
+            f"stderr:\n{proc.stderr[-2000:]}"
+        )
+        return set(dump.read_text().split())
+
+
+AXES = ("op", "dtype", "shape", "layout")
+
+
+def _diagnose(orphans: list[str], keys: set[str]) -> str:
+    """Name what went missing, not just which paths broke.
+
+    Renaming one shape token orphans every op that uses it, so the raw
+    list is hundreds of paths with one cause.  Report the axis VALUES the
+    suite no longer produces, with their blast radius, and fall back to
+    listing paths when every value still exists and only the combination
+    is gone (a dropped parametrize case).
+    """
+    live = [{key.split("/")[i] for key in keys} for i in range(len(AXES))]
+    unknown: dict[str, int] = {}
+    combinations = []
+    for orphan in orphans:
+        parts = orphan.split("/")
+        missing = [
+            f"{AXES[i]} {part!r}" for i, part in enumerate(parts) if part not in live[i]
+        ]
+        if missing:
+            for token in missing:
+                unknown[token] = unknown.get(token, 0) + 1
+        else:
+            combinations.append(orphan)
+    lines = [
+        f"  no test node produces {token} — {count} recorded entr"
+        f"{'y' if count == 1 else 'ies'} under it"
+        for token, count in sorted(unknown.items(), key=lambda kv: -kv[1])
+    ]
+    if combinations:
+        shown = combinations[:10]
+        lines.append(
+            f"  {len(combinations)} entr{'y' if len(combinations) == 1 else 'ies'} "
+            f"whose axes all exist but whose combination is gone: {shown}"
+            + (" (first 10)" if len(combinations) > len(shown) else "")
+        )
+    return "\n".join(lines)
+
+
+def test_every_recorded_baseline_is_still_addressable() -> None:
+    keys = _addressable_keys()
+    assert keys, "the collection run found no benchmark nodes at all"
+
+    # Across every hardware config: a machine that measured a case still
+    # owns that baseline even when this machine never runs it.
+    recorded = {
+        str(key)
+        for config in baselines.load().configs.values()
+        for key in config.leaves()
+    }
+    orphans = sorted(recorded - keys)
+    assert not orphans, (
+        f"{len(orphans)} of {len(recorded)} recorded baselines are no longer "
+        f"addressed by any test node:\n{_diagnose(orphans, keys)}\n"
+        "Each one silently protects nothing — the case it was measured for "
+        "will re-record as a new entry on the machine that owns it. If a "
+        "token was renamed, rename the recorded entries with it (a shape id "
+        "IS a baseline key); if the case was dropped for good, delete its "
+        "entries from the data block of benchmarks/baselines.html."
     )

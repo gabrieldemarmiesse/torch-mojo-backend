@@ -70,7 +70,7 @@ def _sync_for(device: str) -> Callable[[], None]:
     return lambda: None
 
 
-def _bench_key(request: pytest.FixtureRequest) -> baselines.BenchKey:
+def bench_key(node: pytest.Function) -> baselines.BenchKey:
     """The baseline tree path of this test node: op/dtype/shape/layout.
 
     Derived from the test's own axes, never parsed out of the node id:
@@ -79,8 +79,13 @@ def _bench_key(request: pytest.FixtureRequest) -> baselines.BenchKey:
     Python identifier), dtype and shape come from the parametrize ids,
     and a test without a layout axis gets the fixed sentinel "contig" so
     every path has the same rank.
+
+    Takes the node rather than the request so that collection can derive
+    the same keys without running anything: benchmarks/test_coverage.py
+    reconciles the recorded baselines against the suite through this very
+    function, which is what keeps the check honest — it cannot drift from
+    the key a real run would write.
     """
-    node = request.node
     marker = node.get_closest_marker("bench_op")
     op = marker.args[0] if marker else node.originalname.removeprefix("test_")
     callspec = getattr(node, "callspec", None)
@@ -117,7 +122,7 @@ class Bench:
         self, ref_fn: Callable[[], object], our_fn: Callable[[], object], flops: float
     ) -> None:
         hw = self._hw
-        entry_key = _bench_key(self._request)
+        entry_key = bench_key(self._request.node)
         iters = iters_for_flops(flops)
         try:
             for attempt in range(1 + NOISE_RETRIES):

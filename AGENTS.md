@@ -87,6 +87,10 @@ uv run pytest benchmarks/ -k "..." --update-baselines=force
 
 # Where are we far behind stock PyTorch? (reads only the JSON, no GPU needed)
 uv run python benchmarks/report.py --worst 20
+
+# Two GPU-free reconciliations: every registered op is benchmarked or has a
+# documented skip, and every recorded baseline still has a test node
+uv run pytest benchmarks/test_coverage.py
 ```
 
 `baselines.html` is one file with two halves. The `<script
@@ -112,7 +116,13 @@ the file, or route it through a raw-HTML viewer such as
 Updates merge per entry: a run that measured three cases changes those
 three lines of `baselines.html` and nothing else, so a PR touching one op
 updates that op's numbers without rerunning the rest. Do not gate CI on
-this suite: CI machines may have no GPU.
+this suite: CI machines may have no GPU — except
+`benchmarks/test_coverage.py`, which needs no accelerator and is safe to
+gate on: it reconciles the registered ops against what is benchmarked,
+and every recorded baseline against the test nodes that address it (a
+shape id, dtype id or op token IS a baseline key, so renaming one without
+renaming its recorded entries silently retires them — that check is what
+catches it).
 
 
 ## To add support for an op

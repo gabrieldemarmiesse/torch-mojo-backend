@@ -21,10 +21,31 @@ import os
 
 os.environ.setdefault("MODULAR_TELEMETRY_ENABLED", "0")
 
+from pathlib import Path
+
 import pytest
 import torch
-from bench_lib.check import Bench, update_mode
+from bench_lib.check import Bench, bench_key, update_mode
 from bench_lib.hw import Hardware, detect
+
+# Set to a path to make collection write every benchmark node's baseline
+# key there, one per line, and measure nothing.  test_coverage.py drives
+# this to reconcile the recorded baselines against the suite: the keys come
+# from the real bench_key(), so the reconciliation cannot disagree with
+# what a measuring run would write.
+KEY_DUMP_ENV = "TORCH_MOJO_BACKEND_BENCH_DUMP_KEYS"
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    dump = os.environ.get(KEY_DUMP_ENV)
+    if not dump:
+        return
+    keys = [
+        bench_key(item)
+        for item in session.items
+        if isinstance(item, pytest.Function) and "bench" in item.fixturenames
+    ]
+    Path(dump).write_text("".join(f"{key}\n" for key in keys))
 
 
 def pytest_configure(config: pytest.Config) -> None:
