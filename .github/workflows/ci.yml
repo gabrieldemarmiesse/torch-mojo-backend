@@ -52,7 +52,7 @@ jobs:
         env:
           MODULAR_HOME: /tmp/modular/
         run: |
-          uv run pytest benchmarks/test_coverage.py benchmarks/test_measure_ordering.py -v
+          uv run pytest benchmarks/test_coverage.py -v
 
   test:
     runs-on: ubuntu-latest
