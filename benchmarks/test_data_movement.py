@@ -18,10 +18,19 @@ from bench_lib.cases import DTYPES, both
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
-# (pieces, elements per piece)
+# (pieces, elements per piece).  The piece COUNT is a regime axis of its own:
+# CatN batches up to CAT_SEG_CAP inputs per launch, so 64 is the last count
+# that fits one launch and 65 is the first that does not — benchmark both
+# sides of that edge, or a change to the cap only ever gets measured on its
+# good side.  The odd piece length is the unaligned regime: 281673 = 357*789
+# elements is not a multiple of 16 bytes in either dtype, so it exercises the
+# element/tail path instead of the wide vector path.
 CAT_SHAPES: dict[str, tuple[int, int]] = {
     "P_2x8388608": (2, 8388608),
     "P_64x262144": (64, 262144),
+    "P_65x262144": (65, 262144),
+    "P_512x2048": (512, 2048),
+    "P_64x281673": (64, 281673),
 }
 STACK_SHAPES: dict[str, tuple[int, int]] = {
     "P_8x1048576": (8, 1048576),
