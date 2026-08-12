@@ -27,7 +27,6 @@ from std.memory import memcpy
 from std.python import Python, PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.python.bindings import PythonModuleBuilder
-from std.utils.coord import Coord
 
 from std.sys.info import has_apple_gpu_accelerator, size_of
 from std.utils import IndexList
@@ -39,10 +38,12 @@ from op_utils import (
     TensorSpec,
     _copy_strided,
     _enqueue_cached,
+    _fill_bits,
+    _fill_bits_dtype,
+    _fill_layout,
     _get_ctx,
     _gs_blocks,
     _make_ptr,
-    _parallel_for_dt,
     _raw_ctx,
     _raw_dtype_int,
     _raw_f64,
@@ -492,29 +493,20 @@ def _strided_fill[
     dst_strides: IndexList[MAX_RANK],
     ctx: DeviceContext,
 ) raises:
-    var dst_ptr = _make_ptr[dtype](dst_addr)
-    var scalar = value.cast[dtype]()
-    var total = 1
-    for i in range(MAX_RANK):
-        total *= shape[i]
-    if total == 0:
-        return
+    """`dst[coords] = value`, collapsing the layout first (`_fill_layout`).
 
-    @always_inline
-    @parameter
-    @__copy_capture(dst_ptr, scalar, shape, dst_strides)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var rest = Int(idx[0].value())
-        var dst_off = 0
-
-        comptime for d in range(MAX_RANK - 1, 0, -1):
-            var coord = rest % shape[d]
-            rest = rest // shape[d]
-            dst_off += coord * dst_strides[d]
-        dst_off += rest * dst_strides[0]
-        dst_ptr[dst_off] = scalar
-
-    _parallel_for_dt[dtype, func](total, ctx)
+    The Apple float64 guard is kept at the *tensor's* dtype even though the
+    store itself now goes through a same-width unsigned type that Metal
+    accepts: declining exactly what used to be declined keeps the caller's
+    error path unchanged.
+    """
+    comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
+        if ctx.api() != "cpu":
+            raise Error("float64 is not supported on Apple GPU")
+    comptime BITS = _fill_bits_dtype[dtype]()
+    _fill_layout[BITS](
+        dst_addr, _fill_bits[dtype, BITS](value), shape, dst_strides, ctx
+    )
 
 
 def _strided_fill_go(
@@ -535,10 +527,7 @@ def _strided_fill_go(
     var dtype = DType._from_ui8(UInt8(_raw_int(dtype_o))._mlir_value)
     var ctx = _raw_ctx(ctx_ptr)
 
-    # bool fill must store exactly 0/1.
-    if dtype == DType.bool:
-        value = Float64(1) if value != 0 else Float64(0)
-
+    # bool's exact 0/1 byte is `_fill_bits`' job, not this dispatcher's.
     var handled = False
     comptime for dt in ALL_DTYPES:
         if dtype == dt:

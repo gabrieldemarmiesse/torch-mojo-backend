@@ -2650,6 +2650,107 @@ def test_fast_bool_fill_scalar(mojo_device, value):
     torch.testing.assert_close(actual.cpu(), torch.full((3, 5), value))
 
 
+# One dtype per element width the fill kernels dispatch on: 8, 4, 2 and 1
+# bytes. The kernel is layout-only below that -- the value's bits are cast on
+# the host -- so widening this list tests the host cast, not the kernel.
+FILL_WIDTH_DTYPES = [torch.int64, torch.float32, torch.bfloat16, torch.bool]
+
+
+def _fill_check(built, dtype, value, mojo_device, base_numel=8192):
+    """Fill `built(base)` on both CPU torch and the mojo device; compare the
+    WHOLE base, so a kernel that writes outside the view is caught."""
+    host = torch.zeros(base_numel, dtype=dtype)
+    device = host.clone().to(mojo_device)
+    built(host).fill_(value)
+    built(device).fill_(value)
+    assert torch.equal(device.cpu(), host)
+
+
+@pytest.mark.parametrize("dtype", FILL_WIDTH_DTYPES)
+def test_fast_fill_scalar_ranks_one_through_eight(mojo_device, dtype):
+    """Every rank the rank-8 padded layout can carry collapses correctly."""
+    value = True if dtype is torch.bool else 3
+    for rank in range(1, 9):
+        shape = tuple([2] * (rank - 1) + [5])
+        numel = 5 * 2 ** (rank - 1)
+        _fill_check(
+            lambda base, s=shape, n=numel: base[:n].view(s), dtype, value, mojo_device
+        )
+
+
+@pytest.mark.parametrize("dtype", FILL_WIDTH_DTYPES)
+def test_fast_fill_scalar_lengths_exercise_the_scalar_tail(mojo_device, dtype):
+    """Lengths that are not a whole number of 16-byte stores, plus empty.
+
+    A zero-element fill must be a no-op rather than a launch, and any length
+    from 1 to one below the widest vector leaves only the tail.
+    """
+    value = True if dtype is torch.bool else 3
+    for length in (0, 1, 2, 3, 5, 7, 9, 15, 16, 17, 31, 33, 4099):
+        _fill_check(lambda base, n=length: base[:n], dtype, value, mojo_device)
+
+
+@pytest.mark.parametrize("dtype", FILL_WIDTH_DTYPES)
+def test_fast_fill_scalar_offset_views_at_every_alignment_phase(mojo_device, dtype):
+    """A view can start at any element offset, so the vector width is chosen
+    from the runtime base ADDRESS; every 16-byte phase must stay correct."""
+    value = True if dtype is torch.bool else 3
+    for offset in range(17):
+        _fill_check(lambda base, o=offset: base[o : o + 333], dtype, value, mojo_device)
+
+
+@pytest.mark.parametrize("dtype", FILL_WIDTH_DTYPES)
+def test_fast_fill_scalar_strided_layouts(mojo_device, dtype):
+    """Layouts the collapse must either flatten or hand to the strided arm.
+
+    The transposed and permuted views are dense, so they must come out
+    identical to a contiguous fill; the column, the step and the 2-D slice
+    stay genuinely strided; `expand` repeats a stride-0 dimension, whose
+    writes are redundant for a constant.
+    """
+    value = True if dtype is torch.bool else 3
+    layouts = [
+        lambda base: base[:6000].view(60, 100).t(),
+        lambda base: base[:6000].view(60, 100)[:, 3],
+        lambda base: base[:6000:7],
+        lambda base: base[:6000].view(60, 100)[10:50, 20:90],
+        lambda base: base[:5040].view(6, 7, 8, 15).permute(2, 0, 3, 1),
+        lambda base: base[:100].view(1, 100).expand(7, 100),
+        lambda base: base[:1].view(()),
+    ]
+    for build in layouts:
+        _fill_check(build, dtype, value, mojo_device)
+
+
+@pytest.mark.parametrize("dtype", FILL_WIDTH_DTYPES)
+def test_fast_zero__delegates_to_the_fill_bridge(mojo_device, dtype):
+    """aten::zero_ is aten::fill_.Scalar with 0, on any layout."""
+    host = torch.ones(1234, dtype=dtype)
+    device = host.clone().to(mojo_device)
+    host.view(2, 617).t().zero_()
+    device.view(2, 617).t().zero_()
+    assert torch.equal(device.cpu(), host)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.int64, torch.int32, torch.uint8]
+)
+def test_fast_fill_scalar_value_conversion_matches_cpu(mojo_device, dtype):
+    """The scalar is narrowed to the tensor's dtype exactly as ATen does:
+    floats truncate into integer tensors, and `bool` -- a Python `int`
+    subclass ATen accepts for every scalar fill -- lands as 0 or 1."""
+    values = [0, 7, True, False, 0.0, 2.75]
+    if dtype is not torch.uint8:
+        values += [-1.5, -3]
+    if dtype.is_floating_point:
+        values += [float("inf"), float("-inf"), float("nan")]
+    for value in values:
+        host = torch.empty(33, dtype=dtype).fill_(value)
+        device = torch.empty(33, dtype=dtype).to(mojo_device).fill_(value).cpu()
+        assert torch.equal(device.isnan(), host.isnan())
+        assert torch.equal(device.nan_to_num(0.0), host.nan_to_num(0.0))
+
+
 def test_fast_gpu_portability_kernels(mojo_device):
     # These closures previously captured Float64 or instantiated host-only
     # code for the GPU target, which is rejected by Metal and gfx942.

@@ -777,6 +777,15 @@ different kind of item.
   rank 5–8 shapes on `mojo:0`; `tests/test_eager_kernels.py` for correctness.
   `_copy_strided` is also what `.contiguous()`, `copy_` into views and `expand`
   materialization all use, so a regression here is broad — keep the scalar arm.
+* **Half of this now exists next door.** The fill family took the same
+  treatment and shipped it: `_collapse_fill_layout` (`op_utils/__init__.mojo`)
+  is exactly the stride-normalizing prologue described above, and `_fill_contig`
+  is the vector ladder that follows it. The *shape* of the fix transfers; the
+  prologue itself does not, because a fill collapses a SET of addresses — it may
+  drop stride-0 dimensions and reorder dimensions freely — while a copy must
+  merge the source and destination strides jointly and preserve the
+  correspondence between the two index spaces. Read it as a worked example, not
+  as a function to call.
 
 ### D3
 **The fused three-source `cat` is Metal-only** — **DONE** (batched `CatN`)

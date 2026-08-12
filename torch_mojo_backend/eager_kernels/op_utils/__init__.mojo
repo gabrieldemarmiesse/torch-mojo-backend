@@ -13,7 +13,7 @@ from max.gpu.sync import barrier
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceBuffer, DeviceContext
 from std.math import ceildiv, sqrt
-from std.memory import OpaquePointer, alloc, stack_allocation
+from std.memory import OpaquePointer, alloc, bitcast, stack_allocation
 from std.python import Python, PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.sys import llvm_intrinsic
@@ -21,6 +21,7 @@ from std.sys.info import (
     has_accelerator,
     has_apple_gpu_accelerator,
     is_nvidia_gpu,
+    simd_width_of,
     size_of,
 )
 from std.utils import IndexList
@@ -1418,6 +1419,466 @@ def _copy_strided[
             )
         else:
             raise Error("no GPU accelerator available at compile time")
+
+
+# ===========================================================================
+# Fill: dst[coords] = value over a contiguous run or a strided rank-<=8
+# layout. Shared by the in-place `aten::fill_.Scalar` / `aten::zero_` bridge
+# in tensor_holder and by the alloc+fill factories (zeros / ones / full /
+# *_like / new_*) behind `FillSpec` in elementwise_ops.
+#
+# A fill reads nothing and writes one repeated bit pattern, which is what
+# makes both of its optimizations legal:
+#
+#  * The kernel never needs the real dtype. The host casts the Float64 value
+#    once and the device stores the resulting bits through the unsigned
+#    integer type of the same width, so thirteen fillable dtypes compile to
+#    four kernels per vector width instead of thirteen -- the same dispatch
+#    on element *size* that `CopyStrided` above already uses.
+#  * The destination is a SET of addresses, not an ordered traversal, so the
+#    layout can be collapsed hard before any kernel runs (see
+#    `_collapse_fill_layout`).
+#
+# What bounds how many regimes this family may have is COLD START, not
+# runtime: every `_enqueue_cached` instantiation is compiled into
+# tensor_holder.mojo, the ungated module `_ensure_tensor_holder` builds as a
+# serial barrier ahead of every other extension. The twenty kernels here --
+# four element widths x {16-byte, scalar} x {contiguous, rank-2 strided},
+# plus the rank-8 scalar arm -- take that module's `mojo build` from 15 s to
+# 30 s on this box. Anything that multiplies another axis into that product,
+# a third vector width or a third rank, buys microseconds with seconds; the
+# two places that turned one down say so where the choice is made.
+# ===========================================================================
+
+
+@always_inline
+def _fill_bits_dtype[dtype: DType]() -> DType:
+    """The unsigned integer dtype `dtype`'s bit pattern is stored through."""
+    comptime if size_of[dtype]() == 1:
+        return DType.uint8
+    else:
+        comptime if size_of[dtype]() == 2:
+            return DType.uint16
+        else:
+            comptime if size_of[dtype]() == 4:
+                return DType.uint32
+            else:
+                return DType.uint64
+
+
+@always_inline
+def _fill_bits[dtype: DType, bits: DType](value: Float64) -> Scalar[bits]:
+    """`value` narrowed to `dtype`, reinterpreted as `bits`.
+
+    torch's bool is one byte holding exactly 0 or 1 while Mojo's `Bool`
+    scalar is an `i1`, so bool builds its byte directly instead of
+    bitcasting; every other dtype is a pure reinterpretation of the value
+    the old dtype-typed store would have written.
+    """
+    comptime if dtype == DType.bool:
+        return Scalar[bits](1) if value != Float64(0) else Scalar[bits](0)
+    else:
+        return bitcast[bits](value.cast[dtype]())
+
+
+@always_inline
+def _collapse_fill_layout(
+    shape: IndexList[MAX_RANK],
+    strides: IndexList[MAX_RANK],
+    mut out_shape: IndexList[MAX_RANK],
+    mut out_strides: IndexList[MAX_RANK],
+) -> Int:
+    """The smallest layout that writes the same addresses as (shape, strides).
+
+    Because a fill stores one constant, the order dimensions are visited in
+    does not matter and an address written twice is written the same value
+    twice. That buys three reductions no copy could make: dimensions of
+    extent 1 and dimensions of stride 0 (`expand`/broadcast views, whose
+    repeats are redundant) drop outright, what is left is sorted by
+    descending stride, and adjacent dimensions whose strides already tile
+    (`strides[i] == strides[i + 1] * shape[i + 1]`) merge into one. A
+    contiguous tensor of any rank, a transposed view of a dense matrix and an
+    expanded view all end up as a single contiguous run.
+
+    Returns the collapsed rank, with slots `[0, rank)` holding it
+    outermost-first and the remaining slots padded `(1, 0)` so the rank-8
+    kernel can still be handed the result. A layout whose dimensions all drop
+    is a single address and comes back as rank 1, `(1, 1)`.
+    """
+    var n = 0
+    for i in range(MAX_RANK):
+        if shape[i] > 1 and strides[i] != 0:
+            out_shape[n] = shape[i]
+            out_strides[n] = strides[i]
+            n += 1
+    if n == 0:
+        out_shape[0] = 1
+        out_strides[0] = 1
+        return 1
+
+    # Descending stride, insertion sort (at most 8 entries).
+    for i in range(1, n):
+        var extent = out_shape[i]
+        var stride = out_strides[i]
+        var j = i
+        while j > 0 and out_strides[j - 1] < stride:
+            out_shape[j] = out_shape[j - 1]
+            out_strides[j] = out_strides[j - 1]
+            j -= 1
+        out_shape[j] = extent
+        out_strides[j] = stride
+
+    # Merge innermost outward into the suffix [w, n); a merged pair keeps the
+    # inner stride and multiplies the extents.
+    var w = n
+    for idx in range(n - 1, -1, -1):
+        if w < n and out_strides[idx] == out_strides[w] * out_shape[w]:
+            out_shape[w] *= out_shape[idx]
+        else:
+            w -= 1
+            out_shape[w] = out_shape[idx]
+            out_strides[w] = out_strides[idx]
+
+    var rank = n - w
+    for i in range(rank):
+        out_shape[i] = out_shape[w + i]
+        out_strides[i] = out_strides[w + i]
+    for i in range(rank, MAX_RANK):
+        out_shape[i] = 1
+        out_strides[i] = 0
+    return rank
+
+
+comptime FILL_THREADS = GS_THREADS
+
+
+@always_inline
+def _fill_blocks(slots: Int) -> Int:
+    """Grid for a FILL_THREADS-wide fill: cover the slots exactly.
+
+    A fill has no reuse to protect and reads nothing, so -- unlike the
+    read+write traffic `_bw_blocks` sizes -- there is no cache-resident arm
+    that prefers a few long-lived workgroups. Measured on an H100 PCIe (114
+    SMs, 50 MB L2, 1395 MHz core clock pinned by the suite), ours/stock
+    device time on `benchmarks/test_inplace.py::test_fill_`, sweeping a cap
+    of N waves of `MULTIPROCESSOR_COUNT` blocks against this exact-cover
+    grid:
+
+      cap        16.8M bf16 (33 MB, L2-resident)   16.8M fp32 (67 MB, HBM)
+       1 wave                0.964                        1.098
+       2 waves               0.953                        1.096
+       4 waves               0.950                        1.098
+       8 waves               0.943                        1.090
+      16 waves               0.901                        1.055
+      64 waves               0.928                        1.004
+      exact cover            0.934                        0.999
+
+    The streaming arm is the one that matters (it is the one that was
+    failing) and it wants every slot to have its own thread; the resident arm
+    gives up 3.5% against its own best cap, from 0.901 to 0.934, which is far
+    inside the 1.10 bar. Covering exactly is therefore the whole rule: no SM
+    count, no cache-size constant, nothing fitted to this card and nothing
+    that can silently retarget another one. Past `_BW_MAX_BLOCKS` the
+    kernels' grid-stride loop takes over.
+    """
+    return max(1, min(ceildiv(slots, FILL_THREADS), _BW_MAX_BLOCKS))
+
+
+# Named for the profiler: a fill dispatches on element WIDTH, not dtype, so
+# the name carries the width in bits and how many elements one store covers
+# (`fill_contig_16bit_v8` is one 16-byte store of eight 2-byte elements).
+@__name(t"fill_contig_{8 * size_of[dtype]()}bit_v{VEC}")
+def _fill_vec_kernel[
+    dtype: DType, VEC: Int
+](
+    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    value: Scalar[dtype],
+    nvec_arg: Int64,
+    size_arg: Int64,
+):
+    """`dst[i] = value` for `size` elements, VEC of them per thread."""
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var nvec = Int(nvec_arg)
+    var size = Int(size_arg)
+    comptime ALIGN = min(16, VEC * size_of[dtype]())
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    var wide = SIMD[dtype, VEC](value)
+    var j = tid
+    while j < nvec:
+        dst_ptr.store[width=VEC, alignment=ALIGN](j * VEC, wide)
+        j += gstride
+    # The tail is at most VEC-1 elements and the grid is never narrower than
+    # one FILL_THREADS-wide block, so the leading threads cover all of it.
+    var t = nvec * VEC + tid
+    if t < size:
+        dst_ptr[t] = value
+
+
+@__name(t"fill_strided_{8 * size_of[dtype]()}bit_r{RANK}_v{VEC}")
+def _fill_strided_kernel[
+    dtype: DType, RANK: Int, VEC: Int
+](
+    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    value: Scalar[dtype],
+    shape: IndexList[MAX_RANK],
+    strides: IndexList[MAX_RANK],
+    total_arg: Int64,
+):
+    """`dst[coords] = value` over the collapsed layout in slots [0, RANK).
+
+    The layout is in units of VEC elements: `total` counts VEC-blocks, every
+    stride is a VEC-block stride, and one thread stores one whole block. The
+    launcher only rewrites a layout that way when the trailing dimension is
+    contiguous and every stride tiles by VEC, so VEC=1 is the general arm.
+    """
+    var total = Int(total_arg)
+    comptime ALIGN = min(16, VEC * size_of[dtype]())
+    var wide = SIMD[dtype, VEC](value)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while i < total:
+        var rest = i
+        var off = 0
+
+        comptime for d in range(RANK - 1, 0, -1):
+            off += (rest % shape[d]) * strides[d]
+            rest = rest // shape[d]
+        off += rest * strides[0]
+        dst_ptr.store[width=VEC, alignment=ALIGN](off * VEC, wide)
+        i += gstride
+
+
+@always_inline
+def _fill_contig[
+    dtype: DType
+](dst_addr: Int, value: Scalar[dtype], size: Int, ctx: DeviceContext) raises:
+    """`dst[i] = value` for `size` contiguous elements.
+
+    The vector width is a compile-time regime picked at runtime: 16 bytes
+    when the base address admits it, one element when it does not. The check
+    has to be on the address itself, not on the element count -- a tensor can
+    start at any element offset inside its storage (`x[1:]`), and an
+    under-aligned wide store is a corruption, not a slowdown. Nothing is
+    needed at the head, exactly because the base is what is being tested; the
+    at-most-VEC-1 elements at the tail are stored one at a time by the
+    leading threads of the same launch, so a ragged length never costs a
+    second kernel.
+
+    Unlike `_cast`'s ladder this stops at two rungs rather than stepping
+    8, 4, 2. Each rung is one more kernel per element width in
+    tensor_holder's cold-start build -- the build every other extension waits
+    behind -- and it only ever serves a base address whose phase is a nonzero
+    multiple of 4 bytes, which is both rare and already off the fast path.
+    """
+    if size <= 0:
+        return
+    var dst_ptr = _make_ptr[dtype](dst_addr)
+
+    if ctx.api() == "cpu":
+
+        @always_inline
+        @parameter
+        @__copy_capture(dst_ptr, value)
+        def func[width: Int, alignment: Int = 1](idx: Coord):
+            dst_ptr.store[width=width](
+                Int(idx[0].value()), SIMD[dtype, width](value)
+            )
+
+        elementwise[func, simd_width=simd_width_of[dtype]()](Coord(size), ctx)
+        return
+
+    comptime if not has_accelerator():
+        raise Error("no GPU accelerator available at compile time")
+    else:
+
+        @always_inline
+        @parameter
+        def _try_fill[VEC: Int]() raises -> Bool:
+            comptime ALIGN = min(16, VEC * size_of[dtype]())
+            if dst_addr % ALIGN != 0:
+                return False
+            var nvec = size // VEC
+            _enqueue_cached[_fill_vec_kernel[dtype, VEC]](
+                ctx,
+                String(t"fill_vec_{dtype}_v{VEC}"),
+                _fill_blocks(nvec),
+                1,
+                1,
+                FILL_THREADS,
+                dst_ptr.as_unsafe_any_origin(),
+                value,
+                Int64(nvec),
+                Int64(size),
+            )
+            return True
+
+        # 16 bytes per store; wider is not a single instruction anywhere.
+        comptime WIDEST = 16 // size_of[dtype]()
+        if _try_fill[WIDEST]():
+            return
+        # VEC=1 needs no alignment, so this always launches.
+        _ = _try_fill[1]()
+
+
+@always_inline
+def _fill_strided[
+    dtype: DType, RANK: Int, VEC: Int
+](
+    dst_addr: Int,
+    value: Scalar[dtype],
+    shape: IndexList[MAX_RANK],
+    strides: IndexList[MAX_RANK],
+    total: Int,
+    ctx: DeviceContext,
+) raises:
+    """`dst[coords] = value` over a COLLAPSED rank-`RANK` layout in VEC units.
+    """
+    var dst_ptr = _make_ptr[dtype](dst_addr)
+
+    if ctx.api() == "cpu":
+
+        @always_inline
+        @parameter
+        @__copy_capture(dst_ptr, value, shape, strides)
+        def func[width: Int, alignment: Int = 1](idx: Coord):
+            var rest = Int(idx[0].value())
+            var off = 0
+
+            comptime for d in range(RANK - 1, 0, -1):
+                off += (rest % shape[d]) * strides[d]
+                rest = rest // shape[d]
+            off += rest * strides[0]
+            dst_ptr.store[width=VEC](off * VEC, SIMD[dtype, VEC](value))
+
+        elementwise[func, simd_width=1](Coord(total), ctx)
+        return
+
+    comptime if not has_accelerator():
+        raise Error("no GPU accelerator available at compile time")
+    else:
+        _enqueue_cached[_fill_strided_kernel[dtype, RANK, VEC]](
+            ctx,
+            String(t"fill_strided_{dtype}_r{RANK}_v{VEC}"),
+            _fill_blocks(total),
+            1,
+            1,
+            FILL_THREADS,
+            dst_ptr.as_unsafe_any_origin(),
+            value,
+            shape,
+            strides,
+            Int64(total),
+        )
+
+
+@always_inline
+def _fill_strided_wide[
+    dtype: DType, RANK: Int
+](
+    dst_addr: Int,
+    value: Scalar[dtype],
+    shape: IndexList[MAX_RANK],
+    strides: IndexList[MAX_RANK],
+    rank: Int,
+    total: Int,
+    ctx: DeviceContext,
+) raises:
+    """`_fill_strided` with the trailing contiguous run vectorized.
+
+    A collapsed layout whose innermost dimension has stride 1 is a stack of
+    contiguous runs -- a channel slice, a batch slice, any dense sub-block --
+    and the scalar arm would write it one element at a time. When the base
+    address is aligned, the run is a whole number of VEC-element blocks and
+    every outer stride tiles by VEC, the whole layout can be re-expressed in
+    units of VEC elements: the index space keeps its shape, each thread's one
+    store becomes 16 bytes wide, and no head or tail appears anywhere. The
+    ladder walks down to VEC=1, which imposes none of those conditions and is
+    therefore the general arm the old kernel always was.
+    """
+
+    @always_inline
+    @parameter
+    def _try_wide[VEC: Int]() raises -> Bool:
+        comptime ALIGN = min(16, VEC * size_of[dtype]())
+        var vshape = shape
+        var vstrides = strides
+        comptime if VEC > 1:
+            if dst_addr % ALIGN != 0:
+                return False
+            if strides[rank - 1] != 1 or shape[rank - 1] % VEC != 0:
+                return False
+            for d in range(rank - 1):
+                if strides[d] % VEC != 0:
+                    return False
+                vstrides[d] = strides[d] // VEC
+            vshape[rank - 1] = shape[rank - 1] // VEC
+            vstrides[rank - 1] = 1
+        _fill_strided[dtype, RANK, VEC](
+            dst_addr, value, vshape, vstrides, total // VEC, ctx
+        )
+        return True
+
+    # Two rungs, not the five `_fill_contig` has: this ladder is crossed with
+    # RANK, so every rung costs one kernel instantiation per rank per element
+    # width, and those show up directly in the cold-start build of
+    # tensor_holder (the module every other extension waits on). A layout that
+    # misses the 16-byte rung is one whose runs or strides are ragged, and a
+    # half-width store on ragged runs is not worth doubling that build.
+    comptime WIDEST = 16 // size_of[dtype]()
+    if _try_wide[WIDEST]():
+        return
+    _ = _try_wide[1]()
+
+
+@always_inline
+def _fill_layout[
+    dtype: DType
+](
+    dst_addr: Int,
+    value: Scalar[dtype],
+    shape: IndexList[MAX_RANK],
+    strides: IndexList[MAX_RANK],
+    ctx: DeviceContext,
+) raises:
+    """`dst[coords] = value` over a rank-8-padded strided layout.
+
+    `dtype` is the *bit-pattern* dtype (`_fill_bits_dtype`), never the
+    tensor's own; `value` is what `_fill_bits` made of the scalar.
+    """
+    var total = 1
+    for i in range(MAX_RANK):
+        total *= shape[i]
+    if total == 0:
+        return
+
+    var cshape = IndexList[MAX_RANK](1)
+    var cstrides = IndexList[MAX_RANK](0)
+    var rank = _collapse_fill_layout(shape, strides, cshape, cstrides)
+    var count = 1
+    for i in range(rank):
+        count *= cshape[i]
+
+    if rank == 1 and cstrides[0] == 1:
+        _fill_contig[dtype](dst_addr, value, count, ctx)
+    elif rank <= 2:
+        # A collapsed rank of 1 is a single non-contiguous run; it rides the
+        # rank-2 instance, whose padded trailing slot divides by 1 and adds
+        # nothing, rather than earning four kernels of its own.
+        _fill_strided_wide[dtype, 2](
+            dst_addr, value, cshape, cstrides, rank, count, ctx
+        )
+    else:
+        # Ranks 3-8 share the rank-8 instance, whose padded trailing slots
+        # divide by 1 exactly as the uncollapsed kernel always did, and they
+        # stay scalar: a layout that survives the collapse with three or more
+        # mutually incompatible stride groups is rare enough that widening it
+        # is not worth another four kernels in tensor_holder's cold-start
+        # build (see `_fill_strided_wide`).
+        _fill_strided[dtype, MAX_RANK, 1](
+            dst_addr, value, cshape, cstrides, count, ctx
+        )
 
 
 @always_inline
