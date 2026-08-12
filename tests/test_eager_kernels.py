@@ -2363,19 +2363,21 @@ def test_fast_sum_nonadjacent_or_strided_fallback(mojo_device):
     )
 
 
-def test_fast_reduction_library_tier(mojo_device):
-    """Huge-col reductions route to the stdlib reduction library (GPU: rows <=
-    128 and cols >= 2**20; MAX-CPU: always) — exercise that tier, which no other
-    test reaches. Integer-valued floats keep every f32 partial sum exact, so the
-    comparisons are bit-exact instead of tolerance-based."""
-    # rows == 1: full-reduction layout (the two-phase GPU tier's main case).
+def test_fast_reduction_split_tier(mojo_device):
+    """Few outputs, huge reduce extent: the split-the-reduce-axis path, where
+    stage 1 writes per-shard accumulators to a workspace and a merge kernel
+    folds them.  Integer-valued floats keep every f32 partial sum exact, so the
+    comparisons are bit-exact whatever order the shards merge in — which is the
+    point: an arbitrary split must reproduce the sequential answer."""
+    # rows == 1: full-reduction layout, one output over millions of elements.
     x = torch.randint(-4, 5, (1, 2**20 + 7)).float()
     xd = x.to(mojo_device)
     torch.testing.assert_close(xd.sum(-1).cpu(), x.sum(-1))
     torch.testing.assert_close(xd.amax(-1).cpu(), x.amax(-1))
     torch.testing.assert_close(torch.any(xd, -1).cpu(), torch.any(x, -1))
 
-    # rows == 128 (gate boundary): per-row outputs must land in the right rows.
+    # A handful of rows: still under-saturated, so still split, but now the
+    # merge has to keep per-row outputs apart.
     y = torch.randint(-4, 5, (128, 2**20)).float()
     y[5] = 0.0  # give any() a False row
     yd = y.to(mojo_device)
@@ -2385,9 +2387,9 @@ def test_fast_reduction_library_tier(mojo_device):
 
 
 def test_fast_anyall_nan_is_truthy(mojo_device):
-    """torch treats NaN as truthy in any/all. Cover both dispatch tiers: the
-    small shape uses the block kernel on GPU (and the library on MAX-CPU), the
-    huge shape uses the library tier everywhere."""
+    """torch treats NaN as truthy in any/all. Cover both launch regimes: the
+    small shape fuses into one launch, the huge shape splits the reduce axis
+    across blocks and merges."""
     small_any = torch.zeros(2, 100)
     small_any[0, 0] = float("nan")
     small_all = torch.full((2, 100), float("nan"))
@@ -2401,6 +2403,238 @@ def test_fast_anyall_nan_is_truthy(mojo_device):
     for x in (small_all, huge_all):
         got = torch.all(x.to(mojo_device), -1).cpu()
         torch.testing.assert_close(got, torch.all(x, -1))
+
+
+# --------------------------------------------------------------------------
+# The generic reduction skeleton (reduce_skeleton.mojo).  One accumulator per
+# op over one (outer, reduce, inner) geometry, so these cases are written once
+# and parametrized by the op rather than once per op.
+#
+# `_REDUCE_OPS` maps a name to (mojo callable, torch reference); everything
+# below runs the whole table so a new accumulator inherits the coverage.
+# --------------------------------------------------------------------------
+
+_REDUCE_OPS = {
+    "sum": lambda t, **kw: torch.sum(t, **kw),
+    "mean": lambda t, **kw: torch.mean(t, **kw),
+    "amax": lambda t, **kw: torch.amax(t, **kw),
+    "amin": lambda t, **kw: torch.amin(t, **kw),
+    "norm": lambda t, **kw: torch.linalg.vector_norm(t, **kw),
+    "all": lambda t, **kw: torch.all(t, **kw),
+    "any": lambda t, **kw: torch.any(t, **kw),
+}
+
+
+@pytest.mark.parametrize("op", list(_REDUCE_OPS))
+@pytest.mark.parametrize(
+    "shape,dim",
+    [
+        # Straddle the split threshold on the CONTIGUOUS axis: the split count
+        # is derived from the runtime SM count, so these bracket it on any card
+        # rather than at one fitted size.  Prime-ish extents leave the last
+        # shard short, which is what an identity-seeded merge has to tolerate.
+        ((1048583,), 0),  # one output, millions deep: maximum splitting
+        ((3, 400001), 1),  # a few outputs: still split
+        ((4099, 1031), 1),  # many outputs: fused, block per row
+        ((5003, 37), 1),  # many SHORT rows: fused, warp per row
+        # ... and on the STRIDED axis, where a non-trailing reduce dim is read
+        # where it lies instead of being materialized transposed.
+        ((400001, 3), 0),
+        ((2, 65537), 0),
+        ((1031, 4099), 0),
+        ((37, 5003), 0),
+        # Awkward rank-3 interiors: outer > 1 AND inner > 1.
+        ((7, 129, 33), 1),
+        ((3, 5, 7), 1),
+    ],
+)
+def test_fast_reduce_skeleton_layouts_match_cpu(mojo_gpu, shape, dim, op):
+    fn = _REDUCE_OPS[op]
+    if op in ("all", "any"):
+        x = torch.rand(shape) < 0.5
+    else:
+        x = torch.rand(shape) * 0.9 + 0.05
+    ours = fn(x.to(mojo_gpu), dim=dim).cpu()
+    if op in ("all", "any"):
+        torch.testing.assert_close(ours, fn(x, dim=dim))
+    else:
+        # fp64 reference on the same values: this measures the reduction
+        # order, not the input dtype.
+        expected = fn(x.double(), dim=dim)
+        torch.testing.assert_close(ours.double(), expected, atol=1e-6, rtol=1e-4)
+
+
+@pytest.mark.parametrize("op", list(_REDUCE_OPS))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dim", [0, 1])
+def test_fast_reduce_skeleton_nonfinite_matches_torch(mojo_gpu, op, dtype, dim):
+    """NaN and +/-inf, per op, against stock torch rather than against a rule.
+
+    The rules genuinely differ: amax/amin PROPAGATE NaN (a plain `max()` does
+    not, which is why the accumulator carries its own combine), sum and mean
+    inherit it through the arithmetic, the L2 norm squares it, and any/all
+    treat NaN as TRUTHY because their map is a nonzero test and not a
+    comparison.  Every element of the grid below is exercised on both layouts,
+    since the contiguous and strided kernels seed and combine separately.
+    """
+    if op in ("all", "any") and dtype is torch.bfloat16:
+        pytest.skip("any/all take the bool fast path; dtype is not the axis")
+    nan, inf = float("nan"), float("inf")
+    x = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [nan, 2.0, 3.0, 4.0],
+            [1.0, inf, 3.0, 4.0],
+            [1.0, 2.0, -inf, 4.0],
+            [inf, -inf, 3.0, 4.0],
+            [nan, inf, -inf, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=dtype,
+    )
+    fn = _REDUCE_OPS[op]
+    expected = fn(x, dim=dim)
+    ours = fn(x.to(mojo_gpu), dim=dim).cpu()
+    if ours.dtype == torch.bool:
+        torch.testing.assert_close(ours, expected)
+    else:
+        torch.testing.assert_close(
+            ours.float(), expected.float(), equal_nan=True, atol=1e-2, rtol=1e-2
+        )
+
+
+@pytest.mark.parametrize("op", list(_REDUCE_OPS))
+@pytest.mark.parametrize(
+    "shape,dim",
+    [
+        ((3, 1), 1),  # reduce extent of exactly 1
+        ((1, 3), 1),  # one output
+        ((1, 1), 1),
+        ((3, 0), 1),  # EMPTY reduce axis: identity, or torch's own error
+        ((0, 3), 1),  # empty output
+        ((3, 0), 0),
+    ],
+)
+def test_fast_reduce_skeleton_degenerate_extents_match_torch(mojo_gpu, shape, dim, op):
+    """A zero-length reduce axis is where an identity-seeded accumulator and a
+    zero-filled workspace part company, and where each op's own rule shows: sum
+    answers 0, the L2 norm 0, all true, any false, mean nan (0/0) — and amax /
+    amin refuse, because torch refuses ("Expected reduction dim to have
+    non-zero size"): there is no element to select.  A reduction with no
+    OUTPUTS is an error for nobody and writes nothing."""
+    fn = _REDUCE_OPS[op]
+    x = (torch.rand(shape) < 0.5) if op in ("all", "any") else torch.rand(shape)
+    try:
+        expected = fn(x, dim=dim)
+    except (RuntimeError, IndexError) as exc:
+        # The device declines the same cases; it reports its own
+        # NotImplementedError rather than reproducing torch's message.
+        with pytest.raises((type(exc), NotImplementedError)):
+            fn(x.to(mojo_gpu), dim=dim)
+        return
+    ours = fn(x.to(mojo_gpu), dim=dim).cpu()
+    if ours.dtype == torch.bool:
+        torch.testing.assert_close(ours, expected)
+    else:
+        torch.testing.assert_close(ours, expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("op", ["all", "any"])
+@pytest.mark.parametrize("size", [1, 255, 4096, (1 << 22) - 1, (1 << 22) + 1, 1 << 24])
+def test_fast_bool_full_reduce_settles_early_and_late(mojo_gpu, op, size):
+    """Full any()/all() over bool, including the aten cap at 4.2M elements that
+    separates the AnyBool/AllBool entry from the AnySpec/AllSpec one, and the
+    split threshold above it.  Both the settled-immediately case (element 0
+    decides) and the settled-at-the-very-end case must give torch's answer: a
+    reduction may not stop early in a way that skips a later element."""
+    fn = torch.all if op == "all" else torch.any
+    seed = (
+        torch.ones(size, dtype=torch.bool)
+        if op == "all"
+        else torch.zeros(size, dtype=torch.bool)
+    )
+    for position in (0, size // 2, size - 1, None):
+        x = seed.clone()
+        if position is not None:
+            x[position] = op != "all"
+        assert bool(fn(x.to(mojo_gpu)).cpu()) == bool(fn(x)), (
+            f"{op} size={size} flipped at {position}"
+        )
+
+
+@pytest.mark.parametrize(
+    "spec,fn",
+    [
+        (("reduction_ops", "SumSpec"), lambda t: torch.sum(t, dim=0)),
+        (("reduction_ops", "AmaxSpec"), lambda t: torch.amax(t, dim=0)),
+        (("reduction_ops", "AminSpec"), lambda t: torch.amin(t, dim=0)),
+        (("reduction_ops", "NormSpec"), lambda t: torch.linalg.vector_norm(t, dim=0)),
+        (("reduction_ops", "MinDimSpec"), lambda t: torch.min(t, dim=0)),
+        (("nn_ops", "MeanSpec"), lambda t: torch.mean(t, dim=0)),
+    ],
+)
+def test_fast_reduce_strided_axis_skips_materialization(
+    mojo_gpu, monkeypatch, spec, fn
+):
+    """Reducing a leading dim must reach the bridge with its ORIGINAL dims.
+
+    If it did not, Python would have permuted the operand and materialized a
+    full transposed copy first, and the bridge would see the trailing dim
+    instead — an extra read plus an extra write of the whole tensor, which was
+    the entire cost of a `dim=0` reduction before the strided-axis kernel.
+    """
+    target = (f"{spec[0]}.mojo", spec[1])
+    native_calls = _spy_defined_native_calls(monkeypatch, {target})
+    x = torch.randn(64, 48).to(mojo_gpu)
+    _ = fn(x)
+    assert len(native_calls[target]) == 1
+    assert native_calls[target][0][0][1] == (0,)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape,dim",
+    [((4099, 1031), 1), ((5003, 37), 1), ((1031, 4099), 0), ((1 << 20,), 0)],
+)
+def test_fast_vector_norm_matches_torch(mojo_gpu, shape, dim, dtype):
+    """linalg_vector_norm is one pass now (sum of squares, root in the
+    finalize) rather than mul -> sum -> sqrt with a full-size temporary."""
+    x = (torch.rand(shape) * 0.9 + 0.05).to(dtype)
+    ours = torch.linalg.vector_norm(x.to(mojo_gpu), dim=dim).cpu()
+    expected = torch.linalg.vector_norm(x.double(), dim=dim)
+    torch.testing.assert_close(ours.double(), expected, atol=0, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape,dim",
+    [((4099, 1031), 1), ((5003, 37), 1), ((1031, 4099), 0), ((1 << 20,), 0)],
+)
+def test_fast_min_dim_layouts_and_ties(mojo_gpu, shape, dim, dtype):
+    """min.dim rides the (value, index) arg-reduction now, so it inherits the
+    split path, the strided-axis kernel and first-occurrence tie-breaking."""
+    x = (torch.rand(shape) * 0.9 + 0.05).to(dtype)
+    # Force ties so the index answer is only right if the lower one wins.
+    flat = x.reshape(-1)
+    flat[: flat.numel() // 3] = 0.05
+    values, indices = torch.min(x.to(mojo_gpu), dim=dim)
+    exp_values, exp_indices = torch.min(x, dim=dim)
+    torch.testing.assert_close(values.cpu(), exp_values)
+    torch.testing.assert_close(indices.cpu(), exp_indices)
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_fast_min_dim_propagates_nan_like_torch(mojo_gpu, dim):
+    """torch's min.dim answers with the FIRST NaN, not with the smallest
+    number; the old block kernel's plain `<` silently answered the number."""
+    nan = float("nan")
+    x = torch.tensor(
+        [[1.0, nan, -7.0, 3.0], [nan, nan, 2.0, 1.0], [5.0, 4.0, 3.0, 2.0]]
+    )
+    values, indices = torch.min(x.to(mojo_gpu), dim=dim)
+    exp_values, exp_indices = torch.min(x, dim=dim)
+    torch.testing.assert_close(values.cpu(), exp_values, equal_nan=True)
+    torch.testing.assert_close(indices.cpu(), exp_indices)
 
 
 def test_fast_max_pool2d(mojo_device):
@@ -3084,6 +3318,107 @@ def test_fast_bool_fill_scalar(mojo_device, value):
     assert returned is not actual
     assert returned._ptr == actual._ptr
     torch.testing.assert_close(actual.cpu(), torch.full((3, 5), value))
+
+
+# One dtype per element width the fill kernels dispatch on: 8, 4, 2 and 1
+# bytes. The kernel is layout-only below that -- the value's bits are cast on
+# the host -- so widening this list tests the host cast, not the kernel.
+FILL_WIDTH_DTYPES = [torch.int64, torch.float32, torch.bfloat16, torch.bool]
+
+
+def _fill_check(built, dtype, value, mojo_device, base_numel=8192):
+    """Fill `built(base)` on both CPU torch and the mojo device; compare the
+    WHOLE base, so a kernel that writes outside the view is caught."""
+    host = torch.zeros(base_numel, dtype=dtype)
+    device = host.clone().to(mojo_device)
+    built(host).fill_(value)
+    built(device).fill_(value)
+    assert torch.equal(device.cpu(), host)
+
+
+@pytest.mark.parametrize("dtype", FILL_WIDTH_DTYPES)
+def test_fast_fill_scalar_ranks_one_through_eight(mojo_device, dtype):
+    """Every rank the rank-8 padded layout can carry collapses correctly."""
+    value = True if dtype is torch.bool else 3
+    for rank in range(1, 9):
+        shape = tuple([2] * (rank - 1) + [5])
+        numel = 5 * 2 ** (rank - 1)
+        _fill_check(
+            lambda base, s=shape, n=numel: base[:n].view(s), dtype, value, mojo_device
+        )
+
+
+@pytest.mark.parametrize("dtype", FILL_WIDTH_DTYPES)
+def test_fast_fill_scalar_lengths_exercise_the_scalar_tail(mojo_device, dtype):
+    """Lengths that are not a whole number of 16-byte stores, plus empty.
+
+    A zero-element fill must be a no-op rather than a launch, and any length
+    from 1 to one below the widest vector leaves only the tail.
+    """
+    value = True if dtype is torch.bool else 3
+    for length in (0, 1, 2, 3, 5, 7, 9, 15, 16, 17, 31, 33, 4099):
+        _fill_check(lambda base, n=length: base[:n], dtype, value, mojo_device)
+
+
+@pytest.mark.parametrize("dtype", FILL_WIDTH_DTYPES)
+def test_fast_fill_scalar_offset_views_at_every_alignment_phase(mojo_device, dtype):
+    """A view can start at any element offset, so the vector width is chosen
+    from the runtime base ADDRESS; every 16-byte phase must stay correct."""
+    value = True if dtype is torch.bool else 3
+    for offset in range(17):
+        _fill_check(lambda base, o=offset: base[o : o + 333], dtype, value, mojo_device)
+
+
+@pytest.mark.parametrize("dtype", FILL_WIDTH_DTYPES)
+def test_fast_fill_scalar_strided_layouts(mojo_device, dtype):
+    """Layouts the collapse must either flatten or hand to the strided arm.
+
+    The transposed and permuted views are dense, so they must come out
+    identical to a contiguous fill; the column, the step and the 2-D slice
+    stay genuinely strided; `expand` repeats a stride-0 dimension, whose
+    writes are redundant for a constant.
+    """
+    value = True if dtype is torch.bool else 3
+    layouts = [
+        lambda base: base[:6000].view(60, 100).t(),
+        lambda base: base[:6000].view(60, 100)[:, 3],
+        lambda base: base[:6000:7],
+        lambda base: base[:6000].view(60, 100)[10:50, 20:90],
+        lambda base: base[:5040].view(6, 7, 8, 15).permute(2, 0, 3, 1),
+        lambda base: base[:100].view(1, 100).expand(7, 100),
+        lambda base: base[:1].view(()),
+    ]
+    for build in layouts:
+        _fill_check(build, dtype, value, mojo_device)
+
+
+@pytest.mark.parametrize("dtype", FILL_WIDTH_DTYPES)
+def test_fast_zero__delegates_to_the_fill_bridge(mojo_device, dtype):
+    """aten::zero_ is aten::fill_.Scalar with 0, on any layout."""
+    host = torch.ones(1234, dtype=dtype)
+    device = host.clone().to(mojo_device)
+    host.view(2, 617).t().zero_()
+    device.view(2, 617).t().zero_()
+    assert torch.equal(device.cpu(), host)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.int64, torch.int32, torch.uint8]
+)
+def test_fast_fill_scalar_value_conversion_matches_cpu(mojo_device, dtype):
+    """The scalar is narrowed to the tensor's dtype exactly as ATen does:
+    floats truncate into integer tensors, and `bool` -- a Python `int`
+    subclass ATen accepts for every scalar fill -- lands as 0 or 1."""
+    values = [0, 7, True, False, 0.0, 2.75]
+    if dtype is not torch.uint8:
+        values += [-1.5, -3]
+    if dtype.is_floating_point:
+        values += [float("inf"), float("-inf"), float("nan")]
+    for value in values:
+        host = torch.empty(33, dtype=dtype).fill_(value)
+        device = torch.empty(33, dtype=dtype).to(mojo_device).fill_(value).cpu()
+        assert torch.equal(device.isnan(), host.isnan())
+        assert torch.equal(device.nan_to_num(0.0), host.nan_to_num(0.0))
 
 
 def test_fast_gpu_portability_kernels(mojo_device):

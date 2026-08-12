@@ -71,6 +71,9 @@ from op_utils import (
     MAX_RANK,
     _check_into,
     _enqueue_cached,
+    _fill_bits,
+    _fill_bits_dtype,
+    _fill_contig,
     _gs_blocks,
     _make_ptr,
     _raw_ctx,
@@ -784,33 +787,19 @@ def _int_scalar_elementwise[
 @always_inline
 def _fill[
     dtype: DType
-](
-    out_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    value: Float64,
-    size: Int,
-    ctx: DeviceContext,
-) raises:
-    var scalar = value.cast[dtype]()
+](out_addr: Int, value: Float64, size: Int, ctx: DeviceContext) raises:
+    """`out[i] = value` over a contiguous buffer.
 
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr, scalar)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        out_ptr.store[width=width](i, SIMD[dtype, width](scalar))
-
-    if ctx.api() == "cpu":
-        elementwise[func, simd_width=simd_width_of[dtype]()](Coord(size), ctx)
-    else:
-        comptime if has_accelerator():
-            comptime if (
-                dtype == DType.float64 and has_apple_gpu_accelerator()
-            ):
-                raise Error("float64 is not supported on Apple GPU")
-            else:
-                elementwise[func, simd_width=1, target="gpu"](Coord(size), ctx)
-        else:
-            raise Error("no GPU accelerator available at compile time")
+    Shares the whole fill implementation with the in-place `StridedFill`
+    bridge (`op_utils._fill_contig`): both write one repeated bit pattern,
+    so both store it through the same-width unsigned integer type at the
+    widest vector width the base address admits.
+    """
+    comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
+        if ctx.api() != "cpu":
+            raise Error("float64 is not supported on Apple GPU")
+    comptime BITS = _fill_bits_dtype[dtype]()
+    _fill_contig[BITS](out_addr, _fill_bits[dtype, BITS](value), size, ctx)
 
 
 @always_inline
@@ -1376,7 +1365,7 @@ def _fill_spec_into_go(value_o: PyObjectPtr, out_o: PyObjectPtr) raises:
         comptime for dt in SPEC_FILL_DTYPES:
             comptime if _dtype_out_on[0, dt]():
                 if out.dtype == dt:
-                    _fill[dt](_make_ptr[dt](out.ptr), value, out.numel, ctx)
+                    _fill[dt](out.ptr, value, out.numel, ctx)
 
 
 # ---------------------------------------------------------------------------

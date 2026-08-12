@@ -1,6 +1,10 @@
 # ===----------------------------------------------------------------------=== #
-# Arg-reductions (argmin / argmax): the index of the first extremum along one
-# contiguous interval of dimensions.
+# Reductions with a (value, index) payload: argmin / argmax, which keep the
+# index of the first extremum along one contiguous interval of dimensions, and
+# min.dim / max.dim, which keep both. `with_values` is the only difference
+# between them -- the scan, the tie-break, the split policy and the merge are
+# one mechanism, so a fix to first-occurrence or NaN handling lands on all
+# four ops at once.
 #
 # One mechanism, shared by both bridges -- reduction_ops owns ArgminSpec and
 # nn_ops owns ArgmaxSpec, so the direction is a comptime parameter here and
@@ -59,7 +63,7 @@
 # threads instead of 456 of 256) and its PDL launch attributes.
 # ===----------------------------------------------------------------------=== #
 
-from max.gpu.host import DeviceAttribute, DeviceContext
+from max.gpu.host import DeviceContext
 from max.gpu.sync import barrier
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
@@ -76,11 +80,11 @@ from std.utils.static_tuple import StaticTuple
 
 from op_utils import (
     TensorSpec,
+    _adjacent_reduce_geom,
     _enqueue_cached,
     _make_ptr,
     _parallel_for,
-    _raw_tuple_int,
-    _raw_tuple_len,
+    _runtime_sm_count,
 )
 from std.python._cpython import PyObjectPtr
 
@@ -395,6 +399,75 @@ def _argreduce_cols_split_kernel[
 
 
 # ---------------------------------------------------------------------------
+# (value, index) stage 1: the same two scans, keeping the value as well.
+# Only the UNSPLIT kernels need their own entry: the split kernels above
+# already write (value, index) pairs into the workspace, so min.dim reuses
+# them verbatim and differs only in the merge.
+# ---------------------------------------------------------------------------
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(AR_THREADS))
+)
+@__name(t"minmax_rows_block_{dtype}_min{is_min}_v{VEC}")
+def _minmax_rows_kernel[
+    dtype: DType, is_min: Bool, VEC: Int
+](
+    val_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    idx_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    cols_arg: Int64,
+):
+    """One block per row (grid.x = rows), for the saturated regime."""
+    var cols = Int(cols_arg)
+    var tid = Int(thread_idx.x)
+    var r = Int(block_idx.x)
+    var best_val = Scalar[dtype](0)
+    var best_idx = Int64(-1)
+    _ar_scan_row[dtype, is_min, VEC](
+        in_ptr, r * cols, 0, cols, tid, best_val, best_idx
+    )
+    _ar_block_merge[dtype, is_min](tid, best_val, best_idx)
+    if tid == 0:
+        val_ptr[r] = best_val
+        idx_ptr[r] = best_idx
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(AR_THREADS))
+)
+@__name(t"minmax_cols_{dtype}_min{is_min}")
+def _minmax_cols_kernel[
+    dtype: DType, is_min: Bool
+](
+    val_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    idx_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    reduce_arg: Int64,
+    inner_arg: Int64,
+    lanes_arg: Int64,
+):
+    """One thread per output column; see `_argreduce_cols_kernel`."""
+    var reduce_n = Int(reduce_arg)
+    var inner = Int(inner_arg)
+    var lanes = Int(lanes_arg)
+    var o = Int(block_idx.x) // lanes
+    var i = (Int(block_idx.x) % lanes) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= inner:
+        return
+    var base = o * reduce_n * inner + i
+    var best_val = in_ptr[base]
+    var best_idx = Int64(0)
+    for r in range(1, reduce_n):
+        var v = in_ptr[base + r * inner]
+        if _ar_take_next[dtype, is_min](v, best_val):
+            best_val = v
+            best_idx = Int64(r)
+    val_ptr[o * inner + i] = best_val
+    idx_ptr[o * inner + i] = best_idx
+
+
+# ---------------------------------------------------------------------------
 # Workspace merge (shared by both split paths)
 # ---------------------------------------------------------------------------
 
@@ -431,63 +504,68 @@ def _argreduce_merge_kernel[
         out_ptr[p] = best_idx
 
 
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(AR_THREADS))
+)
+@__name(t"minmax_merge_{dtype}_min{is_min}")
+def _minmax_merge_kernel[
+    dtype: DType, is_min: Bool
+](
+    val_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    idx_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    ws_val: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    ws_idx: UnsafePointer[Scalar[DType.int64], ImmutAnyOrigin],
+    splits_arg: Int64,
+):
+    """`_argreduce_merge_kernel` keeping the winning value as well."""
+    var splits = Int(splits_arg)
+    var tid = Int(thread_idx.x)
+    var p = Int(block_idx.x)
+    var base = p * splits
+    var best_val = Scalar[dtype](0)
+    var best_idx = Int64(-1)
+    for s in range(tid, splits, AR_THREADS):
+        if _ar_better[dtype, is_min](
+            ws_val[base + s], ws_idx[base + s], best_val, best_idx
+        ):
+            best_val = ws_val[base + s]
+            best_idx = ws_idx[base + s]
+    _ar_block_merge[dtype, is_min](tid, best_val, best_idx)
+    if tid == 0:
+        val_ptr[p] = best_val
+        idx_ptr[p] = best_idx
+
+
 # ---------------------------------------------------------------------------
 # Host-side dispatch
 # ---------------------------------------------------------------------------
 
 
 @always_inline
-def _ar_adjacent_geom(
-    a: TensorSpec,
-    rdims_t: PyObjectPtr,
-    mut outer: Int,
-    mut reduce_n: Int,
-    mut inner: Int,
-) raises -> Bool:
-    """Collapse a contiguous, adjacent, ascending reduce interval into runtime
-    (outer, reduce, inner) dimensions; False when the layout is anything else.
+def _ar_cpu_scan[
+    dtype: DType, is_min: Bool
+](
+    in_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    base: Int,
+    stride: Int,
+    n: Int,
+) -> Tuple[Scalar[dtype], Int]:
+    """One slice, sequentially: the CPU branch of both entry points.
 
-    `inner == 1` is the trailing case (the row kernels); `inner > 1` is the
-    strided one, which is exactly the reduction Python would otherwise have to
-    materialize a transposed copy for. All three are runtime values."""
-    if not a.contig:
-        return False
-    var n = _raw_tuple_len(rdims_t)
-    if n == 0 or n > a.rank:
-        return False
-    var first = _raw_tuple_int(rdims_t, 0)
-    if first < 0 or first + n > a.rank:
-        return False
-    for k in range(n):
-        if _raw_tuple_int(rdims_t, k) != first + k:
-            return False
-    outer = 1
-    reduce_n = 1
-    inner = 1
-    for d in range(first):
-        outer *= a.dim(d)
-    for d in range(first, first + n):
-        reduce_n *= a.dim(d)
-    for d in range(first + n, a.rank):
-        inner *= a.dim(d)
-    return True
-
-
-@always_inline
-def _ar_sm_count(ctx: DeviceContext) -> Int:
-    """SMs / CUs of the device actually in hand.
-
-    The compile-time `default_device_info` describes the architecture the
-    variant was built for, which is the right fallback but not the right
-    answer: two cards of one architecture differ here (H100 PCIe 114 vs SXM
-    132), and the split factor is derived from it."""
-    comptime fallback = ctx.default_device_info.sm_count
-    var count = 0
-    try:
-        count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
-    except:
-        count = fallback
-    return count if count > 0 else fallback
+    Factored out so the `with_values` and index-only closures below can be
+    written separately -- which they must be, because a `@__copy_capture` list
+    is not comptime-conditional, and capturing an unused values pointer would
+    change the parallel-for kernel argmin/argmax emit for no reason -- without
+    the scan itself existing twice.
+    """
+    var best = in_ptr[base]
+    var best_idx = 0
+    for r in range(1, n):
+        var v = in_ptr[base + r * stride]
+        if _ar_take_next[dtype, is_min](v, best):
+            best = v
+            best_idx = r
+    return (best, best_idx)
 
 
 @always_inline
@@ -502,7 +580,7 @@ def _ar_splits(
     4096x4096 dim-0 reduction when it was confused for it. 1 means the grid
     already fills the device; the split path exists for the other end (a full
     reduction is one block)."""
-    var target = AR_SPLIT_WAVES * _ar_sm_count(ctx)
+    var target = AR_SPLIT_WAVES * _runtime_sm_count(ctx)
     if blocks >= target or blocks <= 0:
         return 1
     var by_work = reduce_n // min_chunk
@@ -513,56 +591,91 @@ def _ar_splits(
 
 @always_inline
 def _ar_merge_launch[
-    dtype: DType, is_min: Bool
+    dtype: DType, is_min: Bool, with_values: Bool
 ](
     out_addr: Int,
+    val_addr: Int,
     ws_val: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     ws_idx: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
     outputs: Int,
     splits: Int,
     ctx: DeviceContext,
 ) raises:
-    _enqueue_cached[_argreduce_merge_kernel[dtype, is_min]](
-        ctx,
-        String(t"argreduce_merge_{dtype}_{is_min}"),
-        outputs,
-        1,
-        1,
-        AR_THREADS,
-        _make_ptr[DType.int64](out_addr).as_unsafe_any_origin(),
-        ws_val.as_immutable(),
-        ws_idx.as_immutable(),
-        Int64(splits),
-    )
+    comptime if with_values:
+        _enqueue_cached[_minmax_merge_kernel[dtype, is_min]](
+            ctx,
+            String(t"minmax_merge_{dtype}_{is_min}"),
+            outputs,
+            1,
+            1,
+            AR_THREADS,
+            _make_ptr[dtype](val_addr).as_unsafe_any_origin(),
+            _make_ptr[DType.int64](out_addr).as_unsafe_any_origin(),
+            ws_val.as_immutable(),
+            ws_idx.as_immutable(),
+            Int64(splits),
+        )
+    else:
+        _enqueue_cached[_argreduce_merge_kernel[dtype, is_min]](
+            ctx,
+            String(t"argreduce_merge_{dtype}_{is_min}"),
+            outputs,
+            1,
+            1,
+            AR_THREADS,
+            _make_ptr[DType.int64](out_addr).as_unsafe_any_origin(),
+            ws_val.as_immutable(),
+            ws_idx.as_immutable(),
+            Int64(splits),
+        )
 
 
 @always_inline
 def _argreduce_rows[
-    dtype: DType, is_min: Bool
-](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
-    """argmin/argmax over the trailing (contiguous) axis of a (rows, cols)
-    buffer; `rows == 1` is the full reduction."""
+    dtype: DType, is_min: Bool, with_values: Bool
+](
+    out_addr: Int,
+    val_addr: Int,
+    in_addr: Int,
+    rows: Int,
+    cols: Int,
+    ctx: DeviceContext,
+) raises:
+    """argmin/argmax (and min.dim/max.dim, when `with_values`) over the
+    trailing (contiguous) axis of a (rows, cols) buffer; `rows == 1` is the
+    full reduction."""
     var out_ptr = _make_ptr[DType.int64](out_addr)
+    var val_ptr = _make_ptr[dtype](val_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
 
     if ctx.api() == "cpu":
+        comptime if with_values:
 
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var r = Int(idx[0].value())
-            var base = r * cols
-            var best = in_ptr[base]
-            var best_idx = 0
-            for j in range(1, cols):
-                var v = in_ptr[base + j]
-                if _ar_take_next[dtype, is_min](v, best):
-                    best = v
-                    best_idx = j
-            out_ptr[r] = Int64(best_idx)
+            @always_inline
+            @parameter
+            @__copy_capture(out_ptr, val_ptr, in_ptr)
+            def func_v[width: Int, alignment: Int = 1](idx: Coord):
+                var r = Int(idx[0].value())
+                var best, best_idx = _ar_cpu_scan[dtype, is_min](
+                    in_ptr, r * cols, 1, cols
+                )
+                out_ptr[r] = Int64(best_idx)
+                val_ptr[r] = best
 
-        _parallel_for[func](rows, ctx)
+            _parallel_for[func_v](rows, ctx)
+        else:
+
+            @always_inline
+            @parameter
+            @__copy_capture(out_ptr, in_ptr)
+            def func[width: Int, alignment: Int = 1](idx: Coord):
+                var r = Int(idx[0].value())
+                var _best, best_idx = _ar_cpu_scan[dtype, is_min](
+                    in_ptr, r * cols, 1, cols
+                )
+                out_ptr[r] = Int64(best_idx)
+
+            _parallel_for[func](rows, ctx)
         return
 
     comptime if not has_accelerator():
@@ -588,17 +701,31 @@ def _argreduce_rows[
             ):
                 return False
             if splits <= 1:
-                _enqueue_cached[_argreduce_rows_kernel[dtype, is_min, VEC]](
-                    ctx,
-                    String(t"argreduce_rows_{dtype}_{is_min}_v{VEC}"),
-                    rows,
-                    1,
-                    1,
-                    AR_THREADS,
-                    out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
-                    Int64(cols),
-                )
+                comptime if with_values:
+                    _enqueue_cached[_minmax_rows_kernel[dtype, is_min, VEC]](
+                        ctx,
+                        String(t"minmax_rows_{dtype}_{is_min}_v{VEC}"),
+                        rows,
+                        1,
+                        1,
+                        AR_THREADS,
+                        val_ptr.as_unsafe_any_origin(),
+                        out_ptr.as_unsafe_any_origin(),
+                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        Int64(cols),
+                    )
+                else:
+                    _enqueue_cached[_argreduce_rows_kernel[dtype, is_min, VEC]](
+                        ctx,
+                        String(t"argreduce_rows_{dtype}_{is_min}_v{VEC}"),
+                        rows,
+                        1,
+                        1,
+                        AR_THREADS,
+                        out_ptr.as_unsafe_any_origin(),
+                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        Int64(cols),
+                    )
                 return True
             var ws_val = ctx.enqueue_create_buffer[dtype](rows * splits)
             var ws_idx = ctx.enqueue_create_buffer[DType.int64](rows * splits)
@@ -617,8 +744,8 @@ def _argreduce_rows[
                 Int64(cols),
                 Int64(chunk),
             )
-            _ar_merge_launch[dtype, is_min](
-                out_addr, ws_val_ptr, ws_idx_ptr, rows, splits, ctx
+            _ar_merge_launch[dtype, is_min, with_values](
+                out_addr, val_addr, ws_val_ptr, ws_idx_ptr, rows, splits, ctx
             )
             return True
 
@@ -638,39 +765,54 @@ def _argreduce_rows[
 
 @always_inline
 def _argreduce_cols[
-    dtype: DType, is_min: Bool
+    dtype: DType, is_min: Bool, with_values: Bool
 ](
     out_addr: Int,
+    val_addr: Int,
     in_addr: Int,
     outer: Int,
     reduce_n: Int,
     inner: Int,
     ctx: DeviceContext,
 ) raises:
-    """argmin/argmax over a STRIDED axis: the input is (outer, reduce, inner)
-    row-major and the index runs over the middle axis."""
+    """argmin/argmax (and min.dim/max.dim, when `with_values`) over a STRIDED
+    axis: the input is (outer, reduce, inner) row-major and the index runs over
+    the middle axis."""
     var out_ptr = _make_ptr[DType.int64](out_addr)
+    var val_ptr = _make_ptr[dtype](val_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
     var outputs = outer * inner
 
     if ctx.api() == "cpu":
+        comptime if with_values:
 
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var p = Int(idx[0].value())
-            var base = (p // inner) * reduce_n * inner + (p % inner)
-            var best = in_ptr[base]
-            var best_idx = 0
-            for r in range(1, reduce_n):
-                var v = in_ptr[base + r * inner]
-                if _ar_take_next[dtype, is_min](v, best):
-                    best = v
-                    best_idx = r
-            out_ptr[p] = Int64(best_idx)
+            @always_inline
+            @parameter
+            @__copy_capture(out_ptr, val_ptr, in_ptr)
+            def func_v[width: Int, alignment: Int = 1](idx: Coord):
+                var p = Int(idx[0].value())
+                var base = (p // inner) * reduce_n * inner + (p % inner)
+                var best, best_idx = _ar_cpu_scan[dtype, is_min](
+                    in_ptr, base, inner, reduce_n
+                )
+                out_ptr[p] = Int64(best_idx)
+                val_ptr[p] = best
 
-        _parallel_for[func](outputs, ctx)
+            _parallel_for[func_v](outputs, ctx)
+        else:
+
+            @always_inline
+            @parameter
+            @__copy_capture(out_ptr, in_ptr)
+            def func[width: Int, alignment: Int = 1](idx: Coord):
+                var p = Int(idx[0].value())
+                var base = (p // inner) * reduce_n * inner + (p % inner)
+                var _best, best_idx = _ar_cpu_scan[dtype, is_min](
+                    in_ptr, base, inner, reduce_n
+                )
+                out_ptr[p] = Int64(best_idx)
+
+            _parallel_for[func](outputs, ctx)
         return
 
     comptime if not has_accelerator():
@@ -679,19 +821,35 @@ def _argreduce_cols[
         var lanes = ceildiv(inner, AR_THREADS)
         var splits = _ar_splits(lanes * outer, reduce_n, AR_COLS_MIN_CHUNK, ctx)
         if splits <= 1:
-            _enqueue_cached[_argreduce_cols_kernel[dtype, is_min]](
-                ctx,
-                String(t"argreduce_cols_{dtype}_{is_min}"),
-                lanes * outer,
-                1,
-                1,
-                AR_THREADS,
-                out_ptr.as_unsafe_any_origin(),
-                in_ptr.as_unsafe_any_origin().as_immutable(),
-                Int64(reduce_n),
-                Int64(inner),
-                Int64(lanes),
-            )
+            comptime if with_values:
+                _enqueue_cached[_minmax_cols_kernel[dtype, is_min]](
+                    ctx,
+                    String(t"minmax_cols_{dtype}_{is_min}"),
+                    lanes * outer,
+                    1,
+                    1,
+                    AR_THREADS,
+                    val_ptr.as_unsafe_any_origin(),
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    Int64(reduce_n),
+                    Int64(inner),
+                    Int64(lanes),
+                )
+            else:
+                _enqueue_cached[_argreduce_cols_kernel[dtype, is_min]](
+                    ctx,
+                    String(t"argreduce_cols_{dtype}_{is_min}"),
+                    lanes * outer,
+                    1,
+                    1,
+                    AR_THREADS,
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    Int64(reduce_n),
+                    Int64(inner),
+                    Int64(lanes),
+                )
             return
         var chunk = ceildiv(reduce_n, splits)
         splits = ceildiv(reduce_n, chunk)
@@ -714,28 +872,36 @@ def _argreduce_cols[
             Int64(lanes),
             Int64(chunk),
         )
-        _ar_merge_launch[dtype, is_min](
-            out_addr, ws_val_ptr, ws_idx_ptr, outputs, splits, ctx
+        _ar_merge_launch[dtype, is_min, with_values](
+            out_addr, val_addr, ws_val_ptr, ws_idx_ptr, outputs, splits, ctx
         )
 
 
 @always_inline
 def _argreduce_spec_into[
-    dtypes: List[DType], is_min: Bool
+    dtypes: List[DType], is_min: Bool, with_values: Bool = False
 ](
-    a: TensorSpec, dst: TensorSpec, rdims_t: PyObjectPtr, ctx: DeviceContext
+    a: TensorSpec,
+    dst: TensorSpec,
+    rdims_t: PyObjectPtr,
+    ctx: DeviceContext,
+    val_addr: Int = 0,
+    val_numel: Int = -1,
 ) raises:
-    """The whole body of ArgminSpec / ArgmaxSpec below the dtype guard:
-    geometry, output validation and dtype dispatch. The two bridges differ
-    only in `is_min`, so they cannot drift apart.
+    """The whole body of ArgminSpec / ArgmaxSpec / MinDimSpec below the dtype
+    guard: geometry, output validation and dtype dispatch. The bridges differ
+    only in `is_min` and `with_values`, so they cannot drift apart.
 
-    `keepdim` never reaches here: Python allocates the output and therefore
-    owns its shape; this side only ever fills a contiguous run of indices.
-    (`dst`, not `out`: that name is Mojo's result-argument keyword.)"""
+    `keepdim` never reaches here: Python allocates the outputs and therefore
+    owns their shapes; this side only ever fills contiguous runs. (`dst`, not
+    `out`: that name is Mojo's result-argument keyword.) `val_addr` /
+    `val_numel` are the values buffer of the (value, index) ops and are unused
+    when `with_values` is off.
+    """
     var outer = 0
     var reduce_n = 0
     var inner = 0
-    if not _ar_adjacent_geom(a, rdims_t, outer, reduce_n, inner):
+    if not _adjacent_reduce_geom(a, rdims_t, outer, reduce_n, inner):
         raise Error(
             "mojo spec argreduce: reduce dims must be an adjacent ascending"
             " interval of a contiguous operand (Python pre-materializes)"
@@ -745,6 +911,9 @@ def _argreduce_spec_into[
         raise Error("mojo spec into: output buffer mismatch")
     if dst.dtype != DType.int64:
         raise Error("mojo spec into: output dtype mismatch")
+    comptime if with_values:
+        if val_numel != outputs:
+            raise Error("mojo spec into: output buffer mismatch")
     if outputs <= 0 or reduce_n <= 0:
         return
     comptime for dt in dtypes:
@@ -752,10 +921,10 @@ def _argreduce_spec_into[
             if a.dtype == dt:
                 if inner == 1:
                     # Trailing reduce dims: the contiguous-axis kernels.
-                    _argreduce_rows[dt, is_min](
-                        dst.ptr, a.ptr, outer, reduce_n, ctx
+                    _argreduce_rows[dt, is_min, with_values](
+                        dst.ptr, val_addr, a.ptr, outer, reduce_n, ctx
                     )
                 else:
-                    _argreduce_cols[dt, is_min](
-                        dst.ptr, a.ptr, outer, reduce_n, inner, ctx
+                    _argreduce_cols[dt, is_min, with_values](
+                        dst.ptr, val_addr, a.ptr, outer, reduce_n, inner, ctx
                     )
