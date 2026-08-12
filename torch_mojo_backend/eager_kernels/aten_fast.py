@@ -4567,6 +4567,26 @@ def fast_aten_native_dropout_backward(grad_output, mask, scale):
     return grad_input
 
 
+def _layer_norm_stats_to_input_dtype(
+    mean: MojoTensorLike, rstd: MojoTensorLike, input_dtype: DType
+) -> tuple[MojoTensorLike, MojoTensorLike]:
+    """`(mean, rstd)` as ATen returns them: same dtype as the input.
+
+    ATen's CPU `layer_norm` accumulates in `opmath_type` (float for a
+    reduced-precision input) but casts the two saved statistics back down to
+    `param_scalar_type`, which is the input's own dtype unless weight/bias
+    carry a genuinely different ("mixed") dtype. `fast_aten_native_layer_norm`
+    already declines any weight/bias whose dtype differs from the input's, so
+    every call reaching here is the non-mixed case and the target is always
+    `input_dtype`. Typed structurally (not `TorchMojoTensor`) because the
+    no-op float32 branch is exercised with lightweight payload stand-ins by
+    `test_fast_native_layer_norm_gpu_prologue_runs_without_a_gpu`.
+    """
+    if input_dtype == DType.float32:
+        return mean, rstd
+    return _cast_tensor(mean, input_dtype), _cast_tensor(rstd, input_dtype)
+
+
 def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
     a = _t(input)
     normalized_shape = tuple(normalized_shape)
@@ -4621,6 +4641,13 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
     # two-group spec a -34% win).
     out = _alloc(a._shape, a._dtype, a._device)
     stat_shape = tuple(a._shape[:-k]) + (1,) * k
+    # The device kernels only ever write float32 into these two buffers
+    # (their pointer ABI is fixed at float32, unlike the batch/group-norm
+    # running stats, which carry their own dtype template parameter). ATen's
+    # `param_scalar_type` returns the reduced input dtype here whenever
+    # weight/bias aren't mixed-precision -- which, by this function's own
+    # gating above, is every call it accepts -- so the public mean/rstd are
+    # cast down from the float32 accumulator to match, once, at the end.
     mean = _alloc(stat_shape, DType.float32, a._device)
     rstd = _alloc(stat_shape, DType.float32, a._device)
 
@@ -4658,7 +4685,7 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
             flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
             keepalive=(out, mean, rstd, a, gamma, beta),
         )
-        return out, mean, rstd
+        return out, *_layer_norm_stats_to_input_dtype(mean, rstd, a._dtype)
 
     if weight is None:
         gamma = fast_filled((cols,), 1.0, a._dtype, a._device)
@@ -4683,7 +4710,7 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
         flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
         keepalive=(out, mean, rstd, a, gamma, beta),
     )
-    return out, mean, rstd
+    return out, *_layer_norm_stats_to_input_dtype(mean, rstd, a._dtype)
 
 
 def fast_aten_native_layer_norm_backward(
