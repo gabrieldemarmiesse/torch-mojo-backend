@@ -271,6 +271,205 @@ def _bw_flat_blocks(slots: Int, traffic_bytes: Int) -> Int:
 
 
 @always_inline
+def _device_sm_count(ctx: DeviceContext) -> Int:
+    """SMs / CUs of the device actually in hand.
+
+    The compile-time `default_device_info.sm_count` describes the
+    ARCHITECTURE the variant was built for, which is the right fallback but
+    not the right answer: two cards of one architecture differ here (an H100
+    PCIe has 114, an H100 SXM 132, and the table reports 132 for both). Any
+    grid derived from the SM count wants this, not the table.
+    """
+    comptime fallback = ctx.default_device_info.sm_count
+    var count = 0
+    try:
+        count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    except:
+        count = fallback
+    return count if count > 0 else fallback
+
+
+# ===========================================================================
+# Shifted single-pass moments: the shared core of every mean+variance pass
+# ===========================================================================
+#
+# One read of a contiguous run of elements yields the pair
+#
+#   s = sum(x - K)      q = sum((x - K)^2)
+#
+# about an assumed mean K, from which `mean = K + s/n` and the second central
+# moment `M2 = q - s^2/n` follow. Shards of the same run merge by PLAIN
+# ADDITION as long as they all use the same K, and an empty shard contributes
+# the additive identity (0, 0) — which is why this and not Welford is what the
+# split reductions here use: no per-element division, no count bookkeeping in
+# the merge.
+#
+# The shift is what makes one pass safe. With K = 0 the two terms of `M2`
+# cancel catastrophically on data with a large mean (float32 loses every
+# significant digit on x ~ 1e6 + noise); shifting by anything near the mean
+# leaves `q` the same order as the answer. Callers use the run's FIRST element,
+# which is one broadcast load away and identical in every shard.
+#
+# Choosing K from the data is also what makes it fallible, so every caller
+# must pair the scan with `_moment_cancels` and a second read about the
+# now-known accurate mean when it answers true — see that function.
+#
+# Consumers: `reduction_ops._var_moments` (aten.var.correction, over an
+# arbitrary (outer, reduce, inner) view) and
+# `normalization_forward_kernels` (layer / group / batch norm forward, whose
+# statistics are exactly this pair).
+
+
+# Cancellation budget for `M2 = q - s^2/n`: re-read a slice about its accurate
+# mean once `q / M2` exceeds this, i.e. once more than 4 of float32's 24
+# significand bits have been eaten by the subtraction. Not fitted to any card
+# — it is a property of the float32 format, and the two ends of the trade are:
+#
+#   * how often the second read is paid. `q/M2 = 1 + (K - mean)^2 / var`, so
+#     tripping 16 needs the slice's FIRST element to sit 3.9 standard
+#     deviations from its mean. Uniform data (every benchmarked case) tops out
+#     at q/M2 = 4 and never re-passes; Gaussian data re-passes one slice in
+#     ~1e4.
+#   * the error left when it does not trip. Bounded by 16x the accumulator's
+#     own relative error (~4e-7 measured at n = 2^22), i.e. ~6e-6 — still an
+#     order of magnitude better than torch's own worst measured case (2.2e-4,
+#     a 2048x2048 dim=0 reduction of N(1e4,1)).
+comptime MOMENT_CANCEL_RATIO = Float32(16)
+
+
+@always_inline
+def _vec16_phase[dtype: DType](addr: Int) -> Int:
+    """Element offset of `addr` inside its own 16-byte block, or -1 when `addr`
+    is not even element-aligned.
+
+    A 128-bit access is legal only at an address that is a multiple of 16, so
+    this — and not the column index — is what decides where a row's vectorized
+    body may start: element index `j` of a buffer sits at a 16-byte boundary iff
+    `(phase + j) % V == 0`, which collapses to `j % V == 0` only for a buffer
+    whose own base is 16-byte aligned.
+
+    Shared by the log-softmax row pass, the variance moments, the generic
+    reduction skeleton and the normalization forward kernels; all of them walk
+    a runtime sub-range of a buffer whose base phase they do not control.
+    """
+    comptime esize = size_of[dtype]()
+    if addr % esize != 0:
+        return -1
+    return (addr % 16) // esize
+
+
+@always_inline
+def _moment_cancels(s: Float32, q: Float32, n: Int) -> Bool:
+    """Did `M2 = q - s^2/n` lose too much of the significand to be trusted?
+
+    `q >= s^2/n` always (Cauchy-Schwarz), so the subtraction is pure
+    cancellation and destroys about `log2(q / M2)` bits. `q / M2` equals
+    `1 + (K - mean)^2 / var`, so it is a direct measure of how bad the assumed
+    mean K was: it stays near 1 for any K within a standard deviation of the
+    mean and explodes when K is an outlier — which is exactly the case a
+    single-pass shifted formulation cannot survive on its own (a slice whose
+    FIRST element is 1e6 while the rest are N(0,1) reaches q/M2 = 4e6, i.e.
+    22 of float32's 24 bits gone and a 37% error). The caller answers a true
+    here by re-reading the slice about the now-known accurate mean, which
+    leaves no cancellation at all.
+
+    A `q` of exactly 0 (constant slice) reports false and stays exact; a nan
+    reports true and re-passes to the same nan.
+    """
+    return not ((q - s * s / Float32(n)) * MOMENT_CANCEL_RATIO >= q)
+
+
+@always_inline
+def _moment_partition[
+    dtype: DType
+](
+    base_addr: Int,
+    start: Int,
+    n: Int,
+    mut head: Int,
+    mut n_vec: Int,
+    mut vec_start: Int,
+    mut tail_start: Int,
+):
+    """Split `[start, start + n)` of a buffer based at `base_addr` into a
+    scalar head, a 16-byte-aligned vector body and a scalar tail.
+
+    The split is on the ADDRESS, not the column index: the range start has
+    whatever 16-byte phase the buffer's own base and `start` give it. Nothing
+    here depends on the values, so a caller that re-scans the same range about
+    a corrected shift passes the same partition back in.
+    """
+    comptime V = 16 // size_of[dtype]()
+    var phase = _vec16_phase[dtype](base_addr)
+    head = n
+    n_vec = 0
+    if phase >= 0:
+        head = (V - (phase + start) % V) % V
+        if head > n:
+            head = n
+        n_vec = (n - head) // V
+    vec_start = start + head
+    tail_start = head + n_vec * V
+
+
+@always_inline
+def _moments_scan_contig[
+    dtype: DType, //, V: Int, vec_align: Int, threads: Int
+](
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    start: Int,
+    n: Int,
+    head: Int,
+    n_vec: Int,
+    vec_start: Int,
+    tail_start: Int,
+    tid: Int,
+    shift: Float32,
+    mut s_t: Float32,
+    mut q_t: Float32,
+):
+    """One thread's share of a contiguous run, as moments about `shift`.
+
+    16-byte vector body plus the scalar head and tail the buffer's own
+    alignment phase leaves over (`_moment_partition` computes the split). The
+    partition arguments are shift-independent so a caller that has to re-scan
+    about a corrected shift passes the same ones back in.
+    """
+    s_t = Float32(0)
+    q_t = Float32(0)
+    if n <= 0:
+        return
+    var s_vec = SIMD[DType.float32, V](0)
+    var q_vec = SIMD[DType.float32, V](0)
+    var v = tid
+    while v < n_vec:
+        var d = (
+            in_ptr.load[width=V, alignment=vec_align](vec_start + v * V).cast[
+                DType.float32
+            ]()
+            - shift
+        )
+        s_vec += d
+        q_vec = d.fma(d, q_vec)
+        v += threads
+    s_t = s_vec.reduce_add()
+    q_t = q_vec.reduce_add()
+
+    var jh = tid
+    while jh < head:
+        var d = in_ptr[start + jh].cast[DType.float32]() - shift
+        s_t += d
+        q_t += d * d
+        jh += threads
+    var jt = tail_start + tid
+    while jt < n:
+        var d = in_ptr[start + jt].cast[DType.float32]() - shift
+        s_t += d
+        q_t += d * d
+        jt += threads
+
+
+@always_inline
 def _make_ptr[
     dtype: DType
 ](addr: Int) -> UnsafePointer[Scalar[dtype], MutUntrackedOrigin]:
@@ -304,27 +503,6 @@ def _runtime_sm_count(ctx: DeviceContext) -> Int:
     except:
         count = fallback
     return count if count > 0 else fallback
-
-
-@always_inline
-def _vec16_phase[dtype: DType](addr: Int) -> Int:
-    """Element offset of `addr` inside its own 16-byte block, or -1 when `addr`
-    is not even element-aligned.
-
-    A 128-bit access is legal only at an address that is a multiple of 16, so
-    this -- and not the column index -- is what decides where a row's
-    vectorized body may start: element index `j` of a buffer sits at a 16-byte
-    boundary iff `(phase + j) % V == 0`, which collapses to `j % V == 0` only
-    for a buffer whose own base is 16-byte aligned.
-
-    Shared by the log-softmax row pass, the variance moments and the generic
-    reduction skeleton; all three walk a runtime sub-range of a buffer whose
-    base phase they do not control.
-    """
-    comptime esize = size_of[dtype]()
-    if addr % esize != 0:
-        return -1
-    return (addr % 16) // esize
 
 
 # ---------------------------------------------------------------------------

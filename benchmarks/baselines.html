@@ -989,16 +989,30 @@ document.addEventListener("DOMContentLoaded", boot);
         },
         "_native_batch_norm_legit_no_training": {
           "dtypes": {
-            "f32": {
+            "bf16": {
               "shapes": {
                 "N32xC64xH112xW112": {
                   "layouts": {
-                    "contig": 1.87
+                    "contig": 0.643
                   }
                 },
                 "N8xC256xH28xW28": {
                   "layouts": {
-                    "contig": 2.717
+                    "contig": 0.575
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 0.857
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 0.706
                   }
                 }
               }
@@ -3984,6 +3998,38 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "native_batch_norm": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 0.194
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 0.763
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 0.333
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 0.851
+                  }
+                }
+              }
+            }
+          }
+        },
         "native_dropout": {
           "dtypes": {
             "f32": {
@@ -4026,12 +4072,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "N32xC64xH56xW56_G32": {
                   "layouts": {
-                    "contig": 1.042
+                    "contig": 0.701
                   }
                 },
                 "N8xC256xH14xW14_G32": {
                   "layouts": {
-                    "contig": 0.813
+                    "contig": 0.638
                   }
                 }
               }
@@ -4040,12 +4086,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "N32xC64xH56xW56_G32": {
                   "layouts": {
-                    "contig": 1.091
+                    "contig": 0.766
                   }
                 },
                 "N8xC256xH14xW14_G32": {
                   "layouts": {
-                    "contig": 0.815
+                    "contig": 0.466
                   }
                 }
               }
@@ -4058,12 +4104,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 0.76
+                    "contig": 0.448
                   }
                 },
                 "B32768xD1024": {
                   "layouts": {
-                    "contig": 3.108
+                    "contig": 0.664
                   }
                 }
               }

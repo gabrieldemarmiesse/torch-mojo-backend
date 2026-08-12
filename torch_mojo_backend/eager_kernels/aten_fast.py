@@ -4148,8 +4148,211 @@ def fast_aten_nonzero(input):
 # ---------------------------------------------------------------------------
 
 
+def _bn_geometry(
+    a: TorchMojoTensor, params: tuple[TorchMojoTensor | None, ...]
+) -> tuple[int, int, int] | None:
+    """`(channels, inner, planes)` of an NC... contiguous batch-norm input, or
+    None when the metadata does not fit the kernel family: every parameter
+    vector must be contiguous, on the same device and sized C, and the two
+    running statistics must share a dtype (as must weight and bias) because
+    the kernels carry one comptime dtype for each pair."""
+    if len(a._shape) < 2 or a._numel == 0 or not a._is_contiguous:
+        return None
+    channels = a._shape[1]
+    for p in params:
+        if (
+            p is None
+            or p._device != a._device
+            or not p._is_contiguous
+            or tuple(p._shape) != (channels,)
+            or p._dtype not in _FLOAT_DTYPES
+        ):
+            return None
+    return channels, math.prod(a._shape[2:]), a._shape[0] * channels
+
+
+def _bn_inference_saved_stats(
+    running_mean: object, running_var: object, eps: object
+) -> tuple[object, object] | None:
+    """`(save_mean, save_invstd)` for an inference batch norm, or None.
+
+    These are NOT empty in PyTorch.  `batch_norm_cuda_out` resizes `save_mean`
+    to the channel count and copies `running_mean` into it, and `save_invstd`
+    holds `1/sqrt(running_var + eps)` (ATen/native/cuda/Normalization.cu).  The
+    autograd formula for `_native_batch_norm_legit_no_training` forwards both
+    straight into `native_batch_norm_backward` (derivatives.yaml), which is how
+    a frozen BatchNorm still yields gradients — so returning `(0,)` tensors
+    here is a silently wrong answer waiting for the backward to be written.
+    """
+    mean_t, var_t = _t(running_mean), _t(running_var)
+    if mean_t is None or var_t is None:
+        return None
+    save_mean = fast_aten_clone(mean_t)
+    save_invstd = fast_aten_rsqrt(fast_aten_add(var_t, float(eps)))
+    if save_mean is NOT_HANDLED or save_invstd is NOT_HANDLED:
+        return None
+    return save_mean, save_invstd
+
+
+def _fast_batch_norm_inference_gpu(
+    a: TorchMojoTensor,
+    weight: object,
+    bias: object,
+    running_mean: object,
+    running_var: object,
+    eps: object,
+) -> object:
+    """Vectorized GPU inference batch norm, or NOT_HANDLED.
+
+    Torch feeds float32 running statistics to a half/bfloat16 input (that is
+    what `nn.BatchNorm2d` holds under AMP), so the kernel carries the input,
+    the statistics and the affine dtypes as three independent comptime
+    parameters instead of demanding they all match.
+    """
+    mean_t, var_t, gamma_t, beta_t = (
+        _t(running_mean),
+        _t(running_var),
+        _t(weight),
+        _t(bias),
+    )
+    geom = _bn_geometry(a, (mean_t, var_t, gamma_t, beta_t))
+    if geom is None or mean_t._dtype != var_t._dtype or gamma_t._dtype != beta_t._dtype:
+        return NOT_HANDLED
+    channels, inner, planes = geom
+    a = _tc(a)
+    out = _alloc(a._shape, a._dtype, a._device)
+    # The kernel emits the saved statistics itself: see _bn_inference_saved_stats
+    # for why they must not be empty, and the kernel docstring for why doing it
+    # there rather than in three extra launches matters at small `inner`.
+    save_mean = _alloc((channels,), mean_t._dtype, a._device)
+    save_invstd = _alloc((channels,), mean_t._dtype, a._device)
+    _call_mojo(
+        _NormalizationForwardExtension,
+        "BatchNormInfer",
+        (
+            out._ptr,
+            a._ptr,
+            mean_t._ptr,
+            var_t._ptr,
+            gamma_t._ptr,
+            beta_t._ptr,
+            (
+                float(eps),
+                channels,
+                inner,
+                planes,
+                1,
+                1,
+                save_mean._ptr,
+                save_invstd._ptr,
+            ),
+            _ctx_ptr(a._device),
+        ),
+        arg_dtypes=(a._dtype, mean_t._dtype, gamma_t._dtype),
+        output_dtypes=(out._dtype,),
+        keepalive=(out, a, mean_t, var_t, gamma_t, beta_t, save_mean, save_invstd),
+    )
+    return (out, save_mean, save_invstd)
+
+
+def _fast_batch_norm_training(
+    input: object,
+    weight: object,
+    bias: object,
+    running_mean: object,
+    running_var: object,
+    momentum: object,
+    eps: object,
+) -> object:
+    """`aten::native_batch_norm` with `training=True` on the GPU.
+
+    The per-channel statistics reduce `{0, 2, 3}` of an NCHW tensor — an axis
+    set that is neither contiguous nor trailing — through the shared
+    shifted-moment scan, reading the tensor where it lies. See
+    `eager_kernels/normalization_forward_ops/batch_norm_kernels.mojo`.
+    """
+    a = _t(input)
+    if a is None or a._dtype not in _FLOAT_DTYPES or not _on_gpu(a):
+        return NOT_HANDLED
+    if not isinstance(momentum, int | float) or not isinstance(eps, int | float):
+        return NOT_HANDLED
+    gamma_t = _t(weight) if weight is not None else None
+    beta_t = _t(bias) if bias is not None else None
+    mean_t = _t(running_mean) if running_mean is not None else None
+    var_t = _t(running_var) if running_var is not None else None
+    has_running = mean_t is not None or var_t is not None
+    if has_running and (mean_t is None or var_t is None):
+        return NOT_HANDLED
+    if (weight is not None and gamma_t is None) or (
+        bias is not None and beta_t is None
+    ):
+        return NOT_HANDLED
+    present = tuple(p for p in (mean_t, var_t, gamma_t, beta_t) if p is not None)
+    geom = _bn_geometry(a, present)
+    if geom is None:
+        return NOT_HANDLED
+    if has_running and mean_t._dtype != var_t._dtype:
+        return NOT_HANDLED
+    if gamma_t is not None and beta_t is not None and gamma_t._dtype != beta_t._dtype:
+        return NOT_HANDLED
+    channels, hxw, _planes = geom
+    runs = a._shape[0]
+    if runs * hxw < 2:
+        # ATen's unbiased running variance divides by N-1; refuse the
+        # degenerate sample rather than inventing a rule for it.
+        return NOT_HANDLED
+    # The saved statistics are float32 whatever the input dtype is (ATen's
+    # `at::acc_type`), and the second one is the inverse standard deviation.
+    stat_dtype = mean_t._dtype if has_running else DType.float32
+    param_dtype = gamma_t._dtype if gamma_t is not None else a._dtype
+    a = _tc(a)
+    out = _alloc(a._shape, a._dtype, a._device)
+    save_mean = _alloc((channels,), DType.float32, a._device)
+    save_invstd = _alloc((channels,), DType.float32, a._device)
+    _call_mojo(
+        _NormalizationForwardExtension,
+        "BatchNormTrain",
+        (
+            out._ptr,
+            save_mean._ptr,
+            save_invstd._ptr,
+            a._ptr,
+            gamma_t._ptr if gamma_t is not None else 0,
+            beta_t._ptr if beta_t is not None else 0,
+            mean_t._ptr if has_running else 0,
+            var_t._ptr if has_running else 0,
+            (
+                float(eps),
+                float(momentum),
+                channels,
+                runs,
+                hxw,
+                int(gamma_t is not None),
+                int(beta_t is not None),
+                int(has_running),
+            ),
+            _ctx_ptr(a._device),
+        ),
+        arg_dtypes=(a._dtype, stat_dtype, param_dtype),
+        output_dtypes=(out._dtype, save_mean._dtype, save_invstd._dtype),
+        flags={
+            "HAS_WEIGHT": gamma_t is not None,
+            "HAS_BIAS": beta_t is not None,
+            "HAS_RUNNING": has_running,
+        },
+        keepalive=(out, save_mean, save_invstd, a, gamma_t, beta_t, mean_t, var_t),
+    )
+    return out, save_mean, save_invstd
+
+
 def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, eps):
     a = _t(input)
+    if a is not None and _on_gpu(a) and a._dtype in _FLOAT_DTYPES:
+        result = _fast_batch_norm_inference_gpu(
+            a, weight, bias, running_mean, running_var, eps
+        )
+        if result is not NOT_HANDLED:
+            return result
     stats = [_t(x) for x in (running_mean, running_var, weight, bias)]
     if (
         a is not None
@@ -4182,12 +4385,9 @@ def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, e
             output_dtypes=(out._dtype,),
             keepalive=(a, stats, out),
         )
-        # Inference mode returns empty (0,) tensors for the saved stats.
-        return (
-            out,
-            _alloc((0,), a._dtype, a._device),
-            _alloc((0,), a._dtype, a._device),
-        )
+        saved = _bn_inference_saved_stats(running_mean, running_var, eps)
+        if saved is not None:
+            return (out, *saved)
     a = _tc(input)
     if a is None or a._dtype not in _FLOAT_DTYPES or len(a._shape) < 2:
         return NOT_HANDLED
@@ -4224,8 +4424,10 @@ def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, e
         output_dtypes=(out._dtype,),
         keepalive=(out, a, mean_t, var_t, gamma_t, beta_t),
     )
-    # Inference mode returns empty (0,) tensors for the saved stats.
-    return (out, _alloc((0,), a._dtype, a._device), _alloc((0,), a._dtype, a._device))
+    saved = _bn_inference_saved_stats(running_mean, running_var, eps)
+    if saved is None:
+        return NOT_HANDLED
+    return (out, *saved)
 
 
 def fast_aten_native_batch_norm(
@@ -4235,7 +4437,9 @@ def fast_aten_native_batch_norm(
         return _fast_batch_norm_inference(
             input, weight, bias, running_mean, running_var, eps
         )
-    return NOT_HANDLED
+    return _fast_batch_norm_training(
+        input, weight, bias, running_mean, running_var, momentum, eps
+    )
 
 
 def fast_aten__native_batch_norm_legit_no_training(
@@ -4420,13 +4624,13 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
     mean = _alloc(stat_shape, DType.float32, a._device)
     rstd = _alloc(stat_shape, DType.float32, a._device)
 
-    # The training-hot FP32 GPU route has a direct optional-affine ABI.  A
-    # zero pointer is safe because the runtime flags prevent any corresponding
-    # device load; this avoids allocating and filling synthetic ones/zeros.
-    if a._dtype == DType.float32 and _on_gpu(a):
+    # The GPU route has a direct optional-affine ABI.  A zero pointer is safe
+    # because the runtime flags prevent any corresponding device load; this
+    # avoids allocating and filling synthetic ones/zeros.
+    if _on_gpu(a):
         _call_mojo(
             _NormalizationForwardExtension,
-            "LayerNormForwardF32",
+            "LayerNormForward",
             (
                 out._ptr,
                 mean._ptr,
@@ -4439,6 +4643,10 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
                 eps_value,
                 int(weight is not None),
                 int(bias is not None),
+                # hxw / cpg / group: read only by the group-norm affine.
+                1,
+                1,
+                1,
                 _ctx_ptr(a._device),
             ),
             arg_dtypes=(
@@ -5439,31 +5647,61 @@ def fast_aten_native_group_norm(input, weight, bias, N, C, HxW, group, eps):
         cpg = C // group
         cols = cpg * HxW
         rows = N * group
-        gamma = (
-            _tc(weight)
-            if weight is not None
-            else fast_filled((C,), 1.0, a._dtype, a._device)
-        )
-        beta = (
-            _tc(bias)
-            if bias is not None
-            else fast_filled((C,), 0.0, a._dtype, a._device)
-        )
-        if (
-            gamma is None
-            or beta is None
-            or gamma._dtype != a._dtype
-            or beta._dtype != a._dtype
-            or tuple(gamma._shape) != (C,)
-            or tuple(beta._shape) != (C,)
+        gamma = _tc(weight) if weight is not None else None
+        beta = _tc(bias) if bias is not None else None
+        if (weight is not None and gamma is None) or (
+            bias is not None and beta is None
         ):
             return NOT_HANDLED
+        for param in (gamma, beta):
+            if param is not None and (
+                param._dtype != a._dtype or tuple(param._shape) != (C,)
+            ):
+                return NOT_HANDLED
         # Not spec-converted for the same reason as native_layer_norm
         # above (three-group result construction outweighs the thin
         # classic prologue).
         out = _alloc(a._shape, a._dtype, a._device)
         mean = _alloc((N, group), DType.float32, a._device)
         rstd = _alloc((N, group), DType.float32, a._device)
+        if _on_gpu(a):
+            # Same kernel family as layer norm, with the per-channel affine
+            # indexing selected at compile time; a zero pointer is safe
+            # because the runtime flags prevent the matching device load.
+            _call_mojo(
+                _NormalizationForwardExtension,
+                "GroupNormForward",
+                (
+                    out._ptr,
+                    mean._ptr,
+                    rstd._ptr,
+                    a._ptr,
+                    gamma._ptr if gamma is not None else 0,
+                    beta._ptr if beta is not None else 0,
+                    rows,
+                    cols,
+                    float(eps),
+                    int(gamma is not None),
+                    int(beta is not None),
+                    HxW,
+                    cpg,
+                    group,
+                    _ctx_ptr(a._device),
+                ),
+                arg_dtypes=(
+                    a._dtype,
+                    gamma._dtype if gamma is not None else a._dtype,
+                    beta._dtype if beta is not None else a._dtype,
+                ),
+                output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
+                flags={"HAS_WEIGHT": gamma is not None, "HAS_BIAS": beta is not None},
+                keepalive=(out, mean, rstd, a, gamma, beta),
+            )
+            return out, mean, rstd
+        if gamma is None:
+            gamma = fast_filled((C,), 1.0, a._dtype, a._device)
+        if beta is None:
+            beta = fast_filled((C,), 0.0, a._dtype, a._device)
         _call_mojo(
             _NNExtension,
             "GroupNorm",

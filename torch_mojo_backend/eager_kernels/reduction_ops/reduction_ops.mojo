@@ -78,6 +78,9 @@ from op_utils import (
     _check_into,
     _enqueue_cached,
     _make_ptr,
+    _moment_cancels,
+    _moment_partition,
+    _moments_scan_contig,
     _parallel_for,
     _raw_f64,
     _raw_tuple_int,
@@ -136,39 +139,30 @@ from variant_gates import (
 #                   preferred to `Atomic.fetch_add` (sequentially consistent by
 #                   default) and is deterministic.
 #
-# Both stage-1 kernels read the input exactly ONCE, accumulating the moment
-# pair (sum of deviations, sum of squared deviations) about an assumed mean K
-# — the first element of the reduced slice, which every split of the same
-# output re-reads so partials merge by plain addition:
+# Both stage-1 kernels read the input exactly ONCE, accumulating the shifted
+# moment pair `(s, q)` of `op_utils._moments_scan_contig` — the shared core
+# documented there, and the same one the normalization forward kernels use —
+# about an assumed mean K taken from the first element of the reduced slice,
+# which every split of the same output re-reads so partials merge by plain
+# addition:
 #
 #   s = sum(x - K)   q = sum((x - K)^2)   M2 = q - s^2/n   var = M2/(n - corr)
 #
-# The shift is what makes one pass safe: with K = 0 the two terms of `M2`
-# cancel catastrophically on data with a large mean (x ~ 1e6 + noise loses
-# every significant digit in float32 — measured 3.5e4 relative error for the
-# two-pass predecessor, which suffered the same thing in its float32 mean),
-# while shifting by any value near the mean leaves `q` the same order as the
-# answer. It costs one broadcast load and one subtract per element, and unlike
-# Welford it needs no per-element division and no count bookkeeping in the
-# merge (an empty split contributes the additive identity, 0). Accumulation
-# stays float32, matching torch's accumulator; the finalize deliberately does
-# NOT use float64, which Apple GPUs cannot execute.
+# Accumulation stays float32, matching torch's accumulator; the finalize
+# deliberately does NOT use float64, which Apple GPUs cannot execute.
 #
 # Choosing K from the data is what makes it cheap and also what makes it
-# fallible: an element is *usually* near the mean, but if the slice's first
-# element happens to be a wild outlier then K is the worst shift available and
-# `M2` cancels just as badly as K = 0 would (a slice of N(0,1) whose x[0] is
-# 1e6 measured 37% error). So the moments are **adaptive**: the point where
-# the merged (s, q) for an output first exists is also the point where the
-# accurate mean `K + s/n` first exists, and `_moment_cancels` tests right
-# there whether the subtraction kept enough bits. If it did not, that output —
-# and only that output — is read a second time about the accurate mean, which
-# leaves no cancellation at all. Well-conditioned data never pays it (the
-# check is a compare on values already in registers), the pathological case
-# pays exactly 2x bandwidth, and the decision is made entirely on the device:
-# for a single-split reduction the block already holds its whole slice and
-# simply scans again, and for a split reduction the merge records a per-output
-# flag that a second scan+merge pair consumes.
+# fallible (see `op_utils._moment_cancels`). So the moments are **adaptive**:
+# the point where the merged (s, q) for an output first exists is also the
+# point where the accurate mean `K + s/n` first exists, and `_moment_cancels`
+# tests right there whether the subtraction kept enough bits. If it did not,
+# that output — and only that output — is read a second time about the
+# accurate mean, which leaves no cancellation at all. Well-conditioned data
+# never pays it (the check is a compare on values already in registers), the
+# pathological case pays exactly 2x bandwidth, and the decision is made
+# entirely on the device: for a single-split reduction the block already holds
+# its whole slice and simply scans again, and for a split reduction the merge
+# records a per-output flag that a second scan+merge pair consumes.
 # ---------------------------------------------------------------------------
 
 comptime MOMENT_THREADS = 256
@@ -193,22 +187,6 @@ comptime MOMENT_BLOCKS_PER_SM = 4
 # a few rows the workspace slot costs more than the shard computes.
 comptime MOMENT_MIN_ROWS_PER_SPLIT = 8
 
-# Cancellation budget for `M2 = q - s^2/n`: re-read a slice about its accurate
-# mean once `q / M2` exceeds this, i.e. once more than 4 of float32's 24
-# significand bits have been eaten by the subtraction. Not fitted to any card
-# — it is a property of the float32 format, and the two ends of the trade are:
-#
-#   * how often the second read is paid. `q/M2 = 1 + (K - mean)^2 / var`, so
-#     tripping 16 needs the slice's FIRST element to sit 3.9 standard
-#     deviations from its mean. Uniform data (every benchmarked case) tops out
-#     at q/M2 = 4 and never re-passes; Gaussian data re-passes one slice in
-#     ~1e4.
-#   * the error left when it does not trip. Bounded by 16x the accumulator's
-#     own relative error (~4e-7 measured at n = 2^22), i.e. ~6e-6 — still an
-#     order of magnitude better than torch's own worst measured case (2.2e-4,
-#     a 2048x2048 dim=0 reduction of N(1e4,1)).
-comptime MOMENT_CANCEL_RATIO = Float32(16)
-
 
 @always_inline
 def _moment_finish[
@@ -231,27 +209,6 @@ def _moment_finish[
     if divisor < 0:
         divisor = Float32(0)
     return (m2 / divisor).cast[dtype]()
-
-
-@always_inline
-def _moment_cancels(s: Float32, q: Float32, n: Int) -> Bool:
-    """Did `M2 = q - s^2/n` lose too much of the significand to be trusted?
-
-    `q >= s^2/n` always (Cauchy-Schwarz), so the subtraction is pure
-    cancellation and destroys about `log2(q / M2)` bits. `q / M2` equals
-    `1 + (K - mean)^2 / var`, so it is a direct measure of how bad the assumed
-    mean K was: it stays near 1 for any K within a standard deviation of the
-    mean and explodes when K is an outlier — which is exactly the case a
-    single-pass shifted formulation cannot survive on its own (a slice whose
-    FIRST element is 1e6 while the rest are N(0,1) reaches q/M2 = 4e6, i.e.
-    22 of float32's 24 bits gone and a 37% error). The caller answers a true
-    here by re-reading the slice about the now-known accurate mean, which
-    leaves no cancellation at all.
-
-    A `q` of exactly 0 (constant slice) reports false and stays exact; a nan
-    reports true and re-passes to the same nan.
-    """
-    return not ((q - s * s / Float32(n)) * MOMENT_CANCEL_RATIO >= q)
 
 
 @always_inline
@@ -293,63 +250,6 @@ def _moment_slice_base(o: Int, reduce_n: Int, inner: Int) -> Int:
     Collapses to `o * reduce_n` when the reduced axis is the contiguous one.
     """
     return (o // inner) * reduce_n * inner + (o % inner)
-
-
-@always_inline
-def _moments_scan_contig[
-    dtype: DType, //, V: Int, vec_align: Int
-](
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    start: Int,
-    n: Int,
-    head: Int,
-    n_vec: Int,
-    vec_start: Int,
-    tail_start: Int,
-    tid: Int,
-    shift: Float32,
-    mut s_t: Float32,
-    mut q_t: Float32,
-):
-    """One thread's share of a contiguous shard, as moments about `shift`.
-
-    16-byte vector body plus the scalar head and tail the buffer's own
-    alignment phase leaves over. The partition arguments are shift-independent
-    so a caller that has to re-scan about a corrected shift passes the same
-    ones back in.
-    """
-    s_t = Float32(0)
-    q_t = Float32(0)
-    if n <= 0:
-        return
-    var s_vec = SIMD[DType.float32, V](0)
-    var q_vec = SIMD[DType.float32, V](0)
-    var v = tid
-    while v < n_vec:
-        var d = (
-            in_ptr.load[width=V, alignment=vec_align](vec_start + v * V).cast[
-                DType.float32
-            ]()
-            - shift
-        )
-        s_vec += d
-        q_vec = d.fma(d, q_vec)
-        v += MOMENT_THREADS
-    s_t = s_vec.reduce_add()
-    q_t = q_vec.reduce_add()
-
-    var jh = tid
-    while jh < head:
-        var d = in_ptr[start + jh].cast[DType.float32]() - shift
-        s_t += d
-        q_t += d * d
-        jh += MOMENT_THREADS
-    var jt = tail_start + tid
-    while jt < n:
-        var d = in_ptr[start + jt].cast[DType.float32]() - shift
-        s_t += d
-        q_t += d * d
-        jt += MOMENT_THREADS
 
 
 @__llvm_metadata(
@@ -418,20 +318,17 @@ def _moments_contig_kernel[
     # re-walks the same partition.
     var start = base + j0
     var n = j1 - j0
-    var phase = _vec16_phase[dtype](Int(in_ptr))
-    var head = n
+    var head = 0
     var n_vec = 0
-    if phase >= 0:
-        head = (V - (phase + start) % V) % V
-        if head > n:
-            head = n
-        n_vec = (n - head) // V
-    var vec_start = start + head
-    var tail_start = head + n_vec * V
+    var vec_start = 0
+    var tail_start = 0
+    _moment_partition[dtype](
+        Int(in_ptr), start, n, head, n_vec, vec_start, tail_start
+    )
 
     var s_t = Float32(0)
     var q_t = Float32(0)
-    _moments_scan_contig[V=V, vec_align=vec_align](
+    _moments_scan_contig[V=V, vec_align=vec_align, threads=MOMENT_THREADS](
         in_ptr,
         start,
         n,
@@ -453,7 +350,7 @@ def _moments_contig_kernel[
     # the whole block agrees, and a second read about the now-known accurate
     # mean removes the cancellation entirely.
     if fused and _moment_cancels(bs, bq, cols):
-        _moments_scan_contig[V=V, vec_align=vec_align](
+        _moments_scan_contig[V=V, vec_align=vec_align, threads=MOMENT_THREADS](
             in_ptr,
             start,
             n,

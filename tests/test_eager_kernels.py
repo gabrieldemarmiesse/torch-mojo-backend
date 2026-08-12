@@ -475,6 +475,254 @@ def test_fast_stack_uses_the_batched_cat(mojo_gpu, dim):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fast_batch_norm_inference_float32_running_stats(mojo_gpu, dtype):
+    """A half/bfloat16 activation with FLOAT32 running statistics.
+
+    That is exactly what `nn.BatchNorm2d` holds under AMP -- torch keeps the
+    statistics in the parameter dtype while the activation is reduced
+    precision -- and the pairing used to be refused outright because the
+    bridge demanded that every operand share the input's dtype.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(3, 8, 5, 7, dtype=dtype)
+    weight = torch.randn(8, dtype=dtype)
+    bias = torch.randn(8, dtype=dtype)
+    running_mean = torch.randn(8)
+    running_var = torch.rand(8) + 0.5
+    args = (weight, bias, running_mean, running_var)
+    expected = torch.ops.aten._native_batch_norm_legit_no_training(
+        x.float(), *(t.float() for t in args), 0.1, 1e-5
+    )
+    actual = torch.ops.aten._native_batch_norm_legit_no_training(
+        x.to(mojo_gpu), *(t.to(mojo_gpu) for t in args), 0.1, 1e-5
+    )
+    tolerance = 1e-5 if dtype == torch.float32 else 8e-3
+    torch.testing.assert_close(
+        actual[0].cpu().float(), expected[0], atol=tolerance, rtol=tolerance
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(3, 8, 5, 7), (2, 5, 13), (4, 3, 8, 8, 2)])
+def test_fast_batch_norm_training_matches_torch(mojo_gpu, dtype, shape):
+    """Every output and both in-place running statistics, against CPU torch.
+
+    The three rules that are easy to get backwards and are all checked here:
+    `save_invstd` inverts the BIASED variance, the running variance takes the
+    UNBIASED one, and eps sits inside the square root.
+    """
+    torch.manual_seed(0)
+    channels = shape[1]
+    x = torch.randn(shape, dtype=dtype)
+    weight = torch.randn(channels, dtype=dtype)
+    bias = torch.randn(channels, dtype=dtype)
+    running_mean = torch.randn(channels)
+    running_var = torch.rand(channels) + 0.5
+
+    ref_mean, ref_var = running_mean.clone(), running_var.clone()
+    expected = torch.ops.aten.native_batch_norm(
+        x.float(), weight.float(), bias.float(), ref_mean, ref_var, True, 0.13, 1e-5
+    )
+    our_mean = running_mean.to(mojo_gpu)
+    our_var = running_var.to(mojo_gpu)
+    actual = torch.ops.aten.native_batch_norm(
+        x.to(mojo_gpu),
+        weight.to(mojo_gpu),
+        bias.to(mojo_gpu),
+        our_mean,
+        our_var,
+        True,
+        0.13,
+        1e-5,
+    )
+    tolerance = 1e-5 if dtype == torch.float32 else 8e-3
+    torch.testing.assert_close(
+        actual[0].cpu().float(), expected[0], atol=tolerance, rtol=tolerance
+    )
+    for got, want in zip(actual[1:], expected[1:], strict=True):
+        assert got.dtype == torch.float32  # ATen's acc_type, whatever x is
+        torch.testing.assert_close(got.cpu(), want, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(our_mean.cpu(), ref_mean, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(our_var.cpu(), ref_var, atol=1e-5, rtol=1e-5)
+
+
+def test_fast_batch_norm_training_running_stats_update_once(mojo_gpu):
+    """The momentum update must be applied exactly once per call.
+
+    The statistics kernel enqueues its cancellation re-pass unconditionally
+    (the decision is made on the device), so the merge runs twice per call --
+    and a running-stat update living in the wrong one of those two passes
+    would compound `(1-m)*r + m*v` twice and stay plausible-looking.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(4, 6, 5, 5)
+    running_mean = torch.zeros(6)
+    running_var = torch.ones(6)
+    ref_mean, ref_var = running_mean.clone(), running_var.clone()
+    our_mean, our_var = running_mean.to(mojo_gpu), running_var.to(mojo_gpu)
+    for _ in range(3):
+        torch.ops.aten.native_batch_norm(
+            x.float(), None, None, ref_mean, ref_var, True, 0.1, 1e-5
+        )
+        torch.ops.aten.native_batch_norm(
+            x.to(mojo_gpu), None, None, our_mean, our_var, True, 0.1, 1e-5
+        )
+    torch.testing.assert_close(our_mean.cpu(), ref_mean, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(our_var.cpu(), ref_var, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("magnitude", [1e6, -1e6])
+@pytest.mark.parametrize("channels", [3, 200])
+def test_fast_batch_norm_training_outlier_first_element(mojo_gpu, magnitude, channels):
+    """Element (0, c, 0) is a wild outlier for every channel c.
+
+    The statistics take their assumed mean from exactly that element, so this
+    is the worst shift available and `M2 = q - s^2/n` cancels catastrophically
+    without the adaptive re-pass.  Both channel counts are exercised because
+    they take different routes: 3 channels cannot fill the device and go
+    through the split workspace plus its merge, 200 take the fused
+    one-block-per-channel path that re-scans in place.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(6, channels, 4, 9)
+    x[0, :, 0, 0] = magnitude
+    running_mean = torch.zeros(channels)
+    running_var = torch.ones(channels)
+    ref_mean, ref_var = running_mean.clone(), running_var.clone()
+    expected = torch.ops.aten.native_batch_norm(
+        x, None, None, ref_mean, ref_var, True, 0.1, 1e-5
+    )
+    our_mean, our_var = running_mean.to(mojo_gpu), running_var.to(mojo_gpu)
+    actual = torch.ops.aten.native_batch_norm(
+        x.to(mojo_gpu), None, None, our_mean, our_var, True, 0.1, 1e-5
+    )
+    for got, want in zip(actual[1:], expected[1:], strict=True):
+        torch.testing.assert_close(got.cpu(), want, atol=0, rtol=1e-5)
+    torch.testing.assert_close(our_var.cpu(), ref_var, atol=0, rtol=1e-5)
+
+
+def test_fast_batch_norm_training_refuses_autograd_in_the_forward(mojo_gpu):
+    """A training call that would need a gradient must fail at the FORWARD.
+
+    `aten::native_batch_norm_backward` is not implemented here, and a raise
+    from inside the autograd engine aborts the process on this backend instead
+    of raising, so the refusal cannot wait for the backward node.
+    """
+    x = torch.randn(2, 4, 3, 3, device=mojo_gpu, requires_grad=True)
+    running_mean = torch.zeros(4, device=mojo_gpu)
+    running_var = torch.ones(4, device=mojo_gpu)
+    with pytest.raises(NotImplementedError, match="native_batch_norm_backward"):
+        torch.ops.aten.native_batch_norm(
+            x, None, None, running_mean, running_var, True, 0.1, 1e-5
+        )
+    with torch.no_grad():
+        torch.ops.aten.native_batch_norm(
+            x, None, None, running_mean, running_var, True, 0.1, 1e-5
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cols", [7, 789, 1024, 4096, 20000])
+def test_fast_layer_norm_row_widths(mojo_gpu, dtype, cols):
+    """Row widths across every launch route of the forward.
+
+    789 is not a whole number of 16-byte vectors (so the row has a scalar head
+    and tail), 1024 and 4096 sit in the register-cached ladder, and 20000
+    exceeds it and falls to the shifted-moment streaming kernel.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(9, cols, dtype=dtype)
+    weight = torch.randn(cols, dtype=dtype)
+    bias = torch.randn(cols, dtype=dtype)
+    expected = torch.ops.aten.native_layer_norm(
+        x.float(), [cols], weight.float(), bias.float(), 1e-5
+    )
+    actual = torch.ops.aten.native_layer_norm(
+        x.to(mojo_gpu), [cols], weight.to(mojo_gpu), bias.to(mojo_gpu), 1e-5
+    )
+    tolerance = 1e-5 if dtype == torch.float32 else 1e-2
+    torch.testing.assert_close(
+        actual[0].cpu().float(), expected[0], atol=tolerance, rtol=tolerance
+    )
+    torch.testing.assert_close(actual[1].cpu(), expected[1], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(actual[2].cpu(), expected[2], atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("offset", [1, 2, 3])
+def test_fast_layer_norm_offset_view_row_phase(mojo_gpu, offset):
+    """A row base that is not a multiple of the 16-byte vector width.
+
+    Slicing a flat buffer gives the input a 16-byte phase its freshly
+    allocated output does not share, which is what decides whether the cached
+    route may store where it loaded.
+    """
+    torch.manual_seed(0)
+    flat = torch.randn(5 * 64 + offset).to(mojo_gpu)
+    x = flat[offset:].view(5, 64)
+    weight = torch.randn(64).to(mojo_gpu)
+    bias = torch.randn(64).to(mojo_gpu)
+    expected = torch.ops.aten.native_layer_norm(
+        x.cpu(), [64], weight.cpu(), bias.cpu(), 1e-5
+    )
+    actual = torch.ops.aten.native_layer_norm(x, [64], weight, bias, 1e-5)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+
+
+def test_fast_layer_norm_large_mean_needs_the_moment_repass(mojo_gpu):
+    """A row whose FIRST element is a wild outlier, on the streaming route.
+
+    Rows too long for the register-cached route take their statistics from
+    the shared shifted-moment scan about the row's first element; when that
+    element is the outlier the variance loses most of its significand unless
+    the kernel notices and re-reads about the accurate mean.
+    """
+    torch.manual_seed(0)
+    cols = 40000  # past the cached ladder
+    x = torch.randn(4, cols)
+    x[:, 0] = 1e6
+    expected = torch.ops.aten.native_layer_norm(x, [cols], None, None, 1e-5)
+    actual = torch.ops.aten.native_layer_norm(x.to(mojo_gpu), [cols], None, None, 1e-5)
+    torch.testing.assert_close(actual[2].cpu(), expected[2], atol=0, rtol=1e-4)
+    torch.testing.assert_close(actual[0].cpu(), expected[0], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("n", "c", "hxw", "groups"), [(2, 8, 5, 4), (3, 12, 49, 3), (2, 6, 4096, 2)]
+)
+def test_fast_group_norm_matches_torch(mojo_gpu, dtype, n, c, hxw, groups):
+    torch.manual_seed(0)
+    x = torch.randn(n, c, hxw, dtype=dtype)
+    weight = torch.randn(c, dtype=dtype)
+    bias = torch.randn(c, dtype=dtype)
+    expected = torch.ops.aten.native_group_norm(
+        x.float(), weight.float(), bias.float(), n, c, hxw, groups, 1e-5
+    )
+    actual = torch.ops.aten.native_group_norm(
+        x.to(mojo_gpu), weight.to(mojo_gpu), bias.to(mojo_gpu), n, c, hxw, groups, 1e-5
+    )
+    tolerance = 1e-5 if dtype == torch.float32 else 1e-2
+    torch.testing.assert_close(
+        actual[0].cpu().float(), expected[0], atol=tolerance, rtol=tolerance
+    )
+    for got, want in zip(actual[1:], expected[1:], strict=True):
+        torch.testing.assert_close(got.cpu(), want, atol=1e-3, rtol=1e-3)
+
+
+def test_fast_group_norm_without_affine(mojo_gpu):
+    """No weight and no bias: the kernel must not read the null pointers."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 6, 32)
+    expected = torch.ops.aten.native_group_norm(x, None, None, 2, 6, 32, 3, 1e-5)
+    actual = torch.ops.aten.native_group_norm(
+        x.to(mojo_gpu), None, None, 2, 6, 32, 3, 1e-5
+    )
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+
+
 def test_fast_batch_norm_inference(mojo_device):
     x = torch.randn(2, 64, 14, 14)
     bn = torch.nn.BatchNorm2d(64).eval()
@@ -569,10 +817,10 @@ def test_fast_native_layer_norm_fp32_gpu_optional_affine_without_fill(
     ("has_weight", "has_bias"),
     [(False, False), (True, False), (False, True), (True, True)],
 )
-def test_fast_native_layer_norm_fp32_gpu_prologue_runs_without_a_gpu(
+def test_fast_native_layer_norm_gpu_prologue_runs_without_a_gpu(
     monkeypatch, has_weight, has_bias
 ):
-    """The FP32 GPU launch arguments must build for every affine combination.
+    """The GPU launch arguments must build for every affine combination.
 
     Every other test of this route needs the `mojo_gpu` fixture, which skips
     on any host without a MAX GPU -- CI included. That is how a name bound
@@ -617,7 +865,7 @@ def test_fast_native_layer_norm_fp32_gpu_prologue_runs_without_a_gpu(
     _replace_defined_native_calls(
         monkeypatch,
         {
-            ("normalization_forward_ops.mojo", "LayerNormForwardF32"): (
+            ("normalization_forward_ops.mojo", "LayerNormForward"): (
                 lambda *args: calls.append(args)
             )
         },

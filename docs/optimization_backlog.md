@@ -551,25 +551,33 @@ different kind of item.
   cast to bf16.
 
 ### N2
-**BatchNorm training and GroupNorm backward are absent in eager**
+**BatchNorm and GroupNorm BACKWARD are absent in eager (the BatchNorm training
+forward now exists)**
 
-* **What.** `fast_aten_native_batch_norm`, `aten_fast.py:4103` — returns
-  `NOT_HANDLED` whenever `training` is true, and the registration
-  (`mojo_device_aten_ops.py:1154`) raises. `aten::native_batch_norm_backward` and
+* **What.** `aten::native_batch_norm_backward` and
   `aten::native_group_norm_backward` are not registered at all — the file has
-  exactly one `_register_missing`, for `aten::_adaptive_avg_pool2d_backward`
-  (`:1222`).
-* **Current implementation.** Inference BatchNorm has a fused `BatchNormSpec`
-  kernel (`aten_fast.py:4044`); training does not exist. GroupNorm has a fused
-  forward (`aten_fast.py:5285`) and no backward.
+  exactly one `_register_missing`, for `aten::_adaptive_avg_pool2d_backward`.
+* **Current implementation.** The BatchNorm TRAINING FORWARD landed with the
+  shared-moments normalization work: `_fast_batch_norm_training` in
+  `aten_fast.py` over
+  `normalization_forward_ops/batch_norm_kernels.mojo`, which reduces
+  `{0, 2, 3}` in place through `op_utils._moments_scan_contig` and produces
+  `save_mean` / `save_invstd` plus the ATen running-statistic update
+  (measured 0.19-0.85x stock CUDA). Because its backward does not exist,
+  `mojo_device_native_batch_norm` refuses a training call whose inputs require
+  grad IN THE FORWARD — a raise from inside the autograd engine aborts the
+  process on this backend rather than raising. GroupNorm likewise has a fused
+  forward and no backward.
 * **Why it is not optimal.** ResNet / VGG / DenseNet *training* on the mojo
-  device is blocked outright; the `demo_scripts/` vision examples are
-  inference-only for this reason.
-* **What the optimized version looks like.** A two-pass (or Welford) batch-norm
-  training forward producing `save_mean` / `save_invstd`, plus the two backwards,
-  written like the existing layer-norm pair (`normalization_backward_dx.mojo` +
+  device is still blocked — now by the missing backward rather than the
+  missing forward; the `demo_scripts/` vision examples are inference-only for
+  this reason.
+* **What the optimized version looks like.** The two backwards, written like
+  the existing layer-norm pair (`normalization_backward_dx.mojo` +
   `normalization_backward_params.mojo`), which already solve the identical
-  "per-channel parameter reduction across a large outer extent" problem.
+  "per-channel parameter reduction across a large outer extent" problem; the
+  batch-norm one can walk the NCHW geometry exactly as its forward does.
+  Removing the forward preflight is part of that change.
 * **Expected win.** N/A (coverage). Unblocks vision training.
 * **How to measure it.** `tests/test_aten_functions.py` for correctness; a
   resnet-18 training-step benchmark modelled on `bench_nanogpt_train.py` for

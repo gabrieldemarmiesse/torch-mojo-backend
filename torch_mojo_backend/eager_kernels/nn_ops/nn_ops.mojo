@@ -192,91 +192,16 @@ def _batch_norm_go(
 
 # ---------------------------------------------------------------------------
 # Layer norm over the last dim; also writes the per-row mean and rstd
-# (float32), matching aten.native_layer_norm outputs. The CPU path is one
-# parallel task per row. The GPU path launches one thread block per row —
-# transformer decode calls this with few rows (batch * seq_len), so a
-# thread-per-row launch would leave all but a warp of the GPU idle.
+# (float32), matching aten.native_layer_norm outputs. CPU DEVICE ONLY, one
+# parallel task per row: the accelerator route lives in
+# `normalization_forward_ops`, whose kernels serve layer norm, group norm and
+# batch norm from one register-cached / shifted-moment mechanism. Python picks
+# between them in `aten_fast.fast_aten_native_layer_norm`.
 # ---------------------------------------------------------------------------
 
 comptime ROWRED_THREADS = 256
 # log2(ROWRED_THREADS): halving steps in the shared-memory reduction trees.
 comptime ROWRED_STAGES = 8
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
-)
-@__name(t"layer_norm_block_{dtype}")
-def _layer_norm_block_kernel[
-    dtype: DType
-](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mean_out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd_out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    eps: Float32,
-    cols_arg: Int64,
-):
-    """One block per row (grid.x = rows); lanes stride over the row and
-    tree-reduce the sum and squared-deviation partials in shared memory —
-    the same two-pass mean/variance the CPU path computes."""
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var cols = Int(cols_arg)
-    var r = block_idx.x
-    var tid = thread_idx.x
-    var base = r * cols
-
-    var red = stack_allocation[
-        ROWRED_THREADS, DType.float32, address_space=AddressSpace.SHARED
-    ]()
-    var bcast = stack_allocation[
-        2, DType.float32, address_space=AddressSpace.SHARED
-    ]()
-
-    var s = Float32(0)
-    for j in range(tid, cols, ROWRED_THREADS):
-        s += in_ptr[base + j].cast[DType.float32]()
-    red[tid] = s
-    barrier()
-    var stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            red[tid] += red[tid + stride]
-        barrier()
-        stride //= 2
-    if tid == 0:
-        bcast[0] = red[0] / Float32(cols)
-    barrier()
-    var mean = bcast[0]
-
-    var vs = Float32(0)
-    for j in range(tid, cols, ROWRED_THREADS):
-        var d = in_ptr[base + j].cast[DType.float32]() - mean
-        vs += d * d
-    red[tid] = vs
-    barrier()
-    stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            red[tid] += red[tid + stride]
-        barrier()
-        stride //= 2
-    if tid == 0:
-        var rstd0 = 1.0 / ieee_sqrt(red[0] / Float32(cols) + eps)
-        bcast[1] = rstd0
-        mean_out_ptr[r] = mean
-        rstd_out_ptr[r] = rstd0
-    barrier()
-    var rstd = bcast[1]
-
-    for j in range(tid, cols, ROWRED_THREADS):
-        var x = in_ptr[base + j].cast[DType.float32]()
-        var g = gamma_ptr[j].cast[DType.float32]()
-        var b = beta_ptr[j].cast[DType.float32]()
-        out_ptr[base + j] = ((x - mean) * rstd * g + b).cast[dtype]()
 
 
 @always_inline
@@ -330,25 +255,10 @@ def _layer_norm[
 
         _parallel_for[func](rows, ctx)
     else:
-        comptime if has_accelerator():
-            _enqueue_cached[_layer_norm_block_kernel[dtype]](
-                ctx,
-                String(t"layer_norm_block_{dtype}"),
-                rows,
-                1,
-                1,
-                ROWRED_THREADS,
-                out_ptr.as_unsafe_any_origin(),
-                mean_out_ptr.as_unsafe_any_origin(),
-                rstd_out_ptr.as_unsafe_any_origin(),
-                in_ptr.as_unsafe_any_origin().as_immutable(),
-                gamma_ptr.as_unsafe_any_origin().as_immutable(),
-                beta_ptr.as_unsafe_any_origin().as_immutable(),
-                eps,
-                Int64(cols),
-            )
-        else:
-            raise Error("no GPU accelerator available at compile time")
+        raise Error(
+            "GPU layer norm belongs to normalization_forward_ops"
+            " (LayerNormForward); this bridge serves the CPU device"
+        )
 
 
 def _layer_norm_go(
@@ -2263,98 +2173,10 @@ def _adaptive_avg_pool2d_go(
 
 
 # ---------------------------------------------------------------------------
-# Group norm: normalize each (sample, group) over its C/group channels AND all
-# spatial elements together, then apply the per-channel affine. Input is
-# viewed as (rows = N*group, cols = (C/group) * HxW) — the group's elements are
-# a contiguous row because the input is NC(HxW) contiguous. Same two-pass
-# mean/variance as layer norm; mean/rstd are float32, shape (N, group). The GPU
-# path launches one block per row (row counts are small: N*group); the CPU
-# path runs one task per row.
+# Group norm: like layer norm, but the affine parameters are per channel.
+# CPU DEVICE ONLY, one task per (sample, group) row; the accelerator route is
+# `normalization_forward_ops`'s GroupNormForward.
 # ---------------------------------------------------------------------------
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
-)
-@__name(t"group_norm_block_{dtype}")
-def _group_norm_block_kernel[
-    dtype: DType
-](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mean_out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd_out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    eps: Float32,
-    cols_arg: Int64,
-    hxw_arg: Int64,
-    group_arg: Int64,
-    cpg_arg: Int64,
-):
-    """One block per (sample, group) row (grid.x = N*group). Same shared-memory
-    mean/variance reduction as `_layer_norm_block_kernel`; the affine is applied
-    per channel, where channel = (row % group) * cpg + (position // hxw)."""
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var cols = Int(cols_arg)
-    var hxw = Int(hxw_arg)
-    var group = Int(group_arg)
-    var cpg = Int(cpg_arg)
-    var r = block_idx.x
-    var tid = thread_idx.x
-    var g = Int(r) % group
-    var base = r * cols
-
-    var red = stack_allocation[
-        ROWRED_THREADS, DType.float32, address_space=AddressSpace.SHARED
-    ]()
-    var bcast = stack_allocation[
-        2, DType.float32, address_space=AddressSpace.SHARED
-    ]()
-
-    var s = Float32(0)
-    for j in range(tid, cols, ROWRED_THREADS):
-        s += in_ptr[base + j].cast[DType.float32]()
-    red[tid] = s
-    barrier()
-    var stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            red[tid] += red[tid + stride]
-        barrier()
-        stride //= 2
-    if tid == 0:
-        bcast[0] = red[0] / Float32(cols)
-    barrier()
-    var mean = bcast[0]
-
-    var vs = Float32(0)
-    for j in range(tid, cols, ROWRED_THREADS):
-        var d = in_ptr[base + j].cast[DType.float32]() - mean
-        vs += d * d
-    red[tid] = vs
-    barrier()
-    stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            red[tid] += red[tid + stride]
-        barrier()
-        stride //= 2
-    if tid == 0:
-        var rstd0 = 1.0 / ieee_sqrt(red[0] / Float32(cols) + eps)
-        bcast[1] = rstd0
-        mean_out_ptr[r] = mean
-        rstd_out_ptr[r] = rstd0
-    barrier()
-    var rstd = bcast[1]
-
-    for j in range(tid, cols, ROWRED_THREADS):
-        var c = g * cpg + j // hxw
-        var x = in_ptr[base + j].cast[DType.float32]()
-        var gm = gamma_ptr[c].cast[DType.float32]()
-        var bt = beta_ptr[c].cast[DType.float32]()
-        out_ptr[base + j] = ((x - mean) * rstd * gm + bt).cast[dtype]()
 
 
 @always_inline
@@ -2413,28 +2235,10 @@ def _group_norm[
 
         _parallel_for[func](rows, ctx)
     else:
-        comptime if has_accelerator():
-            _enqueue_cached[_group_norm_block_kernel[dtype]](
-                ctx,
-                String(t"group_norm_block_{dtype}"),
-                rows,
-                1,
-                1,
-                ROWRED_THREADS,
-                out_ptr.as_unsafe_any_origin(),
-                mean_out_ptr.as_unsafe_any_origin(),
-                rstd_out_ptr.as_unsafe_any_origin(),
-                in_ptr.as_unsafe_any_origin().as_immutable(),
-                gamma_ptr.as_unsafe_any_origin().as_immutable(),
-                beta_ptr.as_unsafe_any_origin().as_immutable(),
-                eps,
-                Int64(cols),
-                Int64(hxw),
-                Int64(group),
-                Int64(cpg),
-            )
-        else:
-            raise Error("no GPU accelerator available at compile time")
+        raise Error(
+            "GPU group norm belongs to normalization_forward_ops"
+            " (GroupNormForward); this bridge serves the CPU device"
+        )
 
 
 def _group_norm_go(
