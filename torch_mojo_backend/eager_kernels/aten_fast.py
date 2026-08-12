@@ -4171,6 +4171,29 @@ def _bn_geometry(
     return channels, math.prod(a._shape[2:]), a._shape[0] * channels
 
 
+def _bn_inference_saved_stats(
+    running_mean: object, running_var: object, eps: object
+) -> tuple[object, object] | None:
+    """`(save_mean, save_invstd)` for an inference batch norm, or None.
+
+    These are NOT empty in PyTorch.  `batch_norm_cuda_out` resizes `save_mean`
+    to the channel count and copies `running_mean` into it, and `save_invstd`
+    holds `1/sqrt(running_var + eps)` (ATen/native/cuda/Normalization.cu).  The
+    autograd formula for `_native_batch_norm_legit_no_training` forwards both
+    straight into `native_batch_norm_backward` (derivatives.yaml), which is how
+    a frozen BatchNorm still yields gradients — so returning `(0,)` tensors
+    here is a silently wrong answer waiting for the backward to be written.
+    """
+    mean_t, var_t = _t(running_mean), _t(running_var)
+    if mean_t is None or var_t is None:
+        return None
+    save_mean = fast_aten_clone(mean_t)
+    save_invstd = fast_aten_rsqrt(fast_aten_add(var_t, float(eps)))
+    if save_mean is NOT_HANDLED or save_invstd is NOT_HANDLED:
+        return None
+    return save_mean, save_invstd
+
+
 def _fast_batch_norm_inference_gpu(
     a: TorchMojoTensor,
     weight: object,
@@ -4215,8 +4238,10 @@ def _fast_batch_norm_inference_gpu(
         output_dtypes=(out._dtype,),
         keepalive=(out, a, mean_t, var_t, gamma_t, beta_t),
     )
-    # Inference mode returns empty (0,) tensors for the saved stats.
-    return (out, _alloc((0,), a._dtype, a._device), _alloc((0,), a._dtype, a._device))
+    saved = _bn_inference_saved_stats(running_mean, running_var, eps)
+    if saved is None:
+        return NOT_HANDLED
+    return (out, *saved)
 
 
 def _fast_batch_norm_training(
@@ -4349,12 +4374,9 @@ def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, e
             output_dtypes=(out._dtype,),
             keepalive=(a, stats, out),
         )
-        # Inference mode returns empty (0,) tensors for the saved stats.
-        return (
-            out,
-            _alloc((0,), a._dtype, a._device),
-            _alloc((0,), a._dtype, a._device),
-        )
+        saved = _bn_inference_saved_stats(running_mean, running_var, eps)
+        if saved is not None:
+            return (out, *saved)
     a = _tc(input)
     if a is None or a._dtype not in _FLOAT_DTYPES or len(a._shape) < 2:
         return NOT_HANDLED
@@ -4391,8 +4413,10 @@ def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, e
         output_dtypes=(out._dtype,),
         keepalive=(out, a, mean_t, var_t, gamma_t, beta_t),
     )
-    # Inference mode returns empty (0,) tensors for the saved stats.
-    return (out, _alloc((0,), a._dtype, a._device), _alloc((0,), a._dtype, a._device))
+    saved = _bn_inference_saved_stats(running_mean, running_var, eps)
+    if saved is None:
+        return NOT_HANDLED
+    return (out, *saved)
 
 
 def fast_aten_native_batch_norm(
