@@ -1779,9 +1779,7 @@ def test_aten_addr_basic(conf: Conf, dtype: torch.dtype, call_checker: CallCheck
     and ..._bfloat16. beta/alpha values below match the failing OpInfo
     sample exactly.
     """
-    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import (
-        EAGER_CALL_COUNTERS,
-    )
+    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
 
     call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
 

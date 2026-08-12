@@ -1344,21 +1344,23 @@ def _addr_bcast[
         # float32 multiplies with a single final rounding is *more*
         # accurate but drifts from this specific imperfectly-rounded
         # reference (see the module comment above).
-        var t2 = (alpha_f32 * bv.cast[DType.float32]()).cast[dtype]().cast[
-            DType.float32
-        ]()
-        var t3 = (t2 * cv.cast[DType.float32]()).cast[dtype]().cast[
-            DType.float32
-        ]()
+        var t2 = (
+            (alpha_f32 * bv.cast[DType.float32]())
+            .cast[dtype]()
+            .cast[DType.float32]()
+        )
+        var t3 = (
+            (t2 * cv.cast[DType.float32]()).cast[dtype]().cast[DType.float32]()
+        )
         # `self` is masked to 0 rather than branched around: beta==0 must
         # not propagate nan/inf from `self` (matches CPU), and a select on
         # an already-loaded value keeps this branch-free per element.
-        var av = (
-            Scalar[dtype](0) if beta_is_zero else a_ptr[i * as0 + j * as1]
+        var av = Scalar[dtype](0) if beta_is_zero else a_ptr[i * as0 + j * as1]
+        var t1 = (
+            (beta_f32 * av.cast[DType.float32]())
+            .cast[dtype]()
+            .cast[DType.float32]()
         )
-        var t1 = (beta_f32 * av.cast[DType.float32]()).cast[dtype]().cast[
-            DType.float32
-        ]()
         out_ptr[i_flat] = (t1 + t3).cast[dtype]()
 
     # Not `_parallel_for` on CPU -- see the module comment above.
