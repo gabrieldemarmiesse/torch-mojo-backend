@@ -1089,3 +1089,51 @@ def test_compile_with_max_device(mojo_device):
         return torch.sqrt(a)
 
     function_equivalent_on_both_devices(do_sqrt, mojo_device)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a second backend to copy from"
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_to_mojo_from_another_backend(mojo_gpu, dtype):
+    """A tensor on another accelerator must transfer, not fault.
+
+    `_to_copy` and `_copy_from` branch on "is it a TorchMojoTensor", which is
+    not the same question as "is it on the host": with a GPU torch installed
+    they also take a CUDA source, and both upload paths dereference
+    `data_ptr()` as HOST memory.  A CUDA pointer therefore segfaulted the
+    process -- no exception, no message.  Found by the OpInfo `to` samples,
+    which include a cross-device target tensor.
+    """
+    src = torch.randn(3, 5, device="cuda", dtype=dtype)
+    moved = src.to(mojo_gpu)
+    assert moved.device.type == "mojo"
+    assert moved.dtype == dtype
+    assert torch.equal(moved.cpu(), src.cpu())
+
+    cast = src.to(mojo_gpu, dtype=torch.float32)
+    assert cast.dtype == torch.float32
+    assert torch.allclose(cast.cpu(), src.float().cpu())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a second backend to copy from"
+)
+def test_copy_into_mojo_from_another_backend(mojo_gpu):
+    """The same trap on the `copy_` path, including the broadcasting arm."""
+    dest = torch.zeros(3, 5, device=mojo_gpu)
+    src = torch.randn(3, 5, device="cuda")
+    dest.copy_(src)
+    assert torch.equal(dest.cpu(), src.cpu())
+
+    wide = torch.zeros(4, 3, device=mojo_gpu)
+    row = torch.arange(3, device="cuda", dtype=torch.float32)
+    wide.copy_(row)
+    assert torch.equal(wide.cpu(), row.cpu().expand(4, 3).contiguous())
+
+
+def test_from_cpu_rejects_a_device_source(mojo_gpu):
+    """The guard behind both call sites: a message, never a fault."""
+    on_device = torch.zeros(4, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="requires a CPU source"):
+        TorchMojoTensor._from_cpu(on_device, on_device._device)

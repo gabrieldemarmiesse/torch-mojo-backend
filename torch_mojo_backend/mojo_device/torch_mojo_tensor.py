@@ -429,6 +429,15 @@ class TorchMojoTensor(torch.Tensor):
         from max.experimental.torch.torch import torch_dtype_to_max
 
         t = cpu_tensor.detach()
+        if t.device.type != "cpu":
+            # alloc_from_host below dereferences data_ptr() as HOST memory, so
+            # handing it a device pointer faults inside the runtime instead of
+            # raising anything Python can catch.  Callers must bounce through
+            # the host; this turns a future mistake into a message.
+            raise RuntimeError(
+                "TorchMojoTensor._from_cpu requires a CPU source tensor, got "
+                f"{t.device}; copy it to the host before uploading."
+            )
         if not t.is_contiguous():
             t = t.contiguous()
         dtype = torch_dtype_to_max(t.dtype)

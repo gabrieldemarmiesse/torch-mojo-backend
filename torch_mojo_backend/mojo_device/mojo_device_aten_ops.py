@@ -239,6 +239,12 @@ def mojo_device__copy_from(self, dest, non_blocking: bool = False):
         torch_dtype = max_dtype_to_torch_dtype(dest._dtype)
         if cpu.dtype != torch_dtype:
             cpu = cpu.to(torch_dtype)
+        if cpu.device.type != "cpu":
+            # Same trap as _to_copy: the source only has to be non-mojo, and
+            # copy_from_host below reads data_ptr() as host memory.  Bounce a
+            # CUDA (or other backend) source through the host after the cast,
+            # before the broadcast materializes anything.
+            cpu = cpu.cpu()
         if tuple(cpu.shape) != tuple(dest._shape):
             cpu = cpu.broadcast_to(dest._shape)
         cpu = cpu.contiguous()
@@ -284,10 +290,17 @@ def mojo_device__to_copy(
 ):
     aten_fast = _fast()
     if not isinstance(tensor, TorchMojoTensor):
-        # CPU tensor moving onto mojo_device (optionally casting on host).
+        # Any non-mojo tensor moving onto mojo_device (optionally casting
+        # first).  "Not mojo" is not "on the host": with a GPU torch installed
+        # this branch also takes `x.cuda().to("mojo")`, and _from_cpu passes
+        # data_ptr() to alloc_from_host, which reads it as HOST memory -- so a
+        # CUDA pointer segfaulted the process instead of raising.  Cast before
+        # the bounce: on a downcast that shrinks the transfer.
         t = tensor.detach()
         if dtype is not None and t.dtype != dtype:
             t = t.to(dtype)
+        if t.device.type != "cpu":
+            t = t.cpu()
         return TorchMojoTensor._from_cpu(
             t, find_equivalent_max_device(device), non_blocking=non_blocking
         )
