@@ -11,24 +11,30 @@
 # than NN for the cp.async pipeline (the physical layout IS the smem slab
 # layout), so every suite shape beats NN parity rather than just matching.
 #
-# Two 128x128 cores plus a 64x64 small-shape core (tn_f32_gemm_core.mojo):
+# One 128x128 core plus a 64x64 small-shape core (tn_f32_gemm_core.mojo):
 #
-#   - `_tn_split_kernel`: warp-group split-K-in-block, 8x16 thread tile,
-#     255 regs -> 1 CTA/SM. Runs the m,n >= 96 shapes whenever both
-#     operands are 16B-alignable. Waves are 114 blocks; partial waves are
-#     expensive at 1 CTA/SM (1.26 waves ran 45% slower than 0.95 waves on
-#     768x768), so the fill-aware picker matters most here.
 #   - `_tn_core_kernel` 128x128: quadrant-warp-tiled 8x8 thread tile,
-#     2 CTAs/SM (228-block waves). Runs the misaligned m,n >= 96 shapes:
-#     its 4-byte-cp.async staging needs half as many copy instructions per
-#     thread as the split kernel's 128-thread groups (measured faster on
-#     357x789x4571).
+#     2 CTAs/SM (228-block waves), STAGES=2. Runs every m,n >= 96 shape
+#     regardless of operand alignment (VEC_A/VEC_B are picked per-call
+#     from the alignment gates below). A de-phased-pipeline sibling,
+#     `_tn_split_kernel` (warp-group split-K-in-block, 8x16 thread tile),
+#     used to run instead whenever both operands were 16B-alignable; it
+#     is gone because its stage buffers cannot fit the ptxas static
+#     shared-memory budget on this toolchain at BM=BN=128,BK=16 for any
+#     STAGES it is allowed to run at (see the note in
+#     tn_f32_gemm_core.mojo). `_tn_core_kernel` itself only fits that
+#     budget at STAGES=2 (0x8000 bytes) rather than the STAGES=4 (0x10000
+#     bytes) it ran at alongside the split kernel; both facts came from
+#     directly reproducing the ptxas failure (`mojo build --emit
+#     shared-lib` with MODULAR_NVPTX_COMPILER_PATH pointed at a real
+#     ptxas, on an actual H100) rather than guesswork.
 #   - `_tn_core_kernel` 64x64 with the deep-K one-wave split rule for
-#     smaller shapes.
+#     smaller shapes (STAGES=4, unaffected -- its stage buffers are a
+#     quarter the 128x128 tile's and were never close to the cap).
 #   - `_pick_ksplits_wave` minimizes 1/fill + reduce_penalty over ks with
-#     the core's own wave size (228 or 114); reduce_penalty charges the
+#     the core's own wave size (228); reduce_penalty charges the
 #     split-K workspace traffic (2*ks*m*n*4 B at ~1.5 TB/s) against the
-#     ideal GEMM time. Constants are physics; the wave sizes were
+#     ideal GEMM time. Constants are physics; the wave size was
 #     measured on H100 PCIe @ 1500 MHz locked clocks (114 SMs).
 #   - Split-K partials to a stream-ordered workspace + deterministic
 #     reduce: the stock `_ksplit_reduce_kernel` for <= 32 splits, one-pass
@@ -60,7 +66,7 @@ from std.sys.info import _has_sm_9x
 
 from gemm_splitk_common import TARGET_BLOCKS, _ksplit_reduce_kernel
 from op_utils import _enqueue_cached, _make_ptr
-from tn_f32_gemm_core import _tn_core_kernel, _tn_split_kernel
+from tn_f32_gemm_core import _tn_core_kernel
 
 
 # Split-K workspace cap. 32 MB never binds for the tiny-MN deep-K regime it
@@ -70,15 +76,13 @@ comptime SPLITK_WS_CAP_BYTES = 32 * 1024 * 1024
 comptime SPLITK_GENERIC_CAP = 32
 # One full wave for the 128x128 quadrant core at its measured 2-blocks/SM
 # residency (H100 PCIe @ 1500 MHz, 114 SMs; 122 regs/thread -> 2 CTAs).
-# Card-fitted in value, portable in form (2 x SM count).
+# Card-fitted in value, portable in form (2 x SM count). Measured at
+# STAGES=4; occupancy here is register-bound, not smem-bound (2 CTAs x
+# 64 KiB of stage buffers already fit well inside a 227 KiB/SM Hopper
+# budget), so this residency -- and the wave size derived from it -- still
+# holds at STAGES=2, which is what actually runs now (see
+# tn_f32_gemm_core.mojo for why).
 comptime WAVE_T128 = 228
-# One full wave for the warp-group split core (255 regs -> 1 CTA/SM).
-# Card-fitted in value (H100 PCIe @ 1500 MHz, 114 SMs), portable in form
-# (1 x SM count). Partial waves are much more expensive at 1 CTA/SM than
-# at 2 (measured: 144 blocks = 1.26 waves ran 45% slower than 108 blocks =
-# 0.95 waves on 768x768x12288), so the fill term of the picker matters
-# more here.
-comptime WAVE_SPLIT = 114
 # Minimum k-chunk for a 128x128 split: amortizes the pipeline prologue and
 # the per-block epilogue over >= 16 slabs.
 comptime KCHUNK_MIN_T128 = 256
@@ -260,112 +264,13 @@ def _tn_core_launch[
         )
 
 
-@always_inline
-def _tn_split_launch[
-    BM: Int,
-    BN: Int,
-    BK: Int,
-    STAGES: Int,
-    LR: Int = 8,
-    SERP: Bool = False,
-](
-    ctx: DeviceContext,
-    gx: Int,
-    gy: Int,
-    gz: Int,
-    c_addr: Int,
-    a_addr: Int,
-    b_addr: Int,
-    m: Int,
-    n: Int,
-    k: Int,
-    ksplits: Int,
-    va4: Bool,
-    vb4: Bool,
-) raises:
-    """Launch the warp-group split core (256 threads) with VEC_A/VEC_B
-    picked by the caller's alignment gates."""
-    var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
-    var a = (
-        _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var b = (
-        _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
-    )
-
-    if va4 and vb4:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 4, 4, STAGES, LR, SERP]](
-            ctx,
-            String(t"tn_s_{BM}x{BN}x{BK}_v44_s{STAGES}_l{LR}_z{SERP}"),
-            gx,
-            gy,
-            gz,
-            256,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
-    elif va4:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 4, 1, STAGES, LR, SERP]](
-            ctx,
-            String(t"tn_s_{BM}x{BN}x{BK}_v41_s{STAGES}_l{LR}_z{SERP}"),
-            gx,
-            gy,
-            gz,
-            256,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
-    elif vb4:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 1, 4, STAGES, LR, SERP]](
-            ctx,
-            String(t"tn_s_{BM}x{BN}x{BK}_v14_s{STAGES}_l{LR}_z{SERP}"),
-            gx,
-            gy,
-            gz,
-            256,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
-    else:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 1, 1, STAGES, LR, SERP]](
-            ctx,
-            String(t"tn_s_{BM}x{BN}x{BK}_v11_s{STAGES}_l{LR}_z{SERP}"),
-            gx,
-            gy,
-            gz,
-            256,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
-
-
 def _pick_ksplits_wave(base: Int, m: Int, n: Int, k: Int, wave: Int) -> Int:
     """Fill-aware split-K factor for the 128x128 cores.
 
     Minimizes  1/fill + reduce_penalty  where
       fill = blocks / (ceil(blocks / wave) * wave)   (wave quantization at
-             the core's measured residency: 228 blocks/wave for the 2-CTA
-             `_tn_core_kernel`, 114 for the 1-CTA `_tn_split_kernel`), and
+             the 2-CTA `_tn_core_kernel`'s measured 228-block/wave
+             residency), and
       reduce_penalty = (2 * ks * m * n * 4 B / 1.5e12 B/s) / ideal_gemm_s
              charges the workspace write+read against the ideal GEMM time.
     Candidates capped by kchunk >= KCHUNK_MIN_T128 and the workspace bytes.
@@ -429,14 +334,12 @@ def try_enqueue_tn_f32_gemm(
         assume it; outputs are fresh contiguous allocations, so this never
         triggers in practice).
 
-    For m, n >= 96: 128x128 tiles with a fill-aware split-K picker. When
-    both operands are 16B-alignable the warp-group split core runs (8x16
-    thread tile, 2 de-phased 4-warp pipelines, 1 CTA/SM -> 114-block
-    waves); otherwise the quadrant core (8x8 thread tile, 2 CTAs/SM ->
-    228-block waves), whose 4-byte-cp.async staging costs half as many
-    copy instructions per thread (measured faster on 357x789x4571). 64x64
-    core with the deep-K split rules for smaller shapes. Correct for any
-    m, n, k >= 1 (all loads/stores edge-guarded, cp.async zero-fills).
+    For m, n >= 96: the 128x128 quadrant core (8x8 thread tile, 2 CTAs/SM
+    -> 228-block waves) with a fill-aware split-K picker, regardless of
+    operand alignment (VEC_A/VEC_B are picked per-call from the alignment
+    gates). 64x64 core with the deep-K split rules for smaller shapes.
+    Correct for any m, n, k >= 1 (all loads/stores edge-guarded, cp.async
+    zero-fills).
     """
     comptime if not _has_sm_9x():
         return False
@@ -458,7 +361,6 @@ def try_enqueue_tn_f32_gemm(
     var vb4 = n % 4 == 0 and b_addr % 16 == 0
 
     var use_t128 = m >= 96 and n >= 96
-    var use_split = use_t128 and va4 and vb4
 
     var gx: Int
     var gy: Int
@@ -466,9 +368,8 @@ def try_enqueue_tn_f32_gemm(
     if use_t128:
         gx = ceildiv(n, 128)
         gy = ceildiv(m, 128)
-        var wave = WAVE_SPLIT if use_split else WAVE_T128
         ksplits = _stabilize_ksplits(
-            _pick_ksplits_wave(gx * gy, m, n, k, wave), k, 16
+            _pick_ksplits_wave(gx * gy, m, n, k, WAVE_T128), k, 16
         )
     else:
         gx = ceildiv(n, 64)
@@ -498,45 +399,14 @@ def try_enqueue_tn_f32_gemm(
         ws = ctx.enqueue_create_buffer[DType.float32](ksplits * m * n)
         c_target = Int(ws.value().unsafe_ptr())
 
-    if use_split:
-        # Deep splits mean short per-group chains (kchunk <= ~2 x
-        # KCHUNK_MIN_T128 slabs); STAGES=2's one-slab prologue amortizes
-        # better there (interleaved A/B on 128x128x131072 ks=114: s2
-        # 0.157 ms vs s4 0.158-0.159 ms). Long chains keep STAGES=4.
-        if ksplits > SPLITK_GENERIC_CAP:
-            _tn_split_launch[128, 128, 16, 2](
-                ctx,
-                gx,
-                gy,
-                ksplits,
-                c_target,
-                a_addr,
-                b_addr,
-                m,
-                n,
-                k,
-                ksplits,
-                va4,
-                vb4,
-            )
-        else:
-            _tn_split_launch[128, 128, 16, 4](
-                ctx,
-                gx,
-                gy,
-                ksplits,
-                c_target,
-                a_addr,
-                b_addr,
-                m,
-                n,
-                k,
-                ksplits,
-                va4,
-                vb4,
-            )
-    elif use_t128:
-        _tn_core_launch[128, 128, 16, 32, 64, 4, 4, 2](
+    if use_t128:
+        # STAGES=2, not the 4 an earlier revision used: at BM=BN=128,BK=16
+        # the stage buffers are STAGES * (BM*BK + BK*BN) floats, 0x10000
+        # bytes at STAGES=4 vs 0x8000 at STAGES=2, and ptxas on this
+        # toolchain caps static shared memory at 0xc000 bytes on sm_90 --
+        # STAGES=4 no longer builds (verified directly against a real
+        # ptxas on an H100; see tn_f32_gemm_core.mojo).
+        _tn_core_launch[128, 128, 16, 32, 64, 4, 2, 2](
             ctx,
             gx,
             gy,

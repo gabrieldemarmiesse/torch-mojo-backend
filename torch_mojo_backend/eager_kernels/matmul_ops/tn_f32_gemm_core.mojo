@@ -5,7 +5,7 @@
 #
 #   C[m,n] = A_phys[k,m]^T @ B[k,n]
 #
-# Two device kernels, dispatched by `tn_f32_gemm_kernels.mojo`:
+# One device kernel, dispatched by `tn_f32_gemm_kernels.mojo`:
 #
 # `_tn_core_kernel` — the repo `_gemm_pipe3_kernel` (AT=True) restructured
 # around the two limiters ncu found while profiling that kernel on 4096^3
@@ -38,35 +38,29 @@
 # order per output element is the same sequential-over-k FFMA chain as
 # pipe3/NN, so the NN fp32 comparison tolerances apply unchanged.
 #
-# `_tn_split_kernel` — block-internal split-K by warp group. Motivation
-# (measured on the same card):
-#
-#   - The 8x8-thread-tile 128x128 core (`_tn_core_kernel`) issues at 83%
-#     (4 warps/scheduler from 2 de-phased CTAs) but its FFMA:issue mix caps
-#     at ~86% (1024 FFMA vs ~70 LDS + ~95 control per slab).
-#   - The cuBLAS-geometry 128x256 / 8x16-thread-tile core reaches ~89-91%
-#     mix but only ~75% issue: at 254 regs it is 1 CTA/SM, so each
-#     scheduler holds 2 warps of the SAME block, co-phased by the slab
-#     barrier -> their stalls correlate and neither can cover the other.
-#
-# This kernel keeps the 8x16 thread tile (2048 FFMA/slab -> the good mix)
-# but restores de-phased dual pipelines WITHIN the single resident block:
-# 256 threads = 2 warp GROUPS of 4 warps. Each group covers the WHOLE
-# 128x128 tile over HALF of the block's k-chunk (block-internal split-K),
-# with its OWN smem stage buffers and its OWN named barrier — the groups
-# never synchronize during the main loop, so each scheduler again holds
-# two mutually de-phased warps (one per group), like the 2-CTA t128 case,
-# while every FFMA belongs to a 128-accumulator thread tile.
-#
-# At the end, the groups meet at a full-block barrier, then group 1
-# publishes its accumulators through shared memory (group 1's stage area,
-# reused once both pipelines are done) and group 0 adds and stores C.
-# The exchange is fully barrier-serialized: an earlier version let group 1
-# store into its own stage area WHILE group 0 was still looping, and that
-# overlap produced intermittent slab-sized errors on this card (e.g.
-# 256x256x131072, ks=28) — do not reintroduce it. Accumulation order per
-# element is two sequential-over-k FFMA chains summed once — the same
-# numerics as ordinary two-way split-K.
+# A second kernel, `_tn_split_kernel` (block-internal split-K by warp
+# group: two 4-warp groups each cover the WHOLE 128x128 tile over HALF of
+# the block's k-chunk, trading smem for a de-phased-pipeline issue-rate win
+# over `_tn_core_kernel`; see git history around 2026-08 for the full
+# design writeup) USED to run alongside this one. It is gone: its stage
+# buffers are `2 * STAGES * BK * (BM + BN)` floats (one full A+B tile per
+# warp group) — 0x10000 bytes at STAGES=2, 0x20000 at STAGES=4 for the
+# 128x128x16 tile it was launched at — and ptxas on this toolchain caps
+# *static* (non-opt-in) shared memory at 0xc000 bytes (48 KiB) on every sm_90
+# part, so BOTH stage counts fail `ptxas error: ... uses too much shared
+# data` (verified directly: `mojo build --emit shared-lib` with
+# MODULAR_NVPTX_COMPILER_PATH pointed at ptxas 12.8 on an actual H100).
+# `_tn_core_kernel` needs only `STAGES * BM * BK + STAGES * BK * BN` floats
+# (one group's worth) for the same tile, which fits at STAGES=2 (0x8000
+# bytes) — `tn_f32_gemm_kernels.mojo` now launches the 128x128 tile at
+# STAGES=2 instead of reaching for `_tn_split_kernel`. Making the split
+# kernel fit again needs genuine dynamic-shared-memory opt-in (`external_
+# memory` + `FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES`, the pattern
+# `matmul_ops.mojo`'s `multistage_gemm_kernel` launches and
+# `softmax_backward_kernels.mojo`/`tf32_gemm_kernels.mojo` already use for
+# their own hand-written kernels) plus a threaded `shared_mem_bytes`/
+# `func_attribute` path through `_enqueue_cached` — real kernel-level work,
+# out of scope for the smem-budget fix that removed it here.
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.sync import barrier
@@ -77,7 +71,6 @@ from max.gpu.memory import (
     async_copy_wait_group,
 )
 from std.memory import AddressSpace
-from max.gpu.sync import named_barrier
 from std.math import ceildiv
 from std.memory import stack_allocation
 from std.utils.static_tuple import StaticTuple
@@ -379,271 +372,6 @@ def _tn_core_kernel[
     # When VEC_B == 4 every in-range vector store is 16B aligned (n % 4 == 0
     # and a 16B-aligned C base are part of that gate) — say so, or the
     # store scalarizes like the loads did.
-    comptime CALIGN = 16 if VEC_B == 4 else 4
-    comptime for i in range(TM):
-        var row = bm + wr * WM + tr * TM + i
-        if row < m:
-            comptime for qn in range(QN):
-                var col = bn + wc * WN + qn * (LC * 4) + tc * 4
-                var v = acc[i * QN + qn]
-                if col + 4 <= n:
-                    c_ptr.store[alignment=CALIGN](row * n + col, v)
-                else:
-                    comptime for j in range(4):
-                        if col + j < n:
-                            c_ptr[row * n + col + j] = v[j]
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(256)),
-    `nvvm.minctasm`=SIMDLength(1),
-)
-@__name(t"tn_split_{BM}x{BN}x{BK}_va{VEC_A}_vb{VEC_B}_s{STAGES}_l{LR}_z{SERP}")
-def _tn_split_kernel[
-    BM: Int,
-    BN: Int,
-    BK: Int,
-    VEC_A: Int,
-    VEC_B: Int,
-    STAGES: Int,
-    LR: Int = 8,  # lane-grid rows within a warp (8 -> 8x16, 4 -> 16x8)
-    SERP: Bool = False,  # serpentine quadrant order (operand-reuse aid)
-](
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    m_arg: Int64,
-    n_arg: Int64,
-    k_arg: Int64,
-    ksplits_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var m = Int(m_arg)
-    var n = Int(n_arg)
-    var k = Int(k_arg)
-    var ksplits = Int(ksplits_arg)
-
-    comptime F32 = DType.float32
-    comptime TG = 128  # threads per warp group (4 warps)
-    # Warp grid within a group: 2x2 warps of 64x64; lanes LR=8 x LC=4;
-    # thread tile TM=8 rows x QN=4 float4 quadrants (8x16 = 128 acc).
-    comptime WM = 64
-    comptime WN = 64
-    comptime LC = 32 // LR
-    comptime TM = WM // LR
-    comptime QN = WN // (LC * 4)
-    comptime NA = (BM * BK) // (TG * VEC_A)
-    comptime NB = (BK * BN) // (TG * VEC_B)
-    comptime assert BM == 2 * WM and BN == 2 * WN
-    comptime assert (BM * BK) % (TG * VEC_A) == 0
-    comptime assert (BK * BN) % (TG * VEC_B) == 0
-    comptime assert STAGES >= 2
-
-    var ks = block_idx.z
-    var kchunk = ceildiv(ceildiv(k, ksplits), BK) * BK
-    var k_start = ks * kchunk
-    var k_end = min(k, k_start + kchunk)
-    var ns = ceildiv(k_end - k_start, BK)
-    if ns <= 0:
-        return
-
-    var c_ptr = c_base + block_idx.z * m * n
-
-    var bm = block_idx.y * BM
-    var bn = block_idx.x * BN
-    var tid = thread_idx.x
-    var gid = tid // TG
-    var ltid = tid % TG
-    var warp = ltid // 32
-    var lane = ltid % 32
-    var wr = warp // 2
-    var wc = warp % 2
-    var tr = lane // LC
-    var tc = lane % LC
-
-    # Group-major smem: [g0: A stages | B stages][g1: A stages | B stages].
-    # Group 1's contiguous region (GROUP_F floats) doubles as the
-    # accumulator-exchange buffer once both main loops have ended.
-    comptime GROUP_F = STAGES * BK * (BM + BN)
-    # Half the accs per round: a single 32-acc round makes ptxas spill
-    # (104 B stack) at the 255-reg ceiling; 16-acc rounds stay spill-free.
-    comptime EX_CHUNK = min((TM * QN) // 2, GROUP_F // (TG * 4))
-    comptime EX_ROUNDS = (TM * QN + EX_CHUNK - 1) // EX_CHUNK
-    comptime assert EX_CHUNK >= 1
-    var smem = stack_allocation[
-        2 * GROUP_F, F32, address_space=AddressSpace.SHARED
-    ]()
-    var a_smem = smem + gid * GROUP_F
-    var b_smem = a_smem + STAGES * BK * BM
-    var ex_smem = smem + GROUP_F
-
-    var am0 = wr * WM + tr * TM
-    var bn0 = wc * WN + tc * 4
-
-    var acc = InlineArray[SIMD[F32, 4], TM * QN](fill=SIMD[F32, 4](0))
-
-    # Block-internal split-K: group 0 takes slabs [0, nsl0), group 1 takes
-    # [nsl0, ns). Group 0 gets the extra slab and is the finisher.
-    var nsl0 = (ns + 1) // 2
-    var s_begin = 0 if gid == 0 else nsl0
-    var nsg = nsl0 if gid == 0 else ns - nsl0
-
-    # ---- staging invariants (see _tn_core_kernel above) ----------------
-    comptime COLS_A = BM // VEC_A
-    comptime COLS_B = BN // VEC_B
-    comptime ROWS_A_STEP = TG // COLS_A
-    comptime ROWS_B_STEP = TG // COLS_B
-    comptime assert TG % COLS_A == 0 and TG % COLS_B == 0
-    var a_cm = (ltid % COLS_A) * VEC_A
-    var a_bkk = ltid // COLS_A
-    var a_col = bm + a_cm
-    var a_bytes = Int32(max(0, min(VEC_A, m - a_col)) * 4)
-    var a_colc = a_col if a_bytes > 0 else 0
-    var a_rstep = ROWS_A_STEP * m
-    var b_cn = (ltid % COLS_B) * VEC_B
-    var b_bkk = ltid // COLS_B
-    var b_col = bn + b_cn
-    var b_bytes = Int32(max(0, min(VEC_B, n - b_col)) * 4)
-    var b_colc = b_col if b_bytes > 0 else 0
-    var b_rstep = ROWS_B_STEP * n
-    var a_srcs = (k_start + s_begin * BK + a_bkk) * m + a_colc
-    var b_srcs = (k_start + s_begin * BK + b_bkk) * n + b_colc
-
-    @always_inline
-    @parameter
-    def _fetch[GUARDED: Bool](s: Int, buf: Int):
-        # Issues the copies for GLOBAL slab `s` into this group's smem
-        # buffer `buf`.
-        var kt = k_start + s * BK
-
-        var a_dst = a_smem + (buf * BM * BK + a_bkk * BM + a_cm)
-        var a_src = a_srcs
-        comptime for t in range(NA):
-            var bytes = a_bytes
-            comptime if GUARDED:
-                if kt + a_bkk + t * ROWS_A_STEP >= k_end:
-                    bytes = 0
-            async_copy[VEC_A * 4, fill=Scalar[F32](0)](
-                (a_base + (a_src + t * a_rstep)).address_space_cast[
-                    AddressSpace.GLOBAL
-                ](),
-                (a_dst + t * (ROWS_A_STEP * BM)).address_space_cast[
-                    AddressSpace.SHARED
-                ](),
-                src_size=bytes,
-            )
-
-        var b_dst = b_smem + (buf * BK * BN + b_bkk * BN + b_cn)
-        var b_src = b_srcs
-        comptime for t in range(NB):
-            var bytes = b_bytes
-            comptime if GUARDED:
-                if kt + b_bkk + t * ROWS_B_STEP >= k_end:
-                    bytes = 0
-            async_copy[VEC_B * 4, fill=Scalar[F32](0)](
-                (b_base + (b_src + t * b_rstep)).address_space_cast[
-                    AddressSpace.GLOBAL
-                ](),
-                (b_dst + t * (ROWS_B_STEP * BN)).address_space_cast[
-                    AddressSpace.SHARED
-                ](),
-                src_size=bytes,
-            )
-
-    @always_inline
-    @parameter
-    def _fetch_slab(s: Int, buf: Int):
-        # The row guard can only fail on the LAST slab of the block chunk
-        # (the k tail), which lives in exactly one group's range.
-        if s == ns - 1:
-            _fetch[True](s, buf)
-        else:
-            _fetch[False](s, buf)
-        a_srcs += BK * m
-        b_srcs += BK * n
-
-    @always_inline
-    @parameter
-    def _compute(aoff: Int, boff: Int):
-        var a_base_s = a_smem + aoff
-        var b_base_s = b_smem + boff
-        var a_cur = a_base_s.load[width=TM, alignment=16](am0)
-        var b_cur = InlineArray[SIMD[F32, 4], QN](uninitialized=True)
-        comptime for q in range(QN):
-            b_cur[q] = b_base_s.load[width=4, alignment=16](bn0 + q * (LC * 4))
-        comptime for kk in range(BK - 1):
-            var a_nxt = a_base_s.load[width=TM, alignment=16](
-                (kk + 1) * BM + am0
-            )
-            var b_nxt = InlineArray[SIMD[F32, 4], QN](uninitialized=True)
-            comptime for q in range(QN):
-                b_nxt[q] = b_base_s.load[width=4, alignment=16](
-                    (kk + 1) * BN + bn0 + q * (LC * 4)
-                )
-            comptime for i in range(TM):
-                comptime for qz in range(QN):
-                    comptime q = (qz if not SERP or i % 2 == 0 else QN - 1 - qz)
-                    acc[i * QN + q] = b_cur[q].fma(
-                        SIMD[F32, 4](a_cur[i]), acc[i * QN + q]
-                    )
-            a_cur = a_nxt
-            comptime for q in range(QN):
-                b_cur[q] = b_nxt[q]
-        comptime for i in range(TM):
-            comptime for qz in range(QN):
-                comptime q = qz if not SERP or i % 2 == 0 else QN - 1 - qz
-                acc[i * QN + q] = b_cur[q].fma(
-                    SIMD[F32, 4](a_cur[i]), acc[i * QN + q]
-                )
-
-    # ---- per-group pipelined main loop (never syncs the other group) ---
-    for st in range(min(STAGES - 1, nsg)):
-        _fetch_slab(s_begin + st, st)
-        async_copy_commit_group()
-    for _ in range(nsg, STAGES - 1):
-        async_copy_commit_group()
-
-    for i in range(nsg):
-        async_copy_wait_group(Int32(STAGES - 2))
-        named_barrier[Int32(TG)](Int32(1 + gid))
-
-        if i + STAGES - 1 < nsg:
-            _fetch_slab(s_begin + i + STAGES - 1, (i + STAGES - 1) % STAGES)
-        async_copy_commit_group()
-
-        var buf = i % STAGES
-        _compute(buf * (BM * BK), buf * (BK * BN))
-
-    # ---- exchange: group 1 publishes, group 0 adds and stores C --------
-    # Fully serialized: both groups first meet at a full barrier (their
-    # pipelines are drained — every real cp.async completed before each
-    # group's last wait), then rounds of EX_CHUNK accs go through group
-    # 1's stage area with a barrier on each side of the store->read edge.
-    barrier()
-    comptime for r in range(EX_ROUNDS):
-        if gid == 1:
-            comptime for j in range(EX_CHUNK):
-                comptime idx = r * EX_CHUNK + j
-                comptime if idx < TM * QN:
-                    ex_smem.store[alignment=16](
-                        ltid * (EX_CHUNK * 4) + j * 4, acc[idx]
-                    )
-        barrier()
-        if gid == 0:
-            comptime for j in range(EX_CHUNK):
-                comptime idx = r * EX_CHUNK + j
-                comptime if idx < TM * QN:
-                    acc[idx] += ex_smem.load[width=4, alignment=16](
-                        ltid * (EX_CHUNK * 4) + j * 4
-                    )
-        comptime if r != EX_ROUNDS - 1:
-            barrier()
-
-    if gid != 0:
-        return
-
-    # Epilogue (group 0 only): identical to _tn_core_kernel's.
     comptime CALIGN = 16 if VEC_B == 4 else 4
     comptime for i in range(TM):
         var row = bm + wr * WM + tr * TM + i
