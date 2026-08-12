@@ -89,6 +89,10 @@ dev = [
     "mojo-compiler-mojo-libs==1.0.0rc1",
     "hatchling",
     "ipython",
+    # torch ships torch/testing/_internal inside the wheel but not this, its
+    # one missing import: without expecttest, common_methods_invocations -- the
+    # OpInfo database the conformance/ suite runs -- cannot be imported at all.
+    "expecttest>=0.2.1",
     "pillow>=11.3.0",
     "pytest>=8.4.1",
     "pytest-forked>=1.6.0",
