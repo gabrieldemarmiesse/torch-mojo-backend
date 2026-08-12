@@ -194,7 +194,8 @@ def _batch_norm_infer_go(
     var_obj: PyObjectPtr,
     weight_obj: PyObjectPtr,
     bias_obj: PyObjectPtr,
-    params: PyObjectPtr,  # (eps, channels, inner, planes, has_weight, has_bias)
+    params: PyObjectPtr,  # (eps, channels, inner, planes, has_weight,
+    #  has_bias, save_mean_addr, save_invstd_addr)
     context_obj: PyObjectPtr,
 ) raises:
     """`aten::_native_batch_norm_legit_no_training` / eval-mode batch norm."""
@@ -210,10 +211,16 @@ def _batch_norm_infer_go(
     var planes = _raw_tuple_int(params, 3)
     var has_weight = _raw_tuple_int(params, 4) != 0
     var has_bias = _raw_tuple_int(params, 5) != 0
+    # torch fills both saved statistics on this route (Normalization.cu:454);
+    # the elementwise kernel emits them from the prologue it already runs.
+    var save_mean_addr = _raw_tuple_int(params, 6)
+    var save_invstd_addr = _raw_tuple_int(params, 7)
     if channels <= 0 or inner <= 0 or planes <= 0:
         raise Error("batch norm geometry must be positive")
     if out_addr == 0 or in_addr == 0 or mean_addr == 0 or var_addr == 0:
         raise Error("batch norm required pointers must be nonzero")
+    if save_mean_addr == 0 or save_invstd_addr == 0:
+        raise Error("batch norm inference saved-stat pointers must be nonzero")
     if (has_weight and weight_addr == 0) or (has_bias and bias_addr == 0):
         raise Error("batch norm enabled affine pointers must be nonzero")
     var ctx = _raw_ctx(context_obj)
@@ -244,6 +251,8 @@ def _batch_norm_infer_go(
                         has_weight,
                         has_bias,
                         ctx,
+                        save_mean_addr,
+                        save_invstd_addr,
                     )
     if not handled:
         raise Error("unsupported dtype combination for batch norm inference")

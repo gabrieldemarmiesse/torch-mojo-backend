@@ -4221,6 +4221,11 @@ def _fast_batch_norm_inference_gpu(
     channels, inner, planes = geom
     a = _tc(a)
     out = _alloc(a._shape, a._dtype, a._device)
+    # The kernel emits the saved statistics itself: see _bn_inference_saved_stats
+    # for why they must not be empty, and the kernel docstring for why doing it
+    # there rather than in three extra launches matters at small `inner`.
+    save_mean = _alloc((channels,), mean_t._dtype, a._device)
+    save_invstd = _alloc((channels,), mean_t._dtype, a._device)
     _call_mojo(
         _NormalizationForwardExtension,
         "BatchNormInfer",
@@ -4231,17 +4236,23 @@ def _fast_batch_norm_inference_gpu(
             var_t._ptr,
             gamma_t._ptr,
             beta_t._ptr,
-            (float(eps), channels, inner, planes, 1, 1),
+            (
+                float(eps),
+                channels,
+                inner,
+                planes,
+                1,
+                1,
+                save_mean._ptr,
+                save_invstd._ptr,
+            ),
             _ctx_ptr(a._device),
         ),
         arg_dtypes=(a._dtype, mean_t._dtype, gamma_t._dtype),
         output_dtypes=(out._dtype,),
-        keepalive=(out, a, mean_t, var_t, gamma_t, beta_t),
+        keepalive=(out, a, mean_t, var_t, gamma_t, beta_t, save_mean, save_invstd),
     )
-    saved = _bn_inference_saved_stats(running_mean, running_var, eps)
-    if saved is None:
-        return NOT_HANDLED
-    return (out, *saved)
+    return (out, save_mean, save_invstd)
 
 
 def _fast_batch_norm_training(

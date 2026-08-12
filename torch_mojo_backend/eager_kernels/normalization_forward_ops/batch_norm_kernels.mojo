@@ -145,6 +145,8 @@ def _bn_elementwise_kernel[
     var_ptr: UnsafePointer[Scalar[sdtype], ImmutAnyOrigin],
     gamma_ptr: UnsafePointer[Scalar[pdtype], ImmutAnyOrigin],
     beta_ptr: UnsafePointer[Scalar[pdtype], ImmutAnyOrigin],
+    save_mean_ptr: UnsafePointer[Scalar[sdtype], MutAnyOrigin],
+    save_invstd_ptr: UnsafePointer[Scalar[sdtype], MutAnyOrigin],
     eps: Float32,
     inner_slots_arg: Int64,
     channels_arg: Int64,
@@ -155,7 +157,16 @@ def _bn_elementwise_kernel[
     """Block (x = slot tile, y = plane): one (sample, channel) plane per block
     row, so the channel — and therefore the four coefficients and the
     reciprocal square root — is uniform across the whole block and is
-    evaluated once, not once per element."""
+    evaluated once, not once per element.
+
+    The inference route also emits the two statistics torch returns from
+    `_native_batch_norm_legit_no_training`: `save_mean` is the running mean and
+    `save_invstd` the `rsqrt(var + eps)` the per-channel prologue already forms
+    before folding gamma into it.  Emitting them here costs one thread per
+    channel; doing it outside cost three extra launches over C elements, which
+    at small `inner` is the whole op again.  The training route
+    (`from_invstd`) gets those statistics from its own stats pass and passes
+    null, so the write is compiled out."""
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
     var inner_slots = Int(inner_slots_arg)
@@ -169,6 +180,19 @@ def _bn_elementwise_kernel[
         return
     var plane = Int(block_idx.y)
     var plane_stride = Int(grid_dim.y)
+    comptime if not from_invstd:
+        # Emitted OUTSIDE the plane loop: a per-iteration branch to catch the
+        # channel-naming plane cost 16% on N8 C256 28x28, where the loop is the
+        # whole kernel.  Its own grid-stride walk covers every channel whatever
+        # grid_dim.y is, instead of assuming the y grid reaches `channels`.
+        if slot == 0:
+            var c = Int(block_idx.y)
+            while c < channels:
+                save_mean_ptr[c] = mean_ptr[c]
+                save_invstd_ptr[c] = (
+                    1.0 / ieee_sqrt(var_ptr[c].cast[DType.float32]() + eps)
+                ).cast[sdtype]()
+                c += plane_stride
     while plane < planes:
         var mean = Float32(0)
         var scale = Float32(0)
@@ -674,6 +698,8 @@ def enqueue_batch_norm_elementwise[
     has_weight: Bool,
     has_bias: Bool,
     ctx: DeviceContext,
+    save_mean_addr: Int = 0,
+    save_invstd_addr: Int = 0,
 ) raises:
     """`out = (x - mean[c]) * invstd[c] * gamma[c] + beta[c]` over an NC...
     contiguous tensor, `inner` being the product of the dims after C."""
@@ -693,6 +719,10 @@ def enqueue_batch_norm_elementwise[
     var beta_ptr = (
         _make_ptr[pdtype](beta_addr).as_unsafe_any_origin().as_immutable()
     )
+    var save_mean_ptr = _make_ptr[sdtype](save_mean_addr).as_unsafe_any_origin()
+    var save_invstd_ptr = _make_ptr[sdtype](
+        save_invstd_addr
+    ).as_unsafe_any_origin()
     var hw = 1 if has_weight else 0
     var hb = 1 if has_bias else 0
 
@@ -723,6 +753,8 @@ def enqueue_batch_norm_elementwise[
             var_ptr,
             gamma_ptr,
             beta_ptr,
+            save_mean_ptr,
+            save_invstd_ptr,
             eps,
             Int64(slots),
             Int64(channels),
@@ -746,6 +778,8 @@ def enqueue_batch_norm_elementwise[
         var_ptr,
         gamma_ptr,
         beta_ptr,
+        save_mean_ptr,
+        save_invstd_ptr,
         eps,
         Int64(slots),
         Int64(channels),
