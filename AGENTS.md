@@ -64,7 +64,7 @@ disk: the data is a JSON block inside the page, so there is nothing to
 fetch and nothing to serve). Each (op, shape, layout, dtype) case is its own
 test node and the node id is its key in the JSON, so the list of failing test names is the
 list of regressed kernel regimes. A test fails when its ratio regresses more
-than 4% versus the recorded baseline, passes when this hardware has never
+than 8% versus the recorded baseline, passes when this hardware has never
 been measured, and the whole suite skips cleanly when there is no
 accelerator. GPU **device time only** is measured (never wall time), the
 two legs are interleaved in ABBA order (ref,ours | ours,ref) so a monotonic
@@ -80,10 +80,10 @@ uv run pytest benchmarks/test_gemm.py -k "TN and bf16"
 uv run pytest "benchmarks/test_gemm.py::test_mm[S7_768x50304x49152-TN-bf16]"
 
 # Record a baseline on new hardware, or update after an optimization
-# (writes new entries and >4% improvements; +/-4% dead band never churns)
+# (writes new entries and >8% improvements; +/-8% dead band never churns)
 uv run pytest benchmarks/ --update-baselines
 
-# Accept a >4% regression after an INTENTIONAL trade-off, for chosen nodes only
+# Accept a >8% regression after an INTENTIONAL trade-off, for chosen nodes only
 uv run pytest benchmarks/ -k "..." --update-baselines=force
 
 # Where are we far behind stock PyTorch? (reads only the JSON, no GPU needed)

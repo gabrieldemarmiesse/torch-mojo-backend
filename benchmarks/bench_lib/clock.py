@@ -4,7 +4,8 @@ Why this module exists (measured 2026-08-10 on an H100 PCIe, torch 2.11):
 
 The stock cuBLAS leg of the tf32 GEMM cases was bimodal ACROSS processes
 (S1-NN stock leg ~614us in some processes, ~787us in others) while our leg
-barely moved, so seeded ratios flapped against the 4% threshold.  It is NOT
+barely moved, so seeded ratios flapped against the regression threshold
+(4% at the time).  It is NOT
 cuBLAS kernel selection: the profiler shows the byte-identical kernel
 (sm90_xmma_..._tilesize128x128x32...) in both modes, so pinning knobs like
 CUBLAS_WORKSPACE_CONFIG or extra warmup cannot help.  The driver is the

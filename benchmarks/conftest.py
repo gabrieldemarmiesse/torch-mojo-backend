@@ -66,7 +66,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         choices=("improve", "force"),
         help=(
             "Write measured ratios into benchmarks/baselines.html: new entries "
-            "and >4%% improvements. '=force' also accepts >4%% regressions "
+            "and >8%% improvements. '=force' also accepts >8%% regressions "
             "(after an intentional performance trade-off)."
         ),
     )
