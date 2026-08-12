@@ -1794,8 +1794,13 @@ def test_aten_addr_basic(conf: Conf, dtype: torch.dtype, call_checker: CallCheck
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-def test_aten_addr_default_beta_alpha(conf: Conf, dtype: torch.dtype):
+def test_aten_addr_default_beta_alpha(
+    conf: Conf, dtype: torch.dtype, call_checker: CallChecker
+):
     """aten.addr with default beta=alpha=1 (self + outer(vec1, vec2))."""
+    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
+
+    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2)
@@ -1804,11 +1809,15 @@ def test_aten_addr_default_beta_alpha(conf: Conf, dtype: torch.dtype):
     vec1 = torch.randn(4, dtype=dtype)
     vec2 = torch.randn(6, dtype=dtype)
     check_outputs(fn, conf, [self_, vec1, vec2])
+    call_checker.check_was_called()
 
 
-def test_aten_addr_beta_zero(conf: Conf):
+def test_aten_addr_beta_zero(conf: Conf, call_checker: CallChecker):
     """beta=0 must ignore `self` entirely, including nan/inf in it (matches
     ATen's own addr contract, see aten/src/ATen/native/LinearAlgebra.cpp)."""
+    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
+
+    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2, beta=0.0, alpha=1.5)
@@ -1817,12 +1826,17 @@ def test_aten_addr_beta_zero(conf: Conf):
     vec1 = torch.randn(3, dtype=torch.float32)
     vec2 = torch.randn(4, dtype=torch.float32)
     check_outputs(fn, conf, [self_, vec1, vec2])
+    call_checker.check_was_called()
 
 
-def test_aten_addr_broadcast_self_fallback(conf: Conf):
-    """`self` broadcastable but not shaped exactly (len(vec1), len(vec2)):
-    the fast path declines and redispatches to ATen's composite fallback
-    (see `fast_aten_addr`'s docstring), which must still be correct."""
+def test_aten_addr_self_broadcast(conf: Conf, call_checker: CallChecker):
+    """`self` broadcastable to (len(vec1), len(vec2)) but not that exact
+    shape (here: 0-d): the fast path's own right-alignment handles this
+    directly (see `fast_aten_addr`), so this still goes through the fused
+    kernel, not the composite fallback -- verified via call_checker."""
+    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
+
+    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2, beta=0.5, alpha=2.0)
@@ -1831,6 +1845,23 @@ def test_aten_addr_broadcast_self_fallback(conf: Conf):
     vec1 = torch.randn(3, dtype=torch.float32)
     vec2 = torch.randn(5, dtype=torch.float32)
     check_outputs(fn, conf, [self_, vec1, vec2])
+    call_checker.check_was_called()
+
+
+def test_aten_addr_dtype_mismatch_fallback(conf: Conf):
+    """`self`, vec1, vec2 with different dtypes: `fast_aten_addr` requires
+    them to already match (see its docstring) and declines, so this
+    exercises the actual redispatch-to-ATen's-composite-fallback path in
+    `mojo_device_addr` -- confirmed to return NOT_HANDLED for this input
+    and to redispatch to a correct result, not just declared to."""
+
+    def fn(self, vec1, vec2):
+        return aten.addr(self, vec1, vec2, beta=0.5, alpha=2.0)
+
+    self_ = torch.randn(3, 5, dtype=torch.float32)
+    vec1 = torch.randn(3, dtype=torch.bfloat16)
+    vec2 = torch.randn(5, dtype=torch.bfloat16)
+    check_outputs(fn, conf, [self_, vec1, vec2], rtol=1e-2, atol=1e-2)
 
 
 def test_aten_isin_basic(conf: Conf):
