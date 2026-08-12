@@ -1766,6 +1766,75 @@ def test_aten_trigon_scalar_tensor(conf: Conf, fn: Callable):
     check_outputs(fn, conf, [x])
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_aten_addr_basic(conf: Conf, dtype: torch.dtype, call_checker: CallChecker):
+    """aten.addr: beta*self + alpha*outer(vec1, vec2).
+
+    Regression test for the fused fast path added because ATen's own
+    CompositeExplicitAutograd fallback for backends without a native addr
+    kernel (`math_addr`) composes outer/scale/add in a different
+    multiplication order than the native CPU/CUDA kernel, which drifted
+    enough to fail OpInfo conformance for fp16/bf16 (up to 18% of sampled
+    elements): conformance/test_opinfo.py::test_matches_cpu_addr_mojo_float16
+    and ..._bfloat16. beta/alpha values below match the failing OpInfo
+    sample exactly.
+    """
+    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import (
+        EAGER_CALL_COUNTERS,
+    )
+
+    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
+
+    def fn(self, vec1, vec2):
+        return aten.addr(self, vec1, vec2, beta=0.6, alpha=0.2)
+
+    self_ = torch.randn(5, 10, dtype=dtype)
+    vec1 = torch.randn(5, dtype=dtype)
+    vec2 = torch.randn(10, dtype=dtype)
+    check_outputs(fn, conf, [self_, vec1, vec2])
+    call_checker.check_was_called()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_aten_addr_default_beta_alpha(conf: Conf, dtype: torch.dtype):
+    """aten.addr with default beta=alpha=1 (self + outer(vec1, vec2))."""
+
+    def fn(self, vec1, vec2):
+        return aten.addr(self, vec1, vec2)
+
+    self_ = torch.randn(4, 6, dtype=dtype)
+    vec1 = torch.randn(4, dtype=dtype)
+    vec2 = torch.randn(6, dtype=dtype)
+    check_outputs(fn, conf, [self_, vec1, vec2])
+
+
+def test_aten_addr_beta_zero(conf: Conf):
+    """beta=0 must ignore `self` entirely, including nan/inf in it (matches
+    ATen's own addr contract, see aten/src/ATen/native/LinearAlgebra.cpp)."""
+
+    def fn(self, vec1, vec2):
+        return aten.addr(self, vec1, vec2, beta=0.0, alpha=1.5)
+
+    self_ = torch.full((3, 4), float("nan"), dtype=torch.float32)
+    vec1 = torch.randn(3, dtype=torch.float32)
+    vec2 = torch.randn(4, dtype=torch.float32)
+    check_outputs(fn, conf, [self_, vec1, vec2])
+
+
+def test_aten_addr_broadcast_self_fallback(conf: Conf):
+    """`self` broadcastable but not shaped exactly (len(vec1), len(vec2)):
+    the fast path declines and redispatches to ATen's composite fallback
+    (see `fast_aten_addr`'s docstring), which must still be correct."""
+
+    def fn(self, vec1, vec2):
+        return aten.addr(self, vec1, vec2, beta=0.5, alpha=2.0)
+
+    self_ = torch.randn((), dtype=torch.float32)  # 0-d, broadcasts to (n, m)
+    vec1 = torch.randn(3, dtype=torch.float32)
+    vec2 = torch.randn(5, dtype=torch.float32)
+    check_outputs(fn, conf, [self_, vec1, vec2])
+
+
 def test_aten_isin_basic(conf: Conf):
     """Test aten.isin basic functionality with 1D tensors"""
 
