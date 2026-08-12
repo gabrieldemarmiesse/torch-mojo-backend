@@ -1286,9 +1286,17 @@ def _ternary_bcast_dispatcher[
 # treat it as a MAX/Mojo `elementwise` CPU-backend issue specific to this
 # closure's shape (six captured values incl. a Bool, three independently
 # strided pointer reads) rather than a correctness property of the
-# arithmetic. GPU is unaffected: it still goes through
-# `elementwise[..., target="gpu"]` via `_parallel_for`, same as every other
-# kernel in this file.
+# arithmetic. GPU still goes through `elementwise[..., target="gpu"]` via
+# `_parallel_for`, same as every other kernel in this file, and was not
+# rewritten to match: on an actual H100
+# (test_matches_cpu_addr_mojo_float16/bfloat16), it landed exactly one
+# element out of 50 just outside tolerance (down from up to 18% before
+# this fix), where the arithmetic above reproduces CPU exactly to the bit
+# on every sample tried. A hand-written grid-stride GPU kernel (bypassing
+# `elementwise` entirely, mirroring `_bin_bcast_kernel` above) was tried
+# and closed the CPU path back down to the pre-workaround failure rate
+# when the same restructuring was applied there, so it was not safe to
+# ship blind without more GPU time to verify; left as the next step.
 # ---------------------------------------------------------------------------
 
 
