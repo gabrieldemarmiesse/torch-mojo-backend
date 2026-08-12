@@ -3,9 +3,9 @@
 Pass/fail rules (per test node, for this machine's hardware config):
 
 * no baseline entry            -> PASS (recorded when updating is enabled)
-* ratio within +/-4% of base   -> PASS, nothing written (dead band, no churn)
-* ratio  > baseline * 1.04     -> FAIL: this kernel regime regressed
-* ratio  < baseline * 0.96     -> PASS (recorded when updating is enabled)
+* ratio within +/-8% of base   -> PASS, nothing written (dead band, no churn)
+* ratio  > baseline * 1.08     -> FAIL: this kernel regime regressed
+* ratio  < baseline * 0.92     -> PASS (recorded when updating is enabled)
 
 Read-only by default; writing needs --update-baselines (improvements and
 new entries) or --update-baselines=force (also accepts regressions after
@@ -35,7 +35,17 @@ from bench_lib.measure import (
     measure,
 )
 
-REGRESSION_THRESHOLD = 0.04  # fail when the ratio worsens by more than 4%
+# Fail when the ratio worsens by more than this.  The band is deliberately
+# SYMMETRIC: it is also what an improvement must clear before it is recorded.
+# An asymmetric band ratchets — a lucky-low draw becomes the new baseline and
+# every ordinary run afterwards reads as a regression.  That is not
+# hypothetical: cat/f32/P_64x281673 was recorded at 1.011 from one such draw
+# while its between-process spread runs 1.01-1.06, and it then failed about
+# one run in three.  8% covers that spread; the within-run scatter the suite
+# reports (0.1-0.6%) is much smaller and says nothing about it, because the
+# variation is between processes (allocator and memory-layout state), not
+# within a burst.
+REGRESSION_THRESHOLD = 0.08
 
 # A too-noisy measurement is re-attempted after a cooldown before the node
 # goes red: the observed noisy S7 episodes are transient throttle states
@@ -210,7 +220,8 @@ class Bench:
                 return
             pytest.fail(
                 f"performance regression: {detail}; baseline {base:.3f}, "
-                f"{(ratio / base - 1) * 100:+.1f}% vs the 4% threshold on "
+                f"{(ratio / base - 1) * 100:+.1f}% vs the "
+                f"{REGRESSION_THRESHOLD:.0%} threshold on "
                 f"[{self._hw.key}]. If this trade-off is intentional, rerun "
                 "this node with --update-baselines=force.",
                 pytrace=False,

@@ -41,7 +41,7 @@ Rules this module enforces (they were learned painfully):
   settle lead-in per burst.  If the cap is reached with the uncertainty
   still above RATIO_NOISE_LIMIT_PCT the caller must refuse the number
   (check.py retries after a cooldown, then fails the node) instead of
-  silently recording a value that cannot resolve the 4% regression
+  silently recording a value that cannot resolve the regression
   threshold.
 * Within-run sampling cannot see BETWEEN-process variance: device clock
   policy is sampled once per process and is then stable, so determinism
@@ -71,7 +71,7 @@ MAX_BURSTS = 12  # hard cap so the suite terminates on a noisy case
 
 # Convergence is judged on the sampling uncertainty of the REPORTED number
 # (the median of the pair ratios), i.e. robust pair scatter / sqrt(n): that
-# is what must resolve the 4% regression threshold.  Individual pairs may
+# is what must resolve the regression threshold.  Individual pairs may
 # scatter a few percent on throttle-heavy cases while the median is still
 # pinned well below 1%.
 TARGET_UNCERTAINTY_PCT = 0.7  # stop adding bursts once the median is this tight
