@@ -711,6 +711,194 @@ def test_fast_log_softmax_positive_inf_rows_match_cpu(mojo_gpu):
     )
 
 
+# --- aten::var.correction: the (outer, reduce, inner) moment reduction ------
+#
+# One mechanism serves every layout and regime, so the cases below walk the
+# axes it dispatches on rather than any particular shape: reduced axis
+# contiguous vs strided, enough outputs to fill the device vs few enough to
+# need the reduced axis split across blocks, and both sides of each 16-byte
+# vectorization boundary.  Shapes are deliberately awkward where they can be.
+
+# (shape, dim) -- keyed by what the dispatch does with it.
+_VAR_LAYOUTS = [
+    ((357, 789), 1),  # contiguous reduce, awkward extents
+    ((357, 789), 0),  # strided reduce (leading dim), awkward extents
+    ((357, 789), None),  # full reduce
+    ((4, 5, 6), 1),  # strided reduce with a real outer AND inner
+    ((4, 5, 6), (1, 2)),  # adjacent trailing interval
+    ((4, 5, 6), (0, 1)),  # adjacent leading interval
+    ((4, 5, 6), (0, 2)),  # NON-adjacent: python permutes and materializes
+    ((1, 513), 0),  # reduced extent of 1
+    ((513, 1), 0),  # inner of 1, single column
+    ((16, 33), 1),  # rows shorter than one 16-byte pass per thread
+]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize("shape,dim", _VAR_LAYOUTS)
+def test_fast_var_layouts_match_cpu(mojo_device, shape, dim, keepdim, dtype):
+    x = torch.randn(shape).to(dtype)
+    kwargs = {} if dim is None else {"dim": dim}
+    result = torch.var(x.to(mojo_device), correction=1, keepdim=keepdim, **kwargs)
+    expected = torch.var(x, correction=1, keepdim=keepdim, **kwargs)
+    assert result.shape == expected.shape
+    # equal_nan: a reduced extent of 1 with correction=1 is nan on both sides.
+    torch.testing.assert_close(
+        result.cpu(), expected, atol=2e-2, rtol=2e-2, equal_nan=True
+    )
+
+
+@pytest.mark.parametrize(
+    "shape,dim",
+    [
+        # Few outputs, long reduced axis: the split path, both layouts.  The
+        # extents are prime-ish so the last shard is short and the merge has
+        # to tolerate it.
+        ((1048583,), None),
+        ((3, 400001), 1),
+        ((400001, 3), 0),
+        ((2, 65537), 0),
+        # Many outputs: no split, stage 1 finalizes on its own.
+        ((4099, 1031), 1),
+        ((1031, 4099), 0),
+    ],
+)
+def test_fast_var_split_regimes_match_cpu(mojo_gpu, shape, dim):
+    # The split factor is derived from the runtime SM count, so these cases
+    # straddle the threshold on any card rather than at one fitted size.
+    x = torch.rand(shape) * 0.9 + 0.05
+    kwargs = {} if dim is None else {"dim": dim}
+    result = torch.var(x.to(mojo_gpu), correction=1, **kwargs)
+    expected = torch.var(x.double(), correction=1, **kwargs)
+    torch.testing.assert_close(result.cpu().double(), expected, atol=1e-6, rtol=1e-4)
+
+
+@pytest.mark.parametrize("shape,dim", [((1 << 22,), None), ((5, 300000), 1)])
+def test_fast_var_survives_large_mean_offset(mojo_gpu, shape, dim):
+    """Single-pass moments must not cancel away the answer.
+
+    Accumulating raw sum and sum-of-squares would compute 1e8 - 1e8 here and
+    keep almost no significant digits; the moments are taken about an assumed
+    mean read from the slice itself, so the accumulator stays the size of the
+    variance.
+    """
+    x = torch.rand(shape) - 0.5 + 1e4
+    kwargs = {} if dim is None else {"dim": dim}
+    result = torch.var(x.to(mojo_gpu), correction=1, **kwargs).cpu().double()
+    expected = torch.var(x.double(), correction=1, **kwargs)
+    torch.testing.assert_close(result, expected, atol=0, rtol=1e-3)
+
+
+# Positions an outlier can occupy relative to the split geometry.  Only the
+# FIRST element of a reduced slice is dangerous -- it is the assumed mean --
+# but a shard boundary is where a wrong one would first show up as a merge
+# bug, so all of them are probed.  n is large enough to take the split path.
+_VAR_OUTLIER_N = 1 << 22
+_VAR_OUTLIER_POSITIONS = [
+    0,  # the assumed mean itself: the catastrophic case
+    1,
+    8192,
+    _VAR_OUTLIER_N // 528,  # first shard boundary at 4 blocks/SM on 132 SMs
+    _VAR_OUTLIER_N // 528 - 1,
+    _VAR_OUTLIER_N // 2,
+    _VAR_OUTLIER_N - 1,
+]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("position", _VAR_OUTLIER_POSITIONS)
+@pytest.mark.parametrize("magnitude", [1e6, -1e6])
+def test_fast_var_outlier_anywhere_stays_accurate(mojo_gpu, position, magnitude, dtype):
+    """A single wild element must not corrupt the reduction, wherever it sits.
+
+    Shifting the moments by the slice's first element is what makes the single
+    pass safe on data with a large mean, but it turns that first element into a
+    load-bearing choice: if it is the outlier, `M2 = q - s^2/n` becomes a
+    difference of two ~4e18 quantities and six digits vanish.  The kernel
+    detects that cancellation and re-reads the slice about the mean it now
+    knows exactly, so the answer must come out at float32's noise floor for
+    every position -- not just the ones where the shift happened to be benign.
+
+    Compared against an fp64 reference computed on the SAME quantized values,
+    so this measures the algorithm and not the input dtype.
+    """
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(_VAR_OUTLIER_N, generator=g, dtype=torch.float64)
+    x[position] = magnitude
+    quantized = x.to(dtype)
+    truth = torch.var(quantized.double(), correction=1)
+    ours = torch.var(quantized.to(mojo_gpu), correction=1).cpu().double()
+    # bf16 quantizes the outlier itself, which sets the floor at ~2e-3 for any
+    # algorithm (stock CUDA torch measures the same); f32 must reach 1e-6.
+    rtol = 1e-6 if dtype == torch.float32 else 5e-3
+    torch.testing.assert_close(ours, truth, atol=0, rtol=rtol)
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_fast_var_outlier_row_poisons_every_slice(mojo_gpu, dim):
+    """The same defect, one per output: index 0 of EVERY reduced slice is wild.
+
+    dim=0 puts the outliers in row 0 (the first element of every column's
+    slice) and takes the strided kernel; dim=1 puts them in column 0 and takes
+    the contiguous one.  Both must recover per output element -- one bad slice
+    must not need, or be rescued by, a whole-tensor decision.
+    """
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(2048, 2048, generator=g, dtype=torch.float64)
+    if dim == 0:
+        x[0, :] = 1e6
+    else:
+        x[:, 0] = 1e6
+    quantized = x.to(torch.float32)
+    truth = torch.var(quantized.double(), dim=dim, correction=1)
+    ours = torch.var(quantized.to(mojo_gpu), dim=dim, correction=1).cpu().double()
+    torch.testing.assert_close(ours, truth, atol=0, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("value", [0.0, 3.0, -1e6])
+@pytest.mark.parametrize("shape,dim", [((1 << 22,), None), ((512, 4096), 0)])
+def test_fast_var_constant_slice_is_exactly_zero(mojo_gpu, shape, dim, value, dtype):
+    """A constant slice has variance exactly 0, not an epsilon and not -0.
+
+    This is the boundary of the cancellation detector: `q` and `M2` are both
+    0, so a detector written as a ratio would divide by zero and a sloppy one
+    would re-read every constant tensor forever.
+    """
+    x = torch.full(shape, value, dtype=dtype)
+    kwargs = {} if dim is None else {"dim": dim}
+    ours = torch.var(x.to(mojo_gpu), correction=1, **kwargs).cpu()
+    assert bool((ours == 0).all()), ours
+    assert not bool(ours.signbit().any()), "variance came back as -0.0"
+
+
+@pytest.mark.parametrize("correction", [0, 1, 4, 5, 9])
+def test_fast_var_correction_at_or_above_extent_matches_torch(mojo_gpu, correction):
+    # torch clamps the divisor at 0 (WelfordOps::project), so correction >= n
+    # yields inf for a non-constant sample and nan for a constant one -- not a
+    # negative variance.
+    x = torch.tensor([[1.0, 2.0, 3.0, 5.0], [7.0, 7.0, 7.0, 7.0]])
+    result = torch.var(x.to(mojo_gpu), dim=1, correction=correction)
+    expected = torch.var(x, dim=1, correction=correction)
+    torch.testing.assert_close(result.cpu(), expected, equal_nan=True)
+
+
+def test_fast_var_strided_axis_skips_materialization(mojo_gpu, monkeypatch):
+    """Reducing a leading dim must reach the bridge with its ORIGINAL dims.
+
+    If it did not, Python would have permuted the operand and materialized a
+    full transposed copy first, and the bridge would see the trailing dim
+    instead -- an extra read plus an extra write of the whole tensor.
+    """
+    target = ("reduction_ops.mojo", "VarSpec")
+    native_calls = _spy_defined_native_calls(monkeypatch, {target})
+    x = torch.randn(64, 48).to(mojo_gpu)
+    _ = torch.var(x, dim=0)
+    assert len(native_calls[target]) == 1
+    assert native_calls[target][0][0][1] == (0,)
+
+
 def test_fast_native_layer_norm_bf16_gpu_preserves_generic_path(mojo_gpu):
     input = torch.randn(3, 65).bfloat16()
     weight = torch.randn(65).bfloat16()
@@ -3105,6 +3293,178 @@ def test_fast_gpt2_logits_argmax(mojo_gpu):
     logits[:, 123] = 100.0
     actual = torch.argmax(logits.to(mojo_gpu), dim=-1).cpu()
     torch.testing.assert_close(actual, torch.argmax(logits, dim=-1))
+
+
+# ---------------------------------------------------------------------------
+# argmin / argmax (argreduce_kernels.mojo)
+#
+# The arg-reduction splits the reduce axis across blocks and merges partials
+# out of order, so every one of these checks a rule that an out-of-order merge
+# could break: torch answers with the FIRST occurrence of the extremum, and a
+# NaN anywhere beats every number.  Random data alone never produces a tie, so
+# the tie cases are built by hand and placed on both sides of the split
+# boundaries.
+# ---------------------------------------------------------------------------
+
+_ARGREDUCE_FNS = (torch.argmax, torch.argmin)
+# Sizes that straddle the split decision (AR_MIN_CHUNK = 4096 elements is the
+# smallest slice worth its own block): one block and a ragged vector tail, one
+# block exactly, the first size that splits in two, and one that splits as many
+# ways as the device has room for.
+_ARGREDUCE_SPLIT_SHAPES = (4095, 4096, 8193, 1 << 20)
+
+
+def _assert_argreduce_matches(
+    device: str, cpu_tensor: torch.Tensor, dim: int | None = None
+) -> None:
+    device_tensor = cpu_tensor.to(device)
+    for fn in _ARGREDUCE_FNS:
+        expected = fn(cpu_tensor) if dim is None else fn(cpu_tensor, dim=dim)
+        actual = (
+            fn(device_tensor) if dim is None else fn(device_tensor, dim=dim)
+        ).cpu()
+        assert actual.dtype == expected.dtype
+        assert torch.equal(actual, expected), f"{fn.__name__} dim={dim}"
+
+
+@pytest.mark.parametrize("size", _ARGREDUCE_SPLIT_SHAPES)
+def test_fast_argreduce_full_reduction_across_split_sizes(
+    mojo_gpu: str, size: int
+) -> None:
+    """A full reduction is one output: it always takes the split path."""
+    generator = torch.Generator().manual_seed(20260811)
+    _assert_argreduce_matches(mojo_gpu, torch.randn(size, generator=generator))
+
+
+@pytest.mark.parametrize("size", _ARGREDUCE_SPLIT_SHAPES)
+def test_fast_argreduce_ties_take_the_lowest_index(mojo_gpu: str, size: int) -> None:
+    """Every element equal, and the extremum repeated at known positions:
+    both must answer with the FIRST of them however the axis was split."""
+    _assert_argreduce_matches(mojo_gpu, torch.full((size,), 3.5))
+
+    marked = torch.zeros(size)
+    for position in (0, 1, size // 3, size // 2, size - 1):
+        marked[position] = 1.0
+    _assert_argreduce_matches(mojo_gpu, marked)  # first max at 0, first min at 2
+
+    marked = torch.zeros(size)
+    for position in (2, size // 5, size - 2):
+        marked[position] = -1.0
+    _assert_argreduce_matches(mojo_gpu, marked)
+
+
+@pytest.mark.parametrize("size", (1000, 1 << 20))
+def test_fast_argreduce_nan_beats_every_number(mojo_gpu: str, size: int) -> None:
+    """torch propagates NaN: the index of the first NaN is the answer."""
+    generator = torch.Generator().manual_seed(20260811)
+    for position in (0, 3, size // 2, size - 1):
+        values = torch.randn(size, generator=generator)
+        values[position] = float("nan")
+        _assert_argreduce_matches(mojo_gpu, values)
+
+    two_nans = torch.randn(size, generator=generator)
+    two_nans[5] = float("nan")
+    two_nans[size - 5] = float("nan")
+    _assert_argreduce_matches(mojo_gpu, two_nans)
+    _assert_argreduce_matches(mojo_gpu, torch.full((size,), float("nan")))
+
+
+@pytest.mark.parametrize("size", (1000, 1 << 20))
+def test_fast_argreduce_saturated_identity_values(mojo_gpu: str, size: int) -> None:
+    """A row of the identity element (-inf for argmax, +inf for argmin) still
+    has an answer: index 0.  A lane seeded with the identity and a strict
+    comparison would report "nothing found" here."""
+    _assert_argreduce_matches(mojo_gpu, torch.full((size,), float("-inf")))
+    _assert_argreduce_matches(mojo_gpu, torch.full((size,), float("inf")))
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.int64]
+)
+def test_fast_argreduce_dtypes(mojo_gpu: str, dtype: torch.dtype) -> None:
+    generator = torch.Generator().manual_seed(20260811)
+    if dtype.is_floating_point:
+        values = torch.randn(3, 5000, generator=generator).to(dtype)
+    else:
+        values = torch.randint(-1000, 1000, (3, 5000), generator=generator, dtype=dtype)
+    _assert_argreduce_matches(mojo_gpu, values)
+    _assert_argreduce_matches(mojo_gpu, values, dim=1)
+    _assert_argreduce_matches(mojo_gpu, values, dim=0)
+
+
+@pytest.mark.parametrize(
+    ("shape", "dim"),
+    [
+        ((4096, 8), 0),  # inner below the coalescing floor: materialized
+        ((4096, 16), 0),  # first inner extent the strided kernel takes
+        ((4096, 33), 0),  # ragged tail column
+        ((357, 789), 0),  # awkward, and one block per column tile
+        ((5, 7, 33), 1),  # middle dim of a rank-3 tensor
+        ((2, 3, 4, 5), 1),
+        ((1 << 12, 1 << 12), 0),  # wide enough to split the strided axis
+        ((70000, 2, 32), 1),  # outer past the 65535 cap on grid.y / grid.z
+    ],
+)
+def test_fast_argreduce_strided_axis(
+    mojo_gpu: str, shape: tuple[int, ...], dim: int
+) -> None:
+    """Non-trailing reduce dims: the strided kernel reads the source in place
+    above the coalescing floor and the materialized route runs below it, and
+    both must agree with torch (including on ties)."""
+    generator = torch.Generator().manual_seed(20260811)
+    _assert_argreduce_matches(
+        mojo_gpu, torch.randn(shape, generator=generator), dim=dim
+    )
+    _assert_argreduce_matches(mojo_gpu, torch.zeros(shape), dim=dim)
+
+    with_nan = torch.randn(shape, generator=generator)
+    with_nan[(0,) * (len(shape) - 1) + (1,)] = float("nan")
+    _assert_argreduce_matches(mojo_gpu, with_nan, dim=dim)
+
+
+def test_fast_argreduce_strided_direct_gate_matches_the_kernel_regime(
+    mojo_gpu: str,
+) -> None:
+    """The Python gate and the Mojo kernel must agree about which layouts go
+    in place: a queued launch cannot fall back."""
+    from torch_mojo_backend.eager_kernels.aten_fast import (
+        _ARG_DIRECT_MIN_INNER,
+        _arg_strided_direct_ok,
+        _t,
+    )
+
+    contiguous = _t(torch.randn(8, _ARG_DIRECT_MIN_INNER).to(mojo_gpu))
+    assert _arg_strided_direct_ok("ArgminSpec", contiguous, (0,))
+    assert _arg_strided_direct_ok("ArgmaxSpec", contiguous, (0,))
+    # trailing dims belong to the contiguous-axis kernels
+    assert not _arg_strided_direct_ok("ArgmaxSpec", contiguous, (1,))
+    # every other spec op keeps its own route
+    assert not _arg_strided_direct_ok("SumSpec", contiguous, (0,))
+    # below the coalescing floor, and non-contiguous operands, materialize
+    narrow = _t(torch.randn(8, _ARG_DIRECT_MIN_INNER - 1).to(mojo_gpu))
+    assert not _arg_strided_direct_ok("ArgmaxSpec", narrow, (0,))
+    strided = _t(torch.randn(8, 64).to(mojo_gpu)[:, ::2])
+    assert not _arg_strided_direct_ok("ArgmaxSpec", strided, (0,))
+    # a non-adjacent dim interval is not a (outer, reduce, inner) view
+    cube = _t(torch.randn(4, 5, 64).to(mojo_gpu))
+    assert not _arg_strided_direct_ok("ArgmaxSpec", cube, (0, 2))
+
+
+def test_fast_argreduce_views_and_keepdim(mojo_gpu: str) -> None:
+    generator = torch.Generator().manual_seed(20260811)
+    base = torch.randn(64, 128, generator=generator)
+    for view in (base.t(), base[:, 3:70], base[::2, ::3]):
+        for dim in (None, 0, 1):
+            _assert_argreduce_matches(mojo_gpu, view, dim=dim)
+
+    values = torch.randn(8, 300, 17, generator=generator)
+    device_values = values.to(mojo_gpu)
+    for dim in (0, 1, 2):
+        for fn in _ARGREDUCE_FNS:
+            expected = fn(values, dim=dim, keepdim=True)
+            actual = fn(device_values, dim=dim, keepdim=True).cpu()
+            assert actual.shape == expected.shape
+            assert torch.equal(actual, expected)
 
 
 def test_fast_bmm(mojo_gpu):
