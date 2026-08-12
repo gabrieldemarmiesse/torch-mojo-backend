@@ -649,13 +649,25 @@ def test_fast_layer_norm_row_widths(mojo_gpu, dtype, cols):
     # the input, see fast_aten_native_layer_norm), but `expected` was
     # computed from float32 inputs above to get a clean reference for the
     # output tolerance check -- so its saved stats are float32 regardless of
-    # `dtype` and must be cast down to compare.
+    # `dtype` and must be cast down to compare. That final cast is a single
+    # bf16 rounding step on each side of two independently-computed float32
+    # values (our device reduction vs. CPU's), so the float32-era tolerances
+    # below (tight enough there) must widen to a bf16 ULP or a boundary value
+    # can round to adjacent bf16 representables and fail on a correct result.
+    mean_tolerance = 1e-4 if dtype == torch.float32 else 2e-2
+    rstd_tolerance = 1e-3 if dtype == torch.float32 else 2e-2
     mean_actual, rstd_actual = actual[1].cpu(), actual[2].cpu()
     torch.testing.assert_close(
-        mean_actual, expected[1].to(mean_actual.dtype), atol=1e-4, rtol=1e-4
+        mean_actual,
+        expected[1].to(mean_actual.dtype),
+        atol=mean_tolerance,
+        rtol=mean_tolerance,
     )
     torch.testing.assert_close(
-        rstd_actual, expected[2].to(rstd_actual.dtype), atol=1e-3, rtol=1e-3
+        rstd_actual,
+        expected[2].to(rstd_actual.dtype),
+        atol=rstd_tolerance,
+        rtol=rstd_tolerance,
     )
 
 
