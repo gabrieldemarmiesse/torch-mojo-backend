@@ -81,10 +81,10 @@ from std.utils.static_tuple import StaticTuple
 from op_utils import (
     TensorSpec,
     _adjacent_reduce_geom,
+    _device_sm_count,
     _enqueue_cached,
     _make_ptr,
     _parallel_for,
-    _runtime_sm_count,
 )
 from std.python._cpython import PyObjectPtr
 
@@ -580,7 +580,7 @@ def _ar_splits(
     4096x4096 dim-0 reduction when it was confused for it. 1 means the grid
     already fills the device; the split path exists for the other end (a full
     reduction is one block)."""
-    var target = AR_SPLIT_WAVES * _runtime_sm_count(ctx)
+    var target = AR_SPLIT_WAVES * _device_sm_count(ctx)
     if blocks >= target or blocks <= 0:
         return 1
     var by_work = reduce_n // min_chunk

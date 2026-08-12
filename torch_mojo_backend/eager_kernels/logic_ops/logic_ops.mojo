@@ -40,7 +40,9 @@ from op_utils import (
     MAX_RANK,
     _bw_flat_blocks,
     _enqueue_cached,
+    _flat_vec_unary,
     _gs_blocks,
+    _l2_wave_blocks,
     _make_ptr,
     _parallel_for,
     _raw_ctx,
@@ -67,6 +69,18 @@ from variant_gates import (
 # d0..d3; each operand is indexed with its own strides (0 on broadcast
 # dims). Bitwise ops only instantiate for integer dtypes (the Python side
 # routes bool through uint8 views), div only for floats.
+#
+# ONE kernel family serves two op-code spaces, told apart by `is_cmp`:
+# arithmetic/bitwise (BOP_*), whose output dtype is the operand dtype, and
+# comparisons/logical (COP_*), whose output is a 1-byte 0/1 mask. That is
+# why every kernel below is parametrized on the (dtype -> out_dtype) PAIR
+# rather than on a single dtype: with a same-dtype signature the vectorized
+# kernels could not express a comparison, so every comparison fell through
+# to the general strided kernel -- three integer divisions and three moduli
+# per element, one element per thread, scalar loads. That kernel is index-
+# math bound, not bandwidth bound: measured at 16.7M elements it took the
+# same ~264us whether it moved 9, 5 or 3 bytes per element, while the
+# vectorized path moves MORE bytes in 110us (1.83 TB/s).
 # ---------------------------------------------------------------------------
 
 comptime BOP_ADD = 0
@@ -81,6 +95,69 @@ comptime BOP_XOR = 8
 comptime BOP_REMAINDER = 9
 comptime BOP_FLOORDIV = 10
 comptime BOP_POW = 11
+
+comptime COP_EQ = 0
+comptime COP_NE = 1
+comptime COP_LT = 2
+comptime COP_LE = 3
+comptime COP_GT = 4
+comptime COP_GE = 5
+comptime COP_LAND = 6
+comptime COP_LXOR = 7
+
+
+@always_inline
+def _op_token[op_code: Int, is_cmp: Bool]() -> StaticString:
+    """The op's aten-ish name, for the kernel names below.
+
+    A kernel name is what CUPTI, Nsight and torch.profiler print, so a user
+    profiling their own model reads it: `binary_flat_vec_lt_float32_uint8`
+    says what ran, a mangled `_bin_flat_vec_kernel6A6AcB_48b3...` does not.
+    """
+    comptime if is_cmp:
+        comptime if op_code == COP_EQ:
+            return "eq"
+        comptime if op_code == COP_NE:
+            return "ne"
+        comptime if op_code == COP_LT:
+            return "lt"
+        comptime if op_code == COP_LE:
+            return "le"
+        comptime if op_code == COP_GT:
+            return "gt"
+        comptime if op_code == COP_GE:
+            return "ge"
+        comptime if op_code == COP_LAND:
+            return "logical_and"
+        comptime if op_code == COP_LXOR:
+            return "logical_xor"
+    else:
+        comptime if op_code == BOP_ADD:
+            return "add"
+        comptime if op_code == BOP_SUB:
+            return "sub"
+        comptime if op_code == BOP_MUL:
+            return "mul"
+        comptime if op_code == BOP_DIV:
+            return "div"
+        comptime if op_code == BOP_MAX:
+            return "maximum"
+        comptime if op_code == BOP_MIN:
+            return "minimum"
+        comptime if op_code == BOP_AND:
+            return "bitwise_and"
+        comptime if op_code == BOP_OR:
+            return "bitwise_or"
+        comptime if op_code == BOP_XOR:
+            return "bitwise_xor"
+        comptime if op_code == BOP_REMAINDER:
+            return "remainder"
+        comptime if op_code == BOP_FLOORDIV:
+            return "floor_divide"
+        comptime if op_code == BOP_POW:
+            return "pow"
+    return "binop"
+
 
 comptime _ADD_F32_BF16_BLOCK = 256
 comptime _ADD_F32_BF16_VEC = 4
@@ -153,61 +230,97 @@ def _add_f32_bf16_contig(
 
 
 @always_inline
-def _bin_bcast_body[
-    dtype: DType, op_code: Int
-](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    a: Scalar[dtype],
-    b: Scalar[dtype],
-    i: Int,
-):
-    """One output element of the broadcast binary op — shared verbatim by
-    the CPU closure and the cached GPU kernel."""
-    comptime if op_code == BOP_ADD:
-        out_ptr[i] = a + b
-    comptime if op_code == BOP_SUB:
-        out_ptr[i] = a - b
-    comptime if op_code == BOP_MUL:
-        out_ptr[i] = a * b
-    comptime if op_code == BOP_DIV:
-        comptime if dtype.is_floating_point():
-            out_ptr[i] = a / b
-    comptime if op_code == BOP_MAX:
-        out_ptr[i] = max(a, b)
-    comptime if op_code == BOP_MIN:
-        out_ptr[i] = min(a, b)
-    comptime if op_code == BOP_AND:
-        comptime if not dtype.is_floating_point():
-            out_ptr[i] = a & b
-    comptime if op_code == BOP_OR:
-        comptime if not dtype.is_floating_point():
-            out_ptr[i] = a | b
-    comptime if op_code == BOP_XOR:
-        comptime if not dtype.is_floating_point():
-            out_ptr[i] = a ^ b
-    comptime if op_code == BOP_REMAINDER:
-        # Mojo's `%` follows the divisor's sign (Python/torch
-        # semantics) for both signed integers and floats.
-        out_ptr[i] = a % b
-    comptime if op_code == BOP_FLOORDIV:
-        # `//` = floor(a / b), matching torch.floor_divide for
-        # both float and integer dtypes.
-        out_ptr[i] = a // b
-    comptime if op_code == BOP_POW:
-        # Float only (gated at the launcher); accumulate halves in
-        # float32 to match torch's numerics.
-        comptime if dtype == DType.float16 or dtype == DType.bfloat16:
-            out_ptr[i] = pow(
-                a.cast[DType.float32](), b.cast[DType.float32]()
-            ).cast[dtype]()
-        elif dtype.is_floating_point():
-            out_ptr[i] = pow(a, b)
+def _bin_vec_op[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool, width: Int
+](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+    """The op itself on one SIMD group: `dtype x dtype -> out_dtype`.
+
+    Every kernel in this family funnels through this one body -- the general
+    strided kernel and the CPU closure at width 1, the vectorized kernels at
+    the vector width -- so each op has exactly one definition.
+
+    `out_dtype` is the operand dtype for BOP_*, and uint8 for COP_*: the
+    1-byte 0/1 storage a torch bool tensor uses. A comparison yields
+    SIMD[bool, width], which is a vector of i1; it is cast to uint8 HERE and
+    stored through a uint8 pointer, so a vector store writes one byte per
+    element instead of a packed bitmask.
+
+    Runtime-unreachable (dtype, op) combos are pre-gated by the launcher;
+    they still instantiate, so every branch must compile -- hence the
+    trailing pass-through return.
+    """
+    comptime if is_cmp:
+        # `<` and friends are Scalar-only in mojo 1.0; the elementwise forms
+        # are the named methods, and they are what yields the mask.
+        comptime if op_code == COP_EQ:
+            return a.eq(b).cast[out_dtype]()
+        comptime if op_code == COP_NE:
+            return a.ne(b).cast[out_dtype]()
+        comptime if op_code == COP_LT:
+            return a.lt(b).cast[out_dtype]()
+        comptime if op_code == COP_LE:
+            return a.le(b).cast[out_dtype]()
+        comptime if op_code == COP_GT:
+            return a.gt(b).cast[out_dtype]()
+        comptime if op_code == COP_GE:
+            return a.ge(b).cast[out_dtype]()
+        comptime if op_code == COP_LAND or op_code == COP_LXOR:
+            # Logical ops test each operand for nonzero-ness, then combine.
+            # Output is bool regardless of the (arbitrary) input dtype.
+            var la = a.ne(SIMD[dtype, width](0))
+            var lb = b.ne(SIMD[dtype, width](0))
+            comptime if op_code == COP_LAND:
+                return (la & lb).cast[out_dtype]()
+            else:
+                return (la ^ lb).cast[out_dtype]()
+    else:
+        comptime if op_code == BOP_ADD:
+            return (a + b).cast[out_dtype]()
+        comptime if op_code == BOP_SUB:
+            return (a - b).cast[out_dtype]()
+        comptime if op_code == BOP_MUL:
+            return (a * b).cast[out_dtype]()
+        comptime if op_code == BOP_DIV:
+            comptime if dtype.is_floating_point():
+                return (a / b).cast[out_dtype]()
+        comptime if op_code == BOP_MAX:
+            return max(a, b).cast[out_dtype]()
+        comptime if op_code == BOP_MIN:
+            return min(a, b).cast[out_dtype]()
+        comptime if op_code == BOP_AND:
+            comptime if not dtype.is_floating_point():
+                return (a & b).cast[out_dtype]()
+        comptime if op_code == BOP_OR:
+            comptime if not dtype.is_floating_point():
+                return (a | b).cast[out_dtype]()
+        comptime if op_code == BOP_XOR:
+            comptime if not dtype.is_floating_point():
+                return (a ^ b).cast[out_dtype]()
+        comptime if op_code == BOP_REMAINDER:
+            # Mojo's `%` follows the divisor's sign (Python/torch semantics)
+            # for both signed integers and floats.
+            return (a % b).cast[out_dtype]()
+        comptime if op_code == BOP_FLOORDIV:
+            # `//` = floor(a / b), matching torch.floor_divide for both
+            # float and integer dtypes.
+            return (a // b).cast[out_dtype]()
+        comptime if op_code == BOP_POW:
+            # Float only (gated at the launcher); accumulate halves in
+            # float32 to match torch's numerics.
+            comptime if dtype == DType.float16 or dtype == DType.bfloat16:
+                return pow(
+                    a.cast[DType.float32](), b.cast[DType.float32]()
+                ).cast[out_dtype]()
+            elif dtype.is_floating_point():
+                return pow(a, b).cast[out_dtype]()
+    return a.cast[out_dtype]()
 
 
+@__name(t"binary_strided_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
 def _bin_bcast_kernel[
-    dtype: DType, op_code: Int
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    out_ptr: UnsafePointer[Scalar[out_dtype], MutAnyOrigin],
     l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     d1_arg: Int64,
@@ -223,6 +336,11 @@ def _bin_bcast_kernel[
     rs3_arg: Int64,
     total_arg: Int64,
 ):
+    """Fully general arm: any broadcast strides, one element per thread.
+
+    Pays three integer divisions and three moduli per element, so the
+    launcher reaches it only when neither vectorized layout applies.
+    """
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
     var d1 = Int(d1_arg)
@@ -248,93 +366,93 @@ def _bin_bcast_kernel[
         var i0 = rest // d1
         var a = l_ptr[i0 * ls0 + i1 * ls1 + i2 * ls2 + i3 * ls3]
         var b = r_ptr[i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3]
-        _bin_bcast_body[dtype, op_code](out_ptr, a, b, i)
+        out_ptr[i] = _bin_vec_op[dtype, out_dtype, op_code, is_cmp, 1](a, b)[0]
         i += gstride
 
 
-@always_inline
-def _bin_vec_op[
-    dtype: DType, op_code: Int, width: Int
-](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
-    """SIMD counterpart of `_bin_bcast_body` (non-comparison ops only).
-
-    Runtime-unreachable (dtype, op) combos are pre-gated by the launcher;
-    they still instantiate, so every branch must compile — hence the
-    trailing pass-through return."""
-    comptime if op_code == BOP_ADD:
-        return a + b
-    comptime if op_code == BOP_SUB:
-        return a - b
-    comptime if op_code == BOP_MUL:
-        return a * b
-    comptime if op_code == BOP_DIV:
-        comptime if dtype.is_floating_point():
-            return a / b
-    comptime if op_code == BOP_MAX:
-        return max(a, b)
-    comptime if op_code == BOP_MIN:
-        return min(a, b)
-    comptime if op_code == BOP_AND:
-        comptime if not dtype.is_floating_point():
-            return a & b
-    comptime if op_code == BOP_OR:
-        comptime if not dtype.is_floating_point():
-            return a | b
-    comptime if op_code == BOP_XOR:
-        comptime if not dtype.is_floating_point():
-            return a ^ b
-    comptime if op_code == BOP_REMAINDER:
-        return a % b
-    comptime if op_code == BOP_FLOORDIV:
-        return a // b
-    comptime if op_code == BOP_POW:
-        comptime if dtype == DType.float16 or dtype == DType.bfloat16:
-            return pow(a.cast[DType.float32](), b.cast[DType.float32]()).cast[
-                dtype
-            ]()
-        elif dtype.is_floating_point():
-            return pow(a, b)
-    return a
-
-
+@__name(t"binary_flat_vec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
 def _bin_flat_vec_kernel[
-    dtype: DType, op_code: Int
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    out_ptr: UnsafePointer[Scalar[out_dtype], MutAnyOrigin],
     l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     total_arg: Int64,
+    l_bcast_arg: Int64,
+    r_bcast_arg: Int64,
 ):
     """16-byte-vectorized binary op for the no-broadcast, all-contiguous
-    case (both operands and the output flat over the same extent). The
-    launcher guarantees 16B base alignment."""
+    case: both operands flat over the same extent as the output, or a
+    single broadcast element (`l_bcast` / `r_bcast`, i.e. a 0-d scalar
+    operand, read once and splatted). The launcher guarantees 16B base
+    alignment of every operand it does not flag as broadcast.
+
+    The load width follows the OPERAND dtype and the store width the output
+    dtype, which is the whole point: an f32 -> bool comparison makes two
+    16-byte loads and one 4-byte store per thread.
+    """
     comptime VW = 16 // size_of[dtype]()
     comptime vec_align = VW * size_of[dtype]()
+    comptime out_align = min(16, VW * size_of[out_dtype]())
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
     var total = Int(total_arg)
     var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     var nvec = total // VW
-    var c = tid
-    while c < nvec:
-        var i = c * VW
-        var a = l_ptr.load[width=VW, alignment=vec_align](i)
-        var b = r_ptr.load[width=VW, alignment=vec_align](i)
-        out_ptr.store[width=VW, alignment=vec_align](
-            i, _bin_vec_op[dtype, op_code, VW](a, b)
-        )
-        c += gstride
-    var tail = total - nvec * VW
-    if tid < tail:
-        var i = nvec * VW + tid
-        out_ptr[i] = _bin_vec_op[dtype, op_code, 1](l_ptr[i], r_ptr[i])[0]
+
+    @always_inline
+    @parameter
+    def pass_over[l_b: Bool, r_b: Bool]():
+        # A flagged operand holds exactly one element, so this read is in
+        # range whenever the output is (the launcher returns early on
+        # total == 0), and it happens once per thread, not once per element.
+        var l_splat = SIMD[dtype, VW](l_ptr[0]) if l_b else SIMD[dtype, VW](0)
+        var r_splat = SIMD[dtype, VW](r_ptr[0]) if r_b else SIMD[dtype, VW](0)
+        var c = tid
+        while c < nvec:
+            var i = c * VW
+            var a = l_splat if l_b else l_ptr.load[
+                width=VW, alignment=vec_align
+            ](i)
+            var b = r_splat if r_b else r_ptr.load[
+                width=VW, alignment=vec_align
+            ](i)
+            out_ptr.store[width=VW, alignment=out_align](
+                i, _bin_vec_op[dtype, out_dtype, op_code, is_cmp, VW](a, b)
+            )
+            c += gstride
+        var tail = total - nvec * VW
+        if tid < tail:
+            var i = nvec * VW + tid
+            var a = l_splat[0] if l_b else l_ptr[i]
+            var b = r_splat[0] if r_b else r_ptr[i]
+            out_ptr[i] = _bin_vec_op[dtype, out_dtype, op_code, is_cmp, 1](
+                a, b
+            )[0]
+
+    # The splat flags are loop-invariant, so each arm is INSTANTIATED rather
+    # than branched on per iteration: that keeps the tensor-tensor arm the
+    # straight-line pair of vector loads it was before scalar operands
+    # existed. Measured on 357x789 i32 bitwise_and, where the kernel is
+    # launch/latency bound rather than bandwidth bound, a per-iteration
+    # uniform branch cost 7% (1.80us against 1.68us).
+    if l_bcast_arg != 0:
+        if r_bcast_arg != 0:
+            pass_over[True, True]()
+        else:
+            pass_over[True, False]()
+    elif r_bcast_arg != 0:
+        pass_over[False, True]()
+    else:
+        pass_over[False, False]()
 
 
+@__name(t"binary_rowvec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
 def _bin_rowvec_kernel[
-    dtype: DType, op_code: Int
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    out_ptr: UnsafePointer[Scalar[out_dtype], MutAnyOrigin],
     l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     d1_arg: Int64,
@@ -354,6 +472,7 @@ def _bin_rowvec_kernel[
     launcher guarantees d3 % VW == 0 and 16B alignment of every row base."""
     comptime VW = 16 // size_of[dtype]()
     comptime vec_align = VW * size_of[dtype]()
+    comptime out_align = min(16, VW * size_of[out_dtype]())
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
     var d1 = Int(d1_arg)
@@ -380,16 +499,17 @@ def _bin_rowvec_kernel[
         while j < d3:
             var a = l_ptr.load[width=VW, alignment=vec_align](lbase + j)
             var b = r_ptr.load[width=VW, alignment=vec_align](rbase + j)
-            out_ptr.store[width=VW, alignment=vec_align](
-                obase + j, _bin_vec_op[dtype, op_code, VW](a, b)
+            out_ptr.store[width=VW, alignment=out_align](
+                obase + j,
+                _bin_vec_op[dtype, out_dtype, op_code, is_cmp, VW](a, b),
             )
             j += step
         row += Int(grid_dim.x)
 
 
 @always_inline
-def _bin_bcast[
-    dtype: DType, op_code: Int
+def _binary_bcast[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
     out_addr: Int,
     l_addr: Int,
@@ -409,16 +529,20 @@ def _bin_bcast[
     ctx: DeviceContext,
 ) raises:
     comptime if (
-        op_code == BOP_DIV or op_code == BOP_POW
-    ) and not dtype.is_floating_point():
+        not is_cmp
+        and (op_code == BOP_DIV or op_code == BOP_POW)
+        and not dtype.is_floating_point()
+    ):
         raise Error("integer/bool div/pow is not supported in the fast path")
     else:
         comptime if (
-            op_code == BOP_AND or op_code == BOP_OR or op_code == BOP_XOR
-        ) and dtype.is_floating_point():
+            not is_cmp
+            and (op_code == BOP_AND or op_code == BOP_OR or op_code == BOP_XOR)
+            and dtype.is_floating_point()
+        ):
             raise Error("bitwise ops require an integer dtype")
         else:
-            var out_ptr = _make_ptr[dtype](out_addr)
+            var out_ptr = _make_ptr[out_dtype](out_addr)
             var l_ptr = _make_ptr[dtype](l_addr)
             var r_ptr = _make_ptr[dtype](r_addr)
 
@@ -437,9 +561,9 @@ def _bin_bcast[
                     var i0 = rest // d1
                     var a = l_ptr[i0 * ls0 + i1 * ls1 + i2 * ls2 + i3 * ls3]
                     var b = r_ptr[i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3]
-                    _bin_bcast_body[dtype, op_code](
-                        out_ptr.as_unsafe_any_origin(), a, b, i
-                    )
+                    out_ptr[i] = _bin_vec_op[
+                        dtype, out_dtype, op_code, is_cmp, 1
+                    ](a, b)[0]
 
                 elementwise[func, simd_width=1](Coord(total), ctx)
             else:
@@ -455,23 +579,37 @@ def _bin_bcast[
                         # sizes. Prefer 16-byte vector kernels whenever the
                         # layout allows them.
                         comptime itemsize = size_of[dtype]()
+                        comptime out_itemsize = size_of[out_dtype]()
                         comptime VW = 16 // itemsize
                         var d0 = total // max(1, d1 * d2 * d3)
                         var cont3 = d3
                         var cont2 = d2 * d3
                         var cont1 = d1 * d2 * d3
+                        # An operand whose every stride is 0 is a single
+                        # element -- what `x < 0.5` and `x & 21` look like
+                        # once Python has materialized the scalar operand.
+                        # The flat kernel reads it once and splats it, so it
+                        # neither breaks the flat layout nor needs 16B
+                        # alignment, and the whole scalar-overload family
+                        # stops falling through to the strided kernel.
+                        var l_scalar = (
+                            ls0 == 0 and ls1 == 0 and ls2 == 0 and ls3 == 0
+                        )
+                        var r_scalar = (
+                            rs0 == 0 and rs1 == 0 and rs2 == 0 and rs3 == 0
+                        )
                         var aligned16 = (
                             out_addr % 16 == 0
-                            and l_addr % 16 == 0
-                            and r_addr % 16 == 0
+                            and (l_scalar or l_addr % 16 == 0)
+                            and (r_scalar or r_addr % 16 == 0)
                         )
-                        var l_flat = (
+                        var l_flat = l_scalar or (
                             (ls3 == 1 or d3 == 1)
                             and (ls2 == cont3 or d2 == 1)
                             and (ls1 == cont2 or d1 == 1)
                             and (ls0 == cont1 or d0 == 1)
                         )
-                        var r_flat = (
+                        var r_flat = r_scalar or (
                             (rs3 == 1 or d3 == 1)
                             and (rs2 == cont3 or d2 == 1)
                             and (rs1 == cont2 or d1 == 1)
@@ -490,14 +628,34 @@ def _bin_bcast[
                             and (rs2 * itemsize) % 16 == 0
                         )
                         if aligned16 and l_flat and r_flat:
+                            # Bytes actually moved: a splatted operand reads
+                            # one element for the whole launch, so it does
+                            # not count toward the residency decision.
+                            var traffic = total * (
+                                (0 if l_scalar else itemsize)
+                                + (0 if r_scalar else itemsize)
+                                + out_itemsize
+                            )
+                            var slots = max(1, total // VW)
+                            # A comparison's thread moves fewer bytes than an
+                            # arithmetic one (16 + 16 read, 4 written), and
+                            # the residency crossover follows the bytes per
+                            # thread, so the two arms keep the grid rule each
+                            # was measured on -- see `_l2_wave_blocks` and
+                            # `_bw_flat_blocks`.
+                            var blocks = _l2_wave_blocks(
+                                slots, traffic, ctx
+                            ) if is_cmp else _bw_flat_blocks(slots, traffic)
                             _enqueue_cached[
-                                _bin_flat_vec_kernel[dtype, op_code]
+                                _bin_flat_vec_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
                             ](
                                 ctx,
-                                String(t"lg_bcast_fv_{op_code}_{dtype}"),
-                                _bw_flat_blocks(
-                                    max(1, total // VW), 3 * total * itemsize
+                                String(
+                                    t"lg_fv_{is_cmp}_{op_code}_{dtype}_{out_dtype}"
                                 ),
+                                blocks,
                                 1,
                                 1,
                                 GS_THREADS,
@@ -505,12 +663,20 @@ def _bin_bcast[
                                 l_ptr.as_unsafe_any_origin().as_immutable(),
                                 r_ptr.as_unsafe_any_origin().as_immutable(),
                                 Int64(total),
+                                Int64(l_scalar),
+                                Int64(r_scalar),
                             )
                         elif aligned16 and rows_aligned:
                             var rows = total // d3
-                            _enqueue_cached[_bin_rowvec_kernel[dtype, op_code]](
+                            _enqueue_cached[
+                                _bin_rowvec_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
                                 ctx,
-                                String(t"lg_bcast_rv_{op_code}_{dtype}"),
+                                String(
+                                    t"lg_rv_{is_cmp}_{op_code}_{dtype}_{out_dtype}"
+                                ),
                                 max(1, min(rows, 65535)),
                                 1,
                                 1,
@@ -530,9 +696,15 @@ def _bin_bcast[
                                 Int64(rows),
                             )
                         else:
-                            _enqueue_cached[_bin_bcast_kernel[dtype, op_code]](
+                            _enqueue_cached[
+                                _bin_bcast_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
                                 ctx,
-                                String(t"lg_bcast_{op_code}_{dtype}"),
+                                String(
+                                    t"lg_bc_{is_cmp}_{op_code}_{dtype}_{out_dtype}"
+                                ),
                                 _gs_blocks(total),
                                 1,
                                 1,
@@ -560,196 +732,28 @@ def _bin_bcast[
 
 
 # ---------------------------------------------------------------------------
-# Broadcast-strided comparisons: same indexing, bool output.
-# ---------------------------------------------------------------------------
-
-comptime COP_EQ = 0
-comptime COP_NE = 1
-comptime COP_LT = 2
-comptime COP_LE = 3
-comptime COP_GT = 4
-comptime COP_GE = 5
-comptime COP_LAND = 6
-comptime COP_LXOR = 7
-
-
-@always_inline
-def _cmp_bcast_body[
-    dtype: DType, op_code: Int
-](
-    out_ptr: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    a: Scalar[dtype],
-    b: Scalar[dtype],
-    i: Int,
-):
-    """One output element of the broadcast comparison — shared verbatim by
-    the CPU closure and the cached GPU kernel."""
-    comptime if op_code == COP_EQ:
-        out_ptr[i] = Scalar[DType.bool](a == b)
-    comptime if op_code == COP_NE:
-        out_ptr[i] = Scalar[DType.bool](a != b)
-    comptime if op_code == COP_LT:
-        out_ptr[i] = Scalar[DType.bool](a < b)
-    comptime if op_code == COP_LE:
-        out_ptr[i] = Scalar[DType.bool](a <= b)
-    comptime if op_code == COP_GT:
-        out_ptr[i] = Scalar[DType.bool](a > b)
-    comptime if op_code == COP_GE:
-        out_ptr[i] = Scalar[DType.bool](a >= b)
-    comptime if op_code == COP_LAND or op_code == COP_LXOR:
-        # Logical ops test each operand for nonzero-ness, then combine.
-        # Output is bool regardless of the (arbitrary) input dtype.
-        var la = a != Scalar[dtype](0)
-        var lb = b != Scalar[dtype](0)
-        comptime if op_code == COP_LAND:
-            out_ptr[i] = la & lb
-        comptime if op_code == COP_LXOR:
-            out_ptr[i] = la ^ lb
-
-
-def _cmp_bcast_kernel[
-    dtype: DType, op_code: Int
-](
-    out_ptr: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    d1_arg: Int64,
-    d2_arg: Int64,
-    d3_arg: Int64,
-    ls0_arg: Int64,
-    ls1_arg: Int64,
-    ls2_arg: Int64,
-    ls3_arg: Int64,
-    rs0_arg: Int64,
-    rs1_arg: Int64,
-    rs2_arg: Int64,
-    rs3_arg: Int64,
-    total_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var d1 = Int(d1_arg)
-    var d2 = Int(d2_arg)
-    var d3 = Int(d3_arg)
-    var ls0 = Int(ls0_arg)
-    var ls1 = Int(ls1_arg)
-    var ls2 = Int(ls2_arg)
-    var ls3 = Int(ls3_arg)
-    var rs0 = Int(rs0_arg)
-    var rs1 = Int(rs1_arg)
-    var rs2 = Int(rs2_arg)
-    var rs3 = Int(rs3_arg)
-    var total = Int(total_arg)
-    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
-    var gstride = Int(grid_dim.x) * Int(block_dim.x)
-    while i < total:
-        var i3 = i % d3
-        var rest = i // d3
-        var i2 = rest % d2
-        rest = rest // d2
-        var i1 = rest % d1
-        var i0 = rest // d1
-        var a = l_ptr[i0 * ls0 + i1 * ls1 + i2 * ls2 + i3 * ls3]
-        var b = r_ptr[i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3]
-        _cmp_bcast_body[dtype, op_code](out_ptr, a, b, i)
-        i += gstride
-
-
-@always_inline
-def _cmp_bcast[
-    dtype: DType, op_code: Int
-](
-    out_addr: Int,
-    l_addr: Int,
-    r_addr: Int,
-    d1: Int,
-    d2: Int,
-    d3: Int,
-    ls0: Int,
-    ls1: Int,
-    ls2: Int,
-    ls3: Int,
-    rs0: Int,
-    rs1: Int,
-    rs2: Int,
-    rs3: Int,
-    total: Int,
-    ctx: DeviceContext,
-) raises:
-    var out_ptr = _make_ptr[DType.bool](out_addr)
-    var l_ptr = _make_ptr[dtype](l_addr)
-    var r_ptr = _make_ptr[dtype](r_addr)
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, l_ptr, r_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var i = Int(idx[0].value())
-            var i3 = i % d3
-            var rest = i // d3
-            var i2 = rest % d2
-            rest = rest // d2
-            var i1 = rest % d1
-            var i0 = rest // d1
-            var a = l_ptr[i0 * ls0 + i1 * ls1 + i2 * ls2 + i3 * ls3]
-            var b = r_ptr[i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3]
-            _cmp_bcast_body[dtype, op_code](
-                out_ptr.as_unsafe_any_origin(), a, b, i
-            )
-
-        elementwise[func, simd_width=1](Coord(total), ctx)
-    else:
-        comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
-            raise Error("float64 is not supported on Apple GPU")
-        else:
-            comptime if has_accelerator():
-                _enqueue_cached[_cmp_bcast_kernel[dtype, op_code]](
-                    ctx,
-                    String(t"lg_cmp_{op_code}_{dtype}"),
-                    _gs_blocks(total),
-                    1,
-                    1,
-                    GS_THREADS,
-                    out_ptr.as_unsafe_any_origin(),
-                    l_ptr.as_unsafe_any_origin().as_immutable(),
-                    r_ptr.as_unsafe_any_origin().as_immutable(),
-                    Int64(d1),
-                    Int64(d2),
-                    Int64(d3),
-                    Int64(ls0),
-                    Int64(ls1),
-                    Int64(ls2),
-                    Int64(ls3),
-                    Int64(rs0),
-                    Int64(rs1),
-                    Int64(rs2),
-                    Int64(rs3),
-                    Int64(total),
-                )
-            else:
-                raise Error("no GPU accelerator available at compile time")
-
-
-# ---------------------------------------------------------------------------
-# Runtime dtype dispatch shared by both broadcast kernel families. The
-# strides/dims arrive as one raw CPython 12-tuple (d0..d3, ls0..ls3,
-# rs0..rs3), read element-by-element with `_raw_tuple_int` (borrowed
-# references, no refcount traffic).
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Bitwise not over a contiguous span. `~` on bool is logical not, on
 # integers the usual complement — matching torch.
 # ---------------------------------------------------------------------------
 
 
 @always_inline
+def _not_vec[dtype: DType, w: Int](a: SIMD[dtype, w]) -> SIMD[dtype, w]:
+    """`~a` at an arbitrary SIMD width. Module level, not a closure: the
+    vectorized skeleton compiles it into a device function."""
+    return ~a
+
+
+@always_inline
 def _bitwise_not[
     dtype: DType
 ](out_addr: Int, in_addr: Int, size: Int, ctx: DeviceContext) raises:
+    # 16-byte vectorized when both bases are aligned; the closure below
+    # keeps offset views (and the CPU context) correct.
+    if _flat_vec_unary[dtype, dtype, _not_vec[dtype, _], "bitwise_not"](
+        out_addr, in_addr, size, ctx
+    ):
+        return
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
 
@@ -1244,8 +1248,8 @@ def _ternary_bcast_dispatcher[
 # ---------------------------------------------------------------------------
 # TensorSpec entries (docs/tensor_spec_design.md): the whole binary-broadcast
 # op prologue — input checks, broadcast layout, output alloc, kernel launch —
-# in one boundary call over cached TensorSpecs, reusing `_bin_bcast` /
-# `_cmp_bcast` above. Failed checks raise a real NotImplementedError into
+# in one boundary call over cached TensorSpecs, reusing `_binary_bcast`
+# above. Failed checks raise a real NotImplementedError into
 # Python ("take the classic path"); nothing is swallowed on spec paths.
 # ---------------------------------------------------------------------------
 
@@ -1410,44 +1414,28 @@ def _binary_spec_into_go[
         comptime for dt in SPEC_BCAST_DTYPES:
             comptime if _dtype_arg_abi_on[0, dt]():
                 if kdtype == dt:
-                    comptime if is_cmp:
-                        _cmp_bcast[dt, op_code](
-                            addr,
-                            a.ptr,
-                            b.ptr,
-                            d[1],
-                            d[2],
-                            d[3],
-                            ls[0],
-                            ls[1],
-                            ls[2],
-                            ls[3],
-                            rs[0],
-                            rs[1],
-                            rs[2],
-                            rs[3],
-                            numel,
-                            ctx,
-                        )
-                    else:
-                        _bin_bcast[dt, op_code](
-                            addr,
-                            a.ptr,
-                            b.ptr,
-                            d[1],
-                            d[2],
-                            d[3],
-                            ls[0],
-                            ls[1],
-                            ls[2],
-                            ls[3],
-                            rs[0],
-                            rs[1],
-                            rs[2],
-                            rs[3],
-                            numel,
-                            ctx,
-                        )
+                    # A comparison writes torch's bool storage, which IS
+                    # uint8: the kernels store 0/1 bytes through a uint8
+                    # pointer rather than an i1 vector (see _bin_vec_op).
+                    comptime out_dt = DType.uint8 if is_cmp else dt
+                    _binary_bcast[dt, out_dt, op_code, is_cmp](
+                        addr,
+                        a.ptr,
+                        b.ptr,
+                        d[1],
+                        d[2],
+                        d[3],
+                        ls[0],
+                        ls[1],
+                        ls[2],
+                        ls[3],
+                        rs[0],
+                        rs[1],
+                        rs[2],
+                        rs[3],
+                        numel,
+                        ctx,
+                    )
 
 
 # ---------------------------------------------------------------------------

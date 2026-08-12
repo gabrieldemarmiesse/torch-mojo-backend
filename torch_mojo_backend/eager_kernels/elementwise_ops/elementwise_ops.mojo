@@ -74,6 +74,7 @@ from op_utils import (
     _fill_bits,
     _fill_bits_dtype,
     _fill_contig,
+    _flat_vec_unary,
     _gs_blocks,
     _make_ptr,
     _raw_ctx,
@@ -670,6 +671,27 @@ comptime BUOP_LOGICAL_NOT = 1
 
 
 @always_inline
+def _unary_bool_vec[
+    dtype: DType, op_code: Int, w: Int
+](a: SIMD[dtype, w]) -> SIMD[DType.uint8, w]:
+    """The bool-output unary ops at an arbitrary SIMD width.
+
+    Module level, not a nested closure: the vectorized skeleton compiles
+    this into a device function, and a capturing closure would capture by
+    reference on GPU. The mask is cast to uint8 (0/1) and stored through a
+    uint8 pointer -- that IS torch's bool memory format, while storing
+    SIMD[bool, w] would offer LLVM a packed i1 vector.
+    """
+    comptime if op_code == BUOP_ISNAN:
+        # `numerics.isnan` is bit-based (llvm.is.fpclass), so it survives the
+        # fast-math flags that would fold `a != a` to False; it also returns
+        # all-False for integer dtypes.
+        return isnan(a).cast[DType.uint8]()
+    else:
+        return a.eq(SIMD[dtype, w](0)).cast[DType.uint8]()
+
+
+@always_inline
 def _unary_bool[
     dtype: DType, op_code: Int
 ](
@@ -682,15 +704,15 @@ def _unary_bool[
     @parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
+        # Same body as the vectorized path above, through the same helper:
+        # the 0/1 uint8 it returns is bit-identical to the bool stored here.
         var i = Int(idx[0].value())
-        var a = in_ptr.load[width=width](i)
-        comptime if op_code == BUOP_ISNAN:
-            # `numerics.isnan` is bit-based (llvm.is.fpclass), so it survives
-            # the fast-math flags that would fold `a != a` to False; it also
-            # returns all-False for integer dtypes.
-            out_ptr.store[width=width](i, isnan(a))
-        comptime if op_code == BUOP_LOGICAL_NOT:
-            out_ptr.store[width=width](i, a.eq(SIMD[dtype, width](0)))
+        out_ptr.store[width=width](
+            i,
+            _unary_bool_vec[dtype, op_code, width](
+                in_ptr.load[width=width](i)
+            ).cast[DType.bool](),
+        )
 
     if ctx.api() == "cpu":
         elementwise[func, simd_width=simd_width_of[dtype]()](Coord(size), ctx)
@@ -701,6 +723,15 @@ def _unary_bool[
             ):
                 raise Error("float64 is not supported on Apple GPU")
             else:
+                # 16-byte loads, one byte written per element; declines
+                # unaligned bases, which keep the scalar closure below.
+                comptime name = (
+                    "isnan" if op_code == BUOP_ISNAN else "logical_not"
+                )
+                if _flat_vec_unary[
+                    dtype, DType.uint8, _unary_bool_vec[dtype, op_code, _], name
+                ](Int(out_ptr), Int(in_ptr), size, ctx):
+                    return
                 elementwise[func, simd_width=1, target="gpu"](Coord(size), ctx)
         else:
             raise Error("no GPU accelerator available at compile time")

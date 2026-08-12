@@ -271,6 +271,43 @@ def _bw_flat_blocks(slots: Int, traffic_bytes: Int) -> Int:
 
 
 @always_inline
+def _device_attr_cached(
+    ctx: DeviceContext, key: StaticString, attr: DeviceAttribute, fallback: Int
+) -> Int:
+    """One driver round trip per (device, attribute) for the whole process.
+
+    `ctx.get_attribute` is a driver call, and the grid rules below read it on
+    EVERY launch of kernels whose whole duration is ~2us. Memoized in the
+    process-global registry — the `_enqueue_cached` pattern — keyed by
+    context id, so a multi-GPU process keeps one entry per device. A query
+    that fails or answers <= 0 caches the fallback, so it is not retried
+    either.
+    """
+    try:
+        var name = String(t"TMB_DEVATTR_{key}_{ctx.id()}")
+        var cached = _get_global_or_null(name)
+        if cached:
+            return cached.value().bitcast[Int]()[]
+        var value = fallback
+        try:
+            var queried = ctx.get_attribute(attr)
+            if queried > 0:
+                value = queried
+        except:
+            # A backend that does not answer this query caches the fallback
+            # too, so it is asked exactly once rather than on every launch.
+            value = fallback
+        var slot = alloc[Int](1)
+        slot.init_pointee_move(value)
+        external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+            StringSlice(name), slot.bitcast[NoneType]()
+        )
+        return value
+    except:
+        return fallback
+
+
+@always_inline
 def _device_sm_count(ctx: DeviceContext) -> Int:
     """SMs / CUs of the device actually in hand.
 
@@ -280,13 +317,78 @@ def _device_sm_count(ctx: DeviceContext) -> Int:
     PCIe has 114, an H100 SXM 132, and the table reports 132 for both). Any
     grid derived from the SM count wants this, not the table.
     """
-    comptime fallback = ctx.default_device_info.sm_count
-    var count = 0
-    try:
-        count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
-    except:
-        count = fallback
-    return count if count > 0 else fallback
+    return _device_attr_cached(
+        ctx,
+        "sm",
+        DeviceAttribute.MULTIPROCESSOR_COUNT,
+        ctx.default_device_info.sm_count,
+    )
+
+
+# CUDA's CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE. `DeviceAttribute` is a thin
+# wrapper over the driver enum and does not name this one, but the query is
+# the only way to get the real capacity of the card in hand (an H100 PCIe has
+# 50 MiB, an A100 40 MiB, an L40S 96 MiB). The number is CUDA's, so it is
+# only ever asked of a CUDA context; everywhere else the answer is 0, which
+# reads as "assume nothing is resident" and takes the streaming arm. That is
+# the safe side of the split: measured on the H100 comparison kernel, the
+# streaming arm is never worse than 5% at any size, while the resident arm
+# costs 12% at 151 MB of traffic.
+#
+# It does leave something on the table on AMD, where 256 MiB of Infinity
+# Cache makes far more shapes resident than 50 MiB of L2 does: mapping the
+# HIP attribute number here would enable the resident arm on MI300X, but the
+# ladder above was fitted on 50 MiB and the resident block count would have
+# to be re-measured there (the same warning `_bw_flat_blocks` carries).
+comptime _CU_ATTR_L2_CACHE_SIZE = 38
+
+
+@always_inline
+def _device_l2_bytes(ctx: DeviceContext) -> Int:
+    """Last-level cache capacity of the device in hand, 0 when unknown."""
+    if ctx.api() != "cuda":
+        return 0
+    return _device_attr_cached(
+        ctx, "l2", DeviceAttribute(_CU_ATTR_L2_CACHE_SIZE), 0
+    )
+
+
+@always_inline
+def _l2_wave_blocks(slots: Int, traffic_bytes: Int, ctx: DeviceContext) -> Int:
+    """Grid for a GS_THREADS-wide launch whose thread reads 16 bytes per
+    operand and writes a NARROWER result (a comparison's 1-byte mask).
+
+    Same two regimes as `_bw_flat_blocks`, both constants re-measured for
+    this traffic mix, because the crossover depends on how many bytes one
+    thread moves (see `_bw_blocks`: the resident block count is the caller's
+    to measure, not this file's to assume). Ours/stock device time on an
+    f32 -> bool comparison, H100 PCIe at 1395 MHz, kineto, 64 iterations:
+
+      elements   MB    exact grid   one wave   wave while L2-resident
+       357x789   2.5      1.01        1.02            1.02
+      1023x1025  9.4      1.02        0.99            0.99
+      2048x2048 37.7      0.96        0.63            0.60
+         5.0M   45.0      1.05        0.92            0.92
+         8.0M   75.5      1.00        1.01            1.00
+      4096x4096 151.0     1.00        1.02            1.00
+
+    The cap is one full RESIDENCY WAVE -- the point past which a block cannot
+    start until an earlier one retires -- not a fitted constant. While the
+    operands fit in L2, many short-lived blocks lose badly to few long-lived
+    ones (1.68x at 2048x2048); once they stream from HBM the ranking reverses
+    and the exact grid is ~2% ahead. A 4-blocks-per-SM resident arm (half a
+    wave) was measured at 1.05 worst-cell against 1.03 for the full wave, and
+    2 blocks per SM at 1.12: one wave is the right cap, a fraction of one is
+    not.
+    """
+    var exact = (slots + GS_THREADS - 1) // GS_THREADS
+    if traffic_bytes <= _device_l2_bytes(ctx):
+        comptime blocks_per_sm = max(
+            1,
+            ctx.default_device_info.threads_per_multiprocessor // GS_THREADS,
+        )
+        return max(1, min(exact, _device_sm_count(ctx) * blocks_per_sm))
+    return max(1, min(exact, _BW_MAX_BLOCKS))
 
 
 # ===========================================================================
@@ -484,25 +586,6 @@ def _get_ctx(device_context_ptr: PythonObject) raises -> DeviceContext:
     return DeviceContext(
         OpaquePointer[MutUntrackedOrigin](unsafe_from_address=addr)
     )
-
-
-@always_inline
-def _runtime_sm_count(ctx: DeviceContext) -> Int:
-    """SMs / CUs of the device actually in hand.
-
-    The compile-time `default_device_info` describes the ARCHITECTURE the
-    variant was built for, which is the right fallback but not the right
-    answer: two cards of one architecture differ here (H100 PCIe 114 vs SXM
-    132, and harvested parts differ again), and every split-reduction grid in
-    this package is derived from it.
-    """
-    comptime fallback = ctx.default_device_info.sm_count
-    var count = 0
-    try:
-        count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
-    except:
-        count = fallback
-    return count if count > 0 else fallback
 
 
 # ---------------------------------------------------------------------------
@@ -1209,6 +1292,103 @@ def _row_major8(shape: IndexList[MAX_RANK], rank: Int) -> IndexList[MAX_RANK]:
         strides[i] = acc
         acc *= shape[i]
     return strides
+
+
+# ===========================================================================
+# Flat vectorized unary skeleton
+# ===========================================================================
+#
+# The unary counterpart of logic_ops' `_bin_flat_vec_kernel`, and it is here
+# for the same reason: an op whose OUTPUT dtype differs from its input's
+# (isnan, logical_not: anything -> a 1-byte mask) cannot be written with a
+# same-dtype signature, so those ops fell through to the stdlib `elementwise`
+# closure at simd_width=1 -- one element loaded and one byte stored per
+# thread. Measured on a 16.7M-element bool tensor, H100 PCIe: 45.3us there
+# (0.74 TB/s) against 11.9us for stock PyTorch on the same op.
+#
+# `op` is the elementwise body at an arbitrary SIMD width, so one skeleton
+# serves every (in -> out) unary; the caller supplies its own op-code
+# dispatch inside it. It is declared `thin` on purpose: this body is
+# compiled into a DEVICE function, and a capturing closure would capture its
+# environment by reference, which is garbage on GPU. Pass a module-level
+# parametric function with its trailing width unbound
+# (`_my_op[dtype, op_code, _]`), never a nested closure.
+
+
+@__name(t"unary_flat_vec_{name}_{dtype}_{out_dtype}")
+def _flat_vec_unary_kernel[
+    dtype: DType,
+    out_dtype: DType,
+    op: def[w: Int](SIMD[dtype, w]) thin -> SIMD[out_dtype, w],
+    name: StaticString,
+](
+    out_ptr: UnsafePointer[Scalar[out_dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    total_arg: Int64,
+):
+    """One 16-byte load and one (possibly narrower) store per thread, plus a
+    ragged tail handled scalarly by the lowest-numbered threads of the same
+    launch. The launcher guarantees both bases are vector-aligned."""
+    comptime VW = 16 // size_of[dtype]()
+    comptime vec_align = VW * size_of[dtype]()
+    comptime out_align = min(16, VW * size_of[out_dtype]())
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var total = Int(total_arg)
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    var nvec = total // VW
+    var c = tid
+    while c < nvec:
+        var i = c * VW
+        out_ptr.store[width=VW, alignment=out_align](
+            i, op[VW](in_ptr.load[width=VW, alignment=vec_align](i))
+        )
+        c += gstride
+    var tail = total - nvec * VW
+    if tid < tail:
+        var i = nvec * VW + tid
+        out_ptr[i] = op[1](in_ptr[i])[0]
+
+
+@always_inline
+def _flat_vec_unary[
+    dtype: DType,
+    out_dtype: DType,
+    op: def[w: Int](SIMD[dtype, w]) thin -> SIMD[out_dtype, w],
+    name: StaticString,
+](out_addr: Int, in_addr: Int, total: Int, ctx: DeviceContext) raises -> Bool:
+    """Launch `out[i] = op(in[i])` over a contiguous span, vectorized.
+
+    Returns False without launching anything when the bases are not
+    vector-aligned (an offset view), so the caller keeps its scalar path for
+    that case rather than this one silently corrupting: a 16-byte load needs
+    a 16-byte-aligned source, and the gate is on the runtime ADDRESSES, never
+    on `total % VW` -- an offset view breaks the former while satisfying the
+    latter.
+    """
+    comptime if not has_accelerator():
+        return False
+    else:
+        comptime VW = 16 // size_of[dtype]()
+        comptime out_align = min(16, VW * size_of[out_dtype]())
+        if ctx.api() == "cpu" or total <= 0:
+            return False
+        if in_addr % 16 != 0 or out_addr % out_align != 0:
+            return False
+        var traffic = total * (size_of[dtype]() + size_of[out_dtype]())
+        _enqueue_cached[_flat_vec_unary_kernel[dtype, out_dtype, op, name]](
+            ctx,
+            String(t"uflat_{name}_{dtype}_{out_dtype}"),
+            _l2_wave_blocks(max(1, total // VW), traffic, ctx),
+            1,
+            1,
+            GS_THREADS,
+            _make_ptr[out_dtype](out_addr).as_unsafe_any_origin(),
+            _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_immutable(),
+            Int64(total),
+        )
+        return True
 
 
 @always_inline

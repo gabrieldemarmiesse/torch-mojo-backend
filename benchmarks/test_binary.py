@@ -22,6 +22,17 @@ SHAPES: dict[str, tuple[int, ...]] = {
     "A_357x789": (357, 789),
 }
 
+# A third REGIME, not just a third size, and only comparisons run it: at
+# 2048x2048 f32 a comparison moves 37.7 MB against the 50 MiB of L2 on an
+# H100, so its operands stay cache-resident, and the grid rule that serves
+# that regime (cap at one residency wave) and the one that serves a
+# streaming C_4096x4096 (cover the slots exactly) are 1.68x apart here --
+# 7.6us against 12.9us, measured.  Neither existing shape can see it: C_ is
+# streaming and A_ is launch-bound, so both read the same either way, and a
+# later simplification that collapses the two arms into one would pass the
+# whole suite while costing 68% right here.
+COMPARE_SHAPES: dict[str, tuple[int, ...]] = SHAPES | {"E_2048x2048": (2048, 2048)}
+
 ARITH_OPS = {
     "add.Tensor": torch.add,
     "sub.Tensor": torch.sub,
@@ -87,7 +98,7 @@ def _pair(
     shape_id: str, dtype_id: str, layout: str, hw: Hardware, mojo: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """(a_ref, b_ref, a_our, b_our); layout "bcast" makes b a broadcast row."""
-    shape = SHAPES[shape_id]
+    shape = COMPARE_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     a_ref, a_our = both(unit_interval(shape, dtype), hw, mojo)
     b_shape = (shape[-1],) if layout == "bcast" else shape
@@ -135,7 +146,7 @@ def test_minmax(
 
 @pytest.mark.parametrize("dtype_id", ("f32",))
 @pytest.mark.parametrize("layout", ("Scalar", "Tensor"))
-@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("shape_id", COMPARE_SHAPES)
 @pytest.mark.parametrize("op_name", op_params(COMPARE_OPS))
 def test_compare(
     op_name: str,

@@ -69,11 +69,11 @@ from op_utils import (
     TensorSpec,
     _adjacent_reduce_geom,
     _check_into_sized,
+    _device_sm_count,
     _enqueue_cached,
     _make_ptr,
     _parallel_for,
     _reduce_spec_geom,
-    _runtime_sm_count,
     _spec_ptr,
     _vec16_phase,
 )
@@ -984,7 +984,7 @@ def _reduce_generic[
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
     else:
-        var target = RED_BLOCKS_PER_SM * _runtime_sm_count(ctx)
+        var target = RED_BLOCKS_PER_SM * _device_sm_count(ctx)
         var mout = out_ptr.as_unsafe_any_origin()
         var min_ = in_ptr.as_unsafe_any_origin().as_immutable()
 
@@ -1105,7 +1105,7 @@ def _reduce_generic[
         # Few outputs cannot keep the device busy one thread each, so they get
         # a block apiece; many outputs would waste 255 of every 256 threads
         # that way and get a thread apiece instead.
-        if outputs <= _runtime_sm_count(ctx):
+        if outputs <= _device_sm_count(ctx):
             _enqueue_cached[_reduce_merge_block_kernel[Op, dtype]](
                 ctx,
                 String(t"reduce_merge_block_{Op.name}_{dtype}"),

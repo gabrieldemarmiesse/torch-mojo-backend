@@ -4147,6 +4147,130 @@ def test_fast_binary_add_above_last_level_cache(mojo_gpu):
     torch.testing.assert_close(actual, left + right)
 
 
+# The (dtype -> out_dtype) vectorized kernels: a comparison reads 16 bytes per
+# operand and writes a 1-byte mask, so its vector width, its ragged tail and
+# its alignment gate are all different from the same-dtype arithmetic case.
+# Sizes below straddle the vector width (16 // itemsize) in both directions;
+# the offset views are what catches a gate written on `total % VW` instead of
+# on the runtime base ADDRESS, which is the failure mode that silently
+# corrupts rather than faulting.
+_MASK_SIZES = [0, 1, 3, 4, 5, 15, 16, 17, 255, 256, 257, 4095, 100_003]
+_COMPARE_OPS = {
+    "eq": torch.eq,
+    "ne": torch.ne,
+    "lt": torch.lt,
+    "le": torch.le,
+    "gt": torch.gt,
+    "ge": torch.ge,
+}
+
+
+def _mask_operands(n: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic operands that overlap on a third of their elements, so
+    equality is exercised rather than being vacuously false everywhere."""
+    if dtype.is_floating_point:
+        left = (torch.arange(n, dtype=torch.float32) % 97 - 48.0).to(dtype)
+        right = (torch.arange(n, dtype=torch.float32) % 61 - 30.0).to(dtype)
+    else:
+        left = (torch.arange(n) % 97 - 48).to(dtype)
+        right = (torch.arange(n) % 61 - 30).to(dtype)
+    right[: n // 3] = left[: n // 3]
+    return left, right
+
+
+@pytest.mark.parametrize("op_name", sorted(_COMPARE_OPS))
+def test_fast_comparison_vector_width_boundaries_match_cpu(mojo_gpu, op_name):
+    op = _COMPARE_OPS[op_name]
+    for n in _MASK_SIZES:
+        left, right = _mask_operands(n, torch.float32)
+        actual = op(left.to(mojo_gpu), right.to(mojo_gpu)).cpu()
+        assert actual.dtype == torch.bool
+        assert torch.equal(actual, op(left, right)), f"tensor operands, n={n}"
+        # 0-d operand: read once and splatted, not broadcast-indexed.
+        scalar = op(left.to(mojo_gpu), 0.5).cpu()
+        assert torch.equal(scalar, op(left, 0.5)), f"scalar operand, n={n}"
+
+
+@pytest.mark.parametrize("offset", [1, 2, 3])
+def test_fast_comparison_offset_views_match_cpu(mojo_gpu, offset):
+    """A base address off by `offset` elements fails the 16-byte gate and must
+    take the strided arm — with the same answers, including the tail."""
+    for n in (5, 17, 100_003):
+        left, right = _mask_operands(n + offset, torch.float32)
+        device_left = left.to(mojo_gpu)[offset:]
+        device_right = right.to(mojo_gpu)[offset:]
+        expected = torch.lt(left[offset:], right[offset:])
+        assert torch.equal(torch.lt(device_left, device_right).cpu(), expected)
+        assert torch.equal(
+            torch.lt(device_left, 0.5).cpu(), torch.lt(left[offset:], 0.5)
+        )
+
+        ints = (torch.arange(n + offset) % 251).to(torch.int32)
+        device_ints = ints.to(mojo_gpu)[offset:]
+        assert torch.equal(
+            torch.bitwise_and(device_ints, device_ints).cpu(),
+            torch.bitwise_and(ints[offset:], ints[offset:]),
+        )
+        assert torch.equal(
+            torch.bitwise_not(device_ints).cpu(), torch.bitwise_not(ints[offset:])
+        )
+        bools = (torch.arange(n + offset) % 3) == 0
+        device_bools = bools.to(mojo_gpu)[offset:]
+        assert torch.equal(
+            torch.logical_not(device_bools).cpu(), torch.logical_not(bools[offset:])
+        )
+
+
+def test_fast_logical_and_xor_bool_operands_match_cpu(mojo_gpu):
+    """bool operands ride the uint8 kernel at the full 16-element width."""
+    for n in _MASK_SIZES:
+        left = (torch.arange(n) % 3) == 0
+        right = (torch.arange(n) % 5) < 2
+        for op in (torch.logical_and, torch.logical_xor):
+            actual = op(left.to(mojo_gpu), right.to(mojo_gpu)).cpu()
+            assert actual.dtype == torch.bool
+            assert torch.equal(actual, op(left, right)), f"{op.__name__}, n={n}"
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int8]
+)
+def test_fast_comparison_dtypes_and_scalar_operands_match_cpu(mojo_gpu, dtype):
+    # One dtype per storage width, each with a ragged tail (1003 is not a
+    # multiple of any of the vector widths 2, 4, 8 or 16).
+    left, right = _mask_operands(1003, dtype)
+    for op in _COMPARE_OPS.values():
+        assert torch.equal(
+            op(left.to(mojo_gpu), right.to(mojo_gpu)).cpu(), op(left, right)
+        )
+        assert torch.equal(op(left.to(mojo_gpu), 3).cpu(), op(left, 3))
+
+
+def test_fast_bitwise_scalar_operand_match_cpu(mojo_gpu):
+    for n in (5, 17, 1003, 100_003):
+        values = (torch.arange(n) * 2654435761 % (1 << 30)).to(torch.int32)
+        device = values.to(mojo_gpu)
+        for op in (torch.bitwise_and, torch.bitwise_or, torch.bitwise_xor):
+            assert torch.equal(op(device, 21).cpu(), op(values, 21)), f"{op}, n={n}"
+
+
+@pytest.mark.parametrize("op_name", ["logical_not", "bitwise_not", "isnan"])
+def test_fast_unary_mask_vector_tail_match_cpu(mojo_gpu, op_name):
+    """The flat vectorized unary skeleton: same tail and alignment rules, and
+    for logical_not/isnan the same (dtype -> 1-byte mask) narrowing."""
+    op = getattr(torch, op_name)
+    for n in _MASK_SIZES:
+        if op_name == "bitwise_not":
+            values = (torch.arange(n) % 251 - 125).to(torch.int32)
+        elif op_name == "isnan":
+            values = (torch.arange(n, dtype=torch.float32) % 7) - 3.0
+            values[::5] = float("nan")
+        else:
+            values = ((torch.arange(n) % 4) == 0).to(torch.bool)
+        actual = op(values.to(mojo_gpu)).cpu()
+        assert torch.equal(actual, op(values)), f"{op_name}, n={n}"
+
+
 @pytest.mark.parametrize(
     "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32]
 )
