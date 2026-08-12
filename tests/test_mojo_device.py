@@ -1137,3 +1137,54 @@ def test_from_cpu_rejects_a_device_source(mojo_gpu):
     on_device = torch.zeros(4, device=mojo_gpu)
     with pytest.raises(RuntimeError, match="requires a CPU source"):
         TorchMojoTensor._from_cpu(on_device, on_device._device)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a second backend to copy from"
+)
+def test_same_gpu_transfer_skips_the_host(mojo_gpu):
+    """The transfer must not go through host memory when both live on one GPU.
+
+    Asserted by timing rather than by values, because a host bounce is
+    CORRECT -- just two PCIe crossings instead of one HBM copy.  537 MB
+    measured 375 ms bounced against 0.64 ms on device, so an order of
+    magnitude is a wide margin around that.
+    """
+    import time
+
+    big = torch.randn(1 << 26, device="cuda")  # 256 MB
+    big.to(mojo_gpu)
+    torch.mojo.synchronize()
+
+    start = time.perf_counter()
+    moved = big.to(mojo_gpu)
+    torch.mojo.synchronize()
+    on_device = time.perf_counter() - start
+
+    start = time.perf_counter()
+    bounced = big.cpu().to(mojo_gpu)
+    torch.mojo.synchronize()
+    through_host = time.perf_counter() - start
+
+    assert torch.equal(moved.cpu(), bounced.cpu())
+    assert on_device * 10 < through_host, (
+        f"expected the on-device route; {on_device * 1e3:.2f}ms on device vs "
+        f"{through_host * 1e3:.2f}ms through the host"
+    )
+
+
+def test_pointer_ordinal_identifies_the_owning_gpu(mojo_gpu):
+    """cuda_peer reads device identity off the POINTER, not off an ordinal.
+
+    MAX's Device exposes no UUID or PCI id, so matching its `gpu:0` to torch's
+    `cuda:0` by ordinal would assume both runtimes enumerate alike.  Asking the
+    driver who owns each allocation is a fact rather than an assumption.
+    """
+    from torch_mojo_backend.mojo_device import cuda_peer
+
+    on_mojo = torch.zeros(8, device=mojo_gpu)
+    torch.mojo.synchronize()
+    assert cuda_peer.device_ordinal(on_mojo._ptr) is not None
+    assert cuda_peer.device_ordinal(0) is None
+    assert cuda_peer.device_ordinal(torch.zeros(8).data_ptr()) is None
+    assert not cuda_peer.same_physical_device(on_mojo._ptr, 0)
