@@ -11,7 +11,7 @@ from std.builtin.device_passable import DevicePassable
 from std.ffi import _get_global_or_null, external_call
 from max.gpu.sync import barrier
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from max.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
 from std.math import ceildiv, sqrt
 from std.memory import OpaquePointer, alloc, stack_allocation
 from std.python import Python, PythonObject
@@ -284,6 +284,46 @@ def _get_ctx(device_context_ptr: PythonObject) raises -> DeviceContext:
     return DeviceContext(
         OpaquePointer[MutUntrackedOrigin](unsafe_from_address=addr)
     )
+
+
+@always_inline
+def _runtime_sm_count(ctx: DeviceContext) -> Int:
+    """SMs / CUs of the device actually in hand.
+
+    The compile-time `default_device_info` describes the ARCHITECTURE the
+    variant was built for, which is the right fallback but not the right
+    answer: two cards of one architecture differ here (H100 PCIe 114 vs SXM
+    132, and harvested parts differ again), and every split-reduction grid in
+    this package is derived from it.
+    """
+    comptime fallback = ctx.default_device_info.sm_count
+    var count = 0
+    try:
+        count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    except:
+        count = fallback
+    return count if count > 0 else fallback
+
+
+@always_inline
+def _vec16_phase[dtype: DType](addr: Int) -> Int:
+    """Element offset of `addr` inside its own 16-byte block, or -1 when `addr`
+    is not even element-aligned.
+
+    A 128-bit access is legal only at an address that is a multiple of 16, so
+    this -- and not the column index -- is what decides where a row's
+    vectorized body may start: element index `j` of a buffer sits at a 16-byte
+    boundary iff `(phase + j) % V == 0`, which collapses to `j % V == 0` only
+    for a buffer whose own base is 16-byte aligned.
+
+    Shared by the log-softmax row pass, the variance moments and the generic
+    reduction skeleton; all three walk a runtime sub-range of a buffer whose
+    base phase they do not control.
+    """
+    comptime esize = size_of[dtype]()
+    if addr % esize != 0:
+        return -1
+    return (addr % 16) // esize
 
 
 # ---------------------------------------------------------------------------
@@ -1535,3 +1575,45 @@ def _reduce_spec_geom(
             if is_red[i] == 0:
                 oshape[w2] = a.shape[i]
                 w2 += 1
+
+
+@always_inline
+def _adjacent_reduce_geom(
+    a: TensorSpec,
+    rdims_t: PyObjectPtr,
+    mut outer: Int,
+    mut reduce_n: Int,
+    mut inner: Int,
+) raises -> Bool:
+    """Collapse a contiguous, adjacent, ascending reduce interval into runtime
+    (outer, reduce, inner) dimensions; False when the layout is anything else.
+
+    The one geometry every reduction in this package works in: element
+    (o, r, i) of the operand sits at `(o * reduce + r) * inner + i` and output
+    (o, i) at `o * inner + i`. `inner == 1` is the trailing case (a (rows,
+    cols) buffer, a full reduction being rows == 1); `inner > 1` is the
+    interior/leading case, which is exactly the reduction Python would
+    otherwise have to materialize a transposed copy for. All three are runtime
+    values -- no shape is ever baked in.
+    """
+    if not a.contig:
+        return False
+    var n = _raw_tuple_len(rdims_t)
+    if n == 0 or n > a.rank:
+        return False
+    var first = _raw_tuple_int(rdims_t, 0)
+    if first < 0 or first + n > a.rank:
+        return False
+    for k in range(n):
+        if _raw_tuple_int(rdims_t, k) != first + k:
+            return False
+    outer = 1
+    reduce_n = 1
+    inner = 1
+    for d in range(first):
+        outer *= a.dim(d)
+    for d in range(first, first + n):
+        reduce_n *= a.dim(d)
+    for d in range(first + n, a.rank):
+        inner *= a.dim(d)
+    return True

@@ -376,14 +376,42 @@ def _reduce_ready_operand(
     return view._contig(), trailing
 
 
+# Operand dtypes the scalar reductions accept.  Mirrors reduce_skeleton.mojo's
+# SCALAR_DTYPES / TRUTHY_DTYPES: a queued launch cannot fall back, so the two
+# lists have to agree.
+_ROW_REDUCE_DTYPES = _FLOAT_DTYPES + (DType.int64, DType.int32)
+
+# Dtypes any()/all() accept as input (the nonzero test works for all of them;
+# the output is always bool). Matches AnyOp.dtypes / AllOp.dtypes.
+_ANYALL_DTYPES = _FLOAT_DTYPES + (
+    DType.int64,
+    DType.int32,
+    DType.int16,
+    DType.int8,
+    DType.uint8,
+    DType.bool,
+)
+
+
 # Reduce specs whose Mojo bridge reduces an adjacent NON-trailing dim interval
-# in place, mapped to the operand dtypes that route there: reduction_ops'
-# SumSpec has a direct fp32 middle-sum kernel, VarSpec a strided-axis moment
-# kernel for every float dtype.  Everything else still pays the Python-side
-# permute + materialize.
+# in place, mapped to the operand dtypes that route there.  Every scalar
+# reduction is here now: they all share the generic skeleton's strided-axis
+# kernel (one thread per output column, walking the reduce axis while
+# neighbouring lanes read neighbouring elements of the contiguous inner axis),
+# which reads the source where it lies and so skips the transposed full-tensor
+# copy `_reduce_ready_operand` would otherwise materialize -- the whole cost of
+# a `dim=0` reduction.  VarSpec has the same shape with a two-slot payload.
+# Non-adjacent intervals still pay the Python-side permute + materialize.
 _REDUCE_MIDDLE_DIRECT: dict[tuple[str, str], frozenset[DType]] = {
-    ("reduction_ops", "SumSpec"): frozenset({DType.float32}),
+    ("reduction_ops", "SumSpec"): frozenset(_ROW_REDUCE_DTYPES),
+    ("reduction_ops", "AmaxSpec"): frozenset(_ROW_REDUCE_DTYPES),
+    ("reduction_ops", "AminSpec"): frozenset(_ROW_REDUCE_DTYPES),
+    ("reduction_ops", "AnySpec"): frozenset(_ANYALL_DTYPES),
+    ("reduction_ops", "AllSpec"): frozenset(_ANYALL_DTYPES),
+    ("reduction_ops", "NormSpec"): frozenset(_FLOAT_DTYPES),
     ("reduction_ops", "VarSpec"): frozenset(_FLOAT_DTYPES),
+    ("nn_ops", "MeanSpec"): frozenset(_FLOAT_DTYPES),
+    ("nn_ops", "MaxSpec"): frozenset(_ROW_REDUCE_DTYPES),
 }
 
 
@@ -410,9 +438,10 @@ def _reduce_middle_direct_ok(
 def _arg_strided_direct_ok(
     spec_fn_name: str, a: TorchMojoTensor, dims: tuple[int, ...]
 ) -> bool:
-    """Whether argmin/argmax reduces a NON-trailing dim interval in place.
+    """Whether an arg-reduction (or min.dim) reduces a NON-trailing dim
+    interval in place.
 
-    The arg-reduction bridge has a strided-axis kernel (`_argreduce_cols` in
+    The (value, index) bridge has a strided-axis kernel (`_argreduce_cols` in
     argreduce_kernels.mojo): one thread per output column, walking the reduce
     axis while neighbouring lanes read neighbouring elements of the
     contiguous inner axis. It reads the source where it lies, so this route
@@ -424,7 +453,7 @@ def _arg_strided_direct_ok(
     contiguous operand, one adjacent ascending dim interval that is not the
     trailing one, on an accelerator, and enough inner elements for the lanes
     to coalesce."""
-    if spec_fn_name not in ("ArgminSpec", "ArgmaxSpec"):
+    if spec_fn_name not in ("ArgminSpec", "ArgmaxSpec", "MinDimSpec"):
         return False
     if not a._is_contiguous or getattr(a._device, "api", "cpu") == "cpu":
         return False
@@ -1664,6 +1693,8 @@ _SPEC_UNARY_DIRECT_NAMES = frozenset({"ReluSpec", "AbsSpec", "NegSpec", "SignSpe
 _SPEC_ROWRED_INTO = frozenset(
     {DType.float32, DType.float16, DType.bfloat16, DType.int64, DType.int32}
 )
+# The vector norm accumulates in float32 and has no float64 kernel.
+_SPEC_NORM_DTYPES = frozenset({DType.float32, DType.float16, DType.bfloat16})
 _SPEC_ANYALL_INTO = frozenset(
     {
         DType.float32,
@@ -1683,6 +1714,7 @@ _SPEC_REDUCE_INTO = {
     ("reduction_ops", "AmaxSpec"): (_SPEC_ROWRED_INTO, None),
     ("reduction_ops", "AminSpec"): (_SPEC_ROWRED_INTO, None),
     ("reduction_ops", "ArgminSpec"): (_SPEC_ROWRED_INTO, DType.int64),
+    ("reduction_ops", "NormSpec"): (_SPEC_NORM_DTYPES, None),
     ("reduction_ops", "VarSpec"): (_SPEC_FLOAT_DTYPES, None),
     ("reduction_ops", "AllSpec"): (_SPEC_ANYALL_INTO, DType.bool),
     ("reduction_ops", "AnySpec"): (_SPEC_ANYALL_INTO, DType.bool),
@@ -1851,7 +1883,10 @@ def _try_spec_min_dim(
     """
     ok = _call_queue.enabled() and a._numel > 0 and a._dtype in _SPEC_ROWRED_INTO
     original_shape = tuple(a._shape)
-    a, ready_dims = _reduce_ready_operand(a, (dim,))
+    if _arg_strided_direct_ok("MinDimSpec", a, (dim,)):
+        ready_dims = (dim,)  # zero-copy strided-axis kernel, no materialization
+    else:
+        a, ready_dims = _reduce_ready_operand(a, (dim,))
     try:
         outputs = _submit_prepared_into(
             _MinDimSpecExtension.prepare(a, ready_dims[0], keepdim), force_sync=not ok
@@ -4594,20 +4629,6 @@ def fast_aten_native_layer_norm_backward(
 # ---------------------------------------------------------------------------
 
 
-_ROW_REDUCE_DTYPES = _FLOAT_DTYPES + (DType.int64, DType.int32)
-
-# Dtypes any()/all() accept as input (the nonzero test works for all of them;
-# the output is always bool). Matches reduction_ops' AnyRows/AllRows dispatch.
-_ANYALL_DTYPES = _FLOAT_DTYPES + (
-    DType.int64,
-    DType.int32,
-    DType.int16,
-    DType.int8,
-    DType.uint8,
-    DType.bool,
-)
-
-
 def _torch_dtype_to_max(dtype):
     from max.experimental.torch.torch import torch_dtype_to_max
 
@@ -4715,11 +4736,17 @@ def fast_aten_sum(input, dim=None, keepdim=False, *, dtype=None):
 
 
 def fast_aten_linalg_vector_norm(self, ord=2, dim=None, keepdim=False, *, dtype=None):
-    """FP32 L2 norm composed from existing eager elementwise/reduction ops."""
-    input = _t(self)
+    """L2 norm in ONE pass: sum of squares with the root folded into the
+    accumulator's finalize (reduction_ops' NormSpec / NormL2Op).
+
+    It used to be composed here as mul -> sum -> sqrt, which is three launches
+    and a temporary the size of the input for a reduction that reads each
+    element once.
+    """
+    a = _t(self)
     if (
-        input is None
-        or input._dtype != DType.float32
+        a is None
+        or a._dtype not in _FLOAT_DTYPES
         or not isinstance(ord, int | float)
         or isinstance(ord, bool)
         or ord != 2
@@ -4727,14 +4754,12 @@ def fast_aten_linalg_vector_norm(self, ord=2, dim=None, keepdim=False, *, dtype=
         or not isinstance(keepdim, bool)
     ):
         return NOT_HANDLED
-
-    squared = fast_aten_mul(input, input)
-    if squared is NOT_HANDLED:
+    rank = len(a._shape)
+    rdims = _norm_reduce_dims(dim, rank, empty_is_all=True)
+    if rdims is None:
         return NOT_HANDLED
-    summed = fast_aten_sum(squared, dim, keepdim)
-    if summed is NOT_HANDLED:
-        return NOT_HANDLED
-    return fast_aten_sqrt(summed)
+    result = _try_spec_reduce("NormSpec", a, rdims, keepdim)
+    return result if result is not None else NOT_HANDLED
 
 
 def _amax_amin(input, dim, keepdim, spec_name):

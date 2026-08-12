@@ -48,7 +48,7 @@ different kind of item.
 | [A3](#a3) | Fused SDPA backward is Apple-only; CUDA/ROCm run the composed sequence with two extra full transposes for dV | Attention | Medium–High | Medium | — |
 | [D1](#d1) | The hot rank≤4 materialize path lacks the 16-byte vectorized transpose the rank≤8 path already has | Data movement | Medium (2.1–2.4 → 3.57 TB/s on the transposes, gfx942-measured) | **Low** (port an existing kernel) | — |
 | [P1](#p1) | Warm-path regression from the variant loader: 101 ms/step vs 60 ms on `main` | Compile pipeline | **High** — the largest single eager regression currently on record | Medium | — |
-| [R1](#r1) | Non-trailing reductions materialize a whole permuted copy of the input (all ops, all dtypes, except fp32 `sum` over one adjacent middle interval) | Reductions | Medium | Medium | — |
+| [R1](#r1) | ~~Non-trailing reductions materialize a whole permuted copy of the input~~ **DONE**: one accumulator-parametrized skeleton over (outer, reduce, inner), strided-axis kernel for every scalar reduction | Reductions | Medium | Medium | — |
 | [O2](#o2) | Five `_foreach_*` batched kernels are Metal-only; CUDA/ROCm fall back to one launch per tensor | Optimizer | Medium (non-fused `AdamW(foreach=True)`) | Low–Medium | — |
 | [C2](#c2) | Grouped convolution issues `N × groups` GEMM launches from a Python loop | Conv | Medium for depthwise/grouped nets | Medium | — |
 | [C1](#c1) | Convolution is im2col + GEMM with a full `(N, C·kh·kw, out_h·out_w)` temporary | Conv | Medium (memory-bound at large spatial) | High | no conv benchmark exists |
@@ -61,7 +61,7 @@ different kind of item.
 | [N4](#n4) | RMSNorm has no fused op in either backend | Normalization | Medium for modern LLMs | Medium | — |
 | [A5](#a5) | `attn_mask` is a hard decline in eager SDPA | Attention | High for HF models | Medium | — |
 | [D5](#d5) | `aten::index` only handles a single index tensor on dim 0 | Data movement | Medium | Medium | — |
-| [R2](#r2) | `linalg_vector_norm` is composed: 3 launches + an input-sized temporary | Reductions | Low | Low | — |
+| [R2](#r2) | ~~`linalg_vector_norm` is composed: 3 launches + an input-sized temporary~~ **DONE**: `NormSpec` / `NormL2Op`, one pass | Reductions | Low | Low | — |
 | [C3](#c3) | conv is 2-D forward only; no `convolution_backward`, no conv1d/3d/transposed in eager | Conv | High for vision *training* (blocks it) | High | — |
 | [N2](#n2) | BatchNorm training and GroupNorm backward are absent in eager | Normalization | High for vision training (blocks it) | Medium | — |
 | [Q1](#q1) | Graph backend hand-decomposes softmax / log_softmax instead of using MAX's fused ops | Graph | Low–Medium | **Low** | verify MAX does not already re-fuse |
@@ -622,72 +622,39 @@ different kind of item.
 ## Reductions
 
 ### R1
-**Non-trailing reductions materialize a full permuted copy of the input**
+**Non-trailing reductions materialize a full permuted copy of the input** —
+**DONE** (generic reduction skeleton)
 
-> **Scratch moved to Python (2026-08-03).** The input-sized Mojo-side
-> scratch copies are gone: the reduce family (rowred/argmin/min.dim/var/
-> anyall/mean/max/argmax) and the strided unary/scalar/softmax/cumsum/
-> log_softmax paths now have their operands permuted and materialized in
-> Python (`aten_fast._reduce_ready_operand`, `_contig()`), through the
-> queued strided copy — so those transients are budget-metered, covered by
-> the allocation retry, and retained per queued item. The bridges refuse
-> non-trailing/strided layouts instead of copying. **Kept deliberately**:
-> the contiguous-fp32 adjacent-interval direct sum kernel (zero-copy
-> non-trailing sums) — it allocates nothing, and nanoGPT's positional-
-> embedding gradient takes it every step; replacing it with permute +
-> row-reduce measured ~3 ms/step slower (rows huge, cols tiny). Python
-> mirrors its gate exactly (`_sum_middle_direct_ok`). **Still Mojo-side**
-> (deferred): matmul's strided-operand copies (entangled with G1's stranded
-> strided routes), conv's im2col workspace (algorithmic, needs a scratch
-> ABI or an op split), and data_movement's two small sites.
-
-* **What.** `_rowred_spec_into_go` and its siblings,
-  `reduction_ops/reduction_ops.mojo:1140`; the `_scratch_copy` calls at `:1217`,
-  `:1304`, `:1398`, `:1487`, `:1571` (row-reduce, argmin, min-with-index,
-  variance, any/all). Python entry: `_try_spec_reduce`, `aten_fast.py:1800`.
-* **Current implementation.** The kernels reduce the trailing dimension of a
-  contiguous `(rows, cols)` buffer. Any other dim set is handled by permuting the
-  logical layout and copying the **whole tensor** into a scratch buffer first.
-  There is exactly one exception: fp32 `sum` over a single *adjacent* interval of
-  middle dimensions on GPU, which takes a direct `(outer, reduce, inner)` kernel
-  (`_adjacent_reduce_geom`, `reduction_ops.mojo:368`;
-  `_sum_contiguous_middle_f32`, `:310`; selected at `:1195`).
-* **Why it is not optimal.** A reduction is bandwidth-bound and should read its
-  input once. The permute path reads it, writes it, reads it again — 3x the
-  traffic — for `amax` / `amin` / `argmin` / `var` / `any` / `all` / `min.dim`
-  over any non-trailing dim, and for `sum` in bf16/fp16/int64 or over
-  non-adjacent dims. `sum(dim=0)` on a 2-D tensor is the most common instance and
-  is not covered.
-* **What the optimized version looks like.** Generalize the existing
-  `(outer, reduce, inner)` kernel to all row-reduce op codes and all supported
-  dtypes, and to any dim set that collapses to a single such triple after merging
-  adjacent dims. `_adjacent_reduce_geom` already computes the triple; what is
-  missing is op-code and dtype parametrization and dropping the fp32/GPU/sum
-  restriction.
-* **Expected win.** **UNMEASURED.** Bandwidth model says up to ~3x on the
-  affected reductions.
-* **How to measure it.** `tests/test_eager_kernels.py` for correctness; a small
-  timing loop over `torch.amax(x, dim=0)` for a few shapes on `mojo:0` versus
-  `cuda` is enough to size it, since this is a single-op question.
+> **Closed (2026-08-11).** `reduce_skeleton.mojo` is one comptime-parametrized
+> reduction over an accumulator (`ReduceOp`: identity, map, combine, finalize)
+> and one `(outer, reduce, inner)` geometry, with a contiguous-axis kernel, a
+> STRIDED-axis kernel and a split-the-reduce-axis policy derived from the
+> runtime SM count. `sum`, `mean`, `amax`, `amin`, `max`, `min`, `any`, `all`
+> and the new L2 norm are one accumulator each; `min.dim` moved onto the
+> arg-reduction's (value, index) payload, which already had both. Every one of
+> them now reads an adjacent non-trailing reduce interval WHERE IT LIES
+> (`aten_fast._REDUCE_MIDDLE_DIRECT` lists them), so the permuted copy is gone
+> for the whole family rather than for fp32 `sum` alone. Measured on an H100
+> PCIe against stock CUDA, ours/stock device time: `sum` bf16 `dim=0`
+> 4.87 -> 0.90, `amax` bf16 `dim=0` 3.33 -> 0.81, `any` bool `dim=0`
+> 3.41 -> 0.68, `min.dim` f32 `dim=0` 1.34 -> 0.60. The full-reduction end
+> moved with it (one block for the whole tensor was the other half of the same
+> defect): `sum` bf16 16.7M 13.08 -> 0.85, `max` bf16 7.76 -> 0.58.
+> **Still deferred**: non-ADJACENT dim sets (e.g. `dim=(0, 2)` of a rank-3)
+> still permute and materialize in Python, and so do genuinely strided
+> operands; matmul's strided-operand copies and conv's im2col workspace are
+> untouched.
 
 ### R2
-**`linalg_vector_norm` is a three-launch composition with an input-sized temporary**
+**`linalg_vector_norm` is a three-launch composition with an input-sized
+temporary** — **DONE** (`NormSpec`)
 
-* **What.** `fast_aten_linalg_vector_norm`, `aten_fast.py:4610`.
-* **Current implementation.** `mul(x, x)` → `sum(...)` → `sqrt(...)`. The first
-  step allocates and writes a tensor the size of the input.
-* **Why it is not optimal.** A norm needs one pass and no temporary. The repo
-  already knows how: `fast_aten__foreach_norm` (`aten_fast.py:329`) has a batched
-  single-pass `ForeachL2Norm` kernel with a small partials buffer. The
-  single-tensor path does not use it.
-* **What the optimized version looks like.** Route the single-tensor fp32 case
-  through the same `ForeachL2Norm` bridge with a one-element list, or add a
-  `NormSpec` row-reduction op code.
-* **Expected win.** **UNMEASURED**; ~3x traffic reduction on the op plus one
-  fewer allocation. Grad clipping already uses the foreach form, so this is a
-  low-priority tidy.
-* **How to measure it.** `tests/test_eager_optimizer_ops.py`; time
-  `torch.linalg.vector_norm` directly.
+> **Closed (2026-08-11).** `NormL2Op` in `reduce_skeleton.mojo` maps each
+> element to `x*x` and folds the square root into the accumulator's finalize,
+> so the op is one pass with no temporary, over any dim set the skeleton
+> accepts, in f32/f16/bf16 (it was fp32-only). Measured on an H100 PCIe,
+> ours/stock device time: 357x789 f32 10.61 -> 0.86, 16.7M f32 6.13 -> 0.96;
+> bf16 went from "declined, decomposed by torch" to 0.79-0.82.
 
 ### R3
 **`cumsum` is trailing-dim only, three dtypes, and refuses `dtype=`**

@@ -1,30 +1,33 @@
 # ===----------------------------------------------------------------------=== #
-# Fast eager-mode reduction kernels for mojo_device: row-wise sum / max /
-# min / prod / argmin / min-with-index / variance / log-softmax / any / all
-# over the trailing dimension of a contiguous tensor. Any other layout is
-# permuted and materialized in PYTHON before the call (through the queued
-# strided copy, so the transient is budget-metered and covered by the
-# allocation retry); the bridges here refuse non-trailing dims or strided
-# operands rather than scratch-copying, and the kernels only ever see a
-# contiguous (rows, cols) buffer reducing each row to one output element.
-# Three routes opt out of that materialization and read a non-trailing reduce
-# axis where it lies, allocating nothing: the fp32 middle sum and the variance
-# moment reduction, both of which take a contiguous (outer, reduce, inner) view
-# of an ADJACENT reduce interval, and ArgminSpec's strided-axis kernel in
-# `argreduce_kernels.mojo`. Python mirrors the first two in
-# `aten_fast._reduce_middle_direct_ok` and the third in `_arg_strided_direct_ok`.
+# Fast eager-mode reduction kernels for mojo_device.
+#
+# The scalar reductions -- sum / mean / amax / amin / max / min / L2 norm /
+# any / all -- are NOT written here: they are one accumulator apiece against
+# the generic skeleton in `reduce_skeleton.mojo`, which owns the geometry, the
+# split-the-reduce-axis launch policy and the workspace merge. This file keeps
+# what is not a scalar reduction: the variance moments (a two-slot payload with
+# its own cancellation re-pass) and the fused log-softmax row pass, plus the
+# TensorSpec registrations that name which accumulator each aten op gets.
+# Arg-reductions and min.dim live in `argreduce_kernels.mojo` (a (value, index)
+# payload).
+#
+# Every one of those mechanisms reads an ADJACENT reduce interval of a
+# contiguous operand where it lies, as (outer, reduce, inner) -- so a
+# non-trailing reduce dim costs one pass and not a materialized transposed
+# copy. Non-adjacent intervals and strided operands are permuted and
+# materialized in PYTHON before the call (through the queued strided copy, so
+# the transient is budget-metered and covered by the allocation retry); the
+# bridges here refuse them rather than scratch-copying. Python mirrors the
+# accepted regimes in `aten_fast._reduce_middle_direct_ok` and
+# `_arg_strided_direct_ok`.
 #
 # Raw-pointer calling convention (see elementwise_ops.mojo / nn_ops.mojo):
 # tensor operands arrive as element-aligned int addresses, sizes and dtypes as
 # ints, ctx_ptr last. Every kernel has a CPU branch (one sequential task per
-# row) and a GPU branch (one thread block per row, shared-memory tree reduce
-# via `_enqueue_cached`) — the same split nn_ops uses for layer norm / softmax
-# / argmax, because full reductions and vocab-dim reductions are called with
-# rows == 1 and cols in the tens of thousands, where a thread-per-row launch
-# would leave the GPU idle.
+# output) and a GPU branch.
 #
-# Floating-point rows accumulate in float32 (matching torch); integer rows
-# accumulate in their own dtype.
+# Floating-point reductions accumulate in float32 (matching torch); integer
+# ones accumulate in their own dtype.
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
@@ -54,18 +57,24 @@ from std.utils.index import IndexList
 from std.utils.numerics import min_or_neg_inf, max_or_inf
 from std.utils.static_tuple import StaticTuple
 
-from max.algorithm.reduction import product, sum
-from max.algorithm.reduction import max as reduce_max
-from max.algorithm.reduction import min as reduce_min
-
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from argreduce_kernels import _argreduce_spec_into
+from reduce_skeleton import (
+    AllOp,
+    AnyOp,
+    MaxOp,
+    MinOp,
+    NormL2Op,
+    SumOp,
+    _rowred_spec_into_go,
+)
 
 from op_utils import (
     FLOAT_DTYPES,
     MAX_RANK,
     TensorSpec,
+    _adjacent_reduce_geom,
     _check_into,
     _enqueue_cached,
     _make_ptr,
@@ -80,6 +89,7 @@ from op_utils import (
     _spec_ptr,
     _raw_ret_none,
     _spec_unsupported,
+    _vec16_phase,
 )
 
 from variant_gates import (
@@ -90,494 +100,10 @@ from variant_gates import (
 )
 
 
-comptime ROWRED_THREADS = 256
-# log2(ROWRED_THREADS): number of halving steps in the reduction trees.
-comptime ROWRED_STAGES = 8
-
-# Reduction opcodes shared by the generic value-reduction kernel.
-comptime RED_SUM = 0
-comptime RED_MAX = 1
-comptime RED_MIN = 2
-comptime RED_PROD = 3
-
-
-@always_inline
-def _accum_dtype[dtype: DType]() -> DType:
-    """float rows accumulate in float32; int rows in their own dtype."""
-    comptime if dtype.is_floating_point():
-        return DType.float32
-    else:
-        return dtype
-
-
-# ---------------------------------------------------------------------------
-# Library-vs-block routing gate (GPU only).
-#
-# Benchmarking against the pinned nightly showed the stdlib reduction library is
-# NOT strictly better than a 256-thread block-per-row kernel: its two-phase tier
-# allocates two device buffers + a memset per call (bad for the small full
-# reductions the decode loop issues every step, e.g. max(1,256)/all(1,~3000)),
-# and its block-saturated tier uses 128 threads/block (half ours), losing ~2x on
-# few-row, huge-col shapes like (256, vocab). The library only wins where there
-# are too few rows to saturate the device yet each row is huge (its two-phase
-# multi-block fan-out) — full reductions of multi-million-element tensors. Route
-# only that regime to the library; everything else uses the block kernel below.
-# ---------------------------------------------------------------------------
-
-comptime LIB_MIN_COLS = 1 << 20  # 1,048,576
-comptime LIB_MAX_ROWS = 128
-
-
-@always_inline
-def _use_library_reduce(rows: Int, cols: Int) -> Bool:
-    return rows <= LIB_MAX_ROWS and cols >= LIB_MIN_COLS
-
-
-@always_inline
-def _vec16_phase[dtype: DType](addr: Int) -> Int:
-    """Element offset of `addr` inside its own 16-byte block, or -1 when `addr`
-    is not even element-aligned.
-
-    A 128-bit access is legal only at an address that is a multiple of 16, so
-    this — and not the column index — is what decides where a row's vectorized
-    body may start: element index `j` of a buffer sits at a 16-byte boundary iff
-    `(phase + j) % V == 0`, which collapses to `j % V == 0` only for a buffer
-    whose own base is 16-byte aligned.
-
-    Shared by the log-softmax row pass and the moment reduction below; both
-    walk a runtime sub-range of a buffer whose base phase they do not control.
-    """
-    comptime esize = size_of[dtype]()
-    if addr % esize != 0:
-        return -1
-    return (addr % 16) // esize
-
-
-@always_inline
-def _red_init[acc_dtype: DType, op_code: Int]() -> Scalar[acc_dtype]:
-    comptime if op_code == RED_SUM:
-        return Scalar[acc_dtype](0)
-    comptime if op_code == RED_PROD:
-        return Scalar[acc_dtype](1)
-    comptime if op_code == RED_MAX:
-        return min_or_neg_inf[acc_dtype]()
-    comptime if op_code == RED_MIN:
-        return max_or_inf[acc_dtype]()
-    return Scalar[acc_dtype](0)
-
-
-@always_inline
-def _red_combine[
-    acc_dtype: DType, op_code: Int
-](mut acc: Scalar[acc_dtype], v: Scalar[acc_dtype]):
-    comptime if op_code == RED_SUM:
-        acc += v
-    comptime if op_code == RED_PROD:
-        acc *= v
-    comptime if op_code == RED_MAX:
-        if v > acc:
-            acc = v
-    comptime if op_code == RED_MIN:
-        if v < acc:
-            acc = v
-
-
-# ---------------------------------------------------------------------------
-# Generic row reduction (sum / max / min / prod): input viewed as
-# (rows, cols) contiguous, out has `rows` elements of the same dtype.
-# rows == 1 covers full reductions (x.sum(), x.max(), ...).
-#
-# The under-saturated, huge-col case is handed to the stdlib reduction library
-# (`std.algorithm.reduction`) via per-element input_fn/output_fn closures; its
-# two-phase tier fans the reduction across the device (rows == 1 over millions
-# of elements: 24 ms -> 0.2 ms). Every other GPU case, and all CPU cases, use a
-# 256-thread block-per-row kernel (no per-call allocation). Floats reduce in
-# float32 (`_accum_dtype`), matching torch.
-# ---------------------------------------------------------------------------
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
-)
-@__name(t"reduce_rows_block_{dtype}_{op_code}")
-def _reduce_block_kernel[
-    dtype: DType, op_code: Int
-](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols_arg: Int64,
-):
-    """One block per row (grid.x = rows); lanes stride over the row and
-    tree-reduce their partials in shared memory."""
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var cols = Int(cols_arg)
-    comptime acc_dtype = _accum_dtype[dtype]()
-    var r = block_idx.x
-    var tid = thread_idx.x
-    var base = r * cols
-
-    var acc = _red_init[acc_dtype, op_code]()
-    for j in range(tid, cols, ROWRED_THREADS):
-        var v = in_ptr[base + j].cast[acc_dtype]()
-        _red_combine[acc_dtype, op_code](acc, v)
-
-    var red = stack_allocation[
-        ROWRED_THREADS, acc_dtype, address_space=AddressSpace.SHARED
-    ]()
-    red[tid] = acc
-    barrier()
-    var stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            var cur = red[tid]
-            _red_combine[acc_dtype, op_code](cur, red[tid + stride])
-            red[tid] = cur
-        barrier()
-        stride //= 2
-    if tid == 0:
-        out_ptr[r] = red[0].cast[dtype]()
-
-
-@always_inline
-def _reduce_rows[
-    dtype: DType, op_code: Int
-](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
-    comptime acc_dtype = _accum_dtype[dtype]()
-    var out_ptr = _make_ptr[dtype](out_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-
-    @always_inline
-    @parameter
-    @__copy_capture(in_ptr)
-    def input_fn[
-        width: Int, rank: Int
-    ](coords: IndexList[rank]) -> SIMD[acc_dtype, width]:
-        var flat = coords[0] * cols + coords[1]
-        return in_ptr.load[width=width](flat).cast[acc_dtype]()
-
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr)
-    def output_fn[
-        width: SIMDLength, rank: Int
-    ](coords: IndexList[rank], val: SIMD[acc_dtype, width]):
-        out_ptr[coords[0]] = val[0].cast[dtype]()
-
-    var shape = IndexList[2](rows, cols)
-
-    @always_inline
-    @parameter
-    def run[target: StaticString]() raises:
-        comptime if op_code == RED_SUM:
-            sum[acc_dtype, input_fn, output_fn, target=target, reduce_dim=1](
-                Coord(shape), ctx
-            )
-        elif op_code == RED_PROD:
-            product[
-                acc_dtype, input_fn, output_fn, target=target, reduce_dim=1
-            ](Coord(shape), ctx)
-        elif op_code == RED_MAX:
-            reduce_max[
-                acc_dtype, input_fn, output_fn, target=target, reduce_dim=1
-            ](Coord(shape), ctx)
-        else:  # RED_MIN
-            reduce_min[
-                acc_dtype, input_fn, output_fn, target=target, reduce_dim=1
-            ](Coord(shape), ctx)
-
-    if ctx.api() == "cpu":
-        run["cpu"]()
-    else:
-        comptime if has_accelerator():
-            if _use_library_reduce(rows, cols):
-                run["gpu"]()
-            else:
-                _enqueue_cached[_reduce_block_kernel[dtype, op_code]](
-                    ctx,
-                    String(t"reduce_rows_{dtype}_{op_code}"),
-                    rows,
-                    1,
-                    1,
-                    ROWRED_THREADS,
-                    out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
-                    Int64(cols),
-                )
-        else:
-            raise Error("no GPU accelerator available at compile time")
-
-
-# ---------------------------------------------------------------------------
-# Direct contiguous adjacent-dimension FP32 sum. Presenting a row-major input
-# as (outer, reduce, inner) lets the pinned stdlib's saturated reduction path
-# SIMD-pack adjacent inner values and read the source directly. This avoids the
-# full-tensor permutation scratch required by the generic non-trailing path.
-# All dimensions remain runtime values; unsupported layouts keep the existing
-# materialize-and-reduce fallback.
-# ---------------------------------------------------------------------------
-
-
-@always_inline
-# ---------------------------------------------------------------------------
-# Direct contiguous adjacent-dimension FP32 sum. Presenting a row-major input
-# as (outer, reduce, inner) lets the pinned stdlib's saturated reduction path
-# SIMD-pack adjacent inner values and read the source directly. This avoids the
-# full-tensor permutation scratch required by the generic non-trailing path.
-# All dimensions remain runtime values; unsupported layouts keep the existing
-# materialize-and-reduce fallback.
-# ---------------------------------------------------------------------------
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
-)
-@__name("sum_contiguous_middle_f32_few_outputs")
-def _sum_middle_few_outputs_kernel(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    reduce_elements_arg: Int64,
-    inner_elements_arg: Int64,
-):
-    """One cooperative block per output for the stdlib's scratch regime."""
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var reduce_elements = Int(reduce_elements_arg)
-    var inner_elements = Int(inner_elements_arg)
-    var output_index = Int(block_idx.x)
-    var outer_index = output_index // inner_elements
-    var inner_index = output_index % inner_elements
-    var partial = Float32(0.0)
-    for reduction_index in range(
-        Int(thread_idx.x), reduce_elements, ROWRED_THREADS
-    ):
-        partial += input[
-            (outer_index * reduce_elements + reduction_index) * inner_elements
-            + inner_index
-        ]
-    var reduced = block.sum[block_size=ROWRED_THREADS](partial)
-    if thread_idx.x == 0:
-        output[output_index] = reduced
-
-
-@always_inline
-def _sum_contiguous_middle_f32(
-    out_addr: Int,
-    in_addr: Int,
-    outer_elements: Int,
-    reduce_elements: Int,
-    inner_elements: Int,
-    ctx: DeviceContext,
-) raises:
-    var output = _make_ptr[DType.float32](out_addr)
-    var input = _make_ptr[DType.float32](in_addr)
-    var output_elements = outer_elements * inner_elements
-    comptime sm_count = ctx.default_device_info.sm_count
-    if output_elements < sm_count and reduce_elements > 128:
-        _enqueue_cached[_sum_middle_few_outputs_kernel](
-            ctx,
-            "sum_contiguous_middle_f32_few_outputs",
-            output_elements,
-            1,
-            1,
-            ROWRED_THREADS,
-            output.as_unsafe_any_origin(),
-            input.as_unsafe_any_origin().as_immutable(),
-            Int64(reduce_elements),
-            Int64(inner_elements),
-        )
-        return
-
-    @always_inline
-    @parameter
-    @__copy_capture(input, reduce_elements, inner_elements)
-    def input_fn[
-        width: Int, rank: Int
-    ](coords: IndexList[rank]) -> SIMD[DType.float32, width]:
-        var flat = (
-            coords[0] * reduce_elements + coords[1]
-        ) * inner_elements + coords[2]
-        return input.load[width=width](flat)
-
-    @always_inline
-    @parameter
-    @__copy_capture(output, inner_elements)
-    def output_fn[
-        width: SIMDLength, rank: Int
-    ](coords: IndexList[rank], value: SIMD[DType.float32, width]):
-        var flat = coords[0] * inner_elements + coords[2]
-        output.store[width=width](flat, value)
-
-    var shape = IndexList[3](outer_elements, reduce_elements, inner_elements)
-    sum[
-        DType.float32,
-        input_fn,
-        output_fn,
-        target="gpu",
-        reduce_dim=1,
-    ](Coord(shape), ctx)
-
-
-@always_inline
-def _adjacent_reduce_geom(
-    a: TensorSpec,
-    rdims_t: PyObjectPtr,
-    mut outer_elements: Int,
-    mut reduce_elements: Int,
-    mut inner_elements: Int,
-) raises -> Bool:
-    """Collapse a contiguous adjacent reduction interval into runtime
-    (outer, reduce, inner) dimensions. Empty/non-adjacent intervals reject."""
-    if not a.contig:
-        return False
-    var n = _raw_tuple_len(rdims_t)
-    if n == 0:
-        return False
-    var first = _raw_tuple_int(rdims_t, 0)
-    if first < 0 or first + n > a.rank:
-        return False
-    for k in range(n):
-        if _raw_tuple_int(rdims_t, k) != first + k:
-            return False
-
-    outer_elements = 1
-    reduce_elements = 1
-    inner_elements = 1
-    for d in range(first):
-        outer_elements *= a.dim(d)
-    for d in range(first, first + n):
-        reduce_elements *= a.dim(d)
-    for d in range(first + n, a.rank):
-        inner_elements *= a.dim(d)
-    return True
-
-
 # Row-wise argmin lives in `argreduce_kernels.mojo` (`_argreduce_rows`, with
 # `_argreduce_cols` for a strided reduce axis): one comptime-parametrized
 # mechanism shared with nn_ops' argmax, so the two ops cannot drift apart in
 # either semantics or launch geometry.
-
-
-# ---------------------------------------------------------------------------
-# Row-wise min/max with indices: values AND int64 indices (first occurrence
-# wins). `is_min` selects the direction. Covers aten.min.dim / max.dim.
-# ---------------------------------------------------------------------------
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
-)
-@__name(t"minmax_idx_rows_block_{dtype}_{is_min}")
-def _minmax_idx_block_kernel[
-    dtype: DType, is_min: Bool
-](
-    val_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    idx_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var cols = Int(cols_arg)
-    var r = block_idx.x
-    var tid = thread_idx.x
-    var base = r * cols
-
-    var best_val = max_or_inf[dtype]() if is_min else min_or_neg_inf[dtype]()
-    var best_idx = Int64(-1)
-    for j in range(tid, cols, ROWRED_THREADS):
-        var v = in_ptr[base + j]
-        var take = (v < best_val) if is_min else (v > best_val)
-        if take:
-            best_val = v
-            best_idx = Int64(j)
-
-    var val_smem = stack_allocation[
-        ROWRED_THREADS, dtype, address_space=AddressSpace.SHARED
-    ]()
-    var idx_smem = stack_allocation[
-        ROWRED_THREADS, DType.int64, address_space=AddressSpace.SHARED
-    ]()
-    val_smem[tid] = best_val
-    idx_smem[tid] = best_idx
-    barrier()
-
-    var stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            var other_val = val_smem[tid + stride]
-            var other_idx = idx_smem[tid + stride]
-            var cur_val = val_smem[tid]
-            var cur_idx = idx_smem[tid]
-            var strictly_better = (other_val < cur_val) if is_min else (
-                other_val > cur_val
-            )
-            if strictly_better or (
-                other_val == cur_val
-                and other_idx != Int64(-1)
-                and (cur_idx == Int64(-1) or other_idx < cur_idx)
-            ):
-                val_smem[tid] = other_val
-                idx_smem[tid] = other_idx
-        barrier()
-        stride //= 2
-
-    if tid == 0:
-        val_ptr[r] = val_smem[0]
-        idx_ptr[r] = idx_smem[0]
-
-
-@always_inline
-def _minmax_idx_rows[
-    dtype: DType, is_min: Bool
-](
-    val_addr: Int,
-    idx_addr: Int,
-    in_addr: Int,
-    rows: Int,
-    cols: Int,
-    ctx: DeviceContext,
-) raises:
-    var val_ptr = _make_ptr[dtype](val_addr)
-    var idx_ptr = _make_ptr[DType.int64](idx_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(val_ptr, idx_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var r = Int(idx[0].value())
-            var base = r * cols
-            var best = in_ptr[base]
-            var best_idx = 0
-            for j in range(1, cols):
-                var v = in_ptr[base + j]
-                var take = (v < best) if is_min else (v > best)
-                if take:
-                    best = v
-                    best_idx = j
-            val_ptr[r] = best
-            idx_ptr[r] = Int64(best_idx)
-
-        _parallel_for[func](rows, ctx)
-    else:
-        comptime if has_accelerator():
-            _enqueue_cached[_minmax_idx_block_kernel[dtype, is_min]](
-                ctx,
-                String(t"minmax_idx_rows_{dtype}_{is_min}"),
-                rows,
-                1,
-                1,
-                ROWRED_THREADS,
-                val_ptr.as_unsafe_any_origin(),
-                idx_ptr.as_unsafe_any_origin(),
-                in_ptr.as_unsafe_any_origin().as_immutable(),
-                Int64(cols),
-            )
-        else:
-            raise Error("no GPU accelerator available at compile time")
 
 
 # ---------------------------------------------------------------------------
@@ -1658,143 +1184,17 @@ def _log_softmax_rows[
 
 
 # ---------------------------------------------------------------------------
-# Row-wise any / all: input viewed as (rows, cols) of any dtype, out is
-# `rows` bool elements (nonzero test). Covers aten.any.dim / all.dim(s).
-# Same library-vs-block routing as the value reductions: the library's max/min
-# accept DType.bool natively (any = max init False -> OR; all = min init True ->
-# AND), but its two-phase tier allocates per call, so only the under-saturated,
-# huge-col regime uses it; everything else uses the block kernel.
-# ---------------------------------------------------------------------------
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
-)
-@__name(t"anyall_rows_block_{dtype}_{is_all}")
-def _anyall_rows_block_kernel[
-    dtype: DType, is_all: Bool
-](
-    out_ptr: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var cols = Int(cols_arg)
-    var r = block_idx.x
-    var tid = thread_idx.x
-    var base = r * cols
-    var zero = Scalar[dtype](0)
-
-    var acc: Bool = is_all
-    for j in range(tid, cols, ROWRED_THREADS):
-        var nz = Bool(in_ptr[base + j] != zero)
-        comptime if is_all:
-            acc = acc and nz
-        else:
-            acc = acc or nz
-
-    var red = stack_allocation[
-        ROWRED_THREADS, DType.bool, address_space=AddressSpace.SHARED
-    ]()
-    red[tid] = acc
-    barrier()
-    var stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            comptime if is_all:
-                red[tid] = red[tid] and red[tid + stride]
-            else:
-                red[tid] = red[tid] or red[tid + stride]
-        barrier()
-        stride //= 2
-    if tid == 0:
-        out_ptr[r] = red[0]
-
-
-@always_inline
-def _anyall_rows[
-    dtype: DType, is_all: Bool
-](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
-    """any/all over the trailing axis. The nonzero test maps each row to bools,
-    then any = max / all = min over DType.bool. Routes the under-saturated,
-    huge-col regime to the stdlib library and everything else to a block kernel
-    (see `_use_library_reduce`)."""
-    var out_ptr = _make_ptr[DType.bool](out_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-
-    # cols == 0 always arrives with rows == 0 (an empty reduce dim means an
-    # empty tensor; the guard lives upstream in aten_fast._reduce_to_rows), so
-    # both the library (zero-size shape check) and the block kernel (grid 0)
-    # write nothing — same pre-existing contract as the old kernels.
-
-    @always_inline
-    @parameter
-    @__copy_capture(in_ptr)
-    def input_fn[
-        width: Int, rank: Int
-    ](coords: IndexList[rank]) -> SIMD[DType.bool, width]:
-        var flat = coords[0] * cols + coords[1]
-        # Nonzero test with the block kernel's `!=` semantics: `.eq` is an
-        # ORDERED equal (NaN == 0 -> False), so ~eq gives NaN -> True, matching
-        # torch's NaN-is-truthy any/all. (`.cast[DType.bool]()` lowers to an
-        # ordered ne, which would wrongly map NaN -> False.) For bool input,
-        # eq-with-False then invert is the identity.
-        var v = in_ptr.load[width=width](flat)
-        return ~v.eq(SIMD[dtype, width]())
-
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr)
-    def output_fn[
-        width: SIMDLength, rank: Int
-    ](coords: IndexList[rank], val: SIMD[DType.bool, width]):
-        out_ptr[coords[0]] = val[0]
-
-    var shape = IndexList[2](rows, cols)
-
-    @always_inline
-    @parameter
-    def run[target: StaticString]() raises:
-        comptime if is_all:
-            reduce_min[
-                DType.bool, input_fn, output_fn, target=target, reduce_dim=1
-            ](Coord(shape), ctx)
-        else:
-            reduce_max[
-                DType.bool, input_fn, output_fn, target=target, reduce_dim=1
-            ](Coord(shape), ctx)
-
-    if ctx.api() == "cpu":
-        run["cpu"]()
-    else:
-        comptime if has_accelerator():
-            if _use_library_reduce(rows, cols):
-                run["gpu"]()
-            else:
-                _enqueue_cached[_anyall_rows_block_kernel[dtype, is_all]](
-                    ctx,
-                    String(t"anyall_rows_{dtype}_{is_all}"),
-                    rows,
-                    1,
-                    1,
-                    ROWRED_THREADS,
-                    out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
-                    Int64(cols),
-                )
-        else:
-            raise Error("no GPU accelerator available at compile time")
-
-
-# ---------------------------------------------------------------------------
-# TensorSpec entries (docs/tensor_spec_design.md): trailing-dims reductions
-# over a contiguous input — dim checks, rows/cols/keepdim geometry, output
-# alloc and launch in one boundary call, reusing the row kernels above.
-# Python still parses the dim spec (`_norm_reduce_dims`) and does dtype
-# promotion; non-trailing/strided layouts raise so the classic
+# TensorSpec entries (docs/tensor_spec_design.md): dim checks, geometry,
+# preallocated-output validation and the launch in one boundary call. Python
+# parses the dim spec (`_norm_reduce_dims`) and does dtype promotion; layouts
+# outside the adjacent-interval regime raise so the classic
 # permute+materialize path keeps handling them. Failed checks raise a real
 # NotImplementedError into Python ("take the classic path").
+#
+# The scalar reductions have no entry point of their own here: they are
+# `_rowred_spec_into_go[Op]` from `reduce_skeleton.mojo` with the accumulator
+# named at the registration site below, so sum, amax, amin, any, all and the
+# vector norm are one function and cannot drift apart.
 # ---------------------------------------------------------------------------
 
 # Annotated List[DType]: rc1 infers bare `[...]` literals as Array, which no
@@ -1806,105 +1206,6 @@ comptime SPEC_ROWRED_DTYPES: List[DType] = [
     DType.int64,
     DType.int32,
 ]
-
-comptime SPEC_ANYALL_DTYPES: List[DType] = [
-    DType.float32,
-    DType.float16,
-    DType.bfloat16,
-    DType.int64,
-    DType.int32,
-    DType.int16,
-    DType.int8,
-    DType.uint8,
-    DType.bool,
-]
-
-
-def _rowred_spec_into_go[
-    op_code: Int
-](
-    a_o: PyObjectPtr,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
-    out_o: PyObjectPtr,
-) raises:
-    ref a = _spec_ptr(a_o)[]
-    ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[SPEC_ROWRED_DTYPES](a.dtype):
-        raise Error("mojo spec reduce: unsupported dtype ", a.dtype)
-    if a.numel == 0:
-        # sum-of-empty is a Python-side fill; amax/amin reject empty dims.
-        raise Error("mojo spec reduce: empty input")
-    var ctx0 = a.ctx()
-    # Zero-copy direct path, kept deliberately: a contiguous fp32 sum over
-    # one adjacent NON-trailing dim interval allocates nothing, so it stays
-    # in Mojo — only layouts that would scratch-COPY are refused by the
-    # geometry below (Python pre-materializes those). nanoGPT's positional-
-    # embedding gradient (sum over dim 0) takes this every step; the
-    # permute + row-reduce replacement measured ~3 ms/step slower there
-    # (rows huge, cols tiny).
-    comptime if op_code == RED_SUM:
-        if a.dtype == DType.float32 and ctx0.api() != "cpu":
-            var n_red = _raw_tuple_len(rdims_t)
-            var trailing = True
-            for k in range(n_red):
-                if _raw_tuple_int(rdims_t, k) != a.rank - n_red + k:
-                    trailing = False
-            if not trailing:
-                var outer_elements = 0
-                var reduce_elements = 0
-                var inner_elements = 0
-                if _adjacent_reduce_geom(
-                    a,
-                    rdims_t,
-                    outer_elements,
-                    reduce_elements,
-                    inner_elements,
-                ):
-                    var direct_rows = outer_elements * inner_elements
-                    if (
-                        out.numel != direct_rows
-                        or not out.contig
-                        or out.ctx_ptr != a.ctx_ptr
-                    ):
-                        raise Error("mojo spec into: output buffer mismatch")
-                    if out.dtype != a.dtype:
-                        raise Error("mojo spec into: output dtype mismatch")
-                    if direct_rows > 0:
-                        comptime if has_accelerator():
-                            _sum_contiguous_middle_f32(
-                                out.ptr,
-                                a.ptr,
-                                outer_elements,
-                                reduce_elements,
-                                inner_elements,
-                                ctx0,
-                            )
-                        else:
-                            raise Error(
-                                "no GPU accelerator available at compile time"
-                            )
-                    return
-
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
-
-    var ctx = a.ctx()
-    var nbytes = rows * a.itemsize
-    _ = nbytes
-    if out.numel != rows or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != a.dtype:
-        raise Error("mojo spec into: output dtype mismatch")
-    var addr = out.ptr
-    if rows > 0:
-        comptime for dt in SPEC_ROWRED_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _reduce_rows[dt, op_code](addr, a.ptr, rows, cols, ctx)
 
 
 def _argmin_spec_into_go(
@@ -1931,7 +1232,15 @@ def _min_dim_spec_into_go(
 ) raises:
     """aten::min.dim values+indices in one call — the multi-output protocol:
     Python allocates both outputs and passes their specs as the last two
-    arguments, so one boundary call still fills both."""
+    arguments, so one boundary call still fills both.
+
+    The payload is a (value, index) pair, which is the arg-reduction's payload
+    with the value kept instead of dropped, so this is `_argreduce_spec_into`
+    with `with_values` on rather than a fifth hand-written row kernel — and it
+    inherits that mechanism's split path (a full-length row no longer runs in
+    one block), its strided-axis kernel (a `dim=0` min.dim no longer
+    materializes a transposed copy) and its NaN rule (torch propagates NaN
+    through min.dim; the old kernel's plain `<` silently did not)."""
     ref a = _spec_ptr(a_o)[]
     ref out_v = _spec_ptr(out_v_o)[]
     ref out_i = _spec_ptr(out_i_o)[]
@@ -1939,33 +1248,11 @@ def _min_dim_spec_into_go(
         raise Error("mojo spec min.dim: unsupported dtype ", a.dtype)
     if a.numel == 0:
         raise Error("mojo spec min.dim: empty input")
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
-
-    var ctx = a.ctx()
-    if (
-        out_v.numel != rows
-        or out_i.numel != rows
-        or not out_v.contig
-        or not out_i.contig
-        or out_v.ctx_ptr != a.ctx_ptr
-        or out_i.ctx_ptr != a.ctx_ptr
-    ):
-        raise Error("mojo spec min.dim into: output buffer mismatch")
-    if out_v.dtype != a.dtype or out_i.dtype != DType.int64:
+    if out_v.dtype != a.dtype:
         raise Error("mojo spec min.dim into: output dtype mismatch")
-    var addr_v = out_v.ptr
-    var addr_i = out_i.ptr
-    if rows > 0:
-        comptime for dt in SPEC_ROWRED_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _minmax_idx_rows[dt, True](
-                        addr_v, addr_i, a.ptr, rows, cols, ctx
-                    )
+    _argreduce_spec_into[SPEC_ROWRED_DTYPES, True, with_values=True](
+        a, out_i, rdims_t, a.ctx(), out_v.ptr, out_v.numel
+    )
 
 
 def _var_spec_into_go(
@@ -2020,38 +1307,6 @@ def _var_spec_into_go(
                     )
 
 
-def _anyall_spec_into_go[
-    is_all: Bool
-](
-    a_o: PyObjectPtr,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
-    out_o: PyObjectPtr,
-) raises:
-    ref a = _spec_ptr(a_o)[]
-    ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[SPEC_ANYALL_DTYPES](a.dtype):
-        raise Error("mojo spec any/all: unsupported dtype ", a.dtype)
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    _reduce_spec_geom(a, rdims_t, keepdim_o, rows, cols, out_rank, oshape)
-    var ctx = a.ctx()
-    var nbytes = rows  # bool output
-    _ = nbytes
-    if out.numel != rows or not out.contig or out.ctx_ptr != a.ctx_ptr:
-        raise Error("mojo spec into: output buffer mismatch")
-    if out.dtype != DType.bool:
-        raise Error("mojo spec into: output dtype mismatch")
-    var addr = out.ptr
-    if rows > 0:
-        comptime for dt in SPEC_ANYALL_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _anyall_rows[dt, is_all](addr, a.ptr, rows, cols, ctx)
-
-
 def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
     """log_softmax over the trailing dim; full-shape output. The non-trailing
     dim transpose recursion stays in Python (view ops)."""
@@ -2095,7 +1350,7 @@ def PyInit_reduction_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _spec_dispatcher4[
-                    _rowred_spec_into_go[RED_SUM], "a row-reduction spec op"
+                    _rowred_spec_into_go[SumOp], "a scalar-reduction spec op"
                 ],
                 docstring="(a_spec, rdims, keepdim, out_spec)",
             )
@@ -2103,7 +1358,7 @@ def PyInit_reduction_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _spec_dispatcher4[
-                    _rowred_spec_into_go[RED_MAX], "a row-reduction spec op"
+                    _rowred_spec_into_go[MaxOp], "a scalar-reduction spec op"
                 ],
                 docstring="(a_spec, rdims, keepdim, out_spec)",
             )
@@ -2111,7 +1366,7 @@ def PyInit_reduction_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _spec_dispatcher4[
-                    _rowred_spec_into_go[RED_MIN], "a row-reduction spec op"
+                    _rowred_spec_into_go[MinOp], "a scalar-reduction spec op"
                 ],
                 docstring="(a_spec, rdims, keepdim, out_spec)",
             )
@@ -2137,7 +1392,7 @@ def PyInit_reduction_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _spec_dispatcher4[
-                    _anyall_spec_into_go[False], "an any/all spec op"
+                    _rowred_spec_into_go[AnyOp], "a scalar-reduction spec op"
                 ],
                 docstring="(a_spec, rdims, keepdim, out_spec); bool",
             )
@@ -2145,9 +1400,17 @@ def PyInit_reduction_ops() abi("C") -> PythonObject:
             _register_call(
                 b,
                 _spec_dispatcher4[
-                    _anyall_spec_into_go[True], "an any/all spec op"
+                    _rowred_spec_into_go[AllOp], "a scalar-reduction spec op"
                 ],
                 docstring="(a_spec, rdims, keepdim, out_spec); bool",
+            )
+        comptime if _op_on["NormSpec"]():
+            _register_call(
+                b,
+                _spec_dispatcher4[
+                    _rowred_spec_into_go[NormL2Op], "a scalar-reduction spec op"
+                ],
+                docstring="(a_spec, rdims, keepdim, out_spec); ord=2",
             )
         comptime if _op_on["LogSoftmaxSpec"]():
             _register_call(

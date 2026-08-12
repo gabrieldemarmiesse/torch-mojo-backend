@@ -49,11 +49,16 @@ from std.utils.numerics import min_finite, min_or_neg_inf
 from std.utils.static_tuple import StaticTuple
 
 from max.algorithm import elementwise
-from max.algorithm.reduction import mean
-from max.algorithm.reduction import max as reduce_max
-from max.algorithm.reduction import min as reduce_min
 
 from argreduce_kernels import _argreduce_spec_into
+from reduce_skeleton import (
+    AllOp,
+    AnyOp,
+    MaxOp,
+    MeanOp,
+    _reduce_generic,
+    _rowred_spec_into_go,
+)
 from layout import TileTensor, row_major
 from native_dropout_kernels import _philox4x32_10
 from nn.softmax import softmax
@@ -91,31 +96,6 @@ from variant_gates import (
     _op_on,
     _register_call,
 )
-
-
-@always_inline
-def _accum_dtype[dtype: DType]() -> DType:
-    """float rows accumulate in float32 (matching torch); int rows in their own
-    dtype. Used to pick the reduction accumulator handed to the stdlib library.
-    """
-    comptime if dtype.is_floating_point():
-        return DType.float32
-    else:
-        return dtype
-
-
-# The stdlib reduction library only beats a 256-thread block-per-row kernel when
-# there are too few rows to saturate the device yet each row is huge (its
-# two-phase multi-block tier); elsewhere its per-call buffer allocation and
-# 128-thread blocks lose. Route only that regime to the library. Mirrors
-# `reduction_ops._use_library_reduce`.
-comptime LIB_MIN_COLS = 1 << 20  # 1,048,576
-comptime LIB_MAX_ROWS = 128
-
-
-@always_inline
-def _use_library_reduce(rows: Int, cols: Int) -> Bool:
-    return rows <= LIB_MAX_ROWS and cols >= LIB_MIN_COLS
 
 
 # ---------------------------------------------------------------------------
@@ -1747,62 +1727,6 @@ def _attn_decode[
 
 
 # ---------------------------------------------------------------------------
-# Mean over the trailing dims: input viewed as (rows, cols), out has `rows`
-# elements. Covers aten.mean.dim over the last dims (e.g. global avg pool).
-# ---------------------------------------------------------------------------
-
-
-@always_inline
-def _mean_rows[
-    dtype: DType
-](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
-    """Row-wise mean over the trailing axis, backed by the stdlib reduction
-    library (`std.algorithm.reduction.mean`). Floats accumulate in float32
-    (the closures cast raw<->f32); the library applies the 1/cols scaling.
-    The library picks the GPU launch tier, so full reductions (rows == 1) fan
-    out across the device instead of the single sequential thread the old
-    per-row kernel used."""
-    comptime acc_dtype = DType.float32
-    var out_ptr = _make_ptr[dtype](out_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-
-    @always_inline
-    @parameter
-    @__copy_capture(in_ptr)
-    def input_fn[
-        width: Int, rank: Int
-    ](coords: IndexList[rank]) -> SIMD[acc_dtype, width]:
-        var flat = coords[0] * cols + coords[1]
-        return in_ptr.load[width=width](flat).cast[acc_dtype]()
-
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr)
-    def output_fn[
-        width: SIMDLength, rank: Int
-    ](coords: IndexList[rank], val: SIMD[acc_dtype, width]):
-        out_ptr[coords[0]] = val[0].cast[dtype]()
-
-    var in_shape = IndexList[2](rows, cols)
-    var out_shape = IndexList[2](rows, 1)
-
-    @always_inline
-    @parameter
-    def run[target: StaticString]() raises:
-        mean[acc_dtype, input_fn, output_fn, target=target, reduce_dim=1](
-            Coord(in_shape), Coord(out_shape), ctx
-        )
-
-    if ctx.api() == "cpu":
-        run["cpu"]()
-    else:
-        comptime if has_accelerator():
-            run["gpu"]()
-        else:
-            raise Error("no GPU accelerator available at compile time")
-
-
-# ---------------------------------------------------------------------------
 # Max pool 2D over NCHW contiguous input, with indices (torch semantics:
 # index of the max within the flattened H*W input plane, int64).
 # `planes` is N * C; one parallel task per output element.
@@ -2031,121 +1955,20 @@ def _gather0_go(
 
 # ---------------------------------------------------------------------------
 # Full any()/all() over a bool tensor -> scalar bool. Viewed as one row of
-# `size` bools reduced over the trailing axis (any = max / all = min over bool).
-# aten caps this path at < 4.2M elements, so it is almost always the small
-# regime; a single 256-thread block (strided scan + shared-memory AND/OR tree,
-# no per-call allocation) handles it, which matters because the HF sdpa mask
-# check runs this every decode step. Only the rare huge case (>= 2^20) is handed
-# to the stdlib library's two-phase multi-block tier.
+# `size` bools reduced over the trailing axis, i.e. the generic reduction
+# skeleton's (outer=1, reduce=size, inner=1) geometry with the AnyOp / AllOp
+# accumulator. aten caps this path at < 4.2M elements, so it is almost always
+# the small regime, where the split chooser degrades to a single 256-thread
+# block and no merge launch -- which matters because the HF sdpa mask check
+# runs this every decode step.
 # ---------------------------------------------------------------------------
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
-)
-@__name(t"bool_full_block_{is_all}")
-def _bool_full_block_kernel[
-    is_all: Bool
-](
-    out_ptr: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
-    size_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var size = Int(size_arg)
-    var tid = Int(thread_idx.x)
-    var acc = is_all
-    for j in range(tid, size, ROWRED_THREADS):
-        comptime if is_all:
-            if not in_ptr[j]:
-                acc = False
-        else:
-            if in_ptr[j]:
-                acc = True
-    var red = stack_allocation[
-        ROWRED_THREADS, DType.bool, address_space=AddressSpace.SHARED
-    ]()
-    red[tid] = acc
-    barrier()
-    comptime for stage in range(ROWRED_STAGES):
-        comptime half = ROWRED_THREADS >> (stage + 1)
-        if tid < half:
-            comptime if is_all:
-                red[tid] = red[tid] and red[tid + half]
-            else:
-                red[tid] = red[tid] or red[tid + half]
-        barrier()
-    if tid == 0:
-        out_ptr[0] = red[0]
-
-
-@always_inline
-def _bool_full_reduce[
-    is_all: Bool
-](out_addr: Int, in_addr: Int, size: Int, ctx: DeviceContext) raises:
-    var out_ptr = _make_ptr[DType.bool](out_addr)
-    var in_ptr = _make_ptr[DType.bool](in_addr)
-
-    @always_inline
-    @parameter
-    @__copy_capture(in_ptr)
-    def input_fn[
-        width: Int, rank: Int
-    ](coords: IndexList[rank]) -> SIMD[DType.bool, width]:
-        return in_ptr.load[width=width](coords[0] * size + coords[1])
-
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr)
-    def output_fn[
-        width: SIMDLength, rank: Int
-    ](coords: IndexList[rank], val: SIMD[DType.bool, width]):
-        out_ptr[coords[0]] = val[0]
-
-    var shape = IndexList[2](1, size)
-
-    @always_inline
-    @parameter
-    def run[target: StaticString]() raises:
-        comptime if is_all:
-            reduce_min[
-                DType.bool, input_fn, output_fn, target=target, reduce_dim=1
-            ](Coord(shape), ctx)
-        else:
-            reduce_max[
-                DType.bool, input_fn, output_fn, target=target, reduce_dim=1
-            ](Coord(shape), ctx)
-
-    if ctx.api() == "cpu":
-        run["cpu"]()
-    else:
-        comptime if has_accelerator():
-            if _use_library_reduce(1, size):
-                run["gpu"]()
-            else:
-                _enqueue_cached[_bool_full_block_kernel[is_all]](
-                    ctx,
-                    String(t"bool_full_block_{is_all}"),
-                    1,
-                    1,
-                    1,
-                    ROWRED_THREADS,
-                    out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
-                    Int64(size),
-                )
-        else:
-            raise Error("no GPU accelerator available at compile time")
 
 
 def _all_bool(
     out_addr: Int, in_addr: Int, size: Int, ctx: DeviceContext
 ) raises:
-    """Full all() over a bool tensor -> scalar bool (AND). Single-block for the
-    common small case, stdlib library for the rare huge case (`_bool_full_reduce`).
-    """
-    _bool_full_reduce[is_all=True](out_addr, in_addr, size, ctx)
+    """Full all() over a bool tensor -> scalar bool (AND)."""
+    _reduce_generic[AllOp, DType.bool](out_addr, in_addr, 1, size, 1, ctx)
 
 
 def _all_bool_go(
@@ -2171,10 +1994,8 @@ def _all_bool_go(
 def _any_bool(
     out_addr: Int, in_addr: Int, size: Int, ctx: DeviceContext
 ) raises:
-    """Full any() over a bool tensor -> scalar bool (OR). Single-block for the
-    common small case, stdlib library for the rare huge case (`_bool_full_reduce`).
-    """
-    _bool_full_reduce[is_all=False](out_addr, in_addr, size, ctx)
+    """Full any() over a bool tensor -> scalar bool (OR)."""
+    _reduce_generic[AnyOp, DType.bool](out_addr, in_addr, 1, size, 1, ctx)
 
 
 def _any_bool_go(
@@ -2197,113 +2018,9 @@ def _any_bool_go(
 # the two ops cannot drift apart in semantics or launch geometry.
 
 
-# ---------------------------------------------------------------------------
-# Row-wise max reduction (values only): input viewed as (rows, cols), out
-# has `rows` elements of the same dtype. rows=1 covers aten.max() (no dim).
-# Routes the under-saturated, huge-col regime to the stdlib library (two-phase
-# fan-out) and everything else to a 256-thread block-per-row kernel; the decode
-# loop calls this every step with a tiny (1, batch) input, where the library's
-# per-call scratch allocation would be pure overhead.
-# ---------------------------------------------------------------------------
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(ROWRED_THREADS))
-)
-@__name(t"max_rows_block_{dtype}")
-def _max_rows_block_kernel[
-    dtype: DType
-](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    cols_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var cols = Int(cols_arg)
-    comptime acc_dtype = _accum_dtype[dtype]()
-    var r = block_idx.x
-    var tid = thread_idx.x
-    var base = r * cols
-
-    var acc = min_or_neg_inf[acc_dtype]()
-    for j in range(tid, cols, ROWRED_THREADS):
-        var v = in_ptr[base + j].cast[acc_dtype]()
-        if v > acc:
-            acc = v
-
-    var red = stack_allocation[
-        ROWRED_THREADS, acc_dtype, address_space=AddressSpace.SHARED
-    ]()
-    red[tid] = acc
-    barrier()
-    var stride = ROWRED_THREADS // 2
-    for _ in range(ROWRED_STAGES):
-        if tid < stride:
-            if red[tid + stride] > red[tid]:
-                red[tid] = red[tid + stride]
-        barrier()
-        stride //= 2
-    if tid == 0:
-        out_ptr[r] = red[0].cast[dtype]()
-
-
-@always_inline
-def _max_rows[
-    dtype: DType
-](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
-    """Row-wise max (values only). rows == 1 covers aten.max() (full reduce).
-    Floats reduce in float32 (max is exact under the cast)."""
-    comptime acc_dtype = _accum_dtype[dtype]()
-    var out_ptr = _make_ptr[dtype](out_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-
-    @always_inline
-    @parameter
-    @__copy_capture(in_ptr)
-    def input_fn[
-        width: Int, rank: Int
-    ](coords: IndexList[rank]) -> SIMD[acc_dtype, width]:
-        var flat = coords[0] * cols + coords[1]
-        return in_ptr.load[width=width](flat).cast[acc_dtype]()
-
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr)
-    def output_fn[
-        width: SIMDLength, rank: Int
-    ](coords: IndexList[rank], val: SIMD[acc_dtype, width]):
-        out_ptr[coords[0]] = val[0].cast[dtype]()
-
-    var shape = IndexList[2](rows, cols)
-
-    @always_inline
-    @parameter
-    def run[target: StaticString]() raises:
-        reduce_max[acc_dtype, input_fn, output_fn, target=target, reduce_dim=1](
-            Coord(shape), ctx
-        )
-
-    if ctx.api() == "cpu":
-        run["cpu"]()
-    else:
-        comptime if has_accelerator():
-            if _use_library_reduce(rows, cols):
-                run["gpu"]()
-            else:
-                _enqueue_cached[_max_rows_block_kernel[dtype]](
-                    ctx,
-                    String(t"max_rows_{dtype}"),
-                    rows,
-                    1,
-                    1,
-                    ROWRED_THREADS,
-                    out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
-                    Int64(cols),
-                )
-        else:
-            raise Error("no GPU accelerator available at compile time")
+# Row-wise max (values only, aten.max() with no dim) is the generic reduction
+# skeleton's MaxOp: no kernel of its own here, only the MaxSpec registration
+# below.
 
 
 # ---------------------------------------------------------------------------
@@ -3150,82 +2867,6 @@ comptime SPEC_MAXROWS_DTYPES: List[DType] = [
 ]
 
 
-def _mean_spec_into_go(
-    a_o: PyObjectPtr,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
-    out_o: PyObjectPtr,
-) raises:
-    ref a = _spec_ptr(a_o)[]
-    ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype):
-        raise Error("mojo spec mean: unsupported dtype ", a.dtype)
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-    )
-    if cols == 0:
-        raise Error("mojo spec mean: empty reduce dim")
-
-    var ctx = a.ctx()
-    var nbytes = rows * a.itemsize
-    _ = nbytes
-    _check_into_sized(a, out, rows, a.dtype)
-    var addr = out.ptr
-    if rows > 0:
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _mean_rows[dt](addr, a.ptr, rows, cols, ctx)
-
-
-def _max_spec_into_go(
-    a_o: PyObjectPtr,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
-    out_o: PyObjectPtr,
-) raises:
-    ref a = _spec_ptr(a_o)[]
-    ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[SPEC_MAXROWS_DTYPES](a.dtype):
-        raise Error("mojo spec max: unsupported dtype ", a.dtype)
-    if a.numel == 0:
-        raise Error("mojo spec max: empty input")
-    var rows = 0
-    var cols = 0
-    var out_rank = 0
-    var oshape = IndexList[MAX_RANK](1)
-    _reduce_spec_geom(
-        a,
-        rdims_t,
-        keepdim_o,
-        rows,
-        cols,
-        out_rank,
-        oshape,
-    )
-
-    var ctx = a.ctx()
-    var nbytes = rows * a.itemsize
-    _ = nbytes
-    _check_into_sized(a, out, rows, a.dtype)
-    var addr = out.ptr
-    if rows > 0:
-        comptime for dt in SPEC_MAXROWS_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _max_rows[dt](addr, a.ptr, rows, cols, ctx)
-
-
 def _argmax_spec_into_go(
     a_o: PyObjectPtr,
     rdims_t: PyObjectPtr,
@@ -3475,13 +3116,17 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
         comptime if _op_on["MeanSpec"]():
             _register_call(
                 b,
-                _spec_dispatcher4[_mean_spec_into_go, "MeanSpec"],
+                _spec_dispatcher4[
+                    _rowred_spec_into_go[MeanOp], "a scalar-reduction spec op"
+                ],
                 docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["MaxSpec"]():
             _register_call(
                 b,
-                _spec_dispatcher4[_max_spec_into_go, "MaxSpec"],
+                _spec_dispatcher4[
+                    _rowred_spec_into_go[MaxOp], "a scalar-reduction spec op"
+                ],
                 docstring="(a_spec, rdims, keepdim, out_spec)",
             )
         comptime if _op_on["ArgmaxSpec"]():
