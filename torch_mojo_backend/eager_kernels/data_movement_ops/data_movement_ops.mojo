@@ -54,6 +54,7 @@ from op_utils import (
     _raw_ret_none,
     _raw_tuple_int,
     _raw_tuple_len,
+    _runtime_sm_count,
     _spec_dispatcher3,
     _spec_ptr,
     _spec_unsupported,
@@ -1893,18 +1894,35 @@ def _tile_copy_go(
 # moduli per element even for a rank-2 tensor, and lands at ~4% of achievable
 # bandwidth. Writing the mapping the way above rather than as
 # `out[i, j] = in[i % rows, j % cols]` makes every index a loop counter: grid
-# x carries `c`, y carries `ir`, z carries `copy`, `s` is an inner loop, and
-# not one integer division survives in the segment kernel's hot path
-# (verified in the emitted PTX, not assumed). Measured on an H100 PCIe at
-# 1395 MHz, kineto DEVICE time against stock CUDA: 1024x1024 r(4,4) 41.4us vs
-# 73.6 (`_tile_copy`: 1086), 357x789 r(3,5) 10.6 vs 19.7 (301), 8192x64
-# r(1,16) 14.7 vs 32.2 (594), 64x8192 r(16,1) 16.5 vs 26.9 (595).
+# x carries `c`, y carries the OUTPUT row, `s` is an inner loop, and not one
+# integer division survives either kernel's inner loop (verified in the
+# emitted PTX, not assumed). Measured on an H100 PCIe at 1395 MHz, kineto
+# DEVICE time against stock CUDA: 1024x1024 r(4,4) 41.4us vs 73.6
+# (`_tile_copy`: 1086), 357x789 r(3,5) 10.6 vs 19.7 (301), 8192x64 r(1,16)
+# 14.7 vs 32.2 (594), 64x8192 r(16,1) 16.5 vs 26.9 (595).
 #
-# TWO REGIMES, dispatched on the row length in BYTES (SEG_MIN_BYTES below).
-# Layout-only -> element-size dispatch, like `_tile_copy`.
+# THE COPY AXIS IS FOLDED INTO THE OUTPUT ROW, not given a grid dimension of
+# its own. Output rows are contiguous ACROSS copies as well as within one, so
+# `copy * rows + ir` is just an output row index and the whole launch is
+# (row interior) x (output rows). Splitting them cost a grid dimension AND
+# left blocks idle whenever `rows` was smaller than the block's y extent: at
+# rows=1, cols=3 only 3 of 255 threads survived the row guard and the copy
+# ran 86.5us against 45.2 for the general `_tile_copy` it replaced. The price
+# is one modulo per THREAD to recover `ir = orow % rows`; the per-step
+# advance is uniform, so the host computes it and the kernel carries `ir`
+# with an add and a conditional subtract, exactly like the flat kernel's
+# source column.
+#
+# TWO REGIMES, dispatched on the row length in BYTES (SEG_MIN_BYTES below)
+# and on whether the segment kernel's grid can fill the device
+# (`_repeat_seg_blocks`). Layout-only -> element-size dispatch, like
+# `_tile_copy`.
 # ---------------------------------------------------------------------------
 
-# Threads per block (threads_x * threads_y) for both repeat kernels.
+# Threads per block (threads_x * threads_y) for both repeat kernels. 256 is
+# this package's house block size (GS_THREADS, CAST_THREADS) rather than a
+# fitted number, and the H100 ladder in RESULTS.md was measured at it; no
+# other block size has been measured for these kernels on any card.
 comptime REPEAT_THREADS = 256
 
 # The row length, in BYTES, at or above which the segment kernel takes over
@@ -1919,11 +1937,20 @@ comptime REPEAT_THREADS = 256
 comptime SEG_MIN_BYTES = 64
 
 # Widest access the automatic width choice will take, in BYTES. 16 is the
-# widest the hardware has; 32 (VEC=8 on f32) only doubles the per-thread
-# footprint and shrinks the grid, and measured worse on every shape (H100:
-# 57.5 vs 43.9us on 1024x1024, 35.1 vs 16.1 on 8192x64, 25.4 vs 17.1 on
-# 64x8192).
+# widest access the hardware has, so this is an ISA ceiling rather than a
+# fitted constant; what was measured (on an H100, and only there) is that
+# asking for more does not help -- 32 bytes a thread, VEC=8 on f32, only
+# doubles the per-thread footprint and shrinks the grid, and came out worse
+# on every shape: 57.5 vs 43.9us on 1024x1024, 35.1 vs 16.1 on 8192x64, 25.4
+# vs 17.1 on 64x8192.
 comptime REPEAT_MAX_BYTES = 16
+
+# Both kernels advance their 32-bit column counter by a whole grid stride, so
+# a single row within ~2048 elements of 2^31 could wrap it: value-correct
+# (the counters are unsigned) but the loop bound would stop terminating on
+# schedule. A row that long is an 8GB operand; the caller keeps the general
+# path for it rather than widening every counter.
+comptime _REPEAT_MAX_EXTENT = 0x7FFF_F000
 
 
 @always_inline
@@ -1938,11 +1965,64 @@ def _repeat_quantize(full: Int, cap: Int) -> Int:
     Rounding the grid DOWN to `ceil(full / k)` blocks of exactly `k`
     iterations costs nothing and removes the tail (measured on 8192x64
     r(1,16): 34.7us -> 24.6us).
+
+    Op-agnostic, and strictly better than the bare `min(full, _MAX_GRID_Y)`
+    that `_permute_copy` and `_transpose2d` cap their batch grids with. It is
+    kept local rather than promoted to `op_utils` on purpose: the two sites
+    that would adopt it have no benchmark node of their own yet, and moving
+    the helper alone would invalidate the compile cache of every extension
+    for no behavioural gain.
     """
     if full <= cap:
         return max(1, full)
     var k = ceildiv(full, cap)
     return ceildiv(full, k)
+
+
+@always_inline
+def _repeat_seg_blocks(nseg: Int, nout: Int) -> Int:
+    """Blocks the segment kernel's grid would have for this geometry.
+
+    The segment kernel's `r1` loop is SERIAL -- one load feeding `r1` stores
+    is the whole point of it -- so its grid is (row interior) x (output rows)
+    and knows nothing about how wide `r1` makes the output. A repeat that is
+    wide precisely BECAUSE `r1` is large (a short input row copied thousands
+    of times across, with few output rows) therefore leaves it with almost no
+    grid at all: rows=1, cols=64, r1=9375 put a 600k-element copy in ONE
+    block and took 87.6us against 45.3 for the general path. The flat
+    kernel's x axis spans the whole output row, `r1` included, so it is the
+    one with parallelism there.
+
+    The caller hands over to it when this count cannot put a block on every
+    SM. That floor is a property of the device (`_runtime_sm_count`), not a
+    tuned number, and the two regimes are three orders of magnitude apart:
+    8192x64 r(1,16), which wants the segment kernel, has 512 blocks here
+    against the pathological case's 1.
+    """
+    var tx = min(nseg, REPEAT_THREADS)
+    var ty = max(1, REPEAT_THREADS // tx)
+    return ceildiv(nseg, tx) * ceildiv(nout, ty)
+
+
+@always_inline
+def _repeat_first_row(orow: UInt32, rows: UInt32, nout: UInt32) -> UInt32:
+    """The input row output row `orow` reads, `orow % rows`, without paying a
+    division for the two shapes that do not need one.
+
+    This runs once per THREAD, not per element, and both branches are on
+    kernel ARGUMENTS, so every thread of the launch takes the same one. It is
+    still worth skipping: 64x8192 r(16,1) does one 16-byte load and one
+    16-byte store per thread -- the worst instruction-to-byte ratio either
+    kernel reaches -- and the bare modulo cost it 6.5% (16.3 -> 17.3us).
+    `rows == 1` is the shape the `r1 == 1` flattening in `_repeat_tiled`
+    turns that case into; `nout == rows` is `ncopies == 1`, where the output
+    row IS the input row.
+    """
+    if rows == 1:
+        return 0
+    if nout == rows:
+        return orow
+    return orow % rows
 
 
 # Index math is 32-bit on purpose in both kernels. `Int` is 64 bits on device,
@@ -1962,12 +2042,13 @@ def _repeat_seg_kernel[
     rows_arg: Int64,
     cols_arg: Int64,
     cout_arg: Int64,
-    ncopies_arg: Int64,
+    nout_arg: Int64,
     r1_arg: Int64,
+    iradv_arg: Int64,
 ):
-    """x = inside one input row, y = input rows, z = copies; `r1` is an inner
-    loop, so one load feeds `r1` stores and the input row is read once instead
-    of `r1` times. Zero integer divisions."""
+    """x = inside one input row, y = OUTPUT rows (`rows * ncopies`); `r1` is an
+    inner loop, so one load feeds `r1` stores and the input row is read once
+    instead of `r1` times. No division in either loop."""
     # 16 bytes is the widest access the hardware has; a wider VEC issues two.
     comptime ALIGN = min(16, VEC * size_of[dtype]())
     # Int is not device-passable (host/device width mismatch); scalars cross
@@ -1975,8 +2056,9 @@ def _repeat_seg_kernel[
     var rows = UInt32(Int(rows_arg))
     var cols = UInt32(Int(cols_arg))
     var cout = Int(cout_arg)
-    var ncopies = UInt32(Int(ncopies_arg))
+    var nout = UInt32(Int(nout_arg))
     var r1 = Int(r1_arg)
+    var iradv = UInt32(Int(iradv_arg))
 
     var c0 = (
         UInt32(Int(block_idx.x)) * UInt32(Int(block_dim.x))
@@ -1985,30 +2067,27 @@ def _repeat_seg_kernel[
     var cstride = (
         UInt32(Int(grid_dim.x)) * UInt32(Int(block_dim.x)) * UInt32(VEC)
     )
-    var ir0 = UInt32(Int(block_idx.y)) * UInt32(Int(block_dim.y)) + UInt32(
+    var orow = UInt32(Int(block_idx.y)) * UInt32(Int(block_dim.y)) + UInt32(
         Int(thread_idx.y)
     )
-    var irstride = UInt32(Int(grid_dim.y)) * UInt32(Int(block_dim.y))
-    var copy = UInt32(Int(block_idx.z))
-    var copystride = UInt32(Int(grid_dim.z))
+    var orowstride = UInt32(Int(grid_dim.y)) * UInt32(Int(block_dim.y))
+    var ir = _repeat_first_row(orow, rows, nout)
 
-    while copy < ncopies:
-        var ir = ir0
-        while ir < rows:
-            var in_base = Int(ir) * Int(cols)
-            var out_base = (Int(copy) * Int(rows) + Int(ir)) * cout
-            var c = c0
-            while c < cols:
-                var v = in_ptr.load[width=VEC, alignment=ALIGN](
-                    in_base + Int(c)
-                )
-                var o = out_base + Int(c)
-                for _ in range(r1):
-                    out_ptr.store[width=VEC, alignment=ALIGN](o, v)
-                    o += Int(cols)
-                c += cstride
-            ir += irstride
-        copy += copystride
+    while orow < nout:
+        var in_base = Int(ir) * Int(cols)
+        var out_base = Int(orow) * cout
+        var c = c0
+        while c < cols:
+            var v = in_ptr.load[width=VEC, alignment=ALIGN](in_base + Int(c))
+            var o = out_base + Int(c)
+            for _ in range(r1):
+                out_ptr.store[width=VEC, alignment=ALIGN](o, v)
+                o += Int(cols)
+            c += cstride
+        orow += orowstride
+        ir += iradv
+        if ir >= rows:
+            ir -= rows
 
 
 @__name(t"repeat_flat_rowmajor_{dtype}_v{VEC}")
@@ -2020,61 +2099,62 @@ def _repeat_flat_kernel[
     rows_arg: Int64,
     cols_arg: Int64,
     cout_arg: Int64,
-    ncopies_arg: Int64,
+    nout_arg: Int64,
     cadv_arg: Int64,
+    iradv_arg: Int64,
 ):
-    """For rows too short to fill a transaction: x indexes the output row FLAT
-    (across segment boundaries), y = input rows, z = copies.
+    """For rows too short to fill a transaction, and for outputs whose width
+    comes from `r1` rather than from `cols`: x indexes the output row FLAT
+    (across segment boundaries), y = OUTPUT rows (`rows * ncopies`).
 
     Output rows are adjacent in memory, so with `threads_x == nslots` the
     block's linear thread id maps to consecutive output elements even across a
     row boundary and a warp stays fully coalesced over, say, a 40-element row.
-    The price is one modulo per THREAD to place its first source column; the
-    per-step advance `cadv` is uniform, so the host computes it and the kernel
-    carries the column with an add and a conditional subtract.
+    The price is two moduli per THREAD -- one to place its first source
+    column, one to place its first source row; both per-step advances are
+    uniform, so the host computes them and the kernel carries each with an add
+    and a conditional subtract.
     """
     comptime ALIGN = min(16, VEC * size_of[dtype]())
     var rows = UInt32(Int(rows_arg))
     var cols = UInt32(Int(cols_arg))
     var cout = Int(cout_arg)
-    var ncopies = UInt32(Int(ncopies_arg))
+    var nout = UInt32(Int(nout_arg))
     var cadv = UInt32(Int(cadv_arg))
+    var iradv = UInt32(Int(iradv_arg))
     var nslots = UInt32(Int(cout_arg) // VEC)
 
     var slot0 = UInt32(Int(block_idx.x)) * UInt32(Int(block_dim.x)) + UInt32(
         Int(thread_idx.x)
     )
     var xstride = UInt32(Int(grid_dim.x)) * UInt32(Int(block_dim.x))
-    var ir0 = UInt32(Int(block_idx.y)) * UInt32(Int(block_dim.y)) + UInt32(
+    var orow = UInt32(Int(block_idx.y)) * UInt32(Int(block_dim.y)) + UInt32(
         Int(thread_idx.y)
     )
-    var irstride = UInt32(Int(grid_dim.y)) * UInt32(Int(block_dim.y))
-    var copy = UInt32(Int(block_idx.z))
-    var copystride = UInt32(Int(grid_dim.z))
+    var orowstride = UInt32(Int(grid_dim.y)) * UInt32(Int(block_dim.y))
     if slot0 >= nslots:
         return
-    # The only division in either kernel, and it is per thread, not per
-    # element.
     var c0 = (slot0 * UInt32(VEC)) % cols
+    var ir = _repeat_first_row(orow, rows, nout)
 
-    while copy < ncopies:
-        var ir = ir0
-        while ir < rows:
-            var in_base = Int(ir) * Int(cols)
-            var out_base = (Int(copy) * Int(rows) + Int(ir)) * cout
-            var slot = slot0
-            var c = c0
-            while slot < nslots:
-                out_ptr.store[width=VEC, alignment=ALIGN](
-                    out_base + Int(slot) * VEC,
-                    in_ptr.load[width=VEC, alignment=ALIGN](in_base + Int(c)),
-                )
-                slot += xstride
-                c += cadv
-                if c >= cols:
-                    c -= cols
-            ir += irstride
-        copy += copystride
+    while orow < nout:
+        var in_base = Int(ir) * Int(cols)
+        var out_base = Int(orow) * cout
+        var slot = slot0
+        var c = c0
+        while slot < nslots:
+            out_ptr.store[width=VEC, alignment=ALIGN](
+                out_base + Int(slot) * VEC,
+                in_ptr.load[width=VEC, alignment=ALIGN](in_base + Int(c)),
+            )
+            slot += xstride
+            c += cadv
+            if c >= cols:
+                c -= cols
+        orow += orowstride
+        ir += iradv
+        if ir >= rows:
+            ir -= rows
 
 
 @always_inline
@@ -2087,7 +2167,7 @@ def _repeat_seg_launch[
     cols: Int,
     cout: Int,
     r1: Int,
-    ncopies: Int,
+    nout: Int,
     ctx: DeviceContext,
 ) raises:
     var out_ptr = _make_ptr[dtype](out_addr)
@@ -2095,12 +2175,13 @@ def _repeat_seg_launch[
     var nseg = cols // VEC  # vector slots inside one input row
     var tx = min(nseg, REPEAT_THREADS)
     var ty = max(1, REPEAT_THREADS // tx)
+    var gy = _repeat_quantize(ceildiv(nout, ty), _MAX_GRID_Y)
     _enqueue_cached_2d[_repeat_seg_kernel[dtype, VEC]](
         ctx,
         String(t"dm_rptseg_{dtype}_v{VEC}"),
         _repeat_quantize(ceildiv(nseg, tx), _BW_MAX_BLOCKS),
-        _repeat_quantize(ceildiv(rows, ty), _MAX_GRID_Y),
-        _repeat_quantize(ncopies, _MAX_GRID_Y),
+        gy,
+        1,
         tx,
         ty,
         out_ptr.as_unsafe_any_origin(),
@@ -2108,8 +2189,9 @@ def _repeat_seg_launch[
         Int64(rows),
         Int64(cols),
         Int64(cout),
-        Int64(ncopies),
+        Int64(nout),
         Int64(r1),
+        Int64((gy * ty) % rows),
     )
 
 
@@ -2122,7 +2204,7 @@ def _repeat_flat_launch[
     rows: Int,
     cols: Int,
     cout: Int,
-    ncopies: Int,
+    nout: Int,
     ctx: DeviceContext,
 ) raises:
     var out_ptr = _make_ptr[dtype](out_addr)
@@ -2136,12 +2218,13 @@ def _repeat_flat_launch[
     var tx = min(nslots, REPEAT_THREADS)
     var ty = max(1, REPEAT_THREADS // tx)
     var gx = _repeat_quantize(ceildiv(nslots, tx), _BW_MAX_BLOCKS)
+    var gy = _repeat_quantize(ceildiv(nout, ty), _MAX_GRID_Y)
     _enqueue_cached_2d[_repeat_flat_kernel[dtype, VEC]](
         ctx,
         String(t"dm_rptflat_{dtype}_v{VEC}"),
         gx,
-        _repeat_quantize(ceildiv(rows, ty), _MAX_GRID_Y),
-        _repeat_quantize(ncopies, _MAX_GRID_Y),
+        gy,
+        1,
         tx,
         ty,
         out_ptr.as_unsafe_any_origin(),
@@ -2149,8 +2232,9 @@ def _repeat_flat_launch[
         Int64(rows),
         Int64(cols),
         Int64(cout),
-        Int64(ncopies),
+        Int64(nout),
         Int64((gx * tx * VEC) % cols),
+        Int64((gy * ty) % rows),
     )
 
 
@@ -2167,27 +2251,55 @@ def _repeat_tiled[
     ctx: DeviceContext,
 ) raises:
     """Pick the vector width from the RUNTIME addresses and the kernel from the
-    row length, then launch the EXACT grid.
+    row length and the grid it would get, then launch the EXACT grid.
 
     The exact grid (one loop iteration per thread, capped only by the 65535
-    limit on grid.y/z with `_repeat_quantize` keeping every block's iteration
+    limit on grid.y with `_repeat_quantize` keeping every block's iteration
     count equal) is a result rather than a default: while the kernel still had
     four integer divisions per thread the grid mattered enormously -- 66.5us
     against 21.7 for a one-wave grid on 357x789 -- and with the divisions gone
     the whole wave-budget ladder is flat to within 2% on every measured shape.
-    That is why nothing here consults the SM count.
+    The device is consulted for ONE thing only, and not to size the grid: the
+    segment kernel is skipped when its grid cannot put a block on every SM
+    (`_repeat_seg_blocks`).
     """
     if rows <= 0 or cols <= 0 or r1 <= 0 or ncopies <= 0:
         return
-    var cout = cols * r1
-    if cout > 0x7FFF_FFFF or rows * ncopies > 0x7FFF_FFFF:
-        raise Error("RepeatTiled: extent does not fit in 31 bits")
+    if cols * r1 > _REPEAT_MAX_EXTENT or rows * ncopies > _REPEAT_MAX_EXTENT:
+        raise Error("RepeatTiled: extent does not fit a 32-bit counter")
 
-    var use_seg = cols * size_of[dtype]() >= SEG_MIN_BYTES
+    # `r1 == 1` means nothing is tiled ALONG a row, so the whole input block
+    # is one contiguous run and the output is just `ncopies` copies of it: the
+    # (rows, cols) input flattens to a single row of rows*cols, which is the
+    # same bytes in the same order. That is a strict simplification -- it
+    # removes the input-row modulo entirely (rows becomes 1) and hands the
+    # segment kernel a long row to spread over the grid instead of a short one
+    # -- and it is the shape `x.repeat(k, 1)` produces.
+    var erows = rows
+    var ecols = cols
+    if r1 == 1 and rows > 1 and rows * cols <= _REPEAT_MAX_EXTENT:
+        erows = 1
+        ecols = rows * cols
+    var cout = ecols * r1
+    var nout = erows * ncopies  # output rows, copies folded in
+    var wide = ecols * size_of[dtype]() >= SEG_MIN_BYTES
+    var sm_count = _runtime_sm_count(ctx)
+
+    @always_inline
+    @parameter
+    def _launch[V: Int]() raises:
+        if wide and _repeat_seg_blocks(ecols // V, nout) >= sm_count:
+            _repeat_seg_launch[dtype, V](
+                out_addr, in_addr, erows, ecols, cout, r1, nout, ctx
+            )
+        else:
+            _repeat_flat_launch[dtype, V](
+                out_addr, in_addr, erows, ecols, cout, nout, ctx
+            )
 
     # A VEC-wide access needs a VEC*itemsize-byte aligned address (capped at
-    # the 16-byte hardware maximum) on BOTH operands, and needs `cols` to be a
-    # multiple of VEC -- otherwise a row start is not aligned and a vector
+    # the 16-byte hardware maximum) on BOTH operands, and needs `ecols` to be
+    # a multiple of VEC -- otherwise a row start is not aligned and a vector
     # would straddle the `j % cols` wrap. Gate on the runtime ADDRESSES: an
     # offset view (`x[1:]`) satisfies every divisibility test and still faults
     # (proven by a negative control that forces the 16-byte path onto a
@@ -2204,31 +2316,17 @@ def _repeat_tiled[
             comptime ALIGN = min(16, V * size_of[dtype]())
             if (
                 not handled
-                and cols % V == 0
+                and ecols % V == 0
                 and out_addr % ALIGN == 0
                 and in_addr % ALIGN == 0
             ):
-                if use_seg:
-                    _repeat_seg_launch[dtype, V](
-                        out_addr, in_addr, rows, cols, cout, r1, ncopies, ctx
-                    )
-                else:
-                    _repeat_flat_launch[dtype, V](
-                        out_addr, in_addr, rows, cols, cout, ncopies, ctx
-                    )
+                _launch[V]()
                 handled = True
     if not handled:
         # Scalar path. Consecutive threads still touch consecutive output
         # elements, so the stores stay perfectly coalesced; only the
         # instruction count grows.
-        if use_seg:
-            _repeat_seg_launch[dtype, 1](
-                out_addr, in_addr, rows, cols, cout, r1, ncopies, ctx
-            )
-        else:
-            _repeat_flat_launch[dtype, 1](
-                out_addr, in_addr, rows, cols, cout, ncopies, ctx
-            )
+        _launch[1]()
 
 
 def _repeat_tiled_go(

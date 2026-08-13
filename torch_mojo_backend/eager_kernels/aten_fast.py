@@ -3880,10 +3880,12 @@ def fast_aten_stack(tensors, dim=0):
     return fast_aten_cat(unsqueezed, dim)
 
 
-# Both repeat kernels index in 32 bits, so an output row or an output row
-# COUNT of 2^31 elements (a >2GB operand at one byte an element) keeps the
-# general rank-8 path instead of making every launch pay 64-bit counters.
-_REPEAT_TILED_MAX_EXTENT = 0x7FFF_FFFF
+# Both repeat kernels index in 32 bits and advance those counters by a whole
+# grid stride, so an output row -- or an output row COUNT -- within a grid
+# stride of 2^31 keeps the general rank-8 path instead of making every launch
+# pay 64-bit counters. That is an 8GB operand. Mirrors `_REPEAT_MAX_EXTENT`
+# in data_movement_ops.mojo, which raises rather than trusting this.
+_REPEAT_TILED_MAX_EXTENT = 0x7FFF_F000
 
 
 def _repeat_tile_plan(

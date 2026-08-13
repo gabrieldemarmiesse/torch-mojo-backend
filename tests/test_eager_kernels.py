@@ -501,6 +501,13 @@ def _repeat_fill(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
 # shorter than a warp (which take the second, flat kernel), the r = (1, 1)
 # identity, and repeats LONGER than the input rank, where torch left-pads the
 # input shape with 1s and the extra leading factors multiply the output.
+#
+# The last four are the geometries where the launch, not the indexing, is the
+# whole problem: almost no input rows with the copy count carrying the work,
+# ONE output row whose width comes entirely from the trailing repeat factor,
+# and `r1 == 1`, which flattens the input to a single row before launching.
+# Each of those took a different branch of the dispatch, and a first version
+# of these kernels was slower than the general path on all of them.
 _REPEAT_CASES = [
     (357, 789, (2, 3)),
     (13, 7, (3, 5)),
@@ -514,6 +521,10 @@ _REPEAT_CASES = [
     (3, 4, (2, 3, 5)),
     (5, 6, (3, 1, 1)),
     (7, 128, (4, 1, 2)),
+    (1, 3, (2000, 1)),
+    (2, 3, (1000, 1)),
+    (1, 1, (5000, 1)),
+    (1, 64, (1, 300)),
 ]
 _REPEAT_IDS = [
     f"{r}x{c}_r{'x'.join(str(k) for k in reps)}" for r, c, reps in _REPEAT_CASES
