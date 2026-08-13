@@ -1242,6 +1242,222 @@ def _ternary_bcast_dispatcher[
 
 
 # ---------------------------------------------------------------------------
+# addr: out = beta*self + alpha*outer(vec1, vec2); self: (n, m) (any
+# strides), vec1: (n,), vec2: (m,). A dedicated 2-D kernel rather than a new
+# `_ternary_bcast` op_code: PyTorch's own vec1.reshape({n, 1}) broadcast
+# (build_addr_iter in aten/src/ATen/native/LinearAlgebra.cpp) places vec1's
+# only axis at dim 0, which plain right-aligned broadcasting of a 1-D
+# operand against a 2-D one would instead place at dim 1 -- so the caller
+# always passes each operand's *own* row/column stride below and this
+# kernel indexes them by (i, j) directly, no shared broadcast-dims plumbing
+# needed.
+#
+# This exists because, absent a native addr kernel, PyTorch's
+# CompositeExplicitAutograd fallback for backends like this one
+# (`math_addr`) composes outer/scale/add as three separately-dtype-rounded
+# ops in a different multiplication order than CPU/CUDA's native addr_stub
+# kernel -- enough rounding-order drift on top of an already coarse dtype
+# to fail OpInfo conformance for fp16 (up to 18% of sampled elements; see
+# conformance/test_opinfo.py::test_matches_cpu_addr_mojo_float16).
+#
+# The fix is NOT a higher-precision (float32) accumulator: CPU's own
+# addr_kernel (aten/src/ATen/native/cpu/LinearAlgebraKernel.cpp) computes
+# `beta*self + alpha*vec1*vec2` directly in the tensor's own dtype, and for
+# fp16/bf16 that still rounds after every individual +/- (Half/BFloat16's
+# operator overloads convert to float, do ONE op, and round back), so the
+# reference this compares against has four separate low-precision roundings
+# baked in, in a specific order: t1 = beta*self, t2 = alpha*vec1, t3 =
+# t2*vec2, result = t1+t3. A single-final-rounding fp32 accumulation is
+# *more* accurate but that makes it a worse match for this specific
+# imperfectly-rounded reference (confirmed empirically: it still failed
+# ~8% of elements at fp16). Reproducing CPU's exact op order and rounding
+# granularity below matches it exactly.
+#
+# Hard-won, separate from the above: getting the arithmetic right was not
+# enough on its own. With that arithmetic launched through `_parallel_for`
+# (== `elementwise[func, simd_width=1]` on CPU), a couple of percent of
+# fp16/bf16 elements still came out wrong -- reproducible, deterministic,
+# and unaffected by which equivalent arithmetic formula or branch style
+# (`if`/`else` statement vs. the branch-free `... if ... else ...`
+# expression below) was used. Replacing `_parallel_for` with a plain
+# sequential loop over the *same* closure on CPU (below) made it exact
+# (0 mismatches over 100k+ randomized elements across both dtypes and two
+# shape/beta/alpha combinations). Root cause not traced further than that;
+# treat it as a MAX/Mojo `elementwise` CPU-backend issue specific to this
+# closure's shape (six captured values incl. a Bool, three independently
+# strided pointer reads) rather than a correctness property of the
+# arithmetic. GPU still goes through `elementwise[..., target="gpu"]` via
+# `_parallel_for`, same as every other kernel in this file, and was not
+# rewritten to match: on an actual H100
+# (test_matches_cpu_addr_mojo_float16/bfloat16), it landed exactly one
+# element out of 50 just outside tolerance (down from up to 18% before
+# this fix), where the arithmetic above reproduces CPU exactly to the bit
+# on every sample tried. A hand-written grid-stride GPU kernel (bypassing
+# `elementwise` entirely, mirroring `_bin_bcast_kernel` above) was tried
+# and closed the CPU path back down to the pre-workaround failure rate
+# when the same restructuring was applied there, so it was not safe to
+# ship blind without more GPU time to verify; left as the next step.
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _addr_bcast[
+    dtype: DType
+](
+    out_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    c_addr: Int,
+    n: Int,
+    m: Int,
+    as0: Int,
+    as1: Int,
+    bs0: Int,
+    cs0: Int,
+    beta: Float64,
+    alpha: Float64,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var a_ptr = _make_ptr[dtype](a_addr)
+    var b_ptr = _make_ptr[dtype](b_addr)
+    var c_ptr = _make_ptr[dtype](c_addr)
+    var total = n * m
+    var beta_dt = beta.cast[dtype]()
+    var alpha_dt = alpha.cast[dtype]()
+    var beta_is_zero = beta_dt == 0
+    # Every multiply below runs in float32 (never a native Scalar[dtype]
+    # arithmetic op for fp16/bf16, only load/round-trip conversions): this
+    # matches how CPU's own Half/BFloat16 operator overloads are
+    # implemented (promote to float, do ONE op, round back), and sidesteps
+    # it entirely for float32 dtype (where these casts are no-ops).
+    var beta_f32 = beta_dt.cast[DType.float32]()
+    var alpha_f32 = alpha_dt.cast[DType.float32]()
+
+    @always_inline
+    @parameter
+    @__copy_capture(
+        out_ptr, a_ptr, b_ptr, c_ptr, beta_f32, alpha_f32, beta_is_zero
+    )
+    def func[width: Int, alignment: Int = 1](idx: Coord):
+        var i_flat = Int(idx[0].value())
+        var i = i_flat // m
+        var j = i_flat % m
+        var bv = b_ptr[i * bs0]
+        var cv = c_ptr[j * cs0]
+        # Multiply in float32, then explicitly round down to `dtype` and
+        # back up before the next op -- one rounding per op, matching
+        # CPU's Half/BFloat16 operator overloads (convert to float, do ONE
+        # op, round back) exactly. Skipping the round-trip and chaining
+        # float32 multiplies with a single final rounding is *more*
+        # accurate but drifts from this specific imperfectly-rounded
+        # reference (see the module comment above).
+        var t2 = (
+            (alpha_f32 * bv.cast[DType.float32]())
+            .cast[dtype]()
+            .cast[DType.float32]()
+        )
+        var t3 = (
+            (t2 * cv.cast[DType.float32]()).cast[dtype]().cast[DType.float32]()
+        )
+        # `self` is masked to 0 rather than branched around: beta==0 must
+        # not propagate nan/inf from `self` (matches CPU), and a select on
+        # an already-loaded value keeps this branch-free per element.
+        var av = Scalar[dtype](0) if beta_is_zero else a_ptr[i * as0 + j * as1]
+        var t1 = (
+            (beta_f32 * av.cast[DType.float32]())
+            .cast[dtype]()
+            .cast[DType.float32]()
+        )
+        out_ptr[i_flat] = (t1 + t3).cast[dtype]()
+
+    # Not `_parallel_for` on CPU -- see the module comment above.
+    if ctx.api() == "cpu":
+        for i in range(total):
+            func[1](Coord(i))
+    else:
+        _parallel_for[func](total, ctx)
+
+
+def _addr_bcast_go(
+    out_ptr: PyObjectPtr,
+    a_ptr: PyObjectPtr,
+    b_ptr: PyObjectPtr,
+    c_ptr: PyObjectPtr,
+    params: PyObjectPtr,  # (n, m, as0, as1, bs0, cs0)
+    beta: PyObjectPtr,
+    alpha: PyObjectPtr,
+    dtype: PyObjectPtr,
+    ctx_ptr: PyObjectPtr,
+) raises:
+    var dtype_val = _raw_dtype_int(dtype)
+    var out_addr = _raw_int(out_ptr)
+    var a_addr = _raw_int(a_ptr)
+    var b_addr = _raw_int(b_ptr)
+    var c_addr = _raw_int(c_ptr)
+    var n = _raw_tuple_int(params, 0)
+    var m = _raw_tuple_int(params, 1)
+    var as0 = _raw_tuple_int(params, 2)
+    var as1 = _raw_tuple_int(params, 3)
+    var bs0 = _raw_tuple_int(params, 4)
+    var cs0 = _raw_tuple_int(params, 5)
+    var beta_v = _raw_f64(beta)
+    var alpha_v = _raw_f64(alpha)
+    var ctx = _raw_ctx(ctx_ptr)
+
+    @always_inline
+    @parameter
+    def run[dt: DType]() raises:
+        _addr_bcast[dt](
+            out_addr,
+            a_addr,
+            b_addr,
+            c_addr,
+            n,
+            m,
+            as0,
+            as1,
+            bs0,
+            cs0,
+            beta_v,
+            alpha_v,
+            ctx,
+        )
+
+    var handled = False
+    comptime for dt in [DType.float32, DType.float16, DType.bfloat16]:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype_val == dt:
+                run[dt]()
+                handled = True
+    if not handled:
+        raise Error("unsupported dtype for fast addr op: " + String(dtype_val))
+
+
+def _addr_bcast_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _addr_bcast_go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+        )
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
+# ---------------------------------------------------------------------------
 # TensorSpec entries (docs/tensor_spec_design.md): the whole binary-broadcast
 # op prologue — input checks, broadcast layout, output alloc, kernel launch —
 # in one boundary call over cached TensorSpecs, reusing `_bin_bcast` /
@@ -1658,6 +1874,15 @@ def PyInit_logic_ops() abi("C") -> PythonObject:
                 b,
                 _ternary_bcast_dispatcher[TOP_ADDCDIV],
                 docstring="out = self + value * (t1 / t2) (broadcast strides)",
+            )
+        comptime if _op_on["AddrBcast"]():
+            _register_call(
+                b,
+                _addr_bcast_dispatcher,
+                docstring=(
+                    "out = beta*self + alpha*(vec1 outer vec2); self:(n,m)"
+                    " vec1:(n,) vec2:(m,)"
+                ),
             )
         return b.finalize()
     except e:

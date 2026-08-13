@@ -3226,6 +3226,72 @@ def fast_aten_addcdiv(self, tensor1, tensor2, value=1):
     return _try_addc("AddcdivBcast", self, tensor1, tensor2, value, False)
 
 
+def fast_aten_addr(
+    self: object,
+    vec1: object,
+    vec2: object,
+    beta: int | float = 1,
+    alpha: int | float = 1,
+) -> object:
+    """beta*self + alpha*outer(vec1, vec2), fused into one kernel launch
+    that reproduces CPU's own addr_kernel op order and per-op rounding
+    exactly (see the comment above `_addr_bcast` in logic_ops.mojo for why
+    that -- not a higher-precision accumulator -- is what fp16/bf16 needs).
+    Declines (NOT_HANDLED) whenever `self` isn't standard-broadcastable to
+    (len(vec1), len(vec2)) or dtypes don't already match; the caller
+    redispatches those to ATen's own composite fallback, so declining here
+    never removes support -- see `mojo_device_addr` in
+    mojo_device_aten_ops.py."""
+    a = _t(self)
+    b = _t(vec1)
+    c = _t(vec2)
+    if a is None or b is None or c is None:
+        return NOT_HANDLED
+    if a._device != b._device or a._device != c._device:
+        return NOT_HANDLED
+    dtype = b._dtype
+    if a._dtype != dtype or c._dtype != dtype or dtype not in _FLOAT_DTYPES:
+        return NOT_HANDLED
+    if not isinstance(beta, int | float) or isinstance(beta, bool):
+        return NOT_HANDLED
+    if not isinstance(alpha, int | float) or isinstance(alpha, bool):
+        return NOT_HANDLED
+    if len(b._shape) != 1 or len(c._shape) != 1 or len(a._shape) > 2:
+        return NOT_HANDLED
+    n, m = b._shape[0], c._shape[0]
+    # Right-align `self` against (n, m), same rule as every other broadcast
+    # op here -- but NOT against vec1/vec2, which PyTorch's own addr places
+    # at dim 0 / dim 1 respectively regardless of rank (see the kernel-side
+    # comment in logic_ops.mojo above `_addr_bcast`).
+    a_shape = (1,) * (2 - len(a._shape)) + tuple(a._shape)
+    a_strides = (0,) * (2 - len(a._strides)) + tuple(a._strides)
+    if a_shape[0] not in (1, n) or a_shape[1] not in (1, m):
+        return NOT_HANDLED
+    as0 = a_strides[0] if a_shape[0] != 1 else 0
+    as1 = a_strides[1] if a_shape[1] != 1 else 0
+    out = _alloc((n, m), dtype, a._device)
+    if out._numel > 0:
+        _call_mojo(
+            _LogicExtension,
+            "AddrBcast",
+            (
+                out._ptr,
+                a._ptr,
+                b._ptr,
+                c._ptr,
+                (n, m, as0, as1, b._strides[0], c._strides[0]),
+                float(beta),
+                float(alpha),
+                dtype.value,
+                _ctx_ptr(a._device),
+            ),
+            arg_dtypes=(a._dtype, b._dtype, c._dtype),
+            output_dtypes=(out._dtype,),
+            keepalive=(out, a, b, c),
+        )
+    return out
+
+
 def _binary_operands(input, other):
     """Resolve (lhs, rhs) TorchMojoTensors with equal dtypes for the ternary
     broadcast kernels (where / masked_fill). Either operand may be a Python
@@ -4631,6 +4697,26 @@ def fast_aten_native_dropout_backward(grad_output, mask, scale):
     return grad_input
 
 
+def _layer_norm_stats_to_input_dtype(
+    mean: MojoTensorLike, rstd: MojoTensorLike, input_dtype: DType
+) -> tuple[MojoTensorLike, MojoTensorLike]:
+    """`(mean, rstd)` as ATen returns them: same dtype as the input.
+
+    ATen's CPU `layer_norm` accumulates in `opmath_type` (float for a
+    reduced-precision input) but casts the two saved statistics back down to
+    `param_scalar_type`, which is the input's own dtype unless weight/bias
+    carry a genuinely different ("mixed") dtype. `fast_aten_native_layer_norm`
+    already declines any weight/bias whose dtype differs from the input's, so
+    every call reaching here is the non-mixed case and the target is always
+    `input_dtype`. Typed structurally (not `TorchMojoTensor`) because the
+    no-op float32 branch is exercised with lightweight payload stand-ins by
+    `test_fast_native_layer_norm_gpu_prologue_runs_without_a_gpu`.
+    """
+    if input_dtype == DType.float32:
+        return mean, rstd
+    return _cast_tensor(mean, input_dtype), _cast_tensor(rstd, input_dtype)
+
+
 def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
     a = _t(input)
     normalized_shape = tuple(normalized_shape)
@@ -4685,6 +4771,13 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
     # two-group spec a -34% win).
     out = _alloc(a._shape, a._dtype, a._device)
     stat_shape = tuple(a._shape[:-k]) + (1,) * k
+    # The device kernels only ever write float32 into these two buffers
+    # (their pointer ABI is fixed at float32, unlike the batch/group-norm
+    # running stats, which carry their own dtype template parameter). ATen's
+    # `param_scalar_type` returns the reduced input dtype here whenever
+    # weight/bias aren't mixed-precision -- which, by this function's own
+    # gating above, is every call it accepts -- so the public mean/rstd are
+    # cast down from the float32 accumulator to match, once, at the end.
     mean = _alloc(stat_shape, DType.float32, a._device)
     rstd = _alloc(stat_shape, DType.float32, a._device)
 
@@ -4722,7 +4815,7 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
             flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
             keepalive=(out, mean, rstd, a, gamma, beta),
         )
-        return out, mean, rstd
+        return out, *_layer_norm_stats_to_input_dtype(mean, rstd, a._dtype)
 
     if weight is None:
         gamma = fast_filled((cols,), 1.0, a._dtype, a._device)
@@ -4747,7 +4840,7 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
         flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
         keepalive=(out, mean, rstd, a, gamma, beta),
     )
-    return out, mean, rstd
+    return out, *_layer_norm_stats_to_input_dtype(mean, rstd, a._dtype)
 
 
 def fast_aten_native_layer_norm_backward(
