@@ -475,6 +475,155 @@ def test_fast_stack_uses_the_batched_cat(mojo_gpu, dim):
     )
 
 
+def _repeat_fill(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """A deterministic input, never an RNG: consecutive elements differ, so a
+    tiled copy that reads one element off is caught by VALUE.
+
+    251 is prime and coprime with every row length used below, so the pattern
+    never lines up with a row boundary; k/256 for k < 251 is exact in bfloat16
+    as well as float32, which keeps every comparison a bit-exact one.
+    """
+    numel = 1
+    for extent in shape:
+        numel *= extent
+    base = torch.arange(numel, dtype=torch.int64) % 251
+    if dtype.is_floating_point:
+        base = base.to(torch.float32) / 256.0
+    return base.to(dtype).view(shape)
+
+
+# (rows, cols, repeats) for the rank-2 tiled-copy path. `cols` of 789, 7, 1015
+# and 31 divide by no vector width, which is the case a vectorized tiled copy
+# gets silently wrong -- a wide load would straddle the `j % cols` wrap and
+# read the next row -- and an ODD `cols` additionally lands successive output
+# rows on different 16-byte phases, so "the first row is aligned" proves
+# nothing. The rest cover a single input row, a single input COLUMN, rows
+# shorter than a warp (which take the second, flat kernel), the r = (1, 1)
+# identity, and repeats LONGER than the input rank, where torch left-pads the
+# input shape with 1s and the extra leading factors multiply the output.
+#
+# The last four are the geometries where the launch, not the indexing, is the
+# whole problem: almost no input rows with the copy count carrying the work,
+# ONE output row whose width comes entirely from the trailing repeat factor,
+# and `r1 == 1`, which flattens the input to a single row before launching.
+# Each of those took a different branch of the dispatch, and a first version
+# of these kernels was slower than the general path on all of them.
+_REPEAT_CASES = [
+    (357, 789, (2, 3)),
+    (13, 7, (3, 5)),
+    (64, 1024, (3, 2)),
+    (1024, 64, (1, 16)),
+    (100, 8, (1, 5)),
+    (33, 33, (2, 2)),
+    (1, 100, (5, 7)),
+    (100, 1, (3, 7)),
+    (17, 31, (1, 1)),
+    (3, 4, (2, 3, 5)),
+    (5, 6, (3, 1, 1)),
+    (7, 128, (4, 1, 2)),
+    (1, 3, (2000, 1)),
+    (2, 3, (1000, 1)),
+    (1, 1, (5000, 1)),
+    (1, 64, (1, 300)),
+]
+_REPEAT_IDS = [
+    f"{r}x{c}_r{'x'.join(str(k) for k in reps)}" for r, c, reps in _REPEAT_CASES
+]
+
+
+@pytest.mark.parametrize("rows,cols,reps", _REPEAT_CASES, ids=_REPEAT_IDS)
+def test_fast_repeat_matches_torch(mojo_device, rows, cols, reps):
+    x = _repeat_fill((rows, cols), torch.float32)
+    torch.testing.assert_close(
+        x.to(mojo_device).repeat(*reps).cpu(), x.repeat(*reps), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.int64, torch.uint8]
+)
+@pytest.mark.parametrize("rows,cols,reps", [(357, 789, (2, 3)), (100, 8, (1, 5))])
+def test_fast_repeat_every_element_size(mojo_gpu, dtype, rows, cols, reps):
+    """The kernels dispatch on element SIZE, and the widest access is capped in
+    BYTES, so a 1-byte dtype reaches a 16-wide vector the 4-byte one never
+    instantiates. Run all four widths through both the segment and the flat
+    kernel."""
+    x = _repeat_fill((rows, cols), dtype)
+    torch.testing.assert_close(
+        x.to(mojo_gpu).repeat(*reps).cpu(), x.repeat(*reps), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("offset", [1, 2, 3, 4])
+@pytest.mark.parametrize("rows,cols,reps", [(357, 789, (2, 3)), (64, 1024, (3, 2))])
+def test_fast_repeat_offset_views_are_not_assumed_aligned(
+    mojo_gpu, offset, rows, cols, reps
+):
+    """A base that is not 16-byte aligned must drop to a narrower access rather
+    than fault. An offset view satisfies every divisibility test the shapes can
+    show -- only the runtime ADDRESS says otherwise -- and one float is 4 bytes,
+    so offsets 1..3 cover every misaligned residue and 4 goes back to aligned.
+    """
+    base = _repeat_fill((rows * cols + 4,), torch.float32)
+    x = base[offset : offset + rows * cols].view(rows, cols)
+    device = base.to(mojo_gpu)[offset : offset + rows * cols].view(rows, cols)
+    torch.testing.assert_close(
+        device.repeat(*reps).cpu(), x.repeat(*reps), rtol=0, atol=0
+    )
+
+
+def test_fast_repeat_routes_only_rank2_tiles_to_the_fast_kernel(mojo_gpu, monkeypatch):
+    """The tiled kernel takes a rank-<=2 input with any number of repeat
+    factors (plus a higher-rank one whose leading extents are all 1); a
+    genuinely higher-rank tile keeps the general rank-8 `_tile_copy`."""
+    fast = ("data_movement_ops.mojo", "RepeatTiled")
+    general = ("data_movement_ops.mojo", "TileCopy")
+    calls = _spy_defined_native_calls(monkeypatch, {fast, general})
+
+    for shape, reps in (
+        ((64, 32), (2, 3)),  # rank 2
+        ((64,), (5,)),  # rank 1, one repeat factor
+        ((64,), (2, 5)),  # rank 1, left-padded to rank 2
+        ((8, 16), (2, 3, 4)),  # rank 2, left-padded to rank 3
+        ((1, 8, 16), (2, 3, 4)),  # rank 3, leading extent 1
+    ):
+        x = _repeat_fill(shape, torch.float32)
+        torch.testing.assert_close(
+            x.to(mojo_gpu).repeat(*reps).cpu(), x.repeat(*reps), rtol=0, atol=0
+        )
+    assert len(calls[fast]) == 5
+    assert calls[general] == []
+
+    for shape, reps in (
+        ((4, 8, 16), (2, 3, 4)),  # a real rank-3 tile
+        ((2, 3, 4, 5), (2, 2, 2, 2)),
+    ):
+        x = _repeat_fill(shape, torch.float32)
+        torch.testing.assert_close(
+            x.to(mojo_gpu).repeat(*reps).cpu(), x.repeat(*reps), rtol=0, atol=0
+        )
+    assert len(calls[fast]) == 5
+    assert len(calls[general]) == 2
+
+
+def test_fast_repeat_degenerate_extents(mojo_device):
+    """A zero repeat factor or a zero input extent is an empty output, not a
+    launch and not a crash. `repeat(x, [])` on a 0-d tensor is a legal 0-d
+    copy with no last dim to tile along, and reaches the general kernel."""
+    for shape, reps in (((4, 5), (0, 2)), ((4, 5), (2, 0)), ((0, 5), (2, 3))):
+        x = _repeat_fill(shape, torch.float32)
+        torch.testing.assert_close(
+            x.to(mojo_device).repeat(*reps).cpu(), x.repeat(*reps), rtol=0, atol=0
+        )
+    scalar = torch.tensor(1.25)
+    torch.testing.assert_close(
+        torch.ops.aten.repeat(scalar.to(mojo_device), []).cpu(),
+        torch.ops.aten.repeat(scalar, []),
+        rtol=0,
+        atol=0,
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_fast_batch_norm_inference_float32_running_stats(mojo_gpu, dtype):
     """A half/bfloat16 activation with FLOAT32 running statistics.
@@ -645,8 +794,30 @@ def test_fast_layer_norm_row_widths(mojo_gpu, dtype, cols):
     torch.testing.assert_close(
         actual[0].cpu().float(), expected[0], atol=tolerance, rtol=tolerance
     )
-    torch.testing.assert_close(actual[1].cpu(), expected[1], atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(actual[2].cpu(), expected[2], atol=1e-3, rtol=1e-3)
+    # mean/rstd come back in `dtype` (ATen's own convention: same dtype as
+    # the input, see fast_aten_native_layer_norm), but `expected` was
+    # computed from float32 inputs above to get a clean reference for the
+    # output tolerance check -- so its saved stats are float32 regardless of
+    # `dtype` and must be cast down to compare. That final cast is a single
+    # bf16 rounding step on each side of two independently-computed float32
+    # values (our device reduction vs. CPU's), so the float32-era tolerances
+    # below (tight enough there) must widen to a bf16 ULP or a boundary value
+    # can round to adjacent bf16 representables and fail on a correct result.
+    mean_tolerance = 1e-4 if dtype == torch.float32 else 2e-2
+    rstd_tolerance = 1e-3 if dtype == torch.float32 else 2e-2
+    mean_actual, rstd_actual = actual[1].cpu(), actual[2].cpu()
+    torch.testing.assert_close(
+        mean_actual,
+        expected[1].to(mean_actual.dtype),
+        atol=mean_tolerance,
+        rtol=mean_tolerance,
+    )
+    torch.testing.assert_close(
+        rstd_actual,
+        expected[2].to(rstd_actual.dtype),
+        atol=rstd_tolerance,
+        rtol=rstd_tolerance,
+    )
 
 
 @pytest.mark.parametrize("offset", [1, 2, 3])
@@ -1158,7 +1329,7 @@ def test_fast_native_layer_norm_bf16_gpu_preserves_generic_path(mojo_gpu):
     )
 
     assert actual[0].dtype == torch.bfloat16
-    assert actual[1].dtype == actual[2].dtype == torch.float32
+    assert actual[1].dtype == actual[2].dtype == torch.bfloat16
     for got, want in zip(actual, expected, strict=True):
         got_cpu = got.cpu()
         torch.testing.assert_close(

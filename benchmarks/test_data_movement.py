@@ -36,10 +36,29 @@ STACK_SHAPES: dict[str, tuple[int, int]] = {
     "P_8x1048576": (8, 1048576),
     "P_32x65536": (32, 65536),
 }
-# (rows, cols, repeats)
+# (rows, cols, repeats).  The ASPECT RATIO of the input is a regime axis of
+# its own, and the two square shapes this dict started with hid every one of
+# them.  repeat dispatches on the row length in bytes AND on how much grid
+# the resulting geometry has, so all four of these are separately reachable:
+#
+#   8192x64 r(1,16)   a 256-byte row: 16 vector slots to spread over a block
+#   64x8192 r(16,1)   one row fills whole blocks and is repeated DOWN
+#   2x3    r(100000,1)  a 12-byte row and almost no input rows -- the copy
+#                       axis, not the row axis, is where the parallelism is
+#   1x64   r(1,9375)    ONE output row, all of its width coming from the
+#                       repeat factor, which the segment kernel's serial
+#                       inner loop cannot spread over the grid at all
+#
+# The last two are here because they are what a regression looks like: a
+# first version of the tiled kernel ran them at 1.9x the general kernel it
+# replaced while every recorded shape improved 24-41x.
 REPEAT_SHAPES: dict[str, tuple[int, int, tuple[int, int]]] = {
     "S_1024x1024_r4x4": (1024, 1024, (4, 4)),
     "S_357x789_r3x5": (357, 789, (3, 5)),
+    "S_8192x64_r1x16": (8192, 64, (1, 16)),
+    "S_64x8192_r16x1": (64, 8192, (16, 1)),
+    "S_2x3_r100000x1": (2, 3, (100000, 1)),
+    "S_1x64_r1x9375": (1, 64, (1, 9375)),
 }
 TRI_SHAPES: dict[str, tuple[int, int]] = {"S_8192x8192": (8192, 8192)}
 ARANGE_N = 16777216
