@@ -14,7 +14,7 @@
 # One 128x128 core plus a 64x64 small-shape core (tn_f32_gemm_core.mojo):
 #
 #   - `_tn_core_kernel` 128x128: quadrant-warp-tiled 8x8 thread tile,
-#     2 CTAs/SM (228-block waves), STAGES=2. Runs every m,n >= 96 shape
+#     2 CTAs/SM (228-block waves), STAGES=3. Runs every m,n >= 96 shape
 #     regardless of operand alignment (VEC_A/VEC_B are picked per-call
 #     from the alignment gates below). A de-phased-pipeline sibling,
 #     `_tn_split_kernel` (warp-group split-K-in-block, 8x16 thread tile),
@@ -22,15 +22,22 @@
 #     is gone because its stage buffers cannot fit the ptxas static
 #     shared-memory budget on this toolchain at BM=BN=128,BK=16 for any
 #     STAGES it is allowed to run at (see the note in
-#     tn_f32_gemm_core.mojo). `_tn_core_kernel` itself only fits that
-#     budget at STAGES=2 (0x8000 bytes) rather than the STAGES=4 (0x10000
-#     bytes) it ran at alongside the split kernel; both facts came from
-#     directly reproducing the ptxas failure (`mojo build --emit
-#     shared-lib` with MODULAR_NVPTX_COMPILER_PATH pointed at a real
-#     ptxas, on an actual H100) rather than guesswork.
+#     tn_f32_gemm_core.mojo). `_tn_core_kernel`'s own per-stage cost here
+#     is BM*BK + BK*BN = 4096 floats (16384 bytes); STAGES=4 (0x10000
+#     bytes, what it ran at alongside the split kernel) no longer fits the
+#     ptxas cap either. STAGES=3 lands at exactly 0xc000 bytes -- the
+#     deepest pipeline that fits -- which is why it runs at STAGES=3 and
+#     not the STAGES=2 an earlier revision of this fix used: AGENTS.md's
+#     own benchmark notes say deep-K shapes want 3-4 pipeline stages, not
+#     2, and this is the one kernel left serving that regime after the
+#     split kernel's removal. All of the above came from directly
+#     reproducing the ptxas failure (`mojo build --emit shared-lib` with
+#     MODULAR_NVPTX_COMPILER_PATH pointed at a real ptxas, on an actual
+#     H100) rather than guesswork.
 #   - `_tn_core_kernel` 64x64 with the deep-K one-wave split rule for
-#     smaller shapes (STAGES=4, unaffected -- its stage buffers are a
-#     quarter the 128x128 tile's and were never close to the cap).
+#     smaller shapes (STAGES=4, unaffected by any of the above -- its
+#     stage buffers are 0x8000 bytes regardless of what the 128x128 tile
+#     runs at, and were never close to the cap).
 #   - `_pick_ksplits_wave` minimizes 1/fill + reduce_penalty over ks with
 #     the core's own wave size (228); reduce_penalty charges the
 #     split-K workspace traffic (2*ks*m*n*4 B at ~1.5 TB/s) against the
@@ -78,10 +85,10 @@ comptime SPLITK_GENERIC_CAP = 32
 # residency (H100 PCIe @ 1500 MHz, 114 SMs; 122 regs/thread -> 2 CTAs).
 # Card-fitted in value, portable in form (2 x SM count). Measured at
 # STAGES=4; occupancy here is register-bound, not smem-bound (2 CTAs x
-# 64 KiB of stage buffers already fit well inside a 227 KiB/SM Hopper
-# budget), so this residency -- and the wave size derived from it -- still
-# holds at STAGES=2, which is what actually runs now (see
-# tn_f32_gemm_core.mojo for why).
+# 48 KiB of stage buffers, the STAGES=3 this now runs at, still fits well
+# inside a 227 KiB/SM Hopper budget), so this residency -- and the wave
+# size derived from it -- still holds (see tn_f32_gemm_core.mojo for why
+# STAGES changed).
 comptime WAVE_T128 = 228
 # Minimum k-chunk for a 128x128 split: amortizes the pipeline prologue and
 # the per-block epilogue over >= 16 slabs.
@@ -400,13 +407,16 @@ def try_enqueue_tn_f32_gemm(
         c_target = Int(ws.value().unsafe_ptr())
 
     if use_t128:
-        # STAGES=2, not the 4 an earlier revision used: at BM=BN=128,BK=16
+        # STAGES=3, not the 4 an earlier revision used: at BM=BN=128,BK=16
         # the stage buffers are STAGES * (BM*BK + BK*BN) floats, 0x10000
-        # bytes at STAGES=4 vs 0x8000 at STAGES=2, and ptxas on this
-        # toolchain caps static shared memory at 0xc000 bytes on sm_90 --
-        # STAGES=4 no longer builds (verified directly against a real
-        # ptxas on an H100; see tn_f32_gemm_core.mojo).
-        _tn_core_launch[128, 128, 16, 32, 64, 4, 2, 2](
+        # bytes at STAGES=4, and ptxas on this toolchain caps static
+        # shared memory at 0xc000 bytes on sm_90 -- STAGES=4 no longer
+        # builds (verified directly against a real ptxas on an H100; see
+        # tn_f32_gemm_core.mojo). STAGES=3 (0xc000 bytes exactly) does
+        # build and is the deepest pipeline the cap allows -- deep-K
+        # shapes want 3-4 stages, not 2 (AGENTS.md), and this kernel is
+        # now the only one serving that regime.
+        _tn_core_launch[128, 128, 16, 32, 64, 4, 3, 2](
             ctx,
             gx,
             gy,

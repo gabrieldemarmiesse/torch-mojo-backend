@@ -7095,7 +7095,7 @@ def _assert_f32_seq_k_close(
         (127, 255, 63, 2),
     ],
     ids=[
-        "aligned_fat_tile_split_core",
+        "aligned_fat_tile_t128_core",
         "n_misaligned_quadrant_core",
         "awkward_vec1_quadrant_core",
         "misaligned_base_offset_view",

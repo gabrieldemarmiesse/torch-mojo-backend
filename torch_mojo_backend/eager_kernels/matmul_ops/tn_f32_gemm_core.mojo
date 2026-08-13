@@ -44,23 +44,32 @@
 # over `_tn_core_kernel`; see git history around 2026-08 for the full
 # design writeup) USED to run alongside this one. It is gone: its stage
 # buffers are `2 * STAGES * BK * (BM + BN)` floats (one full A+B tile per
-# warp group) — 0x10000 bytes at STAGES=2, 0x20000 at STAGES=4 for the
-# 128x128x16 tile it was launched at — and ptxas on this toolchain caps
-# *static* (non-opt-in) shared memory at 0xc000 bytes (48 KiB) on every sm_90
-# part, so BOTH stage counts fail `ptxas error: ... uses too much shared
-# data` (verified directly: `mojo build --emit shared-lib` with
-# MODULAR_NVPTX_COMPILER_PATH pointed at ptxas 12.8 on an actual H100).
-# `_tn_core_kernel` needs only `STAGES * BM * BK + STAGES * BK * BN` floats
-# (one group's worth) for the same tile, which fits at STAGES=2 (0x8000
-# bytes) — `tn_f32_gemm_kernels.mojo` now launches the 128x128 tile at
-# STAGES=2 instead of reaching for `_tn_split_kernel`. Making the split
-# kernel fit again needs genuine dynamic-shared-memory opt-in (`external_
-# memory` + `FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES`, the pattern
-# `matmul_ops.mojo`'s `multistage_gemm_kernel` launches and
-# `softmax_backward_kernels.mojo`/`tf32_gemm_kernels.mojo` already use for
-# their own hand-written kernels) plus a threaded `shared_mem_bytes`/
-# `func_attribute` path through `_enqueue_cached` — real kernel-level work,
-# out of scope for the smem-budget fix that removed it here.
+# warp group) — 0x10000 bytes at STAGES=2, its own minimum (`comptime
+# assert STAGES >= 2`), and 0x20000 at STAGES=4 for the 128x128x16 tile it
+# was launched at — and ptxas on this toolchain caps *static* (non-opt-in)
+# shared memory at 0xc000 bytes (48 KiB) on every sm_90 part, so EVERY
+# stage count it could legally run at fails `ptxas error: ... uses too
+# much shared data` (verified directly: `mojo build --emit shared-lib`
+# with MODULAR_NVPTX_COMPILER_PATH pointed at ptxas 12.8 on an actual
+# H100). `_tn_core_kernel` needs only `STAGES * BM * BK + STAGES * BK *
+# BN` floats (one group's worth) for the same tile — 0xc000 bytes exactly
+# at STAGES=3, still under the cap where the split kernel's STAGES=2 was
+# already 0x10000 over it — so `tn_f32_gemm_kernels.mojo` now launches the
+# 128x128 tile at STAGES=3 instead of reaching for `_tn_split_kernel`;
+# that is the deepest pipeline this cap admits, which matters because
+# deep-K shapes want 3-4 stages, not 2 (AGENTS.md), and this kernel is now
+# the only one left serving that regime.
+#
+# Reviving the split kernel needs genuine dynamic-shared-memory opt-in:
+# `external_memory` + `FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES` at the
+# allocation site (the pattern `matmul_ops.mojo`'s `multistage_gemm_kernel`
+# launches and `softmax_backward_kernels.mojo`/`tf32_gemm_kernels.mojo`
+# already use for their own hand-written kernels), PLUS threading a
+# `shared_mem_bytes`/`func_attribute` pair through `_enqueue_cached`
+# (`op_utils.mojo`) — that helper has no such parameters today and is
+# shared by every cached-enqueue call site in the tree, so this is a
+# shared-infra change, not a local one; out of scope for the smem-budget
+# fix that removed the kernel here.
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.sync import barrier
@@ -135,6 +144,12 @@ def _tn_core_kernel[
     comptime assert BM % WM == 0 and BN % WN == 0
     comptime assert (BM * BK) % (THREADS * VEC_A) == 0
     comptime assert (BK * BN) % (THREADS * VEC_B) == 0
+    # STAGES == 1 has no prologue prefetch, so the PUMP==1 loop below issues
+    # slab s's cp.async and reads it in the SAME iteration with no wait
+    # between them -- `_compute` would read whatever was in the buffer
+    # before the copy landed. Every current call site uses STAGES >= 2;
+    # this only guards a future one.
+    comptime assert PUMP != 1 or STAGES >= 2
 
     var ks = block_idx.z
     # Round the chunk to a BK multiple: k_start must stay vector-aligned
