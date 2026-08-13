@@ -36,10 +36,17 @@ STACK_SHAPES: dict[str, tuple[int, int]] = {
     "P_8x1048576": (8, 1048576),
     "P_32x65536": (32, 65536),
 }
-# (rows, cols, repeats)
+# (rows, cols, repeats).  The ASPECT RATIO of the input row is a regime axis
+# of its own, because repeat dispatches on the row length in bytes: a 64-wide
+# f32 row (256 bytes) leaves only 16 vector slots to spread over a block,
+# while an 8192-wide one fills whole blocks from a single row and repeats it
+# down the output instead.  Both were far off stock while only the two square
+# shapes below were recorded, which is precisely why they are here now.
 REPEAT_SHAPES: dict[str, tuple[int, int, tuple[int, int]]] = {
     "S_1024x1024_r4x4": (1024, 1024, (4, 4)),
     "S_357x789_r3x5": (357, 789, (3, 5)),
+    "S_8192x64_r1x16": (8192, 64, (1, 16)),
+    "S_64x8192_r16x1": (64, 8192, (16, 1)),
 }
 TRI_SHAPES: dict[str, tuple[int, int]] = {"S_8192x8192": (8192, 8192)}
 ARANGE_N = 16777216

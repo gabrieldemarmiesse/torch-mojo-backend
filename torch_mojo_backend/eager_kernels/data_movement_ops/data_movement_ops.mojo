@@ -18,6 +18,7 @@ from std.os import abort
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.collections import InlineArray
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.math import ceildiv
 from max.gpu.host import DeviceContext
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
@@ -32,11 +33,13 @@ from std.python._cpython import PyObjectPtr, Py_ssize_t
 from op_utils import (
     GS_THREADS,
     MAX_RANK,
+    _BW_MAX_BLOCKS,
     _LLC_BYTES,
     _bw_blocks,
     _MAX_GRID_Y,
     _T2D_ROWS,
     _enqueue_cached,
+    _enqueue_cached_2d,
     _gs_blocks,
     _t2d_tile,
     _transpose2d_kernel,
@@ -1873,6 +1876,411 @@ def _tile_copy_go(
 
 
 # ---------------------------------------------------------------------------
+# RepeatTiled: aten::repeat when it reduces to a rank-2 tiled copy.
+#
+#   out[copy * rows + ir, s * cols + c] = in[ir, c]
+#
+# for ir in [0, rows), c in [0, cols), s in [0, r1), copy in [0, ncopies).
+# `rows x cols` is the contiguous input, `r1` the repeat factor along the
+# columns and `ncopies` the number of stacked copies of the resulting
+# (rows, cols * r1) base block -- `repeats[-2]` times the product of every
+# repeat factor left of it, which is exact whenever the padded input shape is
+# 1 on all but its last two dims (the Python side checks that and keeps
+# `_tile_copy` above for everything else).
+#
+# WHY IT IS A SEPARATE KERNEL. `_tile_copy` walks a rank-8-PADDED index space
+# one output element per thread, so it pays ~8 integer divisions and 16
+# moduli per element even for a rank-2 tensor, and lands at ~4% of achievable
+# bandwidth. Writing the mapping the way above rather than as
+# `out[i, j] = in[i % rows, j % cols]` makes every index a loop counter: grid
+# x carries `c`, y carries `ir`, z carries `copy`, `s` is an inner loop, and
+# not one integer division survives in the segment kernel's hot path
+# (verified in the emitted PTX, not assumed). Measured on an H100 PCIe at
+# 1395 MHz, kineto DEVICE time against stock CUDA: 1024x1024 r(4,4) 41.4us vs
+# 73.6 (`_tile_copy`: 1086), 357x789 r(3,5) 10.6 vs 19.7 (301), 8192x64
+# r(1,16) 14.7 vs 32.2 (594), 64x8192 r(16,1) 16.5 vs 26.9 (595).
+#
+# TWO REGIMES, dispatched on the row length in BYTES (SEG_MIN_BYTES below).
+# Layout-only -> element-size dispatch, like `_tile_copy`.
+# ---------------------------------------------------------------------------
+
+# Threads per block (threads_x * threads_y) for both repeat kernels.
+comptime REPEAT_THREADS = 256
+
+# The row length, in BYTES, at or above which the segment kernel takes over
+# from the flat one. It is the size of the contiguous chunk one input row
+# contributes to a warp's store, and 64 bytes is two 32-byte DRAM sectors --
+# the point where a per-row chunk stops being a partial transaction. Measured
+# ladder on an H100 (flat vs seg, streamed us, same output size): 16B
+# 7.20/14.93, 32B 7.04/7.80, 48B 7.16/10.38 | 64B 5.11/4.76, 96B 7.06/6.67,
+# 256B 17.96/16.01, so the crossover is between 48 and 64 bytes there. It is a
+# transaction granularity rather than a fitted model constant, but it has only
+# been measured on that card; re-measure on MI300X and Metal.
+comptime SEG_MIN_BYTES = 64
+
+# Widest access the automatic width choice will take, in BYTES. 16 is the
+# widest the hardware has; 32 (VEC=8 on f32) only doubles the per-thread
+# footprint and shrinks the grid, and measured worse on every shape (H100:
+# 57.5 vs 43.9us on 1024x1024, 35.1 vs 16.1 on 8192x64, 25.4 vs 17.1 on
+# 64x8192).
+comptime REPEAT_MAX_BYTES = 16
+
+
+@always_inline
+def _repeat_quantize(full: Int, cap: Int) -> Int:
+    """Largest block count <= `cap` giving every block the SAME number of
+    grid-stride iterations.
+
+    Capping a grid at a budget leaves `full / cap` iterations per block on
+    average but `ceil(full / cap)` for the unlucky ones, and a launch is as
+    long as its slowest block: 8192 rows over 7296 blocks means 896 blocks do
+    two rows while 6400 do one, so the kernel takes twice the average work.
+    Rounding the grid DOWN to `ceil(full / k)` blocks of exactly `k`
+    iterations costs nothing and removes the tail (measured on 8192x64
+    r(1,16): 34.7us -> 24.6us).
+    """
+    if full <= cap:
+        return max(1, full)
+    var k = ceildiv(full, cap)
+    return ceildiv(full, k)
+
+
+# Index math is 32-bit on purpose in both kernels. `Int` is 64 bits on device,
+# so every counter update costs two instructions; only the row base ADDRESSES
+# are 64-bit, and they are computed once per row rather than per element. The
+# caller keeps `_tile_copy` for operands whose extents do not fit in 31 bits
+# (a >2G-element row or row count, i.e. >8GB of tensor) instead of making
+# every launch pay 64-bit counters.
+
+
+@__name(t"repeat_seg_rowmajor_{dtype}_v{VEC}")
+def _repeat_seg_kernel[
+    dtype: DType, VEC: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    rows_arg: Int64,
+    cols_arg: Int64,
+    cout_arg: Int64,
+    ncopies_arg: Int64,
+    r1_arg: Int64,
+):
+    """x = inside one input row, y = input rows, z = copies; `r1` is an inner
+    loop, so one load feeds `r1` stores and the input row is read once instead
+    of `r1` times. Zero integer divisions."""
+    # 16 bytes is the widest access the hardware has; a wider VEC issues two.
+    comptime ALIGN = min(16, VEC * size_of[dtype]())
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays 32-bit.
+    var rows = UInt32(Int(rows_arg))
+    var cols = UInt32(Int(cols_arg))
+    var cout = Int(cout_arg)
+    var ncopies = UInt32(Int(ncopies_arg))
+    var r1 = Int(r1_arg)
+
+    var c0 = (
+        UInt32(Int(block_idx.x)) * UInt32(Int(block_dim.x))
+        + UInt32(Int(thread_idx.x))
+    ) * UInt32(VEC)
+    var cstride = (
+        UInt32(Int(grid_dim.x)) * UInt32(Int(block_dim.x)) * UInt32(VEC)
+    )
+    var ir0 = UInt32(Int(block_idx.y)) * UInt32(Int(block_dim.y)) + UInt32(
+        Int(thread_idx.y)
+    )
+    var irstride = UInt32(Int(grid_dim.y)) * UInt32(Int(block_dim.y))
+    var copy = UInt32(Int(block_idx.z))
+    var copystride = UInt32(Int(grid_dim.z))
+
+    while copy < ncopies:
+        var ir = ir0
+        while ir < rows:
+            var in_base = Int(ir) * Int(cols)
+            var out_base = (Int(copy) * Int(rows) + Int(ir)) * cout
+            var c = c0
+            while c < cols:
+                var v = in_ptr.load[width=VEC, alignment=ALIGN](
+                    in_base + Int(c)
+                )
+                var o = out_base + Int(c)
+                for _ in range(r1):
+                    out_ptr.store[width=VEC, alignment=ALIGN](o, v)
+                    o += Int(cols)
+                c += cstride
+            ir += irstride
+        copy += copystride
+
+
+@__name(t"repeat_flat_rowmajor_{dtype}_v{VEC}")
+def _repeat_flat_kernel[
+    dtype: DType, VEC: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    rows_arg: Int64,
+    cols_arg: Int64,
+    cout_arg: Int64,
+    ncopies_arg: Int64,
+    cadv_arg: Int64,
+):
+    """For rows too short to fill a transaction: x indexes the output row FLAT
+    (across segment boundaries), y = input rows, z = copies.
+
+    Output rows are adjacent in memory, so with `threads_x == nslots` the
+    block's linear thread id maps to consecutive output elements even across a
+    row boundary and a warp stays fully coalesced over, say, a 40-element row.
+    The price is one modulo per THREAD to place its first source column; the
+    per-step advance `cadv` is uniform, so the host computes it and the kernel
+    carries the column with an add and a conditional subtract.
+    """
+    comptime ALIGN = min(16, VEC * size_of[dtype]())
+    var rows = UInt32(Int(rows_arg))
+    var cols = UInt32(Int(cols_arg))
+    var cout = Int(cout_arg)
+    var ncopies = UInt32(Int(ncopies_arg))
+    var cadv = UInt32(Int(cadv_arg))
+    var nslots = UInt32(Int(cout_arg) // VEC)
+
+    var slot0 = UInt32(Int(block_idx.x)) * UInt32(Int(block_dim.x)) + UInt32(
+        Int(thread_idx.x)
+    )
+    var xstride = UInt32(Int(grid_dim.x)) * UInt32(Int(block_dim.x))
+    var ir0 = UInt32(Int(block_idx.y)) * UInt32(Int(block_dim.y)) + UInt32(
+        Int(thread_idx.y)
+    )
+    var irstride = UInt32(Int(grid_dim.y)) * UInt32(Int(block_dim.y))
+    var copy = UInt32(Int(block_idx.z))
+    var copystride = UInt32(Int(grid_dim.z))
+    if slot0 >= nslots:
+        return
+    # The only division in either kernel, and it is per thread, not per
+    # element.
+    var c0 = (slot0 * UInt32(VEC)) % cols
+
+    while copy < ncopies:
+        var ir = ir0
+        while ir < rows:
+            var in_base = Int(ir) * Int(cols)
+            var out_base = (Int(copy) * Int(rows) + Int(ir)) * cout
+            var slot = slot0
+            var c = c0
+            while slot < nslots:
+                out_ptr.store[width=VEC, alignment=ALIGN](
+                    out_base + Int(slot) * VEC,
+                    in_ptr.load[width=VEC, alignment=ALIGN](in_base + Int(c)),
+                )
+                slot += xstride
+                c += cadv
+                if c >= cols:
+                    c -= cols
+            ir += irstride
+        copy += copystride
+
+
+@always_inline
+def _repeat_seg_launch[
+    dtype: DType, VEC: Int
+](
+    out_addr: Int,
+    in_addr: Int,
+    rows: Int,
+    cols: Int,
+    cout: Int,
+    r1: Int,
+    ncopies: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var in_ptr = _make_ptr[dtype](in_addr)
+    var nseg = cols // VEC  # vector slots inside one input row
+    var tx = min(nseg, REPEAT_THREADS)
+    var ty = max(1, REPEAT_THREADS // tx)
+    _enqueue_cached_2d[_repeat_seg_kernel[dtype, VEC]](
+        ctx,
+        String(t"dm_rptseg_{dtype}_v{VEC}"),
+        _repeat_quantize(ceildiv(nseg, tx), _BW_MAX_BLOCKS),
+        _repeat_quantize(ceildiv(rows, ty), _MAX_GRID_Y),
+        _repeat_quantize(ncopies, _MAX_GRID_Y),
+        tx,
+        ty,
+        out_ptr.as_unsafe_any_origin(),
+        in_ptr.as_unsafe_any_origin().as_immutable(),
+        Int64(rows),
+        Int64(cols),
+        Int64(cout),
+        Int64(ncopies),
+        Int64(r1),
+    )
+
+
+@always_inline
+def _repeat_flat_launch[
+    dtype: DType, VEC: Int
+](
+    out_addr: Int,
+    in_addr: Int,
+    rows: Int,
+    cols: Int,
+    cout: Int,
+    ncopies: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var in_ptr = _make_ptr[dtype](in_addr)
+    var nslots = cout // VEC
+    # One output row's worth of threads, capped at a block: `threads_x ==
+    # nslots` is what keeps a warp coalesced across a row boundary. Rounding
+    # it up to a warp instead -- the obvious "a warp must not straddle two
+    # rows" rule -- measured 33.4us against 13.5 on 65536x8 r(1,5), because it
+    # left 7/8 of every block idle on a 40-element row.
+    var tx = min(nslots, REPEAT_THREADS)
+    var ty = max(1, REPEAT_THREADS // tx)
+    var gx = _repeat_quantize(ceildiv(nslots, tx), _BW_MAX_BLOCKS)
+    _enqueue_cached_2d[_repeat_flat_kernel[dtype, VEC]](
+        ctx,
+        String(t"dm_rptflat_{dtype}_v{VEC}"),
+        gx,
+        _repeat_quantize(ceildiv(rows, ty), _MAX_GRID_Y),
+        _repeat_quantize(ncopies, _MAX_GRID_Y),
+        tx,
+        ty,
+        out_ptr.as_unsafe_any_origin(),
+        in_ptr.as_unsafe_any_origin().as_immutable(),
+        Int64(rows),
+        Int64(cols),
+        Int64(cout),
+        Int64(ncopies),
+        Int64((gx * tx * VEC) % cols),
+    )
+
+
+@always_inline
+def _repeat_tiled[
+    dtype: DType
+](
+    out_addr: Int,
+    in_addr: Int,
+    rows: Int,
+    cols: Int,
+    r1: Int,
+    ncopies: Int,
+    ctx: DeviceContext,
+) raises:
+    """Pick the vector width from the RUNTIME addresses and the kernel from the
+    row length, then launch the EXACT grid.
+
+    The exact grid (one loop iteration per thread, capped only by the 65535
+    limit on grid.y/z with `_repeat_quantize` keeping every block's iteration
+    count equal) is a result rather than a default: while the kernel still had
+    four integer divisions per thread the grid mattered enormously -- 66.5us
+    against 21.7 for a one-wave grid on 357x789 -- and with the divisions gone
+    the whole wave-budget ladder is flat to within 2% on every measured shape.
+    That is why nothing here consults the SM count.
+    """
+    if rows <= 0 or cols <= 0 or r1 <= 0 or ncopies <= 0:
+        return
+    var cout = cols * r1
+    if cout > 0x7FFF_FFFF or rows * ncopies > 0x7FFF_FFFF:
+        raise Error("RepeatTiled: extent does not fit in 31 bits")
+
+    var use_seg = cols * size_of[dtype]() >= SEG_MIN_BYTES
+
+    # A VEC-wide access needs a VEC*itemsize-byte aligned address (capped at
+    # the 16-byte hardware maximum) on BOTH operands, and needs `cols` to be a
+    # multiple of VEC -- otherwise a row start is not aligned and a vector
+    # would straddle the `j % cols` wrap. Gate on the runtime ADDRESSES: an
+    # offset view (`x[1:]`) satisfies every divisibility test and still faults
+    # (proven by a negative control that forces the 16-byte path onto a
+    # 4-byte-offset base and dies with CUDA_ERROR_MISALIGNED_ADDRESS).
+    var handled = False
+    comptime auto_max = max(1, REPEAT_MAX_BYTES // size_of[dtype]())
+    comptime for V in [16, 8, 4, 2]:
+        # Descending, so the widest access up to REPEAT_MAX_BYTES that the
+        # shape and the addresses allow wins. Only the widths that can ever
+        # apply to this element size are instantiated. VEC > 4 is reached only
+        # by the 1- and 2-byte dtypes, which were not part of the f32
+        # measurements above.
+        comptime if V <= auto_max:
+            comptime ALIGN = min(16, V * size_of[dtype]())
+            if (
+                not handled
+                and cols % V == 0
+                and out_addr % ALIGN == 0
+                and in_addr % ALIGN == 0
+            ):
+                if use_seg:
+                    _repeat_seg_launch[dtype, V](
+                        out_addr, in_addr, rows, cols, cout, r1, ncopies, ctx
+                    )
+                else:
+                    _repeat_flat_launch[dtype, V](
+                        out_addr, in_addr, rows, cols, cout, ncopies, ctx
+                    )
+                handled = True
+    if not handled:
+        # Scalar path. Consecutive threads still touch consecutive output
+        # elements, so the stores stay perfectly coalesced; only the
+        # instruction count grows.
+        if use_seg:
+            _repeat_seg_launch[dtype, 1](
+                out_addr, in_addr, rows, cols, cout, r1, ncopies, ctx
+            )
+        else:
+            _repeat_flat_launch[dtype, 1](
+                out_addr, in_addr, rows, cols, cout, ncopies, ctx
+            )
+
+
+def _repeat_tiled_go(
+    out_ptr: PyObjectPtr,
+    in_ptr: PyObjectPtr,
+    rows_o: PyObjectPtr,
+    cols_o: PyObjectPtr,
+    r1_o: PyObjectPtr,
+    ncopies_o: PyObjectPtr,
+    itemsize_o: PyObjectPtr,
+    ctx_ptr: PyObjectPtr,
+) raises:
+    var out_addr = _raw_int(out_ptr)
+    var in_addr = _raw_int(in_ptr)
+    var rows = _raw_int(rows_o)
+    var cols = _raw_int(cols_o)
+    var r1 = _raw_int(r1_o)
+    var ncopies = _raw_int(ncopies_o)
+    var itemsize = _raw_int(itemsize_o)
+    var ctx = _raw_ctx(ctx_ptr)
+
+    comptime if not has_accelerator():
+        raise Error("RepeatTiled: no accelerator in this build")
+    elif _dtype_arg_width_on[0, 32]():
+        if itemsize != 4:
+            raise Error("repeat-tiled specialization/itemsize mismatch")
+        _repeat_tiled[DType.uint32](
+            out_addr, in_addr, rows, cols, r1, ncopies, ctx
+        )
+    elif _dtype_arg_width_on[0, 16]():
+        if itemsize != 2:
+            raise Error("repeat-tiled specialization/itemsize mismatch")
+        _repeat_tiled[DType.uint16](
+            out_addr, in_addr, rows, cols, r1, ncopies, ctx
+        )
+    elif _dtype_arg_width_on[0, 64]():
+        if itemsize != 8:
+            raise Error("repeat-tiled specialization/itemsize mismatch")
+        _repeat_tiled[DType.uint64](
+            out_addr, in_addr, rows, cols, r1, ncopies, ctx
+        )
+    elif _dtype_arg_width_on[0, 8]():
+        if itemsize != 1:
+            raise Error("repeat-tiled specialization/itemsize mismatch")
+        _repeat_tiled[DType.uint8](
+            out_addr, in_addr, rows, cols, r1, ncopies, ctx
+        )
+    else:
+        raise Error("RepeatTiled: unsupported element size ", itemsize)
+
+
+# ---------------------------------------------------------------------------
 # TriangularCopy: out = in where the (row, col) is on the kept side of the
 # diagonal, else 0. Implements aten::tril (upper == 0, keep col <= row + diag)
 # and aten::triu (upper == 1, keep col >= row + diag) over a batch of
@@ -2315,6 +2723,28 @@ def _tile_copy_dispatcher(
     return _raw_ret_none()
 
 
+def _repeat_tiled_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _repeat_tiled_go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+        )
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
 def _triangular_copy_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -2481,6 +2911,16 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
                 docstring=(
                     "out[coords] = in[coords % in_shape] over a rank-8-padded"
                     " index space (aten::repeat; element-size dispatch)"
+                ),
+            )
+        comptime if _op_on["RepeatTiled"]():
+            _register_call(
+                b,
+                _repeat_tiled_dispatcher,
+                docstring=(
+                    "out[copy * rows + ir, s * cols + c] = in[ir, c]"
+                    " (aten::repeat reduced to a rank-2 tiled copy;"
+                    " element-size dispatch)"
                 ),
             )
         comptime if _op_on["TriangularCopy"]():

@@ -3880,6 +3880,44 @@ def fast_aten_stack(tensors, dim=0):
     return fast_aten_cat(unsqueezed, dim)
 
 
+# Both repeat kernels index in 32 bits, so an output row or an output row
+# COUNT of 2^31 elements (a >2GB operand at one byte an element) keeps the
+# general rank-8 path instead of making every launch pay 64-bit counters.
+_REPEAT_TILED_MAX_EXTENT = 0x7FFF_FFFF
+
+
+def _repeat_tile_plan(
+    padded_shape: tuple[int, ...], repeats: Sequence[int]
+) -> tuple[int, int, int, int] | None:
+    """`(rows, cols, r1, ncopies)` for the rank-2 tiled-copy kernel, or None.
+
+    The whole output is `ncopies` stacked copies of one `(rows, cols * r1)`
+    block exactly when the padded input shape is 1 on every dim but its last
+    two -- so `out[copy * rows + ir, s * cols + c] = in[ir, c]` and no index
+    needs a division. That covers a rank-<=2 input with any number of repeat
+    factors (torch left-pads the shape with 1s, and those leading factors just
+    multiply into `ncopies`), plus a higher-rank input whose leading extents
+    are all 1. Anything else -- a genuinely higher-rank tile -- returns None
+    and takes `_tile_copy`.
+    """
+    # `aten::repeat(x, [])` on a 0-d tensor is a legal 0-d copy with no last
+    # dim to tile along; the general path already handles it.
+    if not padded_shape or any(extent != 1 for extent in padded_shape[:-2]):
+        return None
+    rows = padded_shape[-2] if len(padded_shape) >= 2 else 1
+    cols = padded_shape[-1]
+    r1 = repeats[-1]
+    ncopies = 1
+    for r in repeats[:-1]:
+        ncopies *= r
+    if (
+        cols * r1 > _REPEAT_TILED_MAX_EXTENT
+        or rows * ncopies > _REPEAT_TILED_MAX_EXTENT
+    ):
+        return None
+    return rows, cols, r1, ncopies
+
+
 def fast_aten_repeat(input, repeats):
     t = _tc(input)
     if t is None or t._dtype not in _COPYABLE_DTYPES:
@@ -3897,25 +3935,49 @@ def fast_aten_repeat(input, repeats):
     n_out = len(repeats)
     padded_shape = (1,) * (n_out - rank) + tuple(t._shape)
     out_shape = tuple(padded_shape[i] * repeats[i] for i in range(n_out))
-    padded_strides = _row_major_strides(padded_shape)
     out = _alloc(out_shape, t._dtype, t._device)
     if out._numel > 0:
-        _call_mojo(
-            _DataMovementExtension,
-            "TileCopy",
-            (
-                out._ptr,
-                t._ptr,
-                _pad8(out_shape, 1),
-                _pad8(padded_shape, 1),
-                _pad8(padded_strides, 0),
-                out._itemsize,
-                _ctx_ptr(t._device),
-            ),
-            arg_dtypes=(t._dtype,),
-            output_dtypes=(out._dtype,),
-            keepalive=(out, t),
+        # The tiled kernels are GPU-only; the CPU device keeps the
+        # `elementwise` general path, which is already parallel there.
+        plan = (
+            None if t._device.api == "cpu" else _repeat_tile_plan(padded_shape, repeats)
         )
+        if plan is not None:
+            rows, cols, r1, ncopies = plan
+            _call_mojo(
+                _DataMovementExtension,
+                "RepeatTiled",
+                (
+                    out._ptr,
+                    t._ptr,
+                    rows,
+                    cols,
+                    r1,
+                    ncopies,
+                    out._itemsize,
+                    _ctx_ptr(t._device),
+                ),
+                arg_dtypes=(t._dtype,),
+                output_dtypes=(out._dtype,),
+                keepalive=(out, t),
+            )
+        else:
+            _call_mojo(
+                _DataMovementExtension,
+                "TileCopy",
+                (
+                    out._ptr,
+                    t._ptr,
+                    _pad8(out_shape, 1),
+                    _pad8(padded_shape, 1),
+                    _pad8(_row_major_strides(padded_shape), 0),
+                    out._itemsize,
+                    _ctx_ptr(t._device),
+                ),
+                arg_dtypes=(t._dtype,),
+                output_dtypes=(out._dtype,),
+                keepalive=(out, t),
+            )
     return out
 
 
