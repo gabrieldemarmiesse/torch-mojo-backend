@@ -123,6 +123,16 @@ SKIPPED_OPS: dict[str, str] = {
         "registered as an explicit raiser (_register_missing): no fast impl "
         "exists, nothing to measure"
     ),
+    # -- new op, no benchmark yet -------------------------------------------
+    "aten::addr": (
+        "newly added fast kernel (see fix-addr-fp16-bf16-precision) fixes "
+        "fp16/bf16 rounding-order drift vs CPU; it has no prior native "
+        "kernel to regress against (ATen's own CompositeExplicitAutograd "
+        "fallback ran before this, composing already-benchmarked mul/add), "
+        "so there is no throughput baseline to protect yet. A dedicated "
+        "benchmark is a reasonable follow-up, not required for a precision "
+        "fix that doesn't touch performance-critical code paths."
+    ),
 }
 
 
