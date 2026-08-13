@@ -99,8 +99,7 @@ def test_build_extension_compiles_original_source(
     monkeypatch.setattr(eager_kernels, "_find_mojo", fake_find_mojo)
     monkeypatch.setattr(eager_kernels.subprocess, "run", fake_run)
 
-    # As they arrive here: already canonical and already reduced to the
-    # defines the source reads (see `_live_defines`).
+    # As they arrive here: already canonical.
     defines = eager_kernels.normalize_defines(
         {
             "OP": "AddSpec",
@@ -140,14 +139,16 @@ _GATED_SOURCE = (
 )
 
 
-def test_loader_reuses_canonical_variant_and_ignores_unread_defines(
+def test_loader_reuses_one_variant_per_distinct_define_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """One .so per *distinguishable* specialization.
+    """One .so per distinct define set, and exactly one.
 
-    A define no `comptime` gate in the source reads cannot change the
-    generated code, so it must not fork a second, byte-identical build — nor
-    reach the compiler command line.
+    The key is the defines as sent, so order must not matter but any
+    difference in name or value must fork a build. A define the source never
+    gates on is not special-cased: it forks a byte-identical build, which is
+    a wasted first-use compile and the reason not to emit dead defines at the
+    call site.
     """
     source = tmp_path / "elementwise_ops.mojo"
     source.write_text(_GATED_SOURCE)
@@ -187,13 +188,16 @@ def test_loader_reuses_canonical_variant_and_ignores_unread_defines(
     different_op = load(OP="MulSpec", DTYPE_ARG_0="float32", INPLACE=False)
 
     assert same_defines_different_order is base
-    assert unread_define_differs is base  # INPLACE gates nothing in this source
-    assert all(module is not base for module in (different_dtype, different_op))
-    assert len(builds) == 3
-    assert len(loaded) == 3
-    assert not any(
-        name == "INPLACE" for _, defines in builds for name, _ in defines or ()
+    assert all(
+        module is not base
+        for module in (unread_define_differs, different_dtype, different_op)
     )
+    assert len(builds) == 4
+    assert len(loaded) == 4
+    # Every define reaches the compiler, including the one no gate reads.
+    assert sum(
+        1 for _, defines in builds for name, _ in defines or () if name == "INPLACE"
+    ) == len(builds)
     assert callable(base.call)
     assert not hasattr(base, "AddSpec")
 

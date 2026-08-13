@@ -10,7 +10,9 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
-    "max",
+    # 26.5 is the first stable MAX on PyPI (it ships mojo 1.0); the kernels use
+    # its API, so an older one cannot compile them.
+    "max>=26.5",
     "tabulate",
     "torch>=2.10",
     "beartype>=0.17.0",
@@ -34,59 +36,25 @@ select = [
 ]
 
 
-[tool.uv.sources]
-max = [
-    { index = "modular-nightly" },
-]
-mblack = [
-    { index = "modular-nightly" },
-]
-max-core = [
-    { index = "modular-nightly" },
-]
-mojo = [
-    { index = "modular-nightly" },
-]
-mojo-lldb-libs = [
-    { index = "modular-nightly" },
-]
-mojo-compiler = [
-    { index = "modular-nightly" },
-]
-max-mojo-libs = [
-    { index = "modular-nightly" },
-]
-max-mojo-mogg-libs = [
-    { index = "modular-nightly" },
-]
-mojo-compiler-mojo-libs = [
-    { index = "modular-nightly" },
-]
-
-[[tool.uv.index]]
-name = "modular-nightly"
-url = "https://whl.modular.com/nightly/simple/"
-explicit = true
-
 [tool.uv]
-prerelease = "explicit"
 python-preference = "only-managed"
-index-strategy = "unsafe-best-match"
 
 [tool.ruff.format]
 skip-magic-trailing-comma = true
 
 [dependency-groups]
 dev = [
-    # Bump the version of max nightly here
-    "max==26.5.0rc1",
-    "max-core==26.5.0rc1",
-    "max-mojo-libs==26.5.0rc1",
-    "mojo==1.0.0rc1",
-    "mblack==26.5.0rc1",
-    "mojo-lldb-libs==1.0.0rc1",
-    "mojo-compiler==1.0.0rc1",
-    "mojo-compiler-mojo-libs==1.0.0rc1",
+    # Bump the version of mojo/max here.  These come from PyPI like everything
+    # else: mojo 1.0 is a stable release, so there is no nightly index and no
+    # prerelease opt-in to keep in sync with them.
+    "max==26.5.0",
+    "max-core==26.5.0",
+    "max-mojo-libs==26.5.0",
+    "mojo==1.0.0",
+    "mblack==26.5.0",
+    "mojo-lldb-libs==1.0.0",
+    "mojo-compiler==1.0.0",
+    "mojo-compiler-mojo-libs==1.0.0",
     "hatchling",
     "ipython",
     # torch ships torch/testing/_internal inside the wheel but not this, its

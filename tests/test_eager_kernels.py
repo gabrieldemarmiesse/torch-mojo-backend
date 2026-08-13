@@ -645,8 +645,30 @@ def test_fast_layer_norm_row_widths(mojo_gpu, dtype, cols):
     torch.testing.assert_close(
         actual[0].cpu().float(), expected[0], atol=tolerance, rtol=tolerance
     )
-    torch.testing.assert_close(actual[1].cpu(), expected[1], atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(actual[2].cpu(), expected[2], atol=1e-3, rtol=1e-3)
+    # mean/rstd come back in `dtype` (ATen's own convention: same dtype as
+    # the input, see fast_aten_native_layer_norm), but `expected` was
+    # computed from float32 inputs above to get a clean reference for the
+    # output tolerance check -- so its saved stats are float32 regardless of
+    # `dtype` and must be cast down to compare. That final cast is a single
+    # bf16 rounding step on each side of two independently-computed float32
+    # values (our device reduction vs. CPU's), so the float32-era tolerances
+    # below (tight enough there) must widen to a bf16 ULP or a boundary value
+    # can round to adjacent bf16 representables and fail on a correct result.
+    mean_tolerance = 1e-4 if dtype == torch.float32 else 2e-2
+    rstd_tolerance = 1e-3 if dtype == torch.float32 else 2e-2
+    mean_actual, rstd_actual = actual[1].cpu(), actual[2].cpu()
+    torch.testing.assert_close(
+        mean_actual,
+        expected[1].to(mean_actual.dtype),
+        atol=mean_tolerance,
+        rtol=mean_tolerance,
+    )
+    torch.testing.assert_close(
+        rstd_actual,
+        expected[2].to(rstd_actual.dtype),
+        atol=rstd_tolerance,
+        rtol=rstd_tolerance,
+    )
 
 
 @pytest.mark.parametrize("offset", [1, 2, 3])
@@ -1158,7 +1180,7 @@ def test_fast_native_layer_norm_bf16_gpu_preserves_generic_path(mojo_gpu):
     )
 
     assert actual[0].dtype == torch.bfloat16
-    assert actual[1].dtype == actual[2].dtype == torch.float32
+    assert actual[1].dtype == actual[2].dtype == torch.bfloat16
     for got, want in zip(actual, expected, strict=True):
         got_cpu = got.cpu()
         torch.testing.assert_close(

@@ -7,11 +7,16 @@ such as `OP`, `DTYPE_ARG_0`, and `DTYPE_OUT` select the operation, ordered
 argument dtypes, and compile-time flags for one GPU-call family. Shapes and
 strides are runtime arguments and never enter the specialization key.
 
-A specialization is identified by the defines its Mojo sources actually
-read (`_live_defines`): a define no `comptime` gate consumes cannot change
-the generated code, so keeping it in the key would fork a second,
-byte-identical `mojo build`. The source hash is part of the same key, so
-adding a gate later invalidates every cached variant.
+A specialization is identified by the defines Python sends, verbatim, plus
+the hash of the source closure they are compiled against. The key is
+deliberately not narrowed to the defines the sources are believed to read:
+deciding that required parsing Mojo with regexes, which had to be taught
+every new gate form and silently reverted to the unnarrowed key whenever it
+could not (see git history). Sending a define no `comptime` gate consumes
+can therefore fork a second, byte-identical `mojo build` -- a first-use
+compile, never a wrong answer -- and the fix is to stop emitting the dead
+define at its call site, where the fact is known, rather than to infer it
+here.
 
 Each Python operation descriptor is a stateless `MojoExtension` class. It
 selects one immutable specialization and invokes that extension's constant
@@ -340,8 +345,8 @@ def _source_stamps(files: tuple[Path, ...]) -> tuple[SourceStamp, ...]:
 def _closure_of(source: Path) -> tuple[tuple[Path, ...], tuple[SourceStamp, ...]]:
     """The dependency closure of an already resolved source, cached per path.
 
-    Every consumer below (hashing, gate analysis) reads the whole closure,
-    which costs milliseconds per source; the cached list is reused only while
+    Hashing reads every file in the closure, which costs milliseconds per
+    source; the cached list is reused only while
     every file in it still has the same size and mtime, so editing any of
     them — including editing one to add an import — invalidates the entry.
     An edit that preserves both size and mtime is invisible, the same
@@ -379,127 +384,6 @@ def _source_hash(source: Path) -> str:
     digest = hasher.hexdigest()[:16]
     _SOURCE_HASH_CACHE[key] = digest
     return digest
-
-
-# ---------------------------------------------------------------------------
-# Which defines a source actually reads
-#
-# `variant_gates.mojo` is the only file that touches `get_defined_*`; every
-# operation source reaches a define through one of its gate helpers, always
-# with a literal operation name or argument index. Scanning for those calls
-# tells us exactly which defines can change the generated code — the rest are
-# dropped from both the cache key and the compiler command line.
-
-_GATE_LIBRARY_NAME = "variant_gates.mojo"
-_MOJO_IMPORT_BLOCK_RE = re.compile(
-    r"^[ \t]*(?:from[ \t]+\S+[ \t]+)?import[ \t]+(?:\([^)]*\)|[^\n]*)", re.M
-)
-_OP_GATE_RE = re.compile(r"_op_on\s*\[\s*([^\],]+)")
-_ARG_GATE_RE = re.compile(r"_dtype_arg(?:_abi|_width)?_on\s*\[\s*([^\],]+)")
-_OUT_GATE_RE = re.compile(r"_dtype_out_on\s*\[\s*([^\],]+)")
-# The shared support-check helper reads DTYPE_ARG_<index> through the gate
-# library (which this scanner skips), so its call sites must count as reads:
-# `_dtype_supported[SOME_DTYPES]` -> index 0, `_dtype_supported[SOME_DTYPES, 1]`
-# -> index 1.
-_ARG_SUPPORTED_RE = re.compile(r"_dtype_supported\s*\[([^\]]*)\]")
-_DEFINE_READ_RE = re.compile(r"(?:get_defined_\w+|is_defined)\s*\[\s*([^\],]+)")
-# Bare mentions of the same names, used to detect a helper that is passed
-# around instead of being called with literal parameters.
-_GATE_HELPER_RE = re.compile(
-    r"_(?:op_on|dtype_arg_on|dtype_arg_abi_on|dtype_arg_width_on|dtype_out_on"
-    r"|dtype_supported)\b"
-)
-_DEFINE_READER_RE = re.compile(r"\b(?:get_defined_\w+|is_defined)\b")
-
-_DEFINE_NAMES_CACHE: dict[
-    tuple[Path, tuple[SourceStamp, ...]], frozenset[str] | None
-] = {}
-
-
-def _scan_define_names(files: tuple[Path, ...]) -> frozenset[str] | None:
-    """Every define name the given Mojo sources can read.
-
-    Returns None when the sources cannot be analysed conservatively — a gate
-    called with a non-literal name or index, or a gate helper named without
-    being called — in which case the caller must keep every define.
-    """
-    names: set[str] = set()
-    for path in files:
-        if path.name == _GATE_LIBRARY_NAME:
-            continue  # the gate library declares every canonical name
-        try:
-            text = _MOJO_IMPORT_BLOCK_RE.sub("", path.read_text())
-        except OSError:
-            return None
-        gate_calls = 0
-        for operation in _OP_GATE_RE.findall(text):
-            if not operation.startswith('"'):
-                return None
-            names.add("OP")
-            gate_calls += 1
-        for pattern, template in (
-            (_ARG_GATE_RE, "DTYPE_ARG_{}"),
-            (_OUT_GATE_RE, "DTYPE_OUT_{}"),
-        ):
-            for index in pattern.findall(text):
-                if not index.strip().isdigit():
-                    return None
-                names.add(template.format(int(index)))
-                gate_calls += 1
-        for params in _ARG_SUPPORTED_RE.findall(text):
-            if "[" in params:
-                return None  # an inline list literal defeats this parse
-            parts = [part.strip() for part in params.split(",")]
-            if len(parts) == 1:
-                index = "0"
-            elif len(parts) == 2:
-                index = parts[1]
-            else:
-                return None
-            if not index.isdigit():
-                return None
-            names.add(f"DTYPE_ARG_{int(index)}")
-            gate_calls += 1
-        read_calls = 0
-        for name in _DEFINE_READ_RE.findall(text):
-            name = name.strip()
-            if not (name.startswith('"') and name.endswith('"')):
-                return None
-            names.add(name[1:-1])
-            read_calls += 1
-        # A helper that is aliased or passed around instead of being called
-        # with literal parameters escapes the scans above; refuse to guess.
-        if len(_GATE_HELPER_RE.findall(text)) != gate_calls:
-            return None
-        if len(_DEFINE_READER_RE.findall(text)) != read_calls:
-            return None
-    if "DTYPE_OUT_0" in names:
-        names.add("DTYPE_OUT")  # variant_gates spells output 0 both ways
-    return frozenset(names)
-
-
-def _define_names_read_by(source: Path) -> frozenset[str] | None:
-    """Cached `_scan_define_names` over one resolved source's closure."""
-    files, stamps = _closure_of(source)
-    key = (source, stamps)
-    if key not in _DEFINE_NAMES_CACHE:
-        _DEFINE_NAMES_CACHE[key] = _scan_define_names(files)
-    return _DEFINE_NAMES_CACHE[key]
-
-
-def _live_defines(source: Path, defines: CanonicalDefines) -> CanonicalDefines:
-    """Drop the defines no gate in `source`'s closure consumes.
-
-    A define nothing reads cannot change the generated code, so two calls
-    that differ only in such a define must share one build instead of forking
-    a second, byte-identical .so. Dropping is safe in both directions because
-    `_source_hash` covers the same closure: adding a gate for a define
-    invalidates every cached variant of that source.
-    """
-    names = _define_names_read_by(source)
-    if names is None:
-        return defines
-    return tuple(item for item in defines if item[0] in names)
 
 
 def _defines_tag(defines: CanonicalDefines | None) -> str:
@@ -770,9 +654,9 @@ class MojoExtensionLoader:
 
         This is on the path of every kernel launch, so a repeated request is
         one dict lookup and nothing else. Everything that turns a request
-        into a build identity — resolving the source path, reading its
-        dependency closure, dropping the defines it does not read — happens
-        once per distinct (file, defines) pair on the miss path below.
+        into a build identity — resolving the source path and reading its
+        dependency closure — happens once per distinct (file, defines) pair
+        on the miss path below.
         """
         unit = self._requests.get((mojo_file, defines))
         if unit is None:
@@ -781,7 +665,7 @@ class MojoExtensionLoader:
 
     def _resolve_unit(self, mojo_file: Path, defines: CanonicalDefines) -> _DefinedUnit:
         source = _resolve_mojo_file(mojo_file).resolve()
-        key = (source, _live_defines(source, defines))
+        key = (source, defines)
         with self._lock:
             unit = self._units.get(key)
             if unit is None:
