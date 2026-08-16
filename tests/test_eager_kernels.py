@@ -9415,6 +9415,196 @@ def test_fast_conv2d_refuses_autograd_in_the_forward(mojo_gpu):
         )
 
 
+# Shrunk-N copies of benchmarks/test_vision.py's CONV_SHAPES: same C/H/W/kernel
+# (so the same im2col K and GEMM N the benchmark measures), a small batch so
+# the test is cheap.
+_CONV_BENCH_SHAPES = {
+    "body_N32xC64x56x56_K64k3s1": (2, 64, 56, 56, 64, 3, 1, 1),
+    "stem_N8xC3x224x224_K64k7s2": (2, 3, 224, 224, 64, 7, 2, 3),
+}
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape_id", _CONV_BENCH_SHAPES)
+def test_fast_conv2d_tensor_core_benchmark_shapes(
+    mojo_h100: torch.device, shape_id: str, dtype: torch.dtype
+) -> None:
+    """The benchmark body/stem conv shapes, N shrunk to 2, through whichever
+    GEMM route sm_90a picks for the dtype: Bmm16 (bf16/f16, always opt-in),
+    the opt-in TF32 BMM (f32, only past the same
+    `float32_matmul_precision() != "highest"` gate `_try_tf32_mm` uses), or
+    the plain SIMT Bmm fallback (f32 at the default "highest" precision)."""
+    n, c_in, h, w, c_out, k, stride, pad = _CONV_BENCH_SHAPES[shape_id]
+    x = torch.randn(n, c_in, h, w, dtype=dtype)
+    weight = torch.randn(c_out, c_in, k, k, dtype=dtype) * 0.1
+    bias = torch.randn(c_out, dtype=dtype)
+
+    old_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        dev = torch.nn.functional.conv2d(
+            x.to(mojo_h100), weight.to(mojo_h100), bias.to(mojo_h100), stride, pad
+        ).cpu()
+    finally:
+        torch.set_float32_matmul_precision(old_precision)
+    ref = torch.nn.functional.conv2d(
+        x.float(), weight.float(), bias.float(), stride, pad
+    )
+
+    # float16 has more mantissa bits than bfloat16, so it gets the tighter
+    # bound; both are FP32-accumulated tensor-core GEMMs (see the analogous
+    # gemm16 mm/bmm tests), just rounded to a narrower output type than the
+    # k=333 case those tests calibrate against, hence the wider margin for
+    # this k up to 576. float32 goes through TF32 (or, at default precision,
+    # plain FP32) -- the same calibrated bound the mm/addmm tensor-core tests
+    # use.
+    if dtype == torch.float16:
+        atol, rtol = 3e-2, 3e-3
+    elif dtype == torch.bfloat16:
+        atol, rtol = 8e-2, 8e-2
+    else:
+        atol, rtol = 5e-2, 5e-2
+    torch.testing.assert_close(dev.float(), ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("op", ["bmm16", "1x1_bmm16"])
+def test_fast_conv2d_routes_dense_bf16_through_gemm16_bmm(
+    mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch, op: str
+) -> None:
+    """Dense (groups == 1) bf16 conv reaches the same Bmm16 kernel fast_aten_bmm
+    already builds -- both the general im2col path and the 1x1 stride-1
+    fast path that reads the NCHW input as the col matrix in place."""
+    calls = _spy_defined_native_calls(
+        monkeypatch, {("gemm16_matmul_ops.mojo", "Bmm16")}
+    )
+    n, c_in, h, w, c_out = 2, 8, 16, 16, 12
+    k, stride, pad = (3, 1, 1) if op == "bmm16" else (1, 1, 0)
+    x = torch.randn(n, c_in, h, w).to(torch.bfloat16)
+    weight = (torch.randn(c_out, c_in, k, k) * 0.1).to(torch.bfloat16)
+    dev = torch.nn.functional.conv2d(
+        x.to(mojo_h100), weight.to(mojo_h100), None, stride, pad
+    ).cpu()
+    ref = torch.nn.functional.conv2d(x.float(), weight.float(), None, stride, pad)
+
+    target = ("gemm16_matmul_ops.mojo", "Bmm16")
+    assert len(calls[target]) == 1, "dense bf16 conv did not reach the Bmm16 bridge"
+    torch.testing.assert_close(dev.float(), ref, atol=8e-2, rtol=8e-2)
+
+
+def test_fast_conv2d_tf32_bmm_is_opt_in_like_mm(
+    mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same numerics policy as the mm/bmm TF32 routes: off by default (torch's
+    `float32_matmul_precision() == "highest"`), reachable once the caller
+    opts in with `torch.set_float32_matmul_precision("high")`. The repo has
+    no separate `torch.backends.cudnn.allow_tf32`-style policy for
+    convolution, so this deliberately follows the mm gate instead."""
+    calls = _spy_defined_native_calls(
+        monkeypatch,
+        {("tf32_matmul_ops.mojo", "Tf32BmmF32"), ("matmul_ops.mojo", "Bmm")},
+    )
+    x = torch.randn(2, 8, 16, 16)
+    weight = torch.randn(12, 8, 3, 3) * 0.1
+
+    dev_default = torch.nn.functional.conv2d(
+        x.to(mojo_h100), weight.to(mojo_h100), None, 1, 1
+    ).cpu()
+    assert not calls[("tf32_matmul_ops.mojo", "Tf32BmmF32")]
+    assert len(calls[("matmul_ops.mojo", "Bmm")]) == 1
+
+    old_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        dev_tf32 = torch.nn.functional.conv2d(
+            x.to(mojo_h100), weight.to(mojo_h100), None, 1, 1
+        ).cpu()
+    finally:
+        torch.set_float32_matmul_precision(old_precision)
+    assert len(calls[("tf32_matmul_ops.mojo", "Tf32BmmF32")]) == 1
+
+    ref = torch.nn.functional.conv2d(x, weight, None, 1, 1)
+    torch.testing.assert_close(dev_default, ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(dev_tf32, ref, atol=5e-2, rtol=5e-2)
+
+
+def test_fast_conv2d_grouped_and_noncontiguous_keep_generic_route(
+    mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blast-radius guard: grouped convs and non-contiguous inputs are the
+    cases the tensor-core routes decline (grouped: no single (out_c, ckk) x
+    (ckk, cols) GEMM; non-contiguous: `_tc` materializes it back to dense
+    before either helper ever sees it, per the existing contract) -- both
+    must still land on the untouched SIMT path, not silently regress or
+    raise."""
+    calls = _spy_defined_native_calls(
+        monkeypatch,
+        {
+            ("gemm16_matmul_ops.mojo", "Bmm16"),
+            ("tf32_matmul_ops.mojo", "Tf32BmmF32"),
+            ("matmul_ops.mojo", "Matmul"),
+            ("matmul_ops.mojo", "Bmm"),
+        },
+    )
+    old_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        # Grouped conv, bf16: per (sample, group) Matmul, never Bmm16.
+        x = torch.randn(2, 8, 16, 16).to(torch.bfloat16)
+        w = torch.randn(12, 4, 3, 3).to(torch.bfloat16)
+        dev_grouped = torch.nn.functional.conv2d(
+            x.to(mojo_h100), w.to(mojo_h100), None, 1, 1, groups=2
+        ).cpu()
+        ref_grouped = torch.nn.functional.conv2d(
+            x.float(), w.float(), None, 1, 1, groups=2
+        )
+        torch.testing.assert_close(
+            dev_grouped.float(), ref_grouped, atol=8e-2, rtol=8e-2
+        )
+
+        # Non-contiguous (channels-last) f32 input, dense conv: still TF32.
+        x_nc = torch.randn(2, 8, 16, 16).to(memory_format=torch.channels_last)
+        w_nc = torch.randn(12, 8, 3, 3) * 0.1
+        dev_nc = torch.nn.functional.conv2d(
+            x_nc.to(mojo_h100), w_nc.to(mojo_h100), None, 1, 1
+        ).cpu()
+        ref_nc = torch.nn.functional.conv2d(x_nc, w_nc, None, 1, 1)
+        torch.testing.assert_close(dev_nc, ref_nc, atol=5e-2, rtol=5e-2)
+    finally:
+        torch.set_float32_matmul_precision(old_precision)
+
+    assert not calls[("gemm16_matmul_ops.mojo", "Bmm16")]
+    assert len(calls[("matmul_ops.mojo", "Matmul")]) == 2 * 2  # 2 samples x 2 groups
+    assert len(calls[("tf32_matmul_ops.mojo", "Tf32BmmF32")]) == 1
+    assert len(calls[("matmul_ops.mojo", "Bmm")]) == 0
+
+
+def test_fast_conv2d_cpu_device_matches_gpu_row_kernel(mojo_device: str) -> None:
+    """`conv_ops.mojo`'s Im2col/BiasAddChan dispatch on `ctx.api()`: the CPU
+    device (`mojo_device` here, not `mojo_gpu`) takes the scalar
+    `elementwise` path (`_im2col_scalar`/`_bias_add_chan_scalar`), unchanged
+    logic from before this file's GPU row-kernel rewrite, just extracted into
+    a named function -- this is the one test in the module that actually
+    exercises it, on both stride=1 (im2col's contiguous-read branch) and
+    stride=2 (its strided-gather branch)."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 8, 16, 16)
+    w = torch.randn(12, 8, 3, 3) * 0.1
+    b = torch.randn(12)
+    dev = torch.nn.functional.conv2d(
+        x.to(mojo_device), w.to(mojo_device), b.to(mojo_device), stride=1, padding=1
+    ).cpu()
+    ref = torch.nn.functional.conv2d(x, w, b, stride=1, padding=1)
+    torch.testing.assert_close(dev, ref, atol=1e-4, rtol=1e-4)
+
+    x2 = torch.randn(3, 3, 15, 17)
+    w2 = torch.randn(6, 3, 5, 5) * 0.1
+    dev2 = torch.nn.functional.conv2d(
+        x2.to(mojo_device), w2.to(mojo_device), None, stride=2, padding=2
+    ).cpu()
+    ref2 = torch.nn.functional.conv2d(x2, w2, None, stride=2, padding=2)
+    torch.testing.assert_close(dev2, ref2, atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize("is_causal", [True, False])
 # kv_len <= 32 exercises the library softmax's warp kernel, kv_len=64 the
 # online/block kernel.

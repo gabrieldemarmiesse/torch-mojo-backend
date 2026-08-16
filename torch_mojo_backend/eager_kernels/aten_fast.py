@@ -8664,7 +8664,123 @@ def _fast_aten_bmm_transpose_b(input, mat2):
 # (K,C,R,S) weight used as-is and NCHW output — no layout permutes.
 # Grouped convolutions slice the channel-major im2col rows and weights per
 # group with element offsets.
+#
+# The dense (groups == 1) GEMM shares one (out_c, ckk) weight matrix across
+# every sample in the batch, so it is a batched matmul with the A operand
+# broadcast (runtime batch stride 0) against a densely packed, per-sample
+# row-major im2col B. That broadcast is not a new capability: the plain SIMT
+# `Bmm` bridge below already threads it through as `a_shared`, and the
+# accepted Bmm16/Tf32BmmF32 kernels already prove their pointer arithmetic
+# for a zero A-batch-stride (`_opt_bmm_address_proof`'s `a_bstride > 0`
+# guards treat zero as the trivial case). The two helpers below reuse those
+# kernels as-is: same OP name, same dtype, same TRANSPOSE_B=False flag that
+# fast_aten_bmm already builds, so no new compiled variant exists anywhere
+# because of them -- only a new host-side call site.
 # ---------------------------------------------------------------------------
+
+
+def _try_gemm16_conv_bmm(
+    w: TorchMojoTensor,
+    a: TorchMojoTensor,
+    col_ptr: int,
+    n: int,
+    out_c: int,
+    cols: int,
+    ckk: int,
+) -> TorchMojoTensor | None:
+    """Dense conv GEMM (shared weight x per-sample im2col) via Bmm16, or
+    ``None``. ``w`` is the contiguous (out_c, ckk) weight; ``col_ptr`` is the
+    per-sample dense row-major (ckk, cols) im2col slice (or, for 1x1
+    stride-1 convs, the NCHW input reread in place)."""
+    if (
+        w._dtype not in _GEMM16_DTYPES
+        or w._device != a._device
+        or w._device.label != "gpu"
+        or w._device.api != "cuda"
+        or w._device.architecture_name != "sm_90a"
+        or min(n, out_c, cols, ckk) <= 0
+        or not _gemm16_bridge_available()
+    ):
+        return None
+    out = _alloc((n, out_c, cols), w._dtype, w._device)
+    _call_mojo(
+        _Gemm16MatmulExtension,
+        "Bmm16",
+        (
+            out._ptr,
+            w._ptr,
+            col_ptr,
+            n,
+            out_c,
+            cols,
+            ckk,
+            out_c * cols,
+            0,
+            ckk * cols,
+            0,
+            0,
+            _ctx_ptr(w._device),
+        ),
+        arg_dtypes=(w._dtype, w._dtype),
+        output_dtypes=(out._dtype,),
+        flags={"TRANSPOSE_B": False},
+        keepalive=(out, w),
+    )
+    return out
+
+
+def _try_tf32_conv_bmm(
+    w: TorchMojoTensor,
+    a: TorchMojoTensor,
+    col_ptr: int,
+    n: int,
+    out_c: int,
+    cols: int,
+    ckk: int,
+) -> TorchMojoTensor | None:
+    """Dense conv GEMM (shared weight x per-sample im2col) via the opt-in
+    TF32 BMM, or ``None``. Same numerics policy as ``_try_tf32_bmm``: TF32 is
+    off when the user asked for full FP32 (`torch.set_float32_matmul_precision
+    ("highest")`) -- the repo has no separate `torch.backends.cudnn.
+    allow_tf32`-style policy for convolution, so this follows the exact gate
+    the mm/bmm TF32 paths already use."""
+    if torch.get_float32_matmul_precision() == "highest":
+        return None
+    if (
+        w._dtype != DType.float32
+        or w._device != a._device
+        or w._device.label != "gpu"
+        or w._device.api != "cuda"
+        or w._device.architecture_name != "sm_90a"
+        or min(n, out_c, cols, ckk) <= 0
+        or not _tf32_bridge_available()
+    ):
+        return None
+    out = _alloc((n, out_c, cols), w._dtype, w._device)
+    _call_mojo(
+        _Tf32MatmulExtension,
+        "Tf32BmmF32",
+        (
+            out._ptr,
+            w._ptr,
+            col_ptr,
+            n,
+            out_c,
+            cols,
+            ckk,
+            out_c * cols,
+            0,
+            ckk * cols,
+            0,
+            0,
+            _ctx_ptr(w._device),
+        ),
+        arg_dtypes=(w._dtype, w._dtype),
+        output_dtypes=(out._dtype,),
+        flags={"TRANSPOSE_B": False},
+        keepalive=(out, w),
+    )
+    return out
 
 
 def fast_aten_convolution(
@@ -8740,29 +8856,42 @@ def fast_aten_convolution(
                     keepalive=(col, a),
                 )
                 col_ptr = col._ptr
-            out = _alloc((n, out_c, cols), a._dtype, a._device)
             if groups == 1:
-                _call_mojo(
-                    _MatmulExtension,
-                    "Bmm",
-                    (
-                        out._ptr,
-                        w._ptr,
-                        col_ptr,
-                        (n, out_c, cols, ckk, 0, 1),
-                        a._dtype.value,
-                        ctx,
-                    ),
-                    arg_dtypes=(w._dtype, a._dtype),
-                    output_dtypes=(out._dtype,),
-                    # Same define shape as every other Bmm site: the shared-A
-                    # broadcast is RUNTIME data (the trailing 1 in the params
-                    # tuple, matmul_ops._bmm_go), so naming it here would only
-                    # fork this call site onto a second .so of identical code.
-                    flags={"TRANSPOSE_B": False},
-                    keepalive=(out, w),
-                )
+                # H100 tensor cores first: bf16/f16 through the same Bmm16
+                # kernel fast_aten_bmm already builds, f32 through the same
+                # opt-in TF32 route _try_tf32_mm already gates. Both decline
+                # (return None) off sm_90a, off their dtype, or with the
+                # bridge sources missing, and the plain SIMT Bmm below is the
+                # fallback for every regime they decline, including grouped
+                # convs (untouched, handled in the `else` branch).
+                out = _try_gemm16_conv_bmm(w, a, col_ptr, n, out_c, cols, ckk)
+                if out is None:
+                    out = _try_tf32_conv_bmm(w, a, col_ptr, n, out_c, cols, ckk)
+                if out is None:
+                    out = _alloc((n, out_c, cols), a._dtype, a._device)
+                    _call_mojo(
+                        _MatmulExtension,
+                        "Bmm",
+                        (
+                            out._ptr,
+                            w._ptr,
+                            col_ptr,
+                            (n, out_c, cols, ckk, 0, 1),
+                            a._dtype.value,
+                            ctx,
+                        ),
+                        arg_dtypes=(w._dtype, a._dtype),
+                        output_dtypes=(out._dtype,),
+                        # Same define shape as every other Bmm site: the
+                        # shared-A broadcast is RUNTIME data (the trailing 1
+                        # in the params tuple, matmul_ops._bmm_go), so naming
+                        # it here would only fork this call site onto a
+                        # second .so of identical code.
+                        flags={"TRANSPOSE_B": False},
+                        keepalive=(out, w),
+                    )
             else:
+                out = _alloc((n, out_c, cols), a._dtype, a._device)
                 # Channel-major im2col rows make each group a contiguous
                 # (crs_g, cols) slice; run one offset GEMM per (sample, group).
                 crs_g = c_per_group * kh * kw
