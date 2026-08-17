@@ -66,6 +66,25 @@ comptime _V4_PTR = UnsafePointer[Scalar[_V4_DT], MutAnyOrigin]
 comptime _V4_F32_PTR = UnsafePointer[Scalar[_V4_F32], MutAnyOrigin]
 comptime _V4_BM = 128
 comptime _V4_BK = 64
+# SWIZZLE_128B is not just the default, it is a MEASURED choice, and the
+# alternative has been tried: SWIZZLE_64B halves the TMA box of an MN-major B
+# from 64 elements to 32, which is the only way to unquantize BN off multiples
+# of 64 (it admits BN in {96, 160, 224}, i.e. the CTA counts cuBLAS reaches
+# with its 128x80 and 320x128 tiles).  It was built and measured on H100 PCIe
+# at 1395 MHz and it LOSES, for a reason that is a property of the request
+# path rather than of any tile: a 64B box halves the TMA request size, which
+# ncu measures as 2.02x the L2 REQUESTS for the same bytes (3.12M -> 6.29M),
+# 1.51x the sector traffic, and in-CTA tensor-pipe occupancy 92.5% -> 80.0%.
+# On an IDENTICAL tile and grid that costs +1.4% (1024x1024x8192, 3 splits)
+# to +24.4% (1024x1024x16384, 128x192, 2 splits), and the finer tiles it
+# unlocks lose on top of that because this mainloop is operand-delivery bound:
+# measured wave fill x pipe occupancy is CONSERVED (0.675 at 128x256/96 CTAs,
+# 0.649 at 128x160/112 CTAs, 0.615 at 128x224/80 CTAs).  Because the tax is
+# not a tile-local constant, no TILE_FACTOR can carry it and no cost model can
+# safely dispatch a 64B tile.  The next lever is not the swizzle and not the
+# tile: it is CTA-cluster multicast of the operands (which is how
+# nvjet_sm90_tst_128x80_64x8_4x1 affords a 128x80 tile, and what the
+# persistent kernel in gemm16_nn_v4_kernels.mojo already does).
 comptime _V4_SWIZZLE = TensorMapSwizzle.SWIZZLE_128B
 comptime _V4_THREADS = 384
 comptime _V4_CONSUMERS = 2
@@ -1494,12 +1513,7 @@ def try_enqueue_gemm16_gemm_nn_v4(
     ctx: DeviceContext,
 ) raises -> Bool:
     comptime if _has_sm_9x():
-        if (
-            ctx.api() == "cuda"
-            and not has_bias
-            and n % 256 == 0
-            and n % 192 == 0
-        ):
+        if ctx.api() == "cuda" and not has_bias and n % 256 == 0:
             var cc_major = ctx.get_attribute(
                 DeviceAttribute.COMPUTE_CAPABILITY_MAJOR
             )
@@ -1533,7 +1547,7 @@ def try_enqueue_gemm16_gemm_nn_v4(
                     var tiles256 = blocks_m256 * (n // 256)
                     var waves256 = (tiles256 + sm_count - 1) // sm_count
                     if waves256 == 2:
-                        var tiles192 = blocks_m256 * (n // 192)
+                        var tiles192 = blocks_m256 * ((n + 191) // 192)
                         if tiles192 > 0 and tiles192 <= max_grid_x:
                             var waves192 = (tiles192 + sm_count - 1) // sm_count
                             var cost256 = _v4_wave_cost_us(
