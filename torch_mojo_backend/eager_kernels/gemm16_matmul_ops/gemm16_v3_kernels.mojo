@@ -1389,19 +1389,26 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
 # Single-matrix TN route, factored out of enqueue_gemm16_gemm's ladder below
 # so a batched TN BMM (see enqueue_gemm16_bmm) can loop this exact sequence
 # once per batch item instead of falling all the way back to the pre-wgmma
-# accepted BMM kernel. Caller guarantees TN (transpose_a, not transpose_b)
-# and no bias; every gate and tile choice here is unchanged from the ladder
-# it was pulled out of. Returns True when a route enqueued; False declines
-# with no side effect (no partial launch), so the caller's own fallback
-# stays correct.
+# accepted BMM kernel. Caller guarantees TN (transpose_a, not transpose_b);
+# every gate and tile choice here is unchanged from the ladder it was pulled
+# out of. Returns True when a route enqueued; False declines with no side
+# effect (no partial launch), so the caller's own fallback stays correct.
+# `has_bias` may be True: only the split-K rung inside
+# try_enqueue_gemm16_gemm_tn_v4 fuses a bias epilogue, and that function
+# itself returns False without trying its own non-split rungs whenever
+# has_bias is set and split-K declined -- so this wrapper's own
+# non-split fallbacks below (which never see has_bias) are only reached
+# when has_bias is False, exactly preserving their existing contract.
 # ============================================================================
 def _try_enqueue_gemm16_tn_route(
     output: _V3_PTR,
     a: _V3_PTR,
     b: _V3_PTR,
+    bias: _V3_PTR,
     m: Int,
     n: Int,
     k: Int,
+    has_bias: Bool,
     ctx: DeviceContext,
 ) raises -> Bool:
     # V4 TN (wgrad) route: split-K and narrow-tile kernels for the deep-K,
@@ -1409,8 +1416,12 @@ def _try_enqueue_gemm16_tn_route(
     # gemm16_tn_v4_kernels.mojo). The dispatcher checks its own
     # alignment/regime gates and returns False whenever it declines, so
     # every route below remains the fallback.
-    if try_enqueue_gemm16_gemm_tn_v4(output, a, b, m, n, k, ctx):
+    if try_enqueue_gemm16_gemm_tn_v4(
+        output, a, b, bias, m, n, k, has_bias, ctx
+    ):
         return True
+    if has_bias:
+        return False
     # Underfilled aligned TN regime. A smaller 64x128 output tile exposes
     # four times as many CTAs and uses half the consumer warp groups per
     # CTA. Dispatch is based on severe underfill relative to the current
@@ -1512,18 +1523,22 @@ def enqueue_gemm16_gemm(
     # helper enqueues only for regimes it fully supports (SM90, aligned
     # n/k, TMA-compatible sizes) and returns False otherwise, in which case
     # the pre-existing NT path below remains the fallback.
-    if not transpose_a and transpose_b and not has_bias:
+    if not transpose_a and transpose_b:
         # Deep-K split-K route first: the persistent kernel below keeps all
         # SMs resident but cannot parallelize over K, so an output with few
         # macro-tiles and a deep reduction leaves most of the GPU idle.
         # The helper gates itself on that regime (see
-        # gemm16_tn_v4_kernels.mojo) and returns False otherwise.
+        # gemm16_tn_v4_kernels.mojo) and returns False otherwise. It also
+        # fuses a bias epilogue into its reduce kernel (see
+        # _v4_tn_splitk_reduce), so it is tried even when has_bias is set --
+        # the persistent kernel just below never supports bias.
         if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
-            output, a, b, m, n, k, ctx
+            output, a, b, bias, m, n, k, has_bias, ctx
         ):
             return
-        if maybe_enqueue_gemm16_nt_v4(output, a, b, m, n, k, ctx):
-            return
+        if not has_bias:
+            if maybe_enqueue_gemm16_nt_v4(output, a, b, m, n, k, ctx):
+                return
     comptime if _has_sm_9x():
         if ctx.api() == "cuda":
             var cc_major = ctx.get_attribute(
@@ -1549,10 +1564,12 @@ def enqueue_gemm16_gemm(
                 # persistent kernel because a persistent CTA serializes its
                 # tiles' whole K depth -- few output macro-tiles plus deep K
                 # leaves most SMs idle.  The helper gates itself on that
-                # regime.
-                if not transpose_a and not transpose_b and not has_bias:
+                # regime, and fuses bias into its reduce epilogue, so it is
+                # tried even when has_bias is set (the persistent kernel
+                # below still declines outright on bias).
+                if not transpose_a and not transpose_b:
                     if try_enqueue_gemm16_gemm_splitk_rm_v4[False](
-                        output, a, b, m, n, k, ctx
+                        output, a, b, bias, m, n, k, has_bias, ctx
                     ):
                         return
                 if maybe_enqueue_gemm16_nn_v4(
@@ -1573,8 +1590,13 @@ def enqueue_gemm16_gemm(
                 # (gemm16_tn_v4_kernels.mojo, this file). Factored into
                 # _try_enqueue_gemm16_tn_route so enqueue_gemm16_bmm below can
                 # loop the identical single-matrix ladder once per batch item.
-                if transpose_a and not transpose_b and not has_bias:
-                    if _try_enqueue_gemm16_tn_route(output, a, b, m, n, k, ctx):
+                # Bias-carrying calls are tried too: the wrapper's split-K
+                # rung fuses bias and declines cleanly (no non-split
+                # fallback) when it cannot engage.
+                if transpose_a and not transpose_b:
+                    if _try_enqueue_gemm16_tn_route(
+                        output, a, b, bias, m, n, k, has_bias, ctx
+                    ):
                         return
                 # V4 TT route: the (COL_A, KMAJ_B) = (True, True)
                 # instantiations of the shared warp-specialized body
@@ -1584,10 +1606,12 @@ def enqueue_gemm16_gemm(
                 # buffer -- the same strides CUDA torch returns.  The
                 # dispatcher gates its own aligned regime and returns False
                 # otherwise, in which case the all-layout v2 fallback below
-                # serves the call.
-                if transpose_a and transpose_b and not has_bias:
+                # serves the call. Bias-carrying calls are tried too: the
+                # dispatcher's split-K rung fuses bias and declines cleanly
+                # (no non-split fallback) when it cannot engage.
+                if transpose_a and transpose_b:
                     if try_enqueue_gemm16_gemm_tt_v4(
-                        output, a, b, m, n, k, ctx
+                        output, a, b, bias, m, n, k, has_bias, ctx
                     ):
                         return
                 # A 64x128 tile preserves the prior aligned-NN coverage and
@@ -1833,14 +1857,16 @@ def enqueue_gemm16_bmm(
                     cc_major == 9
                     and cc_minor == 0
                     and batch_count > 0
-                    and _try_enqueue_gemm16_tn_route(output, a, b, m, n, k, ctx)
+                    and _try_enqueue_gemm16_tn_route(
+                        output, a, b, output, m, n, k, False, ctx
+                    )
                 ):
                     for bidx in range(1, batch_count):
                         var oo = output + bidx * output_batch_stride
                         var ao = a + bidx * a_batch_stride
                         var bo = b + bidx * b_batch_stride
                         if not _try_enqueue_gemm16_tn_route(
-                            oo, ao, bo, m, n, k, ctx
+                            oo, ao, bo, oo, m, n, k, False, ctx
                         ):
                             _enqueue_accepted_bf16_gemm(
                                 oo, ao, bo, oo, m, n, k, True, False, False, ctx

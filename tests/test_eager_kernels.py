@@ -7071,6 +7071,226 @@ def test_gemm16_float16_linear_backward_matches_fp32_reference(
     )
 
 
+def test_gemm16_splitk_bias_certain_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_gemm16_splitk_bias_certain` must only say True where split-K's own
+    Mojo-side gates (m % 128 == 0, n % 256 == 0, k % 64 == 0, and enough
+    output tiles relative to any sm_90a part's SM count) are guaranteed to
+    engage -- see the function's docstring for why a false positive there
+    would be a real regression, not just a missed optimization."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+
+    def tensor(shape: tuple[int, ...]) -> SimpleNamespace:
+        return SimpleNamespace(_shape=tuple(shape))
+
+    # S4's exact shape: 8 * 4 = 32 tiles, comfortably under the >=64-SM-part
+    # floor of 32, and k // 64 = 128 >= 32.
+    assert aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 8192)), tensor((8192, 1024))
+    )
+    # transpose_b reinterprets which rhs dim is k vs n, same as the sibling
+    # _gemm16_alignment_favors_split helper.
+    assert aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 8192)), tensor((1024, 8192)), transpose_b=True
+    )
+    # S1's exact shape: aligned, but 32 * 16 = 512 tiles -- split-K would
+    # decline at the SM-count gate on every real GPU, so this must be False.
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 4096))
+    )
+    # n not a multiple of 256 (only tile width the split-K kernels come in).
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 8192)), tensor((8192, 128))
+    )
+    # m not a multiple of 128.
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((900, 8192)), tensor((8192, 1024))
+    )
+    # k shallower than the depth floor (k // 64 < 32).
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 1024)), tensor((1024, 1024))
+    )
+    # k mismatch between lhs and rhs.
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 8192)), tensor((4096, 1024))
+    )
+    # S5's awkward shape: nowhere near aligned.
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((357, 333)), tensor((333, 789))
+    )
+
+
+def test_addmm_tries_fused_splitk_before_compose_for_deep_k_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shape `_gemm16_splitk_bias_certain` accepts (S4-like: deep K, few
+    output tiles) must try the single fused bias-aware gemm16 call FIRST,
+    never the bias-free-mm-then-add composition -- that composition is what
+    the split-K reduce epilogue's bias fusion exists to avoid paying for."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    def tensor(shape: tuple[int, ...]) -> SimpleNamespace:
+        return SimpleNamespace(_shape=tuple(shape))
+
+    lhs, rhs, bias = tensor((1024, 8192)), tensor((8192, 1024)), object()
+    fused_result = object()
+    fused_calls = []
+
+    def try_gemm(*args: object, **kwargs: object) -> object:
+        fused_calls.append((args, kwargs))
+        return fused_result
+
+    def fail_add(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError(
+            "a split-K-certain shape should never fall back to composing"
+        )
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", fail_add)
+
+    assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is fused_result
+    assert fused_calls == [((lhs, rhs, bias), {})]
+
+
+def test_addmm_still_composes_for_many_tile_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A large, many-output-tile shape (S1-like: aligned but split-K always
+    declines it) must still take the existing compose-then-add path, not the
+    new fused-first attempt -- the fused call there would fall through
+    split-K straight to the slow accepted kernel (see
+    _gemm16_splitk_bias_certain's docstring). Regression guard for exactly
+    the failure mode a too-loose predicate would cause."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    def tensor(shape: tuple[int, ...]) -> SimpleNamespace:
+        return SimpleNamespace(_shape=tuple(shape))
+
+    lhs, rhs, bias = tensor((4096, 4096)), tensor((4096, 4096)), object()
+    mm_result, biased_result = object(), object()
+    gemm_calls = []
+    add_calls = []
+
+    def try_gemm(*args: object, **kwargs: object) -> object:
+        gemm_calls.append((args, kwargs))
+        return mm_result
+
+    def try_add(*args: object, **kwargs: object) -> object:
+        add_calls.append((args, kwargs))
+        return biased_result
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", try_add)
+
+    assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is biased_result
+    # The bias-free mm is called with no bias argument -- the fused call
+    # (which would carry `bias` as a third positional arg) is never tried.
+    assert gemm_calls == [((lhs, rhs), {})]
+    assert add_calls == [((mm_result, bias), {})]
+
+
+@pytest.mark.parametrize("layout", _GEMM16_LAYOUTS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm16_splitk_bias_epilogue_matches_fp32_reference(
+    mojo_h100: torch.device, layout: str, dtype: torch.dtype
+) -> None:
+    """End-to-end correctness of the fused split-K + bias epilogue on the
+    deep-K shape it targets (S4's dimensions), across every operand layout
+    and both 16-bit dtypes the gemm16 family serves."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 1024, 1024, 8192  # S4: deep K, few output tiles -- split-K regime
+    a, b = _gemm16_operands(layout, m, n, k, dtype, mojo_h100)
+    bias = torch.randn(n).to(dtype).to(mojo_h100)
+
+    out = aten_fast._try_gemm16_mm(a, b, bias)
+    assert out is not None, "the fused bias-aware gemm16 call declined"
+    assert out.dtype == dtype
+    assert tuple(out.shape) == (m, n)
+
+    expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
+    torch.testing.assert_close(out.cpu().float(), expected, atol=0.15, rtol=5e-3)
+
+
+@pytest.mark.parametrize(
+    "k",
+    [
+        1984,  # not a multiple of 64: split-K's own BK tiling gate declines
+        2048,  # k // 64 == 32, exactly the depth-floor boundary
+        2112,  # 64-aligned but one BK-tile past the boundary (ragged chunking)
+        8256,  # 64-aligned, deep: one BK-tile past S4's own k = 8192
+    ],
+)
+def test_gemm16_splitk_bias_epilogue_k_boundaries(
+    mojo_h100: torch.device, k: int
+) -> None:
+    """Bias correctness right around split-K's depth-floor and BK-tiling
+    boundaries -- both the engaged-split-K path and the decline-to-fallback
+    path (k=1984) must still add the bias exactly once, correctly."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n = 1024, 1024
+    a, b = _gemm16_operands("NN", m, n, k, torch.bfloat16, mojo_h100)
+    bias = torch.randn(n).to(torch.bfloat16).to(mojo_h100)
+
+    out = aten_fast._try_gemm16_mm(a, b, bias)
+    assert out is not None
+
+    expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
+    torch.testing.assert_close(out.cpu().float(), expected, atol=0.2, rtol=8e-3)
+
+
+def test_gemm16_splitk_bias_epilogue_rejects_misaligned_bias(
+    mojo_h100: torch.device,
+) -> None:
+    """The reduce epilogue reads bias 4-wide (16B), so a bias view whose
+    element offset breaks 16B alignment (contiguous, but not the start of
+    its allocation) must make the split-K route decline rather than issue
+    a misaligned vector load: the split-K gate checks `Int(bias) % 16`
+    whenever has_bias is set. This only exercises the safe-decline path
+    (the accepted kernel picks it up instead); the result must still be
+    correct either way."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 1024, 1024, 8192  # split-K-certain shape
+    a, b = _gemm16_operands("NN", m, n, k, torch.bfloat16, mojo_h100)
+    # Slice 5 elements (10 bytes) into a wider buffer: contiguous, but not
+    # 16B-aligned.
+    wide = torch.randn(n + 5).to(torch.bfloat16).to(mojo_h100)
+    bias = wide[5:]
+    assert bias.data_ptr() % 16 != 0
+
+    out = aten_fast._try_gemm16_mm(a, b, bias)
+    assert out is not None
+
+    expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
+    torch.testing.assert_close(out.cpu().float(), expected, atol=0.2, rtol=8e-3)
+
+
+def test_addmm_alpha_beta_scaling_declines_the_fused_fast_path(
+    mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """alpha/beta != 1 is unsupported by eager-mode addmm entirely (no
+    alpha/beta scaling anywhere in fast_aten_addmm, fused split-K included,
+    and eager mode has no graph fallback -- see AGENTS.md). A shape that
+    `_gemm16_splitk_bias_certain` would otherwise accept must still decline
+    cleanly (NotImplementedError) rather than the new fused-first attempt
+    silently computing an unscaled (wrong) result."""
+    calls = _spy_defined_native_calls(
+        monkeypatch, {("gemm16_matmul_ops.mojo", "Gemm16")}
+    )
+    m, n, k = 1024, 1024, 8192  # split-K-certain shape
+    a, b = _gemm16_operands("NN", m, n, k, torch.bfloat16, mojo_h100)
+    bias = torch.randn(n).to(torch.bfloat16).to(mojo_h100)
+
+    with pytest.raises(NotImplementedError):
+        torch.addmm(bias, a, b, beta=0.5, alpha=2.0)
+    assert not calls[("gemm16_matmul_ops.mojo", "Gemm16")]
+
+
 @pytest.mark.parametrize(
     "invalid_case",
     [

@@ -550,6 +550,16 @@ comptime _V4_RED_GROUPS = 4
 comptime _V4_RED_SPAN = _V4_RED_THREADS * _V4_RED_GROUPS * 4
 
 
+# `bias` is an (n,)-row vector broadcast over every one of the `m` output
+# rows; `output`/`ws` are addressed as the flattened (m, n) row-major
+# buffer, so column `i % n` is the bias index for flat offset `i`. Callers
+# that engage the bias epilogue always satisfy n % 256 == 0 (the only tile
+# width the split-K kernels come in -- see the two `try_enqueue_*` call
+# sites that pass has_bias=True), so n is always a multiple of 4 and every
+# vec4 group's flat offset is itself a multiple of 4: `base % n` therefore
+# never straddles a row boundary, and a 4-element bias read is always a
+# contiguous, correctly-ordered slice of one row. has_bias=False (every
+# pre-existing caller) skips the extra loads/adds entirely.
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_RED_THREADS))
 )
@@ -557,13 +567,18 @@ comptime _V4_RED_SPAN = _V4_RED_THREADS * _V4_RED_GROUPS * 4
 def _v4_tn_splitk_reduce(
     output: _V4_PTR,
     ws: _V4_F32_PTR,
+    bias: _V4_PTR,
     count_arg: Int64,
     splits_arg: Int64,
+    n_arg: Int64,
+    has_bias_arg: Int64,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
     var count = Int(count_arg)
     var splits = Int(splits_arg)
+    var n = Int(n_arg)
+    var has_bias = has_bias_arg != 0
     var base = Int(block_idx.x) * _V4_RED_SPAN + Int(thread_idx.x) * 4
     if base + (_V4_RED_GROUPS - 1) * _V4_RED_THREADS * 4 + 4 <= count:
         # Fast path: all four chains fully in range.
@@ -578,6 +593,12 @@ def _v4_tn_splitk_reduce(
                 acc[g] += ws.load[width=4, alignment=16](
                     slice_base + g * _V4_RED_THREADS * 4
                 )
+        if has_bias:
+            comptime for g in range(_V4_RED_GROUPS):
+                var idx = base + g * _V4_RED_THREADS * 4
+                acc[g] += bias.load[width=4, alignment=8](idx % n).cast[
+                    _V4_F32
+                ]()
         comptime for g in range(_V4_RED_GROUPS):
             output.store[alignment=8](
                 base + g * _V4_RED_THREADS * 4, acc[g].cast[_V4_DT]()
@@ -589,12 +610,18 @@ def _v4_tn_splitk_reduce(
                 var acc4 = ws.load[width=4, alignment=16](i)
                 for s in range(1, splits):
                     acc4 += ws.load[width=4, alignment=16](s * count + i)
+                if has_bias:
+                    acc4 += bias.load[width=4, alignment=8](i % n).cast[
+                        _V4_F32
+                    ]()
                 output.store[alignment=8](i, acc4.cast[_V4_DT]())
             else:
                 while i < count:
                     var acc1 = ws[i]
                     for s in range(1, splits):
                         acc1 += ws[s * count + i]
+                    if has_bias:
+                        acc1 += bias[i % n].cast[_V4_F32]()
                     output[i] = acc1.cast[_V4_DT]()
                     i += 1
 
@@ -696,11 +723,13 @@ def _v4_enqueue_splitk_m128n256[
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
     grid_x: Int,
     splits: Int,
+    has_bias: Bool,
     ctx: DeviceContext,
 ) raises:
     var total_tiles = k // _V4_BK
@@ -759,8 +788,11 @@ def _v4_enqueue_splitk_m128n256[
     ctx.enqueue_function[_v4_tn_splitk_reduce](
         output,
         ws_ptr,
+        bias,
         Int64(count),
         Int64(splits),
+        Int64(n),
+        Int64(1) if has_bias else Int64(0),
         grid_dim=((count + _V4_RED_SPAN - 1) // _V4_RED_SPAN,),
         block_dim=(_V4_RED_THREADS,),
     )
@@ -864,15 +896,23 @@ def _v4_enqueue_tt_direct_m64n128(
 
 # ============================================================================
 # Regime dispatch.  Returns True when a v4 kernel handled the call.
-# Caller guarantees: TN (transpose_a and not transpose_b), no bias.
+# Caller guarantees: TN (transpose_a and not transpose_b). `has_bias` may be
+# True: only the split-K rung below fuses a bias epilogue (see
+# _v4_tn_splitk_reduce), so a bias-carrying call that reaches this function
+# but declines split-K (e.g. too few output tiles for a >=2-way split)
+# returns False without trying the persistent/narrow-tile rungs, none of
+# which support bias -- the caller's own accepted-kernel fallback handles
+# it instead, exactly as it did before this function existed.
 # ============================================================================
 def try_enqueue_gemm16_gemm_tn_v4(
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
+    has_bias: Bool,
     ctx: DeviceContext,
 ) raises -> Bool:
     comptime if not _has_sm_9x():
@@ -894,6 +934,9 @@ def try_enqueue_gemm16_gemm_tn_v4(
         or Int(output) % 16 != 0
         or Int(a) % 16 != 0
         or Int(b) % 16 != 0
+        # has_bias only: the reduce epilogue reads bias 4-wide
+        # (_v4_tn_splitk_reduce), so its base must be 16B-aligned too.
+        or (has_bias and Int(bias) % 16 != 0)
         or m > 2_147_483_647
         or n > 2_147_483_647
         or k > 2_147_483_647
@@ -922,9 +965,22 @@ def try_enqueue_gemm16_gemm_tn_v4(
             if m * n <= _V4_MAX_WS_BYTES // 4 // max(splits, 1):
                 if splits >= 2:
                     _v4_enqueue_splitk_m128n256(
-                        output, a, b, m, n, k, tiles, splits, ctx
+                        output,
+                        a,
+                        b,
+                        bias,
+                        m,
+                        n,
+                        k,
+                        tiles,
+                        splits,
+                        has_bias,
+                        ctx,
                     )
                     return True
+
+    if has_bias:
+        return False
 
     # Multi-wave regime: the persistent clustered body (shared with NN)
     # in its col-major-A mode.  Gated inside the helper; it declines
@@ -984,7 +1040,11 @@ def try_enqueue_gemm16_gemm_tn_v4(
 
 # ============================================================================
 # TT regime dispatch.  Returns True when a v4 kernel handled the call.
-# Caller guarantees: TT (transpose_a and transpose_b), no bias.
+# Caller guarantees: TT (transpose_a and transpose_b). `has_bias` may be
+# True: only the split-K rung fuses a bias epilogue (see
+# _v4_tn_splitk_reduce); a bias-carrying call that reaches this function but
+# declines split-K returns False immediately rather than trying the
+# persistent/small-tile rungs, which do not support bias.
 #
 # TT is served by the (COL_A, KMAJ_B) = (True, True) instantiations of the
 # shared body -- TN's col-major A combined with NT's K-major B -- so C lands
@@ -1000,9 +1060,11 @@ def try_enqueue_gemm16_gemm_tt_v4(
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
+    has_bias: Bool,
     ctx: DeviceContext,
 ) raises -> Bool:
     comptime if not _has_sm_9x():
@@ -1027,6 +1089,9 @@ def try_enqueue_gemm16_gemm_tt_v4(
         or Int(output) % 16 != 0
         or Int(a) % 16 != 0
         or Int(b) % 16 != 0
+        # has_bias only: the reduce epilogue reads bias 4-wide
+        # (_v4_tn_splitk_reduce), so its base must be 16B-aligned too.
+        or (has_bias and Int(bias) % 16 != 0)
         or m > 2_147_483_647
         or n > 2_147_483_647
         or k > 2_147_483_647
@@ -1076,9 +1141,12 @@ def try_enqueue_gemm16_gemm_tt_v4(
                 and m * n <= _V4_MAX_WS_BYTES // 4 // splits
             ):
                 _v4_enqueue_splitk_m128n256[True, True](
-                    output, a, b, m, n, k, tiles, splits, ctx
+                    output, a, b, bias, m, n, k, tiles, splits, has_bias, ctx
                 )
                 return True
+
+    if has_bias:
+        return False
 
     # Multi-wave regimes: persistent clustered body (shared with NN and TN)
     # in its col-major-A + K-major-B + ragged-n mode (any_wave=True because
@@ -1178,9 +1246,11 @@ def try_enqueue_gemm16_gemm_splitk_rm_v4[
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
+    has_bias: Bool,
     ctx: DeviceContext,
 ) raises -> Bool:
     comptime if not _has_sm_9x():
@@ -1204,6 +1274,9 @@ def try_enqueue_gemm16_gemm_splitk_rm_v4[
         or Int(output) % 16 != 0
         or Int(a) % 16 != 0
         or Int(b) % 16 != 0
+        # has_bias only: the reduce epilogue reads bias 4-wide
+        # (_v4_tn_splitk_reduce), so its base must be 16B-aligned too.
+        or (has_bias and Int(bias) % 16 != 0)
         or m > 2_147_483_647
         or n > 2_147_483_647
         or k > 2_147_483_647
@@ -1244,6 +1317,6 @@ def try_enqueue_gemm16_gemm_splitk_rm_v4[
     if m * n > _V4_MAX_WS_BYTES // 4 // splits:
         return False
     _v4_enqueue_splitk_m128n256[False, KMAJ_B](
-        output, a, b, m, n, k, tiles, splits, ctx
+        output, a, b, bias, m, n, k, tiles, splits, has_bias, ctx
     )
     return True
