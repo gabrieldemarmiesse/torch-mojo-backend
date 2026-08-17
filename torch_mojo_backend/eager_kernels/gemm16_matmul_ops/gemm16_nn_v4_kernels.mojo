@@ -278,6 +278,22 @@ def _v4_nn_persistent_ws[
     var n = Int(n_arg)
     var k = Int(k_arg)
     comptime if _is_sm_9x():
+        # Same guard as _v4_tn_ws_body in gemm16_tn_v4_kernels.mojo: a wide
+        # consumer count built off bm >= 256 asks warpgroup_reg_alloc for
+        # more registers per thread than the sm_90 launch-bound cap leaves
+        # it, which builds clean (ptxas accepts the SASS) but HANGS the GPU
+        # at runtime instead of failing loudly. Every instantiation here is
+        # driven by the hardcoded _V4_PROD_BM = 128 (see above), so this is
+        # a consistency guard, not a live constraint -- it exists so a
+        # future caller that widens bm fails at compile time instead of at
+        # a silent runtime hang.
+        comptime assert bm < 256, (
+            "gemm16 persistent body: bm >= 256 is not supported -- it"
+            " builds clean but HANGS the GPU at runtime"
+            " (warpgroup_reg_alloc exceeds the sm_90 launch-bound register"
+            " cap). See _v4_tn_ws_body's matching guard in"
+            " gemm16_tn_v4_kernels.mojo."
+        )
         comptime A_LAYOUT = tile_layout_mn_major[
             _V4_DT, bm, _V4_BK, _V4_SWIZZLE
         ]() if col_a else tile_layout_k_major[_V4_DT, bm, _V4_BK, _V4_SWIZZLE]()

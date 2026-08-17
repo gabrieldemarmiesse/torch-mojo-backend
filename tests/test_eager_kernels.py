@@ -7100,40 +7100,55 @@ def test_gemm16_splitk_bias_certain_helper(monkeypatch: pytest.MonkeyPatch) -> N
     def tensor(shape: tuple[int, ...]) -> SimpleNamespace:
         return SimpleNamespace(_shape=tuple(shape))
 
+    aligned_bias = SimpleNamespace(_ptr=1024)  # 16-byte-aligned
+    misaligned_bias = SimpleNamespace(_ptr=1026)  # NOT 16-byte-aligned
+
     # S4's exact shape: 8 * 4 = 32 tiles, comfortably under the >=64-SM-part
     # floor of 32, and k // 64 = 128 >= 32.
     assert aten_fast._gemm16_splitk_bias_certain(
-        tensor((1024, 8192)), tensor((8192, 1024))
+        tensor((1024, 8192)), tensor((8192, 1024)), aligned_bias
     )
     # transpose_b reinterprets which rhs dim is k vs n, same as the sibling
     # _gemm16_alignment_favors_split helper.
     assert aten_fast._gemm16_splitk_bias_certain(
-        tensor((1024, 8192)), tensor((1024, 8192)), transpose_b=True
+        tensor((1024, 8192)), tensor((1024, 8192)), aligned_bias, transpose_b=True
+    )
+    # Same shape as the first assertion, but a bias whose runtime pointer is
+    # not 16-byte aligned (e.g. an offset view into a wider buffer): split-K's
+    # own reduce epilogue reads bias 4-wide and its host gate declines with
+    # `Int(bias) % 16 != 0` (see gemm16_tn_v4_kernels.mojo), so certain must
+    # flip to False even though the shape alone is identical to a True case
+    # above. Regression guard for the bug this predicate used to have: it
+    # never received bias at all, so it said True unconditionally here and
+    # the fused call silently fell to the slow accepted kernel when split-K
+    # declined underneath it (reproduced on H100 at m=128, n=256, k=8192).
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 8192)), tensor((8192, 1024)), misaligned_bias
     )
     # S1's exact shape: aligned, but 32 * 16 = 512 tiles -- split-K would
     # decline at the SM-count gate on every real GPU, so this must be False.
     assert not aten_fast._gemm16_splitk_bias_certain(
-        tensor((4096, 4096)), tensor((4096, 4096))
+        tensor((4096, 4096)), tensor((4096, 4096)), aligned_bias
     )
     # n not a multiple of 256 (only tile width the split-K kernels come in).
     assert not aten_fast._gemm16_splitk_bias_certain(
-        tensor((1024, 8192)), tensor((8192, 128))
+        tensor((1024, 8192)), tensor((8192, 128)), aligned_bias
     )
     # m not a multiple of 128.
     assert not aten_fast._gemm16_splitk_bias_certain(
-        tensor((900, 8192)), tensor((8192, 1024))
+        tensor((900, 8192)), tensor((8192, 1024)), aligned_bias
     )
     # k shallower than the depth floor (k // 64 < 32).
     assert not aten_fast._gemm16_splitk_bias_certain(
-        tensor((1024, 1024)), tensor((1024, 1024))
+        tensor((1024, 1024)), tensor((1024, 1024)), aligned_bias
     )
     # k mismatch between lhs and rhs.
     assert not aten_fast._gemm16_splitk_bias_certain(
-        tensor((1024, 8192)), tensor((4096, 1024))
+        tensor((1024, 8192)), tensor((4096, 1024)), aligned_bias
     )
     # S5's awkward shape: nowhere near aligned.
     assert not aten_fast._gemm16_splitk_bias_certain(
-        tensor((357, 333)), tensor((333, 789))
+        tensor((357, 333)), tensor((333, 789)), aligned_bias
     )
 
 
@@ -7159,55 +7174,71 @@ def test_gemm16_persistent_bias_certain_helper(monkeypatch: pytest.MonkeyPatch) 
             _device=h100,
         )
 
+    bias = SimpleNamespace(_ptr=1024)  # 16-byte-aligned; alignment is moot here
+
     # S1's exact shape, NN: both row-major, both >= 2048, both 256-aligned.
     assert aten_fast._gemm16_persistent_bias_certain(
-        tensor((4096, 4096)), tensor((4096, 4096))
+        tensor((4096, 4096)), tensor((4096, 4096)), bias
     )
     # TN: A physically transposed, B row-major -- still covered.
     assert aten_fast._gemm16_persistent_bias_certain(
-        tensor((4096, 4096), transposed=True), tensor((4096, 4096))
+        tensor((4096, 4096), transposed=True), tensor((4096, 4096)), bias
+    )
+    # Unlike _gemm16_splitk_bias_certain, a 16-byte-MISALIGNED bias pointer
+    # must NOT flip this to False: the persistent body's fused-bias epilogue
+    # (_v4_nn_persistent_ws in gemm16_nn_v4_kernels.mojo) reads bias through
+    # two plain scalar element loads, and its host dispatchers
+    # (maybe_enqueue_gemm16_nn_v4 / maybe_enqueue_gemm16_tn_v4_persistent)
+    # never gate on `Int(bias) % 16` -- any bf16/f16 pointer is 2-byte
+    # aligned regardless of element offset, which is all a scalar load
+    # needs. Asserting True here pins that the two predicates deliberately
+    # check different things for their different epilogues.
+    assert aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 4096)), SimpleNamespace(_ptr=1026)
     )
     # NT: B physically transposed -- the persistent kernel's OWN dedicated
     # NT family (gemm16_nt_v4_kernels.mojo) is untouched by this
     # engagement, so this must be False.
     assert not aten_fast._gemm16_persistent_bias_certain(
-        tensor((4096, 4096)), tensor((4096, 4096), transposed=True)
+        tensor((4096, 4096)), tensor((4096, 4096), transposed=True), bias
     )
     # TT: both transposed -- also untouched.
     assert not aten_fast._gemm16_persistent_bias_certain(
-        tensor((4096, 4096), transposed=True), tensor((4096, 4096), transposed=True)
+        tensor((4096, 4096), transposed=True),
+        tensor((4096, 4096), transposed=True),
+        bias,
     )
     # transpose_b reinterprets which operand's physical layout is "B",
     # same convention as the sibling _gemm16_splitk_bias_certain helper:
     # a row-major weight read with transpose_b=True is effectively NT
     # (see _try_gemm16_linear), so this must be False too.
     assert not aten_fast._gemm16_persistent_bias_certain(
-        tensor((4096, 4096)), tensor((4096, 4096)), transpose_b=True
+        tensor((4096, 4096)), tensor((4096, 4096)), bias, transpose_b=True
     )
     # n below the 2048 floor: W1-class shape the direct 128x192 kernel
     # (no bias epilogue) may win instead of persistent.
     assert not aten_fast._gemm16_persistent_bias_certain(
-        tensor((4096, 4096)), tensor((4096, 1792))
+        tensor((4096, 4096)), tensor((4096, 1792)), bias
     )
     # m below the 2048 floor.
     assert not aten_fast._gemm16_persistent_bias_certain(
-        tensor((1024, 4096)), tensor((4096, 4096))
+        tensor((1024, 4096)), tensor((4096, 4096)), bias
     )
     # n not 256-aligned.
     assert not aten_fast._gemm16_persistent_bias_certain(
-        tensor((4096, 4096)), tensor((4096, 2112))
+        tensor((4096, 4096)), tensor((4096, 2112)), bias
     )
     # k not 64-aligned.
     assert not aten_fast._gemm16_persistent_bias_certain(
-        tensor((4096, 4033)), tensor((4033, 4096))
+        tensor((4096, 4033)), tensor((4033, 4096)), bias
     )
     # k mismatch between lhs and rhs.
     assert not aten_fast._gemm16_persistent_bias_certain(
-        tensor((4096, 4096)), tensor((2048, 4096))
+        tensor((4096, 4096)), tensor((2048, 4096)), bias
     )
     # S5's awkward shape: nowhere near the floor.
     assert not aten_fast._gemm16_persistent_bias_certain(
-        tensor((357, 333)), tensor((333, 789))
+        tensor((357, 333)), tensor((333, 789)), bias
     )
 
 
@@ -7223,7 +7254,13 @@ def test_addmm_tries_fused_splitk_before_compose_for_deep_k_shapes(
     def tensor(shape: tuple[int, ...]) -> SimpleNamespace:
         return SimpleNamespace(_shape=tuple(shape))
 
-    lhs, rhs, bias = tensor((1024, 8192)), tensor((8192, 1024)), object()
+    # A 16-byte-aligned pointer: this shape must clear the bias-certain gate,
+    # so the placeholder needs the `_ptr` attribute the predicate now reads.
+    lhs, rhs, bias = (
+        tensor((1024, 8192)),
+        tensor((8192, 1024)),
+        SimpleNamespace(_ptr=1024),
+    )
     fused_result = object()
     fused_calls = []
 
@@ -7646,6 +7683,71 @@ def test_gemm16_splitk_bias_epilogue_rejects_misaligned_bias(
 
     expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
     torch.testing.assert_close(out.cpu().float(), expected, atol=0.2, rtol=8e-3)
+
+
+def test_addmm_bias_certain_predicate_matches_dispatch_at_repro_shape(
+    mojo_h100: torch.device,
+) -> None:
+    """End-to-end regression for the bias-certainty predicate gap (PR #395
+    review): `_gemm16_splitk_bias_certain` used to never receive the bias
+    tensor at all, so it said True unconditionally -- including for a bias
+    whose runtime pointer breaks the 16-byte alignment split-K's reduce
+    epilogue requires, silently dropping `torch.addmm` to the slow accepted
+    kernel while still reporting "certain". This pins both directions at
+    the exact shape that reproduced it on H100 (m=128, n=256, k=8192):
+
+    - An aligned bias must say certain==True AND `torch.addmm` must
+      actually launch the fused split-K kernels it promises (the NN
+      workspace pass and the shared bias-fusing reduce kernel), not just
+      happen to compute the right numbers through some other route.
+    - An otherwise-identical offset-view bias whose pointer is NOT 16-byte
+      aligned must say certain==False, and the end-to-end result must
+      still be correct through whichever route it falls back to.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 128, 256, 8192  # S4-like: split-K-certain, few output tiles
+    a, b = _gemm16_operands("NN", m, n, k, torch.bfloat16, mojo_h100)
+
+    aligned_bias = torch.randn(n).to(torch.bfloat16).to(mojo_h100)
+    assert aligned_bias.data_ptr() % 16 == 0
+    assert aten_fast._gemm16_splitk_bias_certain(a, b, aligned_bias)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = torch.addmm(aligned_bias, a, b)
+        torch.accelerator.synchronize()
+    names = [
+        evt.name
+        for evt in prof.events()
+        if str(evt.device_type) in ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+    ]
+    # The wave-fill cost model picks between the 128x256 and 128x128 NN
+    # split-K workspace tiles at runtime -- either satisfies "split-K
+    # engaged" -- but the bias fusion always lands in the one shared reduce
+    # kernel (_v4_tn_splitk_reduce, named "tn" regardless of the caller's
+    # actual layout; see gemm16_tn_v4_kernels.mojo).
+    assert any("bf16_gemm_nn_v4_splitk" in name for name in names), names
+    assert any("bf16_gemm_tn_v4_splitk_reduce" in name for name in names), names
+
+    expected = a.cpu().float() @ b.cpu().float() + aligned_bias.cpu().float()
+    torch.testing.assert_close(out.cpu().float(), expected, atol=0.2, rtol=8e-3)
+
+    # Same shape, an offset view 10 bytes into a wider buffer: contiguous
+    # and otherwise identical, but not 16-byte aligned.
+    wide = torch.randn(n + 5).to(torch.bfloat16).to(mojo_h100)
+    misaligned_bias = wide[5:]
+    assert misaligned_bias.data_ptr() % 16 != 0
+    assert not aten_fast._gemm16_splitk_bias_certain(a, b, misaligned_bias)
+
+    out_misaligned = torch.addmm(misaligned_bias, a, b)
+    expected_misaligned = (
+        a.cpu().float() @ b.cpu().float() + misaligned_bias.cpu().float()
+    )
+    torch.testing.assert_close(
+        out_misaligned.cpu().float(), expected_misaligned, atol=0.2, rtol=8e-3
+    )
 
 
 def test_addmm_alpha_beta_scaling_declines_the_fused_fast_path(
