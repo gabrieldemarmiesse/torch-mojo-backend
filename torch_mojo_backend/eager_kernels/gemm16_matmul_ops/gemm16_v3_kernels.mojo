@@ -44,9 +44,9 @@ from gemm16_kernels import (
     enqueue_gemm16_gemm as _enqueue_accepted_bf16_gemm,
 )
 from gemm16_bmm_v5_kernels import try_enqueue_bmm16_nn_batched
-from gemm16_nn_v4_kernels import maybe_enqueue_gemm16_nn_v4
 from gemm16_nt_v4_kernels import maybe_enqueue_gemm16_nt_v4
 from gemm16_tn_v4_kernels import (
+    try_enqueue_gemm16_gemm_nn_v4,
     try_enqueue_gemm16_gemm_splitk_rm_v4,
     try_enqueue_gemm16_gemm_tn_v4,
     try_enqueue_gemm16_gemm_tt_v4,
@@ -1572,19 +1572,15 @@ def enqueue_gemm16_gemm(
                         output, a, b, bias, m, n, k, has_bias, ctx
                     ):
                         return
-                if maybe_enqueue_gemm16_nn_v4(
-                    output,
-                    a,
-                    b,
-                    m,
-                    n,
-                    k,
-                    transpose_a,
-                    transpose_b,
-                    has_bias,
-                    ctx,
-                ):
-                    return
+                # NN (dgrad) route: persistent 128x256 kernel, or -- for
+                # the 2-wave underfilled regime -- the direct 128x192 tile
+                # the wave-fill cost model picks instead (see
+                # try_enqueue_gemm16_gemm_nn_v4, gemm16_tn_v4_kernels.mojo).
+                if not transpose_a and not transpose_b:
+                    if try_enqueue_gemm16_gemm_nn_v4(
+                        output, a, b, bias, m, n, k, has_bias, ctx
+                    ):
+                        return
                 # TN (wgrad) route ladder: split-K/narrow-tile v4, then the
                 # underfilled small-tile and large-tile v3 wgmma kernels
                 # (gemm16_tn_v4_kernels.mojo, this file). Factored into

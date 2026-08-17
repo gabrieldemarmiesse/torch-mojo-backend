@@ -54,6 +54,7 @@ from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from gemm16_nn_v4_kernels import (
     _v4_mma_tile,
+    maybe_enqueue_gemm16_nn_v4,
     maybe_enqueue_gemm16_tn_v4_persistent,
 )
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
@@ -73,6 +74,116 @@ comptime _V4_CONSUMERS = 2
 comptime _V4_MIN_CHUNK_TILES = 16
 comptime _V4_MAX_SPLITS = 8
 comptime _V4_MAX_WS_BYTES = 256 * 1024 * 1024
+
+
+# Register budget per consumer thread, by consumer warp-group count
+# (CONSUMERS = BM // 64).  65536 registers/SM total, the producer warp group
+# holds 128 x 24 of them, and the accumulator alone costs BN/2 registers per
+# thread (CFRAG = 64 * BN // 128) -- see NOTES.md (deep-K wave-fill
+# engagement) for the full feasibility table this was measured against.
+# CONSUMERS 1 and 2 are pinned to 232: every pre-existing instantiation of
+# this body (BM=64/CONSUMERS=1 -- `_v4_tt_direct_m64n128_s3` -- and every
+# BM=128/CONSUMERS=2 kernel) already hardcoded `warpgroup_reg_alloc[232]`,
+# and this table must keep producing that exact value for both so existing
+# kernels stay codegen-identical (verified with
+# scripts/compare_kernel_asm.py --accelerator sm_90a).  CONSUMERS >= 3
+# (BM >= 192) is not instantiated by any production dispatcher today; 160 is
+# carried over from the persistent kernel's own 3-consumer budget
+# (gemm16_nn_v4_kernels.mojo) as a plausible value, not one measured for
+# THIS body.  CONSUMERS == 4 (BM == 256) is unreachable: the `constrained`
+# check in `_v4_tn_ws_body` below rejects it at compile time before this
+# value would ever be used -- see that check for why (a measured GPU hang).
+@always_inline
+def _v4_wave_reg_alloc[CONSUMERS: Int]() -> Int:
+    comptime if CONSUMERS <= 2:
+        return 232
+    comptime if CONSUMERS == 3:
+        return 160
+    return 120
+
+
+# Kernel-symbol suffix for a fused-bias direct-store instantiation, so
+# profiles and scripts/compare_kernel_asm.py's by-name pairing can tell it
+# apart from the (pre-existing, unsuffixed) unbiased kernel.
+@always_inline
+def _v4_bias_tag[HAS_BIAS: Bool]() -> StaticString:
+    comptime if HAS_BIAS:
+        return "_bias"
+    return ""
+
+
+# ============================================================================
+# Wave-fill cost model -- the dispatch rule between the tile/split
+# configurations in the closed menu below, ported from the Python reference
+# model of the deep-K wave-fill engagement (model.py; see NOTES.md sections
+# 2-3). Not a general tile search: the menu this family actually builds is
+# {128x256, 128x192 (direct only), 128x128 (6-stage split only)}, and every
+# call site below enumerates it explicitly -- no formula derives a
+# candidate that does not have a real kernel behind it.
+#
+# RAMP is the fixed non-MMA cost of one CTA, in units of BK-tiles of
+# mainloop (pipeline fill, WGMMA drain, epilogue store); TILE_FACTOR is a
+# per-tile efficiency measured relative to that ramp model (it folds in
+# operand traffic per MAC and, for BM=64, the single-consumer-warp-group
+# penalty -- this family never dispatches BM=64 through this model, so only
+# the BM=128 entries are defined). Both were fitted on an H100 PCIe
+# (114 SMs) at a 1395 MHz clock pin; a different card needs its own fit
+# (see NOTES.md). The absolute microsecond estimate below is only as
+# accurate as that fit; the ARGMIN over the menu is far more robust, since
+# every candidate's estimate scales by the same clock/peak-throughput
+# constant.
+comptime _V4_WAVE_RAMP: Float64 = 17.5
+comptime _V4_WAVE_TF_128x256: Float64 = 0.958
+comptime _V4_WAVE_TF_128x192: Float64 = 0.939
+comptime _V4_WAVE_TF_128x128: Float64 = 0.797
+comptime _V4_WAVE_REDUCE_BYTES_PER_US: Float64 = 3.4e6
+comptime _V4_WAVE_SPLIT_LAUNCH_US: Float64 = 1.6
+comptime _V4_WAVE_PEAK_MAC_PER_SM_PER_US: Float64 = 2048.0 * 1395.0
+
+
+@always_inline
+def _v4_wave_cost_us(
+    m: Int,
+    n: Int,
+    k: Int,
+    bn: Int,
+    splits: Int,
+    tile_factor: Float64,
+    sm_count: Int,
+) -> Float64:
+    """Predicted device microseconds for one (128, bn, splits) config.
+
+    `rate(chunk) = chunk / (chunk + RAMP) * tile_factor`; `us = load /
+    peak_mac_per_sm_per_us / rate`, plus the split-K workspace round trip
+    when splits > 1 (a fp32 write + read of the whole output per split,
+    plus one launch gap) -- the exact formula `model.py::cost_us` computes,
+    restricted to BM = 128 (the only row tile this family's non-split-K-64
+    menu uses).
+    """
+    var tiles = ((m + _V4_BM - 1) // _V4_BM) * ((n + bn - 1) // bn)
+    var t = tiles * splits
+    var rounds = (t + sm_count - 1) // sm_count
+    var k_tiles = k // _V4_BK
+    var chunk = (k_tiles + splits - 1) // splits
+    var load = (
+        Float64(rounds)
+        * Float64(_V4_BM)
+        * Float64(bn)
+        * Float64(chunk)
+        * Float64(_V4_BK)
+    )
+    var rate = (Float64(chunk) / (Float64(chunk) + _V4_WAVE_RAMP)) * tile_factor
+    var us = load / _V4_WAVE_PEAK_MAC_PER_SM_PER_US / rate
+    if splits > 1:
+        us += (
+            Float64(splits)
+            * Float64(m)
+            * Float64(n)
+            * 4.0
+            / _V4_WAVE_REDUCE_BYTES_PER_US
+            + _V4_WAVE_SPLIT_LAUNCH_US
+        )
+    return us
 
 
 # Operand-layout parametrization of the shared body.  COL_A means A is
@@ -117,28 +228,47 @@ def _v4_tn_ws_body[
     b_tile: IndexList[2],
     b_desc: IndexList[2],
     //,
+    BM: Int,
     BN: Int,
     STAGES: Int,
     SPLITK: Bool,
     GROUP_ROWS: Int,
-    COL_A: Bool = True,
-    KMAJ_B: Bool = False,
-    # BM = 64 with CONSUMERS = 1 is the v3-small-kernel geometry (one
-    # 64-row WGMMA warp group, 256 threads); the defaults keep every
-    # pre-existing 128-row two-consumer instantiation unchanged.
-    BM: Int = _V4_BM,
-    CONSUMERS: Int = _V4_CONSUMERS,
+    COL_A: Bool,
+    KMAJ_B: Bool,
+    HAS_BIAS: Bool,
 ](
     a_tma: TMATensorTile[_V4_DT, 2, a_tile, a_desc],
     b_tma: TMATensorTile[_V4_DT, 2, b_tile, b_desc],
     output: _V4_PTR,
     ws: _V4_F32_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
     chunk_tiles: Int,
 ):
     comptime if _is_sm_9x():
+        # BM >= 256 (CONSUMERS >= 4) builds clean -- ptxas accepts the SASS
+        # -- but HANGS the GPU at runtime: the body's warpgroup_reg_alloc
+        # asks for more registers per thread than the launch-bounds cap
+        # leaves it (measured: BM=256/BN=128 needs 120, the cap at 640
+        # threads is 102), and it spins forever in the barrier wait.
+        # BM=192/BN=256 fails differently but just as unsupported (ptxas:
+        # "Insufficient registers (128) ... Try 154 or higher"). Neither
+        # failure is caught by any other check in this body, so a caller
+        # that instantiates BM >= 256 gets a silently-hanging kernel instead
+        # of a build error. Reject it here instead, as loudly as the
+        # 192x256 ptxas failure -- see NOTES.md (deep-K wave-fill
+        # engagement, probe_bm256) for the measurements.
+        comptime assert BM < 256, (
+            "gemm16 wave body: BM >= 256 is not supported -- it builds"
+            " clean but HANGS the GPU at runtime (warpgroup_reg_alloc"
+            " exceeds the sm_90 launch-bound register cap). See"
+            " NOTES.md's deep-K wave-fill engagement (probe_bm256) for"
+            " the measurement."
+        )
+        comptime CONSUMERS = BM // 64
+        comptime REG_ALLOC = _v4_wave_reg_alloc[CONSUMERS]()
         comptime A_LAYOUT = _v4_a_smem_layout[COL_A, BM]()
         comptime B_LAYOUT = _v4_b_smem_layout[BN, KMAJ_B]()
         comptime A_PIPE_LAYOUT = Layout.row_major(STAGES, BM * _V4_BK)
@@ -247,7 +377,7 @@ def _v4_tn_ws_body[
                         b_tma.async_copy(b_tile, full_barriers[stage], (n0, k0))
                     it += 1
         else:
-            warpgroup_reg_alloc[232]()
+            warpgroup_reg_alloc[REG_ALLOC]()
             var accum = LayoutTensor[
                 _V4_F32,
                 Layout.row_major(1, CFRAG),
@@ -305,9 +435,16 @@ def _v4_tn_ws_body[
                     var e = q * 2
                     var row = (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                     var col = base_col + (q // 2) * 8
+                    var v0 = accum.ptr[e]
+                    var v1 = accum.ptr[e + 1]
+                    comptime if HAS_BIAS:
+                        # bias is an (n,) row vector broadcast over every
+                        # output row; the two accumulated columns are
+                        # n0+col and n0+col+1.
+                        v0 += bias[n0 + col].cast[_V4_F32]()
+                        v1 += bias[n0 + col + 1].cast[_V4_F32]()
                     var pair = SIMD[_V4_DT, 2](
-                        accum.ptr[e].cast[_V4_DT](),
-                        accum.ptr[e + 1].cast[_V4_DT](),
+                        v0.cast[_V4_DT](), v1.cast[_V4_DT]()
                     )
                     if m0 + row < m and n0 + col + 1 < n:
                         output.store[alignment=4](
@@ -339,8 +476,16 @@ def _v4_tn_splitk_m128n256_s4(
     var n = Int(n_arg)
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
-    _v4_tn_ws_body[256, 4, True, 8](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
+    _v4_tn_ws_body[_V4_BM, 256, 4, True, 8, True, False, False](
+        a_tma,
+        b_tma,
+        ws.bitcast[Scalar[_V4_DT]](),
+        ws,
+        ws.bitcast[Scalar[_V4_DT]](),
+        m,
+        n,
+        k,
+        chunk_tiles,
     )
 
 
@@ -372,8 +517,16 @@ def _v4_nt_splitk_m128n256_s4(
     var n = Int(n_arg)
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
-    _v4_tn_ws_body[256, 4, True, 8, False, True](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
+    _v4_tn_ws_body[_V4_BM, 256, 4, True, 8, False, True, False](
+        a_tma,
+        b_tma,
+        ws.bitcast[Scalar[_V4_DT]](),
+        ws,
+        ws.bitcast[Scalar[_V4_DT]](),
+        m,
+        n,
+        k,
+        chunk_tiles,
     )
 
 
@@ -400,8 +553,16 @@ def _v4_nn_splitk_m128n256_s4(
     var n = Int(n_arg)
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
-    _v4_tn_ws_body[256, 4, True, 8, False, False](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
+    _v4_tn_ws_body[_V4_BM, 256, 4, True, 8, False, False, False](
+        a_tma,
+        b_tma,
+        ws.bitcast[Scalar[_V4_DT]](),
+        ws,
+        ws.bitcast[Scalar[_V4_DT]](),
+        m,
+        n,
+        k,
+        chunk_tiles,
     )
 
 
@@ -426,8 +587,60 @@ def _v4_tt_splitk_m128n256_s4(
     var n = Int(n_arg)
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
-    _v4_tn_ws_body[256, 4, True, 8, True, True](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
+    _v4_tn_ws_body[_V4_BM, 256, 4, True, 8, True, True, False](
+        a_tma,
+        b_tma,
+        ws.bitcast[Scalar[_V4_DT]](),
+        ws,
+        ws.bitcast[Scalar[_V4_DT]](),
+        m,
+        n,
+        k,
+        chunk_tiles,
+    )
+
+
+# 128x128, 6-stage split-K tile: the deep-K wave-fill engagement's fix for
+# the short-chunk regime (e.g. 768x768x8192), where the 128x256 tile above
+# only reaches 95% of one wave's worth of CTAs and is still ~1.4x off stock
+# because each CTA's K-chunk is too shallow to amortize the mainloop's
+# fixed per-CTA ramp cost (see NOTES.md section 2 and 3). Same body, same
+# split-K store; only BN and STAGES differ. Dispatched by the `_v4_wave_cost_us`
+# comparison inline in each caller (try_enqueue_gemm16_gemm_tn_v4,
+# try_enqueue_gemm16_gemm_tt_v4, try_enqueue_gemm16_gemm_splitk_rm_v4),
+# never unconditionally -- deeper 128x256 splits remain the winner whenever
+# the chunk stays reasonably deep (e.g. S4, W3).
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
+@__name(t"{_GEMM16_TAG}_gemm_tn_v4_splitk_m128n128_s6")
+def _v4_tn_splitk_m128n128_s6(
+    a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 128), Index(_V4_BK, 64)],
+    ws: _V4_F32_PTR,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    chunk_tiles_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var chunk_tiles = Int(chunk_tiles_arg)
+    _v4_tn_ws_body[_V4_BM, 128, 6, True, 8, True, False, False](
+        a_tma,
+        b_tma,
+        ws.bitcast[Scalar[_V4_DT]](),
+        ws,
+        ws.bitcast[Scalar[_V4_DT]](),
+        m,
+        n,
+        k,
+        chunk_tiles,
     )
 
 
@@ -436,11 +649,122 @@ def _v4_tt_splitk_m128n256_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name(t"{_GEMM16_TAG}_gemm_tn_v4_direct_m128n192_s4")
-def _v4_tn_direct_m128n192_s4(
+@__name(t"{_GEMM16_TAG}_gemm_nt_v4_splitk_m128n128_s6")
+def _v4_nt_splitk_m128n128_s6(
+    a_tma: TMATensorTile[
+        _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+    ],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(128, _V4_BK), Index(128, _V4_BK)],
+    ws: _V4_F32_PTR,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    chunk_tiles_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var chunk_tiles = Int(chunk_tiles_arg)
+    _v4_tn_ws_body[_V4_BM, 128, 6, True, 8, False, True, False](
+        a_tma,
+        b_tma,
+        ws.bitcast[Scalar[_V4_DT]](),
+        ws,
+        ws.bitcast[Scalar[_V4_DT]](),
+        m,
+        n,
+        k,
+        chunk_tiles,
+    )
+
+
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
+@__name(t"{_GEMM16_TAG}_gemm_nn_v4_splitk_m128n128_s6")
+def _v4_nn_splitk_m128n128_s6(
+    a_tma: TMATensorTile[
+        _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+    ],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 128), Index(_V4_BK, 64)],
+    ws: _V4_F32_PTR,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    chunk_tiles_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var chunk_tiles = Int(chunk_tiles_arg)
+    _v4_tn_ws_body[_V4_BM, 128, 6, True, 8, False, False, False](
+        a_tma,
+        b_tma,
+        ws.bitcast[Scalar[_V4_DT]](),
+        ws,
+        ws.bitcast[Scalar[_V4_DT]](),
+        m,
+        n,
+        k,
+        chunk_tiles,
+    )
+
+
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
+@__name(t"{_GEMM16_TAG}_gemm_tt_v4_splitk_m128n128_s6")
+def _v4_tt_splitk_m128n128_s6(
+    a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(128, _V4_BK), Index(128, _V4_BK)],
+    ws: _V4_F32_PTR,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    chunk_tiles_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var chunk_tiles = Int(chunk_tiles_arg)
+    _v4_tn_ws_body[_V4_BM, 128, 6, True, 8, True, True, False](
+        a_tma,
+        b_tma,
+        ws.bitcast[Scalar[_V4_DT]](),
+        ws,
+        ws.bitcast[Scalar[_V4_DT]](),
+        m,
+        n,
+        k,
+        chunk_tiles,
+    )
+
+
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
+@__name(
+    t"{_GEMM16_TAG}_gemm_tn_v4_direct_m128n192_s4{_v4_bias_tag[HAS_BIAS]()}"
+)
+def _v4_tn_direct_m128n192_s4[
+    HAS_BIAS: Bool = False
+](
     a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
     output: _V4_PTR,
+    bias: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -450,8 +774,16 @@ def _v4_tn_direct_m128n192_s4(
     var m = Int(m_arg)
     var n = Int(n_arg)
     var k = Int(k_arg)
-    _v4_tn_ws_body[192, 4, False, 8](
-        a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
+    _v4_tn_ws_body[_V4_BM, 192, 4, False, 8, True, False, HAS_BIAS](
+        a_tma,
+        b_tma,
+        output,
+        output.bitcast[Scalar[_V4_F32]](),
+        bias,
+        m,
+        n,
+        k,
+        0,
     )
 
 
@@ -463,9 +795,55 @@ def _v4_tn_direct_m128n192_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name(t"{_GEMM16_TAG}_gemm_tn_v4_direct_m128n192_s3g16")
-def _v4_tn_direct_m128n192_s3g16(
+@__name(
+    t"{_GEMM16_TAG}_gemm_tn_v4_direct_m128n192_s3g16{_v4_bias_tag[HAS_BIAS]()}"
+)
+def _v4_tn_direct_m128n192_s3g16[
+    HAS_BIAS: Bool = False
+](
     a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
+    output: _V4_PTR,
+    bias: _V4_PTR,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    _v4_tn_ws_body[_V4_BM, 192, 3, False, 16, True, False, HAS_BIAS](
+        a_tma,
+        b_tma,
+        output,
+        output.bitcast[Scalar[_V4_F32]](),
+        bias,
+        m,
+        n,
+        k,
+        0,
+    )
+
+
+# NN (dgrad) direct 128x192 tile: the row-major-A twin of the TN kernels
+# above, for the same 2-wave underfilled regime (e.g. 2048x2048x8192) --
+# NN never had a narrow-tile alternative to the persistent 128x256 kernel
+# before this (see NOTES.md, deep-K wave-fill engagement); this is that
+# alternative. Same body, same store; only COL_A flips (A is physically
+# (M, K), K-major shared tile) so it reads through `_v4_make_a_row_tma`
+# instead of the col-major `_v4_make_a_tma`.
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
+@__name(t"{_GEMM16_TAG}_gemm_nn_v4_direct_m128n192_s4")
+def _v4_nn_direct_m128n192_s4(
+    a_tma: TMATensorTile[
+        _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+    ],
     b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
     output: _V4_PTR,
     m_arg: Int64,
@@ -477,8 +855,53 @@ def _v4_tn_direct_m128n192_s3g16(
     var m = Int(m_arg)
     var n = Int(n_arg)
     var k = Int(k_arg)
-    _v4_tn_ws_body[192, 3, False, 16](
-        a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
+    _v4_tn_ws_body[_V4_BM, 192, 4, False, 8, False, False, False](
+        a_tma,
+        b_tma,
+        output,
+        output.bitcast[Scalar[_V4_F32]](),
+        output,
+        m,
+        n,
+        k,
+        0,
+    )
+
+
+# Multi-wave variant, matching the TN kernel's rationale: 3 stages draw
+# measurably less power on this power-limited card, and 16-row
+# rasterization groups halve DRAM traffic for B.
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
+@__name(t"{_GEMM16_TAG}_gemm_nn_v4_direct_m128n192_s3g16")
+def _v4_nn_direct_m128n192_s3g16(
+    a_tma: TMATensorTile[
+        _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+    ],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
+    output: _V4_PTR,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    _v4_tn_ws_body[_V4_BM, 192, 3, False, 16, False, False, False](
+        a_tma,
+        b_tma,
+        output,
+        output.bitcast[Scalar[_V4_F32]](),
+        output,
+        m,
+        n,
+        k,
+        0,
     )
 
 
@@ -509,8 +932,16 @@ def _v4_tt_direct_m128n64_s4(
     var m = Int(m_arg)
     var n = Int(n_arg)
     var k = Int(k_arg)
-    _v4_tn_ws_body[64, 4, False, 8, True, True](
-        a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
+    _v4_tn_ws_body[_V4_BM, 64, 4, False, 8, True, True, False](
+        a_tma,
+        b_tma,
+        output,
+        output.bitcast[Scalar[_V4_F32]](),
+        output,
+        m,
+        n,
+        k,
+        0,
     )
 
 
@@ -536,8 +967,16 @@ def _v4_tt_direct_m64n128_s3(
     var m = Int(m_arg)
     var n = Int(n_arg)
     var k = Int(k_arg)
-    _v4_tn_ws_body[128, 3, False, 8, True, True, 64, 1](
-        a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
+    _v4_tn_ws_body[64, 128, 3, False, 8, True, True, False](
+        a_tma,
+        b_tma,
+        output,
+        output.bitcast[Scalar[_V4_F32]](),
+        output,
+        m,
+        n,
+        k,
+        0,
     )
 
 
@@ -800,10 +1239,100 @@ def _v4_enqueue_splitk_m128n256[
     _ = ws^
 
 
-def _v4_enqueue_direct_m128n192(
+# 128x128, 6-stage split-K enqueue: identical structure to
+# `_v4_enqueue_splitk_m128n256` above (same workspace + fused-bias reduce),
+# only the narrower tile's kernels are selected. See
+# `_v4_tn_splitk_m128n128_s6` for why this tile exists.
+def _v4_enqueue_splitk_m128n128_s6[
+    COL_A: Bool = True, KMAJ_B: Bool = False
+](
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    bias: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    grid_x: Int,
+    splits: Int,
+    has_bias: Bool,
+    ctx: DeviceContext,
+) raises:
+    var total_tiles = k // _V4_BK
+    var chunk_tiles = (total_tiles + splits - 1) // splits
+    var count = m * n
+    var ws = ctx.enqueue_create_buffer[DType.float32](splits * count)
+    var ws_ptr = ws.unsafe_ptr().as_unsafe_any_origin()
+    comptime if COL_A and not KMAJ_B:
+        ctx.enqueue_function[_v4_tn_splitk_m128n128_s6](
+            _v4_make_a_tma(a, m, k, ctx),
+            _v4_make_b_mn_tma[128](b, n, k, ctx),
+            ws_ptr,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(chunk_tiles),
+            grid_dim=(grid_x, splits),
+            block_dim=(_V4_THREADS,),
+        )
+    elif not COL_A and KMAJ_B:
+        ctx.enqueue_function[_v4_nt_splitk_m128n128_s6](
+            _v4_make_a_row_tma(a, m, k, ctx),
+            _v4_make_b_kmaj_tma[128](b, n, k, ctx),
+            ws_ptr,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(chunk_tiles),
+            grid_dim=(grid_x, splits),
+            block_dim=(_V4_THREADS,),
+        )
+    elif not COL_A and not KMAJ_B:
+        ctx.enqueue_function[_v4_nn_splitk_m128n128_s6](
+            _v4_make_a_row_tma(a, m, k, ctx),
+            _v4_make_b_mn_tma[128](b, n, k, ctx),
+            ws_ptr,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(chunk_tiles),
+            grid_dim=(grid_x, splits),
+            block_dim=(_V4_THREADS,),
+        )
+    else:
+        ctx.enqueue_function[_v4_tt_splitk_m128n128_s6](
+            _v4_make_a_tma(a, m, k, ctx),
+            _v4_make_b_kmaj_tma[128](b, n, k, ctx),
+            ws_ptr,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(chunk_tiles),
+            grid_dim=(grid_x, splits),
+            block_dim=(_V4_THREADS,),
+        )
+    ctx.enqueue_function[_v4_tn_splitk_reduce](
+        output,
+        ws_ptr,
+        bias,
+        Int64(count),
+        Int64(splits),
+        Int64(n),
+        Int64(1) if has_bias else Int64(0),
+        grid_dim=((count + _V4_RED_SPAN - 1) // _V4_RED_SPAN,),
+        block_dim=(_V4_RED_THREADS,),
+    )
+    # Normal release after both stream-ordered consumers are enqueued.
+    _ = ws^
+
+
+def _v4_enqueue_direct_m128n192[
+    HAS_BIAS: Bool = False
+](
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
@@ -827,7 +1356,52 @@ def _v4_enqueue_direct_m128n192(
         b_desc
     )
     if multi_wave:
-        ctx.enqueue_function[_v4_tn_direct_m128n192_s3g16](
+        ctx.enqueue_function[_v4_tn_direct_m128n192_s3g16[HAS_BIAS]](
+            a_tma,
+            b_tma,
+            output,
+            bias,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            grid_dim=(grid_x,),
+            block_dim=(_V4_THREADS,),
+        )
+    else:
+        ctx.enqueue_function[_v4_tn_direct_m128n192_s4[HAS_BIAS]](
+            a_tma,
+            b_tma,
+            output,
+            bias,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            grid_dim=(grid_x,),
+            block_dim=(_V4_THREADS,),
+        )
+
+
+# NN twin of `_v4_enqueue_direct_m128n192` above -- row-major A instead of
+# col-major.  No bias epilogue: the NN direct-192 route is only used to
+# cover the 2-wave mm regime (see the cost-model comparison inline in
+# `try_enqueue_gemm16_gemm_nn_v4` below); the recorded addmm win comes from
+# the persistent kernel's own fused-bias epilogue (gemm16_nn_v4_kernels.mojo)
+# instead.
+def _v4_enqueue_nn_direct_m128n192(
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    grid_x: Int,
+    multi_wave: Bool,
+    ctx: DeviceContext,
+) raises:
+    var a_tma = _v4_make_a_row_tma(a, m, k, ctx)
+    var b_tma = _v4_make_b_mn_tma[192](b, n, k, ctx)
+    if multi_wave:
+        ctx.enqueue_function[_v4_nn_direct_m128n192_s3g16](
             a_tma,
             b_tma,
             output,
@@ -838,7 +1412,7 @@ def _v4_enqueue_direct_m128n192(
             block_dim=(_V4_THREADS,),
         )
     else:
-        ctx.enqueue_function[_v4_tn_direct_m128n192_s4](
+        ctx.enqueue_function[_v4_nn_direct_m128n192_s4](
             a_tma,
             b_tma,
             output,
@@ -891,6 +1465,98 @@ def _v4_enqueue_tt_direct_m64n128(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(256,),
+    )
+
+
+# ============================================================================
+# NN (dgrad) regime dispatch: persistent 128x256 vs the new direct 128x192
+# tile.  Unlike the TN fix below, NN never had a narrow-tile alternative to
+# the persistent kernel before this engagement, so this isn't a dispatch-
+# ORDERING bug -- it's a new route, gated by the exact same wave-fill cost
+# model and the same "persistent wins outright at >= 3 waves" rule (see
+# NOTES.md, deep-K wave-fill engagement, and try_enqueue_gemm16_gemm_tn_v4's
+# docstring below for the full rationale). `has_bias` always takes the
+# persistent path (it fuses a bias epilogue -- see gemm16_nn_v4_kernels.mojo)
+# and skips the 2-wave cost-model comparison entirely: the direct 128x192 NN
+# kernel has no bias epilogue, and adding one is out of scope here (the
+# recorded addmm win for well-filled NN shapes already comes from the
+# persistent kernel).
+# ============================================================================
+def try_enqueue_gemm16_gemm_nn_v4(
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    bias: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    has_bias: Bool,
+    ctx: DeviceContext,
+) raises -> Bool:
+    comptime if _has_sm_9x():
+        if (
+            ctx.api() == "cuda"
+            and not has_bias
+            and n % 256 == 0
+            and n % 192 == 0
+        ):
+            var cc_major = ctx.get_attribute(
+                DeviceAttribute.COMPUTE_CAPABILITY_MAJOR
+            )
+            var cc_minor = ctx.get_attribute(
+                DeviceAttribute.COMPUTE_CAPABILITY_MINOR
+            )
+            if (
+                cc_major == 9
+                and cc_minor == 0
+                and m >= _V4_BM
+                and k >= _V4_BK
+                and k % _V4_BK == 0
+                and Int(output) % 16 == 0
+                and Int(a) % 16 == 0
+                and Int(b) % 16 == 0
+                and m <= 2_147_483_647
+                and n <= 2_147_483_647
+                and k <= 2_147_483_647
+                and k <= 9_223_372_036_854_775_807 // m
+                and k <= 9_223_372_036_854_775_807 // n
+                and n <= 9_223_372_036_854_775_807 // m
+            ):
+                var sm_count = ctx.get_attribute(
+                    DeviceAttribute.MULTIPROCESSOR_COUNT
+                )
+                var max_grid_x = ctx.get_attribute(
+                    DeviceAttribute.MAX_GRID_DIM_X
+                )
+                if sm_count > 0 and max_grid_x > 0:
+                    var blocks_m256 = (m + _V4_BM - 1) // _V4_BM
+                    var tiles256 = blocks_m256 * (n // 256)
+                    var waves256 = (tiles256 + sm_count - 1) // sm_count
+                    if waves256 == 2:
+                        var tiles192 = blocks_m256 * (n // 192)
+                        if tiles192 > 0 and tiles192 <= max_grid_x:
+                            var waves192 = (tiles192 + sm_count - 1) // sm_count
+                            var cost256 = _v4_wave_cost_us(
+                                m, n, k, 256, 1, _V4_WAVE_TF_128x256, sm_count
+                            )
+                            var cost192 = _v4_wave_cost_us(
+                                m, n, k, 192, 1, _V4_WAVE_TF_128x192, sm_count
+                            )
+                            if cost192 < cost256:
+                                _v4_enqueue_nn_direct_m128n192(
+                                    output,
+                                    a,
+                                    b,
+                                    m,
+                                    n,
+                                    k,
+                                    tiles192,
+                                    waves192 > 1,
+                                    ctx,
+                                )
+                                return True
+    return maybe_enqueue_gemm16_nn_v4(
+        output, a, b, bias, m, n, k, False, False, has_bias, ctx
     )
 
 
@@ -950,20 +1616,57 @@ def try_enqueue_gemm16_gemm_tn_v4(
     if sm_count <= 0 or max_grid_x <= 0:
         return False
 
-    # Split-K on 256-wide tiles: only when at least two K-chunks per tile
-    # fit within the SM count, each chunk deep enough to amortize pipeline
-    # ramp-up, and the fp32 workspace stays modest.
+    # Split-K regime: only when at least two K-chunks per tile fit within
+    # the SM count, each chunk deep enough to amortize pipeline ramp-up,
+    # and the fp32 workspace stays modest.  Once engaged, the wave-fill
+    # cost model (`_v4_wave_cost_us`, ported from model.py -- see NOTES.md
+    # deep-K wave-fill engagement, sections 2-3) picks between the 128x256
+    # tile and the narrower 128x128/6-stage one: the latter wins on
+    # shallow-chunk shapes where 256-wide splits don't amortize their
+    # per-CTA ramp cost (e.g. 768x768x8192: 1.37x -> 1.11x).  n % 256 == 0
+    # implies n % 128 == 0, so the 128-wide tile is always in the menu here.
     if n % 256 == 0:
-        var tiles = (m // _V4_BM) * (n // 256)
-        if tiles > 0 and tiles <= max_grid_x and 2 * tiles <= sm_count:
-            var splits = sm_count // tiles
-            if splits > _V4_MAX_SPLITS:
-                splits = _V4_MAX_SPLITS
+        var tiles256 = (m // _V4_BM) * (n // 256)
+        if tiles256 > 0 and tiles256 <= max_grid_x and 2 * tiles256 <= sm_count:
+            var splits256 = sm_count // tiles256
+            if splits256 > _V4_MAX_SPLITS:
+                splits256 = _V4_MAX_SPLITS
             var max_by_depth = (k // _V4_BK) // _V4_MIN_CHUNK_TILES
-            if splits > max_by_depth:
-                splits = max_by_depth
-            if m * n <= _V4_MAX_WS_BYTES // 4 // max(splits, 1):
-                if splits >= 2:
+            if splits256 > max_by_depth:
+                splits256 = max_by_depth
+            if splits256 >= 2 and m * n <= _V4_MAX_WS_BYTES // 4 // splits256:
+                var tiles128 = (m // _V4_BM) * (n // 128)
+                var splits128 = sm_count // tiles128
+                if splits128 > _V4_MAX_SPLITS:
+                    splits128 = _V4_MAX_SPLITS
+                if splits128 > max_by_depth:
+                    splits128 = max_by_depth
+                var use_128 = (
+                    splits128 >= 2
+                    and tiles128 <= max_grid_x
+                    and m * n <= _V4_MAX_WS_BYTES // 4 // splits128
+                    and _v4_wave_cost_us(
+                        m, n, k, 128, splits128, _V4_WAVE_TF_128x128, sm_count
+                    )
+                    < _v4_wave_cost_us(
+                        m, n, k, 256, splits256, _V4_WAVE_TF_128x256, sm_count
+                    )
+                )
+                if use_128:
+                    _v4_enqueue_splitk_m128n128_s6(
+                        output,
+                        a,
+                        b,
+                        bias,
+                        m,
+                        n,
+                        k,
+                        tiles128,
+                        splits128,
+                        has_bias,
+                        ctx,
+                    )
+                else:
                     _v4_enqueue_splitk_m128n256(
                         output,
                         a,
@@ -972,22 +1675,87 @@ def try_enqueue_gemm16_gemm_tn_v4(
                         m,
                         n,
                         k,
-                        tiles,
-                        splits,
+                        tiles256,
+                        splits256,
                         has_bias,
                         ctx,
                     )
+                return True
+
+    # Multi-wave regime, exactly 2 waves of 128x256 tiles: compare the
+    # persistent clustered kernel against the direct 128x192 tile via the
+    # wave-fill cost model and take whichever wins, instead of always
+    # taking persistent. This is the fix for the regression the deep-K
+    # wave-fill engagement found: the direct 128x192 kernel two paragraphs
+    # below already existed, but the unconditional persistent call right
+    # after this block made it unreachable for every multi-wave shape (see
+    # NOTES.md, deep-K wave-fill engagement, section 8/must-fix 4) --
+    # W1-class shapes (2048x2048x8192) measured 1.74x on persistent and
+    # 1.32x on 128x192, and the narrow tile was never tried. At 3+ waves
+    # the persistent kernel's per-tile amortization (cluster B multicast,
+    # background TMA-store epilogue) measures ~6% faster than a plain grid
+    # launch of the same tile on this hardware (NOTES.md section 4), an
+    # advantage this cost model was not fitted against (its TILE_FACTOR
+    # table comes from non-persistent launches) -- so persistent keeps an
+    # unconditional win there, exactly as before this change. Both
+    # candidates fuse bias into their direct store, so this comparison
+    # runs for addmm too.
+    if n % 256 == 0 and n % 192 == 0:
+        var blocks_m256 = (m + _V4_BM - 1) // _V4_BM
+        var tiles256_mw = blocks_m256 * (n // 256)
+        var waves256_mw = (tiles256_mw + sm_count - 1) // sm_count
+        if waves256_mw == 2:
+            var tiles192_mw = blocks_m256 * (n // 192)
+            if tiles192_mw > 0 and tiles192_mw <= max_grid_x:
+                var waves192_mw = (tiles192_mw + sm_count - 1) // sm_count
+                var cost256_mw = _v4_wave_cost_us(
+                    m, n, k, 256, 1, _V4_WAVE_TF_128x256, sm_count
+                )
+                var cost192_mw = _v4_wave_cost_us(
+                    m, n, k, 192, 1, _V4_WAVE_TF_128x192, sm_count
+                )
+                if cost192_mw < cost256_mw:
+                    if has_bias:
+                        _v4_enqueue_direct_m128n192[True](
+                            output,
+                            a,
+                            b,
+                            bias,
+                            m,
+                            n,
+                            k,
+                            tiles192_mw,
+                            waves192_mw > 1,
+                            ctx,
+                        )
+                    else:
+                        _v4_enqueue_direct_m128n192(
+                            output,
+                            a,
+                            b,
+                            output,
+                            m,
+                            n,
+                            k,
+                            tiles192_mw,
+                            waves192_mw > 1,
+                            ctx,
+                        )
                     return True
+
+    # Multi-wave regime: the persistent clustered body (shared with NN)
+    # in its col-major-A mode, with a fused-bias epilogue (see
+    # gemm16_nn_v4_kernels.mojo).  Gated inside the helper; it declines
+    # single-wave and unaligned shapes, which fall through to the
+    # narrow-tile / v3 routes below (bias-incapable, so has_bias returns
+    # False from here on if this declines).
+    if maybe_enqueue_gemm16_tn_v4_persistent(
+        output, a, b, bias, m, n, k, has_bias, ctx
+    ):
+        return True
 
     if has_bias:
         return False
-
-    # Multi-wave regime: the persistent clustered body (shared with NN)
-    # in its col-major-A mode.  Gated inside the helper; it declines
-    # single-wave and unaligned shapes, which fall through to the
-    # narrow-tile / v3 routes below.
-    if maybe_enqueue_gemm16_tn_v4_persistent(output, a, b, m, n, k, ctx):
-        return True
 
     # Same rung for n % 256 != 0 (n % 64 == 0, gated in the helper): the
     # ragged-n instantiation of the same body, the one the TT dispatcher
@@ -1007,15 +1775,19 @@ def try_enqueue_gemm16_gemm_tn_v4(
     # ragged shapes therefore keep the narrow-tile / v3 routes below.
     if n % 256 != 0:
         if maybe_enqueue_gemm16_tn_v4_persistent[False, False, True](
-            output, a, b, m, n, k, ctx
+            output, a, b, output, m, n, k, False, ctx
         ):
             return True
 
     # Narrow-tile regime: 192-wide tiles trade 33% more CTAs for fuller
     # waves.  Per-CTA time is proportional to BN at fixed BM/BK, so compare
     # wave-quantized cost (waves x BN) and pick 192 when it wins; e.g. 72
-    # CTAs on 114 SMs (one third-idle wave) and 1179 CTAs (10.3 waves with
-    # an idle tail wave) both improve.
+    # CTAs on 114 SMs (one third-idle wave) improves. The exactly-2-wave
+    # case above already ran the full cost-model comparison and returned;
+    # this cheaper wave-quantized proxy covers what's left: single-wave
+    # shapes (where persistent already declined outright) and n % 256 != 0
+    # ragged shapes (no cost-model candidate above; n % 192 == 0 can still
+    # hold there).
     if n % 192 == 0:
         var tiles192 = (m // _V4_BM) * (n // 192)
         if tiles192 > 0 and tiles192 <= max_grid_x:
@@ -1025,13 +1797,22 @@ def try_enqueue_gemm16_gemm_tn_v4(
                 var waves192 = (tiles192 + sm_count - 1) // sm_count
                 if waves192 * 192 < waves256 * 256:
                     _v4_enqueue_direct_m128n192(
-                        output, a, b, m, n, k, tiles192, waves192 > 1, ctx
+                        output,
+                        a,
+                        b,
+                        output,
+                        m,
+                        n,
+                        k,
+                        tiles192,
+                        waves192 > 1,
+                        ctx,
                     )
                     return True
             elif tiles192 <= sm_count:
                 # No 256-wide alternative; take the single-wave win only.
                 _v4_enqueue_direct_m128n192(
-                    output, a, b, m, n, k, tiles192, False, ctx
+                    output, a, b, output, m, n, k, tiles192, False, ctx
                 )
                 return True
 
@@ -1140,9 +1921,55 @@ def try_enqueue_gemm16_gemm_tt_v4(
                 splits >= min_splits
                 and m * n <= _V4_MAX_WS_BYTES // 4 // splits
             ):
-                _v4_enqueue_splitk_m128n256[True, True](
-                    output, a, b, bias, m, n, k, tiles, splits, has_bias, ctx
+                # Wave-fill cost model: compare against the narrower
+                # 128x128/6-stage split tile, same rule as the TN
+                # dispatcher above (see NOTES.md, deep-K wave-fill
+                # engagement).
+                var tiles128 = (m // _V4_BM) * (n // 128)
+                var splits128 = sm_count // tiles128
+                if splits128 > _V4_MAX_SPLITS:
+                    splits128 = _V4_MAX_SPLITS
+                if splits128 > max_by_depth:
+                    splits128 = max_by_depth
+                var use_128 = (
+                    splits128 >= min_splits
+                    and tiles128 <= max_grid_x
+                    and m * n <= _V4_MAX_WS_BYTES // 4 // splits128
+                    and _v4_wave_cost_us(
+                        m, n, k, 128, splits128, _V4_WAVE_TF_128x128, sm_count
+                    )
+                    < _v4_wave_cost_us(
+                        m, n, k, 256, splits, _V4_WAVE_TF_128x256, sm_count
+                    )
                 )
+                if use_128:
+                    _v4_enqueue_splitk_m128n128_s6[True, True](
+                        output,
+                        a,
+                        b,
+                        bias,
+                        m,
+                        n,
+                        k,
+                        tiles128,
+                        splits128,
+                        has_bias,
+                        ctx,
+                    )
+                else:
+                    _v4_enqueue_splitk_m128n256[True, True](
+                        output,
+                        a,
+                        b,
+                        bias,
+                        m,
+                        n,
+                        k,
+                        tiles,
+                        splits,
+                        has_bias,
+                        ctx,
+                    )
                 return True
 
     if has_bias:
@@ -1176,7 +2003,7 @@ def try_enqueue_gemm16_gemm_tt_v4(
     #     and both cells stay within 2% of stock PyTorch.
     if not small_covers and m % 256 == 0:
         if maybe_enqueue_gemm16_tn_v4_persistent[True, True, True](
-            output, a, b, m, n, k, ctx
+            output, a, b, output, m, n, k, False, ctx
         ):
             return True
 
@@ -1304,6 +2131,7 @@ def try_enqueue_gemm16_gemm_splitk_rm_v4[
         splits = max_by_depth
     if splits < _V4_SPLITK_RM_MIN_SPLITS:
         return False
+    var small_tile_covers = 4 * tiles < sm_count
     comptime if KMAJ_B:
         # NT: a marginal 2-way split of a minimum-depth K loses to the
         # persistent kernel's nearly-full wave (see the fit above).
@@ -1312,10 +2140,42 @@ def try_enqueue_gemm16_gemm_splitk_rm_v4[
     else:
         # NN: when the v3 small-tile kernel covers the output in one wave,
         # only a deep split beats it (see the fit above).
-        if 4 * tiles < sm_count and splits < _V4_SPLITK_RM_COVERED_MIN_SPLITS:
+        if small_tile_covers and splits < _V4_SPLITK_RM_COVERED_MIN_SPLITS:
             return False
     if m * n > _V4_MAX_WS_BYTES // 4 // splits:
         return False
+
+    # Wave-fill cost model: compare against the narrower 128x128/6-stage
+    # split tile, same rule and same closed menu as the TN dispatcher (see
+    # NOTES.md, deep-K wave-fill engagement).  The 128-wide candidate is
+    # gated through the SAME per-layout floors as the 256-wide one above
+    # (re-evaluated at its own split count) so it only engages in a regime
+    # already validated for split-K on this layout.
+    var tiles128 = (m // _V4_BM) * (n // 128)
+    var cap128 = sm_count // tiles128
+    var splits128 = cap128
+    if splits128 > _V4_MAX_SPLITS:
+        splits128 = _V4_MAX_SPLITS
+    if splits128 > max_by_depth:
+        splits128 = max_by_depth
+    var splits128_ok = (
+        splits128 >= _V4_SPLITK_RM_MIN_SPLITS and tiles128 <= max_grid_x
+    )
+    comptime if KMAJ_B:
+        if cap128 == 2 and k_tiles < _V4_SPLITK_RM_DEEP_TILES:
+            splits128_ok = False
+    else:
+        if small_tile_covers and splits128 < _V4_SPLITK_RM_COVERED_MIN_SPLITS:
+            splits128_ok = False
+    if splits128_ok and m * n > _V4_MAX_WS_BYTES // 4 // splits128:
+        splits128_ok = False
+    if splits128_ok and _v4_wave_cost_us(
+        m, n, k, 128, splits128, _V4_WAVE_TF_128x128, sm_count
+    ) < _v4_wave_cost_us(m, n, k, 256, splits, _V4_WAVE_TF_128x256, sm_count):
+        _v4_enqueue_splitk_m128n128_s6[False, KMAJ_B](
+            output, a, b, bias, m, n, k, tiles128, splits128, has_bias, ctx
+        )
+        return True
     _v4_enqueue_splitk_m128n256[False, KMAJ_B](
         output, a, b, bias, m, n, k, tiles, splits, has_bias, ctx
     )

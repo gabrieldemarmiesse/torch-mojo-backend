@@ -245,6 +245,11 @@ def _v4_nn_persistent_ws[
     # uses, on the other axis.  The NN, TN and TT routes all instantiate
     # it.
     ragged_n: Bool = False,
+    # has_bias fuses an (n,)-row-vector bias add into the epilogue, for
+    # both the TMA-store and direct-store paths -- see the epilogue below.
+    # Default False keeps every pre-existing instantiation codegen-
+    # identical (verified with scripts/compare_kernel_asm.py).
+    has_bias: Bool = False,
     a_tile_shape: IndexList[2] = Index(_V4_BK, bm) if col_a else Index(
         bm, _V4_BK
     ),
@@ -262,6 +267,7 @@ def _v4_nn_persistent_ws[
     b_tma: TMATensorTile[_V4_DT, 2, b_tile_shape, b_desc_shape],
     c_tma: TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)],
     output: _V4_PTR,
+    bias: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -565,9 +571,15 @@ def _v4_nn_persistent_ws[
                             (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                         )
                         var col = base_col + (q // 2) * 8
+                        var v0 = accum.ptr[e]
+                        var v1 = accum.ptr[e + 1]
+                        comptime if has_bias:
+                            # bias is an (n,) row vector broadcast over
+                            # every output row.
+                            v0 += bias[n0 + col].cast[_V4_F32]()
+                            v1 += bias[n0 + col + 1].cast[_V4_F32]()
                         var pair = SIMD[_V4_DT, 2](
-                            accum.ptr[e].cast[_V4_DT](),
-                            accum.ptr[e + 1].cast[_V4_DT](),
+                            v0.cast[_V4_DT](), v1.cast[_V4_DT]()
                         )
                         # 128B-swizzled staging layout: 16B units within
                         # each 64-element row are XORed with (row % 8).
@@ -599,9 +611,13 @@ def _v4_nn_persistent_ws[
                             (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                         )
                         var col = base_col + (q // 2) * 8
+                        var v0 = accum.ptr[e]
+                        var v1 = accum.ptr[e + 1]
+                        comptime if has_bias:
+                            v0 += bias[n0 + col].cast[_V4_F32]()
+                            v1 += bias[n0 + col + 1].cast[_V4_F32]()
                         var pair = SIMD[_V4_DT, 2](
-                            accum.ptr[e].cast[_V4_DT](),
-                            accum.ptr[e + 1].cast[_V4_DT](),
+                            v0.cast[_V4_DT](), v1.cast[_V4_DT]()
                         )
                         if m0 + row < m and n0 + col + 1 < n:
                             output.store[alignment=4](
@@ -628,10 +644,12 @@ def _v4_enqueue_nn_persistent[
     col_a: Bool = False,
     kmaj_b: Bool = False,
     ragged_n: Bool = False,
+    has_bias: Bool = False,
 ](
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
@@ -704,12 +722,14 @@ def _v4_enqueue_nn_persistent[
             col_a,
             kmaj_b,
             ragged_n,
+            has_bias,
         ]
     ](
         a_tma,
         b_tma,
         c_tma,
         output,
+        bias,
         Int64(m),
         Int64(n),
         Int64(k),
@@ -722,6 +742,7 @@ def maybe_enqueue_gemm16_nn_v4(
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
@@ -760,7 +781,6 @@ def maybe_enqueue_gemm16_nn_v4(
                 if (
                     not transpose_a
                     and not transpose_b
-                    and not has_bias
                     and m >= _V4_PROD_BM * _V4_PROD_CLUSTER_M
                     and n >= _V4_PROD_BN
                     and k >= _V4_BK
@@ -862,26 +882,54 @@ def maybe_enqueue_gemm16_nn_v4(
                         )
                     if sm_count >= _V4_PROD_CLUSTER_M and not small_route_wins:
                         if n % _V4_PROD_BN == 0:
-                            _v4_enqueue_nn_persistent[
-                                _V4_PROD_STAGES,
-                                _V4_PROD_CLUSTER_M,
-                                _V4_PROD_BM,
-                                _V4_PROD_BN,
-                                _V4_PROD_CONSUMERS,
-                                _V4_PROD_TMA_STORE,
-                            ](output, a, b, m, n, k, sm_count, ctx)
+                            if has_bias:
+                                _v4_enqueue_nn_persistent[
+                                    _V4_PROD_STAGES,
+                                    _V4_PROD_CLUSTER_M,
+                                    _V4_PROD_BM,
+                                    _V4_PROD_BN,
+                                    _V4_PROD_CONSUMERS,
+                                    _V4_PROD_TMA_STORE,
+                                    False,
+                                    False,
+                                    False,
+                                    True,
+                                ](output, a, b, bias, m, n, k, sm_count, ctx)
+                            else:
+                                _v4_enqueue_nn_persistent[
+                                    _V4_PROD_STAGES,
+                                    _V4_PROD_CLUSTER_M,
+                                    _V4_PROD_BM,
+                                    _V4_PROD_BN,
+                                    _V4_PROD_CONSUMERS,
+                                    _V4_PROD_TMA_STORE,
+                                ](output, a, b, bias, m, n, k, sm_count, ctx)
                         else:
-                            _v4_enqueue_nn_persistent[
-                                _V4_PROD_STAGES,
-                                _V4_PROD_CLUSTER_M,
-                                _V4_PROD_BM,
-                                _V4_PROD_BN,
-                                _V4_PROD_CONSUMERS,
-                                _V4_PROD_TMA_STORE,
-                                False,
-                                False,
-                                True,
-                            ](output, a, b, m, n, k, sm_count, ctx)
+                            if has_bias:
+                                _v4_enqueue_nn_persistent[
+                                    _V4_PROD_STAGES,
+                                    _V4_PROD_CLUSTER_M,
+                                    _V4_PROD_BM,
+                                    _V4_PROD_BN,
+                                    _V4_PROD_CONSUMERS,
+                                    _V4_PROD_TMA_STORE,
+                                    False,
+                                    False,
+                                    True,
+                                    True,
+                                ](output, a, b, bias, m, n, k, sm_count, ctx)
+                            else:
+                                _v4_enqueue_nn_persistent[
+                                    _V4_PROD_STAGES,
+                                    _V4_PROD_CLUSTER_M,
+                                    _V4_PROD_BM,
+                                    _V4_PROD_BN,
+                                    _V4_PROD_CONSUMERS,
+                                    _V4_PROD_TMA_STORE,
+                                    False,
+                                    False,
+                                    True,
+                                ](output, a, b, bias, m, n, k, sm_count, ctx)
                         return True
     return False
 
@@ -892,9 +940,11 @@ def maybe_enqueue_gemm16_tn_v4_persistent[
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
+    has_bias: Bool,
     ctx: DeviceContext,
 ) raises -> Bool:
     """Route a multi-wave TN (wgrad) GEMM -- or, with kmaj_b, a TT one --
@@ -976,15 +1026,29 @@ def maybe_enqueue_gemm16_tn_v4_persistent[
             blocks_n = (n + _V4_PROD_BN - 1) // _V4_PROD_BN
         if blocks_m * blocks_n <= sm_count:
             return False
-    _v4_enqueue_nn_persistent[
-        _V4_PROD_STAGES,
-        _V4_PROD_CLUSTER_M,
-        _V4_PROD_BM,
-        _V4_PROD_BN,
-        _V4_PROD_CONSUMERS,
-        _V4_PROD_TMA_STORE,
-        True,
-        kmaj_b,
-        ragged_n,
-    ](output, a, b, m, n, k, sm_count, ctx)
+    if has_bias:
+        _v4_enqueue_nn_persistent[
+            _V4_PROD_STAGES,
+            _V4_PROD_CLUSTER_M,
+            _V4_PROD_BM,
+            _V4_PROD_BN,
+            _V4_PROD_CONSUMERS,
+            _V4_PROD_TMA_STORE,
+            True,
+            kmaj_b,
+            ragged_n,
+            True,
+        ](output, a, b, bias, m, n, k, sm_count, ctx)
+    else:
+        _v4_enqueue_nn_persistent[
+            _V4_PROD_STAGES,
+            _V4_PROD_CLUSTER_M,
+            _V4_PROD_BM,
+            _V4_PROD_BN,
+            _V4_PROD_CONSUMERS,
+            _V4_PROD_TMA_STORE,
+            True,
+            kmaj_b,
+            ragged_n,
+        ](output, a, b, bias, m, n, k, sm_count, ctx)
     return True

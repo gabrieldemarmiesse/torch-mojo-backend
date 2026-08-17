@@ -7969,6 +7969,59 @@ def _gemm16_splitk_bias_certain(a, b, *, transpose_b: bool = False) -> bool:
     return 0 < tiles <= 32 and k // 64 >= 32
 
 
+def _gemm16_persistent_bias_certain(a, b, *, transpose_b: bool = False) -> bool:
+    """Third pre-check: is the persistent 128x256 kernel's fused-bias
+    epilogue (gemm16_nn_v4_kernels.mojo, deep-K wave-fill engagement)
+    CERTAIN to engage?
+
+    The deep-K wave-fill engagement extended the persistent kernel's
+    epilogue to fuse an (n,)-row-vector bias add for the NN (dgrad) and TN
+    (wgrad) layouts only -- NT's persistent kernel
+    (gemm16_nt_v4_kernels.mojo) and every TT route are untouched. Unlike
+    ``_gemm16_alignment_favors_split``/``_gemm16_splitk_bias_certain``
+    above, this one DOES need to know which operand is physically
+    transposed (NN vs TN vs NT vs TT are different kernels here, not just
+    different strides into the same one), so it inspects
+    ``_tf32_dense_2d_layout`` directly and combines it with the caller's
+    ``transpose_b`` exactly the way ``_try_gemm16_mm`` does
+    (``rhs_layout ^ transpose_b``), instead of working from logical shape
+    alone. Must never be True when the persistent kernel would actually
+    decline bias -- same false-positive/false-negative asymmetry as
+    ``_gemm16_splitk_bias_certain`` above: a wrong True drops the call all
+    the way to the slow accepted mma.sync kernel; a wrong False just costs
+    one extra elementwise-add launch.
+
+    Bounds, deliberately conservative: ``m, n >= 2048`` and both multiples
+    of 256 (so the persistent kernel's own multi-wave gate,
+    ``total_works * 8 < sm_count``, is false on every sm_90a part this
+    family targets -- 2048x2048 alone is 64 macro-tiles, 512 "small-tile"
+    equivalents, far past any real SM count) and ``k % 64 == 0``. A shape
+    just outside these might still reach the persistent kernel (e.g. via
+    the 2-wave direct-192 route, which has no bias epilogue and is
+    correctly excluded here), but this function only needs to be right
+    when it says True.
+    """
+    lhs = _t(a)
+    rhs = _t(b)
+    if lhs is None or rhs is None or len(lhs._shape) != 2 or len(rhs._shape) != 2:
+        return False
+    lhs_layout = _tf32_dense_2d_layout(lhs)
+    rhs_layout = _tf32_dense_2d_layout(rhs)
+    if lhs_layout is None or rhs_layout is None:
+        return False
+    # NN (both row-major) or TN (A transposed, B row-major) only -- NT and
+    # TT (effective B transpose True) are excluded. Mirrors _try_gemm16_mm's
+    # own `int(rhs_layout) ^ int(bool(transpose_b))` exactly.
+    if rhs_layout ^ bool(transpose_b):
+        return False
+    m, k = lhs._shape
+    rhs_k = rhs._shape[1] if transpose_b else rhs._shape[0]
+    n = rhs._shape[0] if transpose_b else rhs._shape[1]
+    if rhs_k != k:
+        return False
+    return m >= 2048 and n >= 2048 and m % 256 == 0 and n % 256 == 0 and k % 64 == 0
+
+
 def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     """Enqueue the dense H100 16-bit tensor-core GEMM, or return ``None``.
 
@@ -8384,19 +8437,25 @@ def fast_aten_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0):
     # beta/alpha scaling isn't implemented by the fast path (falls through).
     if beta == 1 and alpha == 1:
         # See _try_gemm16_linear: every gemm16 tensor-core route except
-        # split-K declines outright whenever a bias is present, so calling
-        # it WITH the bias would silently fall back to the much slower
-        # "accepted" mma.sync kernel. Split-K itself now fuses the bias add
-        # into its reduce epilogue, so when the shape is deep-K/few-tile
-        # enough that split-K is certain to engage (see
-        # _gemm16_splitk_bias_certain), try the fused call first: no worse
-        # than composing, and it skips the second elementwise-add launch
-        # whenever split-K fires. For every other shape that could
+        # split-K and (as of the deep-K wave-fill engagement) the
+        # persistent 128x256 NN/TN kernel declines outright whenever a
+        # bias is present, so calling it WITH the bias would silently fall
+        # back to the much slower "accepted" mma.sync kernel. Split-K and
+        # the persistent kernel both fuse the bias add into their own
+        # epilogue, so when the shape is certain to reach one of them (see
+        # _gemm16_splitk_bias_certain / _gemm16_persistent_bias_certain),
+        # try the fused call first: no worse than composing, and it skips
+        # the second elementwise-add launch whenever either fires -- this
+        # is what recovers well-filled NN/TN addmm from paying for a
+        # separate binary_rowvec_add kernel (e.g. 4096x4096x4096: measured
+        # 1.178x stock -> ~1.08x). For every other shape that could
         # plausibly reach some other fast route (see
         # _gemm16_alignment_favors_split), compute the bias-free mm on the
         # fast path and add the bias with the existing broadcasting
         # elementwise add instead.
-        if _gemm16_splitk_bias_certain(mat1, mat2):
+        if _gemm16_splitk_bias_certain(mat1, mat2) or _gemm16_persistent_bias_certain(
+            mat1, mat2
+        ):
             out = _try_gemm16_mm(mat1, mat2, input)
             if out is not None:
                 return out

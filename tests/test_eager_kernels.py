@@ -6271,8 +6271,16 @@ def test_addmm_skips_split_for_misaligned_shapes(monkeypatch):
     into a 1.25-1.65x regression before this gate existed."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
     def tensor(shape):
-        return SimpleNamespace(_shape=tuple(shape))
+        rows, cols = shape
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=(cols, 1),
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
 
     lhs, rhs, bias = tensor((357, 333)), tensor((333, 789)), object()
     fused_result = object()
@@ -6299,8 +6307,16 @@ def test_addmm_tries_split_for_aligned_shapes(monkeypatch):
     route -- see _gemm16_alignment_favors_split."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
     def tensor(shape):
-        return SimpleNamespace(_shape=tuple(shape))
+        rows, cols = shape
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=(cols, 1),
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
 
     lhs, rhs, bias = tensor((128, 128)), tensor((128, 128)), object()
     mm_result, biased_result = object(), object()
@@ -7121,6 +7137,80 @@ def test_gemm16_splitk_bias_certain_helper(monkeypatch: pytest.MonkeyPatch) -> N
     )
 
 
+def test_gemm16_persistent_bias_certain_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_gemm16_persistent_bias_certain` must only say True where the
+    persistent kernel's fused-bias epilogue (gemm16_nn_v4_kernels.mojo,
+    deep-K wave-fill engagement) is guaranteed to engage: NN or TN layout
+    (not NT/TT -- untouched by this engagement), both dims >= 2048 and
+    256-aligned, k a multiple of 64."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(shape: tuple[int, int], *, transposed: bool = False) -> SimpleNamespace:
+        rows, cols = shape
+        strides = (1, rows) if transposed else (cols, 1)
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=strides,
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
+
+    # S1's exact shape, NN: both row-major, both >= 2048, both 256-aligned.
+    assert aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 4096))
+    )
+    # TN: A physically transposed, B row-major -- still covered.
+    assert aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096), transposed=True), tensor((4096, 4096))
+    )
+    # NT: B physically transposed -- the persistent kernel's OWN dedicated
+    # NT family (gemm16_nt_v4_kernels.mojo) is untouched by this
+    # engagement, so this must be False.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 4096), transposed=True)
+    )
+    # TT: both transposed -- also untouched.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096), transposed=True), tensor((4096, 4096), transposed=True)
+    )
+    # transpose_b reinterprets which operand's physical layout is "B",
+    # same convention as the sibling _gemm16_splitk_bias_certain helper:
+    # a row-major weight read with transpose_b=True is effectively NT
+    # (see _try_gemm16_linear), so this must be False too.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 4096)), transpose_b=True
+    )
+    # n below the 2048 floor: W1-class shape the direct 128x192 kernel
+    # (no bias epilogue) may win instead of persistent.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 1792))
+    )
+    # m below the 2048 floor.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((1024, 4096)), tensor((4096, 4096))
+    )
+    # n not 256-aligned.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 2112))
+    )
+    # k not 64-aligned.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4033)), tensor((4033, 4096))
+    )
+    # k mismatch between lhs and rhs.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((2048, 4096))
+    )
+    # S5's awkward shape: nowhere near the floor.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((357, 333)), tensor((333, 789))
+    )
+
+
 def test_addmm_tries_fused_splitk_before_compose_for_deep_k_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7157,18 +7247,35 @@ def test_addmm_tries_fused_splitk_before_compose_for_deep_k_shapes(
 def test_addmm_still_composes_for_many_tile_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A large, many-output-tile shape (S1-like: aligned but split-K always
-    declines it) must still take the existing compose-then-add path, not the
-    new fused-first attempt -- the fused call there would fall through
-    split-K straight to the slow accepted kernel (see
-    _gemm16_splitk_bias_certain's docstring). Regression guard for exactly
-    the failure mode a too-loose predicate would cause."""
+    """A many-output-tile shape that BOTH split-K
+    (`_gemm16_splitk_bias_certain`, too many tiles) and the persistent
+    kernel (`_gemm16_persistent_bias_certain`, n below the 2048 floor) are
+    certain to decline for must still take the existing compose-then-add
+    path, not the fused-first attempt -- the fused call there would fall
+    through both fused-bias routes straight to the slow accepted kernel.
+    Regression guard for exactly the failure mode a too-loose predicate
+    would cause.
+
+    (Before the deep-K wave-fill engagement, m=n=4096 alone was such a
+    shape: split-K declined it but nothing else fused bias. It no longer
+    is -- the persistent kernel's epilogue now fuses bias there too (see
+    test_addmm_tries_fused_persistent_before_compose_for_well_filled_shapes)
+    -- so this shape narrows n to stay below the persistent kernel's
+    2048 floor while remaining aligned and many-tile.)"""
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    def tensor(shape: tuple[int, ...]) -> SimpleNamespace:
-        return SimpleNamespace(_shape=tuple(shape))
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
 
-    lhs, rhs, bias = tensor((4096, 4096)), tensor((4096, 4096)), object()
+    def tensor(shape: tuple[int, ...]) -> SimpleNamespace:
+        rows, cols = shape
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=(cols, 1),
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
+
+    lhs, rhs, bias = tensor((4096, 4096)), tensor((4096, 1792)), object()
     mm_result, biased_result = object(), object()
     gemm_calls = []
     add_calls = []
@@ -7190,6 +7297,277 @@ def test_addmm_still_composes_for_many_tile_shapes(
     # (which would carry `bias` as a third positional arg) is never tried.
     assert gemm_calls == [((lhs, rhs), {})]
     assert add_calls == [((mm_result, bias), {})]
+
+
+@pytest.mark.parametrize("layout", ["NN", "TN"])
+def test_addmm_tries_fused_persistent_before_compose_for_well_filled_shapes(
+    monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    """A well-filled shape (S1-like: 4096x4096x4096, both >= 2048 and
+    256-aligned) that `_gemm16_persistent_bias_certain` accepts must try the
+    single fused bias-aware gemm16 call FIRST, on both layouts the deep-K
+    wave-fill engagement's persistent-kernel bias epilogue covers (NN and
+    TN) -- never the bias-free-mm-then-add composition, which is exactly
+    the separate `binary_rowvec_add` launch that epilogue exists to avoid
+    (measured 4096x4096x4096: 1.178x stock -> ~1.08x)."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(shape: tuple[int, int], *, transposed: bool) -> SimpleNamespace:
+        rows, cols = shape
+        strides = (1, rows) if transposed else (cols, 1)
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=strides,
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
+
+    lhs = tensor((4096, 4096), transposed=layout[0] == "T")
+    rhs = tensor((4096, 4096), transposed=False)
+    bias = object()
+    fused_result = object()
+    fused_calls = []
+
+    def try_gemm(*args: object, **kwargs: object) -> object:
+        fused_calls.append((args, kwargs))
+        return fused_result
+
+    def fail_add(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError(
+            "a persistent-certain shape should never fall back to composing"
+        )
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", fail_add)
+
+    assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is fused_result
+    assert fused_calls == [((lhs, rhs, bias), {})]
+
+
+@pytest.mark.parametrize("layout", ["NT", "TT"])
+def test_addmm_persistent_fused_excludes_untouched_layouts(
+    monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    """The same well-filled shape on NT or TT (the persistent kernel's
+    bias epilogue was extended to NN and TN only -- see
+    gemm16_nn_v4_kernels.mojo; NT's own dedicated persistent kernel,
+    gemm16_nt_v4_kernels.mojo, is an explicit canary in this engagement)
+    must still take the compose path, not a fused call the underlying
+    Mojo dispatcher would actually decline."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(shape: tuple[int, int], *, transposed: bool) -> SimpleNamespace:
+        rows, cols = shape
+        strides = (1, rows) if transposed else (cols, 1)
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=strides,
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
+
+    lhs = tensor((4096, 4096), transposed=layout[0] == "T")
+    rhs = tensor((4096, 4096), transposed=layout[1] == "T")
+    bias = object()
+    mm_result, biased_result = object(), object()
+    gemm_calls = []
+    add_calls = []
+
+    def try_gemm(*args: object, **kwargs: object) -> object:
+        gemm_calls.append((args, kwargs))
+        return mm_result
+
+    def try_add(*args: object, **kwargs: object) -> object:
+        add_calls.append((args, kwargs))
+        return biased_result
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", try_add)
+
+    assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is biased_result
+    assert gemm_calls == [((lhs, rhs), {})]
+    assert add_calls == [((mm_result, bias), {})]
+
+
+# The deep-K wave-fill engagement's own harness correctness sweep, ported:
+# {bf16, f16} x {NN, TN} x bias x 5 shapes, including a ragged n % 256 != 0
+# boundary. Each case exercises a different rung of the wave-fill dispatch
+# added in this engagement (see gemm16_tn_v4_kernels.mojo /
+# gemm16_nn_v4_kernels.mojo): the 128x256 split-K ladder still winning on
+# S4/W3, the new 128x128/6-stage split winning on W2, the persistent-vs-
+# direct-192 cost-model comparison on W1, and the ragged multi-wave
+# persistent rung on the last shape.
+_WAVE_FILL_SHAPES = {
+    "W1_2048x2048x8192": (2048, 2048, 8192),
+    "W2_768x768x8192": (768, 768, 8192),
+    "W3_1024x1024x16384": (1024, 1024, 16384),
+    "S4_1024x1024x8192": (1024, 1024, 8192),
+    "ragged_4096x1216x2048": (4096, 1216, 2048),  # n % 256 != 0, n % 64 == 0
+}
+
+
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("layout", ["NN", "TN"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape_id", _WAVE_FILL_SHAPES)
+def test_gemm16_wave_fill_dispatch_matches_fp32_reference(
+    mojo_h100: torch.device,
+    shape_id: str,
+    dtype: torch.dtype,
+    layout: str,
+    has_bias: bool,
+) -> None:
+    """Deep-K wave-fill engagement correctness sweep, ported from the
+    harness (NOTES.md): every new dispatch rung (128x128 split, direct
+    128x192 vs persistent, ragged multi-wave persistent, and their fused-
+    bias epilogues) reproduces the FP32 reference within bf16/f16
+    accumulation tolerance, on both layouts the engagement covers."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = _WAVE_FILL_SHAPES[shape_id]
+    a, b = _gemm16_operands(layout, m, n, k, dtype, mojo_h100)
+    bias = torch.randn(n).to(dtype).to(mojo_h100) if has_bias else None
+
+    out = aten_fast._try_gemm16_mm(a, b, bias)
+    assert out is not None, "the gemm16 dispatch declined this shape"
+    assert out.dtype == dtype
+    assert tuple(out.shape) == (m, n)
+
+    expected = a.cpu().float() @ b.cpu().float()
+    if bias is not None:
+        expected = expected + bias.cpu().float()
+    # bf16/f16 accumulate in FP32 on-device; the tolerance is the k-depth
+    # floor (grows ~sqrt(k) for a tiled reduction) plus the final round to
+    # the 16-bit output dtype (about half a ULP).
+    ulp = 2**-8 if dtype == torch.bfloat16 else 2**-11
+    atol = 4 * ulp * (k**0.5)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
+
+
+def test_gemm16_wave_body_rejects_bm_256_at_compile_time(tmp_path: Path) -> None:
+    """BM >= 256 (CONSUMERS >= 4) is not just unused by any dispatcher --
+    it is actively dangerous: the deep-K wave-fill engagement measured it
+    building clean and then HANGING the GPU at runtime (warpgroup_reg_alloc
+    exceeds the sm_90 launch-bound register cap). The `comptime assert` in
+    `_v4_tn_ws_body` (gemm16_tn_v4_kernels.mojo) must turn that into a loud
+    build-time failure instead.
+
+    This is a compile-check, not a device test (mirrors
+    scripts/compare_kernel_asm.py's own `--emit asm --target-accelerator`
+    cross-compile): it needs no GPU and must never run under the GPU flock
+    (see AGENTS.md's kernel-optimization-harness notes -- compiling under
+    the lock wastes it for no reason, since `mojo build` never touches the
+    device).
+    """
+    import subprocess
+
+    from torch_mojo_backend.eager_kernels import _build_env, _find_mojo
+
+    package_dir = (
+        Path(__file__).resolve().parents[1] / "torch_mojo_backend" / "eager_kernels"
+    )
+    probe = tmp_path / "bm256_probe.mojo"
+    probe.write_text(
+        """
+from std.memory import alloc
+from max.gpu.host import DeviceContext
+from gemm16_matmul_ops.gemm16_tn_v4_kernels import (
+    _V4_DT,
+    _V4_F32,
+    _V4_BK,
+    _v4_make_a_tma,
+    _v4_make_b_mn_tma,
+    _v4_tn_ws_body,
+)
+from std.utils.index import Index
+from layout.tma_async import TMATensorTile
+
+
+# A named kernel entry point, exactly like the production ones in
+# gemm16_tn_v4_kernels.mojo: `ctx.enqueue_function[F]` is what forces the
+# compiler to target the accelerator for F's body (and therefore evaluate
+# `_is_sm_9x()` -- and the comptime assert inside it -- as a device
+# kernel). Calling `_v4_tn_ws_body` directly from `main()` (host code)
+# does NOT do this: `_is_sm_9x()` is false there regardless of
+# `--target-accelerator`, so the guarded branch compiles away as dead code
+# and the assert never runs -- confirmed by first writing the probe that
+# way and watching it build clean.
+def _probe_kernel_bm256(
+    a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 128), Index(_V4_BK, 64)],
+    output: UnsafePointer[Scalar[_V4_DT], MutAnyOrigin],
+    ws: UnsafePointer[Scalar[_V4_F32], MutAnyOrigin],
+    bias: UnsafePointer[Scalar[_V4_DT], MutAnyOrigin],
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+):
+    # BM=256: must fail to build, not silently compile a hanging kernel.
+    _v4_tn_ws_body[256, 128, 4, False, 8, True, False, False](
+        a_tma, b_tma, output, ws, bias, Int(m_arg), Int(n_arg), Int(k_arg), 0
+    )
+
+
+def main() raises:
+    var ctx = DeviceContext()
+    var a = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var b = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var out = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var ws = alloc[Scalar[_V4_F32]](1).as_unsafe_any_origin()
+    var a_tma = _v4_make_a_tma[256](a, 1024, 8192, ctx)
+    var b_tma = _v4_make_b_mn_tma[128](b, 1024, 8192, ctx)
+    ctx.enqueue_function[_probe_kernel_bm256](
+        a_tma,
+        b_tma,
+        out,
+        ws,
+        out,
+        Int64(1024),
+        Int64(1024),
+        Int64(8192),
+        grid_dim=(1,),
+        block_dim=(640,),
+    )
+"""
+    )
+    result = subprocess.run(
+        [
+            str(_find_mojo()),
+            "build",
+            str(probe),
+            "--emit",
+            "asm",
+            "--target-accelerator",
+            "sm_90a",
+            "-I",
+            str(probe.parent),
+            "-I",
+            str(package_dir),
+            "-I",
+            str(package_dir / "gemm16_matmul_ops"),
+            "-o",
+            str(tmp_path / "bm256_probe.s"),
+        ],
+        env=_build_env(),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode != 0, (
+        "BM=256 built successfully -- the compile-time guard regressed "
+        f"(NOTES.md documents this hanging the GPU at runtime)\nstdout:"
+        f"\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert "BM >= 256" in combined, (
+        f"build failed, but not with the expected guard message\n{combined}"
+    )
 
 
 @pytest.mark.parametrize("layout", _GEMM16_LAYOUTS)
