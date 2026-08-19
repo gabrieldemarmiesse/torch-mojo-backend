@@ -1879,6 +1879,237 @@ def aten_convolution(
 
 
 # convolution_backward(Tensor grad_output, Tensor input, Tensor weight, SymInt[]? bias_sizes, SymInt[] stride, SymInt[] padding, SymInt[] dilation, bool transposed, SymInt[] output_padding, SymInt groups, bool[3] output_mask) -> (Tensor, Tensor, Tensor)
+#
+# MAX has no convolution-gradient op of any kind, and its one adjacent
+# primitive, `conv2d_transpose`, is cuDNN-only on GPU (the kernel aborts the
+# process with "symbol not found: cudnnCreate" on an accelerator that has no
+# cuDNN), so neither gradient may be expressed with it. Both are therefore
+# composed here from ops that run everywhere:
+#
+#   grad_input  = fold(weight^T @ grad_output_columns) -- `F.fold` IS col2im,
+#                 the exact adjoint of the im2col a convolution lowers to.
+#   grad_weight = a convolution with the operand ROLES swapped: the input's
+#                 channels become the batch, the batch becomes the reduction,
+#                 and grad_output becomes the filter, with stride and
+#                 dilation exchanged.
+#   grad_bias   = grad_output summed over batch and space.
+#
+# `transposed=True` is not implemented (input and grad_output swap roles
+# again); it raises rather than silently returning the non-transposed answer.
+
+
+def _conv2d_backward_input(
+    grad_output: MaxTensor,
+    input: MaxTensor,
+    weight: MaxTensor,
+    stride: tuple[int, int],
+    padding: tuple[int, int],
+    dilation: tuple[int, int],
+    groups: int,
+) -> MaxTensor:
+    """col2im of (weight^T x grad_output), i.e. the data gradient.
+
+    `F.fold`'s own `padding` argument does NOT match torch's fold (measured:
+    it agrees for padding 0 and diverges for every nonzero padding), so the
+    padded case is expressed the way it is defined instead -- fold into the
+    PADDED image extent with zero padding, then crop the border back off.
+    That is the identity `fold(x, H, pad=p) == fold(x, H + 2p, pad=0)[p:-p]`,
+    and it keeps this path on the one fold configuration that is verified
+    against torch.
+    """
+    kh, kw = int(weight.shape[2]), int(weight.shape[3])
+    ph, pw = padding
+    batch = grad_output.shape[0]
+    columns = grad_output.shape[2] * grad_output.shape[3]
+    grad_cols = F.reshape(grad_output, (batch, grad_output.shape[1], columns))
+    padded_size = (input.shape[2] + 2 * ph, input.shape[3] + 2 * pw)
+
+    if groups == 1:
+        weight_groups, grad_groups = [weight], [grad_cols]
+    else:
+        out_channels = int(weight.shape[0])
+        if out_channels % groups != 0:
+            raise ValueError(
+                f"Weight dim 0 ({out_channels}) must be divisible by groups ({groups})."
+            )
+        weight_groups = F.split(weight, [out_channels // groups] * groups, axis=0)
+        grad_groups = F.split(grad_cols, [out_channels // groups] * groups, axis=1)
+
+    parts = []
+    for weight_group, grad_group in zip(weight_groups, grad_groups):
+        # (out_c/groups, C/groups * KH * KW) -> transposed, so the matmul
+        # reduces over the output channels exactly as the forward reduces
+        # over the patch rows.
+        weight_matrix = F.reshape(
+            weight_group, (weight_group.shape[0], weight_group.shape[1] * kh * kw)
+        )
+        columns_grad = F.matmul(F.transpose(weight_matrix, 0, 1), grad_group)
+        parts.append(
+            F.fold(
+                columns_grad,
+                output_size=padded_size,
+                kernel_size=(kh, kw),
+                stride=stride,
+                dilation=dilation,
+                padding=0,
+            )
+        )
+    padded = parts[0] if len(parts) == 1 else F.concat(parts, axis=1)
+    slices = [
+        slice(None),
+        slice(None),
+        slice(ph, -ph) if ph else slice(None),
+        slice(pw, -pw) if pw else slice(None),
+    ]
+    return padded[*slices]
+
+
+def _conv2d_backward_weight(
+    grad_output: MaxTensor,
+    input: MaxTensor,
+    weight: MaxTensor,
+    stride: tuple[int, int],
+    padding: tuple[int, int],
+    dilation: tuple[int, int],
+    groups: int,
+) -> MaxTensor:
+    """The weight gradient as a convolution with the roles permuted.
+
+    `grad_weight[k, c, r, s] = sum_{n, oh, ow} grad_output[n, k, oh, ow] *
+    input[n, c, r*dh - ph + oh*sh, s*dw - pw + ow*sw]` is itself a
+    convolution: over an "input" whose batch is the channel axis `c` and
+    whose channels are the batch `n`, with grad_output as the filter (its
+    `oh, ow` are the filter taps), the forward's DILATION as the stride and
+    its STRIDE as the dilation. The result is bigger than the filter
+    whenever the forward truncated, so it is cropped to the kernel extent.
+    """
+    kh, kw = int(weight.shape[2]), int(weight.shape[3])
+    ph, pw = padding
+    # (N, C, H, W) -> NHWC with C as the batch and N as the channels.
+    input_nhwc = F.permute(input, [1, 2, 3, 0])
+    # (N, K, OH, OW) -> RSCF = (tap_h, tap_w, in_channels=N, out_channels=K).
+    grad_rscf = F.permute(grad_output, [2, 3, 0, 1])
+
+    if groups == 1:
+        pairs = [(input_nhwc, grad_rscf)]
+    else:
+        in_channels = int(input.shape[1])
+        out_channels = int(grad_output.shape[1])
+        if in_channels % groups != 0 or out_channels % groups != 0:
+            raise ValueError(
+                f"Input channels ({in_channels}) and output channels "
+                f"({out_channels}) must both be divisible by groups ({groups})."
+            )
+        pairs = list(
+            zip(
+                F.split(input_nhwc, [in_channels // groups] * groups, axis=0),
+                F.split(grad_rscf, [out_channels // groups] * groups, axis=3),
+            )
+        )
+
+    parts = []
+    for input_group, grad_group in pairs:
+        correlated = F.conv2d(
+            input_group,
+            grad_group,
+            bias=None,
+            stride=dilation,
+            dilation=stride,
+            padding=(ph, ph, pw, pw),
+            groups=1,
+            input_layout=max_type.ConvInputLayout.NHWC,
+            filter_layout=max_type.FilterLayout.RSCF,
+        )
+        # (C/groups, R', S', out_c/groups) -> (out_c/groups, C/groups, KH, KW)
+        parts.append(F.permute(correlated[:, :kh, :kw, :], [3, 0, 1, 2]))
+    return parts[0] if len(parts) == 1 else F.concat(parts, axis=0)
+
+
+@map_to(aten.convolution_backward)
+def aten_convolution_backward(
+    grad_output: MaxTensor,
+    input: MaxTensor,
+    weight: MaxTensor,
+    bias_sizes: list[SymIntType] | None,
+    stride: list[SymIntType],
+    padding: list[SymIntType],
+    dilation: list[SymIntType],
+    transposed: bool,
+    output_padding: list[SymIntType],
+    groups: SymIntType,
+    output_mask: list[bool],
+) -> tuple[MaxTensor | None, MaxTensor | None, MaxTensor | None]:
+    mask = tuple(output_mask)
+    if len(mask) != 3 or any(not isinstance(requested, bool) for requested in mask):
+        raise ValueError("convolution_backward output_mask must contain three booleans")
+    if transposed:
+        raise NotImplementedError(
+            "convolution_backward is not implemented for transposed convolutions "
+            "(the backward of a conv_transpose forward, where input and "
+            "grad_output swap roles)."
+        )
+    groups = int(groups)
+    input_rank = len(input.shape)
+
+    if input_rank == 3:
+        # conv1d: a synthetic size-1 H axis makes every operand look like
+        # conv2d's, the single stride/padding/dilation maps onto the W axis,
+        # and the two spatial gradients get the dummy axis squeezed back out.
+        grad_input, grad_weight, grad_bias = aten_convolution_backward(
+            F.unsqueeze(grad_output, axis=2),
+            F.unsqueeze(input, axis=2),
+            F.unsqueeze(weight, axis=2),
+            bias_sizes,
+            [1, stride[0]],
+            [0, padding[0]],
+            [1, dilation[0]],
+            transposed,
+            [0, output_padding[0] if output_padding else 0],
+            groups,
+            output_mask,
+        )
+        if grad_input is not None:
+            grad_input = F.squeeze(grad_input, axis=2)
+        if grad_weight is not None:
+            grad_weight = F.squeeze(grad_weight, axis=2)
+        return grad_input, grad_weight, grad_bias
+
+    if input_rank != 4:
+        raise ValueError(
+            f"Unsupported input rank for convolution_backward: {input_rank}. "
+            "Expected 3 (1D) or 4 (2D)."
+        )
+
+    stride, padding, dilation, _ = _normalize_2d_params(
+        stride, padding, dilation, output_padding
+    )
+    if padding[0] != padding[1] or padding[2] != padding[3]:
+        raise NotImplementedError(
+            "convolution_backward does not support asymmetric padding."
+        )
+    padding = (int(padding[0]), int(padding[2]))
+    stride = (int(stride[0]), int(stride[1]))
+    dilation = (int(dilation[0]), int(dilation[1]))
+
+    grad_input = None
+    if mask[0]:
+        grad_input = _conv2d_backward_input(
+            grad_output, input, weight, stride, padding, dilation, groups
+        )
+    grad_weight = None
+    if mask[1]:
+        grad_weight = _conv2d_backward_weight(
+            grad_output, input, weight, stride, padding, dilation, groups
+        )
+    grad_bias = None
+    if mask[2]:
+        # ATen computes this straight from grad_output whenever the backend
+        # did not, so `bias_sizes` -- which only records that the forward HAD
+        # a bias, something mask[2] already says -- is not consulted.
+        grad_bias = aten_sum(grad_output, dim=[0, 2, 3])
+    return grad_input, grad_weight, grad_bias
+
+
 # copy(Tensor self, Tensor src, bool non_blocking=False) -> Tensor
 @map_to(aten.copy)
 def aten_copy(

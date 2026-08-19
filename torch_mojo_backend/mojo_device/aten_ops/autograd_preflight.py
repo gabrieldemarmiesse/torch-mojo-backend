@@ -160,56 +160,6 @@ mojo_device_upsample_bilinear2d = _preflight_unsupported_backward(
 # ---------------------------------------------------------------------------
 
 
-def mojo_device_convolution(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    stride: Sequence[int],
-    padding: Sequence[int],
-    dilation: Sequence[int],
-    transposed: bool,
-    output_padding: Sequence[int],
-    groups: int,
-) -> TorchMojoTensor:
-    """Convolution with a forward-time preflight of its native autograd node.
-
-    The forward exists here; `aten::convolution_backward` does not (it needs
-    the im2col-transpose GEMM pair). Recording ConvolutionBackward0 anyway
-    would move the failure into the autograd engine, where an exception aborts
-    the process instead of raising — the unwind hazard
-    `_refuse_unsupported_backward` documents — so a call whose gradient the
-    engine would come back for is refused here, from the forward, with a
-    traceback that names the op.
-
-    Unlike batch norm this has no training-mode escape: a conv weight normally
-    requires grad, so in practice this refuses every conv in a training model,
-    and the honest message is that the backward kernel is missing rather than
-    that some flag is set wrong. Inference is unaffected under
-    `torch.no_grad()` / `torch.inference_mode()`.
-    """
-    _refuse_unsupported_backward(
-        "aten::convolution",
-        "aten::convolution_backward",
-        (input, weight, bias),
-        _GRAD_OFF_ONLY,
-    )
-    aten_fast = _fast()
-    result = aten_fast.fast_aten_convolution(
-        input,
-        weight,
-        bias,
-        stride,
-        padding,
-        dilation,
-        transposed,
-        output_padding,
-        groups,
-    )
-    if result is aten_fast.NOT_HANDLED:
-        raise _unsupported("aten::convolution", (input, weight, bias))
-    return result
-
-
 def mojo_device_embedding(
     weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False
 ):
