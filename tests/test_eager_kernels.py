@@ -990,6 +990,14 @@ _UNARY_AUTOGRAD_PREFLIGHT_CASES = [
         ),
         "aten::upsample_bilinear2d_backward",
     ),
+    (
+        "upsample_nearest2d",
+        (2, 3, 4, 4),
+        functools.partial(
+            torch.nn.functional.interpolate, scale_factor=2, mode="nearest"
+        ),
+        "aten::upsample_nearest2d_backward",
+    ),
 ]
 
 

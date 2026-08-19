@@ -154,6 +154,17 @@ mojo_device_upsample_bilinear2d = _preflight_unsupported_backward(
     grad_operands=(0,),
 )
 
+# Nearest-neighbor upsample has no interpolation weights, but its backward is
+# still a scatter-add: each input-gradient pixel sums the contributions of
+# every output pixel that nearest-mapped to it. No such reduction kernel
+# exists here yet, so refuse the same way bilinear's backward is refused.
+mojo_device_upsample_nearest2d = _preflight_unsupported_backward(
+    "aten::upsample_nearest2d",
+    "fast_aten_upsample_nearest2d",
+    "aten::upsample_nearest2d_backward",
+    grad_operands=(0,),
+)
+
 
 # ---------------------------------------------------------------------------
 # Ops whose preflight needs op-specific reasoning. Alphabetical.
