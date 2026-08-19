@@ -70,6 +70,12 @@ comptime _V4_PTR = UnsafePointer[Scalar[_V4_DT], MutAnyOrigin]
 comptime _V4_SWIZZLE = TensorMapSwizzle.SWIZZLE_128B
 
 comptime _V4_BM = 128
+# NOT derived from the family's operand width (gemm16_dtype.mojo's
+# _GEMM16_BK), unlike its siblings in gemm16_v3/nn_v4/tn_v4: this file's
+# epilogue stages C through `st.matrix`, a 16-bit-only instruction, so the
+# whole route is 16-bit by construction and the float32 ladder never calls
+# it.  Widening the tile alone would produce a kernel that compiles and
+# cannot be correct.
 comptime _V4_BK = 64
 comptime _V4_THREADS = 384
 comptime _V4_CONSUMERS = 2
