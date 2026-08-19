@@ -2876,6 +2876,412 @@ def test_fast_uniform_carries_torch_rand_on_device(mojo_gpu):
     assert host.max().item() < 1.0
 
 
+# ---------------------------------------------------------------------------
+# sort / topk. The kernel picks one of three launch routes from the row
+# length and k, so the interesting cases are the route boundaries -- which is
+# also why every reference below is a CPU *stable* sort: the kernel's order is
+# total (ties broken by original index), so it must reproduce the stable
+# answer exactly, not merely a correct one.
+# ---------------------------------------------------------------------------
+
+# Elements one block sorts in shared memory, mirrored from the kernel; the
+# route boundaries sit at and just past it.
+_SORT_TILE = 4096
+_SORT_ROUTE_SIZES = (1, 2, 33, 255, 4095, 4096, 4097, 8192, 8193, 12000, 50257)
+
+
+def _assert_same_ordering(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Bit-exact equality, with NaN counted equal to NaN.
+
+    `torch.equal` has no equal_nan, and a sort that moves NaN correctly still
+    has to be compared for NaN in the right *place*.
+    """
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+
+
+def _sort_probe(rows: int, columns: int, seed: int = 7) -> torch.Tensor:
+    """Values with deliberate ties, both zeros, and a NaN in longer rows."""
+    generator = torch.Generator().manual_seed(seed)
+    host = torch.randn(rows, columns, generator=generator)
+    if columns >= 16:
+        host[:, ::7] = 0.0
+        host[:, ::11] = -0.0
+        host[:, ::13] = 1.5
+        host[:, 3] = float("nan")
+    return host
+
+
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("columns", _SORT_ROUTE_SIZES)
+def test_fast_sort_matches_stable_cpu_on_every_route(mojo_gpu, columns, descending):
+    host = _sort_probe(2, columns)
+    expected = torch.sort(host, dim=-1, descending=descending, stable=True)
+    actual = torch.sort(host.to(mojo_gpu), dim=-1, descending=descending, stable=True)
+    _assert_same_ordering(actual.values.cpu(), expected.values)
+    _assert_same_ordering(actual.indices.cpu(), expected.indices)
+
+
+@pytest.mark.parametrize(
+    ("columns", "k"),
+    [
+        # k small enough for the tournament route (one tile per row's worth of
+        # candidates), then the first k that no longer fits and has to fall
+        # back to the full sort, then a k spanning the whole row.
+        (50257, 50),
+        (50257, 315),
+        (50257, 316),
+        (50257, 2048),
+        (8193, 4096),
+        (4096, 4096),
+        (33, 33),
+    ],
+)
+@pytest.mark.parametrize("largest", [True, False])
+def test_fast_topk_matches_stable_cpu_across_the_tournament_boundary(
+    mojo_gpu, columns, k, largest
+):
+    """Values against ATen, indices against the stable sort's prefix.
+
+    ATen leaves topk's tie order unspecified (CPU and CUDA disagree with each
+    other on this data), so only the values are comparable to `torch.topk`.
+    The indices are pinned to the stronger contract this kernel actually
+    offers -- the first k of the stable sort -- which is what makes a tie
+    reproducible here at all.
+    """
+    host = _sort_probe(2, columns, seed=11)
+    expected = torch.topk(host, k, dim=-1, largest=largest)
+    actual = torch.topk(host.to(mojo_gpu), k, dim=-1, largest=largest)
+    _assert_same_ordering(actual.values.cpu(), expected.values)
+
+    stable = torch.sort(host, dim=-1, descending=largest, stable=True)
+    _assert_same_ordering(actual.indices.cpu(), stable.indices[..., :k])
+
+
+def test_fast_sort_orders_nan_and_signed_zero_like_aten(mojo_gpu):
+    """The two bit patterns the monotone key gets wrong on its own.
+
+    A negative NaN's bits sit below -inf and -0.0's below +0.0, but ATen
+    orders every NaN above every number and treats the two zeros as equal, so
+    the kernel overrides both before comparing.
+    """
+    host = torch.tensor(
+        [
+            [
+                0.0,
+                -0.0,
+                float("nan"),
+                -float("nan"),
+                float("inf"),
+                -float("inf"),
+                1.0,
+                -1.0,
+            ]
+        ]
+    )
+    for descending in (False, True):
+        expected = torch.sort(host, dim=-1, descending=descending, stable=True)
+        actual = torch.sort(
+            host.to(mojo_gpu), dim=-1, descending=descending, stable=True
+        )
+        _assert_same_ordering(actual.values.cpu(), expected.values)
+        _assert_same_ordering(actual.indices.cpu(), expected.indices)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float64,
+        torch.bfloat16,
+        torch.float16,
+        torch.int64,
+        torch.int32,
+        torch.int16,
+        torch.int8,
+        torch.uint8,
+        torch.bool,
+    ],
+)
+def test_fast_sort_covers_its_declared_dtypes(mojo_gpu, dtype):
+    """Every kernel dtype, on a row long enough to cross tiles.
+
+    The 64-bit dtypes matter most: their key is twice as wide, which halves
+    the shared-memory tile and so moves every route boundary.
+    """
+    host = torch.arange(2 * 6000, dtype=torch.int64)
+    host = ((host * 37 + 11) % 251).reshape(2, 6000)
+    if dtype is torch.bool:
+        host = host % 2 == 0
+    else:
+        host = (host - 125).to(dtype)
+    expected = torch.sort(host, dim=-1, stable=True)
+    actual = torch.sort(host.to(mojo_gpu), dim=-1, stable=True)
+    assert torch.equal(actual.values.cpu(), expected.values)
+    assert torch.equal(actual.indices.cpu(), expected.indices)
+
+
+def test_fast_sort_and_topk_materialize_non_contiguous_and_non_last_dims(mojo_gpu):
+    """A dim other than the last is transposed to last and back, and a view
+    of the result must not read the wrong elements."""
+    host = _sort_probe(9, 7, seed=3)
+    device = host.to(mojo_gpu)
+    for dim in (0, 1, -1, -2):
+        expected = torch.sort(host, dim=dim, stable=True)
+        actual = torch.sort(device, dim=dim, stable=True)
+        _assert_same_ordering(actual.values.cpu(), expected.values)
+        _assert_same_ordering(actual.indices.cpu(), expected.indices)
+
+    transposed_expected = torch.topk(host.t(), 3, dim=-1)
+    transposed_actual = torch.topk(device.t(), 3, dim=-1)
+    _assert_same_ordering(transposed_actual.values.cpu(), transposed_expected.values)
+    sliced_expected = torch.sort(host[:, 1::2], dim=-1, stable=True)
+    sliced_actual = torch.sort(device[:, 1::2], dim=-1, stable=True)
+    _assert_same_ordering(sliced_actual.values.cpu(), sliced_expected.values)
+
+
+def test_fast_sort_and_topk_reject_out_of_range_arguments(mojo_gpu):
+    tensor = torch.randn(4, 8).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="selected index k out of range"):
+        torch.topk(tensor, 9, dim=-1)
+    with pytest.raises(IndexError, match="Dimension out of range"):
+        torch.sort(tensor, dim=2)
+
+
+# ---------------------------------------------------------------------------
+# multinomial.  A sampler, so it is tested differently from a kernel: the
+# mojo device's own draws are never compared to CPU's (different RNG
+# streams -- that's expected, not a bug), only (1) determinism under a fixed
+# seed, (2) the sampled DISTRIBUTION against the true weights, and (3) the
+# ATen edge semantics that don't depend on which values got drawn.
+#
+# With replacement is cumsum + Philox uniforms (same generator `uniform_`
+# already uses) + searchsorted; without replacement is Gumbel-top-k over
+# #416's topk kernel. See `fast_aten_multinomial` in aten_fast.py for why
+# each is a correct-DISTRIBUTION sampler without being ATen bit-identical.
+# ---------------------------------------------------------------------------
+
+
+def test_fast_multinomial_is_reproducible_under_manual_seed(mojo_device):
+    weights = torch.tensor([0.1, 0.2, 0.3, 0.4], device=mojo_device)
+    torch.mojo.manual_seed_all(20260819)
+    first = torch.multinomial(weights, 4096, replacement=True).cpu()
+    torch.mojo.manual_seed_all(20260819)
+    second = torch.multinomial(weights, 4096, replacement=True).cpu()
+    assert torch.equal(first, second)
+
+    torch.mojo.manual_seed_all(20260819)
+    first_wo = torch.multinomial(weights, 4, replacement=False).cpu()
+    torch.mojo.manual_seed_all(20260819)
+    second_wo = torch.multinomial(weights, 4, replacement=False).cpu()
+    assert torch.equal(first_wo, second_wo)
+
+
+def test_fast_multinomial_torch_manual_seed_also_reproduces(mojo_device):
+    """`torch.manual_seed` (not just `torch.mojo.manual_seed_all`) reseeds
+    the mojo device too, same as it already does for `uniform_`/`rand`."""
+    weights = torch.tensor([1.0, 1.0, 1.0], device=mojo_device)
+    torch.manual_seed(4242)
+    first = torch.multinomial(weights, 1024, replacement=True).cpu()
+    torch.manual_seed(4242)
+    second = torch.multinomial(weights, 1024, replacement=True).cpu()
+    assert torch.equal(first, second)
+
+
+def test_fast_multinomial_with_replacement_matches_weight_distribution(mojo_device):
+    """Frequency of each category over many draws, against the true
+    (normalized) weights -- same moment-check style as
+    `test_fast_uniform_bounds_and_distribution`, not a bit-parity check."""
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.tensor([1.0, 2.0, 3.0, 4.0], device=mojo_device)
+    n = 200_000
+    drawn = torch.multinomial(weights, n, replacement=True).cpu()
+    observed = drawn.bincount(minlength=4).double() / n
+    expected = weights.cpu().double() / weights.cpu().double().sum()
+    assert (observed - expected).abs().max().item() < 0.01
+
+
+def test_fast_multinomial_unnormalized_weights_accepted(mojo_device):
+    """Weights need not sum to 1 -- ATen normalizes internally."""
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.tensor([10.0, 20.0, 30.0, 40.0], device=mojo_device)
+    n = 100_000
+    drawn = torch.multinomial(weights, n, replacement=True).cpu()
+    observed = drawn.bincount(minlength=4).double() / n
+    expected = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float64)
+    assert (observed - expected).abs().max().item() < 0.01
+
+
+@pytest.mark.parametrize("replacement", [True, False])
+def test_fast_multinomial_zero_probability_categories_never_drawn(
+    mojo_device, replacement
+):
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0], device=mojo_device)
+    num_samples = 2 if replacement is False else 4000
+    drawn = torch.multinomial(weights, num_samples, replacement=replacement).cpu()
+    assert set(drawn.unique().tolist()) <= {1, 3}
+
+
+def test_fast_multinomial_single_nonzero_always_sampled(mojo_device):
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.tensor([0.0, 0.0, 5.0, 0.0], device=mojo_device)
+    drawn = torch.multinomial(weights, 500, replacement=True).cpu()
+    assert bool((drawn == 2).all())
+
+
+def test_fast_multinomial_without_replacement_never_repeats(mojo_device):
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.rand(64, device=mojo_device) + 0.01
+    for _ in range(20):
+        drawn = torch.multinomial(weights, 64, replacement=False).cpu()
+        assert len(set(drawn.tolist())) == 64
+
+
+def test_fast_multinomial_without_replacement_first_pick_matches_weight_distribution(
+    mojo_device,
+):
+    """The Gumbel-top-k trick's FIRST selected index alone has exactly the
+    plain categorical distribution -- a testable, well-known property of the
+    algorithm, distinct from (and complementary to) the no-repeat check."""
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.tensor([1.0, 2.0, 3.0, 4.0], device=mojo_device)
+    n = 50_000
+    first_picks = torch.stack(
+        [torch.multinomial(weights, 2, replacement=False)[0] for _ in range(n)]
+    ).cpu()
+    observed = first_picks.bincount(minlength=4).double() / n
+    expected = weights.cpu().double() / weights.cpu().double().sum()
+    assert (observed - expected).abs().max().item() < 0.02
+
+
+def test_fast_multinomial_num_samples_between_nonzero_and_total_does_not_raise(
+    mojo_device,
+):
+    """ATen's own multinomial(replacement=False) does NOT require enough
+    positive-probability categories to cover num_samples -- it only raises
+    once num_samples exceeds the TOTAL category count (verified against CPU
+    torch: `multinomial([1,0,0,0], num_samples=4, replacement=False)`
+    succeeds and includes zero-weight categories). This backend matches that
+    permissiveness (Gumbel-top-k naturally ranks -inf-perturbed zero-weight
+    categories below every positive one, deterministically) without
+    promising the same fallback ORDER CPU's own implementation picks."""
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.tensor([1.0, 0.0, 0.0, 0.0], device=mojo_device)
+    drawn = torch.multinomial(weights, 4, replacement=False).cpu()
+    assert sorted(drawn.tolist()) == [0, 1, 2, 3]
+    assert drawn[0].item() == 0  # the only positive-weight category wins first
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.bfloat16, torch.float16]
+)
+@pytest.mark.parametrize("replacement", [True, False])
+def test_fast_multinomial_covers_its_declared_dtypes(mojo_gpu, dtype, replacement):
+    """float64 weights are a real declared dtype (`multinomial only supports
+    floating-point dtypes` on CPU accepts it too), but neither the
+    validation reductions nor `aten::cumsum` have a float64 kernel --
+    `_multinomial_validate_and_prepare` downcasts via a host round-trip
+    first, same precedent as `mojo_device_normal_`."""
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=dtype, device=mojo_gpu)
+    num_samples = 3 if replacement is False else 16
+    drawn = torch.multinomial(weights, num_samples, replacement=replacement)
+    assert drawn.dtype == torch.int64
+    assert drawn.min().item() >= 0
+    assert drawn.max().item() < 4
+
+
+def test_fast_multinomial_2d_batched_rows_are_independent(mojo_device):
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], device=mojo_device
+    )
+    drawn = torch.multinomial(weights, 200, replacement=True).cpu()
+    assert bool((drawn[0] == 0).all())
+    assert bool((drawn[1] == 1).all())
+    assert bool((drawn[2] == 2).all())
+
+
+def test_fast_multinomial_without_replacement_full_row_is_a_permutation(mojo_device):
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.tensor(
+        [[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]], device=mojo_device
+    )
+    drawn = torch.multinomial(weights, 4, replacement=False).cpu()
+    for row in drawn:
+        assert sorted(row.tolist()) == [0, 1, 2, 3]
+
+
+def test_fast_multinomial_decode_shape_realistic(mojo_device):
+    """The `generate()` regime: batch 1, a GPT-2-sized vocabulary,
+    num_samples=1, with replacement."""
+    torch.mojo.manual_seed_all(20260819)
+    weights = torch.rand(1, 50304, device=mojo_device)
+    drawn = torch.multinomial(weights, 1, replacement=True)
+    assert drawn.shape == (1, 1)
+    assert drawn.dtype == torch.int64
+    assert 0 <= drawn.item() < 50304
+
+
+def test_fast_multinomial_rng_state_advances_and_round_trips(mojo_device):
+    torch.mojo.manual_seed_all((1 << 63) + 0x777)
+    initial = torch.mojo.get_rng_state(mojo_device)
+    weights = torch.tensor([1.0, 1.0, 1.0, 1.0], device=mojo_device)
+    first = torch.multinomial(weights, 8, replacement=True).cpu()
+    advanced = torch.mojo.get_rng_state(mojo_device)
+    assert not torch.equal(initial, advanced)
+
+    torch.mojo.set_rng_state(initial, mojo_device)
+    replayed = torch.multinomial(weights, 8, replacement=True).cpu()
+    assert torch.equal(first, replayed)
+    assert torch.equal(torch.mojo.get_rng_state(mojo_device), advanced)
+
+
+# ---------------------------------------------------------------------------
+# median.dim / kthvalue eager coverage: both reuse the sort/topk kernel
+# family above, so this is a dtype/shape sweep on top of that kernel's own
+# extensive route-boundary tests, not a new set of route boundaries.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float64,
+        torch.bfloat16,
+        torch.float16,
+        torch.int64,
+        torch.int32,
+        torch.int16,
+        torch.int8,
+        torch.uint8,
+    ],
+)
+def test_fast_median_and_kthvalue_cover_their_declared_dtypes(mojo_gpu, dtype):
+    host = torch.arange(2 * 37, dtype=torch.int64)
+    host = ((host * 37 + 11) % 251).reshape(2, 37)
+    host = (host - 125).to(dtype)
+    expected_median = torch.median(host, dim=-1)
+    expected_kth = torch.kthvalue(host, 5, dim=-1)
+
+    device = host.to(mojo_gpu)
+    got_median = torch.median(device, dim=-1)
+    got_kth = torch.kthvalue(device, 5, dim=-1)
+    assert torch.equal(got_median.values.cpu(), expected_median.values)
+    assert torch.equal(got_median.indices.cpu(), expected_median.indices)
+    assert torch.equal(got_kth.values.cpu(), expected_kth.values)
+
+
+def test_fast_median_declines_bool(mojo_gpu):
+    """ATen itself doesn't implement median for bool ("median_out" not
+    implemented for 'Bool') -- declining here is the matching behavior, not
+    a gap."""
+    tensor = (torch.arange(8) % 2 == 0).reshape(2, 4).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.median(tensor, dim=-1)
+
+
 def test_fast_lerp_scalar_out_and_inplace_alias(mojo_gpu):
     """AdamW's lerp out path preserves ATen's FP32 branch and aliases."""
     # This Python double rounds to exactly 0.5f. ATen narrows before choosing
