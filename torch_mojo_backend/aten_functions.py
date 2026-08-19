@@ -3592,6 +3592,43 @@ def aten_upsample_bilinear2d(
 
 
 # upsample_nearest2d.vec(Tensor input, SymInt[]? output_size, float[]? scale_factors) -> Tensor
+@map_to(aten.upsample_nearest2d)
+def aten_upsample_nearest2d(
+    input: MaxTensor,
+    output_size: list[SymIntType] | None,
+    scale_factors: list[float] | None = None,
+) -> MaxTensor:
+    if len(input.shape) != 4:
+        raise ValueError(
+            "The Mojo backend currently only supports upsample_nearest2d for 4D tensors"
+        )
+    if output_size is None:
+        if scale_factors is None:
+            raise ValueError(
+                "upsample_nearest2d requires exactly one of output_size or scale_factors"
+            )
+        # Matches at::native::upsample::compute_output_size: truncate
+        # input_size * scale_factor towards zero, per spatial axis.
+        in_h = int(input.shape[2])
+        in_w = int(input.shape[3])
+        output_size = [int(in_h * scale_factors[0]), int(in_w * scale_factors[1])]
+
+    output_shape = [input.shape[0], input.shape[1], output_size[0], output_size[1]]
+    # coordinate_transform_mode=2 (asymmetric) + round_mode=2 (floor) reproduces
+    # torch's nearest_neighbor_compute_source_index: floor(dst_index * scale)
+    # clamped to input_size - 1, where MAX's internal scale is out_size/in_size
+    # (the reciprocal of torch's). This is exact whenever the output size was
+    # not itself rounded from a non-integral scale_factor (always true for an
+    # explicit output_size, and true for the common exact scale_factors like
+    # 2.0 tested here); an unusual scale_factor whose input_size * scale_factor
+    # is not itself an integer can diverge by at most one source pixel at the
+    # boundary, unlike the eager path (mojo_device), which is always exact
+    # because it receives torch's already-resolved scales_h/scales_w.
+    return F.resize_nearest(
+        input, output_shape, coordinate_transform_mode=2, round_mode=2
+    )
+
+
 # var.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False) -> Tensor
 # var.dim(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False) -> Tensor
 @map_to(aten.var)

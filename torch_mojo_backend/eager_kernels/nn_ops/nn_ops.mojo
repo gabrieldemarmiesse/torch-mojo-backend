@@ -2565,6 +2565,103 @@ def _upsample_bilinear2d_go(
 
 
 # ---------------------------------------------------------------------------
+# Nearest-neighbor upsample 2D over NCHW contiguous input. The per-axis scale
+# ratio is resolved Python-side (torch's compute_scales_value: 1/scale when a
+# scale is given, else in_size/out_size), matching torch's
+# nearest_neighbor_compute_source_index exactly: no interpolation weights, so
+# each output element is a straight copy of its source element. One parallel
+# task per output element (CPU and GPU).
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _nearest_source_index(ratio: Float32, dst: Int, in_size: Int) -> Int:
+    """torch nearest_neighbor_compute_source_index for one axis."""
+    var idx = Int(floor(ratio * Float32(dst)))
+    if idx > in_size - 1:
+        idx = in_size - 1
+    return idx
+
+
+@always_inline
+def _upsample_nearest2d[
+    dtype: DType
+](
+    out_addr: Int,
+    in_addr: Int,
+    ratio_h: Float32,
+    ratio_w: Float32,
+    in_h: Int,
+    in_w: Int,
+    out_h: Int,
+    out_w: Int,
+    planes: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var in_ptr = _make_ptr[dtype](in_addr)
+
+    @always_inline
+    @parameter
+    @__copy_capture(out_ptr, in_ptr)
+    def func[width: Int, alignment: Int = 1](idx: Coord):
+        var i = Int(idx[0].value())
+        var ow = i % out_w
+        var oh = (i // out_w) % out_h
+        var plane = i // (out_w * out_h)
+        var in_base = plane * in_h * in_w
+
+        var ih = _nearest_source_index(ratio_h, oh, in_h)
+        var iw = _nearest_source_index(ratio_w, ow, in_w)
+
+        out_ptr[i] = in_ptr[in_base + ih * in_w + iw]
+
+    _parallel_for[func](planes * out_h * out_w, ctx)
+
+
+def _upsample_nearest2d_go(
+    out_ptr_obj: PyObjectPtr,
+    in_ptr_obj: PyObjectPtr,
+    params: PyObjectPtr,  # (ratio_h, ratio_w, in_h, in_w, out_h, out_w, planes)
+    dtype_obj: PyObjectPtr,
+    device_context_ptr: PyObjectPtr,
+) raises:
+    var dtype = _raw_dtype_int(dtype_obj)
+    var out_addr = _raw_int(out_ptr_obj)
+    var in_addr = _raw_int(in_ptr_obj)
+    var ratio_h = Float32(_raw_tuple_f64(params, 0))
+    var ratio_w = Float32(_raw_tuple_f64(params, 1))
+    var in_h = _raw_tuple_int(params, 2)
+    var in_w = _raw_tuple_int(params, 3)
+    var out_h = _raw_tuple_int(params, 4)
+    var out_w = _raw_tuple_int(params, 5)
+    var planes = _raw_tuple_int(params, 6)
+    var ctx = _raw_ctx(device_context_ptr)
+
+    var handled = False
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                _upsample_nearest2d[dt](
+                    out_addr,
+                    in_addr,
+                    ratio_h,
+                    ratio_w,
+                    in_h,
+                    in_w,
+                    out_h,
+                    out_w,
+                    planes,
+                    ctx,
+                )
+                handled = True
+    if not handled:
+        raise Error(
+            "unsupported dtype for fast upsample_nearest2d: " + String(dtype)
+        )
+
+
+# ---------------------------------------------------------------------------
 # METH_FASTCALL wrappers: raw CPython argument unpacking (no owning
 # PythonObject per argument). Argument types are guaranteed by the internal
 # Python callers; raise sites are unsupported-dtype guards gated upstream.
@@ -2739,6 +2836,19 @@ def _upsample_bilinear2d_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _upsample_bilinear2d_go(args[0], args[1], args[2], args[3], args[4])
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
+def _upsample_nearest2d_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _upsample_nearest2d_go(args[0], args[1], args[2], args[3], args[4])
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -3190,6 +3300,14 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
                 b,
                 _upsample_bilinear2d_dispatcher,
                 docstring="bilinear upsample over NCHW contiguous input",
+            )
+        comptime if _op_on["UpsampleNearest2d"]():
+            _register_call(
+                b,
+                _upsample_nearest2d_dispatcher,
+                docstring=(
+                    "nearest-neighbor upsample over NCHW contiguous input"
+                ),
             )
         comptime if _op_on["Gather0"]():
             _register_call(

@@ -39,6 +39,7 @@ from .aten_ops.autograd_preflight import (
     mojo_device_softmax,
     mojo_device_tanh,
     mojo_device_upsample_bilinear2d,
+    mojo_device_upsample_nearest2d,
 )
 from .aten_ops.blas import mojo_device_addr
 from .aten_ops.factories import (
@@ -402,6 +403,7 @@ _register_fast("aten::unbind.int", "fast_aten_unbind")
 _register_fast("aten::uniform_", "fast_aten_uniform_")
 _register_fast("aten::unsqueeze", "fast_aten_unsqueeze")
 register_aten_op("aten::upsample_bilinear2d")(mojo_device_upsample_bilinear2d)
+register_aten_op("aten::upsample_nearest2d")(mojo_device_upsample_nearest2d)
 _register_fast("aten::var.correction", "fast_aten_var")
 _register_fast("aten::view", "fast_aten_view")
 _register_fast("aten::where.self", "fast_aten_where")

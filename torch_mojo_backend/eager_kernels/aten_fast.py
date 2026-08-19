@@ -6523,6 +6523,53 @@ def fast_aten_upsample_bilinear2d(
     return NOT_HANDLED
 
 
+def _nearest_scale(in_size: int, out_size: int, scale: float | None) -> float:
+    """torch compute_scales_value for one axis: the reciprocal of an explicit
+    scale, else the plain input/output size ratio."""
+    if scale is not None and scale > 0:
+        return 1.0 / scale
+    return in_size / out_size
+
+
+def fast_aten_upsample_nearest2d(
+    input: torch.Tensor,
+    output_size: Sequence[int],
+    scales_h: float | None = None,
+    scales_w: float | None = None,
+) -> TorchMojoTensor | object:
+    a = _tc(input)
+    osize = _pair(output_size)
+    if (
+        a is not None
+        and a._numel > 0
+        and a._dtype in _FLOAT_DTYPES
+        and len(a._shape) == 4
+        and osize is not None
+    ):
+        n, c, in_h, in_w = a._shape
+        out_h, out_w = osize
+        if out_h > 0 and out_w > 0:
+            ratio_h = _nearest_scale(in_h, out_h, scales_h)
+            ratio_w = _nearest_scale(in_w, out_w, scales_w)
+            out = _alloc((n, c, out_h, out_w), a._dtype, a._device)
+            _call_mojo(
+                _NNExtension,
+                "UpsampleNearest2d",
+                (
+                    out._ptr,
+                    a._ptr,
+                    (float(ratio_h), float(ratio_w), in_h, in_w, out_h, out_w, n * c),
+                    a._dtype.value,
+                    _ctx_ptr(a._device),
+                ),
+                arg_dtypes=(a._dtype,),
+                output_dtypes=(out._dtype,),
+                keepalive=(out, a),
+            )
+            return out
+    return NOT_HANDLED
+
+
 # Causal regimes of `matmul_ops.CausalBmm`; see the CAUSAL_* aliases there.
 SDPA_CAUSAL_NONE = 0
 SDPA_CAUSAL_OUT = 1

@@ -3886,6 +3886,43 @@ def test_aten_linear_backward_degenerate_features(
         torch.testing.assert_close(got.cpu(), want)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("kwargs", "shape"),
+    [
+        pytest.param(
+            {"scale_factor": 2, "mode": "nearest"}, (2, 3, 8, 8), id="scale_factor_2x"
+        ),
+        pytest.param(
+            {"size": (20, 20), "mode": "nearest"},
+            (2, 3, 8, 8),
+            id="output_size_8_to_20",
+        ),
+    ],
+)
+def test_aten_upsample_nearest2d(
+    conf: Conf,
+    dtype: torch.dtype,
+    kwargs: dict,
+    shape: tuple[int, ...],
+    call_checker: CallChecker,
+):
+    """F.interpolate(..., mode="nearest") dispatches to
+    aten::upsample_nearest2d.vec. Covers an integer scale_factor (2x, an exact
+    ratio) and an explicit non-integer-scale output_size (8 -> 20), which is
+    nearest-neighbor's own index formula (no interpolation weights, unlike
+    bilinear), so the output must be an exact copy of the source elements --
+    no tolerance needed.
+    """
+    call_checker.register(aten_functions.aten_upsample_nearest2d)
+
+    def fn(x):
+        return torch.nn.functional.interpolate(x, **kwargs)
+
+    x = torch.randn(shape, dtype=dtype)
+    check_outputs(fn, conf, [x], atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_aten_var_no_dim(conf: Conf, dtype: torch.dtype, call_checker: CallChecker):
     """Test aten.var over all dimensions (default correction=1)"""
