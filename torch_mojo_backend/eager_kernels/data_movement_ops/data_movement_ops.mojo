@@ -3258,6 +3258,189 @@ def _scatter_dim_go(
 
 
 # ---------------------------------------------------------------------------
+# Pad2D: out[b, oh, ow] = in[b, ih, iw], where (ih, iw) come from reflecting
+# or clamping (oh - pad_t, ow - pad_l) into [0, in_h) x [0, in_w). Implements
+# aten::reflection_pad2d and aten::replication_pad2d over a contiguous
+# (batch, in_h, in_w) view (batch = product of the leading dims); `reflect`
+# is a runtime flag selecting the boundary rule, so one kernel body serves
+# both ops -- the same shared-body-plus-runtime-flag shape TriangularCopy
+# uses for tril/triu. Element-size dispatch, like GatherRows/TriangularCopy.
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _reflect_index(x: Int, length: Int) -> Int:
+    """Fold a possibly out-of-[0, length) coordinate back in by mirroring at
+    each edge without repeating the boundary element (numpy's
+    mode="reflect"), matching ATen's CUDA `reflect_index` helper
+    (ReflectionPad.cu): period 2*(length-1), reduced modulo that period."""
+    if length <= 1:
+        return 0
+    var period = 2 * (length - 1)
+    var m = x % period
+    if m < 0:
+        m += period
+    return m if m < length else period - m
+
+
+@always_inline
+def _clamp_index(x: Int, length: Int) -> Int:
+    """Clamp a possibly out-of-[0, length) coordinate to the nearest edge
+    (numpy's mode="edge", i.e. ATen's replication padding)."""
+    if x < 0:
+        return 0
+    if x >= length:
+        return length - 1
+    return x
+
+
+def _pad2d[
+    dtype: DType
+](
+    out_addr: Int,
+    in_addr: Int,
+    batch: Int,
+    in_h: Int,
+    in_w: Int,
+    pad_l: Int,
+    pad_r: Int,
+    pad_t: Int,
+    pad_b: Int,
+    reflect: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var in_ptr = _make_ptr[dtype](in_addr)
+    # out_h/out_w/is_reflect are computed INSIDE the closure below, from
+    # captured parameters, rather than hoisted into `var`s here: a GPU
+    # closure capturing an enclosing-function-local `var` by reference reads
+    # garbage on device (see AGENTS.md), while its own parameters (in_h,
+    # in_w, pad_t, pad_l, pad_r, pad_b, reflect) capture correctly, matching
+    # `_gather_rows`'s row_len/size0 precedent above.
+    var out_h_ = in_h + pad_t + pad_b
+    var out_w_ = in_w + pad_l + pad_r
+
+    @always_inline
+    @parameter
+    @__copy_capture(out_ptr, in_ptr)
+    def func[width: Int, alignment: Int = 1](coord: Coord):
+        var out_h = in_h + pad_t + pad_b
+        var out_w = in_w + pad_l + pad_r
+        var is_reflect = reflect != 0
+        var i = Int(coord[0].value())
+        var ow = i % out_w
+        var rest = i // out_w
+        var oh = rest % out_h
+        var b = rest // out_h
+        var ih: Int
+        var iw: Int
+        if is_reflect:
+            ih = _reflect_index(oh - pad_t, in_h)
+            iw = _reflect_index(ow - pad_l, in_w)
+        else:
+            ih = _clamp_index(oh - pad_t, in_h)
+            iw = _clamp_index(ow - pad_l, in_w)
+        out_ptr[i] = in_ptr[(b * in_h + ih) * in_w + iw]
+
+    _parallel_for[func](batch * out_h_ * out_w_, ctx)
+
+
+def _pad2d_go(
+    out_ptr: PyObjectPtr,
+    in_ptr: PyObjectPtr,
+    batch_o: PyObjectPtr,
+    in_h_o: PyObjectPtr,
+    in_w_o: PyObjectPtr,
+    pad_l_o: PyObjectPtr,
+    pad_r_o: PyObjectPtr,
+    pad_t_o: PyObjectPtr,
+    pad_b_o: PyObjectPtr,
+    reflect_o: PyObjectPtr,
+    itemsize_o: PyObjectPtr,
+    ctx_ptr: PyObjectPtr,
+) raises:
+    var out_addr = _raw_int(out_ptr)
+    var in_addr = _raw_int(in_ptr)
+    var batch = _raw_int(batch_o)
+    var in_h = _raw_int(in_h_o)
+    var in_w = _raw_int(in_w_o)
+    var pad_l = _raw_int(pad_l_o)
+    var pad_r = _raw_int(pad_r_o)
+    var pad_t = _raw_int(pad_t_o)
+    var pad_b = _raw_int(pad_b_o)
+    var reflect = _raw_int(reflect_o)
+    var itemsize = _raw_int(itemsize_o)
+    var ctx = _raw_ctx(ctx_ptr)
+
+    comptime if _dtype_arg_width_on[0, 32]():
+        if itemsize != 4:
+            raise Error("Pad2D specialization/itemsize mismatch")
+        _pad2d[DType.uint32](
+            out_addr,
+            in_addr,
+            batch,
+            in_h,
+            in_w,
+            pad_l,
+            pad_r,
+            pad_t,
+            pad_b,
+            reflect,
+            ctx,
+        )
+    elif _dtype_arg_width_on[0, 16]():
+        if itemsize != 2:
+            raise Error("Pad2D specialization/itemsize mismatch")
+        _pad2d[DType.uint16](
+            out_addr,
+            in_addr,
+            batch,
+            in_h,
+            in_w,
+            pad_l,
+            pad_r,
+            pad_t,
+            pad_b,
+            reflect,
+            ctx,
+        )
+    elif _dtype_arg_width_on[0, 64]():
+        if itemsize != 8:
+            raise Error("Pad2D specialization/itemsize mismatch")
+        _pad2d[DType.uint64](
+            out_addr,
+            in_addr,
+            batch,
+            in_h,
+            in_w,
+            pad_l,
+            pad_r,
+            pad_t,
+            pad_b,
+            reflect,
+            ctx,
+        )
+    elif _dtype_arg_width_on[0, 8]():
+        if itemsize != 1:
+            raise Error("Pad2D specialization/itemsize mismatch")
+        _pad2d[DType.uint8](
+            out_addr,
+            in_addr,
+            batch,
+            in_h,
+            in_w,
+            pad_l,
+            pad_r,
+            pad_t,
+            pad_b,
+            reflect,
+            ctx,
+        )
+    else:
+        raise Error("Pad2D: unsupported element size ", itemsize)
+
+
+# ---------------------------------------------------------------------------
 # METH_FASTCALL wrappers: raw CPython argument unpacking (no owning
 # PythonObject per argument). Argument types are guaranteed by the internal
 # Python callers; raise sites are unsupported-dtype guards gated upstream.
@@ -3434,6 +3617,32 @@ def _scatter_dim_dispatcher(
     return _raw_ret_none()
 
 
+def _pad2d_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _pad2d_go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+            args[9],
+            args[10],
+            args[11],
+        )
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
 def _cast_spec_into_go(
     a_o: PyObjectPtr, out_dtype_o: PyObjectPtr, out_o: PyObjectPtr
 ) raises:
@@ -3580,6 +3789,18 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
                 docstring=(
                     "out[coord with dim := index[coord]] = src[coord] or value"
                     " (aten::scatter.src/value, rank <= 4; dtype dispatch)"
+                ),
+            )
+        comptime if _op_on["Pad2D"]():
+            _register_call(
+                b,
+                _pad2d_dispatcher,
+                docstring=(
+                    "out[b, oh, ow] = in[b, reflect_or_clamp(oh - pad_t, in_h),"
+                    " reflect_or_clamp(ow - pad_l, in_w)]"
+                    " (aten::reflection_pad2d / replication_pad2d; element-size"
+                    " dispatch, `reflect` runtime flag selects the boundary"
+                    " rule)"
                 ),
             )
         return b.finalize()

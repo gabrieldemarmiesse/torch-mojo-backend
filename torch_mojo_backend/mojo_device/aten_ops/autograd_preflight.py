@@ -129,8 +129,22 @@ mojo_device_max_pool2d_with_indices = _preflight_unsupported_backward(
     grad_operands=(0,),
 )
 
+mojo_device_reflection_pad2d = _preflight_unsupported_backward(
+    "aten::reflection_pad2d",
+    "fast_aten_reflection_pad2d",
+    "aten::reflection_pad2d_backward",
+    grad_operands=(0,),
+)
+
 mojo_device_relu = _preflight_unsupported_backward(
     "aten::relu", "fast_aten_relu", "aten::threshold_backward", grad_operands=(0,)
+)
+
+mojo_device_replication_pad2d = _preflight_unsupported_backward(
+    "aten::replication_pad2d",
+    "fast_aten_replication_pad2d",
+    "aten::replication_pad2d_backward",
+    grad_operands=(0,),
 )
 
 # Only the `src` gradient goes through `gather`; the `self` gradient is a
