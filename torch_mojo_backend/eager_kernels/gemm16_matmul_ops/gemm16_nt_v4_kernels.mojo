@@ -62,6 +62,11 @@ from layout.tensor_core_async import (
     warpgroup_fence,
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
+from gemm16_bias import (
+    _gemm16_add_bias_to_accum,
+    _gemm16_bias_ptr_ok,
+    _gemm16_bias_tag,
+)
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 comptime _V4_DT = _GEMM16_DT
@@ -191,10 +196,14 @@ def _v4c_nt_defer_tag[defer_release: Bool]() -> StaticString:
 # a 16-hex hash that moves on any refactor -- which is both unreadable and,
 # once this family serves float16 too, wrong about the dtype.
 @__name(
-    t"{_GEMM16_TAG}_gemm_nt_v4_persistent_m{_V4_BM}n{bn}_s{stages}g{raster_h}{_v4c_nt_defer_tag[defer_release]()}"
+    t"{_GEMM16_TAG}_gemm_nt_v4_persistent_m{_V4_BM}n{bn}_s{stages}g{raster_h}{_v4c_nt_defer_tag[defer_release]()}{_gemm16_bias_tag[has_bias]()}"
 )
 def _v4c_nt_persistent[
-    bn: Int, stages: Int, raster_h: Int, defer_release: Bool = False
+    bn: Int,
+    stages: Int,
+    raster_h: Int,
+    defer_release: Bool = False,
+    has_bias: Bool = False,
 ](
     a_tma: _V4_A_TMA,
     b_tma: TMATensorTile[
@@ -209,6 +218,7 @@ def _v4c_nt_persistent[
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
+    bias: _V4_PTR,
 ):
     """Clustered persistent NT kernel with TMA multicast of B.
 
@@ -493,6 +503,9 @@ def _v4c_nt_persistent[
                     c_tma.wait_group[0]()
                 named_barrier[Int32(128)](Int32(warp_group_idx))
 
+                comptime if has_bias:
+                    _gemm16_add_bias_to_accum[CFRAG](accum, bias, n0, n, lane)
+
                 _v4_store_accum_stmatrix[bn](wg_half, accum, warp, lane)
 
                 # Make generic-proxy smem writes visible to the async proxy,
@@ -525,11 +538,16 @@ def _v4c_nt_persistent[
 
 
 def _v4c_enqueue_nt_persistent[
-    bn: Int, stages: Int, raster_h: Int, defer_release: Bool = False
+    bn: Int,
+    stages: Int,
+    raster_h: Int,
+    defer_release: Bool = False,
+    has_bias: Bool = False,
 ](
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
@@ -580,7 +598,7 @@ def _v4c_enqueue_nt_persistent[
         _V4_DT, 2, Index(_V4_WG_ROWS, bn), Index(_V4_WG_ROWS, _V4_C_BOX_N)
     ](c_desc)
     ctx.enqueue_function[
-        _v4c_nt_persistent[bn, stages, raster_h, defer_release]
+        _v4c_nt_persistent[bn, stages, raster_h, defer_release, has_bias]
     ](
         a_tma,
         b_tma,
@@ -588,15 +606,19 @@ def _v4c_enqueue_nt_persistent[
         Int64(m),
         Int64(n),
         Int64(k),
+        bias,
         grid_dim=(grid_x,),
         block_dim=(_V4_THREADS,),
     )
 
 
-def maybe_enqueue_gemm16_nt_v4(
+def maybe_enqueue_gemm16_nt_v4[
+    has_bias: Bool = False
+](
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
@@ -610,6 +632,12 @@ def maybe_enqueue_gemm16_nt_v4(
     pipeline, and TMA descriptor dimension limits.  m and n need NOT be
     tile-aligned: TMA clips partial edge tiles on load and store.
     """
+    comptime if has_bias:
+        # The fused epilogue's two-element bias load is naturally aligned;
+        # an offset bias view is not, and would fault.  Decline so the
+        # caller's ladder serves it some other way.
+        if not _gemm16_bias_ptr_ok(bias):
+            return False
     comptime if _has_sm_9x():
         if ctx.api() == "cuda":
             var cc_major = ctx.get_attribute(
@@ -673,13 +701,13 @@ def maybe_enqueue_gemm16_nt_v4(
                     ) * (192 + 32)
                     if cost_192 * 102 < cost_256 * 100:
                         var grid_x = min(pairs_192, grid_pairs) * _V4_CLUSTER
-                        _v4c_enqueue_nt_persistent[192, 4, 16](
-                            output, a, b, m, n, k, grid_x, ctx
+                        _v4c_enqueue_nt_persistent[192, 4, 16, False, has_bias](
+                            output, a, b, bias, m, n, k, grid_x, ctx
                         )
                         return True
                     var grid_x = min(pairs_256, grid_pairs) * _V4_CLUSTER
-                    _v4c_enqueue_nt_persistent[256, 3, 16](
-                        output, a, b, m, n, k, grid_x, ctx
+                    _v4c_enqueue_nt_persistent[256, 3, 16, False, has_bias](
+                        output, a, b, bias, m, n, k, grid_x, ctx
                     )
                     return True
     return False

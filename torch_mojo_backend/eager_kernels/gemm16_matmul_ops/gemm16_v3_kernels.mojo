@@ -54,6 +54,12 @@ from gemm16_tn_v4_kernels import (
     try_enqueue_gemm16_gemm_tn_v4,
     try_enqueue_gemm16_gemm_tt_v4,
 )
+from gemm16_bias import (
+    _GEMM16_HAS_BIAS,
+    _gemm16_add_bias_to_accum,
+    _gemm16_bias_ptr_ok,
+    _gemm16_bias_tag,
+)
 from gemm16_dtype import (
     _GEMM16_BK,
     _GEMM16_DT,
@@ -678,14 +684,19 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V3_NT_THREADS))
 )
-@__name(t"{_GEMM16_TAG}_gemm_v3_nt_ws_m128n256_tma_s3")
-def _v3_nt_ws_m128n256_tma_s3(
+@__name(
+    t"{_GEMM16_TAG}_gemm_v3_nt_ws_m128n256_tma_s3{_gemm16_bias_tag[has_bias]()}"
+)
+def _v3_nt_ws_m128n256_tma_s3[
+    has_bias: Bool = False
+](
     a_tma: _V3_NT_A_TMA,
     b_tma: _V3_B_K_TMA,
     output: _V3_PTR,
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
+    bias: _V3_PTR,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
@@ -839,6 +850,8 @@ def _v3_nt_ws_m128n256_tma_s3(
             var lane = tid % 32
             var base_row = warp * 16 + lane // 4
             var base_col = (lane % 4) * 2
+            comptime if has_bias:
+                _gemm16_add_bias_to_accum[CFRAG](accum, bias, n0, n, lane)
             comptime for q in range(CFRAG // 2):
                 var e = q * 2
                 var row = (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
@@ -853,10 +866,13 @@ def _v3_nt_ws_m128n256_tma_s3(
                     )
 
 
-def _v3_enqueue_nt_ws_m128n256_tma_s3(
+def _v3_enqueue_nt_ws_m128n256_tma_s3[
+    has_bias: Bool = False
+](
     output: _V3_PTR,
     a: _V3_PTR,
     b: _V3_PTR,
+    bias: _V3_PTR,
     m: Int,
     n: Int,
     k: Int,
@@ -887,13 +903,14 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
     )
     var a_tma = _V3_NT_A_TMA(a_desc)
     var b_tma = _V3_B_K_TMA(b_desc)
-    ctx.enqueue_function[_v3_nt_ws_m128n256_tma_s3](
+    ctx.enqueue_function[_v3_nt_ws_m128n256_tma_s3[has_bias]](
         a_tma,
         b_tma,
         output,
         Int64(m),
         Int64(n),
         Int64(k),
+        bias,
         grid_dim=(grid_x,),
         block_dim=(_V3_NT_THREADS,),
     )
@@ -1545,10 +1562,13 @@ def _try_enqueue_gemm16_tn_route(
 #
 # So ragged m and any even n are served, and k needs only 4-element alignment.
 # ============================================================================
-def _try_enqueue_gemm16_nt_v3_tf32(
+def _try_enqueue_gemm16_nt_v3_tf32[
+    has_bias: Bool = False
+](
     output: _V3_PTR,
     a: _V3_PTR,
     b: _V3_PTR,
+    bias: _V3_PTR,
     m: Int,
     n: Int,
     k: Int,
@@ -1558,6 +1578,9 @@ def _try_enqueue_gemm16_nt_v3_tf32(
         return False
     if ctx.api() != "cuda":
         return False
+    comptime if has_bias:
+        if not _gemm16_bias_ptr_ok(bias):
+            return False
     # _has_sm_9x() is a comptime FAMILY check; on a mixed-architecture box the
     # DeviceContext can still be bound to a non-Hopper device, and this kernel
     # is WGMMA+TMA-only.  Every sibling route checks the runtime compute
@@ -1593,8 +1616,8 @@ def _try_enqueue_gemm16_nt_v3_tf32(
         or blocks_m > max_grid_x // blocks_n
     ):
         return False
-    _v3_enqueue_nt_ws_m128n256_tma_s3(
-        output, a, b, m, n, k, blocks_m * blocks_n, ctx
+    _v3_enqueue_nt_ws_m128n256_tma_s3[has_bias](
+        output, a, b, bias, m, n, k, blocks_m * blocks_n, ctx
     )
     return True
 
@@ -1622,26 +1645,37 @@ def _enqueue_gemm16_gemm_tf32(
     output: _V3_PTR,
     a: _V3_PTR,
     b: _V3_PTR,
+    bias: _V3_PTR,
     m: Int,
     n: Int,
     k: Int,
     transpose_a: Bool,
     transpose_b: Bool,
-    has_bias: Bool,
     ctx: DeviceContext,
 ) raises:
-    if not transpose_a and transpose_b and not has_bias:
-        if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
-            output, a, b, m, n, k, ctx
+    if not transpose_a and transpose_b:
+        # The split-K arm has no fused-bias epilogue (its bias would belong in
+        # the separate reduce kernel, not here), so a biased call skips it and
+        # takes the direct kernel, whose epilogue does fuse.  That would be the
+        # wrong trade for the deep-K shapes split-K exists for -- measured on
+        # an H100 PCIe, 1024x1024x8192 tf32 costs 85us split-K versus 197us
+        # direct -- which is why the host keeps splitting the bias off exactly
+        # those shapes (`_gemm16_splitk_nt_may_fire` in aten_fast.py) and only
+        # sends a fused bias here when the direct kernel is the route anyway.
+        comptime if not _GEMM16_HAS_BIAS:
+            if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
+                output, a, b, m, n, k, ctx
+            ):
+                return
+        if _try_enqueue_gemm16_nt_v3_tf32[_GEMM16_HAS_BIAS](
+            output, a, b, bias, m, n, k, ctx
         ):
             return
-        if _try_enqueue_gemm16_nt_v3_tf32(output, a, b, m, n, k, ctx):
-            return
     raise Error(
-        t"gemm16 float32 (tf32) carries the NT no-bias route only, and only"
-        t" for (k * 4) % 16 == 0 and even n on sm_90a; got m={m} n={n} k={k}"
+        t"gemm16 float32 (tf32) carries the NT route only, and only for"
+        t" (k * 4) % 16 == 0 and even n on sm_90a; got m={m} n={n} k={k}"
         t" transpose_a={transpose_a} transpose_b={transpose_b}"
-        t" has_bias={has_bias}. The host gate in aten_fast.py"
+        t" has_bias={_GEMM16_HAS_BIAS}. The host gate in aten_fast.py"
         t" (_tf32_nt_wgmma_admits) must not offer this call to this bridge."
     )
 
@@ -1659,17 +1693,28 @@ def enqueue_gemm16_gemm(
     has_bias: Bool,
     ctx: DeviceContext,
 ) raises:
+    # The compiled-in HAS_BIAS flag selects which kernels this .so carries, so
+    # it MUST agree with the bias the caller actually passed.  Disagreement can
+    # only come from a loader/bridge bug, and its silent form would be a wrong
+    # answer (a dropped or a garbage bias), so it is checked once per call --
+    # host-side integer compare, next to a GEMM.
+    if has_bias != _GEMM16_HAS_BIAS:
+        raise Error(
+            t"gemm16 was built with HAS_BIAS={_GEMM16_HAS_BIAS} but called"
+            t" with has_bias={has_bias}: the specialization defines and the"
+            t" call ABI have drifted apart."
+        )
     comptime if _GEMM16_TF32:
         _enqueue_gemm16_gemm_tf32(
             output,
             a,
             b,
+            bias,
             m,
             n,
             k,
             transpose_a,
             transpose_b,
-            has_bias,
             ctx,
         )
     else:
@@ -1706,17 +1751,24 @@ def _enqueue_gemm16_gemm_16bit(
     # helper enqueues only for regimes it fully supports (SM90, aligned
     # n/k, TMA-compatible sizes) and returns False otherwise, in which case
     # the pre-existing NT path below remains the fallback.
-    if not transpose_a and transpose_b and not has_bias:
+    if not transpose_a and transpose_b:
         # Deep-K split-K route first: the persistent kernel below keeps all
         # SMs resident but cannot parallelize over K, so an output with few
         # macro-tiles and a deep reduction leaves most of the GPU idle.
         # The helper gates itself on that regime (see
         # gemm16_tn_v4_kernels.mojo) and returns False otherwise.
-        if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
-            output, a, b, m, n, k, ctx
+        comptime if not _GEMM16_HAS_BIAS:
+            # See _enqueue_gemm16_gemm_tf32: split-K has no fused-bias
+            # epilogue, and the host keeps splitting the bias off the deep-K
+            # shapes that reach it rather than pushing them onto the direct
+            # kernel, which is much slower there.
+            if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
+                output, a, b, m, n, k, ctx
+            ):
+                return
+        if maybe_enqueue_gemm16_nt_v4[_GEMM16_HAS_BIAS](
+            output, a, b, bias, m, n, k, ctx
         ):
-            return
-        if maybe_enqueue_gemm16_nt_v4(output, a, b, m, n, k, ctx):
             return
     comptime if _has_sm_9x():
         if ctx.api() == "cuda":
@@ -1893,7 +1945,7 @@ def _enqueue_gemm16_gemm_16bit(
                 if (
                     not transpose_a
                     and transpose_b
-                    and not has_bias
+                    and (not _GEMM16_HAS_BIAS or _gemm16_bias_ptr_ok(bias))
                     and m >= _V3_BM
                     and n >= _V3_BN
                     and k >= _V3_BK
@@ -1923,8 +1975,8 @@ def _enqueue_gemm16_gemm_16bit(
                     ):
                         var grid_x = blocks_m * blocks_n
                         if grid_x > 0:
-                            _v3_enqueue_nt_ws_m128n256_tma_s3(
-                                output, a, b, m, n, k, grid_x, ctx
+                            _v3_enqueue_nt_ws_m128n256_tma_s3[_GEMM16_HAS_BIAS](
+                                output, a, b, bias, m, n, k, grid_x, ctx
                             )
                             return
                 # The remaining TN regimes (underfilled small-tile and large

@@ -6363,11 +6363,17 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     for kernel_name in (
         "gemm_v3_nn_ws_m64n128_tma_s3",
         "gemm_v3_nn_ws_m128n256_tma_s3",
-        "gemm_v3_nt_ws_m128n256_tma_s3",
         "gemm_v3_tn_ws_m64n128_tma_col_a_s3",
         "gemm_v3_tn_ws_m128n256_tma_col_a_s3",
     ):
         assert f'@__name(t"{{_GEMM16_TAG}}_{kernel_name}")' in v3_source
+    # The NT kernel carries a second interpolation: it is specialized on a
+    # fused-bias epilogue, and the two specializations must be tellable apart
+    # in a profile (`..._tma_s3` vs `..._tma_s3_bias`).
+    assert (
+        't"{_GEMM16_TAG}_gemm_v3_nt_ws_m128n256_tma_s3'
+        '{_gemm16_bias_tag[has_bias]()}"' in v3_source
+    )
 
     for helper_name in (
         "_v3_enqueue_nn_ws_m64n128_tma_s3",
@@ -6375,9 +6381,7 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     ):
         assert v3_source.count(f"{helper_name}(") == 2
 
-    nt_kernel_start = v3_source.index(
-        '@__name(t"{_GEMM16_TAG}_gemm_v3_nt_ws_m128n256_tma_s3")'
-    )
+    nt_kernel_start = v3_source.index('t"{_GEMM16_TAG}_gemm_v3_nt_ws_m128n256_tma_s3')
     nt_kernel_end = v3_source.index(
         '@__name(t"{_GEMM16_TAG}_gemm_v3_tn_ws_m64n128_tma_col_a_s3")'
     )
@@ -6597,10 +6601,22 @@ def test_addmm_tries_split_for_aligned_shapes(monkeypatch):
     route -- see _gemm16_alignment_favors_split."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    def tensor(shape):
-        return SimpleNamespace(_shape=tuple(shape))
+    device = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
 
-    lhs, rhs, bias = tensor((128, 128)), tensor((128, 128)), object()
+    def tensor(shape):
+        shape = tuple(shape)
+        return SimpleNamespace(
+            _shape=shape,
+            _strides=aten_fast._row_major_strides(shape),
+            _dtype=aten_fast.DType.bfloat16,
+            _device=device,
+            _ptr=4096,
+            _is_contiguous=True,
+        )
+
+    # NN, so no fused-bias route exists for it whatever the alignment: the
+    # bias-free mm plus a separate add is still the best available pair.
+    lhs, rhs, bias = tensor((128, 128)), tensor((128, 128)), tensor((128,))
     mm_result, biased_result = object(), object()
     gemm_calls = []
     add_calls = []
@@ -7103,29 +7119,35 @@ def test_tf32_wgmma_nt_runs_the_named_wgmma_kernels(mojo_h100: torch.device) -> 
         assert not any("bf16" in name or "f16_gemm" in name for name in names)
 
 
-def test_tf32_linear_and_addmm_split_bias_off_the_wgmma_route(
+def test_tf32_linear_and_addmm_fuse_bias_into_the_wgmma_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A biased NT float32 call splits into mm + add exactly when the WGMMA
-    route serves the mm.
+    """A biased NT float32 call carries its bias to the direct WGMMA kernel,
+    and splits it off only where that kernel is not the route.
 
-    Those kernels have no fused-bias epilogue and decline a biased call, so a
-    fused call would land on the SM80-class kernel; when the WGMMA route would
-    not serve the mm anyway, the split only pays for an extra launch (the S5
-    regression `_gemm16_alignment_favors_split` documents).
+    The direct kernel adds the bias inside its accumulator epilogue, so the
+    bias travels with the call: one launch, and no second full pass over C.
+    Two exceptions keep the old mm-then-add composition -- the deep-K shapes
+    the split-K arm claims (it reduces through an FP32 workspace and has no
+    accumulator epilogue to fuse into), and a bias whose pointer the fused
+    epilogue's naturally-aligned pair load cannot use.
     """
     from torch_mojo_backend.eager_kernels import aten_fast
 
     device = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
 
-    def tensor(shape: tuple[int, int], strides: tuple[int, int]) -> SimpleNamespace:
+    def tensor(
+        shape: tuple[int, ...], strides: tuple[int, ...], ptr: int = 4096
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             _shape=tuple(shape),
             _strides=tuple(strides),
             _dtype=aten_fast.DType.float32,
             _device=device,
-            _ptr=4096,
-            _is_contiguous=strides == (shape[1], 1),
+            _ptr=ptr,
+            _is_contiguous=strides == tuple(shape[1:]) + (1,)
+            if len(shape) == 2
+            else True,
         )
 
     gemm_calls = []
@@ -7150,19 +7172,20 @@ def test_tf32_linear_and_addmm_split_bias_off_the_wgmma_route(
     monkeypatch.setattr(aten_fast, "_try_gemm16_linear", lambda *a, **k: None)
 
     weight = tensor((790, 336), (336, 1))  # (n, k): linear's NT weight
-    bias = object()
+    bias = tensor((790,), (1,))
 
     with _tf32_precision("high"):
-        # Admitted: k % 4 == 0 and n even -> split.
+        # Admitted, direct arm (a 357x790 output is far too large for split-K
+        # to claim): the bias rides along, no separate add.
         assert (
             aten_fast._try_tf32_linear(tensor((357, 336), (336, 1)), weight, bias)
-            is biased_result
+            is mm_result
         )
-        assert gemm_calls == [None]
-        assert add_calls == [(mm_result, bias)]
-        # Declined (k * 4 not 16B-aligned) -> one fused-bias call, no add.
+        assert gemm_calls == [bias]
+        assert add_calls == []
+        # Declined (k * 4 not 16B-aligned): one fused-bias call, no add, as
+        # before -- the SM80-class kernel takes the bias itself.
         gemm_calls.clear()
-        add_calls.clear()
         assert (
             aten_fast._try_tf32_linear(
                 tensor((357, 333), (333, 1)), tensor((790, 333), (333, 1)), bias
@@ -7171,17 +7194,170 @@ def test_tf32_linear_and_addmm_split_bias_off_the_wgmma_route(
         )
         assert gemm_calls == [bias]
         assert add_calls == []
-        # addmm's NT case splits on the same predicate.
+        # Deep K with few output tiles: the split-K arm claims this shape and
+        # cannot fuse, so the bias is split off exactly as it used to be.
+        gemm_calls.clear()
+        deep_bias = tensor((1024,), (1,))
+        assert (
+            aten_fast._try_tf32_linear(
+                tensor((1024, 8192), (8192, 1)),
+                tensor((1024, 8192), (8192, 1)),
+                deep_bias,
+            )
+            is biased_result
+        )
+        assert gemm_calls == [None]
+        assert add_calls == [(mm_result, deep_bias)]
+        # A bias the fused epilogue cannot read as a contiguous n-vector --
+        # a scalar, an expanded view -- keeps the split, whose elementwise
+        # add broadcasts.  Getting this wrong does not fault: the bridge
+        # declines the biased call and the projection falls past BOTH fast
+        # paths.
+        gemm_calls.clear()
+        add_calls.clear()
+        assert (
+            aten_fast._try_tf32_linear(
+                tensor((357, 336), (336, 1)), weight, tensor((), ())
+            )
+            is biased_result
+        )
+        assert gemm_calls == [None]
+        assert add_calls[0][0] is mm_result
+        # A bias reached through an offset view is not 8B-aligned, which the
+        # fused epilogue's pair load requires: split rather than fault.
+        gemm_calls.clear()
+        add_calls.clear()
+        odd_bias = tensor((790,), (1,), ptr=4100)
+        assert (
+            aten_fast._try_tf32_linear(tensor((357, 336), (336, 1)), weight, odd_bias)
+            is biased_result
+        )
+        assert gemm_calls == [None]
+        assert add_calls == [(mm_result, odd_bias)]
+        # addmm's NT case decides on the same predicates.
         gemm_calls.clear()
         add_calls.clear()
         assert (
             aten_fast.fast_aten_addmm(
                 bias, tensor((357, 336), (336, 1)), tensor((336, 790), (1, 336))
             )
-            is biased_result
+            is mm_result
         )
-        assert gemm_calls == [None]
-        assert add_calls == [(mm_result, bias)]
+        assert gemm_calls == [bias]
+        assert add_calls == []
+
+
+def test_gemm16_linear_and_addmm_fuse_bias_into_the_nt_wgmma_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 16-bit twin of the float32 case above.
+
+    `linear` IS the NT regime by construction, and the persistent v4 NT kernel
+    fuses the bias, so a biased 16-bit projection is one launch.  Non-NT
+    layouts have no fused-bias route and keep the mm-then-add split, which is
+    the whole reason `_gemm16_alignment_favors_split` exists.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    device = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(
+        shape: tuple[int, ...], strides: tuple[int, ...], ptr: int = 4096
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=tuple(strides),
+            _dtype=aten_fast.DType.bfloat16,
+            _device=device,
+            _ptr=ptr,
+            _is_contiguous=True,
+        )
+
+    gemm_calls = []
+    add_calls = []
+    mm_result, biased_result = object(), object()
+
+    def try_gemm16_mm(
+        a: object, b: object, bias: object = None, **kwargs: object
+    ) -> object:
+        gemm_calls.append(bias)
+        return mm_result
+
+    def fast_add(value: object, bias: object) -> object:
+        add_calls.append((value, bias))
+        return biased_result
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm16_mm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", fast_add)
+
+    x = tensor((4096, 4096), (4096, 1))
+    weight = tensor((4096, 4096), (4096, 1))  # (n, k)
+    bias = tensor((4096,), (1,))
+
+    # NT (linear): fused, one call.
+    assert aten_fast._try_gemm16_linear(x, weight, bias) is mm_result
+    assert gemm_calls == [bias]
+    assert add_calls == []
+
+    # Deep K, few output tiles: split-K claims it, so the bias is split off.
+    gemm_calls.clear()
+    deep_bias = tensor((1024,), (1,))
+    assert (
+        aten_fast._try_gemm16_linear(
+            tensor((1024, 8192), (8192, 1)), tensor((1024, 8192), (8192, 1)), deep_bias
+        )
+        is biased_result
+    )
+    assert gemm_calls == [None]
+    assert add_calls == [(mm_result, deep_bias)]
+
+    # A scalar bias cannot be read as a contiguous n-vector: split.
+    gemm_calls.clear()
+    add_calls.clear()
+    assert aten_fast._try_gemm16_linear(x, weight, tensor((), ())) is biased_result
+    assert gemm_calls == [None]
+    assert add_calls[0][0] is mm_result
+
+    # An NN addmm has no fused-bias route: the mm-then-add split stands.
+    gemm_calls.clear()
+    add_calls.clear()
+    gemm_calls.clear()
+    add_calls.clear()
+    assert (
+        aten_fast.fast_aten_addmm(bias, x, tensor((4096, 4096), (4096, 1)))
+        is biased_result
+    )
+    assert gemm_calls == [None]
+    assert add_calls == [(mm_result, bias)]
+
+
+def test_gemm16_splitk_nt_may_fire_mirrors_the_split_k_gate() -> None:
+    """The host mirror that keeps deep-K shapes on the split-the-bias path.
+
+    It has to claim every shape the Mojo split-K arm could claim (claiming one
+    it cannot only costs an extra elementwise-add launch, while MISSING one
+    would push a deep-K shape onto the direct kernel, measured 85us -> 197us
+    on 1024x1024x8192 tf32).  The multiprocessor count it cannot query is
+    replaced by its architectural upper bound, in that same direction.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    may_fire = aten_fast._gemm16_splitk_nt_may_fire
+    # The deep-K regime split-K exists for.
+    assert may_fire(1024, 1024, 8192)
+    # The four shapes the eight above-bar addmm/linear cells live on: their
+    # outputs are far too many tiles for a 2-way split to be reachable.
+    assert not may_fire(4096, 4096, 4096)
+    assert not may_fire(8192, 2048, 2048)
+    assert not may_fire(2048, 8192, 2048)
+    assert not may_fire(32768, 768, 768)
+    # Hard gates: the split-K tile is 128 x 256, exactly divided, and a 2-way
+    # split needs 32 k-tiles of 64.
+    assert not may_fire(1000, 1024, 8192)
+    assert not may_fire(1024, 1000, 8192)
+    assert not may_fire(1024, 1024, 8200)
+    assert not may_fire(1024, 1024, 1024)
 
 
 def test_matmul_spec_device_oom_is_not_disguised_as_unsupported(

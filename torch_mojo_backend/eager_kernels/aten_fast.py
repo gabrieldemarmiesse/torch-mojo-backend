@@ -8330,6 +8330,126 @@ def _gemm16_alignment_favors_split(a, b, *, transpose_b: bool = False) -> bool:
     return m % 64 == 0 and n % 64 == 0 and k % 64 == 0
 
 
+# The largest multiprocessor count of any sm_90a part (H100 PCIe 114, H100
+# SXM / H200 / GH200 132).  Used only as an UPPER bound below, where
+# over-estimating it is the safe direction: it can only make
+# `_gemm16_splitk_nt_may_fire` claim more shapes, i.e. keep more of them on
+# today's split-the-bias path.
+_SM90_MAX_MULTIPROCESSORS = 160
+
+
+def _gemm16_splitk_nt_may_fire(m: int, n: int, k: int) -> bool:
+    """Whether the deep-K split-K NT route could claim this shape.
+
+    The split-K kernels write an FP32 workspace and reduce it in a SECOND
+    kernel, so they have no accumulator epilogue to fuse a bias into (that
+    bias belongs in the reduce kernel, which is a different change).  A
+    biased call therefore skips them and takes the direct WGMMA kernel --
+    the right trade everywhere except in the regime split-K exists for,
+    where it is a large loss: 1024x1024x8192 tf32 measures 85us split-K
+    against 197us direct on an H100 PCIe.  So the caller keeps splitting the
+    bias off exactly the shapes this returns True for, and fuses the rest.
+
+    This mirrors `try_enqueue_gemm16_gemm_splitk_rm_v4`'s hard gates
+    (gemm16_tn_v4_kernels.mojo) and the cheapest of its regime conditions,
+    deliberately in the CONSERVATIVE direction: every condition dropped here
+    can only make the Mojo side decline where this says "may", which costs
+    an extra elementwise-add launch on a shape whose C is small by
+    construction -- never the reverse, which would be the 2x loss above.
+    The dropped conditions are the ones needing a device query (the exact
+    multiprocessor count, replaced by its architectural upper bound) or the
+    workspace-size and marginal-split refinements.
+    """
+    # Hard gates: the split-K tile is 128 x 256 with an exact division, and a
+    # 2-way split needs _V4_MIN_CHUNK_TILES = 16 k-tiles of 64 per part.
+    if m % 128 or n % 256 or k % 64 or k // 64 < 2 * 16:
+        return False
+    tiles = (m // 128) * (n // 256)
+    # cap = sm_count // tiles must reach _V4_SPLITK_RM_MIN_SPLITS = 2.
+    return tiles > 0 and 2 * tiles <= _SM90_MAX_MULTIPROCESSORS
+
+
+def _fused_bias_vector_ok(bias, reference, n: int) -> bool:
+    """Whether the fused WGMMA epilogue can consume this bias as it stands.
+
+    It reads one contiguous row of `n` values in the operand dtype through a
+    naturally-aligned two-element load.  Everything else -- a scalar or
+    otherwise broadcast bias, a strided or expanded view, a different dtype,
+    an offset view whose pointer is not pair-aligned -- keeps the separate
+    elementwise add, which broadcasts and does not care.
+
+    The shape/contiguity half is deliberately the same check `_try_gemm16_mm`
+    and `_try_tf32_gemm` already apply before handing a bias to a bridge at
+    all: if this were the looser of the two, a caller would skip the split,
+    the bridge would then decline the biased call, and the whole projection
+    would fall past both fast paths.  That is exactly what a scalar bias did.
+    """
+    bias_tensor = _t(bias)
+    return (
+        bias_tensor is not None
+        and bias_tensor._dtype == reference._dtype
+        and bias_tensor._device == reference._device
+        and tuple(bias_tensor._shape) == (n,)
+        and bias_tensor._is_contiguous
+        and bias_tensor._ptr % (2 * bias_tensor._dtype.size_in_bytes) == 0
+    )
+
+
+def _gemm16_nt_wgmma_fuses_bias(a, b, bias, *, transpose_b: bool = False) -> bool:
+    """Whether a BIASED 16-bit NT call lands on a kernel that fuses the bias.
+
+    True exactly when the persistent v4 NT kernel
+    (`maybe_enqueue_gemm16_nt_v4`, gemm16_nt_v4_kernels.mojo) will serve the
+    call: it is the first fused-bias route the NT ladder offers once the
+    split-K arm is out of the way, and its gate is looser than the v3 NT
+    fallback's, so mirroring it alone is both sufficient and conservative --
+    a shape it declines and v3 NT would have taken merely keeps today's
+    split, at the cost of one elementwise-add launch.
+
+    This is the 16-bit twin of `_tf32_nt_wgmma_admits`, and it exists for
+    the same reason that one does: the routing decision is made on the host,
+    before the bridge is called, so the condition has to be legible here.
+
+    The bias itself is checked too, by `_fused_bias_vector_ok`: the fused
+    epilogue consumes one contiguous, pair-aligned row of `n` values and
+    nothing else.
+    """
+    lhs = _t(a)
+    rhs = _t(b)
+    if (
+        lhs is None
+        or rhs is None
+        or lhs._dtype not in _GEMM16_DTYPES
+        or rhs._dtype != lhs._dtype
+        or lhs._device != rhs._device
+        or lhs._device.label != "gpu"
+        or lhs._device.api != "cuda"
+        or lhs._device.architecture_name != "sm_90a"
+    ):
+        return False
+    lhs_layout = _tf32_dense_2d_layout(lhs)
+    rhs_layout = _tf32_dense_2d_layout(rhs)
+    if lhs_layout is None or rhs_layout is None:
+        return False
+    # NT only: A untransposed, B effectively transposed.
+    if lhs_layout or not (rhs_layout ^ bool(transpose_b)):
+        return False
+    m, k = lhs._shape
+    rhs_k = rhs._shape[1] if transpose_b else rhs._shape[0]
+    n = rhs._shape[0] if transpose_b else rhs._shape[1]
+    if min(m, n, k) <= 0 or rhs_k != k:
+        return False
+    # TMA descriptor creation needs 16B-aligned bases; an offset view's data
+    # pointer need not be one.  The output is freshly allocated and is.
+    if lhs._ptr % 16 or rhs._ptr % 16:
+        return False
+    if n % 8 or k % 64 or n < 64 or m > 2**31 - 1 or n > 2**31 - 1 or k > 2**31 - 1:
+        return False
+    if not _fused_bias_vector_ok(bias, lhs, n):
+        return False
+    return not _gemm16_splitk_nt_may_fire(m, n, k)
+
+
 def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     """Enqueue the dense H100 16-bit tensor-core GEMM, or return ``None``.
 
@@ -8490,6 +8610,30 @@ def _tf32_nt_wgmma_admits(a, b, *, transpose_b: bool = False) -> bool:
     return _tf32_nt_wgmma_shape_admits(m, n, k) and _gemm16_bridge_available()
 
 
+def _tf32_nt_wgmma_splits_bias(a, b, bias, *, transpose_b: bool = False) -> bool:
+    """For an operand pair `_tf32_nt_wgmma_admits` accepted: must its bias
+    still be added by a separate kernel?
+
+    True for the deep-K shapes the split-K arm claims, which has no
+    accumulator epilogue to fuse into (see `_gemm16_splitk_nt_may_fire`), and
+    for any bias the fused epilogue cannot consume as it stands (see
+    `_fused_bias_vector_ok`).  Everywhere else the direct WGMMA kernel adds
+    the bias for free, and this returns False so the caller passes the bias
+    straight to the bridge.
+
+    Split from `_tf32_nt_wgmma_admits` rather than folded into it so the two
+    together cost one admission check plus a handful of integer reads, not two
+    admission checks, on the eager `addmm`/`linear` hot path.
+    """
+    lhs = _t(a)
+    rhs = _t(b)
+    m, k = lhs._shape
+    n = rhs._shape[0] if transpose_b else rhs._shape[1]
+    if not _fused_bias_vector_ok(bias, lhs, n):
+        return True
+    return _gemm16_splitk_nt_may_fire(m, n, k)
+
+
 def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     """Enqueue the opt-in dense H100 TF32 GEMM, or return ``None``.
 
@@ -8559,16 +8703,23 @@ def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     out = _alloc(logical_output_shape, DType.float32, lhs._device)
     # Route selection, not capability: both bridges accept this exact 11-tuple,
     # so the only difference is which extension compiles it.  The WGMMA leg
-    # takes the NT no-bias regimes it was measured on; everything else stays on
-    # the SM80-class kernel.  A fresh allocation is always 16B-aligned, but the
-    # gemm16 gate requires that of the OUTPUT too and it raises rather than
-    # declining, so check rather than assume.
+    # takes the NT regimes it was measured on; everything else stays on the
+    # SM80-class kernel.  A bias comes along only where the DIRECT WGMMA kernel
+    # serves the call and fuses it into its epilogue: the split-K arm has no
+    # such epilogue, and `_enqueue_gemm16_gemm_tf32` skips that arm entirely in
+    # a biased build, which would push a deep-K shape onto the much slower
+    # direct kernel (see `_tf32_nt_wgmma_splits_bias`).  A fresh allocation is
+    # always 16B-aligned, but the gemm16 gate requires that of the OUTPUT too
+    # and it raises rather than declining, so check rather than assume.
     extension = _Tf32MatmulExtension
     op_name = "Tf32GemmF32"
     if (
-        bias_tensor is None
-        and out._ptr % 16 == 0
+        out._ptr % 16 == 0
         and _tf32_nt_wgmma_admits(lhs, rhs, transpose_b=transpose_b)
+        and (
+            bias_tensor is None
+            or not _tf32_nt_wgmma_splits_bias(lhs, rhs, bias, transpose_b=transpose_b)
+        )
     ):
         extension = _Gemm16MatmulExtension
         op_name = "Gemm16"
@@ -8727,15 +8878,21 @@ def _try_tf32_bmm(a, b, *, transpose_b=False):
 def _try_gemm16_linear(input, weight, bias=None):
     """Route a dense rank >= 2 16-bit projection through GEMM without copies.
 
-    Every gemm16 tensor-core route (the v3/v4 warp-specialized, TMA, and
-    split-K kernels in gemm16_v3_kernels.mojo) declines outright whenever a
-    bias is present, so a fused-bias call here would silently fall back to
-    the far slower "accepted" mma.sync kernel -- measured 3.6-7.4x slower
-    than stock PyTorch on deep-K shapes, versus ~1.3x for the identical
-    unbiased mm.  Compute the bias-free mm on the fast path instead and add
-    the bias afterward with the existing broadcasting elementwise add: the
-    same mm-then-add composition `aten_addmm` already uses for the
-    torch.compile backend, and microseconds next to the GEMM itself.
+    `linear` IS the NT regime by construction (the weight is stored
+    (out_features, in_features) and reached k-minor), and the NT direct WGMMA
+    kernels now add the bias inside their accumulator epilogue, so the bias
+    travels with the call whenever `_gemm16_nt_wgmma_fuses_bias` accepts the
+    operands -- one launch instead of two, and no second pass over C.
+
+    Everything it declines keeps the older two-step composition, because the
+    remaining tensor-core routes (the v3 NN/TN kernels, the split-K arm) still
+    decline a biased call outright and a fused-bias call would silently fall
+    back to the far slower "accepted" mma.sync kernel -- measured 3.6-7.4x
+    slower than stock PyTorch on deep-K shapes, versus ~1.3x for the identical
+    unbiased mm.  So the bias-free mm runs on the fast path and the bias is
+    added afterward with the existing broadcasting elementwise add: the same
+    mm-then-add composition `aten_addmm` already uses for the torch.compile
+    backend.
     """
     a = _t(input)
     w = _t(weight)
@@ -8764,7 +8921,9 @@ def _try_gemm16_linear(input, weight, bias=None):
         return _try_gemm16_mm(
             matrix, weight, transpose_b=True, output_shape=output_shape
         )
-    if _gemm16_alignment_favors_split(matrix, weight, transpose_b=True):
+    if _gemm16_alignment_favors_split(
+        matrix, weight, transpose_b=True
+    ) and not _gemm16_nt_wgmma_fuses_bias(matrix, weight, bias, transpose_b=True):
         mm_out = _try_gemm16_mm(
             matrix, weight, transpose_b=True, output_shape=output_shape
         )
@@ -8789,12 +8948,11 @@ def _try_tf32_linear(input, weight, bias=None):
     are flattened, so only a metadata view is needed.  Non-contiguous inputs
     retain the TensorSpec path, which owns any required materialization.
 
-    A bias is split off exactly when the bias-free mm reaches the WGMMA route
-    (`_tf32_nt_wgmma_admits`), for the reason spelled out in
-    `_try_gemm16_linear`: those kernels have no fused-bias epilogue and decline
-    a biased call outright, so a fused-bias call would land on the much slower
-    SM80-class kernel.  When the WGMMA route would not serve the mm anyway,
-    the fused-bias call is at worst identical and saves a launch.
+    A bias is split off only where the WGMMA route serves the mm but cannot
+    fuse the bias -- the deep-K split-K arm, see `_tf32_nt_wgmma_splits_bias`.
+    The direct WGMMA kernel adds the bias in its epilogue, so it takes the
+    bias directly; and when no WGMMA route would serve the mm anyway, the
+    fused-bias call is at worst identical and saves a launch.
     """
     if torch.get_float32_matmul_precision() == "highest":
         return None
@@ -8821,7 +8979,11 @@ def _try_tf32_linear(input, weight, bias=None):
             a._offset,
             contiguous=True,
         )
-    if bias is not None and _tf32_nt_wgmma_admits(matrix, weight, transpose_b=True):
+    if (
+        bias is not None
+        and _tf32_nt_wgmma_admits(matrix, weight, transpose_b=True)
+        and _tf32_nt_wgmma_splits_bias(matrix, weight, bias, transpose_b=True)
+    ):
         mm_out = _try_tf32_gemm(
             matrix, weight, transpose_b=True, output_shape=output_shape
         )
@@ -8848,23 +9010,28 @@ def fast_aten_mm(x, y):
 def fast_aten_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0):
     # beta/alpha scaling isn't implemented by the fast path (falls through).
     if beta == 1 and alpha == 1:
-        # See _try_gemm16_linear: every gemm16 tensor-core route declines
-        # outright whenever a bias is present, so calling it WITH the bias
-        # would silently fall back to the much slower "accepted" mma.sync
-        # kernel.  When the shape could plausibly reach a fast route (see
-        # _gemm16_alignment_favors_split), compute the bias-free mm on the
-        # fast path and add the bias with the existing broadcasting
-        # elementwise add instead.
-        if _gemm16_alignment_favors_split(mat1, mat2):
+        # See _try_gemm16_linear.  The NT direct WGMMA kernels fuse the bias
+        # into their accumulator epilogue, so those calls carry it straight
+        # through (the `_try_gemm16_mm(..., input)` below).  Every other
+        # tensor-core route still declines a biased call outright, so calling
+        # one WITH the bias would silently fall back to the much slower
+        # "accepted" mma.sync kernel; when the shape could plausibly reach
+        # such a route (see _gemm16_alignment_favors_split), compute the
+        # bias-free mm on the fast path and add the bias with the existing
+        # broadcasting elementwise add instead.
+        if _gemm16_alignment_favors_split(
+            mat1, mat2
+        ) and not _gemm16_nt_wgmma_fuses_bias(mat1, mat2, input):
             mm_out = _try_gemm16_mm(mat1, mat2)
             if mm_out is not None:
                 biased = fast_aten_add(mm_out, input)
                 if biased is not NOT_HANDLED:
                     return biased
-        # The float32 (TF32) WGMMA route has no fused-bias epilogue either, and
-        # declines a biased call the same way; split the bias off it too, but
-        # only where that route would actually serve the mm.
-        if _tf32_nt_wgmma_admits(mat1, mat2):
+        # Same for float32 (TF32): its direct WGMMA kernel fuses the bias, so
+        # only the deep-K split-K arm still needs the bias split off it.
+        if _tf32_nt_wgmma_admits(mat1, mat2) and _tf32_nt_wgmma_splits_bias(
+            mat1, mat2, input
+        ):
             mm_out = _try_tf32_gemm(mat1, mat2)
             if mm_out is not None:
                 biased = fast_aten_add(mm_out, input)
