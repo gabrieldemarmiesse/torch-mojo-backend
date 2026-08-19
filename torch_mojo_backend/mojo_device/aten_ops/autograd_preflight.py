@@ -17,12 +17,15 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 from .support import _eager_impl, _fast, _refuse_unsupported_backward, _unsupported
 
-# Most of these ops have no autograd escape other than turning grad off: their
-# parameters legitimately require grad during training, so unlike batch norm
-# (whose `training=False` forward records a node nobody runs) there is no mode
+# These ops have no autograd escape other than turning grad off: their
+# parameters legitimately require grad during training, so there is no mode
 # that keeps training working. `.eval()` specifically does NOT help — it leaves
 # grad mode on and the parameters still require grad — and saying otherwise has
-# sent users chasing a workaround that cannot exist.
+# sent users chasing a workaround that cannot exist. Batch norm used to be the
+# counter-example named here, on the theory that its `training=False` forward
+# records a node nobody runs; that was wrong (an `.eval()` BatchNorm's backward
+# calls `aten::native_batch_norm_backward` like any other) and it is moot now
+# that both norm backwards are implemented.
 _GRAD_OFF_ONLY = (
     "The forward itself is supported: run it under torch.no_grad() or "
     "torch.inference_mode(). Module .eval() alone does not help here, because "
@@ -181,11 +184,11 @@ def mojo_device_convolution(
     engine would come back for is refused here, from the forward, with a
     traceback that names the op.
 
-    Unlike batch norm this has no training-mode escape: a conv weight normally
-    requires grad, so in practice this refuses every conv in a training model,
-    and the honest message is that the backward kernel is missing rather than
-    that some flag is set wrong. Inference is unaffected under
-    `torch.no_grad()` / `torch.inference_mode()`.
+    There is no training-mode escape: a conv weight normally requires grad, so
+    in practice this refuses every conv in a training model, and the honest
+    message is that the backward kernel is missing rather than that some flag
+    is set wrong. Inference is unaffected under `torch.no_grad()` /
+    `torch.inference_mode()`.
     """
     _refuse_unsupported_backward(
         "aten::convolution",
@@ -359,96 +362,6 @@ def mojo_device_linear(
     result = aten_fast.fast_aten_linear(input, weight, bias)
     if result is aten_fast.NOT_HANDLED:
         raise _unsupported("aten::linear", (input, weight, bias))
-    return result
-
-
-def mojo_device_native_batch_norm(
-    input: torch.Tensor,
-    weight: torch.Tensor | None,
-    bias: torch.Tensor | None,
-    running_mean: torch.Tensor | None,
-    running_var: torch.Tensor | None,
-    training: bool,
-    momentum: float,
-    eps: float,
-) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor]:
-    """Batch norm with a forward-time preflight of its native autograd node.
-
-    The training forward exists here; `aten::native_batch_norm_backward` does
-    not (docs/optimization_backlog.md N2). Letting the forward record
-    NativeBatchNormBackward anyway would move the failure into the autograd
-    engine, where an exception aborts the process on this backend rather than
-    raising — the same unwind hazard `mojo_device_linear` above documents — so
-    a training call that would need a gradient is refused here, from the
-    forward, with a traceback that names the op.
-
-    Inference needs no preflight: `training=False` records a backward this
-    backend never has to run.
-    """
-    if (
-        training
-        and torch.is_grad_enabled()
-        and (
-            input.requires_grad
-            or (weight is not None and weight.requires_grad)
-            or (bias is not None and bias.requires_grad)
-        )
-    ):
-        raise NotImplementedError(
-            "aten::native_batch_norm (training=True) would record an autograd "
-            "node (aten::native_batch_norm_backward) that mojo eager mode "
-            f"does not implement (input {tuple(input.shape)} {input.dtype}, "
-            f"device {input.device}). The forward itself is supported: run it "
-            "under torch.no_grad(), or put the module in eval() mode. Raised "
-            "from the forward on purpose: raised from the backward node "
-            "instead, this aborts the process without a traceback."
-        )
-    aten_fast = _fast()
-    result = aten_fast.fast_aten_native_batch_norm(
-        input, weight, bias, running_mean, running_var, training, momentum, eps
-    )
-    if result is aten_fast.NOT_HANDLED:
-        raise _unsupported(
-            "aten::native_batch_norm", (input, weight, bias, running_mean, running_var)
-        )
-    return result
-
-
-def mojo_device_native_group_norm(
-    input: torch.Tensor,
-    weight: torch.Tensor | None,
-    bias: torch.Tensor | None,
-    N: int,
-    C: int,
-    HxW: int,
-    group: int,
-    eps: float,
-) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor]:
-    """Group norm with a forward-time preflight of its native autograd node.
-
-    The forward exists here; `aten::native_group_norm_backward` does not (it
-    needs the per-group reduction statistics). Recording
-    NativeGroupNormBackward0 anyway would move the failure into the autograd
-    engine, where an exception aborts the process instead of raising, so the
-    call is refused from the forward as `mojo_device_native_batch_norm` above
-    refuses its training case.
-
-    Group norm has no `training` flag to key on, so unlike batch norm every
-    grad-requiring call is refused; inference is unaffected under
-    `torch.no_grad()` / `torch.inference_mode()`.
-    """
-    _refuse_unsupported_backward(
-        "aten::native_group_norm",
-        "aten::native_group_norm_backward",
-        (input, weight, bias),
-        _GRAD_OFF_ONLY,
-    )
-    aten_fast = _fast()
-    result = aten_fast.fast_aten_native_group_norm(
-        input, weight, bias, N, C, HxW, group, eps
-    )
-    if result is aten_fast.NOT_HANDLED:
-        raise _unsupported("aten::native_group_norm", (input, weight, bias))
     return result
 
 
