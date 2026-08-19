@@ -184,7 +184,8 @@ class Bench:
         detail = (
             f"ratio {ratio:.3f} +/- {result.ratio_uncertainty_pct:.1f}% "
             f"(pair scatter {result.ratio_spread_pct:.1f}% over "
-            f"{result.bursts} burst pairs; ours/stock device time: "
+            f"{result.bursts} burst pairs{', bimodal' if result.bimodal else ''}; "
+            f"ours/stock device time: "
             f"{result.ours.per_iter_us:.1f}us / {result.ref.per_iter_us:.1f}us), "
             f"leg spread ours {result.ours.spread_pct:.1f}% "
             f"stock {result.ref.spread_pct:.1f}%"
