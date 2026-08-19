@@ -75,6 +75,7 @@ import sys
 import textwrap
 import threading
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -367,12 +368,32 @@ def plan_module(
     return ModulePlan(stem, modules, merged, variants, notes)
 
 
-def collect(out_dir: Path) -> dict[str, str]:
-    """Map each kernel's hash-stripped name to its hash-masked assembly."""
-    kernels = {}
+def collect(out_dir: Path) -> dict[str, list[str]]:
+    """Map each kernel's hash-stripped name to every hash-masked assembly
+    sharing that name.
+
+    A stripped name is not unique within one build: several comptime
+    instantiations of one generically-named function (different tile sizes,
+    stage counts, or in this repo's case different `col_a`/`kmaj_b` layout
+    parameters sharing one base symbol) can all reduce to the same name once
+    HASH_RE removes the part of the mangled symbol that told them apart.
+    Keying a plain `dict[str, str]` on that name overwrote every instantiation
+    but the last one `sorted(out_dir.iterdir())` produced -- which one
+    survived depended on mangling-hash sort order, not on anything meaningful
+    -- and then compared whichever survivor "before" happened to keep against
+    whichever survivor "after" happened to keep, which need not be the same
+    instantiation. That produced false "changed" reports on any module with
+    more than one instantiation per base name (confirmed on this repo's bmm
+    module: 10 false changes with the dict, 0 with the multiset below).
+    Collecting every instantiation into a list, compared as a multiset by the
+    caller (order-independent: sort before comparing), fixes this without
+    losing the hash-masking that makes an unrelated rename compare equal.
+    """
+    kernels: dict[str, list[str]] = {}
     for path in sorted(out_dir.iterdir()):
         if path.suffix in SIDECAR_SUFFIXES:
-            kernels[HASH_RE.sub("", path.stem)] = HASH_RE.sub("_HASH", path.read_text())
+            name = HASH_RE.sub("", path.stem)
+            kernels.setdefault(name, []).append(HASH_RE.sub("_HASH", path.read_text()))
     return kernels
 
 
@@ -390,6 +411,104 @@ def print_diff(kernel: str, before: str, after: str) -> None:
             )
         )
     )
+
+
+def residual_bodies(before: list[str], after: list[str]) -> tuple[list[str], list[str]]:
+    """Multiset difference between two instantiation lists sharing one
+    stripped name.
+
+    Identical bodies cancel regardless of position or count: `Counter`
+    subtraction removes exactly as many copies of a body as appear on the
+    other side, so a body present twice on both sides cancels completely,
+    one present three times on one side and once on the other leaves two
+    residual copies, and so on. A positional zip of the two SORTED lists
+    (an earlier, wrong version of this function) instead pairs whichever
+    bodies happen to land at the same sorted index once a multiplicity
+    differs -- e.g. before=[A,B,C], after=[B,C,Z] zips to (A,B) (B,C) (C,Z),
+    reporting three changes for what is really one replacement (A -> Z) --
+    or, when the group only grew or shrank, reports the whole group as
+    changed instead of the true added/removed delta (before=[A,B],
+    after=[A,B,C] zips to (A,A) (B,B), silently dropping C rather than
+    reporting it as new). What's left after cancellation, sorted on each
+    side, is what the caller should treat as a real difference.
+    """
+    before_counter = Counter(before)
+    after_counter = Counter(after)
+    return (
+        sorted((before_counter - after_counter).elements()),
+        sorted((after_counter - before_counter).elements()),
+    )
+
+
+@dataclass(frozen=True)
+class KernelDelta:
+    """One stripped name's multiset delta between before and after.
+
+    `changed`/`added`/`removed` are body counts, not name counts -- see
+    collect()'s docstring for why one name can carry more than one body.
+    `residual_before`/`residual_after` are what's left of each side after
+    identical bodies cancel (sorted); the first `changed` entries of each
+    are a same-length pair-up used for display, any excess on the `after`
+    side is purely new, any excess on the `before` side is purely gone.
+    """
+
+    name: str
+    changed: int
+    added: int
+    removed: int
+    residual_before: list[str]
+    residual_after: list[str]
+
+
+def diff_names(
+    before: dict[str, list[str]], after: dict[str, list[str]]
+) -> list[KernelDelta]:
+    """Per-name multiset deltas for every name present on both sides that
+    genuinely differs.
+
+    A name entirely missing from one side is NOT covered here -- the caller
+    already has a fast, exact path for a whole name being added or removed
+    (see main()); this only concerns names that exist on both sides but
+    whose instantiations differ.
+    """
+    deltas = []
+    for name in sorted(before.keys() & after.keys()):
+        residual_before, residual_after = residual_bodies(before[name], after[name])
+        if not residual_before and not residual_after:
+            continue
+        paired = min(len(residual_before), len(residual_after))
+        deltas.append(
+            KernelDelta(
+                name,
+                changed=paired,
+                added=len(residual_after) - paired,
+                removed=len(residual_before) - paired,
+                residual_before=residual_before,
+                residual_after=residual_after,
+            )
+        )
+    return deltas
+
+
+def print_kernel_delta(label: str, delta: KernelDelta) -> None:
+    """--show-diff detail for one changed name: a header when the
+    instantiation count itself moved, then a unified diff per paired
+    residual (the excess residual on either side has no partner to diff
+    against and is only reflected in the header's added/removed counts).
+    """
+    paired = min(len(delta.residual_before), len(delta.residual_after))
+    if len(delta.residual_before) != len(delta.residual_after):
+        print(
+            f"\n{label}: {delta.changed} replaced, {delta.added} added, "
+            f"{delta.removed} removed (after canceling identical "
+            "instantiations)"
+        )
+    for index in range(paired):
+        print_diff(
+            f"{label}[{index}]",
+            delta.residual_before[index],
+            delta.residual_after[index],
+        )
 
 
 def default_jobs() -> int:
@@ -543,7 +662,7 @@ def build_plans(args: argparse.Namespace) -> list[ModulePlan]:
 
 def build_both_sides(
     args: argparse.Namespace, trees: dict[str, Path], plan: ModulePlan, variant: Variant
-) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+) -> tuple[dict[str, dict[str, list[str]]], dict[str, str]]:
     """Build one specialization on every side it exists, and read its kernels.
 
     Both sides are built one after the other **into the same directory**, which
@@ -558,7 +677,7 @@ def build_both_sides(
     miss; the sidecars are read into memory and the directory is emptied between
     sides so nothing of the first side can be mistaken for the second's.
     """
-    kernels: dict[str, dict[str, str]] = {}
+    kernels: dict[str, dict[str, list[str]]] = {}
     errors: dict[str, str] = {}
     out_dir = args.work_dir / plan.stem / variant.label
     for side in plan.modules:
@@ -598,11 +717,13 @@ def build_both_sides(
 
 def run_builds(
     args: argparse.Namespace, plans: list[ModulePlan]
-) -> tuple[dict[tuple[str, str, str], dict[str, str]], dict[tuple[str, str, str], str]]:
+) -> tuple[
+    dict[tuple[str, str, str], dict[str, list[str]]], dict[tuple[str, str, str], str]
+]:
     """Build every (module, variant) in parallel; return kernels and errors."""
     trees = {"before": args.before, "after": args.after}
     jobs = [(plan, variant) for plan in plans for variant in plan.variants]
-    kernels: dict[tuple[str, str, str], dict[str, str]] = {}
+    kernels: dict[tuple[str, str, str], dict[str, list[str]]] = {}
     errors: dict[tuple[str, str, str], str] = {}
     lock = threading.Lock()
     done = 0
@@ -618,7 +739,12 @@ def run_builds(
             for side, error in failures.items():
                 errors[(side, plan.stem, variant.label)] = error
             if not args.quiet:
-                counts = [f"{side} {len(found)}" for side, found in built.items()]
+                # Total sidecar count, not the number of distinct names: a
+                # name can carry more than one instantiation (see collect()).
+                counts = [
+                    f"{side} {sum(len(asms) for asms in found.values())}"
+                    for side, found in built.items()
+                ]
                 counts += [f"{side} FAILED" for side in failures]
                 print(
                     f"[{done:>4}/{len(jobs)}] {plan.stem}/{variant.label}"
@@ -700,29 +826,38 @@ def main() -> int:
                 continue
             before = sides.get("before", {})
             after = sides.get("after", {})
-            counts["kernels"] += len(after)
-            total_kernels += len(before) + len(after)
+            # File counts (total sidecars), not name counts: a name can carry
+            # more than one instantiation (see collect()), and every other
+            # count below is a file count too, so these stay comparable.
+            after_count = sum(len(asms) for asms in after.values())
+            before_count = sum(len(asms) for asms in before.values())
+            counts["kernels"] += after_count
+            total_kernels += before_count + after_count
             if not before and not after:
                 empty.append(f"{plan.stem}/{variant.label}")
                 continue
             if "before" not in sides or "after" not in sides:
                 # Added or removed module: every kernel of it is new or gone.
-                counts["added"] += len(after)
-                counts["removed"] += len(before)
+                counts["added"] += after_count
+                counts["removed"] += before_count
                 continue
-            changed = sorted(
-                name
-                for name in before.keys() & after.keys()
-                if before[name] != after[name]
+            # Multiset compare per name: identical bodies cancel regardless
+            # of position or count (see residual_bodies()), so a name whose
+            # instantiation count changed reports as added/removed, not as
+            # every member of the group changing, and a single replacement
+            # inside a larger group reports as one change, not the whole
+            # group.
+            deltas = diff_names(before, after)
+            counts["changed"] += sum(delta.changed for delta in deltas)
+            counts["added"] += sum(delta.added for delta in deltas) + sum(
+                len(after[name]) for name in after.keys() - before.keys()
             )
-            counts["changed"] += len(changed)
-            counts["added"] += len(after.keys() - before.keys())
-            counts["removed"] += len(before.keys() - after.keys())
-            changed_names += [f"{variant.label}/{name}" for name in changed]
-            for name in changed if args.show_diff else []:
-                print_diff(
-                    f"{plan.stem}/{variant.label}/{name}", before[name], after[name]
-                )
+            counts["removed"] += sum(delta.removed for delta in deltas) + sum(
+                len(before[name]) for name in before.keys() - after.keys()
+            )
+            changed_names += [f"{variant.label}/{delta.name}" for delta in deltas]
+            for delta in deltas if args.show_diff else []:
+                print_kernel_delta(f"{plan.stem}/{variant.label}/{delta.name}", delta)
 
         total_changed += counts["changed"] + counts["added"] + counts["removed"]
         if broken:
