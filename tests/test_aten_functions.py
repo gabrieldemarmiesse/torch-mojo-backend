@@ -941,6 +941,70 @@ def test_aten_bitwise_xor_broadcasting(conf: Conf):
     check_outputs(fn, conf, [x, y])
 
 
+@pytest.mark.parametrize(
+    "in_c,out_c,length,k,stride,padding,dilation,groups",
+    [
+        (3, 8, 17, 3, 1, 0, 1, 1),  # basic, awkward/non-round length
+        (8, 8, 17, 3, 2, 1, 1, 1),  # stride
+        (8, 12, 25, 3, 1, 2, 2, 1),  # dilation
+        (8, 12, 25, 3, 1, 1, 1, 2),  # groups
+        (80, 16, 40, 3, 1, 1, 1, 1),  # Whisper-shaped channel counts
+    ],
+)
+def test_aten_conv1d(
+    conf: Conf,
+    call_checker: CallChecker,
+    in_c: int,
+    out_c: int,
+    length: int,
+    k: int,
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+):
+    """aten::convolution with a rank-3 (conv1d) input.
+
+    Same overload as conv2d; mojo eager reuses the rank-4 im2col+GEMM path by
+    inserting a synthetic size-1 H axis (see `fast_aten_convolution`).
+    """
+    call_checker.register(aten_functions.aten_convolution)
+
+    def fn(x, w, b):
+        return torch.nn.functional.conv1d(
+            x, w, b, stride=stride, padding=padding, dilation=dilation, groups=groups
+        )
+
+    x = torch.randn(2, in_c, length)
+    w = torch.randn(out_c, in_c // groups, k)
+    b = torch.randn(out_c)
+    check_outputs(fn, conf, [x, w, b], atol=1e-4, rtol=1e-4)
+
+
+def test_aten_conv1d_no_bias(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_convolution)
+
+    def fn(x, w):
+        return torch.nn.functional.conv1d(x, w, padding=1)
+
+    x = torch.randn(2, 4, 13)
+    w = torch.randn(6, 4, 3)
+    check_outputs(fn, conf, [x, w], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_aten_conv1d_dtypes(conf: Conf, call_checker: CallChecker, dtype: torch.dtype):
+    call_checker.register(aten_functions.aten_convolution)
+
+    def fn(x, w, b):
+        return torch.nn.functional.conv1d(x, w, b, stride=2, padding=1)
+
+    x = torch.randn(2, 8, 21, dtype=dtype)
+    w = torch.randn(12, 8, 3, dtype=dtype)
+    b = torch.randn(12, dtype=dtype)
+    check_outputs(fn, conf, [x, w, b], atol=5e-2, rtol=5e-2)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_add_scalar(conf: Conf, dtype: torch.dtype):
     """Test _foreach_add.Scalar - adds scalar to each tensor in list"""
