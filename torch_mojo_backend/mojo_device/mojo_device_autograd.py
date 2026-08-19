@@ -562,6 +562,39 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
         return grad_query, grad_key, grad_value, None, None, None, None, None
 
 
+def _expand_gqa_key_value(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(key, value)`` repeated up to the query's head count, differentiably.
+
+    ``enable_gqa=True`` lets K and V carry fewer heads than Q; this is HF
+    transformers' ``repeat_kv``, written with ordinary differentiable ops
+    rather than the raw payload helper in ``aten_fast`` so that PyTorch's own
+    ``ExpandBackward`` sums each group of query heads back down: ``grad_key``
+    and ``grad_value`` then arrive in the leaves' original
+    ``(b, kv_heads, s, d)`` shape with no custom backward code owed here.
+
+    Returns ``None`` when the head counts do not divide.
+    """
+    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+        return None
+    q_heads = query.shape[1]
+    expanded = []
+    for tensor in (key, value):
+        batch, kv_heads, length, head_dim = tensor.shape
+        if kv_heads <= 0 or q_heads <= 0 or q_heads % kv_heads != 0:
+            return None
+        if kv_heads == q_heads:
+            expanded.append(tensor)
+            continue
+        expanded.append(
+            tensor.unsqueeze(2)
+            .expand(batch, kv_heads, q_heads // kv_heads, length, head_dim)
+            .reshape(batch, q_heads, length, head_dim)
+        )
+    return expanded[0], expanded[1]
+
+
 def _scaled_dot_product_attention_autograd(
     query,
     key,
@@ -600,6 +633,28 @@ def _scaled_dot_product_attention_autograd(
         return torch.ops.aten._scaled_dot_product_flash_attention.default(
             query, key, value, dropout_p, is_causal, False, scale=scale
         )[0]
+    # Grouped-query attention is turned into plain attention HERE, and
+    # deliberately not one line earlier: the native flash dispatch above owns a
+    # native (derivatives.yaml-generated) backward, and a decline inside a
+    # native backward node aborts the process instead of raising (the
+    # PrivateUse1 stream guard unwinds through a noexcept Python round-trip --
+    # same hazard ``aten_ops/autograd_preflight.py`` exists for). Its
+    # eligibility gate declines ``enable_gqa`` on the inputs as the caller
+    # passed them, so expanding first would hand it a triple it believes it can
+    # differentiate. Every destination below is a Python ``autograd.Function``,
+    # which is free to decline safely -- and now mostly does not need to.
+    #
+    # Only the backward-needing routes are expanded here, with differentiable
+    # ops. The forward-only route below expands inside ``aten_fast`` instead,
+    # where a single K/V head stays a stride-0 broadcast the decode kernel reads
+    # directly -- no ``repeat_kv`` copy at all on a multi-query decode step.
+    # This runs BEFORE the drain: the expansion queues a copy of its own.
+    if needs_backward and enable_gqa:
+        key, value = _require_handled(
+            _expand_gqa_key_value(query, key, value),
+            "aten::scaled_dot_product_attention with enable_gqa=True",
+        )
+        enable_gqa = False
     # The remaining paths read q/k/v payloads directly through aten_fast,
     # ABOVE __torch_dispatch__ — invisible to the deferred-compile queue —
     # so every still-pending producer must land first (FIFO granularity: the
