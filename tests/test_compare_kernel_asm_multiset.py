@@ -22,7 +22,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scripts.compare_kernel_asm import HASH_RE, collect
+import pytest
+
+from scripts.compare_kernel_asm import (
+    HASH_RE,
+    KernelDelta,
+    collect,
+    diff_names,
+    print_kernel_delta,
+    residual_bodies,
+)
 
 
 def _write_ptx(directory: Path, stem: str, hexhash: str, body: str) -> None:
@@ -119,3 +128,142 @@ def test_naive_single_value_dict_would_falsely_report_a_change(tmp_path: Path) -
     before = collect(before_dir)
     after = collect(after_dir)
     assert sorted(before["mod_gemm_persistent"]) == sorted(after["mod_gemm_persistent"])
+
+
+# ---------------------------------------------------------------------------
+# Aggregation/reporting path: residual_bodies(), diff_names(), and
+# print_kernel_delta(). collect() returning every instantiation under a name
+# (tested above) is necessary but not sufficient -- main() still has to turn
+# "before"/"after" instantiation lists into correct changed/added/removed
+# counts and a correct --show-diff pairing. A positional zip of the two
+# SORTED lists (an earlier, wrong version of this) pairs whichever bodies
+# land at the same sorted index once a multiplicity differs, which is wrong
+# whenever a duplicate-name group genuinely changes rather than merely being
+# unchanged-but-reordered. These tests cover that path directly.
+# ---------------------------------------------------------------------------
+
+
+def test_residual_bodies_one_replacement_inside_a_group() -> None:
+    """before=[A,B,C], after=[B,C,Z]: B and C cancel, only A/Z are residual.
+
+    A positional zip of the sorted lists would pair (A,B) (B,C) (C,Z) and
+    report three changes for what is really one replacement.
+    """
+    residual_before, residual_after = residual_bodies(["A", "B", "C"], ["B", "C", "Z"])
+    assert residual_before == ["A"]
+    assert residual_after == ["Z"]
+
+
+def test_residual_bodies_multiplicity_growth() -> None:
+    """before=[A,B], after=[A,B,C]: nothing changed, C is purely new."""
+    residual_before, residual_after = residual_bodies(["A", "B"], ["A", "B", "C"])
+    assert residual_before == []
+    assert residual_after == ["C"]
+
+
+def test_residual_bodies_multiplicity_shrink() -> None:
+    """before=[A,B,C], after=[A,B]: nothing changed, C is purely gone."""
+    residual_before, residual_after = residual_bodies(["A", "B", "C"], ["A", "B"])
+    assert residual_before == ["C"]
+    assert residual_after == []
+
+
+def test_residual_bodies_duplicate_bodies_cancel_by_count() -> None:
+    """Two copies of A on each side fully cancel; only the extra copy of A
+    on the "after" side, and B's replacement by C, are residual."""
+    residual_before, residual_after = residual_bodies(
+        ["A", "A", "B"], ["A", "A", "A", "C"]
+    )
+    assert residual_before == ["B"]
+    assert residual_after == ["A", "C"]
+
+
+def test_diff_names_reports_added_not_changed_for_a_grown_group() -> None:
+    """Codex's exact regression case: before=[A,B], after=[A,B,C] must report
+    0 changed / +1 new for this name, not 3 changed / +0 new."""
+    before = {"mod_kernel": ["A", "B"]}
+    after = {"mod_kernel": ["A", "B", "C"]}
+    (delta,) = diff_names(before, after)
+    assert delta == KernelDelta(
+        "mod_kernel",
+        changed=0,
+        added=1,
+        removed=0,
+        residual_before=[],
+        residual_after=["C"],
+    )
+
+
+def test_diff_names_reports_one_change_for_one_replacement() -> None:
+    before = {"mod_kernel": ["A", "B", "C"]}
+    after = {"mod_kernel": ["B", "C", "Z"]}
+    (delta,) = diff_names(before, after)
+    assert delta.changed == 1
+    assert delta.added == 0
+    assert delta.removed == 0
+    assert delta.residual_before == ["A"]
+    assert delta.residual_after == ["Z"]
+
+
+def test_diff_names_reports_removed_for_a_shrunk_group() -> None:
+    before = {"mod_kernel": ["A", "B", "C"]}
+    after = {"mod_kernel": ["A", "B"]}
+    (delta,) = diff_names(before, after)
+    assert delta.changed == 0
+    assert delta.added == 0
+    assert delta.removed == 1
+
+
+def test_diff_names_skips_a_name_whose_multiset_is_unchanged() -> None:
+    """Reordered-only (mangling hash moved, bodies identical): no delta at
+    all, matching the fix's original purpose (order-independence)."""
+    before = {"mod_kernel": ["A", "B"]}
+    after = {"mod_kernel": ["B", "A"]}
+    assert diff_names(before, after) == []
+
+
+def test_diff_names_ignores_names_present_on_only_one_side() -> None:
+    """Whole-name add/remove is the caller's fast path (module-level added/
+    removed in main()), not diff_names()'s job."""
+    before = {"only_before": ["A"]}
+    after = {"only_after": ["Z"]}
+    assert diff_names(before, after) == []
+
+
+def test_show_diff_pairs_residuals_not_shifted_sorted_positions(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The --show-diff detail for a replacement must diff the actual
+    replaced pair (A -> Z), not a positional artifact of sorting the whole
+    group (which would show unrelated bodies B and C as "changed")."""
+    before = {"mod_kernel": ["A", "B", "C"]}
+    after = {"mod_kernel": ["B", "C", "Z"]}
+    (delta,) = diff_names(before, after)
+
+    print_kernel_delta("mod/variant/mod_kernel", delta)
+    out = capsys.readouterr().out
+
+    assert "before/mod/variant/mod_kernel[0]" in out
+    assert "after/mod/variant/mod_kernel[0]" in out
+    assert "-A" in out
+    assert "+Z" in out
+    # B and C canceled and must not appear as changed lines in the diff body.
+    assert "-B" not in out
+    assert "-C" not in out
+    assert "+B" not in out
+    assert "+C" not in out
+
+
+def test_show_diff_header_reports_counts_for_a_grown_group(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    before = {"mod_kernel": ["A", "B"]}
+    after = {"mod_kernel": ["A", "B", "C"]}
+    (delta,) = diff_names(before, after)
+
+    print_kernel_delta("mod/variant/mod_kernel", delta)
+    out = capsys.readouterr().out
+
+    assert "0 replaced, 1 added, 0 removed" in out
+    # Nothing to pair, so no unified-diff body -- just the header.
+    assert "@@" not in out

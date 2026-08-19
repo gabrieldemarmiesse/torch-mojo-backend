@@ -75,6 +75,7 @@ import sys
 import textwrap
 import threading
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -412,6 +413,104 @@ def print_diff(kernel: str, before: str, after: str) -> None:
     )
 
 
+def residual_bodies(before: list[str], after: list[str]) -> tuple[list[str], list[str]]:
+    """Multiset difference between two instantiation lists sharing one
+    stripped name.
+
+    Identical bodies cancel regardless of position or count: `Counter`
+    subtraction removes exactly as many copies of a body as appear on the
+    other side, so a body present twice on both sides cancels completely,
+    one present three times on one side and once on the other leaves two
+    residual copies, and so on. A positional zip of the two SORTED lists
+    (an earlier, wrong version of this function) instead pairs whichever
+    bodies happen to land at the same sorted index once a multiplicity
+    differs -- e.g. before=[A,B,C], after=[B,C,Z] zips to (A,B) (B,C) (C,Z),
+    reporting three changes for what is really one replacement (A -> Z) --
+    or, when the group only grew or shrank, reports the whole group as
+    changed instead of the true added/removed delta (before=[A,B],
+    after=[A,B,C] zips to (A,A) (B,B), silently dropping C rather than
+    reporting it as new). What's left after cancellation, sorted on each
+    side, is what the caller should treat as a real difference.
+    """
+    before_counter = Counter(before)
+    after_counter = Counter(after)
+    return (
+        sorted((before_counter - after_counter).elements()),
+        sorted((after_counter - before_counter).elements()),
+    )
+
+
+@dataclass(frozen=True)
+class KernelDelta:
+    """One stripped name's multiset delta between before and after.
+
+    `changed`/`added`/`removed` are body counts, not name counts -- see
+    collect()'s docstring for why one name can carry more than one body.
+    `residual_before`/`residual_after` are what's left of each side after
+    identical bodies cancel (sorted); the first `changed` entries of each
+    are a same-length pair-up used for display, any excess on the `after`
+    side is purely new, any excess on the `before` side is purely gone.
+    """
+
+    name: str
+    changed: int
+    added: int
+    removed: int
+    residual_before: list[str]
+    residual_after: list[str]
+
+
+def diff_names(
+    before: dict[str, list[str]], after: dict[str, list[str]]
+) -> list[KernelDelta]:
+    """Per-name multiset deltas for every name present on both sides that
+    genuinely differs.
+
+    A name entirely missing from one side is NOT covered here -- the caller
+    already has a fast, exact path for a whole name being added or removed
+    (see main()); this only concerns names that exist on both sides but
+    whose instantiations differ.
+    """
+    deltas = []
+    for name in sorted(before.keys() & after.keys()):
+        residual_before, residual_after = residual_bodies(before[name], after[name])
+        if not residual_before and not residual_after:
+            continue
+        paired = min(len(residual_before), len(residual_after))
+        deltas.append(
+            KernelDelta(
+                name,
+                changed=paired,
+                added=len(residual_after) - paired,
+                removed=len(residual_before) - paired,
+                residual_before=residual_before,
+                residual_after=residual_after,
+            )
+        )
+    return deltas
+
+
+def print_kernel_delta(label: str, delta: KernelDelta) -> None:
+    """--show-diff detail for one changed name: a header when the
+    instantiation count itself moved, then a unified diff per paired
+    residual (the excess residual on either side has no partner to diff
+    against and is only reflected in the header's added/removed counts).
+    """
+    paired = min(len(delta.residual_before), len(delta.residual_after))
+    if len(delta.residual_before) != len(delta.residual_after):
+        print(
+            f"\n{label}: {delta.changed} replaced, {delta.added} added, "
+            f"{delta.removed} removed (after canceling identical "
+            "instantiations)"
+        )
+    for index in range(paired):
+        print_diff(
+            f"{label}[{index}]",
+            delta.residual_before[index],
+            delta.residual_after[index],
+        )
+
+
 def default_jobs() -> int:
     """Concurrent `mojo build` subprocesses.
 
@@ -742,47 +841,23 @@ def main() -> int:
                 counts["added"] += after_count
                 counts["removed"] += before_count
                 continue
-            # Multiset compare per name: sort each side's instantiations so
-            # order (which depends on mangling-hash sort order, not on
-            # anything meaningful) cannot make an unchanged set of bodies
-            # read as different.
-            changed = sorted(
-                name
-                for name in before.keys() & after.keys()
-                if sorted(before[name]) != sorted(after[name])
-            )
-            # Weight a changed name by the larger side's instantiation count,
-            # so a name whose instantiation count itself changed (an
-            # instantiation added or dropped under an existing name) is not
-            # under-counted relative to added/removed's own file counts.
-            counts["changed"] += sum(
-                max(len(before[name]), len(after[name])) for name in changed
-            )
-            counts["added"] += sum(
+            # Multiset compare per name: identical bodies cancel regardless
+            # of position or count (see residual_bodies()), so a name whose
+            # instantiation count changed reports as added/removed, not as
+            # every member of the group changing, and a single replacement
+            # inside a larger group reports as one change, not the whole
+            # group.
+            deltas = diff_names(before, after)
+            counts["changed"] += sum(delta.changed for delta in deltas)
+            counts["added"] += sum(delta.added for delta in deltas) + sum(
                 len(after[name]) for name in after.keys() - before.keys()
             )
-            counts["removed"] += sum(
+            counts["removed"] += sum(delta.removed for delta in deltas) + sum(
                 len(before[name]) for name in before.keys() - after.keys()
             )
-            changed_names += [f"{variant.label}/{name}" for name in changed]
-            for name in changed if args.show_diff else []:
-                before_asms, after_asms = sorted(before[name]), sorted(after[name])
-                if len(before_asms) != len(after_asms):
-                    print(
-                        f"\n{plan.stem}/{variant.label}/{name}: instantiation "
-                        f"count {len(before_asms)} -> {len(after_asms)} "
-                        "(before/after; sorted bodies below are paired by "
-                        "position up to the shorter side only)"
-                    )
-                for index, (one_before, one_after) in enumerate(
-                    zip(before_asms, after_asms)
-                ):
-                    if one_before != one_after:
-                        print_diff(
-                            f"{plan.stem}/{variant.label}/{name}[{index}]",
-                            one_before,
-                            one_after,
-                        )
+            changed_names += [f"{variant.label}/{delta.name}" for delta in deltas]
+            for delta in deltas if args.show_diff else []:
+                print_kernel_delta(f"{plan.stem}/{variant.label}/{delta.name}", delta)
 
         total_changed += counts["changed"] + counts["added"] + counts["removed"]
         if broken:
