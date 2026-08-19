@@ -65,7 +65,7 @@ the RS wgmma walks fragments k-major, `a_frags[m + k*num_m]`.)
 
 from std.math import exp2, log, tanh
 from std.math.constants import log2e
-from std.sys import size_of
+from std.sys import inlined_assembly, size_of
 from std.utils.index import StaticTuple, IndexList
 
 from max.gpu.sync import barrier
@@ -103,6 +103,67 @@ from fa4_fwd_selfload_common import (
 
 comptime WGMMA_M: Int = 64
 comptime WGMMA_K: Int = 16
+
+
+@always_inline
+def wgmma_wait_group_ordered[group: Int = 0]():
+    """`wgmma.wait_group.sync.aligned` that is also a COMPILER ordering point.
+
+    Identical PTX to the stdlib's `wgmma_wait_group_sync` (same one
+    instruction, zero extra cost) with one addition: `~{memory}` in the
+    constraint string, so LLVM is told the wait may read and write memory
+    and may not move memory operations across it.
+
+    Why this kernel needs that and the stdlib call does not suffice.
+    This kernel has no empty[] mbarriers: the proof that a ring slot's
+    reader has retired before the TMA refills that slot is
+    `wgmma.wait_group` plus PROGRAM ORDER (see the PREFETCH invariant
+    comment in the kernel body). The PTX ISA backs that proof:
+
+      * "The wgmma.mma_async operations are performed in the asynchronous
+        proxy (or async proxy)" (PTX ISA 9.7.16.4), and TMA
+        (`cp.async.bulk.tensor`) writes are async-proxy too -- so this is
+        an async->async write-after-read, NOT a proxy crossing.
+        `fence.proxy.async` (what `fence_async_view_proxy()` emits) is
+        defined only "between the async proxy and the generic proxy"
+        (9.7.14.4), so it is the wrong instrument here and would order
+        nothing: it is deliberately NOT used at the refill sites.
+      * "Once the wgmma-group completes, all the wgmma.mma_async
+        operations have been performed and completed" (9.7.16) -- the
+        reads are done when the wait returns.
+      * "These asynchronous operations are ordered after prior
+        instructions in the same thread" (8.9.1.1, and cp.async.bulk is
+        not among the exceptions) -- the refill cannot start before the
+        wait that precedes it.
+
+    Every link in that chain is a statement about the order the two
+    instructions appear in, which is exactly the property the compiler is
+    free to change: the stdlib's `wgmma_wait_group_sync` is
+    `inlined_assembly[..., constraints="n"]` (max/mojo/max/gpu/compute/
+    mma.mojo), i.e. `has_side_effect=True` but NO memory clobber, and so
+    is the TMA copy asm it must stay ordered against
+    (`cp_async_bulk_tensor_shared_cluster_global`, max/mojo/max/gpu/
+    memory/memory.mojo). Today both are side-effecting asm and LLVM keeps
+    side-effecting asm in relative order, which is why the emitted PTX is
+    correct -- but that is a property of the current toolchain, not a
+    contract it owes us. The clobber makes it a contract, for free, and
+    it is the same idiom the modular repo itself documents as a "hard
+    reordering barrier" (has_side_effect=True + `~{memory}`, see
+    max/kernels/src/nn/attention/gpu/amd_structured/mha_prefill_v2.mojo).
+
+    ptxas is the other half and cannot be reached from here: it is
+    covered by asserting the SASS (not just the PTX) in
+    tests/test_fa4_selfload_ptx_ordering.py.
+
+    Parameters:
+        group: Number of most recent wgmma-groups allowed to stay pending.
+    """
+    inlined_assembly[
+        "wgmma.wait_group.sync.aligned $0;",
+        NoneType,
+        constraints="n,~{memory}",
+        has_side_effect=True,
+    ](group)
 
 
 @__llvm_metadata(
@@ -195,16 +256,23 @@ def fwd_fa4_selfload_kernel[
     # sites' `it + PREFETCH` / `pf < kv_trips` offsets to match) breaks
     # the slot arithmetic silently: the refill would target a slot a
     # DIFFERENT in-flight tile still owns, which is a write-after-read
-    # race with no barrier left to catch it -- Mojo's `wgmma.wait_group`
-    # is not annotated with an LLVM memory clobber, so nothing but this
-    # invariant (and the PTX-ordering regression test that checks it,
-    # tests/test_fa4_selfload_ptx_ordering.py) stops a future toolchain
-    # from reordering a refill's `cp.async.bulk.tensor` ahead of the
-    # `wgmma.wait_group` that proves the slot is free. Failure mode if
-    # violated: silent corruption (wrong output, no error, no crash) --
-    # see tests/test_fa4_selfload_soak.py, ported from the phase-2c
-    # harness's soak_v7.mojo, which stresses exactly this window with
-    # back-to-back launches and no inter-launch sync.
+    # race with no barrier left to catch it. Failure mode if violated:
+    # silent corruption (wrong output, no error, no crash) -- see
+    # tests/test_fa4_selfload_soak.py, ported from the phase-2c harness's
+    # soak_v7.mojo, which stresses exactly this window with back-to-back
+    # launches and no inter-launch sync.
+    #
+    # The other half of the proof is that the refill really is EMITTED
+    # after the wait. That is a program-order property, so it is the
+    # compiler's to break, and the stdlib's `wgmma.wait_group` asm
+    # declares no memory clobber; the refill-gating waits below therefore
+    # go through `wgmma_wait_group_ordered` (same single instruction,
+    # plus `~{memory}`) instead -- see its docstring for the PTX ISA
+    # chain this pins down, and why a `fence.proxy.async` is NOT the
+    # instrument (async->async write-after-read: that fence is defined
+    # only across the generic/async boundary). The regression guards are
+    # tests/test_fa4_selfload_ptx_ordering.py, which checks the emitted
+    # PTX *and* the ptxas-scheduled SASS, and the soak above.
     #
     # The "consumer refills its own slot after its own retirement proof"
     # pattern is the same one warp-specialized GEMM mainloops use for
@@ -225,6 +293,21 @@ def fwd_fa4_selfload_kernel[
     # say anything about a paired smem consumer/producer schedule being
     # safe, so those three call sites (not the ISA text alone) are what
     # back the claim that this pattern is correct.
+    #
+    # READ THOSE THREE PRECEDENTS CAREFULLY, because all three ALSO have
+    # an mbarrier release/acquire pair where this kernel has nothing, and
+    # that difference looks alarming until you see what the pair is for.
+    # In every one of them the thread that refills the slot is in a
+    # DIFFERENT warp from the threads whose wgmma read it, so the arrive/
+    # wait pair is how the refilling thread LEARNS the read retired; the
+    # proof that it retired is `wgmma.wait_group` on the consumer side,
+    # exactly as here (CUTLASS says so at the call site: "Wait on the
+    # GMMA barrier for K_PIPE_MMAS (or fewer) outstanding to ensure
+    # smem_pipe_write is consumed"). This CTA is ONE warpgroup: the
+    # thread that refills is one of the threads that waited, so there is
+    # no second party to inform and the pair would carry no information.
+    # What it would carry is ordering, and that comes instead from the
+    # PTX ISA chain in `wgmma_wait_group_ordered`'s docstring.
     comptime PREFETCH: Int = STAGES // 2
     comptime accum_type: DType = DType.float32
     comptime swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B
@@ -917,7 +1000,10 @@ def fwd_fa4_selfload_kernel[
         q_smem, k_tile(0), s_reg, wg
     )
     wgmma_qk.commit_group()
-    wgmma_qk.wait_group()
+    # Refill-gating wait: `wgmma_wait_group_ordered`, not the stdlib's
+    # `wgmma_qk.wait_group()`, so the refill below cannot be moved above
+    # it (see the helper's docstring).
+    wgmma_wait_group_ordered()
     warpgroup_fence(s_reg)
     # K(0)'s slot (0) is free: refill it with K(PREFETCH). 2*PREFETCH
     # == STAGES, so that tile's slot IS slot 0 (see the PREFETCH
@@ -1003,7 +1089,8 @@ def fwd_fa4_selfload_kernel[
             )
 
         # QK(n+1) retired (PV(n) still running on the tensor core).
-        wgmma_qk.wait_group[1]()
+        # Refill-gating wait -- memory-clobbering variant (see the helper).
+        wgmma_wait_group_ordered[1]()
         warpgroup_fence(s_reg)
         # QK(it+1) has retired for the whole warpgroup -> K(it+1)'s slot
         # is free for the tile PREFETCH trips later (same slot; see the
@@ -1042,7 +1129,8 @@ def fwd_fa4_selfload_kernel[
         softmax_block(loop_diag, loop_lead)
 
         # PV(n) retired: p_reg and o_reg are safe to touch.
-        wgmma_pv.wait_group[0]()
+        # Refill-gating wait -- memory-clobbering variant (see the helper).
+        wgmma_wait_group_ordered[0]()
         warpgroup_fence(o_reg)
         if thread_idx.x == 0:
             var v_next: Int = it + PREFETCH
@@ -1070,7 +1158,15 @@ def fwd_fa4_selfload_kernel[
     wgmma_pv.arrive()
     pv_gemm(v_slot)
     wgmma_pv.commit_group()
-    wgmma_pv.wait_group[0]()
+    # Same memory-clobbering wait: what follows is not a TMA refill but the
+    # O epilogue staging its c-frags into the DEAD Q tile -- plain
+    # (generic-proxy) shared-memory stores into the exact smem the QK
+    # wgmmas were reading. Same write-after-read shape, same reliance on
+    # "the wait retired the readers, and the stores come after it in
+    # program order", and plain stores are freer to move than the refill's
+    # side-effecting asm is, so this site wants the clobber at least as
+    # much as the three above.
+    wgmma_wait_group_ordered[0]()
     warpgroup_fence(o_reg)
 
     # ---- Normalize (reciprocal; one div per row) and store.
