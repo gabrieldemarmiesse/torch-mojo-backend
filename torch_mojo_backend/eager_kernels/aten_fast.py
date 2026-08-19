@@ -89,6 +89,7 @@ from torch_mojo_backend.eager_kernels.searchsorted_ops import (
 from torch_mojo_backend.eager_kernels.softmax_backward_ops import (
     SoftmaxBackwardExtension as _SoftmaxBackwardExtension,
 )
+from torch_mojo_backend.eager_kernels.sort_ops import SortExtension as _SortExtension
 from torch_mojo_backend.eager_kernels.tf32_matmul_ops import (
     TF32MatmulExtension as _Tf32MatmulExtension,
 )
@@ -3400,6 +3401,182 @@ def fast_aten_searchsorted(
         side=side,
         sorter=sorter,
     )
+
+
+# ---------------------------------------------------------------------------
+# sort / topk: one segmented (key, index) sort behind both ops.
+#
+# The kernel orders (order-preserving unsigned key, original index) pairs, so
+# the order is total: ties resolve by index, which makes every result stable
+# and identical on CPU and GPU.  `sort(stable=True)` therefore costs nothing
+# extra, and `topk` is the same primitive run as a tournament.
+#
+# That is STRONGER than ATen asks for, and the difference shows up as a
+# conformance disagreement rather than a bug: `torch.sort(stable=None)` and
+# `torch.topk` both leave the order of equal elements unspecified, and CPU
+# ATen does pick a different one (verified: on a tie-heavy 8000-element row
+# these results equal CPU's `stable=True` answer exactly, while CPU's own
+# default answer does not).  The conformance entries that remain for
+# sort/argsort/topk on the low-cardinality dtypes are all that -- the values
+# match, the tie indices differ.
+# ---------------------------------------------------------------------------
+
+
+_SORT_DTYPES = (
+    DType.float32,
+    DType.float64,
+    DType.bfloat16,
+    DType.float16,
+    DType.int64,
+    DType.int32,
+    DType.int16,
+    DType.int8,
+    DType.uint8,
+)
+# bool rides the uint8 specialization (its ties are broken by index, so the
+# stable answer is well defined).  The unsigned 16/32/64-bit dtypes are
+# declined until they have kernel specializations of their own.
+
+# Mirrors `_TILE` in sort_ops/sort_ops.mojo -- Python picks the launch route
+# and sizes the workspace, so the two constants have to agree.
+_SORT_TILE_64 = 2048
+_SORT_TILE_32 = 4096
+# grid.y carries the row, and CUDA/Metal cap that dimension at 65535.
+_SORT_MAX_ROWS = 65535
+# The index rides through the kernel as int32 (halving shared-memory traffic
+# against int64), so a row longer than this cannot be addressed.
+_SORT_MAX_ROW = 2**31 - 1
+
+
+def _sort_tile_size(dtype: DType) -> int:
+    return _SORT_TILE_64 if dtype.size_in_bytes == 8 else _SORT_TILE_32
+
+
+def _sort_key_alloc_dtype(dtype: DType) -> DType:
+    """The workspace dtype whose width matches the kernel's key.
+
+    Only the byte width matters -- Mojo reinterprets the buffer as unsigned
+    -- and int32/int64 are the widths every allocator here already knows.
+    """
+    return DType.int64 if dtype.size_in_bytes == 8 else DType.int32
+
+
+def _fast_sort_or_topk(
+    input: torch.Tensor, dim: int, descending: bool, k: int | None
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | object:
+    """`(values, indices)` along `dim`; `k is None` means a full sort."""
+    a = _t(input)
+    if a is None:
+        return NOT_HANDLED
+    kernel_dtype = DType.uint8 if a._dtype == DType.bool else a._dtype
+    if kernel_dtype not in _SORT_DTYPES:
+        return NOT_HANDLED
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        return NOT_HANDLED
+
+    rank = len(a._shape)
+    ndim = rank or 1
+    if not -ndim <= dim < ndim:
+        raise IndexError(
+            "Dimension out of range (expected to be in range of "
+            f"[{-ndim}, {ndim - 1}], but got {dim})"
+        )
+    dim %= ndim
+    size = a._shape[dim] if rank else 1
+    if k is None:
+        out_k = size
+    else:
+        if not isinstance(k, int) or isinstance(k, bool):
+            return NOT_HANDLED
+        if not 0 <= k <= size:
+            raise RuntimeError("selected index k out of range")
+        out_k = k
+
+    swapped = rank > 1 and dim != rank - 1
+    if swapped:
+        a = fast_aten_transpose(a, dim, rank - 1)
+        if a is NOT_HANDLED:
+            return NOT_HANDLED
+
+    n = a._shape[-1] if rank else 1
+    rows = (a._numel // n) if n else 0
+    if n > _SORT_MAX_ROW or rows > _SORT_MAX_ROWS:
+        return NOT_HANDLED
+
+    out_shape = (tuple(a._shape[:-1]) + (out_k,)) if rank else ()
+    values = _alloc(out_shape, a._dtype, a._device)
+    indices = _alloc(out_shape, DType.int64, a._device)
+
+    if values._numel and rows:
+        a = _tc(a)
+        on_gpu = a._device.label == "gpu"
+        tile = _sort_tile_size(kernel_dtype)
+        tiles = (n + tile - 1) // tile
+        n_pow2 = 1 << (n - 1).bit_length()
+        if not on_gpu:
+            route, pad = 3, n
+        elif n_pow2 <= tile:
+            route, pad = 0, n_pow2
+        elif k is not None and tiles * out_k <= tile:
+            route, pad = 1, tiles * out_k
+        else:
+            route, pad = 2, n_pow2
+
+        scratch = _alloc((rows * pad,), DType.int32, a._device)
+        if on_gpu:
+            keys = _alloc((rows * pad,), _sort_key_alloc_dtype(kernel_dtype), a._device)
+            keys_ptr = keys._ptr
+        else:
+            keys = None
+            keys_ptr = 0
+
+        _call_mojo(
+            _SortExtension,
+            "Sort",
+            (
+                values._ptr,
+                indices._ptr,
+                a._ptr,
+                keys_ptr,
+                scratch._ptr,
+                rows,
+                n,
+                out_k,
+                pad,
+                route,
+                1 if descending else 0,
+                kernel_dtype.value,
+                _ctx_ptr(a._device),
+            ),
+            arg_dtypes=(kernel_dtype,),
+            keepalive=tuple(
+                tensor
+                for tensor in (values, indices, a, keys, scratch)
+                if tensor is not None
+            ),
+        )
+
+    if swapped:
+        values = fast_aten_transpose(values, dim, rank - 1)
+        indices = fast_aten_transpose(indices, dim, rank - 1)
+    return values, indices
+
+
+def fast_aten_sort(
+    self: torch.Tensor, dim: int = -1, descending: bool = False
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | object:
+    return _fast_sort_or_topk(self, dim, descending, None)
+
+
+def fast_aten_topk(
+    self: torch.Tensor, k: int, dim: int = -1, largest: bool = True, sorted: bool = True
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | object:
+    # `sorted=False` only frees an implementation to return the k elements in
+    # any order; returning them sorted, as this one always does, is a legal
+    # answer to both.
+    del sorted
+    # `largest` IS the sort direction: the k largest come back descending.
+    return _fast_sort_or_topk(self, dim, largest, k)
 
 
 # ---------------------------------------------------------------------------

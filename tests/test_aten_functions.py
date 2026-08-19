@@ -2771,6 +2771,296 @@ def test_aten_searchsorted_compile_backend_declines_unchecked_sorter() -> None:
         torch.compile(fn, backend=mojo_backend)(boundaries, values, out_of_range_sorter)
 
 
+# ---------------------------------------------------------------------------
+# topk / sort.  Every case below uses tie-free values on purpose: ATen leaves
+# the index of a tie unspecified (CPU, CUDA and this backend are each free to
+# pick a different one), so only `sort(stable=True)` -- which pins the order --
+# is tested against ties.
+# ---------------------------------------------------------------------------
+
+
+def _distinct(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """A tensor whose values are all distinct, exactly representable in
+    `dtype`, and not in sorted order."""
+    numel = math.prod(shape)
+    values = torch.arange(numel, dtype=torch.int64)
+    values = (values * 37 + 11) % numel  # a fixed tie-free permutation
+    return (values - numel // 2).reshape(shape).to(dtype)
+
+
+@pytest.mark.parametrize("largest", [True, False])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.int32]
+)
+def test_aten_topk_last_dim(
+    mojo_device: str, call_checker: CallChecker, dtype: torch.dtype, largest: bool
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_topk)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.topk(x, 3, -1, largest, True)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((4, 33), dtype)])
+
+
+@pytest.mark.parametrize("dim", [0, 1, -2])
+def test_aten_topk_non_last_dim(
+    mojo_device: str, call_checker: CallChecker, dim: int
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_topk)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.topk(x, 2, dim, True, True)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((5, 4, 3), torch.float32)])
+
+
+@pytest.mark.parametrize("k", [0, 1, 7])
+def test_aten_topk_k_edges(mojo_device: str, call_checker: CallChecker, k: int) -> None:
+    """k=0 (empty result), k=1, and k == the whole row (a full sort)."""
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_topk)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.topk(x, k, -1, True, True)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((3, 7), torch.float32)])
+
+
+def test_aten_topk_large_row_small_k(
+    mojo_device: str, call_checker: CallChecker
+) -> None:
+    """The LLM-sampling regime: k tiny, the row a whole vocabulary."""
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_topk)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.topk(x, 50, -1, True, True)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((2, 4099), torch.float32)])
+
+
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+        torch.int64,
+        torch.int32,
+        torch.bool,
+    ],
+)
+def test_aten_sort_last_dim(
+    mojo_device: str, call_checker: CallChecker, dtype: torch.dtype, descending: bool
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_sort)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.sort.stable(x, stable=True, dim=-1, descending=descending)
+
+    if dtype is torch.bool:
+        # Booleans are all ties; only a stable sort has a defined answer, and
+        # `stable=True` above is what makes CPU and this backend agree.
+        x = (torch.arange(4 * 33) % 3 == 0).reshape(4, 33)
+    else:
+        x = _distinct((4, 33), dtype)
+    check_outputs(fn, Conf(mojo_device, False), [x])
+
+
+@pytest.mark.parametrize("dim", [0, 1, -2])
+def test_aten_sort_non_last_dim(
+    mojo_device: str, call_checker: CallChecker, dim: int
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_sort)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.sort.stable(x, stable=True, dim=dim, descending=False)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((5, 4, 3), torch.float32)])
+
+
+@pytest.mark.parametrize("descending", [False, True])
+def test_aten_sort_stable_with_ties(
+    mojo_device: str, call_checker: CallChecker, descending: bool
+) -> None:
+    """`stable=True` pins the index order of equal values; check it holds."""
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_sort)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.sort.stable(x, stable=True, dim=-1, descending=descending)
+
+    x = torch.tensor([[3.0, 1.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]]).repeat(3, 5)
+    check_outputs(fn, Conf(mojo_device, False), [x])
+
+
+def test_aten_sort_large_row(mojo_device: str, call_checker: CallChecker) -> None:
+    """The top-p sampling regime: one full-vocabulary descending sort."""
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_sort)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.sort.stable(x, stable=True, dim=-1, descending=True)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((2, 4099), torch.float32)])
+
+
+def test_aten_sort_empty_and_singleton(
+    mojo_device: str, call_checker: CallChecker
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
+
+    def fn(
+        empty: torch.Tensor, scalar: torch.Tensor, single: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        empty_values, empty_indices = aten.sort.stable(empty, stable=True, dim=-1)
+        scalar_values, scalar_indices = aten.topk(scalar, 1, 0, True, True)
+        single_values, single_indices = aten.sort.stable(single, stable=True, dim=0)
+        return (
+            empty_values,
+            empty_indices,
+            scalar_values,
+            scalar_indices,
+            single_values,
+            single_indices,
+        )
+
+    check_outputs(
+        fn,
+        Conf(mojo_device, False),
+        [torch.empty(2, 0), torch.tensor(4.5), torch.tensor([7.0])],
+    )
+
+
+def test_aten_argsort_and_msort_reach_sort(
+    mojo_device: str, call_checker: CallChecker
+) -> None:
+    """Both decompose onto aten::sort, so registering sort covers them."""
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_sort)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.argsort(x, dim=-1),
+            torch.argsort(x, dim=-1, descending=True),
+            torch.msort(x),
+        )
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((4, 9), torch.float32)])
+
+
+def test_aten_topk_and_sort_non_contiguous_input(
+    mojo_device: str, call_checker: CallChecker
+) -> None:
+    """A transposed (and a sliced) view must be materialized, not misread."""
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        transposed = x.t()
+        sliced = x[:, 1::2]
+        top_values, top_indices = aten.topk(transposed, 2, -1, True, True)
+        sorted_values, sorted_indices = aten.sort.stable(sliced, stable=True, dim=-1)
+        return (top_values, top_indices, sorted_values, sorted_indices)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((6, 8), torch.float32)])
+
+
+def test_aten_topk_and_sort_out_variants(
+    mojo_device: str, call_checker: CallChecker
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
+    x = _distinct((3, 6), torch.float32).to(mojo_device)
+
+    values = torch.empty(0, dtype=torch.float32, device=mojo_device)
+    indices = torch.empty(0, dtype=torch.int64, device=mojo_device)
+    got = aten.topk.values(x, 2, -1, True, True, values=values, indices=indices)
+    assert got[0] is values and got[1] is indices
+    expected = torch.topk(x.cpu(), 2, dim=-1)
+    torch.testing.assert_close(values.cpu(), expected.values)
+    torch.testing.assert_close(indices.cpu(), expected.indices)
+
+    values = torch.empty(0, dtype=torch.float32, device=mojo_device)
+    indices = torch.empty(0, dtype=torch.int64, device=mojo_device)
+    got = aten.sort.values_stable(
+        x, stable=True, dim=-1, descending=False, values=values, indices=indices
+    )
+    assert got[0] is values and got[1] is indices
+    expected = torch.sort(x.cpu(), dim=-1, stable=True)
+    torch.testing.assert_close(values.cpu(), expected.values)
+    torch.testing.assert_close(indices.cpu(), expected.indices)
+
+
+def test_aten_topk_and_sort_errors(mojo_device: str, call_checker: CallChecker) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
+    x = _distinct((3, 6), torch.float32).to(mojo_device)
+
+    with pytest.raises(RuntimeError, match="selected index k out of range"):
+        aten.topk(x, 7, -1, True, True)
+    with pytest.raises(IndexError, match="Dimension out of range"):
+        aten.topk(x, 2, 5, True, True)
+    with pytest.raises(IndexError, match="Dimension out of range"):
+        aten.sort.stable(x, stable=True, dim=5)
+
+
+def test_aten_topk_and_sort_backward(call_checker: CallChecker) -> None:
+    """Both backwards are a scatter of the gradient over the returned indices.
+
+    Pinned to mojo device 0 rather than the `mojo_device` fixture: the
+    generated backward rebuilds the gradient buffer from the C++ side with
+    `at::zeros(sizes, grad.options())`, and a mojo tensor's C++ TensorImpl
+    carries the phantom device index 0 whatever device it really lives on, so
+    on any other index that allocation lands on the wrong device. That is a
+    backend-wide property (`aten::min.dim` backward hits it identically), not
+    something sort or topk can fix.
+    """
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
+    x = _distinct((4, 9), torch.float32).to("mojo:0").requires_grad_(True)
+    reference = x.detach().cpu().clone().requires_grad_(True)
+
+    def loss(t: torch.Tensor) -> torch.Tensor:
+        top = torch.topk(t, 3, dim=-1).values
+        low = torch.sort(t, dim=-1).values[..., :2]
+        return (top * 2).sum() + (low * 3).sum()
+
+    loss(x).backward()
+    loss(reference).backward()
+    torch.testing.assert_close(x.grad.cpu(), reference.grad)
+
+
+def test_aten_topk_and_sort_compile_backend(call_checker: CallChecker) -> None:
+    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        top_values, top_indices = aten.topk(x, 3, -1, True, True)
+        low_values, low_indices = aten.topk(x, 2, -1, False, True)
+        sorted_values, sorted_indices = aten.sort.stable(
+            x, stable=True, dim=-1, descending=False
+        )
+        descending_values, _ = aten.sort.stable(x, stable=True, dim=0, descending=True)
+        return (
+            top_values,
+            top_indices,
+            low_values,
+            low_indices,
+            sorted_values,
+            sorted_indices,
+            descending_values,
+        )
+
+    check_outputs(fn, Conf("cpu", True), [_distinct((4, 9), torch.float32)])
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_aten_scatter_src_basic_2d(conf: Conf, dtype: torch.dtype):
     """Test aten.scatter.src basic functionality with 2D tensors"""

@@ -252,6 +252,34 @@ def type_promotion(x, y):
     return x, y
 
 
+def _select_sorted_k(
+    input: MaxTensor, k: int, axis: int, largest: bool
+) -> tuple[MaxTensor, MaxTensor]:
+    """MAX's k-selection: the k largest (or smallest) values, already ordered.
+
+    Shared by sort (k = the whole axis) and topk. MAX only selects along the
+    innermost axis on GPU, so any other axis is transposed to last and the
+    two results transposed back.
+    """
+    rank = len(input.shape)
+    if k == 0:
+        # top_k/bottom_k reject k=0; an empty slice of the input already has
+        # the right shape, dtype and device.
+        slices = [slice(None)] * rank
+        slices[axis] = slice(0, 0)
+        empty = input[*slices]
+        return empty, F.cast(empty, DType.int64)
+    last = rank - 1
+    operand = input if axis == last else F.transpose(input, axis, last)
+    if largest:
+        values, indices = max_ops.top_k(operand, k=k, axis=last)
+    else:
+        values, indices = max_ops.bottom_k(operand, k=k, axis=last)
+    if axis == last:
+        return values, indices
+    return F.transpose(values, axis, last), F.transpose(indices, axis, last)
+
+
 _SEARCHSORTED_DTYPES = (
     DType.float32,
     DType.bfloat16,
@@ -3458,7 +3486,35 @@ def aten_slice(
 
 
 # slice_scatter(Tensor self, Tensor src, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
-# sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+
+
+# aten::sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+# aten::sort.stable(Tensor self, *, bool? stable, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+@map_to(aten.sort)
+def aten_sort(
+    input: MaxTensor,
+    dim: int = -1,
+    descending: bool = False,
+    *,
+    stable: bool | None = None,
+) -> tuple[MaxTensor, MaxTensor]:
+    # `stable` needs no branch: MAX's top_k/bottom_k document their output as
+    # sorted *stably*, which is the stronger of the two guarantees ATen asks
+    # for, so it is a correct answer to `stable=True` and to `stable=None`.
+    del stable
+    rank = len(input.shape)
+    if rank == 0:
+        raise NotImplementedError(
+            "sorting a 0-d tensor is not supported by the MAX graph backend"
+        )
+    axis = dim + rank if dim < 0 else dim
+    size = input.shape[axis]
+    if not isinstance(size, StaticDim):
+        raise NotImplementedError(
+            "sort needs a statically known size along the sorted axis, but "
+            f"axis {axis} has symbolic dim {size}"
+        )
+    return _select_sorted_k(input, int(size), axis, descending)
 
 
 # split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]
@@ -3554,8 +3610,29 @@ def aten_sum(
 # sym_stride.int(Tensor self, int dim) -> SymInt
 # tan(Tensor self) -> Tensor
 # tanh(Tensor self) -> Tensor
-# topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)
 # trunc(Tensor self) -> Tensor
+
+
+# aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)
+@map_to(aten.topk)
+def aten_topk(
+    input: MaxTensor, k: int, dim: int = -1, largest: bool = True, sorted: bool = True
+) -> tuple[MaxTensor, MaxTensor]:
+    # `sorted=False` only permits an arbitrary order among the k results;
+    # returning them sorted, which is all MAX offers, answers both settings.
+    del sorted
+    rank = len(input.shape)
+    if rank == 0:
+        raise NotImplementedError(
+            "topk of a 0-d tensor is not supported by the MAX graph backend"
+        )
+    if not isinstance(k, int):
+        raise NotImplementedError(f"topk needs a statically known k, but got {k!r}")
+    axis = dim + rank if dim < 0 else dim
+    size = input.shape[axis]
+    if isinstance(size, StaticDim) and not 0 <= k <= int(size):
+        raise RuntimeError("selected index k out of range")
+    return _select_sorted_k(input, k, axis, largest)
 
 
 # unsqueeze(Tensor(a) self, int dim) -> Tensor(a)
