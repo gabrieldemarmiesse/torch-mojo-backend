@@ -20,6 +20,18 @@ from bench_lib.hw import Hardware
 CONV_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int]] = {
     "N32xC64x56x56_K64k3s1": (32, 64, 56, 56, 64, 3, 1, 1),
     "N8xC3x224x224_K64k7s2": (8, 3, 224, 224, 64, 7, 2, 3),
+    # Deeper-C, small-spatial ResNet stage. Same implicit-GEMM domain as the
+    # body shape above but the output row pitch (hw*2 = 392 B) is not TMA
+    # store aligned, so it exercises the scalar epilogue instead.
+    "N32xC256x14x14_K256k3s1": (32, 256, 14, 14, 256, 3, 1, 1),
+    # Nothing divides anything: C=48 pads to 64 (25% wasted reduction),
+    # out_c=80 is ragged against BM=64, H/W are both odd. Worst-case shape
+    # inside the implicit-GEMM domain.
+    "N7xC48x39x53_K80k3s1": (7, 48, 39, 53, 80, 3, 1, 1),
+    # 1x1 control: the materialized route already skips im2col for this case
+    # (the NCHW input IS the col matrix), so the implicit-GEMM route must
+    # decline it rather than regress it with an added NHWC pass.
+    "N32xC256x56x56_K64k1s1": (32, 256, 56, 56, 64, 1, 1, 0),
 }
 # (N, C, H, W, output)
 ADAPTIVE_SHAPES: dict[str, tuple[int, int, int, int, int]] = {

@@ -39,6 +39,9 @@ from torch_mojo_backend.eager_kernels.activation_backward_ops import (
 from torch_mojo_backend.eager_kernels.activation_forward_ops import (
     ActivationForwardExtension as _ActivationForwardExtension,
 )
+from torch_mojo_backend.eager_kernels.conv_igemm_ops import (
+    ConvIgemmExtension as _ConvIgemmExtension,
+)
 from torch_mojo_backend.eager_kernels.conv_ops import ConvExtension as _ConvExtension
 from torch_mojo_backend.eager_kernels.data_movement_ops import (
     DataMovementExtension as _DataMovementExtension,
@@ -8783,6 +8786,146 @@ def _try_tf32_conv_bmm(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Implicit-GEMM conv2d (sm_90a): the (N*OH*OW) x (R*S*C) patch matrix is never
+# written to memory. The hardware im2col TMA reads each B tile straight out of
+# an NHWC copy of the activation, so the route costs one NCHW->NHWC pass plus
+# the GEMM, where the materialized route costs a full im2col write + read
+# (89% of the body conv's device time) plus the same GEMM. Measured on an
+# H100 PCIe at a 1395 MHz pin, bf16 N32xC64x56x56 K64 k3s1: 59.0 us vs
+# 861 us on the materialized route and 71.95 us for cuDNN (0.82x cuDNN).
+#
+# Everything the route cannot do stays on the materialized route: grouped
+# convolution (not implemented here at all), stride != 1, dilation != 1,
+# 1x1 filters (which skip im2col entirely there and are already at 0.94x
+# cuDNN), thin-C shapes like a 3-channel stem, and float32/TF32 (feasible --
+# the descriptor path is dtype-generic -- but the 128 B swizzle makes the
+# k-tile, the C padding and the wgmma shape all change with the element
+# width, so it is a separate piece of work and is not built).
+# ---------------------------------------------------------------------------
+
+_CONV_IGEMM_SOURCE_PATHS = (
+    eager_kernels._PACKAGE_DIR / _ConvIgemmExtension.MOJO_FILE,
+    eager_kernels._PACKAGE_DIR / "wgmma_c_epilogue.mojo",
+)
+
+# 16-bit only: the kernel is a wgmma path whose k-tile is one 128 B swizzle
+# row. float16 is the same instruction with a different operand token and the
+# Mojo source instantiates for it, but only bfloat16 has been measured, so
+# only bfloat16 is admitted here.
+_CONV_IGEMM_DTYPES = (DType.bfloat16,)
+
+# C is padded up to the 64-channel k-tile and the padded reduction is real
+# work: at C = 32 the GEMM already does 2x the necessary math, and a
+# 3-channel stem would do 21x. Below this the materialized route wins.
+_CONV_IGEMM_MIN_C = 32
+# With BM = 64 a ragged out_c wastes up to half of every output tile.
+_CONV_IGEMM_MIN_OUT_C = 32
+_CONV_IGEMM_CHANNEL_TILE = 64
+
+
+def _conv_igemm_bridge_available() -> bool:
+    """Whether the implicit-GEMM conv bridge and its sources are present."""
+    return _bridge_available("conv_igemm", _CONV_IGEMM_SOURCE_PATHS)
+
+
+def _conv_igemm_descriptor_legal(ph: int, pw: int, kh: int, kw: int) -> bool:
+    """Whether the im2col TMA descriptor this conv needs is legal at all.
+
+    `cuTensorMapEncodeIm2col` takes the pixel-box corners as SIGNED CHAR --
+    both corners of both spatial dimensions must land in [-128, 127] -- and
+    the per-transaction im2col offsets (the filter taps this kernel issues,
+    0..R-1 and 0..S-1) are limited to [0, 255]. The two failure modes differ
+    and both have to be caught HERE, before anything is allocated: an illegal
+    corner makes descriptor creation fail outright, while an illegal tap is
+    undefined behaviour at the instruction and does not fail loudly. E.g.
+    N=1, C=64, H=W=7, K=64, R=257, S=3, pad=(128, 1) satisfies every other
+    condition on this route and produces tap r = 256.
+    """
+    corners = (-ph, -pw, ph - (kh - 1), pw - (kw - 1))
+    return (
+        all(-128 <= corner <= 127 for corner in corners)
+        and kh - 1 <= 255
+        and kw - 1 <= 255
+    )
+
+
+def _try_conv_igemm(
+    a: TorchMojoTensor,
+    w: TorchMojoTensor,
+    in_shape: tuple[int, int, int, int],
+    filt: tuple[int, int, int],
+    strides: tuple[int, int],
+    pads: tuple[int, int],
+    dils: tuple[int, int],
+    out_hw: tuple[int, int],
+    ctx: int,
+) -> TorchMojoTensor | None:
+    """Dense conv2d forward through the sm_90a implicit GEMM, or ``None`` when
+    any gate declines (the caller then takes the materialized im2col route).
+
+    Only ``groups == 1`` reaches here; grouped convolution is not implemented
+    by this kernel.
+    """
+    n, c, in_h, in_w = in_shape
+    out_c, kh, kw = filt
+    ph, pw = pads
+    out_h, out_w = out_hw
+    if (
+        a._dtype not in _CONV_IGEMM_DTYPES
+        or w._dtype != a._dtype
+        or w._device != a._device
+        or a._device.label != "gpu"
+        or a._device.api != "cuda"
+        or a._device.architecture_name != "sm_90a"
+        or not _conv_igemm_bridge_available()
+    ):
+        return None
+    if strides != (1, 1) or dils != (1, 1):
+        # The box convention (lower = -pad, upper = pad - (filter - 1)) makes
+        # the pixel box the output grid, which is only true at stride 1;
+        # dilation needs a different box.
+        return None
+    if kh * kw <= 1:
+        # A 1x1 conv has no im2col on the materialized route either (the NCHW
+        # input is reread in place) and is already faster than cuDNN there;
+        # routing it here would only add the NHWC pass.
+        return None
+    if c < _CONV_IGEMM_MIN_C or out_c < _CONV_IGEMM_MIN_OUT_C:
+        return None
+    if min(n, in_h, in_w, out_h, out_w) <= 0:
+        return None
+    if not _conv_igemm_descriptor_legal(ph, pw, kh, kw):
+        return None
+    c_pad = (
+        (c + _CONV_IGEMM_CHANNEL_TILE - 1) // _CONV_IGEMM_CHANNEL_TILE
+    ) * _CONV_IGEMM_CHANNEL_TILE
+    # Scratch: the NHWC activation and the k-major weight. Both are smaller
+    # than the (n, C*R*S, OH*OW) column buffer this route replaces -- the
+    # activation by R*S, the weight by the batch.
+    act = _alloc((n, in_h, in_w, c_pad), a._dtype, a._device)
+    wpack = _alloc((out_c, kh * kw * c_pad), a._dtype, a._device)
+    out = _alloc((n, out_c, out_h * out_w), a._dtype, a._device)
+    _call_mojo(
+        _ConvIgemmExtension,
+        "ConvIgemm",
+        (
+            out._ptr,
+            act._ptr,
+            wpack._ptr,
+            a._ptr,
+            w._ptr,
+            (n, c, c_pad, in_h, in_w, out_c, kh, kw, ph, pw, out_h, out_w),
+            a._dtype.value,
+            ctx,
+        ),
+        arg_dtypes=(a._dtype,),
+        output_dtypes=(out._dtype,),
+        keepalive=(out, act, wpack, a, w),
+    )
+    return out
+
+
 def fast_aten_convolution(
     input, weight, bias, stride, padding, dilation, transposed, output_padding, groups
 ):
@@ -8821,107 +8964,124 @@ def fast_aten_convolution(
             ctx = _ctx_ptr(a._device)
             cols = out_h * out_w
             ckk = c * kh * kw
-            if (kh, kw, sh, sw, ph, pw, dh, dw) == (1, 1, 1, 1, 0, 0, 1, 1):
-                # 1x1 stride-1 conv: NCHW input already is the col matrix.
-                col_ptr = a._ptr
-            else:
-                col = _alloc((n, ckk, cols), a._dtype, a._device)
-                _call_mojo(
-                    _ConvExtension,
-                    "Im2col",
-                    (
-                        col._ptr,
-                        a._ptr,
-                        (
-                            in_h,
-                            in_w,
-                            out_h,
-                            out_w,
-                            kh,
-                            kw,
-                            sh,
-                            sw,
-                            ph,
-                            pw,
-                            dh,
-                            dw,
-                            c,
-                            n,
-                        ),
-                        a._dtype.value,
-                        ctx,
-                    ),
-                    arg_dtypes=(a._dtype,),
-                    output_dtypes=(col._dtype,),
-                    keepalive=(col, a),
-                )
-                col_ptr = col._ptr
+            out = None
             if groups == 1:
-                # H100 tensor cores first: bf16/f16 through the same Bmm16
-                # kernel fast_aten_bmm already builds, f32 through the same
-                # opt-in TF32 route _try_tf32_mm already gates. Both decline
-                # (return None) off sm_90a, off their dtype, or with the
-                # bridge sources missing, and the plain SIMT Bmm below is the
-                # fallback for every regime they decline, including grouped
-                # convs (untouched, handled in the `else` branch).
-                out = _try_gemm16_conv_bmm(w, a, col_ptr, n, out_c, cols, ckk)
-                if out is None:
-                    out = _try_tf32_conv_bmm(w, a, col_ptr, n, out_c, cols, ckk)
-                if out is None:
-                    out = _alloc((n, out_c, cols), a._dtype, a._device)
+                # Implicit GEMM (the patch matrix is never materialized) when
+                # the shape is inside its domain; everything else, grouped
+                # convs included, falls through to the im2col route below.
+                out = _try_conv_igemm(
+                    a,
+                    w,
+                    (n, c, in_h, in_w),
+                    (out_c, kh, kw),
+                    (sh, sw),
+                    (ph, pw),
+                    (dh, dw),
+                    (out_h, out_w),
+                    ctx,
+                )
+            if out is None:
+                if (kh, kw, sh, sw, ph, pw, dh, dw) == (1, 1, 1, 1, 0, 0, 1, 1):
+                    # 1x1 stride-1 conv: NCHW input already is the col matrix.
+                    col_ptr = a._ptr
+                else:
+                    col = _alloc((n, ckk, cols), a._dtype, a._device)
                     _call_mojo(
-                        _MatmulExtension,
-                        "Bmm",
+                        _ConvExtension,
+                        "Im2col",
                         (
-                            out._ptr,
-                            w._ptr,
-                            col_ptr,
-                            (n, out_c, cols, ckk, 0, 1),
+                            col._ptr,
+                            a._ptr,
+                            (
+                                in_h,
+                                in_w,
+                                out_h,
+                                out_w,
+                                kh,
+                                kw,
+                                sh,
+                                sw,
+                                ph,
+                                pw,
+                                dh,
+                                dw,
+                                c,
+                                n,
+                            ),
                             a._dtype.value,
                             ctx,
                         ),
-                        arg_dtypes=(w._dtype, a._dtype),
-                        output_dtypes=(out._dtype,),
-                        # Same define shape as every other Bmm site: the
-                        # shared-A broadcast is RUNTIME data (the trailing 1
-                        # in the params tuple, matmul_ops._bmm_go), so naming
-                        # it here would only fork this call site onto a
-                        # second .so of identical code.
-                        flags={"TRANSPOSE_B": False},
-                        keepalive=(out, w),
+                        arg_dtypes=(a._dtype,),
+                        output_dtypes=(col._dtype,),
+                        keepalive=(col, a),
                     )
-            else:
-                out = _alloc((n, out_c, cols), a._dtype, a._device)
-                # Channel-major im2col rows make each group a contiguous
-                # (crs_g, cols) slice; run one offset GEMM per (sample, group).
-                crs_g = c_per_group * kh * kw
-                oc_g = out_c // groups
-                for s in range(n):
-                    for g in range(groups):
+                    col_ptr = col._ptr
+                if groups == 1:
+                    # H100 tensor cores first: bf16/f16 through the same Bmm16
+                    # kernel fast_aten_bmm already builds, f32 through the same
+                    # opt-in TF32 route _try_tf32_mm already gates. Both decline
+                    # (return None) off sm_90a, off their dtype, or with the
+                    # bridge sources missing, and the plain SIMT Bmm below is the
+                    # fallback for every regime they decline, including grouped
+                    # convs (untouched, handled in the `else` branch).
+                    out = _try_gemm16_conv_bmm(w, a, col_ptr, n, out_c, cols, ckk)
+                    if out is None:
+                        out = _try_tf32_conv_bmm(w, a, col_ptr, n, out_c, cols, ckk)
+                    if out is None:
+                        out = _alloc((n, out_c, cols), a._dtype, a._device)
                         _call_mojo(
                             _MatmulExtension,
-                            "Matmul",
+                            "Bmm",
                             (
                                 out._ptr,
                                 w._ptr,
                                 col_ptr,
-                                (
-                                    oc_g,
-                                    cols,
-                                    crs_g,
-                                    0,
-                                    (s * out_c + g * oc_g) * cols,
-                                    g * oc_g * crs_g,
-                                    (s * c + g * c_per_group) * kh * kw * cols,
-                                ),
+                                (n, out_c, cols, ckk, 0, 1),
                                 a._dtype.value,
                                 ctx,
                             ),
                             arg_dtypes=(w._dtype, a._dtype),
                             output_dtypes=(out._dtype,),
+                            # Same define shape as every other Bmm site: the
+                            # shared-A broadcast is RUNTIME data (the trailing 1
+                            # in the params tuple, matmul_ops._bmm_go), so naming
+                            # it here would only fork this call site onto a
+                            # second .so of identical code.
                             flags={"TRANSPOSE_B": False},
                             keepalive=(out, w),
                         )
+                else:
+                    out = _alloc((n, out_c, cols), a._dtype, a._device)
+                    # Channel-major im2col rows make each group a contiguous
+                    # (crs_g, cols) slice; run one offset GEMM per (sample, group).
+                    crs_g = c_per_group * kh * kw
+                    oc_g = out_c // groups
+                    for s in range(n):
+                        for g in range(groups):
+                            _call_mojo(
+                                _MatmulExtension,
+                                "Matmul",
+                                (
+                                    out._ptr,
+                                    w._ptr,
+                                    col_ptr,
+                                    (
+                                        oc_g,
+                                        cols,
+                                        crs_g,
+                                        0,
+                                        (s * out_c + g * oc_g) * cols,
+                                        g * oc_g * crs_g,
+                                        (s * c + g * c_per_group) * kh * kw * cols,
+                                    ),
+                                    a._dtype.value,
+                                    ctx,
+                                ),
+                                arg_dtypes=(w._dtype, a._dtype),
+                                output_dtypes=(out._dtype,),
+                                flags={"TRANSPOSE_B": False},
+                                keepalive=(out, w),
+                            )
             if bias_t is not None:
                 _call_mojo(
                     _ConvExtension,

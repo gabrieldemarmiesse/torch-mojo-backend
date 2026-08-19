@@ -9467,6 +9467,178 @@ def test_fast_conv2d_tensor_core_benchmark_shapes(
     torch.testing.assert_close(dev.float(), ref, atol=atol, rtol=rtol)
 
 
+# ---------------------------------------------------------------------------
+# Implicit-GEMM conv (sm_90a, bf16): the TMA im2col route that never
+# materializes the patch matrix. Ported from the standalone Mojo harness the
+# kernel was developed in, which checked EVERY output element of each case
+# against an fp64 host reference; here the reference is torch's own fp32 conv.
+# ---------------------------------------------------------------------------
+_CONV_IGEMM_SHAPES = {
+    # (n, c, h, w, out_c, kh, kw, pad_h, pad_w)
+    # hw = 49: fewer pixels than one B tile, so the single im2col transaction
+    # walks past the end of the ONLY sample -- the case that would need a
+    # guard sample if the pixels-per-column tail faulted instead of
+    # zero-filling. Odd row pitch (98 B) -> scalar epilogue.
+    "batch1_pad_7x7": (1, 64, 7, 7, 64, 3, 3, 1, 1),
+    "unpadded_9x9": (2, 64, 9, 9, 64, 3, 3, 0, 0),
+    # body geometry: 16 B aligned row pitch -> TMA-store epilogue
+    "body_56x56": (2, 64, 56, 56, 64, 3, 3, 1, 1),
+    # hw = 196 (392 B) -> scalar epilogue, deep C
+    "mid_14x14_C256": (2, 256, 14, 14, 256, 3, 3, 1, 1),
+    # C = 48 padded to 64, ragged out_c = 80, awkward spatial extent
+    "awkward_C48_K80": (3, 48, 39, 53, 80, 3, 3, 1, 1),
+    # ragged out_c WITH the TMA-store epilogue
+    "ragged_K80_tma_store": (2, 64, 16, 16, 80, 3, 3, 1, 1),
+    "ragged_K96_tma_store": (1, 64, 16, 16, 96, 3, 3, 1, 1),
+    # rectangular filters with ASYMMETRIC padding (pad_h != pad_w), both
+    # epilogues, plus degenerate 1-tap dimensions
+    "rect_R3S5_pad12": (2, 64, 16, 20, 64, 3, 5, 1, 2),
+    "rect_R5S3_pad21_C96": (1, 96, 11, 13, 96, 5, 3, 2, 1),
+    "rect_R1S3_pad01": (2, 64, 13, 13, 64, 1, 3, 0, 1),
+    "rect_R3S1_pad10_C128": (2, 128, 12, 12, 64, 3, 1, 1, 0),
+    # deeper K: 7x7 taps
+    "k7_pad3": (1, 64, 16, 16, 64, 7, 7, 3, 3),
+}
+
+
+@pytest.mark.parametrize("shape_id", _CONV_IGEMM_SHAPES)
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_fast_conv2d_igemm_edge_shapes(
+    mojo_h100: torch.device,
+    monkeypatch: pytest.MonkeyPatch,
+    shape_id: str,
+    with_bias: bool,
+) -> None:
+    """Every geometry the implicit-GEMM dispatch ACCEPTS, and a check that it
+    really is the route that ran."""
+    calls = _spy_defined_native_calls(
+        monkeypatch, {("conv_igemm_ops.mojo", "ConvIgemm")}
+    )
+    n, c, h, w, out_c, kh, kw, ph, pw = _CONV_IGEMM_SHAPES[shape_id]
+    x = torch.randn(n, c, h, w, dtype=torch.bfloat16)
+    weight = (torch.randn(out_c, c, kh, kw, dtype=torch.bfloat16) * 0.1).to(
+        torch.bfloat16
+    )
+    bias = torch.randn(out_c, dtype=torch.bfloat16) if with_bias else None
+    dev = torch.nn.functional.conv2d(
+        x.to(mojo_h100),
+        weight.to(mojo_h100),
+        None if bias is None else bias.to(mojo_h100),
+        stride=1,
+        padding=(ph, pw),
+    ).cpu()
+    ref = torch.nn.functional.conv2d(
+        x.float(),
+        weight.float(),
+        None if bias is None else bias.float(),
+        stride=1,
+        padding=(ph, pw),
+    )
+
+    target = ("conv_igemm_ops.mojo", "ConvIgemm")
+    assert len(calls[target]) == 1, f"{shape_id} did not take the implicit-GEMM route"
+    # One fp32-accumulated reduction of up to k = 3136, rounded once to
+    # bfloat16 (2^-8 relative): the same calibration the gemm16 mm/bmm tests
+    # use for a bf16 output.
+    torch.testing.assert_close(dev.float(), ref, atol=8e-2, rtol=8e-2)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "stride2",
+        "dilation2",
+        "grouped",
+        "pointwise_1x1",
+        "thin_c",
+        "thin_out_c",
+        "f32",
+        "f16",
+    ],
+)
+def test_fast_conv2d_igemm_declines_outside_its_domain(
+    mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Everything the implicit GEMM cannot (or should not) do stays on the
+    materialized-im2col route and still computes the right answer."""
+    calls = _spy_defined_native_calls(
+        monkeypatch, {("conv_igemm_ops.mojo", "ConvIgemm")}
+    )
+    n, c, h, w, out_c, k = 2, 64, 16, 16, 64, 3
+    stride, pad, dilation, groups = 1, 1, 1, 1
+    dtype = torch.bfloat16
+    if case == "stride2":
+        stride = 2
+    elif case == "dilation2":
+        dilation, pad = 2, 2
+    elif case == "grouped":
+        groups = 4
+    elif case == "pointwise_1x1":
+        k, pad = 1, 0
+    elif case == "thin_c":
+        c = 3  # C_pad/C = 21x wasted math on this route
+    elif case == "thin_out_c":
+        out_c = 16  # BM = 64 would waste 3/4 of every output tile
+    elif case == "f32":
+        dtype = torch.float32
+    elif case == "f16":
+        dtype = torch.float16
+
+    x = torch.randn(n, c, h, w, dtype=dtype)
+    weight = (torch.randn(out_c, c // groups, k, k, dtype=dtype) * 0.1).to(dtype)
+    dev = torch.nn.functional.conv2d(
+        x.to(mojo_h100),
+        weight.to(mojo_h100),
+        None,
+        stride=stride,
+        padding=pad,
+        dilation=dilation,
+        groups=groups,
+    ).cpu()
+    ref = torch.nn.functional.conv2d(
+        x.float(),
+        weight.float(),
+        None,
+        stride=stride,
+        padding=pad,
+        dilation=dilation,
+        groups=groups,
+    )
+
+    target = ("conv_igemm_ops.mojo", "ConvIgemm")
+    assert not calls[target], f"{case} must not take the implicit-GEMM route"
+    torch.testing.assert_close(dev.float(), ref, atol=8e-2, rtol=8e-2)
+
+
+def test_conv_igemm_descriptor_domain_gate() -> None:
+    """The im2col TMA descriptor domain, checked on the host before anything
+    is allocated: pixel-box corners are SIGNED CHAR ([-128, 127]) and the
+    filter taps this kernel issues must fit in [0, 255].
+
+    The R = 257 line is the one that matters: that conv satisfies every other
+    eligibility condition (bf16, sm_90a, dense, stride 1, dilation 1, C = 64,
+    and corners -128/-1, 128/-1 that are all legal) yet its last tap is 256,
+    which is undefined behaviour at the instruction rather than a loud
+    failure.
+    """
+    from torch_mojo_backend.eager_kernels.aten_fast import _conv_igemm_descriptor_legal
+
+    assert _conv_igemm_descriptor_legal(1, 1, 3, 3)
+    assert _conv_igemm_descriptor_legal(0, 0, 1, 1)
+    assert _conv_igemm_descriptor_legal(3, 3, 7, 7)
+    # lower corner = -pad
+    assert _conv_igemm_descriptor_legal(128, 1, 3, 3)
+    assert not _conv_igemm_descriptor_legal(129, 1, 3, 3)
+    assert not _conv_igemm_descriptor_legal(1, 129, 3, 3)
+    # upper corner = pad - (filter - 1)
+    assert _conv_igemm_descriptor_legal(0, 0, 129, 3)
+    assert not _conv_igemm_descriptor_legal(0, 0, 130, 3)
+    # legal corners, illegal tap
+    assert _conv_igemm_descriptor_legal(128, 1, 256, 3)
+    assert not _conv_igemm_descriptor_legal(128, 1, 257, 3)
+    assert not _conv_igemm_descriptor_legal(1, 128, 3, 257)
+
+
 @pytest.mark.parametrize("op", ["bmm16", "1x1_bmm16"])
 def test_fast_conv2d_routes_dense_bf16_through_gemm16_bmm(
     mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch, op: str
