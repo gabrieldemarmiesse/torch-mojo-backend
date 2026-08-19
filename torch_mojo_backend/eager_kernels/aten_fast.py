@@ -8788,7 +8788,19 @@ def _try_tf32_conv_bmm(
 # the GEMM, where the materialized route costs a full im2col write + read
 # (89% of the body conv's device time) plus the same GEMM. Measured on an
 # H100 PCIe at a 1395 MHz pin, bf16 N32xC64x56x56 K64 k3s1: 59.0 us vs
-# 861 us on the materialized route and 71.95 us for cuDNN (0.82x cuDNN).
+# 861 us on the materialized route and 71.95 us for cuDNN.
+#
+# That 71.95 us is cuDNN reached the way torch.nn.Conv2d reaches it from an
+# NCHW tensor, which is NOT cuDNN's own speed: 31.2 us of convolution plus
+# 41.0 us of nchwToNhwc / nhwcToNchw transposes around it. Handed a
+# channels_last tensor cuDNN does the same convolution in 33.9 us with no
+# transposes, against 54.6 us for the three kernels of this route (NHWC
+# pass + weight repack + implicit GEMM). So this route wins the NCHW
+# comparison because it needs no layout conversion, and loses the
+# same-layout comparison by ~1.6x. Both statements are about the forward
+# convolution only; the separate BiasAddChan kernel is another 12.2 us here
+# against 25.3 us for the elementwise bias add torch appends to cuDNN, which
+# is where a further chunk of the end-to-end ratio comes from.
 #
 # Everything the route cannot do stays on the materialized route: grouped
 # convolution (not implemented here at all), stride != 1, dilation != 1,
