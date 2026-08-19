@@ -8737,7 +8737,20 @@ def fast_aten_convolution(
         dh, dw = dils
         out_h = (in_h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
         out_w = (in_w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
-        if c_per_group * groups == c and out_h > 0 and out_w > 0:
+        if (
+            c_per_group * groups == c
+            # Without this, an invalid `out_c % groups != 0` silently passed
+            # through: the grouped path below floors the per-group output
+            # count (`oc_g = out_c // groups`) and only launches
+            # `groups * oc_g` channels, while `out` is allocated at the full
+            # (unfloored) `out_c` -- the remaining channels are read back as
+            # whatever the allocator handed out, not zero and not an error.
+            # Stock torch raises for this shape; matching that means
+            # declining here rather than launching a partial result.
+            and out_c % groups == 0
+            and out_h > 0
+            and out_w > 0
+        ):
             if bias_t is not None and (
                 bias_t._dtype != a._dtype or tuple(bias_t._shape) != (out_c,)
             ):

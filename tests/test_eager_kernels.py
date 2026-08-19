@@ -9415,6 +9415,48 @@ def test_fast_conv2d_refuses_autograd_in_the_forward(mojo_gpu):
         )
 
 
+def test_fast_conv1d_refuses_autograd_in_the_forward(mojo_gpu):
+    """Same guarantee as test_fast_conv2d_refuses_autograd_in_the_forward,
+    pinned specifically for rank-3: conv1d recurses into the rank-4 path
+    (see fast_aten_convolution) and shares its `aten::convolution`
+    registration, so it must inherit the SAME forward-time preflight, not
+    reopen the native `ConvolutionBackward0` crash (exit 134, no traceback)
+    that existed before mojo_device_convolution's preflight wrapper landed.
+    """
+    host_input, device_input = _preflight_input((1, 2, 9), mojo_gpu)
+    host_weight, device_weight = _preflight_input((3, 2, 3), mojo_gpu, seed=11)
+    host_bias, device_bias = _preflight_input((3,), mojo_gpu, seed=13)
+
+    expected = torch.nn.functional.conv1d(host_input, host_weight, host_bias, padding=1)
+    torch.testing.assert_close(
+        torch.nn.functional.conv1d(
+            device_input, device_weight, device_bias, padding=1
+        ).cpu(),
+        expected,
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+    for which in range(3):
+        operands = [device_input.detach(), device_weight.detach(), device_bias.detach()]
+        operands[which] = operands[which].requires_grad_()
+        with pytest.raises(NotImplementedError, match="convolution_backward"):
+            torch.nn.functional.conv1d(operands[0], operands[1], operands[2], padding=1)
+
+    with torch.no_grad():
+        torch.testing.assert_close(
+            torch.nn.functional.conv1d(
+                device_input.detach().requires_grad_(),
+                device_weight,
+                device_bias,
+                padding=1,
+            ).cpu(),
+            expected,
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+
 @pytest.mark.parametrize(
     "batch,in_c,out_c,length,k,stride,padding,dilation,groups",
     [
@@ -9483,6 +9525,33 @@ def test_fast_conv1d_transposed_declines_cleanly(mojo_gpu):
     w = torch.randn(6, 4, 3).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
         torch.nn.functional.conv_transpose1d(x, w)
+
+
+def test_fast_conv1d_invalid_groups_declines_instead_of_partial_output(mojo_gpu):
+    """Regression test: out_channels=5, groups=2 (5 % 2 != 0) used to pass
+    fast_aten_convolution's shape gate (which only checked in-channel
+    divisibility), then the grouped path floored the per-group output count
+    (`oc_g = out_c // groups = 2`) and launched only `groups * oc_g = 4`
+    output channels while `out` was allocated at the full, unfloored
+    `out_c = 5` -- the 5th channel silently read back whatever the allocator
+    handed out instead of raising. Stock torch raises
+    ``RuntimeError: Given groups=2, expected weight to be divisible by 2 at
+    dimension 0`` for this shape; mojo must raise too, not return a
+    partially-written tensor."""
+    x = torch.randn(1, 4, 9).to(mojo_gpu)
+    w = torch.randn(5, 2, 3).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.nn.functional.conv1d(x, w, groups=2)
+
+
+def test_fast_conv2d_invalid_groups_declines_instead_of_partial_output(mojo_gpu):
+    """Same bug, rank-4: the missing `out_channels % groups` guard predates
+    this PR's conv1d reuse but is exercised here directly since conv1d only
+    reuses this rank-4 path."""
+    x = torch.randn(1, 4, 9, 9).to(mojo_gpu)
+    w = torch.randn(5, 2, 3, 3).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.nn.functional.conv2d(x, w, groups=2)
 
 
 @pytest.mark.parametrize("is_causal", [True, False])
