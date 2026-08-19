@@ -15,6 +15,7 @@ from max.gpu.host import DeviceContext
 from std.python import PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.python.bindings import PythonModuleBuilder
+from std.sys.info import has_accelerator
 from std.utils.coord import Coord as StdCoord
 
 from op_utils import (
@@ -349,7 +350,18 @@ def _im2col[
             batch,
             ctx,
         )
-    else:
+        return
+    # `_im2col_gpu` pulls in `_enqueue_cached`, which needs a target GPU
+    # architecture at compile time (`gpu/host/info.mojo`). A runtime
+    # `if`/`else` does not stop Mojo from instantiating the `else` branch
+    # too (same hazard matmul_ops.mojo's MFMA gate documents), so on a host
+    # with no accelerator at all this has to be a comptime gate, or the
+    # whole module fails to build -- and with it every conv test, including
+    # the CPU-device ones (AGENTS.md eager rule 1: a torch-cpu-only install
+    # must still build this file). `ctx.api() == "cpu"` already returned
+    # above, so this is unreachable when `has_accelerator()` is False; the
+    # gate below exists only to keep it out of that host's build.
+    comptime if has_accelerator():
         _im2col_gpu[dtype](
             out_addr,
             in_addr,
@@ -560,7 +572,12 @@ def _bias_add_chan[
         _bias_add_chan_scalar[dtype](
             out_addr, bias_addr, total, plane, channels, ctx
         )
-    else:
+        return
+    # Same comptime-gate requirement as `_im2col` above: `_bias_add_chan_gpu`
+    # pulls in `_enqueue_cached`, which fails to build with no target GPU
+    # architecture at all. `ctx.api() == "cpu"` already returned above, so
+    # this is unreachable when `has_accelerator()` is False.
+    comptime if has_accelerator():
         _bias_add_chan_gpu[dtype](
             out_addr, bias_addr, total, plane, channels, ctx
         )
