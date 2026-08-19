@@ -8924,9 +8924,14 @@ def _try_conv_igemm(
 def fast_aten_convolution(
     input, weight, bias, stride, padding, dilation, transposed, output_padding, groups
 ):
-    a = _tc(input)
-    w = _tc(weight)
-    bias_t = _tc(bias) if bias is not None else None
+    # `_t()` here, not `_tc()`: every gate below (dtype, device, shape) reads
+    # metadata only, so it must run before paying for `_tc()`'s allocation +
+    # copy of a non-contiguous operand -- including the device-equality gate,
+    # so a cross-device pair returns NOT_HANDLED before any materialization,
+    # not just before the eventual conv kernel launch.
+    a = _t(input)
+    w = _t(weight)
+    bias_t = _t(bias) if bias is not None else None
     strides = _pair(list(stride))
     pads = _pair(list(padding))
     dils = _pair(list(dilation))
@@ -8959,6 +8964,13 @@ def fast_aten_convolution(
                 or tuple(bias_t._shape) != (out_c,)
             ):
                 return NOT_HANDLED
+            # Every reason to decline (dtype/device/shape mismatch, a
+            # cross-device pair included) has already returned NOT_HANDLED
+            # above; only now is a non-contiguous operand worth the
+            # allocation + copy `_tc()` pays for.
+            a = _tc(a)
+            w = _tc(w)
+            bias_t = _tc(bias_t) if bias_t is not None else None
             ctx = _ctx_ptr(a._device)
             cols = out_h * out_w
             ckk = c * kh * kw

@@ -9471,7 +9471,8 @@ def test_fast_conv2d_tensor_core_benchmark_shapes(
 # Implicit-GEMM conv (sm_90a, bf16): the TMA im2col route that never
 # materializes the patch matrix. Ported from the standalone Mojo harness the
 # kernel was developed in, which checked EVERY output element of each case
-# against an fp64 host reference; here the reference is torch's own fp32 conv.
+# against an fp64 host reference (`_conv_igemm_reference` below is that same
+# criterion, not torch's own fp32 conv).
 # ---------------------------------------------------------------------------
 _CONV_IGEMM_SHAPES = {
     # (n, c, h, w, out_c, kh, kw, pad_h, pad_w)
