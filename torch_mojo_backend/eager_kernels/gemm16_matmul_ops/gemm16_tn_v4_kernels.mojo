@@ -1,4 +1,4 @@
-"""V4 H100 16-bit TN (wgrad) GEMM kernels: split-K and narrow-tile variants.
+"""V4 H100 TN (wgrad) GEMM kernels: split-K and narrow-tile variants.
 
 The nanogpt wgrad family C[m,n] = A[k,m]^T @ B[k,n] has a huge reduction
 dimension (K = tokens = 32768) and small outputs (m,n in the hundreds to a
@@ -10,8 +10,9 @@ Two remedies, both dispatched by regime (no model dims hardcoded):
 1. Split-K: when output tiles fill less than half the SMs, partition K
    across `splits` CTAs per tile (grid y).  Each CTA accumulates its K-chunk
    into an fp32 workspace slice; a small elementwise kernel reduces the
-   slices and casts to bf16.  A workspace + separate reduce is deterministic
-   and much faster than atomics on these deep-K shapes.
+   slices and casts back to the operand dtype.  A workspace + separate
+   reduce is deterministic and much faster than atomics on these deep-K
+   shapes.
 2. Narrow 128x192 tiles whenever the wave-quantized cost (waves x per-CTA
    work) beats 256-wide tiles.  That covers the one-wave underfilled case
    (72 CTAs of 128x256 on 114 SMs -> 96 fuller CTAs) and the multi-wave
@@ -25,10 +26,11 @@ Both kernels reuse the v3 warp-specialized TMA + WGMMA structure: A is
 physical row-major (K, M) and loaded directly into an MN-major shared tile,
 which is the column-major A representation accepted by SM90 WGMMA.
 
-The operand dtype is bfloat16 or float16, chosen at compile time by
-`_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
-here is a function of the 2-byte operand width, not of the exponent
-layout, so one source serves both.
+The operand dtype is bfloat16, float16 or float32, chosen at compile time
+by `_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
+here is a function of the operand WIDTH, not of the exponent layout, so one
+source serves all three.  At float32 only the NT split-K instantiation is
+reached (see `_enqueue_gemm16_gemm_tf32` in gemm16_v3_kernels.mojo).
 """
 
 from max.gpu.sync import barrier
@@ -56,7 +58,12 @@ from gemm16_nn_v4_kernels import (
     _v4_mma_tile,
     maybe_enqueue_gemm16_tn_v4_persistent,
 )
-from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+from gemm16_dtype import (
+    _GEMM16_BK,
+    _GEMM16_DT,
+    _GEMM16_TAG,
+    _GEMM16_W,
+)
 
 
 comptime _V4_DT = _GEMM16_DT
@@ -64,12 +71,19 @@ comptime _V4_F32 = DType.float32
 comptime _V4_PTR = UnsafePointer[Scalar[_V4_DT], MutAnyOrigin]
 comptime _V4_F32_PTR = UnsafePointer[Scalar[_V4_F32], MutAnyOrigin]
 comptime _V4_BM = 128
-comptime _V4_BK = 64
+comptime _V4_BK = _GEMM16_BK
 comptime _V4_SWIZZLE = TensorMapSwizzle.SWIZZLE_128B
 comptime _V4_THREADS = 384
 comptime _V4_CONSUMERS = 2
 # Split-K sizing: never split below this many BK-tiles per chunk (pipeline
 # ramp-up dominates below that), and cap the workspace size.
+#
+# This floor counts BK-TILES, and BK halves with a 4-byte operand, so the same
+# 16 tiles are 1024 k-elements at bfloat16/float16 and 512 at float32.  Kept in
+# tiles rather than restated in k-elements because that is the configuration the
+# float32 split-K route was measured in (1024x1024x8192 at 3 splits, 84.8us vs
+# cuBLAS 95.4us on H100 PCIe @1395MHz); expressing it in k-elements would make
+# it width-invariant but would also cap float32's splits at half, unmeasured.
 comptime _V4_MIN_CHUNK_TILES = 16
 comptime _V4_MAX_SPLITS = 8
 comptime _V4_MAX_WS_BYTES = 256 * 1024 * 1024
@@ -103,7 +117,8 @@ def _v4_b_smem_layout[BN: Int, KMAJ_B: Bool]() -> Layout:
 #
 # SPLITK=True : accumulates BK-tiles [tile_start, tile_start + chunk) and
 #               stores the fp32 partial tile into ws at slice block_idx.y.
-# SPLITK=False: accumulates the whole K range and stores bf16 into out.
+# SPLITK=False: accumulates the whole K range and stores the operand dtype
+#               into out.
 #
 # The TMA tile/descriptor shapes are infer-only: each concrete entry point
 # passes descriptors matching its operand majorness (built by the enqueue
@@ -200,7 +215,7 @@ def _v4_tn_ws_body[
             my_tiles = min(chunk_tiles, k // _V4_BK - tile_start)
             if my_tiles < 0:
                 my_tiles = 0
-        comptime TMA_BYTES = (BM + BN) * _V4_BK * 2
+        comptime TMA_BYTES = (BM + BN) * _V4_BK * _GEMM16_W
 
         # Initially release every pipeline slot to the producer.  Thereafter
         # both consumer warp groups arrive only after their WGMMA reads
@@ -297,6 +312,10 @@ def _v4_tn_ws_body[
                     var col = base_col + (q // 2) * 8
                     var pair = SIMD[_V4_F32, 2](accum.ptr[e], accum.ptr[e + 1])
                     if m0 + row < m and n0 + col + 1 < n:
+                        # The split-K workspace is FP32 whatever the operands
+                        # are, so this pair is 8 bytes for every dtype of the
+                        # family -- unlike the output store below, whose
+                        # alignment tracks the operand width.
                         ws_base.store[alignment=8](
                             (m0 + row) * n + n0 + col, pair
                         )
@@ -310,7 +329,7 @@ def _v4_tn_ws_body[
                         accum.ptr[e + 1].cast[_V4_DT](),
                     )
                     if m0 + row < m and n0 + col + 1 < n:
-                        output.store[alignment=4](
+                        output.store[alignment=2 * _GEMM16_W](
                             (m0 + row) * n + n0 + col, pair
                         )
 
@@ -541,8 +560,8 @@ def _v4_tt_direct_m64n128_s3(
     )
 
 
-# Elementwise reduction of the split-K fp32 workspace slices into the bf16
-# output: out[i] = bf16(sum_s ws[s * count + i]).  Each thread owns
+# Elementwise reduction of the split-K fp32 workspace slices into the output:
+# out[i] = operand_dtype(sum_s ws[s * count + i]).  Each thread owns
 # _V4_RED_GROUPS independent vec4 chains so enough loads are in flight to
 # saturate DRAM (a single chain per thread measured only ~53% of peak).
 comptime _V4_RED_THREADS = 256
@@ -579,7 +598,7 @@ def _v4_tn_splitk_reduce(
                     slice_base + g * _V4_RED_THREADS * 4
                 )
         comptime for g in range(_V4_RED_GROUPS):
-            output.store[alignment=8](
+            output.store[alignment=4 * _GEMM16_W](
                 base + g * _V4_RED_THREADS * 4, acc[g].cast[_V4_DT]()
             )
     else:
@@ -589,7 +608,7 @@ def _v4_tn_splitk_reduce(
                 var acc4 = ws.load[width=4, alignment=16](i)
                 for s in range(1, splits):
                     acc4 += ws.load[width=4, alignment=16](s * count + i)
-                output.store[alignment=8](i, acc4.cast[_V4_DT]())
+                output.store[alignment=4 * _GEMM16_W](i, acc4.cast[_V4_DT]())
             else:
                 while i < count:
                     var acc1 = ws[i]
