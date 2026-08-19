@@ -31,16 +31,21 @@ here is a function of the 2-byte operand width, not of the exponent
 layout, so one source serves both.
 """
 
-from max.gpu.sync import barrier
+from max.gpu.sync import barrier, named_barrier
 from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, thread_idx
 from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
-from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
+from max.gpu.host.nvidia.tma import (
+    TensorMapSwizzle,
+    TMADescriptor,
+    create_tma_descriptor,
+)
 from max.gpu.compute.mma import (
     wgmma_async,
     wgmma_commit_group_sync,
     wgmma_fence_aligned,
     wgmma_wait_group_sync,
 )
+from max.gpu.memory import fence_async_view_proxy
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from std.memory import AddressSpace
 from std.memory import stack_allocation
@@ -93,6 +98,21 @@ comptime _V4_CONSUMERS = 2
 comptime _V4_MIN_CHUNK_TILES = 16
 comptime _V4_MAX_SPLITS = 8
 comptime _V4_MAX_WS_BYTES = 256 * 1024 * 1024
+# TMA-store epilogue for the DIRECT (non-split-K) arm of this body only --
+# mirrors _V4_PROD_TMA_STORE in gemm16_nn_v4_kernels.mojo, a one-line
+# rollback switch.  NOTES.md (deep-K wave-fill engagement), phase 5,
+# sections 22-26: the split-K epilogue writes fp32 at exactly one L2
+# sector per wavefront
+# already (nothing to recover, and it MEASURED a 2.27% regression on
+# many-wave split-K grids because the drain holds the staging smem -- which
+# here aliases the retired B pipeline -- past the point a scalar store would
+# have retired the CTA). The direct epilogue writes bf16 at half a sector per
+# wavefront, so TMA halves L2 write traffic there and measured -2% to -8%
+# (ABBA) on every direct config tried, all five harness shapes, both
+# TN/NN/TT layouts. _v4_tn_ws_body's own comptime assert enforces that this
+# can only ever apply when SPLITK is False, so flipping this constant can
+# never light up the regressing split-K path.
+comptime _V4_DIRECT_TMA_STORE = True
 
 
 # Register budget per consumer thread, by consumer warp-group count
@@ -255,6 +275,12 @@ def _v4_tn_ws_body[
     COL_A: Bool,
     KMAJ_B: Bool,
     HAS_BIAS: Bool,
+    # TMA-store epilogue for the direct (SPLITK=False) arm only -- see
+    # _V4_DIRECT_TMA_STORE above and NOTES.md (deep-K wave-fill
+    # engagement), phase 5, sections 22-26. Every pre-existing call site
+    # omits this parameter, so it defaults False and those instantiations
+    # stay codegen-identical (verified with scripts/compare_kernel_asm.py).
+    TMA_STORE: Bool = False,
 ](
     a_tma: TMATensorTile[_V4_DT, 2, a_tile, a_desc],
     b_tma: TMATensorTile[_V4_DT, 2, b_tile, b_desc],
@@ -265,7 +291,36 @@ def _v4_tn_ws_body[
     n: Int,
     k: Int,
     chunk_tiles: Int,
+    # bf16 (m, n) output descriptor, box (BM, 64) -- the one the production
+    # persistent body already builds for its own TMA-store epilogue. Only
+    # read when TMA_STORE (which the comptime assert below restricts to the
+    # SPLITK=False arm); every split-K call site omits it, so this default
+    # -- an empty, never-filled descriptor -- is never touched.
+    c_tma: TMATensorTile[_V4_DT, 2, Index(BM, 64), Index(BM, 64)] = (
+        TMATensorTile[_V4_DT, 2, Index(BM, 64), Index(BM, 64)](TMADescriptor())
+    ),
 ):
+    comptime assert not TMA_STORE or not SPLITK, (
+        "gemm16 wave body: TMA_STORE is only valid on the direct"
+        " (SPLITK=False) arm. NOTES.md (deep-K wave-fill engagement),"
+        " phase 5 section 24d measured a 2.27%"
+        " REGRESSION on many-wave split-K grids -- the drain holds the"
+        " staging smem (which aliases the retired B pipeline) resident"
+        " past the point a scalar store would have retired the CTA -- while"
+        " the split-K workspace store is already 1.00x sector-efficient"
+        " (section 24a), so there is nothing to recover there either."
+    )
+    # The bf16 staging tile (BM x BN x 2 B) must fit in the retired B
+    # pipeline it aliases (STAGES x BN x BK x 2 B) -- cancel BN x 2 B from
+    # both sides and the fit condition is BM <= STAGES * BK. Every
+    # instantiation that sets TMA_STORE today (BM=128/STAGES in {3, 4} and
+    # BM=64/STAGES=3) clears this with room to spare; this guards a future
+    # one that doesn't. See NOTES.md (deep-K wave-fill engagement), phase 5,
+    # section 23.
+    comptime assert not TMA_STORE or BM <= STAGES * _V4_BK, (
+        "gemm16 wave body: TMA_STORE's staging tile does not fit in the"
+        " retired B pipeline it aliases (BM must be <= STAGES * BK)."
+    )
     comptime if _is_sm_9x():
         # BM >= 256 (CONSUMERS >= 4) builds clean -- ptxas accepts the SASS
         # -- but HANGS the GPU at runtime: the body's warpgroup_reg_alloc
@@ -449,6 +504,72 @@ def _v4_tn_ws_body[
                         ws_base.store[alignment=8](
                             (m0 + row) * n + n0 + col, pair
                         )
+            elif TMA_STORE:
+                # TMA-store epilogue, direct arm only (the comptime assert
+                # above rejects SPLITK=True). Stage the tile in shared
+                # memory and hand it to TMA -- L2 write sectors halve versus
+                # the scalar path below because a bf16 store is a half-
+                # sector (16 B) wavefront but a TMA bulk-tensor store is not.
+                # See NOTES.md (deep-K wave-fill engagement), phase 5,
+                # sections 22 and 24b.
+                #
+                # The staging tile ALIASES the retired B pipeline instead of
+                # a fresh allocation (section 23): this consumer only
+                # reaches here after its own mainloop above has drained
+                # every stage of `b_pipeline` (the last `full_barriers[
+                # stage].wait` already cleared), and the producer warp group
+                # issued its last TMA load before that same wait cleared, so
+                # b_pipeline's smem is free to overwrite. The named_barrier
+                # orders every consumer's last WGMMA read before the first
+                # write into it.
+                comptime NCONS = Int32(CONSUMERS * 128)
+                var c_smem = b_pipeline.ptr
+                named_barrier[NCONS](1)
+                comptime for q in range(CFRAG // 2):
+                    var e = q * 2
+                    var row = (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
+                    var col = base_col + (q // 2) * 8
+                    var v0 = accum.ptr[e]
+                    var v1 = accum.ptr[e + 1]
+                    comptime if HAS_BIAS:
+                        v0 += bias[n0 + col].cast[_V4_F32]()
+                        v1 += bias[n0 + col + 1].cast[_V4_F32]()
+                    var pair = SIMD[_V4_DT, 2](
+                        v0.cast[_V4_DT](), v1.cast[_V4_DT]()
+                    )
+                    # 128B-swizzled staging layout -- identical formula to
+                    # the persistent body's own TMA-store epilogue
+                    # (gemm16_nn_v4_kernels.mojo): 16B units within each
+                    # 64-element row are XORed with (row % 8). No manual
+                    # m/n edge clip here (unlike the scalar path below): the
+                    # c_tma descriptor is built over the exact (m, n) output
+                    # extent, so the hardware clips a ragged final row/column
+                    # tile the same way it already does for a_tma/b_tma
+                    # loads.
+                    var lcol = col % 64
+                    var elem = (
+                        (col // 64) * (BM * 64)
+                        + row * 64
+                        + ((lcol // 8) ^ (row % 8)) * 8
+                        + lcol % 8
+                    )
+                    c_smem.store[alignment=4](elem, pair)
+                fence_async_view_proxy()
+                named_barrier[NCONS](1)
+                if warp_group_idx == 1 and warp_group_thread_idx == 0:
+                    comptime for chunk in range(BN // 64):
+                        var c_chunk = LayoutTensor[
+                            _V4_DT,
+                            Layout.row_major(BM, 64),
+                            MutAnyOrigin,
+                            address_space=AddressSpace.SHARED,
+                            alignment=128,
+                        ](c_smem + chunk * BM * 64)
+                        c_tma.async_store(c_chunk, (n0 + chunk * 64, m0))
+                    c_tma.commit_group()
+                    # Outstanding bulk store must complete before the CTA
+                    # (and its aliased smem) tears down.
+                    c_tma.wait_group[0]()
             else:
                 comptime for q in range(CFRAG // 2):
                     var e = q * 2
@@ -818,6 +939,7 @@ def _v4_tt_splitk_m128n128_s6(
 
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
@@ -829,6 +951,7 @@ def _v4_tn_direct_m128n192_s4[
 ](
     a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
+    c_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BM, 64), Index(_V4_BM, 64)],
     output: _V4_PTR,
     bias: _V4_PTR,
     m_arg: Int64,
@@ -840,7 +963,9 @@ def _v4_tn_direct_m128n192_s4[
     var m = Int(m_arg)
     var n = Int(n_arg)
     var k = Int(k_arg)
-    _v4_tn_ws_body[_V4_BM, 192, 4, False, 8, True, False, HAS_BIAS](
+    _v4_tn_ws_body[
+        _V4_BM, 192, 4, False, 8, True, False, HAS_BIAS, _V4_DIRECT_TMA_STORE
+    ](
         a_tma,
         b_tma,
         output,
@@ -850,6 +975,7 @@ def _v4_tn_direct_m128n192_s4[
         n,
         k,
         0,
+        c_tma,
     )
 
 
@@ -858,6 +984,7 @@ def _v4_tn_direct_m128n192_s4[
 # rasterization groups halve DRAM traffic for B, which all row-tiles share.
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
@@ -869,6 +996,7 @@ def _v4_tn_direct_m128n192_s3g16[
 ](
     a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
+    c_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BM, 64), Index(_V4_BM, 64)],
     output: _V4_PTR,
     bias: _V4_PTR,
     m_arg: Int64,
@@ -880,7 +1008,9 @@ def _v4_tn_direct_m128n192_s3g16[
     var m = Int(m_arg)
     var n = Int(n_arg)
     var k = Int(k_arg)
-    _v4_tn_ws_body[_V4_BM, 192, 3, False, 16, True, False, HAS_BIAS](
+    _v4_tn_ws_body[
+        _V4_BM, 192, 3, False, 16, True, False, HAS_BIAS, _V4_DIRECT_TMA_STORE
+    ](
         a_tma,
         b_tma,
         output,
@@ -890,6 +1020,7 @@ def _v4_tn_direct_m128n192_s3g16[
         n,
         k,
         0,
+        c_tma,
     )
 
 
@@ -902,6 +1033,7 @@ def _v4_tn_direct_m128n192_s3g16[
 # instead of the col-major `_v4_make_a_tma`.
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
@@ -911,6 +1043,7 @@ def _v4_nn_direct_m128n192_s4(
         _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
     ],
     b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
+    c_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BM, 64), Index(_V4_BM, 64)],
     output: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -921,7 +1054,9 @@ def _v4_nn_direct_m128n192_s4(
     var m = Int(m_arg)
     var n = Int(n_arg)
     var k = Int(k_arg)
-    _v4_tn_ws_body[_V4_BM, 192, 4, False, 8, False, False, False](
+    _v4_tn_ws_body[
+        _V4_BM, 192, 4, False, 8, False, False, False, _V4_DIRECT_TMA_STORE
+    ](
         a_tma,
         b_tma,
         output,
@@ -931,6 +1066,7 @@ def _v4_nn_direct_m128n192_s4(
         n,
         k,
         0,
+        c_tma,
     )
 
 
@@ -939,6 +1075,7 @@ def _v4_nn_direct_m128n192_s4(
 # rasterization groups halve DRAM traffic for B.
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
@@ -948,6 +1085,7 @@ def _v4_nn_direct_m128n192_s3g16(
         _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
     ],
     b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
+    c_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BM, 64), Index(_V4_BM, 64)],
     output: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -958,7 +1096,9 @@ def _v4_nn_direct_m128n192_s3g16(
     var m = Int(m_arg)
     var n = Int(n_arg)
     var k = Int(k_arg)
-    _v4_tn_ws_body[_V4_BM, 192, 3, False, 16, False, False, False](
+    _v4_tn_ws_body[
+        _V4_BM, 192, 3, False, 16, False, False, False, _V4_DIRECT_TMA_STORE
+    ](
         a_tma,
         b_tma,
         output,
@@ -968,6 +1108,7 @@ def _v4_nn_direct_m128n192_s3g16(
         n,
         k,
         0,
+        c_tma,
     )
 
 
@@ -981,6 +1122,7 @@ def _v4_nn_direct_m128n192_s3g16(
 # only BN shrinks.
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
@@ -988,6 +1130,7 @@ def _v4_nn_direct_m128n192_s3g16(
 def _v4_tt_direct_m128n64_s4(
     a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_DT, 2, Index(64, _V4_BK), Index(64, _V4_BK)],
+    c_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BM, 64), Index(_V4_BM, 64)],
     output: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -998,7 +1141,9 @@ def _v4_tt_direct_m128n64_s4(
     var m = Int(m_arg)
     var n = Int(n_arg)
     var k = Int(k_arg)
-    _v4_tn_ws_body[_V4_BM, 64, 4, False, 8, True, True, False](
+    _v4_tn_ws_body[
+        _V4_BM, 64, 4, False, 8, True, True, False, _V4_DIRECT_TMA_STORE
+    ](
         a_tma,
         b_tma,
         output,
@@ -1008,6 +1153,7 @@ def _v4_tt_direct_m128n64_s4(
         n,
         k,
         0,
+        c_tma,
     )
 
 
@@ -1016,6 +1162,7 @@ def _v4_tt_direct_m128n64_s4(
 # the TT operand modes.
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(256))
 )
@@ -1023,6 +1170,7 @@ def _v4_tt_direct_m128n64_s4(
 def _v4_tt_direct_m64n128_s3(
     a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 64), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_DT, 2, Index(128, _V4_BK), Index(128, _V4_BK)],
+    c_tma: TMATensorTile[_V4_DT, 2, Index(64, 64), Index(64, 64)],
     output: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -1033,7 +1181,9 @@ def _v4_tt_direct_m64n128_s3(
     var m = Int(m_arg)
     var n = Int(n_arg)
     var k = Int(k_arg)
-    _v4_tn_ws_body[64, 128, 3, False, 8, True, True, False](
+    _v4_tn_ws_body[
+        64, 128, 3, False, 8, True, True, False, _V4_DIRECT_TMA_STORE
+    ](
         a_tma,
         b_tma,
         output,
@@ -1043,6 +1193,7 @@ def _v4_tt_direct_m64n128_s3(
         n,
         k,
         0,
+        c_tma,
     )
 
 
@@ -1221,6 +1372,30 @@ def _v4_make_b_kmaj_tma[
     return TMATensorTile[_V4_DT, 2, Index(BN, _V4_BK), Index(BN, _V4_BK)](
         b_desc
     )
+
+
+# Output as (m, n) row-major, box (BM, 64) -- the descriptor the direct
+# arm's TMA-store epilogue drains into (see _v4_tn_ws_body's TMA_STORE
+# branch and _V4_DIRECT_TMA_STORE above). Same descriptor shape the
+# persistent body in gemm16_nn_v4_kernels.mojo already builds for its own
+# TMA-store epilogue.
+def _v4_make_c_tma[
+    BM: Int
+](c: _V4_PTR, m: Int, n: Int, ctx: DeviceContext) raises -> TMATensorTile[
+    _V4_DT, 2, Index(BM, 64), Index(BM, 64)
+]:
+    var c_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
+        DeviceBuffer(
+            ctx,
+            c.address_space_cast[AddressSpace.GENERIC](),
+            1,
+            owning=False,
+        ),
+        IndexList[2](m, n),
+        IndexList[2](n, 1),
+        IndexList[2](BM, 64),
+    )
+    return TMATensorTile[_V4_DT, 2, Index(BM, 64), Index(BM, 64)](c_desc)
 
 
 def _v4_enqueue_splitk_m128n256[
@@ -1470,10 +1645,12 @@ def _v4_enqueue_direct_m128n192[
     var b_tma = TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)](
         b_desc
     )
+    var c_tma = _v4_make_c_tma[_V4_BM](output, m, n, ctx)
     if multi_wave:
         ctx.enqueue_function[_v4_tn_direct_m128n192_s3g16[HAS_BIAS]](
             a_tma,
             b_tma,
+            c_tma,
             output,
             bias,
             Int64(m),
@@ -1486,6 +1663,7 @@ def _v4_enqueue_direct_m128n192[
         ctx.enqueue_function[_v4_tn_direct_m128n192_s4[HAS_BIAS]](
             a_tma,
             b_tma,
+            c_tma,
             output,
             bias,
             Int64(m),
@@ -1515,10 +1693,12 @@ def _v4_enqueue_nn_direct_m128n192(
 ) raises:
     var a_tma = _v4_make_a_row_tma(a, m, k, ctx)
     var b_tma = _v4_make_b_mn_tma[192](b, n, k, ctx)
+    var c_tma = _v4_make_c_tma[_V4_BM](output, m, n, ctx)
     if multi_wave:
         ctx.enqueue_function[_v4_nn_direct_m128n192_s3g16](
             a_tma,
             b_tma,
+            c_tma,
             output,
             Int64(m),
             Int64(n),
@@ -1530,6 +1710,7 @@ def _v4_enqueue_nn_direct_m128n192(
         ctx.enqueue_function[_v4_nn_direct_m128n192_s4](
             a_tma,
             b_tma,
+            c_tma,
             output,
             Int64(m),
             Int64(n),
@@ -1552,6 +1733,7 @@ def _v4_enqueue_tt_direct_m128n64(
     ctx.enqueue_function[_v4_tt_direct_m128n64_s4](
         _v4_make_a_tma(a, m, k, ctx),
         _v4_make_b_kmaj_tma[64](b, n, k, ctx),
+        _v4_make_c_tma[_V4_BM](output, m, n, ctx),
         output,
         Int64(m),
         Int64(n),
@@ -1574,6 +1756,7 @@ def _v4_enqueue_tt_direct_m64n128(
     ctx.enqueue_function[_v4_tt_direct_m64n128_s3](
         _v4_make_a_tma[64](a, m, k, ctx),
         _v4_make_b_kmaj_tma[128](b, n, k, ctx),
+        _v4_make_c_tma[64](output, m, n, ctx),
         output,
         Int64(m),
         Int64(n),

@@ -7588,6 +7588,114 @@ def test_gemm16_ragged_n_splitk_addmm_bias_matches_fp32_reference(
     torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
 
 
+# Phase 5 (NOTES.md, deep-K wave-fill engagement, sections 22-26): a
+# TMA-store epilogue for the DIRECT (non-split-K) arm of the shared v4 body.
+# Split-K's fp32 workspace store was already 1.00x sector-efficient (nothing
+# to recover, and it REGRESSES on many-wave split-K grids -- section 24d),
+# but the direct arm's bf16 store was a half-sector (16 B) wavefront, so TMA
+# halves its L2 write traffic. `_v4_tn_ws_body`'s new `TMA_STORE` comptime
+# only ever turns on for the six direct-arm entry points
+# (`_v4_tn_direct_m128n192_{s4,s3g16}`, `_v4_nn_direct_m128n192_{s4,s3g16}`,
+# `_v4_tt_direct_m128n64_s4`, `_v4_tt_direct_m64n128_s3`); everything else
+# (every split-K and persistent kernel) keeps the scalar store unchanged.
+# These shapes are picked to dynamically reach one of those six kernels
+# through the real dispatch code (not just build one at compile time):
+_DIRECT_ARM_CASES = {
+    # TN's dedicated single-wave narrow-tile rung (n % 192 == 0, tiles192 <=
+    # sm_count): the only way to reach `_v4_tn_direct_m128n192_s4` at
+    # runtime -- the "exactly 2 waves" cost-model branch a few lines above
+    # it in the dispatcher always produces >= 2 waves of 192-wide tiles
+    # once it engages, so that rung only ever reaches the *_s3g16 sibling.
+    "TN_single_wave_128x192": ("TN", 128, 192, 8192),
+    # TN's "exactly 2 waves of 128x256" cost-model comparison (n % 256 == 0
+    # and n % 192 == 0): reaches `_v4_tn_direct_m128n192_s3g16`.
+    "TN_two_wave_5120x768": ("TN", 5120, 768, 8192),
+    # NN's only direct-192 rung is the same "exactly 2 waves" comparison,
+    # gated on n % 256 == 0 alone (a ceil-div covers ragged 192-tiling) --
+    # this is the deep-K wave-fill engagement's own flagship shape (W1),
+    # 1.74x stock on the persistent-only branch head, 1.32x once this rung
+    # exists. Reaches `_v4_nn_direct_m128n192_s3g16`.
+    "NN_W1_2048x2048x8192": ("NN", 2048, 2048, 8192),
+    # TT's small-tile fallback for a deep-K single/few-wave grid: reaches
+    # `_v4_tt_direct_m128n64_s4`.
+    "TT_small_tile_128x64": ("TT", 128, 64, 8192),
+    # TT's k <= 2*BK shortcut (n % 128 == 0): reaches
+    # `_v4_tt_direct_m64n128_s3`.
+    "TT_shallow_k_512x256x128": ("TT", 512, 256, 128),
+}
+
+
+@pytest.mark.parametrize("shape_id", _DIRECT_ARM_CASES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm16_direct_arm_tma_store_matches_fp32_reference_and_engages(
+    mojo_h100: torch.device, dtype: torch.dtype, shape_id: str
+) -> None:
+    """The direct-arm TMA-store epilogue must reach the FP32 reference
+    within the usual bf16/f16 accumulation tolerance, through the real
+    production entry point (`_try_gemm16_mm`), on the exact kernels the
+    phase-5 measurement was about: the store mechanism changed, the math
+    did not."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    layout, m, n, k = _DIRECT_ARM_CASES[shape_id]
+    a, b = _gemm16_operands(layout, m, n, k, dtype, mojo_h100)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = aten_fast._try_gemm16_mm(a, b)
+        torch.accelerator.synchronize()
+    assert out is not None, "the direct-arm dispatch declined this shape"
+    names = [
+        evt.name
+        for evt in prof.events()
+        if str(evt.device_type) in ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+    ]
+    tag = "bf16" if dtype == torch.bfloat16 else "f16"
+    layout_tag = layout.lower()
+    assert any(f"{tag}_gemm_{layout_tag}_v4_direct_" in name for name in names), (
+        shape_id,
+        names,
+    )
+
+    expected = a.cpu().float() @ b.cpu().float()
+    ulp = 2**-8 if dtype == torch.bfloat16 else 2**-11
+    atol = 4 * ulp * (k**0.5)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm16_direct_arm_tma_store_addmm_bias_matches_fp32_reference(
+    mojo_h100: torch.device, dtype: torch.dtype
+) -> None:
+    """The TN direct-192 kernel's bias epilogue (fused into the same TMA
+    store) still adds the right bias after the smem-staging rewrite."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 5120, 768, 8192
+    a, b = _gemm16_operands("TN", m, n, k, dtype, mojo_h100)
+    bias = torch.randn(n).to(dtype).to(mojo_h100)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = aten_fast._try_gemm16_mm(a, b, bias)
+        torch.accelerator.synchronize()
+    assert out is not None, "the direct-arm dispatch declined this biased shape"
+    names = [
+        evt.name
+        for evt in prof.events()
+        if str(evt.device_type) in ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+    ]
+    tag = "bf16" if dtype == torch.bfloat16 else "f16"
+    assert any(f"{tag}_gemm_tn_v4_direct_" in name for name in names), names
+
+    expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
+    ulp = 2**-8 if dtype == torch.bfloat16 else 2**-11
+    atol = 4 * ulp * (k**0.5)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
+
+
 def test_gemm16_wave_body_rejects_bm_256_at_compile_time(tmp_path: Path) -> None:
     """BM >= 256 (CONSUMERS >= 4) is not just unused by any dispatcher --
     it is actively dangerous: the deep-K wave-fill engagement measured it
@@ -7704,6 +7812,95 @@ def main() raises:
     )
     combined = result.stdout + result.stderr
     assert "BM >= 256" in combined, (
+        f"build failed, but not with the expected guard message\n{combined}"
+    )
+
+
+def test_gemm16_wave_body_rejects_tma_store_on_splitk_at_compile_time(
+    tmp_path: Path,
+) -> None:
+    """TMA_STORE=True is only valid on the direct (SPLITK=False) arm
+    (NOTES.md, deep-K wave-fill engagement, phase 5, section 24d): on a
+    many-wave split-K grid the TMA drain holds the staging smem -- which
+    aliases the retired B pipeline -- resident past the point a scalar
+    store would have retired the CTA, a measured 2.27% REGRESSION. The
+    `comptime assert` in `_v4_tn_ws_body` must turn SPLITK=True,
+    TMA_STORE=True into a loud build-time failure, so nobody flips this
+    epilogue on for split-K by editing one call site.
+
+    Unlike the BM=256 guard above, this assert does not depend on
+    `_is_sm_9x()`, so instantiating the body from a plain host function
+    (no `ctx.enqueue_function`) is enough to trigger it -- still built with
+    `--target-accelerator sm_90a` for consistency with the rest of this
+    file's compile probes, and it still needs no GPU and must never run
+    under the GPU flock.
+    """
+    import subprocess
+
+    from torch_mojo_backend.eager_kernels import _build_env, _find_mojo
+
+    package_dir = (
+        Path(__file__).resolve().parents[1] / "torch_mojo_backend" / "eager_kernels"
+    )
+    probe = tmp_path / "splitk_tma_store_probe.mojo"
+    probe.write_text(
+        """
+from std.memory import alloc
+from max.gpu.host import DeviceContext
+from gemm16_matmul_ops.gemm16_tn_v4_kernels import (
+    _V4_DT,
+    _V4_F32,
+    _v4_make_a_tma,
+    _v4_make_b_mn_tma,
+    _v4_tn_ws_body,
+)
+
+
+def main() raises:
+    var ctx = DeviceContext()
+    var a = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var b = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var out = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var ws = alloc[Scalar[_V4_F32]](1).as_unsafe_any_origin()
+    var a_tma = _v4_make_a_tma[128](a, 1024, 8192, ctx)
+    var b_tma = _v4_make_b_mn_tma[192](b, 1024, 8192, ctx)
+    # SPLITK=True with TMA_STORE=True: must fail to build.
+    _v4_tn_ws_body[128, 192, 4, True, 8, True, False, False, True](
+        a_tma, b_tma, out, ws, out, 1024, 1024, 8192, 0
+    )
+"""
+    )
+    result = subprocess.run(
+        [
+            str(_find_mojo()),
+            "build",
+            str(probe),
+            "--emit",
+            "asm",
+            "--target-accelerator",
+            "sm_90a",
+            "-I",
+            str(probe.parent),
+            "-I",
+            str(package_dir),
+            "-I",
+            str(package_dir / "gemm16_matmul_ops"),
+            "-o",
+            str(tmp_path / "splitk_tma_store_probe.s"),
+        ],
+        env=_build_env(),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode != 0, (
+        "SPLITK=True, TMA_STORE=True built successfully -- the compile-time "
+        "guard regressed (NOTES.md documents this as a measured regression, "
+        f"not just an unproven risk)\nstdout:\n{result.stdout}\nstderr:"
+        f"\n{result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert "TMA_STORE is only valid on the direct" in combined, (
         f"build failed, but not with the expected guard message\n{combined}"
     )
 
