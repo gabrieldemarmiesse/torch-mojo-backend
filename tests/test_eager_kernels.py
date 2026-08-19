@@ -6810,6 +6810,13 @@ _TF32_WGMMA_SHAPES = {
     "ragged_357x790x336": (357, 790, 336),
     # deep K, few output tiles: the split-K workspace + reduce route
     "deep_k_256x256x8192": (256, 256, 8192),
+    # k = 4 is the SMALLEST k the gate can admit at a 4-byte operand: the TMA
+    # rule is (k * 4) % 16 == 0, so k must be a multiple of 4, and k = 4 is one
+    # eighth of a single BK = 32 tile.  The whole mainloop is then one k-tile
+    # whose tail TMA zero-fills, which is exact because zeros contribute
+    # nothing to a dot product -- the boundary where that reasoning either
+    # holds or the kernel reads garbage.
+    "min_k_128x256x4": (128, 256, 4),
 }
 
 # k = 333 makes the row pitch k * 4 = 1332 bytes, not a multiple of 16, so no
@@ -7088,7 +7095,9 @@ def test_tf32_wgmma_nt_runs_the_named_wgmma_kernels(mojo_h100: torch.device) -> 
     ), deep_k
     assert any(name.startswith("tf32_gemm_tn_v4_splitk_reduce") for name in deep_k)
     # The declined shape stays on the SM80-class kernel and never reaches a
-    # WGMMA one.
+    # WGMMA one.  Assert the positive too: "no WGMMA kernel ran" would also be
+    # satisfied by a decomposition that never reached tf32_matmul_ops at all.
+    assert any(name.startswith("tf32_gemm_tile") for name in declined), declined
     assert not any("_v3_nt_ws_" in name or "_v4_splitk_" in name for name in declined)
     for names in (ragged, deep_k):
         assert not any("bf16" in name or "f16_gemm" in name for name in names)
