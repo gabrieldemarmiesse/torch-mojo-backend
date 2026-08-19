@@ -48,11 +48,15 @@ no col-major A mode.  The batch folding above, the pipeline, the persistent
 work list, the rasterization and the ENTIRE C epilogue are layout-invariant:
 C is row-major (batch, m, n) whatever the operands do.
 
-No K-split is implemented: batching alone fills the machine on the deep-K
-shapes measured (S4 8x1024x1024x8192 reaches 0.91x of cuBLAS).  If a
-batched deep-K underfilled case appears, the work-list decode extends
-naturally with a ksplit factor plus an f32 workspace + separate reduce
-kernel (never atomics).
+No K-split is implemented: batching alone is NOT enough on the deep-K
+shapes measured (S4 8x1024x1024x8192 measures 1.15-1.18x across every
+layout, NN included -- misses the repository's 1.10x acceptance bar).  This
+is the same schedule limit the mm-level body has without split-K on the
+equivalent single-matrix shape: the mm family's split-K route
+(gemm16_tn_v4_kernels.mojo) reaches 0.86x there.  Extending that route to
+this batched body -- a ksplit factor in the work-list decode plus an f32
+workspace + separate reduce kernel (never atomics) -- is the documented
+follow-up for closing this gap; it is NOT implemented here.
 
 The operand dtype is bfloat16 or float16 via _GEMM16_DT, same as the family.
 """
@@ -1087,11 +1091,17 @@ def _b5_dispatch[
     # depth.  The persistent warp-specialized body is capped at 2 CTAs/SM
     # (256 threads x 114-168 static regs); the 128-thread/80-reg tiny body
     # fits 3-4 and measured 41.9 -> 36.7 us on 8x357x789x333 (6 k-tiles),
-    # 79.7 -> 77.0 us on the conv im2col 32x64x3136x576 (9 k-tiles) and
-    # 143.4 -> 128.4 us on attn@V 96x1024x64x1024 (16 k-tiles).  The
+    # 79.7 -> 77.0 us on a conv-im2col-SHAPED 32x64x3136x576 microbenchmark
+    # (9 k-tiles; NOT a traced production call site -- production conv
+    # dispatches through the separate _MatmulExtension "Bmm" op, not
+    # Bmm16/this kernel, see aten_fast.py's conv path.  This is a synthetic
+    # shape check for the broadcast-operand/small-per-item-grid regime conv
+    # WOULD produce if it ever routed here) and 143.4 -> 128.4 us on an
+    # attn@V-shaped 96x1024x64x1024 microbenchmark (16 k-tiles).  The
     # 16-tile cut is the deepest k measured to win; the persistent body
-    # wins at 128 k-tiles (S4 deep-K, 0.89x).  2*sm_count works is where
-    # the extra CTAs/SM matter.
+    # wins at 128 k-tiles (S4 deep-K, where it still measures 1.15-1.18x --
+    # misses the 1.10x bar, see the module docstring).  2*sm_count works is
+    # where the extra CTAs/SM matter.
     #
     # ...but the tiny body gives that band back once the BIG 128x256 tile is
     # the persistent alternative AND the work list is many waves of it: the
