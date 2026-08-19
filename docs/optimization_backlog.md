@@ -834,6 +834,13 @@ temporary** — **DONE** (`NormSpec`)
   broadcast index shape and per-dim index pointers as runtime data (rank ≤ 8,
   the descriptor style `CopyStrided` already uses), plus the boolean-mask case
   routed through `nonzero` + gather.
+* **Still open, but narrower than when this was written.** `aten::gather`,
+  `index_select`, `scatter_add`, `index_add` and `_index_put_impl_` now exist on
+  two kernels alongside `GatherRows` (`GatherDim` reads, `ScatterAddDim`
+  accumulates), so single-axis indexing along ANY dim is covered in both
+  directions, and `x[mask] = scalar` reaches `masked_fill_`. What is left of D5
+  is `aten::index`/`index_put` with SEVERAL index tensors, or one on a non-zero
+  axis, and a boolean mask whose write is not a scalar fill.
 * **Expected win.** N/A (coverage).
 * **How to measure it.** `tests/test_aten_functions.py` with parametrized index
   patterns.
