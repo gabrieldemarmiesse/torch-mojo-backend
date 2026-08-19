@@ -6528,6 +6528,102 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "convolution_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC128x28x28_K128k3s2": {
+                  "layouts": {
+                    "bgrad": 0.582,
+                    "dgrad": 10.379,
+                    "wgrad": 13.264
+                  }
+                },
+                "N32xC256x14x14_K256k3s1": {
+                  "layouts": {
+                    "bgrad": 0.885,
+                    "dgrad": 12.392,
+                    "wgrad": 23.246
+                  }
+                },
+                "N32xC512x7x7_K512k3s1": {
+                  "layouts": {
+                    "bgrad": 1.549,
+                    "dgrad": 10.583,
+                    "wgrad": 22.865
+                  }
+                },
+                "N32xC64x56x56_K64k3s1": {
+                  "layouts": {
+                    "bgrad": 0.613,
+                    "dgrad": 10.737,
+                    "wgrad": 11.71
+                  }
+                },
+                "N7xC48x39x53_K80k3s1": {
+                  "layouts": {
+                    "bgrad": 3.21,
+                    "dgrad": 6.114,
+                    "wgrad": 5.401
+                  }
+                },
+                "N8xC3x224x224_K64k7s2": {
+                  "layouts": {
+                    "bgrad": 0.455,
+                    "dgrad": 1.397,
+                    "wgrad": 3.418
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC128x28x28_K128k3s2": {
+                  "layouts": {
+                    "bgrad": 0.389,
+                    "dgrad": 10.945,
+                    "wgrad": 6.845
+                  }
+                },
+                "N32xC256x14x14_K256k3s1": {
+                  "layouts": {
+                    "bgrad": 0.575,
+                    "dgrad": 15.118,
+                    "wgrad": 13.01
+                  }
+                },
+                "N32xC512x7x7_K512k3s1": {
+                  "layouts": {
+                    "bgrad": 1.541,
+                    "dgrad": 11.228,
+                    "wgrad": 18.656
+                  }
+                },
+                "N32xC64x56x56_K64k3s1": {
+                  "layouts": {
+                    "bgrad": 0.92,
+                    "dgrad": 10.376,
+                    "wgrad": 7.896
+                  }
+                },
+                "N7xC48x39x53_K80k3s1": {
+                  "layouts": {
+                    "bgrad": 3.126,
+                    "dgrad": 6.11,
+                    "wgrad": 4.627
+                  }
+                },
+                "N8xC3x224x224_K64k7s2": {
+                  "layouts": {
+                    "bgrad": 0.897,
+                    "dgrad": 3.161,
+                    "wgrad": 3.274
+                  }
+                }
+              }
+            }
+          }
+        },
         "cos": {
           "dtypes": {
             "bf16": {

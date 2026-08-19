@@ -9370,49 +9370,344 @@ def test_fast_conv2d_batched_falls_back_correctly(mojo_gpu):
     torch.testing.assert_close(dev, ref, atol=5e-2, rtol=5e-2)
 
 
-def test_fast_conv2d_refuses_autograd_in_the_forward(mojo_gpu):
-    """A grad-requiring conv must fail at the FORWARD.
+# ---------------------------------------------------------------------------
+# Convolution backward: the three gradients through im2col + GEMM + col2im.
+# Every case is checked against an fp64 CPU-autograd ground truth with a
+# PER-ELEMENT tolerance derived from the fp32 accumulation bound (the same
+# criterion `_conv_igemm_reference` uses for the forward), not a fixed slop:
+# a conv backward reduces over n * OH * OW terms for the parameter gradients,
+# so a flat atol would either pass wrong kernels on big shapes or fail right
+# ones on small.
+# ---------------------------------------------------------------------------
 
-    `aten::convolution_backward` is not implemented here, and a raise from
-    inside the autograd engine aborts the process on this backend (exit 134,
-    no traceback) instead of propagating, so the refusal cannot wait for
-    ConvolutionBackward0. A conv weight normally requires grad, so this refuses
-    conv training outright -- the alternative was a dead process -- while
-    inference under `torch.no_grad()` is untouched.
+# (n, c, h, w, out_c, k, stride, padding, dilation, groups)
+_CONV_BWD_SHAPES = {
+    "base_k3s1p1": (2, 6, 12, 12, 8, 3, 1, 1, 1, 1),
+    "stride2": (2, 6, 13, 13, 8, 3, 2, 1, 1, 1),
+    "unpadded_stride3_k4": (2, 5, 14, 14, 7, 4, 3, 0, 1, 1),
+    "dilation2": (2, 6, 15, 15, 8, 3, 1, 2, 2, 1),
+    "groups2": (2, 8, 10, 10, 12, 3, 1, 1, 1, 2),
+    # groups == C: depthwise, one output channel per input channel, the
+    # regime where the per-(sample, group) GEMM loop is longest.
+    "depthwise_g64": (2, 64, 9, 9, 64, 3, 1, 1, 1, 64),
+    # 1x1 stride-1: col2im is the identity and the columns ARE the gradient
+    # image, so this is the branch that skips both spatial kernels.
+    "batch1_1x1": (1, 8, 7, 7, 5, 1, 1, 0, 1, 1),
+    "batch32": (32, 4, 8, 8, 6, 3, 1, 1, 1, 1),
+    # stride 2 with a truncating input extent: (13 + 2*1 - 3) // 2 + 1 == 7
+    # loses the last input column, so col2im must leave those pixels at zero
+    # rather than reading a tap that never existed.
+    "truncating_stride2": (2, 4, 13, 11, 6, 3, 2, 1, 1, 1),
+    # rectangular filter, asymmetric padding
+    "rect_k3x5": (2, 4, 11, 13, 6, (3, 5), 1, (1, 2), 1, 1),
+}
+
+# One bf16 / fp16 / fp32 half-ulp: the largest relative error of ONE
+# correctly-rounded cast into that dtype.
+_CONV_BWD_HALF_ULP = {
+    torch.float32: 2.0**-24,
+    torch.bfloat16: 2.0**-8,
+    torch.float16: 2.0**-11,
+}
+# 2^-24, the fp32 machine epsilon: every reduction here (the GEMMs, the batch
+# reduce, col2im's tap sum) accumulates in fp32, so this is the per-term
+# rounding unit. The 4x safety factor matches `_conv_igemm_reference`.
+_CONV_BWD_EPS_F32 = 2.0**-24
+
+
+def _conv_backward_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    grad_output: torch.Tensor,
+    stride,
+    padding,
+    dilation,
+    groups: int,
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    """`(exact_fp64_grads, magnitudes)` for (grad_input, grad_weight,
+    grad_bias).
+
+    The magnitudes are the same three reductions run on the ABSOLUTE values
+    of the operands, i.e. `sum |a*b|` per output element -- the quantity a
+    floating-point accumulation-error bound is proportional to. Deriving them
+    from torch's own backward (rather than by hand) keeps the reference
+    independent of the layout this backend happens to reduce in.
     """
-    host_input, device_input = _preflight_input((2, 3, 8, 8), mojo_gpu)
-    host_weight, device_weight = _preflight_input((4, 3, 3, 3), mojo_gpu, seed=11)
-    host_bias, device_bias = _preflight_input((4,), mojo_gpu, seed=13)
 
-    expected = torch.nn.functional.conv2d(host_input, host_weight, host_bias, padding=1)
-    torch.testing.assert_close(
-        torch.nn.functional.conv2d(
-            device_input, device_weight, device_bias, padding=1
-        ).cpu(),
-        expected,
-        atol=5e-2,
-        rtol=5e-2,
+    def grads(xt: torch.Tensor, wt: torch.Tensor, gt: torch.Tensor):
+        xd = xt.double().detach().requires_grad_()
+        wd = wt.double().detach().requires_grad_()
+        out = torch.nn.functional.conv2d(
+            xd, wd, None, stride, padding, dilation, groups
+        )
+        out.backward(gt.double())
+        return xd.grad, wd.grad
+
+    grad_input, grad_weight = grads(x, weight, grad_output)
+    mag_input, mag_weight = grads(x.abs(), weight.abs(), grad_output.abs())
+    grad_bias = grad_output.double().sum(dim=(0, 2, 3))
+    mag_bias = grad_output.double().abs().sum(dim=(0, 2, 3))
+    return (grad_input, grad_weight, grad_bias), (mag_input, mag_weight, mag_bias)
+
+
+def _assert_conv_grad_close(
+    actual: torch.Tensor,
+    exact: torch.Tensor,
+    magnitude: torch.Tensor,
+    dtype: torch.dtype,
+    reduction_len: int,
+    roundings: int,
+    what: str,
+) -> None:
+    """`actual` is within the fp32 accumulation bound of the fp64 truth.
+
+    `roundings` counts the casts back into `dtype` the value survives: one
+    for a gradient written straight out, two where an intermediate is
+    materialized in `dtype` first (the per-sample weight partials, the column
+    gradient col2im then reads). Each costs a half-ulp of the MAGNITUDE, not
+    of the possibly-cancelled exact value.
+    """
+    tol = (
+        roundings * _CONV_BWD_HALF_ULP[dtype]
+        + 4.0 * _CONV_BWD_EPS_F32 * math.sqrt(max(reduction_len, 1))
+    ) * magnitude
+    err = (actual.double() - exact).abs()
+    worst = int((err - tol).argmax())
+    assert bool((err <= tol).all()), (
+        f"{what}: {int((err > tol).sum())} of {err.numel()} elements outside the "
+        f"fp32 accumulation bound; worst err={err.flatten()[worst]:.3e} "
+        f"tol={tol.flatten()[worst]:.3e} exact={exact.flatten()[worst]:.3e}"
     )
 
-    # The weight-only case is the one every training model actually hits.
-    for which in range(3):
-        operands = [device_input.detach(), device_weight.detach(), device_bias.detach()]
-        operands[which] = operands[which].requires_grad_()
-        with pytest.raises(NotImplementedError, match="convolution_backward"):
-            torch.nn.functional.conv2d(operands[0], operands[1], operands[2], padding=1)
 
-    with torch.no_grad():
-        torch.testing.assert_close(
-            torch.nn.functional.conv2d(
-                device_input.detach().requires_grad_(),
-                device_weight,
-                device_bias,
-                padding=1,
-            ).cpu(),
-            expected,
-            atol=5e-2,
-            rtol=5e-2,
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape_id", _CONV_BWD_SHAPES)
+def test_fast_convolution_backward_matches_cpu_autograd(
+    mojo_gpu: torch.device, shape_id: str, dtype: torch.dtype
+) -> None:
+    torch.manual_seed(0)
+    n, c, h, w, out_c, k, stride, padding, dilation, groups = _CONV_BWD_SHAPES[shape_id]
+    kh, kw = k if isinstance(k, tuple) else (k, k)
+    x = torch.randn(n, c, h, w, dtype=dtype)
+    weight = (torch.randn(out_c, c // groups, kh, kw, dtype=dtype) * 0.2).to(dtype)
+    eff_h = dilation * (kh - 1) + 1
+    eff_w = dilation * (kw - 1) + 1
+    ph, pw = padding if isinstance(padding, tuple) else (padding, padding)
+    out_h = (h + 2 * ph - eff_h) // stride + 1
+    out_w = (w + 2 * pw - eff_w) // stride + 1
+    grad_output = torch.randn(n, out_c, out_h, out_w, dtype=dtype)
+
+    exact, magnitude = _conv_backward_reference(
+        x, weight, grad_output, stride, padding, dilation, groups
+    )
+    got = torch.ops.aten.convolution_backward(
+        grad_output.to(mojo_gpu),
+        x.to(mojo_gpu),
+        weight.to(mojo_gpu),
+        [out_c],
+        [stride, stride],
+        list(padding) if isinstance(padding, tuple) else [padding, padding],
+        [dilation, dilation],
+        False,
+        [0, 0],
+        groups,
+        [True, True, True],
+    )
+    cols = out_h * out_w
+    lengths = (out_c // groups * kh * kw, n * cols, n * cols)
+    roundings = (2, 2, 1)
+    for slot, name in enumerate(("grad_input", "grad_weight", "grad_bias")):
+        assert got[slot] is not None
+        assert got[slot].dtype == dtype
+        assert got[slot].shape == exact[slot].shape
+        _assert_conv_grad_close(
+            got[slot].cpu(),
+            exact[slot],
+            magnitude[slot],
+            dtype,
+            lengths[slot],
+            roundings[slot],
+            f"{shape_id}/{dtype}/{name}",
         )
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, True, False),
+        (False, False, False),
+    ],
+)
+def test_fast_convolution_backward_output_mask(
+    mojo_gpu: torch.device, mask: tuple[bool, bool, bool]
+) -> None:
+    """A masked-off slot comes back as `None`, exactly as ATen's undefined
+    tensor does through the Python binding, and the requested slots are
+    bit-identical to what the all-on call returns -- i.e. masking really
+    skips work instead of changing the answer."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 6, 10, 10)
+    weight = torch.randn(8, 6, 3, 3) * 0.2
+    grad_output = torch.randn(2, 8, 10, 10)
+    args = (
+        grad_output.to(mojo_gpu),
+        x.to(mojo_gpu),
+        weight.to(mojo_gpu),
+        [8],
+        [1, 1],
+        [1, 1],
+        [1, 1],
+        False,
+        [0, 0],
+        1,
+    )
+    full = torch.ops.aten.convolution_backward(*args, [True, True, True])
+    got = torch.ops.aten.convolution_backward(*args, list(mask))
+    for slot in range(3):
+        if mask[slot]:
+            assert got[slot] is not None
+            torch.testing.assert_close(
+                got[slot].cpu(), full[slot].cpu(), atol=0, rtol=0
+            )
+        else:
+            assert got[slot] is None
+
+
+def test_fast_convolution_backward_accepts_a_channels_last_grad_output(
+    mojo_gpu: torch.device,
+) -> None:
+    """grad_output routinely arrives non-contiguous (a channels_last op
+    upstream, a permuted view), and ATen contiguifies it inside the backend
+    rather than at the dispatcher, so this op has to do it itself."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 6, 9, 9)
+    weight = torch.randn(8, 6, 3, 3) * 0.2
+    grad_output = torch.randn(2, 8, 9, 9)
+    args = ([8], [1, 1], [1, 1], [1, 1], False, [0, 0], 1, [True, True, True])
+    dense = torch.ops.aten.convolution_backward(
+        grad_output.to(mojo_gpu), x.to(mojo_gpu), weight.to(mojo_gpu), *args
+    )
+    strided = torch.ops.aten.convolution_backward(
+        grad_output.to(mojo_gpu).contiguous(memory_format=torch.channels_last),
+        x.to(mojo_gpu),
+        weight.to(mojo_gpu),
+        *args,
+    )
+    for slot in range(3):
+        torch.testing.assert_close(
+            strided[slot].cpu(), dense[slot].cpu(), atol=0, rtol=0
+        )
+
+
+def test_fast_convolution_backward_declines_transposed(mojo_gpu: torch.device) -> None:
+    """The backward of a conv_transpose FORWARD (input and grad_output swap
+    roles again) is not implemented, and the forward declines `transposed`
+    too, so nothing on this device can produce such a node. It must decline
+    with the actionable NotImplementedError, never silently compute the
+    non-transposed answer."""
+    x = torch.randn(2, 6, 8, 8).to(mojo_gpu)
+    weight = torch.randn(6, 3, 3, 3).to(mojo_gpu)
+    grad_output = torch.randn(2, 3, 10, 10).to(mojo_gpu)
+    with pytest.raises(NotImplementedError, match="convolution_backward"):
+        torch.ops.aten.convolution_backward(
+            grad_output,
+            x,
+            weight,
+            [3],
+            [1, 1],
+            [1, 1],
+            [1, 1],
+            True,
+            [0, 0],
+            1,
+            [True, True, True],
+        )
+
+
+@pytest.mark.parametrize("stride,padding,dilation", [(1, 0, 1), (2, 2, 1), (1, 1, 2)])
+def test_fast_convolution_backward_rank3(
+    mojo_gpu: torch.device, stride: int, padding: int, dilation: int
+) -> None:
+    """conv1d's backward, through the same rank-4 path behind a size-1 H
+    axis. Called at the aten level rather than through autograd because the
+    rank-3 FORWARD is a separate piece of work: the lift has to be correct
+    from the day the backward exists, not from the day something can reach
+    it."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 6, 17)
+    weight = torch.randn(8, 6, 3) * 0.2
+    length = (17 + 2 * padding - (dilation * 2 + 1)) // stride + 1
+    grad_output = torch.randn(2, 8, length)
+
+    xd = x.double().requires_grad_()
+    wd = (weight.double()).requires_grad_()
+    torch.nn.functional.conv1d(xd, wd, None, stride, padding, dilation).backward(
+        grad_output.double()
+    )
+    got = torch.ops.aten.convolution_backward(
+        grad_output.to(mojo_gpu),
+        x.to(mojo_gpu),
+        weight.to(mojo_gpu),
+        [8],
+        [stride],
+        [padding],
+        [dilation],
+        False,
+        [0],
+        1,
+        [True, True, True],
+    )
+    assert got[0].shape == x.shape
+    assert got[1].shape == weight.shape
+    torch.testing.assert_close(got[0].cpu().double(), xd.grad, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(got[1].cpu().double(), wd.grad, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(
+        got[2].cpu().double(),
+        grad_output.double().sum(dim=(0, 2)),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+
+
+@pytest.mark.parametrize("groups", [1, 2])
+@pytest.mark.parametrize("with_bias", [True, False])
+def test_fast_conv2d_trains_through_autograd(
+    mojo_gpu: torch.device, groups: int, with_bias: bool
+) -> None:
+    """The end-to-end case the preflight used to refuse: a grad-requiring
+    conv now records ConvolutionBackward0 and the engine runs it here.
+
+    Before `aten::convolution_backward` existed, `aten::convolution` had to
+    refuse a grad-requiring call from the FORWARD, because a raise from
+    inside the autograd engine aborts the process on this backend instead of
+    propagating. That refusal is gone with the kernel that replaces it, so
+    this asserts the whole round trip: forward, engine, and all three
+    gradients against a CPU reference.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(3, 8, 11, 11)
+    weight = torch.randn(12, 8 // groups, 3, 3) * 0.2
+    bias = torch.randn(12) * 0.1 if with_bias else None
+    grad_output = torch.randn(3, 12, 11, 11)
+
+    def run(device: torch.device | str):
+        xd = x.to(device).detach().requires_grad_()
+        wd = weight.to(device).detach().requires_grad_()
+        bd = None if bias is None else bias.to(device).detach().requires_grad_()
+        out = torch.nn.functional.conv2d(xd, wd, bd, 1, 1, 1, groups)
+        out.backward(grad_output.to(device))
+        return out, xd.grad, wd.grad, (None if bd is None else bd.grad)
+
+    dev = run(mojo_gpu)
+    ref = run("cpu")
+    for got, want in zip(dev, ref):
+        if want is None:
+            assert got is None
+            continue
+        torch.testing.assert_close(got.cpu(), want, atol=2e-4, rtol=2e-4)
 
 
 # Shrunk-N copies of benchmarks/test_vision.py's CONV_SHAPES: same C/H/W/kernel

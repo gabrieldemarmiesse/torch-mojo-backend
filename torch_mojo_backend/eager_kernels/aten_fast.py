@@ -8682,103 +8682,178 @@ def _fast_aten_bmm_transpose_b(input, mat2):
 # ---------------------------------------------------------------------------
 
 
-def _try_gemm16_conv_bmm(
-    w: TorchMojoTensor, col: TorchMojoTensor, n: int, out_c: int, cols: int, ckk: int
+def _try_gemm16_shared_a_bmm(
+    a: TorchMojoTensor, b: TorchMojoTensor, batch: int, m: int, n: int, k: int
 ) -> TorchMojoTensor | None:
-    """Dense conv GEMM (shared weight x per-sample im2col) via Bmm16, or
-    ``None``. ``w`` is the contiguous (out_c, ckk) weight; ``col`` OWNS the
-    per-sample dense row-major (ckk, cols) im2col slice (or, for 1x1
-    stride-1 convs, ``col`` IS the input tensor, reread in place). ``col``
-    must be the actual owning tensor, not a bare pointer: under the default
-    kernel-call queue the launch this enqueues can be deferred behind a
-    still-compiling specialization, and the caller's last reference to the
-    buffer it points at can drop before that launch runs unless this frame's
-    keepalive tuple holds it too (queue rule 3, call_queue.py:18-26)."""
+    """``batch`` GEMMs of one shared (m, k) ``a`` against a densely packed
+    per-sample (k, n) ``b``, through Bmm16, or ``None`` when a gate declines.
+
+    Both convolution directions have this shape: the forward multiplies the
+    (out_c, C*R*S) weight by each sample's im2col, and the data gradient
+    multiplies the (C*R*S, out_c) transposed weight by each sample's
+    grad_output. ``b`` must be the tensor that OWNS the buffer it points at
+    (the im2col slice, or the input tensor itself for a 1x1 conv), not a bare
+    pointer: under the default kernel-call queue the launch this enqueues can
+    be deferred behind a still-compiling specialization, and the caller's last
+    reference to the buffer can drop before that launch runs unless this
+    frame's keepalive tuple holds it too (queue rule 3, call_queue.py:18-26).
+    """
     if (
-        w._dtype not in _GEMM16_DTYPES
-        or w._device != col._device
-        or w._device.label != "gpu"
-        or w._device.api != "cuda"
-        or w._device.architecture_name != "sm_90a"
-        or min(n, out_c, cols, ckk) <= 0
+        a._dtype not in _GEMM16_DTYPES
+        or a._device != b._device
+        or a._device.label != "gpu"
+        or a._device.api != "cuda"
+        or a._device.architecture_name != "sm_90a"
+        or min(batch, m, n, k) <= 0
         or not _gemm16_bridge_available()
     ):
         return None
-    out = _alloc((n, out_c, cols), w._dtype, w._device)
+    out = _alloc((batch, m, n), a._dtype, a._device)
     _call_mojo(
         _Gemm16MatmulExtension,
         "Bmm16",
         (
             out._ptr,
-            w._ptr,
-            col._ptr,
+            a._ptr,
+            b._ptr,
+            batch,
+            m,
             n,
-            out_c,
-            cols,
-            ckk,
-            out_c * cols,
+            k,
+            m * n,
             0,
-            ckk * cols,
+            k * n,
             0,
             0,
-            _ctx_ptr(w._device),
+            _ctx_ptr(a._device),
         ),
-        arg_dtypes=(w._dtype, w._dtype),
+        arg_dtypes=(a._dtype, a._dtype),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": False},
-        keepalive=(out, w, col),
+        keepalive=(out, a, b),
     )
     return out
 
 
-def _try_tf32_conv_bmm(
-    w: TorchMojoTensor, col: TorchMojoTensor, n: int, out_c: int, cols: int, ckk: int
+def _try_tf32_shared_a_bmm(
+    a: TorchMojoTensor, b: TorchMojoTensor, batch: int, m: int, n: int, k: int
 ) -> TorchMojoTensor | None:
-    """Dense conv GEMM (shared weight x per-sample im2col) via the opt-in
-    TF32 BMM, or ``None``. Same numerics policy as ``_try_tf32_bmm``: TF32 is
-    off when the user asked for full FP32 (`torch.set_float32_matmul_precision
-    ("highest")`) -- the repo has no separate `torch.backends.cudnn.
-    allow_tf32`-style policy for convolution, so this follows the exact gate
-    the mm/bmm TF32 paths already use. ``col`` must be the tensor that OWNS
-    the im2col buffer (or the input tensor itself for a 1x1 conv), not a
-    bare pointer -- see ``_try_gemm16_conv_bmm``'s docstring for why."""
+    """The same shared-A batched GEMM through the opt-in TF32 BMM, or
+    ``None``. Same numerics policy as ``_try_tf32_bmm``: TF32 is off when the
+    user asked for full FP32 (`torch.set_float32_matmul_precision("highest")`)
+    -- the repo has no separate `torch.backends.cudnn.allow_tf32`-style policy
+    for convolution, so this follows the exact gate the mm/bmm TF32 paths
+    already use. ``b`` must own its buffer, for the reason
+    ``_try_gemm16_shared_a_bmm``'s docstring gives."""
     if torch.get_float32_matmul_precision() == "highest":
         return None
     if (
-        w._dtype != DType.float32
-        or w._device != col._device
-        or w._device.label != "gpu"
-        or w._device.api != "cuda"
-        or w._device.architecture_name != "sm_90a"
-        or min(n, out_c, cols, ckk) <= 0
+        a._dtype != DType.float32
+        or a._device != b._device
+        or a._device.label != "gpu"
+        or a._device.api != "cuda"
+        or a._device.architecture_name != "sm_90a"
+        or min(batch, m, n, k) <= 0
         or not _tf32_bridge_available()
     ):
         return None
-    out = _alloc((n, out_c, cols), w._dtype, w._device)
+    out = _alloc((batch, m, n), a._dtype, a._device)
     _call_mojo(
         _Tf32MatmulExtension,
         "Tf32BmmF32",
         (
             out._ptr,
-            w._ptr,
-            col._ptr,
+            a._ptr,
+            b._ptr,
+            batch,
+            m,
             n,
-            out_c,
-            cols,
-            ckk,
-            out_c * cols,
+            k,
+            m * n,
             0,
-            ckk * cols,
+            k * n,
             0,
             0,
-            _ctx_ptr(w._device),
+            _ctx_ptr(a._device),
         ),
-        arg_dtypes=(w._dtype, w._dtype),
+        arg_dtypes=(a._dtype, a._dtype),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": False},
-        keepalive=(out, w, col),
+        keepalive=(out, a, b),
     )
     return out
+
+
+def _conv_shared_a_bmm(
+    a: TorchMojoTensor, b: TorchMojoTensor, batch: int, m: int, n: int, k: int, ctx: int
+) -> TorchMojoTensor:
+    """``batch`` GEMMs of the shared (m, k) ``a`` against per-sample (k, n)
+    ``b``, on whichever route this device and dtype support.
+
+    H100 tensor cores first: bf16/f16 through the same Bmm16 kernel
+    `fast_aten_bmm` already builds, f32 through the same opt-in TF32 route
+    `_try_tf32_mm` already gates. Both decline (return None) off sm_90a, off
+    their dtype, or with the bridge sources missing, and the plain SIMT Bmm
+    below is the fallback for every regime they decline.
+    """
+    out = _try_gemm16_shared_a_bmm(a, b, batch, m, n, k)
+    if out is None:
+        out = _try_tf32_shared_a_bmm(a, b, batch, m, n, k)
+    if out is None:
+        out = _alloc((batch, m, n), a._dtype, a._device)
+        _call_mojo(
+            _MatmulExtension,
+            "Bmm",
+            (out._ptr, a._ptr, b._ptr, (batch, m, n, k, 0, 1), a._dtype.value, ctx),
+            arg_dtypes=(a._dtype, b._dtype),
+            output_dtypes=(out._dtype,),
+            # Same define shape as every other Bmm site: the shared-A
+            # broadcast is RUNTIME data (the trailing 1 in the params tuple,
+            # matmul_ops._bmm_go), so naming it here would only fork this call
+            # site onto a second .so of identical code.
+            flags={"TRANSPOSE_B": False},
+            # `b` owns the pointer this call names and must outlive the
+            # deferred launch (kernel queue rule 3, call_queue.py:18-26) -- it
+            # is not implied by `a`/`out` alone.
+            keepalive=(out, a, b),
+        )
+    return out
+
+
+def _conv_col_matrix(
+    a: TorchMojoTensor, geom: tuple[int, ...], ctx: int
+) -> TorchMojoTensor | object:
+    """The tensor OWNING the (batch, C*KH*KW, OH*OW) im2col patch buffer of
+    the NCHW ``a``.
+
+    ``geom`` is the shared convolution descriptor
+    ``(n, c, in_h, in_w, out_h, out_w, kh, kw, sh, sw, ph, pw, dh, dw)``.
+    A 1x1 stride-1 unpadded convolution has no im2col at all: every patch is
+    one pixel, so the NCHW input already IS that matrix and is reread in
+    place. ``a`` ITSELF comes back then -- still rank 4, not a reshaped view
+    -- because it is the tensor that must appear in the keepalive of every
+    queued GEMM reading the buffer (queue rule 3), and a caller that needs
+    the (batch, C*KH*KW, OH*OW) matrix shape should take that view itself.
+    """
+    n, c, in_h, in_w, out_h, out_w, kh, kw, sh, sw, ph, pw, dh, dw = geom
+    if (kh, kw, sh, sw, ph, pw, dh, dw) == (1, 1, 1, 1, 0, 0, 1, 1):
+        return a
+    col = _alloc((n, c * kh * kw, out_h * out_w), a._dtype, a._device)
+    _call_mojo(
+        _ConvExtension,
+        "Im2col",
+        (
+            col._ptr,
+            a._ptr,
+            (in_h, in_w, out_h, out_w, kh, kw, sh, sw, ph, pw, dh, dw, c, n),
+            a._dtype.value,
+            ctx,
+        ),
+        arg_dtypes=(a._dtype,),
+        output_dtypes=(col._dtype,),
+        keepalive=(col, a),
+    )
+    return col
 
 
 # ---------------------------------------------------------------------------
@@ -8961,6 +9036,14 @@ def fast_aten_convolution(
         and groups >= 1
         and None not in (strides, pads, dils)
         and 0 not in a._shape
+        # ATen's own "expected weight to be at least 1 at dimension 0" check
+        # does NOT run on the PrivateUse1 path -- a 0-out-channel conv that
+        # CPU and CUDA both reject returns a 0-channel tensor here instead --
+        # so this is the only thing between a degenerate weight and a made-up
+        # answer. It also keeps `fast_aten_convolution_backward`'s matching
+        # gate implied by this one, which that function's header explains is
+        # the difference between a NotImplementedError and a dead process.
+        and 0 not in w._shape
     ):
         n, c, in_h, in_w = a._shape
         out_c, c_per_group, kh, kw = w._shape
@@ -9003,83 +9086,16 @@ def fast_aten_convolution(
                     ctx,
                 )
             if out is None:
-                if (kh, kw, sh, sw, ph, pw, dh, dw) == (1, 1, 1, 1, 0, 0, 1, 1):
-                    # 1x1 stride-1 conv: NCHW input already is the col matrix.
-                    # `col` ALIASES `a` (no allocation) -- it is still the
-                    # tensor that must stay alive until every GEMM reading it
-                    # has launched, so it flows through exactly like the
-                    # materialized branch's freshly allocated `col` below.
-                    col = a
-                else:
-                    col = _alloc((n, ckk, cols), a._dtype, a._device)
-                    _call_mojo(
-                        _ConvExtension,
-                        "Im2col",
-                        (
-                            col._ptr,
-                            a._ptr,
-                            (
-                                in_h,
-                                in_w,
-                                out_h,
-                                out_w,
-                                kh,
-                                kw,
-                                sh,
-                                sw,
-                                ph,
-                                pw,
-                                dh,
-                                dw,
-                                c,
-                                n,
-                            ),
-                            a._dtype.value,
-                            ctx,
-                        ),
-                        arg_dtypes=(a._dtype,),
-                        output_dtypes=(col._dtype,),
-                        keepalive=(col, a),
-                    )
+                # `col` is the tensor that OWNS the column buffer -- or, for a
+                # 1x1 stride-1 conv, a zero-copy view of `a` itself -- and must
+                # stay alive until every GEMM reading it has launched.
+                col = _conv_col_matrix(
+                    a,
+                    (n, c, in_h, in_w, out_h, out_w, kh, kw, sh, sw, ph, pw, dh, dw),
+                    ctx,
+                )
                 if groups == 1:
-                    # H100 tensor cores first: bf16/f16 through the same Bmm16
-                    # kernel fast_aten_bmm already builds, f32 through the same
-                    # opt-in TF32 route _try_tf32_mm already gates. Both decline
-                    # (return None) off sm_90a, off their dtype, or with the
-                    # bridge sources missing, and the plain SIMT Bmm below is the
-                    # fallback for every regime they decline, including grouped
-                    # convs (untouched, handled in the `else` branch).
-                    out = _try_gemm16_conv_bmm(w, col, n, out_c, cols, ckk)
-                    if out is None:
-                        out = _try_tf32_conv_bmm(w, col, n, out_c, cols, ckk)
-                    if out is None:
-                        out = _alloc((n, out_c, cols), a._dtype, a._device)
-                        _call_mojo(
-                            _MatmulExtension,
-                            "Bmm",
-                            (
-                                out._ptr,
-                                w._ptr,
-                                col._ptr,
-                                (n, out_c, cols, ckk, 0, 1),
-                                a._dtype.value,
-                                ctx,
-                            ),
-                            arg_dtypes=(w._dtype, a._dtype),
-                            output_dtypes=(out._dtype,),
-                            # Same define shape as every other Bmm site: the
-                            # shared-A broadcast is RUNTIME data (the trailing 1
-                            # in the params tuple, matmul_ops._bmm_go), so naming
-                            # it here would only fork this call site onto a
-                            # second .so of identical code.
-                            flags={"TRANSPOSE_B": False},
-                            # `col` (the im2col buffer, or `a` itself for the
-                            # 1x1 fast path) owns the pointer this call names
-                            # and must outlive the deferred launch (kernel
-                            # queue rule 3, call_queue.py:18-26) -- it is not
-                            # implied by `w`/`out` alone.
-                            keepalive=(out, w, col),
-                        )
+                    out = _conv_shared_a_bmm(w, col, n, out_c, cols, ckk, ctx)
                 else:
                     out = _alloc((n, out_c, cols), a._dtype, a._device)
                     # Channel-major im2col rows make each group a contiguous
@@ -9137,6 +9153,356 @@ def fast_aten_convolution(
                 out._offset,
             )
     return NOT_HANDLED
+
+
+# ---------------------------------------------------------------------------
+# Convolution backward, pure Mojo: the same im2col + GEMM machinery the
+# forward uses, with the operand roles permuted.
+#
+#   grad_bias   = grad_output summed over (N, H, W)             -- one reduce
+#   grad_weight = grad_output x im2col(input)^T, summed over N  -- the forward
+#                 GEMM with the two operands' roles swapped, so the reduction
+#                 runs over the OUTPUT pixels instead of over the patch rows
+#   grad_input  = col2im(weight^T x grad_output)                -- the forward
+#                 GEMM transposed, then im2col's adjoint
+#
+# `transposed=True` (the backward of a conv_transpose forward, where the
+# input/grad_output roles swap again) is declined: the forward declines it
+# too, so nothing on this device can produce such a node.
+#
+# THAT SENTENCE IS AN INVARIANT, not an aside. This function runs INSIDE the
+# autograd engine, where a raise does not propagate -- it aborts the process
+# (the unwind hazard `mojo_device/aten_ops/autograd_preflight.py` documents at
+# length), and returning NOT_HANDLED from here raises. So every gate below
+# must already be implied by something that ran EARLIER, on a path that can
+# still raise: either a gate `fast_aten_convolution` enforces (transposed,
+# rank, dtype, device, 0-sized extents) or a check ATen itself makes before
+# dispatch (`aten::convolution` rejects `out_c % groups != 0` outright, which
+# is why the same condition here is unreachable defensive code, and why the
+# forward carries a matching `0 not in w._shape` -- ATen's degenerate-weight
+# check does NOT run on this dispatch path, so that one had to be added there
+# rather than assumed). Adding a gate to this function that the forward does
+# not imply turns a would-be NotImplementedError into a dead process, so a new
+# restriction belongs in the FORWARD first.
+#
+# Memory: the weight gradient's per-sample partials are an (N, out_c, C*R*S)
+# buffer that a batch reduce then collapses, because none of the GEMM routes
+# here takes a beta=1 accumulator. That is smaller than the column buffer it
+# is computed from whenever out_c <= OH*OW, i.e. everywhere except the last
+# stages of a deep net; folding N into the GEMM's K instead would need a
+# patch-major im2col variant (a transposed write, so a different kernel, not
+# a different index), which is left for a perf pass.
+# ---------------------------------------------------------------------------
+
+
+def _conv_backward_1d(
+    grad_output: TorchMojoTensor,
+    input: TorchMojoTensor,
+    weight: TorchMojoTensor,
+    bias_sizes: Sequence[int] | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    transposed: bool,
+    output_padding: Sequence[int],
+    groups: int,
+    output_mask: Sequence[bool],
+) -> object:
+    """conv1d backward through the rank-4 path, or ``NOT_HANDLED``.
+
+    Same lift the rank-3 forward uses: a synthetic size-1 H axis (unsqueeze
+    is a zero-copy view) makes the rank-3 operands look like conv2d's, the
+    single stride/padding/dilation maps onto the W axis while the dummy H
+    axis is pinned at kernel=1/stride=1/pad=0/dilation=1, and the two
+    spatial gradients get the dummy axis squeezed back out (zero-copy
+    again). grad_bias is already (out_c,) and needs no fixup.
+    """
+    lifted = [fast_aten_unsqueeze(t, 2) for t in (grad_output, input, weight)]
+    if any(t is NOT_HANDLED for t in lifted):
+        return NOT_HANDLED
+    result = fast_aten_convolution_backward(
+        lifted[0],
+        lifted[1],
+        lifted[2],
+        bias_sizes,
+        [1, int(stride[0])],
+        [0, int(padding[0])],
+        [1, int(dilation[0])],
+        transposed,
+        [0, int(output_padding[0]) if output_padding else 0],
+        groups,
+        output_mask,
+    )
+    if result is NOT_HANDLED:
+        return NOT_HANDLED
+    grad_input, grad_weight, grad_bias = result
+    if grad_input is not None:
+        grad_input = fast_aten_squeeze_dim(grad_input, 2)
+        if grad_input is NOT_HANDLED:
+            return NOT_HANDLED
+    if grad_weight is not None:
+        grad_weight = fast_aten_squeeze_dim(grad_weight, 2)
+        if grad_weight is NOT_HANDLED:
+            return NOT_HANDLED
+    return grad_input, grad_weight, grad_bias
+
+
+def fast_aten_convolution_backward(
+    grad_output: TorchMojoTensor,
+    input: TorchMojoTensor,
+    weight: TorchMojoTensor,
+    bias_sizes: Sequence[int] | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    transposed: bool,
+    output_padding: Sequence[int],
+    groups: int,
+    output_mask: Sequence[bool],
+) -> object:
+    """``(grad_input, grad_weight, grad_bias)``, or ``NOT_HANDLED``.
+
+    Each gradient is ``None`` when its ``output_mask`` slot is off, matching
+    the undefined tensor ATen returns there. The return type can only be
+    ``object``: ``NOT_HANDLED`` is a bare ``object()`` sentinel with no type
+    of its own, so any union naming it collapses to ``object`` anyway.
+    """
+    # `_t()` first, like the forward: every gate below reads metadata only, so
+    # a call this cannot serve must return NOT_HANDLED before `_tc()` pays for
+    # the allocation + copy of a non-contiguous operand.
+    g = _t(grad_output)
+    a = _t(input)
+    w = _t(weight)
+    if g is None or a is None or w is None or transposed:
+        return NOT_HANDLED
+    mask = tuple(output_mask) if isinstance(output_mask, list | tuple) else ()
+    if len(mask) != 3 or any(not isinstance(requested, bool) for requested in mask):
+        return NOT_HANDLED
+    if not isinstance(groups, int) or isinstance(groups, bool) or groups < 1:
+        return NOT_HANDLED
+    if not all(
+        isinstance(seq, list | tuple) and all(isinstance(i, int) for i in seq)
+        for seq in (stride, padding, dilation)
+    ):
+        return NOT_HANDLED
+    if not isinstance(output_padding, list | tuple):
+        return NOT_HANDLED
+
+    if len(a._shape) == 3 and len(w._shape) == 3 and len(g._shape) == 3:
+        if len(stride) != 1 or len(padding) != 1 or len(dilation) != 1:
+            return NOT_HANDLED
+        return _conv_backward_1d(
+            g,
+            a,
+            w,
+            bias_sizes,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+            output_mask,
+        )
+
+    strides = _pair(list(stride))
+    pads = _pair(list(padding))
+    dils = _pair(list(dilation))
+    if (
+        len(a._shape) != 4
+        or len(w._shape) != 4
+        or len(g._shape) != 4
+        or a._dtype != w._dtype
+        or a._dtype != g._dtype
+        or a._dtype not in _FLOAT_DTYPES
+        or a._device != w._device
+        or a._device != g._device
+        or None in (strides, pads, dils)
+        or 0 in a._shape
+        or 0 in w._shape
+    ):
+        return NOT_HANDLED
+
+    n, c, in_h, in_w = a._shape
+    out_c, c_per_group, kh, kw = w._shape
+    sh, sw = strides
+    ph, pw = pads
+    dh, dw = dils
+    if min(sh, sw, dh, dw) < 1 or min(ph, pw) < 0:
+        return NOT_HANDLED
+    if c_per_group * groups != c or out_c % groups != 0:
+        return NOT_HANDLED
+    out_h = (in_h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
+    out_w = (in_w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
+    if out_h < 1 or out_w < 1 or tuple(g._shape) != (n, out_c, out_h, out_w):
+        return NOT_HANDLED
+
+    if not any(mask):
+        return None, None, None
+
+    # Only now is a non-contiguous operand worth what `_tc()` costs. The
+    # gradients come back plain contiguous NCHW whatever memory format the
+    # forward's operands had: the autograd engine validates a returned
+    # gradient's shape, dtype, layout and device but never its strides
+    # (torch/csrc/autograd/engine.cpp, validate_outputs_impl), so a
+    # channels_last input is a performance question here, not a correctness
+    # one.
+    g = _tc(g)
+    ctx = _ctx_ptr(a._device)
+    cols = out_h * out_w
+    ckk = c * kh * kw
+    crs_g = c_per_group * kh * kw
+    oc_g = out_c // groups
+    geom = (n, c, in_h, in_w, out_h, out_w, kh, kw, sh, sw, ph, pw, dh, dw)
+    g3 = fast_aten_view(g, (n, out_c, cols))
+    if g3 is NOT_HANDLED:
+        return NOT_HANDLED
+
+    grad_bias = None
+    if mask[2]:
+        # ATen computes this straight from grad_output whenever the backend
+        # did not (Convolution.cpp's `grad_output.sum({0, 2, 3})` fixup), so
+        # `bias_sizes` is not consulted: it only records that the forward HAD
+        # a bias, which mask[2] already says. The reduce accumulates in fp32
+        # for every float dtype, like torch's own.
+        grad_bias = fast_aten_sum(g, dim=[0, 2, 3], keepdim=False)
+        if grad_bias is NOT_HANDLED:
+            return NOT_HANDLED
+
+    grad_weight = None
+    if mask[1]:
+        col = _conv_col_matrix(_tc(a), geom, ctx)
+        # The 1x1 fast path hands back the rank-4 input itself (it owns the
+        # buffer); the GEMMs below want the (n, ckk, cols) matrix shape.
+        col_matrix = (
+            col if len(col._shape) == 3 else fast_aten_view(col, (n, ckk, cols))
+        )
+        if col_matrix is NOT_HANDLED:
+            return NOT_HANDLED
+        if groups == 1:
+            # (n, out_c, cols) x (n, ckk, cols)^T: both operands have the
+            # reduction (the output pixels) as their contiguous last axis,
+            # which is exactly the transposed-B GEMM the accepted Bmm16 /
+            # TF32 / SIMT routes already build for `fast_aten_bmm`.
+            partial = _fast_aten_bmm_transpose_b(g3, col_matrix)
+            if partial is NOT_HANDLED:
+                return NOT_HANDLED
+        else:
+            # Channel-major im2col rows make each group's rows a contiguous
+            # (crs_g, cols) slice, and each group's grad_output rows a
+            # contiguous (oc_g, cols) slice, so one offset GEMM per
+            # (sample, group) covers it -- the same decomposition the
+            # forward's grouped path uses, with transpose_b flipped on.
+            partial = _alloc((n, out_c, crs_g), a._dtype, a._device)
+            for s in range(n):
+                for group in range(groups):
+                    _call_mojo(
+                        _MatmulExtension,
+                        "Matmul",
+                        (
+                            partial._ptr,
+                            g3._ptr,
+                            col_matrix._ptr,
+                            (
+                                oc_g,
+                                crs_g,
+                                cols,
+                                1,
+                                (s * out_c + group * oc_g) * crs_g,
+                                (s * out_c + group * oc_g) * cols,
+                                (s * ckk + group * crs_g) * cols,
+                            ),
+                            a._dtype.value,
+                            ctx,
+                        ),
+                        arg_dtypes=(g3._dtype, col_matrix._dtype),
+                        output_dtypes=(partial._dtype,),
+                        flags={"TRANSPOSE_B": True},
+                        keepalive=(partial, g3, col_matrix),
+                    )
+        # The batch reduce is what turns the per-sample products into the
+        # gradient; it accumulates in fp32 like every float reduce here.
+        summed = fast_aten_sum(partial, dim=[0], keepdim=False)
+        if summed is NOT_HANDLED:
+            return NOT_HANDLED
+        grad_weight = fast_aten_view(summed, w._shape)
+        if grad_weight is NOT_HANDLED:
+            return NOT_HANDLED
+        # Drop the column buffer and the partials before the data gradient
+        # allocates its own column-sized buffer below: both are the size of
+        # an im2col, and nothing reads them past this point.
+        col = None
+        col_matrix = None
+        partial = None
+
+    grad_input = None
+    if mask[0]:
+        # (groups, crs_g, oc_g): each group's weight block transposed, which
+        # is what the data gradient's GEMM reads as its shared A operand. The
+        # weight is the smallest tensor in the op, so materializing its
+        # transpose costs nothing next to the column buffer below.
+        wt = fast_aten_view(_tc(w), (groups, oc_g, crs_g))
+        if wt is NOT_HANDLED:
+            return NOT_HANDLED
+        wt = fast_aten_transpose(wt, 1, 2)
+        if wt is NOT_HANDLED:
+            return NOT_HANDLED
+        wt = _tc(wt)
+        if groups == 1:
+            colgrad = _conv_shared_a_bmm(wt, g3, n, ckk, cols, out_c, ctx)
+        else:
+            colgrad = _alloc((n, ckk, cols), a._dtype, a._device)
+            for s in range(n):
+                for group in range(groups):
+                    _call_mojo(
+                        _MatmulExtension,
+                        "Matmul",
+                        (
+                            colgrad._ptr,
+                            wt._ptr,
+                            g3._ptr,
+                            (
+                                crs_g,
+                                cols,
+                                oc_g,
+                                0,
+                                (s * ckk + group * crs_g) * cols,
+                                group * crs_g * oc_g,
+                                (s * out_c + group * oc_g) * cols,
+                            ),
+                            a._dtype.value,
+                            ctx,
+                        ),
+                        arg_dtypes=(wt._dtype, g3._dtype),
+                        output_dtypes=(colgrad._dtype,),
+                        flags={"TRANSPOSE_B": False},
+                        keepalive=(colgrad, wt, g3),
+                    )
+        if (kh, kw, sh, sw, ph, pw, dh, dw) == (1, 1, 1, 1, 0, 0, 1, 1):
+            # The adjoint of the forward's in-place 1x1 column matrix: every
+            # patch is one pixel, so col2im is the identity and the columns
+            # ARE the gradient image.
+            grad_input = fast_aten_view(colgrad, (n, c, in_h, in_w))
+        else:
+            grad_input = _alloc((n, c, in_h, in_w), a._dtype, a._device)
+            _call_mojo(
+                _ConvExtension,
+                "Col2im",
+                (
+                    grad_input._ptr,
+                    colgrad._ptr,
+                    (in_h, in_w, out_h, out_w, kh, kw, sh, sw, ph, pw, dh, dw, c, n),
+                    a._dtype.value,
+                    ctx,
+                ),
+                arg_dtypes=(colgrad._dtype,),
+                output_dtypes=(grad_input._dtype,),
+                keepalive=(grad_input, colgrad),
+            )
+        if grad_input is NOT_HANDLED:
+            return NOT_HANDLED
+
+    return grad_input, grad_weight, grad_bias
 
 
 # ---------------------------------------------------------------------------

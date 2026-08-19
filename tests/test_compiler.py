@@ -19,7 +19,7 @@ from torch_mojo_backend import (
 )
 from torch_mojo_backend.testing import check_functions_are_equivalent
 
-from .conftest import require_cuda_autograd
+from .conftest import matmul_tolerance, require_cuda_autograd
 
 
 # MAX lowers an fp32 matmul to TF32 tensor cores on NVIDIA GPUs while torch
@@ -36,12 +36,6 @@ from .conftest import require_cuda_autograd
 # the tolerance. atol=2e-2 is ~1.3x the measured worst case and still ~50x
 # below the O(1) error an actually wrong matmul produces on N(0, 1) data.
 # CPU keeps assert_close's exact fp32 defaults.
-def matmul_tolerance(device: str) -> dict[str, float]:
-    if device == "cpu":
-        return {}
-    return {"rtol": 1e-2, "atol": 2e-2}
-
-
 def test_basic_training(device: str):
     require_cuda_autograd(device)
 

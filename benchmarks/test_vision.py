@@ -62,6 +62,34 @@ CONV_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int, int]] = {
     # design; this node is what pins the fallback's cost for it.
     "N16xC64x32x32_K64k3s1d2": (16, 64, 32, 32, 64, 3, 1, 2, 2),
 }
+# Backward is measured on a subset of the same CONV_SHAPES geometries, one
+# node per GRADIENT: the three gradients are three different kernels (a
+# col2im-fed GEMM, a transposed-B GEMM plus a batch reduce, and a plain
+# reduction) whose ratios move independently, so folding them into one node
+# would hide which of them regressed.  The subset spans the regimes that
+# matter to the backward specifically: the body/mid shapes the forward is
+# tuned on, the thin-C stem, an awkward one, a stride-2 one (the only
+# regime where col2im's tap loop mostly misses), and the deepest stage,
+# where the weight gradient's per-sample partials buffer is at its largest
+# relative to the column buffer.
+CONV_BACKWARD_SHAPES: tuple[str, ...] = (
+    "N32xC64x56x56_K64k3s1",
+    "N8xC3x224x224_K64k7s2",
+    "N32xC256x14x14_K256k3s1",
+    "N7xC48x39x53_K80k3s1",
+    "N32xC128x28x28_K128k3s2",
+    "N32xC512x7x7_K512k3s1",
+)
+# output_mask, one gradient at a time.  This is the suite's `layout` axis:
+# `bench_key` builds the baseline path op/dtype/shape/layout from the
+# parametrize ids, so naming the gradient selector `layout` is what keeps the
+# three gradients of one shape three separate entries (and lands them next to
+# each other in the tree) instead of three writes to one key.
+CONV_BACKWARD_GRADS: dict[str, list[bool]] = {
+    "dgrad": [True, False, False],
+    "wgrad": [False, True, False],
+    "bgrad": [False, False, True],
+}
 # (N, C, H, W, output)
 ADAPTIVE_SHAPES: dict[str, tuple[int, int, int, int, int]] = {
     "N32xC512x28x28_o7": (32, 512, 28, 28, 7),
@@ -80,6 +108,7 @@ UPSAMPLE_SHAPES: dict[str, tuple[int, int, int, int]] = {
 
 COVERS: dict[str, str] = {
     "aten::convolution": "test_conv2d",
+    "aten::convolution_backward": "test_conv2d_backward",
     "aten::_adaptive_avg_pool2d": "test_adaptive_avg_pool2d",
     "aten::avg_pool2d": "test_avg_pool2d",
     "aten::max_pool2d_with_indices": (
@@ -111,6 +140,54 @@ def test_conv2d(
     bench.run(
         lambda: F.conv2d(x_ref, w_ref, b_ref, stride, pad, dil),
         lambda: F.conv2d(x_our, w_our, b_our, stride, pad, dil),
+        flops=flops,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("layout", CONV_BACKWARD_GRADS)
+@pytest.mark.parametrize("shape_id", CONV_BACKWARD_SHAPES)
+@pytest.mark.bench_op("convolution_backward")
+def test_conv2d_backward(
+    shape_id: str,
+    layout: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+) -> None:
+    n, c_in, h, w, c_out, k, stride, pad, dil = CONV_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    eff_k = dil * (k - 1) + 1
+    h_out = (h + 2 * pad - eff_k) // stride + 1
+    w_out = (w + 2 * pad - eff_k) // stride + 1
+    grad_ref, grad_our = both(
+        torch.randn(n, c_out, h_out, w_out, dtype=dtype), hw, mojo_device
+    )
+    x_ref, x_our = both(torch.randn(n, c_in, h, w, dtype=dtype), hw, mojo_device)
+    w_ref, w_our = both(
+        torch.randn(c_out, c_in, k, k, dtype=dtype) * 0.1, hw, mojo_device
+    )
+    tail = (
+        [c_out],
+        [stride, stride],
+        [pad, pad],
+        [dil, dil],
+        False,
+        [0, 0],
+        1,
+        CONV_BACKWARD_GRADS[layout],
+    )
+    # The bias gradient is a pure reduction over grad_output, so its "flops"
+    # is its element count, the same convention the pooling nodes use.
+    flops = (
+        float(n * c_out * h_out * w_out)
+        if layout == "bgrad"
+        else 2.0 * n * c_out * h_out * w_out * c_in * k * k
+    )
+    bench.run(
+        lambda: torch.ops.aten.convolution_backward(grad_ref, x_ref, w_ref, *tail),
+        lambda: torch.ops.aten.convolution_backward(grad_our, x_our, w_our, *tail),
         flops=flops,
     )
 
