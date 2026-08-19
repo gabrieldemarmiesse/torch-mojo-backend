@@ -9415,6 +9415,76 @@ def test_fast_conv2d_refuses_autograd_in_the_forward(mojo_gpu):
         )
 
 
+@pytest.mark.parametrize(
+    "batch,in_c,out_c,length,k,stride,padding,dilation,groups",
+    [
+        # Whisper audio-encoder frontend (tiny d_model): first Conv1d.
+        (1, 80, 384, 3000, 3, 1, 1, 1, 1),
+        # Whisper's second Conv1d (stride 2 downsamples the time axis).
+        (1, 384, 384, 3000, 3, 2, 1, 1, 1),
+        # Awkward/non-round length, no padding.
+        (2, 3, 8, 17, 3, 1, 0, 1, 1),
+        # Dilation.
+        (2, 8, 12, 25, 3, 1, 2, 2, 1),
+        # Grouped (depthwise-ish) conv1d.
+        (2, 8, 12, 25, 3, 1, 1, 1, 2),
+        # 1x1 pointwise conv with stride.
+        (2, 64, 128, 33, 1, 2, 0, 1, 1),
+    ],
+)
+def test_fast_conv1d(
+    mojo_gpu, batch, in_c, out_c, length, k, stride, padding, dilation, groups
+):
+    x = torch.randn(batch, in_c, length)
+    w = torch.randn(out_c, in_c // groups, k)
+    b = torch.randn(out_c)
+    dev = torch.nn.functional.conv1d(
+        x.to(mojo_gpu),
+        w.to(mojo_gpu),
+        b.to(mojo_gpu),
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    ).cpu()
+    ref = torch.nn.functional.conv1d(
+        x, w, b, stride=stride, padding=padding, dilation=dilation, groups=groups
+    )
+    torch.testing.assert_close(dev, ref, atol=5e-2, rtol=5e-2)
+
+
+def test_fast_conv1d_no_bias(mojo_gpu):
+    x = torch.randn(2, 5, 19)
+    w = torch.randn(7, 5, 3)
+    dev = torch.nn.functional.conv1d(x.to(mojo_gpu), w.to(mojo_gpu), padding=1).cpu()
+    ref = torch.nn.functional.conv1d(x, w, padding=1)
+    torch.testing.assert_close(dev, ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fast_conv1d_low_precision(mojo_gpu, dtype):
+    x = torch.randn(2, 8, 41, dtype=dtype)
+    w = torch.randn(12, 8, 3, dtype=dtype)
+    b = torch.randn(12, dtype=dtype)
+    dev = torch.nn.functional.conv1d(
+        x.to(mojo_gpu), w.to(mojo_gpu), b.to(mojo_gpu), stride=2, padding=1
+    ).cpu()
+    ref = torch.nn.functional.conv1d(
+        x.float(), w.float(), b.float(), stride=2, padding=1
+    ).to(dtype)
+    torch.testing.assert_close(dev, ref, atol=5e-2, rtol=5e-2)
+
+
+def test_fast_conv1d_transposed_declines_cleanly(mojo_gpu):
+    # transposed conv1d shares fast_aten_convolution's rank-4 path's
+    # unconditional decline of `transposed=True` -- it must raise, not crash
+    # or silently produce a wrong result.
+    x = torch.randn(2, 6, 9).to(mojo_gpu)
+    w = torch.randn(6, 4, 3).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.nn.functional.conv_transpose1d(x, w)
+
+
 @pytest.mark.parametrize("is_causal", [True, False])
 # kv_len <= 32 exercises the library softmax's warp kernel, kv_len=64 the
 # online/block kernel.

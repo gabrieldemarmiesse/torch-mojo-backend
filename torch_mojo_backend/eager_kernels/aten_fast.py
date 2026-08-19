@@ -8672,6 +8672,46 @@ def fast_aten_convolution(
 ):
     a = _tc(input)
     w = _tc(weight)
+    if (
+        a is not None
+        and w is not None
+        and not transposed
+        and len(a._shape) == 3
+        and len(w._shape) == 3
+        and isinstance(stride, list | tuple)
+        and len(stride) == 1
+        and isinstance(padding, list | tuple)
+        and len(padding) == 1
+        and isinstance(dilation, list | tuple)
+        and len(dilation) == 1
+    ):
+        # conv1d has no dedicated kernel: insert a synthetic size-1 H axis
+        # (unsqueeze is a zero-copy view) so input/weight look like conv2d's
+        # (N, C, H, W) / (out_c, c_per_group, kh, kw), map the single
+        # stride/padding/dilation onto the W axis while pinning the dummy H
+        # axis at kernel=1/stride=1/pad=0/dilation=1 (so out_h is always 1),
+        # run the existing im2col+GEMM conv2d path unchanged, then squeeze the
+        # dummy axis back out of the result (also zero-copy). Transposed
+        # convolution is declined here exactly like the rank-4 path below.
+        a2d = fast_aten_unsqueeze(a, 2)
+        w2d = fast_aten_unsqueeze(w, 2)
+        if a2d is NOT_HANDLED or w2d is NOT_HANDLED:
+            return NOT_HANDLED
+        out_padding_1d = int(output_padding[0]) if output_padding else 0
+        out2d = fast_aten_convolution(
+            a2d,
+            w2d,
+            bias,
+            [1, int(stride[0])],
+            [0, int(padding[0])],
+            [1, int(dilation[0])],
+            transposed,
+            [0, out_padding_1d],
+            groups,
+        )
+        if out2d is NOT_HANDLED:
+            return NOT_HANDLED
+        return fast_aten_squeeze_dim(out2d, 2)
     bias_t = _tc(bias) if bias is not None else None
     strides = _pair(list(stride))
     pads = _pair(list(padding))
