@@ -8942,6 +8942,58 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "sort.values_stable": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 3.034
+                  }
+                },
+                "S_4096x4096": {
+                  "layouts": {
+                    "contig": 4.689
+                  }
+                },
+                "V_8x50304": {
+                  "layouts": {
+                    "contig": 3.676
+                  }
+                },
+                "V_8x50304_desc": {
+                  "layouts": {
+                    "contig": 3.64
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 2.038
+                  }
+                },
+                "S_4096x4096": {
+                  "layouts": {
+                    "contig": 3.054
+                  }
+                },
+                "V_8x50304": {
+                  "layouts": {
+                    "contig": 2.461
+                  }
+                },
+                "V_8x50304_desc": {
+                  "layouts": {
+                    "contig": 2.446
+                  }
+                }
+              }
+            }
+          }
+        },
         "sqrt": {
           "dtypes": {
             "bf16": {
@@ -9142,6 +9194,58 @@ document.addEventListener("DOMContentLoaded", boot);
                 "C_16777216": {
                   "layouts": {
                     "contig": 1.129
+                  }
+                }
+              }
+            }
+          }
+        },
+        "topk.values": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789_K32": {
+                  "layouts": {
+                    "contig": 1.466
+                  }
+                },
+                "V_1x50304_K50": {
+                  "layouts": {
+                    "contig": 2.061
+                  }
+                },
+                "V_8x50304_K2048": {
+                  "layouts": {
+                    "contig": 3.965
+                  }
+                },
+                "V_8x50304_K2048_min": {
+                  "layouts": {
+                    "contig": 3.875
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789_K32": {
+                  "layouts": {
+                    "contig": 1.277
+                  }
+                },
+                "V_1x50304_K50": {
+                  "layouts": {
+                    "contig": 1.377
+                  }
+                },
+                "V_8x50304_K2048": {
+                  "layouts": {
+                    "contig": 2.706
+                  }
+                },
+                "V_8x50304_K2048_min": {
+                  "layouts": {
+                    "contig": 2.689
                   }
                 }
               }
