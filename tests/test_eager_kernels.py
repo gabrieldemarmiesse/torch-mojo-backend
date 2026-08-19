@@ -7487,6 +7487,107 @@ def test_gemm16_wave_fill_dispatch_matches_fp32_reference(
     torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
 
 
+# A1-class ragged-N deep-K shapes (NOTES.md, deep-K wave-fill engagement,
+# section 20): n % 256 != 0 but n % 64 == 0, few output macro-tiles, and K
+# deep enough for a 2-way split to clear the depth floor. Production used to
+# fall straight through the whole split-K ladder to the persistent nclip
+# route on shapes like this (2.46x stock on the engagement's own A1 shape),
+# because the split-K dispatcher (`try_enqueue_gemm16_gemm_splitk_rm_v4`,
+# gemm16_tn_v4_kernels.mojo) declined outright on any n that was not an
+# exact multiple of 256. The fix is two gates over kernels that already
+# exist as a template (the shared warp-specialized body,
+# `_v4_tn_ws_body`), not a new algorithm: relax the entry gate to n % 64 ==
+# 0 (the body already ceil-divs blocks_n and predicates its store, exactly
+# like the ragged-N *direct* 128x192 kernel a phase-3 fix unblocked
+# earlier), and add a 128x192 split-K candidate (NN only) gated by the SAME
+# split-worthiness predicate (min splits, chunk depth, small-tile coverage)
+# that already gates the 128/256 candidates -- not by a shape-specific
+# n == 1088 check.
+_RAGGED_SPLITK_SHAPES = {
+    "A1_1152x1088x7936": (1152, 1088, 7936),  # the engagement's own A1 shape
+    "ragged_896x1216x7936": (896, 1216, 7936),  # a second ragged n
+}
+
+
+@pytest.mark.parametrize("shape_id", _RAGGED_SPLITK_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm16_ragged_n_splitk_matches_fp32_reference_and_engages(
+    mojo_h100: torch.device, dtype: torch.dtype, shape_id: str
+) -> None:
+    """A shape whose n is a multiple of 64 but not of 256 -- so neither the
+    128- nor the 256-wide split-K candidate is available -- must reach the
+    new 128x192 split-K candidate through the real production entry point
+    (`_try_gemm16_mm`, what `fast_aten_mm` itself calls), not just produce a
+    correct result through some other route, and the result must match an
+    FP32 reference within bf16/f16 accumulation tolerance."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = _RAGGED_SPLITK_SHAPES[shape_id]
+    assert n % 64 == 0 and n % 256 != 0, "shape must exercise the ragged-N rung"
+    a, b = _gemm16_operands("NN", m, n, k, dtype, mojo_h100)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = aten_fast._try_gemm16_mm(a, b)
+        torch.accelerator.synchronize()
+    assert out is not None, "the ragged-N split-K dispatch declined this shape"
+    names = [
+        evt.name
+        for evt in prof.events()
+        if str(evt.device_type) in ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+    ]
+    tag = "bf16" if dtype == torch.bfloat16 else "f16"
+    assert any(f"{tag}_gemm_nn_v4_splitk_m128n192" in name for name in names), names
+    assert any(f"{tag}_gemm_tn_v4_splitk_reduce" in name for name in names), names
+
+    assert out.dtype == dtype
+    assert tuple(out.shape) == (m, n)
+    expected = a.cpu().float() @ b.cpu().float()
+    # bf16/f16 accumulate in FP32 on-device; the tolerance is the k-depth
+    # floor (grows ~sqrt(k) for a tiled reduction) plus the final round to
+    # the 16-bit output dtype (about half a ULP) -- same bound the wave-fill
+    # sweep above uses.
+    ulp = 2**-8 if dtype == torch.bfloat16 else 2**-11
+    atol = 4 * ulp * (k**0.5)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm16_ragged_n_splitk_addmm_bias_matches_fp32_reference(
+    mojo_h100: torch.device, dtype: torch.dtype
+) -> None:
+    """Same ragged-N split-K rung, with a bias: the fused reduce epilogue
+    (`_v4_tn_splitk_reduce`, shared with the 128/256 split-K kernels) reads
+    bias 4-wide, which assumes n % 4 == 0 -- true here because n % 64 == 0,
+    even though n % 256 != 0 is exactly what used to make this whole regime
+    unreachable."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 1152, 1088, 7936  # A1
+    a, b = _gemm16_operands("NN", m, n, k, dtype, mojo_h100)
+    bias = torch.randn(n).to(dtype).to(mojo_h100)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = aten_fast._try_gemm16_mm(a, b, bias)
+        torch.accelerator.synchronize()
+    assert out is not None, "the ragged-N split-K dispatch declined this shape"
+    names = [
+        evt.name
+        for evt in prof.events()
+        if str(evt.device_type) in ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+    ]
+    tag = "bf16" if dtype == torch.bfloat16 else "f16"
+    assert any(f"{tag}_gemm_nn_v4_splitk_m128n192" in name for name in names), names
+
+    expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
+    ulp = 2**-8 if dtype == torch.bfloat16 else 2**-11
+    atol = 4 * ulp * (k**0.5)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
+
+
 def test_gemm16_wave_body_rejects_bm_256_at_compile_time(tmp_path: Path) -> None:
     """BM >= 256 (CONSUMERS >= 4) is not just unused by any dispatcher --
     it is actively dangerous: the deep-K wave-fill engagement measured it

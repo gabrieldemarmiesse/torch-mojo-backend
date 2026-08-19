@@ -735,6 +735,53 @@ def _v4_nn_splitk_m128n128_s6(
     )
 
 
+# NN ragged-N split-K 128x192 tile: the fix for A1-class shapes (n % 256 !=
+# 0 but n % 64 == 0, e.g. 1152x1088x7936), where the 256- and 128-wide
+# split-K tiles above are both unreachable because their host-side tile
+# counts assume an exact factor of n -- even though the shared body
+# already ceil-divs blocks_n and predicates its store, exactly like the
+# ragged-N *direct* 128x192 kernel a few hundred lines down
+# (`_v4_nn_direct_m128n192_s3g16`).  Same body, same workspace + reduce
+# store as the 128/256 split-K kernels above; only BN (and the resulting B
+# TMA box count) differs.  See NOTES.md, deep-K wave-fill engagement,
+# section 20, and `try_enqueue_gemm16_gemm_splitk_rm_v4`'s ragged-N branch
+# for the dispatch side.
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
+)
+@__name(t"{_GEMM16_TAG}_gemm_nn_v4_splitk_m128n192_s4")
+def _v4_nn_splitk_m128n192_s4(
+    a_tma: TMATensorTile[
+        _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+    ],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
+    ws: _V4_F32_PTR,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    chunk_tiles_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var chunk_tiles = Int(chunk_tiles_arg)
+    _v4_tn_ws_body[_V4_BM, 192, 4, True, 8, False, False, False](
+        a_tma,
+        b_tma,
+        ws.bitcast[Scalar[_V4_DT]](),
+        ws,
+        ws.bitcast[Scalar[_V4_DT]](),
+        m,
+        n,
+        k,
+        chunk_tiles,
+    )
+
+
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
 @__llvm_metadata(
@@ -1011,13 +1058,14 @@ comptime _V4_RED_SPAN = _V4_RED_THREADS * _V4_RED_GROUPS * 4
 # `bias` is an (n,)-row vector broadcast over every one of the `m` output
 # rows; `output`/`ws` are addressed as the flattened (m, n) row-major
 # buffer, so column `i % n` is the bias index for flat offset `i`. Callers
-# that engage the bias epilogue always satisfy n % 256 == 0 (the only tile
-# width the split-K kernels come in -- see the two `try_enqueue_*` call
-# sites that pass has_bias=True), so n is always a multiple of 4 and every
-# vec4 group's flat offset is itself a multiple of 4: `base % n` therefore
-# never straddles a row boundary, and a 4-element bias read is always a
-# contiguous, correctly-ordered slice of one row. has_bias=False (every
-# pre-existing caller) skips the extra loads/adds entirely.
+# that engage the bias epilogue always satisfy n % 64 == 0 -- every split-K
+# entry gate requires it (256-, 128- and, since the ragged-N NN candidate,
+# 192-wide tiles alike; see the `try_enqueue_*` call sites that pass
+# has_bias=True), so n is always a multiple of 4 and every vec4 group's flat
+# offset is itself a multiple of 4: `base % n` therefore never straddles a
+# row boundary, and a 4-element bias read is always a contiguous,
+# correctly-ordered slice of one row. has_bias=False (every pre-existing
+# caller) skips the extra loads/adds entirely.
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_RED_THREADS))
 )
@@ -1330,6 +1378,54 @@ def _v4_enqueue_splitk_m128n128_s6[
             grid_dim=(grid_x, splits),
             block_dim=(_V4_THREADS,),
         )
+    ctx.enqueue_function[_v4_tn_splitk_reduce](
+        output,
+        ws_ptr,
+        bias,
+        Int64(count),
+        Int64(splits),
+        Int64(n),
+        Int64(1) if has_bias else Int64(0),
+        grid_dim=((count + _V4_RED_SPAN - 1) // _V4_RED_SPAN,),
+        block_dim=(_V4_RED_THREADS,),
+    )
+    # Normal release after both stream-ordered consumers are enqueued.
+    _ = ws^
+
+
+# 128x192 NN split-K enqueue: same workspace + fused-bias reduce structure
+# as the two helpers above, for the ragged-N candidate
+# (`_v4_nn_splitk_m128n192_s4`) `try_enqueue_gemm16_gemm_splitk_rm_v4`
+# dispatches to.  NN-only (see that dispatcher's ragged-N branch for why).
+def _v4_enqueue_nn_splitk_m128n192(
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    bias: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    grid_x: Int,
+    splits: Int,
+    has_bias: Bool,
+    ctx: DeviceContext,
+) raises:
+    var total_tiles = k // _V4_BK
+    var chunk_tiles = (total_tiles + splits - 1) // splits
+    var count = m * n
+    var ws = ctx.enqueue_create_buffer[DType.float32](splits * count)
+    var ws_ptr = ws.unsafe_ptr().as_unsafe_any_origin()
+    ctx.enqueue_function[_v4_nn_splitk_m128n192_s4](
+        _v4_make_a_row_tma(a, m, k, ctx),
+        _v4_make_b_mn_tma[192](b, n, k, ctx),
+        ws_ptr,
+        Int64(m),
+        Int64(n),
+        Int64(k),
+        Int64(chunk_tiles),
+        grid_dim=(grid_x, splits),
+        block_dim=(_V4_THREADS,),
+    )
     ctx.enqueue_function[_v4_tn_splitk_reduce](
         output,
         ws_ptr,
@@ -2103,15 +2199,24 @@ def try_enqueue_gemm16_gemm_splitk_rm_v4[
     if cc_major != 9 or cc_minor != 0:
         return False
     # Aligned full-tile regime with machine-width-safe products (same gates
-    # as the TN dispatcher above, plus the 256-wide n requirement of the
-    # only tile shape the split-K kernels come in).
+    # as the TN dispatcher above).  n only needs to tile by 64: the shared
+    # body (`_v4_tn_ws_body`) ceil-divs `blocks_n` and predicates every
+    # store, so a ragged n does not need an exact factor of any tile width
+    # -- the same reasoning as the phase-3 direct-192 ceil-div fix (git
+    # history, "Fix the n%192 gate...").  n % 256 == 0 used to be required
+    # here because the 256- and 128-wide candidates below are the only
+    # ones that existed; they still gate themselves on their own exact
+    # factor (256 and 128 respectively), and the new ragged-N candidate
+    # further down (128x192, NN only) is what a non-multiple-of-256 n
+    # actually reaches. See NOTES.md, deep-K wave-fill engagement,
+    # section 20.
     if (
         m < _V4_BM
         or k < _V4_BK
         or m % _V4_BM != 0
         or k % _V4_BK != 0
         or n <= 0
-        or n % 256 != 0
+        or n % 64 != 0
         or Int(output) % 16 != 0
         or Int(a) % 16 != 0
         or Int(b) % 16 != 0
@@ -2130,67 +2235,116 @@ def try_enqueue_gemm16_gemm_splitk_rm_v4[
     var max_grid_x = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
     if sm_count <= 0 or max_grid_x <= 0:
         return False
-    var tiles = (m // _V4_BM) * (n // 256)
-    if tiles <= 0 or tiles > max_grid_x:
-        return False
-    var cap = sm_count // tiles
-    if cap < _V4_SPLITK_RM_MIN_SPLITS:
-        return False
     var k_tiles = k // _V4_BK
-    var splits = cap
-    if splits > _V4_MAX_SPLITS:
-        splits = _V4_MAX_SPLITS
     var max_by_depth = k_tiles // _V4_MIN_CHUNK_TILES
-    if splits > max_by_depth:
-        splits = max_by_depth
-    if splits < _V4_SPLITK_RM_MIN_SPLITS:
-        return False
-    var small_tile_covers = 4 * tiles < sm_count
-    comptime if KMAJ_B:
-        # NT: a marginal 2-way split of a minimum-depth K loses to the
-        # persistent kernel's nearly-full wave (see the fit above).
-        if cap == 2 and k_tiles < _V4_SPLITK_RM_DEEP_TILES:
-            return False
-    else:
-        # NN: when the v3 small-tile kernel covers the output in one wave,
-        # only a deep split beats it (see the fit above).
-        if small_tile_covers and splits < _V4_SPLITK_RM_COVERED_MIN_SPLITS:
-            return False
-    if m * n > _V4_MAX_WS_BYTES // 4 // splits:
-        return False
 
-    # Wave-fill cost model: compare against the narrower 128x128/6-stage
-    # split tile, same rule and same closed menu as the TN dispatcher (see
-    # NOTES.md, deep-K wave-fill engagement).  The 128-wide candidate is
-    # gated through the SAME per-layout floors as the 256-wide one above
-    # (re-evaluated at its own split count) so it only engages in a regime
-    # already validated for split-K on this layout.
-    var tiles128 = (m // _V4_BM) * (n // 128)
-    var cap128 = sm_count // tiles128
-    var splits128 = cap128
-    if splits128 > _V4_MAX_SPLITS:
-        splits128 = _V4_MAX_SPLITS
-    if splits128 > max_by_depth:
-        splits128 = max_by_depth
-    var splits128_ok = (
-        splits128 >= _V4_SPLITK_RM_MIN_SPLITS and tiles128 <= max_grid_x
-    )
-    comptime if KMAJ_B:
-        if cap128 == 2 and k_tiles < _V4_SPLITK_RM_DEEP_TILES:
+    if n % 256 == 0:
+        var tiles = (m // _V4_BM) * (n // 256)
+        if tiles <= 0 or tiles > max_grid_x:
+            return False
+        var cap = sm_count // tiles
+        if cap < _V4_SPLITK_RM_MIN_SPLITS:
+            return False
+        var splits = cap
+        if splits > _V4_MAX_SPLITS:
+            splits = _V4_MAX_SPLITS
+        if splits > max_by_depth:
+            splits = max_by_depth
+        if splits < _V4_SPLITK_RM_MIN_SPLITS:
+            return False
+        var small_tile_covers = 4 * tiles < sm_count
+        comptime if KMAJ_B:
+            # NT: a marginal 2-way split of a minimum-depth K loses to the
+            # persistent kernel's nearly-full wave (see the fit above).
+            if cap == 2 and k_tiles < _V4_SPLITK_RM_DEEP_TILES:
+                return False
+        else:
+            # NN: when the v3 small-tile kernel covers the output in one
+            # wave, only a deep split beats it (see the fit above).
+            if small_tile_covers and splits < _V4_SPLITK_RM_COVERED_MIN_SPLITS:
+                return False
+        if m * n > _V4_MAX_WS_BYTES // 4 // splits:
+            return False
+
+        # Wave-fill cost model: compare against the narrower 128x128/6-stage
+        # split tile, same rule and same closed menu as the TN dispatcher
+        # (see NOTES.md, deep-K wave-fill engagement).  The 128-wide
+        # candidate is gated through the SAME per-layout floors as the
+        # 256-wide one above (re-evaluated at its own split count) so it
+        # only engages in a regime already validated for split-K on this
+        # layout.
+        var tiles128 = (m // _V4_BM) * (n // 128)
+        var cap128 = sm_count // tiles128
+        var splits128 = cap128
+        if splits128 > _V4_MAX_SPLITS:
+            splits128 = _V4_MAX_SPLITS
+        if splits128 > max_by_depth:
+            splits128 = max_by_depth
+        var splits128_ok = (
+            splits128 >= _V4_SPLITK_RM_MIN_SPLITS and tiles128 <= max_grid_x
+        )
+        comptime if KMAJ_B:
+            if cap128 == 2 and k_tiles < _V4_SPLITK_RM_DEEP_TILES:
+                splits128_ok = False
+        else:
+            if (
+                small_tile_covers
+                and splits128 < _V4_SPLITK_RM_COVERED_MIN_SPLITS
+            ):
+                splits128_ok = False
+        if splits128_ok and m * n > _V4_MAX_WS_BYTES // 4 // splits128:
             splits128_ok = False
-    else:
-        if small_tile_covers and splits128 < _V4_SPLITK_RM_COVERED_MIN_SPLITS:
-            splits128_ok = False
-    if splits128_ok and m * n > _V4_MAX_WS_BYTES // 4 // splits128:
-        splits128_ok = False
-    if splits128_ok and _v4_wave_cost_us(
-        m, n, k, 128, splits128, _V4_WAVE_TF_128x128, sm_count
-    ) < _v4_wave_cost_us(m, n, k, 256, splits, _V4_WAVE_TF_128x256, sm_count):
-        _v4_enqueue_splitk_m128n128_s6[False, KMAJ_B](
-            output, a, b, bias, m, n, k, tiles128, splits128, has_bias, ctx
+        if splits128_ok and _v4_wave_cost_us(
+            m, n, k, 128, splits128, _V4_WAVE_TF_128x128, sm_count
+        ) < _v4_wave_cost_us(
+            m, n, k, 256, splits, _V4_WAVE_TF_128x256, sm_count
+        ):
+            _v4_enqueue_splitk_m128n128_s6[False, KMAJ_B](
+                output, a, b, bias, m, n, k, tiles128, splits128, has_bias, ctx
+            )
+            return True
+        _v4_enqueue_splitk_m128n256[False, KMAJ_B](
+            output, a, b, bias, m, n, k, tiles, splits, has_bias, ctx
         )
         return True
-    _v4_enqueue_splitk_m128n256[False, KMAJ_B](
-        output, a, b, bias, m, n, k, tiles, splits, has_bias, ctx
-    )
-    return True
+
+    # Ragged-N regime: n % 256 != 0 but n % 64 == 0 (guaranteed by the
+    # entry gate above), e.g. A1 1152x1088x7936 (n % 256 == 64).  Neither
+    # exact-factor candidate above is available, but the shared body's
+    # ceil-div tiling makes a 128x192 split-K tile just as exact as it is
+    # for the already-shipped ragged-N *direct* 128x192 kernel
+    # (`_v4_enqueue_nn_direct_m128n192`, phase 3's ceil-div fix). Gated by
+    # the SAME split-worthiness predicate as the 128/256 candidates above
+    # (min splits, chunk depth, small-tile coverage -- all fitted from the
+    # same H100 PCIe sweep the module docstring describes), not by any
+    # shape-specific check, so it engages only where the model says a
+    # split actually pays for itself.  Wired for NN only (the measured
+    # regime, NOTES.md deep-K wave-fill engagement section 20); NT is left
+    # for a measured follow-up, same as the TN dispatcher's own n % 192
+    # gate (git history, "Fix the n%192 gate...").
+    comptime if not KMAJ_B:
+        var tiles192 = (m // _V4_BM) * ((n + 191) // 192)
+        if tiles192 <= 0 or tiles192 > max_grid_x:
+            return False
+        var cap192 = sm_count // tiles192
+        if cap192 < _V4_SPLITK_RM_MIN_SPLITS:
+            return False
+        var splits192 = cap192
+        if splits192 > _V4_MAX_SPLITS:
+            splits192 = _V4_MAX_SPLITS
+        if splits192 > max_by_depth:
+            splits192 = max_by_depth
+        if splits192 < _V4_SPLITK_RM_MIN_SPLITS:
+            return False
+        if (
+            4 * tiles192 < sm_count
+            and splits192 < _V4_SPLITK_RM_COVERED_MIN_SPLITS
+        ):
+            return False
+        if m * n > _V4_MAX_WS_BYTES // 4 // splits192:
+            return False
+        _v4_enqueue_nn_splitk_m128n192(
+            output, a, b, bias, m, n, k, tiles192, splits192, has_bias, ctx
+        )
+        return True
+    return False
