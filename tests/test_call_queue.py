@@ -19,7 +19,7 @@ import gc
 import threading
 import weakref
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -653,6 +653,233 @@ def test_keepalive_survives_dropped_intermediates(mojo_gpu, forced_queue):
     finally:
         stall.release()
     torch.testing.assert_close(z.cpu(), torch.full((256,), 12.0))
+
+
+# ---------------------------------------------------------------------------
+# Convolution's im2col/GEMM keep-alive (agent-C review of PR #387): the
+# materialized im2col buffer -- or, for a 1x1 stride-1 conv, the input
+# tensor read in place -- is never seen outside `fast_aten_convolution`.
+# Nothing in these tests holds a reference to it either; its only owner is
+# the stack frame that allocates (or aliases) it, which is gone by the time
+# a queued GEMM launch that reads it actually runs. That is exactly the
+# shape of hazard queue rule 3 exists for: a raw pointer's owning tensor
+# must be in the SAME item's keepalive as the pointer, not just alive
+# somewhere in the caller at enqueue time.
+#
+# `_StalledUnits` forces every specialization the second (post-warm-up) call
+# touches to look cold, so the producer (im2col) and the GEMM both queue
+# instead of launching directly. Releasing only the producer's stall and
+# calling `pump()` (not `drain()`) launches it ALONE and stops with the GEMM
+# item still queued -- the one moment queue rule 3 says a missing keepalive
+# entry drops the buffer's last reference.
+#
+# The assertion is a `weakref` check, not a value comparison: whether the
+# buffer's Python object is still alive right there is a direct read of
+# queue rule 3, and it does not depend on whatever the device allocator
+# happens to do with freed memory (which may not corrupt a value-based
+# check promptly, or at all, on a given allocator/run -- a weakref going
+# dead is unambiguous either way).
+# ---------------------------------------------------------------------------
+
+
+def _spy_keepalive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, tuple[object, ...]]]:
+    """Record every ``(op, keepalive)`` pair `_call_mojo` is invoked with,
+    without changing its behavior."""
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    orig_call_mojo = aten_fast._call_mojo
+
+    def spy(
+        extension: object,
+        op: str,
+        extension_args: tuple[object, ...],
+        *,
+        arg_dtypes: tuple[object, ...],
+        output_dtypes: tuple[object, ...] = (),
+        flags: object = None,
+        keepalive: tuple[object, ...],
+    ) -> object:
+        calls.append((op, keepalive))
+        return orig_call_mojo(
+            extension,
+            op,
+            extension_args,
+            arg_dtypes=arg_dtypes,
+            output_dtypes=output_dtypes,
+            flags=flags,
+            keepalive=keepalive,
+        )
+
+    monkeypatch.setattr(aten_fast, "_call_mojo", spy)
+    return calls
+
+
+def _assert_materialized_col_survives_to_gemm(
+    run: Callable[[], torch.Tensor], monkeypatch: pytest.MonkeyPatch
+) -> torch.Tensor:
+    """Warm up ``run`` (a zero-arg callable issuing one materialized conv2d
+    -- i.e. NOT the 1x1 fast path, which has no separate im2col call), then
+    replay it with every specialization forced cold. Launches the im2col
+    item alone (dropping ITS OWN keepalive, `(col, a)`), then checks -- with
+    the GEMM item still queued, not yet launched -- that the im2col buffer
+    is still alive. It can only be alive there because the GEMM item's own
+    keepalive retains it: nothing else does."""
+    calls = _spy_keepalive(monkeypatch)
+    warm = run()
+    call_queue.drain()
+    del warm
+    calls.clear()
+
+    stall = _StalledUnits(monkeypatch, limit=None)
+    col_survived = None
+    try:
+        y = run()
+        assert call_queue.active()
+        assert len(stall.stalls) >= 2, "expected im2col AND a GEMM unit to stall"
+        assert calls and calls[0][0] == "Im2col", (
+            f"expected the first call to be Im2col, got {calls[0][0] if calls else None!r}"
+        )
+        col = calls[0][1][0]  # keepalive=(col, a): index 0 is `col`
+        weak_col = weakref.ref(col)
+        del col, calls[:]  # this frame must not become col's last owner
+
+        gemm_stall = stall.stalls[-1]
+        for earlier in stall.stalls[:-1]:
+            earlier.release()
+        call_queue.pump()  # launches im2col only; the GEMM item stays queued
+        gc.collect()
+        col_survived = weak_col() is not None
+        gemm_stall.release()
+    finally:
+        stall.release()
+    call_queue.drain()
+    assert col_survived, (
+        "the im2col buffer was garbage-collected after im2col's own queued "
+        "item launched (and dropped its keepalive, rule 3) but BEFORE the "
+        "GEMM item that reads it had launched -- the GEMM item's keepalive "
+        "does not retain its own B operand, so a real cold start can free "
+        "this buffer out from under the GEMM kernel (call_queue.py:18-26)"
+    )
+    return y
+
+
+@pytest.mark.parametrize("case", ["dense_simt_bmm", "grouped_simt_matmul"])
+def test_convolution_gemm_keepalive_survives_a_cold_queued_launch(
+    mojo_gpu, forced_queue, monkeypatch: pytest.MonkeyPatch, case: str
+):
+    """Reproduces the review's use-after-free hazard for the plain SIMT
+    `Bmm` fallback (materialized conv, dense) and the grouped `Matmul` loop
+    (materialized conv, groups > 1, one queue item per (sample, group), all
+    reading the same im2col buffer).
+
+    float32 with matmul precision forced to "highest" (TF32 off) keeps this
+    off the sm_90a-gated Bmm16/TF32 routes regardless of which GPU runs the
+    suite, so it deterministically exercises the SIMT fallbacks these cases
+    target -- patched on `aten_fast.torch` rather than the global, so it
+    cannot leak into another test.
+    """
+    monkeypatch.setattr(
+        aten_fast.torch, "get_float32_matmul_precision", lambda: "highest"
+    )
+    torch.manual_seed(0)
+    if case == "grouped_simt_matmul":
+        n, c, out_c, groups = 2, 8, 8, 2
+    else:
+        n, c, out_c, groups = 2, 6, 5, 1
+    k, pad = 3, 1
+    x = torch.randn(n, c, 9, 9, device=mojo_gpu)
+    weight = torch.randn(out_c, c // groups, k, k, device=mojo_gpu) * 0.1
+    x_cpu, weight_cpu = x.cpu(), weight.cpu()
+
+    def run() -> torch.Tensor:
+        return torch.nn.functional.conv2d(
+            x, weight, None, stride=1, padding=pad, groups=groups
+        )
+
+    y = _assert_materialized_col_survives_to_gemm(run, monkeypatch)
+
+    ref = torch.nn.functional.conv2d(
+        x_cpu, weight_cpu, None, stride=1, padding=pad, groups=groups
+    )
+    torch.testing.assert_close(y.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+
+def test_convolution_gemm16_keepalive_survives_a_cold_queued_launch(
+    mojo_gpu, forced_queue, monkeypatch: pytest.MonkeyPatch
+):
+    """Same hazard as `test_convolution_gemm_keepalive_survives_a_cold_
+    queued_launch`, for the sm_90a Bmm16 route `_try_gemm16_conv_bmm`
+    builds (bf16, the default fast path production actually takes on this
+    hardware) -- skipped off an sm_90a GPU, where it is not reachable."""
+    accelerator = list(get_accelerators())[0]
+    if accelerator.api != "cuda" or accelerator.architecture_name != "sm_90a":
+        pytest.skip("the Bmm16 conv route requires an sm_90a GPU")
+    torch.manual_seed(0)
+    # C = 8 < 32 declines the implicit-GEMM route (`_try_conv_igemm`), so
+    # the materialized im2col + Bmm16 route -- the one this fix touches --
+    # is what actually launches.
+    n, c, out_c, k, pad = 2, 8, 16, 3, 1
+    x = (torch.randn(n, c, 9, 9, device=mojo_gpu)).to(torch.bfloat16)
+    weight = (torch.randn(out_c, c, k, k, device=mojo_gpu) * 0.1).to(torch.bfloat16)
+    x_cpu, weight_cpu = x.float().cpu(), weight.float().cpu()
+
+    def run() -> torch.Tensor:
+        return torch.nn.functional.conv2d(x, weight, None, stride=1, padding=pad)
+
+    y = _assert_materialized_col_survives_to_gemm(run, monkeypatch)
+
+    ref = torch.nn.functional.conv2d(x_cpu, weight_cpu, None, stride=1, padding=pad)
+    torch.testing.assert_close(y.float().cpu(), ref, atol=8e-2, rtol=8e-2)
+
+
+def test_convolution_1x1_alias_keepalive_survives_a_cold_queued_launch(
+    mojo_gpu, forced_queue, monkeypatch: pytest.MonkeyPatch
+):
+    """The 1x1 stride-1 fast path never allocates a separate im2col buffer:
+    `col` in `fast_aten_convolution` IS `a`, the input tensor, read in
+    place. Once this test drops its own reference, the GEMM item's own
+    keepalive is the ONLY thing that can keep the input alive until that
+    item -- forced cold, still queued -- launches. Same TF32-off float32
+    setup as the materialized cases, for the same portability reason."""
+    monkeypatch.setattr(
+        aten_fast.torch, "get_float32_matmul_precision", lambda: "highest"
+    )
+    torch.manual_seed(0)
+    n, c, out_c = 2, 6, 5
+    x = torch.randn(n, c, 9, 9, device=mojo_gpu)
+    weight = torch.randn(out_c, c, 1, 1, device=mojo_gpu) * 0.1
+    x_cpu, weight_cpu = x.cpu(), weight.cpu()
+
+    def run() -> torch.Tensor:
+        return torch.nn.functional.conv2d(x, weight, None, stride=1, padding=0)
+
+    warm = run()
+    call_queue.drain()
+    del warm
+
+    stall = _StalledUnits(monkeypatch, limit=None)
+    x_survived = None
+    try:
+        y = run()
+        assert call_queue.active()
+        assert stall.stalls, "expected the GEMM unit to stall cold"
+        weak_x = weakref.ref(x)
+        x = None  # drop the caller's only reference to the input
+        gc.collect()
+        x_survived = weak_x() is not None
+    finally:
+        stall.release()
+    call_queue.drain()
+    assert x_survived, (
+        "the input tensor was garbage-collected while the queued GEMM item "
+        "that reads it in place (the 1x1 fast path, no separate im2col "
+        "buffer) was still cold -- its keepalive does not retain the input "
+        "(queue rule 3, call_queue.py:18-26)"
+    )
+
+    ref = torch.nn.functional.conv2d(x_cpu, weight_cpu, None, stride=1, padding=0)
+    torch.testing.assert_close(y.cpu(), ref, atol=1e-4, rtol=1e-4)
 
 
 def test_sync_read_drains_the_queue(mojo_gpu, forced_queue):
