@@ -4916,6 +4916,38 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "_index_put_impl_": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R_262144x64_S65536_acc": {
+                  "layouts": {
+                    "contig": 0.899
+                  }
+                },
+                "R_262144x64_S65536_set": {
+                  "layouts": {
+                    "contig": 3.041
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R_262144x64_S65536_acc": {
+                  "layouts": {
+                    "contig": 0.837
+                  }
+                },
+                "R_262144x64_S65536_set": {
+                  "layouts": {
+                    "contig": 2.957
+                  }
+                }
+              }
+            }
+          }
+        },
         "_log_softmax": {
           "dtypes": {
             "bf16": {
@@ -6812,6 +6844,38 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "gather": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R_262144x64_D1": {
+                  "layouts": {
+                    "contig": 2.677
+                  }
+                },
+                "R_4096x4096_D0": {
+                  "layouts": {
+                    "contig": 1.126
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R_262144x64_D1": {
+                  "layouts": {
+                    "contig": 2.163
+                  }
+                },
+                "R_4096x4096_D0": {
+                  "layouts": {
+                    "contig": 1.073
+                  }
+                }
+              }
+            }
+          }
+        },
         "ge": {
           "dtypes": {
             "f32": {
@@ -6954,6 +7018,70 @@ document.addEventListener("DOMContentLoaded", boot);
                 "R_262144x64_I1048576": {
                   "layouts": {
                     "contig": 0.522
+                  }
+                }
+              }
+            }
+          }
+        },
+        "index_add": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R_262144x64_S1048576_D0": {
+                  "layouts": {
+                    "contig": 1.476
+                  }
+                },
+                "R_4096x4096_S8192_D1": {
+                  "layouts": {
+                    "contig": 2.338
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R_262144x64_S1048576_D0": {
+                  "layouts": {
+                    "contig": 1.517
+                  }
+                },
+                "R_4096x4096_S8192_D1": {
+                  "layouts": {
+                    "contig": 1.013
+                  }
+                }
+              }
+            }
+          }
+        },
+        "index_select": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R_262144x64_S1048576_D0": {
+                  "layouts": {
+                    "contig": 0.487
+                  }
+                },
+                "R_4096x4096_S8192_D1": {
+                  "layouts": {
+                    "contig": 4.298
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R_262144x64_S1048576_D0": {
+                  "layouts": {
+                    "contig": 0.52
+                  }
+                },
+                "R_4096x4096_S8192_D1": {
+                  "layouts": {
+                    "contig": 2.855
                   }
                 }
               }
@@ -8758,6 +8886,38 @@ document.addEventListener("DOMContentLoaded", boot);
                 "R_262144x64_S65536": {
                   "layouts": {
                     "contig": 1.183
+                  }
+                }
+              }
+            }
+          }
+        },
+        "scatter_add": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R_262144x64_D1": {
+                  "layouts": {
+                    "contig": 2.247
+                  }
+                },
+                "R_4096x4096_D0": {
+                  "layouts": {
+                    "contig": 1.247
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R_262144x64_D1": {
+                  "layouts": {
+                    "contig": 1.508
+                  }
+                },
+                "R_4096x4096_D0": {
+                  "layouts": {
+                    "contig": 1.048
                   }
                 }
               }

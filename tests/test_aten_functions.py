@@ -2005,6 +2005,280 @@ def test_aten_isin_all_match(conf: Conf):
     check_outputs(fn, conf, [elements, test_elements])
 
 
+# ---------------------------------------------------------------------------
+# The dim-indexed family: gather / index_select / scatter_add / index_add /
+# index_put.  All of them are the same two kernels over an index space
+# described by strides (GatherDim reads, ScatterDim[+add] writes), so the
+# axes worth parametrizing are the ones that change that description: the
+# rank, WHICH dim is indexed (0 has a dedicated row fast path, the last is
+# the contiguous-inner regime, a negative dim exercises normalization), the
+# payload dtype, and whether the operands are contiguous.
+# ---------------------------------------------------------------------------
+
+_INDEX_DTYPES = [torch.float32, torch.bfloat16, torch.int64]
+
+
+def _index_payload(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """A tensor of `dtype` holding exactly representable values: bfloat16 has
+    8 mantissa bits, so a scatter_add of random floats would fail on rounding
+    rather than on anything this family of ops does."""
+    numel = math.prod(shape)
+    values = torch.arange(numel, dtype=torch.int64) % 17 - 8
+    return values.reshape(shape).to(dtype)
+
+
+@pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "dim"),
+    [((6, 5), 0), ((6, 5), 1), ((6, 5), -1), ((3, 4, 5), 1), ((2, 3, 4, 5), 2)],
+)
+def test_aten_gather(
+    conf: Conf,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    dim: int,
+    call_checker: CallChecker,
+):
+    call_checker.register(aten_functions.aten_gather)
+
+    def fn(x, index):
+        return aten.gather(x, dim, index)
+
+    x = _index_payload(shape, dtype)
+    # `index.size(d) <= self.size(d)` is legal for gather on EVERY dim, not
+    # only the indexed one, and the output is shaped like the INDEX — so a
+    # kernel that walked `self`'s shape, or took the output's strides from
+    # `self`, is wrong here while an equal-shaped index would hide it.
+    index_shape = [3 if d == dim else max(1, s - 1) for d, s in enumerate(shape)]
+    index = torch.randint(0, shape[dim], index_shape, dtype=torch.int64)
+    check_outputs(fn, conf, [x, index])
+
+
+def test_aten_gather_strided_input(conf: Conf, call_checker: CallChecker):
+    """A transposed (non-contiguous) `self`: the kernel reads it through its
+    real strides instead of materializing a copy first."""
+    call_checker.register(aten_functions.aten_gather)
+
+    def fn(x, index):
+        return aten.gather(x.transpose(0, 1), 1, index)
+
+    x = torch.randn(7, 5)
+    index = torch.randint(0, 7, (5, 7), dtype=torch.int64)
+    check_outputs(fn, conf, [x, index])
+
+
+def test_aten_take_along_dim(conf: Conf, call_checker: CallChecker):
+    """`take_along_dim` is a composite that lowers straight to gather — and,
+    unlike gather itself, it DOES define negative indices (it normalizes them
+    with `remainder` before calling gather)."""
+    call_checker.register(aten_functions.aten_gather)
+
+    def fn(x, index):
+        return torch.take_along_dim(x, index, dim=1)
+
+    x = torch.randn(4, 6)
+    index = torch.tensor([[0, -1, 2], [-2, 1, 0], [3, 3, -6], [5, 0, 1]])
+    check_outputs(fn, conf, [x, index])
+
+
+@pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "dim"),
+    [((6, 5), 0), ((6, 5), 1), ((6, 5), -1), ((3, 4, 5), 1), ((2, 3, 4, 5, 2), 2)],
+)
+def test_aten_index_select(
+    conf: Conf,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    dim: int,
+    call_checker: CallChecker,
+):
+    call_checker.register(aten_functions.aten_index_select)
+
+    def fn(x, index):
+        return aten.index_select(x, dim, index)
+
+    x = _index_payload(shape, dtype)
+    # Duplicated and out-of-order indices, and a length that differs from the
+    # indexed extent (index_select is the one op in the family whose output is
+    # shaped like neither input).
+    index = torch.tensor([2, 0, 2, 1, 0, 1, 2], dtype=torch.int64)
+    check_outputs(fn, conf, [x, index])
+
+
+def test_aten_index_select_int32_index(conf: Conf, call_checker: CallChecker):
+    """index_select accepts an int32 index; gather/scatter_add do not."""
+    call_checker.register(aten_functions.aten_index_select)
+
+    def fn(x, index):
+        return aten.index_select(x, 0, index)
+
+    x = torch.randn(5, 3)
+    index = torch.tensor([4, 0, 2], dtype=torch.int32)
+    check_outputs(fn, conf, [x, index])
+
+
+def test_aten_index_select_strided_input(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_index_select)
+
+    def fn(x, index):
+        return aten.index_select(x.transpose(0, 1), 1, index)
+
+    x = torch.randn(6, 4)
+    index = torch.tensor([5, 5, 1, 0], dtype=torch.int64)
+    check_outputs(fn, conf, [x, index])
+
+
+@pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "dim"), [((6, 5), 0), ((6, 5), 1), ((6, 5), -1), ((3, 4, 5), 1)]
+)
+def test_aten_scatter_add(
+    conf: Conf,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    dim: int,
+    call_checker: CallChecker,
+):
+    """Every index here is duplicated many times over: the whole point of
+    scatter_add is that colliding writes SUM instead of clobbering, and a test
+    with unique indices would pass against a plain scatter."""
+    call_checker.register(aten_functions.aten_scatter_add)
+
+    def fn(x, index, src):
+        return aten.scatter_add(x, dim, index, src)
+
+    x = _index_payload(shape, dtype)
+    index = torch.zeros(shape, dtype=torch.int64)
+    index.narrow(dim % len(shape), 1, shape[dim] - 1).fill_(1)
+    src = _index_payload(shape, dtype)
+    check_outputs(fn, conf, [x, index, src])
+
+
+def test_aten_scatter_add_inplace(conf: Conf, call_checker: CallChecker):
+    """`scatter_add_` and `scatter_add` both route through
+    `aten::scatter_add.out`; in the in-place one the out= tensor IS self, so
+    the "start from a copy of self" step must be a no-op rather than a copy of
+    an already-scattered buffer."""
+    call_checker.register(aten_functions.aten_scatter_add)
+
+    def fn(x, index, src):
+        out = x.clone()
+        out.scatter_add_(1, index, src)
+        return out
+
+    x = _index_payload((4, 6), torch.float32)
+    index = torch.randint(0, 6, (4, 6), dtype=torch.int64)
+    src = _index_payload((4, 6), torch.float32)
+    check_outputs(fn, conf, [x, index, src])
+
+
+@pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+@pytest.mark.parametrize(("shape", "dim"), [((6, 5), 0), ((6, 5), 1), ((3, 4, 5), 1)])
+def test_aten_index_add(
+    conf: Conf,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    dim: int,
+    call_checker: CallChecker,
+):
+    """index_add is scatter_add with a broadcast index, and it is also what
+    autograd calls for index_select's backward — an unimplemented backward on
+    this device aborts the process instead of raising, so it stops being
+    optional the moment index_select exists."""
+    call_checker.register(aten_functions.aten_index_add)
+
+    def fn(x, index, source):
+        return aten.index_add(x, dim, index, source)
+
+    x = _index_payload(shape, dtype)
+    index = torch.tensor([0, 0, 1, 0], dtype=torch.int64)
+    source_shape = list(shape)
+    source_shape[dim] = 4
+    source = _index_payload(tuple(source_shape), dtype)
+    check_outputs(fn, conf, [x, index, source])
+
+
+@pytest.mark.parametrize("accumulate", [False, True])
+@pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+def test_aten_index_put(
+    conf: Conf, dtype: torch.dtype, accumulate: bool, call_checker: CallChecker
+):
+    """`x[idx] = v` / `x[idx] += v`. With `accumulate=False` the indices are
+    unique on purpose: torch leaves the winner of colliding writes undefined
+    on an accelerator, so a duplicate there would be testing nothing."""
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, accumulate)
+
+    x = _index_payload((6, 4), dtype)
+    index = torch.tensor(
+        [3, 0, 3, 1] if accumulate else [3, 0, 5, 1], dtype=torch.int64
+    )
+    values = _index_payload((4, 4), dtype)
+    check_outputs(fn, conf, [x, index, values])
+
+
+def test_aten_index_put_negative_indices(conf: Conf, call_checker: CallChecker):
+    """Advanced indexing — unlike gather/index_select/scatter_add — DOES
+    define negative indices, and wraps them python-style."""
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, False)
+
+    x = torch.randn(5, 3)
+    index = torch.tensor([-1, -5, 2], dtype=torch.int64)
+    values = torch.randn(3, 3)
+    check_outputs(fn, conf, [x, index, values])
+
+
+def test_aten_index_put_broadcast_values(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, False)
+
+    x = torch.randn(5, 3)
+    index = torch.tensor([1, 4], dtype=torch.int64)
+    values = torch.randn(3)  # broadcast over the indexed rows
+    check_outputs(fn, conf, [x, index, values])
+
+
+def test_aten_index_put_bool_mask_scalar(conf: Conf):
+    """`x[mask] = scalar` does NOT reach a bool-mask index_put kernel: torch's
+    own `_index_put_impl_` re-routes exactly this shape to `masked_fill_`
+    (canDispatchToMaskedFill), and so does the mojo one — which is why no
+    index_put implementation is asserted here."""
+
+    def fn(x):
+        out = x.clone()
+        out[x > 0] = -1.0
+        return out
+
+    check_outputs(fn, conf, [torch.randn(4, 5)])
+
+
+def test_aten_index_put_bool_row_mask_scalar(conf: Conf):
+    """A mask that covers only the LEADING dim, on a SQUARE tensor.
+
+    A mask index selects leading dims, but broadcasting is right-aligned, so
+    routing a shape-(4,) mask straight into masked_fill_ on a (4, 4) tensor
+    fills the wrong axis — and only a square tensor exposes it, because any
+    other shape raises instead of answering wrongly.
+    """
+
+    def fn(x, keep):
+        out = x.clone()
+        out[keep] = 0.0
+        return out
+
+    x = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    keep = torch.tensor([True, False, False, True])
+    check_outputs(fn, conf, [x, keep])
+
+
 def test_aten_isin_none_match(conf: Conf):
     """Test aten.isin when no elements are in test_elements"""
 

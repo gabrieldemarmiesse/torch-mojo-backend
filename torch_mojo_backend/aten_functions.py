@@ -2230,6 +2230,44 @@ def aten_full_like(
 
 
 # gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor
+@map_to(aten.gather)
+def aten_gather(
+    input: MaxTensor, dim: int, index: MaxTensor, sparse_grad: bool = False
+) -> MaxTensor:
+    """``out[i][j][k] = input[i][index[i][j][k]][k]`` for ``dim=1``, etc.
+
+    ``F.gather`` is numpy.take — it selects whole slices along one axis — NOT
+    torch.gather, so the full coordinate of every output element is built and
+    fed to ``gather_nd``. ``sparse_grad`` only picks the layout of the
+    gradient, which autograd builds separately, so the forward ignores it
+    exactly as ATen's does.
+    """
+    return F.gather_nd(input, _dim_coords(input, dim, index), batch_dims=0)
+
+
+def _dim_coords(input: MaxTensor, dim: int, index: MaxTensor) -> MaxTensor:
+    """The ``index.shape + [rank]`` coordinate tensor of a torch-style
+    gather/scatter along ``dim``.
+
+    Every axis contributes its own coordinate — an iota broadcast along that
+    axis — except ``dim``, which contributes ``index``. This is the bridge
+    between torch's elementwise gather/scatter index convention and MAX's
+    ``gather_nd``/``scatter_nd`` coordinate-vector convention, and is shared
+    by ``aten_gather`` and ``aten_scatter_add``: their index semantics are
+    identical, only the direction of the copy differs.
+    """
+    rank = len(input.shape)
+    dim = dim % rank
+    coords = []
+    for axis in range(rank):
+        if axis == dim:
+            coords.append(index)
+            continue
+        iota = F.arange(0, index.shape[axis], 1, dtype=index.dtype, device=index.device)
+        axis_shape = [StaticDim(1)] * rank
+        axis_shape[axis] = index.shape[axis]
+        coords.append(F.broadcast_to(F.reshape(iota, axis_shape), index.shape))
+    return F.stack(coords, axis=-1)
 
 
 # ge.Scalar(Tensor self, Scalar other) -> Tensor
@@ -2387,8 +2425,75 @@ def broadcast_shape(shapes):
     return out
 
 
+# index_add(Tensor self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor
+@map_to(aten.index_add)
+def aten_index_add(
+    input: MaxTensor, dim: int, index: MaxTensor, source: MaxTensor, alpha: Scalar = 1
+) -> MaxTensor:
+    """``out = input.clone(); out.index_add_(dim, index, source)``.
+
+    index_add IS scatter_add with a 1-D index broadcast across every other
+    axis, so it broadcasts the index to `source`'s shape and reuses
+    `aten_scatter_add` rather than repeating the coordinate construction.
+    It is also what autograd calls for index_select's backward.
+    """
+    if alpha != 1:
+        source = source * alpha
+    axis_shape = [StaticDim(1)] * len(source.shape)
+    axis_shape[dim % len(source.shape)] = index.shape[0]
+    index = F.broadcast_to(F.reshape(index, axis_shape), source.shape)
+    return aten_scatter_add(input, dim, index, source)
+
+
 # index_put(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor
+@map_to(aten.index_put)
+def aten_index_put(
+    input: MaxTensor,
+    indices: list[MaxTensor | None],
+    values: MaxTensor,
+    accumulate: bool = False,
+) -> MaxTensor:
+    """``out = input.clone(); out[indices] = values`` (``+=`` when
+    ``accumulate``) — the write mirror of ``aten_index``.
+
+    Only a single index tensor on axis 0 is served, the same regime the eager
+    fast path covers; anything else (a boolean mask, several index tensors, an
+    index on a later axis) raises rather than silently computing the wrong
+    thing. The MAX primitives are the ``_nd`` scatters and not the axis-based
+    ``F.scatter``/``F.scatter_add``, because those have no GPU kernel and
+    would insert a silent host round trip per call.
+    """
+    non_none = [(axis, idx) for axis, idx in enumerate(indices) if idx is not None]
+    if len(non_none) != 1 or non_none[0][0] != 0:
+        raise NotImplementedError(
+            "aten.index_put only supports a single index tensor on dim 0, got "
+            f"{[idx is not None for idx in indices]}"
+        )
+    index = non_none[0][1]
+    if index.dtype == DType.bool:
+        raise NotImplementedError(
+            "aten.index_put with a boolean mask is not supported yet (the "
+            "number of written elements is data dependent)"
+        )
+    if len(index.shape) != 1:
+        raise NotImplementedError(
+            f"aten.index_put needs a 1-D index tensor, got rank {len(index.shape)}"
+        )
+    # scatter_nd's updates carry the trailing (unindexed) axes of `input`:
+    # indices [rows, 1] pairs with updates [rows, *input.shape[1:]].
+    updates = F.broadcast_to(values, [index.shape[0]] + list(input.shape[1:]))
+    scatter = F.scatter_nd_add if accumulate else F.scatter_nd
+    return scatter(input, updates, F.unsqueeze(index, -1))
+
+
 # index_select(Tensor self, int dim, Tensor index) -> Tensor
+@map_to(aten.index_select)
+def aten_index_select(input: MaxTensor, dim: int, index: MaxTensor) -> MaxTensor:
+    """``F.gather`` is exactly index_select: numpy.take semantics, with the
+    indexed axis replaced by the (1-D) index's shape."""
+    return F.gather(input, index, axis=dim)
+
+
 # isinf(Tensor self) -> Tensor
 
 
@@ -3305,6 +3410,25 @@ def aten_scatter_value(
 
 
 # scatter_add(Tensor self, int dim, Tensor index, Tensor src) -> Tensor
+@map_to(aten.scatter_add)
+def aten_scatter_add(
+    input: MaxTensor, dim: int, index: MaxTensor, src: MaxTensor
+) -> MaxTensor:
+    """``out = input.clone(); out[i][index[i][j][k]][k] += src[i][j][k]`` for
+    ``dim=1``, etc. — the accumulating twin of ``aten_scatter_src``, and the
+    backward of ``aten_gather``.
+
+    Deliberately NOT `F.scatter_add`, whose semantics match but which has no
+    GPU kernel: its wrapper transfers input/updates/indices to the host and
+    the result back on every call. The `_nd` form keeps the GPU kernel in the
+    loop, at the cost of materializing the coordinate tensor `_dim_coords`
+    builds (shared with `aten_gather`).
+    """
+    coords = _dim_coords(input, dim, index)
+    rank = len(input.shape)
+    return F.scatter_nd_add(input, F.reshape(src, [-1]), F.reshape(coords, [-1, rank]))
+
+
 # scatter_reduce.two(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor
 
 

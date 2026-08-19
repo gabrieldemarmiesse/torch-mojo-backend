@@ -14,6 +14,7 @@
 # `_raw_dtype_int`.
 # ===----------------------------------------------------------------------=== #
 
+from std.atomic import Atomic, Ordering
 from std.os import abort
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.collections import InlineArray
@@ -22,6 +23,7 @@ from std.math import ceildiv
 from max.gpu.host import DeviceContext
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
+from std.sys import is_amd_gpu, is_nvidia_gpu
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
@@ -3113,6 +3115,307 @@ def _gather_rows_go(
 
 
 # ---------------------------------------------------------------------------
+# GatherDim: out[coord] = in[coord with coord[dim] := index[coord]], the read
+# mirror of ScatterDim below, over a rank-<=4 index space described by
+# explicit strides (padded to rank 4 with leading 0/1). Serves
+#   * aten::gather      -- dims = index.shape, real index strides
+#   * aten::index_select -- dims = out.shape, index strides 0 everywhere but
+#     `dim` (a 1-D index broadcast across the untouched coordinates), which is
+#     why one kernel covers both and no separate index_select body exists.
+# Element-size dispatch for the payload (a pure copy), int32/int64 for the
+# index. NEGATIVE INDICES ARE NOT WRAPPED and nothing is bounds checked, which
+# is torch's own contract for these two ops: CPU raises before launching,
+# CUDA's ScatterGatherKernel.cu only device-asserts, so a negative index is
+# undefined there too. (aten::index.Tensor / aten::index_put_ do wrap; those
+# route through GatherRows / a `remainder` on the index instead.)
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _gather_dim[
+    dtype: DType, idx_dtype: DType
+](
+    out_addr: Int,
+    in_addr: Int,
+    index_addr: Int,
+    d0: Int,
+    d1: Int,
+    d2: Int,
+    d3: Int,
+    os0: Int,
+    os1: Int,
+    os2: Int,
+    os3: Int,
+    ss0: Int,
+    ss1: Int,
+    ss2: Int,
+    ss3: Int,
+    xs0: Int,
+    xs1: Int,
+    xs2: Int,
+    xs3: Int,
+    dim_padded: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var in_ptr = _make_ptr[dtype](in_addr)
+    var index_ptr = _make_ptr[idx_dtype](index_addr)
+    var total = d0 * d1 * d2 * d3
+
+    @always_inline
+    @parameter
+    @__copy_capture(out_ptr, in_ptr, index_ptr)
+    def func[width: Int, alignment: Int = 1](coord: Coord):
+        var i = Int(coord[0].value())
+        var i3 = i % d3
+        var rest = i // d3
+        var i2 = rest % d2
+        rest = rest // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        var source = Int(index_ptr[i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3])
+        var in_off = i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
+        # Replace the coordinate along `dim_padded` with the gather source.
+        if dim_padded == 0:
+            in_off += (source - i0) * ss0
+        elif dim_padded == 1:
+            in_off += (source - i1) * ss1
+        elif dim_padded == 2:
+            in_off += (source - i2) * ss2
+        else:
+            in_off += (source - i3) * ss3
+        out_ptr[i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3] = in_ptr[in_off]
+
+    _parallel_for[func](total, ctx)
+
+
+@always_inline
+def _gather_dim_idx[
+    idx_dtype: DType
+](
+    out_addr: Int,
+    in_addr: Int,
+    index_addr: Int,
+    d0: Int,
+    d1: Int,
+    d2: Int,
+    d3: Int,
+    os0: Int,
+    os1: Int,
+    os2: Int,
+    os3: Int,
+    ss0: Int,
+    ss1: Int,
+    ss2: Int,
+    ss3: Int,
+    xs0: Int,
+    xs1: Int,
+    xs2: Int,
+    xs3: Int,
+    dim_padded: Int,
+    itemsize: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime if _dtype_arg_width_on[0, 32]():
+        if itemsize != 4:
+            raise Error("gather_dim specialization/itemsize mismatch")
+        _gather_dim[DType.uint32, idx_dtype](
+            out_addr,
+            in_addr,
+            index_addr,
+            d0,
+            d1,
+            d2,
+            d3,
+            os0,
+            os1,
+            os2,
+            os3,
+            ss0,
+            ss1,
+            ss2,
+            ss3,
+            xs0,
+            xs1,
+            xs2,
+            xs3,
+            dim_padded,
+            ctx,
+        )
+    elif _dtype_arg_width_on[0, 16]():
+        if itemsize != 2:
+            raise Error("gather_dim specialization/itemsize mismatch")
+        _gather_dim[DType.uint16, idx_dtype](
+            out_addr,
+            in_addr,
+            index_addr,
+            d0,
+            d1,
+            d2,
+            d3,
+            os0,
+            os1,
+            os2,
+            os3,
+            ss0,
+            ss1,
+            ss2,
+            ss3,
+            xs0,
+            xs1,
+            xs2,
+            xs3,
+            dim_padded,
+            ctx,
+        )
+    elif _dtype_arg_width_on[0, 64]():
+        if itemsize != 8:
+            raise Error("gather_dim specialization/itemsize mismatch")
+        _gather_dim[DType.uint64, idx_dtype](
+            out_addr,
+            in_addr,
+            index_addr,
+            d0,
+            d1,
+            d2,
+            d3,
+            os0,
+            os1,
+            os2,
+            os3,
+            ss0,
+            ss1,
+            ss2,
+            ss3,
+            xs0,
+            xs1,
+            xs2,
+            xs3,
+            dim_padded,
+            ctx,
+        )
+    elif _dtype_arg_width_on[0, 8]():
+        if itemsize != 1:
+            raise Error("gather_dim specialization/itemsize mismatch")
+        _gather_dim[DType.uint8, idx_dtype](
+            out_addr,
+            in_addr,
+            index_addr,
+            d0,
+            d1,
+            d2,
+            d3,
+            os0,
+            os1,
+            os2,
+            os3,
+            ss0,
+            ss1,
+            ss2,
+            ss3,
+            xs0,
+            xs1,
+            xs2,
+            xs3,
+            dim_padded,
+            ctx,
+        )
+    else:
+        raise Error("GatherDim: unsupported element size ", itemsize)
+
+
+def _gather_dim_go(
+    out_ptr: PyObjectPtr,
+    in_ptr: PyObjectPtr,
+    index_ptr: PyObjectPtr,
+    params: PyObjectPtr,  # (d0..d3, os0..os3, ss0..ss3, xs0..xs3, dim_padded)
+    idx_dtype_o: PyObjectPtr,
+    itemsize_o: PyObjectPtr,
+    ctx_ptr: PyObjectPtr,
+) raises:
+    var out_addr = _raw_int(out_ptr)
+    var in_addr = _raw_int(in_ptr)
+    var index_addr = _raw_int(index_ptr)
+    var d0 = _raw_tuple_int(params, 0)
+    var d1 = _raw_tuple_int(params, 1)
+    var d2 = _raw_tuple_int(params, 2)
+    var d3 = _raw_tuple_int(params, 3)
+    var os0 = _raw_tuple_int(params, 4)
+    var os1 = _raw_tuple_int(params, 5)
+    var os2 = _raw_tuple_int(params, 6)
+    var os3 = _raw_tuple_int(params, 7)
+    var ss0 = _raw_tuple_int(params, 8)
+    var ss1 = _raw_tuple_int(params, 9)
+    var ss2 = _raw_tuple_int(params, 10)
+    var ss3 = _raw_tuple_int(params, 11)
+    var xs0 = _raw_tuple_int(params, 12)
+    var xs1 = _raw_tuple_int(params, 13)
+    var xs2 = _raw_tuple_int(params, 14)
+    var xs3 = _raw_tuple_int(params, 15)
+    var dim_padded = _raw_tuple_int(params, 16)
+    var idx_dtype = _raw_dtype_int(idx_dtype_o)
+    var itemsize = _raw_int(itemsize_o)
+    var ctx = _raw_ctx(ctx_ptr)
+
+    comptime if _dtype_arg_on[1, DType.int64]():
+        if idx_dtype != DType.int64:
+            raise Error("gather_dim specialization/index dtype mismatch")
+        _gather_dim_idx[DType.int64](
+            out_addr,
+            in_addr,
+            index_addr,
+            d0,
+            d1,
+            d2,
+            d3,
+            os0,
+            os1,
+            os2,
+            os3,
+            ss0,
+            ss1,
+            ss2,
+            ss3,
+            xs0,
+            xs1,
+            xs2,
+            xs3,
+            dim_padded,
+            itemsize,
+            ctx,
+        )
+    elif _dtype_arg_on[1, DType.int32]():
+        if idx_dtype != DType.int32:
+            raise Error("gather_dim specialization/index dtype mismatch")
+        _gather_dim_idx[DType.int32](
+            out_addr,
+            in_addr,
+            index_addr,
+            d0,
+            d1,
+            d2,
+            d3,
+            os0,
+            os1,
+            os2,
+            os3,
+            ss0,
+            ss1,
+            ss2,
+            ss3,
+            xs0,
+            xs1,
+            xs2,
+            xs3,
+            dim_padded,
+            itemsize,
+            ctx,
+        )
+    else:
+        raise Error("GatherDim: unsupported index dtype ", idx_dtype)
+
+
+# ---------------------------------------------------------------------------
 # ScatterDim: out[coord with coord[dim] := index[coord]] = src[coord] (or a
 # scalar value). Implements aten::scatter.src / aten::scatter.value over a
 # rank-<=4 index space; `out` is a contiguous clone of self, `index` is
@@ -3255,6 +3558,187 @@ def _scatter_dim_go(
                 handled = True
     if not handled:
         raise Error("ScatterDim: unsupported dtype ", dtype)
+
+
+# ---------------------------------------------------------------------------
+# ScatterAddDim: out[coord with coord[dim] := index[coord]] += src[coord] over
+# the same rank-<=4 index space and stride convention as ScatterDim above,
+# reducing with a relaxed device-scope atomic add. Serves
+#   * aten::scatter_add   -- real index strides
+#   * aten::index_add     -- index strides 0 everywhere but `dim`
+#   * aten::index_put(accumulate=True) -- dim 0, index strides (1, 0, ...)
+# Which dtypes may be asked for is decided on the PYTHON side
+# (`_SCATTER_ADD_DTYPES` in aten_fast.py): `Atomic.fetch_add` has no lowering
+# for sub-32-bit integers on the GPU targets, so int8/int16/uint8/bool are
+# declined before a build is requested rather than reaching the compiler as an
+# unsatisfiable specialization.
+#
+# This is deliberately NOT ScatterDim parametrized on the reduction, which is
+# what it looks like it should be. Every way of writing that -- a
+# `comptime if` around the value/src branch, one inside each arm of it, an
+# `@always_inline` store helper called from both -- moved the REDUCE=0
+# assembly (2 to 4 of ScatterDim's 4 sm_90a kernels changed, +/-3 predicates
+# and +/-25 b64 registers), while a bare unused comptime parameter on
+# `_scatter_dim` changed nothing. Metaprogramming that rewrites the existing
+# kernel's code is not a refactor, so the reduction lives here instead. The
+# duplication is smaller than it looks: scatter_add has no scalar-value
+# overload, so this body has no `is_value` branch and no `value` argument.
+#
+# Match torch: no bounds checking, and the accumulation order of colliding
+# writes is unspecified -- torch's own CUDA scatter_add is atomic too
+# (ScatterGatherKernel.cu's ReduceAdd calls fastAtomicAdd), so neither
+# implementation is bitwise reproducible for float dtypes.
+# `torch.use_deterministic_algorithms(True)` is not honored: torch switches to
+# a sort-based reduction there and this does not.
+#
+# The deterministic alternative, if it is ever wanted: a scatter along `dim`
+# can only collide between entries that agree on every coordinate EXCEPT
+# `dim` (the index replaces that one coordinate and no other), so giving one
+# thread a whole `dim`-column and accumulating it serially is race-free with
+# no atomics at all, for every dtype and every backend. The catch is
+# parallelism -- the thread count becomes total/dims[dim], which is 64 threads
+# for a (65536, 64) index scattered along dim 0 -- so it would have to be a
+# second kernel chosen by a runtime dispatch, not a replacement for this one.
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _atomic_scope() -> StaticString:
+    # Device-scope atomics skip system-scope ordering cost on the discrete
+    # targets; every other accelerator keeps the portable default scope.
+    # (embedding_backward_kernels.mojo has an f32-only twin of this with an
+    # extra sm_90 `red.v4.f32` vector path; this one is scalar and generic over
+    # the dtype, so they are deliberately not shared.)
+    comptime if is_nvidia_gpu():
+        return "device"
+    elif is_amd_gpu():
+        return "agent"
+    else:
+        return ""
+
+
+@always_inline
+def _scatter_add_dim[
+    dtype: DType
+](
+    out_addr: Int,
+    index_addr: Int,
+    src_addr: Int,
+    d0: Int,
+    d1: Int,
+    d2: Int,
+    d3: Int,
+    os0: Int,
+    os1: Int,
+    os2: Int,
+    os3: Int,
+    ss0: Int,
+    ss1: Int,
+    ss2: Int,
+    ss3: Int,
+    xs0: Int,
+    xs1: Int,
+    xs2: Int,
+    xs3: Int,
+    dim_padded: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var index_ptr = _make_ptr[DType.int64](index_addr)
+    var src_ptr = _make_ptr[dtype](src_addr)
+    var total = d0 * d1 * d2 * d3
+
+    @always_inline
+    @parameter
+    @__copy_capture(out_ptr, index_ptr, src_ptr)
+    def func[width: Int, alignment: Int = 1](coord: Coord):
+        var i = Int(coord[0].value())
+        var i3 = i % d3
+        var rest = i // d3
+        var i2 = rest % d2
+        rest = rest // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        var target = Int(index_ptr[i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3])
+        var out_off = i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3
+        # Replace the coordinate along `dim_padded` with the scatter target.
+        if dim_padded == 0:
+            out_off += (target - i0) * os0
+        elif dim_padded == 1:
+            out_off += (target - i1) * os1
+        elif dim_padded == 2:
+            out_off += (target - i2) * os2
+        else:
+            out_off += (target - i3) * os3
+        # Relaxed ordering is enough: nothing else in the launch reads `out`.
+        _ = Atomic[dtype, scope=_atomic_scope()].fetch_add[
+            ordering=Ordering.RELAXED
+        ](out_ptr + out_off, src_ptr[i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3])
+
+    _parallel_for_dt[dtype, func](total, ctx)
+
+
+def _scatter_add_dim_go(
+    out_ptr: PyObjectPtr,
+    index_ptr: PyObjectPtr,
+    src_ptr: PyObjectPtr,
+    params: PyObjectPtr,  # (d0..d3, os0..os3, ss0..ss3, xs0..xs3, dim_padded)
+    dtype_o: PyObjectPtr,
+    ctx_ptr: PyObjectPtr,
+) raises:
+    var out_addr = _raw_int(out_ptr)
+    var index_addr = _raw_int(index_ptr)
+    var src_addr = _raw_int(src_ptr)
+    var d0 = _raw_tuple_int(params, 0)
+    var d1 = _raw_tuple_int(params, 1)
+    var d2 = _raw_tuple_int(params, 2)
+    var d3 = _raw_tuple_int(params, 3)
+    var os0 = _raw_tuple_int(params, 4)
+    var os1 = _raw_tuple_int(params, 5)
+    var os2 = _raw_tuple_int(params, 6)
+    var os3 = _raw_tuple_int(params, 7)
+    var ss0 = _raw_tuple_int(params, 8)
+    var ss1 = _raw_tuple_int(params, 9)
+    var ss2 = _raw_tuple_int(params, 10)
+    var ss3 = _raw_tuple_int(params, 11)
+    var xs0 = _raw_tuple_int(params, 12)
+    var xs1 = _raw_tuple_int(params, 13)
+    var xs2 = _raw_tuple_int(params, 14)
+    var xs3 = _raw_tuple_int(params, 15)
+    var dim_padded = _raw_tuple_int(params, 16)
+    var dtype = _raw_dtype_int(dtype_o)
+    var ctx = _raw_ctx(ctx_ptr)
+
+    var handled = False
+    comptime for dt in SCATTER_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                _scatter_add_dim[dt](
+                    out_addr,
+                    index_addr,
+                    src_addr,
+                    d0,
+                    d1,
+                    d2,
+                    d3,
+                    os0,
+                    os1,
+                    os2,
+                    os3,
+                    ss0,
+                    ss1,
+                    ss2,
+                    ss3,
+                    xs0,
+                    xs1,
+                    xs2,
+                    xs3,
+                    dim_padded,
+                    ctx,
+                )
+                handled = True
+    if not handled:
+        raise Error("ScatterAddDim: unsupported dtype ", dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -3412,6 +3896,27 @@ def _gather_rows_dispatcher(
     return _raw_ret_none()
 
 
+def _gather_dim_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _gather_dim_go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+        )
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
 def _scatter_dim_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -3428,6 +3933,21 @@ def _scatter_dim_dispatcher(
             args[5],
             args[6],
             args[7],
+        )
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
+def _scatter_add_dim_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _scatter_add_dim_go(
+            args[0], args[1], args[2], args[3], args[4], args[5]
         )
     except e:
         return _spec_unsupported(e)
@@ -3573,6 +4093,16 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
                     " int32/int64 idx)"
                 ),
             )
+        comptime if _op_on["GatherDim"]():
+            _register_call(
+                b,
+                _gather_dim_dispatcher,
+                docstring=(
+                    "out[coord] = in[coord with dim := index[coord]]"
+                    " (aten::gather / aten::index_select, rank <= 4;"
+                    " element-size + int32/int64 idx)"
+                ),
+            )
         comptime if _op_on["ScatterDim"]():
             _register_call(
                 b,
@@ -3580,6 +4110,16 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
                 docstring=(
                     "out[coord with dim := index[coord]] = src[coord] or value"
                     " (aten::scatter.src/value, rank <= 4; dtype dispatch)"
+                ),
+            )
+        comptime if _op_on["ScatterAddDim"]():
+            _register_call(
+                b,
+                _scatter_add_dim_dispatcher,
+                docstring=(
+                    "out[coord with dim := index[coord]] += src[coord] with"
+                    " relaxed atomics (aten::scatter_add / index_add /"
+                    " index_put accumulate, rank <= 4; dtype dispatch)"
                 ),
             )
         return b.finalize()
