@@ -9500,6 +9500,56 @@ _CONV_IGEMM_SHAPES = {
     "k7_pad3": (1, 64, 16, 16, 64, 7, 7, 3, 3),
 }
 
+# 2^-24, the fp32 machine epsilon: the GEMM's tile accumulation is fp32, so
+# this is the per-term rounding unit the accumulation-error bound below is
+# built from -- ported from conv_igemm_test.mojo's host-side correctness
+# harness, not re-derived here.
+_CI_EPS_F32 = 2.0**-24
+# 2^-8: one bf16 half-ulp, the max relative error of ONE correctly-rounded
+# fp64/fp32 -> bfloat16 cast.
+_CI_BF16_HALF_ULP = 2.0**-8
+
+
+def _conv_igemm_reference(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, ph: int, pw: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The fp64 ground truth, a PER-ELEMENT tolerance derived from the fp32
+    accumulation error bound (not a fixed slop), and the bit-exact target --
+    ported from conv_igemm_test.mojo, the kernel's own correctness harness.
+
+    Inputs are bf16 tensors, hence already exactly representable in bf16, so
+    the only error a correct kernel can introduce is (1) the fp32 tile
+    accumulation of the GEMM reduction and (2) the bf16 rounding(s) of the
+    output. The accumulation term is `4 * eps_f32 * sqrt(k_pad) * sum|a*b|`
+    (`k_pad` includes the C-padding to the kernel's 64-channel tile, since
+    the padded zero terms still cost accumulation steps); the 4x is the same
+    safety factor the Mojo harness uses. Bias goes through a SEPARATE kernel
+    (`BiasAddChan`) that reads the already-bf16-rounded GEMM output and
+    rounds again after the add, so a biased case pays a second independent
+    half-ulp term, not a bigger accumulation term, and its bit-exact target
+    is the double-rounded value the real pipeline computes, not
+    `round_bf16(gemm + bias)` directly (double rounding can legitimately
+    differ from single rounding even in exact arithmetic).
+    """
+    c, kh, kw = x.shape[1], weight.shape[2], weight.shape[3]
+    c_pad = ((c + 63) // 64) * 64
+    k_pad = kh * kw * c_pad
+    acc_coeff = 4.0 * _CI_EPS_F32 * math.sqrt(k_pad)
+
+    x64 = x.double()
+    w64 = weight.double()
+    acc_gemm = torch.nn.functional.conv2d(x64, w64, stride=1, padding=(ph, pw))
+    mag = torch.nn.functional.conv2d(x64.abs(), w64.abs(), stride=1, padding=(ph, pw))
+    tol = _CI_BF16_HALF_ULP * acc_gemm.abs() + acc_coeff * mag
+    want_bf16 = acc_gemm.to(torch.bfloat16)
+    if bias is None:
+        return acc_gemm, tol, want_bf16
+    b64 = bias.double().view(1, -1, 1, 1)
+    acc_true = acc_gemm + b64
+    tol = tol + _CI_BF16_HALF_ULP * acc_true.abs()
+    want_bf16 = (want_bf16.double() + b64).to(torch.bfloat16)
+    return acc_true, tol, want_bf16
+
 
 @pytest.mark.parametrize("shape_id", _CONV_IGEMM_SHAPES)
 @pytest.mark.parametrize("with_bias", [False, True])
@@ -9511,6 +9561,7 @@ def test_fast_conv2d_igemm_edge_shapes(
 ) -> None:
     """Every geometry the implicit-GEMM dispatch ACCEPTS, and a check that it
     really is the route that ran."""
+    torch.manual_seed(0)  # exact_frac below is a measured bound, not a tautology
     calls = _spy_defined_native_calls(
         monkeypatch, {("conv_igemm_ops.mojo", "ConvIgemm")}
     )
@@ -9527,20 +9578,33 @@ def test_fast_conv2d_igemm_edge_shapes(
         stride=1,
         padding=(ph, pw),
     ).cpu()
-    ref = torch.nn.functional.conv2d(
-        x.float(),
-        weight.float(),
-        None if bias is None else bias.float(),
-        stride=1,
-        padding=(ph, pw),
-    )
 
     target = ("conv_igemm_ops.mojo", "ConvIgemm")
     assert len(calls[target]) == 1, f"{shape_id} did not take the implicit-GEMM route"
-    # One fp32-accumulated reduction of up to k = 3136, rounded once to
-    # bfloat16 (2^-8 relative): the same calibration the gemm16 mm/bmm tests
-    # use for a bf16 output.
-    torch.testing.assert_close(dev.float(), ref, atol=8e-2, rtol=8e-2)
+    acc, tol, want_bf16 = _conv_igemm_reference(x, weight, bias, ph, pw)
+    got = dev.double()
+    err = (got - acc).abs()
+    bad = err > tol
+    assert not bad.any(), (
+        f"{shape_id} with_bias={with_bias}: {int(bad.sum())}/{bad.numel()} "
+        f"outputs exceed the fp32-accumulation-derived tolerance; worst "
+        f"error={err.max().item():.6g} at tol={tol.flatten()[err.argmax()].item():.6g}"
+    )
+    # fp32 accumulation noise should move at most a handful of outputs off
+    # their correctly-rounded bf16 code; an indexing or accumulation bug
+    # collapses this fraction instead of nudging it. conv_igemm_test.mojo's
+    # deterministic hash-filled inputs measure exactly 1.0 on an H100 and
+    # gate at 0.999; these tests use genuinely random inputs instead (no
+    # per-case tuning), and the deepest reductions here (k7_pad3, k_pad =
+    # 3136; mid_14x14_C256, k_pad = 2304) measure ~99.87% at seed 0 -- still
+    # two orders of magnitude away from anything an indexing or
+    # accumulation bug would produce. 0.99 keeps that margin without
+    # chasing the harness's input-specific figure.
+    exact_frac = (dev == want_bf16).double().mean().item()
+    assert exact_frac >= 0.99, (
+        f"{shape_id} with_bias={with_bias}: only {exact_frac:.4%} of outputs "
+        "are bit-exact against the double-rounded reference"
+    )
 
 
 @pytest.mark.parametrize(

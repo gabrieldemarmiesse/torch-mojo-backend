@@ -8683,21 +8683,20 @@ def _fast_aten_bmm_transpose_b(input, mat2):
 
 
 def _try_gemm16_conv_bmm(
-    w: TorchMojoTensor,
-    a: TorchMojoTensor,
-    col_ptr: int,
-    n: int,
-    out_c: int,
-    cols: int,
-    ckk: int,
+    w: TorchMojoTensor, col: TorchMojoTensor, n: int, out_c: int, cols: int, ckk: int
 ) -> TorchMojoTensor | None:
     """Dense conv GEMM (shared weight x per-sample im2col) via Bmm16, or
-    ``None``. ``w`` is the contiguous (out_c, ckk) weight; ``col_ptr`` is the
+    ``None``. ``w`` is the contiguous (out_c, ckk) weight; ``col`` OWNS the
     per-sample dense row-major (ckk, cols) im2col slice (or, for 1x1
-    stride-1 convs, the NCHW input reread in place)."""
+    stride-1 convs, ``col`` IS the input tensor, reread in place). ``col``
+    must be the actual owning tensor, not a bare pointer: under the default
+    kernel-call queue the launch this enqueues can be deferred behind a
+    still-compiling specialization, and the caller's last reference to the
+    buffer it points at can drop before that launch runs unless this frame's
+    keepalive tuple holds it too (queue rule 3, call_queue.py:18-26)."""
     if (
         w._dtype not in _GEMM16_DTYPES
-        or w._device != a._device
+        or w._device != col._device
         or w._device.label != "gpu"
         or w._device.api != "cuda"
         or w._device.architecture_name != "sm_90a"
@@ -8712,7 +8711,7 @@ def _try_gemm16_conv_bmm(
         (
             out._ptr,
             w._ptr,
-            col_ptr,
+            col._ptr,
             n,
             out_c,
             cols,
@@ -8727,31 +8726,27 @@ def _try_gemm16_conv_bmm(
         arg_dtypes=(w._dtype, w._dtype),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": False},
-        keepalive=(out, w),
+        keepalive=(out, w, col),
     )
     return out
 
 
 def _try_tf32_conv_bmm(
-    w: TorchMojoTensor,
-    a: TorchMojoTensor,
-    col_ptr: int,
-    n: int,
-    out_c: int,
-    cols: int,
-    ckk: int,
+    w: TorchMojoTensor, col: TorchMojoTensor, n: int, out_c: int, cols: int, ckk: int
 ) -> TorchMojoTensor | None:
     """Dense conv GEMM (shared weight x per-sample im2col) via the opt-in
     TF32 BMM, or ``None``. Same numerics policy as ``_try_tf32_bmm``: TF32 is
     off when the user asked for full FP32 (`torch.set_float32_matmul_precision
     ("highest")`) -- the repo has no separate `torch.backends.cudnn.
     allow_tf32`-style policy for convolution, so this follows the exact gate
-    the mm/bmm TF32 paths already use."""
+    the mm/bmm TF32 paths already use. ``col`` must be the tensor that OWNS
+    the im2col buffer (or the input tensor itself for a 1x1 conv), not a
+    bare pointer -- see ``_try_gemm16_conv_bmm``'s docstring for why."""
     if torch.get_float32_matmul_precision() == "highest":
         return None
     if (
         w._dtype != DType.float32
-        or w._device != a._device
+        or w._device != col._device
         or w._device.label != "gpu"
         or w._device.api != "cuda"
         or w._device.architecture_name != "sm_90a"
@@ -8766,7 +8761,7 @@ def _try_tf32_conv_bmm(
         (
             out._ptr,
             w._ptr,
-            col_ptr,
+            col._ptr,
             n,
             out_c,
             cols,
@@ -8781,7 +8776,7 @@ def _try_tf32_conv_bmm(
         arg_dtypes=(w._dtype, w._dtype),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": False},
-        keepalive=(out, w),
+        keepalive=(out, w, col),
     )
     return out
 
@@ -8941,6 +8936,7 @@ def fast_aten_convolution(
         and not transposed
         and (bias is None or bias_t is not None)
         and a._dtype == w._dtype
+        and a._device == w._device
         and a._dtype in _FLOAT_DTYPES
         and len(a._shape) == 4
         and len(w._shape) == 4
@@ -8958,7 +8954,9 @@ def fast_aten_convolution(
         out_w = (in_w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
         if c_per_group * groups == c and out_h > 0 and out_w > 0:
             if bias_t is not None and (
-                bias_t._dtype != a._dtype or tuple(bias_t._shape) != (out_c,)
+                bias_t._dtype != a._dtype
+                or bias_t._device != a._device
+                or tuple(bias_t._shape) != (out_c,)
             ):
                 return NOT_HANDLED
             ctx = _ctx_ptr(a._device)
@@ -8983,7 +8981,11 @@ def fast_aten_convolution(
             if out is None:
                 if (kh, kw, sh, sw, ph, pw, dh, dw) == (1, 1, 1, 1, 0, 0, 1, 1):
                     # 1x1 stride-1 conv: NCHW input already is the col matrix.
-                    col_ptr = a._ptr
+                    # `col` ALIASES `a` (no allocation) -- it is still the
+                    # tensor that must stay alive until every GEMM reading it
+                    # has launched, so it flows through exactly like the
+                    # materialized branch's freshly allocated `col` below.
+                    col = a
                 else:
                     col = _alloc((n, ckk, cols), a._dtype, a._device)
                     _call_mojo(
@@ -9015,7 +9017,6 @@ def fast_aten_convolution(
                         output_dtypes=(col._dtype,),
                         keepalive=(col, a),
                     )
-                    col_ptr = col._ptr
                 if groups == 1:
                     # H100 tensor cores first: bf16/f16 through the same Bmm16
                     # kernel fast_aten_bmm already builds, f32 through the same
@@ -9024,9 +9025,9 @@ def fast_aten_convolution(
                     # bridge sources missing, and the plain SIMT Bmm below is the
                     # fallback for every regime they decline, including grouped
                     # convs (untouched, handled in the `else` branch).
-                    out = _try_gemm16_conv_bmm(w, a, col_ptr, n, out_c, cols, ckk)
+                    out = _try_gemm16_conv_bmm(w, col, n, out_c, cols, ckk)
                     if out is None:
-                        out = _try_tf32_conv_bmm(w, a, col_ptr, n, out_c, cols, ckk)
+                        out = _try_tf32_conv_bmm(w, col, n, out_c, cols, ckk)
                     if out is None:
                         out = _alloc((n, out_c, cols), a._dtype, a._device)
                         _call_mojo(
@@ -9035,7 +9036,7 @@ def fast_aten_convolution(
                             (
                                 out._ptr,
                                 w._ptr,
-                                col_ptr,
+                                col._ptr,
                                 (n, out_c, cols, ckk, 0, 1),
                                 a._dtype.value,
                                 ctx,
@@ -9048,7 +9049,12 @@ def fast_aten_convolution(
                             # it here would only fork this call site onto a
                             # second .so of identical code.
                             flags={"TRANSPOSE_B": False},
-                            keepalive=(out, w),
+                            # `col` (the im2col buffer, or `a` itself for the
+                            # 1x1 fast path) owns the pointer this call names
+                            # and must outlive the deferred launch (kernel
+                            # queue rule 3, call_queue.py:18-26) -- it is not
+                            # implied by `w`/`out` alone.
+                            keepalive=(out, w, col),
                         )
                 else:
                     out = _alloc((n, out_c, cols), a._dtype, a._device)
@@ -9064,7 +9070,7 @@ def fast_aten_convolution(
                                 (
                                     out._ptr,
                                     w._ptr,
-                                    col_ptr,
+                                    col._ptr,
                                     (
                                         oc_g,
                                         cols,
@@ -9080,7 +9086,10 @@ def fast_aten_convolution(
                                 arg_dtypes=(w._dtype, a._dtype),
                                 output_dtypes=(out._dtype,),
                                 flags={"TRANSPOSE_B": False},
-                                keepalive=(out, w),
+                                # Same rationale as the dense-path Bmm call
+                                # above: `col` owns the pointer this call
+                                # names.
+                                keepalive=(out, w, col),
                             )
             if bias_t is not None:
                 _call_mojo(
