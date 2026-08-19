@@ -8033,6 +8033,154 @@ def _gemm16_alignment_favors_split(a, b, *, transpose_b: bool = False) -> bool:
     return m % 64 == 0 and n % 64 == 0 and k % 64 == 0
 
 
+def _gemm16_splitk_bias_certain(a, b, bias, *, transpose_b: bool = False) -> bool:
+    """Stricter pre-check: is gemm16's split-K route CERTAIN to engage (with
+    its fused bias epilogue), for every sm_90a device this family targets?
+
+    Unlike ``_gemm16_alignment_favors_split`` above (a "might reach some
+    tensor-core route" heuristic, safe to be wrong about in either
+    direction), this one must never be True when split-K would actually
+    decline: the split-K reduce kernel is the only gemm16 route whose
+    epilogue fuses a bias add (see ``_v4_tn_splitk_reduce`` in
+    gemm16_tn_v4_kernels.mojo); every other v3/v4 tensor-core route still
+    declines outright on a bias. So a False positive here would call
+    ``_try_gemm16_mm`` with a bias, split-K would correctly decline, and the
+    non-split routes would *also* decline (unchanged), dropping the call
+    all the way to the slow "accepted" mma.sync kernel -- the exact
+    regression PR #388 fixed by composing mm + a separate add instead. A
+    False negative just keeps today's compose behavior: safe, only costs
+    the one extra elementwise-add launch.
+
+    Split-K needs `m % 128 == 0`, `n % 256 == 0`, `k % 64 == 0` (BM/BN/BK of
+    the only tile the split-K kernels come in) and, at runtime,
+    `sm_count // tiles >= 2` where `tiles = (m/128)*(n/256)`. Python has no
+    portable way to read the device's SM count (this backend must run with
+    a CPU-only PyTorch install; see AGENTS.md), so this bounds `tiles`
+    instead: every shipped sm_90a part this family gates to (H100 PCIe/SXM,
+    H800, H200) carries at least 114 SMs, so `tiles <= 32` guarantees
+    `sm_count // tiles >= 3`, clear of the `>= 2` floor with margin to
+    spare. Also requires `k // 64 >= 32` so the depth floor
+    (`_V4_MIN_CHUNK_TILES = 16`) leaves room for >= 2 splits. Both bounds
+    are deliberately conservative, not tight: a shape just outside them
+    might still reach split-K, but this function only needs to be right
+    when it says True.
+
+    ``bias`` must also be checked: ``_v4_tn_splitk_reduce`` reads it through
+    a 4-wide vector load (``bias.load[width=4, ...]``), and the host-side
+    dispatcher this predicate mirrors -- ``try_enqueue_gemm16_gemm_splitk_rm_v4``
+    in gemm16_tn_v4_kernels.mojo, along with its TT sibling -- declines
+    outright with `Int(bias) % 16 != 0`. Without this check, a bias that is
+    an offset view with an odd element offset (so its runtime pointer is
+    16-byte-misaligned even though its shape/dtype look fine) made this
+    predicate say True while split-K actually declined underneath it,
+    silently dropping the call to the slow accepted kernel -- reproduced on
+    H100 at m=128, n=256, k=8192 with such a bias.
+    """
+    lhs = _t(a)
+    rhs = _t(b)
+    bias_tensor = _t(bias)
+    if (
+        lhs is None
+        or rhs is None
+        or bias_tensor is None
+        or len(lhs._shape) != 2
+        or len(rhs._shape) != 2
+    ):
+        return False
+    m, k = lhs._shape
+    rhs_k = rhs._shape[1] if transpose_b else rhs._shape[0]
+    n = rhs._shape[0] if transpose_b else rhs._shape[1]
+    if rhs_k != k:
+        return False
+    if m % 128 != 0 or n % 256 != 0 or k % 64 != 0:
+        return False
+    tiles = (m // 128) * (n // 256)
+    if not (0 < tiles <= 32 and k // 64 >= 32):
+        return False
+    # Checked last: every branch above is a cheap shape/metadata comparison,
+    # while this dereferences the bias tensor's actual runtime pointer --
+    # no need to pay for it on a shape split-K was already going to decline.
+    return bias_tensor._ptr % 16 == 0
+
+
+def _gemm16_persistent_bias_certain(a, b, bias, *, transpose_b: bool = False) -> bool:
+    """Third pre-check: is the persistent 128x256 kernel's fused-bias
+    epilogue (gemm16_nn_v4_kernels.mojo, deep-K wave-fill engagement)
+    CERTAIN to engage?
+
+    The deep-K wave-fill engagement extended the persistent kernel's
+    epilogue to fuse an (n,)-row-vector bias add for the NN (dgrad) and TN
+    (wgrad) layouts only -- NT's persistent kernel
+    (gemm16_nt_v4_kernels.mojo) and every TT route are untouched. Unlike
+    ``_gemm16_alignment_favors_split``/``_gemm16_splitk_bias_certain``
+    above, this one DOES need to know which operand is physically
+    transposed (NN vs TN vs NT vs TT are different kernels here, not just
+    different strides into the same one), so it inspects
+    ``_tf32_dense_2d_layout`` directly and combines it with the caller's
+    ``transpose_b`` exactly the way ``_try_gemm16_mm`` does
+    (``rhs_layout ^ transpose_b``), instead of working from logical shape
+    alone. Must never be True when the persistent kernel would actually
+    decline bias -- same false-positive/false-negative asymmetry as
+    ``_gemm16_splitk_bias_certain`` above: a wrong True drops the call all
+    the way to the slow accepted mma.sync kernel; a wrong False just costs
+    one extra elementwise-add launch.
+
+    Bounds, deliberately conservative: ``m, n >= 2048`` and both multiples
+    of 256 (so the persistent kernel's own multi-wave gate,
+    ``total_works * 8 < sm_count``, is false on every sm_90a part this
+    family targets -- 2048x2048 alone is 64 macro-tiles, 512 "small-tile"
+    equivalents, far past any real SM count) and ``k % 64 == 0``. A shape
+    just outside these might still reach the persistent kernel (e.g. via
+    the 2-wave direct-192 route, which has no bias epilogue and is
+    correctly excluded here), but this function only needs to be right
+    when it says True.
+
+    ``bias`` is taken for the same reason ``_gemm16_splitk_bias_certain``
+    now takes it -- so both predicates share one call-site shape -- but the
+    condition it is checked against is NOT the same. The persistent body's
+    fused-bias epilogue (``_v4_nn_persistent_ws`` in gemm16_nn_v4_kernels.mojo)
+    reads bias through two scalar element loads per pair
+    (``bias[n0 + col]``, ``bias[n0 + col + 1]``), not the reduce kernel's
+    4-wide vector load; its host dispatchers
+    (``maybe_enqueue_gemm16_nn_v4``, ``maybe_enqueue_gemm16_tn_v4_persistent``)
+    correspondingly never gate on `Int(bias) % 16`, only on `a`/`b`/`output`
+    (the TMA-descriptor operands). A bf16/f16 tensor's runtime pointer is
+    always 2-byte aligned regardless of its element offset, which is all a
+    scalar load needs, so there is no bias alignment condition to mirror
+    here -- checking one anyway would be a spurious False (safe, but an
+    unnecessary bias-composition fallback) for a bias this route can
+    actually consume just fine. Only require that ``bias`` resolves to a
+    real tensor, so a caller that fails to pass one gets a clean decline
+    instead of an attribute error.
+    """
+    lhs = _t(a)
+    rhs = _t(b)
+    bias_tensor = _t(bias)
+    if (
+        lhs is None
+        or rhs is None
+        or bias_tensor is None
+        or len(lhs._shape) != 2
+        or len(rhs._shape) != 2
+    ):
+        return False
+    lhs_layout = _tf32_dense_2d_layout(lhs)
+    rhs_layout = _tf32_dense_2d_layout(rhs)
+    if lhs_layout is None or rhs_layout is None:
+        return False
+    # NN (both row-major) or TN (A transposed, B row-major) only -- NT and
+    # TT (effective B transpose True) are excluded. Mirrors _try_gemm16_mm's
+    # own `int(rhs_layout) ^ int(bool(transpose_b))` exactly.
+    if rhs_layout ^ bool(transpose_b):
+        return False
+    m, k = lhs._shape
+    rhs_k = rhs._shape[1] if transpose_b else rhs._shape[0]
+    n = rhs._shape[0] if transpose_b else rhs._shape[1]
+    if rhs_k != k:
+        return False
+    return m >= 2048 and n >= 2048 and m % 256 == 0 and n % 256 == 0 and k % 64 == 0
+
+
 def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     """Enqueue the dense H100 16-bit tensor-core GEMM, or return ``None``.
 
@@ -8328,15 +8476,22 @@ def _try_tf32_bmm(a, b, *, transpose_b=False):
 def _try_gemm16_linear(input, weight, bias=None):
     """Route a dense rank >= 2 16-bit projection through GEMM without copies.
 
-    Every gemm16 tensor-core route (the v3/v4 warp-specialized, TMA, and
-    split-K kernels in gemm16_v3_kernels.mojo) declines outright whenever a
-    bias is present, so a fused-bias call here would silently fall back to
-    the far slower "accepted" mma.sync kernel -- measured 3.6-7.4x slower
-    than stock PyTorch on deep-K shapes, versus ~1.3x for the identical
-    unbiased mm.  Compute the bias-free mm on the fast path instead and add
-    the bias afterward with the existing broadcasting elementwise add: the
-    same mm-then-add composition `aten_addmm` already uses for the
-    torch.compile backend, and microseconds next to the GEMM itself.
+    Every gemm16 tensor-core route except split-K (the v3/v4 warp-specialized
+    and TMA kernels in gemm16_v3_kernels.mojo) declines outright whenever a
+    bias is present, so a fused-bias call that lands on one of those would
+    silently fall back to the far slower "accepted" mma.sync kernel --
+    measured 3.6-7.4x slower than stock PyTorch on deep-K shapes, versus
+    ~1.3x for the identical unbiased mm. Split-K itself now fuses the bias
+    add into its reduce kernel's epilogue (gemm16_tn_v4_kernels.mojo,
+    `_v4_tn_splitk_reduce`), so for the deep-K, few-output-tile regime it
+    engages (`_gemm16_splitk_bias_certain`), the fused call is tried FIRST:
+    it is at worst identical to composing and, when split-K fires, saves
+    the whole second elementwise-add launch and its extra read/write of the
+    output. Everywhere else, compute the bias-free mm on the fast path
+    instead and add the bias afterward with the existing broadcasting
+    elementwise add: the same mm-then-add composition `aten_addmm` already
+    uses for the torch.compile backend, and microseconds next to the GEMM
+    itself.
     """
     a = _t(input)
     w = _t(weight)
@@ -8365,6 +8520,12 @@ def _try_gemm16_linear(input, weight, bias=None):
         return _try_gemm16_mm(
             matrix, weight, transpose_b=True, output_shape=output_shape
         )
+    if _gemm16_splitk_bias_certain(matrix, weight, bias, transpose_b=True):
+        out = _try_gemm16_mm(
+            matrix, weight, bias, transpose_b=True, output_shape=output_shape
+        )
+        if out is not None:
+            return out
     if _gemm16_alignment_favors_split(matrix, weight, transpose_b=True):
         mm_out = _try_gemm16_mm(
             matrix, weight, transpose_b=True, output_shape=output_shape
@@ -8434,13 +8595,29 @@ def fast_aten_mm(x, y):
 def fast_aten_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0):
     # beta/alpha scaling isn't implemented by the fast path (falls through).
     if beta == 1 and alpha == 1:
-        # See _try_gemm16_linear: every gemm16 tensor-core route declines
-        # outright whenever a bias is present, so calling it WITH the bias
-        # would silently fall back to the much slower "accepted" mma.sync
-        # kernel.  When the shape could plausibly reach a fast route (see
+        # See _try_gemm16_linear: every gemm16 tensor-core route except
+        # split-K and (as of the deep-K wave-fill engagement) the
+        # persistent 128x256 NN/TN kernel declines outright whenever a
+        # bias is present, so calling it WITH the bias would silently fall
+        # back to the much slower "accepted" mma.sync kernel. Split-K and
+        # the persistent kernel both fuse the bias add into their own
+        # epilogue, so when the shape is certain to reach one of them (see
+        # _gemm16_splitk_bias_certain / _gemm16_persistent_bias_certain),
+        # try the fused call first: no worse than composing, and it skips
+        # the second elementwise-add launch whenever either fires -- this
+        # is what recovers well-filled NN/TN addmm from paying for a
+        # separate binary_rowvec_add kernel (e.g. 4096x4096x4096: measured
+        # 1.178x stock -> ~1.08x). For every other shape that could
+        # plausibly reach some other fast route (see
         # _gemm16_alignment_favors_split), compute the bias-free mm on the
         # fast path and add the bias with the existing broadcasting
         # elementwise add instead.
+        if _gemm16_splitk_bias_certain(
+            mat1, mat2, input
+        ) or _gemm16_persistent_bias_certain(mat1, mat2, input):
+            out = _try_gemm16_mm(mat1, mat2, input)
+            if out is not None:
+                return out
         if _gemm16_alignment_favors_split(mat1, mat2):
             mm_out = _try_gemm16_mm(mat1, mat2)
             if mm_out is not None:
