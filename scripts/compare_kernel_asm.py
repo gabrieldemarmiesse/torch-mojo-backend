@@ -367,12 +367,32 @@ def plan_module(
     return ModulePlan(stem, modules, merged, variants, notes)
 
 
-def collect(out_dir: Path) -> dict[str, str]:
-    """Map each kernel's hash-stripped name to its hash-masked assembly."""
-    kernels = {}
+def collect(out_dir: Path) -> dict[str, list[str]]:
+    """Map each kernel's hash-stripped name to every hash-masked assembly
+    sharing that name.
+
+    A stripped name is not unique within one build: several comptime
+    instantiations of one generically-named function (different tile sizes,
+    stage counts, or in this repo's case different `col_a`/`kmaj_b` layout
+    parameters sharing one base symbol) can all reduce to the same name once
+    HASH_RE removes the part of the mangled symbol that told them apart.
+    Keying a plain `dict[str, str]` on that name overwrote every instantiation
+    but the last one `sorted(out_dir.iterdir())` produced -- which one
+    survived depended on mangling-hash sort order, not on anything meaningful
+    -- and then compared whichever survivor "before" happened to keep against
+    whichever survivor "after" happened to keep, which need not be the same
+    instantiation. That produced false "changed" reports on any module with
+    more than one instantiation per base name (confirmed on this repo's bmm
+    module: 10 false changes with the dict, 0 with the multiset below).
+    Collecting every instantiation into a list, compared as a multiset by the
+    caller (order-independent: sort before comparing), fixes this without
+    losing the hash-masking that makes an unrelated rename compare equal.
+    """
+    kernels: dict[str, list[str]] = {}
     for path in sorted(out_dir.iterdir()):
         if path.suffix in SIDECAR_SUFFIXES:
-            kernels[HASH_RE.sub("", path.stem)] = HASH_RE.sub("_HASH", path.read_text())
+            name = HASH_RE.sub("", path.stem)
+            kernels.setdefault(name, []).append(HASH_RE.sub("_HASH", path.read_text()))
     return kernels
 
 
@@ -543,7 +563,7 @@ def build_plans(args: argparse.Namespace) -> list[ModulePlan]:
 
 def build_both_sides(
     args: argparse.Namespace, trees: dict[str, Path], plan: ModulePlan, variant: Variant
-) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+) -> tuple[dict[str, dict[str, list[str]]], dict[str, str]]:
     """Build one specialization on every side it exists, and read its kernels.
 
     Both sides are built one after the other **into the same directory**, which
@@ -558,7 +578,7 @@ def build_both_sides(
     miss; the sidecars are read into memory and the directory is emptied between
     sides so nothing of the first side can be mistaken for the second's.
     """
-    kernels: dict[str, dict[str, str]] = {}
+    kernels: dict[str, dict[str, list[str]]] = {}
     errors: dict[str, str] = {}
     out_dir = args.work_dir / plan.stem / variant.label
     for side in plan.modules:
@@ -598,11 +618,13 @@ def build_both_sides(
 
 def run_builds(
     args: argparse.Namespace, plans: list[ModulePlan]
-) -> tuple[dict[tuple[str, str, str], dict[str, str]], dict[tuple[str, str, str], str]]:
+) -> tuple[
+    dict[tuple[str, str, str], dict[str, list[str]]], dict[tuple[str, str, str], str]
+]:
     """Build every (module, variant) in parallel; return kernels and errors."""
     trees = {"before": args.before, "after": args.after}
     jobs = [(plan, variant) for plan in plans for variant in plan.variants]
-    kernels: dict[tuple[str, str, str], dict[str, str]] = {}
+    kernels: dict[tuple[str, str, str], dict[str, list[str]]] = {}
     errors: dict[tuple[str, str, str], str] = {}
     lock = threading.Lock()
     done = 0
@@ -618,7 +640,12 @@ def run_builds(
             for side, error in failures.items():
                 errors[(side, plan.stem, variant.label)] = error
             if not args.quiet:
-                counts = [f"{side} {len(found)}" for side, found in built.items()]
+                # Total sidecar count, not the number of distinct names: a
+                # name can carry more than one instantiation (see collect()).
+                counts = [
+                    f"{side} {sum(len(asms) for asms in found.values())}"
+                    for side, found in built.items()
+                ]
                 counts += [f"{side} FAILED" for side in failures]
                 print(
                     f"[{done:>4}/{len(jobs)}] {plan.stem}/{variant.label}"
@@ -700,29 +727,62 @@ def main() -> int:
                 continue
             before = sides.get("before", {})
             after = sides.get("after", {})
-            counts["kernels"] += len(after)
-            total_kernels += len(before) + len(after)
+            # File counts (total sidecars), not name counts: a name can carry
+            # more than one instantiation (see collect()), and every other
+            # count below is a file count too, so these stay comparable.
+            after_count = sum(len(asms) for asms in after.values())
+            before_count = sum(len(asms) for asms in before.values())
+            counts["kernels"] += after_count
+            total_kernels += before_count + after_count
             if not before and not after:
                 empty.append(f"{plan.stem}/{variant.label}")
                 continue
             if "before" not in sides or "after" not in sides:
                 # Added or removed module: every kernel of it is new or gone.
-                counts["added"] += len(after)
-                counts["removed"] += len(before)
+                counts["added"] += after_count
+                counts["removed"] += before_count
                 continue
+            # Multiset compare per name: sort each side's instantiations so
+            # order (which depends on mangling-hash sort order, not on
+            # anything meaningful) cannot make an unchanged set of bodies
+            # read as different.
             changed = sorted(
                 name
                 for name in before.keys() & after.keys()
-                if before[name] != after[name]
+                if sorted(before[name]) != sorted(after[name])
             )
-            counts["changed"] += len(changed)
-            counts["added"] += len(after.keys() - before.keys())
-            counts["removed"] += len(before.keys() - after.keys())
+            # Weight a changed name by the larger side's instantiation count,
+            # so a name whose instantiation count itself changed (an
+            # instantiation added or dropped under an existing name) is not
+            # under-counted relative to added/removed's own file counts.
+            counts["changed"] += sum(
+                max(len(before[name]), len(after[name])) for name in changed
+            )
+            counts["added"] += sum(
+                len(after[name]) for name in after.keys() - before.keys()
+            )
+            counts["removed"] += sum(
+                len(before[name]) for name in before.keys() - after.keys()
+            )
             changed_names += [f"{variant.label}/{name}" for name in changed]
             for name in changed if args.show_diff else []:
-                print_diff(
-                    f"{plan.stem}/{variant.label}/{name}", before[name], after[name]
-                )
+                before_asms, after_asms = sorted(before[name]), sorted(after[name])
+                if len(before_asms) != len(after_asms):
+                    print(
+                        f"\n{plan.stem}/{variant.label}/{name}: instantiation "
+                        f"count {len(before_asms)} -> {len(after_asms)} "
+                        "(before/after; sorted bodies below are paired by "
+                        "position up to the shorter side only)"
+                    )
+                for index, (one_before, one_after) in enumerate(
+                    zip(before_asms, after_asms)
+                ):
+                    if one_before != one_after:
+                        print_diff(
+                            f"{plan.stem}/{variant.label}/{name}[{index}]",
+                            one_before,
+                            one_after,
+                        )
 
         total_changed += counts["changed"] + counts["added"] + counts["removed"]
         if broken:
