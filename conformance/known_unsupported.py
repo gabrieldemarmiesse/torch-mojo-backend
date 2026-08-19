@@ -222,7 +222,14 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "isin": ("float32", "bfloat16", "float16"),
     "isneginf": ("float32", "bfloat16", "float16", "int64", "bool"),
     "isposinf": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "kthvalue": ("float32", "bfloat16", "float16", "int64"),
+    # float32/float16: OpInfo includes a 0-d input, which the reused
+    # sort/topk kernel this op composes on top of doesn't accept.
+    # bfloat16/int64: real, not-implementable-away tie-index disagreement
+    # against ATen's own introselect tie order on inputs with duplicate
+    # values (bfloat16's narrow range and int64's small-integer OpInfo
+    # samples both hit real ties) -- same accepted-disagreement class as
+    # "sort"/"topk" below, whose own kernel this op reuses.
+    "kthvalue": ("float32", "float16", "bfloat16", "int64"),
     "lcm": ("int64",),
     "ldexp": ("float32", "int64", "bool"),
     "lerp": ("float32", "bfloat16", "float16"),
@@ -614,6 +621,14 @@ _ERRORS_MATCH: dict[str, tuple[str, ...]] = {
     "index_select": ("float32",),
     "isclose": ("float32",),
     "item": ("float32",),
+    # A 0-d input + an out-of-range k + out= together: this backend's
+    # kthvalue.values raises the matching RuntimeError, but something in
+    # how OpInfo's error_inputs invokes the out= overload for this specific
+    # sample never lets it propagate as a raise the harness observes --
+    # confirmed the same call raises correctly called directly
+    # (torch.kthvalue(x, k, out=(values, indices))). Every other kthvalue
+    # error-input sample (dim out of range, empty reduction dim, k out of
+    # range on an ordinary tensor) passes.
     "kthvalue": ("float32",),
     "linalg_cross": ("float32",),
     "linalg_diagonal": ("float32",),

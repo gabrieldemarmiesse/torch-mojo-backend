@@ -1,4 +1,4 @@
-"""Per-dim value+index ops: min.dim, sort and topk.
+"""Per-dim value+index ops: min.dim, sort, topk, kthvalue and median.dim.
 
 All of them return a `(values, indices)` pair, which `_register_out`
 cannot serve (it wraps single-tensor functionals), so each functional
@@ -165,6 +165,75 @@ def mojo_device_topk_values(
     `torch.topk` call through."""
     return _write_pair(
         _topk_result("aten::topk.values", input, k, dim, largest, sorted),
+        values,
+        indices,
+    )
+
+
+def _kthvalue_result(
+    op_name: str, input: TorchMojoTensor, k: int, dim: int, keepdim: bool
+) -> tuple[TorchMojoTensor, TorchMojoTensor]:
+    aten_fast = _fast()
+    result = aten_fast.fast_aten_kthvalue(input, k, dim, keepdim)
+    if result is aten_fast.NOT_HANDLED:
+        raise _unsupported(op_name, (input,))
+    return result
+
+
+def _median_dim_result(
+    op_name: str, input: TorchMojoTensor, dim: int, keepdim: bool
+) -> tuple[TorchMojoTensor, TorchMojoTensor]:
+    aten_fast = _fast()
+    result = aten_fast.fast_aten_median_dim(input, dim, keepdim)
+    if result is aten_fast.NOT_HANDLED:
+        raise _unsupported(op_name, (input,))
+    return result
+
+
+def mojo_device_kthvalue(
+    input: TorchMojoTensor, k: int, dim: int = -1, keepdim: bool = False
+) -> tuple[TorchMojoTensor, TorchMojoTensor]:
+    """Functional torch.kthvalue: (values, indices) along `dim`."""
+    return _kthvalue_result("aten::kthvalue", input, k, dim, keepdim)
+
+
+def mojo_device_kthvalue_values(
+    input: TorchMojoTensor,
+    k: int,
+    dim: int = -1,
+    keepdim: bool = False,
+    values: TorchMojoTensor | None = None,
+    indices: TorchMojoTensor | None = None,
+) -> tuple[TorchMojoTensor | None, TorchMojoTensor | None]:
+    """Structured-kernel dispatch target for `torch.kthvalue(...)` -- the
+    overload torch actually routes an ordinary (no explicit out=) call
+    through, and also the explicit out= overload."""
+    return _write_pair(
+        _kthvalue_result("aten::kthvalue.values", input, k, dim, keepdim),
+        values,
+        indices,
+    )
+
+
+def mojo_device_median_dim(
+    input: TorchMojoTensor, dim: int, keepdim: bool = False
+) -> tuple[TorchMojoTensor, TorchMojoTensor]:
+    """Functional torch.median(x, dim): (values, indices)."""
+    return _median_dim_result("aten::median.dim", input, dim, keepdim)
+
+
+def mojo_device_median_dim_values(
+    input: TorchMojoTensor,
+    dim: int,
+    keepdim: bool = False,
+    values: TorchMojoTensor | None = None,
+    indices: TorchMojoTensor | None = None,
+) -> tuple[TorchMojoTensor | None, TorchMojoTensor | None]:
+    """Structured-kernel dispatch target for `torch.median(x, dim=...)` --
+    the overload torch actually routes an ordinary call through, and also
+    the explicit out= overload."""
+    return _write_pair(
+        _median_dim_result("aten::median.dim_values", input, dim, keepdim),
         values,
         indices,
     )

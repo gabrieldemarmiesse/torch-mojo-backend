@@ -3061,6 +3061,218 @@ def test_aten_topk_and_sort_compile_backend(call_checker: CallChecker) -> None:
     check_outputs(fn, Conf("cpu", True), [_distinct((4, 9), torch.float32)])
 
 
+# ---------------------------------------------------------------------------
+# median.dim / kthvalue.  Both are a k-th order statistic along one dim, so
+# both reuse #416's sort/topk kernel (the k smallest values, ascending, kept
+# to the last one) rather than a new kernel. Ties are only guaranteed to
+# match ATen's VALUE, not necessarily its (unspecified, introselect-derived)
+# tie index -- the same accepted disagreement class already documented for
+# sort/topk itself -- so every case below except the dedicated NaN ones uses
+# tie-free values.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize("dim", [0, 1, -1])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.int32]
+)
+def test_aten_median_dim(
+    mojo_device: str,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    dim: int,
+    keepdim: bool,
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_median_dim)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.median.dim(x, dim, keepdim)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((4, 5), dtype)])
+
+
+@pytest.mark.parametrize("size", [1, 2, 5, 8])
+def test_aten_median_dim_odd_and_even_sizes(
+    mojo_device: str, call_checker: CallChecker, size: int
+) -> None:
+    """The lower-of-two-middle rule only shows up at even sizes; size 1 is
+    the degenerate single-element case."""
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_median_dim)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.median.dim(x, -1, False)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((3, size), torch.float32)])
+
+
+def test_aten_median_dim_propagates_nan(mojo_device: str) -> None:
+    """ATen's real median.dim quirk: ANY NaN in the row forces the whole
+    result to (nan, index of the FIRST nan) -- not merely whatever value the
+    order-statistic position would naively land on. Compared manually
+    (`equal_nan=True`) since `check_outputs` doesn't expose that."""
+    register_mojo_devices()
+    x = torch.tensor([[5.0, float("nan"), 1.0, 2.0], [1.0, 2.0, 3.0, 4.0]])
+    expected = torch.median(x, dim=1)
+
+    eager = torch.median(x.to(mojo_device), dim=1)
+    torch.testing.assert_close(eager.values.cpu(), expected.values, equal_nan=True)
+    assert torch.equal(eager.indices.cpu(), expected.indices)
+
+    def fn(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.median.dim(t, 1, False)
+
+    compiled = torch.compile(fn, backend=mojo_backend)(x.to(mojo_device))
+    torch.testing.assert_close(compiled[0].cpu(), expected.values, equal_nan=True)
+    assert torch.equal(compiled[1].cpu(), expected.indices)
+
+
+def test_aten_median_dim_errors(mojo_device: str) -> None:
+    register_mojo_devices()
+    x = torch.randn(3, 4).to(mojo_device)
+    with pytest.raises(IndexError, match="Dimension out of range"):
+        torch.median(x, dim=5)
+    with pytest.raises(IndexError, match="non-zero size"):
+        torch.median(torch.randn(3, 0).to(mojo_device), dim=1)
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize("k", [1, 2, 5])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.int32]
+)
+def test_aten_kthvalue(
+    mojo_device: str,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    k: int,
+    keepdim: bool,
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_kthvalue)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.kthvalue(x, k, -1, keepdim)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((3, 5), dtype)])
+
+
+def test_aten_kthvalue_non_last_dim(
+    mojo_device: str, call_checker: CallChecker
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_kthvalue)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return aten.kthvalue(x, 2, 0, False)
+
+    check_outputs(fn, Conf(mojo_device, False), [_distinct((5, 4, 3), torch.float32)])
+
+
+def test_aten_kthvalue_with_nan_matches_stable_sort_order(mojo_device: str) -> None:
+    """kthvalue has no median-style NaN special case: a NaN just sorts as
+    the largest value, like everywhere else in this kernel family, so it
+    matches ATen's own kthvalue exactly here (verified against CPU torch,
+    including the index -- there is no tie to break with a single NaN)."""
+    register_mojo_devices()
+    x = torch.tensor([1.0, float("nan"), 3.0])
+    expected = torch.kthvalue(x, 3, dim=0)
+    got = torch.kthvalue(x.to(mojo_device), 3, dim=0)
+    torch.testing.assert_close(got.values.cpu(), expected.values, equal_nan=True)
+    assert torch.equal(got.indices.cpu(), expected.indices)
+
+
+def test_aten_kthvalue_errors(mojo_device: str) -> None:
+    register_mojo_devices()
+    x = torch.randn(3, 4).to(mojo_device)
+    with pytest.raises(RuntimeError, match="selected number k out of range"):
+        torch.kthvalue(x, 5, dim=1)
+    with pytest.raises(IndexError, match="Dimension out of range"):
+        torch.kthvalue(x, 1, dim=5)
+    with pytest.raises(IndexError, match="non-zero size"):
+        torch.kthvalue(torch.randn(3, 0).to(mojo_device), 1, dim=1)
+
+
+def test_aten_median_and_kthvalue_compile_backend(call_checker: CallChecker) -> None:
+    call_checker.register(aten_functions.aten_median_dim, aten_functions.aten_kthvalue)
+
+    def fn(
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        median_values, median_indices = aten.median.dim(x, 1, False)
+        kth_values, kth_indices = aten.kthvalue(x, 2, 1, False)
+        return median_values, median_indices, kth_values, kth_indices
+
+    check_outputs(fn, Conf("cpu", True), [_distinct((4, 7), torch.float32)])
+
+
+# ---------------------------------------------------------------------------
+# multinomial.  A sampler, not a pure function: its distribution and
+# determinism are exercised in test_eager_kernels.py (which already has the
+# Philox / manual_seed conventions this needs); here we cover dispatch
+# (CallChecker), the compile backend's deliberate decline, and the ATen-
+# worded validation errors that don't need randomness to trigger.
+# ---------------------------------------------------------------------------
+
+
+def test_aten_multinomial_dispatches_to_fast_eager(
+    mojo_device: str, call_checker: CallChecker
+) -> None:
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    register_mojo_devices()
+    call_checker.register(aten_fast.fast_aten_multinomial)
+    torch.mojo.manual_seed_all(20260819)
+
+    weights = torch.tensor([0.1, 0.2, 0.3, 0.4], device=mojo_device)
+    out = torch.multinomial(weights, 5, replacement=True)
+    assert out.dtype == torch.int64
+    assert out.shape == (5,)
+    assert out.device.type == "mojo"
+
+
+def test_aten_multinomial_compile_backend_declines() -> None:
+    def fn(weights: torch.Tensor) -> torch.Tensor:
+        return torch.multinomial(weights, 1)
+
+    weights = torch.tensor([0.1, 0.2, 0.3], device="mojo")
+    with pytest.raises(BackendCompilerFailed, match="multinomial"):
+        torch.compile(fn, backend=mojo_backend)(weights)
+
+
+def test_aten_multinomial_validation_errors(mojo_device: str) -> None:
+    register_mojo_devices()
+
+    with pytest.raises(RuntimeError, match="prob_dist must be 1 or 2 dim"):
+        torch.multinomial(torch.rand(2, 3, 4, device=mojo_device), 1)
+
+    with pytest.raises(RuntimeError, match=r"cannot sample n_sample <= 0"):
+        torch.multinomial(torch.tensor([1.0, 2.0], device=mojo_device), 0)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"cannot sample n_sample > prob_dist.size\(-1\) samples without replacement",
+    ):
+        torch.multinomial(
+            torch.tensor([1.0, 1.0], device=mojo_device), 3, replacement=False
+        )
+
+    with pytest.raises(
+        RuntimeError, match=r"invalid multinomial distribution \(sum of probabilities"
+    ):
+        torch.multinomial(torch.tensor([0.0, 0.0], device=mojo_device), 1)
+
+    with pytest.raises(RuntimeError, match="inf.*nan.*element < 0"):
+        torch.multinomial(torch.tensor([1.0, -1.0], device=mojo_device), 1)
+
+    with pytest.raises(NotImplementedError, match="generator"):
+        torch.multinomial(
+            torch.tensor([1.0, 1.0], device=mojo_device), 1, generator=torch.Generator()
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_aten_scatter_src_basic_2d(conf: Conf, dtype: torch.dtype):
     """Test aten.scatter.src basic functionality with 2D tensors"""

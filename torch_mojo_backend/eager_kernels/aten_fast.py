@@ -3579,6 +3579,141 @@ def fast_aten_topk(
     return _fast_sort_or_topk(self, dim, largest, k)
 
 
+# median.dim / kthvalue: both are a k-th order statistic along one dim, so
+# both are the ascending branch of the same sort/topk kernel above (the k
+# smallest values, keeping only the last of them). Ties among equal values
+# are broken by the kernel's own stable (ascending original-index) order,
+# which need not match CPU ATen's introselect-derived tie index -- the same
+# accepted disagreement class already documented for sort/topk itself: the
+# VALUE always matches, the INDEX is *a* valid occurrence of it, not
+# necessarily ATen's specific one.
+#
+# median.dim carries one more real (not just tie-break) ATen quirk: if a row
+# contains ANY NaN, the whole result becomes (nan, index of the FIRST NaN in
+# that row) instead of whatever the order-statistic position would naively
+# select -- confirmed against CPU torch.median, including the case where only
+# one NaN exists far from the median position. `min.dim` is documented
+# first-min-wins, so negating an (isnan ? 1 : 0) mask makes NaN positions the
+# unique minimum (-1) and its index IS the first NaN's original index; the
+# minimum's own value (-1 vs 0) says whether one was present at all. Both
+# ends compose from kernels this file already has (isnan, cast, neg, min.dim,
+# lt, where) -- no new Mojo. kthvalue has no such quirk: a NaN simply sorts
+# as the largest value like everywhere else in this kernel family, so its
+# plain order-statistic answer already matches ATen's NaN behavior exactly
+# (verified against CPU torch.kthvalue).
+_MEDIAN_KTHVALUE_DTYPES = tuple(d for d in _SORT_DTYPES if d != DType.bool)
+# `_SORT_DTYPES` doesn't include DType.bool itself (bool rides sort/topk's
+# own uint8 specialization) -- this tuple is the same list, named for its use
+# here so a future edit to one doesn't silently desync the other.
+
+
+def _kth_smallest_along_dim(
+    op_label: str, input: TorchMojoTensor, k: int | None, dim: int, keepdim: bool
+) -> tuple[TorchMojoTensor, int, TorchMojoTensor, TorchMojoTensor] | object:
+    """`(t, axis, value, index)` of the k-th smallest (1-indexed) along `dim`,
+    in KEEPDIM=TRUE shape regardless of the caller's `keepdim` (callers that
+    need more computation at this axis, like median's NaN correction, want
+    the axis kept; the final squeeze is the caller's job). `k=None` means the
+    lower median position, `(size + 1) // 2`.
+
+    Raises like ATen's own `median()` / `kthvalue()` for an out-of-range dim,
+    an empty reduction dim, or (kthvalue only) a `k` outside `[1, size]`.
+    """
+    t = _t(input)
+    if (
+        t is None
+        or t._dtype not in _MEDIAN_KTHVALUE_DTYPES
+        or not isinstance(dim, int)
+        or isinstance(dim, bool)
+    ):
+        return NOT_HANDLED
+    rank = len(t._shape)
+    ndim = rank or 1
+    if not -ndim <= dim < ndim:
+        raise IndexError(
+            "Dimension out of range (expected to be in range of "
+            f"[{-ndim}, {ndim - 1}], but got {dim})"
+        )
+    axis = dim % ndim
+    size = t._shape[axis] if rank else 1
+    if size == 0:
+        raise IndexError(
+            f"{op_label}(): Expected reduction dim {axis} to have non-zero size."
+        )
+    if k is None:
+        kk = (size + 1) // 2
+    else:
+        if not isinstance(k, int) or isinstance(k, bool):
+            return NOT_HANDLED
+        if not 1 <= k <= size:
+            raise RuntimeError(
+                f"kthvalue(): selected number k out of range for dimension {axis}"
+            )
+        kk = k
+
+    result = _fast_sort_or_topk(t, axis, False, kk)  # ascending: the kk smallest
+    if result is NOT_HANDLED:
+        return NOT_HANDLED
+    values_k, indices_k = result
+    value = fast_aten_slice(values_k, axis, kk - 1, kk)
+    index = fast_aten_slice(indices_k, axis, kk - 1, kk)
+    if value is NOT_HANDLED or index is NOT_HANDLED:
+        return NOT_HANDLED
+    return t, axis, value, index
+
+
+def _squeeze_pair_if(
+    keepdim: bool, axis: int, value: TorchMojoTensor, index: TorchMojoTensor
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | object:
+    if keepdim:
+        return value, index
+    value = fast_aten_select(value, axis, 0)
+    index = fast_aten_select(index, axis, 0)
+    if value is NOT_HANDLED or index is NOT_HANDLED:
+        return NOT_HANDLED
+    return value, index
+
+
+def fast_aten_kthvalue(
+    input: TorchMojoTensor, k: int, dim: int = -1, keepdim: bool = False
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | object:
+    result = _kth_smallest_along_dim("kthvalue", input, k, dim, keepdim)
+    if result is NOT_HANDLED:
+        return NOT_HANDLED
+    _, axis, value, index = result
+    return _squeeze_pair_if(keepdim, axis, value, index)
+
+
+def fast_aten_median_dim(
+    input: TorchMojoTensor, dim: int, keepdim: bool = False
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | object:
+    result = _kth_smallest_along_dim("median", input, None, dim, keepdim)
+    if result is NOT_HANDLED:
+        return NOT_HANDLED
+    t, axis, value, index = result
+
+    if t._dtype.is_float():
+        nan_mask = fast_aten_isnan(t)
+        if nan_mask is NOT_HANDLED:
+            return NOT_HANDLED
+        key = fast_aten_neg(_cast_tensor(nan_mask, DType.int32))
+        if key is NOT_HANDLED:
+            return NOT_HANDLED
+        nan_stat = fast_aten_min_dim(key, axis, True)
+        if nan_stat is NOT_HANDLED:
+            return NOT_HANDLED
+        min_key, first_nan_index = nan_stat
+        has_nan = fast_aten_lt(min_key, 0)
+        if has_nan is NOT_HANDLED:
+            return NOT_HANDLED
+        value = fast_aten_where(has_nan, float("nan"), value)
+        index = fast_aten_where(has_nan, first_nan_index, index)
+        if value is NOT_HANDLED or index is NOT_HANDLED:
+            return NOT_HANDLED
+
+    return _squeeze_pair_if(keepdim, axis, value, index)
+
+
 # ---------------------------------------------------------------------------
 # Binary/ternary extras: remainder, floor_divide, pow(Tensor,Tensor),
 # logical_and/xor, clamp, addcmul/addcdiv. All ride the broadcast-strided
@@ -5400,6 +5535,221 @@ def fast_aten_uniform_(
     if target is not self:
         _copy_into(self, target)
     return self
+
+
+# multinomial: two disjoint composed algorithms, no new kernel.
+#
+# WITH replacement is an inverse-CDF draw: an inclusive cumsum of the row
+# (aten::cumsum's existing kernel, `nn_ops.CumsumSpec`) turns the weights into
+# a CDF, `num_samples` uniforms per row are drawn from the device's own
+# Philox stream exactly like `uniform_`, scaled into [0, row_total), and
+# `searchsorted(..., right=True)` (aten::searchsorted's existing kernel)
+# turns each draw into a category index in one launch. `right=True` matters:
+# it is bisect_right, so a draw landing exactly on a cumsum boundary goes to
+# the bin AFTER it, giving every zero-weight run of categories a genuinely
+# zero-width interval -- they are structurally unreachable, not just
+# unlikely.
+#
+# WITHOUT replacement is the Gumbel-top-k trick: perturbing each category's
+# log-probability with iid Gumbel(0,1) noise and taking the top `num_samples`
+# perturbed scores (aten::topk's existing kernel) is a textbook equivalent-
+# distribution sampler for an unordered draw without replacement -- no
+# per-draw renormalization or removal loop needed, and it can never repeat an
+# index because topk cannot return one twice. A zero-weight category has
+# log(0) = -inf, so it only gets selected once every strictly-positive
+# category has been exhausted, at which point the -inf ties break by the
+# topk kernel's stable index order -- deterministic, but not a promise to
+# reproduce ATen's own (unspecified, implementation-specific) tie order in
+# that regime. That is the same class of accepted disagreement already
+# documented for sort/topk's own equal-value ties.
+#
+# Both algorithms need only ops this backend already has a kernel for
+# (cumsum, searchsorted, sort/topk, log, uniform_); see rng.py for the
+# generator-argument refusal and native_functions.yaml overload wiring.
+_MULTINOMIAL_DTYPES = _UNIFORM_DTYPES
+
+
+def _multinomial_validate_and_prepare(
+    self: TorchMojoTensor,
+    num_samples: int,
+    replacement: bool,
+    generator: torch.Generator | None,
+) -> tuple[TorchMojoTensor, int, int] | object:
+    """ATen's own checks, in ATen's order, plus a contiguous weights tensor.
+
+    Every RuntimeError message below is copied from ATen's own
+    (`Distributions.cpp`, `MultinomialKernel.cu`) wording. The `sum <= 0` and
+    `inf`/`nan`/`< 0` checks are a deliberate device sync -- same precedent as
+    `_searchsorted_sorter_in_range` -- because they read data, not metadata.
+    """
+    if self._dtype not in _MULTINOMIAL_DTYPES:
+        return NOT_HANDLED
+    if not isinstance(num_samples, int) or isinstance(num_samples, bool):
+        return NOT_HANDLED
+    if not isinstance(replacement, bool):
+        return NOT_HANDLED
+    rank = len(self._shape)
+    if rank not in (1, 2):
+        raise RuntimeError("prob_dist must be 1 or 2 dim")
+    if generator is not None:
+        raise NotImplementedError(
+            "aten::multinomial on the mojo device draws from the device's "
+            "default generator; an explicit generator= is not supported (a "
+            'torch.Generator(device="mojo") cannot be constructed from Python '
+            "in the first place). Seed the device generator instead: "
+            "torch.mojo.manual_seed_all(seed), or torch.manual_seed(seed), "
+            "and checkpoint it with torch.mojo.get_rng_state() / "
+            "torch.mojo.set_rng_state(state)."
+        )
+    if num_samples <= 0:
+        raise RuntimeError("cannot sample n_sample <= 0 samples")
+    size = self._shape[-1]
+    if not replacement and num_samples > size:
+        raise RuntimeError(
+            "cannot sample n_sample > prob_dist.size(-1) samples without replacement"
+        )
+
+    weights = _tc(self)
+    if weights._dtype == DType.float64:
+        # Neither the validation reductions below (`AminSpec`/`MaxSpec`/
+        # `SumSpec` all decline float64) nor `aten::cumsum` (no float64
+        # kernel) run at this width. float64 probability weights are a rare
+        # enough input for a sampling op that a host round-trip (same
+        # precedent as `mojo_device_normal_`'s CPU-generated `normal_`) is
+        # the pragmatic fix rather than new kernel work: nothing downstream
+        # of this needs more than float32 precision.
+        weights = TorchMojoTensor._from_cpu(
+            weights._to_cpu_tensor().float(), weights._device
+        )
+
+    nan_mask = fast_aten_isnan(weights)
+    if nan_mask is NOT_HANDLED:
+        return NOT_HANDLED
+    any_nan = fast_aten_any(nan_mask)
+    if any_nan is NOT_HANDLED:
+        return NOT_HANDLED
+    has_nan = fast_aten__local_scalar_dense(any_nan)
+    min_t = fast_aten_min(weights)
+    max_t = fast_aten_max(weights)
+    if has_nan is NOT_HANDLED or min_t is NOT_HANDLED or max_t is NOT_HANDLED:
+        return NOT_HANDLED
+    min_v = fast_aten__local_scalar_dense(min_t)
+    max_v = fast_aten__local_scalar_dense(max_t)
+    if min_v is NOT_HANDLED or max_v is NOT_HANDLED:
+        return NOT_HANDLED
+    if bool(has_nan) or not (float(min_v) >= 0.0) or float(max_v) == float("inf"):
+        raise RuntimeError(
+            "probability tensor contains either `inf`, `nan` or element < 0"
+        )
+
+    row_sums = fast_aten_sum(weights, -1, False)
+    if row_sums is NOT_HANDLED:
+        return NOT_HANDLED
+    if rank == 1:
+        # Already the single 0-d total; `fast_aten_min` declines a 0-d input
+        # (no axis left to reduce), so read it back directly.
+        min_row_sum = fast_aten__local_scalar_dense(row_sums)
+    else:
+        min_row_sum_t = fast_aten_min(row_sums)
+        if min_row_sum_t is NOT_HANDLED:
+            return NOT_HANDLED
+        min_row_sum = fast_aten__local_scalar_dense(min_row_sum_t)
+    if min_row_sum is NOT_HANDLED:
+        return NOT_HANDLED
+    if not (float(min_row_sum) > 0.0):
+        raise RuntimeError(
+            "invalid multinomial distribution (sum of probabilities <= 0)"
+        )
+
+    return weights, rank, size
+
+
+def _multinomial_with_replacement(
+    weights: TorchMojoTensor, rank: int, size: int, num_samples: int
+) -> TorchMojoTensor | object:
+    # `weights` is never float64 here: `_multinomial_validate_and_prepare`
+    # already downcast it (aten::cumsum has no float64 kernel at all).
+    cumulative = fast_aten_cumsum(weights, -1, dtype=torch.float32)
+    if cumulative is NOT_HANDLED:
+        return NOT_HANDLED
+    total = fast_aten_select(cumulative, -1, size - 1)
+    if total is NOT_HANDLED:
+        return NOT_HANDLED
+    if rank == 2:
+        total = fast_aten_unsqueeze(total, -1)
+        if total is NOT_HANDLED:
+            return NOT_HANDLED
+
+    draw_shape = weights._shape[:-1] + (num_samples,)
+    draws = _alloc(draw_shape, DType.float32, weights._device)
+    filled = fast_aten_uniform_(draws, 0.0, 1.0)
+    if filled is NOT_HANDLED:
+        return NOT_HANDLED
+
+    scaled = fast_aten_mul(draws, total)
+    if scaled is NOT_HANDLED:
+        return NOT_HANDLED
+    return _fast_searchsorted(
+        cumulative, scaled, out_int32=False, right=True, side=None, sorter=None
+    )
+
+
+def _multinomial_without_replacement(
+    weights: TorchMojoTensor, num_samples: int
+) -> TorchMojoTensor | object:
+    log_p = fast_aten_log(weights)
+    if log_p is NOT_HANDLED:
+        return NOT_HANDLED
+
+    noise = _alloc(weights._shape, weights._dtype, weights._device)
+    filled = fast_aten_uniform_(noise, 0.0, 1.0)
+    if filled is NOT_HANDLED:
+        return NOT_HANDLED
+    log_noise = fast_aten_log(noise)
+    neg_log_noise = fast_aten_neg(log_noise) if log_noise is not NOT_HANDLED else None
+    if log_noise is NOT_HANDLED or neg_log_noise is NOT_HANDLED:
+        return NOT_HANDLED
+    log_neg_log_noise = fast_aten_log(neg_log_noise)
+    if log_neg_log_noise is NOT_HANDLED:
+        return NOT_HANDLED
+    gumbel = fast_aten_neg(log_neg_log_noise)
+    if gumbel is NOT_HANDLED:
+        return NOT_HANDLED
+
+    perturbed = fast_aten_add(log_p, gumbel)
+    if perturbed is NOT_HANDLED:
+        return NOT_HANDLED
+    result = _fast_sort_or_topk(perturbed, -1, True, num_samples)
+    if result is NOT_HANDLED:
+        return NOT_HANDLED
+    _, indices = result
+    return indices
+
+
+def fast_aten_multinomial(
+    self: TorchMojoTensor,
+    num_samples: int,
+    replacement: bool = False,
+    *,
+    generator: torch.Generator | None = None,
+) -> TorchMojoTensor | object:
+    """`num_samples` int64 category indices, drawn from row(s) of weights.
+
+    Correct DISTRIBUTION, not ATen bit-parity: see the module comment above
+    this function for the two algorithms and why. Both draw only from the
+    device's own default Philox generator (`_reserve_philox_state`, via
+    `fast_aten_uniform_`), so they are reproducible the same way `uniform_`
+    is -- `torch.mojo.manual_seed_all` / `torch.manual_seed` before the call.
+    """
+    prepared = _multinomial_validate_and_prepare(
+        self, num_samples, replacement, generator
+    )
+    if prepared is NOT_HANDLED:
+        return NOT_HANDLED
+    weights, rank, size = prepared
+    if replacement:
+        return _multinomial_with_replacement(weights, rank, size, num_samples)
+    return _multinomial_without_replacement(weights, num_samples)
 
 
 def _layer_norm_stats_to_input_dtype(

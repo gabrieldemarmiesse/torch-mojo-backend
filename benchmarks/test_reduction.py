@@ -88,9 +88,25 @@ COVERS: dict[str, str] = {
     "aten::sort.stable": "test_sort (same kernel, stable= is free here)",
     "aten::sort.values": "test_sort (same kernel, non-stable out= overload)",
     "aten::nonzero": "test_nonzero",
+    "aten::multinomial": "test_multinomial",
+    "aten::multinomial.out": "test_multinomial (same kernel, out= overload)",
 }
 
-SKIPPED: dict[str, str] = {}
+_ORDER_STAT_REUSE = (
+    "order statistic (k-th smallest, k=1 for kthvalue's argument or "
+    "(size+1)//2 for median.dim) over #416's already-benchmarked sort/topk "
+    "kernel -- bottom_k(k) + one slice, no kernel of its own. Perf tracked "
+    "via test_topk's bottom_k=False cases; a dedicated benchmark is "
+    "follow-up work, not a correctness question (see the op's PR)."
+)
+SKIPPED: dict[str, str] = {
+    "aten::kthvalue": _ORDER_STAT_REUSE,
+    "aten::kthvalue.values": _ORDER_STAT_REUSE
+    + " Also the overload torch.kthvalue actually dispatches.",
+    "aten::median.dim": _ORDER_STAT_REUSE,
+    "aten::median.dim_values": _ORDER_STAT_REUSE
+    + " Also the overload torch.median(x, dim=...) actually dispatches.",
+}
 
 
 def _dim_case(
@@ -365,5 +381,32 @@ def test_sort(
     bench.run(
         lambda: torch.sort(x_ref, dim=-1, descending=descending, stable=True),
         lambda: torch.sort(x_our, dim=-1, descending=descending, stable=True),
+        flops=float(x_ref.numel()),
+    )
+
+
+# The HF `generate()` regime this op exists for: batch 1, a GPT-2-sized
+# vocabulary, one sample with replacement -- one draw per decode step.
+MULTINOMIAL_SHAPES: dict[str, tuple[tuple[int, ...], int, bool]] = {
+    "V_1x50304_N1": ((1, 50304), 1, True)
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", MULTINOMIAL_SHAPES)
+@pytest.mark.bench_op("multinomial")
+def test_multinomial(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    # Device time only, like every other case in this suite: the two legs
+    # draw from independent RNG streams, so the sampled INDICES are never
+    # compared here -- only how long each backend takes to produce them.
+    # Correctness (determinism, distribution, ATen edge semantics) is
+    # covered in tests/test_eager_kernels.py and tests/test_aten_functions.py.
+    shape, num_samples, replacement = MULTINOMIAL_SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.multinomial(x_ref, num_samples, replacement=replacement),
+        lambda: torch.multinomial(x_our, num_samples, replacement=replacement),
         flops=float(x_ref.numel()),
     )
