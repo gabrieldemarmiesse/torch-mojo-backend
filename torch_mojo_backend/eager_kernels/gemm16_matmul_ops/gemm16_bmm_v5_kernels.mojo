@@ -1,11 +1,13 @@
-"""Batched persistent H100 16-bit NN BMM — v5.
+"""Batched persistent H100 16-bit BMM — v5.
 
-C[b, m, n] = A[b, m, k] @ B[b, k, n], all row-major per batch item, arbitrary
-(element) batch strides including 0 (broadcast operand, e.g. conv's im2col
-GEMM where one A weight matrix serves every batch item).
+C[b, m, n] = A[b, m, k] @ B[b, k, n] with each operand stored either
+row-major or transposed per batch item (the four BLAS layouts NN, NT, TN and
+TT, selected by the `col_a` / `kmaj_b` comptime parameters below), and
+arbitrary (element) batch strides including 0 (broadcast operand, e.g.
+conv's im2col GEMM where one A weight matrix serves every batch item).
 
-There was previously no batched (grid.z) wgmma NN kernel: BMM NN reached
-only the pre-wgmma accepted kernel (gemm16_v3_kernels.mojo's
+There was previously no batched (grid.z) wgmma kernel at all: every BMM
+layout reached only the pre-wgmma accepted kernel (gemm16_v3_kernels.mojo's
 `_enqueue_accepted_bf16_bmm`), and looping the mm-level `_v4_nn_persistent_ws`
 ladder once per batch item (the way #389 serves TN) collapses on the small
 per-item grids attention/conv-shaped BMM produce: batch items independently
@@ -28,9 +30,23 @@ into BOTH the work decomposition and the TMA descriptors:
     items, batch-outermost, so small per-item grids (attention/conv-shaped
     BMM) still fill every SM instead of leaving (SMs - per-item-tiles) idle
     per launch the way looping the mm kernel would.
-  - A `tiny` sibling body (`_b5_bmm_nn_tiny`) serves the short-k regime:
+  - A `tiny` sibling body (`_b5_bmm_tiny`) serves the short-k regime:
     one 128-thread CTA per work item, self-issued 2-stage pipeline, 3-4
     CTAs resident per SM (see the dispatch comment in `_b5_dispatch`).
+
+Operand majorness is the orthogonal axis, expressed exactly as the mm-level
+`_v4_nn_persistent_ws` body expresses it (gemm16_nn_v4_kernels.mojo): `col_a`
+means A is physically (K, M) per item -- read column-major, TMA-loaded into
+an MN-major shared tile and consumed through WGMMA's col-major A mode;
+`kmaj_b` means B is physically (N, K) per item, TMA-loaded into a K-major
+shared tile for WGMMA's col-major B mode.  NN = (False, False),
+NT = (False, True), TN = (True, False), TT = (True, True).  Only four things
+vary with them -- the two shared-memory layouts, the TMA box shapes, the TMA
+coordinate order, and (for anything but NN) routing WGMMA through the
+majorness-generic `_v4_mma_tile` slab instead of `TensorCoreAsync`, which has
+no col-major A mode.  The batch folding above, the pipeline, the persistent
+work list, the rasterization and the ENTIRE C epilogue are layout-invariant:
+C is row-major (batch, m, n) whatever the operands do.
 
 No K-split is implemented: batching alone fills the machine on the deep-K
 shapes measured (S4 8x1024x1024x8192 reaches 0.91x of cuBLAS).  If a
@@ -74,6 +90,7 @@ from layout.tensor_core_async import (
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+from gemm16_nn_v4_kernels import _v4_mma_tile
 
 comptime _B5_DT = _GEMM16_DT
 comptime _B5_F32 = DType.float32
@@ -102,6 +119,49 @@ def _b5_store_tag[tma_store: Bool]() -> StaticString:
     return "_scalar_c"
 
 
+# Kernel-symbol layout token.  One symbol per layout: the four instantiations
+# of each body would otherwise share one base name (differing only by mangling
+# hash), so a GPU profile could not tell an NT batched BMM from an NN one and
+# scripts/compare_kernel_asm.py -- which pairs kernels by hash-stripped name --
+# would collide them.  "nn" is the pre-existing token, so every NN symbol keeps
+# its exact former name.
+@always_inline
+def _b5_layout_tag[col_a: Bool, kmaj_b: Bool]() -> StaticString:
+    comptime if col_a and kmaj_b:
+        return "tt"
+    comptime if col_a:
+        return "tn"
+    comptime if kmaj_b:
+        return "nt"
+    return "nn"
+
+
+# Per-layout TMA box shapes.  Each descriptor is rank 3 (batch, rows, cols)
+# over the operand's PHYSICAL per-item matrix, so the box follows majorness:
+# a col-major A is a (K, M) tensor read in (BK, 64) boxes that stack into the
+# MN-major shared tile (bm // 64 of them), a K-major B is an (N, K) tensor
+# read in (64, BK) boxes.  The row-major cases keep their pre-existing shapes.
+@always_inline
+def _b5_a_tile[col_a: Bool, bm: Int]() -> IndexList[3]:
+    comptime if col_a:
+        return Index(1, _B5_BK, bm)
+    return Index(1, bm, _B5_BK)
+
+
+@always_inline
+def _b5_a_desc[col_a: Bool, bm: Int]() -> IndexList[3]:
+    comptime if col_a:
+        return Index(1, _B5_BK, 64)
+    return Index(1, bm, _B5_BK)
+
+
+@always_inline
+def _b5_b_tile[kmaj_b: Bool]() -> IndexList[3]:
+    comptime if kmaj_b:
+        return Index(1, 64, _B5_BK)
+    return Index(1, _B5_BK, 64)
+
+
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
@@ -114,18 +174,26 @@ def _b5_store_tag[tma_store: Bool]() -> StaticString:
     ),
 )
 @__name(
-    t"{_GEMM16_TAG}_bmm_nn_batched_persistent_{_b5_regime_tag[bm, bn]()}{_b5_store_tag[tma_store]()}"
+    t"{_GEMM16_TAG}_bmm_{_b5_layout_tag[col_a, kmaj_b]()}_batched_persistent_{_b5_regime_tag[bm, bn]()}{_b5_store_tag[tma_store]()}"
 )
-def _b5_bmm_nn_persistent_ws[
+def _b5_bmm_persistent_ws[
     stages: Int,
     cluster_m: Int,
     bm: Int,
     bn: Int,
     consumers: Int,
     tma_store: Bool = True,
+    # Operand majorness; see the module docstring.  The trailing shape
+    # parameters exist because the TMA boxes follow it; their defaults keep
+    # every pre-existing NN instantiation (and its generated code) unchanged.
+    col_a: Bool = False,
+    kmaj_b: Bool = False,
+    a_tile_shape: IndexList[3] = _b5_a_tile[col_a, bm](),
+    a_desc_shape: IndexList[3] = _b5_a_desc[col_a, bm](),
+    b_tile_shape: IndexList[3] = _b5_b_tile[kmaj_b](),
 ](
-    a_tma: TMATensorTile[_B5_DT, 3, Index(1, bm, _B5_BK), Index(1, bm, _B5_BK)],
-    b_tma: TMATensorTile[_B5_DT, 3, Index(1, _B5_BK, 64), Index(1, _B5_BK, 64)],
+    a_tma: TMATensorTile[_B5_DT, 3, a_tile_shape, a_desc_shape],
+    b_tma: TMATensorTile[_B5_DT, 3, b_tile_shape, b_tile_shape],
     c_tma: TMATensorTile[_B5_DT, 3, Index(1, bm, 64), Index(1, bm, 64)],
     output: _B5_PTR,
     c_bs_arg: Int64,
@@ -145,13 +213,20 @@ def _b5_bmm_nn_persistent_ws[
     var a_mul = Int(a_mul_arg)
     var b_mul = Int(b_mul_arg)
     comptime if _is_sm_9x():
-        comptime A_LAYOUT = tile_layout_k_major[
+        comptime A_LAYOUT = tile_layout_mn_major[
             _B5_DT, bm, _B5_BK, _B5_SWIZZLE
-        ]()
-        comptime B_LAYOUT = tile_layout_mn_major[
+        ]() if col_a else tile_layout_k_major[_B5_DT, bm, _B5_BK, _B5_SWIZZLE]()
+        comptime B_LAYOUT = tile_layout_k_major[
+            _B5_DT, bn, _B5_BK, _B5_SWIZZLE
+        ]() if kmaj_b else tile_layout_mn_major[
             _B5_DT, bn, _B5_BK, _B5_SWIZZLE
         ]()
-        comptime B_CHUNK_LAYOUT = tile_layout_mn_major[
+        # For both majornesses a 64-row chunk of the bn-row tile is one
+        # contiguous 64 * BK block at offset chunk * 64 * BK (BK = 64 16-bit
+        # elements is exactly one 128B swizzle atom row).
+        comptime B_CHUNK_LAYOUT = tile_layout_k_major[
+            _B5_DT, 64, _B5_BK, _B5_SWIZZLE
+        ]() if kmaj_b else tile_layout_mn_major[
             _B5_DT, 64, _B5_BK, _B5_SWIZZLE
         ]()
         comptime A_PIPE_LAYOUT = Layout.row_major(stages, bm * _B5_BK)
@@ -268,9 +343,20 @@ def _b5_bmm_nn_persistent_ws[
                             alignment=128,
                         ](a_pipeline.ptr + stage * bm * _B5_BK)
                         var k0 = t * _B5_BK
-                        a_tma.async_copy_3d(
-                            a_tile, full_barriers[stage], (k0, m0, ab)
-                        )
+                        # TMA coordinates are (fastest, ..., slowest dim) of
+                        # the global tensor the descriptor was built over --
+                        # (m, k, batch) for the col-major (K, M) operand,
+                        # (k, m, batch) for the row-major (M, K) one.  Either
+                        # way the batch coordinate is the slowest, and the
+                        # box's own extents clip a ragged m or k per item.
+                        comptime if col_a:
+                            a_tma.async_copy_3d(
+                                a_tile, full_barriers[stage], (m0, k0, ab)
+                            )
+                        else:
+                            a_tma.async_copy_3d(
+                                a_tile, full_barriers[stage], (k0, m0, ab)
+                            )
                         # Cooperative B load: each cluster rank reads its
                         # share of the 64-column chunks once from L2 and
                         # multicasts it to every peer.
@@ -288,19 +374,38 @@ def _b5_bmm_nn_persistent_ws[
                                 + stage * bn * _B5_BK
                                 + cc * 64 * _B5_BK
                             )
+                            # B TMA coordinates likewise follow B's physical
+                            # majorness: (k, n, batch) for the K-major (N, K)
+                            # kmaj_b operand, (n, k, batch) for the row-major
+                            # (K, N) one.
                             comptime if cluster_m > 1:
-                                b_tma.async_multicast_load_3d(
-                                    b_chunk,
-                                    full_barriers[stage],
-                                    (n0 + cc * 64, k0, bb),
-                                    MCAST_MASK,
-                                )
+                                comptime if kmaj_b:
+                                    b_tma.async_multicast_load_3d(
+                                        b_chunk,
+                                        full_barriers[stage],
+                                        (k0, n0 + cc * 64, bb),
+                                        MCAST_MASK,
+                                    )
+                                else:
+                                    b_tma.async_multicast_load_3d(
+                                        b_chunk,
+                                        full_barriers[stage],
+                                        (n0 + cc * 64, k0, bb),
+                                        MCAST_MASK,
+                                    )
                             else:
-                                b_tma.async_copy_3d(
-                                    b_chunk,
-                                    full_barriers[stage],
-                                    (n0 + cc * 64, k0, bb),
-                                )
+                                comptime if kmaj_b:
+                                    b_tma.async_copy_3d(
+                                        b_chunk,
+                                        full_barriers[stage],
+                                        (k0, n0 + cc * 64, bb),
+                                    )
+                                else:
+                                    b_tma.async_copy_3d(
+                                        b_chunk,
+                                        full_barriers[stage],
+                                        (n0 + cc * 64, k0, bb),
+                                    )
                             cc += 1
                         t += 1
                         gt += 1
@@ -364,14 +469,23 @@ def _b5_bmm_nn_persistent_ws[
                         address_space=AddressSpace.SHARED,
                         alignment=128,
                     ](b_pipeline.ptr + stage * bn * _B5_BK)
-                    warpgroup_fence(accum)
-                    wgmma.arrive()
-                    wgmma.wgmma[consumers](
-                        a_tile, b_tile, accum, warp_group_idx - 1
-                    )
-                    wgmma.commit_group()
-                    warpgroup_fence(accum)
-                    wgmma.wait_group()
+                    comptime if col_a or kmaj_b:
+                        # Raw descriptor path: TensorCoreAsync has no
+                        # col-major A mode, and the K-major B of NT/TT rides
+                        # the same majorness-generic helper (shared verbatim
+                        # with the mm-level v4 bodies).
+                        _v4_mma_tile[bn, col_a, kmaj_b, A_LAYOUT, B_LAYOUT](
+                            a_tile.ptr, b_tile.ptr, accum, warp_group_idx
+                        )
+                    else:
+                        warpgroup_fence(accum)
+                        wgmma.arrive()
+                        wgmma.wgmma[consumers](
+                            a_tile, b_tile, accum, warp_group_idx - 1
+                        )
+                        wgmma.commit_group()
+                        warpgroup_fence(accum)
+                        wgmma.wait_group()
                     if warp_group_thread_idx < cluster_m:
                         empty_barriers[stage].arrive_cluster(
                             UInt32(warp_group_thread_idx)
@@ -483,15 +597,19 @@ def _b5_p(addr: Int) -> _B5_PTR:
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(128))
 )
 @__name(
-    t"{_GEMM16_TAG}_bmm_nn_batched_tiny_{_b5_regime_tag[64, bn]()}{_b5_store_tag[tma_store]()}"
+    t"{_GEMM16_TAG}_bmm_{_b5_layout_tag[col_a, kmaj_b]()}_batched_tiny_{_b5_regime_tag[64, bn]()}{_b5_store_tag[tma_store]()}"
 )
-def _b5_bmm_nn_tiny[
+def _b5_bmm_tiny[
     stages: Int,
     bn: Int,
     tma_store: Bool,
+    col_a: Bool = False,
+    kmaj_b: Bool = False,
+    a_tile_shape: IndexList[3] = _b5_a_tile[col_a, 64](),
+    b_tile_shape: IndexList[3] = _b5_b_tile[kmaj_b](),
 ](
-    a_tma: TMATensorTile[_B5_DT, 3, Index(1, 64, _B5_BK), Index(1, 64, _B5_BK)],
-    b_tma: TMATensorTile[_B5_DT, 3, Index(1, _B5_BK, 64), Index(1, _B5_BK, 64)],
+    a_tma: TMATensorTile[_B5_DT, 3, a_tile_shape, a_tile_shape],
+    b_tma: TMATensorTile[_B5_DT, 3, b_tile_shape, b_tile_shape],
     c_tma: TMATensorTile[_B5_DT, 3, Index(1, 64, 64), Index(1, 64, 64)],
     output: _B5_PTR,
     c_bs_arg: Int64,
@@ -510,13 +628,17 @@ def _b5_bmm_nn_tiny[
     var a_mul = Int(a_mul_arg)
     var b_mul = Int(b_mul_arg)
     comptime if _is_sm_9x():
-        comptime A_LAYOUT = tile_layout_k_major[
+        comptime A_LAYOUT = tile_layout_mn_major[
             _B5_DT, bm, _B5_BK, _B5_SWIZZLE
-        ]()
-        comptime B_LAYOUT = tile_layout_mn_major[
+        ]() if col_a else tile_layout_k_major[_B5_DT, bm, _B5_BK, _B5_SWIZZLE]()
+        comptime B_LAYOUT = tile_layout_k_major[
+            _B5_DT, bn, _B5_BK, _B5_SWIZZLE
+        ]() if kmaj_b else tile_layout_mn_major[
             _B5_DT, bn, _B5_BK, _B5_SWIZZLE
         ]()
-        comptime B_CHUNK_LAYOUT = tile_layout_mn_major[
+        comptime B_CHUNK_LAYOUT = tile_layout_k_major[
+            _B5_DT, 64, _B5_BK, _B5_SWIZZLE
+        ]() if kmaj_b else tile_layout_mn_major[
             _B5_DT, 64, _B5_BK, _B5_SWIZZLE
         ]()
         var a_pipeline = LayoutTensor[
@@ -585,7 +707,12 @@ def _b5_bmm_nn_tiny[
                 address_space=AddressSpace.SHARED,
                 alignment=128,
             ](a_pipeline.ptr + stage * bm * _B5_BK)
-            a_tma.async_copy_3d(a_tile, full_barriers[stage], (k0, m0, ab))
+            # Coordinate order follows each operand's physical majorness; see
+            # the persistent body above.
+            comptime if col_a:
+                a_tma.async_copy_3d(a_tile, full_barriers[stage], (m0, k0, ab))
+            else:
+                a_tma.async_copy_3d(a_tile, full_barriers[stage], (k0, m0, ab))
             comptime for cc in range(B_CHUNKS):
                 var b_chunk = LayoutTensor[
                     _B5_DT,
@@ -594,9 +721,14 @@ def _b5_bmm_nn_tiny[
                     address_space=AddressSpace.SHARED,
                     alignment=128,
                 ](b_pipeline.ptr + stage * bn * _B5_BK + cc * 64 * _B5_BK)
-                b_tma.async_copy_3d(
-                    b_chunk, full_barriers[stage], (n0 + cc * 64, k0, bb)
-                )
+                comptime if kmaj_b:
+                    b_tma.async_copy_3d(
+                        b_chunk, full_barriers[stage], (k0, n0 + cc * 64, bb)
+                    )
+                else:
+                    b_tma.async_copy_3d(
+                        b_chunk, full_barriers[stage], (n0 + cc * 64, k0, bb)
+                    )
 
         if thread_idx.x == 0:
             var pre = min(stages, num_tiles)
@@ -639,18 +771,26 @@ def _b5_bmm_nn_tiny[
                 address_space=AddressSpace.SHARED,
                 alignment=128,
             ](b_pipeline.ptr + stage * bn * _B5_BK)
-            warpgroup_fence(accum)
-            wgmma.arrive()
-            wgmma.wgmma[1](a_tile, b_tile, accum, 0)
-            wgmma.commit_group()
-            warpgroup_fence(accum)
-            # Full wait before refilling the just-consumed stage.  A
-            # wait_group[1] variant that refills the OTHER stage during the
-            # current group (issue tile t+1 after g_{t-1} retires) was tried
-            # and measured WORSE: AWK 36.9 -> 37.6-38.2, CONV 77.1 -> 78.8,
-            # ATT 128.7 -> 127.3 — the refill is not the critical path and
-            # the earlier TMA contends with the running wgmma.
-            wgmma.wait_group()
+            # Full wait before refilling the just-consumed stage (both mma
+            # paths end in one).  A wait_group[1] variant that refills the
+            # OTHER stage during the current group (issue tile t+1 after
+            # g_{t-1} retires) was tried and measured WORSE: AWK 36.9 ->
+            # 37.6-38.2, CONV 77.1 -> 78.8, ATT 128.7 -> 127.3 — the refill is
+            # not the critical path and the earlier TMA contends with the
+            # running wgmma.
+            comptime if col_a or kmaj_b:
+                # Single warp group: pass 1 so the helper's per-consumer A
+                # offset (warp_group_idx - 1) is zero.
+                _v4_mma_tile[bn, col_a, kmaj_b, A_LAYOUT, B_LAYOUT](
+                    a_tile.ptr, b_tile.ptr, accum, 1
+                )
+            else:
+                warpgroup_fence(accum)
+                wgmma.arrive()
+                wgmma.wgmma[1](a_tile, b_tile, accum, 0)
+                wgmma.commit_group()
+                warpgroup_fence(accum)
+                wgmma.wait_group()
             if thread_idx.x == 0 and t + stages < num_tiles:
                 issue_tile(t + stages)
             t += 1
@@ -714,6 +854,8 @@ def _b5_enqueue_tiny[
     stages: Int,
     bn: Int,
     tma_store: Bool,
+    col_a: Bool = False,
+    kmaj_b: Bool = False,
 ](
     output: _B5_PTR,
     a: _B5_PTR,
@@ -730,25 +872,33 @@ def _b5_enqueue_tiny[
     ctx: DeviceContext,
 ) raises:
     comptime bm = 64
+    comptime A_TILE = _b5_a_tile[col_a, bm]()
+    comptime B_TILE = _b5_b_tile[kmaj_b]()
+    # Each descriptor spans the operand's PHYSICAL per-item matrix: (m, k) row
+    # major, or (k, m) for a col_a operand; (k, n), or (n, k) for a kmaj_b one.
+    # `a_row_stride` / `b_row_stride` are that physical matrix's row stride,
+    # supplied by the caller (padded on the repack route).
+    var a_rows = k if col_a else m
+    var b_rows = n if kmaj_b else k
     var a_items = 1 if a_bs == 0 else batch_count
-    var a_stride = m * a_row_stride if a_bs == 0 else a_bs
+    var a_stride = a_rows * a_row_stride if a_bs == 0 else a_bs
     var b_items = 1 if b_bs == 0 else batch_count
-    var b_stride = k * b_row_stride if b_bs == 0 else b_bs
+    var b_stride = b_rows * b_row_stride if b_bs == 0 else b_bs
     var a_desc = create_tma_descriptor[_B5_DT, 3, _B5_SWIZZLE](
         DeviceBuffer(
             ctx, a.address_space_cast[AddressSpace.GENERIC](), 1, owning=False
         ),
-        IndexList[3](a_items, m, k),
+        IndexList[3](a_items, a_rows, m if col_a else k),
         IndexList[3](a_stride, a_row_stride, 1),
-        IndexList[3](1, bm, _B5_BK),
+        A_TILE,
     )
     var b_desc = create_tma_descriptor[_B5_DT, 3, _B5_SWIZZLE](
         DeviceBuffer(
             ctx, b.address_space_cast[AddressSpace.GENERIC](), 1, owning=False
         ),
-        IndexList[3](b_items, k, n),
+        IndexList[3](b_items, b_rows, k if kmaj_b else n),
         IndexList[3](b_stride, b_row_stride, 1),
-        IndexList[3](1, _B5_BK, 64),
+        B_TILE,
     )
     var c_dim0 = batch_count if tma_store else 1
     var c_dim1 = m if tma_store else bm
@@ -766,19 +916,15 @@ def _b5_enqueue_tiny[
         IndexList[3](c_str0, c_str1, 1),
         IndexList[3](1, bm, 64),
     )
-    var a_tma = TMATensorTile[
-        _B5_DT, 3, Index(1, bm, _B5_BK), Index(1, bm, _B5_BK)
-    ](a_desc)
-    var b_tma = TMATensorTile[
-        _B5_DT, 3, Index(1, _B5_BK, 64), Index(1, _B5_BK, 64)
-    ](b_desc)
+    var a_tma = TMATensorTile[_B5_DT, 3, A_TILE, A_TILE](a_desc)
+    var b_tma = TMATensorTile[_B5_DT, 3, B_TILE, B_TILE](b_desc)
     var c_tma = TMATensorTile[_B5_DT, 3, Index(1, bm, 64), Index(1, bm, 64)](
         c_desc
     )
     var macro_rows = (m + bm - 1) // bm
     var blocks_n = (n + bn - 1) // bn
     var total_works = batch_count * macro_rows * blocks_n
-    ctx.enqueue_function[_b5_bmm_nn_tiny[stages, bn, tma_store]](
+    ctx.enqueue_function[_b5_bmm_tiny[stages, bn, tma_store, col_a, kmaj_b]](
         a_tma,
         b_tma,
         c_tma,
@@ -802,6 +948,8 @@ def _b5_enqueue_batched[
     bn: Int,
     consumers: Int,
     tma_store: Bool,
+    col_a: Bool = False,
+    kmaj_b: Bool = False,
 ](
     output: _B5_PTR,
     a: _B5_PTR,
@@ -822,25 +970,34 @@ def _b5_enqueue_batched[
     # A broadcast operand (batch stride 0) is described as a single-item
     # tensor and addressed with a zero coordinate multiplier; the dummy
     # stride is never dereferenced because the batch coordinate is always 0.
+    # Each descriptor spans the operand's PHYSICAL per-item matrix, which
+    # follows its majorness: (m, k) row-major, or (k, m) under col_a; (k, n),
+    # or (n, k) under kmaj_b.  A col_a A tile is assembled from bm // 64 boxes
+    # of (BK, 64), hence the separate descriptor box.
+    comptime A_TILE = _b5_a_tile[col_a, bm]()
+    comptime A_DESC = _b5_a_desc[col_a, bm]()
+    comptime B_TILE = _b5_b_tile[kmaj_b]()
+    var a_rows = k if col_a else m
+    var b_rows = n if kmaj_b else k
     var a_items = 1 if a_bs == 0 else batch_count
-    var a_stride = m * a_row_stride if a_bs == 0 else a_bs
+    var a_stride = a_rows * a_row_stride if a_bs == 0 else a_bs
     var b_items = 1 if b_bs == 0 else batch_count
-    var b_stride = k * b_row_stride if b_bs == 0 else b_bs
+    var b_stride = b_rows * b_row_stride if b_bs == 0 else b_bs
     var a_desc = create_tma_descriptor[_B5_DT, 3, _B5_SWIZZLE](
         DeviceBuffer(
             ctx, a.address_space_cast[AddressSpace.GENERIC](), 1, owning=False
         ),
-        IndexList[3](a_items, m, k),
+        IndexList[3](a_items, a_rows, m if col_a else k),
         IndexList[3](a_stride, a_row_stride, 1),
-        IndexList[3](1, bm, _B5_BK),
+        A_DESC,
     )
     var b_desc = create_tma_descriptor[_B5_DT, 3, _B5_SWIZZLE](
         DeviceBuffer(
             ctx, b.address_space_cast[AddressSpace.GENERIC](), 1, owning=False
         ),
-        IndexList[3](b_items, k, n),
+        IndexList[3](b_items, b_rows, k if kmaj_b else n),
         IndexList[3](b_stride, b_row_stride, 1),
-        IndexList[3](1, _B5_BK, 64),
+        B_TILE,
     )
     # Without the TMA-store epilogue the C descriptor is a never-used dummy
     # over the output base (the kernel gates every c_tma call off).
@@ -860,12 +1017,8 @@ def _b5_enqueue_batched[
         IndexList[3](c_str0, c_str1, 1),
         IndexList[3](1, bm, 64),
     )
-    var a_tma = TMATensorTile[
-        _B5_DT, 3, Index(1, bm, _B5_BK), Index(1, bm, _B5_BK)
-    ](a_desc)
-    var b_tma = TMATensorTile[
-        _B5_DT, 3, Index(1, _B5_BK, 64), Index(1, _B5_BK, 64)
-    ](b_desc)
+    var a_tma = TMATensorTile[_B5_DT, 3, A_TILE, A_DESC](a_desc)
+    var b_tma = TMATensorTile[_B5_DT, 3, B_TILE, B_TILE](b_desc)
     var c_tma = TMATensorTile[_B5_DT, 3, Index(1, bm, 64), Index(1, bm, 64)](
         c_desc
     )
@@ -879,8 +1032,8 @@ def _b5_enqueue_batched[
     var num_clusters = min(occ * (sm_count // cluster_m), total_works)
     var grid_x = num_clusters * cluster_m
     ctx.enqueue_function[
-        _b5_bmm_nn_persistent_ws[
-            stages, cluster_m, bm, bn, consumers, tma_store
+        _b5_bmm_persistent_ws[
+            stages, cluster_m, bm, bn, consumers, tma_store, col_a, kmaj_b
         ]
     ](
         a_tma,
@@ -900,7 +1053,7 @@ def _b5_enqueue_batched[
 
 
 def _b5_dispatch[
-    tma_store: Bool
+    tma_store: Bool, col_a: Bool = False, kmaj_b: Bool = False
 ](
     output: _B5_PTR,
     a: _B5_PTR,
@@ -937,13 +1090,42 @@ def _b5_dispatch[
     # 79.7 -> 77.0 us on the conv im2col 32x64x3136x576 (9 k-tiles) and
     # 143.4 -> 128.4 us on attn@V 96x1024x64x1024 (16 k-tiles).  The
     # 16-tile cut is the deepest k measured to win; the persistent body
-    # wins at 128 k-tiles (S4 deep-K, 0.89x) and the band in between is
-    # unmeasured.  2*sm_count works is where the extra CTAs/SM matter.
+    # wins at 128 k-tiles (S4 deep-K, 0.89x).  2*sm_count works is where
+    # the extra CTAs/SM matter.
+    #
+    # ...but the tiny body gives that band back once the BIG 128x256 tile is
+    # the persistent alternative AND the work list is many waves of it: the
+    # tiny body has no cluster B multicast, no rasterization groups and a
+    # blocking store epilogue, so on a long work list its per-work L2 traffic
+    # is what dominates.  Measured on an H100 PCIe (114 SMs) across the
+    # k = 384/768/1024 x n = 768 plane, NN and NT agreeing within 1%: the
+    # `big_wave` predicate separates the two bodies exactly.  Every big_wave
+    # shape ran faster persistent (batch 8, m = 2048..32768: tiny took 1.08x,
+    # 1.15x, 1.18x, 1.23x, 1.25x of the persistent time as m grows), every
+    # non-big_wave shape 7-19% faster tiny.  This is what put the tall-skinny
+    # BMM regime (8x32768x768x768) back at parity: 1.35x stock -> 1.01x.
+    # The extra 10*sm_count works floor covers the works_big ~ sm_count
+    # corner where big_wave only just trips (a second sweep found tiny still
+    # ahead at 8.4-9.0 waves there, the big tile ahead from 10.1 waves up),
+    # and the 6-k-tile floor leaves the shallow-k end untouched: at 1 k-tile
+    # (SDPA's q @ k^T, 96x1024x1024x64) the persistent pipeline never fills,
+    # and nothing below 6 tiles in this regime has been measured.
     var num_tiles = (k + _B5_BK - 1) // _B5_BK
     var works_64 = batch_count * ((m + 63) // 64)
-    if num_tiles <= 16 and works_64 * ((n + 127) // 128) >= 2 * sm_count:
+    var works = works_64 * ((n + 127) // 128)
+    # The 128x256 / cluster-2 / 2-consumer tile fills at least one persistent
+    # wave of clusters (works_big >= sm_count means >= 2 works per cluster),
+    # and needs the 256-wide n regime; see the ladder below, which repeats
+    # this decision as its last rung.
+    var big_wave = False
+    if m >= 256 and n > 192:
+        big_wave = ((m + 255) // 256) * (
+            (n + 255) // 256
+        ) * batch_count >= sm_count
+    var big_tile_wins = big_wave and num_tiles >= 6 and works >= 10 * sm_count
+    if num_tiles <= 16 and works >= 2 * sm_count and not big_tile_wins:
         if n <= 96:
-            _b5_enqueue_tiny[2, 64, tma_store](
+            _b5_enqueue_tiny[2, 64, tma_store, col_a, kmaj_b](
                 output,
                 a,
                 b,
@@ -959,7 +1141,7 @@ def _b5_dispatch[
                 ctx,
             )
         else:
-            _b5_enqueue_tiny[2, 128, tma_store](
+            _b5_enqueue_tiny[2, 128, tma_store, col_a, kmaj_b](
                 output,
                 a,
                 b,
@@ -976,7 +1158,7 @@ def _b5_dispatch[
             )
         return
     if n <= 96:
-        _b5_enqueue_batched[3, 1, 64, 64, 1, tma_store](
+        _b5_enqueue_batched[3, 1, 64, 64, 1, tma_store, col_a, kmaj_b](
             output,
             a,
             b,
@@ -994,7 +1176,7 @@ def _b5_dispatch[
         )
         return
     if n <= 192:
-        _b5_enqueue_batched[3, 1, 64, 128, 1, tma_store](
+        _b5_enqueue_batched[3, 1, 64, 128, 1, tma_store, col_a, kmaj_b](
             output,
             a,
             b,
@@ -1011,12 +1193,10 @@ def _b5_dispatch[
             ctx,
         )
         return
-    var use_big = False
-    if m >= 256:
-        var works_big = ((m + 255) // 256) * ((n + 255) // 256) * batch_count
-        use_big = works_big >= sm_count
-    if use_big:
-        _b5_enqueue_batched[3, 2, 128, 256, 2, tma_store](
+    # n > 192 here (the narrow rungs above returned), so `big_wave` is the
+    # whole predicate: this is the rung the tiny route defers to.
+    if big_wave:
+        _b5_enqueue_batched[3, 2, 128, 256, 2, tma_store, col_a, kmaj_b](
             output,
             a,
             b,
@@ -1033,7 +1213,7 @@ def _b5_dispatch[
             ctx,
         )
     else:
-        _b5_enqueue_batched[3, 1, 64, 256, 1, tma_store](
+        _b5_enqueue_batched[3, 1, 64, 256, 1, tma_store, col_a, kmaj_b](
             output,
             a,
             b,
@@ -1186,7 +1366,7 @@ def _b5_repack2(ctx: DeviceContext, op0: _B5RepackOp, op1: _B5RepackOp) raises:
 
 
 def _b5_dispatch_variant[
-    tma_store: Bool
+    tma_store: Bool, col_a: Bool = False, kmaj_b: Bool = False
 ](
     variant: Int,
     output: _B5_PTR,
@@ -1206,7 +1386,30 @@ def _b5_dispatch_variant[
 ) raises:
     """Tuning-sweep dispatch: variant 0 is the production rule; the rest are
     fixed instantiations (smem/reg budgets allow the listed CTAs per SM on
-    H100: 227 KB smem, 64K regs)."""
+    H100: 227 KB smem, 64K regs).
+
+    The sweep instantiations exist for the NN layout only -- they are what the
+    NN regime thresholds were fitted with, and nothing passes a non-zero
+    variant at runtime -- so the other three layouts go straight to the
+    production rule instead of compiling the whole ladder four times."""
+    comptime if col_a or kmaj_b:
+        _b5_dispatch[tma_store, col_a, kmaj_b](
+            output,
+            a,
+            b,
+            batch_count,
+            m,
+            n,
+            k,
+            c_bs,
+            a_bs,
+            b_bs,
+            a_row_stride,
+            b_row_stride,
+            sm_count,
+            ctx,
+        )
+        return
     if variant == 1:
         # 2-stage 64x256, 2 CTAs/SM (80KB smem, 232-reg consumer just fits)
         _b5_enqueue_batched[2, 1, 64, 256, 1, tma_store](
@@ -1405,7 +1608,9 @@ def _b5_dispatch_variant[
         )
 
 
-def try_enqueue_bmm16_nn_batched(
+def try_enqueue_bmm16_batched[
+    col_a: Bool = False, kmaj_b: Bool = False
+](
     output: _B5_PTR,
     a: _B5_PTR,
     b: _B5_PTR,
@@ -1419,7 +1624,8 @@ def try_enqueue_bmm16_nn_batched(
     ctx: DeviceContext,
     variant: Int = 0,
 ) raises -> Bool:
-    """Route a strided NN BMM to the batched persistent kernel.
+    """Route a strided BMM of the `col_a` / `kmaj_b` layout (NN, NT, TN or TT)
+    to the batched persistent kernel.
 
     Direct TMA route when every stride is 16B-compatible; otherwise a repack
     route copies the offending operand(s) into stride-padded workspaces and
@@ -1463,11 +1669,29 @@ def try_enqueue_bmm16_nn_batched(
     var sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
     if sm_count < 2:
         return False
-    var a_ok = k % 8 == 0 and a_bs % 8 == 0
-    var b_ok = n % 8 == 0 and b_bs % 8 == 0
+    # TMA requires every global stride to be a multiple of 16 bytes, i.e. 8
+    # elements, and the stride it checks is that of each operand's PHYSICAL
+    # per-item matrix -- so which dimension carries the row length depends on
+    # the layout, and the gate must be written in the operand's own
+    # coordinates rather than NN's:
+    #
+    #   layout | A extents      A row len | B extents      B row len
+    #   -------+--------------------------+-------------------------
+    #   NN     | (items, m, k)  k         | (items, k, n)  n
+    #   NT     | (items, m, k)  k         | (items, n, k)  k
+    #   TN     | (items, k, m)  m         | (items, k, n)  n
+    #   TT     | (items, k, m)  m         | (items, n, k)  k
+    #
+    # C is row-major (items, m, n) in every layout, so its gate never moves.
+    var a_rows = k if col_a else m
+    var a_len = m if col_a else k
+    var b_rows = n if kmaj_b else k
+    var b_len = k if kmaj_b else n
+    var a_ok = a_len % 8 == 0 and a_bs % 8 == 0
+    var b_ok = b_len % 8 == 0 and b_bs % 8 == 0
     var c_ok = n % 8 == 0 and c_bs % 8 == 0
     if a_ok and b_ok and c_ok:
-        _b5_dispatch_variant[True](
+        _b5_dispatch_variant[True, col_a, kmaj_b](
             variant,
             output,
             a,
@@ -1479,8 +1703,8 @@ def try_enqueue_bmm16_nn_batched(
             c_bs,
             a_bs,
             b_bs,
-            k,
-            n,
+            a_len,
+            b_len,
             sm_count,
             ctx,
         )
@@ -1491,53 +1715,55 @@ def try_enqueue_bmm16_nn_batched(
     # C keeps its caller layout via the scalar epilogue when unaligned.
     # A single allocation serves both operands: the per-call allocator
     # bookkeeping is half of the non-kernel overhead of this route.
-    var kp = ((k + 7) // 8) * 8
-    var np = ((n + 7) // 8) * 8
+    # Rows and row lengths are the physical ones from the table above, so a
+    # col_a A is repacked as `k` rows of `m` and a kmaj_b B as `n` rows of `k`.
+    var a_lp = ((a_len + 7) // 8) * 8
+    var b_lp = ((b_len + 7) // 8) * 8
     var a_items = 1 if a_bs == 0 else batch_count
     var b_items = 1 if b_bs == 0 else batch_count
-    var a_ws_elems = 0 if a_ok else a_items * m * kp
-    var b_ws_elems = 0 if b_ok else b_items * k * np
+    var a_ws_elems = 0 if a_ok else a_items * a_rows * a_lp
+    var b_ws_elems = 0 if b_ok else b_items * b_rows * b_lp
     var ws = ctx.enqueue_create_buffer[_B5_DT](max(1, a_ws_elems + b_ws_elems))
     var ws_base = Int(ws.unsafe_ptr())
     var a2 = a
     var a2_bs = a_bs
-    var a2_row = k
+    var a2_row = a_len
     var op_a = _B5RepackOp(
         _B5_UPTR(unsafe_from_address=ws_base),
         _B5_UPTR(unsafe_from_address=Int(a)),
     )
     if not a_ok:
-        op_a.rows = a_items * m
-        op_a.rows_per_item = m
-        op_a.row_len = k
+        op_a.rows = a_items * a_rows
+        op_a.rows_per_item = a_rows
+        op_a.row_len = a_len
         op_a.src_item_stride = a_bs
-        op_a.src_row_stride = k
-        op_a.dst_row_stride = kp
+        op_a.src_row_stride = a_len
+        op_a.dst_row_stride = a_lp
         a2 = _b5_p(ws_base)
-        a2_bs = 0 if a_bs == 0 else m * kp
-        a2_row = kp
+        a2_bs = 0 if a_bs == 0 else a_rows * a_lp
+        a2_row = a_lp
     var b2 = b
     var b2_bs = b_bs
-    var b2_row = n
-    # B's slice starts after A's (kp % 8 == 0 keeps it 16B-aligned).
+    var b2_row = b_len
+    # B's slice starts after A's (a_lp % 8 == 0 keeps it 16B-aligned).
     var b_ws_base = ws_base + a_ws_elems * 2
     var op_b = _B5RepackOp(
         _B5_UPTR(unsafe_from_address=b_ws_base),
         _B5_UPTR(unsafe_from_address=Int(b)),
     )
     if not b_ok:
-        op_b.rows = b_items * k
-        op_b.rows_per_item = k
-        op_b.row_len = n
+        op_b.rows = b_items * b_rows
+        op_b.rows_per_item = b_rows
+        op_b.row_len = b_len
         op_b.src_item_stride = b_bs
-        op_b.src_row_stride = n
-        op_b.dst_row_stride = np
+        op_b.src_row_stride = b_len
+        op_b.dst_row_stride = b_lp
         b2 = _b5_p(b_ws_base)
-        b2_bs = 0 if b_bs == 0 else k * np
-        b2_row = np
+        b2_bs = 0 if b_bs == 0 else b_rows * b_lp
+        b2_row = b_lp
     _b5_repack2(ctx, op_a, op_b)
     if c_ok:
-        _b5_dispatch_variant[True](
+        _b5_dispatch_variant[True, col_a, kmaj_b](
             variant,
             output,
             a2,
@@ -1555,7 +1781,7 @@ def try_enqueue_bmm16_nn_batched(
             ctx,
         )
     else:
-        _b5_dispatch_variant[False](
+        _b5_dispatch_variant[False, col_a, kmaj_b](
             variant,
             output,
             a2,
