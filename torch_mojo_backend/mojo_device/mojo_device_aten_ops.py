@@ -25,7 +25,6 @@ from .aten_ops.autograd_preflight import (
     mojo_device__scaled_dot_product_efficient_attention,
     mojo_device__softmax,
     mojo_device_avg_pool2d,
-    mojo_device_convolution,
     mojo_device_cumsum,
     mojo_device_embedding,
     mojo_device_index,
@@ -247,7 +246,8 @@ _register_fast("aten::cat", "fast_aten_cat")
 _register_fast("aten::ceil", "fast_aten_ceil")
 _register_fast("aten::clamp", "fast_aten_clamp")
 _register_fast("aten::clone", "fast_aten_clone")
-register_aten_op("aten::convolution")(mojo_device_convolution)
+_register_fast("aten::convolution", "fast_aten_convolution")
+_register_fast("aten::convolution_backward", "fast_aten_convolution_backward")
 _register_fast("aten::cos", "fast_aten_cos")
 _register_fast("aten::cosh", "fast_aten_cosh")
 register_aten_op("aten::cumsum")(mojo_device_cumsum)

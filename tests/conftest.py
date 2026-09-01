@@ -187,6 +187,20 @@ def call_checker():
     call_checker_instance.check_was_called()
 
 
+def matmul_tolerance(device: str) -> dict[str, float]:
+    """The comparison tolerance a GPU matmul or convolution needs.
+
+    MAX reduces float32 matmuls and convolutions through TF32 tensor cores on
+    an accelerator, whose 10 mantissa bits put the per-term relative error
+    near 2^-11 -- four orders of magnitude looser than the fp32 the same graph
+    computes on CPU. Any test comparing a compiled GPU result against stock
+    torch has to allow for that; on CPU nothing is loosened.
+    """
+    if device == "cpu":
+        return {}
+    return {"rtol": 1e-2, "atol": 2e-2}
+
+
 def require_cuda_autograd(device: str) -> None:
     """Skip when this process can no longer run a CUDA backward.
 

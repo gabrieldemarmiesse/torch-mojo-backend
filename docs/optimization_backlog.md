@@ -62,7 +62,7 @@ different kind of item.
 | [A5](#a5) | `attn_mask` is a hard decline in eager SDPA | Attention | High for HF models | Medium | — |
 | [D5](#d5) | `aten::index` only handles a single index tensor on dim 0 | Data movement | Medium | Medium | — |
 | [R2](#r2) | ~~`linalg_vector_norm` is composed: 3 launches + an input-sized temporary~~ **DONE**: `NormSpec` / `NormL2Op`, one pass | Reductions | Low | Low | — |
-| [C3](#c3) | conv is 2-D forward only; no `convolution_backward`, no conv1d/3d/transposed in eager | Conv | High for vision *training* (blocks it) | High | — |
+| [C3](#c3) | eager conv backward rides the materialized im2col route: 1.4-23x cuDNN; forward still 2-D-only (no conv1d/3d/transposed) | Conv | High for vision *training* | High | — |
 | [N2](#n2) | BatchNorm training and GroupNorm backward are absent in eager | Normalization | High for vision training (blocks it) | Medium | — |
 | [Q1](#q1) | Graph backend hand-decomposes softmax / log_softmax instead of using MAX's fused ops | Graph | Low–Medium | **Low** | verify MAX does not already re-fuse |
 | [Q3](#q3) | Graph `max_pool2d_with_indices` returns the values as the indices | Graph | Correctness bug | Low | — |
@@ -932,27 +932,42 @@ temporary** — **DONE** (`NormSpec`)
   (depthwise-heavy) model, and `TORCH_MOJO_BACKEND_TRACE=1` to count launches.
 
 ### C3
-**Convolution is 2-D and forward-only in eager**
+**The eager conv backward rides the materialized im2col route**
 
-* **What.** `fast_aten_convolution`, `aten_fast.py:7438` (`and not transposed`)
-  and `:7442` (`len(a._shape) == 4`). `aten::convolution_backward` is not
-  registered in `mojo_device_aten_ops.py` (`aten::convolution` is).
-* **Current implementation.** conv1d (rank-3 input), conv3d and transposed
-  convolutions all return `NOT_HANDLED` → raise. There is no eager conv
-  backward, so `mojo_device_convolution` refuses any conv whose operands
-  require grad in the FORWARD (see [N2](#n2) for why it cannot wait for the
-  backward node). A conv weight normally requires grad, so that is every conv
-  in a training model; inference under `torch.no_grad()` is unaffected.
-* **Why it is not optimal.** conv1d is a reshape away — `(N, C, L)` →
-  `(N, C, 1, L)` with a `(1, kw)` kernel. The missing backward blocks all vision
-  training together with [N2](#n2) and [C4](#c4).
-* **What the optimized version looks like.** conv1d by reshape into the existing
-  2-D path; `convolution_backward` as dgrad (col2im of a GEMM) plus wgrad (a
-  transposed-A GEMM against the im2col matrix) — the same `TRANSPOSE_A`
-  capability [G2](#g2) asks for.
-* **Expected win.** N/A (coverage).
-* **How to measure it.** `tests/test_aten_functions.py`; then a resnet-18
-  training step.
+* **What.** `fast_aten_convolution_backward` and `fast_aten_convolution`,
+  `aten_fast.py`. Both decline transposed convolutions; the forward also
+  declines rank-3 (conv1d) and rank-5 (conv3d) inputs, while the backward
+  already serves rank-3 through a size-1 H lift.
+* **Current implementation.** `aten::convolution_backward` is registered and
+  computes all three gradients: the bias gradient as one reduction, the weight
+  gradient as a transposed-B GEMM against the im2col matrix plus a reduce over
+  the batch, the data gradient as a shared-A GEMM plus a `Col2im` gather. The
+  implicit-GEMM route of [C1](#c1) is FORWARD-ONLY, so both spatial
+  gradients pay a full column-buffer write and read, which is what the
+  forward's own profiling found was 89% of its device time before that route
+  existed.
+* **Why it is not optimal.** Measured on an H100 PCIe against cuDNN
+  (`benchmarks/baselines.html`, 12 entries each): the data gradient runs
+  1.40-15.12x stock (median 10.58) and the weight gradient 3.27-23.25x
+  (median 11.71), both worst on the deep-C small-spatial stages; the bias
+  gradient is 0.39-3.21x (median 0.90), i.e. usually FASTER, since it is a
+  plain reduction. The weight gradient additionally materializes an
+  `(N, out_c, C*R*S)` partials buffer, because none of the GEMM routes here
+  takes a `beta=1` accumulator — bigger than the column buffer itself whenever
+  `out_c > OH*OW`, i.e. in exactly those deep stages.
+* **What the optimized version looks like.** A patch-major im2col variant (a
+  transposed write, so a different kernel rather than a different index) folds
+  N into the weight GEMM's K, which removes both the partials buffer and the
+  batch reduce and turns `N` small-K GEMMs into one deep-K GEMM. Beyond that,
+  an implicit-GEMM data/weight gradient in the shape of the forward's TMA
+  im2col route would remove the column buffer entirely.
+* **Expected win.** **UNMEASURED**, but the forward's own materialized-route
+  profile bounds it: the column traffic this removes was 89% of that route's
+  device time.
+* **How to measure it.** `benchmarks/test_vision.py::test_conv2d_backward`,
+  whose baseline keys are `convolution_backward/<dtype>/<shape>/{dgrad, wgrad,
+  bgrad}` — one node per gradient, so a change to one of the three kernels is
+  attributable. Then a resnet-18 training step.
 
 ### C4
 **Pooling has no `ceil_mode` and no backward**

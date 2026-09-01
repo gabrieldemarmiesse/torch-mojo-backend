@@ -750,7 +750,7 @@ _ACCELERATOR_DELTAS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
                 "bool",
             ),
             "nn_functional_batch_norm": ("float32", "bfloat16", "float16"),
-            "nn_functional_conv2d": ("bfloat16", "float16", "int64"),
+            "nn_functional_conv2d": ("bfloat16", "float16", "float32", "int64"),
             "nn_functional_instance_norm": ("float32", "bfloat16", "float16"),
             "pow": ("float32", "int64"),
         },
