@@ -115,13 +115,6 @@ mojo_device_cumsum = _preflight_unsupported_backward(
     "aten::cumsum", "fast_aten_cumsum", "aten::flip", grad_operands=(0,)
 )
 
-mojo_device_index = _preflight_unsupported_backward(
-    "aten::index.Tensor",
-    "fast_aten_index",
-    "aten::_index_put_impl_",
-    grad_operands=(0,),
-)
-
 mojo_device_max_pool2d_with_indices = _preflight_unsupported_backward(
     "aten::max_pool2d_with_indices",
     "fast_aten_max_pool2d_with_indices",
@@ -131,12 +124,6 @@ mojo_device_max_pool2d_with_indices = _preflight_unsupported_backward(
 
 mojo_device_relu = _preflight_unsupported_backward(
     "aten::relu", "fast_aten_relu", "aten::threshold_backward", grad_operands=(0,)
-)
-
-# Only the `src` gradient goes through `gather`; the `self` gradient is a
-# scatter of zeros, which runs, so a self-only call must not be refused.
-mojo_device_scatter_src = _preflight_unsupported_backward(
-    "aten::scatter.src", "fast_aten_scatter_src", "aten::gather", grad_operands=(3,)
 )
 
 mojo_device_sigmoid = _preflight_unsupported_backward(
@@ -237,6 +224,41 @@ def mojo_device_embedding(
     )
     if result is aten_fast.NOT_HANDLED:
         raise _unsupported("aten::embedding", (weight, indices))
+    return result
+
+
+def mojo_device_index(
+    self: torch.Tensor, indices: Sequence[torch.Tensor | None]
+) -> TorchMojoTensor:
+    """Advanced indexing, refused from the forward only where its backward
+    still cannot run.
+
+    `index.Tensor`'s derivative is
+    `zeros.index_put_(indices, grad, accumulate=True)`, i.e.
+    `aten::_index_put_impl_`. That op EXISTS for an integer index, so ordinary
+    `x[idx]` is differentiable here and a blanket refusal would reject a case
+    that works — this function used to be a table entry that did exactly that,
+    written when the op was missing.
+
+    A BOOLEAN mask is still refused. The forward takes it (through a host
+    bounce, since the number of selected rows is data dependent), but the
+    accumulating `index_put` its backward needs has no kernel for a mask, so
+    without this the engine would abort the process instead of raising.
+    """
+    if any(
+        index is not None and index.dtype in (torch.bool, torch.uint8)
+        for index in indices
+    ):
+        _refuse_unsupported_backward(
+            "aten::index.Tensor with a boolean mask",
+            "aten::_index_put_impl_ with a boolean mask",
+            (self,),
+            _GRAD_OFF_ONLY,
+        )
+    aten_fast = _fast()
+    result = aten_fast.fast_aten_index(self, indices)
+    if result is aten_fast.NOT_HANDLED:
+        raise _unsupported("aten::index.Tensor", (self, *indices))
     return result
 
 

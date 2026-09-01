@@ -4319,6 +4319,16 @@ _SCATTER_DTYPES = _FLOAT_DTYPES + (
     DType.bool,
 )
 
+# What ScatterAddDim can serve. It reduces with `Atomic.fetch_add`, and there
+# is no sub-32-bit atomic read-modify-write on the GPU targets, so the narrow
+# integer dtypes (and bool) are declined HERE rather than reaching the
+# compiler as an unsatisfiable specialization -- the Mojo dtype ladder
+# instantiates whatever DTYPE_ARG_0 names, with no list of its own to gate on.
+_SCATTER_ADD_DTYPES = _FLOAT_DTYPES + (DType.float64, DType.int32, DType.int64)
+
+# The rank Gather/ScatterDim pad their index space to.
+_DIM_INDEX_RANK = 4
+
 
 def _try_stack_scalars(
     tensors: Sequence[torch.Tensor], dim: int
@@ -4574,6 +4584,556 @@ def fast_aten_index(input, indices):
     return NOT_HANDLED
 
 
+# ---------------------------------------------------------------------------
+# The dim-indexed family: gather / index_select / scatter_add / index_add /
+# index_put.  All five are the SAME two Mojo kernels over a rank-<=4 index
+# space described by explicit strides (GatherDim reads, ScatterDim[+add]
+# writes); what distinguishes them is only which stride vector is real and
+# which is a broadcast:
+#
+#   gather        dims = index.shape,  index strides real
+#   index_select  dims = out.shape,    index strides 0 except along `dim`
+#   scatter_add   dims = index.shape,  index strides real, atomic add
+#   index_add     dims = source.shape, index strides 0 except along `dim`
+#   index_put     dims = values.shape, dim 0, index strides (1, 0, ...)
+#
+# INDEX BOUNDS ARE NOT CHECKED, matching torch: its CPU kernels raise before
+# launching, but the CUDA kernels only device-assert (ScatterGatherKernel.cu,
+# Indexing.cu), so an out-of-range index is undefined on an accelerator there
+# too.  NEGATIVE indices are undefined for gather/index_select/scatter_add/
+# index_add for the same reason -- torch never wraps them there.  They ARE
+# wrapped for index_put, which is advanced indexing and does define them; the
+# wrap reuses the `remainder` kernel on the index, exactly as torch's own
+# `wrapIndexOnce` does.
+# ---------------------------------------------------------------------------
+
+
+def _dim_launch_params(dims, out_strides, src_strides, idx_strides, dim):
+    """The 17-int parameter tuple Gather/ScatterDim take: the index-space
+    dims and three stride vectors, each left-padded to rank 4 (dims with 1,
+    strides with 0), plus the padded position of the indexed dim."""
+    pad = _DIM_INDEX_RANK - len(dims)
+    return (
+        tuple([1] * pad + list(dims))
+        + tuple([0] * pad + list(out_strides))
+        + tuple([0] * pad + list(src_strides))
+        + tuple([0] * pad + list(idx_strides))
+        + (dim + pad,)
+    )
+
+
+def _launch_gather_dim(out, src, idx, geometry):
+    """`geometry` is (dims, out_strides, src_strides, idx_strides, dim) over
+    the index space -- passed explicitly rather than read off the tensors so
+    a contiguous operand can be re-described at a lower rank (see
+    `_collapse3`) without minting a view object for it."""
+    _call_mojo(
+        _DataMovementExtension,
+        "GatherDim",
+        (
+            out._ptr,
+            src._ptr,
+            idx._ptr,
+            _dim_launch_params(*geometry),
+            idx._dtype.value,
+            out._itemsize,
+            _ctx_ptr(src._device),
+        ),
+        arg_dtypes=(src._dtype, idx._dtype),
+        output_dtypes=(out._dtype,),
+        keepalive=(out, src, idx),
+    )
+
+
+def _launch_scatter_add_dim(out, src, idx, geometry):
+    _call_mojo(
+        _DataMovementExtension,
+        "ScatterAddDim",
+        (
+            out._ptr,
+            idx._ptr,
+            src._ptr,
+            _dim_launch_params(*geometry),
+            out._dtype.value,
+            _ctx_ptr(out._device),
+        ),
+        arg_dtypes=(out._dtype, idx._dtype, src._dtype),
+        output_dtypes=(out._dtype,),
+        keepalive=(out, src, idx),
+    )
+
+
+def _collapse3(shape, dim):
+    """`(outer, shape[dim], inner)`: the rank-3 form of a CONTIGUOUS operand
+    around its indexed dim.
+
+    A broadcast-index op (index_select / index_add) touches only the `dim`
+    coordinate, so every other dim can be folded into one leading and one
+    trailing extent. That lifts the kernels' rank-4 cap for contiguous
+    operands of any rank and costs one div/mod less per element than the
+    padded rank-4 form.
+    """
+    return math.prod(shape[:dim]), shape[dim], math.prod(shape[dim + 1 :])
+
+
+def _int64_index(index):
+    """`index` as a contiguous int64 tensor, or None.
+
+    The ScatterDim family carries one comptime index dtype (int64) rather
+    than the width ladder GatherDim/GatherRows have, so an int32 index --
+    which torch accepts for index_select/index_add/index_put -- is widened
+    here instead of doubling the number of compiled variants.
+    """
+    idx = _t(index)
+    if idx is None:
+        return None
+    if idx._dtype == DType.int64:
+        return _tc(idx)
+    if idx._dtype == DType.int32:
+        return _tc(_cast_tensor(_tc(idx), DType.int64))
+    return None
+
+
+def _dim_op_dest(out, shape, dtype, device):
+    """`(destination, out)` for an optional `out=` argument.
+
+    `destination` is what the kernel writes; when it is not `out` itself the
+    caller copies it in afterwards. `(None, None)` means `out` cannot serve.
+    Every input must already be validated before this runs: it resizes `out`,
+    so a route that declines afterwards would leave a half-applied out=.
+    """
+    shape = tuple(shape)
+    if out is None:
+        return _alloc(shape, dtype, device), None
+    dst = _t(out)
+    if dst is None or dst._dtype != dtype or dst._device != device:
+        return None, None
+    if tuple(dst._shape) != shape:
+        _resize_payload(dst, shape)
+        return dst, dst
+    if dst._is_contiguous:
+        return dst, dst
+    # A correctly-shaped strided view keeps its storage and takes one
+    # ordered copy after the kernel.
+    return _alloc(shape, dtype, device), dst
+
+
+def _dim_op_finish(dest, out):
+    if out is None:
+        return dest
+    if dest is not out:
+        _copy_into(out, dest)
+    return out
+
+
+def _index_space_fits(idx_shape, shape, skip_dim=None):
+    """torch's gather/scatter shape rule: `index.size(d) <= other.size(d)`
+    for every dim, optionally skipping the indexed one. Enforced because a
+    backend kernel registered at this level replaces the structured meta
+    function that would otherwise have checked it -- and reading past a
+    smaller operand is an out-of-bounds access, not a wrong answer."""
+    return all(
+        i <= s for d, (i, s) in enumerate(zip(idx_shape, shape)) if d != skip_dim
+    )
+
+
+def fast_aten_gather(input, dim, index, sparse_grad=False, *, out=None):
+    t = _t(input)
+    idx = _t(index)
+    if t is None or idx is None or not isinstance(dim, int):
+        return NOT_HANDLED
+    if idx._device != t._device or idx._dtype not in _INT_SCALAR_DTYPES:
+        return NOT_HANDLED
+    if t._dtype not in _COPYABLE_DTYPES:
+        return NOT_HANDLED
+    rank = len(t._shape)
+    if rank == 0 or rank > _DIM_INDEX_RANK or len(idx._shape) != rank:
+        return NOT_HANDLED
+    if not -rank <= dim < rank:
+        return NOT_HANDLED
+    dim %= rank
+    if not _index_space_fits(idx._shape, t._shape, dim):
+        return NOT_HANDLED
+
+    dest, out_t = _dim_op_dest(out, idx._shape, t._dtype, t._device)
+    if dest is None:
+        return NOT_HANDLED
+    if dest._numel > 0:
+        _launch_gather_dim(
+            dest, t, idx, (idx._shape, dest._mojo_strides, t._mojo_strides, idx._mojo_strides, dim)
+        )
+    return _dim_op_finish(dest, out_t)
+
+
+def fast_aten_index_select(input, dim, index, *, out=None):
+    t = _t(input)
+    idx = _t(index)
+    if t is None or idx is None or not isinstance(dim, int):
+        return NOT_HANDLED
+    if idx._device != t._device or idx._dtype not in _INT_SCALAR_DTYPES:
+        return NOT_HANDLED
+    if t._dtype not in _COPYABLE_DTYPES or len(idx._shape) > 1:
+        return NOT_HANDLED
+    rank = len(t._shape)
+    if rank == 0 or not -rank <= dim < rank:
+        return NOT_HANDLED
+    dim %= rank
+    # A contiguous input collapses to a rank-3 (outer, n, inner) problem
+    # whatever its rank; a strided one needs its real strides and so is
+    # capped at the kernels' rank.
+    if not t._is_contiguous and rank > _DIM_INDEX_RANK:
+        return NOT_HANDLED
+
+    n = idx._numel
+    shape = list(t._shape)
+    shape[dim] = n
+    dest, out_t = _dim_op_dest(out, shape, t._dtype, t._device)
+    if dest is None:
+        return NOT_HANDLED
+    if dest._numel > 0:
+        idx_c = _tc(idx)
+        idx_stride = idx_c._mojo_strides[0] if idx_c._shape else 0
+        # `dest` is always contiguous here: `_dim_op_dest` either allocated
+        # it or resized `out` (which resets it to contiguous strides), and a
+        # correctly-shaped strided `out` got scratch instead.
+        if dim == 0 and t._is_contiguous:
+            # Whole rows along dim 0: the existing GatherRows kernel, one
+            # div/mod per element instead of three.
+            _call_mojo(
+                _DataMovementExtension,
+                "GatherRows",
+                (
+                    dest._ptr,
+                    t._ptr,
+                    idx_c._ptr,
+                    idx_c._dtype.value,
+                    n,
+                    math.prod(t._shape[1:]),
+                    t._shape[0],
+                    dest._itemsize,
+                    _ctx_ptr(t._device),
+                ),
+                arg_dtypes=(t._dtype, idx_c._dtype),
+                output_dtypes=(dest._dtype,),
+                keepalive=(dest, t, idx_c),
+            )
+        elif t._is_contiguous:
+            outer, size_dim, inner = _collapse3(t._shape, dim)
+            _launch_gather_dim(
+                dest,
+                t,
+                idx_c,
+                (
+                    (outer, n, inner),
+                    (n * inner, inner, 1),
+                    (size_dim * inner, inner, 1),
+                    (0, idx_stride, 0),
+                    1,
+                ),
+            )
+        else:
+            idx_strides = [0] * rank
+            idx_strides[dim] = idx_stride
+            _launch_gather_dim(
+                dest, t, idx_c, (shape, dest._mojo_strides, t._mojo_strides, idx_strides, dim)
+            )
+    return _dim_op_finish(dest, out_t)
+
+
+def _scatter_add_dest(input, out):
+    """`(dest, out_t)` for a scatter-add-shaped op: the destination starts as
+    a copy of `self`, since `out = self.clone(); out[...] += src`. `out is
+    self` (the in-place `scatter_add_`/`index_add_` overloads) needs no copy
+    at all."""
+    a = _t(input)
+    dest, out_t = _dim_op_dest(out, a._shape, a._dtype, a._device)
+    if dest is None:
+        return None, None
+    if dest is not a:
+        _copy_into(dest, a)
+    return dest, out_t
+
+
+def fast_aten_scatter_add(input, dim, index, src, *, out=None):
+    a = _t(input)
+    s = _t(src)
+    idx = _t(index)
+    if a is None or s is None or idx is None or not isinstance(dim, int):
+        return NOT_HANDLED
+    if idx._device != a._device or s._device != a._device:
+        return NOT_HANDLED
+    if idx._dtype != DType.int64 or s._dtype != a._dtype:
+        return NOT_HANDLED
+    if a._dtype not in _SCATTER_ADD_DTYPES:
+        return NOT_HANDLED
+    if a._dtype == DType.float64 and a._device.api == "metal":
+        return NOT_HANDLED
+    rank = len(a._shape)
+    if rank == 0 or rank > _DIM_INDEX_RANK or not -rank <= dim < rank:
+        return NOT_HANDLED
+    if len(idx._shape) != rank or len(s._shape) != rank:
+        return NOT_HANDLED
+    dim %= rank
+    if not _index_space_fits(idx._shape, a._shape, dim):
+        return NOT_HANDLED
+    if not _index_space_fits(idx._shape, s._shape):
+        return NOT_HANDLED
+
+    dest, out_t = _scatter_add_dest(input, out)
+    if dest is None:
+        return NOT_HANDLED
+    if idx._numel > 0:
+        _launch_scatter_add_dim(
+            dest, s, idx, (idx._shape, dest._mojo_strides, s._mojo_strides, idx._mojo_strides, dim)
+        )
+    return _dim_op_finish(dest, out_t)
+
+
+def fast_aten_scatter_add_(input, dim, index, src):
+    """`scatter_add_`: the out= destination IS self, so no clone happens."""
+    return fast_aten_scatter_add(input, dim, index, src, out=input)
+
+
+def fast_aten_index_add(input, dim, index, source, alpha=1, *, out=None):
+    a = _t(input)
+    if a is None or not isinstance(dim, int):
+        return NOT_HANDLED
+    # alpha scales `source`; an extra elementwise pass for it would be a
+    # different op's kernel, so only the default is served here.
+    if not isinstance(alpha, int | float) or isinstance(alpha, bool) or alpha != 1:
+        return NOT_HANDLED
+    idx = _int64_index(index)
+    src = _t(source)
+    if idx is None or src is None or len(idx._shape) > 1:
+        return NOT_HANDLED
+    if idx._device != a._device or src._device != a._device:
+        return NOT_HANDLED
+    if src._dtype != a._dtype or a._dtype not in _SCATTER_ADD_DTYPES:
+        return NOT_HANDLED
+    if a._dtype == DType.float64 and a._device.api == "metal":
+        return NOT_HANDLED
+    rank = len(a._shape)
+    if rank == 0 or not -rank <= dim < rank:
+        return NOT_HANDLED
+    dim %= rank
+    n = idx._numel
+    expected = list(a._shape)
+    expected[dim] = n
+    if list(src._shape) != expected:
+        return NOT_HANDLED
+    src_c = _tc(src)
+
+    dest, out_t = _scatter_add_dest(input, out)
+    if dest is None:
+        return NOT_HANDLED
+    if n > 0 and src_c._numel > 0:
+        # Both operands are contiguous by construction here -- `_tc` for the
+        # source, `_dim_op_dest` for the destination -- so the rank-3 collapse
+        # always applies and there is no rank cap on this op.
+        outer, size_dim, inner = _collapse3(a._shape, dim)
+        _launch_scatter_add_dim(
+            dest,
+            src_c,
+            idx,
+            (
+                (outer, n, inner),
+                (size_dim * inner, inner, 1),
+                (n * inner, inner, 1),
+                (0, idx._mojo_strides[0] if idx._shape else 0, 0),
+                1,
+            ),
+        )
+    return _dim_op_finish(dest, out_t)
+
+
+def fast_aten_index_add_(input, dim, index, source, alpha=1):
+    """`index_add_`: the out= destination IS self, so no clone happens."""
+    return fast_aten_index_add(input, dim, index, source, alpha, out=input)
+
+
+def _mask_over_leading_dims(mask, shape):
+    """An index mask reshaped so masked_fill's broadcast means what advanced
+    indexing means, or None.
+
+    A mask index covers `self`'s LEADING dims, while broadcasting is
+    right-aligned: a shape-(4,) mask on a (4, 5) tensor selects rows, but
+    `masked_fill_` would try to broadcast it across the 5 columns -- an error
+    when 4 != 5, and silently the WRONG axis when they happen to be equal.
+    Appending the missing trailing 1s (zero-copy: a mask index is contiguous
+    or it is not ours) makes the two conventions agree.
+    """
+    m = _tc(mask)
+    if m is None or len(m._shape) > len(shape):
+        return None
+    if any(a != b for a, b in zip(m._shape, shape)):
+        return None
+    if len(m._shape) == len(shape):
+        return m
+    padded = fast_aten_view(m, tuple(m._shape) + (1,) * (len(shape) - len(m._shape)))
+    return None if padded is NOT_HANDLED else padded
+
+
+def _fold_leading_strides(t, k):
+    """`t`'s element strides with its first `k` dims folded into one axis, or
+    None when they do not fold.
+
+    They fold when their extents and strides describe a single run
+    (`stride[d] == stride[d+1] * shape[d+1]`), which covers both of the cases
+    that reach it: a contiguous buffer, and a fully broadcast one whose
+    strides are all 0. `k == 0` (a 0-d index) prepends a stride for the
+    length-1 row axis the kernel still walks.
+    """
+    if k == 0:
+        return [0] + list(t._mojo_strides)
+    for d in range(k - 1):
+        if t._mojo_strides[d] != t._mojo_strides[d + 1] * t._shape[d + 1]:
+            return None
+    return [t._mojo_strides[k - 1]] + list(t._mojo_strides[k:])
+
+
+def fast_aten_index_put(input, indices, values, accumulate=False, unsafe=False):
+    """Registered for `aten::_index_put_impl_`, which `x[idx] = v` /
+    `x[mask] = v` and `index_put`/`index_put_` all funnel into (those two are
+    CompositeExplicitAutograd wrappers over this one). Named after the concept
+    rather than that overload so it pairs with `aten_functions.aten_index_put`.
+
+    Writes into `input` and returns it. Only a single index tensor on dim 0
+    is served -- of ANY rank, matching what `fast_aten_index` reads, so that
+    `x[idx2d]` is differentiable and not just readable; multi-tensor advanced
+    indexing declines. Duplicate indices with `accumulate=False`
+    race, and torch leaves the winner undefined there too.
+
+    KNOWN GAP, not this function's: on a mojo device that is not the current
+    one, the `accumulate=False` BACKWARD declines and, being inside the
+    autograd engine, aborts the process. Its derivative formula is
+    `grad.index_put(indices, zeros_like(values), false)`, and that
+    `zeros_like` is allocated by ATen on the CURRENT device rather than on
+    `values`' device -- the PrivateUse1 device guard is a no-op here, so the
+    values tensor arrives on a different device than self and there is
+    nothing to do but decline. Every C++ derivative formula that allocates
+    without naming a device has the same problem; the fix belongs in the
+    device guard, not here.
+    """
+    a = _t(input)
+    if a is None or not isinstance(indices, list | tuple):
+        return NOT_HANDLED
+    non_none = [(i, x) for i, x in enumerate(indices) if x is not None]
+    if len(non_none) != 1 or non_none[0][0] != 0:
+        return NOT_HANDLED
+    raw = _t(non_none[0][1])
+    if raw is None or raw._device != a._device:
+        return NOT_HANDLED
+
+    if raw._dtype == DType.bool:
+        # `x[mask] = scalar`, the one boolean-mask form whose output shape is
+        # not data dependent: torch's own `_index_put_impl_` re-routes exactly
+        # it to masked_fill_ (canDispatchToMaskedFill), and so does this.
+        # Anything else needs the mask's true-count, i.e. a host sync.
+        if accumulate:
+            return NOT_HANDLED
+        value = values
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return NOT_HANDLED
+            if not isinstance(value, TorchMojoTensor):
+                # A python scalar assignment arrives as a 1-element CPU tensor
+                # (python_variable_indexing.cpp builds it there); reading it
+                # back costs no device sync.
+                value = value.item()
+        elif not isinstance(value, int | float | bool):
+            return NOT_HANDLED
+        mask = _mask_over_leading_dims(raw, a._shape)
+        if mask is None:
+            return NOT_HANDLED
+        return (
+            input
+            if fast_aten_masked_fill_(input, mask, value) is not None
+            else NOT_HANDLED
+        )
+
+    if raw._dtype not in _INT_SCALAR_DTYPES:
+        return NOT_HANDLED
+    v = _t(values)
+    if v is None or v._device != a._device or v._dtype != a._dtype:
+        return NOT_HANDLED
+    dtypes = _SCATTER_ADD_DTYPES if accumulate else _SCATTER_DTYPES
+    if a._dtype not in dtypes:
+        return NOT_HANDLED
+    # Metal has no float64 at all, in either scatter kernel; decline instead of
+    # letting `_parallel_for_dt`'s guard raise from inside the launch.
+    if a._dtype == DType.float64 and a._device.api == "metal":
+        return NOT_HANDLED
+    rank = len(a._shape)
+    if rank == 0 or rank > _DIM_INDEX_RANK:
+        return NOT_HANDLED
+    n = raw._numel
+    dims = (n,) + tuple(a._shape[1:])
+    if n == 0 or a._numel == 0:
+        return input
+    # `values` is written over the index space `index.shape + self.shape[1:]`,
+    # which the kernel walks as the flattened `(n,) + self.shape[1:]`. Two
+    # shapes arrive here: exactly that subspace (what `aten::index.Tensor`'s
+    # backward hands back, and it is often a STRIDE-0 expansion of a scalar,
+    # so it has no view at the lower rank -- fold its leading dims into one
+    # stride instead), or something smaller that broadcasts.
+    put_shape = tuple(raw._shape) + tuple(a._shape[1:])
+    if tuple(v._shape) == put_shape:
+        src_strides = _fold_leading_strides(v, len(raw._shape))
+        if src_strides is None:
+            return NOT_HANDLED
+    elif tuple(v._shape) == dims:
+        src_strides = list(v._mojo_strides)
+    else:
+        expanded = fast_aten_expand(v, dims)
+        if expanded is NOT_HANDLED:
+            return NOT_HANDLED
+        v = expanded
+        src_strides = list(v._mojo_strides)
+
+    # Advanced indexing DOES define negative indices; `remainder` by the
+    # indexed extent is how torch's own wrapIndexOnce normalizes them.
+    idx = _int64_index(raw)
+    if idx is None:
+        return NOT_HANDLED
+    # One row per index ELEMENT, whatever the index's rank: flatten it so the
+    # kernel walks it with a single stride (zero-copy, `_int64_index` already
+    # made it contiguous).
+    if len(idx._shape) != 1:
+        idx = fast_aten_view(idx, (n,))
+        if idx is NOT_HANDLED:
+            return NOT_HANDLED
+    wrapped = fast_aten_remainder(idx, a._shape[0])
+    if wrapped is NOT_HANDLED:
+        return NOT_HANDLED
+    idx = _tc(wrapped)
+
+    idx_strides = [0] * rank
+    idx_strides[0] = idx._mojo_strides[0] if idx._shape else 0
+    geometry = (dims, a._mojo_strides, src_strides, idx_strides, 0)
+    if accumulate:
+        _launch_scatter_add_dim(a, v, idx, geometry)
+    else:
+        _call_mojo(
+            _DataMovementExtension,
+            "ScatterDim",
+            (
+                a._ptr,
+                idx._ptr,
+                v._ptr,
+                _dim_launch_params(*geometry),
+                0,
+                0.0,
+                a._dtype.value,
+                _ctx_ptr(a._device),
+            ),
+            arg_dtypes=(a._dtype, idx._dtype, v._dtype),
+            output_dtypes=(a._dtype,),
+            flags={"VALUE_MODE": False},
+            keepalive=(a, v, idx),
+        )
+    return input
+
+
 def _fast_scatter(input, dim, index, src, value):
     a = _t(input)
     idx = _t(index)
@@ -4598,7 +5158,7 @@ def _fast_scatter(input, dim, index, src, value):
     is_value = 0
     value_f = 0.0
     src_ptr = out._ptr  # unused in value mode; a valid pointer for the kernel
-    src_strides4 = [0, 0, 0, 0]
+    src_strides = [0] * rank
     if src is not None:
         s = _tc(src)
         if (
@@ -4609,7 +5169,7 @@ def _fast_scatter(input, dim, index, src, value):
         ):
             return NOT_HANDLED
         src_ptr = s._ptr
-        src_strides4 = [0] * (4 - rank) + list(_row_major_strides(s._shape))
+        src_strides = _row_major_strides(s._shape)
     else:
         if isinstance(value, bool):
             value = int(value)
@@ -4621,16 +5181,8 @@ def _fast_scatter(input, dim, index, src, value):
         else:
             value_f = float(value)
 
-    dims4 = [1] * (4 - rank) + list(idx_c._shape)
-    out_strides4 = [0] * (4 - rank) + list(out._mojo_strides)
-    idx_strides4 = [0] * (4 - rank) + list(idx_c._mojo_strides)
-    dim_padded = dim + (4 - rank)
-    params = (
-        tuple(dims4)
-        + tuple(out_strides4)
-        + tuple(src_strides4)
-        + tuple(idx_strides4)
-        + (dim_padded,)
+    params = _dim_launch_params(
+        idx_c._shape, out._mojo_strides, src_strides, idx_c._mojo_strides, dim
     )
     if idx_c._numel > 0:
         _call_mojo(

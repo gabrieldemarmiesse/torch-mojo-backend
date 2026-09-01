@@ -34,7 +34,6 @@ from .aten_ops.autograd_preflight import (
     mojo_device_native_batch_norm,
     mojo_device_native_group_norm,
     mojo_device_relu,
-    mojo_device_scatter_src,
     mojo_device_sigmoid,
     mojo_device_softmax,
     mojo_device_tanh,
@@ -176,6 +175,7 @@ register_aten_op("aten::_foreach_norm.Scalar")(mojo_device__foreach_norm_scalar)
 register_aten_op("aten::_foreach_sqrt")(mojo_device__foreach_sqrt)
 _register_fast("aten::_fused_adamw_", "fast_aten__fused_adamw")
 _register_fast("aten::_fused_adamw_.tensor_lr", "fast_aten__fused_adamw")
+_register_fast("aten::_index_put_impl_", "fast_aten_index_put")
 _register_fast("aten::_local_scalar_dense", "fast_aten__local_scalar_dense")
 _register_fast("aten::_log_softmax", "fast_aten__log_softmax")
 _register_fast(
@@ -277,6 +277,18 @@ _register_fast("aten::floor_divide.Scalar", "fast_aten_floor_divide")
 _register_fast("aten::floordiv", "fast_aten_floor_divide")
 register_aten_op("aten::full")(mojo_device_full)
 register_aten_op("aten::full_like")(mojo_device_full_like)
+# The functional/in-place overloads of the structured ops in this family are
+# registered ALONGSIDE their `.out` twin on purpose. PyTorch's generated
+# wrapper for a `structured_delegate` op allocates the `out` tensor itself,
+# on the CURRENT device rather than the input's -- the PrivateUse1 device
+# guard is a no-op for us (there is no C++ extension to register a real
+# one), so on a machine with more than one accelerator that wrapper hands
+# `gather.out` an `out` that lives on the wrong device and nothing can
+# recover from it. A backend kernel on the functional overload takes
+# precedence over the wrapper and allocates the output where the inputs
+# are, which is also one allocation and one dispatch less.
+_register_fast("aten::gather", "fast_aten_gather")
+_register_fast("aten::gather.out", "fast_aten_gather")
 _register_fast("aten::ge", "fast_aten_ge")
 _register_fast("aten::ge.Scalar", "fast_aten_ge")
 _register_fast("aten::ge.Tensor", "fast_aten_ge")
@@ -286,6 +298,11 @@ _register_fast("aten::gt", "fast_aten_gt")
 _register_fast("aten::gt.Scalar", "fast_aten_gt")
 _register_fast("aten::gt.Tensor", "fast_aten_gt")
 register_aten_op("aten::index.Tensor")(mojo_device_index)
+_register_fast("aten::index_add", "fast_aten_index_add")
+_register_fast("aten::index_add.out", "fast_aten_index_add")
+_register_fast("aten::index_add_", "fast_aten_index_add_")
+_register_fast("aten::index_select", "fast_aten_index_select")
+_register_fast("aten::index_select.out", "fast_aten_index_select")
 _register_fast("aten::isin.Tensor_Tensor", "fast_aten_isin")
 _register_out("aten::isin.Tensor_Tensor_out", "fast_aten_isin", dtype_policy="exact")
 _register_fast("aten::isnan", "fast_aten_isnan")
@@ -366,8 +383,11 @@ register_aten_op("aten::scalar_tensor")(mojo_device_scalar_tensor)
 _register_fast(
     "aten::scaled_dot_product_attention", "fast_aten_scaled_dot_product_attention"
 )
-register_aten_op("aten::scatter.src")(mojo_device_scatter_src)
+_register_fast("aten::scatter.src", "fast_aten_scatter_src")
 _register_fast("aten::scatter.value", "fast_aten_scatter_value")
+_register_fast("aten::scatter_add", "fast_aten_scatter_add")
+_register_fast("aten::scatter_add.out", "fast_aten_scatter_add")
+_register_fast("aten::scatter_add_", "fast_aten_scatter_add_")
 _register_fast("aten::searchsorted.Scalar", "fast_aten_searchsorted")
 _register_out(
     "aten::searchsorted.Scalar_out", "fast_aten_searchsorted", dtype_policy="exact"

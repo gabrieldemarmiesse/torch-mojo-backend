@@ -1083,37 +1083,74 @@ def test_autograd_preflight_refuses_relu_inplace_in_the_forward(mojo_gpu):
         torch.relu_(non_leaf)
 
 
-def test_autograd_preflight_refuses_advanced_indexing_in_the_forward(mojo_gpu):
-    """`index.Tensor`'s backward scatters through `_index_put_impl_`."""
+@pytest.mark.parametrize("index_shape", [(2,), (3, 2)], ids=["1d", "2d"])
+def test_advanced_indexing_with_an_integer_index_is_differentiable(
+    mojo_gpu, index_shape
+):
+    """`index.Tensor`'s backward scatters through `_index_put_impl_`, which
+    exists now, so this must NOT be refused -- it used to be.
+
+    The 2-D index is the case worth a node of its own: the grad handed to the
+    backward is a stride-0 expansion whose leading index dims have no view at
+    the rank the scatter walks, so a `values` reshape (rather than folding
+    those dims into one stride) declines and aborts the engine.
+    """
     host_input, device_input = _preflight_input((4, 5), mojo_gpu)
-    index = torch.tensor([0, 2], device=mojo_gpu)
-    torch.testing.assert_close(device_input[index].cpu(), host_input[[0, 2]])
+    host_index = torch.arange(math.prod(index_shape)).reshape(index_shape) % 4
+    index = host_index.to(mojo_gpu)
+
+    host_leaf = host_input.clone().requires_grad_()
+    host_leaf[host_index].sum().backward()
+    device_input.requires_grad_()
+    device_input[index].sum().backward()
+
+    torch.testing.assert_close(device_input.grad.cpu(), host_leaf.grad)
+
+
+def test_advanced_indexing_with_a_boolean_mask_is_refused_in_the_forward(mojo_gpu):
+    """A mask's accumulating index_put has no kernel (the written element count
+    is data dependent), so this one still has to be refused from the forward
+    rather than aborting the engine."""
+    host_input, device_input = _preflight_input((4, 5), mojo_gpu)
+    mask = (torch.arange(4) % 2 == 0).to(mojo_gpu)
+    torch.testing.assert_close(
+        device_input[mask].cpu(), host_input[torch.arange(4) % 2 == 0]
+    )
     device_input.requires_grad_()
     with pytest.raises(NotImplementedError, match="aten::_index_put_impl_"):
-        device_input[index]
+        device_input[mask]
 
 
-def test_autograd_preflight_refuses_scatter_src_only_for_the_src_gradient(mojo_gpu):
-    """Only `src`'s gradient needs `gather`; a self-only call still runs.
+def test_scatter_src_is_differentiable_in_both_operands(mojo_gpu):
+    """`src`'s gradient is `grad.gather(dim, index)`, which exists now.
 
-    The `self` gradient is a scatter of zeros, which this backend can run, so
-    preflighting on "any operand requires grad" would refuse a working call.
+    This op used to be preflighted so that a `src`-requiring-grad call was
+    refused from the forward; with `aten::gather` implemented both gradients
+    run, and refusing either would reject a working call.
     """
     host_input, device_input = _preflight_input((4, 5), mojo_gpu)
     host_src, device_src = _preflight_input((4, 1), mojo_gpu, seed=7)
-    index = torch.zeros(4, 1, dtype=torch.long, device=mojo_gpu)
+    host_index = torch.zeros(4, 1, dtype=torch.long)
+    index = host_index.to(mojo_gpu)
 
-    expected = host_input.scatter(1, torch.zeros(4, 1, dtype=torch.long), host_src)
+    expected = host_input.scatter(1, host_index, host_src)
     torch.testing.assert_close(
         device_input.scatter(1, index, device_src).cpu(), expected
     )
-    # self-only: still allowed, and the node it records is runnable.
-    device_input.requires_grad_()
-    device_input.scatter(1, index, device_src).sum().backward()
-    assert device_input.grad is not None
 
-    with pytest.raises(NotImplementedError, match="aten::gather"):
-        device_input.detach().scatter(1, index, device_src.requires_grad_())
+    for want_self, want_src in ((True, False), (False, True), (True, True)):
+        host_a = host_input.clone().requires_grad_(want_self)
+        host_b = host_src.clone().requires_grad_(want_src)
+        host_a.scatter(1, host_index, host_b).sum().backward()
+
+        device_a = device_input.detach().clone().requires_grad_(want_self)
+        device_b = device_src.detach().clone().requires_grad_(want_src)
+        device_a.scatter(1, index, device_b).sum().backward()
+
+        if want_self:
+            torch.testing.assert_close(device_a.grad.cpu(), host_a.grad)
+        if want_src:
+            torch.testing.assert_close(device_b.grad.cpu(), host_b.grad)
 
 
 def test_autograd_preflight_refuses_efficient_attention_in_the_forward(mojo_gpu):

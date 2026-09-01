@@ -531,7 +531,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "sum_to_size": ("float32", "bfloat16", "float16", "int64", "bool"),
     "svd": ("float32",),
     "take": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "take_along_dim": ("float32", "bfloat16", "float16", "int64", "bool"),
     "tan": ("int64", "bool"),
     "tanh": ("int64", "bool"),
     "tensordot": ("float32", "bfloat16", "float16", "int64"),
