@@ -1679,24 +1679,49 @@ def aten_clone(
 
 
 # col2im(Tensor self, SymInt[2] output_size, int[2] kernel_size, int[2] dilation, int[2] padding, int[2] stride) -> Tensor
+def _torch_pad_to_max_paddings(rank: int, pad: list[SymIntType]) -> list[SymIntType]:
+    """Torch's pad list to MAX's `ops.pad` paddings list.
+
+    Torch's pad list covers the trailing `len(pad) // 2` dims, LAST dim
+    first: `[last_before, last_after, second_to_last_before, ...]`. MAX
+    wants every dim, in forward order: `[before_dim0, after_dim0,
+    before_dim1, after_dim1, ...]`. Shared by constant_pad_nd,
+    reflection_pad2d and replication_pad2d, whose pad/padding arguments all
+    use this same torch convention.
+    """
+    paddings: list[SymIntType] = [0] * (2 * rank)
+    for i in range(len(pad) // 2):
+        dim = rank - 1 - i
+        paddings[2 * dim] = pad[2 * i]
+        paddings[2 * dim + 1] = pad[2 * i + 1]
+    return paddings
+
+
 # constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor
 @map_to(aten.constant_pad_nd)
 def aten_constant_pad_nd(
     input: MaxTensor, pad: list[int | Dim], value: Scalar = 0
 ) -> MaxTensor:
-    if any(isinstance(p, int) and p < 0 for p in pad):
-        raise NotImplementedError(
-            "constant_pad_nd with negative padding (cropping) is not supported yet"
-        )
-    # torch's pad list covers the trailing len(pad)//2 dims, LAST dim first:
-    # [last_before, last_after, second_to_last_before, ...]. MAX wants all
-    # dims in forward order: [before_dim0, after_dim0, before_dim1, ...].
     rank = len(input.shape)
-    paddings = [0] * (2 * rank)
-    for i in range(len(pad) // 2):
-        dim = rank - 1 - i
-        paddings[2 * dim] = pad[2 * i]
-        paddings[2 * dim + 1] = pad[2 * i + 1]
+    if any(isinstance(p, int) and p < 0 for p in pad):
+        # A negative entry crops rather than pads. Mirrors ATen's own
+        # constant_pad_nd (PadNd.cpp): narrow the input away from the
+        # negative amount first, then pad only what remains non-negative --
+        # MAX's ops.pad rejects negative paddings outright.
+        slices = [slice(None)] * rank
+        cropped_pad = list(pad)
+        for i in range(len(pad) // 2):
+            dim = rank - 1 - i
+            before, after = pad[2 * i], pad[2 * i + 1]
+            if isinstance(before, int) and before < 0:
+                slices[dim] = slice(-before, slices[dim].stop)
+                cropped_pad[2 * i] = 0
+            if isinstance(after, int) and after < 0:
+                slices[dim] = slice(slices[dim].start, after)
+                cropped_pad[2 * i + 1] = 0
+        input = input[*slices]
+        pad = cropped_pad
+    paddings = _torch_pad_to_max_paddings(rank, pad)
     return max_ops.pad(input, paddings, mode="constant", value=value)
 
 
@@ -3131,6 +3156,34 @@ def aten_reciprocal(tensor: MaxTensor) -> MaxTensor:
 
 # reflection_pad1d(Tensor self, SymInt[2] padding) -> Tensor
 # reflection_pad2d(Tensor self, SymInt[4] padding) -> Tensor
+@map_to(aten.reflection_pad2d)
+def aten_reflection_pad2d(input: MaxTensor, padding: list[SymIntType]) -> MaxTensor:
+    pad_l, pad_r, pad_t, pad_b = padding
+    input_h, input_w = input.shape[-2], input.shape[-1]
+    # Match ATen's own validation (ReflectionPad.cpp): a reflected index
+    # needs a pivot strictly inside the dimension. Only checked when both
+    # the padding and the dimension are concrete -- a dynamic dim trusts the
+    # graph, same as everywhere else in this file.
+    if (
+        isinstance(pad_l, int)
+        and isinstance(pad_r, int)
+        and isinstance(input_w, StaticDim)
+        and not (pad_l < int(input_w) and pad_r < int(input_w))
+    ) or (
+        isinstance(pad_t, int)
+        and isinstance(pad_b, int)
+        and isinstance(input_h, StaticDim)
+        and not (pad_t < int(input_h) and pad_b < int(input_h))
+    ):
+        raise RuntimeError(
+            "Padding size should be less than the corresponding input "
+            f"dimension, but got: padding ({pad_l}, {pad_r}, {pad_t}, {pad_b}) "
+            f"for input of size {tuple(input.shape)}"
+        )
+    paddings = _torch_pad_to_max_paddings(len(input.shape), padding)
+    return max_ops.pad(input, paddings, mode="reflect")
+
+
 # reflection_pad3d(Tensor self, SymInt[6] padding) -> Tensor
 
 
@@ -3165,6 +3218,15 @@ def aten_repeat(input: MaxTensor, repeats: list[SymIntType]) -> MaxTensor:
 
 
 # replication_pad2d(Tensor self, SymInt[4] padding) -> Tensor
+@map_to(aten.replication_pad2d)
+def aten_replication_pad2d(input: MaxTensor, padding: list[SymIntType]) -> MaxTensor:
+    # Unlike reflection padding, ATen's replication_pad2d (ReplicationPadding.cpp)
+    # places no upper bound on the padding size relative to the input dimension --
+    # every padded cell just repeats the nearest edge element.
+    paddings = _torch_pad_to_max_paddings(len(input.shape), padding)
+    return max_ops.pad(input, paddings, mode="edge")
+
+
 # replication_pad3d(Tensor self, SymInt[6] padding) -> Tensor
 
 

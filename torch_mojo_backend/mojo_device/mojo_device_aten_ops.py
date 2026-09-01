@@ -33,7 +33,9 @@ from .aten_ops.autograd_preflight import (
     mojo_device_max_pool2d_with_indices,
     mojo_device_native_batch_norm,
     mojo_device_native_group_norm,
+    mojo_device_reflection_pad2d,
     mojo_device_relu,
+    mojo_device_replication_pad2d,
     mojo_device_scatter_src,
     mojo_device_sigmoid,
     mojo_device_softmax,
@@ -355,12 +357,14 @@ _register_fast("aten::permute", "fast_aten_permute")
 _register_fast("aten::pow.Tensor_Scalar", "fast_aten_pow")
 _register_fast("aten::pow.Tensor_Tensor", "fast_aten_pow_tensor_tensor")
 _register_fast("aten::reciprocal", "fast_aten_reciprocal")
+register_aten_op("aten::reflection_pad2d")(mojo_device_reflection_pad2d)
 register_aten_op("aten::relu")(mojo_device_relu)
 register_aten_op("aten::relu_")(mojo_device_relu_)
 _register_fast("aten::remainder.Scalar", "fast_aten_remainder")
 _register_fast("aten::remainder.Scalar_Tensor", "fast_aten_remainder")
 _register_fast("aten::remainder.Tensor", "fast_aten_remainder")
 _register_fast("aten::repeat", "fast_aten_repeat")
+register_aten_op("aten::replication_pad2d")(mojo_device_replication_pad2d)
 _register_fast("aten::rsqrt", "fast_aten_rsqrt")
 register_aten_op("aten::scalar_tensor")(mojo_device_scalar_tensor)
 _register_fast(

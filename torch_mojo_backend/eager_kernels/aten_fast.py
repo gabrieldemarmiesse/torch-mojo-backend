@@ -4518,6 +4518,89 @@ def fast_aten_triu(input, diagonal=0):
     return _fast_triangular(input, diagonal, 1)
 
 
+def _fast_pad2d(
+    input: torch.Tensor, padding: list[int], reflect: bool
+) -> TorchMojoTensor | object:
+    """Shared body for `fast_aten_reflection_pad2d`/`fast_aten_replication_pad2d`.
+
+    `padding` is `(left, right, top, bottom)`, applied to the last two dims
+    of a 3D `(C, H, W)` or 4D `(N, C, H, W)` input; everything before those
+    two dims is treated as one flattened batch by the Pad2D kernel. `reflect`
+    picks the boundary rule at runtime (the same shared-body/runtime-flag
+    shape `_fast_triangular` uses for tril/triu) -- True mirrors across each
+    edge excluding the boundary element (`aten::reflection_pad2d`), False
+    clamps to the nearest edge (`aten::replication_pad2d`).
+    """
+    t = _tc(input)
+    if t is None or t._dtype not in _COPYABLE_DTYPES:
+        return NOT_HANDLED
+    if len(t._shape) not in (3, 4) or t._numel == 0:
+        return NOT_HANDLED
+    if not isinstance(padding, list | tuple) or len(padding) != 4:
+        return NOT_HANDLED
+    if not all(isinstance(p, int) for p in padding):
+        return NOT_HANDLED
+    pad_l, pad_r, pad_t, pad_b = (int(p) for p in padding)
+    if pad_l < 0 or pad_r < 0 or pad_t < 0 or pad_b < 0:
+        # Cropping (negative padding) isn't handled by this fast path.
+        return NOT_HANDLED
+    in_h, in_w = t._shape[-2], t._shape[-1]
+    if reflect and (pad_l >= in_w or pad_r >= in_w or pad_t >= in_h or pad_b >= in_h):
+        # Matches ATen's own reflection_pad2d validation (ReflectionPad.cpp):
+        # a reflected index needs a pivot strictly inside the dimension.
+        raise RuntimeError(
+            "Padding size should be less than the corresponding input "
+            f"dimension, but got: padding ({pad_l}, {pad_r}, {pad_t}, {pad_b}) "
+            f"for input of size {tuple(t._shape)}"
+        )
+    out_h = in_h + pad_t + pad_b
+    out_w = in_w + pad_l + pad_r
+    if out_h < 1 and out_w < 1:
+        raise RuntimeError(
+            f"input (H: {in_h}, W: {in_w}) is too small. Calculated output "
+            f"H: {out_h} W: {out_w}"
+        )
+    out_shape = (*t._shape[:-2], out_h, out_w)
+    out = _alloc(out_shape, t._dtype, t._device)
+    if out._numel > 0:
+        batch = t._numel // (in_h * in_w)
+        _call_mojo(
+            _DataMovementExtension,
+            "Pad2D",
+            (
+                out._ptr,
+                t._ptr,
+                batch,
+                in_h,
+                in_w,
+                pad_l,
+                pad_r,
+                pad_t,
+                pad_b,
+                int(reflect),
+                out._itemsize,
+                _ctx_ptr(t._device),
+            ),
+            arg_dtypes=(t._dtype,),
+            output_dtypes=(out._dtype,),
+            flags={"REFLECT": reflect},
+            keepalive=(out, t),
+        )
+    return out
+
+
+def fast_aten_reflection_pad2d(
+    input: torch.Tensor, padding: list[int]
+) -> TorchMojoTensor | object:
+    return _fast_pad2d(input, padding, True)
+
+
+def fast_aten_replication_pad2d(
+    input: torch.Tensor, padding: list[int]
+) -> TorchMojoTensor | object:
+    return _fast_pad2d(input, padding, False)
+
+
 def fast_aten_index(input, indices):
     t = _t(input)
     if t is None or not isinstance(indices, list | tuple):

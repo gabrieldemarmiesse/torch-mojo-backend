@@ -1018,6 +1018,18 @@ _UNARY_AUTOGRAD_PREFLIGHT_CASES = [
         ),
         "aten::upsample_bilinear2d_backward",
     ),
+    (
+        "reflection_pad2d",
+        (2, 3, 8, 8),
+        functools.partial(torch.nn.functional.pad, pad=(1, 2, 2, 1), mode="reflect"),
+        "aten::reflection_pad2d_backward",
+    ),
+    (
+        "replication_pad2d",
+        (2, 3, 8, 8),
+        functools.partial(torch.nn.functional.pad, pad=(1, 2, 2, 1), mode="replicate"),
+        "aten::replication_pad2d_backward",
+    ),
 ]
 
 
