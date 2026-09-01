@@ -73,7 +73,20 @@ from .aten_ops.inplace import (
     mojo_device_relu_,
     mojo_device_zero_,
 )
-from .aten_ops.reductions import mojo_device_min_dim, mojo_device_min_dim_min
+from .aten_ops.reductions import (
+    mojo_device_kthvalue,
+    mojo_device_kthvalue_values,
+    mojo_device_median_dim,
+    mojo_device_median_dim_values,
+    mojo_device_min_dim,
+    mojo_device_min_dim_min,
+    mojo_device_sort,
+    mojo_device_sort_stable,
+    mojo_device_sort_values,
+    mojo_device_sort_values_stable,
+    mojo_device_topk,
+    mojo_device_topk_values,
+)
 from .aten_ops.rng import mojo_device_normal_
 from .aten_ops.support import _eager_impl, _not_implemented, _out_variant
 from .aten_ops.transfer import mojo_device__copy_from, mojo_device__to_copy
@@ -289,6 +302,8 @@ register_aten_op("aten::index.Tensor")(mojo_device_index)
 _register_fast("aten::isin.Tensor_Tensor", "fast_aten_isin")
 _register_out("aten::isin.Tensor_Tensor_out", "fast_aten_isin", dtype_policy="exact")
 _register_fast("aten::isnan", "fast_aten_isnan")
+register_aten_op("aten::kthvalue")(mojo_device_kthvalue)
+register_aten_op("aten::kthvalue.values")(mojo_device_kthvalue_values)
 _register_fast("aten::le", "fast_aten_le")
 _register_fast("aten::le.Scalar", "fast_aten_le")
 _register_fast("aten::le.Tensor", "fast_aten_le")
@@ -314,6 +329,8 @@ _register_fast("aten::masked_fill.Tensor", "fast_aten_masked_fill")
 _register_fast("aten::max", "fast_aten_max")
 register_aten_op("aten::max_pool2d_with_indices")(mojo_device_max_pool2d_with_indices)
 _register_fast("aten::maximum", "fast_aten_maximum")
+register_aten_op("aten::median.dim")(mojo_device_median_dim)
+register_aten_op("aten::median.dim_values")(mojo_device_median_dim_values)
 _register_fast("aten::mean", "fast_aten_mean")
 # Registering the base name only covers the default overload; mean.dim would
 # otherwise get decomposed by PyTorch into a chain of sum/div/... ops.
@@ -324,6 +341,8 @@ register_aten_op("aten::min.dim")(mojo_device_min_dim)
 register_aten_op("aten::min.dim_min")(mojo_device_min_dim_min)
 _register_fast("aten::minimum", "fast_aten_minimum")
 _register_fast("aten::mm", "fast_aten_mm")
+_register_fast("aten::multinomial", "fast_aten_multinomial")
+_register_out("aten::multinomial.out", "fast_aten_multinomial")
 register_aten_op("aten::mul_.Tensor")(mojo_device_mul_)
 _register_out("aten::mul.out", "fast_aten_mul")
 _register_fast("aten::mul.Tensor", "fast_aten_mul")
@@ -385,6 +404,10 @@ _register_fast("aten::sin", "fast_aten_sin")
 _register_fast("aten::sinh", "fast_aten_sinh")
 _register_fast("aten::slice.Tensor", "fast_aten_slice")
 register_aten_op("aten::softmax.int")(mojo_device_softmax)
+register_aten_op("aten::sort")(mojo_device_sort)
+register_aten_op("aten::sort.stable")(mojo_device_sort_stable)
+register_aten_op("aten::sort.values")(mojo_device_sort_values)
+register_aten_op("aten::sort.values_stable")(mojo_device_sort_values_stable)
 _register_fast("aten::split_with_sizes", "fast_aten_split_with_sizes")
 _register_fast("aten::split.Tensor", "fast_aten_split")
 _register_fast("aten::sqrt", "fast_aten_sqrt")
@@ -396,6 +419,8 @@ _register_fast("aten::sum.dim_IntList", "fast_aten_sum")
 _register_fast("aten::t", "fast_aten_t")
 _register_fast("aten::tan", "fast_aten_tan")
 register_aten_op("aten::tanh")(mojo_device_tanh)
+register_aten_op("aten::topk")(mojo_device_topk)
+register_aten_op("aten::topk.values")(mojo_device_topk_values)
 _register_fast("aten::transpose.int", "fast_aten_transpose")
 _register_fast("aten::tril", "fast_aten_tril")
 _register_fast("aten::triu", "fast_aten_triu")

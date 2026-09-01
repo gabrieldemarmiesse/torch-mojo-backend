@@ -252,6 +252,81 @@ def type_promotion(x, y):
     return x, y
 
 
+def _select_sorted_k(
+    input: MaxTensor, k: int, axis: int, largest: bool
+) -> tuple[MaxTensor, MaxTensor]:
+    """MAX's k-selection: the k largest (or smallest) values, already ordered.
+
+    Shared by sort (k = the whole axis) and topk. MAX only selects along the
+    innermost axis on GPU, so any other axis is transposed to last and the
+    two results transposed back.
+    """
+    rank = len(input.shape)
+    if k == 0:
+        # top_k/bottom_k reject k=0; an empty slice of the input already has
+        # the right shape, dtype and device.
+        slices = [slice(None)] * rank
+        slices[axis] = slice(0, 0)
+        empty = input[*slices]
+        return empty, F.cast(empty, DType.int64)
+    last = rank - 1
+    operand = input if axis == last else F.transpose(input, axis, last)
+    if largest:
+        values, indices = max_ops.top_k(operand, k=k, axis=last)
+    else:
+        values, indices = max_ops.bottom_k(operand, k=k, axis=last)
+    if axis == last:
+        return values, indices
+    return F.transpose(values, axis, last), F.transpose(indices, axis, last)
+
+
+def _reduction_dim_and_size(
+    op_label: str, input: MaxTensor, dim: int
+) -> tuple[int, int]:
+    """`(axis, size)` for a kthvalue/median.dim-style reduction: `dim`
+    normalized non-negative, and its statically known length -- raising like
+    ATen's own for an out-of-range `dim` or an empty reduction axis."""
+    rank = len(input.shape)
+    ndim = rank or 1
+    if not -ndim <= dim < ndim:
+        raise IndexError(
+            "Dimension out of range (expected to be in range of "
+            f"[{-ndim}, {ndim - 1}], but got {dim})"
+        )
+    axis = dim % ndim
+    size = input.shape[axis] if rank else 1
+    if not isinstance(size, StaticDim):
+        raise NotImplementedError(
+            f"{op_label} needs a statically known size along the reduced "
+            f"axis, but axis {axis} has symbolic dim {size}"
+        )
+    size = int(size)
+    if size == 0:
+        raise IndexError(
+            f"{op_label}(): Expected reduction dim {axis} to have non-zero size."
+        )
+    return axis, size
+
+
+def _kth_smallest(
+    input: MaxTensor, k: int, axis: int, keepdim: bool
+) -> tuple[MaxTensor, MaxTensor]:
+    """`(value, index)` of the k-th smallest (1-indexed) along `axis`.
+
+    Ties break by the kernel's own stable order (ascending original index),
+    which need not be ATen's own (unspecified) tie index -- the same
+    accepted disagreement already documented for sort/topk: the VALUE always
+    matches, the INDEX is *a* valid occurrence of it.
+    """
+    values_k, indices_k = _select_sorted_k(input, k, axis, False)
+    value = aten_slice(values_k, axis, k - 1, k)
+    index = aten_slice(indices_k, axis, k - 1, k)
+    if not keepdim:
+        value = F.squeeze(value, axis=axis)
+        index = F.squeeze(index, axis=axis)
+    return value, index
+
+
 _SEARCHSORTED_DTYPES = (
     DType.float32,
     DType.bfloat16,
@@ -2481,6 +2556,22 @@ def aten_isnan(input: MaxTensor) -> MaxTensor:
     return F.is_nan(input)
 
 
+# aten::kthvalue(Tensor self, SymInt k, int dim=-1, bool keepdim=False) -> (Tensor values, Tensor indices)
+# aten::kthvalue.values(Tensor self, SymInt k, int dim=-1, bool keepdim=False, *, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
+@map_to(aten.kthvalue)
+def aten_kthvalue(
+    self: MaxTensor, k: int, dim: int = -1, keepdim: bool = False
+) -> tuple[MaxTensor, MaxTensor]:
+    axis, size = _reduction_dim_and_size("kthvalue", self, dim)
+    if not isinstance(k, int):
+        raise NotImplementedError(f"kthvalue needs a statically known k, but got {k!r}")
+    if not 1 <= k <= size:
+        raise RuntimeError(
+            f"kthvalue(): selected number k out of range for dimension {axis}"
+        )
+    return _kth_smallest(self, k, axis, keepdim)
+
+
 # le.Scalar(Tensor self, Scalar other) -> Tensor
 # le.Tensor(Tensor self, Tensor other) -> Tensor
 @map_to(aten.le)
@@ -2731,6 +2822,47 @@ def aten_maximum(x: MaxTensor, y: MaxTensor) -> MaxTensor:
     return F.max(x, y)
 
 
+# aten::median.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
+# aten::median.dim_values(Tensor self, int dim, bool keepdim=False, *, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
+@map_to(aten.median)
+def aten_median_dim(
+    self: MaxTensor, dim: int, keepdim: bool = False
+) -> tuple[MaxTensor, MaxTensor]:
+    """The lower of the two middle values (ATen's median.dim, not a mean).
+
+    One real ATen quirk beyond order statistics: if the row has ANY NaN, the
+    whole result becomes (nan, index of the FIRST NaN) rather than whatever
+    the order-statistic position would naively land on -- verified against
+    CPU torch.median, including a row with a single NaN far from the median
+    position. `_select_sorted_k(..., largest=False)` already returns
+    (value, index) together, so `bottom_k(key, 1)` on an (isnan ? -1 : 0) key
+    finds the first NaN's index directly (ties broken by the kernel's own
+    stable order, ascending original index) and its value (-1 vs 0) says
+    whether one was present at all -- the same composition as the mojo eager
+    device's `fast_aten_median_dim`, no new kernel either side.
+    """
+    axis, size = _reduction_dim_and_size("median", self, dim)
+    k = (size + 1) // 2
+    value, index = _kth_smallest(self, k, axis, True)
+
+    if self.dtype.is_float():
+        key = -F.cast(F.is_nan(self), dtype=DType.int32)
+        min_key, first_nan_index = _select_sorted_k(key, 1, axis, False)
+        has_nan = min_key < 0
+        # `F.where`'s scalar-branch coercion takes ITS dtype from `cond`
+        # (bool here), not from the other branch, so a bare `float("nan")`
+        # scalar fails to embed -- fill a same-dtype-as-`value` constant
+        # first instead.
+        nan_fill = F.full_like(value, float("nan"))
+        value = F.where(has_nan, nan_fill, value)
+        index = F.where(has_nan, first_nan_index, index)
+
+    if not keepdim:
+        value = F.squeeze(value, axis=axis)
+        index = F.squeeze(index, axis=axis)
+    return value, index
+
+
 # mean(Tensor self, *, ScalarType? dtype=None) -> Tensor
 # mean.dim(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor
 @map_to(aten.mean)
@@ -2823,6 +2955,36 @@ def aten_mul(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
         # MAX's mul doesn't lower for bool; torch defines it as logical AND.
         return F.logical_and(input, other)
     return input * other
+
+
+# aten::multinomial(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None) -> Tensor
+@map_to(aten.multinomial)
+def aten_multinomial(
+    self: MaxTensor,
+    num_samples: int,
+    replacement: bool = False,
+    *,
+    generator: object = None,
+) -> MaxTensor:
+    # Declined here the same way aten::rand/randn/randperm still are
+    # (unregistered, further up this file): a graph-mode draw would come
+    # from MAX's own internal random state, which does not tie into torch's
+    # per-device Philox generator the way the mojo eager device's does
+    # (torch_mojo_backend/mojo_device/aten_ops/rng.py -- see
+    # `fast_aten_multinomial`), so `torch.manual_seed` could not reproduce
+    # it. Sample outside the compiled region instead, on a mojo-device
+    # tensor -- which is what HF `generate()` already does; the logits
+    # computation is what benefits from torch.compile, not the sampling
+    # step.
+    del num_samples, replacement, generator
+    raise NotImplementedError(
+        "aten::multinomial is not supported by the MAX graph backend: its "
+        "internal RNG state does not tie into torch's per-device generator, "
+        "so torch.manual_seed could not reproduce a graph-mode draw the way "
+        "it reproduces the mojo eager device's aten::multinomial. Run "
+        "sampling eagerly on a mojo-device tensor instead (outside the "
+        "torch.compile'd region), which is what HF generate() already does."
+    )
 
 
 # native_batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)
@@ -3458,7 +3620,35 @@ def aten_slice(
 
 
 # slice_scatter(Tensor self, Tensor src, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
-# sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+
+
+# aten::sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+# aten::sort.stable(Tensor self, *, bool? stable, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+@map_to(aten.sort)
+def aten_sort(
+    input: MaxTensor,
+    dim: int = -1,
+    descending: bool = False,
+    *,
+    stable: bool | None = None,
+) -> tuple[MaxTensor, MaxTensor]:
+    # `stable` needs no branch: MAX's top_k/bottom_k document their output as
+    # sorted *stably*, which is the stronger of the two guarantees ATen asks
+    # for, so it is a correct answer to `stable=True` and to `stable=None`.
+    del stable
+    rank = len(input.shape)
+    if rank == 0:
+        raise NotImplementedError(
+            "sorting a 0-d tensor is not supported by the MAX graph backend"
+        )
+    axis = dim + rank if dim < 0 else dim
+    size = input.shape[axis]
+    if not isinstance(size, StaticDim):
+        raise NotImplementedError(
+            "sort needs a statically known size along the sorted axis, but "
+            f"axis {axis} has symbolic dim {size}"
+        )
+    return _select_sorted_k(input, int(size), axis, descending)
 
 
 # split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]
@@ -3554,8 +3744,29 @@ def aten_sum(
 # sym_stride.int(Tensor self, int dim) -> SymInt
 # tan(Tensor self) -> Tensor
 # tanh(Tensor self) -> Tensor
-# topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)
 # trunc(Tensor self) -> Tensor
+
+
+# aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)
+@map_to(aten.topk)
+def aten_topk(
+    input: MaxTensor, k: int, dim: int = -1, largest: bool = True, sorted: bool = True
+) -> tuple[MaxTensor, MaxTensor]:
+    # `sorted=False` only permits an arbitrary order among the k results;
+    # returning them sorted, which is all MAX offers, answers both settings.
+    del sorted
+    rank = len(input.shape)
+    if rank == 0:
+        raise NotImplementedError(
+            "topk of a 0-d tensor is not supported by the MAX graph backend"
+        )
+    if not isinstance(k, int):
+        raise NotImplementedError(f"topk needs a statically known k, but got {k!r}")
+    axis = dim + rank if dim < 0 else dim
+    size = input.shape[axis]
+    if isinstance(size, StaticDim) and not 0 <= k <= int(size):
+        raise RuntimeError("selected index k out of range")
+    return _select_sorted_k(input, k, axis, largest)
 
 
 # unsqueeze(Tensor(a) self, int dim) -> Tensor(a)
