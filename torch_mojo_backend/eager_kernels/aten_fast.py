@@ -5551,6 +5551,414 @@ def fast_aten_native_layer_norm_backward(
 
 
 # ---------------------------------------------------------------------------
+# Group / batch norm backward
+#
+# Both reduce over axis sets no LayerNorm kernel covers on its own, so they are
+# composed here from the kernels that do exist:
+#
+#   * group norm IS layer norm over the trailing `(C/G) * HxW` elements of the
+#     `(N*G, K)` view, so its grad-input half is exactly
+#     `fast_aten_native_layer_norm_backward` on that view, with the per-channel
+#     affine folded into grad_out first (the LayerNorm kernel's `weight` is
+#     indexed per column, group norm's per channel).
+#   * the affine gradients of both ops reduce over the batch and the spatial
+#     extent for each channel -- the complement of the per-sample axes the
+#     LayerNorm kernels reduce -- so they go through the per-(sample, channel)
+#     partial sums ATen's own kernels use, which are ordinary trailing-axis
+#     reductions of the existing reduce kernels.
+#
+# Half-precision inputs accumulate in float32 (ATen's `at::acc_type`) and the
+# results are narrowed back at the end, so a bf16 model gets ATen's accuracy
+# rather than the input dtype's.
+# ---------------------------------------------------------------------------
+
+
+class _NormBackwardDeclined(Exception):
+    """A composed step declined; the caller returns NOT_HANDLED."""
+
+
+def _norm_bwd(value: object) -> object:
+    """One composed step's result, or decline the whole op.
+
+    The compositions below are a dozen calls deep and every one of them can
+    answer NOT_HANDLED. Letting that sentinel flow into the next call would
+    surface as an unrelated AttributeError inside some other op, so it is
+    turned into a decline here, at the step that produced it.
+    """
+    if value is NOT_HANDLED or value is None:
+        raise _NormBackwardDeclined
+    return value
+
+
+def _norm_bwd_f32(t: TorchMojoTensor) -> TorchMojoTensor:
+    """`t` as a contiguous float32 tensor (ATen's `acc_type` for half input)."""
+    c = _tc(t)
+    if c is None:
+        raise _NormBackwardDeclined
+    if c._dtype == DType.float32:
+        return c
+    if c._dtype not in _CAST_DTYPES:
+        raise _NormBackwardDeclined
+    return _cast_tensor(c, DType.float32)
+
+
+def _norm_bwd_narrow(t: object, dtype: DType) -> object:
+    """`t` cast back down to the dtype ATen gives that output, if needed."""
+    if t is None or t is NOT_HANDLED:
+        return t
+    if t._dtype == dtype:
+        return t
+    if dtype not in _CAST_DTYPES:
+        raise _NormBackwardDeclined
+    return _cast_tensor(t, dtype)
+
+
+def _group_norm_backward_dx(
+    q: TorchMojoTensor,
+    x: TorchMojoTensor,
+    mean: TorchMojoTensor,
+    rstd: TorchMojoTensor,
+    N: int,
+    group: int,
+    K: int,
+) -> TorchMojoTensor:
+    """Group norm grad-input for `q = grad_out * gamma`, x flattened to (N,G,K).
+
+    The fused LayerNorm backward kernel is the whole op on the `(N*G, K)` view:
+    with `weight=None` it forms exactly
+    `rstd/K * (K*q - sum(q) - xhat * sum(q*xhat))` per row, which is group
+    norm's grad-input once gamma is already folded into `q`. It gates itself on
+    float32 GPU operands, so the explicit composition below serves the mojo CPU
+    device (and anything else the kernel declines).
+    """
+    rows = N * group
+    q2 = _norm_bwd(fast_aten_view(q, (rows, K)))
+    x2 = _norm_bwd(fast_aten_view(x, (rows, K)))
+    fused = fast_aten_native_layer_norm_backward(
+        q2, x2, (K,), mean, rstd, None, None, [True, False, False]
+    )
+    if fused is not NOT_HANDLED and fused[0] is not None:
+        return _norm_bwd(fast_aten_view(fused[0], (N, group, K)))
+
+    mean_g = _norm_bwd(fast_aten_view(mean, (N, group, 1)))
+    rstd_g = _norm_bwd(fast_aten_view(rstd, (N, group, 1)))
+    q3 = _norm_bwd(fast_aten_view(q, (N, group, K)))
+    x3 = _norm_bwd(fast_aten_view(x, (N, group, K)))
+    xhat = _norm_bwd(fast_aten_mul(_norm_bwd(fast_aten_sub(x3, mean_g)), rstd_g))
+    mean_q = _norm_bwd(
+        fast_aten_div(_norm_bwd(fast_aten_sum(q3, dim=[2], keepdim=True)), float(K))
+    )
+    mean_qx = _norm_bwd(
+        fast_aten_div(
+            _norm_bwd(
+                fast_aten_sum(_norm_bwd(fast_aten_mul(q3, xhat)), dim=[2], keepdim=True)
+            ),
+            float(K),
+        )
+    )
+    centred = _norm_bwd(fast_aten_sub(q3, mean_q))
+    centred = _norm_bwd(fast_aten_sub(centred, _norm_bwd(fast_aten_mul(xhat, mean_qx))))
+    return _norm_bwd(fast_aten_mul(centred, rstd_g))
+
+
+def fast_aten_native_group_norm_backward(
+    grad_out: object,
+    input: object,
+    mean: object,
+    rstd: object,
+    weight: object,
+    N: object,
+    C: object,
+    HxW: object,
+    group: object,
+    output_mask: object,
+) -> object:
+    """`aten::native_group_norm_backward` (see the section comment above).
+
+        dgamma[c] = sum_n rstd[n, g] * (S2[n, c] - mean[n, g] * S1[n, c])
+        dbeta[c]  = sum_n S1[n, c]
+        S1[n, c]  = sum_hw dy        S2[n, c] = sum_hw dy * x
+
+    with `g = c // (C / group)`; this is the same regrouping ATen's own CUDA
+    kernel does, and it keeps every reduction on a trailing axis.
+    """
+    a = _t(input)
+    grad = _t(grad_out)
+    saved_mean = _t(mean)
+    saved_rstd = _t(rstd)
+    gamma = _t(weight) if weight is not None else None
+    if (
+        a is None
+        or grad is None
+        or saved_mean is None
+        or saved_rstd is None
+        or (weight is not None and gamma is None)
+        or not isinstance(N, int)
+        or not isinstance(C, int)
+        or not isinstance(HxW, int)
+        or not isinstance(group, int)
+        or isinstance(group, bool)
+        or group <= 0
+        or C <= 0
+        or C % group != 0
+        or N < 0
+        or HxW < 0
+        or not isinstance(output_mask, list | tuple)
+    ):
+        return NOT_HANDLED
+    mask = tuple(output_mask)
+    if len(mask) != 3 or any(not isinstance(requested, bool) for requested in mask):
+        return NOT_HANDLED
+    if (
+        a._dtype not in _FLOAT_DTYPES
+        or grad._dtype != a._dtype
+        or a._numel != N * C * HxW
+        or tuple(grad._shape) != tuple(a._shape)
+        or grad._device != a._device
+        or saved_mean._device != a._device
+        or saved_rstd._device != a._device
+        or saved_mean._dtype not in _FLOAT_DTYPES
+        or saved_rstd._dtype not in _FLOAT_DTYPES
+        or saved_mean._numel != N * group
+        or saved_rstd._numel != N * group
+    ):
+        return NOT_HANDLED
+    if gamma is not None and (
+        gamma._device != a._device
+        or gamma._dtype not in _FLOAT_DTYPES
+        or tuple(gamma._shape) != (C,)
+    ):
+        return NOT_HANDLED
+    # ATen allocates the affine gradients with gamma's options, falling back to
+    # the input's (aten/src/ATen/native/group_norm.cpp).
+    param_dtype = gamma._dtype if gamma is not None else a._dtype
+    if not any(mask):
+        return None, None, None
+    if a._numel == 0:
+        # ATen returns zeros for every requested output when N == 0.
+        return (
+            fast_filled(a._shape, 0.0, a._dtype, a._device) if mask[0] else None,
+            fast_filled((C,), 0.0, param_dtype, a._device) if mask[1] else None,
+            fast_filled((C,), 0.0, param_dtype, a._device) if mask[2] else None,
+        )
+
+    channels_per_group = C // group
+    K = channels_per_group * HxW
+    try:
+        x = _norm_bwd_f32(a)
+        dy = _norm_bwd_f32(grad)
+        saved_mean = _norm_bwd_f32(saved_mean)
+        saved_rstd = _norm_bwd_f32(saved_rstd)
+        dy3 = _norm_bwd(fast_aten_view(dy, (N, C, HxW)))
+
+        grad_input = grad_weight = grad_bias = None
+        if mask[1] or mask[2]:
+            partial_dy = _norm_bwd(fast_aten_sum(dy3, dim=[2]))  # (N, C)
+            if mask[2]:
+                grad_bias = _norm_bwd(fast_aten_sum(partial_dy, dim=[0]))
+            if mask[1]:
+                x3 = _norm_bwd(fast_aten_view(x, (N, C, HxW)))
+                partial_dyx = _norm_bwd(
+                    fast_aten_sum(_norm_bwd(fast_aten_mul(dy3, x3)), dim=[2])
+                )
+                shape = (N, group, channels_per_group)
+                s1 = _norm_bwd(fast_aten_view(partial_dy, shape))
+                s2 = _norm_bwd(fast_aten_view(partial_dyx, shape))
+                mean_g = _norm_bwd(fast_aten_view(saved_mean, (N, group, 1)))
+                rstd_g = _norm_bwd(fast_aten_view(saved_rstd, (N, group, 1)))
+                centred = _norm_bwd(
+                    fast_aten_sub(s2, _norm_bwd(fast_aten_mul(mean_g, s1)))
+                )
+                per_sample = _norm_bwd(fast_aten_mul(centred, rstd_g))
+                grad_weight = _norm_bwd(
+                    fast_aten_view(_norm_bwd(fast_aten_sum(per_sample, dim=[0])), (C,))
+                )
+        if mask[0]:
+            if gamma is None:
+                q = dy3
+            else:
+                broadcast_gamma = _norm_bwd(
+                    fast_aten_view(_norm_bwd_f32(gamma), (1, C, 1))
+                )
+                q = _norm_bwd(fast_aten_mul(dy3, broadcast_gamma))
+            dx = _group_norm_backward_dx(q, x, saved_mean, saved_rstd, N, group, K)
+            grad_input = _norm_bwd(fast_aten_view(dx, tuple(a._shape)))
+
+        grad_input = _norm_bwd_narrow(grad_input, a._dtype)
+        grad_weight = _norm_bwd_narrow(grad_weight, param_dtype)
+        grad_bias = _norm_bwd_narrow(grad_bias, param_dtype)
+    except _NormBackwardDeclined:
+        return NOT_HANDLED
+    return grad_input, grad_weight, grad_bias
+
+
+def fast_aten_native_batch_norm_backward(
+    grad_out: object,
+    input: object,
+    weight: object,
+    running_mean: object,
+    running_var: object,
+    save_mean: object,
+    save_invstd: object,
+    train: object,
+    eps: object,
+    output_mask: object,
+) -> object:
+    """`aten::native_batch_norm_backward` for the mojo eager device.
+
+    Follows `batch_norm_backward_cpu_template` exactly
+    (aten/src/ATen/native/Normalization.cpp): with `M = numel / C`,
+
+        dotp[c]   = sum_{n,s} (x - mean) * dy
+        dgamma[c] = dotp * invstd            dbeta[c] = sum_{n,s} dy
+        dx        = (dy - dbeta/M - xhat * dgamma/M) * invstd * gamma   (train)
+        dx        = dy * invstd * gamma                                 (eval)
+
+    `mean` / `invstd` are the saved statistics while training and
+    `running_mean` / `rsqrt(running_var + eps)` in eval, which is why an
+    `.eval()` BatchNorm still produces gradients. The per-channel reduction is
+    split into a trailing-axis pass over the spatial extent and a leading-axis
+    pass over the batch, so both legs are ordinary reduce-kernel shapes.
+    """
+    a = _t(input)
+    grad = _t(grad_out)
+    gamma = _t(weight) if weight is not None else None
+    run_mean = _t(running_mean) if running_mean is not None else None
+    run_var = _t(running_var) if running_var is not None else None
+    saved_mean = _t(save_mean) if save_mean is not None else None
+    saved_invstd = _t(save_invstd) if save_invstd is not None else None
+    if (
+        a is None
+        or grad is None
+        or (weight is not None and gamma is None)
+        or type(train) is not bool
+        or not isinstance(eps, int | float)
+        or isinstance(eps, bool)
+        or not isinstance(output_mask, list | tuple)
+        or len(a._shape) < 2
+    ):
+        return NOT_HANDLED
+    mask = tuple(output_mask)
+    if len(mask) != 3 or any(not isinstance(requested, bool) for requested in mask):
+        return NOT_HANDLED
+    channels = a._shape[1]
+    if (
+        a._dtype not in _FLOAT_DTYPES
+        or grad._dtype != a._dtype
+        or tuple(grad._shape) != tuple(a._shape)
+        or grad._device != a._device
+    ):
+        return NOT_HANDLED
+    # Training reads the statistics the forward saved; inference recomputes
+    # them from the running buffers, exactly as ATen does.
+    stats = (saved_mean, saved_invstd) if train else (run_mean, run_var)
+    if any(
+        stat is None
+        or stat._device != a._device
+        or stat._dtype not in _FLOAT_DTYPES
+        or stat._numel != channels
+        for stat in stats
+    ):
+        return NOT_HANDLED
+    if gamma is not None and (
+        gamma._device != a._device
+        or gamma._dtype not in _FLOAT_DTYPES
+        or tuple(gamma._shape) != (channels,)
+    ):
+        return NOT_HANDLED
+    # ATen widens the affine gradients to float32 exactly when the parameters
+    # are already wider than the input (`mixed_type` in Normalization.cpp).
+    present = [p for p in (gamma, *stats) if p is not None]
+    mixed = any(p._dtype != a._dtype for p in present)
+    param_dtype = DType.float32 if mixed else a._dtype
+    if not any(mask):
+        return None, None, None
+    if a._numel == 0:
+        return (
+            fast_filled(a._shape, 0.0, a._dtype, a._device) if mask[0] else None,
+            fast_filled((channels,), 0.0, param_dtype, a._device) if mask[1] else None,
+            fast_filled((channels,), 0.0, param_dtype, a._device) if mask[2] else None,
+        )
+
+    inner = a._numel // (a._shape[0] * channels)
+    reduced = a._numel // channels
+    try:
+        x = _norm_bwd_f32(a)
+        dy = _norm_bwd_f32(grad)
+        if train:
+            mean = _norm_bwd_f32(stats[0])
+            invstd = _norm_bwd_f32(stats[1])
+        else:
+            mean = _norm_bwd_f32(stats[0])
+            shifted = _norm_bwd(fast_aten_add(_norm_bwd_f32(stats[1]), float(eps)))
+            invstd = _norm_bwd(fast_aten_rsqrt(shifted))
+        planes = (a._shape[0], channels, inner)
+        dy3 = _norm_bwd(fast_aten_view(dy, planes))
+        x3 = _norm_bwd(fast_aten_view(x, planes))
+
+        grad_input = grad_weight = grad_bias = None
+        # dx needs both affine gradients while training, whatever the mask says,
+        # and `xhat` is exactly what the weight gradient needs -- so an
+        # inference dx, or a bias-only call, never materializes it.
+        need_bias = mask[2] or (mask[0] and train)
+        need_weight = mask[1] or (mask[0] and train)
+        xhat = sum_dy = sum_dyxhat = None
+        if need_bias:
+            sum_dy = _norm_bwd(
+                fast_aten_sum(_norm_bwd(fast_aten_sum(dy3, dim=[2])), dim=[0])
+            )
+            grad_bias = sum_dy if mask[2] else None
+        if need_weight:
+            mean_c = _norm_bwd(fast_aten_view(mean, (1, channels, 1)))
+            invstd_c = _norm_bwd(fast_aten_view(invstd, (1, channels, 1)))
+            xhat = _norm_bwd(
+                fast_aten_mul(_norm_bwd(fast_aten_sub(x3, mean_c)), invstd_c)
+            )
+            per_plane = _norm_bwd(
+                fast_aten_sum(_norm_bwd(fast_aten_mul(dy3, xhat)), dim=[2])
+            )
+            sum_dyxhat = _norm_bwd(fast_aten_sum(per_plane, dim=[0]))
+            grad_weight = sum_dyxhat if mask[1] else None
+        if mask[0]:
+            scale = (
+                invstd
+                if gamma is None
+                else _norm_bwd(fast_aten_mul(invstd, _norm_bwd_f32(gamma)))
+            )
+            scale_c = _norm_bwd(fast_aten_view(scale, (1, channels, 1)))
+            if train:
+                mean_dy = _norm_bwd(
+                    fast_aten_view(
+                        _norm_bwd(fast_aten_div(sum_dy, float(reduced))),
+                        (1, channels, 1),
+                    )
+                )
+                mean_dyxhat = _norm_bwd(
+                    fast_aten_view(
+                        _norm_bwd(fast_aten_div(sum_dyxhat, float(reduced))),
+                        (1, channels, 1),
+                    )
+                )
+                projected = _norm_bwd(fast_aten_sub(dy3, mean_dy))
+                projected = _norm_bwd(
+                    fast_aten_sub(
+                        projected, _norm_bwd(fast_aten_mul(xhat, mean_dyxhat))
+                    )
+                )
+            else:
+                projected = dy3
+            dx = _norm_bwd(fast_aten_mul(projected, scale_c))
+            grad_input = _norm_bwd(fast_aten_view(dx, tuple(a._shape)))
+
+        grad_input = _norm_bwd_narrow(grad_input, a._dtype)
+        grad_weight = _norm_bwd_narrow(grad_weight, param_dtype)
+        grad_bias = _norm_bwd_narrow(grad_bias, param_dtype)
+    except _NormBackwardDeclined:
+        return NOT_HANDLED
+    return grad_input, grad_weight, grad_bias
+
+
+# ---------------------------------------------------------------------------
 # Reductions
 # ---------------------------------------------------------------------------
 

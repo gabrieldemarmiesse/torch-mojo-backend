@@ -540,7 +540,7 @@ def aten__native_batch_norm_legit_no_training(
     running_var: MaxTensor,
     momentum: float,
     eps: float,
-) -> tuple[MaxTensor, NotImplementedError, NotImplementedError]:
+) -> tuple[MaxTensor, MaxTensor, MaxTensor]:
     """
     Implements batch normalization for inference (no training).
 
@@ -554,8 +554,9 @@ def aten__native_batch_norm_legit_no_training(
         eps: Small value for numerical stability
 
     Returns:
-        Tuple of (normalized_output, save_mean, save_var)
-        where save_mean and save_var are empty tensors in no-training mode
+        Tuple of (normalized_output, save_mean, save_var), where save_mean
+        and save_var are the empty (0,) tensors PyTorch's meta kernel
+        promises for the no-training overload
     """
     # Get input dimensions
     input_shape = input.shape
@@ -582,19 +583,13 @@ def aten__native_batch_norm_legit_no_training(
         bias_reshaped = F.reshape(bias, broadcast_shape)
         normalized = normalized + bias_reshaped
 
-    # It's not sure we'll ever support returning those, notably because of
-    # https://github.com/pytorch/pytorch/issues/85960
-    return (
-        normalized,
-        NotImplementedError(
-            "We don't support returning the saved mean "
-            "in aten._native_batch_norm_legit_no_training yet"
-        ),
-        NotImplementedError(
-            "We don't support returning the saved variance "
-            "in aten._native_batch_norm_legit_no_training yet"
-        ),
-    )
+    # PyTorch's meta kernel gives both saved statistics shape (0,) here (that
+    # is the inconsistency pytorch/pytorch#85960 is about), and the eval
+    # backward reads the RUNNING buffers rather than these, so empty tensors
+    # are the whole contract -- returning NotImplementedError placeholders
+    # instead only made a training graph fail to compile as soon as anything
+    # kept the node's second or third output alive.
+    return (normalized, running_mean[0:0], running_var[0:0])
 
 
 # _pdist_forward(Tensor self, float p=2) -> Tensor
@@ -2907,6 +2902,85 @@ def aten_native_batch_norm(
     return (normalized, save_mean, save_invstd)
 
 
+# native_batch_norm_backward(Tensor grad_out, Tensor input, Tensor? weight, Tensor? running_mean, Tensor? running_var, Tensor? save_mean, Tensor? save_invstd, bool train, float eps, bool[3] output_mask) -> (Tensor, Tensor, Tensor)
+@map_to(aten.native_batch_norm_backward)
+def aten_native_batch_norm_backward(
+    grad_out: MaxTensor,
+    input: MaxTensor,
+    weight: MaxTensor | None,
+    running_mean: MaxTensor | None,
+    running_var: MaxTensor | None,
+    save_mean: MaxTensor | None,
+    save_invstd: MaxTensor | None,
+    train: bool,
+    eps: float,
+    output_mask: list[bool],
+) -> tuple[MaxTensor | None, MaxTensor | None, MaxTensor | None]:
+    """Gradients of `aten.native_batch_norm`, per channel.
+
+    Follows `batch_norm_backward_cpu_template`
+    (aten/src/ATen/native/Normalization.cpp) with `M = numel / C`:
+
+        dbeta[c]  = sum_{n,s} dy          dgamma[c] = sum_{n,s} dy * xhat
+        dx        = (dy - dbeta/M - xhat * dgamma/M) * invstd * gamma   (train)
+        dx        = dy * invstd * gamma                                 (eval)
+
+    Training reads the statistics the forward saved; evaluation recomputes
+    them from the running buffers, which is why an `.eval()` BatchNorm still
+    produces gradients rather than the zeros an "inference needs no backward"
+    reading would give.
+
+    Returns `None` for the outputs `output_mask` turns off, the way
+    `aten_native_layer_norm` returns `None` for statistics nothing reads.
+    """
+    mask = tuple(output_mask)
+    input_shape = input.shape
+    rank = len(input_shape)
+    num_channels = int(input_shape[1])
+    broadcast_shape = [1] * rank
+    broadcast_shape[1] = num_channels
+    reduce_axes = [axis for axis in range(rank) if axis != 1]
+    reduced = math.prod(int(input_shape[axis]) for axis in reduce_axes)
+
+    if train:
+        if save_mean is None or save_invstd is None:
+            raise ValueError(
+                "save_mean and save_invstd are required when train=True in "
+                "aten.native_batch_norm_backward"
+            )
+        mean = F.reshape(save_mean, broadcast_shape)
+        invstd = F.reshape(save_invstd, broadcast_shape)
+    else:
+        if running_mean is None or running_var is None:
+            raise ValueError(
+                "running_mean and running_var are required when train=False "
+                "in aten.native_batch_norm_backward"
+            )
+        mean = F.reshape(running_mean, broadcast_shape)
+        invstd = 1.0 / F.sqrt(F.reshape(running_var, broadcast_shape) + eps)
+
+    normalized = (input - mean) * invstd
+    # dx needs both affine gradients while training, whatever the mask says.
+    sum_grad = aten_sum(grad_out, dim=reduce_axes, keepdim=True)
+    dot_grad = aten_sum(grad_out * normalized, dim=reduce_axes, keepdim=True)
+
+    grad_input = None
+    if mask[0]:
+        scale = invstd
+        if weight is not None:
+            scale = scale * F.reshape(weight, broadcast_shape)
+        if train:
+            projected = (
+                grad_out - sum_grad / reduced - normalized * (dot_grad / reduced)
+            )
+        else:
+            projected = grad_out
+        grad_input = projected * scale
+    grad_weight = F.reshape(dot_grad, [num_channels]) if mask[1] else None
+    grad_bias = F.reshape(sum_grad, [num_channels]) if mask[2] else None
+    return grad_input, grad_weight, grad_bias
+
+
 # native_dropout(Tensor input, float p, bool? train) -> (Tensor, Tensor)
 
 
@@ -2921,10 +2995,11 @@ def aten_native_group_norm(
     HxW: SymIntType,
     group: int,
     eps: float,
-) -> tuple[MaxTensor, NotImplementedError, NotImplementedError]:
+) -> tuple[MaxTensor, MaxTensor, MaxTensor]:
     """
     This is the low-level operation that F.group_norm gets compiled to.
-    Returns (normalized_output, mean, rstd) tuple but we only return the first element for simplicity.
+    Returns (normalized_output, mean, rstd); the two statistics are per
+    (sample, group) and are what `aten.native_group_norm_backward` consumes.
     """
     # Reshape input from [N*C, HxW] back to [N, C, H, W] format
     # First, calculate H and W from HxW
@@ -2942,15 +3017,19 @@ def aten_native_group_norm(
     # Use the regular group_norm implementation
     result = torch_group_norm_equivalent(input_reshaped, group, weight, bias, eps)
 
-    # Return just the normalized output (native_group_norm returns a tuple)
+    # The statistics are per (sample, group) and are what
+    # `aten.native_group_norm_backward` consumes, so a training graph is dead
+    # without them; they used to be NotImplementedError placeholders, which
+    # made every grad-requiring group norm fail to compile.
+    grouped = F.reshape(input, [int(N), group, (int(C) // group) * HW])
+    group_mean = aten_mean(grouped, dim=[2], keepdim=True)
+    group_centered = grouped - group_mean
+    group_var = aten_mean(group_centered * group_centered, dim=[2], keepdim=True)
+    group_rstd = 1 / F.sqrt(group_var + eps)
     return (
         result,
-        NotImplementedError(
-            "The implementation of aten.native_group_norm doesn't support returning mean yet."
-        ),
-        NotImplementedError(
-            "The implementation of aten.native_group_norm doesn't support returning rstd yet."
-        ),
+        F.reshape(group_mean, [int(N), group]),
+        F.reshape(group_rstd, [int(N), group]),
     )
 
 
@@ -3003,6 +3082,77 @@ def torch_group_norm_equivalent(input, num_groups, weight=None, bias=None, eps=1
 
 
 # native_group_norm_backward(Tensor grad_out, Tensor input, Tensor mean, Tensor rstd, Tensor? weight, SymInt N, SymInt C, SymInt HxW, int group, bool[3] output_mask) -> (Tensor, Tensor, Tensor)
+@map_to(aten.native_group_norm_backward)
+def aten_native_group_norm_backward(
+    grad_out: MaxTensor,
+    input: MaxTensor,
+    mean: MaxTensor,
+    rstd: MaxTensor,
+    weight: MaxTensor | None,
+    N: SymIntType,
+    C: SymIntType,
+    HxW: SymIntType,
+    group: int,
+    output_mask: list[bool],
+) -> tuple[MaxTensor | None, MaxTensor | None, MaxTensor | None]:
+    """Gradients of `aten.native_group_norm`.
+
+    Group norm normalizes the trailing `(C / group) * HxW` elements of the
+    `(N, group, K)` view, so its grad-input is the layer-norm formula on that
+    view once the per-channel gamma is folded into grad_out:
+
+        dx = rstd * (q - mean_k(q) - xhat * mean_k(q * xhat)),  q = dy * gamma
+
+    The affine gradients reduce over a different axis set -- the batch and the
+    spatial extent, per channel -- and go through the per-(sample, channel)
+    partial sums ATen's own kernel uses:
+
+        dgamma[c] = sum_n rstd[n, g] * (S2[n, c] - mean[n, g] * S1[n, c])
+        dbeta[c]  = sum_n S1[n, c]
+        S1[n, c]  = sum_hw dy        S2[n, c] = sum_hw dy * x
+    """
+    mask = tuple(output_mask)
+    samples = int(N)
+    channels = int(C)
+    spatial = int(HxW)
+    channels_per_group = channels // group
+    inner = channels_per_group * spatial
+
+    planes = [samples, channels, spatial]
+    grad_planes = F.reshape(grad_out, planes)
+    input_planes = F.reshape(input, planes)
+    mean_groups = F.reshape(mean, [samples, group, 1])
+    rstd_groups = F.reshape(rstd, [samples, group, 1])
+
+    grad_weight = None
+    grad_bias = None
+    if mask[1] or mask[2]:
+        partial_grad = aten_sum(grad_planes, dim=[2])
+        if mask[2]:
+            grad_bias = aten_sum(partial_grad, dim=[0])
+        if mask[1]:
+            partial_dot = aten_sum(grad_planes * input_planes, dim=[2])
+            per_group = [samples, group, channels_per_group]
+            sums = F.reshape(partial_grad, per_group)
+            dots = F.reshape(partial_dot, per_group)
+            centered = (dots - mean_groups * sums) * rstd_groups
+            grad_weight = F.reshape(aten_sum(centered, dim=[0]), [channels])
+
+    grad_input = None
+    if mask[0]:
+        scaled = grad_planes
+        if weight is not None:
+            scaled = scaled * F.reshape(weight, [1, channels, 1])
+        groups = [samples, group, inner]
+        scaled = F.reshape(scaled, groups)
+        normalized = (F.reshape(input_planes, groups) - mean_groups) * rstd_groups
+        mean_scaled = aten_sum(scaled, dim=[2], keepdim=True) / inner
+        mean_dot = aten_sum(scaled * normalized, dim=[2], keepdim=True) / inner
+        grad_input = F.reshape(
+            (scaled - mean_scaled - normalized * mean_dot) * rstd_groups,
+            list(input.shape),
+        )
+    return grad_input, grad_weight, grad_bias
 
 
 # native_layer_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight, Tensor? bias, float eps) -> (Tensor, Tensor, Tensor)

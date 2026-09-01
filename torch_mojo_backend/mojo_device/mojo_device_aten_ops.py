@@ -31,8 +31,6 @@ from .aten_ops.autograd_preflight import (
     mojo_device_index,
     mojo_device_linear,
     mojo_device_max_pool2d_with_indices,
-    mojo_device_native_batch_norm,
-    mojo_device_native_group_norm,
     mojo_device_relu,
     mojo_device_scatter_src,
     mojo_device_sigmoid,
@@ -327,10 +325,16 @@ _register_fast("aten::mm", "fast_aten_mm")
 register_aten_op("aten::mul_.Tensor")(mojo_device_mul_)
 _register_out("aten::mul.out", "fast_aten_mul")
 _register_fast("aten::mul.Tensor", "fast_aten_mul")
-register_aten_op("aten::native_batch_norm")(mojo_device_native_batch_norm)
+_register_fast("aten::native_batch_norm", "fast_aten_native_batch_norm")
+_register_fast(
+    "aten::native_batch_norm_backward", "fast_aten_native_batch_norm_backward"
+)
 _register_fast("aten::native_dropout", "fast_aten_native_dropout")
 _register_fast("aten::native_dropout_backward", "fast_aten_native_dropout_backward")
-register_aten_op("aten::native_group_norm")(mojo_device_native_group_norm)
+_register_fast("aten::native_group_norm", "fast_aten_native_group_norm")
+_register_fast(
+    "aten::native_group_norm_backward", "fast_aten_native_group_norm_backward"
+)
 _register_fast("aten::native_layer_norm", "fast_aten_native_layer_norm")
 _register_fast(
     "aten::native_layer_norm_backward", "fast_aten_native_layer_norm_backward"

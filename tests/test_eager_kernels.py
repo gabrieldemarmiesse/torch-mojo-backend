@@ -948,23 +948,92 @@ def test_fast_batch_norm_training_outlier_first_element(mojo_gpu, magnitude, cha
     torch.testing.assert_close(our_var.cpu(), ref_var, atol=0, rtol=1e-5)
 
 
-def test_fast_batch_norm_training_refuses_autograd_in_the_forward(mojo_gpu):
-    """A training call that would need a gradient must fail at the FORWARD.
+# Tolerance for the norm backwards: float32 reductions over a few hundred
+# elements accumulate around sqrt(k) * eps ~ 3e-6 relative, the two sides sum
+# in different orders, and the standard-normal inputs keep rstd at O(1) so
+# nothing amplifies that. A wrong axis or a missing term moves these outputs by
+# O(1), not by ulps.
+_NORM_BACKWARD_TOLERANCE = 2e-5
 
-    `aten::native_batch_norm_backward` is not implemented here, and a raise
-    from inside the autograd engine aborts the process on this backend instead
-    of raising, so the refusal cannot wait for the backward node.
+
+# (training, affine). The inference forward needs an affine here -- its fast
+# path takes all four per-channel buffers or none -- so `training=False` with
+# no weight/bias is a pre-existing forward gap, not a backward one.
+@pytest.mark.parametrize(
+    ("training", "affine"), [(True, True), (True, False), (False, True)]
+)
+def test_fast_batch_norm_backward_matches_torch(mojo_gpu, training, affine):
+    """`nn.BatchNorm2d` gradients, training and eval, against CPU autograd.
+
+    Both used to be unreachable. Training was refused from the forward because
+    `aten::native_batch_norm_backward` did not exist, and eval was worse: it
+    was not preflighted at all, on the theory that `training=False` records a
+    backward nobody runs -- but an `.eval()` BatchNorm records
+    NativeBatchNormBackward0 like any other and the engine does come back for
+    it, so the missing kernel aborted the process instead of raising.
     """
-    x = torch.randn(2, 4, 3, 3, device=mojo_gpu, requires_grad=True)
-    running_mean = torch.zeros(4, device=mojo_gpu)
-    running_var = torch.ones(4, device=mojo_gpu)
-    with pytest.raises(NotImplementedError, match="native_batch_norm_backward"):
-        torch.ops.aten.native_batch_norm(
-            x, None, None, running_mean, running_var, True, 0.1, 1e-5
+    torch.manual_seed(0)
+    host_input = torch.randn(3, 4, 5, 5)
+    host_weight = torch.randn(4)
+    host_bias = torch.randn(4)
+    running_mean = torch.randn(4)
+    running_var = torch.rand(4) + 0.5
+
+    def run(device):
+        x = host_input.to(device).detach().requires_grad_(True)
+        gamma = host_weight.to(device).detach().requires_grad_(True) if affine else None
+        beta = host_bias.to(device).detach().requires_grad_(True) if affine else None
+        output = torch.nn.functional.batch_norm(
+            x,
+            running_mean.to(device).clone(),
+            running_var.to(device).clone(),
+            gamma,
+            beta,
+            training,
+            0.1,
+            1e-5,
         )
-    with torch.no_grad():
-        torch.ops.aten.native_batch_norm(
-            x, None, None, running_mean, running_var, True, 0.1, 1e-5
+        (output * output).sum().backward()
+        grads = [x.grad] + ([gamma.grad, beta.grad] if affine else [])
+        return [grad.cpu() for grad in grads]
+
+    for got, want in zip(run(mojo_gpu), run("cpu"), strict=True):
+        torch.testing.assert_close(
+            got, want, rtol=_NORM_BACKWARD_TOLERANCE, atol=_NORM_BACKWARD_TOLERANCE
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fast_batch_norm_backward_dtypes(mojo_gpu, dtype):
+    """Half precision accumulates in float32 and narrows back, like ATen."""
+    torch.manual_seed(1)
+    shape = (2, 6, 4, 4)
+    host_grad = torch.randn(shape)
+    host_input = torch.randn(shape)
+    host_weight = torch.randn(6)
+    save_mean = torch.randn(6)
+    save_invstd = torch.rand(6) + 0.5
+
+    def run(device, cast):
+        return torch.ops.aten.native_batch_norm_backward(
+            host_grad.to(device).to(cast),
+            host_input.to(device).to(cast),
+            host_weight.to(device).to(cast),
+            None,
+            None,
+            save_mean.to(device),
+            save_invstd.to(device),
+            True,
+            1e-5,
+            [True, True, True],
+        )
+
+    expected = run("cpu", torch.float32)
+    actual = run(mojo_gpu, dtype)
+    tolerance = _NORM_BACKWARD_TOLERANCE if dtype == torch.float32 else 3e-2
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            got.cpu().float(), want, rtol=tolerance, atol=tolerance
         )
 
 
@@ -1248,45 +1317,99 @@ def test_fast_group_norm_matches_torch(mojo_gpu, dtype, n, c, hxw, groups):
         torch.testing.assert_close(got.cpu(), want, atol=1e-3, rtol=1e-3)
 
 
-def test_fast_group_norm_refuses_autograd_in_the_forward(mojo_gpu):
-    """A grad-requiring group norm must fail at the FORWARD.
+@pytest.mark.parametrize(
+    ("shape", "group"), [((2, 4, 6, 6), 2), ((2, 8, 5, 5), 8), ((1, 6, 7, 3), 1)]
+)
+@pytest.mark.parametrize("affine", [True, False])
+def test_fast_group_norm_backward_matches_torch(mojo_gpu, shape, group, affine):
+    """`F.group_norm` gradients against CPU autograd.
 
-    `aten::native_group_norm_backward` is not implemented here, and a raise
-    from inside the autograd engine aborts the process on this backend instead
-    of propagating, so the refusal cannot wait for NativeGroupNormBackward0.
-    Unlike batch norm there is no `training` flag to key on: every
-    grad-requiring call is refused, and only turning grad off gets the forward.
+    This used to be refused from the forward, because
+    `aten::native_group_norm_backward` had no kernel and reaching an
+    unimplemented backward node aborts the process on this backend rather than
+    raising. The grad-input half now runs on the LayerNorm backward kernel:
+    group norm IS layer norm over the trailing `(C / group) * HxW` elements of
+    the `(N * group, K)` view. `group == C` (instance norm) and `group == 1`
+    (layer norm over the whole sample) are the two degenerate ends of that.
     """
-    host_input, device_input = _preflight_input((2, 4, 6, 6), mojo_gpu)
-    host_weight, device_weight = _preflight_input((4,), mojo_gpu, seed=11)
-    host_bias, device_bias = _preflight_input((4,), mojo_gpu, seed=13)
+    torch.manual_seed(0)
+    host_input = torch.randn(*shape)
+    host_weight = torch.randn(shape[1])
+    host_bias = torch.randn(shape[1])
 
-    expected = torch.nn.functional.group_norm(host_input, 2, host_weight, host_bias)
-    torch.testing.assert_close(
-        torch.nn.functional.group_norm(
-            device_input, 2, device_weight, device_bias
-        ).cpu(),
-        expected,
-        atol=1e-5,
-        rtol=1e-5,
-    )
+    def run(device):
+        x = host_input.to(device).detach().requires_grad_(True)
+        gamma = host_weight.to(device).detach().requires_grad_(True) if affine else None
+        beta = host_bias.to(device).detach().requires_grad_(True) if affine else None
+        output = torch.nn.functional.group_norm(x, group, gamma, beta)
+        (output * output).sum().backward()
+        grads = [x.grad] + ([gamma.grad, beta.grad] if affine else [])
+        return [grad.cpu() for grad in grads]
 
-    # Any one of the three operands wanting a gradient is enough to refuse:
-    # the engine would come back for the same unrunnable node either way.
-    for which in range(3):
-        operands = [device_input.detach(), device_weight.detach(), device_bias.detach()]
-        operands[which] = operands[which].requires_grad_()
-        with pytest.raises(NotImplementedError, match="native_group_norm_backward"):
-            torch.nn.functional.group_norm(operands[0], 2, operands[1], operands[2])
-
-    with torch.no_grad():
+    for got, want in zip(run(mojo_gpu), run("cpu"), strict=True):
         torch.testing.assert_close(
-            torch.nn.functional.group_norm(
-                device_input.detach().requires_grad_(), 2, device_weight, device_bias
-            ).cpu(),
-            expected,
-            atol=1e-5,
-            rtol=1e-5,
+            got, want, rtol=_NORM_BACKWARD_TOLERANCE, atol=_NORM_BACKWARD_TOLERANCE
+        )
+
+
+def test_fast_group_norm_backward_uses_the_layer_norm_kernel(mojo_gpu, monkeypatch):
+    """The grad-input half must reach the fused LayerNorm backward kernel.
+
+    The composition it falls back to is correct but reads the whole tensor
+    several more times, so a silent fallback is a performance regression this
+    test would otherwise not see.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    calls = []
+    original = aten_fast.fast_aten_native_layer_norm_backward
+
+    def spy(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append(result is not aten_fast.NOT_HANDLED)
+        return result
+
+    monkeypatch.setattr(aten_fast, "fast_aten_native_layer_norm_backward", spy)
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 8, 4, 4, device=mojo_gpu, requires_grad=True)
+    weight = torch.randn(8, device=mojo_gpu, requires_grad=True)
+    bias = torch.randn(8, device=mojo_gpu, requires_grad=True)
+    torch.nn.functional.group_norm(x, 4, weight, bias).sum().backward()
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fast_group_norm_backward_dtypes(mojo_gpu, dtype):
+    """Half precision accumulates in float32 and narrows back, like ATen."""
+    torch.manual_seed(1)
+    N, C, HxW, group = 2, 6, 12, 3
+    host_grad = torch.randn(N, C, HxW)
+    host_input = torch.randn(N, C, HxW)
+    host_weight = torch.randn(C)
+    mean = torch.randn(N, group)
+    rstd = torch.rand(N, group) + 0.5
+
+    def run(device, cast):
+        return torch.ops.aten.native_group_norm_backward(
+            host_grad.to(device).to(cast),
+            host_input.to(device).to(cast),
+            mean.to(device),
+            rstd.to(device),
+            host_weight.to(device).to(cast),
+            N,
+            C,
+            HxW,
+            group,
+            [True, True, True],
+        )
+
+    expected = run("cpu", torch.float32)
+    actual = run(mojo_gpu, dtype)
+    tolerance = _NORM_BACKWARD_TOLERANCE if dtype == torch.float32 else 3e-2
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            got.cpu().float(), want, rtol=tolerance, atol=tolerance
         )
 
 
