@@ -33,6 +33,27 @@ LASTDIM_SHAPES: dict[str, tuple[tuple[int, ...], int]] = {
     "S_4096x4096_d0": ((4096, 4096), 0),
     "S_4096x4096_d1": ((4096, 4096), 1),
 }
+# Selection along the last dim. k and the direction are folded into the shape
+# token, per the design rule above that any extra axis an op needs goes into
+# the shape id. V_ rows are a GPT-2 vocabulary -- the regime HF generate()
+# actually runs, one row per sequence with k either a sampling cutoff or a
+# beam width -- and A_ is the awkward-shape control. k also selects the launch
+# route: K50 fits the tournament (one pass over the row), K2048 does not and
+# falls back to the full sort, which is why both are measured. The _min /
+# _desc tokens only flip a compile-time flag in the same kernel; one of each
+# is enough to notice if that stops being true.
+TOPK_SHAPES: dict[str, tuple[tuple[int, ...], int, bool]] = {
+    "V_1x50304_K50": ((1, 50304), 50, True),
+    "V_8x50304_K2048": ((8, 50304), 2048, True),
+    "V_8x50304_K2048_min": ((8, 50304), 2048, False),
+    "A_357x789_K32": ((357, 789), 32, True),
+}
+SORT_SHAPES: dict[str, tuple[tuple[int, ...], bool]] = {
+    "V_8x50304": ((8, 50304), False),
+    "V_8x50304_desc": ((8, 50304), True),
+    "S_4096x4096": ((4096, 4096), False),
+    "A_357x789": ((357, 789), False),
+}
 
 COVERS: dict[str, str] = {
     "aten::sum.dim_IntList": "test_sum",
@@ -57,6 +78,15 @@ COVERS: dict[str, str] = {
         "torch.linalg.vector_norm reaches it)"
     ),
     "aten::cumsum": "test_cumsum",
+    "aten::topk.values": "test_topk",
+    "aten::topk": (
+        "test_topk (torch.topk dispatches the .values overload; the "
+        "functional one is the same kernel plus one less copy)"
+    ),
+    "aten::sort.values_stable": "test_sort",
+    "aten::sort": "test_sort (same kernel, plain overload)",
+    "aten::sort.stable": "test_sort (same kernel, stable= is free here)",
+    "aten::sort.values": "test_sort (same kernel, non-stable out= overload)",
     "aten::nonzero": "test_nonzero",
 }
 
@@ -305,5 +335,35 @@ def test_nonzero(
     bench.run(
         lambda: torch.nonzero(x_ref),
         lambda: torch.nonzero(x_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", TOPK_SHAPES)
+@pytest.mark.bench_op("topk.values")
+def test_topk(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    shape, k, largest = TOPK_SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.topk(x_ref, k, dim=-1, largest=largest),
+        lambda: torch.topk(x_our, k, dim=-1, largest=largest),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SORT_SHAPES)
+@pytest.mark.bench_op("sort.values_stable")
+def test_sort(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    shape, descending = SORT_SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.sort(x_ref, dim=-1, descending=descending, stable=True),
+        lambda: torch.sort(x_our, dim=-1, descending=descending, stable=True),
         flops=float(x_ref.numel()),
     )

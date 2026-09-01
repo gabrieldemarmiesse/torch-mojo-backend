@@ -2904,6 +2904,177 @@ def test_fast_uniform_carries_torch_rand_on_device(mojo_gpu):
     assert host.max().item() < 1.0
 
 
+# ---------------------------------------------------------------------------
+# sort / topk. The kernel picks one of three launch routes from the row
+# length and k, so the interesting cases are the route boundaries -- which is
+# also why every reference below is a CPU *stable* sort: the kernel's order is
+# total (ties broken by original index), so it must reproduce the stable
+# answer exactly, not merely a correct one.
+# ---------------------------------------------------------------------------
+
+# Elements one block sorts in shared memory, mirrored from the kernel; the
+# route boundaries sit at and just past it.
+_SORT_TILE = 4096
+_SORT_ROUTE_SIZES = (1, 2, 33, 255, 4095, 4096, 4097, 8192, 8193, 12000, 50257)
+
+
+def _assert_same_ordering(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Bit-exact equality, with NaN counted equal to NaN.
+
+    `torch.equal` has no equal_nan, and a sort that moves NaN correctly still
+    has to be compared for NaN in the right *place*.
+    """
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+
+
+def _sort_probe(rows: int, columns: int, seed: int = 7) -> torch.Tensor:
+    """Values with deliberate ties, both zeros, and a NaN in longer rows."""
+    generator = torch.Generator().manual_seed(seed)
+    host = torch.randn(rows, columns, generator=generator)
+    if columns >= 16:
+        host[:, ::7] = 0.0
+        host[:, ::11] = -0.0
+        host[:, ::13] = 1.5
+        host[:, 3] = float("nan")
+    return host
+
+
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("columns", _SORT_ROUTE_SIZES)
+def test_fast_sort_matches_stable_cpu_on_every_route(mojo_gpu, columns, descending):
+    host = _sort_probe(2, columns)
+    expected = torch.sort(host, dim=-1, descending=descending, stable=True)
+    actual = torch.sort(host.to(mojo_gpu), dim=-1, descending=descending, stable=True)
+    _assert_same_ordering(actual.values.cpu(), expected.values)
+    _assert_same_ordering(actual.indices.cpu(), expected.indices)
+
+
+@pytest.mark.parametrize(
+    ("columns", "k"),
+    [
+        # k small enough for the tournament route (one tile per row's worth of
+        # candidates), then the first k that no longer fits and has to fall
+        # back to the full sort, then a k spanning the whole row.
+        (50257, 50),
+        (50257, 315),
+        (50257, 316),
+        (50257, 2048),
+        (8193, 4096),
+        (4096, 4096),
+        (33, 33),
+    ],
+)
+@pytest.mark.parametrize("largest", [True, False])
+def test_fast_topk_matches_stable_cpu_across_the_tournament_boundary(
+    mojo_gpu, columns, k, largest
+):
+    """Values against ATen, indices against the stable sort's prefix.
+
+    ATen leaves topk's tie order unspecified (CPU and CUDA disagree with each
+    other on this data), so only the values are comparable to `torch.topk`.
+    The indices are pinned to the stronger contract this kernel actually
+    offers -- the first k of the stable sort -- which is what makes a tie
+    reproducible here at all.
+    """
+    host = _sort_probe(2, columns, seed=11)
+    expected = torch.topk(host, k, dim=-1, largest=largest)
+    actual = torch.topk(host.to(mojo_gpu), k, dim=-1, largest=largest)
+    _assert_same_ordering(actual.values.cpu(), expected.values)
+
+    stable = torch.sort(host, dim=-1, descending=largest, stable=True)
+    _assert_same_ordering(actual.indices.cpu(), stable.indices[..., :k])
+
+
+def test_fast_sort_orders_nan_and_signed_zero_like_aten(mojo_gpu):
+    """The two bit patterns the monotone key gets wrong on its own.
+
+    A negative NaN's bits sit below -inf and -0.0's below +0.0, but ATen
+    orders every NaN above every number and treats the two zeros as equal, so
+    the kernel overrides both before comparing.
+    """
+    host = torch.tensor(
+        [
+            [
+                0.0,
+                -0.0,
+                float("nan"),
+                -float("nan"),
+                float("inf"),
+                -float("inf"),
+                1.0,
+                -1.0,
+            ]
+        ]
+    )
+    for descending in (False, True):
+        expected = torch.sort(host, dim=-1, descending=descending, stable=True)
+        actual = torch.sort(
+            host.to(mojo_gpu), dim=-1, descending=descending, stable=True
+        )
+        _assert_same_ordering(actual.values.cpu(), expected.values)
+        _assert_same_ordering(actual.indices.cpu(), expected.indices)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float64,
+        torch.bfloat16,
+        torch.float16,
+        torch.int64,
+        torch.int32,
+        torch.int16,
+        torch.int8,
+        torch.uint8,
+        torch.bool,
+    ],
+)
+def test_fast_sort_covers_its_declared_dtypes(mojo_gpu, dtype):
+    """Every kernel dtype, on a row long enough to cross tiles.
+
+    The 64-bit dtypes matter most: their key is twice as wide, which halves
+    the shared-memory tile and so moves every route boundary.
+    """
+    host = torch.arange(2 * 6000, dtype=torch.int64)
+    host = ((host * 37 + 11) % 251).reshape(2, 6000)
+    if dtype is torch.bool:
+        host = host % 2 == 0
+    else:
+        host = (host - 125).to(dtype)
+    expected = torch.sort(host, dim=-1, stable=True)
+    actual = torch.sort(host.to(mojo_gpu), dim=-1, stable=True)
+    assert torch.equal(actual.values.cpu(), expected.values)
+    assert torch.equal(actual.indices.cpu(), expected.indices)
+
+
+def test_fast_sort_and_topk_materialize_non_contiguous_and_non_last_dims(mojo_gpu):
+    """A dim other than the last is transposed to last and back, and a view
+    of the result must not read the wrong elements."""
+    host = _sort_probe(9, 7, seed=3)
+    device = host.to(mojo_gpu)
+    for dim in (0, 1, -1, -2):
+        expected = torch.sort(host, dim=dim, stable=True)
+        actual = torch.sort(device, dim=dim, stable=True)
+        _assert_same_ordering(actual.values.cpu(), expected.values)
+        _assert_same_ordering(actual.indices.cpu(), expected.indices)
+
+    transposed_expected = torch.topk(host.t(), 3, dim=-1)
+    transposed_actual = torch.topk(device.t(), 3, dim=-1)
+    _assert_same_ordering(transposed_actual.values.cpu(), transposed_expected.values)
+    sliced_expected = torch.sort(host[:, 1::2], dim=-1, stable=True)
+    sliced_actual = torch.sort(device[:, 1::2], dim=-1, stable=True)
+    _assert_same_ordering(sliced_actual.values.cpu(), sliced_expected.values)
+
+
+def test_fast_sort_and_topk_reject_out_of_range_arguments(mojo_gpu):
+    tensor = torch.randn(4, 8).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="selected index k out of range"):
+        torch.topk(tensor, 9, dim=-1)
+    with pytest.raises(IndexError, match="Dimension out of range"):
+        torch.sort(tensor, dim=2)
+
+
 def test_fast_lerp_scalar_out_and_inplace_alias(mojo_gpu):
     """AdamW's lerp out path preserves ATen's FP32 branch and aliases."""
     # This Python double rounds to exactly 0.5f. ATen narrows before choosing
