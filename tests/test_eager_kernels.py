@@ -1,8 +1,11 @@
 """Tests for the Mojo-extension fast path used by mojo eager mode."""
 
+import contextlib
+import fcntl
 import functools
 import math
 import weakref
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -6380,8 +6383,11 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     assert "from gemm16_tn_v4_kernels import" in v3_source
     # Kernel names carry the dtype the build was specialized for, so the
     # literal in the source is the tag interpolation, not "bf16".  A user
-    # profiling a float16 model must read "f16_gemm_..." there.
-    assert "from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG" in v3_source
+    # profiling a float16 model must read "f16_gemm_..." there, and one
+    # profiling float32 under a TF32 matmul precision must read "tf32_gemm_...".
+    assert "from gemm16_dtype import (" in v3_source
+    for imported in ("_GEMM16_DT,", "_GEMM16_TAG,", "_GEMM16_TF32,", "_GEMM16_W,"):
+        assert imported in v3_source
     for kernel_name in (
         "gemm_v3_nn_ws_m64n128_tma_s3",
         "gemm_v3_nn_ws_m128n256_tma_s3",
@@ -6809,6 +6815,403 @@ def test_tf32_matmul_family_highest_retains_tensorspec_fallback(monkeypatch):
     assert tf32_import_calls == []
 
 
+# ---------------------------------------------------------------------------
+# float32 (TF32) WGMMA NT route: gemm16's warp-specialized Hopper kernels
+# compiled for a 4-byte operand.  WGMMA takes float32 operands directly and
+# computes them as TF32, so these are the same kernels the bf16/f16 builds use,
+# with the width-bound constants doubled.
+#
+# The oracle in these tests is EXACT, not a tolerance: operands are multiples of
+# 1/32 in [-1, 1), which are exact in TF32's 10 mantissa bits, so every product
+# is a multiple of 1/1024 and a k-deep sum of them stays inside FP32's
+# exactly-representable integer range (|sum| * 1024 <= 2^24 for every k used
+# here).  A TF32 GEMM must therefore reproduce the FP64 reference BIT-exactly,
+# and any mantissa loss, misaddressed k-step or dropped tile shows up as a
+# nonzero error rather than as a tolerance judgement call.
+# ---------------------------------------------------------------------------
+_TF32_WGMMA_SHAPES = {
+    # aligned: the plain 128x256 WGMMA tile
+    "aligned_256x512x256": (256, 512, 256),
+    # ragged m AND ragged (even) n AND k not a multiple of BK=32: the three
+    # relaxations the float32 gate makes over the 16-bit routes' tile-multiple
+    # gate, all at once (A2 of the kernel harness)
+    "ragged_357x790x336": (357, 790, 336),
+    # deep K, few output tiles: the split-K workspace + reduce route
+    "deep_k_256x256x8192": (256, 256, 8192),
+    # k = 4 is the SMALLEST k the gate can admit at a 4-byte operand: the TMA
+    # rule is (k * 4) % 16 == 0, so k must be a multiple of 4, and k = 4 is one
+    # eighth of a single BK = 32 tile.  The whole mainloop is then one k-tile
+    # whose tail TMA zero-fills, which is exact because zeros contribute
+    # nothing to a dot product -- the boundary where that reasoning either
+    # holds or the kernel reads garbage.
+    "min_k_128x256x4": (128, 256, 4),
+}
+
+# k = 333 makes the row pitch k * 4 = 1332 bytes, not a multiple of 16, so no
+# TMA descriptor can be built for it; n = 257 is odd, so the epilogue's
+# two-element pair store would be misaligned.  Both must decline to the
+# SM80-class tf32_matmul_ops kernel rather than fault.
+_TF32_DECLINED_SHAPES = {
+    "unaligned_k_357x790x333": (357, 790, 333),
+    "odd_n_128x257x256": (128, 257, 256),
+}
+
+
+@contextlib.contextmanager
+def _gpu_lock(index: int = 0) -> Iterator[None]:
+    """AGENTS.md rule: hold flock /tmp/gpu_lock_{index}.lock around GPU work.
+
+    These few cases time nothing, but they run WGMMA kernels that saturate the
+    card, and this box shares one GPU between agents.  Do not wrap a whole
+    pytest run in an outer flock on the same file: this would then block on it
+    forever.
+    """
+    with open(f"/tmp/gpu_lock_{index}.lock", "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _tf32_exact_operand(shape: tuple[int, ...], seed: int) -> torch.Tensor:
+    """Multiples of 1/32 in [-1, 1): exact in TF32, so the reference is exact."""
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randint(-31, 32, shape, generator=generator).float() / 32.0
+
+
+@contextlib.contextmanager
+def _tf32_precision(precision: str = "high") -> Iterator[None]:
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(precision)
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
+def test_tf32_nt_wgmma_shape_admits_mirrors_the_kernel_gate() -> None:
+    """The host mirror of the two hardware constraints, with no GPU involved.
+
+    TMA needs a 16-BYTE global stride and both operands are k-minor, so k must
+    be a multiple of 4 at float32; the epilogue's pair store needs an even n.
+    m is free -- that is the whole point of the relaxation over the 16-bit
+    routes' tile-multiple gate.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    admits = aten_fast._tf32_nt_wgmma_shape_admits
+    assert admits(357, 790, 336)  # ragged m, even n, k % 4 == 0
+    assert admits(1, 2, 4)  # every dimension at its minimum
+    assert not admits(357, 790, 333)  # k * 4 = 1332 is not 16B-aligned
+    assert not admits(357, 790, 334)
+    assert not admits(128, 257, 256)  # odd n misaligns the pair store
+    assert not admits(0, 256, 256)  # empty
+    # k a multiple of 4 but NOT of the 32-element tile: a partial trailing
+    # k-tile is legal (TMA zero-fills past the extent), unlike for the 16-bit
+    # routes.
+    assert admits(128, 256, 4)
+    # The two graceful-fallback bounds: past 2^31 the Mojo route declines on
+    # machine width, and the grid is one CTA per 128x256 tile.  Nothing that
+    # fits in device memory reaches either, but a shape that did must fall back
+    # rather than hit the bridge's raise.
+    assert not admits(2**31, 256, 256)
+    assert not admits(2**31 - 1, 2**31 - 2, 4)
+
+
+def test_tf32_nt_wgmma_admits_only_nt_layout_under_tf32_precision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Layout, dtype, architecture and precision gate the route, on the host.
+
+    Only NT is ported to a 4-byte operand, and "highest" means the user asked
+    for real FP32 -- neither may reach the WGMMA kernels.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    device = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(
+        shape: tuple[int, int],
+        strides: tuple[int, int],
+        dtype: object = None,
+        ptr: int = 4096,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=tuple(strides),
+            _dtype=aten_fast.DType.float32 if dtype is None else dtype,
+            _device=device,
+            _ptr=ptr,
+        )
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_gemm16_bridge_available", lambda: True)
+
+    row_major_a = tensor((256, 256), (256, 1))
+    nt_b = tensor((256, 512), (1, 256))  # a .t() view of a (512, 256) buffer
+    nn_b = tensor((256, 512), (512, 1))
+
+    with _tf32_precision("high"):
+        assert aten_fast._tf32_nt_wgmma_admits(row_major_a, nt_b)
+        # NN, TN, TT stay on the SM80-class route.
+        assert not aten_fast._tf32_nt_wgmma_admits(row_major_a, nn_b)
+        assert not aten_fast._tf32_nt_wgmma_admits(tensor((256, 256), (1, 256)), nt_b)
+        # transpose_b flips which physical layout counts as NT.  With it set
+        # the RHS is the (n, k) buffer -- the shape torch.linear hands over --
+        # so it must be (512, 256) here, not nn_b's (256, 512), whose k would
+        # contradict A's.
+        nk_b = tensor((512, 256), (256, 1))
+        assert aten_fast._tf32_nt_wgmma_admits(row_major_a, nk_b, transpose_b=True)
+        # bfloat16 has its own, separately routed build of the same family.
+        assert not aten_fast._tf32_nt_wgmma_admits(
+            tensor((256, 256), (256, 1), dtype=aten_fast.DType.bfloat16),
+            tensor((256, 512), (1, 256), dtype=aten_fast.DType.bfloat16),
+        )
+        # An offset view's data pointer need not be 16B-aligned, and TMA
+        # descriptor creation requires it.
+        assert not aten_fast._tf32_nt_wgmma_admits(
+            tensor((256, 256), (256, 1), ptr=4100), nt_b
+        )
+        # Not an H100: these are WGMMA+TMA kernels and nothing else runs them.
+        other = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_80")
+        sm80_a = tensor((256, 256), (256, 1))
+        sm80_b = tensor((256, 512), (1, 256))
+        sm80_a._device = other
+        sm80_b._device = other
+        assert not aten_fast._tf32_nt_wgmma_admits(sm80_a, sm80_b)
+        # An absent bridge declines before anything is allocated.
+        monkeypatch.setattr(aten_fast, "_gemm16_bridge_available", lambda: False)
+        assert not aten_fast._tf32_nt_wgmma_admits(row_major_a, nt_b)
+
+    monkeypatch.setattr(aten_fast, "_gemm16_bridge_available", lambda: True)
+    with _tf32_precision("highest"):
+        assert not aten_fast._tf32_nt_wgmma_admits(row_major_a, nt_b)
+
+
+@pytest.mark.parametrize("shape_id", sorted(_TF32_WGMMA_SHAPES))
+def test_tf32_wgmma_nt_mm_is_bit_exact(mojo_h100: torch.device, shape_id: str) -> None:
+    """The WGMMA float32 route reproduces the FP64 reference bit for bit."""
+    _require_real_bf16_gemm_sources()
+    m, n, k = _TF32_WGMMA_SHAPES[shape_id]
+    host_a = _tf32_exact_operand((m, k), 20260819)
+    host_b = _tf32_exact_operand((n, k), 20260820)
+    expected = (host_a.double() @ host_b.double().t()).float()
+
+    with _tf32_precision("high"), _gpu_lock():
+        a = host_a.to(mojo_h100)
+        b = host_b.to(mojo_h100)
+        actual = (a @ b.t()).cpu()
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shape_id", sorted(_TF32_DECLINED_SHAPES))
+def test_tf32_declined_shapes_stay_correct_on_the_sm80_route(
+    mojo_h100: torch.device, shape_id: str
+) -> None:
+    """A shape no TMA descriptor can describe must decline, not fault.
+
+    k * 4 not a multiple of 16 bytes fails descriptor creation outright, and an
+    odd n misaligns the epilogue's pair store; the SM80-class kernel serves
+    both, and is exact on the same operands.
+    """
+    _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = _TF32_DECLINED_SHAPES[shape_id]
+    assert not aten_fast._tf32_nt_wgmma_shape_admits(m, n, k)
+    host_a = _tf32_exact_operand((m, k), 20260821)
+    host_b = _tf32_exact_operand((n, k), 20260822)
+    expected = (host_a.double() @ host_b.double().t()).float()
+
+    with _tf32_precision("high"), _gpu_lock():
+        a = host_a.to(mojo_h100)
+        b = host_b.to(mojo_h100)
+        actual = (a @ b.t()).cpu()
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_tf32_wgmma_nt_writes_nothing_past_the_output(
+    mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard cells immediately after C survive a doubly ragged output tile.
+
+    357x790 straddles the 128x256 tile in both dimensions, so the last CTA row
+    and column are partial and the epilogue's own bounds check is the only
+    thing keeping the stores inside C.  Handing the route a view into the head
+    of a larger buffer puts real, checkable memory right after that last
+    element.
+    """
+    _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 357, 790, 336
+    guard_elements = 4096
+    sentinel = -12345.0
+    host_a = _tf32_exact_operand((m, k), 20260823)
+    host_b = _tf32_exact_operand((n, k), 20260824)
+    expected = (host_a.double() @ host_b.double().t()).float()
+    real_alloc = aten_fast._alloc
+
+    with _tf32_precision("high"), _gpu_lock():
+        buffer = torch.full(
+            (m * n + guard_elements,), sentinel, device=mojo_h100, dtype=torch.float32
+        )
+        head = aten_fast._view_of(buffer, (m, n), (n, 1), 0, contiguous=True)
+
+        def alloc_head(
+            shape: tuple[int, ...], dtype: object, device: object
+        ) -> torch.Tensor:
+            if tuple(shape) == (m, n) and dtype == head._dtype:
+                return head
+            return real_alloc(shape, dtype, device)
+
+        monkeypatch.setattr(aten_fast, "_alloc", alloc_head)
+        a = host_a.to(mojo_h100)
+        b = host_b.to(mojo_h100)
+        actual = a @ b.t()
+        # Aliasing, not identity: what matters is that the kernel wrote into the
+        # guarded buffer rather than into a fresh allocation of its own.
+        assert actual._ptr == head._ptr
+        result = head.cpu()
+        guard = buffer[m * n :].cpu()
+
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+    assert torch.equal(guard, torch.full((guard_elements,), sentinel))
+
+
+def test_tf32_wgmma_nt_runs_the_named_wgmma_kernels(mojo_h100: torch.device) -> None:
+    """The route actually taken, read back from the profiler's kernel names.
+
+    The names are what CUPTI, Nsight and torch.profiler print, so this is also
+    the assertion that a user profiling a float32 model at TF32 precision reads
+    "tf32", never "bf16".  A silent fall back to the SM80-class kernel would
+    otherwise look exactly like success.
+    """
+    _require_real_bf16_gemm_sources()
+    from torch.profiler import ProfilerActivity, profile
+
+    device_event_types = ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+
+    def kernel_names(m: int, n: int, k: int) -> set[str]:
+        a = torch.randn(m, k, device=mojo_h100)
+        b = torch.randn(n, k, device=mojo_h100)
+        for _ in range(2):  # build and warm the variant outside the profile
+            del_me = a @ b.t()
+            del del_me
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            out = a @ b.t()
+            del out
+        return {
+            event.name
+            for event in prof.events()
+            if str(event.device_type) in device_event_types
+            and "memc" not in event.name.lower()
+            and "memset" not in event.name.lower()
+        }
+
+    with _tf32_precision("high"), _gpu_lock():
+        ragged = kernel_names(357, 790, 336)
+        deep_k = kernel_names(256, 256, 8192)
+        declined = kernel_names(357, 790, 333)
+
+    assert any(name.startswith("tf32_gemm_v3_nt_ws_m128n256_tma_s3") for name in ragged)
+    assert any(
+        name.startswith("tf32_gemm_nt_v4_splitk_m128n256_s4") for name in deep_k
+    ), deep_k
+    assert any(name.startswith("tf32_gemm_tn_v4_splitk_reduce") for name in deep_k)
+    # The declined shape stays on the SM80-class kernel and never reaches a
+    # WGMMA one.  Assert the positive too: "no WGMMA kernel ran" would also be
+    # satisfied by a decomposition that never reached tf32_matmul_ops at all.
+    assert any(name.startswith("tf32_gemm_tile") for name in declined), declined
+    assert not any("_v3_nt_ws_" in name or "_v4_splitk_" in name for name in declined)
+    for names in (ragged, deep_k):
+        assert not any("bf16" in name or "f16_gemm" in name for name in names)
+
+
+def test_tf32_linear_and_addmm_split_bias_off_the_wgmma_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A biased NT float32 call splits into mm + add exactly when the WGMMA
+    route serves the mm.
+
+    Those kernels have no fused-bias epilogue and decline a biased call, so a
+    fused call would land on the SM80-class kernel; when the WGMMA route would
+    not serve the mm anyway, the split only pays for an extra launch (the S5
+    regression `_gemm16_alignment_favors_split` documents).
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    device = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(shape: tuple[int, int], strides: tuple[int, int]) -> SimpleNamespace:
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=tuple(strides),
+            _dtype=aten_fast.DType.float32,
+            _device=device,
+            _ptr=4096,
+            _is_contiguous=strides == (shape[1], 1),
+        )
+
+    gemm_calls = []
+    add_calls = []
+    mm_result, biased_result = object(), object()
+
+    def try_tf32_gemm(
+        a: object, b: object, bias: object = None, **kwargs: object
+    ) -> object:
+        gemm_calls.append(bias)
+        return mm_result
+
+    def fast_add(value: object, bias: object) -> object:
+        add_calls.append((value, bias))
+        return biased_result
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_gemm16_bridge_available", lambda: True)
+    monkeypatch.setattr(aten_fast, "_try_tf32_gemm", try_tf32_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", fast_add)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", lambda *a, **k: None)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_linear", lambda *a, **k: None)
+
+    weight = tensor((790, 336), (336, 1))  # (n, k): linear's NT weight
+    bias = object()
+
+    with _tf32_precision("high"):
+        # Admitted: k % 4 == 0 and n even -> split.
+        assert (
+            aten_fast._try_tf32_linear(tensor((357, 336), (336, 1)), weight, bias)
+            is biased_result
+        )
+        assert gemm_calls == [None]
+        assert add_calls == [(mm_result, bias)]
+        # Declined (k * 4 not 16B-aligned) -> one fused-bias call, no add.
+        gemm_calls.clear()
+        add_calls.clear()
+        assert (
+            aten_fast._try_tf32_linear(
+                tensor((357, 333), (333, 1)), tensor((790, 333), (333, 1)), bias
+            )
+            is mm_result
+        )
+        assert gemm_calls == [bias]
+        assert add_calls == []
+        # addmm's NT case splits on the same predicate.
+        gemm_calls.clear()
+        add_calls.clear()
+        assert (
+            aten_fast.fast_aten_addmm(
+                bias, tensor((357, 336), (336, 1)), tensor((336, 790), (1, 336))
+            )
+            is biased_result
+        )
+        assert gemm_calls == [None]
+        assert add_calls == [(mm_result, bias)]
+
+
 def test_matmul_spec_device_oom_is_not_disguised_as_unsupported(
     monkeypatch, fake_mojo_tensor
 ):
@@ -6888,7 +7291,16 @@ def test_tf32_linear_flattens_contiguous_gpt_input_as_zero_copy_view(monkeypatch
     gemm_calls = []
 
     def as_tensor(value):
-        return {input: input_metadata, weight: weight_metadata}.get(value)
+        # Identity lookup rather than a dict: `_try_tf32_linear` now offers the
+        # flattened matrix view to `_tf32_nt_wgmma_admits` before deciding
+        # whether to split the bias off, and that view is a SimpleNamespace,
+        # which is unhashable.  Returning None for it makes the predicate
+        # decline, which is the fused-bias path this test is about.
+        if value is input:
+            return input_metadata
+        if value is weight:
+            return weight_metadata
+        return None
 
     def view_of(*args, **kwargs):
         view_calls.append((args, kwargs))
@@ -6924,7 +7336,16 @@ def test_tf32_linear_noncontiguous_batch_retains_tensorspec_path(monkeypatch):
     fallback = object()
 
     def as_tensor(value):
-        return {input: input_metadata, weight: weight_metadata}.get(value)
+        # Identity lookup rather than a dict: `_try_tf32_linear` now offers the
+        # flattened matrix view to `_tf32_nt_wgmma_admits` before deciding
+        # whether to split the bias off, and that view is a SimpleNamespace,
+        # which is unhashable.  Returning None for it makes the predicate
+        # decline, which is the fused-bias path this test is about.
+        if value is input:
+            return input_metadata
+        if value is weight:
+            return weight_metadata
+        return None
 
     def fail_tf32_work(*_args, **_kwargs):
         raise AssertionError("non-contiguous batched linear entered the TF32 path")

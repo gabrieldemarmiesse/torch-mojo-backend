@@ -30,10 +30,14 @@ clips the trailing partial column of tiles the same way); everything else
 must be routed to the existing v3 dispatcher by the caller
 (`maybe_enqueue_...` returns False in that case).
 
-The operand dtype is bfloat16 or float16, chosen at compile time by
-`_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
-here is a function of the 2-byte operand width, not of the exponent
-layout, so one source serves both.
+The operand dtype is bfloat16, float16 or float32, chosen at compile time
+by `_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
+here is a function of the operand WIDTH.  One exception, and it is why the
+float32 ladder never selects this route: the `tma_store` epilogue's
+128B-swizzle arithmetic treats a 64-element row as one swizzle row, which
+holds only for a 2-byte operand.  `_v4_mma_tile` below IS width-generic --
+it is shared with the float32 NT split-K route in
+gemm16_tn_v4_kernels.mojo.
 """
 
 from std.gpu import (
@@ -78,12 +82,18 @@ from layout.tensor_core_async import (
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from gemm16_kernels import _pick_regime
-from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+from gemm16_dtype import (
+    _GEMM16_BK,
+    _GEMM16_DT,
+    _GEMM16_TAG,
+    _GEMM16_W,
+    _GEMM16_WGMMA_K,
+)
 
 comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
 comptime _V4_PTR = UnsafePointer[Scalar[_V4_DT], MutAnyOrigin]
-comptime _V4_BK = 64
+comptime _V4_BK = _GEMM16_BK
 # Macro-rows per rasterization group: consecutive work indices cover
 # _V4_GROUP macro rows before advancing one BN column, keeping the in-flight
 # A slab and the current B column resident in L2.
@@ -138,10 +148,15 @@ def _v4_mma_tile[
     comptime a_stride01 = a_canonical_layout[0].stride[1].value()
     comptime a_stride11 = a_canonical_layout[1].stride[1].value()
     comptime b_stride11 = b_canonical_layout[1].stride[1].value()
-    comptime a_m_stride = a_stride01 * (64 // a_shape00) * 2
-    comptime a_k_stride = a_stride11 * 2 * 2
-    comptime b_k_stride = b_stride11 * 2 * 2
-    comptime NUM_K_MMAS = _V4_BK // 16
+    # Only the TRAILING factor of each stride is the operand width.  The
+    # leading 2 of a_k_stride/b_k_stride is modular's own core-matrix
+    # factor (layout/tensor_core_async.mojo, `TensorCoreAsync.wgmma`), and
+    # scaling it by the width too would mis-address every k-step past the
+    # first.
+    comptime a_m_stride = a_stride01 * (64 // a_shape00) * _GEMM16_W
+    comptime a_k_stride = a_stride11 * 2 * _GEMM16_W
+    comptime b_k_stride = b_stride11 * 2 * _GEMM16_W
+    comptime NUM_K_MMAS = _V4_BK // _GEMM16_WGMMA_K
     var a_desc = _wgmma_descriptor[a_canonical_layout, not COL_A, _V4_SWIZZLE](
         a_smem
     )
@@ -157,7 +172,7 @@ def _v4_mma_tile[
         var c_out = wgmma_async[
             64,
             BN,
-            16,
+            _GEMM16_WGMMA_K,
             a_type=_V4_DT,
             b_type=_V4_DT,
             layout_a="col" if COL_A else "row",
@@ -346,7 +361,7 @@ def _v4_nn_persistent_ws[
 
         comptime CFRAG = 64 * bn // 128
         comptime MACRO_BM = bm * cluster_m
-        comptime TMA_BYTES = (bm + bn) * _V4_BK * 2
+        comptime TMA_BYTES = (bm + bn) * _V4_BK * _GEMM16_W
         comptime MCAST_MASK = UInt16((1 << cluster_m) - 1)
         comptime B_CHUNKS = bn // 64
         var warp_group_idx = Int(thread_idx.x) // 128
@@ -483,7 +498,7 @@ def _v4_nn_persistent_ws[
                 _V4_F32,
                 _V4_DT,
                 _V4_DT,
-                Index(64, bn, 16),
+                Index(64, bn, _GEMM16_WGMMA_K),
                 a_swizzle=_V4_SWIZZLE,
                 b_swizzle=_V4_SWIZZLE,
                 transpose_b=False,
@@ -571,6 +586,10 @@ def _v4_nn_persistent_ws[
                         )
                         # 128B-swizzled staging layout: 16B units within
                         # each 64-element row are XORed with (row % 8).
+                        # A 64-element row is one 128-byte swizzle row only
+                        # at a 2-byte operand, so this arithmetic -- alone in
+                        # this file -- is 16-bit-only, and the float32 ladder
+                        # never selects a tma_store route.
                         var lcol = col % 64
                         var elem = (
                             (col // 64) * (bm * 64)
@@ -578,7 +597,7 @@ def _v4_nn_persistent_ws[
                             + ((lcol // 8) ^ (row % 8)) * 8
                             + lcol % 8
                         )
-                        c_smem.ptr.store[alignment=4](elem, pair)
+                        c_smem.ptr.store[alignment=2 * _GEMM16_W](elem, pair)
                     fence_async_view_proxy()
                     named_barrier[NCONS](1)
                     if warp_group_idx == 1 and warp_group_thread_idx == 0:
@@ -604,7 +623,7 @@ def _v4_nn_persistent_ws[
                             accum.ptr[e + 1].cast[_V4_DT](),
                         )
                         if m0 + row < m and n0 + col + 1 < n:
-                            output.store[alignment=4](
+                            output.store[alignment=2 * _GEMM16_W](
                                 (m0 + row) * n + n0 + col, pair
                             )
                 w += num_clusters

@@ -191,11 +191,18 @@ _GEMM16_SOURCE_PATHS = (
     eager_kernels._PACKAGE_DIR / "gemm16_matmul_ops/gemm16_kernels.mojo",
 )
 
-# The dtypes that family serves.  bfloat16 and float16 are one and the same to
-# Hopper's tensor cores -- same operand width, same WGMMA tile shapes, same
-# FP32 accumulator, only the operand-type token of the instruction differs --
-# so every tile size, pipeline depth and TMA descriptor carries over unchanged
-# and the loader simply compiles the sources once per dtype.
+# The dtypes the `_try_gemm16_*` helpers here offer that family.  bfloat16 and
+# float16 are one and the same to Hopper's tensor cores -- same operand width,
+# same WGMMA tile shapes, same FP32 accumulator, only the operand-type token of
+# the instruction differs -- so every tile size, pipeline depth and TMA
+# descriptor carries over unchanged and the loader simply compiles the sources
+# once per dtype.
+#
+# float32 is deliberately NOT in this tuple even though the family compiles for
+# it (gemm16_dtype.mojo): using it is a numerics decision gated on
+# `torch.get_float32_matmul_precision()`, not a capability one, so that route is
+# reached only through `_try_tf32_gemm`, which owns the precision gate and picks
+# between the WGMMA kernels and the SM80-class `tf32_matmul_ops` fallback.
 _GEMM16_DTYPES = (DType.bfloat16, DType.float16)
 
 # The TF32 host route is useful before the separately profiled Fable kernel is
@@ -8449,12 +8456,99 @@ def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     return out
 
 
+def _tf32_nt_wgmma_shape_admits(m: int, n: int, k: int) -> bool:
+    """The shape half of the gemm16 float32 NT gate, mirrored on the host.
+
+    It has to be mirrored rather than discovered, because the two bridges are
+    separate extensions and the host is what picks between them: whatever this
+    declines must reach the SM80-class ``tf32_matmul_ops`` route instead.  The
+    Mojo side (``_enqueue_gemm16_gemm_tf32``) raises rather than silently
+    no-op'ing if the two ever disagree, so a drift is loud.
+
+    The two conditions are hardware, not tuning (``_try_enqueue_gemm16_nt_v3_tf32``
+    in gemm16_v3_kernels.mojo carries the full derivation): TMA needs every
+    global stride to be a multiple of 16 BYTES and both operands are k-minor, so
+    the row pitch ``k * 4`` must be; and the epilogue stores a two-element pair
+    per lane at a row start of ``row * n * 4`` bytes, which needs an even ``n``.
+    ``m`` is unconstrained -- a partial edge tile in m is clipped by the
+    kernel's own bounds check.
+
+    The 2^31 bound and the grid bound are the Mojo route's remaining two
+    declines, mirrored here only so an absurd shape falls back gracefully
+    instead of hitting that raise; both are far beyond anything that fits in
+    device memory.  Every machine-width product guard the Mojo side also checks
+    (k * m, k * n, m * n against INT64_MAX) is implied by the 2^31 bound.
+    """
+    if min(m, n, k) < 1 or max(m, n, k) > 2**31 - 1:
+        return False
+    if (k * 4) % 16 or n % 2:
+        return False
+    # One CTA per 128x256 output tile, and grid.x is capped at 2^31 - 1 on
+    # every CUDA device of the compute capability this route already requires.
+    blocks_m = (m + 127) // 128
+    blocks_n = (n + 255) // 256
+    return blocks_m * blocks_n <= 2**31 - 1
+
+
+def _tf32_nt_wgmma_admits(a, b, *, transpose_b: bool = False) -> bool:
+    """Whether the float32 (TF32) WGMMA route serves this bias-free 2-D mm.
+
+    True only for the NT layout, which is the one layout of the gemm16 family
+    that has been ported and measured at a 4-byte operand: A row-major (m, k)
+    and B reached k-minor, i.e. a ``.t()`` view of an (n, k) buffer or an
+    explicit ``transpose_b``.  Every other float32 layout keeps the
+    SM80-class route, so this predicate is also what a caller consults before
+    splitting a fused bias off a matmul: splitting is only worth an extra
+    elementwise-add launch when the mm itself lands on the faster route.
+    """
+    if torch.get_float32_matmul_precision() == "highest":
+        return False
+    lhs = _t(a)
+    rhs = _t(b)
+    if (
+        lhs is None
+        or rhs is None
+        or lhs._dtype != DType.float32
+        or rhs._dtype != DType.float32
+        or lhs._device != rhs._device
+        or lhs._device.label != "gpu"
+        or lhs._device.api != "cuda"
+        or lhs._device.architecture_name != "sm_90a"
+    ):
+        return False
+    lhs_layout = _tf32_dense_2d_layout(lhs)
+    rhs_layout = _tf32_dense_2d_layout(rhs)
+    if lhs_layout is None or rhs_layout is None:
+        return False
+    # NT only: A untransposed, B effectively transposed.
+    if lhs_layout or not (rhs_layout ^ bool(transpose_b)):
+        return False
+    m, k = lhs._shape
+    rhs_k = rhs._shape[1] if transpose_b else rhs._shape[0]
+    n = rhs._shape[0] if transpose_b else rhs._shape[1]
+    if min(m, n, k) <= 0 or rhs_k != k:
+        return False
+    # An offset view's data pointer need not be 16B-aligned, and TMA
+    # descriptor creation requires it.
+    if lhs._ptr % 16 or rhs._ptr % 16:
+        return False
+    return _tf32_nt_wgmma_shape_admits(m, n, k) and _gemm16_bridge_available()
+
+
 def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     """Enqueue the opt-in dense H100 TF32 GEMM, or return ``None``.
 
+    Two device routes hide behind this one helper, both consuming and producing
+    float32 while accumulating in FP32.  The NT layout goes to the gemm16
+    family's warp-specialized WGMMA kernels compiled for a 4-byte operand --
+    WGMMA takes float32 operands directly and computes them as TF32 -- which
+    took the benchmark's NT tf32 nodes from 3.1-5.7x stock cuBLAS to 0.85-1.07x
+    on an H100 PCIe.  Every other layout, and every NT shape the WGMMA gate
+    declines, keeps the SM80-class ``mma.m16n8k8`` route in ``tf32_matmul_ops``.
+
     This helper owns only host validation/allocation and the raw bridge call;
-    the Fable-owned module owns every device-kernel body.  Unsupported layouts
-    and strict FP32 retain the existing pure-Mojo SIMT path.
+    the Mojo module owns every device-kernel body.  Unsupported layouts and
+    strict FP32 retain the existing pure-Mojo SIMT path.
     """
     # This gate is a numerics decision, not a capability one: TF32 drops
     # mantissa bits, and "highest" (PyTorch's default) is the user asking for
@@ -8508,9 +8602,24 @@ def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     if not _tf32_bridge_available():
         return None
     out = _alloc(logical_output_shape, DType.float32, lhs._device)
+    # Route selection, not capability: both bridges accept this exact 11-tuple,
+    # so the only difference is which extension compiles it.  The WGMMA leg
+    # takes the NT no-bias regimes it was measured on; everything else stays on
+    # the SM80-class kernel.  A fresh allocation is always 16B-aligned, but the
+    # gemm16 gate requires that of the OUTPUT too and it raises rather than
+    # declining, so check rather than assume.
+    extension = _Tf32MatmulExtension
+    op_name = "Tf32GemmF32"
+    if (
+        bias_tensor is None
+        and out._ptr % 16 == 0
+        and _tf32_nt_wgmma_admits(lhs, rhs, transpose_b=transpose_b)
+    ):
+        extension = _Gemm16MatmulExtension
+        op_name = "Gemm16"
     _call_mojo(
-        _Tf32MatmulExtension,
-        "Tf32GemmF32",
+        extension,
+        op_name,
         (
             out._ptr,
             lhs._ptr,
@@ -8724,6 +8833,13 @@ def _try_tf32_linear(input, weight, bias=None):
     input is already the same row-major matrix after its leading dimensions
     are flattened, so only a metadata view is needed.  Non-contiguous inputs
     retain the TensorSpec path, which owns any required materialization.
+
+    A bias is split off exactly when the bias-free mm reaches the WGMMA route
+    (`_tf32_nt_wgmma_admits`), for the reason spelled out in
+    `_try_gemm16_linear`: those kernels have no fused-bias epilogue and decline
+    a biased call outright, so a fused-bias call would land on the much slower
+    SM80-class kernel.  When the WGMMA route would not serve the mm anyway,
+    the fused-bias call is at worst identical and saves a launch.
     """
     if torch.get_float32_matmul_precision() == "highest":
         return None
@@ -8750,6 +8866,14 @@ def _try_tf32_linear(input, weight, bias=None):
             a._offset,
             contiguous=True,
         )
+    if bias is not None and _tf32_nt_wgmma_admits(matrix, weight, transpose_b=True):
+        mm_out = _try_tf32_gemm(
+            matrix, weight, transpose_b=True, output_shape=output_shape
+        )
+        if mm_out is not None:
+            biased = fast_aten_add(mm_out, bias)
+            if biased is not NOT_HANDLED:
+                return biased
     return _try_tf32_gemm(
         matrix, weight, bias, transpose_b=True, output_shape=output_shape
     )
@@ -8778,6 +8902,15 @@ def fast_aten_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0):
         # elementwise add instead.
         if _gemm16_alignment_favors_split(mat1, mat2):
             mm_out = _try_gemm16_mm(mat1, mat2)
+            if mm_out is not None:
+                biased = fast_aten_add(mm_out, input)
+                if biased is not NOT_HANDLED:
+                    return biased
+        # The float32 (TF32) WGMMA route has no fused-bias epilogue either, and
+        # declines a biased call the same way; split the bias off it too, but
+        # only where that route would actually serve the mm.
+        if _tf32_nt_wgmma_admits(mat1, mat2):
+            mm_out = _try_tf32_gemm(mat1, mat2)
             if mm_out is not None:
                 biased = fast_aten_add(mm_out, input)
                 if biased is not NOT_HANDLED:
