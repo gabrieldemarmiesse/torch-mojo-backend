@@ -7718,6 +7718,71 @@ def _sdpa_math_forward(query, key, value, is_causal, scale):
     return output, probabilities
 
 
+def _expand_kv_heads_for_gqa(
+    tensor: torch.Tensor, q_heads: int
+) -> TorchMojoTensor | None:
+    """A grouped-query K or V ``(b, kv_heads, s, d)`` as ``(b, q_heads, s, d)``.
+
+    ``enable_gqa=True`` lets K and V carry fewer heads than Q: query head ``i``
+    attends to K/V head ``i // n_rep``, with ``n_rep = q_heads // kv_heads``.
+    Expanding the head axis here is exactly HF transformers' ``repeat_kv``, and
+    it lets every route below -- masked, fused, decomposed, decode -- keep its
+    single equal-head indexing rule instead of growing a second one.
+
+    ``kv_heads == 1`` (multi-query attention) is a true zero-copy broadcast: the
+    size-1 head axis simply becomes a stride-0 axis of size ``q_heads``, with no
+    merge to perform, and the decode kernel reads it through that stride. For
+    any other ratio the ``(kv_heads, n_rep)`` merge after a broadcast expand is
+    not expressible as a view -- the merged axis would need stride 0 within a
+    group and ``h_stride`` across groups, which is not one stride -- the same
+    reason ``repeat_kv`` itself materializes, so this materializes too.
+
+    ``None`` means "not a K/V I can expand" (wrong rank, or a head count the
+    group structure cannot express); the caller declines rather than guessing.
+    """
+    t = _t(tensor)
+    if t is None or len(t._shape) != 4:
+        return None
+    kv_heads = t._shape[1]
+    if kv_heads <= 0 or q_heads <= 0 or q_heads % kv_heads != 0:
+        return None
+    if kv_heads == q_heads:
+        return t
+    batch, _, length, head_dim = t._shape
+    batch_stride, head_stride, length_stride, dim_stride = t._strides
+    expanded_shape = (batch, q_heads, length, head_dim)
+    if kv_heads == 1:
+        return _view_of(
+            t, expanded_shape, (batch_stride, 0, length_stride, dim_stride), t._offset
+        )
+    grouped = _view_of(
+        t,
+        (batch, kv_heads, q_heads // kv_heads, length, head_dim),
+        (batch_stride, head_stride, 0, length_stride, dim_stride),
+        t._offset,
+    )
+    dense = grouped._contig()
+    return _view_of(
+        dense,
+        expanded_shape,
+        _row_major_strides(expanded_shape),
+        dense._offset,
+        contiguous=True,
+    )
+
+
+def _sdpa_expanded_gqa_kv(query, key, value):
+    """``(key, value)`` with their head axis grown to the query's, or None."""
+    q = _t(query)
+    if q is None or len(q._shape) != 4:
+        return None
+    expanded_key = _expand_kv_heads_for_gqa(key, q._shape[1])
+    expanded_value = _expand_kv_heads_for_gqa(value, q._shape[1])
+    if expanded_key is None or expanded_value is None:
+        return None
+    return expanded_key, expanded_value
+
+
 def fast_aten__scaled_dot_product_attention_math(
     query,
     key,
@@ -7730,8 +7795,13 @@ def fast_aten__scaled_dot_product_attention_math(
     scale=None,
     enable_gqa=False,
 ):
-    if dropout_p != 0.0 or dropout_mask is not None or enable_gqa:
+    if dropout_p != 0.0 or dropout_mask is not None:
         return NOT_HANDLED
+    if enable_gqa:
+        expanded = _sdpa_expanded_gqa_kv(query, key, value)
+        if expanded is None:
+            return NOT_HANDLED
+        key, value = expanded
     if attn_mask is not None:
         return _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale)
     result = _sdpa_math_forward(query, key, value, is_causal, scale)
@@ -9154,10 +9224,21 @@ def fast_aten_scaled_dot_product_attention(
     scale=None,
     enable_gqa=False,
 ):
+    if enable_gqa:
+        # Grow K/V to Q's head count once, here, and every route below runs its
+        # ordinary equal-head code -- including the fused ones, which decline
+        # ``enable_gqa`` outright and would otherwise be unreachable for the
+        # Llama-class models that pass it.
+        expanded = _sdpa_expanded_gqa_kv(query, key, value)
+        if expanded is None:
+            return NOT_HANDLED
+        key, value = expanded
+        enable_gqa = False
+
     if attn_mask is not None:
         # None of the fused attention kernels take a mask operand, so a masked
         # call goes straight to the decomposed masked forward.
-        if enable_gqa or dropout_p != 0.0:
+        if dropout_p != 0.0:
             return NOT_HANDLED
         result = _sdpa_masked_math_forward(
             query, key, value, attn_mask, is_causal, scale

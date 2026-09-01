@@ -10138,6 +10138,501 @@ def test_fast_sdpa_causal_training_backward(mojo_gpu):
         torch.testing.assert_close(actual_grad, expected_grad, atol=2e-2, rtol=2e-2)
 
 
+# ---------------------------------------------------------------------------
+# Grouped-query attention (``enable_gqa=True``).
+#
+# HF transformers' ``sdpa_attention_forward`` stops calling ``repeat_kv``
+# itself and passes ``enable_gqa=True`` whenever there is no padding mask, so
+# this is the shape of every ordinary Llama-3/Mistral/Qwen2/Gemma2 causal step.
+# ``(32, 8)`` is Llama-3-8B's ratio, ``(8, 1)`` is multi-query attention, whose
+# single K/V head is broadcast rather than copied.
+# ---------------------------------------------------------------------------
+
+_GQA_HEAD_COUNTS = ((32, 8), (8, 1))
+_GQA_HEAD_IDS = ["q32kv8", "q8kv1"]
+
+
+def _gqa_host_qkv(
+    q_heads: int,
+    kv_heads: int,
+    dtype: torch.dtype,
+    *,
+    batch: int = 1,
+    q_len: int = 128,
+    kv_len: int = 128,
+    head_dim: int = 64,
+    seed: int = 20260811,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Host-side ``(query, key, value)`` with mismatched head counts."""
+    generator = torch.Generator().manual_seed(seed)
+
+    def make(heads: int, length: int) -> torch.Tensor:
+        return (
+            torch.randn(
+                batch, heads, length, head_dim, generator=generator, dtype=torch.float32
+            )
+            * 0.25
+        ).to(dtype)
+
+    return make(q_heads, q_len), make(kv_heads, kv_len), make(kv_heads, kv_len)
+
+
+def _repeat_kv(tensor: torch.Tensor, q_heads: int) -> torch.Tensor:
+    """HF transformers' ``repeat_kv``, the reference expansion."""
+    batch, kv_heads, length, head_dim = tensor.shape
+    return (
+        tensor[:, :, None]
+        .expand(batch, kv_heads, q_heads // kv_heads, length, head_dim)
+        .reshape(batch, q_heads, length, head_dim)
+    )
+
+
+@pytest.mark.parametrize("is_causal", [True, False], ids=["causal", "full"])
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize("q_heads,kv_heads", _GQA_HEAD_COUNTS, ids=_GQA_HEAD_IDS)
+def test_fast_sdpa_enable_gqa_forward_matches_reference(
+    mojo_gpu, q_heads, kv_heads, dtype, head_dim, is_causal
+):
+    """``enable_gqa=True`` with fewer K/V heads must compute plain attention.
+
+    head_dim 64 and 128 are the two FA4-eligible regimes, so this also covers
+    a GQA call landing on a fused route after the expansion rather than only
+    on the math decomposition.
+    """
+    query, key, value = _gqa_host_qkv(q_heads, kv_heads, dtype, head_dim=head_dim)
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        query.float(),
+        _repeat_kv(key, q_heads).float(),
+        _repeat_kv(value, q_heads).float(),
+        is_causal=is_causal,
+    )
+    with torch.no_grad():
+        actual = torch.nn.functional.scaled_dot_product_attention(
+            query.to(mojo_gpu),
+            key.to(mojo_gpu),
+            value.to(mojo_gpu),
+            is_causal=is_causal,
+            enable_gqa=True,
+        )
+    assert tuple(actual.shape) == tuple(reference.shape)
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual.cpu().float(), reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", _GQA_HEAD_COUNTS, ids=_GQA_HEAD_IDS)
+def test_fast_sdpa_enable_gqa_grad_enabled_forward_matches_reference(
+    mojo_gpu, q_heads, kv_heads
+):
+    """Grad mode on with no leaf requiring a gradient stays graph-free.
+
+    fp32 too, so this is the math decomposition rather than the fused route
+    the 16-bit cases above reach.
+    """
+    query, key, value = _gqa_host_qkv(q_heads, kv_heads, torch.float32)
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        query, _repeat_kv(key, q_heads), _repeat_kv(value, q_heads), is_causal=True
+    )
+    actual = torch.nn.functional.scaled_dot_product_attention(
+        query.to(mojo_gpu),
+        key.to(mojo_gpu),
+        value.to(mojo_gpu),
+        is_causal=True,
+        enable_gqa=True,
+    )
+    assert actual.grad_fn is None
+    torch.testing.assert_close(actual.cpu(), reference, atol=2e-3, rtol=2e-3)
+
+
+def test_fast_sdpa_enable_gqa_multi_query_expansion_is_zero_copy(mojo_gpu):
+    """A single K/V head becomes a stride-0 broadcast, never a copy."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    key = torch.randn(2, 1, 8, 16).to(mojo_gpu)
+    expanded = aten_fast._expand_kv_heads_for_gqa(key, 12)
+    assert expanded is not None
+    assert tuple(expanded.shape) == (2, 12, 8, 16)
+    assert expanded._strides[1] == 0
+    assert expanded._ptr == key._ptr
+    assert expanded._holder is key._holder
+    torch.testing.assert_close(expanded.cpu(), _repeat_kv(key.cpu(), 12))
+
+
+def test_fast_sdpa_enable_gqa_expansion_matches_repeat_kv(mojo_gpu):
+    """The materialized expansion repeats each head n_rep times in place."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    host = torch.randn(2, 3, 5, 4)
+    expanded = aten_fast._expand_kv_heads_for_gqa(host.to(mojo_gpu), 12)
+    assert expanded is not None
+    assert expanded._is_contiguous
+    torch.testing.assert_close(expanded.cpu(), _repeat_kv(host, 12))
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", [(6, 4), (2, 3)], ids=["6to4", "2to3"])
+def test_fast_sdpa_enable_gqa_indivisible_head_counts_raise(
+    mojo_gpu, q_heads, kv_heads
+):
+    """A head count the group structure cannot express is declined cleanly."""
+    query, key, value = _gqa_host_qkv(
+        q_heads, kv_heads, torch.float32, q_len=8, kv_len=8
+    )
+    with pytest.raises(NotImplementedError), torch.no_grad():
+        torch.nn.functional.scaled_dot_product_attention(
+            query.to(mojo_gpu), key.to(mojo_gpu), value.to(mojo_gpu), enable_gqa=True
+        )
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", _GQA_HEAD_COUNTS, ids=_GQA_HEAD_IDS)
+def test_fast_sdpa_enable_gqa_masked_forward_matches_reference(
+    mojo_gpu, q_heads, kv_heads
+):
+    """A float bias mask together with ``enable_gqa`` used to decline outright."""
+    query, key, value = _gqa_host_qkv(
+        q_heads, kv_heads, torch.float32, q_len=16, kv_len=24, head_dim=32
+    )
+    generator = torch.Generator().manual_seed(20260812)
+    mask = torch.randn(1, q_heads, 16, 24, generator=generator)
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        query, _repeat_kv(key, q_heads), _repeat_kv(value, q_heads), attn_mask=mask
+    )
+    with torch.no_grad():
+        actual = torch.nn.functional.scaled_dot_product_attention(
+            query.to(mojo_gpu),
+            key.to(mojo_gpu),
+            value.to(mojo_gpu),
+            attn_mask=mask.to(mojo_gpu),
+            enable_gqa=True,
+        )
+    torch.testing.assert_close(actual.cpu(), reference, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_fast_sdpa_enable_gqa_strided_qkv_forward_matches_reference(mojo_gpu, dtype):
+    """Q/K/V taken as transposed views of one packed projection, the way a real
+    model hands them over (the layout the FA4 ``_strided_qkv`` ABI exists for).
+
+    The expansion has to read K/V through those strides rather than assume a
+    dense head axis; Q stays a strided view throughout.
+    """
+    batch, seqlen, q_heads, kv_heads, head_dim = 1, 128, 8, 2, 64
+    generator = torch.Generator().manual_seed(20260813)
+    packed = (
+        torch.randn(
+            batch,
+            seqlen,
+            (q_heads + 2 * kv_heads) * head_dim,
+            generator=generator,
+            dtype=torch.float32,
+        )
+        * 0.25
+    ).to(dtype)
+
+    def split(source: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        query_part, key_part, value_part = source.split(
+            [q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim], dim=2
+        )
+        return tuple(
+            part.view(batch, seqlen, heads, head_dim).transpose(1, 2)
+            for part, heads in (
+                (query_part, q_heads),
+                (key_part, kv_heads),
+                (value_part, kv_heads),
+            )
+        )
+
+    host_query, host_key, host_value = split(packed)
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        host_query.float(),
+        _repeat_kv(host_key, q_heads).float(),
+        _repeat_kv(host_value, q_heads).float(),
+        is_causal=True,
+    )
+    device_query, device_key, device_value = split(packed.to(mojo_gpu))
+    for tensor in (device_query, device_key, device_value):
+        assert not tensor._is_contiguous
+    with torch.no_grad():
+        actual = torch.nn.functional.scaled_dot_product_attention(
+            device_query, device_key, device_value, is_causal=True, enable_gqa=True
+        )
+    torch.testing.assert_close(actual.cpu().float(), reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("is_causal", [True, False], ids=["causal", "full"])
+@pytest.mark.parametrize("q_heads,kv_heads", _GQA_HEAD_COUNTS, ids=_GQA_HEAD_IDS)
+def test_fast_sdpa_enable_gqa_backward_matches_reference(
+    mojo_gpu, q_heads, kv_heads, is_causal
+):
+    """GQA gradients must land on the ORIGINAL (b, kv_heads, s, d) K and V.
+
+    That is the whole reason the backward-needing route expands with
+    differentiable ops: ``ExpandBackward`` sums each group of query heads back
+    down, so no custom backward code is owed.
+    """
+    query, key, value = _gqa_host_qkv(
+        q_heads, kv_heads, torch.float32, q_len=64, kv_len=64, head_dim=32
+    )
+    grad_output = torch.randn(query.shape, generator=torch.Generator().manual_seed(7))
+
+    reference_inputs = [
+        tensor.detach().clone().requires_grad_() for tensor in (query, key, value)
+    ]
+    reference_output = torch.nn.functional.scaled_dot_product_attention(
+        reference_inputs[0],
+        _repeat_kv(reference_inputs[1], q_heads),
+        _repeat_kv(reference_inputs[2], q_heads),
+        is_causal=is_causal,
+    )
+    reference_output.backward(grad_output)
+
+    mojo_inputs = [
+        tensor.detach().clone().to(mojo_gpu).requires_grad_()
+        for tensor in (query, key, value)
+    ]
+    mojo_output = torch.nn.functional.scaled_dot_product_attention(
+        *mojo_inputs, is_causal=is_causal, enable_gqa=True
+    )
+    assert "Flash" not in type(mojo_output.grad_fn).__name__
+    mojo_output.backward(grad_output.to(mojo_gpu))
+
+    for name, tensor, reference in zip(
+        ("query", "key", "value"), mojo_inputs, reference_inputs, strict=True
+    ):
+        assert tensor.grad is not None, f"{name} gradient was not computed"
+        assert tuple(tensor.grad.shape) == tuple(tensor.shape)
+        torch.testing.assert_close(
+            tensor.grad.cpu(), reference.grad, atol=2e-3, rtol=2e-3
+        )
+
+
+def test_fast_sdpa_enable_gqa_hf_llama_forward(mojo_gpu):
+    """``transformers.integrations.sdpa_attention.sdpa_attention_forward``'s
+    own call shape: no mask, ``is_causal=True``, ``enable_gqa=True``, at
+    Llama-3-8B's 32/8 heads and head_dim 128 -- prefill then one decode step."""
+    q_heads, kv_heads, head_dim = 32, 8, 128
+    for q_len, kv_len in ((256, 256), (1, 257)):
+        query, key, value = _gqa_host_qkv(
+            q_heads,
+            kv_heads,
+            torch.bfloat16,
+            q_len=q_len,
+            kv_len=kv_len,
+            head_dim=head_dim,
+            seed=q_len,
+        )
+        is_causal = q_len > 1
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            query.float(),
+            _repeat_kv(key, q_heads).float(),
+            _repeat_kv(value, q_heads).float(),
+            is_causal=is_causal,
+        )
+        with torch.no_grad():
+            actual = torch.nn.functional.scaled_dot_product_attention(
+                query.to(mojo_gpu),
+                key.to(mojo_gpu),
+                value.to(mojo_gpu),
+                dropout_p=0.0,
+                is_causal=is_causal,
+                enable_gqa=True,
+            )
+        torch.testing.assert_close(
+            actual.cpu().float(), reference, atol=2e-2, rtol=2e-2
+        )
+
+
+def test_fast_sdpa_enable_gqa_inference_expands_without_repeat_kv_copy(
+    mojo_gpu, monkeypatch
+):
+    """A multi-query decode step must not pay for a ``repeat_kv`` copy.
+
+    Without a gradient to track, the expansion happens inside ``aten_fast``,
+    where a single K/V head is a stride-0 broadcast the decode kernel reads
+    through. The differentiable ``repeat_kv`` (whose ``reshape`` materializes)
+    is reserved for the backward-needing routes.
+    """
+    from torch_mojo_backend.mojo_device import mojo_device_autograd
+
+    calls = {"count": 0}
+    original = mojo_device_autograd._expand_gqa_key_value
+
+    def spy(*args: torch.Tensor) -> object:
+        calls["count"] += 1
+        return original(*args)
+
+    monkeypatch.setattr(mojo_device_autograd, "_expand_gqa_key_value", spy)
+
+    q_heads, kv_len, head_dim = 12, 48, 64
+    query, key, value = _gqa_host_qkv(
+        q_heads, 1, torch.float32, q_len=1, kv_len=kv_len, head_dim=head_dim
+    )
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        query, _repeat_kv(key, q_heads), _repeat_kv(value, q_heads)
+    )
+    device_inputs = [tensor.to(mojo_gpu) for tensor in (query, key, value)]
+    with torch.no_grad():
+        gqa = torch.nn.functional.scaled_dot_product_attention(
+            *device_inputs, enable_gqa=True
+        )
+    assert calls["count"] == 0
+    torch.testing.assert_close(gqa.cpu(), reference, atol=2e-3, rtol=2e-3)
+
+    for tensor in device_inputs:
+        tensor.requires_grad_()
+    torch.nn.functional.scaled_dot_product_attention(
+        *device_inputs, enable_gqa=True
+    ).sum().backward()
+    assert calls["count"] == 1
+
+
+def test_fast_sdpa_enable_gqa_math_op_matches_reference(mojo_gpu):
+    """The lower ``aten::_scaled_dot_product_attention_math`` op, which returns
+    the probability matrix alongside the output, declined GQA for the same
+    reason and is fixed by the same expansion."""
+    q_heads, kv_heads = 8, 2
+    query, key, value = _gqa_host_qkv(
+        q_heads, kv_heads, torch.float32, q_len=16, kv_len=16, head_dim=32
+    )
+    reference, reference_probabilities = (
+        torch.ops.aten._scaled_dot_product_attention_math(
+            query, _repeat_kv(key, q_heads), _repeat_kv(value, q_heads), is_causal=True
+        )
+    )
+    with torch.no_grad():
+        actual, probabilities = torch.ops.aten._scaled_dot_product_attention_math(
+            query.to(mojo_gpu),
+            key.to(mojo_gpu),
+            value.to(mojo_gpu),
+            is_causal=True,
+            enable_gqa=True,
+        )
+    torch.testing.assert_close(actual.cpu(), reference, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(
+        probabilities.cpu(), reference_probabilities, atol=2e-3, rtol=2e-3
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
+def test_fast_sdpa_enable_gqa_reaches_fa4_without_grad(
+    mojo_h100, monkeypatch, head_dim
+):
+    """Once K/V are expanded, a GQA prefill is an ordinary FA4 call.
+
+    The fused kernels decline ``enable_gqa`` outright, so before the expansion
+    a Llama-class causal step could only ever reach the O(n^2) math
+    decomposition. This pins that it now reaches the BHSD-native FA4 route
+    instead -- the reason to expand in the entry point rather than inside the
+    decomposition.
+    """
+    from torch_mojo_backend.eager_flash_attention import load_fa4_ops
+
+    module = load_fa4_ops()
+    name = f"flash_attention_fwd_bf16_d{head_dim}_causal_bhsd"
+    original = getattr(module, name)
+    calls = {"count": 0}
+
+    def spy(*args):
+        calls["count"] += 1
+        return original(*args)
+
+    monkeypatch.setattr(module, name, spy)
+
+    query, key, value = _gqa_host_qkv(
+        32, 8, torch.bfloat16, q_len=128, kv_len=128, head_dim=head_dim
+    )
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        query.float(),
+        _repeat_kv(key, 32).float(),
+        _repeat_kv(value, 32).float(),
+        is_causal=True,
+    )
+    with torch.no_grad():
+        actual = torch.nn.functional.scaled_dot_product_attention(
+            query.to(mojo_h100),
+            key.to(mojo_h100),
+            value.to(mojo_h100),
+            is_causal=True,
+            enable_gqa=True,
+        )
+    actual_host = actual.cpu().float()
+    assert calls["count"] == 1
+    torch.testing.assert_close(actual_host, reference, atol=2e-2, rtol=2e-2)
+
+
+def test_fast_sdpa_enable_gqa_backward_never_uses_native_flash(mojo_h100):
+    """A GQA triple whose EXPANDED form would be FA4-eligible must still not
+    reach the native flash op when a backward is coming.
+
+    Its backward is a native (derivatives.yaml) node, and a decline inside one
+    aborts the process rather than raising, so the expansion is applied only
+    after that dispatch decision. This is the regression test for reordering
+    the two.
+    """
+    q_heads, kv_heads, seqlen, head_dim = 8, 2, 128, 64
+    query, key, value = _gqa_host_qkv(
+        q_heads,
+        kv_heads,
+        torch.bfloat16,
+        q_len=seqlen,
+        kv_len=seqlen,
+        head_dim=head_dim,
+    )
+    grad_output = torch.randn(
+        query.shape, generator=torch.Generator().manual_seed(20260814)
+    ).to(torch.bfloat16)
+
+    reference_inputs = [
+        tensor.float().detach().requires_grad_() for tensor in (query, key, value)
+    ]
+    reference_output = torch.nn.functional.scaled_dot_product_attention(
+        reference_inputs[0],
+        _repeat_kv(reference_inputs[1], q_heads),
+        _repeat_kv(reference_inputs[2], q_heads),
+        is_causal=True,
+    )
+    reference_output.backward(grad_output.float())
+
+    mojo_inputs = [
+        tensor.detach().clone().to(mojo_h100).requires_grad_()
+        for tensor in (query, key, value)
+    ]
+    mojo_output = torch.nn.functional.scaled_dot_product_attention(
+        *mojo_inputs, is_causal=True, enable_gqa=True
+    )
+    assert type(mojo_output.grad_fn).__name__ != (
+        "ScaledDotProductFlashAttentionBackward0"
+    )
+    mojo_output.backward(grad_output.to(mojo_h100))
+
+    torch.testing.assert_close(
+        mojo_output.detach().cpu().float(),
+        reference_output.detach(),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    for tensor, reference in zip(mojo_inputs, reference_inputs, strict=True):
+        assert tensor.grad is not None
+        assert tuple(tensor.grad.shape) == tuple(tensor.shape)
+        torch.testing.assert_close(
+            tensor.grad.cpu().float(), reference.grad, atol=5e-2, rtol=5e-2
+        )
+
+
+def test_fast_sdpa_equal_head_counts_ignore_enable_gqa(mojo_gpu):
+    """``enable_gqa=True`` with equal head counts is plain attention, and the
+    ordinary ``enable_gqa=False`` call is untouched by the expansion."""
+    query, key, value = _gqa_host_qkv(8, 8, torch.float32, q_len=32, kv_len=32)
+    device_inputs = [tensor.to(mojo_gpu) for tensor in (query, key, value)]
+    with torch.no_grad():
+        plain = torch.nn.functional.scaled_dot_product_attention(
+            *device_inputs, is_causal=True
+        )
+        gqa = torch.nn.functional.scaled_dot_product_attention(
+            *device_inputs, is_causal=True, enable_gqa=True
+        )
+    torch.testing.assert_close(gqa.cpu(), plain.cpu(), atol=0.0, rtol=0.0)
+
+
 @pytest.mark.parametrize(
     (
         "requires",
