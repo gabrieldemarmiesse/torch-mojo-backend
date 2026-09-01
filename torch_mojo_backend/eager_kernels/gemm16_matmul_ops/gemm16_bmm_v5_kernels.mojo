@@ -74,6 +74,7 @@ from layout.tensor_core_async import (
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+from wgmma_c_epilogue import _wgmma_store_c_tile
 
 comptime _B5_DT = _GEMM16_DT
 comptime _B5_F32 = DType.float32
@@ -655,59 +656,22 @@ def _b5_bmm_nn_tiny[
                 issue_tile(t + stages)
             t += 1
 
-        var tid = Int(thread_idx.x)
-        var warp = tid // 32
-        var lane = tid % 32
-        var base_row = warp * 16 + lane // 4
-        var base_col = (lane % 4) * 2
-        comptime if tma_store:
-            comptime for q in range(CFRAG // 2):
-                var e = q * 2
-                var row = base_row + (q % 2) * 8
-                var col = base_col + (q // 2) * 8
-                var pair = SIMD[_B5_DT, 2](
-                    accum.ptr[e].cast[_B5_DT](),
-                    accum.ptr[e + 1].cast[_B5_DT](),
-                )
-                var lcol = col % 64
-                var elem = (
-                    (col // 64) * (bm * 64)
-                    + row * 64
-                    + ((lcol // 8) ^ (row % 8)) * 8
-                    + lcol % 8
-                )
-                c_smem.ptr.store[alignment=4](elem, pair)
-            fence_async_view_proxy()
-            barrier()
-            if thread_idx.x == 0:
-                comptime for chunk in range(bn // 64):
-                    var c_chunk = LayoutTensor[
-                        _B5_DT,
-                        Layout.row_major(bm, 64),
-                        MutAnyOrigin,
-                        address_space=AddressSpace.SHARED,
-                        alignment=128,
-                    ](c_smem.ptr + chunk * bm * 64)
-                    c_tma.async_store_3d(c_chunk, (n0 + chunk * 64, m0, bidx))
-                c_tma.commit_group()
-                c_tma.wait_group[0]()
-        else:
-            comptime for q in range(CFRAG // 2):
-                var e = q * 2
-                var row = base_row + (q % 2) * 8
-                var col = base_col + (q // 2) * 8
-                if m0 + row < m:
-                    var off = bidx * c_bs + (m0 + row) * n + n0 + col
-                    if n0 + col + 1 < n:
-                        output.store[alignment=2](
-                            off,
-                            SIMD[_B5_DT, 2](
-                                accum.ptr[e].cast[_B5_DT](),
-                                accum.ptr[e + 1].cast[_B5_DT](),
-                            ),
-                        )
-                    elif n0 + col < n:
-                        output[off] = accum.ptr[e].cast[_B5_DT]()
+        # Both epilogues (128 B-swizzled TMA store and the scalar 4 B
+        # fallback) are pure functions of the wgmma fragment layout, and the
+        # implicit-GEMM conv kernel writes exactly the same (batch, m, n)
+        # tile, so they live in wgmma_c_epilogue.mojo and are shared instead
+        # of copied.  `@always_inline`: verified via
+        # scripts/compare_kernel_asm.py (sm_90a) that this is a NEW-FUNCTION-
+        # BOUNDARY diff, not a logic change -- the scalar-epilogue kernels'
+        # PTX shifts by register renumbering and instruction reordering
+        # (param-load order), never a changed opcode/operand/immediate. Not
+        # byte-identical, so treat that script's "0 kernels changed" bar as
+        # not met here; the correctness net is the 140+ gemm16/bmm/conv unit
+        # tests plus benchmarks/test_vision.py's mid/awkward conv shapes
+        # (both route through this exact scalar-epilogue kernel), all green.
+        _wgmma_store_c_tile[_B5_DT, bm, bn, tma_store](
+            c_tma, c_smem.ptr, accum.ptr, output, m, n, c_bs, m0, n0, bidx
+        )
 
 
 def _b5_enqueue_tiny[
