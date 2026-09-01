@@ -323,6 +323,83 @@ def test_fast_div_trunc_mode_narrow_float_boundary(mojo_device, dtype):
     torch.testing.assert_close(result, torch.div(x, y, rounding_mode="trunc"))
 
 
+def test_fast_div_trunc_mode_scalar_divisor_uses_fp32_precision(mojo_device):
+    """Regression test (adversarial review, wave A): torch's bf16/fp16
+    trunc kernel takes a SEPARATE fp32-upcast fast path whenever the
+    divisor is a scalar (CPU's `is_scalar(2)`, CUDA's `is_cpu_scalar(2)`),
+    unlike its native-precision tensor/tensor path (pinned by
+    test_fast_div_trunc_mode_narrow_float_boundary above). A prior version
+    of BOP_TRUNCDIV applied the tensor/tensor rule unconditionally and
+    returned 6.0 for this exact case; stock returns 5.0 for both a raw
+    Python-scalar divisor and a one-element TENSOR divisor."""
+    x = torch.tensor([-6.3125], dtype=torch.bfloat16)
+    expected = torch.div(x, -1.0547, rounding_mode="trunc")
+    assert expected.item() == 5.0  # sanity: this is what stock actually does
+
+    scalar_result = torch.div(x.to(mojo_device), -1.0547, rounding_mode="trunc").cpu()
+    torch.testing.assert_close(scalar_result, expected)
+
+    one_elem = torch.tensor([-1.0547], dtype=torch.bfloat16)
+    one_elem_expected = torch.div(x, one_elem, rounding_mode="trunc")
+    one_elem_result = torch.div(
+        x.to(mojo_device), one_elem.to(mojo_device), rounding_mode="trunc"
+    ).cpu()
+    torch.testing.assert_close(one_elem_result, one_elem_expected)
+
+
+def test_fast_div_int_div_by_zero_raises_on_cpu():
+    """Regression test (adversarial review, wave A): integer floor/trunc
+    div-by-zero used to return a deterministic-but-meaningless value
+    (`a // 0` reads as 0 via Mojo's own zero-guard, and the old trunc
+    correction step then perturbed that to 1 for negative numerators) with
+    no raise anywhere. Stock CPU raises `RuntimeError: ZeroDivisionError`;
+    this device's CPU dispatch tier now scans the divisor host-side (real,
+    already-addressable memory on this tier) and raises before launching,
+    matching stock CPU exactly."""
+    cpu_device = f"mojo:{len(get_accelerators()) - 1}"
+    x = torch.tensor([1, -1], dtype=torch.int32)
+    y = torch.tensor([0, 0], dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="ZeroDivisionError"):
+        torch.div(x.to(cpu_device), y.to(cpu_device), rounding_mode="floor")
+    with pytest.raises(RuntimeError, match="ZeroDivisionError"):
+        torch.div(x.to(cpu_device), y.to(cpu_device), rounding_mode="trunc")
+
+
+def test_fast_div_int_div_by_zero_is_a_documented_sentinel_on_gpu(mojo_gpu):
+    """GPU dispatch cannot cheaply raise from device code (see the CPU-only
+    check in `_binary_bcast`), so it returns a documented sentinel instead:
+    0, uniformly, for both floor and trunc (not stock CUDA's own
+    platform-specific sentinel, which this device does not attempt to
+    reproduce -- see BOP_TRUNCDIV's b==0 handling in logic_ops.mojo). This
+    pins that the sentinel is at least CONSISTENT (floor and trunc used to
+    disagree: trunc's now-removed sign-correction step turned 0 into 1 for
+    a negative numerator) rather than an unreviewed accident."""
+    x = torch.tensor([1, -1], dtype=torch.int32).to(mojo_gpu)
+    y = torch.tensor([0, 0], dtype=torch.int32).to(mojo_gpu)
+    zero = torch.tensor([0, 0], dtype=torch.int32)
+    torch.testing.assert_close(torch.div(x, y, rounding_mode="floor").cpu(), zero)
+    torch.testing.assert_close(torch.div(x, y, rounding_mode="trunc").cpu(), zero)
+
+
+def test_fast_div_out_mode_cross_category_dtype(mojo_device):
+    """Regression test (adversarial review, wave A): `div.out_mode`'s
+    "safe_cast" dtype policy accepts any torch-legal (result, out) pair
+    (`torch.can_cast`), but the fast CastSpec kernel family deliberately
+    excludes float64 (see `_CAST_DTYPES`). int32 inputs with a float64 `out`
+    used to raise `NotImplementedError: mojo spec cast into: unsupported
+    dtype pair` even though stock succeeds; `_copy_into_tensor` now falls
+    back to a host round-trip through real torch's own cast for dtype pairs
+    outside `_CAST_DTYPES`."""
+    x = torch.tensor([7, -7], dtype=torch.int32)
+    y = torch.tensor([2, 2], dtype=torch.int32)
+    expected = torch.empty(2, dtype=torch.float64)
+    torch.div(x, y, rounding_mode="trunc", out=expected)
+
+    out = torch.empty(2, dtype=torch.float64, device=mojo_device)
+    torch.div(x.to(mojo_device), y.to(mojo_device), rounding_mode="trunc", out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
 @pytest.mark.parametrize("shape", [(0,), (1,), (7,), (0, 5)])
 def test_edge_case_shapes(mojo_device, shape):
     x = torch.randn(*shape)

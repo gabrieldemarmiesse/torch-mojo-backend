@@ -136,7 +136,26 @@ def _copy_into_tensor(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     """dst[...] = src[...] with dtype cast + broadcast, any strides."""
     aten_fast = _fast()
     if src._dtype != dst._dtype:
-        src = aten_fast._cast_tensor(src, dst._dtype)
+        if (
+            src._dtype in aten_fast._CAST_DTYPES
+            and dst._dtype in aten_fast._CAST_DTYPES
+        ):
+            src = aten_fast._cast_tensor(src, dst._dtype)
+        else:
+            # Neither the fast CastSpec kernel family's dtype list nor this
+            # helper's callers agree with torch's own `can_cast` rules --
+            # an `out=` dtype policy of "safe_cast" (e.g. div.out_mode)
+            # accepts any torch-legal pair (int32 -> float64 is legal), but
+            # _CAST_DTYPES deliberately excludes float64 (and the narrow
+            # ints) from the device cast kernels. Rather than growing that
+            # kernel matrix for a rare `out=` dtype, round-trip through the
+            # host and real torch's own cast, which is correct for any
+            # dtype pair torch supports. This is the same `_to_cpu_tensor`
+            # drain other host-dependent ops already pay (see
+            # deferred_compile.py), just on the tail end of an `out=` copy
+            # instead of a value read.
+            host_cast = src._to_cpu_tensor().to(max_dtype_to_torch_dtype(dst._dtype))
+            src = TorchMojoTensor._from_cpu(host_cast, dst._device)
     if tuple(src._shape) != tuple(dst._shape):
         expanded = aten_fast.fast_aten_expand(src, dst._shape)
         if expanded is aten_fast.NOT_HANDLED:

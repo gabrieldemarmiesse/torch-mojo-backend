@@ -2015,16 +2015,28 @@ def _try_spec_reduce(
 
 
 def _raise_if_device_oom(exc: BaseException) -> None:
-    """Keep TensorSpec fallbacks from disguising allocator exhaustion.
+    """Keep TensorSpec fallbacks from disguising a handful of REAL errors.
 
     Mojo TensorSpec dispatch reports both unsupported metadata and runtime
-    launch/allocation failures as ``NotImplementedError``. Unsupported
-    metadata should retain the classic fallback, but retrying after a device
-    OOM only replaces the useful allocator error with a misleading
-    ``aten::<op> is not supported`` message.
+    launch/allocation/data failures as ``NotImplementedError``. Unsupported
+    metadata should retain the classic fallback (return ``None`` so the
+    caller declines), but a few conditions are not "this input combination
+    isn't supported" at all and must propagate instead of being disguised as
+    a generic ``aten::<op> is not supported`` decline:
+
+    - Device OOM: retrying after allocator exhaustion only replaces the
+      useful allocator error with that misleading message.
+    - Integer floor/trunc division by zero: `_binary_bcast`'s CPU dispatch
+      tier (logic_ops.mojo) scans the divisor host-side and raises
+      ``Error("ZeroDivisionError")`` rather than silently returning the
+      documented sentinel the (non-raising) GPU tiers use -- matching
+      stock CPU's own ``RuntimeError: ZeroDivisionError`` means re-raising
+      that here, not letting the generic decline path swallow it.
     """
     if eager_kernels.is_device_oom(exc):
         raise torch.OutOfMemoryError(str(exc)) from exc
+    if "ZeroDivisionError" in str(exc):
+        raise RuntimeError("ZeroDivisionError") from exc
 
 
 # A queued launch fails inside `call_queue.drain()`, far from the `_call_mojo`
@@ -2681,11 +2693,54 @@ def fast_aten_mul_(input, other):
 _DIV_ROUNDING_MODE_SPECS = {"floor": "FloorDivSpec", "trunc": "TruncDivSpec"}
 
 
+def _is_div_other_scalar_like(other: object) -> bool:
+    """Whether `other` is a scalar for torch's div-by-a-scalar fp32 fast
+    path: a raw Python number, or a tensor with exactly one element (any
+    rank, including 0-dim) -- both count as `TensorIteratorBase::is_scalar`
+    in torch's own CPU/CUDA kernels."""
+    if isinstance(other, int | float) and not isinstance(other, bool):
+        return True
+    t = _t(other)
+    return t is not None and t._numel == 1
+
+
 def fast_aten_div(input, other, *, rounding_mode=None):
     if rounding_mode is not None:
         spec_name = _DIV_ROUNDING_MODE_SPECS.get(rounding_mode)
         if spec_name is None:
             return NOT_HANDLED
+        a = _t(input)
+        if (
+            rounding_mode == "trunc"
+            and a is not None
+            and a._dtype in (DType.float16, DType.bfloat16)
+            and _is_div_other_scalar_like(other)
+        ):
+            # BOP_TRUNCDIV intentionally computes at the operands' own
+            # (narrow) precision for ordinary tensor/tensor calls, matching
+            # torch's tensor/tensor trunc kernel exactly (see the comment on
+            # BOP_TRUNCDIV in logic_ops.mojo). But torch's kernels take a
+            # SEPARATE, fp32-upcast fast path whenever the divisor is a
+            # scalar (CPU's `is_scalar(2)`, CUDA's `is_cpu_scalar(2)`) --
+            # e.g. `torch.div(bf16_tensor, -1.0547, rounding_mode="trunc")`
+            # divides at fp32, not bf16. A raw Python scalar reaches this
+            # function unrounded (see `_try_spec_binary`'s scalar-embed
+            # path), so casting `input` to fp32 BEFORE calling
+            # `_try_spec_binary` embeds the scalar straight into fp32
+            # storage -- no bf16 rounding of the divisor at all, matching
+            # (and for a raw Python float, exceeding) torch's own
+            # cast-the-original-value-to-opmath_t precision. A one-element
+            # TENSOR divisor is already whatever dtype it was created at, so
+            # upcasting it to fp32 here recovers no precision that wasn't
+            # already lost, same as torch's own `scalar_value<accscalar_t>`
+            # read of an already-narrow stored value.
+            other_t = _t(other)
+            lhs = _cast_tensor(a, DType.float32)
+            rhs = _cast_tensor(other_t, DType.float32) if other_t is not None else other
+            result = _try_spec_binary(spec_name, lhs, rhs)
+            if result is None:
+                return NOT_HANDLED
+            return _cast_tensor(result, a._dtype)
         result = _try_spec_binary(spec_name, input, other)
         return result if result is not None else NOT_HANDLED
     a = _t(input)

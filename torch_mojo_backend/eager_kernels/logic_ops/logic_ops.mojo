@@ -371,20 +371,28 @@ def _bin_vec_op[
             # (away from zero), trunc rounds toward zero.
             comptime if dtype.is_floating_point():
                 # UNLIKE BOP_FLOORDIV, deliberately NOT widened to fp32 for
-                # bf16/fp16: torch's own tensor-tensor trunc kernel
+                # bf16/fp16 HERE: torch's own tensor-tensor trunc kernel
                 # (`div_trunc_kernel` in aten/src/ATen/native/cpu/
-                # BinaryOpsKernel.cpp) computes `std::trunc(a / b)` at the
-                # operand's OWN precision for the general tensor/tensor case
-                # -- only its separate is-scalar fast path upcasts to
-                # opmath_t, and that fast path is not reachable from here
-                # (a Python scalar operand already arrives pre-rounded into
-                # a same-dtype broadcast tensor, see `_scalar_embed`). So
-                # matching torch means reproducing its rounding here too:
-                # verified directly against torch.div(..., rounding_mode=
-                # "trunc") on real bf16 tensors that -6.3125 / -1.0546875
-                # (true quotient ~5.985) rounds to 6.0 in bf16 *before*
-                # truncation, same as torch -- not the fp32-computed 5.0
-                # BOP_FLOORDIV's comment calls "correct".
+                # BinaryOpsKernel.cpp / BinaryDivTruncKernel.cu) computes
+                # `std::trunc(a / b)` at the operand's OWN precision for the
+                # general tensor/tensor case -- only its separate
+                # is-scalar fast path (CPU's `is_scalar(2)`, CUDA's
+                # `is_cpu_scalar(2)`) upcasts to opmath_t. That scalar fast
+                # path IS reachable from a Python call, but it is handled
+                # one level up in Python (`fast_aten_div` in aten_fast.py,
+                # see `_is_div_other_scalar_like`): a scalar/one-element
+                # divisor is cast to fp32 by the CALLER before this kernel
+                # ever runs, so by the time `dtype` is bf16/fp16 HERE, both
+                # operands are guaranteed genuine multi-element tensors and
+                # native precision is correct -- verified directly against
+                # torch.div(..., rounding_mode="trunc") on real bf16
+                # tensors that -6.3125 / -1.0546875 (true quotient ~5.985)
+                # rounds to 6.0 in bf16 *before* truncation for a tensor
+                # divisor, same as torch, but computes the mathematically
+                # exact 5.0 (matching torch's OWN scalar fast path) for a
+                # scalar/one-element divisor -- not the same value BOP_
+                # FLOORDIV's comment calls "correct" for its own (always
+                # fp32) case.
                 return (a / b).__trunc__().cast[out_dtype]()
             else:
                 # Correct Mojo's floor division (`//`, already zero-safe --
@@ -394,11 +402,26 @@ def _bin_vec_op[
                 # from zero than trunc; `r` here has floor's sign
                 # convention (the divisor's sign, or zero) so `r != 0` is
                 # exactly the "inexact" test.
+                #
+                # b == 0: `a // b` already comes back 0 (Mojo's own
+                # `pop.floordiv` zero-guard, same as BOP_FLOORDIV above), and
+                # `not_zero` below forces `needs_adjust` off too, so trunc
+                # matches floor's documented b==0 sentinel: 0, not a raise
+                # (there is no per-element device-side raise) and not
+                # whatever sign-dependent value the correction step would
+                # otherwise produce. See `_binary_bcast`'s CPU-only
+                # zero-divisor check for the platforms that DO raise
+                # (matching stock CPU); this 0 is what every OTHER dispatch
+                # tier (GPU) returns instead, by documented convention, not
+                # accident -- stock CUDA's own int-div-by-zero sentinel is
+                # likewise platform-defined, not something a raise-free
+                # kernel is expected to reproduce bit-for-bit.
                 var q = a // b
                 var r = a - q * b
                 var zero = SIMD[dtype, width](0)
+                var not_zero = b.ne(zero)
                 var opposite_signs = a.lt(zero) ^ b.lt(zero)
-                var needs_adjust = opposite_signs & r.ne(zero)
+                var needs_adjust = opposite_signs & r.ne(zero) & not_zero
                 return needs_adjust.select(q + 1, q).cast[out_dtype]()
         comptime if op_code == BOP_POW:
             # Float only (gated at the launcher); accumulate halves in
@@ -643,6 +666,37 @@ def _binary_bcast[
             var r_ptr = _make_ptr[dtype](r_addr)
 
             if ctx.api() == "cpu":
+                comptime if (
+                    not is_cmp
+                    and (op_code == BOP_FLOORDIV or op_code == BOP_TRUNCDIV)
+                    and not dtype.is_floating_point()
+                ):
+                    # Stock CPU raises for integer div-by-zero
+                    # (`TORCH_CHECK(b != 0, "ZeroDivisionError")` in
+                    # BinaryOpsKernel.cpp); Mojo's `pop.floordiv` has its
+                    # own zero-guard instead (see BOP_FLOORDIV/BOP_TRUNCDIV
+                    # above), silently substituting a documented 0 rather
+                    # than trapping. This CPU dispatch path's divisor
+                    # buffer is real, host-addressable memory -- no device
+                    # sync needed to read it -- so scan it up front and
+                    # raise before doing any work, matching stock's CPU
+                    # behavior exactly instead of returning the
+                    # documented-but-still-wrong 0 sentinel that GPU
+                    # dispatch (which cannot cheaply raise from device
+                    # code, and settles for a plain documented 0 instead)
+                    # returns.
+                    for i in range(total):
+                        var i3 = i % d3
+                        var rest = i // d3
+                        var i2 = rest % d2
+                        rest = rest // d2
+                        var i1 = rest % d1
+                        var i0 = rest // d1
+                        if (
+                            r_ptr[i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3]
+                            == 0
+                        ):
+                            raise Error("ZeroDivisionError")
 
                 @always_inline
                 @parameter
