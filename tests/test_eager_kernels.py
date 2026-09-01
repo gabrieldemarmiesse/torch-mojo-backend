@@ -6591,8 +6591,16 @@ def test_addmm_skips_split_for_misaligned_shapes(monkeypatch):
     into a 1.25-1.65x regression before this gate existed."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
     def tensor(shape):
-        return SimpleNamespace(_shape=tuple(shape))
+        rows, cols = shape
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=(cols, 1),
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
 
     lhs, rhs, bias = tensor((357, 333)), tensor((333, 789)), object()
     fused_result = object()
@@ -6619,8 +6627,16 @@ def test_addmm_tries_split_for_aligned_shapes(monkeypatch):
     route -- see _gemm16_alignment_favors_split."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
     def tensor(shape):
-        return SimpleNamespace(_shape=tuple(shape))
+        rows, cols = shape
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=(cols, 1),
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
 
     lhs, rhs, bias = tensor((128, 128)), tensor((128, 128)), object()
     mm_result, biased_result = object(), object()
@@ -7389,6 +7405,988 @@ def test_gemm16_float16_linear_backward_matches_fp32_reference(
     torch.testing.assert_close(
         grad_bias.cpu().float(), host_grad.float().sum(0), atol=2e-2, rtol=2e-3
     )
+
+
+def test_gemm16_splitk_bias_certain_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_gemm16_splitk_bias_certain` must only say True where split-K's own
+    Mojo-side gates (m % 128 == 0, n % 256 == 0, k % 64 == 0, and enough
+    output tiles relative to any sm_90a part's SM count) are guaranteed to
+    engage -- see the function's docstring for why a false positive there
+    would be a real regression, not just a missed optimization."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+
+    def tensor(shape: tuple[int, ...]) -> SimpleNamespace:
+        return SimpleNamespace(_shape=tuple(shape))
+
+    aligned_bias = SimpleNamespace(_ptr=1024)  # 16-byte-aligned
+    misaligned_bias = SimpleNamespace(_ptr=1026)  # NOT 16-byte-aligned
+
+    # S4's exact shape: 8 * 4 = 32 tiles, comfortably under the >=64-SM-part
+    # floor of 32, and k // 64 = 128 >= 32.
+    assert aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 8192)), tensor((8192, 1024)), aligned_bias
+    )
+    # transpose_b reinterprets which rhs dim is k vs n, same as the sibling
+    # _gemm16_alignment_favors_split helper.
+    assert aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 8192)), tensor((1024, 8192)), aligned_bias, transpose_b=True
+    )
+    # Same shape as the first assertion, but a bias whose runtime pointer is
+    # not 16-byte aligned (e.g. an offset view into a wider buffer): split-K's
+    # own reduce epilogue reads bias 4-wide and its host gate declines with
+    # `Int(bias) % 16 != 0` (see gemm16_tn_v4_kernels.mojo), so certain must
+    # flip to False even though the shape alone is identical to a True case
+    # above. Regression guard for the bug this predicate used to have: it
+    # never received bias at all, so it said True unconditionally here and
+    # the fused call silently fell to the slow accepted kernel when split-K
+    # declined underneath it (reproduced on H100 at m=128, n=256, k=8192).
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 8192)), tensor((8192, 1024)), misaligned_bias
+    )
+    # S1's exact shape: aligned, but 32 * 16 = 512 tiles -- split-K would
+    # decline at the SM-count gate on every real GPU, so this must be False.
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 4096)), aligned_bias
+    )
+    # n not a multiple of 256 (only tile width the split-K kernels come in).
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 8192)), tensor((8192, 128)), aligned_bias
+    )
+    # m not a multiple of 128.
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((900, 8192)), tensor((8192, 1024)), aligned_bias
+    )
+    # k shallower than the depth floor (k // 64 < 32).
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 1024)), tensor((1024, 1024)), aligned_bias
+    )
+    # k mismatch between lhs and rhs.
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((1024, 8192)), tensor((4096, 1024)), aligned_bias
+    )
+    # S5's awkward shape: nowhere near aligned.
+    assert not aten_fast._gemm16_splitk_bias_certain(
+        tensor((357, 333)), tensor((333, 789)), aligned_bias
+    )
+
+
+def test_gemm16_persistent_bias_certain_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_gemm16_persistent_bias_certain` must only say True where the
+    persistent kernel's fused-bias epilogue (gemm16_nn_v4_kernels.mojo,
+    deep-K wave-fill engagement) is guaranteed to engage: NN or TN layout
+    (not NT/TT -- untouched by this engagement), both dims >= 2048 and
+    256-aligned, k a multiple of 64."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(shape: tuple[int, int], *, transposed: bool = False) -> SimpleNamespace:
+        rows, cols = shape
+        strides = (1, rows) if transposed else (cols, 1)
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=strides,
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
+
+    bias = SimpleNamespace(_ptr=1024)  # 16-byte-aligned; alignment is moot here
+
+    # S1's exact shape, NN: both row-major, both >= 2048, both 256-aligned.
+    assert aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 4096)), bias
+    )
+    # TN: A physically transposed, B row-major -- still covered.
+    assert aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096), transposed=True), tensor((4096, 4096)), bias
+    )
+    # Unlike _gemm16_splitk_bias_certain, a 16-byte-MISALIGNED bias pointer
+    # must NOT flip this to False: the persistent body's fused-bias epilogue
+    # (_v4_nn_persistent_ws in gemm16_nn_v4_kernels.mojo) reads bias through
+    # two plain scalar element loads, and its host dispatchers
+    # (maybe_enqueue_gemm16_nn_v4 / maybe_enqueue_gemm16_tn_v4_persistent)
+    # never gate on `Int(bias) % 16` -- any bf16/f16 pointer is 2-byte
+    # aligned regardless of element offset, which is all a scalar load
+    # needs. Asserting True here pins that the two predicates deliberately
+    # check different things for their different epilogues.
+    assert aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 4096)), SimpleNamespace(_ptr=1026)
+    )
+    # NT: B physically transposed -- the persistent kernel's OWN dedicated
+    # NT family (gemm16_nt_v4_kernels.mojo) is untouched by this
+    # engagement, so this must be False.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 4096), transposed=True), bias
+    )
+    # TT: both transposed -- also untouched.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096), transposed=True),
+        tensor((4096, 4096), transposed=True),
+        bias,
+    )
+    # transpose_b reinterprets which operand's physical layout is "B",
+    # same convention as the sibling _gemm16_splitk_bias_certain helper:
+    # a row-major weight read with transpose_b=True is effectively NT
+    # (see _try_gemm16_linear), so this must be False too.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 4096)), bias, transpose_b=True
+    )
+    # n below the 2048 floor: W1-class shape the direct 128x192 kernel
+    # (no bias epilogue) may win instead of persistent.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 1792)), bias
+    )
+    # m below the 2048 floor.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((1024, 4096)), tensor((4096, 4096)), bias
+    )
+    # n not 256-aligned.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((4096, 2112)), bias
+    )
+    # k not 64-aligned.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4033)), tensor((4033, 4096)), bias
+    )
+    # k mismatch between lhs and rhs.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((4096, 4096)), tensor((2048, 4096)), bias
+    )
+    # S5's awkward shape: nowhere near the floor.
+    assert not aten_fast._gemm16_persistent_bias_certain(
+        tensor((357, 333)), tensor((333, 789)), bias
+    )
+
+
+def test_addmm_tries_fused_splitk_before_compose_for_deep_k_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shape `_gemm16_splitk_bias_certain` accepts (S4-like: deep K, few
+    output tiles) must try the single fused bias-aware gemm16 call FIRST,
+    never the bias-free-mm-then-add composition -- that composition is what
+    the split-K reduce epilogue's bias fusion exists to avoid paying for."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    def tensor(shape: tuple[int, ...]) -> SimpleNamespace:
+        return SimpleNamespace(_shape=tuple(shape))
+
+    # A 16-byte-aligned pointer: this shape must clear the bias-certain gate,
+    # so the placeholder needs the `_ptr` attribute the predicate now reads.
+    lhs, rhs, bias = (
+        tensor((1024, 8192)),
+        tensor((8192, 1024)),
+        SimpleNamespace(_ptr=1024),
+    )
+    fused_result = object()
+    fused_calls = []
+
+    def try_gemm(*args: object, **kwargs: object) -> object:
+        fused_calls.append((args, kwargs))
+        return fused_result
+
+    def fail_add(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError(
+            "a split-K-certain shape should never fall back to composing"
+        )
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", fail_add)
+
+    assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is fused_result
+    assert fused_calls == [((lhs, rhs, bias), {})]
+
+
+def test_addmm_still_composes_for_many_tile_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A many-output-tile shape that BOTH split-K
+    (`_gemm16_splitk_bias_certain`, too many tiles) and the persistent
+    kernel (`_gemm16_persistent_bias_certain`, n below the 2048 floor) are
+    certain to decline for must still take the existing compose-then-add
+    path, not the fused-first attempt -- the fused call there would fall
+    through both fused-bias routes straight to the slow accepted kernel.
+    Regression guard for exactly the failure mode a too-loose predicate
+    would cause.
+
+    (Before the deep-K wave-fill engagement, m=n=4096 alone was such a
+    shape: split-K declined it but nothing else fused bias. It no longer
+    is -- the persistent kernel's epilogue now fuses bias there too (see
+    test_addmm_tries_fused_persistent_before_compose_for_well_filled_shapes)
+    -- so this shape narrows n to stay below the persistent kernel's
+    2048 floor while remaining aligned and many-tile.)"""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(shape: tuple[int, ...]) -> SimpleNamespace:
+        rows, cols = shape
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=(cols, 1),
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
+
+    lhs, rhs, bias = tensor((4096, 4096)), tensor((4096, 1792)), object()
+    mm_result, biased_result = object(), object()
+    gemm_calls = []
+    add_calls = []
+
+    def try_gemm(*args: object, **kwargs: object) -> object:
+        gemm_calls.append((args, kwargs))
+        return mm_result
+
+    def try_add(*args: object, **kwargs: object) -> object:
+        add_calls.append((args, kwargs))
+        return biased_result
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", try_add)
+
+    assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is biased_result
+    # The bias-free mm is called with no bias argument -- the fused call
+    # (which would carry `bias` as a third positional arg) is never tried.
+    assert gemm_calls == [((lhs, rhs), {})]
+    assert add_calls == [((mm_result, bias), {})]
+
+
+@pytest.mark.parametrize("layout", ["NN", "TN"])
+def test_addmm_tries_fused_persistent_before_compose_for_well_filled_shapes(
+    monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    """A well-filled shape (S1-like: 4096x4096x4096, both >= 2048 and
+    256-aligned) that `_gemm16_persistent_bias_certain` accepts must try the
+    single fused bias-aware gemm16 call FIRST, on both layouts the deep-K
+    wave-fill engagement's persistent-kernel bias epilogue covers (NN and
+    TN) -- never the bias-free-mm-then-add composition, which is exactly
+    the separate `binary_rowvec_add` launch that epilogue exists to avoid
+    (measured 4096x4096x4096: 1.178x stock -> ~1.08x)."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(shape: tuple[int, int], *, transposed: bool) -> SimpleNamespace:
+        rows, cols = shape
+        strides = (1, rows) if transposed else (cols, 1)
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=strides,
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
+
+    lhs = tensor((4096, 4096), transposed=layout[0] == "T")
+    rhs = tensor((4096, 4096), transposed=False)
+    bias = object()
+    fused_result = object()
+    fused_calls = []
+
+    def try_gemm(*args: object, **kwargs: object) -> object:
+        fused_calls.append((args, kwargs))
+        return fused_result
+
+    def fail_add(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError(
+            "a persistent-certain shape should never fall back to composing"
+        )
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", fail_add)
+
+    assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is fused_result
+    assert fused_calls == [((lhs, rhs, bias), {})]
+
+
+@pytest.mark.parametrize("layout", ["NT", "TT"])
+def test_addmm_persistent_fused_excludes_untouched_layouts(
+    monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    """The same well-filled shape on NT or TT (the persistent kernel's
+    bias epilogue was extended to NN and TN only -- see
+    gemm16_nn_v4_kernels.mojo; NT's own dedicated persistent kernel,
+    gemm16_nt_v4_kernels.mojo, is an explicit canary in this engagement)
+    must still take the compose path, not a fused call the underlying
+    Mojo dispatcher would actually decline."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(shape: tuple[int, int], *, transposed: bool) -> SimpleNamespace:
+        rows, cols = shape
+        strides = (1, rows) if transposed else (cols, 1)
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=strides,
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
+
+    lhs = tensor((4096, 4096), transposed=layout[0] == "T")
+    rhs = tensor((4096, 4096), transposed=layout[1] == "T")
+    bias = object()
+    mm_result, biased_result = object(), object()
+    gemm_calls = []
+    add_calls = []
+
+    def try_gemm(*args: object, **kwargs: object) -> object:
+        gemm_calls.append((args, kwargs))
+        return mm_result
+
+    def try_add(*args: object, **kwargs: object) -> object:
+        add_calls.append((args, kwargs))
+        return biased_result
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", try_add)
+
+    assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is biased_result
+    assert gemm_calls == [((lhs, rhs), {})]
+    assert add_calls == [((mm_result, bias), {})]
+
+
+# The deep-K wave-fill engagement's own harness correctness sweep, ported:
+# {bf16, f16} x {NN, TN} x bias x 5 shapes, including a ragged n % 256 != 0
+# boundary. Each case exercises a different rung of the wave-fill dispatch
+# added in this engagement (see gemm16_tn_v4_kernels.mojo /
+# gemm16_nn_v4_kernels.mojo): the 128x256 split-K ladder still winning on
+# S4/W3, the new 128x128/6-stage split winning on W2, the persistent-vs-
+# direct-192 cost-model comparison on W1, and the ragged multi-wave
+# persistent rung on the last shape.
+_WAVE_FILL_SHAPES = {
+    "W1_2048x2048x8192": (2048, 2048, 8192),
+    "W2_768x768x8192": (768, 768, 8192),
+    "W3_1024x1024x16384": (1024, 1024, 16384),
+    "S4_1024x1024x8192": (1024, 1024, 8192),
+    "ragged_4096x1216x2048": (4096, 1216, 2048),  # n % 256 != 0, n % 64 == 0
+}
+
+
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("layout", ["NN", "TN"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape_id", _WAVE_FILL_SHAPES)
+def test_gemm16_wave_fill_dispatch_matches_fp32_reference(
+    mojo_h100: torch.device,
+    shape_id: str,
+    dtype: torch.dtype,
+    layout: str,
+    has_bias: bool,
+) -> None:
+    """Deep-K wave-fill engagement correctness sweep, ported from the
+    harness (NOTES.md): every new dispatch rung (128x128 split, direct
+    128x192 vs persistent, ragged multi-wave persistent, and their fused-
+    bias epilogues) reproduces the FP32 reference within bf16/f16
+    accumulation tolerance, on both layouts the engagement covers."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = _WAVE_FILL_SHAPES[shape_id]
+    a, b = _gemm16_operands(layout, m, n, k, dtype, mojo_h100)
+    bias = torch.randn(n).to(dtype).to(mojo_h100) if has_bias else None
+
+    out = aten_fast._try_gemm16_mm(a, b, bias)
+    assert out is not None, "the gemm16 dispatch declined this shape"
+    assert out.dtype == dtype
+    assert tuple(out.shape) == (m, n)
+
+    expected = a.cpu().float() @ b.cpu().float()
+    if bias is not None:
+        expected = expected + bias.cpu().float()
+    # bf16/f16 accumulate in FP32 on-device; the tolerance is the k-depth
+    # floor (grows ~sqrt(k) for a tiled reduction) plus the final round to
+    # the 16-bit output dtype (about half a ULP).
+    ulp = 2**-8 if dtype == torch.bfloat16 else 2**-11
+    atol = 4 * ulp * (k**0.5)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
+
+
+# A1-class ragged-N deep-K shapes (NOTES.md, deep-K wave-fill engagement,
+# section 20): n % 256 != 0 but n % 64 == 0, few output macro-tiles, and K
+# deep enough for a 2-way split to clear the depth floor. Production used to
+# fall straight through the whole split-K ladder to the persistent nclip
+# route on shapes like this (2.46x stock on the engagement's own A1 shape),
+# because the split-K dispatcher (`try_enqueue_gemm16_gemm_splitk_rm_v4`,
+# gemm16_tn_v4_kernels.mojo) declined outright on any n that was not an
+# exact multiple of 256. The fix is two gates over kernels that already
+# exist as a template (the shared warp-specialized body,
+# `_v4_tn_ws_body`), not a new algorithm: relax the entry gate to n % 64 ==
+# 0 (the body already ceil-divs blocks_n and predicates its store, exactly
+# like the ragged-N *direct* 128x192 kernel a phase-3 fix unblocked
+# earlier), and add a 128x192 split-K candidate (NN only) gated by the SAME
+# split-worthiness predicate (min splits, chunk depth, small-tile coverage)
+# that already gates the 128/256 candidates -- not by a shape-specific
+# n == 1088 check.
+_RAGGED_SPLITK_SHAPES = {
+    "A1_1152x1088x7936": (1152, 1088, 7936),  # the engagement's own A1 shape
+    "ragged_896x1216x7936": (896, 1216, 7936),  # a second ragged n
+}
+
+
+@pytest.mark.parametrize("shape_id", _RAGGED_SPLITK_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm16_ragged_n_splitk_matches_fp32_reference_and_engages(
+    mojo_h100: torch.device, dtype: torch.dtype, shape_id: str
+) -> None:
+    """A shape whose n is a multiple of 64 but not of 256 -- so neither the
+    128- nor the 256-wide split-K candidate is available -- must reach the
+    new 128x192 split-K candidate through the real production entry point
+    (`_try_gemm16_mm`, what `fast_aten_mm` itself calls), not just produce a
+    correct result through some other route, and the result must match an
+    FP32 reference within bf16/f16 accumulation tolerance."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = _RAGGED_SPLITK_SHAPES[shape_id]
+    assert n % 64 == 0 and n % 256 != 0, "shape must exercise the ragged-N rung"
+    a, b = _gemm16_operands("NN", m, n, k, dtype, mojo_h100)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = aten_fast._try_gemm16_mm(a, b)
+        torch.accelerator.synchronize()
+    assert out is not None, "the ragged-N split-K dispatch declined this shape"
+    names = [
+        evt.name
+        for evt in prof.events()
+        if str(evt.device_type) in ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+    ]
+    tag = "bf16" if dtype == torch.bfloat16 else "f16"
+    assert any(f"{tag}_gemm_nn_v4_splitk_m128n192" in name for name in names), names
+    assert any(f"{tag}_gemm_tn_v4_splitk_reduce" in name for name in names), names
+
+    assert out.dtype == dtype
+    assert tuple(out.shape) == (m, n)
+    expected = a.cpu().float() @ b.cpu().float()
+    # bf16/f16 accumulate in FP32 on-device; the tolerance is the k-depth
+    # floor (grows ~sqrt(k) for a tiled reduction) plus the final round to
+    # the 16-bit output dtype (about half a ULP) -- same bound the wave-fill
+    # sweep above uses.
+    ulp = 2**-8 if dtype == torch.bfloat16 else 2**-11
+    atol = 4 * ulp * (k**0.5)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm16_ragged_n_splitk_addmm_bias_matches_fp32_reference(
+    mojo_h100: torch.device, dtype: torch.dtype
+) -> None:
+    """Same ragged-N split-K rung, with a bias: the fused reduce epilogue
+    (`_v4_tn_splitk_reduce`, shared with the 128/256 split-K kernels) reads
+    bias 4-wide, which assumes n % 4 == 0 -- true here because n % 64 == 0,
+    even though n % 256 != 0 is exactly what used to make this whole regime
+    unreachable."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 1152, 1088, 7936  # A1
+    a, b = _gemm16_operands("NN", m, n, k, dtype, mojo_h100)
+    bias = torch.randn(n).to(dtype).to(mojo_h100)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = aten_fast._try_gemm16_mm(a, b, bias)
+        torch.accelerator.synchronize()
+    assert out is not None, "the ragged-N split-K dispatch declined this shape"
+    names = [
+        evt.name
+        for evt in prof.events()
+        if str(evt.device_type) in ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+    ]
+    tag = "bf16" if dtype == torch.bfloat16 else "f16"
+    assert any(f"{tag}_gemm_nn_v4_splitk_m128n192" in name for name in names), names
+
+    expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
+    ulp = 2**-8 if dtype == torch.bfloat16 else 2**-11
+    atol = 4 * ulp * (k**0.5)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
+
+
+# Phase 5 (NOTES.md, deep-K wave-fill engagement, sections 22-26): a
+# TMA-store epilogue for the DIRECT (non-split-K) arm of the shared v4 body.
+# Split-K's fp32 workspace store was already 1.00x sector-efficient (nothing
+# to recover, and it REGRESSES on many-wave split-K grids -- section 24d),
+# but the direct arm's bf16 store was a half-sector (16 B) wavefront, so TMA
+# halves its L2 write traffic. `_v4_tn_ws_body`'s new `TMA_STORE` comptime
+# only ever turns on for the six direct-arm entry points
+# (`_v4_tn_direct_m128n192_{s4,s3g16}`, `_v4_nn_direct_m128n192_{s4,s3g16}`,
+# `_v4_tt_direct_m128n64_s4`, `_v4_tt_direct_m64n128_s3`); everything else
+# (every split-K and persistent kernel) keeps the scalar store unchanged.
+# These shapes are picked to dynamically reach one of those six kernels
+# through the real dispatch code (not just build one at compile time):
+_DIRECT_ARM_CASES = {
+    # TN's dedicated single-wave narrow-tile rung (n % 192 == 0, tiles192 <=
+    # sm_count): the only way to reach `_v4_tn_direct_m128n192_s4` at
+    # runtime -- the "exactly 2 waves" cost-model branch a few lines above
+    # it in the dispatcher always produces >= 2 waves of 192-wide tiles
+    # once it engages, so that rung only ever reaches the *_s3g16 sibling.
+    "TN_single_wave_128x192": ("TN", 128, 192, 8192),
+    # TN's "exactly 2 waves of 128x256" cost-model comparison (n % 256 == 0
+    # and n % 192 == 0): reaches `_v4_tn_direct_m128n192_s3g16`.
+    "TN_two_wave_5120x768": ("TN", 5120, 768, 8192),
+    # NN's only direct-192 rung is the same "exactly 2 waves" comparison,
+    # gated on n % 256 == 0 alone (a ceil-div covers ragged 192-tiling) --
+    # this is the deep-K wave-fill engagement's own flagship shape (W1),
+    # 1.74x stock on the persistent-only branch head, 1.32x once this rung
+    # exists. Reaches `_v4_nn_direct_m128n192_s3g16`.
+    "NN_W1_2048x2048x8192": ("NN", 2048, 2048, 8192),
+    # TT's small-tile fallback for a deep-K single/few-wave grid: reaches
+    # `_v4_tt_direct_m128n64_s4`.
+    "TT_small_tile_128x64": ("TT", 128, 64, 8192),
+    # TT's k <= 2*BK shortcut (n % 128 == 0): reaches
+    # `_v4_tt_direct_m64n128_s3`.
+    "TT_shallow_k_512x256x128": ("TT", 512, 256, 128),
+}
+
+
+@pytest.mark.parametrize("shape_id", _DIRECT_ARM_CASES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm16_direct_arm_tma_store_matches_fp32_reference_and_engages(
+    mojo_h100: torch.device, dtype: torch.dtype, shape_id: str
+) -> None:
+    """The direct-arm TMA-store epilogue must reach the FP32 reference
+    within the usual bf16/f16 accumulation tolerance, through the real
+    production entry point (`_try_gemm16_mm`), on the exact kernels the
+    phase-5 measurement was about: the store mechanism changed, the math
+    did not."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    layout, m, n, k = _DIRECT_ARM_CASES[shape_id]
+    a, b = _gemm16_operands(layout, m, n, k, dtype, mojo_h100)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = aten_fast._try_gemm16_mm(a, b)
+        torch.accelerator.synchronize()
+    assert out is not None, "the direct-arm dispatch declined this shape"
+    names = [
+        evt.name
+        for evt in prof.events()
+        if str(evt.device_type) in ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+    ]
+    tag = "bf16" if dtype == torch.bfloat16 else "f16"
+    layout_tag = layout.lower()
+    assert any(f"{tag}_gemm_{layout_tag}_v4_direct_" in name for name in names), (
+        shape_id,
+        names,
+    )
+
+    expected = a.cpu().float() @ b.cpu().float()
+    ulp = 2**-8 if dtype == torch.bfloat16 else 2**-11
+    atol = 4 * ulp * (k**0.5)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm16_direct_arm_tma_store_addmm_bias_matches_fp32_reference(
+    mojo_h100: torch.device, dtype: torch.dtype
+) -> None:
+    """The TN direct-192 kernel's bias epilogue (fused into the same TMA
+    store) still adds the right bias after the smem-staging rewrite."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 5120, 768, 8192
+    a, b = _gemm16_operands("TN", m, n, k, dtype, mojo_h100)
+    bias = torch.randn(n).to(dtype).to(mojo_h100)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = aten_fast._try_gemm16_mm(a, b, bias)
+        torch.accelerator.synchronize()
+    assert out is not None, "the direct-arm dispatch declined this biased shape"
+    names = [
+        evt.name
+        for evt in prof.events()
+        if str(evt.device_type) in ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+    ]
+    tag = "bf16" if dtype == torch.bfloat16 else "f16"
+    assert any(f"{tag}_gemm_tn_v4_direct_" in name for name in names), names
+
+    expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
+    ulp = 2**-8 if dtype == torch.bfloat16 else 2**-11
+    atol = 4 * ulp * (k**0.5)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=atol, rtol=8e-3)
+
+
+def test_gemm16_wave_body_rejects_bm_256_at_compile_time(tmp_path: Path) -> None:
+    """BM >= 256 (CONSUMERS >= 4) is not just unused by any dispatcher --
+    it is actively dangerous: the deep-K wave-fill engagement measured it
+    building clean and then HANGING the GPU at runtime (warpgroup_reg_alloc
+    exceeds the sm_90 launch-bound register cap). The `comptime assert` in
+    `_v4_tn_ws_body` (gemm16_tn_v4_kernels.mojo) must turn that into a loud
+    build-time failure instead.
+
+    This is a compile-check, not a device test (mirrors
+    scripts/compare_kernel_asm.py's own `--emit asm --target-accelerator`
+    cross-compile): it needs no GPU and must never run under the GPU flock
+    (see AGENTS.md's kernel-optimization-harness notes -- compiling under
+    the lock wastes it for no reason, since `mojo build` never touches the
+    device).
+    """
+    import subprocess
+
+    from torch_mojo_backend.eager_kernels import _build_env, _find_mojo
+
+    package_dir = (
+        Path(__file__).resolve().parents[1] / "torch_mojo_backend" / "eager_kernels"
+    )
+    probe = tmp_path / "bm256_probe.mojo"
+    probe.write_text(
+        """
+from std.memory import alloc
+from max.gpu.host import DeviceContext
+from gemm16_matmul_ops.gemm16_tn_v4_kernels import (
+    _V4_DT,
+    _V4_F32,
+    _V4_BK,
+    _v4_make_a_tma,
+    _v4_make_b_mn_tma,
+    _v4_tn_ws_body,
+)
+from std.utils.index import Index
+from layout.tma_async import TMATensorTile
+
+
+# A named kernel entry point, exactly like the production ones in
+# gemm16_tn_v4_kernels.mojo: `ctx.enqueue_function[F]` is what forces the
+# compiler to target the accelerator for F's body (and therefore evaluate
+# `_is_sm_9x()` -- and the comptime assert inside it -- as a device
+# kernel). Calling `_v4_tn_ws_body` directly from `main()` (host code)
+# does NOT do this: `_is_sm_9x()` is false there regardless of
+# `--target-accelerator`, so the guarded branch compiles away as dead code
+# and the assert never runs -- confirmed by first writing the probe that
+# way and watching it build clean.
+def _probe_kernel_bm256(
+    a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 128), Index(_V4_BK, 64)],
+    output: UnsafePointer[Scalar[_V4_DT], MutAnyOrigin],
+    ws: UnsafePointer[Scalar[_V4_F32], MutAnyOrigin],
+    bias: UnsafePointer[Scalar[_V4_DT], MutAnyOrigin],
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+):
+    # BM=256: must fail to build, not silently compile a hanging kernel.
+    _v4_tn_ws_body[256, 128, 4, False, 8, True, False, False](
+        a_tma, b_tma, output, ws, bias, Int(m_arg), Int(n_arg), Int(k_arg), 0
+    )
+
+
+def main() raises:
+    var ctx = DeviceContext()
+    var a = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var b = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var out = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var ws = alloc[Scalar[_V4_F32]](1).as_unsafe_any_origin()
+    var a_tma = _v4_make_a_tma[256](a, 1024, 8192, ctx)
+    var b_tma = _v4_make_b_mn_tma[128](b, 1024, 8192, ctx)
+    ctx.enqueue_function[_probe_kernel_bm256](
+        a_tma,
+        b_tma,
+        out,
+        ws,
+        out,
+        Int64(1024),
+        Int64(1024),
+        Int64(8192),
+        grid_dim=(1,),
+        block_dim=(640,),
+    )
+"""
+    )
+    result = subprocess.run(
+        [
+            str(_find_mojo()),
+            "build",
+            str(probe),
+            "--emit",
+            "asm",
+            "--target-accelerator",
+            "sm_90a",
+            "-I",
+            str(probe.parent),
+            "-I",
+            str(package_dir),
+            "-I",
+            str(package_dir / "gemm16_matmul_ops"),
+            "-o",
+            str(tmp_path / "bm256_probe.s"),
+        ],
+        env=_build_env(),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode != 0, (
+        "BM=256 built successfully -- the compile-time guard regressed "
+        f"(NOTES.md documents this hanging the GPU at runtime)\nstdout:"
+        f"\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert "BM >= 256" in combined, (
+        f"build failed, but not with the expected guard message\n{combined}"
+    )
+
+
+def test_gemm16_wave_body_rejects_tma_store_on_splitk_at_compile_time(
+    tmp_path: Path,
+) -> None:
+    """TMA_STORE=True is only valid on the direct (SPLITK=False) arm
+    (NOTES.md, deep-K wave-fill engagement, phase 5, section 24d): on a
+    many-wave split-K grid the TMA drain holds the staging smem -- which
+    aliases the retired B pipeline -- resident past the point a scalar
+    store would have retired the CTA, a measured 2.27% REGRESSION. The
+    `comptime assert` in `_v4_tn_ws_body` must turn SPLITK=True,
+    TMA_STORE=True into a loud build-time failure, so nobody flips this
+    epilogue on for split-K by editing one call site.
+
+    Unlike the BM=256 guard above, this assert does not depend on
+    `_is_sm_9x()`, so instantiating the body from a plain host function
+    (no `ctx.enqueue_function`) is enough to trigger it -- still built with
+    `--target-accelerator sm_90a` for consistency with the rest of this
+    file's compile probes, and it still needs no GPU and must never run
+    under the GPU flock.
+    """
+    import subprocess
+
+    from torch_mojo_backend.eager_kernels import _build_env, _find_mojo
+
+    package_dir = (
+        Path(__file__).resolve().parents[1] / "torch_mojo_backend" / "eager_kernels"
+    )
+    probe = tmp_path / "splitk_tma_store_probe.mojo"
+    probe.write_text(
+        """
+from std.memory import alloc
+from max.gpu.host import DeviceContext
+from gemm16_matmul_ops.gemm16_tn_v4_kernels import (
+    _V4_DT,
+    _V4_F32,
+    _v4_make_a_tma,
+    _v4_make_b_mn_tma,
+    _v4_tn_ws_body,
+)
+
+
+def main() raises:
+    var ctx = DeviceContext()
+    var a = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var b = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var out = alloc[Scalar[_V4_DT]](1).as_unsafe_any_origin()
+    var ws = alloc[Scalar[_V4_F32]](1).as_unsafe_any_origin()
+    var a_tma = _v4_make_a_tma[128](a, 1024, 8192, ctx)
+    var b_tma = _v4_make_b_mn_tma[192](b, 1024, 8192, ctx)
+    # SPLITK=True with TMA_STORE=True: must fail to build.
+    _v4_tn_ws_body[128, 192, 4, True, 8, True, False, False, True](
+        a_tma, b_tma, out, ws, out, 1024, 1024, 8192, 0
+    )
+"""
+    )
+    result = subprocess.run(
+        [
+            str(_find_mojo()),
+            "build",
+            str(probe),
+            "--emit",
+            "asm",
+            "--target-accelerator",
+            "sm_90a",
+            "-I",
+            str(probe.parent),
+            "-I",
+            str(package_dir),
+            "-I",
+            str(package_dir / "gemm16_matmul_ops"),
+            "-o",
+            str(tmp_path / "splitk_tma_store_probe.s"),
+        ],
+        env=_build_env(),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode != 0, (
+        "SPLITK=True, TMA_STORE=True built successfully -- the compile-time "
+        "guard regressed (NOTES.md documents this as a measured regression, "
+        f"not just an unproven risk)\nstdout:\n{result.stdout}\nstderr:"
+        f"\n{result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert "TMA_STORE is only valid on the direct" in combined, (
+        f"build failed, but not with the expected guard message\n{combined}"
+    )
+
+
+@pytest.mark.parametrize("layout", _GEMM16_LAYOUTS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm16_splitk_bias_epilogue_matches_fp32_reference(
+    mojo_h100: torch.device, layout: str, dtype: torch.dtype
+) -> None:
+    """End-to-end correctness of the fused split-K + bias epilogue on the
+    deep-K shape it targets (S4's dimensions), across every operand layout
+    and both 16-bit dtypes the gemm16 family serves."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 1024, 1024, 8192  # S4: deep K, few output tiles -- split-K regime
+    a, b = _gemm16_operands(layout, m, n, k, dtype, mojo_h100)
+    bias = torch.randn(n).to(dtype).to(mojo_h100)
+
+    out = aten_fast._try_gemm16_mm(a, b, bias)
+    assert out is not None, "the fused bias-aware gemm16 call declined"
+    assert out.dtype == dtype
+    assert tuple(out.shape) == (m, n)
+
+    expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
+    torch.testing.assert_close(out.cpu().float(), expected, atol=0.15, rtol=5e-3)
+
+
+@pytest.mark.parametrize(
+    "k",
+    [
+        1984,  # not a multiple of 64: split-K's own BK tiling gate declines
+        2048,  # k // 64 == 32, exactly the depth-floor boundary
+        2112,  # 64-aligned but one BK-tile past the boundary (ragged chunking)
+        8256,  # 64-aligned, deep: one BK-tile past S4's own k = 8192
+    ],
+)
+def test_gemm16_splitk_bias_epilogue_k_boundaries(
+    mojo_h100: torch.device, k: int
+) -> None:
+    """Bias correctness right around split-K's depth-floor and BK-tiling
+    boundaries -- both the engaged-split-K path and the decline-to-fallback
+    path (k=1984) must still add the bias exactly once, correctly."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n = 1024, 1024
+    a, b = _gemm16_operands("NN", m, n, k, torch.bfloat16, mojo_h100)
+    bias = torch.randn(n).to(torch.bfloat16).to(mojo_h100)
+
+    out = aten_fast._try_gemm16_mm(a, b, bias)
+    assert out is not None
+
+    expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
+    torch.testing.assert_close(out.cpu().float(), expected, atol=0.2, rtol=8e-3)
+
+
+def test_gemm16_splitk_bias_epilogue_rejects_misaligned_bias(
+    mojo_h100: torch.device,
+) -> None:
+    """The reduce epilogue reads bias 4-wide (16B), so a bias view whose
+    element offset breaks 16B alignment (contiguous, but not the start of
+    its allocation) must make the split-K route decline rather than issue
+    a misaligned vector load: the split-K gate checks `Int(bias) % 16`
+    whenever has_bias is set. This only exercises the safe-decline path
+    (the accepted kernel picks it up instead); the result must still be
+    correct either way."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 1024, 1024, 8192  # split-K-certain shape
+    a, b = _gemm16_operands("NN", m, n, k, torch.bfloat16, mojo_h100)
+    # Slice 5 elements (10 bytes) into a wider buffer: contiguous, but not
+    # 16B-aligned.
+    wide = torch.randn(n + 5).to(torch.bfloat16).to(mojo_h100)
+    bias = wide[5:]
+    assert bias.data_ptr() % 16 != 0
+
+    out = aten_fast._try_gemm16_mm(a, b, bias)
+    assert out is not None
+
+    expected = a.cpu().float() @ b.cpu().float() + bias.cpu().float()
+    torch.testing.assert_close(out.cpu().float(), expected, atol=0.2, rtol=8e-3)
+
+
+def test_addmm_bias_certain_predicate_matches_dispatch_at_repro_shape(
+    mojo_h100: torch.device,
+) -> None:
+    """End-to-end regression for the bias-certainty predicate gap (PR #395
+    review): `_gemm16_splitk_bias_certain` used to never receive the bias
+    tensor at all, so it said True unconditionally -- including for a bias
+    whose runtime pointer breaks the 16-byte alignment split-K's reduce
+    epilogue requires, silently dropping `torch.addmm` to the slow accepted
+    kernel while still reporting "certain". This pins both directions at
+    the exact shape that reproduced it on H100 (m=128, n=256, k=8192):
+
+    - An aligned bias must say certain==True AND `torch.addmm` must
+      actually launch the fused split-K kernels it promises (the NN
+      workspace pass and the shared bias-fusing reduce kernel), not just
+      happen to compute the right numbers through some other route.
+    - An otherwise-identical offset-view bias whose pointer is NOT 16-byte
+      aligned must say certain==False, and the end-to-end result must
+      still be correct through whichever route it falls back to.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 128, 256, 8192  # S4-like: split-K-certain, few output tiles
+    a, b = _gemm16_operands("NN", m, n, k, torch.bfloat16, mojo_h100)
+
+    aligned_bias = torch.randn(n).to(torch.bfloat16).to(mojo_h100)
+    assert aligned_bias.data_ptr() % 16 == 0
+    assert aten_fast._gemm16_splitk_bias_certain(a, b, aligned_bias)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        out = torch.addmm(aligned_bias, a, b)
+        torch.accelerator.synchronize()
+    names = [
+        evt.name
+        for evt in prof.events()
+        if str(evt.device_type) in ("DeviceType.CUDA", "DeviceType.PrivateUse1")
+    ]
+    # The wave-fill cost model picks between the 128x256 and 128x128 NN
+    # split-K workspace tiles at runtime -- either satisfies "split-K
+    # engaged" -- but the bias fusion always lands in the one shared reduce
+    # kernel (_v4_tn_splitk_reduce, named "tn" regardless of the caller's
+    # actual layout; see gemm16_tn_v4_kernels.mojo).
+    assert any("bf16_gemm_nn_v4_splitk" in name for name in names), names
+    assert any("bf16_gemm_tn_v4_splitk_reduce" in name for name in names), names
+
+    expected = a.cpu().float() @ b.cpu().float() + aligned_bias.cpu().float()
+    torch.testing.assert_close(out.cpu().float(), expected, atol=0.2, rtol=8e-3)
+
+    # Same shape, an offset view 10 bytes into a wider buffer: contiguous
+    # and otherwise identical, but not 16-byte aligned.
+    wide = torch.randn(n + 5).to(torch.bfloat16).to(mojo_h100)
+    misaligned_bias = wide[5:]
+    assert misaligned_bias.data_ptr() % 16 != 0
+    assert not aten_fast._gemm16_splitk_bias_certain(a, b, misaligned_bias)
+
+    out_misaligned = torch.addmm(misaligned_bias, a, b)
+    expected_misaligned = (
+        a.cpu().float() @ b.cpu().float() + misaligned_bias.cpu().float()
+    )
+    torch.testing.assert_close(
+        out_misaligned.cpu().float(), expected_misaligned, atol=0.2, rtol=8e-3
+    )
+
+
+def test_addmm_alpha_beta_scaling_declines_the_fused_fast_path(
+    mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """alpha/beta != 1 is unsupported by eager-mode addmm entirely (no
+    alpha/beta scaling anywhere in fast_aten_addmm, fused split-K included,
+    and eager mode has no graph fallback -- see AGENTS.md). A shape that
+    `_gemm16_splitk_bias_certain` would otherwise accept must still decline
+    cleanly (NotImplementedError) rather than the new fused-first attempt
+    silently computing an unscaled (wrong) result."""
+    calls = _spy_defined_native_calls(
+        monkeypatch, {("gemm16_matmul_ops.mojo", "Gemm16")}
+    )
+    m, n, k = 1024, 1024, 8192  # split-K-certain shape
+    a, b = _gemm16_operands("NN", m, n, k, torch.bfloat16, mojo_h100)
+    bias = torch.randn(n).to(torch.bfloat16).to(mojo_h100)
+
+    with pytest.raises(NotImplementedError):
+        torch.addmm(bias, a, b, beta=0.5, alpha=2.0)
+    assert not calls[("gemm16_matmul_ops.mojo", "Gemm16")]
 
 
 @pytest.mark.parametrize(
