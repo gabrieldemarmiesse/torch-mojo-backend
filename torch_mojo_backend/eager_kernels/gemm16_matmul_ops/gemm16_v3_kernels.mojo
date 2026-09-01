@@ -1,12 +1,15 @@
-"""Dynamically routed H100 16-bit tensor-core GEMM kernels.
+"""Dynamically routed H100 tensor-core GEMM kernels (16-bit and TF32).
 
 The accepted-v2 implementation remains the fallback for every regime not
 handled by the optimized NN, NT, and TN routes in this module.
 
-The operand dtype is bfloat16 or float16, chosen at compile time by
-`_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
-here is a function of the 2-byte operand width, not of the exponent
-layout, so one source serves both.
+The operand dtype is bfloat16, float16 or float32, chosen at compile time
+by `_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
+here is a function of the operand WIDTH, not of the exponent layout, so one
+source serves all three -- float32 operands are what WGMMA computes as TF32.
+float32 reaches only the NT routes (`_enqueue_gemm16_gemm_tf32`), which is
+also what keeps the unwidened ones out of a float32 build: Mojo instantiates
+only what is called.
 """
 
 from max.gpu.sync import barrier
@@ -51,7 +54,20 @@ from gemm16_tn_v4_kernels import (
     try_enqueue_gemm16_gemm_tn_v4,
     try_enqueue_gemm16_gemm_tt_v4,
 )
-from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+from gemm16_bias import (
+    _GEMM16_HAS_BIAS,
+    _gemm16_add_bias_to_accum,
+    _gemm16_bias_ptr_ok,
+    _gemm16_bias_tag,
+)
+from gemm16_dtype import (
+    _GEMM16_BK,
+    _GEMM16_DT,
+    _GEMM16_TAG,
+    _GEMM16_TF32,
+    _GEMM16_W,
+    _GEMM16_WGMMA_K,
+)
 
 
 comptime _V3_DT = _GEMM16_DT
@@ -59,15 +75,15 @@ comptime _V3_F32 = DType.float32
 comptime _V3_PTR = UnsafePointer[Scalar[_V3_DT], MutAnyOrigin]
 comptime _V3_BM = 64
 comptime _V3_BN = 128
-comptime _V3_BK = 64
+comptime _V3_BK = _GEMM16_BK
 comptime _V3_SWIZZLE = TensorMapSwizzle.SWIZZLE_128B
 comptime _V3_NN_BM = 128
 comptime _V3_NN_BN = 256
-comptime _V3_NN_BK = 64
+comptime _V3_NN_BK = _GEMM16_BK
 comptime _V3_NN_STAGES = 3
 comptime _V3_NN_THREADS = 384
 comptime _V3_NN_CONSUMERS = 2
-comptime _V3_NN_WGMMA_SHAPE = Index(64, 256, 16)
+comptime _V3_NN_WGMMA_SHAPE = Index(64, 256, _GEMM16_WGMMA_K)
 comptime _V3_NN_A_LAYOUT = tile_layout_k_major[
     _V3_DT, _V3_NN_BM, _V3_NN_BK, _V3_SWIZZLE
 ]()
@@ -94,11 +110,11 @@ comptime _V3_NN_B_PIPE_LAYOUT = Layout.row_major(
 )
 comptime _V3_NN_SMALL_BM = 64
 comptime _V3_NN_SMALL_BN = 128
-comptime _V3_NN_SMALL_BK = 64
+comptime _V3_NN_SMALL_BK = _GEMM16_BK
 comptime _V3_NN_SMALL_STAGES = 3
 comptime _V3_NN_SMALL_THREADS = 256
 comptime _V3_NN_SMALL_CONSUMERS = 1
-comptime _V3_NN_SMALL_WGMMA_SHAPE = Index(64, 128, 16)
+comptime _V3_NN_SMALL_WGMMA_SHAPE = Index(64, 128, _GEMM16_WGMMA_K)
 comptime _V3_NN_SMALL_A_LAYOUT = tile_layout_k_major[
     _V3_DT, _V3_NN_SMALL_BM, _V3_NN_SMALL_BK, _V3_SWIZZLE
 ]()
@@ -125,11 +141,11 @@ comptime _V3_NN_SMALL_B_PIPE_LAYOUT = Layout.row_major(
 )
 comptime _V3_NT_BM = 128
 comptime _V3_NT_BN = 256
-comptime _V3_NT_BK = 64
+comptime _V3_NT_BK = _GEMM16_BK
 comptime _V3_NT_STAGES = 3
 comptime _V3_NT_THREADS = 384
 comptime _V3_NT_CONSUMERS = 2
-comptime _V3_NT_WGMMA_SHAPE = Index(64, 256, 16)
+comptime _V3_NT_WGMMA_SHAPE = Index(64, 256, _GEMM16_WGMMA_K)
 comptime _V3_NT_A_LAYOUT = tile_layout_k_major[
     _V3_DT, _V3_NT_BM, _V3_NT_BK, _V3_SWIZZLE
 ]()
@@ -156,11 +172,11 @@ comptime _V3_NT_B_PIPE_LAYOUT = Layout.row_major(
 )
 comptime _V3_TN_WS_BM = 128
 comptime _V3_TN_WS_BN = 256
-comptime _V3_TN_WS_BK = 64
+comptime _V3_TN_WS_BK = _GEMM16_BK
 comptime _V3_TN_WS_STAGES = 3
 comptime _V3_TN_WS_THREADS = 384
 comptime _V3_TN_WS_CONSUMERS = 2
-comptime _V3_TN_WS_WGMMA_SHAPE = Index(64, 256, 16)
+comptime _V3_TN_WS_WGMMA_SHAPE = Index(64, 256, _GEMM16_WGMMA_K)
 comptime _V3_TN_WS_A_LAYOUT = tile_layout_mn_major[
     _V3_DT, _V3_TN_WS_BM, _V3_TN_WS_BK, _V3_SWIZZLE
 ]()
@@ -187,11 +203,11 @@ comptime _V3_TN_WS_B_PIPE_LAYOUT = Layout.row_major(
 )
 comptime _V3_TN_SMALL_BM = 64
 comptime _V3_TN_SMALL_BN = 128
-comptime _V3_TN_SMALL_BK = 64
+comptime _V3_TN_SMALL_BK = _GEMM16_BK
 comptime _V3_TN_SMALL_STAGES = 3
 comptime _V3_TN_SMALL_THREADS = 256
 comptime _V3_TN_SMALL_CONSUMERS = 1
-comptime _V3_TN_SMALL_WGMMA_SHAPE = Index(64, 128, 16)
+comptime _V3_TN_SMALL_WGMMA_SHAPE = Index(64, 128, _GEMM16_WGMMA_K)
 comptime _V3_TN_SMALL_A_LAYOUT = tile_layout_mn_major[
     _V3_DT, _V3_TN_SMALL_BM, _V3_TN_SMALL_BK, _V3_SWIZZLE
 ]()
@@ -288,7 +304,7 @@ def _v3_nn_ws_m128n256_tma_s3(
         var m0 = (group * 8 + rem % rows_in_group) * _V3_NN_BM
         var n0 = (rem // rows_in_group) * _V3_NN_BN
         var num_tiles = k // _V3_NN_BK
-        comptime TMA_BYTES = (_V3_NN_BM + _V3_NN_BN) * _V3_NN_BK * 2
+        comptime TMA_BYTES = (_V3_NN_BM + _V3_NN_BN) * _V3_NN_BK * _GEMM16_W
 
         if warp_group_idx > 0 and warp_group_thread_idx == 0:
             comptime for stage in range(_V3_NN_STAGES):
@@ -386,7 +402,9 @@ def _v3_nn_ws_m128n256_tma_s3(
                     accum.ptr[e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
-                    output.store[alignment=4]((m0 + row) * n + n0 + col, pair)
+                    output.store[alignment=2 * _GEMM16_W](
+                        (m0 + row) * n + n0 + col, pair
+                    )
 
 
 def _v3_enqueue_nn_ws_m128n256_tma_s3(
@@ -506,7 +524,7 @@ def _v3_nn_ws_m64n128_tma_s3(
         var num_tiles = k // _V3_NN_SMALL_BK
         comptime TMA_BYTES = (
             _V3_NN_SMALL_BM + _V3_NN_SMALL_BN
-        ) * _V3_NN_SMALL_BK * 2
+        ) * _V3_NN_SMALL_BK * _GEMM16_W
 
         if warp_group_idx > 0 and warp_group_thread_idx == 0:
             comptime for stage in range(_V3_NN_SMALL_STAGES):
@@ -610,7 +628,9 @@ def _v3_nn_ws_m64n128_tma_s3(
                     accum.ptr[e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
-                    output.store[alignment=4]((m0 + row) * n + n0 + col, pair)
+                    output.store[alignment=2 * _GEMM16_W](
+                        (m0 + row) * n + n0 + col, pair
+                    )
 
 
 def _v3_enqueue_nn_ws_m64n128_tma_s3(
@@ -664,14 +684,19 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V3_NT_THREADS))
 )
-@__name(t"{_GEMM16_TAG}_gemm_v3_nt_ws_m128n256_tma_s3")
-def _v3_nt_ws_m128n256_tma_s3(
+@__name(
+    t"{_GEMM16_TAG}_gemm_v3_nt_ws_m128n256_tma_s3{_gemm16_bias_tag[has_bias]()}"
+)
+def _v3_nt_ws_m128n256_tma_s3[
+    has_bias: Bool = False
+](
     a_tma: _V3_NT_A_TMA,
     b_tma: _V3_B_K_TMA,
     output: _V3_PTR,
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
+    bias: _V3_PTR,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
@@ -726,7 +751,16 @@ def _v3_nt_ws_m128n256_tma_s3(
         var m0 = (group * 8 + rem % rows_in_group) * _V3_NT_BM
         var n0 = (rem // rows_in_group) * _V3_NT_BN
         var num_tiles = k // _V3_NT_BK
-        comptime TMA_BYTES = (_V3_NT_BM + _V3_NT_BN) * _V3_NT_BK * 2
+        comptime if _GEMM16_TF32:
+            # The 16-bit dispatcher admits this route only at k % BK == 0, so
+            # the exact division above is the whole K range for it and stays
+            # byte-identical.  The tf32 dispatcher admits any k whose ROW PITCH
+            # is TMA-legal ((k * width) % 16 == 0, i.e. k % 4 here), which
+            # leaves a partial trailing k-tile: TMA zero-fills a box that runs
+            # past the global extent and zeros do not contribute to a dot
+            # product, so one extra tile is exactly right.
+            num_tiles = (k + _V3_NT_BK - 1) // _V3_NT_BK
+        comptime TMA_BYTES = (_V3_NT_BM + _V3_NT_BN) * _V3_NT_BK * _GEMM16_W
 
         if warp_group_idx > 0 and warp_group_thread_idx == 0:
             comptime for stage in range(_V3_NT_STAGES):
@@ -816,6 +850,8 @@ def _v3_nt_ws_m128n256_tma_s3(
             var lane = tid % 32
             var base_row = warp * 16 + lane // 4
             var base_col = (lane % 4) * 2
+            comptime if has_bias:
+                _gemm16_add_bias_to_accum[CFRAG](accum, bias, n0, n, lane)
             comptime for q in range(CFRAG // 2):
                 var e = q * 2
                 var row = (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
@@ -825,13 +861,18 @@ def _v3_nt_ws_m128n256_tma_s3(
                     accum.ptr[e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
-                    output.store[alignment=4]((m0 + row) * n + n0 + col, pair)
+                    output.store[alignment=2 * _GEMM16_W](
+                        (m0 + row) * n + n0 + col, pair
+                    )
 
 
-def _v3_enqueue_nt_ws_m128n256_tma_s3(
+def _v3_enqueue_nt_ws_m128n256_tma_s3[
+    has_bias: Bool = False
+](
     output: _V3_PTR,
     a: _V3_PTR,
     b: _V3_PTR,
+    bias: _V3_PTR,
     m: Int,
     n: Int,
     k: Int,
@@ -862,13 +903,14 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
     )
     var a_tma = _V3_NT_A_TMA(a_desc)
     var b_tma = _V3_B_K_TMA(b_desc)
-    ctx.enqueue_function[_v3_nt_ws_m128n256_tma_s3](
+    ctx.enqueue_function[_v3_nt_ws_m128n256_tma_s3[has_bias]](
         a_tma,
         b_tma,
         output,
         Int64(m),
         Int64(n),
         Int64(k),
+        bias,
         grid_dim=(grid_x,),
         block_dim=(_V3_NT_THREADS,),
     )
@@ -948,7 +990,7 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
         var num_tiles = k // _V3_TN_SMALL_BK
         comptime TMA_BYTES = (
             _V3_TN_SMALL_BM + _V3_TN_SMALL_BN
-        ) * _V3_TN_SMALL_BK * 2
+        ) * _V3_TN_SMALL_BK * _GEMM16_W
 
         if warp_group_idx > 0 and warp_group_thread_idx == 0:
             comptime for stage in range(_V3_TN_SMALL_STAGES):
@@ -1078,7 +1120,9 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
                     accum.ptr[e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
-                    output.store[alignment=4]((m0 + row) * n + n0 + col, pair)
+                    output.store[alignment=2 * _GEMM16_W](
+                        (m0 + row) * n + n0 + col, pair
+                    )
 
 
 def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
@@ -1201,7 +1245,9 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
         var m0 = (group * 8 + rem % rows_in_group) * _V3_TN_WS_BM
         var n0 = (rem // rows_in_group) * _V3_TN_WS_BN
         var num_tiles = k // _V3_TN_WS_BK
-        comptime TMA_BYTES = (_V3_TN_WS_BM + _V3_TN_WS_BN) * _V3_TN_WS_BK * 2
+        comptime TMA_BYTES = (
+            _V3_TN_WS_BM + _V3_TN_WS_BN
+        ) * _V3_TN_WS_BK * _GEMM16_W
 
         # Initially release every pipeline slot to the producer.  Thereafter
         # both consumer warp groups arrive only after their WGMMA reads finish.
@@ -1336,7 +1382,9 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
                     accum.ptr[e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
-                    output.store[alignment=4]((m0 + row) * n + n0 + col, pair)
+                    output.store[alignment=2 * _GEMM16_W](
+                        (m0 + row) * n + n0 + col, pair
+                    )
 
 
 def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
@@ -1494,7 +1542,198 @@ def _try_enqueue_gemm16_tn_route(
     return False
 
 
+# ============================================================================
+# float32 (TF32) NT route: the 128x256 warp-specialized WGMMA kernel above at
+# the 4-byte tile.  Its admission gate is NOT the 16-bit NT route's
+# tile-multiple gate; it is the two real hardware constraints, which are looser:
+#
+#   * TMA requires every global stride to be a multiple of 16 BYTES.  A is
+#     (m, k) row-major and B is (n, k) row-major, so both row pitches are
+#     k * width and the constraint on k is (k * width) % 16 == 0 -- k % 4 at
+#     float32.  It is NOT k % BK: a partial trailing k-tile is fine because TMA
+#     zero-fills a box past the global extent and zeros do not contribute to a
+#     dot product (that is what the ceil-div `num_tiles` above is for).
+#     Violating it fails descriptor creation with CUDA_ERROR_INVALID_VALUE, so
+#     it has to be a gate rather than a hope.
+#   * the epilogue stores a 2-element pair per lane at a row start of
+#     row * n * width, so n must be EVEN for that to be 2*width-aligned.  m is
+#     unconstrained: it only picks the row, and the epilogue's bounds check
+#     already clips a partial edge tile.
+#
+# So ragged m and any even n are served, and k needs only 4-element alignment.
+# ============================================================================
+def _try_enqueue_gemm16_nt_v3_tf32[
+    has_bias: Bool = False
+](
+    output: _V3_PTR,
+    a: _V3_PTR,
+    b: _V3_PTR,
+    bias: _V3_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    comptime if not _has_sm_9x():
+        return False
+    if ctx.api() != "cuda":
+        return False
+    comptime if has_bias:
+        if not _gemm16_bias_ptr_ok(bias):
+            return False
+    # _has_sm_9x() is a comptime FAMILY check; on a mixed-architecture box the
+    # DeviceContext can still be bound to a non-Hopper device, and this kernel
+    # is WGMMA+TMA-only.  Every sibling route checks the runtime compute
+    # capability for exactly this reason.
+    var cc_major = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MAJOR)
+    var cc_minor = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR)
+    if cc_major != 9 or cc_minor != 0:
+        return False
+    if (
+        m < 1
+        or n < 1
+        or k < 1
+        or (k * _GEMM16_W) % 16 != 0
+        or n % 2 != 0
+        or Int(output) % 16 != 0
+        or Int(a) % 16 != 0
+        or Int(b) % 16 != 0
+        or m > 2_147_483_647
+        or n > 2_147_483_647
+        or k > 2_147_483_647
+        or k > 9_223_372_036_854_775_807 // m
+        or k > 9_223_372_036_854_775_807 // n
+        or n > 9_223_372_036_854_775_807 // m
+    ):
+        return False
+    var blocks_m = (m + _V3_NT_BM - 1) // _V3_NT_BM
+    var blocks_n = (n + _V3_NT_BN - 1) // _V3_NT_BN
+    var max_grid_x = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
+    if (
+        blocks_m <= 0
+        or blocks_n <= 0
+        or max_grid_x <= 0
+        or blocks_m > max_grid_x // blocks_n
+    ):
+        return False
+    _v3_enqueue_nt_ws_m128n256_tma_s3[has_bias](
+        output, a, b, bias, m, n, k, blocks_m * blocks_n, ctx
+    )
+    return True
+
+
+# ============================================================================
+# The float32 (TF32) route ladder.
+#
+# Deliberately much shorter than the 16-bit one: only the NT split-K kernel and
+# the NT 128x256 WGMMA kernel above have been measured at float32 (H100 PCIe,
+# 1395MHz, versus cuBLAS's sm90 warpgroup tf32 kernels: 0.85-1.07x on
+# 4096^3 / 8192x2048x2048 / 2048x8192x2048 / 32768x768x768, and 0.89x on the
+# deep-K 1024x1024x8192 through split-K).  The routes NOT reachable here are
+# not merely unmeasured, two of them are structurally 16-bit:
+# gemm16_nt_v4_kernels.mojo's persistent kernel and the `tma_store` epilogue of
+# gemm16_nn_v4_kernels.mojo stage C through `st.matrix` / a hand-written
+# 128B-swizzle whose 64-element row is one swizzle row only at a 2-byte
+# operand.  Since Mojo instantiates only what is called, gating here is also
+# what keeps those out of a float32 build entirely.
+#
+# Everything this ladder declines keeps the SM80-class mma.m16n8k8 route in
+# tf32_matmul_ops/, which aten_fast.py picks on the host with the same
+# arithmetic; reaching the raise below means those two gates disagree.
+# ============================================================================
+def _enqueue_gemm16_gemm_tf32(
+    output: _V3_PTR,
+    a: _V3_PTR,
+    b: _V3_PTR,
+    bias: _V3_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    transpose_a: Bool,
+    transpose_b: Bool,
+    ctx: DeviceContext,
+) raises:
+    if not transpose_a and transpose_b:
+        # The split-K arm has no fused-bias epilogue (its bias would belong in
+        # the separate reduce kernel, not here), so a biased call skips it and
+        # takes the direct kernel, whose epilogue does fuse.  That would be the
+        # wrong trade for the deep-K shapes split-K exists for -- measured on
+        # an H100 PCIe, 1024x1024x8192 tf32 costs 85us split-K versus 197us
+        # direct -- which is why the host keeps splitting the bias off exactly
+        # those shapes (`_gemm16_splitk_nt_may_fire` in aten_fast.py) and only
+        # sends a fused bias here when the direct kernel is the route anyway.
+        comptime if not _GEMM16_HAS_BIAS:
+            if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
+                output, a, b, m, n, k, ctx
+            ):
+                return
+        if _try_enqueue_gemm16_nt_v3_tf32[_GEMM16_HAS_BIAS](
+            output, a, b, bias, m, n, k, ctx
+        ):
+            return
+    raise Error(
+        t"gemm16 float32 (tf32) carries the NT route only, and only for"
+        t" (k * 4) % 16 == 0 and even n on sm_90a; got m={m} n={n} k={k}"
+        t" transpose_a={transpose_a} transpose_b={transpose_b}"
+        t" has_bias={_GEMM16_HAS_BIAS}. The host gate in aten_fast.py"
+        t" (_tf32_nt_wgmma_admits) must not offer this call to this bridge."
+    )
+
+
 def enqueue_gemm16_gemm(
+    output: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    a: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    b: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    bias: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    transpose_a: Bool,
+    transpose_b: Bool,
+    has_bias: Bool,
+    ctx: DeviceContext,
+) raises:
+    # The compiled-in HAS_BIAS flag selects which kernels this .so carries, so
+    # it MUST agree with the bias the caller actually passed.  Disagreement can
+    # only come from a loader/bridge bug, and its silent form would be a wrong
+    # answer (a dropped or a garbage bias), so it is checked once per call --
+    # host-side integer compare, next to a GEMM.
+    if has_bias != _GEMM16_HAS_BIAS:
+        raise Error(
+            t"gemm16 was built with HAS_BIAS={_GEMM16_HAS_BIAS} but called"
+            t" with has_bias={has_bias}: the specialization defines and the"
+            t" call ABI have drifted apart."
+        )
+    comptime if _GEMM16_TF32:
+        _enqueue_gemm16_gemm_tf32(
+            output,
+            a,
+            b,
+            bias,
+            m,
+            n,
+            k,
+            transpose_a,
+            transpose_b,
+            ctx,
+        )
+    else:
+        _enqueue_gemm16_gemm_16bit(
+            output,
+            a,
+            b,
+            bias,
+            m,
+            n,
+            k,
+            transpose_a,
+            transpose_b,
+            has_bias,
+            ctx,
+        )
+
+
+def _enqueue_gemm16_gemm_16bit(
     output: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     a: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     b: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
@@ -1512,17 +1751,24 @@ def enqueue_gemm16_gemm(
     # helper enqueues only for regimes it fully supports (SM90, aligned
     # n/k, TMA-compatible sizes) and returns False otherwise, in which case
     # the pre-existing NT path below remains the fallback.
-    if not transpose_a and transpose_b and not has_bias:
+    if not transpose_a and transpose_b:
         # Deep-K split-K route first: the persistent kernel below keeps all
         # SMs resident but cannot parallelize over K, so an output with few
         # macro-tiles and a deep reduction leaves most of the GPU idle.
         # The helper gates itself on that regime (see
         # gemm16_tn_v4_kernels.mojo) and returns False otherwise.
-        if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
-            output, a, b, m, n, k, ctx
+        comptime if not _GEMM16_HAS_BIAS:
+            # See _enqueue_gemm16_gemm_tf32: split-K has no fused-bias
+            # epilogue, and the host keeps splitting the bias off the deep-K
+            # shapes that reach it rather than pushing them onto the direct
+            # kernel, which is much slower there.
+            if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
+                output, a, b, m, n, k, ctx
+            ):
+                return
+        if maybe_enqueue_gemm16_nt_v4[_GEMM16_HAS_BIAS](
+            output, a, b, bias, m, n, k, ctx
         ):
-            return
-        if maybe_enqueue_gemm16_nt_v4(output, a, b, m, n, k, ctx):
             return
     comptime if _has_sm_9x():
         if ctx.api() == "cuda":
@@ -1699,7 +1945,7 @@ def enqueue_gemm16_gemm(
                 if (
                     not transpose_a
                     and transpose_b
-                    and not has_bias
+                    and (not _GEMM16_HAS_BIAS or _gemm16_bias_ptr_ok(bias))
                     and m >= _V3_BM
                     and n >= _V3_BN
                     and k >= _V3_BK
@@ -1729,8 +1975,8 @@ def enqueue_gemm16_gemm(
                     ):
                         var grid_x = blocks_m * blocks_n
                         if grid_x > 0:
-                            _v3_enqueue_nt_ws_m128n256_tma_s3(
-                                output, a, b, m, n, k, grid_x, ctx
+                            _v3_enqueue_nt_ws_m128n256_tma_s3[_GEMM16_HAS_BIAS](
+                                output, a, b, bias, m, n, k, grid_x, ctx
                             )
                             return
                 # The remaining TN regimes (underfilled small-tile and large
@@ -1754,6 +2000,50 @@ def enqueue_gemm16_gemm(
 
 
 def enqueue_gemm16_bmm(
+    output: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    a: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    b: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    batch_count: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    output_batch_stride: Int,
+    a_batch_stride: Int,
+    b_batch_stride: Int,
+    transpose_a: Bool,
+    transpose_b: Bool,
+    ctx: DeviceContext,
+) raises:
+    # No float32 (TF32) BMM here: the batched routes below are the pre-wgmma
+    # accepted kernel and gemm16_bmm_v5_kernels.mojo, neither of which has been
+    # widened or measured at a 4-byte operand.  A float32 BMM keeps the
+    # SM80-class route in tf32_matmul_ops/, which is what aten_fast.py calls,
+    # so this raise is unreachable from the eager path and exists only so a
+    # float32 specialization of this module compiles and says why.
+    comptime if _GEMM16_TF32:
+        raise Error(
+            "gemm16 carries no float32 (tf32) BMM route; float32 batched"
+            " matmuls use the tf32_matmul_ops bridge."
+        )
+    else:
+        _enqueue_gemm16_bmm_16bit(
+            output,
+            a,
+            b,
+            batch_count,
+            m,
+            n,
+            k,
+            output_batch_stride,
+            a_batch_stride,
+            b_batch_stride,
+            transpose_a,
+            transpose_b,
+            ctx,
+        )
+
+
+def _enqueue_gemm16_bmm_16bit(
     output: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     a: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     b: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
