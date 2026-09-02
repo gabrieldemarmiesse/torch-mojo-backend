@@ -43,7 +43,7 @@ from gemm16_kernels import (
     enqueue_gemm16_bmm as _enqueue_accepted_bf16_bmm,
     enqueue_gemm16_gemm as _enqueue_accepted_bf16_gemm,
 )
-from gemm16_bmm_v5_kernels import try_enqueue_bmm16_nn_batched
+from gemm16_bmm_v5_kernels import try_enqueue_bmm16_batched
 from gemm16_nn_v4_kernels import maybe_enqueue_gemm16_nn_v4
 from gemm16_nt_v4_kernels import maybe_enqueue_gemm16_nt_v4
 from gemm16_tn_v4_kernels import (
@@ -1768,12 +1768,14 @@ def enqueue_gemm16_bmm(
     transpose_b: Bool,
     ctx: DeviceContext,
 ) raises:
-    # TN strided-batch loop over the mm-level wgmma ladder. There is no
-    # batched (grid.z) wgmma TN kernel: every BMM layout, including TN,
-    # reaches only the pre-wgmma accepted kernel below today, and TN is the
-    # worst-served layout there (~1.7x the NN/NT/TT siblings sharing that
-    # same kernel, ~6-7x cuBLAS overall) because that kernel predates the
-    # tensor-core-async / TMA work the mm-level TN route already has.
+    # TN strided-batch loop over the mm-level wgmma ladder. TN is the only
+    # layout that reaches the fast path this way; NN, NT and TT all take the
+    # single batched launch of gemm16_bmm_v5_kernels.mojo (see the comment
+    # further down). Before #389 no layout had a batched (grid.z) wgmma
+    # kernel at all and TN was the worst-served of the four on the pre-wgmma
+    # accepted kernel below (~1.7x its NN/NT/TT siblings there, ~6-7x
+    # cuBLAS), because that kernel predates the tensor-core-async / TMA work
+    # the mm-level TN route already has.
     #
     # This loops _try_enqueue_gemm16_tn_route -- the exact single-matrix TN
     # ladder `enqueue_gemm16_gemm` uses -- once per batch item, the same way
@@ -1792,21 +1794,57 @@ def enqueue_gemm16_bmm(
     # expected path: same-shape batches only diverge if a batch stride
     # breaks 16B alignment partway through.
     #
-    # NN batched route: unlike TN above, this is a single launch over the
-    # WHOLE batch (gemm16_bmm_v5_kernels.mojo) rather than a per-item loop --
-    # a persistent work list spanning every batch item's tiles, addressed by
-    # rank-3 TMA descriptors that carry the batch dimension (and clip ragged
-    # m/n/k per item). Looping the mm-level NN ladder the way TN does was
-    # tried and measured worse on every shape (small per-item grids -- e.g.
-    # attention's batch of narrow-n matrices, or conv's im2col batch --
+    # NN / NT / TT batched route: unlike TN above, this is a single launch
+    # over the WHOLE batch (gemm16_bmm_v5_kernels.mojo) rather than a per-item
+    # loop -- a persistent work list spanning every batch item's tiles,
+    # addressed by rank-3 TMA descriptors that carry the batch dimension (and
+    # clip ragged m/n/k per item). Looping the mm-level ladder the way TN does
+    # was tried and measured worse on every shape (small per-item grids --
+    # e.g. attention's batch of narrow-n matrices, or conv's im2col batch --
     # underfill the GPU independently on each loop iteration); see
     # gemm16_bmm_v5_kernels.mojo's module docstring. `a_bs == 0` (a
     # broadcast/expanded A, e.g. conv's shared per-sample weight matrix)
     # is a first-class input here, not a special case: the caller passes it
     # straight through, unlike `_tf32_dense_batched_layout` on the aten_fast
     # side which used to reject it (see that function's history).
+    #
+    # NT and TT are the same kernel body under its `col_a` / `kmaj_b`
+    # majorness parameters (one kernel symbol each), not new schedules. They
+    # were the last two layouts still falling to the accepted kernel below,
+    # where they measured 3.5-5.1x stock PyTorch on the large benchmark
+    # shapes; the batch-folded body serves them at the NN/TN speed class.
     if not transpose_a and not transpose_b:
-        if try_enqueue_bmm16_nn_batched(
+        if try_enqueue_bmm16_batched(
+            output,
+            a,
+            b,
+            batch_count,
+            m,
+            n,
+            k,
+            output_batch_stride,
+            a_batch_stride,
+            b_batch_stride,
+            ctx,
+        ):
+            return
+    if not transpose_a and transpose_b:
+        if try_enqueue_bmm16_batched[False, True](
+            output,
+            a,
+            b,
+            batch_count,
+            m,
+            n,
+            k,
+            output_batch_stride,
+            a_batch_stride,
+            b_batch_stride,
+            ctx,
+        ):
+            return
+    if transpose_a and transpose_b:
+        if try_enqueue_bmm16_batched[True, True](
             output,
             a,
             b,

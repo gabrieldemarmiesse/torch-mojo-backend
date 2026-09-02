@@ -9013,6 +9013,121 @@ def test_bf16_real_bmm_batched_nn_v5_route(
     _assert_gemm16_fp32_accumulation_close(actual.cpu(), expected, dtype)
 
 
+# ---------------------------------------------------------------------------
+# Batched NT / TT wgmma route: the same batch-folded body as the NN route
+# above, under its `col_a` / `kmaj_b` operand-majorness parameters (one kernel
+# symbol per layout).  These were the last two BMM layouts still falling to
+# the pre-wgmma accepted kernel, where they measured 3.5-5.1x stock PyTorch on
+# the large benchmark shapes.
+#
+# The col-major-A cases (TT) are the reason this test exists rather than
+# leaning on the layout-parametrized test further up: every OTHER caller of a
+# col_a persistent body in this repository gates m % 128 == 0 first, so the
+# body's ragged-m clip path -- the A TMA reads clamping past the item's m edge
+# and zero-filling, plus the epilogue's row predication -- had no coverage at
+# all.  Batched BMM cannot make that assumption (per-item ragged m is normal),
+# so `ragged_m_*` below deliberately runs m = 357 and m = 300 through both the
+# 64-row and the 128-row (two A boxes per tile) instantiations.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["NT", "TT"])
+@pytest.mark.parametrize(
+    ("m", "n", "k", "batch", "gap_a", "gap_b"),
+    [
+        (64, 64, 64, 3, 0, 0),  # minimal aligned direct-TMA
+        (300, 520, 128, 2, 0, 0),  # ragged m on the 64-row persistent body
+        (357, 512, 1088, 24, 0, 0),  # ragged m on the 128-row big tile
+        (70, 96, 64, 2, 64, 128),  # padded (non-packed) batch strides
+        (77, 89, 100, 2, 0, 0),  # fully unaligned: repack route + scalar-C
+        (357, 789, 333, 8, 0, 0),  # awkward/odd dims: tiny body, scalar C
+        (32768, 768, 768, 2, 0, 0),  # tall-skinny: the big-tile dispatch rung
+    ],
+    ids=[
+        "aligned_min",
+        "ragged_m_persistent64",
+        "ragged_m_bigtile128",
+        "padded_batch_strides",
+        "unaligned_repack_scalar_c",
+        "awkward_odd_dims",
+        "tall_skinny_big_tile",
+    ],
+)
+def test_bf16_real_bmm_batched_nt_tt_v5_route(
+    mojo_h100, monkeypatch, layout, m, n, k, batch, gap_a, gap_b, dtype
+):
+    """NT and TT match the NN route's correctness across the same dispatch
+    ladder, at both 16-bit dtypes, with a transposed operand's own row stride
+    driving the TMA alignment gate and the row-repack workspace."""
+    _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    generator = torch.Generator().manual_seed(20260819)
+    lhs, mojo_lhs = _bf16_dense_batched_pair(
+        generator, (batch, m, k), layout[0] == "T", gap_a, 1, mojo_h100, dtype
+    )
+    rhs, mojo_rhs = _bf16_dense_batched_pair(
+        generator, (batch, k, n), layout[1] == "T", gap_b, 2, mojo_h100, dtype
+    )
+    expected = torch.bmm(lhs.float(), rhs.float()).to(dtype)
+
+    def fail_later_route(*_args, **_kwargs):
+        raise AssertionError("eligible 16-bit NT/TT BMM reached TF32 or TensorSpec")
+
+    monkeypatch.setattr(aten_fast, "_try_tf32_bmm", fail_later_route)
+    monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
+    actual = torch.bmm(mojo_lhs, mojo_rhs)
+
+    _assert_gemm16_fp32_accumulation_close(actual.cpu(), expected, dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["NT", "TT"])
+def test_bf16_real_bmm_batched_nt_tt_v5_broadcast_operand(
+    mojo_h100, monkeypatch, layout, dtype
+):
+    """A broadcast (`expand()`ed, batch stride 0) transposed operand rides the
+    coordinate multiplier the same way the NN route's broadcast A does: the
+    descriptor describes ONE physical matrix, whose extents and row stride are
+    the transposed ones."""
+    _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    batch, m, n, k = 3, 128, 256, 128
+    generator = torch.Generator().manual_seed(20260819)
+    # The broadcast side is A for TT (physically (k, m)) and B for NT
+    # (physically (n, k)) -- in both cases the transposed operand.
+    rows, cols = (k, m) if layout[0] == "T" else (n, k)
+    shared = torch.randn(rows, cols, generator=generator).to(dtype)
+    mojo_shared = shared.to(mojo_h100)
+    shape = (batch, m, k) if layout[0] == "T" else (batch, k, n)
+    # A transposed operand's last-axis stride is its physical row length.
+    strides = (0, 1, cols)
+    bcast = torch.as_strided(shared.reshape(-1), shape, strides, 0)
+    mojo_bcast = aten_fast._view_of(mojo_shared, shape, strides, 0)
+
+    other_shape = (batch, k, n) if layout[0] == "T" else (batch, m, k)
+    other_transposed = layout[1] == "T" if layout[0] == "T" else False
+    other, mojo_other = _bf16_dense_batched_pair(
+        generator, other_shape, other_transposed, 0, 2, mojo_h100, dtype
+    )
+    if layout[0] == "T":
+        lhs, mojo_lhs, rhs, mojo_rhs = bcast, mojo_bcast, other, mojo_other
+    else:
+        lhs, mojo_lhs, rhs, mojo_rhs = other, mojo_other, bcast, mojo_bcast
+    expected = torch.bmm(lhs.float(), rhs.float()).to(dtype)
+
+    def fail_later_route(*_args, **_kwargs):
+        raise AssertionError("eligible broadcast NT/TT BMM reached TF32 or TensorSpec")
+
+    monkeypatch.setattr(aten_fast, "_try_tf32_bmm", fail_later_route)
+    monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
+    actual = torch.bmm(mojo_lhs, mojo_rhs)
+
+    _assert_gemm16_fp32_accumulation_close(actual.cpu(), expected, dtype)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     ("m", "n", "k", "batch"),
