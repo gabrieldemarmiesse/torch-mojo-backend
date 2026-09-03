@@ -3,8 +3,8 @@
 Driven through the public functional entry points (F.conv2d,
 F.max_pool2d, F.interpolate, ...), which reach the registered aten ops:
 convolution, max_pool2d_with_indices (max_pool2d is composite over it),
-_adaptive_avg_pool2d, avg_pool2d, upsample_bilinear2d.  Shape tokens
-fold the kernel/stride/output configuration in.
+_adaptive_avg_pool2d, avg_pool2d, upsample_bilinear2d, upsample_nearest2d.
+Shape tokens fold the kernel/stride/output configuration in.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ COVERS: dict[str, str] = {
         "test_max_pool2d (F.max_pool2d is composite over it)"
     ),
     "aten::upsample_bilinear2d": "test_upsample_bilinear2d",
+    "aten::upsample_nearest2d": "test_upsample_nearest2d",
 }
 
 SKIPPED: dict[str, str] = {}
@@ -142,4 +143,23 @@ def test_upsample_bilinear2d(
             x_our, scale_factor=2, mode="bilinear", align_corners=False
         ),
         flops=float(x_ref.numel()) * 4.0,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", UPSAMPLE_SHAPES)
+@pytest.mark.bench_op("upsample_nearest2d")
+def test_upsample_nearest2d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    n, c, h, w = UPSAMPLE_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: F.interpolate(x_ref, scale_factor=2, mode="nearest"),
+        lambda: F.interpolate(x_our, scale_factor=2, mode="nearest"),
+        # No interpolation weights (unlike bilinear): a pure index gather, so
+        # there is no meaningful FLOP count -- element throughput instead.
+        flops=float(x_ref.numel()),
     )
