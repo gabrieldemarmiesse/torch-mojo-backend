@@ -1,9 +1,11 @@
 """Tests for the Mojo-extension fast path used by mojo eager mode."""
 
+import collections
+import contextlib
 import functools
 import math
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Protocol, cast
@@ -11195,3 +11197,390 @@ def test_fast_sdpa_decode(mojo_gpu, dtype):
     ).cpu()
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     torch.testing.assert_close(dev, ref, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# FA4 extreme-logit accuracy (2026-08 nanoGPT attention-collapse incident)
+# ---------------------------------------------------------------------------
+#
+# FA4's online softmax formed P as `exp2(fma(s, scale_log2, -rowmax))`: an
+# EXACT product against a ROUNDED row maximum. The winning element's exponent
+# is then off zero by up to half an f32 ulp of |s * scale_log2| -- an envelope
+# that widens with each binade of the scaled logit, so p_max is no longer
+# exactly 1.0 and the 16-bit P-packing error on the dominant entry stops
+# cancelling against the f32 rowsum. Rounding the product on its own first
+# restores the cancellation.
+#
+# The tests below are OUTCOME regressions: they bound the error of saturated
+# rows against a CPU fp64 causal decomposition, so any implementation that
+# reintroduces the mismatch fails regardless of how it is spelled. They do not
+# inspect p_max, and the fixed-seed bounds are empirical thresholds measured on
+# both trees (table below), NOT a derived format floor. The kernel-level
+# companion is tests/test_fa4_rounded_product_ptx.py, which checks the emitted
+# PTX of every FA4 instantiation, including the ones no runtime test reaches.
+#
+# Coverage: H100 only (`mojo_h100` skips everything else) -- FA4 eligibility is
+# hard-gated to sm_90a. A flash kernel for another architecture would need its
+# own measurement; nothing here establishes portability.
+#
+# Measured saturated-row rms/peak, stock -> fixed, at the exact shapes and seed
+# used below (`|` separates head_dim 64 | 128; the selfload row is d64 only):
+#
+#   dtype regime     rms stock          rms fixed         peak stock       peak fixed
+#   bf16  healthy    5.58e-4|5.52e-4    5.58e-4|5.52e-4   1.41e-2|1.16e-2  same
+#   bf16  collapsed  1.12e-3|9.34e-4    3.24e-5|3.27e-5   1.56e-2|1.56e-2  5.66e-3|6.48e-3
+#   bf16  selfload   8.72e-4            3.09e-5           1.56e-2          7.82e-3
+#   f16   healthy    9.32e-5|8.96e-5    9.31e-5|8.96e-5   1.72e-3|1.52e-3  same
+#   f16   collapsed  2.49e-4|2.50e-4    4.85e-6|6.28e-6   1.95e-3|2.52e-3  9.64e-4|9.50e-4
+#   f16   selfload   2.45e-4            4.44e-6           3.91e-3          9.55e-4
+#
+# The healthy rows move by less than 0.1% -- the defect is triggered by logit
+# MAGNITUDE, not by saturation, which is why ordinary random-input sweeps never
+# saw it. The collapsed rows are what the bounds separate; the margins are
+# stated next to each bound and are wide on rms, narrow (about 1.4x either
+# side) on peak, which is a single-element statistic.
+_FA4_EXTREME_LOGIT_BOUNDS = {
+    # (dtype, regime): (rms bound, peak bound)
+    # healthy: sanity guards, ~1.4x above the measured value on both trees.
+    (torch.bfloat16, "healthy"): (8e-4, 2e-2),
+    (torch.float16, "healthy"): (1.5e-4, 3e-3),
+    # collapsed: rms 4.6x above fixed / 5.8x below stock (bf16), 4.8x / 8.2x
+    # (f16). peak 1.4x above fixed / 1.4x below stock for both.
+    (torch.bfloat16, "collapsed"): (1.5e-4, 1.1e-2),
+    (torch.float16, "collapsed"): (3e-5, 1.4e-3),
+}
+_FA4_EXTREME_LOGIT_SIGMA = {"healthy": 8.0, "collapsed": 160.0}
+_FA4_EXTREME_LOGIT_SEED = 20260818
+
+
+@functools.cache
+def _fa4_extreme_logit_reference(
+    batch: int, heads: int, seqlen: int, head_dim: int, dtype: torch.dtype, regime: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Host Q/K/V plus the fp64 causal-attention output and saturated mask.
+
+    Q/K/V are rounded to the target 16-bit dtype FIRST and the fp64 reference
+    consumes those exact values, so the only error measured is the kernel's.
+    Cached because the same reference serves every layout of a cell.
+    """
+    sigma = _FA4_EXTREME_LOGIT_SIGMA[regime]
+    generator = torch.Generator().manual_seed(_FA4_EXTREME_LOGIT_SEED)
+    shape = (batch, heads, seqlen, head_dim)
+    query = (torch.randn(shape, generator=generator) * sigma).to(dtype)
+    key = (torch.randn(shape, generator=generator) * sigma).to(dtype)
+    value = torch.randn(shape, generator=generator).to(dtype)
+
+    logits = query.double() @ key.double().transpose(-1, -2) / math.sqrt(head_dim)
+    probabilities = (logits + torch.full((seqlen, seqlen), -math.inf).triu(1)).softmax(
+        -1
+    )
+    reference = probabilities @ value.double()
+    saturated = probabilities.max(-1).values > 0.99
+    assert saturated.any(), "no saturated row: the regime this guards is not reached"
+    return query, key, value, reference, saturated
+
+
+def _fa4_place_qkv(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layout: str,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Move Q/K/V to `device` in the physical layout that selects one FA4 ABI.
+
+    Each layout reaches a DIFFERENT compiled bridge -- verified by the route
+    assertions in the tests below, not assumed:
+
+    - ``gapped_qkv``: nanoGPT's production layout, one (B, S, 3*H*D) fused
+      buffer with three gapped (B, H, S, D) views -> ``*_strided_qkv``;
+    - ``bshd_view``: (B, H, S, D) logical over a (B, S, H, D)-contiguous
+      buffer. Its BTHD view is contiguous, so the bridge does NOT need the
+      strided ABI -> the dense entry point;
+    - ``bhsd``: public contiguous (B, H, S, D) -> ``*_bhsd``.
+    """
+    if layout == "gapped_qkv":
+        batch, heads, seqlen, head_dim = query.shape
+        width = heads * head_dim
+        fused = torch.cat(
+            [
+                tensor.transpose(1, 2).reshape(batch, seqlen, width)
+                for tensor in (query, key, value)
+            ],
+            dim=2,
+        ).contiguous()
+        q_part, k_part, v_part = fused.to(device).split(width, dim=2)
+        return (
+            q_part.view(batch, seqlen, heads, head_dim).transpose(1, 2),
+            k_part.view(batch, seqlen, heads, head_dim).transpose(1, 2),
+            v_part.view(batch, seqlen, heads, head_dim).transpose(1, 2),
+        )
+    if layout == "bshd_view":
+        return (
+            query.transpose(1, 2).contiguous().to(device).transpose(1, 2),
+            key.transpose(1, 2).contiguous().to(device).transpose(1, 2),
+            value.transpose(1, 2).contiguous().to(device).transpose(1, 2),
+        )
+    return (
+        query.contiguous().to(device),
+        key.contiguous().to(device),
+        value.contiguous().to(device),
+    )
+
+
+_FA4_LAYOUT_VARIANT = {"gapped_qkv": "_strided_qkv", "bshd_view": "", "bhsd": "_bhsd"}
+
+
+@contextlib.contextmanager
+def _fa4_route_spy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[collections.Counter[str]]:
+    """Count calls to every compiled FA4 bridge symbol, by symbol name.
+
+    Without this the accuracy assertions below would pass just as happily if a
+    future eligibility-gate change routed the case to the accurate math
+    decomposition -- a green test that no longer tests FA4 at all.
+    """
+    from torch_mojo_backend.eager_flash_attention import load_fa4_ops
+
+    module = load_fa4_ops()
+    calls: collections.Counter[str] = collections.Counter()
+    for direction in ("fwd", "bwd"):
+        for suffix in ("bf16", "f16"):
+            for head_dim in (64, 128):
+                for variant in ("", "_strided_qkv", "_bhsd"):
+                    name = (
+                        f"flash_attention_{direction}_{suffix}"
+                        f"_d{head_dim}_causal{variant}"
+                    )
+                    original = getattr(module, name, None)
+                    if original is None:
+                        continue
+
+                    def spy(*args, _name=name, _original=original):
+                        calls[_name] += 1
+                        return _original(*args)
+
+                    monkeypatch.setattr(module, name, spy)
+    yield calls
+
+
+def _fa4_saturated_error(
+    output: torch.Tensor, reference: torch.Tensor, saturated: torch.Tensor
+) -> tuple[float, float]:
+    error = output.cpu().double() - reference
+    saturated_error = error[saturated.unsqueeze(-1).expand_as(error)]
+    return (
+        float(saturated_error.pow(2).mean().sqrt()),
+        float(saturated_error.abs().max()),
+    )
+
+
+def _assert_fa4_saturated_bounds(
+    output: torch.Tensor,
+    reference: torch.Tensor,
+    saturated: torch.Tensor,
+    dtype: torch.dtype,
+    regime: str,
+) -> None:
+    rms_bound, peak_bound = _FA4_EXTREME_LOGIT_BOUNDS[dtype, regime]
+    rms, peak = _fa4_saturated_error(output, reference, saturated)
+    assert rms <= rms_bound, (
+        f"saturated-row rms {rms:.3e} exceeds the {regime} bound {rms_bound:.3e}"
+    )
+    assert peak <= peak_bound, (
+        f"saturated-row max error {peak:.3e} exceeds the {regime} bound"
+        f" {peak_bound:.3e}"
+    )
+
+
+@pytest.mark.parametrize("regime", ["healthy", "collapsed"])
+@pytest.mark.parametrize("layout", ["gapped_qkv", "bshd_view", "bhsd"])
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_fa4_forward_saturated_extreme_logit_accuracy(
+    mojo_h100: str,
+    monkeypatch,
+    dtype: torch.dtype,
+    head_dim: int,
+    layout: str,
+    regime: str,
+) -> None:
+    """Saturated rows stay accurate at extreme LOGIT MAGNITUDE, every route.
+
+    ``collapsed`` is the incident regime (|scaled logit| ~ 2e4): stock FA4
+    measures a saturated-row rms 28-51x the fixed kernel's here. ``healthy``
+    (|scaled logit| ~ 5e1) is unchanged by the fix and guards against paying
+    for the fix in the ordinary regime. See the module-level table above for
+    every measured value and the margin each bound carries.
+
+    S is 1024 at d64 and 512 at d128, which reaches the two instantiated
+    forward reduction branches (d64/tree and d128/linear). The self-loading
+    d64 kernel needs far more parallel work and has its own test below.
+    """
+    batch, heads = 2, 4
+    seqlen = 1024 if head_dim == 64 else 512
+    query, key, value, reference, saturated = _fa4_extreme_logit_reference(
+        batch, heads, seqlen, head_dim, dtype, regime
+    )
+
+    with _fa4_route_spy(monkeypatch) as calls:
+        output = torch.nn.functional.scaled_dot_product_attention(
+            *_fa4_place_qkv(query, key, value, layout, mojo_h100), is_causal=True
+        )
+        output.cpu()
+
+    suffix = _FA4_DTYPE_SUFFIX[dtype]
+    expected = (
+        f"flash_attention_fwd_{suffix}_d{head_dim}_causal{_FA4_LAYOUT_VARIANT[layout]}"
+    )
+    assert calls == {expected: 1}, (
+        f"expected exactly one call to {expected}, got {dict(calls)} -- this"
+        " case no longer runs the FA4 kernel it is meant to guard"
+    )
+    _assert_fa4_saturated_bounds(output, reference, saturated, dtype, regime)
+
+
+@pytest.mark.parametrize("regime", ["healthy", "collapsed"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_fa4_selfload_forward_saturated_extreme_logit_accuracy(
+    mojo_h100: str, monkeypatch, dtype: torch.dtype, regime: str
+) -> None:
+    """Same guard on the self-loading d64 forward kernel, which owns its own
+    copy of the P expression.
+
+    The bhsd bridge picks between the phase-2b producer/consumer kernel and
+    the self-loading one at RUNTIME, on wave count: it needs
+    ``ceildiv(S, 64) * heads * batch >= _FA4_SELFLOAD_MIN_WAVES * 3 * SM_count``
+    (see ``fa4_ops.mojo``). This shape supplies ``ceildiv(256, 64) * 32 * 8``
+    = 1024 CTAs, which clears the bar for any SM count up to 170 and so covers
+    both the 114-SM PCIe and 132-SM SXM H100. Selecting the bhsd ABI is not
+    the same as selecting this kernel, which is why the shape is sized rather
+    than borrowed.
+    """
+    batch, heads, seqlen, head_dim = 8, 32, 256, 64
+    query, key, value, reference, saturated = _fa4_extreme_logit_reference(
+        batch, heads, seqlen, head_dim, dtype, regime
+    )
+
+    with _fa4_route_spy(monkeypatch) as calls:
+        output = torch.nn.functional.scaled_dot_product_attention(
+            *_fa4_place_qkv(query, key, value, "bhsd", mojo_h100), is_causal=True
+        )
+        output.cpu()
+
+    expected = f"flash_attention_fwd_{_FA4_DTYPE_SUFFIX[dtype]}_d64_causal_bhsd"
+    assert calls == {expected: 1}, f"expected one {expected}, got {dict(calls)}"
+    _assert_fa4_saturated_bounds(output, reference, saturated, dtype, regime)
+
+
+# Gradient rms bounds, keyed by (dtype, regime). Measured stock -> fixed at the
+# shape and seed below (`|` separates head_dim 64 | 128):
+#
+#   dtype regime     dQ stock         dQ fixed        dK stock         dK fixed
+#   bf16  healthy    6.62e-3|7.30e-3  6.70e-3|7.30e-3 6.45e-3|7.07e-3  6.51e-3|7.08e-3
+#   bf16  collapsed  1.75e-1|1.56e-1  1.36e-5|2.05e-5 1.73e-1|1.56e-1  1.30e-5|2.04e-5
+#   f16   healthy    9.13e-4|9.82e-4  8.87e-4|9.62e-4 8.91e-4|9.63e-4  8.67e-4|9.50e-4
+#   f16   collapsed  4.10e-2|4.17e-2  2.11e-5|9.28e-4 3.83e-2|4.12e-2  1.99e-5|8.09e-4
+#
+# dV barely moves (bf16 collapsed 2.43e-3 -> 1.52e-3 at d64, 3.48e-3 -> 3.54e-3
+# at d128): it is the one gradient whose dominant term does not carry the P
+# normalization error, so its bound is a loose sanity guard, not a
+# discriminator. The f16 d128 collapsed cell is the weakest of the set -- 9.3e-4
+# fixed against 4.2e-2 stock -- so its bound is set from that cell.
+_FA4_EXTREME_LOGIT_GRAD_BOUNDS = {
+    # (dtype, regime): (dQ/dK rms bound, dV rms bound)
+    (torch.bfloat16, "healthy"): (1e-2, 6e-3),
+    (torch.float16, "healthy"): (2e-3, 5e-3),
+    # collapsed: bf16 4.9x above fixed / 7600x below stock; f16 5.4x above the
+    # worst fixed cell (d128) / 8.3x below stock.
+    (torch.bfloat16, "collapsed"): (1e-4, 6e-3),
+    (torch.float16, "collapsed"): (5e-3, 5e-3),
+}
+
+
+@pytest.mark.parametrize("regime", ["healthy", "collapsed"])
+@pytest.mark.parametrize("layout", ["gapped_qkv", "bhsd"])
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_fa4_backward_saturated_extreme_logit_accuracy(
+    mojo_h100: str,
+    monkeypatch,
+    dtype: torch.dtype,
+    head_dim: int,
+    layout: str,
+    regime: str,
+) -> None:
+    """dQ/dK/dV stay accurate at extreme logit magnitude.
+
+    This exercises the fixed forward and the fixed backward as a PAIR, which
+    is the only combination that ships: the backward consumes the forward's
+    LSE and recomputes P from it, so the two must agree on what softmax was
+    computed. It does not isolate the backward edit from the forward one. The
+    backward's own justification is that consistency -- it subtracts a rounded
+    LSE, never a rowmax, so the forward's exact p_max == 1 argument does not
+    apply there.
+
+    The reference is CPU fp64 autograd over an explicit causal-attention
+    decomposition, so no vendor backward kernel is involved.
+
+    ``layout`` picks the two compiled backward ABIs: gapped Q/K/V views reach
+    ``*_strided_qkv``, contiguous BHSD reaches the dense entry (there is no
+    BHSD-native backward). The remaining backward edit lives in the softcap
+    branch, which no exported FA4 entry instantiates -- it is not covered here
+    and is not compiled into any shipping kernel.
+    """
+    batch, heads, seqlen = 1, 2, 512
+    query, key, value, _, saturated = _fa4_extreme_logit_reference(
+        batch, heads, seqlen, head_dim, dtype, regime
+    )
+    generator = torch.Generator().manual_seed(_FA4_EXTREME_LOGIT_SEED + 1)
+    grad_output = torch.randn(batch, heads, seqlen, head_dim, generator=generator).to(
+        dtype
+    )
+
+    expected_inputs = [
+        tensor.double().requires_grad_() for tensor in (query, key, value)
+    ]
+    expected_logits = (
+        expected_inputs[0] @ expected_inputs[1].transpose(-1, -2) / math.sqrt(head_dim)
+    )
+    expected_probabilities = (
+        expected_logits + torch.full((seqlen, seqlen), -math.inf).triu(1)
+    ).softmax(-1)
+    (expected_probabilities @ expected_inputs[2]).backward(grad_output.double())
+
+    actual_query, actual_key, actual_value = (
+        tensor.requires_grad_()
+        for tensor in _fa4_place_qkv(query, key, value, layout, mojo_h100)
+    )
+    actual_inputs = (actual_query, actual_key, actual_value)
+    with _fa4_route_spy(monkeypatch) as calls:
+        output = torch.nn.functional.scaled_dot_product_attention(
+            *actual_inputs, is_causal=True
+        )
+        output.backward(grad_output.to(mojo_h100))
+
+    suffix = _FA4_DTYPE_SUFFIX[dtype]
+    variant = _FA4_LAYOUT_VARIANT[layout]
+    # The backward has no BHSD-native ABI: a contiguous BHSD forward is
+    # followed by the DENSE backward over the materialized BTHD buffers.
+    backward_variant = variant if variant == "_strided_qkv" else ""
+    assert calls == {
+        f"flash_attention_fwd_{suffix}_d{head_dim}_causal{variant}": 1,
+        f"flash_attention_bwd_{suffix}_d{head_dim}_causal{backward_variant}": 1,
+    }, f"unexpected FA4 route selection: {dict(calls)}"
+
+    grad_bound, value_grad_bound = _FA4_EXTREME_LOGIT_GRAD_BOUNDS[dtype, regime]
+    bounds = (grad_bound, grad_bound, value_grad_bound)
+    names = ("dQ", "dK", "dV")
+    for name, bound, actual, expected in zip(
+        names, bounds, actual_inputs, expected_inputs, strict=True
+    ):
+        assert actual.grad is not None
+        assert expected.grad is not None
+        error = actual.grad.cpu().double() - expected.grad
+        rms = float(error.pow(2).mean().sqrt())
+        assert rms <= bound, (
+            f"{name} rms {rms:.3e} exceeds the {regime} bound {bound:.3e}"
+        )
