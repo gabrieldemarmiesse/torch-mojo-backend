@@ -1211,6 +1211,9 @@ def test_pointer_ordinal_identifies_the_owning_gpu(mojo_gpu):
     """
     on_mojo = torch.zeros(8, device=mojo_gpu)
     assert isinstance(on_mojo, TorchMojoTensor)
+    if on_mojo._device.api != "cuda":
+        # tests/test_distributed.py covers hip_peer, the AMD counterpart.
+        pytest.skip("cuda_peer speaks the CUDA driver API only")
     torch_mojo_device_module.synchronize()
     assert cuda_peer.device_ordinal(on_mojo._ptr) is not None
     assert cuda_peer.device_ordinal(0) is None

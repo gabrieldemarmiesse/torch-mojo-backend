@@ -20,12 +20,16 @@ Concretely, the backend provides two things:
 
 You can see our benchmarks for the supported ops [here](https://html-preview.github.io/?url=https://github.com/gabrieldemarmiesse/torch-mojo-backend/raw/refs/heads/main/benchmarks/baselines.html). It can give you an idea of where we're fast and where we're not. We recently tried running nanogpt eager mode on H100, MI300X and Apple M4 on 2.5B tokens, with torch autocast, and we got the same loss curve as stock PyTorch, while being ~2% faster.
 
-Distributed training with DDP works on NVIDIA GPUs — single node and
-multi-node under torchrun, over NCCL — see [docs/distributed.md](docs/distributed.md).
+Distributed training with DDP works on NVIDIA and AMD GPUs — single node
+and multi-node under torchrun, over NCCL or RCCL — see
+[docs/distributed.md](docs/distributed.md). On AMD machines install the CPU
+wheel of torch (`--index-url https://download.pytorch.org/whl/cpu`): the
+CUDA wheel makes every first-use kernel load on HIP about 10x slower, and a
+ROCm wheel brings a second HIP runtime the collectives cannot serve.
 
 We don't support yet:
 * Using `torch.compile` with the mojo device, only the cuda device is supported for now. 
-* DDP on AMD/Apple (the NCCL-backed process group is NVIDIA-only for now).
+* DDP on Apple (the process group needs an NCCL-API library: NCCL or RCCL).
 * Many GPUs (prefer H100, MI300X and Apple M4)
 * Many ops
 * Other mojo versions than 1.0

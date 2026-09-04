@@ -1,4 +1,4 @@
-"""A c10d ProcessGroup for the mojo eager device, backed by NCCL.
+"""A c10d ProcessGroup for the mojo eager device, backed by NCCL or RCCL.
 
 Design (see docs/distributed.md for the full story):
 
@@ -9,6 +9,10 @@ Design (see docs/distributed.md for the full story):
   (``_get_object_coll_device`` falls back to "cpu" when ``_device_types`` is
   empty). Every override dispatches on the tensor's device type and delegates
   CPU tensors to a private ``ProcessGroupGloo``.
+
+- Collectives go through the NCCL C API — NCCL on NVIDIA, RCCL on AMD, one
+  ctypes binding for both (``distributed/nccl.py``). "NCCL" below means
+  whichever of the two the process loaded.
 
 - NCCL collectives run on a dedicated comm stream (a side stream,
   ``mojo_device/device_streams.py``) for compute/communication overlap: it
@@ -48,8 +52,9 @@ Design (see docs/distributed.md for the full story):
   ``_create_work_from_future``. Gradient scaling (/world_size) happens inside
   the Reducer before the collective, so ``allreduce`` here is a plain SUM.
 
-One process drives exactly one GPU (torchrun layout). Set
-``CUDA_VISIBLE_DEVICES`` per rank *before* MAX enumerates devices — see
+One process drives exactly one GPU (torchrun layout). Pin the visible GPU
+per rank *before* MAX enumerates devices (``CUDA_VISIBLE_DEVICES`` on NVIDIA,
+``ROCR_VISIBLE_DEVICES``/``HIP_VISIBLE_DEVICES`` on AMD) — see
 ``torch_mojo_backend.distributed.use_local_rank_gpu()``.
 """
 
@@ -83,7 +88,6 @@ from torch.distributed import PrefixStore, Store, Work
 from torch_mojo_backend.distributed import nccl
 from torch_mojo_backend.mojo_device import (
     comm_fence,
-    cuda_peer,
     deferred_compile,
     torch_mojo_device_module,
 )
@@ -115,7 +119,7 @@ def _nccl_dtype(dtype: torch.dtype) -> int:
     try:
         return _NCCL_DTYPE_OF[dtype]
     except KeyError:
-        raise TypeError(f"dtype {dtype} is not supported by the mojo NCCL backend")
+        raise TypeError(f"dtype {dtype} is not supported by the mojo NCCL/RCCL backend")
 
 
 def _nccl_red_op(op: ReduceOp | ReduceOp.RedOpType) -> int:
@@ -130,7 +134,7 @@ def _nccl_red_op(op: ReduceOp | ReduceOp.RedOpType) -> int:
     if op == ReduceOp.AVG:
         return nccl.NCCL_AVG
     raise NotImplementedError(
-        f"ReduceOp {op} is not supported by the mojo NCCL backend"
+        f"ReduceOp {op} is not supported by the mojo NCCL/RCCL backend"
     )
 
 
@@ -178,7 +182,7 @@ def _loud(fn: Callable[..., Work]) -> Callable[..., Work]:
 
 
 class MojoProcessGroup(dist.ProcessGroup):
-    """NCCL-backed process group for ``mojo`` tensors, gloo for CPU tensors."""
+    """NCCL/RCCL-backed process group for ``mojo`` tensors, gloo for CPU tensors."""
 
     def __init__(
         self, store: Store, rank: int, world_size: int, timeout: datetime.timedelta
@@ -193,9 +197,12 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._store = store
         self._timeout = timeout
         self._group_name = ""
-        # NCCL communicators keyed by mojo device index, created lazily at the
+        # Communicators keyed by mojo device index, created lazily at the
         # first device collective (a collective, blocking rendezvous — every
         # rank reaches it in the same order because collectives are SPMD).
+        # The library (NCCL or RCCL) is chosen then too, from the device api
+        # of the first mojo tensor seen: one process drives one GPU vendor.
+        self._ccl: nccl.CclLibrary | None = None
         self._comms: dict[int, nccl.NcclComm] = {}
         self._streams: dict[int, int] = {}
         self._max_devices: dict[int, Device] = {}
@@ -260,30 +267,38 @@ class MojoProcessGroup(dist.ProcessGroup):
                 get_stream(max_device, "nccl").synchronize()
             comm_fence.discard(index)
 
-    def _ensure_device_current(self, ordinal: int):
-        # NCCL resolves the target GPU from the thread-current CUDA context,
-        # and DDP calls us from the autograd thread while init usually runs on
-        # the main thread — so re-assert per thread, once.
+    def _ensure_device_current(self, api: str, ordinal: int):
+        # Both libraries resolve the target GPU from per-thread runtime state
+        # (the current CUDA context, the current HIP device), and DDP calls us
+        # from the autograd thread while init usually runs on the main thread
+        # — so re-assert per thread, once.
         if getattr(self._device_current, "ordinal", None) != ordinal:
-            nccl.set_current_cuda_device(ordinal)
+            nccl.set_current_device(api, ordinal)
             self._device_current.ordinal = ordinal
 
     def _device_state(self, tensor: torch.Tensor) -> tuple[nccl.NcclComm, int, int]:
-        """(communicator, default-stream CUstream, device index) for a tensor."""
+        """(communicator, default-stream native handle, device index) for a tensor."""
         index = tensor.device.index
         if index is None:
             index = torch_mojo_device_module.current_device()
-        ordinal = cuda_peer.device_ordinal(_ptr_of(tensor))
+        assert isinstance(tensor, TorchMojoTensor)  # _is_cpu classified it
+        api = tensor._device.api
+        # Which physical GPU owns the allocation is read off the POINTER
+        # (cuda_peer / hip_peer), never assumed from an ordinal.
+        ordinal = nccl.device_ordinal(api, _ptr_of(tensor))
         if ordinal is None:
             raise RuntimeError(
-                "could not resolve the CUDA ordinal of a mojo tensor; the mojo "
-                "NCCL backend currently supports NVIDIA GPUs only"
+                "could not resolve which GPU owns a mojo tensor (device api "
+                f"{api!r}); the mojo distributed backend supports NVIDIA (NCCL) "
+                "and AMD (RCCL) GPUs"
             )
-        self._ensure_device_current(ordinal)
+        self._ensure_device_current(api, ordinal)
         with self._comm_lock:
             comm = self._comms.get(index)
             if comm is None:
-                comm = self._init_comm(index, ordinal)
+                if self._ccl is None:
+                    self._ccl = nccl.load(api)
+                comm = self._init_comm(index)
                 self._comms[index] = comm
                 max_device = find_equivalent_max_device(torch.device("mojo", index))
                 self._max_devices[index] = max_device
@@ -328,10 +343,11 @@ class MojoProcessGroup(dist.ProcessGroup):
     def _fence_default(self, index: int):
         """Drain, and order the default stream after the comm stream.
 
-        NCCL requires every rank to EXECUTE a communicator's operations in
-        issue order. When comm-stream and default-stream collectives mix,
-        this fence keeps device execution order equal to issue order. (The
-        reverse direction is ``wait_default_stream`` in ``_stream_work``.)
+        NCCL and RCCL require every rank to EXECUTE a communicator's
+        operations in issue order. When comm-stream and default-stream
+        collectives mix, this fence keeps device execution order equal to
+        issue order. (The reverse direction is ``wait_default_stream`` in
+        ``_stream_work``.)
         Unconditional, unlike ``comm_fence``: a comm-stream collective no
         consumer has touched yet is still pending on the device.
         """
@@ -340,17 +356,20 @@ class MojoProcessGroup(dist.ProcessGroup):
             get_stream(self._max_devices[index], "nccl").make_default_stream_wait()
             comm_fence.discard(index)
 
-    def _init_comm(self, index: int, ordinal: int) -> nccl.NcclComm:
+    def _init_comm(self, index: int) -> nccl.NcclComm:
+        assert self._ccl is not None  # loaded by _device_state
         key = f"nccl-uid-{self._comm_seq}"
         self._comm_seq += 1
         if self.rank() == 0:
-            unique_id = nccl.get_unique_id()
+            unique_id = self._ccl.get_unique_id()
             self._store.set(key, unique_id)  # ty: ignore[invalid-argument-type] -- the stub says str; the binding takes bytes too
         else:
             unique_id = bytes(self._store.get(key))
             if len(unique_id) != nccl.NCCL_UNIQUE_ID_BYTES:
-                raise RuntimeError(f"bad NCCL unique id from store key {key}")
-        return nccl.NcclComm.init_rank(self.size(), unique_id, self.rank())
+                raise RuntimeError(
+                    f"bad {self._ccl.name} unique id from store key {key}"
+                )
+        return self._ccl.init_rank(self.size(), unique_id, self.rank())
 
     def _drained(self):
         """Launch every queued mojo kernel so the stream sees all producers."""
@@ -371,7 +390,7 @@ class MojoProcessGroup(dist.ProcessGroup):
             "hip",
         ):
             # mojo:<last> is MAX's host device (device_count counts it too);
-            # NCCL cannot touch host memory and gloo cannot touch mojo
+            # NCCL/RCCL cannot touch host memory and gloo cannot touch mojo
             # wrappers, so refuse loudly rather than guess.
             raise NotImplementedError(
                 "collectives on the mojo host device are not supported; use a "
@@ -426,12 +445,12 @@ class MojoProcessGroup(dist.ProcessGroup):
         staged = [self._dense(t) for t in tensors]
 
         def enqueue(handle: int):
-            nccl.group_start()
+            comm.group_start()
             for s in staged:
                 comm.all_reduce(
                     _ptr_of(s), _ptr_of(s), s.numel(), _nccl_dtype(s.dtype), op, handle
                 )
-            nccl.group_end()
+            comm.group_end()
 
         if all(s is t for s, t in zip(staged, tensors)):
             work = self._stream_work(index, tensors, tuple(tensors), enqueue)
@@ -594,7 +613,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         staged_out = [self._dense(t) for t in output_tensors]
 
         def enqueue(handle: int):
-            nccl.group_start()
+            comm.group_start()
             for source, dest in zip(staged_in, staged_out):
                 comm.all_gather(
                     _ptr_of(source),
@@ -603,7 +622,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                     _nccl_dtype(source.dtype),
                     handle,
                 )
-            nccl.group_end()
+            comm.group_end()
 
         if all(s is t for s, t in zip(staged_out, output_tensors)):
             work = self._stream_work(
@@ -707,7 +726,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         staged_out = [self._dense(t) for t in output_tensors]
 
         def enqueue(handle: int):
-            nccl.group_start()
+            comm.group_start()
             for source, dest in zip(staged_in, staged_out):
                 comm.reduce_scatter(
                     _ptr_of(source),
@@ -717,7 +736,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                     op,
                     handle,
                 )
-            nccl.group_end()
+            comm.group_end()
 
         if all(s is t for s, t in zip(staged_out, output_tensors)):
             work = self._stream_work(
@@ -756,7 +775,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         dtype = _nccl_dtype(source.dtype)
         comm, stream, index = self._device_state(source)
         self._fence_default(index)
-        nccl.group_start()
+        comm.group_start()
         send_offset = 0
         recv_offset = 0
         itemsize = source.element_size()
@@ -775,7 +794,7 @@ class MojoProcessGroup(dist.ProcessGroup):
             )
             send_offset += send_count
             recv_offset += recv_count
-        nccl.group_end()
+        comm.group_end()
         if dest is not output_tensor:
             output_tensor.copy_(dest)
         return _completed_work([output_tensor])
@@ -793,7 +812,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         staged_in = [self._dense(t) for t in input_tensors]
         staged_out = [self._dense(t) for t in output_tensors]
         self._fence_default(index)
-        nccl.group_start()
+        comm.group_start()
         for peer in range(self.size()):
             source = staged_in[peer]
             dest = staged_out[peer]
@@ -803,7 +822,7 @@ class MojoProcessGroup(dist.ProcessGroup):
             comm.recv(
                 _ptr_of(dest), dest.numel(), _nccl_dtype(dest.dtype), peer, stream
             )
-        nccl.group_end()
+        comm.group_end()
         for original, s in zip(output_tensors, staged_out):
             if s is not original:
                 original.copy_(s)
@@ -830,20 +849,20 @@ class MojoProcessGroup(dist.ProcessGroup):
             outputs[root].copy_(source.view(outputs[root].shape))
             staged_out = [self._dense(t) for t in outputs]
             self._fence_default(index)
-            nccl.group_start()
+            comm.group_start()
             for peer, dest in enumerate(staged_out):
                 if peer != root:
                     comm.recv(_ptr_of(dest), dest.numel(), dtype, peer, stream)
-            nccl.group_end()
+            comm.group_end()
             for original, s in zip(outputs, staged_out):
                 if s is not original:
                     original.copy_(s)
             result = outputs
         else:
             self._fence_default(index)
-            nccl.group_start()
+            comm.group_start()
             comm.send(_ptr_of(source), source.numel(), dtype, root, stream)
-            nccl.group_end()
+            comm.group_end()
         return _completed_work(result)
 
     @_loud
@@ -863,16 +882,16 @@ class MojoProcessGroup(dist.ProcessGroup):
             sources = [self._dense(t) for t in input_tensors[0]]
             output_tensors[0].copy_(sources[root].view(output_tensors[0].shape))
             self._fence_default(index)
-            nccl.group_start()
+            comm.group_start()
             for peer, source in enumerate(sources):
                 if peer != root:
                     comm.send(_ptr_of(source), source.numel(), dtype, peer, stream)
-            nccl.group_end()
+            comm.group_end()
         else:
             self._fence_default(index)
-            nccl.group_start()
+            comm.group_start()
             comm.recv(_ptr_of(dest), dest.numel(), dtype, root, stream)
-            nccl.group_end()
+            comm.group_end()
             if dest is not output_tensors[0]:
                 output_tensors[0].copy_(dest)
         return _completed_work([output_tensors[0]])
@@ -951,34 +970,78 @@ def create_mojo_process_group(
     return MojoProcessGroup(store, rank, world_size, timeout)
 
 
+# NVIDIA has one visibility variable. AMD has two levels: ROCR_VISIBLE_DEVICES
+# masks at the HSA level and HIP_VISIBLE_DEVICES (or CUDA_VISIBLE_DEVICES, which
+# the HIP runtime reads as its fallback) indexes INTO the ROCR-visible set.
+_HSA_LEVEL = "ROCR_VISIBLE_DEVICES"
+_RUNTIME_LEVEL = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")
+
+
+def _visible_entries(var: str) -> list[str] | None:
+    """The comma list in `var`, or None when it is unset or empty."""
+    visible = os.environ.get(var)
+    if visible is None:
+        return None
+    entries = [entry.strip() for entry in visible.split(",") if entry.strip()]
+    return entries or None
+
+
+def _keep_local_rank_entry(var: str, entries: list[str], rank_index: int):
+    if len(entries) <= 1:
+        return  # already pinned, e.g. one srun task per GPU
+    if rank_index >= len(entries):
+        raise RuntimeError(
+            f"LOCAL_RANK={rank_index} but {var}={os.environ[var]!r} lists only "
+            f"{len(entries)} devices"
+        )
+    os.environ[var] = entries[rank_index]
+
+
 def use_local_rank_gpu():
-    """Pin this torchrun worker to its GPU via CUDA_VISIBLE_DEVICES.
+    """Pin this torchrun worker to its GPU via the vendor's visibility variable.
 
     Call as early as possible — before any mojo tensor is created and before
     MAX enumerates devices (enumeration is cached per process). With exactly
     one visible GPU per rank, ``mojo``/``mojo:0`` is always the right device,
     the phantom ``privateuseone:0`` TensorImpl index is always truthful, and
-    each process binds a single CUDA context.
+    each process binds a single CUDA context / HIP device.
 
-    SLURM (and other launchers) often pre-set CUDA_VISIBLE_DEVICES to the
-    whole allocation ("0,1,...,7"); in that case each rank keeps only its
-    LOCAL_RANK-th entry. A single already-pinned entry is left alone.
+    SLURM (and other launchers) often pre-set the visibility variable to the
+    whole allocation — ``CUDA_VISIBLE_DEVICES=0,...,7`` on NVIDIA,
+    ``ROCR_VISIBLE_DEVICES=0,...,3`` on AMD; in that case each rank keeps
+    only its LOCAL_RANK-th entry. A single already-pinned entry is left
+    alone (one srun task per GPU pins that way). When no variable is set at
+    all, both the CUDA and HIP ones are set to LOCAL_RANK, whichever runtime
+    turns out to be present.
+
+    Only one level is ever narrowed. When ``ROCR_VISIBLE_DEVICES`` is
+    present it is the level that gets the rank's entry, and any runtime-level
+    list (SLURM's gres plugin exports ``CUDA_VISIBLE_DEVICES`` next to it by
+    default) is rewritten to ``"0"``, the only index that exists in a
+    one-entry HSA set — narrowing both levels by rank would compose to no
+    visible GPU at all for every rank but 0.
     """
     local_rank = os.environ.get("LOCAL_RANK")
     if local_rank is None:
         return
-    rank_index = int(local_rank)
-    for var in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
-        visible = os.environ.get(var)
-        if visible is None:
-            os.environ[var] = local_rank
+    try:
+        rank_index = int(local_rank)
+    except ValueError:
+        raise RuntimeError(f"LOCAL_RANK={local_rank!r} is not an integer") from None
+    hsa = _visible_entries(_HSA_LEVEL)
+    if hsa is not None:
+        _keep_local_rank_entry(_HSA_LEVEL, hsa, rank_index)
+        for var in _RUNTIME_LEVEL:
+            if _visible_entries(var) is not None:
+                os.environ[var] = "0"
+        return
+    pinned = False
+    for var in _RUNTIME_LEVEL:
+        entries = _visible_entries(var)
+        if entries is None:
             continue
-        entries = [entry for entry in visible.split(",") if entry]
-        if len(entries) <= 1:
-            continue  # already pinned (or nothing to slice)
-        if rank_index >= len(entries):
-            raise RuntimeError(
-                f"LOCAL_RANK={rank_index} but {var}={visible!r} lists only "
-                f"{len(entries)} devices"
-            )
-        os.environ[var] = entries[rank_index]
+        _keep_local_rank_entry(var, entries, rank_index)
+        pinned = True
+    if not pinned:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank_index)
+        os.environ["HIP_VISIBLE_DEVICES"] = str(rank_index)

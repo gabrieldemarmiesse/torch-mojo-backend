@@ -1,4 +1,4 @@
-"""Distributed nanoGPT training on the mojo eager device (DDP over NCCL).
+"""Distributed nanoGPT training on the mojo eager device (DDP over NCCL/RCCL).
 
 Launch with torchrun — single node:
 
@@ -20,9 +20,11 @@ forward, backward, clip_grad_norm_, AdamW, zero_grad — under bf16 autocast.
 
 import os
 
-# One GPU per torchrun worker, decided before anything initializes CUDA/MAX
-# (slices a SLURM-style "0,1,...,7" CUDA_VISIBLE_DEVICES by LOCAL_RANK).
-# Optional so --device cuda works as a baseline in a stock-torch venv.
+# One GPU per torchrun worker, decided before anything initializes the GPU
+# runtime or MAX (slices a SLURM-style "0,1,...,7" CUDA_VISIBLE_DEVICES —
+# ROCR_VISIBLE_DEVICES on AMD — by LOCAL_RANK). Optional so --device cuda
+# works as a baseline in a stock-torch venv (CUDA or ROCm, which also calls
+# its devices "cuda").
 try:
     from torch_mojo_backend.distributed import use_local_rank_gpu
 
@@ -223,6 +225,16 @@ def main():
         log(f"saved checkpoint to {args.out_dir / 'ckpt.pt'}")
     dist.barrier()
     dist.destroy_process_group()
+    vmm = os.environ.get("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM", "").lower()
+    if device == "mojo" and vmm in ("1", "true", "yes", "on"):
+        # MAX's on-demand (VMM) device allocator is what makes an APU such as
+        # the MI300A usable with one rank per GPU (docs/distributed.md), but
+        # with MAX 26.5 + ROCm 6.4.3 the HSA runtime segfaults in its atexit
+        # teardown of the VMM mappings, after Python has finished. Everything
+        # above ran and was checkpointed; skip the C exit handlers.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
