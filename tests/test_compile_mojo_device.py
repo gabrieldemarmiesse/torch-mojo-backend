@@ -224,6 +224,63 @@ def test_compile_backward(mojo_device):
     torch.testing.assert_close(w.grad.cpu(), w_cpu.grad, rtol=2e-2, atol=2e-3)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "aten::softmax.int silently produces no gradient under torch.compile "
+        "on the mojo device -- pre-existing on main, not introduced by PR #401. "
+        "Root cause (confirmed by direct experiment, see PR body): NOT this "
+        "module's own DECOMPOSITION_TABLE.pop(aten.softmax) -- popping only "
+        "changes what aten_functions.py's own map_to sees; re-adding softmax.int "
+        "to DECOMPOSITION_TABLE still leaves the forward graph fed to fw_compiler "
+        "correctly decomposed into aten::_softmax, yet the SAME "
+        "autograd_not_implemented_fallback warning and empty backward still fire. "
+        "AOTAutograd separately runs the traced function through REAL autograd-key "
+        "resolution (to decide whether/how to build a backward node) before its "
+        "own make_fx decomposition pass ever applies our DECOMPOSITION_TABLE; that "
+        "resolution consults the process-wide dispatcher, which the EAGER backend "
+        "(torch_mojo_backend/mojo_device/mojo_device_aten_ops.py's PrivateUse1 "
+        "registration for aten::softmax.int, kept -- and its silent-no-gradient "
+        "failure mode fixed with a forward-time raise -- by PR #401) has already "
+        "told 'has a specific backend kernel, no AutogradPrivateUse1 kernel, do "
+        "not fall back to CompositeImplicitAutograd' -- for the WHOLE PROCESS, "
+        "compile path included. A real fix means the eager registration itself "
+        "exposing a working AutogradPrivateUse1 path (or an equivalent forward-time "
+        "guard reachable from the compile path), which risks the exact silent-"
+        "training PR #401 just closed and needs its own dedicated engagement, not "
+        "a fix folded into this regression test."
+    ),
+)
+def test_compile_softmax_backward_produces_a_gradient(mojo_device):
+    """torch.softmax's gradient must not silently vanish under torch.compile.
+
+    Currently xfail(strict=True): this is a real, tracked bug, not a skip --
+    see the xfail reason above for the root cause and why it needs its own
+    engagement rather than a fix here. PR #401's body claimed the compile path
+    was safe because "AOTAutograd decomposes these backwards"; that claim was
+    inaccurate for softmax specifically (narrowed via a follow-up edit to that
+    PR's description) and this test is what proves it, and will keep proving
+    it (as a hard xfail->fail promotion, since strict=True turns an
+    unexpected pass into a failure) once someone lands the real fix.
+    """
+
+    def fn(x):
+        return torch.softmax(x, -1).square().sum()
+
+    x = torch.randn(2, 5, device=mojo_device, requires_grad=True)
+    loss = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x)
+    loss.backward()
+    assert x.grad is not None, (
+        "torch.softmax's gradient vanished silently under torch.compile "
+        "(no exception, no traceback): aten::softmax.int escaped "
+        "AOTAutograd's decomposition and has no native derivative of its own"
+    )
+
+    x_cpu = x.detach().cpu().requires_grad_(True)
+    fn(x_cpu).backward()
+    torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
+
+
 def test_compile_recompiles_for_cpu_inputs(mojo_device):
     """The same compiled function serves mojo and cpu inputs (device guard)."""
 
