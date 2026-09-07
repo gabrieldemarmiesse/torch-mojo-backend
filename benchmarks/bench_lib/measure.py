@@ -47,6 +47,22 @@ Rules this module enforces (they were learned painfully):
   policy is sampled once per process and is then stable, so determinism
   across processes is owned by the core-clock pin in bench_lib/clock.py,
   applied by check.py around this module's timed region.
+* A handful of cases (large-batch bmm NT/TT, some tf32 addmm) are not just
+  noisy, they are BIMODAL: the stock leg's kernel-selection heuristic settles
+  on one of two algorithms and a run can sample bursts from either or both.
+  A short run that happens to land only in one mode reports a tight,
+  low-uncertainty ratio that still disagrees with an equally confident run
+  that landed in the other mode (see gemm-baselines-are-unreproducible).  The
+  ordinary noise/uncertainty machinery above cannot see this: it is built for
+  scatter around ONE center and, once enough bursts pile up in a single
+  mode, "converges" early on whichever mode got sampled first.  Detecting a
+  two-cluster (bimodal) split in the pair ratios and refusing to stop until
+  enough bursts have crossed it (BIMODAL_MAX_BURSTS, well past the ordinary
+  MAX_BURSTS) reports the population median across both modes instead of a
+  coin flip — a number that reproduces across process launches because the
+  long-run mode-mix is a property of the hardware/driver, not of when the
+  measurement happened to stop.  This costs extra bursts ONLY for cases that
+  actually show the pattern; the common unimodal case is unaffected.
 """
 
 from __future__ import annotations
@@ -96,6 +112,21 @@ ITERS_ESCALATION_CAP = 64  # bounds kineto event volume for fast kernels
 # left behind (observed: 26.7% stock-leg spread on S7 TN-bf16 without it).
 SETTLE_FRACTION = 2  # settle iters = burst iters // SETTLE_FRACTION, min 1
 
+# A bimodal split is a single dominant gap in the sorted pair ratios with
+# real samples (>= 2) settled on each side, distinguishing "two clusters"
+# from "one Gaussian-ish cluster with a long tail". Both conditions must
+# hold so ordinary noise is never misclassified as bimodal:
+#  - the gap must dwarf the spread WITHIN either side (a wide single cluster
+#    has gaps comparable to its own internal spacing, a real split does not)
+#  - the gap must be a real fraction of the median, so float jitter on an
+#    already-tiny number can never trip this
+BIMODAL_GAP_RATIO = 2.5
+BIMODAL_MIN_GAP_PCT = 5.0
+# Extended cap used only while a case keeps showing the bimodal signature;
+# ordinary noisy-but-unimodal cases still stop at MAX_BURSTS. Bounded so a
+# persistently bimodal case still terminates the suite in finite time.
+BIMODAL_MAX_BURSTS = 32
+
 # Device-event types torch.profiler may report kernels under: cuBLAS/rocBLAS
 # kernels land on DeviceType.CUDA; the mojo-device kernels are reported by
 # CUPTI under the PrivateUse1 backend.
@@ -120,6 +151,7 @@ class Measurement:
     bursts: int  # burst pairs actually sampled (adaptive, MIN..MAX)
     ours: LegTiming
     ref: LegTiming
+    bimodal: bool = False  # a two-cluster split was seen in the pair ratios
 
 
 @contextlib.contextmanager
@@ -194,6 +226,31 @@ def _robust_spread_pct(values: list[float]) -> float:
     return (hi - lo) / med * 100.0
 
 
+def _bimodal_split(values: list[float]) -> bool:
+    """True if `values` look like two tight clusters, not one noisy one.
+
+    Finds the single largest gap in the sorted samples and requires real
+    samples (>= 2) on each side, so one outlier burst cannot trip this. The
+    gap must also dominate the spread WITHIN either side (BIMODAL_GAP_RATIO)
+    and be a real fraction of the median (BIMODAL_MIN_GAP_PCT) — see the
+    module docstring and the constants' comments for why both are needed.
+    """
+    if len(values) < 4:
+        return False
+    s = sorted(values)
+    gaps = [b - a for a, b in zip(s, s[1:])]
+    i = max(range(len(gaps)), key=gaps.__getitem__)
+    left, right = s[: i + 1], s[i + 1 :]
+    if len(left) < 2 or len(right) < 2:
+        return False
+    gap = gaps[i]
+    within = max(left[-1] - left[0], right[-1] - right[0], 1e-12)
+    med = statistics.median(s)
+    return (
+        gap >= BIMODAL_GAP_RATIO * within and gap / med * 100.0 >= BIMODAL_MIN_GAP_PCT
+    )
+
+
 def _longer_iters(
     iters_now: int, ref_us: list[float], our_us: list[float]
 ) -> int | None:
@@ -250,6 +307,13 @@ def measure(
     spread = float("inf")
     uncertainty = float("inf")
     iters_now = iters
+    # Sticky latch, not a per-iteration recomputation: a two-cluster split is
+    # only detectable at a complete quartet (see _bimodal_split's >= 4
+    # requirement), so on the odd sample mid-quartet this must hold its last
+    # value rather than momentarily reporting False — otherwise the extended
+    # cap below collapses back to max_bursts one sample after being earned
+    # and the loop stops right past the ordinary cap regardless.
+    bimodal = False
     while True:
         # ABBA: flip which leg leads on every pair, so the lag between a
         # pair's two bursts alternates sign and a monotonic ramp cancels
@@ -264,10 +328,13 @@ def measure(
         spread = _robust_spread_pct(pair_ratios)
         uncertainty = spread / math.sqrt(len(pair_ratios))
         complete_quartets = len(pair_ratios) % 2 == 0
+        if complete_quartets:
+            bimodal = bimodal or _bimodal_split(pair_ratios)
         if (
             len(pair_ratios) >= min_bursts
             and complete_quartets
             and uncertainty <= target_uncertainty_pct
+            and not bimodal
         ):
             break
         if len(pair_ratios) >= min_bursts and complete_quartets:
@@ -276,13 +343,19 @@ def measure(
                 # Short noisy bursts: lengthen them so each one averages a
                 # whole throttle cycle, and restart sampling — the short
                 # bursts sampled single clock states and would poison the
-                # median.
+                # median. Fresh burst length, fresh bimodality read.
                 iters_now = longer
                 ref_us.clear()
                 our_us.clear()
                 pair_ratios.clear()
+                bimodal = False
                 continue
-        if len(pair_ratios) >= max_bursts:
+        # A confirmed bimodal split gets a much bigger burst budget than
+        # ordinary noise: it needs enough draws to cross BOTH clusters
+        # before the median means anything (see the module docstring). Every
+        # other case is unaffected and still stops at max_bursts.
+        cap = BIMODAL_MAX_BURSTS if bimodal else max_bursts
+        if len(pair_ratios) >= cap:
             break
     return Measurement(
         statistics.median(pair_ratios),
@@ -291,6 +364,7 @@ def measure(
         len(pair_ratios),
         _leg(our_us),
         _leg(ref_us),
+        bimodal,
     )
 
 
