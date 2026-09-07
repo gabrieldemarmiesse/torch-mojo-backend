@@ -9256,6 +9256,38 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "upsample_nearest2d": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N2xC3x256x256_x2": {
+                  "layouts": {
+                    "contig": 3.789
+                  }
+                },
+                "N8xC64x56x56_x2": {
+                  "layouts": {
+                    "contig": 4.457
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2xC3x256x256_x2": {
+                  "layouts": {
+                    "contig": 3.79
+                  }
+                },
+                "N8xC64x56x56_x2": {
+                  "layouts": {
+                    "contig": 4.002
+                  }
+                }
+              }
+            }
+          }
+        },
         "var.correction": {
           "dtypes": {
             "bf16": {
