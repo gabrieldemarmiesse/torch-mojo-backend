@@ -8168,6 +8168,38 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "native_batch_norm_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 2.958
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 11.846
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 2.649
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 11.676
+                  }
+                }
+              }
+            }
+          }
+        },
         "native_dropout": {
           "dtypes": {
             "f32": {
@@ -8230,6 +8262,38 @@ document.addEventListener("DOMContentLoaded", boot);
                 "N8xC256xH14xW14_G32": {
                   "layouts": {
                     "contig": 0.466
+                  }
+                }
+              }
+            }
+          }
+        },
+        "native_group_norm_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64xH56xW56_G32": {
+                  "layouts": {
+                    "contig": 3.977
+                  }
+                },
+                "N8xC256xH14xW14_G32": {
+                  "layouts": {
+                    "contig": 3.203
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC64xH56xW56_G32": {
+                  "layouts": {
+                    "contig": 2.695
+                  }
+                },
+                "N8xC256xH14xW14_G32": {
+                  "layouts": {
+                    "contig": 2.924
                   }
                 }
               }
