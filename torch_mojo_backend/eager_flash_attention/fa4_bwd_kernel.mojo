@@ -43,6 +43,7 @@ or finite next-batch garbage, both annihilated by P=dS=0). All
 q/k/v/o/do/dq/dk/dv tensors are contiguous (B, S, H, D) bf16.
 """
 
+from std.builtin.simd import FastMathFlag
 from std.math import exp2, tanh
 from std.math.constants import log2e
 from std.utils.numerics import inf
@@ -922,8 +923,17 @@ def bwd_main_kernel[
                 comptime for ic in range(4):
                     comptime c: Int = cc * 4 + ic
                     comptime j: Int = c & 1
+                    # Rounded product, then subtract the rounded lse,
+                    # kept in step with the live branch below. DORMANT:
+                    # no exported FA4 entry instantiates softcap_on, so
+                    # this expression is never compiled into a shipping
+                    # kernel and no test or PTX guard covers it. It is
+                    # changed only so the two branches cannot drift.
                     s_reg.ptr[c] = exp2(
-                        s_reg.ptr[c].fma(scale_log2, -lp2c[j])
+                        s_reg.ptr[c].fma[FastMathFlag.NONE](
+                            scale_log2, Scalar[accum_type](0)
+                        )
+                        - lp2c[j]
                     )
             comptime for c in range(c_frag_sdp):
                 dp_reg.ptr[c] = s_reg.ptr[c] * dp_reg.ptr[c]
@@ -946,8 +956,23 @@ def bwd_main_kernel[
                             scale_log2, -lp2[j]
                         )
                     else:
+                        # Round the scaled score before subtracting the
+                        # lse, matching the forward (see
+                        # fa4_fwd_kernel.mojo). The justification HERE is
+                        # fwd/bwd CONSISTENCY, not the forward's
+                        # p_max == 1 cancellation: backward subtracts a
+                        # rounded lse, never a rowmax, so no exact
+                        # winner-zero is available either way. The
+                        # forward now defines its softmax over
+                        # RN32(s * scale_log2), so the recompute must
+                        # rebuild P from those same rounded scores or it
+                        # differentiates a different softmax than the one
+                        # whose output and LSE were saved.
                         s_reg.ptr[c] = exp2(
-                            s_reg.ptr[c].fma(scale_log2, -lp2[j])
+                            s_reg.ptr[c].fma[FastMathFlag.NONE](
+                                scale_log2, Scalar[accum_type](0)
+                            )
+                            - lp2[j]
                         )
 
             # dP^T retired (wait 0: nothing else in flight — FA4's

@@ -52,7 +52,10 @@ register buffer keeps the register count near FA4's target; there is no
 producer warpgroup left to deallocate registers for via setmaxnreg.
 
 The exp2 uses the scaled-domain trick: rowmax is kept premultiplied
-by softmax_scale*log2(e) so P = exp2(fma(s, scale_log2, -m)).
+by softmax_scale*log2(e) so P = exp2(round(s*scale_log2) - m). The
+product is rounded on its own instead of being fused with the
+subtraction, so p_max is exactly 1.0 at any logit magnitude; see the
+comment at the P loop.
 
 Grid: (ceildiv(seqlen, BM), nheads, batch). Block: 128 threads.
 
@@ -63,6 +66,7 @@ straight indexwise cast is correct. (With >1 m_mma it would not be:
 the RS wgmma walks fragments k-major, `a_frags[m + k*num_m]`.)
 """
 
+from std.builtin.simd import FastMathFlag
 from std.math import exp2, log, tanh
 from std.math.constants import log2e
 from std.sys import size_of
@@ -868,8 +872,13 @@ def fwd_fa4_selfload_kernel[
             comptime for c in range(c_frag_size_qk):
                 comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
                 comptime part: Int = (c // 4) % RED_WAYS
+                # Rounded product minus the rounded rowmax, so p_max is
+                # exactly 1.0 (see fa4_fwd_kernel.mojo).
                 var p: Scalar[accum_type] = exp2(
-                    s_reg.ptr[c].fma(scale_log2, -rowmax[row_idx])
+                    s_reg.ptr[c].fma[FastMathFlag.NONE](
+                        scale_log2, Scalar[accum_type](0)
+                    )
+                    - rowmax[row_idx]
                 )
                 s_reg.ptr[c] = p
                 part_sum[row_idx * RED_WAYS + part] += p
@@ -887,8 +896,13 @@ def fwd_fa4_selfload_kernel[
                 local_sum[i] = Scalar[accum_type](0)
             comptime for c in range(c_frag_size_qk):
                 comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
+                # Rounded product minus the rounded rowmax, so p_max is
+                # exactly 1.0 (see fa4_fwd_kernel.mojo).
                 var p: Scalar[accum_type] = exp2(
-                    s_reg.ptr[c].fma(scale_log2, -rowmax[row_idx])
+                    s_reg.ptr[c].fma[FastMathFlag.NONE](
+                        scale_log2, Scalar[accum_type](0)
+                    )
+                    - rowmax[row_idx]
                 )
                 s_reg.ptr[c] = p
                 local_sum[row_idx] += p

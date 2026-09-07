@@ -23,7 +23,10 @@ single P register buffer keeps the consumer register count near
 FA4's 168/thread; producer deallocates to 24 regs via setmaxnreg.
 
 The exp2 uses the scaled-domain trick: rowmax is kept premultiplied
-by softmax_scale*log2(e) so P = exp2(fma(s, scale_log2, -m)).
+by softmax_scale*log2(e) so P = exp2(round(s*scale_log2) - m). The
+product is rounded on its own instead of being fused with the
+subtraction, so p_max is exactly 1.0 at any logit magnitude; see the
+comment at the P loop.
 
 Grid: (ceildiv(seqlen, BM), nheads, batch). Block: 384 threads.
 
@@ -34,6 +37,7 @@ straight indexwise cast is correct. (With >1 m_mma it would not be:
 the RS wgmma walks fragments k-major, `a_frags[m + k*num_m]`.)
 """
 
+from std.builtin.simd import FastMathFlag
 from std.math import exp2, log, tanh
 from std.math.constants import log2e
 from std.sys import size_of
@@ -820,8 +824,33 @@ def fwd_fa4_kernel[
             comptime for c in range(c_frag_size_qk):
                 comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
                 comptime part: Int = (c // 4) % RED_WAYS
+                # Round the scaled score BEFORE subtracting the rowmax
+                # (which is itself the rounded scaled max): the winning
+                # element's exponent is then exactly zero and p_max is
+                # exactly 1.0, so the 16-bit P-packing error on the
+                # dominant entry cancels against the f32 rowsum instead
+                # of biasing numerator against denominator. A single
+                # fma(s, scale_log2, -rowmax) keeps the product EXACT
+                # while rowmax is rounded, leaving a residual bounded by
+                # half an f32 ulp of |s * scale_log2| -- an envelope
+                # that widens with each binade of the scaled logit
+                # (2026-08 nanoGPT layer-1 attention-collapse incident:
+                # |scaled logit| ~ 7e4, half-ulp ~3.9e-3, i.e. up to
+                # ~0.27% displacement of the dominant probability, and
+                # 16x cuda flash's saturated-row rms).
+                #
+                # The spelling is load bearing. `s * scale_log2 - rowmax`
+                # is contracted straight back into the defective fma;
+                # FastMathFlag.NONE asks for the strict, non-contracted
+                # form. Verified non-contracted on Mojo 1.0.0 (ed45d567)
+                # for sm_90a -- and kept verified by the PTX guard in
+                # tests/test_fa4_rounded_product_ptx.py, which fails if
+                # any FA4 exp2 input is ever produced by an fma again.
                 var p: Scalar[accum_type] = exp2(
-                    s_reg.ptr[c].fma(scale_log2, -rowmax[row_idx])
+                    s_reg.ptr[c].fma[FastMathFlag.NONE](
+                        scale_log2, Scalar[accum_type](0)
+                    )
+                    - rowmax[row_idx]
                 )
                 s_reg.ptr[c] = p
                 part_sum[row_idx * RED_WAYS + part] += p
@@ -839,8 +868,13 @@ def fwd_fa4_kernel[
                 local_sum[i] = Scalar[accum_type](0)
             comptime for c in range(c_frag_size_qk):
                 comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
+                # Rounded product minus the rounded rowmax, so p_max is
+                # exactly 1.0 (rationale at the TREE_REDUCE site above).
                 var p: Scalar[accum_type] = exp2(
-                    s_reg.ptr[c].fma(scale_log2, -rowmax[row_idx])
+                    s_reg.ptr[c].fma[FastMathFlag.NONE](
+                        scale_log2, Scalar[accum_type](0)
+                    )
+                    - rowmax[row_idx]
                 )
                 s_reg.ptr[c] = p
                 local_sum[row_idx] += p
