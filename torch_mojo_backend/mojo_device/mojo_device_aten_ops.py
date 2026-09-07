@@ -77,6 +77,12 @@ from torch_mojo_backend.mojo_device.aten_ops.inplace import (
 from torch_mojo_backend.mojo_device.aten_ops.reductions import (
     mojo_device_min_dim,
     mojo_device_min_dim_min,
+    mojo_device_sort,
+    mojo_device_sort_stable,
+    mojo_device_sort_values,
+    mojo_device_sort_values_stable,
+    mojo_device_topk,
+    mojo_device_topk_values,
 )
 from torch_mojo_backend.mojo_device.aten_ops.rng import mojo_device_normal_
 from torch_mojo_backend.mojo_device.aten_ops.streams import mojo_device_record_stream
@@ -404,6 +410,10 @@ _register_fast("aten::sin", "fast_aten_sin")
 _register_fast("aten::sinh", "fast_aten_sinh")
 _register_fast("aten::slice.Tensor", "fast_aten_slice")
 register_aten_op("aten::softmax.int")(mojo_device_softmax)
+register_aten_op("aten::sort")(mojo_device_sort)
+register_aten_op("aten::sort.stable")(mojo_device_sort_stable)
+register_aten_op("aten::sort.values")(mojo_device_sort_values)
+register_aten_op("aten::sort.values_stable")(mojo_device_sort_values_stable)
 _register_fast("aten::split_with_sizes", "fast_aten_split_with_sizes")
 _register_fast("aten::split.Tensor", "fast_aten_split")
 _register_fast("aten::sqrt", "fast_aten_sqrt")
@@ -415,6 +425,8 @@ _register_fast("aten::sum.dim_IntList", "fast_aten_sum")
 _register_fast("aten::t", "fast_aten_t")
 _register_fast("aten::tan", "fast_aten_tan")
 register_aten_op("aten::tanh")(mojo_device_tanh)
+register_aten_op("aten::topk")(mojo_device_topk)
+register_aten_op("aten::topk.values")(mojo_device_topk_values)
 _register_fast("aten::transpose.int", "fast_aten_transpose")
 _register_fast("aten::tril", "fast_aten_tril")
 _register_fast("aten::triu", "fast_aten_triu")
