@@ -25,9 +25,6 @@ from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, pow
-from std.python import PythonObject
-from std.python._cpython import PyObjectPtr, Py_ssize_t
-from std.python.bindings import PythonModuleBuilder
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
@@ -36,6 +33,8 @@ from max.algorithm import elementwise
 from std.utils import IndexList
 
 from op_utils import (
+    Arg,
+    Argv,
     GS_THREADS,
     MAX_RANK,
     _bw_flat_blocks,
@@ -49,19 +48,19 @@ from op_utils import (
     _raw_dtype_int,
     _raw_f64,
     _raw_int,
-    _raw_ret_none,
     _raw_tuple_int,
     _spec_dispatcher3,
     _spec_ptr,
-    _spec_unsupported,
     custom_remainder,
 )
 
 from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
     _dtype_arg_abi_on,
     _dtype_arg_on,
     _op_on,
-    _register_call,
+    _tmb_entry_error,
 )
 
 
@@ -884,11 +883,11 @@ def _bitwise_not[
 
 
 def _bitwise_not_go(
-    out_ptr: PyObjectPtr,
-    in_ptr: PyObjectPtr,
-    numel: PyObjectPtr,
-    dtype: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    in_ptr: Arg,
+    numel: Arg,
+    dtype: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var dtype_val = _raw_dtype_int(dtype)
     var out_addr = _raw_int(out_ptr)
@@ -915,23 +914,15 @@ def _bitwise_not_go(
         )
 
 
-def _bitwise_not_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _bitwise_not_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _bitwise_not_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _bitwise_not_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -975,14 +966,14 @@ def _isin[
 
 
 def _isin_go(
-    out_ptr: PyObjectPtr,
-    el_ptr: PyObjectPtr,
-    te_ptr: PyObjectPtr,
-    el_numel: PyObjectPtr,
-    te_numel: PyObjectPtr,
-    invert: PyObjectPtr,
-    dtype: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    el_ptr: Arg,
+    te_ptr: Arg,
+    el_numel: Arg,
+    te_numel: Arg,
+    invert: Arg,
+    dtype: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var dtype_val = _raw_dtype_int(dtype)
     var out_addr = _raw_int(out_ptr)
@@ -1011,26 +1002,18 @@ def _isin_go(
         raise Error("unsupported dtype for fast isin: " + String(dtype_val))
 
 
-def _isin_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _isin_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _isin_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _isin_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1075,15 +1058,15 @@ def _clamp_scalar[
 
 
 def _clamp_scalar_go(
-    out_ptr: PyObjectPtr,
-    in_ptr: PyObjectPtr,
-    lo: PyObjectPtr,
-    hi: PyObjectPtr,
-    has_min: PyObjectPtr,
-    has_max: PyObjectPtr,
-    numel: PyObjectPtr,
-    dtype: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    in_ptr: Arg,
+    lo: Arg,
+    hi: Arg,
+    has_min: Arg,
+    has_max: Arg,
+    numel: Arg,
+    dtype: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var dtype_val = _raw_dtype_int(dtype)
     var out_addr = _raw_int(out_ptr)
@@ -1123,27 +1106,19 @@ def _clamp_scalar_go(
         raise Error("unsupported dtype for fast clamp: " + String(dtype_val))
 
 
-def _clamp_scalar_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _clamp_scalar_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _clamp_scalar_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _clamp_scalar_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1278,14 +1253,14 @@ def _ternary_bcast[
 def _ternary_bcast_go[
     op_code: Int
 ](
-    out_ptr: PyObjectPtr,
-    a_ptr: PyObjectPtr,
-    b_ptr: PyObjectPtr,
-    c_ptr: PyObjectPtr,
-    params: PyObjectPtr,  # (d0..d3, as0..as3, bs0..bs3, cs0..cs3)
-    value: PyObjectPtr,
-    dtype: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    a_ptr: Arg,
+    b_ptr: Arg,
+    c_ptr: Arg,
+    params: Arg,  # (d0..d3, as0..as3, bs0..bs3, cs0..cs3)
+    value: Arg,
+    dtype: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var dtype_val = _raw_dtype_int(dtype)
     var out_addr = _raw_int(out_ptr)
@@ -1359,28 +1334,18 @@ def _ternary_bcast_go[
         raise Error("unsupported dtype for fast addc* op: " + String(dtype_val))
 
 
-def _ternary_bcast_dispatcher[
-    op_code: Int
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _ternary_bcast_go[op_code](
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _ternary_bcast_dispatcher[op_code: Int](argv: Argv, argc: Int) raises:
+    var args = argv
+    _ternary_bcast_go[op_code](
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1524,15 +1489,15 @@ def _addr_bcast[
 
 
 def _addr_bcast_go(
-    out_ptr: PyObjectPtr,
-    a_ptr: PyObjectPtr,
-    b_ptr: PyObjectPtr,
-    c_ptr: PyObjectPtr,
-    params: PyObjectPtr,  # (n, m, as0, as1, bs0, cs0)
-    beta: PyObjectPtr,
-    alpha: PyObjectPtr,
-    dtype: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    a_ptr: Arg,
+    b_ptr: Arg,
+    c_ptr: Arg,
+    params: Arg,  # (n, m, as0, as1, bs0, cs0)
+    beta: Arg,
+    alpha: Arg,
+    dtype: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var dtype_val = _raw_dtype_int(dtype)
     var out_addr = _raw_int(out_ptr)
@@ -1578,27 +1543,19 @@ def _addr_bcast_go(
         raise Error("unsupported dtype for fast addr op: " + String(dtype_val))
 
 
-def _addr_bcast_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _addr_bcast_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _addr_bcast_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _addr_bcast_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1622,9 +1579,7 @@ comptime SPEC_BCAST_DTYPES = [
 ]
 
 
-def _add_f32_bf16_spec_into_go(
-    a_o: PyObjectPtr, b_o: PyObjectPtr, out_o: PyObjectPtr
-) raises:
+def _add_f32_bf16_spec_into_go(a_o: Arg, b_o: Arg, out_o: Arg) raises:
     """Contiguous FP32 + BF16 -> caller-allocated FP32."""
     ref a = _spec_ptr(a_o)[]
     ref b = _spec_ptr(b_o)[]
@@ -1669,7 +1624,7 @@ def _add_f32_bf16_spec_into_go(
 
 def _binary_spec_into_go[
     op_code: Int, is_cmp: Bool
-](a_o: PyObjectPtr, b_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+](a_o: Arg, b_o: Arg, out_o: Arg) raises:
     """Launch into a caller-allocated contiguous output. Python owns
     allocation and shape math, so the call returns nothing and can hold a
     FIFO slot while its unit builds."""
@@ -1798,227 +1753,142 @@ def _binary_spec_into_go[
 
 
 @export
-def PyInit_logic_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("logic_ops")
         comptime if _op_on["AddF32Bf16Spec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[_add_f32_bf16_spec_into_go, "AddF32Bf16Spec"],
-                docstring=(
-                    "(a_spec, b_spec, out_spec); contiguous FP32 + BF16 -> FP32"
-                ),
+            _spec_dispatcher3[_add_f32_bf16_spec_into_go, "AddF32Bf16Spec"](
+                argv, argc
             )
+            return 0
         comptime if _op_on["AddSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_ADD, False], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); + ",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_ADD, False], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["SubSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_SUB, False], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); - ",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_SUB, False], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["MulSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_MUL, False], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); * ",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_MUL, False], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["DivSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_DIV, False], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); / float",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_DIV, False], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["MaximumSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_MAX, False], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); max",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_MAX, False], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["MinimumSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_MIN, False], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); min",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_MIN, False], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["PowSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_POW, False], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); ** float",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_POW, False], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["RemainderSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_REMAINDER, False],
-                    "a binary spec op",
-                ],
-                docstring="(a_spec, b_spec, out_spec); %",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_REMAINDER, False],
+                "a binary spec op",
+            ](argv, argc)
+            return 0
         comptime if _op_on["FloorDivSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_FLOORDIV, False],
-                    "a binary spec op",
-                ],
-                docstring="(a_spec, b_spec, out_spec); //",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_FLOORDIV, False],
+                "a binary spec op",
+            ](argv, argc)
+            return 0
         comptime if _op_on["TruncDivSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_TRUNCDIV, False],
-                    "a binary spec op",
-                ],
-                docstring="(a_spec, b_spec, out_spec); trunc(a / b)",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_TRUNCDIV, False],
+                "a binary spec op",
+            ](argv, argc)
+            return 0
         comptime if _op_on["BitwiseAndSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_AND, False], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); & int/bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_AND, False], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["BitwiseOrSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_OR, False], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); | int/bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_OR, False], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["BitwiseXorSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[BOP_XOR, False], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); ^ int/bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_XOR, False], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["EqSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[COP_EQ, True], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); == -> bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[COP_EQ, True], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["NeSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[COP_NE, True], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); != -> bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[COP_NE, True], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["LtSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[COP_LT, True], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); < -> bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[COP_LT, True], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["LeSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[COP_LE, True], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); <= -> bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[COP_LE, True], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["GtSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[COP_GT, True], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); > -> bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[COP_GT, True], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["GeSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[COP_GE, True], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); >= -> bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[COP_GE, True], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["LogicalAndSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[COP_LAND, True], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); and -> bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[COP_LAND, True], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["LogicalXorSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[
-                    _binary_spec_into_go[COP_LXOR, True], "a binary spec op"
-                ],
-                docstring="(a_spec, b_spec, out_spec); xor -> bool",
-            )
+            _spec_dispatcher3[
+                _binary_spec_into_go[COP_LXOR, True], "a binary spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["BitwiseNot"]():
-            _register_call(
-                b,
-                _bitwise_not_dispatcher,
-                docstring="out = ~x (bool/int, contiguous)",
-            )
+            _bitwise_not_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["IsIn"]():
-            _register_call(
-                b,
-                _isin_dispatcher,
-                docstring="out[i] = x[i] in test (int dtypes) ^ invert",
-            )
+            _isin_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["ClampScalar"]():
-            _register_call(
-                b,
-                _clamp_scalar_dispatcher,
-                docstring="out = min(max(x, lo), hi) with optional bounds",
-            )
+            _clamp_scalar_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["AddcmulBcast"]():
-            _register_call(
-                b,
-                _ternary_bcast_dispatcher[TOP_ADDCMUL],
-                docstring="out = self + value * (t1 * t2) (broadcast strides)",
-            )
+            _ternary_bcast_dispatcher[TOP_ADDCMUL](argv, argc)
+            return 0
         comptime if _op_on["AddcdivBcast"]():
-            _register_call(
-                b,
-                _ternary_bcast_dispatcher[TOP_ADDCDIV],
-                docstring="out = self + value * (t1 / t2) (broadcast strides)",
-            )
+            _ternary_bcast_dispatcher[TOP_ADDCDIV](argv, argc)
+            return 0
         comptime if _op_on["AddrBcast"]():
-            _register_call(
-                b,
-                _addr_bcast_dispatcher,
-                docstring=(
-                    "out = beta*self + alpha*(vec1 outer vec2); self:(n,m)"
-                    " vec1:(n,) vec2:(m,)"
-                ),
-            )
-        return b.finalize()
+            _addr_bcast_dispatcher(argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create logic_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

@@ -10,8 +10,8 @@ where the library comes from and how the target GPU is selected differ:
 
 - NVIDIA: `libnccl.so.2` from the nvidia-nccl-cu12 wheel. It statically links
   the CUDA runtime and dlopens libcuda.so.1 by itself, so this needs nothing
-  beyond the wheel and a driver — the same trick mojo_device/cuda_peer.py
-  uses. The target GPU is the CUDA context current on the calling thread;
+  beyond the wheel and a driver. The target GPU is the CUDA context current
+  on the calling thread;
   MAX binds the per-device *primary* context, so memory allocated by MAX is
   directly valid for NCCL, and `set_current_device` performs the minimal
   driver-API dance (cuInit -> cuDevicePrimaryCtxRetain -> cuCtxSetCurrent)
@@ -29,13 +29,10 @@ ABI-stable across 2.x.
 """
 
 import ctypes
-import functools
 import os
 from pathlib import Path
 
-from torch_mojo_backend.distributed import mojoccl_build
-from torch_mojo_backend.eager_kernels import _trace
-from torch_mojo_backend.mojo_device import cuda_peer, hip_peer
+from torch_mojo_backend.mojo_device import hip_peer
 
 # nccl.h: ncclResult_t
 NCCL_SUCCESS = 0
@@ -135,330 +132,44 @@ def _install_help(api: str) -> str:
     )
 
 
-def _declare(lib: ctypes.CDLL):
-    """Pin the argument types of every entry point used, once per library."""
-    lib.ncclGetErrorString.restype = ctypes.c_char_p
-    lib.ncclGetErrorString.argtypes = [ctypes.c_int]
-    lib.ncclGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
-    lib.ncclGetUniqueId.argtypes = [ctypes.POINTER(NcclUniqueId)]
-    # ncclUniqueId is passed BY VALUE — it must be a ctypes.Structure here: a
-    # bare (c_char * 128) array argtype decays to a pointer like a C array,
-    # shifting every following argument (NCCL then sees a garbage rank).
-    lib.ncclCommInitRank.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_int,
-        NcclUniqueId,
-        ctypes.c_int,
-    ]
-    lib.ncclCommDestroy.argtypes = [ctypes.c_void_p]
-    lib.ncclCommAbort.argtypes = [ctypes.c_void_p]
-    lib.ncclCommGetAsyncError.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-    lib.ncclCommUserRank.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-    lib.ncclCommCount.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-    for name, extra in [
-        ("ncclAllReduce", [ctypes.c_int, ctypes.c_int]),  # datatype, op
-        ("ncclReduceScatter", [ctypes.c_int, ctypes.c_int]),
-        ("ncclAllGather", [ctypes.c_int]),  # datatype
-    ]:
-        fn = getattr(lib, name)
-        fn.argtypes = (
-            [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-            + extra
-            + [ctypes.c_void_p, ctypes.c_void_p]  # comm, stream
-        )
-    lib.ncclBroadcast.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_int,  # datatype
-        ctypes.c_int,  # root
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    ]
-    lib.ncclReduce.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_int,  # datatype
-        ctypes.c_int,  # op
-        ctypes.c_int,  # root
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    ]
-    for name in ["ncclSend", "ncclRecv"]:
-        fn = getattr(lib, name)
-        fn.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_size_t,
-            ctypes.c_int,  # datatype
-            ctypes.c_int,  # peer
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-    lib.ncclGroupStart.argtypes = []
-    lib.ncclGroupEnd.argtypes = []
+def uses_mojoccl() -> bool:
+    return os.environ.get(_CCL_ENV, "").lower() == "mojo"
 
 
-class CclLibrary:
-    """One loaded implementation of the NCCL API (NCCL or RCCL)."""
-
-    def __init__(self, lib: ctypes.CDLL, path: str, name: str):
-        self._lib = lib
-        self.path = path
-        self.name = name  # "NCCL" or "RCCL", for messages
-
-    def _check(self, func_name: str, result: int):
-        if result != NCCL_SUCCESS:
-            detail = self._lib.ncclGetErrorString(result).decode()
-            raise NcclError(func_name, result, detail)
-
-    def version(self) -> int:
-        """The runtime library's version code, e.g. 23102 for 2.31.2."""
-        version = ctypes.c_int(0)
-        self._check("ncclGetVersion", self._lib.ncclGetVersion(ctypes.byref(version)))
-        return version.value
-
-    def get_unique_id(self) -> bytes:
-        """Generate the 128-byte communicator id (rank 0 only; share via the store)."""
-        uid = NcclUniqueId()
-        self._check("ncclGetUniqueId", self._lib.ncclGetUniqueId(ctypes.byref(uid)))
-        # Not uid.internal: ctypes truncates c_char-array fields at the first NUL.
-        return ctypes.string_at(ctypes.byref(uid), NCCL_UNIQUE_ID_BYTES)
-
-    def init_rank(self, nranks: int, unique_id: bytes, rank: int) -> "NcclComm":
-        """Collective, blocking: every rank of the clique must call concurrently.
-
-        Binds the communicator to the device current on this thread — see
-        `set_current_device`.
-        """
-        if len(unique_id) != NCCL_UNIQUE_ID_BYTES:
-            raise ValueError(f"unique_id must be {NCCL_UNIQUE_ID_BYTES} bytes")
-        uid = NcclUniqueId.from_buffer_copy(unique_id)
-        handle = ctypes.c_void_p(0)
-        self._check(
-            "ncclCommInitRank",
-            self._lib.ncclCommInitRank(ctypes.byref(handle), nranks, uid, rank),
-        )
-        assert handle.value is not None  # a checked init never leaves it null
-        return NcclComm(self, handle.value)
-
-    def group_start(self):
-        self._check("ncclGroupStart", self._lib.ncclGroupStart())
-
-    def group_end(self):
-        self._check("ncclGroupEnd", self._lib.ncclGroupEnd())
-
-
-@functools.cache
-def load(api: str) -> CclLibrary:
-    """The NCCL-API library for MAX's device api string ("cuda" or "hip")."""
-    try:
-        name = _LIBRARY_NAME_OF[api]
-    except KeyError:
-        raise RuntimeError(
-            f"no NCCL-API collective library for the {api!r} device api; the "
-            "mojo distributed backend supports NVIDIA (NCCL) and AMD (RCCL) GPUs"
-        ) from None
-    if os.environ.get(_CCL_ENV) == "mojo":
-        path = mojoccl_build.ensure_built()
-        lib = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-        _declare(lib)
-        ccl = CclLibrary(lib, path, "mojoccl")
-        _trace(f"collectives via {path} (mojoccl, NCCL ABI version {ccl.version()})")
-        return ccl
-    paths = _candidate_librccl_paths() if api == "hip" else _candidate_libnccl_paths()
-    errors = []
-    for path in paths:
-        try:
-            # RTLD_GLOBAL so a later dlopen of the same soname (for example by
-            # MAX's optional vendor-CCL bridge) resolves to this exact library
-            # instead of a mismatched system copy.
-            lib = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-        except OSError as e:
-            errors.append(f"{path}: {e}")
-            continue
-        _declare(lib)
-        ccl = CclLibrary(lib, path, name)
-        _trace(f"collectives via {path} ({name} version {ccl.version()})")
-        return ccl
-    raise RuntimeError(_install_help(api) + ". Tried:\n  " + "\n  ".join(errors))
-
-
-class NcclComm:
-    """One communicator, bound to the device that was current at init."""
-
-    def __init__(self, ccl: CclLibrary, handle: int):
-        self._ccl = ccl
-        self._handle = handle
-        self._aborted = False
-
-    def destroy(self):
-        if self._handle and not self._aborted:
-            self._ccl._lib.ncclCommDestroy(ctypes.c_void_p(self._handle))
-            self._handle = 0
-
-    def abort(self):
-        if self._handle:
-            self._ccl._lib.ncclCommAbort(ctypes.c_void_p(self._handle))
-            self._aborted = True
-            self._handle = 0
-
-    def async_error(self) -> int:
-        err = ctypes.c_int(0)
-        self._ccl._check(
-            "ncclCommGetAsyncError",
-            self._ccl._lib.ncclCommGetAsyncError(
-                ctypes.c_void_p(self._handle), ctypes.byref(err)
-            ),
-        )
-        return err.value
-
-    def all_reduce(
-        self, send_ptr: int, recv_ptr: int, count: int, dtype: int, op: int, stream: int
-    ):
-        self._ccl._check(
-            "ncclAllReduce",
-            self._ccl._lib.ncclAllReduce(
-                send_ptr, recv_ptr, count, dtype, op, self._handle, stream
-            ),
-        )
-
-    def broadcast(
-        self,
-        send_ptr: int,
-        recv_ptr: int,
-        count: int,
-        dtype: int,
-        root: int,
-        stream: int,
-    ):
-        self._ccl._check(
-            "ncclBroadcast",
-            self._ccl._lib.ncclBroadcast(
-                send_ptr, recv_ptr, count, dtype, root, self._handle, stream
-            ),
-        )
-
-    def reduce(
-        self,
-        send_ptr: int,
-        recv_ptr: int,
-        count: int,
-        dtype: int,
-        op: int,
-        root: int,
-        stream: int,
-    ):
-        self._ccl._check(
-            "ncclReduce",
-            self._ccl._lib.ncclReduce(
-                send_ptr, recv_ptr, count, dtype, op, root, self._handle, stream
-            ),
-        )
-
-    def all_gather(
-        self, send_ptr: int, recv_ptr: int, send_count: int, dtype: int, stream: int
-    ):
-        self._ccl._check(
-            "ncclAllGather",
-            self._ccl._lib.ncclAllGather(
-                send_ptr, recv_ptr, send_count, dtype, self._handle, stream
-            ),
-        )
-
-    def reduce_scatter(
-        self,
-        send_ptr: int,
-        recv_ptr: int,
-        recv_count: int,
-        dtype: int,
-        op: int,
-        stream: int,
-    ):
-        self._ccl._check(
-            "ncclReduceScatter",
-            self._ccl._lib.ncclReduceScatter(
-                send_ptr, recv_ptr, recv_count, dtype, op, self._handle, stream
-            ),
-        )
-
-    def send(self, ptr: int, count: int, dtype: int, peer: int, stream: int):
-        self._ccl._check(
-            "ncclSend",
-            self._ccl._lib.ncclSend(ptr, count, dtype, peer, self._handle, stream),
-        )
-
-    def recv(self, ptr: int, count: int, dtype: int, peer: int, stream: int):
-        self._ccl._check(
-            "ncclRecv",
-            self._ccl._lib.ncclRecv(ptr, count, dtype, peer, self._handle, stream),
-        )
-
-    # Group semantics are library-global, not per communicator; exposed here
-    # so a caller holding a communicator needs nothing else.
-    def group_start(self):
-        self._ccl.group_start()
-
-    def group_end(self):
-        self._ccl.group_end()
-
-
-# --- Device selection ---------------------------------------------------------
-# Both libraries pick the GPU a communicator binds to from per-thread runtime
-# state. On HIP that is the current device (hipSetDevice). On CUDA it is the
-# thread's current context; cuda_peer.py already dlopens libcuda for pointer
-# queries, and here three more driver calls reproduce what the runtime API's
-# cudaSetDevice() does.
-
-CUDA_SUCCESS = 0
-
-
-@functools.cache
-def _libcuda() -> ctypes.CDLL:
-    lib = ctypes.CDLL("libcuda.so.1")
-    lib.cuInit.argtypes = [ctypes.c_uint]
-    lib.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
-    lib.cuDevicePrimaryCtxRetain.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_int,
-    ]
-    lib.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
-    return lib
-
-
-def _check_cu(func_name: str, result: int):
-    if result != CUDA_SUCCESS:
-        raise RuntimeError(f"{func_name} failed (CUresult={result})")
-
-
-def set_current_cuda_device(ordinal: int):
-    """Make `ordinal`'s primary context current on this thread (for NCCL init)."""
-    lib = _libcuda()
-    _check_cu("cuInit", lib.cuInit(0))
-    device = ctypes.c_int(0)
-    _check_cu("cuDeviceGet", lib.cuDeviceGet(ctypes.byref(device), ordinal))
-    context = ctypes.c_void_p(0)
-    _check_cu(
-        "cuDevicePrimaryCtxRetain",
-        lib.cuDevicePrimaryCtxRetain(ctypes.byref(context), device),
+def vendor_name() -> str:
+    """ "rccl" when MAX's accelerators are AMD (HIP api), else "nccl"."""
+    from torch_mojo_backend.torch_compile_backend.utils import (  # noqa: PLC0415 -- imports max.driver; keep it off the import path
+        get_accelerators,
     )
-    _check_cu("cuCtxSetCurrent", lib.cuCtxSetCurrent(context))
+
+    return (
+        "rccl"
+        if any(getattr(d, "api", "") == "hip" for d in get_accelerators())
+        else "nccl"
+    )
 
 
-def set_current_device(api: str, ordinal: int):
-    """Make GPU `ordinal` the calling thread's current device for `api`."""
-    if api == "hip":
-        hip_peer.set_device(ordinal)
-    elif api == "cuda":
-        set_current_cuda_device(ordinal)
-    else:
-        raise RuntimeError(f"no device selection for the {api!r} device api")
+def library_path() -> str:
+    """Path of the collectives library: mojoccl (built from Mojo on first use,
+    TORCH_MOJO_BACKEND_CCL=mojo) or the vendor NCCL / RCCL."""
+    if uses_mojoccl():
+        from torch_mojo_backend.distributed.mojoccl_build import (  # noqa: PLC0415 -- builds a library; keep it lazy
+            ensure_built,
+        )
 
-
-def device_ordinal(api: str, ptr: int) -> int | None:
-    """The `api` ordinal of the GPU owning `ptr`, or None if it is not one."""
-    if api == "hip":
-        return hip_peer.device_ordinal(ptr)
-    if api == "cuda":
-        return cuda_peer.device_ordinal(ptr)
-    return None
+        return ensure_built()
+    candidates = (
+        _candidate_librccl_paths()
+        if vendor_name() == "rccl"
+        else _candidate_libnccl_paths()
+    )
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise RuntimeError(
+        "no NCCL/RCCL library found (looked at "
+        + ", ".join(candidates)
+        + "); install nvidia-nccl-cu12 "
+        "or point TORCH_MOJO_BACKEND_NCCL_LIB / TORCH_MOJO_BACKEND_RCCL_LIB at one, or set "
+        f"{_CCL_ENV}=mojo for the in-repo Mojo collectives"
+    )

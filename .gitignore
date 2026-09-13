@@ -46,3 +46,9 @@ current_bench_train/
 # both the data and the viewer for it).
 benchmarks/baselines.html.lock
 benchmarks/baselines.html.tmp
+
+# Prebuilt native libraries: build artefacts written by
+# scripts/build_prebuilt.py (or the wheel workflow) and shipped in the wheel;
+# only the README is tracked.
+torch_mojo_backend/native/prebuilt/*
+!torch_mojo_backend/native/prebuilt/README.md

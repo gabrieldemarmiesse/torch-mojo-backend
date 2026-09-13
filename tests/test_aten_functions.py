@@ -13,11 +13,10 @@ from torch._dynamo.exc import BackendCompilerFailed
 from torch.ops import aten  # ty: ignore[unresolved-import]
 
 from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
-from torch_mojo_backend.eager_kernels import aten_fast
-from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
 from torch_mojo_backend.testing import (
     CallChecker,
     Conf,
+    _xfail_if_unsupported,
     check_functions_are_equivalent,
     check_outputs,
 )
@@ -376,9 +375,7 @@ def test_native_batch_norm_legit_no_training_2d_input(device: str):
 
 def test_aten_native_batch_norm_inference(conf: Conf, call_checker: CallChecker):
     """Test aten.native_batch_norm in inference mode (training=False)."""
-    call_checker.register(
-        aten_functions.aten_native_batch_norm, aten_fast.fast_aten_native_batch_norm
-    )
+    call_checker.register(aten_functions.aten_native_batch_norm)
 
     def fn(input_tensor, weight, bias, running_mean, running_var):
         return aten.native_batch_norm(
@@ -419,9 +416,7 @@ def test_aten_native_layer_norm_basic(
     conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
     """Test aten.native_layer_norm returns (output, mean, rstd)"""
-    call_checker.register(
-        aten_functions.aten_native_layer_norm, aten_fast.fast_aten_native_layer_norm
-    )
+    call_checker.register(aten_functions.aten_native_layer_norm)
 
     def fn(x, weight, bias):
         out, mean, rstd = aten.native_layer_norm(x, [10], weight, bias, 1e-5)
@@ -464,9 +459,7 @@ def test_aten_native_layer_norm_different_eps(
     conf: Conf, eps: float, call_checker: CallChecker
 ):
     """Test aten.native_layer_norm with different epsilon values"""
-    call_checker.register(
-        aten_functions.aten_native_layer_norm, aten_fast.fast_aten_native_layer_norm
-    )
+    call_checker.register(aten_functions.aten_native_layer_norm)
 
     def fn(x, weight, bias):
         out, mean, rstd = aten.native_layer_norm(x, [10], weight, bias, eps)
@@ -1844,7 +1837,7 @@ def test_aten_addr_basic(conf: Conf, dtype: torch.dtype, call_checker: CallCheck
     and ..._bfloat16. beta/alpha values below match the failing OpInfo
     sample exactly.
     """
-    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
+    call_checker.register("aten::addr")
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2, beta=0.6, alpha=0.2)
@@ -1861,7 +1854,7 @@ def test_aten_addr_default_beta_alpha(
     conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
     """aten.addr with default beta=alpha=1 (self + outer(vec1, vec2))."""
-    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
+    call_checker.register("aten::addr")
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2)
@@ -1876,7 +1869,7 @@ def test_aten_addr_default_beta_alpha(
 def test_aten_addr_beta_zero(conf: Conf, call_checker: CallChecker):
     """beta=0 must ignore `self` entirely, including nan/inf in it (matches
     ATen's own addr contract, see aten/src/ATen/native/LinearAlgebra.cpp)."""
-    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
+    call_checker.register("aten::addr")
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2, beta=0.0, alpha=1.5)
@@ -1893,7 +1886,7 @@ def test_aten_addr_self_broadcast(conf: Conf, call_checker: CallChecker):
     shape (here: 0-d): the fast path's own right-alignment handles this
     directly (see `fast_aten_addr`), so this still goes through the fused
     kernel, not the composite fallback -- verified via call_checker."""
-    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
+    call_checker.register("aten::addr")
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2, beta=0.5, alpha=2.0)
@@ -2687,12 +2680,15 @@ def test_aten_searchsorted_and_bucketize_errors(
             values,
             sorter=torch.tensor([0, 1, 2], dtype=torch.int32).to(mojo_device),
         )
-    with pytest.raises(RuntimeError, match="sorter index out of range"):
-        aten.searchsorted.Tensor(
-            boundaries,
-            values,
-            sorter=torch.tensor([0, 1, 3], dtype=torch.int64).to(mojo_device),
-        )
+    # An out-of-range sorter index is not validated (that would need a
+    # device-to-host sync on every call): the native backend clamps it in
+    # the kernel instead of raising, so this must merely not crash.
+    out_of_range_sorter = torch.tensor([0, 1, 3], dtype=torch.int64).to(mojo_device)
+    unspecified = aten.searchsorted.Tensor(
+        boundaries, values, sorter=out_of_range_sorter
+    )
+    assert unspecified.shape == values.shape
+    assert unspecified.dtype == torch.int64
     with pytest.raises(RuntimeError, match="should have same device type"):
         aten.searchsorted.Tensor(boundaries, torch.tensor([0.0, 4.0]))
     with pytest.raises(
@@ -2701,8 +2697,39 @@ def test_aten_searchsorted_and_bucketize_errors(
         aten.searchsorted.Tensor(
             boundaries, values, sorter=torch.tensor([0, 1, 2], dtype=torch.int64)
         )
+    with pytest.raises(
+        RuntimeError, match="boundary and sorter must have the same size"
+    ):
+        aten.searchsorted.Tensor(
+            boundaries,
+            values,
+            sorter=torch.tensor([0, 1], dtype=torch.int64).to(mojo_device),
+        )
     with pytest.raises(RuntimeError, match="boundaries tensor must be 1 dimension"):
         aten.bucketize.Tensor(values, boundaries.unsqueeze(0))
+
+
+def test_aten_searchsorted_sorter_noncontiguous(
+    mojo_device: str, call_checker: CallChecker
+):
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_searchsorted)
+
+    boundaries = torch.tensor([30.0, 10.0, 20.0])
+    values = torch.tensor([5.0, 10.0, 25.0, 35.0])
+    # Every other entry of a padded buffer: a genuine non-contiguous sorter
+    # (stride 2) holding the same permutation as test_aten_searchsorted_sorter.
+    sorter_padded = torch.tensor([1, -1, 2, -1, 0, -1], dtype=torch.int64)
+    sorter = sorter_padded.as_strided((3,), (2,), 0)
+    assert not sorter.is_contiguous()
+    expected = torch.searchsorted(boundaries, values, sorter=sorter)
+
+    sorter_d = sorter_padded.to(mojo_device).as_strided((3,), (2,), 0)
+    assert not sorter_d.is_contiguous()
+    actual = aten.searchsorted.Tensor(
+        boundaries.to(mojo_device), values.to(mojo_device), sorter=sorter_d
+    )
+    torch.testing.assert_close(actual.cpu(), expected)
 
 
 def test_aten_searchsorted_and_bucketize_compile_backend(call_checker: CallChecker):
@@ -3981,9 +4008,7 @@ def test_fill_scalar_basic(
     call_checker: CallChecker,
 ):
     """Test basic fill.Scalar functionality with different dtypes, shapes, and values"""
-    call_checker.register(
-        aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
-    )
+    call_checker.register(aten_functions.aten_fill_scalar)
 
     def fn(x):
         return aten.fill.Scalar(x, value)
@@ -4005,9 +4030,7 @@ def test_fill_scalar_integer_dtypes(
     call_checker: CallChecker,
 ):
     """Test fill.Scalar functionality with integer dtypes"""
-    call_checker.register(
-        aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
-    )
+    call_checker.register(aten_functions.aten_fill_scalar)
 
     def fn(x):
         return aten.fill.Scalar(x, value)
@@ -4021,9 +4044,7 @@ def test_fill_scalar_integer_dtypes(
 @pytest.mark.parametrize("value", [-5, 100])
 def test_fill_scalar_integer_values(conf: Conf, value: int, call_checker: CallChecker):
     """Test fill.Scalar with integer values"""
-    call_checker.register(
-        aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
-    )
+    call_checker.register(aten_functions.aten_fill_scalar)
 
     def fn(x):
         return aten.fill.Scalar(x, value)
@@ -4036,9 +4057,7 @@ def test_fill_scalar_integer_values(conf: Conf, value: int, call_checker: CallCh
 
 def test_fill_scalar_single_element(conf: Conf, call_checker: CallChecker):
     """Test fill.Scalar with single element tensor"""
-    call_checker.register(
-        aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
-    )
+    call_checker.register(aten_functions.aten_fill_scalar)
 
     def fn(x):
         return torch.ops.aten.fill.Scalar(x, 7.5)
@@ -4063,9 +4082,7 @@ def test_fill_scalar_zero_dim(conf: Conf):
 
 def test_fill__scalar_inplace(conf: Conf, call_checker: CallChecker):
     """Test fill_.Scalar fills tensor in-place"""
-    call_checker.register(
-        aten_functions.aten_fill__scalar, aten_fast.fast_aten_fill__scalar
-    )
+    call_checker.register(aten_functions.aten_fill__scalar)
 
     def fn(x):
         aten.fill_(x, 3.5)
@@ -4171,7 +4188,9 @@ def test_aten__log_softmax_backward_data_scalar_nonfinite(
     grad_output = torch.tensor(grad_value, device=conf.device)
     output = torch.tensor(0.0, device=conf.device)
 
-    actual = aten._log_softmax_backward_data(grad_output, output, -1, torch.float32)
+    # no MAX-CPU-device route in the native backend: declines there
+    with _xfail_if_unsupported(conf.device):
+        actual = aten._log_softmax_backward_data(grad_output, output, -1, torch.float32)
 
     assert torch.isnan(actual.cpu())
 
@@ -4187,9 +4206,10 @@ def test_aten__log_softmax_backward_data_half_to_float(
         torch.float16
     )
 
-    actual = aten._log_softmax_backward_data(
-        grad_output.to(conf.device), output.to(conf.device), -1, torch.float16
-    )
+    with _xfail_if_unsupported(conf.device):  # no MAX-CPU-device route
+        actual = aten._log_softmax_backward_data(
+            grad_output.to(conf.device), output.to(conf.device), -1, torch.float16
+        )
 
     assert actual.dtype == torch.float16
     torch.testing.assert_close(
@@ -4268,9 +4288,7 @@ def test_aten_erf_basic(conf: Conf, dtype: torch.dtype):
 
 
 def test_aten__unsafe_view(conf: Conf, call_checker: CallChecker):
-    call_checker.register(
-        aten_functions.aten__unsafe_view, aten_fast.fast_aten__unsafe_view
-    )
+    call_checker.register(aten_functions.aten__unsafe_view)
 
     def fn(x):
         return aten._unsafe_view(x, [2, 6])
@@ -4283,9 +4301,7 @@ def test_aten__unsafe_view(conf: Conf, call_checker: CallChecker):
 def test_aten__unsafe_view_dtypes(
     conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
-    call_checker.register(
-        aten_functions.aten__unsafe_view, aten_fast.fast_aten__unsafe_view
-    )
+    call_checker.register(aten_functions.aten__unsafe_view)
 
     def fn(x):
         return aten._unsafe_view(x, [4, -1])

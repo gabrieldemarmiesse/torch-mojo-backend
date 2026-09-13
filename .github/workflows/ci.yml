@@ -78,6 +78,23 @@ jobs:
           restore-keys: |
             modular-${{ matrix.test-index }}
       
+      # The native backend compiles its shim, base library, op extensions and
+      # kernel specializations on first use; keyed by their sources, so a run
+      # that changes nothing native reuses the previous run's builds -- and by
+      # the CPU: mojo builds for the host, and the runner pool mixes CPUs
+      # (a build from an AVX-512 runner restored on one without dies with
+      # SIGILL).
+      - name: Identify the runner's CPU
+        id: cpu
+        run: echo "id=$(grep -m1 flags /proc/cpuinfo | md5sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+      - name: Cache native builds
+        uses: actions/cache@v4
+        with:
+          path: torch_mojo_backend/eager_kernels/__mojocache__/native
+          key: native-${{ steps.cpu.outputs.id }}-${{ matrix.test-index }}-${{ matrix.mojo-device }}-${{ hashFiles('torch_mojo_backend/native/**', 'torch_mojo_backend/eager_kernels/**/*.mojo', 'uv.lock') }}
+          restore-keys: |
+            native-${{ steps.cpu.outputs.id }}-${{ matrix.test-index }}-${{ matrix.mojo-device }}-
+
       - name: Install uv
         uses: astral-sh/setup-uv@v4
       

@@ -1,9 +1,9 @@
 """HIP-runtime facts about mojo tensors on AMD GPUs: which device owns a
 pointer, and making a device current on the calling thread.
 
-The AMD counterpart of `cuda_peer.py`, with the same posture: everything is
-asked of the runtime that MAX itself drives, so the answers are facts about an
-allocation rather than assumptions about how two runtimes enumerate. MAX
+The posture: everything is asked of the runtime that MAX itself drives, so
+the answers are facts about an allocation rather than assumptions about how
+two runtimes enumerate. MAX
 dlopens `libamdhip64.so` from the ROCm install (``$ROCM_PATH`` or
 ``/opt/rocm``); this module reuses THAT copy — found through the process's own
 memory map, preferring the one under that install when a ROCm torch wheel
@@ -14,8 +14,7 @@ MAX's and RCCL's are one numbering.
 
 Only the driver-style `hipPointerGetAttribute` (singular) is used: it writes
 a plain int, where `hipPointerGetAttributes` fills a struct whose layout
-changed in ROCm 6.0 — the trap cuda_peer.py describes for the CUDA runtime
-API.
+changed in ROCm 6.0.
 """
 
 from __future__ import annotations

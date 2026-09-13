@@ -48,14 +48,8 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   stays where it is with `# noqa: PLC0415 -- <why>`, and the reason must be
   a checked fact. Verify a suspected cycle by hoisting the import and
   re-importing the module in a fresh interpreter; most "cycles" are not one.
-  Importing `aten_fast` is not an exception: it loads no Mojo extension
-  (measured: nothing lands in `sys.modules`, 0.02 s), because a kernel is
-  built and dlopened by the first *call* into its descriptor. The one
-  import-time side effect in the kernel layer is reading
-  `eager_kernels.tensor_holder`, whose module `__getattr__` builds and
-  dlopens that extension there and then. Watch for late binding: code and
-  tests that monkeypatch `module.function` need the *module* imported at the
-  top, not the function.
+  Watch for late binding: code and tests that monkeypatch `module.function`
+  need the *module* imported at the top, not the function.
 - **Monkeypatching**: every runtime patch of a torch (or other third-party)
   module or class lives in `torch_mojo_backend/monkeypatching.py`, one
   function per patch with a docstring saying what upstream lacks, so each can
@@ -231,41 +225,43 @@ def aten__log_softmax(
     return F.log_softmax(self, axis=dim)
 ```
 
-### Step 7: Register for Eager Mode Execution
-Eager mode has **no graph fallback**: every op is either bound to a fast
-implementation (Mojo kernels over raw pointers) or raises
-`NotImplementedError`. (The old `wrap_for_mojo_device` wrapper no longer
-exists.) Two places are involved:
+### Step 7: Implement the Op on the Native Device
+Eager mode is the native PrivateUse1 backend (`docs/native_backend.md` — read
+it before writing an op): torch's C++ dispatcher calls a Mojo function
+directly, no Python on the op path. There is **no graph fallback**: an op is
+either implemented in Mojo or `NotImplementedError`.
 
-1. Write the fast implementation `fast_aten_<op>` in
-   `torch_mojo_backend/eager_kernels/aten_fast.py`. It receives
-   `TorchMojoTensor`s (a Mojo `TensorHolder` ownership token plus `_ptr` /
-   `_shape` / `_strides` / `_offset` / `_dtype` / `_device`) and runs one or
-   a few kernel calls from an `eager_kernels/<family>/` extension. View ops
-   are zero-copy wrapper math (no kernel at all). Return the `NOT_HANDLED`
-   sentinel to decline inputs you don't handle — the registration turns it
-   into an actionable `NotImplementedError`.
-2. Bind it in `torch_mojo_backend/mojo_device/mojo_device_aten_ops.py`, in
-   alphabetical order within the file:
+1. Write `op_<name>` in the matching
+   `torch_mojo_backend/native/mojo/ops_<group>.mojo` — `core`, `unary`,
+   `binary`, `compare`, `data_movement`, `factories`, `reductions`, `matmul`,
+   `nn`, `attention`, `foreach`; generic helpers shared by several groups go
+   in `ops_common.mojo`. Read the arguments by schema position with the `v_*`
+   helpers, build outputs with `new_tensor` / `new_like` / `view_strided`
+   (never write into an input unless the schema says so), and set results with
+   `ret_tensor` (owned), `ret_ref` (an input handed back: in-place ops),
+   `ret_tensor_list`, `ret_scalar_*`. Decline inputs you do not handle with
+   `unsupported("why")`, which reaches Python as `NotImplementedError`.
+2. Run a kernel with `KernelCall(<family>, <OP>)`: `arg_dtype`/`out_dtype`/
+   `flag` are the `-D` defines that select the specialization, `spec`/`int`/
+   `f64`/`tuple` are the runtime slots the family's `tmb_call` reads back by
+   position. Launch on the device's current stream (`ctx_for(t.device)`, and
+   `_ = ctx` after the call so it outlives the launch).
+3. Register it in `register_<group>(lib)` at the bottom of the same file:
 
-   ```python
-   _register_fast("aten::<op>", "fast_aten_<op>")
+   ```mojo
+   impl[op_<name>](lib, "<name>.<overload>")
    ```
 
-   That file is only the registration list — one line per aten name, kept
-   alphabetical. Related shorthands: `_register_out(...)` wraps a functional
-   fast impl as an `out=` variant; `_register_foreach_inplace(...)` covers
-   `_foreach_*_` ops; `_register_missing(...)` registers an explicit raiser.
+   `backend.mojo` calls every `register_<group>`; only `ops_core.mojo`'s few
+   ops are registered there directly. Register the functional variant; an
+   `out=` variant computes into the caller's tensor when its shape/dtype/
+   contiguity allow and otherwise computes then `copy_strided_into`s. A
+   composite ATen op only needs a registration if a fused route is faster
+   than letting ATen decompose it.
 
-   An op needing real Python code of its own (custom device handling like
-   `aten::_copy_from`, a forward-time autograd preflight, ...) gets a
-   function in the matching `mojo_device/aten_ops/` module — `transfer`,
-   `factories`, `autograd_preflight`, `inplace`, `rng`, `reductions`,
-   `foreach`, `blas`, with the shared plumbing (`_fast`, `_unsupported`,
-   `_copy_into_tensor`, `_out_variant`) in `aten_ops/support.py`. The
-   registration list then imports it and calls
-   `register_aten_op("aten::<op>")(<fn>)`. Do not register from inside
-   `aten_ops/`: every binding stays visible in the one list.
+**Lifetimes.** Mojo destroys a value right after its last use, so never hand a
+local's address over as a slot and let the local die before `run()` — that
+reads freed memory.
 
 If the op needs a new Mojo kernel, add it to the matching
 `eager_kernels/<family>/<family>.mojo` (variant-gated: the loader compiles
@@ -284,6 +280,10 @@ house grammar is `<algorithm-or-route>_<layout/regime>_<dtype>_<tuning params>`
 with no project prefix — `pure_gemm_pipe3_...`, `amd_splitk_mfma_...`,
 `fa_mfma_...`, `lsm_bwd_...`. Recording the workload a tuning constant was
 fitted to belongs in a comment next to the constant, not in the kernel name.
+
+Device-side tests go in `tests/native/test_<group>.py`, written against the
+public torch API only (the `mojo_gpu` / `mojo_device` fixtures), compared
+against CPU torch.
 
 ### Step 8: Re-run Tests
 Run the unit tests again and verify they pass:
@@ -304,11 +304,13 @@ uvx pre-commit run --all-files
 **Do not run the whole test suite** as it takes too long. Only run tests for the specific operation you added.
 
 ### Summary: Implementation Checklist
-When adding an operation, you typically update **three places**:
+When adding an operation, you typically update **two places** (three with a
+new kernel):
 1. **`aten_functions.py`**: torch.compile backend implementation (MAX ops composition)
-2. **`eager_kernels/aten_fast.py`**: fast eager implementation over
-   `TorchMojoTensor` (plus a Mojo kernel in `eager_kernels/<family>/` when needed)
-3. **`mojo_device_aten_ops.py`**: the `_register_fast(...)` binding for eager mode
+2. **`native/mojo/ops_<group>.mojo`**: `op_<name>` plus its `impl[op_<name>]`
+   registration, for the mojo device
+3. **`eager_kernels/<family>/<family>.mojo`**: the kernel itself, when none of
+   the existing ones does the job
 
 This ensures the operation works in both `torch.compile()` and on the `mojo` device.
 
@@ -323,8 +325,7 @@ type hints in the function body (no annotated local variables like
 `x: Foo = ...`).
 
 Use `: object` only when no other option is possible. Prefer precise types,
-unions, `Protocol`s (e.g. `MojoTensorLike` for payload-level helpers), or a
-`TypeVar` for pass-through functions.
+unions, `Protocol`s, or a `TypeVar` for pass-through functions.
 
 These hints are enforced statically by Astral's `ty` type checker
 (`uv run ty check`), which must exit 0. Suppressing a diagnostic (per-rule
@@ -365,7 +366,7 @@ It may be hard to find the correct type hints for a function. What you should do
 Read this especially if you're an agent doing code review.
 
 1) The user should be able to use `my_tensor.to("mojo")` and use their gpu, even if they have a CPU-only install of PyTorch. That means that when writing kernels, we can't use CuBLAS, CuDNN, RocBLAS, or any other lib that would be available only if torch-gpu was installed. We want to stand on our own legs. We can use and import mojo functions from the modular repository (`from nn import ...`) but only if it's not calling CuBLAS, CuDNN... underneath. Our motto should be "pip install torch-mojo-backend with the minimal pytorch install (cpu) and use your gpu.".
-2) We cannot use the C++ interface of pytorch. We use JIT compilation to compile extensions only when they're first called. We want to be compatible with many PyTorch versions and we don't want to force the user to install a C++ compiler. So we must use Python extensions in mojo.
+2) Everything is JIT-compiled at first use against the installed torch, never prebuilt against one ABI: that is what keeps us compatible with many PyTorch versions. The ONE piece of C++ is `native/csrc/` (`docs/native_backend.md`), which exists only for the c10 objects torch accepts as nothing but C++ classes -- the boxed-kernel adapter, the allocator, the hooks/device guard, the generator, the profiler stubs, the autocast fallback -- and it compiles in ~7 s at the first `register_mojo_devices()`. It needs g++ or clang++ on the box; nothing else does, and no op, kernel or device logic may move into it. Everything above that line is Mojo.
 3) You cannot use information about the tensors other than the shape, stride, dtype, pointer in the eager mode. While it's tempting to "keep a history of some past op to do fused ops", it will not improve the performance for all workflows. Pytorch uses Aten ops and decompositions, so sometimes, if you want to implement a fused op, you might want to target a higher level aten function, before it gets decomposed. Aten ops that are not implemented are decomposed automatically in pytorch. 
 4) Do not write kernels that work only for a very specific shape. Input shapes should be dynamic to avoid recompiles. While it's tempting to make things faster, a user trying a slightly different shape will not benefit from the optimisations of this kernels. It's fine to write different kernels for different regimes (e.g. a kernel for big shape, small shapes, square shapes, rectangular, power of two, etc...) and then do dynamic dispatch based on the input shapes. It's not because we optimize for a given model that we can hardcode at compile-time all the shapes of the kenels to make it faster. So do multiple flexible kernels + dispatch, do not do kernels for hardcoded shapes + fallback.
 5) When asked to optimize a model, the answer should never be "change the code of the model". The model is user-defined, we have no control over it. We just control what we do with the tensors we're given by pytorch.
@@ -448,7 +449,7 @@ When optimizing a kernel, you should make a harness for a subagent A to work on.
 A small agent A2 should be used for a quick code review, notably just check that the kernel respects the rules of the eager mode and the tests are passing. No need for a very smart model here.
 
 When subagent A is done, a subagent B should start to integrate the kernel into the codebase. The subagent B should first:
-- Add those harness tests in the ` tests/test_eager_kernels.py` file.
+- Add those harness tests in the matching `tests/native/test_<group>.py` file.
 - Add benchmarks for the `benchmarks/` directory.  `ncu` or rocprof or equivalent should be given to the agent.
 - Export the ptx/asm of the kernel into a temporary directory.
 - Then integrate the kernel into the codebase, make sure the tests are passing and the benchmarks are as good as before. The subagent B can also generate the ptx/asm of its implementation to help, even if it doesn't need to match exactly the ptx/asm of the agent A kernel. The subagent B should take the decision to either use metaprogramming to adapt a kernel already in the codebase to perform the work of the new kernel given some specific parameter, or to write new code. Duplication should be avoided if possible so if the agent find out that some function/piece of code is already used in the codebase, the agent should perform a refactoring to reuse this code.
@@ -546,12 +547,10 @@ Believe them before rediscovering them at GPU-hour prices.
   `matmul_ops/` resolves as a package and shadows the `matmul_ops.mojo` file
   inside it. Import as `from matmul_ops.matmul_ops import ...`.
 - Cache/source registration for new `.mojo` files: the extension loader
-  hashes the import closure of each extension's entry `.mojo` file, so a new
-  file imported (even transitively) from the entry module invalidates the
-  compile cache automatically. Verify it anyway: touch the new file and
-  confirm the source hash changes and a recompile happens. Only optional
-  bridges enumerated in explicit `*_SOURCE_PATHS` lists in `aten_fast.py`
-  need manual registration.
+  (`native/mojo/loader.mojo`) hashes the import closure of each family's entry
+  `.mojo` file, so a new file imported (even transitively) from the entry
+  module invalidates the compile cache automatically. Verify it anyway: touch
+  the new file and confirm the source hash changes and a recompile happens.
 - `ctx.enqueue_function[f]` re-runs `compile_function` on every call (tens to
   hundreds of microseconds for large kernels). That is acceptable in a
   throwaway harness; production code must use the `_enqueue_cached` pattern

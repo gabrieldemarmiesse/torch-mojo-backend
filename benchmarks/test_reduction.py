@@ -52,9 +52,9 @@ COVERS: dict[str, str] = {
     "aten::any.dims": "test_any (same fast impl as .dim)",
     "aten::min.dim": "test_min_dim",
     "aten::var.correction": "test_var",
+    "aten::linalg_vector_norm": "test_vector_norm",
     "aten::linalg_vector_norm.out": (
-        "test_vector_norm (the .out form is the only registered entry; "
-        "torch.linalg.vector_norm reaches it)"
+        "test_vector_norm (same kernel, out-variant plumbing)"
     ),
     "aten::cumsum": "test_cumsum",
     "aten::nonzero": "test_nonzero",

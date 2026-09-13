@@ -8,24 +8,23 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from native_dropout_kernels import (
     enqueue_native_dropout_backward_f32,
     enqueue_native_dropout_f32,
 )
 from op_utils import (
+    Arg,
+    Argv,
     _make_ptr,
     _raw_ctx,
     _raw_f64,
     _raw_int,
-    _spec_dispatcher6,
     _spec_dispatcher10,
+    _spec_dispatcher6,
 )
 
-from variant_gates import _op_on, _register_call
+from variant_gates import ErrBuf, NO_OP_COMPILED, _op_on, _tmb_entry_error
 
 
 @always_inline
@@ -34,16 +33,16 @@ def _join_u64(lo: Int, hi: Int) -> UInt64:
 
 
 def _native_dropout_go(
-    output_ptr_obj: PyObjectPtr,
-    mask_ptr_obj: PyObjectPtr,
-    input_ptr_obj: PyObjectPtr,
-    elements_obj: PyObjectPtr,
-    p_obj: PyObjectPtr,
-    seed_lo_obj: PyObjectPtr,
-    seed_hi_obj: PyObjectPtr,
-    offset_lo_obj: PyObjectPtr,
-    offset_hi_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    output_ptr_obj: Arg,
+    mask_ptr_obj: Arg,
+    input_ptr_obj: Arg,
+    elements_obj: Arg,
+    p_obj: Arg,
+    seed_lo_obj: Arg,
+    seed_hi_obj: Arg,
+    offset_lo_obj: Arg,
+    offset_hi_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var output = _make_ptr[DType.float32](
         _raw_int(output_ptr_obj)
@@ -72,12 +71,12 @@ def _native_dropout_go(
 
 
 def _native_dropout_backward_go(
-    grad_input_ptr_obj: PyObjectPtr,
-    grad_output_ptr_obj: PyObjectPtr,
-    mask_ptr_obj: PyObjectPtr,
-    elements_obj: PyObjectPtr,
-    scale_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    grad_input_ptr_obj: Arg,
+    grad_output_ptr_obj: Arg,
+    mask_ptr_obj: Arg,
+    elements_obj: Arg,
+    scale_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var grad_input = _make_ptr[DType.float32](
         _raw_int(grad_input_ptr_obj)
@@ -100,30 +99,21 @@ def _native_dropout_backward_go(
 
 
 @export
-def PyInit_dropout_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("dropout_ops")
         comptime if _op_on["NativeDropoutF32"]():
-            _register_call(
-                b,
-                _spec_dispatcher10[_native_dropout_go, "NativeDropoutF32"],
-                docstring=(
-                    "(output_ptr, mask_ptr, input_ptr, elements, p, seed_lo,"
-                    " seed_hi, offset_lo, offset_hi, context_ptr); float32"
-                    " native dropout forward"
-                ),
+            _spec_dispatcher10[_native_dropout_go, "NativeDropoutF32"](
+                argv, argc
             )
+            return 0
         comptime if _op_on["NativeDropoutBackwardF32"]():
-            _register_call(
-                b,
-                _spec_dispatcher6[
-                    _native_dropout_backward_go, "NativeDropoutBackwardF32"
-                ],
-                docstring=(
-                    "(grad_input_ptr, grad_output_ptr, mask_ptr, elements,"
-                    " scale, context_ptr); float32 native dropout backward"
-                ),
-            )
-        return b.finalize()
+            _spec_dispatcher6[
+                _native_dropout_backward_go, "NativeDropoutBackwardF32"
+            ](argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create dropout_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

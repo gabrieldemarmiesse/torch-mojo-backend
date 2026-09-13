@@ -29,7 +29,6 @@ ELEM_SHAPES: dict[str, tuple[int, ...]] = {
 
 COVERS: dict[str, str] = {
     "aten::_softmax": "test_softmax",
-    "aten::softmax.int": "test_softmax (same fast impl as aten::_softmax)",
     "aten::_log_softmax": "test_log_softmax",
     "aten::_log_softmax_backward_data": "test_log_softmax_backward",
     "aten::gelu_backward": "test_gelu_backward",

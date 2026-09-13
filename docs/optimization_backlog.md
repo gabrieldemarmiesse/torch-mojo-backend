@@ -14,6 +14,14 @@ PCIe (`sm_90a`), PyTorch 2.11.0+cu130.
 files were being edited concurrently while this was written. Every citation also
 names the symbol; if a line does not match, grep the name.
 
+**The host side moved to Mojo.** Every `aten_fast.py`, `mojo_device_aten_ops.py`
+and `TorchMojoTensor` citation below points into the Python eager path, which
+has since been deleted: the host logic it describes now lives in
+`native/mojo/ops_*.mojo` (see `docs/native_backend.md`). The *kernels* and the
+gates in `eager_kernels/<family>/` are the same sources, so every finding about
+a kernel, a dtype gate or a route still applies; translate the entry point by
+grepping the route's name or its `KernelCall("<family>", "<Op>")`.
+
 **Honesty rules used here** (AGENTS.md "no silent caps" spirit):
 
 * Every number is labelled with where it came from. Numbers taken from

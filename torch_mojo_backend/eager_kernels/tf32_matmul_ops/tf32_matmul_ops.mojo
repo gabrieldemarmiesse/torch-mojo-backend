@@ -8,36 +8,33 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from tf32_gemm_kernels import enqueue_tf32_bmm_f32, enqueue_tf32_gemm_f32
 from op_utils import (
+    Arg,
+    Argv,
     _make_ptr,
     _raw_ctx,
     _raw_int,
-    _raw_ret_none,
     _spec_dispatcher11,
     _spec_dispatcher13,
-    _spec_unsupported,
 )
 
-from variant_gates import _op_on, _register_call
+from variant_gates import ErrBuf, NO_OP_COMPILED, _op_on, _tmb_entry_error
 
 
 def _tf32_gemm_go(
-    output_ptr_obj: PyObjectPtr,
-    a_ptr_obj: PyObjectPtr,
-    b_ptr_obj: PyObjectPtr,
-    bias_ptr_obj: PyObjectPtr,
-    m_obj: PyObjectPtr,
-    n_obj: PyObjectPtr,
-    k_obj: PyObjectPtr,
-    transpose_a_obj: PyObjectPtr,
-    transpose_b_obj: PyObjectPtr,
-    has_bias_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    output_ptr_obj: Arg,
+    a_ptr_obj: Arg,
+    b_ptr_obj: Arg,
+    bias_ptr_obj: Arg,
+    m_obj: Arg,
+    n_obj: Arg,
+    k_obj: Arg,
+    transpose_a_obj: Arg,
+    transpose_b_obj: Arg,
+    has_bias_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var output = _make_ptr[DType.float32](
         _raw_int(output_ptr_obj)
@@ -64,19 +61,19 @@ def _tf32_gemm_go(
 
 
 def _tf32_bmm_go(
-    output_ptr_obj: PyObjectPtr,
-    a_ptr_obj: PyObjectPtr,
-    b_ptr_obj: PyObjectPtr,
-    batch_count_obj: PyObjectPtr,
-    m_obj: PyObjectPtr,
-    n_obj: PyObjectPtr,
-    k_obj: PyObjectPtr,
-    output_batch_stride_obj: PyObjectPtr,
-    a_batch_stride_obj: PyObjectPtr,
-    b_batch_stride_obj: PyObjectPtr,
-    transpose_a_obj: PyObjectPtr,
-    transpose_b_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    output_ptr_obj: Arg,
+    a_ptr_obj: Arg,
+    b_ptr_obj: Arg,
+    batch_count_obj: Arg,
+    m_obj: Arg,
+    n_obj: Arg,
+    k_obj: Arg,
+    output_batch_stride_obj: Arg,
+    a_batch_stride_obj: Arg,
+    b_batch_stride_obj: Arg,
+    transpose_a_obj: Arg,
+    transpose_b_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var output = _make_ptr[DType.float32](
         _raw_int(output_ptr_obj)
@@ -102,30 +99,17 @@ def _tf32_bmm_go(
 
 
 @export
-def PyInit_tf32_matmul_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("tf32_matmul_ops")
         comptime if _op_on["Tf32BmmF32"]():
-            _register_call(
-                b,
-                _spec_dispatcher13[_tf32_bmm_go, "Tf32BmmF32"],
-                docstring=(
-                    "(output_ptr, a_ptr, b_ptr, batch_count, m, n, k,"
-                    " output_batch_stride, a_batch_stride, b_batch_stride,"
-                    " transpose_a, transpose_b, context_ptr); opt-in"
-                    " FP32/TF32 strided BMM"
-                ),
-            )
+            _spec_dispatcher13[_tf32_bmm_go, "Tf32BmmF32"](argv, argc)
+            return 0
         comptime if _op_on["Tf32GemmF32"]():
-            _register_call(
-                b,
-                _spec_dispatcher11[_tf32_gemm_go, "Tf32GemmF32"],
-                docstring=(
-                    "(output_ptr, a_ptr, b_ptr, bias_ptr, m, n, k, transpose_a,"
-                    " transpose_b, has_bias, context_ptr); opt-in FP32/TF32 2-D"
-                    " GEMM"
-                ),
-            )
-        return b.finalize()
+            _spec_dispatcher11[_tf32_gemm_go, "Tf32GemmF32"](argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create tf32_matmul_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

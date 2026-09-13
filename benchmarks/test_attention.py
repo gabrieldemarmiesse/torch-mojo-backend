@@ -25,10 +25,8 @@ SHAPES: dict[str, tuple[int, int, int, int]] = {
 }
 
 COVERS: dict[str, str] = {
-    "aten::scaled_dot_product_attention": "test_sdpa",
     "aten::_scaled_dot_product_flash_attention": "test_sdpa_flash",
     "aten::_scaled_dot_product_efficient_attention": "test_sdpa_efficient",
-    "aten::_scaled_dot_product_attention_math": "test_sdpa_math",
     "aten::_scaled_dot_product_flash_attention_backward": "test_sdpa_flash_backward",
 }
 

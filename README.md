@@ -8,7 +8,7 @@ You only need Torch CPU and a mojo compiler, and if your accelerator is supporte
 No need to match compiler versions, torch versions, cuda versions, multiple channels, etc... Just pip install and you're ready to go.
 
 Concretely, the backend provides two things:
-- It uses the PrivateUse1 device registration method purely in Python, meaning you can just use the `mojo` device with `my_model.to("mojo")` to use your accelerator in eager mode.
+- It registers `mojo` as a PrivateUse1 device whose aten ops are Mojo functions torch's dispatcher calls directly, meaning you can just use the `mojo` device with `my_model.to("mojo")` to use your accelerator in eager mode. See [docs/native_backend.md](docs/native_backend.md).
 - This project also provides a backend for doing `@torch.compile(backend=mojo_backend)`, and it will use mojo (MAX graph) instead of triton to compile your model.
 
 ## Warning:

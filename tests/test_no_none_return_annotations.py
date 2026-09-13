@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 _REPO_DIR = Path(__file__).parent.parent
-_SKIPPED_DIRS = {".venv", "deeplink", "__mojocache__"}
+_SKIPPED_DIRS = {".venv", "deeplink", "__mojocache__", ".claude"}
 _NONE_RETURN_RE = re.compile(r"\)\s*->\s*None\s*:")
 
 

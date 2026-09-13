@@ -38,7 +38,7 @@ from torch.ops import aten  # ty: ignore[unresolved-import]
 import torch_mojo_backend.is_running_tests
 from torch_mojo_backend import custom_mojo_ops
 from torch_mojo_backend.flags import verbose_enabled
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import get_ordered_accelerators
+from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 from torch_mojo_backend.types import CountedCallable, MaxTensor, Scalar, SymIntType
 
 # F.functional's stub returns Callable[..., Any], incompatible with the
@@ -104,12 +104,13 @@ def find_broadcast_shape(shape_a: list[Dim], shape_b: list[Dim]) -> list[Dim]:
 
 def torch_device_to_max_device(x: torch.device) -> DeviceRef:
     if x.type == "mojo":
-        # For mojo, use ordered accelerators (GPU first, CPU last)
+        # get_accelerators() is already ordered GPU first, CPU last -- the
+        # same order the native backend's device.mojo assigns mojo indices.
         # index None or 0 = first accelerator (first GPU or CPU if no GPU)
         # higher indices = additional GPUs, with CPU at the highest index
         index = x.index if x.index is not None else 0
 
-        accelerators = get_ordered_accelerators()
+        accelerators = get_accelerators()
         if index >= len(accelerators):
             raise ValueError(f"Invalid mojo index {index}")
 

@@ -234,13 +234,14 @@ def emit_asm(
 def find_entry_modules(tree: Path, kernel_dir: Path) -> dict[str, Path]:
     """Map each entry module's stem to its path relative to ``tree``.
 
-    Only the modules that define a `PyInit_` are built on their own; the rest
-    are libraries whose kernels are instantiated by an importer of theirs, and
-    building one in isolation emits no sidecars at all.
+    Only the modules that export the family's `tmb_call` C entry are built on
+    their own (see docs/native_backend.md); the rest are libraries whose
+    kernels are instantiated by an importer of theirs, and building one in
+    isolation emits no sidecars at all.
     """
     entries: dict[str, Path] = {}
     for path in sorted((tree / kernel_dir).rglob("*.mojo")):
-        if "def PyInit_" not in path.read_text():
+        if "def tmb_call" not in path.read_text():
             continue
         relative = path.relative_to(tree)
         if path.stem in entries:
@@ -257,8 +258,8 @@ def gate_sources(tree: Path, kernel_dir: Path, module: Path) -> list[Path]:
 
     An operation directory owns its entry point and its private helpers, and a
     gate may sit in either, so the whole directory is scanned.  An entry module
-    that lives at the package root (tensor_holder.mojo) is scanned alone: its
-    siblings there are the shared libraries, including variant_gates.mojo.
+    that lives at the package root is scanned alone: its siblings there are the
+    shared libraries, including variant_gates.mojo.
     """
     entry = tree / module
     if entry.parent.resolve() == (tree / kernel_dir).resolve():
@@ -334,7 +335,7 @@ def plan_module(
 
     ops: list[str | None] = list(merged.ops)
     if not ops:
-        # Not necessarily a bug -- tensor_holder.mojo is deliberately ungated --
+        # Not necessarily a bug -- a family may be deliberately ungated --
         # but a module that lost its gates would otherwise compare as empty and
         # silently read as "nothing differs", which is the failure mode this
         # whole script exists to avoid. Build it bare and say so out loud.
@@ -443,7 +444,7 @@ def parse_args() -> argparse.Namespace:
         "--modules",
         nargs="*",
         default=None,
-        help="module stems to check; default is every PyInit_ module in --kernel-dir",
+        help="module stems to check; default is every tmb_call module in --kernel-dir",
     )
     parser.add_argument(
         "--ops",

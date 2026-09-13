@@ -6,9 +6,7 @@ from typing import cast
 
 import torch
 
-from torch_mojo_backend import mojo_backend
-from torch_mojo_backend.eager_kernels import aten_fast
-from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
+from torch_mojo_backend import mojo_backend, native
 from torch_mojo_backend.types import CountedCallable
 
 
@@ -20,108 +18,151 @@ def _xfail_if_unsupported(device: str) -> Iterator[None]:
     Killing the graph fallback (docs/strided_owning_tensors_design.md) turned
     "unsupported input" from a slow fallback into a clear raise; this makes the
     existing suite record those as expected-unsupported instead of hard
-    failures, without editing individual tests or masking real errors (only
-    our own "not supported by mojo" NotImplementedError is caught).
+    failures, without editing individual tests or masking real errors.
+
+    Two spellings are recognized, one per generation of the backend. The old
+    Python eager path said "not supported by mojo eager mode"; the native
+    backend's `unsupported()` comes through the C++ shim as
+    `<why> [aten::<op>.<overload>]` (`raise_from_kernel` in
+    native/csrc/shim_dispatch.cpp) and never names the device, so that
+    bracketed suffix is what identifies it. Any other NotImplementedError is
+    re-raised.
     """
     try:
         yield
     except NotImplementedError as exc:
-        if str(device).startswith("mojo") and "mojo" in str(exc):
+        declined = "mojo" in str(exc) or "[aten::" in str(exc)
+        if str(device).startswith("mojo") and declined:
             import pytest  # noqa: PLC0415 -- pytest is a dev dependency; this module imports without it
 
             pytest.xfail(f"unsupported on mojo eager: {exc}")
         raise
 
 
+# Composites the mojo device deliberately registers no kernel for, mapped to
+# the native ops ATen's decomposition of them actually calls. Keyed by the
+# `aten_functions` twin's name, because that is what a test registers.
+#
+#   *_like and fill.Scalar are CompositeExplicitAutograd upstream, so they
+#   reach the device as `empty.memory_format` (+ `fill_.Scalar` when they
+#   write a value) -- see the module docstring of native/mojo/ops_factories.mojo.
+#
+#   scaled_dot_product_attention and _scaled_dot_product_attention_math are
+#   CompositeImplicitAutograd. Registering either would take it out of reach
+#   of the decomposition autograd differentiates and silently drop the
+#   gradient, so native/mojo/ops_attention.mojo registers only the lower ops:
+#   a route with no fused kernel (a mask, the CPU device, an unsupported
+#   shape) runs ATen's own math composition, two batched matmuls around one
+#   softmax.
+_COMPOSITE_NATIVE_OPS: dict[str, tuple[str, ...]] = {
+    "aten_empty_like": ("aten::empty.memory_format", "aten::empty_strided"),
+    "aten_fill_scalar": ("aten::fill_.Scalar",),
+    "aten_ones_like": ("aten::empty.memory_format", "aten::fill_.Scalar"),
+    "aten_scaled_dot_product_attention": ("aten::bmm", "aten::_softmax"),
+    "aten__scaled_dot_product_attention_math": ("aten::bmm", "aten::_softmax"),
+}
+
+
 class CallChecker:
     """Asserts that at least one of the registered implementations ran.
 
-    Ops covered by the mojo fast eager path have two implementations:
-    the graph one in `aten_functions` (used by the torch.compile backend)
-    and the Mojo-kernel one in `aten_fast` (used by mojo eager mode).
-    A test registers the `aten_functions` twin; `register` automatically
-    also accepts the matching `aten_fast.fast_<name>` twin, so the same
-    test passes whether the op routed to the graph path (compile) or the
-    fast path (eager) — no per-test bookkeeping needed.
+    Ops have two implementations: the graph one in `aten_functions` (used by
+    the torch.compile backend) and the native one on the mojo device. A test
+    registers the `aten_functions` twin; `register` also accepts the native
+    op(s) of the same name, counted by the C++ shim per boxed-kernel call
+    (`native.op_counts`), so the same test passes whether the op routed to
+    the graph path (compile) or the native path (eager).
+
+    An op the mojo device leaves to ATen's decomposition has no native op of
+    its own name: for those, `_COMPOSITE_NATIVE_OPS` names the ops the
+    decomposition calls, and running any of them counts as running the
+    composite natively.
     """
 
     def __init__(self):
         self._functions_to_check: tuple[CountedCallable, ...] | None = None
         self._counts_before_starting_to_check: list[int] | None = None
+        self._native_names: list[str] = []
+        self._native_before: dict[str, int] = {}
 
     @staticmethod
-    def _fast_twins(func: Callable[..., object]) -> list[CountedCallable]:
-        """The aten_fast counterparts of an aten_functions twin.
-
-        Matches `fast_<name>` and its variants `fast_<name>_<suffix>` (e.g.
-        `aten_min` -> `fast_aten_min`, `fast_aten_min_dim`), so a test that
-        registers the base op accepts whichever specialized fast impl the
-        inputs routed to. Only instrumented (call-counted) functions match.
-        """
-        name = getattr(func, "__name__", "")
-        if not name.startswith("aten"):
-            return []
-        base = f"fast_{name}"
-        twins = []
-        for attr in dir(aten_fast):
-            if attr == base or attr.startswith(base + "_"):
-                cand = getattr(aten_fast, attr)
-                if hasattr(cand, "call_count"):
-                    twins.append(cand)
-        return twins
-
-    @staticmethod
-    def _eager_twins(func: Callable[..., object]) -> list[CountedCallable]:
-        """The instrumented mojo registration(s) whose op matches an
-        aten_functions twin. Covers ops implemented as custom / out-variant
-        registrations (empty_like, mean.out, normal_, ...) that don't route
-        through an aten_fast.fast_* function, so nothing else observes them.
-        """
+    def _native_candidates(func: Callable[..., object]) -> list[str]:
+        """Op-name patterns of an aten_functions twin: `aten_mean_out` ->
+        aten::mean_out, aten::mean.out and every aten::mean_out.* overload,
+        plus, for a composite, the ops its decomposition calls."""
         name = getattr(func, "__name__", "")
         if not name.startswith("aten_"):
             return []
-        base = name[len("aten_") :]  # e.g. "empty_like", "mean_out", "_log_softmax"
-        candidates = {f"aten::{base}"}
+        base = name[len("aten_") :]
+        candidates = [f"aten::{base}", f"aten::{base}."]
         if "_" in base:
             head, tail = base.rsplit("_", 1)
-            candidates.add(f"aten::{head}.{tail}")  # mean_out -> aten::mean.out
-        prefix = f"aten::{base}."
-        # The scaled_dot_product_attention family (plain / _math / _flash /
-        # _efficient) is one concept; eager routes to the fused impl whatever
-        # variant the test names, so accept any of them.
-        sdpa_family = "scaled_dot_product" in base
-        twins = []
-        for op_name, counter in EAGER_CALL_COUNTERS.items():
-            if (
-                op_name in candidates
-                or op_name.startswith(prefix)
-                or (sdpa_family and "scaled_dot_product" in op_name)
-            ):
-                twins.append(counter)
-        return twins
+            candidates.append(f"aten::{head}.{tail}")
+        if "scaled_dot_product" in base:
+            candidates.append("scaled_dot_product")
+        candidates.extend(_COMPOSITE_NATIVE_OPS.get(name, ()))
+        return candidates
 
-    def register(self, *funcs: Callable[..., object]):
-        """Register the functions expected to run.
+    @staticmethod
+    def _matches(pattern: str, op_name: str) -> bool:
+        # Case-folded: a twin's name is all lowercase, so the overload it
+        # yields is too (`aten_fill__scalar` -> `aten::fill_.scalar`), while
+        # ATen capitalizes type-named overloads (`aten::fill_.Scalar`). No
+        # two aten ops differ only in case.
+        pattern, op_name = pattern.lower(), op_name.lower()
+        if pattern == "scaled_dot_product":
+            return pattern in op_name
+        if pattern.endswith("."):
+            return op_name.startswith(pattern)
+        return op_name == pattern
 
-        `funcs` are typed `Callable` (each caller's own precise signature,
-        e.g. `aten_functions.aten_min`), not `CountedCallable`: under tests
-        `map_to`/`register_aten_op` always wrap them with a `call_count`
-        attribute, but that fact is deliberately hidden from their static
-        type (see `aten_functions.map_to`) so callers elsewhere keep a
-        precise signature. Cast here, at the one place that relies on it.
+    def register(self, *funcs: Callable[..., object] | str):
+        """Register the implementations expected to run.
+
+        A callable is an `aten_functions` twin, typed `Callable` (each
+        caller's own precise signature, e.g. `aten_functions.aten_min`) and
+        not `CountedCallable`: under tests `map_to` always wraps them with a
+        `call_count` attribute, but that fact is deliberately hidden from
+        their static type (see `aten_functions.map_to`). Cast here, at the
+        one place that relies on it.
+
+        A string is a native op name (`"aten::addr"`), for an op with no
+        `aten_functions` twin because the graph backend leaves it to ATen's
+        decomposition: only the mojo device's own kernel can satisfy it.
         """
         expanded: list[CountedCallable] = []
+        self._native_names = []
         for func in funcs:
+            if isinstance(func, str):
+                if func not in self._native_names:
+                    self._native_names.append(func)
+                continue
             counted_func = cast(CountedCallable, func)
             if counted_func not in expanded:
                 expanded.append(counted_func)
-            for twin in self._fast_twins(func) + self._eager_twins(func):
-                if twin not in expanded:
-                    expanded.append(twin)
+            for pattern in self._native_candidates(func):
+                if pattern not in self._native_names:
+                    self._native_names.append(pattern)
         self._functions_to_check = tuple(expanded)
         self._counts_before_starting_to_check = [
             f.call_count for f in self._functions_to_check
         ]
+        if native.is_registered():
+            native.op_counting(True)
+            self._native_before = native.op_counts()
+        else:
+            self._native_before = {}
+
+    def _native_called(self) -> bool:
+        if not native.is_registered() or not self._native_names:
+            return False
+        now = native.op_counts()
+        for op_name, count in now.items():
+            if count > self._native_before.get(op_name, 0) and any(
+                self._matches(p, op_name) for p in self._native_names
+            ):
+                return True
+        return False
 
     def check_was_called(self):
         if (
@@ -131,15 +172,21 @@ class CallChecker:
             raise ValueError(
                 "No function to check was set, call call_checker.register first"
             )
-        if not any(
+        if not self._functions_to_check and not self._native_names:
+            raise ValueError("call_checker.register was called with nothing to check")
+        graph_called = any(
             func.call_count > count_before
             for func, count_before in zip(
                 self._functions_to_check, self._counts_before_starting_to_check
             )
-        ):
-            names = ", ".join(f.__name__ for f in self._functions_to_check)
+        )
+        if not graph_called and not self._native_called():
+            names = ", ".join(
+                [f.__name__ for f in self._functions_to_check] + self._native_names
+            )
             raise AssertionError(
-                f"Expected one of [{names}] to be called at least once in the test, but none was"
+                f"Expected one of [{names}] (or the native mojo op of the same "
+                "name) to be called at least once in the test, but none was"
             )
 
 

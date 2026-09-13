@@ -70,7 +70,9 @@ COVERS: dict[str, str] = {
     "aten::clone": "test_clone (strided inputs; contiguous clone is a memcpy)",
     "aten::tril": "test_tril",
     "aten::triu": "test_triu",
-    "aten::arange": "test_arange",
+    "aten::arange.start_out": (
+        "test_arange (torch.arange reaches the device through the out overload)"
+    ),
     "aten::_to_copy": "test_to_copy_cast (dtype-cast regime only)",
 }
 

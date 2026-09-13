@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -37,9 +38,26 @@ from bench_lib import baselines
 # `environment.root = ["benchmarks"]` in [tool.ty], mirroring the sys.path
 # insert -- left for a repo-wide config change rather than a local workaround.)
 from conftest import KEY_DUMP_ENV  # ty: ignore[unresolved-import]
-from torch_mojo_backend.mojo_device import mojo_device_aten_ops as reg
 
 BENCH_DIR = Path(__file__).resolve().parent
+NATIVE_MOJO_DIR = BENCH_DIR.parent / "torch_mojo_backend" / "native" / "mojo"
+
+# `impl[op_add_tensor](lib, "add.Tensor")` in an ops_*.mojo file IS the
+# registration (see docs/native_backend.md): the backend registers its ops
+# from Mojo, so the list is read from the source rather than imported.
+# `impl[op_x, "name.overload"](site)` in each register_<group> (registry.mojo);
+# the formatter may break the call over several lines
+_IMPL_RE = re.compile(r'impl\[\s*\w+\s*,\s*"([^"]+)"\s*,?\s*\]\s*\(', re.S)
+
+
+def registered_ops() -> set[str]:
+    names: set[str] = set()
+    for path in sorted(NATIVE_MOJO_DIR.glob("*.mojo")):
+        names |= {f"aten::{name}" for name in _IMPL_RE.findall(path.read_text())}
+    if not names:
+        raise AssertionError(f"no aten op registrations found under {NATIVE_MOJO_DIR}")
+    return names
+
 
 FAMILY_MODULES = (
     "test_gemm",
@@ -57,7 +75,7 @@ FAMILY_MODULES = (
     "test_data_movement",
 )
 
-_VIEW = "pure view/metadata op: zero-copy wrapper math, no kernel launched"
+_VIEW = "pure view/metadata op: zero-copy metadata math, no kernel launched"
 _ALLOC = "pure allocation, no kernel; the allocator is Modular's, not ours to gate"
 _FILL = "alloc + the same fill kernel already benchmarked via fill_.Scalar"
 _MEMCPY = (
@@ -65,89 +83,151 @@ _MEMCPY = (
     "unmeasurable by the suite's own rules"
 )
 _OUT = (
-    "out-variant plumbing over an already-benchmarked functional fast impl "
-    "(compute + _copy_into)"
+    "out-variant plumbing over an already-benchmarked functional impl "
+    "(compute, then copy_strided_into when the caller's tensor isn't the "
+    "right shape/dtype/layout to compute into directly)"
 )
+
+_COMPOSED = (
+    "no kernel of its own: ops_composed.mojo builds it from ops this suite "
+    "already measures (a few extra launches, nothing new to regress against)"
+)
+_HOST_RNG = "host-side torch RNG + upload; no device kernel of ours"
 
 # Registered ops that are deliberately NOT benchmarked, with the defense.
 SKIPPED_OPS: dict[str, str] = {
     # -- views ------------------------------------------------------------
-    "aten::alias": _VIEW,
     "aten::as_strided": _VIEW,
-    "aten::detach": _VIEW,
     "aten::view": _VIEW,
     "aten::_unsafe_view": _VIEW,
-    "aten::expand": _VIEW,
-    "aten::permute": _VIEW,
-    "aten::transpose.int": _VIEW,
-    "aten::t": _VIEW,
-    "aten::select.int": _VIEW,
-    "aten::slice.Tensor": _VIEW,
-    "aten::unsqueeze": _VIEW,
-    "aten::squeeze.dim": _VIEW,
-    "aten::split.Tensor": _VIEW + " (returns views)",
-    "aten::split_with_sizes": _VIEW + " (returns views)",
-    "aten::unbind.int": _VIEW + " (returns views)",
+    "aten::_reshape_alias": _VIEW,
     # -- allocation -------------------------------------------------------
     "aten::empty.memory_format": _ALLOC,
     "aten::empty_strided": _ALLOC,
-    "aten::empty_strided.memory_format": _ALLOC,
     "aten::empty_permuted": _ALLOC,
-    "aten::empty_like": _ALLOC,
-    "aten::new_empty": _ALLOC,
     # -- alloc + fill -----------------------------------------------------
-    "aten::zeros": _FILL,
-    "aten::ones": _FILL,
-    "aten::full": _FILL,
-    "aten::zeros_like": _FILL,
-    "aten::ones_like": _FILL,
-    "aten::full_like": _FILL,
-    "aten::new_zeros": _FILL,
-    "aten::new_ones": _FILL,
-    "aten::new_full": _FILL,
-    "aten::scalar_tensor": _FILL,
     "aten::zero_": _FILL + " (delegates to fill_)",
     "aten::fill.Scalar": _FILL,
     # -- transfers / sync -------------------------------------------------
     "aten::_copy_from": _MEMCPY + " (H2D/D2H/D2D)",
-    "aten::arange.start_out": _MEMCPY + " (arange + copy plumbing)",
     "aten::_local_scalar_dense": (
         "scalar extraction / sync primitive: the cost is the sync, not a kernel"
     ),
-    "aten::normal_": "host-side torch RNG + upload; no device kernel of ours",
+    "aten::normal_": _HOST_RNG,
     "aten::record_stream": (
         "stream-lifetime bookkeeping, not compute: records a MAX event on "
         "the named stream so a buffer's free is fenced behind a foreign "
-        "reader (device_streams.record_use). No kernel launches, so there "
-        "is no device time to measure"
+        "reader (native/mojo/device.mojo). No kernel launches, so there is "
+        "no device time to measure"
     ),
     # -- metadata-only mutation -------------------------------------------
     "aten::set_.source_Tensor": (
-        "repoints a tensor at another's allocation in place: payload rebind "
+        "repoints a tensor at another's allocation in place: storage swap "
         "plus TensorImpl metadata, zero-copy and no kernel"
     ),
+    # -- dispatch decision, not compute -----------------------------------
+    "aten::_fused_sdp_choice": (
+        "returns which SDPA backend to use as an int; the attention kernel "
+        "it selects is what test_attention measures"
+    ),
+    # -- CPU-device-only attention ----------------------------------------
+    "aten::_scaled_dot_product_flash_attention_for_cpu": (
+        "ATen routes this overload only on the MAX CPU device; the suite "
+        "measures the accelerator against stock GPU torch, so there is no "
+        "comparable reference leg"
+    ),
+    "aten::_scaled_dot_product_flash_attention_for_cpu_backward": (
+        "backward of the CPU-device-only overload above, same reason"
+    ),
     # -- out-variant plumbing --------------------------------------------
+    "aten::abs.out": _OUT,
+    "aten::acos.out": _OUT,
+    "aten::add.out": _OUT,
     "aten::addcdiv.out": _OUT,
     "aten::addcmul.out": _OUT,
+    "aten::addmm.out": _OUT,
+    "aten::any.out": _OUT,
+    "aten::asinh.out": _OUT,
+    "aten::atanh.out": _OUT,
+    "aten::bitwise_not.out": _OUT,
+    "aten::bmm.out": _OUT,
     "aten::bucketize.Scalar_out": _OUT,
     "aten::bucketize.Tensor_out": _OUT,
+    "aten::cat.out": _OUT,
+    "aten::ceil.out": _OUT,
+    "aten::cos.out": _OUT,
+    "aten::cosh.out": _OUT,
     "aten::div.out": _OUT,
     "aten::div.out_mode": _OUT,
-    "aten::mul.out": _OUT,
-    "aten::mean.out": _OUT,
-    "aten::sub.out": _OUT,
-    "aten::any.out": _OUT,
-    "aten::lerp.Scalar_out": _OUT,
+    "aten::eq.Scalar_out": _OUT,
+    "aten::eq.Tensor_out": _OUT,
+    "aten::erf.out": _OUT,
+    "aten::exp.out": _OUT,
+    "aten::floor.out": _OUT,
+    "aten::ge.Scalar_out": _OUT,
+    "aten::ge.Tensor_out": _OUT,
+    "aten::gelu.out": _OUT,
+    "aten::gt.Scalar_out": _OUT,
+    "aten::gt.Tensor_out": _OUT,
     "aten::isin.Tensor_Tensor_out": _OUT,
+    "aten::isnan.out": _OUT,
+    "aten::le.Scalar_out": _OUT,
+    "aten::le.Tensor_out": _OUT,
+    "aten::lerp.Scalar_out": _OUT,
+    "aten::log.out": _OUT,
+    "aten::log1p.out": _OUT,
+    "aten::logical_not.out": _OUT,
+    "aten::lt.Scalar_out": _OUT,
+    "aten::lt.Tensor_out": _OUT,
+    "aten::masked_fill.Scalar_out": _OUT,
+    "aten::masked_fill.Tensor_out": _OUT,
+    "aten::mean.out": _OUT,
     "aten::min.dim_min": _OUT,
+    "aten::mm.out": _OUT,
+    "aten::mul.out": _OUT,
+    "aten::ne.Scalar_out": _OUT,
+    "aten::ne.Tensor_out": _OUT,
+    "aten::neg.out": _OUT,
+    "aten::reciprocal.out": _OUT,
+    "aten::relu.out": _OUT,
+    "aten::rsqrt.out": _OUT,
     "aten::searchsorted.Scalar_out": _OUT,
     "aten::searchsorted.Tensor_out": _OUT,
-    # -- not implemented --------------------------------------------------
-    "aten::_adaptive_avg_pool2d_backward": (
-        "registered as an explicit raiser (_register_missing): no fast impl "
-        "exists, nothing to measure"
-    ),
+    "aten::sigmoid.out": _OUT,
+    "aten::sign.out": _OUT,
+    "aten::silu.out": _OUT,
+    "aten::sin.out": _OUT,
+    "aten::sinh.out": _OUT,
+    "aten::sqrt.out": _OUT,
+    "aten::sub.out": _OUT,
+    "aten::where.self_out": _OUT,
+    "aten::tan.out": _OUT,
+    "aten::tanh.out": _OUT,
+    # -- composed from already-benchmarked ops ------------------------------
+    "aten::threshold_backward": _COMPOSED,
+    "aten::threshold_backward.grad_input": _COMPOSED,
+    "aten::sigmoid_backward": _COMPOSED,
+    "aten::sigmoid_backward.grad_input": _COMPOSED,
+    "aten::tanh_backward": _COMPOSED,
+    "aten::tanh_backward.grad_input": _COMPOSED,
+    "aten::isneginf": _COMPOSED,
+    "aten::isneginf.out": _COMPOSED,
+    "aten::isposinf": _COMPOSED,
+    "aten::isposinf.out": _COMPOSED,
+    # -- host-side RNG ------------------------------------------------------
+    "aten::random_": _HOST_RNG,
+    "aten::random_.from": _HOST_RNG,
+    "aten::random_.to": _HOST_RNG,
     # -- new op, no benchmark yet -------------------------------------------
+    "aten::_softmax_backward_data": (
+        "newly registered; test_softmax covers the forward and the backward "
+        "shares _log_softmax_backward_data's reduce-and-scale shape, but it "
+        "has no benchmark node of its own yet"
+    ),
+    "aten::native_batch_norm_backward": (
+        "newly registered; test_batch_norm covers the forward, and the "
+        "backward has no benchmark node of its own yet"
+    ),
     "aten::addr": (
         "newly added fast kernel (see fix-addr-fp16-bf16-precision) fixes "
         "fp16/bf16 rounding-order drift vs CPU; it has no prior native "
@@ -161,7 +241,7 @@ SKIPPED_OPS: dict[str, str] = {
 
 
 def test_every_registered_op_is_classified():
-    registered = {name for name, _ in reg._aten_ops_registry}
+    registered = registered_ops()
     covered: dict[str, str] = {}
     skipped: dict[str, str] = dict(SKIPPED_OPS)
     for module_name in FAMILY_MODULES:

@@ -34,6 +34,27 @@ dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["torch_mojo_backend"]
+# The prebuilt native libraries (scripts/build_prebuilt.py) are ignored by
+# git, and hatchling skips VCS-ignored files unless they are named here. The
+# wheel stays py3-none-any: these are data files ctypes loads at run time, not
+# extension modules, and one wheel carrying every platform's pair is simpler
+# than a wheel per platform -- a file that does not match the machine is never
+# opened (see docs/native_backend.md, "Prebuilt libraries and the wheel").
+artifacts = [
+    "torch_mojo_backend/native/prebuilt/*.so",
+    "torch_mojo_backend/native/prebuilt/*.dylib",
+    "torch_mojo_backend/native/prebuilt/manifest.json",
+]
+
+[tool.hatch.build.targets.sdist]
+# Plain `uv build` builds the wheel from the sdist, so the same list has to be
+# here or the libraries silently vanish from the wheel. A checkout without
+# prebuilt libraries (every clone) matches nothing and ships as before.
+artifacts = [
+    "torch_mojo_backend/native/prebuilt/*.so",
+    "torch_mojo_backend/native/prebuilt/*.dylib",
+    "torch_mojo_backend/native/prebuilt/manifest.json",
+]
 
 [tool.ruff]
 target-version = "py311"
@@ -77,20 +98,13 @@ ban-relative-imports = "all"
 python = ".venv"
 
 [tool.ty.rules]
-# Every occurrence (verified by hand, none blanket-assumed) is one of two
-# deliberate polymorphic-override points that nominal override-checking
-# cannot express: (1) MojoExtension's abstract methods are `*args/**kwargs`
-# placeholders precisely so each concrete descriptor (MojoFileExtension,
-# aten_fast.py's per-op extensions, ...) can declare its own independent
-# call ABI -- callers always go through the concrete subclass, never a
-# MojoExtension-typed reference, so this is runtime-duck-typed dispatch, not
-# a substitutability hole; (2) TorchMojoTensor's __torch_dispatch__,
-# __torch_function__, __repr__, __reduce_ex__ and the autograd Functions'
-# backward() are torch's own documented tensor-subclass/autograd extension
-# points, where every real subclass (including torch's own FakeTensor,
-# LoggingTensor, ...) intentionally uses its own signature. `ty check`
-# exits non-zero on warnings too (no `--exit-zero-on-warning` in CI), so
-# this must be "ignore", not "warn", to keep `ty check` green.
+# One deliberate polymorphic-override point that nominal override-checking
+# cannot express: MojoProcessGroup._get_backend returns itself rather than a
+# c10d Backend, because torch looks a group's backend up that way for
+# batch_isend_irecv and _coalescing_manager and the mojo group IS its own
+# backend (see docs/native_backend.md, "Distributed"). `ty check` exits
+# non-zero on warnings too (no `--exit-zero-on-warning` in CI), so this must
+# be "ignore", not "warn", to keep `ty check` green.
 invalid-method-override = "ignore"
 # Bare `dict`/`list`/`Callable` is an unchecked hole: require the arguments.
 missing-type-argument = "error"

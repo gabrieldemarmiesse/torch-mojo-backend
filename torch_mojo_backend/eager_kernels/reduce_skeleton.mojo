@@ -61,10 +61,10 @@ from std.utils.coord import Coord
 from std.utils.numerics import max_or_inf, min_or_neg_inf
 from std.utils.static_tuple import StaticTuple
 
-from std.python._cpython import PyObjectPtr
 from std.utils.index import IndexList
 
 from op_utils import (
+    Arg,
     MAX_RANK,
     TensorSpec,
     _adjacent_reduce_geom,
@@ -1155,12 +1155,7 @@ def _reduce_generic[
 
 def _rowred_spec_into_go[
     Op: ReduceOp
-](
-    a_o: PyObjectPtr,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
-    out_o: PyObjectPtr,
-) raises:
+](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, out_o: Arg,) raises:
     """TensorSpec entry for one scalar reduction (docs/tensor_spec_design.md).
 
     Python parses the dim spec and owns dtype promotion and output allocation;

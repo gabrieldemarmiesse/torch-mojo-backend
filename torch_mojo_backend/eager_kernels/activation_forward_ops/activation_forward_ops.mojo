@@ -7,27 +7,26 @@ read, synchronization, or vendor-library call.
 """
 
 from std.os import abort
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from activation_forward_kernels import enqueue_gelu_forward_bf16
 from op_utils import (
+    Arg,
+    Argv,
     _make_ptr,
     _raw_ctx,
     _raw_int,
     _spec_dispatcher5,
 )
 
-from variant_gates import _op_on, _register_call
+from variant_gates import ErrBuf, NO_OP_COMPILED, _op_on, _tmb_entry_error
 
 
 def _gelu_forward_bf16_go(
-    output_obj: PyObjectPtr,
-    input_obj: PyObjectPtr,
-    elements_obj: PyObjectPtr,
-    tanh_approx_obj: PyObjectPtr,
-    context_obj: PyObjectPtr,
+    output_obj: Arg,
+    input_obj: Arg,
+    elements_obj: Arg,
+    tanh_approx_obj: Arg,
+    context_obj: Arg,
 ) raises:
     var output_addr = _raw_int(output_obj)
     var input_addr = _raw_int(input_obj)
@@ -52,18 +51,16 @@ def _gelu_forward_bf16_go(
 
 
 @export
-def PyInit_activation_forward_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var builder = PythonModuleBuilder("activation_forward_ops")
         comptime if _op_on["GeluForwardBF16"]():
-            _register_call(
-                builder,
-                _spec_dispatcher5[_gelu_forward_bf16_go, "GeluForwardBF16"],
-                docstring=(
-                    "(output, input, elements, tanh_approx, context); "
-                    "runtime-dynamic BF16 GELU forward"
-                ),
+            _spec_dispatcher5[_gelu_forward_bf16_go, "GeluForwardBF16"](
+                argv, argc
             )
-        return builder.finalize()
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create activation_forward_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

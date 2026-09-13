@@ -36,8 +36,6 @@ from std.gpu.primitives import warp
 from std.math import ceildiv, exp, floor
 from std.memory import stack_allocation
 from std.memory.alloc import unsafe_alloc
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
 from std.sys.info import (
     _accelerator_arch,
     has_accelerator,
@@ -73,9 +71,10 @@ from layout import TileTensor, row_major
 from native_dropout_kernels import _philox4x32_10
 from nn.softmax import softmax
 
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from op_utils import (
+    Arg,
+    Argv,
     FLOAT_DTYPES,
     MAX_RANK,
     _check_into,
@@ -88,7 +87,6 @@ from op_utils import (
     _raw_dtype_int,
     _raw_f64,
     _raw_int,
-    _raw_ret_none,
     _raw_tuple_f64,
     _raw_tuple_int,
     _reduce_spec_geom,
@@ -98,15 +96,16 @@ from op_utils import (
     _spec_dispatcher5,
     _spec_dispatcher7,
     _spec_ptr,
-    _spec_unsupported,
     ieee_sqrt,
 )
 
 from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
     _dtype_arg_on,
     _dtype_supported,
     _op_on,
-    _register_call,
+    _tmb_entry_error,
 )
 
 
@@ -157,15 +156,15 @@ def _batch_norm[
 
 
 def _batch_norm_go(
-    out_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    mean_ptr_obj: PyObjectPtr,
-    var_ptr_obj: PyObjectPtr,
-    gamma_ptr_obj: PyObjectPtr,
-    beta_ptr_obj: PyObjectPtr,
-    params: PyObjectPtr,  # (eps, channels, inner, total)
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    mean_ptr_obj: Arg,
+    var_ptr_obj: Arg,
+    gamma_ptr_obj: Arg,
+    beta_ptr_obj: Arg,
+    params: Arg,  # (eps, channels, inner, total)
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_addr = _raw_int(out_ptr_obj)
@@ -278,15 +277,15 @@ def _layer_norm[
 
 
 def _layer_norm_go(
-    out_ptr_obj: PyObjectPtr,
-    mean_out_ptr_obj: PyObjectPtr,
-    rstd_out_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    gamma_ptr_obj: PyObjectPtr,
-    beta_ptr_obj: PyObjectPtr,
-    params: PyObjectPtr,  # (eps, rows, cols)
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    mean_out_ptr_obj: Arg,
+    rstd_out_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    gamma_ptr_obj: Arg,
+    beta_ptr_obj: Arg,
+    params: Arg,  # (eps, rows, cols)
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_addr = _raw_int(out_ptr_obj)
@@ -851,21 +850,21 @@ def _softmax_rows_dropout_warp_kernel(
 
 
 def _softmax_rows_dropout_go(
-    probs_ptr_obj: PyObjectPtr,
-    pdrop_ptr_obj: PyObjectPtr,
-    mask_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    rows_obj: PyObjectPtr,
-    cols_obj: PyObjectPtr,
-    scale_obj: PyObjectPtr,
-    causal_obj: PyObjectPtr,
-    q_len_obj: PyObjectPtr,
-    p_obj: PyObjectPtr,
-    seed_lo_obj: PyObjectPtr,
-    seed_hi_obj: PyObjectPtr,
-    offset_lo_obj: PyObjectPtr,
-    offset_hi_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    probs_ptr_obj: Arg,
+    pdrop_ptr_obj: Arg,
+    mask_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    rows_obj: Arg,
+    cols_obj: Arg,
+    scale_obj: Arg,
+    causal_obj: Arg,
+    q_len_obj: Arg,
+    p_obj: Arg,
+    seed_lo_obj: Arg,
+    seed_hi_obj: Arg,
+    offset_lo_obj: Arg,
+    offset_hi_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var probs_addr = _raw_int(probs_ptr_obj)
     var pdrop_addr = _raw_int(pdrop_ptr_obj)
@@ -1260,15 +1259,15 @@ def _softmax_rows[
 
 
 def _softmax_rows_go(
-    out_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    rows: PyObjectPtr,
-    cols: PyObjectPtr,
-    scale: PyObjectPtr,
-    causal: PyObjectPtr,
-    q_len: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    rows: Arg,
+    cols: Arg,
+    scale: Arg,
+    causal: Arg,
+    q_len: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_addr = _raw_int(out_ptr_obj)
@@ -1753,12 +1752,12 @@ def _max_pool2d[
 
 
 def _max_pool2d_go(
-    out_ptr_obj: PyObjectPtr,
-    idx_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    params: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    idx_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    params: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_addr = _raw_int(out_ptr_obj)
@@ -1810,6 +1809,14 @@ def _max_pool2d_go(
 # ---------------------------------------------------------------------------
 # Embedding lookup: out[i] = weight[indices[i // row_len] * row_len +
 # i % row_len]. This is gather along dim 0 of a 2D weight table.
+#
+# `num_rows` is the table's row count: a row index outside [0, num_rows)
+# would read arbitrary device memory, so it is clamped into range. Clamped
+# rather than reported because a host-visible error flag costs a device
+# synchronization on every embedding lookup -- the first op of every
+# transformer forward -- and CUDA_KERNEL_ASSERT has no portable equivalent
+# across CUDA / HIP / Metal. The value produced for an invalid index is
+# unspecified; the memory access is not.
 # ---------------------------------------------------------------------------
 
 
@@ -1822,6 +1829,7 @@ def _gather0[
     indices_addr: Int,
     num_indices: Int,
     row_len: Int,
+    num_rows: Int,
     ctx: DeviceContext,
 ) raises:
     var out_ptr = _make_ptr[dtype](out_addr)
@@ -1834,6 +1842,10 @@ def _gather0[
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
         var row = Int(indices_ptr[unsafe_offset=i // row_len])
+        if row < 0:
+            row = 0
+        elif row >= num_rows:
+            row = num_rows - 1
         out_ptr[unsafe_offset=i] = weight_ptr[
             unsafe_offset=row * row_len + i % row_len
         ]
@@ -1851,6 +1863,7 @@ def _gather0_data_dispatch[
     indices_addr: Int,
     num_indices: Int,
     row_len: Int,
+    num_rows: Int,
     ctx: DeviceContext,
 ) raises:
     var handled = False
@@ -1863,6 +1876,7 @@ def _gather0_data_dispatch[
                     indices_addr,
                     num_indices,
                     row_len,
+                    num_rows,
                     ctx,
                 )
                 handled = True
@@ -1871,14 +1885,15 @@ def _gather0_data_dispatch[
 
 
 def _gather0_go(
-    out_ptr_obj: PyObjectPtr,
-    weight_ptr_obj: PyObjectPtr,
-    indices_ptr_obj: PyObjectPtr,
-    idx_dtype_obj: PyObjectPtr,
-    num_indices: PyObjectPtr,
-    row_len: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    weight_ptr_obj: Arg,
+    indices_ptr_obj: Arg,
+    idx_dtype_obj: Arg,
+    num_indices: Arg,
+    row_len: Arg,
+    num_rows: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var idx_dtype = _raw_dtype_int(idx_dtype_obj)
@@ -1887,6 +1902,7 @@ def _gather0_go(
     var indices_addr = _raw_int(indices_ptr_obj)
     var num_indices_val = _raw_int(num_indices)
     var row_len_val = _raw_int(row_len)
+    var num_rows_val = _raw_int(num_rows)
     var ctx = _raw_ctx(device_context_ptr)
 
     comptime if _dtype_arg_on[1, DType.int64]():
@@ -1899,6 +1915,7 @@ def _gather0_go(
             indices_addr,
             num_indices_val,
             row_len_val,
+            num_rows_val,
             ctx,
         )
     elif _dtype_arg_on[1, DType.int32]():
@@ -1911,6 +1928,7 @@ def _gather0_go(
             indices_addr,
             num_indices_val,
             row_len_val,
+            num_rows_val,
             ctx,
         )
     else:
@@ -1938,10 +1956,10 @@ def _all_bool(
 
 
 def _all_bool_go(
-    out_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    size: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    size: Arg,
+    device_context_ptr: Arg,
 ) raises:
     _all_bool(
         _raw_int(out_ptr_obj),
@@ -1965,10 +1983,10 @@ def _any_bool(
 
 
 def _any_bool_go(
-    out_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    size: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    size: Arg,
+    device_context_ptr: Arg,
 ) raises:
     _any_bool(
         _raw_int(out_ptr_obj),
@@ -2219,11 +2237,11 @@ def _avg_pool2d[
 
 
 def _avg_pool2d_go(
-    out_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    params: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    params: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_addr = _raw_int(out_ptr_obj)
@@ -2323,11 +2341,11 @@ def _adaptive_avg_pool2d[
 
 
 def _adaptive_avg_pool2d_go(
-    out_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    params: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    params: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_addr = _raw_int(out_ptr_obj)
@@ -2427,15 +2445,15 @@ def _group_norm[
 
 
 def _group_norm_go(
-    out_ptr_obj: PyObjectPtr,
-    mean_out_ptr_obj: PyObjectPtr,
-    rstd_out_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    gamma_ptr_obj: PyObjectPtr,
-    beta_ptr_obj: PyObjectPtr,
-    params: PyObjectPtr,  # (eps, rows, cols, hxw, group, cpg)
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    mean_out_ptr_obj: Arg,
+    rstd_out_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    gamma_ptr_obj: Arg,
+    beta_ptr_obj: Arg,
+    params: Arg,  # (eps, rows, cols, hxw, group, cpg)
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_addr = _raw_int(out_ptr_obj)
@@ -2570,11 +2588,11 @@ def _upsample_bilinear2d[
 
 
 def _upsample_bilinear2d_go(
-    out_ptr_obj: PyObjectPtr,
-    in_ptr_obj: PyObjectPtr,
-    params: PyObjectPtr,  # (ratio_h, ratio_w, in_h, in_w, out_h, out_w, planes, align_corners)
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr_obj: Arg,
+    in_ptr_obj: Arg,
+    params: Arg,  # (ratio_h, ratio_w, in_h, in_w, out_h, out_w, planes, align_corners)
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_addr = _raw_int(out_ptr_obj)
@@ -2620,260 +2638,165 @@ def _upsample_bilinear2d_go(
 # ---------------------------------------------------------------------------
 
 
-def _batch_norm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _batch_norm_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _batch_norm_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _batch_norm_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
-def _layer_norm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _layer_norm_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _layer_norm_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _layer_norm_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
-def _softmax_rows_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _softmax_rows_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _softmax_rows_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _softmax_rows_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
-def _softmax_rows_dropout_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _softmax_rows_dropout_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-            args[unsafe_offset=9],
-            args[unsafe_offset=10],
-            args[unsafe_offset=11],
-            args[unsafe_offset=12],
-            args[unsafe_offset=13],
-            args[unsafe_offset=14],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _softmax_rows_dropout_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _softmax_rows_dropout_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+        args[unsafe_offset=9],
+        args[unsafe_offset=10],
+        args[unsafe_offset=11],
+        args[unsafe_offset=12],
+        args[unsafe_offset=13],
+        args[unsafe_offset=14],
+    )
 
 
-def _max_pool2d_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _max_pool2d_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _max_pool2d_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _max_pool2d_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+    )
 
 
-def _avg_pool2d_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _avg_pool2d_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _avg_pool2d_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _avg_pool2d_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+    )
 
 
-def _adaptive_avg_pool2d_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _adaptive_avg_pool2d_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _adaptive_avg_pool2d_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _adaptive_avg_pool2d_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+    )
 
 
-def _group_norm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _group_norm_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _group_norm_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _group_norm_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
-def _upsample_bilinear2d_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _upsample_bilinear2d_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _upsample_bilinear2d_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _upsample_bilinear2d_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+    )
 
 
-def _gather0_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _gather0_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _gather0_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _gather0_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
-def _all_bool_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _all_bool_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _all_bool_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _all_bool_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+    )
 
 
-def _any_bool_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _any_bool_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _any_bool_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _any_bool_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+    )
 
 
 comptime SPEC_MAXROWS_DTYPES: List[DType] = [
@@ -2886,10 +2809,10 @@ comptime SPEC_MAXROWS_DTYPES: List[DType] = [
 
 
 def _argmax_spec_into_go(
-    a_o: PyObjectPtr,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
-    out_o: PyObjectPtr,
+    a_o: Arg,
+    rdims_t: Arg,
+    keepdim_o: Arg,
+    out_o: Arg,
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
@@ -2900,9 +2823,7 @@ def _argmax_spec_into_go(
     _argreduce_spec_into[SPEC_MAXROWS_DTYPES, False](a, out, rdims_t, a.ctx())
 
 
-def _cumsum_spec_into_go(
-    a_o: PyObjectPtr, dim_o: PyObjectPtr, out_o: PyObjectPtr
-) raises:
+def _cumsum_spec_into_go(a_o: Arg, dim_o: Arg, out_o: Arg) raises:
     """Cumulative sum over the trailing dim (any rank) or dim=0 of a rank-2
     tensor; full-shape output. Python (`fast_aten_cumsum`) normalizes the
     dim and pre-materializes non-contiguous/other-dim inputs, but this
@@ -2948,13 +2869,13 @@ def _cumsum_spec_into_go(
 
 
 def _batch_norm_spec_into_go(
-    in_o: PyObjectPtr,
-    mean_o: PyObjectPtr,
-    var_o: PyObjectPtr,
-    gamma_o: PyObjectPtr,
-    beta_o: PyObjectPtr,
-    eps_o: PyObjectPtr,
-    out_o: PyObjectPtr,
+    in_o: Arg,
+    mean_o: Arg,
+    var_o: Arg,
+    gamma_o: Arg,
+    beta_o: Arg,
+    eps_o: Arg,
+    out_o: Arg,
 ) raises:
     """Inference batch norm: geometry (channels/inner) derived from the
     input spec, output alloc and launch in one boundary call, reusing the
@@ -3017,7 +2938,7 @@ def _batch_norm_spec_into_go(
                 )
 
 
-def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+def _softmax_spec_into_go(a_o: Arg, out_o: Arg) raises:
     """Plain softmax over the trailing dim (scale=1, no causal mask);
     full-shape output. The non-trailing dim transpose recursion and the
     half_to_float cast stay in Python."""
@@ -3050,11 +2971,11 @@ def _softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
 
 
 def _attn_decode_spec_into_go(
-    q_o: PyObjectPtr,
-    k_o: PyObjectPtr,
-    v_o: PyObjectPtr,
-    scale_o: PyObjectPtr,
-    out_o: PyObjectPtr,
+    q_o: Arg,
+    k_o: Arg,
+    v_o: Arg,
+    scale_o: Arg,
+    out_o: Arg,
 ) raises:
     """Fused decode attention (q_len == 1, not causal), GPU only — one
     boundary call replacing the Python gates + geometry + alloc + launch.
@@ -3147,152 +3068,76 @@ def _attn_decode_spec_into_go(
 
 
 @export
-def PyInit_nn_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("nn_ops")
         comptime if _op_on["MeanSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[
-                    _rowred_spec_into_go[MeanOp], "a scalar-reduction spec op"
-                ],
-                docstring="(a_spec, rdims, keepdim, out_spec)",
-            )
+            _spec_dispatcher4[
+                _rowred_spec_into_go[MeanOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["MaxSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[
-                    _rowred_spec_into_go[MaxOp], "a scalar-reduction spec op"
-                ],
-                docstring="(a_spec, rdims, keepdim, out_spec)",
-            )
+            _spec_dispatcher4[
+                _rowred_spec_into_go[MaxOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["ArgmaxSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[_argmax_spec_into_go, "ArgmaxSpec"],
-                docstring="(a_spec, rdims, keepdim, out_spec); int64 indices",
-            )
+            _spec_dispatcher4[_argmax_spec_into_go, "ArgmaxSpec"](argv, argc)
+            return 0
         comptime if _op_on["CumsumSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[_cumsum_spec_into_go, "CumsumSpec"],
-                docstring=(
-                    "(a_spec, dim, out_spec); trailing dim, or dim=0 on a"
-                    " rank-2 tensor"
-                ),
-            )
+            _spec_dispatcher3[_cumsum_spec_into_go, "CumsumSpec"](argv, argc)
+            return 0
         comptime if _op_on["BatchNormSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher7[_batch_norm_spec_into_go, "BatchNormSpec"],
-                docstring=(
-                    "(in, mean, var, gamma, beta specs, eps, out_spec);"
-                    " inference batch norm, geometry from specs"
-                ),
+            _spec_dispatcher7[_batch_norm_spec_into_go, "BatchNormSpec"](
+                argv, argc
             )
+            return 0
         comptime if _op_on["SoftmaxSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher2[_softmax_spec_into_go, "SoftmaxSpec"],
-                docstring="(a_spec, out_spec); trailing dim",
-            )
+            _spec_dispatcher2[_softmax_spec_into_go, "SoftmaxSpec"](argv, argc)
+            return 0
         comptime if _op_on["AttnDecodeSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher5[_attn_decode_spec_into_go, "AttnDecodeSpec"],
-                docstring="(q, k, v specs, scale, out_spec); q_len==1, GPU",
+            _spec_dispatcher5[_attn_decode_spec_into_go, "AttnDecodeSpec"](
+                argv, argc
             )
+            return 0
         comptime if _op_on["BatchNormInference"]():
-            _register_call(
-                b,
-                _batch_norm_dispatcher,
-                docstring=(
-                    "out = (x - mean[c]) * gamma[c] / sqrt(var[c] + eps) +"
-                    " beta[c] (NC..., contiguous)"
-                ),
-            )
+            _batch_norm_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["LayerNorm"]():
-            _register_call(
-                b,
-                _layer_norm_dispatcher,
-                docstring=(
-                    "layer norm over the last dim; also writes float32"
-                    " mean/rstd per row"
-                ),
-            )
+            _layer_norm_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["SoftmaxRows"]():
-            _register_call(
-                b,
-                _softmax_rows_dispatcher,
-                docstring="row softmax of scale*x with optional causal mask",
-            )
+            _softmax_rows_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["SoftmaxRowsDropoutF32"]():
-            _register_call(
-                b,
-                _softmax_rows_dropout_dispatcher,
-                docstring=(
-                    "fused causal row softmax + Philox native dropout (Apple"
-                    " GPU f32): writes pre-dropout probs, dropped probs, and"
-                    " the bool keep-mask in one pass"
-                ),
-            )
+            _softmax_rows_dropout_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["MaxPool2dWithIndices"]():
-            _register_call(
-                b,
-                _max_pool2d_dispatcher,
-                docstring=(
-                    "max pool over NCHW contiguous input, returns values and"
-                    " int64 plane indices"
-                ),
-            )
+            _max_pool2d_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["AvgPool2d"]():
-            _register_call(
-                b,
-                _avg_pool2d_dispatcher,
-                docstring=(
-                    "average pool over NCHW contiguous input (count_include_pad"
-                    " / divisor_override honored)"
-                ),
-            )
+            _avg_pool2d_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["AdaptiveAvgPool2d"]():
-            _register_call(
-                b,
-                _adaptive_avg_pool2d_dispatcher,
-                docstring="adaptive average pool over NCHW contiguous input",
-            )
+            _adaptive_avg_pool2d_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["GroupNorm"]():
-            _register_call(
-                b,
-                _group_norm_dispatcher,
-                docstring=(
-                    "group norm over NC(HxW) contiguous input; writes float32"
-                    " mean/rstd per (sample, group)"
-                ),
-            )
+            _group_norm_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["UpsampleBilinear2d"]():
-            _register_call(
-                b,
-                _upsample_bilinear2d_dispatcher,
-                docstring="bilinear upsample over NCHW contiguous input",
-            )
+            _upsample_bilinear2d_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["Gather0"]():
-            _register_call(
-                b,
-                _gather0_dispatcher,
-                docstring="embedding lookup: gather rows of a 2D table",
-            )
+            _gather0_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["AllBool"]():
-            _register_call(
-                b,
-                _all_bool_dispatcher,
-                docstring="all() over a bool tensor -> scalar bool",
-            )
+            _all_bool_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["AnyBool"]():
-            _register_call(
-                b,
-                _any_bool_dispatcher,
-                docstring="any() over a bool tensor -> scalar bool",
-            )
-        return b.finalize()
+            _any_bool_dispatcher(argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create nn_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

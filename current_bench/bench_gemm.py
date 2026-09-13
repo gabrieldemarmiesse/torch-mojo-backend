@@ -18,6 +18,7 @@ from pathlib import Path
 import torch
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
+from torch_mojo_backend.native import device_module
 
 MI300X_BF16_FLOPS = 1.3e15
 MI300X_HBM_BYTES = 5.3e12
@@ -393,13 +394,9 @@ def main():
 
     register_mojo_devices()
     max_device = list(get_accelerators())[0]
-    from torch_mojo_backend.eager_kernels import (  # noqa: PLC0415 -- reading `tensor_holder` runs eager_kernels' module __getattr__, which builds (cold cache) and dlopens the extension
-        _ctx_ptr,
-        tensor_holder,
-    )
 
     def mojo_synchronize():
-        tensor_holder.synchronize(_ctx_ptr(max_device))
+        device_module.synchronize(0)
 
     cases = extract_cases(args.rocm_profile_dir, args.mojo_profile_dir)
     if args.phase != "all":

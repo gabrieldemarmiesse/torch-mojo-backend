@@ -9,16 +9,14 @@ no allocation, host read, synchronization, or vendor-library call.
 from std.collections import InlineArray
 from std.math import ceildiv
 from std.os import abort
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from op_utils import (
+    Arg,
+    Argv,
     FLOAT_DTYPES,
     _raw_ctx,
     _raw_dtype_int,
     _raw_int,
-    _raw_ret_none,
     _raw_tuple_f64,
     _raw_tuple_int,
     _raw_tuple_len,
@@ -26,7 +24,6 @@ from op_utils import (
     _spec_dispatcher4,
     _spec_dispatcher5,
     _spec_dispatcher8,
-    _spec_unsupported,
 )
 from optimizer_contract import (
     ADAMW_CHUNK_ELEMENTS,
@@ -66,10 +63,12 @@ from foreach_elementwise_kernels import (
 )
 
 from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
     _dtype_arg_on,
     _dtype_supported,
     _op_on,
-    _register_call,
+    _tmb_entry_error,
 )
 
 
@@ -78,14 +77,14 @@ comptime _FOREACH_NORM_RECORD_FIELDS = 3
 
 
 def _fused_adamw_go(
-    metadata_obj: PyObjectPtr,
-    scalars_obj: PyObjectPtr,
-    dtype_mode_obj: PyObjectPtr,
-    flags_obj: PyObjectPtr,
-    lr_ptr_obj: PyObjectPtr,
-    grad_scale_ptr_obj: PyObjectPtr,
-    found_inf_ptr_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    metadata_obj: Arg,
+    scalars_obj: Arg,
+    dtype_mode_obj: Arg,
+    flags_obj: Arg,
+    lr_ptr_obj: Arg,
+    grad_scale_ptr_obj: Arg,
+    found_inf_ptr_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var value_count = _raw_tuple_len(metadata_obj)
     if value_count % _ADAMW_RECORD_FIELDS != 0:
@@ -162,10 +161,10 @@ def _fused_adamw_go(
 
 
 def _foreach_l2_norm_go(
-    metadata_obj: PyObjectPtr,
-    partials_ptr_obj: PyObjectPtr,
-    partials_numel_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    metadata_obj: Arg,
+    partials_ptr_obj: Arg,
+    partials_numel_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var value_count = _raw_tuple_len(metadata_obj)
     if value_count == 0:
@@ -230,7 +229,7 @@ def _foreach_l2_norm_go(
 
 
 def _foreach_ew_validate(
-    metadata_obj: PyObjectPtr, record_fields: Int, op_name: StaticString
+    metadata_obj: Arg, record_fields: Int, op_name: StaticString
 ) raises -> Int:
     """Shared record-count/pointer validation for the batched foreach ops.
 
@@ -258,11 +257,11 @@ def _foreach_ew_validate(
 def _foreach_ew_go[
     op: Int
 ](
-    metadata_obj: PyObjectPtr,
-    scalars_obj: PyObjectPtr,
-    aux_obj: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    metadata_obj: Arg,
+    scalars_obj: Arg,
+    aux_obj: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     """One bridge for the whole `aten::_foreach_*` elementwise family.
 
@@ -380,9 +379,9 @@ def _foreach_ew_go[
 
 
 def _foreach_gather_scalars_go(
-    metadata_obj: PyObjectPtr,
-    out_ptr_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    metadata_obj: Arg,
+    out_ptr_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var record_count = _raw_tuple_len(metadata_obj)
     if record_count == 0:
@@ -419,64 +418,57 @@ comptime _FOREACH_EW_DOC = (
 )
 
 
-def _register_foreach_ew[
-    op: Int, name: StaticString
-](mut builder: PythonModuleBuilder) raises:
-    """Expose one member of the foreach elementwise family.
-
-    Each member is its own specialized build (`OP=<name>`), so the .so it
-    compiles holds exactly one instantiation of the shared kernel body.
-    """
-    comptime if _op_on[name]():
-        _register_call(
-            builder,
-            _spec_dispatcher5[_foreach_ew_go[op], name],
-            docstring=_FOREACH_EW_DOC,
-        )
-
-
 @export
-def PyInit_optimizer_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var builder = PythonModuleBuilder("optimizer_ops")
         comptime if _op_on["FusedAdamW"]():
-            _register_call(
-                builder,
-                _spec_dispatcher8[_fused_adamw_go, "FusedAdamW"],
-                docstring=(
-                    "(metadata, scalars, dtype_mode, flags, lr_ptr,"
-                    " grad_scale_ptr, found_inf_ptr, context_ptr); fused FP32"
-                    " AdamW"
-                ),
-            )
+            _spec_dispatcher8[_fused_adamw_go, "FusedAdamW"](argv, argc)
+            return 0
         comptime if _op_on["ForeachL2Norm"]():
-            _register_call(
-                builder,
-                _spec_dispatcher4[_foreach_l2_norm_go, "ForeachL2Norm"],
-                docstring=(
-                    "(metadata, partials_ptr, partials_numel, context_ptr); "
-                    "runtime-dynamic FP32 foreach L2 norms"
-                ),
-            )
-        _register_foreach_ew[FEW_MUL, "ForeachMul"](builder)
-        _register_foreach_ew[FEW_ADD, "ForeachAdd"](builder)
-        _register_foreach_ew[FEW_DIV, "ForeachDiv"](builder)
-        _register_foreach_ew[FEW_MUL_TENSOR, "ForeachMulTensor"](builder)
-        _register_foreach_ew[FEW_LERP, "ForeachLerp"](builder)
-        _register_foreach_ew[FEW_ADDCMUL, "ForeachAddcmul"](builder)
-        _register_foreach_ew[FEW_ADDCDIV, "ForeachAddcdiv"](builder)
-        _register_foreach_ew[FEW_SQRT, "ForeachSqrt"](builder)
+            _spec_dispatcher4[_foreach_l2_norm_go, "ForeachL2Norm"](argv, argc)
+            return 0
         comptime if _op_on["ForeachGatherScalars"]():
-            _register_call(
-                builder,
-                _spec_dispatcher3[
-                    _foreach_gather_scalars_go, "ForeachGatherScalars"
-                ],
-                docstring=(
-                    "(in_ptrs, out_ptr, context_ptr); batched FP32 gather of "
-                    "one scalar per input tensor into a contiguous output"
-                ),
+            _spec_dispatcher3[
+                _foreach_gather_scalars_go, "ForeachGatherScalars"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["ForeachMul"]():
+            _spec_dispatcher5[_foreach_ew_go[FEW_MUL], "ForeachMul"](argv, argc)
+            return 0
+        comptime if _op_on["ForeachAdd"]():
+            _spec_dispatcher5[_foreach_ew_go[FEW_ADD], "ForeachAdd"](argv, argc)
+            return 0
+        comptime if _op_on["ForeachDiv"]():
+            _spec_dispatcher5[_foreach_ew_go[FEW_DIV], "ForeachDiv"](argv, argc)
+            return 0
+        comptime if _op_on["ForeachMulTensor"]():
+            _spec_dispatcher5[
+                _foreach_ew_go[FEW_MUL_TENSOR], "ForeachMulTensor"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["ForeachLerp"]():
+            _spec_dispatcher5[_foreach_ew_go[FEW_LERP], "ForeachLerp"](
+                argv, argc
             )
-        return builder.finalize()
+            return 0
+        comptime if _op_on["ForeachAddcmul"]():
+            _spec_dispatcher5[_foreach_ew_go[FEW_ADDCMUL], "ForeachAddcmul"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["ForeachAddcdiv"]():
+            _spec_dispatcher5[_foreach_ew_go[FEW_ADDCDIV], "ForeachAddcdiv"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["ForeachSqrt"]():
+            _spec_dispatcher5[_foreach_ew_go[FEW_SQRT], "ForeachSqrt"](
+                argv, argc
+            )
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create optimizer_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

@@ -69,7 +69,7 @@ COVERS: dict[str, str] = (
     | {
         f"aten::{name}{variant}": "test_compare"
         for name in COMPARE_OPS
-        for variant in ("", ".Scalar", ".Tensor")
+        for variant in (".Scalar", ".Tensor")
     }
     | {
         f"aten::{name}.{variant}": "test_bitwise"
@@ -82,7 +82,6 @@ COVERS: dict[str, str] = (
         "aten::pow.Tensor_Tensor": "test_pow[Tensor]",
         "aten::floor_divide": "test_floor_divide[Tensor]",
         "aten::floor_divide.Scalar": "test_floor_divide[Scalar]",
-        "aten::floordiv": "test_floor_divide (same fast impl, alias entry)",
         "aten::div.Tensor_mode": "test_div_trunc_mode (rounding_mode='trunc'; "
         "the 'floor' sub-case shares FloorDivSpec with test_floor_divide above)",
         "aten::remainder.Tensor": "test_remainder[Tensor]",

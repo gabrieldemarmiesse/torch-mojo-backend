@@ -21,9 +21,6 @@ pass between the two — and, with layer/group norm and
 """
 
 from std.os import abort
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from batch_norm_kernels import (
     enqueue_batch_norm_elementwise,
@@ -35,38 +32,46 @@ from normalization_forward_kernels import (
     enqueue_norm_rows,
 )
 from op_utils import (
+    Arg,
+    Argv,
     FLOAT_DTYPES,
     _raw_ctx,
     _raw_f64,
     _raw_int,
     _raw_tuple_f64,
     _raw_tuple_int,
-    _spec_dispatcher8,
     _spec_dispatcher10,
     _spec_dispatcher15,
+    _spec_dispatcher8,
 )
 
-from variant_gates import _dtype_arg_on, _op_on, _register_call
+from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
+    _dtype_arg_on,
+    _op_on,
+    _tmb_entry_error,
+)
 
 
 def _norm_rows_go[
     affine: Int
 ](
-    output_obj: PyObjectPtr,
-    mean_obj: PyObjectPtr,
-    rstd_obj: PyObjectPtr,
-    input_obj: PyObjectPtr,
-    weight_obj: PyObjectPtr,
-    bias_obj: PyObjectPtr,
-    rows_obj: PyObjectPtr,
-    cols_obj: PyObjectPtr,
-    epsilon_obj: PyObjectPtr,
-    has_weight_obj: PyObjectPtr,
-    has_bias_obj: PyObjectPtr,
-    hxw_obj: PyObjectPtr,
-    cpg_obj: PyObjectPtr,
-    group_obj: PyObjectPtr,
-    context_obj: PyObjectPtr,
+    output_obj: Arg,
+    mean_obj: Arg,
+    rstd_obj: Arg,
+    input_obj: Arg,
+    weight_obj: Arg,
+    bias_obj: Arg,
+    rows_obj: Arg,
+    cols_obj: Arg,
+    epsilon_obj: Arg,
+    has_weight_obj: Arg,
+    has_bias_obj: Arg,
+    hxw_obj: Arg,
+    cpg_obj: Arg,
+    group_obj: Arg,
+    context_obj: Arg,
 ) raises:
     var output_addr = _raw_int(output_obj)
     var mean_addr = _raw_int(mean_obj)
@@ -116,21 +121,21 @@ def _norm_rows_go[
 
 
 def _layer_norm_forward_go(
-    output_obj: PyObjectPtr,
-    mean_obj: PyObjectPtr,
-    rstd_obj: PyObjectPtr,
-    input_obj: PyObjectPtr,
-    weight_obj: PyObjectPtr,
-    bias_obj: PyObjectPtr,
-    rows_obj: PyObjectPtr,
-    cols_obj: PyObjectPtr,
-    epsilon_obj: PyObjectPtr,
-    has_weight_obj: PyObjectPtr,
-    has_bias_obj: PyObjectPtr,
-    hxw_obj: PyObjectPtr,
-    cpg_obj: PyObjectPtr,
-    group_obj: PyObjectPtr,
-    context_obj: PyObjectPtr,
+    output_obj: Arg,
+    mean_obj: Arg,
+    rstd_obj: Arg,
+    input_obj: Arg,
+    weight_obj: Arg,
+    bias_obj: Arg,
+    rows_obj: Arg,
+    cols_obj: Arg,
+    epsilon_obj: Arg,
+    has_weight_obj: Arg,
+    has_bias_obj: Arg,
+    hxw_obj: Arg,
+    cpg_obj: Arg,
+    group_obj: Arg,
+    context_obj: Arg,
 ) raises:
     _norm_rows_go[AFFINE_COL](
         output_obj,
@@ -152,21 +157,21 @@ def _layer_norm_forward_go(
 
 
 def _group_norm_forward_go(
-    output_obj: PyObjectPtr,
-    mean_obj: PyObjectPtr,
-    rstd_obj: PyObjectPtr,
-    input_obj: PyObjectPtr,
-    weight_obj: PyObjectPtr,
-    bias_obj: PyObjectPtr,
-    rows_obj: PyObjectPtr,
-    cols_obj: PyObjectPtr,
-    epsilon_obj: PyObjectPtr,
-    has_weight_obj: PyObjectPtr,
-    has_bias_obj: PyObjectPtr,
-    hxw_obj: PyObjectPtr,
-    cpg_obj: PyObjectPtr,
-    group_obj: PyObjectPtr,
-    context_obj: PyObjectPtr,
+    output_obj: Arg,
+    mean_obj: Arg,
+    rstd_obj: Arg,
+    input_obj: Arg,
+    weight_obj: Arg,
+    bias_obj: Arg,
+    rows_obj: Arg,
+    cols_obj: Arg,
+    epsilon_obj: Arg,
+    has_weight_obj: Arg,
+    has_bias_obj: Arg,
+    hxw_obj: Arg,
+    cpg_obj: Arg,
+    group_obj: Arg,
+    context_obj: Arg,
 ) raises:
     _norm_rows_go[AFFINE_CHAN](
         output_obj,
@@ -188,15 +193,15 @@ def _group_norm_forward_go(
 
 
 def _batch_norm_infer_go(
-    out_obj: PyObjectPtr,
-    in_obj: PyObjectPtr,
-    mean_obj: PyObjectPtr,
-    var_obj: PyObjectPtr,
-    weight_obj: PyObjectPtr,
-    bias_obj: PyObjectPtr,
-    params: PyObjectPtr,  # (eps, channels, inner, planes, has_weight,
+    out_obj: Arg,
+    in_obj: Arg,
+    mean_obj: Arg,
+    var_obj: Arg,
+    weight_obj: Arg,
+    bias_obj: Arg,
+    params: Arg,  # (eps, channels, inner, planes, has_weight,
     #  has_bias, save_mean_addr, save_invstd_addr)
-    context_obj: PyObjectPtr,
+    context_obj: Arg,
 ) raises:
     """`aten::_native_batch_norm_legit_no_training` / eval-mode batch norm."""
     var out_addr = _raw_int(out_obj)
@@ -259,17 +264,17 @@ def _batch_norm_infer_go(
 
 
 def _batch_norm_train_go(
-    out_obj: PyObjectPtr,
-    save_mean_obj: PyObjectPtr,
-    save_invstd_obj: PyObjectPtr,
-    in_obj: PyObjectPtr,
-    weight_obj: PyObjectPtr,
-    bias_obj: PyObjectPtr,
-    run_mean_obj: PyObjectPtr,
-    run_var_obj: PyObjectPtr,
+    out_obj: Arg,
+    save_mean_obj: Arg,
+    save_invstd_obj: Arg,
+    in_obj: Arg,
+    weight_obj: Arg,
+    bias_obj: Arg,
+    run_mean_obj: Arg,
+    run_var_obj: Arg,
     # (eps, momentum, channels, runs, hxw, has_weight, has_bias, has_running)
-    params: PyObjectPtr,
-    context_obj: PyObjectPtr,
+    params: Arg,
+    context_obj: Arg,
 ) raises:
     """`aten::native_batch_norm` with `training=True`: per-channel statistics
     over N*HxW, the ATen running-stat update, then the elementwise pass."""
@@ -350,50 +355,31 @@ def _batch_norm_train_go(
 
 
 @export
-def PyInit_normalization_forward_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var builder = PythonModuleBuilder("normalization_forward_ops")
         comptime if _op_on["LayerNormForward"]():
-            _register_call(
-                builder,
-                _spec_dispatcher15[_layer_norm_forward_go, "LayerNormForward"],
-                docstring=(
-                    "(output, mean, rstd, input, weight, bias, rows, cols, "
-                    "epsilon, has_weight, has_bias, hxw, cpg, group, "
-                    "context); runtime-dynamic native LayerNorm forward"
-                ),
+            _spec_dispatcher15[_layer_norm_forward_go, "LayerNormForward"](
+                argv, argc
             )
+            return 0
         comptime if _op_on["GroupNormForward"]():
-            _register_call(
-                builder,
-                _spec_dispatcher15[_group_norm_forward_go, "GroupNormForward"],
-                docstring=(
-                    "(output, mean, rstd, input, weight, bias, rows, cols, "
-                    "epsilon, has_weight, has_bias, hxw, cpg, group, "
-                    "context); runtime-dynamic native GroupNorm forward"
-                ),
+            _spec_dispatcher15[_group_norm_forward_go, "GroupNormForward"](
+                argv, argc
             )
+            return 0
         comptime if _op_on["BatchNormInfer"]():
-            _register_call(
-                builder,
-                _spec_dispatcher8[_batch_norm_infer_go, "BatchNormInfer"],
-                docstring=(
-                    "(out, input, mean, var, weight, bias, (eps, channels, "
-                    "inner, planes, has_weight, has_bias), context); "
-                    "runtime-dynamic batch norm inference"
-                ),
+            _spec_dispatcher8[_batch_norm_infer_go, "BatchNormInfer"](
+                argv, argc
             )
+            return 0
         comptime if _op_on["BatchNormTrain"]():
-            _register_call(
-                builder,
-                _spec_dispatcher10[_batch_norm_train_go, "BatchNormTrain"],
-                docstring=(
-                    "(out, save_mean, save_invstd, input, weight, bias, "
-                    "running_mean, running_var, (eps, momentum, channels, "
-                    "runs, hxw, has_weight, has_bias, has_running), context); "
-                    "runtime-dynamic batch norm training forward"
-                ),
+            _spec_dispatcher10[_batch_norm_train_go, "BatchNormTrain"](
+                argv, argc
             )
-        return builder.finalize()
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create normalization_forward_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

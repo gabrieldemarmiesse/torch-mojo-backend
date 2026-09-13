@@ -4,8 +4,10 @@
 # One logical worker searches one input value.  A 1-D boundary is shared by
 # every value; an N-D boundary selects the matching flattened prefix row.
 # Optional sorter entries are relative indices within the final dimension,
-# matching ATen.  Python validates shapes, devices, dtypes, and sorter bounds
-# before this raw-pointer bridge is called.
+# matching ATen.  Python validates the sorter's device, shape and dtype
+# before this raw-pointer bridge is called, but NOT its index values (that
+# would need a device-to-host sync); a sorter entry outside the boundary
+# range is clamped in `_binary_search_position` instead of trusted raw.
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
@@ -17,14 +19,13 @@ from std.gpu import (
     thread_idx,
 )
 from max.gpu.host import DeviceContext
-from std.python import PythonObject
-from std.python._cpython import PyObjectPtr
-from std.python.bindings import PythonModuleBuilder
 from std.sys.info import has_accelerator
 from std.utils.coord import Coord
 from std.utils.static_tuple import StaticTuple
 
 from op_utils import (
+    Arg,
+    Argv,
     GS_THREADS,
     _enqueue_cached,
     _gs_blocks,
@@ -34,13 +35,14 @@ from op_utils import (
     _raw_dtype_int,
     _raw_int,
     _spec_dispatcher13,
-    _spec_unsupported,
 )
 from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
     _dtype_arg_on,
     _dtype_out_on,
     _op_on,
-    _register_call,
+    _tmb_entry_error,
 )
 
 
@@ -91,7 +93,12 @@ def _binary_search_position[
         var mid = low + ((high - low) >> 1)
         var boundary_index = mid
         comptime if has_sorter:
-            boundary_index = Int(sorter[unsafe_offset=boundary_base + mid])
+            # Python checks the sorter's device/shape/dtype but not its
+            # values (no device-to-host sync per call): clamp the gathered
+            # index so an out-of-range entry reads some in-bounds boundary
+            # (an unspecified result) instead of out of bounds.
+            var raw_index = Int(sorter[unsafe_offset=boundary_base + mid])
+            boundary_index = max(0, min(raw_index, boundary_size - 1))
         var boundary = SIMD[dtype, 1](
             boundaries[unsafe_offset=boundary_base + boundary_index]
         )
@@ -279,19 +286,19 @@ def _dispatch_searchsorted[
 
 
 def _searchsorted_go(
-    out_obj: PyObjectPtr,
-    boundaries_obj: PyObjectPtr,
-    values_obj: PyObjectPtr,
-    sorter_obj: PyObjectPtr,
-    num_values_obj: PyObjectPtr,
-    boundary_size_obj: PyObjectPtr,
-    values_per_batch_obj: PyObjectPtr,
-    boundaries_are_1d_obj: PyObjectPtr,
-    has_sorter_obj: PyObjectPtr,
-    right_obj: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    out_dtype_obj: PyObjectPtr,
-    ctx_obj: PyObjectPtr,
+    out_obj: Arg,
+    boundaries_obj: Arg,
+    values_obj: Arg,
+    sorter_obj: Arg,
+    num_values_obj: Arg,
+    boundary_size_obj: Arg,
+    values_per_batch_obj: Arg,
+    boundaries_are_1d_obj: Arg,
+    has_sorter_obj: Arg,
+    right_obj: Arg,
+    dtype_obj: Arg,
+    out_dtype_obj: Arg,
+    ctx_obj: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_dtype = _raw_dtype_int(out_dtype_obj)
@@ -326,18 +333,14 @@ def _searchsorted_go(
 
 
 @export
-def PyInit_searchsorted_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("searchsorted_ops")
         comptime if _op_on["Searchsorted"]():
-            _register_call(
-                b,
-                _spec_dispatcher13[_searchsorted_go, "Searchsorted"],
-                docstring=(
-                    "(out, boundaries, values, sorter pointers; dynamic search "
-                    "geometry, flags, dtypes, context)"
-                ),
-            )
-        return b.finalize()
+            _spec_dispatcher13[_searchsorted_go, "Searchsorted"](argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create searchsorted_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

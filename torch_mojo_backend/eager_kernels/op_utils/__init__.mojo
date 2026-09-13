@@ -16,8 +16,6 @@ from std.math import ceildiv, cos, floor, sin, sqrt, tan
 from std.math.polynomial import polynomial_evaluate
 from std.memory import OpaquePointer, bitcast, stack_allocation
 from std.memory.alloc import unsafe_alloc
-from std.python import Python, PythonObject
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.sys import llvm_intrinsic
 from std.sys.info import (
     has_accelerator,
@@ -862,149 +860,80 @@ def _make_ptr[
     return Pointer[Scalar[dtype], MutUntrackedOrigin](unsafe_from_address=addr)
 
 
-def _get_ctx(device_context_ptr: PythonObject) raises -> DeviceContext:
-    var addr = Int(py=device_context_ptr)
-    return DeviceContext(
-        OpaquePointer[MutUntrackedOrigin](unsafe_from_address=addr)
-    )
-
-
 # ---------------------------------------------------------------------------
-# Raw-CPython argument unpacking for METH_FASTCALL dispatchers
-# (`def_py_c_function`). The high-level `def_function` path pays an owning
-# PythonObject per argument plus PyNumber round-trips per int — several
-# hundred ns per argument. These helpers read the exact types aten_fast.py
-# passes (ints, tuples of ints, driver.Buffer objects) directly, with
-# borrowed references where possible. No type checking: the Python callers
-# are internal and guarantee the shapes.
+# Kernel arguments are 64-bit slots handed over by the C entry `tmb_call`
+# (the Mojo backend builds them, nothing goes through Python). Ints and
+# pointers are the value itself, floats travel as their bit pattern, a tuple
+# is the address of an `[len, e0, e1, ...]` Int array the caller keeps alive
+# for the call, a spec is the address of a TensorSpec.
 # ---------------------------------------------------------------------------
+comptime Arg = Int
+comptime Argv = Pointer[Int, MutUntrackedOrigin]
 
 
 @always_inline
-def _raw_int(obj: PyObjectPtr) -> Int:
-    return Int(Python().cpython().PyLong_AsSsize_t(obj))
+def _raw_int(a: Arg) -> Int:
+    return a
 
 
 @always_inline
-def _raw_f64(obj: PyObjectPtr) -> Float64:
-    return Float64(Python().cpython().PyFloat_AsDouble(obj))
+def _raw_f64(a: Arg) -> Float64:
+    return bitcast[DType.float64](Int64(a))
 
 
 @always_inline
-def _raw_tuple_int(t: PyObjectPtr, i: Int) -> Int:
-    # PyTuple_GetItem returns a borrowed reference: no refcount traffic.
-    ref cpy = Python().cpython()
-    return Int(cpy.PyLong_AsSsize_t(cpy.PyTuple_GetItem(t, i)))
+def _raw_tuple_int(t: Arg, i: Int) -> Int:
+    return Argv(unsafe_from_address=t)[unsafe_offset=i + 1]
 
 
 @always_inline
-def _raw_dtype_int(obj: PyObjectPtr) -> DType:
-    """DType from a Python int holding `max.dtype.DType.value`.
-
-    The raw-pointer kernel convention passes dtypes as plain ints; this is
-    the counterpart of the GetAttr-based `_raw_dtype` below (which reads a
-    `driver.Buffer.dtype` and dies with the Buffer).
-    """
-    return DType._from_ui8(UInt8(_raw_int(obj))._mlir_value)
+def _raw_tuple_f64(t: Arg, i: Int) -> Float64:
+    return bitcast[DType.float64](Int64(_raw_tuple_int(t, i)))
 
 
 @always_inline
-def _raw_dtype(buffer: PyObjectPtr) -> DType:
-    ref cpy = Python().cpython()
-    var dt = cpy.PyObject_GetAttrString(buffer, "dtype")
-    var val = cpy.PyObject_GetAttrString(dt, "value")
-    var v = Int(cpy.PyLong_AsSsize_t(val))
-    cpy.Py_DecRef(val)
-    cpy.Py_DecRef(dt)
-    return DType._from_ui8(UInt8(v)._mlir_value)
+def _raw_tuple_len(t: Arg) -> Int:
+    return Argv(unsafe_from_address=t)[]
 
 
 @always_inline
-def _raw_ctx(ptr_obj: PyObjectPtr) -> DeviceContext:
+def _raw_dtype_int(a: Arg) -> DType:
+    """DType from the numeric value of `max.dtype.DType` / `DType._as_ui8`."""
+    return DType._from_ui8(UInt8(a)._mlir_value)
+
+
+@always_inline
+def _raw_ctx(a: Arg) -> DeviceContext:
     return DeviceContext(
-        OpaquePointer[MutUntrackedOrigin](unsafe_from_address=_raw_int(ptr_obj))
+        OpaquePointer[MutUntrackedOrigin](unsafe_from_address=a)
     )
 
 
 @always_inline
-def _raw_ret_none() -> PyObjectPtr:
-    # The Python callers ignore the return value; 0 is an immortal cached
-    # small int, so this is refcount-only.
-    return Python().cpython().PyLong_FromSsize_t(0)
-
-
-@always_inline
-def _raw_tuple_f64(t: PyObjectPtr, i: Int) -> Float64:
-    ref cpy = Python().cpython()
-    return Float64(cpy.PyFloat_AsDouble(cpy.PyTuple_GetItem(t, i)))
-
-
-@always_inline
-def _raw_tuple_len(t: PyObjectPtr) -> Int:
-    return Int(Python().cpython().PyObject_Length(t))
+def _f64_slot(v: Float64) -> Arg:
+    """Encode a float for a slot (the inverse of `_raw_f64`)."""
+    return Int(bitcast[DType.int64](v))
 
 
 # ===========================================================================
 # TensorSpec infrastructure — the single source of truth.
 #
-# `tensor_holder` is the sole registrar of the process-wide Python type
-# objects for `TensorSpec` and `TensorHolder`. The eager module loader imports
-# it before any other kernel module, allowing those modules to construct the
-# shared types from this common Mojo definition. Specs are read through
-# `_spec_ptr`, an unchecked bitcast that relies on this layout staying exact.
-#
-# INVARIANT: never define a per-module TensorSpec/TensorHolder variant —
-# import these. Diverging layouts would turn the unchecked downcast into
-# silent memory corruption.
+# Specs are built by the Mojo backend (one per tensor argument, on its stack)
+# and passed to kernels as the address of the struct; `_spec_ptr` is a pure
+# pointer cast, so this layout must stay identical in every module.
 #
 # Spec ops (see docs/tensor_spec_design.md) do the whole op prologue in one
 # boundary call: input checks, geometry, and the kernel launch. The output is
-# always allocated by Python and handed in as a trailing spec, so a spec op
-# writes into it and returns None — there is no allocating return ABI.
-# Errors are REAL: dispatchers catch Mojo errors and return
-# `_spec_unsupported(e)`, which raises NotImplementedError into Python;
-# the Python callers treat that as "take the classic path".
+# always allocated by the backend and handed in as a trailing spec, so a spec
+# op writes into it and returns nothing — there is no allocating return ABI.
+# Errors are REAL: a raised Error travels back through `tmb_call` as the
+# NotImplementedError the backend reports for that op.
 # ===========================================================================
 
 # Strided kernels always work on shapes/strides padded to this rank
 # (leading dims of size 1 / stride 0).
+
 comptime MAX_RANK = 8
-
-
-struct TensorHolder(Movable, Writable):
-    """Owns one device allocation. Nothing else.
-
-    `buf`'s destructor (run by this struct's destructor when the CPython
-    refcount hits 0) calls `AsyncRT_DeviceBuffer_release`, which enqueues
-    the stream-ordered free.
-    """
-
-    var buf: DeviceBuffer[DType.uint8]
-    var nbytes: Int
-
-    def __init__(out self, var buf: DeviceBuffer[DType.uint8], nbytes: Int):
-        self.buf = buf^
-        self.nbytes = nbytes
-
-    def write_to(self, mut writer: Some[Writer]):
-        # Writable is mandatory for types exposed via add_type (tp_repr).
-        writer.write(
-            "TensorHolder(ptr=",
-            Int(self.buf.unsafe_ptr()),
-            ", nbytes=",
-            self.nbytes,
-            ")",
-        )
-
-    @staticmethod
-    def data_ptr(py_self: PythonObject) raises -> PythonObject:
-        var self_ptr = py_self.downcast_value_ptr[Self]()
-        return PythonObject(Int(self_ptr[].buf.unsafe_ptr()))
-
-    @staticmethod
-    def get_nbytes(py_self: PythonObject) raises -> PythonObject:
-        var self_ptr = py_self.downcast_value_ptr[Self]()
-        return PythonObject(self_ptr[].nbytes)
 
 
 struct TensorSpec(Movable, Writable):
@@ -1103,490 +1032,376 @@ def _check_into(a: TensorSpec, dst: TensorSpec, expected_dtype: DType) raises:
 
 
 @always_inline
-def _spec_ptr(o: PyObjectPtr) -> Pointer[TensorSpec, MutAnyOrigin]:
-    """The TensorSpec behind a borrowed spec argument — a pure pointer cast.
-
-    Callers are internal and guarantee the type (never consults the type
-    registry, so it works on specs registered by any kernel module)."""
-    var obj = PythonObject(from_borrowed=o)
-    return obj.unchecked_downcast_value_ptr[TensorSpec]().unsafe_origin_cast[
-        MutAnyOrigin
-    ]()
-
-
-def _spec_unsupported(e: Error) -> PyObjectPtr:
-    """Translate a Mojo Error into a real Python NotImplementedError: set the
-    CPython error indicator and return null so the dispatcher signals failure
-    (nothing is swallowed on the spec paths)."""
-    ref cpy = Python().cpython()
-    var msg = String(e)
-    cpy.PyErr_SetString(
-        cpy.get_error_global("PyExc_NotImplementedError"),
-        msg.as_c_string_slice().unsafe_ptr().as_unsafe_any_origin(),
-    )
-    return PyObjectPtr()
+def _spec_ptr(a: Arg) -> Pointer[TensorSpec, MutAnyOrigin]:
+    """The TensorSpec behind a spec slot — a pure pointer cast."""
+    return Pointer[TensorSpec, MutAnyOrigin](unsafe_from_address=a)
 
 
 # ===========================================================================
-# Arity-generic METH_FASTCALL dispatchers
+# Arity-generic dispatchers for the C entry
 # ===========================================================================
 #
-# Every spec entry point shares one skeleton: check the argument count, hand
-# the raw PyObjectPtr arguments to a `_go` function (which does its own
-# conversion and validation), return None, and translate any Error into
-# Python's NotImplementedError. Only the arity and the target differ, so the
-# target is a compile-time function parameter — the same idiom
-# `_enqueue_cached` uses — and one dispatcher per observed arity replaces the
+# Every kernel entry shares one skeleton: check the argument count and hand
+# the slots to a `_go` function (which does its own conversion and
+# validation). Errors propagate to the family's `tmb_call`, which reports
+# them to the backend. Only the arity and the target differ, so the target is
+# a compile-time function parameter and one dispatcher per arity replaces the
 # per-op copies. `what` names the op family in the arity error.
 
 
+@always_inline
+def _spec_dispatcher1[
+    go: def(Arg) raises thin -> None,
+    what: StaticString = "spec op",
+](argv: Argv, argc: Int) raises:
+    if argc != 1:
+        raise Error(what, " expects exactly 1 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+    )
+
+
+@always_inline
 def _spec_dispatcher2[
-    go: def(PyObjectPtr, PyObjectPtr) raises thin -> None,
+    go: def(Arg, Arg) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 2:
-            raise Error(what, " expects exactly 2 arguments")
-        go(args[unsafe_offset=0], args[unsafe_offset=1])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 2:
+        raise Error(what, " expects exactly 2 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+    )
 
 
+@always_inline
 def _spec_dispatcher3[
-    go: def(PyObjectPtr, PyObjectPtr, PyObjectPtr) raises thin -> None,
+    go: def(Arg, Arg, Arg) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 3:
-            raise Error(what, " expects exactly 3 arguments")
-        go(args[unsafe_offset=0], args[unsafe_offset=1], args[unsafe_offset=2])
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 3:
+        raise Error(what, " expects exactly 3 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+    )
 
 
+@always_inline
 def _spec_dispatcher4[
-    go: def(
-        PyObjectPtr, PyObjectPtr, PyObjectPtr, PyObjectPtr
-    ) raises thin -> None,
+    go: def(Arg, Arg, Arg, Arg) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 4:
-            raise Error(what, " expects exactly 4 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 4:
+        raise Error(what, " expects exactly 4 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+    )
 
 
+@always_inline
 def _spec_dispatcher5[
-    go: def(
-        PyObjectPtr, PyObjectPtr, PyObjectPtr, PyObjectPtr, PyObjectPtr
-    ) raises thin -> None,
+    go: def(Arg, Arg, Arg, Arg, Arg) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 5:
-            raise Error(what, " expects exactly 5 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 5:
+        raise Error(what, " expects exactly 5 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+    )
 
 
+@always_inline
 def _spec_dispatcher6[
-    go: def(
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-    ) raises thin -> None,
+    go: def(Arg, Arg, Arg, Arg, Arg, Arg) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 6:
-            raise Error(what, " expects exactly 6 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 6:
+        raise Error(what, " expects exactly 6 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+    )
 
 
+@always_inline
 def _spec_dispatcher7[
-    go: def(
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-    ) raises thin -> None,
+    go: def(Arg, Arg, Arg, Arg, Arg, Arg, Arg) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 7:
-            raise Error(what, " expects exactly 7 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 7:
+        raise Error(what, " expects exactly 7 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+        argv[unsafe_offset=6],
+    )
 
 
+@always_inline
 def _spec_dispatcher8[
-    go: def(
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-    ) raises thin -> None,
+    go: def(Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 8:
-            raise Error(what, " expects exactly 8 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 8:
+        raise Error(what, " expects exactly 8 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+        argv[unsafe_offset=6],
+        argv[unsafe_offset=7],
+    )
 
 
+@always_inline
 def _spec_dispatcher9[
-    go: def(
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-    ) raises thin -> None,
+    go: def(Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 9:
-            raise Error(what, " expects exactly 9 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 9:
+        raise Error(what, " expects exactly 9 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+        argv[unsafe_offset=6],
+        argv[unsafe_offset=7],
+        argv[unsafe_offset=8],
+    )
 
 
+@always_inline
 def _spec_dispatcher10[
     go: def(
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
+        Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg
     ) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 10:
-            raise Error(what, " expects exactly 10 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-            args[unsafe_offset=9],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 10:
+        raise Error(what, " expects exactly 10 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+        argv[unsafe_offset=6],
+        argv[unsafe_offset=7],
+        argv[unsafe_offset=8],
+        argv[unsafe_offset=9],
+    )
 
 
+@always_inline
 def _spec_dispatcher11[
     go: def(
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
+        Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg
     ) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 11:
-            raise Error(what, " expects exactly 11 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-            args[unsafe_offset=9],
-            args[unsafe_offset=10],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 11:
+        raise Error(what, " expects exactly 11 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+        argv[unsafe_offset=6],
+        argv[unsafe_offset=7],
+        argv[unsafe_offset=8],
+        argv[unsafe_offset=9],
+        argv[unsafe_offset=10],
+    )
 
 
+@always_inline
 def _spec_dispatcher12[
     go: def(
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
+        Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg
     ) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 12:
-            raise Error(what, " expects exactly 12 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-            args[unsafe_offset=9],
-            args[unsafe_offset=10],
-            args[unsafe_offset=11],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 12:
+        raise Error(what, " expects exactly 12 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+        argv[unsafe_offset=6],
+        argv[unsafe_offset=7],
+        argv[unsafe_offset=8],
+        argv[unsafe_offset=9],
+        argv[unsafe_offset=10],
+        argv[unsafe_offset=11],
+    )
 
 
+@always_inline
 def _spec_dispatcher13[
     go: def(
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
+        Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg
     ) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 13:
-            raise Error(what, " expects exactly 13 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-            args[unsafe_offset=9],
-            args[unsafe_offset=10],
-            args[unsafe_offset=11],
-            args[unsafe_offset=12],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 13:
+        raise Error(what, " expects exactly 13 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+        argv[unsafe_offset=6],
+        argv[unsafe_offset=7],
+        argv[unsafe_offset=8],
+        argv[unsafe_offset=9],
+        argv[unsafe_offset=10],
+        argv[unsafe_offset=11],
+        argv[unsafe_offset=12],
+    )
 
 
+@always_inline
+def _spec_dispatcher14[
+    go: def(
+        Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg, Arg
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](argv: Argv, argc: Int) raises:
+    if argc != 14:
+        raise Error(what, " expects exactly 14 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+        argv[unsafe_offset=6],
+        argv[unsafe_offset=7],
+        argv[unsafe_offset=8],
+        argv[unsafe_offset=9],
+        argv[unsafe_offset=10],
+        argv[unsafe_offset=11],
+        argv[unsafe_offset=12],
+        argv[unsafe_offset=13],
+    )
+
+
+@always_inline
 def _spec_dispatcher15[
     go: def(
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
-        PyObjectPtr,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
     ) raises thin -> None,
     what: StaticString = "spec op",
-](
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        if nargs != 15:
-            raise Error(what, " expects exactly 15 arguments")
-        go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-            args[unsafe_offset=9],
-            args[unsafe_offset=10],
-            args[unsafe_offset=11],
-            args[unsafe_offset=12],
-            args[unsafe_offset=13],
-            args[unsafe_offset=14],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+](argv: Argv, argc: Int) raises:
+    if argc != 15:
+        raise Error(what, " expects exactly 15 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+        argv[unsafe_offset=6],
+        argv[unsafe_offset=7],
+        argv[unsafe_offset=8],
+        argv[unsafe_offset=9],
+        argv[unsafe_offset=10],
+        argv[unsafe_offset=11],
+        argv[unsafe_offset=12],
+        argv[unsafe_offset=13],
+        argv[unsafe_offset=14],
+    )
+
+
+@always_inline
+def _spec_dispatcher16[
+    go: def(
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+        Arg,
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](argv: Argv, argc: Int) raises:
+    if argc != 16:
+        raise Error(what, " expects exactly 16 arguments, got ", argc)
+    go(
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        argv[unsafe_offset=3],
+        argv[unsafe_offset=4],
+        argv[unsafe_offset=5],
+        argv[unsafe_offset=6],
+        argv[unsafe_offset=7],
+        argv[unsafe_offset=8],
+        argv[unsafe_offset=9],
+        argv[unsafe_offset=10],
+        argv[unsafe_offset=11],
+        argv[unsafe_offset=12],
+        argv[unsafe_offset=13],
+        argv[unsafe_offset=14],
+        argv[unsafe_offset=15],
+    )
 
 
 @always_inline
@@ -2640,8 +2455,8 @@ def _scratch_contig(
 @always_inline
 def _reduce_spec_geom(
     a: TensorSpec,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
+    rdims_t: Arg,
+    keepdim_o: Arg,
     mut rows: Int,
     mut cols: Int,
     mut out_rank: Int,
@@ -2706,7 +2521,7 @@ def _reduce_spec_geom(
 @always_inline
 def _adjacent_reduce_geom(
     a: TensorSpec,
-    rdims_t: PyObjectPtr,
+    rdims_t: Arg,
     mut outer: Int,
     mut reduce_n: Int,
     mut inner: Int,

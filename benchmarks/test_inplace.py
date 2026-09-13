@@ -1,4 +1,4 @@
-"""In-place elementwise benchmarks: add_, mul_, relu_, fill_, masked_fill_.
+"""In-place elementwise benchmarks: add_, sub_, mul_, relu_, fill_, masked_fill_.
 
 The in-place ops mutate their input across iterations, so operand values
 are chosen to stay numerically tame over thousands of calls (mul_ by
@@ -27,6 +27,7 @@ SHAPES: dict[str, tuple[int, ...]] = {
 
 COVERS: dict[str, str] = {
     "aten::add_.Tensor": "test_add_",
+    "aten::sub_.Tensor": "test_sub_",
     "aten::mul_.Tensor": "test_mul_",
     "aten::relu_": "test_relu_",
     "aten::fill_.Scalar": "test_fill_",
@@ -50,6 +51,21 @@ def test_add_(
     d_ref, d_our = both((unit_interval(shape, dtype) - 0.5) * 1e-4, hw, mojo_device)
     bench.run(
         lambda: x_ref.add_(d_ref), lambda: x_our.add_(d_our), flops=float(x_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("sub_.Tensor")
+def test_sub_(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(unit_interval(shape, dtype), hw, mojo_device)
+    d_ref, d_our = both((unit_interval(shape, dtype) - 0.5) * 1e-4, hw, mojo_device)
+    bench.run(
+        lambda: x_ref.sub_(d_ref), lambda: x_our.sub_(d_our), flops=float(x_ref.numel())
     )
 
 

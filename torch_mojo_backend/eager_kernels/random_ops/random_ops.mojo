@@ -10,11 +10,10 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
-from std.python import PythonObject
-from std.python._cpython import PyObjectPtr, Py_ssize_t
-from std.python.bindings import PythonModuleBuilder
 
 from op_utils import (
+    Arg,
+    Argv,
     _raw_ctx,
     _raw_dtype_int,
     _raw_f64,
@@ -23,7 +22,13 @@ from op_utils import (
 )
 from uniform_kernels import enqueue_uniform
 
-from variant_gates import _dtype_out_on, _op_on, _register_call
+from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
+    _dtype_out_on,
+    _op_on,
+    _tmb_entry_error,
+)
 
 
 # The dtypes `aten::uniform_` is defined for, minus complex (unsupported
@@ -41,23 +46,23 @@ comptime UNIFORM_DTYPES = [
 def _join_u64(lo: Int, hi: Int) -> UInt64:
     """Rejoin a 64-bit value split into 32-bit halves by the Python caller.
 
-    Keeping every Python integer below 2**32 avoids `Py_ssize_t` overflow in
+    Keeping every Python integer below 2**32 avoids `Int` overflow in
     the raw CPython bridge while preserving all 64 bits of seed and counter.
     """
     return UInt64(lo) | (UInt64(hi) << 32)
 
 
 def _uniform_go(
-    dst_ptr_obj: PyObjectPtr,
-    from_obj: PyObjectPtr,
-    to_obj: PyObjectPtr,
-    numel_obj: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    seed_lo_obj: PyObjectPtr,
-    seed_hi_obj: PyObjectPtr,
-    offset_lo_obj: PyObjectPtr,
-    offset_hi_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    dst_ptr_obj: Arg,
+    from_obj: Arg,
+    to_obj: Arg,
+    numel_obj: Arg,
+    dtype_obj: Arg,
+    seed_lo_obj: Arg,
+    seed_hi_obj: Arg,
+    offset_lo_obj: Arg,
+    offset_hi_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dst_addr = _raw_int(dst_ptr_obj)
     var from_value = _raw_f64(from_obj)
@@ -85,19 +90,14 @@ def _uniform_go(
 
 
 @export
-def PyInit_random_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("random_ops")
         comptime if _op_on["UniformFill"]():
-            _register_call(
-                b,
-                _spec_dispatcher10[_uniform_go, "UniformFill"],
-                docstring=(
-                    "(dst_ptr, from, to, numel, dtype, seed_lo, seed_hi,"
-                    " offset_lo, offset_hi, context_ptr); in-place uniform"
-                    " [from, to) fill of a contiguous buffer"
-                ),
-            )
-        return b.finalize()
+            _spec_dispatcher10[_uniform_go, "UniformFill"](argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create random_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

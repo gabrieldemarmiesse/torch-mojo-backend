@@ -1,4 +1,5 @@
 import datetime as dt
+import functools
 import time
 import traceback
 import weakref
@@ -25,12 +26,8 @@ from torch_mojo_backend.aten_functions import (
     torch_device_to_max_device,
 )
 from torch_mojo_backend.flags import profiling_enabled, verbose_enabled
-from torch_mojo_backend.mojo_device import comm_fence
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-    TorchMojoTensor,
-    _row_major_strides,
-    find_equivalent_max_device,
-)
+from torch_mojo_backend.mojo_device import dlpack as mojo_dlpack
+from torch_mojo_backend.native import device_module
 from torch_mojo_backend.torch_compile_backend import debug
 from torch_mojo_backend.torch_compile_backend.utils import (
     get_accelerators,
@@ -449,24 +446,62 @@ def _graph_uses_mojo_device(
     return False
 
 
-def _mojo_tensor_from_buffer(buffer: max.driver.Buffer) -> torch.Tensor:
-    """Zero-copy wrap of a MAX output buffer as an eager mojo tensor.
+@functools.cache
+def _mojo_accelerators() -> tuple[max.driver.Device, ...]:
+    """The concrete MAX devices backing each `mojo:<index>`, in the same
+    order (GPUs, then the MAX CPU device) the native backend's
+    `device.mojo` assigns them -- see `get_accelerators()`."""
+    return tuple(get_accelerators())
 
-    The buffer itself becomes the wrapper's ownership token (`_holder`):
-    MAX buffers release their device memory when the last Python reference
-    drops, exactly like the eager TensorHolder.
+
+def _max_device_for_mojo(device: torch.device) -> max.driver.Device:
+    """The concrete `max.driver.Device` a `mojo:<index>` torch device maps to."""
+    accelerators = _mojo_accelerators()
+    index = device.index if device.index is not None else 0
+    if index >= len(accelerators):
+        raise ValueError(f"Invalid mojo device index {index}")
+    return accelerators[index]
+
+
+def _mojo_index_for_max_device(device: max.driver.Device) -> int:
+    """The inverse of `_max_device_for_mojo`: which `mojo:<index>` a MAX
+    device (as reported by a MAX output buffer) corresponds to."""
+    for index, accelerator in enumerate(_mojo_accelerators()):
+        if accelerator.label == "cpu" and device.label == "cpu":
+            return index
+        if accelerator.label == device.label and accelerator.id == device.id:
+            return index
+    raise ValueError(f"MAX device {device} has no corresponding mojo index")
+
+
+def _max_device_for_cuda(device: torch.device) -> max.driver.Device:
+    """The concrete MAX accelerator a real (non-mojo) `cuda`/`hip` torch
+    device maps to: the GPUs among `_mojo_accelerators()`, in order."""
+    gpu_accelerators = [a for a in _mojo_accelerators() if a.label == "gpu"]
+    index = device.index if device.index is not None else 0
+    if index >= len(gpu_accelerators):
+        raise RuntimeError(f"GPU index {index} not available in MAX")
+    return gpu_accelerators[index]
+
+
+def _mojo_tensor_from_buffer(buffer: max.driver.Buffer) -> torch.Tensor:
+    """Zero-copy wrap of a MAX output buffer as a plain `mojo`-device tensor.
+
+    The `mojo` device is a real (renamed) PrivateUse1 backend: torch's C++
+    DLPack importer maps DLPack's kDLExtDev device-type code straight to
+    `at::Device(DeviceType::PrivateUse1, index)` (aten/src/ATen/DLConvertor.cpp)
+    regardless of the backend's Python-visible rename, so a capsule tagged
+    (kDLExtDev, this mojo index) imports zero-copy through the public
+    `torch.from_dlpack` (see `mojo_dlpack.make_capsule_privateuse1`). The
+    capsule keeps `buffer` (a normal Python object) alive until torch frees
+    the imported storage -- the same refcount-based lifetime a MAX buffer
+    already has on its own.
     """
-    shape = tuple(buffer.shape)
-    return TorchMojoTensor._make(
-        buffer,
-        buffer._data_ptr(),
-        shape,
-        _row_major_strides(shape),
-        0,
-        buffer.dtype,
-        buffer.device,
-        contiguous=True,
+    index = _mojo_index_for_max_device(buffer.device)
+    capsule = mojo_dlpack.make_capsule_privateuse1(
+        buffer, buffer._data_ptr(), tuple(buffer.shape), buffer.dtype, index
     )
+    return torch.from_dlpack(capsule)
 
 
 def _dim_buffer_to_cpu_tensor(buffer: max.driver.Buffer) -> torch.Tensor:
@@ -528,10 +563,6 @@ class BaseMaxCompiler:
         # Detach tensors to avoid gradient tracking issues with DLpack
         if profiling_enabled():
             start_inference_time = time.time_ns()
-        if comm_fence.PENDING:
-            # The graph reads its inputs' device memory straight from MAX, so
-            # the per-op hook in register.py never sees them; fence here.
-            comm_fence.fence_pending_args(args, {})
         input_tensors = [
             _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
         ]
@@ -582,13 +613,6 @@ def _evict_buffer(tensor_id: int, /):
     _buffer_cache.pop(tensor_id, None)
 
 
-def _data_ptr_of(t: torch.Tensor) -> int:
-    ptr = getattr(t, "_ptr", None)  # TorchMojoTensor
-    if ptr is not None:
-        return ptr
-    return t.data_ptr()
-
-
 def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
     if not t.is_contiguous():
         # A MAX Buffer is dense row-major, and the graph input type only
@@ -602,11 +626,11 @@ def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
     entry = _buffer_cache.get(key)
     if entry is not None:
         buffer, ptr, _finalizer = entry
-        if ptr == _data_ptr_of(t):
+        if ptr == t.data_ptr():
             return buffer
     buffer = fast_from_dlpack(t.detach())
     finalizer = weakref.finalize(t, _evict_buffer, key)
-    _buffer_cache[key] = (buffer, _data_ptr_of(t), finalizer)
+    _buffer_cache[key] = (buffer, t.data_ptr(), finalizer)
     return buffer
 
 
@@ -656,7 +680,7 @@ def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
         stream = torch.cuda.current_stream(t.device).cuda_stream
         # _from_dlpack wants a concrete driver Device, not the graph-building
         # DeviceRef torch_device_to_max_device returns.
-        device = find_equivalent_max_device(t.device)
+        device = _max_device_for_cuda(t.device)
         data = t.__dlpack__()
         try:
             return max.driver.Buffer._from_dlpack(data, device, stream)
@@ -664,4 +688,32 @@ def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
             # This approach fails when passing the tensor across threads.
             # Fall back to letting torch slowly sync streams.
             return max.driver.Buffer.from_dlpack(t)
+    if t.device.type == "mojo":
+        # `Tensor.__dlpack_device__` (torch/_tensor.py) checks the device
+        # type string literal "privateuse1", not the *renamed* backend name
+        # ("mojo") -- a real torch gap for a renamed PrivateUse1 backend, so
+        # it (and the 1-arg `Buffer.from_dlpack`, which calls it first) raise
+        # "Unknown device type mojo for Dlpack". `Tensor.__dlpack__()` itself
+        # is unaffected (its C++ implementation keys off the DeviceType enum,
+        # not the name), so build the capsule through it directly and hand
+        # MAX the device/stream explicitly, exactly like the CUDA branch
+        # above. No fallback: unlike CUDA, `Buffer.from_dlpack(t)` would hit
+        # the very same broken device query.
+        device = _max_device_for_mojo(t.device)
+        if device.label == "cpu":
+            # The explicit-device/stream `_from_dlpack` overload below is
+            # GPU-only (it raises "unsupported device type in dlpack
+            # implementation" for a CPU `device`), and the MAX-CPU mojo
+            # device's memory is already host RAM, so there is nothing to
+            # gain from a cleverer path: hand MAX a real torch CPU tensor
+            # (a plain host-to-host copy, not the zero-copy exchange the
+            # GPU case below gets).
+            return max.driver.Buffer.from_dlpack(t.cpu())
+        # the vendor handle of the current mojo stream (torch.Stream's own
+        # native_handle exists only from torch 2.11)
+        stream = device_module.stream_native_handle(
+            torch.accelerator.current_stream(t.device)
+        )
+        data = t.__dlpack__()
+        return max.driver.Buffer._from_dlpack(data, device, stream)
     return max.driver.Buffer.from_dlpack(t)

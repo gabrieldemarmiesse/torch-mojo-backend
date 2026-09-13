@@ -1,5 +1,21 @@
 # Fast eager mode via Mojo Python extensions (proof of concept)
 
+> **Superseded.** This documents the old Python-driven eager path
+> (`eager_kernels/__init__.py`'s `MojoExtensionLoader`, `aten_fast.py`,
+> `TorchMojoTensor`, `mojo_device_aten_ops.py`). The `mojo` device is now the
+> native PrivateUse1 backend described in `docs/native_backend.md`: torch's
+> C++ dispatcher calls Mojo directly, with no `TorchMojoTensor` wrapper, no
+> Python `MojoExtensionLoader`, and no per-op Python descriptor. The kernel
+> families this file measures (`elementwise_ops.mojo`, `matmul_ops.mojo`,
+> `nn_ops.mojo`, ...) are largely the same Mojo sources, now called from
+> `native/mojo/ops_*.mojo` via `native/mojo/loader.mojo` — see
+> `docs/mojo_extensions.md` for that design and `docs/native_backend.md` for
+> the architecture. This page is kept for its measurements and the kernel
+> design history (GEMM/conv milestones, ncu findings), which are still
+> accurate engineering record; treat every code path and Python API it
+> mentions (`aten_fast`, `MojoExtension`, `mojo_device_aten_ops.py`, the
+> kernel-call queue) as historical, not current.
+
 ## Why
 
 The mojo_device eager mode routes every ATen op through

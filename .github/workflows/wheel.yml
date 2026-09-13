@@ -1,0 +1,236 @@
+name: Wheel
+
+# Builds the release wheel: the one that carries the two fixed native
+# libraries prebuilt, so `pip install torch-mojo-backend` does not compile
+# them -- and does not need a C++ compiler -- at the first
+# register_mojo_devices(). See docs/native_backend.md, "Prebuilt libraries
+# and the wheel", for what ships and how a file is selected at run time.
+#
+# Every command below is one `scripts/build_prebuilt.py` invocation that can
+# be run by hand on a laptop; the workflow only decides where each one runs.
+# Note that .github/workflows/publish.yml, which uploads to PyPI when a
+# GitHub release is created, builds from a plain checkout and therefore
+# produces a wheel with NO prebuilt libraries (it still works: the package
+# compiles them on first use). The artefact-carrying wheel is the one this
+# workflow uploads.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Every torch series the native backend supports (docs/native_backend.md,
+  # "Supported torch versions"). A series with no CPU wheel for a platform is
+  # skipped, with a line in the build log.
+  TORCH_SERIES: "2.7 2.8 2.9 2.10 2.11 2.12 2.13 2.14"
+
+jobs:
+  prebuilt:
+    name: prebuilt ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            manylinux: quay.io/pypa/manylinux_2_28_x86_64
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            manylinux: quay.io/pypa/manylinux_2_28_aarch64
+          - name: macos-arm64
+            runner: macos-14
+            manylinux: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Cache the Mojo compiler's module cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/modular
+          key: modular-prebuilt-${{ matrix.name }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            modular-prebuilt-${{ matrix.name }}-
+
+      # On Linux the shim is built in manylinux_2_28 -- torch's own floor --
+      # because where it loads is decided by the glibc it was compiled
+      # against, not by anything in its sources. This runner's glibc is 2.39
+      # and a build here picks up symbols no older system has
+      # (__libc_single_threaded@GLIBC_2.32 was measured; __isoc23_* at 2.38
+      # is the next one waiting). MAX is not installed in that container and
+      # cannot be (its wheels are manylinux_2_34) -- the shim needs only the
+      # torch headers and a C++ compiler, both of which the image has.
+      - name: Build the C++ shims (manylinux_2_28)
+        if: matrix.manylinux != ''
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --volume "$PWD:/src" \
+            --workdir /src \
+            ${{ matrix.manylinux }} \
+            bash -euxo pipefail -c '
+              export PATH="/tmp/.local/bin:$PATH"
+              /opt/python/cp312-cp312/bin/python -m pip install --user --quiet uv
+              /opt/python/cp312-cp312/bin/python scripts/build_prebuilt.py \
+                --torch ${{ env.TORCH_SERIES }} \
+                --no-backend \
+                --python 3.12 \
+                --out /src/prebuilt-out \
+                --work-dir /tmp/prebuilt-work
+            '
+
+      - name: Build the C++ shims (macOS)
+        if: matrix.manylinux == ''
+        run: |
+          uv run --no-project --python 3.12 scripts/build_prebuilt.py \
+            --torch ${{ env.TORCH_SERIES }} \
+            --no-backend \
+            --python 3.12 \
+            --out prebuilt-out \
+            --work-dir "${RUNNER_TEMP}/prebuilt-work"
+
+      # The base library holds no device code and makes no compile-time
+      # accelerator choice, so it is built once per platform, on the runner
+      # (MAX cannot run in the manylinux container). --backend-python gives it
+      # a venv of its own -- the max/mojo pins plus a CPU torch -- instead of
+      # a full project sync, whose CUDA torch and nvidia wheels this build
+      # never reads.
+      - name: Build the Mojo base library
+        env:
+          MODULAR_HOME: /tmp/modular
+        run: |
+          uv run --no-project --python 3.12 scripts/build_prebuilt.py \
+            --backend-python 3.12 \
+            --out prebuilt-out \
+            --work-dir "${RUNNER_TEMP}/prebuilt-work"
+
+      - name: Report every artefact and the glibc it needs
+        run: |
+          uv run --no-project --python 3.12 scripts/build_prebuilt.py \
+            --report --out prebuilt-out
+
+      - name: The Linux shims must load on manylinux_2_28
+        if: matrix.manylinux != ''
+        run: |
+          uv run --no-project --python 3.12 scripts/build_prebuilt.py \
+            --report --out prebuilt-out --kind shim --max-glibc 2.28
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.name }}
+          path: prebuilt-out/
+          if-no-files-found: error
+
+  wheel:
+    needs: prebuilt
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: prebuilt-*
+          path: artifacts
+
+      - name: Collect every platform's libraries into the package
+        run: |
+          uv run --no-project --python 3.12 scripts/build_prebuilt.py \
+            --merge artifacts \
+            --out torch_mojo_backend/native/prebuilt
+
+      # 2.34 is the floor the package already has on Linux: max-core and
+      # mojo-compiler ship manylinux_2_34 wheels, so an artefact needing more
+      # than that would be the only thing standing between an install and a
+      # working device.
+      - name: No artefact may need a newer glibc than MAX itself
+        run: |
+          uv run --no-project --python 3.12 scripts/build_prebuilt.py \
+            --report --out torch_mojo_backend/native/prebuilt --max-glibc 2.34
+
+      - name: Build the wheel
+        run: uv build
+
+      - name: The wheel must carry every library the manifest names
+        run: |
+          unzip -l dist/*.whl | grep "torch_mojo_backend/native/prebuilt/"
+          in_wheel=$(unzip -l dist/*.whl | grep -c "native/prebuilt/libtmb_")
+          in_manifest=$(uv run --no-project --python 3.12 python -c \
+            "import json; print(len(json.load(open('torch_mojo_backend/native/prebuilt/manifest.json'))['entries']))")
+          echo "$in_wheel libraries in the wheel, $in_manifest in the manifest"
+          test "$in_wheel" -eq "$in_manifest"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/
+          if-no-files-found: error
+
+  smoke:
+    needs: wheel
+    name: smoke torch ${{ matrix.torch }} on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            torch: "2.11"
+          - runner: ubuntu-24.04
+            torch: "2.14"
+          - runner: macos-14
+            torch: "2.14"
+
+    steps:
+      # For scripts/smoke_prebuilt_wheel.py; it refuses to test anything but
+      # an installed package, so the checkout cannot shadow the wheel.
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: dist
+
+      # torch comes from its CPU index, everything else (max, mojo, ...) from
+      # PyPI. `2.14.0+cpu` sorts above `2.14.0` -- a local version segment
+      # ranks higher -- so the CPU wheel wins the best match.
+      - name: Install the wheel against torch ${{ matrix.torch }}
+        run: |
+          uv venv --python 3.12 "${RUNNER_TEMP}/venv"
+          uv pip install --python "${RUNNER_TEMP}/venv/bin/python" \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple \
+            --index-strategy unsafe-best-match \
+            dist/*.whl "torch==${{ matrix.torch }}.*"
+
+      - name: Prebuilt libraries used, nothing compiled, one op on the CPU device
+        env:
+          MODULAR_HOME: /tmp/modular
+          # A CI runner has no accelerator, so the triton driver hook has
+          # nothing to bind to and refuses to install. The mojo device is
+          # then its MAX CPU pseudo-device alone, which is what the smoke
+          # test runs its op on.
+          TORCH_MOJO_BACKEND_TRITON: "0"
+        run: |
+          "${RUNNER_TEMP}/venv/bin/python" scripts/smoke_prebuilt_wheel.py

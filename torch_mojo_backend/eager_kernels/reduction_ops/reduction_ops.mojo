@@ -43,8 +43,6 @@ from max.gpu.primitives import block
 from std.math import ceildiv, exp, log
 from std.memory import stack_allocation
 from std.memory.unsafe import bitcast
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
 from std.sys._assembly import inlined_assembly
 from std.sys.info import (
     has_apple_gpu_accelerator,
@@ -57,7 +55,6 @@ from std.utils.index import IndexList
 from std.utils.numerics import min_or_neg_inf, max_or_inf
 from std.utils.static_tuple import StaticTuple
 
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from argreduce_kernels import _argreduce_spec_into
 from reduce_skeleton import (
@@ -71,6 +68,8 @@ from reduce_skeleton import (
 )
 
 from op_utils import (
+    Arg,
+    Argv,
     FLOAT_DTYPES,
     MAX_RANK,
     TensorSpec,
@@ -90,16 +89,16 @@ from op_utils import (
     _spec_dispatcher4,
     _spec_dispatcher5,
     _spec_ptr,
-    _raw_ret_none,
-    _spec_unsupported,
     _vec16_phase,
 )
 
 from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
     _dtype_arg_on,
     _dtype_supported,
     _op_on,
-    _register_call,
+    _tmb_entry_error,
 )
 
 
@@ -1134,10 +1133,10 @@ comptime SPEC_ROWRED_DTYPES: List[DType] = [
 
 
 def _argmin_spec_into_go(
-    a_o: PyObjectPtr,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
-    out_o: PyObjectPtr,
+    a_o: Arg,
+    rdims_t: Arg,
+    keepdim_o: Arg,
+    out_o: Arg,
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
@@ -1149,11 +1148,11 @@ def _argmin_spec_into_go(
 
 
 def _min_dim_spec_into_go(
-    a_o: PyObjectPtr,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
-    out_v_o: PyObjectPtr,
-    out_i_o: PyObjectPtr,
+    a_o: Arg,
+    rdims_t: Arg,
+    keepdim_o: Arg,
+    out_v_o: Arg,
+    out_i_o: Arg,
 ) raises:
     """aten::min.dim values+indices in one call — the multi-output protocol:
     Python allocates both outputs and passes their specs as the last two
@@ -1181,11 +1180,11 @@ def _min_dim_spec_into_go(
 
 
 def _var_spec_into_go(
-    a_o: PyObjectPtr,
-    rdims_t: PyObjectPtr,
-    keepdim_o: PyObjectPtr,
-    corr_o: PyObjectPtr,
-    out_o: PyObjectPtr,
+    a_o: Arg,
+    rdims_t: Arg,
+    keepdim_o: Arg,
+    corr_o: Arg,
+    out_o: Arg,
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
@@ -1232,7 +1231,7 @@ def _var_spec_into_go(
                     )
 
 
-def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
+def _log_softmax_spec_into_go(a_o: Arg, out_o: Arg) raises:
     """log_softmax over the trailing dim; full-shape output. The non-trailing
     dim transpose recursion stays in Python (view ops)."""
     ref a = _spec_ptr(a_o)[]
@@ -1268,81 +1267,55 @@ def _log_softmax_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
 
 
 @export
-def PyInit_reduction_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("reduction_ops")
         comptime if _op_on["SumSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[
-                    _rowred_spec_into_go[SumOp], "a scalar-reduction spec op"
-                ],
-                docstring="(a_spec, rdims, keepdim, out_spec)",
-            )
+            _spec_dispatcher4[
+                _rowred_spec_into_go[SumOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["AmaxSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[
-                    _rowred_spec_into_go[MaxOp], "a scalar-reduction spec op"
-                ],
-                docstring="(a_spec, rdims, keepdim, out_spec)",
-            )
+            _spec_dispatcher4[
+                _rowred_spec_into_go[MaxOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["AminSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[
-                    _rowred_spec_into_go[MinOp], "a scalar-reduction spec op"
-                ],
-                docstring="(a_spec, rdims, keepdim, out_spec)",
-            )
+            _spec_dispatcher4[
+                _rowred_spec_into_go[MinOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["ArgminSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[_argmin_spec_into_go, "ArgminSpec"],
-                docstring="(a_spec, rdims, keepdim, out_spec); int64 indices",
-            )
+            _spec_dispatcher4[_argmin_spec_into_go, "ArgminSpec"](argv, argc)
+            return 0
         comptime if _op_on["MinDimSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher5[_min_dim_spec_into_go, "MinDimSpec"],
-                docstring="(a_spec, rdims, keepdim, values_spec, indices_spec)",
-            )
+            _spec_dispatcher5[_min_dim_spec_into_go, "MinDimSpec"](argv, argc)
+            return 0
         comptime if _op_on["VarSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher5[_var_spec_into_go, "VarSpec"],
-                docstring="(a_spec, rdims, keepdim, correction, out_spec)",
-            )
+            _spec_dispatcher5[_var_spec_into_go, "VarSpec"](argv, argc)
+            return 0
         comptime if _op_on["AnySpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[
-                    _rowred_spec_into_go[AnyOp], "a scalar-reduction spec op"
-                ],
-                docstring="(a_spec, rdims, keepdim, out_spec); bool",
-            )
+            _spec_dispatcher4[
+                _rowred_spec_into_go[AnyOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["AllSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[
-                    _rowred_spec_into_go[AllOp], "a scalar-reduction spec op"
-                ],
-                docstring="(a_spec, rdims, keepdim, out_spec); bool",
-            )
+            _spec_dispatcher4[
+                _rowred_spec_into_go[AllOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["NormSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[
-                    _rowred_spec_into_go[NormL2Op], "a scalar-reduction spec op"
-                ],
-                docstring="(a_spec, rdims, keepdim, out_spec); ord=2",
-            )
+            _spec_dispatcher4[
+                _rowred_spec_into_go[NormL2Op], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["LogSoftmaxSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher2[_log_softmax_spec_into_go, "LogSoftmaxSpec"],
-                docstring="(a_spec, out_spec); trailing dim",
+            _spec_dispatcher2[_log_softmax_spec_into_go, "LogSoftmaxSpec"](
+                argv, argc
             )
-        return b.finalize()
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create reduction_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

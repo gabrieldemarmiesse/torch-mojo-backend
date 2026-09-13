@@ -10,25 +10,28 @@
 
 from std.os import abort
 from max.gpu.host import DeviceContext
-from std.python import PythonObject
-from std.python._cpython import PyObjectPtr, Py_ssize_t
-from std.python.bindings import PythonModuleBuilder
 from std.utils.coord import Coord as StdCoord
 
 from op_utils import (
-    _spec_unsupported,
+    Arg,
+    Argv,
     FLOAT_DTYPES,
     _make_ptr,
     _parallel_for,
     _raw_ctx,
     _raw_dtype_int,
     _raw_int,
-    _raw_ret_none,
     _raw_tuple_int,
     _raw_tuple_len,
 )
 
-from variant_gates import _dtype_arg_on, _op_on, _register_call
+from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
+    _dtype_arg_on,
+    _op_on,
+    _tmb_entry_error,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -94,13 +97,13 @@ def _im2col[
 
 
 def _im2col_go(
-    col_ptr: PyObjectPtr,
-    in_ptr: PyObjectPtr,
+    col_ptr: Arg,
+    in_ptr: Arg,
     # (in_h, in_w, out_h, out_w, kh, kw, stride_h, stride_w, pad_h, pad_w,
     #  dil_h, dil_w, channels, batch); batch defaults to 1 when omitted.
-    params: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    params: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_addr = _raw_int(col_ptr)
@@ -149,23 +152,15 @@ def _im2col_go(
         raise Error("unsupported dtype for fast im2col: " + String(dtype))
 
 
-def _im2col_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _im2col_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _im2col_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _im2col_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -202,11 +197,11 @@ def _bias_add_chan[
 
 
 def _bias_add_chan_go(
-    out_ptr: PyObjectPtr,
-    bias_ptr: PyObjectPtr,
-    params: PyObjectPtr,  # (plane, channels, total_elements)
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    bias_ptr: Arg,
+    params: Arg,  # (plane, channels, total_elements)
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var out_addr = _raw_int(out_ptr)
@@ -228,23 +223,15 @@ def _bias_add_chan_go(
         raise Error("unsupported dtype for fast bias add: " + String(dtype))
 
 
-def _bias_add_chan_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _bias_add_chan_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _bias_add_chan_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _bias_add_chan_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -253,26 +240,17 @@ def _bias_add_chan_dispatcher(
 
 
 @export
-def PyInit_conv_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("conv_ops")
         comptime if _op_on["Im2col"]():
-            _register_call(
-                b,
-                _im2col_dispatcher,
-                docstring=(
-                    "batched NCHW im2col -> (N, C*KH*KW, OH*OW) patch matrix"
-                ),
-            )
+            _im2col_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["BiasAddChan"]():
-            _register_call(
-                b,
-                _bias_add_chan_dispatcher,
-                docstring=(
-                    "in-place out[i] += bias[(i // plane) % channels] on a"
-                    " (batch, channels, plane) tensor"
-                ),
-            )
-        return b.finalize()
+            _bias_add_chan_dispatcher(argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create conv_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

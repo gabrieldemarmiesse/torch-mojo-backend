@@ -8,9 +8,6 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from sdpa_backward_gemm_kernels import enqueue_sdpa_ta_gemm_f32
 from sdpa_dropout_softmax_backward_kernels import (
@@ -18,6 +15,8 @@ from sdpa_dropout_softmax_backward_kernels import (
     enqueue_sdpa_dropout_softmax_backward_f32,
 )
 from op_utils import (
+    Arg,
+    Argv,
     FLOAT_DTYPES,
     _make_ptr,
     _raw_ctx,
@@ -30,23 +29,23 @@ from op_utils import (
     _spec_dispatcher7,
 )
 
-from variant_gates import _op_on, _register_call
+from variant_gates import ErrBuf, NO_OP_COMPILED, _op_on, _tmb_entry_error
 
 
 def _sdpa_dropout_softmax_backward_go(
-    output_ptr_obj: PyObjectPtr,
-    probabilities_ptr_obj: PyObjectPtr,
-    grad_after_dropout_ptr_obj: PyObjectPtr,
-    mask_ptr_obj: PyObjectPtr,
-    rows_obj: PyObjectPtr,
-    cols_obj: PyObjectPtr,
-    q_len_obj: PyObjectPtr,
-    has_mask_obj: PyObjectPtr,
-    causal_obj: PyObjectPtr,
-    dropout_scale_obj: PyObjectPtr,
-    score_scale_obj: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    output_ptr_obj: Arg,
+    probabilities_ptr_obj: Arg,
+    grad_after_dropout_ptr_obj: Arg,
+    mask_ptr_obj: Arg,
+    rows_obj: Arg,
+    cols_obj: Arg,
+    q_len_obj: Arg,
+    has_mask_obj: Arg,
+    causal_obj: Arg,
+    dropout_scale_obj: Arg,
+    score_scale_obj: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var output_address = _raw_int(output_ptr_obj)
@@ -105,18 +104,18 @@ def _sdpa_dropout_softmax_backward_go(
 
 
 def _sdpa_dsb_f32_go(
-    output_ptr_obj: PyObjectPtr,
-    probabilities_ptr_obj: PyObjectPtr,
-    grad_after_dropout_ptr_obj: PyObjectPtr,
-    mask_ptr_obj: PyObjectPtr,
-    rows_obj: PyObjectPtr,
-    cols_obj: PyObjectPtr,
-    has_mask_obj: PyObjectPtr,
-    dropout_scale_obj: PyObjectPtr,
-    score_scale_obj: PyObjectPtr,
-    causal_obj: PyObjectPtr,
-    q_len_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    output_ptr_obj: Arg,
+    probabilities_ptr_obj: Arg,
+    grad_after_dropout_ptr_obj: Arg,
+    mask_ptr_obj: Arg,
+    rows_obj: Arg,
+    cols_obj: Arg,
+    has_mask_obj: Arg,
+    dropout_scale_obj: Arg,
+    score_scale_obj: Arg,
+    causal_obj: Arg,
+    q_len_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var output = _make_ptr[DType.float32](
         _raw_int(output_ptr_obj)
@@ -161,14 +160,14 @@ def _sdpa_dsb_f32_go(
 
 
 def _sdpa_ta_gemm_go(
-    c_ptr_obj: PyObjectPtr,
-    a_ptr_obj: PyObjectPtr,
-    b_ptr_obj: PyObjectPtr,
-    mask_ptr_obj: PyObjectPtr,
+    c_ptr_obj: Arg,
+    a_ptr_obj: Arg,
+    b_ptr_obj: Arg,
+    mask_ptr_obj: Arg,
     # (batch, m, n, k, has_mask, causal)
-    params: PyObjectPtr,
-    drop_scale_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    params: Arg,
+    drop_scale_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var c = _make_ptr[DType.float32](_raw_int(c_ptr_obj)).as_unsafe_any_origin()
     var a = (
@@ -215,52 +214,25 @@ def _sdpa_ta_gemm_go(
 
 
 @export
-def PyInit_sdpa_backward_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("sdpa_backward_ops")
         comptime if _op_on["SDPADropoutSoftmaxBackward"]():
-            _register_call(
-                b,
-                _spec_dispatcher13[
-                    _sdpa_dropout_softmax_backward_go,
-                    "SDPADropoutSoftmaxBackward",
-                ],
-                docstring=(
-                    "(output_ptr, probabilities_ptr, grad_after_dropout_ptr,"
-                    " mask_ptr_or_zero, rows, cols, q_len, has_mask, causal,"
-                    " dropout_scale, score_scale, dtype, context_ptr); fused"
-                    " SDPA dropout and softmax backward,"
-                    " float32/bfloat16/float16"
-                ),
-            )
+            _spec_dispatcher13[
+                _sdpa_dropout_softmax_backward_go,
+                "SDPADropoutSoftmaxBackward",
+            ](argv, argc)
+            return 0
         comptime if _op_on["SDPADropoutSoftmaxBackwardF32"]():
-            _register_call(
-                b,
-                _spec_dispatcher12[
-                    _sdpa_dsb_f32_go, "SDPADropoutSoftmaxBackwardF32"
-                ],
-                docstring=(
-                    "(output_ptr, probabilities_ptr, grad_after_dropout_ptr,"
-                    " mask_ptr_or_zero, rows, cols, has_mask, dropout_scale,"
-                    " score_scale, causal, q_len, context_ptr); fused FP32 SDPA"
-                    " dropout and softmax backward, optionally causal (reads"
-                    " and reduces only the causal prefix; zero band to the 64"
-                    " boundary)"
-                ),
-            )
+            _spec_dispatcher12[
+                _sdpa_dsb_f32_go, "SDPADropoutSoftmaxBackwardF32"
+            ](argv, argc)
+            return 0
         comptime if _op_on["SDPATransAGemmF32"]():
-            _register_call(
-                b,
-                _spec_dispatcher7[_sdpa_ta_gemm_go, "SDPATransAGemmF32"],
-                docstring=(
-                    "(c_ptr, a_ptr, b_ptr, mask_ptr_or_zero, (batch, m, n, k,"
-                    " has_mask, causal), drop_scale, context_ptr); Apple-only"
-                    " batched C = A^T @ B with A stored (k, m) row-major,"
-                    " optional fused dropout-mask multiply on A, optional"
-                    " causal reduction cut — dV/dK of eager SDPA backward"
-                    " without permute copies"
-                ),
-            )
-        return b.finalize()
+            _spec_dispatcher7[_sdpa_ta_gemm_go, "SDPATransAGemmF32"](argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create sdpa_backward_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

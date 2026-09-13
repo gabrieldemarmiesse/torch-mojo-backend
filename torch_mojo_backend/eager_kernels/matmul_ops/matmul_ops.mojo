@@ -38,8 +38,6 @@ from max.gpu.host import (
     DeviceContext,
     FuncAttribute,
 )
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
 from std.sys.info import (
     _accelerator_arch,
     _has_sm_9x,
@@ -95,7 +93,6 @@ def _mma8x8(
 
 from max.gpu.primitives import PDLLevel
 
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from std.utils.index import Index, IndexList
 
@@ -111,18 +108,18 @@ from apple_gemm_tn_kernels import apple_tn_gemm_enqueue
 from gemm_splitk_common import TARGET_BLOCKS, _ksplit_reduce_kernel
 from tn_f32_gemm_kernels import try_enqueue_tn_f32_gemm
 from op_utils import (
+    Arg,
+    Argv,
     FLOAT_DTYPES,
     MAX_RANK,
     TensorSpec,
     _copy_strided,
     _enqueue_cached,
-    _get_ctx,
     _gs_blocks,
     _make_ptr,
     _raw_ctx,
     _raw_dtype_int,
     _raw_int,
-    _raw_ret_none,
     _raw_tuple_int,
     _raw_tuple_len,
     _scratch_contig,
@@ -130,14 +127,15 @@ from op_utils import (
     _spec_dispatcher5,
     _spec_dispatcher6,
     _spec_ptr,
-    _spec_unsupported,
 )
 
 from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
     _dtype_arg_on,
     _dtype_supported,
     _op_on,
-    _register_call,
+    _tmb_entry_error,
 )
 
 
@@ -3785,109 +3783,6 @@ def _amd_dynamic_mfma_dispatch[
 # non-parameterized, so it is always codegen'd, and instantiating the MFMA
 # multistage GEMM on non-AMD targets (Apple in particular has no `mma`)
 # breaks the whole module build.
-def _amd_bf16_tune_dispatcher(
-    c_obj: PythonObject,
-    a_obj: PythonObject,
-    b_obj: PythonObject,
-    bias_obj: PythonObject,
-    # (m, n, k, config_id)
-    params: PythonObject,
-    device_context_ptr: PythonObject,
-) raises:
-    comptime if _accelerator_arch() != "amdgpu:gfx942":
-        raise Error("AmdBf16Tune requires an AMD gfx942 accelerator")
-    else:
-        var c_addr = Int(py=c_obj)
-        var a_addr = Int(py=a_obj)
-        var b_addr = Int(py=b_obj)
-        var bias_addr = Int(py=bias_obj)
-        var m = Int(py=params[0])
-        var n = Int(py=params[1])
-        var k = Int(py=params[2])
-        var cfg = Int(py=params[3])
-        var ctx = _get_ctx(device_context_ptr)
-
-        if cfg == 0:
-            _amd_dynamic_mfma_gemm[DType.bfloat16, 32, 64, 16, 32, False, True](
-                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-            )
-        elif cfg == 1:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 32, 128, 16, 64, False, True
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 2:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 32, 128, 32, 64, False, True
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 3:
-            _amd_dynamic_mfma_gemm[DType.bfloat16, 64, 64, 32, 32, False, True](
-                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-            )
-        elif cfg == 4:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 64, 128, 32, 64, False, True
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 5:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 96, 64, 48, 32, False, True, 64
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 6:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 128, 64, 64, 32, False, True
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 7:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 32, 32, 32, 32, False, True, 64, 2
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 8:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 32, 64, 32, 32, False, True, 64, 2
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 9:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 64, 32, 32, 32, False, True, 64, 2
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 15:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 32, 32, 32, 32, False, True, 32, 2
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 16:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 32, 32, 32, 32, False, True, 64, 4
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 17:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 32, 32, 32, 32, False, True, 64, 2, 2
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 21:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 32, 64, 16, 32, False, True, 64, 1, 2
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        elif cfg == 18:
-            _amd_dynamic_mfma_gemm[DType.bfloat16, 16, 32, 16, 32, False, True](
-                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-            )
-        elif cfg == 19:
-            _amd_dynamic_mfma_gemm[DType.bfloat16, 16, 64, 16, 32, False, True](
-                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-            )
-        elif cfg == 20:
-            _amd_dynamic_mfma_gemm[DType.bfloat16, 64, 32, 32, 32, False, True](
-                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-            )
-        elif cfg == 22:
-            _amd_dynamic_mfma_gemm[
-                DType.bfloat16, 128, 32, 64, 32, False, True
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-        else:
-            raise Error("unknown AMD BF16 MFMA tune config")
-
-
-# ---------------------------------------------------------------------------
-# Dispatch: pick a kernel/config from the runtime shape.
-# ---------------------------------------------------------------------------
-
-
 @always_inline
 def _enqueue_pipe[
     BM: Int, BN: Int, BK: Int, TM: Int, TN: Int, transpose_b: Bool
@@ -5850,132 +5745,6 @@ def _pipe3t_enqueue[
         raise Error("no GPU accelerator available at compile time")
 
 
-def _matmul_tune_dispatcher(
-    c_buffer: PythonObject,
-    a_buffer: PythonObject,
-    b_buffer: PythonObject,
-    # (m, n, k, transpose_b, cfg, kchunk_min); float32 only, k % 4 == 0
-    # and (n % 4 == 0 when transpose_b == 0) required.
-    params: PythonObject,
-    device_context_ptr: PythonObject,
-) raises:
-    var c_addr = Int(py=c_buffer._data_ptr())
-    var a_addr = Int(py=a_buffer._data_ptr())
-    var b_addr = Int(py=b_buffer._data_ptr())
-    var m = Int(py=params[0])
-    var n = Int(py=params[1])
-    var k = Int(py=params[2])
-    var transpose_b = Int(py=params[3])
-    var cfg = Int(py=params[4])
-    var kmin = Int(py=params[5])
-    var ctx = _get_ctx(device_context_ptr)
-
-    if transpose_b == 0:
-        if cfg == 1:
-            _tune_enqueue[32, 64, 16, 4, 4, False, True](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, kmin, ctx
-            )
-        elif cfg == 2:
-            _tune_enqueue[64, 64, 16, 4, 4, False, True](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, kmin, ctx
-            )
-        elif cfg == 3:
-            _tune_enqueue[128, 128, 16, 8, 8, False, False](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, kmin, ctx
-            )
-        elif cfg == 4:
-            _tune_enqueue[128, 64, 8, 8, 8, False, True, 5](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, kmin, ctx
-            )
-        elif cfg == 5:
-            _tune_enqueue[128, 128, 8, 8, 8, False, True, 5](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, kmin, ctx
-            )
-        elif cfg == 6:
-            _tune_enqueue[128, 64, 8, 8, 8, False, True, 7](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, kmin, ctx
-            )
-        elif cfg == 7:
-            _pipe3t_enqueue[128, 64, 8, 8, 8, 5](
-                c_addr, a_addr, b_addr, m, n, k, kmin, ctx
-            )
-        elif cfg == 8:
-            _pipe3t_enqueue[128, 128, 8, 8, 8, 5](
-                c_addr, a_addr, b_addr, m, n, k, kmin, ctx
-            )
-        elif cfg == 9:
-            _pipe3t_enqueue[128, 64, 16, 8, 8, 3](
-                c_addr, a_addr, b_addr, m, n, k, kmin, ctx
-            )
-        elif cfg == 10:
-            _pipe3t_enqueue[64, 64, 8, 8, 8, 5](
-                c_addr, a_addr, b_addr, m, n, k, kmin, ctx
-            )
-        elif cfg == 11:
-            _tune_enqueue[64, 64, 16, 4, 4, False, True, 4, 4](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, kmin, ctx
-            )
-        elif cfg == 12:
-            _tune_enqueue[64, 64, 16, 4, 4, False, True, 4, 5](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, kmin, ctx
-            )
-        elif cfg == 13:
-            _pipe3t_enqueue[64, 64, 8, 8, 4, 5, 6](
-                c_addr, a_addr, b_addr, m, n, k, kmin, ctx
-            )
-        elif cfg == 14:
-            _pipe3t_enqueue[64, 64, 8, 8, 4, 6, 8](
-                c_addr, a_addr, b_addr, m, n, k, kmin, ctx
-            )
-        elif cfg == 15:
-            _pipe3t_enqueue[128, 64, 8, 8, 8, 5, 4](
-                c_addr, a_addr, b_addr, m, n, k, kmin, ctx
-            )
-        elif cfg == 16:
-            _pipe3t_enqueue[64, 128, 8, 8, 8, 5, 6](
-                c_addr, a_addr, b_addr, m, n, k, kmin, ctx
-            )
-        else:
-            raise Error("unknown tb0 tune cfg")
-    else:
-        if cfg == 1:
-            _tune_enqueue[32, 64, 16, 4, 4, True, False](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, kmin, ctx
-            )
-        elif cfg == 2:
-            _ct_enqueue[64, 32, 32, 4, 4, 3](
-                c_addr, a_addr, b_addr, m, n, k, ctx
-            )
-        elif cfg == 3:
-            _ct_enqueue[64, 32, 16, 4, 4](c_addr, a_addr, b_addr, m, n, k, ctx)
-        elif cfg == 4:
-            _ct_enqueue[128, 64, 8, 8, 8, 5](
-                c_addr, a_addr, b_addr, m, n, k, ctx
-            )
-        elif cfg == 5:
-            _ct_enqueue[128, 128, 8, 8, 8, 5](
-                c_addr, a_addr, b_addr, m, n, k, ctx
-            )
-        elif cfg == 6:
-            _ct_enqueue[64, 64, 8, 8, 8, 5](
-                c_addr, a_addr, b_addr, m, n, k, ctx
-            )
-        elif cfg == 7:
-            _ct_enqueue[64, 64, 8, 8, 8, 5, 6](
-                c_addr, a_addr, b_addr, m, n, k, ctx
-            )
-        elif cfg == 8:
-            _ct_enqueue[64, 128, 8, 8, 8, 5, 4](
-                c_addr, a_addr, b_addr, m, n, k, ctx
-            )
-        elif cfg == 9:
-            _ct_enqueue[64, 64, 16, 8, 8, 3, 6](
-                c_addr, a_addr, b_addr, m, n, k, ctx
-            )
-        else:
-            raise Error("unknown tb1 tune cfg")
-
-
 @always_inline
 def _gemm_dtype_dispatch(
     dtype: DType,
@@ -6291,15 +6060,15 @@ def _cpu_gemm_dtype_dispatch(
 
 
 def _matmul_go(
-    out_ptr: PyObjectPtr,
-    a_ptr: PyObjectPtr,
-    b_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    a_ptr: Arg,
+    b_ptr: Arg,
     # (m, n, k, transpose_b) or, with element offsets into the three
     # buffers (grouped convolution), (m, n, k, transpose_b, c_off, a_off,
     # b_off).
-    params: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    params: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var c_addr = _raw_int(out_ptr)
@@ -6370,15 +6139,15 @@ def _matmul_go(
 
 
 def _bmm_go(
-    out_ptr: PyObjectPtr,
-    a_ptr: PyObjectPtr,
-    b_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    a_ptr: Arg,
+    b_ptr: Arg,
     # (batch, m, n, k, transpose_b) or (batch, m, n, k, transpose_b,
     # a_shared) — a_shared=1 broadcasts a single (m, k) A across the batch
     # (batched convolution with shared weights).
-    params: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    params: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var c_addr = _raw_int(out_ptr)
@@ -6448,13 +6217,13 @@ def _bmm_go(
 
 
 def _bmm_causal_go(
-    out_ptr: PyObjectPtr,
-    a_ptr: PyObjectPtr,
-    b_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    a_ptr: Arg,
+    b_ptr: Arg,
     # (batch, m, n, k, transpose_b, causal_mode)
-    params: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    params: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_obj)
     var c_addr = _raw_int(out_ptr)
@@ -6498,24 +6267,16 @@ def _bmm_causal_go(
         raise Error("BmmCausalF32 is Apple-GPU only")
 
 
-def _bmm_causal_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _bmm_causal_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _bmm_causal_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _bmm_causal_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6709,54 +6470,38 @@ def _matmul_bias_run(
 # unsupported-dtype guards gated upstream).
 
 
-def _matmul_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _matmul_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _matmul_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _matmul_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+    )
 
 
-def _bmm_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _bmm_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _bmm_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _bmm_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+    )
 
 
 def _causal_bmm_go(
-    out_ptr: PyObjectPtr,
-    a_ptr: PyObjectPtr,
-    b_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    a_ptr: Arg,
+    b_ptr: Arg,
     # (batch, m, n, k, transpose_b, causal_mode)
-    params: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    params: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var ctx = _raw_ctx(device_context_ptr)
     var causal = _raw_tuple_int(params, 5)
@@ -7069,9 +6814,7 @@ def _matmul_spec_operands_launch(
         _ = tmp_b^
 
 
-def _matmul_spec_into_go(
-    a_o: PyObjectPtr, b_o: PyObjectPtr, tb_o: PyObjectPtr, out_o: PyObjectPtr
-) raises:
+def _matmul_spec_into_go(a_o: Arg, b_o: Arg, tb_o: Arg, out_o: Arg) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
     ref b = _spec_ptr(b_o)[]
@@ -7101,11 +6844,11 @@ def _matmul_spec_into_go(
 
 
 def _matmul_bias_spec_into_go(
-    a_o: PyObjectPtr,
-    b_o: PyObjectPtr,
-    bias_o: PyObjectPtr,
-    tb_o: PyObjectPtr,
-    out_o: PyObjectPtr,
+    a_o: Arg,
+    b_o: Arg,
+    bias_o: Arg,
+    tb_o: Arg,
+    out_o: Arg,
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
@@ -7155,9 +6898,7 @@ def _matmul_bias_spec_into_go(
     oshape[MAX_RANK - 1] = n
 
 
-def _bmm_spec_into_go(
-    a_o: PyObjectPtr, b_o: PyObjectPtr, tb_o: PyObjectPtr, out_o: PyObjectPtr
-) raises:
+def _bmm_spec_into_go(a_o: Arg, b_o: Arg, tb_o: Arg, out_o: Arg) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
     ref b = _spec_ptr(b_o)[]
@@ -7214,79 +6955,34 @@ def _bmm_spec_into_go(
 
 
 @export
-def PyInit_matmul_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("matmul_ops")
         comptime if _op_on["MatmulSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[_matmul_spec_into_go, "MatmulSpec"],
-                docstring="(a_spec, b_spec, transpose_b, out_spec)",
-            )
+            _spec_dispatcher4[_matmul_spec_into_go, "MatmulSpec"](argv, argc)
+            return 0
         comptime if _op_on["MatmulBiasSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher5[_matmul_bias_spec_into_go, "MatmulBiasSpec"],
-                docstring="(a_spec, b_spec, bias_spec, transpose_b, out_spec)",
+            _spec_dispatcher5[_matmul_bias_spec_into_go, "MatmulBiasSpec"](
+                argv, argc
             )
+            return 0
         comptime if _op_on["BmmSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher4[_bmm_spec_into_go, "BmmSpec"],
-                docstring="(a_spec, b_spec, transpose_b, out_spec)",
-            )
+            _spec_dispatcher4[_bmm_spec_into_go, "BmmSpec"](argv, argc)
+            return 0
         comptime if _op_on["Matmul"]():
-            _register_call(
-                b,
-                _matmul_dispatcher,
-                docstring=(
-                    "C = A @ B (row-major, optional transposed B); pure Mojo"
-                    " tiled kernels on GPU, modular's linalg matmul on CPU"
-                ),
-            )
+            _matmul_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["Bmm"]():
-            _register_call(
-                b,
-                _bmm_dispatcher,
-                docstring=(
-                    "batched C = A @ B (rank 3, optional transposed B); pure"
-                    " Mojo tiled kernels on GPU, modular's linalg matmul on CPU"
-                ),
-            )
+            _bmm_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["BmmCausalF32"]():
-            _register_call(
-                b,
-                _bmm_causal_dispatcher,
-                docstring=(
-                    "causal-structured batched f32 GEMM for SDPA on Apple GPUs:"
-                    " mode 1 skips (and leaves unwritten) score tiles above the"
-                    " diagonal, mode 2 cuts the reduction at the causal"
-                    " boundary"
-                ),
-            )
+            _bmm_causal_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["CausalBmm"]():
-            _register_call(
-                b,
-                _spec_dispatcher6[_causal_bmm_go, "CausalBmm"],
-                docstring=(
-                    "(out_ptr, a_ptr, b_ptr, (batch, m, n, k, transpose_b,"
-                    " causal_mode), dtype, context_ptr); batched C = A @ B that"
-                    " skips the contraction indices a top-left-aligned causal"
-                    " mask kills. Mode 1 leaves the masked half of the output"
-                    " unwritten (its consumer must read only each row's live"
-                    " prefix), modes 2 and 3 are exact for any consumer"
-                ),
-            )
-        b.def_function[_matmul_tune_dispatcher](
-            "MatmulTune",
-            docstring=(
-                "GEMM with explicit tile cfg + split-K floor — tuning only"
-            ),
-        )
-        b.def_function[_amd_bf16_tune_dispatcher](
-            "AmdBf16Tune",
-            docstring="BF16 MFMA tile sweep — benchmarking only",
-        )
-        return b.finalize()
+            _spec_dispatcher6[_causal_bmm_go, "CausalBmm"](argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create matmul_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

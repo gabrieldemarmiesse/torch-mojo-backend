@@ -121,11 +121,7 @@ def main():
     # rank-offset seed for on-device randomness (dropout).
     torch.manual_seed(args.seed)
     if device == "mojo":
-        from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- same optional import as above
-            torch_mojo_device_module,
-        )
-
-        torch_mojo_device_module.manual_seed_all(args.seed + rank)
+        torch.mojo.manual_seed_all(args.seed + rank)  # ty: ignore[unresolved-attribute] -- registered by register_mojo_devices()
     else:
         torch.cuda.manual_seed_all(args.seed + rank)
 

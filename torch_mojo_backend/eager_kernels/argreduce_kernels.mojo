@@ -79,6 +79,7 @@ from std.utils.coord import Coord
 from std.utils.static_tuple import StaticTuple
 
 from op_utils import (
+    Arg,
     TensorSpec,
     _adjacent_reduce_geom,
     _device_sm_count,
@@ -86,7 +87,6 @@ from op_utils import (
     _make_ptr,
     _parallel_for,
 )
-from std.python._cpython import PyObjectPtr
 
 from variant_gates import _dtype_arg_on
 
@@ -892,7 +892,7 @@ def _argreduce_spec_into[
 ](
     a: TensorSpec,
     dst: TensorSpec,
-    rdims_t: PyObjectPtr,
+    rdims_t: Arg,
     ctx: DeviceContext,
     val_addr: Int = 0,
     val_numel: Int = -1,

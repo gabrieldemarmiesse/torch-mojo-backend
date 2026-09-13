@@ -24,21 +24,18 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, erf, exp, tanh
 from std.os import abort
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator
 
 from op_utils import (
-    _spec_unsupported,
+    Arg,
+    Argv,
     _enqueue_cached,
     _make_ptr,
     _raw_ctx,
     _raw_int,
-    _raw_ret_none,
 )
 
-from variant_gates import _op_on, _register_call
+from variant_gates import ErrBuf, NO_OP_COMPILED, _op_on, _tmb_entry_error
 
 
 comptime _BLOCK = 256
@@ -416,12 +413,12 @@ def enqueue_gelu_backward_bf16(
 
 
 def _gelu_backward_go(
-    output_ptr_obj: PyObjectPtr,
-    grad_output_ptr_obj: PyObjectPtr,
-    input_ptr_obj: PyObjectPtr,
-    elements_obj: PyObjectPtr,
-    tanh_mode_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    output_ptr_obj: Arg,
+    grad_output_ptr_obj: Arg,
+    input_ptr_obj: Arg,
+    elements_obj: Arg,
+    tanh_mode_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var output = _make_ptr[DType.float32](
         _raw_int(output_ptr_obj)
@@ -443,33 +440,25 @@ def _gelu_backward_go(
     )
 
 
-def _gelu_backward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _gelu_backward_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _gelu_backward_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _gelu_backward_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+    )
 
 
 def _gelu_backward_bf16_go(
-    output_ptr_obj: PyObjectPtr,
-    grad_output_ptr_obj: PyObjectPtr,
-    input_ptr_obj: PyObjectPtr,
-    elements_obj: PyObjectPtr,
-    tanh_mode_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    output_ptr_obj: Arg,
+    grad_output_ptr_obj: Arg,
+    input_ptr_obj: Arg,
+    elements_obj: Arg,
+    tanh_mode_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var output = _make_ptr[DType.bfloat16](
         _raw_int(output_ptr_obj)
@@ -491,24 +480,16 @@ def _gelu_backward_bf16_go(
     )
 
 
-def _gelu_backward_bf16_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _gelu_backward_bf16_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _gelu_backward_bf16_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _gelu_backward_bf16_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -517,29 +498,17 @@ def _gelu_backward_bf16_dispatcher(
 
 
 @export
-def PyInit_activation_backward_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("activation_backward_ops")
         comptime if _op_on["GeluBackwardF32"]():
-            _register_call(
-                b,
-                _gelu_backward_dispatcher,
-                docstring=(
-                    "(output_ptr, grad_output_ptr, input_ptr, elements,"
-                    " tanh_mode, context_ptr); float32 GELU backward,"
-                    " tanh_mode 0 = exact erf, nonzero = tanh approximation"
-                ),
-            )
+            _gelu_backward_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["GeluBackwardBF16"]():
-            _register_call(
-                b,
-                _gelu_backward_bf16_dispatcher,
-                docstring=(
-                    "(output_ptr, grad_output_ptr, input_ptr, elements,"
-                    " tanh_mode, context_ptr); bfloat16 GELU backward,"
-                    " tanh_mode 0 = exact erf, nonzero = tanh approximation"
-                ),
-            )
-        return b.finalize()
+            _gelu_backward_bf16_dispatcher(argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create activation_backward_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

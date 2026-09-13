@@ -26,9 +26,7 @@ LISTS: dict[str, list[tuple[int, ...]]] = {
 
 COVERS: dict[str, str] = {
     "aten::_foreach_add_.Scalar": "test_foreach_add_",
-    "aten::_foreach_addcdiv_.ScalarList": "test_foreach_addcdiv_",
     "aten::_foreach_addcmul_.Scalar": "test_foreach_addcmul_",
-    "aten::_foreach_div_.ScalarList": "test_foreach_div_",
     "aten::_foreach_lerp_.Scalar": "test_foreach_lerp_",
     "aten::_foreach_mul_.Scalar": "test_foreach_mul_scalar",
     "aten::_foreach_mul_.Tensor": "test_foreach_mul_tensor",

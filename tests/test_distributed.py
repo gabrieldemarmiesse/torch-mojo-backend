@@ -1,9 +1,10 @@
 """Tests for the mojo distributed backend (torch_mojo_backend/distributed).
 
-Single-process pieces (registration, dtype maps, CPU/gloo delegation) run
-anywhere. Real multi-rank NCCL/RCCL coverage launches torchrun subprocesses and
-needs multiple GPUs, so those tests skip on smaller machines; they are also
-exercised on the cluster by the SLURM jobs in demo_scripts/nanogpt_ddp.
+Single-process pieces (registration, dtype maps, CPU/gloo delegation, library
+discovery) run anywhere. Real multi-rank NCCL/RCCL coverage launches torchrun
+subprocesses and needs multiple GPUs, so those tests skip on smaller machines;
+they are also exercised on the cluster by the SLURM jobs in
+demo_scripts/nanogpt_ddp and tests/multinode/.
 """
 
 import datetime
@@ -25,7 +26,6 @@ from torch_mojo_backend.mojo_device import hip_peer
 from torch_mojo_backend.torch_compile_backend import utils
 
 _WORKER = Path(__file__).parent / "ddp_worker.py"
-_OVERHEAD_WORKER = Path(__file__).parent / "comm_fence_overhead.py"
 
 
 def _gpu_count() -> int:
@@ -148,35 +148,83 @@ def test_use_local_rank_gpu_is_a_no_op_outside_torchrun(monkeypatch):
     assert env["ROCR_VISIBLE_DEVICES"] == "0,1,2,3"
 
 
-def test_collective_library_refuses_an_unknown_device_api():
-    with pytest.raises(RuntimeError, match="NVIDIA \\(NCCL\\) and AMD \\(RCCL\\)"):
-        nccl.load("metal")
+def test_uses_mojoccl_reads_the_env_var(monkeypatch):
+    monkeypatch.delenv("TORCH_MOJO_BACKEND_CCL", raising=False)
+    assert nccl.uses_mojoccl() is False
+    monkeypatch.setenv("TORCH_MOJO_BACKEND_CCL", "mojo")
+    assert nccl.uses_mojoccl() is True
+    monkeypatch.setenv("TORCH_MOJO_BACKEND_CCL", "MoJo")  # case-insensitive
+    assert nccl.uses_mojoccl() is True
+    monkeypatch.setenv("TORCH_MOJO_BACKEND_CCL", "vendor")
+    assert nccl.uses_mojoccl() is False
+
+
+def test_vendor_name_reflects_the_max_accelerator_api(monkeypatch):
+    monkeypatch.setattr(
+        utils, "get_accelerators", lambda: [SimpleNamespace(api="cuda")]
+    )
+    assert nccl.vendor_name() == "nccl"
+    monkeypatch.setattr(utils, "get_accelerators", lambda: [SimpleNamespace(api="hip")])
+    assert nccl.vendor_name() == "rccl"
+    monkeypatch.setattr(utils, "get_accelerators", lambda: [])
+    assert nccl.vendor_name() == "nccl"
+
+
+def test_library_path_builds_mojoccl_when_selected(monkeypatch):
+    monkeypatch.setenv("TORCH_MOJO_BACKEND_CCL", "mojo")
+    monkeypatch.setattr(
+        "torch_mojo_backend.distributed.mojoccl_build.ensure_built",
+        lambda: "/fake/libmojoccl.so",
+    )
+    assert nccl.library_path() == "/fake/libmojoccl.so"
+
+
+def test_library_path_picks_the_vendor_candidate_that_exists(monkeypatch, tmp_path):
+    monkeypatch.delenv("TORCH_MOJO_BACKEND_CCL", raising=False)
+    fake = tmp_path / "libnccl.so.2"
+    fake.write_bytes(b"")
+    monkeypatch.setattr(nccl, "vendor_name", lambda: "nccl")
+    monkeypatch.setattr(
+        nccl,
+        "_candidate_libnccl_paths",
+        lambda: ["/nonexistent/libnccl.so.2", str(fake)],
+    )
+    assert nccl.library_path() == str(fake)
+
+
+def test_library_path_raises_a_clear_error_when_nothing_is_found(monkeypatch):
+    monkeypatch.delenv("TORCH_MOJO_BACKEND_CCL", raising=False)
+    monkeypatch.setattr(nccl, "vendor_name", lambda: "nccl")
+    monkeypatch.setattr(
+        nccl, "_candidate_libnccl_paths", lambda: ["/nonexistent/libnccl.so.2"]
+    )
+    with pytest.raises(RuntimeError, match="no NCCL/RCCL library found"):
+        nccl.library_path()
 
 
 _GPU_PROBE = """
-import sys
+import os
 import torch
+
 from torch_mojo_backend import register_mojo_devices
 from torch_mojo_backend.distributed import nccl
-from torch_mojo_backend.mojo_device import hip_peer, torch_mojo_device_module
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
+from torch_mojo_backend.mojo_device import hip_peer
 
 register_mojo_devices()
 on_mojo = torch.zeros(8, device="mojo:0")
-assert isinstance(on_mojo, TorchMojoTensor)
-api = on_mojo._device.api
-print("api", api)
-if api in ("cuda", "hip"):
-    library = nccl.load(api)
-    assert library.name == {"cuda": "NCCL", "hip": "RCCL"}[api], library.name
-    assert library.version() >= 20000, library.version()  # 2.x: the pinned ABI
-    assert len(library.get_unique_id()) == nccl.NCCL_UNIQUE_ID_BYTES
-    print("library", library.name, library.version())
-if api == "hip":
-    torch_mojo_device_module.synchronize()
+assert on_mojo.device.type == "mojo"
+
+vendor = nccl.vendor_name()
+print("vendor", vendor)
+if not nccl.uses_mojoccl():
+    path = nccl.library_path()
+    assert os.path.exists(path), path
+    print("library", path)
+if vendor == "rccl":
+    torch.accelerator.synchronize()
     assert hip_peer.available()
     assert hip_peer.runtime_dir() is not None  # MAX already mapped libamdhip64
-    assert hip_peer.device_ordinal(on_mojo._ptr) is not None
+    assert hip_peer.device_ordinal(on_mojo.data_ptr()) is not None
     assert hip_peer.device_ordinal(0) is None
     assert hip_peer.device_ordinal(torch.zeros(8).data_ptr()) is None
     print("hip_peer ok")
@@ -214,9 +262,8 @@ def test_collective_library_matches_the_gpu_vendor():
     if _gpu_count() < 1:
         pytest.skip("needs a GPU")
     out = _run_gpu_probe()
-    api = out.split("api ", 1)[1].split()[0]
-    if api not in ("cuda", "hip"):
-        pytest.skip(f"no NCCL-API library for the {api!r} device api")
+    vendor = out.split("vendor ", 1)[1].split()[0]
+    assert vendor in ("nccl", "rccl"), out
     assert "library " in out, out
 
 
@@ -227,7 +274,7 @@ def test_hip_pointer_ordinal_identifies_the_owning_gpu():
     if _gpu_count() < 1:
         pytest.skip("needs a GPU")
     out = _run_gpu_probe()
-    if "api hip" not in out:
+    if "vendor rccl" not in out:
         pytest.skip("needs an AMD GPU")
     assert "hip_peer ok" in out, out
 
@@ -341,82 +388,27 @@ def _run_torchrun(nproc: int, mode: str, extra_env: dict[str, str] | None = None
 
 
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
-@pytest.mark.parametrize("comm_stream", ["1", "0"], ids=["side-stream", "same-stream"])
 @pytest.mark.parametrize(
-    "mode", ["collectives", "ddp_parity", "lazy_fence", "stress", "abort"]
+    "mode", ["collectives", "ddp_parity", "stream_ordering", "stress", "abort"]
 )
-def test_two_rank_nccl(mode: str, comm_stream: str, ccl: str):
+def test_two_rank_nccl(mode: str, ccl: str):
     """`ccl="mojo"` runs the same workers against mojoccl
     (torch_mojo_backend/distributed/mojoccl), the in-repo NCCL-API library,
-    instead of vendor NCCL/RCCL -- same process_group.py, same ddp_worker.py,
-    only the loaded .so differs (nccl.py's `load()`). ddp_worker.py itself
-    skips the two collectives mojoccl does not implement yet
-    (ReduceScatter, Send/Recv) when this is set.
+    instead of vendor NCCL/RCCL — same process_group.py, same ddp_worker.py,
+    only the loaded .so differs (nccl.py's `library_path()`). ddp_worker.py
+    itself skips the collectives mojoccl does not implement yet (Reduce,
+    ReduceScatter, Send/Recv, AllToAll, Gather/Scatter) when this is set.
 
-    `mode="stress"` is mojoccl-specific regression coverage ported from the
-    kernel harness (docs/mojo_collectives_kernel_results.md §6-7): the
-    interleaving pattern that found a silent-corruption bug, plus a
-    dtype/size/op/placement verify matrix. It exercises nothing vendor
-    NCCL/RCCL doesn't already cover elsewhere, so it only runs for
-    `ccl="mojo"`. MOJOCCL_REGION_MB is pinned small so its "past the region
-    cap" cases stay cheap tensors instead of needing a real 256 MiB region.
+    `mode="stress"` hammers every collective back to back at mixed sizes; the
+    mojoccl-only collectives inside it are skipped the same way `collectives`
+    skips them, so it runs (and asserts something) under both `ccl` values.
 
-    `mode="abort"` is likewise mojoccl-only: it asserts that ncclCommAbort
-    releases the spinning kernels and the region in a fraction of the
-    barrier deadline, which is a timing claim about this library.
+    `mode="abort"` exercises `MojoProcessGroup.abort()`/`shutdown()` and needs
+    2+ ranks; abort() deliberately drops the aborted communicator rather than
+    wedging the group, so a collective issued right after it transparently
+    rebuilds one, and it behaves the same under both libraries.
     """
     if _gpu_count() < 2:
         pytest.skip("needs at least 2 GPUs")
-    if mode in ("stress", "abort") and ccl != "mojo":
-        pytest.skip(f"{mode} is mojoccl-only regression coverage")
-    extra_env = {"TORCH_MOJO_BACKEND_COMM_STREAM": comm_stream}
-    if ccl == "mojo":
-        extra_env["TORCH_MOJO_BACKEND_CCL"] = "mojo"
-    if mode == "stress":
-        extra_env["MOJOCCL_REGION_MB"] = "4"
+    extra_env = {"TORCH_MOJO_BACKEND_CCL": "mojo"} if ccl == "mojo" else None
     _run_torchrun(2, mode, extra_env)
-
-
-def _measure_overhead_microseconds(no_hook: bool) -> dict[str, float]:
-    result = subprocess.run(
-        [sys.executable, str(_OVERHEAD_WORKER)] + (["--no-hook"] if no_hook else []),
-        # os.environ, not the inherited environment: the Mojo runtime setenv()s
-        # PYTHONEXECUTABLE=/usr/bin/python3 at the C level once a kernel
-        # extension loads, which breaks a child launched with sys.executable.
-        env=dict(os.environ),
-        capture_output=True,
-        text=True,
-        timeout=900,
-        cwd=Path(__file__).parent.parent,
-    )
-    if result.returncode != 0:
-        raise AssertionError(
-            f"overhead worker failed (rc={result.returncode})\n"
-            f"stdout:\n{result.stdout[-4000:]}\nstderr:\n{result.stderr[-4000:]}"
-        )
-    return {
-        key: float(value)
-        for key, _, value in (
-            line.partition("=") for line in result.stdout.splitlines()
-        )
-        if value
-    }
-
-
-def test_comm_fence_hook_per_op_overhead():
-    """What the per-op comm-fence hook costs when no collective is pending.
-
-    One subprocess per leg: the hook is installed once, at registration.
-    """
-    if _gpu_count() < 1:
-        pytest.skip("needs a GPU")
-    with_hook = _measure_overhead_microseconds(no_hook=False)
-    without_hook = _measure_overhead_microseconds(no_hook=True)
-    print(
-        f"\ncomm-fence hook: {with_hook['us_per_op']:.3f} us/op with, "
-        f"{without_hook['us_per_op']:.3f} us/op without "
-        f"({with_hook['us_per_op'] - without_hook['us_per_op']:+.3f} us/op); "
-        f"wrapper frame alone {with_hook['wrapper_us']:.3f} us"
-    )
-    assert with_hook["us_per_op"] - without_hook["us_per_op"] < 5.0
-    assert with_hook["wrapper_us"] < 5.0

@@ -9,23 +9,20 @@
 
 from max.gpu.host import DeviceContext
 from std.os import abort
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from normalization_backward_dx import enqueue_layer_norm_backward_dx_f32
 from normalization_backward_params import (
     enqueue_layer_norm_backward_params_f32,
 )
 from op_utils import (
+    Arg,
+    Argv,
     _make_ptr,
     _raw_ctx,
     _raw_int,
-    _raw_ret_none,
-    _spec_unsupported,
 )
 
-from variant_gates import _op_on, _register_call
+from variant_gates import ErrBuf, NO_OP_COMPILED, _op_on, _tmb_entry_error
 
 
 def enqueue_layer_norm_backward_f32(
@@ -80,18 +77,18 @@ def enqueue_layer_norm_backward_f32(
 
 
 def _layer_norm_backward_go(
-    grad_input_ptr_obj: PyObjectPtr,
-    grad_weight_ptr_obj: PyObjectPtr,
-    grad_bias_ptr_obj: PyObjectPtr,
-    grad_output_ptr_obj: PyObjectPtr,
-    input_ptr_obj: PyObjectPtr,
-    mean_ptr_obj: PyObjectPtr,
-    rstd_ptr_obj: PyObjectPtr,
-    weight_ptr_obj: PyObjectPtr,
-    rows_obj: PyObjectPtr,
-    cols_obj: PyObjectPtr,
-    output_mask_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    grad_input_ptr_obj: Arg,
+    grad_weight_ptr_obj: Arg,
+    grad_bias_ptr_obj: Arg,
+    grad_output_ptr_obj: Arg,
+    input_ptr_obj: Arg,
+    mean_ptr_obj: Arg,
+    rstd_ptr_obj: Arg,
+    weight_ptr_obj: Arg,
+    rows_obj: Arg,
+    cols_obj: Arg,
+    output_mask_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var grad_input = _make_ptr[DType.float32](
         _raw_int(grad_input_ptr_obj)
@@ -134,47 +131,33 @@ def _layer_norm_backward_go(
     )
 
 
-def _layer_norm_backward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _layer_norm_backward_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-            args[unsafe_offset=9],
-            args[unsafe_offset=10],
-            args[unsafe_offset=11],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _layer_norm_backward_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _layer_norm_backward_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+        args[unsafe_offset=9],
+        args[unsafe_offset=10],
+        args[unsafe_offset=11],
+    )
 
 
 @export
-def PyInit_normalization_backward_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("normalization_backward_ops")
         comptime if _op_on["LayerNormBackwardF32"]():
-            _register_call(
-                b,
-                _layer_norm_backward_dispatcher,
-                docstring=(
-                    "(grad_input_ptr, grad_weight_ptr, grad_bias_ptr,"
-                    " grad_output_ptr, input_ptr, mean_ptr, rstd_ptr,"
-                    " weight_ptr, rows, cols, output_mask, context_ptr);"
-                    " float32 native LayerNorm backward"
-                ),
-            )
-        return b.finalize()
+            _layer_norm_backward_dispatcher(argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create normalization_backward_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

@@ -1,7 +1,5 @@
 # ruff: noqa: E402 -- the environment variables below must be set before the imports
-import math
 import os
-from collections.abc import Callable
 
 os.environ["MODULAR_TELEMETRY_ENABLED"] = "0"
 os.environ["MAX_USE_EAGER_INTERPRETER"] = "1"
@@ -13,16 +11,9 @@ pytest.register_assert_rewrite("torch_mojo_backend.testing")
 
 
 import torch
-from max.driver import Device
-from max.dtype import DType
 from mojo.paths import _build_mojo_source_package
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-    TorchMojoTensor,
-    _row_major_strides,
-    _torch_dtype_of,
-)
 from torch_mojo_backend.testing import CallChecker, Conf
 from torch_mojo_backend.torch_compile_backend import compiler
 
@@ -101,6 +92,7 @@ def reset_compiler():
 
 @pytest.fixture(params=["cpu", "gpu"])
 def mojo_device(request, mojo_gpu_available: bool):
+    register_mojo_devices()  # idempotent
     if request.param == "cpu":
         yield (f"mojo:{len(get_accelerators()) - 1}")
     else:
@@ -120,52 +112,6 @@ def mojo_gpu(mojo_gpu_available: bool) -> str:
         pytest.skip("You do not have a GPU supported by MAX")
     register_mojo_devices()  # idempotent; some callers have no autouse setup
     return "mojo:0"
-
-
-@pytest.fixture
-def fake_mojo_tensor() -> Callable[..., torch.Tensor]:
-    """Build a `TorchMojoTensor` whose payload metadata is pure fiction.
-
-    Host-only tests of the kernel wiring need a tensor that answers every
-    metadata question `aten_fast` asks (`_shape`, `_dtype`, `_ptr`, ...)
-    without owning device memory, so the prologue of a kernel route can be
-    exercised on a machine with no GPU. The pointer is never dereferenced:
-    such tests replace the native `call` entry point.
-    """
-
-    def make(
-        device: Device,
-        *,
-        dtype: DType = DType.float32,
-        shape: tuple[int, ...] = (2, 3),
-        strides: tuple[int, ...] | None = None,
-        ptr: int = 1,
-    ) -> torch.Tensor:
-        shape = tuple(shape)
-        strides = _row_major_strides(shape) if strides is None else tuple(strides)
-        tensor = torch.Tensor._make_wrapper_subclass(
-            TorchMojoTensor,
-            shape,
-            strides=strides,
-            storage_offset=0,
-            dtype=_torch_dtype_of(dtype),
-            layout=torch.strided,
-            device=torch.device("cpu"),
-            requires_grad=False,
-        )
-        tensor._holder = object()
-        tensor._ptr = ptr
-        tensor._device = device
-        tensor._dtype = dtype
-        tensor._shape = shape
-        tensor._mojo_strides = strides
-        tensor._offset = 0
-        tensor._itemsize = dtype.size_in_bytes
-        tensor._numel = math.prod(shape)
-        tensor._is_contiguous = True
-        return tensor
-
-    return make
 
 
 def pytest_make_parametrize_id(val):

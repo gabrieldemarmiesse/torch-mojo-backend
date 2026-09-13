@@ -11,12 +11,11 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from softmax_backward_kernels import enqueue_log_softmax_backward
 from op_utils import (
+    Arg,
+    Argv,
     _make_ptr,
     _raw_ctx,
     _raw_dtype_int,
@@ -24,17 +23,23 @@ from op_utils import (
     _spec_dispatcher7,
 )
 
-from variant_gates import _dtype_arg_on, _op_on, _register_call
+from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
+    _dtype_arg_on,
+    _op_on,
+    _tmb_entry_error,
+)
 
 
 def _log_softmax_backward_go(
-    grad_input_ptr_obj: PyObjectPtr,
-    grad_output_ptr_obj: PyObjectPtr,
-    output_ptr_obj: PyObjectPtr,
-    rows_obj: PyObjectPtr,
-    cols_obj: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    grad_input_ptr_obj: Arg,
+    grad_output_ptr_obj: Arg,
+    output_ptr_obj: Arg,
+    rows_obj: Arg,
+    cols_obj: Arg,
+    dtype_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var dtype_val = _raw_dtype_int(dtype_obj)
     var grad_input_addr = _raw_int(grad_input_ptr_obj)
@@ -67,22 +72,16 @@ def _log_softmax_backward_go(
 
 
 @export
-def PyInit_softmax_backward_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("softmax_backward_ops")
         comptime if _op_on["LogSoftmaxBackwardData"]():
-            _register_call(
-                b,
-                _spec_dispatcher7[
-                    _log_softmax_backward_go, "LogSoftmaxBackwardData"
-                ],
-                docstring=(
-                    "(grad_input_ptr, grad_output_ptr, output_ptr, rows, cols,"
-                    " dtype, context_ptr); fused trailing-dim log_softmax"
-                    " backward: grad_input = grad_output - exp(output) *"
-                    " rowsum(grad_output); f32/f16/bf16, fp32 accumulation"
-                ),
-            )
-        return b.finalize()
+            _spec_dispatcher7[
+                _log_softmax_backward_go, "LogSoftmaxBackwardData"
+            ](argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create softmax_backward_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

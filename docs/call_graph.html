@@ -7,8 +7,8 @@
 <!-- Open this file in a browser. Two call graphs, NVIDIA and AMD: which layer of
      torch-mojo-backend talks to which library and hardware, from user code down to
      the GPUs and the network. Edges were established from the sources: PrivateUse1
-     dispatch and the "mojo" distributed backend (torch_mojo_backend/), max.driver in the
-     Python layer, max.gpu.host in the eager kernels and mojoccl, and the dlopens in
+     dispatch and the "mojo" distributed backend (torch_mojo_backend/), max.gpu.host in
+     the native backend, the kernels and mojoccl, and the dlopens in
      torch_mojo_backend/distributed/mojoccl/{driver,ibverbs,libfabric}.mojo. -->
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
@@ -157,7 +157,7 @@
     return [
       { id: "user", kind: "py", label: "user code", sub: "model, DDP, optimizer", x: 300, y: 36, w: 210, h: 44 },
       { id: "disp", kind: "sys", label: "torch dispatcher", sub: "ATen ops · torch.distributed", x: 300, y: 110, w: 210, h: 44 },
-      { id: "py", kind: "py", label: "torch-mojo-backend (python layer)", sub: "mojo device · process group · loader", x: 300, y: 186, w: 260, h: 44 },
+      { id: "be", kind: "mojo", label: "torch-mojo-backend (native backend)", sub: "C++ shim → mojo aten ops · process group", x: 300, y: 186, w: 300, h: 44 },
       { id: "kern", kind: "mojo", label: "torch-mojo-backend (mojo kernels)", sub: "ATen ops, JIT-built extensions", x: 150, y: 280, w: 236, h: 44 },
       { id: "ccl", kind: "mojo", label: "torch-mojo-backend (mojoccl)", sub: "NCCL C ABI in Mojo", x: 445, y: 280, w: 220, h: 44 },
       { id: "max", kind: "mojo", label: "MAX DeviceContext", sub: "max.gpu.host · runtime", x: 150, y: 372, w: 190, h: 44 }
@@ -165,10 +165,10 @@
   }
   var commonEdges = [
     { from: "user", to: "disp", label: "torch ops · dist.all_reduce", anchor: "start", lx: 8 },
-    { from: "disp", to: "py", label: "PrivateUse1 kernels · backend \"mojo\"", anchor: "start", lx: 8 },
-    { from: "py", to: "kern", dx1: -60, label: "calls into CPython extensions", anchor: "end", lx: -8, t: 0.25 },
-    { from: "py", to: "ccl", dx1: 60, label: "NCCL C ABI via ctypes", anchor: "start", lx: 8, t: 0.35 },
-    { from: "py", to: "max", dx1: -110, dx2: -60, bow: -60, label: "max.driver: tensors, streams", anchor: "start", lx: 6, t: 0.85 },
+    { from: "disp", to: "be", label: "PrivateUse1 boxed kernels · backend \"mojo\"", anchor: "start", lx: 8 },
+    { from: "be", to: "kern", dx1: -60, label: "tmb_call: one C entry per family", anchor: "end", lx: -8, t: 0.25 },
+    { from: "be", to: "ccl", dx1: 60, label: "NCCL C ABI, called from Mojo", anchor: "start", lx: 8, t: 0.35 },
+    { from: "be", to: "max", dx1: -110, dx2: -60, bow: -60, label: "max.gpu.host: memory, streams, events", anchor: "start", lx: 6, t: 0.85 },
     { from: "kern", to: "max", dx1: 20, dx2: 20, label: "enqueue_function · buffers", t: 0.25 },
     { from: "ccl", to: "max", dx1: -80, dx2: 70, label: "launches", t: 0.5 }
   ];
@@ -179,7 +179,6 @@
     { id: "gpu", kind: "hw", label: "H100", sub: "8 per node · NVSwitch", x: 210, y: 566, w: 200, h: 44 },
     { id: "nic", kind: "hw", label: "InfiniBand", sub: "ConnectX, 400 Gb/s", x: 490, y: 566, w: 170, h: 44 }
   ]), commonEdges.concat([
-    { from: "py", to: "drv", soft: true, label: "ctypes (GPU identity)", t: 0.72, anchor: "start", lx: 8 },
     { from: "ccl", to: "drv", dx1: -20, dx2: 40, label: "dlopen: cuMem*, cuIpc*, cuMulticast*", t: 0.75, anchor: "start", lx: 8 },
     { from: "ccl", to: "net", dx1: 60, dx2: 10, label: "dlopen: queue pairs, RDMA writes", anchor: "end", lx: -8, t: 0.45 },
     { from: "max", to: "drv", dx1: 40, dx2: -50, label: "cuMemCreate · cuLaunchKernel", anchor: "end", lx: -8, t: 0.5 },
@@ -194,7 +193,7 @@
     { id: "gpu", kind: "hw", label: "MI300A", sub: "4 APUs per node", x: 210, y: 566, w: 200, h: 44 },
     { id: "nic", kind: "hw", label: "Slingshot", sub: "Cassini NICs, 200 Gb/s", x: 490, y: 566, w: 170, h: 44 }
   ]), commonEdges.concat([
-    { from: "py", to: "drv", soft: true, label: "ctypes (GPU identity)", t: 0.72, anchor: "start", lx: 8 },
+    { from: "be", to: "drv", soft: true, label: "ctypes: locate the mapped libamdhip64", t: 0.72, anchor: "start", lx: 8 },
     { from: "ccl", to: "drv", dx1: -20, dx2: 40, label: "dlopen: hipExtMallocWithFlags, hipIpc*", t: 0.75, anchor: "start", lx: 8 },
     { from: "ccl", to: "net", dx1: 60, dx2: 10, label: "dlopen: fi_writemsg + fi_sendmsg", anchor: "end", lx: -8, t: 0.45 },
     { from: "max", to: "drv", dx1: 40, dx2: -50, label: "hipMemCreate · hipModuleLaunchKernel", anchor: "end", lx: -8, t: 0.5 },

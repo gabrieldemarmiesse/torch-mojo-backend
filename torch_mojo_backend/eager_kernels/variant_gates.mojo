@@ -1,7 +1,5 @@
-"""Compile-time operation/dtype gates and the specialized-module ABI."""
+"""Compile-time operation/dtype gates and the specialized-module C entry."""
 
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyCFunctionFast
 from std.sys.defines import get_defined_string
 
 comptime _OP = get_defined_string["OP", ""]()
@@ -108,16 +106,20 @@ def _dtype_arg_width_on[index: Int, bits: Int]() -> Bool:
         return False
 
 
-def _register_call(
-    mut builder: PythonModuleBuilder,
-    function: PyCFunctionFast,
-    docstring: StaticString = "",
-):
-    """Register the one callable exposed by a specialized extension module.
+comptime ErrBuf = Pointer[UInt8, MutUntrackedOrigin]
 
-    Every dispatcher in this package is a `METH_FASTCALL` entry point, and the
-    operation it serves is already named by the enclosing
-    `comptime if _op_on["..."]()` gate, so neither a second name argument nor
-    the `PyCFunction`/`PyCFunctionWithKeywords` shapes are needed here.
-    """
-    builder.def_py_c_function(function, "call", docstring)
+
+def _tmb_entry_error(err: ErrBuf, errcap: Int, e: Error) -> Int32:
+    """Report a kernel error through `tmb_call`'s (buffer, capacity) channel:
+    the message, NUL-terminated and truncated to the capacity."""
+    var msg = String(e)
+    var b = msg.as_bytes()
+    var n = min(len(b), errcap - 1) if errcap > 0 else 0
+    for i in range(n):
+        err[unsafe_offset=i] = b[i]
+    if errcap > 0:
+        err[unsafe_offset=n] = 0
+    return 1
+
+
+comptime NO_OP_COMPILED = "no operation compiled into this module (OP define)"

@@ -15,12 +15,11 @@
 from max.gpu.host import DeviceBuffer
 from std.os import abort
 from std.memory import AddressSpace
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 from flash_attention_bwd_kernels import enqueue_flash_attention_bwd
 from flash_attention_fwd_kernels import RowStrides, enqueue_flash_attention_fwd
 from op_utils import (
+    Arg,
+    Argv,
     FLOAT_DTYPES,
     _make_ptr,
     _raw_ctx,
@@ -32,11 +31,17 @@ from op_utils import (
     _spec_dispatcher15,
 )
 
-from variant_gates import _dtype_arg_on, _op_on, _register_call
+from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
+    _dtype_arg_on,
+    _op_on,
+    _tmb_entry_error,
+)
 
 
 @always_inline
-def _raw_strides(t: PyObjectPtr, i: Int) -> RowStrides:
+def _raw_strides(t: Arg, i: Int) -> RowStrides:
     """The `i`-th (batch, head, seq) element-stride triple of a flat tuple."""
     return RowStrides(
         _raw_tuple_int(t, 3 * i),
@@ -46,17 +51,17 @@ def _raw_strides(t: PyObjectPtr, i: Int) -> RowStrides:
 
 
 def _flash_attention_forward_go(
-    out_obj: PyObjectPtr,
-    lse_obj: PyObjectPtr,
-    q_obj: PyObjectPtr,
-    k_obj: PyObjectPtr,
-    v_obj: PyObjectPtr,
-    dims_obj: PyObjectPtr,
-    strides_obj: PyObjectPtr,
-    scale_obj: PyObjectPtr,
-    causal_obj: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    ctx_obj: PyObjectPtr,
+    out_obj: Arg,
+    lse_obj: Arg,
+    q_obj: Arg,
+    k_obj: Arg,
+    v_obj: Arg,
+    dims_obj: Arg,
+    strides_obj: Arg,
+    scale_obj: Arg,
+    causal_obj: Arg,
+    dtype_obj: Arg,
+    ctx_obj: Arg,
 ) raises:
     var batch = _raw_tuple_int(dims_obj, 0)
     var heads = _raw_tuple_int(dims_obj, 1)
@@ -113,21 +118,21 @@ def _flash_attention_forward_go(
 
 
 def _flash_attention_backward_go(
-    dq_obj: PyObjectPtr,
-    dk_obj: PyObjectPtr,
-    dv_obj: PyObjectPtr,
-    grad_obj: PyObjectPtr,
-    q_obj: PyObjectPtr,
-    k_obj: PyObjectPtr,
-    v_obj: PyObjectPtr,
-    out_obj: PyObjectPtr,
-    lse_obj: PyObjectPtr,
-    dims_obj: PyObjectPtr,
-    strides_obj: PyObjectPtr,
-    scale_obj: PyObjectPtr,
-    causal_obj: PyObjectPtr,
-    dtype_obj: PyObjectPtr,
-    ctx_obj: PyObjectPtr,
+    dq_obj: Arg,
+    dk_obj: Arg,
+    dv_obj: Arg,
+    grad_obj: Arg,
+    q_obj: Arg,
+    k_obj: Arg,
+    v_obj: Arg,
+    out_obj: Arg,
+    lse_obj: Arg,
+    dims_obj: Arg,
+    strides_obj: Arg,
+    scale_obj: Arg,
+    causal_obj: Arg,
+    dtype_obj: Arg,
+    ctx_obj: Arg,
 ) raises:
     var batch = _raw_tuple_int(dims_obj, 0)
     var heads = _raw_tuple_int(dims_obj, 1)
@@ -221,43 +226,21 @@ def _flash_attention_backward_go(
 
 
 @export
-def PyInit_flash_attention_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("flash_attention_ops")
         comptime if _op_on["FlashAttentionForward"]():
-            _register_call(
-                b,
-                _spec_dispatcher11[
-                    _flash_attention_forward_go, "FlashAttentionForward"
-                ],
-                docstring=(
-                    "(out_ptr, lse_ptr, q_ptr, k_ptr, v_ptr, (batch, heads,"
-                    " seq_q, seq_kv, head_dim), (batch, head, seq) x 4 for q,"
-                    " k, v and the output, scale, is_causal, dtype,"
-                    " context_ptr); fused flash-attention forward writing the"
-                    " output and the per-row log-sum-exp the backward consumes."
-                    " Q, K, V and the output are addressed through the given"
-                    " element strides and their head_dim stride must be 1; the"
-                    " log-sum-exp is dense."
-                ),
-            )
+            _spec_dispatcher11[
+                _flash_attention_forward_go, "FlashAttentionForward"
+            ](argv, argc)
+            return 0
         comptime if _op_on["FlashAttentionBackward"]():
-            _register_call(
-                b,
-                _spec_dispatcher15[
-                    _flash_attention_backward_go, "FlashAttentionBackward"
-                ],
-                docstring=(
-                    "(dq_ptr, dk_ptr, dv_ptr, grad_out_ptr, q_ptr, k_ptr,"
-                    " v_ptr, out_ptr, lse_ptr, (batch, heads, seq_q, seq_kv,"
-                    " head_dim), (batch, head, seq) x 8 for grad_out, q, k, v,"
-                    " out, dq, dk and dv, scale, is_causal, dtype,"
-                    " context_ptr); fused flash-attention backward writing dQ,"
-                    " dK and dV. All eight operands are addressed through the"
-                    " given element strides and their head_dim stride must be"
-                    " 1; the log-sum-exp is dense."
-                ),
-            )
-        return b.finalize()
+            _spec_dispatcher15[
+                _flash_attention_backward_go, "FlashAttentionBackward"
+            ](argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create flash_attention_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

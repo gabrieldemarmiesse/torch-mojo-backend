@@ -1,18 +1,15 @@
-"""DLPack export for TorchMojoTensor.
+"""Hand-built DLPack capsules over a raw device allocation.
 
-TorchMojoTensor's torch-side TensorImpl is a zero-byte meta-backed wrapper,
-so torch's built-in `__dlpack__` would export a null pointer. The real
-allocation lives behind the Python-side metadata (`_ptr`, `_shape`,
-`_dtype`, `_device`, `_holder`). This module builds the `DLManagedTensor`
-capsule from that metadata so consumers like `max.driver.Buffer.from_dlpack`
-can adopt the memory zero-copy — this is how mojo tensors are fed into
-compiled MAX graphs.
+`torch_compile_backend/compiler.py` adopts a compiled MAX graph's output
+buffers as `mojo` tensors zero-copy with `make_capsule_privateuse1`; torch
+cannot do that itself, since its importer keys off the DLPack device-type
+code and MAX tags its buffers with the vendor one. `make_capsule` is the
+vendor-tagged variant, for consumers like `max.driver.Buffer.from_dlpack`.
 
-Only contiguous tensors are exported (callers materialize first), so the
+Only contiguous allocations are exported (callers materialize first), so the
 capsule advertises compact row-major layout (strides=NULL). The capsule
-keeps the producing tensor's `_holder` alive until the consumer's deleter
-runs, which is the same refcount-based ownership the rest of the eager
-backend relies on.
+pins the caller-supplied `holder` -- any object whose refcount keeps the
+memory alive -- until the consumer's deleter runs.
 """
 
 # ctypes._CData / ctypes._Pointer are typeshed-only names (not real runtime
@@ -102,6 +99,14 @@ _pyapi.Py_IncRef.argtypes = [ctypes.py_object]
 _pyapi.Py_IncRef.restype = None
 _pyapi.Py_DecRef.argtypes = [ctypes.py_object]
 _pyapi.Py_DecRef.restype = None
+
+# A second handle on the same symbols, taking the capsule as a Python object
+# rather than as a raw address: ctypes caches one function object per name per
+# library, so `argtypes` cannot be both at once and the two callers above and
+# below need different ones.
+_pyapi_obj = ctypes.PyDLL(None)
+_pyapi_obj.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+_pyapi_obj.PyCapsule_GetPointer.restype = ctypes.c_void_p
 
 
 class _ExportState:
@@ -224,17 +229,29 @@ def dlpack_device(device: max.driver.Device) -> tuple[int, int]:
     return (device_type, device.id)
 
 
-def make_capsule(
+# torch's C++ DLPack importer maps this device-type code straight to
+# `at::Device(DeviceType::PrivateUse1, index)` (aten/src/ATen/DLConvertor.cpp),
+# independent of a *renamed* PrivateUse1 backend's Python-visible name (this
+# project renames it to "mojo"). See `make_capsule_privateuse1` below and
+# `torch_compile_backend/compiler.py`, which imports MAX output buffers this
+# way.
+_KDL_EXT_DEV = 12
+
+
+def _build_capsule(
     holder: object,
     data_ptr: int,
     shape: Sequence[int],
     dtype: DType,
-    device: max.driver.Device,
+    device_type: int,
+    device_id: int,
 ) -> object:
-    """A "dltensor" PyCapsule for a contiguous device allocation.
+    """Shared "dltensor" PyCapsule builder for a contiguous device allocation.
 
     `holder` is any Python object whose refcount keeps the allocation
-    alive; it is pinned until the consumer's deleter runs.
+    alive; it is pinned until the consumer's deleter runs. `device_type` is
+    a raw DLPack device-type code (see `make_capsule` and
+    `make_capsule_privateuse1` for the two ways callers pick one).
     """
     code_bits = _DLPACK_CODE_OF.get(dtype)
     if code_bits is None:
@@ -243,7 +260,7 @@ def make_capsule(
     shape_arr = (ctypes.c_int64 * ndim)(*shape)
     managed = _DLManagedTensor()
     managed.dl_tensor.data = data_ptr
-    managed.dl_tensor.device = _DLDevice(*dlpack_device(device))
+    managed.dl_tensor.device = _DLDevice(device_type, device_id)
     managed.dl_tensor.ndim = ndim
     managed.dl_tensor.dtype = _DLDataType(code_bits[0], code_bits[1], 1)
     managed.dl_tensor.shape = shape_arr
@@ -267,3 +284,63 @@ def make_capsule(
     except Exception:
         _release_export(ctypes.pointer(managed))
         raise
+
+
+def make_capsule(
+    holder: object,
+    data_ptr: int,
+    shape: Sequence[int],
+    dtype: DType,
+    device: max.driver.Device,
+) -> object:
+    """A "dltensor" PyCapsule for a contiguous device allocation.
+
+    `holder` is any Python object whose refcount keeps the allocation
+    alive; it is pinned until the consumer's deleter runs.
+    """
+    return _build_capsule(holder, data_ptr, shape, dtype, *dlpack_device(device))
+
+
+def make_capsule_privateuse1(
+    holder: object, data_ptr: int, shape: Sequence[int], dtype: DType, device_index: int
+) -> object:
+    """A "dltensor" PyCapsule tagged for import as a `mojo` (renamed
+    PrivateUse1) torch tensor at index `device_index`.
+
+    Unlike `make_capsule` (which tags the real vendor device type so MAX
+    recognizes the producer), this tags DLPack's ``kDLExtDev`` code:
+    torch's C++ DLPack importer maps that straight to
+    ``at::Device(DeviceType::PrivateUse1, device_index)`` regardless of the
+    renamed backend's Python-visible name, so `torch.from_dlpack` on this
+    capsule yields a `mojo:<device_index>` tensor sharing this memory
+    zero-copy. Used for MAX graph outputs, whose buffers are otherwise
+    tagged with MAX's own vendor device type (see compiler.py).
+    """
+    return _build_capsule(holder, data_ptr, shape, dtype, _KDL_EXT_DEV, device_index)
+
+
+def retag_capsule(capsule: object, device_type: int, device_id: int) -> object:
+    """Rewrite the device recorded in an unconsumed "dltensor" capsule.
+
+    The producer of a capsule decides which DLPack device code it carries,
+    and that code is the only thing an importer looks at to pick the torch
+    device -- but the *memory* is the same either way when the two devices
+    are two names for one piece of hardware. That is exactly the mojo/CUDA
+    pair: a mojo tensor exports ``kDLExtDev``, a CUDA tensor exports
+    ``kDLCUDA``, and both are a pointer into the same device's address
+    space. Retagging is therefore how `cuda_interop` builds an alias --
+    torch's own exporter fills in shape, strides, offset and dtype, and its
+    deleter keeps the source tensor alive, which a hand-built capsule
+    (`make_capsule*` above) would have to redo.
+
+    The capsule is mutated in place and returned. Only a capsule the
+    consumer has not adopted yet ("dltensor", not "used_dltensor") can be
+    retagged: `PyCapsule_GetPointer` raises `ValueError` for anything else,
+    which `PyDLL` turns back into a Python exception here.
+    """
+    managed = ctypes.cast(
+        _pyapi_obj.PyCapsule_GetPointer(capsule, _CAPSULE_NAME),
+        ctypes.POINTER(_DLManagedTensor),
+    )
+    managed.contents.dl_tensor.device = _DLDevice(device_type, device_id)
+    return capsule

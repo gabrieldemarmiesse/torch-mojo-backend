@@ -1,5 +1,11 @@
 # Strided owning tensors + killing the Python `driver.Buffer` (design)
 
+> **Superseded.** This designs the Python eager path (`TorchMojoTensor`,
+> `aten_fast.py`, the `MojoExtension` loader), which has been deleted; the
+> `mojo` device is the native PrivateUse1 backend of
+> `docs/native_backend.md`. Kept for the design reasoning and the
+> measurements, which the Mojo host side inherited.
+
 Status: **IMPLEMENTED** on branch `eager-strided-owning-tensors`. The plan
 below is the original design; the "Implementation status" section right
 after this intro records what was actually built and where it deviates.

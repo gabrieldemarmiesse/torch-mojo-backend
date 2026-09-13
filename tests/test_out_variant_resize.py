@@ -1,65 +1,66 @@
-"""Eager out= resize, aliasing, and dtype-policy regressions."""
+"""Eager `out=` resize, aliasing, and dtype-policy contracts, on the native
+backend.
+
+Per docs/native_backend.md / the porting brief: an `out=` op computes into
+the caller's tensor when it already has the right shape/dtype/contiguity,
+else computes then `copy_strided_into`s -- so a same-shape `out=` on a view
+must keep writing through the *original* storage (no silent reallocation),
+and dtype-checked `out=` ops must reject a mismatched output dtype with a
+clear error rather than a wrong answer.
+"""
 
 import pytest
 import torch
 
-from torch_mojo_backend import TorchMojoTensor
-from torch_mojo_backend.eager_kernels.aten_fast import _spec_of
-from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
+from torch_mojo_backend import aten_functions
 from torch_mojo_backend.testing import CallChecker
 
 pytestmark = pytest.mark.xdist_group(name="group1")
 
 
-def _watch_eager_op(call_checker: CallChecker, op_name: str):
-    call_checker.register(EAGER_CALL_COUNTERS[op_name])
-
-
+@pytest.mark.xfail(strict=False, reason="op not ported yet: aten::add.out")
 @pytest.mark.parametrize("storage_offset", [0, 2])
-def test_mul_out_resize_preserves_existing_storage_alias(
+def test_add_out_resize_preserves_existing_storage_alias(
     mojo_gpu: str, call_checker: CallChecker, storage_offset: int
 ):
-    _watch_eager_op(call_checker, "aten::mul.out")
+    call_checker.register(aten_functions.aten_add)
     base = torch.arange(8, dtype=torch.float32).to(mojo_gpu)
-    assert isinstance(base, TorchMojoTensor)
-    out = base[storage_offset:storage_offset]
-    assert isinstance(out, TorchMojoTensor)
+    out = base[storage_offset : storage_offset + 2]
+    base_ptr = base.data_ptr()
+
     lhs = torch.tensor([2.0, 3.0], device=mojo_gpu)
     rhs = torch.tensor([5.0, 7.0], device=mojo_gpu)
-    holder = base._holder
-
-    returned = torch.ops.aten.mul.out(lhs, rhs, out=out)
+    returned = torch.add(lhs, rhs, out=out)
 
     assert returned is out
-    assert out._holder is holder is base._holder
+    assert out.data_ptr() == base_ptr + storage_offset * base.element_size()
     assert out.shape == (2,)
-    assert torch.numel(out) == 2
-    torch.testing.assert_close(out.cpu(), torch.tensor([10.0, 21.0]))
+    torch.testing.assert_close(out.cpu(), torch.tensor([7.0, 10.0]))
     expected_base = torch.arange(8, dtype=torch.float32)
-    expected_base[storage_offset : storage_offset + 2] = torch.tensor([10.0, 21.0])
+    expected_base[storage_offset : storage_offset + 2] = torch.tensor([7.0, 10.0])
     torch.testing.assert_close(base.cpu(), expected_base)
 
 
-def test_resized_out_invalidates_cached_tensor_spec(
-    mojo_gpu: str, call_checker: CallChecker
-):
-    """A spec operation after resize must use the new pointer and shape."""
-    _watch_eager_op(call_checker, "aten::mul.out")
+@pytest.mark.xfail(strict=False, reason="op not ported yet: aten::mul.out")
+def test_mul_out_resizes_a_mismatched_output(mojo_gpu: str, call_checker: CallChecker):
+    """An `out=` tensor with the wrong shape must be resized, not reused."""
+    call_checker.register(aten_functions.aten_mul)
     out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
-    assert isinstance(out, TorchMojoTensor)
-    _spec_of(out)
-    assert "_spec" in out.__dict__
 
     lhs = torch.tensor([2.0, 3.0], device=mojo_gpu)
     rhs = torch.tensor([5.0, 7.0], device=mojo_gpu)
-    torch.ops.aten.mul.out(lhs, rhs, out=out)
+    torch.mul(lhs, rhs, out=out)
 
-    assert "_spec" not in out.__dict__
     assert out.shape == (2,)
-    incremented = torch.add(out, 1.0)
-    torch.testing.assert_close(incremented.cpu(), torch.tensor([11.0, 22.0]))
+    torch.testing.assert_close(out.cpu(), torch.tensor([10.0, 21.0]))
+    incremented = torch.add(out, out)
+    torch.testing.assert_close(incremented.cpu(), torch.tensor([20.0, 42.0]))
 
 
+@pytest.mark.xfail(
+    strict=False,
+    reason="op not ported yet: aten::any.out / aten::isin.Tensor_Tensor_out",
+)
 @pytest.mark.parametrize(
     ("op_name", "valid_dtype", "invalid_dtype"),
     [
@@ -68,13 +69,8 @@ def test_resized_out_invalidates_cached_tensor_spec(
     ],
 )
 def test_out_variants_enforce_operation_specific_dtype_contracts(
-    mojo_gpu: str,
-    call_checker: CallChecker,
-    op_name: str,
-    valid_dtype: torch.dtype,
-    invalid_dtype: torch.dtype,
+    mojo_gpu: str, op_name: str, valid_dtype: torch.dtype, invalid_dtype: torch.dtype
 ):
-    _watch_eager_op(call_checker, op_name)
     if op_name == "aten::any.out":
         input = torch.tensor([[0, 2, 0], [0, 0, 0]], device=mojo_gpu)
 

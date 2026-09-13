@@ -12,10 +12,10 @@ SymIntType = int | Dim
 class CountedCallable(Protocol):
     """A function wrapped with the test-only call-count instrumentation.
 
-    `map_to` (aten_functions.py), `aten_fast.py`'s per-op wrappers, and
-    `mojo_device_aten_ops.py`'s registration wrap every op with
+    `map_to` (aten_functions.py) wraps every graph-backend op with
     `functools.wraps` plus a `call_count` attribute so tests can assert an
-    op actually ran (see `testing.CallChecker`). `functools.wraps` preserves
+    op actually ran (see `testing.CallChecker`; the native mojo device is
+    counted by the C++ shim instead). `functools.wraps` preserves
     `__name__` but its stub doesn't know about the extra attribute, so the
     wrapped callable needs this structural type instead of plain `Callable`.
     """

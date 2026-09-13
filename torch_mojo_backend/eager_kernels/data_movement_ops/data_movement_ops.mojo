@@ -20,55 +20,54 @@ from std.collections import InlineArray
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
 from max.algorithm import elementwise
 from std.utils import IndexList
 
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from op_utils import (
+    Arg,
+    Argv,
     GS_THREADS,
     MAX_RANK,
     _BW_MAX_BLOCKS,
     _LLC_BYTES,
-    _bw_blocks,
-    _bw_flat_blocks,
-    _fill_bits,
-    _fill_bits_dtype,
     _MAX_GRID_Y,
     _T2D_ROWS,
+    _bw_blocks,
+    _bw_flat_blocks,
+    _device_sm_count,
     _enqueue_cached,
     _enqueue_cached_2d,
+    _fill_bits,
+    _fill_bits_dtype,
     _gs_blocks,
-    _t2d_tile,
-    _transpose2d_kernel,
     _make_ptr,
     _parallel_for,
     _parallel_for_dt,
-    _scratch_contig,
     _raw_ctx,
     _raw_dtype_int,
     _raw_f64,
     _raw_int,
-    _raw_ret_none,
     _raw_tuple_int,
     _raw_tuple_len,
-    _device_sm_count,
+    _scratch_contig,
     _spec_dispatcher3,
     _spec_ptr,
-    _spec_unsupported,
+    _t2d_tile,
+    _transpose2d_kernel,
 )
 
 from variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
     _dtype_arg_on,
     _dtype_arg_width_on,
     _dtype_out_on,
     _op_on,
-    _register_call,
+    _tmb_entry_error,
 )
 
 
@@ -500,12 +499,12 @@ def _permute_copy[
 
 
 def _permute_copy_go(
-    out_ptr: PyObjectPtr,
-    in_ptr: PyObjectPtr,
-    dims: PyObjectPtr,
-    strides: PyObjectPtr,
-    itemsize_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    in_ptr: Arg,
+    dims: Arg,
+    strides: Arg,
+    itemsize_o: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var in_addr = _raw_int(in_ptr)
@@ -863,8 +862,8 @@ def _cat_launch_width[
     dtype: DType, width: Int
 ](
     out_addr: Int,
-    srcs: PyObjectPtr,
-    lens: PyObjectPtr,
+    srcs: Arg,
+    lens: Arg,
     n: Int,
     outer: Int,
     dst_stride: Int,
@@ -937,8 +936,8 @@ def _cat_launch[
     dtype: DType
 ](
     out_addr: Int,
-    srcs: PyObjectPtr,
-    lens: PyObjectPtr,
+    srcs: Arg,
+    lens: Arg,
     n: Int,
     outer: Int,
     dst_stride: Int,
@@ -959,14 +958,14 @@ def _cat_launch[
 
 
 def _cat_n_go(
-    out_ptr_o: PyObjectPtr,
-    srcs_o: PyObjectPtr,
-    lens_o: PyObjectPtr,
-    outer_o: PyObjectPtr,
-    dst_stride_o: PyObjectPtr,
-    itemsize_o: PyObjectPtr,
-    width_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr_o: Arg,
+    srcs_o: Arg,
+    lens_o: Arg,
+    outer_o: Arg,
+    dst_stride_o: Arg,
+    itemsize_o: Arg,
+    width_o: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr_o)
     var outer = _raw_int(outer_o)
@@ -1009,26 +1008,18 @@ def _cat_n_go(
         raise Error("no GPU accelerator available at compile time")
 
 
-def _cat_n_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _cat_n_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-        )
-        return _raw_ret_none()
-    except e:
-        return _spec_unsupported(e)
+def _cat_n_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _cat_n_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1234,14 +1225,14 @@ def _narrow_copy_dst[
 
 
 def _narrow_copy_dst_go(
-    out_ptr: PyObjectPtr,
-    in_ptr: PyObjectPtr,
-    outer: PyObjectPtr,
-    dst_stride: PyObjectPtr,
-    copy_len: PyObjectPtr,
-    dst_offset: PyObjectPtr,
-    itemsize_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    in_ptr: Arg,
+    outer: Arg,
+    dst_stride: Arg,
+    copy_len: Arg,
+    dst_offset: Arg,
+    itemsize_o: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var in_addr = _raw_int(in_ptr)
@@ -1885,13 +1876,13 @@ comptime _MASKED_FILL_SCALAR_DTYPES = [
 
 
 def _masked_fill_scalar_go(
-    out_ptr: PyObjectPtr,
-    cond_ptr: PyObjectPtr,
-    b_ptr: PyObjectPtr,
-    params: PyObjectPtr,  # (d0..d3, cs0..cs3, bs0..bs3)
-    value: PyObjectPtr,
-    dtype_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    cond_ptr: Arg,
+    b_ptr: Arg,
+    params: Arg,  # (d0..d3, cs0..cs3, bs0..bs3)
+    value: Arg,
+    dtype_o: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var cond_addr = _raw_int(cond_ptr)
@@ -1980,13 +1971,13 @@ def _dtype_size(dtype: DType) raises -> Int:
 
 
 def _where_select_go(
-    out_ptr: PyObjectPtr,
-    cond_ptr: PyObjectPtr,
-    a_ptr: PyObjectPtr,
-    b_ptr: PyObjectPtr,
-    params: PyObjectPtr,  # (d0..d3, cs0..cs3, as0..as3, bs0..bs3)
-    dtype_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    cond_ptr: Arg,
+    a_ptr: Arg,
+    b_ptr: Arg,
+    params: Arg,  # (d0..d3, cs0..cs3, as0..as3, bs0..bs3)
+    dtype_o: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var cond_addr = _raw_int(cond_ptr)
@@ -2364,13 +2355,13 @@ def _tile_copy[
 
 
 def _tile_copy_go(
-    out_ptr: PyObjectPtr,
-    in_ptr: PyObjectPtr,
-    out_shape_t: PyObjectPtr,
-    in_shape_t: PyObjectPtr,
-    in_strides_t: PyObjectPtr,
-    itemsize_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    in_ptr: Arg,
+    out_shape_t: Arg,
+    in_shape_t: Arg,
+    in_strides_t: Arg,
+    itemsize_o: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var in_addr = _raw_int(in_ptr)
@@ -2870,14 +2861,14 @@ def _repeat_tiled[
 
 
 def _repeat_tiled_go(
-    out_ptr: PyObjectPtr,
-    in_ptr: PyObjectPtr,
-    rows_o: PyObjectPtr,
-    cols_o: PyObjectPtr,
-    r1_o: PyObjectPtr,
-    ncopies_o: PyObjectPtr,
-    itemsize_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    in_ptr: Arg,
+    rows_o: Arg,
+    cols_o: Arg,
+    r1_o: Arg,
+    ncopies_o: Arg,
+    itemsize_o: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var in_addr = _raw_int(in_ptr)
@@ -2966,15 +2957,15 @@ def _triangular_copy[
 
 
 def _triangular_copy_go(
-    out_ptr: PyObjectPtr,
-    in_ptr: PyObjectPtr,
-    batch_o: PyObjectPtr,
-    rows_o: PyObjectPtr,
-    cols_o: PyObjectPtr,
-    diagonal_o: PyObjectPtr,
-    upper_o: PyObjectPtr,
-    itemsize_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    in_ptr: Arg,
+    batch_o: Arg,
+    rows_o: Arg,
+    cols_o: Arg,
+    diagonal_o: Arg,
+    upper_o: Arg,
+    itemsize_o: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var in_addr = _raw_int(in_ptr)
@@ -3047,6 +3038,15 @@ def _gather_rows[
         var row = Int(idx_ptr[unsafe_offset=i // row_len])
         if row < 0:
             row += size0
+        # An index outside [0, size0) would read arbitrary device memory.
+        # Clamped rather than reported: a host-visible error flag costs a
+        # device synchronization per gather, and CUDA_KERNEL_ASSERT has no
+        # portable equivalent across CUDA / HIP / Metal. The result for an
+        # invalid index is unspecified; the access is not.
+        if row < 0:
+            row = 0
+        elif row >= size0:
+            row = size0 - 1
         out_ptr[unsafe_offset=i] = in_ptr[
             unsafe_offset=row * row_len + i % row_len
         ]
@@ -3096,15 +3096,15 @@ def _gather_rows_idx[
 
 
 def _gather_rows_go(
-    out_ptr: PyObjectPtr,
-    in_ptr: PyObjectPtr,
-    idx_ptr: PyObjectPtr,
-    idx_dtype_o: PyObjectPtr,
-    n_indices_o: PyObjectPtr,
-    row_len_o: PyObjectPtr,
-    size0_o: PyObjectPtr,
-    itemsize_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    in_ptr: Arg,
+    idx_ptr: Arg,
+    idx_dtype_o: Arg,
+    n_indices_o: Arg,
+    row_len_o: Arg,
+    size0_o: Arg,
+    itemsize_o: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var in_addr = _raw_int(in_ptr)
@@ -3151,8 +3151,12 @@ def _gather_rows_go(
 # scalar value). Implements aten::scatter.src / aten::scatter.value over a
 # rank-<=4 index space; `out` is a contiguous clone of self, `index` is
 # int64, and everything is described by explicit strides (padded to rank 4
-# with leading 0). Match torch: no bounds checking, last-write-wins on
-# duplicate targets. Dispatches on dtype (the scalar value is cast to it).
+# with leading 0). Last-write-wins on duplicate targets, like torch.
+#
+# An index outside `[0, dim_size)` would write arbitrary device memory: the
+# write is skipped and, when `err_addr` is non-zero, an int32 flag there is
+# set to 1 so the host can raise after the launch (the native backend does;
+# a caller passing 0 opts out of the report but still gets the skip).
 # ---------------------------------------------------------------------------
 
 
@@ -3180,6 +3184,8 @@ def _scatter_dim[
     xs2: Int,
     xs3: Int,
     dim_padded: Int,
+    dim_size: Int,
+    err_addr: Int,
     is_value: Int,
     value: Float64,
     ctx: DeviceContext,
@@ -3187,12 +3193,14 @@ def _scatter_dim[
     var out_ptr = _make_ptr[dtype](out_addr)
     var index_ptr = _make_ptr[DType.int64](index_addr)
     var src_ptr = _make_ptr[dtype](src_addr)
+    var err_ptr = _make_ptr[DType.int32](err_addr)
+    var has_err = err_addr != 0
     var scalar = value.cast[dtype]()
     var total = d0 * d1 * d2 * d3
 
     @always_inline
     @parameter
-    @__copy_capture(out_ptr, index_ptr, src_ptr, scalar)
+    @__copy_capture(out_ptr, index_ptr, src_ptr, err_ptr, has_err, scalar)
     def func[width: Int, alignment: Int = 1](coord: Coord):
         var i = Int(coord[0].value())
         var i3 = i % d3
@@ -3204,6 +3212,12 @@ def _scatter_dim[
         var target = Int(
             index_ptr[unsafe_offset=i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3]
         )
+        if target < 0 or target >= dim_size:
+            # Out of range: skip the write, report it if the caller asked.
+            # Every writer stores the same 1, so the race is benign.
+            if has_err:
+                err_ptr[] = 1
+            return
         var out_off = i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3
         # Replace the coordinate along `dim_padded` with the scatter target.
         if dim_padded == 0:
@@ -3225,14 +3239,16 @@ def _scatter_dim[
 
 
 def _scatter_dim_go(
-    out_ptr: PyObjectPtr,
-    index_ptr: PyObjectPtr,
-    src_ptr: PyObjectPtr,
-    params: PyObjectPtr,  # (d0..d3, os0..os3, ss0..ss3, xs0..xs3, dim_padded)
-    is_value_o: PyObjectPtr,
-    value_o: PyObjectPtr,
-    dtype_o: PyObjectPtr,
-    ctx_ptr: PyObjectPtr,
+    out_ptr: Arg,
+    index_ptr: Arg,
+    src_ptr: Arg,
+    # (d0..d3, os0..os3, ss0..ss3, xs0..xs3, dim_padded, dim_size)
+    params: Arg,
+    err_ptr_o: Arg,
+    is_value_o: Arg,
+    value_o: Arg,
+    dtype_o: Arg,
+    ctx_ptr: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var index_addr = _raw_int(index_ptr)
@@ -3254,6 +3270,8 @@ def _scatter_dim_go(
     var xs2 = _raw_tuple_int(params, 14)
     var xs3 = _raw_tuple_int(params, 15)
     var dim_padded = _raw_tuple_int(params, 16)
+    var dim_size = _raw_tuple_int(params, 17)
+    var err_addr = _raw_int(err_ptr_o)
     var is_value = _raw_int(is_value_o)
     var value = _raw_f64(value_o)
     var dtype = _raw_dtype_int(dtype_o)
@@ -3284,6 +3302,8 @@ def _scatter_dim_go(
                     xs2,
                     xs3,
                     dim_padded,
+                    dim_size,
+                    err_addr,
                     is_value,
                     value,
                     ctx,
@@ -3300,204 +3320,131 @@ def _scatter_dim_go(
 # ---------------------------------------------------------------------------
 
 
-def _permute_copy_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _permute_copy_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _permute_copy_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _permute_copy_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+    )
 
 
-def _narrow_copy_dst_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _narrow_copy_dst_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _narrow_copy_dst_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _narrow_copy_dst_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+    )
 
 
-def _where_select_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _where_select_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _where_select_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _where_select_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+    )
 
 
-def _masked_fill_scalar_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _masked_fill_scalar_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _masked_fill_scalar_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _masked_fill_scalar_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+    )
 
 
-def _tile_copy_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _tile_copy_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _tile_copy_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _tile_copy_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+    )
 
 
-def _repeat_tiled_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _repeat_tiled_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _repeat_tiled_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _repeat_tiled_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+    )
 
 
-def _triangular_copy_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _triangular_copy_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _triangular_copy_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _triangular_copy_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
-def _gather_rows_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _gather_rows_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _gather_rows_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _gather_rows_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
-def _scatter_dim_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _scatter_dim_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _scatter_dim_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _scatter_dim_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
-def _cast_spec_into_go(
-    a_o: PyObjectPtr, out_dtype_o: PyObjectPtr, out_o: PyObjectPtr
-) raises:
+def _cast_spec_into_go(a_o: Arg, out_dtype_o: Arg, out_o: Arg) raises:
     """Cast into a caller-allocated contiguous output."""
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
@@ -3543,106 +3490,44 @@ def _cast_spec_into_go(
 
 
 @export
-def PyInit_data_movement_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("data_movement_ops")
         comptime if _op_on["CastSpec"]():
-            _register_call(
-                b,
-                _spec_dispatcher3[_cast_spec_into_go, "CastSpec"],
-                docstring="(a_spec, out_dtype, out_spec)",
-            )
+            _spec_dispatcher3[_cast_spec_into_go, "CastSpec"](argv, argc)
+            return 0
         comptime if _op_on["PermuteCopy"]():
-            _register_call(
-                b,
-                _permute_copy_dispatcher,
-                docstring=(
-                    "materialize a permutation of a contiguous tensor (rank"
-                    " <= 4)"
-                ),
-            )
+            _permute_copy_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["NarrowCopyDst"]():
-            _register_call(
-                b,
-                _narrow_copy_dst_dispatcher,
-                docstring=(
-                    "copy `outer` contiguous blocks of `copy_len` elements to a"
-                    " destination stride/offset (concatenation)"
-                ),
-            )
+            _narrow_copy_dst_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["CatN"]():
-            _register_call(
-                b,
-                _cat_n_dispatcher,
-                docstring=(
-                    "(out, src_addrs, row_lens, outer, dst_stride, itemsize,"
-                    " width, ctx); batched N-input concat rows, one launch per"
-                    " CAT_SEG_CAP inputs"
-                ),
-            )
+            _cat_n_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["WhereSelect"]():
-            _register_call(
-                b,
-                _where_select_dispatcher,
-                docstring="out = cond ? a : b (broadcast strides, any dtype)",
-            )
+            _where_select_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["MaskedFillScalar"]():
-            _register_call(
-                b,
-                _masked_fill_scalar_dispatcher,
-                docstring=(
-                    "out = cond ? value : b (value baked into the launch, no"
-                    " device buffer; masked_fill(_).Scalar fast path, float"
-                    " dtypes only)"
-                ),
-            )
+            _masked_fill_scalar_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["TileCopy"]():
-            _register_call(
-                b,
-                _tile_copy_dispatcher,
-                docstring=(
-                    "out[coords] = in[coords % in_shape] over a rank-8-padded"
-                    " index space (aten::repeat; element-size dispatch)"
-                ),
-            )
+            _tile_copy_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["RepeatTiled"]():
-            _register_call(
-                b,
-                _repeat_tiled_dispatcher,
-                docstring=(
-                    "out[copy * rows + ir, s * cols + c] = in[ir, c]"
-                    " (aten::repeat reduced to a rank-2 tiled copy;"
-                    " element-size dispatch)"
-                ),
-            )
+            _repeat_tiled_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["TriangularCopy"]():
-            _register_call(
-                b,
-                _triangular_copy_dispatcher,
-                docstring=(
-                    "out = in on the kept side of the diagonal, else 0"
-                    " (aten::tril/triu; element-size dispatch)"
-                ),
-            )
+            _triangular_copy_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["GatherRows"]():
-            _register_call(
-                b,
-                _gather_rows_dispatcher,
-                docstring=(
-                    "out[i] = in[wrap(idx[i // row_len]) * row_len + i %"
-                    " row_len] (gather rows along dim 0; element-size +"
-                    " int32/int64 idx)"
-                ),
-            )
+            _gather_rows_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["ScatterDim"]():
-            _register_call(
-                b,
-                _scatter_dim_dispatcher,
-                docstring=(
-                    "out[coord with dim := index[coord]] = src[coord] or value"
-                    " (aten::scatter.src/value, rank <= 4; dtype dispatch)"
-                ),
-            )
-        return b.finalize()
+            _scatter_dim_dispatcher(argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create data_movement_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

@@ -41,21 +41,18 @@ from max.gpu.primitives import block
 from std.math import ceildiv
 from std.memory import stack_allocation
 from std.os import abort
-from std.python import PythonObject
-from std.python.bindings import PythonModuleBuilder
-from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.sys.info import has_accelerator
 
 from op_utils import (
-    _spec_unsupported,
+    Arg,
+    Argv,
     _enqueue_cached,
     _make_ptr,
     _raw_ctx,
     _raw_int,
-    _raw_ret_none,
 )
 
-from variant_gates import _op_on, _register_call
+from variant_gates import ErrBuf, NO_OP_COMPILED, _op_on, _tmb_entry_error
 
 
 comptime _NONE_BLOCK = 256
@@ -515,15 +512,15 @@ def enqueue_nll_backward_f32(
 
 
 def _nll_forward_go(
-    output_ptr_obj: PyObjectPtr,
-    total_weight_ptr_obj: PyObjectPtr,
-    log_probs_ptr_obj: PyObjectPtr,
-    target_ptr_obj: PyObjectPtr,
-    rows_obj: PyObjectPtr,
-    classes_obj: PyObjectPtr,
-    reduction_obj: PyObjectPtr,
-    ignore_index_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    output_ptr_obj: Arg,
+    total_weight_ptr_obj: Arg,
+    log_probs_ptr_obj: Arg,
+    target_ptr_obj: Arg,
+    rows_obj: Arg,
+    classes_obj: Arg,
+    reduction_obj: Arg,
+    ignore_index_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var output = _make_ptr[DType.float32](
         _raw_int(output_ptr_obj)
@@ -552,15 +549,15 @@ def _nll_forward_go(
 
 
 def _nll_backward_go(
-    grad_input_ptr_obj: PyObjectPtr,
-    grad_output_ptr_obj: PyObjectPtr,
-    target_ptr_obj: PyObjectPtr,
-    total_weight_ptr_obj: PyObjectPtr,
-    rows_obj: PyObjectPtr,
-    classes_obj: PyObjectPtr,
-    reduction_obj: PyObjectPtr,
-    ignore_index_obj: PyObjectPtr,
-    device_context_ptr: PyObjectPtr,
+    grad_input_ptr_obj: Arg,
+    grad_output_ptr_obj: Arg,
+    target_ptr_obj: Arg,
+    total_weight_ptr_obj: Arg,
+    rows_obj: Arg,
+    classes_obj: Arg,
+    reduction_obj: Arg,
+    ignore_index_obj: Arg,
+    device_context_ptr: Arg,
 ) raises:
     var grad_input = _make_ptr[DType.float32](
         _raw_int(grad_input_ptr_obj)
@@ -588,50 +585,34 @@ def _nll_backward_go(
     )
 
 
-def _nll_forward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _nll_forward_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _nll_forward_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _nll_forward_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
-def _nll_backward_dispatcher(
-    py_self: PyObjectPtr,
-    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
-    nargs: Py_ssize_t,
-) abi("C") -> PyObjectPtr:
-    var args = Pointer(args_safe)
-    try:
-        _nll_backward_go(
-            args[unsafe_offset=0],
-            args[unsafe_offset=1],
-            args[unsafe_offset=2],
-            args[unsafe_offset=3],
-            args[unsafe_offset=4],
-            args[unsafe_offset=5],
-            args[unsafe_offset=6],
-            args[unsafe_offset=7],
-            args[unsafe_offset=8],
-        )
-    except e:
-        return _spec_unsupported(e)
-    return _raw_ret_none()
+def _nll_backward_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _nll_backward_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -640,29 +621,17 @@ def _nll_backward_dispatcher(
 
 
 @export
-def PyInit_loss_ops() abi("C") -> PythonObject:
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kernel per build (see `OP`).
+    Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
+    """
     try:
-        var b = PythonModuleBuilder("loss_ops")
         comptime if _op_on["NllLossForwardF32"]():
-            _register_call(
-                b,
-                _nll_forward_dispatcher,
-                docstring=(
-                    "(output_ptr, total_weight_ptr, log_probs_ptr, target_ptr,"
-                    " rows, classes, reduction, ignore_index, context_ptr);"
-                    " float32 NLL forward, reduction 0=none/1=mean/2=sum"
-                ),
-            )
+            _nll_forward_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["NllLossBackwardF32"]():
-            _register_call(
-                b,
-                _nll_backward_dispatcher,
-                docstring=(
-                    "(grad_input_ptr, grad_output_ptr, target_ptr,"
-                    " total_weight_ptr, rows, classes, reduction, ignore_index,"
-                    " context_ptr); float32 NLL backward, writes the dense grad"
-                ),
-            )
-        return b.finalize()
+            _nll_backward_dispatcher(argv, argc)
+            return 0
+        raise Error(NO_OP_COMPILED)
     except e:
-        abort(t"failed to create loss_ops python module: {e}")
+        return _tmb_entry_error(err, errcap, e)

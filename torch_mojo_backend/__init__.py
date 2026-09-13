@@ -4,7 +4,6 @@ from torch_mojo_backend.custom_torch_ops_in_mojo.torch_custom_ops import (
 )
 from torch_mojo_backend.mojo_device.log_aten_calls import log_aten_calls
 from torch_mojo_backend.mojo_device.register import register_mojo_devices
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 from torch_mojo_backend.torch_compile_backend.compiler import (
     MAPPING_TORCH_ATEN_TO_MOJO,
     MojoCompilerError,
@@ -19,6 +18,5 @@ __all__ = [
     "MojoCompilerError",
     "register_mojo_devices",
     "make_torch_op_from_mojo",
-    "TorchMojoTensor",
     "log_aten_calls",
 ]

@@ -1,12 +1,14 @@
 # Distributed training (DDP) on the mojo device
 
-The mojo eager device supports `torch.nn.parallel.DistributedDataParallel`
-through a c10d backend named `"mojo"`, registered automatically by
+The mojo device supports `torch.nn.parallel.DistributedDataParallel` through
+a c10d backend named `"mojo"`, registered automatically by
 `register_mojo_devices()`. Collectives on mojo tensors run over the NCCL C
-API — **NCCL** on NVIDIA, **RCCL** on AMD — driven with ctypes from
-`torch_mojo_backend/distributed/nccl.py`, no CUDA/ROCm torch build and no
-libcudart needed, in keeping with the project's "CPU-only torch install, we
-bring the GPU stack" motto:
+API — **NCCL** on NVIDIA, **RCCL** on AMD — dlopened and called from Mojo
+(`torch_mojo_backend/native/mojo/pg.mojo`); `torch_mojo_backend/distributed/
+nccl.py` only resolves which library that is and the dtype/op constant maps —
+no ctypes calls into NCCL/RCCL happen in Python any more. No CUDA/ROCm torch
+build and no libcudart needed, in keeping with the project's "CPU-only torch
+install, we bring the GPU stack" motto:
 
 - NVIDIA: `libnccl.so.2` comes from the `nvidia-nccl-cu12` wheel (a
   dependency of this package).
@@ -71,73 +73,127 @@ anything touches the GPU runtime or enumerates MAX devices.
   non-CUDA module) and move inputs to the device yourself.
 - `broadcast_buffers=False` is recommended when buffers never change (e.g.
   causal masks) — it removes a per-step broadcast.
-- **`find_unused_parameters=True` and `static_graph=True` are unsupported**:
-  that path needs a pinned-memory allocator PyTorch does not let a
-  Python-level PrivateUse1 backend register (`reducer.cpp`
-  `all_reduce_local_used_map`).
-- `dist.all_reduce/broadcast/all_gather(_into_tensor)/reduce_scatter_tensor/
-  send/recv/barrier` and the object collectives all work; `ReduceOp`
-  SUM/PROD/MIN/MAX/AVG map to NCCL/RCCL (PREMUL_SUM does not).
+- **`find_unused_parameters=True` and `static_graph=True`: unverified, treat
+  as unsupported.** That path wants a pinned-memory allocator for
+  `reducer.cpp`'s `all_reduce_local_used_map`. The old reason this could not
+  work — a Python-level PrivateUse1 backend cannot register one — no longer
+  applies: `native/csrc/shim_runtime.cpp`'s `MojoHooks` is a real C++
+  `PrivateUse1HooksInterface`, and it does register a
+  `getPinnedMemoryAllocator()`. But that allocator is the ordinary
+  (unpinned) CPU one — `isPinnedPtr()` always returns false — so the buffer
+  `all_reduce_local_used_map` wants is still not actually pinned; this has
+  not been re-tried against the native backend.
+- `dist.all_reduce/broadcast/reduce/all_gather(_into_tensor, coalesced)/
+  reduce_scatter(_tensor, coalesced)/all_to_all(_single)/gather/scatter/
+  send/recv/barrier`, `batch_isend_irecv` and the object collectives all
+  work; `ReduceOp` SUM/PROD/MIN/MAX/AVG map to NCCL/RCCL for float and int
+  tensors (PREMUL_SUM does not); a bool tensor maps SUM/MAX to `ncclMax` and
+  PRODUCT/MIN to `ncclMin` and rejects AVG, matching `ProcessGroupNCCL`. Mojo
+  collectives (`TORCH_MOJO_BACKEND_CCL=mojo`) implement only allreduce,
+  broadcast and all_gather — see "Mojo collectives" below.
+- The MAX **CPU pseudo-device** (`mojo:{N-1}`, the last index —
+  `torch.mojo.cpu()`) cannot take part in a collective at all: construction
+  itself needs a real accelerator (communicators are created eagerly, see
+  Design notes), and a collective call on a tensor living there raises
+  `NotImplementedError`. Use a real GPU, or a plain `torch.device("cpu")`
+  tensor (routed to the internal gloo group).
 - Per-rank randomness: seed the device RNG per rank
   (`torch.mojo.manual_seed_all(seed + rank)`); weight init runs on the CPU
   RNG (`torch.manual_seed`) and DDP broadcasts rank 0's weights anyway.
 
 ## Design notes
 
-- **A comm stream overlaps compute.** Collectives run on a dedicated side
-  device stream per device (`mojo_device/device_streams.py`): it waits for
-  the default stream so every producer kernel comes first, then the
-  collective is enqueued. Every tensor a collective touches is fenced with
-  `device_streams.record_use` (the backend's `record_stream` analog): its
-  eventual stream-ordered free is ordered after the collective on the
-  device, because MAX does not fence frees across streams by itself
-  (measured; see the memory note in `mojo_device/device_streams.py`).
-  `TORCH_MOJO_BACKEND_COMM_STREAM=0` pins collectives to the default stream
-  instead (simplest ordering, zero overlap) — also the automatic path for
-  collectives needing default-stream copies after the NCCL call. One
-  contract carried over from stock torch: `wait()` an async collective
-  before reading its result —
-  including before exporting it through DLPack.
-- **Work objects** wrap already-completed `torch.futures.Future`s (no
-  `devices=` — the PrivateUse1 device guard is a stub, and a device-typed
-  future would do out-of-bounds bookkeeping for index ≥ 1), so `wait()` is
-  a host no-op in both paths.
-- **The default stream is ordered after the comm stream lazily**, at the
-  first op that touches a buffer a collective read or wrote
-  (`mojo_device/comm_fence.py`): the collective records those buffers as
-  pending, and a hook in front of every eager op makes the default stream
-  wait on the comm stream when it sees one. Host reads no op mediates —
-  `torch.mojo.synchronize()`, a default-stream `synchronize()`/`query()`,
-  DLPack export, the D2H copy — fence the same way. This is what lets the
-  host run ahead: DDP's reducer never blocks on a bucket's future, so it
-  keeps enqueuing while allreduces fly, and the fence lands in
-  `finalize_backward` where it first reads a reduced bucket — after every
-  backward kernel is already enqueued, so overlap is unchanged. Blocking
-  the host on those futures instead cost ~2 ms of a 96 ms step, spent
-  launching the bucket→grad copies, `clip_grad_norm_` and the optimizer
-  against an idle GPU: nanoGPT 124M on 32 H100s (4 nodes, bf16, batch
-  32×1024 per rank) went 10.89 → 11.10 M tok/s when it stopped doing so
-  (paired A/B/B/A runs, medians of the 10-step windows), closing most of
-  the gap to stock CUDA torch's 11.16. Stock `ProcessGroupNCCL` gets there with a
-  device-typed future whose `wait()` makes the current stream wait; that
-  needs a C++ DeviceGuardImpl for PrivateUse1 which torch does not provide
-  and this backend cannot ship.
-- **The Python PG replaces the whole process group** (torch ≥ 2.10 behavior),
-  so torch cannot compose `cpu:gloo` alongside it; the internal gloo handles
-  CPU tensors instead, and `_device_types` stays empty, which routes object
-  collectives to CPU — exactly what the internal gloo serves.
-- **Comm setup**: rank 0 calls `ncclGetUniqueId` and publishes the 128
-  raw bytes through the c10d store (the same rendezvous torchrun already
-  provides); every rank then calls `ncclCommInitRank`. Both libraries bind
-  the communicator to per-thread runtime state — the current CUDA context
-  on NVIDIA (a 4-call libcuda sequence, `nccl.set_current_cuda_device`),
-  the current HIP device on AMD (`hipSetDevice`, `mojo_device/hip_peer.py`)
-  — and DDP invokes the PG from the autograd thread, so this is re-asserted
-  per thread. Which physical GPU a mojo tensor lives on is read off its
-  pointer (`cuda_peer`/`hip_peer.device_ordinal`), never assumed from an
-  ordinal. The library is picked once per process from the device api of
-  the first mojo tensor a collective sees (`Device.api` is `"cuda"` or
-  `"hip"`).
+The process group is split the way the rest of the native backend is
+(`docs/native_backend.md`): a thin Python adapter
+(`torch_mojo_backend/distributed/process_group.py`, `MojoProcessGroup`) over
+a Mojo core (`torch_mojo_backend/native/mojo/pg.mojo`, `PG`) that owns the
+communicators and does the actual library calls.
+
+- **One communicator and one dedicated comm stream per device, in Mojo.**
+  `PG` (`pg.mojo`) holds an `OwnedDLHandle` to whichever library `nccl.py`
+  resolved (NCCL, RCCL, or mojoccl — all three share the NCCL C ABI) plus one
+  `Comm` per device index: the communicator handle, the device's comm stream,
+  and the raw vendor stream handle the library enqueues on
+  (`tmb_pg_init_device`). Bring-up is the usual NCCL dance: rank 0 calls
+  `ncclGetUniqueId` and publishes the 128 bytes through the c10d store
+  (`MojoProcessGroup._ensure`, the same rendezvous torchrun already
+  provides), every rank then calls `ncclCommInitRank` inside the device's
+  context (`d[].ctx.push_context()` in `pg.mojo`) — that push, not a
+  Python-side `hipSetDevice`/CUDA-context dance, is what binds the
+  communicator to the right GPU now.
+- **Communicators are created eagerly, once, at construction** —
+  `MojoProcessGroup.__init__` calls `_ensure(device_module.current_device())`
+  itself, collectively, while every rank is still inside
+  `init_process_group` — rather than lazily on a rank's first collective.
+  `pg.mojo` refuses to build one on the MAX CPU device
+  (`tmb_pg_init_device`: "the mojo process group needs an accelerator
+  device"), and the Python side refuses a collective on the MAX CPU
+  *pseudo*-device the same way (`_is_cpu`: `NotImplementedError` for a
+  tensor whose device equals `device_module.cpu()`) — use plain CPU tensors
+  (routed to the internal gloo group) or a real GPU.
+- **Every collective: sync-in, issue, fence.** `PG.sync_in` makes the comm
+  stream wait for the caller's current stream before the library call is
+  issued on it, so every producer kernel is ordered before the collective
+  with no host blocking. The Python adapter resolves data pointers with
+  plain `tensor.data_ptr()`; a non-contiguous input is copied dense on the
+  comm stream (`_stage_in`), a non-contiguous output gets a fresh dense
+  buffer there instead (`_stage_out` — never `.contiguous()` on the
+  caller's output, so a partial write can't alias it); the call itself goes
+  through a ctypes vtable wrapper resolved once per process group from
+  `tmb_pg_vtable()` (`_Core`). Every NCCL group (`_group()`, a context
+  manager) calls `ncclGroupEnd` on every exit path, including an exception,
+  so a failed submission never leaves the communicator wedged inside an open
+  group. Then — still with the comm stream current — a staged result is
+  copied back and every touched buffer is `record_stream`d on that stream
+  (`_finish`/`_record`), fencing its eventual release there: MAX does not
+  fence frees across streams by itself.
+- **Work objects are real device-typed futures, and `wait()` is what orders
+  a stream** — the contract `ProcessGroupNCCL` implements, now reachable
+  because the device guard (streams, events, current device) is real C++
+  (`native/csrc/shim_runtime.cpp`), not a Python stub. `_work()` wraps a
+  `torch.futures.Future(devices=[torch.device("mojo", index)])` whose result
+  is set while the comm stream is current (`device_module.stream(...)`);
+  calling `.wait()` on that future from any stream inserts a wait for that
+  stream specifically. A synchronous collective (`async_op=False`) calls
+  `wait()` internally, like any c10d backend; an async one hands the Work to
+  the caller, who must `wait()` it before reading the result on their own
+  stream — including a host read (`.cpu()`), a default-stream op, a side
+  stream, or a DLPack export.
+- **Memory safety does not depend on `wait()`.** The `record_stream` fence in
+  `_finish` runs unconditionally, so a tensor dropped right after an async
+  collective — before anyone calls `wait()` — is still not corrupted by a
+  later allocation reusing its memory while the collective still writes it.
+  That guarantee is independent of, and weaker than, the value-visibility one
+  `wait()` gives: without `wait()` the memory is safe but the *value* is not
+  guaranteed to be observed yet.
+- **Known bug: `wait()` from a non-default stream does not reliably order
+  that stream.** A consumer on the *same* stream the collective was issued
+  from (the default stream, after `work.wait()`, including when
+  `async_op=False` waits internally) sees the correct result every time; a
+  consumer on a *different* `torch.Stream` that itself calls `work.wait()`
+  intermittently reads a partially-applied buffer (the tail of a large
+  tensor correct, the head still the pre-collective value) even after an
+  additional `torch.accelerator.synchronize()`. Reproduced on both vendor
+  NCCL and mojoccl, so the bug is in the Future/event plumbing shared by
+  both, not in either collectives library. `tests/ddp_worker.py`'s
+  `stream_ordering` mode (`stream_ordering.side_stream`) is the repro;
+  it currently fails and is left failing on purpose rather than weakened,
+  since passing it is the point.
+- **The Python PG still replaces the whole process group** (torch ≥ 2.10
+  behavior), so torch cannot compose `cpu:gloo` alongside it;
+  `MojoProcessGroup` keeps its own private `ProcessGroupGloo` for CPU tensors
+  (`_is_cpu`) and object collectives, and `_device_types` stays empty, which
+  routes object collectives to CPU — exactly what the internal gloo serves.
+- **The group is its own backend** (`supports_coalescing = True`,
+  `_get_backend` returns `self`): torch's `batch_isend_irecv` and
+  `_coalescing_manager` look a device's backend up with `_get_backend(device)`
+  and check `supports_coalescing` on it, and the C++-side lookup would find
+  nothing registered for `"mojo"` otherwise. This is what lets
+  `batch_isend_irecv` group a rank's sends with its receives into one NCCL
+  group instead of issuing them one at a time.
+- **bool reduces the way `ProcessGroupNCCL` does**: SUM and MAX both become
+  `ncclMax` (logical OR), PRODUCT and MIN both become `ncclMin` (logical
+  AND), and AVG raises `TypeError` — bool has no meaningful average.
 - Errors raised inside collectives print a full traceback to stderr before
   propagating (`_loud`): an exception escaping into the autograd engine on
   this backend can otherwise kill the process with no Python traceback.
@@ -327,10 +383,11 @@ srun --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=96 -- \
 An in-repo replacement for NCCL/RCCL's intra-node collectives, written in Mojo
 and exposed through **NCCL's own C ABI**: `torch_mojo_backend/distributed/mojoccl/`
 builds `libmojoccl.so` on first use (into the eager kernels' `__mojocache__`,
-same lock/atomic-rename machinery) and `nccl.py` dlopens it instead of
-`libnccl.so.2` when `TORCH_MOJO_BACKEND_CCL=mojo`. `process_group.py` is
-unchanged; NCCL/RCCL stays the default. Design and measurements:
-`docs/mojo_collectives_feasibility.md` (study) and
+same lock/atomic-rename machinery), and `nccl.py`'s `library_path()` resolves
+to it instead of `libnccl.so.2`/`librccl.so.1` when `TORCH_MOJO_BACKEND_CCL=mojo`
+— `pg.mojo` dlopens whichever path comes back, so neither it nor
+`process_group.py` special-cases mojoccl; NCCL/RCCL stays the default. Design
+and measurements: `docs/mojo_collectives_feasibility.md` (study) and
 `docs/mojo_collectives_kernel_results.md` (kernels).
 
 Scope, deliberately narrow — it is an experiment showing Mojo can write
@@ -365,8 +422,9 @@ NCCL-class collectives, not a general library:
   barrier used to leave no trace anybody read). That latch is what keeps a
   timed-out collective from turning into wrong data:
   - `ncclAllReduce` / `ncclBroadcast` / `ncclAllGather` return
-    `ncclRemoteError` from the next call on, and `process_group.py` raises
-    `NcclError` out of the collective — with a traceback, through `_loud` —
+    `ncclRemoteError` from the next call on; `pg.mojo`'s `check()` turns that
+    into a Mojo `Error`, and the Python adapter surfaces it as a plain
+    `RuntimeError` out of the collective — with a traceback, through `_loud` —
     so the rank fails instead of training on garbage;
   - the call that notices prints one line naming the rank, the collective,
     the arena, the generation, the phase, the block, and the peer whose flag

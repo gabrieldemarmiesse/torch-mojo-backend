@@ -29,6 +29,7 @@ from torch.profiler import ProfilerActivity, profile
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
+from torch_mojo_backend.native import device_module
 
 PROMPT = "Here is how quantum computing works: "
 
@@ -333,12 +334,7 @@ def main():
             raise RuntimeError(f"Expected MAX accelerator 0 to be a GPU: {max_device}")
 
         def synchronize():
-            from torch_mojo_backend.eager_kernels import (  # noqa: PLC0415 -- reading `tensor_holder` runs eager_kernels' module __getattr__, which builds (cold cache) and dlopens the extension
-                _ctx_ptr,
-                tensor_holder,
-            )
-
-            tensor_holder.synchronize(_ctx_ptr(max_device))
+            device_module.synchronize(0)
 
         execution_backend = f"Mojo/MAX ({max_device})"
         execution_device = "mojo"

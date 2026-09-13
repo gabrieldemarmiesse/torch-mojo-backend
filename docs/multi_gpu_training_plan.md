@@ -1,6 +1,10 @@
 # Multi-GPU training on the mojo device (eager mode): design and plan
 
-Status: proposal (researched 2026-07, not yet implemented).
+Status: **superseded.** Multi-GPU training shipped instead as the c10d
+backend of the native device (`docs/distributed.md`,
+`native/mojo/pg.mojo`), not as the single-process pure-Python ProcessGroup
+this file proposes; the eager internals it cites (`torch_mojo_tensor.py`,
+`mojo_device_aten_ops.py`) are deleted. Kept for the research it records.
 
 Goal: data-parallel training across multiple GPUs on the `mojo` device in eager
 mode, with performance comparable to CUDA (`torchrun` + DDP + NCCL), while
