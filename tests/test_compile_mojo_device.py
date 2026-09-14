@@ -103,17 +103,16 @@ def test_compile_output_feeds_eager_ops(mojo_device):
     assert_close_cpu(eager_result, (x.cpu() * 2.0 + 1.0).sum())
 
 
-def test_compile_output_ordered_after_graph(mojo_gpu):
-    """An eager op reading a compiled output runs after the graph wrote it.
+def sleep_on_stream(max_device, stream, microseconds):
+    """Stall a raw CUDA/HIP stream on the host for `microseconds`.
 
-    The graph runs on MAX's own stream, not on the mojo stream, and the
-    compiled call returns before its kernels finish. Instead of a slow graph,
-    a 0.5 s sleep is launched on MAX's stream in front of it, so the graph
-    cannot have written its output for 0.5 s however fast the GPU is. An
-    eager read not ordered behind the graph sees the buffer unwritten.
+    Everything launched on a stream after a host function waits for it to
+    return, so work queued behind this sleep cannot finish before it ends,
+    however fast the GPU is -- a slow kernel without the compute. libc's
+    usleep is the host function: its one integer argument travels in the same
+    register as the void* user data on x86-64 and aarch64, and it never takes
+    the GIL, so a host thread blocked on the stream cannot deadlock it.
     """
-    device = torch.device(mojo_gpu)
-    max_device = compiler._max_device_for_mojo(device)
     driver = {
         "cuda": ("libcuda.so.1", "cuLaunchHostFunc"),
         "hip": ("libamdhip64.so", "hipLaunchHostFunc"),
@@ -124,6 +123,19 @@ def test_compile_output_ordered_after_graph(mojo_gpu):
     launch_host_func.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     launch_host_func.restype = ctypes.c_int
     usleep = ctypes.cast(ctypes.CDLL(None).usleep, ctypes.c_void_p)
+    assert launch_host_func(stream, usleep, microseconds) == 0
+
+
+def test_compile_output_ordered_after_graph(mojo_gpu):
+    """An eager op reading a compiled output runs after the graph wrote it.
+
+    The graph runs on MAX's own stream, not on the mojo stream, and the
+    compiled call returns before its kernels finish. Instead of a slow graph,
+    a 0.5 s sleep is launched on MAX's stream in front of it. An eager read
+    not ordered behind the graph sees the buffer unwritten.
+    """
+    device = torch.device(mojo_gpu)
+    max_device = compiler._max_device_for_mojo(device)
 
     def fn(x):
         return x * 2.0 + 1.0
@@ -138,15 +150,45 @@ def test_compile_output_ordered_after_graph(mojo_gpu):
     torch.accelerator.synchronize(device)
     max_device.default_stream.synchronize()
 
-    # Everything launched on the stream after a host function waits for it to
-    # return. libc's usleep is the host function: its one integer argument
-    # travels in the same register as the void* user data on x86-64 and
-    # aarch64, and it never takes the GIL, so a blocked host cannot deadlock it.
-    stream = max_device.default_stream.native_stream_handle
-    assert launch_host_func(stream, usleep, 500_000) == 0
+    sleep_on_stream(max_device, max_device.default_stream.native_stream_handle, 500_000)
     out = compiled(x_mojo)
     result = (out + 0.0).cpu()
     torch.testing.assert_close(result, fn(x))
+
+
+def test_compile_input_ordered_after_eager_op(mojo_gpu):
+    """A compiled graph reads its input after the eager op that wrote it.
+
+    The eager op producing the input is queued on the mojo stream behind a
+    0.5 s sleep, and the compiled call follows right away. Importing the input
+    must make MAX's stream wait for the mojo stream, or the graph reads the
+    buffer before the eager op has written it.
+    """
+    device = torch.device(mojo_gpu)
+    max_device = compiler._max_device_for_mojo(device)
+
+    def fn(x):
+        return x * 2.0 + 1.0
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    # Compile the graph and the eager mul kernel up front, on values unlike
+    # the real input: an inline kernel build would launch the mul after the
+    # sleep, and memory recycled from this call must not already hold the
+    # right input.
+    compiled(torch.zeros(8, 8, device=device) * 3.0).cpu()
+
+    src = torch.arange(64, dtype=torch.float32).reshape(8, 8) + 1000.0
+    src_mojo = src.to(device)
+    torch.accelerator.synchronize(device)
+    max_device.default_stream.synchronize()
+
+    mojo_stream = torch.accelerator.current_stream(device)
+    sleep_on_stream(
+        max_device, device_module.stream_native_handle(mojo_stream), 500_000
+    )
+    x_mojo = src_mojo * 3.0  # launched behind the sleep
+    result = compiled(x_mojo).cpu()
+    torch.testing.assert_close(result, fn(src * 3.0))
 
 
 def test_compile_nn_module(mojo_device):
