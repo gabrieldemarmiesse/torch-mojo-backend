@@ -1,10 +1,12 @@
-"""Hand-built DLPack capsules over a raw device allocation.
+"""Hand-built DLPack capsules over a raw device allocation, and device-code
+retagging of existing ones.
 
-`torch_compile_backend/compiler.py` adopts a compiled MAX graph's output
-buffers as `mojo` tensors zero-copy with `make_capsule_privateuse1`; torch
-cannot do that itself, since its importer keys off the DLPack device-type
-code and MAX tags its buffers with the vendor one. `make_capsule` is the
-vendor-tagged variant, for consumers like `max.driver.Buffer.from_dlpack`.
+`make_capsule` tags the vendor device code, for consumers like
+`max.driver.Buffer.from_dlpack`. `retag_capsule` rewrites the device code of
+a capsule some producer already built: `cuda_interop` aliases mojo and CUDA
+tensors with it, and `torch_compile_backend/compiler.py` adopts a compiled
+MAX graph's output buffers as `mojo` tensors (MAX tags its capsules with the
+vendor code, which torch would import as `cuda`).
 
 Only contiguous allocations are exported (callers materialize first), so the
 capsule advertises compact row-major layout (strides=NULL). The capsule
@@ -232,27 +234,24 @@ def dlpack_device(device: max.driver.Device) -> tuple[int, int]:
 # torch's C++ DLPack importer maps this device-type code straight to
 # `at::Device(DeviceType::PrivateUse1, index)` (aten/src/ATen/DLConvertor.cpp),
 # independent of a *renamed* PrivateUse1 backend's Python-visible name (this
-# project renames it to "mojo"). See `make_capsule_privateuse1` below and
-# `torch_compile_backend/compiler.py`, which imports MAX output buffers this
-# way.
-_KDL_EXT_DEV = 12
+# project renames it to "mojo"). `torch_compile_backend/compiler.py` retags MAX
+# output capsules to it.
+KDL_EXT_DEV = 12
 
 
-def _build_capsule(
+def make_capsule(
     holder: object,
     data_ptr: int,
     shape: Sequence[int],
     dtype: DType,
-    device_type: int,
-    device_id: int,
+    device: max.driver.Device,
 ) -> object:
-    """Shared "dltensor" PyCapsule builder for a contiguous device allocation.
+    """A "dltensor" PyCapsule for a contiguous device allocation.
 
     `holder` is any Python object whose refcount keeps the allocation
-    alive; it is pinned until the consumer's deleter runs. `device_type` is
-    a raw DLPack device-type code (see `make_capsule` and
-    `make_capsule_privateuse1` for the two ways callers pick one).
+    alive; it is pinned until the consumer's deleter runs.
     """
+    device_type, device_id = dlpack_device(device)
     code_bits = _DLPACK_CODE_OF.get(dtype)
     if code_bits is None:
         raise BufferError(f"dtype {dtype} is not exportable via DLPack")
@@ -284,39 +283,6 @@ def _build_capsule(
     except Exception:
         _release_export(ctypes.pointer(managed))
         raise
-
-
-def make_capsule(
-    holder: object,
-    data_ptr: int,
-    shape: Sequence[int],
-    dtype: DType,
-    device: max.driver.Device,
-) -> object:
-    """A "dltensor" PyCapsule for a contiguous device allocation.
-
-    `holder` is any Python object whose refcount keeps the allocation
-    alive; it is pinned until the consumer's deleter runs.
-    """
-    return _build_capsule(holder, data_ptr, shape, dtype, *dlpack_device(device))
-
-
-def make_capsule_privateuse1(
-    holder: object, data_ptr: int, shape: Sequence[int], dtype: DType, device_index: int
-) -> object:
-    """A "dltensor" PyCapsule tagged for import as a `mojo` (renamed
-    PrivateUse1) torch tensor at index `device_index`.
-
-    Unlike `make_capsule` (which tags the real vendor device type so MAX
-    recognizes the producer), this tags DLPack's ``kDLExtDev`` code:
-    torch's C++ DLPack importer maps that straight to
-    ``at::Device(DeviceType::PrivateUse1, device_index)`` regardless of the
-    renamed backend's Python-visible name, so `torch.from_dlpack` on this
-    capsule yields a `mojo:<device_index>` tensor sharing this memory
-    zero-copy. Used for MAX graph outputs, whose buffers are otherwise
-    tagged with MAX's own vendor device type (see compiler.py).
-    """
-    return _build_capsule(holder, data_ptr, shape, dtype, _KDL_EXT_DEV, device_index)
 
 
 def retag_capsule(capsule: object, device_type: int, device_id: int) -> object:

@@ -485,23 +485,32 @@ def _max_device_for_cuda(device: torch.device) -> max.driver.Device:
 
 
 def _mojo_tensor_from_buffer(buffer: max.driver.Buffer) -> torch.Tensor:
-    """Zero-copy wrap of a MAX output buffer as a plain `mojo`-device tensor.
+    """Zero-copy wrap of a MAX output buffer as a plain `mojo`-device tensor,
+    ordered after the graph that writes it.
 
-    The `mojo` device is a real (renamed) PrivateUse1 backend: torch's C++
-    DLPack importer maps DLPack's kDLExtDev device-type code straight to
-    `at::Device(DeviceType::PrivateUse1, index)` (aten/src/ATen/DLConvertor.cpp)
-    regardless of the backend's Python-visible rename, so a capsule tagged
-    (kDLExtDev, this mojo index) imports zero-copy through the public
-    `torch.from_dlpack` (see `mojo_dlpack.make_capsule_privateuse1`). The
-    capsule keeps `buffer` (a normal Python object) alive until torch frees
-    the imported storage -- the same refcount-based lifetime a MAX buffer
-    already has on its own.
+    The graph runs on MAX's own stream (the session device's default stream),
+    which is none of the mojo device's streams, and `Model.execute` returns
+    before its kernels finish. Passing the current mojo stream to
+    `Buffer.__dlpack__(stream=...)` is DLPack's consumer-stream handshake:
+    MAX makes that stream wait, on the device, for the work pending on its
+    own, so the eager op that reads the output cannot run first. torch's
+    `from_dlpack` does the same handshake for `cuda` tensors.
+
+    MAX tags that capsule with the vendor device code, which would import as
+    a `cuda` tensor. `retag_capsule` rewrites it to kDLExtDev, which torch's
+    C++ DLPack importer maps straight to `at::Device(DeviceType::PrivateUse1,
+    index)` (aten/src/ATen/DLConvertor.cpp) regardless of the backend's
+    Python-visible rename. The capsule's deleter keeps `buffer` alive until
+    torch frees the imported storage.
     """
     index = _mojo_index_for_max_device(buffer.device)
-    capsule = mojo_dlpack.make_capsule_privateuse1(
-        buffer, buffer._data_ptr(), tuple(buffer.shape), buffer.dtype, index
+    stream = torch.accelerator.current_stream(torch.device("mojo", index))
+    # 0: a device with no native stream (the MAX CPU device), nothing to hand off
+    handle = device_module.stream_native_handle(stream) or None
+    capsule = buffer.__dlpack__(stream=handle)
+    return torch.from_dlpack(
+        mojo_dlpack.retag_capsule(capsule, mojo_dlpack.KDL_EXT_DEV, index)
     )
-    return torch.from_dlpack(capsule)
 
 
 def _dim_buffer_to_cpu_tensor(buffer: max.driver.Buffer) -> torch.Tensor:

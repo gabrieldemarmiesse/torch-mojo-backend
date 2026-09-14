@@ -6,6 +6,7 @@ backends ("eager", "aot_eager") execute the traced graph through the
 eager mojo kernels instead.
 """
 
+import ctypes
 import gc
 
 import max.driver
@@ -100,6 +101,52 @@ def test_compile_output_feeds_eager_ops(mojo_device):
     out = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x)
     eager_result = (out + 1.0).sum()
     assert_close_cpu(eager_result, (x.cpu() * 2.0 + 1.0).sum())
+
+
+def test_compile_output_ordered_after_graph(mojo_gpu):
+    """An eager op reading a compiled output runs after the graph wrote it.
+
+    The graph runs on MAX's own stream, not on the mojo stream, and the
+    compiled call returns before its kernels finish. Instead of a slow graph,
+    a 0.5 s sleep is launched on MAX's stream in front of it, so the graph
+    cannot have written its output for 0.5 s however fast the GPU is. An
+    eager read not ordered behind the graph sees the buffer unwritten.
+    """
+    device = torch.device(mojo_gpu)
+    max_device = compiler._max_device_for_mojo(device)
+    driver = {
+        "cuda": ("libcuda.so.1", "cuLaunchHostFunc"),
+        "hip": ("libamdhip64.so", "hipLaunchHostFunc"),
+    }.get(max_device.api)
+    if driver is None:
+        pytest.skip(f"no host callbacks on the {max_device.api} MAX backend")
+    launch_host_func = getattr(ctypes.CDLL(driver[0]), driver[1])
+    launch_host_func.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    launch_host_func.restype = ctypes.c_int
+    usleep = ctypes.cast(ctypes.CDLL(None).usleep, ctypes.c_void_p)
+
+    def fn(x):
+        return x * 2.0 + 1.0
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    # Compile the graph and the eager add/copy kernels up front: an inline
+    # kernel build during the sleep would delay the eager read past it.
+    (compiled(torch.zeros(8, 8, device=device)) + 0.0).cpu()
+
+    x = torch.arange(64, dtype=torch.float32).reshape(8, 8) + 1000.0
+    x_mojo = x.to(device)
+    torch.accelerator.synchronize(device)
+    max_device.default_stream.synchronize()
+
+    # Everything launched on the stream after a host function waits for it to
+    # return. libc's usleep is the host function: its one integer argument
+    # travels in the same register as the void* user data on x86-64 and
+    # aarch64, and it never takes the GIL, so a blocked host cannot deadlock it.
+    stream = max_device.default_stream.native_stream_handle
+    assert launch_host_func(stream, usleep, 500_000) == 0
+    out = compiled(x_mojo)
+    result = (out + 0.0).cpu()
+    torch.testing.assert_close(result, fn(x))
 
 
 def test_compile_nn_module(mojo_device):
