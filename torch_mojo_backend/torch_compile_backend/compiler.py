@@ -485,23 +485,12 @@ def _max_device_for_cuda(device: torch.device) -> max.driver.Device:
 
 
 def _mojo_tensor_from_buffer(buffer: max.driver.Buffer) -> torch.Tensor:
-    """Zero-copy wrap of a MAX output buffer as a plain `mojo`-device tensor,
-    ordered after the graph that writes it.
+    """Zero-copy wrap of a MAX output buffer as a `mojo`-device tensor.
 
-    The graph runs on MAX's own stream (the session device's default stream),
-    which is none of the mojo device's streams, and `Model.execute` returns
-    before its kernels finish. Passing the current mojo stream to
-    `Buffer.__dlpack__(stream=...)` is DLPack's consumer-stream handshake:
-    MAX makes that stream wait, on the device, for the work pending on its
-    own, so the eager op that reads the output cannot run first. torch's
-    `from_dlpack` does the same handshake for `cuda` tensors.
-
-    MAX tags that capsule with the vendor device code, which would import as
-    a `cuda` tensor. `retag_capsule` rewrites it to kDLExtDev, which torch's
-    C++ DLPack importer maps straight to `at::Device(DeviceType::PrivateUse1,
-    index)` (aten/src/ATen/DLConvertor.cpp) regardless of the backend's
-    Python-visible rename. The capsule's deleter keeps `buffer` alive until
-    torch frees the imported storage.
+    The graph runs on MAX's own stream, not a mojo one, and is still running
+    when `execute` returns: `__dlpack__(stream=...)` makes the mojo stream
+    wait for it. MAX tags the capsule with the vendor device code (a `cuda`
+    tensor on import); retagging it kDLExtDev imports it as PrivateUse1.
     """
     index = _mojo_index_for_max_device(buffer.device)
     stream = torch.accelerator.current_stream(torch.device("mojo", index))
