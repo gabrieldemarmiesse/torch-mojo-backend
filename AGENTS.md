@@ -61,7 +61,8 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   - Graph visualization when `TORCH_MOJO_BACKEND_VERBOSE=1`
   - Eager-mode kernel builds are described in `docs/mojo_extensions.md`:
     every specialization compiles inline at its first call and is cached in
-    `__mojocache__`; build timings print by default
+    `~/.cache/torch-mojo-backend/native/` (`TORCH_MOJO_BACKEND_CACHE_DIR`
+    moves it); build timings print by default
     (`TORCH_MOJO_BACKEND_TRACE=0` silences them).
     `TORCH_MOJO_BACKEND_WERROR=1` makes every Mojo build fail on a compiler
     warning; off by default, on under pytest (`tests/conftest.py`), so keep
@@ -269,7 +270,7 @@ reads freed memory.
 If the op needs a new Mojo kernel, add it to the matching
 `eager_kernels/<family>/<family>.mojo` (variant-gated: the loader compiles
 one specialization per (OP, DTYPE) on first use and caches it in
-`__mojocache__`). You may import kernels from the modular repo inside the
+`~/.cache/torch-mojo-backend/native/`). You may import kernels from the modular repo inside the
 `.mojo` file (`from nn import ...`) only if they don't call
 CuBLAS/CuDNN/rocBLAS underneath. If a fully dynamic-shape function is not
 available in the modular repo, write the kernel yourself.

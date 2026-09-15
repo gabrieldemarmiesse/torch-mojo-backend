@@ -73,8 +73,8 @@ then package-root, plus every `op_utils/*.mojo`) together with the defines
 and the toolchain identity (`native/__init__.py`'s `toolchain_identity()`:
 torch/mojo/max/python/platform/machine versions) into the cache filename
 `<family>.<defines-slug>.hash-<source-hash>.so` under
-`TORCH_MOJO_BACKEND_CACHE_DIR` (default
-`eager_kernels/__mojocache__/native/`). A cache hit loads that exact `.so`;
+`TORCH_MOJO_BACKEND_CACHE_DIR` (default: the user's cache directory,
+`~/.cache/torch-mojo-backend/native/` on Linux). A cache hit loads that exact `.so`;
 a miss builds it under a per-identity `flock` and installs it with an atomic
 rename, so an interrupted compiler cannot leave a partial file that looks
 valid, and concurrent requests for the same identity compile it once.

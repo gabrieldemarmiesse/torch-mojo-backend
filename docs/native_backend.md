@@ -21,9 +21,13 @@ is then cached on disk (see "Three builds" below).
 
 ## Three builds
 
-Everything is compiled on demand into `eager_kernels/__mojocache__/native/`
-(`TORCH_MOJO_BACKEND_CACHE_DIR` moves the cache; it is contents-addressed so
-several checkouts can share it) and each build is keyed by the hash of every
+Everything is compiled on demand into the user's cache directory —
+`~/.cache/torch-mojo-backend/native/` on Linux (`XDG_CACHE_HOME` honored),
+`~/Library/Caches/torch-mojo-backend/native/` on macOS — so the builds
+outlive the venv and the checkout; `TORCH_MOJO_BACKEND_CACHE_DIR` moves the
+cache (it is contents-addressed so several checkouts share it, and nothing
+ever reaps it: a torch/mojo/max upgrade orphans every entry, so wipe the
+directory when it grows). Each build is keyed by the hash of every
 source it compiles in, the toolchain versions and its `-D` defines — so
 touching `abi.mojo` invalidates every op extension, not just the backend.
 

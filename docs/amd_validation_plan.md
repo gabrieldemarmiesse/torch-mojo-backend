@@ -33,8 +33,9 @@ uv run --no-sync python -c "import torch; print(torch.__version__)"   # must be 
   `uv sync` pulled the CUDA build, `uv pip install torch --index-url
   https://download.pytorch.org/whl/cpu` into the venv. `register_mojo_devices()`
   warns when it sees either.
-- Put the checkout, its `.venv` and `__mojocache__` on the fast parallel
-  filesystem (scratch), not on a slow home; kernel loads read every mapped
+- Put the checkout, its `.venv` and the kernel cache
+  (`TORCH_MOJO_BACKEND_CACHE_DIR`; it defaults to `~/.cache`) on the fast
+  parallel filesystem (scratch), not on a slow home; kernel loads read every mapped
   library.
 - `export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` on APUs: MAX's default
   allocator reserves ~115 GB of host RAM per process at first use.

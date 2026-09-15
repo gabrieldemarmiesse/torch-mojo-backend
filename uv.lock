@@ -2399,6 +2399,7 @@ dependencies = [
     { name = "mojo" },
     { name = "nvidia-cuda-nvcc-cu12", marker = "sys_platform == 'linux'" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'" },
+    { name = "platformdirs" },
     { name = "tabulate" },
     { name = "torch" },
 ]
@@ -2442,6 +2443,7 @@ requires-dist = [
     { name = "mojo", specifier = "==1.0" },
     { name = "nvidia-cuda-nvcc-cu12", marker = "sys_platform == 'linux'", specifier = "==12.8.*" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'", specifier = ">=2.27" },
+    { name = "platformdirs" },
     { name = "tabulate" },
     { name = "torch", specifier = ">=2.10" },
 ]

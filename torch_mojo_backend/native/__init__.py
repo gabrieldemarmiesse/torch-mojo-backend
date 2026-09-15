@@ -34,16 +34,21 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Protocol, cast
 
+import platformdirs
 import torch
 
 _HERE = Path(__file__).resolve().parent
 _PACKAGE = _HERE.parent
 _KERNELS_DIR = _PACKAGE / "eager_kernels"
 # One cache for every checkout on a box (contents-addressed: every build is
-# keyed by its sources and toolchain), overridable for shared scratch space.
+# keyed by its sources and toolchain), in the user's cache directory
+# (`~/.cache/torch-mojo-backend` on Linux, honoring XDG_CACHE_HOME;
+# `~/Library/Caches/torch-mojo-backend` on macOS) so it outlives the venv
+# and the checkout; TORCH_MOJO_BACKEND_CACHE_DIR points it at shared
+# scratch space instead.
 _CACHE_DIR = Path(
     os.environ.get("TORCH_MOJO_BACKEND_CACHE_DIR")
-    or (_KERNELS_DIR / "__mojocache__" / "native")
+    or (Path(platformdirs.user_cache_dir("torch-mojo-backend")) / "native")
 )
 _CSRC = _HERE / "csrc"
 _MOJO_SRC = _HERE / "mojo"

@@ -210,7 +210,7 @@ communicators and does the actual library calls.
   NCCL's interface auto-detection picks a dead interface.
 - First-run kernel builds: the JIT compile pool sizes itself per process
   from whole-node resources, so 8 cold ranks can oversubscribe a node.
-  The kernel caches (`__mojocache__`, `~/.modular`) are shared over NFS, so
+  The kernel caches (`~/.cache/torch-mojo-backend`, `~/.modular`) are shared over NFS, so
   a one-off single-process warmup run (or just letting step 1 be slow once)
   populates them for every node.
 
@@ -245,8 +245,9 @@ Verified on CINES's Adastra (4 × MI300A per node, ROCm 6.4.3, RCCL 2.22.3).
 - RCCL's knob for MI300 is `NCCL_MIN_NCHANNELS`; the site recommends 42 for
   up to 4 APUs and 32 beyond. The single-node numbers above were taken
   with the defaults.
-- Put the checkout, its `.venv` and `__mojocache__` on the fast parallel
-  filesystem (scratch on Adastra, not work): a first-use kernel load makes
+- Put the checkout, its `.venv` and the kernel cache
+  (`TORCH_MOJO_BACKEND_CACHE_DIR`; it defaults to `~/.cache`) on the fast
+  parallel filesystem (scratch on Adastra, not work): a first-use kernel load makes
   the HIP runtime walk every mapped shared object, and with the venv on a
   slow filesystem each one costs tens of seconds per rank.
 - **Memory on an APU.** MAX's default device allocator reserves ~115 GB
@@ -382,7 +383,7 @@ srun --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=96 -- \
 
 An in-repo replacement for NCCL/RCCL's intra-node collectives, written in Mojo
 and exposed through **NCCL's own C ABI**: `torch_mojo_backend/distributed/mojoccl/`
-builds `libmojoccl.so` on first use (into the eager kernels' `__mojocache__`,
+builds `libmojoccl.so` on first use (into the native backend's kernel cache,
 same lock/atomic-rename machinery), and `nccl.py`'s `library_path()` resolves
 to it instead of `libnccl.so.2`/`librccl.so.1` when `TORCH_MOJO_BACKEND_CCL=mojo`
 — `pg.mojo` dlopens whichever path comes back, so neither it nor

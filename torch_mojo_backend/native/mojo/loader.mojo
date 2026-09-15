@@ -119,7 +119,7 @@ struct OpExt(Movable):
 struct Loader(Movable):
     var kernels_dir: String  # torch_mojo_backend/eager_kernels
     var mojo_dir: String  # torch_mojo_backend/native/mojo
-    var cache_dir: String  # <kernels_dir>/__mojocache__/native
+    var cache_dir: String  # native/__init__.py's _CACHE_DIR (~/.cache/torch-mojo-backend/native)
     var mojo_exe: String
     var toolchain: String  # versions of mojo/max/python, from the Python side
     var trace: Bool
