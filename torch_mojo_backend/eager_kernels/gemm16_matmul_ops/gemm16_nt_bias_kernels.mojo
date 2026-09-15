@@ -34,7 +34,7 @@ from max.gpu.primitives import block_rank_in_cluster, cluster_sync
 from max.gpu.memory import fence_async_view_proxy
 from std.memory import AddressSpace
 from max.gpu.sync import named_barrier
-from std.memory import bitcast, stack_allocation
+from std.memory import stack_allocation
 from std.sys.info import _has_sm_9x, _is_sm_9x
 from std.sys import get_defined_bool, get_defined_int
 from std.utils.index import Index, IndexList
@@ -51,6 +51,7 @@ from op_utils import _enqueue_cached
 
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 from gemm16_nn_v4_kernels import (
+    _v4_bias_epilogue_quad,
     _v4_dyn_smem_tile,
 )
 
@@ -115,56 +116,13 @@ def _v4_store_accum_bias_stmatrix[
     var row_mod = row % 8
     var c0 = mi // 2
     comptime for t in range(CFRAG // 8):
-        # WGMMA fragment pairs q=4*t+j: j%2 selects the 8-row half,
-        # j//2 selects the 8-column group.  Each lane contributes columns
-        # 2*(lane%4)+[0,1], so the two row halves reuse each bias pair.
-        # Scalar loads need only bf16 alignment and are individually clipped;
-        # TMA clips C stores, but cannot protect these independent bias loads.
-        var bias_col = n0 + 16 * t + (lane % 4) * 2
-        var bias0 = Float32(0)
-        var bias1 = Float32(0)
-        var bias8 = Float32(0)
-        var bias9 = Float32(0)
-        if bias_col < n:
-            bias0 = bias[unsafe_offset=bias_col].cast[DType.float32]()
-        if bias_col + 1 < n:
-            bias1 = bias[unsafe_offset=bias_col + 1].cast[DType.float32]()
-        if bias_col + 8 < n:
-            bias8 = bias[unsafe_offset=bias_col + 8].cast[DType.float32]()
-        if bias_col + 9 < n:
-            bias9 = bias[unsafe_offset=bias_col + 9].cast[DType.float32]()
         var col = 16 * t + 8 * c0
         var off = (
             (col // _V4_C_BOX_N) * _V4_C_BOX_ELEMS
             + row_base
             + (((col % _V4_C_BOX_N) // 8) ^ row_mod) * 8
         )
-        var data = SIMD[DType.float32, 4](
-            bitcast[DType.float32, 1](
-                SIMD[_V4_DT, 2](
-                    (accum.ptr[unsafe_offset=8 * t] + bias0).cast[_V4_DT](),
-                    (accum.ptr[unsafe_offset=8 * t + 1] + bias1).cast[_V4_DT](),
-                )
-            ),
-            bitcast[DType.float32, 1](
-                SIMD[_V4_DT, 2](
-                    (accum.ptr[unsafe_offset=8 * t + 2] + bias0).cast[_V4_DT](),
-                    (accum.ptr[unsafe_offset=8 * t + 3] + bias1).cast[_V4_DT](),
-                )
-            ),
-            bitcast[DType.float32, 1](
-                SIMD[_V4_DT, 2](
-                    (accum.ptr[unsafe_offset=8 * t + 4] + bias8).cast[_V4_DT](),
-                    (accum.ptr[unsafe_offset=8 * t + 5] + bias9).cast[_V4_DT](),
-                )
-            ),
-            bitcast[DType.float32, 1](
-                SIMD[_V4_DT, 2](
-                    (accum.ptr[unsafe_offset=8 * t + 6] + bias8).cast[_V4_DT](),
-                    (accum.ptr[unsafe_offset=8 * t + 7] + bias9).cast[_V4_DT](),
-                )
-            ),
-        )
+        var data = _v4_bias_epilogue_quad[bn](accum, t, lane, bias, n0, n)
         st_matrix[simd_width=4](wg_half.unsafe_offset(off), data)
 
 
@@ -649,6 +607,51 @@ def _v4c_enqueue_nt_bias_persistent[
     )
 
 
+@always_inline
+def _v4c_nt_bias_hw_gate(
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    bias: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """Runtime hw/alignment/overflow gate shared by every bf16 sm_90a NT+bias
+    persistent kernel candidate (this 128-row route and the 192-row rolling
+    one in gemm16_rolling_kernels.mojo): exact compute capability 9.0,
+    16B-aligned dense operands, a non-null bf16-aligned bias, and TMA/
+    product bounds that fit Int32 extents without overflowing Int64 m*n*k
+    arithmetic. Each caller still checks its own launch-resource limits
+    (grid width, cluster occupancy) separately -- those differ by tile."""
+    if ctx.api() != "cuda":
+        return False
+    if (
+        ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MAJOR) != 9
+        or ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR) != 0
+    ):
+        return False
+    return (
+        m >= 1
+        and n >= _V4_C_BOX_N
+        and k >= _V4_BK
+        and n % 8 == 0
+        and k % _V4_BK == 0
+        and Int(output) % 16 == 0
+        and Int(a) % 16 == 0
+        and Int(b) % 16 == 0
+        and Int(bias) != 0
+        and Int(bias) % 2 == 0
+        and m <= 2_147_483_647
+        and n <= 2_147_483_647
+        and k <= 2_147_483_647
+        and k <= 9_223_372_036_854_775_807 // m
+        and k <= 9_223_372_036_854_775_807 // n
+        and n <= 9_223_372_036_854_775_807 // m
+    )
+
+
 def maybe_enqueue_gemm16_nt_bias_v4(
     output: _V4_PTR,
     a: _V4_PTR,
@@ -671,77 +674,49 @@ def maybe_enqueue_gemm16_nt_bias_v4(
     comptime if _GEMM16_DT != DType.bfloat16:
         return False
     comptime if _has_sm_9x():
-        if ctx.api() == "cuda":
-            var cc_major = ctx.get_attribute(
-                DeviceAttribute.COMPUTE_CAPABILITY_MAJOR
+        if _v4c_nt_bias_hw_gate(output, a, b, bias, m, n, k, ctx):
+            var blocks_m = (m + _V4_BM - 1) // _V4_BM
+            var sm_count = ctx.get_attribute(
+                DeviceAttribute.MULTIPROCESSOR_COUNT
             )
-            var cc_minor = ctx.get_attribute(
-                DeviceAttribute.COMPUTE_CAPABILITY_MINOR
-            )
+            var max_grid_x = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
+            var grid_pairs = sm_count // _V4_CLUSTER
+            var blocks_n_256 = (n + 255) // 256
+            var blocks_n_192 = (n + 191) // 192
             if (
-                cc_major == 9
-                and cc_minor == 0
-                and m >= 1
-                and n >= _V4_C_BOX_N
-                and k >= _V4_BK
-                and n % 8 == 0
-                and k % _V4_BK == 0
-                and Int(output) % 16 == 0
-                and Int(a) % 16 == 0
-                and Int(b) % 16 == 0
-                and Int(bias) != 0
-                and Int(bias) % 2 == 0
-                and m <= 2_147_483_647
-                and n <= 2_147_483_647
-                and k <= 2_147_483_647
-                and k <= 9_223_372_036_854_775_807 // m
-                and k <= 9_223_372_036_854_775_807 // n
-                and n <= 9_223_372_036_854_775_807 // m
+                blocks_m > 0
+                and grid_pairs > 0
+                and max_grid_x > 0
+                and blocks_m <= max_grid_x // blocks_n_256
+                and blocks_m <= max_grid_x // blocks_n_192
             ):
-                var blocks_m = (m + _V4_BM - 1) // _V4_BM
-                var sm_count = ctx.get_attribute(
-                    DeviceAttribute.MULTIPROCESSOR_COUNT
+                # Persistent-wave cost model: per-cluster time is
+                # (waves) x (per-tile cost ~ BN + fixed per-tile
+                # overhead).  Measured on H100: the fixed overhead makes
+                # BN = 256 win whenever both widths tile n comparably;
+                # BN = 192 only pays off for genuinely narrow n where
+                # the wide tile would compute mostly-clipped columns.
+                var pairs_256 = (
+                    blocks_m * blocks_n_256 + _V4_CLUSTER - 1
+                ) // _V4_CLUSTER
+                var pairs_192 = (
+                    blocks_m * blocks_n_192 + _V4_CLUSTER - 1
+                ) // _V4_CLUSTER
+                var cost_256 = ((pairs_256 + grid_pairs - 1) // grid_pairs) * (
+                    256 + 32
                 )
-                var max_grid_x = ctx.get_attribute(
-                    DeviceAttribute.MAX_GRID_DIM_X
+                var cost_192 = ((pairs_192 + grid_pairs - 1) // grid_pairs) * (
+                    192 + 32
                 )
-                var grid_pairs = sm_count // _V4_CLUSTER
-                var blocks_n_256 = (n + 255) // 256
-                var blocks_n_192 = (n + 191) // 192
-                if (
-                    blocks_m > 0
-                    and grid_pairs > 0
-                    and max_grid_x > 0
-                    and blocks_m <= max_grid_x // blocks_n_256
-                    and blocks_m <= max_grid_x // blocks_n_192
-                ):
-                    # Persistent-wave cost model: per-cluster time is
-                    # (waves) x (per-tile cost ~ BN + fixed per-tile
-                    # overhead).  Measured on H100: the fixed overhead makes
-                    # BN = 256 win whenever both widths tile n comparably;
-                    # BN = 192 only pays off for genuinely narrow n where
-                    # the wide tile would compute mostly-clipped columns.
-                    var pairs_256 = (
-                        blocks_m * blocks_n_256 + _V4_CLUSTER - 1
-                    ) // _V4_CLUSTER
-                    var pairs_192 = (
-                        blocks_m * blocks_n_192 + _V4_CLUSTER - 1
-                    ) // _V4_CLUSTER
-                    var cost_256 = (
-                        (pairs_256 + grid_pairs - 1) // grid_pairs
-                    ) * (256 + 32)
-                    var cost_192 = (
-                        (pairs_192 + grid_pairs - 1) // grid_pairs
-                    ) * (192 + 32)
-                    if cost_192 * 102 < cost_256 * 100:
-                        var grid_x = min(pairs_192, grid_pairs) * _V4_CLUSTER
-                        _v4c_enqueue_nt_bias_persistent[192, 4, _NT_RASTER](
-                            output, a, b, bias, m, n, k, grid_x, ctx
-                        )
-                        return True
-                    var grid_x = min(pairs_256, grid_pairs) * _V4_CLUSTER
-                    _v4c_enqueue_nt_bias_persistent[256, 3, _NT_RASTER](
+                if cost_192 * 102 < cost_256 * 100:
+                    var grid_x = min(pairs_192, grid_pairs) * _V4_CLUSTER
+                    _v4c_enqueue_nt_bias_persistent[192, 4, _NT_RASTER](
                         output, a, b, bias, m, n, k, grid_x, ctx
                     )
                     return True
+                var grid_x = min(pairs_256, grid_pairs) * _V4_CLUSTER
+                _v4c_enqueue_nt_bias_persistent[256, 3, _NT_RASTER](
+                    output, a, b, bias, m, n, k, grid_x, ctx
+                )
+                return True
     return False

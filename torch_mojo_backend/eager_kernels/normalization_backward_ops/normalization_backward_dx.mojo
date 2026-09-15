@@ -17,7 +17,8 @@ fixed-latency store pass.  The fast path assigns one warp per row: each lane
 owns up to `chunks` 16-byte vector columns, accumulates both sums locally,
 resolves them with two warp shuffles, and replays dx from shared.  `chunks`
 is a comptime parameter instantiated for a few broad column regimes
-(cols <= 128/256/384/512/768/1024) so small rows do not pay the shared/
+(cols <= 128/256/384/512/768/1024, plus a half-block c16 up to 2048) so
+small rows do not pay the shared/
 register footprint of the largest regime; every instantiation still serves an
 open range of runtime shapes.  The narrow regimes (chunks <= 4) also mark the
 grad/input reads as streaming (evict-first): measured on H100, giving L2 to
@@ -27,7 +28,7 @@ for wider rows.
 The fast path requires cols % 4 == 0 and 16-byte-aligned dx/grad/input (plus
 weight when used); with cols a multiple of 4, every row start inherits the
 base alignment.  Anything else -- odd columns, four-byte storage offsets, or
-cols > 1024 -- takes the generic block-per-row kernel: scalar coalesced loads,
+cols > 2048 (1024 on Apple) -- takes the generic block-per-row kernel: scalar coalesced loads,
 two `block.sum` reductions, and a second pass that re-reads the row (L1/L2
 resident) to write dx.  Both kernels handle arbitrary positive rows/cols and
 grid-stride over rows.
@@ -41,6 +42,7 @@ from max.gpu.primitives import block
 from std.gpu.primitives import warp
 from std.math import ceildiv
 from std.memory import AddressSpace, stack_allocation
+from std.sys import has_amd_gpu_accelerator
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 
 from op_utils import _enqueue_cached
@@ -67,11 +69,19 @@ comptime _SMEM_BUDGET = 32 * 1024 if has_apple_gpu_accelerator() else 64 * 1024
 # 32 KiB of `q` alone, which leaves Apple no room for even the unstaged `xh`
 # stub, so rows that wide take `_dx_generic` there.
 comptime _MAX_WARP_CHUNKS = 6 if has_apple_gpu_accelerator() else 8
+# Rows of 1025-2048 columns (a 1600-wide transformer, say) used to fall to
+# `_dx_generic`; c16 serves them with half the warps per block so its q
+# staging is the same 32 KiB c8 uses.  Measured on H100 only: not on Apple
+# (over its 32 KiB cap) and not on AMD, where the 64-wide warps would make it
+# a 2049-4096-column regime nobody has timed against the generic kernel.
+comptime _WIDE_CHUNKS = 16
+comptime _WIDE_WARPS = _WARPS_PER_BLOCK // 2
+comptime _WIDE_ON = not has_apple_gpu_accelerator() and not has_amd_gpu_accelerator()
 
 
 @always_inline
 def _dx_warp_rows[
-    chunks: Int
+    chunks: Int, warps: Int = _WARPS_PER_BLOCK
 ](
     dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
     grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
@@ -85,8 +95,8 @@ def _dx_warp_rows[
     has_weight: Int,
 ):
     var lane = Int(lane_id())
-    var row = Int(block_idx.x) * _WARPS_PER_BLOCK + Int(warp_id())
-    var row_stride = Int(grid_dim.x) * _WARPS_PER_BLOCK
+    var row = Int(block_idx.x) * warps + Int(warp_id())
+    var row_stride = Int(grid_dim.x) * warps
 
     # Per-warp staging for q (and xh when the budget allows) between the
     # reduction and the store pass: keeping them in registers costs enough
@@ -101,7 +111,7 @@ def _dx_warp_rows[
     # all: 48 KiB is over that target's 32 KiB threadgroup cap, so c5 and c6
     # there stage q only and re-read xh.
     comptime q_bytes = (
-        _WARPS_PER_BLOCK * chunks * WARP_SIZE * _VEC * size_of[DType.float32]()
+        warps * chunks * WARP_SIZE * _VEC * size_of[DType.float32]()
     )
     comptime stage_xh = chunks <= 6 and 2 * q_bytes <= _SMEM_BUDGET
     # Streaming (evict-first) reads help while the per-SM working set of
@@ -110,7 +120,7 @@ def _dx_warp_rows[
     # regimes and reverses once rows get wide (chunks > 4).  Apple has no
     # cache-policy loads: the STREAMING lowering crashes the Metal compiler.
     comptime stream_loads = chunks <= 4 and not has_apple_gpu_accelerator()
-    comptime q_slots = _WARPS_PER_BLOCK * chunks * WARP_SIZE * _VEC
+    comptime q_slots = warps * chunks * WARP_SIZE * _VEC
     comptime xh_slots = q_slots if stage_xh else _VEC
     var q_shared = stack_allocation[
         q_slots, DType.float32, alignment=16, address_space=AddressSpace.SHARED
@@ -389,6 +399,33 @@ def _dx_c8(
     )
 
 
+@__name("layer_norm_backward_dx_f32_c16")
+def _dx_c16(
+    dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rows_arg: Int64,
+    cols_arg: Int64,
+    vec_cols_arg: Int64,
+    has_weight_arg: Int64,
+):
+    _dx_warp_rows[_WIDE_CHUNKS, _WIDE_WARPS](
+        dx,
+        grad_output,
+        input,
+        mean,
+        rstd,
+        weight,
+        Int(rows_arg),
+        Int(cols_arg),
+        Int(vec_cols_arg),
+        Int(has_weight_arg),
+    )
+
+
 @__name("layer_norm_backward_dx_f32_generic")
 def _dx_generic(
     dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
@@ -590,6 +627,27 @@ def enqueue_layer_norm_backward_dx_f32(
                         Int64(hw),
                     )
                 return
+            comptime if _WIDE_ON:
+                if needed <= _WIDE_CHUNKS:
+                    _enqueue_cached[_dx_c16](
+                        ctx,
+                        "layer_norm_backward_dx_f32_c16",
+                        min(ceildiv(rows, _WIDE_WARPS), _MAX_GRID),
+                        1,
+                        1,
+                        _WIDE_WARPS * WARP_SIZE,
+                        dx,
+                        grad_output,
+                        input,
+                        mean,
+                        rstd,
+                        weight,
+                        Int64(rows),
+                        Int64(cols),
+                        Int64(vec_cols),
+                        Int64(hw),
+                    )
+                    return
         var grid = min(rows, _MAX_GRID)
         _enqueue_cached[_dx_generic](
             ctx,

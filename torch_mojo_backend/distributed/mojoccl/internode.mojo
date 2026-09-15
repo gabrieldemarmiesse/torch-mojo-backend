@@ -98,6 +98,7 @@ from std.memory.alloc import unsafe_alloc
 from std.sys import size_of
 from std.os import getenv
 from std.time import perf_counter_ns, sleep
+from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
 
 from std.atomic import Atomic, Ordering
@@ -199,6 +200,13 @@ comptime CREDIT_SLOT_BYTES = 64
 comptime CREDIT_AREA_BYTES = 4096
 comptime CREDIT_PAYLOAD_BYTES = 4
 
+# Payload a rank sends when it has nothing to contribute to an exchange:
+# a broadcast, or an allreduce whose shard table leaves this rank empty
+# (7 of 8 local ranks on DDP's 4-byte AVG allreduce). Every exchange has to
+# be all-to-all because an arrival tally of `npeers` is what completes one,
+# so a rank that stayed silent would hang its peers.
+comptime EMPTY_SHARD_BYTES = 16
+
 comptime OP_UNKNOWN = 0
 comptime OP_ALLREDUCE = 1
 comptime OP_BROADCAST = 2
@@ -217,14 +225,21 @@ def _op_name(kind: Int) -> String:
     return String("?")
 
 
-# The proxy mailbox: two 64-bit words the GPU and the progress thread
-# pass the exchange counter through, plus a stop word the host sets at
-# teardown. A cache line apart so the GPU's writes to REQUEST never
-# invalidate the line the CPU is writing DONE into.
+# The proxy mailbox: 64-bit words the GPU and the progress thread pass
+# exchange counters through, plus a stop word the host sets at teardown. A
+# cache line apart so the GPU's writes to REQUEST never invalidate the line
+# the CPU is writing DONE into.
+#
+# REQUEST and CONSUMED are written by the device, DONE by the thread, STOP by
+# the host. CONSUMED exists for the fused kernel (internode_fused.mojo): it is
+# "my consumer for exchange e has RUN", the credit that frees the inbox slot
+# group, published from the kernel rather than inferred on the host from the
+# order kernels were enqueued in.
 comptime MB_REQUEST = 0
 comptime MB_DONE = 64
 comptime MB_STOP = 128
-comptime MB_BYTES = 192
+comptime MB_CONSUMED = 192
+comptime MB_BYTES = 256
 
 
 struct IbPeer(Copyable, Movable):
@@ -345,6 +360,10 @@ struct IbState(Movable):
     # e's source for the slow peer.
     var send_done: List[Int]
     var credit_sent: Int  # highest credit published to the peers
+    # Highest "my consumer has run" the fused kernel published in MB_CONSUMED.
+    # Device-attested, unlike `consumed_enqueued`, so it may be used directly
+    # (see `ib_drive`), and monotone because one thread stores it in order.
+    var credit_device: Int
     var tally: List[Int]  # arrivals, indexed by `seq % nslots`
     var credit_recv: List[Int]  # per peer, highest credit it published
     var last_progress_ns: Int
@@ -438,6 +457,7 @@ struct IbState(Movable):
         self.flush_t0 = 0
         self.send_done = List[Int]()
         self.credit_sent = 0
+        self.credit_device = 0
         self.tally = List[Int]()
         for _ in range(nslots):
             self.tally.append(0)
@@ -852,6 +872,13 @@ def ib_drive(mut st: IbState) -> Bool:
         _release_on_error(st)
         return False
     var moved = False
+    # The fused kernel publishes "my consumer for e has run" itself, so a
+    # credit can be due with nothing of our own left to post. Send it anyway:
+    # a peer blocked on `_can_post` is waiting for exactly this, and riding
+    # the next request out (the only way the split path had) would make that
+    # wait last until this rank's host issued another collective.
+    if _send_credits(st, st.credit_device):
+        moved = True
     if st.posted_seq < st.request_seq:
         var e = st.posted_seq + 1
         ref w = _work(st, e)[]
@@ -1037,6 +1064,13 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
             != 0
         ):
             return
+        var consumed = Int(
+            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+                _mb(st, MB_CONSUMED)
+            )
+        )
+        if consumed > st.credit_device:
+            st.credit_device = consumed
         var req = Int(
             Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
                 _mb(st, MB_REQUEST)
@@ -1551,6 +1585,93 @@ def ib_next_seq(ib: Int) -> Int:
     ref st = _st(ib)[]
     st.exchanges += 1
     return st.exchanges
+
+
+def ib_reserve_seqs(ib: Int, n: Int) -> Int:
+    """Consume `n` consecutive exchange counters and return the first.
+
+    `ib_next_seq` for a collective that knows up front how many exchanges it
+    will make -- the fused multi-node allreduce, which fills all of its work
+    items on the host and then launches one kernel that publishes the
+    counters in order."""
+    ref st = _st(ib)[]
+    st.exchanges += n
+    return st.exchanges - n + 1
+
+
+def ib_mailbox_dev(ib: Int) -> StaticTuple[Int, 3]:
+    """Device addresses of `(MB_REQUEST, MB_DONE, MB_CONSUMED)`.
+
+    The fused kernel writes the first and the third and spins on the second,
+    doing from inside the collective what `proxy_request` / `proxy_wait` did
+    as kernels of their own."""
+    ref st = _st(ib)[]
+    return StaticTuple[Int, 3](
+        st.mailbox_dev + MB_REQUEST,
+        st.mailbox_dev + MB_DONE,
+        st.mailbox_dev + MB_CONSUMED,
+    )
+
+
+def ib_uses_proxy(ib: Int) -> Bool:
+    """Whether the progress thread is driving the engine. False means
+    `MOJOCCL_IB_PROXY=0`, where the exchange runs inside a stream callback and
+    the fused kernel cannot be used -- there is no point in the stream for the
+    callback to run at."""
+    return _st(ib)[].proxy
+
+
+def ib_timeout_ns(ib: Int) -> Int:
+    return _st(ib)[].timeout_ns
+
+
+def ib_prepare_request(
+    ib: Int,
+    send_addr: Int,
+    send_bytes: Int,
+    inbox_base: Int,
+    slot_bytes: Int,
+    do_send: Bool,
+    nrecv: Int,
+    flush_addr: Int,
+    seq: Int,
+    op_kind: Int = OP_UNKNOWN,
+    op_chunk: Int = 0,
+    op_nchunks: Int = 0,
+    op_numel: Int = 0,
+) raises:
+    """Describe exchange `seq` for the engine without releasing it.
+
+    `ib_enqueue_request` minus the release: the fused kernel publishes the
+    counter itself when its reduce-scatter for that chunk has completed, so
+    the host only has to have the work item ready before the kernel runs.
+    Filling every chunk's item before the launch is what makes the whole
+    collective one `cuLaunchKernelEx`.
+
+    The credit carried here is the host's own `consumed_enqueued`, which on
+    the fused path never advances (the kernel publishes credits through
+    MB_CONSUMED instead); it is still the right value for a communicator that
+    mixes fused allreduces with the unfused broadcast/allgather paths.
+    """
+    ref st = _st(ib)[]
+    _fill_work(
+        st,
+        ib,
+        send_addr,
+        send_bytes,
+        inbox_base,
+        slot_bytes,
+        do_send,
+        nrecv,
+        flush_addr,
+        seq,
+        st.consumed_enqueued,
+        True,
+        op_kind,
+        op_chunk,
+        op_nchunks,
+        op_numel,
+    )
 
 
 def ib_note_consumed(ib: Int, seq: Int):

@@ -5,7 +5,7 @@ dimension (K = tokens = 32768) and small outputs (m,n in the hundreds to a
 few thousand), so the v3 one-CTA-per-output-tile kernels leave most of the
 GPU idle: (768,768) yields only 18 CTAs of 128x256 for 114 SMs.
 
-Two remedies, both dispatched by regime (no model dims hardcoded):
+Three remedies, all dispatched by regime (no model dims hardcoded):
 
 1. Split-K: when output tiles fill less than half the SMs, partition K
    across `splits` CTAs per tile (grid y).  Each CTA accumulates its K-chunk
@@ -20,8 +20,17 @@ Two remedies, both dispatched by regime (no model dims hardcoded):
    multi-wave sustained grids get 3 stages (measurably less power draw on
    this power-limited card) and 16-row rasterization groups (halves DRAM
    traffic for B, which all row-tiles share).
+3. Persistent-rolling geometry dispatch (`_try_enqueue_tn_rolling_geom`,
+   just above `try_enqueue_gemm16_gemm_tn_v4`): three tunings of
+   gemm16_rolling_kernels.mojo's shared `_rolling_persistent_body` in its
+   col_a=True mode, chosen by a runtime cost model.  Reuses that file's
+   mainloop rather than adding one here, and is the only route in this
+   ladder that clips a ragged m (m % 8 == 0) via TMA instead of declining
+   it -- see that function's docstring for the geometry table and the
+   negative results behind it.
 
-Both kernels reuse the v3 warp-specialized TMA + WGMMA structure: A is
+The split-K and narrow-tile kernels below reuse the v3 warp-specialized
+TMA + WGMMA structure: A is
 physical row-major (K, M) and loaded directly into an MN-major shared tile,
 which is the column-major A representation accepted by SM90 WGMMA.
 
@@ -58,6 +67,7 @@ from gemm16_nn_v4_kernels import (
     _v4_mma_tile,
     maybe_enqueue_gemm16_tn_v4_persistent,
 )
+from gemm16_rolling_kernels import enqueue_rolling_persistent
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 
@@ -962,6 +972,341 @@ def _v4_enqueue_tt_direct_m64n128(
 
 
 # ============================================================================
+# TN persistent-rolling geometry dispatcher: three tuned instantiations of
+# the shared body (gemm16_rolling_kernels.mojo::_rolling_persistent_body,
+# already parametrized col_a/kmaj_b/ragged_n/group by the NN and NT+bias
+# routes) in its col_a=True (wgrad) mode, chosen at runtime by a modeled-
+# cost comparison.  Standalone engagement: /home/gabriel/ddp_work/gpt2xl/
+# tn192/ (tn_rolling.mojo -- a specialized COPY of the body kept only for
+# that harness, not reused here; candidate.mojo -- the geometry dispatcher
+# this one is ported from).  No new mainloop, no new kernel file: this is
+# the body's col_a instantiation exercised in production for the first
+# time.
+#
+# Geometry table (measured H100 SXM sm:1500 MHz, job 250131, six shapes
+# from 4800x1600x8192 down to the ragged 4808x1600x6592; worst candidate/
+# cuBLAS ratio per geometry, over the shapes where it was the runtime's
+# pick):
+#
+#   G0  192x192  s3 c2 wg3 g4    1.037  (tall-M / narrow-N: two 192-rounds
+#                                        fit where 256-wide would pad more)
+#   G1  128x256  s3 c2 wg2 g8    1.073  (wide-N: seven 256-columns beat
+#                                        nine 192-columns)
+#   G2  128x192  s4 c2 wg2 g4    1.041  (small output: the whole grid fits
+#                                        in one round, tile sized to it)
+#
+# Negative results (measured, do not re-explore without new evidence): a
+# rectangular cluster that ALSO multicasts A (cm x cn, cn=2) is 1.5-2.1x
+# SLOWER on every shape here, as is any 1-D cluster of 4 -- the extra
+# CTAs' lockstep on the shared empty-barrier costs more than the L2
+# traffic they save.  192x256 with 3 consumer warp groups does not
+# compile (512 threads -> a 128-register target below the 154 the
+# mainloop needs).  192x128, 64x256 and plain 128x128 all lose to the
+# three geometries above.
+#
+# The cost model -- rounds * bm * bn, rounds = ceil(works / clusters),
+# ties to the larger tile (fewer L2 bytes/flop, bm*bn / (bm + bn/cluster_m))
+# -- picks the measured winner on all six engagement shapes and is a
+# function of M, N and the GPU's SM count only, never a particular size.
+# ============================================================================
+
+comptime _V4_TN_ROLL_NGEOM = 3
+comptime _V4_TN_ROLL_BM = StaticTuple[Int, _V4_TN_ROLL_NGEOM](192, 128, 128)
+comptime _V4_TN_ROLL_BN = StaticTuple[Int, _V4_TN_ROLL_NGEOM](192, 256, 192)
+comptime _V4_TN_ROLL_STAGES = StaticTuple[Int, _V4_TN_ROLL_NGEOM](3, 3, 4)
+comptime _V4_TN_ROLL_CONSUMERS = StaticTuple[Int, _V4_TN_ROLL_NGEOM](3, 2, 2)
+comptime _V4_TN_ROLL_GROUP = StaticTuple[Int, _V4_TN_ROLL_NGEOM](4, 8, 4)
+# Every geometry here uses cluster_m=2 (measured winner; see the negative
+# results above) -- kept as a named constant rather than a fourth tuple so
+# a reader sees at a glance that none of the three varies it.
+comptime _V4_TN_ROLL_CLUSTER_M = 2
+# Smallest output area (m * n) worth a persistent-rolling launch when NO
+# other rung of the ladder can take the shape at all, so the alternative is
+# the generic non-TMA route.  Fitted on H100 SXM at 1980 MHz over 21 shapes
+# with no fallback (m in 64..2048 x n in {320, 448, 704}, none of which
+# divides 128, 192 or 256), rolling us / generic us:
+#
+#     m * n      64x320  128x320  256x320  512x320  384x704  512x704  1024x320
+#     ratio       0.26     2.40     1.67     1.27     1.00     0.75      0.75
+#
+# Below m = _V4_BM the generic route is catastrophic at every n measured
+# (125-128 us against rolling's 33) because m is under every other rung's
+# floor and the generic grid degenerates, so those shapes keep rolling
+# whatever their area.  At or above it the generic route tiles m properly and
+# costs roughly m * n, while rolling is pinned near a fixed ~33 us per launch
+# (three cuTensorMapEncodeTiled calls plus the persistent prologue, which a
+# tiny output cannot hide): the two cross at an area of about 270e3, the same
+# place for all three n, which is what this constant rounds.
+comptime _V4_TN_ROLL_MIN_AREA = 262144
+
+
+@always_inline
+def _v4_tn_roll_works(bm: Int, bn: Int, m: Int, n: Int) -> Int:
+    """Macro-row-blocks x n-blocks: the work census one geometry's cost and
+    occupancy checks both key off."""
+    var macro_rows = (m + bm * _V4_TN_ROLL_CLUSTER_M - 1) // (
+        bm * _V4_TN_ROLL_CLUSTER_M
+    )
+    var blocks_n = (n + bn - 1) // bn
+    return macro_rows * blocks_n
+
+
+@always_inline
+def _v4_tn_roll_cost(bm: Int, bn: Int, m: Int, n: Int, sm_count: Int) -> Int:
+    """`rounds * bm * bn`: the padded work of the cluster with the most
+    tiles -- see the module comment above."""
+    var works = _v4_tn_roll_works(bm, bn, m, n)
+    var clusters = min(sm_count // _V4_TN_ROLL_CLUSTER_M, works)
+    var rounds = (works + clusters - 1) // clusters
+    return rounds * bm * bn
+
+
+@always_inline
+def _v4_try_launch_tn_roll_geom[
+    g: Int
+](
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    sm_count: Int,
+    max_grid_x: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """Launch geometry `g` of the shared persistent-rolling body in its TN
+    (col_a) mode, or decline (False) if this geometry's cluster grid would
+    overflow the GPU's grid-x limit -- or if the enqueuer itself declines
+    (its dynamic tile scheduler cannot serve the work census).  has_bias
+    defaults to False, so `output` also fills the body's unread `bias` slot
+    (see enqueue_rolling_persistent's docstring)."""
+    comptime BM = _V4_TN_ROLL_BM[g]
+    comptime BN = _V4_TN_ROLL_BN[g]
+    var macro_rows = (m + BM * _V4_TN_ROLL_CLUSTER_M - 1) // (
+        BM * _V4_TN_ROLL_CLUSTER_M
+    )
+    var blocks_n = (n + BN - 1) // BN
+    if blocks_n <= 0 or macro_rows > max_grid_x // blocks_n:
+        return False
+    return enqueue_rolling_persistent[
+        _V4_TN_ROLL_STAGES[g],
+        _V4_TN_ROLL_CLUSTER_M,
+        BM,
+        BN,
+        _V4_TN_ROLL_CONSUMERS[g],
+        True,
+        True,
+        False,
+        True,
+        _V4_TN_ROLL_GROUP[g],
+    ](output, a, b, output, m, n, k, sm_count, ctx)
+
+
+def _try_enqueue_tn_splitk_m128n256(
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    sm_count: Int,
+    max_grid_x: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """Split-K on 256-wide, 128-row tiles: only when at least two K-chunks
+    per tile fit within the SM count, each chunk deep enough to amortize
+    pipeline ramp-up, and the fp32 workspace stays modest.
+
+    m % 128 == 0 and n % 256 == 0 are checked here (not just left to the
+    caller): `tiles` floor-divides m by the 128-row tile, so a ragged m
+    would leave its tail rows of C unwritten (an A2 review finding on this
+    engagement) -- this kernel has no TMA clip for a ragged m the way the
+    rolling geometry dispatcher does. Shared by both `try_enqueue_gemm16_
+    gemm_tn_v4` and `try_enqueue_candidate_tn` (gemm16_candidate_dispatch.
+    mojo), which must both try split-K before the rolling dispatcher: a
+    deep-K, underfilled-output shape parallelizes over K here in a way the
+    persistent rolling body cannot (each of its clusters serializes the
+    whole K depth of its tiles), so trying the rolling dispatcher first
+    starved split-K of shapes it used to win outright (an agent-C review
+    finding -- 256x256x65536 regressed 425%, 84.4 -> 443.1 us, when the
+    rolling dispatcher pre-empted split-K here).
+    """
+    if m % _V4_BM != 0 or n % 256 != 0:
+        return False
+    var tiles = (m // _V4_BM) * (n // 256)
+    if tiles > 0 and tiles <= max_grid_x and 2 * tiles <= sm_count:
+        var splits = sm_count // tiles
+        if splits > _V4_MAX_SPLITS:
+            splits = _V4_MAX_SPLITS
+        var max_by_depth = (k // _V4_BK) // _V4_MIN_CHUNK_TILES
+        if splits > max_by_depth:
+            splits = max_by_depth
+        if m * n <= _V4_MAX_WS_BYTES // 4 // max(splits, 1):
+            if splits >= 2:
+                _v4_enqueue_splitk_m128n256(
+                    output, a, b, m, n, k, tiles, splits, ctx
+                )
+                return True
+    return False
+
+
+def _try_enqueue_tn_rolling_geom(
+    output: _V4_PTR,
+    a: _V4_PTR,
+    b: _V4_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    sm_count: Int,
+    max_grid_x: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """Pick and launch the cheapest of the three TN rolling geometries, or
+    decline on low occupancy (see below).
+
+    Caller (`try_enqueue_gemm16_gemm_tn_v4`) has already checked dtype/
+    architecture, k % 64 == 0, 16-byte-aligned bases, machine-width-safe
+    products and m % 8 == 0. Unlike the NT+bias route (col_a=False: A
+    physically (M, K), so A's TMA descriptor declares K as its global
+    stride, already a multiple of 64 * 2 = 128 bytes -- M has no stride
+    role there), this body's col_a=True mode reads A physically (K, M),
+    so A's descriptor declares M itself as the global stride;
+    cuTensorMapEncodeTiled requires every declared stride to be a
+    multiple of 16 bytes, so m * 2 (bf16) % 16 == 0, i.e. m % 8 == 0 -- a
+    real hardware requirement, not merely where this was measured. C's
+    own descriptor stride is N (unaffected by col_a), already covered by
+    the n % 64 == 0 this function checks next: n % 64 == 0 (TMA clips a
+    ragged n edge on that same B/C column stride).
+
+    Occupancy decline (an A2/agent-C/Codex review finding): the cost
+    model above picks the cheapest geometry unconditionally, but for an
+    output small enough that even the cheapest geometry's work census
+    barely dents the available clusters, a persistent kernel's fixed
+    per-CTA setup (barrier init, TMA descriptor prefetch, a big smem
+    carve) is not amortized and this route loses badly to the ladder's
+    other rungs -- measured (H100 SXM, sm:1500 MHz): 768x768x12288
+    regressed 152% (35.3 -> 89.0 us), 256x256x65536 425% (84.4 -> 443.1),
+    128x128x8192 61% (37.1 -> 59.8), and a (64, 128, 64)-class shape 6x
+    (a Codex review finding: two 128x192 CTAs computing six times the
+    padded work of the one 64x128 CTA gemm16_v3_kernels.mojo's dedicated
+    small-tile route would have used) when this dispatcher ran
+    unconditionally.
+
+    Declining requires TWO things, both Codex review findings on the
+    first cut of this decline: (1) a fallback actually exists, and (2)
+    when the fallback is the dedicated small-tile route specifically,
+    that its bm=64 is a strictly better fit than the geometry this
+    function would otherwise pick.
+
+    (1) `_v4_tn_fallback_available` below encodes the alignment each
+    ladder rung needs (m % 128 == 0 for split-K / narrow-tile-192 / v3's
+    large aligned route, or m % 64 == 0 and n % 128 == 0 for v3's small-
+    tile route) -- a shape whose N does not divide 128, 192 or 256 at
+    all, e.g. (256, 320, 4096) (320 divides none of them), has NO
+    fallback anywhere in the ladder and must keep the rolling dispatcher
+    regardless of modeled occupancy: declining it here used to fall all
+    the way to the generic non-TMA route.
+
+    (2) Even with a fallback, declining below three quarters of the
+    available clusters busy (the same bar try_enqueue_candidate_tn's own
+    occupancy gate uses) is the right call only when no fallback is
+    STRICTLY better-fitted than that occupancy math already accounts
+    for. The small-tile route's bm=64 breaks that assumption: on 132
+    SMs, (64, 9600, 64) clears the three-quarters floor outright (50 of
+    66 clusters, cost-model works=50) yet still loses to the small-tile
+    route, because the CHOSEN rolling geometry's bm (128, from this
+    shape's own cost model) does not divide m=64 at all -- half its
+    CTAs (the second cluster rank, entirely) are pure padding and the
+    other half wastes half their rows, 4x the small-tile route's exact
+    64-row fit. So the small-tile route is preferred outright (bypassing
+    the occupancy math entirely) whenever it is eligible AND the chosen
+    geometry's bm exceeds m; only when bm <= m (no such waste) does the
+    three-quarters occupancy floor decide.
+
+    (3) "No fallback exists" is a reason to look at the generic non-TMA
+    route, not a reason to skip looking: it is a disaster for a small m
+    and perfectly good above one. Measured over 21 no-fallback shapes
+    (see `_V4_TN_ROLL_MIN_AREA`), rolling wins by 4x below m = _V4_BM at
+    every n, and loses by up to 2.4x above it until the output area
+    reaches about 270e3 -- (256, 320, 4096) is 33.4 us on rolling against
+    20.0 on generic. So the no-fallback branch keeps rolling for
+    m < _V4_BM whatever the area, and above it only from that area up.
+
+    Together, the escape hatch (accept unconditionally) is: no fallback is
+    available at all AND either m is under the ladder's own 128-row floor
+    or the output is big enough to hide a persistent launch, OR the only
+    available fallback is the small-tile route and it is not a strictly
+    better fit than the chosen geometry. This is why 64x192x4096 (n=192
+    divides neither 128 nor 256, and m = 64: no fallback at all, and the
+    generic route degenerates) keeps its genuine 4x win (125.6 -> 32.6 us):
+    nothing else can take it.
+    """
+    if n % 64 != 0 or sm_count < _V4_TN_ROLL_CLUSTER_M:
+        return False
+    var best = 0
+    var best_cost = _v4_tn_roll_cost(
+        _V4_TN_ROLL_BM[0], _V4_TN_ROLL_BN[0], m, n, sm_count
+    )
+    var best_area = _V4_TN_ROLL_BM[0] * _V4_TN_ROLL_BN[0]
+    var best_bm = _V4_TN_ROLL_BM[0]
+    var best_works = _v4_tn_roll_works(
+        _V4_TN_ROLL_BM[0], _V4_TN_ROLL_BN[0], m, n
+    )
+    comptime for g in range(1, _V4_TN_ROLL_NGEOM):
+        var c = _v4_tn_roll_cost(
+            _V4_TN_ROLL_BM[g], _V4_TN_ROLL_BN[g], m, n, sm_count
+        )
+        var area = _V4_TN_ROLL_BM[g] * _V4_TN_ROLL_BN[g]
+        # Lower modeled time wins; a tie goes to the larger tile, which
+        # reads fewer L2 bytes per flop.
+        if c < best_cost or (c == best_cost and area > best_area):
+            best = g
+            best_cost = c
+            best_area = area
+            best_bm = _V4_TN_ROLL_BM[g]
+            best_works = _v4_tn_roll_works(
+                _V4_TN_ROLL_BM[g], _V4_TN_ROLL_BN[g], m, n
+            )
+    # m % 64 == 0 and n % 128 == 0 mirrors gemm16_v3_kernels.mojo's
+    # _V3_TN_SMALL_BM / _V3_TN_SMALL_BN (the dedicated 64x128 small-tile
+    # route); m % _V4_BM == 0 mirrors its _V3_TN_WS_BM and this file's own
+    # split-K / narrow-tile-192 (all m % 128 == 0, n % 256 == 0 or
+    # n % 192 == 0).  Importing those constants directly would cycle
+    # (gemm16_v3_kernels.mojo already imports from this file), so the
+    # values are repeated here -- see the docstring above for the two
+    # Codex review findings this pair of checks fixes.
+    var small_tile_fits = m % 64 == 0 and n % 128 == 0
+    var large_fallback = m % _V4_BM == 0 and (n % 256 == 0 or n % 192 == 0)
+    if small_tile_fits and m < best_bm:
+        # The small-tile route's exact 64-row fit beats the chosen
+        # geometry's padding outright: bypass the occupancy math (a
+        # shape can clear three quarters of the clusters -- e.g.
+        # (64, 9600, 64), 50 of 66 -- and still lose 4x to this padding).
+        return False
+    if small_tile_fits or large_fallback:
+        var clusters_max = sm_count // _V4_TN_ROLL_CLUSTER_M
+        if best_works * 4 < clusters_max * 3:
+            return False
+    elif m >= _V4_BM and m * n < _V4_TN_ROLL_MIN_AREA:
+        # No fallback rung, so the alternative is the generic non-TMA route,
+        # and "accept unconditionally" was too broad: below _V4_TN_ROLL_MIN_
+        # AREA that route is genuinely faster, because rolling's fixed
+        # per-launch cost cannot be hidden by so small an output.  (256, 320,
+        # 4096) measured 33.4 us on rolling against 20.0 on generic, and
+        # 21 shapes agree on where the two cross -- see the constant.  The
+        # m < _V4_BM shapes stay on rolling: there the generic route is the
+        # 4x disaster this escape hatch was written for.
+        return False
+    comptime for g in range(_V4_TN_ROLL_NGEOM):
+        if best == g:
+            return _v4_try_launch_tn_roll_geom[g](
+                output, a, b, m, n, k, sm_count, max_grid_x, ctx
+            )
+    return False
+
+
+# ============================================================================
 # Regime dispatch.  Returns True when a v4 kernel handled the call.
 # Caller guarantees: TN (transpose_a and not transpose_b), no bias.
 # ============================================================================
@@ -982,12 +1327,17 @@ def try_enqueue_gemm16_gemm_tn_v4(
     var cc_minor = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR)
     if cc_major != 9 or cc_minor != 0:
         return False
-    # Aligned full-tile regime with machine-width-safe products (mirrors the
-    # v3 gates).
+    # Base regime: k tiles exactly, machine-width-safe products.  m is only
+    # m % 8 == 0 here -- the persistent rolling route below (col_a=True)
+    # clips a ragged m via TMA the same way the NT+bias route already clips
+    # ragged m and n, so it no longer needs the historical m % 128 == 0
+    # (kept explicitly, just below, in front of the ONE branch that still
+    # requires it: split-K's fixed 128-row tile floor-divides m and would
+    # silently leave ragged tail rows of C unwritten otherwise).
     if (
-        m < _V4_BM
+        m < 64
         or k < _V4_BK
-        or m % _V4_BM != 0
+        or m % 8 != 0
         or k % _V4_BK != 0
         or n <= 0
         or Int(output) % 16 != 0
@@ -1006,60 +1356,40 @@ def try_enqueue_gemm16_gemm_tn_v4(
     if sm_count <= 0 or max_grid_x <= 0:
         return False
 
-    # Split-K on 256-wide tiles: only when at least two K-chunks per tile
-    # fit within the SM count, each chunk deep enough to amortize pipeline
-    # ramp-up, and the fp32 workspace stays modest.
-    if n % 256 == 0:
-        var tiles = (m // _V4_BM) * (n // 256)
-        if tiles > 0 and tiles <= max_grid_x and 2 * tiles <= sm_count:
-            var splits = sm_count // tiles
-            if splits > _V4_MAX_SPLITS:
-                splits = _V4_MAX_SPLITS
-            var max_by_depth = (k // _V4_BK) // _V4_MIN_CHUNK_TILES
-            if splits > max_by_depth:
-                splits = max_by_depth
-            if m * n <= _V4_MAX_WS_BYTES // 4 // max(splits, 1):
-                if splits >= 2:
-                    _v4_enqueue_splitk_m128n256(
-                        output, a, b, m, n, k, tiles, splits, ctx
-                    )
-                    return True
-
-    # Multi-wave regime: the persistent clustered body (shared with NN)
-    # in its col-major-A mode.  Gated inside the helper; it declines
-    # single-wave and unaligned shapes, which fall through to the
-    # narrow-tile / v3 routes below.
-    if maybe_enqueue_gemm16_tn_v4_persistent(output, a, b, m, n, k, ctx):
+    # Split-K first: it parallelizes a deep-K, underfilled output over K in
+    # a way the persistent rolling body below cannot (see
+    # _try_enqueue_tn_splitk_m128n256's docstring for the measured
+    # regression from trying the rolling dispatcher ahead of it).
+    if _try_enqueue_tn_splitk_m128n256(
+        output, a, b, m, n, k, sm_count, max_grid_x, ctx
+    ):
         return True
 
-    # Same rung for n % 256 != 0 (n % 64 == 0, gated in the helper): the
-    # ragged-n instantiation of the same body, the one the TT dispatcher
-    # already uses.  Without it every multi-wave half-tile-n wgrad shape
-    # fell past the whole v4 ladder: n % 128 == 0 shapes onto the v3
-    # 64x128 one-CTA-per-tile grid -- GPT-2's padded vocab gives
-    # n = 50304, n % 256 == 128, and 768x50304x49152 lost ~1.9x to stock
-    # there (H100 PCIe sweep vs b99e74e: 15.5 ms -> 9.0 with this rung)
-    # -- and n % 128 == 64 shapes all the way to the non-TMA wide
-    # fallback, a ~6x cliff (1536x4160x1024: 185 us -> 31).  The helper
-    # keeps the multi-wave-only engagement, with a ceil-div census so the
-    # trailing partial tile column counts; the census edge sits right at
-    # the measured crossing (768x4992x1024, 120 census tiles on 114 SMs,
-    # engages and wins 28.8 us vs 31.4 on v3; one step below,
-    # 768x4224x1024 at 102 tiles, declines to v3's 24.7 us, which the
-    # persistent body's per-tile rate would only tie).  Single-wave
-    # ragged shapes therefore keep the narrow-tile / v3 routes below.
-    if n % 256 != 0:
-        if maybe_enqueue_gemm16_tn_v4_persistent[False, False, True](
-            output, a, b, m, n, k, ctx
-        ):
-            return True
+    # Persistent-rolling geometry dispatcher (see the module comment above
+    # try_enqueue_gemm16_gemm_tn_v4's TN-rolling helpers): replaces the
+    # fixed-128x256 maybe_enqueue_gemm16_tn_v4_persistent calls this rung
+    # used to make (both the exact-n and the n % 256 != 0 ragged-n ones) --
+    # a runtime cost model over three geometries wins on every shape those
+    # calls served, plus it is the only route here that clips a ragged m
+    # (m % 8 == 0, already checked above) via TMA instead of declining it.
+    # maybe_enqueue_gemm16_tn_v4_persistent remains as-is for its other
+    # caller, the TT dispatcher, which this change does not touch.
+    if _try_enqueue_tn_rolling_geom(
+        output, a, b, m, n, k, sm_count, max_grid_x, ctx
+    ):
+        return True
 
     # Narrow-tile regime: 192-wide tiles trade 33% more CTAs for fuller
     # waves.  Per-CTA time is proportional to BN at fixed BM/BK, so compare
     # wave-quantized cost (waves x BN) and pick 192 when it wins; e.g. 72
     # CTAs on 114 SMs (one third-idle wave) and 1179 CTAs (10.3 waves with
-    # an idle tail wave) both improve.
-    if n % 192 == 0:
+    # an idle tail wave) both improve.  m % 128 == 0 stays explicit here
+    # too: `tiles192` floor-divides m by this kernel's 128-row tile, and it
+    # has no TMA clip for a ragged m either -- the rolling dispatcher above
+    # already claims every ragged-m shape it can, so in practice this only
+    # ever declines a ragged m that the rolling dispatcher also declined
+    # (too small an SM count, or past MAX_GRID_DIM_X).
+    if m % _V4_BM == 0 and n % 192 == 0:
         var tiles192 = (m // _V4_BM) * (n // 192)
         if tiles192 > 0 and tiles192 <= max_grid_x:
             if n % 256 == 0:

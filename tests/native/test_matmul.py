@@ -7,7 +7,11 @@ produced it (rather than a decomposition into something else).
 """
 
 import contextlib
+import os
+import pathlib
 import re
+import subprocess
+import sys
 from collections.abc import Callable
 
 import pytest
@@ -358,6 +362,220 @@ def test_gemm16_addmm_residue64_sites(mojo_h100, site, n, k):
             got = torch.addmm(bias.to(mojo_h100), a.to(mojo_h100), bt.to(mojo_h100).t())
     ref = a.float() @ bt.float().t() + bias.float()
     assert _rel_err(got, ref) < _bf16_bound(k)
+
+
+# --- the NT+bias 192x192 rolling kernel (GPT-2 XL forward linear sites) ------
+#
+# gemm16_candidate_dispatch.mojo's try_enqueue_candidate_nt_bias now tries the
+# 192x192 rolling kernel (gemm16_rolling_kernels.mojo's kmaj_b + has_bias
+# instantiation, `bf16_gemm_nt_bias_rolling_ws_m192n192_s3c2wg3g8`) ahead of
+# the 128-row maybe_enqueue_gemm16_nt_bias_v4 fallback; both -- and the
+# generic bf16 route below them for shapes neither accepts, e.g. m not a
+# multiple of 128 -- fuse the bias into the accumulator, so assert_no_bias_add
+# holds regardless of which one actually served a given shape.
+#
+# Shapes are exactly the ones the standalone engagement measured on H100 SXM
+# (worst ratio 1.052 against cuBLAS), plus two smaller ones exercising the
+# ragged-N tile boundary (1600 and 6400 are not multiples of BN=192; only
+# 4800 is) at a cheaper M for test time.
+# -------------------------------------------------------------------------------
+
+NT_BIAS_192_SHAPES = [
+    (8192, 4800, 1600),  # c_attn
+    (8192, 1600, 1600),  # c_proj
+    (8192, 6400, 1600),  # c_fc
+    (8192, 1600, 6400),  # mlp_proj
+    (16384, 4800, 1600),  # c_attn at the larger batch -- kept full-size
+    (6600, 4800, 1600),  # ragged M (not a multiple of 128 or of 384)
+    (4096, 1664, 1600),  # small, ragged N (1664 % 192 != 0)
+    (4224, 4800, 1664),  # small, one tile past the regime's 4096 minimum
+]
+
+
+@pytest.mark.parametrize("m,n,k", NT_BIAS_192_SHAPES)
+def test_gemm16_nt_bias_rolling_192(mojo_h100, m, n, k):
+    """Forward linear in bf16 with a bias at the 192x192 rolling kernel's own
+    shapes: fused in one launch regardless of which NT+bias route inside the
+    regime actually serves it (see the module comment above)."""
+    x = torch.randn(m, k, dtype=torch.bfloat16)
+    w = torch.randn(n, k, dtype=torch.bfloat16)
+    b = torch.randn(n, dtype=torch.bfloat16)
+    with assert_ran("aten::linear"):
+        with assert_no_bias_add():
+            got = torch.nn.functional.linear(
+                x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100)
+            )
+    ref = torch.nn.functional.linear(x.float(), w.float(), b.float())
+    assert got.dtype == torch.bfloat16
+    assert _rel_err(got, ref) < _bf16_bound(k)
+
+
+@pytest.mark.parametrize("m,n,k", NT_BIAS_192_SHAPES)
+def test_gemm16_nt_bias_rolling_192_bias_only(mojo_h100, m, n, k):
+    """Zero products: the output IS the bias, so a dropped, shifted or
+    misindexed bias column shows up exactly, across every column-tile
+    boundary. (The random-input test above tolerates bf16 accumulation error
+    of the size of a unit bias.)"""
+    x = torch.zeros(m, k, dtype=torch.bfloat16)
+    w = torch.zeros(n, k, dtype=torch.bfloat16)
+    b = (torch.arange(n, dtype=torch.float32) % 251 - 125).to(torch.bfloat16)
+    with assert_ran("aten::linear"):
+        with assert_no_bias_add():
+            got = torch.nn.functional.linear(
+                x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100)
+            )
+    torch.testing.assert_close(got.cpu(), b.expand(m, n), rtol=0, atol=0)
+
+
+# --- the TN persistent-rolling geometry dispatcher (GPT-2 XL dW sites) -------
+#
+# gemm16_tn_v4_kernels.mojo's try_enqueue_gemm16_gemm_tn_v4 now routes a
+# multi-wave TN (weight-gradient) GEMM to one of three tuned geometries of
+# the shared persistent-rolling body (192x192 / 128x256 / 128x192, chosen by
+# a runtime cost model -- see _try_enqueue_tn_rolling_geom's module comment
+# in that file), replacing the old fixed-128x256 rung, and clips a ragged M
+# (m % 8 == 0) via TMA instead of declining it the way the split-K and
+# narrow-tile rungs below it still do.
+#
+# Shapes are the standalone engagement's six (out_features, in_features,
+# tokens); tokens is scaled down on all but the first the way this file's
+# other site tables scale down whatever axis dominates test time (XL_M
+# above) -- the geometry choice is a function of out_features/in_features
+# and the GPU's SM count only, never of tokens.
+# -------------------------------------------------------------------------------
+
+TN_ROLLING_SHAPES = [
+    (4800, 1600, 8192),  # c_attn dW -- full-size tokens, the flagship shape
+    (1600, 1600, 1024),  # c_proj dW
+    (6400, 1600, 1024),  # c_fc dW
+    (1600, 6400, 1024),  # mlp_proj dW
+    (4800, 1600, 2048),  # c_attn dW at the model's deeper reduction (16384)
+    (4808, 1600, 1024),  # ragged M -- not a multiple of 64; measured 942 us
+    # (generic fallback) -> 149 us (rolling route) at full size, job 250131
+]
+
+
+@pytest.mark.parametrize("out_features,in_features,tokens", TN_ROLLING_SHAPES)
+def test_gemm16_tn_rolling_geometry_dispatch(
+    mojo_h100, out_features, in_features, tokens
+):
+    """dW through linear_backward at the rolling dispatcher's own shapes."""
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    w = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+    g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
+    with assert_ran("aten::linear_backward"):
+        _dx, dw, _db = torch.ops.aten.linear_backward(
+            x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
+        )
+    ref = g.float().t() @ x.float()
+    assert dw.dtype == torch.bfloat16
+    assert _rel_err(dw, ref) < _bf16_bound(tokens)
+
+
+def test_gemm16_tn_rolling_small_ragged_m(mojo_h100):
+    """A small ragged M (64 <= m < 1600) was not part of the standalone
+    engagement's measured sweep (an A2 review finding); this is the
+    smallest case that still clears the dispatcher's m >= 64 floor."""
+    out_features, in_features, tokens = 136, 1600, 512
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    w = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+    g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
+    with assert_ran("aten::linear_backward"):
+        _dx, dw, _db = torch.ops.aten.linear_backward(
+            x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
+        )
+    ref = g.float().t() @ x.float()
+    assert _rel_err(dw, ref) < _bf16_bound(tokens)
+
+
+# n=320 divides none of 128/192/256 -- no fallback rung (split-K, narrow-
+# tile-192, v3's aligned or small-tile routes) exists anywhere in the TN
+# ladder, so the occupancy decline must keep the rolling dispatcher
+# regardless of how low its own modeled occupancy is (a Codex review
+# finding: it used to fall all the way to the generic non-TMA route).
+# m=64, n=9600 is the opposite failure mode of the same decline: n % 128
+# == 0 makes v3's small-tile route (bm=64, an exact fit) eligible, and on
+# 132 SMs this shape clears the three-quarters occupancy floor outright
+# (50 of 66 clusters) -- so occupancy alone was not enough to stop the
+# rolling dispatcher from choosing a 128-row geometry that pads m=64 to
+# 128 (4x the small-tile route's padding-free work), also a Codex finding.
+# (64, 320, 4096) and (2048, 320, 4096) are the two sides of the third
+# finding (agent C): with no fallback rung the generic route is still the
+# right answer for a small output above the ladder's 128-row floor -- so
+# (256, 320, 4096) now DECLINES to it (33.4 -> 20.0 us) while these two,
+# one under the floor and one far past _V4_TN_ROLL_MIN_AREA, keep rolling
+# (0.26x and 0.35x of generic). All four must be numerically right
+# whichever route the dispatcher picks for them.
+TN_ROLLING_ESCAPE_HATCH_SHAPES = [
+    (256, 320, 4096),
+    (64, 9600, 64),
+    (64, 320, 4096),
+    (2048, 320, 4096),
+]
+
+
+@pytest.mark.parametrize(
+    "out_features,in_features,tokens", TN_ROLLING_ESCAPE_HATCH_SHAPES
+)
+def test_gemm16_tn_rolling_occupancy_decline_escape_hatch(
+    mojo_h100, out_features, in_features, tokens
+):
+    """Correctness at the two shapes the occupancy decline's escape hatch
+    (_try_enqueue_tn_rolling_geom's docstring) must get right: one with no
+    fallback rung at all, one where the fallback exists but the rolling
+    dispatcher's own geometry would pad m severely worse than it does."""
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    w = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+    g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
+    with assert_ran("aten::linear_backward"):
+        _dx, dw, _db = torch.ops.aten.linear_backward(
+            x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
+        )
+    ref = g.float().t() @ x.float()
+    assert _rel_err(dw, ref) < _bf16_bound(tokens)
+
+
+def test_gemm16_tn_rolling_m4800_boundary_guard(mojo_h100):
+    """m = 4800 lands exactly on the 192x192/cluster-2 geometry's macro-row
+    boundary: 4800 % (192 * 2) == 192, so the second cluster rank's box for
+    the grid's last macro row starts exactly at m -- entirely out of bounds
+    for the A load and the C store, not merely a partial tile (an A2 review
+    finding on this engagement, documented in _try_enqueue_tn_rolling_geom's
+    docstring, gemm16_tn_v4_kernels.mojo).
+
+    Geometry selection is SM-count dependent (see
+    _try_enqueue_tn_rolling_geom's cost model); this (out, in) pair picks
+    the 192x192 geometry on an H100 SXM (132 SMs), the hardware this
+    engagement was measured on -- on a different SM count the correctness
+    check below still holds for whichever geometry actually ran.
+
+    What this can and cannot detect (a Codex review finding): `out=`
+    (ops_matmul.mojo's op_mm_out / _store_out) computes into a freshly
+    allocated, exactly (m, n)-sized temporary and then copy_strided_intos
+    it into `view`; that copy is itself bounded by (m, n), so the nonzero
+    canary below guards the COPY against overrunning `view`, not the GEMM
+    kernel's own TMA store against overrunning ITS temporary -- the canary
+    rows never border the kernel's real destination memory, so an
+    out-of-bounds *write* by the kernel itself would not reach them (nor
+    would a zero canary catch an out-of-bounds write of zero, which is why
+    this one is not zero). Real evidence for the kernel's own store comes
+    from a clean `compute-sanitizer --tool memcheck` run over the direct
+    (non-`out=`) `torch.mm(grad.t(), x)` path at this m and the ragged
+    m=4808, cited in this change's commit message. This test remains a
+    regression guard for the `out=` copy path (a real thing that could
+    still break on its own), not a substitute for that sanitizer evidence.
+    """
+    m, n, k = 4800, 1600, 1024
+    canary = -12345.0
+    base = torch.full((m + 192, n), canary, dtype=torch.bfloat16, device=mojo_h100)
+    view = base[:m]
+    g = torch.randn(k, m, dtype=torch.bfloat16)
+    x = torch.randn(k, n, dtype=torch.bfloat16)
+    torch.mm(g.to(mojo_h100).t(), x.to(mojo_h100), out=view)
+    ref = g.float().t() @ x.float()
+    assert _rel_err(view, ref) < _bf16_bound(k)
+    expected_guard = torch.full((192, n), canary, dtype=torch.bfloat16)
+    assert torch.equal(base[m:].cpu(), expected_guard), "the out= copy wrote past m"
 
 
 # --- the out= overloads (TorchInductor's extern kernels) ----------------------
@@ -1014,3 +1232,242 @@ def test_linear_skinny_m_large_output(mojo_gpu):
     torch.testing.assert_close(
         got.cpu(), torch.nn.functional.linear(x, w), atol=5e-2, rtol=5e-2
     )
+
+
+# --- the dynamic tile scheduler (gemm16_sched_pool.mojo) ----------------------
+#
+# The three persistent bodies -- `_rolling_persistent_ws`,
+# `_nt_bias_rolling_ws` (gemm16_rolling_kernels.mojo) and
+# `_v4_nn_persistent_ws` (gemm16_nn_v4_kernels.mojo) -- take their output
+# tiles from a global ticket counter instead of owning a static share, so a
+# cluster that cannot launch (NCCL holding its SMs on a DDP job's comm
+# stream) costs its tiles' latency rather than the whole kernel's.  The
+# counter lives in a per-(device, stream) block that the kernel itself
+# resets: the last cluster to fetch a ticket stores 0 back.  What that makes
+# testable, beyond the ordinary correctness the tables above already cover:
+#
+#   * a MISSED reset shows up only on the SECOND launch that shares the
+#     counter (it would start mid-count and skip tiles), so the tests below
+#     launch repeatedly without a sync in between and check the last result;
+#   * the tile order is dynamic but each tile's K order is not, so two runs
+#     of one GEMM must agree BIT for bit -- a stronger assertion than the
+#     bf16 bound, and the one that would catch a torn ticket handing two
+#     clusters the same tile;
+#   * a second stream gets its own counter, which is what makes reuse safe
+#     without reasoning about occupancy.
+# -----------------------------------------------------------------------------
+
+# (m, n, k) through the NN rolling body: m % 128 == 0, n % 256 == 64,
+# 4n <= m <= 32n and n <= k <= 8n is try_enqueue_candidate_nn's own gate.
+SCHED_NN_DX = (8192, 1600, 4800)  # c_attn dX
+SCHED_NN_DX_SMALL = (6400, 1600, 1600)  # attn.c_proj dX, cheap enough to loop
+SCHED_TN_DW = (4800, 1600, 8192)  # c_attn dW, through the TN rolling body
+
+
+def _sched_mm(device, m, n, k):
+    """One bf16 NN GEMM on `device`, with its fp32 CPU reference."""
+    a = torch.randn(m, k, dtype=torch.bfloat16)
+    b = torch.randn(k, n, dtype=torch.bfloat16)
+    return a.to(device), b.to(device), a.float() @ b.float()
+
+
+@pytest.mark.parametrize("m,n,k", [(8192, 4800, 1600), (8192, 1600, 6400)])
+def test_gemm16_sched_fused_forward(mojo_h100, m, n, k):
+    """The fused NT+bias 192x192 kernel through the scheduler.
+
+    That instantiation (`_nt_bias_rolling_ws`, the only one with a live
+    `bias` argument) was compiled but never launched while the scheduler was
+    developed outside the tree, so it gets its own test: the bias still fuses
+    into the one launch, the result still clears the bf16 bound, and two runs
+    agree bit for bit."""
+    x = torch.randn(m, k, dtype=torch.bfloat16)
+    w = torch.randn(n, k, dtype=torch.bfloat16)
+    b = torch.randn(n, dtype=torch.bfloat16)
+    dx, dw, db = x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100)
+    with assert_ran("aten::linear"):
+        with assert_no_bias_add():
+            got = torch.nn.functional.linear(dx, dw, db)
+    again = torch.nn.functional.linear(dx, dw, db)
+    assert torch.equal(got.cpu(), again.cpu()), (
+        "two runs of one GEMM disagree: the tile ORDER is dynamic but each "
+        "tile's K order is not, so the result must be bit-identical"
+    )
+    ref = torch.nn.functional.linear(x.float(), w.float(), b.float())
+    assert _rel_err(got, ref) < _bf16_bound(k)
+
+
+def test_gemm16_sched_dx_mm(mojo_h100):
+    """dX as a bare mm: the NN rolling body's own route."""
+    m, n, k = SCHED_NN_DX
+    a, b, ref = _sched_mm(mojo_h100, m, n, k)
+    with assert_ran("aten::mm"):
+        got = torch.mm(a, b)
+    assert torch.equal(got.cpu(), torch.mm(a, b).cpu())
+    assert _rel_err(got, ref) < _bf16_bound(k)
+
+
+def test_gemm16_sched_dw_mm(mojo_h100):
+    """dW as `mm(grad.t(), x)`: the TN (col_a) instantiation of the same
+    body, reached through the rolling geometry dispatcher."""
+    out_features, in_features, tokens = SCHED_TN_DW
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
+    dx, dg = x.to(mojo_h100), g.to(mojo_h100)
+    with assert_ran("aten::mm"):
+        got = torch.mm(dg.t(), dx)
+    assert torch.equal(got.cpu(), torch.mm(dg.t(), dx).cpu())
+    assert _rel_err(got, g.float().t() @ x.float()) < _bf16_bound(tokens)
+
+
+def test_gemm16_sched_counter_is_reset_between_launches(mojo_h100):
+    """64 back-to-back launches sharing one ticket counter, each computing a
+    DIFFERENT product, then a GEMM with a different work census.
+
+    Nothing synchronizes between the launches, so they are exactly the
+    same-stream sequence the reset argument relies on: launch j+1 may only
+    start once launch j's last fetcher has stored 0 back.  A counter left
+    dirty makes launch j+1 start mid-count and never issue its first tiles.
+
+    Every launch slides the A operand down one row, so consecutive launches
+    have different answers everywhere. That is what makes the final
+    comparison able to see a skipped tile at all: torch.mm allocates a fresh
+    output each call and the caching allocator hands back the block the
+    previous result just freed, so a launch that recomputed the SAME product
+    would find correct bytes already sitting in the tiles it never wrote (an
+    agent-C review finding on the first cut of this test)."""
+    m, n, k = SCHED_NN_DX_SMALL
+    laps = 64
+    a = torch.randn(m + laps, k, dtype=torch.bfloat16)
+    b = torch.randn(k, n, dtype=torch.bfloat16)
+    dev_a, dev_b = a.to(mojo_h100), b.to(mojo_h100)
+    got = torch.mm(dev_a[:m], dev_b)
+    for lap in range(1, laps):
+        got = torch.mm(dev_a[lap : lap + m], dev_b)
+    ref = a[laps - 1 : laps - 1 + m].float() @ b.float()
+    assert _rel_err(got, ref) < _bf16_bound(k)
+    # A different census on the same counter: the TN body's work loop is a
+    # different length, so a stale count would land somewhere else entirely.
+    out_features, in_features, tokens = 1600, 1600, 8192
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
+    dw = torch.mm(g.to(mojo_h100).t(), x.to(mojo_h100))
+    assert _rel_err(dw, g.float().t() @ x.float()) < _bf16_bound(tokens)
+
+
+def test_gemm16_sched_on_a_side_stream(mojo_h100):
+    """Two streams running persistent GEMMs AT THE SAME TIME.
+
+    The whole reuse argument is "launches on one stream are ordered", so a
+    GEMM issued on a side stream must not share the default stream's counter:
+    if it did, two genuinely concurrent launches would dispense from one
+    counter and two clusters would compute the same tile while another tile
+    went unwritten.  Only genuinely overlapping launches can show that, so
+    the streams are fenced once for INPUT readiness and then each issues its
+    own burst with no fence in between -- an earlier cut of this test fenced
+    the side stream behind the default stream's GEMM, which serialized the
+    two and tested nothing (an agent-C/Codex review finding).
+
+    Outputs are held until after the barrier: freeing a side stream's tensor
+    is ordered on its owner stream only, so dropping them inside the burst
+    would hand live memory back to the allocator."""
+    side = side_stream_or_skip(mojo_h100)
+    m, n, k = SCHED_NN_DX_SMALL
+    a, b, ref = _sched_mm(mojo_h100, m, n, k)
+    bound = _bf16_bound(k)
+    # Prewarm both streams (kernel build, allocator) and preallocate every
+    # output, so the bursts below are nothing but back-to-back launches.
+    with device_module.stream(side):
+        warm_side = torch.mm(a, b)
+    warm_default = torch.mm(a, b)
+    on_side = [torch.empty(m, n, dtype=a.dtype, device=a.device) for _ in range(24)]
+    on_default = [torch.empty(m, n, dtype=a.dtype, device=a.device) for _ in range(24)]
+    # The inputs were filled on the default stream; that is the only
+    # cross-stream dependency, and this is the last fence before the bursts.
+    torch.accelerator.synchronize()
+    # Interleave the two streams' submissions so neither burst can drain
+    # before the other starts (a side burst issued whole before the default
+    # one could finish first and never overlap -- a Codex review finding).
+    # Overlap is made likely, not proven: nothing here observes the device
+    # timeline, so a shared counter would show only as a wrong tile.
+    for out_side, out_default in zip(on_side, on_default, strict=True):
+        with device_module.stream(side):
+            torch.mm(a, b, out=out_side)
+        torch.mm(a, b, out=out_default)
+    torch.accelerator.synchronize()
+    del warm_side, warm_default
+    for got in on_default:
+        assert _rel_err(got, ref) < bound
+    first = on_default[0].cpu()
+    for got in on_side:
+        assert _rel_err(got, ref) < bound
+        # Same operands, same per-tile K order: the answer is bit-identical
+        # however the tiles were shared out, on either stream.
+        assert torch.equal(got.cpu(), first)
+
+
+# The 650-launch body runs in a FRESH process: the counter table is
+# process-global and never evicts, so a test sharing a process with the rest
+# of this file could find it already exhausted and then measure two runs of
+# the SAME fallback kernel -- equal times, a green test, and the bug intact
+# (an agent-C/Codex review finding). A subprocess also keeps the timing away
+# from whatever else the session has left resident.
+_SLOT_STABILITY_PROGRAM = """
+import os, time
+os.environ.setdefault("MODULAR_TELEMETRY_ENABLED", "0")
+import torch
+from torch_mojo_backend import register_mojo_devices
+
+register_mojo_devices()
+dev = "mojo:0"
+grad = torch.randn(8192, 1600, dtype=torch.bfloat16, device=dev)
+x = torch.randn(8192, 1600, dtype=torch.bfloat16, device=dev)
+
+
+def burst(n):
+    torch.mojo.synchronize()
+    start = time.perf_counter()
+    for _ in range(n):
+        out = torch.mm(grad.t(), x)
+    torch.mojo.synchronize()
+    return (time.perf_counter() - start) / n, out
+
+
+burst(8)
+first, _ = burst(50)
+for _ in range(600):
+    torch.mm(grad.t(), x)
+last, out = burst(50)
+ref = grad.t().float().cpu() @ x.float().cpu()
+scale = ref.abs().max().clamp(min=1.0)
+rel = float((out.cpu().float() - ref).abs().max() / scale)
+print("RESULT", first, last, rel, flush=True)
+"""
+
+
+def test_gemm16_sched_slot_is_stable_across_many_launches(mojo_h100):
+    """The scheduler's counter slot is keyed on the (device, stream) context
+    handle. Keyed on a per-call object it appended one table entry per launch
+    -- a device allocation and a memset on the hot path -- until the 512-slot
+    table filled, after which every persistent route declined to the fallback
+    kernels for the rest of the process (the GPT-2 XL step went 227 -> 460
+    ms). Launch well past that count in a fresh process and check the last
+    launches are as fast as the first (a decline is a 3-9x cliff, not a few
+    percent).
+
+    What this can NOT see is a table that fills for some other reason and
+    takes both bursts down with it; that is what the fresh process is for,
+    and why the absolute per-launch time is printed on failure."""
+    out = subprocess.run(
+        [sys.executable, "-c", _SLOT_STABILITY_PROGRAM],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        env={**os.environ, "PYTHONPATH": str(pathlib.Path(__file__).parents[2])},
+    )
+    assert out.returncode == 0, f"subprocess failed:\n{out.stdout}\n{out.stderr}"
+    line = [x for x in out.stdout.splitlines() if x.startswith("RESULT ")]
+    assert line, f"no RESULT line:\n{out.stdout}\n{out.stderr}"
+    _, first, last, rel = line[-1].split()
+    first, last, rel = float(first), float(last), float(rel)
+    assert last < 1.5 * first, f"per-launch {first * 1e6:.0f} -> {last * 1e6:.0f} us"
+    assert rel < _bf16_bound(8192), f"relative error {rel}"

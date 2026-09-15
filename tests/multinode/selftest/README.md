@@ -228,3 +228,30 @@ partially-created resources on a failure path. NOT covered: the progress
 thread and its two spin kernels (they need pinned host memory and a stream),
 byte-level verification of an RMA write into device memory, and everything
 in `mojoccl.mojo` above the transport.
+
+## `host_fault_test.mojo` — independent host/device fault records
+
+Calls the production host publisher against a stack-allocated status page.
+Checks device-first, host-first, partially published device details, and a
+second host fault: host writes never change device fields, and the first
+observed source and host details remain latched. No GPU code runs.
+
+```bash
+PYTHONPATH=$PWD uv run --no-sync mojo build tests/multinode/selftest/host_fault_test.mojo \
+    -I torch_mojo_backend/distributed/mojoccl --target-accelerator sm_90a \
+  -o /tmp/mojoccl_host_fault_test
+PYTHONPATH=$PWD uv run --no-sync /tmp/mojoccl_host_fault_test
+```
+
+## `comm_state_probe.mojo` — abort release assertion
+
+Read-only helper for `stream_order_probe.py`, built against the same source
+as the tested library. Checks the release flag and cleared IB, status-page,
+and completion-event handles after abort.
+
+```bash
+PYTHONPATH=$PWD uv run --no-sync mojo build --emit shared-lib \
+    tests/multinode/selftest/comm_state_probe.mojo \
+    -I torch_mojo_backend/distributed/mojoccl -o /tmp/comm_state_probe.so
+export MOJOCCL_STATE_PROBE_LIBRARY=/tmp/comm_state_probe.so
+```

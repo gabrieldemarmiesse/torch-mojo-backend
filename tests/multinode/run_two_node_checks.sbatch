@@ -6,6 +6,7 @@
 #SBATCH -c 64
 #SBATCH --mem=256G
 #SBATCH -t 1:30:00
+#SBATCH --exclusive
 #SBATCH -J mojoccl_2node
 #SBATCH --exclude=par2dc5-ai-prd-cl02s03dgx01
 #SBATCH -o /home/gabriel/ddp_work/logs/mojoccl_2node_%j.log
@@ -33,8 +34,11 @@
 # Every leg is one torchrun launch across both nodes (--nnodes=2
 # --nproc-per-node=8), guarded per node by `flock /tmp/gpu_lock_0.lock`
 # inside the srun'd command (srun runs one task per node; that task's
-# flock is local to that node's /tmp). Each leg's full output goes to its
-# own log under /home/gabriel/ddp_work/logs/; a filtered view (result
+# flock is local to that node's /tmp). `--exclusive` because that lock is
+# node-wide: sharing a node with another GPU job means every leg queues
+# behind it, and a job that spent its whole time budget waiting on the
+# lock rather than running was mistaken for a hang. Each leg's full output
+# goes to its own log under /home/gabriel/ddp_work/logs/; a filtered view (result
 # lines, per-rank OK/FAIL, step lines, errors) is echoed to this job's
 # main -o log, which is what tests/multinode/summarize.py reads.
 

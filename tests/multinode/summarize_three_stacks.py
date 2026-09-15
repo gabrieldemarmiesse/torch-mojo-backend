@@ -7,7 +7,8 @@ rounds (t, n-1 dof).
 
 usage: summarize_three_stacks.py JOB [LOGDIR] [WORLD]
 env: E2E_STOCK_NAME (row label of the stock stack), E2E_SETUP (the "16 ranks on 2x8 H100"
-phrase of the table caption).
+phrase of the table caption), E2E_MODEL (the model phrase, default nanoGPT-124M), E2E_TAG (the
+log-name prefix the sbatch wrote, default e2e_three_stacks).
 """
 
 import glob
@@ -20,6 +21,8 @@ job = sys.argv[1]
 LOGDIR = sys.argv[2] if len(sys.argv) > 2 else "/home/gabriel/ddp_work/logs"
 WORLD = int(sys.argv[3]) if len(sys.argv) > 3 else 16
 SETUP = os.environ.get("E2E_SETUP", "16 ranks on 2x8 H100")
+MODEL = os.environ.get("E2E_MODEL", "nanoGPT-124M")
+TAG = os.environ.get("E2E_TAG", "e2e_three_stacks")
 T = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776}
 NAMES = {
     "stock": os.environ.get("E2E_STOCK_NAME", "stock CUDA torch 2.11 + NCCL"),
@@ -27,11 +30,11 @@ NAMES = {
     "mojo_mojoccl": "mojo backend + mojoccl (all Mojo)",
 }
 runs, problems = {}, []
-for f in sorted(glob.glob(f"{LOGDIR}/e2e_three_stacks_{job}_bs*_*_*.log")):
+for f in sorted(glob.glob(f"{LOGDIR}/{TAG}_{job}_bs*_*_*.log")):
     m = re.search(rf"{job}_bs(\d+)_(\d+)_(\w+)\.log", f)
     assert m is not None, f
     bs, i, cfg = int(m.group(1)), int(m.group(2)), m.group(3)
-    if cfg == "warmup":
+    if cfg.startswith("warmup"):
         continue
     text = open(f).read()
     tps, el = {}, {}
@@ -95,7 +98,7 @@ for bs in sorted({b for b, _ in runs}, reverse=True):
     rm, rc = statistics.mean(ref), ci(ref)
     n = len(ref)
     print(
-        f"\nBatch {bs}x1024 per rank, {SETUP}, nanoGPT-124M, bf16 autocast, 30 steps, {n} interleaved rounds after a discarded warm-up; +- is a 95% CI over rounds:\n"
+        f"\nBatch {bs}x1024 per rank, {SETUP}, {MODEL}, bf16 autocast, 30 steps, {n} interleaved rounds after a discarded warm-up; +- is a 95% CI over rounds:\n"
     )
     print(
         f"| stack | mean tokens/s, steps 20-30 | ratio vs {NAMES['stock']} | step 1 (init) |"

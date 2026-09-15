@@ -18,6 +18,7 @@ from mojoccl import (
     inbox_group_bytes,
     max_chunk_bytes,
     net_stage_bytes,
+    PIPE_SPLIT_UNIT,
     pipeline_chunk_bytes,
     region_layout,
 )
@@ -126,7 +127,7 @@ def main() raises:
                     for si in range(len(sizes)):
                         var total = sizes[si]
                         var chunk_bytes = pipeline_chunk_bytes(
-                            maxchunk, lw, total
+                            maxchunk, lw, total, PIPE_SPLIT_UNIT
                         )
                         _check(chunk_bytes <= maxchunk, "chunk <= max", bad)
                         _check(

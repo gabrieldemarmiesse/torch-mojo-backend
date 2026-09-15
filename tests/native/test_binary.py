@@ -314,6 +314,43 @@ def test_out_variants(mojo_device):
     torch.testing.assert_close(dest.cpu(), a_cpu / b_cpu)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("n", "in_offset", "out_offset"),
+    [
+        (16000, 0, 0),  # 16-byte aligned bases, no tail: the vector lanes
+        (16000, 8, 8),  # aligned by offset (8 elements = 16 B in bf16, 32 B in fp32)
+        (16003, 0, 0),  # ragged length: scalar lanes
+        (16000, 1, 0),  # unaligned input, aligned output
+        (16000, 0, 7),  # aligned input, unaligned output
+        (16000, 4, 1),
+    ],
+)
+def test_scalar_mul_out_into_bucket_view(mojo_device, dtype, n, in_offset, out_offset):
+    """DDP's reducer: `mul_out(bucket_view, grad, 1/world)` with the view at
+    whatever element offset the previous parameter left. Both bases 16-byte
+    aligned with no tail takes the vector lanes; anything else the scalar
+    ones."""
+    src_cpu, src = _both((n + 16,), dtype, mojo_device)
+    grad_cpu, grad = src_cpu[in_offset : in_offset + n], src[in_offset : in_offset + n]
+    bucket = torch.zeros(n + 16, dtype=dtype, device=mojo_device)
+    with native_ran("aten::mul.out"):
+        torch.mul(grad, 1.0 / 16, out=bucket[out_offset : out_offset + n])
+    expected = torch.zeros(n + 16, dtype=dtype)
+    expected[out_offset : out_offset + n] = grad_cpu * (1.0 / 16)
+    torch.testing.assert_close(bucket.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_scalar_mul_out_aliasing_self(mojo_device, dtype):
+    """`torch.mul(x, s, out=x)`: the exact alias the direct-write route must
+    accept (a flat elementwise loop reads each element before writing it)."""
+    x_cpu, x = _both((16000,), dtype, mojo_device)
+    with native_ran("aten::mul.out"):
+        torch.mul(x, 0.5, out=x)
+    torch.testing.assert_close(x.cpu(), x_cpu * 0.5)
+
+
 def test_out_resizes(mojo_device):
     a_cpu, a = _both((3, 4), torch.float32, mojo_device)
     b_cpu, b = _both((3, 4), torch.float32, mojo_device)

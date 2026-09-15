@@ -152,7 +152,12 @@ from std.gpu import (
     grid_dim,
     thread_idx,
 )
-from max.gpu.host import DeviceContext, DeviceStream
+from max.gpu.host import DeviceAttribute, DeviceContext, DeviceStream
+from max.gpu.host.launch_attribute import (
+    LaunchAttribute,
+    LaunchAttributeID,
+    LaunchAttributeValue,
+)
 from max.gpu.sync import barrier
 from std.memory import AddressSpace, stack_allocation
 from std.memory.alloc import unsafe_alloc
@@ -192,6 +197,28 @@ comptime _STATUS_PTR_OFFSET = 256
 status page (below). Zero until `install_status_page` publishes one, and every
 spin reads zero as "this region has no status page". 64/128/192 are the NVLS
 barrier counters (nvls_kernels.mojo), so 256 is the first free line."""
+
+comptime _GRIDBAR_ARRIVE_OFFSET = 320
+comptime _GRIDBAR_RELEASE_OFFSET = 384
+"""The two words of `grid_barrier`, on separate cache lines so the arrival
+counter's traffic never invalidates the line every block is spinning on.
+Purely rank-local -- no peer ever reads them -- and zeroed by `region_init`
+with the rest of the signal area. Only arena 0's pair is ever used: the fused
+inter-node kernel spans arenas but is one grid. They are a fixed rendezvous,
+not generation-tagged, so two collectives of one communicator must never be
+on the device at once. mojoccl (not NCCL, which allows groups across
+streams) enforces that itself: a collective issued on a stream other than
+the communicator's previous one is made to wait, through an event, for the
+previous collective (`_order_before` / `_order_after`, mojoccl.mojo), so
+every collective of a communicator runs in one total order whatever streams
+the caller uses. The process group issues everything on one comm stream
+anyway."""
+
+comptime _POISON_OFFSET = 448
+"""Device word one block of a persistent kernel raises to tell the others to
+give up (internode_fused.mojo). Device memory, unlike the status page's abort
+word: every block reads it once per chunk, and that read has to be an L2 hit
+rather than a PCIe round trip."""
 
 comptime _SIGNAL_BYTES = 128 * 1024
 """Signal-area size: 4 KiB header + MAX_BLOCKS*MAX_WORLD*8 B of flags = 68 KiB,
@@ -276,6 +303,17 @@ comptime ERR_PROXY_WAIT = 9
 """`internode_kernels.mojo`'s wait for the inter-node progress thread. The
 value is what that kernel has always written, so old logs still decode."""
 
+comptime ERR_FUSED_GRID = 10
+"""A grid barrier inside the fused inter-node allreduce (internode_fused.mojo)
+gave up: this rank's own blocks stopped arriving, which only happens because
+another spin in the same kernel already failed and returned."""
+
+comptime ERR_HOST_LAUNCH = 11
+"""The host failed to launch the fused inter-node allreduce after reserving
+its exchange counters (mojoccl.mojo `_do_allreduce_fused`): the peers will
+wait for flags and exchanges that are never coming, so the communicator is
+failed from the host through the same status page a device deadline uses."""
+
 
 # ===-------------------------------------------------------------------=== #
 # Region geometry (host + device agree; every rank computes the same numbers)
@@ -294,6 +332,14 @@ def signal_bytes() -> Int:
         _FLAG_BYTE_OFFSET + MAX_BLOCKS * MAX_WORLD * 8 <= _SIGNAL_BYTES
     ), "the flag matrix must fit the signal area"
     return _SIGNAL_BYTES
+
+
+def poison_offset() -> Int:
+    """Byte offset, inside the signal area, of `_POISON_OFFSET`'s word."""
+    comptime assert (
+        _POISON_OFFSET + 8 <= _FLAG_BYTE_OFFSET
+    ), "the header words must stay inside the first page"
+    return _POISON_OFFSET
 
 
 def error_offset() -> Int:
@@ -345,6 +391,12 @@ comptime STATUS_ABORT_WORD = 0
 
 comptime STATUS_FAULT_WORD = 8
 """Word index of the first word of the fault record (second cache line)."""
+
+comptime STATUS_HOST_FAULT_WORD = 15
+"""Host-only record: bit 63 = device fault already observed, bits 32..62 =
+code, bits 0..31 = exchange. The host cannot join the device arena's claim,
+so it never writes the device record. `_report_fault` keeps the first fully
+published fault observed when the host latches this word."""
 
 # Fault record layout, as word offsets from `STATUS_FAULT_WORD`. `FAULT_CODE`
 # is written LAST, with a release store, so a nonzero code also means the six
@@ -582,6 +634,7 @@ def _record_deadline(
     target: UInt64,
     peer: UInt64,
     seen: UInt64,
+    arena_off: Int = 0,
 ):
     """A barrier gave up: record it in the arena and latch it for the host.
 
@@ -591,7 +644,7 @@ def _record_deadline(
     status page is what makes the next collective on this communicator fail
     loudly instead of returning garbage.
     """
-    var region = regions[rank]
+    var region = regions[rank].unsafe_offset(arena_off)
     var phase = Int(target % UInt64(PHASES_PER_GEN))
     # `error_offset()` is 0: the error word is the first word of the region.
     if not latch_arena_error(region.unsafe_bitcast[UInt64](), code, phase):
@@ -617,6 +670,7 @@ def _sync(
     target: UInt64,
     t0: UInt64,
     timeout_ns: UInt64,
+    arena_off: Int = 0,
 ) -> Bool:
     """Block-scoped barrier across the same block index on every rank.
 
@@ -690,10 +744,14 @@ def _sync(
         # pay for it. See docs/mojo_collectives_kernel_results.md section 7
         # for the experiment that would settle it.
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-            _flags(regions[peer]).unsafe_offset(bid * MAX_WORLD + rank),
+            _flags(regions[peer].unsafe_offset(arena_off)).unsafe_offset(
+                bid * MAX_WORLD + rank
+            ),
             target,
         )
-        var mine = _flags(regions[rank]).unsafe_offset(bid * MAX_WORLD + peer)
+        var mine = _flags(regions[rank].unsafe_offset(arena_off)).unsafe_offset(
+            bid * MAX_WORLD + peer
+        )
         var spins = 0
         while (
             Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mine) < target
@@ -701,7 +759,7 @@ def _sync(
             spins += 1
             if spins >= _SPIN_CHECK:
                 spins = 0
-                if _abort_raised(regions[rank]):
+                if _abort_raised(regions[rank].unsafe_offset(arena_off)):
                     # Abort is a request, not a failure: record it in the
                     # arena word the way this file always has, but do not
                     # latch a fault. `ncclCommAbort` already told the host
@@ -709,7 +767,9 @@ def _sync(
                     # answering NCCL_INVALID_USAGE rather than start
                     # answering NCCL_REMOTE_ERROR.
                     _ = latch_arena_error(
-                        regions[rank].unsafe_bitcast[UInt64](),
+                        regions[rank]
+                        .unsafe_offset(arena_off)
+                        .unsafe_bitcast[UInt64](),
                         code,
                         Int(target % UInt64(PHASES_PER_GEN)),
                     )
@@ -726,9 +786,147 @@ def _sync(
                         Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
                             mine
                         ),
+                        arena_off,
                     )
                     failed[unsafe_offset=0] = 1
                     break
+    barrier()
+    return failed[unsafe_offset=0] == 0
+
+
+@always_inline
+def grid_barrier(
+    region: Pointer[UInt8, MutAnyOrigin],
+    poison: Pointer[UInt64, MutAnyOrigin],
+    nblocks: Int,
+    code: Int,
+    t0: UInt64,
+    timeout_ns: UInt64,
+) -> Bool:
+    """Rendezvous of every block of ONE grid on ONE GPU; True if it completed.
+
+    What a kernel boundary used to provide. The split inter-node schedule got
+    "every block of this rank has finished phase P" from launching P+1 as a
+    separate kernel; the fused kernel (internode_fused.mojo) runs the whole
+    pipeline in one launch and has to say it itself -- before it hands a shard
+    to the NIC, before it reads what the NIC delivered, and at the end of each
+    chunk, where it restores exactly the invariant the launch boundary had.
+
+    THE CALLER MUST GUARANTEE THAT EVERY BLOCK IS RESIDENT. Blocks that have
+    arrived spin, so a grid larger than the device can hold at once deadlocks:
+    the launcher sizes the grid at one block per SM/CU for that reason.
+
+    Sense reversal, not a target count: the last block to arrive resets the
+    counter and bumps a release word every other block is waiting to see
+    change. Nothing is carried across launches and nothing has to agree with
+    the host, which a "wait for arrival number N" barrier would need -- and
+    would hang on for ever if the host's arithmetic and the kernel's loop ever
+    disagreed by one.
+
+    `poison` is how a block that has already given up -- in a spin of its own,
+    or on a peer that stopped answering -- releases the blocks waiting here
+    instead of leaving each of them to burn its own full deadline. It is a
+    device word, read only from the slow path of the spin.
+
+    Ordering: each block's arrival is a release RMW after its payload writes,
+    the last arriver's RMW acquires the release sequence of all of them, and
+    its release store of the sense word is what the waiters acquire. So a
+    block that leaves this barrier sees every write every block made before
+    entering it -- including, for block 0, the shard the NIC is about to read.
+    """
+    var failed = stack_allocation[
+        1, DType.uint32, address_space=AddressSpace.SHARED
+    ]()
+    if thread_idx.x == 0:
+        failed[unsafe_offset=0] = 0
+    comptime if _AMD:
+        # Same reason as `_sync`: gfx942's `s_barrier` does not wait on
+        # outstanding vector stores, so the block's payload writes need an
+        # explicit release before one thread announces them.
+        fence[ordering=Ordering.RELEASE]()
+    barrier()
+
+    if thread_idx.x == 0:
+        var arrive = region.unsafe_offset(
+            _GRIDBAR_ARRIVE_OFFSET
+        ).unsafe_bitcast[UInt64]()
+        var release = region.unsafe_offset(
+            _GRIDBAR_RELEASE_OFFSET
+        ).unsafe_bitcast[UInt64]()
+        var seen = Atomic[DType.uint64].load[ordering=Ordering.RELAXED](release)
+        var was = Atomic[DType.uint64].fetch_add[
+            ordering=Ordering.ACQUIRE_RELEASE
+        ](arrive, UInt64(1))
+        if Int(was) == nblocks - 1:
+            # Last in. Reset the counter first: no block can arrive at the
+            # next barrier before it has seen the sense word below change,
+            # and the release store orders this plain one ahead of it.
+            Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
+                arrive, UInt64(0)
+            )
+            Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+                release, seen + 1
+            )
+        else:
+            var page = status_page(region)
+            var spins = 0
+            while (
+                Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](release)
+                == seen
+            ):
+                comptime if _AMD:
+                    # On gfx942 the acquire load above is a `buffer_inv sc0
+                    # sc1` -- an L1+L2 invalidate -- per iteration, and
+                    # nblocks-1 threads spin here for a whole network round
+                    # trip (internode_kernels.mojo has the measurement for
+                    # one such thread). Sleep between polls; the ordering
+                    # stays as it is.
+                    llvm_intrinsic[
+                        "llvm.amdgcn.s.sleep", NoneType, has_side_effect=True
+                    ](Int32(2))
+                spins += 1
+                if spins >= _SPIN_CHECK:
+                    spins = 0
+                    if (
+                        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+                            poison
+                        )
+                        != 0
+                    ):
+                        failed[unsafe_offset=0] = 1
+                        break
+                    if abort_raised(page):
+                        _ = latch_arena_error(
+                            region.unsafe_bitcast[UInt64](), code, 0
+                        )
+                        failed[unsafe_offset=0] = 1
+                        break
+                    if device_now_ns() - t0 > timeout_ns:
+                        if latch_arena_error(
+                            region.unsafe_bitcast[UInt64](), code, 0
+                        ):
+                            publish_fault(
+                                page,
+                                code,
+                                0,
+                                Int(block_idx.x),
+                                FAULT_NO_PEER,
+                                seen,
+                                seen + 1,
+                                Int(region),
+                            )
+                        failed[unsafe_offset=0] = 1
+                        break
+        # Read once, by one thread, for the whole block: a block that has
+        # been released may still be one another block just poisoned, and
+        # the answer has to be the same for every thread of this CTA or part
+        # of it would leave while the rest reaches the next `barrier()`.
+        if (
+            failed[unsafe_offset=0] == 0
+            and Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](poison)
+            != 0
+        ):
+            failed[unsafe_offset=0] = 1
     barrier()
     return failed[unsafe_offset=0] == 0
 
@@ -1463,46 +1661,54 @@ def _ar_oneshot_kernel[
 # 0 and 1, `allgather_finish` phase 0.
 
 
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
-)
-@__name(t"ccl_reduce_scatter_stage_{dtype}_w{NW}")
-def _rs_stage_kernel[
+@always_inline
+def _rs_stage_body[
     dtype: DType, W: Int, U: Int, NW: Int
 ](
     regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    arena_off: Int,
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
-    numel: Int64,
-    per_e: Int64,
-    slot_stride_b: Int64,
-    push_off_b: Int64,
-    out_off_b: Int64,
-    world_i: Int32,
-    rank_i: Int32,
+    n: Int,
+    per: Int,
+    slot_stride: Int,
+    push_off: Int,
+    out_off: Int,
+    world: Int,
+    rank: Int,
+    tid: Int,
+    stride: Int,
     flag_base: UInt64,
     scale: Float32,
+    t0: UInt64,
     timeout_ns: UInt64,
-):
+) -> Bool:
+    """The reduce-scatter half, as a body two kernels share.
+
+    `_rs_stage_kernel` is one launch of it; the pipelined inter-node kernel
+    (internode_fused.mojo) runs it once per chunk with `arena_off` naming the
+    arena and `tid`/`stride` the caller's grid-stride slice. Everything the
+    launcher used to compute from `Int64` arguments arrives here as `Int`.
+
+    False means a barrier gave up (deadline or abort); it has already
+    recorded why, and the caller must return without touching the arena.
+    """
     comptime accum = DType.float32 if (
         dtype == DType.bfloat16 or dtype == DType.float16
     ) else dtype
     comptime esize = size_of[dtype]()
-    var t0 = device_now_ns()
-    var world = NW if NW > 0 else Int(world_i)
-    var rank = Int(rank_i)
-    var tid = Int(global_idx.x)
-    var stride = Int(grid_dim.x) * BLOCK
-    var n = Int(numel)
-    var per = Int(per_e)
-    var slot_stride = Int(slot_stride_b)
-    var push_off = Int(push_off_b)
-    var out_off = Int(out_off_b)
 
     # --- phase 0: start barrier (the arena-reuse invariant) -----------------
     if not _sync(
-        regions, world, rank, ERR_RS_STAGE_SYNC, flag_base, t0, timeout_ns
+        regions,
+        world,
+        rank,
+        ERR_RS_STAGE_SYNC,
+        flag_base,
+        t0,
+        timeout_ns,
+        arena_off,
     ):
-        return
+        return False
 
     # --- phase 1: push shard s of my input into peer s's slot for me --------
     for i in range(1, world):
@@ -1516,7 +1722,9 @@ def _rs_stage_kernel[
         var dst = (
             regions[s]
             .unsafe_offset(
-                push_off + slot_stride * (rank if rank < s else rank - 1)
+                arena_off
+                + push_off
+                + slot_stride * (rank if rank < s else rank - 1)
             )
             .unsafe_bitcast[Scalar[dtype]]()
         )
@@ -1525,9 +1733,16 @@ def _rs_stage_kernel[
         )
 
     if not _sync(
-        regions, world, rank, ERR_RS_STAGE_SYNC, flag_base + 1, t0, timeout_ns
+        regions,
+        world,
+        rank,
+        ERR_RS_STAGE_SYNC,
+        flag_base + 1,
+        t0,
+        timeout_ns,
+        arena_off,
     ):
-        return
+        return False
 
     # --- phase 2: sum the `world` contributions to my shard into stage_out --
     # Times `scale`, applied in the fp32 accumulator BEFORE the store narrows
@@ -1539,17 +1754,17 @@ def _rs_stage_kernel[
     var my_off = _shard_off(n, per, rank)
     var my_cnt = _shard_cnt(n, per, rank)
     if my_cnt <= 0:
-        return
+        return True
     var uin = in_ptr.unsafe_offset(my_off)
     var shard = (
         regions[rank]
-        .unsafe_offset(out_off + my_off * esize)
+        .unsafe_offset(arena_off + out_off + my_off * esize)
         .unsafe_bitcast[Scalar[dtype]]()
     )
     # Slot pointers are formed arithmetically, never held in a stack array:
     # such an array is demoted to local memory (MOCO-1431) and every payload
     # load becomes a generic-address `ld.v4.b32` plus an `ld.local.b64`.
-    var slots = regions[rank].unsafe_offset(push_off)
+    var slots = regions[rank].unsafe_offset(arena_off + push_off)
     var my_vc = my_cnt // W
 
     for v in range(tid, my_vc, stride):
@@ -1599,6 +1814,107 @@ def _rs_stage_kernel[
         comptime if accum.is_floating_point():
             a *= scale.cast[accum]()
         shard[unsafe_offset=k] = a.cast[dtype]()
+    return True
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name(t"ccl_reduce_scatter_stage_{dtype}_w{NW}")
+def _rs_stage_kernel[
+    dtype: DType, W: Int, U: Int, NW: Int
+](
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    numel: Int64,
+    per_e: Int64,
+    slot_stride_b: Int64,
+    push_off_b: Int64,
+    out_off_b: Int64,
+    world_i: Int32,
+    rank_i: Int32,
+    flag_base: UInt64,
+    scale: Float32,
+    timeout_ns: UInt64,
+):
+    _ = _rs_stage_body[dtype, W, U, NW](
+        regions,
+        0,
+        in_ptr,
+        Int(numel),
+        Int(per_e),
+        Int(slot_stride_b),
+        Int(push_off_b),
+        Int(out_off_b),
+        NW if NW > 0 else Int(world_i),
+        Int(rank_i),
+        Int(global_idx.x),
+        Int(grid_dim.x) * BLOCK,
+        flag_base,
+        scale,
+        device_now_ns(),
+        timeout_ns,
+    )
+
+
+@always_inline
+def _ag_finish_body[
+    dtype: DType, W: Int, U: Int
+](
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    arena_off: Int,
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    n: Int,
+    per: Int,
+    out_off: Int,
+    world: Int,
+    rank: Int,
+    tid: Int,
+    stride: Int,
+    flag_base: UInt64,
+    scale: Float32,
+    t0: UInt64,
+    timeout_ns: UInt64,
+) -> Bool:
+    """The all-gather half, as a body two kernels share (see
+    `_rs_stage_body`)."""
+    comptime esize = size_of[dtype]()
+
+    # Start barrier. Doubles as the wait for every peer's inter-node step: a
+    # peer publishes this flag from inside this kernel, which its stream runs
+    # after that step.
+    if not _sync(
+        regions,
+        world,
+        rank,
+        ERR_AG_FINISH_SYNC,
+        flag_base,
+        t0,
+        timeout_ns,
+        arena_off,
+    ):
+        return False
+
+    # My own shard is pulled out of my own stage_out like everyone else's: the
+    # inter-node step rewrote it, so the reduce-scatter's result in the user
+    # buffer would be stale even if it had been written there.
+    for i in range(world):
+        var p = rank + _peer_step0(i, world)
+        if p >= world:
+            p -= world
+        var off = _shard_off(n, per, p)
+        var cnt = _shard_cnt(n, per, p)
+        if cnt <= 0:
+            continue
+        var src = (
+            regions[p]
+            .unsafe_offset(arena_off + out_off + off * esize)
+            .unsafe_bitcast[Scalar[dtype]]()
+        )
+        _copy_span_scaled[dtype, W, U](
+            out_ptr.unsafe_offset(off), src, cnt, tid, stride, scale
+        )
+    return True
 
 
 @__llvm_metadata(
@@ -1619,43 +1935,22 @@ def _ag_finish_kernel[
     scale: Float32,
     timeout_ns: UInt64,
 ):
-    comptime esize = size_of[dtype]()
-    var t0 = device_now_ns()
-    var world = NW if NW > 0 else Int(world_i)
-    var rank = Int(rank_i)
-    var tid = Int(global_idx.x)
-    var stride = Int(grid_dim.x) * BLOCK
-    var n = Int(numel)
-    var per = Int(per_e)
-    var out_off = Int(out_off_b)
-
-    # Start barrier. Doubles as the wait for every peer's inter-node step: a
-    # peer publishes this flag from inside this kernel, which its stream runs
-    # after that step.
-    if not _sync(
-        regions, world, rank, ERR_AG_FINISH_SYNC, flag_base, t0, timeout_ns
-    ):
-        return
-
-    # My own shard is pulled out of my own stage_out like everyone else's: the
-    # inter-node step rewrote it, so the reduce-scatter's result in the user
-    # buffer would be stale even if it had been written there.
-    for i in range(world):
-        var p = rank + _peer_step0(i, world)
-        if p >= world:
-            p -= world
-        var off = _shard_off(n, per, p)
-        var cnt = _shard_cnt(n, per, p)
-        if cnt <= 0:
-            continue
-        var src = (
-            regions[p]
-            .unsafe_offset(out_off + off * esize)
-            .unsafe_bitcast[Scalar[dtype]]()
-        )
-        _copy_span_scaled[dtype, W, U](
-            out_ptr.unsafe_offset(off), src, cnt, tid, stride, scale
-        )
+    _ = _ag_finish_body[dtype, W, U](
+        regions,
+        0,
+        out_ptr,
+        Int(numel),
+        Int(per_e),
+        Int(out_off_b),
+        NW if NW > 0 else Int(world_i),
+        Int(rank_i),
+        Int(global_idx.x),
+        Int(grid_dim.x) * BLOCK,
+        flag_base,
+        scale,
+        device_now_ns(),
+        timeout_ns,
+    )
 
 
 # ===-------------------------------------------------------------------=== #
@@ -1963,6 +2258,52 @@ def _store_u64_kernel(dst: Pointer[UInt64, MutAnyOrigin], value: UInt64):
 
 
 @always_inline
+def _cached_function[
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(* args: * declared_arg_types) thin -> None,
+](ctx: DeviceContext, key: String) raises -> Pointer[
+    type_of(ctx.compile_function[func]()), MutUntrackedOrigin
+]:
+    """Compile `func` at most once per process and context (same caching
+    pattern as the repo's eager kernels)."""
+    var name = String(t"CCL_KERNEL_{key}_{ctx.id()}")
+    comptime FuncT = type_of(ctx.compile_function[func]())
+    var global_ptr = _get_global_or_null(name)
+    if global_ptr:
+        return global_ptr.value().unsafe_bitcast[FuncT]()
+    var compiled = ctx.compile_function[func]()
+    var fptr = unsafe_alloc[FuncT](1)
+    fptr.unsafe_write(compiled^)
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), fptr.unsafe_bitcast[NoneType]()
+    )
+    return fptr
+
+
+def _cached_occupancy[
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(* args: * declared_arg_types) thin -> None,
+](ctx: DeviceContext, key: String, threads: Int) raises -> Int:
+    """The driver's occupancy answer for `func` at `threads` per block --
+    blocks per multiprocessor that can be active at once -- which is what a
+    kernel whose blocks wait for each other has to size its grid by
+    (`internode_fused.mojo`). Asked once per (kernel, context)."""
+    var name = String(t"CCL_OCC_{key}_{ctx.id()}")
+    var global_ptr = _get_global_or_null(name)
+    if global_ptr:
+        return global_ptr.value().unsafe_bitcast[Int]()[]
+    var f = _cached_function[func](ctx, key)
+    var occ = f[].occupancy_max_active_blocks_per_multiprocessor(threads, 0)
+    var p = unsafe_alloc[Int](1)
+    p.unsafe_write(occ)
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), p.unsafe_bitcast[NoneType]()
+    )
+    return occ
+
+
 def _enqueue_cached[
     declared_arg_types: TypeList[Trait=AnyType, ...],
     //,
@@ -1975,30 +2316,55 @@ def _enqueue_cached[
     blocks: Int,
     *args: *Ts,
 ) raises:
-    """Enqueue `func` on `stream`, compiling it at most once per process and
-    context. `ctx` is only the compilation/caching handle -- the launch always
-    goes to the stream the caller handed us, which in production is a foreign
-    `cudaStream_t` wrapped by `DeviceContext.create_external_stream`. Same
-    caching pattern as the repo's eager kernels."""
-    var name = String(t"CCL_KERNEL_{key}_{ctx.id()}")
-    comptime FuncT = type_of(ctx.compile_function[func]())
+    """`_enqueue_cached_dim` at this file's `BLOCK` threads per block."""
+    _enqueue_cached_dim[func](ctx, stream, key, blocks, BLOCK, False, *args)
 
-    var global_ptr = _get_global_or_null(name)
-    if global_ptr:
-        var fptr = global_ptr.value().unsafe_bitcast[FuncT]()
-        stream.enqueue_function(
-            fptr[], *args, grid_dim=(blocks,), block_dim=(BLOCK,)
-        )
-        return
 
-    var compiled = ctx.compile_function[func]()
-    var fptr = unsafe_alloc[FuncT](1)
-    fptr.unsafe_write(compiled^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), fptr.unsafe_bitcast[NoneType]()
-    )
+def _enqueue_cached_dim[
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(* args: * declared_arg_types) thin -> None,
+    *Ts: DevicePassable,
+](
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    key: String,
+    blocks: Int,
+    threads: Int,
+    cooperative: Bool,
+    *args: *Ts,
+) raises:
+    """Enqueue `func` on `stream`. `ctx` is only the compilation/caching
+    handle -- the launch always goes to the stream the caller handed us, which
+    in production is a foreign `cudaStream_t` wrapped by
+    `DeviceContext.create_external_stream`. `threads` must not exceed the
+    kernel's MAX_THREADS_PER_BLOCK_METADATA.
+
+    `cooperative` asks the driver for a co-resident grid (CUDA's
+    `CU_LAUNCH_ATTRIBUTE_COOPERATIVE`, where the device supports it): the
+    launch is refused outright, instead of deadlocking at the first grid
+    barrier, when the grid cannot be resident at once. MAX's launch
+    attributes are CUDA-only, so on AMD the occupancy bound the caller
+    applied is the whole guarantee."""
+    var f = _cached_function[func](ctx, key)
+    var attrs = List[LaunchAttribute]()
+    comptime if not _AMD:
+        if (
+            cooperative
+            and ctx.get_attribute(DeviceAttribute.COOPERATIVE_LAUNCH) != 0
+        ):
+            attrs.append(
+                LaunchAttribute(
+                    id=LaunchAttributeID.COOPERATIVE,
+                    value=LaunchAttributeValue(True),
+                )
+            )
     stream.enqueue_function(
-        fptr[], *args, grid_dim=(blocks,), block_dim=(BLOCK,)
+        f[],
+        *args,
+        grid_dim=(blocks,),
+        block_dim=(threads,),
+        attributes=attrs^,
     )
 
 

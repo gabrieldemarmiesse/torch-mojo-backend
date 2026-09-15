@@ -22,6 +22,15 @@ Design, motivated by ncu on the nanogpt dgrad shapes (m=32768, short k):
     inflated L2 write traffic ~3x through partial-sector stores.
   - A 192x192 / 3-consumer tile (nvjet's pick) was also implemented and
     benched; 128x256 with 2 consumers won on every nanogpt dgrad shape.
+  - Output tiles are assigned DYNAMICALLY, from a global ticket counter
+    (gemm16_sched_pool.mojo), not by the static `w = cluster_id;
+    w += num_clusters` walk this body used to do.  A persistent grid that
+    owns its tiles up front cannot rebalance when another kernel -- NCCL on
+    a DDP job's comm stream -- holds some of the SMs, and loses far more
+    than the SMs it lost; a ticket counter hands the tiles of a cluster that
+    never launched to the clusters that did.  The `@__name` is deliberately
+    unchanged (the algorithm a profile names is the same one); the kernel
+    ABI gained the `sched` counter pointer.
 
 Dynamic shapes: any problem in the tall-m NN regime with n % 64 == 0 and
 k % BK == 0 is handled (m may be ragged: TMA clamps loads and clips
@@ -63,12 +72,8 @@ from max.gpu.memory import (
 )
 from std.memory import AddressSpace
 from max.gpu.sync import named_barrier
-from max.gpu.primitives import (
-    block_rank_in_cluster,
-    cluster_sync,
-    cluster_sync_relaxed,
-)
-from std.memory import stack_allocation
+from max.gpu.primitives import block_rank_in_cluster, cluster_sync
+from std.memory import bitcast, stack_allocation
 from std.sys import size_of
 from std.sys.info import _has_sm_9x, _is_sm_9x
 from std.utils.index import Index, IndexList
@@ -89,6 +94,23 @@ from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from gemm16_kernels import _pick_regime
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+
+from op_utils import _enqueue_cached
+
+from gemm16_sched_pool import (
+    SCHED_PTR,
+    SCHED_RING,
+    sched_advance,
+    sched_fetch_add,
+    sched_finish,
+    sched_init_ring,
+    sched_poll_local,
+    sched_publish_first,
+    sched_publish_round,
+    sched_read_local,
+    sched_slot_ptr,
+    sched_supported,
+)
 
 comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
@@ -269,6 +291,72 @@ def _v4_mma_tile[
     wgmma_wait_group_sync()
 
 
+# Bias-fused accumulator pack shared by every NT+bias epilogue (the 128-row
+# persistent kernel in gemm16_nt_bias_kernels.mojo and the 192-row rolling
+# one in gemm16_rolling_kernels.mojo): for st.matrix instruction t, matrix
+# j holds fragment pair q = 4t + j (row half j % 2, column block 2t + j //
+# 2), so four bias scalars serve the whole instruction. Bias loads need
+# only bf16 alignment and are individually clipped -- TMA clips the C
+# store, but not these. NT-specific: the column map assumes bias varies
+# along the tile's N axis the way kmaj_b's B operand does (see
+# _v4_mma_tile); do not reuse for a TN/TT epilogue without re-deriving it.
+@always_inline
+def _v4_bias_epilogue_quad[
+    bn: Int
+](
+    accum: LayoutTensor[
+        _V4_F32,
+        Layout.row_major(1, 64 * bn // 128),
+        MutAnyOrigin,
+        address_space=AddressSpace.LOCAL,
+    ],
+    t: Int,
+    lane: Int,
+    bias: _V4_PTR,
+    n0: Int,
+    n: Int,
+) -> SIMD[DType.float32, 4]:
+    var bias_col = n0 + 16 * t + (lane % 4) * 2
+    var bias0 = Float32(0)
+    var bias1 = Float32(0)
+    var bias8 = Float32(0)
+    var bias9 = Float32(0)
+    if bias_col < n:
+        bias0 = bias[unsafe_offset=bias_col].cast[DType.float32]()
+    if bias_col + 1 < n:
+        bias1 = bias[unsafe_offset=bias_col + 1].cast[DType.float32]()
+    if bias_col + 8 < n:
+        bias8 = bias[unsafe_offset=bias_col + 8].cast[DType.float32]()
+    if bias_col + 9 < n:
+        bias9 = bias[unsafe_offset=bias_col + 9].cast[DType.float32]()
+    return SIMD[DType.float32, 4](
+        bitcast[DType.float32, 1](
+            SIMD[_V4_DT, 2](
+                (accum.ptr[unsafe_offset=8 * t] + bias0).cast[_V4_DT](),
+                (accum.ptr[unsafe_offset=8 * t + 1] + bias1).cast[_V4_DT](),
+            )
+        ),
+        bitcast[DType.float32, 1](
+            SIMD[_V4_DT, 2](
+                (accum.ptr[unsafe_offset=8 * t + 2] + bias0).cast[_V4_DT](),
+                (accum.ptr[unsafe_offset=8 * t + 3] + bias1).cast[_V4_DT](),
+            )
+        ),
+        bitcast[DType.float32, 1](
+            SIMD[_V4_DT, 2](
+                (accum.ptr[unsafe_offset=8 * t + 4] + bias8).cast[_V4_DT](),
+                (accum.ptr[unsafe_offset=8 * t + 5] + bias9).cast[_V4_DT](),
+            )
+        ),
+        bitcast[DType.float32, 1](
+            SIMD[_V4_DT, 2](
+                (accum.ptr[unsafe_offset=8 * t + 6] + bias8).cast[_V4_DT](),
+                (accum.ptr[unsafe_offset=8 * t + 7] + bias9).cast[_V4_DT](),
+            )
+        ),
+    )
+
+
 # Kernel-symbol layout tag for the persistent body: col_a selects the TN
 # (wgrad) instantiation, col_a + kmaj_b the TT one, plain NN (dgrad)
 # otherwise.  (kmaj_b alone would be NT, which has its own dedicated
@@ -312,7 +400,9 @@ def _v4_persistent_ragged_tag[ragged_n: Bool]() -> StaticString:
 # GPU profiles could not tell them apart and scripts/compare_kernel_asm.py --
 # which pairs kernels by hash-stripped name -- would collide them.  The
 # ragged tag does the same for the n-clip TT instantiation while keeping
-# every exact-n symbol byte-identical to its pre-existing name.
+# every exact-n symbol byte-identical to its pre-existing name -- as does the
+# dynamic tile scheduler, which changed this kernel's work loop but not the
+# algorithm the name describes.
 @__name(
     t"{_GEMM16_TAG}_gemm_{_v4_persistent_layout_tag[col_a, kmaj_b]()}_v4_persistent{_v4_persistent_ragged_tag[ragged_n]()}"
 )
@@ -358,6 +448,7 @@ def _v4_nn_persistent_ws[
     b_tma: TMATensorTile[_V4_DT, 2, b_tile_shape, b_desc_shape],
     c_tma: TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)],
     output: _V4_PTR,
+    sched: SCHED_PTR,
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -419,7 +510,28 @@ def _v4_nn_persistent_ws[
             address_space=AddressSpace.SHARED,
             alignment=8,
         ]()
+        # Published work tickets; see gemm16_sched_pool.mojo for the ring
+        # depth argument this assert encodes.
+        comptime assert (
+            SCHED_RING >= stages + 4
+        ), "work-ticket ring too shallow for this pipeline depth"
+        var work_ring = stack_allocation[
+            SCHED_RING,
+            Scalar[DType.uint32],
+            address_space=AddressSpace.SHARED,
+            alignment=16,
+        ]()
+        # Round 0's ticket is fetched HERE, before the barrier inits, the TMA
+        # descriptor prefetches and the cluster barrier: every cluster's rank
+        # 0 hits the same counter word at the same instant, and same-address
+        # L2 atomics serialise.  Issuing it first lets that queue drain behind
+        # the prologue instead of standing between kernel entry and the first
+        # TMA.
+        var ticket0 = UInt32(0)
         if thread_idx.x == 0:
+            if Int(block_rank_in_cluster()) == 0:
+                ticket0 = UInt32(sched_fetch_add(sched, 1))
+            sched_init_ring(work_ring)
             comptime for stage in range(stages):
                 full_barriers[unsafe_offset=stage].init()
                 # Released by every consumer warp group of every CTA in the
@@ -434,8 +546,16 @@ def _v4_nn_persistent_ws[
                 c_tma.prefetch_descriptor()
             fence_mbarrier_init()
         # All barriers must be initialized cluster-wide before any arrival
-        # (the consumers below arrive at peer CTAs' empty barriers).
-        cluster_sync_relaxed()
+        # (the consumers below arrive at peer CTAs' empty barriers), and the
+        # zeroed ticket ring must be VISIBLE to the peer before it can poll
+        # it.  `cluster_sync_relaxed` orders neither -- it is an arrive/wait
+        # with no memory ordering -- and `fence_mbarrier_init` covers only
+        # the mbarrier state, so a peer could read whatever was in that
+        # shared word before the kernel started; one arbitrary word in 1024
+        # carries round 0's tag and would be accepted as a published ticket
+        # (wrong macro-row, or a hang).  `cluster_sync` is the same barrier
+        # with the fence, once per launch (a Codex review finding).
+        cluster_sync()
 
         comptime CFRAG = 64 * bn // 128
         comptime MACRO_BM = bm * cluster_m
@@ -445,7 +565,8 @@ def _v4_nn_persistent_ws[
         var warp_group_idx = Int(thread_idx.x) // 128
         var warp_group_thread_idx = Int(thread_idx.x) % 128
         var rank = Int(block_rank_in_cluster())
-        var cluster_id = Int(block_idx.x) // cluster_m
+        # No cluster id: the work index is a ticket from the global counter,
+        # not `cluster_id + j * num_clusters` (gemm16_sched_pool.mojo).
         var num_clusters = Int(grid_dim.x) // cluster_m
         # m may be ragged: TMA A reads clamp out-of-bounds rows and the
         # epilogue stores are row-predicated.  With ragged_n, n may be too
@@ -466,11 +587,24 @@ def _v4_nn_persistent_ws[
                 )
 
         if warp_group_idx == 0:
-            warpgroup_reg_dealloc[24]()
+            # 32, not 24: the scheduler adds live state to this warp
+            # group and 24 spills it to local memory (ptxas -v: 32 bytes of
+            # spill stores at 24, zero at 32).  32 still fits the SM's 65536
+            # registers beside three consumer warp groups at 160
+            # (3 * 128 * 160 + 128 * 32 = 65536 exactly) and two at 232.
+            # Measured worth up to 6% under contention (tn_c_attn at a 16-SM
+            # hog: 252.9 -> 239.1 us).
+            warpgroup_reg_dealloc[32]()
             if warp_group_thread_idx == 0:
                 var gt = 0
-                var w = cluster_id
+                var rm = UInt32(0)
+                sched_publish_first(work_ring, rank, rm, ticket0)
+                var w = sched_read_local(work_ring, rm)
                 while w < total_works:
+                    # Round j+1 is published before round j is issued, so the
+                    # peer rank's DSMEM poll is already satisfied.
+                    var rm_next = sched_advance(rm)
+                    sched_publish_round(sched, work_ring, rank, rm_next)
                     var group = w // group_span
                     var rem = w % group_span
                     var rows_in_group = min(
@@ -564,7 +698,13 @@ def _v4_nn_persistent_ws[
                             cc += 1
                         t += 1
                         gt += 1
-                    w += num_clusters
+                    rm = rm_next
+                    w = sched_read_local(work_ring, rm)
+                if rank == 0:
+                    # `w` is this cluster's past-the-end ticket; see
+                    # gemm16_sched_pool.mojo for why the highest one resets
+                    # the counter.
+                    sched_finish(sched, w, total_works, num_clusters)
         else:
             # Consumer registers: three warp groups fit 65536 regs/SM only
             # at 160 regs/thread (96 accumulator + addressing); two fit 232.
@@ -589,7 +729,8 @@ def _v4_nn_persistent_ws[
             ]()
 
             var gt = 0
-            var w = cluster_id
+            var rm = UInt32(0)
+            var w = sched_poll_local(work_ring, rm)
             while w < total_works:
                 var group = w // group_span
                 var rem = w % group_span
@@ -706,7 +847,8 @@ def _v4_nn_persistent_ws[
                             output.unsafe_store[alignment=4](
                                 (m0 + row) * n + n0 + col, pair
                             )
-                w += num_clusters
+                rm = sched_advance(rm)
+                w = sched_poll_local(work_ring, rm)
             comptime if tma_store:
                 # Outstanding bulk stores must complete before kernel exit.
                 if warp_group_idx == 1 and warp_group_thread_idx == 0:
@@ -736,7 +878,30 @@ def _v4_enqueue_nn_persistent[
     k: Int,
     sm_count: Int,
     ctx: DeviceContext,
-) raises:
+) raises -> Bool:
+    """Launch the v4 persistent clustered kernel, or decline.
+
+    Returns False WITHOUT launching -- and without building a single TMA
+    descriptor -- when the dynamic tile scheduler cannot serve the shape: a
+    work census past the ring word's 22-bit payload, or a counter table with
+    no free entry (see gemm16_sched_pool.mojo).  Every caller treats that as
+    "this rung declines" and falls through to the next one.
+    """
+    # The work census decides both the grid and whether the scheduler can
+    # serve the shape at all, so it is computed before anything is allocated.
+    var macro_rows = (m + bm * cluster_m - 1) // (bm * cluster_m)
+    var blocks_n = n // bn
+    comptime if ragged_n:
+        blocks_n = (n + bn - 1) // bn
+    var total_works = macro_rows * blocks_n
+    if not sched_supported(total_works):
+        return False
+    # One ticket counter per (device, stream); allocated once and self-reset
+    # by the kernel, so nothing is allocated or memset per launch.
+    var slot = sched_slot_ptr(ctx)
+    if not slot:
+        return False
+    var sched = slot.value()
     # Each descriptor follows its operand's physical layout: (M, K) row-major
     # with a whole-tile box, or -- for the TN/wgrad and TT col_a routes --
     # (K, M) row-major with a (BK, 64) box feeding the MN-major shared tile;
@@ -785,15 +950,21 @@ def _v4_enqueue_nn_persistent[
     var a_tma = TMATensorTile[_V4_DT, 2, A_TILE, A_DESC](a_desc)
     var b_tma = TMATensorTile[_V4_DT, 2, B_TILE, B_TILE](b_desc)
     var c_tma = TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)](c_desc)
-    var macro_rows = (m + bm * cluster_m - 1) // (bm * cluster_m)
-    var blocks_n = n // bn
-    comptime if ragged_n:
-        blocks_n = (n + bn - 1) // bn
-    var total_works = macro_rows * blocks_n
     var num_clusters = min(sm_count // cluster_m, total_works)
     var grid_x = num_clusters * cluster_m
     comptime DYN_SMEM = _v4_persistent_smem_bytes[stages, bm, bn, tma_store]()
-    ctx.enqueue_function[
+    # Compiled once per process and context: `ctx.enqueue_function[kernel]`
+    # re-runs compile_function on EVERY launch (~180 us of host time even
+    # when the runtime's module cache hits), and a DDP step issues 48 of
+    # these.  The key names what selects the code -- dtype, geometry, stages,
+    # layout, epilogue -- and nothing about this call's pointers or its
+    # m/n/k, which travel as arguments.  The trailing `2` is the ABI version:
+    # the registry is keyed by string, so a key unchanged across a signature
+    # change would bitcast a stale DeviceFunction compiled for the old ABI,
+    # and this kernel gained the `sched` counter pointer.  The cluster shape
+    # rides on the kernel's own `nvvm.cluster_dim` metadata, as it did when
+    # this call was a bare `enqueue_function`.
+    _enqueue_cached[
         _v4_nn_persistent_ws[
             stages,
             cluster_m,
@@ -804,20 +975,27 @@ def _v4_enqueue_nn_persistent[
             col_a,
             kmaj_b,
             ragged_n,
-        ]
+        ],
+        dyn_smem=DYN_SMEM,
     ](
+        ctx,
+        String(
+            t"g16v4p2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_{Int(tma_store)}{Int(col_a)}{Int(kmaj_b)}{Int(ragged_n)}"
+        ),
+        grid_x,
+        1,
+        1,
+        128 * (consumers + 1),
         a_tma,
         b_tma,
         c_tma,
         output,
+        sched,
         Int64(m),
         Int64(n),
         Int64(k),
-        grid_dim=(grid_x,),
-        block_dim=(128 * (consumers + 1),),
-        shared_mem_bytes=DYN_SMEM,
-        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
+    return True
 
 
 def maybe_enqueue_gemm16_nn_v4(
@@ -963,8 +1141,11 @@ def maybe_enqueue_gemm16_nn_v4(
                             < sm_count * 9
                         )
                     if sm_count >= _V4_PROD_CLUSTER_M and not small_route_wins:
+                        # A declined launch (the tile scheduler cannot
+                        # serve the census) returns False from here, which is
+                        # this function's "the caller must fall back".
                         if n % _V4_PROD_BN == 0:
-                            _v4_enqueue_nn_persistent[
+                            return _v4_enqueue_nn_persistent[
                                 _V4_PROD_STAGES,
                                 _V4_PROD_CLUSTER_M,
                                 _V4_PROD_BM,
@@ -972,19 +1153,17 @@ def maybe_enqueue_gemm16_nn_v4(
                                 _V4_PROD_CONSUMERS,
                                 _V4_PROD_TMA_STORE,
                             ](output, a, b, m, n, k, sm_count, ctx)
-                        else:
-                            _v4_enqueue_nn_persistent[
-                                _V4_PROD_STAGES,
-                                _V4_PROD_CLUSTER_M,
-                                _V4_PROD_BM,
-                                _V4_PROD_BN,
-                                _V4_PROD_CONSUMERS,
-                                _V4_PROD_TMA_STORE,
-                                False,
-                                False,
-                                True,
-                            ](output, a, b, m, n, k, sm_count, ctx)
-                        return True
+                        return _v4_enqueue_nn_persistent[
+                            _V4_PROD_STAGES,
+                            _V4_PROD_CLUSTER_M,
+                            _V4_PROD_BM,
+                            _V4_PROD_BN,
+                            _V4_PROD_CONSUMERS,
+                            _V4_PROD_TMA_STORE,
+                            False,
+                            False,
+                            True,
+                        ](output, a, b, m, n, k, sm_count, ctx)
     return False
 
 
@@ -999,35 +1178,44 @@ def maybe_enqueue_gemm16_tn_v4_persistent[
     k: Int,
     ctx: DeviceContext,
 ) raises -> Bool:
-    """Route a multi-wave TN (wgrad) GEMM -- or, with kmaj_b, a TT one --
-    to the persistent clustered v4 body in its col-major-A mode.
+    """Route a multi-wave TT GEMM to this file's OWN persistent clustered v4
+    body (_v4_nn_persistent_ws below) in its col-major-A, K-major-B mode --
+    distinct from gemm16_rolling_kernels.mojo's _rolling_persistent_body,
+    which the TN dispatcher's rolling-geometry route uses instead (see
+    below).
 
-    Called by the TN and TT dispatchers in gemm16_tn_v4_kernels.mojo
-    AFTER their split-K attempt (deep-K underfilled outputs stay on split-K)
-    and BEFORE the remaining one-CTA-per-tile routes.  By default it engages
-    only when the 128x256 tiling of the output is strictly multi-wave on the
-    current GPU: that is the regime where the one-CTA-per-tile kernels pay a
-    per-wave pipeline refill plus a serialized scalar epilogue, and where
-    this body's persistent scheduler, cluster B multicast and background
-    TMA-store epilogue were measured to win (H100 PCIe; same regime split as
-    the NN dispatcher above).  Single-wave TN shapes keep the pre-existing
-    narrow-tile / v3 routes, which beat the persistent body there.  The TT
+    Called by try_enqueue_gemm16_gemm_tt_v4 (gemm16_tn_v4_kernels.mojo)
+    AFTER its split-K attempt (deep-K underfilled outputs stay on split-K)
+    and BEFORE the remaining one-CTA-per-tile routes; kmaj_b=True there
+    selects the TT (col-major A, K-major B) instantiation.  By default it
+    engages only when the 128x256 tiling of the output is strictly
+    multi-wave on the current GPU: that is the regime where the
+    one-CTA-per-tile kernels pay a per-wave pipeline refill plus a
+    serialized scalar epilogue, and where this body's persistent scheduler,
+    cluster B multicast and background TMA-store epilogue were measured to
+    win (H100 PCIe; same regime split as the NN dispatcher above).  The TT
     dispatcher passes any_wave=True because it makes its own wave decision
     (its 128x64 small-tile kernel beats this body on every single-wave
     shape measured; see try_enqueue_gemm16_gemm_tt_v4), and ragged_n=True so
     n % 256 != 0 multi-wave shapes (n % 64 == 0, guaranteed by its gate)
     reach the body's n-clip instantiation instead of falling off to the far
-    slower one-CTA-per-tile grid.  The TN dispatcher calls twice: once with
-    the defaults (exact n, its pre-existing rung) and -- when n % 256 != 0
-    -- once more with ragged_n=True, so multi-wave half-tile-n wgrad shapes
-    (GPT-2's padded vocab 50304 has n % 256 == 128) stop falling through to
-    the one-CTA-per-tile v3 grid, which loses ~2x there.
+    slower one-CTA-per-tile grid.
+
+    The TN dispatcher used to call this same function (kmaj_b=False) twice,
+    once at defaults and once with ragged_n=True; it now uses a runtime
+    geometry dispatcher over three tunings of the OTHER family's shared
+    body instead (gemm16_tn_v4_kernels.mojo::_try_enqueue_tn_rolling_geom),
+    which also clips a ragged m via TMA -- something this function's own
+    body still cannot do reachably (see the precondition note below).
 
     Precondition: m % 128 == 0, k % 64 == 0, and n % 256 == 0 unless
-    ragged_n (then n % 64 == 0).  Both callers
-    (try_enqueue_gemm16_gemm_tn_v4 / _tt_v4) gate m % 128 == 0 before calling,
-    so the kernel body's ragged-m clip path (TMA read clamp + store clip) is
-    unreachable and untested on these routes.
+    ragged_n (then n % 64 == 0).  Its one remaining caller
+    (try_enqueue_gemm16_gemm_tt_v4) still gates m % 128 == 0 before calling,
+    so this body's own col_a ragged-m clip path (TMA read clamp + store
+    clip) stays unreachable and untested here -- unlike the OTHER family's
+    col_a clip path, which the TN rolling dispatcher now exercises in
+    production (measured job 250131, six shapes down to the ragged
+    4808x1600x6592).
     Returns False when the caller must fall back."""
     comptime if not _has_sm_9x():
         return False
@@ -1078,7 +1266,7 @@ def maybe_enqueue_gemm16_tn_v4_persistent[
             blocks_n = (n + _V4_PROD_BN - 1) // _V4_PROD_BN
         if blocks_m * blocks_n <= sm_count:
             return False
-    _v4_enqueue_nn_persistent[
+    return _v4_enqueue_nn_persistent[
         _V4_PROD_STAGES,
         _V4_PROD_CLUSTER_M,
         _V4_PROD_BM,
@@ -1089,4 +1277,3 @@ def maybe_enqueue_gemm16_tn_v4_persistent[
         kmaj_b,
         ragged_n,
     ](output, a, b, m, n, k, sm_count, ctx)
-    return True

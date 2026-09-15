@@ -648,7 +648,7 @@ def _b_binary(
 
 
 def _b_try_scalar(
-    op: StaticString, lhs: Side, rhs: Side, negate: Bool
+    op: StaticString, lhs: Side, rhs: Side, negate: Bool, dst: Optional[T]
 ) raises -> Optional[Res]:
     """The old `_try_spec_scalar`: contiguous float tensor with a numeric
     scalar in one elementwise launch.
@@ -656,6 +656,11 @@ def _b_try_scalar(
     float64 is excluded because the kernel's FLOAT_DTYPES has no entry for it
     — the old code let the kernel raise and fell through to the broadcast
     route, which is what declining here does, minus a wasted build.
+
+    An `out=` that already has the result's dtype, shape and a contiguous
+    layout is written directly (DDP's reducer scales every gradient into its
+    bucket view this way, `mul_out(bucket_view, grad, 1/world)`: a temporary
+    plus a copy per parameter was a second pass over every gradient byte).
     """
     if not lhs.is_t or rhs.is_t:
         return None
@@ -667,6 +672,17 @@ def _b_try_scalar(
         return None
     var value = -s.f if negate else s.f
     var src = _b_ready(a, a.stype, True)
+    if dst:
+        var d = dst.value().copy()
+        if (
+            d.contig
+            and d.stype == src.t.stype
+            and d.device == src.t.device
+            and d.same_shape(src.t)
+        ):
+            _b_scalar_spec(op, src.t, value, d)
+            _ = src
+            return Res(d^, False)
     var out = own(new_like(src.t))
     _b_scalar_spec(op, src.t, value, out.t)
     _ = src
@@ -765,7 +781,7 @@ def _b_scale(t: T, alpha: Float64, alpha_is_int: Bool) raises -> Held:
     `_b_alpha_as` for the rounding this implies)."""
     var side = _b_tside(t)
     var a_side = _b_sside(Scal(alpha, Int(alpha), alpha_is_int, False))
-    var scaled = _b_try_scalar("MulScalarSpec", side, a_side, False)
+    var scaled = _b_try_scalar("MulScalarSpec", side, a_side, False, None)
     if not scaled.__bool__():
         scaled = _b_try_int_scalar("MulScalarIntSpec", side, a_side, False)
     if not scaled.__bool__():
@@ -917,7 +933,7 @@ def _b_add_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
     var r = _b_try_add_f32_bf16(lhs, rhs)
     if r.__bool__():
         return r.value().copy()
-    r = _b_try_scalar("AddScalarSpec", lhs, rhs, False)
+    r = _b_try_scalar("AddScalarSpec", lhs, rhs, False, dst)
     if r.__bool__():
         return r.value().copy()
     r = _b_try_int_scalar("AddScalarIntSpec", lhs, rhs, False)
@@ -954,7 +970,7 @@ def _b_add(
 
 def _b_sub_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
     # sub-by-scalar reuses the AddScalar specs with a negated scalar.
-    var r = _b_try_scalar("AddScalarSpec", lhs, rhs, True)
+    var r = _b_try_scalar("AddScalarSpec", lhs, rhs, True, dst)
     if r.__bool__():
         return r.value().copy()
     r = _b_try_int_scalar("AddScalarIntSpec", lhs, rhs, True)
@@ -986,7 +1002,7 @@ def _b_sub(
 
 
 def _b_mul(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
-    var r = _b_try_scalar("MulScalarSpec", lhs, rhs, False)
+    var r = _b_try_scalar("MulScalarSpec", lhs, rhs, False, dst)
     if r.__bool__():
         return r.value().copy()
     r = _b_try_int_scalar("MulScalarIntSpec", lhs, rhs, False)
@@ -1307,7 +1323,7 @@ def _b_simple(op: StaticString, args: Values, rets: Values) raises:
 def op_pow_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
-    var r = _b_try_scalar("PowScalarSpec", lhs, rhs, False)
+    var r = _b_try_scalar("PowScalarSpec", lhs, rhs, False, None)
     if r.__bool__():
         _b_ret(rets, r.value().copy())
         return

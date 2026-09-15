@@ -55,6 +55,66 @@ def _check(rc: Int32, what: String) raises:
         raise Error(what + " failed, rc=" + String(rc))
 
 
+struct CompletionEvent(Movable):
+    """Owned ordering event; MAX's DeviceEvent has no nonblocking query."""
+
+    var lib: OwnedDLHandle
+    var handle: Int
+
+    def __init__(out self, ctx: DeviceContext) raises:
+        self.lib = open_driver()
+        self.handle = 0
+        comptime name = "hipEventCreateWithFlags" if AMD else "cuEventCreate"
+        with ctx.push_context():
+            _check(
+                self.lib.get_function[Int32](name)(
+                    Pointer(to=self.handle), UInt32(2)  # DISABLE_TIMING
+                ),
+                name,
+            )
+
+    def __deinit__(deinit self):
+        try:
+            self.release()
+        except e:
+            print("mojoccl: completion event cleanup failed:", e)
+
+    def release(mut self) raises:
+        if self.handle != 0:
+            comptime name = "hipEventDestroy" if AMD else "cuEventDestroy_v2"
+            _check(self.lib.get_function[Int32](name)(self.handle), name)
+            self.handle = 0
+
+    def record(self, stream: Int64) raises:
+        comptime name = "hipEventRecord" if AMD else "cuEventRecord"
+        _check(self.lib.get_function[Int32](name)(self.handle, stream), name)
+
+    def wait_on(self, stream: Int64) raises:
+        comptime name = "hipStreamWaitEvent" if AMD else "cuStreamWaitEvent"
+        _check(
+            self.lib.get_function[Int32](name)(stream, self.handle, UInt32(0)),
+            name,
+        )
+
+    def synchronize(self) raises:
+        comptime name = "hipEventSynchronize" if AMD else "cuEventSynchronize"
+        _check(self.lib.get_function[Int32](name)(self.handle), name)
+
+    def query(self) raises -> Bool:
+        comptime name = "hipEventQuery" if AMD else "cuEventQuery"
+        var rc = self.lib.get_function[Int32](name)(self.handle)
+        if rc == 600:  # CUDA_ERROR_NOT_READY == hipErrorNotReady
+            return False
+        _check(rc, name)
+        return True
+
+    def done(self) -> Bool:
+        try:
+            return self.query()
+        except:
+            return False
+
+
 def current_device_ordinal(lib: OwnedDLHandle) raises -> Int:
     """The GPU this thread already has current.
 

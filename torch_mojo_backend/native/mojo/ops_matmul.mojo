@@ -199,6 +199,7 @@ def _gemm16_available() raises -> Bool:
             "gemm16_candidate_dispatch.mojo",
             "gemm16_rolling_kernels.mojo",
             "gemm16_nt_bias_kernels.mojo",
+            "gemm16_sched_pool.mojo",
         ],
     )
 
@@ -485,7 +486,16 @@ def _nt_bias_regime(m: Int, n: Int, k: Int) -> Bool:
     """
     if m < 4096 or n < 1024 or k < 1024:
         return False
-    if m % 128 != 0 or n % 64 != 0 or k % 64 != 0:
+    # m needs only m % 8 == 0: the kernel's A/C TMA descriptors carry M as
+    # the row-major operand's outer (non-innermost) extent with K (already
+    # % 64 == 0, i.e. a row stride of >=128 bytes) as the inner dimension, so
+    # no descriptor stride keys off M -- the 192x192 rolling route clips a
+    # ragged M edge via TMA the same way it already clips ragged N. Kept at
+    # m % 8 (not fully unaligned) because that is what was measured: the
+    # ragged 6600x4800x1600 shape reaches the fused route at 148 us here,
+    # vs 547 us when it fell through to the unfused (matmul + broadcast
+    # add) path.
+    if m % 8 != 0 or n % 64 != 0 or k % 64 != 0:
         return False
     # The residue-64 regime the candidate was fitted for; 128-aligned N and K
     # keep the routes they had.

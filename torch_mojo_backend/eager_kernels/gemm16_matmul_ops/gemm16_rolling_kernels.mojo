@@ -12,11 +12,44 @@ pipeline, layouts, consumer barriers, C descriptor, and TMA-store launches
 remain unchanged.  The upstream col_a/kmaj_b/ragged_n parameters remain
 available, so the candidate serves NN/TN/NT/TT with runtime M/N/K.
 
-Tuning provenance: BK=64, raster group=4, and the parent's intended
-BM=128/BN=256/stages=3/cluster_m=2/consumers=2 regime are the upstream
-H100-tuned configuration.  Problem dimensions are never compile-time
-constants.  The exported enqueuer has the upstream generic signature;
-its caller is responsible for the existing SM90/TMA regime guards.
+The raster group (macro-rows per rasterization band) is an explicit kernel
+parameter, `group`, rather than a build define: every instantiation's value
+travels in its `@__name` and its `_enqueue_cached` key, so two builds that
+disagree on it never collide on one cached DeviceFunction.  NN (dgrad) uses
+group=4, the upstream H100-tuned value; the NT+bias 192x192 route below
+uses group=8, independently measured for that regime (worst ratio over
+group in {1,2,4,6,8,12}: g=8 -> 1.037).
+
+The NT+bias 192x192 route (`_nt_bias_rolling_ws`, reached from
+gemm16_candidate_dispatch.mojo's `_try_enqueue_nt_bias_rolling_192`) fuses
+`bias[n]` into the epilogue's fp32 accumulator before the single bf16
+round; it shares the mainloop, pipeline and barrier logic with
+`_rolling_persistent_ws` through one inlined body, `_rolling_persistent_
+body` (has_bias=True there, fixed to the NT layout and the TMA-store
+epilogue), rather than a `has_bias` parameter bolted onto
+`_rolling_persistent_ws` itself: that kernel's compiled ABI must never
+change for its existing has_bias=False (NN/TN) callers, so the bias-fused
+route is its own `@__name`d entry point with its own `bias` argument. See
+`_store_accum_bm_boxes_stmatrix`'s docstring for why the bias column map
+does not generalize past NT, and the comptime assert in
+`_rolling_persistent_body` that enforces it.
+
+Output tiles are assigned DYNAMICALLY: every cluster takes its next work
+index from a global ticket counter (gemm16_sched_pool.mojo) instead of the
+static `w = cluster_id; w += num_clusters` this body used to walk.  That is
+what keeps these kernels from losing nearly half their throughput whenever
+another kernel -- NCCL on a DDP job's comm stream -- holds some of the SMs a
+persistent grid assumed it owned.  The `@__name`s are deliberately unchanged
+(a profile of this kernel names the same algorithm it always did); the
+`_enqueue_cached` keys are not, because the kernel ABI gained the `sched`
+counter pointer.
+
+Tuning provenance: BK=64 and the parent's intended BM=128/BN=256/stages=3/
+cluster_m=2/consumers=2 regime are the upstream H100-tuned configuration
+for the has_bias=False (NN) route.  Problem dimensions are never
+compile-time constants.  The exported enqueuer has the upstream generic
+signature; its caller is responsible for the existing SM90/TMA regime
+guards.
 """
 
 from std.gpu import (
@@ -42,11 +75,7 @@ from max.gpu.memory import (
 )
 from std.memory import AddressSpace
 from max.gpu.sync import named_barrier
-from max.gpu.primitives import (
-    block_rank_in_cluster,
-    cluster_sync,
-    cluster_sync_relaxed,
-)
+from max.gpu.primitives import block_rank_in_cluster, cluster_sync
 from std.memory import bitcast, stack_allocation
 from std.sys import size_of
 from std.sys.info import _has_sm_9x, _is_sm_9x
@@ -66,10 +95,25 @@ from layout.tensor_core_async import (
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
-from std.sys import get_defined_bool, get_defined_int
+from std.sys import get_defined_bool
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 from op_utils import _enqueue_cached
+
+from gemm16_sched_pool import (
+    SCHED_PTR,
+    SCHED_RING,
+    sched_advance,
+    sched_fetch_add,
+    sched_finish,
+    sched_init_ring,
+    sched_poll_local,
+    sched_publish_first,
+    sched_publish_round,
+    sched_read_local,
+    sched_slot_ptr,
+    sched_supported,
+)
 
 from gemm16_nn_v4_kernels import (
     _V4_DT,
@@ -77,16 +121,13 @@ from gemm16_nn_v4_kernels import (
     _V4_PTR,
     _V4_BK,
     _V4_SWIZZLE,
+    _v4_bias_epilogue_quad,
     _v4_dyn_smem_tile,
     _v4_persistent_smem_bytes,
     _v4_mma_tile,
     _v4_persistent_layout_tag,
     _v4_persistent_ragged_tag,
 )
-
-# H100 cache-reuse experiment: macro rows grouped before advancing N.
-# Runtime M/N/K still determine the entire work census.
-comptime _V4_GROUP = get_defined_int["TUNE_GROUP", 4]()
 
 # Named here only so the launch cache key can spell the build identity of the
 # epilogue: the selected instruction sequence differs between the two values,
@@ -109,9 +150,9 @@ def _pack_accum_pair(x: Float32, y: Float32) -> Float32:
 
 @always_inline
 def _store_accum_bm_boxes_stmatrix[
-    bm: Int, bn: Int
+    bm: Int, bn: Int, has_bias: Bool
 ](
-    wg_half: Pointer[
+    c_smem: Pointer[
         Scalar[_V4_DT], MutAnyOrigin, address_space=AddressSpace.SHARED
     ],
     accum: LayoutTensor[
@@ -123,6 +164,9 @@ def _store_accum_bm_boxes_stmatrix[
     warp: Int,
     lane: Int,
     warp_group_idx: Int,
+    bias: _V4_PTR,
+    n0: Int,
+    n: Int,
 ):
     """Store one warp group's WGMMA accumulator fragments into the 128B-
     swizzled TMA staging tile using `st.matrix.x4` (bn // 16 instructions
@@ -132,6 +176,14 @@ def _store_accum_bm_boxes_stmatrix[
     j % 2, column block 2t + j // 2.  Lane group l // 8 supplies the
     address of matrix (l // 8), row l % 8, which this function maps through
     the canonical SWIZZLE_128B 64x64 box layout.
+
+    has_bias fuses bias[n] into the fp32 accumulator before the single bf16
+    round (the NT+bias 192x192 rolling kernel, `bias`/`n0`/`n` used only
+    then); comptime-eliminated to the original bias-free expression
+    otherwise, so the NN/TN routes' codegen is unchanged.  NT-specific
+    addressing: every consumer warp group owns 64 rows in the SAME BM-high
+    C box (successive column boxes stride by bm*64) -- do not reuse for a
+    layout with per-warp-group C boxes without re-deriving `row`.
     """
     comptime CFRAG = 64 * bn // 128
     var mi = lane // 8
@@ -149,93 +201,83 @@ def _store_accum_bm_boxes_stmatrix[
             + row_base
             + (((col % 64) // 8) ^ row_mod) * 8
         )
-        var data = SIMD[DType.float32, 4](
-            _pack_accum_pair(
-                accum.ptr[unsafe_offset=8 * t],
-                accum.ptr[unsafe_offset=8 * t + 1],
-            ),
-            _pack_accum_pair(
-                accum.ptr[unsafe_offset=8 * t + 2],
-                accum.ptr[unsafe_offset=8 * t + 3],
-            ),
-            _pack_accum_pair(
-                accum.ptr[unsafe_offset=8 * t + 4],
-                accum.ptr[unsafe_offset=8 * t + 5],
-            ),
-            _pack_accum_pair(
-                accum.ptr[unsafe_offset=8 * t + 6],
-                accum.ptr[unsafe_offset=8 * t + 7],
-            ),
-        )
-        st_matrix[simd_width=4](wg_half.unsafe_offset(off), data)
+        var data: SIMD[DType.float32, 4]
+        comptime if has_bias:
+            data = _v4_bias_epilogue_quad[bn](accum, t, lane, bias, n0, n)
+        else:
+            data = SIMD[DType.float32, 4](
+                _pack_accum_pair(
+                    accum.ptr[unsafe_offset=8 * t],
+                    accum.ptr[unsafe_offset=8 * t + 1],
+                ),
+                _pack_accum_pair(
+                    accum.ptr[unsafe_offset=8 * t + 2],
+                    accum.ptr[unsafe_offset=8 * t + 3],
+                ),
+                _pack_accum_pair(
+                    accum.ptr[unsafe_offset=8 * t + 4],
+                    accum.ptr[unsafe_offset=8 * t + 5],
+                ),
+                _pack_accum_pair(
+                    accum.ptr[unsafe_offset=8 * t + 6],
+                    accum.ptr[unsafe_offset=8 * t + 7],
+                ),
+            )
+        st_matrix[simd_width=4](c_smem.unsafe_offset(off), data)
 
 
-@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
-@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
-@__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(128 * (consumers + 1))
-    ),
-    `nvvm.cluster_dim`=StaticTuple[Int32, 3](
-        Int32(cluster_m), Int32(1), Int32(1)
-    ),
-)
-# One kernel symbol per layout: the TN and NN instantiations of this body
-# would otherwise share one base name (differing only by mangling hash), so
-# GPU profiles could not tell them apart and scripts/compare_kernel_asm.py --
-# which pairs kernels by hash-stripped name -- would collide them.  The
-# ragged tag does the same for the n-clip TT instantiation while keeping
-# every exact-n symbol byte-identical to its pre-existing name.
-@__name(
-    t"{_GEMM16_TAG}_gemm_{_v4_persistent_layout_tag[col_a, kmaj_b]()}_v4_persistent_stmatrix_rolling_m{bm}n{bn}_s{stages}c{cluster_m}wg{consumers}g{_V4_GROUP}{_v4_persistent_ragged_tag[ragged_n]()}"
-)
-def _rolling_persistent_ws[
+@always_inline
+def _rolling_persistent_body[
     stages: Int,
     cluster_m: Int,
     bm: Int,
     bn: Int,
     consumers: Int,
     tma_store: Bool,
-    # col_a extends the persistent body to the TN (wgrad) layout: A is
-    # physically (K, M), TMA-loaded into an MN-major shared tile and
-    # consumed through WGMMA's col-major A mode via _v4_mma_tile.  kmaj_b
-    # does the same for B: physically (N, K), TMA-loaded into a K-major
-    # shared tile for WGMMA's col-major B mode; col_a + kmaj_b is the TT
-    # instantiation.  The trailing shape parameters exist because the TMA
-    # boxes follow each operand's majorness; their defaults keep every
-    # pre-existing NN and TN instantiation (and its generated code)
-    # unchanged.
-    col_a: Bool = False,
-    kmaj_b: Bool = False,
-    # ragged_n admits n % bn != 0 (still n % 64 == 0): blocks_n becomes a
-    # ceil-div, the B TMA reads clamp past the n edge (zero-fill, zero
-    # contributions) and the C TMA store's partial last column box clips
-    # against the (m, n) descriptor -- the same machinery the ragged-m path
-    # uses, on the other axis.  The NN, TN and TT routes all instantiate
-    # it.
-    ragged_n: Bool = False,
-    a_tile_shape: IndexList[2] = Index(_V4_BK, bm) if col_a else Index(
-        bm, _V4_BK
-    ),
-    a_desc_shape: IndexList[2] = Index(_V4_BK, 64) if col_a else Index(
-        bm, _V4_BK
-    ),
-    b_tile_shape: IndexList[2] = Index(64, _V4_BK) if kmaj_b else Index(
-        _V4_BK, 64
-    ),
-    b_desc_shape: IndexList[2] = Index(64, _V4_BK) if kmaj_b else Index(
-        _V4_BK, 64
-    ),
+    col_a: Bool,
+    kmaj_b: Bool,
+    ragged_n: Bool,
+    group: Int,
+    # Fuses bias[n] into the epilogue (the NT+bias 192x192 route); requires
+    # tma_store and the NT layout (kmaj_b, not col_a) -- see the comptime
+    # assert below and _store_accum_bm_boxes_stmatrix's docstring. `bias` is
+    # a live pointer only when has_bias -- callers with has_bias=False pass
+    # any valid pointer (never read) rather than a constructed null one.
+    has_bias: Bool,
+    a_tile_shape: IndexList[2],
+    a_desc_shape: IndexList[2],
+    b_tile_shape: IndexList[2],
+    b_desc_shape: IndexList[2],
 ](
     a_tma: TMATensorTile[_V4_DT, 2, a_tile_shape, a_desc_shape],
     b_tma: TMATensorTile[_V4_DT, 2, b_tile_shape, b_desc_shape],
     c_tma: TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)],
     output: _V4_PTR,
+    bias: _V4_PTR,
+    sched: SCHED_PTR,
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
 ):
+    """Shared mainloop/epilogue body of every persistent-rolling device
+    kernel in this file (`_rolling_persistent_ws` has_bias=False and
+    `_nt_bias_rolling_ws` has_bias=True call it, inlined, from their own
+    `@__name`d entry points): a change here reaches both, and there is no
+    second copy of the ring/barrier/pipeline logic to keep in sync. Whether
+    a particular instantiation's compiled kernel takes `bias` as a real ABI
+    argument, and its exact device-side behavior, is decided entirely by
+    each caller's own signature and has_bias -- this body has no `@__name`
+    of its own and is never launched directly.
+
+    `sched` is the launch's ticket counter (gemm16_sched_pool.mojo): rank 0's
+    producer thread dispenses work indices from it, the peer rank reads them
+    over DSMEM and every consumer reads its own CTA's ring.  Per-tile K order
+    is untouched, so results are bit-identical to the static assignment this
+    replaced -- only WHICH cluster computes a tile changes.
+    """
+    comptime assert not has_bias or (
+        tma_store and kmaj_b and not col_a
+    ), "the fused bias epilogue is NT-only (kmaj_b) and needs the TMA store"
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
     var m = Int(m_arg)
@@ -293,7 +335,31 @@ def _rolling_persistent_ws[
             address_space=AddressSpace.SHARED,
             alignment=8,
         ]()
+        # Published work tickets, one 32-bit word per round (see
+        # gemm16_sched_pool.mojo).  A slot is rewritten SCHED_RING rounds
+        # later and publication runs at most `stages + 1` rounds ahead of the
+        # slowest reader in the cluster, so this bound is what keeps a live
+        # ticket from being overwritten under a reader.
+        comptime assert (
+            SCHED_RING >= stages + 4
+        ), "work-ticket ring too shallow for this pipeline depth"
+        var work_ring = stack_allocation[
+            SCHED_RING,
+            Scalar[DType.uint32],
+            address_space=AddressSpace.SHARED,
+            alignment=16,
+        ]()
+        # Round 0's ticket is fetched HERE, before the barrier inits, the TMA
+        # descriptor prefetches and the cluster barrier: every cluster's rank
+        # 0 hits the same counter word at the same instant, and same-address
+        # L2 atomics serialise.  Issuing it first lets that queue drain behind
+        # the prologue instead of standing between kernel entry and the first
+        # TMA.
+        var ticket0 = UInt32(0)
         if thread_idx.x == 0:
+            if Int(block_rank_in_cluster()) == 0:
+                ticket0 = UInt32(sched_fetch_add(sched, 1))
+            sched_init_ring(work_ring)
             comptime for stage in range(stages):
                 full_barriers[unsafe_offset=stage].init()
                 # Released by every consumer warp group of every CTA in the
@@ -308,8 +374,16 @@ def _rolling_persistent_ws[
                 c_tma.prefetch_descriptor()
             fence_mbarrier_init()
         # All barriers must be initialized cluster-wide before any arrival
-        # (the consumers below arrive at peer CTAs' empty barriers).
-        cluster_sync_relaxed()
+        # (the consumers below arrive at peer CTAs' empty barriers), and the
+        # zeroed ticket ring must be VISIBLE to the peer before it can poll
+        # it.  `cluster_sync_relaxed` orders neither -- it is an arrive/wait
+        # with no memory ordering -- and `fence_mbarrier_init` covers only
+        # the mbarrier state, so a peer could read whatever was in that
+        # shared word before the kernel started; one arbitrary word in 1024
+        # carries round 0's tag and would be accepted as a published ticket
+        # (wrong macro-row, or a hang).  `cluster_sync` is the same barrier
+        # with the fence, once per launch (a Codex review finding).
+        cluster_sync()
 
         comptime CFRAG = 64 * bn // 128
         comptime MACRO_BM = bm * cluster_m
@@ -319,7 +393,8 @@ def _rolling_persistent_ws[
         var warp_group_idx = Int(thread_idx.x) // 128
         var warp_group_thread_idx = Int(thread_idx.x) % 128
         var rank = Int(block_rank_in_cluster())
-        var cluster_id = Int(block_idx.x) // cluster_m
+        # No cluster id: the work index is a ticket from the global counter,
+        # not `cluster_id + j * num_clusters` (gemm16_sched_pool.mojo).
         var num_clusters = Int(grid_dim.x) // cluster_m
         # m may be ragged: TMA A reads clamp out-of-bounds rows and the
         # epilogue stores are row-predicated.  With ragged_n, n may be too
@@ -330,7 +405,7 @@ def _rolling_persistent_ws[
             blocks_n = (n + bn - 1) // bn
         var total_works = macro_rows * blocks_n
         var num_tiles = k // _V4_BK
-        var group_span = _V4_GROUP * blocks_n
+        var group_span = group * blocks_n
 
         # Release every pipeline slot to the producers (cluster-wide).
         if warp_group_idx > 0 and warp_group_thread_idx < cluster_m:
@@ -340,18 +415,30 @@ def _rolling_persistent_ws[
                 )
 
         if warp_group_idx == 0:
-            warpgroup_reg_dealloc[24]()
+            # 32, not 24: the scheduler adds live state to this warp
+            # group and 24 spills it to local memory (ptxas -v: 32 bytes of
+            # spill stores at 24, zero at 32).  32 still fits the SM's 65536
+            # registers beside three consumer warp groups at 160
+            # (3 * 128 * 160 + 128 * 32 = 65536 exactly) and two at 232.
+            # Measured worth up to 6% under contention (tn_c_attn at a 16-SM
+            # hog: 252.9 -> 239.1 us).
+            warpgroup_reg_dealloc[32]()
             if warp_group_thread_idx == 0:
                 var ring_stage = 0
                 var ring_phase = UInt32(0)
-                var w = cluster_id
+                var rm = UInt32(0)
+                sched_publish_first(work_ring, rank, rm, ticket0)
+                var w = sched_read_local(work_ring, rm)
                 while w < total_works:
-                    var group = w // group_span
+                    # Publish round j+1 BEFORE issuing round j, so the peer
+                    # rank's DSMEM poll and both CTAs' consumer polls are
+                    # already satisfied when they look.
+                    var rm_next = sched_advance(rm)
+                    sched_publish_round(sched, work_ring, rank, rm_next)
+                    var g = w // group_span
                     var rem = w % group_span
-                    var rows_in_group = min(
-                        _V4_GROUP, macro_rows - group * _V4_GROUP
-                    )
-                    var macro_row = group * _V4_GROUP + rem % rows_in_group
+                    var rows_in_group = min(group, macro_rows - g * group)
+                    var macro_row = g * group + rem % rows_in_group
                     var n0 = (rem // rows_in_group) * bn
                     var m0 = macro_row * MACRO_BM + rank * bm
                     var t = 0
@@ -442,7 +529,13 @@ def _rolling_persistent_ws[
                         if ring_stage == stages:
                             ring_stage = 0
                             ring_phase = ring_phase ^ UInt32(1)
-                    w += num_clusters
+                    rm = rm_next
+                    w = sched_read_local(work_ring, rm)
+                if rank == 0:
+                    # `w` is this cluster's past-the-end ticket; see
+                    # gemm16_sched_pool.mojo for why the highest one resets
+                    # the counter.
+                    sched_finish(sched, w, total_works, num_clusters)
         else:
             # Consumer registers: three warp groups fit 65536 regs/SM only
             # at 160 regs/thread (96 accumulator + addressing); two fit 232.
@@ -468,14 +561,13 @@ def _rolling_persistent_ws[
 
             var ring_stage = 0
             var ring_phase = UInt32(0)
-            var w = cluster_id
+            var rm = UInt32(0)
+            var w = sched_poll_local(work_ring, rm)
             while w < total_works:
-                var group = w // group_span
+                var g = w // group_span
                 var rem = w % group_span
-                var rows_in_group = min(
-                    _V4_GROUP, macro_rows - group * _V4_GROUP
-                )
-                var macro_row = group * _V4_GROUP + rem % rows_in_group
+                var rows_in_group = min(group, macro_rows - g * group)
+                var macro_row = g * group + rem % rows_in_group
                 var n0 = (rem // rows_in_group) * bn
                 var m0 = macro_row * MACRO_BM + rank * bm
                 _ = accum.fill(0.0)
@@ -540,8 +632,15 @@ def _rolling_persistent_ws[
                         # staging tile is overwritten.
                         c_tma.wait_group[0]()
                     named_barrier[NCONS](1)
-                    _store_accum_bm_boxes_stmatrix[bm, bn](
-                        c_smem.ptr, accum, warp, lane, warp_group_idx
+                    _store_accum_bm_boxes_stmatrix[bm, bn, has_bias](
+                        c_smem.ptr,
+                        accum,
+                        warp,
+                        lane,
+                        warp_group_idx,
+                        bias,
+                        n0,
+                        n,
                     )
                     fence_async_view_proxy()
                     named_barrier[NCONS](1)
@@ -571,7 +670,8 @@ def _rolling_persistent_ws[
                             output.unsafe_store[alignment=4](
                                 (m0 + row) * n + n0 + col, pair
                             )
-                w += num_clusters
+                rm = sched_advance(rm)
+                w = sched_poll_local(work_ring, rm)
             comptime if tma_store:
                 # Outstanding bulk stores must complete before kernel exit.
                 if warp_group_idx == 1 and warp_group_thread_idx == 0:
@@ -580,6 +680,159 @@ def _rolling_persistent_ws[
         # Peer CTAs receive multicast writes into this CTA's shared memory;
         # do not tear the block down while any cluster member is running.
         cluster_sync()
+
+
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32(128 * (consumers + 1))
+    ),
+    `nvvm.cluster_dim`=StaticTuple[Int32, 3](
+        Int32(cluster_m), Int32(1), Int32(1)
+    ),
+)
+# One kernel symbol per layout: the TN and NN instantiations of this body
+# would otherwise share one base name (differing only by mangling hash), so
+# GPU profiles could not tell them apart and scripts/compare_kernel_asm.py --
+# which pairs kernels by hash-stripped name -- would collide them.  The
+# ragged tag does the same for the n-clip TT instantiation while keeping
+# every exact-n symbol byte-identical to its pre-existing name.  This entry
+# point's own runtime ABI (no `bias` argument) is exactly what it was before
+# has_bias existed: the bias-fused route is a SEPARATE kernel below
+# (`_nt_bias_rolling_ws`), not a `bias` parameter bolted onto this one, so
+# adding it could not add a dead pointer argument to this compiled kernel --
+# scripts/compare_kernel_asm.py caught exactly that mistake in an earlier
+# revision of this change.
+@__name(
+    t"{_GEMM16_TAG}_gemm_{_v4_persistent_layout_tag[col_a, kmaj_b]()}_v4_persistent_stmatrix_rolling_m{bm}n{bn}_s{stages}c{cluster_m}wg{consumers}g{group}{_v4_persistent_ragged_tag[ragged_n]()}"
+)
+def _rolling_persistent_ws[
+    stages: Int,
+    cluster_m: Int,
+    bm: Int,
+    bn: Int,
+    consumers: Int,
+    tma_store: Bool,
+    # col_a extends the persistent body to the TN (wgrad) layout: A is
+    # physically (K, M), TMA-loaded into an MN-major shared tile and
+    # consumed through WGMMA's col-major A mode via _v4_mma_tile.  kmaj_b
+    # does the same for B: physically (N, K), TMA-loaded into a K-major
+    # shared tile for WGMMA's col-major B mode; col_a + kmaj_b is the TT
+    # instantiation.  The trailing shape parameters exist because the TMA
+    # boxes follow each operand's majorness; their defaults keep every
+    # pre-existing NN and TN instantiation (and its generated code)
+    # unchanged.
+    col_a: Bool = False,
+    kmaj_b: Bool = False,
+    # ragged_n admits n % bn != 0 (still n % 64 == 0): blocks_n becomes a
+    # ceil-div, the B TMA reads clamp past the n edge (zero-fill, zero
+    # contributions) and the C TMA store's partial last column box clips
+    # against the (m, n) descriptor -- the same machinery the ragged-m path
+    # uses, on the other axis.  The NN, TN and TT routes all instantiate
+    # it.
+    ragged_n: Bool = False,
+    # Macro-rows per rasterization group before advancing one BN column
+    # (keeps the in-flight A slab and current B column resident in L2). A
+    # kernel parameter rather than a build define -- see try_enqueue_
+    # candidate_nn in gemm16_candidate_dispatch.mojo for the measured value.
+    group: Int = 4,
+    a_tile_shape: IndexList[2] = Index(_V4_BK, bm) if col_a else Index(
+        bm, _V4_BK
+    ),
+    a_desc_shape: IndexList[2] = Index(_V4_BK, 64) if col_a else Index(
+        bm, _V4_BK
+    ),
+    b_tile_shape: IndexList[2] = Index(64, _V4_BK) if kmaj_b else Index(
+        _V4_BK, 64
+    ),
+    b_desc_shape: IndexList[2] = Index(64, _V4_BK) if kmaj_b else Index(
+        _V4_BK, 64
+    ),
+](
+    a_tma: TMATensorTile[_V4_DT, 2, a_tile_shape, a_desc_shape],
+    b_tma: TMATensorTile[_V4_DT, 2, b_tile_shape, b_desc_shape],
+    c_tma: TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)],
+    output: _V4_PTR,
+    sched: SCHED_PTR,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+):
+    # `output` fills the body's unread `bias` slot: has_bias=False comptime-
+    # eliminates every bias read, so this never dereferences it.
+    _rolling_persistent_body[
+        stages,
+        cluster_m,
+        bm,
+        bn,
+        consumers,
+        tma_store,
+        col_a,
+        kmaj_b,
+        ragged_n,
+        group,
+        False,
+        a_tile_shape,
+        a_desc_shape,
+        b_tile_shape,
+        b_desc_shape,
+    ](a_tma, b_tma, c_tma, output, output, sched, m_arg, n_arg, k_arg)
+
+
+@__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
+@__llvm_arg_metadata(c_tma, `nvvm.grid_constant`)
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32(128 * (consumers + 1))
+    ),
+    `nvvm.cluster_dim`=StaticTuple[Int32, 3](
+        Int32(cluster_m), Int32(1), Int32(1)
+    ),
+)
+# The 192x192 NT+bias rolling kernel: its own entry point (own `@__name`,
+# own `bias` ABI slot) rather than a parameter on `_rolling_persistent_ws`,
+# so that kernel's compiled signature never changes for has_bias=False
+# callers (NN/TN). Fixed to the NT layout (kmaj_b, not col_a), the TMA-store
+# epilogue and ragged_n=True -- the only configuration this route needs;
+# `group` stays a parameter, per-instantiation-measured like the sibling
+# kernel's. Name matches the standalone engagement that measured it
+# (gemm16_candidate_dispatch.mojo's `_try_enqueue_nt_bias_rolling_192`).
+@__name(
+    t"{_GEMM16_TAG}_gemm_nt_bias_rolling_ws_m{bm}n{bn}_s{stages}c{cluster_m}wg{consumers}g{group}"
+)
+def _nt_bias_rolling_ws[
+    stages: Int, cluster_m: Int, bm: Int, bn: Int, consumers: Int, group: Int
+](
+    a_tma: TMATensorTile[_V4_DT, 2, Index(bm, _V4_BK), Index(bm, _V4_BK)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(64, _V4_BK), Index(64, _V4_BK)],
+    c_tma: TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)],
+    output: _V4_PTR,
+    bias: _V4_PTR,
+    sched: SCHED_PTR,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+):
+    _rolling_persistent_body[
+        stages,
+        cluster_m,
+        bm,
+        bn,
+        consumers,
+        True,
+        False,
+        True,
+        True,
+        group,
+        True,
+        Index(bm, _V4_BK),
+        Index(bm, _V4_BK),
+        Index(64, _V4_BK),
+        Index(64, _V4_BK),
+    ](a_tma, b_tma, c_tma, output, bias, sched, m_arg, n_arg, k_arg)
 
 
 def enqueue_rolling_persistent[
@@ -592,16 +845,44 @@ def enqueue_rolling_persistent[
     col_a: Bool = False,
     kmaj_b: Bool = False,
     ragged_n: Bool = False,
+    group: Int = 4,
+    has_bias: Bool = False,
 ](
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
+    # Unused (never read) unless has_bias: the NN/TN callers pass `output`
+    # as a valid-but-ignored filler rather than constructing a null pointer.
+    bias: _V4_PTR,
     m: Int,
     n: Int,
     k: Int,
     sm_count: Int,
     ctx: DeviceContext,
-) raises:
+) raises -> Bool:
+    """Launch one of this file's persistent-rolling kernels, or decline.
+
+    Returns False WITHOUT launching -- and without building a single TMA
+    descriptor -- when the dynamic tile scheduler cannot serve the shape: a
+    work census past the ring word's 22-bit payload, or a counter table with
+    no free entry (see gemm16_sched_pool.mojo).  Every caller treats that as
+    "this rung declines" and falls through to the next one.
+    """
+    # The work census decides both the grid and whether the scheduler can
+    # serve the shape at all, so it is computed before anything is allocated.
+    var macro_rows = (m + bm * cluster_m - 1) // (bm * cluster_m)
+    var blocks_n = n // bn
+    comptime if ragged_n:
+        blocks_n = (n + bn - 1) // bn
+    var total_works = macro_rows * blocks_n
+    if not sched_supported(total_works):
+        return False
+    # One ticket counter per (device, stream); allocated once and self-reset
+    # by the kernel, so nothing is allocated or memset per launch.
+    var slot = sched_slot_ptr(ctx)
+    if not slot:
+        return False
+    var sched = slot.value()
     # Each descriptor follows its operand's physical layout: (M, K) row-major
     # with a whole-tile box, or -- for the TN/wgrad and TT col_a routes --
     # (K, M) row-major with a (BK, 64) box feeding the MN-major shared tile;
@@ -650,47 +931,75 @@ def enqueue_rolling_persistent[
     var a_tma = TMATensorTile[_V4_DT, 2, A_TILE, A_DESC](a_desc)
     var b_tma = TMATensorTile[_V4_DT, 2, B_TILE, B_TILE](b_desc)
     var c_tma = TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)](c_desc)
-    var macro_rows = (m + bm * cluster_m - 1) // (bm * cluster_m)
-    var blocks_n = n // bn
-    comptime if ragged_n:
-        blocks_n = (n + bn - 1) // bn
-    var total_works = macro_rows * blocks_n
     var num_clusters = min(sm_count // cluster_m, total_works)
     var grid_x = num_clusters * cluster_m
     comptime DYN_SMEM = _v4_persistent_smem_bytes[stages, bm, bn, tma_store]()
     # Compiled once per process and context: `ctx.enqueue_function[kernel]`
-    # re-runs compile_function on every launch. The key names what selects the
-    # code -- dtype, geometry, stages, layout, epilogue and the PAIR_CAST /
-    # raster-group build defines -- and nothing about this call's pointers or
-    # its m/n/k, which travel as arguments. The cluster shape rides on the
-    # kernel's own `nvvm.cluster_dim` metadata, as it did before.
-    _enqueue_cached[
-        _rolling_persistent_ws[
-            stages,
-            cluster_m,
-            bm,
-            bn,
-            consumers,
-            tma_store,
-            col_a,
-            kmaj_b,
-            ragged_n,
-        ],
-        dyn_smem=DYN_SMEM,
-    ](
-        ctx,
-        String(
-            t"g16roll_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_{Int(tma_store)}{Int(col_a)}{Int(kmaj_b)}{Int(ragged_n)}_g{_V4_GROUP}_p{Int(_ROLL_PAIR_CAST)}"
-        ),
-        grid_x,
-        1,
-        1,
-        128 * (consumers + 1),
-        a_tma,
-        b_tma,
-        c_tma,
-        output,
-        Int64(m),
-        Int64(n),
-        Int64(k),
-    )
+    # re-runs compile_function on every launch. The key names what selects
+    # the code -- dtype, geometry, stages, layout, epilogue, raster group
+    # and the PAIR_CAST build define -- and nothing about this call's
+    # pointers or its m/n/k, which travel as arguments. The cluster shape
+    # rides on the kernel's own `nvvm.cluster_dim` metadata, as it did
+    # before.  has_bias picks which DEVICE KERNEL is launched (see their
+    # docstrings): _rolling_persistent_ws's own ABI never gains a `bias`
+    # argument just because this host function grew one.
+    comptime if has_bias:
+        comptime assert (
+            tma_store and kmaj_b and not col_a
+        ), "the fused bias epilogue is NT-only (kmaj_b) and needs the TMA store"
+        _enqueue_cached[
+            _nt_bias_rolling_ws[stages, cluster_m, bm, bn, consumers, group],
+            dyn_smem=DYN_SMEM,
+        ](
+            ctx,
+            String(
+                t"ntbroll2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_g{group}"
+            ),
+            grid_x,
+            1,
+            1,
+            128 * (consumers + 1),
+            a_tma,
+            b_tma,
+            c_tma,
+            output,
+            bias,
+            sched,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+        )
+    else:
+        _enqueue_cached[
+            _rolling_persistent_ws[
+                stages,
+                cluster_m,
+                bm,
+                bn,
+                consumers,
+                tma_store,
+                col_a,
+                kmaj_b,
+                ragged_n,
+                group,
+            ],
+            dyn_smem=DYN_SMEM,
+        ](
+            ctx,
+            String(
+                t"g16roll2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_{Int(tma_store)}{Int(col_a)}{Int(kmaj_b)}{Int(ragged_n)}_g{group}_p{Int(_ROLL_PAIR_CAST)}"
+            ),
+            grid_x,
+            1,
+            1,
+            128 * (consumers + 1),
+            a_tma,
+            b_tma,
+            c_tma,
+            output,
+            sched,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+        )
+    return True

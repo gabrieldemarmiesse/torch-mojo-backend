@@ -71,10 +71,16 @@ from std.os import getenv
 from std.sys import size_of
 from std.time import perf_counter_ns, sleep
 from std.utils import StaticTuple
-from max.gpu.host import DeviceContext, DeviceBuffer, DeviceStream
+from max.gpu.host import (
+    DeviceAttribute,
+    DeviceBuffer,
+    DeviceContext,
+    DeviceStream,
+)
 
 from driver import (
     HANDLE_BYTES,
+    CompletionEvent,
     alloc_host,
     alloc_region,
     close_handle,
@@ -103,6 +109,8 @@ from collectives_kernels import (
     ERR_ALLREDUCE_SYNC,
     ERR_AG_FINISH_SYNC,
     ERR_BROADCAST_SYNC,
+    ERR_FUSED_GRID,
+    ERR_HOST_LAUNCH,
     ERR_PROXY_WAIT,
     ERR_RS_STAGE_SYNC,
     FAULT_ARENA,
@@ -116,7 +124,9 @@ from collectives_kernels import (
     MAX_WORLD,
     PHASES_PER_GEN,
     STATUS_FAULT_WORD,
+    STATUS_HOST_FAULT_WORD,
     STATUS_PAGE_BYTES,
+    _shard_per,
     allgather,
     allgather_max_bytes,
     allgather_finish,
@@ -133,8 +143,10 @@ from collectives_kernels import (
 )
 from internode import (
     CREDIT_AREA_BYTES,
+    EMPTY_SHARD_BYTES,
     IB_BLOB_BYTES,
     MAX_NODES,
+    WORK_SLOTS,
     OP_ALLGATHER,
     OP_ALLREDUCE,
     OP_BROADCAST,
@@ -144,13 +156,28 @@ from internode import (
     ib_enqueue_wait,
     ib_error,
     ib_local_info,
+    ib_mailbox_dev,
     ib_next_seq,
     ib_note_consumed,
     ib_npeers,
+    ib_prepare_request,
+    ib_reserve_seqs,
+    ib_timeout_ns,
+    ib_uses_proxy,
     ib_set_abort_word,
     ib_setup,
     ib_signal_abort,
     ib_teardown,
+)
+from internode_fused import (
+    FUSED_THREADS,
+    check_fused_call,
+    fused_big_block_cap,
+    fused_big_bytes,
+    fused_block_cap,
+    fused_blocks,
+    fused_resident_blocks,
+    internode_allreduce_fused,
 )
 from internode_kernels import copy_bytes, inbox_add, place_blocks
 from nvls_kernels import (
@@ -205,13 +232,6 @@ comptime NCCL_BFLOAT16: Int32 = 9
 comptime NCCL_SUM: Int32 = 0
 comptime NCCL_AVG: Int32 = 4
 
-# Payload a rank sends when it has nothing to contribute to an exchange:
-# a broadcast, or an allreduce whose shard table leaves this rank empty
-# (7 of 8 local ranks on DDP's 4-byte AVG allreduce). Every exchange has to
-# be all-to-all because an arrival tally of `npeers` is what completes one,
-# so a rank that stayed silent would hang its peers.
-comptime EMPTY_SHARD_BYTES = 16
-
 # Staging arenas the multi-node region is carved into, and therefore chunks
 # the pipeline may keep alive (`_arena_regions`, `_do_allreduce`).
 #
@@ -254,6 +274,27 @@ comptime PIPE_MAX_CHUNKS = 16
 # latency an extra chunk adds is not fully hidden, so splitting past the
 # point where the network is covered only buys launches.
 comptime PIPE_SPLIT_UNIT = 640_000
+
+# `MOJOCCL_PIPE_SPLIT_UNIT` overrides it. Part of the wire layout in the same
+# way `MOJOCCL_REGION_MB` is -- K decides how many exchange counters a
+# collective consumes, so two ranks that disagree about it stop agreeing about
+# which exchange is which -- so `ncclCommInitRank` checks it matches, and it is
+# an environment variable only so that the rule can be re-fitted in one job.
+#
+# Re-measured for the fused kernel (2x8 H100, GPT-2 XL, job 250995, mean
+# tok/s of steps 10-20 over two passes, vs mojo+NCCL in the same job), where
+# an extra chunk costs two grid barriers and two 8-way start barriers rather
+# than launches: 640_000 (K=2 at the 39 MiB bucket) 0.982, 320_000 (K=3)
+# 0.975, 160_000 (K=4) 0.971. The rule stands.
+
+
+def _pipe_split_unit() -> Int:
+    var raw = getenv("MOJOCCL_PIPE_SPLIT_UNIT", String(PIPE_SPLIT_UNIT))
+    try:
+        return max(1, Int(raw))
+    except:
+        return PIPE_SPLIT_UNIT
+
 
 comptime DEFAULT_REGION_MB = 256
 comptime DEFAULT_BOOTSTRAP_TIMEOUT_S: Float64 = 120.0
@@ -299,6 +340,15 @@ def _bootstrap_timeout_s() -> Float64:
         return Float64(s)
     except:
         return DEFAULT_BOOTSTRAP_TIMEOUT_S
+
+
+def _fused_enabled() -> Bool:
+    """`MOJOCCL_FUSED=0` puts multi-node allreduces back on the split
+    schedule (five kernels per chunk). The two schedules launch different
+    grids (216 x 256 threads against 16 x 512 at the DDP bucket) and the
+    intra-node barriers are matched by block index, so every rank has to run
+    the same one: the effective mode is exchanged and checked at init."""
+    return getenv("MOJOCCL_FUSED", "1") != "0"
 
 
 def _nvls_enabled() -> Bool:
@@ -412,6 +462,14 @@ struct CommState(Movable):
     # message is worth one line, not one per call.
     var fault_said: Bool
     var stream_cache: Dict[Int64, DeviceStream]
+    # Recorded on the stream after every collective; a collective issued on
+    # another stream waits for it first (`_order_before` / `_order_after`).
+    var order_event: CompletionEvent
+    var order_recorded: Bool
+    # Protected by the submission lock, including while a call is in progress.
+    var order_incomplete: Bool
+    # Atomic terminal flag: watchdogs may read it without the submission lock.
+    var submission_failed: Int64
     var local_rank: Int
     var local_world: Int
     var my_node: Int
@@ -428,14 +486,32 @@ struct CommState(Movable):
     var nvls_grid: Int
     var nvls_min: Int
     var nvls_bars: Int
+    # SM/CU count of this rank's GPU: the fused inter-node kernel's grid has
+    # to be co-resident, so it is one block per multiprocessor
+    # (`fused_blocks`), and every rank of a node derives the same number.
+    var sm_count: Int
+    # Grid caps of the fused kernel (`MOJOCCL_FUSED_BLOCKS`, and
+    # `MOJOCCL_FUSED_BIG_BLOCKS` for messages of at least `fused_big_bytes`),
+    # checked equal on every rank at init: its barriers are matched by block
+    # index.
+    var fused_cap: Int
+    var fused_big_cap: Int
+    var fused_big_bytes: Int
+    # Co-resident bound of the fused kernel on this GPU (occupancy times SMs,
+    # `fused_resident_blocks`); the grid never exceeds it.
+    var fused_resident: Int
+    # `MOJOCCL_PIPE_SPLIT_UNIT`; checked equal on every rank at init.
+    var split_unit: Int
+    # Whether multi-node allreduces go through the one-launch fused kernel.
+    # Off without the progress thread (MOJOCCL_IB_PROXY=0 runs the exchange in
+    # a stream callback, which needs a point in stream order to run at) and
+    # off under MOJOCCL_FUSED=0, which is the way back to the split schedule.
+    var fused: Bool
     # `ncclCommGetAsyncError`'s scratch, built once instead of per poll: the
-    # device word the copy kernel writes, the host word it lands in, and the
-    # stream to use before any collective has named one. A watchdog polls
-    # this on a timer, and a fresh DeviceStream, DeviceBuffer and host
-    # allocation per poll was three allocations and a leak of the last one.
+    # device word the copy kernel writes and the host word it lands in.
+    # Reusing them avoids an allocation (and formerly a leak) per poll.
     var err_buf: DeviceBuffer[DType.uint64]
     var err_host: Int
-    var own_stream: DeviceStream
     # Submission lock (`_lock`/`_unlock`): 0 free, 1 held.
     var lock: Int64
 
@@ -464,6 +540,13 @@ struct CommState(Movable):
         nvls_on: Bool,
         nvls_grid: Int,
         nvls_min: Int,
+        sm_count: Int,
+        fused_cap: Int,
+        fused_big_cap: Int,
+        fused_big_bytes: Int,
+        fused_resident: Int,
+        split_unit: Int,
+        fused: Bool,
         abort_host: Int,
         abort_dev: Int,
     ) raises:
@@ -477,6 +560,10 @@ struct CommState(Movable):
         self.owned_base = owned_base
         self.generation = 0
         self.last_stream = 0
+        self.order_event = CompletionEvent(ctx)
+        self.order_recorded = False
+        self.order_incomplete = False
+        self.submission_failed = 0
         self.aborted = False
         self.released = False
         self.abort_host = abort_host
@@ -498,6 +585,13 @@ struct CommState(Movable):
         self.nvls_on = nvls_on
         self.nvls_grid = nvls_grid
         self.nvls_min = nvls_min
+        self.sm_count = sm_count
+        self.fused_cap = fused_cap
+        self.fused_big_cap = fused_big_cap
+        self.fused_big_bytes = fused_big_bytes
+        self.fused_resident = fused_resident
+        self.split_unit = split_unit
+        self.fused = fused
         # Barriers the NVLS kernel has completed on this region. Its flag is a
         # single UInt64 counter that every GPU adds 1 to per barrier, so the
         # value to wait for is `(nvls_bars + 1) * local_world`; it is never
@@ -506,7 +600,6 @@ struct CommState(Movable):
         self.nvls_bars = 0
         self.err_buf = self.ctx.enqueue_create_buffer[DType.uint64](1)
         self.err_host = Int(unsafe_alloc[UInt64](1))
-        self.own_stream = DeviceStream(self.ctx)
         self.lock = 0
 
 
@@ -521,9 +614,8 @@ def _lock(mut state: CommState):
     submissions could interleave -- thread A's reduce-scatter, then thread
     B's on the same arena before A released its exchange. NCCL declares
     concurrent calls on one communicator unsupported; a spin word costs ~20 ns
-    uncontended and turns that into a serialization. Never taken by
-    `ncclCommAbort` or `ncclCommGetAsyncError`: a watchdog must be able to
-    abort a communicator whose submitter is stuck behind a full launch queue.
+    uncontended and turns that into a serialization. Watchdogs use bounded
+    or nonblocking attempts: a submitter may be stuck behind a full queue.
     """
     var p = Pointer(to=state.lock).unsafe_origin_cast[MutAnyOrigin]()
     while True:
@@ -640,11 +732,11 @@ def max_chunk_bytes(
 
 
 def pipeline_chunk_bytes(
-    max_chunk: Int, local_world: Int, total_bytes: Int
+    max_chunk: Int, local_world: Int, total_bytes: Int, split_unit: Int
 ) -> Int:
     """Chunk size of a pipelined multi-node allreduce; see PIPE_SPLIT_UNIT
     for where the square root comes from."""
-    var unit = local_world * PIPE_SPLIT_UNIT
+    var unit = local_world * split_unit
     var k = 1
     while k < PIPE_MAX_CHUNKS and (k + 1) * (k + 1) * unit <= total_bytes:
         k += 1
@@ -664,6 +756,45 @@ def _any(p: Pointer[UInt8, MutUntrackedOrigin]) -> Pointer[UInt8, MutAnyOrigin]:
     matching what driver.mojo/bootstrap.mojo (and the exported ABI functions
     they share signatures with) declare."""
     return Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p))
+
+
+def _order_before(mut state: CommState, handle: Int64) raises:
+    """Wait for the previous collective, including one on default stream 0.
+
+    Record before returning to the caller: a later call cannot touch the
+    previous stream, which the caller may have destroyed in the meantime.
+    The event orders reuse of the communicator's shared barrier words.
+    """
+    _ensure_stream_cached(state, handle)
+    if state.order_recorded and state.last_stream != handle:
+        state.order_event.wait_on(handle)
+    state.last_stream = handle
+    state.order_incomplete = True
+
+
+def _order_after(mut state: CommState, handle: Int64) raises:
+    """Record completion before returning; one driver event record per call."""
+    state.order_event.record(handle)
+    state.order_recorded = True
+    state.order_incomplete = False
+
+
+def _fail_submission(mut state: CommState):
+    Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+        Pointer(to=state.submission_failed).unsafe_origin_cast[MutAnyOrigin](),
+        1,
+    )
+
+
+def _submission_failed(state: CommState) -> Bool:
+    return (
+        Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            Pointer(to=state.submission_failed).unsafe_origin_cast[
+                MutAnyOrigin
+            ]()
+        )
+        != 0
+    )
 
 
 def _ensure_stream_cached(mut state: CommState, handle: Int64) raises:
@@ -767,6 +898,50 @@ def _fault_code(state: CommState) -> UInt64:
     return _fault_field(state, FAULT_CODE)
 
 
+@always_inline
+def _host_fault_word(state: CommState) -> UInt64:
+    """`STATUS_HOST_FAULT_WORD`: the host's own latched failure, 0 if none."""
+    if state.abort_host == 0:
+        return UInt64(0)
+    return Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+        Pointer[UInt64, MutAnyOrigin](
+            unsafe_from_address=state.abort_host + STATUS_HOST_FAULT_WORD * 8
+        )
+    )
+
+
+def _latch_host_fault_record(page: Int, code: Int, detail: Int):
+    """Latch a separate host record under the communicator's submission lock."""
+    if page == 0:
+        return
+    var host = Pointer[UInt64, MutAnyOrigin](
+        unsafe_from_address=page + STATUS_HOST_FAULT_WORD * 8
+    )
+    if Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](host) != 0:
+        return
+    # First fully published fault observed here wins. A device record still
+    # being published loses to this host fault; their detail words are disjoint.
+    var device = Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+        Pointer[UInt64, MutAnyOrigin](
+            unsafe_from_address=page + (STATUS_FAULT_WORD + FAULT_CODE) * 8
+        )
+    )
+    var device_first = UInt64(device != 0) << 63
+    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+        host,
+        device_first
+        | (UInt64(code) << 32)
+        | (UInt64(detail) & UInt64(0xFFFF_FFFF)),
+    )
+
+
+def _latch_host_fault(state: CommState, code: Int, detail: Int):
+    """Publish only to the host record, then release this rank's device spins.
+    """
+    _latch_host_fault_record(state.abort_host, code, detail)
+    _raise_abort_word(state)
+
+
 def _fault_kind(code: UInt64) -> String:
     """The collective a fault code names, for the message."""
     var c = Int(code)
@@ -784,6 +959,10 @@ def _fault_kind(code: UInt64) -> String:
         return String("the NVLS allreduce")
     if c == ERR_PROXY_WAIT:
         return String("the inter-node exchange wait")
+    if c == ERR_FUSED_GRID:
+        return String("the multi-node allreduce's grid barrier")
+    if c == ERR_HOST_LAUNCH:
+        return String("the host's launch of the multi-node allreduce")
     return String("an unknown collective (code " + String(c) + ")")
 
 
@@ -799,6 +978,26 @@ def _report_fault(mut state: CommState):
     if state.fault_said:
         return
     var code = _fault_code(state)
+    var host = _host_fault_word(state)
+    # Bit 63 snapshots precedence at host publication; a later device
+    # fault must not replace the host fault before the first report.
+    if host != 0 and host >> 63 == 0:
+        state.fault_said = True
+        print(
+            "mojoccl: rank",
+            state.rank,
+            ": HOST FAULT in",
+            _fault_kind(host >> 32),
+            "at exchange",
+            host & UInt64(0xFFFF_FFFF),
+            (
+                "-- the kernel launch failed after its exchanges were reserved,"
+                " so this rank's peers will report a deadline waiting for it;"
+                " every later collective on this communicator fails with"
+                " ncclRemoteError."
+            ),
+        )
+        return
     if code == 0:
         return
     state.fault_said = True
@@ -820,6 +1019,12 @@ def _report_fault(mut state: CommState):
         what += String(secs) + String(" s for this rank's progress thread to")
         what += String(" retire exchange ") + String(target)
         what += String(", and it had retired ") + String(seen)
+    elif Int(code) == ERR_FUSED_GRID:
+        # Rank-local: the other blocks of the same kernel never arrived,
+        # which only happens after another spin in it gave up.
+        what += String(": block ") + String(block) + String(" waited ")
+        what += String(secs)
+        what += String(" s for the other blocks of its own kernel")
     elif peer == FAULT_NO_PEER:
         # The NVLS barrier is a multicast counter, not a per-peer flag.
         what += String(" (arena ") + String(arena) + String(", phase ")
@@ -852,9 +1057,11 @@ def _latched_error(mut state: CommState) -> Int32:
     checking it is what turned a timed-out barrier from a silently wrong
     result into a failed call. Neither check touches a stream.
     """
+    if _submission_failed(state):
+        return NCCL_REMOTE_ERROR
     if state.ib != 0 and ib_error(state.ib) != 0:
         return NCCL_REMOTE_ERROR
-    if _fault_code(state) != 0:
+    if _fault_code(state) != 0 or _host_fault_word(state) != 0:
         _report_fault(state)
         return NCCL_REMOTE_ERROR
     return NCCL_SUCCESS
@@ -1134,6 +1341,26 @@ def _bootstrap(
         )
 
     var cap_bytes = _region_cap_bytes()
+    var fused_cap = fused_block_cap()
+    var fused_big_cap = fused_big_block_cap()
+    var fused_big = fused_big_bytes()
+    var split_unit = _pipe_split_unit()
+    var fused = False
+    var fused_resident = 0
+    # The NVLS grid and the fused grid must be entirely resident, so both are
+    # functions of this device's SM count, not constants. MAX's attribute
+    # query answers on both vendors (the driver-binding one, `vmm.sm_count`,
+    # is NVIDIA-only and reads 0 on AMD, which would leave AMD on the split
+    # schedule for no reason); the binding is the fallback.
+    var device_sms: Int
+    try:
+        device_sms = Int(
+            ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+        )
+    except:
+        device_sms = 0
+    if device_sms <= 0:
+        device_sms = sm_count(lib, ordinal)
     # A positive multiple of 4096 (the kernels' own precondition,
     # RESULTS.md section 9) is what keeps every per-chunk offset the
     # collectives form 16-byte aligned for every supported dtype.
@@ -1316,6 +1543,20 @@ def _bootstrap(
             )
             ib_set_abort_word(ib, abort_dev, abort_host)
 
+        # The schedule this rank will run and the fused kernel's residency,
+        # decided before round 2 so the peers can check them. The probe
+        # compiles the fp32 kernel now rather than at the first collective.
+        if (
+            _fused_enabled()
+            and ib != 0
+            and ib_uses_proxy(ib)
+            and device_sms > 0
+        ):
+            fused_resident = fused_resident_blocks(
+                ctx, topo.local_world, device_sms
+            )
+            fused = fused_resident > 0
+
         # Round 2: IPC handle + IB connection data + the geometry every rank has
         # to agree on. `MOJOCCL_REGION_MB` reaching one rank and not another
         # (a per-node environment, a stale export) silently gives the peers
@@ -1323,7 +1564,7 @@ def _bootstrap(
         # a per-rank `MOJOCCL_NVLS_MIN_MB` sends one rank into the multicast
         # counter barrier and another into the flag barrier, which is a hang.
         # Checking three integers here turns both into a message.
-        comptime CFG_BYTES = 24
+        comptime CFG_BYTES = 88
         comptime BLOB2 = HANDLE_BYTES + IB_BLOB_BYTES + CFG_BYTES
         var b2 = unsafe_alloc[UInt8](BLOB2)
         for i in range(BLOB2):
@@ -1348,6 +1589,21 @@ def _bootstrap(
             narenas * 1000 + INBOX_SLOTS + (1_000_000 if use_nvls else 0)
         )
         cfg[unsafe_offset=2] = Int64(nvls_min if use_nvls else 0)
+        cfg[unsafe_offset=3] = Int64(fused_cap)
+        cfg[unsafe_offset=4] = Int64(split_unit)
+        cfg[unsafe_offset=5] = Int64(fused_big_cap)
+        cfg[unsafe_offset=6] = Int64(fused_big)
+        # The effective schedule and the fused kernel's geometry. The split
+        # and fused schedules launch different grids and the barriers are
+        # block-matched, so a rank on the other schedule, built with another
+        # thread count, or on a GPU that holds a different number of blocks
+        # would sync a different slice of the data: a hang or a race, caught
+        # here as a message. The two device numbers are compared within a
+        # node only -- the barriers never cross nodes.
+        cfg[unsafe_offset=7] = Int64(1 if fused else 0)
+        cfg[unsafe_offset=8] = Int64(FUSED_THREADS)
+        cfg[unsafe_offset=9] = Int64(fused_resident)
+        cfg[unsafe_offset=10] = Int64(device_sms)
         var t2 = unsafe_alloc[UInt8](BLOB2 * nranks)
         bootstrap_allgather(conn, _any(b2), BLOB2, _any(t2), timeout_s)
         for r in range(nranks):
@@ -1361,6 +1617,12 @@ def _bootstrap(
                 rcfg[unsafe_offset=0] != cfg[unsafe_offset=0]
                 or rcfg[unsafe_offset=1] != cfg[unsafe_offset=1]
                 or rcfg[unsafe_offset=2] != cfg[unsafe_offset=2]
+                or rcfg[unsafe_offset=3] != cfg[unsafe_offset=3]
+                or rcfg[unsafe_offset=4] != cfg[unsafe_offset=4]
+                or rcfg[unsafe_offset=5] != cfg[unsafe_offset=5]
+                or rcfg[unsafe_offset=6] != cfg[unsafe_offset=6]
+                or rcfg[unsafe_offset=7] != cfg[unsafe_offset=7]
+                or rcfg[unsafe_offset=8] != cfg[unsafe_offset=8]
             ):
                 raise Error(
                     "mojoccl: rank "
@@ -1377,9 +1639,52 @@ def _bootstrap(
                     + String(Int(cfg[unsafe_offset=1]))
                     + " / "
                     + String(Int(cfg[unsafe_offset=2]) // (1024 * 1024))
-                    + " MiB; MOJOCCL_REGION_MB and MOJOCCL_NVLS_MIN_MB must"
-                    " match"
-                    " on every rank"
+                    + " MiB and a fused grid of "
+                    + String(Int(cfg[unsafe_offset=3]))
+                    + "/"
+                    + String(Int(cfg[unsafe_offset=5]))
+                    + " from "
+                    + String(Int(cfg[unsafe_offset=6]) // (1024 * 1024))
+                    + " MiB against that rank's "
+                    + String(Int(rcfg[unsafe_offset=3]))
+                    + "/"
+                    + String(Int(rcfg[unsafe_offset=5]))
+                    + " from "
+                    + String(Int(rcfg[unsafe_offset=6]) // (1024 * 1024))
+                    + " MiB, and a split unit of "
+                    + String(Int(cfg[unsafe_offset=4]))
+                    + " against that rank's "
+                    + String(Int(rcfg[unsafe_offset=4]))
+                    + ", schedule "
+                    + ("fused" if cfg[unsafe_offset=7] != 0 else "split")
+                    + " x "
+                    + String(Int(cfg[unsafe_offset=8]))
+                    + " threads against that rank's "
+                    + ("fused" if rcfg[unsafe_offset=7] != 0 else "split")
+                    + " x "
+                    + String(Int(rcfg[unsafe_offset=8]))
+                    + "; MOJOCCL_REGION_MB, MOJOCCL_NVLS_MIN_MB,"
+                    " MOJOCCL_FUSED_BLOCKS, MOJOCCL_FUSED_BIG_BLOCKS,"
+                    " MOJOCCL_FUSED_BIG_MB, MOJOCCL_PIPE_SPLIT_UNIT,"
+                    " MOJOCCL_FUSED, MOJOCCL_IB_PROXY and the build's"
+                    " ccl_fused_threads must match on every rank"
+                )
+            if topo.node_of[r] == topo.my_node and (
+                rcfg[unsafe_offset=9] != cfg[unsafe_offset=9]
+                or rcfg[unsafe_offset=10] != cfg[unsafe_offset=10]
+            ):
+                raise Error(
+                    "mojoccl: rank "
+                    + String(r)
+                    + " on this node can hold "
+                    + String(Int(rcfg[unsafe_offset=9]))
+                    + " blocks of the fused allreduce kernel on "
+                    + String(Int(rcfg[unsafe_offset=10]))
+                    + " multiprocessors, this rank "
+                    + String(fused_resident)
+                    + " on "
+                    + String(device_sms)
+                    + "; the ranks of a node must run identical GPUs"
                 )
 
         # Same-node peers only: an IPC handle from another host is meaningless.
@@ -1433,10 +1738,7 @@ def _bootstrap(
     var rank_at = List[Int]()
     for i in range(len(topo.rank_at)):
         rank_at.append(topo.rank_at[i])
-    # Read before `lib` is moved into the state. The NVLS grid must be
-    # entirely resident (see `nvls_blocks`), so it is a function of this
-    # device's SM count, not a constant.
-    var nvls_grid = nvls_blocks(sm_count(lib, ordinal))
+    var nvls_grid = nvls_blocks(device_sms)
     var state = CommState(
         rank=rank,
         world=nranks,
@@ -1461,6 +1763,13 @@ def _bootstrap(
         nvls_on=use_nvls,
         nvls_grid=nvls_grid,
         nvls_min=nvls_min,
+        sm_count=device_sms,
+        fused_cap=fused_cap,
+        fused_big_cap=fused_big_cap,
+        fused_big_bytes=fused_big,
+        fused_resident=fused_resident,
+        split_unit=split_unit,
+        fused=fused,
         abort_host=abort_host,
         abort_dev=abort_dev,
     )
@@ -1471,53 +1780,22 @@ def _bootstrap(
 
 
 def _cached_stream_handles(state: CommState) -> List[Int64]:
-    """Every raw stream handle wrapped in `state.stream_cache`, copied into a
-    plain List.
-
-    Kept to exactly this -- iterating `Dict.keys()` inside a `raises`
-    function narrows the function's inferred error type to `DictKeyError`,
-    which then rejects every unrelated `raise Error(...)` still in scope. A
-    helper doing nothing else keeps that narrowing from leaking into
-    `_drain_all_streams` or its callers.
-    """
+    """Copy cached stream handles for abort's bounded polling."""
     var handles = List[Int64]()
     for h in state.stream_cache.keys():
         handles.append(h)
     return handles^
 
 
-def _async_error_stream(state: CommState) -> DeviceStream:
-    """The stream `ncclCommGetAsyncError` synchronizes: the cached wrapper for
-    the stream a collective last ran on, or the communicator's own if none
-    has.
+def _drain_all_streams(state: CommState) raises:
+    """The last completion event covers the total order across all streams.
 
-    A helper of its own for the same reason `_cached_stream_handles` is one:
-    indexing a `Dict` narrows the enclosing function's inferred error type to
-    `DictKeyError`, which then rejects every unrelated `raise Error(...)`
-    still in scope. It also takes no lock, so `last_stream` may be set by a
-    concurrent submission a moment before that stream is cached -- hence the
-    membership test rather than an insert.
+    Caller-owned streams may already be destroyed; only the event is ours.
     """
-    try:
-        if state.last_stream != 0 and state.last_stream in state.stream_cache:
-            return state.stream_cache[state.last_stream]
-    except:
-        # Lost the race with a concurrent insert: the communicator's own
-        # stream is always a valid answer.
-        return state.own_stream
-    return state.own_stream
-
-
-def _drain_all_streams(mut state: CommState) raises:
-    """Synchronize every stream a collective has ever run on.
-
-    `state.last_stream` is only the MOST RECENT one: `stream_cache` can hold
-    several (the side-stream test in the suite uses two), and an exchange
-    still in flight on a stream that isn't the last one used would otherwise
-    find its QPs destroyed out from under it by `ncclCommDestroy`.
-    """
-    for h in _cached_stream_handles(state):
-        state.stream_cache[h].synchronize()
+    if state.order_incomplete:
+        raise Error("collective completion was not recorded; abort required")
+    if state.order_recorded:
+        state.order_event.synchronize()
 
 
 # ---------------------------------------------------------------------------
@@ -1556,6 +1834,7 @@ def _release_resources(mut state: CommState) raises:
         free_host(state.driver, state.abort_host)
         state.abort_host = 0
         state.abort_dev = 0
+    state.order_event.release()
     state.released = True
 
 
@@ -1566,10 +1845,7 @@ def _destroy_locked(comm: Int64) -> Int32:
         # abort either ran this same unwind or decided it could not safely.
         if state.released or state.aborted:
             return NCCL_SUCCESS
-        # The inter-node callbacks were enqueued on the CALLER's stream(s),
-        # not on the context's own, and they dereference the IbState this
-        # tears down -- so drain every cached stream too before touching
-        # it, not just the last one used (see `_drain_all_streams`).
+        # Completion includes all inter-node callbacks that use IbState.
         _drain_all_streams(state)
         state.ctx.synchronize()
         _release_resources(state)
@@ -1579,20 +1855,20 @@ def _destroy_locked(comm: Int64) -> Int32:
 
 
 def _abort_quiesced(state: CommState, deadline_ns: Int) -> Bool:
-    """Poll every stream a collective ran on until all are idle, or the
-    deadline passes.
-
-    `cuStreamQuery`, not `cuStreamSynchronize`: the point of the abort word is
-    that the spin kernels are already on their way out, and a synchronize
-    would be exactly the unbounded wait abort promises not to do.
+    """Poll owned completion; failed submissions need conservative stream checks.
     """
-    var handles = _cached_stream_handles(state)
+    var handles = List[Int64]()
+    if state.order_incomplete:
+        handles = _cached_stream_handles(state)
     while True:
         var pending = False
-        for i in range(len(handles)):
-            if not stream_done(state.driver, Int(handles[i])):
-                pending = True
-                break
+        if not state.order_incomplete:
+            pending = state.order_recorded and not state.order_event.done()
+        else:
+            for i in range(len(handles)):
+                if not stream_done(state.driver, Int(handles[i])):
+                    pending = True
+                    break
         if not pending:
             return True
         if perf_counter_ns() > deadline_ns:
@@ -1674,7 +1950,7 @@ def ncclCommGetAsyncError(
             # Host-side state, so it needs no device read.
             err_out[] = NCCL_REMOTE_ERROR
             return NCCL_SUCCESS
-        if _fault_code(state) != 0:
+        if _fault_code(state) != 0 or _host_fault_word(state) != 0:
             # A device deadline, latched in the status page. Also host memory,
             # so a watchdog polling this function pays nothing for it and --
             # unlike the arena read below -- does not block behind the kernel
@@ -1682,38 +1958,46 @@ def ncclCommGetAsyncError(
             _report_fault(state)
             err_out[] = NCCL_REMOTE_ERROR
             return NCCL_SUCCESS
-        # Synchronize first: the freshest read this cheaply-checkable word
-        # can give is "everything enqueued so far landed", same as before --
-        # only the read itself changes, from a host dereference of device
-        # memory (wrong) to a real D2H copy (_read_error_word).
-        # The wrapper comes out of the same cache the collectives use, and
-        # `own_stream` covers the case where no collective has named a stream
-        # yet. This poll takes no lock, so `last_stream` can be set by a
-        # concurrent submission a moment before it is cached -- hence the
-        # membership test rather than an insert.
-        var s = _async_error_stream(state)
-        s.synchronize()
-        if state.ib != 0 and ib_error(state.ib) != 0:
-            # A proxy failure during that sync releases the spin kernels
-            # through MB_DONE without touching the device error word; the
-            # host word is the only record of it.
+        if _submission_failed(state):
             err_out[] = NCCL_REMOTE_ERROR
             return NCCL_SUCCESS
-        # One error word per pipeline arena: a multi-node allreduce spreads
-        # its chunks over all of them, and a barrier that gave up did so in
-        # exactly one.
-        for a in range(state.narenas):
-            var word = _read_error_word(
-                state,
-                state.regions[state.local_rank] + a * state.arena_stride,
-            )
-            if Int(word) != 0:
-                err_out[] = NCCL_REMOTE_ERROR
-                return NCCL_SUCCESS
-        err_out[] = NCCL_SUCCESS
+        # Never read ordering fields or share poll scratch without the lock.
+        # A busy submitter is healthy unless it publishes a terminal failure.
+        if not _try_lock(state, perf_counter_ns()):
+            err_out[] = NCCL_REMOTE_ERROR if _submission_failed(
+                state
+            ) else NCCL_SUCCESS
+            return NCCL_SUCCESS
+        try:
+            err_out[] = _async_error_locked(state)
+        except e:
+            _unlock(state)
+            raise e
+        _unlock(state)
         return NCCL_SUCCESS
     except:
         return NCCL_INTERNAL_ERROR
+
+
+def _async_error_locked(mut state: CommState) raises -> Int32:
+    if state.aborted or state.released:
+        return NCCL_SYSTEM_ERROR
+    if _submission_failed(state):
+        return NCCL_REMOTE_ERROR
+    # Do not hold up submissions behind unfinished GPU work.
+    if state.order_recorded and not state.order_event.query():
+        return NCCL_SUCCESS
+    _drain_all_streams(state)
+    if state.ib != 0 and ib_error(state.ib) != 0:
+        return NCCL_REMOTE_ERROR
+    for a in range(state.narenas):
+        var word = _read_error_word(
+            state,
+            state.regions[state.local_rank] + a * state.arena_stride,
+        )
+        if Int(word) != 0:
+            return NCCL_REMOTE_ERROR
+    return NCCL_SUCCESS
 
 
 @export
@@ -1839,7 +2123,10 @@ def _max_chunk_bytes(state: CommState) -> Int:
 
 def _pipeline_chunk_bytes(state: CommState, total_bytes: Int) -> Int:
     return pipeline_chunk_bytes(
-        _max_chunk_bytes(state), state.local_world, total_bytes
+        _max_chunk_bytes(state),
+        state.local_world,
+        total_bytes,
+        state.split_unit,
     )
 
 
@@ -2052,15 +2339,176 @@ def _do_allreduce[
             done += chunk
         return
 
-    # Multi-node: hierarchical and pipelined. Chunk k is issued as
-    # reduce-scatter, release; its wait / add / all-gather come `depth-1`
-    # chunks later, so between them the GPU runs whole chunks of other work
-    # while the proxy exchanges this one. `depth <= narenas` is what keeps
-    # chunk k+narenas's reduce-scatter enqueued AFTER chunk k's all-gather,
-    # which is what the arena's start barrier needs to order the reuse.
+    # The fused kernel files every chunk's work item before it launches, so a
+    # collective of more chunks than the ring has slots would wait on itself
+    # (`_await_ring_slot`); geometry can cut a large message that finely
+    # (129 MiB at MOJOCCL_REGION_MB=1 is over 500 chunks). The split schedule
+    # releases chunks as it goes and has no such bound.
+    var plan = _pipeline_plan(state, count, item)
+    if state.fused and plan[1] <= WORK_SLOTS:
+        _do_allreduce_fused[dtype](
+            state, stream, sendbuff, recvbuff, count, scale, plan
+        )
+        return
+    _do_allreduce_split[dtype](
+        state, stream, raw_stream, sendbuff, recvbuff, count, scale, plan
+    )
+
+
+def _pipeline_plan(
+    mut state: CommState, count: Int, item: Int
+) -> Tuple[Int, Int, Int]:
+    """`(chunk_elems, nchunks, depth)` of a pipelined multi-node allreduce.
+
+    Shared by the fused and the split schedules so they cut a bucket the same
+    way: the only difference between them is who runs the loop.
+    """
     var chunk_elems = max(1, _pipeline_chunk_bytes(state, count * item) // item)
     var nchunks = (count + chunk_elems - 1) // chunk_elems
-    var depth = min(state.narenas, nchunks)
+    return Tuple(chunk_elems, nchunks, min(state.narenas, nchunks))
+
+
+def _do_allreduce_fused[
+    dtype: DType
+](
+    mut state: CommState,
+    stream: DeviceStream,
+    sendbuff: Int,
+    recvbuff: Int,
+    count: Int,
+    scale: Float32,
+    plan: Tuple[Int, Int, Int],
+) raises:
+    """The pipelined multi-node allreduce as one launch (internode_fused.mojo).
+
+    Everything below the launch is what `_do_allreduce_split` does per chunk,
+    hoisted: the exchange counters are reserved as one run, every chunk's work
+    item is filled before the kernel starts, and the kernel publishes the
+    counters, waits for them and releases the inbox slots itself. The host
+    touches the driver exactly once.
+    """
+    comptime item = size_of[dtype]()
+    comptime W = 16 // item
+    var chunk_elems = plan[0]
+    var nchunks = plan[1]
+    var npeers = ib_npeers(state.ib)
+    var group = _inbox_group_bytes(state)
+    # Two generations per chunk, reserved up front, so each chunk's
+    # all-gather is its own reduce-scatter's plus one (the split kernels'
+    # documented pairing).
+    # Every reason to refuse the call comes before anything is reserved:
+    # the largest chunk (the first) sets the largest inbox slot.
+    check_fused_call[dtype](
+        sendbuff, recvbuff, chunk_elems, state.arena_cap, nchunks
+    )
+    var sr0 = shard_range(
+        min(chunk_elems, count), state.local_world, state.local_rank, item
+    )
+    if npeers * _align_up(max(sr0[1] * item, EMPTY_SHARD_BYTES), 16) > group:
+        raise Error(
+            "mojoccl: the inter-node inbox overflows the network area; this"
+            " is a chunking bug"
+        )
+    var g0 = state.generation + 1
+    state.generation += 2 * nchunks
+    var seq0 = ib_reserve_seqs(state.ib, nchunks)
+    for k in range(nchunks):
+        var off = k * chunk_elems
+        var cnt = min(chunk_elems, count - off)
+        var sr = shard_range(cnt, state.local_world, state.local_rank, item)
+        var nbytes = sr[1] * item
+        var slot_bytes = _align_up(max(nbytes, EMPTY_SHARD_BYTES), 16)
+        var seq = seq0 + k
+        var inbox_base = _inbox_base(state, seq)
+        var shard = _arena_shard(state, k % state.narenas, sr[0] * item)
+        # A rank with an empty shard still exchanges, with EMPTY_SHARD_BYTES
+        # of ignored payload -- every exchange is all-to-all because an
+        # arrival tally of `npeers` is what completes one.
+        ib_prepare_request(
+            state.ib,
+            shard if sr[1] > 0 else state.owned_base,
+            nbytes if sr[1] > 0 else EMPTY_SHARD_BYTES,
+            inbox_base,
+            slot_bytes,
+            True,
+            npeers,
+            state.owned_base + inbox_base if sr[1] > 0 else 0,
+            seq,
+            OP_ALLREDUCE,
+            k,
+            nchunks,
+            cnt,
+        )
+    try:
+        internode_allreduce_fused[dtype](
+            state.ctx,
+            stream,
+            state.local_rank,
+            state.local_world,
+            state.regions,
+            sendbuff,
+            recvbuff,
+            ib_mailbox_dev(state.ib),
+            count,
+            chunk_elems,
+            nchunks,
+            plan[2],
+            state.narenas,
+            state.arena_stride,
+            state.arena_cap,
+            seq0,
+            state.net_off + state.cap_bytes // 2,
+            group,
+            state.nslots,
+            npeers,
+            g0,
+            scale,
+            fused_blocks(
+                state.fused_big_cap if count * item
+                >= state.fused_big_bytes else state.fused_cap,
+                state.fused_resident,
+                _shard_per(chunk_elems, state.local_world, W),
+                W,
+            ),
+            spin_timeout_ns(),
+        )
+    except e:
+        # The exchanges are reserved and the peers will wait for this rank's
+        # flags: fail the communicator now, so every later call here returns
+        # ncclRemoteError and the peers' own deadlines say what happened,
+        # instead of a hang.
+        _latch_host_fault(state, ERR_HOST_LAUNCH, seq0)
+        raise e
+
+
+def _do_allreduce_split[
+    dtype: DType
+](
+    mut state: CommState,
+    stream: DeviceStream,
+    raw_stream: Int64,
+    sendbuff: Int,
+    recvbuff: Int,
+    count: Int,
+    scale: Float32,
+    plan: Tuple[Int, Int, Int],
+) raises:
+    """The pipelined multi-node allreduce as five kernels per chunk.
+
+    What ran before `_do_allreduce_fused`, kept for `MOJOCCL_IB_PROXY=0` --
+    where the exchange happens in a stream callback and there is no point
+    inside a kernel for it to run at -- and for `MOJOCCL_FUSED=0`.
+    """
+    comptime item = size_of[dtype]()
+    # Chunk k is issued as reduce-scatter, release; its wait / add /
+    # all-gather come `depth-1` chunks later, so between them the GPU runs
+    # whole chunks of other work while the proxy exchanges this one.
+    # `depth <= narenas` is what keeps chunk k+narenas's reduce-scatter
+    # enqueued AFTER chunk k's all-gather, which is what the arena's start
+    # barrier needs to order the reuse.
+    var chunk_elems = plan[0]
+    var nchunks = plan[1]
+    var depth = plan[2]
     # AVG's 1/world is applied by the reduce-scatter to each input (NCCL's
     # PreMulSum): the node partials that cross the network and the inbox add
     # are then already scaled, so no fp16 sum ever exceeds the average, and
@@ -2148,8 +2596,16 @@ def ncclAllReduce(
                 comm, sendbuff, recvbuff, count, datatype, op, stream
             )
         except e:
+            _fail_submission(state)
             _unlock(state)
             raise e
+        if rc == NCCL_SUCCESS:
+            try:
+                _order_after(state, stream)
+            except e:
+                _fail_submission(state)
+                _unlock(state)
+                raise e
         _unlock(state)
         return rc
     except e:
@@ -2172,8 +2628,9 @@ def _allreduce_locked(
     var latched = _latched_error(state)
     if latched != NCCL_SUCCESS:
         return latched
-    state.last_stream = stream
-    _ensure_stream_cached(state, stream)
+    if state.order_incomplete:
+        return NCCL_REMOTE_ERROR
+    _order_before(state, stream)
     ref s = state.stream_cache[stream]
     var scale = Float32(1.0)
     if op == NCCL_AVG:
@@ -2253,8 +2710,16 @@ def ncclBroadcast(
                 comm, sendbuff, recvbuff, Int(count) * item, root, stream
             )
         except e:
+            _fail_submission(state)
             _unlock(state)
             raise e
+        if rc == NCCL_SUCCESS:
+            try:
+                _order_after(state, stream)
+            except e:
+                _fail_submission(state)
+                _unlock(state)
+                raise e
         _unlock(state)
         return rc
     except e:
@@ -2278,8 +2743,9 @@ def _broadcast_locked(
     var latched = _latched_error(state)
     if latched != NCCL_SUCCESS:
         return latched
-    state.last_stream = stream
-    _ensure_stream_cached(state, stream)
+    if state.order_incomplete:
+        return NCCL_REMOTE_ERROR
+    _order_before(state, stream)
     ref s = state.stream_cache[stream]
     if state.nnodes == 1:
         var max_bytes = max(1, state.cap_bytes)
@@ -2462,8 +2928,16 @@ def ncclAllGather(
                 comm, sendbuff, recvbuff, Int(sendcount) * item, stream
             )
         except e:
+            _fail_submission(state)
             _unlock(state)
             raise e
+        if rc == NCCL_SUCCESS:
+            try:
+                _order_after(state, stream)
+            except e:
+                _fail_submission(state)
+                _unlock(state)
+                raise e
         _unlock(state)
         return rc
     except e:
@@ -2484,8 +2958,9 @@ def _allgather_locked(
     var latched = _latched_error(state)
     if latched != NCCL_SUCCESS:
         return latched
-    state.last_stream = stream
-    _ensure_stream_cached(state, stream)
+    if state.order_incomplete:
+        return NCCL_REMOTE_ERROR
+    _order_before(state, stream)
     ref s = state.stream_cache[stream]
     if state.nnodes == 1:
         # AMD's push all-gather stages `world-1` slots, so its chunk is

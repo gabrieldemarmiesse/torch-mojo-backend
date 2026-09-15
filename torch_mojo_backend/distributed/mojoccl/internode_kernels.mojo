@@ -83,11 +83,32 @@ def _inbox_add_kernel[
     the remote sums arrived rounded already, so a wider accumulator here
     would buy nothing.
     """
-    var tid = Int(global_idx.x)
-    var stride = Int(grid_dim.x) * BLOCK
-    var n = Int(count)
-    var npeers = Int(npeers_i)
-    var sb = Int(slot_bytes)
+    _inbox_add_body[dtype, W](
+        shard,
+        inbox,
+        Int(count),
+        Int(slot_bytes),
+        Int(npeers_i),
+        Int(global_idx.x),
+        Int(grid_dim.x) * BLOCK,
+    )
+
+
+@always_inline
+def _inbox_add_body[
+    dtype: DType, W: Int
+](
+    shard: Pointer[Scalar[dtype], MutAnyOrigin],
+    inbox: Pointer[UInt8, MutAnyOrigin],
+    n: Int,
+    sb: Int,
+    npeers: Int,
+    tid: Int,
+    stride: Int,
+):
+    """`_inbox_add_kernel`'s body, shared with the fused inter-node kernel
+    (internode_fused.mojo), which runs it once per chunk on its own
+    grid-stride slice."""
     var nv = n // W
 
     for v in range(tid, nv, stride):

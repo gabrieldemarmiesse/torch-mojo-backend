@@ -334,6 +334,38 @@ def test_native_layer_norm_backward_output_masks(mojo_gpu, mask):
             assert got[i] is None  # an undefined Tensor, as ATen returns it
 
 
+@pytest.mark.parametrize("has_weight", [False, True])
+@pytest.mark.parametrize("cols", [1028, 1600, 2048, 2052])
+def test_native_layer_norm_backward_wide_rows(mojo_gpu, cols, has_weight):
+    """Rows wider than the eight-chunk warp regime: 1028-2048 columns take the
+    half-block c16 kernel (1600 is GPT-2 XL's width), 2052 the generic one;
+    37 rows so the row grid-stride runs a partial last block."""
+    x = torch.randn(37, cols)
+    w = torch.randn(cols) if has_weight else None
+    b = torch.randn(cols) if has_weight else None
+    grad = torch.randn(37, cols)
+    _, mean, rstd = torch.native_layer_norm(x, (cols,), w, b, 1e-5)
+    want = torch.ops.aten.native_layer_norm_backward(
+        grad, x, [cols], mean, rstd, w, b, [True, has_weight, has_weight]
+    )
+    dev = lambda t: None if t is None else t.to(mojo_gpu)  # noqa: E731
+    with ran("aten::native_layer_norm_backward"):
+        got = torch.ops.aten.native_layer_norm_backward(
+            dev(grad),
+            dev(x),
+            [cols],
+            dev(mean),
+            dev(rstd),
+            dev(w),
+            dev(b),
+            [True, has_weight, has_weight],
+        )
+    torch.testing.assert_close(got[0].cpu(), want[0], atol=1e-4, rtol=1e-4)
+    if has_weight:
+        torch.testing.assert_close(got[1].cpu(), want[1], atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(got[2].cpu(), want[2], atol=1e-3, rtol=1e-3)
+
+
 def test_native_layer_norm_backward_empty_rows(mojo_gpu):
     x = torch.randn(0, 9)
     w = torch.randn(9)
