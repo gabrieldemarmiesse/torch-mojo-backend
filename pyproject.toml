@@ -12,7 +12,6 @@ requires-python = ">=3.11"
 dependencies = [
     "mojo==1.0",
     "max==26.5",
-    # The per-user cache directory the compiled native libraries live in.
     "platformdirs",
     "tabulate",
     "torch>=2.10",
