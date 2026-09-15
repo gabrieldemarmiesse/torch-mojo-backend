@@ -23,8 +23,8 @@ from max.gpu.host import (
 from vendor import Vendor, raw_stream
 
 comptime BufP = Pointer[Buf, MutUntrackedOrigin]
+comptime PinnedP = Pointer[Pinned, MutUntrackedOrigin]
 comptime EvP = Pointer[Ev, MutUntrackedOrigin]
-comptime StagingP = Pointer[Staging, MutUntrackedOrigin]
 comptime U8P = Pointer[UInt8, MutUntrackedOrigin]
 comptime POOL_STREAMS = 4
 
@@ -44,7 +44,7 @@ struct Dev(Movable):
     var is_cpu: Bool
     var pool: List[Int]
     var pool_next: Int
-    var staging: List[Int]  # pending pageable-H2D staging boxes (addresses)
+    var pending_host: List[Int]  # freed pinned / H2D staging boxes (addresses)
 
     def __init__(out self, var ctx: DeviceContext, is_cpu: Bool) raises:
         self.api = ctx.api()
@@ -58,7 +58,7 @@ struct Dev(Movable):
         )  # filled once the vendor driver exists (init_backend)
         self.pool = List[Int]()
         self.pool_next = 0
-        self.staging = List[Int]()
+        self.pending_host = List[Int]()
         self.ctx = ctx^
 
     def view(self, s: Int) raises -> DeviceContext:
@@ -72,6 +72,7 @@ struct Backend(Movable):
     var devices: List[Dev]
     var vendor: Optional[Vendor]
     var n_accel: Int
+    var pinned: List[Int]  # Pinned box addresses, sorted by buffer base
 
 
 comptime BACKEND_GLOBAL = "TMB_NATIVE_BACKEND"
@@ -130,7 +131,7 @@ def init_backend() raises -> Int:
         devs.append(Dev(DeviceContext(i, api=api), False))
     devs.append(Dev(DeviceContext(api="cpu"), True))
     var box = unsafe_alloc[Backend](1)
-    box.unsafe_write(Backend(devs^, vendor^, n))
+    box.unsafe_write(Backend(devs^, vendor^, n, List[Int]()))
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(BACKEND_GLOBAL), box.unsafe_bitcast[NoneType]()
     )
@@ -216,6 +217,133 @@ def h_free(handle: Int) abi("C"):
     _ = moved^
 
 
+@fieldwise_init
+struct Pinned(Movable):
+    var buf: Optional[HostBuffer[DType.uint8]]
+    var base: Int
+    var nbytes: Int
+    var device: Int  # host memory is not necessarily portable across devices
+    # The device above plus each stream below identifies an async user.
+    var users: List[Int]
+    var remaining: Atomic[DType.int32]  # decremented by driver callbacks
+
+
+def _pinned_lower_bound(base: Int) -> Int:
+    ref blocks = be()[].pinned
+    var lo = 0
+    var hi = len(blocks)
+    while lo < hi:
+        var mid = lo + (hi - lo) // 2
+        if PinnedP(unsafe_from_address=blocks[mid])[].base < base:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def h_host_alloc(
+    nbytes: Int, device: Int32, data: Pointer[Int, MutUntrackedOrigin]
+) abi("C") -> Int:
+    try:
+        var index = Int(device)
+        if index < 0 or index >= len(be()[].devices):
+            index = len(be()[].devices) - 1
+        var d = dev(index)
+        _drain_host(d)
+        var buf = Optional[HostBuffer[DType.uint8]]()
+        var base = 0
+        if nbytes != 0:
+            var ctx = d[].ctx
+            buf = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+            base = Int(buf.value().unsafe_ptr())
+        # Zero bytes still need a handle to free, but have no address to pin.
+        var box = unsafe_alloc[Pinned](1)
+        box.unsafe_write(
+            Pinned(
+                buf^, base, nbytes, index, List[Int](), Atomic[DType.int32](0)
+            )
+        )
+        if nbytes != 0:
+            be()[].pinned.insert(_pinned_lower_bound(base), Int(box))
+        data[] = base
+        return Int(box)
+    except e:
+        set_error(String(e))
+        return 0
+
+
+def h_host_free(handle: Int) abi("C"):
+    if handle == 0:
+        return
+    var box = PinnedP(unsafe_from_address=handle)
+    if box[].nbytes != 0:
+        ref blocks = be()[].pinned
+        var i = _pinned_lower_bound(box[].base)
+        # A missing or mismatched handle must not remove another live allocation.
+        if i >= len(blocks) or blocks[i] != handle:
+            return
+        _ = blocks.pop(i)
+    # Removing it from the live registry marks it freed: no new async users.
+    if len(box[].users) > 0:
+        box[].remaining.store(Int32(len(box[].users)))
+        try:
+            var d = dev(box[].device)
+            d[].pending_host.append(handle)
+            for j in range(len(box[].users)):
+                _defer_host_free(d[].view(box[].users[j]), box)
+            _drain_host(d)
+        except e:
+            # A failed synchronization must retain the buffer, even if some
+            # callbacks were already queued. Unfinished counts keep it alive.
+            set_error(String(e))
+        return
+    var moved = box.unsafe_take_pointee()
+    box.unsafe_free()
+    _ = moved^
+
+
+def _pinned_block(ptr: Int) -> Optional[PinnedP]:
+    """Live allocation containing ptr, including interior pointers."""
+    ref blocks = be()[].pinned
+    var i = _pinned_lower_bound(ptr)
+    if i < len(blocks) and PinnedP(unsafe_from_address=blocks[i])[].base == ptr:
+        return PinnedP(unsafe_from_address=blocks[i])
+    if i == 0:
+        return None
+    var box = PinnedP(unsafe_from_address=blocks[i - 1])
+    if ptr - box[].base < box[].nbytes:
+        return box
+    return None
+
+
+def h_is_pinned_ptr(ptr: Int) abi("C") -> Int32:
+    if _pinned_block(ptr):
+        return 1
+    return external_call["tmb_cuda_is_pinned_ptr", Int32](ptr)
+
+
+def _record_pinned_use(ctx: DeviceContext, ptr: Int) raises -> Bool:
+    """Only our own pinned blocks can defer their free against our streams."""
+    var found = _pinned_block(ptr)
+    if not found:
+        return False
+    var box = found.value()
+    var d = dev(box[].device)
+    if d[].is_cpu:
+        return False
+    # Match the actual context view, not the thread's current device/stream.
+    # This also rejects pinned blocks belonging to another mojo device.
+    for stream in range(len(d[].views)):
+        if ctx_ptr(d[].views[stream]) != ctx_ptr(ctx):
+            continue
+        for i in range(len(box[].users)):
+            if box[].users[i] == stream:
+                return True
+        box[].users.append(stream)
+        return True
+    return False
+
+
 def h_copy_data(
     dst: Int, src: Int, nbytes: Int, device: Int32, stream: Int64
 ) abi("C"):
@@ -268,46 +396,64 @@ def copy_d2d(ctx: DeviceContext, dst: Int, src: Int, nbytes: Int) raises:
 
 
 def copy_to_host(
-    ctx: DeviceContext, dev_ptr: Int, host_ptr: Int, nbytes: Int
+    ctx: DeviceContext,
+    dev_ptr: Int,
+    host_ptr: Int,
+    nbytes: Int,
+    non_blocking: Bool = False,
 ) raises:
-    """Blocking D2H."""
+    """D2H, asynchronous only into our device's live pinned host memory."""
     if nbytes == 0:
         return
+    var asynchronous = non_blocking and _record_pinned_use(ctx, host_ptr)
     var s = wrap_raw(ctx, dev_ptr, nbytes)
     s.enqueue_copy_to(U8P(unsafe_from_address=host_ptr))
-    ctx.synchronize()
+    if not asynchronous:
+        # Mojo guarantees completed pageable/foreign downloads even with
+        # non_blocking=True; CUDA's async API makes no such general promise.
+        # Foreign pinned allocations lack lifetime tracking on our streams.
+        ctx.synchronize()
 
 
-@fieldwise_init
-struct Staging(Movable):
-    var buf: HostBuffer[DType.uint8]
-    var done: Atomic[DType.int32]  # set from the driver's callback thread
+def _host_use_done(p: Pointer[NoneType, MutAnyOrigin]):
+    # No device API or destructor may run on the driver's callback thread.
+    _ = p.unsafe_bitcast[Pinned]()[].remaining.fetch_sub(1)
 
 
-def _staging_done(p: Pointer[NoneType, MutAnyOrigin]):
-    p.unsafe_bitcast[Staging]()[].done.store(1)
+def _defer_host_free(ctx: DeviceContext, box: PinnedP) raises:
+    var p = box.unsafe_bitcast[NoneType]().unsafe_origin_cast[MutAnyOrigin]()
+    try:
+        ctx.stream().enqueue_host_func(_host_use_done, p)
+    except e:
+        # MAX documents host callbacks as CUDA-only. HIP and other backends
+        # can reject them; synchronizing this stream makes its DMA safe too.
+        ctx.synchronize()
+        _host_use_done(p)
 
 
-def _drain_staging(d: Pointer[Dev, MutUntrackedOrigin]):
+def _drain_host(d: Pointer[Dev, MutUntrackedOrigin]):
     var keep = List[Int]()
-    for i in range(len(d[].staging)):
-        var box = StagingP(unsafe_from_address=d[].staging[i])
-        if box[].done.load() != 0:
+    for i in range(len(d[].pending_host)):
+        var box = PinnedP(unsafe_from_address=d[].pending_host[i])
+        if box[].remaining.load() == 0:
             var moved = box.unsafe_take_pointee()
             box.unsafe_free()
             _ = moved^
         else:
-            keep.append(d[].staging[i])
-    d[].staging = keep^
+            keep.append(d[].pending_host[i])
+    d[].pending_host = keep^
 
 
 def copy_from_host(
-    device: Int, ctx: DeviceContext, dev_ptr: Int, host_ptr: Int, nbytes: Int
+    device: Int,
+    ctx: DeviceContext,
+    dev_ptr: Int,
+    host_ptr: Int,
+    nbytes: Int,
+    non_blocking: Bool = False,
 ) raises:
-    """H2D from pageable host memory: on GPUs, stage through a MAX pinned
-    buffer (a synchronous memcpy, then an asynchronous DMA) and release the
-    staging buffer once a host callback reports the copy done. The CPU
-    device copies synchronously."""
+    """H2D: stream-ordered DMA from our pinned memory, otherwise a snapshot.
+    Direct blocking uploads synchronize; CPU and Metal copy synchronously."""
     if nbytes == 0:
         return
     var dst = wrap_raw(ctx, dev_ptr, nbytes)
@@ -318,7 +464,18 @@ def copy_from_host(
         ctx.synchronize()
         return
     var d = dev(device)
-    _drain_staging(d)
+    _drain_host(d)
+    if _record_pinned_use(ctx, host_ptr):
+        # Only our live registry blocks can have a pending async host write.
+        # Queue the read behind that download (or an explicit stream wait),
+        # including blocking uploads: a CPU staging memcpy would read too soon.
+        dst.enqueue_copy_from(U8P(unsafe_from_address=host_ptr))
+        if not non_blocking:
+            # DMA reads the caller's memory, so finish before it can be reused.
+            ctx.synchronize()
+        return
+    # Pageable, foreign-pinned and other-device sources need a snapshot
+    # because we cannot track their lifetimes on this device's streams.
     var host = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
     unsafe_memcpy(
         dest=host.unsafe_ptr(),
@@ -326,13 +483,25 @@ def copy_from_host(
         count=nbytes,
     )
     dst.enqueue_copy_from(host)
-    var box = unsafe_alloc[Staging](1)
-    box.unsafe_write(Staging(host^, Atomic[DType.int32](0)))
-    ctx.stream().enqueue_host_func(
-        _staging_done,
-        box.unsafe_bitcast[NoneType]().unsafe_origin_cast[MutAnyOrigin](),
+    var box = unsafe_alloc[Pinned](1)
+    var base = Int(host.unsafe_ptr())
+    box.unsafe_write(
+        Pinned(host^, base, nbytes, device, List[Int](), Atomic[DType.int32](1))
     )
-    d[].staging.append(Int(box))
+    d[].pending_host.append(Int(box))
+    _defer_host_free(ctx, box)
+    # The synchronous snapshot already lets the caller reuse its source.
+    _drain_host(d)
+
+
+def wait_for_host_read(ctx: DeviceContext, host_ptr: Int) raises:
+    """Order a CPU conversion/relayout after an eligible async download.
+
+    A stream wait only orders device work. Host reads must wait for the
+    stream itself; other-device/foreign sources require caller synchronization.
+    """
+    if _record_pinned_use(ctx, host_ptr):
+        ctx.synchronize()
 
 
 def read_bytes_sync(
@@ -379,7 +548,7 @@ def h_synchronize_device(device: Int32) abi("C"):
         var d = dev(Int(device))
         for i in range(len(d[].views)):
             d[].views[i].synchronize()
-        _drain_staging(d)
+        _drain_host(d)
     except e:
         set_error(String(e))
 
@@ -432,6 +601,7 @@ def h_stream_from_pool(device: Int32, high_priority: Int32) abi("C") -> Int64:
 def h_synchronize_stream(device: Int32, stream: Int64) abi("C"):
     try:
         stream_ctx(Int(device), Int(stream)).synchronize()
+        _drain_host(dev(Int(device)))
     except e:
         set_error(String(e))
 
@@ -598,9 +768,9 @@ def set_error(msg: String):
 
 
 def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
-    """The TmbBackendHooks struct (tmb.h): a u32 size then 23 function pointers.
+    """TmbBackendHooks (tmb.h): a u32 size padded to 8 bytes, then 25 pointers.
     """
-    comptime N = 24
+    comptime N = 26
     var t = unsafe_alloc[Int](N)
     for i in range(N):
         t[unsafe_offset=i] = 0
@@ -632,6 +802,11 @@ def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
     var f_evq: def(Int) thin abi("C") -> Int32 = h_event_query
     var f_evs: def(Int) thin abi("C") -> None = h_event_synchronize
     var f_eve: def(Int, Int) thin abi("C") -> Float64 = h_event_elapsed_ms
+    var f_host_alloc: def(
+        Int, Int32, Pointer[Int, MutUntrackedOrigin]
+    ) thin abi("C") -> Int = h_host_alloc
+    var f_host_free: def(Int) thin abi("C") -> None = h_host_free
+    var f_pinned: def(Int) thin abi("C") -> Int32 = h_is_pinned_ptr
     t[unsafe_offset=1] = Pointer(to=f_alloc).unsafe_bitcast[Int]()[]
     t[unsafe_offset=2] = Pointer(to=f_free).unsafe_bitcast[Int]()[]
     t[unsafe_offset=3] = Pointer(to=f_copy).unsafe_bitcast[Int]()[]
@@ -652,6 +827,9 @@ def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
     t[unsafe_offset=18] = Pointer(to=f_evs).unsafe_bitcast[Int]()[]
     t[unsafe_offset=19] = Pointer(to=f_eve).unsafe_bitcast[Int]()[]
     # 20..22: prof_mark / prof_range_push / prof_range_pop stay NULL for now
+    t[unsafe_offset=23] = Pointer(to=f_host_alloc).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=24] = Pointer(to=f_host_free).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=25] = Pointer(to=f_pinned).unsafe_bitcast[Int]()[]
     return t
 
 

@@ -226,6 +226,73 @@ workers that only touch CPU tensors run normally
 boxed-kernel calls per op (the `CallChecker` in `torch_mojo_backend/testing.py`
 uses them to assert that an op ran natively).
 
+## Host memory
+
+The device allocator owns MAX `DeviceBuffer` boxes; the pinned CPU allocator
+owns MAX `HostBuffer` boxes from `enqueue_create_host_buffer`, backed by
+page-locked host memory for the current mojo device's context. Mojo owns
+zero-byte requests too: a real allocation handle with a null data pointer,
+no host buffer and no registry entry, so `is_pinned()` stays false.
+`is_pinned()` forwards to Mojo, which shares the transfer registry's binary
+interval lookup, including interior pointers, then asks torch's CUDA hook
+through a C accessor on a miss. Torch's CPU factories prefer CUDA's pinned
+allocator when CUDA is available; `pin_memory=True` uses the Mojo allocator
+with a CPU torch build. The CUDA fallback accounts for factories preferring
+CUDA's allocator while queries prefer PrivateUse1.
+
+Both `copy_` and `.to()` honor `non_blocking`. H2D copies directly from a
+live Mojo-pinned source on the transfer device's selected stream, even when
+blocking: this queues the read after a preceding async download or an explicit
+stream dependency. A blocking upload then synchronizes that stream. Only our
+live registry blocks can have a pending async host write. CPU conversion or
+relayout of such a source waits for the selected stream before reading it.
+
+With `non_blocking=True`, D2H copies directly into a live Mojo-pinned
+destination on the same device without waiting for the stream. Synchronize
+before reading an async download or modifying a direct upload's source.
+Cross-stream producers and consumers require explicit event waits; before a
+host read or an upload to another device, synchronize the producing event
+on the host. A GPU-side wait alone cannot order a CPU staging memcpy.
+
+`.to("cpu", non_blocking=True)` allocates its destination through Mojo's
+pinned allocator for the **source** device, including on CUDA-enabled torch
+wheels and when another device is current. The shim's `tmb_cpu_empty_pinned`
+only constructs that CPU tensor; Mojo makes the allocation/routing decisions.
+This reproduces upstream `_to_copy`'s strided accelerator-to-CPU pinning
+condition (`isAcceleratorExcluded` is already present in torch 2.7), which
+overwrites the explicit `pin_memory` option on `aten::_to_copy`. Blocking
+CPU output is pageable even with `pin_memory=True`. If pinned allocation
+fails, Mojo retries with pageable memory and completes the download before
+returning; transfer errors still propagate.
+
+The following conservative policies deliberately differ from CUDA:
+
+* Pageable, foreign-pinned and other-device pinned downloads finish before
+  returning, even with `non_blocking=True`. CUDA's asynchronous API does not
+  make a general completion promise for these pointers. CUDA-owned pinned
+  blocks have no lifetime tracking on our streams, so `is_pinned()` alone
+  cannot enable Mojo's async routes.
+* Uploads from those memory classes snapshot into a separate pinned buffer
+  before returning. Mojo restricts direct DMA to the owning device; CUDA can
+  use portable pinned allocations asynchronously across devices.
+* `copy_` downloads needing host dtype conversion or relayout block. `.to()`
+  performs supported conversions/relayouts on the GPU and stays asynchronous,
+  but casts using the host fallback (for example float32 to float64) block.
+  CUDA can also perform that conversion on the GPU and stay asynchronous.
+
+Blocking direct uploads finish reading the caller's memory before returning.
+Staged uploads take a synchronous snapshot, so the caller can reuse its source
+without waiting for queued DMA or device relayout. CPU and Metal uploads always
+finish synchronously; `non_blocking` is a no-op on the MAX CPU device.
+
+Async copies record each stream on the pinned block. Free removes the block
+from the live registry and queues one completion callback per recorded
+stream; the shared staging/pinned drain destroys it after all callbacks
+finish. Uploads, pinned allocations/frees and device/stream synchronization
+drain completed blocks. Callbacks only decrement an atomic counter; no
+device API runs on the callback thread. If MAX rejects host callbacks, free
+synchronizes the affected stream instead.
+
 ## Streams and events
 
 `torch.Stream(device="mojo")`, `torch.Event`, `torch.accelerator.current_stream

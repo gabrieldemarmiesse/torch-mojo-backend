@@ -109,7 +109,11 @@ int32_t alloc_device() {
 // ---- allocator ---------------------------------------------------------------
 struct MojoAllocator final : c10::Allocator {
   static void deleter(void* p) {
-    if (!p) return;
+    // Same reasoning as the pinned deleter below: a forked child inherits
+    // tmb_mutex possibly locked by a thread that no longer exists, so taking
+    // it here deadlocks. The child cannot use the runtime anyway, and its
+    // copy of the block dies with it.
+    if (!p || tmb_in_bad_fork) return;
     Lock g(tmb_mutex);
     H.free(p);
   }
@@ -131,6 +135,32 @@ struct MojoAllocator final : c10::Allocator {
   }
 };
 MojoAllocator g_allocator;
+
+struct MojoPinnedAllocator final : c10::Allocator {
+  static void deleter(void* p) {
+    // A vanished parent thread may own the mutex, and MAX's inherited buffers
+    // cannot be destroyed safely. Let child process exit reclaim its copy.
+    if (!p || tmb_in_bad_fork) return;
+    Lock g(tmb_mutex);
+    H.host_free(p);
+  }
+  c10::DataPtr allocate(size_t n) override {
+    REQUIRE_READY();
+    Lock g(tmb_mutex);
+    void* data = nullptr;
+    tmb_thread_error().clear();
+    void* handle = H.host_alloc(n, alloc_device(), &data);
+    TORCH_CHECK(handle, "mojo backend: failed to allocate ", n,
+                " bytes of pinned host memory (", tmb_thread_error(), ")");
+    return {data, handle, &deleter, c10::Device(c10::kCPU)};
+  }
+  // data != context here, which raw_allocate/raw_deallocate cannot express.
+  c10::DeleterFnPtr raw_deleter() const override { return nullptr; }
+  void copy_data(void* dst, const void* src, size_t n) const override {
+    std::memcpy(dst, src, n);
+  }
+};
+MojoPinnedAllocator g_pinned_allocator;
 
 // ---- generator: Philox (seed, offset) ------------------------------------------
 // `offset_` counts in curand's unit (one Philox4x32 block = 4), exactly like
@@ -219,8 +249,17 @@ struct MojoHooks final : at::PrivateUse1HooksInterface {
     return old;
   }
   c10::DeviceIndex maybeExchangeDevice(c10::DeviceIndex d) const override { return d < 0 ? getCurrentDevice() : exchangeDevice(d); }
-  bool isPinnedPtr(const void*) const override { return false; }
-  c10::Allocator* getPinnedMemoryAllocator() const override { return c10::GetAllocator(c10::kCPU); }
+  bool isPinnedPtr(const void* ptr) const override {
+    // tmb_internal.h forbids runtime access in a forked child.
+    if (tmb_in_bad_fork) return false;
+    if (!tmb_ready || !H.is_pinned_ptr) return false;
+    Lock g(tmb_mutex);
+    return H.is_pinned_ptr(ptr) != 0;
+  }
+  c10::Allocator* getPinnedMemoryAllocator() const override {
+    REQUIRE_READY();
+    return &g_pinned_allocator;
+  }
   at::Device getDeviceFromPtr(void* data) const override {
     Lock g(tmb_mutex);
     int32_t d = H.device_of_ptr(data);
@@ -423,6 +462,8 @@ int32_t tmb_backend_register(const TmbBackendHooks* hooks) {
     // From here the runtime is up (every device context exists), so a child
     // of this process cannot use it: mark the child, see tmb_check_not_forked.
     pthread_atfork(nullptr, nullptr, [] { tmb_in_bad_fork = true; });
+    // init() is a no-op; flip Context's guard so the first is_pinned reaches us.
+    at::globalContext().lazyInitDevice(c10::DeviceType::PrivateUse1);
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());
@@ -450,6 +491,7 @@ void* tmb_tensor_storage_ctx(TmbTensor t) {
 }
 int64_t tmb_tensor_storage_nbytes(TmbTensor t) { return static_cast<int64_t>(T(t).storage().nbytes()); }
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
+int32_t tmb_tensor_is_neg(TmbTensor t) { return T(t).is_neg(); }
 int32_t tmb_tensor_requires_grad(TmbTensor t) { return T(t).requires_grad(); }
 void tmb_tensor_bump_version(TmbTensor t) { T(t).unsafeGetTensorImpl()->bump_version(); }
 void* tmb_stream_native_handle(int32_t device, int64_t stream) {
@@ -460,6 +502,9 @@ int32_t tmb_float32_matmul_precision(void) {
   return static_cast<int32_t>(at::globalContext().float32MatmulPrecision());
 }
 int32_t tmb_grad_enabled(void) { return c10::GradMode::is_enabled() ? 1 : 0; }
+int32_t tmb_cuda_is_pinned_ptr(const void* ptr) {
+  return at::globalContext().isPinnedPtr(ptr, c10::DeviceType::CUDA) ? 1 : 0;
+}
 TmbTensor tmb_tensor_retain(TmbTensor t) { return new at::Tensor(T(t)); }
 void tmb_tensor_release(TmbTensor t) { delete reinterpret_cast<at::Tensor*>(t); }
 
@@ -547,6 +592,18 @@ int32_t tmb_storage_resize(TmbTensor t, int64_t nbytes) {
 int32_t tmb_cpu_empty(int64_t ndim, const int64_t* sizes, int32_t dtype, TmbTensor* ret) {
   try {
     *ret = new at::Tensor(at::detail::empty_cpu(c10::IntArrayRef(sizes, ndim), static_cast<c10::ScalarType>(dtype)));
+    return 0;
+  } catch (const std::exception& e) {
+    tmb_set_error(e.what());
+    return 1;
+  }
+}
+
+int32_t tmb_cpu_empty_pinned(int64_t ndim, const int64_t* sizes, int32_t dtype, int32_t device, TmbTensor* ret) {
+  try {
+    AllocDeviceScope scope(device);
+    *ret = new at::Tensor(at::detail::empty_generic(c10::IntArrayRef(sizes, ndim), &g_pinned_allocator,
+        c10::DispatchKeySet(c10::DispatchKey::CPU), static_cast<c10::ScalarType>(dtype), std::nullopt));
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());

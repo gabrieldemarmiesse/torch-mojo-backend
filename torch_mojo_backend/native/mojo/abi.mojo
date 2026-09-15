@@ -1034,12 +1034,25 @@ def release(h: Int):
     external_call["tmb_tensor_release", NoneType](h)
 
 
-def cpu_empty(shape: IndexList[MAX_RANK], rank: Int, stype: Int32) raises -> T:
+def cpu_empty(
+    shape: IndexList[MAX_RANK], rank: Int, stype: Int32, pinned_device: Int = -1
+) raises -> T:
     var sizes = InlineArray[Int64, MAX_RANK](fill=0)
     var pad = MAX_RANK - rank
     for i in range(rank):
         sizes[i] = Int64(shape[pad + i])
     var h: Int = 0
+    if pinned_device >= 0:
+        var rc = external_call["tmb_cpu_empty_pinned", Int32](
+            Int64(rank),
+            sizes.unsafe_ptr(),
+            stype,
+            Int32(pinned_device),
+            Pointer(to=h),
+        )
+        if rc == 0:
+            return T(h)
+        # Only retry allocation: copy_to_host blocks for the pageable result.
     check(
         external_call["tmb_cpu_empty", Int32](
             Int64(rank), sizes.unsafe_ptr(), stype, Pointer(to=h)

@@ -73,6 +73,7 @@ from device import (
     copy_d2d,
     copy_from_host,
     copy_to_host,
+    wait_for_host_read,
     ctx_for,
     current_device,
     dev,
@@ -112,6 +113,8 @@ def _shape_of(sizes: IntList) raises -> IndexList[MAX_RANK]:
 def op_empty_memory_format(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    if v_bool_or(args[unsafe_offset=4], False):
+        raise Error("Only dense CPU tensors can be pinned")
     var sizes = IntList(args[unsafe_offset=0])
     var stype = v_dtype_or(args[unsafe_offset=1], default_dtype())
     var device = _target_device(args[unsafe_offset=3])
@@ -136,6 +139,8 @@ def op_empty_memory_format(
 def op_empty_strided(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    if v_bool_or(args[unsafe_offset=5], False):
+        raise Error("Only dense CPU tensors can be pinned")
     var sizes = IntList(args[unsafe_offset=0])
     var strides = IntList(args[unsafe_offset=1])
     var stype = v_dtype_or(args[unsafe_offset=2], default_dtype())
@@ -221,18 +226,34 @@ def _host_copy(dst: T, src: T) raises:
     _ = call_op("aten::copy_", "", args^, 1)  # Results releases copy_'s handle
 
 
+def _copy_broadcast_source(src: T, dst: T) raises -> T:
+    # _copy_from also accepts equal-element-count reshapes. Unequal counts
+    # require normal trailing-dimension broadcasting, validated before writes.
+    if src.numel == dst.numel:
+        return src.copy()
+    if src.rank > dst.rank:
+        raise Error("_copy_from: source shape cannot broadcast to destination")
+    var strides = IndexList[MAX_RANK](0)
+    for i in range(dst.rank):
+        var j = i - (dst.rank - src.rank)
+        if j < 0:
+            continue
+        if src.dim(j) == dst.dim(i):
+            strides[MAX_RANK - dst.rank + i] = src.stride(j)
+        elif src.dim(j) != 1:
+            raise Error(
+                "_copy_from: source shape cannot broadcast to destination"
+            )
+    return view_strided(src, dst.shape, strides, dst.rank, src.offset)
+
+
 # aten::_copy_from(Tensor self, Tensor dst, bool non_blocking=False) -> Tensor
 def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var src = v_tensor(args[unsafe_offset=0])
+    var input = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    if src.numel != dst.numel:
-        raise Error(
-            "_copy_from: element count mismatch (",
-            src.numel,
-            " vs ",
-            dst.numel,
-            ")",
-        )
+    var non_blocking = v_bool_or(args[unsafe_offset=2], False)
+    var expanded = own_if_new(_copy_broadcast_source(input, dst), input)
+    var src = expanded.t.copy()
     if dst.numel == 0:
         ret_ref(rets, 0, dst)
         return
@@ -256,19 +277,30 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             src,
         )
         if host.t.h != src.h:
+            wait_for_host_read(ctx_for(dst.device), src.ptr)
             _host_copy(host.t, src)
         var nbytes = dst.numel * dst.itemsize
         # `host` is dense in dst's dtype, so a contiguous dst takes the bytes
         # whatever the two logical shapes are.
         if dst.contig:
             copy_from_host(
-                dst.device, ctx_for(dst.device), dst.ptr, host.t.ptr, nbytes
+                dst.device,
+                ctx_for(dst.device),
+                dst.ptr,
+                host.t.ptr,
+                nbytes,
+                non_blocking,
             )
             _ = host^  # alive past the launch
         else:
             var tmp = own(new_like(dst))
             copy_from_host(
-                dst.device, ctx_for(dst.device), tmp.t.ptr, host.t.ptr, nbytes
+                dst.device,
+                ctx_for(dst.device),
+                tmp.t.ptr,
+                host.t.ptr,
+                nbytes,
+                non_blocking,
             )
             _ = host^  # alive past the launch
             copy_strided_into(dst, tmp.t)
@@ -287,7 +319,9 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # Both dense in the same dtype: the bytes land in the right order
         # whatever the two logical shapes are.
         if dst.contig and dst.stype == src.stype:
-            copy_to_host(ctx_for(src.device), dense.t.ptr, dst.ptr, nbytes)
+            copy_to_host(
+                ctx_for(src.device), dense.t.ptr, dst.ptr, nbytes, non_blocking
+            )
             _ = dense^  # alive past the launch
         else:
             var host = own(cpu_empty(src.shape, src.rank, src.stype))
@@ -297,6 +331,7 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             _ = host^  # alive past the copy
     else:
         raise Error("_copy_from: neither tensor is on the mojo device")
+    _ = expanded^
     ret_ref(rets, 0, dst)
 
 

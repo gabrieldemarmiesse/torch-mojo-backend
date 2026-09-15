@@ -24,12 +24,14 @@ from abi import (
     MEMORY_FORMAT_PRESERVE,
     ST_INT32,
     ST_INT64,
+    TAG_NONE,
     IntList,
     Owned,
     T,
     Value,
     Values,
     check,
+    call_op,
     contiguous_strides,
     cpu_empty,
     default_dtype,
@@ -51,7 +53,9 @@ from abi import (
     strides_equal,
     strides_for_memory_format,
     unsupported,
+    tensor_arg,
     v_device_index,
+    v_bool_or,
     v_device_type,
     v_dtype_or,
     v_f64,
@@ -70,6 +74,7 @@ from device import (
     ctx_for,
     ctx_ptr,
     current_device,
+    wait_for_host_read,
 )
 from kernels import KernelCall
 from op_utils import MAX_RANK
@@ -396,6 +401,12 @@ def op_clone(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var mf = v_memory_format_or(args[unsafe_offset=1], MEMORY_FORMAT_PRESERVE)
     var out = own(_materialize_as(t, _wanted_strides(t, mf)))
+    # ATen's Negative fallback resolves logical views by calling clone with
+    # the bit still set (NegateFallback.cpp). A raw copy loses that transform.
+    # Query through the tensor accessor: dispatching is_neg itself would
+    # re-enter Negative's clone fallback. Negate only the fresh output.
+    if external_call["tmb_tensor_is_neg", Int32](t.h) != 0:
+        _ = call_op("aten::neg_", "", [tensor_arg(out.t)], 1)
     ret_owned(rets, 0, out)
 
 
@@ -505,13 +516,17 @@ def _host_cast(t: T, stype: Int32) raises -> T:
     return out^
 
 
-def _download_to_cpu(t: T) raises -> T:
-    var out = cpu_empty(t.shape, t.rank, t.stype)
+def _download_to_cpu(
+    t: T, non_blocking: Bool = False, pin_memory: Bool = False
+) raises -> T:
+    var out = own(
+        cpu_empty(t.shape, t.rank, t.stype, t.device if pin_memory else -1)
+    )
     if t.numel > 0:
         var ctx = ctx_for(t.device)
-        copy_to_host(ctx, t.ptr, out.ptr, t.numel * t.itemsize)
+        copy_to_host(ctx, t.ptr, out.t.ptr, t.numel * t.itemsize, non_blocking)
         _ = ctx
-    return out^
+    return out.take()
 
 
 def _upload_cross_device(t: T, target_device: Int) raises -> T:
@@ -566,7 +581,9 @@ def _host_materialize_contiguous(t: T) raises -> T:
     return out^
 
 
-def _upload_from_cpu(t: T, stype: Int32, target_device: Int) raises -> T:
+def _upload_from_cpu(
+    t: T, stype: Int32, target_device: Int, non_blocking: Bool
+) raises -> T:
     """A real (non-mojo) CPU tensor moving onto the mojo device: a host
     cast (when the dtype changes) then one upload -- mirrors the old eager
     path's `mojo_device__to_copy` "not isinstance(tensor, TorchMojoTensor)"
@@ -580,10 +597,16 @@ def _upload_from_cpu(t: T, stype: Int32, target_device: Int) raises -> T:
         # no scratch allocation needed.
         var ctx0 = ctx_for(target_device)
         copy_from_host(
-            target_device, ctx0, out.ptr, t.ptr, t.numel * t.itemsize
+            target_device,
+            ctx0,
+            out.ptr,
+            t.ptr,
+            t.numel * t.itemsize,
+            non_blocking,
         )
         _ = ctx0
         return out^
+    wait_for_host_read(ctx_for(target_device), t.ptr)
     var contiguous_cpu = own(_host_materialize_contiguous(t))
     if stype == t.stype:
         var ctx = ctx_for(target_device)
@@ -593,6 +616,7 @@ def _upload_from_cpu(t: T, stype: Int32, target_device: Int) raises -> T:
             out.ptr,
             contiguous_cpu.t.ptr,
             t.numel * t.itemsize,
+            non_blocking,
         )
         _ = ctx
     else:
@@ -612,6 +636,7 @@ def _upload_from_cpu(t: T, stype: Int32, target_device: Int) raises -> T:
             out.ptr,
             casted.t.ptr,
             t.numel * dtype_itemsize(dst_dtype),
+            non_blocking,
         )
         _ = ctx2
         _ = casted
@@ -625,11 +650,20 @@ def _upload_from_cpu(t: T, stype: Int32, target_device: Int) raises -> T:
 def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var stype = v_dtype_or(args[unsafe_offset=1], t.stype)
+    var layout = args[unsafe_offset=2].copy()
+    if layout.tag != TAG_NONE and layout.a != 0:
+        raise Error(
+            "to(options) doesn't support converting to a different layout"
+        )
+    var pin_memory = v_bool_or(args[unsafe_offset=4], False)
+    var non_blocking = v_bool_or(args[unsafe_offset=5], False)
     var mf = v_memory_format_or(args[unsafe_offset=6], MEMORY_FORMAT_PRESERVE)
     var want = _wanted_strides(t, mf)
     var contig = contiguous_strides(t.shape, t.rank)
     var dev_v = args[unsafe_offset=3].copy()
     var dev_type = v_device_type(dev_v)
+    if pin_memory and dev_type != DEVICE_TYPE_CPU:
+        raise Error("Only dense CPU tensors can be pinned")
     if (
         dev_type != -1
         and dev_type != DEVICE_TYPE_CPU
@@ -655,7 +689,9 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         var target_index = v_device_index(dev_v)
         if target_index < 0:
             raise Error("aten::_to_copy: no explicit mojo device index given")
-        var uploaded = own(_upload_from_cpu(t, stype, target_index))
+        var uploaded = own(
+            _upload_from_cpu(t, stype, target_index, non_blocking)
+        )
         var out = own(_relayout_owned(uploaded^, want))
         ret_owned(rets, 0, out)
         return
@@ -669,7 +705,17 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # the destination for a move to another mojo device.
     var staged = own(_to_copy_same_device(t, stype, contig if cross else want))
     if dev_type == DEVICE_TYPE_CPU:
-        var host = own(_download_to_cpu(staged.t))
+        # TensorConversions.cpp's pin_out rule: PrivateUse1 is an accelerator
+        # other than MPS, and layout was checked strided above (also in 2.7).
+        # Use our allocator explicitly so CUDA-enabled wheels still get a
+        # destination whose lifetime can be tracked on the source's device.
+        # A host cast already required a completed readback. Keep that entire
+        # fallback blocking; GPU casts/relayouts can remain stream-ordered.
+        var async_download = non_blocking and (
+            stype == t.stype
+            or (_is_cast_dtype(t.dtype) and _is_cast_dtype(max_dtype(stype)))
+        )
+        var host = own(_download_to_cpu(staged.t, async_download, non_blocking))
         _ = staged^
         if not strides_equal(want, contig, t.rank):
             # `staged` was dense in `want`'s order, so its bytes landed in the

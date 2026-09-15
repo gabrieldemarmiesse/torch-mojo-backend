@@ -95,6 +95,12 @@ typedef struct TmbBackendHooks {
   void (*prof_mark)(const char* name);
   void (*prof_range_push)(const char* name);
   void (*prof_range_pop)(void);
+  // pinned (page-locked) host memory: torch's getPinnedMemoryAllocator /
+  // isPinnedPtr. `data` receives the host pointer; the return value is the
+  // opaque handle to pass to host_free. NULL on failure.
+  void* (*host_alloc)(size_t nbytes, int32_t device, void** data);
+  void (*host_free)(void* handle);
+  int32_t (*is_pinned_ptr)(const void* ptr);  // 1 if page-locked by Mojo or CUDA
 } TmbBackendHooks;
 
 // ---- registration ------------------------------------------------------------
@@ -142,10 +148,15 @@ void* tmb_tensor_storage_data_ptr(TmbTensor t);
 void* tmb_tensor_storage_ctx(TmbTensor t);  // the allocation handle Mojo returned from alloc (NULL if not ours)
 int64_t tmb_tensor_storage_nbytes(TmbTensor t);
 int32_t tmb_tensor_is_contiguous(TmbTensor t);
+int32_t tmb_tensor_is_neg(TmbTensor t);
 int32_t tmb_tensor_requires_grad(TmbTensor t);
 void tmb_tensor_bump_version(TmbTensor t);
 int32_t tmb_float32_matmul_precision(void);  // torch.get_float32_matmul_precision: 0 highest, 1 high, 2 medium
 int32_t tmb_grad_enabled(void);
+// Whether CUDA considers `ptr` page-locked. Upstream's pin_memory=True factory
+// prefers CUDA's allocator while is_pinned() prefers PrivateUse1, so a pointer
+// we did not allocate may still be genuinely pinned.
+int32_t tmb_cuda_is_pinned_ptr(const void* ptr);
 void* tmb_stream_native_handle(int32_t device, int64_t stream);  // the vendor (CUDA/HIP) stream of a mojo stream  // at::GradMode::is_enabled(): whether autograd records this call
 TmbTensor tmb_tensor_retain(TmbTensor t);   // new owned handle to the same tensor
 void tmb_tensor_release(TmbTensor t);
@@ -162,6 +173,7 @@ int32_t tmb_tensor_set_storage(TmbTensor t, TmbTensor source);
 int32_t tmb_storage_resize(TmbTensor t, int64_t nbytes);
 // CPU tensors (for host round trips such as .item() and _local_scalar_dense)
 int32_t tmb_cpu_empty(int64_t ndim, const int64_t* sizes, int32_t dtype, TmbTensor* ret);
+int32_t tmb_cpu_empty_pinned(int64_t ndim, const int64_t* sizes, int32_t dtype, int32_t device, TmbTensor* ret);
 // Philox state lives in the C++ generators (one default per device, plus any
 // torch.Generator(device="mojo")). reserve() hands back the (seed, offset) before
 // bumping the offset by `increment`; the 16-byte state is (seed, offset) little-endian.
