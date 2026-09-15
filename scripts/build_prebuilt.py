@@ -233,10 +233,22 @@ def build_shim_for(
             str(py),
             "--index-url",
             index_url,
-            "--extra-index-url",
-            _PYPI,
             _torch_requirement(version),
-            # native/__init__.py imports it for the default cache directory.
+        ]
+    )
+    # native/__init__.py imports it for the default cache directory. A
+    # separate install: adding PyPI as an extra index to the one above makes
+    # uv resolve `torch==2.11.*` to PyPI's CUDA build instead of the CPU
+    # index's `2.11.0+cpu`.
+    _run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(py),
+            "--index-url",
+            _PYPI,
             "platformdirs",
         ]
     )
