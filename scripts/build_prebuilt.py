@@ -39,7 +39,8 @@ sources shipped beside it.
     # CI: each platform job builds its own, the release job merges them
     python3 scripts/build_prebuilt.py --merge artifacts/
 
-The shim venvs hold torch alone -- no MAX, no install of this package -- and
+The shim venvs hold torch and platformdirs alone -- no MAX, no install of
+this package -- and
 the build reaches `torch_mojo_backend.native` through `_native_module()`
 below. That is what lets the same command run in a manylinux_2_28 container,
 where MAX cannot be installed (its wheels are manylinux_2_34) and where a
@@ -97,7 +98,8 @@ def _native_module() -> ModuleType:
     the torch-only venvs this script makes and uninstallable in the
     manylinux_2_28 container (MAX ships manylinux_2_34 wheels). So load the
     module from its file when the ordinary import is not available. The
-    module itself imports only torch at import time.
+    module itself imports only torch and platformdirs (for its default
+    cache directory) at import time, and the shim venvs hold both.
     """
     try:
         from torch_mojo_backend import native  # noqa: PLC0415 -- optional path
@@ -124,8 +126,8 @@ def _pins() -> list[str]:
 
 
 def _package_version() -> str:
-    """From pyproject, not importlib.metadata: the shim venvs hold torch
-    alone, so this package is not installed in them."""
+    """From pyproject, not importlib.metadata: this package is not
+    installed in the shim venvs."""
     return str(
         tomllib.loads((_ROOT / "pyproject.toml").read_text())["project"]["version"]
     )
@@ -231,7 +233,11 @@ def build_shim_for(
             str(py),
             "--index-url",
             index_url,
+            "--extra-index-url",
+            _PYPI,
             _torch_requirement(version),
+            # native/__init__.py imports it for the default cache directory.
+            "platformdirs",
         ]
     )
     out = _run(
