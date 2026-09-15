@@ -51,6 +51,13 @@ _CACHE_DIR = Path(
     or (Path(platformdirs.user_cache_dir("torch-mojo-backend")) / "native")
 )
 _CSRC = _HERE / "csrc"
+
+
+def cache_dir() -> Path:
+    """Where every native build is cached (`torch-mojo-backend cache dir`)."""
+    return _CACHE_DIR
+
+
 _MOJO_SRC = _HERE / "mojo"
 # Libraries shipped in the wheel, built by scripts/build_prebuilt.py.
 _PREBUILT = _HERE / "prebuilt"

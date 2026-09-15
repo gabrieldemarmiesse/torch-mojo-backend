@@ -62,7 +62,8 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   - Eager-mode kernel builds are described in `docs/mojo_extensions.md`:
     every specialization compiles inline at its first call and is cached in
     `~/.cache/torch-mojo-backend/native/` (`TORCH_MOJO_BACKEND_CACHE_DIR`
-    moves it); build timings print by default
+    moves it, `torch-mojo-backend cache dir` prints it,
+    `torch-mojo-backend cache clean` wipes it); build timings print by default
     (`TORCH_MOJO_BACKEND_TRACE=0` silences them).
     `TORCH_MOJO_BACKEND_WERROR=1` makes every Mojo build fail on a compiler
     warning; off by default, on under pytest (`tests/conftest.py`), so keep

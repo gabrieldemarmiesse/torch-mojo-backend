@@ -28,6 +28,9 @@ dependencies = [
     "nvidia-cuda-nvcc-cu12==12.8.*; platform_system == 'Linux'",
 ]
 
+[project.scripts]
+torch-mojo-backend = "torch_mojo_backend.cli:main"
+
 [project.urls]
 "Source" = "https://github.com/gabrieldemarmiesse/torch-mojo-backend"
 "Documentation" = "https://gabrieldemarmiesse.github.io/torch-mojo-backend/"
