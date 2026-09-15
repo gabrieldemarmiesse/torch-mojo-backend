@@ -11,14 +11,36 @@ a one-line reason (see the docstring of each removed test's replacement, and
 the migration report).
 """
 
+import ctypes
+import gc
 import io
+import math
+import multiprocessing
+import os
+import subprocess
+import sys
+import textwrap
 import time
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from threading import Barrier
+from typing import Generic, NamedTuple, TypeVar
 
+import numpy as np
 import pytest
 import torch
 from torch.optim.optimizer import _default_to_fused_or_foreach
+from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data.dataloader import _MultiProcessingDataLoaderIter
 
-from torch_mojo_backend import get_accelerators, mojo_backend, register_mojo_devices
+from torch_mojo_backend import (
+    get_accelerators,
+    mojo_backend,
+    native,
+    register_mojo_devices,
+)
 from torch_mojo_backend.native import device_module
 
 pytestmark = pytest.mark.xdist_group(name="group1")
@@ -377,6 +399,1360 @@ def test_multiple_conversions_arithmetic():
     squared = diff * diff
     summed = torch.sum(squared)
     assert summed.to("cpu").item() == 0
+
+
+def test_pin_memory_preserves_values_and_reuses_storage(mojo_device: str):
+    with device_module.device(mojo_device):
+        source = torch.arange(64, dtype=torch.float32)
+        pinned = source.pin_memory()
+        assert pinned.device.type == "cpu"
+        assert pinned.is_pinned()
+        torch.testing.assert_close(pinned, source)
+        assert pinned.pin_memory().data_ptr() == pinned.data_ptr()
+
+
+@pytest.mark.parametrize("entry", ["empty", "empty_like"])
+@pytest.mark.parametrize("cuda_first", [False, True], ids=["cold", "cuda-initialized"])
+def test_first_pinned_factory_query_after_registration(
+    mojo_device: str, entry: str, cuda_first: bool
+):
+    """Registration makes the first factory's is_pinned query reach our hook."""
+    if cuda_first and not torch.cuda.is_available():
+        pytest.skip(
+            "initializing CUDA before registration requires runtime CUDA availability"
+        )
+    script = textwrap.dedent(
+        """
+        import sys
+        import torch
+        from torch_mojo_backend import register_mojo_devices
+        from torch_mojo_backend.native import device_module
+
+        if sys.argv[3] == 'True':
+            torch.cuda.init()
+        register_mojo_devices()
+        with device_module.device(sys.argv[1]):
+            if sys.argv[2] == 'empty':
+                pinned = torch.empty(8, device='cpu', pin_memory=True)
+            else:
+                pinned = torch.empty_like(torch.empty(8), device='cpu', pin_memory=True)
+            assert pinned.is_pinned()
+        """
+    )
+    # MAX's Python interop sets these to its own prefix in the parent.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", script, mojo_device, entry, str(cuda_first)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("size", [0, 8])
+def test_pinned_empty(mojo_device: str, size: int):
+    with device_module.device(mojo_device):
+        for pinned in (
+            torch.empty(size, pin_memory=True),
+            torch.empty(size).pin_memory(),
+        ):
+            assert pinned.device.type == "cpu"
+            # Zero bytes means a null storage pointer; stock CUDA also says False.
+            assert pinned.is_pinned() is (size != 0)
+        assert not torch.empty(size).is_pinned()
+
+
+def test_pinned_entry_points_agree(mojo_device: str):
+    with device_module.device(mojo_device):
+        source = torch.arange(8, dtype=torch.float32)
+        factory_pinned = torch.empty(8, pin_memory=True)
+        factory_pinned.copy_(source)
+        method_pinned = source.pin_memory()
+        # Factories may choose CUDA while Tensor.pin_memory() chooses Mojo.
+        for pinned in (factory_pinned, method_pinned):
+            assert pinned.is_pinned()
+            assert pinned.pin_memory().data_ptr() == pinned.data_ptr()
+            torch.testing.assert_close(pinned.to(mojo_device).cpu(), source)
+
+
+_PIN_ENTRY_POINTS = ("method", "empty", "empty_like")
+
+
+def _pin_via(source: torch.Tensor, entry: str) -> torch.Tensor:
+    if entry == "method":
+        return source.pin_memory()
+    if entry == "empty":
+        result = torch.empty(
+            source.shape, dtype=source.dtype, device="cpu", pin_memory=True
+        )
+    else:
+        assert entry == "empty_like"
+        result = torch.empty_like(source, device="cpu", pin_memory=True)
+    result.copy_(source)
+    return result
+
+
+class _PinAllocatorProbe:
+    def __init__(self, path: Path):
+        self.path = path
+        self.lib = ctypes.CDLL(str(path))
+        self.lib.uses_mojo_allocator.argtypes = [ctypes.c_void_p]
+        self.lib.uses_mojo_allocator.restype = ctypes.c_bool
+        self.lib.is_pinned_address.argtypes = [ctypes.c_void_p]
+        self.lib.is_pinned_address.restype = ctypes.c_bool
+
+    def uses_mojo_allocator(self, tensor: torch.Tensor) -> bool:
+        return self.lib.uses_mojo_allocator(tensor.untyped_storage()._cdata)
+
+    def is_pinned_address(self, address: int) -> bool:
+        return self.lib.is_pinned_address(address)
+
+
+@pytest.fixture(scope="module")
+def pin_allocator_probe(tmp_path_factory: pytest.TempPathFactory) -> _PinAllocatorProbe:
+    """Inspect ATen's allocator identity, independently of our pin registry.
+
+    Python exposes neither StorageImpl::allocator nor DataPtr's deleter. This
+    read-only probe uses ATen's public C++ interface and keeps its Tensor alive.
+    """
+    directory = tmp_path_factory.mktemp("pin-allocator-probe")
+    source = directory / "probe.cpp"
+    source.write_text("""
+        #include <ATen/Context.h>
+        #include <c10/core/StorageImpl.h>
+        extern "C" bool uses_mojo_allocator(c10::StorageImpl* storage) {
+            return storage->allocator() ==
+                at::globalContext().getPinnedMemoryAllocator(
+                    c10::DeviceType::PrivateUse1);
+        }
+        extern "C" bool is_pinned_address(const void* pointer) {
+            return at::globalContext().isPinnedPtr(
+                pointer, c10::DeviceType::PrivateUse1);
+        }
+    """)
+    output = directory / ("probe.dylib" if sys.platform == "darwin" else "probe.so")
+    torch_lib = Path(torch.__file__).parent / "lib"
+    proc = subprocess.run(
+        [
+            *native._cxx(),
+            native._cxx_standard(),
+            "-shared",
+            "-fPIC",
+            "-O0",
+            f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
+            *native._torch_include_flags(),
+            str(source),
+            "-o",
+            str(output),
+            f"-L{torch_lib}",
+            f"-Wl,-rpath,{torch_lib}",
+            "-ltorch_cpu",
+            "-lc10",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return _PinAllocatorProbe(output)
+
+
+@pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
+@pytest.mark.parametrize(
+    "configuration", ["cpu-only-wheel", "cuda-available", "cuda-unavailable"]
+)
+def test_pinned_allocator_provenance_follows_runtime_cuda_availability(
+    mojo_device: str,
+    pin_allocator_probe: _PinAllocatorProbe,
+    entry: str,
+    configuration: str,
+):
+    cuda_available = torch.cuda.is_available()
+    if configuration == "cpu-only-wheel":
+        if torch.backends.cuda.is_built():
+            pytest.skip(
+                "requires a CPU-only PyTorch wheel; this wheel includes CUDA/ROCm"
+            )
+        assert not cuda_available
+    else:
+        if not torch.backends.cuda.is_built():
+            pytest.skip("requires a CUDA/ROCm PyTorch wheel")
+        expected_available = configuration == "cuda-available"
+        if cuda_available != expected_available:
+            pytest.skip(f"requires runtime CUDA availability={expected_available}")
+    with device_module.device(mojo_device):
+        source = torch.arange(257, dtype=torch.int64)
+        pinned = _pin_via(source, entry)
+        assert pinned.device == torch.device("cpu")
+        assert pinned.is_pinned()
+        assert pin_allocator_probe.uses_mojo_allocator(pinned) is (
+            entry == "method" or not cuda_available
+        )
+        assert pinned.pin_memory() is pinned
+        torch.testing.assert_close(pinned, source, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
+@pytest.mark.parametrize("shape", [(0,), (3, 0, 5)], ids=["vector", "middle-zero"])
+def test_pinned_zero_byte_storage_has_null_pointer(
+    mojo_device: str, entry: str, shape: tuple[int, ...]
+):
+    with device_module.device(mojo_device):
+        pinned = _pin_via(torch.empty(shape, device="cpu"), entry)
+        assert pinned.shape == shape
+        assert pinned.untyped_storage().nbytes() == 0
+        assert pinned.untyped_storage().data_ptr() == 0
+        assert not pinned.is_pinned()
+
+
+def test_pinned_empty_strided_zero_byte_storage(mojo_device: str):
+    with device_module.device(mojo_device):
+        pinned = torch.empty_strided(
+            (3, 0, 5), (100, 17, 2), device="cpu", pin_memory=True
+        )
+        assert pinned.stride() == (100, 17, 2)
+        assert pinned.untyped_storage().nbytes() == 0
+        assert pinned.untyped_storage().data_ptr() == 0
+        assert not pinned.is_pinned()
+
+
+@pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
+@pytest.mark.parametrize("offset", [0, 7, 17], ids=["start", "interior", "end"])
+def test_pinned_empty_view_retains_nonempty_storage(
+    mojo_device: str, entry: str, offset: int
+):
+    with device_module.device(mojo_device):
+        base = _pin_via(torch.arange(17), entry)
+        view = base[offset:offset]
+        assert view.numel() == 0
+        assert view.storage_offset() == offset
+        assert view.untyped_storage().nbytes() == 17 * base.element_size()
+        assert view.untyped_storage().data_ptr() == base.data_ptr() != 0
+        assert view.is_pinned()
+        assert view.pin_memory() is view
+        del base
+        gc.collect()
+        assert view.is_pinned()
+
+
+@pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
+@pytest.mark.parametrize("shape", [(), (1,), (17,)], ids=["scalar", "one", "tail"])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.bool,
+        torch.int8,
+        torch.uint8,
+        torch.int16,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.float32,
+        torch.int64,
+        torch.float64,
+        torch.complex64,
+        torch.complex128,
+    ],
+)
+def test_pinned_all_element_widths_preserve_exact_bytes(
+    mojo_device: str, entry: str, shape: tuple[int, ...], dtype: torch.dtype
+):
+    values = torch.arange(math.prod(shape), dtype=torch.int64)
+    if dtype == torch.bool:
+        source = (values % 2 == 0).reshape(shape)
+    elif dtype.is_complex:
+        source = torch.complex(values.double() + 0.25, -values.double() - 0.5)
+        source = source.to(dtype).reshape(shape)
+    else:
+        source = (values - 7).to(dtype).reshape(shape)
+    with device_module.device(mojo_device):
+        pinned = _pin_via(source, entry)
+        assert pinned.shape == shape
+        assert pinned.dtype == dtype
+        assert pinned.is_pinned()
+        assert (
+            pinned.untyped_storage().nbytes() == source.numel() * source.element_size()
+        )
+        assert torch.equal(
+            pinned.reshape(-1).view(torch.uint8), source.reshape(-1).view(torch.uint8)
+        )
+        assert pinned.data_ptr() != source.data_ptr()
+        assert not source.is_pinned()
+
+
+@pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (3,),
+        (255,),
+        (256,),
+        (257,),
+        (4095,),
+        (4096,),
+        (4097,),
+        (357, 789),
+        (8 * 1024 * 1024 + 3,),
+    ],
+    ids=[
+        "three",
+        "255",
+        "256",
+        "257",
+        "page-minus",
+        "page",
+        "page-plus",
+        "awkward",
+        "large",
+    ],
+)
+def test_pinned_size_boundaries_preserve_every_byte(
+    mojo_device: str, entry: str, shape: tuple[int, ...]
+):
+    source = torch.arange(math.prod(shape), dtype=torch.int64) * 37 + 11
+    source = source.to(torch.uint8).reshape(shape)
+    with device_module.device(mojo_device):
+        pinned = _pin_via(source, entry)
+        assert pinned.is_pinned()
+        assert pinned.untyped_storage().nbytes() == source.numel()
+        assert torch.equal(pinned, source)
+
+
+@pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
+def test_pinned_cuda_driver_recognizes_first_and_last_page(mojo_gpu: str, entry: str):
+    if get_accelerators()[int(mojo_gpu.split(":")[1])].api != "cuda":
+        pytest.skip("independent page-registration probe requires the CUDA driver")
+    cuda = ctypes.CDLL("libcuda.so.1")
+    query = cuda.cuPointerGetAttribute
+    query.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
+    query.restype = ctypes.c_int
+    with device_module.device(mojo_gpu):
+        pinned = _pin_via(torch.arange(4 * 1024 * 1024 + 17).to(torch.uint8), entry)
+        for offset in (0, 1, 4095, 4096, pinned.numel() - 1):
+            memory_type = ctypes.c_uint()
+            # CU_POINTER_ATTRIBUTE_MEMORY_TYPE=2, CU_MEMORYTYPE_HOST=1.
+            assert query(ctypes.byref(memory_type), 2, pinned.data_ptr() + offset) == 0
+            assert memory_type.value == 1
+
+
+@pytest.mark.parametrize("kind", ["transpose", "gapped", "offset", "as-strided"])
+def test_pin_memory_preserves_strides_and_independent_storage(
+    mojo_device: str, kind: str
+):
+    base = torch.arange(128, dtype=torch.int64)
+    source = {
+        "transpose": base.reshape(8, 16).t(),
+        "gapped": base.reshape(8, 16)[1::2, 1::3],
+        "offset": base[1:18],
+        "as-strided": base.as_strided((3, 4), (31, 3), 5),
+    }[kind]
+    expected = source.clone()
+    with device_module.device(mojo_device):
+        pinned = source.pin_memory()
+        assert pinned.is_pinned()
+        assert pinned.stride() == source.stride()
+        assert pinned.storage_offset() == 0
+        span = 1 + sum(
+            (size - 1) * stride
+            for size, stride in zip(source.shape, source.stride(), strict=True)
+        )
+        assert pinned.untyped_storage().nbytes() == span * source.element_size()
+        assert torch.equal(pinned, expected)
+        pinned.fill_(-731)
+        assert torch.equal(source, expected)
+        source.fill_(923)
+        assert torch.equal(pinned, torch.full_like(expected, -731))
+        assert not source.is_pinned()
+
+
+@pytest.mark.parametrize(
+    "kind", ["offset", "end", "strided", "transpose", "overlap", "detach", "buffer"]
+)
+def test_pinned_alias_outlives_base_and_preserves_canaries(mojo_device: str, kind: str):
+    with device_module.device(mojo_device):
+        expected = torch.arange(65, dtype=torch.uint8)
+        base = expected.pin_memory()
+        if kind == "offset":
+            view = base[1:18]
+        elif kind == "end":
+            view = base[49:]
+        elif kind == "strided":
+            view = base[1:50:3]
+        elif kind == "transpose":
+            view = base[1:49].view(6, 8).t()
+        elif kind == "overlap":
+            view = base[3:4].expand(17)
+        elif kind == "detach":
+            view = base.detach()
+        else:
+            # NumPy's buffer retains its Tensor owner. Unlike an ordinary slice,
+            # this storage really begins at an interior byte of the allocation.
+            view = torch.frombuffer(memoryview(base.numpy())[1:18], dtype=torch.uint8)
+            assert view.untyped_storage().data_ptr() == base.data_ptr() + 1
+        snapshot = view.clone()
+        guard = base.detach()
+        clone = view.clone()
+        assert not clone.is_pinned()
+        assert view.pin_memory() is view
+        del base
+        gc.collect()
+        pressure = [
+            torch.full((65,), i + 100, dtype=torch.uint8).pin_memory() for i in range(8)
+        ]
+        assert view.is_pinned()
+        assert torch.equal(view, snapshot)
+        # Mutating only the addressed elements must leave all other bytes intact.
+        if kind != "overlap":
+            offsets = view.data_ptr() - guard.data_ptr()
+            indices = torch.empty_strided(view.shape, view.stride(), dtype=torch.int64)
+            for index in np.ndindex(tuple(view.shape)):
+                indices[index] = offsets + sum(
+                    i * s for i, s in zip(index, view.stride(), strict=True)
+                )
+            expected[indices.reshape(-1)] = 231
+            view.fill_(231)
+            assert torch.equal(guard, expected)
+        for i, block in enumerate(pressure):
+            assert torch.equal(block, torch.full_like(block, i + 100))
+
+
+def test_pin_memory_overlapping_pageable_view_errors_but_pinned_view_is_identity(
+    mojo_device: str,
+):
+    with device_module.device(mojo_device):
+        source = torch.tensor([37.0]).expand(3, 5)
+        with pytest.raises(
+            RuntimeError, match="more than one element.*single memory location"
+        ):
+            source.pin_memory()
+        assert torch.equal(source, torch.full((3, 5), 37.0))
+        pinned = torch.tensor([37.0]).pin_memory().expand(3, 5)
+        assert pinned.is_pinned()
+        assert pinned.pin_memory() is pinned
+        assert pinned.stride() == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "kind", ["transpose", "gapped", "expanded", "channels-last", "channels-last-3d"]
+)
+@pytest.mark.parametrize(
+    "memory_format", [torch.preserve_format, torch.contiguous_format]
+)
+def test_pinned_empty_like_memory_format(
+    mojo_device: str, kind: str, memory_format: torch.memory_format
+):
+    templates = {
+        "transpose": torch.arange(24).reshape(4, 6).t(),
+        "gapped": torch.arange(48).reshape(6, 8)[::2, ::2],
+        "expanded": torch.tensor([31]).expand(3, 4),
+        "channels-last": torch.arange(120)
+        .reshape(2, 3, 4, 5)
+        .contiguous(memory_format=torch.channels_last),
+        "channels-last-3d": torch.arange(360)
+        .reshape(2, 3, 3, 4, 5)
+        .contiguous(memory_format=torch.channels_last_3d),
+    }
+    source = templates[kind]
+    expected = torch.empty_like(source, pin_memory=False, memory_format=memory_format)
+    with device_module.device(mojo_device):
+        pinned = torch.empty_like(
+            source, device="cpu", pin_memory=True, memory_format=memory_format
+        )
+        assert pinned.is_pinned()
+        assert pinned.stride() == expected.stride()
+        assert pinned.data_ptr() != source.data_ptr()
+        pinned.copy_(source)
+        assert torch.equal(pinned, source)
+
+
+@pytest.mark.parametrize("entry", ["empty", "empty_like"])
+@pytest.mark.parametrize("pin_option", [None, False], ids=["omitted", "false"])
+@pytest.mark.parametrize("pinned_template", [False, True])
+def test_unpinned_factories_do_not_inherit_template_pinning(
+    mojo_device: str, entry: str, pin_option: bool | None, pinned_template: bool
+):
+    with device_module.device(mojo_device):
+        source = torch.arange(17)
+        if pinned_template:
+            source = source.pin_memory()
+        if entry == "empty_like":
+            result = (
+                torch.empty_like(source, device="cpu")
+                if pin_option is None
+                else torch.empty_like(source, device="cpu", pin_memory=False)
+            )
+        else:
+            result = (
+                torch.empty(17, device="cpu")
+                if pin_option is None
+                else torch.empty(17, device="cpu", pin_memory=False)
+            )
+        assert not result.is_pinned()
+        assert source.is_pinned() is pinned_template
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "numpy", "shared"])
+def test_pin_query_rejects_interleaved_pageable_allocations(
+    mojo_device: str, kind: str
+):
+    with device_module.device(mojo_device):
+        pinned = [torch.arange(n).pin_memory() for n in (1, 17, 4097)]
+        for n in (0, 1, 3, 4097):
+            if kind == "numpy":
+                source = torch.from_numpy(np.arange(n, dtype=np.int64))
+            else:
+                source = torch.arange(n)
+                if kind == "shared":
+                    source.share_memory_()
+            assert not source.is_pinned()
+        assert all(block.is_pinned() for block in pinned)
+
+
+@pytest.mark.parametrize("shape", [(0,), (17,)])
+def test_mojo_tensor_is_not_host_pinned_and_cannot_be_pinned(
+    mojo_device: str, shape: tuple[int, ...]
+):
+    tensor = torch.empty(shape, device=mojo_device)
+    assert not tensor.is_pinned()
+    with pytest.raises(RuntimeError, match="only dense CPU tensors can be pinned"):
+        tensor.pin_memory()
+    assert tensor.device == torch.device(mojo_device)
+
+
+@pytest.mark.parametrize("target", ["meta", "cuda"])
+@pytest.mark.parametrize("size", [0, 17])
+def test_other_non_cpu_tensors_are_not_host_pinned(target: str, size: int):
+    if target == "cuda" and not torch.cuda.is_available():
+        pytest.skip("non-CPU CUDA tensor requires runtime CUDA availability")
+    tensor = torch.empty(size, device=target)
+    assert not tensor.is_pinned()
+    with pytest.raises(RuntimeError, match="only dense CPU tensors can be pinned"):
+        tensor.pin_memory()
+
+
+@pytest.mark.parametrize("entry", ["empty", "empty_like", "empty_strided"])
+def test_pinned_factory_rejects_mojo_output(mojo_device: str, entry: str):
+    source = torch.empty(3, device=mojo_device)
+    with pytest.raises(RuntimeError, match="[Pp]in|CPU"):
+        if entry == "empty":
+            torch.empty(3, device=mojo_device, pin_memory=True)
+        elif entry == "empty_strided":
+            torch.empty_strided((3,), (2,), device=mojo_device, pin_memory=True)
+        else:
+            torch.empty_like(source, pin_memory=True)
+
+
+@pytest.mark.parametrize("query_device", ["mojo", "mojo:0", "cpu", "meta"])
+def test_is_pinned_explicit_device_type_routing(mojo_device: str, query_device: str):
+    with device_module.device(mojo_device):
+        pinned = torch.arange(17).pin_memory()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            if query_device.startswith("mojo"):
+                assert pinned.is_pinned(device=query_device)
+                assert pinned.pin_memory(device=query_device) is pinned
+            else:
+                # Context::isPinnedPtr rejects non-accelerator device types
+                # with false before looking up a hook (Context.h).
+                assert not pinned.is_pinned(device=query_device)
+        assert device_module.current_device() == int(mojo_device.split(":")[1])
+
+
+def test_is_pinned_explicit_cuda_bypasses_mojo_hook():
+    # A MAX CPU HostBuffer is known to Mojo but is not CUDA-registered. Using
+    # it distinguishes the hooks even on a machine with a working CUDA wheel.
+    if torch.cuda.is_available():
+        torch.cuda.init()  # Context::isPinnedPtr otherwise has its own cold guard.
+    with device_module.device(device_module.device_count() - 1):
+        pinned = torch.arange(17).pin_memory()
+        assert pinned.is_pinned()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            assert not pinned.is_pinned(device="cuda")
+            assert pinned.is_pinned(device="mojo")
+        assert pinned.is_pinned()
+
+
+def test_pinned_query_does_not_depend_on_current_device(mojo_device: str):
+    original = device_module.current_device()
+    with device_module.device(mojo_device):
+        pinned = torch.arange(17).pin_memory()
+    for index in range(device_module.device_count()):
+        with device_module.device(index):
+            assert pinned.is_pinned()
+            assert device_module.current_device() == index
+    assert device_module.current_device() == original
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        torch.sparse_coo,
+        torch.sparse_csr,
+        torch.sparse_csc,
+        torch.sparse_bsr,
+        torch.sparse_bsc,
+    ],
+)
+@pytest.mark.parametrize("empty", [False, True], ids=["nonempty", "empty"])
+def test_sparse_pin_memory_pins_components(
+    mojo_device: str, layout: torch.layout, empty: bool
+):
+    dense = (
+        torch.zeros((4, 4), dtype=torch.float64)
+        if empty
+        else torch.tensor(
+            [
+                [0.0, 2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0, 5.0],
+                [0.0, 0.0, 7.0, 0.0],
+                [11.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float64,
+        )
+    )
+    blocksize = (2, 2) if layout in (torch.sparse_bsr, torch.sparse_bsc) else None
+    source = dense.to_sparse(layout=layout, blocksize=blocksize)
+    with device_module.device(mojo_device):
+        pinned = source.pin_memory()
+        assert pinned.layout == layout
+        assert pinned.device == torch.device("cpu")
+        assert torch.equal(pinned.to_dense(), dense)
+        assert pinned.is_pinned() is (not empty)
+        if layout == torch.sparse_coo:
+            parts = (pinned._indices(), pinned._values())
+            originals = (source._indices(), source._values())
+        elif layout in (torch.sparse_csr, torch.sparse_bsr):
+            parts = (pinned.crow_indices(), pinned.col_indices(), pinned.values())
+            originals = (source.crow_indices(), source.col_indices(), source.values())
+        else:
+            parts = (pinned.ccol_indices(), pinned.row_indices(), pinned.values())
+            originals = (source.ccol_indices(), source.row_indices(), source.values())
+        for part, original in zip(parts, originals, strict=True):
+            assert part.is_pinned() is (part.untyped_storage().nbytes() != 0)
+            assert not original.is_pinned()
+            assert torch.equal(part, original)
+            if part.numel():
+                assert part.data_ptr() != original.data_ptr()
+        if not empty:
+            assert pinned.pin_memory() is pinned
+        else:
+            assert torch.equal(pinned.pin_memory().to_dense(), dense)
+
+
+@pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
+def test_pinned_python_threads_allocate_disjoint_live_blocks(
+    mojo_device: str, entry: str
+):
+    # Fresh first use and a process deadline: a deadlocked allocator must not
+    # hang pytest in ThreadPoolExecutor.__exit__ waiting for its worker threads.
+    script = textwrap.dedent("""
+        import sys
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        import torch
+        from torch_mojo_backend import register_mojo_devices
+        from torch_mojo_backend.native import device_module
+
+        register_mojo_devices()
+        barrier = Barrier(4, timeout=60)
+
+        def allocate(worker: int) -> list[torch.Tensor]:
+            with device_module.device(sys.argv[1]):
+                barrier.wait()
+                blocks = []
+                for i in range(8):
+                    source = torch.arange(257) + worker * 10000 + i * 300
+                    if sys.argv[2] == 'method':
+                        pinned = source.pin_memory()
+                    elif sys.argv[2] == 'empty':
+                        pinned = torch.empty(257, dtype=source.dtype, device='cpu', pin_memory=True)
+                        pinned.copy_(source)
+                    else:
+                        pinned = torch.empty_like(source, device='cpu', pin_memory=True)
+                        pinned.copy_(source)
+                    assert pinned.is_pinned()
+                    blocks.append(pinned)
+                assert device_module.current_device() == int(sys.argv[1].split(':')[1])
+            return blocks
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(allocate, range(4)))
+        ranges = sorted((block.data_ptr(), block.data_ptr() + block.untyped_storage().nbytes())
+                        for blocks in results for block in blocks)
+        assert all(end <= start for (_, end), (start, _) in zip(ranges, ranges[1:]))
+        for worker, blocks in enumerate(results):
+            for i, block in enumerate(blocks):
+                assert block.is_pinned()
+                assert torch.equal(block, torch.arange(257) + worker * 10000 + i * 300)
+    """)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", script, mojo_device, entry],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("kind", ["negative-size", "overflow", "overflow-strides"])
+def test_invalid_pinned_allocation_arithmetic_errors_and_recovers(
+    mojo_device: str, kind: str
+):
+    with device_module.device(mojo_device):
+        with pytest.raises(RuntimeError, match="negative|overflow|Storage size"):
+            if kind == "negative-size":
+                torch.empty((-1, 3), device="cpu", pin_memory=True)
+            elif kind == "overflow":
+                torch.empty(
+                    (2**62, 8), dtype=torch.float64, device="cpu", pin_memory=True
+                )
+            else:
+                torch.empty_strided(
+                    (3, 3),
+                    (2**62, 1),
+                    dtype=torch.float64,
+                    device="cpu",
+                    pin_memory=True,
+                )
+        pinned = torch.arange(17).pin_memory()
+        assert pinned.is_pinned()
+        assert torch.equal(pinned, torch.arange(17))
+
+
+def test_method_pinned_storage_cannot_grow(mojo_device: str):
+    with device_module.device(mojo_device):
+        pinned = torch.arange(17).pin_memory()
+        storage = pinned.untyped_storage()
+        assert not storage.resizable()
+        with pytest.raises(RuntimeError, match="not resizable"):
+            storage.resize_(storage.nbytes() + 4096)
+        assert pinned.is_pinned()
+        assert torch.equal(pinned, torch.arange(17))
+
+
+def test_pinned_pointer_query_exact_live_range_on_max_cpu(
+    pin_allocator_probe: _PinAllocatorProbe,
+):
+    with device_module.device(device_module.device_count() - 1):
+        pinned = torch.arange(257, dtype=torch.uint8).pin_memory()
+        base = pinned.data_ptr()
+        end = base + pinned.untyped_storage().nbytes()
+        # These are address-only hook queries, including the two out-of-bounds
+        # addresses. They never construct a readable tensor or touch those bytes.
+        assert pin_allocator_probe.is_pinned_address(base)
+        assert pin_allocator_probe.is_pinned_address(end - 1)
+        assert not pin_allocator_probe.is_pinned_address(base - 1)
+        assert not pin_allocator_probe.is_pinned_address(end)
+        assert not pin_allocator_probe.is_pinned_address(0)
+        assert torch.equal(pinned, torch.arange(257).to(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "dtype_name",
+    [
+        "uint16",
+        "uint32",
+        "uint64",
+        "complex32",
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "float8_e4m3fnuz",
+        "float8_e5m2fnuz",
+        "float8_e8m0fnu",
+    ],
+)
+def test_pinned_additional_installed_host_dtypes(mojo_device: str, dtype_name: str):
+    if not hasattr(torch, dtype_name):
+        pytest.skip(f"installed PyTorch does not expose torch.{dtype_name}")
+    dtype = getattr(torch, dtype_name)
+    source = torch.arange(1, 18, dtype=torch.float32).to(dtype)
+    with device_module.device(mojo_device):
+        pinned = source.pin_memory()
+        assert pinned.dtype == dtype
+        assert pinned.is_pinned()
+        assert torch.equal(pinned.view(torch.uint8), source.view(torch.uint8))
+
+
+def test_pinned_method_preserves_autograd(mojo_device: str):
+    with device_module.device(mojo_device):
+        source = torch.arange(1, 18, dtype=torch.float64, requires_grad=True)
+        pinned = source.pin_memory()
+        assert pinned.is_pinned()
+        (pinned * pinned).sum().backward()
+        assert source.grad is not None
+        assert torch.equal(source.grad, 2 * source.detach())
+        with torch.inference_mode():
+            inference = torch.arange(17).pin_memory()
+            assert inference.is_pinned()
+            assert torch.equal(inference, torch.arange(17))
+
+
+@pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
+def test_pinned_factories_without_runtime_cuda(
+    pin_allocator_probe: _PinAllocatorProbe, entry: str
+):
+    # Hiding accelerators exercises a CUDA wheel with hasCUDA()==false. The
+    # same test also works with a CPU-only wheel; no wheel-branding oracle.
+    script = textwrap.dedent("""
+        import ctypes
+        import sys
+        import torch
+        from torch_mojo_backend import register_mojo_devices
+        from torch_mojo_backend.native import device_module
+
+        assert not torch.cuda.is_available()
+        register_mojo_devices()
+        assert device_module.device_count() == 1
+        probe = ctypes.CDLL(sys.argv[1])
+        probe.uses_mojo_allocator.argtypes = [ctypes.c_void_p]
+        probe.uses_mojo_allocator.restype = ctypes.c_bool
+        source = torch.arange(17)
+        if sys.argv[2] == 'method':
+            pinned = source.pin_memory()
+        elif sys.argv[2] == 'empty':
+            pinned = torch.empty(17, dtype=source.dtype, device='cpu', pin_memory=True)
+        else:
+            pinned = torch.empty_like(source, device='cpu', pin_memory=True)
+        assert pinned.is_pinned()
+        assert probe.uses_mojo_allocator(pinned.untyped_storage()._cdata)
+        assert pinned.pin_memory() is pinned
+        for batch in torch.utils.data.DataLoader([source], batch_size=None, pin_memory=True):
+            assert batch.is_pinned()
+            assert torch.equal(batch, source)
+    """)
+    if any(device.api == "metal" for device in get_accelerators()):
+        pytest.skip("CUDA/HIP visibility variables cannot hide a Metal accelerator")
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
+    }
+    env.update(CUDA_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="", ROCR_VISIBLE_DEVICES="")
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(pin_allocator_probe.path), entry],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def _cuda_pinned_allocation_device(tensor: torch.Tensor) -> int | None:
+    """Driver registration ordinal; None for the MAX CPU's host allocation."""
+    cuda = ctypes.CDLL("libcuda.so.1")
+    query = cuda.cuPointerGetAttribute
+    query.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
+    query.restype = ctypes.c_int
+    ordinal = ctypes.c_int(-1)
+    status = query(ctypes.byref(ordinal), 9, tensor.data_ptr())
+    if status == 1:  # CUDA_ERROR_INVALID_VALUE: no registration for this pointer.
+        return None
+    assert status == 0
+    return ordinal.value
+
+
+@pytest.mark.parametrize("two_gpus", [False, True], ids=["gpu-vs-max-cpu", "two-gpus"])
+def test_explicit_pin_device_index_does_not_override_current_device(
+    mojo_gpu: str, two_gpus: bool
+):
+    if get_accelerators()[0].api != "cuda":
+        pytest.skip("allocation-device conformance probe requires the CUDA driver")
+    if two_gpus and device_module.device_count() < 3:
+        pytest.skip("requires two physical Mojo GPUs; MAX CPU is not a second GPU")
+    other = 1 if two_gpus else device_module.device_count() - 1
+    for current, argument in ((0, other), (other, 0)):
+        with device_module.device(current), warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            pinned = torch.arange(17).pin_memory(device=f"mojo:{argument}")
+            assert pinned.is_pinned(device=f"mojo:{argument}")
+            assert device_module.current_device() == current
+            expected = None if current == device_module.device_count() - 1 else current
+            assert _cuda_pinned_allocation_device(pinned) == expected
+
+
+@pytest.mark.parametrize("two_gpus", [False, True], ids=["gpu-vs-max-cpu", "two-gpus"])
+def test_pinned_threads_keep_their_own_allocation_device(mojo_gpu: str, two_gpus: bool):
+    if get_accelerators()[0].api != "cuda":
+        pytest.skip("thread allocation-device probe requires the CUDA driver")
+    if two_gpus and device_module.device_count() < 3:
+        pytest.skip("requires two physical Mojo GPUs")
+    other = 1 if two_gpus else device_module.device_count() - 1
+    barrier = Barrier(2, timeout=30)
+
+    def allocate(index: int) -> torch.Tensor:
+        with device_module.device(index):
+            barrier.wait()
+            result = torch.arange(17).pin_memory()
+            barrier.wait()
+            assert device_module.current_device() == index
+        return result
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        gpu, alternate = list(executor.map(allocate, (0, other)))
+    assert _cuda_pinned_allocation_device(gpu) == 0
+    assert _cuda_pinned_allocation_device(alternate) == (other if two_gpus else None)
+    assert gpu.is_pinned() and alternate.is_pinned()
+
+
+@pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
+def test_pinned_allocation_failure_preserves_source_and_recovers(
+    mojo_device: str, entry: str, pinned_host_failure_preload: Path
+):
+    if not sys.platform.startswith("linux"):
+        pytest.skip(
+            "controlled address-space exhaustion needs Linux /proc and RLIMIT_AS"
+        )
+    script = textwrap.dedent("""
+        import ctypes
+        import gc
+        import os
+        import resource
+        import sys
+        from pathlib import Path
+        import torch
+        from torch_mojo_backend import register_mojo_devices
+        from torch_mojo_backend.native import device_module
+
+        torch.set_num_threads(1)
+        register_mojo_devices()
+        with device_module.device(sys.argv[1]):
+            for warm in (torch.empty(17).pin_memory(), torch.empty(17, device='cpu', pin_memory=True)):
+                assert warm.is_pinned()
+            del warm
+            # Allocate the input and oracle before imposing the limit. The
+            # request is a budgeted 128 MiB, not an arbitrary enormous size.
+            source = torch.arange(32 * 1024 * 1024, dtype=torch.int32)
+            expected = source.clone()
+            gc.collect()
+            pages = int(Path('/proc/self/statm').read_text().split()[0])
+            current = pages * resource.getpagesize()
+            old_limit = resource.getrlimit(resource.RLIMIT_AS)
+            ceiling = current + 8 * 1024 * 1024
+            if old_limit[1] != resource.RLIM_INFINITY:
+                ceiling = min(ceiling, old_limit[1])
+            message = ''
+            # MAX may serve allocations from reserved address space, so
+            # RLIMIT_AS alone is not a fault injector for its HostBuffers.
+            # Interpose only its documented createHostBuffer C ABI; CUDA
+            # factories still fail against the address-space limit below.
+            os.environ['TMB_TEST_FAIL_HOST_BUFFER'] = '1'
+            resource.setrlimit(resource.RLIMIT_AS, (ceiling, old_limit[1]))
+            try:
+                try:
+                    if sys.argv[2] == 'method':
+                        source.pin_memory()
+                    elif sys.argv[2] == 'empty':
+                        torch.empty(source.shape, dtype=source.dtype, device='cpu', pin_memory=True)
+                    else:
+                        torch.empty_like(source, device='cpu', pin_memory=True)
+                except RuntimeError as error:
+                    message = str(error)
+            finally:
+                resource.setrlimit(resource.RLIMIT_AS, old_limit)
+                del os.environ['TMB_TEST_FAIL_HOST_BUFFER']
+            assert message, 'controlled allocation unexpectedly succeeded'
+            assert any(word in message.lower() for word in ('allocat', 'memory')), message
+            probe = ctypes.CDLL(sys.argv[3])
+            expected_faults = int(sys.argv[2] == 'method' or not torch.cuda.is_available())
+            assert probe.tmb_test_host_buffer_failures() == expected_faults
+            assert not source.is_pinned()
+            assert torch.equal(source, expected)
+            for recovered in (torch.arange(17).pin_memory(),
+                              torch.empty(17, device='cpu', pin_memory=True),
+                              torch.empty_like(torch.arange(17), device='cpu', pin_memory=True)):
+                assert recovered.is_pinned()
+            print('allocation failure recovered', flush=True)
+    """)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
+    }
+    env["LD_PRELOAD"] = str(pinned_host_failure_preload) + (
+        ":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else ""
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            mojo_device,
+            entry,
+            str(pinned_host_failure_preload),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "allocation failure recovered" in proc.stdout
+
+
+@pytest.fixture(scope="module")
+def pinned_host_failure_preload(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A subprocess-only fault at MAX's C ABI, with no production test switch."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("MAX allocation fault injection requires Linux LD_PRELOAD")
+    directory = tmp_path_factory.mktemp("host-buffer-failure")
+    source = directory / "fail_host_buffer.cpp"
+    source.write_text("""
+        #include <dlfcn.h>
+        #include <stddef.h>
+        #include <stdlib.h>
+        #include <string.h>
+        static int failures = 0;
+        extern "C" int tmb_test_host_buffer_failures() { return failures; }
+        extern "C" const char* AsyncRT_DeviceContext_createHostBuffer(
+            void** result, void** pointer, const void* context,
+            size_t count, size_t itemsize) {
+            if (getenv("TMB_TEST_FAIL_HOST_BUFFER")) {
+                ++failures;
+                *result = nullptr;
+                *pointer = nullptr;
+                // MAX consumes errors with AsyncRT_DeviceContext_strfree.
+                return strdup("injected host memory allocation failure");
+            }
+            using Create = const char* (*)(void**, void**, const void*, size_t, size_t);
+            auto create = reinterpret_cast<Create>(dlsym(
+                RTLD_NEXT, "AsyncRT_DeviceContext_createHostBuffer"));
+            if (!create) return strdup("test interposer could not find MAX host allocator");
+            return create(result, pointer, context, count, itemsize);
+        }
+    """)
+    output = directory / "fail_host_buffer.so"
+    proc = subprocess.run(
+        [*native._cxx(), "-shared", "-fPIC", str(source), "-o", str(output), "-ldl"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return output
+
+
+def test_pinned_view_is_sole_surviving_storage_owner(mojo_device: str):
+    with device_module.device(mojo_device):
+        base = torch.arange(257, dtype=torch.int64).pin_memory()
+        view = base[3::7]
+        expected = torch.arange(257)[3::7]
+        del base
+        gc.collect()
+        pressure = [
+            torch.full((257,), -i - 17, dtype=torch.int64).pin_memory()
+            for i in range(8)
+        ]
+        assert view.is_pinned()
+        assert torch.equal(view, expected)
+        assert all(block.is_pinned() for block in pressure)
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_pinned_round_trip(mojo_device: str, strided: bool):
+    with device_module.device(mojo_device):
+        source = torch.arange(128, dtype=torch.float32).reshape(8, 16)
+        if strided:
+            source = source[1::2, 1::2]
+        pinned = source.pin_memory()
+        assert pinned.is_pinned()
+        assert pinned.stride() == source.stride()
+        uploaded = pinned.to(mojo_device)
+        assert not uploaded.is_pinned()
+        torch.testing.assert_close(uploaded.cpu(), source)
+        downloaded = torch.empty_like(pinned, pin_memory=True)
+        downloaded.copy_(uploaded)
+        assert downloaded.is_pinned()
+        torch.testing.assert_close(downloaded, source)
+
+
+def _host_pointer_alias(address: int) -> torch.Tensor:
+    """A non-owning storage for pointer queries; never read its contents."""
+    return torch.frombuffer(
+        (ctypes.c_uint8 * 1).from_address(address), dtype=torch.uint8
+    )
+
+
+def test_pinned_interior_pointers(mojo_device: str):
+    with device_module.device(mojo_device):
+        pinned = torch.arange(64, dtype=torch.float32).pin_memory()
+        view = pinned[16:]
+        base = pinned.data_ptr()
+        end = base + pinned.numel() * pinned.element_size()
+        assert base < view.data_ptr() < end
+        assert view.is_pinned()
+        # A slice queries the storage base; these storages start inside it.
+        for address in (base + 1, view.data_ptr(), end - 1):
+            assert _host_pointer_alias(address).is_pinned()
+        del pinned
+        assert view.is_pinned()
+
+
+def _current_rss_bytes() -> int | None:
+    """Current resident memory, or None when procfs does not expose it."""
+    try:
+        status = Path("/proc/self/status").read_text()
+    except FileNotFoundError:
+        return None
+    for line in status.splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1]) * 1024
+    return None
+
+
+def test_pinned_allocations_are_released(mojo_device: str):
+    """Catch leaked HostBuffers that were not destroyed after their tensors died.
+
+    Current RSS bounds retained memory after churn regardless of earlier peaks.
+    Without procfs, the churn and fresh-allocation checks still run.
+    """
+    with device_module.device(mojo_device):
+        # Tensor.pin_memory() uses our allocator even with a CUDA torch wheel.
+        source = torch.zeros(4 * 1024 * 1024, dtype=torch.uint8)
+        warm = source.pin_memory()
+        del warm
+        before = _current_rss_bytes()
+        # Churn 256 MiB in total with only 32 MiB of live pinned blocks.
+        for _ in range(8):
+            blocks = [source.pin_memory() for _ in range(8)]
+            while blocks:
+                block = blocks.pop(len(blocks) // 2)
+                del block
+                assert all(live.is_pinned() for live in blocks)
+        after = _current_rss_bytes()
+        if before is not None and after is not None:
+            assert after - before < 128 * 1024 * 1024
+        fresh = torch.empty(8).pin_memory()
+        assert fresh.is_pinned()
+
+
+@pytest.mark.filterwarnings("ignore:pin_memory_device is deprecated:UserWarning")
+def test_pinned_dataloader(mojo_device: str):
+    with device_module.device(mojo_device):
+        source = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(source),
+            batch_size=2,
+            num_workers=0,
+            pin_memory=True,
+            pin_memory_device=mojo_device,
+        )
+        batches = [batch[0] for batch in loader]
+        assert all(batch.is_pinned() for batch in batches)
+        torch.testing.assert_close(torch.cat(batches), source)
+
+
+@pytest.mark.parametrize("workers", ["none", "fork", "spawn"])
+def test_pinned_dataloader_worker_modes_preserve_values_and_method_provenance(
+    mojo_device: str, workers: str, pin_allocator_probe: _PinAllocatorProbe
+):
+    if workers != "none" and workers not in multiprocessing.get_all_start_methods():
+        pytest.skip(f"multiprocessing start method {workers!r} is unavailable")
+    source = (torch.arange(68) * 37 + 11).reshape(17, 4)
+    with device_module.device(mojo_device):
+        loader = DataLoader(
+            TensorDataset(source),
+            batch_size=3,
+            num_workers=0 if workers == "none" else 2,
+            multiprocessing_context=None if workers == "none" else workers,
+            pin_memory=True,
+            timeout=0 if workers == "none" else 60,
+        )
+        batches = [batch[0] for batch in loader]
+        assert len(batches) == 6
+        assert all(
+            batch.device.type == "cpu" and batch.is_pinned() for batch in batches
+        )
+        assert all(pin_allocator_probe.uses_mojo_allocator(batch) for batch in batches)
+        assert torch.equal(torch.cat(batches), source)
+        assert not source.is_pinned()
+
+
+class _NamedPinSample(NamedTuple):
+    value: torch.Tensor
+    label: str
+
+
+_Sample = TypeVar("_Sample")
+
+
+class _SinglePinSample(Dataset[_Sample], Generic[_Sample]):
+    def __init__(self, sample: _Sample):
+        self.sample = sample
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, index: int) -> _Sample:
+        if index != 0:
+            raise IndexError(index)
+        return self.sample
+
+
+@dataclass
+class _CustomPinSample:
+    value: torch.Tensor
+    pin_calls: int = 0
+
+    def pin_memory(self) -> "_CustomPinSample":
+        return _CustomPinSample(self.value.pin_memory(), self.pin_calls + 1)
+
+
+def test_pinned_dataloader_nested_and_custom_batches(mojo_device: str):
+    source = {
+        "tensor": torch.arange(17),
+        "list": [torch.tensor(31), "text", 19],
+        "tuple": (torch.tensor([7, 11]), "pair"),
+        "named": _NamedPinSample(torch.tensor([29]), "named"),
+        "empty": torch.empty(3, 0, 5),
+        "custom": _CustomPinSample(torch.tensor([43, 47])),
+    }
+    with device_module.device(mojo_device):
+        batch = next(
+            iter(DataLoader(_SinglePinSample(source), batch_size=None, pin_memory=True))
+        )
+        assert torch.equal(batch["tensor"], source["tensor"])
+        assert batch["tensor"].is_pinned()
+        assert batch["list"][0].shape == ()
+        assert batch["list"][0].item() == 31 and batch["list"][0].is_pinned()
+        assert batch["list"][1:] == ["text", 19]
+        # Upstream intentionally turns ordinary tuples into lists.
+        assert isinstance(batch["tuple"], list)
+        assert torch.equal(batch["tuple"][0], torch.tensor([7, 11]))
+        assert batch["tuple"][0].is_pinned() and batch["tuple"][1] == "pair"
+        assert isinstance(batch["named"], _NamedPinSample)
+        assert batch["named"].value.is_pinned()
+        assert batch["named"].label == "named"
+        assert batch["empty"].shape == (3, 0, 5) and not batch["empty"].is_pinned()
+        assert isinstance(batch["custom"], _CustomPinSample)
+        assert batch["custom"].pin_calls == 1
+        assert batch["custom"].value.is_pinned()
+        assert torch.equal(batch["custom"].value, torch.tensor([43, 47]))
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_pinned_dataloader_pin_error_reaches_consumer_and_recovers(
+    mojo_device: str, num_workers: int
+):
+    source = torch.tensor([37.0]).expand(3, 5)
+    with device_module.device(mojo_device):
+        loader = DataLoader(
+            _SinglePinSample(source),
+            batch_size=None,
+            num_workers=num_workers,
+            pin_memory=True,
+            timeout=60 if num_workers else 0,
+        )
+        iterator = iter(loader)
+        try:
+            with pytest.raises(
+                RuntimeError, match="more than one element.*single memory location"
+            ):
+                next(iterator)
+        finally:
+            if num_workers:
+                assert isinstance(iterator, _MultiProcessingDataLoaderIter)
+                iterator._shutdown_workers()
+            del iterator, loader
+            gc.collect()
+        assert torch.equal(source, torch.full((3, 5), 37.0))
+        batch = next(
+            iter(
+                DataLoader(
+                    _SinglePinSample(torch.arange(17)), batch_size=None, pin_memory=True
+                )
+            )
+        )
+        assert batch.is_pinned()
+        assert torch.equal(batch, torch.arange(17))
+
+
+def test_pinned_dataloader_persistent_workers_and_early_shutdown(mojo_device: str):
+    source = torch.arange(68).reshape(17, 4)
+    with device_module.device(mojo_device):
+        for _ in range(2):
+            loader = DataLoader(
+                TensorDataset(source),
+                batch_size=3,
+                num_workers=2,
+                persistent_workers=True,
+                pin_memory=True,
+                timeout=60,
+            )
+            iterator = iter(loader)
+            first = next(iterator)[0]
+            assert first.is_pinned()
+            assert torch.equal(first, source[:3])
+            for _ in range(2):
+                batches = [batch[0] for batch in loader]
+                assert all(batch.is_pinned() for batch in batches)
+                assert torch.equal(torch.cat(batches), source)
+            del iterator, loader
+            gc.collect()
+            # A delivered batch survives its loader and pinning thread.
+            assert first.is_pinned()
+            assert torch.equal(first, source[:3])
+
+
+def test_pinned_dataloader_foreign_cuda_batch_keeps_allocator(
+    pin_allocator_probe: _PinAllocatorProbe,
+):
+    if not torch.cuda.is_available():
+        pytest.skip(
+            "foreign CUDA-owned pinned batch requires runtime CUDA availability"
+        )
+    source = torch.empty(17, dtype=torch.int64, device="cpu", pin_memory=True)
+    source.copy_(torch.arange(17))
+    assert not pin_allocator_probe.uses_mojo_allocator(source)
+    batch = next(
+        iter(DataLoader(_SinglePinSample(source), batch_size=None, pin_memory=True))
+    )
+    assert batch is source
+    assert batch.is_pinned()
+    assert not pin_allocator_probe.uses_mojo_allocator(batch)
+    assert torch.equal(batch, torch.arange(17))
+
+
+def test_pinned_dataloader_thread_keeps_captured_device(mojo_gpu: str):
+    if get_accelerators()[0].api != "cuda":
+        pytest.skip("pinning-thread allocation-device probe requires the CUDA driver")
+    if device_module.device_count() < 3:
+        pytest.skip(
+            "requires two physical Mojo GPUs for the pinning thread's captured device"
+        )
+    with device_module.device(1):
+        loader = DataLoader(
+            TensorDataset(torch.arange(68).reshape(17, 4)),
+            batch_size=3,
+            num_workers=2,
+            pin_memory=True,
+            timeout=60,
+        )
+        iterator = iter(loader)
+        try:
+            with device_module.device(0):
+                batches = [batch[0] for batch in iterator]
+                assert all(
+                    _cuda_pinned_allocation_device(batch) == 1 for batch in batches
+                )
+                assert device_module.current_device() == 0
+        finally:
+            del iterator, loader
+            gc.collect()
+        assert torch.equal(torch.cat(batches), torch.arange(68).reshape(17, 4))
 
 
 def test_module_to_mojo_preserves_tied_parameters(mojo_device):

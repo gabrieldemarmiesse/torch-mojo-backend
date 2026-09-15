@@ -112,6 +112,8 @@ def _shape_of(sizes: IntList) raises -> IndexList[MAX_RANK]:
 def op_empty_memory_format(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    if v_bool_or(args[unsafe_offset=4], False):
+        raise Error("Only dense CPU tensors can be pinned")
     var sizes = IntList(args[unsafe_offset=0])
     var stype = v_dtype_or(args[unsafe_offset=1], default_dtype())
     var device = _target_device(args[unsafe_offset=3])
@@ -136,6 +138,8 @@ def op_empty_memory_format(
 def op_empty_strided(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    if v_bool_or(args[unsafe_offset=5], False):
+        raise Error("Only dense CPU tensors can be pinned")
     var sizes = IntList(args[unsafe_offset=0])
     var strides = IntList(args[unsafe_offset=1])
     var stype = v_dtype_or(args[unsafe_offset=2], default_dtype())

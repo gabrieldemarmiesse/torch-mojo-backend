@@ -226,6 +226,24 @@ workers that only touch CPU tensors run normally
 boxed-kernel calls per op (the `CallChecker` in `torch_mojo_backend/testing.py`
 uses them to assert that an op ran natively).
 
+## Host memory
+
+The device allocator owns MAX `DeviceBuffer` boxes; the pinned CPU allocator
+owns MAX `HostBuffer` boxes from `enqueue_create_host_buffer`, backed by
+page-locked host memory for the current mojo device's context. Mojo owns
+zero-byte requests too: a real allocation handle with a null data pointer,
+no host buffer and no registry entry, so `is_pinned()` stays false.
+`is_pinned()` forwards to Mojo, which queries its registry with a binary
+interval lookup, including interior pointers, then asks torch's CUDA hook
+through a C accessor on a miss. Torch's CPU factories prefer CUDA's pinned
+allocator when CUDA is available; `pin_memory=True` uses the Mojo allocator
+with a CPU torch build. The CUDA fallback accounts for factories preferring
+CUDA's allocator while queries prefer PrivateUse1.
+H2D still copies into a separate pinned staging buffer before asynchronous
+DMA on CUDA/HIP (CPU and Metal copy synchronously); D2H is synchronous.
+Direct asynchronous copies using pinned tensors need deferred frees tied to
+outstanding copies.
+
 ## Streams and events
 
 `torch.Stream(device="mojo")`, `torch.Event`, `torch.accelerator.current_stream
