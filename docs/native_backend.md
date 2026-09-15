@@ -195,9 +195,40 @@ the op decides whether to try another route or propagate.
 
 **Streams.** Ops launch on the device's current stream (`ctx_for`), so
 `with torch.Stream(...)` really moves execution. Memory is allocated on the
-current stream; a tensor used by another stream gets `record_stream`ed by
-torch (`recordDataPtrOnStream`), which the backend turns into an event the
-owner stream waits on before the buffer is released.
+current stream; callers using a tensor on another stream must record that
+use (`Tensor.record_stream`, or torch's internal `recordDataPtrOnStream`),
+which the backend turns into an event the owner stream waits on before
+the buffer is released.
+
+### Transfers
+
+`.to("mojo:j")` and `dst.copy_(src)` automatically use MAX
+`DeviceBuffer.enqueue_copy_from` for CUDA/HIP peer-capable pairs. Peer access
+is enabled lazily per ordered pair; success and failure are cached under the
+shim mutex. CPU, Metal, inaccessible pairs, and enable errors use host staging.
+ROCm correctness and performance remain unmeasured.
+
+Direct copies run on the destination's current stream, with MAX events in
+both directions and no host completion wait for either `non_blocking` value.
+Destination consumers are ordered after the copy; `.cpu()` and `.item()` wait
+for readback. Callers must order producers on unrelated streams.
+
+Original source, staging, and destination storage are recorded on their own
+device's current stream. At release, allocation-owner streams wait for those
+streams; MAX's reverse event fences the remote source read. Transfer errors
+drain both streams before release. A failed drain retains both devices'
+allocations until exit; pinned staging is retained unless completion is known.
+
+`.to` borrows contiguous, unchanged-dtype sources, otherwise packs/casts on
+the source, then restores destination memory format. `copy_` packs and moves
+before casting or copying into destination strides. Dtype pairs outside the
+fast cast kernel use CPU torch to preserve exact integer conversions.
+
+`TORCH_MOJO_BACKEND_TEST_PEER_COPY` and `TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD`
+are test-only hooks cached at initialization; unset leaves no-op checks.
+See `tests/native/test_peer_copy.py` for modes and usage.
+
+### Threads and fork
 
 **Threads.** The shim's recursive mutex serializes every call into Mojo, so
 ops need no locking of their own; the autograd engine's thread and the main

@@ -327,6 +327,19 @@ def _fill_contiguous(t: T, s: FillScalar) raises:
     _ = ctx
 
 
+def is_cast_dtype(dt: DType) -> Bool:
+    """Mirrors data_movement_ops.mojo's `CAST_DTYPES`."""
+    return (
+        dt == DType.float32
+        or dt == DType.float16
+        or dt == DType.bfloat16
+        or dt == DType.int64
+        or dt == DType.int32
+        or dt == DType.uint8
+        or dt == DType.bool
+    )
+
+
 def cast_into(dst: T, src: T) raises:
     """dst = src.to(dst.dtype) for a contiguous dst (data_movement_ops CastSpec).
     """
@@ -388,20 +401,6 @@ def philox_reserve(
 # int64 scalars round-trip through a Float64 fill argument exactly up to
 # this magnitude.
 comptime _MAX_EXACT_INT = 9007199254740992  # 2**53
-
-
-def _is_cast_dtype(dtype: DType) -> Bool:
-    """Dtypes `binary_promotion`/`promoted_pair` can materialize a cast into
-    (matches the old `_CAST_DTYPES`)."""
-    return (
-        dtype == DType.float32
-        or dtype == DType.float16
-        or dtype == DType.bfloat16
-        or dtype == DType.int64
-        or dtype == DType.int32
-        or dtype == DType.uint8
-        or dtype == DType.bool
-    )
 
 
 def _is_embeddable_dtype(dtype: DType) -> Bool:
@@ -467,9 +466,9 @@ def binary_promotion(a_dtype: DType, b_dtype: DType) raises -> DType:
     """
     if a_dtype == b_dtype:
         return a_dtype
-    if a_dtype == DType.bool and _is_cast_dtype(b_dtype):
+    if a_dtype == DType.bool and is_cast_dtype(b_dtype):
         return b_dtype
-    if b_dtype == DType.bool and _is_cast_dtype(a_dtype):
+    if b_dtype == DType.bool and is_cast_dtype(a_dtype):
         return a_dtype
     if a_dtype == DType.int32 and b_dtype == DType.int64:
         return DType.int64
@@ -505,9 +504,9 @@ def promoted_pair(a: T, b: T) raises -> Tuple[T, T]:
     """
     if a.dtype == b.dtype:
         return (a.copy(), b.copy())
-    if a.dtype == DType.bool and _is_cast_dtype(b.dtype):
+    if a.dtype == DType.bool and is_cast_dtype(b.dtype):
         return (cast_to(a, torch_dtype(b.dtype)), b.copy())
-    if b.dtype == DType.bool and _is_cast_dtype(a.dtype):
+    if b.dtype == DType.bool and is_cast_dtype(a.dtype):
         return (a.copy(), cast_to(b, torch_dtype(a.dtype)))
     if a.dtype == DType.int32 and b.dtype == DType.int64:
         return (cast_to(a, torch_dtype(DType.int64)), b.copy())

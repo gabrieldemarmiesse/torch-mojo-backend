@@ -71,16 +71,25 @@ from abi import (
 )
 from device import (
     copy_d2d,
+    copy_peer,
     copy_from_host,
     copy_to_host,
     ctx_for,
     current_device,
+    current_stream,
+    drain_copy,
     dev,
     read_bytes_sync,
     record_stream,
 )
 from op_utils import MAX_RANK
-from ops_common import cast_to, contiguous, copy_strided_into, fill_value
+from ops_common import (
+    cast_to,
+    contiguous,
+    copy_strided_into,
+    fill_value,
+    is_cast_dtype,
+)
 from registry import Site, impl, op_address_of
 
 
@@ -175,12 +184,57 @@ def _viewed_as(t: T, like: T) raises -> T:
     )
 
 
+def record_tensor_stream(t: T) raises:
+    var handle = t.storage_ctx()
+    if handle != 0:
+        record_stream(handle, t.device, current_stream(t.device))
+
+
+def copy_between_devices(dst: T, src: T) raises:
+    """Requires contiguous buffers of equal dtype and size."""
+    record_tensor_stream(src)
+    record_tensor_stream(dst)
+    var nbytes = src.numel * src.itemsize
+    try:
+        if copy_peer(dst.device, dst.ptr, src.device, src.ptr, nbytes):
+            return
+    except e:
+        _ = drain_copy(dst.device, src.device)
+        raise e
+    var host = own(cpu_empty(src.shape, src.rank, src.stype))
+    try:
+        copy_to_host(ctx_for(src.device), src.ptr, host.t.ptr, nbytes)
+        copy_from_host(
+            dst.device, ctx_for(dst.device), dst.ptr, host.t.ptr, nbytes
+        )
+    except e:
+        if not drain_copy(dst.device, src.device):
+            _ = retain(host.t)
+        _ = host^
+        raise e
+    _ = host^
+
+
 def _device_copy(dst: T, src: T) raises:
-    """mojo -> mojo, same device: any layouts, any dtype pair, and any two
-    logical shapes of the same element count (op_copy_from checked that)."""
+    """Shapes may differ; op_copy_from checks equal element counts."""
+    if src.device != dst.device:
+        record_tensor_stream(src)
+        record_tensor_stream(dst)
+        var dense = own_if_new(contiguous(src), src)
+        if dst.contig and dst.stype == src.stype:
+            copy_between_devices(dst, dense.t)
+        else:
+            var moved = own(
+                new_tensor(src.shape, src.rank, src.stype, dst.device)
+            )
+            copy_between_devices(moved.t, dense.t)
+            _device_copy(dst, moved.t)
+            _ = moved^
+        _ = dense^
+        return
     if src.stype != dst.stype:
         var dense = own_if_new(contiguous(src), src)
-        var tmp = own_if_new(cast_to(dense.t, dst.stype), dense.t)
+        var tmp = own_if_new(cast_for_copy(dense.t, dst.stype), dense.t)
         if dst.contig:
             copy_d2d(
                 ctx_for(dst.device),
@@ -221,6 +275,29 @@ def _host_copy(dst: T, src: T) raises:
     _ = call_op("aten::copy_", "", args^, 1)  # Results releases copy_'s handle
 
 
+def cast_for_copy(src: T, stype: Int32) raises -> T:
+    if is_cast_dtype(src.dtype) and is_cast_dtype(max_dtype(stype)):
+        return cast_to(src, stype)
+    # CPU torch preserves integer precision for pairs outside CastSpec.
+    var host_src = own(cpu_empty(src.shape, src.rank, src.stype))
+    copy_to_host(
+        ctx_for(src.device), src.ptr, host_src.t.ptr, src.numel * src.itemsize
+    )
+    var host_dst = own(cpu_empty(src.shape, src.rank, stype))
+    _host_copy(host_dst.t, host_src.t)
+    _ = host_src^
+    var out = own(new_like_dtype(src, stype))
+    copy_from_host(
+        src.device,
+        ctx_for(src.device),
+        out.t.ptr,
+        host_dst.t.ptr,
+        out.t.numel * out.t.itemsize,
+    )
+    _ = host_dst^
+    return out.take()
+
+
 # aten::_copy_from(Tensor self, Tensor dst, bool non_blocking=False) -> Tensor
 def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var src = v_tensor(args[unsafe_offset=0])
@@ -237,8 +314,6 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         ret_ref(rets, 0, dst)
         return
     if dst.on_mojo() and src.on_mojo():
-        if dst.device != src.device:
-            unsupported("copy between two mojo devices")
         _device_copy(dst, src)
     elif dst.on_mojo():
         if not src.on_cpu():

@@ -97,7 +97,13 @@ Also ruled out: `torch.nn.parallel.DataParallel` (the old single-process
 wrapper) is hard-locked to CUDA in C++ (`torch/csrc/cuda/comm.cpp`) — dead
 end. Standard DDP brought into one process via thread-ranks replaces it.
 
-## Current state of this repo (what exists / what's missing)
+## Original state when this plan was written
+
+This section describes the former Python-wrapper backend. The native
+backend now supports direct peer copies for `.to("mojo:1")` and cross-device
+`copy_`, with host staging when peer access is unavailable. See
+[native backend transfers](native_backend.md#transfers) for the current
+implementation.
 
 Exists and is directly reusable:
 
@@ -113,7 +119,7 @@ Missing (the work):
 
 - No collectives, no `ProcessGroup`, nothing under `torch.distributed` for
   mojo.
-- Cross-device copy bounces through host memory
+- Cross-device copy originally bounced through host memory
   (`mojo_device_aten_ops.py::mojo_device__copy_from` does D2H→H2D for
   `mojo:0`→`mojo:1`), even though cross-context `enqueue_copy` D2D exists in
   MAX.
@@ -127,10 +133,9 @@ Missing (the work):
 
 ### M0 — Multi-device groundwork (small, useful on its own)
 
-- Call `enable_all_peer_access()` at device-module init when >1 GPU (guarded
-  by `Device.can_access`).
-- Replace the host bounce in cross-device `_copy_from` with a direct D2D
-  `enqueue_copy` across contexts. This alone makes naive multi-GPU usable.
+- Peer copies are now implemented in the native backend: enable access
+  lazily per ordered pair and use direct D2D copies for `_to_copy` and
+  `_copy_from`, retaining host staging as the fallback.
 - Make `current_device` thread-local; make the wrapper TensorImpl device index
   match the real device (`privateuseone:i`) so the autograd engine gets one
   worker thread per device.

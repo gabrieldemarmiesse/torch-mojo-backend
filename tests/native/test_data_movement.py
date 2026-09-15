@@ -7,6 +7,12 @@ living on a `mojo` device, and `call_checker` confirms the native op (not
 some other route) actually ran.
 """
 
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -66,6 +72,376 @@ def test_clone_every_rank(mojo_gpu, rank):
     x = _fill(shape, torch.bfloat16)
     dev = x.to(mojo_gpu).permute(*reversed(range(rank)))
     torch.testing.assert_close(dev.clone().cpu(), x.permute(*reversed(range(rank))))
+
+
+@pytest.fixture(params=[(0, 1), (1, 0)], ids=["0-to-1", "1-to-0"])
+def mojo_pair(request: pytest.FixtureRequest) -> tuple[str, str]:
+    if len(get_accelerators()) - 1 < 2:
+        pytest.skip("requires two mojo GPUs")
+    src, dst = request.param
+    return f"mojo:{src}", f"mojo:{dst}"
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.bool]
+)
+@pytest.mark.parametrize("shape", [(357, 789), (), (0, 3)])
+def test_cross_device_to(
+    mojo_pair: tuple[str, str], dtype: torch.dtype, shape: tuple[int, ...]
+):
+    src, dst = mojo_pair
+    expected = _fill(shape, dtype)
+    actual = expected.to(src).to(dst)
+    assert str(actual.device) == dst
+    torch.testing.assert_close(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("layout", ["transpose", "channels_last", "slice", "offset"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize(
+    "memory_format",
+    [torch.preserve_format, torch.contiguous_format, torch.channels_last],
+)
+def test_cross_device_to_layout(
+    mojo_pair: tuple[str, str],
+    layout: str,
+    dtype: torch.dtype,
+    memory_format: torch.memory_format,
+):
+    src, dst = mojo_pair
+    cpu = _fill((3, 5, 7, 11), torch.float32)
+    gpu = cpu.to(src)
+    if layout == "transpose":
+        cpu, gpu = cpu.transpose(1, 3), gpu.transpose(1, 3)
+    elif layout == "channels_last":
+        cpu = cpu.contiguous(memory_format=torch.channels_last)
+        gpu = gpu.contiguous(memory_format=torch.channels_last)
+    elif layout == "slice":
+        cpu, gpu = cpu[:, :, 1::2, 1::2], gpu[:, :, 1::2, 1::2]
+    else:
+        cpu, gpu = cpu[1:], gpu[1:]
+    expected = cpu.to(dtype=dtype, memory_format=memory_format, copy=True)
+    actual = gpu.to(dst, dtype=dtype, memory_format=memory_format)
+    assert actual.stride() == expected.stride()
+    torch.testing.assert_close(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.int64, torch.bool]
+)
+@pytest.mark.parametrize("reshape", [False, True])
+def test_cross_device_copy(
+    mojo_pair: tuple[str, str], strided: bool, dtype: torch.dtype, reshape: bool
+):
+    src, dst = mojo_pair
+    cpu = _fill((19, 37), torch.float32).t()
+    source = _fill((19, 37), torch.float32).to(src).t()
+    host_base = torch.full((37, 38), -1, dtype=dtype)
+    device_base = host_base.to(dst)
+    expected = host_base[:, ::2] if strided else host_base[:, :19].contiguous()
+    actual = device_base[:, ::2] if strided else device_base[:, :19].contiguous()
+    if reshape:
+        expected, actual = expected.unsqueeze(0), actual.unsqueeze(0)
+    expected.copy_(cpu)
+    result = actual.copy_(source)
+    assert result is actual
+    torch.testing.assert_close(actual.cpu(), expected)
+    if strided:
+        torch.testing.assert_close(device_base.cpu(), host_base)
+
+
+@pytest.mark.parametrize(
+    "src_dtype,dst_dtype",
+    [
+        (torch.float64, torch.float32),
+        (torch.float32, torch.float64),
+        (torch.int16, torch.int64),
+        (torch.int64, torch.uint64),
+        (torch.uint64, torch.int64),
+        (torch.int8, torch.float32),
+        (torch.float32, torch.int16),
+        (torch.uint32, torch.int64),
+    ],
+)
+@pytest.mark.parametrize("strided", [False, True])
+def test_cross_device_copy_other_dtypes(
+    mojo_pair: tuple[str, str],
+    src_dtype: torch.dtype,
+    dst_dtype: torch.dtype,
+    strided: bool,
+):
+    src, dst = mojo_pair
+    values = torch.tensor([2**60 + 3, 2**60 + 5, 0, 1, 19, 251]).reshape(2, 3)
+    host = values.to(src_dtype)
+    expected = torch.empty((2, 3), dtype=dst_dtype).copy_(host)
+    actual = torch.empty((2, 6) if strided else (2, 3), dtype=dst_dtype, device=dst)
+    if strided:
+        actual = actual[:, ::2]
+    actual.copy_(host.to(src))
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("copy_into", [False, True])
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_cross_device_stream_lifetime(
+    mojo_pair: tuple[str, str], copy_into: bool, non_blocking: bool
+):
+    src, dst = mojo_pair
+    n = 64 * 1024 * 1024  # 256 MiB; queued producers outlast host dispatch.
+    source_stream = torch.Stream(device=src)
+    destination_stream = torch.Stream(device=dst)
+    with source_stream:
+        source = torch.full((n,), 1.0, device=src)
+        for _ in range(8):
+            source.add_(1.0)
+        with destination_stream:
+            if copy_into:
+                actual = torch.full((n,), -3.0, device=dst)
+                actual.copy_(source, non_blocking=non_blocking)
+            else:
+                actual = source.to(dst, non_blocking=non_blocking)
+            del source
+            # Reuse source-side allocations while the destination consumes.
+            scratch = torch.empty((n,), device=src)
+            scratch.fill_(-11.0)
+            actual.add_(1.0)
+            torch.testing.assert_close(actual.cpu(), torch.full((n,), 10.0))
+    source_stream.synchronize()
+    destination_stream.synchronize()
+
+
+def test_cross_device_autograd(mojo_pair: tuple[str, str]):
+    src, dst = mojo_pair
+    x = _fill((13, 7), torch.float32).requires_grad_()
+    w1 = _fill((7, 11), torch.float32).requires_grad_()
+    w2 = _fill((11, 5), torch.float32).requires_grad_()
+    gx = x.detach().to(src).requires_grad_()
+    gw1 = w1.detach().to(src).requires_grad_()
+    gw2 = w2.detach().to(dst).requires_grad_()
+    expected = ((x @ w1).relu() @ w2).square().mean()
+    actual = ((gx @ gw1).relu().to(dst) @ gw2).square().mean()
+    expected.backward()
+    actual.backward()
+    torch.testing.assert_close(actual.cpu(), expected.detach())
+    for got, ref in [(gx, x), (gw1, w1), (gw2, w2)]:
+        assert got.grad is not None and ref.grad is not None
+        torch.testing.assert_close(got.grad.cpu(), ref.grad, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.parametrize("same_device", [False, True])
+@pytest.mark.parametrize("operation", ["to", "copy"])
+@pytest.mark.parametrize(
+    "source_dtype,target_dtype",
+    [(torch.int64, torch.uint64), (torch.uint64, torch.int64)],
+)
+def test_cross_device_to_exact_integer_cast(
+    mojo_pair: tuple[str, str],
+    same_device: bool,
+    operation: str,
+    source_dtype: torch.dtype,
+    target_dtype: torch.dtype,
+):
+    src, dst = mojo_pair
+    cpu = torch.tensor([2**60 + 3, 2**60 + 5, 2**53 + 1, 0, 19], dtype=source_dtype)
+    source = cpu.to(src)
+    destination = src if same_device else dst
+    if operation == "to":
+        actual = source.to(destination, dtype=target_dtype)
+    else:
+        actual = torch.empty(cpu.shape, device=destination, dtype=target_dtype)
+        actual.copy_(source)
+    torch.testing.assert_close(actual.cpu(), cpu.to(target_dtype), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "transpose", "cast"])
+@pytest.mark.parametrize("copy_into", [False, True])
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_cross_device_allocation_stream(
+    mojo_pair: tuple[str, str], layout: str, copy_into: bool, non_blocking: bool
+):
+    src, dst = mojo_pair
+    owner_src, owner_dst = torch.Stream(device=src), torch.Stream(device=dst)
+    current_src, current_dst = torch.Stream(device=src), torch.Stream(device=dst)
+    cpu = _fill((1021, 4093), torch.float32)
+    with owner_src:
+        source = cpu.to(src)
+    with owner_dst:
+        actual = torch.empty_like(cpu, device=dst)
+    current_src.wait_stream(owner_src)
+    current_dst.wait_stream(owner_dst)
+    with current_src, current_dst:
+        source.add_(1)
+        expected = cpu + 1
+        if layout == "transpose":
+            source, expected, actual = source.t(), expected.t(), actual.t()
+        dtype = torch.float16 if layout == "cast" else torch.float32
+        if copy_into:
+            if dtype != actual.dtype:
+                with owner_dst:
+                    actual = actual.to(dtype=dtype)
+                current_dst.wait_stream(owner_dst)
+            actual.copy_(source, non_blocking=non_blocking)
+        else:
+            actual = source.to(dst, dtype=dtype, non_blocking=non_blocking)
+        del source
+        # Churn on the allocation streams, before either current stream drains.
+        with owner_src:
+            torch.empty_like(cpu, device=src).fill_(-111)
+        if copy_into:
+            # Immediately free destination storage after enqueueing a consumer.
+            consumed = actual + 2
+            del actual
+            with owner_dst:
+                torch.empty_like(cpu, device=dst, dtype=dtype).fill_(-222)
+            actual = consumed
+            expected = expected.to(dtype) + 2
+        else:
+            expected = expected.to(dtype)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        assert (
+            torch.tensor(19, device=src).to(dst, non_blocking=non_blocking).item() == 19
+        )
+    owner_src.synchronize()
+    owner_dst.synchronize()
+
+
+def _peer_autograd_stress(src: str, dst: str, iterations: int):
+    a, b = torch.Stream(device=src), torch.Stream(device=dst)
+    with a, b:
+        for _ in range(iterations):
+            x = torch.full((257, 31), 0.25, device=src, requires_grad=True)
+            y = (x * 2).to(dst)
+            y.square().sum().backward()
+            assert x.grad is not None
+            torch.testing.assert_close(x.grad.cpu(), torch.full((257, 31), 2.0))
+
+
+def test_cross_device_interleaved_stress(mojo_pair: tuple[str, str]):
+    src, dst = mojo_pair
+    owners = [torch.Stream(device=d) for d in (src, dst)]
+    streams = [torch.Stream(device=d) for d in (src, dst)]
+    # 16 MiB per transfer, delayed checks and owner-stream churn force real reuse.
+    shape = (1021, 4093)
+    pending = []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker = pool.submit(_peer_autograd_stress, src, dst, 100)
+        for i in range(300):
+            direction = i % 2
+            source_device, dest_device = (src, dst) if direction == 0 else (dst, src)
+            owner, target_owner = owners[direction], owners[1 - direction]
+            current, target_current = streams[direction], streams[1 - direction]
+            with owner:
+                source = torch.full(shape, float(i % 19), device=source_device)
+            with target_owner:
+                target = torch.empty(shape, device=dest_device)
+            current.wait_stream(owner)
+            target_current.wait_stream(target_owner)
+            with current, target_current:
+                source.add_(1)
+                if i % 3 == 0:
+                    source, target = source.t(), target.t()
+                if i % 4 < 2:
+                    target.copy_(source, non_blocking=True)
+                else:
+                    target = source.to(dest_device, non_blocking=True)
+                del source
+                result = target + 2
+                del target
+                pending.append((result, float(i % 19 + 3), target_current))
+            with owner:
+                torch.empty(shape, device=source_device).fill_(-999)
+            with target_owner:
+                torch.empty(shape, device=dest_device).fill_(-888)
+            if len(pending) == 16:
+                for result, value, stream in pending:
+                    with stream:
+                        torch.testing.assert_close(
+                            result.cpu(), torch.full(result.shape, value)
+                        )
+                pending.clear()
+        for result, value, stream in pending:
+            with stream:
+                torch.testing.assert_close(
+                    result.cpu(), torch.full(result.shape, value)
+                )
+        worker.result()
+    for stream in owners + streams:
+        stream.synchronize()
+
+
+@pytest.mark.parametrize("mode", [None, "trace", "host", "enable_error"])
+def test_cross_device_route(mojo_pair: tuple[str, str], mode: str | None):
+    # The test hook and peer cache are per backend.
+    code = r"""
+import ctypes
+import os
+import sys
+import torch
+from torch_mojo_backend import register_mojo_devices
+register_mojo_devices()
+# Independent capability query: losing the backend's direct route must fail.
+try:
+    driver = ctypes.CDLL("libcuda.so.1")
+    assert driver.cuInit(0) == 0
+    capable = ctypes.c_int()
+    for dst, src in [(1, 0), (0, 1)]:
+        assert driver.cuDeviceCanAccessPeer(ctypes.byref(capable), dst, src) == 0
+        if not capable.value:
+            sys.exit(77)
+except OSError:
+    sys.exit(77)
+if not capable.value:
+    sys.exit(77)
+mode = os.environ.get("TORCH_MOJO_BACKEND_TEST_PEER_COPY", "")
+os.environ["TORCH_MOJO_BACKEND_TEST_PEER_COPY"] = "host" if mode != "host" else "trace"
+for src, dst in [("mojo:0", "mojo:1"), ("mojo:1", "mojo:0")]:
+    cpu = torch.arange(357 * 79, dtype=torch.float32).reshape(357, 79)
+    source = cpu.to(src)
+    for _ in range(3):
+        torch.testing.assert_close(source.to(dst).cpu(), cpu)
+        target = torch.empty((357, 158), device=dst)[:, ::2]
+        target.copy_(source)
+        torch.testing.assert_close(target.cpu(), cpu)
+"""
+    env = dict(os.environ)
+    env.pop("TORCH_MOJO_BACKEND_TEST_PEER_COPY", None)
+    if mode is not None:
+        env["TORCH_MOJO_BACKEND_TEST_PEER_COPY"] = mode
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode == 77:
+        pytest.skip("route assertion requires a CUDA peer-capable pair")
+    assert result.returncode == 0, result.stdout + result.stderr
+    output = result.stdout
+    if mode is None:
+        assert "peer " not in output and "P2P_" not in output, output
+        return
+    assert output.count("peer probe") == 2, output
+    assert output.count("peer enable failed") == (2 if mode == "enable_error" else 0), (
+        output
+    )
+    route = "direct" if mode == "trace" else "host"
+    assert output.count(f"peer copy {route}") == 12, output
+    assert f"peer copy {'host' if route == 'direct' else 'direct'}" not in output
+
+
+def test_cross_device_cpu_fallback(mojo_gpu: str):
+    cpu_device = f"mojo:{len(get_accelerators()) - 1}"
+    expected = _fill((17, 23), torch.float32).t()
+    source = _fill((17, 23), torch.float32).to(mojo_gpu).t()
+    moved = source.to(cpu_device).to(mojo_gpu)
+    torch.testing.assert_close(moved.cpu(), expected)
+    for target, source_device in [(cpu_device, mojo_gpu), (mojo_gpu, cpu_device)]:
+        actual = torch.empty((23, 34), device=target)[:, ::2]
+        actual.copy_(expected.to(source_device))
+        torch.testing.assert_close(actual.cpu(), expected)
 
 
 # ---------------------------------------------------------------------------
