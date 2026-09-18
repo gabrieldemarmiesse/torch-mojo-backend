@@ -61,7 +61,7 @@ from ops_common import (
     philox_reserve,
     resize_out,
 )
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 comptime INT32_MAX = 2147483647
 comptime INT64_MIN = -9223372036854775808
@@ -1208,8 +1208,3 @@ def register_random(site: Site) raises:
     impl[op_random_, "random_"](site)
     impl[op_native_dropout, "native_dropout"](site)
     impl[op_native_dropout_backward, "native_dropout_backward"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    return op_address_of[register_random]()

@@ -91,7 +91,7 @@ from ops_common import (
     fill_value,
     is_cast_dtype,
 )
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 
 def _target_device(v: Value) -> Int:
@@ -613,10 +613,3 @@ def register_core(site: Site) raises:
     impl[op_fill_scalar_, "fill_.Scalar"](site)
     impl[op_zero_, "zero_"](site)
     impl[op_record_stream, "record_stream"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_core]()

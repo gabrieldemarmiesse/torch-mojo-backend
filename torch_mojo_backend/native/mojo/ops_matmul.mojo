@@ -57,7 +57,7 @@ from ops_common import (
     fill_value,
     resize_out,
 )
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 
 # --- small shape helpers ------------------------------------------------------
@@ -1757,10 +1757,3 @@ def register_matmul(site: Site) raises:
     impl[op_linear_backward, "linear_backward"](site)
     impl[op_mm, "mm"](site)
     impl[op_mm_out, "mm.out"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_matmul]()

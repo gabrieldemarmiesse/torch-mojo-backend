@@ -9,17 +9,17 @@ directly. No Python runs on the op path.
 torch.add(a, b)  ->  dispatcher  ->  MojoBoxedKernel (C++, native/csrc)
                                          |  TmbValue records
                                          v
-                                  op_add_tensor (Mojo, native/mojo/ops_*.mojo)
+                                  op_add_tensor (Mojo, libtmb_backend, native/mojo/ops_*.mojo)
                                          |  KernelCall
                                          v
                                   logic_ops.so::tmb_call  (built on first use)
 ```
 
-Nothing above is compiled ahead of time except the runtime: the op body and
-the kernel are each one `mojo build` that happens at the op's first call and
-is then cached on disk (see "Three builds" below).
+The shim, the backend library and every op body are fixed-size and ship
+prebuilt in the wheel; the kernel is one `mojo build` that happens at its
+first call and is then cached on disk (see "Two builds" below).
 
-## Three builds
+## Two builds
 
 Everything is compiled on demand into the user's cache directory —
 `~/.cache/torch-mojo-backend/native/` on Linux (`XDG_CACHE_HOME` honored),
@@ -29,30 +29,22 @@ cache (it is contents-addressed so several checkouts share it, and nothing
 ever reaps it: a torch/mojo/max upgrade orphans every entry, so
 `torch-mojo-backend cache clean` wipes the directory when it grows, and
 `torch-mojo-backend cache dir` prints it). Each build is keyed by the hash of every
-source it compiles in, the toolchain versions and its `-D` defines — so
-touching `abi.mojo` invalidates every op extension, not just the backend.
+source it compiles in, the toolchain versions and its `-D` defines.
 
 | build | when | what it holds |
 |---|---|---|
-| C++ shim, Mojo backend | first `register_mojo_devices()`, unless the wheel ships them (see "Prebuilt libraries and the wheel") | the runtime, both fixed-size |
-| one op extension per aten op | that op's first call | that op's body alone |
+| C++ shim, Mojo backend | first `register_mojo_devices()`, unless the wheel ships them (see "Prebuilt libraries and the wheel") | the runtime and every op body, both fixed-size |
 | one kernel family specialization | that kernel's first call | one (OP, dtypes, flags) kernel |
 
-The backend library therefore does not grow with the number of ops: it holds
-devices, streams, events, memory, the loader, the record ABI and the
-registration list, and nothing else. Measured on one H100 node, 226 ops:
-0.33 MB and 5.5 s of build, against 3.58 MB and 6.2 s when every op body was
-linked into it — the size is the number that was growing, and the rest of the
-build time is the compiler and the runtime modules, which are fixed.
-
-The price is the first call of each op: one `mojo build` of 6–7 s, once per
-op per source revision per machine (0.3–0.5 MB of cache each), and
-milliseconds — a `dlopen` — in every later process. Building all 226 takes
-about 22 minutes, which is why `prebuild_ops` exists.
-
-`native.prebuild_ops()` compiles every op extension up front instead, for a
-test suite or a CI image that would rather not pay a compile inside the first
-call of each op (and, on a shared machine, not inside a GPU lock either).
+The backend library holds devices, streams, events, memory, the loader, the
+record ABI and every op body, registered eagerly at `tmb_native_init`.
+Measured on a 22-core box, 274 registered ops: 4.6 MB, about 50 s to build
+with a cold compiler module cache and about 10 s warm, against 0.4 MB and
+16 s / 9 s for the runtime alone. An earlier revision kept the op bodies out
+and built each one alone at its first call (6–7 s per op, about 22 minutes
+for all of them); one build of 50 s that ships prebuilt replaces that. The
+library still carries no device code (kernels are built per specialization
+below), so it is one file per platform.
 
 Every `mojo build` subprocess runs with `MODULAR_HOME` on node-local disk
 (`native.compiler_env`, `loader.mojo`'s `_compiler_env`; an explicit value
@@ -70,7 +62,7 @@ classes, each forwarding to a Mojo function pointer:
 
 | file | what |
 |---|---|
-| `shim_dispatch.cpp` | `tmb_library_impl` / `tmb_library_impl_lazy`: registers a Mojo function (or a resolver that produces one at the first call) as a boxed kernel. `MojoBoxedKernel` converts the IValue stack to `TmbValue` records (Scalar included, no heap boxing) and back, and caches the resolved kernel pointer. `tmb_call_op` calls any aten op from Mojo. |
+| `shim_dispatch.cpp` | `tmb_library_impl`: registers a Mojo function as a boxed kernel. `MojoBoxedKernel` converts the IValue stack to `TmbValue` records (Scalar included, no heap boxing) and back. `tmb_call_op` calls any aten op from Mojo. |
 | `shim_runtime.cpp` | allocator (`c10::DeviceAllocator` forwarding allocation and memory APIs to Mojo), `PrivateUse1HooksInterface`, the device guard (devices/streams/events), the Philox generator, `ProfilerStubs`, the tensor C API (`tmb_tensor_*`, `tmb_empty_strided`, `tmb_as_strided`). The current device and per-device current stream are C++ thread-locals (`tmb_current_device/stream`). |
 | `shim_autocast.cpp` | `AutocastPrivateUse1` as one boxed fallback with a policy table filled from torch's own CUDA op lists. |
 
@@ -81,11 +73,11 @@ Three translation units compile in parallel: about 7 s wall cold.
 | file | what |
 |---|---|
 | `backend.mojo` | `tmb_native_init`: hooks table + the registration list (one `_group[register_x]` per ops file) |
-| `registry.mojo` | `impl[op, "name"]`: registers the name behind a lazy trampoline in the backend, *or* is the selected op in that op's extension — see below |
+| `registry.mojo` | `impl[op, "name"]`: registers the op's boxed entry with torch's dispatcher — see below |
 | `abi.mojo` | `Value` records, tag constants, `T` (tensor view), result setters, `new_tensor` / `view_strided`, `unsupported()` |
 | `device.mojo` | `Dev` per mojo index (accelerators, then the MAX CPU device), cached MAX properties, stream views, events (MAX events for ordering, vendor driver for query/timing), memory (`Buf` boxes behind DataPtr, per-device accounting, `record_stream` fences), transfers and deferred host staging |
 | `vendor.mojo` | CUDA / HIP driver calls on MAX's raw streams |
-| `loader.mojo` | on-demand builds of op extensions and kernel families: closure hash, cache lookup, `mojo build` in a subprocess under a flock, dlopen |
+| `loader.mojo` | on-demand builds of kernel families: closure hash, cache lookup, `mojo build` in a subprocess under a flock, dlopen |
 | `kernels.mojo` | `KernelCall`: defines + slots + owned specs for one kernel invocation |
 | `ops_*.mojo` | the aten ops, and each file's `register_<group>` list |
 
@@ -146,34 +138,14 @@ candidate table, the reason each one was rejected and the wheel to install;
 machine whose rules we got wrong. A `MODULAR_NVPTX_COMPILER_PATH` the user
 set is never overridden — only explained, if it cannot work here.
 
-## Op extensions: how an op body reaches the dispatcher
+## Registration: how an op body reaches the dispatcher
 
-`backend.mojo` registers names, not implementations: `tmb_library_impl_lazy`
-gives torch one generic trampoline per aten name, carrying the group file the
-op lives in. At the op's first call the trampoline asks the loader for
-
-```
-mojo build native/mojo/ops_<group>.mojo --emit shared-lib -D TMB_OP=<aten name>
-```
-
-dlopens it, calls its `tmb_op_address` for the address of that op's boxed
-entry (`abi.op_entry[op]`, exactly what a non-lazy registration would have
-passed), and the shim stores it in the kernel object — so every later call is
-the same direct call as before, with no added indirection.
-
-One `impl[op, "name"](site)` line does both jobs, and `registry.TARGET_OP`
-(the `TMB_OP` define) picks which:
-
-* **backend library**, no define — register the name; `op` is named only in
-  the branch the compiler drops, so the body is not elaborated;
-* **that op's extension**, `TMB_OP=<name>` — hand back `op_address[op]()`.
-  The other ~40 lines of the group's list compile to nothing, which is what
-  keeps an extension to one op rather than a whole file.
-
-A failed build is reported as a `RuntimeError` and is *not* remembered: the
-next call tries again, so a compiler that died on a full disk is not fatal
-for the process. A kernel that declines its inputs still raises
-`NotImplementedError`, as before.
+Every op body is compiled into the backend library. `tmb_native_init` walks
+the `register_<group>` list of each group file, and each
+`impl[op, "name"](site)` line hands `tmb_library_impl` the address of
+`abi.op_entry[op]`, the boxed entry around that op, so torch calls the Mojo
+function directly from the first call on. A kernel that declines its inputs
+raises `NotImplementedError`.
 
 ## Kernel families: the C entry
 
@@ -196,19 +168,14 @@ its `_spec_dispatcherN[go, "Name"]`; a raised `Error` comes back as
 
 An op is `def op_x(args: Values, n_args: Int, rets: Values, n_rets: Int)
 raises` in one `ops_<group>.mojo`, registered at the bottom of that same file
-in `register_<group>` with `impl[op_x, "x.overload"](site)` (the name is a
-compile-time parameter: that is what lets the op's extension select it).
-A new group file needs three things: the `register_<group>` list, the
-`tmb_op_address` export every group file ends with, and one
-`_group[register_<group>](lib, "ops_<group>", prebuild)` line in
-`backend.mojo`.
+in `register_<group>` with `impl[op_x, "x.overload"](site)`. A new group
+file needs two things: the `register_<group>` list, and one
+`_group[register_<group>](lib)` line in `backend.mojo`.
 
 External operator namespaces use their own `tmb_library_new` handle and
 fully qualified registration names, such as `torchvision::roi_align`.
 The dispatcher accepts these implementations before the extension defining
-their schemas is imported. Qualified names also select `TMB_OP`; the loader
-escapes colons in extension filenames while retaining the full name in cache
-keys. Torchvision remains optional at runtime.
+their schemas is imported. Torchvision remains optional at runtime.
 
 The native detection groups are `ops_roi.mojo` (ROI align/pool, their
 position-sensitive variants, and backwards), `ops_nms.mojo` (non-maximum
@@ -677,11 +644,11 @@ library built on an AVX-512 machine dies with SIGILL on one without (seen on
 GitHub's runner pool). The base library is runtime glue, not a kernel, so
 `build_backend()` always targets the platform baseline
 (`portable_target_cpu()`: `x86-64-v3` on x86, `apple-m1`, `generic` on other
-arm64); op extensions and kernel specializations are built on the machine
-that runs them and keep the host target.
+arm64); kernel specializations are built on the machine that runs them and
+keep the host target.
 
-Everything else still builds on demand: op extensions and kernel
-specializations carry device code, so they cannot ship.
+Everything else still builds on demand: kernel specializations carry device
+code, so they cannot ship.
 
 **glibc.** On Linux the package's floor is glibc 2.34, set by MAX itself:
 `max-core` and `mojo-compiler` publish manylinux_2_34 wheels, so an

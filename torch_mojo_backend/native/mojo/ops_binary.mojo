@@ -65,7 +65,7 @@ from device import copy_d2d, ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import cast_to, contiguous, copy_strided_into, resize_out
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 # ---------------------------------------------------------------------------
 # dtype predicates: the gates of the kernels this file calls
@@ -1694,10 +1694,3 @@ def register_binary(site: Site) raises:
     impl[op_sub_tensor, "sub.Tensor"](site)
     impl[op_sub_, "sub_.Tensor"](site)
     impl[op_sub_out, "sub.out"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_binary]()

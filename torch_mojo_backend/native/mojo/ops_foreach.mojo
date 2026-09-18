@@ -61,7 +61,7 @@ from device import ctx_for, ctx_ptr, dev
 from foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from kernels import KernelCall
 from op_utils import MAX_RANK
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 
 # --- the sequential per-tensor fallback ---------------------------------
@@ -848,10 +848,3 @@ def register_foreach(site: Site) raises:
     # _foreach_div_.ScalarList / _foreach_addcdiv_.ScalarList: intentionally
     # unregistered -- see the module docstring (Scalar[] cannot be marshalled
     # by the current C++ shim).
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_foreach]()

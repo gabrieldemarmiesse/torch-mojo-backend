@@ -1,12 +1,11 @@
 """Entry point of the native backend: `tmb_native_init` registers the device
 hooks with the C++ shim and every aten op name with torch's dispatcher.
 
-This library is the runtime only — devices, streams, events, memory, the
-loader, the record ABI and the registration list below. No op body is
-compiled into it: each is built alone, from its own `ops_<group>.mojo`, at
-its first call (registry.mojo). The group files are still imported here, for
-their `register_<group>` lists; those lists reference the op functions only
-inside the branch the `TMB_OP` define drops, so the bodies stay out.
+This library holds the runtime — devices, streams, events, memory, the
+loader, the record ABI — and every op body, registered eagerly through the
+`register_<group>` list of each group file (registry.mojo). Kernels are not
+in it: each (op, dtype) specialization is built by the loader at first use,
+so the library carries no device code and ships prebuilt.
 
 Build: `mojo build backend.mojo --emit shared-lib -I native/mojo -I eager_kernels`
 (native/__init__.py does it, cached like every other on-demand build).
@@ -32,47 +31,36 @@ from ops_random import register_random
 from ops_reductions import register_reductions
 from ops_roi import register_roi
 from ops_unary import register_unary
-from pg import Locked, pg_vtable
+from pg import pg_vtable
 from registry import Lib, RegisterFn, Site
 
 
-def _group[
-    reg: RegisterFn
-](lib: Int, group: StaticString, prebuild: Bool) raises:
-    """Register one file's ops (or, with `prebuild`, build their extensions
-    right away); `group` names the file the extensions are built from."""
-    var unused = 0
-    reg(
-        Site(
-            lib,
-            group,
-            Pointer(to=unused).unsafe_origin_cast[MutUntrackedOrigin](),
-            prebuild,
-        )
-    )
+def _group[reg: RegisterFn](lib: Int) raises:
+    """Register one file's ops."""
+    reg(Site(lib))
 
 
-def _register_ops(lib: Int, prebuild: Bool = False) raises:
-    _group[register_core](lib, "ops_core", prebuild)
-    _group[register_unary](lib, "ops_unary", prebuild)
+def _register_ops(lib: Int) raises:
+    _group[register_core](lib)
+    _group[register_unary](lib)
     # after every group it composes from
-    _group[register_composed](lib, "ops_composed", prebuild)
-    _group[register_binary](lib, "ops_binary", prebuild)
-    _group[register_compare](lib, "ops_compare", prebuild)
-    _group[register_data_movement](lib, "ops_data_movement", prebuild)
-    _group[register_factories](lib, "ops_factories", prebuild)
-    _group[register_random](lib, "ops_random", prebuild)
-    _group[register_reductions](lib, "ops_reductions", prebuild)
-    _group[register_matmul](lib, "ops_matmul", prebuild)
-    _group[register_nn](lib, "ops_nn", prebuild)
-    _group[register_attention](lib, "ops_attention", prebuild)
-    _group[register_foreach](lib, "ops_foreach", prebuild)
+    _group[register_composed](lib)
+    _group[register_binary](lib)
+    _group[register_compare](lib)
+    _group[register_data_movement](lib)
+    _group[register_factories](lib)
+    _group[register_random](lib)
+    _group[register_reductions](lib)
+    _group[register_matmul](lib)
+    _group[register_nn](lib)
+    _group[register_attention](lib)
+    _group[register_foreach](lib)
 
 
-def _register_detection(lib: Int, prebuild: Bool = False) raises:
-    _group[register_deform_conv](lib, "ops_deform_conv", prebuild)
-    _group[register_nms](lib, "ops_nms", prebuild)
-    _group[register_roi](lib, "ops_roi", prebuild)
+def _register_detection(lib: Int) raises:
+    _group[register_deform_conv](lib)
+    _group[register_nms](lib)
+    _group[register_roi](lib)
 
 
 @export
@@ -119,22 +107,6 @@ def tmb_native_init(
     except e:
         set_shim_error(String(e))
         return -1
-
-
-@export
-def tmb_prebuild_ops() abi("C") -> Int32:
-    """Build every op extension now, instead of one per first call. Nothing
-    needs it at runtime; it exists so a test suite or a CI image pays the
-    compilations up front (and outside any GPU lock) rather than inside the
-    first call of each op."""
-    try:
-        with Locked():  # the loader's tables are shared with the lazy first calls
-            _register_ops(0, prebuild=True)
-            _register_detection(0, prebuild=True)
-        return 0
-    except e:
-        set_shim_error(String(e))
-        return 1
 
 
 @export

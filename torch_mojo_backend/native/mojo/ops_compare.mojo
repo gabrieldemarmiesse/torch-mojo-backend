@@ -51,7 +51,7 @@ from ops_common import (
     resize_out,
     scalar_embed,
 )
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 
 def _release_if_new(t: T, orig: T):
@@ -1318,10 +1318,3 @@ def register_compare(site: Site) raises:
     impl[op_bucketize_tensor_out, "bucketize.Tensor_out"](site)
     impl[op_bucketize_scalar, "bucketize.Scalar"](site)
     impl[op_bucketize_scalar_out, "bucketize.Scalar_out"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_compare]()

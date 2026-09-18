@@ -55,7 +55,7 @@ from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import cast_into, cast_to, copy_strided_into, resize_out
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 # Smallest contiguous inner extent that makes the strided arg-reduction kernel
 # (one thread per output column) worth taking over materializing a transposed
@@ -1279,10 +1279,3 @@ def register_reductions(site: Site) raises:
     impl[op_min_dim_min, "min.dim_min"](site)
     impl[op_sum_dim_intlist, "sum.dim_IntList"](site)
     impl[op_var_correction, "var.correction"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_reductions]()

@@ -47,7 +47,7 @@ from ops_common import (
     fill_value,
     resize_out,
 )
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 
 # ---------------------------------------------------------------------------
@@ -1048,10 +1048,3 @@ def register_unary(site: Site) raises:
     impl[op_bitwise_not, "bitwise_not"](site)
     impl[op_bitwise_not_out, "bitwise_not.out"](site)
     impl[op_fill_scalar, "fill.Scalar"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_unary]()

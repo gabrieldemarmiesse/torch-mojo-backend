@@ -131,13 +131,6 @@ int32_t tmb_backend_register(const TmbBackendHooks* hooks);       // once per pr
 TmbLibrary tmb_library_new(const char* ns, const char* dispatch_key);
 int32_t tmb_library_impl(TmbLibrary lib, const char* name, TmbKernelFn fn, void* ctx);
 int32_t tmb_library_fallback(TmbLibrary lib, TmbKernelFn fn, void* ctx);
-// Fills *out_fn with the kernel of the op `ctx` describes, compiling it on the
-// way if needed. 0 on success, else the message is in tmb_set_error().
-typedef int32_t (*TmbResolveFn)(void* ctx, TmbKernelFn* out_fn);
-// Registers aten::<name> without its implementation: `resolve` produces the
-// kernel at the first call and the result is kept for every later one. A
-// failed resolve is not remembered, so a transient compiler failure retries.
-int32_t tmb_library_impl_lazy(TmbLibrary lib, const char* name, TmbResolveFn resolve, void* ctx);
 // autocast policy for AutocastPrivateUse1: 1 lower_precision_fp, 2 fp32,
 // 3 fp32_set_opt_dtype, 4 promote. Names are "aten::op" or "aten::op.overload".
 int32_t tmb_autocast_policy(const char* qualified_name, int32_t policy);

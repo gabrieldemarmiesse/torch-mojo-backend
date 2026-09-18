@@ -15,7 +15,7 @@ from abi import (
 from device import copy_from_host, copy_to_host, ctx_for, ctx_ptr
 from kernels import KernelCall
 from op_utils import MAX_RANK
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 
 def _shape(n: Int) -> IndexList[MAX_RANK]:
@@ -126,8 +126,3 @@ def op_nms(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def register_nms(site: Site) raises:
     impl[op_nms, "torchvision::nms"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    return op_address_of[register_nms]()

@@ -12,9 +12,8 @@ unit cache object to import and poke at. What is left to test is the cache's
 `.so` files, whatever process asks -- so every test here runs the real
 backend in a subprocess against a throwaway cache directory.
 
-These tests build real Mojo extensions (a cold run compiles the C++ shim,
-the Mojo backend, one extension per aten op the script touches, and one
-kernel-family variant), so they are slow and need the GPU allocation like
+These tests build real Mojo libraries (a cold run compiles the C++ shim,
+the Mojo backend, and one kernel-family variant), so they are slow and need the GPU allocation like
 every other native test.
 """
 
@@ -74,12 +73,6 @@ def _family_sos(cache_dir: Path) -> list[Path]:
     return sorted(cache_dir.glob("logic_ops.*.so"))
 
 
-def _op_sos(cache_dir: Path) -> list[Path]:
-    """The per-op extensions: one `mojo build` of an ops_*.mojo per aten op
-    (native/mojo/registry.mojo), built at that op's first call."""
-    return sorted(cache_dir.glob("tmbop.*.so"))
-
-
 def _assert_ok(proc: subprocess.CompletedProcess[str]):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "OK" in proc.stdout, proc.stdout + proc.stderr
@@ -100,18 +93,13 @@ def test_cache_dir_env_var_relocates_every_build(tmp_path: Path):
     )
     family_sos = _family_sos(cache_dir)
     assert family_sos, "logic_ops (AddSpec) kernel variant not cached here"
-    op_sos = _op_sos(cache_dir)
-    assert op_sos, "no op extension cached here"
-    # add is one of the ops the script runs, and its body lives in its own
-    # extension rather than in the backend library.
-    assert any(p.name.startswith("tmbop.ops_binary.add.Tensor.") for p in op_sos), [
-        p.name for p in op_sos
-    ]
+    assert not list(cache_dir.glob("tmbop.*")), (
+        "op bodies live in the backend library, nothing is built per op"
+    )
     # A cold run must have actually built all of them, not found them by luck.
     assert "built C++ shim" in proc.stdout + proc.stderr
     assert "built Mojo backend" in proc.stdout + proc.stderr
     assert "built  logic_ops" in proc.stdout + proc.stderr
-    assert "built  ops_binary add.Tensor" in proc.stdout + proc.stderr
 
 
 def test_second_process_reuses_every_build(tmp_path: Path):
@@ -133,7 +121,6 @@ def test_second_process_reuses_every_build(tmp_path: Path):
     assert "built C++ shim" not in combined
     assert "built Mojo backend" not in combined
     assert "built  logic_ops" not in combined
-    assert "built  ops_" not in combined, "an op extension was rebuilt warm"
     mtimes_after = {
         p: p.stat().st_mtime_ns
         for p in cache_dir.iterdir()
@@ -210,40 +197,6 @@ def test_corrupt_family_so_fails_clearly_and_recovers_once_removed(tmp_path: Pat
     assert "built  logic_ops" in recovered.stdout + recovered.stderr
 
 
-def test_missing_op_extension_is_rebuilt_alone(tmp_path: Path):
-    """Deleting one op's extension makes the next process rebuild that op and
-    nothing else: op bodies are cached per op, independently of the backend
-    library and of the kernel families."""
-    cache_dir = tmp_path / "cache"
-    _assert_ok(_run(cache_dir))
-    add_sos = sorted(cache_dir.glob("tmbop.ops_binary.add.Tensor.*.so"))
-    assert add_sos
-    for so in add_sos:
-        so.unlink()
-    others_before = {
-        p: p.stat().st_mtime_ns
-        for p in cache_dir.iterdir()
-        if p.suffix in (".so", ".dylib")
-        if not p.name.startswith("tmbop.ops_binary.add.Tensor.")
-    }
-
-    proc = _run(cache_dir)
-    _assert_ok(proc)
-
-    combined = proc.stdout + proc.stderr
-    assert "built  ops_binary add.Tensor" in combined
-    assert "built Mojo backend" not in combined
-    assert "built  logic_ops" not in combined
-    assert sorted(cache_dir.glob("tmbop.ops_binary.add.Tensor.*.so"))
-    others_after = {
-        p: p.stat().st_mtime_ns
-        for p in cache_dir.iterdir()
-        if p.suffix in (".so", ".dylib")
-        if not p.name.startswith("tmbop.ops_binary.add.Tensor.")
-    }
-    assert others_after == others_before
-
-
 def test_compiler_env_drops_the_runtime_interpreter_variables(monkeypatch):
     """The MAX runtime exports PYTHONEXECUTABLE for the interpreter it found on
     PATH; a `mojo` launcher started with it against another venv's prefix dies
@@ -258,7 +211,7 @@ def test_compiler_env_drops_the_runtime_interpreter_variables(monkeypatch):
 def test_werror_flag_reaches_every_python_driven_mojo_build(monkeypatch, tmp_path):
     """TORCH_MOJO_BACKEND_WERROR=1 (what conftest sets) turns compiler warnings
     into build failures; unset, a user's build must not carry --Werror. The
-    Mojo-side builds (loader.mojo, kernel families and op extensions) read
+    Mojo-side builds (loader.mojo, kernel families) read
     the same variable."""
     monkeypatch.delenv("TORCH_MOJO_BACKEND_WERROR", raising=False)
     assert "--Werror" not in native.backend_build_command(tmp_path / "a.so")

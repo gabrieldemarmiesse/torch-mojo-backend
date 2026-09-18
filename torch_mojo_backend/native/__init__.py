@@ -81,7 +81,7 @@ def _trace(msg: str):
 
 def mojo_diagnostic_flags() -> list[str]:
     """Extra `mojo build` flags every Mojo build gets (loader.mojo's `_build`
-    appends the same for the kernel families and op extensions).
+    appends the same for the kernel families).
 
     TORCH_MOJO_BACKEND_WERROR=1 turns compiler warnings into build failures.
     Off by default -- a user on a newer toolchain that warns about something
@@ -798,18 +798,6 @@ def op_counts() -> dict[str, int]:
         if name:
             out[name] = int(count)
     return out
-
-
-def prebuild_ops():
-    """Compile every op's extension now rather than one per first call.
-
-    Only useful up front: a test suite or a CI image pays the compilations
-    here, outside any GPU lock, instead of inside the first call of each op.
-    """
-    fn = backend_lib().tmb_prebuild_ops
-    fn.restype = ctypes.c_int32
-    if fn() != 0:
-        raise RuntimeError("prebuilding the mojo ops failed: " + last_error())
 
 
 def device_count() -> int:

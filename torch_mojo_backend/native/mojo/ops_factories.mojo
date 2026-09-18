@@ -36,7 +36,7 @@ from device import copy_from_host, ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import call_op, copy_strided_into, resize_out
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 
 # ---------------------------------------------------------------------------
@@ -225,10 +225,3 @@ def op_arange_start_out(
 
 def register_factories(site: Site) raises:
     impl[op_arange_start_out, "arange.start_out"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_factories]()

@@ -21,7 +21,7 @@ from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import contiguous
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 
 def _check_pair(input: T, rois: T) raises:
@@ -415,8 +415,3 @@ def register_roi(site: Site) raises:
     impl[op_roi_align_backward, "torchvision::_roi_align_backward"](site)
     impl[op_roi_pool, "torchvision::roi_pool"](site)
     impl[op_roi_pool_backward, "torchvision::_roi_pool_backward"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    return op_address_of[register_roi]()

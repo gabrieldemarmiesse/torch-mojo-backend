@@ -347,9 +347,6 @@ void raise_from_kernel(int32_t rc, const char* op, const char* overload) {
 class MojoBoxedKernel final : public c10::OperatorKernel {
  public:
   MojoBoxedKernel(TmbKernelFn fn, void* ctx) : fn_(fn), ctx_(ctx) {}
-  // Lazy form: `resolve` compiles and returns the kernel at the first call.
-  MojoBoxedKernel(TmbResolveFn resolve, void* resolve_ctx)
-      : resolve_(resolve), resolve_ctx_(resolve_ctx) {}
 
   void operator()(const c10::OperatorHandle& op, c10::DispatchKeySet /*ks*/, torch::jit::Stack* stack) {
     tmb_check_not_forked();
@@ -377,17 +374,7 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
     int32_t rc;
     {
       std::lock_guard<std::recursive_mutex> g(tmb_mutex);
-      TmbKernelFn fn = fn_.load(std::memory_order_relaxed);
-      if (!fn) {
-        TmbKernelFn resolved = nullptr;
-        if (resolve_(resolve_ctx_, &resolved) != 0 || !resolved) {
-          release_records(rets, n_rets);
-          raise_from_kernel(1, name, overload);
-        }
-        fn_.store(resolved, std::memory_order_release);
-        fn = resolved;
-      }
-      rc = fn(ctx_, name, overload, args, static_cast<int32_t>(n_args), rets, static_cast<int32_t>(n_rets));
+      rc = fn_(ctx_, name, overload, args, static_cast<int32_t>(n_args), rets, static_cast<int32_t>(n_rets));
     }
     if (rc != 0) {
       release_records(rets, n_rets);
@@ -412,11 +399,8 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
   }
 
  private:
-  // Written once, under tmb_mutex, by the first call of a lazily registered op.
-  std::atomic<TmbKernelFn> fn_{nullptr};
-  void* ctx_{nullptr};
-  TmbResolveFn resolve_{nullptr};
-  void* resolve_ctx_{nullptr};
+  TmbKernelFn fn_;
+  void* ctx_;
 };
 
 }  // namespace
@@ -457,17 +441,6 @@ int32_t tmb_library_impl(TmbLibrary lib, const char* name, TmbKernelFn fn, void*
   try {
     reinterpret_cast<torch::Library*>(lib)->impl(
         name, torch::CppFunction::makeFromBoxedFunctor(std::make_unique<MojoBoxedKernel>(fn, ctx)));
-    return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
-}
-
-int32_t tmb_library_impl_lazy(TmbLibrary lib, const char* name, TmbResolveFn resolve, void* ctx) {
-  try {
-    reinterpret_cast<torch::Library*>(lib)->impl(
-        name, torch::CppFunction::makeFromBoxedFunctor(std::make_unique<MojoBoxedKernel>(resolve, ctx)));
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());

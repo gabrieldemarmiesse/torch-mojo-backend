@@ -64,7 +64,7 @@ import time, torch
 from torch_mojo_backend import register_mojo_devices, get_accelerators
 t = time.time(); register_mojo_devices(); print('registered in %.1fs' % (time.time() - t))
 print(get_accelerators(), torch.mojo.device_count())            # api must be hip
-x = torch.ones(3, device='mojo:0') * 2; print(x.cpu().tolist())  # first op: builds an extension + a kernel
+x = torch.ones(3, device='mojo:0') * 2; print(x.cpu().tolist())  # first op: builds a kernel
 a = torch.randn(256, 256); b = torch.randn(256, 256)
 print((torch.mm(a.to('mojo:0'), b.to('mojo:0')).cpu() - a @ b).abs().max().item())
 s = torch.mojo.Stream(); e = torch.mojo.Event(enable_timing=True)
@@ -84,7 +84,7 @@ Then warm the cache once, outside the lock (~15 to 25 min on H100, report the
 AMD time):
 
 ```bash
-uv run --no-sync python -c "from torch_mojo_backend import register_mojo_devices, native; register_mojo_devices(); native.prebuild_ops()"
+uv run --no-sync python -c "from torch_mojo_backend import register_mojo_devices; register_mojo_devices()"
 ```
 
 ## 2. Runtime and op groups (`tests/native/`)
@@ -279,7 +279,7 @@ fork, plus a comment on PR #458 pointing at it. Sections in this order:
 6. What you did not run and why.
 
 Time budget: setup and first contact 1 h, sections 2 and 3 half a day
-(compiles dominate: the first call of every op builds an extension, ~6 s
-each on H100), section 4 two hours, 5 and 6 two hours, 7 and 8 optional,
+(compiles dominate: the first call of every kernel specialization builds
+it, ~5 s each on H100), section 4 two hours, 5 and 6 two hours, 7 and 8 optional,
 9 two hours. Do not stop on a failure you cannot fix in an hour: record it,
 skip that section's dependents, continue.

@@ -1,16 +1,11 @@
 """On-demand builds, from Mojo, of everything that is not the runtime.
 
-Two kinds of library, built the same way: hash the entry file's import
-closure, look the .so up in the cache, otherwise run `mojo build` in a
-subprocess (under a cross-process flock, atomic rename), dlopen it and keep
-the entry pointer.
-
-* **kernel families** (torch_mojo_backend/eager_kernels/<family>/<family>.mojo)
-  export `tmb_call` and compile one (OP, dtypes, flags) specialization per
-  build, selected with -D defines.
-* **op extensions** (native/mojo/ops_<group>.mojo, `-D TMB_OP=<aten name>`)
-  export `tmb_op_address` and hold the body of exactly one aten op, so the
-  backend library itself carries no op code — see registry.mojo.
+Kernel families (torch_mojo_backend/eager_kernels/<family>/<family>.mojo)
+export `tmb_call` and compile one (OP, dtypes, flags) specialization per
+build, selected with -D defines. A build hashes the entry file's import
+closure, looks the .so up in the cache, otherwise runs `mojo build` in a
+subprocess (under a cross-process flock, atomic rename), dlopens it and
+keeps the entry pointer.
 """
 from std.builtin.sort import sort
 from std.collections import Dict
@@ -95,28 +90,6 @@ struct Family(Movable):
         self.entry = Int(sym.value())
 
 
-comptime AddressFn = def() thin abi("C") -> Int
-
-
-struct OpExt(Movable):
-    """One aten op's extension: `tmb_op_address` reports the address of the
-    boxed entry of the op the build selected."""
-
-    var lib: OwnedDLHandle
-    var entry: Int
-
-    def __init__(out self, path: String) raises:
-        self.lib = OwnedDLHandle(path)
-        var sym = self.lib.get_symbol[NoneType]("tmb_op_address")
-        if not sym:
-            raise Error("tmb_op_address not exported by ", path)
-        var addr = Int(sym.value())
-        var f = Pointer(to=addr).unsafe_bitcast[AddressFn]()[]
-        self.entry = f()
-        if self.entry == 0:
-            raise Error("no op compiled into ", path)
-
-
 struct Loader(Movable):
     var kernels_dir: String  # torch_mojo_backend/eager_kernels
     var mojo_dir: String  # torch_mojo_backend/native/mojo
@@ -125,7 +98,6 @@ struct Loader(Movable):
     var toolchain: String  # versions of mojo/max/python, from the Python side
     var trace: Bool
     var families: Dict[String, Family]  # "<family>.<slug>" -> loaded build
-    var ops: Dict[String, OpExt]  # "<group>/<aten name>" -> loaded build
     var source_hashes: Dict[String, String]  # family -> closure hash
     var fast: Dict[
         UInt64, Int
@@ -147,7 +119,6 @@ struct Loader(Movable):
         self.toolchain = toolchain
         self.trace = trace
         self.families = Dict[String, Family]()
-        self.ops = Dict[String, OpExt]()
         self.source_hashes = Dict[String, String]()
         self.fast = Dict[UInt64, Int]()
 
@@ -256,16 +227,6 @@ struct Loader(Movable):
             String(self.kernels_dir),
         )
 
-    def op_source_hash(mut self, group: String) raises -> String:
-        """Hashes abi/device/kernels/ops_common too (the group file imports
-        them), so a runtime change invalidates every op extension."""
-        return self._hash_closure(
-            "op:" + group,
-            self.mojo_dir + "/" + group + ".mojo",
-            String(self.mojo_dir),
-            String(self.mojo_dir),
-        )
-
     def _build(
         mut self,
         label: String,
@@ -304,8 +265,8 @@ struct Loader(Movable):
             + "'"
         )
         comptime if CompilationTarget.is_macos():
-            # Op extensions call the shim and the base library, resolved at
-            # dlopen; ld64 wants to be told so.
+            # Kernel families call the shim and the base library, resolved
+            # at dlopen; ld64 wants to be told so.
             cmd += " -Xlinker -undefined -Xlinker dynamic_lookup"
         for d in defines:
             cmd += " -D '" + d + "'"
@@ -419,42 +380,6 @@ struct Loader(Movable):
             if fd >= 0:
                 _ = external_call["flock", Int32](fd, Int32(8))  # LOCK_UN
                 _ = external_call["close", Int32](fd)
-
-    def op_entry(mut self, group: String, name: String) raises -> Int:
-        """Address of the boxed entry of aten::<name>, compiling its
-        extension from native/mojo/<group>.mojo on the first call.
-
-        A failure is not remembered: the next call retries, so a compiler
-        that failed on a full disk or a killed subprocess is not fatal for
-        the rest of the process."""
-        var key = group + "/" + name
-        if key in self.ops:
-            return self.ops[key].entry
-        var filename_name = name.replace(":", "%3A")
-        var so = (
-            self.cache_dir
-            + "/tmbop."
-            + group
-            + "."
-            + filename_name
-            + ".hash-"
-            + self.op_source_hash(group)
-            + ".so"
-        )
-        var defines = List[String]()
-        defines.append("TMB_OP=" + name)
-        self._ensure_built(
-            "tmbop." + group + "." + filename_name,
-            so,
-            group + " " + name,
-            self.mojo_dir + "/" + group + ".mojo",
-            String(self.mojo_dir),
-            defines,
-        )
-        var ext = OpExt(so)
-        var addr = ext.entry
-        self.ops[key] = ext^
-        return addr
 
     def entry(mut self, family: String, defines: List[String]) raises -> Int:
         """Address of the family's `tmb_call` for this specialization."""

@@ -25,7 +25,7 @@ from ops_matmul import (
     _sm90_cuda,
     _tf32_enabled,
 )
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 
 def _matrix(base: T, rows: Int, cols: Int, offset: Int = 0) raises -> T:
@@ -444,8 +444,3 @@ def register_deform_conv(site: Site) raises:
     impl[op_deform_conv2d_backward, "torchvision::_deform_conv2d_backward"](
         site
     )
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    return op_address_of[register_deform_conv]()

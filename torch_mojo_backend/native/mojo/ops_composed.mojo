@@ -46,7 +46,7 @@ from ops_common import (
     fill_value,
     resize_out,
 )
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 
 comptime NEG_INF_BITS: Int64 = -4503599627370496  # 0xFFF0000000000000
@@ -812,10 +812,3 @@ def register_composed(site: Site) raises:
     impl[op_where_self_out, "where.self_out"](site)
     impl[op_native_batch_norm_backward, "native_batch_norm_backward"](site)
     impl[op_softmax_backward_data, "_softmax_backward_data"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_composed]()

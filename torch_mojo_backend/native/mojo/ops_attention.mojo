@@ -52,7 +52,7 @@ from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import cast_to, copy_strided_into, fill_value, release_if_new
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 # at::SDPBackend (ATen/SDPBackend.h): what `_fused_sdp_choice` returns.
 comptime SDP_MATH = 0
@@ -1191,10 +1191,3 @@ def register_attention(site: Site) raises:
         "_scaled_dot_product_flash_attention_backward",
     ](site)
     impl[op_fused_sdp_choice, "_fused_sdp_choice"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_attention]()

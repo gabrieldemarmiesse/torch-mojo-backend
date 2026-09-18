@@ -60,7 +60,7 @@ from ops_common import (
     fill_value,
     resize_out,
 )
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 # The three dtypes every nn kernel family is instantiated for
 # (`op_utils.FLOAT_DTYPES` / `aten_fast._FLOAT_DTYPES`).
@@ -2013,10 +2013,3 @@ def register_nn(site: Site) raises:
     impl[op_nll_loss_backward_grad_input, "nll_loss_backward.grad_input"](site)
     impl[op_nll_loss_forward_output, "nll_loss_forward.output"](site)
     impl[op_upsample_bilinear2d, "upsample_bilinear2d"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_nn]()
