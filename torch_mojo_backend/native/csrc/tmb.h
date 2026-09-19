@@ -131,6 +131,9 @@ int32_t tmb_backend_register(const TmbBackendHooks* hooks);       // once per pr
 TmbLibrary tmb_library_new(const char* ns, const char* dispatch_key);
 int32_t tmb_library_impl(TmbLibrary lib, const char* name, TmbKernelFn fn, void* ctx);
 int32_t tmb_library_fallback(TmbLibrary lib, TmbKernelFn fn, void* ctx);
+// Registers ATen's own kernel for one of the metadata-only view ops
+// ("view", "_reshape_alias", "as_strided"), unboxed: shim_views.cpp.
+int32_t tmb_library_impl_aten_view(TmbLibrary lib, const char* name);
 // autocast policy for AutocastPrivateUse1: 1 lower_precision_fp, 2 fp32,
 // 3 fp32_set_opt_dtype, 4 promote. Names are "aten::op" or "aten::op.overload".
 int32_t tmb_autocast_policy(const char* qualified_name, int32_t policy);

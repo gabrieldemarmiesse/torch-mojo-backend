@@ -103,11 +103,9 @@ _RNG_TRANSFORM = (
 # Registered ops that are deliberately NOT benchmarked, with the defense.
 SKIPPED_OPS: dict[str, str] = {
     "aten::log2.out": _OUT,
-    # -- views ------------------------------------------------------------
-    "aten::as_strided": _VIEW,
-    "aten::view": _VIEW,
-    "aten::_unsafe_view": _VIEW,
-    "aten::_reshape_alias": _VIEW,
+    # `view`, `_unsafe_view`, `_reshape_alias` and `as_strided` are ATen's own
+    # kernels on this device (native/csrc/shim_views.cpp), so they are not in
+    # the Mojo registration list this reconciles against.
     # -- allocation -------------------------------------------------------
     "aten::empty.memory_format": _ALLOC,
     "aten::empty_strided": _ALLOC,

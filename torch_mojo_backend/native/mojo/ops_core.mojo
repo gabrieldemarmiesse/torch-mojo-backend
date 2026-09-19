@@ -6,6 +6,7 @@ result records. Views and the two empty factories never launch a kernel;
 transfers are MAX copies; fills are memsets on contiguous memory. The
 value-producing factories (arange, normal_, rand...) are ops_factories.mojo.
 """
+from std.ffi import external_call
 from std.utils import IndexList
 
 from abi import (
@@ -478,6 +479,9 @@ def _view_strides(
 
 
 # aten::view(Tensor(a) self, SymInt[] size) -> Tensor(a)
+# Unregistered: ATen's own kernel serves `view` / `_unsafe_view` /
+# `_reshape_alias` / `as_strided` here (see register_core). Kept as the Mojo
+# route for a device or a torch version that needs one.
 def op_view(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var sizes = IntList(args[unsafe_offset=1])
@@ -601,14 +605,30 @@ def op_record_stream(
         record_stream(handle, st[0], st[1])
 
 
+def _aten_view(site: Site, name: StaticString) raises:
+    """Register ATen's own kernel for one metadata-only view op
+    (shim_views.cpp): storage sharing plus new sizes/strides, no device code,
+    and unboxed -- which skips boxing a `SymInt[]` into a heap c10::List per
+    call and the round trip into Mojo."""
+    var s = String(name)
+    check(
+        external_call["tmb_library_impl_aten_view", Int32](
+            site.lib, s.as_c_string_slice().unsafe_ptr()
+        ),
+        "registering ATen's view kernel",
+    )
+
+
 def register_core(site: Site) raises:
     impl[op_empty_memory_format, "empty.memory_format"](site)
     impl[op_empty_strided, "empty_strided"](site)
     impl[op_copy_from, "_copy_from"](site)
-    impl[op_view, "view"](site)
-    impl[op_view, "_unsafe_view"](site)
-    impl[op_reshape_alias, "_reshape_alias"](site)
-    impl[op_as_strided, "as_strided"](site)
+    # The four metadata-only views are ATen's own kernels: `_unsafe_view` is
+    # CompositeExplicitAutograd there, so leaving it unregistered is enough,
+    # and the other three are registered through the shim.
+    _aten_view(site, "view")
+    _aten_view(site, "_reshape_alias")
+    _aten_view(site, "as_strided")
     impl[op_local_scalar_dense, "_local_scalar_dense"](site)
     impl[op_fill_scalar_, "fill_.Scalar"](site)
     impl[op_zero_, "zero_"](site)
