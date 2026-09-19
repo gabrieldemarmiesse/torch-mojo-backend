@@ -229,7 +229,6 @@ def enqueue_layer_norm_backward_params_f32(
         if rows <= _DIRECT_MAX_ROWS:
             _enqueue_cached[_direct_kernel](
                 ctx,
-                "layer_norm_backward_params_direct",
                 col_blocks,
                 1,
                 1,
@@ -261,7 +260,6 @@ def enqueue_layer_norm_backward_params_f32(
             # A single chunk degenerates to the direct regime: no scratch needed.
             _enqueue_cached[_direct_kernel](
                 ctx,
-                "layer_norm_backward_params_direct",
                 col_blocks,
                 1,
                 1,
@@ -289,7 +287,6 @@ def enqueue_layer_norm_backward_params_f32(
 
         _enqueue_cached[_partial_kernel](
             ctx,
-            "layer_norm_backward_params_partial",
             col_blocks,
             num_chunks,
             1,
@@ -308,7 +305,6 @@ def enqueue_layer_norm_backward_params_f32(
         )
         _enqueue_cached_2d[_final_kernel](
             ctx,
-            "layer_norm_backward_params_final",
             ceildiv(cols, _FINAL_TX),
             1,
             1,

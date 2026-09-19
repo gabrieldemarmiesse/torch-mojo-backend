@@ -220,7 +220,6 @@ def enqueue_native_dropout[
             if vec == 8:
                 _enqueue_cached[_dropout_vec_kernel[dtype, 8]](
                     ctx,
-                    String(t"dropout_v8_{dtype}"),
                     grid,
                     1,
                     1,
@@ -236,7 +235,6 @@ def enqueue_native_dropout[
             elif vec == 4:
                 _enqueue_cached[_dropout_vec_kernel[dtype, 4]](
                     ctx,
-                    String(t"dropout_v4_{dtype}"),
                     grid,
                     1,
                     1,
@@ -252,7 +250,6 @@ def enqueue_native_dropout[
             elif vec == 2:
                 _enqueue_cached[_dropout_vec_kernel[dtype, 2]](
                     ctx,
-                    String(t"dropout_v2_{dtype}"),
                     grid,
                     1,
                     1,
@@ -268,7 +265,6 @@ def enqueue_native_dropout[
             else:
                 _enqueue_cached[_dropout_strided_kernel[dtype]](
                     ctx,
-                    String(t"dropout_s_{dtype}"),
                     grid,
                     1,
                     1,
@@ -310,7 +306,6 @@ def enqueue_native_dropout_backward[
         else:
             _enqueue_cached[_dropout_backward_kernel[dtype]](
                 ctx,
-                String(t"dropout_bwd_{dtype}"),
                 _fill_blocks(numel),
                 1,
                 1,

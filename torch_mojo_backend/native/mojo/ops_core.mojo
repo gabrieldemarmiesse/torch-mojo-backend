@@ -85,6 +85,7 @@ from device import (
 )
 from op_utils import MAX_RANK
 from ops_common import (
+    cast_into,
     cast_to,
     contiguous,
     copy_strided_into,
@@ -238,6 +239,20 @@ def _device_copy(dst: T, src: T) raises:
         _ = dense^
         return
     if src.stype != dst.stype:
+        if (
+            src.contig
+            and dst.contig
+            and is_cast_dtype(src.dtype)
+            and is_cast_dtype(dst.dtype)
+            and (
+                src.ptr + src.numel * src.itemsize <= dst.ptr
+                or dst.ptr + dst.numel * dst.itemsize <= src.ptr
+            )
+        ):
+            # The caller already owns the destination. Convert into it
+            # directly when no source bytes can be overwritten before read.
+            cast_into(dst, src)
+            return
         var dense = own_if_new(contiguous(src), src)
         var tmp = own_if_new(cast_for_copy(dense.t, dst.stype), dense.t)
         if dst.contig:

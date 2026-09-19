@@ -21,6 +21,7 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
 from std.sys.info import (
+    _has_sm_9x,
     has_accelerator,
     has_apple_gpu_accelerator,
     has_nvidia_gpu_accelerator,
@@ -64,6 +65,9 @@ from op_utils import (
     _t2d_tile,
     _transpose2d_kernel,
 )
+
+from batched_copy_cast import copy_batched_cast
+from batched_copy_rows import copy_batched_rows
 
 from variant_gates import (
     ErrBuf,
@@ -354,7 +358,6 @@ def _permute_copy[
                 var slots = total // VEC
                 _enqueue_cached[_run_gather_kernel[dtype, VEC]](
                     ctx,
-                    String(t"dm_rungather_{dtype}_v{VEC}"),
                     _gs_blocks(slots),
                     1,
                     1,
@@ -387,7 +390,6 @@ def _permute_copy[
                     if nrows >= 4096:
                         _enqueue_cached[_permute_copy_rowloop_kernel[dtype]](
                             ctx,
-                            String(t"dm_permute_rowloop_{dtype}"),
                             _gs_blocks(nrows),
                             1,
                             1,
@@ -406,7 +408,6 @@ def _permute_copy[
                     var nchunks = total // 4
                     _enqueue_cached[_permute_copy_rows4_kernel[dtype]](
                         ctx,
-                        String(t"dm_permute_rows4_{dtype}"),
                         _gs_blocks(nchunks),
                         1,
                         1,
@@ -466,7 +467,6 @@ def _permute_copy[
             ):
                 _enqueue_cached[_transpose2d_kernel[dtype]](
                     ctx,
-                    String(t"transpose2d_{dtype}"),
                     (d3 + TILE - 1) // TILE,
                     min((d2 + TILE - 1) // TILE, _MAX_GRID_Y),
                     min(batch, _MAX_GRID_Y),
@@ -483,7 +483,6 @@ def _permute_copy[
                 return
             _enqueue_cached[_permute_copy_kernel[dtype]](
                 ctx,
-                String(t"dm_permute_{dtype}"),
                 _gs_blocks(total),
                 1,
                 1,
@@ -699,10 +698,15 @@ def _cat_owner(
 
 @always_inline
 def _cat_copy_rows[
-    dtype: DType, width: Int
+    mut: Bool,
+    src_origin: Origin[mut=mut],
+    //,
+    dtype: DType,
+    width: Int,
+    out_dtype: DType = dtype,
 ](
-    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    src_ptr: Pointer[Scalar[dtype], src_origin],
     seg: CatSeg,
     slot: Int,
     outer: Int,
@@ -720,26 +724,36 @@ def _cat_copy_rows[
     var src_index = slot * width
     var dst_index = seg.dst_off + slot * width
     var row = Int(block_idx.y)
-    src_index += row * row_len
-    dst_index += row * dst_stride
+    comptime if dtype == out_dtype:
+        src_index += row * row_len
+        dst_index += row * dst_stride
+    else:
+        src_index = row * seg.nvec * width + slot * width
+        dst_index = row * dst_stride + seg.dst_off + slot * width
     while row < outer:
         comptime for step in range(ilp):
             if slot + step * GS_THREADS < seg.nvec:
-                out_ptr.unsafe_store[width=width, alignment=align](
+                out_ptr.unsafe_store[
+                    width=width, alignment=min(16, width * size_of[out_dtype]())
+                ](
                     dst_index + step * GS_THREADS * width,
                     src_ptr.unsafe_load[width=width, alignment=align](
                         src_index + step * GS_THREADS * width
-                    ),
+                    ).cast[out_dtype](),
                 )
         row += Int(grid_dim.y)
-        src_index += Int(grid_dim.y) * row_len
+        comptime if dtype == out_dtype:
+            src_index += Int(grid_dim.y) * row_len
+        else:
+            src_index += Int(grid_dim.y) * seg.nvec * width
         dst_index += Int(grid_dim.y) * dst_stride
 
 
-def _cat_batched_kernel[
-    dtype: DType, width: Int
+@always_inline
+def _cat_batched_body[
+    dtype: DType, width: Int, out_dtype: DType = dtype
 ](
-    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
     segs: InlineArray[CatSeg, CAT_CAP],
     nseg_arg: Int64,
     tiles_arg: Int64,
@@ -759,15 +773,61 @@ def _cat_batched_kernel[
         var seg = segs[owner]
         var slot = (tile - first) * _cat_tile_slots[dtype, width]() + lane
         if slot < seg.nvec:
-            _cat_copy_rows[dtype, width](
-                out_ptr,
-                _make_ptr[dtype](seg.src_addr).as_unsafe_any_origin().as_imm(),
-                seg,
-                slot,
-                outer,
-                dst_stride,
-            )
+            comptime if dtype == out_dtype or width == 1:
+                _cat_copy_rows[dtype, width, out_dtype](
+                    out_ptr,
+                    _make_ptr[dtype](seg.src_addr)
+                    .as_unsafe_any_origin()
+                    .as_imm(),
+                    seg,
+                    slot,
+                    outer,
+                    dst_stride,
+                )
+            else:
+                # Preserve the measured cast kernel's ordinary global loads.
+                # Immutable provenance lowers to ld.global.nc on Hopper and
+                # slows vector BF16-to-FP32 copies; scalar copies benefit from it.
+                _cat_copy_rows[dtype, width, out_dtype](
+                    out_ptr,
+                    _make_ptr[dtype](seg.src_addr).as_unsafe_any_origin(),
+                    seg,
+                    slot,
+                    outer,
+                    dst_stride,
+                )
         tile += Int(grid_dim.x)
+
+
+def _cat_batched_kernel[
+    dtype: DType, width: Int
+](
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    segs: InlineArray[CatSeg, CAT_CAP],
+    nseg_arg: Int64,
+    tiles_arg: Int64,
+    outer_arg: Int64,
+    dst_stride_arg: Int64,
+):
+    _cat_batched_body[dtype, width](
+        out_ptr, segs, nseg_arg, tiles_arg, outer_arg, dst_stride_arg
+    )
+
+
+@__name(t"cat_cast_rows_bf16_f32_v{width}")
+def _cat_cast_kernel[
+    width: Int
+](
+    out_ptr: Pointer[Float32, MutAnyOrigin],
+    segs: InlineArray[CatSeg, CAT_CAP],
+    nseg_arg: Int64,
+    tiles_arg: Int64,
+    outer_arg: Int64,
+    dst_stride_arg: Int64,
+):
+    _cat_batched_body[DType.bfloat16, width, DType.float32](
+        out_ptr, segs, nseg_arg, tiles_arg, outer_arg, dst_stride_arg
+    )
 
 
 @always_inline
@@ -864,7 +924,7 @@ def _cat_slot_ptr[
 
 @always_inline
 def _cat_launch_width[
-    dtype: DType, width: Int
+    dtype: DType, width: Int, out_dtype: DType = dtype
 ](
     out_addr: Int,
     srcs: Arg,
@@ -875,7 +935,7 @@ def _cat_launch_width[
     ctx: DeviceContext,
 ) raises:
     comptime tile_slots = _cat_tile_slots[dtype, width]()
-    var out_ptr = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
+    var out_ptr = _make_ptr[out_dtype](out_addr).as_unsafe_any_origin()
     var dst_off = 0
     var index = 0
     while index < n:
@@ -896,10 +956,26 @@ def _cat_launch_width[
             continue
         var gy = min(outer, _MAX_GRID_Y)
         var gx = min(tiles, max(1, CAT_MAX_BLOCKS // gy))
-        comptime if has_apple_gpu_accelerator():
+        comptime if dtype != out_dtype:
+            comptime if dtype == DType.bfloat16 and out_dtype == DType.float32 and _has_sm_9x():
+                _enqueue_cached[_cat_cast_kernel[width]](
+                    ctx,
+                    gx,
+                    gy,
+                    1,
+                    GS_THREADS,
+                    out_ptr,
+                    segs,
+                    Int64(nseg),
+                    Int64(tiles),
+                    Int64(outer),
+                    Int64(dst_stride),
+                )
+            else:
+                raise Error("cat cast requires BF16 to FP32 on Hopper")
+        elif has_apple_gpu_accelerator():
             _enqueue_cached[_cat_slots_kernel[dtype, width]](
                 ctx,
-                String(t"dm_cat_slots_{dtype}_{width}"),
                 gx,
                 gy,
                 1,
@@ -922,7 +998,6 @@ def _cat_launch_width[
         else:
             _enqueue_cached[_cat_batched_kernel[dtype, width]](
                 ctx,
-                String(t"dm_cat_batched_{dtype}_{width}"),
                 gx,
                 gy,
                 1,
@@ -960,6 +1035,68 @@ def _cat_launch[
         )
     else:
         raise Error("unsupported vector width for batched cat")
+
+
+def _cat_cast_into(
+    dst: Int,
+    sources: Arg,
+    lengths: Arg,
+    count: Int,
+    outer: Int,
+    stride: Int,
+    ctx: DeviceContext,
+) raises:
+    """Contiguous BF16 rows to disjoint FP32 output; metadata validated by caller.
+    """
+    if count == 0 or outer == 0 or stride == 0:
+        return
+    comptime if _has_sm_9x():
+        if ctx.api() != "cuda":
+            raise Error("cat cast requires CUDA")
+        var wide = dst % 16 == 0 and stride % 4 == 0
+        for index in range(count):
+            wide = (
+                wide
+                and _raw_tuple_int(lengths, index) % 8 == 0
+                and _raw_tuple_int(sources, index) % 16 == 0
+            )
+        if wide:
+            _cat_launch_width[DType.bfloat16, 8, DType.float32](
+                dst, sources, lengths, count, outer, stride, ctx
+            )
+        else:
+            _cat_launch_width[DType.bfloat16, 1, DType.float32](
+                dst, sources, lengths, count, outer, stride, ctx
+            )
+    else:
+        raise Error("cat cast requires Hopper")
+
+
+def _cat_cast_dispatcher(argv: Argv, argc: Int) raises:
+    if argc != 6:
+        raise Error(
+            "CatCast expects output, pointers, lengths, rows, stride, context"
+        )
+    comptime if _dtype_arg_on[0, DType.bfloat16]() and _dtype_out_on[
+        0, DType.float32
+    ]():
+        var sources = argv[unsafe_offset=1]
+        var lengths = argv[unsafe_offset=2]
+        var count = _raw_tuple_len(sources)
+        if count != _raw_tuple_len(lengths):
+            raise Error("CatCast metadata lengths differ")
+        var ctx = _raw_ctx(argv[unsafe_offset=5])
+        _cat_cast_into(
+            _raw_int(argv[unsafe_offset=0]),
+            sources,
+            lengths,
+            count,
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_int(argv[unsafe_offset=4]),
+            ctx,
+        )
+    else:
+        raise Error("CatCast requires BF16 inputs and FP32 output")
 
 
 def _cat_n_go(
@@ -1154,7 +1291,6 @@ def _narrow_copy_dst[
                     var gx = min((copy_len4 + GS_THREADS - 1) // GS_THREADS, 32)
                     _enqueue_cached[_narrow_copy_dst_kernel2d[dtype]](
                         ctx,
-                        String(t"dm_narrowdst2d_{dtype}"),
                         max(gx, 1),
                         outer,
                         1,
@@ -1169,7 +1305,6 @@ def _narrow_copy_dst[
                 var nchunks = outer * copy_len4
                 _enqueue_cached[_narrow_copy_dst_kernel4[dtype]](
                     ctx,
-                    String(t"dm_narrowdst4_{dtype}"),
                     _gs_blocks(nchunks),
                     1,
                     1,
@@ -1185,7 +1320,6 @@ def _narrow_copy_dst[
                 var total = outer * copy_len
                 _enqueue_cached[_narrow_copy_dst_kernel1[dtype]](
                     ctx,
-                    String(t"dm_narrowdst1_{dtype}"),
                     _gs_blocks(total),
                     1,
                     1,
@@ -1571,7 +1705,6 @@ def _where_bcast[
                 var slots = max(1, total // VW)
                 _enqueue_cached[_where_flat_vec_kernel[dtype]](
                     ctx,
-                    String(t"dm_where_fv_{dtype}"),
                     _bw_flat_blocks(slots, traffic),
                     1,
                     1,
@@ -1588,7 +1721,6 @@ def _where_bcast[
 
             _enqueue_cached[_where_bcast_kernel[dtype]](
                 ctx,
-                String(t"dm_where_bc_{dtype}"),
                 _gs_blocks(total),
                 1,
                 1,
@@ -1825,7 +1957,6 @@ def _masked_fill_scalar_bcast[
             var slots = max(1, total // VW)
             _enqueue_cached[_masked_fill_scalar_flat_vec_kernel[dtype]](
                 ctx,
-                String(t"dm_mfs_fv_{dtype}"),
                 _bw_flat_blocks(slots, traffic),
                 1,
                 1,
@@ -1841,7 +1972,6 @@ def _masked_fill_scalar_bcast[
 
         _enqueue_cached[_masked_fill_scalar_bcast_kernel[dtype]](
             ctx,
-            String(t"dm_mfs_bc_{dtype}"),
             _gs_blocks(total),
             1,
             1,
@@ -2244,7 +2374,6 @@ def _cast[
             )
             _enqueue_cached[_cast_vec_kernel[src, dst, VEC]](
                 ctx,
-                String(t"dm_cast_{src}_{dst}_v{VEC}"),
                 _bw_blocks(
                     nvec,
                     SLOTS,
@@ -2714,7 +2843,6 @@ def _repeat_seg_launch[
     var gy = _repeat_quantize(ceildiv(nout, ty), _MAX_GRID_Y)
     _enqueue_cached_2d[_repeat_seg_kernel[dtype, VEC]](
         ctx,
-        String(t"dm_rptseg_{dtype}_v{VEC}"),
         _repeat_quantize(ceildiv(nseg, tx), _BW_MAX_BLOCKS),
         gy,
         1,
@@ -2757,7 +2885,6 @@ def _repeat_flat_launch[
     var gy = _repeat_quantize(ceildiv(nout, ty), _MAX_GRID_Y)
     _enqueue_cached_2d[_repeat_flat_kernel[dtype, VEC]](
         ctx,
-        String(t"dm_rptflat_{dtype}_v{VEC}"),
         gx,
         gy,
         1,
@@ -3230,7 +3357,6 @@ def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
         if vector:
             _enqueue_cached[_index_put_rows_kernel[dtype, vector_width]](
                 ctx,
-                kernel_name + String(vector_width),
                 blocks,
                 1,
                 1,
@@ -3246,7 +3372,6 @@ def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
         else:
             _enqueue_cached[_index_put_rows_kernel[dtype, 1]](
                 ctx,
-                kernel_name + "1",
                 blocks,
                 1,
                 1,
@@ -3602,6 +3727,57 @@ def _cast_spec_into_go(a_o: Arg, out_dtype_o: Arg, out_o: Arg) raises:
             _ = tmp^
 
 
+def _copy_batched_rows_dispatcher(argv: Argv, argc: Int) raises:
+    if argc != 2:
+        raise Error("CopyBatchedRows expects metadata and context")
+    comptime if _has_sm_9x():
+        var metadata = argv[unsafe_offset=0]
+        var count = _raw_tuple_len(metadata)
+        if count % 5 != 0:
+            raise Error(
+                "CopyBatchedRows expects source/destination/rows/columns/pitch"
+                " records"
+            )
+        var srcs = List[Int]()
+        var dsts = List[Int]()
+        var rows = List[Int]()
+        var cols = List[Int]()
+        var pitches = List[Int]()
+        for i in range(count // 5):
+            srcs.append(_raw_tuple_int(metadata, i * 5))
+            dsts.append(_raw_tuple_int(metadata, i * 5 + 1))
+            rows.append(_raw_tuple_int(metadata, i * 5 + 2))
+            cols.append(_raw_tuple_int(metadata, i * 5 + 3))
+            pitches.append(_raw_tuple_int(metadata, i * 5 + 4))
+        copy_batched_rows(
+            srcs, dsts, rows, cols, pitches, _raw_ctx(argv[unsafe_offset=1])
+        )
+    else:
+        raise Error("CopyBatchedRows requires Hopper")
+
+
+def _copy_batched_cast_dispatcher(argv: Argv, argc: Int) raises:
+    if argc != 2:
+        raise Error("CopyBatchedCast expects metadata and context")
+    comptime if _has_sm_9x():
+        var metadata = argv[unsafe_offset=0]
+        var count = _raw_tuple_len(metadata)
+        if count % 3 != 0:
+            raise Error(
+                "CopyBatchedCast metadata must contain pointer/size triples"
+            )
+        var srcs = List[Int]()
+        var dsts = List[Int]()
+        var sizes = List[Int]()
+        for i in range(count // 3):
+            srcs.append(_raw_tuple_int(metadata, i * 3))
+            dsts.append(_raw_tuple_int(metadata, i * 3 + 1))
+            sizes.append(_raw_tuple_int(metadata, i * 3 + 2))
+        copy_batched_cast(srcs, dsts, sizes, _raw_ctx(argv[unsafe_offset=1]))
+    else:
+        raise Error("CopyBatchedCast requires Hopper")
+
+
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -3613,6 +3789,12 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
     """
     try:
+        comptime if _op_on["CopyBatchedRows"]():
+            _copy_batched_rows_dispatcher(argv, argc)
+            return 0
+        comptime if _op_on["CopyBatchedCast"]():
+            _copy_batched_cast_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["CastSpec"]():
             _spec_dispatcher3[_cast_spec_into_go, "CastSpec"](argv, argc)
             return 0
@@ -3621,6 +3803,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["NarrowCopyDst"]():
             _narrow_copy_dst_dispatcher(argv, argc)
+            return 0
+        comptime if _op_on["CatCast"]():
+            _cat_cast_dispatcher(argv, argc)
             return 0
         comptime if _op_on["CatN"]():
             _cat_n_dispatcher(argv, argc)

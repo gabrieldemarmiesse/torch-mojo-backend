@@ -234,6 +234,32 @@ def test_addmm(mojo_device, dtype, call_checker: CallChecker):
     torch.testing.assert_close(got, (ra @ rb + rbias).to(dtype), atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "shape", [(1024, 1600, 1600), (256, 1600, 6400), (512, 256, 256)]
+)
+def test_addmm_adds_its_bias_without_the_dispatcher(mojo_gpu, dtype, shape):
+    """The shapes whose bias is added after an unbiased mm: that add is one
+    launch into the product, not a second `aten::add` and a second buffer."""
+    m, k, n = shape
+    bias = (torch.randn(n) * 0.1).to(dtype)
+    a = (torch.randn(m, k) * 0.1).to(dtype)
+    b = (torch.randn(k, n) * 0.1).to(dtype)
+    dev_bias, dev_a, dev_b = bias.to(mojo_gpu), a.to(mojo_gpu), b.to(mojo_gpu)
+    with assert_no_bias_add():
+        got = torch.addmm(dev_bias, dev_a, dev_b)
+    ref = a.float() @ b.float() + bias.float()
+    assert got.dtype == dtype
+    assert got.stride() == (n, 1)
+    assert _rel_err(got, ref) < _bf16_bound(k)
+    # the same product without the bias, to show the bias landed at all
+    plain = torch.mm(dev_a, dev_b)
+    assert _rel_err(got - dev_bias, plain.cpu().float()) < _bf16_bound(k)
+    out = torch.empty(m, n, dtype=dtype, device=mojo_gpu)
+    assert torch.addmm(dev_bias, dev_a, dev_b, out=out) is out
+    torch.testing.assert_close(out.cpu(), got.cpu(), rtol=0, atol=0)
+
+
 def test_addmm_scaled_declines(mojo_device):
     """beta/alpha scaling is not implemented by this family; the decline is a
     NotImplementedError, not a silently dropped scale."""

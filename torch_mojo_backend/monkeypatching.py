@@ -18,6 +18,7 @@ monkeypatches and stay in ``mojo_device/register.py``.
 import functools
 import os
 import sys
+from collections.abc import Callable
 from functools import wraps
 from typing import TYPE_CHECKING
 
@@ -73,6 +74,46 @@ def fix_privateuse1_dlpack_device_type():
     torch.Tensor.__dlpack_device__ = (  # ty: ignore[invalid-assignment]
         __dlpack_device__
     )
+
+
+def stage_mojo_checkpoint_tensors():
+    """DCP's overlapping CPU loader stages only its preferred accelerator.
+
+    With CUDA torch installed, `_OverlappingCpuLoader` selects CUDA even
+    when saving Mojo tensors. Its `_refill` leaves other accelerators on
+    device, and the filesystem writer then rejects them. Stage Mojo data
+    synchronously when the selected loader stream cannot stage it; retain
+    upstream's overlap for tensors on that stream's device type.
+    """
+    if not torch.distributed.is_available():
+        return
+    from torch.distributed.checkpoint import (  # noqa: PLC0415 -- checkpoint requires optional distributed support, guarded above
+        filesystem,
+    )
+
+    original = filesystem._OverlappingCpuLoader.__init__
+    if getattr(original, "_torch_mojo_backend", False):
+        return
+
+    def initialize(
+        self: filesystem._OverlappingCpuLoader,
+        resolve_fun: Callable[[object], torch.Tensor],
+        stream: torch.Stream | None = None,
+        inflight_threshhold: int = 1_000_000,
+    ):
+        original(self, resolve_fun, stream, inflight_threshhold)
+
+        def resolve_data(item: object) -> torch.Tensor:
+            tensor = resolve_fun(item)
+            if tensor.device.type == "mojo" and self.device_type != "mojo":
+                return tensor.detach().cpu()
+            return tensor
+
+        self.resolve_fun = resolve_data
+
+    functools.update_wrapper(initialize, original)
+    initialize._torch_mojo_backend = True  # ty: ignore[unresolved-attribute] -- idempotent patch marker
+    filesystem._OverlappingCpuLoader.__init__ = initialize
 
 
 def fix_batch_isend_irecv_for_python_process_groups():

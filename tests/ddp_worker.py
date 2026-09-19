@@ -17,6 +17,7 @@ inside main().
 
 # ruff: noqa: E402 -- use_local_rank_gpu() must run before torch/MAX initialize
 import contextlib
+import datetime
 import os
 import sys
 import time
@@ -27,8 +28,6 @@ from torch_mojo_backend.distributed import use_local_rank_gpu
 
 use_local_rank_gpu()
 
-import datetime
-
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -38,7 +37,7 @@ from torch_mojo_backend.distributed.process_group import MojoProcessGroup
 from torch_mojo_backend.native import device_module
 
 # mojoccl (torch_mojo_backend/distributed/mojoccl) implements AllReduce/
-# Broadcast/AllGather only -- Reduce/ReduceScatter/Send/Recv/AllToAll/Gather/
+# Broadcast/AllGather/ReduceScatter -- Reduce/Send/Recv/AllToAll/Gather/
 # Scatter return ncclInvalidUsage (DDP needs only the first three). Every mode
 # below skips the checks that need an op mojoccl does not implement.
 _MOJO_CCL = os.environ.get("TORCH_MOJO_BACKEND_CCL") == "mojo"
@@ -114,6 +113,12 @@ def run_collectives(failures: list[str]):
     dist.all_reduce(tb)
     _check(failures, "all_reduce.bf16", bool((tb.float().cpu() == total).all()))
 
+    # AVG scales each contribution before summing (NCCL's PreMulSum), so the
+    # average of values whose SUM overflows is still finite.
+    hot = torch.full((1024,), 3.0e38, device="mojo")
+    dist.all_reduce(hot, op=dist.ReduceOp.AVG)
+    _check(failures, "all_reduce.AVG.no_overflow", bool((hot.cpu() == 3.0e38).all()))
+
     i64 = torch.tensor([rank + 1], dtype=torch.int64, device="mojo")
     dist.all_reduce(i64)
     _check(failures, "all_reduce.int64", i64.cpu().item() == int(total))
@@ -167,54 +172,47 @@ def run_collectives(failures: list[str]):
     _check(failures, "all_gather.coalesced", ok)
 
     # ---- reduce_scatter: tensor, list, coalesced ---------------------------
-    if _MOJO_CCL:
-        _skip(rank, "reduce_scatter")
-    else:
-        with _tolerate_missing_ops(rank, "reduce_scatter.tensor"):
-            src = torch.arange(world * 3, dtype=torch.float32).to("mojo")
-            out = torch.zeros(3, device="mojo")
-            dist.reduce_scatter_tensor(out, src)
-            exp = (
-                torch.arange(world * 3, dtype=torch.float32)[rank * 3 : (rank + 1) * 3]
-                * world
-            )
-            _check(failures, "reduce_scatter.tensor", bool((out.cpu() == exp).all()))
+    with _tolerate_missing_ops(rank, "reduce_scatter.tensor"):
+        src = torch.arange(world * 3, dtype=torch.float32).to("mojo")
+        out = torch.zeros(3, device="mojo")
+        dist.reduce_scatter_tensor(out, src)
+        exp = (
+            torch.arange(world * 3, dtype=torch.float32)[rank * 3 : (rank + 1) * 3]
+            * world
+        )
+        _check(failures, "reduce_scatter.tensor", bool((out.cpu() == exp).all()))
 
-        with _tolerate_missing_ops(rank, "reduce_scatter.list"):
-            # the list variant stages its inputs with torch.cat, a separate
-            # op from the tensor variant above and not guaranteed ported yet.
-            rs_out = torch.zeros(2, device="mojo")
-            rs_in = [
-                torch.full((2,), float(rank + r), device="mojo") for r in range(world)
-            ]
-            dist.reduce_scatter(rs_out, rs_in)
-            exp_list = sum(float(rank + r) for r in range(world))
-            _check(
-                failures, "reduce_scatter.list", bool((rs_out.cpu() == exp_list).all())
-            )
+    with _tolerate_missing_ops(rank, "reduce_scatter.list"):
+        # the list variant stages its inputs with torch.cat, a separate
+        # op from the tensor variant above and not guaranteed ported yet.
+        rs_out = torch.zeros(2, device="mojo")
+        rs_in = [torch.full((2,), float(rank + r), device="mojo") for r in range(world)]
+        dist.reduce_scatter(rs_out, rs_in)
+        exp_list = sum(float(rank + r) for r in range(world))
+        _check(failures, "reduce_scatter.list", bool((rs_out.cpu() == exp_list).all()))
 
-        with _tolerate_missing_ops(rank, "reduce_scatter.coalesced"):
-            c_rs_outs = [torch.zeros(2, device="mojo") for _ in range(2)]
-            c_rs_srcs = [
-                (torch.arange(world * 2, dtype=torch.float32) + 10 * i).to("mojo")
-                for i in range(2)
-            ]
-            with dist._coalescing_manager():
-                for out, src in zip(c_rs_outs, c_rs_srcs):
-                    dist.reduce_scatter_tensor(out, src)
-            ok = all(
-                bool(
-                    (
-                        c_rs_outs[i].cpu()
-                        == (torch.arange(world * 2, dtype=torch.float32) + 10 * i)[
-                            rank * 2 : (rank + 1) * 2
-                        ]
-                        * world
-                    ).all()
-                )
-                for i in range(2)
+    with _tolerate_missing_ops(rank, "reduce_scatter.coalesced"):
+        c_rs_outs = [torch.zeros(2, device="mojo") for _ in range(2)]
+        c_rs_srcs = [
+            (torch.arange(world * 2, dtype=torch.float32) + 10 * i).to("mojo")
+            for i in range(2)
+        ]
+        with dist._coalescing_manager():
+            for out, src in zip(c_rs_outs, c_rs_srcs):
+                dist.reduce_scatter_tensor(out, src)
+        ok = all(
+            bool(
+                (
+                    c_rs_outs[i].cpu()
+                    == (torch.arange(world * 2, dtype=torch.float32) + 10 * i)[
+                        rank * 2 : (rank + 1) * 2
+                    ]
+                    * world
+                ).all()
             )
-            _check(failures, "reduce_scatter.coalesced", ok)
+            for i in range(2)
+        )
+        _check(failures, "reduce_scatter.coalesced", ok)
 
     # ---- all_to_all: _single with and without splits, and the list form ---
     if _MOJO_CCL:
@@ -315,9 +313,22 @@ def run_collectives(failures: list[str]):
         at = torch.full((1000,), float(rank + 1), device="mojo")
         work = dist.all_reduce(at, async_op=True)
         assert work is not None
-        work.wait()
+        work.wait()  # orders the current stream, does not block the host
+        torch.accelerator.synchronize()
         _check(failures, "async_work.is_completed", work.is_completed())
         _check(failures, "async_work.result", bool((at.cpu() == total).all()))
+        ft = torch.full((1000,), float(rank + 1), device="mojo")
+        later = torch.zeros(8, device="mojo")
+        work = dist.all_reduce(ft, async_op=True)
+        assert work is not None
+        dist.all_reduce(later)  # queued behind: the Future must not depend on it
+        value = work.get_future().wait()[0]
+        _check(failures, "async_work.future", bool((value.cpu() == total).all()))
+        try:
+            work.wait(datetime.timedelta(seconds=1))
+            _check(failures, "async_work.finite_timeout_rejected", False)
+        except RuntimeError:
+            _check(failures, "async_work.finite_timeout_rejected", True)
 
     # ---- object collectives (route through the internal gloo group) -------
     with _tolerate_missing_ops(rank, "all_gather_object"):

@@ -11,6 +11,7 @@ from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
 from torch_mojo_backend.monkeypatching import (
     fix_batch_isend_irecv_for_python_process_groups,
     fix_privateuse1_dlpack_device_type,
+    stage_mojo_checkpoint_tensors,
 )
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.triton_driver import install_triton_hook
@@ -55,4 +56,5 @@ def register_mojo_devices():
         install_triton_hook()
         warn_if_gpu_torch_on_hip()
         register_distributed_backend()
+        stage_mojo_checkpoint_tensors()
         _registered = True

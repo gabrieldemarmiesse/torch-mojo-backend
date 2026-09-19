@@ -381,7 +381,6 @@ def enqueue_fused_adamw_f32(
             )
             _enqueue_cached[_fused_adamw_f32_tensor_apple](
                 ctx,
-                String("FUSED_ADAMW_TENSOR_APPLE_F32_V1"),
                 chunk_count,
                 1,
                 1,

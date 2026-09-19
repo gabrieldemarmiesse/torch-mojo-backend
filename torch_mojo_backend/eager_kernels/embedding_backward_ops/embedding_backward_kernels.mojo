@@ -669,7 +669,6 @@ def enqueue_embedding_dense_backward_f32_i64(
                 var vec_cols = embedding_dim // _VEC
                 _enqueue_cached_2d[_owner_vec4](
                     ctx,
-                    "emb_bwd_owner_vec4",
                     ceildiv(vec_cols, _OWN_TX),
                     blocks_y,
                     1,
@@ -686,7 +685,6 @@ def enqueue_embedding_dense_backward_f32_i64(
             else:
                 _enqueue_cached_2d[_owner_scalar](
                     ctx,
-                    "emb_bwd_owner_scalar",
                     ceildiv(embedding_dim, _OWN_TX),
                     blocks_y,
                     1,
@@ -733,7 +731,6 @@ def enqueue_embedding_dense_backward_f32_i64(
         var scratch_ptr = scratch.unsafe_ptr().as_unsafe_any_origin()
         _enqueue_cached_2d[_table_accum](
             ctx,
-            "emb_bwd_table_accum",
             col_chunks,
             blocks_y,
             1,
@@ -755,7 +752,6 @@ def enqueue_embedding_dense_backward_f32_i64(
         var total_vec = num_weights * (dim_pad // _VEC)
         _enqueue_cached_2d[_table_reduce](
             ctx,
-            "emb_bwd_table_reduce",
             max(1, min(ceildiv(total_vec, _RED_TX), max_grid)),
             1,
             1,
@@ -782,7 +778,6 @@ def enqueue_embedding_dense_backward_f32_i64(
         var counts_ptr = counts.unsafe_ptr().as_unsafe_any_origin()
         _enqueue_cached[_count_zero](
             ctx,
-            "emb_bwd_count_zero",
             max(1, min(ceildiv(num_weights, _BLOCK), max_grid)),
             1,
             1,
@@ -792,7 +787,6 @@ def enqueue_embedding_dense_backward_f32_i64(
         )
         _enqueue_cached[_count](
             ctx,
-            "emb_bwd_count",
             max(1, min(ceildiv(num_indices, _BLOCK), max_grid)),
             1,
             1,
@@ -805,7 +799,6 @@ def enqueue_embedding_dense_backward_f32_i64(
         var col_blocks = ceildiv(vec_cols, _BLOCK)
         _enqueue_cached[_zero_untouched](
             ctx,
-            "emb_bwd_zero_untouched",
             col_blocks,
             min(num_weights, _MAX_GRID_Y),
             1,
@@ -817,7 +810,6 @@ def enqueue_embedding_dense_backward_f32_i64(
         )
         _enqueue_cached[_scatter_hist_vec4](
             ctx,
-            "emb_bwd_scatter_hist_vec4",
             col_blocks,
             min(num_indices, _MAX_GRID_Y),
             1,
@@ -844,7 +836,6 @@ def enqueue_embedding_dense_backward_f32_i64(
         var grid = max(1, min(ceildiv(vec_count, _BLOCK), max_grid))
         _enqueue_cached[_zero_vec4](
             ctx,
-            "emb_bwd_zero_vec4",
             grid,
             1,
             1,
@@ -858,7 +849,6 @@ def enqueue_embedding_dense_backward_f32_i64(
         var grid = max(1, min(ceildiv(output_elements, _BLOCK), max_grid))
         _enqueue_cached[_zero_scalar](
             ctx,
-            "emb_bwd_zero_scalar",
             grid,
             1,
             1,
@@ -879,7 +869,6 @@ def enqueue_embedding_dense_backward_f32_i64(
         var grid = max(1, min(ceildiv(total, _BLOCK), max_grid))
         _enqueue_cached[_scatter_vec4](
             ctx,
-            "emb_bwd_scatter_vec4",
             grid,
             1,
             1,
@@ -896,7 +885,6 @@ def enqueue_embedding_dense_backward_f32_i64(
         var grid = max(1, min(ceildiv(total, _BLOCK), max_grid))
         _enqueue_cached[_scatter_scalar](
             ctx,
-            "emb_bwd_scatter_scalar",
             grid,
             1,
             1,

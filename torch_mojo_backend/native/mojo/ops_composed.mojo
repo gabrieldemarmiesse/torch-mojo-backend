@@ -1,9 +1,9 @@
-"""Ops with no kernel of their own composed from registered ops through the
-dispatcher (`call_op`): backward formulas ATen only ships as per-backend
+"""Ops composed from registered ops through the dispatcher (`call_op`), with
+fused routes for supported regimes: backward formulas ATen ships as per-backend
 kernels (threshold / sigmoid / tanh / batch norm / softmax backward), the
 signed-infinity tests, and out= overloads of ops whose functional form
-exists. Each costs a few extra launches; a fused kernel can replace any of
-them later without changing the registration."""
+exists. Contiguous FP32 tanh backward has a fused Hopper route; other regimes
+retain the composed implementation without changing the registration."""
 from std.utils import IndexList
 
 from abi import (
@@ -38,7 +38,10 @@ from abi import (
     v_tensor,
     view_strided,
 )
+from device import ctx_for, ctx_ptr
+from kernels import KernelCall
 from op_utils import MAX_RANK
+from ops_matmul import _sm90_cuda
 from ops_common import (
     call_op,
     cast_to,
@@ -174,6 +177,45 @@ def op_sigmoid_backward_grad_input(
     ret_ref(rets, 0, out)
 
 
+def _tanh_fused_inputs(grad: T, output: T) raises -> Bool:
+    return (
+        grad.on_mojo()
+        and output.on_mojo()
+        and grad.device == output.device
+        and grad.dtype == DType.float32
+        and output.dtype == DType.float32
+        and grad.contig
+        and output.contig
+        and grad.same_shape(output)
+        and _sm90_cuda(grad.device)
+    )
+
+
+def _tanh_safe_output(dst: T, input: T) -> Bool:
+    # Called only for equal-shape contiguous FP32 tensors. Exact aliases are
+    # elementwise-safe; partial overlap keeps the existing temporary route.
+    return (
+        dst.numel == 0
+        or dst.ptr == input.ptr
+        or dst.ptr + dst.numel * dst.itemsize <= input.ptr
+        or input.ptr + input.numel * input.itemsize <= dst.ptr
+    )
+
+
+def _tanh_fused_into(dst: T, grad: T, output: T) raises:
+    if dst.numel == 0:
+        return
+    var ctx = ctx_for(dst.device)
+    var call = KernelCall("activation_backward_ops", "TanhBackwardF32")
+    call.int(dst.ptr)
+    call.int(grad.ptr)
+    call.int(output.ptr)
+    call.int(dst.numel)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+
+
 # aten::tanh_backward(Tensor grad_output, Tensor output) -> Tensor: grad * (1 - out^2)
 def _tanh_backward_factor(output: T) raises -> T:
     var sq = _dispatch(
@@ -188,7 +230,13 @@ def op_tanh_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var grad = v_tensor(args[unsafe_offset=0])
-    var f = _tanh_backward_factor(v_tensor(args[unsafe_offset=1]))
+    var output = v_tensor(args[unsafe_offset=1])
+    if _tanh_fused_inputs(grad, output):
+        var result = own(new_like(grad))
+        _tanh_fused_into(result.t, grad, output)
+        ret_owned(rets, 0, result)
+        return
+    var f = _tanh_backward_factor(output)
     var g = own(
         _dispatch(
             "aten::mul", "Tensor", [_tensor_value(grad), _tensor_value(f)]
@@ -204,7 +252,21 @@ def op_tanh_backward_grad_input(
 ) raises:
     var grad = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=2])
-    var f = _tanh_backward_factor(v_tensor(args[unsafe_offset=1]))
+    var output = v_tensor(args[unsafe_offset=1])
+    if (
+        _tanh_fused_inputs(grad, output)
+        and out.on_mojo()
+        and out.device == grad.device
+        and out.dtype == DType.float32
+        and out.contig
+        and out.same_shape(grad)
+        and _tanh_safe_output(out, grad)
+        and _tanh_safe_output(out, output)
+    ):
+        _tanh_fused_into(out, grad, output)
+        ret_ref(rets, 0, out)
+        return
+    var f = _tanh_backward_factor(output)
     _dispatch_into(
         "aten::mul",
         "out",

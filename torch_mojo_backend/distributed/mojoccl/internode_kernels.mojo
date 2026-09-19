@@ -318,6 +318,72 @@ def inbox_add[
     )
 
 
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name(t"ccl_internode_inbox_sum_out_{dtype}_v{W}")
+def _inbox_sum_out_kernel[
+    dtype: DType, W: Int
+](
+    dst: Pointer[Scalar[dtype], MutAnyOrigin],
+    partial: Pointer[Scalar[dtype], MutAnyOrigin],
+    inbox: Pointer[UInt8, MutAnyOrigin],
+    count: Int64,
+    slot_bytes: Int64,
+    npeers_i: Int32,
+):
+    comptime accum = DType.float32 if (
+        dtype == DType.bfloat16 or dtype == DType.float16
+    ) else dtype
+    var tid = Int(global_idx.x)
+    var stride = Int(grid_dim.x) * BLOCK
+    var n = Int(count)
+    for v in range(tid, n // W, stride):
+        var acc = partial.unsafe_load[width=W](v * W).cast[accum]()
+        for j in range(Int(npeers_i)):
+            var src = inbox.unsafe_offset(j * Int(slot_bytes)).unsafe_bitcast[
+                Scalar[dtype]
+            ]()
+            acc += src.unsafe_load[width=W](v * W).cast[accum]()
+        dst.unsafe_store[width=W](v * W, acc.cast[dtype]())
+    for i in range(n // W * W + tid, n, stride):
+        var acc = partial[unsafe_offset=i].cast[accum]()
+        for j in range(Int(npeers_i)):
+            var src = inbox.unsafe_offset(j * Int(slot_bytes)).unsafe_bitcast[
+                Scalar[dtype]
+            ]()
+            acc += src[unsafe_offset=i].cast[accum]()
+        dst[unsafe_offset=i] = acc.cast[dtype]()
+
+
+def inbox_sum_out[
+    dtype: DType
+](
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    out_ptr: Int,
+    partial_ptr: Int,
+    inbox_ptr: Int,
+    count: Int,
+    slot_bytes: Int,
+    npeers: Int,
+) raises:
+    """Sum node partials straight into user memory, including offset views."""
+    comptime W = 16 // size_of[dtype]()
+    _enqueue_cached[_inbox_sum_out_kernel[dtype, W]](
+        ctx,
+        stream,
+        String(t"ib_sum_out_{dtype}"),
+        _blocks_for(count * size_of[dtype]()),
+        Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=out_ptr),
+        Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=partial_ptr),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=inbox_ptr),
+        Int64(count),
+        Int64(slot_bytes),
+        Int32(npeers),
+    )
+
+
 def copy_bytes(
     ctx: DeviceContext, stream: DeviceStream, dst: Int, src: Int, nbytes: Int
 ) raises:

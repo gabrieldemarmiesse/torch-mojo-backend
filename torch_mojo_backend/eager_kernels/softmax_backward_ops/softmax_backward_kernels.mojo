@@ -330,7 +330,6 @@ def _enqueue_bwd_reg[
 ) raises:
     _enqueue_cached[_log_softmax_bwd_reg_kernel[dtype, 1024, slots]](
         ctx,
-        String(t"lsm_bwd_reg_{dtype}_1024_{slots}"),
         blocks,
         1,
         1,
@@ -530,7 +529,6 @@ def enqueue_log_softmax_backward[
                 return
             _enqueue_cached[_log_softmax_bwd_nosmem_kernel[dtype]](
                 ctx,
-                String(t"lsm_bwd_nosmem_{dtype}"),
                 rows,
                 1,
                 1,

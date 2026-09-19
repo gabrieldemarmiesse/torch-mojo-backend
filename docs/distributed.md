@@ -1,4 +1,4 @@
-# Distributed training (DDP) on the mojo device
+# Distributed training on the mojo device
 
 The mojo device supports `torch.nn.parallel.DistributedDataParallel` through
 a c10d backend named `"mojo"`, registered automatically by
@@ -73,6 +73,106 @@ entry, and a `HIP_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES` list next to it
 an index into the HSA-visible set) is rewritten to `0`. Call it before
 anything touches the GPU runtime or enumerates MAX devices.
 
+## FSDP2
+
+Use PyTorch's `fully_shard` directly with a mojo device mesh. FSDP1 is not
+required. Create the optimizer **after** sharding, and apply `fully_shard`
+to blocks before applying it to the root (shared embeddings/output weights
+remain in the root group):
+
+```python
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
+
+# After use_local_rank_gpu(), register_mojo_devices(), and
+# dist.init_process_group("mojo") as above:
+mesh = init_device_mesh("mojo", (dist.get_world_size(),))
+model = MyModel().to("mojo")
+for block in model.blocks:
+    fully_shard(block, mesh=mesh)
+fully_shard(model, mesh=mesh)
+optimizer = torch.optim.AdamW(model.parameters(), foreach=False)
+```
+
+Set `TORCH_MOJO_BACKEND_CCL=mojo` to use MojoCCL. On one node its
+reduce-scatter is a real reduce-scatter — one kernel per call, `(world-1)/
+world × bytes` on the wire, nothing allocated and no stream synchronized —
+and its all-gather is the unicast minimum; both are measured against NCCL at
+FSDP2's sizes in "Mojo collectives" below. Across nodes the reduce-scatter
+reduces node-locally and exchanges one destination shard per rank over RDMA,
+and the all-gather sends one contribution per NIC; both are pipelined and
+their grids are sized so the GEMMs keep their SMs (same section); both
+schedules cross-compile for gfx942 but are measured on H100 only. Neither
+modifies the input, except when the caller explicitly uses its own input
+shard as the output (which NCCL also allows).
+
+`demo_scripts/gpt2_fsdp2.py` exercises GPT-2 124M and XL without downloading
+weights or a dataset. It uses the standard architecture, random initial
+weights, and fixed rank-specific synthetic token batches; it checks finite
+losses/gradient norms, parameter sharding, and loss reduction after AdamW
+updates. Launch one process per GPU:
+
+```bash
+TORCH_MOJO_BACKEND_CCL=mojo uv run torchrun --standalone --nproc-per-node=2 \
+    demo_scripts/gpt2_fsdp2.py --model gpt2
+TORCH_MOJO_BACKEND_CCL=mojo uv run torchrun --standalone --nproc-per-node=2 \
+    demo_scripts/gpt2_fsdp2.py --model gpt2-xl
+```
+
+Validated with PyTorch 2.11.0 and two H100 80GB GPUs (Slurm job 256073):
+FP32, batch size 1 per rank, sequence length 64, dropout disabled, five
+AdamW steps on the fixed synthetic batches above:
+
+| Model | Parameters | First loss | Fifth loss |
+|---|---:|---:|---:|
+| GPT-2 | 124,439,808 | 11.028627 | 6.929632 |
+| GPT-2 XL | 1,557,611,200 | 11.163113 | 4.367539 |
+
+Both runs used MojoCCL and had finite gradient norms at every step.
+
+`--dtype bfloat16` uses bf16 parameters for the transformer blocks, fp32
+reductions, and autocast to keep normalization in fp32. The root retains
+fp32 embedding/head parameters because the device's embedding backward
+currently requires fp32 gradients. GPT-2 also passed five steps in this
+configuration (loss 11.028791 → 6.922672), as did GPT-2 XL
+(11.165338 → 4.369543). These
+are training smoke tests, not performance measurements or pretrained-model
+quality results. Runtime behavior on AMD and multi-node FSDP2 remains
+unvalidated; the MojoCCL addition also cross-compiles for gfx942.
+
+The two-rank regression worker (`tests/fsdp_worker.py`) compares full
+gradients and AdamW updates against CPU PyTorch on uneven layer shapes,
+checks reduce-scatter dtypes/chunk boundaries/offset buffers, and saves and
+reloads a sharded model/optimizer checkpoint before another reference-checked
+update. The gradient/update and checkpoint checks also passed on two H100s
+with a CPU-only `torch==2.11.0+cpu` wheel (Slurm job 256133): CUDA-enabled
+torch is not required for FSDP2 on the mojo device.
+
+For a throughput comparison, the same demo also supports stock CUDA and a
+timed mode. Run each command on the same allocated GPUs, under the GPU
+locks, using a PyTorch CUDA wheel compatible with the installed driver:
+
+```bash
+# Stock PyTorch CUDA + NCCL
+uv run torchrun --standalone --nproc-per-node=2 demo_scripts/gpt2_fsdp2.py \
+    --model gpt2-xl --device cuda --dtype bfloat16 --sequence-length 1024 \
+    --benchmark --warmup 5 --steps 10 --windows 3 --output cuda.json
+# Mojo device + vendor NCCL: use the same arguments with --device mojo
+# and TORCH_MOJO_BACKEND_CCL=vendor. For MojoCCL, set CCL=mojo instead.
+```
+
+Timed windows include forward, backward, gradient clipping, AdamW, and
+gradient clearing. They exclude initialization, compilation, warmup, and
+loss reporting. Each window synchronizes the device before and after the
+steps, and uses the slowest rank's elapsed wall time. Tokens/second is
+aggregate across ranks: `world_size * batch_size * sequence_length * steps
+/ elapsed_seconds`. Both devices use the same FSDP precision policy
+(including the fp32 root), dropout-free model, and `foreach=False` AdamW.
+This measures that explicit training configuration, without `torch.compile`
+or an optimizer tuning search.
+See [the two-H100 GPT-2 XL comparison](gpt2_fsdp2_throughput.md) for measured
+CUDA, Mojo + NCCL, and Mojo + MojoCCL throughput.
+
 ## What works, what to avoid
 
 - `DDP(model)` with the defaults; keep `device_ids=None` (the default for a
@@ -95,8 +195,8 @@ anything touches the GPU runtime or enumerates MAX devices.
   work; `ReduceOp` SUM/PROD/MIN/MAX/AVG map to NCCL/RCCL for float and int
   tensors (PREMUL_SUM does not); a bool tensor maps SUM/MAX to `ncclMax` and
   PRODUCT/MIN to `ncclMin` and rejects AVG, matching `ProcessGroupNCCL`. Mojo
-  collectives (`TORCH_MOJO_BACKEND_CCL=mojo`) implement only allreduce,
-  broadcast and all_gather — see "Mojo collectives" below.
+  collectives (`TORCH_MOJO_BACKEND_CCL=mojo`) implement allreduce,
+  broadcast, all_gather and reduce_scatter (SUM/AVG) — see "Mojo collectives" below.
 - The MAX **CPU pseudo-device** (`mojo:{N-1}`, the last index —
   `torch.mojo.cpu()`) cannot take part in a collective at all: construction
   itself needs a real accelerator (communicators are created eagerly, see
@@ -183,8 +283,9 @@ communicators and does the actual library calls.
   NCCL and mojoccl, so the bug is in the Future/event plumbing shared by
   both, not in either collectives library. `tests/ddp_worker.py`'s
   `stream_ordering` mode (`stream_ordering.side_stream`) is the repro;
-  it currently fails and is left failing on purpose rather than weakened,
-  since passing it is the point.
+  it is retained as a regression test. It passed with both vendor NCCL and
+  MojoCCL on two H100s during the FSDP2 bring-up, but the historical
+  intermittent failure has no confirmed root cause or fix.
 - **The Python PG still replaces the whole process group** (torch ≥ 2.10
   behavior), so torch cannot compose `cpu:gloo` alongside it;
   `MojoProcessGroup` keeps its own private `ProcessGroupGloo` for CPU tensors
@@ -488,7 +589,8 @@ NCCL-class collectives, not a general library:
   "Multi-node" below;
 - `ncclAllReduce` (float32/float16/bfloat16/int32/int64, SUM and AVG),
   `ncclBroadcast` and `ncclAllGather` (every dtype, byte-granular);
-  `ncclReduce`, `ncclReduceScatter`, `ncclSend`, `ncclRecv` return
+  `ncclReduceScatter` (the same dtypes; SUM, and floating-point AVG).
+  `ncclReduce`, `ncclSend`, `ncclRecv` return
   `ncclInvalidUsage`, so DDP works and anything needing them does not;
 - the rendezvous is a TCP socket that `ncclGetUniqueId` opens on rank 0;
   the 128-byte `ncclUniqueId` carries its address, port and a random magic
@@ -556,6 +658,347 @@ DDP bucket) 164 vs 181, 168 MiB 988 vs 756, 512 MiB 2.99 vs 2.15 ms. The last
 two rows are where the multicast path takes over — next subsection. AMD: the
 same source cross-compiles for gfx942, and it now runs there — see the
 subsection after that.
+
+### Reduce-scatter: push, then reduce into the caller's output
+
+FSDP2 asks for exactly two collectives and nothing else — a reduce-scatter of
+the gradients and an all-gather of the parameters, 146 calls per GPT-2 XL
+step at two ranks — so the reduce-scatter is a real one on a single node,
+not the allreduce transport in a costume:
+
+- **PUSH** rank r reads chunk s of its own input and writes it into peer s's
+  staging slot. That write is the wire transfer, as in the allreduce's
+  phase 1;
+- **REDUCE** every rank sums its own chunk, straight out of user memory,
+  with the `world-1` pushed slots, and writes the result into the caller's
+  output. AVG scales each contribution as it enters the fp32 accumulator,
+  never the finished sum (NCCL's PreMulSum): two fp32 ranks contributing
+  2**127 average to 2**127, not to inf.
+
+`(world-1)/world × bytes` per GPU on the wire, the unicast minimum; nothing
+allocated, no stream synchronized, and one kernel per call at every size
+FSDP2 asks for — the push slots are `world-1` compacted slots that may use
+the whole `2 × MOJOCCL_REGION_MB` arena (512 MiB at the default region), for
+the same reason the NVLS allreduce may: the start barrier is what orders a
+generation's writes after every peer's previous reads.
+`reduce_scatter_max_count` is that bound and a larger message is chunked
+against it. In place is safe in NCCL's sense (`recvbuff == sendbuff +
+rank*count`): the push never reads chunk `rank`, and in the reduce each
+thread writes only the elements it just read. Any alignment is accepted —
+16-byte vectors where the pointers and the input stride allow them, and the
+same W-element groups moved one element at a time where they do not, so two
+ranks may disagree about it and stay block-matched.
+
+Every cross-link byte goes in the **write** direction, so unlike the
+allreduce and the all-gather this schedule needs no separate AMD variant.
+
+On one node, at the FSDP2 shapes and against NCCL on the same GPUs (H100
+SXM, `--core`, CUPTI device time, median over ranks, unlocked clocks, us):
+
+| single node, per rank | NCCL | mojoccl | ratio |
+|---|---:|---:|---:|
+| 2 ranks, XL block fp32 (61.4 MB) | 276 | 262 | **0.95** |
+| 2 ranks, XL root fp32 (164 MB) | 677 | 688 | **1.02** |
+| 8 ranks, XL block fp32 (15.4 MB) | 345 | 370 | **1.07** |
+| 8 ranks, XL root fp32 (41 MB) | 864 | 1000 | 1.16 |
+| 8 ranks, 357x789 at an odd offset (1.1 MB) | 51 | 104 | 2.03 |
+| 8 ranks, 256 KB | 19 | 15 | **0.80** |
+
+The 8-rank root is this same push-then-reduce shape one node down: 7 shard
+pushes of 41 MB at the fabric's rate, then an 8-way HBM reduce that only
+starts once every rank's push is in. At 2 ranks there is one push and the
+reduce is two streams, so there is nothing to hide and it is at parity.
+
+Across nodes, each local rank reduces the chunks destined for that local
+rank on every node, using the bootstrap topology table to address input
+chunks. Each remote node receives only its own partial through the existing
+RDMA exchange; an add kernel combines incoming partials with the local one
+directly into the caller's output. On two nodes each rank sends `count`
+elements, with no all-gather phase, temporary allocation, or host stream
+synchronization. Larger messages use the existing staging arenas and inbox
+credits to pipeline chunks. AVG scales each input before the node-local sum.
+NVIDIA fp32 runs the pipeline in one persistent kernel: local reduction,
+mailbox release, bounded completion wait, output sum, and credit return.
+Two such kernels exist. `rs_stream.mojo` takes every call of at least
+`PIPE_SPLIT_UNIT` bytes per rank (see "Streaming reduce-scatter" below);
+`rs_fused.mojo` runs everything smaller, two chunks per call so only the
+second exchange is exposed (`RS_FUSED_TARGET_CHUNKS`), and stays the
+fallback for every geometry the streaming kernel declines. Other dtypes and
+targets use separate kernels for these phases (`rs_multinode.mojo`). Calls
+whose chunk count exceeds the existing work ring also use the split
+schedule.
+
+#### Streaming reduce-scatter
+
+`rs_fused.mojo` runs a chunk as push, 8-way barrier, reduce: no rank starts
+reducing before every rank has finished pushing the whole chunk, so the
+NVLink push and the HBM-bound reduce never overlap, the barrier exposes the
+slowest rank's whole push, and the chunk's RDMA exchange only starts once
+all of that is done. It also spends four grid barriers per chunk. NCCL's
+ring has none of that: its unit of "has data arrived" is a 1 MiB slice
+checked by four threads of the block against the neighbour's step counter,
+with an eight-deep credit pipeline and no grid barrier anywhere
+(nccl:src/device/prims_simple.h `waitPeer`/`postPeer`,
+src/device/reduce_scatter.h; at these sizes NCCL 2.28 picks RING/SIMPLE,
+16 CTAs of 544 threads = 512 workers plus one post warp).
+
+`rs_stream.mojo` keeps the hierarchical schedule -- its bytes are already
+NCCL's: `(local_world-1) * nnodes` shard pushes on NVLink and one shard on
+the wire per rank, against a 16-rank ring's 14/15 NVLink and 1/15 network
+hops, which is 287 MB and 20.5 MB for the XL root at 16 ranks either way --
+and replaces every rendezvous in it with a one-directional flag:
+
+- each block owns a contiguous range of the chunk and walks it in pieces of
+  `RS_STREAM_UNROLL * RS_STREAM_SLICE_UNROLLS` 16-byte vectors per thread.
+  It pushes piece `j`, publishes `DATA[peer][block][me] = ordinal(chunk, j)`
+  and waits for every peer's `DATA[me][block][peer]` to reach
+  `ordinal(chunk, j - RS_STREAM_DEPTH)` before reducing that piece;
+- `FREE[peer][block][me]`, published once this block has reduced chunk `k`,
+  is the credit that lets peers overwrite the arena at chunk `k + narenas`.
+  In steady state it is already there -- it is `narenas` chunks of slack --
+  so nothing waits for it;
+- a rank-local arrival counter per chunk releases that chunk's RDMA exchange
+  and returns the inbox credit. Blocks arrive and keep going; only the last
+  one stores into the mailbox.
+
+Both counters are generation-tagged, monotone, never reset and compared with
+`>=`, like the block barrier's flags; the host reserves
+`ceil(nchunks * pieces / PHASES_PER_GEN)` generations per call so a later
+call's values cannot collide with them. The block-matched invariant is
+unchanged: block `b` of every rank derives the same range and the same
+pieces from `(chunk, grid)` alone, so it still consumes only what block `b`
+of a peer produced, whatever the two ranks decide about 16-byte alignment.
+In-place, `count == 0`, arbitrary alignment, bounded spins, the error word
+and the status page work exactly as in the fused kernel.
+
+**The arena layout is the same for every chunk of a call, and that is what
+makes the per-block credit sound.** The slot stride and the partition come
+from the full `chunk_elems`; a short last chunk leaves the tail of the
+layout unwritten instead of re-cutting it. Deriving either from a chunk's
+own `cnt` -- which is what the kernel first did -- moves every slot base and
+every block boundary for the last chunk, so block `b`'s write lands on bytes
+block `b-1` of a peer is still reducing while `b` has waited only for the
+peer's block `b`. `rs_fused.mojo` gets away with a per-chunk stride because
+its rank-local grid barrier makes one block's cross-rank sync transitively
+cover every block of the peer; this kernel gave that up, so it owes the
+invariant instead. Reachable at ordinary sizes -- the default 256 MiB region
+caps a chunk at 2,097,152 fp32, so 36 MiB per rank is five chunks over four
+arenas with a half-size last one -- and `tests/test_mojoccl_reduce_scatter_layout.py`
+pins it in source, because the failure is a race: 1000 mojo-leg collectives
+per rank at 16 ranks over 5, 9 and 35 chunks, with half-size and
+single-element last chunks, at both region sizes, did not reproduce it on
+the broken kernel. What keeps it shut is that every block waits on the same
+`_RS_STREAM_DONE` word once per chunk and must arrive before the exchange is
+released, which holds the blocks of a rank inside one chunk of each other.
+Nothing promises that.
+
+Neither benchmark shape below can reach the bug -- both plan exactly four
+chunks over four arenas, so no arena is reused -- and for the block size the
+two layouts are bit-identical (four chunks of exactly 480,000 elements),
+while the root's differ only in a 48-byte slot stride on its last chunk.
+The fixed kernel nevertheless measures about 3% slower on the root in both
+leg orders (1.269/1.286 -> 1.316/1.326 against NCCL). That is either this
+unlocked-clock box's build-to-build spread, which the earlier variants put
+at +-4% on the mojo leg, or those 48 bytes moving the RDMA source's page
+offset; it is not attributed. Rounding the slot stride to 4 KiB instead of
+16 B would make every slot base page-aligned for every message and settle
+the question, and it needs the arena and inbox bounds widened to match.
+
+One thing did not survive dropping the grid barriers. With no barrier left,
+every block polled the pinned mailbox for the exchange itself, and 32
+threads reading host memory over the link the NIC is moving the shard on
+cost far more than the barrier ever did: that one line, changed back on an
+otherwise final tree, takes the isolated root fp32 reduce-scatter from
+1273 us to 2195 (NCCL 982-1007). Block 0 now polls and republishes what it
+saw into a device word the other blocks spin on out of L2 -- the same
+transitive acquire of the NIC's writes that the grid barrier used to give
+them.
+
+What the streaming bought, measured on 2x8 H100 SXM over InfiniBand
+(job 259332, 16 ranks, `--core`, CUPTI device time of the comm stream,
+median over ranks, vendor/mojo ABBA and BAAB in one process,
+**unlocked clocks** -- `nvidia-smi -lgc` is not permitted on these nodes):
+
+| isolated, us | NCCL | rs_fused | rs_stream |
+|---|---:|---:|---:|
+| reduce-scatter fp32 SUM, XL block (7.68 MB/rank) | 463 | 645 (1.39x) | 512-519 (**1.10-1.12x**) |
+| reduce-scatter fp32 AVG, XL block | 465 | 640 (1.38x) | 502-507 (**1.08-1.09x**) |
+| reduce-scatter fp32 SUM, XL root (20.5 MB/rank) | 990-1007 | 1470 (1.48x) | 1273-1281 (1.26-1.28x) |
+| reduce-scatter fp32 AVG, XL root | 1001-1007 | 1468 (1.46x) | 1283-1294 (1.28x) |
+
+The grid is 32 CTAs and, unlike `rs_fused.mojo`'s, that is also its
+isolated fit: the handoff is per block, so a larger grid multiplies the
+seven remote flag stores and the 8-way rendezvous per piece while leaving
+each block less to push between them. Block / root fp32 SUM in us:
+**32 CTAs 515/1277**, 128 CTAs 602-628/1370-1383. The fused kernel wants
+the opposite (128 CTAs 1263 us on the root, 32 CTAs 1567) and has to be
+held down to 32 by the step; this one does not, and it matches the fused
+kernel's 128-CTA root time on a quarter of the SMs.
+
+`RS_STREAM_TARGET_CHUNKS = 4` is fitted on the same nodes, block / root
+fp32 SUM in us: 2 chunks 617/1292, **4 chunks 500/1299**, 8 chunks
+571/1413. More chunks shorten the one exposed exchange (the last chunk's)
+and add about 50 us of proxy time each, and 8 is already the wrong side of
+that. Two variants measured and not taken: one piece per block per chunk
+(`RS_STREAM_SLICE_UNROLLS = 8`, which degenerates the streaming to the
+fused schedule minus its grid barriers) 517/1279, and pushing piece `j` and
+reducing piece `j-1` back to back with no barrier between them, so the
+warps drift apart and one SM holds NVLink stores and HBM loads at once,
+520/1274. Both sit inside this unlocked-clock box's run-to-run spread
+(+-4% on the mojo leg, +-1% on NCCL's).
+
+**The root reduce-scatter is still 1.28x NCCL, and the reduce is not most
+of what is left.** Deleting both HBM passes -- the 8-way reduce and the
+output sum -- from an otherwise final kernel, keeping every flag, exchange
+and arrival so the schedule is unchanged, measures block 469 us and root
+1155 us against 515 and 1277 with them. So the two passes cost 46 and 122
+us, and the rest (the push, the handoff and the one exposed exchange) is
+already 1.01x NCCL at the block size and **1.17x at the root**.
+
+That bounds what the obvious next step buys. A node-local **ring** whose
+hop fuses load, add and store -- NCCL's `recvReduceSend`, one pass that
+loads the neighbour's slice, adds the local contribution and stores to the
+next neighbour -- moves exactly the same NVLink bytes as this push and
+makes the reduce free, so it would land near that 469 / 1155: parity at the
+block size, 1.17x at the root. The other 17% is the push itself. 287 MB per
+GPU at the 326 GB/s the fused kernel's push measured on this fabric would be
+880 us, and 880 plus the last chunk's 122 us exchange is 1002; the
+push-only build measures 1155, i.e. about 281 GB/s all in. Recovering the
+fused kernel's push rate inside the streaming schedule -- the two differ in
+that a block here owns a contiguous range instead of grid-striding the
+chunk, and publishes a release flag per piece -- is worth as much as the
+ring, and neither has been tried.
+
+Its grid is fitted end to end, not on the isolated collective, and the two
+fits disagree: 128 CTAs make the isolated root reduce-scatter 1.2x NCCL and
+32 CTAs 1.5x, but every CTA holds an SM's register file for the call and the
+backward's GEMMs lose those SMs, so GPT-2 XL FSDP2 on 2x8 H100 runs 62.4k
+tok/s at 128 CTAs and 67.0-67.6k at 32 (`RS_FUSED_BIG_BLOCKS`, with the
+sweep). The node-local gathers of the multi-node all-gather are capped the
+same way (`AG_NODE_BLOCKS`, 96 against the single-node 432) and the progress
+thread keeps polling between the chunks of one call instead of sleeping
+(`BATCH_POLL_NS`). NCCL's kernels here are 16 CTAs of 544 threads at 96
+registers.
+
+What the SMs cost, from a torch trace of one step (`tmp/fsdp2-parity/prof0`,
+both stacks): a persistent GEMM (132 CTAs, 168 registers x 384 threads,
+214 KB of shared memory) cannot share an SM with any collective CTA, so the
+GEMMs launched while NCCL's 16-CTA kernel is resident run at their solo
+speed (41.2 vs 41.0 us), those launched under a 96-CTA gather took 1.8x and
+under a 32-CTA reduce-scatter 1.46x; and both stacks' collectives are
+resident about three times their isolated duration, because the kernel of
+an early rank waits in its start barrier for the slowest one (our fused
+reduce-scatter 1.8 ms resident for 0.65 ms of work, NCCL's 1.6 ms for
+0.52). Two things follow. The start barrier is now run by one block ahead
+of the grid (`ccl_rank_gate`, `_sync` on the spare flag row `GATE_ROW`), so
+the skew is absorbed on one SM and the 32 (reduce-scatter) or 96 (remote
+gather) CTAs behind it only ever hold their SMs while moving bytes; the
+grid skips its phase-0 barrier (`GATED`), on the same guarantee -- a
+rank's gate flag is published after everything before it on its stream
+completed, and every peer's is awaited. And the mapped local gather
+releases its chunk's RDMA exchange from inside the kernel, the moment the
+last block has staged this rank's contribution (arrival counter at
+`_AG_ARRIVE_OFFSET`), so the network transfer runs under the peer pulls
+instead of after them: block bf16 all-gather 350 -> 249 us and one launch
+fewer per chunk.
+
+Two isolated wins that did not survive the step, recorded so they are not
+retried blind: NCCL's 16-CTA grid for the gathers (16 blocks x 16 loads in
+flight measure the same isolated time as 96 x 4 on the XL sizes, but a
+latency-bound pull under the compute stream's HBM traffic loses far more
+from 6x fewer CTAs than the GEMMs gain, 63.1-64.8k tok/s against
+66.1-69.1k), and 256 threads per reduce-scatter block (no register spills,
+isolated block 618 -> 576 us, but the block still owns the whole register
+file and the step measured no better). The push itself is bound by the
+fabric, not by the SMs: rotating the peer each block stores into by its
+block index took it from 291 to 326 GB/s per GPU (`_peer_step`, now on
+both vendors), and it runs at 140-170 us per 53.8 MB chunk from 16 CTAs
+up; what fewer CTAs cost is the HBM-bound reduce and the phase-1 barrier's
+wait on the slowest rank's push.
+
+The former multi-node implementation all-reduced 1 MiB chunks of every
+destination's slice and synchronized the host to release temporary memory
+(16 ranks: 32x NCCL's device time on an XL block, 39x on the root). The
+single-node measurements below compare against that former schedule; the
+16-rank numbers are under "Multi-node".
+
+Measured through the library's own exported entry points on 2×H100 SXM
+(NV18), one process per GPU, 20 back-to-back calls per burst, four bursts in
+ABBA order, median CUPTI kernel time, against NCCL 2.28.9 on the same node
+and the same buffers (job 257033, `tmp/fsdp2-mojoccl-harness`):
+
+| reduce-scatter | per rank out | NCCL µs | placeholder µs | this µs | ratio |
+|---|---:|---:|---:|---:|---:|
+| fp32, one XL block | 61.4 MB | 277.3 | 2236.9 | 263.4 | **0.95** |
+| fp32, the XL root | 164.1 MB | 673.4 | 5988.9 | 689.0 | **1.02** |
+| fp32, 1 MiB | 1.0 MB | 16.2 | 35.2 | 13.0 | **0.80** |
+| fp32, 357×789 at an odd offset | 1.1 MB | 21.0 | 88.6 | 22.8 | 1.09 |
+
+Host enqueue, the same call measured on the host (median of 30, queue
+short): 6.4 µs, against NCCL's 12.4 µs and the placeholder's 2553 µs — it
+synchronized the stream, so its enqueue was the whole collective.
+
+The unaligned row is the one that does not clear 10%: its scalar path
+reduces one element at a time where the vector path does a whole 16-byte
+group with one SIMD accumulate. It reads 1.09 through the library and 1.12
+through the process group, i.e. 2 µs, and FSDP2 never issues an unaligned
+reduce-scatter.
+
+### All-gather: one read of the contribution, two stores
+
+The all-gather was already the unicast minimum (a local stage into my own
+region, then every peer's slot read into my output — NVIDIA cannot do
+better, because a peer may read my library region but may not write my
+MAX-allocated output). Two things in it were not minimal:
+
+- the local half copied my contribution **twice**, once into the region and
+  once into my own slice of the output, so it read it twice. One read and
+  two stores is a quarter less HBM traffic in that phase
+  (`_copy_bytes2`) — worth 5 µs of 141 on an XL block gather and 31 of 686
+  on the root's;
+- the byte copy's unaligned fallback moved **one byte at a time**, sixteen
+  loads and stores per 16-byte chunk. An offset view is still 4-byte
+  aligned for every dtype wider than a byte, so there is now a 4-byte path
+  between the two, which halves the time of an unaligned gather
+  (32.3 → 18.2 µs at 1.1 MB). Both paths walk the same 16-byte chunks in the
+  same grid-stride order as the vector path, which is what keeps a writer
+  and a reader that disagree about alignment block-matched.
+
+Same conditions as the reduce-scatter table above:
+
+| all-gather | per rank in | NCCL µs | before µs | this µs | ratio |
+|---|---:|---:|---:|---:|---:|
+| bf16, one XL block | 30.7 MB | 147.1 | 140.8 | 135.5 | **0.92** |
+| fp32, the XL root | 164.1 MB | 663.5 | 697.9 | 655.8 | **0.99** |
+| bf16, 0.5 MiB | 0.5 MB | 11.5 | 11.1 | 11.3 | **0.98** |
+| fp32, 357×789 at an odd offset | 1.1 MB | 28.3 | 32.2 | 18.2 | **0.65** |
+
+Host enqueue 6.1 µs against NCCL's 12.2.
+
+At 0.5 MiB the two libraries read the same within their own run-to-run
+spread (NCCL's own 0.5 MiB number was 10.1, 11.5 and 15.6 µs in three
+runs), and roughly 9 µs of our 11.3 is fixed cost: two system-scope
+barriers — the start barrier, and the one between the stage and the pull —
+plus the launch. NCCL needs neither, because below a few megabytes it runs
+LL, whose flags travel inside the payload. Closing that would take an
+LL-style protocol; the smallest all-gather GPT-2 XL FSDP2 issues is 30 MB.
+
+For the architectures that are not present here (`gfx942`, `sm_80`, through
+`scripts/compare_kernel_asm.py --kernel-dir torch_mojo_backend/distributed`
+against the tree before this work): the twenty new reduce-scatter
+specializations appear, the four users of `_copy_bytes` change — the
+all-gather, the broadcast, and the inter-node copy and place kernels, all
+for its new 4-byte path — and nothing else moves. **Unmeasured on AMD**: the
+reduce-scatter's cross-link direction is the one gfx942 wants and the 4-byte
+path only removes instructions, but neither of those is a measurement.
+
+**End to end**, GPT-2 XL FSDP2 on 2×H100 (bf16 blocks, fp32 root, sequence
+1024, batch 1 per rank, `demo_scripts/gpt2_fsdp2.py --benchmark`), four legs
+in palindromic order mojo/vendor/vendor/mojo, median tokens/s per leg:
+mojoccl 7870 and 7861, NCCL 7164 and 7786. MojoCCL was at 5134 tok/s before
+this work against NCCL's 7786 — the reduce-scatter was the whole gap. The
+124M five-step loss trajectory is bit-identical under the two libraries in
+both precisions (11.028627 → 6.929632 fp32, 11.028791 → 6.923096 bf16).
 
 ### AMD MI300A: every cross-link byte goes in the write direction
 
@@ -794,11 +1237,88 @@ small kernel sums the N−1 inbox shards into the shard; the intra-node
 all-gather (`allgather_finish`) then pulls the globally reduced shards into
 the user output. AVG's 1/world is applied by the reduce-scatter to each input
 (NCCL's PreMulSum), so no node partial or inbox sum is ever an unscaled total
-in a half dtype. Broadcast and all-gather use the same RDMA
-path with a simpler schedule (root's node fans out to its counterparts, then
-intra-node; node blocks exchanged, then placed by global rank) and stay
-unpipelined — they run at DDP init, not in the step. Single-node
+in a half dtype. Broadcast uses the same RDMA path: the root's node fans
+out to its counterparts, then each node broadcasts locally. All-gather
+first gathers local contributions into a node block, then each rank sends
+only its own contribution to the same local rank on each remote node.
+After the exchange, node-local all-gathers disseminate the received
+contributions, and placement follows the bootstrap global-rank table.
+On NVIDIA each local all-gather writes directly into the mapped global
+output slots, and its local staging supplies the RDMA send. Other targets
+place the local block while the network transfer runs. Staging is reused
+only after send completion. NVIDIA all-gather pipelines two chunks through
+separate existing arenas, overlapping a network exchange with the next local
+gather and the earlier remote gather. Messages at least
+`PIPE_SPLIT_UNIT * local_world` bytes per rank are split into two balanced
+chunks unless region capacity requires more. This threshold was measured on
+2×8 H100 and leaves smaller single-chunk gathers unchanged. Inbox credits
+follow each chunk's remote consumers; the source arena is reused only after
+its send and consumers complete. Broadcast and the other-target all-gather
+schedule remain unpipelined. Single-node
 communicators keep the fused intra-node path and never touch IB.
+
+Measured at 16 ranks (2x8 H100 SXM, InfiniBand, job 258050) through the
+library's exported entry points, CUPTI device time of the comm stream,
+median over ranks of complete-call sums, vendor/mojo ABBA in one process
+(`tmp/fsdp2-2node/harness`, `tmp/fsdp2-parity/final/bench_abba.json`); NCCL
+2.28 picked RING_LL for both collectives. The reduce-scatter grid is 32 CTAs
+because the GEMMs it runs under decide the step, not this table (see
+"Reduce-scatter" above): the same kernel at 128 CTAs measures root 1263 us.
+"Before" is the tree before the gate, the in-kernel RDMA release and the
+peer rotation (same day, same nodes).
+
+| 16 ranks, per rank | NCCL us | before us | mojoccl us | ratio | launches | host us NCCL / mojo |
+|---|---:|---:|---:|---:|---:|---:|
+| all-gather bf16, XL block (3.84 MB) | 394 | 350 | 272 | **0.69** | 4 | 12.8 / 18.5 |
+| all-gather fp32, XL root (20.5 MB) | 1084 | 1027 | 977 | **0.90** | 8 | 12.3 / 21.3 |
+| reduce-scatter fp32 SUM, XL block (7.68 MB) | 520 | 669 | 658 | 1.27 | 2 | 12.3 / 8.5 |
+| reduce-scatter fp32 AVG, XL block | 524 | 666 | 654 | 1.25 | 2 | 12.4 / 8.5 |
+| reduce-scatter fp32 SUM, XL root (20.5 MB) | 1068 | 1566 | 1499 | 1.40 | 2 | 12.2 / 8.7 |
+| reduce-scatter fp32, 357x789 at an odd offset | 159 | 312 | 299 | 1.88 | 2 | 13.9 / 8.2 |
+| all-gather fp32, 357x789 at an odd offset | 169 | 179 | 159 | **0.94** | 4 | 12.0 / 11.7 |
+
+The reduce-scatter rows of that table are `rs_fused.mojo`'s and are now
+only what calls below `PIPE_SPLIT_UNIT` bytes per rank take; "Streaming
+reduce-scatter" above has the current numbers (block 1.10x, root 1.28x) and
+a fresh NCCL column measured beside them.
+
+The reduce-scatter's device time is not where its step cost is. Its
+per-phase trace (block fp32, 32 CTAs, per 3.84 MB chunk): push 165-185 us
+at 326 GB/s per GPU, 8-way phase-1 barrier 5-35 us of rank skew, reduce
+41-51 us, output sum 13 us, exposed last RDMA 55-60 us (42 GB/s), grid
+barriers 4-7 us each. The push is bound by the fabric from 16 CTAs up, so
+the isolated gap to NCCL (a 16-rank ring that never waits for a whole
+node's push before reducing) is the reduce and the barriers, and closing it
+with more CTAs costs the step more than it returns.
+
+The streaming kernel confirms that from the other side. It cut the isolated
+block reduce-scatter from 1.39x NCCL to 1.10x and the root from 1.48x to
+1.28x, and GPT-2 XL FSDP2 on these two nodes did not notice: three six-leg
+palindromes of the streaming tree against two of the tree before it, same
+allocation, alternated before/after/before/after, 18 and 12 windows per
+stack, median tok/s -- Mojo + MojoCCL 65,448 before and 66,007 after
+(+0.9%), against -0.6% and -0.3% on the two stacks whose code is
+byte-identical between the trees (Mojo + NCCL 67,571 -> 67,139, CUDA + NCCL
+71,021 -> 70,789). Per-window spread is 60-71k on every stack, so +0.9% is
+inside the noise and the honest reading is "nothing lost": the SM footprint
+is the same 32 CTAs, and a reduce-scatter FSDP2 has already overlapped with
+the next layer's backward does not get cheaper by finishing sooner.
+
+The placeholder these replaced measured 16,623 / 41,256 us on the block /
+root reduce-scatter (32x / 39x) with a host synchronize per call; the
+Nsight probe of the new paths sees no synchronize or query inside any
+reduce-scatter or all-gather enqueue. End to end, GPT-2 XL FSDP2 on those
+two nodes, six-leg palindrome, six windows per leg, median tok/s of all
+twelve windows per stack: CUDA + NCCL 70,993, Mojo + NCCL 65,444, Mojo +
+MojoCCL 65,760 (`tmp/fsdp2-parity/final/xl`) -- MojoCCL and NCCL on the
+Mojo device within noise of each other (the Mojo + NCCL legs of that run
+spread 57.0-68.8k; the same stack measured 69,134 on job 258050 the day
+before with the untouched tree, when Mojo + MojoCCL measured 66,406). The 124M
+five-step fp32 loss trajectory matches NCCL's exactly at four steps and
+differs by one fp32 ULP at one (9.151466 vs 9.151465): AVG's 1/16 is
+applied to every input before either sum, as NCCL does, but the eight
+node-local terms and two node partials associate differently from a
+16-step ring, so the last bit of an fp32 sum can differ.
 
 **The three phases overlap, inside one kernel.** The bucket is cut into K
 chunks, with at most `PIPE_ARENAS` chunks alive:

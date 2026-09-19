@@ -25,6 +25,8 @@ from abi import (
     ST_INT32,
     ST_INT64,
     TAG_NONE,
+    TAG_INT_LIST,
+    TAG_BOOL,
     IntList,
     Owned,
     T,
@@ -90,6 +92,8 @@ from ops_common import (
     resize_out,
 )
 from registry import Site, impl
+from ops_foreach import _overlaps, _self_overlaps
+from ops_matmul import _sm90_cuda
 from ops_core import cast_for_copy, copy_between_devices, record_tensor_stream
 
 # ---------------------------------------------------------------------------
@@ -610,6 +614,25 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             "aten::_to_copy to a device type this backend does not know"
         )
 
+    if (
+        t.on_mojo()
+        and t.contig
+        and stype != t.stype
+        and dev_type != DEVICE_TYPE_CPU
+        and (dev_type == -1 or v_device_index(dev_v) == t.device)
+        and strides_equal(want, contig, t.rank)
+        and is_cast_dtype(t.dtype)
+        and is_cast_dtype(max_dtype(stype))
+    ):
+        # The hot case of a mixed-precision step: a dense same-device cast
+        # whose result is the contiguous layout. `_to_copy_same_device` ends
+        # on exactly this allocation and this launch, after three more stride
+        # comparisons, a density test, and two `Owned` round trips.
+        var cast = own(new_like_dtype(t, stype))
+        cast_into(cast.t, t)
+        ret_owned(rets, 0, cast)
+        return
+
     if not t.on_mojo():
         # `_to_copy` reaches this PrivateUse1 kernel even for a foreign CPU
         # `self` whenever the target device resolves to `mojo` (dispatch
@@ -804,6 +827,159 @@ def _cat_impl(ins: List[T], dim: Int) raises -> Owned:
     return out^
 
 
+def _split_rows_qualifies(
+    src: T, outs: List[T], sizes: IntList, dim: Int
+) raises -> Bool:
+    # A singleton contiguous span already uses a faster device memcpy.
+    if (
+        len(outs) <= 1
+        or not src.on_mojo()
+        or not src.contig
+        or src.dtype != DType.bfloat16
+    ):
+        return False
+    if not _sm90_cuda(src.device):
+        return False
+    for i in range(len(outs)):
+        var out = outs[i].copy()
+        if (
+            not out.on_mojo()
+            or out.device != src.device
+            or out.dtype != src.dtype
+            or not out.contig
+            or out.rank != src.rank
+        ):
+            return False
+        for d in range(src.rank):
+            if out.dim(d) != (sizes[i] if d == dim else src.dim(d)):
+                return False
+        if _overlaps(out, src):
+            return False
+    return not _self_overlaps(outs)
+
+
+def _split_rows_launch(src: T, outs: List[T], sizes: IntList, dim: Int) raises:
+    var rows = 1
+    var inner = 1
+    for d in range(dim):
+        rows *= src.dim(d)
+    for d in range(dim + 1, src.rank):
+        inner *= src.dim(d)
+    var pitch = src.dim(dim) * inner
+    var offset = 0
+    var metadata = List[Int]()
+    for i in range(len(outs)):
+        var cols = sizes[i] * inner
+        metadata.append(src.ptr + offset * src.itemsize)
+        metadata.append(outs[i].ptr)
+        metadata.append(rows)
+        metadata.append(cols)
+        metadata.append(pitch)
+        offset += cols
+    var ctx = ctx_for(src.device)
+    var call = KernelCall("data_movement_ops", "CopyBatchedRows")
+    call.tuple(metadata)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    for dest in outs:
+        dest.bump_version()
+    _ = ctx
+
+
+def _split_resize_out(mut out: T, src: T) raises:
+    if out.same_shape(src):
+        return
+    if out.on_mojo():
+        resize_out(out, src.shape, src.rank)
+        out.bump_version()
+    else:
+        # A wrong-device CPU output is resized before the device error, as in
+        # the composite implementation. Its allocator belongs to CPU torch.
+        var shape = List[Int64]()
+        for d in range(src.rank):
+            shape.append(Int64(src.dim(d)))
+        var args = List[Value]()
+        args.append(tensor_arg(out))
+        args.append(
+            Value(
+                TAG_INT_LIST,
+                Int32(len(shape)),
+                Int64(Int(shape.unsafe_ptr())),
+                0,
+            )
+        )
+        args.append(Value(TAG_NONE, 0, 0, 0))
+        _ = call_op("aten::resize_", "", args^, 1)
+        _ = shape
+        out = T(out.h)
+
+
+# aten::split_with_sizes_copy.out(Tensor self, SymInt[] split_sizes, int dim=0, *, Tensor(a!)[] out) -> ()
+def op_split_with_sizes_copy_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var src = v_tensor(args[unsafe_offset=0])
+    var sizes = IntList(args[unsafe_offset=1])
+    var dim = v_int(args[unsafe_offset=2])
+    var outs = v_tensor_list(args[unsafe_offset=3])
+    if src.rank == 0:
+        raise Error("split expects at least a 1-dimensional tensor")
+    if dim < 0:
+        dim += src.rank
+    if dim < 0 or dim >= src.rank:
+        raise Error("Dimension out of range")
+    var total = 0
+    for i in range(len(sizes)):
+        if sizes[i] < 0:
+            raise Error(
+                "split_with_sizes expects split_sizes have only non-negative"
+                " entries"
+            )
+        total += sizes[i]
+    if total != src.dim(dim):
+        raise Error(
+            "split_with_sizes expects split_sizes to sum exactly to the input"
+            " dimension"
+        )
+    if len(outs) != len(sizes):
+        raise Error(
+            "split_with_sizes_copy_out expected an out= argument of size ",
+            len(sizes),
+            ", got size ",
+            len(outs),
+        )
+    if _split_rows_qualifies(src, outs, sizes, dim):
+        _split_rows_launch(src, outs, sizes, dim)
+        return
+    # Retain torch's view construction and sequential mutation ordering for
+    # strided/aliased outputs, resizing and unsupported dtype/device pairs.
+    var split_args = List[Value]()
+    for i in range(3):
+        split_args.append(args[unsafe_offset=i].copy())
+    var parts = call_op("aten::split_with_sizes", "", split_args^, 1)
+    var views = v_tensor_list(parts[0])
+    for i in range(len(outs)):
+        var out = T(outs[i].h)
+        var view = views[i].copy()
+        _split_resize_out(out, view)
+        if out.dtype != src.dtype:
+            raise Error(
+                "Expected out tensor to have dtype ",
+                src.dtype,
+                ", but got ",
+                out.dtype,
+                " instead",
+            )
+        if out.device_type != src.device_type or out.device != src.device:
+            raise Error("Expected out tensor to have device matching the input")
+        var copy_args = List[Value]()
+        copy_args.append(tensor_arg(out))
+        copy_args.append(tensor_arg(view))
+        copy_args.append(Value(TAG_BOOL, 0, 0, 0))
+        _ = call_op("aten::copy_", "", copy_args^, 1)
+    _ = parts
+
+
 # aten::cat(Tensor[] tensors, int dim=0) -> Tensor
 def op_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var all_tensors = v_tensor_list(args[unsafe_offset=0])
@@ -820,9 +996,76 @@ def op_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+def _cat_cast_out(ins: List[T], dim: Int, out_t: T) raises -> Bool:
+    """Write eligible mixed-precision cat directly into an existing output."""
+    var first = ins[0].copy()
+    var rank = first.rank
+    if (
+        not first.on_mojo()
+        or first.dtype != DType.bfloat16
+        or out_t.dtype != DType.float32
+        or rank == 0
+        or dim < 0
+        or dim >= rank
+        or out_t.rank != rank
+        or not out_t.on_mojo()
+        or out_t.device != first.device
+        or not out_t.contig
+    ):
+        return False
+    var cat_size = 0
+    for x in ins:
+        if (
+            not x.on_mojo()
+            or x.dtype != first.dtype
+            or x.device != first.device
+            or x.rank != rank
+            or not x.contig
+        ):
+            return False
+        for d in range(rank):
+            if d != dim and x.dim(d) != first.dim(d):
+                return False
+        if _overlaps(out_t, x):
+            return False
+        cat_size += x.dim(dim)
+    for d in range(rank):
+        if out_t.dim(d) != (cat_size if d == dim else first.dim(d)):
+            # Preserve existing resize and error ordering in the fallback.
+            return False
+    if not _sm90_cuda(first.device):
+        return False
+    if out_t.numel == 0:
+        return True
+    var inner = 1
+    var outer = 1
+    for d in range(dim + 1, rank):
+        inner *= first.dim(d)
+    for d in range(dim):
+        outer *= first.dim(d)
+    var sources = List[Int](capacity=len(ins))
+    var lengths = List[Int](capacity=len(ins))
+    for x in ins:
+        sources.append(x.ptr)
+        lengths.append(x.dim(dim) * inner)
+    var ctx = ctx_for(first.device)
+    var call = KernelCall("data_movement_ops", "CatCast")
+    call.arg_dtype(0, first.dtype)
+    call.out_dtype(out_t.dtype)
+    call.int(out_t.ptr)
+    call.tuple(sources)
+    call.tuple(lengths)
+    call.int(outer)
+    call.int(cat_size * inner)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    return True
+
+
 # aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)
 def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    """DDP's reducer flattens its buckets with this overload."""
+    """DDP bucket flattening and FSDP2 gradient packing (including fp32 out)."""
     var all_tensors = v_tensor_list(args[unsafe_offset=0])
     var dim_in = v_int_or(args[unsafe_offset=1], 0)
     var out = v_tensor(args[unsafe_offset=2])
@@ -834,9 +1077,17 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         unsupported("aten::cat.out of only legacy-empty tensors")
     var rank = real[0].rank
     var dim = dim_in + rank if dim_in < 0 else dim_in
+    if _cat_cast_out(real, dim, out):
+        ret_ref(rets, 0, out)
+        return
     var result = _cat_impl(real, dim)
-    if result.t.dtype != out.dtype:
-        raise Error("cat.out: out dtype must match the inputs")
+    if result.t.dtype != out.dtype and not (
+        result.t.dtype.is_floating_point() and out.dtype.is_floating_point()
+    ):
+        raise Error(
+            "cat.out: out dtype must match the inputs or both must be floating"
+            " point"
+        )
     if not out.on_mojo() or out.device != result.t.device:
         raise Error("cat.out: out must be on the inputs' mojo device")
     # Only a mismatching `out` is resized. Resizing resets sizes, strides and
@@ -844,7 +1095,14 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # to the front of `base`.
     if not out.same_shape(result.t):
         resize_out(out, result.t.shape, result.t.rank)
-    copy_strided_into(out, result.t)
+    if result.t.dtype == out.dtype:
+        copy_strided_into(out, result.t)
+    elif out.contig:
+        cast_into(out, result.t)
+    else:
+        var converted = own(cast_to(result.t, out.stype))
+        copy_strided_into(out, converted.t)
+        _ = converted^
     _ = result^  # alive past the launch
     ret_ref(rets, 0, out)
 
@@ -1780,6 +2038,7 @@ def op_empty_permuted(
 
 
 def register_data_movement(site: Site) raises:
+    impl[op_split_with_sizes_copy_out, "split_with_sizes_copy.out"](site)
     impl[op_clone, "clone"](site)
     impl[op_to_copy, "_to_copy"](site)
     impl[op_cat, "cat"](site)

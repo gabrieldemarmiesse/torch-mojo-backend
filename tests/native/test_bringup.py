@@ -3,6 +3,8 @@ views, fills, item, autograd, streams, events, RNG (public torch API only)."""
 
 import pytest
 import torch
+from torch._dynamo.source import ConstantSource
+from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 
 from tests.native.conftest import side_stream_or_skip
 from torch_mojo_backend import native
@@ -147,6 +149,176 @@ def test_error_paths(mojo_device):
     a = _arange(6, mojo_device).reshape(2, 3)
     with pytest.raises(RuntimeError):
         a * _arange(5, mojo_device)
+
+
+def test_boxed_adapter_carries_every_argument_kind(mojo_device):
+    """One call per record kind the boxed adapter converts (shim_dispatch.cpp):
+    its per-schema plan decides these once, so every kind needs a live call."""
+    a = _arange(6, mojo_device).reshape(2, 3)
+    b = torch.full((2, 3), 2.0).to(mojo_device)
+
+    # Scalar: int, float, bool -- the three tags a c10::Scalar can carry here
+    assert torch.add(a, 2).cpu().tolist() == [[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]]
+    assert torch.add(a, 0.5).cpu()[0, 0].item() == 0.5
+    assert torch.add(a, True).cpu()[0, 0].item() == 1.0
+    # int[] (a view's size), int? left None (as_strided's storage_offset)
+    assert a.view([6]).cpu().tolist() == list(range(6))
+    assert a.sum(dim=[0, 1]).item() == 15.0
+    assert a.as_strided((3, 2), (2, 1)).cpu().tolist() == [
+        [0.0, 1.0],
+        [2.0, 3.0],
+        [4.0, 5.0],
+    ]
+    # ScalarType?, Device?, bool? (pin_memory), MemoryFormat?
+    e = torch.empty(
+        (2, 3),
+        dtype=torch.int64,
+        device=mojo_device,
+        memory_format=torch.contiguous_format,
+    )
+    assert e.dtype == torch.int64 and e.is_contiguous()
+    # str
+    torch.testing.assert_close(
+        torch.nn.functional.gelu(a, approximate="tanh").cpu(),
+        torch.nn.functional.gelu(a.cpu(), approximate="tanh"),
+    )
+    torch.testing.assert_close(
+        torch.div(a, b, rounding_mode="floor").cpu(), a.cpu() // 2
+    )
+    # Tensor? left None (layer_norm without affine parameters)
+    torch.testing.assert_close(
+        torch.nn.functional.layer_norm(a, (3,)).cpu(),
+        torch.nn.functional.layer_norm(a.cpu(), (3,)),
+    )
+    # Tensor?[] (advanced indexing, leading index only) and Tensor[] in and out
+    idx = torch.tensor([1, 0]).to(mojo_device)
+    assert a[idx].cpu().tolist() == [[3.0, 4.0, 5.0], [0.0, 1.0, 2.0]]
+    assert torch.cat([a, b]).cpu().shape == (4, 3)
+    parts = a.view(6).split_with_sizes([2, 4])
+    assert [p.cpu().tolist() for p in parts] == [[0.0, 1.0], [2.0, 3.0, 4.0, 5.0]]
+    # Generator
+    g = torch.Generator(device=mojo_device)
+    g.manual_seed(7)
+    r1 = torch.rand(4, device=mojo_device, generator=g)
+    g.manual_seed(7)
+    torch.testing.assert_close(
+        r1.cpu(), torch.rand(4, device=mojo_device, generator=g).cpu()
+    )
+    # Scalar return (_local_scalar_dense)
+    assert a[1, 2].item() == 5.0
+
+
+def test_boxed_adapter_returns_undefined_tensors_for_masked_gradients(mojo_gpu):
+    """bool[] argument, three returns, and the None-record rule: a masked-off
+    gradient of a `Tensor` (not `Tensor?`) return must come back as an
+    UNDEFINED tensor, which torch shows as None -- not as an error.
+
+    Accelerators only: the layer-norm backward kernel has no CPU route."""
+    x = _arange(6, mojo_gpu).reshape(2, 3)
+    w = torch.full((3,), 1.0).to(mojo_gpu)
+    bias = torch.zeros(3).to(mojo_gpu)
+    out, mean, rstd = torch.ops.aten.native_layer_norm(x, [3], w, bias, 1e-5)
+    grad = torch.ones_like(out)
+    full = torch.ops.aten.native_layer_norm_backward(
+        grad, x, [3], mean, rstd, w, bias, [True, True, True]
+    )
+    assert all(t is not None for t in full)
+    masked = torch.ops.aten.native_layer_norm_backward(
+        grad, x, [3], mean, rstd, w, bias, [True, False, False]
+    )
+    assert masked[0] is not None and masked[1] is None and masked[2] is None
+
+
+def test_boxed_adapter_error_kinds(mojo_device):
+    """A declined op is a NotImplementedError, a real failure a plain
+    RuntimeError, and every message names the op the adapter called."""
+    a = _arange(6, mojo_device).reshape(2, 3)
+    with pytest.raises(NotImplementedError) as declined:
+        torch.empty(2, dtype=torch.complex64, device=mojo_device)
+    assert "ScalarType" in str(declined.value)
+    assert "aten::empty.memory_format" in str(declined.value)
+
+    with pytest.raises(RuntimeError) as failed:
+        a.view([4, 4])
+    assert not isinstance(failed.value, NotImplementedError), failed.value
+    assert "aten::view" in str(failed.value)
+
+    # a C++-side check inside the shim, not a declining kernel
+    with pytest.raises(RuntimeError) as bounds:
+        torch.ops.aten.as_strided(a, [2, 3], [3, 1], 20)
+    assert not isinstance(bounds.value, NotImplementedError), bounds.value
+    assert "storage" in str(bounds.value)
+
+
+def test_view_ops_metadata_and_aliasing(mojo_device):
+    """view / _unsafe_view / _reshape_alias / as_strided: shape, stride,
+    storage offset, one shared storage, writes visible through the base."""
+    base = _arange(24, mojo_device).reshape(4, 6)
+    for v in (
+        base.view(2, 12),
+        torch.ops.aten._unsafe_view(base, [2, 12]),
+        torch.ops.aten._reshape_alias(base, [2, 12], [12, 1]),
+        base.as_strided((2, 12), (12, 1)),
+    ):
+        assert v.shape == (2, 12) and v.stride() == (12, 1)
+        assert v.storage_offset() == 0 and v.data_ptr() == base.data_ptr()
+        assert v.dtype == base.dtype and v.device == base.device
+    sub = base[1:3, 2:5]
+    assert sub.shape == (2, 3) and sub.stride() == (6, 1) and sub.storage_offset() == 8
+    strided = base.as_strided((3, 2), (2, 3), 5)
+    assert strided.stride() == (2, 3) and strided.storage_offset() == 5
+    assert strided.cpu().tolist() == [[5.0, 8.0], [7.0, 10.0], [9.0, 12.0]]
+    view = base.view(24)
+    view[0] = 99.0
+    assert base.cpu()[0, 0].item() == 99.0
+
+
+def test_boxed_adapter_finds_a_warm_plan_by_value(mojo_device):
+    """A warm op's conversion plan is accepted by the hot-path identity check,
+    so no call after the first re-interns it (shim_dispatch.cpp, Plan)."""
+    a = _arange(6, mojo_device)
+    ops = (lambda: a.add(1.0), lambda: a.mul(2.0), lambda: a.view(2, 3), a.sum)
+    for op in ops:
+        op()
+    before = native.plan_builds()
+    assert before > 0
+    for _ in range(20):
+        for op in ops:
+            op()
+    assert native.plan_builds() == before
+
+
+def test_view_ops_guard_a_backed_symbolic_size(mojo_device):
+    """A backed symbolic size specializes at the view boundary (`guard_int`)
+    rather than being rejected, as the boxed adapter did for the same
+    argument."""
+    env = ShapeEnv()
+    six = env.create_symintnode(
+        env.create_symbol(6, ConstantSource("v"), dynamic_dim=DimDynamic.DYNAMIC),
+        hint=6,
+    )
+    t = _arange(6, mojo_device)
+    assert t.view([six]).shape == (6,)
+    assert t.view([six]).cpu().tolist() == list(range(6))
+    strided = t.as_strided([six - 3], [2], six - 6)
+    assert strided.shape == (3,) and strided.storage_offset() == 0
+    assert torch.ops.aten._reshape_alias(t, [six], [1]).shape == (6,)
+
+
+def test_empty_strided_metadata(mojo_device):
+    """empty_strided keeps the strides it was given; empty_like and a
+    channels-last request keep theirs."""
+    t = torch.empty_strided((3, 4), (1, 3), dtype=torch.bfloat16, device=mojo_device)
+    assert t.shape == (3, 4) and t.stride() == (1, 3) and t.dtype == torch.bfloat16
+    assert not t.is_contiguous()
+    like = torch.empty_like(t)
+    assert like.shape == (3, 4) and like.stride() == (1, 3)
+    cl = torch.empty(
+        (2, 3, 4, 5), device=mojo_device, memory_format=torch.channels_last
+    )
+    assert cl.stride() == (60, 1, 15, 3)
+    assert torch.empty((), device=mojo_device).shape == ()
+    assert torch.empty((0, 3), device=mojo_device).numel() == 0
 
 
 def test_autograd_uses_aten_formulas(mojo_device):

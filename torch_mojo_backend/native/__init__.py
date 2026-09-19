@@ -482,7 +482,7 @@ def build_shim(*, prebuilt: bool = True) -> Path:
     cxx = _find_cxx()  # None is fine as long as a prebuilt shim matches
     abi = f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}"
     cflags = [
-        "-O1",
+        "-O2",
         _cxx_standard(),
         "-fPIC",
         "-fvisibility=hidden",  # tmb.h re-exports the C entries; 40% smaller library
@@ -770,6 +770,17 @@ def _load_or_compile(path: Path, build: _Builder, mode: int, what: str) -> ctype
 
 def is_registered() -> bool:
     return bool(_state.get("registered"))
+
+
+def plan_builds() -> int:
+    """Conversion plans the boxed adapter has interned (test support).
+
+    One per schema it has seen: a warm op finds its plan by value and must not
+    add to this count.
+    """
+    fn = shim().tmb_plan_builds
+    fn.restype = ctypes.c_int64
+    return int(fn())
 
 
 def op_counting(enabled: bool):

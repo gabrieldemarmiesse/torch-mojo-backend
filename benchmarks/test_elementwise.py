@@ -66,6 +66,7 @@ SKIPPED: dict[str, str] = {}
 COVERS: dict[str, str] = {f"aten::{name}": "test_unary" for name in UNARY_OPS} | {
     "aten::bitwise_not": "test_bitwise_not",
     "aten::logical_not": "test_logical_not",
+    "aten::sqrt.out": "test_sqrt_contiguous_out",
 }
 
 
@@ -184,4 +185,36 @@ def test_logical_not(
         lambda: torch.logical_not(x_ref),
         lambda: torch.logical_not(x_our),
         flops=float(x_ref.numel()),
+    )
+
+
+_SQRT_OUT_SHAPES = {
+    "small_800": (800, 0),
+    "l2_3840000": (3840000, 0),
+    "l2_5120000": (5120000, 0),
+    "stream_40206400": (40206400, 0),
+    "awkward_281673": (357 * 789, 0),
+    "offset_281673": (357 * 789, 1),
+}
+
+
+@pytest.mark.bench_op("sqrt.out")
+@pytest.mark.parametrize("dtype_id", ["f32"])
+@pytest.mark.parametrize("shape_id", _SQRT_OUT_SHAPES)
+def test_sqrt_contiguous_out(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    count, offset = _SQRT_OUT_SHAPES[shape_id]
+    host = ((torch.arange(count + 16, dtype=torch.int64) * 7919 + 13) % 65521).to(
+        DTYPES[dtype_id]
+    ) / 4096
+    ref_base, our_base = both(host, hw, mojo_device)
+    ref_storage, our_storage = torch.empty_like(ref_base), torch.empty_like(our_base)
+    ref, our = ref_base[offset : offset + count], our_base[offset : offset + count]
+    ref_out = ref_storage[offset : offset + count]
+    our_out = our_storage[offset : offset + count]
+    bench.run(
+        lambda: torch.sqrt(ref, out=ref_out),
+        lambda: torch.sqrt(our, out=our_out),
+        flops=float(count),
     )

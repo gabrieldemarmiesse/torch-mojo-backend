@@ -619,7 +619,6 @@ def _enqueue_columns[
         var buffer = _scatter_buffer(ctx, output, count, initialize=False)
         _enqueue_cached[_scatter[dt, acc, fast, storage]](
             ctx,
-            "deform_col2im_" + String(dt) + String(fast),
             blocks,
             1,
             1,
@@ -644,7 +643,6 @@ def _enqueue_columns[
         ).as_unsafe_any_origin()
         _enqueue_cached[_im2col[dt, fast]](
             ctx,
-            "deform_im2col_" + String(dt) + String(fast),
             blocks,
             1,
             1,
@@ -719,7 +717,6 @@ def _enqueue_loop[dt: DType](argv: Argv, p: Geometry, blocks: Int) raises:
     ).as_unsafe_any_origin()
     _enqueue_cached[_im2col_pixel_loop[dt]](
         ctx,
-        "deform_im2col_pixel_loop_i32_" + String(dt),
         blocks,
         1,
         1,
@@ -757,7 +754,6 @@ def _enqueue_layout[
         dd = _divisor(Int(p.oc) if op == 3 else Int(p.n))
     _enqueue_cached[_layout[dt, op, fast]](
         ctx,
-        "deform_layout_" + String(dt) + String(op) + String(fast),
         blocks,
         1,
         1,
@@ -850,7 +846,6 @@ def launch[dt: DType, op: Int](argv: Argv, argc: Int) raises:
     elif op == 2:
         _enqueue_cached[_offset_grad[dt]](
             ctx,
-            "deform_offset_" + String(dt),
             blocks,
             1,
             1,
@@ -866,7 +861,6 @@ def launch[dt: DType, op: Int](argv: Argv, argc: Int) raises:
     elif op == 6:
         _enqueue_cached[_bias_reduce[dt]](
             ctx,
-            "deform_bias_reduce_" + String(dt),
             Int(p.oc),
             1,
             1,

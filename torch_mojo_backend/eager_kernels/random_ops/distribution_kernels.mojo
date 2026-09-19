@@ -591,7 +591,6 @@ def enqueue_distribution[
             if trivial:
                 _enqueue_cached[_dist_kernel[dtype, DIST, True]](
                     ctx,
-                    String(t"rng_{DIST}_{dtype}_1d"),
                     grid,
                     1,
                     1,
@@ -613,7 +612,6 @@ def enqueue_distribution[
             else:
                 _enqueue_cached[_dist_kernel[dtype, DIST, False]](
                     ctx,
-                    String(t"rng_{DIST}_{dtype}_nd"),
                     grid,
                     1,
                     1,
@@ -749,7 +747,6 @@ def enqueue_bernoulli_tensor[
         else:
             _enqueue_cached[_bernoulli_tensor_kernel[dtype, PDT]](
                 ctx,
-                String(t"rng_bernoulli_tensor_{dtype}_{PDT}"),
                 grid,
                 1,
                 1,

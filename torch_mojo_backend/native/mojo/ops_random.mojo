@@ -228,15 +228,24 @@ def _pieces(p: Plan, itemsize: Int, mut out: List[Plan]):
 # ---------------------------------------------------------------------------
 
 
+comptime _CPU_SM = 132  # an H100 SXM: the constants the CPU device answers with
+comptime _CPU_MAX_THREADS = 2048
+
+
 def _grid(device: Int, numel: Int) raises -> Int:
-    # Constant fallbacks (an H100 SXM) only ever answer for the MAX CPU
-    # device, which no CUDA card is compared against.
+    # The MAX CPU device answers the constants without asking, and without
+    # touching the per-device attribute cache: that cache is indexed by
+    # `DeviceContext.id()`, which is 0 for the CPU context AND for GPU 0, so
+    # asking here would write the CPU's answer into GPU 0's slot (and every
+    # grid derived from `_device_sm_count` would then read it).
+    if dev(device)[].is_cpu:
+        return min(ceildiv(numel, BLOCK), _CPU_SM * (_CPU_MAX_THREADS // BLOCK))
     var ctx = ctx_for(device)
-    var max_threads = _device_attr_cached(
-        ctx, "maxthr", DeviceAttribute.MAX_THREADS_PER_MULTIPROCESSOR, 2048
+    var max_threads = _device_attr_cached["maxthr"](
+        ctx, DeviceAttribute.MAX_THREADS_PER_MULTIPROCESSOR, _CPU_MAX_THREADS
     )
-    var sm = _device_attr_cached(
-        ctx, "sm", DeviceAttribute.MULTIPROCESSOR_COUNT, 132
+    var sm = _device_attr_cached["sm"](
+        ctx, DeviceAttribute.MULTIPROCESSOR_COUNT, _CPU_SM
     )
     return min(ceildiv(numel, BLOCK), sm * (max_threads // BLOCK))
 

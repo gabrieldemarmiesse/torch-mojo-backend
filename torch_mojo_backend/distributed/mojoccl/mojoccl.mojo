@@ -6,7 +6,7 @@
 # Signatures, enum values and ncclResult_t codes are pinned to
 # /home/gabriel/projects/nccl/src/nccl.h.in (2.31.2) -- the source of truth
 # is nccl.py's `_declare()`, which this library's exports were written
-# against. AllReduce/Broadcast/AllGather are real; Reduce/ReduceScatter/
+# against. AllReduce/Broadcast/AllGather/ReduceScatter are real; Reduce/
 # Send/Recv return ncclInvalidUsage (GPT-2 DDP needs only the first three;
 # tests/ddp_worker.py skips the checks that need them when
 # TORCH_MOJO_BACKEND_CCL=mojo is set).
@@ -41,14 +41,16 @@
 #   broadcast  root stages and RDMA-writes to its same-local_rank peers,
 #              then every node runs the node-local broadcast from its own
 #              local root
-#   allgather  node-local allgather into a node block, one RDMA exchange of
-#              node blocks, then place each block by GLOBAL rank (read out
-#              of the bootstrap table, not assumed to be
-#              node * local_world + local_rank)
+#   allgather  node-local allgather, RDMA exchange of each rank's contribution,
+#              then node-local dissemination of the remote contributions.
+#              Place by GLOBAL rank from the bootstrap topology table.
+#              NVIDIA gathers directly into the mapped output slots.
 #
-# Broadcast and allgather run once at init and are written for clarity
-# rather than speed, and stay unpipelined for the same reason; allreduce is
-# the one the DDP step waits on, and it is PIPELINED: the bucket is cut into
+# Reduce-scatter reduces all node destinations locally, exchanges each
+# remote destination with its owner, and sums into the user output. It uses
+# the same pipeline arenas and inbox credits as allreduce. Allgather also
+# runs during FSDP2 training; NVIDIA pipelines large gathers over two arenas.
+# Allreduce is PIPELINED: the bucket is cut into
 # K chunks and issued on the one comm stream as
 #
 #   RS(0) release(0) RS(1) release(1) ... wait(0) add(0) AG(0) RS(3) ...
@@ -68,7 +70,7 @@ from std.ffi import OwnedDLHandle, external_call
 from std.gpu import global_idx
 from std.memory.alloc import unsafe_alloc
 from std.os import getenv
-from std.sys import size_of
+from std.sys import has_nvidia_gpu_accelerator, size_of
 from std.time import perf_counter_ns, sleep
 from std.utils import StaticTuple
 from max.gpu.host import (
@@ -117,6 +119,7 @@ from collectives_kernels import (
     ERR_FUSED_GRID,
     ERR_HOST_LAUNCH,
     ERR_PROXY_WAIT,
+    ERR_REDUCE_SCATTER_SYNC,
     ERR_RS_STAGE_SYNC,
     FAULT_ARENA,
     FAULT_BLOCK,
@@ -134,6 +137,7 @@ from collectives_kernels import (
     _shard_per,
     allgather,
     allgather_max_bytes,
+    allgather_mapped,
     allgather_finish,
     allreduce,
     broadcast,
@@ -141,6 +145,9 @@ from collectives_kernels import (
     error_offset,
     install_status_page,
     region_init,
+    reduce_scatter,
+    rank_gate,
+    reduce_scatter_max_count,
     reduce_scatter_stage,
     shard_range,
     signal_bytes,
@@ -154,6 +161,7 @@ from internode import (
     WORK_SLOTS,
     OP_ALLGATHER,
     OP_ALLREDUCE,
+    OP_REDUCE_SCATTER,
     OP_BROADCAST,
     PIPE_MAX_SLOTS,
     ib_connect,
@@ -185,7 +193,28 @@ from internode_fused import (
     fused_resident_blocks,
     internode_allreduce_fused,
 )
-from internode_kernels import copy_bytes, inbox_add, place_blocks
+from internode_kernels import copy_bytes, inbox_add, inbox_sum_out, place_blocks
+from rs_fused import (
+    RS_FUSED_BIG_BLOCKS,
+    reduce_scatter_fused,
+    reduce_scatter_fused_blocks,
+    reduce_scatter_fused_plan,
+)
+from rs_multinode import (
+    reduce_scatter_nodes,
+    reduce_scatter_nodes_max_count,
+    reduce_scatter_rank_ids,
+)
+from rs_stream import (
+    RS_STREAM_BIG_BLOCKS,
+    RS_STREAM_ENABLED,
+    reduce_scatter_stream,
+    reduce_scatter_stream_blocks,
+    reduce_scatter_stream_generations,
+    reduce_scatter_stream_pieces,
+    reduce_scatter_stream_plan,
+    reduce_scatter_stream_wanted,
+)
 from nvls_kernels import (
     ERR_NVLS_SYNC,
     nvls_allreduce,
@@ -295,6 +324,25 @@ comptime PIPE_SPLIT_UNIT = 640_000
 
 def _pipe_split_unit() -> Int:
     return PIPE_SPLIT_UNIT
+
+
+comptime AG_NODE_BLOCKS = 96
+"""Grid cap of the node-local gathers of a multi-node all-gather, in place
+of the single-node copy cap (432). The gathers run under the forward's and
+backward's GEMMs, so the cap is fitted end to end, not on the isolated
+collective: GPT-2 XL FSDP2 on 2x8 H100, mojo+mojoccl tok/s at 32
+reduce-scatter CTAs (CUDA+NCCL 70.2k): 32 -> 66.5k, 64 -> 66.5-67.0k,
+96 -> 67.3-67.6k, 128 -> 65.3-66.7k; 432 with 128 reduce-scatter CTAs
+62.4k. Isolated, 64 blocks still beat NCCL (block bf16 0.92x, root fp32
+0.94x). NCCL's 16 CTAs are not the answer for a pull: 16 blocks x 16
+vectors in flight measures the same isolated time as 96 x 4 on the XL sizes
+(block 360 vs 348 us, root 1031 vs 1027) yet 63.1-64.8k tok/s end to end
+against 66.1-69.1k -- a latency-bound pull under the compute stream's HBM
+traffic loses far more from 6x fewer CTAs than the GEMMs gain from the
+freed SMs, and the compute stream waits on this gather."""
+comptime AG_NODE_UNROLL = 4
+"""16-byte vectors in flight per thread in those gathers; 8 measured
+66.1k tok/s against 67.3-67.6k at 96 blocks."""
 
 
 # MI300A: 64 MiB supports four ranks/node without the large shared-memory
@@ -966,6 +1014,8 @@ def _fault_kind(code: UInt64) -> String:
         return String("the broadcast")
     if c == ERR_ALLGATHER_SYNC:
         return String("the allgather")
+    if c == ERR_REDUCE_SCATTER_SYNC:
+        return String("the reduce-scatter")
     if c == ERR_RS_STAGE_SYNC:
         return String("the multi-node allreduce's reduce-scatter stage")
     if c == ERR_AG_FINISH_SYNC:
@@ -2644,6 +2694,28 @@ def _allreduce_locked(
         return NCCL_REMOTE_ERROR
     _order_before(state, stream)
     ref s = state.stream_cache[stream]
+    _enqueue_allreduce(
+        state, s, sendbuff, recvbuff, count, datatype, op, stream
+    )
+    return NCCL_SUCCESS
+
+
+def _enqueue_allreduce(
+    mut state: CommState,
+    s: DeviceStream,
+    sendbuff: Int64,
+    recvbuff: Int64,
+    count: Int64,
+    datatype: Int32,
+    op: Int32,
+    stream: Int64,
+) raises:
+    """Enqueue one reduction within an already-open collective order scope.
+
+    Reduce-scatter invokes this repeatedly while its outer operation owns
+    the communicator lock and completion event. It must not reopen the
+    submission scope between chunks.
+    """
     var scale = Float32(1.0)
     if op == NCCL_AVG:
         scale = Float32(1.0) / Float32(state.world)
@@ -2697,7 +2769,6 @@ def _allreduce_locked(
             Int(count),
             scale,
         )
-    return NCCL_SUCCESS
 
 
 @export
@@ -3008,6 +3079,192 @@ def _allgather_locked(
     return NCCL_SUCCESS
 
 
+def allgather_mapped_max_bytes(
+    arena_cap: Int, inbox_group: Int, npeers: Int
+) -> Int:
+    return min(arena_cap, inbox_group // npeers) // 16 * 16
+
+
+def _allgather_node_mapped(
+    mut state: CommState,
+    stream: DeviceStream,
+    arena: Int,
+    node: Int,
+    src: Int,
+    dst: Int,
+    count: Int,
+    stride: Int,
+    seq: Int = 0,
+    gated: Bool = False,
+) raises:
+    var ranks = StaticTuple[Int32, MAX_WORLD](fill=0)
+    for l in range(state.local_world):
+        ranks[l] = Int32(state.rank_at[node * state.local_world + l])
+    state.generation += 1
+    var mb_req = ib_mailbox_dev(state.ib)[0] if seq != 0 else 0
+    if gated:
+        allgather_mapped[AG_NODE_UNROLL, True](
+            state.ctx,
+            stream,
+            state.local_rank,
+            state.local_world,
+            _arena_regions(state, arena),
+            src,
+            dst,
+            count,
+            state.arena_cap,
+            state.generation,
+            stride,
+            ranks,
+            AG_NODE_BLOCKS,
+            mb_req,
+            seq,
+        )
+        return
+    allgather_mapped[AG_NODE_UNROLL](
+        state.ctx,
+        stream,
+        state.local_rank,
+        state.local_world,
+        _arena_regions(state, arena),
+        src,
+        dst,
+        count,
+        state.arena_cap,
+        state.generation,
+        stride,
+        ranks,
+        AG_NODE_BLOCKS,
+        mb_req,
+        seq,
+    )
+
+
+def allgather_mapped_pipeline_plan(
+    count: Int,
+    chunk_cap: Int,
+    narenas: Int,
+    nslots: Int,
+    split_threshold: Int,
+) raises -> Tuple[Int, Int, Int]:
+    if count <= 0 or chunk_cap < 16 or narenas <= 0 or nslots < 2:
+        raise Error("mojoccl: invalid mapped allgather pipeline geometry")
+    var chunk = chunk_cap
+    if count >= split_threshold:
+        chunk = min(chunk, _align_up((count + 1) // 2, 16))
+    var nchunks = (count + chunk - 1) // chunk
+    return Tuple(chunk, nchunks, min(2, min(narenas, min(nslots - 1, nchunks))))
+
+
+def _allgather_multinode_mapped(
+    mut state: CommState,
+    stream: DeviceStream,
+    raw_stream: Int64,
+    sendbuff: Int,
+    recvbuff: Int,
+    per_rank_bytes: Int,
+) raises:
+    if per_rank_bytes == 0:
+        return
+    var npeers = ib_npeers(state.ib)
+    var max_bytes = allgather_mapped_max_bytes(
+        state.arena_cap, _inbox_group_bytes(state), npeers
+    )
+    var plan = allgather_mapped_pipeline_plan(
+        per_rank_bytes,
+        max_bytes,
+        state.narenas,
+        state.nslots,
+        # Measured on 2x8 H100: overlap large gathers, retain the passing
+        # single-chunk route below this node-scaled threshold.
+        PIPE_SPLIT_UNIT * state.local_world,
+    )
+    var chunk_bytes = plan[0]
+    var nchunks = plan[1]
+    var depth = plan[2]
+    var seqs = List[Int](length=depth, fill=0)
+    for k in range(nchunks + depth - 1):
+        if k < nchunks:
+            var off = k * chunk_bytes
+            var count = min(chunk_bytes, per_rank_bytes - off)
+            var arena = k % depth
+            # The work item is filled before the gather launches; the gather
+            # itself releases the exchange once the contribution is staged.
+            var seq = ib_next_seq(state.ib)
+            var slot_bytes = _align_up(count, 16)
+            var inbox_base = _inbox_base(state, seq)
+            ib_prepare_request(
+                state.ib,
+                state.owned_base + arena * state.arena_stride + signal_bytes(),
+                count,
+                inbox_base,
+                slot_bytes,
+                True,
+                npeers,
+                state.owned_base + inbox_base,
+                seq,
+                OP_ALLGATHER,
+                k,
+                nchunks,
+                count,
+            )
+            _allgather_node_mapped(
+                state,
+                stream,
+                arena,
+                state.my_node,
+                sendbuff + off,
+                recvbuff + off,
+                count,
+                per_rank_bytes,
+                seq,
+            )
+            seqs[k % depth] = seq
+        var j = k - (depth - 1)
+        if j >= 0:
+            var off = j * chunk_bytes
+            var count = min(chunk_bytes, per_rank_bytes - off)
+            var slot_bytes = _align_up(count, 16)
+            var arena = j % depth
+            var seq = seqs[j % depth]
+            # Send completion protects this arena before the remote gathers
+            # reuse it; the next chunk reuses it only after those consumers.
+            ib_enqueue_wait(state.ib, state.ctx, stream, seq)
+            # The peers' exchanges retire at different times: wait for them
+            # on one SM (`rank_gate`), not in the first remote gather's
+            # start barrier with the whole grid resident.
+            state.generation += 1
+            rank_gate(
+                state.ctx,
+                stream,
+                state.local_rank,
+                state.local_world,
+                state.regions,
+                ERR_ALLGATHER_SYNC,
+                state.generation,
+            )
+            var slot = 0
+            for node in range(state.nnodes):
+                if node == state.my_node:
+                    continue
+                _allgather_node_mapped(
+                    state,
+                    stream,
+                    arena,
+                    node,
+                    state.owned_base
+                    + _inbox_base(state, seq)
+                    + slot * slot_bytes,
+                    recvbuff + off,
+                    count,
+                    per_rank_bytes,
+                    0,
+                    slot == 0,
+                )
+                slot += 1
+            ib_note_consumed(state.ib, seq)
+
+
 def _allgather_multinode(
     mut state: CommState,
     stream: DeviceStream,
@@ -3016,28 +3273,31 @@ def _allgather_multinode(
     recvbuff: Int,
     per_rank_bytes: Int,
 ) raises:
-    """Node-local allgather, one RDMA exchange of node blocks, then place.
-
-    Every rank ships its whole node block (`local_world * chunk` bytes)
-    rather than a share of it: at DDP's 8-byte allgather that is 64 bytes on
-    the wire and the simpler code is worth more than the bandwidth. Placement
-    reads the global rank of (node, local_rank) out of the bootstrap table --
-    torchrun makes it `node * local_world + local_rank`, but nothing here
-    assumes so.
-    """
+    """Exchange one contribution per NIC, disseminate on the receiving node."""
+    comptime if has_nvidia_gpu_accelerator():
+        _allgather_multinode_mapped(
+            state, stream, raw_stream, sendbuff, recvbuff, per_rank_bytes
+        )
+        return
     var lw = state.local_world
     var npeers = ib_npeers(state.ib)
     var block_stage = state.owned_base + _net_stage_off(state)
-    # One node block (lw * chunk) in the staging half; an inbox slot group
-    # has to hold npeers of them, and the node-local half runs in arena 0.
-    var max_block = min(
-        min(_net_stage_bytes(state), state.arena_cap),
-        _inbox_group_bytes(state) // npeers,
+    var max_bytes = (
+        min(
+            _net_stage_bytes(state) // lw,
+            min(
+                allgather_max_bytes(state.arena_cap, lw),
+                _inbox_group_bytes(state) // npeers,
+            ),
+        )
+        // 16
+        * 16
     )
-    var max_bytes = max(16, ((max_block - 8192) // lw) // 16 * 16)
+    if max_bytes < 16:
+        raise Error("mojoccl: allgather staging cannot hold one vector")
     var done = 0
-    var ag_chunk_index = 0
-    var ag_nchunks = (per_rank_bytes + max_bytes - 1) // max_bytes
+    var chunk_index = 0
+    var nchunks = (per_rank_bytes + max_bytes - 1) // max_bytes
     while done < per_rank_bytes:
         var chunk = min(max_bytes, per_rank_bytes - done)
         state.generation += 1
@@ -3055,19 +3315,18 @@ def _allgather_multinode(
             stride_bytes=chunk,
         )
         var seq = ib_next_seq(state.ib)
-        var block = lw * chunk
-        var slot_bytes = _align_up(block, 16)
-        if npeers * slot_bytes > _inbox_group_bytes(state):
-            raise Error("mojoccl: allgather inbox does not fit; chunking bug")
+        var slot_bytes = _align_up(chunk, 16)
         var inbox_base = _inbox_base(state, seq)
+        if npeers * slot_bytes > _inbox_group_bytes(state):
+            raise Error("mojoccl: allgather inbox does not fit")
         ib_enqueue_request(
             state.ib,
             state.driver,
             state.ctx,
             stream,
             Int(raw_stream),
-            block_stage,
-            block,
+            block_stage + state.local_rank * chunk,
+            chunk,
             inbox_base,
             slot_bytes,
             True,
@@ -3075,12 +3334,10 @@ def _allgather_multinode(
             state.owned_base + inbox_base,
             seq,
             OP_ALLGATHER,
-            ag_chunk_index,
-            ag_nchunks,
-            block,
+            chunk_index,
+            nchunks,
+            chunk,
         )
-        # Unpipelined, like broadcast: one exchange, waited for in place.
-        ib_enqueue_wait(state.ib, state.ctx, stream, seq)
         _place_node_block(
             state,
             stream,
@@ -3091,25 +3348,40 @@ def _allgather_multinode(
             done,
             per_rank_bytes,
         )
+        # Completion includes sends: staging is now safe to overwrite.
+        ib_enqueue_wait(state.ib, state.ctx, stream, seq)
         var slot = 0
-        for j in range(state.nnodes):
-            if j == state.my_node:
+        for node in range(state.nnodes):
+            if node == state.my_node:
                 continue
+            state.generation += 1
+            allgather(
+                state.ctx,
+                stream,
+                state.local_rank,
+                lw,
+                _arena_regions(state, 0),
+                state.owned_base + inbox_base + slot * slot_bytes,
+                block_stage,
+                chunk,
+                state.arena_cap,
+                state.generation,
+                stride_bytes=chunk,
+            )
             _place_node_block(
                 state,
                 stream,
                 recvbuff,
-                state.owned_base + inbox_base + slot * slot_bytes,
-                j,
+                block_stage,
+                node,
                 chunk,
                 done,
                 per_rank_bytes,
             )
             slot += 1
-        # `place_blocks` above is what read the inbox slots.
         ib_note_consumed(state.ib, seq)
         done += chunk
-        ag_chunk_index += 1
+        chunk_index += 1
 
 
 def _place_node_block(
@@ -3133,7 +3405,7 @@ def _place_node_block(
 
 
 # ---------------------------------------------------------------------------
-# Not implemented: DDP on GPT-2 needs only AllReduce/Broadcast/AllGather (+
+# Not implemented: Reduce and point-to-point operations (+
 # barrier, which routes to gloo -- see process_group.py). Returning
 # ncclInvalidUsage rather than silently mis-computing is the point.
 # ---------------------------------------------------------------------------
@@ -3163,7 +3435,520 @@ def ncclReduceScatter(
     comm: Int64,
     stream: Int64,
 ) abi("C") -> Int32:
-    return NCCL_INVALID_USAGE
+    try:
+        var item = _dtype_item_bytes(datatype)
+        if item == 0 or count < 0:
+            return NCCL_INVALID_ARGUMENT
+        if op != NCCL_SUM and op != NCCL_AVG:
+            return NCCL_INVALID_USAGE
+        if op == NCCL_AVG and (
+            datatype == NCCL_INT32 or datatype == NCCL_INT64
+        ):
+            return NCCL_INVALID_USAGE
+        ref state = _comm_ptr(comm)[]
+        _lock(state)
+        var rc = NCCL_INTERNAL_ERROR
+        try:
+            rc = _reduce_scatter_locked(
+                comm, sendbuff, recvbuff, Int(count), datatype, op, stream
+            )
+        except e:
+            rc = _submission_exception_code(state)
+            _unlock(state)
+            print("mojoccl: ncclReduceScatter failed:", e)
+            return rc
+        if rc == NCCL_SUCCESS:
+            try:
+                _order_after(state, stream)
+            except e:
+                _fail_submission(state)
+                _unlock(state)
+                raise e
+        _unlock(state)
+        return rc
+    except e:
+        print("mojoccl: ncclReduceScatter failed:", e)
+        return NCCL_INTERNAL_ERROR
+
+
+def _reduce_scatter_locked(
+    comm: Int64,
+    sendbuff: Int64,
+    recvbuff: Int64,
+    count: Int,
+    datatype: Int32,
+    op: Int32,
+    stream: Int64,
+) raises -> Int32:
+    """Push/reduce locally, then exchange destination shards across nodes."""
+    ref state = _comm_ptr(comm)[]
+    if state.aborted:
+        return NCCL_INVALID_USAGE
+    var latched = _latched_error(state)
+    if latched != NCCL_SUCCESS:
+        return latched
+    if state.order_incomplete:
+        return NCCL_REMOTE_ERROR
+    # Order before the first launch: the previous collective may have produced
+    # sendbuff on another stream. The exported wrapper records completion
+    # after every chunk, even when count is zero.
+    _order_before(state, stream)
+    ref s = state.stream_cache[stream]
+    if count == 0:
+        return NCCL_SUCCESS
+    if state.nnodes == 1:
+        var scale = Float32(1.0)
+        if op == NCCL_AVG:
+            scale = Float32(1.0) / Float32(state.world)
+        if datatype == NCCL_INT32:
+            _do_reduce_scatter[DType.int32](
+                state, s, Int(sendbuff), Int(recvbuff), count, scale
+            )
+        elif datatype == NCCL_INT64:
+            _do_reduce_scatter[DType.int64](
+                state, s, Int(sendbuff), Int(recvbuff), count, scale
+            )
+        elif datatype == NCCL_FLOAT16:
+            _do_reduce_scatter[DType.float16](
+                state, s, Int(sendbuff), Int(recvbuff), count, scale
+            )
+        elif datatype == NCCL_FLOAT32:
+            _do_reduce_scatter[DType.float32](
+                state, s, Int(sendbuff), Int(recvbuff), count, scale
+            )
+        else:  # NCCL_BFLOAT16, ruled in by _dtype_item_bytes above
+            _do_reduce_scatter[DType.bfloat16](
+                state, s, Int(sendbuff), Int(recvbuff), count, scale
+            )
+        return NCCL_SUCCESS
+    return _reduce_scatter_multinode(
+        state, s, sendbuff, recvbuff, count, datatype, op, stream
+    )
+
+
+def _do_reduce_scatter[
+    dtype: DType
+](
+    mut state: CommState,
+    s: DeviceStream,
+    sendbuff: Int,
+    recvbuff: Int,
+    count: Int,
+    scale: Float32,
+) raises:
+    """One node's reduce-scatter, chunked only if the arena cannot hold it."""
+    comptime item = size_of[dtype]()
+    var max_count = reduce_scatter_max_count(
+        state.cap_bytes, state.local_world, item
+    )
+    var done = 0
+    while done < count:
+        var chunk = min(max_count, count - done)
+        state.generation += 1
+        reduce_scatter[dtype](
+            state.ctx,
+            s,
+            state.local_rank,
+            state.local_world,
+            state.regions,
+            sendbuff + done * item,
+            recvbuff + done * item,
+            chunk,
+            state.cap_bytes,
+            scale,
+            state.generation,
+            in_stride=count,
+        )
+        done += chunk
+
+
+def _reduce_scatter_multinode(
+    mut state: CommState,
+    s: DeviceStream,
+    sendbuff: Int64,
+    recvbuff: Int64,
+    count: Int,
+    datatype: Int32,
+    op: Int32,
+    stream: Int64,
+) raises -> Int32:
+    var scale = Float32(1.0)
+    if op == NCCL_AVG:
+        scale /= Float32(state.world)
+    if datatype == NCCL_INT32:
+        _do_reduce_scatter_nodes[DType.int32](
+            state, s, stream, Int(sendbuff), Int(recvbuff), count, scale
+        )
+    elif datatype == NCCL_INT64:
+        _do_reduce_scatter_nodes[DType.int64](
+            state, s, stream, Int(sendbuff), Int(recvbuff), count, scale
+        )
+    elif datatype == NCCL_FLOAT16:
+        _do_reduce_scatter_nodes[DType.float16](
+            state, s, stream, Int(sendbuff), Int(recvbuff), count, scale
+        )
+    elif datatype == NCCL_FLOAT32:
+        _do_reduce_scatter_nodes[DType.float32](
+            state, s, stream, Int(sendbuff), Int(recvbuff), count, scale
+        )
+    else:
+        _do_reduce_scatter_nodes[DType.bfloat16](
+            state, s, stream, Int(sendbuff), Int(recvbuff), count, scale
+        )
+    return NCCL_SUCCESS
+
+
+def _reduce_scatter_partial(
+    state: CommState, arena: Int, slot_bytes: Int
+) -> Int:
+    return (
+        state.owned_base
+        + arena * state.arena_stride
+        + signal_bytes()
+        + (state.local_world - 1) * state.nnodes * slot_bytes
+    )
+
+
+def _do_reduce_scatter_fused(
+    mut state: CommState,
+    stream: DeviceStream,
+    sendbuff: Int,
+    recvbuff: Int,
+    count: Int,
+    scale: Float32,
+    chunk_elems: Int,
+    nchunks: Int,
+    depth: Int,
+) raises:
+    # Called only for fp32, after packed arena and inbox geometry validation.
+    if count <= 0 or chunk_elems <= 0 or nchunks <= 0 or nchunks > WORK_SLOTS:
+        raise Error("mojoccl: invalid fused reduce-scatter plan")
+    var npeers = ib_npeers(state.ib)
+    var group = _inbox_group_bytes(state)
+    if npeers * _align_up(min(chunk_elems, count) * 4, 16) > group:
+        raise Error("mojoccl: fused reduce-scatter inbox overflow")
+    var cap = (
+        RS_FUSED_BIG_BLOCKS if count * 4 >= PIPE_SPLIT_UNIT else state.fused_cap
+    )
+    var blocks = reduce_scatter_fused_blocks(
+        state.ctx,
+        state.local_world,
+        state.sm_count,
+        chunk_elems,
+        cap,
+    )
+    var rank_ids = reduce_scatter_rank_ids(state.rank_at)
+    var g0 = state.generation + 1
+    state.generation += nchunks
+    var seq0 = ib_reserve_seqs(state.ib, nchunks)
+    for k in range(nchunks):
+        var cnt = min(chunk_elems, count - k * chunk_elems)
+        var slot = _align_up(cnt * 4, 16)
+        var seq = seq0 + k
+        var inbox_base = _inbox_base(state, seq)
+        ib_prepare_request(
+            state.ib,
+            _reduce_scatter_partial(state, k % state.narenas, slot),
+            cnt * 4,
+            inbox_base,
+            slot,
+            True,
+            npeers,
+            state.owned_base + inbox_base,
+            seq,
+            OP_REDUCE_SCATTER,
+            k,
+            nchunks,
+            cnt,
+            send_node_stride=slot,
+        )
+    try:
+        rank_gate(
+            state.ctx,
+            stream,
+            state.local_rank,
+            state.local_world,
+            state.regions,
+            ERR_REDUCE_SCATTER_SYNC,
+            g0,
+        )
+        reduce_scatter_fused(
+            state.ctx,
+            stream,
+            state.local_rank,
+            state.local_world,
+            state.regions,
+            sendbuff,
+            recvbuff,
+            ib_mailbox_dev(state.ib),
+            count,
+            chunk_elems,
+            nchunks,
+            depth,
+            state.narenas,
+            state.arena_stride,
+            seq0,
+            state.net_off + state.cap_bytes // 2,
+            group,
+            state.nslots,
+            npeers,
+            state.nnodes,
+            state.my_node,
+            g0,
+            scale,
+            blocks,
+            spin_timeout_ns(),
+            rank_ids,
+        )
+    except e:
+        _latch_host_fault(state, ERR_HOST_LAUNCH, seq0)
+        raise e
+
+
+def _do_reduce_scatter_stream(
+    mut state: CommState,
+    stream: DeviceStream,
+    sendbuff: Int,
+    recvbuff: Int,
+    count: Int,
+    scale: Float32,
+    chunk_elems: Int,
+    nchunks: Int,
+    depth: Int,
+) raises:
+    # Called only for fp32, after packed arena and inbox geometry validation.
+    if count <= 0 or chunk_elems <= 0 or nchunks <= 0 or nchunks > WORK_SLOTS:
+        raise Error("mojoccl: invalid streaming reduce-scatter plan")
+    var npeers = ib_npeers(state.ib)
+    var group = _inbox_group_bytes(state)
+    if npeers * _align_up(min(chunk_elems, count) * 4, 16) > group:
+        raise Error("mojoccl: streaming reduce-scatter inbox overflow")
+    var cap = (
+        RS_STREAM_BIG_BLOCKS if count * 4 >= PIPE_SPLIT_UNIT else state.fused_cap
+    )
+    var blocks = reduce_scatter_stream_blocks(
+        state.ctx, state.local_world, state.sm_count, chunk_elems, cap
+    )
+    var pieces = reduce_scatter_stream_pieces(chunk_elems, blocks)
+    var rank_ids = reduce_scatter_rank_ids(state.rank_at)
+    var g0 = state.generation + 1
+    # The handoff counters run from `g0*PHASES_PER_GEN + 1` to
+    # `+ nchunks*pieces` and are never reset, so the call reserves that many.
+    state.generation += reduce_scatter_stream_generations(nchunks, pieces[1])
+    var seq0 = ib_reserve_seqs(state.ib, nchunks)
+    # One layout for every chunk of the call: the kernel's FREE credit is per
+    # block index and only covers the peers' same-indexed block, which is
+    # sound exactly while a short last chunk cannot re-cut the arena. The
+    # payload it sends is still its own `cnt`.
+    var slot = _align_up(chunk_elems * 4, 16)
+    for k in range(nchunks):
+        var cnt = min(chunk_elems, count - k * chunk_elems)
+        var seq = seq0 + k
+        var inbox_base = _inbox_base(state, seq)
+        ib_prepare_request(
+            state.ib,
+            _reduce_scatter_partial(state, k % state.narenas, slot),
+            cnt * 4,
+            inbox_base,
+            slot,
+            True,
+            npeers,
+            state.owned_base + inbox_base,
+            seq,
+            OP_REDUCE_SCATTER,
+            k,
+            nchunks,
+            cnt,
+            send_node_stride=slot,
+        )
+    try:
+        rank_gate(
+            state.ctx,
+            stream,
+            state.local_rank,
+            state.local_world,
+            state.regions,
+            ERR_REDUCE_SCATTER_SYNC,
+            g0,
+        )
+        reduce_scatter_stream(
+            state.ctx,
+            stream,
+            state.local_rank,
+            state.local_world,
+            state.regions,
+            sendbuff,
+            recvbuff,
+            ib_mailbox_dev(state.ib),
+            count,
+            chunk_elems,
+            nchunks,
+            depth,
+            state.narenas,
+            state.arena_stride,
+            seq0,
+            state.net_off + state.cap_bytes // 2,
+            group,
+            state.nslots,
+            npeers,
+            state.nnodes,
+            state.my_node,
+            g0,
+            scale,
+            blocks,
+            pieces[0],
+            pieces[1],
+            spin_timeout_ns(),
+            rank_ids,
+        )
+    except e:
+        _latch_host_fault(state, ERR_HOST_LAUNCH, seq0)
+        raise e
+
+
+def _do_reduce_scatter_nodes[
+    dtype: DType
+](
+    mut state: CommState,
+    stream: DeviceStream,
+    raw_stream: Int64,
+    sendbuff: Int,
+    recvbuff: Int,
+    count: Int,
+    scale: Float32,
+) raises:
+    comptime item = size_of[dtype]()
+    var npeers = ib_npeers(state.ib)
+    # Reduced destinations follow the push slots in the combined arena.
+    # Inbox groups are disjoint from both and credit protected.
+    var slot_cap = (
+        min(
+            reduce_scatter_nodes_max_count(
+                state.arena_cap, state.local_world, item, state.nnodes
+            )
+            * item,
+            _inbox_group_bytes(state) // npeers,
+        )
+        // 16
+        * 16
+    )
+    if slot_cap < 16:
+        raise Error("mojoccl: reduce-scatter staging cannot hold one vector")
+    var chunk_elems = min(count, slot_cap // item)
+    var nchunks = (count + chunk_elems - 1) // chunk_elems
+    var depth = min(state.narenas, nchunks)
+    comptime if dtype == DType.float32 and has_nvidia_gpu_accelerator():
+        if state.fused:
+            comptime if RS_STREAM_ENABLED:
+                if reduce_scatter_stream_wanted(count, PIPE_SPLIT_UNIT):
+                    var plan = reduce_scatter_stream_plan(
+                        count,
+                        chunk_elems,
+                        state.narenas,
+                        PIPE_SPLIT_UNIT,
+                    )
+                    if plan[1] <= WORK_SLOTS:
+                        _do_reduce_scatter_stream(
+                            state,
+                            stream,
+                            sendbuff,
+                            recvbuff,
+                            count,
+                            scale,
+                            plan[0],
+                            plan[1],
+                            plan[2],
+                        )
+                        return
+            var plan = reduce_scatter_fused_plan(
+                count,
+                chunk_elems,
+                state.narenas,
+                PIPE_SPLIT_UNIT,
+            )
+            if plan[1] <= WORK_SLOTS:
+                _do_reduce_scatter_fused(
+                    state,
+                    stream,
+                    sendbuff,
+                    recvbuff,
+                    count,
+                    scale,
+                    plan[0],
+                    plan[1],
+                    plan[2],
+                )
+                return
+    var rank_ids = reduce_scatter_rank_ids(state.rank_at)
+    var g0 = state.generation + 1
+    state.generation += nchunks
+    var seqs = List[Int](length=depth, fill=0)
+    for k in range(nchunks + depth - 1):
+        if k < nchunks:
+            var off = k * chunk_elems
+            var cnt = min(chunk_elems, count - off)
+            var slot = _align_up(cnt * item, 16)
+            var partials = _reduce_scatter_partial(
+                state, k % state.narenas, slot
+            )
+            reduce_scatter_nodes[dtype](
+                state.ctx,
+                stream,
+                state.local_rank,
+                state.local_world,
+                _arena_regions(state, k % state.narenas),
+                sendbuff + off * item,
+                partials,
+                cnt,
+                state.arena_cap,
+                scale,
+                g0 + k,
+                count,
+                rank_ids,
+                state.nnodes,
+            )
+            var seq = ib_next_seq(state.ib)
+            var inbox_base = _inbox_base(state, seq)
+            ib_enqueue_request(
+                state.ib,
+                state.driver,
+                state.ctx,
+                stream,
+                Int(raw_stream),
+                partials,
+                cnt * item,
+                inbox_base,
+                slot,
+                True,
+                npeers,
+                state.owned_base + inbox_base,
+                seq,
+                OP_REDUCE_SCATTER,
+                k,
+                nchunks,
+                cnt,
+                send_node_stride=slot,
+            )
+            seqs[k % depth] = seq
+        var j = k - (depth - 1)
+        if j >= 0:
+            var off = j * chunk_elems
+            var cnt = min(chunk_elems, count - off)
+            var slot = _align_up(cnt * item, 16)
+            var seq = seqs[j % depth]
+            ib_enqueue_wait(state.ib, state.ctx, stream, seq)
+            inbox_sum_out[dtype](
+                state.ctx,
+                stream,
+                recvbuff + off * item,
+                _reduce_scatter_partial(state, j % state.narenas, slot)
+                + state.my_node * slot,
+                state.owned_base + _inbox_base(state, seq),
+                cnt,
+                slot,
+                npeers,
+            )
+            ib_note_consumed(state.ib, seq)
 
 
 @export

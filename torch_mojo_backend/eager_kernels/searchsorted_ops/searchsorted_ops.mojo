@@ -217,9 +217,6 @@ def _searchsorted[
             ]
         ](
             ctx,
-            String(
-                t"binary_search_{dtype}_{out_dtype}_d1{boundaries_are_1d}_s{has_sorter}_r{right}"
-            ),
             _gs_blocks(num_values),
             1,
             1,

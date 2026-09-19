@@ -979,9 +979,6 @@ def _v4_enqueue_nn_persistent[
         dyn_smem=DYN_SMEM,
     ](
         ctx,
-        String(
-            t"g16v4p2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_{Int(tma_store)}{Int(col_a)}{Int(kmaj_b)}{Int(ragged_n)}"
-        ),
         grid_x,
         1,
         1,

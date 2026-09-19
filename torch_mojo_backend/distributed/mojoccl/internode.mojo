@@ -95,7 +95,7 @@
 
 from std.ffi import OwnedDLHandle, external_call
 from std.memory.alloc import unsafe_alloc
-from std.sys import size_of
+from std.sys import has_nvidia_gpu_accelerator, size_of
 from std.os import getenv
 from std.time import perf_counter_ns, sleep
 from std.utils import StaticTuple
@@ -181,6 +181,16 @@ comptime IB_ABORT_JOIN_TIMEOUT_S: Float64 = 2.0
 # ~20% of its steady-state tok/s against real NCCL, competing for a core/SMT
 # sibling with the ~760-aten-op-per-step host dispatch of the training loop.
 comptime DEFAULT_IB_PROXY_IDLE_US: Int = 20
+
+comptime BATCH_POLL_NS = 2_000_000
+"""How long the proxy keeps yielding rather than sleeping once a pipelined
+reduce-scatter or all-gather has released one chunk and more are due. The
+20 us nanosleep wakes after a median 75 us on this cluster (Nsight, 2x8
+H100), and a root reduce-scatter overlapped 11-13 of them: fused root fp32
+1263 -> 1181 us, block 617 -> 534 (NCCL 1051 / 522). Bounded so a stalled
+peer costs a burst of yields, not a hot core. GPT-2 XL FSDP2 on 2x8 H100
+measured 66.8k tok/s with it against 65.1k without. NVIDIA-only because
+that is where it was measured; AMD keeps the plain backoff."""
 # `cpu_set_t` size for `sched_getaffinity`/`pthread_setaffinity_np` on this
 # ABI: 128 bytes (1024 bits), shared by the default-pin CPU scan and the
 # explicit-CPU pin below.
@@ -216,6 +226,7 @@ comptime OP_UNKNOWN = 0
 comptime OP_ALLREDUCE = 1
 comptime OP_BROADCAST = 2
 comptime OP_ALLGATHER = 3
+comptime OP_REDUCE_SCATTER = 4
 """Which collective an exchange belongs to, carried in its work item for the
 stall messages only. `mojoccl.mojo` passes it to `ib_enqueue_request`."""
 
@@ -227,6 +238,8 @@ def _op_name(kind: Int) -> String:
         return String("broadcast")
     if kind == OP_ALLGATHER:
         return String("allgather")
+    if kind == OP_REDUCE_SCATTER:
+        return String("reduce_scatter")
     return String("?")
 
 
@@ -281,6 +294,7 @@ struct IbWork(Copyable, Movable):
     var state: Int
     var send_addr: Int
     var send_bytes: Int
+    var send_node_stride: Int  # zero broadcasts; otherwise one payload per node
     var inbox_base: Int  # region offset of this exchange's inbox slot group
     var slot_bytes: Int
     var do_send: Int
@@ -300,9 +314,8 @@ struct IbWork(Copyable, Movable):
     var t0: Int  # perf_counter_ns when it was posted, for the trace
     # What the host was issuing when it filled this slot -- kind (see
     # `_op_name`), which chunk of how many, and the chunk's element count.
-    # Diagnostics only: when a stall is reported, "the GPU has not released
-    # exchange 78" is a lot more useful as "exchange 78, allreduce chunk 3 of
-    # 14, 1703936 elements", and the two ends of a stall can be compared.
+    # Stall messages ("exchange 78, allreduce chunk 3 of 14, 1703936
+    # elements") and the proxy's between-chunk polling (`BATCH_POLL_NS`).
     var op_kind: Int
     var op_chunk: Int
     var op_nchunks: Int
@@ -312,6 +325,7 @@ struct IbWork(Copyable, Movable):
         self.state = 0
         self.send_addr = 0
         self.send_bytes = 0
+        self.send_node_stride = 0
         self.inbox_base = 0
         self.slot_bytes = 0
         self.do_send = 0
@@ -684,7 +698,7 @@ def _post_data(mut st: IbState, mut w: IbWork) -> Bool:
             rc = vrb_post_payload(
                 _vn(st)[],
                 i,
-                w.send_addr,
+                w.send_addr + p.node * w.send_node_stride,
                 w.send_bytes,
                 raddr,
                 p.remote_key,
@@ -695,7 +709,7 @@ def _post_data(mut st: IbState, mut w: IbWork) -> Bool:
             rc = fab_post_write(
                 _fn(st)[],
                 i,
-                w.send_addr,
+                w.send_addr + p.node * w.send_node_stride,
                 w.send_bytes,
                 raddr,
                 p.remote_key,
@@ -1063,6 +1077,10 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
     ref st = _st(Int(arg))[]
     var idle_ns = _proxy_idle_ns()
     var published = 0
+    # Last exchange of the multi-chunk collective being released, and how
+    # long to keep polling for its next chunk instead of sleeping.
+    var batch_end = 0
+    var batch_deadline = 0
     st.last_progress_ns = perf_counter_ns()
     while True:
         if (
@@ -1087,6 +1105,20 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
         if req > st.request_seq and not _comm_stopped(st):
             st.request_seq = req
             st.last_progress_ns = perf_counter_ns()
+            comptime if has_nvidia_gpu_accelerator():
+                batch_end = 0
+                # Read before ib_drive can retire and recycle this ring slot.
+                ref work = _work(st, req)[]
+                if (
+                    work.seq == req
+                    and (
+                        work.op_kind == OP_REDUCE_SCATTER
+                        or work.op_kind == OP_ALLGATHER
+                    )
+                    and 0 <= work.op_chunk < work.op_nchunks - 1
+                ):
+                    batch_end = req + work.op_nchunks - 1 - work.op_chunk
+                    batch_deadline = st.last_progress_ns + BATCH_POLL_NS
         var moved = ib_drive(st)
         if st.done_seq > published:
             # Published even on failure: the spin kernels must be released or
@@ -1099,6 +1131,17 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
         if moved or st.done_seq < st.request_seq:
             continue
         _ = external_call["sched_yield", Int32]()
+        comptime if has_nvidia_gpu_accelerator():
+            # Between chunks of one pipelined reduce-scatter or all-gather
+            # the next request is microseconds away and a nanosleep is not
+            # (see BATCH_POLL_NS): keep yielding until it lands.
+            if (
+                st.request_seq < batch_end
+                and perf_counter_ns() < batch_deadline
+                and not _comm_stopped(st)
+                and _load_atomic_i(_err_ptr(st)) == 0
+            ):
+                continue
         if Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
             _mb(st, MB_REQUEST)
         ) <= UInt64(st.request_seq):
@@ -1628,6 +1671,7 @@ def ib_prepare_request(
     op_chunk: Int = 0,
     op_nchunks: Int = 0,
     op_numel: Int = 0,
+    send_node_stride: Int = 0,
 ) raises:
     """Describe exchange `seq` for the engine without releasing it.
 
@@ -1660,6 +1704,7 @@ def ib_prepare_request(
         op_chunk,
         op_nchunks,
         op_numel,
+        send_node_stride,
     )
 
 
@@ -1792,6 +1837,7 @@ def _fill_work(
     op_chunk: Int = 0,
     op_nchunks: Int = 0,
     op_numel: Int = 0,
+    send_node_stride: Int = 0,
 ) raises:
     ref w = _work(st, seq)[]
     if may_wait:
@@ -1807,6 +1853,7 @@ def _fill_work(
     w.state = ib
     w.send_addr = send_addr
     w.send_bytes = send_bytes
+    w.send_node_stride = send_node_stride
     w.inbox_base = inbox_base
     w.slot_bytes = slot_bytes
     w.do_send = 1 if do_send else 0
@@ -1841,6 +1888,7 @@ def ib_enqueue_request(
     op_chunk: Int = 0,
     op_nchunks: Int = 0,
     op_numel: Int = 0,
+    send_node_stride: Int = 0,
 ) raises:
     """Release exchange `seq` to the network, at this point in stream order.
 
@@ -1874,6 +1922,7 @@ def ib_enqueue_request(
         op_chunk,
         op_nchunks,
         op_numel,
+        send_node_stride,
     )
     if st.proxy:
         proxy_request(ctx, stream, st.mailbox_dev + MB_REQUEST, seq)

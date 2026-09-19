@@ -674,7 +674,6 @@ def _var_moments[
             if inner == 1:
                 _enqueue_cached[_moments_contig_kernel[dtype]](
                     ctx,
-                    String(t"moments_contig_{dtype}"),
                     base_blocks,
                     1,
                     1,
@@ -691,7 +690,6 @@ def _var_moments[
             else:
                 _enqueue_cached[_moments_strided_kernel[dtype]](
                     ctx,
-                    String(t"moments_strided_{dtype}"),
                     base_blocks,
                     1,
                     1,
@@ -727,7 +725,6 @@ def _var_moments[
             if inner == 1:
                 _enqueue_cached[_moments_contig_kernel[dtype]](
                     ctx,
-                    String(t"moments_contig_{dtype}"),
                     base_blocks,
                     splits,
                     1,
@@ -744,7 +741,6 @@ def _var_moments[
             else:
                 _enqueue_cached[_moments_strided_kernel[dtype]](
                     ctx,
-                    String(t"moments_strided_{dtype}"),
                     base_blocks,
                     splits,
                     1,
@@ -766,7 +762,6 @@ def _var_moments[
             if outputs <= sm_count:
                 _enqueue_cached[_moments_merge_block_kernel[dtype]](
                     ctx,
-                    String(t"moments_merge_block_{dtype}"),
                     outputs,
                     1,
                     1,
@@ -784,7 +779,6 @@ def _var_moments[
             else:
                 _enqueue_cached[_moments_merge_thread_kernel[dtype]](
                     ctx,
-                    String(t"moments_merge_thread_{dtype}"),
                     ceildiv(outputs, MOMENT_THREADS),
                     1,
                     1,
@@ -1080,7 +1074,6 @@ def _log_softmax_rows[
                 blocks = min(rows, max(blocks, FILL))
                 _enqueue_cached[_log_softmax_rows_block_kernel[dtype, 1024]](
                     ctx,
-                    String(t"log_softmax_rows_{dtype}_1024"),
                     blocks,
                     1,
                     1,
@@ -1093,7 +1086,6 @@ def _log_softmax_rows[
             else:
                 _enqueue_cached[_log_softmax_rows_block_kernel[dtype, 256]](
                     ctx,
-                    String(t"log_softmax_rows_{dtype}_256"),
                     blocks,
                     1,
                     1,

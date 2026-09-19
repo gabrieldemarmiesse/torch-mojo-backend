@@ -876,25 +876,12 @@ def op_fused_sdp_choice(
 ) raises:
     """Which lower op `scaled_dot_product_attention` should call.
 
-    NOTE: ATen's composite reads `_fused_sdp_choice_stub` (a DispatchStub),
-    not this op, and nothing registers a PrivateUse1 entry in that stub -- so
-    today the composite always picks `math` on this device and this op is
-    reached only by a direct call. One line in the C++ shim
-    (`REGISTER_PRIVATEUSE1_DISPATCH(_fused_sdp_choice_stub, ...)` forwarding
-    here) is what would route `F.scaled_dot_product_attention` into the fused
-    kernels below.
+    ATen's composite reads `_fused_sdp_choice_stub` (a DispatchStub).
+    `native/csrc/shim_sdpa.cpp` registers its PrivateUse1 entry and forwards
+    to this op, so supported inputs select the fused kernels below.
 
-    The user's SDP backend switches are NOT honoured, because there is no
-    device-agnostic way to read them from here. They live on the global
-    `at::Context` (`userEnabledFlashSDP()` / `userEnabledMemEfficientSDP()` /
-    `userEnabledMathSDP()`, what `torch.backends.cuda.enable_flash_sdp()`
-    sets), and nothing in the `tmb_*` record ABI exposes them: no aten op
-    reports them and no shim entry point reads them. Honouring them needs
-    three one-line getters in `native/csrc/shim_runtime.cpp` next to
-    `tmb_float32_matmul_precision`, which reads `at::globalContext()` the
-    same way; until then a caller who disables flash still gets flash from a
-    direct call to this op (the composite, which is what those switches are
-    documented to steer, does not reach it at all).
+    The global CUDA SDP backend switches are not exposed through the native
+    ABI. This choice currently depends on the tensors and operation arguments.
     """
     var q = v_tensor(args[unsafe_offset=0])
     var k = v_tensor(args[unsafe_offset=1])

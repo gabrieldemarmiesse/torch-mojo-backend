@@ -976,6 +976,142 @@ def test_fill_through_a_transposed_view_keeps_the_allocation(mojo_device):
     assert bool(x.cpu().all())
 
 
+def _sqrt_ieee_input(count: int) -> torch.Tensor:
+    edges = torch.tensor(
+        [
+            0,
+            0x80000000,
+            1,
+            2,
+            3,
+            0x007FFFFF,
+            0x00800000,
+            0x00800001,
+            0x80000001,
+            0x807FFFFF,
+            0x80800000,
+            0x3F7FFFFF,
+            0x3F800000,
+            0x3F800001,
+            0x3FFFFFFF,
+            0x40000000,
+            0x40000001,
+            0x407FFFFF,
+            0x40800000,
+            0x40800001,
+            0x7F7FFFFF,
+            0xFF7FFFFF,
+            0x7F800000,
+            0xFF800000,
+            0x7FC00001,
+            0x7F800001,
+            0xFFC00001,
+            0xBF800000,
+        ],
+        dtype=torch.int64,
+    )
+    indices = torch.arange(count, dtype=torch.int64)
+    bits = (indices * 2654435761 + 13) & 0xFFFFFFFF
+    slots = indices % 32
+    special = slots < edges.numel()
+    bits[special] = edges[slots[special]]
+    return bits.to(torch.int32).view(torch.float32)
+
+
+_SQRT_SPANS = (
+    [(1029, src, dst, False) for src in range(4) for dst in range(4)]
+    + [
+        (size, 0, 0, False)
+        for size in [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            7,
+            15,
+            16,
+            17,
+            255,
+            256,
+            257,
+            1023,
+            1024,
+            1025,
+            1026,
+            1027,
+            1028,
+            4095,
+            4096,
+            4097,
+        ]
+    ]
+    + [
+        (size, offset, offset, alias)
+        for offset in range(4)
+        for size, alias in [(357 * 789, False), (357 * 789, True), (2, True)]
+    ]
+    + [(size, 0, 0, False) for size in [800, 3840000, 5120000, 40206400]]
+)
+
+
+@pytest.mark.parametrize("count,source_offset,destination_offset,alias", _SQRT_SPANS)
+def test_sqrt_ieee_spans(
+    mojo_gpu: str, count: int, source_offset: int, destination_offset: int, alias: bool
+):
+    host = _sqrt_ieee_input(count + 16)
+    source_storage = host.to(mojo_gpu)
+    source = source_storage[source_offset : source_offset + count]
+    storage = source_storage if alias else torch.full_like(source_storage, 17)
+    out = storage[destination_offset : destination_offset + count]
+    version = out._version
+    returned = source.sqrt_() if alias else torch.sqrt(source, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert out._version == version + 1
+    expected = host.clone() if alias else torch.full_like(host, 17)
+    expected[destination_offset : destination_offset + count] = (
+        host[source_offset : source_offset + count].double().sqrt().float()
+    )
+    actual = storage.cpu()
+    nan = torch.isnan(expected)
+    assert torch.equal(torch.isnan(actual), nan)
+    assert torch.equal(actual.view(torch.int32)[~nan], expected.view(torch.int32)[~nan])
+    if not alias:
+        assert torch.equal(
+            source_storage.cpu().view(torch.int32), host.view(torch.int32)
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
+)
+@pytest.mark.parametrize("layout", ["contiguous", "transposed", "strided"])
+def test_sqrt_dtype_layout_fallback(mojo_gpu: str, dtype: torch.dtype, layout: str):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal does not support float64")
+    host = torch.arange(1, 106, dtype=torch.float32).reshape(7, 15).to(dtype)
+    source = host.to(mojo_gpu)
+    if layout == "transposed":
+        host, source = host.t(), source.t()
+    elif layout == "strided":
+        host, source = host[:, ::2], source[:, ::2]
+    if dtype == torch.float64:
+        # The pre-existing SqrtSpec contract supports f32/f16/bf16 only.
+        with pytest.raises(NotImplementedError, match="dtype float64 is not supported"):
+            torch.sqrt(source)
+        return
+    expected = host.double().sqrt().to(dtype)
+    torch.testing.assert_close(torch.sqrt(source).cpu(), expected, rtol=0, atol=0)
+    storage = torch.full(
+        (source.shape[0], source.shape[1] * 2), -17.0, dtype=dtype, device=mojo_gpu
+    )
+    output = storage[:, ::2]
+    torch.sqrt(source, out=output)
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    assert torch.all(storage[:, 1::2].cpu() == -17)
+
+
 @pytest.mark.parametrize(
     "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
 )

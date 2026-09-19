@@ -471,7 +471,6 @@ def enqueue_foreach_gather_scalars_f32(
     comptime if has_accelerator():
         _enqueue_cached[_gather_scalars_kernel](
             ctx,
-            String("FOREACH_EW_GATHER_SCALARS_F32_V1"),
             1,
             1,
             1,
@@ -505,7 +504,6 @@ def enqueue_foreach_scalar_f32[
     comptime if has_accelerator():
         _enqueue_cached[_foreach_scalar_kernel[op_code]](
             ctx,
-            String(t"FOREACH_EW_SCALAR_{op_code}_F32_V1"),
             total_chunks,
             1,
             1,
@@ -537,7 +535,6 @@ def enqueue_foreach_mul_tensor_f32(
     comptime if has_accelerator():
         _enqueue_cached[_foreach_mul_tensor_kernel](
             ctx,
-            String("FOREACH_EW_MUL_TENSOR_F32_V1"),
             total_chunks,
             1,
             1,
@@ -572,7 +569,6 @@ def enqueue_foreach_lerp_f32(
     comptime if has_accelerator():
         _enqueue_cached[_foreach_lerp_kernel](
             ctx,
-            String("FOREACH_EW_LERP_F32_V1"),
             total_chunks,
             1,
             1,
@@ -618,7 +614,6 @@ def enqueue_foreach_addc_f32[
     comptime if has_accelerator():
         _enqueue_cached[_foreach_addc_kernel[op_code]](
             ctx,
-            String(t"FOREACH_EW_ADDC_{op_code}_F32_V1"),
             total_chunks,
             1,
             1,
@@ -666,7 +661,6 @@ def enqueue_foreach_sqrt_f32(
     comptime if has_accelerator():
         _enqueue_cached[_foreach_sqrt_kernel](
             ctx,
-            String("FOREACH_EW_SQRT_F32_V1"),
             total_chunks,
             1,
             1,

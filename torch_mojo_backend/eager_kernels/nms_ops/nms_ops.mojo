@@ -177,16 +177,13 @@ def _run_mask[dt: DType](argv: Argv) raises:
     var sms = max(1, _device_sm_count(ctx))
     # Portable initial occupancy choice; these constants are not hardware-fitted.
     var blocks = max(1, min((n + 255) // 256, sms * 4))
-    _enqueue_cached[_init](
-        ctx, "nms_order_init_i64", blocks, 1, 1, 256, order, Int64(n)
-    )
+    _enqueue_cached[_init](ctx, blocks, 1, 1, 256, order, Int64(n))
     var src = order
     var dst = temporary
     var width = 1
     while width < n:
         _enqueue_cached[_merge[dt]](
             ctx,
-            "nms_merge_" + String(dt),
             blocks,
             1,
             1,
@@ -207,7 +204,6 @@ def _run_mask[dt: DType](argv: Argv) raises:
     var cutoff = Float32(threshold).cast[acc]()
     _enqueue_cached[_mask[dt, acc]](
         ctx,
-        "nms_iou_mask_" + String(dt),
         min(columns * columns, sms * 8),
         1,
         1,
@@ -250,7 +246,6 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             )
             _enqueue_cached[_gather](
                 ctx,
-                "nms_keep_gather_i64",
                 blocks,
                 1,
                 1,

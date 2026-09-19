@@ -358,11 +358,15 @@ def test_cpu_collectives_through_gloo_delegation():
         dist.destroy_process_group()
 
 
-def _run_torchrun(nproc: int, mode: str, extra_env: dict[str, str] | None = None):
+def _run_torchrun(
+    nproc: int,
+    mode: str,
+    extra_env: dict[str, str] | None = None,
+    worker: Path = _WORKER,
+):
     env = dict(os.environ)
     # The worker pins per-rank visibility from LOCAL_RANK, slicing whichever
     # vendor list the launcher left (SLURM sets ROCR_VISIBLE_DEVICES on AMD).
-    env.pop("CUDA_VISIBLE_DEVICES", None)
     env.update(extra_env or {})
     result = subprocess.run(
         [
@@ -371,7 +375,7 @@ def _run_torchrun(nproc: int, mode: str, extra_env: dict[str, str] | None = None
             "torch.distributed.run",
             "--standalone",
             f"--nproc-per-node={nproc}",
-            str(_WORKER),
+            str(worker),
             mode,
         ],
         env=env,
@@ -397,7 +401,7 @@ def test_two_rank_nccl(mode: str, ccl: str):
     instead of vendor NCCL/RCCL — same process_group.py, same ddp_worker.py,
     only the loaded .so differs (nccl.py's `library_path()`). ddp_worker.py
     itself skips the collectives mojoccl does not implement yet (Reduce,
-    ReduceScatter, Send/Recv, AllToAll, Gather/Scatter) when this is set.
+    Send/Recv, AllToAll, Gather/Scatter) when this is set.
 
     `mode="stress"` hammers every collective back to back at mixed sizes; the
     mojoccl-only collectives inside it are skipped the same way `collectives`
@@ -410,5 +414,31 @@ def test_two_rank_nccl(mode: str, ccl: str):
     """
     if _gpu_count() < 2:
         pytest.skip("needs at least 2 GPUs")
-    extra_env = {"TORCH_MOJO_BACKEND_CCL": "mojo"} if ccl == "mojo" else None
+    extra_env = {"TORCH_MOJO_BACKEND_CCL": ccl}
     _run_torchrun(2, mode, extra_env)
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.parametrize("mode", ["parity", "reduce_scatter"])
+def test_two_rank_fsdp2(mode: str, ccl: str):
+    if _gpu_count() < 2:
+        pytest.skip("needs at least 2 GPUs")
+    extra_env = {"TORCH_MOJO_BACKEND_CCL": ccl}
+    _run_torchrun(2, mode, extra_env, Path(__file__).parent / "fsdp_worker.py")
+
+
+def test_two_rank_reduce_scatter_chunked():
+    """mojoccl's reduce-scatter over a region too small to hold the message.
+
+    One launch per call is the normal case (the push slots may use the whole
+    staging arena, 512 MiB at the default region), so the chunk loop —
+    offsets into the input, a `generation` per chunk — is only reached by a
+    message larger than that. A 1 MiB region puts the 700k-element cases of
+    `check_reduce_scatter` over it.
+    """
+    if _gpu_count() < 2:
+        pytest.skip("needs at least 2 GPUs")
+    extra_env = {"TORCH_MOJO_BACKEND_CCL": "mojo", "MOJOCCL_REGION_MB": "1"}
+    _run_torchrun(
+        2, "reduce_scatter", extra_env, Path(__file__).parent / "fsdp_worker.py"
+    )

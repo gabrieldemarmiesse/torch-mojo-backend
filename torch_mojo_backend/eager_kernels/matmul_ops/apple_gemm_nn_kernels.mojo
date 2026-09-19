@@ -425,10 +425,6 @@ def apple_nn_smem_enqueue[
             ]
         ](
             ctx,
-            String(
-                t"apple8_nn_smem_{BM}x{BN}x{BK}_{SGR}x{SGC}_p{PAD}_d{DOUBLE}"
-                t"_s{SWIZZLE}"
-            ),
             gx,
             gy,
             batch,
@@ -451,10 +447,6 @@ def apple_nn_smem_enqueue[
         _apple8_nn_smem_kernel[True, BM, BN, BK, SGR, SGC, PAD, DOUBLE, SWIZZLE]
     ](
         ctx,
-        String(
-            t"apple8_nn_smem_split_{BM}x{BN}x{BK}_{SGR}x{SGC}_p{PAD}"
-            t"_d{DOUBLE}_s{SWIZZLE}"
-        ),
         gx,
         gy,
         batch * ksplits,
@@ -472,7 +464,6 @@ def apple_nn_smem_enqueue[
     var c_out = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
     _enqueue_cached[_nn_ksplit_reduce_kernel](
         ctx,
-        String("nn_ksplit_reduce"),
         ceildiv(total, 1024),
         1,
         1,
@@ -724,7 +715,6 @@ def apple_nn_direct_enqueue[
             _apple8_nn_direct_kernel[False, BM, BN, SGR, SGC, SWIZZLE]
         ](
             ctx,
-            String(t"apple8_nn_direct_{BM}x{BN}_{SGR}x{SGC}_s{SWIZZLE}"),
             gx,
             gy,
             batch,
@@ -745,7 +735,6 @@ def apple_nn_direct_enqueue[
     ).as_unsafe_any_origin()
     _enqueue_cached[_apple8_nn_direct_kernel[True, BM, BN, SGR, SGC, SWIZZLE]](
         ctx,
-        String(t"apple8_nn_direct_split_{BM}x{BN}_{SGR}x{SGC}_s{SWIZZLE}"),
         gx,
         gy,
         batch * ksplits,
@@ -763,7 +752,6 @@ def apple_nn_direct_enqueue[
     var c_out = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
     _enqueue_cached[_nn_ksplit_reduce_kernel](
         ctx,
-        String("nn_ksplit_reduce"),
         ceildiv(total, 1024),
         1,
         1,

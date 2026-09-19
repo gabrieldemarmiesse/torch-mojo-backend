@@ -222,7 +222,6 @@ def _add_f32_bf16_contig(
     comptime if has_accelerator():
         _enqueue_cached[_add_f32_bf16_contig_kernel](
             ctx,
-            "add_f32_bf16_vec4",
             grid,
             1,
             1,
@@ -792,9 +791,6 @@ def _binary_bcast[
                                 ]
                             ](
                                 ctx,
-                                String(
-                                    t"lg_fv_{is_cmp}_{op_code}_{dtype}_{out_dtype}"
-                                ),
                                 blocks,
                                 1,
                                 1,
@@ -814,9 +810,6 @@ def _binary_bcast[
                                 ]
                             ](
                                 ctx,
-                                String(
-                                    t"lg_rv_{is_cmp}_{op_code}_{dtype}_{out_dtype}"
-                                ),
                                 max(1, min(rows, 65535)),
                                 1,
                                 1,
@@ -842,9 +835,6 @@ def _binary_bcast[
                                 ]
                             ](
                                 ctx,
-                                String(
-                                    t"lg_bc_{is_cmp}_{op_code}_{dtype}_{out_dtype}"
-                                ),
                                 _gs_blocks(total),
                                 1,
                                 1,

@@ -221,6 +221,12 @@ give up (internode_fused.mojo). Device memory, unlike the status page's abort
 word: every block reads it once per chunk, and that read has to be an L2 hit
 rather than a PCIe round trip."""
 
+comptime _AG_ARRIVE_OFFSET = 4032
+"""Arrival counter of the mapped all-gather's stage phase: the last block to
+finish staging this rank's contribution releases the chunk's RDMA exchange
+(`_allgather_body`). Per arena, rank-local, zeroed with the signal area and
+reset by the last arriver, so nothing carries across launches."""
+
 comptime _SIGNAL_BYTES = 128 * 1024
 """Signal-area size: 4 KiB header + MAX_BLOCKS*MAX_WORLD*8 B of flags = 68 KiB,
 rounded to 128 KiB. Two orders of magnitude below MAX's 24.75 MiB `Signal`."""
@@ -293,7 +299,10 @@ comptime ERR_BROADCAST_SYNC = 2
 comptime ERR_ALLGATHER_SYNC = 3
 comptime ERR_RS_STAGE_SYNC = 4
 comptime ERR_AG_FINISH_SYNC = 5
-# 6 is nvls_kernels.mojo's ERR_NVLS_SYNC; 7 and 8 are free.
+# 6 is nvls_kernels.mojo's ERR_NVLS_SYNC; 8 is free.
+comptime ERR_REDUCE_SCATTER_SYNC = 7
+"""`reduce_scatter`'s barriers: the push/reduce kernel that writes the user's
+output directly, not the split allreduce's `reduce_scatter_stage` (code 4)."""
 comptime ERR_PROXY_WAIT = 9
 """`internode_kernels.mojo`'s wait for the inter-node progress thread. The
 value is what that kernel has always written, so old logs still decode."""
@@ -666,8 +675,12 @@ def _sync(
     t0: UInt64,
     timeout_ns: UInt64,
     arena_off: Int = 0,
+    row: Int = -1,
 ) -> Bool:
     """Block-scoped barrier across the same block index on every rank.
+
+    `row` >= 0 uses that flag row instead of the block index: the gate
+    (`_rs_gate_kernel`) barriers a whole rank from one block on `GATE_ROW`.
 
     Thread `p` (p < world) publishes `target` into peer p's flags[bid][rank]
     -- after every payload write this block made into peer memory has landed,
@@ -723,7 +736,7 @@ def _sync(
 
     if Int(thread_idx.x) < world:
         var peer = Int(thread_idx.x)
-        var bid = Int(block_idx.x)
+        var bid = Int(block_idx.x) if row < 0 else row
         # The acquire stays an acquire *load*, per iteration. Spinning on a
         # relaxed load (still `sc0 sc1`, so it cannot read a stale flag) and
         # invalidating once after the wait looks exactly as strong, is worth
@@ -940,24 +953,19 @@ def _peer_step(i: Int, world: Int) -> Int:
     as the MI300A's xGMI mesh (one link per GPU pair): with the plain order
     the whole grid queues on one peer's link at a time and the other
     `world-2` links sit idle; rotated, the blocks spread over all of them at
-    once. Behind a switch (NVSwitch) the order is irrelevant. Measured on
-    4x MI300A: see docs/distributed.md, "Cluster notes (AMD MI300A)".
+    once. Measured on 4x MI300A: see docs/distributed.md, "Cluster notes
+    (AMD MI300A)". Behind NVSwitch it is not irrelevant either: with every
+    block of a rank storing into the same peer at once the 2x8 H100 fused
+    reduce-scatter's push ran at 291 GB/s per GPU, rotated 326 (block fp32
+    isolated 632 -> 618 us), so both vendors rotate.
     """
-    comptime if has_amd_gpu_accelerator():
-        return 1 + (i - 1 + Int(block_idx.x)) % (world - 1)
-    else:
-        # Behind NVSwitch the order is irrelevant; keep the H100-measured
-        # device code byte-identical.
-        return i
+    return 1 + (i - 1 + Int(block_idx.x)) % (world - 1)
 
 
 @always_inline
 def _peer_step0(i: Int, world: Int) -> Int:
     """`_peer_step` for loops that include the rank itself (0 <= i < world)."""
-    comptime if has_amd_gpu_accelerator():
-        return (i + Int(block_idx.x)) % world
-    else:
-        return i
+    return (i + Int(block_idx.x)) % world
 
 
 @always_inline
@@ -1029,11 +1037,21 @@ def _copy_vec[
                 (v + u * stride) * W, tmp[u]
             )
         v += U * stride
-    while v < nvec:
-        dst.unsafe_store[width=W, alignment=16](
-            v * W, src.unsafe_load[width=W, alignment=16](v * W)
-        )
-        v += stride
+    # The remainder is at most U-1 vectors per thread: issue every load
+    # before the first store, as the main loop does, rather than one round
+    # trip per vector. Same vector -> thread mapping either way.
+    if v < nvec:
+        var tmp = InlineArray[SIMD[dtype, W], U](uninitialized=True)
+        comptime for u in range(U):
+            if v + u * stride < nvec:
+                tmp[u] = src.unsafe_load[width=W, alignment=16](
+                    (v + u * stride) * W
+                )
+        comptime for u in range(U):
+            if v + u * stride < nvec:
+                dst.unsafe_store[width=W, alignment=16](
+                    (v + u * stride) * W, tmp[u]
+                )
 
 
 @always_inline
@@ -1075,11 +1093,95 @@ def _copy_bytes[
     var nvec = nbytes // 16
     if (Int(dst) | Int(src)) % 16 == 0:
         _copy_vec[DType.uint8, 16, U](dst, src, nvec, tid, stride)
+    elif (Int(dst) | Int(src)) % 4 == 0:
+        # Four 4-byte accesses per chunk instead of sixteen 1-byte ones: the
+        # common miss is a view whose element offset is not a multiple of the
+        # 16-byte width, which is still 4-byte aligned for every dtype wider
+        # than a byte.
+        var d4 = dst.unsafe_bitcast[UInt32]()
+        var s4 = src.unsafe_bitcast[UInt32]()
+        for v in range(tid, nvec, stride):
+            comptime for j in range(4):
+                d4[unsafe_offset=v * 4 + j] = s4[unsafe_offset=v * 4 + j]
     else:
         for v in range(tid, nvec, stride):
             comptime for j in range(16):
                 dst[unsafe_offset=v * 16 + j] = src[unsafe_offset=v * 16 + j]
     _copy_scalar_tail(dst, src, nvec * 16, nbytes - nvec * 16, tid, stride)
+
+
+@always_inline
+def _copy_bytes2[
+    U: Int
+](
+    dst_a: Pointer[UInt8, MutAnyOrigin],
+    dst_b: Pointer[UInt8, MutAnyOrigin],
+    src: Pointer[UInt8, MutAnyOrigin],
+    nbytes: Int,
+    tid: Int,
+    stride: Int,
+):
+    """`_copy_bytes` to two destinations, reading the source once.
+
+    The all-gather's local half writes my contribution both into my own
+    region (for the peers to read) and into my own slice of the output, and
+    the two copies together were two reads of it. One read and two stores
+    is a quarter less HBM traffic in that phase. Same 16-byte chunk ->
+    thread mapping as `_copy_bytes`, whatever path any of them takes.
+    """
+    var nvec = nbytes // 16
+    if (Int(dst_a) | Int(dst_b) | Int(src)) % 16 == 0:
+        var v = tid
+        var lim = nvec - (U - 1) * stride
+        while v < lim:
+            var tmp = InlineArray[SIMD[DType.uint8, 16], U](uninitialized=True)
+            comptime for u in range(U):
+                tmp[u] = src.unsafe_load[width=16, alignment=16](
+                    (v + u * stride) * 16
+                )
+            comptime for u in range(U):
+                dst_a.unsafe_store[width=16, alignment=16](
+                    (v + u * stride) * 16, tmp[u]
+                )
+                dst_b.unsafe_store[width=16, alignment=16](
+                    (v + u * stride) * 16, tmp[u]
+                )
+            v += U * stride
+        if v < nvec:
+            var tmp = InlineArray[SIMD[DType.uint8, 16], U](uninitialized=True)
+            comptime for u in range(U):
+                if v + u * stride < nvec:
+                    tmp[u] = src.unsafe_load[width=16, alignment=16](
+                        (v + u * stride) * 16
+                    )
+            comptime for u in range(U):
+                if v + u * stride < nvec:
+                    dst_a.unsafe_store[width=16, alignment=16](
+                        (v + u * stride) * 16, tmp[u]
+                    )
+                    dst_b.unsafe_store[width=16, alignment=16](
+                        (v + u * stride) * 16, tmp[u]
+                    )
+    elif (Int(dst_a) | Int(dst_b) | Int(src)) % 4 == 0:
+        var a4 = dst_a.unsafe_bitcast[UInt32]()
+        var b4 = dst_b.unsafe_bitcast[UInt32]()
+        var s4 = src.unsafe_bitcast[UInt32]()
+        for v in range(tid, nvec, stride):
+            comptime for j in range(4):
+                var x = s4[unsafe_offset=v * 4 + j]
+                a4[unsafe_offset=v * 4 + j] = x
+                b4[unsafe_offset=v * 4 + j] = x
+    else:
+        for v in range(tid, nvec, stride):
+            comptime for j in range(16):
+                var x = src[unsafe_offset=v * 16 + j]
+                dst_a[unsafe_offset=v * 16 + j] = x
+                dst_b[unsafe_offset=v * 16 + j] = x
+    var base = nvec * 16
+    for i in range(tid, nbytes - base, stride):
+        var x = src[unsafe_offset=base + i]
+        dst_a[unsafe_offset=base + i] = x
+        dst_b[unsafe_offset=base + i] = x
 
 
 @always_inline
@@ -1095,6 +1197,35 @@ def _copy_span[
     """`count` elements: the 16-byte vectors, then the `count % W` tail."""
     var vc = count // W
     _copy_vec[dtype, W, U](dst, src, vc, tid, stride)
+    _copy_scalar_tail(dst, src, vc * W, count - vc * W, tid, stride)
+
+
+@always_inline
+def _copy_span_flex[
+    dtype: DType, W: Int, U: Int
+](
+    dst: Pointer[Scalar[dtype], MutAnyOrigin],
+    src: Pointer[Scalar[dtype], MutAnyOrigin],
+    count: Int,
+    tid: Int,
+    stride: Int,
+    vec: Bool,
+):
+    """`_copy_span` where 16-byte vectors are allowed, else the same
+    W-element groups moved one element at a time.
+
+    Both paths hand group `g` to the same thread, so a reader taking the other
+    path still reads only what its own block index wrote -- the rule
+    `_copy_bytes` documents, here because the two ranks of one push are
+    different pointers and may disagree about alignment.
+    """
+    if vec:
+        _copy_span[dtype, W, U](dst, src, count, tid, stride)
+        return
+    var vc = count // W
+    for v in range(tid, vc, stride):
+        comptime for e in range(W):
+            dst[unsafe_offset=v * W + e] = src[unsafe_offset=v * W + e]
     _copy_scalar_tail(dst, src, vc * W, count - vc * W, tid, stride)
 
 
@@ -1134,17 +1265,19 @@ def _copy_span_scaled[
                         (tmp[u].cast[accum]() * sv).cast[dtype](),
                     )
                 v += U * stride
-            while v < vc:
-                dst.unsafe_store[width=W, alignment=16](
-                    v * W,
-                    (
-                        src.unsafe_load[width=W, alignment=16](v * W).cast[
-                            accum
-                        ]()
-                        * sv
-                    ).cast[dtype](),
-                )
-                v += stride
+            if v < vc:
+                var tmp = InlineArray[SIMD[dtype, W], U](uninitialized=True)
+                comptime for u in range(U):
+                    if v + u * stride < vc:
+                        tmp[u] = src.unsafe_load[width=W, alignment=16](
+                            (v + u * stride) * W
+                        )
+                comptime for u in range(U):
+                    if v + u * stride < vc:
+                        dst.unsafe_store[width=W, alignment=16](
+                            (v + u * stride) * W,
+                            (tmp[u].cast[accum]() * sv).cast[dtype](),
+                        )
             for i in range(tid, count - vc * W, stride):
                 var k = vc * W + i
                 dst[unsafe_offset=k] = (
@@ -1152,6 +1285,28 @@ def _copy_span_scaled[
                 ).cast[dtype]()
             return
     _copy_span[dtype, W, U](dst, src, count, tid, stride)
+
+
+@always_inline
+def _share[
+    accum: DType, W: Int
+](v: SIMD[accum, W], scale: Float32) -> SIMD[accum, W]:
+    """One rank's contribution to an AVG: scaled BEFORE it joins the sum.
+
+    Scaling the finished sum instead overflows where NCCL does not -- two fp32
+    ranks contributing 2**127 average to inf rather than to 2**127 -- and for
+    a power-of-two world x/world is exact away from the subnormal range (a
+    contribution below 2**-149 * world rounds to zero before the sum), so the
+    result matches post-scaling everywhere else. This is NCCL's PreMulSum for
+    AVG (nccl:src/enqueue/enqueue.cc:2517) applied in the fp32 accumulator
+    rather than in the tensor dtype, and what the NVLS path already does at
+    copy-in. Integer dtypes ignore `scale`, as ncclAvg does; `scale` is 1 for
+    SUM, and the multiply by it is exact.
+    """
+    comptime if accum.is_floating_point():
+        return v * SIMD[accum, W](scale.cast[accum]())
+    else:
+        return v
 
 
 # ===-------------------------------------------------------------------=== #
@@ -1377,31 +1532,33 @@ def _ar_twoshot_kernel[
             )
 
     for v in range(tid, my_vc, stride):
-        var acc = uin.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
+        var acc = _share(
+            uin.unsafe_load[width=W, alignment=16](v * W).cast[accum](), scale
+        )
         comptime if NW > 0:
             comptime for j in range(1, NW):
                 var p = rank + j
                 if p >= NW:
                     p -= NW
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(slot_stride * p)
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
         else:
             for j in range(1, world):
                 var p = rank + j
                 if p >= world:
                     p -= world
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(slot_stride * p)
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
-        comptime if accum.is_floating_point():
-            acc *= SIMD[accum, W](scale.cast[accum]())
         var res = acc.cast[dtype]()
         comptime if not _AMD:
             shard.unsafe_store[width=W, alignment=16](v * W, res)
@@ -1417,18 +1574,17 @@ def _ar_twoshot_kernel[
 
     for i in range(tid, my_tail, stride):
         var k = my_vc * W + i
-        var a = uin[unsafe_offset=k].cast[accum]()
+        var a = _share[accum, 1](uin[unsafe_offset=k].cast[accum](), scale)
         for j in range(1, world):
             var p = rank + j
             if p >= world:
                 p -= world
-            a += (
+            a += _share[accum, 1](
                 slots.unsafe_offset(slot_stride * p)
                 .unsafe_bitcast[Scalar[dtype]]()[unsafe_offset=k]
-                .cast[accum]()
+                .cast[accum](),
+                scale,
             )
-        comptime if accum.is_floating_point():
-            a *= scale.cast[accum]()
         comptime if not _AMD:
             shard[unsafe_offset=k] = a.cast[dtype]()
         uout[unsafe_offset=k] = a.cast[dtype]()
@@ -1557,47 +1713,49 @@ def _ar_oneshot_kernel[
     var slots = regions[rank].unsafe_offset(push_off)
 
     for v in range(tid, nvec, stride):
-        var acc = in_ptr.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
+        var acc = _share(
+            in_ptr.unsafe_load[width=W, alignment=16](v * W).cast[accum](),
+            scale,
+        )
         comptime if NW > 0:
             comptime for j in range(1, NW):
                 var p = rank + j
                 if p >= NW:
                     p -= NW
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(slot_stride * p)
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
         else:
             for j in range(1, world):
                 var p = rank + j
                 if p >= world:
                     p -= world
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(slot_stride * p)
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
-        comptime if accum.is_floating_point():
-            acc *= SIMD[accum, W](scale.cast[accum]())
         out_ptr.unsafe_store[width=W, alignment=16](v * W, acc.cast[dtype]())
 
     for i in range(tid, tail, stride):
         var k = nvec * W + i
-        var a = in_ptr[unsafe_offset=k].cast[accum]()
+        var a = _share[accum, 1](in_ptr[unsafe_offset=k].cast[accum](), scale)
         for j in range(1, world):
             var p = rank + j
             if p >= world:
                 p -= world
-            a += (
+            a += _share[accum, 1](
                 slots.unsafe_offset(slot_stride * p)
                 .unsafe_bitcast[Scalar[dtype]]()[unsafe_offset=k]
-                .cast[accum]()
+                .cast[accum](),
+                scale,
             )
-        comptime if accum.is_floating_point():
-            a *= scale.cast[accum]()
         out_ptr[unsafe_offset=k] = a.cast[dtype]()
 
 
@@ -1744,12 +1902,11 @@ def _rs_stage_body[
         return False
 
     # --- phase 2: sum the `world` contributions to my shard into stage_out --
-    # Times `scale`, applied in the fp32 accumulator BEFORE the store narrows
-    # to the wire dtype: the inter-node step sums these node partials again in
-    # that dtype, and an unscaled fp16 sum of 8 x 10000 is already inf. This
-    # is NCCL's PreMulSum for AVG (nccl:src/enqueue/enqueue.cc:2517), and for
-    # a power-of-two communicator x/world is exact, so it rounds no more than
-    # the plain sum would. `allgather_finish` then runs with scale 1.
+    # Every contribution is scaled as it enters the fp32 accumulator
+    # (`_share`), so the store to the wire dtype carries an average and never
+    # a sum: the inter-node step sums these node partials again in that dtype,
+    # and an unscaled fp16 sum of 8 x 10000 is already inf.
+    # `allgather_finish` then runs with scale 1.
     var my_off = _shard_off(n, per, rank)
     var my_cnt = _shard_cnt(n, per, rank)
     if my_cnt <= 0:
@@ -1767,51 +1924,52 @@ def _rs_stage_body[
     var my_vc = my_cnt // W
 
     for v in range(tid, my_vc, stride):
-        var acc = uin.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
+        var acc = _share(
+            uin.unsafe_load[width=W, alignment=16](v * W).cast[accum](), scale
+        )
         comptime if NW > 0:
             comptime for j in range(1, NW):
                 var p = rank + j
                 if p >= NW:
                     p -= NW
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(
                         slot_stride * (p if p < rank else p - 1)
                     )
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
         else:
             for j in range(1, world):
                 var p = rank + j
                 if p >= world:
                     p -= world
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(
                         slot_stride * (p if p < rank else p - 1)
                     )
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
-        comptime if accum.is_floating_point():
-            acc *= SIMD[accum, W](scale.cast[accum]())
         shard.unsafe_store[width=W, alignment=16](v * W, acc.cast[dtype]())
 
     for i in range(tid, my_cnt - my_vc * W, stride):
         var k = my_vc * W + i
-        var a = uin[unsafe_offset=k].cast[accum]()
+        var a = _share[accum, 1](uin[unsafe_offset=k].cast[accum](), scale)
         for j in range(1, world):
             var p = rank + j
             if p >= world:
                 p -= world
-            a += (
+            a += _share[accum, 1](
                 slots.unsafe_offset(slot_stride * (p if p < rank else p - 1))
                 .unsafe_bitcast[Scalar[dtype]]()[unsafe_offset=k]
-                .cast[accum]()
+                .cast[accum](),
+                scale,
             )
-        comptime if accum.is_floating_point():
-            a *= scale.cast[accum]()
         shard[unsafe_offset=k] = a.cast[dtype]()
     return True
 
@@ -1950,6 +2108,211 @@ def _ag_finish_kernel[
         device_now_ns(),
         timeout_ns,
     )
+
+
+# ===-------------------------------------------------------------------=== #
+# Reduce-scatter -- push + reduce, straight into the user's output
+# ===-------------------------------------------------------------------=== #
+#
+# `out[i] = scale * sum over ranks r of in_r[rank*in_stride + i]`, which is
+# what ncclReduceScatter means. Two phases, two barriers, no pull and no
+# staging of the result:
+#
+#   phase 1  PUSH   rank r reads chunk s of its own input and writes it into
+#                   peer s's compacted slot r. That write IS the wire
+#                   transfer, exactly as in the allreduce's phase 1.
+#   phase 2  REDUCE every rank sums its own chunk (straight from user memory)
+#                   and the `world-1` pushed slots, scales, and stores the
+#                   result into `out_ptr`.
+#
+# Cross-link traffic is `(world-1)/world * bytes` per GPU, the unicast
+# minimum, and all of it is in the WRITE direction -- so unlike the allreduce
+# and the all-gather this schedule needs no separate AMD variant (module
+# header, "Link direction"): no rank ever loads across a link.
+#
+# Slots are compacted like the split allreduce's (`world-1` of them, writer r
+# into destination s's slot `r if r < s else r-1`), and they may use the whole
+# `2*cap` arena: the start barrier is what orders a generation's writes after
+# every peer's previous reads, so one call owning the arena needs no
+# reservation -- the same reason the NVLS allreduce stages one buffer across
+# both halves. `reduce_scatter_max_count` is that bound, and at the default
+# region every size FSDP2 asks for is one launch.
+#
+# In place is safe in NCCL's sense (`recvbuff == sendbuff + rank*count`): the
+# push loop never reads chunk `rank`, and in phase 2 each thread writes only
+# the elements it just read.
+#
+# `vector_ok` is per rank and the host computes it: 16-byte vectors when
+# in_ptr, out_ptr and the input stride all allow them, W-element scalar
+# groups when one does not. Both walk the same groups in the same order, so
+# two ranks may disagree about it (see `_copy_span_flex`).
+
+
+@always_inline
+def _rs_slot[
+    dtype: DType
+](
+    slots: Pointer[UInt8, MutAnyOrigin], slot_stride: Int, p: Int, rank: Int
+) -> Pointer[Scalar[dtype], MutAnyOrigin]:
+    """Peer `p`'s compacted push slot inside my own arena."""
+    return slots.unsafe_offset(
+        slot_stride * (p if p < rank else p - 1)
+    ).unsafe_bitcast[Scalar[dtype]]()
+
+
+@always_inline
+def _rs_one[
+    dtype: DType, accum: DType
+](
+    uin: Pointer[Scalar[dtype], MutAnyOrigin],
+    slots: Pointer[UInt8, MutAnyOrigin],
+    slot_stride: Int,
+    world: Int,
+    rank: Int,
+    k: Int,
+    scale: Float32,
+) -> Scalar[dtype]:
+    """Element `k` of my reduced chunk: my own input plus the pushed slots."""
+    var a = _share[accum, 1](uin[unsafe_offset=k].cast[accum](), scale)
+    for j in range(1, world):
+        var p = rank + j
+        if p >= world:
+            p -= world
+        a += _share[accum, 1](
+            _rs_slot[dtype](slots, slot_stride, p, rank)[unsafe_offset=k].cast[
+                accum
+            ](),
+            scale,
+        )
+    return a.cast[dtype]()
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name(t"ccl_reduce_scatter_push_reduce_{dtype}_w{NW}")
+def _rs_kernel[
+    dtype: DType, W: Int, U: Int, NW: Int
+](
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    count: Int64,
+    in_stride_e: Int64,
+    slot_stride_b: Int64,
+    push_off_b: Int64,
+    world_i: Int32,
+    rank_i: Int32,
+    flag_base: UInt64,
+    scale: Float32,
+    timeout_ns: UInt64,
+    vector_ok: Int32,
+):
+    comptime accum = DType.float32 if (
+        dtype == DType.bfloat16 or dtype == DType.float16
+    ) else dtype
+    var t0 = device_now_ns()
+    var world = NW if NW > 0 else Int(world_i)
+    var rank = Int(rank_i)
+    var tid = Int(global_idx.x)
+    var stride = Int(grid_dim.x) * BLOCK
+    var n = Int(count)
+    var in_stride = Int(in_stride_e)
+    var slot_stride = Int(slot_stride_b)
+    var push_off = Int(push_off_b)
+    var vec = vector_ok != 0
+
+    # --- phase 0: start barrier (the arena-reuse invariant) -----------------
+    if not _sync(
+        regions,
+        world,
+        rank,
+        ERR_REDUCE_SCATTER_SYNC,
+        flag_base,
+        t0,
+        timeout_ns,
+    ):
+        return
+
+    # --- phase 1: push chunk s of my input into peer s's slot for me --------
+    for i in range(1, world):
+        var s = rank + _peer_step(i, world)
+        if s >= world:
+            s -= world
+        var dst = (
+            regions[s]
+            .unsafe_offset(
+                push_off + slot_stride * (rank if rank < s else rank - 1)
+            )
+            .unsafe_bitcast[Scalar[dtype]]()
+        )
+        _copy_span_flex[dtype, W, U](
+            dst, in_ptr.unsafe_offset(s * in_stride), n, tid, stride, vec
+        )
+
+    if not _sync(
+        regions,
+        world,
+        rank,
+        ERR_REDUCE_SCATTER_SYNC,
+        flag_base + 1,
+        t0,
+        timeout_ns,
+    ):
+        return
+
+    # --- phase 2: sum the `world` contributions to my chunk into the output -
+    # Each contribution is scaled as it enters the fp32 accumulator
+    # (`_share`), not the finished sum.
+    var uin = in_ptr.unsafe_offset(rank * in_stride)
+    var slots = regions[rank].unsafe_offset(push_off)
+    var vc = n // W
+    if vec:
+        for v in range(tid, vc, stride):
+            var acc = _share(
+                uin.unsafe_load[width=W, alignment=16](v * W).cast[accum](),
+                scale,
+            )
+            # Slot pointers are formed by arithmetic, never held in a stack
+            # array: such an array is demoted to local memory (MOCO-1431).
+            comptime if NW > 0:
+                comptime for j in range(1, NW):
+                    var p = rank + j
+                    if p >= NW:
+                        p -= NW
+                    acc += _share(
+                        _rs_slot[dtype](slots, slot_stride, p, rank)
+                        .unsafe_load[width=W, alignment=16](v * W)
+                        .cast[accum](),
+                        scale,
+                    )
+            else:
+                for j in range(1, world):
+                    var p = rank + j
+                    if p >= world:
+                        p -= world
+                    acc += _share(
+                        _rs_slot[dtype](slots, slot_stride, p, rank)
+                        .unsafe_load[width=W, alignment=16](v * W)
+                        .cast[accum](),
+                        scale,
+                    )
+            out_ptr.unsafe_store[width=W, alignment=16](
+                v * W, acc.cast[dtype]()
+            )
+    else:
+        for v in range(tid, vc, stride):
+            comptime for e in range(W):
+                var k = v * W + e
+                out_ptr[unsafe_offset=k] = _rs_one[dtype, accum](
+                    uin, slots, slot_stride, world, rank, k, scale
+                )
+
+    for i in range(tid, n - vc * W, stride):
+        var k = vc * W + i
+        out_ptr[unsafe_offset=k] = _rs_one[dtype, accum](
+            uin, slots, slot_stride, world, rank, k, scale
+        )
 
 
 # ===-------------------------------------------------------------------=== #
@@ -2110,12 +2473,18 @@ def _bcast_kernel[
             )
 
 
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
-)
-@__name("ccl_allgather_bytes")
-def _allgather_kernel[
-    U: Int
+@always_inline
+def _allgather_rank[
+    MAPPED: Bool
+](rank_at: InlineArray[Int32, MAX_WORLD], rank: Int) -> Int:
+    comptime if MAPPED:
+        return Int(rank_at[rank])
+    return rank
+
+
+@always_inline
+def _allgather_body[
+    U: Int, MAPPED: Bool, GATED: Bool
 ](
     regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[UInt8, MutAnyOrigin],
@@ -2127,6 +2496,9 @@ def _allgather_kernel[
     rank_i: Int32,
     flag_base: UInt64,
     timeout_ns: UInt64,
+    rank_at: InlineArray[Int32, MAX_WORLD],
+    mb_req: Pointer[UInt64, MutAnyOrigin],
+    seq: UInt64,
 ):
     """Local stage + peer gather -- already the unicast minimum: `nbytes` of
     local copy and `(world-1)*nbytes` of peer reads per GPU.
@@ -2134,6 +2506,14 @@ def _allgather_kernel[
     Rank r's contribution lands at `out_ptr + r*stride_b`; `stride_b` is the
     output layout's true per-rank size, which differs from `nbytes` when the
     caller splits one rank's contribution across several calls.
+
+    `seq != 0` (mapped, NVIDIA): the staged contribution is also this
+    chunk's RDMA payload, and the last block to finish staging stores `seq`
+    into the proxy mailbox `mb_req`, so the NIC reads it while the peer pulls
+    run instead of after them. The arrival RMWs are release, the last one
+    acquire-release, so every block's stage stores are ordered before that
+    mailbox store; the counter is reset by the last arriver and the next
+    launch on this arena is stream-ordered behind this kernel.
     """
     var t0 = device_now_ns()
     var world = Int(world_i)
@@ -2157,7 +2537,13 @@ def _allgather_kernel[
         ):
             return
         _copy_bytes[U](
-            out_ptr.unsafe_offset(rank * out_stride), in_ptr, n, tid, stride
+            out_ptr.unsafe_offset(
+                _allgather_rank[MAPPED](rank_at, rank) * out_stride
+            ),
+            in_ptr,
+            n,
+            tid,
+            stride,
         )
         for i in range(1, world):
             var p = rank + _peer_step(i, world)
@@ -2187,7 +2573,9 @@ def _allgather_kernel[
             if p >= world:
                 p -= world
             _copy_bytes[U](
-                out_ptr.unsafe_offset(p * out_stride),
+                out_ptr.unsafe_offset(
+                    _allgather_rank[MAPPED](rank_at, p) * out_stride
+                ),
                 regions[rank].unsafe_offset(
                     stage_off + slot * _gather_slot(p, rank)
                 ),
@@ -2197,17 +2585,42 @@ def _allgather_kernel[
             )
         return
 
-    if not _sync(
-        regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
-    ):
-        return
+    # A GATED caller ran `_gate_kernel` ahead of the grid instead.
+    comptime if not GATED:
+        if not _sync(
+            regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
+        ):
+            return
 
-    _copy_bytes[U](
-        regions[rank].unsafe_offset(stage_off), in_ptr, n, tid, stride
+    # One read of my contribution, two stores: my region (what the peers
+    # read) and my own slice of the output.
+    _copy_bytes2[U](
+        regions[rank].unsafe_offset(stage_off),
+        out_ptr.unsafe_offset(
+            _allgather_rank[MAPPED](rank_at, rank) * out_stride
+        ),
+        in_ptr,
+        n,
+        tid,
+        stride,
     )
-    _copy_bytes[U](
-        out_ptr.unsafe_offset(rank * out_stride), in_ptr, n, tid, stride
-    )
+    comptime if MAPPED:
+        if seq != 0:
+            barrier()
+            if thread_idx.x == 0:
+                var arrive = regions[rank].unsafe_offset(
+                    _AG_ARRIVE_OFFSET
+                ).unsafe_bitcast[UInt64]()
+                var was = Atomic[DType.uint64].fetch_add[
+                    ordering=Ordering.ACQUIRE_RELEASE
+                ](arrive, UInt64(1))
+                if Int(was) == Int(grid_dim.x) - 1:
+                    Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
+                        arrive, UInt64(0)
+                    )
+                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+                        mb_req, seq
+                    )
 
     if not _sync(
         regions, world, rank, ERR_ALLGATHER_SYNC, flag_base + 1, t0, timeout_ns
@@ -2219,12 +2632,162 @@ def _allgather_kernel[
         if p >= world:
             p -= world
         _copy_bytes[U](
-            out_ptr.unsafe_offset(p * out_stride),
+            out_ptr.unsafe_offset(
+                _allgather_rank[MAPPED](rank_at, p) * out_stride
+            ),
             regions[p].unsafe_offset(stage_off),
             n,
             tid,
             stride,
         )
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name("ccl_allgather_bytes")
+def _allgather_kernel[
+    U: Int
+](
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    in_ptr: Pointer[UInt8, MutAnyOrigin],
+    out_ptr: Pointer[UInt8, MutAnyOrigin],
+    nbytes: Int64,
+    stride_b: Int64,
+    stage_off_b: Int64,
+    world_i: Int32,
+    rank_i: Int32,
+    flag_base: UInt64,
+    timeout_ns: UInt64,
+):
+    _allgather_body[U, False, False](
+        regions,
+        in_ptr,
+        out_ptr,
+        nbytes,
+        stride_b,
+        stage_off_b,
+        world_i,
+        rank_i,
+        flag_base,
+        timeout_ns,
+        InlineArray[Int32, MAX_WORLD](fill=0),
+        regions[0].unsafe_bitcast[UInt64](),
+        UInt64(0),
+    )
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name("ccl_allgather_mapped_bytes")
+def _allgather_mapped_kernel[
+    U: Int, GATED: Bool
+](
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    in_ptr: Pointer[UInt8, MutAnyOrigin],
+    out_ptr: Pointer[UInt8, MutAnyOrigin],
+    nbytes: Int64,
+    stride_b: Int64,
+    stage_off_b: Int64,
+    world_i: Int32,
+    rank_i: Int32,
+    flag_base: UInt64,
+    timeout_ns: UInt64,
+    rank_at: InlineArray[Int32, MAX_WORLD],
+    mb_req: Pointer[UInt64, MutAnyOrigin],
+    seq: UInt64,
+):
+    _allgather_body[U, True, GATED](
+        regions,
+        in_ptr,
+        out_ptr,
+        nbytes,
+        stride_b,
+        stage_off_b,
+        world_i,
+        rank_i,
+        flag_base,
+        timeout_ns,
+        rank_at,
+        mb_req,
+        seq,
+    )
+
+
+comptime GATE_ROW = MAX_BLOCKS - 1
+"""Flag row of the reduce-scatter gate. A multi-node communicator's grids
+are at most the SM count (fused kernels) or `_COPY_MAX_BLOCKS` (432), so
+the last row is never a block's own; single-node communicators, whose
+grids may reach MAX_BLOCKS, never gate."""
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name("ccl_rank_gate")
+def _gate_kernel(
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    world_i: Int32,
+    rank_i: Int32,
+    code: Int32,
+    target: UInt64,
+    timeout_ns: UInt64,
+):
+    """A collective's start barrier, by one block ahead of the grid.
+
+    In a training step the collectives are where the ranks' skew shows: the
+    kernel of an early rank sat in its start barrier for most of its
+    in-situ life (GPT-2 XL FSDP2 on 2x8 H100: the fused reduce-scatter
+    1.8 ms resident for 0.6 ms of work, the remote all-gather up to 2 ms)
+    holding all of its SMs' register files, and the compute stream's GEMMs
+    could not use them. This block waits instead, on one SM; the worker
+    grid is stream-ordered behind it and skips its phase-0 barrier
+    (`GATED=True`). The guarantee is the same one those barriers gave: my
+    flag is published after every collective before this one on my stream
+    has completed, and I wait for every peer's, so when the worker starts
+    every rank has finished reading and pushing the arenas of the previous
+    collective -- including every peer's pulls from my staging, since those
+    peers have completed too. `_sync` records a deadline or an abort the
+    way it does for any other barrier, under the caller's `code`.
+    """
+    var t0 = device_now_ns()
+    _ = _sync(
+        regions,
+        Int(world_i),
+        Int(rank_i),
+        Int(code),
+        target,
+        t0,
+        timeout_ns,
+        0,
+        GATE_ROW,
+    )
+
+
+def rank_gate(
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    rank: Int,
+    world: Int,
+    regions: StaticTuple[Int, MAX_WORLD],
+    code: Int,
+    generation: Int,
+) raises:
+    _enqueue_cached_dim[_gate_kernel](
+        ctx,
+        stream,
+        "rank_gate",
+        1,
+        32,
+        False,
+        _region_ptrs(regions, rank, world),
+        Int32(world),
+        Int32(rank),
+        Int32(code),
+        _flag_target(generation, 0),
+        spin_timeout_ns(),
+    )
 
 
 # ===-------------------------------------------------------------------=== #
@@ -2952,6 +3515,178 @@ def allgather_finish[
         )
 
 
+def reduce_scatter_max_count(
+    cap_bytes: Int, world: Int, elem_bytes: Int
+) -> Int:
+    """Largest per-rank element count one `reduce_scatter` call may carry.
+
+    The only staging is `world-1` compacted push slots of one per-rank chunk,
+    and they may use the whole `2*cap_bytes` arena (see the block comment
+    above `_rs_kernel`). At the 256 MiB default region that is 512 MiB of
+    slots at world 2 and 73 MiB per chunk at world 8, so FSDP2's largest
+    reduce-scatter is a single launch.
+    """
+    if elem_bytes <= 0 or cap_bytes <= 0:
+        return 1
+    var per = (2 * cap_bytes // max(world - 1, 1)) // 16 * 16
+    return max(1, per // elem_bytes)
+
+
+def _launch_rs[
+    dtype: DType, W: Int, NW: Int
+](
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    in_ptr: Int,
+    out_ptr: Int,
+    count: Int,
+    in_stride: Int,
+    world: Int,
+    rank: Int,
+    blocks: Int,
+    vec: Bool,
+    scale: Float32,
+    generation: Int,
+) raises:
+    _enqueue_cached[_rs_kernel[dtype, W, _UNROLL, NW]](
+        ctx,
+        stream,
+        String(t"rsd_{dtype}_{NW}"),
+        blocks,
+        regions,
+        Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=in_ptr),
+        Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=out_ptr),
+        Int64(count),
+        Int64(in_stride),
+        Int64(_align_up(count * size_of[dtype](), 16)),
+        Int64(_SIGNAL_BYTES),
+        Int32(world),
+        Int32(rank),
+        _flag_target(generation, 0),
+        scale,
+        spin_timeout_ns(),
+        Int32(1) if vec else Int32(0),
+    )
+
+
+def reduce_scatter[
+    dtype: DType
+](
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    rank: Int,
+    world: Int,
+    regions: StaticTuple[Int, MAX_WORLD],
+    in_ptr: Int,
+    out_ptr: Int,
+    count: Int,
+    cap_bytes: Int,
+    scale: Float32,
+    generation: Int,
+    in_stride: Int = -1,
+) raises:
+    """`out[i] = scale * sum over ranks of in_r[rank*in_stride + i]`, on
+    `stream`.
+
+    `count` is the PER-RANK element count (the output's); the input holds
+    `world` chunks of `in_stride` elements, of which this call reduces the
+    first `count` of each. `in_stride` defaults to `count` and is larger only
+    when the caller cuts one collective into several calls. `count` must be
+    <= `reduce_scatter_max_count(cap_bytes, world, size_of[dtype]())`.
+    `scale` is ignored for integer dtypes. Any alignment is accepted:
+    misaligned pointers or an odd stride take the scalar path.
+    """
+    _check_common(rank, world, cap_bytes, generation)
+    if count == 0:
+        return
+    if count < 0:
+        raise Error("collectives: count must be >= 0")
+    comptime W = 16 // size_of[dtype]()
+    comptime esize = size_of[dtype]()
+    var stride_e = in_stride if in_stride >= 0 else count
+    if stride_e < count:
+        raise Error("collectives: reduce_scatter in_stride < count")
+    if count > reduce_scatter_max_count(cap_bytes, world, esize):
+        raise Error("collectives: reduce_scatter chunk exceeds the region")
+    var rp = _region_ptrs(regions, rank, world)
+    # world == 1 needs no special case: the push loop is empty, the sync is a
+    # self-rendezvous and the reduce copies the input, scaled.
+    var vec = (in_ptr | out_ptr | (stride_e * esize)) % 16 == 0
+    # One wave of blocks past `_AR_BIG_BYTES` of traffic, like the allreduce:
+    # these barriers are matched by block index, so a second wave would run
+    # the whole collective after the first.
+    var cap_blocks = (
+        _AR_BIG_BLOCKS if world * count * esize
+        >= _AR_BIG_BYTES else _AR_MAX_BLOCKS
+    )
+    var blocks = min(cap_blocks, max(1, (count // W + 1 + BLOCK - 1) // BLOCK))
+    if world == 8:
+        _launch_rs[dtype, W, 8](
+            ctx,
+            stream,
+            rp,
+            in_ptr,
+            out_ptr,
+            count,
+            stride_e,
+            world,
+            rank,
+            blocks,
+            vec,
+            scale,
+            generation,
+        )
+    elif world == 4:
+        _launch_rs[dtype, W, 4](
+            ctx,
+            stream,
+            rp,
+            in_ptr,
+            out_ptr,
+            count,
+            stride_e,
+            world,
+            rank,
+            blocks,
+            vec,
+            scale,
+            generation,
+        )
+    elif world == 2:
+        _launch_rs[dtype, W, 2](
+            ctx,
+            stream,
+            rp,
+            in_ptr,
+            out_ptr,
+            count,
+            stride_e,
+            world,
+            rank,
+            blocks,
+            vec,
+            scale,
+            generation,
+        )
+    else:
+        _launch_rs[dtype, W, 0](
+            ctx,
+            stream,
+            rp,
+            in_ptr,
+            out_ptr,
+            count,
+            stride_e,
+            world,
+            rank,
+            blocks,
+            vec,
+            scale,
+            generation,
+        )
+
+
 def broadcast(
     ctx: DeviceContext,
     stream: DeviceStream,
@@ -3068,4 +3803,72 @@ def allgather(
         Int32(rank),
         _flag_target(generation, 0),
         spin_timeout_ns(),
+    )
+
+
+def allgather_mapped[
+    U: Int = _UNROLL, GATED: Bool = False
+](
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    rank: Int,
+    world: Int,
+    regions: StaticTuple[Int, MAX_WORLD],
+    in_ptr: Int,
+    out_ptr: Int,
+    nbytes_per_rank: Int,
+    cap_bytes: Int,
+    generation: Int,
+    stride_bytes: Int,
+    rank_at: StaticTuple[Int32, MAX_WORLD],
+    max_blocks: Int = _COPY_MAX_BLOCKS,
+    mb_req: Int = 0,
+    seq: Int = 0,
+) raises:
+    """Gather local ranks directly into their mapped global output slots.
+
+    `seq != 0`: release RDMA exchange `seq` through the mailbox at `mb_req`
+    once the contribution is staged (see `_allgather_body`). `GATED`: the
+    caller ran `rank_gate` just before, so the kernel skips its start
+    barrier."""
+    _check_common(rank, world, cap_bytes, generation)
+    if nbytes_per_rank == 0:
+        return
+    if nbytes_per_rank < 0:
+        raise Error("collectives: nbytes_per_rank must be >= 0")
+    if nbytes_per_rank > allgather_max_bytes(cap_bytes, world):
+        raise Error("collectives: allgather message exceeds cap_bytes")
+    var stride = stride_bytes if stride_bytes >= 0 else nbytes_per_rank
+    if stride < nbytes_per_rank:
+        raise Error("collectives: stride_bytes < nbytes_per_rank")
+    if max_blocks < 1 or max_blocks > MAX_BLOCKS:
+        raise Error("collectives: allgather grid cap out of range")
+    var rp = _region_ptrs(regions, rank, world)
+    var blocks = min(
+        max_blocks,
+        max(1, (nbytes_per_rank // 16 + BLOCK - 1) // BLOCK),
+    )
+    var ranks = InlineArray[Int32, MAX_WORLD](fill=0)
+    for i in range(world):
+        ranks[i] = rank_at[i]
+    _enqueue_cached[_allgather_mapped_kernel[U, GATED]](
+        ctx,
+        stream,
+        String(t"allgather_mapped_u{U}_g{GATED}"),
+        blocks,
+        rp,
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=in_ptr),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=out_ptr),
+        Int64(nbytes_per_rank),
+        Int64(stride),
+        Int64(_SIGNAL_BYTES),
+        Int32(world),
+        Int32(rank),
+        _flag_target(generation, 0),
+        spin_timeout_ns(),
+        ranks,
+        Pointer[UInt64, MutAnyOrigin](
+            unsafe_from_address=mb_req if seq != 0 else regions[rank]
+        ),
+        UInt64(seq),
     )

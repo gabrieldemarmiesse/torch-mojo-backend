@@ -65,6 +65,8 @@ TRI_SHAPES: dict[str, tuple[int, int]] = {"S_8192x8192": (8192, 8192)}
 ARANGE_N = 16777216
 
 COVERS: dict[str, str] = {
+    "aten::_copy_from": "test_copy_row_strided (same-device strided copies; contiguous/device moves are memcpy)",
+    "aten::split_with_sizes_copy.out": "test_split_copy_rows",
     "aten::cat": "test_cat",
     "aten::stack": "test_stack",
     "aten::repeat": "test_repeat",
@@ -81,6 +83,108 @@ COVERS: dict[str, str] = {
 SKIPPED: dict[str, str] = {}
 
 
+# Few wide rows exercise all-gather unpacking; odd pitches and offsets cover
+# scalar tails and unaligned views without making launch shapes model-specific.
+ROW_COPY_SHAPES = {
+    "S_2x40206400_p41027200_o0x0": (2, 40206400, 41027200, 0, 0),
+    "S_2x5120000_p15370400_o0x0": (2, 5120000, 15370400, 0, 0),
+    "S_2x3840000_p15370400_o1600x0": (2, 3840000, 15370400, 1600, 0),
+    "S_2x800_p15370400_o0x0": (2, 800, 15370400, 0, 0),
+    "S_357x789_p811_o3x5": (357, 789, 811, 3, 5),
+    "S_7x1025_p1041_o1x3": (7, 1025, 1041, 1, 3),
+    "S_5x32768_p32781_o0x0": (5, 32768, 32781, 0, 0),
+}
+
+
+@pytest.mark.bench_op("_copy_from")
+@pytest.mark.parametrize("dtype_id", ("bf16", "f16", "f32"))
+@pytest.mark.parametrize("shape_id", ROW_COPY_SHAPES)
+def test_copy_row_strided(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    rows, cols, pitch, source_offset, destination_offset = ROW_COPY_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    source_ref, source_our = both(
+        torch.randn(rows * pitch + source_offset, dtype=dtype), hw, mojo_device
+    )
+    destination_ref, destination_our = both(
+        torch.empty(rows * cols + destination_offset, dtype=dtype), hw, mojo_device
+    )
+    source_ref = source_ref.as_strided((rows, cols), (pitch, 1), source_offset)
+    source_our = source_our.as_strided((rows, cols), (pitch, 1), source_offset)
+    destination_ref = destination_ref[destination_offset:].view(rows, cols)
+    destination_our = destination_our[destination_offset:].view(rows, cols)
+    bench.run(
+        lambda: destination_ref.copy_(source_ref),
+        lambda: destination_our.copy_(source_our),
+        flops=float(rows * cols),
+    )
+
+
+@pytest.mark.bench_op("cat.out")
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", ("R2_W41027200_P1",))
+@pytest.mark.parametrize("layout", ("contiguous_out",))
+def test_cat_out_contiguous_fp32(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    # The backend's existing cat.out reaches an internal contiguous copy.
+    # Measure the complete public op here; isolated copy time belongs to the
+    # pure Mojo harness. Plain contiguous copy_ continues to use DMA.
+    source_ref, source_our = both(torch.randn(2, 41027200), hw, mojo_device)
+    out_ref, out_our = both(torch.empty(2, 41027200), hw, mojo_device)
+    bench.run(
+        lambda: torch.cat([source_ref], 1, out=out_ref),
+        lambda: torch.cat([source_our], 1, out=out_our),
+        flops=float(source_ref.numel()),
+    )
+
+
+SPLIT_COPY_SHAPES = {
+    "S_2x15370400_mixed": (
+        2,
+        [800, 800, 3840000, 2400, 1280000, 800, 800, 800, 5120000, 3200, 5120000, 800],
+    ),
+    "S_2x9600_12pieces": (2, [800] * 12),
+    "S_7x1164_awkward": (7, [357, 789, 17, 1, 0]),
+    "S_1x1048576_single": (1, [1048576]),
+    "S_3x33345_65pieces": (3, [513] * 65),
+    "S_65536x3_empty_piece": (65536, [1, 0, 2]),
+}
+
+
+@pytest.mark.bench_op("split_with_sizes_copy.out")
+@pytest.mark.parametrize("dtype_id", ("bf16",))
+@pytest.mark.parametrize("shape_id", SPLIT_COPY_SHAPES)
+def test_split_copy_rows(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    rows, sizes = SPLIT_COPY_SHAPES[shape_id]
+    src_ref, src_our = both(
+        torch.randn(rows, sum(sizes), dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    outputs = [
+        both(torch.empty(rows, n, dtype=DTYPES[dtype_id]), hw, mojo_device)
+        for n in sizes
+    ]
+    dst_ref = [pair[0] for pair in outputs]
+    dst_our = [pair[1] for pair in outputs]
+    bench.run(
+        lambda: torch.ops.aten.split_with_sizes_copy.out(
+            src_ref, sizes, 1, out=dst_ref
+        ),
+        lambda: torch.ops.aten.split_with_sizes_copy.out(
+            src_our, sizes, 1, out=dst_our
+        ),
+        flops=float(rows * sum(sizes)),
+    )
+
+
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", CAT_SHAPES)
 def test_cat(
@@ -95,6 +199,67 @@ def test_cat(
         ours.append(our)
     bench.run(
         lambda: torch.cat(refs), lambda: torch.cat(ours), flops=float(pieces * elems)
+    )
+
+
+CAT_CAST_SHAPES: dict[str, tuple[int, tuple[int, ...], int]] = {
+    "R2_W15370400_P12": (
+        2,
+        (800, 800, 3840000, 2400, 1280000, 800, 800, 800, 5120000, 3200, 5120000, 800),
+        0,
+    ),
+    "R2_W3543936_P12": (
+        2,
+        (384, 384, 884736, 1152, 294912, 384, 384, 384, 1179648, 1536, 1179648, 384),
+        0,
+    ),
+    "R1_W16777216_P2": (1, (8388608, 8388608), 0),
+    "R3_W2760_P4": (3, (357, 789, 13, 1601), 0),
+    "R2_W2760_P4_offset1": (2, (357, 789, 13, 1601), 1),
+    "R1_W1038_P4_empty": (1, (0, 7, 0, 1031), 0),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16_f32",))
+@pytest.mark.parametrize("shape_id", CAT_CAST_SHAPES)
+@pytest.mark.parametrize("layout", ("contiguous_cast_out",))
+@pytest.mark.bench_op("cat.out")
+def test_cat_cast_out(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    rows, widths, offset = CAT_CAST_SHAPES[shape_id]
+    refs, ours = [], []
+    for index, width in enumerate(widths):
+        host = (
+            (
+                (
+                    (torch.arange(rows * width, dtype=torch.int64) * 7919 + 13 + index)
+                    % 65521
+                ).float()
+                / 65536
+                - 0.5
+            )
+            .bfloat16()
+            .view(rows, width)
+        )
+        ref, our = both(host, hw, mojo_device)
+        refs.append(ref)
+        ours.append(our)
+    size = rows * sum(widths)
+    ref_base, our_base = both(
+        torch.empty(size + 16, dtype=torch.float32), hw, mojo_device
+    )
+    ref_out = ref_base[offset : offset + size].view(rows, sum(widths))
+    our_out = our_base[offset : offset + size].view(rows, sum(widths))
+    bench.run(
+        lambda: torch.cat(refs, 1, out=ref_out),
+        lambda: torch.cat(ours, 1, out=our_out),
+        flops=float(size),
     )
 
 

@@ -305,7 +305,6 @@ def enqueue_sdpa_ta_gemm_f32(
             if causal:
                 _enqueue_cached[_sdpa_ta_gemm_kernel[True, True]](
                     ctx,
-                    "sdpa_ta_gemm_f32_m1_c1",
                     gx,
                     gy,
                     batch,
@@ -322,7 +321,6 @@ def enqueue_sdpa_ta_gemm_f32(
             else:
                 _enqueue_cached[_sdpa_ta_gemm_kernel[True, False]](
                     ctx,
-                    "sdpa_ta_gemm_f32_m1_c0",
                     gx,
                     gy,
                     batch,
@@ -339,7 +337,6 @@ def enqueue_sdpa_ta_gemm_f32(
         elif causal:
             _enqueue_cached[_sdpa_ta_gemm_kernel[False, True]](
                 ctx,
-                "sdpa_ta_gemm_f32_m0_c1",
                 gx,
                 gy,
                 batch,
@@ -356,7 +353,6 @@ def enqueue_sdpa_ta_gemm_f32(
         else:
             _enqueue_cached[_sdpa_ta_gemm_kernel[False, False]](
                 ctx,
-                "sdpa_ta_gemm_f32_m0_c0",
                 gx,
                 gy,
                 batch,
