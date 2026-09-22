@@ -238,6 +238,8 @@ def test_empty_strided_metadata(mojo_device):
     assert cl.stride() == (60, 1, 15, 3)
     assert torch.empty((), device=mojo_device).shape == ()
     assert torch.empty((0, 3), device=mojo_device).numel() == 0
+
+
 def test_boxed_adapter_returns_undefined_tensors_for_masked_gradients(mojo_gpu):
     """bool[] argument, three returns, and the None-record rule: a masked-off
     gradient of a `Tensor` (not `Tensor?`) return must come back as an
