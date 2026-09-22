@@ -782,6 +782,8 @@ def _try_gemm16_linear(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
         )
         if mm_out:
             var plain = own(mm_out.value().copy())
+            if _try_bias_inplace(plain.t, bias.value()):
+                return plain.take()
             var biased = _try_add(plain.t, bias.value())
             if biased:
                 return biased.value().copy()
@@ -930,6 +932,73 @@ def _spec_matmul(
         raise e^
     _ = ctx
     return out.take()
+
+
+def _bias_add_dtype_ok(dt: DType) -> Bool:
+    """logic SPEC_BCAST_DTYPES, minus bool: what its broadcast add takes."""
+    return (
+        dt == DType.float32
+        or dt == DType.bfloat16
+        or dt == DType.float16
+        or dt == DType.float64
+        or dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
+        or dt == DType.uint8
+    )
+
+
+def _try_bias_inplace(dst: T, bias: T) raises -> Bool:
+    """`dst += bias` into the product this op just computed, rather than
+    `aten::add` through the dispatcher: one boxed call, one output buffer and
+    one copy less per biased GEMM (192 of them per GPT-2 XL step).
+
+    The kernel is the broadcast add `aten::add.Tensor` would itself have
+    launched for this pair, and it writes element i from the element it read
+    for i, so a destination that is also the left operand is exact. `dst` is
+    this op's own fresh allocation; `bias` is the only aliasing to rule out.
+    """
+    if (
+        not dst.on_mojo()
+        or not bias.on_mojo()
+        or dst.device != bias.device
+        or dst.stype != bias.stype
+        or not dst.contig
+        or not bias.contig
+        or not _bias_add_dtype_ok(dst.dtype)
+        or bias.rank > dst.rank
+        or dst.rank > 4
+    ):
+        return False
+    for i in range(MAX_RANK):
+        if bias.shape[i] != dst.shape[i] and bias.shape[i] != 1:
+            return False
+    # Contiguous, so `numel * itemsize` is the exact byte span of each.
+    if not (
+        bias.ptr >= dst.ptr + dst.numel * dst.itemsize
+        or dst.ptr >= bias.ptr + bias.numel * bias.itemsize
+    ):
+        return False
+    if dst.numel == 0:
+        return True
+    var ctx = ctx_for(dst.device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall("logic", "AddSpec")
+    call.arg_dtype(0, dst.dtype)
+    call.arg_dtype(1, bias.dtype)
+    call.out_dtype(dst.dtype)
+    call.spec(dst.spec(cp))
+    call.spec(bias.spec(cp))
+    call.spec(dst.spec(cp))
+    try:
+        call.run()
+    except e:
+        if _declined(e):
+            return False
+        raise e^
+    _ = ctx
+    return True
 
 
 # --- neighbouring ops reached through the dispatcher --------------------------
@@ -1135,6 +1204,8 @@ def _addmm_route(bias: T, mat1: T, mat2: T) raises -> Optional[T]:
         var mm_out = _try_gemm16_mm(mat1, mat2, None, False, List[Int]())
         if mm_out:
             var plain = own(mm_out.value().copy())
+            if _try_bias_inplace(plain.t, bias):
+                return plain.take()
             var biased = _try_add(plain.t, bias)
             if biased:
                 return biased.value().copy()
