@@ -4,7 +4,7 @@ The `CI` workflow runs CPU unit tests on self-hosted runners labeled
 `cpu-only` and GPU unit tests on the self-hosted runners labeled `L4`.
 Lint, type checking, and benchmark bookkeeping stay on GitHub-hosted runners.
 
-The CPU selection is `uv run pytest tests/ -m "not gpu"`, sharded 40 ways.
+The CPU selection is `uv run pytest tests/ -m "not gpu"`, sharded 18 ways.
 The GPU selection is `uv run pytest tests/ -m gpu`, divided into three jobs:
 
 | Job | Selection | PyTorch wheel |

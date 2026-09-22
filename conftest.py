@@ -5,9 +5,9 @@ GPU requirements are inferred from the shared device fixtures, including
 transitive dependencies; tests managing their own devices use an explicit
 `pytest.mark.gpu`. Parametrized CPU/CUDA fixtures mark only the CUDA case.
 
-CI shards the CPU selection 40 ways with `pytest-split` (`--splits 40 --group N`).
+CI shards the CPU selection 18 ways with `pytest-split` (`--splits 18 --group N`).
 pytest-split has no durations file, so it falls back to cutting the *collection
-order* into 40 equal-count chunks -- and collection order is the worst possible
+order* into equal-count chunks -- and collection order is the worst possible
 order to cut, because cost is clustered in it: a file's tests, and above all the
 parametrizations of one test function, sit next to each other and cost the same.
 A chunk is therefore a slice of one or two files rather than a sample of the
