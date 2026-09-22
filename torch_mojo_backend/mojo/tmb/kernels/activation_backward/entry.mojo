@@ -41,6 +41,9 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
+from tmb.kernels.activation_backward.tanh_backward import (
+    enqueue_tanh_backward_f32,
+)
 
 
 comptime _BLOCK = 256
@@ -508,6 +511,16 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
     """
     try:
+        comptime if _op_on["TanhBackwardF32"]():
+            var ctx = _raw_ctx(argv[unsafe_offset=4])
+            enqueue_tanh_backward_f32(
+                _raw_int(argv[unsafe_offset=0]),
+                _raw_int(argv[unsafe_offset=1]),
+                _raw_int(argv[unsafe_offset=2]),
+                _raw_int(argv[unsafe_offset=3]),
+                ctx,
+            )
+            return 0
         comptime if _op_on["GeluBackwardF32"]():
             _gelu_backward_dispatcher(argv, argc)
             return 0

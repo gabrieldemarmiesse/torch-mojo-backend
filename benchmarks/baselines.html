@@ -4815,6 +4815,44 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "_foreach_copy_": {
+          "dtypes": {
+            "f32_to_bf16": {
+              "shapes": {
+                "L_12x800": {
+                  "layouts": {
+                    "contig": 0.983
+                  }
+                },
+                "L_1x1048576": {
+                  "layouts": {
+                    "contig": 0.299
+                  }
+                },
+                "L_65x513": {
+                  "layouts": {
+                    "contig": 0.846
+                  }
+                },
+                "L_awkward_357x789": {
+                  "layouts": {
+                    "contig": 0.271
+                  }
+                },
+                "L_empty_mixed": {
+                  "layouts": {
+                    "contig": 0.965
+                  }
+                },
+                "L_mixed_15370400": {
+                  "layouts": {
+                    "contig": 0.861
+                  }
+                }
+              }
+            }
+          }
+        },
         "_index_put_impl_": {
           "dtypes": {
             "bf16": {
@@ -4877,6 +4915,66 @@ document.addEventListener("DOMContentLoaded", boot);
                 "C_4096x4096": {
                   "layouts": {
                     "contig": 1.088
+                  }
+                }
+              }
+            }
+          }
+        },
+        "cat": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "P_2x8388608": {
+                  "layouts": {
+                    "contig": 0.978
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "P_2x8388608": {
+                  "layouts": {
+                    "contig": 0.974
+                  }
+                }
+              }
+            }
+          }
+        },
+        "cat.out": {
+          "dtypes": {
+            "bf16_f32": {
+              "shapes": {
+                "R1_W1038_P4_empty": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.518
+                  }
+                },
+                "R1_W16777216_P2": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.743
+                  }
+                },
+                "R2_W15370400_P12": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.484
+                  }
+                },
+                "R2_W2760_P4_offset1": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.185
+                  }
+                },
+                "R2_W3543936_P12": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.273
+                  }
+                },
+                "R3_W2760_P4": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.197
                   }
                 }
               }
@@ -4999,6 +5097,39 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "split_with_sizes_copy.out": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S_2x15370400_mixed": {
+                  "layouts": {
+                    "contig": 1.085
+                  }
+                },
+                "S_2x9600_12pieces": {
+                  "layouts": {
+                    "contig": 1.019
+                  }
+                },
+                "S_3x33345_65pieces": {
+                  "layouts": {
+                    "contig": 0.803
+                  }
+                },
+                "S_65536x3_empty_piece": {
+                  "layouts": {
+                    "contig": 0.215
+                  }
+                },
+                "S_7x1164_awkward": {
+                  "layouts": {
+                    "contig": 0.798
+                  }
+                }
+              }
+            }
+          }
+        },
         "sqrt.out": {
           "dtypes": {
             "f32": {
@@ -5031,6 +5162,44 @@ document.addEventListener("DOMContentLoaded", boot);
                 "stream_40206400": {
                   "layouts": {
                     "contig": 0.996
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tanh_backward": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "awkward357x789": {
+                  "layouts": {
+                    "contiguous_backward": 1.028
+                  }
+                },
+                "large16777216": {
+                  "layouts": {
+                    "contiguous_backward": 0.999
+                  }
+                },
+                "large5242880": {
+                  "layouts": {
+                    "contiguous_backward": 1.002
+                  }
+                },
+                "large6553600": {
+                  "layouts": {
+                    "contiguous_backward": 0.978
+                  }
+                },
+                "offset357x789": {
+                  "layouts": {
+                    "contiguous_backward": 1.103
+                  }
+                },
+                "small1600": {
+                  "layouts": {
+                    "contiguous_backward": 0.902
                   }
                 }
               }

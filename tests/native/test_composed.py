@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from torch_mojo_backend import native
+from torch_mojo_backend.native import device_module
 
 
 @contextlib.contextmanager
@@ -23,8 +24,8 @@ def assert_ran(*op_names: str):
 
 @pytest.mark.parametrize("act", ["relu", "sigmoid", "tanh"])
 def test_activation_backward_composed_through_the_dispatcher(mojo_gpu, act):
-    """threshold/sigmoid/tanh backward have no kernel of their own; they are
-    composed from registered ops and must match CPU autograd."""
+    """Backward registrations, including their composed fallbacks, must
+    match CPU autograd."""
     torch.manual_seed(0)
     x = torch.randn(4, 7, device=mojo_gpu, requires_grad=True)
     y = getattr(torch, act)(x)
@@ -35,6 +36,167 @@ def test_activation_backward_composed_through_the_dispatcher(mojo_gpu, act):
     assert x.grad is not None and ref.grad is not None
     # two float32 rounding orders (tanh: out*out on device, 1 - out^2 on cpu)
     torch.testing.assert_close(x.grad.cpu(), ref.grad, atol=3e-5, rtol=1e-5)
+
+
+def _tanh_f32_bits(size: int, seed: int) -> torch.Tensor:
+    edges = torch.tensor(
+        [
+            0,
+            0x80000000,
+            1,
+            0x80000001,
+            0x007FFFFF,
+            0x807FFFFF,
+            0x00800000,
+            0x80800000,
+            0x3F800000,
+            0xBF800000,
+            0x3F7FFFFF,
+            0xBF7FFFFF,
+            0x3F800001,
+            0xBF800001,
+            0x3F7FFFFE,
+            0xBF7FFFFE,
+            0x3F800002,
+            0xBF800002,
+            0x3F000000,
+            0x7F7FFFFF,
+            0xFF7FFFFF,
+            0x7F800000,
+            0xFF800000,
+            0x7FC00001,
+            0x7F800001,
+        ],
+        dtype=torch.int64,
+    )
+    indices = torch.arange(size, dtype=torch.int64)
+    slots = (indices + seed) % 32
+    bits = torch.where(
+        slots < edges.numel(),
+        edges[slots.clamp_max(edges.numel() - 1)],
+        (indices * 2654435761 + seed) & 0xFFFFFFFF,
+    )
+    return bits.to(torch.int32).view(torch.float32)
+
+
+def _assert_tanh_f32_bits(actual: torch.Tensor, expected: torch.Tensor):
+    nan = torch.isnan(expected)
+    assert torch.equal(torch.isnan(actual), nan)
+    assert torch.equal(actual.view(torch.int32)[~nan], expected.view(torch.int32)[~nan])
+
+
+@pytest.mark.parametrize("goff", range(4))
+@pytest.mark.parametrize("yoff", range(4))
+@pytest.mark.parametrize("doff", range(4))
+def test_tanh_backward_f32_pointer_residues(mojo_gpu, goff, yoff, doff):
+    _check_tanh_backward_f32(mojo_gpu, 1029, goff, yoff, doff, "disjoint")
+
+
+@pytest.mark.parametrize(
+    "size",
+    [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        15,
+        16,
+        17,
+        255,
+        256,
+        257,
+        1023,
+        1024,
+        1025,
+        1026,
+        1027,
+        1028,
+        4095,
+        4096,
+        4097,
+    ],
+)
+def test_tanh_backward_f32_tails(mojo_gpu, size):
+    _check_tanh_backward_f32(mojo_gpu, size, 0, 0, 0, "disjoint")
+
+
+@pytest.mark.parametrize("offset", range(4))
+@pytest.mark.parametrize("alias", ["disjoint", "grad", "output", "inputs", "all"])
+def test_tanh_backward_f32_large_aliases(mojo_gpu, offset, alias):
+    _check_tanh_backward_f32(mojo_gpu, 357 * 789, offset, offset, offset, alias)
+
+
+def _check_tanh_backward_f32(
+    device: str, size: int, goff: int, yoff: int, doff: int, alias: str
+):
+    properties = device_module.get_device_properties(device)
+    if properties.api != "cuda" or properties.major != 9:
+        pytest.skip("CUDA Hopper fused FMA contract")
+    gh = _tanh_f32_bits(size + 16, 0)
+    yh = _tanh_f32_bits(size + 16, 13)
+    gb, yb = gh.to(device), yh.to(device)
+    db = torch.full((size + 16,), 17.0, device=device)
+    if alias in ("inputs", "all"):
+        yb, yh = gb, gh
+    if alias in ("grad", "all"):
+        db = gb
+    elif alias == "output":
+        db = yb
+    g, y, out = gb[goff : goff + size], yb[yoff : yoff + size], db[doff : doff + size]
+    before = db.cpu()
+    expected = (
+        gh[goff : goff + size] * (1 - yh[yoff : yoff + size].double().square()).float()
+    )
+    functional = torch.ops.aten.tanh_backward(g, y)
+    _assert_tanh_f32_bits(functional.cpu(), expected)
+    version = out._version
+    result = torch.ops.aten.tanh_backward.grad_input(g, y, grad_input=out)
+    assert result is out
+    assert out._version == version + 1
+    _assert_tanh_f32_bits(out.cpu(), expected)
+    after = db.cpu()
+    assert torch.equal(after[:doff].view(torch.int32), before[:doff].view(torch.int32))
+    assert torch.equal(
+        after[doff + size :].view(torch.int32), before[doff + size :].view(torch.int32)
+    )
+    if alias not in ("grad", "all"):
+        assert torch.equal(gb.cpu().view(torch.int32), gh.view(torch.int32))
+    if alias not in ("output", "all"):
+        assert torch.equal(yb.cpu().view(torch.int32), yh.view(torch.int32))
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+@pytest.mark.parametrize("layout", ["transpose", "broadcast", "resize", "strided_out"])
+def test_tanh_backward_generic_fallback(mojo_gpu, dtype, layout):
+    g = torch.linspace(-0.5, 0.5, 35).reshape(5, 7).to(dtype)
+    y = torch.linspace(-0.75, 0.75, 35).reshape(5, 7).to(dtype)
+    gm, ym = g.to(mojo_gpu), y.to(mojo_gpu)
+    if layout == "transpose":
+        g, y, gm, ym = g.t(), y.t(), gm.t(), ym.t()
+    elif layout == "broadcast":
+        g, gm = g[:1], gm[:1]
+    # float64 stays on the unchanged composed route (GPU neg accepts it
+    # since #499), so every dtype is checked against CPU the same way.
+    expected = torch.ops.aten.tanh_backward(g, y)
+    result = torch.ops.aten.tanh_backward(gm, ym)
+    rtol, atol = (
+        (0.02, 0.002) if dtype in (torch.float16, torch.bfloat16) else (None, None)
+    )
+    torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
+    if layout == "resize":
+        out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    elif layout == "strided_out":
+        out = torch.empty((5, 14), dtype=dtype, device=mojo_gpu)[:, ::2]
+    else:
+        out = torch.empty_like(result)
+    returned = torch.ops.aten.tanh_backward.grad_input(gm, ym, grad_input=out)
+    assert returned is out
+    torch.testing.assert_close(out.cpu(), expected, rtol=rtol, atol=atol)
 
 
 def test_relu_module_trains(mojo_gpu):

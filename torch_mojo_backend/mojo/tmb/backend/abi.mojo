@@ -59,13 +59,29 @@ comptime ST_UINT64 = Int32(29)
 comptime DEVICE_TYPE_CPU = 0
 comptime DEVICE_TYPE_PRIVATEUSE1 = 20
 
+# --- tmb_tensor_info slots (tmb.h TmbTensorInfoSlot) ------------------------
+comptime INFO_DATA_PTR = 0
+comptime INFO_DIM = 1
+comptime INFO_SIZES = 2
+comptime INFO_STRIDES = 3
+comptime INFO_STORAGE_OFFSET = 4
+comptime INFO_NUMEL = 5
+comptime INFO_DTYPE = 6
+comptime INFO_CONTIGUOUS = 7
+comptime INFO_DEVICE_INDEX = 8
+comptime INFO_DEVICE_TYPE = 9
+comptime TENSOR_INFO_SLOTS = 10
+
 comptime MEMORY_FORMAT_CONTIGUOUS = 0
 comptime MEMORY_FORMAT_PRESERVE = 1
 comptime MEMORY_FORMAT_CHANNELS_LAST = 2
 comptime MEMORY_FORMAT_CHANNELS_LAST_3D = 3
 
 
+@always_inline
 def max_dtype(stype: Int32) raises -> DType:
+    # Inlined, and ordered by how often the device sees each dtype: every
+    # tensor of every op call goes through here (with dtype_itemsize).
     if stype == ST_FLOAT32:
         return DType.float32
     if stype == ST_BFLOAT16:
@@ -160,6 +176,7 @@ def dtype_code(dt: DType) -> Int:
     return 141  # int64
 
 
+@always_inline
 def dtype_itemsize(dt: DType) -> Int:
     if dt == DType.float32 or dt == DType.int32 or dt == DType.uint32:
         return 4
@@ -519,9 +536,20 @@ struct T(Copyable, Movable):
     var device_type: Int  # torch DeviceType (DEVICE_TYPE_PRIVATEUSE1, DEVICE_TYPE_CPU, ...)
 
     def __init__(out self, h: Int) raises:
+        var info = InlineArray[Int64, TENSOR_INFO_SLOTS](fill=0)
+        external_call["tmb_tensor_info", NoneType](h, info.unsafe_ptr())
+        self = T(h, Int(info.unsafe_ptr()))
+        _ = info^  # read through its address above, so alive until here
+
+    def __init__(out self, h: Int, info_addr: Int) raises:
+        """From a filled `tmb_tensor_info` block (tmb.h): the one entry the
+        creating call can hand back, so no field is read a second time."""
+        var info = Pointer[Int64, MutUntrackedOrigin](
+            unsafe_from_address=info_addr
+        )
         self.h = h
-        self.ptr = external_call["tmb_tensor_data_ptr", Int](h)
-        self.rank = Int(external_call["tmb_tensor_dim", Int64](h))
+        self.ptr = Int(info[unsafe_offset=INFO_DATA_PTR])
+        self.rank = Int(info[unsafe_offset=INFO_DIM])
         if self.rank > MAX_RANK:
             raise Error(
                 "tensor rank ",
@@ -533,25 +561,23 @@ struct T(Copyable, Movable):
         self.strides = IndexList[MAX_RANK](0)
         if self.rank > 0:
             var sizes = Pointer[Int64, MutUntrackedOrigin](
-                unsafe_from_address=external_call["tmb_tensor_sizes", Int](h)
+                unsafe_from_address=Int(info[unsafe_offset=INFO_SIZES])
             )
             var strides = Pointer[Int64, MutUntrackedOrigin](
-                unsafe_from_address=external_call["tmb_tensor_strides", Int](h)
+                unsafe_from_address=Int(info[unsafe_offset=INFO_STRIDES])
             )
             var pad = MAX_RANK - self.rank
             for i in range(self.rank):
                 self.shape[pad + i] = Int(sizes[unsafe_offset=i])
                 self.strides[pad + i] = Int(strides[unsafe_offset=i])
-        self.offset = Int(external_call["tmb_tensor_storage_offset", Int64](h))
-        self.numel = Int(external_call["tmb_tensor_numel", Int64](h))
-        self.stype = external_call["tmb_tensor_dtype", Int32](h)
+        self.offset = Int(info[unsafe_offset=INFO_STORAGE_OFFSET])
+        self.numel = Int(info[unsafe_offset=INFO_NUMEL])
+        self.stype = Int32(info[unsafe_offset=INFO_DTYPE])
         self.dtype = max_dtype(self.stype)
         self.itemsize = dtype_itemsize(self.dtype)
-        self.contig = external_call["tmb_tensor_is_contiguous", Int32](h) != 0
-        self.device = Int(external_call["tmb_tensor_device_index", Int32](h))
-        self.device_type = Int(
-            external_call["tmb_tensor_device_type", Int32](h)
-        )
+        self.contig = info[unsafe_offset=INFO_CONTIGUOUS] != 0
+        self.device = Int(info[unsafe_offset=INFO_DEVICE_INDEX])
+        self.device_type = Int(info[unsafe_offset=INFO_DEVICE_TYPE])
 
     @always_inline
     def dim(self, i: Int) -> Int:
@@ -910,6 +936,7 @@ def new_strided(
         sizes[i] = Int64(shape[pad + i])
         strd[i] = Int64(strides[pad + i])
     var h: Int = 0
+    var info = InlineArray[Int64, TENSOR_INFO_SLOTS](fill=0)
     check(
         external_call["tmb_empty_strided", Int32](
             Int64(rank),
@@ -918,10 +945,13 @@ def new_strided(
             stype,
             Int32(device),
             Pointer(to=h),
+            info.unsafe_ptr(),
         ),
         "tmb_empty_strided",
     )
-    return T(h)
+    var out = T(h, Int(info.unsafe_ptr()))
+    _ = info^  # read through its address above, so alive until here
+    return out^
 
 
 def new_tensor(
@@ -960,6 +990,7 @@ def view_strided(
         sizes[i] = Int64(shape[pad + i])
         strd[i] = Int64(strides[pad + i])
     var h: Int = 0
+    var info = InlineArray[Int64, TENSOR_INFO_SLOTS](fill=0)
     check(
         external_call["tmb_as_strided", Int32](
             base.h,
@@ -968,10 +999,13 @@ def view_strided(
             strd.unsafe_ptr(),
             Int64(offset),
             Pointer(to=h),
+            info.unsafe_ptr(),
         ),
         "tmb_as_strided",
     )
-    return T(h)
+    var out = T(h, Int(info.unsafe_ptr()))
+    _ = info^  # read through its address above, so alive until here
+    return out^
 
 
 def set_sizes_strides(
