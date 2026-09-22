@@ -99,3 +99,15 @@ def pytest_collection_finish(session: pytest.Session):
     if not _sharding(session.config):
         return
     session.items.sort(key=lambda item: item.stash[_COLLECTION_INDEX])
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int | pytest.ExitCode):
+    """An empty shard is a pass, not pytest's exit code 5.
+
+    Without durations pytest-split hands every shard `ceil(n / splits)` tests
+    until it runs out, so whenever `39 * ceil(n / 40) >= n` the last shard gets
+    none. `n` moves with every test added or re-marked `gpu`, which made
+    `test (40)` fail on whichever PR crossed such a count.
+    """
+    if _sharding(session.config) and exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED:
+        session.exitstatus = pytest.ExitCode.OK
