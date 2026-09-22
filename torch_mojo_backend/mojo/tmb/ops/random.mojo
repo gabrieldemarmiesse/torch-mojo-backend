@@ -232,11 +232,11 @@ def _grid(device: Int, numel: Int) raises -> Int:
     # Constant fallbacks (an H100 SXM) for a query that fails to answer;
     # every real accelerator answers these, so they are not expected to fire.
     var ctx = ctx_for(device)
-    var max_threads = _device_attr_cached(
-        ctx, "maxthr", DeviceAttribute.MAX_THREADS_PER_MULTIPROCESSOR, 2048
+    var max_threads = _device_attr_cached["maxthr"](
+        ctx, DeviceAttribute.MAX_THREADS_PER_MULTIPROCESSOR, 2048
     )
-    var sm = _device_attr_cached(
-        ctx, "sm", DeviceAttribute.MULTIPROCESSOR_COUNT, 132
+    var sm = _device_attr_cached["sm"](
+        ctx, DeviceAttribute.MULTIPROCESSOR_COUNT, 132
     )
     return min(ceildiv(numel, BLOCK), sm * (max_threads // BLOCK))
 

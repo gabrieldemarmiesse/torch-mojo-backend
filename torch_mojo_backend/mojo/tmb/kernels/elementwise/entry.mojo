@@ -201,7 +201,6 @@ def _bin_elementwise[
                     var n4 = size // 4
                     _enqueue_cached[_bin_contig_kernel4[dtype, op_code]](
                         ctx,
-                        String(t"ew_bin4_{op_code}_{dtype}"),
                         _gs_blocks(n4),
                         1,
                         1,
@@ -214,7 +213,6 @@ def _bin_elementwise[
                     return
                 _enqueue_cached[_bin_contig_kernel[dtype, op_code]](
                     ctx,
-                    String(t"ew_bin_{op_code}_{dtype}"),
                     _gs_blocks(size),
                     1,
                     1,
@@ -587,7 +585,6 @@ def _unary_elementwise[
                         # making both vector bases 16-byte aligned.
                         _enqueue_cached[_sqrt_peel_kernel](
                             ctx,
-                            "sqrt_contig_f32_v4_peel",
                             _l2_wave_blocks(
                                 max(1, (size - head) // 4), size * 8, ctx
                             ),
@@ -621,7 +618,6 @@ def _unary_elementwise[
                 # dtype, and only Apple GPUs lack it.
                 _enqueue_cached[_unary_contig_kernel[dtype, op_code]](
                     ctx,
-                    String(t"ew_unary_{op_code}_{dtype}"),
                     _gs_blocks(size),
                     1,
                     1,
@@ -642,7 +638,6 @@ def _unary_elementwise[
                 var span = max(vec_count // 4, 1) if vec_count > 0 else size
                 _enqueue_cached[_unary_contig_kernel4[dtype, op_code]](
                     ctx,
-                    String(t"ew_unary4_{op_code}_{dtype}"),
                     _gs_blocks(span),
                     1,
                     1,
@@ -813,7 +808,6 @@ def _scalar_elementwise[
                 var nvec = (size - head) // 4
                 _enqueue_cached[_scalar_mul_peel_kernel](
                     ctx,
-                    "scalar_mul_contig_f32_v4_peel",
                     min(ceildiv(nvec, 256), 1 << 22),
                     1,
                     1,

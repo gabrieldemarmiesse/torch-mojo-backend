@@ -1180,9 +1180,6 @@ def _amd_dynamic_mfma_gemm[
             _amd_dynamic_mfma_edge_kernel[dtype, transpose_b, fuse_bias]
         ](
             ctx,
-            String(
-                t"amd_dynamic_mfma_edge_{dtype}_tb{transpose_b}_bias{fuse_bias}"
-            ),
             ceildiv(m * col_count, 256),
             1,
             1,
@@ -1381,7 +1378,6 @@ def _amd_splitk_mfma_gemm[
     comptime VEC = 16 // size_of[DType.float32]()
     _enqueue_cached[_splitk_reduce_kernel[dtype, VEC]](
         ctx,
-        String(t"amd_splitk_reduce_{dtype}_v{VEC}"),
         _gs_blocks(total // VEC),
         1,
         1,
@@ -1754,7 +1750,6 @@ def _amd_batched_mfma_gemm[
             _amd_batched_mfma_edge_kernel[dtype, transpose_b, CAUSAL]
         ](
             ctx,
-            String(t"amd_batched_mfma_edge_{dtype}_tb{transpose_b}_cz{CAUSAL}"),
             ceildiv(m * col_count, 256),
             batch,
             1,
@@ -3249,9 +3244,6 @@ def _nt_mfma_gemm[
                 ]
             ](
                 ctx,
-                String(
-                    t"nt_mfma_bias_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_z{SWIZZLE}_l{MASKED}_t{MASKED}_f{FILL_AT}_body{BODY2}_scalar{SCALAR_LOAD}"
-                ),
                 grid[0],
                 grid[1],
                 grid[2],
@@ -3721,7 +3713,6 @@ def _dense_mfma_route[
         comptime VEC = 16 // size_of[DType.float32]()
         _enqueue_cached[_splitk_reduce_kernel[dtype, VEC]](
             ctx,
-            String(t"amd_splitk_reduce_{dtype}_v{VEC}"),
             _gs_blocks(m * n // VEC),
             1,
             1,
@@ -4135,7 +4126,6 @@ def _enqueue_pipe[
         if va4:
             _enqueue_cached[_gemm_pipe_kernel[BM, BN, BK, TM, TN, 4, 4, True]](
                 ctx,
-                String(t"gemm_pipe_{BM}x{BN}_v44_tb1"),
                 gx,
                 gy,
                 gz,
@@ -4152,7 +4142,6 @@ def _enqueue_pipe[
         else:
             _enqueue_cached[_gemm_pipe_kernel[BM, BN, BK, TM, TN, 1, 1, True]](
                 ctx,
-                String(t"gemm_pipe_{BM}x{BN}_v11_tb1"),
                 gx,
                 gy,
                 gz,
@@ -4172,7 +4161,6 @@ def _enqueue_pipe[
         if va4 and vb4:
             _enqueue_cached[_gemm_pipe_kernel[BM, BN, BK, TM, TN, 4, 4, False]](
                 ctx,
-                String(t"gemm_pipe_{BM}x{BN}_v44_tb0"),
                 gx,
                 gy,
                 gz,
@@ -4189,7 +4177,6 @@ def _enqueue_pipe[
         elif va4:
             _enqueue_cached[_gemm_pipe_kernel[BM, BN, BK, TM, TN, 4, 1, False]](
                 ctx,
-                String(t"gemm_pipe_{BM}x{BN}_v41_tb0"),
                 gx,
                 gy,
                 gz,
@@ -4206,7 +4193,6 @@ def _enqueue_pipe[
         elif vb4:
             _enqueue_cached[_gemm_pipe_kernel[BM, BN, BK, TM, TN, 1, 4, False]](
                 ctx,
-                String(t"gemm_pipe_{BM}x{BN}_v14_tb0"),
                 gx,
                 gy,
                 gz,
@@ -4223,7 +4209,6 @@ def _enqueue_pipe[
         else:
             _enqueue_cached[_gemm_pipe_kernel[BM, BN, BK, TM, TN, 1, 1, False]](
                 ctx,
-                String(t"gemm_pipe_{BM}x{BN}_v11_tb0"),
                 gx,
                 gy,
                 gz,
@@ -4247,7 +4232,6 @@ def _enqueue_pipe[
                 ]
             ](
                 ctx,
-                String(t"gemm_pipe3_{BM}x{BN}_v44_mb4"),
                 gx,
                 gy,
                 gz,
@@ -4269,7 +4253,6 @@ def _enqueue_pipe[
                 ]
             ](
                 ctx,
-                String(t"gemm_pipe3_{BM}x{BN}_v41_mb4"),
                 gx,
                 gy,
                 gz,
@@ -4291,7 +4274,6 @@ def _enqueue_pipe[
                 ]
             ](
                 ctx,
-                String(t"gemm_pipe3_{BM}x{BN}_v14_mb4"),
                 gx,
                 gy,
                 gz,
@@ -4313,7 +4295,6 @@ def _enqueue_pipe[
                 ]
             ](
                 ctx,
-                String(t"gemm_pipe3_{BM}x{BN}_v11_mb4"),
                 gx,
                 gy,
                 gz,
@@ -4605,7 +4586,6 @@ def _gemm_enqueue[
         if m <= SMALLM_MR:
             _enqueue_cached[_gemm_smallm_kernel[dtype, transpose_b]](
                 ctx,
-                String(t"gemm_smallm_{dtype}_tb{transpose_b}"),
                 gx,
                 gy,
                 batch * ksplits,
@@ -4640,7 +4620,6 @@ def _gemm_enqueue[
                     _gemm_tiled_kernel[dtype, 128, 128, 16, 8, 8, transpose_b]
                 ](
                     ctx,
-                    String(t"gemm_t128_{dtype}_tb{transpose_b}"),
                     gx,
                     gy,
                     batch * ksplits,
@@ -4691,7 +4670,6 @@ def _gemm_enqueue[
                     _gemm_tiled_kernel[dtype, 64, 64, 16, 4, 4, transpose_b]
                 ](
                     ctx,
-                    String(t"gemm_t64_{dtype}_tb{transpose_b}"),
                     gx,
                     gy,
                     batch * ksplits,
@@ -4715,7 +4693,6 @@ def _gemm_enqueue[
             )
             _enqueue_cached[_ksplit_reduce_kernel](
                 ctx,
-                String("ksplit_reduce"),
                 ceildiv(total, 1024),
                 1,
                 1,
@@ -5034,7 +5011,6 @@ def _apple8_enqueue[
     if ksplits == 1:
         _enqueue_cached[_apple8_gemm_kernel[HAS_BIAS, False, TRANSPOSE_B]](
             ctx,
-            String(t"apple8_gemm_b{HAS_BIAS}_tb{TRANSPOSE_B}"),
             gx,
             gy,
             1,
@@ -5055,7 +5031,6 @@ def _apple8_enqueue[
     ).as_unsafe_any_origin()
     _enqueue_cached[_apple8_gemm_kernel[False, True, TRANSPOSE_B]](
         ctx,
-        String(t"apple8_gemm_split_tb{TRANSPOSE_B}"),
         gx,
         gy,
         ksplits,
@@ -5072,7 +5047,6 @@ def _apple8_enqueue[
     var mn = m * n
     _enqueue_cached[_apple8_reduce_kernel[HAS_BIAS]](
         ctx,
-        String(t"apple8_reduce_b{HAS_BIAS}"),
         max(1, min((mn + 255) // 256, 512)),
         1,
         1,
@@ -5398,7 +5372,6 @@ def _apple8_fat_enqueue[
                 _apple8_smem_kernel[False, TRANSPOSE_B, TRANSPOSE_A]
             ](
                 ctx,
-                String(t"apple8_smem_tb{TRANSPOSE_B}_ta{TRANSPOSE_A}"),
                 gx,
                 gy,
                 batch,
@@ -5426,10 +5399,6 @@ def _apple8_fat_enqueue[
                 ]
             ](
                 ctx,
-                String(
-                    t"apple8_fat_tb{TRANSPOSE_B}_{BLOCK_M}x{BLOCK_N}"
-                    t"_c{CAUSAL}_ta{TRANSPOSE_A}"
-                ),
                 gx,
                 gy,
                 batch,
@@ -5451,7 +5420,6 @@ def _apple8_fat_enqueue[
     comptime if STAGED:
         _enqueue_cached[_apple8_smem_kernel[True, TRANSPOSE_B, TRANSPOSE_A]](
             ctx,
-            String(t"apple8_smem_split_tb{TRANSPOSE_B}_ta{TRANSPOSE_A}"),
             gx,
             gy,
             batch * ksplits,
@@ -5479,10 +5447,6 @@ def _apple8_fat_enqueue[
             ]
         ](
             ctx,
-            String(
-                t"apple8_fat_split_tb{TRANSPOSE_B}_{BLOCK_M}x{BLOCK_N}"
-                t"_c{CAUSAL}_ta{TRANSPOSE_A}"
-            ),
             gx,
             gy,
             batch * ksplits,
@@ -5500,7 +5464,6 @@ def _apple8_fat_enqueue[
     var c_out = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
     _enqueue_cached[_ksplit_reduce_kernel](
         ctx,
-        String("ksplit_reduce"),
         ceildiv(total, 1024),
         1,
         1,
@@ -5831,9 +5794,6 @@ def _tune_enqueue[
                 ]
             ](
                 ctx,
-                String(
-                    t"tune_p3_{BM}x{BN}x{BK}_{TM}{TN}_s{STAGES}_mb{MINB}_bs{BIAS}"
-                ),
                 gx,
                 gy,
                 batch * ksplits,
@@ -5853,7 +5813,6 @@ def _tune_enqueue[
                 _gemm_pipe_kernel[BM, BN, BK, TM, TN, 4, 4, transpose_b]
             ](
                 ctx,
-                String(t"tune_p_{BM}x{BN}x{BK}_{TM}{TN}_tb{transpose_b}"),
                 gx,
                 gy,
                 batch * ksplits,
@@ -5877,7 +5836,6 @@ def _tune_enqueue[
             )
             _enqueue_cached[_ksplit_reduce_kernel](
                 ctx,
-                String("ksplit_reduce"),
                 ceildiv(total, 1024),
                 1,
                 1,
@@ -5925,7 +5883,6 @@ def _ct_enqueue[
         var at_out = _make_ptr[DType.float32](at_addr).as_unsafe_any_origin()
         _enqueue_cached[_transpose_small_kernel](
             ctx,
-            String("transpose_small"),
             ceildiv(m * k, 256),
             1,
             1,
@@ -5949,7 +5906,6 @@ def _ct_enqueue[
             ]
         ](
             ctx,
-            String(t"gemm_ct_{BM}x{BN}x{BK}_{TM}{TN}_s{STAGES}_mb{MINB}"),
             ceildiv(m, BN),
             ceildiv(n, BM),
             1,
@@ -5995,7 +5951,6 @@ def _pipe3t_enqueue[
         var at_out = _make_ptr[DType.float32](at_addr).as_unsafe_any_origin()
         _enqueue_cached[_transpose_small_kernel](
             ctx,
-            String("transpose_small"),
             ceildiv(m * k, 256),
             1,
             1,
@@ -6028,7 +5983,6 @@ def _pipe3t_enqueue[
             ]
         ](
             ctx,
-            String(t"gemm_p3t_{BM}x{BN}x{BK}_{TM}{TN}_s{STAGES}_mb{MINB}"),
             gx,
             gy,
             ksplits,
@@ -6053,7 +6007,6 @@ def _pipe3t_enqueue[
             )
             _enqueue_cached[_ksplit_reduce_kernel](
                 ctx,
-                String("ksplit_reduce"),
                 ceildiv(total, 1024),
                 1,
                 1,
@@ -6576,7 +6529,6 @@ def _gemm_f64_enqueue[
             _gemm_tiled_kernel[DType.float64, 32, 32, 16, 2, 2, transpose_b]
         ](
             ctx,
-            String(t"gemm_t32_float64_tb{transpose_b}"),
             ceildiv(n, 32),
             ceildiv(m, 32),
             batch,

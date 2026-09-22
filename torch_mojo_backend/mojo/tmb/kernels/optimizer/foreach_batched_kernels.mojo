@@ -670,7 +670,6 @@ def foreach_ew_enqueue[
     else:
         _enqueue_cached[_foreach_ew_kernel[dtype, op]](
             ctx,
-            String(t"FOREACH_EW_{op}_{dtype}_V1"),
             total_chunks,
             1,
             1,

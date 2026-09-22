@@ -471,7 +471,6 @@ def _scatter_buffer[
         else:
             _enqueue_cached[_scatter_cast[dt, storage]](
                 ctx,
-                "scatter_init_" + String(dt),
                 ceildiv(count, BLOCK),
                 1,
                 1,
@@ -507,7 +506,6 @@ def _finish_scatter[
     comptime if storage != dt:
         _enqueue_cached[_scatter_cast[storage, dt]](
             ctx,
-            "scatter_finish_" + String(dt),
             ceildiv(count, BLOCK),
             1,
             1,
@@ -739,7 +737,6 @@ def _launch_backward[dt: DType, pool: Bool](argv: Argv, argc: Int) raises:
         )
         _enqueue_cached[_pool_scatter[dt, acc, storage]](
             ctx,
-            "_pool_scatter_" + String(dt),
             blocks,
             1,
             1,
@@ -760,7 +757,6 @@ def _launch_backward[dt: DType, pool: Bool](argv: Argv, argc: Int) raises:
         var aligned = Int64(_raw_int(argv[unsafe_offset=13]))
         _enqueue_cached[_align_scatter[dt, acc, storage]](
             ctx,
-            "_align_scatter_" + String(dt),
             blocks,
             1,
             1,
@@ -828,7 +824,6 @@ def _enqueue_forward[
                 var geom = geometry.unsafe_ptr().as_unsafe_any_origin()
                 _enqueue_cached[_pool_geometry[dt, acc]](
                     ctx,
-                    "roi_pool_geometry_" + String(dt),
                     min(ceildiv(Int(k * ph * pw), BLOCK), sm * 8),
                     1,
                     1,
@@ -845,7 +840,6 @@ def _enqueue_forward[
                 )
                 _enqueue_cached[_pool_forward[dt, acc, fast, True]](
                     ctx,
-                    "roi_pool_fwd_geometry_" + String(dt),
                     blocks,
                     1,
                     1,
@@ -872,7 +866,6 @@ def _enqueue_forward[
                 return
         _enqueue_cached[_pool_forward[dt, acc, fast, False]](
             ctx,
-            "roi_pool_fwd_" + String(dt) + "_" + String(fast),
             blocks,
             1,
             1,
@@ -899,7 +892,6 @@ def _enqueue_forward[
         var aligned = Int64(_raw_int(argv[unsafe_offset=13]))
         _enqueue_cached[_align_forward[dt, acc, fast]](
             ctx,
-            "roi_align_fwd_" + String(dt) + "_" + String(fast),
             blocks,
             1,
             1,
@@ -1224,7 +1216,6 @@ def _enqueue_ps[
         div_c = _divisor(Int(c // (ph * pw)))
     _enqueue_cached[_ps_roi[dt, acc, out_dt, pool, backward, fast]](
         ctx,
-        "ps_roi_" + String(dt) + String(pool) + String(backward) + String(fast),
         blocks,
         1,
         1,

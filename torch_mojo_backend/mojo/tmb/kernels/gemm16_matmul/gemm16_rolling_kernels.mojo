@@ -129,16 +129,19 @@ from tmb.kernels.gemm16_matmul.gemm16_nn_v4_kernels import (
     _v4_persistent_ragged_tag,
 )
 
-# Named here only so the launch cache key can spell the build identity of the
-# epilogue: the selected instruction sequence differs between the two values,
-# so two builds of this family must not share one cached DeviceFunction.
+# The one place this define is read. It travels from here as the `pair_cast`
+# comptime parameter of the kernels below, never read again inside them: the
+# selected instruction sequence differs between the two values, so it has to
+# be part of the launch cache key, and only a parameter of the kernel is (the
+# key is the kernel's linkage name, and a define read in its body is invisible
+# there -- two builds of this family would share one cached DeviceFunction).
 comptime _ROLL_PAIR_CAST = get_defined_bool["PAIR_CAST", False]()
 
 
 @always_inline
-def _pack_accum_pair(x: Float32, y: Float32) -> Float32:
+def _pack_accum_pair[pair_cast: Bool](x: Float32, y: Float32) -> Float32:
     # Optional instruction-selection experiment, retaining identical rounding.
-    comptime if get_defined_bool["PAIR_CAST", False]():
+    comptime if pair_cast:
         return bitcast[DType.float32, 1](
             SIMD[DType.float32, 2](x, y).cast[_V4_DT]()
         )
@@ -150,7 +153,7 @@ def _pack_accum_pair(x: Float32, y: Float32) -> Float32:
 
 @always_inline
 def _store_accum_bm_boxes_stmatrix[
-    bm: Int, bn: Int, has_bias: Bool
+    bm: Int, bn: Int, has_bias: Bool, pair_cast: Bool
 ](
     c_smem: Pointer[
         Scalar[_V4_DT], MutAnyOrigin, address_space=AddressSpace.SHARED
@@ -206,19 +209,19 @@ def _store_accum_bm_boxes_stmatrix[
             data = _v4_bias_epilogue_quad[bn](accum, t, lane, bias, n0, n)
         else:
             data = SIMD[DType.float32, 4](
-                _pack_accum_pair(
+                _pack_accum_pair[pair_cast](
                     accum.ptr[unsafe_offset=8 * t],
                     accum.ptr[unsafe_offset=8 * t + 1],
                 ),
-                _pack_accum_pair(
+                _pack_accum_pair[pair_cast](
                     accum.ptr[unsafe_offset=8 * t + 2],
                     accum.ptr[unsafe_offset=8 * t + 3],
                 ),
-                _pack_accum_pair(
+                _pack_accum_pair[pair_cast](
                     accum.ptr[unsafe_offset=8 * t + 4],
                     accum.ptr[unsafe_offset=8 * t + 5],
                 ),
-                _pack_accum_pair(
+                _pack_accum_pair[pair_cast](
                     accum.ptr[unsafe_offset=8 * t + 6],
                     accum.ptr[unsafe_offset=8 * t + 7],
                 ),
@@ -244,6 +247,9 @@ def _rolling_persistent_body[
     # a live pointer only when has_bias -- callers with has_bias=False pass
     # any valid pointer (never read) rather than a constructed null one.
     has_bias: Bool,
+    # The epilogue's PAIR_CAST build identity, threaded in rather than read
+    # here, so that it reaches the launch cache key (see `_ROLL_PAIR_CAST`).
+    pair_cast: Bool,
     a_tile_shape: IndexList[2],
     a_desc_shape: IndexList[2],
     b_tile_shape: IndexList[2],
@@ -632,7 +638,7 @@ def _rolling_persistent_body[
                         # staging tile is overwritten.
                         c_tma.wait_group[0]()
                     named_barrier[NCONS](1)
-                    _store_accum_bm_boxes_stmatrix[bm, bn, has_bias](
+                    _store_accum_bm_boxes_stmatrix[bm, bn, has_bias, pair_cast](
                         c_smem.ptr,
                         accum,
                         warp,
@@ -738,6 +744,10 @@ def _rolling_persistent_ws[
     # kernel parameter rather than a build define -- see try_enqueue_
     # candidate_nn in gemm16_candidate_dispatch.mojo for the measured value.
     group: Int = 4,
+    # The epilogue's PAIR_CAST build identity (`_ROLL_PAIR_CAST`), a parameter
+    # so the launch cache distinguishes the two builds. Positioned after
+    # `group` so every existing positional instantiation is unchanged.
+    pair_cast: Bool = _ROLL_PAIR_CAST,
     a_tile_shape: IndexList[2] = Index(_V4_BK, bm) if col_a else Index(
         bm, _V4_BK
     ),
@@ -774,6 +784,7 @@ def _rolling_persistent_ws[
         ragged_n,
         group,
         False,
+        pair_cast,
         a_tile_shape,
         a_desc_shape,
         b_tile_shape,
@@ -804,7 +815,13 @@ def _rolling_persistent_ws[
     t"{_GEMM16_TAG}_gemm_nt_bias_rolling_ws_m{bm}n{bn}_s{stages}c{cluster_m}wg{consumers}g{group}"
 )
 def _nt_bias_rolling_ws[
-    stages: Int, cluster_m: Int, bm: Int, bn: Int, consumers: Int, group: Int
+    stages: Int,
+    cluster_m: Int,
+    bm: Int,
+    bn: Int,
+    consumers: Int,
+    group: Int,
+    pair_cast: Bool = _ROLL_PAIR_CAST,
 ](
     a_tma: TMATensorTile[_V4_DT, 2, Index(bm, _V4_BK), Index(bm, _V4_BK)],
     b_tma: TMATensorTile[_V4_DT, 2, Index(64, _V4_BK), Index(64, _V4_BK)],
@@ -828,6 +845,7 @@ def _nt_bias_rolling_ws[
         True,
         group,
         True,
+        pair_cast,
         Index(bm, _V4_BK),
         Index(bm, _V4_BK),
         Index(64, _V4_BK),
@@ -935,10 +953,11 @@ def enqueue_rolling_persistent[
     var grid_x = num_clusters * cluster_m
     comptime DYN_SMEM = _v4_persistent_smem_bytes[stages, bm, bn, tma_store]()
     # Compiled once per process and context: `ctx.enqueue_function[kernel]`
-    # re-runs compile_function on every launch. The key names what selects
-    # the code -- dtype, geometry, stages, layout, epilogue, raster group
-    # and the PAIR_CAST build define -- and nothing about this call's
-    # pointers or its m/n/k, which travel as arguments. The cluster shape
+    # re-runs compile_function on every launch. The key is the kernel's
+    # linkage name, so everything that selects the code -- dtype, geometry,
+    # stages, layout, epilogue, raster group, `pair_cast` -- is one of its
+    # comptime parameters, and nothing about this call's pointers or its
+    # m/n/k, which travel as arguments. The cluster shape
     # rides on the kernel's own `nvvm.cluster_dim` metadata, as it did
     # before.  has_bias picks which DEVICE KERNEL is launched (see their
     # docstrings): _rolling_persistent_ws's own ABI never gains a `bias`
@@ -952,9 +971,6 @@ def enqueue_rolling_persistent[
             dyn_smem=DYN_SMEM,
         ](
             ctx,
-            String(
-                t"ntbroll2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_g{group}"
-            ),
             grid_x,
             1,
             1,
@@ -986,9 +1002,6 @@ def enqueue_rolling_persistent[
             dyn_smem=DYN_SMEM,
         ](
             ctx,
-            String(
-                t"g16roll2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_{Int(tma_store)}{Int(col_a)}{Int(kmaj_b)}{Int(ragged_n)}_g{group}_p{Int(_ROLL_PAIR_CAST)}"
-            ),
             grid_x,
             1,
             1,

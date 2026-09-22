@@ -213,9 +213,6 @@ def _enqueue_one[
 ) raises:
     _enqueue_cached[_fused_kernel[dtype, has_mask, causal, VEC]](
         ctx,
-        String(
-            t"sdpa_dropout_softmax_bwd_{dtype}_m{has_mask}_c{causal}_v{VEC}"
-        ),
         min(ceildiv(rows, _WARPS_PER_BLOCK), _MAX_GRID),
         1,
         1,
@@ -841,7 +838,6 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
             comptime if HAS_MASK:
                 _enqueue_cached[_masked_causal_warp_f32[_CVEC, VPT]](
                     ctx,
-                    String(t"sdpa_dsb_masked_causal_warp_f32_{_CVEC}_{VPT}"),
                     warp_grid,
                     1,
                     1,
@@ -859,7 +855,6 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
             else:
                 _enqueue_cached[_unmasked_causal_warp_f32[_CVEC, VPT]](
                     ctx,
-                    String(t"sdpa_dsb_unmasked_causal_warp_f32_{_CVEC}_{VPT}"),
                     warp_grid,
                     1,
                     1,
@@ -892,7 +887,6 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
         elif causal and has_mask:
             _enqueue_cached[_masked_causal_f32](
                 ctx,
-                "sdpa_dropout_softmax_backward_masked_causal_f32",
                 grid,
                 1,
                 1,
@@ -910,7 +904,6 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
         elif causal:
             _enqueue_cached[_unmasked_causal_f32](
                 ctx,
-                "sdpa_dropout_softmax_backward_unmasked_causal_f32",
                 grid,
                 1,
                 1,
@@ -927,7 +920,6 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
             var mask_ptr = mask.value()
             _enqueue_cached[_masked_f32](
                 ctx,
-                "sdpa_dropout_softmax_backward_masked_f32",
                 grid,
                 1,
                 1,
@@ -944,7 +936,6 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
         else:
             _enqueue_cached[_unmasked_f32](
                 ctx,
-                "sdpa_dropout_softmax_backward_unmasked_f32",
                 grid,
                 1,
                 1,

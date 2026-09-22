@@ -515,7 +515,6 @@ def enqueue_layer_norm_backward_dx_f32(
                 if needed <= 1:
                     _enqueue_cached[_dx_c1](
                         ctx,
-                        "layer_norm_backward_dx_f32_c1",
                         grid,
                         1,
                         1,
@@ -534,7 +533,6 @@ def enqueue_layer_norm_backward_dx_f32(
                 elif needed <= 2:
                     _enqueue_cached[_dx_c2](
                         ctx,
-                        "layer_norm_backward_dx_f32_c2",
                         grid,
                         1,
                         1,
@@ -553,7 +551,6 @@ def enqueue_layer_norm_backward_dx_f32(
                 elif needed <= 3:
                     _enqueue_cached[_dx_c3](
                         ctx,
-                        "layer_norm_backward_dx_f32_c3",
                         grid,
                         1,
                         1,
@@ -572,7 +569,6 @@ def enqueue_layer_norm_backward_dx_f32(
                 elif needed <= 4:
                     _enqueue_cached[_dx_c4](
                         ctx,
-                        "layer_norm_backward_dx_f32_c4",
                         grid,
                         1,
                         1,
@@ -591,7 +587,6 @@ def enqueue_layer_norm_backward_dx_f32(
                 elif needed <= 6:
                     _enqueue_cached[_dx_c6](
                         ctx,
-                        "layer_norm_backward_dx_f32_c6",
                         grid,
                         1,
                         1,
@@ -610,7 +605,6 @@ def enqueue_layer_norm_backward_dx_f32(
                 else:
                     _enqueue_cached[_dx_c8](
                         ctx,
-                        "layer_norm_backward_dx_f32_c8",
                         grid,
                         1,
                         1,
@@ -631,7 +625,6 @@ def enqueue_layer_norm_backward_dx_f32(
                 if needed <= _WIDE_CHUNKS:
                     _enqueue_cached[_dx_c16](
                         ctx,
-                        "layer_norm_backward_dx_f32_c16",
                         min(ceildiv(rows, _WIDE_WARPS), _MAX_GRID),
                         1,
                         1,
@@ -651,7 +644,6 @@ def enqueue_layer_norm_backward_dx_f32(
         var grid = min(rows, _MAX_GRID)
         _enqueue_cached[_dx_generic](
             ctx,
-            "layer_norm_backward_dx_f32_generic",
             grid,
             1,
             1,

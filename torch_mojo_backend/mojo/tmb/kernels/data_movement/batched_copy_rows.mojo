@@ -161,7 +161,6 @@ def copy_batched_rows(
         if tiles > 0 and small:
             _enqueue_cached[_copy_rows_small_kernel](
                 ctx,
-                "copy_batched_rows_u16_small",
                 count,
                 max_rows,
                 1,
@@ -171,7 +170,6 @@ def copy_batched_rows(
         elif tiles > 0:
             _enqueue_cached[_copy_rows_kernel](
                 ctx,
-                "copy_batched_rows_u16_v8",
                 min(tiles, 1 << 22),
                 1,
                 1,

@@ -338,7 +338,6 @@ def _permute_copy[
             var slots = total // VEC
             _enqueue_cached[_run_gather_kernel[dtype, VEC]](
                 ctx,
-                String(t"dm_rungather_{dtype}_v{VEC}"),
                 _gs_blocks(slots),
                 1,
                 1,
@@ -371,7 +370,6 @@ def _permute_copy[
                 if nrows >= 4096:
                     _enqueue_cached[_permute_copy_rowloop_kernel[dtype]](
                         ctx,
-                        String(t"dm_permute_rowloop_{dtype}"),
                         _gs_blocks(nrows),
                         1,
                         1,
@@ -390,7 +388,6 @@ def _permute_copy[
                 var nchunks = total // 4
                 _enqueue_cached[_permute_copy_rows4_kernel[dtype]](
                     ctx,
-                    String(t"dm_permute_rows4_{dtype}"),
                     _gs_blocks(nchunks),
                     1,
                     1,
@@ -450,7 +447,6 @@ def _permute_copy[
         ):
             _enqueue_cached[_transpose2d_kernel[dtype]](
                 ctx,
-                String(t"transpose2d_{dtype}"),
                 (d3 + TILE - 1) // TILE,
                 min((d2 + TILE - 1) // TILE, _MAX_GRID_Y),
                 min(batch, _MAX_GRID_Y),
@@ -467,7 +463,6 @@ def _permute_copy[
             return
         _enqueue_cached[_permute_copy_kernel[dtype]](
             ctx,
-            String(t"dm_permute_{dtype}"),
             _gs_blocks(total),
             1,
             1,
@@ -945,7 +940,6 @@ def _cat_launch_width[
             comptime if dtype == DType.bfloat16 and out_dtype == DType.float32 and _has_sm_9x():
                 _enqueue_cached[_cat_cast_kernel[width]](
                     ctx,
-                    String(t"cat_cast_rows_bf16_f32_v{width}"),
                     gx,
                     gy,
                     1,
@@ -962,7 +956,6 @@ def _cat_launch_width[
         elif has_apple_gpu_accelerator():
             _enqueue_cached[_cat_slots_kernel[dtype, width]](
                 ctx,
-                String(t"dm_cat_slots_{dtype}_{width}"),
                 gx,
                 gy,
                 1,
@@ -985,7 +978,6 @@ def _cat_launch_width[
         else:
             _enqueue_cached[_cat_batched_kernel[dtype, width]](
                 ctx,
-                String(t"dm_cat_batched_{dtype}_{width}"),
                 gx,
                 gy,
                 1,
@@ -1274,7 +1266,6 @@ def _narrow_copy_dst[
                 var gx = min((copy_len4 + GS_THREADS - 1) // GS_THREADS, 32)
                 _enqueue_cached[_narrow_copy_dst_kernel2d[dtype]](
                     ctx,
-                    String(t"dm_narrowdst2d_{dtype}"),
                     max(gx, 1),
                     outer,
                     1,
@@ -1289,7 +1280,6 @@ def _narrow_copy_dst[
             var nchunks = outer * copy_len4
             _enqueue_cached[_narrow_copy_dst_kernel4[dtype]](
                 ctx,
-                String(t"dm_narrowdst4_{dtype}"),
                 _gs_blocks(nchunks),
                 1,
                 1,
@@ -1305,7 +1295,6 @@ def _narrow_copy_dst[
             var total = outer * copy_len
             _enqueue_cached[_narrow_copy_dst_kernel1[dtype]](
                 ctx,
-                String(t"dm_narrowdst1_{dtype}"),
                 _gs_blocks(total),
                 1,
                 1,
@@ -1641,7 +1630,6 @@ def _where_bcast[
                 var slots = max(1, total // VW)
                 _enqueue_cached[_where_flat_vec_kernel[dtype]](
                     ctx,
-                    String(t"dm_where_fv_{dtype}"),
                     _bw_flat_blocks(slots, traffic),
                     1,
                     1,
@@ -1658,7 +1646,6 @@ def _where_bcast[
 
             _enqueue_cached[_where_bcast_kernel[dtype]](
                 ctx,
-                String(t"dm_where_bc_{dtype}"),
                 _gs_blocks(total),
                 1,
                 1,
@@ -1873,7 +1860,6 @@ def _masked_fill_scalar_bcast[
             var slots = max(1, total // VW)
             _enqueue_cached[_masked_fill_scalar_flat_vec_kernel[dtype]](
                 ctx,
-                String(t"dm_mfs_fv_{dtype}"),
                 _bw_flat_blocks(slots, traffic),
                 1,
                 1,
@@ -1889,7 +1875,6 @@ def _masked_fill_scalar_bcast[
 
         _enqueue_cached[_masked_fill_scalar_bcast_kernel[dtype]](
             ctx,
-            String(t"dm_mfs_bc_{dtype}"),
             _gs_blocks(total),
             1,
             1,
@@ -2272,7 +2257,6 @@ def _cast[
             )
             _enqueue_cached[_cast_vec_kernel[src, dst, VEC]](
                 ctx,
-                String(t"dm_cast_{src}_{dst}_v{VEC}"),
                 _bw_blocks(
                     nvec,
                     SLOTS,
@@ -2742,7 +2726,6 @@ def _repeat_seg_launch[
     var gy = _repeat_quantize(ceildiv(nout, ty), _MAX_GRID_Y)
     _enqueue_cached_2d[_repeat_seg_kernel[dtype, VEC]](
         ctx,
-        String(t"dm_rptseg_{dtype}_v{VEC}"),
         _repeat_quantize(ceildiv(nseg, tx), _BW_MAX_BLOCKS),
         gy,
         1,
@@ -2785,7 +2768,6 @@ def _repeat_flat_launch[
     var gy = _repeat_quantize(ceildiv(nout, ty), _MAX_GRID_Y)
     _enqueue_cached_2d[_repeat_flat_kernel[dtype, VEC]](
         ctx,
-        String(t"dm_rptflat_{dtype}_v{VEC}"),
         gx,
         gy,
         1,
@@ -3258,7 +3240,6 @@ def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
         if vector:
             _enqueue_cached[_index_put_rows_kernel[dtype, vector_width]](
                 ctx,
-                kernel_name + String(vector_width),
                 blocks,
                 1,
                 1,
@@ -3274,7 +3255,6 @@ def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
         else:
             _enqueue_cached[_index_put_rows_kernel[dtype, 1]](
                 ctx,
-                kernel_name + "1",
                 blocks,
                 1,
                 1,

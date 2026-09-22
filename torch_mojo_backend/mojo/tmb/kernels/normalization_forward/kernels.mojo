@@ -709,7 +709,6 @@ def _enqueue_norm_cached[
         _norm_rows_cached_kernel[dtype, threads, vecs, affine, ragged]
     ](
         ctx,
-        String(t"norm_rows_cached_{dtype}_{affine}_{threads}_{vecs}_{ragged}"),
         max(1, min(rows, _MAX_GRID)),
         1,
         1,
@@ -752,7 +751,6 @@ def _enqueue_norm_warp[
 ) raises:
     _enqueue_cached[_ln_fwd_warp_kernel[dtype, chunks]](
         ctx,
-        String(t"ln_fwd_warp_{dtype}_c{chunks}"),
         max(1, min(ceildiv(rows, _WARPS_PER_BLOCK), _MAX_GRID)),
         1,
         1,
@@ -1030,7 +1028,6 @@ def enqueue_norm_rows[
 
     _enqueue_cached[_norm_rows_moments_kernel[dtype, affine]](
         ctx,
-        String(t"norm_rows_moments_{dtype}_{affine}"),
         max(1, min(rows, _MAX_GRID)),
         1,
         1,

@@ -679,7 +679,6 @@ def try_enqueue_tn_f32_gemm(
         if ksplits > SPLITK_GENERIC_CAP:
             _enqueue_cached[_tn_ksplit_reduce_wide_kernel](
                 ctx,
-                String("tn_ksplit_reduce_wide"),
                 ceildiv(total, 128),
                 1,
                 1,
@@ -692,7 +691,6 @@ def try_enqueue_tn_f32_gemm(
         else:
             _enqueue_cached[_ksplit_reduce_kernel](
                 ctx,
-                String("ksplit_reduce"),
                 gxr,
                 1,
                 1,

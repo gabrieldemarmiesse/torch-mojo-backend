@@ -441,6 +441,23 @@ max_abs 3.8e-6 vs CPU, argmax match on both models).
   brings enqueue to ~2 µs. (When benchmarking enqueue cost, beware
   stream backpressure: past ~1000 queued launches the enqueue rate
   degrades to the kernel rate and masquerades as CPU cost.)
+- **The registry name has to be a compile-time constant.** The cache above
+  only pays off if finding the entry is cheap, and formatting one
+  `t"TMB_KERNEL_{key}_{smem}_{id}"` per launch was ~3 ms of `String` work
+  per GPT-2 XL training step. `_enqueue_cached` therefore takes no key: the
+  code identity is `func` itself, whose mangled name (`get_linkage_name`)
+  carries every comptime parameter it was instantiated with, hashed at
+  comptime into a 21-byte `StaticString`; that names a small per-device
+  table of compiled functions, so a launch does one registry probe and no
+  allocation. The consequence for kernel authors is a rule: everything that
+  selects the generated code must be a comptime parameter of the kernel,
+  never a build define read inside its body. A define may still *choose* the
+  value, as the gemm16 kernels' `pair_cast` / `rolling` parameters do
+  (`pair_cast: Bool = _ROLL_PAIR_CAST`): a defaulted parameter's value is
+  rendered into the linkage name like any other, so the two builds keep
+  separate cache entries. What is invisible to the key is a `get_defined_*`
+  call in the body, and one process does hold several builds of a family at
+  once -- the defines are part of the `.so` cache key, not of the kernel's.
 - **Fully comptime-unrolled GEMM inner loops explode register pressure**
   (~190 regs/thread → 1 block/SM → 12.5% occupancy). Keep the K-slab
   loop a runtime loop (register-tile indexing stays comptime) and set

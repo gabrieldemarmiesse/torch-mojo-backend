@@ -616,7 +616,6 @@ def enqueue_batch_norm_stats[
         # launch.
         _enqueue_cached[_bn_moments_fused_kernel[dtype, sdtype]](
             ctx,
-            String(t"bn_moments_fused_{dtype}_{sdtype}"),
             channels,
             1,
             1,
@@ -651,7 +650,6 @@ def enqueue_batch_norm_stats[
     for repass in range(2):
         _enqueue_cached[_bn_moments_kernel[dtype]](
             ctx,
-            String(t"bn_moments_{dtype}"),
             channels,
             n_splits,
             1,
@@ -667,7 +665,6 @@ def enqueue_batch_norm_stats[
         )
         _enqueue_cached[_bn_merge_kernel[dtype, sdtype]](
             ctx,
-            String(t"bn_merge_{dtype}_{sdtype}"),
             merge_blocks,
             1,
             1,
@@ -745,7 +742,6 @@ def enqueue_batch_norm_elementwise[
             _bn_elementwise_kernel[dtype, pdtype, sdtype, V, from_invstd]
         ](
             ctx,
-            String(t"bn_elemwise_{dtype}_{pdtype}_{sdtype}_{from_invstd}_v"),
             grid_x,
             grid_y,
             1,
@@ -770,7 +766,6 @@ def enqueue_batch_norm_elementwise[
         _bn_elementwise_kernel[dtype, pdtype, sdtype, 1, from_invstd]
     ](
         ctx,
-        String(t"bn_elemwise_{dtype}_{pdtype}_{sdtype}_{from_invstd}_s"),
         grid_x,
         grid_y,
         1,

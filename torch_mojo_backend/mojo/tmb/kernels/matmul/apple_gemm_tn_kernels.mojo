@@ -359,7 +359,6 @@ def apple_tn_enqueue[
         var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
         _enqueue_cached[_apple8_tn_kernel[False, BM, BN, SGR, SGC]](
             ctx,
-            String(t"apple8_tn_{BM}x{BN}_{SGR}x{SGC}"),
             gx,
             gy,
             batch,
@@ -380,7 +379,6 @@ def apple_tn_enqueue[
     ).as_unsafe_any_origin()
     _enqueue_cached[_apple8_tn_kernel[True, BM, BN, SGR, SGC]](
         ctx,
-        String(t"apple8_tn_split_{BM}x{BN}_{SGR}x{SGC}"),
         gx,
         gy,
         batch * ksplits,
@@ -398,7 +396,6 @@ def apple_tn_enqueue[
     var c_out = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
     _enqueue_cached[_tn_ksplit_reduce_kernel](
         ctx,
-        String("tn_ksplit_reduce"),
         ceildiv(total, 1024),
         1,
         1,

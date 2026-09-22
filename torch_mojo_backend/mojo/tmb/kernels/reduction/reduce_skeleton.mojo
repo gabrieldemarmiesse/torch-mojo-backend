@@ -1006,7 +1006,6 @@ def _reduce_generic[
                         _reduce_contig_kernel[Op, dtype, WARP_SIZE]
                     ](
                         ctx,
-                        String(t"reduce_contig_{Op.name}_{dtype}_w"),
                         warp_blocks,
                         1,
                         1,
@@ -1021,7 +1020,6 @@ def _reduce_generic[
                     return
                 _enqueue_cached[_reduce_contig_kernel[Op, dtype, RED_THREADS]](
                     ctx,
-                    String(t"reduce_contig_{Op.name}_{dtype}_b"),
                     base_blocks,
                     1,
                     1,
@@ -1036,7 +1034,6 @@ def _reduce_generic[
             else:
                 _enqueue_cached[_reduce_strided_kernel[Op, dtype]](
                     ctx,
-                    String(t"reduce_strided_{Op.name}_{dtype}"),
                     base_blocks,
                     1,
                     1,
@@ -1061,7 +1058,6 @@ def _reduce_generic[
             # which is the opposite of the warp-per-row regime's precondition.
             _enqueue_cached[_reduce_contig_kernel[Op, dtype, RED_THREADS]](
                 ctx,
-                String(t"reduce_contig_{Op.name}_{dtype}_b"),
                 base_blocks,
                 splits,
                 1,
@@ -1076,7 +1072,6 @@ def _reduce_generic[
         else:
             _enqueue_cached[_reduce_strided_kernel[Op, dtype]](
                 ctx,
-                String(t"reduce_strided_{Op.name}_{dtype}"),
                 base_blocks,
                 splits,
                 1,
@@ -1096,7 +1091,6 @@ def _reduce_generic[
         if outputs <= _device_sm_count(ctx):
             _enqueue_cached[_reduce_merge_block_kernel[Op, dtype]](
                 ctx,
-                String(t"reduce_merge_block_{Op.name}_{dtype}"),
                 outputs,
                 1,
                 1,
@@ -1110,7 +1104,6 @@ def _reduce_generic[
         else:
             _enqueue_cached[_reduce_merge_thread_kernel[Op, dtype]](
                 ctx,
-                String(t"reduce_merge_thread_{Op.name}_{dtype}"),
                 ceildiv(outputs, RED_THREADS),
                 1,
                 1,

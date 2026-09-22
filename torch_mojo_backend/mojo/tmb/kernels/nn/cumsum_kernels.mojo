@@ -403,7 +403,6 @@ def enqueue_cumsum_rows[
     if threads == INNER_THREADS_BIG:
         _enqueue_cached[_cumsum_inner_lines_kernel[dtype, INNER_THREADS_BIG]](
             ctx,
-            String(t"cumsum_rows_{dtype}_{INNER_THREADS_BIG}"),
             blocks,
             1,
             1,
@@ -416,7 +415,6 @@ def enqueue_cumsum_rows[
     else:
         _enqueue_cached[_cumsum_inner_lines_kernel[dtype, INNER_THREADS_SMALL]](
             ctx,
-            String(t"cumsum_rows_{dtype}_{INNER_THREADS_SMALL}"),
             blocks,
             1,
             1,
@@ -463,7 +461,6 @@ def enqueue_cumsum_rows_workspace[
         _cumsum_chunk_reduce_kernel[dtype, WS_THREADS, WS_CHUNK_TILES]
     ](
         ctx,
-        String(t"cumsum_reduce_{dtype}_{WS_THREADS}_{WS_CHUNK_TILES}"),
         total_chunks,
         1,
         1,
@@ -483,7 +480,6 @@ def enqueue_cumsum_rows_workspace[
             _cumsum_inner_lines_kernel[acc, INNER_THREADS_BIG, True]
         ](
             ctx,
-            String(t"cumsum_ws_scan_{acc}_{INNER_THREADS_BIG}"),
             sm_blocks,
             1,
             1,
@@ -498,7 +494,6 @@ def enqueue_cumsum_rows_workspace[
             _cumsum_inner_lines_kernel[acc, INNER_THREADS_SMALL, True]
         ](
             ctx,
-            String(t"cumsum_ws_scan_{acc}_{INNER_THREADS_SMALL}"),
             sm_blocks,
             1,
             1,
@@ -513,7 +508,6 @@ def enqueue_cumsum_rows_workspace[
         _cumsum_chunk_finish_kernel[dtype, WS_THREADS, WS_CHUNK_TILES]
     ](
         ctx,
-        String(t"cumsum_finish_{dtype}_{WS_THREADS}_{WS_CHUNK_TILES}"),
         total_chunks,
         1,
         1,
@@ -541,7 +535,6 @@ def enqueue_cumsum_cols[
     var blocks = ceildiv(cols, OUTER_THREADS)
     _enqueue_cached[_cumsum_outer_kernel[dtype, OUTER_THREADS]](
         ctx,
-        String(t"cumsum_cols_{dtype}_{OUTER_THREADS}"),
         blocks,
         1,
         1,

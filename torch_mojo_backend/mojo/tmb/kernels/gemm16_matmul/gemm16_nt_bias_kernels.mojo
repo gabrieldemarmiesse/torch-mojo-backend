@@ -136,8 +136,8 @@ def _v4c_nt_defer_tag[defer_release: Bool]() -> StaticString:
 
 
 @always_inline
-def _v4c_nt_rolling_tag() -> StaticString:
-    comptime if _NT_ROLLING:
+def _v4c_nt_rolling_tag[rolling: Bool]() -> StaticString:
+    comptime if rolling:
         return "_rolling"
     else:
         return ""
@@ -155,10 +155,17 @@ def _v4c_nt_rolling_tag() -> StaticString:
 # a 16-hex hash that moves on any refactor -- which is both unreadable and,
 # once this family serves float16 too, wrong about the dtype.
 @__name(
-    t"{_GEMM16_TAG}_gemm_nt_bias_v4_persistent_m{_V4_BM}n{bn}_s{stages}g{raster_h}{_v4c_nt_defer_tag[defer_release]()}{_v4c_nt_rolling_tag()}"
+    t"{_GEMM16_TAG}_gemm_nt_bias_v4_persistent_m{_V4_BM}n{bn}_s{stages}g{raster_h}{_v4c_nt_defer_tag[defer_release]()}{_v4c_nt_rolling_tag[rolling]()}"
 )
 def _v4c_nt_bias_persistent[
-    bn: Int, stages: Int, raster_h: Int, defer_release: Bool = False
+    bn: Int,
+    stages: Int,
+    raster_h: Int,
+    defer_release: Bool = False,
+    # The TUNE_NT_ROLLING build identity of the pipeline counters, threaded in
+    # rather than read here: the launch cache key is this kernel's linkage
+    # name, and a define read in its body would be invisible there.
+    rolling: Bool = _NT_ROLLING,
 ](
     a_tma: _V4_A_TMA,
     b_tma: TMATensorTile[
@@ -305,7 +312,7 @@ def _v4c_nt_bias_persistent[
                     while kt < num_k_tiles:
                         var stage = ring_stage
                         var phase = ring_phase
-                        comptime if not _NT_ROLLING:
+                        comptime if not rolling:
                             stage = gkt % stages
                             phase = UInt32((gkt // stages) % 2)
                         empty_barriers[unsafe_offset=stage].wait(phase)
@@ -363,7 +370,7 @@ def _v4c_nt_bias_persistent[
                                     (k0, n0 + half * B_HALF),
                                 )
                         kt += 1
-                        comptime if _NT_ROLLING:
+                        comptime if rolling:
                             ring_stage += 1
                             if ring_stage == stages:
                                 ring_stage = 0
@@ -413,7 +420,7 @@ def _v4c_nt_bias_persistent[
                 while kt < num_k_tiles:
                     var stage = ring_stage
                     var phase = ring_phase
-                    comptime if not _NT_ROLLING:
+                    comptime if not rolling:
                         stage = gkt % stages
                         phase = UInt32((gkt // stages) % 2)
                     full_barriers[unsafe_offset=stage].wait(phase)
@@ -467,7 +474,7 @@ def _v4c_nt_bias_persistent[
                                 UInt32(warp_group_thread_idx)
                             )
                     kt += 1
-                    comptime if _NT_ROLLING:
+                    comptime if rolling:
                         ring_stage += 1
                         if ring_stage == stages:
                             ring_stage = 0
@@ -581,18 +588,16 @@ def _v4c_enqueue_nt_bias_persistent[
     ](c_desc)
     comptime DYN_SMEM = _v4c_nt_smem_bytes[bn, stages]()
     # Compiled once per process and context (see gemm16_rolling_kernels.mojo):
-    # the key names dtype, tile width, stage count, raster height, the
-    # release discipline and the TUNE_NT_ROLLING build define -- everything
-    # that selects the code -- and nothing about this call's pointers or
-    # m/n/k. The two-CTA cluster rides on the kernel's own metadata.
+    # the key is the kernel's linkage name, so dtype, tile width, stage count,
+    # raster height, the release discipline and `rolling` -- everything that
+    # selects the code -- are comptime parameters of it, and nothing about
+    # this call's pointers or m/n/k. The two-CTA cluster rides on the kernel's
+    # own metadata.
     _enqueue_cached[
         _v4c_nt_bias_persistent[bn, stages, raster_h, defer_release],
         dyn_smem=DYN_SMEM,
     ](
         ctx,
-        String(
-            t"g16ntbias_{_GEMM16_TAG}_n{bn}_s{stages}_r{raster_h}_{Int(defer_release)}{Int(_NT_ROLLING)}"
-        ),
         grid_x,
         1,
         1,

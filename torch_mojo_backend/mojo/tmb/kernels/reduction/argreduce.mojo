@@ -579,7 +579,6 @@ def _ar_merge_launch[
     comptime if with_values:
         _enqueue_cached[_minmax_merge_kernel[dtype, is_min]](
             ctx,
-            String(t"minmax_merge_{dtype}_{is_min}"),
             outputs,
             1,
             1,
@@ -593,7 +592,6 @@ def _ar_merge_launch[
     else:
         _enqueue_cached[_argreduce_merge_kernel[dtype, is_min]](
             ctx,
-            String(t"argreduce_merge_{dtype}_{is_min}"),
             outputs,
             1,
             1,
@@ -649,7 +647,6 @@ def _argreduce_rows[
                 comptime if with_values:
                     _enqueue_cached[_minmax_rows_kernel[dtype, is_min, VEC]](
                         ctx,
-                        String(t"minmax_rows_{dtype}_{is_min}_v{VEC}"),
                         rows,
                         1,
                         1,
@@ -662,7 +659,6 @@ def _argreduce_rows[
                 else:
                     _enqueue_cached[_argreduce_rows_kernel[dtype, is_min, VEC]](
                         ctx,
-                        String(t"argreduce_rows_{dtype}_{is_min}_v{VEC}"),
                         rows,
                         1,
                         1,
@@ -678,7 +674,6 @@ def _argreduce_rows[
             var ws_idx_ptr = ws_idx.unsafe_ptr().as_unsafe_any_origin()
             _enqueue_cached[_argreduce_rows_split_kernel[dtype, is_min, VEC]](
                 ctx,
-                String(t"argreduce_rows_split_{dtype}_{is_min}_v{VEC}"),
                 rows,
                 splits,
                 1,
@@ -737,7 +732,6 @@ def _argreduce_cols[
             comptime if with_values:
                 _enqueue_cached[_minmax_cols_kernel[dtype, is_min]](
                     ctx,
-                    String(t"minmax_cols_{dtype}_{is_min}"),
                     lanes * outer,
                     1,
                     1,
@@ -752,7 +746,6 @@ def _argreduce_cols[
             else:
                 _enqueue_cached[_argreduce_cols_kernel[dtype, is_min]](
                     ctx,
-                    String(t"argreduce_cols_{dtype}_{is_min}"),
                     lanes * outer,
                     1,
                     1,
@@ -772,7 +765,6 @@ def _argreduce_cols[
         var ws_idx_ptr = ws_idx.unsafe_ptr().as_unsafe_any_origin()
         _enqueue_cached[_argreduce_cols_split_kernel[dtype, is_min]](
             ctx,
-            String(t"argreduce_cols_split_{dtype}_{is_min}"),
             lanes * outer,
             splits,
             1,

@@ -11,7 +11,9 @@ from tmb.graph.math_utils import custom_tan, ieee_sqrt
 from max.algorithm import elementwise
 from std.builtin.device_passable import DevicePassable
 from std.collections import OptionalReg
+from std.collections.string.string_span import get_static_string
 from std.ffi import _get_global_or_null, external_call
+from std.reflection import get_linkage_name
 from max.gpu.sync import barrier
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import (
@@ -254,6 +256,179 @@ def _dyn_smem_attr[dyn_bytes: Int]() -> OptionalReg[FuncAttribute]:
         return OptionalReg[FuncAttribute](None)
 
 
+# ---------------------------------------------------------------------------
+# The compiled-kernel cache: one `DeviceFunction` per (code identity,
+# dynamic-smem allowance, block rank, device), found without formatting or
+# allocating anything on the launch path.
+#
+# The identity of the generated code is `func` itself -- a comptime parameter
+# whose mangled name carries every comptime parameter it was instantiated
+# with -- so the registry name is derived from it at COMPILE time and the
+# launch only hashes a 21-byte constant. The earlier spelling took a hand-
+# written `key: String` and built `t"TMB_KERNEL_{key}_{dyn_smem}_{ctx.id()}"`
+# per launch, which was ~3 ms of String work per GPT-2 XL training step.
+# ---------------------------------------------------------------------------
+
+comptime _HEX = [
+    StaticString("0"),
+    StaticString("1"),
+    StaticString("2"),
+    StaticString("3"),
+    StaticString("4"),
+    StaticString("5"),
+    StaticString("6"),
+    StaticString("7"),
+    StaticString("8"),
+    StaticString("9"),
+    StaticString("a"),
+    StaticString("b"),
+    StaticString("c"),
+    StaticString("d"),
+    StaticString("e"),
+    StaticString("f"),
+]
+
+# Device ordinals (`DeviceContext.id()`) a kernel's cache line covers. One
+# `Int` slot each, allocated on that kernel's first launch.
+comptime _KCACHE_DEVICES = 16
+
+
+def _name_hash(s: StaticString) -> UInt64:
+    """FNV-1a of a comptime name — the loader hashes its own cache keys the
+    same way (`loader._slug`)."""
+    var h: UInt64 = 14695981039346656037
+    for b in s.as_bytes():
+        h ^= UInt64(b)
+        h *= 1099511628211
+    return h
+
+
+def _kcache_name[h: UInt64]() -> StaticString:
+    """`h` as a fixed 21-byte registry name.
+
+    Spelled out digit by digit because a comptime `String` cannot be
+    materialized as a `StaticString`, and only a `StaticString` reaches
+    `_get_global_or_null` without a copy.
+    """
+    return get_static_string[
+        "TMB_K",
+        _HEX[Int((h >> 60) & 15)],
+        _HEX[Int((h >> 56) & 15)],
+        _HEX[Int((h >> 52) & 15)],
+        _HEX[Int((h >> 48) & 15)],
+        _HEX[Int((h >> 44) & 15)],
+        _HEX[Int((h >> 40) & 15)],
+        _HEX[Int((h >> 36) & 15)],
+        _HEX[Int((h >> 32) & 15)],
+        _HEX[Int((h >> 28) & 15)],
+        _HEX[Int((h >> 24) & 15)],
+        _HEX[Int((h >> 20) & 15)],
+        _HEX[Int((h >> 16) & 15)],
+        _HEX[Int((h >> 12) & 15)],
+        _HEX[Int((h >> 8) & 15)],
+        _HEX[Int((h >> 4) & 15)],
+        _HEX[Int(h & 15)],
+    ]()
+
+
+def _launch_tag[
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(* args: * declared_arg_types) thin -> None,
+    dyn_smem: Int,
+    block_rank: Int,
+]():
+    """Never called: its mangled name IS the cache identity of one launch
+    configuration, and nothing else may select the generated code.
+
+    A kernel body must therefore take everything that changes its code as a
+    comptime parameter of `func` (dtype, vector width, stage count, layout,
+    epilogue option) — a build define read inside the body would be invisible
+    here. Problem dimensions and pointers travel as arguments.
+    """
+    pass
+
+
+def _far_device_slot[
+    name: StaticString
+](dev: Int) raises -> Pointer[Int, MutUntrackedOrigin]:
+    """One `Int` slot per (name, ordinal) past the inline table.
+
+    Keyed by a formatted registry name, the way the whole cache was before
+    the inline table: correct for a device count nothing else bounds, at a
+    cost only a seventeenth device pays.
+    """
+    var key = String(t"{name}_{dev}")
+    var g = _get_global_or_null(key)
+    if g:
+        return g.value().unsafe_bitcast[Int]()
+    var one = unsafe_alloc[Int](1)
+    one[] = 0
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(key), one.unsafe_bitcast[NoneType]()
+    )
+    # Re-read rather than trust our own insert, as below.
+    return _get_global_or_null(key).value().unsafe_bitcast[Int]()
+
+
+@always_inline
+def _device_slot[
+    name: StaticString
+](dev: Int) raises -> Pointer[Int, MutUntrackedOrigin]:
+    """Slot `dev` of the process-global `Int` table called `name`, created
+    zeroed on first use.
+
+    `name` is a comptime constant, so a warm lookup is one registry probe of
+    a fixed-size string: nothing formatted, nothing allocated.
+
+    `dev` is `DeviceContext.id()`, the ordinal within one accelerator api:
+    the MAX CPU context answers 0, the same as GPU 0, so a caller that can
+    hold a CPU context must not consult these tables (`ops_random._grid` is
+    the one that could and now declines first).
+    """
+    if dev < 0:
+        raise Error("mojo device cache: negative device ordinal ", dev)
+    if dev >= _KCACHE_DEVICES:
+        return _far_device_slot[name](dev)
+    var g = _get_global_or_null(name)
+    if g:
+        return g.value().unsafe_bitcast[Int]().unsafe_offset(dev)
+    var tbl = unsafe_alloc[Int](_KCACHE_DEVICES)
+    for i in range(_KCACHE_DEVICES):
+        tbl[unsafe_offset=i] = 0
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), tbl.unsafe_bitcast[NoneType]()
+    )
+    # Re-read rather than trust our own insert: two threads racing the first
+    # use must end up on the same table (the loser's 128 bytes are left
+    # behind, at most once per name).
+    return (
+        _get_global_or_null(name)
+        .value()
+        .unsafe_bitcast[Int]()
+        .unsafe_offset(dev)
+    )
+
+
+@always_inline
+def _kernel_slot[
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(* args: * declared_arg_types) thin -> None,
+    dyn_smem: Int,
+    block_rank: Int,
+](dev: Int) raises -> Pointer[Int, MutUntrackedOrigin]:
+    """This kernel's cache slot for device `dev`: it holds the address of the
+    compiled `DeviceFunction`, or 0 before the first launch."""
+    return _device_slot[
+        _kcache_name[
+            _name_hash(
+                get_linkage_name[_launch_tag[func, dyn_smem, block_rank]]()
+            )
+        ]()
+    ](dev)
+
+
 @always_inline
 def _enqueue_cached[
     declared_arg_types: TypeList[Trait=AnyType, ...],
@@ -263,14 +438,13 @@ def _enqueue_cached[
     dyn_smem: Int = 0,
 ](
     ctx: DeviceContext,
-    key: String,
     gx: Int,
     gy: Int,
     gz: Int,
     threads: Int,
     *args: *Ts,
 ) raises:
-    """Enqueue `func`, compiling it at most once per process and context.
+    """Enqueue `func`, compiling it at most once per process and device.
 
     `ctx.enqueue_function[func]` re-runs `compile_function` on every call
     (~180µs even when the runtime's module cache hits); caching the
@@ -279,28 +453,21 @@ def _enqueue_cached[
 
     `dyn_smem` is the dynamic shared memory one block asks for: the compile
     opts into it through `_dyn_smem_attr` and every launch passes the same
-    size. It is part of the registry name because a `DeviceFunction` compiled
-    for one allowance must never be launched with another. Cluster dimensions
-    are NOT passed here: the warp-specialized GEMMs declare them as kernel
-    metadata (`nvvm.cluster_dim`), which the compiled function carries.
-
-    `key` must name everything that selects the generated code and nothing
-    that does not: algorithm, dtype, geometry, stage count, layout, epilogue
-    options and any build define the body reads. Never a pointer, never a
-    problem dimension — those travel as arguments.
+    size. It is part of the cache identity because a `DeviceFunction`
+    compiled for one allowance must never be launched with another. Cluster
+    dimensions are NOT passed here: the warp-specialized GEMMs declare them
+    as kernel metadata (`nvvm.cluster_dim`), which the compiled function
+    carries.
     """
-    var name = String(t"TMB_KERNEL_{key}_{dyn_smem}_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[func]())
     comptime SMEM = OptionalReg[Int](dyn_smem) if dyn_smem > 0 else OptionalReg[
         Int
     ](None)
 
-    var global_ptr = _get_global_or_null(name)
-
-    if global_ptr:
-        var fptr = global_ptr.value().unsafe_bitcast[FuncT]()
+    var slot = _kernel_slot[func, dyn_smem, 1](Int(ctx.id()))
+    if slot[]:
         ctx.enqueue_function(
-            fptr[],
+            Pointer[FuncT, MutUntrackedOrigin](unsafe_from_address=slot[])[],
             *args,
             grid_dim=(gx, gy, gz),
             block_dim=(threads,),
@@ -313,10 +480,7 @@ def _enqueue_cached[
     )
     var fptr = unsafe_alloc[FuncT](1)
     fptr.unsafe_write(compiled^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name),
-        fptr.unsafe_bitcast[NoneType](),
-    )
+    slot[] = Int(fptr)
     ctx.enqueue_function(
         fptr[],
         *args,
@@ -334,7 +498,6 @@ def _enqueue_cached_2d[
     *Ts: DevicePassable,
 ](
     ctx: DeviceContext,
-    key: String,
     gx: Int,
     gy: Int,
     gz: Int,
@@ -343,15 +506,12 @@ def _enqueue_cached_2d[
     *args: *Ts,
 ) raises:
     """Cached enqueue for kernels with a two-dimensional thread block."""
-    var name = String(t"TMB_KERNEL_2D_{key}_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[func]())
 
-    var global_ptr = _get_global_or_null(name)
-
-    if global_ptr:
-        var fptr = global_ptr.value().unsafe_bitcast[FuncT]()
+    var slot = _kernel_slot[func, 0, 2](Int(ctx.id()))
+    if slot[]:
         ctx.enqueue_function(
-            fptr[],
+            Pointer[FuncT, MutUntrackedOrigin](unsafe_from_address=slot[])[],
             *args,
             grid_dim=(gx, gy, gz),
             block_dim=(threads_x, threads_y),
@@ -361,10 +521,7 @@ def _enqueue_cached_2d[
     var compiled = ctx.compile_function[func]()
     var fptr = unsafe_alloc[FuncT](1)
     fptr.unsafe_write(compiled^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name),
-        fptr.unsafe_bitcast[NoneType](),
-    )
+    slot[] = Int(fptr)
     ctx.enqueue_function(
         fptr[],
         *args,
@@ -462,9 +619,9 @@ def _bw_flat_blocks(slots: Int, traffic_bytes: Int) -> Int:
 
 
 @always_inline
-def _device_attr_cached(
-    ctx: DeviceContext, key: StaticString, attr: DeviceAttribute, fallback: Int
-) -> Int:
+def _device_attr_cached[
+    key: StaticString
+](ctx: DeviceContext, attr: DeviceAttribute, fallback: Int) -> Int:
     """One driver round trip per (device, attribute) for the whole process.
 
     `ctx.get_attribute` is a driver call, and the grid rules below read it on
@@ -473,12 +630,19 @@ def _device_attr_cached(
     context id, so a multi-GPU process keeps one entry per device. A query
     that fails or answers <= 0 caches the fallback, so it is not retried
     either.
+
+    `key` is a comptime parameter so the registry name is a constant: a
+    runtime `t"TMB_DEVATTR_{key}_{ctx.id()}"` would have put a String back on
+    the launch path this cache exists to keep cheap. The slot holds
+    `value + 1`, because 0 is a legitimate answer (an unknown L2 capacity)
+    and has to stay distinguishable from an empty slot.
     """
     try:
-        var name = String(t"TMB_DEVATTR_{key}_{ctx.id()}")
-        var cached = _get_global_or_null(name)
-        if cached:
-            return cached.value().unsafe_bitcast[Int]()[]
+        var slot = _device_slot[
+            _kcache_name[_name_hash(get_static_string["TMB_DEVATTR_", key]())]()
+        ](Int(ctx.id()))
+        if slot[]:
+            return slot[] - 1
         var value = fallback
         try:
             var queried = ctx.get_attribute(attr)
@@ -488,11 +652,7 @@ def _device_attr_cached(
             # A backend that does not answer this query caches the fallback
             # too, so it is asked exactly once rather than on every launch.
             value = fallback
-        var slot = unsafe_alloc[Int](1)
-        slot.unsafe_write(value)
-        external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-            StringSlice(name), slot.unsafe_bitcast[NoneType]()
-        )
+        slot[] = value + 1
         return value
     except:
         return fallback
@@ -508,9 +668,8 @@ def _device_sm_count(ctx: DeviceContext) -> Int:
     PCIe has 114, an H100 SXM 132, and the table reports 132 for both). Any
     grid derived from the SM count wants this, not the table.
     """
-    return _device_attr_cached(
+    return _device_attr_cached["sm"](
         ctx,
-        "sm",
         DeviceAttribute.MULTIPROCESSOR_COUNT,
         ctx.default_device_info.sm_count,
     )
@@ -539,8 +698,8 @@ def _device_l2_bytes(ctx: DeviceContext) -> Int:
     """Last-level cache capacity of the device in hand, 0 when unknown."""
     if ctx.api() != "cuda":
         return 0
-    return _device_attr_cached(
-        ctx, "l2", DeviceAttribute(_CU_ATTR_L2_CACHE_SIZE), 0
+    return _device_attr_cached["l2"](
+        ctx, DeviceAttribute(_CU_ATTR_L2_CACHE_SIZE), 0
     )
 
 
@@ -1411,7 +1570,6 @@ def _flat_vec_unary[
         var traffic = total * (size_of[dtype]() + size_of[out_dtype]())
         _enqueue_cached[_flat_vec_unary_kernel[dtype, out_dtype, op, name]](
             ctx,
-            String(t"uflat_{name}_{dtype}_{out_dtype}"),
             _l2_wave_blocks(max(1, total // VW), traffic, ctx),
             1,
             1,
@@ -1799,7 +1957,6 @@ def _copy_strided[
                     ):
                         _enqueue_cached[_copy_row_strided_u16_kernel[8]](
                             ctx,
-                            "row_copy_u16_vec8",
                             ceildiv(cols, 256 * 8),
                             min(rows, _MAX_GRID_Y),
                             1,
@@ -1813,7 +1970,6 @@ def _copy_strided[
                     else:
                         _enqueue_cached[_copy_row_strided_u16_kernel[1]](
                             ctx,
-                            "row_copy_u16_scalar",
                             ceildiv(cols, 256),
                             min(rows, _MAX_GRID_Y),
                             1,
@@ -1835,7 +1991,6 @@ def _copy_strided[
                     ):
                         _enqueue_cached[_copy_row_strided_u32_kernel[4, 1]](
                             ctx,
-                            "row_copy_u32_vec4",
                             ceildiv(cols, 256 * 4),
                             min(rows, _MAX_GRID_Y),
                             1,
@@ -1849,7 +2004,6 @@ def _copy_strided[
                     else:
                         _enqueue_cached[_copy_row_strided_u32_kernel[1, 4]](
                             ctx,
-                            "row_copy_u32_scalar4",
                             ceildiv(cols, 256 * 4),
                             min(rows, _MAX_GRID_Y),
                             1,
@@ -1915,7 +2069,6 @@ def _copy_strided[
             ):
                 _enqueue_cached[_transpose2d_vec_kernel[dtype]](
                     ctx,
-                    String(t"transpose2d_vec_{dtype}"),
                     # One wave per VBLK x VBLK region, unclamped.  A clamp
                     # makes the grid-stride loop give some waves one region
                     # and some two, and the makespan is the larger; measured
@@ -1944,7 +2097,6 @@ def _copy_strided[
                 return
             _enqueue_cached[_transpose2d_kernel[dtype]](
                 ctx,
-                String(t"transpose2d_{dtype}"),
                 ceildiv(cols, TILE),
                 # gridDim.y and .z are both capped at 65535; the kernel
                 # grid-strides row tiles and batch, so clamping here only
@@ -1964,7 +2116,6 @@ def _copy_strided[
             return
         _enqueue_cached[_copy_strided_kernel[dtype]](
             ctx,
-            String(t"copy_strided_{dtype}"),
             _gs_blocks(total),
             1,
             1,
@@ -2248,7 +2399,6 @@ def _fill_contig[
             var nvec = size // VEC
             _enqueue_cached[_fill_vec_kernel[dtype, VEC]](
                 ctx,
-                String(t"fill_vec_{dtype}_v{VEC}"),
                 _fill_blocks(nvec),
                 1,
                 1,
@@ -2288,7 +2438,6 @@ def _fill_strided[
     else:
         _enqueue_cached[_fill_strided_kernel[dtype, RANK, VEC]](
             ctx,
-            String(t"fill_strided_{dtype}_r{RANK}_v{VEC}"),
             _fill_blocks(total),
             1,
             1,

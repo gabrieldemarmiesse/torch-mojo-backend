@@ -335,7 +335,6 @@ def enqueue_foreach_l2_norm_f32(
             if group_chunks > 0:
                 _enqueue_cached[_norm_partials_batched_apple](
                     ctx,
-                    String("FOREACH_NORM_PARTIALS_APPLE_B8_F32_V1"),
                     group_chunks,
                     1,
                     1,
@@ -354,7 +353,6 @@ def enqueue_foreach_l2_norm_f32(
                 )
             _enqueue_cached[_norm_finalize_batched_apple](
                 ctx,
-                String("FOREACH_NORM_FINALIZE_APPLE_B8_F32_V1"),
                 used_slots,
                 1,
                 1,

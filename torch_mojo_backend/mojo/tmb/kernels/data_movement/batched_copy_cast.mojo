@@ -129,7 +129,6 @@ def copy_batched_cast(
         if tiles > 0 and largest <= COPY_CAST_TILE:
             _enqueue_cached[_copy_cast_small_kernel](
                 ctx,
-                "copy_batched_contig_f32_bf16_small",
                 count,
                 1,
                 1,
@@ -139,7 +138,6 @@ def copy_batched_cast(
         elif tiles > 0:
             _enqueue_cached[_copy_cast_kernel](
                 ctx,
-                "copy_batched_contig_f32_bf16_v2",
                 min(tiles, 1 << 22),
                 1,
                 1,

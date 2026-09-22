@@ -83,7 +83,6 @@ def enqueue_tanh_backward_f32(
         if (dst | grad | output) % 16 == 0:
             _enqueue_cached[tanh_backward_kernel[True]](
                 ctx,
-                "tanh_backward_contig_f32_v4_aTrue",
                 blocks,
                 1,
                 1,
@@ -100,7 +99,6 @@ def enqueue_tanh_backward_f32(
             )
             _enqueue_cached[tanh_backward_peel_kernel](
                 ctx,
-                "tanh_backward_contig_f32_v4_input_peel",
                 peel_blocks,
                 1,
                 1,
@@ -114,7 +112,6 @@ def enqueue_tanh_backward_f32(
         else:
             _enqueue_cached[tanh_backward_kernel[False]](
                 ctx,
-                "tanh_backward_contig_f32_v4_aFalse",
                 blocks,
                 1,
                 1,

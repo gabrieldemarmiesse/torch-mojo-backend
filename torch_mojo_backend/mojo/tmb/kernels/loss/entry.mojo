@@ -370,7 +370,6 @@ def enqueue_nll_forward_f32(
             var grid = min(ceildiv(rows, _NONE_BLOCK), 4096)
             _enqueue_cached[_nll_forward_none](
                 ctx,
-                "nll_fwd_none",
                 grid,
                 1,
                 1,
@@ -387,7 +386,6 @@ def enqueue_nll_forward_f32(
             if rows <= _MEAN_SINGLE_MAX_ROWS:
                 _enqueue_cached[_nll_forward_mean](
                     ctx,
-                    "nll_fwd_mean_single",
                     1,
                     1,
                     1,
@@ -406,7 +404,6 @@ def enqueue_nll_forward_f32(
                 var scratch_ptr = scratch.unsafe_ptr().as_unsafe_any_origin()
                 _enqueue_cached[_nll_forward_mean_partial](
                     ctx,
-                    "nll_fwd_mean_partial",
                     grid,
                     1,
                     1,
@@ -420,7 +417,6 @@ def enqueue_nll_forward_f32(
                 )
                 _enqueue_cached[_nll_forward_mean_final](
                     ctx,
-                    "nll_fwd_mean_final",
                     1,
                     1,
                     1,
@@ -436,7 +432,6 @@ def enqueue_nll_forward_f32(
         elif reduction == 2:
             _enqueue_cached[_nll_forward_sum](
                 ctx,
-                "nll_fwd_sum",
                 1,
                 1,
                 1,
@@ -477,7 +472,6 @@ def enqueue_nll_backward_f32(
             var strips = ceildiv(classes // 4, _BWD_BLOCK * _VEC_UNROLL)
             _enqueue_cached[_nll_backward_vec4](
                 ctx,
-                "nll_bwd_vec4",
                 strips,
                 min(rows, 65535),
                 1,
@@ -495,7 +489,6 @@ def enqueue_nll_backward_f32(
             var grid = min(ceildiv(rows, _BWD_BLOCK // WARP_SIZE), 8192)
             _enqueue_cached[_nll_backward_scalar](
                 ctx,
-                "nll_bwd_scalar",
                 grid,
                 1,
                 1,
