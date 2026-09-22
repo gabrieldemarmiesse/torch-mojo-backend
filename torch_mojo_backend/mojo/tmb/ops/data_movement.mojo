@@ -615,6 +615,25 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             "aten::_to_copy to a device type this backend does not know"
         )
 
+    if (
+        t.on_mojo()
+        and t.contig
+        and stype != t.stype
+        and dev_type != DEVICE_TYPE_CPU
+        and (dev_type == -1 or v_device_index(dev_v) == t.device)
+        and strides_equal(want, contig, t.rank)
+        and is_cast_dtype(t.dtype)
+        and is_cast_dtype(max_dtype(stype))
+    ):
+        # The hot case of a mixed-precision step: a dense same-device cast
+        # whose result is the contiguous layout. `_to_copy_same_device` ends
+        # on exactly this allocation and this launch, after three more stride
+        # comparisons, a density test, and two `Owned` round trips.
+        var cast = own(new_like_dtype(t, stype))
+        cast_into(cast.t, t)
+        ret_owned(rets, 0, cast)
+        return
+
     if not t.on_mojo():
         # `_to_copy` reaches this PrivateUse1 kernel even for a foreign CPU
         # `self` whenever the target device resolves to `mojo` (dispatch
