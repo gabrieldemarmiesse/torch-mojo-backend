@@ -153,6 +153,25 @@ int64_t tmb_current_stream(int32_t device);
 void tmb_set_current_stream(int32_t device, int64_t stream);
 
 // ---- tensors (handles are at::Tensor*) ---------------------------------------
+// Everything abi.mojo's `T` view reads about a tensor, in ONE call: `out` is
+// TMB_TENSOR_INFO_SLOTS int64 slots indexed by the enum below. The sizes and
+// strides slots are pointers into the tensor's own metadata, valid while it is
+// alive and its shape unchanged -- which is the whole conversion, so the
+// per-field getters below stay for the occasional single read.
+enum TmbTensorInfoSlot : int32_t {
+  TMB_INFO_DATA_PTR = 0,
+  TMB_INFO_DIM = 1,
+  TMB_INFO_SIZES = 2,
+  TMB_INFO_STRIDES = 3,
+  TMB_INFO_STORAGE_OFFSET = 4,
+  TMB_INFO_NUMEL = 5,
+  TMB_INFO_DTYPE = 6,
+  TMB_INFO_CONTIGUOUS = 7,
+  TMB_INFO_DEVICE_INDEX = 8,  // -1 when not on PrivateUse1
+  TMB_INFO_DEVICE_TYPE = 9,
+  TMB_TENSOR_INFO_SLOTS = 10,
+};
+void tmb_tensor_info(TmbTensor t, int64_t* out);
 void* tmb_tensor_data_ptr(TmbTensor t);
 int64_t tmb_tensor_dim(TmbTensor t);
 const int64_t* tmb_tensor_sizes(TmbTensor t);
@@ -179,12 +198,15 @@ int32_t tmb_cuda_is_pinned_ptr(const void* ptr);
 void* tmb_stream_native_handle(int32_t device, int64_t stream);  // the vendor (CUDA/HIP) stream of a mojo stream  // at::GradMode::is_enabled(): whether autograd records this call
 TmbTensor tmb_tensor_retain(TmbTensor t);   // new owned handle to the same tensor
 void tmb_tensor_release(TmbTensor t);
-// allocation through the registered allocator, no dispatcher round trip
+// Allocation through the registered allocator, no dispatcher round trip.
+// `info` (optional) receives the new tensor's slots, so the caller does not
+// read back what the creating call already knows.
 int32_t tmb_empty_strided(int64_t ndim, const int64_t* sizes, const int64_t* strides,
-                          int32_t dtype, int32_t device, TmbTensor* ret);
+                          int32_t dtype, int32_t device, TmbTensor* ret, int64_t* info);
 // zero-copy view over base's storage
 int32_t tmb_as_strided(TmbTensor base, int64_t ndim, const int64_t* sizes,
-                       const int64_t* strides, int64_t storage_offset, TmbTensor* ret);
+                       const int64_t* strides, int64_t storage_offset, TmbTensor* ret,
+                       int64_t* info);
 // in-place metadata changes (set_/resize_/as_strided_)
 int32_t tmb_tensor_set_sizes_strides(TmbTensor t, int64_t ndim, const int64_t* sizes,
                                      const int64_t* strides, int64_t storage_offset);

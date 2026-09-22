@@ -199,3 +199,42 @@ def test_device_oom_is_not_disguised_as_unsupported(mojo_gpu):
         type(excinfo.value),
         excinfo.value,
     )
+
+
+def test_view_ops_metadata_and_aliasing(mojo_device):
+    """view / _unsafe_view / _reshape_alias / as_strided: shape, stride,
+    storage offset, one shared storage, writes visible through the base."""
+    base = _arange(24, mojo_device).reshape(4, 6)
+    for v in (
+        base.view(2, 12),
+        torch.ops.aten._unsafe_view(base, [2, 12]),
+        torch.ops.aten._reshape_alias(base, [2, 12], [12, 1]),
+        base.as_strided((2, 12), (12, 1)),
+    ):
+        assert v.shape == (2, 12) and v.stride() == (12, 1)
+        assert v.storage_offset() == 0 and v.data_ptr() == base.data_ptr()
+        assert v.dtype == base.dtype and v.device == base.device
+    sub = base[1:3, 2:5]
+    assert sub.shape == (2, 3) and sub.stride() == (6, 1) and sub.storage_offset() == 8
+    strided = base.as_strided((3, 2), (2, 3), 5)
+    assert strided.stride() == (2, 3) and strided.storage_offset() == 5
+    assert strided.cpu().tolist() == [[5.0, 8.0], [7.0, 10.0], [9.0, 12.0]]
+    view = base.view(24)
+    view[0] = 99.0
+    assert base.cpu()[0, 0].item() == 99.0
+
+
+def test_empty_strided_metadata(mojo_device):
+    """empty_strided keeps the strides it was given; empty_like and a
+    channels-last request keep theirs."""
+    t = torch.empty_strided((3, 4), (1, 3), dtype=torch.bfloat16, device=mojo_device)
+    assert t.shape == (3, 4) and t.stride() == (1, 3) and t.dtype == torch.bfloat16
+    assert not t.is_contiguous()
+    like = torch.empty_like(t)
+    assert like.shape == (3, 4) and like.stride() == (1, 3)
+    cl = torch.empty(
+        (2, 3, 4, 5), device=mojo_device, memory_format=torch.channels_last
+    )
+    assert cl.stride() == (60, 1, 15, 3)
+    assert torch.empty((), device=mojo_device).shape == ()
+    assert torch.empty((0, 3), device=mojo_device).numel() == 0
