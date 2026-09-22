@@ -57,7 +57,7 @@ from tmb.backend.abi import (
     TAG_TENSOR,
     TAG_TENSOR_REF,
 )
-from tmb.backend.device import ctx_for, ctx_ptr, dev
+from tmb.backend.device import ctx_for, ctx_ptr, dev, copy_d2d
 from tmb.kernels.optimizer.foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
@@ -560,6 +560,62 @@ def _copy_cast_qualifies(dsts: List[T], srcs: List[T]) raises -> Bool:
     return not _self_overlaps(dsts) and not _overlaps_any(dsts, srcs)
 
 
+def _copy_adjacent_views(dsts: List[T], srcs: List[T]) raises -> Bool:
+    """Copy matching contiguous partitions of two buffers with one DMA.
+
+    Adjacency is proved from current pointers, shapes and strides. Require
+    one storage base on each side so the DMA never crosses allocations.
+    Overlapping source/destination spans retain sequential copy_ semantics.
+    """
+    var first = dsts[0].copy()
+    if not first.on_mojo() or dev(first.device)[].api != "cuda":
+        return False
+    var dst_begin = 0
+    var src_begin = 0
+    var dst_storage = 0
+    var src_storage = 0
+    var nbytes = 0
+    for i in range(len(dsts)):
+        var d = dsts[i].copy()
+        var s = srcs[i].copy()
+        if (
+            not d.on_mojo()
+            or not s.on_mojo()
+            or d.device != first.device
+            or s.device != first.device
+            or d.stype != first.stype
+            or s.stype != first.stype
+            or not d.contig
+            or not s.contig
+            or not d.same_shape(s)
+        ):
+            return False
+        if d.numel == 0:
+            continue
+        if nbytes == 0:
+            dst_begin, src_begin = d.ptr, s.ptr
+            dst_storage, src_storage = d.storage_ptr(), s.storage_ptr()
+            if dst_storage == 0 or src_storage == 0:
+                return False
+        if (
+            d.ptr != dst_begin + nbytes
+            or s.ptr != src_begin + nbytes
+            or d.storage_ptr() != dst_storage
+            or s.storage_ptr() != src_storage
+        ):
+            return False
+        nbytes += d.numel * d.itemsize
+    if nbytes != 0 and dst_begin != src_begin:
+        if dst_begin < src_begin + nbytes and src_begin < dst_begin + nbytes:
+            return False
+        copy_d2d(ctx_for(first.device), dst_begin, src_begin, nbytes)
+    # _foreach_copy_ owns its version bumps (no ADInplaceOrView wrapper).
+    # Repeated empty destinations still receive one bump per occurrence.
+    for d in dsts:
+        d.bump_version()
+    return True
+
+
 # aten::_foreach_copy_(Tensor(a!)[] self, Tensor[] src, bool non_blocking=False) -> ()
 def op_foreach_copy_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -570,6 +626,8 @@ def op_foreach_copy_(
         raise Error("Tensor list must have at least one tensor.")
     if len(srcs) != len(dsts):
         raise Error("Tensor lists must have the same number of tensors.")
+    if _copy_adjacent_views(dsts, srcs):
+        return
     if _copy_cast_qualifies(dsts, srcs):
         var ctx = ctx_for(dsts[0].device)
         var call = KernelCall("data_movement", "CopyBatchedCast")
