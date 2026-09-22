@@ -397,27 +397,16 @@ comptime FamilyFn = def(
 ) thin abi("C") -> Int32
 
 
-def call_family(
-    mut loader: Loader,
-    family: String,
-    key: UInt64,
-    defines: List[String],
-    argv: Argv,
-    argc: Int,
-) raises:
-    """Run one kernel: build/load the specialization on first use, then call
-    its C entry with the argument slots. `key` hashes (family, defines) so a
-    warm call is one dictionary probe; `defines` is only read on a miss.
-    A non-zero return carries the kernel's own message (declined input, bad
-    geometry, ...)."""
-    var entry: Int
-    var hit = loader.fast.find(key)
-    if hit:
-        entry = hit.value()
-    else:
-        entry = loader.entry(family, defines)
-        loader.fast[key] = entry
-    var err = InlineArray[UInt8, ERR_CAP](fill=0)
+def invoke_family(entry: Int, argv: Argv, argc: Int) raises:
+    """Call a family's C entry with the argument slots. A non-zero return
+    carries the kernel's own message (declined input, bad geometry, ...).
+
+    The buffer is left uninitialized but for its first byte: zeroing all 4 KiB
+    on a path that runs ~10k times per training step cost more than every
+    error message ever read from it.
+    """
+    var err = InlineArray[UInt8, ERR_CAP](uninitialized=True)
+    err[0] = 0
     var f = Pointer(to=entry).unsafe_bitcast[FamilyFn]()[]
     var rc = f(
         argv,

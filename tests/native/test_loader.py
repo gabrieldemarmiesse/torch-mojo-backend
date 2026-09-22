@@ -230,6 +230,29 @@ def test_compiler_env_drops_the_runtime_interpreter_variables(monkeypatch):
     assert env["MODULAR_HOME"]
 
 
+def test_kernel_call_defines_and_owned_spec_lifetimes(tmp_path):
+    """Lazy specialization metadata preserves defines and stable spec pointers."""
+    binary = tmp_path / "kernel_call_probe"
+    subprocess.run(
+        [
+            "mojo",
+            "build",
+            str(Path(__file__).with_name("kernel_call_probe.mojo")),
+            "-I",
+            str(_WORKTREE / "torch_mojo_backend/mojo"),
+            "--Werror",
+            "-o",
+            str(binary),
+        ],
+        env=native.compiler_env(),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    subprocess.run([str(binary)], check=True, timeout=30)
+
+
 def test_werror_flag_reaches_every_python_driven_mojo_build(monkeypatch, tmp_path):
     """TORCH_MOJO_BACKEND_WERROR=1 (what conftest sets) turns compiler warnings
     into build failures; unset, a user's build must not carry --Werror. The
