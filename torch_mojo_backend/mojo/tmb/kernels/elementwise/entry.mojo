@@ -186,7 +186,18 @@ def _bin_elementwise[
     else:
         comptime if has_accelerator():
             comptime if dtype != DType.float64:
-                if size % 4 == 0:
+                # The 4-wide body loads and stores at `4 * itemsize`, so
+                # it needs the runtime addresses aligned, not just a numel
+                # divisible by 4: a contiguous operand at an odd storage
+                # offset (any offset view) would fault the context with
+                # CUDA_ERROR_MISALIGNED_ADDRESS. The unary twin gates the
+                # same way; unaligned operands take the scalar body.
+                comptime vec_align = 4 * size_of[dtype]()
+                if (
+                    size % 4 == 0
+                    and (Int(out_ptr) | Int(lhs_ptr) | Int(rhs_ptr)) % vec_align
+                    == 0
+                ):
                     var n4 = size // 4
                     _enqueue_cached[_bin_contig_kernel4[dtype, op_code]](
                         ctx,
