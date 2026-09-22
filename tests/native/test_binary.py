@@ -351,6 +351,144 @@ def test_scalar_mul_out_aliasing_self(mojo_device, dtype):
     torch.testing.assert_close(x.cpu(), x_cpu * 0.5)
 
 
+_SCALAR_MUL_PATTERNS = [
+    0,
+    0x80000000,
+    1,
+    0x80000001,
+    0x007FFFFF,
+    0x807FFFFF,
+    0x00800000,
+    0x80800000,
+    0x3F800000,
+    0x3F800001,
+    0x3F7FFFFF,
+    0xBF800001,
+    0x7F7FFFFF,
+    0xFF7FFFFF,
+    0x7F800000,
+    0xFF800000,
+    0x7FC00000,
+    0xFFC00000,
+    0x7F800001,
+    0xFFFFFFFF,
+]
+
+
+def _check_scalar_mul_peel(
+    device, size, source_offset, destination_offset, bits, inplace
+):
+    indices = torch.arange(size + 16, dtype=torch.int64)
+    source_bits = indices * 2654435761
+    for i, pattern in enumerate(_SCALAR_MUL_PATTERNS):
+        source_bits[indices % 32 == i] = pattern
+    source_bits = source_bits.to(torch.int32)
+    host = source_bits.view(torch.float32)
+    scalar = (
+        torch.tensor(bits, dtype=torch.int64).to(torch.int32).view(torch.float32).item()
+    )
+    source = host.to(device)
+    destination = source if inplace else torch.full_like(source, 17.0)
+    expected = host.clone() if inplace else torch.full_like(host, 17.0)
+    value = source[source_offset : source_offset + size]
+    output = destination[destination_offset : destination_offset + size]
+    before, pointer = output._version, output.data_ptr()
+    assert torch.mul(value, scalar, out=output) is output
+    expected[destination_offset : destination_offset + size] = (
+        host[source_offset : source_offset + size] * scalar
+    )
+    actual = destination.cpu()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    finite_or_inf = ~torch.isnan(expected)
+    torch.testing.assert_close(
+        actual.view(torch.int32)[finite_or_inf],
+        expected.view(torch.int32)[finite_or_inf],
+        rtol=0,
+        atol=0,
+    )
+    assert output._version == before + 1
+    assert output.data_ptr() == pointer
+    if not inplace:
+        torch.testing.assert_close(
+            source.cpu().view(torch.int32), source_bits, rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("source_offset", range(4))
+@pytest.mark.parametrize("destination_offset", range(4))
+def test_scalar_mul_peel_alignment(mojo_gpu, source_offset, destination_offset):
+    _check_scalar_mul_peel(
+        mojo_gpu, 1025, source_offset, destination_offset, 0x41FCFB72, False
+    )
+
+
+@pytest.mark.parametrize(
+    "size",
+    [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        15,
+        16,
+        17,
+        255,
+        256,
+        257,
+        1023,
+        1024,
+        1025,
+        1026,
+        1027,
+        1028,
+        1029,
+    ],
+)
+@pytest.mark.parametrize("inplace", [False, True])
+def test_scalar_mul_peel_boundaries(mojo_gpu, size, inplace):
+    offset, scalar = (3, 0xBF800001) if inplace else (1, 0x3F800001)
+    _check_scalar_mul_peel(mojo_gpu, size, offset, offset, scalar, inplace)
+
+
+@pytest.mark.parametrize(
+    "bits",
+    [
+        0,
+        0x80000000,
+        0x3F800000,
+        0xBF800000,
+        0x3F000000,
+        0x40000000,
+        1,
+        0x00800000,
+        0x7F800000,
+        0xFF800000,
+        0x7FC00000,
+        0x7F7FFFFF,
+    ],
+)
+@pytest.mark.parametrize("inplace", [False, True])
+def test_scalar_mul_peel_special_values(mojo_gpu, bits, inplace):
+    offset = int(inplace)
+    _check_scalar_mul_peel(mojo_gpu, 1025, offset, offset, bits, inplace)
+
+
+@pytest.mark.parametrize("offset", [0, 1, 3])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_scalar_mul_peel_large(mojo_gpu, offset, inplace):
+    _check_scalar_mul_peel(
+        mojo_gpu,
+        357 * 789,
+        offset,
+        offset,
+        0xBF800001 if inplace else 0x41FCFB72,
+        inplace,
+    )
+
+
 def test_out_resizes(mojo_device):
     a_cpu, a = _both((3, 4), torch.float32, mojo_device)
     b_cpu, b = _both((3, 4), torch.float32, mojo_device)

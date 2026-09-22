@@ -746,6 +746,35 @@ comptime SOP_MUL = 1
 comptime SOP_POW = 2
 
 
+@__name("scalar_mul_contig_f32_v4_peel")
+def _scalar_mul_peel_kernel(
+    dst: Pointer[Float32, MutAnyOrigin],
+    src: Pointer[Float32, ImmutAnyOrigin],
+    scalar: Float32,
+    size_arg: Int64,
+    head_arg: Int64,
+):
+    var size = Int(size_arg)
+    var head = Int(head_arg)
+    var nvec = (size - head) // 4
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var index = tid
+    while index < nvec:
+        var i = head + index * 4
+        dst.unsafe_store[width=4, alignment=16](
+            i,
+            src.unsafe_load[width=4, alignment=16](i)
+            * SIMD[DType.float32, 4](scalar),
+        )
+        index += Int(grid_dim.x) * Int(block_dim.x)
+    if tid < head:
+        dst[unsafe_offset=tid] = src[unsafe_offset=tid] * scalar
+    var tail = head + nvec * 4
+    if tid < size - tail:
+        var i = tail + tid
+        dst[unsafe_offset=i] = src[unsafe_offset=i] * scalar
+
+
 @always_inline
 def _scalar_elementwise[
     dtype: DType, op_code: Int
@@ -759,6 +788,32 @@ def _scalar_elementwise[
     comptime if not dtype.is_floating_point():
         raise Error("scalar elementwise ops require a floating point dtype")
     else:
+        comptime if dtype == DType.float32 and op_code == SOP_MUL and _has_sm_9x():
+            # H100 measurements select a common alignment peel for arrays
+            # of at least 1024 elements. Keep the original aligned/divisible
+            # route, other operations/dtypes and non-Hopper targets intact.
+            if (
+                ctx.api() == "cuda"
+                and size >= 1024
+                and Int(in_ptr) % 16 == Int(out_ptr) % 16
+                and (Int(in_ptr) % 16 != 0 or size % 4 != 0)
+            ):
+                var head = min(size, ((16 - Int(in_ptr) % 16) % 16) // 4)
+                var nvec = (size - head) // 4
+                _enqueue_cached[_scalar_mul_peel_kernel](
+                    ctx,
+                    "scalar_mul_contig_f32_v4_peel",
+                    min(ceildiv(nvec, 256), 1 << 22),
+                    1,
+                    1,
+                    256,
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
+                    scalar,
+                    Int64(size),
+                    Int64(head),
+                )
+                return
 
         @always_inline
         @parameter
