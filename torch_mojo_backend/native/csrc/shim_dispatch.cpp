@@ -14,7 +14,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -48,16 +48,18 @@ void tmb_count_op_call(const char* qualified_name) {
 namespace {
 
 // Backing store for list arguments. Nothing is allocated until a list
-// argument appears; inner buffers keep their address when an outer vector
-// grows (a moved std::vector keeps its heap block), generators live in a deque.
+// argument appears (an empty std::vector owns no heap block; a std::deque
+// allocates on construction, which is why one is not used here); inner
+// buffers keep their address when an outer vector grows (a moved std::vector
+// keeps its heap block); a generator is boxed so that its address survives a
+// reallocation too.
 struct Arena {
   std::vector<std::vector<int64_t>> ints;
   std::vector<std::vector<double>> doubles;
   std::vector<std::vector<uint8_t>> bools;
   std::vector<std::vector<at::Tensor>> tensors;
   std::vector<std::vector<const at::Tensor*>> tensor_ptrs;
-  std::deque<at::Generator> generators;
-  explicit Arena(size_t) {}
+  std::vector<std::unique_ptr<at::Generator>> generators;
 };
 
 inline int64_t double_bits(double d) { int64_t r; std::memcpy(&r, &d, 8); return r; }
@@ -105,8 +107,9 @@ void to_record(const c10::TypePtr& type, const c10::IValue& v, TmbValue& out, Ar
       out.tag = TMB_STRING; out.a = reinterpret_cast<int64_t>(s.data()); out.len = static_cast<int32_t>(s.size()); return;
     }
     case c10::TypeKind::GeneratorType:
-      arena.generators.push_back(v.toGenerator());
-      out.tag = TMB_GENERATOR; out.a = reinterpret_cast<int64_t>(&arena.generators.back()); return;
+      // boxed: the address must survive the vector growing
+      arena.generators.push_back(std::make_unique<at::Generator>(v.toGenerator()));
+      out.tag = TMB_GENERATOR; out.a = reinterpret_cast<int64_t>(arena.generators.back().get()); return;
     case c10::TypeKind::StreamObjType: {
       auto st = v.toStream();
       out.tag = TMB_STREAM; out.a = st.device_index(); out.b = static_cast<int64_t>(st.id()); return;
@@ -374,7 +377,7 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
     TmbValue* rets = rets_buf;
     if (n_args > 16) { args_heap.resize(n_args); args = args_heap.data(); }
     if (n_rets > 8) { rets_heap.resize(n_rets); rets = rets_heap.data(); }
-    Arena arena(n_args);
+    Arena arena;
     auto ivalues = torch::jit::last(*stack, n_args);
     for (size_t i = 0; i < n_args; ++i) {
       to_record(arguments[i].real_type(), ivalues[i], args[i], arena);
