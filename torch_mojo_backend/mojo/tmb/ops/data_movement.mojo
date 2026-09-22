@@ -102,6 +102,7 @@ from tmb.ops.core import (
 from tmb.ops.foreach import _overlaps, _self_overlaps
 from tmb.ops.matmul import _sm90_cuda
 
+
 # ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
@@ -1043,6 +1044,73 @@ def op_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+def _cat_cast_out(ins: List[T], dim: Int, out_t: T) raises -> Bool:
+    """Write eligible mixed-precision cat directly into an existing output."""
+    var first = ins[0].copy()
+    var rank = first.rank
+    if (
+        not first.on_mojo()
+        or first.dtype != DType.bfloat16
+        or out_t.dtype != DType.float32
+        or rank == 0
+        or dim < 0
+        or dim >= rank
+        or out_t.rank != rank
+        or not out_t.on_mojo()
+        or out_t.device != first.device
+        or not out_t.contig
+    ):
+        return False
+    var cat_size = 0
+    for x in ins:
+        if (
+            not x.on_mojo()
+            or x.dtype != first.dtype
+            or x.device != first.device
+            or x.rank != rank
+            or not x.contig
+        ):
+            return False
+        for d in range(rank):
+            if d != dim and x.dim(d) != first.dim(d):
+                return False
+        if _overlaps(out_t, x):
+            return False
+        cat_size += x.dim(dim)
+    for d in range(rank):
+        if out_t.dim(d) != (cat_size if d == dim else first.dim(d)):
+            # Preserve existing resize and error ordering in the fallback.
+            return False
+    if not _sm90_cuda(first.device):
+        return False
+    if out_t.numel == 0:
+        return True
+    var inner = 1
+    var outer = 1
+    for d in range(dim + 1, rank):
+        inner *= first.dim(d)
+    for d in range(dim):
+        outer *= first.dim(d)
+    var sources = List[Int](capacity=len(ins))
+    var lengths = List[Int](capacity=len(ins))
+    for x in ins:
+        sources.append(x.ptr)
+        lengths.append(x.dim(dim) * inner)
+    var ctx = ctx_for(first.device)
+    var call = KernelCall("data_movement", "CatCast")
+    call.arg_dtype(0, first.dtype)
+    call.out_dtype(out_t.dtype)
+    call.int(out_t.ptr)
+    call.tuple(sources)
+    call.tuple(lengths)
+    call.int(outer)
+    call.int(cat_size * inner)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    return True
+
+
 # aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)
 def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """DDP bucket flattening and FSDP2 gradient packing (including fp32 out)."""
@@ -1057,6 +1125,9 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         unsupported("aten::cat.out of only legacy-empty tensors")
     var rank = real[0].rank
     var dim = dim_in + rank if dim_in < 0 else dim_in
+    if _cat_cast_out(real, dim, out):
+        ret_ref(rets, 0, out)
+        return
     var result = _cat_impl(real, dim)
     if result.t.dtype != out.dtype and not (
         result.t.dtype.is_floating_point() and out.dtype.is_floating_point()
