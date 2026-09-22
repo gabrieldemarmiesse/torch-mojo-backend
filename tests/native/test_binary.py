@@ -490,6 +490,88 @@ def test_scalar_mul_peel_large(mojo_gpu, offset, inplace):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("n,offset", [(0, 1), (1, 0), (357 * 789, 1)])
+def test_mul_inplace_device_scalar_preserves_storage(mojo_gpu, dtype, n, offset):
+    cpu = (torch.arange(n + offset + 3, dtype=torch.float32) % 29 - 14).to(dtype)
+    base = cpu.to(mojo_gpu)
+    value = base[offset : offset + n]
+    scalar = torch.tensor(0.375, dtype=dtype, device=mojo_gpu)
+    scalar_version, version, ptr = scalar._version, value._version, value.data_ptr()
+    result = value.mul_(scalar)
+    cpu[offset : offset + n].mul_(0.375)
+    assert result is value
+    assert value.data_ptr() == ptr
+    assert value._version == version + 1
+    assert scalar._version == scalar_version
+    assert scalar.cpu().item() == 0.375
+    torch.testing.assert_close(base.cpu(), cpu, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layout", ["strided", "promoted", "broadcast", "alias"])
+def test_mul_inplace_device_scalar_fallbacks(mojo_gpu, layout):
+    cpu = torch.arange(1, 13, dtype=torch.float32).reshape(3, 4)
+    value = cpu.to(mojo_gpu)
+    if layout == "strided":
+        cpu, value = cpu[:, ::2], value[:, ::2]
+    if layout == "alias":
+        with pytest.raises(RuntimeError, match="single memory location|overlap"):
+            value.mul_(value[0, 0])
+        torch.testing.assert_close(value.cpu(), cpu)
+        return
+    dtype = torch.float16 if layout == "promoted" else torch.float32
+    scalar_cpu = torch.tensor(0.375, dtype=dtype)
+    if layout == "broadcast":
+        scalar_cpu = scalar_cpu.expand(3, 1).clone()
+    scalar = scalar_cpu.to(mojo_gpu)
+    version = value._version
+    value.mul_(scalar)
+    cpu.mul_(scalar_cpu)
+    assert value._version == version + 1
+    torch.testing.assert_close(value.cpu(), cpu)
+
+
+@pytest.mark.parametrize("divisor", [3.0, -0.03162277660168379, 7, 1e-20, 1e20])
+@pytest.mark.parametrize("out_kind", ["functional", "offset", "alias", "strided"])
+def test_div_host_scalar_direct(mojo_gpu, divisor, out_kind):
+    cpu = torch.linspace(-17, 19, 359, dtype=torch.float32)
+    source = cpu.to(mojo_gpu)
+    source_before = source.cpu()
+    expected = cpu / divisor
+    if out_kind == "functional":
+        result = source / divisor
+    else:
+        backing = torch.full((2 * cpu.numel() + 3,), 71.0, device=mojo_gpu)
+        if out_kind == "alias":
+            result = source
+        elif out_kind == "strided":
+            result = backing[1 : 2 * cpu.numel() + 1 : 2]
+        else:
+            result = backing[1 : cpu.numel() + 1]
+        version, ptr = result._version, result.data_ptr()
+        assert torch.div(source, divisor, out=result) is result
+        assert result.data_ptr() == ptr
+        assert result._version == version + 1
+        if out_kind != "alias":
+            expected_backing = torch.full_like(backing.cpu(), 71.0)
+            if out_kind == "strided":
+                expected_backing[1 : 2 * cpu.numel() + 1 : 2] = expected
+            else:
+                expected_backing[1 : cpu.numel() + 1] = expected
+            torch.testing.assert_close(backing.cpu(), expected_backing)
+    torch.testing.assert_close(result.cpu(), expected)
+    if out_kind != "alias":
+        torch.testing.assert_close(source.cpu(), source_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("divisor", [0.0, -0.0, float("inf"), -float("inf")])
+def test_div_host_scalar_special_values(mojo_gpu, divisor):
+    cpu = torch.tensor([-float("inf"), -3.0, -0.0, 0.0, 5.0, float("inf")])
+    torch.testing.assert_close(
+        (cpu.to(mojo_gpu) / divisor).cpu(), cpu / divisor, equal_nan=True
+    )
+
+
 def test_out_resizes(mojo_device):
     a_cpu, a = _both((3, 4), torch.float32, mojo_device)
     b_cpu, b = _both((3, 4), torch.float32, mojo_device)
@@ -631,6 +713,152 @@ def test_clamp(mojo_device, call_checker):
     torch.testing.assert_close(a.clamp(-0.5, 0.5).cpu(), a_cpu.clamp(-0.5, 0.5))
     torch.testing.assert_close(a.clamp(min=0.0).cpu(), a_cpu.clamp(min=0.0))
     torch.testing.assert_close(a.clamp(max=0.0).cpu(), a_cpu.clamp(max=0.0))
+
+
+# --------------------------------------------------------------------------
+# the fast common-case route (`_b_fast_route` / `_b_fast_inplace_t`), against
+# the cascade it stands in front of
+# --------------------------------------------------------------------------
+
+
+def _fast_operands(shape, dtype, device, layout):
+    """One (cpu, device) pair per layout class the fast route sorts on."""
+    if layout == "dense":
+        return _both(shape, dtype, device)
+    if layout == "transposed":
+        cpu, dev = _both(tuple(reversed(shape)), dtype, device)
+        return cpu.t(), dev.t()
+    if layout == "strided":
+        wide = tuple(shape[:-1]) + (shape[-1] * 2,)
+        cpu, dev = _both(wide, dtype, device)
+        return cpu[..., ::2], dev[..., ::2]
+    if layout == "offset":
+        flat_cpu, flat = _both((math.prod(shape) + 3,), dtype, device)
+        return flat_cpu[3:].view(shape), flat[3:].view(shape)
+    raise AssertionError(layout)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int64]
+)
+@pytest.mark.parametrize("shape", [(0,), (), (5,), (3, 4), (2, 2, 2, 2, 2)])
+@pytest.mark.parametrize("layout", ["dense", "transposed", "strided", "offset"])
+def test_elementwise_tensor_routes_match_cpu(mojo_device, dtype, shape, layout):
+    """Functional/in-place/out= add, sub and mul over every layout class."""
+    if layout != "dense" and len(shape) != 2:
+        pytest.skip("only the rank-2 shapes have a meaningful transpose/stride")
+    a_cpu, a = _fast_operands(shape, dtype, mojo_device, layout)
+    b_cpu, b = _fast_operands(shape, dtype, mojo_device, layout)
+    for op in ("add", "sub", "mul"):
+        want = getattr(torch, op)(a_cpu, b_cpu)
+        with native_ran(f"aten::{op}.Tensor"):
+            got = getattr(torch, op)(a, b)
+        torch.testing.assert_close(got.cpu(), want)
+        if layout == "dense":
+            # A non-dense input is a layout CPU torch propagates through
+            # TensorIterator and this device does not: its broadcast route
+            # has always returned a contiguous result.
+            assert got.stride() == want.stride()
+        # out= into a fresh buffer, and out= aliasing each operand
+        dest = torch.empty_like(a)
+        assert getattr(torch, op)(a, b, out=dest) is dest
+        torch.testing.assert_close(dest.cpu(), want)
+        for which in ("self", "other"):
+            alias_cpu = (a_cpu if which == "self" else b_cpu).clone()
+            alias = (a if which == "self" else b).clone()
+            getattr(torch, op)(
+                *(alias, b) if which == "self" else (a, alias), out=alias
+            )
+            getattr(torch, op)(
+                *(alias_cpu, b_cpu) if which == "self" else (a_cpu, alias_cpu),
+                out=alias_cpu,
+            )
+            torch.testing.assert_close(alias.cpu(), alias_cpu)
+        inplace_cpu, inplace = a_cpu.clone(), a.clone()
+        with native_ran(f"aten::{op}_.Tensor"):
+            assert getattr(inplace, op + "_")(b) is inplace
+        getattr(inplace_cpu, op + "_")(b_cpu)
+        torch.testing.assert_close(inplace.cpu(), inplace_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "other", ["equal", "row", "column", "zero_dim", "expanded", "wrapped", "scalar"]
+)
+def test_inplace_binary_broadcast_operands(mojo_device, dtype, other):
+    """`self op= other` for every shape of `other` the kernel can broadcast."""
+    a_cpu, a = _both((4, 6), dtype, mojo_device)
+    if other == "equal":
+        b_cpu, b = _both((4, 6), dtype, mojo_device)
+    elif other == "row":
+        b_cpu, b = _both((6,), dtype, mojo_device)
+    elif other == "column":
+        b_cpu, b = _both((4, 1), dtype, mojo_device)
+    elif other == "zero_dim":
+        b_cpu, b = _both((), dtype, mojo_device)
+    elif other == "expanded":
+        base_cpu, base = _both((1, 6), dtype, mojo_device)
+        b_cpu, b = base_cpu.expand(4, 6), base.expand(4, 6)
+    elif other == "wrapped":
+        b_cpu = b = torch.tensor(0.5, dtype=dtype)  # a 0-d CPU wrapped number
+    else:
+        b_cpu = b = 0.5
+    for op in ("mul", "add", "sub"):
+        got_cpu, got = a_cpu.clone(), a.clone()
+        version = got._version
+        with native_ran(f"aten::{op}_.Tensor"):
+            assert getattr(got, op + "_")(b) is got
+        assert got._version == version + 1
+        getattr(got_cpu, op + "_")(b_cpu)
+        torch.testing.assert_close(got.cpu(), got_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_inplace_binary_keeps_self_storage(mojo_device, dtype):
+    """The in-place route writes self's own bytes, at self's own offset."""
+    storage_cpu = torch.linspace(-1, 1, 40)
+    storage = storage_cpu.to(mojo_device)
+    view_cpu, view = storage_cpu[7:31].view(4, 6), storage[7:31].view(4, 6)
+    if dtype is not torch.float32:
+        pytest.skip("the offset-view contract is dtype independent")
+    b_cpu, b = _both((6,), dtype, mojo_device)
+    pointer = view.data_ptr()
+    view.mul_(b)
+    view_cpu.mul_(b_cpu)
+    assert view.data_ptr() == pointer
+    torch.testing.assert_close(storage.cpu(), storage_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_scalar_and_mixed_dtype_routes_match_cpu(mojo_device, dtype):
+    """Tensor-with-scalar add/sub/mul/div/pow, and the mixed-dtype add."""
+    a_cpu, a = _both((3, 5), dtype, mojo_device)
+    for value in (0.5, 2, -1.25):
+        for op in ("add", "sub", "mul"):
+            torch.testing.assert_close(
+                getattr(torch, op)(a, value).cpu(), getattr(torch, op)(a_cpu, value)
+            )
+        # Default per-dtype tolerances: the scalar routes compute in float32
+        # (and the mojo:cpu divide embeds the divisor in the tensor's own
+        # dtype), so a low-precision result is an ulp from CPU torch's.
+        torch.testing.assert_close((a / 0.97).cpu(), a_cpu / 0.97)
+        torch.testing.assert_close(torch.pow(a, 3.0).cpu(), torch.pow(a_cpu, 3.0))
+    other = torch.float32 if dtype is not torch.float32 else torch.bfloat16
+    b_cpu, b = _both((3, 5), other, mojo_device)
+    want = a_cpu + b_cpu
+    got = a + b
+    assert got.dtype == want.dtype
+    torch.testing.assert_close(got.cpu(), want)
+
+
+def test_inplace_binary_rejects_a_partially_overlapping_operand(mojo_device):
+    """The fast route declines and the cascade still raises ATen's error."""
+    storage = torch.arange(10, dtype=torch.float32, device=mojo_device)
+    for op in ("mul_", "add_", "sub_"):
+        with pytest.raises(RuntimeError, match="single memory location"):
+            getattr(storage[1:], op)(storage[:-1])
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.add(storage[:-1], storage[:-1], out=storage[1:])
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])

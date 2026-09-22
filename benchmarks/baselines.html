@@ -4883,6 +4883,24 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "div.Tensor": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "host_scalar": 1.059
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "host_scalar": 1.02
+                  }
+                }
+              }
+            }
+          }
+        },
         "lerp.Scalar_out": {
           "dtypes": {
             "f32": {
@@ -4927,6 +4945,54 @@ document.addEventListener("DOMContentLoaded", boot);
                 "C_16777216": {
                   "layouts": {
                     "contig": 0.997
+                  }
+                }
+              }
+            }
+          }
+        },
+        "mul.Tensor": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "inplace_device_scalar": 0.616
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "inplace_device_scalar": 0.461
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "inplace_device_scalar": 0.619
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "inplace_device_scalar": 0.469
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "host_scalar_offset1": 1.034,
+                    "inplace_device_scalar": 0.727
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "host_scalar_offset1": 0.959,
+                    "inplace_device_scalar": 0.847
                   }
                 }
               }

@@ -520,6 +520,78 @@ def test_addcdiv_inplace(
     )
 
 
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("layout", ("host_scalar",))
+@pytest.mark.bench_op("div.Tensor")
+def test_div_host_scalar(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    a_ref, a_our = both(
+        unit_interval(SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.div(a_ref, 0.03162277660168379),
+        lambda: torch.div(a_our, 0.03162277660168379),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32", "bf16", "f16"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("layout", ("inplace_device_scalar",))
+@pytest.mark.bench_op("mul.Tensor")
+def test_mul_inplace_device_scalar(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    dtype = DTYPES[dtype_id]
+    a_ref, a_our = both(unit_interval(SHAPES[shape_id], dtype), hw, mojo_device)
+    scalar_ref, scalar_our = both(torch.tensor(1.0, dtype=dtype), hw, mojo_device)
+    bench.run(
+        lambda: a_ref.mul_(scalar_ref),
+        lambda: a_our.mul_(scalar_our),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("layout", ("host_scalar_offset1",))
+@pytest.mark.bench_op("mul.Tensor")
+def test_mul_host_scalar_offset(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    size = torch.Size(SHAPES[shape_id]).numel()
+    src_ref, src_our = both(
+        unit_interval((size + 4,), DTYPES[dtype_id]), hw, mojo_device
+    )
+    dst_ref, dst_our = both(
+        torch.empty(size + 4, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    src_ref, src_our = src_ref[1 : size + 1], src_our[1 : size + 1]
+    dst_ref, dst_our = dst_ref[1 : size + 1], dst_our[1 : size + 1]
+    bench.run(
+        lambda: torch.mul(src_ref, 0.375, out=dst_ref),
+        lambda: torch.mul(src_our, 0.375, out=dst_our),
+        flops=float(size),
+    )
+
+
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", SHAPES)
 @pytest.mark.bench_op("where.self")

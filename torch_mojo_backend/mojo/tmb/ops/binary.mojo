@@ -54,8 +54,10 @@ from tmb.backend.abi import (
     new_tensor,
     own,
     release,
+    ret_owned,
     ret_ref,
     ret_tensor,
+    strides_equal,
     unsupported,
     v_f64,
     v_is_none,
@@ -520,6 +522,253 @@ def _b_raw_add(dst: T, a: T, b: T) raises:
     call.int(ctx_ptr(ctx))
     call.run()
     _ = ctx
+
+
+# ---------------------------------------------------------------------------
+# the common case, ahead of the cascade
+#
+# The cascade below reads each operand into a `Side` (two Optionals over a
+# ~200-byte view), copies both into every route it tries and wraps the answer
+# in a `Res`. An nsys CPU profile of one `add.out` call put 36% of its host
+# time in that plumbing alone. These helpers take the SAME route the cascade
+# ends on for the shapes that dominate a training step -- one dtype,
+# contiguous, equal shapes, or a numeric scalar -- reading each record once
+# and launching the same kernel with the same arguments. Anything else
+# returns False, and the cascade runs exactly as before (it re-reads the
+# records: two `tmb_tensor_*` rounds on a path that is no longer the common
+# one).
+# ---------------------------------------------------------------------------
+
+
+@fieldwise_init
+struct MaybeScal(Copyable, Movable):
+    """A Scalar operand when `ok`; POD, so passing it copies no Variant."""
+
+    var ok: Bool
+    var s: Scal
+
+
+@always_inline
+def _b_is_tensor_rec(v: Value) -> Bool:
+    return v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF
+
+
+def _b_wrapped_number(t: T) -> Bool:
+    """torch's *wrapped number*: the 0-d CPU tensor a python scalar becomes
+    where a schema says Tensor (see `_b_side`)."""
+    return t.device_type == DEVICE_TYPE_CPU and t.rank == 0 and t.numel == 1
+
+
+def _b_rec_scalar(v: Value) raises -> MaybeScal:
+    """The number a non-tensor operand record carries."""
+    if v.tag == TAG_SCALAR_DOUBLE or v.tag == TAG_DOUBLE:
+        var f = v_f64(v)
+        return MaybeScal(True, Scal(f, Int(f), False, False))
+    if v.tag == TAG_SCALAR_INT or v.tag == TAG_INT:
+        return MaybeScal(True, Scal(Float64(v.a), Int(v.a), True, False))
+    return MaybeScal(False, Scal(0.0, 0, False, False))
+
+
+def _b_spec_dtype_ok(op: StaticString, st: Int32) -> Bool:
+    """`_b_op_dtype_ok` as a predicate over the non-bool dtypes: False sends
+    the call to the cascade, which raises that function's decline."""
+    if not _b_bcast_dtype(st):
+        return False
+    if op == "DivSpec" or op == "PowSpec":
+        return _b_float3(st) or st == ST_FLOAT64
+    return True
+
+
+def _b_dense_pair(a: T, b: T) -> Bool:
+    """Both on one mojo device, contiguous, the same logical shape: what the
+    flat pass of the spec kernels asks for."""
+    return (
+        a.on_mojo()
+        and b.on_mojo()
+        and a.device == b.device
+        and a.contig
+        and b.contig
+        and a.rank == b.rank
+        and _b_fits(a, b.shape)
+    )
+
+
+def _b_fits_into(b: T, dest: T) -> Bool:
+    """`b` broadcasts into `dest`'s shape without widening it."""
+    for i in range(MAX_RANK):
+        if b.shape[i] != dest.shape[i] and b.shape[i] != 1:
+            return False
+    return True
+
+
+def _b_write_safe(dest: T, other: T) -> Bool:
+    """`dest[i] = f(..., other[...])` is exact: `other` is either the same
+    view of the same storage (element i read for element i) or shares no byte
+    with `dest`. Both are contiguous on this path, so `numel * itemsize` is
+    their exact span.
+
+    Weaker than `_b_no_partial_overlap`, which also passes non-dense views it
+    cannot judge; those return False here and take the cascade, where that
+    function decides.
+    """
+    if dest.h == other.h:
+        return True
+    if (
+        dest.ptr == other.ptr
+        and dest.stype == other.stype
+        and dest.rank == other.rank
+        and dest.numel == other.numel
+        and strides_equal(dest.strides, other.strides, dest.rank)
+    ):
+        return True
+    return (
+        other.ptr >= dest.ptr + dest.numel * dest.itemsize
+        or dest.ptr >= other.ptr + other.numel * other.itemsize
+    )
+
+
+def _b_fast_tt(
+    op: StaticString, a: T, b: T, rets: Values, dest_h: Int
+) raises -> Bool:
+    """Two dense mojo tensors of one dtype (or the FP32+BF16 add pair) into a
+    fresh output, or into `dest_h` when that already fits."""
+    if not _b_dense_pair(a, b):
+        return False
+    var kernel = op
+    var out_stype = a.stype
+    if a.stype != b.stype:
+        if op != "AddSpec":
+            return False
+        if not (
+            (a.stype == ST_FLOAT32 and b.stype == ST_BFLOAT16)
+            or (a.stype == ST_BFLOAT16 and b.stype == ST_FLOAT32)
+        ):
+            return False
+        kernel = "AddF32Bf16Spec"
+        out_stype = ST_FLOAT32
+    elif not _b_spec_dtype_ok(op, a.stype):
+        return False
+    elif op == "AddSpec" and dev(a.device)[].api == "metal":
+        # Metal's equal-shape add is the raw contiguous kernel of
+        # `_b_try_apple_add`; leave that choice to the cascade.
+        return False
+    if dest_h != 0:
+        var dest = T(dest_h)
+        if (
+            not dest.on_mojo()
+            or dest.device != a.device
+            or dest.stype != out_stype
+            or not dest.contig
+            or dest.rank != a.rank
+            or not _b_fits(dest, a.shape)
+            or not _b_write_safe(dest, a)
+            or not _b_write_safe(dest, b)
+        ):
+            return False
+        _b_binary_spec(kernel, a, b, dest)
+        ret_ref(rets, 0, dest)
+        return True
+    var out = own(new_tensor(a.shape, a.rank, out_stype, a.device))
+    _b_binary_spec(kernel, a, b, out.t)
+    ret_owned(rets, 0, out)
+    return True
+
+
+def _b_fast_ts(
+    op: StaticString, a: T, s: Scal, negate: Bool, rets: Values, dest_h: Int
+) raises -> Bool:
+    """A dense float tensor with a numeric scalar: `_b_try_scalar`'s route."""
+    if not _b_float3(a.stype) or s.is_bool or not a.contig:
+        return False
+    var value = -s.f if negate else s.f
+    if dest_h != 0:
+        var dest = T(dest_h)
+        if (
+            not dest.on_mojo()
+            or dest.device != a.device
+            or dest.stype != a.stype
+            or not dest.contig
+            or not dest.same_shape(a)
+            or not _b_write_safe(dest, a)
+        ):
+            return False
+        _b_scalar_spec(op, a, value, dest)
+        ret_ref(rets, 0, dest)
+        return True
+    var out = own(new_like(a))
+    _b_scalar_spec(op, a, value, out.t)
+    ret_owned(rets, 0, out)
+    return True
+
+
+def _b_fast_route(
+    tt: StaticString,
+    ts: StaticString,
+    negate: Bool,
+    args: Values,
+    rets: Values,
+    dest_h: Int,
+) raises -> Bool:
+    """`tt` is the kernel of the tensor-tensor route, `ts` that of the
+    tensor-scalar one ("" for an op that has neither). `dest_h` is an `out=`
+    to write in place, 0 to allocate."""
+    var av = args[unsafe_offset=0].copy()
+    if not _b_is_tensor_rec(av):
+        return False
+    var a = T(Int(av.a))
+    if not a.on_mojo() or not a.contig:
+        return False
+    var bv = args[unsafe_offset=1].copy()
+    if _b_is_tensor_rec(bv):
+        var b = T(Int(bv.a))
+        if b.on_mojo():
+            if tt.byte_length() == 0:
+                return False
+            return _b_fast_tt(tt, a, b, rets, dest_h)
+        if ts.byte_length() == 0 or not _b_wrapped_number(b):
+            return False
+        return _b_fast_ts(ts, a, _b_host_scalar(b), negate, rets, dest_h)
+    if ts.byte_length() == 0:
+        return False
+    var ms = _b_rec_scalar(bv)
+    if not ms.ok:
+        return False
+    return _b_fast_ts(ts, a, ms.s, negate, rets, dest_h)
+
+
+@always_inline
+def _b_out_handle(v: Value) -> Int:
+    """The `out=` tensor's handle for the fast routes, 0 when the record is
+    not a tensor at all (the cascade reports that)."""
+    return Int(v.a) if _b_is_tensor_rec(v) else 0
+
+
+def _b_fast_inplace_t(
+    op: StaticString, self: T, b: T, rets: Values
+) raises -> Bool:
+    """`self op= other` straight into self's storage: one dtype, self dense,
+    other dense and broadcasting into self, and either the same view of self
+    or disjoint from it. Same kernel and same arithmetic as the functional
+    route, minus its output buffer and the copy back over self."""
+    if (
+        not self.on_mojo()
+        or not b.on_mojo()
+        or self.device != b.device
+        or self.stype != b.stype
+        or not self.contig
+        or not b.contig
+        or b.rank > self.rank
+        or not _b_spec_dtype_ok(op, self.stype)
+        or not _b_fits_into(b, self)
+        or not _b_write_safe(self, b)
+    ):
+        return False
+    if (self.rank > 4 or b.rank > 4) and not self.same_shape(b):
+        # The spec entry's rank > 4 pass is a flat one: equal shapes only.
+        return False
+    _b_binary_spec(op, self, b, self)
+    ret_ref(rets, 0, self)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1263,10 @@ def _b_mul(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
 
 # aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
 def op_add_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+        "AddSpec", "AddScalarSpec", False, args, rets, 0
+    ):
+        return
     _b_ret(
         rets,
         _b_add(
@@ -1045,6 +1298,9 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             _b_raw_add(self, self, b)
             ret_ref(rets, 0, self)
             return
+        if _b_fast_inplace_t("AddSpec", self, b, rets):
+            # A broadcasting operand (the 0-d device scalar above all).
+            return
     if not rhs.is_t and self.contig and _b_float3(self.stype):
         # A float scalar goes straight into `self`, alpha folded in exactly:
         # no output buffer and no copy back.
@@ -1060,6 +1316,15 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
 def op_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+        "AddSpec",
+        "AddScalarSpec",
+        False,
+        args,
+        rets,
+        _b_out_handle(args[unsafe_offset=3]),
+    ):
+        return
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
@@ -1074,6 +1339,10 @@ def op_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
 def op_sub_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+        "SubSpec", "AddScalarSpec", True, args, rets, 0
+    ):
+        return
     _b_ret(
         rets,
         _b_sub(
@@ -1091,6 +1360,9 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var rhs = _b_side(args[unsafe_offset=1])
     _b_no_overlap_side(self, rhs)
     var alpha = v_f64(args[unsafe_offset=2])
+    if alpha == 1.0 and rhs.is_t:
+        if _b_fast_inplace_t("SubSpec", self, rhs.t.value(), rets):
+            return
     if not rhs.is_t and self.contig and _b_float3(self.stype):
         var s = rhs.s.value().copy()
         if not s.is_bool:
@@ -1104,6 +1376,15 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::sub.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
 def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+        "SubSpec",
+        "AddScalarSpec",
+        True,
+        args,
+        rets,
+        _b_out_handle(args[unsafe_offset=3]),
+    ):
+        return
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
@@ -1118,6 +1399,8 @@ def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::mul.Tensor(Tensor self, Tensor other) -> Tensor
 def op_mul_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if _b_fast_route("MulSpec", "MulScalarSpec", False, args, rets, 0):
+        return
     _b_ret(
         rets,
         _b_mul(
@@ -1140,11 +1423,25 @@ def op_mul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             _b_scalar_inplace("MulScalarInplace", self, s.f)
             ret_ref(rets, 0, self)
             return
+    if rhs.is_t and _b_fast_inplace_t("MulSpec", self, rhs.t.value(), rets):
+        # Every output element is written from the element (or the single
+        # broadcast element) the kernel read for it, so the functional
+        # route's output buffer and copy back over `self` are both waste.
+        return
     _b_store_inplace(rets, self, _b_mul(_b_tside(self), rhs, None))
 
 
 # aten::mul.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_mul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if _b_fast_route(
+        "MulSpec",
+        "MulScalarSpec",
+        False,
+        args,
+        rets,
+        _b_out_handle(args[unsafe_offset=2]),
+    ):
+        return
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
@@ -1230,6 +1527,24 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     # that pair on its own.
     var num = _b_cast(a, common)
     if not rhs.is_t:
+        var scalar = rhs.s.value().copy()
+        if (
+            a.stype == ST_FLOAT32
+            and a.contig
+            and dev(a.device)[].api == "cuda"
+            and not scalar.is_bool
+            and scalar.f != 0
+        ):
+            # ATen's CUDA div_true cpu-scalar route computes the reciprocal
+            # in float64, then rounds to opmath float32 before multiplying.
+            # Reuse that route without allocating/filling a device scalar.
+            var inverse = Scal(1.0 / scalar.f, 0, False, False)
+            var direct = _b_try_scalar(
+                "MulScalarSpec", _b_tside(num.t), _b_sside(inverse), False, dst
+            )
+            if direct:
+                _ = num
+                return direct.value().copy()
         var r1 = _b_binary("DivSpec", _b_tside(num.t), rhs, Int32(-1), dst)
         _ = num
         return r1^
@@ -1249,8 +1564,55 @@ def _b_no_mode() -> Value:
     return Value(TAG_NONE, 0, 0, 0)
 
 
+def _b_fast_div_scalar(a: T, s: Scal, rets: Values, dest_h: Int) raises -> Bool:
+    """The reciprocal route `_b_div` takes for a CUDA float32 tensor over a
+    nonzero scalar -- same gates, same rounding, no cascade."""
+    if (
+        a.stype != ST_FLOAT32
+        or s.is_bool
+        or s.f == 0.0
+        or dev(a.device)[].api != "cuda"
+    ):
+        return False
+    return _b_fast_ts(
+        "MulScalarSpec",
+        a,
+        Scal(1.0 / s.f, 0, False, False),
+        False,
+        rets,
+        dest_h,
+    )
+
+
+def _b_fast_div(args: Values, rets: Values, dest_h: Int) raises -> Bool:
+    """True division's two common shapes: a dense float tensor over a dense
+    one of the same dtype, and the reciprocal-by-scalar route."""
+    var av = args[unsafe_offset=0].copy()
+    if not _b_is_tensor_rec(av):
+        return False
+    var a = T(Int(av.a))
+    if not a.on_mojo() or not a.contig:
+        return False
+    var bv = args[unsafe_offset=1].copy()
+    if _b_is_tensor_rec(bv):
+        var b = T(Int(bv.a))
+        if b.on_mojo():
+            if a.stype != b.stype or not _b_is_floating(a.stype):
+                return False
+            return _b_fast_tt("DivSpec", a, b, rets, dest_h)
+        if not _b_wrapped_number(b):
+            return False
+        return _b_fast_div_scalar(a, _b_host_scalar(b), rets, dest_h)
+    var ms = _b_rec_scalar(bv)
+    if not ms.ok:
+        return False
+    return _b_fast_div_scalar(a, ms.s, rets, dest_h)
+
+
 # aten::div.Tensor(Tensor self, Tensor other) -> Tensor
 def op_div_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if _b_fast_div(args, rets, 0):
+        return
     _b_ret(
         rets,
         _b_div(
@@ -1277,6 +1639,8 @@ def op_div_mode(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::div.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_div_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if _b_fast_div(args, rets, _b_out_handle(args[unsafe_offset=2])):
+        return
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
@@ -1323,6 +1687,8 @@ def _b_simple(op: StaticString, args: Values, rets: Values) raises:
 
 # aten::pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
 def op_pow_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if _b_fast_route("", "PowScalarSpec", False, args, rets, 0):
+        return
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var r = _b_try_scalar("PowScalarSpec", lhs, rhs, False, None)
