@@ -72,148 +72,202 @@ void scalar_to_record(const c10::Scalar& s, TmbValue& out) {
   else { auto c = s.toComplexDouble(); out.tag = TMB_COMPLEX; out.a = double_bits(c.real()); out.b = double_bits(c.imag()); }
 }
 
-void to_record(const c10::TypePtr& type, const c10::IValue& v, TmbValue& out, Arena& arena) {
-  out.len = 0; out.a = 0; out.b = 0;
-  if (v.isNone()) { out.tag = TMB_NONE; return; }
+// How one schema position converts: derived from its type by conv_of(), which
+// is the only place that walks a c10::Type. Optional is unwrapped there; a
+// None IValue is checked before the conversion either way.
+enum Conv : uint8_t {
+  CV_TENSOR, CV_INT, CV_SYMINT, CV_DOUBLE, CV_BOOL, CV_SCALAR, CV_DTYPE,
+  CV_LAYOUT, CV_MEMORY_FORMAT, CV_DEVICE, CV_STRING, CV_STREAM,
+  // from here on: the kinds that need the Arena
+  CV_GENERATOR, CV_INT_LIST, CV_DOUBLE_LIST, CV_BOOL_LIST, CV_SCALAR_LIST,
+  CV_TENSOR_LIST, CV_OPT_TENSOR_LIST,
+  CV_UNSUPPORTED,       // raised at conversion time, in argument order
+  CV_UNSUPPORTED_LIST,  // a list whose element type we do not carry
+};
+
+uint8_t conv_of(const c10::TypePtr& type) {
   switch (type->kind()) {
     case c10::TypeKind::OptionalType:
-      return to_record(type->castRaw<c10::OptionalType>()->getElementType(), v, out, arena);
-    case c10::TypeKind::TensorType:
+      return conv_of(type->castRaw<c10::OptionalType>()->getElementType());
+    case c10::TypeKind::TensorType: return CV_TENSOR;
+    case c10::TypeKind::IntType: return CV_INT;
+    case c10::TypeKind::SymIntType: return CV_SYMINT;
+    case c10::TypeKind::FloatType: return CV_DOUBLE;
+    case c10::TypeKind::BoolType: return CV_BOOL;
+    case c10::TypeKind::NumberType: return CV_SCALAR;
+    case c10::TypeKind::ScalarTypeType: return CV_DTYPE;
+    case c10::TypeKind::LayoutType: return CV_LAYOUT;
+    case c10::TypeKind::MemoryFormatType: return CV_MEMORY_FORMAT;
+    case c10::TypeKind::DeviceObjType: return CV_DEVICE;
+    case c10::TypeKind::StringType: return CV_STRING;
+    case c10::TypeKind::GeneratorType: return CV_GENERATOR;
+    case c10::TypeKind::StreamObjType: return CV_STREAM;
+    case c10::TypeKind::ListType: {
+      const auto inner = type->castRaw<c10::ListType>()->getElementType();
+      switch (inner->kind()) {
+        case c10::TypeKind::TensorType: return CV_TENSOR_LIST;
+        case c10::TypeKind::IntType:
+        case c10::TypeKind::SymIntType: return CV_INT_LIST;
+        case c10::TypeKind::FloatType: return CV_DOUBLE_LIST;
+        case c10::TypeKind::BoolType: return CV_BOOL_LIST;
+        case c10::TypeKind::NumberType: return CV_SCALAR_LIST;
+        case c10::TypeKind::OptionalType:
+          return inner->castRaw<c10::OptionalType>()->getElementType()->kind() ==
+                         c10::TypeKind::TensorType
+                     ? CV_OPT_TENSOR_LIST
+                     : CV_UNSUPPORTED_LIST;
+        default: return CV_UNSUPPORTED_LIST;
+      }
+    }
+    default: return CV_UNSUPPORTED;
+  }
+}
+
+struct RetConv {
+  uint8_t conv;
+  // A None record for a `Tensor` result is an undefined Tensor (a masked-off
+  // gradient, as ATen's own backward kernels return it); `Tensor?` gives None.
+  bool none_is_undefined_tensor;
+};
+
+inline RetConv ret_conv_of(const c10::TypePtr& type) {
+  return {conv_of(type), type->kind() == c10::TypeKind::TensorType};
+}
+
+void to_record(uint8_t conv, const c10::TypePtr& type, const c10::IValue& v, TmbValue& out, Arena& arena) {
+  out.len = 0; out.a = 0; out.b = 0;
+  if (v.isNone()) { out.tag = TMB_NONE; return; }
+  switch (conv) {
+    case CV_TENSOR:
       // an absent `Tensor?` from a C++ composite is an undefined Tensor, not None
       if (!v.toTensor().defined()) { out.tag = TMB_NONE; return; }
       out.tag = TMB_TENSOR; out.a = reinterpret_cast<int64_t>(&v.toTensor()); return;
-    case c10::TypeKind::IntType:
+    case CV_INT:
       out.tag = TMB_INT; out.a = v.toInt(); return;
-    case c10::TypeKind::SymIntType:
+    case CV_SYMINT:
       out.tag = TMB_INT; out.a = v.isInt() ? v.toInt() : v.toSymInt().guard_int(__FILE__, __LINE__); return;
-    case c10::TypeKind::FloatType:
+    case CV_DOUBLE:
       out.tag = TMB_DOUBLE; out.a = double_bits(v.toDouble()); return;
-    case c10::TypeKind::BoolType:
+    case CV_BOOL:
       out.tag = TMB_BOOL; out.a = v.toBool(); return;
-    case c10::TypeKind::NumberType:
+    case CV_SCALAR:
       scalar_to_record(v.toScalar(), out); return;
-    case c10::TypeKind::ScalarTypeType:
+    case CV_DTYPE:
       out.tag = TMB_DTYPE; out.a = static_cast<int64_t>(v.toScalarType()); return;
-    case c10::TypeKind::LayoutType:
+    case CV_LAYOUT:
       out.tag = TMB_LAYOUT; out.a = static_cast<int64_t>(v.toLayout()); return;
-    case c10::TypeKind::MemoryFormatType:
+    case CV_MEMORY_FORMAT:
       out.tag = TMB_MEMORY_FORMAT; out.a = static_cast<int64_t>(v.toMemoryFormat()); return;
-    case c10::TypeKind::DeviceObjType: {
+    case CV_DEVICE: {
       auto d = v.toDevice();
       out.tag = TMB_DEVICE; out.a = static_cast<int64_t>(d.type()); out.b = d.index(); return;
     }
-    case c10::TypeKind::StringType: {
+    case CV_STRING: {
       const auto& s = v.toStringRef();
       out.tag = TMB_STRING; out.a = reinterpret_cast<int64_t>(s.data()); out.len = static_cast<int32_t>(s.size()); return;
     }
-    case c10::TypeKind::GeneratorType:
-      // boxed: the address must survive the vector growing
-      arena.generators.push_back(std::make_unique<at::Generator>(v.toGenerator()));
-      out.tag = TMB_GENERATOR; out.a = reinterpret_cast<int64_t>(arena.generators.back().get()); return;
-    case c10::TypeKind::StreamObjType: {
+    case CV_STREAM: {
       auto st = v.toStream();
       out.tag = TMB_STREAM; out.a = st.device_index(); out.b = static_cast<int64_t>(st.id()); return;
     }
-    case c10::TypeKind::ListType: {
-      auto inner = type->castRaw<c10::ListType>()->getElementType();
-      auto ik = inner->kind();
-      if (ik == c10::TypeKind::TensorType) {
-        arena.tensors.push_back(v.toTensorVector());
-        auto& ts = arena.tensors.back();
-        arena.tensor_ptrs.emplace_back();
-        auto& ps = arena.tensor_ptrs.back();
-        ps.reserve(ts.size());
-        for (auto& t : ts) ps.push_back(&t);
-        out.tag = TMB_TENSOR_LIST; out.a = reinterpret_cast<int64_t>(ps.data()); out.len = static_cast<int32_t>(ps.size());
-        return;
+    case CV_GENERATOR:
+      // boxed: the address must survive the vector growing
+      arena.generators.push_back(std::make_unique<at::Generator>(v.toGenerator()));
+      out.tag = TMB_GENERATOR; out.a = reinterpret_cast<int64_t>(arena.generators.back().get()); return;
+    case CV_TENSOR_LIST: {
+      arena.tensors.push_back(v.toTensorVector());
+      auto& ts = arena.tensors.back();
+      arena.tensor_ptrs.emplace_back();
+      auto& ps = arena.tensor_ptrs.back();
+      ps.reserve(ts.size());
+      for (auto& t : ts) ps.push_back(&t);
+      out.tag = TMB_TENSOR_LIST; out.a = reinterpret_cast<int64_t>(ps.data()); out.len = static_cast<int32_t>(ps.size());
+      return;
+    }
+    case CV_OPT_TENSOR_LIST: {
+      auto list = v.toOptionalTensorList();
+      arena.tensors.emplace_back();
+      auto& ts = arena.tensors.back();
+      ts.reserve(list.size());
+      std::vector<bool> present;
+      present.reserve(list.size());
+      for (size_t i = 0; i < list.size(); ++i) {
+        std::optional<at::Tensor> e = list.get(i);
+        // ATen indexing also represents an omitted axis as an undefined Tensor.
+        present.push_back(e.has_value() && e->defined());
+        ts.push_back(e.has_value() ? *e : at::Tensor());
       }
-      if (ik == c10::TypeKind::OptionalType &&
-          inner->castRaw<c10::OptionalType>()->getElementType()->kind() == c10::TypeKind::TensorType) {
-        auto list = v.toOptionalTensorList();
-        arena.tensors.emplace_back();
-        auto& ts = arena.tensors.back();
-        ts.reserve(list.size());
-        std::vector<bool> present;
-        present.reserve(list.size());
-        for (size_t i = 0; i < list.size(); ++i) {
-          std::optional<at::Tensor> e = list.get(i);
-          // ATen indexing also represents an omitted axis as an undefined Tensor.
-          present.push_back(e.has_value() && e->defined());
-          ts.push_back(e.has_value() ? *e : at::Tensor());
-        }
-        arena.tensor_ptrs.emplace_back();
-        auto& ps = arena.tensor_ptrs.back();
-        for (size_t i = 0; i < ts.size(); ++i) ps.push_back(present[i] ? &ts[i] : nullptr);
-        out.tag = TMB_OPT_TENSOR_LIST; out.a = reinterpret_cast<int64_t>(ps.data()); out.len = static_cast<int32_t>(ps.size());
-        return;
+      arena.tensor_ptrs.emplace_back();
+      auto& ps = arena.tensor_ptrs.back();
+      for (size_t i = 0; i < ts.size(); ++i) ps.push_back(present[i] ? &ts[i] : nullptr);
+      out.tag = TMB_OPT_TENSOR_LIST; out.a = reinterpret_cast<int64_t>(ps.data()); out.len = static_cast<int32_t>(ps.size());
+      return;
+    }
+    case CV_INT_LIST: {
+      if (v.isIntList()) {
+        arena.ints.push_back(v.toIntVector());
+      } else {
+        arena.ints.emplace_back();
+        for (auto& s : v.toSymIntVector()) arena.ints.back().push_back(s.guard_int(__FILE__, __LINE__));
       }
-      if (ik == c10::TypeKind::IntType || ik == c10::TypeKind::SymIntType) {
-        if (v.isIntList()) {
-          arena.ints.push_back(v.toIntVector());
-        } else {
-          arena.ints.emplace_back();
-          for (auto& s : v.toSymIntVector()) arena.ints.back().push_back(s.guard_int(__FILE__, __LINE__));
-        }
-        out.tag = TMB_INT_LIST; out.a = reinterpret_cast<int64_t>(arena.ints.back().data()); out.len = static_cast<int32_t>(arena.ints.back().size());
-        return;
+      out.tag = TMB_INT_LIST; out.a = reinterpret_cast<int64_t>(arena.ints.back().data()); out.len = static_cast<int32_t>(arena.ints.back().size());
+      return;
+    }
+    case CV_DOUBLE_LIST: {
+      arena.doubles.push_back(v.toDoubleVector());
+      out.tag = TMB_DOUBLE_LIST; out.a = reinterpret_cast<int64_t>(arena.doubles.back().data()); out.len = static_cast<int32_t>(arena.doubles.back().size());
+      return;
+    }
+    case CV_BOOL_LIST: {
+      arena.bools.emplace_back();
+      for (bool b : v.toBoolList()) arena.bools.back().push_back(b ? 1 : 0);
+      out.tag = TMB_BOOL_LIST; out.a = reinterpret_cast<int64_t>(arena.bools.back().data()); out.len = static_cast<int32_t>(arena.bools.back().size());
+      return;
+    }
+    case CV_SCALAR_LIST: {
+      // Scalar[] (the _foreach_*.ScalarList ops). A c10::Scalar is tagged,
+      // and the list has no per-element tag to carry, so the LIST takes the
+      // tag every element agrees on: all bool -> TMB_BOOL_LIST, else all
+      // integral -> TMB_INT_LIST (exact past 2^53, where a double is not),
+      // else TMB_DOUBLE_LIST. An empty list is vacuously integral. A mixed
+      // list is the only one that rounds, and only its integers.
+      const auto& xs = v.toListRef();
+      bool all_bool = true, all_int = true;
+      for (const auto& e : xs) {
+        const auto& s = e.toScalar();
+        all_bool &= s.isBoolean();
+        all_int &= s.isIntegral(/*includeBool=*/true);
       }
-      if (ik == c10::TypeKind::FloatType) {
-        arena.doubles.push_back(v.toDoubleVector());
-        out.tag = TMB_DOUBLE_LIST; out.a = reinterpret_cast<int64_t>(arena.doubles.back().data()); out.len = static_cast<int32_t>(arena.doubles.back().size());
-        return;
-      }
-      if (ik == c10::TypeKind::NumberType) {
-        // Scalar[] (the _foreach_*.ScalarList ops). A c10::Scalar is tagged,
-        // and the list has no per-element tag to carry, so the LIST takes the
-        // tag every element agrees on: all bool -> TMB_BOOL_LIST, else all
-        // integral -> TMB_INT_LIST (exact past 2^53, where a double is not),
-        // else TMB_DOUBLE_LIST. An empty list is vacuously integral. A mixed
-        // list is the only one that rounds, and only its integers.
-        const auto& xs = v.toListRef();
-        bool all_bool = true, all_int = true;
-        for (const auto& e : xs) {
-          const auto& s = e.toScalar();
-          all_bool &= s.isBoolean();
-          all_int &= s.isIntegral(/*includeBool=*/true);
-        }
-        if (all_bool && !xs.empty()) {
-          arena.bools.emplace_back();
-          for (const auto& e : xs) arena.bools.back().push_back(e.toScalar().toBool() ? 1 : 0);
-          out.tag = TMB_BOOL_LIST; out.a = reinterpret_cast<int64_t>(arena.bools.back().data()); out.len = static_cast<int32_t>(arena.bools.back().size());
-          return;
-        }
-        if (all_int) {
-          arena.ints.emplace_back();
-          for (const auto& e : xs) arena.ints.back().push_back(e.toScalar().toLong());
-          out.tag = TMB_INT_LIST; out.a = reinterpret_cast<int64_t>(arena.ints.back().data()); out.len = static_cast<int32_t>(arena.ints.back().size());
-          return;
-        }
-        arena.doubles.emplace_back();
-        for (const auto& e : xs) arena.doubles.back().push_back(e.toScalar().toDouble());
-        out.tag = TMB_DOUBLE_LIST; out.a = reinterpret_cast<int64_t>(arena.doubles.back().data()); out.len = static_cast<int32_t>(arena.doubles.back().size());
-        return;
-      }
-      if (ik == c10::TypeKind::BoolType) {
+      if (all_bool && !xs.empty()) {
         arena.bools.emplace_back();
-        for (bool b : v.toBoolList()) arena.bools.back().push_back(b ? 1 : 0);
+        for (const auto& e : xs) arena.bools.back().push_back(e.toScalar().toBool() ? 1 : 0);
         out.tag = TMB_BOOL_LIST; out.a = reinterpret_cast<int64_t>(arena.bools.back().data()); out.len = static_cast<int32_t>(arena.bools.back().size());
         return;
       }
-      TORCH_CHECK(false, "mojo backend: unsupported list argument type ", type->str());
+      if (all_int) {
+        arena.ints.emplace_back();
+        for (const auto& e : xs) arena.ints.back().push_back(e.toScalar().toLong());
+        out.tag = TMB_INT_LIST; out.a = reinterpret_cast<int64_t>(arena.ints.back().data()); out.len = static_cast<int32_t>(arena.ints.back().size());
+        return;
+      }
+      arena.doubles.emplace_back();
+      for (const auto& e : xs) arena.doubles.back().push_back(e.toScalar().toDouble());
+      out.tag = TMB_DOUBLE_LIST; out.a = reinterpret_cast<int64_t>(arena.doubles.back().data()); out.len = static_cast<int32_t>(arena.doubles.back().size());
+      return;
     }
+    case CV_UNSUPPORTED_LIST:
+      TORCH_CHECK(false, "mojo backend: unsupported list argument type ", type->str());
     default:
       TORCH_CHECK(false, "mojo backend: unsupported argument type ", type->str());
   }
 }
 
-c10::IValue from_record(const c10::TypePtr& type, const TmbValue& r) {
-  // a None record for a Tensor result is an undefined Tensor (a masked-off
-  // gradient, as ATen's own backward kernels return it); None otherwise
-  if (r.tag == TMB_NONE) return type->kind() == c10::TypeKind::TensorType ? c10::IValue(at::Tensor()) : c10::IValue();
-  switch (type->kind()) {
-    case c10::TypeKind::OptionalType:
-      return from_record(type->castRaw<c10::OptionalType>()->getElementType(), r);
-    case c10::TypeKind::TensorType: {
+c10::IValue from_record(RetConv rc, const c10::TypePtr& type, const TmbValue& r) {
+  if (r.tag == TMB_NONE) {
+    return rc.none_is_undefined_tensor ? c10::IValue(at::Tensor()) : c10::IValue();
+  }
+  switch (rc.conv) {
+    case CV_TENSOR: {
       auto* p = reinterpret_cast<at::Tensor*>(r.a);
       if (r.tag == TMB_TENSOR_REF) return c10::IValue(*p);
       TORCH_CHECK(r.tag == TMB_TENSOR, "mojo backend: kernel returned tag ", r.tag, " for a Tensor result");
@@ -221,38 +275,40 @@ c10::IValue from_record(const c10::TypePtr& type, const TmbValue& r) {
       delete p;
       return out;
     }
-    case c10::TypeKind::IntType:
-    case c10::TypeKind::SymIntType:
+    case CV_INT:
+    case CV_SYMINT:
       return c10::IValue(r.a);
-    case c10::TypeKind::FloatType:
+    case CV_DOUBLE:
       return c10::IValue(bits_double(r.a));
-    case c10::TypeKind::BoolType:
+    case CV_BOOL:
       return c10::IValue(r.a != 0);
-    case c10::TypeKind::NumberType:
+    case CV_SCALAR:
       if (r.tag == TMB_SCALAR_BOOL || r.tag == TMB_BOOL) return c10::IValue(c10::Scalar(r.a != 0));
       if (r.tag == TMB_SCALAR_DOUBLE || r.tag == TMB_DOUBLE) return c10::IValue(c10::Scalar(bits_double(r.a)));
       if (r.tag == TMB_COMPLEX) return c10::IValue(c10::Scalar(c10::complex<double>(bits_double(r.a), bits_double(r.b))));
       return c10::IValue(c10::Scalar(r.a));
-    case c10::TypeKind::ListType: {
-      auto inner = type->castRaw<c10::ListType>()->getElementType();
-      if (inner->kind() == c10::TypeKind::TensorType) {
-        TORCH_CHECK(r.tag == TMB_TENSOR_LIST, "mojo backend: kernel returned tag ", r.tag, " for a Tensor[] result");
-        auto** ps = reinterpret_cast<at::Tensor**>(r.a);
-        c10::List<at::Tensor> out;
-        out.reserve(r.len);
-        for (int32_t i = 0; i < r.len; ++i) { out.push_back(std::move(*ps[i])); delete ps[i]; }
-        std::free(ps);
-        return c10::IValue(std::move(out));
-      }
-      if (inner->kind() == c10::TypeKind::IntType || inner->kind() == c10::TypeKind::SymIntType) {
-        auto* xs = reinterpret_cast<const int64_t*>(r.a);
-        c10::List<int64_t> out;
-        for (int32_t i = 0; i < r.len; ++i) out.push_back(xs[i]);
-        std::free(const_cast<int64_t*>(xs));
-        return c10::IValue(std::move(out));
-      }
-      TORCH_CHECK(false, "mojo backend: unsupported list result type ", type->str());
+    case CV_TENSOR_LIST: {
+      TORCH_CHECK(r.tag == TMB_TENSOR_LIST, "mojo backend: kernel returned tag ", r.tag, " for a Tensor[] result");
+      auto** ps = reinterpret_cast<at::Tensor**>(r.a);
+      c10::List<at::Tensor> out;
+      out.reserve(r.len);
+      for (int32_t i = 0; i < r.len; ++i) { out.push_back(std::move(*ps[i])); delete ps[i]; }
+      std::free(ps);
+      return c10::IValue(std::move(out));
     }
+    case CV_INT_LIST: {
+      auto* xs = reinterpret_cast<const int64_t*>(r.a);
+      c10::List<int64_t> out;
+      for (int32_t i = 0; i < r.len; ++i) out.push_back(xs[i]);
+      std::free(const_cast<int64_t*>(xs));
+      return c10::IValue(std::move(out));
+    }
+    case CV_DOUBLE_LIST:
+    case CV_BOOL_LIST:
+    case CV_SCALAR_LIST:
+    case CV_OPT_TENSOR_LIST:
+    case CV_UNSUPPORTED_LIST:
+      TORCH_CHECK(false, "mojo backend: unsupported list result type ", type->str());
     default:
       TORCH_CHECK(false, "mojo backend: unsupported result type ", type->str());
   }
@@ -380,7 +436,8 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
     Arena arena;
     auto ivalues = torch::jit::last(*stack, n_args);
     for (size_t i = 0; i < n_args; ++i) {
-      to_record(arguments[i].real_type(), ivalues[i], args[i], arena);
+      const auto& type = arguments[i].real_type();
+      to_record(conv_of(type), type, ivalues[i], args[i], arena);
     }
     for (size_t i = 0; i < n_rets; ++i) { rets[i].tag = TMB_NONE; rets[i].len = 0; rets[i].a = 0; rets[i].b = 0; }
     const char* name = schema.name().c_str();
@@ -402,7 +459,7 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
         torch::jit::drop(*stack, n_args);
         return;
       }
-      c10::IValue out = from_record(returns[0].real_type(), rets[0]);
+      c10::IValue out = from_record(ret_conv_of(returns[0].real_type()), returns[0].real_type(), rets[0]);
       torch::jit::drop(*stack, n_args);
       stack->push_back(std::move(out));
       return;
@@ -413,7 +470,7 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
     if (n_rets > 8) { out_heap.resize(n_rets); outs = out_heap.data(); }
     for (size_t i = 0; i < n_rets; ++i) {
       try {
-        outs[i] = from_record(returns[i].real_type(), rets[i]);
+        outs[i] = from_record(ret_conv_of(returns[i].real_type()), returns[i].real_type(), rets[i]);
       } catch (...) {
         release_records(rets + i + 1, n_rets - i - 1);
         throw;
