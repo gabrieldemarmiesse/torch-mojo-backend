@@ -30,7 +30,11 @@ sets, put the marker on the GPU `pytest.param` only. Pure validation tests in
 GPU-related modules still belong to the CPU selection.
 
 The GPU suites run on whichever `L4` runners are free. A runner takes one job
-at a time, so there is no need to flock the GPU against another job on it. The
+at a time, so there is no need to flock the GPU against another job on it.
+The `mojo` suite runs under pytest-xdist with four workers sharing the GPU
+(`--dist loadgroup`: modules marked `xdist_group` stay on one worker), then
+the tests marked `timing`, which assert on wall-clock ratios, run alone in a
+second serial pass. The other two suites are small and run serially. The
 jobs preserve the runner's
 uv, Mojo, and native build caches, using
 `UV_CACHE_DIR`, `MODULAR_HOME`, and `TORCH_MOJO_BACKEND_CACHE_DIR` if configured,

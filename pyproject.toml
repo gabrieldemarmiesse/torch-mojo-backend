@@ -60,6 +60,7 @@ markers = [
     "gpu: requires a GPU (also inferred from GPU fixtures); select with -m gpu or -m 'not gpu'",
     "cuda: CUDA graph tests that must run before Mojo device registration, in a separate process",
     "cpu_torch: Mojo GPU integration requiring a CPU-only torch wheel (Inductor/Triton)",
+    "timing: asserts on wall-clock ratios; CI runs these alone, after the xdist pass",
 ]
 
 [tool.ruff.lint]

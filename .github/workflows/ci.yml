@@ -135,12 +135,20 @@ jobs:
           - suite: cuda
             selection: "gpu and cuda"
             torch-wheel: cuda
+            workers: 1
+          # Four workers share the one L4: kernel builds are CPU-bound and
+          # flocked per specialization, so a cold run builds families in
+          # parallel instead of one after the other, and the warm run
+          # overlaps the tests that spawn fresh processes. Modules with
+          # process-level state carry `xdist_group` and stay on one worker.
           - suite: mojo
             selection: "gpu and not cuda and not cpu_torch"
             torch-wheel: cuda
+            workers: 4
           - suite: cpu-torch
             selection: "gpu and cpu_torch"
             torch-wheel: cpu
+            workers: 1
 
     steps:
       - uses: actions/checkout@v4
@@ -207,5 +215,15 @@ jobs:
           PY
 
       - name: Run GPU unit tests
+        if: matrix.workers == 1
         run: |
           uv run --no-sync pytest tests/ -m "${{ matrix.selection }}" -v -ra
+
+      # Tests marked `timing` compare wall-clock durations and would flake
+      # under GPU timeslicing, so they run in a second, serial pass.
+      - name: Run GPU unit tests (${{ matrix.workers }} workers)
+        if: matrix.workers != 1
+        run: |
+          uv run --no-sync pytest tests/ -m "(${{ matrix.selection }}) and not timing" \
+            -n ${{ matrix.workers }} --dist loadgroup -v -ra
+          uv run --no-sync pytest tests/ -m "(${{ matrix.selection }}) and timing" -v -ra

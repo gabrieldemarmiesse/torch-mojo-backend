@@ -1436,6 +1436,7 @@ def _check_empty_cache_staging(device: str, api_name: str):
     not Path("/proc/self/status").exists(),
     reason="current RSS oracle needs Linux /proc",
 )
+@pytest.mark.timing
 @pytest.mark.parametrize("api_name", ["mojo", "accelerator"])
 def test_empty_cache_staging_contract(mojo_gpu: str, api_name: str):
     """Completed staging is released; pending data stays resident without a wait.

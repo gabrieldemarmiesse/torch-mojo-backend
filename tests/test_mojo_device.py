@@ -1208,6 +1208,7 @@ def test_non_blocking_pinned_other_device(mojo_gpu: str):
         torch.testing.assert_close(host, expected)
 
 
+@pytest.mark.timing
 def test_same_device_d2d_does_not_drain_prior_gpu_work(mojo_gpu: str):
     """Contiguous and strided D2D copies stay queued on the device stream."""
     a = torch.full((4096, 4096), 1.0, device=mojo_gpu)
