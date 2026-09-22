@@ -32,6 +32,8 @@ COVERS: dict[str, str] = {
     "aten::_log_softmax": "test_log_softmax",
     "aten::_log_softmax_backward_data": "test_log_softmax_backward",
     "aten::gelu_backward": "test_gelu_backward",
+    "aten::tanh_backward": "test_tanh_backward_f32",
+    "aten::tanh_backward.grad_input": "test_tanh_backward_f32",
 }
 
 SKIPPED: dict[str, str] = {}
@@ -100,4 +102,41 @@ def test_gelu_backward(
         lambda: torch.ops.aten.gelu_backward(g_ref, x_ref),
         lambda: torch.ops.aten.gelu_backward(g_our, x_our),
         flops=float(x_ref.numel()),
+    )
+
+
+_TANH_BACKWARD_CASES = {
+    "small1600": (1600, 0),
+    "large6553600": (6553600, 0),
+    "large5242880": (5242880, 0),
+    "awkward357x789": (357 * 789, 0),
+    "large16777216": (16777216, 0),
+    "offset357x789": (357 * 789, 1),
+}
+
+
+@pytest.mark.parametrize("shape_id", _TANH_BACKWARD_CASES)
+@pytest.mark.parametrize("dtype_id", ["f32"])
+@pytest.mark.parametrize("layout", ["contiguous_backward"])
+@pytest.mark.bench_op("tanh_backward")
+def test_tanh_backward_f32(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    size, offset = _TANH_BACKWARD_CASES[shape_id]
+    values = torch.arange(size + 16, dtype=torch.int64)
+    grad = ((values * 7919 + 13) % 65521).to(DTYPES[dtype_id]) / 65536 - 0.5
+    output = ((values * 7919 + 29) % 65521).to(DTYPES[dtype_id]) / 65536 - 0.5
+    gr, gm = both(grad, hw, mojo_device)
+    yr, ym = both(output, hw, mojo_device)
+    gr, gm = gr[offset : offset + size], gm[offset : offset + size]
+    yr, ym = yr[offset : offset + size], ym[offset : offset + size]
+    bench.run(
+        lambda: torch.ops.aten.tanh_backward(gr, yr),
+        lambda: torch.ops.aten.tanh_backward(gm, ym),
+        flops=float(size * 3),
     )

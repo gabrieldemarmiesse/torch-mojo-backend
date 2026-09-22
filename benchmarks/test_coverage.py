@@ -207,8 +207,6 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::threshold_backward.grad_input": _COMPOSED,
     "aten::sigmoid_backward": _COMPOSED,
     "aten::sigmoid_backward.grad_input": _COMPOSED,
-    "aten::tanh_backward": _COMPOSED,
-    "aten::tanh_backward.grad_input": _COMPOSED,
     "aten::isneginf": _COMPOSED,
     "aten::isneginf.out": _COMPOSED,
     "aten::isposinf": _COMPOSED,

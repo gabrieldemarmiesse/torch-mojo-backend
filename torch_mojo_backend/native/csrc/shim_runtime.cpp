@@ -518,6 +518,25 @@ MojoProfilerStubs g_profiler_stubs;
 
 inline at::Tensor& T(TmbTensor t) { return *reinterpret_cast<at::Tensor*>(t); }
 
+// tmb_tensor_info's slots, straight off the TensorImpl.
+void fill_info(const at::Tensor& x, int64_t* out) {
+  auto* impl = x.unsafeGetTensorImpl();
+  const auto sizes = impl->sizes();
+  const auto strides = impl->strides();
+  const auto device = impl->device();
+  out[TMB_INFO_DATA_PTR] = reinterpret_cast<int64_t>(x.data_ptr());
+  out[TMB_INFO_DIM] = static_cast<int64_t>(sizes.size());
+  out[TMB_INFO_SIZES] = reinterpret_cast<int64_t>(sizes.data());
+  out[TMB_INFO_STRIDES] = reinterpret_cast<int64_t>(strides.data());
+  out[TMB_INFO_STORAGE_OFFSET] = impl->storage_offset();
+  out[TMB_INFO_NUMEL] = impl->numel();
+  out[TMB_INFO_DTYPE] = static_cast<int64_t>(c10::typeMetaToScalarType(impl->dtype()));
+  out[TMB_INFO_CONTIGUOUS] = impl->is_contiguous() ? 1 : 0;
+  out[TMB_INFO_DEVICE_INDEX] =
+      device.type() == c10::DeviceType::PrivateUse1 ? device.index() : -1;
+  out[TMB_INFO_DEVICE_TYPE] = static_cast<int64_t>(device.type());
+}
+
 }  // namespace
 
 extern "C" {
@@ -556,6 +575,7 @@ int32_t tmb_backend_register(const TmbBackendHooks* hooks) {
   }
 }
 
+void tmb_tensor_info(TmbTensor t, int64_t* out) { fill_info(T(t), out); }
 void* tmb_tensor_data_ptr(TmbTensor t) { return T(t).data_ptr(); }
 int64_t tmb_tensor_dim(TmbTensor t) { return T(t).dim(); }
 const int64_t* tmb_tensor_sizes(TmbTensor t) { return T(t).sizes().data(); }
@@ -594,13 +614,15 @@ TmbTensor tmb_tensor_retain(TmbTensor t) { return new at::Tensor(T(t)); }
 void tmb_tensor_release(TmbTensor t) { delete reinterpret_cast<at::Tensor*>(t); }
 
 int32_t tmb_empty_strided(int64_t ndim, const int64_t* sizes, const int64_t* strides, int32_t dtype,
-                          int32_t device, TmbTensor* ret) {
+                          int32_t device, TmbTensor* ret, int64_t* info) {
   try {
     AllocDeviceScope scope(device);
     auto t = at::detail::empty_strided_generic(c10::IntArrayRef(sizes, ndim), c10::IntArrayRef(strides, ndim),
                                                &g_allocator, c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
                                                static_cast<c10::ScalarType>(dtype));
-    *ret = new at::Tensor(std::move(t));
+    auto* box = new at::Tensor(std::move(t));
+    if (info) fill_info(*box, info);
+    *ret = box;
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());
@@ -625,7 +647,7 @@ void check_in_bounds(const c10::Storage& storage, int64_t ndim, const int64_t* s
 }
 
 int32_t tmb_as_strided(TmbTensor base, int64_t ndim, const int64_t* sizes, const int64_t* strides,
-                       int64_t storage_offset, TmbTensor* ret) {
+                       int64_t storage_offset, TmbTensor* ret, int64_t* info) {
   try {
     const at::Tensor& b = T(base);
     check_in_bounds(b.storage(), ndim, sizes, strides, storage_offset, b.itemsize());
@@ -633,7 +655,9 @@ int32_t tmb_as_strided(TmbTensor base, int64_t ndim, const int64_t* sizes, const
                                                       b.key_set(), b.dtype());
     t.unsafeGetTensorImpl()->set_sizes_and_strides(c10::IntArrayRef(sizes, ndim), c10::IntArrayRef(strides, ndim),
                                                    storage_offset);
-    *ret = new at::Tensor(std::move(t));
+    auto* box = new at::Tensor(std::move(t));
+    if (info) fill_info(*box, info);
+    *ret = box;
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());

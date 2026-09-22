@@ -1,0 +1,77 @@
+name: GPU runner setup
+description: What every test job on the persistent L4 runner needs before it runs.
+
+inputs:
+  torch-wheel:
+    description: Which torch wheel the suite needs, "cuda" or "cpu".
+    required: false
+    default: cuda
+
+runs:
+  using: composite
+  steps:
+    # Keep caches outside the checkout and RUNNER_TEMP (both can be cleaned
+    # by Actions). Respect paths already configured on the runner. There is
+    # no cache restore, prune or cleanup on this persistent machine.
+    - name: Preserve local caches between jobs
+      shell: bash
+      run: |
+        echo "UV_CACHE_DIR=${UV_CACHE_DIR:-$HOME/.cache/uv}" >> "$GITHUB_ENV"
+        echo "MODULAR_HOME=${MODULAR_HOME:-$HOME/.cache/modular}" >> "$GITHUB_ENV"
+        echo "TORCH_MOJO_BACKEND_CACHE_DIR=${TORCH_MOJO_BACKEND_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/torch-mojo-backend/native}" >> "$GITHUB_ENV"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: false
+        prune-cache: false
+
+    - name: Install dependencies
+      shell: bash
+      run: uv sync --locked
+
+    # These integrations deliberately refuse to replace torch.cuda's global
+    # Triton driver. Keep the locked versions and the installed Triton, but
+    # use the CPU torch/torchvision wheels for this suite. --no-sync in the
+    # calling job keeps uv from replacing them with the locked CUDA wheels
+    # again.
+    - name: Install CPU torch for Mojo integration tests
+      if: inputs.torch-wheel == 'cpu'
+      shell: bash
+      run: |
+        uv run --no-sync python - <<'PY'
+        import importlib.metadata
+        import subprocess
+        import sys
+
+        requirements = [
+            f"{name}=={importlib.metadata.version(name).split('+')[0]}+cpu"
+            for name in ("torch", "torchvision")
+        ]
+        subprocess.run(
+            ["uv", "pip", "install", "--python", sys.executable, "--no-deps",
+             "--index", "https://download.pytorch.org/whl/cpu", *requirements],
+            check=True,
+        )
+        PY
+
+    - name: Require a working GPU
+      shell: bash
+      env:
+        TORCH_WHEEL: ${{ inputs.torch-wheel }}
+      run: |
+        nvidia-smi
+        uv run --no-sync python - <<'PY'
+        import os
+        import torch
+        from torch_mojo_backend import get_accelerators
+
+        accelerators = get_accelerators()
+        assert accelerators, "MAX must see the GPU; refusing a GPU job that only skips tests"
+        print("MAX accelerators:", accelerators)
+        if os.environ["TORCH_WHEEL"] == "cuda":
+            assert torch.cuda.is_available(), "CUDA torch must see the GPU"
+            print("PyTorch GPU:", torch.cuda.get_device_name(0))
+        else:
+            assert torch.version.cuda is None, "Inductor/Triton need the CPU torch wheel"
+        PY

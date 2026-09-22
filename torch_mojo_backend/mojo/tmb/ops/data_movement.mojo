@@ -25,8 +25,11 @@ from tmb.backend.abi import (
     ST_INT32,
     ST_INT64,
     TAG_NONE,
+    TAG_INT_LIST,
+    TAG_BOOL,
     IntList,
     Owned,
+    dtype_name,
     T,
     Value,
     Values,
@@ -82,6 +85,7 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     is_cast_dtype,
     cast_into,
+    device_str,
     fill_value,
     cast_to,
     contiguous,
@@ -95,6 +99,8 @@ from tmb.ops.core import (
     copy_between_devices,
     record_tensor_stream,
 )
+from tmb.ops.foreach import _overlaps, _self_overlaps
+from tmb.ops.matmul import _sm90_cuda
 
 # ---------------------------------------------------------------------------
 # Small shared helpers
@@ -828,6 +834,199 @@ def _cat_impl(ins: List[T], dim: Int) raises -> Owned:
     return out^
 
 
+def _split_rows_qualifies(
+    src: T, outs: List[T], sizes: IntList, dim: Int
+) raises -> Bool:
+    # A singleton contiguous span already uses a faster device memcpy.
+    # The kernel moves bits through uint16 and never does arithmetic, so every
+    # 2-byte dtype is the same work and the same compiled variant.
+    # TODO: parametrize the kernel on the element width so 4- and 8-byte dtypes
+    # can use it too. That needs a DTYPE_ARG_0 define to select the
+    # specialization (`KernelCall.arg_dtype`), a vector width of
+    # `16 // size_of[dtype]()` in place of the hard-coded 8, and a re-measure:
+    # COPY_ROWS_TILE and COPY_SMALL_ROWS count elements, not bytes, and were
+    # fitted to bf16 on an H100.
+    if (
+        len(outs) <= 1
+        or not src.on_mojo()
+        or not src.contig
+        or src.itemsize != 2
+    ):
+        return False
+    if not _sm90_cuda(src.device):
+        return False
+    for i in range(len(outs)):
+        var out = outs[i].copy()
+        if (
+            not out.on_mojo()
+            or out.device != src.device
+            or out.dtype != src.dtype
+            or not out.contig
+            or out.rank != src.rank
+        ):
+            return False
+        for d in range(src.rank):
+            if out.dim(d) != (sizes[i] if d == dim else src.dim(d)):
+                return False
+        if _overlaps(out, src):
+            return False
+    return not _self_overlaps(outs)
+
+
+def _split_rows_launch(src: T, outs: List[T], sizes: IntList, dim: Int) raises:
+    var rows = 1
+    var inner = 1
+    for d in range(dim):
+        rows *= src.dim(d)
+    for d in range(dim + 1, src.rank):
+        inner *= src.dim(d)
+    var pitch = src.dim(dim) * inner
+    var offset = 0
+    var metadata = List[Int]()
+    for i in range(len(outs)):
+        var cols = sizes[i] * inner
+        metadata.append(src.ptr + offset * src.itemsize)
+        metadata.append(outs[i].ptr)
+        metadata.append(rows)
+        metadata.append(cols)
+        metadata.append(pitch)
+        offset += cols
+    var ctx = ctx_for(src.device)
+    var call = KernelCall("data_movement", "CopyBatchedRows")
+    call.tuple(metadata)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    for dest in outs:
+        dest.bump_version()
+    _ = ctx
+
+
+def _split_resize_out(mut out: T, src: T) raises:
+    if out.same_shape(src):
+        return
+    if out.on_mojo():
+        resize_out(out, src.shape, src.rank)
+        out.bump_version()
+    else:
+        # A wrong-device CPU output is resized before the device error, as in
+        # the composite implementation. Its allocator belongs to CPU torch.
+        var shape = List[Int64]()
+        for d in range(src.rank):
+            shape.append(Int64(src.dim(d)))
+        var args = List[Value]()
+        args.append(tensor_arg(out))
+        args.append(
+            Value(
+                TAG_INT_LIST,
+                Int32(len(shape)),
+                Int64(Int(shape.unsafe_ptr())),
+                0,
+            )
+        )
+        args.append(Value(TAG_NONE, 0, 0, 0))
+        _ = call_op("aten::resize_", "", args^, 1)
+        _ = shape
+        out = T(out.h)
+
+
+def _sizes_str(sizes: IntList) raises -> String:
+    """`split_sizes` the way TORCH_CHECK prints an IntArrayRef."""
+    var s = String("[")
+    for i in range(len(sizes)):
+        if i:
+            s += ", "
+        s += String(sizes[i])
+    return s + "]"
+
+
+# aten::split_with_sizes_copy.out(Tensor self, SymInt[] split_sizes, int dim=0, *, Tensor(a!)[] out) -> ()
+def op_split_with_sizes_copy_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var src = v_tensor(args[unsafe_offset=0])
+    var sizes = IntList(args[unsafe_offset=1])
+    var dim_in = v_int(args[unsafe_offset=2])
+    var outs = v_tensor_list(args[unsafe_offset=3])
+    if src.rank == 0:
+        raise Error("split expects at least a 1-dimensional tensor")
+    # Every message below is ATen's own text: this op is registered, so its
+    # composite kernel no longer runs and these are the only ones a user sees.
+    if dim_in < -src.rank or dim_in >= src.rank:
+        raise Error(
+            "Dimension out of range (expected to be in range of [",
+            -src.rank,
+            ", ",
+            src.rank - 1,
+            "], but got ",
+            dim_in,
+            ")",
+        )
+    var dim = dim_in + src.rank if dim_in < 0 else dim_in
+    var total = 0
+    for i in range(len(sizes)):
+        if sizes[i] < 0:
+            raise Error(
+                (
+                    "split_with_sizes expects split_sizes have only"
+                    " non-negative entries, but got split_sizes="
+                ),
+                _sizes_str(sizes),
+            )
+        total += sizes[i]
+    if total != src.dim(dim):
+        raise Error(
+            "split_with_sizes expects split_sizes to sum exactly to ",
+            src.dim(dim),
+            " (input tensor's size at dimension ",
+            dim,
+            "), but got split_sizes=",
+            _sizes_str(sizes),
+        )
+    if len(outs) != len(sizes):
+        raise Error(
+            "split_with_sizes_copy_out expected an out= argument of size ",
+            len(sizes),
+            ", got size ",
+            len(outs),
+        )
+    if _split_rows_qualifies(src, outs, sizes, dim):
+        _split_rows_launch(src, outs, sizes, dim)
+        return
+    # Retain torch's view construction and sequential mutation ordering for
+    # strided/aliased outputs, resizing and unsupported dtype/device pairs.
+    var split_args = List[Value]()
+    for i in range(3):
+        split_args.append(args[unsafe_offset=i].copy())
+    var parts = call_op("aten::split_with_sizes", "", split_args^, 1)
+    var views = v_tensor_list(parts[0])
+    for i in range(len(outs)):
+        var out = T(outs[i].h)
+        var view = views[i].copy()
+        _split_resize_out(out, view)
+        if out.dtype != src.dtype:
+            raise Error(
+                "Expected out tensor to have dtype ",
+                dtype_name(src.stype),
+                ", but got ",
+                dtype_name(out.stype),
+                " instead",
+            )
+        if out.device_type != src.device_type or out.device != src.device:
+            raise Error(
+                "Expected out tensor to have device ",
+                device_str(src),
+                ", but got ",
+                device_str(out),
+                " instead",
+            )
+        var copy_args = List[Value]()
+        copy_args.append(tensor_arg(out))
+        copy_args.append(tensor_arg(view))
+        copy_args.append(Value(TAG_BOOL, 0, 0, 0))
+        _ = call_op("aten::copy_", "", copy_args^, 1)
+    _ = parts
+
+
 # aten::cat(Tensor[] tensors, int dim=0) -> Tensor
 def op_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var all_tensors = v_tensor_list(args[unsafe_offset=0])
@@ -846,7 +1045,7 @@ def op_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)
 def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    """DDP's reducer flattens its buckets with this overload."""
+    """DDP bucket flattening and FSDP2 gradient packing (including fp32 out)."""
     var all_tensors = v_tensor_list(args[unsafe_offset=0])
     var dim_in = v_int_or(args[unsafe_offset=1], 0)
     var out = v_tensor(args[unsafe_offset=2])
@@ -859,8 +1058,13 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var rank = real[0].rank
     var dim = dim_in + rank if dim_in < 0 else dim_in
     var result = _cat_impl(real, dim)
-    if result.t.dtype != out.dtype:
-        raise Error("cat.out: out dtype must match the inputs")
+    if result.t.dtype != out.dtype and not (
+        result.t.dtype.is_floating_point() and out.dtype.is_floating_point()
+    ):
+        raise Error(
+            "cat.out: out dtype must match the inputs or both must be floating"
+            " point"
+        )
     if not out.on_mojo() or out.device != result.t.device:
         raise Error("cat.out: out must be on the inputs' mojo device")
     # Only a mismatching `out` is resized. Resizing resets sizes, strides and
@@ -868,7 +1072,14 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # to the front of `base`.
     if not out.same_shape(result.t):
         resize_out(out, result.t.shape, result.t.rank)
-    copy_strided_into(out, result.t)
+    if result.t.dtype == out.dtype:
+        copy_strided_into(out, result.t)
+    elif out.contig:
+        cast_into(out, result.t)
+    else:
+        var converted = own(cast_to(result.t, out.stype))
+        copy_strided_into(out, converted.t)
+        _ = converted^
     _ = result^  # alive past the launch
     ret_ref(rets, 0, out)
 
@@ -1804,6 +2015,7 @@ def op_empty_permuted(
 
 
 def register_data_movement(site: Site) raises:
+    impl[op_split_with_sizes_copy_out, "split_with_sizes_copy.out"](site)
     impl[op_clone, "clone"](site)
     impl[op_to_copy, "_to_copy"](site)
     impl[op_cat, "cat"](site)
