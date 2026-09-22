@@ -397,6 +397,16 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
     }
     // Convert the results BEFORE dropping the inputs: a TENSOR_REF points at
     // a tensor inside the input IValues.
+    if (n_rets <= 1) {  // every op but a few: one IValue, constructed once
+      if (n_rets == 0) {
+        torch::jit::drop(*stack, n_args);
+        return;
+      }
+      c10::IValue out = from_record(returns[0].real_type(), rets[0]);
+      torch::jit::drop(*stack, n_args);
+      stack->push_back(std::move(out));
+      return;
+    }
     c10::IValue out_buf[8];
     std::vector<c10::IValue> out_heap;
     c10::IValue* outs = out_buf;
