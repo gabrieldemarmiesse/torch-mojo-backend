@@ -48,6 +48,7 @@ from tmb.backend.abi import (
     default_dtype,
     dtype_code,
     f64_bits,
+    is_dense,
     new_like,
     new_scalar,
     new_tensor,
@@ -66,6 +67,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import cast_to, contiguous, copy_strided_into, resize_out
 from tmb.backend.registry import Site, impl
+from tmb.ops.foreach import _foreach_addc_launch, _foreach_lerp_launch
 
 # ---------------------------------------------------------------------------
 # dtype predicates: the gates of the kernels this file calls
@@ -1506,7 +1508,9 @@ def _b_strides4(t: T, shape: IndexList[MAX_RANK]) -> List[Int]:
     return out^
 
 
-def _b_addc(op: StaticString, args: Values, allow_int: Bool) raises -> Res:
+def _b_addc(
+    op: StaticString, args: Values, allow_int: Bool, dst: Optional[T] = None
+) raises -> Res:
     """self + value * (tensor1 * tensor2) — or / — in one broadcast launch."""
     var a = v_tensor(args[unsafe_offset=0])
     var b = v_tensor(args[unsafe_offset=1])
@@ -1529,11 +1533,98 @@ def _b_addc(op: StaticString, args: Values, allow_int: Bool) raises -> Res:
         unsupported("a bool `value` for addc*")
     var merged = _b_broadcast3(a, b, c)
     var rank = max(a.rank, max(b.rank, c.rank))
-    var numel = 1
-    for i in range(MAX_RANK):
-        numel *= merged[i]
+    if dst:
+        var dest = dst.value().copy()
+        if (
+            dest.contig
+            and a.contig
+            and b.contig
+            and c.contig
+            and dest.stype == a.stype
+            and dest.same_shape(a)
+            and a.same_shape(b)
+            and a.same_shape(c)
+        ):
+            _b_no_partial_overlap(dest, a)
+            _b_no_partial_overlap(dest, b)
+            _b_no_partial_overlap(dest, c)
+            if dest.ptr == a.ptr and a.dtype == DType.float32:
+                var selves = List[T]()
+                var firsts = List[T]()
+                var seconds = List[T]()
+                selves.append(dest.copy())
+                firsts.append(b.copy())
+                seconds.append(c.copy())
+                var kernel = "ForeachAddcmul"
+                if op == "AddcdivBcast":
+                    kernel = "ForeachAddcdiv"
+                _foreach_addc_launch(
+                    selves, firsts, seconds, s.f, kernel, bump_versions=False
+                )
+                return Res(dest^, False)
+            _b_addc_into(op, a, b, c, merged, s.f, dest)
+            return Res(dest^, False)
     var out = own(new_tensor(merged, rank, a.stype, a.device))
-    if numel > 0:
+    _b_addc_into(op, a, b, c, merged, s.f, out.t)
+    return Res(out.take(), True)
+
+
+def _b_inplace_destination(dest: T) raises:
+    # TensorIterator rejects known internal overlap, but empty expanded
+    # tensors are valid. Preserve this meta check when bypassing its wrapper.
+    if dest.numel > 0 and not dest.contig:
+        for i in range(dest.rank):
+            if dest.dim(i) > 1 and dest.stride(i) == 0:
+                raise Error(
+                    "more than one element refers to a single memory location"
+                )
+
+
+def _b_inplace_operand(dest: T, other: T) raises:
+    if other.rank > dest.rank:
+        raise Error("an in-place result cannot change the output shape")
+    for i in range(MAX_RANK):
+        if other.shape[i] != 1 and other.shape[i] != dest.shape[i]:
+            raise Error("an in-place result cannot change the output shape")
+    # ATen/MemoryOverlap.cpp treats non-dense views as TooHard, allowing
+    # disjoint interleaved slices. Only dense spans admit this overlap test.
+    if (dest.contig or is_dense(dest.shape, dest.strides, dest.rank)) and (
+        other.contig or is_dense(other.shape, other.strides, other.rank)
+    ):
+        _b_no_partial_overlap(dest, other)
+
+
+def _b_addc_inplace(
+    op: StaticString, args: Values, rets: Values, allow_int: Bool
+) raises:
+    var dest = _b_self(args[unsafe_offset=0], "addc in-place")
+    _b_inplace_destination(dest)
+    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=1]))
+    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=2]))
+    _b_store_inplace(rets, dest, _b_addc(op, args, allow_int, dest.copy()))
+
+
+# aten::addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+def op_addcmul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _b_addc_inplace("AddcmulBcast", args, rets, True)
+
+
+# aten::addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+def op_addcdiv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _b_addc_inplace("AddcdivBcast", args, rets, False)
+
+
+def _b_addc_into(
+    op: StaticString,
+    a: T,
+    b: T,
+    c: T,
+    merged: IndexList[MAX_RANK],
+    value: Float64,
+    dest: T,
+) raises:
+    """Launch the existing ternary kernel into validated output storage."""
+    if dest.numel > 0:
         var params = List[Int](capacity=16)
         for k in range(4):
             params.append(merged[MAX_RANK - 4 + k])
@@ -1545,18 +1636,17 @@ def _b_addc(op: StaticString, args: Values, allow_int: Bool) raises -> Res:
         call.arg_dtype(0, a.dtype)
         call.arg_dtype(1, b.dtype)
         call.arg_dtype(2, c.dtype)
-        call.out_dtype(out.t.dtype)
-        call.int(out.t.ptr)
+        call.out_dtype(dest.dtype)
+        call.int(dest.ptr)
         call.int(a.ptr)
         call.int(b.ptr)
         call.int(c.ptr)
         call.tuple(params)
-        call.f64(s.f)
+        call.f64(value)
         call.int(dtype_code(a.dtype))
         call.int(ctx_ptr(ctx))
         call.run()
         _ = ctx
-    return Res(out.take(), True)
 
 
 # aten::addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
@@ -1569,7 +1659,7 @@ def op_addcmul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = _b_out_tensor(
         args[unsafe_offset=4], v_tensor(args[unsafe_offset=0]).device
     )
-    _b_store_out(rets, dest, _b_addc("AddcmulBcast", args, True))
+    _b_store_out(rets, dest, _b_addc("AddcmulBcast", args, True, dest.copy()))
 
 
 # aten::addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
@@ -1583,7 +1673,7 @@ def op_addcdiv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = _b_out_tensor(
         args[unsafe_offset=4], v_tensor(args[unsafe_offset=0]).device
     )
-    _b_store_out(rets, dest, _b_addc("AddcdivBcast", args, False))
+    _b_store_out(rets, dest, _b_addc("AddcdivBcast", args, False, dest.copy()))
 
 
 # ---------------------------------------------------------------------------
@@ -1591,7 +1681,7 @@ def op_addcdiv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
-def _b_lerp(args: Values) raises -> Res:
+def _b_lerp(args: Values, dst: Optional[T] = None) raises -> Res:
     """ATen's numerically stable scalar lerp (native/Lerp.h), composed from
     the ops above exactly as the old `fast_aten_lerp` did."""
     var start = _b_self(args[unsafe_offset=0], "lerp")
@@ -1612,6 +1702,27 @@ def _b_lerp(args: Values) raises -> Res:
     var narrowed = Float64(Float32(weight))
     if (weight - weight) == 0.0 and (narrowed - narrowed) != 0.0:
         raise Error("value cannot be converted to type float without overflow")
+    if dst:
+        var dest = dst.value().copy()
+        if (
+            dest.stype == start.stype
+            and dest.ptr == start.ptr
+            and dest.contig
+            and start.contig
+            and finish.contig
+            and dest.same_shape(start)
+            and start.same_shape(finish)
+        ):
+            _b_no_partial_overlap(dest, finish)
+            # The single-tensor in-place decomposition reaches Scalar_out.
+            # Reuse the existing fused foreach arithmetic for one tensor;
+            # ADInplaceOrView handles this op's version increment itself.
+            var starts = List[T]()
+            starts.append(dest.copy())
+            var finishes = List[T]()
+            finishes.append(finish.copy())
+            _foreach_lerp_launch(starts, finishes, weight, bump_versions=False)
+            return Res(dest^, False)
     var delta = _b_binary(
         "SubSpec", _b_tside(finish), _b_tside(start), Int32(-1), None
     )
@@ -1641,6 +1752,16 @@ def op_lerp_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_ret(rets, _b_lerp(args))
 
 
+# aten::lerp_.Scalar(Tensor(a!) self, Tensor end, Scalar weight) -> Tensor(a!)
+def op_lerp_scalar_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _b_self(args[unsafe_offset=0], "lerp in-place")
+    _b_inplace_destination(dest)
+    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=1]))
+    _b_store_inplace(rets, dest, _b_lerp(args, dest.copy()))
+
+
 # aten::lerp.Scalar_out(Tensor self, Tensor end, Scalar weight, *, Tensor(a!) out) -> Tensor(a!)
 def op_lerp_scalar_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -1648,7 +1769,7 @@ def op_lerp_scalar_out(
     var dest = _b_out_tensor(
         args[unsafe_offset=3], v_tensor(args[unsafe_offset=0]).device
     )
-    _b_store_out(rets, dest, _b_lerp(args))
+    _b_store_out(rets, dest, _b_lerp(args, dest.copy()))
 
 
 # ---------------------------------------------------------------------------
@@ -1659,8 +1780,10 @@ def register_binary(site: Site) raises:
     impl[op_add_, "add_.Tensor"](site)
     impl[op_add_out, "add.out"](site)
     impl[op_addcdiv, "addcdiv"](site)
+    impl[op_addcdiv_, "addcdiv_"](site)
     impl[op_addcdiv_out, "addcdiv.out"](site)
     impl[op_addcmul, "addcmul"](site)
+    impl[op_addcmul_, "addcmul_"](site)
     impl[op_addcmul_out, "addcmul.out"](site)
     impl[op_bitwise_and, "bitwise_and.Scalar"](site)
     impl[op_bitwise_and, "bitwise_and.Tensor"](site)
@@ -1676,6 +1799,7 @@ def register_binary(site: Site) raises:
     impl[op_floor_divide, "floor_divide"](site)
     impl[op_floor_divide, "floor_divide.Scalar"](site)
     impl[op_lerp_scalar, "lerp.Scalar"](site)
+    impl[op_lerp_scalar_, "lerp_.Scalar"](site)
     impl[op_lerp_scalar_out, "lerp.Scalar_out"](site)
     impl[op_logical_and, "logical_and"](site)
     impl[op_logical_xor, "logical_xor"](site)

@@ -306,7 +306,10 @@ def _foreach_mul_tensor_launch(tensors: List[T], scalar: T) raises:
 
 
 def _foreach_lerp_launch(
-    self_list: List[T], end_list: List[T], weight: Float64
+    self_list: List[T],
+    end_list: List[T],
+    weight: Float64,
+    bump_versions: Bool = True,
 ) raises:
     var metadata = List[Int]()
     for i in range(len(self_list)):
@@ -334,13 +337,19 @@ def _foreach_lerp_launch(
     call.int(dtype_code(dtype))
     call.int(cp)
     call.run()
-    for t in self_list:
-        t.bump_version()
+    if bump_versions:
+        for t in self_list:
+            t.bump_version()
     _ = ctx
 
 
-def _foreach_addcmul_launch(
-    self_list: List[T], t1_list: List[T], t2_list: List[T], value: Float64
+def _foreach_addc_launch(
+    self_list: List[T],
+    t1_list: List[T],
+    t2_list: List[T],
+    value: Float64,
+    op: String = "ForeachAddcmul",
+    bump_versions: Bool = True,
 ) raises:
     var metadata = List[Int]()
     for i in range(len(self_list)):
@@ -354,7 +363,7 @@ def _foreach_addcmul_launch(
     var dtype = self_list[0].dtype
     var ctx = ctx_for(self_list[0].device)
     var cp = ctx_ptr(ctx)
-    var call = KernelCall("optimizer", "ForeachAddcmul")
+    var call = KernelCall("optimizer", op)
     call.arg_dtype(0, dtype)
     call.arg_dtype(1, dtype)
     call.arg_dtype(2, dtype)
@@ -365,8 +374,9 @@ def _foreach_addcmul_launch(
     call.int(dtype_code(dtype))
     call.int(cp)
     call.run()
-    for t in self_list:
-        t.bump_version()
+    if bump_versions:
+        for t in self_list:
+            t.bump_version()
     _ = ctx
 
 
@@ -527,7 +537,7 @@ def op_foreach_addcmul_scalar_(
         and not _overlaps_any(self_list, t1_list)
         and not _overlaps_any(self_list, t2_list)
     ):
-        _foreach_addcmul_launch(self_list, t1_list, t2_list, v_f64(value_v))
+        _foreach_addc_launch(self_list, t1_list, t2_list, v_f64(value_v))
         return
     for i in range(len(self_list)):
         _seq_addcmul_(self_list[i], t1_list[i], t2_list[i], value_v)

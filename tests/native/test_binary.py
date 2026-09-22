@@ -8,6 +8,7 @@ public API only; `CallChecker` (or `native.op_count` for the ops with no
 """
 
 import contextlib
+import math
 
 import pytest
 import torch
@@ -550,6 +551,135 @@ def test_addcmul_broadcast(mojo_device):
     torch.testing.assert_close(
         out.cpu(), torch.addcmul(a_cpu, b_cpu, c_cpu, value=-1.0)
     )
+
+
+@pytest.mark.parametrize("operation", ["addcmul", "addcdiv", "lerp"])
+@pytest.mark.parametrize("shape", [(0,), (7,), (17, 19)])
+@pytest.mark.parametrize("value", [-0.25, 0.5 - 2**-30, 0.75])
+def test_optimizer_inplace_offset_storage(mojo_gpu, operation, shape, value):
+    count = math.prod(shape)
+    storage_cpu = torch.linspace(-1.0, 1.0, count + 10)
+    storage = storage_cpu.to(mojo_gpu)
+    a_cpu = storage_cpu[3 : 3 + count].view(shape)
+    a = storage[3 : 3 + count].view(shape)
+    b_cpu = torch.linspace(0.25, 1.25, count).view(shape)
+    c_cpu = torch.linspace(1.0, 2.0, count).view(shape)
+    b, c = b_cpu.to(mojo_gpu), c_cpu.to(mojo_gpu)
+    version = a._version
+    native_name = "aten::lerp_.Scalar" if operation == "lerp" else f"aten::{operation}_"
+    with native_ran(native_name):
+        if operation == "lerp":
+            result = a.lerp_(b, value)
+            a_cpu.lerp_(b_cpu, value)
+        else:
+            result = getattr(a, operation + "_")(b, c, value=value)
+            getattr(a_cpu, operation + "_")(b_cpu, c_cpu, value=value)
+    assert result is a
+    assert a._version == version + 1
+    torch.testing.assert_close(storage.cpu(), storage_cpu)
+
+
+@pytest.mark.parametrize("operation", ["addcmul", "addcdiv", "lerp"])
+def test_optimizer_out_partial_overlap(mojo_gpu, operation):
+    storage = torch.arange(10, dtype=torch.float32, device=mojo_gpu)
+    a, dest = storage[:-1], storage[1:]
+    b = torch.ones_like(a)
+    with pytest.raises(RuntimeError, match="overlap|single memory location"):
+        if operation == "lerp":
+            torch.lerp(dest, a, 0.25, out=dest)
+        else:
+            getattr(torch, operation)(a, b, b, out=dest)
+
+
+def _optimizer_update(a: torch.Tensor, b: torch.Tensor, operation: str) -> torch.Tensor:
+    if operation == "lerp":
+        return a.lerp_(b, 0.25)
+    return getattr(a, operation + "_")(b, b, value=0.25)
+
+
+@pytest.mark.parametrize("operation", ["addcmul", "addcdiv", "lerp"])
+@pytest.mark.parametrize(
+    "layout", ["broadcast", "transpose", "interleaved", "alias", "empty_expanded"]
+)
+def test_optimizer_inplace_layout_contract(mojo_device, operation, layout):
+    host = torch.arange(1, 41, dtype=torch.float32).reshape(5, 8) / 40
+    device = host.to(mojo_device)
+
+    def views(base: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if layout == "broadcast":
+            return base[:4], base[4:]
+        if layout == "transpose":
+            return base[:4].t(), base[4:].t()
+        if layout == "interleaved":
+            return base.flatten()[::2], base.flatten()[1::2]
+        if layout == "alias":
+            return base, base
+        empty = base[:0].expand(3, 0, 8)
+        return empty, empty
+
+    a, b = views(device)
+    expected_a, expected_b = views(host)
+    version = a._version
+    assert _optimizer_update(a, b, operation) is a
+    _optimizer_update(expected_a, expected_b, operation)
+    assert a._version == version + 1
+    torch.testing.assert_close(device.cpu(), host)
+
+
+@pytest.mark.parametrize("operation", ["addcmul", "addcdiv", "lerp"])
+@pytest.mark.parametrize("invalid", ["grow", "expand", "partial", "transpose_alias"])
+def test_optimizer_inplace_rejects_before_write(mojo_device, operation, invalid):
+    expected = torch.arange(1, 17, dtype=torch.float32).reshape(4, 4)
+    storage = expected.to(mojo_device)
+    if invalid == "grow":
+        a, b = storage[:1], storage
+    elif invalid == "expand":
+        a, b = storage[:1].expand(4, 4), storage
+    elif invalid == "partial":
+        a, b = storage.flatten()[1:], storage.flatten()[:-1]
+    else:
+        a, b = storage, storage.t()
+    version = a._version
+    with pytest.raises(RuntimeError, match="shape|memory location|overlap"):
+        _optimizer_update(a, b, operation)
+    assert a._version == version
+    torch.testing.assert_close(storage.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("operation", ["addcmul", "addcdiv", "lerp"])
+def test_optimizer_inplace_autograd_contract(mojo_device, operation):
+    host = torch.linspace(0.25, 1.0, 7, requires_grad=True)
+    leaf = host.detach().to(mojo_device).requires_grad_()
+    b_host = torch.full((7,), 0.5)
+    b = b_host.to(mojo_device)
+    for invalid in (leaf, leaf.view_as(leaf)):
+        version = invalid._version
+        with pytest.raises(RuntimeError, match="leaf"):
+            _optimizer_update(invalid, b, operation)
+        assert invalid._version == version
+    torch.testing.assert_close(leaf.cpu(), host)
+    out = _optimizer_update(leaf * 1.0, b, operation)
+    expected = _optimizer_update(host * 1.0, b_host, operation)
+    out.sum().backward()
+    expected.sum().backward()
+    assert leaf.grad is not None
+    assert host.grad is not None
+    torch.testing.assert_close(leaf.grad.cpu(), host.grad)
+
+
+@pytest.mark.parametrize("operation", ["addcmul", "addcdiv"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("alias", [False, True])
+def test_addc_out_contiguous(mojo_gpu, operation, dtype, alias):
+    a_cpu = torch.linspace(-1, 1, 357, dtype=dtype)
+    b_cpu = torch.linspace(0.25, 1.25, 357, dtype=dtype)
+    c_cpu = torch.linspace(1, 2, 357, dtype=dtype)
+    a, b, c = [t.to(mojo_gpu) for t in (a_cpu, b_cpu, c_cpu)]
+    dest = a if alias else torch.empty_like(a)
+    result = getattr(torch, operation)(a, b, c, value=0.125, out=dest)
+    assert result is dest
+    expected = getattr(torch, operation)(a_cpu, b_cpu, c_cpu, value=0.125)
+    torch.testing.assert_close(result.cpu(), expected)
 
 
 @pytest.mark.parametrize("weight", [0.25, 0.75])
