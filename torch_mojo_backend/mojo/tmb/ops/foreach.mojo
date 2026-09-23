@@ -620,10 +620,12 @@ def _copy_batch_qualifies(dsts: List[T], srcs: List[T]) raises -> Bool:
     var first = dsts[0].copy()
     if not first.on_mojo():
         return False
-    # TODO: enable on Metal once measured there. Apple GPUs have no float64,
-    # so it must stay excluded, and the other batched kernels found reason to
-    # accept only float32 on Metal (`_qualifies1`); check bf16/f16/int and the
-    # ~2.5 KiB by-value segment array against Metal's argument limit.
+    # TODO: enable on Metal. Tried on an M4 (macOS 26.6): 142 of the 173
+    # copy tests in tests/native/test_foreach.py fail. float64 does not build
+    # (Apple GPUs have none; it must stay excluded), some variants hit "Failed
+    # to verify LLVM IR for Metal", and the rest return wrong elements, so
+    # check how the ~2.5 KiB by-value segment array reaches a Metal kernel.
+    # The other batched kernels accept only float32 there (`_qualifies1`).
     var api = dev(first.device)[].api
     if api != "cuda" and api != "hip":
         return False
