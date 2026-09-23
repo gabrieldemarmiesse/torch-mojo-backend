@@ -492,12 +492,17 @@ def _held_transfer_stream(stream: torch.Stream) -> Iterator[Event]:
         )
         == 0
     )
+    # DEBUG: dump every thread's Python stack if the gate is still held after
+    # 5 s; faulthandler's C watchdog thread does not need the GIL.
+    import faulthandler, sys  # noqa: E401, PLC0415 -- temporary diagnostics
+    faulthandler.dump_traceback_later(5, exit=False, file=sys.stderr)
     try:
         assert entered.wait(10), "driver did not enter stream gate"
         yield release
     finally:
         release.set()
         stream.synchronize()
+        faulthandler.cancel_dump_traceback_later()
     assert not expired.is_set(), "stream gate watchdog expired"
 
 
