@@ -337,14 +337,23 @@ def _check_split_copy_bits(
     dtype: torch.dtype = torch.bfloat16,
 ):
     count = rows * sum(sizes)
+    bits_dtype = _BITS_DTYPES[dtype.itemsize]
     bits = (torch.arange(count + source_offset + 7, dtype=torch.int64) * 7919 + 13).to(
-        torch.int16
+        bits_dtype
     )
+    if dtype == torch.bool:
+        bits = bits % 2
     host = bits.view(dtype)
     source_base = host.to(device)
     source = source_base[source_offset : source_offset + count].view(rows, sum(sizes))
+    guard_value = True if dtype == torch.bool else -9
     guards = [
-        torch.full((rows * n + destination_offset + 7,), -9, dtype=dtype, device=device)
+        torch.full(
+            (rows * n + destination_offset + 7,),
+            guard_value,
+            dtype=dtype,
+            device=device,
+        )
         for n in sizes
     ]
     outputs = [
@@ -364,26 +373,40 @@ def _check_split_copy_bits(
         outputs, expected, guards, sizes, versions, strict=True
     ):
         torch.testing.assert_close(
-            actual.cpu().view(torch.int16),
-            want.contiguous().view(torch.int16),
+            actual.cpu().view(bits_dtype),
+            want.contiguous().view(bits_dtype),
             rtol=0,
             atol=0,
         )
         observed = guard.cpu()
-        assert bool((observed[:destination_offset] == -9).all())
-        assert bool((observed[destination_offset + rows * n :] == -9).all())
+        assert bool((observed[:destination_offset] == guard_value).all())
+        assert bool((observed[destination_offset + rows * n :] == guard_value).all())
         assert actual._version == version + 1
-    torch.testing.assert_close(
-        source_base.cpu().view(torch.int16), bits, rtol=0, atol=0
-    )
+    torch.testing.assert_close(source_base.cpu().view(bits_dtype), bits, rtol=0, atol=0)
 
 
-# The kernel moves bits through uint16, so every 2-byte dtype is the same work.
-# One small-kernel case (rows <= 8, cols <= the tile) and one that straddles the
-# tile and exercises the 16-byte vector path.
-@pytest.mark.parametrize("dtype", [torch.float16, torch.int16])
+_BITS_DTYPES = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+# A same-dtype copy moves bits, one kernel build per element width; bool also
+# checks its uint8 storage. Short rows under one tile, and rows that straddle
+# it with more rectangles than one launch holds.
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float16,
+        torch.int16,
+        torch.float32,
+        torch.int32,
+        torch.float64,
+        torch.int64,
+        torch.int8,
+        torch.uint8,
+        torch.bool,
+    ],
+)
 @pytest.mark.parametrize("rows,sizes", [(3, [17] * 80), (2, [2049, 1, 0, 4096])])
-def test_split_copy_row_other_16_bit_dtypes(
+def test_split_copy_row_other_dtypes(
     mojo_gpu: str, dtype: torch.dtype, rows: int, sizes: list[int]
 ):
     _check_split_copy_bits(mojo_gpu, rows, sizes, 3, 5, dtype)
@@ -1754,6 +1777,104 @@ def test_cat_cast_rejects_before_writing(mojo_gpu, kind):
     with pytest.raises((RuntimeError, NotImplementedError)):
         torch.cat(parts, 1, out=out)
     assert torch.all(out.cpu() == 17)
+
+
+_CAT_OUT_DTYPES = [
+    torch.float64,
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.uint8,
+    torch.bool,
+]
+# Every pair c10::canCast allows into or out of float32 and bfloat16, the
+# same-dtype copy of each width, and integer widening/narrowing and bool.
+_CAT_OUT_PAIRS = sorted(
+    {
+        (a, b)
+        for a in _CAT_OUT_DTYPES
+        for b in _CAT_OUT_DTYPES
+        if (a == b or {a, b} & {torch.float32, torch.bfloat16})
+        and not (a.is_floating_point and not b.is_floating_point)
+        and not (b == torch.bool and a != torch.bool)
+    }
+    | {
+        (torch.int64, torch.int8),
+        (torch.uint8, torch.int32),
+        (torch.bool, torch.int64),
+    },
+    key=str,
+)
+
+
+def _cat_out_values(n: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
+    index = torch.arange(n, dtype=torch.int64) * 7919 + 13 + seed
+    if dtype == torch.bool:
+        return index % 3 == 1
+    if dtype.is_floating_point:
+        return ((index % 20001 - 10000).double() / 97).to(dtype)
+    return (index % 251 - 125).to(dtype)
+
+
+@pytest.mark.parametrize(("src_dtype", "dst_dtype"), _CAT_OUT_PAIRS, ids=str)
+@pytest.mark.parametrize(
+    "dim,widths,offsets",
+    [
+        (1, [0, 1, 7, 17, 2049, 8193], (0, 0)),
+        (1, [5, 1031, 3], (1, 3)),
+        (0, [4, 1], (3, 1)),
+    ],
+)
+def test_cat_out_batched_dtypes(mojo_gpu, src_dtype, dst_dtype, dim, widths, offsets):
+    """One batched rectangle copy per call: rows of every input straight into
+    the (possibly converting) contiguous output, at aligned and odd offsets."""
+    rows = 3
+    source_offset, destination_offset = offsets
+    hosts, sources = [], []
+    for index, width in enumerate(widths):
+        shape = (rows, width, 2) if dim == 1 else (width, rows, 2)
+        numel = rows * width * 2
+        host = _cat_out_values(numel + source_offset, src_dtype, index)
+        hosts.append(host[source_offset:].view(shape))
+        sources.append(host.to(mojo_gpu)[source_offset:].view(shape))
+    expected = torch.cat(hosts, dim).to(dst_dtype)
+    backing = torch.zeros(
+        expected.numel() + destination_offset + 4, dtype=dst_dtype, device=mojo_gpu
+    )
+    out = backing[destination_offset:][: expected.numel()].view(expected.shape)
+    version, pointer = out._version, out.data_ptr()
+    assert torch.cat(sources, dim, out=out) is out
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+    assert out._version == version + 1 and out.data_ptr() == pointer
+    guard = backing.cpu()
+    assert not guard[:destination_offset].any()
+    assert not guard[destination_offset + expected.numel() :].any()
+
+
+@pytest.mark.parametrize(
+    ("src_dtype", "dst_dtype"),
+    [
+        (torch.float32, torch.int64),
+        (torch.bfloat16, torch.uint8),
+        (torch.int32, torch.bool),
+    ],
+    ids=str,
+)
+def test_cat_out_rejects_what_torch_cannot_cast(mojo_gpu, src_dtype, dst_dtype):
+    parts = [torch.ones(2, 3, dtype=src_dtype), torch.ones(2, 5, dtype=src_dtype)]
+    with pytest.raises(TypeError, match="can't be cast to the desired output type"):
+        torch.cat(parts, 1, out=torch.empty(2, 8, dtype=dst_dtype))
+    before = torch.full((2, 8), 3, dtype=dst_dtype)
+    out = before.to(mojo_gpu)
+    with pytest.raises(
+        (TypeError, RuntimeError), match="can't be cast to the desired output type"
+    ):
+        torch.cat([x.to(mojo_gpu) for x in parts], 1, out=out)
+    torch.testing.assert_close(out.cpu(), before, rtol=0, atol=0)
 
 
 def test_cat_out_keeps_a_matching_out_where_it_is(mojo_gpu):

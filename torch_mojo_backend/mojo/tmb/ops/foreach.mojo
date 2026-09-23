@@ -613,21 +613,27 @@ def _writes_overlap(dsts: List[T], srcs: List[T]) -> Bool:
     return False
 
 
+def _batched_copy_device(device: Int) raises -> Bool:
+    """Where the batched rectangle copy runs (CopyBatched).
+
+    TODO: enable on Metal. Tried on an M4 (macOS 26.6): 142 of the 173 copy
+    tests in tests/native/test_foreach.py fail. float64 does not build
+    (Apple GPUs have none; it must stay excluded), some variants hit "Failed
+    to verify LLVM IR for Metal", and the rest return wrong elements. The
+    descriptors are an array passed by value, and indexing a copied array of
+    pointers is what miscompiles on Metal (see `_cat_pick` in
+    tmb/kernels/data_movement/entry.mojo).
+    """
+    var api = dev(device)[].api
+    return api == "cuda" or api == "hip"
+
+
 def _copy_batch_qualifies(dsts: List[T], srcs: List[T]) raises -> Bool:
     """CUDA's `_foreach_copy_` fast-path rule (one device, contiguous, one
     dtype per list, index-aligned shapes) plus the cross-pair overlap check
     it lacks, so aliased lists keep sequential copy_ semantics."""
     var first = dsts[0].copy()
-    if not first.on_mojo():
-        return False
-    # TODO: enable on Metal. Tried on an M4 (macOS 26.6): 142 of the 173
-    # copy tests in tests/native/test_foreach.py fail. float64 does not build
-    # (Apple GPUs have none; it must stay excluded), some variants hit "Failed
-    # to verify LLVM IR for Metal", and the rest return wrong elements, so
-    # check how the ~2.5 KiB by-value segment array reaches a Metal kernel.
-    # The other batched kernels accept only float32 there (`_qualifies1`).
-    var api = dev(first.device)[].api
-    if api != "cuda" and api != "hip":
+    if not first.on_mojo() or not _batched_copy_device(first.device):
         return False
     var src_dtype = srcs[0].dtype
     if not _batch_copy_dtype(first.dtype) or not _batch_copy_dtype(src_dtype):
@@ -654,10 +660,14 @@ def _copy_batch_launch(dsts: List[T], srcs: List[T]) raises:
     var call = KernelCall("data_movement", "CopyBatched")
     call.arg_dtype(0, src_dtype)
     call.out_dtype(dst_dtype)
-    var metadata = List[Int](capacity=3 * len(dsts))
+    # One-row rectangles: source, destination, rows, cols and both pitches.
+    var metadata = List[Int](capacity=6 * len(dsts))
     for i in range(len(dsts)):
         metadata.append(srcs[i].ptr)
         metadata.append(dsts[i].ptr)
+        metadata.append(1)
+        metadata.append(dsts[i].numel)
+        metadata.append(dsts[i].numel)
         metadata.append(dsts[i].numel)
     call.tuple(metadata)
     call.int(ctx_ptr(ctx))

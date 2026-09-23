@@ -97,7 +97,7 @@ SPLIT_COPY_SHAPES = {
 
 
 @pytest.mark.bench_op("split_with_sizes_copy.out")
-@pytest.mark.parametrize("dtype_id", ("bf16",))
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", SPLIT_COPY_SHAPES)
 def test_split_copy_rows(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
@@ -220,7 +220,16 @@ CAT_CAST_SHAPES: dict[str, tuple[int, tuple[int, ...], int]] = {
 }
 
 
-@pytest.mark.parametrize("dtype_id", ("bf16_f32",))
+# (input, output) dtypes: the mixed-precision cast both ways and a
+# same-dtype cat.out, which also writes straight into `out`.
+CAT_OUT_DTYPES: dict[str, tuple[torch.dtype, torch.dtype]] = {
+    "bf16_f32": (torch.bfloat16, torch.float32),
+    "f32_bf16": (torch.float32, torch.bfloat16),
+    "f32": (torch.float32, torch.float32),
+}
+
+
+@pytest.mark.parametrize("dtype_id", CAT_OUT_DTYPES)
 @pytest.mark.parametrize("shape_id", CAT_CAST_SHAPES)
 @pytest.mark.parametrize("layout", ("contiguous_cast_out",))
 @pytest.mark.bench_op("cat.out")
@@ -233,6 +242,7 @@ def test_cat_cast_out(
     mojo_device: torch.device,
 ):
     rows, widths, offset = CAT_CAST_SHAPES[shape_id]
+    src_dtype, dst_dtype = CAT_OUT_DTYPES[dtype_id]
     refs, ours = [], []
     for index, width in enumerate(widths):
         host = (
@@ -244,16 +254,14 @@ def test_cat_cast_out(
                 / 65536
                 - 0.5
             )
-            .bfloat16()
+            .to(src_dtype)
             .view(rows, width)
         )
         ref, our = both(host, hw, mojo_device)
         refs.append(ref)
         ours.append(our)
     size = rows * sum(widths)
-    ref_base, our_base = both(
-        torch.empty(size + 16, dtype=torch.float32), hw, mojo_device
-    )
+    ref_base, our_base = both(torch.empty(size + 16, dtype=dst_dtype), hw, mojo_device)
     ref_out = ref_base[offset : offset + size].view(rows, sum(widths))
     our_out = our_base[offset : offset + size].view(rows, sum(widths))
     bench.run(

@@ -78,6 +78,7 @@ from tmb.backend.device import (
     ctx_for,
     ctx_ptr,
     current_device,
+    dev,
     wait_for_host_read,
 )
 from tmb.backend.kernel_call import KernelCall
@@ -99,8 +100,13 @@ from tmb.ops.core import (
     copy_between_devices,
     record_tensor_stream,
 )
-from tmb.ops.foreach import _overlaps, _self_overlaps
-from tmb.ops.matmul import _sm90_cuda
+from tmb.ops.foreach import (
+    _batch_copy_dtype,
+    _batched_copy_device,
+    _overlaps,
+    _bits_dtype,
+    _self_overlaps,
+)
 
 # ---------------------------------------------------------------------------
 # Small shared helpers
@@ -834,26 +840,55 @@ def _cat_impl(ins: List[T], dim: Int) raises -> Owned:
     return out^
 
 
+def _batched_copy_run(
+    device: Int,
+    src_dtype: DType,
+    dst_dtype: DType,
+    itemsize: Int,
+    srcs: List[Int],
+    dsts: List[Int],
+    rows: Int,
+    cols: List[Int],
+    src_pitch: Int,
+    dst_pitch: Int,
+) raises:
+    """One CopyBatched call over rectangles sharing `rows` and the pitches;
+    a pitch of -1 means each rectangle's own `cols` (a contiguous side)."""
+    var src_dt = src_dtype
+    var dst_dt = dst_dtype
+    if src_dt == dst_dt:
+        # A same-dtype copy only moves bits: one build per element width.
+        src_dt = _bits_dtype(itemsize)
+        dst_dt = src_dt
+    var metadata = List[Int](capacity=6 * len(cols))
+    for i in range(len(cols)):
+        metadata.append(srcs[i])
+        metadata.append(dsts[i])
+        metadata.append(rows)
+        metadata.append(cols[i])
+        metadata.append(cols[i] if src_pitch < 0 else src_pitch)
+        metadata.append(cols[i] if dst_pitch < 0 else dst_pitch)
+    var ctx = ctx_for(device)
+    var call = KernelCall("data_movement", "CopyBatched")
+    call.arg_dtype(0, src_dt)
+    call.out_dtype(dst_dt)
+    call.tuple(metadata)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+
+
 def _split_rows_qualifies(
     src: T, outs: List[T], sizes: IntList, dim: Int
 ) raises -> Bool:
     # A singleton contiguous span already uses a faster device memcpy.
-    # The kernel moves bits through uint16 and never does arithmetic, so every
-    # 2-byte dtype is the same work and the same compiled variant.
-    # TODO: parametrize the kernel on the element width so 4- and 8-byte dtypes
-    # can use it too. That needs a DTYPE_ARG_0 define to select the
-    # specialization (`KernelCall.arg_dtype`), a vector width of
-    # `16 // size_of[dtype]()` in place of the hard-coded 8, and a re-measure:
-    # COPY_ROWS_TILE and COPY_SMALL_ROWS count elements, not bytes, and were
-    # fitted to bf16 on an H100.
     if (
         len(outs) <= 1
         or not src.on_mojo()
         or not src.contig
-        or src.itemsize != 2
+        or not _batch_copy_dtype(src.dtype)
+        or not _batched_copy_device(src.device)
     ):
-        return False
-    if not _sm90_cuda(src.device):
         return False
     for i in range(len(outs)):
         var out = outs[i].copy()
@@ -870,6 +905,12 @@ def _split_rows_qualifies(
                 return False
         if _overlaps(out, src):
             return False
+    # The descriptors hold row pitches in 32 bits.
+    var inner = 1
+    for d in range(dim + 1, src.rank):
+        inner *= src.dim(d)
+    if src.dim(dim) * inner >= 1 << 31:
+        return False
     return not _self_overlaps(outs)
 
 
@@ -882,23 +923,28 @@ def _split_rows_launch(src: T, outs: List[T], sizes: IntList, dim: Int) raises:
         inner *= src.dim(d)
     var pitch = src.dim(dim) * inner
     var offset = 0
-    var metadata = List[Int]()
+    var srcs = List[Int](capacity=len(outs))
+    var dsts = List[Int](capacity=len(outs))
+    var cols = List[Int](capacity=len(outs))
     for i in range(len(outs)):
-        var cols = sizes[i] * inner
-        metadata.append(src.ptr + offset * src.itemsize)
-        metadata.append(outs[i].ptr)
-        metadata.append(rows)
-        metadata.append(cols)
-        metadata.append(pitch)
-        offset += cols
-    var ctx = ctx_for(src.device)
-    var call = KernelCall("data_movement", "CopyBatchedRows")
-    call.tuple(metadata)
-    call.int(ctx_ptr(ctx))
-    call.run()
+        srcs.append(src.ptr + offset * src.itemsize)
+        dsts.append(outs[i].ptr)
+        cols.append(sizes[i] * inner)
+        offset += sizes[i] * inner
+    _batched_copy_run(
+        src.device,
+        src.dtype,
+        src.dtype,
+        src.itemsize,
+        srcs,
+        dsts,
+        rows,
+        cols,
+        pitch,
+        -1,
+    )
     for dest in outs:
         dest.bump_version()
-    _ = ctx
 
 
 def _split_resize_out(mut out: T, src: T) raises:
@@ -1043,6 +1089,114 @@ def op_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+def _can_cast(src: DType, dst: DType) -> Bool:
+    """c10::canCast for the real dtypes: no float to integer, nothing but bool
+    to bool."""
+    if src.is_floating_point() and not dst.is_floating_point():
+        return False
+    return src == DType.bool or dst != DType.bool
+
+
+def _scalar_type_name(dt: DType) -> String:
+    """How torch names a ScalarType in an error message."""
+    if dt == DType.float64:
+        return "Double"
+    if dt == DType.float32:
+        return "Float"
+    if dt == DType.float16:
+        return "Half"
+    if dt == DType.bfloat16:
+        return "BFloat16"
+    if dt == DType.int64:
+        return "Long"
+    if dt == DType.int32:
+        return "Int"
+    if dt == DType.int16:
+        return "Short"
+    if dt == DType.int8:
+        return "Char"
+    if dt == DType.uint8:
+        return "Byte"
+    if dt == DType.bool:
+        return "Bool"
+    return String(dt)
+
+
+def _cat_out_batched(ins: List[T], dim: Int, out_t: T) raises -> Bool:
+    """Write the concatenation straight into an existing contiguous `out` of
+    the result shape with one batched rectangle copy (converting when the
+    dtypes differ): input i's rows land at column offset sum(len[:i])."""
+    var first = ins[0].copy()
+    var rank = first.rank
+    if (
+        not first.on_mojo()
+        or not _batch_copy_dtype(first.dtype)
+        or not _batch_copy_dtype(out_t.dtype)
+        or not _can_cast(first.dtype, out_t.dtype)
+        or rank == 0
+        or dim < 0
+        or dim >= rank
+        or out_t.rank != rank
+        or not out_t.on_mojo()
+        or out_t.device != first.device
+        or not out_t.contig
+    ):
+        return False
+    var cat_size = 0
+    for x in ins:
+        if (
+            not x.on_mojo()
+            or x.dtype != first.dtype
+            or x.device != first.device
+            or x.rank != rank
+            or not x.contig
+        ):
+            return False
+        for d in range(rank):
+            if d != dim and x.dim(d) != first.dim(d):
+                return False
+        if _overlaps(out_t, x):
+            return False
+        cat_size += x.dim(dim)
+    for d in range(rank):
+        if out_t.dim(d) != (cat_size if d == dim else first.dim(d)):
+            # Preserve the existing resize and error ordering in the fallback.
+            return False
+    if not _batched_copy_device(first.device):
+        return False
+    var outer = 1
+    var inner = 1
+    for d in range(dim):
+        outer *= first.dim(d)
+    for d in range(dim + 1, rank):
+        inner *= first.dim(d)
+    if outer > 1 and cat_size * inner >= 1 << 31:
+        return False  # the descriptors hold row pitches in 32 bits
+    var srcs = List[Int](capacity=len(ins))
+    var dsts = List[Int](capacity=len(ins))
+    var cols = List[Int](capacity=len(ins))
+    var offset = 0
+    for x in ins:
+        srcs.append(x.ptr)
+        dsts.append(out_t.ptr + offset * out_t.itemsize)
+        cols.append(x.dim(dim) * inner)
+        offset += x.dim(dim) * inner
+    if out_t.numel > 0:
+        _batched_copy_run(
+            first.device,
+            first.dtype,
+            out_t.dtype,
+            first.itemsize,
+            srcs,
+            dsts,
+            outer,
+            cols,
+            -1,
+            cat_size * inner,
+        )
+    return True
+
+
 # aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)
 def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """DDP bucket flattening and FSDP2 gradient packing (including fp32 out)."""
@@ -1057,13 +1211,14 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         unsupported("aten::cat.out of only legacy-empty tensors")
     var rank = real[0].rank
     var dim = dim_in + rank if dim_in < 0 else dim_in
+    if _cat_out_batched(real, dim, out):
+        ret_ref(rets, 0, out)
+        return
     var result = _cat_impl(real, dim)
-    if result.t.dtype != out.dtype and not (
-        result.t.dtype.is_floating_point() and out.dtype.is_floating_point()
-    ):
+    if not _can_cast(result.t.dtype, out.dtype):
         raise Error(
-            "cat.out: out dtype must match the inputs or both must be floating"
-            " point"
+            "torch.cat(): input types can't be cast to the desired output type "
+            + _scalar_type_name(out.dtype)
         )
     if not out.on_mojo() or out.device != result.t.device:
         raise Error("cat.out: out must be on the inputs' mojo device")
