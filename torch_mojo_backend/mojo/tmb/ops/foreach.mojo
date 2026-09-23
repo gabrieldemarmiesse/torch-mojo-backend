@@ -618,7 +618,14 @@ def _copy_batch_qualifies(dsts: List[T], srcs: List[T]) raises -> Bool:
     dtype per list, index-aligned shapes) plus the cross-pair overlap check
     it lacks, so aliased lists keep sequential copy_ semantics."""
     var first = dsts[0].copy()
-    if not first.on_mojo() or dev(first.device)[].api != "cuda":
+    if not first.on_mojo():
+        return False
+    # TODO: enable on Metal once measured there. Apple GPUs have no float64,
+    # so it must stay excluded, and the other batched kernels found reason to
+    # accept only float32 on Metal (`_qualifies1`); check bf16/f16/int and the
+    # ~2.5 KiB by-value segment array against Metal's argument limit.
+    var api = dev(first.device)[].api
+    if api != "cuda" and api != "hip":
         return False
     var src_dtype = srcs[0].dtype
     if not _batch_copy_dtype(first.dtype) or not _batch_copy_dtype(src_dtype):
