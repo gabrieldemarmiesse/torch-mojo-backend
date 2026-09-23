@@ -494,8 +494,17 @@ def _held_transfer_stream(stream: torch.Stream) -> Iterator[Event]:
     )
     # DEBUG: dump every thread's Python stack if the gate is still held after
     # 5 s; faulthandler's C watchdog thread does not need the GIL.
-    import faulthandler, sys  # noqa: E401, PLC0415 -- temporary diagnostics
+    import faulthandler, os, subprocess, sys  # noqa: E401, PLC0415 -- temporary diagnostics
     faulthandler.dump_traceback_later(5, exit=False, file=sys.stderr)
+    subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            f"sleep 6; echo ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>&1);"
+            f" which gdb eu-stack; gdb -p {os.getpid()} -batch -ex 'info threads'"
+            f" -ex 'thread apply all bt 25' 2>&1 | grep -v '^\\[New LWP' >&2",
+        ]
+    )
     try:
         assert entered.wait(10), "driver did not enter stream gate"
         yield release
