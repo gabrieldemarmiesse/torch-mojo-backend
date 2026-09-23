@@ -783,6 +783,17 @@ def is_registered() -> bool:
     return bool(_state.get("registered"))
 
 
+def plan_builds() -> int:
+    """Conversion plans the boxed adapter has interned (test support).
+
+    One per schema it has seen: a warm op finds its plan by value and must not
+    add to this count.
+    """
+    fn = shim().tmb_plan_builds
+    fn.restype = ctypes.c_int64
+    return int(fn())
+
+
 def op_counting(enabled: bool):
     """Count boxed-kernel calls per op (test support; off by default)."""
     shim().tmb_op_counting(ctypes.c_int32(1 if enabled else 0))

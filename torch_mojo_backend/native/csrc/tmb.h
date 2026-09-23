@@ -225,6 +225,8 @@ int32_t tmb_rng_get_state(int32_t device, uint8_t* out16);
 int32_t tmb_rng_set_state(int32_t device, const uint8_t* in16);
 int32_t tmb_default_dtype(void);
 int32_t tmb_alert_not_deterministic(const char* caller);
+// test support: per-schema conversion plans built since process start
+int64_t tmb_plan_builds(void);
 // test support: per-op call counters ("aten::add.Tensor"), off by default
 void tmb_op_counting(int32_t enabled);
 void tmb_op_counts_reset(void);

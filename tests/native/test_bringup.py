@@ -3,6 +3,8 @@ views, fills, item, autograd, streams, events, RNG (public torch API only)."""
 
 import pytest
 import torch
+from torch._dynamo.source import ConstantSource
+from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 
 from tests.native.conftest import side_stream_or_skip
 from torch_mojo_backend import native
@@ -259,3 +261,115 @@ def test_boxed_adapter_returns_undefined_tensors_for_masked_gradients(mojo_gpu):
         grad, x, [3], mean, rstd, w, bias, [True, False, False]
     )
     assert masked[0] is not None and masked[1] is None and masked[2] is None
+
+
+def test_boxed_adapter_carries_every_argument_kind(mojo_device):
+    """One call per record kind the boxed adapter converts (shim_dispatch.cpp,
+    the Conv codes), so every kind has a live call."""
+    a = _arange(6, mojo_device).reshape(2, 3)
+    b = torch.full((2, 3), 2.0).to(mojo_device)
+
+    # Scalar: int, float, bool -- the three tags a c10::Scalar can carry here
+    assert torch.add(a, 2).cpu().tolist() == [[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]]
+    assert torch.add(a, 0.5).cpu()[0, 0].item() == 0.5
+    assert torch.add(a, True).cpu()[0, 0].item() == 1.0
+    # int[] (a view's size), int? left None (as_strided's storage_offset)
+    assert a.view([6]).cpu().tolist() == list(range(6))
+    assert a.sum(dim=[0, 1]).item() == 15.0
+    assert a.as_strided((3, 2), (2, 1)).cpu().tolist() == [
+        [0.0, 1.0],
+        [2.0, 3.0],
+        [4.0, 5.0],
+    ]
+    # ScalarType?, Device?, bool? (pin_memory), MemoryFormat?
+    e = torch.empty(
+        (2, 3),
+        dtype=torch.int64,
+        device=mojo_device,
+        memory_format=torch.contiguous_format,
+    )
+    assert e.dtype == torch.int64 and e.is_contiguous()
+    # str
+    torch.testing.assert_close(
+        torch.nn.functional.gelu(a, approximate="tanh").cpu(),
+        torch.nn.functional.gelu(a.cpu(), approximate="tanh"),
+    )
+    torch.testing.assert_close(
+        torch.div(a, b, rounding_mode="floor").cpu(), a.cpu() // 2
+    )
+    # Tensor? left None (layer_norm without affine parameters)
+    torch.testing.assert_close(
+        torch.nn.functional.layer_norm(a, (3,)).cpu(),
+        torch.nn.functional.layer_norm(a.cpu(), (3,)),
+    )
+    # Tensor?[] (advanced indexing, leading index only) and Tensor[] in and out
+    idx = torch.tensor([1, 0]).to(mojo_device)
+    assert a[idx].cpu().tolist() == [[3.0, 4.0, 5.0], [0.0, 1.0, 2.0]]
+    assert torch.cat([a, b]).cpu().shape == (4, 3)
+    parts = a.view(6).split_with_sizes([2, 4])
+    assert [p.cpu().tolist() for p in parts] == [[0.0, 1.0], [2.0, 3.0, 4.0, 5.0]]
+    # Generator
+    g = torch.Generator(device=mojo_device)
+    g.manual_seed(7)
+    r1 = torch.rand(4, device=mojo_device, generator=g)
+    g.manual_seed(7)
+    torch.testing.assert_close(
+        r1.cpu(), torch.rand(4, device=mojo_device, generator=g).cpu()
+    )
+    # Scalar return (_local_scalar_dense)
+    assert a[1, 2].item() == 5.0
+
+
+def test_boxed_adapter_error_kinds(mojo_device):
+    """A declined op is a NotImplementedError, a real failure a plain
+    RuntimeError, and a message from the boxed adapter names the op it
+    called. `view` no longer passes through the adapter (ATen's own kernel
+    serves it since #482), so its bad-shape error is ATen's."""
+    a = _arange(6, mojo_device).reshape(2, 3)
+    with pytest.raises(NotImplementedError) as declined:
+        torch.empty(2, dtype=torch.complex64, device=mojo_device)
+    assert "ScalarType" in str(declined.value)
+    assert "aten::empty.memory_format" in str(declined.value)
+
+    with pytest.raises(RuntimeError) as failed:
+        a.view([4, 4])
+    assert not isinstance(failed.value, NotImplementedError), failed.value
+    assert "invalid for input of size 6" in str(failed.value)
+
+    # a C++-side check inside the shim, not a declining kernel
+    with pytest.raises(RuntimeError) as bounds:
+        torch.ops.aten.as_strided(a, [2, 3], [3, 1], 20)
+    assert not isinstance(bounds.value, NotImplementedError), bounds.value
+    assert "storage" in str(bounds.value)
+
+
+def test_boxed_adapter_finds_a_warm_plan_by_value(mojo_device):
+    """A warm op's conversion plan is accepted by the hot-path identity check,
+    so no call after the first re-interns it (shim_dispatch.cpp, Plan)."""
+    a = _arange(6, mojo_device)
+    ops = (lambda: a.add(1.0), lambda: a.mul(2.0), lambda: a.view(2, 3), a.sum)
+    for op in ops:
+        op()
+    before = native.plan_builds()
+    assert before > 0
+    for _ in range(20):
+        for op in ops:
+            op()
+    assert native.plan_builds() == before
+
+
+def test_view_ops_guard_a_backed_symbolic_size(mojo_device):
+    """A backed symbolic size specializes at the view boundary (`guard_int`)
+    rather than being rejected, as the boxed adapter did for the same
+    argument."""
+    env = ShapeEnv()
+    six = env.create_symintnode(
+        env.create_symbol(6, ConstantSource("v"), dynamic_dim=DimDynamic.DYNAMIC),
+        hint=6,
+    )
+    t = _arange(6, mojo_device)
+    assert t.view([six]).shape == (6,)
+    assert t.view([six]).cpu().tolist() == list(range(6))
+    strided = t.as_strided([six - 3], [2], six - 6)
+    assert strided.shape == (3,) and strided.storage_offset() == 0
+    assert torch.ops.aten._reshape_alias(t, [six], [1]).shape == (6,)
