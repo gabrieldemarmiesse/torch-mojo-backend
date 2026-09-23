@@ -55,6 +55,17 @@ every spec/tuple/slot until `run()` returns, matching the old rule that all
 mutable state belongs to shared infrastructure, never to a per-call
 descriptor a stray concurrent call could stomp on.
 
+A warm call allocates nothing and formats no string: the family and OP names
+are copied into inline byte buffers, the defines are kept as PODs beside a
+running 64-bit hash, and the specs, slots and small tuples live in
+fixed-capacity inline arrays. The `-D` strings are spelled out only on a
+cache miss (`Defines.sorted()`), and the loader's hot path is one dictionary
+probe of that hash. The capacities are therefore fixed (`MAX_CALL_SPECS`,
+`MAX_CALL_SLOTS`, `MAX_DEFINES`, `TUPLE_POOL_WORDS`; a longer tuple spills to
+the heap), and a builder that does not fit records the reason for `run()` to
+raise rather than raising itself — the builders are called from non-raising
+helpers.
+
 ## One compiled function per variant
 
 Unchanged in spirit: every specialized `.so` exposes one C-ABI entry with a
