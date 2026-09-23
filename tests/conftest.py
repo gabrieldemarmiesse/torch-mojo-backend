@@ -1,7 +1,6 @@
 # ruff: noqa: E402 -- the environment variables below must be set before the imports
 import os
 import random
-import zlib
 
 os.environ["MODULAR_TELEMETRY_ENABLED"] = "0"
 os.environ["MAX_USE_EAGER_INTERPRETER"] = "1"
@@ -86,17 +85,17 @@ def reset_compiler():
 
 
 @pytest.fixture(autouse=True)
-def seed_rngs(request: pytest.FixtureRequest):
-    """Seed torch's and Python's global RNGs from the test's own node id.
+def seed_rngs():
+    """Seed torch's and Python's global RNGs to 0 before every test.
 
     Otherwise an unseeded `torch.randn` draws whatever the tests before it
     left in the global generator, so a test's data depends on which tests
     share its CI shard, and adding a test anywhere reshuffles every shard.
-    A test that seeds its own generator is unaffected.
+    A constant keeps a test's data unchanged across renames too. A test
+    that seeds its own generator is unaffected.
     """
-    seed = zlib.crc32(request.node.nodeid.encode())
-    random.seed(seed)
-    torch.manual_seed(seed)
+    random.seed(0)
+    torch.manual_seed(0)
 
 
 @pytest.fixture
