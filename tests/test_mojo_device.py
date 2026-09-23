@@ -543,6 +543,33 @@ def test_non_blocking_pinned_upload_skips_staging_memcpy(
         assert torch.all(storage[:offset] == 17)
 
 
+def _timed_transfer_stream_gate(stream: torch.Stream, seconds: float):
+    """Hold `stream` for `seconds` with a native host function (libc's usleep).
+
+    For a caller that then blocks: `_held_transfer_stream`'s gate is released
+    by Python, which needs the GIL, and a blocking call that keeps the GIL
+    while it waits on the stream would hold the gate shut until its watchdog
+    (seen on L4 CI). This gate releases itself with no Python involved.
+    """
+    if get_accelerators()[stream.device_index].api != "cuda":
+        pytest.skip("the independent stream gate uses CUDA host callbacks")
+    driver = ctypes.CDLL("libcuda.so.1")
+    usleep = ctypes.CDLL(None).usleep
+    driver.cuLaunchHostFunc.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    driver.cuLaunchHostFunc.restype = ctypes.c_int
+    fn = ctypes.cast(usleep, ctypes.c_void_p)
+    assert (
+        driver.cuLaunchHostFunc(
+            device_module.stream_native_handle(stream), fn, int(seconds * 1e6)
+        )
+        == 0
+    )
+
+
 @pytest.mark.parametrize("api", ["copy", "to"])
 @pytest.mark.parametrize("non_blocking", [False, True])
 @pytest.mark.parametrize("streams", ["default", "side", "cross"])
@@ -575,26 +602,22 @@ def test_download_then_upload_orders_pinned_reads(
             else side_stream_or_skip(mojo_gpu)
         )
         second = side_stream_or_skip(mojo_gpu) if streams == "cross" else first
-        with _held_transfer_stream(first) as release:
-            with device_module.stream(first):
-                host.copy_(source, non_blocking=True)
-                ready = first.record_event()
-            assert not ready.query()
-            # Blocking calls and CPU conversion legitimately wait for DMA.
-            timer = Timer(0.2, release.set)
-            timer.start()
-            try:
-                with device_module.stream(second):
-                    second.wait_event(ready)
-                    if api == "copy":
-                        destination.copy_(read_view, non_blocking=non_blocking)
-                    else:
-                        destination = read_view.to(
-                            mojo_gpu, dtype=dtype, non_blocking=non_blocking
-                        )
-                    destination.record_stream(second)
-            finally:
-                timer.join()
+        # Blocking calls and CPU conversion legitimately wait for DMA, so the
+        # gate must open by itself rather than from Python.
+        _timed_transfer_stream_gate(first, 0.5)
+        with device_module.stream(first):
+            host.copy_(source, non_blocking=True)
+            ready = first.record_event()
+        assert not ready.query()
+        with device_module.stream(second):
+            second.wait_event(ready)
+            if api == "copy":
+                destination.copy_(read_view, non_blocking=non_blocking)
+            else:
+                destination = read_view.to(
+                    mojo_gpu, dtype=dtype, non_blocking=non_blocking
+                )
+            destination.record_stream(second)
         second.synchronize()
         torch.testing.assert_close(destination.cpu(), wanted.to(dtype))
 
