@@ -281,9 +281,12 @@ def test_sum_full_reduce_and_dtype_promotion(mojo_gpu):
     """`sum()` with no dim decomposes to sum.dim_IntList, and torch's promotion
     rules (bool / sub-int64 integers -> int64, an explicit dtype= casting the
     input BEFORE the accumulation) are applied on our side too."""
-    x = torch.randn(16, 33)
+    x = torch.randn(16, 33, generator=torch.Generator().manual_seed(0))
+    # fp32 rounding grows with the partial sums, i.e. with sum(|x|), not with
+    # the (possibly near-zero) result: an unseeded draw summing to 0.16 once
+    # missed an absolute 2e-6 by 1e-6 purely from a different reduction order.
     torch.testing.assert_close(
-        x.to(mojo_gpu).sum().cpu(), x.sum(), rtol=2e-6, atol=2e-6
+        x.to(mojo_gpu).sum().cpu(), x.sum(), rtol=2e-6, atol=1e-6 * x.abs().sum().item()
     )
 
     for dtype in (torch.bool, torch.uint8, torch.int32):

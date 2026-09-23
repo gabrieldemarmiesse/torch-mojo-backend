@@ -65,21 +65,48 @@ COPY_LISTS = {
 }
 
 
+# (source, destination) of each batched-copy dtype id: the mixed-precision
+# cast both ways, and a same-dtype copy of each width class.
+COPY_DTYPES: dict[str, tuple[torch.dtype, torch.dtype]] = {
+    "f32_to_bf16": (torch.float32, torch.bfloat16),
+    "bf16_to_f32": (torch.bfloat16, torch.float32),
+    "bf16": (torch.bfloat16, torch.bfloat16),
+    "f32": (torch.float32, torch.float32),
+}
+
+
+# Element offsets (source, destination) into each allocation: "contig" puts
+# the two at different vector phases, "aligned" starts both on one.
+COPY_OFFSETS: dict[str, tuple[int, int]] = {"contig": (3, 5), "aligned": (0, 0)}
+
+
 @pytest.mark.bench_op("_foreach_copy_")
-@pytest.mark.parametrize("dtype_id", ("f32_to_bf16",))
+@pytest.mark.parametrize("dtype_id", COPY_DTYPES)
+@pytest.mark.parametrize("layout", COPY_OFFSETS)
 @pytest.mark.parametrize("shape_id", COPY_LISTS)
 def test_foreach_copy_cast(
-    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+    shape_id: str,
+    layout: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
 ):
+    """Separate allocations, so same-dtype lists take the batched kernel rather
+    than the adjacent-views DMA."""
     sizes = COPY_LISTS[shape_id]
-    src_ref, src_our = both_list([torch.randn(n + 8) for n in sizes], hw, mojo_device)
-    dst_ref, dst_our = both_list(
-        [torch.empty(n + 12, dtype=torch.bfloat16) for n in sizes], hw, mojo_device
+    src_dtype, dst_dtype = COPY_DTYPES[dtype_id]
+    src_offset, dst_offset = COPY_OFFSETS[layout]
+    src_ref, src_our = both_list(
+        [torch.randn(n + 8).to(src_dtype) for n in sizes], hw, mojo_device
     )
-    src_ref = [t[3 : 3 + n] for t, n in zip(src_ref, sizes, strict=True)]
-    src_our = [t[3 : 3 + n] for t, n in zip(src_our, sizes, strict=True)]
-    dst_ref = [t[5 : 5 + n] for t, n in zip(dst_ref, sizes, strict=True)]
-    dst_our = [t[5 : 5 + n] for t, n in zip(dst_our, sizes, strict=True)]
+    dst_ref, dst_our = both_list(
+        [torch.empty(n + 12, dtype=dst_dtype) for n in sizes], hw, mojo_device
+    )
+    src_ref = [t[src_offset:][:n] for t, n in zip(src_ref, sizes, strict=True)]
+    src_our = [t[src_offset:][:n] for t, n in zip(src_our, sizes, strict=True)]
+    dst_ref = [t[dst_offset:][:n] for t, n in zip(dst_ref, sizes, strict=True)]
+    dst_our = [t[dst_offset:][:n] for t, n in zip(dst_our, sizes, strict=True)]
     bench.run(
         lambda: torch._foreach_copy_(dst_ref, src_ref),
         lambda: torch._foreach_copy_(dst_our, src_our),
