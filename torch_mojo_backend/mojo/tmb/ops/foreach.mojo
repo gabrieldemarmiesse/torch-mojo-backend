@@ -30,6 +30,7 @@ sequential fallbacks below do -- one `div_.Scalar` / `addcdiv_` per tensor.
 (Their `Scalar[]` argument does marshal: `to_record`'s `ListType` branch in
 `native/csrc/shim_dispatch.cpp` has a `NumberType` arm.)
 """
+from std.builtin.sort import sort
 from std.math import ceildiv
 from std.utils import IndexList
 
@@ -62,7 +63,6 @@ from tmb.kernels.optimizer.foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
-from tmb.ops.matmul import _sm90_cuda
 
 
 # --- the sequential per-tensor fallback ---------------------------------
@@ -544,20 +544,119 @@ def op_foreach_addcmul_scalar_(
         _seq_addcmul_(self_list[i], t1_list[i], t2_list[i], value_v)
 
 
-def _copy_cast_qualifies(dsts: List[T], srcs: List[T]) raises -> Bool:
+def _batch_copy_dtype(dt: DType) -> Bool:
+    """Mirrors tmb/kernels/data_movement/entry.mojo's `COPY_BATCH_DTYPES`."""
+    return (
+        dt == DType.float64
+        or dt == DType.float32
+        or dt == DType.float16
+        or dt == DType.bfloat16
+        or dt == DType.int64
+        or dt == DType.int32
+        or dt == DType.int16
+        or dt == DType.int8
+        or dt == DType.uint64
+        or dt == DType.uint32
+        or dt == DType.uint16
+        or dt == DType.uint8
+        or dt == DType.bool
+    )
+
+
+def _bits_dtype(itemsize: Int) -> DType:
+    """The unsigned dtype of this width: a same-dtype copy only moves bits, so
+    every dtype of one width shares one compiled variant."""
+    if itemsize == 1:
+        return DType.uint8
+    if itemsize == 2:
+        return DType.uint16
+    if itemsize == 4:
+        return DType.uint32
+    return DType.uint64
+
+
+def _writes_overlap(dsts: List[T], srcs: List[T]) -> Bool:
+    """Whether a destination's bytes meet another destination's or any
+    source's, the pairs a one-launch copy cannot order like sequential copy_.
+
+    O(n log n) on plain integer sorts. Half-open ranges are pairwise disjoint
+    exactly when, with starts and ends sorted independently, every start is
+    at or past the previous end; the sorted destinations then pair up in
+    order, and a binary search finds the one each source could meet.
+    """
+    var begins = List[Int](capacity=len(dsts))
+    var ends = List[Int](capacity=len(dsts))
+    for t in dsts:
+        if t.numel > 0:
+            begins.append(t.ptr)
+            ends.append(t.ptr + t.numel * t.itemsize)
+    sort(begins)
+    sort(ends)
+    for k in range(1, len(begins)):
+        if begins[k] < ends[k - 1]:
+            return True
+    for t in srcs:
+        if t.numel == 0:
+            continue
+        var end = t.ptr + t.numel * t.itemsize
+        # The last destination starting before this source ends.
+        var lo = 0
+        var hi = len(begins)
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            if begins[mid] < end:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo > 0 and ends[lo - 1] > t.ptr:
+            return True
+    return False
+
+
+def _copy_batch_qualifies(dsts: List[T], srcs: List[T]) raises -> Bool:
+    """CUDA's `_foreach_copy_` fast-path rule (one device, contiguous, one
+    dtype per list, index-aligned shapes) plus the cross-pair overlap check
+    it lacks, so aliased lists keep sequential copy_ semantics."""
     var first = dsts[0].copy()
-    if not first.on_mojo() or not _sm90_cuda(first.device):
+    if not first.on_mojo() or dev(first.device)[].api != "cuda":
+        return False
+    var src_dtype = srcs[0].dtype
+    if not _batch_copy_dtype(first.dtype) or not _batch_copy_dtype(src_dtype):
         return False
     for i in range(len(dsts)):
-        if not _tensor_qualifies(dsts[i], first.device, DType.bfloat16):
+        if not _tensor_qualifies(dsts[i], first.device, first.dtype):
             return False
-        if not _tensor_qualifies(srcs[i], first.device, DType.float32):
+        if not _tensor_qualifies(srcs[i], first.device, src_dtype):
             return False
         if not dsts[i].same_shape(srcs[i]):
             return False
     # Empty occurrences have no byte-range hazard. The caller still bumps
     # each occurrence, including repeated references to the same empty tensor.
-    return not _self_overlaps(dsts) and not _overlaps_any(dsts, srcs)
+    return not _writes_overlap(dsts, srcs)
+
+
+def _copy_batch_launch(dsts: List[T], srcs: List[T]) raises:
+    var src_dtype = srcs[0].dtype
+    var dst_dtype = dsts[0].dtype
+    if src_dtype == dst_dtype:
+        src_dtype = _bits_dtype(dsts[0].itemsize)
+        dst_dtype = src_dtype
+    var ctx = ctx_for(dsts[0].device)
+    var call = KernelCall("data_movement", "CopyBatched")
+    call.arg_dtype(0, src_dtype)
+    call.out_dtype(dst_dtype)
+    var metadata = List[Int](capacity=3 * len(dsts))
+    for i in range(len(dsts)):
+        metadata.append(srcs[i].ptr)
+        metadata.append(dsts[i].ptr)
+        metadata.append(dsts[i].numel)
+    call.tuple(metadata)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    # This schema has no ADInplaceOrView wrapper, unlike scalar copy_.
+    for t in dsts:
+        t.bump_version()
+    _ = ctx
 
 
 def _copy_adjacent_views(dsts: List[T], srcs: List[T]) raises -> Bool:
@@ -628,21 +727,8 @@ def op_foreach_copy_(
         raise Error("Tensor lists must have the same number of tensors.")
     if _copy_adjacent_views(dsts, srcs):
         return
-    if _copy_cast_qualifies(dsts, srcs):
-        var ctx = ctx_for(dsts[0].device)
-        var call = KernelCall("data_movement", "CopyBatchedCast")
-        var metadata = List[Int]()
-        for i in range(len(dsts)):
-            metadata.append(srcs[i].ptr)
-            metadata.append(dsts[i].ptr)
-            metadata.append(dsts[i].numel)
-        call.tuple(metadata)
-        call.int(ctx_ptr(ctx))
-        call.run()
-        # This schema has no ADInplaceOrView wrapper, unlike scalar copy_.
-        for t in dsts:
-            t.bump_version()
-        _ = ctx
+    if _copy_batch_qualifies(dsts, srcs):
+        _copy_batch_launch(dsts, srcs)
         return
     for i in range(len(dsts)):
         var copy_args = List[Value]()

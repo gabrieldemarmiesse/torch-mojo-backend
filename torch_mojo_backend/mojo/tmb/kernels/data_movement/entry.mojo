@@ -66,7 +66,7 @@ from tmb.kernels.common.op_utils import (
     _transpose2d_kernel,
 )
 
-from tmb.kernels.data_movement.batched_copy_cast import copy_batched_cast
+from tmb.kernels.data_movement.batched_copy import copy_batched
 from tmb.kernels.data_movement.batched_copy_rows import copy_batched_rows
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
@@ -3630,26 +3630,47 @@ def _cast_spec_into_go(a_o: Arg, out_dtype_o: Arg, out_o: Arg) raises:
             _ = tmp^
 
 
-def _copy_batched_cast_dispatcher(argv: Argv, argc: Int) raises:
+# Every dtype `_foreach_copy_`'s batched route converts between; the op side
+# mirrors it in `tmb/ops/foreach.mojo`'s `_batch_copy_dtype`.
+comptime COPY_BATCH_DTYPES = [
+    DType.float64,
+    DType.float32,
+    DType.float16,
+    DType.bfloat16,
+    DType.int64,
+    DType.int32,
+    DType.int16,
+    DType.int8,
+    DType.uint64,
+    DType.uint32,
+    DType.uint16,
+    DType.uint8,
+    DType.bool,
+]
+
+
+def _copy_batched_dispatcher(argv: Argv, argc: Int) raises:
     if argc != 2:
-        raise Error("CopyBatchedCast expects metadata and context")
-    comptime if _has_sm_9x():
-        var metadata = argv[unsafe_offset=0]
-        var count = _raw_tuple_len(metadata)
-        if count % 3 != 0:
-            raise Error(
-                "CopyBatchedCast metadata must contain pointer/size triples"
-            )
-        var srcs = List[Int]()
-        var dsts = List[Int]()
-        var sizes = List[Int]()
-        for i in range(count // 3):
-            srcs.append(_raw_tuple_int(metadata, i * 3))
-            dsts.append(_raw_tuple_int(metadata, i * 3 + 1))
-            sizes.append(_raw_tuple_int(metadata, i * 3 + 2))
-        copy_batched_cast(srcs, dsts, sizes, _raw_ctx(argv[unsafe_offset=1]))
-    else:
-        raise Error("CopyBatchedCast requires Hopper")
+        raise Error("CopyBatched expects metadata and context")
+    var metadata = argv[unsafe_offset=0]
+    var count = _raw_tuple_len(metadata)
+    if count % 3 != 0:
+        raise Error("CopyBatched metadata must contain pointer/size triples")
+    var srcs = List[Int](capacity=count // 3)
+    var dsts = List[Int](capacity=count // 3)
+    var sizes = List[Int](capacity=count // 3)
+    for i in range(count // 3):
+        srcs.append(_raw_tuple_int(metadata, i * 3))
+        dsts.append(_raw_tuple_int(metadata, i * 3 + 1))
+        sizes.append(_raw_tuple_int(metadata, i * 3 + 2))
+    var ctx = _raw_ctx(argv[unsafe_offset=1])
+    comptime for src in COPY_BATCH_DTYPES:
+        comptime if _dtype_arg_on[0, src]():
+            comptime for dst in COPY_BATCH_DTYPES:
+                comptime if _dtype_out_on[0, dst]():
+                    copy_batched[src, dst](srcs, dsts, sizes, ctx)
+                    return
+    raise Error("CopyBatched: dtype pair not compiled into this module")
 
 
 def _copy_batched_rows_dispatcher(argv: Argv, argc: Int) raises:
@@ -3692,8 +3713,8 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
     """
     try:
-        comptime if _op_on["CopyBatchedCast"]():
-            _copy_batched_cast_dispatcher(argv, argc)
+        comptime if _op_on["CopyBatched"]():
+            _copy_batched_dispatcher(argv, argc)
             return 0
         comptime if _op_on["CopyBatchedRows"]():
             _copy_batched_rows_dispatcher(argv, argc)

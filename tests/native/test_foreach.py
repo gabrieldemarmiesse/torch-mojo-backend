@@ -105,6 +105,129 @@ def test_foreach_copy_cast_alignment(
     )
 
 
+_BATCH_COPY_DTYPES = [
+    torch.float64,
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.uint8,
+    torch.bool,
+]
+# Every dtype into and out of float32, the 16-bit floats both ways, rounding
+# through float (float64 -> bf16, int64 -> half), wrapping integer narrowing,
+# and bool normalization. Each pair is its own kernel build.
+_BATCH_COPY_PAIRS = sorted(
+    {(dtype, torch.float32) for dtype in _BATCH_COPY_DTYPES}
+    | {(torch.float32, dtype) for dtype in _BATCH_COPY_DTYPES}
+    | {
+        (torch.bfloat16, torch.float16),
+        (torch.float16, torch.bfloat16),
+        (torch.float64, torch.bfloat16),
+        (torch.int64, torch.float16),
+        (torch.int64, torch.int8),
+        (torch.int32, torch.uint8),
+        (torch.int64, torch.bool),
+        (torch.bool, torch.bfloat16),
+    }
+    | {(dtype, dtype) for dtype in _BATCH_COPY_DTYPES + [torch.uint16, torch.uint32]},
+    key=str,
+)
+_BATCH_COPY_SIZES = [0, 1, 7, 17, 2047, 2049, 8193, 357 * 789]
+
+
+def _batch_copy_source(n: int, src: torch.dtype, dst: torch.dtype) -> torch.Tensor:
+    """Values whose conversion is defined behaviour in C++ for this pair."""
+    index = torch.arange(n, dtype=torch.int64)
+    if src == torch.bool:
+        return index % 3 == 1
+    if src.is_floating_point:
+        values = ((index * 7919 + 13) % 20001 - 10000).double() / 97
+        if dst in (torch.uint8, torch.uint16, torch.uint32):
+            values = values.abs()
+        if not dst.is_floating_point and dst != torch.bool:
+            values = values.clamp(-127, 127)
+        elif dst.is_floating_point and n >= 4:
+            values[:4] = torch.tensor([float("nan"), float("inf"), -float("inf"), -0.0])
+        return values.to(src)
+    bits = (index * 2654435761 + 12345) % (1 << 40) - (1 << 39)
+    if src in (torch.uint8, torch.uint16, torch.uint32):
+        bits = bits.abs()
+    return bits.to(src)
+
+
+@pytest.mark.parametrize(("src_dtype", "dst_dtype"), _BATCH_COPY_PAIRS, ids=str)
+@pytest.mark.parametrize("offsets", [(0, 0), (1, 3)])
+def test_foreach_copy_batched_dtypes(mojo_gpu: str, src_dtype, dst_dtype, offsets):
+    source_offset, destination_offset = offsets
+    hosts = [_batch_copy_source(n + 8, src_dtype, dst_dtype) for n in _BATCH_COPY_SIZES]
+    sources = [host.to(mojo_gpu) for host in hosts]
+    guards = [
+        torch.full((n + 8,), 5, dtype=dst_dtype, device=mojo_gpu)
+        for n in _BATCH_COPY_SIZES
+    ]
+    spans = list(zip(sources, guards, _BATCH_COPY_SIZES, strict=True))
+    srcs = [s[source_offset : source_offset + n] for s, _, n in spans]
+    dsts = [g[destination_offset : destination_offset + n] for _, g, n in spans]
+    versions = [t._version for t in dsts]
+    _watch("aten::_foreach_copy_")
+    torch._foreach_copy_(dsts, srcs)
+    _assert_ran("aten::_foreach_copy_")
+    assert native.op_count("aten::_copy_from") == 0, "took the per-pair fallback"
+    for host, guard, n, dst, version in zip(
+        hosts, guards, _BATCH_COPY_SIZES, dsts, versions, strict=True
+    ):
+        expected = torch.full((n + 8,), 5, dtype=dst_dtype)
+        expected[destination_offset : destination_offset + n].copy_(
+            host[source_offset : source_offset + n]
+        )
+        torch.testing.assert_close(
+            guard.cpu(), expected, rtol=0, atol=0, equal_nan=True
+        )
+        assert dst._version == version + 1
+
+
+@pytest.mark.parametrize("shift", [0, 1, 5])
+def test_foreach_copy_batched_interleaved_views(mojo_gpu: str, shift: int):
+    """Sources and destinations alternate slots of one buffer, in shuffled
+    pair order: disjoint, they batch; one source shifted into the next slot
+    (partly or wholly) meets another pair's destination, and the whole list
+    takes the sequential route."""
+    slots, width = 200, 5
+    host = torch.arange(slots * width + 2, dtype=torch.float32)
+    base = host.to(mojo_gpu)
+    order = torch.randperm(slots // 2, generator=torch.Generator().manual_seed(0))
+
+    def views(tensor):
+        dsts = [tensor[1 + 2 * i * width :][:width] for i in order.tolist()]
+        srcs = [tensor[1 + (2 * i + 1) * width :][:width] for i in order.tolist()]
+        srcs[37] = tensor[1 + (2 * order[37].item() + 1) * width + shift :][:width]
+        return dsts, srcs
+
+    expected_dsts, expected_srcs = views(host)
+    for destination, source in zip(expected_dsts, expected_srcs, strict=True):
+        destination.copy_(source)
+    _watch("aten::_foreach_copy_")
+    torch._foreach_copy_(*views(base))
+    assert native.op_count("aten::_copy_from") == (0 if shift == 0 else slots // 2)
+    torch.testing.assert_close(base.cpu(), host, rtol=0, atol=0)
+
+
+def test_foreach_copy_batched_keeps_sequential_order(mojo_gpu: str):
+    """Stock CUDA's batched `_foreach_copy_` races here (pair 1 reads what
+    pair 0 writes); ours must fall back and match one-by-one copy_."""
+    n = 1 << 20
+    buffer = torch.zeros(2 * n, device=mojo_gpu)
+    ones = torch.ones(n, dtype=torch.bfloat16, device=mojo_gpu)
+    _watch("aten::_foreach_copy_")
+    torch._foreach_copy_([buffer[:n], buffer[n:]], [ones, buffer[:n]])
+    assert native.op_count("aten::_copy_from") == 2
+    assert bool((buffer == 1).all())
+
+
 @pytest.mark.parametrize(
     "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.uint8]
 )
