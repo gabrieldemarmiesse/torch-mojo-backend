@@ -6,8 +6,9 @@
 #   - stable:  rebuilt from the tag of every published release (pre-releases
 #              excepted), and the version the site's root redirects to.
 # "Run workflow" redeploys by hand: run it on main for nightly, on a release
-# tag for stable. Pull requests only build, with --strict, so a broken link
-# or anchor fails the PR rather than the deploy after merge.
+# tag for stable. Pull requests only build, with --strict, and check every
+# link, so a broken link or anchor fails the PR rather than the deploy after
+# merge.
 name: Docs
 
 on:
@@ -40,6 +41,28 @@ jobs:
       # --only-group: mkdocs and its plugins, not torch and MAX.
       - name: Build the site
         run: uv run --only-group docs mkdocs build --strict
+
+  # The build above checks links between pages; this checks the rest, in
+  # the sources the site is built from. Links into this repository are
+  # remapped to the checkout, not fetched from main: a PR that moves or
+  # deletes a linked file fails here, and an html-preview link (the wrapper
+  # answers 200 for anything) has the file it previews checked instead.
+  # Code blocks are not scanned.
+  links:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check links
+        uses: lycheeverse/lychee-action@v2.9.0
+        with:
+          args: >-
+            --no-progress
+            --remap '^https://github\.com/gabrieldemarmiesse/torch-mojo-backend/blob/main/(.*)$ file://${{ github.workspace }}/$1'
+            --remap '^https://html-preview\.github\.io/\?url=https://github\.com/gabrieldemarmiesse/torch-mojo-backend/raw/refs/heads/main/(.*)$ file://${{ github.workspace }}/$1'
+            --exclude-path docs/overrides
+            README.md 'docs/**/*.md' 'docs/**/*.html'
 
   deploy:
     if: >-
