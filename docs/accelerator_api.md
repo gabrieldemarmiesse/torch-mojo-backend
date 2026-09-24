@@ -34,19 +34,14 @@ cached on disk, as the [home page](index.md) explains. Set
 `TORCH_MOJO_BACKEND_TRACE=0` to silence the build-timing lines printed on
 stderr.
 
-??? tip "Make the backend optional, and fall back to the CPU"
-    For a script that must run whether or not `torch-mojo-backend` is
-    installed, and also on machines without a GPU:
+??? tip "Fall back to the CPU"
+    For a script that must also run on machines without a GPU:
 
     ```python
     import torch
+    import torch_mojo_backend
 
-    try:
-        import torch_mojo_backend
-
-        torch_mojo_backend.register_mojo_devices()
-    except ImportError:
-        pass  # stock PyTorch: CUDA, ROCm, MPS, ... as usual
+    torch_mojo_backend.register_mojo_devices()
 
     device = torch.accelerator.current_accelerator(check_available=True) or torch.device("cpu")
     print(device)
