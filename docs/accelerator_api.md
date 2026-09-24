@@ -418,7 +418,11 @@ Keep device work out of the dataset and in the main process.
 ## Not supported
 
 - `torch.accelerator.get_device_capability()` raises
-  `RuntimeError: Backend doesn't support getting device capabilities.`
+  `RuntimeError: Backend doesn't support getting device capabilities.`, as it
+  does on CUDA and ROCm. The `(major, minor)` pair of
+  `torch.cuda.get_device_capability()` is
+  `torch.get_device_module(device).get_device_capability(device)`, with the
+  same values as stock CUDA and ROCm.
 - `torch.amp.GradScaler`, see [Mixed precision](#mixed-precision).
 - CUDA graphs (`torch.cuda.graph`, `CUDAGraph`, `make_graphed_callables`) have
   no equivalent.

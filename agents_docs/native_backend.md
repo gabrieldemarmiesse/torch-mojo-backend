@@ -429,8 +429,9 @@ per device in Mojo through MAX, without CUDA/HIP probing in Python.
 names follow torch.cuda where possible; `api`, `arch_name`, shared
 memory limits and `clock_rate` (kHz) provide additional MAX information.
 Unavailable fields are `None`.
-Compute capability is a CUDA `(major, minor)` pair; other APIs return
-`(None, None)`, with HIP's architecture in `gcnArchName` and `arch_name`.
+Compute capability matches `torch.cuda.get_device_capability()`: the SM
+version on CUDA, the gfx ISA version on HIP (`gfx942` -> `(9, 4)`, as
+`hipDeviceProp_t` reports it), `(None, None)` on Metal.
 This dataclass is separate from Inductor's Triton autotuner property contract.
 `torch.accelerator.get_device_capability()` describes dtype support and raises
 the default unsupported-capability error, just as CUDA does; we do not advertise

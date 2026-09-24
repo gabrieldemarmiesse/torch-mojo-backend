@@ -418,7 +418,7 @@ def _attribute(ctx: DeviceContext, attr: DeviceAttribute) -> Int64:
 def _properties(d: Pointer[Dev, MutUntrackedOrigin]) -> Properties:
     var ctx = d[].ctx
     var values = List[Int64]()
-    # Capability is CUDA-specific; HIP uses the architecture string instead.
+    # CUDA-only attributes; Python derives HIP's from the gfx arch string.
     values.append(
         _attribute(ctx, DeviceAttribute.COMPUTE_CAPABILITY_MAJOR) if d[].api
         == "cuda" else -1

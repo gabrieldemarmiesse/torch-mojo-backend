@@ -466,18 +466,40 @@ def test_capability_contracts_and_inductor_properties(mojo_device: str):
         assert type(cc) is int
         assert capability[0] is not None and capability[1] is not None
         assert cc == capability[0] * 10 + capability[1]
+    elif props.api == "hip":
+        cc = MojoInterface.get_compute_capability(mojo_device)
+        assert isinstance(cc, str) and cc.startswith("gfx")
+        assert all(type(part) is int for part in capability)
+        if torch.cuda.is_available():
+            idx = torch.device(mojo_device).index
+            assert capability == torch.cuda.get_device_capability(idx)
     else:
-        # Deliberate public contract: unknown CUDA components are None.
         assert capability == (None, None)
-        if props.api == "hip":
-            cc = MojoInterface.get_compute_capability(mojo_device)
-            assert isinstance(cc, str) and cc.startswith("gfx")
     # DeviceGuardImplInterface's default is also inherited by CUDA. This
     # API describes dtype support, not the SM or gfx architecture.
     with pytest.raises(
         RuntimeError, match="doesn't support getting device capabilities"
     ):
         torch.accelerator.get_device_capability(torch.device(mojo_device).index)
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        ("gfx942:sramecc+:xnack-", (9, 4)),
+        ("gfx90a", (9, 0)),
+        ("gfx950", (9, 5)),
+        ("gfx1030", (10, 3)),
+        ("gfx1100", (11, 0)),
+        ("gfx1201", (12, 0)),
+        ("", (None, None)),
+        ("sm_90a", (None, None)),
+    ],
+)
+def test_gfx_version_matches_hip_device_prop(
+    arch: str, expected: tuple[int | None, int | None]
+):
+    assert device_module._gfx_version(arch) == expected
 
 
 @pytest.mark.cpu_torch
