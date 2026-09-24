@@ -414,10 +414,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#from-torchcuda-to-mojo" class="md-nav__link">
+  <a href="#from-torchcuda" class="md-nav__link">
     <span class="md-ellipsis">
       
-        From torch.cuda to mojo
+        From torch.cuda
       
     </span>
   </a>
@@ -636,10 +636,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#from-torchcuda-to-mojo" class="md-nav__link">
+  <a href="#from-torchcuda" class="md-nav__link">
     <span class="md-ellipsis">
       
-        From torch.cuda to mojo
+        From torch.cuda
       
     </span>
   </a>
@@ -794,19 +794,19 @@
 
 
 <h1 id="streams-and-events">Streams and events<a class="headerlink" href="#streams-and-events" title="Permanent link">&para;</a></h1>
-<p>The <code>mojo</code> device implements PyTorch's device-generic stream and event API
-(<code>torch.Stream</code>, <code>torch.Event</code> and the stream functions of
-<code>torch.accelerator</code>), and <code>torch.mojo</code> adds <code>torch.cuda</code>-style names on top of
-it. On NVIDIA and AMD GPUs, each stream is an independent device queue and
-events work as they do on CUDA, so code written for CUDA streams carries over
-once a few calls are renamed. Apple GPUs have a single queue and no events;
-see <a href="#apple-gpus">Apple GPUs</a>.</p>
-<p>This page assumes the device is already set up.
-<a href="../accelerator_api/">Accelerator API</a> covers <code>register_mojo_devices()</code>,
-device selection and the rest of <code>torch.mojo</code>.</p>
+<p>The backend implements PyTorch's device-agnostic stream and event API:
+<code>torch.Stream</code>, <code>torch.Event</code> and the stream functions of <code>torch.accelerator</code>.
+On NVIDIA and AMD GPUs, each stream is an independent device queue and events
+work as they do on CUDA, so code written for CUDA streams carries over once a
+few calls are renamed. Apple GPUs have a single queue and no events; see
+<a href="#apple-gpus">Apple GPUs</a>.</p>
+<p>This page assumes the backend is already registered, and <code>device</code> in the
+examples is <code>torch.accelerator.current_accelerator()</code>.
+<a href="../accelerator_api/">Accelerator API</a> covers registration, device selection
+and the rest of <code>torch.accelerator</code>.</p>
 <h2 id="how-work-is-ordered">How work is ordered<a class="headerlink" href="#how-work-is-ordered" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Every op on a <code>mojo</code> tensor is queued on the current stream of its device,
+<li>Every op on an accelerator tensor is queued on the current stream of its device,
   and the Python call returns without waiting for the kernel to run. Ops
   queued on the same stream run in the order they were issued.</li>
 <li>When a program starts, the current stream is the device's default stream
@@ -816,10 +816,9 @@ device selection and the rest of <code>torch.mojo</code>.</p>
 <li>When it has to give you a value: <code>.cpu()</code>, <code>.item()</code>, <code>.tolist()</code>, or
   a blocking <code>copy_()</code> into a CPU tensor. These copy on the current
   stream and wait for that stream alone.</li>
-<li>When you ask it to: <code>torch.accelerator.synchronize()</code> and
-  <code>torch.mojo.synchronize()</code> wait for every stream of the device,
-  <code>stream.synchronize()</code> waits for one stream, and <code>event.synchronize()</code>
-  waits for one event.</li>
+<li>When you ask it to: <code>torch.accelerator.synchronize()</code> waits for every
+  stream of the device, <code>stream.synchronize()</code> waits for one stream, and
+  <code>event.synchronize()</code> waits for one event.</li>
 </ul>
 </li>
 <li>The first time an op runs with a new combination of dtypes, its kernel is
@@ -827,108 +826,91 @@ device selection and the rest of <code>torch.mojo</code>.</p>
   kernel is cached on disk. Run a warm-up iteration before you time anything.</li>
 </ul>
 <h2 id="streams">Streams<a class="headerlink" href="#streams" title="Permanent link">&para;</a></h2>
-<h3 id="from-torchcuda-to-mojo">From <code>torch.cuda</code> to <code>mojo</code><a class="headerlink" href="#from-torchcuda-to-mojo" title="Permanent link">&para;</a></h3>
+<h3 id="from-torchcuda">From <code>torch.cuda</code><a class="headerlink" href="#from-torchcuda" title="Permanent link">&para;</a></h3>
 <table>
 <thead>
 <tr>
 <th>CUDA</th>
-<th>Device-generic</th>
-<th><code>torch.mojo</code></th>
+<th>Device-agnostic</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>torch.cuda.Stream()</code></td>
-<td><code>torch.Stream(device="mojo")</code></td>
-<td><code>torch.mojo.Stream()</code></td>
+<td><code>torch.Stream(device)</code></td>
 </tr>
 <tr>
 <td><code>torch.cuda.Event(enable_timing=True)</code></td>
-<td><code>torch.Event(device="mojo", enable_timing=True)</code></td>
-<td><code>torch.mojo.Event(enable_timing=True)</code></td>
+<td><code>torch.Event(device, enable_timing=True)</code></td>
 </tr>
 <tr>
 <td><code>torch.cuda.current_stream()</code></td>
 <td><code>torch.accelerator.current_stream()</code></td>
-<td><code>torch.mojo.current_stream()</code></td>
-</tr>
-<tr>
-<td><code>torch.cuda.default_stream()</code></td>
-<td>—</td>
-<td><code>torch.mojo.default_stream()</code></td>
 </tr>
 <tr>
 <td><code>torch.cuda.set_stream(s)</code></td>
 <td><code>torch.accelerator.set_stream(s)</code></td>
-<td><code>torch.mojo.set_stream(s)</code></td>
 </tr>
 <tr>
 <td><code>with torch.cuda.stream(s):</code></td>
 <td><code>with s:</code></td>
-<td><code>with torch.mojo.stream(s):</code></td>
 </tr>
 <tr>
 <td><code>torch.cuda.synchronize()</code></td>
 <td><code>torch.accelerator.synchronize()</code></td>
-<td><code>torch.mojo.synchronize()</code></td>
 </tr>
 <tr>
 <td><code>s.cuda_stream</code></td>
 <td><code>s.native_handle</code> (torch 2.11+)</td>
-<td><code>torch.mojo.stream_native_handle(s)</code></td>
 </tr>
 </tbody>
 </table>
-<p><code>torch.mojo.Stream</code> and <code>torch.mojo.Event</code> <em>are</em> <code>torch.Stream</code> and
-<code>torch.Event</code>, so you can pass a mojo stream to any PyTorch API that takes a
-stream. The methods have their CUDA names: <code>wait_stream</code>, <code>wait_event</code>,
+<p>The methods have their CUDA names: <code>wait_stream</code>, <code>wait_event</code>,
 <code>record_event</code>, <code>query</code> and <code>synchronize</code> on streams, and <code>record</code>, <code>wait</code>,
-<code>query</code>, <code>synchronize</code> and <code>elapsed_time</code> on events. Code that uses only the
-device-generic column, with <code>torch.accelerator.current_accelerator()</code> in place
-of the <code>"mojo"</code> string, also runs on stock PyTorch with CUDA.</p>
+<code>query</code>, <code>synchronize</code> and <code>elapsed_time</code> on events. Code written this way
+also runs on stock PyTorch with CUDA.</p>
 <h3 id="creating-a-stream-and-making-it-current">Creating a stream and making it current<a class="headerlink" href="#creating-a-stream-and-making-it-current" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>   <span class="c1"># the default stream at start-up</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="n">side</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>          <span class="c1"># a new, independent stream</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="nb">print</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>  <span class="c1"># torch.Stream device_type=mojo, device_index=0, stream_id=0</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="nb">print</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>  <span class="c1"># torch.Stream device_type=mojo, device_index=0, stream_id=1</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="k">with</span> <span class="n">side</span><span class="p">:</span>                                  <span class="c1"># or: with torch.mojo.stream(side):</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    <span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span> <span class="o">==</span> <span class="n">side</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="mi">1000</span><span class="p">,),</span> <span class="mf">2.0</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>  <span class="c1"># queued on `side`</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>
-<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span> <span class="o">==</span> <span class="n">main</span>  <span class="c1"># restored on exit</span>
-<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>
-<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="n">side</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>          <span class="c1"># wait for everything queued on `side`</span>
-<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="nb">print</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>       <span class="c1"># 2000.0</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_accelerator</span><span class="p">()</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>   <span class="c1"># the default stream at start-up</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="n">side</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>                 <span class="c1"># a new, independent stream</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="nb">print</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>  <span class="c1"># torch.Stream device_type=mojo, device_index=0, stream_id=0</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="nb">print</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>  <span class="c1"># torch.Stream device_type=mojo, device_index=0, stream_id=1</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="k">with</span> <span class="n">side</span><span class="p">:</span>
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    <span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span> <span class="o">==</span> <span class="n">side</span>
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="mi">1000</span><span class="p">,),</span> <span class="mf">2.0</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>  <span class="c1"># queued on `side`</span>
+<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>
+<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span> <span class="o">==</span> <span class="n">main</span>  <span class="c1"># restored on exit</span>
+<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>
+<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="n">side</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>          <span class="c1"># wait for everything queued on `side`</span>
+<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="nb">print</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>       <span class="c1"># 2000.0</span>
 </code></pre></div>
-<p><code>torch.accelerator.set_stream(s)</code> and <code>torch.mojo.set_stream(s)</code> do the same
-without a <code>with</code> block: the stream stays current until you set another one.</p>
+<p><code>torch.accelerator.set_stream(s)</code> does the same without a <code>with</code> block: the
+stream stays current until you set another one.</p>
 <ul>
 <li>Create streams once, before a loop, and reuse them. Every
   <code>torch.Stream(...)</code> call creates a new device stream (you can watch
   <code>stream_id</code> count up), and the stream stays alive until the process exits.
   CUDA differs here: <code>torch.cuda.Stream()</code> hands out streams from a fixed
   pool.</li>
-<li>Without a <code>device</code> argument, <code>torch.Stream()</code> and <code>torch.mojo.Stream()</code>
-  create the stream on the current mojo device, and
-  <code>torch.Stream(device="mojo:1")</code> targets another GPU. Entering a stream that
-  belongs to another device also makes that device current until the block
-  exits, the same behavior as CUDA.</li>
+<li><code>torch.Stream(device)</code> creates the stream on the current device, and
+  <code>torch.Stream(torch.device(device.type, 1))</code> targets another GPU.
+  Entering a stream that belongs to another device also makes that device
+  current until the block exits, the same behavior as CUDA.</li>
 <li><code>priority=</code> is passed to the driver when the stream is created. The
   convention is CUDA's: a lower number means a higher priority, and values
   outside the device's range are clamped. The generic <code>torch.Stream</code> has no
   <code>priority</code> attribute, so you cannot read the value back.</li>
 <li><code>stream.query()</code> returns whether all the work queued on the stream has
   finished, without blocking. <code>stream.synchronize()</code> blocks until it has.</li>
-<li><code>stream.native_handle</code> (torch 2.11 and later) and
-  <code>torch.mojo.stream_native_handle(stream)</code> (any torch version) return the
-  underlying <code>CUstream</code> or <code>hipStream_t</code>. Use the handle to queue work from
-  outside PyTorch on the same device queue.</li>
+<li><code>stream.native_handle</code> (torch 2.11 and later) returns the underlying
+  <code>CUstream</code> or <code>hipStream_t</code>. Use the handle to queue work from outside
+  PyTorch on the same device queue.</li>
 </ul>
 <h2 id="events">Events<a class="headerlink" href="#events" title="Permanent link">&para;</a></h2>
 <h3 id="timing-gpu-work">Timing GPU work<a class="headerlink" href="#timing-gpu-work" title="Permanent link">&para;</a></h3>
@@ -939,20 +921,21 @@ without a <code>with</code> block: the stream stays current until you set anothe
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
 <a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
 <a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>
-<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2048</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
-<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="n">a</span> <span class="o">@</span> <span class="n">a</span>  <span class="c1"># warm up: the first call of an op compiles its kernel</span>
-<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>
-<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="n">start</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">,</span> <span class="n">enable_timing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="n">end</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">,</span> <span class="n">enable_timing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>
-<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="n">start</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>          <span class="c1"># records on the current stream</span>
-<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
-<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>    <span class="n">b</span> <span class="o">=</span> <span class="n">a</span> <span class="o">@</span> <span class="n">a</span>
-<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="n">end</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
-<a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>
-<a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a><span class="n">end</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>       <span class="c1"># elapsed_time needs both events to have completed</span>
-<a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">start</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">end</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">10</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms per matmul&quot;</span><span class="p">)</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_accelerator</span><span class="p">()</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2048</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="n">a</span> <span class="o">@</span> <span class="n">a</span>  <span class="c1"># warm up: the first call of an op compiles its kernel</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="n">start</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">enable_timing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="n">end</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">enable_timing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>
+<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="n">start</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>          <span class="c1"># records on the current stream</span>
+<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a>    <span class="n">b</span> <span class="o">=</span> <span class="n">a</span> <span class="o">@</span> <span class="n">a</span>
+<a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="n">end</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>
+<a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="n">end</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>       <span class="c1"># elapsed_time needs both events to have completed</span>
+<a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">start</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">end</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">10</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms per matmul&quot;</span><span class="p">)</span>
 </code></pre></div>
 </div>
 <div class="tabbed-block">
@@ -962,17 +945,18 @@ without a <code>with</code> block: the stream stays current until you set anothe
 <a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
 <a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>
 <a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
-<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
-<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2048</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
-<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="n">a</span> <span class="o">@</span> <span class="n">a</span>  <span class="c1"># warm up: the first call of an op compiles its kernel</span>
-<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>
-<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="n">torch</span><span class="o">.</span><span class="n">mojo</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>        <span class="c1"># start from an idle device</span>
-<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="n">start</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
-<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
-<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>    <span class="n">b</span> <span class="o">=</span> <span class="n">a</span> <span class="o">@</span> <span class="n">a</span>
-<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="n">torch</span><span class="o">.</span><span class="n">mojo</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>        <span class="c1"># wait until the GPU is done</span>
-<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="n">elapsed_ms</span> <span class="o">=</span> <span class="mf">1e3</span> <span class="o">*</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">start</span><span class="p">)</span>
-<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">elapsed_ms</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">10</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms per matmul&quot;</span><span class="p">)</span>
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_accelerator</span><span class="p">()</span>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2048</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="n">a</span> <span class="o">@</span> <span class="n">a</span>  <span class="c1"># warm up: the first call of an op compiles its kernel</span>
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>
+<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>   <span class="c1"># start from an idle device</span>
+<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="n">start</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>    <span class="n">b</span> <span class="o">=</span> <span class="n">a</span> <span class="o">@</span> <span class="n">a</span>
+<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>   <span class="c1"># wait until the GPU is done</span>
+<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="n">elapsed_ms</span> <span class="o">=</span> <span class="mf">1e3</span> <span class="o">*</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">start</span><span class="p">)</span>
+<a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">elapsed_ms</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">10</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms per matmul&quot;</span><span class="p">)</span>
 </code></pre></div>
 <p>This measures wall time, so it includes the time the CPU spends queuing
 the ops. Events measure device time only.</p>
@@ -1019,23 +1003,24 @@ matmul, and then the two results are combined:</p>
 <a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
 <a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>
 <a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
-<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>
-<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
-<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="n">side</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>    <span class="c1"># create once, reuse</span>
-<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>
-<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>   <span class="c1"># produced on `main`</span>
-<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>
-<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="n">side</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>          <span class="c1"># rule 1: `side` must not read x before it is written</span>
-<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="k">with</span> <span class="n">side</span><span class="p">:</span>
-<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a>    <span class="n">col_max</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">amax</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>   <span class="c1"># runs on `side` ...</span>
-<a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">@</span> <span class="n">x</span>                           <span class="c1"># ... while this runs on `main`</span>
-<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>
-<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a><span class="n">main</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>          <span class="c1"># rules 1 and 2: `main` must not read col_max too early</span>
-<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a><span class="n">x</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>           <span class="c1"># rule 3: x was used on `side`,</span>
-<a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a><span class="n">col_max</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>     <span class="c1"># and col_max is used on `main`</span>
-<a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a>
-<a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a><span class="n">result</span> <span class="o">=</span> <span class="n">y</span> <span class="o">/</span> <span class="n">col_max</span>
-<a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a><span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">cpu</span><span class="p">()[</span><span class="mi">0</span><span class="p">,</span> <span class="p">:</span><span class="mi">4</span><span class="p">])</span>      <span class="c1"># the copy runs on `main`, after the join</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_accelerator</span><span class="p">()</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="n">side</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>           <span class="c1"># create once, reuse</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>   <span class="c1"># produced on `main`</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a>
+<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="n">side</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>          <span class="c1"># rule 1: `side` must not read x before it is written</span>
+<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="k">with</span> <span class="n">side</span><span class="p">:</span>
+<a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a>    <span class="n">col_max</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">amax</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>   <span class="c1"># runs on `side` ...</span>
+<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a><span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">@</span> <span class="n">x</span>                           <span class="c1"># ... while this runs on `main`</span>
+<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a>
+<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a><span class="n">main</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>          <span class="c1"># rules 1 and 2: `main` must not read col_max too early</span>
+<a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a><span class="n">x</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>           <span class="c1"># rule 3: x was used on `side`,</span>
+<a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a><span class="n">col_max</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>     <span class="c1"># and col_max is used on `main`</span>
+<a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a>
+<a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a><span class="n">result</span> <span class="o">=</span> <span class="n">y</span> <span class="o">/</span> <span class="n">col_max</span>
+<a id="__codelineno-3-22" name="__codelineno-3-22" href="#__codelineno-3-22"></a><span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">cpu</span><span class="p">()[</span><span class="mi">0</span><span class="p">,</span> <span class="p">:</span><span class="mi">4</span><span class="p">])</span>      <span class="c1"># the copy runs on `main`, after the join</span>
 </code></pre></div>
 <div class="admonition warning">
 <p class="admonition-title">Forgetting a wait does not raise an error</p>
@@ -1045,7 +1030,7 @@ written it, and the result can silently be wrong. On NVIDIA and AMD GPUs,
 every cross-stream dependency needs an explicit wait.</p>
 </div>
 <h2 id="host-device-copies">Host-device copies<a class="headerlink" href="#host-device-copies" title="Permanent link">&para;</a></h2>
-<p><code>tensor.to("mojo", non_blocking=True)</code>, <code>tensor.to("cpu", non_blocking=True)</code>
+<p><code>tensor.to(device, non_blocking=True)</code>, <code>tensor.to("cpu", non_blocking=True)</code>
 and <code>dst.copy_(src, non_blocking=True)</code> are supported. What
 <code>non_blocking=True</code> does depends on the kind of host memory:</p>
 <table>
@@ -1074,9 +1059,8 @@ and <code>dst.copy_(src, non_blocking=True)</code> are supported. What
   it is asynchronous and needs a wait before you read it.</li>
 <li>A download that has to convert the dtype or change the memory layout on the
   CPU completes before it returns.</li>
-<li>Pinned memory belongs to the mojo device that was current when it was
-  pinned. Copies between it and another mojo device treat it as pageable
-  memory.</li>
+<li>Pinned memory belongs to the device that was current when it was pinned.
+  Copies between it and another device treat it as pageable memory.</li>
 <li>Without <code>non_blocking=True</code>, you can read or reuse the host tensor as soon
   as the call returns.</li>
 </ul>
@@ -1086,9 +1070,9 @@ and <code>dst.copy_(src, non_blocking=True)</code> are supported. What
 also uses. If you run a CUDA build of PyTorch on a machine with a CUDA
 GPU, factory functions called with <code>pin_memory=True</code>, such as
 <code>torch.empty(..., pin_memory=True)</code>, allocate CUDA's pinned memory
-instead. The mojo device treats that memory like pageable memory: copies
-are correct, but they are not asynchronous. On a CPU-only build of
-PyTorch, both spellings give mojo pinned memory.</p>
+instead. The backend treats that memory like pageable memory: copies are
+correct, but they are not asynchronous. On a CPU-only build of PyTorch,
+both spellings give the backend's pinned memory.</p>
 </div>
 <h3 id="downloading-without-blocking">Downloading without blocking<a class="headerlink" href="#downloading-without-blocking" title="Permanent link">&para;</a></h3>
 <p>To wait for the copy alone rather than for the whole device, record an event
@@ -1097,18 +1081,19 @@ after it:</p>
 <a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
 <a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>
 <a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
-<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>
-<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span>
-<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>
-<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="n">host</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">&quot;cpu&quot;</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>   <span class="c1"># returns at once, into pinned memory</span>
-<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="n">copied</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
-<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="n">copied</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>                         <span class="c1"># marks the end of the copy on the stream</span>
-<a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="nb">print</span><span class="p">(</span><span class="n">host</span><span class="o">.</span><span class="n">is_pinned</span><span class="p">())</span>                 <span class="c1"># True</span>
-<a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>
-<a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="c1"># ... other CPU work here, while the copy runs ...</span>
-<a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>
-<a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a><span class="n">copied</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>                    <span class="c1"># now `host` holds the data</span>
-<a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a><span class="nb">print</span><span class="p">(</span><span class="n">host</span><span class="p">[:</span><span class="mi">4</span><span class="p">])</span>                         <span class="c1"># tensor([0., 2., 4., 6.])</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_accelerator</span><span class="p">()</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>
+<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="n">host</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">&quot;cpu&quot;</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>   <span class="c1"># returns at once, into pinned memory</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="n">copied</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="n">copied</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>                         <span class="c1"># marks the end of the copy on the stream</span>
+<a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a><span class="nb">print</span><span class="p">(</span><span class="n">host</span><span class="o">.</span><span class="n">is_pinned</span><span class="p">())</span>                 <span class="c1"># True</span>
+<a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a>
+<a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a><span class="c1"># ... other CPU work here, while the copy runs ...</span>
+<a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a>
+<a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a><span class="n">copied</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>                    <span class="c1"># now `host` holds the data</span>
+<a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a><span class="nb">print</span><span class="p">(</span><span class="n">host</span><span class="p">[:</span><span class="mi">4</span><span class="p">])</span>                         <span class="c1"># tensor([0., 2., 4., 6.])</span>
 </code></pre></div>
 <h3 id="overlapping-uploads-with-compute">Overlapping uploads with compute<a class="headerlink" href="#overlapping-uploads-with-compute" title="Permanent link">&para;</a></h3>
 <p>In the usual prefetching pattern, a dedicated copy stream uploads the next
@@ -1117,48 +1102,48 @@ batch while the main stream computes on the current one:</p>
 <a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
 <a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
 <a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
-<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="n">copy_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
-<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="n">weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
-<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>
-<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="c1"># Pinned host memory lets the upload run in the background.</span>
-<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="n">batches</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8192</span><span class="p">,</span> <span class="mi">1024</span><span class="p">)</span><span class="o">.</span><span class="n">pin_memory</span><span class="p">()</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">)]</span>
-<a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_accelerator</span><span class="p">()</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
+<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="n">copy_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="n">weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>
+<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="c1"># Pinned host memory lets the upload run in the background.</span>
+<a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="n">batches</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8192</span><span class="p">,</span> <span class="mi">1024</span><span class="p">)</span><span class="o">.</span><span class="n">pin_memory</span><span class="p">()</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">)]</span>
 <a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>
-<a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="k">def</span><span class="w"> </span><span class="nf">upload</span><span class="p">(</span><span class="n">batch</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a>    <span class="k">with</span> <span class="n">copy_stream</span><span class="p">:</span>
-<a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a>        <span class="k">return</span> <span class="n">batch</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">&quot;mojo&quot;</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a>
+<a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a>
+<a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="k">def</span><span class="w"> </span><span class="nf">upload</span><span class="p">(</span><span class="n">batch</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a>    <span class="k">with</span> <span class="n">copy_stream</span><span class="p">:</span>
+<a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a>        <span class="k">return</span> <span class="n">batch</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a>
-<a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="n">losses</span> <span class="o">=</span> <span class="p">[]</span>
-<a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="n">next_batch</span> <span class="o">=</span> <span class="n">upload</span><span class="p">(</span><span class="n">batches</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-<a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">batches</span><span class="p">)):</span>
-<a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a>    <span class="n">main</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">copy_stream</span><span class="p">)</span>   <span class="c1"># batch i has arrived</span>
-<a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a>    <span class="n">batch</span> <span class="o">=</span> <span class="n">next_batch</span>
-<a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a>    <span class="n">batch</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>       <span class="c1"># allocated on copy_stream, used on main</span>
-<a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a>    <span class="k">if</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">batches</span><span class="p">):</span>
-<a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a>        <span class="n">next_batch</span> <span class="o">=</span> <span class="n">upload</span><span class="p">(</span><span class="n">batches</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">])</span>   <span class="c1"># overlaps with the compute below</span>
-<a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a>    <span class="n">losses</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">batch</span> <span class="o">@</span> <span class="n">weight</span><span class="p">)</span><span class="o">.</span><span class="n">square</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span>
-<a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a>
-<a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a><span class="nb">print</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">losses</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">())</span>
+<a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a>
+<a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="n">losses</span> <span class="o">=</span> <span class="p">[]</span>
+<a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="n">next_batch</span> <span class="o">=</span> <span class="n">upload</span><span class="p">(</span><span class="n">batches</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+<a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a><span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">batches</span><span class="p">)):</span>
+<a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a>    <span class="n">main</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">copy_stream</span><span class="p">)</span>   <span class="c1"># batch i has arrived</span>
+<a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a>    <span class="n">batch</span> <span class="o">=</span> <span class="n">next_batch</span>
+<a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a>    <span class="n">batch</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>       <span class="c1"># allocated on copy_stream, used on main</span>
+<a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a>    <span class="k">if</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">batches</span><span class="p">):</span>
+<a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a>        <span class="n">next_batch</span> <span class="o">=</span> <span class="n">upload</span><span class="p">(</span><span class="n">batches</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">])</span>   <span class="c1"># overlaps with the compute below</span>
+<a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a>    <span class="n">losses</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">batch</span> <span class="o">@</span> <span class="n">weight</span><span class="p">)</span><span class="o">.</span><span class="n">square</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span>
+<a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a>
+<a id="__codelineno-5-30" name="__codelineno-5-30" href="#__codelineno-5-30"></a><span class="nb">print</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">losses</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">())</span>
 </code></pre></div>
 <p>Each host batch here is a separate pinned tensor that is never modified. If
 you refill a single pinned buffer instead, wait for its previous upload to
 finish before you write to it again, for example with an event recorded on
 <code>copy_stream</code> after the upload.</p>
 <h2 id="apple-gpus">Apple GPUs<a class="headerlink" href="#apple-gpus" title="Permanent link">&para;</a></h2>
-<p>On Apple GPUs (Metal), the mojo device has a single queue per device, like
+<p>On Apple GPUs (Metal), the backend has a single queue per device, like
 PyTorch's MPS backend:</p>
 <ul>
-<li><code>torch.Stream(device="mojo")</code> returns the default stream, whatever the
-  priority: its <code>stream_id</code> is 0, and it compares equal to
-  <code>torch.mojo.default_stream()</code> and to every other mojo stream of the device.
-  <code>with stream:</code>, <code>set_stream</code>, <code>current_stream</code> and <code>default_stream</code> work.
+<li><code>torch.Stream(device)</code> returns the default stream, whatever the priority:
+  its <code>stream_id</code> is 0, and it compares equal to every other stream of the
+  device. <code>with stream:</code>, <code>torch.accelerator.set_stream</code> and
+  <code>torch.accelerator.current_stream</code> work.
   All the work runs in order on the one queue, so no cross-stream waits are
   needed.</li>
-<li><code>stream.synchronize()</code>, <code>torch.mojo.synchronize()</code> and
-  <code>torch.accelerator.synchronize()</code> work. <code>stream.query()</code> waits for the
+<li><code>stream.synchronize()</code> and <code>torch.accelerator.synchronize()</code> work. <code>stream.query()</code> waits for the
   queue to finish and then returns <code>True</code>.</li>
 <li><code>tensor.record_stream(stream)</code> works.</li>
 <li>Host-to-device copies complete before they return, even with
@@ -1172,34 +1157,32 @@ PyTorch's MPS backend:</p>
 </ul>
 <p>For code that runs on every GPU, skip the wait when the two streams are the
 same stream (they always are on Apple GPUs), and time work with
-<code>torch.mojo.synchronize()</code> and a host clock, as in the
+<code>torch.accelerator.synchronize()</code> and a host clock, as in the
 "Any GPU, including Apple" tab <a href="#timing-gpu-work">above</a>:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
 <a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
 <a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
-<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_accelerator</span><span class="p">()</span>
 <a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>
-<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="k">def</span><span class="w"> </span><span class="nf">wait_for</span><span class="p">(</span><span class="n">waiter</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">,</span> <span class="n">producer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
-<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>    <span class="c1"># On Apple GPUs every stream is the default stream: the two compare</span>
-<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>    <span class="c1"># equal, the queue is already in order, and wait_stream() would raise.</span>
-<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>    <span class="k">if</span> <span class="n">waiter</span> <span class="o">!=</span> <span class="n">producer</span><span class="p">:</span>
-<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>        <span class="n">waiter</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">producer</span><span class="p">)</span>
-<a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="k">def</span><span class="w"> </span><span class="nf">wait_for</span><span class="p">(</span><span class="n">waiter</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">,</span> <span class="n">producer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>    <span class="c1"># On Apple GPUs every stream is the default stream: the two compare</span>
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>    <span class="c1"># equal, the queue is already in order, and wait_stream() would raise.</span>
+<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>    <span class="k">if</span> <span class="n">waiter</span> <span class="o">!=</span> <span class="n">producer</span><span class="p">:</span>
+<a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>        <span class="n">waiter</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">producer</span><span class="p">)</span>
 <a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>
-<a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
-<a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="n">side</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
-<a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
-<a id="__codelineno-6-17" name="__codelineno-6-17" href="#__codelineno-6-17"></a>
-<a id="__codelineno-6-18" name="__codelineno-6-18" href="#__codelineno-6-18"></a><span class="n">wait_for</span><span class="p">(</span><span class="n">side</span><span class="p">,</span> <span class="n">main</span><span class="p">)</span>
-<a id="__codelineno-6-19" name="__codelineno-6-19" href="#__codelineno-6-19"></a><span class="k">with</span> <span class="n">side</span><span class="p">:</span>
-<a id="__codelineno-6-20" name="__codelineno-6-20" href="#__codelineno-6-20"></a>    <span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
-<a id="__codelineno-6-21" name="__codelineno-6-21" href="#__codelineno-6-21"></a><span class="n">wait_for</span><span class="p">(</span><span class="n">main</span><span class="p">,</span> <span class="n">side</span><span class="p">)</span>
-<a id="__codelineno-6-22" name="__codelineno-6-22" href="#__codelineno-6-22"></a><span class="nb">print</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">y</span><span class="o">.</span><span class="n">cpu</span><span class="p">(),</span> <span class="n">x</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span> <span class="o">*</span> <span class="mi">2</span><span class="p">))</span>           <span class="c1"># True</span>
-<a id="__codelineno-6-23" name="__codelineno-6-23" href="#__codelineno-6-23"></a><span class="nb">print</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">mojo</span><span class="o">.</span><span class="n">get_device_properties</span><span class="p">()</span><span class="o">.</span><span class="n">api</span><span class="p">)</span>      <span class="c1"># &quot;cuda&quot;, &quot;hip&quot; or &quot;metal&quot;</span>
+<a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a>
+<a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
+<a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a><span class="n">side</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-6-17" name="__codelineno-6-17" href="#__codelineno-6-17"></a><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-6-18" name="__codelineno-6-18" href="#__codelineno-6-18"></a>
+<a id="__codelineno-6-19" name="__codelineno-6-19" href="#__codelineno-6-19"></a><span class="n">wait_for</span><span class="p">(</span><span class="n">side</span><span class="p">,</span> <span class="n">main</span><span class="p">)</span>
+<a id="__codelineno-6-20" name="__codelineno-6-20" href="#__codelineno-6-20"></a><span class="k">with</span> <span class="n">side</span><span class="p">:</span>
+<a id="__codelineno-6-21" name="__codelineno-6-21" href="#__codelineno-6-21"></a>    <span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
+<a id="__codelineno-6-22" name="__codelineno-6-22" href="#__codelineno-6-22"></a><span class="n">wait_for</span><span class="p">(</span><span class="n">main</span><span class="p">,</span> <span class="n">side</span><span class="p">)</span>
+<a id="__codelineno-6-23" name="__codelineno-6-23" href="#__codelineno-6-23"></a><span class="nb">print</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">y</span><span class="o">.</span><span class="n">cpu</span><span class="p">(),</span> <span class="n">x</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span> <span class="o">*</span> <span class="mi">2</span><span class="p">))</span>           <span class="c1"># True</span>
 </code></pre></div>
-<p>If you need to branch explicitly, <code>torch.mojo.get_device_properties().api</code>
-tells you which kind of GPU you are on.</p>
 <h2 id="not-supported">Not supported<a class="headerlink" href="#not-supported" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Interprocess events: <code>torch.Event(interprocess=True)</code> is accepted but

@@ -460,17 +460,6 @@
   
 </li>
         
-          <li class="md-nav__item">
-  <a href="#one-script-for-cuda-and-mojo" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        One script for CUDA and mojo
-      
-    </span>
-  </a>
-  
-</li>
-        
       </ul>
     </nav>
   
@@ -715,17 +704,6 @@
   
 </li>
         
-          <li class="md-nav__item">
-  <a href="#one-script-for-cuda-and-mojo" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        One script for CUDA and mojo
-      
-    </span>
-  </a>
-  
-</li>
-        
       </ul>
     </nav>
   
@@ -912,13 +890,13 @@
 
 
 <h1 id="distributed-training">Distributed training<a class="headerlink" href="#distributed-training" title="Permanent link">&para;</a></h1>
-<p>The <code>mojo</code> device has its own <code>torch.distributed</code> backend, also called
-<code>"mojo"</code>, which runs collectives on mojo tensors through the GPU vendor's
-collective library: NCCL on NVIDIA and RCCL on AMD. A DDP or FSDP2 script
-written for CUDA needs only a few changed lines, and you launch it with
+<p>Registering the backend also registers a <code>torch.distributed</code> backend for
+the accelerator, which runs collectives through the GPU vendor's collective
+library: NCCL on NVIDIA and RCCL on AMD. A DDP or FSDP2 script written against
+<code>torch.accelerator</code> needs only its setup lines, and you launch it with
 <code>torchrun</code> as usual. You don't need a CUDA or ROCm build of PyTorch.</p>
 <p>Read <a href="../accelerator_api/">Accelerator API</a> first if you don't yet know how to
-get a tensor onto the device.</p>
+get a tensor onto the accelerator.</p>
 <h2 id="what-is-supported">What is supported<a class="headerlink" href="#what-is-supported" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -957,8 +935,8 @@ get a tensor onto the device.</p>
   nodes are aarch64, for example), <code>init_process_group</code> raises
   <code>NotImplementedError</code>.</li>
 <li>The multi-GPU runs behind this page used H100 (NVIDIA) and MI300A (AMD)
-  GPUs, in eager mode. <code>torch.compile</code> isn't supported on the mojo device yet
-  (see the <a href="../">home page</a>).</li>
+  GPUs, in eager mode. <code>torch.compile</code> isn't supported on the accelerator
+  yet (see the <a href="../">home page</a>).</li>
 <li>Tensor and pipeline parallelism, 2-D device meshes (HSDP), FSDP1
   (<code>FullyShardedDataParallel</code>), and DDP's <code>find_unused_parameters=True</code> and
   <code>static_graph=True</code> are not covered by tests yet.</li>
@@ -1035,9 +1013,9 @@ when <code>init_process_group</code> runs:</p>
 <a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a>
 <a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a>
 <a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>    <span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
-<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a>    <span class="n">rank</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_rank</span><span class="p">()</span>
-<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a>    <span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>    <span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_accelerator</span><span class="p">()</span>
+<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a>    <span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="n">dist</span><span class="o">.</span><span class="n">get_default_backend_for_device</span><span class="p">(</span><span class="n">device</span><span class="p">))</span>
+<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a>    <span class="n">rank</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_rank</span><span class="p">()</span>
 <a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a>
 <a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a>    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 <a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a>    <span class="n">model</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Sequential</span><span class="p">(</span>
@@ -1080,37 +1058,40 @@ when <code>init_process_group</code> runs:</p>
 <ol>
 <li><code>use_local_rank_gpu()</code> runs first. It sets the vendor's visibility
    variable so that each torchrun worker sees exactly one GPU, chosen by
-   <code>LOCAL_RANK</code>; <code>"mojo"</code> (that is, <code>mojo:0</code>) is then always that worker's
-   GPU. If a launcher such as SLURM already exported a list of several GPUs
+   <code>LOCAL_RANK</code>; <code>device</code> (index 0) is then always that worker's GPU. If a
+   launcher such as SLURM already exported a list of several GPUs
    (<code>CUDA_VISIBLE_DEVICES=0,...,7</code>, or <code>ROCR_VISIBLE_DEVICES</code> on AMD), each
    worker keeps only its own entry, and a list with a single entry is left
    alone. Outside torchrun (no <code>LOCAL_RANK</code>), the call does nothing.
    Call it before <code>register_mojo_devices()</code> and before anything touches the
    GPU: the GPU list is read only once per process, so a later call has no
    effect.</li>
-<li><code>register_mojo_devices()</code> registers both the device and the <code>"mojo"</code>
+<li><code>register_mojo_devices()</code> registers both the accelerator and its
    process-group backend.</li>
-<li><code>init_process_group(backend="mojo")</code> replaces <code>"nccl"</code>, and creates the
-   communicator right away, on the current GPU. The same group also handles
+<li><code>dist.get_default_backend_for_device(device)</code> replaces <code>"nccl"</code>: it
+   returns the backend registered for the accelerator. The process group
+   creates its communicator right away, on the current GPU. It also handles
    CPU tensors (object collectives, CPU <code>all_reduce</code>) through a private gloo
-   group, so you don't need a <code>"cpu:gloo,..."</code> string.
-   <code>init_process_group(device_id=0)</code> and
-   <code>init_process_group(device_id=torch.device("mojo", 0))</code> work too.</li>
+   group, so you don't need a <code>"cpu:gloo,..."</code> string.</li>
 <li><code>DDP(model)</code> takes no <code>device_ids</code>. Move your inputs to the device
    yourself. DDP's default <code>broadcast_buffers=True</code> works, and if your
    buffers never change (a causal mask, for example), passing
    <code>broadcast_buffers=False</code> saves one broadcast per forward pass.</li>
 <li>Checkpoints are saved from CPU copies, because calling <code>torch.save</code>
-   directly on mojo tensors raises <code>NotImplementedError</code>.</li>
+   directly on accelerator tensors raises <code>NotImplementedError</code>.</li>
 </ol>
+<p>To run the same file on stock CUDA, remove the <code>register_mojo_devices()</code>
+line: <code>current_accelerator()</code> is then <code>cuda</code>, the default backend is <code>nccl</code>,
+and <code>use_local_rank_gpu()</code> gives each rank one GPU there too.</p>
 <p>The first run compiles each kernel the first time it's used, so the first
 steps are slow. Later runs load the kernels from the on-disk cache.</p>
 <h3 id="porting-an-existing-cuda-script">Porting an existing CUDA script<a class="headerlink" href="#porting-an-existing-cuda-script" title="Permanent link">&para;</a></h3>
+<p>In this table, <code>device</code> is <code>torch.accelerator.current_accelerator()</code>.</p>
 <table>
 <thead>
 <tr>
 <th>Stock PyTorch on CUDA</th>
-<th>mojo device</th>
+<th>Device-agnostic</th>
 </tr>
 </thead>
 <tbody>
@@ -1120,11 +1101,11 @@ steps are slow. Later runs load the kernels from the on-disk cache.</p>
 </tr>
 <tr>
 <td><code>dist.init_process_group("nccl")</code></td>
-<td><code>register_mojo_devices()</code>, then <code>dist.init_process_group("mojo")</code></td>
+<td><code>dist.init_process_group(dist.get_default_backend_for_device(device))</code></td>
 </tr>
 <tr>
 <td><code>model.to(f"cuda:{local_rank}")</code></td>
-<td><code>model.to("mojo")</code></td>
+<td><code>model.to(device)</code></td>
 </tr>
 <tr>
 <td><code>DDP(model, device_ids=[local_rank])</code></td>
@@ -1132,11 +1113,11 @@ steps are slow. Later runs load the kernels from the on-disk cache.</p>
 </tr>
 <tr>
 <td><code>torch.autocast("cuda", dtype=torch.bfloat16)</code></td>
-<td><code>torch.autocast("mojo", dtype=torch.bfloat16)</code></td>
+<td><code>torch.autocast(device.type, dtype=torch.bfloat16)</code></td>
 </tr>
 <tr>
 <td><code>torch.cuda.manual_seed_all(seed + rank)</code></td>
-<td><code>torch.mojo.manual_seed_all(seed + rank)</code></td>
+<td><code>torch.manual_seed(seed + rank)</code>, which seeds the CPU too</td>
 </tr>
 <tr>
 <td><code>torch.cuda.synchronize()</code></td>
@@ -1148,41 +1129,20 @@ steps are slow. Later runs load the kernels from the on-disk cache.</p>
 complete example with bf16 autocast, gradient clipping and evaluation, see
 the repository's nanoGPT DDP demo,
 <a href="https://github.com/gabrieldemarmiesse/torch-mojo-backend/blob/main/demo_scripts/nanogpt_ddp.py"><code>demo_scripts/nanogpt_ddp.py</code></a>.</p>
-<h3 id="one-script-for-cuda-and-mojo">One script for CUDA and mojo<a class="headerlink" href="#one-script-for-cuda-and-mojo" title="Permanent link">&para;</a></h3>
-<p>If the rest of the script only refers to <code>device</code>, the same file runs on
-stock CUDA as well:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch_mojo_backend.distributed</span><span class="w"> </span><span class="kn">import</span> <span class="n">use_local_rank_gpu</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="n">use_local_rank_gpu</span><span class="p">()</span>
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
-<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>
-<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
-<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>
-<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>  <span class="c1"># remove this line to use stock CUDA</span>
-<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>
-<a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_accelerator</span><span class="p">()</span>  <span class="c1"># mojo, or cuda without the line above</span>
-<a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="n">dist</span><span class="o">.</span><span class="n">get_default_backend_for_device</span><span class="p">(</span><span class="n">device</span><span class="p">))</span>  <span class="c1"># &quot;mojo&quot; or &quot;nccl&quot;</span>
-</code></pre></div>
-<p>On stock CUDA, <code>use_local_rank_gpu()</code> also leaves each rank one visible GPU,
-so <code>cuda</code> is the right device there too. For autocast, write
-<code>torch.autocast(device.type, ...)</code>. <a href="../accelerator_api/">Accelerator API</a>
-covers <code>torch.accelerator</code> in more detail.</p>
 <h2 id="fsdp2">FSDP2<a class="headerlink" href="#fsdp2" title="Permanent link">&para;</a></h2>
-<p>Use PyTorch's <code>fully_shard</code> with a mojo device mesh. The usual FSDP2 rules
-apply: shard the blocks before the root module, and create the optimizer
-after sharding.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.device_mesh</span><span class="w"> </span><span class="kn">import</span> <span class="n">init_device_mesh</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.fsdp</span><span class="w"> </span><span class="kn">import</span> <span class="n">fully_shard</span>
-<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
-<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="c1"># after use_local_rank_gpu(), register_mojo_devices() and init_process_group(&quot;mojo&quot;)</span>
-<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="n">mesh</span> <span class="o">=</span> <span class="n">init_device_mesh</span><span class="p">(</span><span class="s2">&quot;mojo&quot;</span><span class="p">,</span> <span class="p">(</span><span class="n">dist</span><span class="o">.</span><span class="n">get_world_size</span><span class="p">(),))</span>
-<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="n">model</span> <span class="o">=</span> <span class="n">MyModel</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
-<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">blocks</span><span class="p">:</span>
-<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>    <span class="n">fully_shard</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">mesh</span><span class="o">=</span><span class="n">mesh</span><span class="p">)</span>
-<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="n">fully_shard</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">mesh</span><span class="o">=</span><span class="n">mesh</span><span class="p">)</span>
-<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="n">optimizer</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">1e-4</span><span class="p">,</span> <span class="n">foreach</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<p>Use PyTorch's <code>fully_shard</code> with a device mesh on the accelerator. The
+usual FSDP2 rules apply: shard the blocks before the root module, and create
+the optimizer after sharding.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.device_mesh</span><span class="w"> </span><span class="kn">import</span> <span class="n">init_device_mesh</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.fsdp</span><span class="w"> </span><span class="kn">import</span> <span class="n">fully_shard</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="c1"># after the setup lines of train_ddp.py, device and init_process_group included</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="n">mesh</span> <span class="o">=</span> <span class="n">init_device_mesh</span><span class="p">(</span><span class="n">device</span><span class="o">.</span><span class="n">type</span><span class="p">,</span> <span class="p">(</span><span class="n">dist</span><span class="o">.</span><span class="n">get_world_size</span><span class="p">(),))</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="n">model</span> <span class="o">=</span> <span class="n">MyModel</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">blocks</span><span class="p">:</span>
+<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="n">fully_shard</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">mesh</span><span class="o">=</span><span class="n">mesh</span><span class="p">)</span>
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="n">fully_shard</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">mesh</span><span class="o">=</span><span class="n">mesh</span><span class="p">)</span>
+<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="n">optimizer</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">1e-4</span><span class="p">,</span> <span class="n">foreach</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 </code></pre></div>
 <ul>
 <li>The multi-GPU tests use <code>foreach=False</code> for the optimizer, as above.</li>
@@ -1190,14 +1150,15 @@ after sharding.</p>
   restore a sharded model together with its optimizer state.</li>
 <li>For bf16 training, <code>MixedPrecisionPolicy(param_dtype=torch.bfloat16,
   reduce_dtype=torch.float32)</code> on the blocks works. Leave the module that
-  owns the token embedding (usually the root) in fp32, because the device's
+  owns the token embedding (usually the root) in fp32, because the backend's
   embedding backward currently needs fp32 gradients.</li>
 <li><a href="https://github.com/gabrieldemarmiesse/torch-mojo-backend/blob/main/demo_scripts/gpt2_fsdp2.py"><code>demo_scripts/gpt2_fsdp2.py</code></a>
   trains GPT-2 124M or 1.5B (XL) this way, with no download needed.</li>
 </ul>
 <h2 id="collectives">Collectives<a class="headerlink" href="#collectives" title="Permanent link">&para;</a></h2>
-<p>All tensors in one call must be on the same mojo device, or all on the
-CPU. The table covers mojo tensors; CPU tensors always go through gloo.</p>
+<p>All tensors in one call must be on the same accelerator device, or all on
+the CPU. The table covers accelerator tensors; CPU tensors always go through
+gloo.</p>
 <table>
 <thead>
 <tr>
@@ -1290,18 +1251,18 @@ found.</p>
 <h2 id="multi-node">Multi-node<a class="headerlink" href="#multi-node" title="Permanent link">&para;</a></h2>
 <p>Run one <code>torchrun</code> per node, with the same rendezvous arguments on every
 node:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">    </span>--rdzv-backend<span class="o">=</span>c10d<span class="w"> </span>--rdzv-endpoint<span class="o">=</span><span class="nv">$MASTER_ADDR</span>:29500<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">    </span>--rdzv-id<span class="o">=</span><span class="nv">$JOB_ID</span><span class="w"> </span>train_ddp.py
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">    </span>--rdzv-backend<span class="o">=</span>c10d<span class="w"> </span>--rdzv-endpoint<span class="o">=</span><span class="nv">$MASTER_ADDR</span>:29500<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">    </span>--rdzv-id<span class="o">=</span><span class="nv">$JOB_ID</span><span class="w"> </span>train_ddp.py
 </code></pre></div>
 <p>Under SLURM, start one task per node and let torchrun start the per-GPU
 workers:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="ch">#!/bin/bash</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="c1">#SBATCH --nodes=2 --ntasks-per-node=1 --gpus-per-node=8 --exclusive</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="nv">MASTER_ADDR</span><span class="o">=</span><span class="k">$(</span>scontrol<span class="w"> </span>show<span class="w"> </span>hostnames<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_NODELIST</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="k">)</span>
-<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>srun<span class="w"> </span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_NUM_NODES</span><span class="s2">&quot;</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">    </span>--rdzv-backend<span class="o">=</span>c10d<span class="w"> </span>--rdzv-endpoint<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$MASTER_ADDR</span><span class="s2">:29500&quot;</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="w">    </span>--rdzv-id<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_ID</span><span class="s2">&quot;</span><span class="w"> </span>train_ddp.py
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="ch">#!/bin/bash</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="c1">#SBATCH --nodes=2 --ntasks-per-node=1 --gpus-per-node=8 --exclusive</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="nv">MASTER_ADDR</span><span class="o">=</span><span class="k">$(</span>scontrol<span class="w"> </span>show<span class="w"> </span>hostnames<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_NODELIST</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="k">)</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>srun<span class="w"> </span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_NUM_NODES</span><span class="s2">&quot;</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">    </span>--rdzv-backend<span class="o">=</span>c10d<span class="w"> </span>--rdzv-endpoint<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$MASTER_ADDR</span><span class="s2">:29500&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">    </span>--rdzv-id<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_ID</span><span class="s2">&quot;</span><span class="w"> </span>train_ddp.py
 </code></pre></div>
 <p>The backend needs no extra setup for multi-node runs: communicators bootstrap
 through the torchrun rendezvous, and <code>use_local_rank_gpu()</code> splits the GPU
@@ -1341,7 +1302,7 @@ same; only the loaded library changes, and the <code>[TRACE] collectives via ...
 line then names <code>libmojoccl.so</code>. The library is compiled the first time you
 use it, which takes about a minute, and is then cached with the kernels.
 NCCL/RCCL remain the default.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="nv">TORCH_MOJO_BACKEND_CCL</span><span class="o">=</span>mojo<span class="w"> </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span>train_ddp.py
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nv">TORCH_MOJO_BACKEND_CCL</span><span class="o">=</span>mojo<span class="w"> </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span>train_ddp.py
 </code></pre></div>
 <p>Set the variable on every rank of every node. Consider Mojo collectives
 when NCCL or RCCL isn't available, or when you want to try a collective
@@ -1521,7 +1482,7 @@ collective raises, so the run fails instead of hanging.</p>
 <h3 id="valueerror-the-mojo-distributed-backend-handles-mojo-and-cpu-tensors"><code>ValueError: the mojo distributed backend handles mojo and cpu tensors</code><a class="headerlink" href="#valueerror-the-mojo-distributed-backend-handles-mojo-and-cpu-tensors" title="Permanent link">&para;</a></h3>
 <p>A tensor from another device, such as <code>cuda</code>, reached a collective. With a
 CUDA build of torch installed, check that the model and inputs went to
-<code>"mojo"</code> (or to <code>torch.accelerator.current_accelerator()</code>), not to <code>"cuda"</code>.</p>
+<code>torch.accelerator.current_accelerator()</code>, not to a hard-coded <code>"cuda"</code>.</p>
 <h3 id="notimplementederror-from-torchsave"><code>NotImplementedError</code> from <code>torch.save</code><a class="headerlink" href="#notimplementederror-from-torchsave" title="Permanent link">&para;</a></h3>
 <p>Mojo tensors can't be serialised directly. Copy them to the CPU first:
 <code>{k: v.cpu() for k, v in model.state_dict().items()}</code>. For FSDP2 sharded
