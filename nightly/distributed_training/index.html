@@ -1292,6 +1292,8 @@ FSDP2, up to two nodes over InfiniBand) and on MI300A (DDP, up to two nodes
 over Slingshot).</p>
 <p>Limitations:</p>
 <ul>
+<li>Across nodes on AMD, only MI300A has run them: multi-node Mojo collectives
+  on other AMD GPUs are untested.</li>
 <li><code>all_reduce</code>, <code>broadcast</code>, <code>all_gather</code>, <code>reduce_scatter</code>, <code>barrier</code> and
   the object collectives work. <code>reduce</code>, point-to-point, <code>all_to_all</code>,
   <code>gather</code> and <code>scatter</code> raise. See the <a href="#collectives">Collectives</a> table.</li>
