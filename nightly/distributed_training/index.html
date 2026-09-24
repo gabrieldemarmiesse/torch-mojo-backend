@@ -1,0 +1,1620 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A PyTorch backend powered by Mojo kernels and Modular's MAX framework">
+      
+      
+      
+        <link rel="canonical" href="https://gabrieldemarmiesse.github.io/torch-mojo-backend/stable/distributed_training/">
+      
+      
+        <link rel="prev" href="../streams_and_events/">
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Distributed training - Torch Mojo Backend</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#distributed-training" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+          <aside class="md-banner md-banner--warning">
+            <div class="md-banner__inner md-grid md-typeset">
+              
+  You are reading the nightly documentation, built from the latest commit on
+  main.
+  <a href="../..">
+    <strong>Read the documentation of the latest release instead.</strong>
+  </a>
+
+            </div>
+            <script>var el=document.querySelector("[data-md-component=outdated]"),base=new URL(".."),outdated=__md_get("__outdated",sessionStorage,base);!0===outdated&&el&&(el.hidden=!1)</script>
+          </aside>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Torch Mojo Backend" class="md-header__button md-logo" aria-label="Torch Mojo Backend" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Torch Mojo Backend
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Distributed training
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/gabrieldemarmiesse/torch-mojo-backend" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    gabrieldemarmiesse/torch-mojo-backend
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Torch Mojo Backend" class="md-nav__button md-logo" aria-label="Torch Mojo Backend" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Torch Mojo Backend
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/gabrieldemarmiesse/torch-mojo-backend" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    gabrieldemarmiesse/torch-mojo-backend
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../accelerator_api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Accelerator API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../streams_and_events/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Streams and events
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Distributed training
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Distributed training
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#what-is-supported" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What is supported
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#installing-the-collective-library" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Installing the collective library
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#a-minimal-ddp-script" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A minimal DDP script
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="A minimal DDP script">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#porting-an-existing-cuda-script" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Porting an existing CUDA script
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#one-script-for-cuda-and-mojo" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One script for CUDA and mojo
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#fsdp2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        FSDP2
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#collectives" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Collectives
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#multi-node" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Multi-node
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#mojo-collectives-experimental" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Mojo collectives (experimental)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#environment-variables" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Environment variables
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#troubleshooting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Troubleshooting
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#no-ncclrccl-library-found" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        no NCCL/RCCL library found
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#nccl-fails-to-initialise-on-an-older-driver" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        NCCL fails to initialise on an older driver
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#all-ranks-use-the-same-gpu-or-communicator-creation-fails" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        All ranks use the same GPU, or communicator creation fails
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a-run-hangs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A run hangs
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-first-training-step-takes-minutes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The first training step takes minutes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#valueerror-the-mojo-distributed-backend-handles-mojo-and-cpu-tensors" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ValueError: the mojo distributed backend handles mojo and cpu tensors
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#notimplementederror-from-torchsave" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        NotImplementedError from torch.save
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#time-stats-are-currently-only-collected-for-cpu-and-cuda-devices" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Time stats are currently only collected for CPU and CUDA devices
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#what-is-supported" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What is supported
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#installing-the-collective-library" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Installing the collective library
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#a-minimal-ddp-script" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A minimal DDP script
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="A minimal DDP script">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#porting-an-existing-cuda-script" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Porting an existing CUDA script
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#one-script-for-cuda-and-mojo" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One script for CUDA and mojo
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#fsdp2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        FSDP2
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#collectives" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Collectives
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#multi-node" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Multi-node
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#mojo-collectives-experimental" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Mojo collectives (experimental)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#environment-variables" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Environment variables
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#troubleshooting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Troubleshooting
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#no-ncclrccl-library-found" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        no NCCL/RCCL library found
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#nccl-fails-to-initialise-on-an-older-driver" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        NCCL fails to initialise on an older driver
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#all-ranks-use-the-same-gpu-or-communicator-creation-fails" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        All ranks use the same GPU, or communicator creation fails
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a-run-hangs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A run hangs
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-first-training-step-takes-minutes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The first training step takes minutes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#valueerror-the-mojo-distributed-backend-handles-mojo-and-cpu-tensors" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ValueError: the mojo distributed backend handles mojo and cpu tensors
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#notimplementederror-from-torchsave" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        NotImplementedError from torch.save
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#time-stats-are-currently-only-collected-for-cpu-and-cuda-devices" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Time stats are currently only collected for CPU and CUDA devices
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="distributed-training">Distributed training<a class="headerlink" href="#distributed-training" title="Permanent link">&para;</a></h1>
+<p>The <code>mojo</code> device has its own <code>torch.distributed</code> backend, also called
+<code>"mojo"</code>, which runs collectives on mojo tensors through the GPU vendor's
+collective library: NCCL on NVIDIA and RCCL on AMD. A DDP or FSDP2 script
+written for CUDA needs only a few changed lines, and you launch it with
+<code>torchrun</code> as usual. You don't need a CUDA or ROCm build of PyTorch.</p>
+<p>Read <a href="../accelerator_api/">Accelerator API</a> first if you don't yet know how to
+get a tensor onto the device.</p>
+<h2 id="what-is-supported">What is supported<a class="headerlink" href="#what-is-supported" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>NVIDIA</th>
+<th>AMD</th>
+<th>Apple</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Collective library</td>
+<td>NCCL</td>
+<td>RCCL (from your ROCm install)</td>
+<td>none</td>
+</tr>
+<tr>
+<td>DDP (<code>DistributedDataParallel</code>)</td>
+<td>single node and multi-node</td>
+<td>single node and multi-node</td>
+<td>not supported</td>
+</tr>
+<tr>
+<td>FSDP2 (<code>fully_shard</code>)</td>
+<td>single node and multi-node</td>
+<td>not validated yet</td>
+<td>not supported</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li>Run one process per GPU and launch with <code>torchrun</code>, either directly or
+  under SLURM. Every node needs the same setup.</li>
+<li>GPU collectives need Linux on x86-64. On other architectures (Grace Hopper
+  nodes are aarch64, for example), <code>init_process_group</code> raises
+  <code>NotImplementedError</code>.</li>
+<li>The multi-GPU runs behind this page used H100 (NVIDIA) and MI300A (AMD)
+  GPUs, in eager mode. <code>torch.compile</code> isn't supported on the mojo device yet
+  (see the <a href="../">home page</a>).</li>
+<li>Tensor and pipeline parallelism, 2-D device meshes (HSDP), FSDP1
+  (<code>FullyShardedDataParallel</code>), and DDP's <code>find_unused_parameters=True</code> and
+  <code>static_graph=True</code> are not covered by tests yet.</li>
+</ul>
+<h2 id="installing-the-collective-library">Installing the collective library<a class="headerlink" href="#installing-the-collective-library" title="Permanent link">&para;</a></h2>
+<p>Install the package itself as described in
+<a href="../#installation">Installation</a>. Distributed training also needs the
+vendor's collective library on every node:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:2"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">NVIDIA</label><label for="__tabbed_1_2">AMD</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<p>The backend loads <code>libnccl.so.2</code> from the first of these that exists:</p>
+<ol>
+<li>the path in <code>TORCH_MOJO_BACKEND_NCCL_LIB</code>;</li>
+<li>an installed NCCL wheel (<code>nvidia-nccl-cu12</code> or <code>nvidia-nccl-cu13</code>);</li>
+<li><code>libnccl.so.2</code> on the system library path.</li>
+</ol>
+<p>The CUDA builds of torch on PyPI already depend on one of these NCCL
+wheels, so they bring NCCL with them. With the CPU build of torch,
+install NCCL yourself:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>pip<span class="w"> </span>install<span class="w"> </span>git+https://github.com/gabrieldemarmiesse/torch-mojo-backend
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">&quot;nvidia-nccl-cu12&gt;=2.27&quot;</span>
+</code></pre></div>
+<p>NCCL has to work with your NVIDIA driver: the CUDA 13 wheel
+(<code>nvidia-nccl-cu13</code>) needs driver 580 or newer.</p>
+</div>
+<div class="tabbed-block">
+<p>RCCL ships with ROCm, so there is nothing extra to install. The backend
+loads <code>librccl.so.1</code> from the first of these that exists:</p>
+<ol>
+<li>the path in <code>TORCH_MOJO_BACKEND_RCCL_LIB</code>;</li>
+<li>the ROCm install whose HIP runtime is already loaded in the process;</li>
+<li><code>$ROCM_PATH/lib</code>, then <code>/opt/rocm/lib</code>;</li>
+<li><code>librccl.so.1</code> on the system library path.</li>
+</ol>
+<p>Using the RCCL from the same ROCm as the HIP runtime keeps a single HIP
+runtime in the process. If your ROCm isn't where the backend looks (for
+example, a cluster module), set <code>ROCM_PATH</code> for every rank.</p>
+<p>Install the CPU build of torch:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>pip<span class="w"> </span>install<span class="w"> </span>torch<span class="w"> </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/cpu
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>pip<span class="w"> </span>install<span class="w"> </span>git+https://github.com/gabrieldemarmiesse/torch-mojo-backend
+</code></pre></div>
+<p>The other builds cause problems on AMD:</p>
+<ul>
+<li>The default PyPI build of torch is a CUDA build. It loads gigabytes of
+  NVIDIA libraries, and the HIP runtime rescans all of them every time it
+  loads a kernel, so each first-use kernel load takes about 10 times
+  longer.</li>
+<li>A ROCm build of torch loads its own HIP runtime next to the one this
+  backend uses, and RCCL can't work with buffers from two runtimes.</li>
+</ul>
+<p><code>register_mojo_devices()</code> warns you if it detects either build.</p>
+</div>
+</div>
+</div>
+<p>To see which library a run loaded, check stderr. Each rank prints one line
+when <code>init_process_group</code> runs:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>[TRACE] collectives via /.../site-packages/nvidia/nccl/lib/libnccl.so.2 (nccl version 23102)
+</code></pre></div>
+<p>The number is the library's integer version code (23102 means 2.31.2). Set
+<code>TORCH_MOJO_BACKEND_TRACE=0</code> to hide this line and the kernel build timings.</p>
+<h2 id="a-minimal-ddp-script">A minimal DDP script<a class="headerlink" href="#a-minimal-ddp-script" title="Permanent link">&para;</a></h2>
+<div class="highlight"><span class="filename">train_ddp.py</span><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch_mojo_backend.distributed</span><span class="w"> </span><span class="kn">import</span> <span class="n">use_local_rank_gpu</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="n">use_local_rank_gpu</span><span class="p">()</span>  <span class="c1"># first: give this process its own GPU</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.nn.parallel</span><span class="w"> </span><span class="kn">import</span> <span class="n">DistributedDataParallel</span> <span class="k">as</span> <span class="n">DDP</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
+<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a>
+<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a>
+<a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>    <span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a>    <span class="n">rank</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_rank</span><span class="p">()</span>
+<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a>    <span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a>
+<a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a>    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a>    <span class="n">model</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Sequential</span><span class="p">(</span>
+<a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a>        <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">32</span><span class="p">,</span> <span class="mi">128</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">GELU</span><span class="p">(),</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">128</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<a id="__codelineno-3-22" name="__codelineno-3-22" href="#__codelineno-3-22"></a>    <span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-3-23" name="__codelineno-3-23" href="#__codelineno-3-23"></a>    <span class="n">model</span> <span class="o">=</span> <span class="n">DDP</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+<a id="__codelineno-3-24" name="__codelineno-3-24" href="#__codelineno-3-24"></a>    <span class="n">optimizer</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">1e-3</span><span class="p">)</span>
+<a id="__codelineno-3-25" name="__codelineno-3-25" href="#__codelineno-3-25"></a>
+<a id="__codelineno-3-26" name="__codelineno-3-26" href="#__codelineno-3-26"></a>    <span class="c1"># Each rank draws its own batches.</span>
+<a id="__codelineno-3-27" name="__codelineno-3-27" href="#__codelineno-3-27"></a>    <span class="n">generator</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">()</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">1000</span> <span class="o">+</span> <span class="n">rank</span><span class="p">)</span>
+<a id="__codelineno-3-28" name="__codelineno-3-28" href="#__codelineno-3-28"></a>    <span class="k">for</span> <span class="n">step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">101</span><span class="p">):</span>
+<a id="__codelineno-3-29" name="__codelineno-3-29" href="#__codelineno-3-29"></a>        <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">generator</span><span class="p">)</span>
+<a id="__codelineno-3-30" name="__codelineno-3-30" href="#__codelineno-3-30"></a>        <span class="n">y</span> <span class="o">=</span> <span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">long</span><span class="p">()</span>  <span class="c1"># a toy two-class problem</span>
+<a id="__codelineno-3-31" name="__codelineno-3-31" href="#__codelineno-3-31"></a>        <span class="n">x</span><span class="p">,</span> <span class="n">y</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span> <span class="n">y</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-3-32" name="__codelineno-3-32" href="#__codelineno-3-32"></a>
+<a id="__codelineno-3-33" name="__codelineno-3-33" href="#__codelineno-3-33"></a>        <span class="n">loss</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">cross_entropy</span><span class="p">(</span><span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">y</span><span class="p">)</span>
+<a id="__codelineno-3-34" name="__codelineno-3-34" href="#__codelineno-3-34"></a>        <span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">(</span><span class="n">set_to_none</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-3-35" name="__codelineno-3-35" href="#__codelineno-3-35"></a>        <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>  <span class="c1"># DDP all-reduces the gradients during backward</span>
+<a id="__codelineno-3-36" name="__codelineno-3-36" href="#__codelineno-3-36"></a>        <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<a id="__codelineno-3-37" name="__codelineno-3-37" href="#__codelineno-3-37"></a>
+<a id="__codelineno-3-38" name="__codelineno-3-38" href="#__codelineno-3-38"></a>        <span class="k">if</span> <span class="n">step</span> <span class="o">%</span> <span class="mi">20</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+<a id="__codelineno-3-39" name="__codelineno-3-39" href="#__codelineno-3-39"></a>            <span class="n">mean_loss</span> <span class="o">=</span> <span class="n">loss</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<a id="__codelineno-3-40" name="__codelineno-3-40" href="#__codelineno-3-40"></a>            <span class="n">dist</span><span class="o">.</span><span class="n">all_reduce</span><span class="p">(</span><span class="n">mean_loss</span><span class="p">,</span> <span class="n">op</span><span class="o">=</span><span class="n">dist</span><span class="o">.</span><span class="n">ReduceOp</span><span class="o">.</span><span class="n">AVG</span><span class="p">)</span>
+<a id="__codelineno-3-41" name="__codelineno-3-41" href="#__codelineno-3-41"></a>            <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+<a id="__codelineno-3-42" name="__codelineno-3-42" href="#__codelineno-3-42"></a>                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;step </span><span class="si">{</span><span class="n">step</span><span class="si">:</span><span class="s2">3d</span><span class="si">}</span><span class="s2">  loss </span><span class="si">{</span><span class="n">mean_loss</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<a id="__codelineno-3-43" name="__codelineno-3-43" href="#__codelineno-3-43"></a>
+<a id="__codelineno-3-44" name="__codelineno-3-44" href="#__codelineno-3-44"></a>    <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>  <span class="c1"># torch.save needs CPU tensors</span>
+<a id="__codelineno-3-45" name="__codelineno-3-45" href="#__codelineno-3-45"></a>        <span class="n">state</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">module</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+<a id="__codelineno-3-46" name="__codelineno-3-46" href="#__codelineno-3-46"></a>        <span class="n">torch</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">state</span><span class="p">,</span> <span class="s2">&quot;checkpoint.pt&quot;</span><span class="p">)</span>
+<a id="__codelineno-3-47" name="__codelineno-3-47" href="#__codelineno-3-47"></a>    <span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+<a id="__codelineno-3-48" name="__codelineno-3-48" href="#__codelineno-3-48"></a>
+<a id="__codelineno-3-49" name="__codelineno-3-49" href="#__codelineno-3-49"></a>
+<a id="__codelineno-3-50" name="__codelineno-3-50" href="#__codelineno-3-50"></a><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+<a id="__codelineno-3-51" name="__codelineno-3-51" href="#__codelineno-3-51"></a>    <span class="n">main</span><span class="p">()</span>
+</code></pre></div>
+<p>To run it on every GPU of one machine:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span>train_ddp.py
+</code></pre></div>
+<p>The differences from a CUDA script:</p>
+<ol>
+<li><code>use_local_rank_gpu()</code> runs first. It sets the vendor's visibility
+   variable so that each torchrun worker sees exactly one GPU, chosen by
+   <code>LOCAL_RANK</code>; <code>"mojo"</code> (that is, <code>mojo:0</code>) is then always that worker's
+   GPU. If a launcher such as SLURM already exported a list of several GPUs
+   (<code>CUDA_VISIBLE_DEVICES=0,...,7</code>, or <code>ROCR_VISIBLE_DEVICES</code> on AMD), each
+   worker keeps only its own entry, and a list with a single entry is left
+   alone. Outside torchrun (no <code>LOCAL_RANK</code>), the call does nothing.
+   Call it before <code>register_mojo_devices()</code> and before anything touches the
+   GPU: the GPU list is read only once per process, so a later call has no
+   effect.</li>
+<li><code>register_mojo_devices()</code> registers both the device and the <code>"mojo"</code>
+   process-group backend.</li>
+<li><code>init_process_group(backend="mojo")</code> replaces <code>"nccl"</code>, and creates the
+   communicator right away, on the current GPU. The same group also handles
+   CPU tensors (object collectives, CPU <code>all_reduce</code>) through a private gloo
+   group, so you don't need a <code>"cpu:gloo,..."</code> string.
+   <code>init_process_group(device_id=0)</code> and
+   <code>init_process_group(device_id=torch.device("mojo", 0))</code> work too.</li>
+<li><code>DDP(model)</code> takes no <code>device_ids</code>. Move your inputs to the device
+   yourself. DDP's default <code>broadcast_buffers=True</code> works, and if your
+   buffers never change (a causal mask, for example), passing
+   <code>broadcast_buffers=False</code> saves one broadcast per forward pass.</li>
+<li>Checkpoints are saved from CPU copies, because calling <code>torch.save</code>
+   directly on mojo tensors raises <code>NotImplementedError</code>.</li>
+</ol>
+<p>The first run compiles each kernel the first time it's used, so the first
+steps are slow. Later runs load the kernels from the on-disk cache.</p>
+<h3 id="porting-an-existing-cuda-script">Porting an existing CUDA script<a class="headerlink" href="#porting-an-existing-cuda-script" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Stock PyTorch on CUDA</th>
+<th>mojo device</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>torch.cuda.set_device(local_rank)</code></td>
+<td><code>use_local_rank_gpu()</code> at the top of the script</td>
+</tr>
+<tr>
+<td><code>dist.init_process_group("nccl")</code></td>
+<td><code>register_mojo_devices()</code>, then <code>dist.init_process_group("mojo")</code></td>
+</tr>
+<tr>
+<td><code>model.to(f"cuda:{local_rank}")</code></td>
+<td><code>model.to("mojo")</code></td>
+</tr>
+<tr>
+<td><code>DDP(model, device_ids=[local_rank])</code></td>
+<td><code>DDP(model)</code></td>
+</tr>
+<tr>
+<td><code>torch.autocast("cuda", dtype=torch.bfloat16)</code></td>
+<td><code>torch.autocast("mojo", dtype=torch.bfloat16)</code></td>
+</tr>
+<tr>
+<td><code>torch.cuda.manual_seed_all(seed + rank)</code></td>
+<td><code>torch.mojo.manual_seed_all(seed + rank)</code></td>
+</tr>
+<tr>
+<td><code>torch.cuda.synchronize()</code></td>
+<td><code>torch.accelerator.synchronize()</code></td>
+</tr>
+</tbody>
+</table>
+<p>Autocast, per-rank device seeds and fused AdamW all work under DDP. For a
+complete example with bf16 autocast, gradient clipping and evaluation, see
+the repository's nanoGPT DDP demo,
+<a href="https://github.com/gabrieldemarmiesse/torch-mojo-backend/blob/main/demo_scripts/nanogpt_ddp.py"><code>demo_scripts/nanogpt_ddp.py</code></a>.</p>
+<h3 id="one-script-for-cuda-and-mojo">One script for CUDA and mojo<a class="headerlink" href="#one-script-for-cuda-and-mojo" title="Permanent link">&para;</a></h3>
+<p>If the rest of the script only refers to <code>device</code>, the same file runs on
+stock CUDA as well:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch_mojo_backend.distributed</span><span class="w"> </span><span class="kn">import</span> <span class="n">use_local_rank_gpu</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="n">use_local_rank_gpu</span><span class="p">()</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>
+<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>
+<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>  <span class="c1"># remove this line to use stock CUDA</span>
+<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>
+<a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_accelerator</span><span class="p">()</span>  <span class="c1"># mojo, or cuda without the line above</span>
+<a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="n">dist</span><span class="o">.</span><span class="n">get_default_backend_for_device</span><span class="p">(</span><span class="n">device</span><span class="p">))</span>  <span class="c1"># &quot;mojo&quot; or &quot;nccl&quot;</span>
+</code></pre></div>
+<p>On stock CUDA, <code>use_local_rank_gpu()</code> also leaves each rank one visible GPU,
+so <code>cuda</code> is the right device there too. For autocast, write
+<code>torch.autocast(device.type, ...)</code>. <a href="../accelerator_api/">Accelerator API</a>
+covers <code>torch.accelerator</code> in more detail.</p>
+<h2 id="fsdp2">FSDP2<a class="headerlink" href="#fsdp2" title="Permanent link">&para;</a></h2>
+<p>Use PyTorch's <code>fully_shard</code> with a mojo device mesh. The usual FSDP2 rules
+apply: shard the blocks before the root module, and create the optimizer
+after sharding.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.device_mesh</span><span class="w"> </span><span class="kn">import</span> <span class="n">init_device_mesh</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.fsdp</span><span class="w"> </span><span class="kn">import</span> <span class="n">fully_shard</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="c1"># after use_local_rank_gpu(), register_mojo_devices() and init_process_group(&quot;mojo&quot;)</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="n">mesh</span> <span class="o">=</span> <span class="n">init_device_mesh</span><span class="p">(</span><span class="s2">&quot;mojo&quot;</span><span class="p">,</span> <span class="p">(</span><span class="n">dist</span><span class="o">.</span><span class="n">get_world_size</span><span class="p">(),))</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="n">model</span> <span class="o">=</span> <span class="n">MyModel</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">blocks</span><span class="p">:</span>
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>    <span class="n">fully_shard</span><span class="p">(</span><span class="n">block</span><span class="p">,</span> <span class="n">mesh</span><span class="o">=</span><span class="n">mesh</span><span class="p">)</span>
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="n">fully_shard</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">mesh</span><span class="o">=</span><span class="n">mesh</span><span class="p">)</span>
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="n">optimizer</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">1e-4</span><span class="p">,</span> <span class="n">foreach</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+<ul>
+<li>The multi-GPU tests use <code>foreach=False</code> for the optimizer, as above.</li>
+<li><code>torch.distributed.checkpoint</code> (<code>dcp.save</code> / <code>dcp.load</code>) can save and
+  restore a sharded model together with its optimizer state.</li>
+<li>For bf16 training, <code>MixedPrecisionPolicy(param_dtype=torch.bfloat16,
+  reduce_dtype=torch.float32)</code> on the blocks works. Leave the module that
+  owns the token embedding (usually the root) in fp32, because the device's
+  embedding backward currently needs fp32 gradients.</li>
+<li><a href="https://github.com/gabrieldemarmiesse/torch-mojo-backend/blob/main/demo_scripts/gpt2_fsdp2.py"><code>demo_scripts/gpt2_fsdp2.py</code></a>
+  trains GPT-2 124M or 1.5B (XL) this way, with no download needed.</li>
+</ul>
+<h2 id="collectives">Collectives<a class="headerlink" href="#collectives" title="Permanent link">&para;</a></h2>
+<p>All tensors in one call must be on the same mojo device, or all on the
+CPU. The table covers mojo tensors; CPU tensors always go through gloo.</p>
+<table>
+<thead>
+<tr>
+<th><code>torch.distributed</code> call</th>
+<th>NCCL / RCCL (default)</th>
+<th>Mojo collectives</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>all_reduce</code></td>
+<td>SUM, AVG, MIN, MAX, PRODUCT</td>
+<td>SUM, AVG</td>
+</tr>
+<tr>
+<td><code>broadcast</code></td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>all_gather</code>, <code>all_gather_into_tensor</code></td>
+<td>yes (equal-sized tensors)</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>reduce_scatter</code>, <code>reduce_scatter_tensor</code></td>
+<td>yes</td>
+<td>SUM, AVG</td>
+</tr>
+<tr>
+<td><code>reduce</code></td>
+<td>yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>all_to_all</code>, <code>all_to_all_single</code></td>
+<td>yes, uneven splits included</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>gather</code>, <code>scatter</code></td>
+<td>yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>send</code>, <code>recv</code>, <code>isend</code>, <code>irecv</code></td>
+<td>yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>batch_isend_irecv</code></td>
+<td>implemented, not covered by the tests</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>barrier</code></td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>all_gather_object</code>, <code>broadcast_object_list</code>, other object collectives</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+</tbody>
+</table>
+<p>The vendor libraries handle <code>bool</code>, <code>uint8</code>, <code>int8</code>, <code>int32</code>, <code>uint32</code>,
+<code>int64</code>, <code>uint64</code>, <code>float16</code>, <code>bfloat16</code>, <code>float32</code> and <code>float64</code>. <code>bool</code>
+follows <code>ProcessGroupNCCL</code>'s rules: SUM and MAX act as a logical OR, PRODUCT
+and MIN act as a logical AND, and AVG raises <code>TypeError</code>.
+<code>ReduceOp.PREMUL_SUM</code> isn't supported. Mojo collectives reduce only
+<code>float32</code>, <code>float16</code>, <code>bfloat16</code>, <code>int32</code> and <code>int64</code>, but they broadcast and
+gather any of the dtypes above.</p>
+<p>With <code>async_op=True</code>, a call returns a <code>Work</code> with the same stream semantics
+as NCCL: <code>work.wait()</code> makes the <em>current stream</em> wait for the collective
+without blocking the host, while <code>work.is_completed()</code> and
+<code>work.get_future()</code> behave as usual. Passing a finite timeout,
+<code>work.wait(timeout=...)</code>, raises <code>RuntimeError</code>. If you drop your references
+to a tensor while a collective still uses it, its memory isn't reused until
+the collective finishes. <a href="../streams_and_events/">Streams and events</a> explains
+how streams work on the device.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Consuming a collective's result on the stream that issued it gives the
+most reliable results, and it is what DDP, FSDP2 and blocking calls do.
+The tests also cover waiting from a different stream, but that pattern
+has failed intermittently in the past, and the root cause was never
+found.</p>
+</div>
+<h2 id="multi-node">Multi-node<a class="headerlink" href="#multi-node" title="Permanent link">&para;</a></h2>
+<p>Run one <code>torchrun</code> per node, with the same rendezvous arguments on every
+node:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">    </span>--rdzv-backend<span class="o">=</span>c10d<span class="w"> </span>--rdzv-endpoint<span class="o">=</span><span class="nv">$MASTER_ADDR</span>:29500<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">    </span>--rdzv-id<span class="o">=</span><span class="nv">$JOB_ID</span><span class="w"> </span>train_ddp.py
+</code></pre></div>
+<p>Under SLURM, start one task per node and let torchrun start the per-GPU
+workers:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="ch">#!/bin/bash</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="c1">#SBATCH --nodes=2 --ntasks-per-node=1 --gpus-per-node=8 --exclusive</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="nv">MASTER_ADDR</span><span class="o">=</span><span class="k">$(</span>scontrol<span class="w"> </span>show<span class="w"> </span>hostnames<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_NODELIST</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="k">)</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>srun<span class="w"> </span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_NUM_NODES</span><span class="s2">&quot;</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">    </span>--rdzv-backend<span class="o">=</span>c10d<span class="w"> </span>--rdzv-endpoint<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$MASTER_ADDR</span><span class="s2">:29500&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="w">    </span>--rdzv-id<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_ID</span><span class="s2">&quot;</span><span class="w"> </span>train_ddp.py
+</code></pre></div>
+<p>The backend needs no extra setup for multi-node runs: communicators bootstrap
+through the torchrun rendezvous, and <code>use_local_rank_gpu()</code> splits the GPU
+list that SLURM exports among the workers of each node.</p>
+<p>NCCL's and RCCL's own environment variables, such as <code>NCCL_DEBUG</code>,
+<code>NCCL_SOCKET_IFNAME</code> and <code>NCCL_IB_HCA</code>, still apply. The library itself
+reads them, so they work exactly as with stock PyTorch, and so does any
+network plugin your cluster needs, such as <code>aws-ofi-rccl</code> on HPE Slingshot.
+PyTorch's <code>TORCH_NCCL_*</code> variables configure <code>ProcessGroupNCCL</code>, which this
+backend doesn't use, so they have no effect.</p>
+<p>Warm the kernel cache first. Every rank compiles the kernels it's missing
+the first time it uses them, and on a cold cache the first step can take
+minutes. Put the cache on a filesystem that every node sees
+(<code>TORCH_MOJO_BACKEND_CACHE_DIR</code>, which defaults to the user's cache
+directory), preferably a fast one, and do a short single-process run
+(<code>--nproc-per-node=1</code>, a few steps) before the big launch.
+<code>torch-mojo-backend cache dir</code> prints where the cache is.</p>
+<details class="note">
+<summary>AMD MI300A (APU): device memory is host memory</summary>
+<p>By default, MAX reserves about 90% of the device's memory in each
+process at the first allocation. On an MI300A that memory is the node's
+RAM, so four ranks per node leave little for anything else, and
+processes can be killed for lack of memory while compiling kernels.
+Setting MAX's <code>MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1</code> makes each
+process hold only what it uses. With MAX 26.5 and ROCm 6.4.3, though,
+the process then segfaults during interpreter exit, after your script
+has finished. To avoid this, end the script with <code>os._exit(0)</code> once
+<code>destroy_process_group()</code> and checkpointing are done, as
+<code>demo_scripts/nanogpt_ddp.py</code> does. Without the variable, warm the
+kernel cache with a single process before launching four ranks per node.</p>
+</details>
+<h2 id="mojo-collectives-experimental">Mojo collectives (experimental)<a class="headerlink" href="#mojo-collectives-experimental" title="Permanent link">&para;</a></h2>
+<p>Setting <code>TORCH_MOJO_BACKEND_CCL=mojo</code> replaces NCCL/RCCL with the project's
+own collectives, an implementation of NCCL's C API written in Mojo that
+covers the node-to-node hop too. Your script and the process group stay the
+same; only the loaded library changes, and the <code>[TRACE] collectives via ...</code>
+line then names <code>libmojoccl.so</code>. The library is compiled the first time you
+use it, which takes about a minute, and is then cached with the kernels.
+NCCL/RCCL remain the default.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="nv">TORCH_MOJO_BACKEND_CCL</span><span class="o">=</span>mojo<span class="w"> </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span>train_ddp.py
+</code></pre></div>
+<p>Set the variable on every rank of every node. Consider Mojo collectives
+when NCCL or RCCL isn't available, or when you want to try a collective
+stack that doesn't come from the GPU vendor. They cover what DDP and FSDP2
+need, and the project has trained with them on H100 (DDP and
+FSDP2, up to two nodes over InfiniBand) and on MI300A (DDP, up to two nodes
+over Slingshot).</p>
+<p>Limitations:</p>
+<ul>
+<li><code>all_reduce</code>, <code>broadcast</code>, <code>all_gather</code>, <code>reduce_scatter</code>, <code>barrier</code> and
+  the object collectives work. <code>reduce</code>, point-to-point, <code>all_to_all</code>,
+  <code>gather</code> and <code>scatter</code> raise. See the <a href="#collectives">Collectives</a> table.</li>
+<li>Reductions support only SUM and AVG, on the five dtypes listed under
+  <a href="#collectives">Collectives</a>.</li>
+<li><code>all_reduce</code> needs a tensor that starts at a 16-byte-aligned address.
+  Every freshly allocated tensor does, but a view such as <code>t[1:]</code> may not,
+  and then fails with
+  <code>RuntimeError: ncclAllReduce failed: ... invalid argument</code>. Call
+  <code>.clone()</code> on the view first.</li>
+<li>Mojo collectives support at most 8 GPUs per node and 16 nodes.</li>
+<li>Multi-node runs need InfiniBand with GPUDirect RDMA (<code>nvidia_peermem</code>)
+  through libibverbs, or a libfabric provider with RMA and <code>FI_HMEM</code> support
+  (HPE Slingshot's <code>cxi</code>). The ranks also need a routable network interface
+  for the TCP bootstrap.</li>
+<li>A late peer causes an error instead of a hang. A rank that waits for a
+  peer longer than <code>MOJOCCL_IB_TIMEOUT_S</code> (60 s by default) gives up: it
+  prints a line naming the collective and the peer it waited for, and its
+  next collective raises <code>RuntimeError</code>. If one rank can legitimately reach
+  a collective much later than the others, raise the timeout.</li>
+</ul>
+<p>The variables in this table are the only tuning knobs, and the defaults
+suit the hardware the library was measured on:</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MOJOCCL_SOCKET_IFNAME</code></td>
+<td>an up, non-loopback interface with a default route</td>
+<td>network interface for the TCP bootstrap</td>
+</tr>
+<tr>
+<td><code>MOJOCCL_BOOTSTRAP_TIMEOUT_S</code></td>
+<td>120</td>
+<td>seconds communicator creation waits for every rank to check in</td>
+</tr>
+<tr>
+<td><code>MOJOCCL_IB_TIMEOUT_S</code></td>
+<td>60</td>
+<td>seconds a collective waits for its peers before failing</td>
+</tr>
+<tr>
+<td><code>MOJOCCL_NET</code></td>
+<td>InfiniBand if an active port exists, else libfabric</td>
+<td><code>verbs</code> or <code>fabric</code> forces the node-to-node transport</td>
+</tr>
+<tr>
+<td><code>MOJOCCL_IB_HCA</code></td>
+<td>chosen by GPU/NIC locality</td>
+<td>InfiniBand adapter to use</td>
+</tr>
+<tr>
+<td><code>MOJOCCL_FABRIC_DOMAIN</code></td>
+<td>chosen by GPU/NIC locality</td>
+<td>libfabric domain (NIC) to use, such as <code>cxi0</code></td>
+</tr>
+<tr>
+<td><code>MOJOCCL_FABRIC_PROVIDER</code></td>
+<td><code>cxi</code></td>
+<td>libfabric provider</td>
+</tr>
+<tr>
+<td><code>MOJOCCL_LIBFABRIC</code></td>
+<td>system loader, then the Cray install</td>
+<td>path to <code>libfabric.so.1</code></td>
+</tr>
+<tr>
+<td><code>MOJOCCL_REGION_MB</code></td>
+<td>64 on gfx942 (MI300 series), 256 elsewhere</td>
+<td>size of each rank's staging buffer, in MiB</td>
+</tr>
+<tr>
+<td><code>MOJOCCL_NVLS</code></td>
+<td>on where every GPU supports it</td>
+<td><code>0</code> disables the NVLink SHARP (multicast) path</td>
+</tr>
+<tr>
+<td><code>MOJOCCL_IB_TRACE</code></td>
+<td><code>0</code></td>
+<td><code>1</code> prints what each rank negotiated (transport, device, ports)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="environment-variables">Environment variables<a class="headerlink" href="#environment-variables" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TORCH_MOJO_BACKEND_CCL</code></td>
+<td>unset (vendor library)</td>
+<td><code>mojo</code> selects the <a href="#mojo-collectives-experimental">Mojo collectives</a></td>
+</tr>
+<tr>
+<td><code>TORCH_MOJO_BACKEND_NCCL_LIB</code></td>
+<td>wheel, then system</td>
+<td>absolute path of the <code>libnccl.so.2</code> to load</td>
+</tr>
+<tr>
+<td><code>TORCH_MOJO_BACKEND_RCCL_LIB</code></td>
+<td>ROCm search</td>
+<td>absolute path of the <code>librccl.so.1</code> to load</td>
+</tr>
+<tr>
+<td><code>ROCM_PATH</code></td>
+<td><code>/opt/rocm</code></td>
+<td>ROCm install to take the HIP runtime and RCCL from</td>
+</tr>
+<tr>
+<td><code>TORCH_MOJO_BACKEND_CACHE_DIR</code></td>
+<td>user cache directory</td>
+<td>where compiled kernels (and <code>libmojoccl.so</code>) are cached</td>
+</tr>
+<tr>
+<td><code>TORCH_MOJO_BACKEND_TRACE</code></td>
+<td>on</td>
+<td><code>0</code> hides the <code>[TRACE]</code> lines (library in use, build timings)</td>
+</tr>
+</tbody>
+</table>
+<p><code>register_mojo_devices()</code> warns about any <code>TORCH_MOJO_BACKEND_*</code> or
+<code>MOJOCCL_*</code> variable that it doesn't recognise, and suggests the real name
+when one is close, so a typo doesn't go unnoticed.</p>
+<h2 id="troubleshooting">Troubleshooting<a class="headerlink" href="#troubleshooting" title="Permanent link">&para;</a></h2>
+<h3 id="no-ncclrccl-library-found"><code>no NCCL/RCCL library found</code><a class="headerlink" href="#no-ncclrccl-library-found" title="Permanent link">&para;</a></h3>
+<p><code>init_process_group</code> couldn't find the library. On NVIDIA, install
+<code>nvidia-nccl-cu12</code> or set <code>TORCH_MOJO_BACKEND_NCCL_LIB</code>. On AMD, the error
+message still suggests <code>nvidia-nccl-cu12</code>, but what's missing there is
+<code>librccl.so.1</code> from ROCm: set <code>ROCM_PATH</code> to your ROCm install or
+<code>TORCH_MOJO_BACKEND_RCCL_LIB</code> to the library. See
+<a href="#installing-the-collective-library">Installing the collective library</a>.</p>
+<h3 id="nccl-fails-to-initialise-on-an-older-driver">NCCL fails to initialise on an older driver<a class="headerlink" href="#nccl-fails-to-initialise-on-an-older-driver" title="Permanent link">&para;</a></h3>
+<p>The NCCL that was found is built for a newer CUDA than your driver
+supports. For example, the <code>nvidia-nccl-cu13</code> wheel that recent CUDA builds
+of torch install needs driver 580 or newer. The <code>[TRACE] collectives
+via ...</code> line shows which file was loaded. Either point
+<code>TORCH_MOJO_BACKEND_NCCL_LIB</code> at an NCCL that works with your driver, or use
+the CPU build of torch together with <code>nvidia-nccl-cu12</code>.</p>
+<h3 id="all-ranks-use-the-same-gpu-or-communicator-creation-fails">All ranks use the same GPU, or communicator creation fails<a class="headerlink" href="#all-ranks-use-the-same-gpu-or-communicator-creation-fails" title="Permanent link">&para;</a></h3>
+<p><code>use_local_rank_gpu()</code> wasn't called, or was called after the GPU had
+already been initialised. Make it the first thing the script does. If it
+raises <code>LOCAL_RANK=... but CUDA_VISIBLE_DEVICES=... lists only N devices</code>,
+you started more processes per node than there are visible GPUs.</p>
+<h3 id="a-run-hangs">A run hangs<a class="headerlink" href="#a-run-hangs" title="Permanent link">&para;</a></h3>
+<p>NCCL and RCCL collectives have no watchdog here. The <code>timeout=</code> of
+<code>init_process_group</code> applies only to the rendezvous and to CPU work
+(<code>barrier</code>, object collectives). When a worker crashes, torchrun stops the
+others. A hang with every process still alive usually means the ranks
+issued different collectives, or issued them in a different order.
+<code>NCCL_DEBUG=INFO</code> shows how the communicators were set up, and
+<code>py-spy dump --pid &lt;pid&gt;</code> shows where each rank is waiting. With Mojo
+collectives, a rank stops waiting after <code>MOJOCCL_IB_TIMEOUT_S</code> and its next
+collective raises, so the run fails instead of hanging.</p>
+<h3 id="the-first-training-step-takes-minutes">The first training step takes minutes<a class="headerlink" href="#the-first-training-step-takes-minutes" title="Permanent link">&para;</a></h3>
+<p>Kernels compile the first time each one is used; see
+<a href="#multi-node">warm the kernel cache first</a>. Later runs reuse the cache.</p>
+<h3 id="valueerror-the-mojo-distributed-backend-handles-mojo-and-cpu-tensors"><code>ValueError: the mojo distributed backend handles mojo and cpu tensors</code><a class="headerlink" href="#valueerror-the-mojo-distributed-backend-handles-mojo-and-cpu-tensors" title="Permanent link">&para;</a></h3>
+<p>A tensor from another device, such as <code>cuda</code>, reached a collective. With a
+CUDA build of torch installed, check that the model and inputs went to
+<code>"mojo"</code> (or to <code>torch.accelerator.current_accelerator()</code>), not to <code>"cuda"</code>.</p>
+<h3 id="notimplementederror-from-torchsave"><code>NotImplementedError</code> from <code>torch.save</code><a class="headerlink" href="#notimplementederror-from-torchsave" title="Permanent link">&para;</a></h3>
+<p>Mojo tensors can't be serialised directly. Copy them to the CPU first:
+<code>{k: v.cpu() for k, v in model.state_dict().items()}</code>. For FSDP2 sharded
+state, use <code>torch.distributed.checkpoint</code>, which works as it is.</p>
+<h3 id="time-stats-are-currently-only-collected-for-cpu-and-cuda-devices"><code>Time stats are currently only collected for CPU and CUDA devices</code><a class="headerlink" href="#time-stats-are-currently-only-collected-for-cpu-and-cuda-devices" title="Permanent link">&para;</a></h3>
+<p>DDP prints this warning once for any device other than CPU or CUDA. You can
+ignore it.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../streams_and_events/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Streams and events">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Streams and events
+              </div>
+            </div>
+          </a>
+        
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.copy", "content.tabs.link", "navigation.footer", "navigation.top", "search.highlight", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"default": "stable", "provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

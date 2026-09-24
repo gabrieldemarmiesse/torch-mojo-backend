@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mojo Backend Call Graph</title>
+<!-- Open this file in a browser. Two call graphs, NVIDIA and AMD: which layer of
+     torch-mojo-backend talks to which library and hardware, from user code down to
+     the GPUs and the network. Edges were established from the sources: PrivateUse1
+     dispatch and the "mojo" distributed backend (torch_mojo_backend/), max.gpu.host in
+     the native backend, the kernels and mojoccl, and the dlopens in
+     torch_mojo_backend/distributed/mojoccl/{driver,ibverbs,libfabric}.mojo. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: #F3F4F8; --surface: #FFFFFF; --ink: #1A2233; --muted: #5B6577; --line: #C9D0DB;
+    --edge: #6B7688; --edge-soft: #98A2B3; --label-bg: #F3F4F8;
+    --py: #F7D65A; --mojo: #F28C28; --hw: #8DB4F5; --sys: #D9DEE7; --node-ink: #1A2233; --node-stroke: rgba(26,34,51,0.35);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11151D; --surface: #1A2029; --ink: #E7EAF0; --muted: #9AA4B5; --line: #2C3542;
+      --edge: #9AA4B5; --edge-soft: #6B7688; --label-bg: #11151D;
+      --py: #E9C94A; --mojo: #E8822A; --hw: #7FA6E8; --sys: #B9C2D0; --node-ink: #14181F; --node-stroke: rgba(0,0,0,0.45);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #11151D; --surface: #1A2029; --ink: #E7EAF0; --muted: #9AA4B5; --line: #2C3542;
+    --edge: #9AA4B5; --edge-soft: #6B7688; --label-bg: #11151D;
+    --py: #E9C94A; --mojo: #E8822A; --hw: #7FA6E8; --sys: #B9C2D0; --node-ink: #14181F; --node-stroke: rgba(0,0,0,0.45);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: "IBM Plex Sans", "Segoe UI", Roboto, sans-serif; font-size: 14px; }
+  main { max-width: 1240px; margin: 0 auto; padding: 18px 20px 20px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 24px; margin-bottom: 10px; }
+  h1 { font-family: "Barlow Semi Condensed", "Arial Narrow", sans-serif; font-weight: 700; font-size: 26px; margin: 0; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12.5px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--node-stroke); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px 4px; }
+  .card h2 { font-family: "Barlow Semi Condensed", "Arial Narrow", sans-serif; font-weight: 600; font-size: 17px; margin: 0 0 2px 6px; }
+  .card h2 small { font-family: "IBM Plex Sans", sans-serif; font-weight: 400; font-size: 12px; color: var(--muted); margin-left: 8px; }
+  svg { width: 100%; height: auto; display: block; }
+  .node rect { stroke: var(--node-stroke); stroke-width: 1; }
+  .node text { fill: var(--node-ink); font-family: "IBM Plex Sans", sans-serif; font-size: 13px; font-weight: 600; }
+  .node text.sub { font-family: "IBM Plex Mono", Consolas, monospace; font-weight: 400; font-size: 11px; }
+  .edge { fill: none; stroke: var(--edge); stroke-width: 1.4; }
+  .edge.soft { stroke: var(--edge-soft); stroke-dasharray: 4 3; }
+  .elabel { font-size: 10.5px; fill: var(--muted); font-family: "IBM Plex Sans", sans-serif; }
+  .elabel-bg { fill: var(--surface); }
+  .note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Who talks to whom, on each vendor</h1>
+      <div class="sub">torch-mojo-backend in eager mode with mojoccl for the collectives. Arrows point from caller to callee, top to bottom; every edge names the interface it uses.</div>
+    </div>
+    <div class="legend">
+      <span><i style="background:var(--py)"></i>Python</span>
+      <span><i style="background:var(--mojo)"></i>Mojo</span>
+      <span><i style="background:var(--sys)"></i>C / C++ library</span>
+      <span><i style="background:var(--hw)"></i>hardware</span>
+    </div>
+  </header>
+  <div class="grid">
+    <div class="card"><h2>NVIDIA<small>2 × 8 H100, InfiniBand</small></h2><svg id="nv" viewBox="0 0 600 622" role="img" aria-label="NVIDIA call graph"></svg></div>
+    <div class="card"><h2>AMD<small>MI300A, Slingshot</small></h2><svg id="amd" viewBox="0 0 600 622" role="img" aria-label="AMD call graph"></svg></div>
+  </div>
+  <p class="note">The mojo kernels never touch the driver themselves: every launch, buffer and stream goes through MAX. mojoccl reaches the driver, the NIC library and libc by dlopen, and launches its own kernels through the same MAX DeviceContext. The stock NCCL / RCCL path is the one alternative to mojoccl behind the same C ABI and is left out here.</p>
+</main>
+<script>
+(function () {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(tag, attrs, parent) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  // kind -> fill token
+  var fill = { py: "var(--py)", mojo: "var(--mojo)", sys: "var(--sys)", hw: "var(--hw)" };
+
+  function draw(svgId, nodes, edges) {
+    var svg = document.getElementById(svgId);
+    var defs = el("defs", {}, svg);
+    var m = el("marker", { id: svgId + "-arrow", viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" }, defs);
+    el("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "var(--edge)" }, m);
+    var m2 = el("marker", { id: svgId + "-arrow-soft", viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" }, defs);
+    el("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "var(--edge-soft)" }, m2);
+    var byId = {};
+    nodes.forEach(function (n) { byId[n.id] = n; });
+
+    // edges first so nodes sit on top
+    edges.forEach(function (e) {
+      var a = byId[e.from], b = byId[e.to];
+      var x1, y1, x2, y2, d;
+      if (e.side === "lateral") {           // between two nodes on the same row
+        var right = b.x > a.x;
+        x1 = a.x + (right ? a.w / 2 : -a.w / 2); y1 = a.y; x2 = b.x + (right ? -b.w / 2 : b.w / 2); y2 = b.y;
+        d = "M " + x1 + " " + y1 + " L " + x2 + " " + y2;
+      } else {
+        x1 = a.x + (e.dx1 || 0); y1 = a.y + a.h / 2; x2 = b.x + (e.dx2 || 0); y2 = b.y - b.h / 2;
+        if (e.bow) {                          // a curve bowing sideways, for long hops past a row
+          var cx = (x1 + x2) / 2 + e.bow, cy = (y1 + y2) / 2;
+          d = "M " + x1 + " " + y1 + " Q " + cx + " " + cy + " " + x2 + " " + y2;
+        } else {
+          d = "M " + x1 + " " + y1 + " L " + x2 + " " + y2;
+        }
+      }
+      el("path", { d: d, "class": "edge" + (e.soft ? " soft" : ""), "marker-end": "url(#" + svgId + (e.soft ? "-arrow-soft" : "-arrow") + ")" }, svg);
+      if (e.label) {
+        var t = e.t == null ? 0.5 : e.t;
+        var lx, ly;
+        if (e.bow) { // point on the quadratic curve
+          var cx2 = (x1 + x2) / 2 + e.bow, cy2 = (y1 + y2) / 2;
+          lx = (1 - t) * (1 - t) * x1 + 2 * (1 - t) * t * cx2 + t * t * x2;
+          ly = (1 - t) * (1 - t) * y1 + 2 * (1 - t) * t * cy2 + t * t * y2;
+        } else { lx = x1 + (x2 - x1) * t; ly = y1 + (y2 - y1) * t; }
+        lx += e.lx || 0; ly += e.ly || 0;
+        var g = el("g", {}, svg);
+        var txt = el("text", { x: lx, y: ly, "class": "elabel", "text-anchor": e.anchor || "middle", "dominant-baseline": "middle" }, g);
+        txt.textContent = e.label;
+        // background pill sized after layout
+        var bb = txt.getBBox();
+        var r = el("rect", { x: bb.x - 3, y: bb.y - 1, width: bb.width + 6, height: bb.height + 2, rx: 3, "class": "elabel-bg" }, g);
+        g.insertBefore(r, txt);
+      }
+    });
+
+    nodes.forEach(function (n) {
+      var g = el("g", { "class": "node" }, svg);
+      el("rect", { x: n.x - n.w / 2, y: n.y - n.h / 2, width: n.w, height: n.h, rx: 6, fill: fill[n.kind] }, g);
+      var lines = n.label.split("\n");
+      var sub = n.sub ? 1 : 0;
+      var total = lines.length + sub;
+      var lh = 15, y0 = n.y - ((total - 1) * lh) / 2;
+      lines.forEach(function (line, i) {
+        var t = el("text", { x: n.x, y: y0 + i * lh, "text-anchor": "middle", "dominant-baseline": "middle" }, g);
+        t.textContent = line;
+      });
+      if (n.sub) {
+        var s = el("text", { x: n.x, y: y0 + lines.length * lh, "text-anchor": "middle", "dominant-baseline": "middle", "class": "sub" }, g);
+        s.textContent = n.sub;
+      }
+    });
+  }
+
+  // Rows: 36 / 110 / 186 / 280 / 372 / 468 / 566. MAX gets its own row so the
+  // kernels, mojoccl and the Python layer all converge on it before the driver.
+  function common() {
+    return [
+      { id: "user", kind: "py", label: "user code", sub: "model, DDP, optimizer", x: 300, y: 36, w: 210, h: 44 },
+      { id: "disp", kind: "sys", label: "torch dispatcher", sub: "ATen ops · torch.distributed", x: 300, y: 110, w: 210, h: 44 },
+      { id: "be", kind: "mojo", label: "torch-mojo-backend (native backend)", sub: "C++ shim → mojo aten ops · process group", x: 300, y: 186, w: 300, h: 44 },
+      { id: "kern", kind: "mojo", label: "torch-mojo-backend (mojo kernels)", sub: "ATen ops, JIT-built extensions", x: 150, y: 280, w: 236, h: 44 },
+      { id: "ccl", kind: "mojo", label: "torch-mojo-backend (mojoccl)", sub: "NCCL C ABI in Mojo", x: 445, y: 280, w: 220, h: 44 },
+      { id: "max", kind: "mojo", label: "MAX DeviceContext", sub: "max.gpu.host · runtime", x: 150, y: 372, w: 190, h: 44 }
+    ];
+  }
+  var commonEdges = [
+    { from: "user", to: "disp", label: "torch ops · dist.all_reduce", anchor: "start", lx: 8 },
+    { from: "disp", to: "be", label: "PrivateUse1 boxed kernels · backend \"mojo\"", anchor: "start", lx: 8 },
+    { from: "be", to: "kern", dx1: -60, label: "tmb_call: one C entry per family", anchor: "end", lx: -8, t: 0.25 },
+    { from: "be", to: "ccl", dx1: 60, label: "NCCL C ABI, called from Mojo", anchor: "start", lx: 8, t: 0.35 },
+    { from: "be", to: "max", dx1: -110, dx2: -60, bow: -60, label: "max.gpu.host: memory, streams, events", anchor: "start", lx: 6, t: 0.85 },
+    { from: "kern", to: "max", dx1: 20, dx2: 20, label: "enqueue_function · buffers", t: 0.25 },
+    { from: "ccl", to: "max", dx1: -80, dx2: 70, label: "launches", t: 0.5 }
+  ];
+
+  draw("nv", common().concat([
+    { id: "drv", kind: "sys", label: "nvidia driver (libcuda.so)", sub: "CUDA driver API", x: 300, y: 468, w: 190, h: 44 },
+    { id: "net", kind: "sys", label: "libibverbs.so", sub: "rdma-core · mlx5", x: 490, y: 468, w: 150, h: 44 },
+    { id: "gpu", kind: "hw", label: "H100", sub: "8 per node · NVSwitch", x: 210, y: 566, w: 200, h: 44 },
+    { id: "nic", kind: "hw", label: "InfiniBand", sub: "ConnectX, 400 Gb/s", x: 490, y: 566, w: 170, h: 44 }
+  ]), commonEdges.concat([
+    { from: "ccl", to: "drv", dx1: -20, dx2: 40, label: "dlopen: cuMem*, cuIpc*, cuMulticast*", t: 0.75, anchor: "start", lx: 8 },
+    { from: "ccl", to: "net", dx1: 60, dx2: 10, label: "dlopen: queue pairs, RDMA writes", anchor: "end", lx: -8, t: 0.45 },
+    { from: "max", to: "drv", dx1: 40, dx2: -50, label: "cuMemCreate · cuLaunchKernel", anchor: "end", lx: -8, t: 0.5 },
+    { from: "drv", to: "gpu", dx1: -20, dx2: 30, label: "kernels, memory, streams", anchor: "start", lx: 8 },
+    { from: "net", to: "nic", label: "verbs → HCA", anchor: "start", lx: 8 },
+    { from: "nic", to: "gpu", side: "lateral", soft: true, label: "GPUDirect RDMA (nvidia_peermem)", ly: 30 }
+  ]));
+
+  draw("amd", common().concat([
+    { id: "drv", kind: "sys", label: "amd driver (libamdhip64.so)", sub: "HIP runtime · ROCr", x: 300, y: 468, w: 200, h: 44 },
+    { id: "net", kind: "sys", label: "libfabric.so", sub: "cxi provider", x: 490, y: 468, w: 150, h: 44 },
+    { id: "gpu", kind: "hw", label: "MI300A", sub: "4 APUs per node", x: 210, y: 566, w: 200, h: 44 },
+    { id: "nic", kind: "hw", label: "Slingshot", sub: "Cassini NICs, 200 Gb/s", x: 490, y: 566, w: 170, h: 44 }
+  ]), commonEdges.concat([
+    { from: "be", to: "drv", soft: true, label: "ctypes: locate the mapped libamdhip64", t: 0.72, anchor: "start", lx: 8 },
+    { from: "ccl", to: "drv", dx1: -20, dx2: 40, label: "dlopen: hipExtMallocWithFlags, hipIpc*", t: 0.75, anchor: "start", lx: 8 },
+    { from: "ccl", to: "net", dx1: 60, dx2: 10, label: "dlopen: fi_writemsg + fi_sendmsg", anchor: "end", lx: -8, t: 0.45 },
+    { from: "max", to: "drv", dx1: 40, dx2: -50, label: "hipMemCreate · hipModuleLaunchKernel", anchor: "end", lx: -8, t: 0.5 },
+    { from: "drv", to: "gpu", dx1: -20, dx2: 30, label: "kernels, memory, streams", anchor: "start", lx: 8 },
+    { from: "net", to: "nic", label: "cxi → NIC", anchor: "start", lx: 8 },
+    { from: "nic", to: "gpu", side: "lateral", soft: true, label: "RDMA into GPU memory (FI_HMEM ROCr)", ly: 30 }
+  ]));
+})();
+</script>
+</body>
+</html>

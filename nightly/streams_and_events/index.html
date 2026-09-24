@@ -1,0 +1,1323 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A PyTorch backend powered by Mojo kernels and Modular's MAX framework">
+      
+      
+      
+        <link rel="canonical" href="https://gabrieldemarmiesse.github.io/torch-mojo-backend/stable/streams_and_events/">
+      
+      
+        <link rel="prev" href="../accelerator_api/">
+      
+      
+        <link rel="next" href="../distributed_training/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Streams and events - Torch Mojo Backend</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#streams-and-events" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+          <aside class="md-banner md-banner--warning">
+            <div class="md-banner__inner md-grid md-typeset">
+              
+  You are reading the nightly documentation, built from the latest commit on
+  main.
+  <a href="../..">
+    <strong>Read the documentation of the latest release instead.</strong>
+  </a>
+
+            </div>
+            <script>var el=document.querySelector("[data-md-component=outdated]"),base=new URL(".."),outdated=__md_get("__outdated",sessionStorage,base);!0===outdated&&el&&(el.hidden=!1)</script>
+          </aside>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Torch Mojo Backend" class="md-header__button md-logo" aria-label="Torch Mojo Backend" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Torch Mojo Backend
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Streams and events
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/gabrieldemarmiesse/torch-mojo-backend" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    gabrieldemarmiesse/torch-mojo-backend
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Torch Mojo Backend" class="md-nav__button md-logo" aria-label="Torch Mojo Backend" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Torch Mojo Backend
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/gabrieldemarmiesse/torch-mojo-backend" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    gabrieldemarmiesse/torch-mojo-backend
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../accelerator_api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Accelerator API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Streams and events
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Streams and events
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#how-work-is-ordered" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How work is ordered
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#streams" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Streams
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Streams">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#from-torchcuda-to-mojo" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        From torch.cuda to mojo
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#creating-a-stream-and-making-it-current" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Creating a stream and making it current
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#events" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Events
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Events">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#timing-gpu-work" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Timing GPU work
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-events-do" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What events do
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#working-with-several-streams" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Working with several streams
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#host-device-copies" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Host-device copies
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Host-device copies">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#downloading-without-blocking" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Downloading without blocking
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#overlapping-uploads-with-compute" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overlapping uploads with compute
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#apple-gpus" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Apple GPUs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#not-supported" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Not supported
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../distributed_training/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Distributed training
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#how-work-is-ordered" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How work is ordered
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#streams" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Streams
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Streams">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#from-torchcuda-to-mojo" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        From torch.cuda to mojo
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#creating-a-stream-and-making-it-current" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Creating a stream and making it current
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#events" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Events
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Events">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#timing-gpu-work" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Timing GPU work
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-events-do" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What events do
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#working-with-several-streams" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Working with several streams
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#host-device-copies" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Host-device copies
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Host-device copies">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#downloading-without-blocking" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Downloading without blocking
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#overlapping-uploads-with-compute" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overlapping uploads with compute
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#apple-gpus" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Apple GPUs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#not-supported" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Not supported
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="streams-and-events">Streams and events<a class="headerlink" href="#streams-and-events" title="Permanent link">&para;</a></h1>
+<p>The <code>mojo</code> device implements PyTorch's device-generic stream and event API
+(<code>torch.Stream</code>, <code>torch.Event</code> and the stream functions of
+<code>torch.accelerator</code>), and <code>torch.mojo</code> adds <code>torch.cuda</code>-style names on top of
+it. On NVIDIA and AMD GPUs, each stream is an independent device queue and
+events work as they do on CUDA, so code written for CUDA streams carries over
+once a few calls are renamed. Apple GPUs have a single queue and no events;
+see <a href="#apple-gpus">Apple GPUs</a>.</p>
+<p>This page assumes the device is already set up.
+<a href="../accelerator_api/">Accelerator API</a> covers <code>register_mojo_devices()</code>,
+device selection and the rest of <code>torch.mojo</code>.</p>
+<h2 id="how-work-is-ordered">How work is ordered<a class="headerlink" href="#how-work-is-ordered" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Every op on a <code>mojo</code> tensor is queued on the current stream of its device,
+  and the Python call returns without waiting for the kernel to run. Ops
+  queued on the same stream run in the order they were issued.</li>
+<li>When a program starts, the current stream is the device's default stream
+  (<code>stream_id == 0</code>). Each thread has its own current stream, and a new
+  thread starts on the default stream.</li>
+<li>The CPU waits for the GPU in two cases only:<ul>
+<li>When it has to give you a value: <code>.cpu()</code>, <code>.item()</code>, <code>.tolist()</code>, or
+  a blocking <code>copy_()</code> into a CPU tensor. These copy on the current
+  stream and wait for that stream alone.</li>
+<li>When you ask it to: <code>torch.accelerator.synchronize()</code> and
+  <code>torch.mojo.synchronize()</code> wait for every stream of the device,
+  <code>stream.synchronize()</code> waits for one stream, and <code>event.synchronize()</code>
+  waits for one event.</li>
+</ul>
+</li>
+<li>The first time an op runs with a new combination of dtypes, its kernel is
+  compiled, and the call blocks until compilation is done. The compiled
+  kernel is cached on disk. Run a warm-up iteration before you time anything.</li>
+</ul>
+<h2 id="streams">Streams<a class="headerlink" href="#streams" title="Permanent link">&para;</a></h2>
+<h3 id="from-torchcuda-to-mojo">From <code>torch.cuda</code> to <code>mojo</code><a class="headerlink" href="#from-torchcuda-to-mojo" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>CUDA</th>
+<th>Device-generic</th>
+<th><code>torch.mojo</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>torch.cuda.Stream()</code></td>
+<td><code>torch.Stream(device="mojo")</code></td>
+<td><code>torch.mojo.Stream()</code></td>
+</tr>
+<tr>
+<td><code>torch.cuda.Event(enable_timing=True)</code></td>
+<td><code>torch.Event(device="mojo", enable_timing=True)</code></td>
+<td><code>torch.mojo.Event(enable_timing=True)</code></td>
+</tr>
+<tr>
+<td><code>torch.cuda.current_stream()</code></td>
+<td><code>torch.accelerator.current_stream()</code></td>
+<td><code>torch.mojo.current_stream()</code></td>
+</tr>
+<tr>
+<td><code>torch.cuda.default_stream()</code></td>
+<td>—</td>
+<td><code>torch.mojo.default_stream()</code></td>
+</tr>
+<tr>
+<td><code>torch.cuda.set_stream(s)</code></td>
+<td><code>torch.accelerator.set_stream(s)</code></td>
+<td><code>torch.mojo.set_stream(s)</code></td>
+</tr>
+<tr>
+<td><code>with torch.cuda.stream(s):</code></td>
+<td><code>with s:</code></td>
+<td><code>with torch.mojo.stream(s):</code></td>
+</tr>
+<tr>
+<td><code>torch.cuda.synchronize()</code></td>
+<td><code>torch.accelerator.synchronize()</code></td>
+<td><code>torch.mojo.synchronize()</code></td>
+</tr>
+<tr>
+<td><code>s.cuda_stream</code></td>
+<td><code>s.native_handle</code> (torch 2.11+)</td>
+<td><code>torch.mojo.stream_native_handle(s)</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>torch.mojo.Stream</code> and <code>torch.mojo.Event</code> <em>are</em> <code>torch.Stream</code> and
+<code>torch.Event</code>, so you can pass a mojo stream to any PyTorch API that takes a
+stream. The methods have their CUDA names: <code>wait_stream</code>, <code>wait_event</code>,
+<code>record_event</code>, <code>query</code> and <code>synchronize</code> on streams, and <code>record</code>, <code>wait</code>,
+<code>query</code>, <code>synchronize</code> and <code>elapsed_time</code> on events. Code that uses only the
+device-generic column, with <code>torch.accelerator.current_accelerator()</code> in place
+of the <code>"mojo"</code> string, also runs on stock PyTorch with CUDA.</p>
+<h3 id="creating-a-stream-and-making-it-current">Creating a stream and making it current<a class="headerlink" href="#creating-a-stream-and-making-it-current" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>   <span class="c1"># the default stream at start-up</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="n">side</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>          <span class="c1"># a new, independent stream</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="nb">print</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>  <span class="c1"># torch.Stream device_type=mojo, device_index=0, stream_id=0</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="nb">print</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>  <span class="c1"># torch.Stream device_type=mojo, device_index=0, stream_id=1</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="k">with</span> <span class="n">side</span><span class="p">:</span>                                  <span class="c1"># or: with torch.mojo.stream(side):</span>
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    <span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span> <span class="o">==</span> <span class="n">side</span>
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="mi">1000</span><span class="p">,),</span> <span class="mf">2.0</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>  <span class="c1"># queued on `side`</span>
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>
+<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span> <span class="o">==</span> <span class="n">main</span>  <span class="c1"># restored on exit</span>
+<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>
+<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="n">side</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>          <span class="c1"># wait for everything queued on `side`</span>
+<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="nb">print</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>       <span class="c1"># 2000.0</span>
+</code></pre></div>
+<p><code>torch.accelerator.set_stream(s)</code> and <code>torch.mojo.set_stream(s)</code> do the same
+without a <code>with</code> block: the stream stays current until you set another one.</p>
+<ul>
+<li>Create streams once, before a loop, and reuse them. Every
+  <code>torch.Stream(...)</code> call creates a new device stream (you can watch
+  <code>stream_id</code> count up), and the stream stays alive until the process exits.
+  CUDA differs here: <code>torch.cuda.Stream()</code> hands out streams from a fixed
+  pool.</li>
+<li>Without a <code>device</code> argument, <code>torch.Stream()</code> and <code>torch.mojo.Stream()</code>
+  create the stream on the current mojo device, and
+  <code>torch.Stream(device="mojo:1")</code> targets another GPU. Entering a stream that
+  belongs to another device also makes that device current until the block
+  exits, the same behavior as CUDA.</li>
+<li><code>priority=</code> is passed to the driver when the stream is created. The
+  convention is CUDA's: a lower number means a higher priority, and values
+  outside the device's range are clamped. The generic <code>torch.Stream</code> has no
+  <code>priority</code> attribute, so you cannot read the value back.</li>
+<li><code>stream.query()</code> returns whether all the work queued on the stream has
+  finished, without blocking. <code>stream.synchronize()</code> blocks until it has.</li>
+<li><code>stream.native_handle</code> (torch 2.11 and later) and
+  <code>torch.mojo.stream_native_handle(stream)</code> (any torch version) return the
+  underlying <code>CUstream</code> or <code>hipStream_t</code>. Use the handle to queue work from
+  outside PyTorch on the same device queue.</li>
+</ul>
+<h2 id="events">Events<a class="headerlink" href="#events" title="Permanent link">&para;</a></h2>
+<h3 id="timing-gpu-work">Timing GPU work<a class="headerlink" href="#timing-gpu-work" title="Permanent link">&para;</a></h3>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:2"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">NVIDIA and AMD GPUs</label><label for="__tabbed_1_2">Any GPU, including Apple</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2048</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="n">a</span> <span class="o">@</span> <span class="n">a</span>  <span class="c1"># warm up: the first call of an op compiles its kernel</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="n">start</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">,</span> <span class="n">enable_timing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="n">end</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">,</span> <span class="n">enable_timing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="n">start</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>          <span class="c1"># records on the current stream</span>
+<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>    <span class="n">b</span> <span class="o">=</span> <span class="n">a</span> <span class="o">@</span> <span class="n">a</span>
+<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="n">end</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>
+<a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a><span class="n">end</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>       <span class="c1"># elapsed_time needs both events to have completed</span>
+<a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">start</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">end</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">10</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms per matmul&quot;</span><span class="p">)</span>
+</code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2048</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="n">a</span> <span class="o">@</span> <span class="n">a</span>  <span class="c1"># warm up: the first call of an op compiles its kernel</span>
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="n">torch</span><span class="o">.</span><span class="n">mojo</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>        <span class="c1"># start from an idle device</span>
+<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="n">start</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>    <span class="n">b</span> <span class="o">=</span> <span class="n">a</span> <span class="o">@</span> <span class="n">a</span>
+<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="n">torch</span><span class="o">.</span><span class="n">mojo</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>        <span class="c1"># wait until the GPU is done</span>
+<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="n">elapsed_ms</span> <span class="o">=</span> <span class="mf">1e3</span> <span class="o">*</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">start</span><span class="p">)</span>
+<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">elapsed_ms</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">10</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms per matmul&quot;</span><span class="p">)</span>
+</code></pre></div>
+<p>This measures wall time, so it includes the time the CPU spends queuing
+the ops. Events measure device time only.</p>
+</div>
+</div>
+</div>
+<h3 id="what-events-do">What events do<a class="headerlink" href="#what-events-do" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>event.record()</code> records the event on the current stream, and
+  <code>event.record(stream)</code> on the given stream. <code>stream.record_event()</code> creates
+  a new event and records it in one call.</li>
+<li><code>event.query()</code> returns whether the work before the event has finished,
+  without blocking. <code>event.synchronize()</code> blocks the CPU until it has.</li>
+<li><code>event.wait(stream)</code> and <code>stream.wait_event(event)</code> make a stream wait for
+  the event on the GPU without blocking the CPU. With no argument,
+  <code>event.wait()</code> applies to the current stream.</li>
+<li><code>start.elapsed_time(end)</code> returns milliseconds, under the same contract as
+  CUDA events: it raises <code>ValueError</code> unless both events were created with
+  <code>enable_timing=True</code> and recorded, and <code>RuntimeError</code> unless both have
+  completed.</li>
+<li>An event that was never recorded counts as complete: <code>query()</code> returns
+  <code>True</code>, and <code>synchronize()</code> and <code>wait()</code> do nothing, as in PyTorch.</li>
+</ul>
+<h2 id="working-with-several-streams">Working with several streams<a class="headerlink" href="#working-with-several-streams" title="Permanent link">&para;</a></h2>
+<p>Streams run independently, so you order work across them yourself. The rules
+are the same as for CUDA:</p>
+<ol>
+<li>A stream that reads a tensor must first wait for the stream that wrote
+   it. <code>consumer.wait_stream(producer)</code> waits for everything queued on
+   <code>producer</code> so far, and <code>consumer.wait_event(event)</code> waits for the work
+   before one recorded event. Neither blocks the CPU.</li>
+<li>Reading a result back counts as reading. <code>.cpu()</code> and <code>.item()</code> copy on
+   the <em>current</em> stream, so to read a tensor that a side stream produced,
+   make the current stream wait for the side stream first, read it inside
+   <code>with side:</code>, or synchronize the device.</li>
+<li>When a stream uses a tensor that was allocated on another stream, call
+   <code>tensor.record_stream(stream)</code>. Freed memory is reused by later work on
+   the stream that allocated it, and <code>record_stream</code> keeps the memory from
+   being reused until the work already queued on <code>stream</code> has finished.</li>
+</ol>
+<p>Here a side stream computes a small reduction while the main stream runs a
+matmul, and then the two results are combined:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="n">side</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>    <span class="c1"># create once, reuse</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>   <span class="c1"># produced on `main`</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="n">side</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>          <span class="c1"># rule 1: `side` must not read x before it is written</span>
+<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="k">with</span> <span class="n">side</span><span class="p">:</span>
+<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a>    <span class="n">col_max</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">amax</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>   <span class="c1"># runs on `side` ...</span>
+<a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">@</span> <span class="n">x</span>                           <span class="c1"># ... while this runs on `main`</span>
+<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>
+<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a><span class="n">main</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>          <span class="c1"># rules 1 and 2: `main` must not read col_max too early</span>
+<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a><span class="n">x</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>           <span class="c1"># rule 3: x was used on `side`,</span>
+<a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a><span class="n">col_max</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>     <span class="c1"># and col_max is used on `main`</span>
+<a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a>
+<a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a><span class="n">result</span> <span class="o">=</span> <span class="n">y</span> <span class="o">/</span> <span class="n">col_max</span>
+<a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a><span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">cpu</span><span class="p">()[</span><span class="mi">0</span><span class="p">,</span> <span class="p">:</span><span class="mi">4</span><span class="p">])</span>      <span class="c1"># the copy runs on `main`, after the join</span>
+</code></pre></div>
+<div class="admonition warning">
+<p class="admonition-title">Forgetting a wait does not raise an error</p>
+<p>Without <code>main.wait_stream(side)</code>, the example above still runs, but
+<code>y / col_max</code> and the readback can use <code>col_max</code> before <code>side</code> has
+written it, and the result can silently be wrong. On NVIDIA and AMD GPUs,
+every cross-stream dependency needs an explicit wait.</p>
+</div>
+<h2 id="host-device-copies">Host-device copies<a class="headerlink" href="#host-device-copies" title="Permanent link">&para;</a></h2>
+<p><code>tensor.to("mojo", non_blocking=True)</code>, <code>tensor.to("cpu", non_blocking=True)</code>
+and <code>dst.copy_(src, non_blocking=True)</code> are supported. What
+<code>non_blocking=True</code> does depends on the kind of host memory:</p>
+<table>
+<thead>
+<tr>
+<th><code>non_blocking=True</code></th>
+<th>Pinned with <code>tensor.pin_memory()</code></th>
+<th>Pageable host memory</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Host to device</td>
+<td>Queued on the current stream, and the call returns at once. The copy reads your tensor when it runs, so do not modify the tensor until the copy is done.</td>
+<td>The data is copied into a staging buffer before the call returns, so you can reuse the source right away. The device copy itself is queued.</td>
+</tr>
+<tr>
+<td>Device to host</td>
+<td>Queued on the current stream, and the call returns at once. Wait for the copy before reading the result.</td>
+<td>The copy completes before the call returns.</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><code>tensor.to("cpu", non_blocking=True)</code> puts its result in pinned memory, so
+  it is asynchronous and needs a wait before you read it.</li>
+<li>A download that has to convert the dtype or change the memory layout on the
+  CPU completes before it returns.</li>
+<li>Pinned memory belongs to the mojo device that was current when it was
+  pinned. Copies between it and another mojo device treat it as pageable
+  memory.</li>
+<li>Without <code>non_blocking=True</code>, you can read or reuse the host tensor as soon
+  as the call returns.</li>
+</ul>
+<div class="admonition warning">
+<p class="admonition-title">Pinned memory on a CUDA build of PyTorch</p>
+<p>Pin memory with <code>tensor.pin_memory()</code>, which <code>DataLoader(pin_memory=True)</code>
+also uses. If you run a CUDA build of PyTorch on a machine with a CUDA
+GPU, factory functions called with <code>pin_memory=True</code>, such as
+<code>torch.empty(..., pin_memory=True)</code>, allocate CUDA's pinned memory
+instead. The mojo device treats that memory like pageable memory: copies
+are correct, but they are not asynchronous. On a CPU-only build of
+PyTorch, both spellings give mojo pinned memory.</p>
+</div>
+<h3 id="downloading-without-blocking">Downloading without blocking<a class="headerlink" href="#downloading-without-blocking" title="Permanent link">&para;</a></h3>
+<p>To wait for the copy alone rather than for the whole device, record an event
+after it:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="n">host</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">&quot;cpu&quot;</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>   <span class="c1"># returns at once, into pinned memory</span>
+<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="n">copied</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="n">copied</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>                         <span class="c1"># marks the end of the copy on the stream</span>
+<a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="nb">print</span><span class="p">(</span><span class="n">host</span><span class="o">.</span><span class="n">is_pinned</span><span class="p">())</span>                 <span class="c1"># True</span>
+<a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>
+<a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="c1"># ... other CPU work here, while the copy runs ...</span>
+<a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>
+<a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a><span class="n">copied</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>                    <span class="c1"># now `host` holds the data</span>
+<a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a><span class="nb">print</span><span class="p">(</span><span class="n">host</span><span class="p">[:</span><span class="mi">4</span><span class="p">])</span>                         <span class="c1"># tensor([0., 2., 4., 6.])</span>
+</code></pre></div>
+<h3 id="overlapping-uploads-with-compute">Overlapping uploads with compute<a class="headerlink" href="#overlapping-uploads-with-compute" title="Permanent link">&para;</a></h3>
+<p>In the usual prefetching pattern, a dedicated copy stream uploads the next
+batch while the main stream computes on the current one:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="n">copy_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="n">weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>
+<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="c1"># Pinned host memory lets the upload run in the background.</span>
+<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="n">batches</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8192</span><span class="p">,</span> <span class="mi">1024</span><span class="p">)</span><span class="o">.</span><span class="n">pin_memory</span><span class="p">()</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">)]</span>
+<a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>
+<a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>
+<a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="k">def</span><span class="w"> </span><span class="nf">upload</span><span class="p">(</span><span class="n">batch</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a>    <span class="k">with</span> <span class="n">copy_stream</span><span class="p">:</span>
+<a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a>        <span class="k">return</span> <span class="n">batch</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">&quot;mojo&quot;</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a>
+<a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a>
+<a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="n">losses</span> <span class="o">=</span> <span class="p">[]</span>
+<a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="n">next_batch</span> <span class="o">=</span> <span class="n">upload</span><span class="p">(</span><span class="n">batches</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+<a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">batches</span><span class="p">)):</span>
+<a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a>    <span class="n">main</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">copy_stream</span><span class="p">)</span>   <span class="c1"># batch i has arrived</span>
+<a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a>    <span class="n">batch</span> <span class="o">=</span> <span class="n">next_batch</span>
+<a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a>    <span class="n">batch</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>       <span class="c1"># allocated on copy_stream, used on main</span>
+<a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a>    <span class="k">if</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">batches</span><span class="p">):</span>
+<a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a>        <span class="n">next_batch</span> <span class="o">=</span> <span class="n">upload</span><span class="p">(</span><span class="n">batches</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">])</span>   <span class="c1"># overlaps with the compute below</span>
+<a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a>    <span class="n">losses</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">batch</span> <span class="o">@</span> <span class="n">weight</span><span class="p">)</span><span class="o">.</span><span class="n">square</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span>
+<a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a>
+<a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a><span class="nb">print</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">losses</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">())</span>
+</code></pre></div>
+<p>Each host batch here is a separate pinned tensor that is never modified. If
+you refill a single pinned buffer instead, wait for its previous upload to
+finish before you write to it again, for example with an event recorded on
+<code>copy_stream</code> after the upload.</p>
+<h2 id="apple-gpus">Apple GPUs<a class="headerlink" href="#apple-gpus" title="Permanent link">&para;</a></h2>
+<p>On Apple GPUs (Metal), the mojo device has a single queue per device, like
+PyTorch's MPS backend:</p>
+<ul>
+<li><code>torch.Stream(device="mojo")</code> returns the default stream, whatever the
+  priority: its <code>stream_id</code> is 0, and it compares equal to
+  <code>torch.mojo.default_stream()</code> and to every other mojo stream of the device.
+  <code>with stream:</code>, <code>set_stream</code>, <code>current_stream</code> and <code>default_stream</code> work.
+  All the work runs in order on the one queue, so no cross-stream waits are
+  needed.</li>
+<li><code>stream.synchronize()</code>, <code>torch.mojo.synchronize()</code> and
+  <code>torch.accelerator.synchronize()</code> work. <code>stream.query()</code> waits for the
+  queue to finish and then returns <code>True</code>.</li>
+<li><code>tensor.record_stream(stream)</code> works.</li>
+<li>Host-to-device copies complete before they return, even with
+  <code>non_blocking=True</code>.</li>
+<li>Events are not supported, because MAX does not implement Metal events.
+  Creating a <code>torch.Event</code> works, but recording one raises
+  <code>RuntimeError: mojo backend: events are not supported on Apple GPU (Metal)</code>.
+  That covers <code>event.record()</code>, <code>stream.record_event()</code> and
+  <code>stream.wait_stream()</code>, which PyTorch implements with an event. With no
+  recorded events, <code>elapsed_time()</code> is not available either.</li>
+</ul>
+<p>For code that runs on every GPU, skip the wait when the two streams are the
+same stream (they always are on Apple GPUs), and time work with
+<code>torch.mojo.synchronize()</code> and a host clock, as in the
+"Any GPU, including Apple" tab <a href="#timing-gpu-work">above</a>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch_mojo_backend</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="n">torch_mojo_backend</span><span class="o">.</span><span class="n">register_mojo_devices</span><span class="p">()</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="k">def</span><span class="w"> </span><span class="nf">wait_for</span><span class="p">(</span><span class="n">waiter</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">,</span> <span class="n">producer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">):</span>
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>    <span class="c1"># On Apple GPUs every stream is the default stream: the two compare</span>
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>    <span class="c1"># equal, the queue is already in order, and wait_stream() would raise.</span>
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>    <span class="k">if</span> <span class="n">waiter</span> <span class="o">!=</span> <span class="n">producer</span><span class="p">:</span>
+<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>        <span class="n">waiter</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">producer</span><span class="p">)</span>
+<a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>
+<a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>
+<a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a><span class="n">main</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">accelerator</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
+<a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="n">side</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;mojo&quot;</span><span class="p">)</span>
+<a id="__codelineno-6-17" name="__codelineno-6-17" href="#__codelineno-6-17"></a>
+<a id="__codelineno-6-18" name="__codelineno-6-18" href="#__codelineno-6-18"></a><span class="n">wait_for</span><span class="p">(</span><span class="n">side</span><span class="p">,</span> <span class="n">main</span><span class="p">)</span>
+<a id="__codelineno-6-19" name="__codelineno-6-19" href="#__codelineno-6-19"></a><span class="k">with</span> <span class="n">side</span><span class="p">:</span>
+<a id="__codelineno-6-20" name="__codelineno-6-20" href="#__codelineno-6-20"></a>    <span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
+<a id="__codelineno-6-21" name="__codelineno-6-21" href="#__codelineno-6-21"></a><span class="n">wait_for</span><span class="p">(</span><span class="n">main</span><span class="p">,</span> <span class="n">side</span><span class="p">)</span>
+<a id="__codelineno-6-22" name="__codelineno-6-22" href="#__codelineno-6-22"></a><span class="nb">print</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">y</span><span class="o">.</span><span class="n">cpu</span><span class="p">(),</span> <span class="n">x</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span> <span class="o">*</span> <span class="mi">2</span><span class="p">))</span>           <span class="c1"># True</span>
+<a id="__codelineno-6-23" name="__codelineno-6-23" href="#__codelineno-6-23"></a><span class="nb">print</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">mojo</span><span class="o">.</span><span class="n">get_device_properties</span><span class="p">()</span><span class="o">.</span><span class="n">api</span><span class="p">)</span>      <span class="c1"># &quot;cuda&quot;, &quot;hip&quot; or &quot;metal&quot;</span>
+</code></pre></div>
+<p>If you need to branch explicitly, <code>torch.mojo.get_device_properties().api</code>
+tells you which kind of GPU you are on.</p>
+<h2 id="not-supported">Not supported<a class="headerlink" href="#not-supported" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Interprocess events: <code>torch.Event(interprocess=True)</code> is accepted but
+  creates an ordinary event, and <code>event.ipc_handle()</code> and
+  <code>torch.Event.from_ipc_handle()</code> raise <code>NotImplementedError</code>. For multi-GPU
+  and multi-process work, see <a href="../distributed_training/">Distributed training</a>.</li>
+<li>Graph capture: there is no equivalent of <code>torch.cuda.graph</code> or
+  <code>torch.cuda.CUDAGraph</code>, and no stream capture.</li>
+<li>External streams: nothing plays the role of <code>torch.cuda.ExternalStream</code>,
+  which wraps a stream created outside PyTorch.</li>
+<li>Reading stream priorities: priorities are applied when a stream is
+  created, but there is no <code>stream.priority</code> attribute and no
+  <code>priority_range()</code>.</li>
+<li>Events and independent streams on Apple GPUs, as described
+  <a href="#apple-gpus">above</a>.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../accelerator_api/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Accelerator API">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Accelerator API
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../distributed_training/" class="md-footer__link md-footer__link--next" aria-label="Next: Distributed training">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Distributed training
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.copy", "content.tabs.link", "navigation.footer", "navigation.top", "search.highlight", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"default": "stable", "provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
