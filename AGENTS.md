@@ -70,7 +70,7 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
 - **Debugging Tools**:
   - Environment variables for profiling and verbose output
   - Graph visualization when `TORCH_MOJO_BACKEND_VERBOSE=1`
-  - Eager-mode kernel builds are described in `docs/mojo_extensions.md`:
+  - Eager-mode kernel builds are described in `agents_docs/mojo_extensions.md`:
     every specialization compiles inline at its first call and is cached in
     `~/.cache/torch-mojo-backend/native/` (`TORCH_MOJO_BACKEND_CACHE_DIR`
     moves it, `torch-mojo-backend cache dir` prints it,
@@ -80,7 +80,7 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
     warning; off by default, on under pytest (`tests/conftest.py`), so keep
     the Mojo sources warning-free.
   - `TORCH_MOJO_BACKEND_CCL=mojo` swaps NCCL/RCCL for the in-repo Mojo
-    collectives (`docs/distributed.md`, "Mojo collectives"); default is
+    collectives (`agents_docs/distributed.md`, "Mojo collectives"); default is
     the vendor library.
 - **Model Examples**: `demo_scripts/` contains examples showing real-world usage:
   - GPT-2, Gemma3 (LLM models)
@@ -236,7 +236,7 @@ graph should run too, do not re-compose it from MAX ops: register the eager
 kernel as a MAX custom op in `tmb/graph/` (`gemm.mojo`, `nn.mojo`), wrap it
 in `custom_mojo_ops.native_<name>`, and route to it from `aten_functions.py`
 when every operand sits on one GPU (see `_native_matmul` and
-`docs/mojo_extensions.md`, "The eager kernels in the graph backend"). Call
+`agents_docs/mojo_extensions.md`, "The eager kernels in the graph backend"). Call
 the kernel's comptime-dtype entry point, never a `_spec_*` / runtime-dtype
 dispatcher: those read `-D` defines a MAX-compiled package does not have.
 Import it from a module without the family's `@export tmb_call` (one graph
@@ -255,7 +255,7 @@ def aten__log_softmax(
 ```
 
 ### Step 7: Implement the Op on the Native Device
-Eager mode is the native PrivateUse1 backend (`docs/native_backend.md` — read
+Eager mode is the native PrivateUse1 backend (`agents_docs/native_backend.md` — read
 it before writing an op): torch's C++ dispatcher calls a Mojo function
 directly, no Python on the op path. There is **no graph fallback**: an op is
 either implemented in Mojo or `NotImplementedError`.
@@ -397,7 +397,7 @@ It may be hard to find the correct type hints for a function. What you should do
 Read this especially if you're an agent doing code review.
 
 1) The user should be able to use `my_tensor.to("mojo")` and use their gpu, even if they have a CPU-only install of PyTorch. That means that when writing kernels, we can't use CuBLAS, CuDNN, RocBLAS, or any other lib that would be available only if torch-gpu was installed. We want to stand on our own legs. We can use and import mojo functions from the modular repository (`from nn import ...`) but only if it's not calling CuBLAS, CuDNN... underneath. Our motto should be "pip install torch-mojo-backend with the minimal pytorch install (cpu) and use your gpu.".
-2) Everything is JIT-compiled at first use against the installed torch, never prebuilt against one ABI: that is what keeps us compatible with many PyTorch versions. The ONE piece of C++ is `native/csrc/` (`docs/native_backend.md`), which exists only for the c10 objects torch accepts as nothing but C++ classes -- the boxed-kernel adapter, the allocator, the hooks/device guard, the generator, the profiler stubs, the autocast fallback -- and it compiles in ~7 s at the first `register_mojo_devices()`. It needs g++ or clang++ on the box; nothing else does, and no op, kernel or device logic may move into it. Everything above that line is Mojo.
+2) Everything is JIT-compiled at first use against the installed torch, never prebuilt against one ABI: that is what keeps us compatible with many PyTorch versions. The ONE piece of C++ is `native/csrc/` (`agents_docs/native_backend.md`), which exists only for the c10 objects torch accepts as nothing but C++ classes -- the boxed-kernel adapter, the allocator, the hooks/device guard, the generator, the profiler stubs, the autocast fallback -- and it compiles in ~7 s at the first `register_mojo_devices()`. It needs g++ or clang++ on the box; nothing else does, and no op, kernel or device logic may move into it. Everything above that line is Mojo.
 3) You cannot use information about the tensors other than the shape, stride, dtype, pointer in the eager mode. While it's tempting to "keep a history of some past op to do fused ops", it will not improve the performance for all workflows. Pytorch uses Aten ops and decompositions, so sometimes, if you want to implement a fused op, you might want to target a higher level aten function, before it gets decomposed. Aten ops that are not implemented are decomposed automatically in pytorch. 
 4) Do not write kernels that work only for a very specific shape. Input shapes should be dynamic to avoid recompiles. While it's tempting to make things faster, a user trying a slightly different shape will not benefit from the optimisations of this kernels. It's fine to write different kernels for different regimes (e.g. a kernel for big shape, small shapes, square shapes, rectangular, power of two, etc...) and then do dynamic dispatch based on the input shapes. It's not because we optimize for a given model that we can hardcode at compile-time all the shapes of the kenels to make it faster. So do multiple flexible kernels + dispatch, do not do kernels for hardcoded shapes + fallback.
 5) When asked to optimize a model, the answer should never be "change the code of the model". The model is user-defined, we have no control over it. We just control what we do with the tensors we're given by pytorch.

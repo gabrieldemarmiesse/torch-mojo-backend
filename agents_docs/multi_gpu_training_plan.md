@@ -1,7 +1,7 @@
 # Multi-GPU training on the mojo device (eager mode): design and plan
 
 Status: **superseded.** Multi-GPU training shipped instead as the c10d
-backend of the native device (`docs/distributed.md`,
+backend of the native device (`agents_docs/distributed.md`,
 `native/mojo/pg.mojo`), not as the single-process pure-Python ProcessGroup
 this file proposes; the eager internals it cites (`torch_mojo_tensor.py`,
 `mojo_device_aten_ops.py`) are deleted. Kept for the research it records.

@@ -1,4 +1,4 @@
-"""ATen ops: attention group (see docs/native_backend.md).
+"""ATen ops: attention group (see agents_docs/native_backend.md).
 
 `F.scaled_dot_product_attention` is CompositeImplicitAutograd: ATen picks a
 backend, calls the matching lower op, and autograd differentiates *that* op

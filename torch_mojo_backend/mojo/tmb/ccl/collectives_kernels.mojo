@@ -83,7 +83,7 @@
 #
 # NVIDIA keeps the pull: behind a switch every direction is equivalent, the
 # pull needs no gather slots and no local copy, and the H100 numbers in
-# docs/mojo_collectives_kernel_results.md were measured with it.  The split is
+# agents_docs/mojo_collectives_kernel_results.md were measured with it.  The split is
 # a `comptime if has_amd_gpu_accelerator()` in the kernel and in the one host
 # line that sizes the arena, so NVIDIA device code is unchanged.
 #
@@ -749,7 +749,7 @@ def _sync(
         # why the cheap version is sound on this hardware, and two cheaper
         # release spellings already turned out unsound here in exactly this
         # way -- small payloads only. So: correctness, and the large messages
-        # pay for it. See docs/mojo_collectives_kernel_results.md section 7
+        # pay for it. See agents_docs/mojo_collectives_kernel_results.md section 7
         # for the experiment that would settle it.
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
             _flags(regions[peer].unsafe_offset(arena_off)).unsafe_offset(
@@ -953,7 +953,7 @@ def _peer_step(i: Int, world: Int) -> Int:
     as the MI300A's xGMI mesh (one link per GPU pair): with the plain order
     the whole grid queues on one peer's link at a time and the other
     `world-2` links sit idle; rotated, the blocks spread over all of them at
-    once. Measured on 4x MI300A: see docs/distributed.md, "Cluster notes
+    once. Measured on 4x MI300A: see agents_docs/distributed.md, "Cluster notes
     (AMD MI300A)". Behind NVSwitch it is not irrelevant either: with every
     block of a rank storing into the same peer at once the 2x8 H100 fused
     reduce-scatter's push ran at 291 GB/s per GPU, rotated 326 (block fp32

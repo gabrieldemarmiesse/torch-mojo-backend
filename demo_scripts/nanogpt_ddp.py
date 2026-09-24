@@ -224,7 +224,7 @@ def main():
     vmm = os.environ.get("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM", "").lower()
     if device == "mojo" and vmm in ("1", "true", "yes", "on"):
         # MAX's on-demand (VMM) device allocator is what makes an APU such as
-        # the MI300A usable with one rank per GPU (docs/distributed.md), but
+        # the MI300A usable with one rank per GPU (agents_docs/distributed.md), but
         # with MAX 26.5 + ROCm 6.4.3 the HSA runtime segfaults in its atexit
         # teardown of the VMM mappings, after Python has finished. Everything
         # above ran and was checkpointed; skip the C exit handlers.

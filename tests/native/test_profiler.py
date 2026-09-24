@@ -1,5 +1,5 @@
 """Profiling on the mojo device: the shim registers torch's PrivateUse1
-ProfilerStubs over the backend's timed events (docs/native_backend.md,
+ProfilerStubs over the backend's timed events (agents_docs/native_backend.md,
 "Profiling"), so the legacy profiler reports device time per op; the Kineto
 profiler records the CPU-side timeline and exports a Chrome trace."""
 

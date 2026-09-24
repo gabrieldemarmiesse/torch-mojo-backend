@@ -4,7 +4,7 @@ Runs one validation mode per invocation and exits non-zero on failure so the
 parent test only has to check the return code. Every mode drives the mojo
 distributed backend through public torch.distributed / torch.mojo APIs only:
 the native backend's tensors are ordinary ``torch.Tensor``s (see
-docs/native_backend.md), so there is no more ``TorchMojoTensor``, no ctypes
+agents_docs/native_backend.md), so there is no more ``TorchMojoTensor``, no ctypes
 ``NcclComm``, and no ``process_group`` internals (``_ptr_of``,
 ``_device_state``, ``_fence_default``) to reach into -- `MojoProcessGroup`
 itself (the adapter class, `torch_mojo_backend/distributed/process_group.py`)
@@ -92,7 +92,7 @@ def run_collectives(failures: list[str]):
     # (a product of "rank+1" over many ranks overflows fast).
 
     # ---- all_reduce: every ReduceOp, plus a strided input -----------------
-    # mojoccl implements SUM and AVG only (docs/distributed.md, "Mojo
+    # mojoccl implements SUM and AVG only (agents_docs/distributed.md, "Mojo
     # collectives"); MAX/MIN/PRODUCT are vendor-NCCL/RCCL-only here.
     ops = [(dist.ReduceOp.SUM, total), (dist.ReduceOp.AVG, (world + 1) / 2.0)]
     if not _MOJO_CCL:
@@ -359,7 +359,7 @@ def run_stream_ordering(failures: list[str]):
     The native backend completes a collective's Work while the comm stream is
     current (a device-typed torch Future), so ``Work.wait()`` -- not an
     implicit per-op hook -- is what orders a waiter's stream after it (see
-    "Distributed" in docs/native_backend.md). 256 MiB per collective on
+    "Distributed" in agents_docs/native_backend.md). 256 MiB per collective on
     purpose: big enough that the collective is still running on the comm
     stream a few microseconds later, when the host reaches the check.
     """

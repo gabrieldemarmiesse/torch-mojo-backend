@@ -1,4 +1,4 @@
-"""Registration of the `mojo` device (see docs/native_backend.md)."""
+"""Registration of the `mojo` device (see agents_docs/native_backend.md)."""
 
 import threading
 

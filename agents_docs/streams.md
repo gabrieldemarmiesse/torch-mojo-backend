@@ -79,7 +79,7 @@ reading a tensor a side stream produced needs `torch.accelerator.synchronize()`
 or a `wait_stream`, exactly as on CUDA. `tensor.record_stream(stream)`
 is supported: the backend turns it into a MAX event the owning stream waits
 on before the buffer is released back to the allocator (see
-`docs/native_backend.md`, "Streams").
+`agents_docs/native_backend.md`, "Streams").
 
 `torch.accelerator.synchronize()` and `torch.mojo.synchronize()` are that
 host barrier over *every* stream of the device. They only work because

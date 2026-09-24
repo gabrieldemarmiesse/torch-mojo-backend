@@ -5,7 +5,7 @@ real training steps (bf16 autocast, fused AdamW) to warm every kernel and
 allocate optimizer state, then profiles K iterations of forward + backward with
 the legacy autograd profiler, which reports device time per op on both backends
 (torch's CUDA events on "cuda", the shim's ProfilerStubs on "mojo" — see
-docs/native_backend.md, "Profiling"). The optimizer runs only during warmup so
+agents_docs/native_backend.md, "Profiling"). The optimizer runs only during warmup so
 its ops stay out of the profile; zero_grad(set_to_none=True) between profiled
 steps keeps each backward identical to a fresh training step's.
 

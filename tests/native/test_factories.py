@@ -19,7 +19,7 @@ from torch_mojo_backend.native import device_module
 
 def _op_count_delta(name: str):
     """A context manager-less before/after pair for one native op's call
-    count (docs/native_backend.md "Test support"), for ops with no
+    count (agents_docs/native_backend.md "Test support"), for ops with no
     `aten_functions` twin for `CallChecker` to key off."""
     native.op_counting(True)
     before = native.op_count(name)

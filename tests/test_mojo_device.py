@@ -1,6 +1,6 @@
 """Unit tests for basic native mojo device functionality.
 
-The device is a real PrivateUse1 backend (see docs/native_backend.md):
+The device is a real PrivateUse1 backend (see agents_docs/native_backend.md):
 tensors are plain, unwrapped `torch.Tensor`s over MAX device memory, with no
 `TorchMojoTensor` wrapper, no `_holder`/`_ptr`/`_mojo_strides` payload
 attributes, and no Python-level transfer bookkeeping (`_PENDING_H2D`,

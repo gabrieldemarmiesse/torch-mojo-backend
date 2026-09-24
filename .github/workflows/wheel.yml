@@ -3,7 +3,7 @@ name: Wheel
 # Builds the release wheel: the one that carries the two fixed native
 # libraries prebuilt, so `pip install torch-mojo-backend` does not compile
 # them -- and does not need a C++ compiler -- at the first
-# register_mojo_devices(). See docs/native_backend.md, "Prebuilt libraries
+# register_mojo_devices(). See agents_docs/native_backend.md, "Prebuilt libraries
 # and the wheel", for what ships and how a file is selected at run time.
 #
 # Every command below is one `scripts/build_prebuilt.py` invocation that can
@@ -33,7 +33,7 @@ permissions:
   contents: read
 
 env:
-  # Every torch series the native backend supports (docs/native_backend.md,
+  # Every torch series the native backend supports (agents_docs/native_backend.md,
   # "Supported torch versions"). A series with no CPU wheel for a platform is
   # skipped, with a line in the build log.
   TORCH_SERIES: "2.7 2.8 2.9 2.10 2.11 2.12 2.13 2.14"

@@ -32,7 +32,7 @@ packages = ["torch_mojo_backend"]
 # wheel stays py3-none-any: these are data files ctypes loads at run time, not
 # extension modules, and one wheel carrying every platform's pair is simpler
 # than a wheel per platform -- a file that does not match the machine is never
-# opened (see docs/native_backend.md, "Prebuilt libraries and the wheel").
+# opened (see agents_docs/native_backend.md, "Prebuilt libraries and the wheel").
 artifacts = [
     "torch_mojo_backend/native/prebuilt/*.so",
     "torch_mojo_backend/native/prebuilt/*.dylib",
@@ -109,7 +109,7 @@ allowed-unresolved-imports = ["triton.**", "nvidia.nccl"]
 # cannot express: MojoProcessGroup._get_backend returns itself rather than a
 # c10d Backend, because torch looks a group's backend up that way for
 # batch_isend_irecv and _coalescing_manager and the mojo group IS its own
-# backend (see docs/native_backend.md, "Distributed"). `ty check` exits
+# backend (see agents_docs/native_backend.md, "Distributed"). `ty check` exits
 # non-zero on warnings too (no `--exit-zero-on-warning` in CI), so this must
 # be "ignore", not "warn", to keep `ty check` green.
 invalid-method-override = "ignore"

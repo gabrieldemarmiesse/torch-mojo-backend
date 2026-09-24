@@ -3,7 +3,7 @@
 # copies (transpose/permute materialization), narrow copies (split/slice
 # along one dim), dtype casts, and cond ? a : b selection.
 #
-# Raw-pointer convention (see docs/strided_owning_tensors_design.md): every
+# Raw-pointer convention (see agents_docs/strided_owning_tensors_design.md): every
 # Python-visible function takes raw element-aligned data addresses (ints,
 # storage offset already applied) plus the device's DeviceContext pointer —
 # there is no `max.driver.Buffer` on this side any more. Pure-copy kernels

@@ -10,7 +10,7 @@ longer calls that patch at all -- the native backend registers a real C++
 `PrivateUse1HooksInterface` (`native/csrc/shim_runtime.cpp`), so
 `torch.Stream(device="mojo")` is a genuine, unsubclassed `torch.Stream`
 backed by a real MAX stream, through the ordinary generic path (see
-`docs/streams.md`). There is no more `MojoStream`/`mojo_device.streams`
+`agents_docs/streams.md`). There is no more `MojoStream`/`mojo_device.streams`
 Python surface, no per-name `device_streams.get_stream` cache, and no
 `record_use` to call directly: `tensor.record_stream(stream)` is a public
 torch API now, handled by the C++ shim.
@@ -46,7 +46,7 @@ def test_stream_construction_and_identity(mojo_gpu: str):
     assert stream.device == torch.device("mojo", 0)
     assert stream.device_index == 0
     assert stream.native_handle != 0  # ty: ignore[unresolved-attribute] -- torch's Stream stub lacks native_handle
-    # stream_id indexes the device's MAX context views (see docs/streams.md),
+    # stream_id indexes the device's MAX context views (see agents_docs/streams.md),
     # independently of the underlying native CUstream/hipStream_t.
     assert stream.stream_id != stream.native_handle  # ty: ignore[unresolved-attribute]
     assert stream.stream_id != torch.accelerator.current_stream().stream_id

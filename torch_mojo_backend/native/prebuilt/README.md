@@ -16,4 +16,4 @@ always did. `TORCH_MOJO_BACKEND_PREBUILT=0` ignores this directory entirely.
 
 Everything but this README is a build artefact: git ignores it, and
 `scripts/build_prebuilt.py` (or the `wheel.yml` workflow) writes it. See
-`docs/native_backend.md`, "Prebuilt libraries and the wheel".
+`agents_docs/native_backend.md`, "Prebuilt libraries and the wheel".

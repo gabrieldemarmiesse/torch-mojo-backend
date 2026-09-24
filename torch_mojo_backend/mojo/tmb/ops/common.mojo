@@ -393,7 +393,7 @@ def philox_reserve(
     """Atomically reserve `increment` counters of a device's (generator=0)
     or an explicit generator's Philox stream: returns `(seed, base_offset)`
     as they stood *before* the reservation (tmb_philox_reserve,
-    docs/native_backend.md). Generic device-runtime plumbing any RNG op of
+    agents_docs/native_backend.md). Generic device-runtime plumbing any RNG op of
     any group needs, not specific to one op group."""
     var seed: UInt64 = 0
     var offset: UInt64 = 0

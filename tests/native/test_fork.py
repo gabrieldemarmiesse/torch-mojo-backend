@@ -1,4 +1,4 @@
-"""fork() after the mojo device is up (docs/native_backend.md, "Fork").
+"""fork() after the mojo device is up (agents_docs/native_backend.md, "Fork").
 
 The MAX runtime is not fork-safe: its worker threads and device contexts do
 not exist in a forked child, and a device call there waits forever on a

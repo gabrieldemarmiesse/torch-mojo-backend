@@ -1,6 +1,6 @@
 # Native backend on AMD MI300A (ROCm 6.4.3): validation report
 
-Run of `docs/amd_validation_plan.md` on the Adastra cluster (CINES),
+Run of `agents_docs/amd_validation_plan.md` on the Adastra cluster (CINES),
 2026-09-13, branch `mojo-native-backend` at 588f776. Everything below was run
 by an agent on one exclusive MI300A node; the sections follow the plan.
 

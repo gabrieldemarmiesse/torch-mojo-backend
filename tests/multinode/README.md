@@ -5,8 +5,8 @@ exercises the mojo distributed backend (`torch_mojo_backend/distributed/`)
 both with real NCCL (`TORCH_MOJO_BACKEND_CCL` unset, called "vendor" below)
 and with `mojoccl` (`TORCH_MOJO_BACKEND_CCL=mojo`, the in-repo Mojo
 re-implementation of NCCL's C ABI — see the "Mojo collectives" section of
-`docs/distributed.md`). Background reading: `AGENTS.md`, `docs/distributed.md`,
-`docs/mojo_collectives_feasibility.md` (especially §2 traffic profile, §5.1
+`agents_docs/distributed.md`). Background reading: `AGENTS.md`, `agents_docs/distributed.md`,
+`agents_docs/mojo_collectives_feasibility.md` (especially §2 traffic profile, §5.1
 and §5.5 for the single- and two-node NCCL reference numbers, and §7/§8 for
 the multi-node design this job is meant to validate once it lands).
 
@@ -66,7 +66,7 @@ either libibverbs (`ibverbs.mojo`, InfiniBand) or libfabric
 (`libfabric.mojo`, HPE Slingshot / `cxi`), chosen at `ncclCommInitRank` time
 or forced with `MOJOCCL_NET=verbs|fabric` — no vendor collective library at
 any level. See the "Multi-node" subsection of
-`docs/distributed.md` for the design. `RUN_MOJO` therefore **defaults to
+`agents_docs/distributed.md` for the design. `RUN_MOJO` therefore **defaults to
 `1`**: leave it unset to exercise the mojo legs end to end at 16 ranks.
 `RUN_MOJO=0` still exists to get a vendor-only NCCL reference run without
 spending the job's time budget on the mojo legs (useful when only NCCL's

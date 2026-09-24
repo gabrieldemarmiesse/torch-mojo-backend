@@ -4,7 +4,7 @@ This is a hands-off brief for an agent with an AMD cluster. Everything below
 was verified on NVIDIA H100 (CUDA), on the MAX CPU device, and on an Apple M4
 (Metal); nothing has run on AMD since the eager mode was rewritten as a native
 PyTorch backend (branch `mojo-native-backend`, PR #458,
-`docs/native_backend.md` is the design). The kernel families under
+`agents_docs/native_backend.md` is the design). The kernel families under
 `torch_mojo_backend/eager_kernels/` are the ones the old path ran on MI300A;
 what is new and unverified on AMD is everything above them: the C++ shim, the
 Mojo runtime (`native/mojo/`), every op body (`ops_<group>.mojo`), the HIP

@@ -1,6 +1,6 @@
 """The `torch-mojo-backend` command line: `cache dir` prints the native
 kernel cache directory and `cache clean` removes it (see
-docs/native_backend.md, "Three builds": nothing else ever reaps it).
+agents_docs/native_backend.md, "Three builds": nothing else ever reaps it).
 `ptxas` prints which assembler the kernels are built with and why."""
 
 from __future__ import annotations

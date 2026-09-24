@@ -3,13 +3,13 @@
 > **Superseded.** This documents the old Python-driven eager path
 > (`eager_kernels/__init__.py`'s `MojoExtensionLoader`, `aten_fast.py`,
 > `TorchMojoTensor`, `mojo_device_aten_ops.py`). The `mojo` device is now the
-> native PrivateUse1 backend described in `docs/native_backend.md`: torch's
+> native PrivateUse1 backend described in `agents_docs/native_backend.md`: torch's
 > C++ dispatcher calls Mojo directly, with no `TorchMojoTensor` wrapper, no
 > Python `MojoExtensionLoader`, and no per-op Python descriptor. The kernel
 > families this file measures (`elementwise_ops.mojo`, `matmul_ops.mojo`,
 > `nn_ops.mojo`, ...) are largely the same Mojo sources, now called from
 > `native/mojo/ops_*.mojo` via `native/mojo/loader.mojo` — see
-> `docs/mojo_extensions.md` for that design and `docs/native_backend.md` for
+> `agents_docs/mojo_extensions.md` for that design and `agents_docs/native_backend.md` for
 > the architecture. This page is kept for its measurements and the kernel
 > design history (GEMM/conv milestones, ncu findings), which are still
 > accurate engineering record; treat every code path and Python API it
@@ -94,7 +94,7 @@ This section used to be a "scaling analysis" arguing for compilation at
 that per-variant builds multiply total compile time ~40×. That
 recommendation has been reversed by measurement and the shipped design
 is the opposite one: **one `.so` per exact specialization, built inline
-at its first call** ([docs/mojo_extensions.md](mojo_extensions.md)).
+at its first call** ([agents_docs/mojo_extensions.md](mojo_extensions.md)).
 
 The old argument measured the wrong quantity — total compiler *work*
 rather than the wall-clock a cold workload waits. What changed it:
@@ -250,7 +250,7 @@ multiple families and the `op_utils` Mojo package remain at the package root.
 A family source file is the compilation *input*, not the compilation unit:
 each `.so` built from it is gated down to one operation and one dtype tuple
 (see "Compile granularity" above and
-[docs/mojo_extensions.md](mojo_extensions.md)).
+[agents_docs/mojo_extensions.md](mojo_extensions.md)).
 
 - `elementwise_ops.mojo` — binary/unary ops + Python-scalar variants
   (`x * 0.5`, `x ** 3`, int `x + 1`), tanh; contiguous, dtypes selected by

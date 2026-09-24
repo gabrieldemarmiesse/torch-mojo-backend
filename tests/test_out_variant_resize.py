@@ -1,7 +1,7 @@
 """Eager `out=` resize, aliasing, and dtype-policy contracts, on the native
 backend.
 
-Per docs/native_backend.md / the porting brief: an `out=` op computes into
+Per agents_docs/native_backend.md / the porting brief: an `out=` op computes into
 the caller's tensor when it already has the right shape/dtype/contiguity,
 else computes then `copy_strided_into`s -- so a same-shape `out=` on a view
 must keep writing through the *original* storage (no silent reallocation),

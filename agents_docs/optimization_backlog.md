@@ -17,7 +17,7 @@ names the symbol; if a line does not match, grep the name.
 **The host side moved to Mojo.** Every `aten_fast.py`, `mojo_device_aten_ops.py`
 and `TorchMojoTensor` citation below points into the Python eager path, which
 has since been deleted: the host logic it describes now lives in
-`native/mojo/ops_*.mojo` (see `docs/native_backend.md`). The *kernels* and the
+`native/mojo/ops_*.mojo` (see `agents_docs/native_backend.md`). The *kernels* and the
 gates in `eager_kernels/<family>/` are the same sources, so every finding about
 a kernel, a dtype gate or a route still applies; translate the entry point by
 grepping the route's name or its `KernelCall("<family>", "<Op>")`.
@@ -316,7 +316,7 @@ different kind of item.
   a slice or a permuted view out of the tensor-core path.
 * **What the optimized version looks like.** `alpha`/`beta` as *runtime* scalars
   in the existing bias epilogue — they do not select different code, so per
-  `docs/mojo_extensions.md` they must be runtime data, not defines. For rank>2,
+  `agents_docs/mojo_extensions.md` they must be runtime data, not defines. For rank>2,
   flatten the leading dims whenever the trailing two are dense, which is strictly
   weaker than full contiguity.
 * **Expected win.** **UNMEASURED.** Coverage-shaped: zero for workloads that
@@ -1197,7 +1197,7 @@ descriptor-batched body for the whole family)
 ### P1
 **Warm-path regression from the variant loader: 101 ms/step vs 60 ms on `main`**
 
-> **Update 2026-08-02.** Largely fixed; see `docs/fast_eager_design.md`
+> **Update 2026-08-02.** Largely fixed; see `agents_docs/fast_eager_design.md`
 > "Compile granularity" for the full table. Measured on H100:
 > batch 48 now at **parity** (193.6 vs 193.8 ms), batch 12 at
 > **63.6 vs 60.0 ms** (was 66.5 in the pre-fix working tree). The three
@@ -1210,7 +1210,7 @@ descriptor-batched body for the whole family)
 > allocation, the dispatch bracket (+0.94 µs/op), and prepare/submit
 > machinery (~13 µs vs main's ~4 µs for a warm binary add).
 
-* **What.** Recorded in `docs/fast_eager_design.md`, "Compile granularity":
+* **What.** Recorded in `agents_docs/fast_eager_design.md`, "Compile granularity":
   *"The warm path is currently a regression, not a win. Steady-state training
   step with everything cached: 101 ms on this branch vs 60 ms on main."* The cost
   lives in `eager_kernels/__init__.py` (source-path resolution, define
@@ -1269,7 +1269,7 @@ descriptor-batched body for the whole family)
 > warm path is untouched — the meter runs only on the queued branch,
 > which a warm pass never takes.
 
-* **What.** `docs/fast_eager_design.md`, "Measured (H100 PCIe, 24-core host)":
+* **What.** `agents_docs/fast_eager_design.md`, "Measured (H100 PCIe, 24-core host)":
   11.6 s first step with the build pool, 56.3 s without.
 * **Current implementation.** One `.so` per exact specialization, built inline
   at its first call (the background pool was removed 2026-09-08).

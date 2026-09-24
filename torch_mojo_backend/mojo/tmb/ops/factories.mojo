@@ -1,4 +1,4 @@
-"""ATen ops: factories group (see docs/native_backend.md).
+"""ATen ops: factories group (see agents_docs/native_backend.md).
 
 Most of this group's aten surface -- full/zeros/ones/new_*/scalar_tensor/
 empty_like/*_like -- is CompositeExplicitAutograd upstream (verified against

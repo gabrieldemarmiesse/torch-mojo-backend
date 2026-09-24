@@ -123,7 +123,7 @@ lines** — `nvls_kernels.mojo` and `vmm.mojo`, dispatched above 48 MiB, taking
 168 MiB from 990 to 790 us and 512 MiB from 2988 to 2226. Nothing in this file
 changed: the six exported names below are untouched and the unicast kernels
 still carry everything below the crossover. See the "NVLS" subsection of
-docs/distributed.md.
+agents_docs/distributed.md.
 
 Consequences for GPT-2 DDP: buckets 0-11 (9 and 27 MiB) are faster than NCCL and
 overlapped with backward anyway; the exposed 168 MiB tail bucket costs
@@ -452,7 +452,7 @@ shard in stage_out. Checked exhaustively over every dtype width, world and cap.
 
 The ABI layer now runs several such pairs CONCURRENTLY, to overlap the
 inter-node hop with the intra-node halves of other chunks (see the
-"Multi-node" subsection of `docs/distributed.md`). It needs nothing from this
+"Multi-node" subsection of `agents_docs/distributed.md`). It needs nothing from this
 file to do it: each in-flight chunk is handed a different arena -- a shifted
 region base and a smaller `cap_bytes`, carved so the arenas are disjoint --
 so every rule above applies per arena, unchanged, and point 3 is what orders
@@ -830,7 +830,7 @@ exits nonzero for reasons that have nothing to do with these kernels: without
 `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM` four ranks reserving ~124 GB each
 are OOM-killed on this APU, and with it the process segfaults in HIP's atexit
 handler unless the script ends in `os._exit(0)` — both already in
-`docs/distributed.md`.
+`agents_docs/distributed.md`.
 
 **A flake that cost the large messages 6%.** During the work the barrier's
 acquire was cheapened: spin on a *relaxed* load (still `sc0 sc1`, so it cannot

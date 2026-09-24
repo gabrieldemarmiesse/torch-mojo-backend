@@ -3,7 +3,7 @@
 > **Superseded.** This designs the Python eager path (`TorchMojoTensor`,
 > `aten_fast.py`, the `MojoExtension` loader), which has been deleted; the
 > `mojo` device is the native PrivateUse1 backend of
-> `docs/native_backend.md`. Kept for the design reasoning and the
+> `agents_docs/native_backend.md`. Kept for the design reasoning and the
 > measurements, which the Mojo host side inherited.
 
 Status: **IMPLEMENTED** on branch `eager-strided-owning-tensors`. The plan
@@ -415,4 +415,4 @@ strides too and need the same stride-awareness or guard.
   (`create_empty_tensor` — note it forces contiguous strides, no strides
   param), `aten/src/ATen/native/TensorShape.cpp` (composite view ops →
   `as_strided`).
-- Prior step: `docs/fast_eager_design.md`.
+- Prior step: `agents_docs/fast_eager_design.md`.

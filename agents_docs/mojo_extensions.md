@@ -1,12 +1,12 @@
 # Mojo kernel-family extensions
 
 > This describes the **native backend**'s on-demand kernel builds
-> (`torch_mojo_backend/mojo/tmb/backend/loader.mojo`). See `docs/native_backend.md`
+> (`torch_mojo_backend/mojo/tmb/backend/loader.mojo`). See `agents_docs/native_backend.md`
 > for the full architecture. The Python-level design this file used to
 > describe (`eager_kernels/__init__.py`'s `MojoExtensionLoader`,
 > `MojoExtension` descriptors, one Python-callable `call` per `.so`) was the
 > old eager-mode path; that code is deleted, and its historical measurements
-> live in `docs/fast_eager_design.md` (marked superseded there too).
+> live in `agents_docs/fast_eager_design.md` (marked superseded there too).
 
 ## Compiled at first call
 
@@ -27,7 +27,7 @@ no-warnings check: a warning in any Mojo source fails the tests that build it.
 
 This mirrors the old Python loader's behavior (same "one `.so` per exact
 specialization, built inline at first use" design, same rationale — see
-"Compile granularity" in `docs/fast_eager_design.md`), just driven from Mojo:
+"Compile granularity" in `agents_docs/fast_eager_design.md`), just driven from Mojo:
 the caller is now `tmb/ops/*.mojo`, not a Python `aten_fast.py`
 composition function.
 
@@ -97,13 +97,13 @@ The two backend shims (the C++ shim and the Mojo `tmb/backend/entry.mojo` itself
 cached the same way, one level up, in `native/__init__.py`
 (`libtmb_shim.hash-*.so`, `libtmb_backend.hash-*.so`) -- or copied there
 from the ones the wheel ships prebuilt, which is the same cache entry by
-another route; see `docs/native_backend.md`. `tests/native/test_loader.py` exercises this cache
+another route; see `agents_docs/native_backend.md`. `tests/native/test_loader.py` exercises this cache
 end to end through public behavior (env-var relocation, a second process
 reusing a build, a missing/corrupt `.so`).
 
 The ptxas 48 KiB static-shared-memory cap and the dynamic-shared-memory
 workaround for kernels that need more (unchanged from the old design) are
-documented in `docs/fast_eager_design.md`'s "Milestone 3" section and at
+documented in `agents_docs/fast_eager_design.md`'s "Milestone 3" section and at
 each affected kernel's `shared_mem_bytes` call site.
 
 ## Argv ABI

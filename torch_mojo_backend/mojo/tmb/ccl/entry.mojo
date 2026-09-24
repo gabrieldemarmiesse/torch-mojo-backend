@@ -13,7 +13,7 @@
 #
 # One process per GPU. Within a node, one region per rank of raw
 # driver-owned memory -- MAX's own allocator memory cannot be shared across
-# processes at all (see docs/mojo_collectives_feasibility.md, section 5.6) --
+# processes at all (see agents_docs/mojo_collectives_feasibility.md, section 5.6) --
 # and the collectives of collectives_kernels.mojo run over the peer mappings.
 # Across nodes, GPUDirect RDMA written here over libibverbs (ibverbs.mojo,
 # internode.mojo): no vendor collective library takes part at any level.
@@ -296,7 +296,7 @@ comptime PIPE_MAX_CHUNKS = 16
 #
 # An extra chunk costs one more reduce-scatter and one more all-gather
 # launch, each a launch plus an 8-way start barrier, ~8 us apiece on this
-# cluster (docs/mojo_collectives_kernel_results.md 10.3 reads the pair at
+# cluster (agents_docs/mojo_collectives_kernel_results.md 10.3 reads the pair at
 # 15.9 us for a 4-byte message, which is all fixed cost). Pipelining hides
 # all but ~1/K of the network, and the network of a B-byte allreduce is
 # B/(local_world * 40 GB/s), the RDMA measured at 40-45 GB/s per rank (one
@@ -351,7 +351,7 @@ comptime AG_NODE_UNROLL = 4
 
 
 # MI300A: 64 MiB supports four ranks/node without the large shared-memory
-# reservation conflict (Adastra 124M measurements in docs/distributed.md),
+# reservation conflict (Adastra 124M measurements in agents_docs/distributed.md),
 # and the GPT-2 XL five-round series at 0.9873x stock used it, job 5417296,
 # 2026-09-15. NVIDIA retains its H100 staging fit of 256 MiB.
 comptime DEFAULT_REGION_MB = 64 if _MI300A else 256
@@ -432,7 +432,7 @@ def _nvls_min_bytes() -> Int:
 def _nvls_recommended_granularity() -> Bool:
     """Use MINIMUM multicast granularity: it allocates what the region asks
     for. MINIMUM and RECOMMENDED measured the same on H100; see
-    docs/distributed.md's NVLS measurements."""
+    agents_docs/distributed.md's NVLS measurements."""
     return False
 
 
@@ -1478,7 +1478,7 @@ def _bootstrap(
     # SUPPORTED is 0 there), see the prototype's RESULTS.md section 4. Since
     # the multi-node collective stays on the unicast split kernels anyway
     # (their pipeline chunks are below the NVLS crossover; see
-    # docs/distributed.md), a multicast region there would cost 150-230 ms of
+    # agents_docs/distributed.md), a multicast region there would cost 150-230 ms of
     # bring-up and a granularity rounding for nothing.
     var use_nvls = all_caps and topo.nnodes == 1 and topo.local_world >= 2
     var granularity = 0

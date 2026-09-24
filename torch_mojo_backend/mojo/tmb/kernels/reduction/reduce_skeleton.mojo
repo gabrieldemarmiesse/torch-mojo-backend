@@ -1128,7 +1128,7 @@ def _reduce_generic[
 def _rowred_spec_into_go[
     Op: ReduceOp
 ](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, out_o: Arg,) raises:
-    """TensorSpec entry for one scalar reduction (docs/tensor_spec_design.md).
+    """TensorSpec entry for one scalar reduction (agents_docs/tensor_spec_design.md).
 
     Python parses the dim spec and owns dtype promotion and output allocation;
     this side derives the (outer, reduce, inner) geometry, validates the

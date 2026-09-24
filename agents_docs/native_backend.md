@@ -79,7 +79,7 @@ build passes; `tests/test_mojo_imports.py` keeps the grammar:
 | `tmb/backend/` | the runtime below |
 | `tmb/ops/<group>.mojo` | the aten ops, and each file's `register_<group>` list |
 | `tmb/kernels/<family>/entry.mojo` | one kernel family per directory: its `tmb_call` and its kernels; `tmb/kernels/common/` is what every family shares (`op_utils`, `variant_gates`) |
-| `tmb/ccl/entry.mojo` | libmojoccl, the in-repo collectives (`docs/distributed.md`) |
+| `tmb/ccl/entry.mojo` | libmojoccl, the in-repo collectives (`agents_docs/distributed.md`) |
 | `tmb/graph/` | the MAX custom ops of the torch.compile backend, and the SIMD math they share with the kernels; the one package MAX precompiles on its own |
 
 | file (`tmb/backend/`) | what |
@@ -744,7 +744,7 @@ What MAX 26.5's Metal backend does not have: user-created streams
 (`createStream is not supported on this device`) or device events
 (`eventCreate is not supported on this device`, including the default stream).
 `torch.Stream(device="mojo")` therefore always identifies the default stream
-(`stream_id == 0`, matching MPS — see `docs/streams.md`), while recording an
+(`stream_id == 0`, matching MPS — see `agents_docs/streams.md`), while recording an
 event still raises; and host callbacks, which is why host-to-device copies take
 the synchronous route there (`copy_from_host`; unified memory makes the
 pinned staging pointless anyway). Checked on an M4 (macOS 26.6.1): the

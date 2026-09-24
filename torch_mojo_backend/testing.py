@@ -15,7 +15,7 @@ def _xfail_if_unsupported(device: str) -> Iterator[None]:
     """xfail (rather than fail) when the mojo eager backend raises
     NotImplementedError for an input its fast kernels don't cover.
 
-    Killing the graph fallback (docs/strided_owning_tensors_design.md) turned
+    Killing the graph fallback (agents_docs/strided_owning_tensors_design.md) turned
     "unsupported input" from a slow fallback into a clear raise; this makes the
     existing suite record those as expected-unsupported instead of hard
     failures, without editing individual tests or masking real errors.

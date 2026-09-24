@@ -238,7 +238,7 @@ MojoPinnedAllocator g_pinned_allocator;
 // ---- generator: Philox (seed, offset) ------------------------------------------
 // `offset_` counts in curand's unit (one Philox4x32 block = 4), exactly like
 // CUDAGeneratorImpl's philox_offset_per_thread_, so the state and every draw
-// match stock CUDA bit for bit (docs/native_backend.md, "RNG").
+// match stock CUDA bit for bit (agents_docs/native_backend.md, "RNG").
 struct MojoGeneratorImpl final : c10::GeneratorImpl {
   explicit MojoGeneratorImpl(c10::DeviceIndex index)
       : c10::GeneratorImpl(c10::Device(c10::DeviceType::PrivateUse1, index),

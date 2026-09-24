@@ -1,4 +1,4 @@
-"""Native backend: data_movement group (see docs/native_backend.md and
+"""Native backend: data_movement group (see agents_docs/native_backend.md and
 torch_mojo_backend/mojo/tmb/ops/data_movement.mojo).
 
 Public-API checks only (no `TorchMojoTensor`/`aten_fast`/old-eager

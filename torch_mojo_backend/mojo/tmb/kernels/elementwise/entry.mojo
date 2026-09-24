@@ -1102,7 +1102,7 @@ def _arange_dispatcher(argv: Argv, argc: Int) raises:
 
 
 # ---------------------------------------------------------------------------
-# TensorSpec entries (docs/tensor_spec_design.md): the whole op prologue —
+# TensorSpec entries (agents_docs/tensor_spec_design.md): the whole op prologue —
 # input checks, output alloc, kernel launch — in one boundary call over
 # cached TensorSpecs, reusing the contiguous kernels above. Failed checks
 # raise a real NotImplementedError into Python ("take the classic path");

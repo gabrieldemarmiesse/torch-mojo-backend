@@ -37,7 +37,7 @@
 # so that `MOJOCCL_REGION_MB` keeps meaning what it says -- at RECOMMENDED the
 # default 256 MiB region (128 KiB + 2 x 256 MiB) rounds up to a 1 GiB
 # allocation per rank, and even a deliberately tiny test region costs 512 MiB.
-# MINIMUM and RECOMMENDED measured the same on H100 (docs/distributed.md),
+# MINIMUM and RECOMMENDED measured the same on H100 (agents_docs/distributed.md),
 # so production uses MINIMUM to avoid rounding up that much memory.
 
 from std.ffi import OwnedDLHandle, external_call
@@ -160,7 +160,7 @@ def _mem_prop(
     as NCCL does (nccl:src/include/alloc.h:329) and as MAX's own arena does:
     nvidia_peermem refuses to pin a VMM chunk created without it, so
     `ibv_reg_mr` on the unicast mapping returned NULL (EFAULT) until this was
-    set (docs/mojo_collectives_nvls_results.md §4).
+    set (agents_docs/mojo_collectives_nvls_results.md §4).
     """
     var p = unsafe_alloc[UInt64](4)
     p[unsafe_offset=0] = UInt64(CU_MEM_ALLOCATION_TYPE_PINNED) | (

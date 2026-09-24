@@ -6495,7 +6495,7 @@ def _causal_bmm_go(
 
 
 # ---------------------------------------------------------------------------
-# TensorSpec entries (docs/tensor_spec_design.md): the matmul-family
+# TensorSpec entries (agents_docs/tensor_spec_design.md): the matmul-family
 # prologue — shape/dtype/contiguity gates, m/n/k geometry, output alloc and
 # tier dispatch — in one boundary call. The GEMV-vs-GEMM tier ladder stays
 # in the shared dispatch helpers below (tier choice on scalar fields is

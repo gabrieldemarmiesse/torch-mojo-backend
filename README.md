@@ -8,7 +8,7 @@ You only need Torch CPU and a mojo compiler, and if your accelerator is supporte
 No need to match compiler versions, torch versions, cuda versions, multiple channels, etc... Just pip install and you're ready to go.
 
 Concretely, the backend provides two things:
-- It registers `mojo` as a PrivateUse1 device whose aten ops are Mojo functions torch's dispatcher calls directly, meaning you can just use the `mojo` device with `my_model.to("mojo")` to use your accelerator in eager mode. See [docs/native_backend.md](docs/native_backend.md).
+- It registers `mojo` as a PrivateUse1 device whose aten ops are Mojo functions torch's dispatcher calls directly, meaning you can just use the `mojo` device with `my_model.to("mojo")` to use your accelerator in eager mode. See [agents_docs/native_backend.md](agents_docs/native_backend.md).
 - This project also provides a backend for doing `@torch.compile(backend=mojo_backend)`, and it will use mojo (MAX graph) instead of triton to compile your model.
 
 ## Warning:
@@ -22,7 +22,7 @@ You can see our benchmarks for the supported ops [here](https://html-preview.git
 
 Distributed training with DDP works on NVIDIA and AMD GPUs — single node
 and multi-node under torchrun, over NCCL or RCCL — see
-[docs/distributed.md](docs/distributed.md). On AMD machines install the CPU
+[agents_docs/distributed.md](agents_docs/distributed.md). On AMD machines install the CPU
 wheel of torch (`--index-url https://download.pytorch.org/whl/cpu`): the
 CUDA wheel makes every first-use kernel load on HIP about 10x slower, and a
 ROCm wheel brings a second HIP runtime the collectives cannot serve.

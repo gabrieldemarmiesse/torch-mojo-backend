@@ -167,7 +167,7 @@ comptime _RS_STREAM_DONE = _RS_STREAM_POISON + 8
 Dropping the grid barrier left every block polling the pinned mailbox for
 itself, and 32 threads reading host memory over the link the NIC is moving the
 shard on cost far more than the barrier did: see the measured A/B in
-docs/distributed.md's "Streaming reduce-scatter". One PCIe reader, and the
+agents_docs/distributed.md's "Streaming reduce-scatter". One PCIe reader, and the
 rest spin on an L2 line."""
 
 comptime _RS_STREAM_END = _RS_STREAM_DONE + 8

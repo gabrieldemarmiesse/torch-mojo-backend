@@ -1,4 +1,4 @@
-"""ATen ops: data_movement group (see docs/native_backend.md).
+"""ATen ops: data_movement group (see agents_docs/native_backend.md).
 
 clone / _to_copy / cat / stack / repeat / tril / triu / reflection_pad2d /
 replication_pad2d / select_scatter / scatter.src / scatter.value /

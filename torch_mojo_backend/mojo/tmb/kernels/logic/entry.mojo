@@ -1466,7 +1466,7 @@ def _addr_bcast_dispatcher(argv: Argv, argc: Int) raises:
 
 
 # ---------------------------------------------------------------------------
-# TensorSpec entries (docs/tensor_spec_design.md): the whole binary-broadcast
+# TensorSpec entries (agents_docs/tensor_spec_design.md): the whole binary-broadcast
 # op prologue — input checks, broadcast layout, output alloc, kernel launch —
 # in one boundary call over cached TensorSpecs, reusing `_binary_bcast`
 # above. Failed checks raise a real NotImplementedError into

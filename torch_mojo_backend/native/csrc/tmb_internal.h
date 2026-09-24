@@ -15,7 +15,7 @@ extern bool tmb_ready;
 // thread that is gone. tmb_backend_register() installs a pthread_atfork child
 // handler that sets this flag, and every entry that reaches the runtime --
 // allocation, the boxed kernel -- refuses with a message that names the fix
-// (the 'spawn' start method), as CUDA does. docs/native_backend.md, "Fork".
+// (the 'spawn' start method), as CUDA does. agents_docs/native_backend.md, "Fork".
 extern bool tmb_in_bad_fork;
 void tmb_check_not_forked();
 std::string& tmb_thread_error();

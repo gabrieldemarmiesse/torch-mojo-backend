@@ -1036,7 +1036,7 @@ def _log_softmax_rows[
 
 
 # ---------------------------------------------------------------------------
-# TensorSpec entries (docs/tensor_spec_design.md): dim checks, geometry,
+# TensorSpec entries (agents_docs/tensor_spec_design.md): dim checks, geometry,
 # preallocated-output validation and the launch in one boundary call. Python
 # parses the dim spec (`_norm_reduce_dims`) and does dtype promotion; layouts
 # outside the adjacent-interval regime raise so the classic

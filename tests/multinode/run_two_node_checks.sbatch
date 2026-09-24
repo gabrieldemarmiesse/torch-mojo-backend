@@ -27,7 +27,7 @@
 #
 # RUN_MOJO=0 (default 1): skip every mojo-ccl leg. mojoccl's multi-node
 # transport (TCP bootstrap carried in the unique id, GPUDirect RDMA over
-# libibverbs -- see the "Multi-node" subsection of docs/distributed.md) is
+# libibverbs -- see the "Multi-node" subsection of agents_docs/distributed.md) is
 # exercised by default; RUN_MOJO=0 instead gets a vendor-only NCCL reference
 # run without spending the job's time budget on the mojo legs.
 #

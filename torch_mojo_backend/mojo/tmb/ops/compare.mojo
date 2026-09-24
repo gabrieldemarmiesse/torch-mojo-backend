@@ -1,4 +1,4 @@
-"""ATen ops: compare group (see docs/native_backend.md).
+"""ATen ops: compare group (see agents_docs/native_backend.md).
 
 Ports the old eager path's comparisons / isin / where / masked_fill /
 searchsorted / bucketize (`eager_kernels/aten_fast.py`,

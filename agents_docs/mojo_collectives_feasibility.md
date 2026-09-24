@@ -322,7 +322,7 @@ option (c) does not exist (no IPC/export symbol in MAX's Mojo or Python API,
 but RCCL only enables the VMM path on gfx1250 with HIP ≥ 7.2
 (`rccl:src/misc/rocmwrap.cc:121-150`), so option (b) is the expected path there
 too, and whether MAX's HIP allocator memory accepts `hipIpcGetMemHandle` is
-untested (it is `hipMalloc`-class by default per `docs/distributed.md`, VMM with
+untested (it is `hipMalloc`-class by default per `agents_docs/distributed.md`, VMM with
 `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`).
 
 ## 6. One codebase for NVIDIA and AMD

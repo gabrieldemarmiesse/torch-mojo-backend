@@ -1,6 +1,6 @@
 """Native backend: the compare group (eq/ne/lt/le/gt/ge, isin, where,
 masked_fill(_), searchsorted, bucketize). Public torch API on the mojo
-device only -- see docs/native_backend.md and AGENT_BRIEF.md.
+device only -- see agents_docs/native_backend.md and AGENT_BRIEF.md.
 """
 
 import pytest

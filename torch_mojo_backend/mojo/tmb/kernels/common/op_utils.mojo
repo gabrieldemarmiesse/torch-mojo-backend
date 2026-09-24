@@ -991,7 +991,7 @@ def _f64_slot(v: Float64) -> Arg:
 # and passed to kernels as the address of the struct; `_spec_ptr` is a pure
 # pointer cast, so this layout must stay identical in every module.
 #
-# Spec ops (see docs/tensor_spec_design.md) do the whole op prologue in one
+# Spec ops (see agents_docs/tensor_spec_design.md) do the whole op prologue in one
 # boundary call: input checks, geometry, and the kernel launch. The output is
 # always allocated by the backend and handed in as a trailing spec, so a spec
 # op writes into it and returns nothing — there is no allocating return ABI.
@@ -2570,7 +2570,7 @@ def _scratch_copy(
 ) raises -> DeviceBuffer[DType.uint8]:
     """Materialize the logical order of (shape, strides) into a fresh
     contiguous scratch buffer — the Mojo-side temporary of
-    docs/tensor_spec_design.md §4.7. Python never sees a wrapper for it;
+    agents_docs/tensor_spec_design.md §4.7. Python never sees a wrapper for it;
     the caller keeps the returned buffer alive until its kernel launch is
     enqueued (`_ = buf^`); the stream-ordered free rides the same queue."""
     var nbytes = numel * itemsize

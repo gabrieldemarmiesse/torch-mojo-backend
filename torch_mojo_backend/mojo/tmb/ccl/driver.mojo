@@ -2,7 +2,7 @@
 #
 # MAX's own allocator memory cannot be exported with legacy IPC (measured:
 # cuIpcGetMemHandle rc=1 on enqueue_create_buffer memory -- see
-# docs/mojo_collectives_feasibility.md in the main worktree, section 5.6), so
+# agents_docs/mojo_collectives_feasibility.md in the main worktree, section 5.6), so
 # this library owns raw driver allocations (cuMemAlloc_v2 / hipExtMallocWith-
 # Flags) for its communication regions and shares them with legacy IPC
 # (cuIpc*/hipIpc*). Mirrors proto/ipc_probe.mojo's driver-call shape, called

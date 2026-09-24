@@ -1,6 +1,6 @@
 # The pipelined multi-node allreduce as ONE kernel launch.
 #
-# Same schedule as the split path docs/distributed.md describes -- K chunks,
+# Same schedule as the split path agents_docs/distributed.md describes -- K chunks,
 # chunk k's intra-node reduce-scatter, an RDMA exchange of its shard, and its
 # all-gather `depth-1` chunks later so the proxy exchanges chunk k while the
 # GPU reduce-scatters later chunks and all-gathers earlier ones -- but the

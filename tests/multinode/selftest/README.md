@@ -83,7 +83,7 @@ On Slingshot, the same thing with the other backend (on a compute node --
 Exercised on `cxi` at 2, 4 and 6 processes, and at 4 with
 `MOJOCCL_FABRIC_DOMAIN=cxi$((r % 4))` so each process drives its own NIC.
 If a whole batch fails with `fi_enable failed, rc=-12`, that is the
-unresolved flake described in `docs/distributed.md` ("One unresolved flake on
+unresolved flake described in `agents_docs/distributed.md` ("One unresolved flake on
 Slingshot") -- a node condition, not this code. Retry; that has always
 worked.
 

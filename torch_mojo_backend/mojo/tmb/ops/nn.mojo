@@ -1,4 +1,4 @@
-"""ATen ops: nn group (see docs/native_backend.md).
+"""ATen ops: nn group (see agents_docs/native_backend.md).
 
 Softmax family, normalization (layer / batch / group), NLL loss, embedding,
 2-D pooling and bilinear upsampling. Ported from the old Python fast path
