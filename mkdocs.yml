@@ -1,0 +1,87 @@
+# The documentation site: https://gabrieldemarmiesse.github.io/torch-mojo-backend/
+#
+# Two versions are published side by side with mike on the gh-pages branch
+# (.github/workflows/docs.yml): `stable`, built from the latest GitHub
+# release, and `nightly`, built from every commit on main. docs/hooks.py
+# tells each one's readers how to install the code it documents.
+#
+# Preview locally with `uv run mkdocs serve`; CI builds with
+# `mkdocs build --strict`, so a broken link or anchor fails the job.
+site_name: Torch Mojo Backend
+site_description: A PyTorch backend powered by Mojo kernels and Modular's MAX framework
+site_url: https://gabrieldemarmiesse.github.io/torch-mojo-backend/
+repo_url: https://github.com/gabrieldemarmiesse/torch-mojo-backend
+repo_name: gabrieldemarmiesse/torch-mojo-backend
+
+# agents_docs/ holds the contributor and design notes; only docs/ is published.
+docs_dir: docs
+exclude_docs: |
+  __pycache__/
+  overrides/
+  hooks.py
+
+nav:
+  - Home: index.md
+  - Accelerator API: accelerator_api.md
+  - Streams and events: streams_and_events.md
+  - Distributed training: distributed_training.md
+
+theme:
+  name: material
+  custom_dir: docs/overrides
+  features:
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
+    - navigation.top
+    - search.highlight
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+extra:
+  version:
+    provider: mike
+    # Readers of any other version (nightly) get the banner in
+    # docs/overrides/main.html.
+    default: stable
+
+hooks:
+  - docs/hooks.py
+
+plugins:
+  - search
+  # docs/index.md is README.md, included verbatim.
+  - include-markdown
+  - mike:
+      canonical_version: stable
+
+watch:
+  - README.md
+
+validation:
+  anchors: warn
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true

@@ -52,3 +52,6 @@ benchmarks/baselines.html.tmp
 # only the README is tracked.
 torch_mojo_backend/native/prebuilt/*
 !torch_mojo_backend/native/prebuilt/README.md
+
+# Built documentation site (mkdocs build).
+site/

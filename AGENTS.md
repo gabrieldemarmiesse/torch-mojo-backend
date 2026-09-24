@@ -86,6 +86,15 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   - GPT-2, Gemma3 (LLM models)
   - VGG, DenseNet (vision models)
   - `no_graph_breaks.py` (example demonstrating graph compilation without breaks)
+- **Documentation**: `docs/` is the published user documentation
+  (MkDocs Material, `mkdocs.yml`; the home page is `README.md`, included
+  verbatim). `.github/workflows/docs.yml` deploys it with mike to GitHub
+  Pages: `nightly` from every push to main, `stable` from every release.
+  Preview with `uv run mkdocs serve`; `uv run mkdocs build --strict` must
+  pass. Design notes, journals and anything written for contributors or
+  agents go in `agents_docs/`, which is not published — never in `docs/`.
+  `README.md` and the pages in `docs/` never link to a file in
+  `agents_docs/`.
 
 
 ## Performance-regression benchmarks (`benchmarks/`)

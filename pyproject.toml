@@ -185,4 +185,16 @@ dev = [
     "setuptools>=80.9.0",
     "pydantic>=2.9",
     "ty>=0.0.77",
+    # In dev too, so `uv run ty check` resolves the mkdocs types docs/hooks.py uses.
+    { include-group = "docs" },
+]
+# The documentation site (mkdocs.yml, published by .github/workflows/docs.yml).
+# Its own group so the docs CI job installs these alone (`--only-group docs`)
+# instead of torch and MAX.
+docs = [
+    "mike>=2.2",
+    # docs/hooks.py imports it directly; mkdocs-material supports 1.x only.
+    "mkdocs>=1.6,<2",
+    "mkdocs-include-markdown-plugin>=7.3",
+    "mkdocs-material>=9.7",
 ]

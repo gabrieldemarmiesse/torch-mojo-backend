@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+
+{#- Shown on every version but extra.version.default (mkdocs.yml): nightly. -#}
+{% block outdated %}
+  You are reading the nightly documentation, built from the latest commit on
+  main.
+  <a href="{{ '../' ~ base_url }}">
+    <strong>Read the documentation of the latest release instead.</strong>
+  </a>
+{% endblock %}

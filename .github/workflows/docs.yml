@@ -1,0 +1,90 @@
+# The documentation site, https://gabrieldemarmiesse.github.io/torch-mojo-backend/.
+#
+# mike commits each version into its own directory of the gh-pages branch,
+# which GitHub Pages serves:
+#   - nightly: rebuilt from every push to main;
+#   - stable:  rebuilt from the tag of every published release (pre-releases
+#              excepted), and the version the site's root redirects to.
+# "Run workflow" redeploys by hand: run it on main for nightly, on a release
+# tag for stable. Pull requests only build, with --strict, so a broken link
+# or anchor fails the PR rather than the deploy after merge.
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Material prints a multi-line notice about MkDocs 2.0 on every build; the
+  # mkdocs<2 pin in pyproject.toml already answers it.
+  NO_MKDOCS_2_WARNING: "1"
+
+jobs:
+  build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      # --only-group: mkdocs and its plugins, not torch and MAX.
+      - name: Build the site
+        run: uv run --only-group docs mkdocs build --strict
+
+  deploy:
+    if: >-
+      github.event_name == 'push'
+      || (github.event_name == 'release' && !github.event.release.prerelease)
+      || (github.event_name == 'workflow_dispatch'
+          && (github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Every deploy is a commit on gh-pages, so one runs at a time. GitHub
+    # keeps a single pending run per group and cancels an older pending one:
+    # a stable deploy queued behind a running nightly and then overtaken by a
+    # second push to main is dropped, and "Run workflow" on the tag redoes it.
+    concurrency:
+      group: docs-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # mike adds this version to the deployed ones. The branch does not
+      # exist before the first deploy, which mike then creates.
+      - name: Fetch the published site
+        run: git fetch origin gh-pages --depth=1 || true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Deploy stable
+        if: github.ref_type == 'tag'
+        run: |
+          uv run --only-group docs mike deploy --push --title "stable ($GITHUB_REF_NAME)" stable
+          uv run --only-group docs mike set-default --push stable
+
+      - name: Deploy nightly
+        if: github.ref_type != 'tag'
+        run: |
+          uv run --only-group docs mike deploy --push nightly
+          # Before the first release that has this site there is no stable
+          # version yet: send the root to nightly until one exists.
+          if ! uv run --only-group docs mike list stable > /dev/null 2>&1; then
+            uv run --only-group docs mike set-default --push nightly
+          fi
