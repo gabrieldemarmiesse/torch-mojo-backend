@@ -8,7 +8,7 @@ You only need Torch CPU and a mojo compiler, and if your accelerator is supporte
 No need to match compiler versions, torch versions, cuda versions, multiple channels, etc... Just pip install and you're ready to go.
 
 Concretely, the backend provides two things:
-- It registers `mojo` as a PrivateUse1 device whose aten ops are Mojo functions torch's dispatcher calls directly, meaning you can just use the `mojo` device with `my_model.to("mojo")` to use your accelerator in eager mode. See [the accelerator API](docs/accelerator_api.md).
+- It registers `mojo` as a PrivateUse1 device whose aten ops are Mojo functions torch's dispatcher calls directly, and it becomes PyTorch's current accelerator: `torch.accelerator` and `my_model.to(device)` use your GPU in eager mode. See [the accelerator API](docs/accelerator_api.md).
 - This project also provides a backend for doing `@torch.compile(backend=mojo_backend)`, and it will use mojo (MAX graph) instead of triton to compile your model.
 
 ## Warning:
@@ -62,22 +62,9 @@ wheel to install.
 
 ### Eager mode
 
-The mojo device behaves like any other device in PyTorch.
-
-```python
-import torch 
-import torch_mojo_backend
-torch_mojo_backend.register_mojo_devices()
-
-a = torch.tensor([1, 2, 3], device="mojo:0")
-b = torch.tensor([10, 2, 3]).to("mojo:0") # this works too
-c = torch.tensor([100, 2, 10]).to("mojo:0")
-d = (a + b - c) * 8 / 16
-print(d.cpu())
-```
-
-You can also write generic code by using `torch.accelerator`. Then your code
-will also work on a generic cuda install of Pytorch.
+Once registered, the backend is PyTorch's current accelerator. Write your code
+against `torch.accelerator` and it also works on a generic cuda install of
+PyTorch.
 
 ```python
 import torch

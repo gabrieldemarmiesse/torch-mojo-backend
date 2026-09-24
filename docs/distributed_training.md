@@ -1,13 +1,13 @@
 # Distributed training
 
-The `mojo` device has its own `torch.distributed` backend, also called
-`"mojo"`, which runs collectives on mojo tensors through the GPU vendor's
-collective library: NCCL on NVIDIA and RCCL on AMD. A DDP or FSDP2 script
-written for CUDA needs only a few changed lines, and you launch it with
+Registering the backend also registers a `torch.distributed` backend for
+the accelerator, which runs collectives through the GPU vendor's collective
+library: NCCL on NVIDIA and RCCL on AMD. A DDP or FSDP2 script written against
+`torch.accelerator` needs only its setup lines, and you launch it with
 `torchrun` as usual. You don't need a CUDA or ROCm build of PyTorch.
 
 Read [Accelerator API](accelerator_api.md) first if you don't yet know how to
-get a tensor onto the device.
+get a tensor onto the accelerator.
 
 ## What is supported
 
@@ -23,8 +23,8 @@ get a tensor onto the device.
   nodes are aarch64, for example), `init_process_group` raises
   `NotImplementedError`.
 - The multi-GPU runs behind this page used H100 (NVIDIA) and MI300A (AMD)
-  GPUs, in eager mode. `torch.compile` isn't supported on the mojo device yet
-  (see the [home page](index.md)).
+  GPUs, in eager mode. `torch.compile` isn't supported on the accelerator
+  yet (see the [home page](index.md)).
 - Tensor and pipeline parallelism, 2-D device meshes (HSDP), FSDP1
   (`FullyShardedDataParallel`), and DDP's `find_unused_parameters=True` and
   `static_graph=True` are not covered by tests yet.
@@ -114,9 +114,9 @@ torch_mojo_backend.register_mojo_devices()
 
 
 def main():
-    dist.init_process_group(backend="mojo")
+    device = torch.accelerator.current_accelerator()
+    dist.init_process_group(backend=dist.get_default_backend_for_device(device))
     rank = dist.get_rank()
-    device = torch.device("mojo")
 
     torch.manual_seed(0)
     model = torch.nn.Sequential(
@@ -163,42 +163,47 @@ The differences from a CUDA script:
 
 1. `use_local_rank_gpu()` runs first. It sets the vendor's visibility
    variable so that each torchrun worker sees exactly one GPU, chosen by
-   `LOCAL_RANK`; `"mojo"` (that is, `mojo:0`) is then always that worker's
-   GPU. If a launcher such as SLURM already exported a list of several GPUs
+   `LOCAL_RANK`; `device` (index 0) is then always that worker's GPU. If a
+   launcher such as SLURM already exported a list of several GPUs
    (`CUDA_VISIBLE_DEVICES=0,...,7`, or `ROCR_VISIBLE_DEVICES` on AMD), each
    worker keeps only its own entry, and a list with a single entry is left
    alone. Outside torchrun (no `LOCAL_RANK`), the call does nothing.
    Call it before `register_mojo_devices()` and before anything touches the
    GPU: the GPU list is read only once per process, so a later call has no
    effect.
-2. `register_mojo_devices()` registers both the device and the `"mojo"`
+2. `register_mojo_devices()` registers both the accelerator and its
    process-group backend.
-3. `init_process_group(backend="mojo")` replaces `"nccl"`, and creates the
-   communicator right away, on the current GPU. The same group also handles
+3. `dist.get_default_backend_for_device(device)` replaces `"nccl"`: it
+   returns the backend registered for the accelerator. The process group
+   creates its communicator right away, on the current GPU. It also handles
    CPU tensors (object collectives, CPU `all_reduce`) through a private gloo
    group, so you don't need a `"cpu:gloo,..."` string.
-   `init_process_group(device_id=0)` and
-   `init_process_group(device_id=torch.device("mojo", 0))` work too.
 4. `DDP(model)` takes no `device_ids`. Move your inputs to the device
    yourself. DDP's default `broadcast_buffers=True` works, and if your
    buffers never change (a causal mask, for example), passing
    `broadcast_buffers=False` saves one broadcast per forward pass.
 5. Checkpoints are saved from CPU copies, because calling `torch.save`
-   directly on mojo tensors raises `NotImplementedError`.
+   directly on accelerator tensors raises `NotImplementedError`.
+
+To run the same file on stock CUDA, remove the `register_mojo_devices()`
+line: `current_accelerator()` is then `cuda`, the default backend is `nccl`,
+and `use_local_rank_gpu()` gives each rank one GPU there too.
 
 The first run compiles each kernel the first time it's used, so the first
 steps are slow. Later runs load the kernels from the on-disk cache.
 
 ### Porting an existing CUDA script
 
-| Stock PyTorch on CUDA | mojo device |
+In this table, `device` is `torch.accelerator.current_accelerator()`.
+
+| Stock PyTorch on CUDA | Device-agnostic |
 |---|---|
 | `torch.cuda.set_device(local_rank)` | `use_local_rank_gpu()` at the top of the script |
-| `dist.init_process_group("nccl")` | `register_mojo_devices()`, then `dist.init_process_group("mojo")` |
-| `model.to(f"cuda:{local_rank}")` | `model.to("mojo")` |
+| `dist.init_process_group("nccl")` | `dist.init_process_group(dist.get_default_backend_for_device(device))` |
+| `model.to(f"cuda:{local_rank}")` | `model.to(device)` |
 | `DDP(model, device_ids=[local_rank])` | `DDP(model)` |
-| `torch.autocast("cuda", dtype=torch.bfloat16)` | `torch.autocast("mojo", dtype=torch.bfloat16)` |
-| `torch.cuda.manual_seed_all(seed + rank)` | `torch.mojo.manual_seed_all(seed + rank)` |
+| `torch.autocast("cuda", dtype=torch.bfloat16)` | `torch.autocast(device.type, dtype=torch.bfloat16)` |
+| `torch.cuda.manual_seed_all(seed + rank)` | `torch.manual_seed(seed + rank)`, which seeds the CPU too |
 | `torch.cuda.synchronize()` | `torch.accelerator.synchronize()` |
 
 Autocast, per-rank device seeds and fused AdamW all work under DDP. For a
@@ -206,45 +211,19 @@ complete example with bf16 autocast, gradient clipping and evaluation, see
 the repository's nanoGPT DDP demo,
 [`demo_scripts/nanogpt_ddp.py`](https://github.com/gabrieldemarmiesse/torch-mojo-backend/blob/main/demo_scripts/nanogpt_ddp.py).
 
-### One script for CUDA and mojo
-
-If the rest of the script only refers to `device`, the same file runs on
-stock CUDA as well:
-
-```python
-from torch_mojo_backend.distributed import use_local_rank_gpu
-
-use_local_rank_gpu()
-
-import torch
-import torch.distributed as dist
-
-import torch_mojo_backend
-
-torch_mojo_backend.register_mojo_devices()  # remove this line to use stock CUDA
-
-device = torch.accelerator.current_accelerator()  # mojo, or cuda without the line above
-dist.init_process_group(backend=dist.get_default_backend_for_device(device))  # "mojo" or "nccl"
-```
-
-On stock CUDA, `use_local_rank_gpu()` also leaves each rank one visible GPU,
-so `cuda` is the right device there too. For autocast, write
-`torch.autocast(device.type, ...)`. [Accelerator API](accelerator_api.md)
-covers `torch.accelerator` in more detail.
-
 ## FSDP2
 
-Use PyTorch's `fully_shard` with a mojo device mesh. The usual FSDP2 rules
-apply: shard the blocks before the root module, and create the optimizer
-after sharding.
+Use PyTorch's `fully_shard` with a device mesh on the accelerator. The
+usual FSDP2 rules apply: shard the blocks before the root module, and create
+the optimizer after sharding.
 
 ```python
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
-# after use_local_rank_gpu(), register_mojo_devices() and init_process_group("mojo")
-mesh = init_device_mesh("mojo", (dist.get_world_size(),))
-model = MyModel().to("mojo")
+# after the setup lines of train_ddp.py, device and init_process_group included
+mesh = init_device_mesh(device.type, (dist.get_world_size(),))
+model = MyModel().to(device)
 for block in model.blocks:
     fully_shard(block, mesh=mesh)
 fully_shard(model, mesh=mesh)
@@ -256,15 +235,16 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, foreach=False)
   restore a sharded model together with its optimizer state.
 - For bf16 training, `MixedPrecisionPolicy(param_dtype=torch.bfloat16,
   reduce_dtype=torch.float32)` on the blocks works. Leave the module that
-  owns the token embedding (usually the root) in fp32, because the device's
+  owns the token embedding (usually the root) in fp32, because the backend's
   embedding backward currently needs fp32 gradients.
 - [`demo_scripts/gpt2_fsdp2.py`](https://github.com/gabrieldemarmiesse/torch-mojo-backend/blob/main/demo_scripts/gpt2_fsdp2.py)
   trains GPT-2 124M or 1.5B (XL) this way, with no download needed.
 
 ## Collectives
 
-All tensors in one call must be on the same mojo device, or all on the
-CPU. The table covers mojo tensors; CPU tensors always go through gloo.
+All tensors in one call must be on the same accelerator device, or all on
+the CPU. The table covers accelerator tensors; CPU tensors always go through
+gloo.
 
 | `torch.distributed` call | NCCL / RCCL (default) | Mojo collectives |
 |---|---|---|
@@ -483,7 +463,7 @@ Kernels compile the first time each one is used; see
 
 A tensor from another device, such as `cuda`, reached a collective. With a
 CUDA build of torch installed, check that the model and inputs went to
-`"mojo"` (or to `torch.accelerator.current_accelerator()`), not to `"cuda"`.
+`torch.accelerator.current_accelerator()`, not to a hard-coded `"cuda"`.
 
 ### `NotImplementedError` from `torch.save`
 

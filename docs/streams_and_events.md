@@ -1,20 +1,20 @@
 # Streams and events
 
-The `mojo` device implements PyTorch's device-generic stream and event API
-(`torch.Stream`, `torch.Event` and the stream functions of
-`torch.accelerator`), and `torch.mojo` adds `torch.cuda`-style names on top of
-it. On NVIDIA and AMD GPUs, each stream is an independent device queue and
-events work as they do on CUDA, so code written for CUDA streams carries over
-once a few calls are renamed. Apple GPUs have a single queue and no events;
-see [Apple GPUs](#apple-gpus).
+The backend implements PyTorch's device-agnostic stream and event API:
+`torch.Stream`, `torch.Event` and the stream functions of `torch.accelerator`.
+On NVIDIA and AMD GPUs, each stream is an independent device queue and events
+work as they do on CUDA, so code written for CUDA streams carries over once a
+few calls are renamed. Apple GPUs have a single queue and no events; see
+[Apple GPUs](#apple-gpus).
 
-This page assumes the device is already set up.
-[Accelerator API](accelerator_api.md) covers `register_mojo_devices()`,
-device selection and the rest of `torch.mojo`.
+This page assumes the backend is already registered, and `device` in the
+examples is `torch.accelerator.current_accelerator()`.
+[Accelerator API](accelerator_api.md) covers registration, device selection
+and the rest of `torch.accelerator`.
 
 ## How work is ordered
 
-- Every op on a `mojo` tensor is queued on the current stream of its device,
+- Every op on an accelerator tensor is queued on the current stream of its device,
   and the Python call returns without waiting for the kernel to run. Ops
   queued on the same stream run in the order they were issued.
 - When a program starts, the current stream is the device's default stream
@@ -24,36 +24,31 @@ device selection and the rest of `torch.mojo`.
     - When it has to give you a value: `.cpu()`, `.item()`, `.tolist()`, or
       a blocking `copy_()` into a CPU tensor. These copy on the current
       stream and wait for that stream alone.
-    - When you ask it to: `torch.accelerator.synchronize()` and
-      `torch.mojo.synchronize()` wait for every stream of the device,
-      `stream.synchronize()` waits for one stream, and `event.synchronize()`
-      waits for one event.
+    - When you ask it to: `torch.accelerator.synchronize()` waits for every
+      stream of the device, `stream.synchronize()` waits for one stream, and
+      `event.synchronize()` waits for one event.
 - The first time an op runs with a new combination of dtypes, its kernel is
   compiled, and the call blocks until compilation is done. The compiled
   kernel is cached on disk. Run a warm-up iteration before you time anything.
 
 ## Streams
 
-### From `torch.cuda` to `mojo`
+### From `torch.cuda`
 
-| CUDA | Device-generic | `torch.mojo` |
-|---|---|---|
-| `torch.cuda.Stream()` | `torch.Stream(device="mojo")` | `torch.mojo.Stream()` |
-| `torch.cuda.Event(enable_timing=True)` | `torch.Event(device="mojo", enable_timing=True)` | `torch.mojo.Event(enable_timing=True)` |
-| `torch.cuda.current_stream()` | `torch.accelerator.current_stream()` | `torch.mojo.current_stream()` |
-| `torch.cuda.default_stream()` | — | `torch.mojo.default_stream()` |
-| `torch.cuda.set_stream(s)` | `torch.accelerator.set_stream(s)` | `torch.mojo.set_stream(s)` |
-| `with torch.cuda.stream(s):` | `with s:` | `with torch.mojo.stream(s):` |
-| `torch.cuda.synchronize()` | `torch.accelerator.synchronize()` | `torch.mojo.synchronize()` |
-| `s.cuda_stream` | `s.native_handle` (torch 2.11+) | `torch.mojo.stream_native_handle(s)` |
+| CUDA | Device-agnostic |
+|---|---|
+| `torch.cuda.Stream()` | `torch.Stream(device)` |
+| `torch.cuda.Event(enable_timing=True)` | `torch.Event(device, enable_timing=True)` |
+| `torch.cuda.current_stream()` | `torch.accelerator.current_stream()` |
+| `torch.cuda.set_stream(s)` | `torch.accelerator.set_stream(s)` |
+| `with torch.cuda.stream(s):` | `with s:` |
+| `torch.cuda.synchronize()` | `torch.accelerator.synchronize()` |
+| `s.cuda_stream` | `s.native_handle` (torch 2.11+) |
 
-`torch.mojo.Stream` and `torch.mojo.Event` *are* `torch.Stream` and
-`torch.Event`, so you can pass a mojo stream to any PyTorch API that takes a
-stream. The methods have their CUDA names: `wait_stream`, `wait_event`,
+The methods have their CUDA names: `wait_stream`, `wait_event`,
 `record_event`, `query` and `synchronize` on streams, and `record`, `wait`,
-`query`, `synchronize` and `elapsed_time` on events. Code that uses only the
-device-generic column, with `torch.accelerator.current_accelerator()` in place
-of the `"mojo"` string, also runs on stock PyTorch with CUDA.
+`query`, `synchronize` and `elapsed_time` on events. Code written this way
+also runs on stock PyTorch with CUDA.
 
 ### Creating a stream and making it current
 
@@ -62,15 +57,16 @@ import torch
 import torch_mojo_backend
 
 torch_mojo_backend.register_mojo_devices()
+device = torch.accelerator.current_accelerator()
 
 main = torch.accelerator.current_stream()   # the default stream at start-up
-side = torch.Stream(device="mojo")          # a new, independent stream
+side = torch.Stream(device)                 # a new, independent stream
 print(main)  # torch.Stream device_type=mojo, device_index=0, stream_id=0
 print(side)  # torch.Stream device_type=mojo, device_index=0, stream_id=1
 
-with side:                                  # or: with torch.mojo.stream(side):
+with side:
     assert torch.accelerator.current_stream() == side
-    x = torch.full((1000,), 2.0, device="mojo")  # queued on `side`
+    x = torch.full((1000,), 2.0, device=device)  # queued on `side`
 
 assert torch.accelerator.current_stream() == main  # restored on exit
 
@@ -78,29 +74,27 @@ side.synchronize()          # wait for everything queued on `side`
 print(x.sum().item())       # 2000.0
 ```
 
-`torch.accelerator.set_stream(s)` and `torch.mojo.set_stream(s)` do the same
-without a `with` block: the stream stays current until you set another one.
+`torch.accelerator.set_stream(s)` does the same without a `with` block: the
+stream stays current until you set another one.
 
 - Create streams once, before a loop, and reuse them. Every
   `torch.Stream(...)` call creates a new device stream (you can watch
   `stream_id` count up), and the stream stays alive until the process exits.
   CUDA differs here: `torch.cuda.Stream()` hands out streams from a fixed
   pool.
-- Without a `device` argument, `torch.Stream()` and `torch.mojo.Stream()`
-  create the stream on the current mojo device, and
-  `torch.Stream(device="mojo:1")` targets another GPU. Entering a stream that
-  belongs to another device also makes that device current until the block
-  exits, the same behavior as CUDA.
+- `torch.Stream(device)` creates the stream on the current device, and
+  `torch.Stream(torch.device(device.type, 1))` targets another GPU.
+  Entering a stream that belongs to another device also makes that device
+  current until the block exits, the same behavior as CUDA.
 - `priority=` is passed to the driver when the stream is created. The
   convention is CUDA's: a lower number means a higher priority, and values
   outside the device's range are clamped. The generic `torch.Stream` has no
   `priority` attribute, so you cannot read the value back.
 - `stream.query()` returns whether all the work queued on the stream has
   finished, without blocking. `stream.synchronize()` blocks until it has.
-- `stream.native_handle` (torch 2.11 and later) and
-  `torch.mojo.stream_native_handle(stream)` (any torch version) return the
-  underlying `CUstream` or `hipStream_t`. Use the handle to queue work from
-  outside PyTorch on the same device queue.
+- `stream.native_handle` (torch 2.11 and later) returns the underlying
+  `CUstream` or `hipStream_t`. Use the handle to queue work from outside
+  PyTorch on the same device queue.
 
 ## Events
 
@@ -113,12 +107,13 @@ without a `with` block: the stream stays current until you set another one.
     import torch_mojo_backend
 
     torch_mojo_backend.register_mojo_devices()
+    device = torch.accelerator.current_accelerator()
 
-    a = torch.randn(2048, 2048, device="mojo")
+    a = torch.randn(2048, 2048, device=device)
     a @ a  # warm up: the first call of an op compiles its kernel
 
-    start = torch.Event(device="mojo", enable_timing=True)
-    end = torch.Event(device="mojo", enable_timing=True)
+    start = torch.Event(device, enable_timing=True)
+    end = torch.Event(device, enable_timing=True)
 
     start.record()          # records on the current stream
     for _ in range(10):
@@ -138,15 +133,16 @@ without a `with` block: the stream stays current until you set another one.
     import torch_mojo_backend
 
     torch_mojo_backend.register_mojo_devices()
+    device = torch.accelerator.current_accelerator()
 
-    a = torch.randn(2048, 2048, device="mojo")
+    a = torch.randn(2048, 2048, device=device)
     a @ a  # warm up: the first call of an op compiles its kernel
 
-    torch.mojo.synchronize()        # start from an idle device
+    torch.accelerator.synchronize()   # start from an idle device
     start = time.perf_counter()
     for _ in range(10):
         b = a @ a
-    torch.mojo.synchronize()        # wait until the GPU is done
+    torch.accelerator.synchronize()   # wait until the GPU is done
     elapsed_ms = 1e3 * (time.perf_counter() - start)
     print(f"{elapsed_ms / 10:.3f} ms per matmul")
     ```
@@ -197,11 +193,12 @@ import torch
 import torch_mojo_backend
 
 torch_mojo_backend.register_mojo_devices()
+device = torch.accelerator.current_accelerator()
 
 main = torch.accelerator.current_stream()
-side = torch.Stream(device="mojo")    # create once, reuse
+side = torch.Stream(device)           # create once, reuse
 
-x = torch.randn(1024, 1024, device="mojo")   # produced on `main`
+x = torch.randn(1024, 1024, device=device)   # produced on `main`
 
 side.wait_stream(main)          # rule 1: `side` must not read x before it is written
 with side:
@@ -224,7 +221,7 @@ print(result.cpu()[0, :4])      # the copy runs on `main`, after the join
 
 ## Host-device copies
 
-`tensor.to("mojo", non_blocking=True)`, `tensor.to("cpu", non_blocking=True)`
+`tensor.to(device, non_blocking=True)`, `tensor.to("cpu", non_blocking=True)`
 and `dst.copy_(src, non_blocking=True)` are supported. What
 `non_blocking=True` does depends on the kind of host memory:
 
@@ -237,9 +234,8 @@ and `dst.copy_(src, non_blocking=True)` are supported. What
   it is asynchronous and needs a wait before you read it.
 - A download that has to convert the dtype or change the memory layout on the
   CPU completes before it returns.
-- Pinned memory belongs to the mojo device that was current when it was
-  pinned. Copies between it and another mojo device treat it as pageable
-  memory.
+- Pinned memory belongs to the device that was current when it was pinned.
+  Copies between it and another device treat it as pageable memory.
 - Without `non_blocking=True`, you can read or reuse the host tensor as soon
   as the call returns.
 
@@ -248,9 +244,9 @@ and `dst.copy_(src, non_blocking=True)` are supported. What
     also uses. If you run a CUDA build of PyTorch on a machine with a CUDA
     GPU, factory functions called with `pin_memory=True`, such as
     `torch.empty(..., pin_memory=True)`, allocate CUDA's pinned memory
-    instead. The mojo device treats that memory like pageable memory: copies
-    are correct, but they are not asynchronous. On a CPU-only build of
-    PyTorch, both spellings give mojo pinned memory.
+    instead. The backend treats that memory like pageable memory: copies are
+    correct, but they are not asynchronous. On a CPU-only build of PyTorch,
+    both spellings give the backend's pinned memory.
 
 ### Downloading without blocking
 
@@ -262,11 +258,12 @@ import torch
 import torch_mojo_backend
 
 torch_mojo_backend.register_mojo_devices()
+device = torch.accelerator.current_accelerator()
 
-x = torch.arange(1 << 20, dtype=torch.float32, device="mojo") * 2
+x = torch.arange(1 << 20, dtype=torch.float32, device=device) * 2
 
 host = x.to("cpu", non_blocking=True)   # returns at once, into pinned memory
-copied = torch.Event(device="mojo")
+copied = torch.Event(device)
 copied.record()                         # marks the end of the copy on the stream
 print(host.is_pinned())                 # True
 
@@ -286,10 +283,11 @@ import torch
 import torch_mojo_backend
 
 torch_mojo_backend.register_mojo_devices()
+device = torch.accelerator.current_accelerator()
 
 main = torch.accelerator.current_stream()
-copy_stream = torch.Stream(device="mojo")
-weight = torch.randn(1024, 256, device="mojo")
+copy_stream = torch.Stream(device)
+weight = torch.randn(1024, 256, device=device)
 
 # Pinned host memory lets the upload run in the background.
 batches = [torch.randn(8192, 1024).pin_memory() for _ in range(8)]
@@ -297,7 +295,7 @@ batches = [torch.randn(8192, 1024).pin_memory() for _ in range(8)]
 
 def upload(batch: torch.Tensor) -> torch.Tensor:
     with copy_stream:
-        return batch.to("mojo", non_blocking=True)
+        return batch.to(device, non_blocking=True)
 
 
 losses = []
@@ -320,17 +318,16 @@ finish before you write to it again, for example with an event recorded on
 
 ## Apple GPUs
 
-On Apple GPUs (Metal), the mojo device has a single queue per device, like
+On Apple GPUs (Metal), the backend has a single queue per device, like
 PyTorch's MPS backend:
 
-- `torch.Stream(device="mojo")` returns the default stream, whatever the
-  priority: its `stream_id` is 0, and it compares equal to
-  `torch.mojo.default_stream()` and to every other mojo stream of the device.
-  `with stream:`, `set_stream`, `current_stream` and `default_stream` work.
+- `torch.Stream(device)` returns the default stream, whatever the priority:
+  its `stream_id` is 0, and it compares equal to every other stream of the
+  device. `with stream:`, `torch.accelerator.set_stream` and
+  `torch.accelerator.current_stream` work.
   All the work runs in order on the one queue, so no cross-stream waits are
   needed.
-- `stream.synchronize()`, `torch.mojo.synchronize()` and
-  `torch.accelerator.synchronize()` work. `stream.query()` waits for the
+- `stream.synchronize()` and `torch.accelerator.synchronize()` work. `stream.query()` waits for the
   queue to finish and then returns `True`.
 - `tensor.record_stream(stream)` works.
 - Host-to-device copies complete before they return, even with
@@ -344,7 +341,7 @@ PyTorch's MPS backend:
 
 For code that runs on every GPU, skip the wait when the two streams are the
 same stream (they always are on Apple GPUs), and time work with
-`torch.mojo.synchronize()` and a host clock, as in the
+`torch.accelerator.synchronize()` and a host clock, as in the
 "Any GPU, including Apple" tab [above](#timing-gpu-work):
 
 ```python
@@ -352,6 +349,7 @@ import torch
 import torch_mojo_backend
 
 torch_mojo_backend.register_mojo_devices()
+device = torch.accelerator.current_accelerator()
 
 
 def wait_for(waiter: torch.Stream, producer: torch.Stream):
@@ -362,19 +360,15 @@ def wait_for(waiter: torch.Stream, producer: torch.Stream):
 
 
 main = torch.accelerator.current_stream()
-side = torch.Stream(device="mojo")
-x = torch.randn(1024, 1024, device="mojo")
+side = torch.Stream(device)
+x = torch.randn(1024, 1024, device=device)
 
 wait_for(side, main)
 with side:
     y = x * 2
 wait_for(main, side)
 print(torch.equal(y.cpu(), x.cpu() * 2))           # True
-print(torch.mojo.get_device_properties().api)      # "cuda", "hip" or "metal"
 ```
-
-If you need to branch explicitly, `torch.mojo.get_device_properties().api`
-tells you which kind of GPU you are on.
 
 ## Not supported
 

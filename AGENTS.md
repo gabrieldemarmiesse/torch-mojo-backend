@@ -94,7 +94,12 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   pass. Design notes, journals and anything written for contributors or
   agents go in `agents_docs/`, which is not published — never in `docs/`.
   `README.md` and the pages in `docs/` never link to a file in
-  `agents_docs/`.
+  `agents_docs/`. They teach one API, the device-agnostic one: the only
+  backend-specific code a user writes is the registration
+  (`register_mojo_devices()`, plus `use_local_rank_gpu()` for distributed).
+  Every device comes from `torch.accelerator.current_accelerator()`; no
+  `"mojo"` device string, `.mojo()` or `torch.mojo` appears in user-facing
+  code, even where it would work.
 
 
 ## Performance-regression benchmarks (`benchmarks/`)
