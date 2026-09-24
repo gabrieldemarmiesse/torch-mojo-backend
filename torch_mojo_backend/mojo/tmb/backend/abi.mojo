@@ -131,11 +131,13 @@ def supported_stypes(api: String) -> Int64:
     """
     var mask = Int64(0)
     for s in range(64):
+        var held = True
         try:
             _ = max_dtype(Int32(s))
-            mask |= Int64(1) << Int64(s)
         except:
-            pass
+            held = False  # declined by max_dtype: bit s stays clear
+        if held:
+            mask |= Int64(1) << Int64(s)
     if api == "metal":
         mask &= ~(Int64(1) << Int64(ST_FLOAT64))
     return mask
