@@ -599,17 +599,6 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#notimplementederror-from-torchsave" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        NotImplementedError from torch.save
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
   <a href="#time-stats-are-currently-only-collected-for-cpu-and-cuda-devices" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -843,17 +832,6 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#notimplementederror-from-torchsave" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        NotImplementedError from torch.save
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
   <a href="#time-stats-are-currently-only-collected-for-cpu-and-cuda-devices" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1042,7 +1020,7 @@ when <code>init_process_group</code> runs:</p>
 <a id="__codelineno-3-41" name="__codelineno-3-41" href="#__codelineno-3-41"></a>            <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
 <a id="__codelineno-3-42" name="__codelineno-3-42" href="#__codelineno-3-42"></a>                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;step </span><span class="si">{</span><span class="n">step</span><span class="si">:</span><span class="s2">3d</span><span class="si">}</span><span class="s2">  loss </span><span class="si">{</span><span class="n">mean_loss</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 <a id="__codelineno-3-43" name="__codelineno-3-43" href="#__codelineno-3-43"></a>
-<a id="__codelineno-3-44" name="__codelineno-3-44" href="#__codelineno-3-44"></a>    <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>  <span class="c1"># torch.save needs CPU tensors</span>
+<a id="__codelineno-3-44" name="__codelineno-3-44" href="#__codelineno-3-44"></a>    <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>  <span class="c1"># CPU copies: the file then loads without the backend</span>
 <a id="__codelineno-3-45" name="__codelineno-3-45" href="#__codelineno-3-45"></a>        <span class="n">state</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">module</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
 <a id="__codelineno-3-46" name="__codelineno-3-46" href="#__codelineno-3-46"></a>        <span class="n">torch</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">state</span><span class="p">,</span> <span class="s2">&quot;checkpoint.pt&quot;</span><span class="p">)</span>
 <a id="__codelineno-3-47" name="__codelineno-3-47" href="#__codelineno-3-47"></a>    <span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
@@ -1077,8 +1055,10 @@ when <code>init_process_group</code> runs:</p>
    yourself. DDP's default <code>broadcast_buffers=True</code> works, and if your
    buffers never change (a causal mask, for example), passing
    <code>broadcast_buffers=False</code> saves one broadcast per forward pass.</li>
-<li>Checkpoints are saved from CPU copies, because calling <code>torch.save</code>
-   directly on accelerator tensors raises <code>NotImplementedError</code>.</li>
+<li>Checkpoints are saved from CPU copies so that they load on a machine
+   without the backend. <code>torch.save</code> of the accelerator tensors works too;
+   see <a href="../accelerator_api/#saving-and-loading">Saving and loading</a>. For
+   FSDP2 sharded state, use <code>torch.distributed.checkpoint</code>.</li>
 </ol>
 <p>To run the same file on stock CUDA, remove the <code>register_mojo_devices()</code>
 line: <code>current_accelerator()</code> is then <code>cuda</code>, the default backend is <code>nccl</code>,
@@ -1483,10 +1463,6 @@ collective raises, so the run fails instead of hanging.</p>
 <p>A tensor from another device, such as <code>cuda</code>, reached a collective. With a
 CUDA build of torch installed, check that the model and inputs went to
 <code>torch.accelerator.current_accelerator()</code>, not to a hard-coded <code>"cuda"</code>.</p>
-<h3 id="notimplementederror-from-torchsave"><code>NotImplementedError</code> from <code>torch.save</code><a class="headerlink" href="#notimplementederror-from-torchsave" title="Permanent link">&para;</a></h3>
-<p>Mojo tensors can't be serialised directly. Copy them to the CPU first:
-<code>{k: v.cpu() for k, v in model.state_dict().items()}</code>. For FSDP2 sharded
-state, use <code>torch.distributed.checkpoint</code>, which works as it is.</p>
 <h3 id="time-stats-are-currently-only-collected-for-cpu-and-cuda-devices"><code>Time stats are currently only collected for CPU and CUDA devices</code><a class="headerlink" href="#time-stats-are-currently-only-collected-for-cpu-and-cuda-devices" title="Permanent link">&para;</a></h3>
 <p>DDP prints this warning once for any device other than CPU or CUDA. You can
 ignore it.</p>
