@@ -201,8 +201,6 @@ class MojoDeviceProperties:
 def _gfx_version(arch: str) -> tuple[int | None, int | None]:
     """HIP's `hipDeviceProp_t` (major, minor): the gfx ISA version, whose last
     two hex digits are minor and stepping ("gfx90a" -> 9, 0; "gfx1100" -> 11, 0)."""
-    # TODO: unverified on AMD hardware; check it equals ROCm torch's
-    # torch.cuda.get_device_capability() (test_capability_contracts_and_inductor_properties).
     digits = arch.split(":")[0].removeprefix("gfx")
     if len(digits) < 3 or not digits[:-2].isdigit():
         return None, None
