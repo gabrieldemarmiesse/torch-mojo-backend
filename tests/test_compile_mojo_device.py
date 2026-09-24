@@ -316,6 +316,26 @@ def test_compile_backward(mojo_device):
     torch.testing.assert_close(w.grad.cpu(), w_cpu.grad, rtol=2e-2, atol=2e-3)
 
 
+def test_compile_softmax_backward_produces_a_gradient(mojo_device):
+    """torch.softmax's gradient must not silently vanish under torch.compile.
+
+    It once did (#406): the old eager layer registered aten::softmax.int with
+    no autograd kernel, so AOTAutograd built no backward node and x.grad
+    stayed None without an error.
+    """
+
+    def fn(x):
+        return torch.softmax(x, -1).square().sum()
+
+    x = torch.randn(2, 5, device=mojo_device, requires_grad=True)
+    torch.compile(fn, backend=mojo_backend, fullgraph=True)(x).backward()
+    assert x.grad is not None
+
+    x_cpu = x.detach().cpu().requires_grad_(True)
+    fn(x_cpu).backward()
+    torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
+
+
 def test_compile_recompiles_for_cpu_inputs(mojo_device):
     """The same compiled function serves mojo and cpu inputs (device guard)."""
 
