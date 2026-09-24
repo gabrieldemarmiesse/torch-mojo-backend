@@ -17,6 +17,9 @@
 #include <c10/core/GradMode.h>
 #include <c10/core/GeneratorImpl.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
+#if TMB_TORCH_VERSION >= 210  // c10::DeviceCapability exists from 2.10
+#include <c10/core/DeviceCapability.h>
+#endif
 #include <torch/csrc/profiler/stubs/base.h>
 
 #include <chrono>
@@ -467,6 +470,30 @@ struct MojoGuardImpl final : c10::impl::DeviceGuardImplInterface {
     HOOK(ms = H.event_elapsed_ms(e1, e2));
     return ms;
   }
+#if TMB_TORCH_VERSION >= 210  // c10::DeviceCapability exists from 2.10
+  // torch.accelerator.get_device_capability(): the dtypes Mojo reports in the
+  // supported_dtypes device property (bit s = torch ScalarType s).
+  c10::DeviceCapability getDeviceCapability(c10::Device d) const override {
+    REQUIRE_READY();
+    int64_t props[TMB_DEVICE_PROPS_SLOTS];
+    char text[4096];
+    int32_t rc = 0;
+    HOOK(rc = H.device_props(idx_or_current(d), props, TMB_DEVICE_PROPS_SLOTS, text,
+                             static_cast<int32_t>(sizeof(text))));
+    TORCH_CHECK(rc == 0, "mojo backend: device properties unavailable");
+    const auto mask = static_cast<uint64_t>(props[TMB_PROP_SUPPORTED_DTYPES]);
+    c10::DeviceCapability cap;
+    cap.capability_data.capability_bits = 0;
+#define TMB_CAPABILITY_BIT(_, name)                                        \
+    if (static_cast<int>(c10::ScalarType::name) < 64 &&                   \
+        ((mask >> static_cast<int>(c10::ScalarType::name)) & 1ULL)) {      \
+      cap.capability_data.capability_bits |= 1ULL << c10::kIndex_##name;   \
+    }
+    AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(TMB_CAPABILITY_BIT)
+#undef TMB_CAPABILITY_BIT
+    return cap;
+  }
+#endif
 };
 C10_REGISTER_GUARD_IMPL(PrivateUse1, MojoGuardImpl);
 

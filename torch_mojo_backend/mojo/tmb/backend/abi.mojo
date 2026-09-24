@@ -116,6 +116,31 @@ def max_dtype(stype: Int32) raises -> DType:
     return DType.float32
 
 
+def supported_stypes(api: String) -> Int64:
+    """Bit `s` set for each torch ScalarType `s` that a tensor on a device of
+    MAX api `api` can hold and convert to and from every other one set here:
+    `torch.accelerator.get_device_capability()["supported_dtypes"]`.
+
+    That is `max_dtype`'s domain, read off it rather than listed again: a
+    tensor of any other ScalarType (complex, float8, quantized, bit-packed)
+    is declined before it is allocated. Between two of these, `_copy_from`
+    and `_to_copy` convert on the device (CastSpec) or, for the pairs that
+    kernel lacks, through CPU torch (`cast_for_copy`), so every pair
+    converts. float64 is left out on Metal: the Metal shading language has
+    no double, so no kernel (fill, arithmetic) can compute in it there.
+    """
+    var mask = Int64(0)
+    for s in range(64):
+        try:
+            _ = max_dtype(Int32(s))
+            mask |= Int64(1) << Int64(s)
+        except:
+            pass
+    if api == "metal":
+        mask &= ~(Int64(1) << Int64(ST_FLOAT64))
+    return mask
+
+
 def torch_dtype(dt: DType) raises -> Int32:
     if dt == DType.float32:
         return ST_FLOAT32

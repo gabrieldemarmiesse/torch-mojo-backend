@@ -417,12 +417,6 @@ Keep device work out of the dataset and in the main process.
 
 ## Not supported
 
-- `torch.accelerator.get_device_capability()` raises
-  `RuntimeError: Backend doesn't support getting device capabilities.`, as it
-  does on CUDA and ROCm. The `(major, minor)` pair of
-  `torch.cuda.get_device_capability()` is
-  `torch.get_device_module(device).get_device_capability(device)`, with the
-  same values as stock CUDA and ROCm.
 - `torch.amp.GradScaler`, see [Mixed precision](#mixed-precision).
 - CUDA graphs (`torch.cuda.graph`, `CUDAGraph`, `make_graphed_callables`) have
   no equivalent.
@@ -463,6 +457,18 @@ page:
 A process uses one vendor only: the first of NVIDIA, AMD and Apple that has
 a GPU. On a machine with both an NVIDIA and an AMD card, only the NVIDIA
 GPUs are used.
+
+`torch.accelerator.get_device_capability(device)` (torch 2.10 or newer)
+returns `{"supported_dtypes": {...}}`, the dtypes a tensor on the GPU can
+have and be converted between with `to()` and `copy_()`. On NVIDIA and AMD
+these are `bool`, `uint8`, `int8`, `int16`, `int32`, `int64`, `uint16`,
+`uint32`, `uint64`, `float16`, `bfloat16`, `float32` and `float64`; Apple
+GPUs have the same set without `float64`. Complex and float8 tensors cannot
+be created on the GPU. Stock CUDA and ROCm torch raise
+`RuntimeError: Backend doesn't support getting device capabilities.` here.
+The `(major, minor)` pair of `torch.cuda.get_device_capability()` is
+`torch.get_device_module(device).get_device_capability(device)`, with the
+same values as stock CUDA and ROCm.
 
 Op coverage is still partial. An op the backend does not implement raises
 `NotImplementedError` with the op's name, and never falls back to the CPU

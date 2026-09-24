@@ -109,7 +109,9 @@ typedef struct TmbBackendHooks {
   // max_threads_per_multi_processor, warp_size, regs_per_multiprocessor,
   // max_threads_per_block, regs_per_block, shared_memory_per_block,
   // shared_memory_per_block_optin, shared_memory_per_multiprocessor,
-  // max_blocks_per_multi_processor, clock_rate (kHz), max_grid_dim_x.
+  // max_blocks_per_multi_processor, clock_rate (kHz), max_grid_dim_x,
+  // supported_dtypes (bit s set for each torch ScalarType s the device holds
+  // and converts between: torch.accelerator.get_device_capability()).
   // Unknown numbers are -1. text holds name\0api\0arch_name\0 (UTF-8).
   int32_t (*device_props)(int32_t device, int64_t* out, int32_t n,
                           char* text, int32_t text_cap);
@@ -121,7 +123,7 @@ typedef struct TmbBackendHooks {
   int32_t (*is_pinned_ptr)(const void* ptr);  // 1 if page-locked by Mojo or CUDA
 } TmbBackendHooks;
 
-enum { TMB_MEM_STATS_SLOTS = 20, TMB_DEVICE_PROPS_SLOTS = 15 };
+enum { TMB_MEM_STATS_SLOTS = 20, TMB_DEVICE_PROPS_SLOTS = 16, TMB_PROP_SUPPORTED_DTYPES = 15 };
 
 int32_t tmb_device_properties(int32_t device, int64_t* out, int32_t n,
                               char* text, int32_t text_cap);

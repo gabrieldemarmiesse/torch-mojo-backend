@@ -212,7 +212,7 @@ def get_device_properties(
 ) -> MojoDeviceProperties:
     """Properties cached per device in Mojo."""
     idx = _index(device)
-    values = (ctypes.c_int64 * 15)()
+    values = (ctypes.c_int64 * 16)()  # tmb.h TMB_DEVICE_PROPS_SLOTS
     text = ctypes.create_string_buffer(4096)
     fn = native.shim().tmb_device_properties
     fn.argtypes = [

@@ -475,12 +475,102 @@ def test_capability_contracts_and_inductor_properties(mojo_device: str):
             assert capability == torch.cuda.get_device_capability(idx)
     else:
         assert capability == (None, None)
-    # DeviceGuardImplInterface's default is also inherited by CUDA. This
-    # API describes dtype support, not the SM or gfx architecture.
-    with pytest.raises(
-        RuntimeError, match="doesn't support getting device capabilities"
-    ):
-        torch.accelerator.get_device_capability(torch.device(mojo_device).index)
+    if not hasattr(torch.accelerator, "get_device_capability"):
+        return  # torch < 2.10
+    # Dtype support, not the SM or gfx architecture (stock CUDA and ROCm
+    # raise here: CUDAGuardImpl keeps DeviceGuardImplInterface's default).
+    index = torch.device(mojo_device).index
+    accelerator_capability = torch.accelerator.get_device_capability(index)
+    assert set(accelerator_capability) == {"supported_dtypes"}
+    expected = _DEVICE_DTYPES - ({torch.float64} if props.api == "metal" else set())
+    assert accelerator_capability["supported_dtypes"] == expected
+    with torch.accelerator.device_index(index):
+        assert torch.accelerator.get_device_capability() == accelerator_capability
+
+
+# What torch.accelerator.get_device_capability() lists on CUDA and HIP; Metal
+# lists the same minus float64.
+_DEVICE_DTYPES = {
+    torch.bool,
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.uint16,
+    torch.uint32,
+    torch.uint64,
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+}
+# Declined on every backend: no mojo tensor of these dtypes can exist.
+_NEVER_ON_DEVICE = (
+    torch.complex32,
+    torch.complex64,
+    torch.complex128,
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2fnuz,
+    torch.qint8,
+    torch.quint8,
+    torch.qint32,
+)
+
+
+def _values_exact_in(a: torch.dtype, b: torch.dtype) -> torch.Tensor:
+    """0/1 when either side is bool, else small non-negative integers: exact
+    in every supported dtype (bfloat16 up to 256, int8 up to 127)."""
+    if torch.bool in (a, b):
+        return torch.tensor([0, 1, 1, 0, 1])
+    return torch.tensor([0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 127])
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.accelerator, "get_device_capability"),
+    reason="torch.accelerator.get_device_capability() needs torch 2.10",
+)
+def test_accelerator_capability_dtypes_allocate_and_convert(mojo_device: str):
+    """Every dtype torch.accelerator.get_device_capability() lists allocates
+    on the device and converts to and from every other listed one, by `to`
+    and by `copy_`; the ones it leaves out are absent."""
+    props = device_module.get_device_properties(mojo_device)
+    index = torch.device(mojo_device).index
+    supported = torch.accelerator.get_device_capability(index)["supported_dtypes"]
+    assert supported and all(isinstance(dtype, torch.dtype) for dtype in supported)
+    assert not supported.intersection(_NEVER_ON_DEVICE)
+    if props.api == "metal":
+        assert torch.float64 not in supported
+    with pytest.raises(NotImplementedError):
+        torch.empty(2, dtype=torch.complex64, device=mojo_device)
+
+    dtypes = sorted(
+        (dtype for dtype in supported if isinstance(dtype, torch.dtype)), key=str
+    )
+    failures = []
+    for src in dtypes:
+        allocated = torch.empty(3, dtype=src, device=mojo_device)
+        assert allocated.dtype == src and allocated.device == torch.device(mojo_device)
+        for dst in dtypes:
+            host = _values_exact_in(src, dst).to(src)
+            expected = host.to(dst)
+            on_device = host.to(mojo_device)
+            converted = on_device.to(dst)
+            copied = torch.empty(host.shape, dtype=dst, device=mojo_device)
+            copied.copy_(on_device)
+            back = converted.to(src)
+            for what, got, want in (
+                ("to", converted, expected),
+                ("copy_", copied, expected),
+                ("round trip", back, host),
+            ):
+                got = got.cpu()
+                # tolist(): CPU torch.equal lacks the uint16/32/64 kernels.
+                if got.dtype != want.dtype or got.tolist() != want.tolist():
+                    failures.append(f"{src} -> {dst} {what}: {got.tolist()}")
+    assert not failures, failures
 
 
 @pytest.mark.parametrize(

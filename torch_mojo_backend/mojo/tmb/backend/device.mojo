@@ -23,6 +23,7 @@ from max.gpu.host import (
     HostBuffer,
 )
 
+from tmb.backend.abi import supported_stypes
 from tmb.backend.env_vars import (
     TORCH_MOJO_BACKEND_TEST_PEER_COPY,
     TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD,
@@ -36,6 +37,7 @@ comptime PinnedP = Pointer[Pinned, MutUntrackedOrigin]
 comptime EvP = Pointer[Ev, MutUntrackedOrigin]
 comptime U8P = Pointer[UInt8, MutUntrackedOrigin]
 comptime POOL_STREAMS = 4
+comptime PROPS_SLOTS = 16  # tmb.h TMB_DEVICE_PROPS_SLOTS
 
 
 struct MemoryStat(Copyable, Movable):
@@ -454,6 +456,7 @@ def _properties(d: Pointer[Dev, MutUntrackedOrigin]) -> Properties:
     ]
     for attr in attrs:
         values.append(_attribute(ctx, attr))
+    values.append(supported_stypes(d[].api))
     var arch: String
     try:
         arch = ctx.arch_name()
@@ -474,14 +477,18 @@ def h_device_props(
 ) abi("C") -> Int32:
     try:
         var d = dev(Int(device))
-        if n != 15:
-            raise Error("device properties ABI mismatch: expected 15 slots")
+        if n != PROPS_SLOTS:
+            raise Error(
+                "device properties ABI mismatch: expected "
+                + String(PROPS_SLOTS)
+                + " slots"
+            )
         if not d[].properties:
             d[].properties = _properties(d)
         ref props = d[].properties.value()
         if Int(text_cap) < props.text.byte_length():
             raise Error("device properties text buffer too small")
-        for i in range(15):
+        for i in range(PROPS_SLOTS):
             dst[unsafe_offset=i] = props.values[i]
         unsafe_memcpy(
             dest=text,

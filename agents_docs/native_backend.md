@@ -433,9 +433,15 @@ Compute capability matches `torch.cuda.get_device_capability()`: the SM
 version on CUDA, the gfx ISA version on HIP (`gfx942` -> `(9, 4)`, as
 `hipDeviceProp_t` reports it), `(None, None)` on Metal.
 This dataclass is separate from Inductor's Triton autotuner property contract.
-`torch.accelerator.get_device_capability()` describes dtype support and raises
-the default unsupported-capability error, just as CUDA does; we do not advertise
-an unverified dtype support list.
+`torch.accelerator.get_device_capability()` describes dtype support, not the
+architecture. Stock CUDA and ROCm raise there (`CUDAGuardImpl` keeps
+`DeviceGuardImplInterface`'s default); `MojoGuardImpl::getDeviceCapability`
+(torch 2.10+) instead returns the `supported_dtypes` device property, a
+bitmask over torch ScalarType values that Mojo computes once per device
+(`supported_stypes` in `tmb/backend/abi.mojo`): the domain of `max_dtype`,
+since a tensor of any other dtype is declined before it is allocated and any
+two of these convert (CastSpec on the device, CPU torch for the pairs it
+lacks), minus `float64` on Metal, which has no double arithmetic.
 
 There is no counterpart for CUDA allocator snapshots/history
 (`memory_snapshot`, `_record_memory_history`, `_dump_snapshot`), raw caching
