@@ -4704,6 +4704,37 @@ document.addEventListener("DOMContentLoaded", boot);
     },
     "NVIDIA H100 80GB HBM3 | cuda | kineto-device-time | torch 2.11.0+cu128": {
       "ops": {
+        "_amp_foreach_non_finite_check_and_unscale_": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "L_16x65536": {
+                  "layouts": {
+                    "contig": 0.328
+                  }
+                },
+                "L_4x1048576": {
+                  "layouts": {
+                    "contig": 0.577
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_amp_update_scale_": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "S_scalar": {
+                  "layouts": {
+                    "contig": 1.037
+                  }
+                }
+              }
+            }
+          }
+        },
         "_copy_from": {
           "dtypes": {
             "bf16": {
