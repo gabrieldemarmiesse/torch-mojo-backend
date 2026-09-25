@@ -18,6 +18,7 @@ runs:
       run: |
         echo "UV_CACHE_DIR=${UV_CACHE_DIR:-$HOME/.cache/uv}" >> "$GITHUB_ENV"
         echo "MODULAR_HOME=${MODULAR_HOME:-$HOME/.cache/modular}" >> "$GITHUB_ENV"
+        echo "MODULAR_CACHE_DIR=${MODULAR_CACHE_DIR:-$HOME/.cache/modular-cache}" >> "$GITHUB_ENV"
         echo "TORCH_MOJO_BACKEND_CACHE_DIR=${TORCH_MOJO_BACKEND_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/torch-mojo-backend/native}" >> "$GITHUB_ENV"
 
     - name: Install uv

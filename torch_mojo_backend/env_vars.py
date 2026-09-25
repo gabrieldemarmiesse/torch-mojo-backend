@@ -211,6 +211,10 @@ FOREIGN_ENV_VARS: dict[str, str] = {
         "The Mojo compiler's module cache. Defaulted to node-local scratch so "
         "concurrent compilers on an NFS $HOME cannot evict each other."
     ),
+    "MODULAR_CACHE_DIR": (
+        "The Mojo compiler's compile cache (default $MODULAR_HOME/cache). "
+        "Defaulted to node-local scratch for the same reason as MODULAR_HOME."
+    ),
     "MODULAR_MOJO_MAX_IMPORT_PATH": (
         "The comma-separated import path the Mojo toolchain -- MAX's in-process "
         "graph compiler included -- resolves `from X import` along. Extended at "

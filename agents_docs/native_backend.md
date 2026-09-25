@@ -53,7 +53,9 @@ sits in `$HOME`, which on a cluster is one NFS directory shared by every
 node, and concurrent compilers evict each other's entries there — "failed to
 produce an archive for the module: No such file or directory". Node-local,
 the first build on a machine pays about 25 s to fill it and nothing else
-touches it.
+touches it. The compile cache, `MODULAR_CACHE_DIR`, gets a node-local default
+of its own: it otherwise follows `MODULAR_HOME`, and a `MODULAR_HOME` a user
+set on NFS brought the same race back with Mojo 1.1.
 
 The two shims of the first row:
 

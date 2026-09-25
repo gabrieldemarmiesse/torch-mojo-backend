@@ -33,7 +33,8 @@ The GPU suites run on whichever `L4` runners are free. A runner takes one job
 at a time, so there is no need to flock the GPU against another job on it. The
 jobs preserve the runner's
 uv, Mojo, and native build caches, using
-`UV_CACHE_DIR`, `MODULAR_HOME`, and `TORCH_MOJO_BACKEND_CACHE_DIR` if configured,
+`UV_CACHE_DIR`, `MODULAR_HOME`, `MODULAR_CACHE_DIR`, and
+`TORCH_MOJO_BACKEND_CACHE_DIR` if configured,
 otherwise persistent directories under the user's cache directory. No cache
 cleanup or pruning runs between jobs. The dependency environment is synced
 against `uv.lock` each job; cached downloads and builds remain available.

@@ -67,8 +67,8 @@ def _local_dir(prefix: String) raises -> String:
 
 def _compiler_env() raises -> String:
     """Environment every `mojo build` subprocess runs with; an explicit value
-    wins. Why MODULAR_HOME must be node-local: native/__init__.py's
-    `compiler_env`, the same thing on the Python side."""
+    wins. Why MODULAR_HOME and MODULAR_CACHE_DIR must be node-local:
+    native/__init__.py's `compiler_env`, the same thing on the Python side."""
     # PYTHONEXECUTABLE/PYTHONHOME: the MAX runtime exports the interpreter it
     # found on PATH into this process's environment (invisible to os.environ,
     # inherited by children); with a venv that is not on PATH, the `mojo`
@@ -77,6 +77,8 @@ def _compiler_env() raises -> String:
     return (
         'unset PYTHONEXECUTABLE PYTHONHOME; MODULAR_HOME="${MODULAR_HOME:-'
         + _local_dir("modular-home-")
+        + '}" MODULAR_CACHE_DIR="${MODULAR_CACHE_DIR:-'
+        + _local_dir("modular-cache-")
         + '}"'
     )
 
@@ -234,8 +236,8 @@ struct Loader(Movable):
             + String(perf_counter_ns())
             + ".so"
         )
-        # MODULAR_HOME: the compiler's own cache goes to local scratch too
-        # (native/__init__.py compiler_env explains why)
+        # MODULAR_HOME, MODULAR_CACHE_DIR: the compiler's own caches go to
+        # local scratch too (native/__init__.py compiler_env explains why)
         var cmd = (
             _compiler_env()
             + " '"

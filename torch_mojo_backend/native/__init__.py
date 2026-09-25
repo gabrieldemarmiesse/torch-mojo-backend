@@ -337,13 +337,26 @@ def compiler_env() -> dict[str, str]:
     compilers then evict each other's entries — "failed to produce an archive
     for the module: No such file or directory". Node-local, it is per-machine
     and nobody else touches it; the first build on a machine pays about 25 s
-    to fill it. A value the caller set deliberately wins."""
+    to fill it. A value the caller set deliberately wins.
+
+    The compile cache, `MODULAR_CACHE_DIR`, defaults to `$MODULAR_HOME/cache`:
+    back on NFS whenever the caller set MODULAR_HOME there (a shell profile
+    often does), and with Mojo 1.1 concurrent builds race on it the same way.
+    It gets its own node-local default, so it stays local either way."""
+    scratch = Path(tempfile.gettempdir())
     home = Path(
-        os.environ.get("MODULAR_HOME")
-        or Path(tempfile.gettempdir()) / f"modular-home-{os.getuid()}"
+        os.environ.get("MODULAR_HOME") or scratch / f"modular-home-{os.getuid()}"
     )
     home.mkdir(parents=True, exist_ok=True)
-    env: dict[str, str] = {**os.environ, "MODULAR_HOME": str(home)}
+    cache = Path(
+        os.environ.get("MODULAR_CACHE_DIR") or scratch / f"modular-cache-{os.getuid()}"
+    )
+    cache.mkdir(parents=True, exist_ok=True)
+    env: dict[str, str] = {
+        **os.environ,
+        "MODULAR_HOME": str(home),
+        "MODULAR_CACHE_DIR": str(cache),
+    }
     # The MAX runtime exports the interpreter it found on PATH into this
     # process's environment (children inherit it); with a venv that is not on
     # PATH the `mojo` launcher script would start /usr/bin/python3 against the

@@ -79,6 +79,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import uuid
@@ -191,8 +192,11 @@ def build_env() -> dict[str, str]:
     parse with "use of unknown declaration 'PyCFunction'".  Stripping them is
     what the on-device builds do, so building them here the same way is also the
     only way this comparison sees the same source the runtime compiles.
+
+    The compile cache defaults to node-local scratch, as in
+    ``native.compiler_env`` (which explains the NFS race it avoids).
     """
-    return {
+    env = {
         key: value
         for key, value in os.environ.items()
         if not (
@@ -200,6 +204,11 @@ def build_env() -> dict[str, str]:
             and ("PACKAGE_ROOT" in key or "IMPORT_PATH" in key)
         )
     }
+    env.setdefault(
+        "MODULAR_CACHE_DIR",
+        str(Path(tempfile.gettempdir()) / f"modular-cache-{os.getuid()}"),
+    )
+    return env
 
 
 def emit_asm(

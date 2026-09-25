@@ -227,7 +227,7 @@ def test_compiler_env_drops_the_runtime_interpreter_variables(monkeypatch):
     monkeypatch.setenv("PYTHONHOME", "/usr")
     env = native.compiler_env()
     assert "PYTHONEXECUTABLE" not in env and "PYTHONHOME" not in env
-    assert env["MODULAR_HOME"]
+    assert env["MODULAR_HOME"] and env["MODULAR_CACHE_DIR"]
 
 
 def test_kernel_call_defines_and_owned_spec_lifetimes(tmp_path):
