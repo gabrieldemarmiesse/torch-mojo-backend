@@ -177,7 +177,7 @@ comptime ERR_REDUCE_SCATTER_SYNC = 7
 """`reduce_scatter`'s barriers: the push/reduce kernel that writes the user's
 output directly, not the split allreduce's `reduce_scatter_stage` (code 4)."""
 comptime ERR_PROXY_WAIT = 9
-"""`gin_scratch.mojo`'s wait for the inter-node progress thread. The
+"""`gin_proxy.mojo`'s wait for the inter-node progress thread. The
 value is what that kernel has always written, so old logs still decode."""
 
 comptime ERR_FUSED_GRID = 10

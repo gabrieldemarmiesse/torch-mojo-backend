@@ -16,8 +16,8 @@
 #    inline` in <rdma/fi_*.h> and dispatch through the ops table hanging off
 #    the object: `ep->rma->writemsg`, `ep->msg->sendmsg`, `cq->ops->read`,
 #    `domain->mr->regattr`, `fid->ops->bind`. This file hand-writes those
-#    dereferences over raw byte offsets, exactly as misc/ibvwrap.mojo does for
-#    `qp->context->ops.post_send`.
+#    dereferences over raw byte offsets, exactly as include/ibvwrap.mojo does
+#    for `qp->context->ops.post_send`.
 #
 # Every offset, size and constant below was dumped by
 # tests/multinode/selftest/fabric_abi.c compiled against

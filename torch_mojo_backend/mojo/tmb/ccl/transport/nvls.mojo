@@ -1,5 +1,4 @@
 # Rewrite of: https://github.com/NVIDIA/nccl/blob/master/src/transport/nvls.cc
-#   also:     https://github.com/NVIDIA/nccl/blob/master/src/transport/multicast.cc
 #
 # CUDA VMM + NVSwitch-multicast bring-up for the region device/all_reduce.mojo
 # reduces through, called into libcuda.so.1 with the `OwnedDLHandle`
@@ -36,20 +35,21 @@
 # so production uses MINIMUM to avoid rounding up that much memory.
 
 from std.os import getenv
-from std.sys import has_amd_gpu_accelerator
 from std.ffi import OwnedDLHandle
 from std.memory.alloc import unsafe_alloc
-from std.utils import StaticTuple
 
 from tmb.ccl.device.all_reduce import nvls_min_bytes
 from tmb.ccl.env_vars import MOJOCCL_NVLS
 from tmb.ccl.include.device import MAX_WORLD
+from tmb.ccl.include.transport import NvlsRegion
 from tmb.ccl.misc.cudawrap import device_attribute
-from tmb.ccl.os.linux_ipcsocket import (
-    scm_exchange_fds,
-    scm_recv,
-    scm_send,
-    socket_path,
+from tmb.ccl.os.linux_ipcsocket import scm_exchange_fds, socket_path
+from tmb.ccl.transport.multicast import (
+    CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+    MSG_KIND_UC,
+    NVLS_AVAILABLE,
+    _cu,
+    _mc_prop,
 )
 
 
@@ -84,8 +84,6 @@ def _nvls_recommended_granularity() -> Bool:
     return False
 
 
-# CUmemAllocationHandleType
-comptime CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 1
 # CUmemAllocationType
 comptime CU_MEM_ALLOCATION_TYPE_PINNED = 1
 # CUmemLocationType
@@ -99,22 +97,6 @@ comptime GRANULARITY_RECOMMENDED = 1
 comptime ATTR_MULTIPROCESSOR_COUNT = 16
 comptime ATTR_MULTICAST_SUPPORTED = 132
 comptime ATTR_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED = 110
-
-
-comptime MSG_KIND_MC = 0
-"""Payload word 0 of the datagram carrying the multicast object's fd."""
-comptime MSG_KIND_UC = 1
-"""...and of the one carrying a peer's own memory handle; word 1 is that
-peer's local rank."""
-
-comptime NVLS_AVAILABLE = not has_amd_gpu_accelerator()
-"""Every entry point below is CUDA-only; HIP has no multicast equivalent and
-RCCL none either, so an AMD build never reaches them."""
-
-
-def _cu(lib: OwnedDLHandle, rc: Int32, what: String) raises:
-    if rc != 0:
-        raise Error("mojoccl: " + what + " failed, driver rc=" + String(rc))
 
 
 def _align_up(x: Int, a: Int) -> Int:
@@ -138,18 +120,6 @@ def sm_count(lib: OwnedDLHandle, ordinal: Int) -> Int:
 # Driver property blocks, laid out by hand over UInt64 words (field offsets
 # from cuda.h; `std.ffi` has no C-struct ABI).
 # ===-------------------------------------------------------------------=== #
-
-
-def _mc_prop(world: Int, size: Int) -> Pointer[UInt64, MutUntrackedOrigin]:
-    """CUmulticastObjectProp{numDevices, size, handleTypes, flags}, 32 B."""
-    var p = unsafe_alloc[UInt64](4)
-    p[unsafe_offset=0] = UInt64(UInt32(world))  # numDevices +0, pad +4
-    p[unsafe_offset=1] = UInt64(size)  # size +8
-    p[unsafe_offset=2] = UInt64(
-        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-    )  # handleTypes +16
-    p[unsafe_offset=3] = 0  # flags +24
-    return p
 
 
 def _mem_prop(
@@ -275,35 +245,6 @@ def multicast_capable(
 # ===-------------------------------------------------------------------=== #
 
 
-struct NvlsRegion(Movable):
-    """One rank's slice of a node-wide multicast allocation.
-
-    `mc` is the multicast VA -- only `multimem.*` may touch it. `uc` is a plain
-    mapping of the same physical bytes and is what every unicast kernel, the
-    staging copies and the flag spin use; it is also what `regions[local_rank]`
-    holds, so device/symmetric/ never learns that the region changed.
-    """
-
-    var mc: Int
-    var uc: Int
-    var size: Int
-    var granularity: Int
-    var mc_handle: UInt64
-    var mem_handle: UInt64
-    var peer_va: StaticTuple[Int, MAX_WORLD]
-    var peer_handle: StaticTuple[UInt64, MAX_WORLD]
-
-    def __init__(out self):
-        self.mc = 0
-        self.uc = 0
-        self.size = 0
-        self.granularity = 0
-        self.mc_handle = 0
-        self.mem_handle = 0
-        self.peer_va = StaticTuple[Int, MAX_WORLD](fill=0)
-        self.peer_handle = StaticTuple[UInt64, MAX_WORLD](fill=0)
-
-
 def _map(
     lib: OwnedDLHandle, handle: UInt64, size: Int, gran: Int, ordinal: Int
 ) raises -> Int:
@@ -370,88 +311,6 @@ def nvls_teardown(
     region.mem_handle = 0
     region.mc_handle = 0
     region.size = 0
-
-
-def nvls_create_and_share(
-    lib: OwnedDLHandle,
-    libc: OwnedDLHandle,
-    dir: String,
-    magic: UInt64,
-    local_rank: Int,
-    local_world: Int,
-    ordinal: Int,
-    size: Int,
-    gran: Int,
-    sock: Int,
-    timeout_s: Float64,
-    mut region: NvlsRegion,
-) raises:
-    """Steps 1-3 of the bring-up: the multicast object exists on every rank and
-    every device has joined it. The caller barriers after this, then calls
-    `nvls_bind_and_map` -- the split is where the "every device in the team
-    before any memory is bound" rule lives.
-    """
-    comptime if not NVLS_AVAILABLE:
-        raise Error("mojoccl: NVLS is CUDA-only")
-    region.size = size
-    region.granularity = gran
-    var mch: UInt64 = 0
-    if local_rank == 0:
-        _cu(
-            lib,
-            lib.get_function[Int32]("cuMulticastCreate")(
-                Pointer(to=mch), _mc_prop(local_world, size)
-            ),
-            "cuMulticastCreate",
-        )
-        # Owned by the region from this line on, so a failure in the export
-        # or the fd hand-off below is released by `nvls_teardown`.
-        region.mc_handle = mch
-        var fd: Int32 = -1
-        _cu(
-            lib,
-            lib.get_function[Int32]("cuMemExportToShareableHandle")(
-                Pointer(to=fd),
-                mch,
-                Int32(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
-                UInt64(0),
-            ),
-            "cuMemExportToShareableHandle(multicast)",
-        )
-        try:
-            for r in range(1, local_world):
-                scm_send(
-                    libc,
-                    socket_path(dir, magic, r),
-                    Int(fd),
-                    MSG_KIND_MC,
-                    0,
-                    timeout_s,
-                )
-        except e:
-            _ = libc.get_function[Int32]("close")(fd)
-            raise e
-        _ = libc.get_function[Int32]("close")(fd)
-    else:
-        var got = scm_recv(libc, sock)
-        if got[1] != MSG_KIND_MC:
-            _ = libc.get_function[Int32]("close")(Int32(got[0]))
-            raise Error(
-                "mojoccl: expected the multicast fd, got kind " + String(got[1])
-            )
-        var rc = lib.get_function[Int32]("cuMemImportFromShareableHandle")(
-            Pointer(to=mch),
-            got[0],
-            Int32(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
-        )
-        _ = libc.get_function[Int32]("close")(Int32(got[0]))
-        _cu(lib, rc, "cuMemImportFromShareableHandle(multicast)")
-        region.mc_handle = mch
-    _cu(
-        lib,
-        lib.get_function[Int32]("cuMulticastAddDevice")(mch, Int32(ordinal)),
-        "cuMulticastAddDevice",
-    )
 
 
 def nvls_bind_and_map(

@@ -31,6 +31,7 @@ from std.memory.alloc import unsafe_alloc
 from tmb.ccl.include.plugin.nccl_net import MAX_NODES
 from tmb.ccl.misc.cudawrap import alloc_host, device_pci_bus_id, host_device_ptr
 from tmb.ccl.misc.utils import P8, alloc_bytes
+from tmb.ccl.plugin.net import NET_VERBS, _select_backend
 from tmb.ccl.transport.net import (
     BATCH_POLL_NS,
     IbPeer,
@@ -40,7 +41,6 @@ from tmb.ccl.transport.net import (
     MB_DONE,
     MB_REQUEST,
     MB_STOP,
-    NET_VERBS,
     OP_ALLGATHER,
     OP_REDUCE_SCATTER,
     PIPE_MAX_SLOTS,
@@ -50,7 +50,6 @@ from tmb.ccl.transport.net import (
     _load_atomic_i,
     _mb,
     _nanosleep_ns,
-    _select_backend,
     _st,
     _teardown_ib_resources,
     _work,

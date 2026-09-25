@@ -328,7 +328,7 @@ def grid_barrier(
                     # On gfx942 the acquire load above is a `buffer_inv sc0
                     # sc1` -- an L1+L2 invalidate -- per iteration, and
                     # nblocks-1 threads spin here for a whole network round
-                    # trip (gin_scratch.mojo has the measurement for
+                    # trip (gin_proxy.mojo has the measurement for
                     # one such thread). Sleep between polls; the ordering
                     # stays as it is.
                     # MI300A sweep, Adastra job 5417296 (2026-09-15):

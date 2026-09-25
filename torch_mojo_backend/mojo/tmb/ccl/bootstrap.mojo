@@ -25,6 +25,15 @@ from std.random import random_ui64
 from std.time import perf_counter_ns, sleep
 
 from tmb.ccl.misc.socket import (
+    _fill_sockaddr,
+    _recv_all,
+    _send_all,
+    format_ipv4,
+    local_ipv4,
+)
+from tmb.ccl.misc.utils import _alloc
+from tmb.ccl.nccl import UID_BYTES
+from tmb.ccl.os.linux import (
     AF_INET,
     EAGAIN,
     EINTR,
@@ -42,17 +51,10 @@ from tmb.ccl.misc.socket import (
     _close,
     _connect_deadline,
     _errno,
-    _fill_sockaddr,
-    _recv_all,
-    _send_all,
     _set_int_opt,
     _set_timeout,
     _wait_ready,
-    format_ipv4,
-    local_ipv4,
 )
-from tmb.ccl.misc.utils import _alloc
-from tmb.ccl.nccl import UID_BYTES
 
 
 comptime HANDLE_BYTES = 64

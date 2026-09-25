@@ -37,10 +37,11 @@ from tmb.ccl.include.device import (
     error_offset,
     signal_bytes,
 )
+from tmb.ccl.include.transport import NvlsRegion
 from tmb.ccl.misc.strongstream import CompletionEvent
 from tmb.ccl.nccl import NCCL_INTERNAL_ERROR, NCCL_REMOTE_ERROR, NCCL_SUCCESS
 from tmb.ccl.transport.net import CREDIT_AREA_BYTES, ib_error
-from tmb.ccl.transport.nvls import NvlsRegion, sm_count
+from tmb.ccl.transport.nvls import sm_count
 
 
 # Staging arenas the multi-node region is carved into, and therefore chunks

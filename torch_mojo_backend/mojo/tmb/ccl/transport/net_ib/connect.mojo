@@ -4,8 +4,7 @@ from std.os import getenv
 
 from tmb.ccl.env_vars import MOJOCCL_IB_HCA, MOJOCCL_IB_RELAXED_ORDERING
 from tmb.ccl.graph.topo import pci_pick
-from tmb.ccl.include.plugin.nccl_net import MAX_NODES
-from tmb.ccl.misc.ibvwrap import (
+from tmb.ccl.include.ibvcore import (
     IBV_ACCESS_LOCAL_WRITE,
     IBV_ACCESS_REMOTE_READ,
     IBV_ACCESS_REMOTE_WRITE,
@@ -13,7 +12,6 @@ from tmb.ccl.misc.ibvwrap import (
     IBV_QPS_RTR,
     IBV_QPS_RTS,
     IBV_QPT_RC,
-    Ibv,
     MR_LKEY,
     MR_RKEY,
     PA_ACTIVE_MTU,
@@ -56,10 +54,10 @@ from tmb.ccl.misc.ibvwrap import (
     SZ_SEND_WR,
     SZ_SGE,
     SZ_WC,
-    build_recv_wr,
-    post_recv,
-    qp_number,
 )
+from tmb.ccl.include.ibvwrap import post_recv
+from tmb.ccl.include.plugin.nccl_net import MAX_NODES
+from tmb.ccl.misc.ibvwrap import Ibv, build_recv_wr, qp_number
 from tmb.ccl.misc.utils import (
     P8,
     alloc_bytes,

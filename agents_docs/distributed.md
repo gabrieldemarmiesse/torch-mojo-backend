@@ -604,8 +604,8 @@ and measurements: `agents_docs/mojo_collectives_feasibility.md` (study) and
 
 **File layout.** `tmb/ccl/` mirrors NCCL master's `src/` tree, one file per
 NCCL file, so someone porting from NCCL finds the code where NCCL keeps it.
-Every file opens with `# Rewrite of: <NCCL file URL>` (plus `#   also:` lines
-when it merges several, or `none (mojoccl-only: ...). Closest: <url>`).
+Every file opens with `# Rewrite of: <NCCL file URL>` -- exactly one NCCL
+file, or `none (mojoccl-only: ...). Closest: <url>`.
 `entry.mojo` is only the export table (`src/libnccl.map`): an `@export` is
 emitted only from the module being built, so it holds one C-ABI shim per
 symbol forwarding to `collectives.mojo` / `group.mojo` / `init.mojo`. Two
@@ -620,13 +620,13 @@ use map as follows:
 | `entry.mojo` (a.k.a. `mojoccl.mojo`) | `entry.mojo` (exports), `init.mojo`, `enqueue.mojo`, `collectives.mojo`, `group.mojo`, `include/comm.mojo`, `nccl.mojo` |
 | `collectives_kernels.mojo` | `device/symmetric/{all_reduce,all_gather,reduce_scatter,primitives,data_ops}.mojo`, `device/{broadcast,common}.mojo`, `include/device.mojo`, `include/nccl_device/lsa_barrier.mojo` |
 | `nvls_kernels.mojo` | `device/all_reduce.mojo` |
-| `vmm.mojo` | `transport/nvls.mojo`, `os/linux_ipcsocket.mojo` |
+| `vmm.mojo` | `transport/nvls.mojo`, `transport/multicast.mojo`, `include/transport.mojo`, `os/linux_ipcsocket.mojo` |
 | `driver.mojo` | `misc/cudawrap.mojo`, `misc/strongstream.mojo`, `transport/p2p.mojo` |
-| `bootstrap.mojo` | `bootstrap.mojo`, `misc/socket.mojo`, `misc/utils.mojo` |
-| `internode.mojo` | `transport/net.mojo`, `proxy.mojo` |
-| `internode_kernels.mojo` | `device/symmetric/gin_scratch.mojo` |
+| `bootstrap.mojo` | `bootstrap.mojo`, `misc/socket.mojo`, `os/linux.mojo`, `misc/utils.mojo` |
+| `internode.mojo` | `transport/net.mojo`, `plugin/net.mojo`, `proxy.mojo` |
+| `internode_kernels.mojo` | `device/symmetric/gin_scratch.mojo`, `include/nccl_device/gin/proxy/gin_proxy.mojo` |
 | `internode_fused.mojo` | `device/symmetric/all_reduce_gin.mojo` |
-| `ibverbs.mojo` | `misc/ibvwrap.mojo`, `transport/net_ib/{init,connect,p2p}.mojo` |
+| `ibverbs.mojo` | `misc/ibvwrap.mojo`, `include/{ibvwrap,ibvcore}.mojo`, `transport/net_ib/{init,connect,p2p}.mojo` |
 | `libfabric.mojo` | `transport/net_ofi.mojo` |
 | `netutil.mojo` | `misc/utils.mojo`, `include/plugin/nccl_net.mojo`, `graph/topo.mojo` |
 | `reduce_scatter/{multinode,fused,stream}.mojo` | `device/symmetric/reduce_scatter_gin{,_fused,_stream}.mojo` |
@@ -1159,7 +1159,8 @@ the path has a size floor: 48 MiB is the measured crossover, sharp (4% the
 wrong side at 40 MiB, 4% the right side at 48) and the same for fp32 and
 bf16. int32/int64 stay unicast.
 
-**Bring-up** (`transport/nvls.mojo`, NCCL's `src/transport/nvls.cc` sequence). The
+**Bring-up** (`transport/nvls.mojo` and `transport/multicast.mojo`, NCCL's
+`src/transport/nvls.cc` sequence). The
 node's local rank 0 calls `cuMulticastCreate` and exports the object as a
 POSIX file descriptor; the fd travels to its node-mates over an AF_UNIX
 `SOCK_DGRAM` socket as an `SCM_RIGHTS` control message, which is what NCCL
@@ -1568,8 +1569,9 @@ per poll batch -- loop-invariant and perfectly predicted -- so the verbs
 path costs what it always did.
 
 **Transport A, InfiniBand** (`torch_mojo_backend/mojo/tmb/ccl/`: `misc/ibvwrap.mojo`,
-`transport/net_ib/`, `transport/net.mojo`, `proxy.mojo`,
-`device/symmetric/gin_scratch.mojo`, `bootstrap.mojo`): libibverbs is dlopened; setup calls are
+`include/{ibvwrap,ibvcore}.mojo`, `transport/net_ib/`, `transport/net.mojo`,
+`proxy.mojo`, `device/symmetric/gin_scratch.mojo`,
+`include/nccl_device/gin/proxy/gin_proxy.mojo`, `bootstrap.mojo`): libibverbs is dlopened; setup calls are
 symbols, the data path (`ibv_post_send`/`post_recv`/`poll_cq`) is reached
 through the `ibv_context_ops` table at the header's offsets, as NCCL's
 `ibvwrap` does. One RC queue pair per remote node, attributes borrowed from

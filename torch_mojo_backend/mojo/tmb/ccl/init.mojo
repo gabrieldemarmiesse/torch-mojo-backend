@@ -69,6 +69,7 @@ from tmb.ccl.include.device import (
     signal_bytes,
 )
 from tmb.ccl.include.plugin.nccl_net import MAX_NODES
+from tmb.ccl.include.transport import NvlsRegion
 from tmb.ccl.misc.cudawrap import (
     alloc_host,
     current_device_ordinal,
@@ -97,6 +98,7 @@ from tmb.ccl.os.linux_ipcsocket import (
     socket_path,
 )
 from tmb.ccl.proxy import ib_setup, ib_signal_abort, ib_teardown
+from tmb.ccl.transport.multicast import nvls_create_and_share
 from tmb.ccl.transport.net import (
     IB_BLOB_BYTES,
     ib_connect,
@@ -107,14 +109,12 @@ from tmb.ccl.transport.net import (
 )
 from tmb.ccl.transport.nvls import (
     NVLS_FD_TIMEOUT_S,
-    NvlsRegion,
     _nvls_enabled,
     _nvls_min_bytes,
     _nvls_recommended_granularity,
     multicast_capable,
     multicast_granularity,
     nvls_bind_and_map,
-    nvls_create_and_share,
     nvls_teardown,
     sm_count,
 )

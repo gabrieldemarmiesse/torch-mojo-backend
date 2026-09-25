@@ -1,5 +1,4 @@
 # Rewrite of: https://github.com/NVIDIA/nccl/blob/master/src/transport/net.cc
-#   also:     https://github.com/NVIDIA/nccl/blob/master/src/plugin/net.cc
 #
 # The inter-node hop: GPUDirect RDMA, no vendor collective library. One
 # connection per remote node, to the rank holding the SAME local_rank there
@@ -83,8 +82,11 @@ from max.gpu.host import DeviceContext, DeviceStream
 from std.ffi import OwnedDLHandle, external_call
 from std.utils import StaticTuple
 
-from tmb.ccl.device.symmetric.gin_scratch import proxy_request, proxy_wait
-from tmb.ccl.env_vars import MOJOCCL_IB_TIMEOUT_S, MOJOCCL_IB_TRACE, MOJOCCL_NET
+from tmb.ccl.env_vars import MOJOCCL_IB_TIMEOUT_S, MOJOCCL_IB_TRACE
+from tmb.ccl.include.nccl_device.gin.proxy.gin_proxy import (
+    proxy_request,
+    proxy_wait,
+)
 from tmb.ccl.include.plugin.nccl_net import (
     MAX_NODES,
     NC_FLUSH,
@@ -95,6 +97,7 @@ from tmb.ccl.include.plugin.nccl_net import (
 from tmb.ccl.misc.cudawrap import free_host, open_driver
 from tmb.ccl.misc.strongstream import launch_host_func
 from tmb.ccl.misc.utils import P8, alloc_bytes
+from tmb.ccl.plugin.net import NET_FABRIC, NET_VERBS
 from tmb.ccl.transport.net_ib.connect import (
     VerbsNet,
     vrb_blob_base,
@@ -104,7 +107,6 @@ from tmb.ccl.transport.net_ib.connect import (
     vrb_local_info,
     vrb_teardown,
 )
-from tmb.ccl.transport.net_ib.init import verbs_available
 from tmb.ccl.transport.net_ib.p2p import (
     vrb_poll,
     vrb_post_flush,
@@ -124,15 +126,8 @@ from tmb.ccl.transport.net_ofi import (
     fab_post_recvs,
     fab_post_write,
     fab_teardown,
-    fabric_available,
 )
 
-
-# Which transport `ib_setup` opened. Runtime rather than comptime: one
-# build of libmojoccl.so has to run on an InfiniBand cluster and on a
-# Slingshot one, and `MOJOCCL_NET` has to be able to force either.
-comptime NET_VERBS = 0
-comptime NET_FABRIC = 1
 
 comptime WORK_SLOTS = 512
 # Completions pulled out of the transport per engine step.
@@ -1016,37 +1011,6 @@ def _callback_address() -> Int:
 # ===-------------------------------------------------------------------=== #
 # Setup
 # ===-------------------------------------------------------------------=== #
-
-
-def _select_backend() raises -> Int:
-    """Which transport to open: `MOJOCCL_NET` wins, else what is present.
-
-    "Present" means the library opens AND has something usable behind it --
-    a login node with a Mellanox card and a compute node with four Slingshot
-    NICs and no /dev/infiniband both give an unambiguous answer, and a
-    machine with neither gets the same error message this library has always
-    given. Verbs is tried first because it is the measured path.
-    """
-    var want = getenv(MOJOCCL_NET, "")
-    if want == "verbs":
-        return NET_VERBS
-    if want == "fabric":
-        return NET_FABRIC
-    if want.byte_length() > 0:
-        raise Error(
-            "mojoccl: MOJOCCL_NET must be `verbs` or `fabric`, got " + want
-        )
-    if verbs_available():
-        return NET_VERBS
-    if fabric_available():
-        return NET_FABRIC
-    raise Error(
-        "mojoccl: no ACTIVE InfiniBand port found (libibverbs) and no"
-        " libfabric provider offering FI_RMA|FI_MSG|FI_HMEM on an FI_EP_RDM"
-        " endpoint; a multi-node communicator needs one of the two."
-        " MOJOCCL_NET=verbs|fabric forces a choice, MOJOCCL_LIBFABRIC points"
-        " at a libfabric.so.1 that is not on the loader path"
-    )
 
 
 def _ib_timeout_s() -> Float64:

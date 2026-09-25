@@ -3,17 +3,17 @@
 from std.os import getenv
 
 from tmb.ccl.env_vars import MOJOCCL_IB_HCA
-from tmb.ccl.misc.ibvwrap import (
+from tmb.ccl.include.ibvcore import (
     DEV_NAME,
     IBV_LINK_LAYER_INFINIBAND,
     IBV_PORT_ACTIVE,
-    Ibv,
     PA_ACTIVE_MTU,
     PA_LID,
     PA_LINK_LAYER,
     PA_STATE,
     SZ_PORT_ATTR,
 )
+from tmb.ccl.misc.ibvwrap import Ibv
 from tmb.ccl.misc.utils import P8, alloc_bytes, ld16, ld32, ld64, ld8
 
 

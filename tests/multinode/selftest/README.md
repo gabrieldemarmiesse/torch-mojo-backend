@@ -144,8 +144,9 @@ growing, and a single-node region byte-identical to the pre-pipeline one.
 
 ## `fd_exchange.mojo` — the SCM_RIGHTS fd transport of the NVLS bring-up
 
-`fd_exchange <local_rank> <local_world> <dir> <magic>`. `transport/nvls.mojo` hands the
-multicast object and every rank's own VMM handle to its node-mates as file
+`fd_exchange <local_rank> <local_world> <dir> <magic>`.
+`transport/multicast.mojo` and `transport/nvls.mojo` hand the multicast
+object and every rank's own VMM handle to its node-mates as file
 descriptors over an AF_UNIX `SOCK_DGRAM` socket, with the msghdr / cmsghdr /
 sockaddr_un structs laid out by hand over `UInt64` words because `std.ffi`
 has no C-struct ABI. A wrong offset there does not fail loudly — `sendmsg`
@@ -184,7 +185,7 @@ the deadline was only read after it came back. It is 1.50 s now.
 ## `fabric_abi.mojo` + `fabric_abi.c` — the libfabric struct offsets
 
 `transport/net_ofi.mojo` reaches libfabric's `static inline` data path the
-way `misc/ibvwrap.mojo` reaches libibverbs': by loading a function pointer out of an
+way `include/ibvwrap.mojo` reaches libibverbs': by loading a function pointer out of an
 ops table at a hand-written byte offset (`ep->rma->writemsg`,
 `cq->ops->read`, `domain->mr->regattr`, `fid->ops->bind`). `std.ffi` has no
 C-struct ABI (MOCO-3692), so those offsets are numbers in the Mojo source,

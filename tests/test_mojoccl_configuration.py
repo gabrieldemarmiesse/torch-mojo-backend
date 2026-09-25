@@ -81,14 +81,19 @@ NCCL_SRC = "https://github.com/NVIDIA/nccl/blob/master/src/"
 
 def test_every_mojoccl_file_names_its_nccl_counterpart():
     """tmb/ccl mirrors NCCL master's src/ tree (AGENTS.md, "mojoccl layout"):
-    each file opens with the NCCL file it rewrites, or says it has none."""
+    each file opens with the one NCCL file it rewrites, or says it has none."""
     ccl = PACKAGE / "mojo/tmb/ccl"
     for path in sorted(ccl.rglob("*.mojo")):
-        first = path.read_text().splitlines()[0]
+        text = path.read_text()
+        first = text.splitlines()[0]
         where = path.relative_to(ccl)
         assert first.startswith(f"# Rewrite of: {NCCL_SRC}") or (
             first.startswith("# Rewrite of: none") and NCCL_SRC in first
         ), f"{where}: first line must be `# Rewrite of: {NCCL_SRC}<path>`"
+        # One NCCL counterpart per file: code whose counterpart is in another
+        # NCCL file goes in the mojoccl file at that file's path.
+        assert text.count("Rewrite of:") == 1, where
+        assert not re.search(r"^#\s*also:", text, re.M), where
         # A module named after its directory, or beside a directory of the
         # same name, is shadowed by the package.
         assert path.stem != path.parent.name, where

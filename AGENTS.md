@@ -73,10 +73,10 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   `src/transport/net_ib/connect.cc`, ...), so an NCCL expert finds the code
   where NCCL keeps it. Each file starts with
   `# Rewrite of: https://github.com/NVIDIA/nccl/blob/master/src/<path>`
-  (`#   also:` lines when it merges several NCCL files; `none (mojoccl-only:
-  <reason>). Closest: <url>` when NCCL has no counterpart). New mojoccl code
-  goes in the file matching its NCCL counterpart, creating that file at
-  NCCL's path if needed. `entry.mojo` stays the export table only (an
+  -- exactly one NCCL file, never a merge of several (`none (mojoccl-only:
+  <reason>). Closest: <url>` when NCCL has no counterpart). New mojoccl
+  code goes in the file matching its NCCL counterpart, creating that file
+  at NCCL's path if needed. `entry.mojo` stays the export table only (an
   `@export` is emitted only from the built module): one C-ABI shim per
   symbol, forwarding to the implementation. Where NCCL has a file and a
   directory of the same name, flatten (`src/enqueue/enqueue.cc` is

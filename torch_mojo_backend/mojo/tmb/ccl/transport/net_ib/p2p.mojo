@@ -2,14 +2,7 @@
 
 from std.sys import size_of
 
-from tmb.ccl.include.plugin.nccl_net import (
-    NC_FLUSH,
-    NC_OTHER,
-    NC_RECV,
-    NC_SEND,
-    NetCompletion,
-)
-from tmb.ccl.misc.ibvwrap import (
+from tmb.ccl.include.ibvcore import (
     IBV_WC_RDMA_READ,
     IBV_WC_RDMA_WRITE,
     IBV_WC_RECV_RDMA_WITH_IMM,
@@ -21,13 +14,20 @@ from tmb.ccl.misc.ibvwrap import (
     WC_STATUS,
     WC_VENDOR_ERR,
     WC_WR_ID,
+)
+from tmb.ccl.include.ibvwrap import poll_cq, post_recv, post_send
+from tmb.ccl.include.plugin.nccl_net import (
+    NC_FLUSH,
+    NC_OTHER,
+    NC_RECV,
+    NC_SEND,
+    NetCompletion,
+)
+from tmb.ccl.misc.ibvwrap import (
     be32,
     build_read_wr,
     build_recv_wr,
     build_write_wr,
-    poll_cq,
-    post_recv,
-    post_send,
 )
 from tmb.ccl.misc.utils import ld32, ld64, ldu32
 from tmb.ccl.transport.net_ib.connect import VerbsNet, _b
