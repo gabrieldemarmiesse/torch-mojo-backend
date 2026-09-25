@@ -3,17 +3,16 @@ from std.memory.alloc import unsafe_alloc
 from std.sys import argv
 from std.time import sleep
 
+from tmb.ccl.nccl import UID_BYTES
 from tmb.ccl.bootstrap import (
-    UID_BYTES,
     bootstrap_allgather,
     bootstrap_barrier,
     bootstrap_connect,
-    derive_topology,
-    format_ipv4,
-    host_hash,
-    local_ipv4,
     make_unique_id,
 )
+from tmb.ccl.init import derive_topology
+from tmb.ccl.misc.socket import format_ipv4, local_ipv4
+from tmb.ccl.misc.utils import host_hash
 
 
 def _p8(n: Int) -> Pointer[UInt8, MutAnyOrigin]:

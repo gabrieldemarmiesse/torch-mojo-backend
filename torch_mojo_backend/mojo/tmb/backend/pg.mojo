@@ -8,7 +8,7 @@ are recorded on the comm stream, so consumers on any stream wait exactly as
 with ProcessGroupNCCL. Communicators, the comm stream and the library calls
 live here. The three libraries share the NCCL C ABI; the 128-byte unique id
 is passed the way the x86-64 SysV ABI lays out a by-value struct: 16 words
-after the register arguments (see mojoccl.mojo's ncclCommInitRank; Python
+after the register arguments (see tmb/ccl/init.mojo's ncclCommInitRank; Python
 refuses other architectures).
 
 The entries are reached from Python outside the boxed adapter, so each one

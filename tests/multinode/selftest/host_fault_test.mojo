@@ -1,7 +1,7 @@
 """Host-only fault publication checks; no DeviceContext or GPU allocation."""
 from std.testing import assert_equal
-from tmb.ccl.entry import _latch_host_fault_record
-from tmb.ccl.collectives_kernels import (
+from tmb.ccl.include.comm import _latch_host_fault_record
+from tmb.ccl.include.device import (
     STATUS_FAULT_WORD,
     STATUS_HOST_FAULT_WORD,
     ERR_HOST_LAUNCH,

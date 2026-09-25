@@ -1,6 +1,6 @@
 # The AF_UNIX SCM_RIGHTS fd transport, without a GPU.
 #
-# `vmm.mojo` hands the multicast object and every rank's own VMM handle to its
+# `transport/nvls.mojo` hands the multicast object and every rank's own VMM handle to its
 # node-mates as file descriptors over an AF_UNIX SOCK_DGRAM socket, with the
 # msghdr / cmsghdr / sockaddr_un structs laid out by hand over UInt64 words
 # because `std.ffi` has no C-struct ABI. Getting one of those offsets wrong
@@ -30,9 +30,8 @@ from std.pathlib import Path
 from std.sys import argv
 from std.time import perf_counter_ns, sleep
 
-from tmb.ccl.vmm import (
-    MSG_KIND_MC,
-    MSG_KIND_UC,
+from tmb.ccl.transport.nvls import MSG_KIND_MC, MSG_KIND_UC
+from tmb.ccl.os.linux_ipcsocket import (
     scm_bind,
     scm_exchange_fds,
     scm_recv,

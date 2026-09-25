@@ -115,7 +115,7 @@ def _constants(paths: Iterable[Path]) -> dict[str, str]:
     """Every module-level string constant in `paths`, as one map.
 
     One map rather than one per file because that is how the code is written:
-    `getenv(MOJOCCL_REGION_MB)` in tmb/ccl/entry.mojo reads a constant declared in
+    `getenv(MOJOCCL_REGION_MB)` in tmb/ccl/init.mojo reads a constant declared in
     env_vars.mojo, and `os.environ.get(_NCCL_LIB_ENV)` reads one declared at
     the top of its own.
     """
@@ -205,7 +205,7 @@ def test_the_scanner_resolves_names_reached_through_a_constant():
         PACKAGE / "mojo/tmb/backend/device.mojo", constants
     )
     assert "MOJOCCL_REGION_MB" in _env_names_touched(
-        PACKAGE / "mojo/tmb/ccl/entry.mojo", constants
+        PACKAGE / "mojo/tmb/ccl/init.mojo", constants
     )
     # Python, through a constant at the top of its own module.
     assert "TORCH_MOJO_BACKEND_NCCL_LIB" in _env_names_touched(

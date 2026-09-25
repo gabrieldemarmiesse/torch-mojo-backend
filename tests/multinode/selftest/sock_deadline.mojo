@@ -24,15 +24,11 @@ from std.memory.alloc import unsafe_alloc
 from std.random import random_ui64
 from std.time import perf_counter_ns
 
-from tmb.ccl.bootstrap import (
-    UID_BYTES,
-    _encode_id,
-    bootstrap_connect,
-    local_ipv4,
-    make_unique_id,
-)
-from tmb.ccl.vmm import (
-    MSG_KIND_UC,
+from tmb.ccl.nccl import UID_BYTES
+from tmb.ccl.bootstrap import _encode_id, bootstrap_connect, make_unique_id
+from tmb.ccl.misc.socket import local_ipv4
+from tmb.ccl.transport.nvls import MSG_KIND_UC
+from tmb.ccl.os.linux_ipcsocket import (
     _fd_msghdr,
     _send_once,
     _send_socket,

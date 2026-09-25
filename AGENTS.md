@@ -67,6 +67,22 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   than as literals at the `getenv`. Adding a variable anywhere means adding
   it to the Python table too; `tests/test_env_vars_are_registered.py` scans
   the repo and fails otherwise.
+- **mojoccl layout**: `torch_mojo_backend/mojo/tmb/ccl/` mirrors NVIDIA
+  NCCL master's `src/` tree, one file per NCCL file (`init.mojo` =
+  `src/init.cc`, `transport/net_ib/connect.mojo` =
+  `src/transport/net_ib/connect.cc`, ...), so an NCCL expert finds the code
+  where NCCL keeps it. Each file starts with
+  `# Rewrite of: https://github.com/NVIDIA/nccl/blob/master/src/<path>`
+  (`#   also:` lines when it merges several NCCL files; `none (mojoccl-only:
+  <reason>). Closest: <url>` when NCCL has no counterpart). New mojoccl code
+  goes in the file matching its NCCL counterpart, creating that file at
+  NCCL's path if needed. `entry.mojo` stays the export table only (an
+  `@export` is emitted only from the built module): one C-ABI shim per
+  symbol, forwarding to the implementation. Where NCCL has a file and a
+  directory of the same name, flatten (`src/enqueue/enqueue.cc` is
+  `enqueue.mojo`) or suffix the file `_core`: a module named after its
+  directory is shadowed by the package. `agents_docs/distributed.md` ("File
+  layout") maps the pre-split file names.
 - **Debugging Tools**:
   - Environment variables for profiling and verbose output
   - Graph visualization when `TORCH_MOJO_BACKEND_VERBOSE=1`

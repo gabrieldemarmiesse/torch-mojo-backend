@@ -4,7 +4,7 @@
 #
 # `ib_bringup` and `ib_pipeline` run the whole engine over a plain malloc'd
 # region, which on the cxi provider registers as FI_HMEM_SYSTEM. Production
-# hands `ib_setup` a `driver.alloc_region` allocation
+# hands `ib_setup` a `transport/p2p.mojo` `alloc_region` allocation
 # (hipExtMallocWithFlags(hipDeviceMallocUncached) / cuMemAlloc_v2), which has
 # to register as FI_HMEM_ROCR (or FI_HMEM_CUDA) instead -- a different code
 # path in the provider, a different kernel driver, and the thing most likely
@@ -15,7 +15,7 @@
 #
 # Each rank is its own "node", so every rank exchanges with every other. It
 # needs a GPU (one HIP/CUDA context per rank) and must be BUILT ON A NODE
-# THAT HAS ONE: `driver.mojo` picks libamdhip64 vs libcuda at compile time
+# THAT HAS ONE: `misc/cudawrap.mojo` picks libamdhip64 vs libcuda at compile time
 # from the build host's accelerator.
 #
 # What it checks is that every exchange RETIRES: the payload write landed,
@@ -27,17 +27,18 @@
 from std.sys import argv
 from std.time import sleep
 
+from tmb.ccl.nccl import UID_BYTES
 from tmb.ccl.bootstrap import (
-    UID_BYTES,
     bootstrap_allgather,
     bootstrap_barrier,
     bootstrap_connect,
-    derive_topology,
-    host_hash,
     make_unique_id,
 )
-from tmb.ccl.driver import alloc_region, free_region, open_driver
-from tmb.ccl.internode import (
+from tmb.ccl.init import derive_topology
+from tmb.ccl.misc.utils import host_hash, P8, alloc_bytes
+from tmb.ccl.transport.p2p import alloc_region, free_region
+from tmb.ccl.misc.cudawrap import open_driver
+from tmb.ccl.transport.net import (
     CREDIT_AREA_BYTES,
     IB_BLOB_BYTES,
     ib_connect,
@@ -45,10 +46,8 @@ from tmb.ccl.internode import (
     ib_exchange_now,
     ib_local_info,
     ib_npeers,
-    ib_setup,
-    ib_teardown,
 )
-from tmb.ccl.netutil import P8, alloc_bytes
+from tmb.ccl.proxy import ib_setup, ib_teardown
 
 
 def main() raises:

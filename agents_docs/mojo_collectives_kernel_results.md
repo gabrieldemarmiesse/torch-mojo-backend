@@ -1,5 +1,9 @@
 # Mojo intra-node collectives — measured results
 
+> Historical record: the file names below predate the NCCL-layout split of
+> `tmb/ccl/`; `agents_docs/distributed.md` ("File layout") maps them to
+> today's files.
+
 Deliverable: `collectives_kernels.mojo` (this directory). Harness: `harness.mojo`
 + `validate.sbatch` (correctness + the tables below, NCCL legs interleaved),
 `ab.sbatch` (the NCCL A/B alone), `sweep.sbatch` / `tune.sbatch` /

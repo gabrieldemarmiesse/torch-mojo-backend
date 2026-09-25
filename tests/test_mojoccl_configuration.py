@@ -52,12 +52,18 @@ def test_mojoccl_has_only_reviewed_environment_controls():
 
 def test_asm_discovery_covers_collective_entry_and_skips_helpers(tmp_path: Path):
     """An entry is any module exporting `tmb_call` or `ncclAllReduce`; an
-    `entry.mojo` is keyed by its package (tmb/ccl/entry.mojo -> "ccl")."""
+    `entry.mojo` is keyed by its package (tmb/ccl/entry.mojo -> "ccl"). A
+    plain `def ncclAllReduce(` (collectives.mojo's implementation, which the
+    entry's `@export` shim forwards to) is a library, not an entry."""
     kernel_dir = Path("tmb")
     (tmp_path / kernel_dir / "ccl").mkdir(parents=True)
     (tmp_path / kernel_dir / "kernels" / "family").mkdir(parents=True)
-    (tmp_path / kernel_dir / "ccl" / "entry.mojo").write_text("def ncclAllReduce(\n")
-    (tmp_path / kernel_dir / "ccl" / "helper.mojo").write_text("def helper(\n")
+    (tmp_path / kernel_dir / "ccl" / "entry.mojo").write_text(
+        "@export\ndef ncclAllReduce(\n"
+    )
+    (tmp_path / kernel_dir / "ccl" / "collectives.mojo").write_text(
+        "def ncclAllReduce(\n"
+    )
     (tmp_path / kernel_dir / "kernels" / "family" / "entry.mojo").write_text(
         "def tmb_call(\n"
     )
@@ -68,3 +74,22 @@ def test_asm_discovery_covers_collective_entry_and_skips_helpers(tmp_path: Path)
         "ccl": kernel_dir / "ccl" / "entry.mojo",
         "family": kernel_dir / "kernels" / "family" / "entry.mojo",
     }
+
+
+NCCL_SRC = "https://github.com/NVIDIA/nccl/blob/master/src/"
+
+
+def test_every_mojoccl_file_names_its_nccl_counterpart():
+    """tmb/ccl mirrors NCCL master's src/ tree (AGENTS.md, "mojoccl layout"):
+    each file opens with the NCCL file it rewrites, or says it has none."""
+    ccl = PACKAGE / "mojo/tmb/ccl"
+    for path in sorted(ccl.rglob("*.mojo")):
+        first = path.read_text().splitlines()[0]
+        where = path.relative_to(ccl)
+        assert first.startswith(f"# Rewrite of: {NCCL_SRC}") or (
+            first.startswith("# Rewrite of: none") and NCCL_SRC in first
+        ), f"{where}: first line must be `# Rewrite of: {NCCL_SRC}<path>`"
+        # A module named after its directory, or beside a directory of the
+        # same name, is shadowed by the package.
+        assert path.stem != path.parent.name, where
+        assert not path.with_suffix("").is_dir(), where

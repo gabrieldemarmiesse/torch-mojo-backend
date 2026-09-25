@@ -1,10 +1,10 @@
 /* Prints every libfabric struct size, field offset and constant that
- * torch_mojo_backend/distributed/mojoccl/libfabric.mojo hard-codes.
+ * torch_mojo_backend/mojo/tmb/ccl/transport/net_ofi.mojo hard-codes.
  *
  * libfabric's data path is `static inline` in <rdma/fi_*.h> and dispatches
  * through the fid_* ops tables (fi_writedata is ep->rma->writedata, fi_cq_read
  * is cq->ops->read, ...), exactly the way libibverbs' data path dispatches
- * through ibv_context->ops -- so, exactly like ibverbs.mojo, the Mojo bindings
+ * through ibv_context->ops -- so, exactly like misc/ibvwrap.mojo, the Mojo bindings
  * reproduce those dereferences by hand over raw byte offsets. `std.ffi` still
  * has no C-struct ABI (MOCO-3692), so every offset below is a number in the
  * Mojo source, and this program is what those numbers are checked against:

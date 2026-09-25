@@ -602,6 +602,35 @@ to it instead of `libnccl.so.2`/`librccl.so.1` when `TORCH_MOJO_BACKEND_CCL=mojo
 and measurements: `agents_docs/mojo_collectives_feasibility.md` (study) and
 `agents_docs/mojo_collectives_kernel_results.md` (kernels).
 
+**File layout.** `tmb/ccl/` mirrors NCCL master's `src/` tree, one file per
+NCCL file, so someone porting from NCCL finds the code where NCCL keeps it.
+Every file opens with `# Rewrite of: <NCCL file URL>` (plus `#   also:` lines
+when it merges several, or `none (mojoccl-only: ...). Closest: <url>`).
+`entry.mojo` is only the export table (`src/libnccl.map`): an `@export` is
+emitted only from the module being built, so it holds one C-ABI shim per
+symbol forwarding to `collectives.mojo` / `group.mojo` / `init.mojo`. Two
+deviations: `src/enqueue/enqueue.cc` is `enqueue.mojo` (a module named after
+its directory is shadowed by the package), and the intra-node kernels are
+NCCL's symmetric (LSA) kernels, `device/symmetric/*.mojo`, since mojoccl has
+no ring/tree prims. The pre-split file names that older notes and journals
+use map as follows:
+
+| old | now |
+|---|---|
+| `entry.mojo` (a.k.a. `mojoccl.mojo`) | `entry.mojo` (exports), `init.mojo`, `enqueue.mojo`, `collectives.mojo`, `group.mojo`, `include/comm.mojo`, `nccl.mojo` |
+| `collectives_kernels.mojo` | `device/symmetric/{all_reduce,all_gather,reduce_scatter,primitives,data_ops}.mojo`, `device/{broadcast,common}.mojo`, `include/device.mojo`, `include/nccl_device/lsa_barrier.mojo` |
+| `nvls_kernels.mojo` | `device/all_reduce.mojo` |
+| `vmm.mojo` | `transport/nvls.mojo`, `os/linux_ipcsocket.mojo` |
+| `driver.mojo` | `misc/cudawrap.mojo`, `misc/strongstream.mojo`, `transport/p2p.mojo` |
+| `bootstrap.mojo` | `bootstrap.mojo`, `misc/socket.mojo`, `misc/utils.mojo` |
+| `internode.mojo` | `transport/net.mojo`, `proxy.mojo` |
+| `internode_kernels.mojo` | `device/symmetric/gin_scratch.mojo` |
+| `internode_fused.mojo` | `device/symmetric/all_reduce_gin.mojo` |
+| `ibverbs.mojo` | `misc/ibvwrap.mojo`, `transport/net_ib/{init,connect,p2p}.mojo` |
+| `libfabric.mojo` | `transport/net_ofi.mojo` |
+| `netutil.mojo` | `misc/utils.mojo`, `include/plugin/nccl_net.mojo`, `graph/topo.mojo` |
+| `reduce_scatter/{multinode,fused,stream}.mojo` | `device/symmetric/reduce_scatter_gin{,_fused,_stream}.mojo` |
+
 Scope, deliberately narrow — it is an experiment showing Mojo can write
 NCCL-class collectives, not a general library:
 
@@ -740,18 +769,18 @@ synchronization. Larger messages use the existing staging arenas and inbox
 credits to pipeline chunks. AVG scales each input before the node-local sum.
 NVIDIA fp32 runs the pipeline in one persistent kernel: local reduction,
 mailbox release, bounded completion wait, output sum, and credit return.
-Two such kernels exist. `reduce_scatter/stream.mojo` takes every call of at least
+Two such kernels exist. `reduce_scatter_gin_stream.mojo` takes every call of at least
 `PIPE_SPLIT_UNIT` bytes per rank (see "Streaming reduce-scatter" below);
-`reduce_scatter/fused.mojo` runs everything smaller, two chunks per call so only the
+`reduce_scatter_gin_fused.mojo` runs everything smaller, two chunks per call so only the
 second exchange is exposed (`RS_FUSED_TARGET_CHUNKS`), and stays the
 fallback for every geometry the streaming kernel declines. Other dtypes and
-targets use separate kernels for these phases (`reduce_scatter/multinode.mojo`). Calls
+targets use separate kernels for these phases (`reduce_scatter_gin.mojo`). Calls
 whose chunk count exceeds the existing work ring also use the split
 schedule.
 
 #### Streaming reduce-scatter
 
-`reduce_scatter/fused.mojo` runs a chunk as push, 8-way barrier, reduce: no rank starts
+`reduce_scatter_gin_fused.mojo` runs a chunk as push, 8-way barrier, reduce: no rank starts
 reducing before every rank has finished pushing the whole chunk, so the
 NVLink push and the HBM-bound reduce never overlap, the barrier exposes the
 slowest rank's whole push, and the chunk's RDMA exchange only starts once
@@ -763,7 +792,7 @@ with an eight-deep credit pipeline and no grid barrier anywhere
 src/device/reduce_scatter.h; at these sizes NCCL 2.28 picks RING/SIMPLE,
 16 CTAs of 544 threads = 512 workers plus one post warp).
 
-`reduce_scatter/stream.mojo` keeps the hierarchical schedule -- its bytes are already
+`reduce_scatter_gin_stream.mojo` keeps the hierarchical schedule -- its bytes are already
 NCCL's: `(local_world-1) * nnodes` shard pushes on NVLink and one shard on
 the wire per rank, against a 16-rank ring's 14/15 NVLink and 1/15 network
 hops, which is 287 MB and 20.5 MB for the XL root at 16 ranks either way --
@@ -799,7 +828,7 @@ layout unwritten instead of re-cutting it. Deriving either from a chunk's
 own `cnt` -- which is what the kernel first did -- moves every slot base and
 every block boundary for the last chunk, so block `b`'s write lands on bytes
 block `b-1` of a peer is still reducing while `b` has waited only for the
-peer's block `b`. `reduce_scatter/fused.mojo` gets away with a per-chunk stride because
+peer's block `b`. `reduce_scatter_gin_fused.mojo` gets away with a per-chunk stride because
 its rank-local grid barrier makes one block's cross-rank sync transitively
 cover every block of the peer; this kernel gave that up, so it owes the
 invariant instead. Reachable at ordinary sizes -- the default 256 MiB region
@@ -847,7 +876,7 @@ median over ranks, vendor/mojo ABBA and BAAB in one process,
 | reduce-scatter fp32 SUM, XL root (20.5 MB/rank) | 990-1007 | 1470 (1.48x) | 1273-1281 (1.26-1.28x) |
 | reduce-scatter fp32 AVG, XL root | 1001-1007 | 1468 (1.46x) | 1283-1294 (1.28x) |
 
-The grid is 32 CTAs and, unlike `reduce_scatter/fused.mojo`'s, that is also its
+The grid is 32 CTAs and, unlike `reduce_scatter_gin_fused.mojo`'s, that is also its
 isolated fit: the handoff is per block, so a larger grid multiplies the
 seven remote flag stores and the 8-way rendezvous per piece while leaving
 each block less to push between them. Block / root fp32 SUM in us:
@@ -1130,7 +1159,7 @@ the path has a size floor: 48 MiB is the measured crossover, sharp (4% the
 wrong side at 40 MiB, 4% the right side at 48) and the same for fp32 and
 bf16. int32/int64 stay unicast.
 
-**Bring-up** (`vmm.mojo`, NCCL's `src/transport/nvls.cc` sequence). The
+**Bring-up** (`transport/nvls.mojo`, NCCL's `src/transport/nvls.cc` sequence). The
 node's local rank 0 calls `cuMulticastCreate` and exports the object as a
 POSIX file descriptor; the fd travels to its node-mates over an AF_UNIX
 `SOCK_DGRAM` socket as an `SCM_RIGHTS` control message, which is what NCCL
@@ -1179,7 +1208,7 @@ region with legacy IPC exactly as before, with no half-built state to unwind.
 A failure *after* that point is reported rather than papered over, and the
 message names `MOJOCCL_NVLS=0`.
 
-**The kernel** (`nvls_kernels.mojo`) is the prototype's split-grid schedule:
+**The kernel** (`device/all_reduce.mojo`) is the prototype's split-grid schedule:
 the low 25% of the blocks only drive the switch and the rest only drive HBM,
 the message is cut into `clamp(bytes/4, 21 MiB, 86 MiB)` chunks, and chunk
 c's reduction runs at the same time as chunk c+1's copy-in and chunk c-1's
@@ -1198,7 +1227,7 @@ copy-out. Two things about it are worth knowing before touching it:
   is therefore `min(216, 2 × SM count)` blocks of 256 threads with
   `nvvm.minctasm=2`, and 216 was fitted on H100's 132 SMs.
 * **It opens with a start barrier**, before a byte of staging is written, for
-  the same reason every other kernel in `collectives_kernels.mojo` does: the
+  the same reason every other kernel in `device/symmetric/` does: the
   arena is shared scratch, and a broadcast or an all-gather retiring just
   before this kernel has its peers still *reading* the bytes the copy-in is
   about to overwrite. One barrier per call, not per chunk.
@@ -1265,7 +1294,7 @@ read the error word to notice -- the collective completed with garbage on
 that node and the run carried on. Measured on 2x4 MI300A: about one 40 s `stress` run in
 five corrupted a check, always a run 60-120 s longer than a clean one, and
 the same event is what hung DDP runs. `device_now_ns` in
-`collectives_kernels.mojo` reads the 100 MHz counter directly on AMD (with a
+`device/common.mojo` reads the 100 MHz counter directly on AMD (with a
 volatile intrinsic -- a side-effect-free read is hoisted out of the spin
 loop and the deadline never fires); after it, 0 of 15 stress runs at 8 ranks
 failed. NVIDIA's `globaltimer` is nanoseconds and unchanged (sm_90a device
@@ -1380,7 +1409,7 @@ peer rotation (same day, same nodes).
 | reduce-scatter fp32, 357x789 at an odd offset | 159 | 312 | 299 | 1.88 | 2 | 13.9 / 8.2 |
 | all-gather fp32, 357x789 at an odd offset | 169 | 179 | 159 | **0.94** | 4 | 12.0 / 11.7 |
 
-The reduce-scatter rows of that table are `reduce_scatter/fused.mojo`'s and are now
+The reduce-scatter rows of that table are `reduce_scatter_gin_fused.mojo`'s and are now
 only what calls below `PIPE_SPLIT_UNIT` bytes per rank take; "Streaming
 reduce-scatter" above has the current numbers (block 1.10x, root 1.28x) and
 a fresh NCCL column measured beside them.
@@ -1434,8 +1463,8 @@ RS(0) rel(0)  RS(1) rel(1)  RS(2) rel(2)  RS(3) rel(3)
 
 so the proxy exchanges chunk k while the GPU reduce-scatters later chunks
 and all-gathers earlier ones. That loop runs inside ONE persistent kernel
-per allreduce (`internode_fused.mojo`, `ccl_internode_allreduce_pipelined_*`):
-the reduce-scatter and all-gather bodies of `collectives_kernels.mojo`, the
+per allreduce (`all_reduce_gin.mojo`, `ccl_internode_allreduce_pipelined_*`):
+the reduce-scatter and all-gather bodies of `device/symmetric/all_reduce.mojo`, the
 inbox add, the mailbox store that releases a chunk to the progress thread
 and the spin on its completion are phases of that kernel, separated by a
 rank-local grid barrier where a launch boundary used to be. A grid that
@@ -1510,12 +1539,12 @@ ranks. **The staging arena is replicated.** A multi-node region is
 network area; chunk k uses arena `k % PIPE_ARENAS`, so concurrent chunks
 cannot collide in the push slots or in the shard, and that arena's own start
 barrier is what orders chunk k+`PIPE_ARENAS` behind chunk k's pulls, the
-invariant one arena already had. `collectives_kernels.mojo` is untouched:
+invariant one arena already had. The intra-node kernels are untouched:
 the split kernels take a shifted base and a smaller cap, nothing more. The
 staging total is `2 × cap` either way, so the region is the size it always
 was. **The inbox is reused only against a credit** — see the transport
 below. `PIPE_ARENAS` (4) and the derived `INBOX_SLOTS` (5) are source
-constants in `mojoccl.mojo`, not environment variables: they are part of the
+constants in `include/comm.mojo`, not environment variables: they are part of the
 wire layout and every rank has to agree on them.
 
 The chunk cap is now one arena, and the inbox slot group, rather than the
@@ -1524,12 +1553,12 @@ region, so the large sizes are chunked by geometry as well as by choice.
 `tests/multinode/selftest/geometry_test.mojo` sweeps that arithmetic over
 regions of 1 MiB–1 GiB, `local_world` 1–8 and 2–16 nodes.
 
-**Two transports, one engine.** `internode.mojo` is the transport-neutral
+**Two transports, one engine.** `transport/net.mojo` is the transport-neutral
 progress engine (work ring, credits, arrival tally, flush, abort,
 teardown); the six operations it needs -- post a payload, post an
 immediate, post the flush read, poll completions, fill the bootstrap blob,
-attach a peer -- are implemented twice, in `ibverbs.mojo` (InfiniBand) and
-`libfabric.mojo` (HPE Slingshot through the `cxi` provider). `ib_setup`
+attach a peer -- are implemented twice, in `transport/net_ib/` (InfiniBand) and
+`transport/net_ofi.mojo` (HPE Slingshot through the `cxi` provider). `ib_setup`
 picks one at run time: `MOJOCCL_NET=verbs|fabric` wins outright, otherwise
 verbs if libibverbs opens and lists an ACTIVE InfiniBand port, else
 libfabric if `libfabric.so.1` opens and `fi_getinfo` finds an FI_EP_RDM
@@ -1538,8 +1567,9 @@ The engine's dispatch is one `st.net == NET_VERBS` branch per post and one
 per poll batch -- loop-invariant and perfectly predicted -- so the verbs
 path costs what it always did.
 
-**Transport A, InfiniBand** (`torch_mojo_backend/mojo/tmb/ccl/{ibverbs,internode,
-internode_kernels,bootstrap}.mojo`): libibverbs is dlopened; setup calls are
+**Transport A, InfiniBand** (`torch_mojo_backend/mojo/tmb/ccl/`: `misc/ibvwrap.mojo`,
+`transport/net_ib/`, `transport/net.mojo`, `proxy.mojo`,
+`device/symmetric/gin_scratch.mojo`, `bootstrap.mojo`): libibverbs is dlopened; setup calls are
 symbols, the data path (`ibv_post_send`/`post_recv`/`poll_cq`) is reached
 through the `ibv_context_ops` table at the header's offsets, as NCCL's
 `ibvwrap` does. One RC queue pair per remote node, attributes borrowed from
@@ -1553,7 +1583,7 @@ memory. Every exchange is all-to-all — a rank whose shard is empty (7 of 8
 ranks on DDP's 4-byte AVG allreduce) still posts a 16-byte placeholder — so
 that an arrival tally of N−1 is what completes one.
 
-**Transport B, Slingshot / libfabric** (`libfabric.mojo`): `libfabric.so.1`
+**Transport B, Slingshot / libfabric** (`transport/net_ofi.mojo`): `libfabric.so.1`
 is dlopened; `fi_getinfo`/`fi_freeinfo`/`fi_fabric`/`fi_version`/`fi_strerror`
 are symbols and the whole data path (`fi_writemsg`, `fi_sendmsg`, `fi_recv`,
 `fi_read`, `fi_cq_read`, `fi_mr_regattr`, `fi_ep_bind`, `fi_close`, …) is
@@ -1606,7 +1636,7 @@ MI300A's "device memory" is host-attached HBM anyway, but no cxi
 documentation was found that promises the ordering, it costs ~3.6 µs, and
 The flush is always enabled.
 
-Every struct offset, size and constant `libfabric.mojo` hard-codes is dumped
+Every struct offset, size and constant `transport/net_ofi.mojo` hard-codes is dumped
 by `tests/multinode/selftest/fabric_abi.c` (gcc, against the installed
 `<libfabric>/include`) and cross-checked by
 `tests/multinode/selftest/fabric_abi.mojo`; 135 of them, and that self-test
@@ -1889,7 +1919,7 @@ Two things came out of chasing it:
   error word, because a rank whose host legitimately spends a minute between
   collectives is behind its peers for a good reason. Every exchange also
   carries which collective and which chunk it belongs to
-  (`IbWork.op_kind/op_chunk/op_nchunks/op_numel`, set by `mojoccl.mojo`), so
+  (`IbWork.op_kind/op_chunk/op_nchunks/op_numel`, set by `enqueue.mojo`), so
   both messages now read "exchange 78 (allreduce chunk 3 of 14, 1703936
   elements)" instead of a bare number. Both were verified to fire and to name
   the right side by running with `MOJOCCL_IB_TIMEOUT_S=0.05`.
@@ -1917,7 +1947,7 @@ the RDMA transport, the pipelined transport with its credit protocol, the
 region geometry, the `SCM_RIGHTS` fd transport the NVLS bring-up uses, the
 socket deadlines and the libfabric ABI cross-check (the last four need no
 NIC either, and the last two need no peers) — plus one that does need a GPU,
-`fabric_hmem`, which registers a `driver.alloc_region` allocation with
+`fabric_hmem`, which registers a `transport/p2p.mojo` `alloc_region` allocation with
 FI_HMEM_ROCR and exchanges into it. The transport ones run against either
 backend (`MOJOCCL_NET`) on a host with a NIC and no GPU — the login node
 under InfiniBand, a compute node under Slingshot — with
@@ -2105,7 +2135,7 @@ weight:
    `ibv_reg_mr` on a `cuMemMap`'d VA first returned NULL on this cluster; the
    cause was the `cuMemCreate` prop, not the kind of memory: `nvidia_peermem`
    refuses (EFAULT) a chunk created without `allocFlags.gpuDirectRDMACapable`,
-   which NCCL sets and `vmm.mojo` now sets too, after which all 12 HCAs
+   which NCCL sets and `transport/nvls.mojo` now sets too, after which all 12 HCAs
    register it (`agents_docs/mojo_collectives_nvls_results.md` §4). There is still
    no dmabuf fallback (`CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` is 0 on every
    device).

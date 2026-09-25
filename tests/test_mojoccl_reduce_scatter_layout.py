@@ -1,8 +1,8 @@
 """The streaming reduce-scatter's arena layout may not depend on the chunk.
 
-`reduce_scatter/stream.mojo` hands a chunk's staging slots to its peers under a credit
-that is per BLOCK INDEX: before writing the arena at chunk k a block waits
-only for the SAME block index on every peer to have released chunk
+`reduce_scatter_gin_stream.mojo` hands a chunk's staging slots to its peers
+under a credit that is per BLOCK INDEX: before writing the arena at chunk k a
+block waits only for the SAME block index on every peer to have released chunk
 `k - narenas`. That is sound exactly while block b owns the same bytes of the
 arena in both chunks. Deriving the slot stride or the per-block partition
 from a short final chunk's element count breaks it -- block b's write then
@@ -15,8 +15,10 @@ import re
 from pathlib import Path
 
 MOJOCCL = Path(__file__).resolve().parents[1] / "torch_mojo_backend/mojo/tmb/ccl"
-STREAM = (MOJOCCL / "reduce_scatter" / "stream.mojo").read_text()
-HOST = (MOJOCCL / "entry.mojo").read_text()
+STREAM = (MOJOCCL / "device/symmetric/reduce_scatter_gin_stream.mojo").read_text()
+ENQUEUE = (MOJOCCL / "enqueue.mojo").read_text()
+INIT = (MOJOCCL / "init.mojo").read_text()
+COMM = (MOJOCCL / "include/comm.mojo").read_text()
 
 
 def _body(source: str, start: str, end: str) -> str:
@@ -55,7 +57,7 @@ def test_streaming_kernel_partitions_by_the_full_chunk():
 
 def test_host_launcher_uses_one_slot_stride_for_the_whole_call():
     launcher = _body(
-        HOST, "def _do_reduce_scatter_stream(", "\ndef _do_reduce_scatter_nodes["
+        ENQUEUE, "def _do_reduce_scatter_stream(", "\ndef _do_reduce_scatter_nodes["
     )
     assert "var slot = _align_up(chunk_elems * 4, 16)" in launcher
     loop = _body(launcher, "for k in range(nchunks):", "    try:")
@@ -67,8 +69,8 @@ def test_host_launcher_uses_one_slot_stride_for_the_whole_call():
 
 def test_a_short_final_chunk_reuses_an_arena_at_reachable_sizes():
     """The geometry that broke is an ordinary FSDP2-sized call, not a corner."""
-    region = _constant(HOST, "DEFAULT_REGION_MB") * 1024 * 1024
-    narenas = _constant(HOST, "PIPE_ARENAS")
+    region = _constant(INIT, "DEFAULT_REGION_MB") * 1024 * 1024
+    narenas = _constant(COMM, "PIPE_ARENAS")
     threads = 512  # RS_STREAM_THREADS, the fused kernel's
     blocks = _constant(STREAM, "RS_STREAM_BIG_BLOCKS")
     arena_cap = region // narenas // 4096 * 4096

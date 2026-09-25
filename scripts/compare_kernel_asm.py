@@ -280,14 +280,15 @@ def find_entry_modules(tree: Path, kernel_dir: Path) -> dict[str, Path]:
     to ``tree``.
 
     Modules that export a family's `tmb_call` C entry or mojoccl's
-    `ncclAllReduce` are built on their own; the rest are libraries whose
-    kernels are instantiated by an importer of theirs, and building one in
-    isolation emits no sidecars at all.
+    `@export ncclAllReduce` are built on their own (mojoccl's
+    `collectives.mojo` defines a plain `ncclAllReduce` too, and is a library);
+    the rest are libraries whose kernels are instantiated by an importer of
+    theirs, and building one in isolation emits no sidecars at all.
     """
     entries: dict[str, Path] = {}
     for path in sorted((tree / scan_dir(tree, kernel_dir)).rglob("*.mojo")):
         source = path.read_text()
-        if "def tmb_call" not in source and "def ncclAllReduce(" not in source:
+        if "def tmb_call" not in source and "@export\ndef ncclAllReduce(" not in source:
             continue
         relative = path.relative_to(tree)
         key = module_key(path)

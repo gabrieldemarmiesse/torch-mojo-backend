@@ -4,8 +4,8 @@ from std.sys.info import _accelerator_arch
 from std.sys import argv
 from std.testing import assert_equal
 
-from tmb.ccl.internode import _proxy_idle_ns
-from tmb.ccl.internode_fused import (
+from tmb.ccl.proxy import _proxy_idle_ns
+from tmb.ccl.device.symmetric.all_reduce_gin import (
     FUSED_THREADS,
     FUSED_UNROLL,
     FUSED_PUSH_UNROLL,
@@ -14,14 +14,12 @@ from tmb.ccl.internode_fused import (
     fused_big_block_cap,
     fused_big_bytes,
 )
-from tmb.ccl.entry import (
-    _region_cap_bytes,
-    _pipe_split_unit,
-    _fused_enabled,
+from tmb.ccl.init import _region_cap_bytes, _pipe_split_unit, _fused_enabled
+from tmb.ccl.transport.nvls import (
     _nvls_min_bytes,
     _nvls_recommended_granularity,
-    _socket_dir,
 )
+from tmb.ccl.os.linux_ipcsocket import _socket_dir
 
 
 def main() raises:

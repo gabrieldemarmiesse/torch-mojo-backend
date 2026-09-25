@@ -1,6 +1,6 @@
 """Read-only lifecycle assertions for stream_order_probe.py."""
 
-from tmb.ccl.entry import _comm_ptr
+from tmb.ccl.include.comm import _comm_ptr
 
 
 @export

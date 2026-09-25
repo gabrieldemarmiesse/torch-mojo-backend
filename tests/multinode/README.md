@@ -63,13 +63,13 @@ iteration is skipped outright, and phases B and C run their vendor leg(s)
 only (no ABBA — there is nothing to interleave against). Default
 (`RUN_MOJO=1` or unset) attempts every leg.
 
-`torch_mojo_backend/distributed/mojoccl/` supports multiple nodes:
+`torch_mojo_backend/mojo/tmb/ccl/` supports multiple nodes:
 `ncclGetUniqueId` encodes a TCP rendezvous (`{ipv4, port, magic}` of a
 listening socket this library opens itself, not a `/dev/shm` path), and the
 inter-node hop is GPUDirect RDMA written directly over the fabric —
-`bootstrap.mojo` plus one transport-neutral engine (`internode.mojo`) on
-either libibverbs (`ibverbs.mojo`, InfiniBand) or libfabric
-(`libfabric.mojo`, HPE Slingshot / `cxi`), chosen at `ncclCommInitRank` time
+`bootstrap.mojo` plus one transport-neutral engine (`transport/net.mojo`)
+on either libibverbs (`transport/net_ib/`, InfiniBand) or libfabric
+(`transport/net_ofi.mojo`, HPE Slingshot / `cxi`), chosen at `ncclCommInitRank` time
 or forced with `MOJOCCL_NET=verbs|fabric` — no vendor collective library at
 any level. See the "Multi-node" subsection of
 `agents_docs/distributed.md` for the design. `RUN_MOJO` therefore **defaults to
@@ -82,7 +82,7 @@ numbers are wanted, or while iterating on something unrelated to mojoccl).
 
 `ring_pressure.py` is a two-node regression test for one specific way the
 inter-node transport can be misused from above: issuing collectives faster
-than the GPU consumes them until the calling thread laps `internode.mojo`'s
+than the GPU consumes them until the calling thread laps `transport/net.mojo`'s
 fixed work ring. DDP's `_sync_module_states` does exactly that, and on
 Slingshot (where an exchange costs milliseconds rather than microseconds) it
 killed `DDP(model)` at construction. `N` broadcasts, no synchronize until the
@@ -152,10 +152,10 @@ InfiniBand at all) — and the rest need no NIC, so they all run in seconds
 without a GPU. They caught six real bugs (bootstrap/QP wiring, resource
 leaks on a failed `ib_setup`, a silently-misread port LID) before any GPU
 time was spent chasing them; run them before and after any change to
-`torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,libfabric,netutil,internode}.mojo`
-or to the region layout in `mojoccl.mojo`. `fabric_hmem.mojo` is the one
+`torch_mojo_backend/mojo/tmb/ccl/` (bootstrap, `misc/`, `transport/`, `proxy.mojo`)
+or to the region layout in `include/comm.mojo`. `fabric_hmem.mojo` is the one
 self-test that does need a GPU: it is the only place the FI_HMEM_ROCR
-registration of a `driver.alloc_region` allocation is exercised. See
+registration of a `transport/p2p.mojo` `alloc_region` allocation is exercised. See
 `tests/multinode/selftest/README.md` for build and run commands.
 
 ## Output

@@ -9,31 +9,35 @@
 # of the shipped code and not of a copy of it.
 from std.sys import size_of
 
-from tmb.ccl.collectives_kernels import (
-    MAX_WORLD,
-    _AMD,
-    allgather_nic_stage_off,
-    shard_range,
-    signal_bytes,
+from tmb.ccl.include.device import MAX_WORLD, _AMD, signal_bytes
+from tmb.ccl.device.symmetric.all_gather import allgather_nic_stage_off
+from tmb.ccl.device.symmetric.primitives import shard_range
+from tmb.ccl.transport.net import (
+    CREDIT_AREA_BYTES,
+    CREDIT_SLOT_BYTES,
+    EMPTY_SHARD_BYTES,
 )
-from tmb.ccl.internode import CREDIT_AREA_BYTES, CREDIT_SLOT_BYTES, MAX_NODES
-from tmb.ccl.reduce_scatter.fused import reduce_scatter_fused_plan
-from tmb.ccl.reduce_scatter.multinode import (
+from tmb.ccl.include.plugin.nccl_net import MAX_NODES
+from tmb.ccl.device.symmetric.reduce_scatter_gin_fused import (
+    reduce_scatter_fused_plan,
+)
+from tmb.ccl.device.symmetric.reduce_scatter_gin import (
     reduce_scatter_nodes_max_count,
     reduce_scatter_rank_ids,
 )
-from tmb.ccl.entry import (
-    EMPTY_SHARD_BYTES,
+from tmb.ccl.include.comm import (
     INBOX_SLOTS,
     PIPE_ARENAS,
-    allgather_mapped_max_bytes,
-    allgather_mapped_pipeline_plan,
     inbox_group_bytes,
     max_chunk_bytes,
     net_stage_bytes,
     PIPE_SPLIT_UNIT,
     pipeline_chunk_bytes,
     region_layout,
+)
+from tmb.ccl.enqueue import (
+    allgather_mapped_max_bytes,
+    allgather_mapped_pipeline_plan,
 )
 
 

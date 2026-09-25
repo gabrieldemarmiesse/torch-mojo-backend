@@ -6,25 +6,24 @@ from std.memory.alloc import unsafe_alloc
 from std.sys import argv
 from std.time import sleep
 
+from tmb.ccl.nccl import UID_BYTES
 from tmb.ccl.bootstrap import (
-    UID_BYTES,
     bootstrap_allgather,
     bootstrap_barrier,
     bootstrap_connect,
-    derive_topology,
-    host_hash,
     make_unique_id,
 )
-from tmb.ccl.internode import (
+from tmb.ccl.init import derive_topology
+from tmb.ccl.misc.utils import host_hash
+from tmb.ccl.transport.net import (
     CREDIT_AREA_BYTES,
     IB_BLOB_BYTES,
     ib_connect,
     ib_exchange_now,
     ib_local_info,
     ib_npeers,
-    ib_setup,
-    ib_teardown,
 )
+from tmb.ccl.proxy import ib_setup, ib_teardown
 
 comptime P8 = Pointer[UInt8, MutAnyOrigin]
 comptime CAP = 1 << 20

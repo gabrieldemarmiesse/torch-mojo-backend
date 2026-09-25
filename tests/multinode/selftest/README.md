@@ -1,7 +1,7 @@
 # mojoccl transport self-tests that need no GPU
 
 Standalone Mojo programs that exercise
-`torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,libfabric,netutil,internode,vmm}.mojo`
+`torch_mojo_backend/mojo/tmb/ccl/` (bootstrap, `misc/`, `os/`, `transport/`, `proxy.mojo`)
 without a GPU or an allocation of one. They caught six real bugs
 (bootstrap/QP/immediate wiring, resource leaks on a failed `ib_setup`, a
 silently-misread port LID) before any GPU time was spent chasing them.
@@ -48,7 +48,7 @@ noted):
     uv run --no-sync mojo build tests/multinode/selftest/fabric_abi.mojo \
         -I torch_mojo_backend/mojo -o /tmp/fabric_abi_check
     # fabric_hmem picks libamdhip64 vs libcuda from the BUILD host's
-    # accelerator (driver.mojo, comptime): build it on a GPU node, or name
+    # accelerator (misc/cudawrap.mojo, comptime): build it on a GPU node, or name
     # the target.
     uv run --no-sync mojo build tests/multinode/selftest/fabric_hmem.mojo \
         --target-accelerator amdgpu:gfx942 \
@@ -72,7 +72,7 @@ Exercised: 8 ranks/1 node, 16/2, 6/3.
 `ib_bringup <rank> <nranks> <uid-file>`. Every rank is its own "node"
 (local_world 1), so `nranks-1` queue pairs are created per rank. Registers
 host memory as the region, runs the bootstrap, moves every QP to RTS, then
-runs 400 exchanges through `internode.ib_exchange_now` — the inline
+runs 400 exchanges through `transport.net.ib_exchange_now` — the inline
 equivalent of the stream callback — alternating inbox halves and verifying
 every peer's slot against a rank/sequence-derived pattern.
 
@@ -144,7 +144,7 @@ growing, and a single-node region byte-identical to the pre-pipeline one.
 
 ## `fd_exchange.mojo` — the SCM_RIGHTS fd transport of the NVLS bring-up
 
-`fd_exchange <local_rank> <local_world> <dir> <magic>`. `vmm.mojo` hands the
+`fd_exchange <local_rank> <local_world> <dir> <magic>`. `transport/nvls.mojo` hands the
 multicast object and every rank's own VMM handle to its node-mates as file
 descriptors over an AF_UNIX `SOCK_DGRAM` socket, with the msghdr / cmsghdr /
 sockaddr_un structs laid out by hand over `UInt64` words because `std.ffi`
@@ -183,8 +183,8 @@ the deadline was only read after it came back. It is 1.50 s now.
 
 ## `fabric_abi.mojo` + `fabric_abi.c` — the libfabric struct offsets
 
-`libfabric.mojo` reaches libfabric's `static inline` data path the way
-`ibverbs.mojo` reaches libibverbs': by loading a function pointer out of an
+`transport/net_ofi.mojo` reaches libfabric's `static inline` data path the
+way `misc/ibvwrap.mojo` reaches libibverbs': by loading a function pointer out of an
 ops table at a hand-written byte offset (`ep->rma->writemsg`,
 `cq->ops->read`, `domain->mr->regattr`, `fid->ops->bind`). `std.ffi` has no
 C-struct ABI (MOCO-3692), so those offsets are numbers in the Mojo source,
@@ -206,7 +206,7 @@ install before trusting the transport on it.
 `fabric_hmem <rank> <nranks> <uid-file> [nexchanges]`, on a GPU node, under
 the GPU lock. `ib_bringup` and `ib_pipeline` register a plain malloc'd
 region, which on cxi means `iface = FI_HMEM_SYSTEM`. Production hands
-`ib_setup` a `driver.alloc_region` allocation
+`ib_setup` a `transport/p2p.mojo` `alloc_region` allocation
 (`hipExtMallocWithFlags(hipDeviceMallocUncached)` / `cuMemAlloc_v2`), which
 has to register as FI_HMEM_ROCR instead -- a different provider path, a
 different kernel driver, and the piece most likely to be missing from a
@@ -235,7 +235,7 @@ deadlines, the libfabric struct ABI, and `ib_setup`'s unwind of
 partially-created resources on a failure path. NOT covered: the progress
 thread and its two spin kernels (they need pinned host memory and a stream),
 byte-level verification of an RMA write into device memory, and everything
-in `mojoccl.mojo` above the transport.
+in `init.mojo`/`enqueue.mojo` above the transport.
 
 ## `host_fault_test.mojo` — independent host/device fault records
 

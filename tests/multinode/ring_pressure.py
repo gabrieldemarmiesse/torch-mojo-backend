@@ -1,6 +1,6 @@
 """Regression test: the calling thread outrunning the inter-node work ring.
 
-`internode.mojo` keeps its exchanges in a ring of `WORK_SLOTS` (512) work
+`transport/net.mojo` keeps its exchanges in a ring of `WORK_SLOTS` (512) work
 items, and nothing about the API tells a caller to stay inside it: the
 enqueue path only puts kernels on a stream, so the calling thread runs as far
 ahead of the GPU -- and therefore of the network -- as torch will let it.

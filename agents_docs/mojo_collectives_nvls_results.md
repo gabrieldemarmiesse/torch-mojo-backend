@@ -146,7 +146,7 @@ choice. `nvidia_peermem` only pins a `cuMemCreate` chunk whose prop set
 `allocFlags.gpuDirectRDMACapable = 1`. Without it every HCA returns NULL with
 `errno 14` (EFAULT); with it all 12 register. NCCL sets the flag whenever
 `CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED` (110) is 1
-(`nccl:src/include/alloc.h:329`), `vmm.mojo` now does the same, and MAX's own
+(`nccl:src/include/alloc.h:329`), `transport/nvls.mojo` (then `vmm.mojo`) now does the same, and MAX's own
 arena chunks already carry it: a `DeviceContext` buffer registers on 12/12
 HCAs too. So the multi-node path can register a VMM region; only the dmabuf
 half stays closed on this driver.

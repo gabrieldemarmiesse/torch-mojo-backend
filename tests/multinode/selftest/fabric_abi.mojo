@@ -1,5 +1,5 @@
 # Checks every libfabric struct offset, size and constant that
-# `libfabric.mojo` hard-codes against what the C compiler says the installed
+# `transport/net_ofi.mojo` hard-codes against what the C compiler says the installed
 # headers actually contain.
 #
 #     gcc -O0 -I <libfabric-prefix>/include \
@@ -12,11 +12,11 @@
 # Needs no libfabric at run time, no NIC and no peers: it compares two lists
 # of numbers. What it is for is the thing that cannot be caught any other
 # way -- `std.ffi` has no C-struct ABI (MOCO-3692), so a wrong offset in
-# libfabric.mojo does not fail to compile and often does not fail to run; it
+# transport/net_ofi.mojo does not fail to compile and often does not fail to run; it
 # passes a garbage pointer to the NIC.
 from std.sys import argv
 
-from tmb.ccl.libfabric import (
+from tmb.ccl.transport.net_ofi import (
     AVA_COUNT,
     AVA_TYPE,
     CMOPS_GETNAME,
@@ -164,7 +164,7 @@ struct Pair(Copyable, ImplicitlyCopyable, Movable):
 
 
 def _expected() -> List[Pair]:
-    """Every number `libfabric.mojo` believes, paired with the name
+    """Every number `transport/net_ofi.mojo` believes, paired with the name
     `fabric_abi.c` prints it under."""
     var e = List[Pair]()
     e.append(Pair(String("SZ_fi_info"), SZ_FI_INFO))

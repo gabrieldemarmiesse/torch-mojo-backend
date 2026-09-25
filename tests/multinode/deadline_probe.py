@@ -36,7 +36,7 @@ import torch.distributed as dist  # noqa: E402
 
 from torch_mojo_backend import register_mojo_devices  # noqa: E402
 
-GRID_GRACE_S = 1.0  # internode_fused.mojo's _GRID_GRACE_NS
+GRID_GRACE_S = 1.0  # all_reduce_gin.mojo's _GRID_GRACE_NS
 SLACK_S = 5.0
 
 
