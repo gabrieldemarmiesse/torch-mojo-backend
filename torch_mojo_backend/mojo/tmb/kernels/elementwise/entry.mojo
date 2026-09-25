@@ -27,7 +27,7 @@ from tmb.kernels.common.unary_math import (
 )
 
 from std.os import abort
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, pow
 from std.sys.info import (
@@ -537,7 +537,7 @@ def _unary_elementwise[
                 # SIMD-4 needs BOTH pointers aligned; offset views retain the
                 # existing scalar/vector fallback and its cached launch.
                 @always_inline
-                @parameter
+                @__parameter
                 @__copy_capture(out_ptr, in_ptr)
                 def gpu_func[width: Int, alignment: Int = 1](idx: Coord):
                     var i = Int(idx[0].value())
@@ -719,7 +719,7 @@ def _unary_bool[
     ctx: DeviceContext,
 ) raises:
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         # Same body as the vectorized path above, through the same helper:
@@ -738,7 +738,7 @@ def _unary_bool[
         else:
 
             @always_inline
-            @parameter
+            @__parameter
             @__copy_capture(out_ptr, in_ptr)
             def gpu_bool[width: Int, alignment: Int = 1](idx: Coord):
                 var i = Int(idx[0].value())
@@ -861,7 +861,7 @@ def _scalar_elementwise[
                 return
 
         @always_inline
-        @parameter
+        @__parameter
         @__copy_capture(out_ptr, in_ptr, scalar)
         def body[width: Int, al: Int](i: Int):
             var a = in_ptr.unsafe_load[width=width, alignment=al](i).cast[
@@ -903,13 +903,13 @@ def _scalar_elementwise[
         # start at any element (a bucket view starts wherever the previous
         # parameter ended).
         @always_inline
-        @parameter
+        @__parameter
         def func[width: Int, alignment: Int = 1](idx: Coord):
             body[width, size_of[dtype]()](Int(idx[0].value()))
 
         # 16-byte vectors, launched only once both bases proved aligned.
         @always_inline
-        @parameter
+        @__parameter
         def func_vec[width: Int, alignment: Int = 1](idx: Coord):
             body[width, 16](Int(idx[0].value()))
 
@@ -947,7 +947,7 @@ def _int_scalar_elementwise[
     ctx: DeviceContext,
 ) raises:
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr, scalar)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -998,7 +998,7 @@ def _arange[
         var step_f32 = step.cast[DType.float32]()
 
         @always_inline
-        @parameter
+        @__parameter
         @__copy_capture(out_ptr, start_f32, step_f32)
         def gpu_f32[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())
@@ -1015,7 +1015,7 @@ def _arange[
         var step_f32 = step.cast[DType.float32]()
 
         @always_inline
-        @parameter
+        @__parameter
         @__copy_capture(out_ptr, start_f32, step_f32)
         def lowp[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())
@@ -1032,7 +1032,7 @@ def _arange[
         var step_i64 = step.cast[DType.int64]()
 
         @always_inline
-        @parameter
+        @__parameter
         @__copy_capture(out_ptr, start_i64, step_i64)
         def integral[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())
@@ -1047,7 +1047,7 @@ def _arange[
     else:
 
         @always_inline
-        @parameter
+        @__parameter
         @__copy_capture(out_ptr, start, step)
         def f64[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())

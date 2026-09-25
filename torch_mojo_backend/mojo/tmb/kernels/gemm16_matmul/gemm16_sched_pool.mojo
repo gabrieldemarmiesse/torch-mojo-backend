@@ -164,12 +164,10 @@ def _cluster_remote_smem_addr(local_addr: UInt32, peer_rank: UInt32) -> UInt32:
     """`mapa.shared::cluster.u32`: this CTA's shared address -> the same
     object in CTA `peer_rank`'s window.  Pure address arithmetic, no access.
 
-    Written out rather than imported: `max.gpu.primitives` grew a
-    `cluster_remote_smem_addr` (identical body) only after the MAX release
-    this repo pins in pyproject.toml (26.5.0), which does not export it --
-    importing it there fails with "package 'primitives' does not contain
-    'cluster_remote_smem_addr'".  Delete this and import the library one when
-    the pin moves.
+    Written out rather than imported: MAX 26.5 had no
+    `cluster_remote_smem_addr`, and 26.6 has one (identical body) in
+    `max.gpu.primitives.cluster` but does not export it from
+    `max.gpu.primitives`. Importing it from the module is a follow-up.
     """
     return inlined_assembly[
         "mapa.shared::cluster.u32 $0, $1, $2;",
@@ -299,7 +297,7 @@ def sched_read_local(ring: SCHED_SMEM_PTR, rm: UInt32) -> Int:
 
 @always_inline
 def sched_fetch_add(ptr: SCHED_PTR, delta: Int32) -> Int32:
-    return Atomic[DType.int32, scope=_sched_scope()].fetch_add[
+    return Atomic[Scalar[DType.int32], scope=_sched_scope()].fetch_add[
         ordering=Ordering.RELAXED
     ](ptr, delta)
 
@@ -439,7 +437,9 @@ def _sched_table() raises -> _SCHED_TABLE:
     # of it (`sched_slot_ptr`), so that pair is what makes the zeroed words
     # above visible to a thread that finds the table through the registry
     # rather than building it.
-    Atomic[DType.int64].store[ordering=Ordering.RELEASE](table, Int64(0))
+    Atomic[Scalar[DType.int64]].store[ordering=Ordering.RELEASE](
+        table, Int64(0)
+    )
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(_SCHED_REG), table.unsafe_bitcast[NoneType]()
     )
@@ -490,7 +490,9 @@ def _sched_warn_exhausted(table: _SCHED_TABLE):
     """
     var flag = table.unsafe_offset(1)
     if (
-        Atomic[DType.int64].fetch_add[ordering=Ordering.RELAXED](flag, Int64(1))
+        Atomic[Scalar[DType.int64]].fetch_add[ordering=Ordering.RELAXED](
+            flag, Int64(1)
+        )
         != 0
     ):
         return
@@ -522,12 +524,15 @@ def sched_slot_ptr(ctx: DeviceContext) raises -> Optional[SCHED_PTR]:
         return None
     var key = stream.value()
     var claimed = Int(
-        Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](table)
+        Atomic[Scalar[DType.int64]].load[ordering=Ordering.ACQUIRE](table)
     )
     var scan = min(claimed, _SCHED_MAX_SLOTS)
     for i in range(scan):
         var entry = table.unsafe_offset(_SCHED_HEADER + 4 * i)
-        if Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](entry) == 0:
+        if (
+            Atomic[Scalar[DType.int64]].load[ordering=Ordering.ACQUIRE](entry)
+            == 0
+        ):
             continue
         if (
             Int(entry[unsafe_offset=1]) == device
@@ -535,7 +540,7 @@ def sched_slot_ptr(ctx: DeviceContext) raises -> Optional[SCHED_PTR]:
         ):
             return SCHED_PTR(unsafe_from_address=Int(entry[unsafe_offset=3]))
     var idx = Int(
-        Atomic[DType.int64].fetch_add[ordering=Ordering.RELAXED](
+        Atomic[Scalar[DType.int64]].fetch_add[ordering=Ordering.RELAXED](
             table, Int64(1)
         )
     )
@@ -559,5 +564,7 @@ def sched_slot_ptr(ctx: DeviceContext) raises -> Optional[SCHED_PTR]:
     entry[unsafe_offset=1] = Int64(device)
     entry[unsafe_offset=2] = Int64(key)
     entry[unsafe_offset=3] = Int64(Int(base))
-    Atomic[DType.int64].store[ordering=Ordering.RELEASE](entry, Int64(1))
+    Atomic[Scalar[DType.int64]].store[ordering=Ordering.RELEASE](
+        entry, Int64(1)
+    )
     return base

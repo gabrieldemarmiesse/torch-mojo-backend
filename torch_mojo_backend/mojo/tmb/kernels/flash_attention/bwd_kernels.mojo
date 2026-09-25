@@ -138,7 +138,7 @@ accumulator ONCE, unconditionally, in straight-line code, fenced with
 
 from tmb.kernels.flash_attention.fwd_kernels import RowStrides, _is_dense
 from max.gpu.sync import barrier
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     grid_dim,
@@ -148,7 +148,7 @@ from max.gpu.compute.mma import mma
 from max.gpu.host import DeviceContext
 from std.memory import AddressSpace
 from max.gpu.primitives import block
-from std.gpu.primitives.warp import shuffle_xor
+from max.gpu.primitives.warp import shuffle_xor
 from std.math import ceildiv, exp, exp2
 from std.memory import bitcast, stack_allocation
 from std.sys.info import is_amd_gpu
@@ -661,7 +661,7 @@ def _bwd_dq_mfma[
         var last_row = max(seq_kv - 1, 0)
 
         @always_inline
-        @parameter
+        @__parameter
         def _tile[MASKED: Bool](t: Int):
             var kv0 = t * BN
             var full = True
@@ -1042,7 +1042,7 @@ def _bwd_dkv_mfma[
         var row_lane = tid % LPR
 
         @always_inline
-        @parameter
+        @__parameter
         def _tile[MASKED: Bool](t: Int):
             var q0 = t * BM
             var full = True

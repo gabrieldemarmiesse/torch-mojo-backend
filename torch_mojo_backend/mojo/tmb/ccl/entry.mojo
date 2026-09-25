@@ -67,7 +67,7 @@
 from std.atomic import Atomic, Ordering
 from std.collections import Dict
 from std.ffi import OwnedDLHandle, external_call
-from std.gpu import global_idx
+from max.gpu import global_idx
 from std.memory.alloc import unsafe_alloc
 from std.os import getenv
 from std.sys import has_nvidia_gpu_accelerator, size_of
@@ -716,7 +716,7 @@ def _lock(mut state: CommState):
     var p = Pointer(to=state.lock).unsafe_origin_cast[MutAnyOrigin]()
     while True:
         var expected: Int64 = 0
-        if Atomic[DType.int64].compare_exchange[
+        if Atomic[Scalar[DType.int64]].compare_exchange[
             success_ordering=Ordering.ACQUIRE,
             failure_ordering=Ordering.RELAXED,
         ](p, expected, 1):
@@ -737,7 +737,7 @@ def _try_lock(mut state: CommState, deadline_ns: Int) -> Bool:
     var p = Pointer(to=state.lock).unsafe_origin_cast[MutAnyOrigin]()
     while True:
         var expected: Int64 = 0
-        if Atomic[DType.int64].compare_exchange[
+        if Atomic[Scalar[DType.int64]].compare_exchange[
             success_ordering=Ordering.ACQUIRE,
             failure_ordering=Ordering.RELAXED,
         ](p, expected, 1):
@@ -748,7 +748,7 @@ def _try_lock(mut state: CommState, deadline_ns: Int) -> Bool:
 
 
 def _unlock(mut state: CommState):
-    Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+    Atomic[Scalar[DType.int64]].store[ordering=Ordering.RELEASE](
         Pointer(to=state.lock).unsafe_origin_cast[MutAnyOrigin](), 0
     )
 
@@ -759,7 +759,7 @@ def _raise_abort_word(state: CommState):
     next check, and no driver call is needed to do it."""
     if state.abort_host == 0:
         return
-    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+    Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
         Pointer[UInt64, MutAnyOrigin](unsafe_from_address=state.abort_host),
         UInt64(1),
     )
@@ -876,7 +876,7 @@ def _order_after(mut state: CommState, handle: Int64) raises:
 
 
 def _fail_submission(mut state: CommState):
-    Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+    Atomic[Scalar[DType.int64]].store[ordering=Ordering.RELEASE](
         Pointer(to=state.submission_failed).unsafe_origin_cast[MutAnyOrigin](),
         1,
     )
@@ -900,7 +900,7 @@ def _submission_exception_code(mut state: CommState) -> Int32:
 
 def _submission_failed(state: CommState) -> Bool:
     return (
-        Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+        Atomic[Scalar[DType.int64]].load[ordering=Ordering.ACQUIRE](
             Pointer(to=state.submission_failed).unsafe_origin_cast[
                 MutAnyOrigin
             ]()
@@ -986,7 +986,7 @@ def _read_error_word(mut state: CommState, region: Int) raises -> UInt64:
 @always_inline
 def _fault_field(state: CommState, index: Int) -> UInt64:
     """One word of the fault record, by its `FAULT_*` index."""
-    return Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+    return Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
         Pointer[UInt64, MutAnyOrigin](
             unsafe_from_address=state.abort_host
             + (STATUS_FAULT_WORD + index) * 8
@@ -1015,7 +1015,7 @@ def _host_fault_word(state: CommState) -> UInt64:
     """`STATUS_HOST_FAULT_WORD`: the host's own latched failure, 0 if none."""
     if state.abort_host == 0:
         return UInt64(0)
-    return Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+    return Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
         Pointer[UInt64, MutAnyOrigin](
             unsafe_from_address=state.abort_host + STATUS_HOST_FAULT_WORD * 8
         )
@@ -1029,17 +1029,17 @@ def _latch_host_fault_record(page: Int, code: Int, detail: Int):
     var host = Pointer[UInt64, MutAnyOrigin](
         unsafe_from_address=page + STATUS_HOST_FAULT_WORD * 8
     )
-    if Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](host) != 0:
+    if Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](host) != 0:
         return
     # First fully published fault observed here wins. A device record still
     # being published loses to this host fault; their detail words are disjoint.
-    var device = Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+    var device = Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
         Pointer[UInt64, MutAnyOrigin](
             unsafe_from_address=page + (STATUS_FAULT_WORD + FAULT_CODE) * 8
         )
     )
     var device_first = UInt64(device != 0) << 63
-    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+    Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
         host,
         device_first
         | (UInt64(code) << 32)

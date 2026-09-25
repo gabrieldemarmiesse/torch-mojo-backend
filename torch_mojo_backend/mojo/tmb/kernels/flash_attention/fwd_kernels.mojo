@@ -132,7 +132,7 @@ Two consequences, both paid for in measurements:
 
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from max.gpu.sync import barrier
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     grid_dim,
@@ -142,7 +142,7 @@ from max.gpu.compute.mma import mma
 from max.gpu.host import DeviceContext
 from std.memory import AddressSpace
 from max.gpu.primitives import block
-from std.gpu.primitives.warp import shuffle_xor
+from max.gpu.primitives.warp import shuffle_xor
 from std.math import ceildiv, exp, exp2, log
 from std.memory import bitcast, stack_allocation
 from std.sys.info import is_amd_gpu
@@ -612,7 +612,7 @@ def _fa_mfma[
         # them behind a runtime `if` cost 70 us/layer on the nanogpt case even
         # though only two tiles per block ever take it.
         @always_inline
-        @parameter
+        @__parameter
         def _tile[MASKED: Bool](t: Int):
             var kv0 = t * BN
             var full = True

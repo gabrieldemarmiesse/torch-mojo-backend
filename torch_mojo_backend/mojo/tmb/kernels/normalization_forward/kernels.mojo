@@ -34,7 +34,7 @@ while one warp per row holds the row in registers and reduces with two
 shuffles.
 """
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
@@ -45,7 +45,7 @@ from std.gpu import (
 )
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
-from std.gpu.primitives import warp
+from max.gpu.primitives import warp
 from std.math import ceildiv, max, min
 from std.sys.info import has_apple_gpu_accelerator, size_of
 from std.utils.static_tuple import StaticTuple

@@ -628,7 +628,7 @@ def _aten_view(site: Site, name: StaticString) raises:
     var s = String(name)
     check(
         external_call["tmb_library_impl_aten_view", Int32](
-            site.lib, s.as_c_string_slice().unsafe_ptr()
+            site.lib, s.as_c_string_span().ptr()
         ),
         "registering ATen's view kernel",
     )

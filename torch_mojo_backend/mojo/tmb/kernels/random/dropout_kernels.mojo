@@ -12,7 +12,7 @@ for a float64 tensor). Geometry and the counter reservation come from the
 caller (tmb/ops/random.mojo).
 """
 from max.gpu.host import DeviceContext
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.sys.info import (
     has_accelerator,
     has_apple_gpu_accelerator,

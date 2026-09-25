@@ -65,7 +65,7 @@
 # per launch measures the sync, not the kernel.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import block_idx, lane_id, thread_idx, warp_id
+from max.gpu import block_idx, lane_id, thread_idx, warp_id
 from max.gpu.host import DeviceContext
 from std.math import ceildiv
 from std.sys import llvm_intrinsic
@@ -205,7 +205,7 @@ def _apple8_tn_kernel[
     # One 8-slab with every bound checked: ragged M/N subtiles and the K
     # tail (kk + 8 > k_end). Interior full slabs never come through here.
     @always_inline
-    @parameter
+    @__parameter
     def _slab_guarded(
         kk: Int,
         mut acc: Array[SIMD[DType.float32, TN_FRAG8], NT_M * NT_N],
@@ -243,7 +243,7 @@ def _apple8_tn_kernel[
     # for A (K, M) — the two lanes' elements are `m` floats apart — and
     # vector loads for B (K, N).
     @always_inline
-    @parameter
+    @__parameter
     def _load_a_fast(
         ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> Array[SIMD[DType.float32, TN_FRAG8], NT_M]:
@@ -259,7 +259,7 @@ def _apple8_tn_kernel[
         return afrag^
 
     @always_inline
-    @parameter
+    @__parameter
     def _load_b_fast(
         bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> Array[SIMD[DType.float32, TN_FRAG8], NT_N]:
@@ -273,7 +273,7 @@ def _apple8_tn_kernel[
         return bfrag^
 
     @always_inline
-    @parameter
+    @__parameter
     def _mma_block(
         afrag: Array[SIMD[DType.float32, TN_FRAG8], NT_M],
         bfrag: Array[SIMD[DType.float32, TN_FRAG8], NT_N],

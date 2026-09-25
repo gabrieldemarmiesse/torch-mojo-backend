@@ -52,7 +52,7 @@ signature; its caller is responsible for the existing SM90/TMA regime
 guards.
 """
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     grid_dim,
@@ -67,7 +67,7 @@ from max.gpu.compute.mma import (
 )
 from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import (
     external_memory,
     fence_async_view_proxy,

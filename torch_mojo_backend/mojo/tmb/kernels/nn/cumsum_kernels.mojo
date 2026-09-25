@@ -45,7 +45,7 @@
 
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_dim,

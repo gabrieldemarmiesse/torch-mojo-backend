@@ -42,7 +42,7 @@ The operand dtype is bfloat16 or float16 via _GEMM16_DT, same as the family.
 """
 
 from std.collections import OptionalReg
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_dim,
     block_idx,
@@ -56,7 +56,7 @@ from max.gpu.host import (
     FuncAttribute,
 )
 from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import (
     external_memory,
     fence_async_view_proxy,
@@ -771,7 +771,7 @@ def _b5_bmm_nn_tiny[
         var ab = bidx * a_mul
         var bb = bidx * b_mul
 
-        @parameter
+        @__parameter
         @always_inline
         def issue_tile(t: Int):
             var stage = t % stages

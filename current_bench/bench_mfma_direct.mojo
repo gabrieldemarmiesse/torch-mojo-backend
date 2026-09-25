@@ -12,7 +12,7 @@ dimensions. Example:
 
 from std.builtin.sort import sort
 from std.collections import List, Optional
-from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu import block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext, FuncAttribute
 from std.math import ceildiv
 from std.time import perf_counter_ns
@@ -124,7 +124,7 @@ def main() raises:
         var bias_ptr = bias_buf.unsafe_ptr().as_unsafe_any_origin().as_imm()
 
         @always_inline
-        @parameter
+        @__parameter
         @__copy_capture(c_ptr, bias_ptr, n)
         def _bias_store[
             value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
@@ -168,7 +168,7 @@ def main() raises:
         ]
 
         @always_inline
-        @parameter
+        @__parameter
         def _launch() raises:
             ctx.enqueue_function[kernel](
                 c,

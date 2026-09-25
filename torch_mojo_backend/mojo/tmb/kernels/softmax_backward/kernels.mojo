@@ -31,7 +31,7 @@
 
 from std.builtin.device_passable import DevicePassable
 from std.ffi import _get_global_or_null, external_call
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     grid_dim,

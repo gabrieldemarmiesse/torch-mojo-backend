@@ -41,7 +41,7 @@ SIDECAR_SUFFIXES = (".ptx", ".amdgcn", ".ll")
 # equality above would be vacuous (a compiler that ignored the flag).
 ONE_KERNEL = """\
 from max.gpu.host import DeviceContext
-from std.gpu import thread_idx
+from max.gpu import thread_idx
 
 
 def fill_kernel(p: Pointer[Float32, MutAnyOrigin]):

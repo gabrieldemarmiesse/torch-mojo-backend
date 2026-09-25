@@ -145,7 +145,7 @@ from std.builtin.device_passable import DevicePassable
 from std.collections import Array
 from std.ffi import _get_global_or_null, external_call
 from std.os import getenv
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     global_idx,
@@ -565,7 +565,7 @@ def abort_raised(page: Int) -> Bool:
     if page == 0:
         return False
     return (
-        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+        Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
             status_word(page, STATUS_ABORT_WORD)
         )
         != 0
@@ -587,7 +587,7 @@ def fault_latched(page: Int) -> Bool:
     if page == 0:
         return False
     return (
-        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+        Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
             status_word(page, STATUS_FAULT_WORD + FAULT_CODE)
         )
         != 0
@@ -619,7 +619,7 @@ def latch_arena_error(
     the last consequence. Device memory, so this is an ordinary global atomic.
     """
     var expected = UInt64(0)
-    return Atomic[DType.uint64].compare_exchange[
+    return Atomic[Scalar[DType.uint64]].compare_exchange[
         success_ordering=Ordering.RELEASE,
         failure_ordering=Ordering.RELAXED,
     ](err_word, expected, UInt64(code) * 1_000_000 + UInt64(phase))
@@ -665,7 +665,7 @@ def publish_fault(
         unsafe_offset=0
     ] = UInt64(arena)
     # Last, and with release: a nonzero code promises the six words above.
-    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+    Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
         status_word(page, STATUS_FAULT_WORD + FAULT_CODE), UInt64(code)
     )
     # And raise the abort word: "this communicator has failed" is then ONE
@@ -673,7 +673,7 @@ def publish_fault(
     # path, where each load of this pinned page is a PCIe round trip per
     # exchange (see `internode._proxy_main`). Ordered after the code, so a
     # reader that sees the word raised finds a complete record.
-    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+    Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
         status_word(page, STATUS_ABORT_WORD), UInt64(1)
     )
 
@@ -787,7 +787,7 @@ def _sync(
         var bid = Int(block_idx.x) if row < 0 else row
         # Only the acquire side is relaxed on gfx942 (`poll_acquire`); both
         # releases stay, for the small-payload reason above.
-        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+        Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
             _flags(regions[peer].unsafe_offset(arena_off)).unsafe_offset(
                 bid * MAX_WORLD + rank
             ),
@@ -797,7 +797,10 @@ def _sync(
             bid * MAX_WORLD + peer
         )
         var spins = 0
-        while Atomic[DType.uint64].load[ordering=_POLL_ORDER](mine) < target:
+        while (
+            Atomic[Scalar[DType.uint64]].load[ordering=_POLL_ORDER](mine)
+            < target
+        ):
             poll_pause()
             spins += 1
             if spins >= _SPIN_CHECK:
@@ -826,9 +829,9 @@ def _sync(
                         code,
                         target,
                         UInt64(peer),
-                        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
-                            mine
-                        ),
+                        Atomic[Scalar[DType.uint64]].load[
+                            ordering=Ordering.ACQUIRE
+                        ](mine),
                         arena_off,
                     )
                     failed[unsafe_offset=0] = 1
@@ -897,25 +900,29 @@ def grid_barrier(
         var release = region.unsafe_offset(
             _GRIDBAR_RELEASE_OFFSET
         ).unsafe_bitcast[UInt64]()
-        var seen = Atomic[DType.uint64].load[ordering=Ordering.RELAXED](release)
-        var was = Atomic[DType.uint64].fetch_add[
+        var seen = Atomic[Scalar[DType.uint64]].load[ordering=Ordering.RELAXED](
+            release
+        )
+        var was = Atomic[Scalar[DType.uint64]].fetch_add[
             ordering=Ordering.ACQUIRE_RELEASE
         ](arrive, UInt64(1))
         if Int(was) == nblocks - 1:
             # Last in. Reset the counter first: no block can arrive at the
             # next barrier before it has seen the sense word below change,
             # and the release store orders this plain one ahead of it.
-            Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
+            Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELAXED](
                 arrive, UInt64(0)
             )
-            Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+            Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
                 release, seen + 1
             )
         else:
             var page = status_page(region)
             var spins = 0
             while (
-                Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](release)
+                Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
+                    release
+                )
                 == seen
             ):
                 comptime if _AMD:
@@ -936,9 +943,9 @@ def grid_barrier(
                 if spins >= _SPIN_CHECK:
                     spins = 0
                     if (
-                        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
-                            poison
-                        )
+                        Atomic[Scalar[DType.uint64]].load[
+                            ordering=Ordering.ACQUIRE
+                        ](poison)
                         != 0
                     ):
                         failed[unsafe_offset=0] = 1
@@ -971,7 +978,9 @@ def grid_barrier(
         # of it would leave while the rest reaches the next `barrier()`.
         if (
             failed[unsafe_offset=0] == 0
-            and Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](poison)
+            and Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
+                poison
+            )
             != 0
         ):
             failed[unsafe_offset=0] = 1
@@ -2535,14 +2544,16 @@ def _ag_release_to_nic(
         var arrive = region.unsafe_offset(_AG_ARRIVE_OFFSET).unsafe_bitcast[
             UInt64
         ]()
-        var was = Atomic[DType.uint64].fetch_add[
+        var was = Atomic[Scalar[DType.uint64]].fetch_add[
             ordering=Ordering.ACQUIRE_RELEASE
         ](arrive, UInt64(1))
         if Int(was) == Int(grid_dim.x) - 1:
-            Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
+            Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELAXED](
                 arrive, UInt64(0)
             )
-            Atomic[DType.uint64].store[ordering=Ordering.RELEASE](mb_req, seq)
+            Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
+                mb_req, seq
+            )
 
 
 @always_inline

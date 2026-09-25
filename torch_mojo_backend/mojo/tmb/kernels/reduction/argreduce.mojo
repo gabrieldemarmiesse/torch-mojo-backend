@@ -65,7 +65,7 @@
 
 from max.gpu.host import DeviceContext
 from max.gpu.sync import barrier
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_dim,
     block_idx,
@@ -634,7 +634,7 @@ def _argreduce_rows[
             splits = ceildiv(cols, chunk)
 
         @always_inline
-        @parameter
+        @__parameter
         def _launch[VEC: Int]() raises -> Bool:
             comptime ALIGN = min(16, VEC * size_of[dtype]())
             # Every row base must land on the same alignment, not just the

@@ -49,7 +49,7 @@ layout, so one source serves both.
 
 from std.collections import Array
 from max.gpu.sync import barrier
-from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu import block_idx, grid_dim, thread_idx
 from max.gpu.compute.mma import mma
 from max.gpu.host import DeviceAttribute, DeviceContext
 from std.memory import AddressSpace
@@ -315,7 +315,7 @@ def _mma_tile_impl[
     # their existing layouts byte-for-byte.
     comptime QKMAJ = (not FASTK) and BM == 64 and BN == 64
 
-    @parameter
+    @__parameter
     @always_inline
     def load_tile(k0: Int32):
         comptime if TA:
@@ -328,7 +328,7 @@ def _mma_tile_impl[
         else:
             _g2r_mc[BCH, FASTK, QKMAJ](bp, bn0, ni, k0, ki, tid, bf, vb)
 
-    @parameter
+    @__parameter
     @always_inline
     def store_tile(stage: Int):
         var base_a = Int32(stage * STAGE_A)
@@ -409,7 +409,7 @@ def _mma_tile_impl[
                         )
                     ] = vb[it][e]
 
-    @parameter
+    @__parameter
     @always_inline
     def compute_tile(stage: Int):
         var base_a = Int32(stage * STAGE_A)
@@ -483,7 +483,7 @@ def _mma_tile_impl[
         t0 = Int32(Int(block_idx.y)) * Int32(chunk_tiles)
         t_end = min(kt, t0 + Int32(chunk_tiles))
 
-    @parameter
+    @__parameter
     @always_inline
     def run_tiles():
         comptime for i in range(2 * NT):
@@ -564,7 +564,7 @@ def _mma_tile_impl[
                                         frag[2 * h + 1] + add1
                                     ).cast[_DT]()
 
-    @parameter
+    @__parameter
     @always_inline
     def set_flags():
         comptime if FASTK:
@@ -1074,7 +1074,7 @@ def _mma_tile_wide[
     var va = Array[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
     var vb = Array[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
 
-    @parameter
+    @__parameter
     @always_inline
     def load_tile(k0: Int):
         comptime if TA:
@@ -1087,7 +1087,7 @@ def _mma_tile_wide[
         else:
             _g2r_mc_wide(bp, bn0, n, k0, k, tid, bf, vb)
 
-    @parameter
+    @__parameter
     @always_inline
     def store_tile(stage: Int):
         var base_a = stage * _STAGE_A
@@ -1131,7 +1131,7 @@ def _mma_tile_wide[
                         it
                     ][e]
 
-    @parameter
+    @__parameter
     @always_inline
     def compute_tile(stage: Int):
         var base_a = stage * _STAGE_A

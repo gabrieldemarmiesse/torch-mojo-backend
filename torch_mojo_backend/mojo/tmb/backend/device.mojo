@@ -492,7 +492,7 @@ def h_device_props(
             dst[unsafe_offset=i] = props.values[i]
         unsafe_memcpy(
             dest=text,
-            src=props.text.as_c_string_slice().unsafe_ptr(),
+            src=props.text.as_c_string_span().ptr(),
             count=props.text.byte_length(),
         )
         return 0
@@ -509,7 +509,8 @@ struct Pinned(Movable):
     var device: Int  # host memory is not necessarily portable across devices
     # The device above plus each stream below identifies an async user.
     var users: List[Int]
-    var remaining: Atomic[DType.int32]  # decremented by driver callbacks
+    # Decremented by driver callbacks.
+    var remaining: Atomic[Scalar[DType.int32]]
 
 
 def _pinned_lower_bound(base: Int) -> Int:
@@ -562,7 +563,12 @@ def h_host_alloc(
         var box = unsafe_alloc[Pinned](1)
         box.unsafe_write(
             Pinned(
-                buf^, base, nbytes, index, List[Int](), Atomic[DType.int32](0)
+                buf^,
+                base,
+                nbytes,
+                index,
+                List[Int](),
+                Atomic[Scalar[DType.int32]](0),
             )
         )
         if nbytes != 0:
@@ -905,7 +911,14 @@ def copy_from_host(
     var box = unsafe_alloc[Pinned](1)
     var base = Int(host.unsafe_ptr())
     box.unsafe_write(
-        Pinned(host^, base, nbytes, device, List[Int](), Atomic[DType.int32](1))
+        Pinned(
+            host^,
+            base,
+            nbytes,
+            device,
+            List[Int](),
+            Atomic[Scalar[DType.int32]](1),
+        )
     )
     # Own pinned staging before submission, including partial-submit errors.
     d[].pending_host.append(Int(box))
@@ -1204,9 +1217,7 @@ def h_event_elapsed_ms(start: Int, end: Int) abi("C") -> Float64:
 
 def set_error(msg: String):
     var tmp = String(msg)
-    external_call["tmb_set_error", NoneType](
-        tmp.as_c_string_slice().unsafe_ptr()
-    )
+    external_call["tmb_set_error", NoneType](tmp.as_c_string_span().ptr())
 
 
 def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:

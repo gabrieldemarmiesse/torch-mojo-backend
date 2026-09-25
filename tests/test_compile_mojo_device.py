@@ -148,9 +148,9 @@ def test_compile_output_ordered_after_graph(mojo_gpu):
     x = torch.arange(64, dtype=torch.float32).reshape(8, 8) + 1000.0
     x_mojo = x.to(device)
     torch.accelerator.synchronize(device)
-    max_device.default_stream.synchronize()
+    max_device.default_queue.synchronize()
 
-    sleep_on_stream(max_device, max_device.default_stream.native_stream_handle, 500_000)
+    sleep_on_stream(max_device, max_device.default_queue.native_stream_handle, 500_000)
     out = compiled(x_mojo)
     result = (out + 0.0).cpu()
     torch.testing.assert_close(result, fn(x))
@@ -180,7 +180,7 @@ def test_compile_input_ordered_after_eager_op(mojo_gpu):
     src = torch.arange(64, dtype=torch.float32).reshape(8, 8) + 1000.0
     src_mojo = src.to(device)
     torch.accelerator.synchronize(device)
-    max_device.default_stream.synchronize()
+    max_device.default_queue.synchronize()
 
     mojo_stream = torch.accelerator.current_stream(device)
     sleep_on_stream(

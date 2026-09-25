@@ -10,7 +10,7 @@ pair; bool travels as its uint8 storage. Tiles measured on H100.
 """
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.collections import Array
-from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu import block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from std.sys import size_of
 from max.gpu.host import DeviceContext

@@ -37,14 +37,14 @@
 #   uv run --no-sync mojo build nvls_kernels.mojo --target-accelerator gfx942
 
 from std.atomic import Atomic, Ordering
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     global_idx,
     grid_dim,
     thread_idx,
 )
-from std.gpu.intrinsics import Scope
+from max.gpu.intrinsics import Scope
 from std.memory import AddressSpace, stack_allocation
 from std.sys import size_of
 from std.sys._assembly import inlined_assembly
@@ -300,7 +300,7 @@ def _nvls_sync(
         var arrive = uc.unsafe_offset(ARRIVE_OFF).unsafe_bitcast[UInt64]()
         var release = uc.unsafe_offset(RELEASE_OFF).unsafe_bitcast[UInt64]()
         var mine = uc.unsafe_offset(FLAG_OFF).unsafe_bitcast[UInt64]()
-        var seen = Atomic[DType.uint64].fetch_add(arrive, UInt64(1))
+        var seen = Atomic[Scalar[DType.uint64]].fetch_add(arrive, UInt64(1))
         var spins = 0
         # The grid is the same on every call of a process (`nvls_blocks` reads
         # only the device), so arrivals group cleanly into runs of `nb`.
@@ -313,7 +313,9 @@ def _nvls_sync(
                     UInt64(1),
                 )
             while (
-                Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mine)
+                Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
+                    mine
+                )
                 < target
             ):
                 spins += 1
@@ -326,12 +328,14 @@ def _nvls_sync(
                     if global_perf_counter_ns() - t0 > timeout_ns:
                         failed[unsafe_offset=0] = 1
                         break
-            Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+            Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
                 release, target
             )
         else:
             while (
-                Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](release)
+                Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
+                    release
+                )
                 < target
             ):
                 spins += 1

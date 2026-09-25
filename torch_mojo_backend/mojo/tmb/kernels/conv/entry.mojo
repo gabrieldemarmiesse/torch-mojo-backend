@@ -73,7 +73,7 @@ def _im2col[
     var in_ptr = _make_ptr[dtype](in_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: StdCoord):
         var i = Int(idx[0].value())
@@ -152,7 +152,7 @@ def _col2im[
     var in_ptr = _make_ptr[dtype](in_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: StdCoord):
         var i = Int(idx[0].value())
@@ -309,7 +309,7 @@ def _bias_add_chan[
     var bias_ptr = _make_ptr[dtype](bias_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, bias_ptr)
     def func[width: Int, alignment: Int = 1](idx: StdCoord):
         var i = Int(idx[0].value())

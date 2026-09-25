@@ -22,7 +22,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, pow
 from std.memory import bitcast
@@ -445,7 +445,7 @@ def _bin_flat_vec_kernel[
     var nvec = total // VW
 
     @always_inline
-    @parameter
+    @__parameter
     def pass_over[l_b: Bool, r_b: Bool]():
         # A flagged operand holds exactly one element, so this read is in
         # range whenever the output is (the launcher returns early on
@@ -771,7 +771,7 @@ def _bitwise_not[
             var src = _make_ptr[storage_dtype](in_addr)
 
             @always_inline
-            @parameter
+            @__parameter
             @__copy_capture(dst, src)
             def gpu_func[width: Int, alignment: Int = 1](idx: Coord):
                 var i = Int(idx[0].value())
@@ -796,7 +796,7 @@ def _bitwise_not[
     var in_ptr = _make_ptr[dtype](in_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -872,7 +872,7 @@ def _isin[
     var test_ptr = _make_ptr[dtype](test_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr, test_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -966,7 +966,7 @@ def _clamp_scalar[
     var hi_s = hi.cast[dtype]()
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr, lo_s, hi_s, has_min, has_max)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -1106,7 +1106,7 @@ def _ternary_bcast[
             var value_f32 = value.cast[DType.float32]()
 
             @always_inline
-            @parameter
+            @__parameter
             @__copy_capture(out_ptr, a_ptr, b_ptr, c_ptr, value_f32)
             def func[width: Int, alignment: Int = 1](idx: Coord):
                 var i = Int(idx[0].value())
@@ -1142,7 +1142,7 @@ def _ternary_bcast[
             var value_dt = value.cast[dtype]()
 
             @always_inline
-            @parameter
+            @__parameter
             @__copy_capture(out_ptr, a_ptr, b_ptr, c_ptr, value_dt)
             def func2[width: Int, alignment: Int = 1](idx: Coord):
                 var i = Int(idx[0].value())
@@ -1211,7 +1211,7 @@ def _ternary_bcast_go[
     var ctx = _raw_ctx(ctx_ptr)
 
     @always_inline
-    @parameter
+    @__parameter
     def run[dt: DType]() raises:
         _ternary_bcast[dt, op_code](
             out_addr,
@@ -1360,7 +1360,7 @@ def _addr_bcast[
     var zero = UInt16(out_addr & 1)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(
         out_ptr, a_ptr, b_ptr, c_ptr, beta_f32, alpha_f32, beta_is_zero, zero
     )
@@ -1422,7 +1422,7 @@ def _addr_bcast_go(
     var ctx = _raw_ctx(ctx_ptr)
 
     @always_inline
-    @parameter
+    @__parameter
     def run[dt: DType]() raises:
         _addr_bcast[dt](
             out_addr,

@@ -8,7 +8,7 @@
 # rank's own region or its own user buffers.
 
 from std.atomic import Atomic, Ordering
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
 from tmb.ccl.collectives_kernels import device_now_ns
 from std.sys import size_of
 from std.utils import StaticTuple
@@ -130,7 +130,9 @@ def _proxy_request_kernel(mailbox: Pointer[UInt64, MutAnyOrigin], seq: UInt64):
     pinned status page cost a PCIe round trip per exchange.
     """
     if global_idx.x == 0:
-        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](mailbox, seq)
+        Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
+            mailbox, seq
+        )
 
 
 @__llvm_metadata(
@@ -179,7 +181,10 @@ def _proxy_wait_kernel(
         var page = Int(status)
         var t0 = device_now_ns()
         var spins = 0
-        while Atomic[DType.uint64].load[ordering=_POLL_ORDER](mailbox) < seq:
+        while (
+            Atomic[Scalar[DType.uint64]].load[ordering=_POLL_ORDER](mailbox)
+            < seq
+        ):
             poll_pause()
             spins += 1
             if spins >= _ABORT_CHECK:
@@ -202,9 +207,9 @@ def _proxy_wait_kernel(
                         0,
                         0,
                         FAULT_NO_PEER,
-                        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
-                            mailbox
-                        ),
+                        Atomic[Scalar[DType.uint64]].load[
+                            ordering=Ordering.ACQUIRE
+                        ](mailbox),
                         seq,
                         Int(error_word),
                     )

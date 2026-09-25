@@ -330,7 +330,7 @@ def host_hash() -> UInt64:
         var n = 0
         while n < 255 and buf[unsafe_offset=n] != 0:
             n += 1
-        text = String(capacity=n)
+        text = String(capacity_bytes=n)
         for i in range(n):
             text += chr(Int(buf[unsafe_offset=i]))
     # FNV-1a: any stable 64-bit mix is fine, this one needs no table.

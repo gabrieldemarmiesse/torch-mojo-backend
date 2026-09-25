@@ -46,14 +46,14 @@
 
 from max.gpu.host import DeviceContext
 from max.gpu.sync import barrier
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
     thread_idx,
 )
-from std.gpu.primitives import warp
-from std.gpu.primitives.warp import shuffle_down
+from max.gpu.primitives import warp
+from max.gpu.primitives.warp import shuffle_down
 from std.math import ceildiv, isnan, sqrt
 from std.memory import bitcast, stack_allocation
 from std.sys.info import has_accelerator, size_of
@@ -522,7 +522,7 @@ struct AnyOp(ReduceOp):
     """any: OR of a nonzero test. NaN is truthy (torch's rule).
 
     The accumulator is int32 rather than bool: the warp shuffle the block fold
-    is built on has no 8-bit form (`std.gpu.primitives.warp._shuffle` refuses
+    is built on has no 8-bit form (`max.gpu.primitives.warp._shuffle` refuses
     it with "unhandled shuffle dtype"), and a bool-width workspace would save
     a few KB on a reduction that reads megabytes. The values are only ever 0
     or 1, so OR and AND are exact.
@@ -639,14 +639,14 @@ def _block_fold[
     """
 
     @always_inline
-    @parameter
+    @__parameter
     def cb[
         dtype: DType, width: SIMDLength
     ](x: SIMD[dtype, width], y: SIMD[dtype, width]) -> SIMD[dtype, width]:
         return Op.combine(x, y)
 
     @always_inline
-    @parameter
+    @__parameter
     def cb_bits[
         dtype: DType, width: SIMDLength
     ](x: SIMD[dtype, width], y: SIMD[dtype, width]) -> SIMD[dtype, width]:

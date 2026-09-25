@@ -40,7 +40,7 @@ reproduced exactly:
   * `running_mean = (1 - momentum) * running_mean + momentum * mean`.
 """
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     grid_dim,

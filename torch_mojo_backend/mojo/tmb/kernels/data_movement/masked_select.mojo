@@ -10,7 +10,7 @@ inputs arrive contiguous and of one shape (the op broadcasts them first).
 Elements move as raw bits, so one kernel per element width serves every
 dtype; the mask is bool's uint8 storage.
 """
-from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu import block_idx, grid_dim, thread_idx
 from std.memory import AddressSpace, stack_allocation
 from max.gpu.sync import barrier
 from tmb.kernels.common.op_utils import (

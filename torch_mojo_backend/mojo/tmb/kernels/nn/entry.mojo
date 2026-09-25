@@ -21,7 +21,7 @@
 
 from std.os import abort
 from max.gpu.sync import barrier
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
@@ -32,7 +32,7 @@ from std.gpu import (
 )
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
-from std.gpu.primitives import warp
+from max.gpu.primitives import warp
 from std.math import ceildiv, exp, floor
 from std.memory import stack_allocation
 from std.memory.alloc import unsafe_alloc
@@ -143,7 +143,7 @@ def _batch_norm[
     var beta_ptr = _make_ptr[dtype](beta_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr, mean_ptr, var_ptr, gamma_ptr, beta_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -546,7 +546,7 @@ def _max_pool2d[
     var in_ptr = _make_ptr[dtype](in_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, idx_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -818,7 +818,7 @@ def _cumsum_rows_portable[
     var in_ptr = _make_ptr[dtype](in_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var r = Int(idx[0].value())
@@ -850,7 +850,7 @@ def _cumsum_cols_portable[
     var in_ptr = _make_ptr[dtype](in_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var c = Int(idx[0].value())
@@ -966,7 +966,7 @@ def _avg_pool2d[
     var in_ptr = _make_ptr[dtype](in_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -1089,7 +1089,7 @@ def _adaptive_avg_pool2d[
     var in_ptr = _make_ptr[dtype](in_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -1208,7 +1208,7 @@ def _upsample_bilinear2d[
     var in_ptr = _make_ptr[dtype](in_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -1318,7 +1318,7 @@ def _upsample_nearest2d[
     var in_ptr = _make_ptr[dtype](in_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())

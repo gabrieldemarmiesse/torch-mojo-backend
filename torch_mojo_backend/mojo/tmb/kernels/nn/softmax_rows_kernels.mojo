@@ -8,7 +8,7 @@ next to a softmax from the nn one) fails to compile on the duplicate export.
 Kernel bodies go here; the `_go` glue and `tmb_call` stay in the entry.
 """
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
     block_idx,
@@ -19,7 +19,7 @@ from std.gpu import (
 )
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
-from std.gpu.primitives import warp
+from max.gpu.primitives import warp
 from std.math import (
     ceildiv,
     exp,
@@ -40,7 +40,7 @@ from layout import (
     TileTensor,
     row_major,
 )
-from nn.softmax import softmax
+from nn.softmax import softmax_inline
 
 from tmb.kernels.random.dropout_kernels import _philox4x32_10
 from tmb.kernels.common.op_utils import (
@@ -61,10 +61,10 @@ from tmb.kernels.common.op_utils import (
 # top-left-aligned tril(ones(L, S)) mask that torch's sdpa is_causal=True
 # specifies; masked columns get probability 0.
 #
-# The CUDA/ROCm GPU path delegates to modular's `nn.softmax.softmax`, which
-# runs an online single-pass kernel (2 input reads + 1 write) — less HBM
-# traffic than a hand-written 4-pass block kernel — and a warp-shuffle kernel
-# for short rows (cols <= WARP_SIZE: 32 NVIDIA, 64 AMD). `scale` and the
+# The CUDA/ROCm GPU path delegates to modular's `nn.softmax.softmax_inline`,
+# which runs an online single-pass kernel (2 input reads + 1 write) — less
+# HBM traffic than a hand-written 4-pass block kernel — and a warp-shuffle
+# kernel for short rows (cols <= WARP_SIZE: 32 NVIDIA, 64 AMD). `scale` and the
 # causal mask are folded into the input lambda: the value is read and scaled
 # in float32 (for scale == 1 the round-trip back to `dtype` is exact), and
 # masked columns are fed as -inf so their softmax weight is exactly 0,
@@ -909,7 +909,7 @@ def _softmax_rows[
                 )
             return
 
-        @parameter
+        @__parameter
         @always_inline
         @__copy_capture(in_ptr)
         def input_fn[
@@ -935,7 +935,7 @@ def _softmax_rows[
             # 1/sqrt(head_dim) scales).
             return v.cast[dtype]()
 
-        softmax[dtype, 1, 2, input_fn, target="gpu"](
+        softmax_inline[dtype, 1, 2, input_fn, target="gpu"](
             Coord(rows, cols),
             TileTensor(out_ptr, row_major(rows, cols)),
             1,

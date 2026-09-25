@@ -14,7 +14,7 @@ kernels here stay 16-bit and are never instantiated in a float32 build
 """
 
 from max.gpu.sync import barrier
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, thread_idx
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, thread_idx
 from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
 from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
 from max.gpu.compute.mma import (
@@ -23,7 +23,7 @@ from max.gpu.compute.mma import (
     wgmma_fence_aligned,
     wgmma_wait_group_sync,
 )
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from std.memory import AddressSpace
 from std.memory import stack_allocation
 from std.sys.info import _has_sm_9x, _is_sm_9x

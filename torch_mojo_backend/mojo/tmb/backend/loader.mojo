@@ -276,9 +276,7 @@ struct Loader(Movable):
             rc = Int(atol(String(String(output[byte = marker + 9 :]).strip())))
         if rc != 0:
             if exists(tmp):
-                _ = external_call["unlink", Int32](
-                    tmp.as_c_string_slice().unsafe_ptr()
-                )
+                _ = external_call["unlink", Int32](tmp.as_c_string_span().ptr())
             var defs = String()
             for d in defines:
                 defs += " -D " + d
@@ -309,14 +307,12 @@ struct Loader(Movable):
         if exists(
             out_path
         ):  # another process installed the same build first: use theirs
-            _ = external_call["unlink", Int32](
-                tmp.as_c_string_slice().unsafe_ptr()
-            )
+            _ = external_call["unlink", Int32](tmp.as_c_string_span().ptr())
         else:
             var dst = String(out_path)
             var r = external_call["rename", Int32](
-                tmp.as_c_string_slice().unsafe_ptr(),
-                dst.as_c_string_slice().unsafe_ptr(),
+                tmp.as_c_string_span().ptr(),
+                dst.as_c_string_span().ptr(),
             )
             if r != 0 and not exists(out_path):
                 raise Error("could not install ", out_path)
@@ -347,7 +343,7 @@ struct Loader(Movable):
             makedirs(self.cache_dir, exist_ok=True)
         var lock_path = self.cache_dir + "/." + key + ".lock"
         var fd = external_call["creat", Int32](
-            lock_path.as_c_string_slice().unsafe_ptr(), Int32(0o644)
+            lock_path.as_c_string_span().ptr(), Int32(0o644)
         )
         if fd >= 0:
             _ = external_call["flock", Int32](

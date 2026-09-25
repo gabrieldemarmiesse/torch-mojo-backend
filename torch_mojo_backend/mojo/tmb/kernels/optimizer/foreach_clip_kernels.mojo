@@ -9,7 +9,7 @@ the elementwise family `foreach_batched_kernels` serves.
 
 from std.collections import Array
 from std.ffi import _get_global_or_null, external_call
-from std.gpu import block_idx, thread_idx
+from max.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
 from std.math import min

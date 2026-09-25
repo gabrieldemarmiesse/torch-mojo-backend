@@ -23,7 +23,7 @@ bit-compatible with the sequential per-tensor decomposition.
 """
 
 from std.collections import Array
-from std.gpu import block_idx, thread_idx
+from max.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import min
 from std.sys.info import has_accelerator

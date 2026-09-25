@@ -51,7 +51,7 @@ from std.utils.index import StaticTuple, IndexList
 
 from std.sys._assembly import inlined_assembly
 from max.gpu.sync import barrier
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     grid_dim,
@@ -59,9 +59,9 @@ from std.gpu import (
     thread_idx,
     warp_id,
 )
-import std.gpu.primitives.warp as warp
+import max.gpu.primitives.warp as warp
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import external_memory, fence_async_view_proxy
 from std.memory import AddressSpace
 from max.gpu.sync import (

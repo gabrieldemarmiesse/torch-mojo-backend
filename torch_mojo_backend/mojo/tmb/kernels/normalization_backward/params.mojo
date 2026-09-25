@@ -19,7 +19,7 @@ bit patterns.
 """
 
 from max.gpu.sync import barrier
-from std.gpu import block_idx, thread_idx
+from max.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.memory import AddressSpace
 from std.math import ceildiv

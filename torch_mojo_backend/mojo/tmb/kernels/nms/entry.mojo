@@ -1,6 +1,6 @@
 """Stable device merge sort, 64-box IoU masks, and kept-index gather."""
 
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.memory import AddressSpace, stack_allocation
 from max.gpu.sync import barrier
 from tmb.kernels.common.op_utils import (

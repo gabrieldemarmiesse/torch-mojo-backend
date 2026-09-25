@@ -12,7 +12,7 @@ fast intrinsics for float and the precise libdevice routines for double
 element order are the caller's (tmb/ops/random.mojo).
 """
 from max.gpu.host import DeviceContext
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceil, fma
 from std.sys.info import (
     bit_width_of,

@@ -26,7 +26,7 @@
 
 from std.atomic import Atomic, Ordering
 from std.collections import Array
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     global_idx,
@@ -214,7 +214,9 @@ def _give_up(poison: Pointer[UInt64, MutAnyOrigin]):
     the blocks still in `grid_barrier` have no other way to learn that the
     block they wait for has left."""
     if thread_idx.x == 0:
-        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](poison, UInt64(1))
+        Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
+            poison, UInt64(1)
+        )
 
 
 @always_inline
@@ -233,7 +235,10 @@ def _await_exchange(
     return alone: this thread still has to reach the next grid barrier, or
     every other block burns its own full deadline there."""
     var spins = 0
-    while Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mb_done) < seq:
+    while (
+        Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](mb_done)
+        < seq
+    ):
         spins += 1
         if spins < _MB_ABORT_CHECK:
             continue
@@ -258,14 +263,14 @@ def _await_exchange(
                     0,
                     Int(block_idx.x),
                     FAULT_NO_PEER,
-                    Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
-                        mb_done
-                    ),
+                    Atomic[Scalar[DType.uint64]].load[
+                        ordering=Ordering.ACQUIRE
+                    ](mb_done),
                     seq,
                     Int(region),
                 )
         if gave_up:
-            Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+            Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
                 poison, UInt64(1)
             )
             return
@@ -323,7 +328,9 @@ def _fused_ar_kernel[
 
     # Cleared before the first barrier, so every block sees the zero.
     if block_idx.x == 0 and thread_idx.x == 0:
-        Atomic[DType.uint64].store[ordering=Ordering.RELAXED](poison, UInt64(0))
+        Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELAXED](
+            poison, UInt64(0)
+        )
 
     for k in range(nchunks + depth - 1):
         # The deadline is per phase, as it was per kernel on the split
@@ -379,7 +386,7 @@ def _fused_ar_kernel[
                 _give_up(poison)
                 return
             if block_idx.x == 0 and thread_idx.x == 0:
-                Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+                Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
                     mb_req, UInt64(Int(seq0) + k)
                 )
 
@@ -436,7 +443,7 @@ def _fused_ar_kernel[
                 _give_up(poison)
                 return
             if block_idx.x == 0 and thread_idx.x == 0:
-                Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+                Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
                     mb_consumed, UInt64(seq)
                 )
 

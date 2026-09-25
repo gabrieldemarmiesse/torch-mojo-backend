@@ -41,7 +41,7 @@ everywhere else.
 
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.collections import Array
-from std.gpu import block_idx, thread_idx
+from max.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, min
 from std.sys.info import has_apple_gpu_accelerator, size_of

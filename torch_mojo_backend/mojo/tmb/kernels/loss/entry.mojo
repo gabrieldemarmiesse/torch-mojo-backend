@@ -35,7 +35,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.sync import barrier
-from std.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
+from max.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
 from std.math import ceildiv

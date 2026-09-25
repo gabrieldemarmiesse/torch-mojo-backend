@@ -310,15 +310,13 @@ def check(rc: Int32, what: StaticString) raises:
 
 def set_shim_error(msg: String):
     var tmp = String(msg)
-    external_call["tmb_set_error", NoneType](
-        tmp.as_c_string_slice().unsafe_ptr()
-    )
+    external_call["tmb_set_error", NoneType](tmp.as_c_string_span().ptr())
 
 
 def alert_not_deterministic(var caller: String) raises:
     check(
         external_call["tmb_alert_not_deterministic", Int32](
-            caller.as_c_string_slice().unsafe_ptr()
+            caller.as_c_string_span().ptr()
         ),
         "nondeterministic operation",
     )
@@ -1294,8 +1292,8 @@ def call_op_raw(
     var o = String(op)
     var ov = String(overload)
     var rc = external_call["tmb_call_op", Int32](
-        o.as_c_string_slice().unsafe_ptr(),
-        ov.as_c_string_slice().unsafe_ptr(),
+        o.as_c_string_span().ptr(),
+        ov.as_c_string_span().ptr(),
         args,
         Int32(n_args),
         rets,

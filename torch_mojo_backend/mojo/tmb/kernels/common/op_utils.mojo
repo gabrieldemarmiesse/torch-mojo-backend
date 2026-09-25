@@ -15,7 +15,7 @@ from std.collections.string.string_span import get_static_string
 from std.ffi import _get_global_or_null, external_call
 from std.reflection import get_linkage_name
 from max.gpu.sync import barrier
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import (
     DeviceAttribute,
     DeviceBuffer,
@@ -2391,7 +2391,7 @@ def _fill_contig[
     else:
 
         @always_inline
-        @parameter
+        @__parameter
         def _try_fill[VEC: Int]() raises -> Bool:
             comptime ALIGN = min(16, VEC * size_of[dtype]())
             if dst_addr % ALIGN != 0:
@@ -2476,7 +2476,7 @@ def _fill_strided_wide[
     """
 
     @always_inline
-    @parameter
+    @__parameter
     def _try_wide[VEC: Int]() raises -> Bool:
         comptime ALIGN = min(16, VEC * size_of[dtype]())
         var vshape = shape

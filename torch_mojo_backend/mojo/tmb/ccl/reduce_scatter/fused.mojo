@@ -1,7 +1,7 @@
 # Hierarchical fp32 reduce-scatter, including every pipelined chunk, in one launch.
 from std.atomic import Atomic, Ordering
 from std.collections import Array
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     global_idx,
@@ -165,7 +165,9 @@ def _fused_rs_kernel[
     var page = status_page(me)
     var poison = me.unsafe_offset(poison_offset()).unsafe_bitcast[UInt64]()
     if block_idx.x == 0 and thread_idx.x == 0:
-        Atomic[DType.uint64].store[ordering=Ordering.RELAXED](poison, UInt64(0))
+        Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELAXED](
+            poison, UInt64(0)
+        )
     for k in range(nchunks + depth - 1):
         var t0 = device_now_ns()
         if not grid_barrier(
@@ -212,7 +214,7 @@ def _fused_rs_kernel[
                 _give_up(poison)
                 return
             if block_idx.x == 0 and thread_idx.x == 0:
-                Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+                Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
                     mb_req, UInt64(Int(seq0) + k)
                 )
         var j = k - (depth - 1)
@@ -263,7 +265,7 @@ def _fused_rs_kernel[
                 _give_up(poison)
                 return
             if block_idx.x == 0 and thread_idx.x == 0:
-                Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+                Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
                     mb_consumed, UInt64(seq)
                 )
 

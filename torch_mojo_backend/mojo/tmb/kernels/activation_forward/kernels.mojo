@@ -8,7 +8,7 @@ and rounds once on return.  Device functions are cached per supplied context.
 
 from nn.activations import gelu_tanh
 from std.ffi import _get_global_or_null, external_call
-from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu import block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, exp2
 from std.math.polynomial import polynomial_evaluate

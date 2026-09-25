@@ -18,7 +18,7 @@ from std.atomic import Atomic, Ordering
 from std.os import abort
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.collections import Array
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
 from std.sys import is_amd_gpu, is_nvidia_gpu
@@ -349,7 +349,7 @@ def _permute_copy[
         # runtime decision, and when none fits the copy declines to the
         # general element-at-a-time kernel below, which masks every extent.
         @always_inline
-        @parameter
+        @__parameter
         def _try_run_gather[VEC: Int]() raises -> Bool:
             comptime ALIGN = min(16, VEC * size_of[dtype]())
             if (
@@ -1319,7 +1319,7 @@ def _where_flat_vec_kernel[
     var nvec = total // VW
 
     @always_inline
-    @parameter
+    @__parameter
     def pass_over[a_b: Bool, b_b: Bool]():
         var a_splat = SIMD[dtype, VW](a_ptr[unsafe_offset=0]) if a_b else SIMD[
             dtype, VW
@@ -1601,7 +1601,7 @@ def _masked_fill_scalar_flat_vec_kernel[
     var a_splat = SIMD[dtype, VW](value)
 
     @always_inline
-    @parameter
+    @__parameter
     def pass_over[b_b: Bool]():
         var b_splat = SIMD[dtype, VW](b_ptr[unsafe_offset=0]) if b_b else SIMD[
             dtype, VW
@@ -1829,7 +1829,7 @@ def _masked_fill_scalar_go(
     var ctx = _raw_ctx(ctx_ptr)
 
     @always_inline
-    @parameter
+    @__parameter
     def run[dt: DType]() raises:
         comptime BITS = _fill_bits_dtype[dt]()
         _masked_fill_scalar_bcast[BITS](
@@ -2125,7 +2125,7 @@ def _cast[
     else:
 
         @always_inline
-        @parameter
+        @__parameter
         def _try_cast[VEC: Int]() raises -> Bool:
             comptime IALIGN = min(16, VEC * size_of[src]())
             comptime OALIGN = min(16, VEC * size_of[dst]())
@@ -2240,7 +2240,7 @@ def _tile_copy[
         return
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr, out_shape, in_shape, in_strides)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -2718,7 +2718,7 @@ def _repeat_tiled[
     var sm_count = _device_sm_count(ctx)
 
     @always_inline
-    @parameter
+    @__parameter
     def _launch[V: Int]() raises:
         if wide and _repeat_seg_blocks(ecols // V, nout) >= sm_count:
             _repeat_seg_launch[dtype, V](
@@ -2838,7 +2838,7 @@ def _triangular_copy[
     var total = batch * rows * cols
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -2932,7 +2932,7 @@ def _gather_rows[
     var idx_ptr = _make_ptr[idx_dtype](idx_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr, idx_ptr)
     def func[width: Int, alignment: Int = 1](coord: Coord):
         var i = Int(coord[0].value())
@@ -3094,7 +3094,7 @@ def _gather_dim[
     var total = _raw_tuple_int(params, 0) * d1 * d2 * d3
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(
         out_ptr,
         in_ptr,
@@ -3377,7 +3377,7 @@ def _scatter_dim[
     var total = d0 * d1 * d2 * d3
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, index_ptr, src_ptr, err_ptr, has_err, scalar)
     def func[width: Int, alignment: Int = 1](coord: Coord):
         var i = Int(coord[0].value())
@@ -3418,7 +3418,7 @@ def _scatter_dim[
             # Colliding targets sum, in an unspecified order (torch's CUDA
             # scatter_add is atomic too). Relaxed is enough: nothing else in
             # the launch reads `out`.
-            _ = Atomic[dtype, scope=_atomic_scope()].fetch_add[
+            _ = Atomic[Scalar[dtype], scope=_atomic_scope()].fetch_add[
                 ordering=Ordering.RELAXED
             ](
                 out_ptr.unsafe_offset(out_off),
@@ -3576,7 +3576,7 @@ def _pad2d[
     var out_w_ = in_w + pad_l + pad_r
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](coord: Coord):
         var out_h = in_h + pad_t + pad_b

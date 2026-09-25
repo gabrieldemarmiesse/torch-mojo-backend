@@ -53,7 +53,7 @@
 from max.gpu.sync import barrier
 from std.builtin.device_passable import DevicePassable
 from std.ffi import _get_global_or_null, external_call
-from std.gpu import block_idx, thread_idx
+from max.gpu import block_idx, thread_idx
 from max.gpu.host import (
     DeviceAttribute,
     DeviceBuffer,

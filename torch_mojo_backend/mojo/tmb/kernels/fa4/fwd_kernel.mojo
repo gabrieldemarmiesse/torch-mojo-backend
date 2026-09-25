@@ -40,16 +40,16 @@ from std.sys import size_of
 from std.utils.index import StaticTuple, IndexList
 
 from max.gpu.sync import barrier
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     lane_id,
     thread_idx,
     warp_id,
 )
-import std.gpu.primitives.warp as warp
+import max.gpu.primitives.warp as warp
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import external_memory, fence_async_view_proxy
 from std.memory import AddressSpace
 from max.gpu.sync import named_barrier, named_barrier_arrive
@@ -574,7 +574,7 @@ def fwd_fa4_kernel[
         t_scale = (softmax_scale / cap_f32).cast[accum_type]()
         scale_log2 = (cap_f32 * Scalar[DType.float32](log2e)).cast[accum_type]()
 
-    @parameter
+    @__parameter
     @always_inline
     def k_tile(
         slot: Int,
@@ -591,7 +591,7 @@ def fwd_fa4_kernel[
             ).as_unsafe_any_origin()
         }
 
-    @parameter
+    @__parameter
     @always_inline
     def v_tile(
         slot: Int,
@@ -618,7 +618,7 @@ def fwd_fa4_kernel[
         v_canonical[1].stride[1].value() * 2 * size_of[dtype]()
     )
 
-    @parameter
+    @__parameter
     @always_inline
     def pv_gemm(slot_arg: Int):
         comptime if dtype == DType.float16:
@@ -676,7 +676,7 @@ def fwd_fa4_kernel[
             # Bottom-right alignment: masked iff j < i + offs - left.
             win_mask_d -= vl_offs
 
-    @parameter
+    @__parameter
     @always_inline
     def softmax_block(mask_diag: Bool, mask_tail: Bool):
         """Online softmax over s_reg (S just retired): update
@@ -898,7 +898,7 @@ def fwd_fa4_kernel[
                 + local_sum[unsafe_offset=i]
             )
 
-    @parameter
+    @__parameter
     @always_inline
     def pack_p():
         comptime for c in range(c_frag_size_qk):
@@ -906,7 +906,7 @@ def fwd_fa4_kernel[
                 dtype
             ]()
 
-    @parameter
+    @__parameter
     @always_inline
     def rescale_o():
         comptime for c in range(c_frag_size_pv):

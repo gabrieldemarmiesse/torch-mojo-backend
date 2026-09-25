@@ -1,6 +1,6 @@
 """Deformable im2col, its derivatives, and convolution layout transforms."""
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
-from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu import block_idx, grid_dim, thread_idx
 from std.math import ceildiv, floor
 from max.gpu.primitives import block
 from tmb.kernels.roi.entry import (

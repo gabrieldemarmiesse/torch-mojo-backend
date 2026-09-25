@@ -70,7 +70,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.sync import barrier
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, thread_idx
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, thread_idx
 from max.gpu.memory import (
     async_copy,
     async_copy_commit_group,
@@ -243,7 +243,7 @@ def _tn_core_kernel[
     var b_srcs = (k_start + b_bkk) * n + b_colc
 
     @always_inline
-    @parameter
+    @__parameter
     def _fetch[GUARDED: Bool](s: Int, buf: Int):
         # Issues the copies for slab `s` into smem buffer `buf` (passed in
         # explicitly: the PUMP=2 path keeps rolling buffer indices because
@@ -290,7 +290,7 @@ def _tn_core_kernel[
             )
 
     @always_inline
-    @parameter
+    @__parameter
     def _fetch_slab(s: Int, buf: Int):
         if s == nslabs - 1:
             _fetch[True](s, buf)
@@ -300,7 +300,7 @@ def _tn_core_kernel[
         b_srcs += BK * n
 
     @always_inline
-    @parameter
+    @__parameter
     def _compute(aoff: Int, boff: Int):
         # One slab of FMAs from the smem slab at (aoff, boff).
         # Register-double-buffered fragments: loads for column kk+1 issue
@@ -549,7 +549,7 @@ def _tn_split_kernel[
     var b_srcs = (k_start + s_begin * BK + b_bkk) * n + b_colc
 
     @always_inline
-    @parameter
+    @__parameter
     def _fetch[GUARDED: Bool](s: Int, buf: Int):
         # Issues the copies for GLOBAL slab `s` into this group's smem
         # buffer `buf`.
@@ -590,7 +590,7 @@ def _tn_split_kernel[
             )
 
     @always_inline
-    @parameter
+    @__parameter
     def _fetch_slab(s: Int, buf: Int):
         # The row guard can only fail on the LAST slab of the block chunk
         # (the k tail), which lives in exactly one group's range.
@@ -602,7 +602,7 @@ def _tn_split_kernel[
         b_srcs += BK * n
 
     @always_inline
-    @parameter
+    @__parameter
     def _compute(aoff: Int, boff: Int):
         var a_base_s = a_smem.unsafe_offset(aoff)
         var b_base_s = b_smem.unsafe_offset(boff)

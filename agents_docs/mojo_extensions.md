@@ -163,9 +163,10 @@ existing math paths.
 
 The graph backend forwards through one generic
 `ElementwiseOp[kind: StaticString](ElementwiseUnaryMixedOp)`. The mixed-output
-trait also supports boolean predicates. In pinned MAX 26.5, fusion lowering
-does not forward parent-struct parameters, so concrete registrations are
-generated from one template in `scripts/generate_elementwise_ops.py`.
+trait also supports boolean predicates. In MAX 26.5, fusion lowering did not
+forward parent-struct parameters (not re-checked on 26.6), so concrete
+registrations are generated from one template in
+`scripts/generate_elementwise_ops.py`.
 These thin forwarders preserve graph fusion while keeping the math and
 registration template in one place. The generator reads the supported kinds
 from the Python helper's `Literal` annotation; run

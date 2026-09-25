@@ -20,7 +20,7 @@
 # once on the store.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, erf, exp, tanh
 from std.os import abort

@@ -31,7 +31,7 @@ def impl[op: OpFn, name: StaticString](site: Site) raises:
     var s = String(name)
     var rc = external_call["tmb_library_impl", Int32](
         site.lib,
-        s.as_c_string_slice().unsafe_ptr(),
+        s.as_c_string_span().ptr(),
         op_address[op](),
         0,
     )

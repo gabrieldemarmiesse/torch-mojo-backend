@@ -42,7 +42,7 @@
 
 from std.atomic import Atomic, Ordering, fence
 from std.collections import Array
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     grid_dim,
@@ -203,7 +203,7 @@ def _poison_word(
 @always_inline
 def _poisoned(region: Pointer[UInt8, MutAnyOrigin], tag: UInt64) -> Bool:
     return (
-        Atomic[DType.uint64].load[ordering=Ordering.RELAXED](
+        Atomic[Scalar[DType.uint64]].load[ordering=Ordering.RELAXED](
             _poison_word(region)
         )
         >= tag
@@ -212,7 +212,7 @@ def _poisoned(region: Pointer[UInt8, MutAnyOrigin], tag: UInt64) -> Bool:
 
 @always_inline
 def _poison(region: Pointer[UInt8, MutAnyOrigin], tag: UInt64):
-    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+    Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
         _poison_word(region), tag
     )
 
@@ -236,7 +236,7 @@ def _publish(
     barrier()
     var t = Int(thread_idx.x)
     if t < world and t != rank:
-        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+        Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
             _row(regions[t], table, block).unsafe_offset(rank), target
         )
 
@@ -272,7 +272,8 @@ def _await(
         var mine = _row(me, table, block).unsafe_offset(t)
         var spins = 0
         while (
-            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mine) < target
+            Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](mine)
+            < target
         ):
             spins += 1
             if spins < _SPIN_CHECK:
@@ -298,9 +299,9 @@ def _await(
                         0,
                         block,
                         UInt64(t),
-                        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
-                            mine
-                        ),
+                        Atomic[Scalar[DType.uint64]].load[
+                            ordering=Ordering.ACQUIRE
+                        ](mine),
                         target,
                         Int(me),
                     )
@@ -345,7 +346,10 @@ def _await_exchange(
         ).unsafe_bitcast[UInt64]()
         var page = status_page(me)
         var spins = 0
-        while Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](word) < seq:
+        while (
+            Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](word)
+            < seq
+        ):
             spins += 1
             if spins < _MB_ABORT_CHECK:
                 continue
@@ -370,9 +374,9 @@ def _await_exchange(
                         0,
                         Int(block_idx.x),
                         FAULT_NO_PEER,
-                        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
-                            word
-                        ),
+                        Atomic[Scalar[DType.uint64]].load[
+                            ordering=Ordering.ACQUIRE
+                        ](word),
                         seq,
                         Int(me),
                     )
@@ -381,7 +385,7 @@ def _await_exchange(
         if failed[unsafe_offset=0] != 0:
             _poison(me, tag)
         elif lead:
-            Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+            Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
                 me.unsafe_offset(_RS_STREAM_DONE).unsafe_bitcast[UInt64](), seq
             )
     barrier()
@@ -398,12 +402,14 @@ def _arrive(
     chunk cannot be mistaken for a straggler arriving at this one, and the
     last arriver clears it -- nothing carries across launches."""
     var arrive = me.unsafe_offset(table + chunk * 8).unsafe_bitcast[UInt64]()
-    var was = Atomic[DType.uint64].fetch_add[ordering=Ordering.ACQUIRE_RELEASE](
-        arrive, UInt64(1)
-    )
+    var was = Atomic[Scalar[DType.uint64]].fetch_add[
+        ordering=Ordering.ACQUIRE_RELEASE
+    ](arrive, UInt64(1))
     if Int(was) != nblocks - 1:
         return False
-    Atomic[DType.uint64].store[ordering=Ordering.RELAXED](arrive, UInt64(0))
+    Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELAXED](
+        arrive, UInt64(0)
+    )
     return True
 
 
@@ -783,9 +789,9 @@ def _stream_rs_kernel[
             )
             if nnodes > 1 and thread_idx.x == 0:
                 if _arrive(me, _RS_STREAM_REQ, k, nblocks):
-                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                        mb_req, UInt64(Int(seq0) + k)
-                    )
+                    Atomic[Scalar[DType.uint64]].store[
+                        ordering=Ordering.RELEASE
+                    ](mb_req, UInt64(Int(seq0) + k))
         var j = k - (depth - 1)
         if j >= 0 and nnodes > 1:
             var off = j * ce
@@ -822,9 +828,9 @@ def _stream_rs_kernel[
             barrier()
             if thread_idx.x == 0:
                 if _arrive(me, _RS_STREAM_CONS, j, nblocks):
-                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                        mb_consumed, UInt64(seq)
-                    )
+                    Atomic[Scalar[DType.uint64]].store[
+                        ordering=Ordering.RELEASE
+                    ](mb_consumed, UInt64(seq))
 
 
 # ===-------------------------------------------------------------------=== #

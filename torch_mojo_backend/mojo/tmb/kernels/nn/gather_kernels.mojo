@@ -44,7 +44,7 @@ def _gather0[
     var indices_ptr = _make_ptr[idx_dtype](indices_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, weight_ptr, indices_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())

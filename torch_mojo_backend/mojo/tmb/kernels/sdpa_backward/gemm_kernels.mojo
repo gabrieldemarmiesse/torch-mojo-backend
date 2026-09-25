@@ -32,7 +32,7 @@ GPU only — the 8x8 simdgroup-matrix primitive does not exist elsewhere, and
 other targets raise so callers keep their composed route.
 """
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     lane_id,
@@ -137,7 +137,7 @@ def _sdpa_ta_gemm_kernel[
     # One 8-slab with every bound checked: ragged M/N subtiles and the K
     # tail. Interior full slabs never come through here.
     @always_inline
-    @parameter
+    @__parameter
     def _slab_guarded(kk: Int, mut acc: Array[SIMD[F32, FRAG8], _NT_M * _NT_N]):
         var afrag = Array[SIMD[F32, FRAG8], _NT_M](uninitialized=True)
         comptime for mi in range(_NT_M):
@@ -178,7 +178,7 @@ def _sdpa_ta_gemm_kernel[
     # transpose makes A's two fragment slots differ by a whole stored row
     # (stride m) — per-lane scalar pairs, like the fat kernel's transposed B.
     @always_inline
-    @parameter
+    @__parameter
     def _load_a_fast(
         ap0: Pointer[Scalar[F32], ImmutAnyOrigin],
         mp0: Pointer[Scalar[DType.bool], ImmutAnyOrigin],
@@ -199,7 +199,7 @@ def _sdpa_ta_gemm_kernel[
         return afrag^
 
     @always_inline
-    @parameter
+    @__parameter
     def _load_b_fast(
         bp0: Pointer[Scalar[F32], ImmutAnyOrigin],
     ) -> Array[SIMD[F32, FRAG8], _NT_N]:
@@ -211,7 +211,7 @@ def _sdpa_ta_gemm_kernel[
         return bfrag^
 
     @always_inline
-    @parameter
+    @__parameter
     def _mma_block(
         afrag: Array[SIMD[F32, FRAG8], _NT_M],
         bfrag: Array[SIMD[F32, FRAG8], _NT_N],

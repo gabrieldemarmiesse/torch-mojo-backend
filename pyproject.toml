@@ -10,8 +10,8 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
-    "mojo==1.0",
-    "max==26.5",
+    "mojo==1.1",
+    "max==26.6",
     "platformdirs",
     "tabulate",
     "torch>=2.7",
@@ -60,6 +60,13 @@ markers = [
     "gpu: requires a GPU (also inferred from GPU fixtures); select with -m gpu or -m 'not gpu'",
     "cuda: CUDA graph tests that must run before Mojo device registration, in a separate process",
     "cpu_torch: Mojo GPU integration requiring a CPU-only torch wheel (Inductor/Triton)",
+]
+filterwarnings = [
+    # MAX 26.6's eager executor warns when its interpreter refuses a graph it
+    # cannot interpret (our custom ops) and the graph is compiled instead --
+    # an expected refusal, not a failure (MAX's own TODO MXF-595 is to stop
+    # warning on it). Any other interpreter failure still warns.
+    "ignore:The eager interpreter failed on this graph \\(UnsupportedGraphError:UserWarning",
 ]
 
 [tool.ruff.lint]
@@ -151,16 +158,16 @@ dev = [
     # when none fits; nvcc is not a runtime dependency.
     "nvidia-cuda-nvcc-cu12==12.8.*; platform_system == 'Linux'",
     # Bump the version of mojo/max here.  These come from PyPI like everything
-    # else: mojo 1.0 is a stable release, so there is no nightly index and no
+    # else: mojo 1.1 is a stable release, so there is no nightly index and no
     # prerelease opt-in to keep in sync with them.
-    "max==26.5.0",
-    "max-core==26.5.0",
-    "max-mojo-libs==26.5.0",
-    "mojo==1.0.0",
-    "mblack==26.5.0",
-    "mojo-lldb-libs==1.0.0",
-    "mojo-compiler==1.0.0",
-    "mojo-compiler-mojo-libs==1.0.0",
+    "max==26.6.0",
+    "max-core==26.6.0",
+    "max-mojo-libs==26.6.0",
+    "mojo==1.1.0",
+    "mblack==26.6.0",
+    "mojo-lldb-libs==1.1.0",
+    "mojo-compiler==1.1.0",
+    "mojo-compiler-mojo-libs==1.1.0",
     "hatchling",
     "ipython",
     # torch ships torch/testing/_internal inside the wheel but not this, its

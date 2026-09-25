@@ -20,7 +20,7 @@
 # positive one. Zero-probability categories are therefore never drawn.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     grid_dim,

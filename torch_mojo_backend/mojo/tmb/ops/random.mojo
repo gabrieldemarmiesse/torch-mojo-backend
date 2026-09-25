@@ -136,7 +136,7 @@ def _plan(t: T) raises -> Plan:
         perm[i] = r - 1 - i
 
     @always_inline
-    @parameter
+    @__parameter
     def should_swap(d0: Int, d1: Int) -> Int:
         var s0 = strides[d0]
         var s1 = strides[d1]

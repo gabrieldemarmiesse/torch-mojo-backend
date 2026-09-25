@@ -552,7 +552,7 @@ def _comp(st: IbState, i: Int) -> Pointer[NetCompletion, MutAnyOrigin]:
 @always_inline
 def _load_atomic_i(p: Pointer[Int, MutAnyOrigin]) -> Int:
     return Int(
-        Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+        Atomic[Scalar[DType.int64]].load[ordering=Ordering.ACQUIRE](
             p.unsafe_bitcast[Int64]()
         )
     )
@@ -560,7 +560,7 @@ def _load_atomic_i(p: Pointer[Int, MutAnyOrigin]) -> Int:
 
 @always_inline
 def _store_atomic_i(p: Pointer[Int, MutAnyOrigin], v: Int):
-    Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+    Atomic[Scalar[DType.int64]].store[ordering=Ordering.RELEASE](
         p.unsafe_bitcast[Int64](), Int64(v)
     )
 
@@ -1034,7 +1034,7 @@ def _comm_stopped(st: IbState) -> Bool:
     if st.status_host == 0:
         return False
     return (
-        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+        Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
             Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.status_host)
         )
         != 0
@@ -1084,21 +1084,21 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
     st.last_progress_ns = perf_counter_ns()
     while True:
         if (
-            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+            Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
                 _mb(st, MB_STOP)
             )
             != 0
         ):
             return
         var consumed = Int(
-            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+            Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
                 _mb(st, MB_CONSUMED)
             )
         )
         if consumed > st.credit_device:
             st.credit_device = consumed
         var req = Int(
-            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+            Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
                 _mb(st, MB_REQUEST)
             )
         )
@@ -1125,7 +1125,7 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
             # the stream hangs past the point where the error can be
             # reported.
             published = st.done_seq
-            Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+            Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
                 _mb(st, MB_DONE), UInt64(published)
             )
         if moved or st.done_seq < st.request_seq:
@@ -1142,7 +1142,7 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
                 and _load_atomic_i(_err_ptr(st)) == 0
             ):
                 continue
-        if Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+        if Atomic[Scalar[DType.uint64]].load[ordering=Ordering.ACQUIRE](
             _mb(st, MB_REQUEST)
         ) <= UInt64(st.request_seq):
             _nanosleep_ns(st.ts, idle_ns)
@@ -1309,7 +1309,9 @@ def _start_proxy(ib: Int, local_rank: Int, local_world: Int) raises:
 def _stop_proxy(mut st: IbState):
     if st.thread_id == 0:
         return
-    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](_mb(st, MB_STOP), 1)
+    Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
+        _mb(st, MB_STOP), 1
+    )
     _ = external_call["pthread_join", Int32](st.thread_id, Int64(0))
     st.thread_id = 0
 
@@ -1350,7 +1352,9 @@ def ib_signal_abort(ib: Int) -> Bool:
     ref st = _st(ib)[]
     if st.thread_id == 0:
         return True
-    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](_mb(st, MB_STOP), 1)
+    Atomic[Scalar[DType.uint64]].store[ordering=Ordering.RELEASE](
+        _mb(st, MB_STOP), 1
+    )
     var tid = st.thread_id
     var deadline = perf_counter_ns() + Int(IB_ABORT_JOIN_TIMEOUT_S * 1.0e9)
     var retval = unsafe_alloc[Int64](1)
@@ -1804,7 +1808,7 @@ def _await_ring_slot(mut st: IbState, seq: Int) raises:
             # timeout as a transport failure for the C ABI and proxy. Only
             # the proxy releases outstanding work; preserve any earlier error.
             var expected = Int64(0)
-            _ = Atomic[DType.int64].compare_exchange[
+            _ = Atomic[Scalar[DType.int64]].compare_exchange[
                 success_ordering=Ordering.RELEASE,
                 failure_ordering=Ordering.RELAXED,
             ](_err_ptr(st).unsafe_bitcast[Int64](), expected, 3)

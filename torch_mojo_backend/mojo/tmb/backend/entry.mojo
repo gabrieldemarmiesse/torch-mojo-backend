@@ -87,16 +87,16 @@ def tmb_native_init(
         var ns = String("aten")
         var key = String("PrivateUse1")
         var lib = external_call["tmb_library_new", Lib](
-            ns.as_c_string_slice().unsafe_ptr(),
-            key.as_c_string_slice().unsafe_ptr(),
+            ns.as_c_string_span().ptr(),
+            key.as_c_string_span().ptr(),
         )
         if Int(lib) == 0:
             raise Error("tmb_library_new failed")
         _register_ops(Int(lib))
         ns = String("torchvision")
         var detection_lib = external_call["tmb_library_new", Lib](
-            ns.as_c_string_slice().unsafe_ptr(),
-            key.as_c_string_slice().unsafe_ptr(),
+            ns.as_c_string_span().ptr(),
+            key.as_c_string_span().ptr(),
         )
         if Int(detection_lib) == 0:
             raise Error("tmb_library_new(torchvision) failed")

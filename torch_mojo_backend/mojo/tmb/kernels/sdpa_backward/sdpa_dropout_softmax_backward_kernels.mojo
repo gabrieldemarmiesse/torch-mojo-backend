@@ -28,10 +28,10 @@ vendor library, or synchronization beyond warp shuffles; launches are enqueued
 asynchronously on the caller's ``DeviceContext``.
 """
 
-from std.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
+from max.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
-from std.gpu.primitives import warp
+from max.gpu.primitives import warp
 from std.math import ceildiv
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.static_tuple import StaticTuple
@@ -71,7 +71,7 @@ def _fused_rows[
     var row_stride = Int(grid_dim.x) * _WARPS_PER_BLOCK
 
     @always_inline
-    @parameter
+    @__parameter
     def _grad_vec(index: Int) -> SIMD[F32, VEC]:
         var d_p = grad_after_dropout.unsafe_load[width=VEC, alignment=ALIGN](
             index
@@ -88,7 +88,7 @@ def _fused_rows[
         return d_p
 
     @always_inline
-    @parameter
+    @__parameter
     def _grad_one(index: Int) -> Float32:
         var d_p = grad_after_dropout[unsafe_offset=index].cast[F32]()
         comptime if has_mask:
@@ -833,7 +833,7 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
         var warp_grid = min(ceildiv(rows, _APPLE_WARPS_PER_BLOCK), 32768)
 
         @always_inline
-        @parameter
+        @__parameter
         def _launch_warp[VPT: Int, HAS_MASK: Bool]() raises:
             comptime if HAS_MASK:
                 _enqueue_cached[_masked_causal_warp_f32[_CVEC, VPT]](
@@ -869,7 +869,7 @@ def enqueue_sdpa_dropout_softmax_backward_f32(
                 )
 
         @always_inline
-        @parameter
+        @__parameter
         def _launch_warp_vpt[HAS_MASK: Bool]() raises:
             if cols <= WARP_SIZE * _CVEC:
                 _launch_warp[1, HAS_MASK]()

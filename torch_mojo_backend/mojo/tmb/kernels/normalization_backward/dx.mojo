@@ -34,12 +34,12 @@ resident) to write dx.  Both kernels handle arbitrary positive rows/cols and
 grid-stride over rows.
 """
 
-from std.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
+from max.gpu import WARP_SIZE, block_idx, grid_dim, lane_id, thread_idx, warp_id
 from max.gpu.host import DeviceContext
-from std.gpu.intrinsics import CacheOperation
+from max.gpu.intrinsics import CacheOperation
 from max.gpu.memory import load as global_load
 from max.gpu.primitives import block
-from std.gpu.primitives import warp
+from max.gpu.primitives import warp
 from std.math import ceildiv
 from std.memory import AddressSpace, stack_allocation
 from std.sys import has_amd_gpu_accelerator

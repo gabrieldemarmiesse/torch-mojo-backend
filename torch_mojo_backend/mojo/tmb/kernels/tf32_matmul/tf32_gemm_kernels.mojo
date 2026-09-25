@@ -38,7 +38,7 @@ strict fallback before this candidate is reached.
 """
 
 from max.gpu.sync import barrier
-from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu import block_idx, grid_dim, thread_idx
 from max.gpu.compute.mma import mma
 from max.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
 from max.gpu.memory import (
@@ -169,7 +169,7 @@ def _tile_body[
             var b_base = b.unsafe_offset(bz * b_bs)
             var c_base = c.unsafe_offset(bz * c_bs)
 
-            @parameter
+            @__parameter
             @always_inline
             def copy_a(ktile: Int, stage: Int):
                 var sa_ptr = smem.unsafe_offset(stage * STAGE_WORDS)
@@ -236,7 +236,7 @@ def _tile_body[
                             else:
                                 dst[unsafe_offset=0] = 0.0
 
-            @parameter
+            @__parameter
             @always_inline
             def copy_b(ktile: Int, stage: Int):
                 var sb_ptr = smem.unsafe_offset(stage * STAGE_WORDS + SA)

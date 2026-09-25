@@ -1,7 +1,7 @@
 # Node-local partials for hierarchical reduce-scatter.
 # Compacted push slots precede the node outputs in the 2*cap staging arena.
 from std.collections import Array
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
 from max.gpu.host import DeviceContext, DeviceStream
 from std.sys import size_of
 from std.utils import StaticTuple

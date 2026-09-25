@@ -55,7 +55,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.sync import barrier
-from std.gpu import block_idx, lane_id, thread_idx, warp_id
+from max.gpu import block_idx, lane_id, thread_idx, warp_id
 from max.gpu.host import DeviceContext
 from std.memory import AddressSpace
 from std.math import ceildiv
@@ -253,7 +253,7 @@ def _apple8_nt_smem_kernel[
     # Both operands are k-contiguous here, so both fills are float4 runs
     # along k; only B's threadgroup store transposes.
     @always_inline
-    @parameter
+    @__parameter
     def _fill_regs(
         kt: Int,
         mut a_regs: Array[SIMD[DType.float32, 4], AV],
@@ -297,7 +297,7 @@ def _apple8_nt_smem_kernel[
     # Register -> threadgroup store for buffer `buf`. B lands transposed:
     # the mma sweep always reads the logical [BK][BN] tile.
     @always_inline
-    @parameter
+    @__parameter
     def _store_smem(
         buf: Int,
         a_regs: Array[SIMD[DType.float32, 4], AV],
@@ -319,7 +319,7 @@ def _apple8_nt_smem_kernel[
 
     # BK/8 8-slab mma sweeps over threadgroup buffer `buf`.
     @always_inline
-    @parameter
+    @__parameter
     def _compute(
         buf: Int,
         mut acc: Array[SIMD[DType.float32, NT_FRAG8], NT_M * NT_N],
@@ -577,7 +577,7 @@ def _apple8_nt_direct_kernel[
     # One 8-slab with every bound checked: ragged M/N subtiles and the K
     # tail (kk + 8 > k_end). Interior full slabs never come through here.
     @always_inline
-    @parameter
+    @__parameter
     def _slab_guarded(
         kk: Int,
         mut acc: Array[SIMD[DType.float32, NT_FRAG8], NT_M * NT_N],
@@ -613,7 +613,7 @@ def _apple8_nt_direct_kernel[
     # Unguarded fragment loads for one 8-slab: vector loads for A (k-major
     # rows), per-n-row scalar pairs for B stored (N, K).
     @always_inline
-    @parameter
+    @__parameter
     def _load_a_fast(
         ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> Array[SIMD[DType.float32, NT_FRAG8], NT_M]:
@@ -627,7 +627,7 @@ def _apple8_nt_direct_kernel[
         return afrag^
 
     @always_inline
-    @parameter
+    @__parameter
     def _load_b_fast(
         bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> Array[SIMD[DType.float32, NT_FRAG8], NT_N]:
@@ -644,7 +644,7 @@ def _apple8_nt_direct_kernel[
         return bfrag^
 
     @always_inline
-    @parameter
+    @__parameter
     def _mma_block(
         afrag: Array[SIMD[DType.float32, NT_FRAG8], NT_M],
         bfrag: Array[SIMD[DType.float32, NT_FRAG8], NT_N],

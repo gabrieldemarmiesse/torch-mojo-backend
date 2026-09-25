@@ -12,7 +12,7 @@ from std.memory import stack_allocation
 from std.memory.alloc import unsafe_alloc
 from std.os import abort
 from max.gpu.sync import barrier
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_dim,
     block_idx,
@@ -386,7 +386,7 @@ def _gemm_pipe_kernel[
     # ---- helpers ----------------------------------------------------------
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(a_ptr, bm, k_end)
     def _load_a_regs(kt: Int, mut regs: Array[SIMD[F32, VEC_A], NA]):
         # Guarded (row, k) loads, zero-padded past m / k_end.
@@ -406,7 +406,7 @@ def _gemm_pipe_kernel[
             regs[t] = vec
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(a_smem, tid)
     def _store_a_smem(buf: Int, regs: Array[SIMD[F32, VEC_A], NA]):
         var base = a_smem.unsafe_offset(buf * BK * BM)
@@ -418,7 +418,7 @@ def _gemm_pipe_kernel[
                 base[unsafe_offset=(ck + u) * BM + mm] = regs[t][u]
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(b_ptr, bn, n, k, k_end)
     def _cpasync_b(kt: Int, buf: Int):
         # B (k, n) row-major: chunks along n, straight into Bs[kk][nn].
@@ -444,7 +444,7 @@ def _gemm_pipe_kernel[
             )
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(b_ptr, bn, n, k, k_end)
     def _load_b_regs(kt: Int, mut regs: Array[SIMD[F32, VEC_B], NB]):
         # transpose_b: B is (n, k) row-major; chunks along k like A.
@@ -464,7 +464,7 @@ def _gemm_pipe_kernel[
             regs[t] = vec
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(b_smem, tid)
     def _store_b_smem(buf: Int, regs: Array[SIMD[F32, VEC_B], NB]):
         var base = b_smem.unsafe_offset(buf * BK * BN)
@@ -476,7 +476,7 @@ def _gemm_pipe_kernel[
                 base[unsafe_offset=(ck + u) * BN + nn] = regs[t][u]
 
     @always_inline
-    @parameter
+    @__parameter
     def _fetch(kt: Int, buf: Int):
         comptime if transpose_b:
             _load_b_regs(kt, b_regs)
@@ -669,7 +669,7 @@ def _gemm_pipe3_kernel[
         return
 
     @always_inline
-    @parameter
+    @__parameter
     def _fetch(s: Int):
         var buf = s % STAGES
         var kt = k_start + s * BK
@@ -897,7 +897,7 @@ def _gemm_smallm_kernel[
     var k4 = k_start + ((k_end - k_start) // KU) * KU
 
     @always_inline
-    @parameter
+    @__parameter
     def _load_b(kk: Int) -> Scalar[DType.float32]:
         comptime if transpose_b:
             return b_ptr[unsafe_offset=col * k + kk].cast[DType.float32]()
@@ -1088,7 +1088,7 @@ def _amd_dynamic_mfma_gemm[
     )
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(c_ptr, n)
     def _edge_store[
         value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
@@ -1110,7 +1110,7 @@ def _amd_dynamic_mfma_gemm[
     var bias_ptr = _make_ptr[dtype](bias_addr).as_imm()
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(c_ptr, bias_ptr, n)
     def _bias_store[
         value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
@@ -1270,7 +1270,7 @@ def _amd_splitk_mfma_kernel[
     )
 
     @always_inline
-    @parameter
+    @__parameter
     def _store[
         value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
     ](coords: IndexList[2], value: SIMD[value_dtype, width]):
@@ -1568,7 +1568,7 @@ def _amd_batched_mfma_kernel[
     # further bound check is needed here.  It exists at all because the core's
     # own store path assumes an NVIDIA staging layout for half-float output.
     @always_inline
-    @parameter
+    @__parameter
     def _store[
         value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
     ](coords: IndexList[2], value: SIMD[value_dtype, width]):
@@ -2461,7 +2461,7 @@ def _nt_mfma_body[
         comptime RegPtr = type_of(areg)
 
         @always_inline
-        @parameter
+        @__parameter
         def _load(kt: Int):
             """Global -> registers for k tile `kt`, then advance the pointers.
 
@@ -2591,7 +2591,7 @@ def _nt_mfma_body[
             b_ptr = b_ptr.unsafe_offset(b_step)
 
         @always_inline
-        @parameter
+        @__parameter
         def _write_row(
             dst: LDSPtr,
             row_base: Int,
@@ -2612,7 +2612,7 @@ def _nt_mfma_body[
         # The interleaved k pair lands contiguously at `2 * x` of pair row `p`,
         # so the whole NT_VEC is still one `ds_write_b128`.
         @always_inline
-        @parameter
+        @__parameter
         def _write_native(
             dst: LDSPtr,
             pair: Int,
@@ -2638,7 +2638,7 @@ def _nt_mfma_body[
                 )
 
         @always_inline
-        @parameter
+        @__parameter
         def _fill(pa: LDSPtr, pb: LDSPtr):
             comptime if A_KMAJOR:
                 comptime for p in range(APASS):
@@ -2695,7 +2695,7 @@ def _nt_mfma_body[
         var bf = stack_allocation[NTL * KSTEPS * 4, dtype]()
 
         @always_inline
-        @parameter
+        @__parameter
         def _read_frags[S0: Int, S1: Int](pa: LDSPtr, pb: LDSPtr):
             # A fragment is the four k elements `8s + 4*hi ..+4` of one tile row,
             # i.e. chunk `2s + hi`, and `2s | hi == 2s ^ hi`, so the swizzled
@@ -2783,7 +2783,7 @@ def _nt_mfma_body[
                             bf.unsafe_store((s * NTL + j) * 4, v)
 
         @always_inline
-        @parameter
+        @__parameter
         def _do_mma[S0: Int, S1: Int]():
             comptime for s in range(S0, S1):
                 comptime for i in range(MT):
@@ -3266,7 +3266,7 @@ def _nt_mfma_gemm[
     var grid = (ceildiv(n, BN), ceildiv(m, BM), parts)
 
     @always_inline
-    @parameter
+    @__parameter
     def _go[MASKED: Bool, BODY2: Bool]() raises:
         comptime if FUSE_BIAS:
             _enqueue_cached[
@@ -3808,7 +3808,7 @@ def _dense_mfma_route[
             s_parts = split
 
     @always_inline
-    @parameter
+    @__parameter
     def _launch[BM: Int, BN: Int, SPLIT_ONLY: Bool = False](parts: Int) raises:
         comptime if not SPLIT_ONLY:
             if parts == 1:
@@ -5615,7 +5615,7 @@ def _apple8_fat_kernel[
     # One 8-slab with every bound checked: ragged M/N subtiles and the K
     # tail (kk + 8 > k_end). Interior full slabs never come through here.
     @always_inline
-    @parameter
+    @__parameter
     def _slab_guarded(
         kk: Int, mut acc: Array[SIMD[DType.float32, FRAG8], NT_M * NT_N]
     ):
@@ -5661,7 +5661,7 @@ def _apple8_fat_kernel[
     # Unguarded fragment loads for one 8-slab: vector A loads, vector B loads
     # for (K, N) storage, per-n-row scalar pairs for transposed (N, K).
     @always_inline
-    @parameter
+    @__parameter
     def _load_a_fast(
         ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> Array[SIMD[DType.float32, FRAG8], NT_M]:
@@ -5682,7 +5682,7 @@ def _apple8_fat_kernel[
         return afrag^
 
     @always_inline
-    @parameter
+    @__parameter
     def _load_b_fast(
         bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> Array[SIMD[DType.float32, FRAG8], NT_N]:
@@ -5702,7 +5702,7 @@ def _apple8_fat_kernel[
         return bfrag^
 
     @always_inline
-    @parameter
+    @__parameter
     def _mma_block(
         afrag: Array[SIMD[DType.float32, FRAG8], NT_M],
         bfrag: Array[SIMD[DType.float32, FRAG8], NT_N],
@@ -6015,7 +6015,7 @@ def _apple8_smem_kernel[
 
     # Device -> register fill for one BK stage at k-offset kt (OOB -> 0).
     @always_inline
-    @parameter
+    @__parameter
     def _fill_regs(
         kt: Int,
         mut a_regs: Array[SIMD[DType.float32, 4], AV],
@@ -6096,7 +6096,7 @@ def _apple8_smem_kernel[
 
     # Register -> threadgroup store for buffer `buf`.
     @always_inline
-    @parameter
+    @__parameter
     def _store_smem(
         buf: Int,
         a_regs: Array[SIMD[DType.float32, 4], AV],
@@ -6129,7 +6129,7 @@ def _apple8_smem_kernel[
 
     # Two 8-slab mma sweeps over threadgroup buffer `buf`.
     @always_inline
-    @parameter
+    @__parameter
     def _compute(
         buf: Int,
         mut acc: Array[SIMD[DType.float32, FRAG8], NT_M * NT_N],
@@ -6705,7 +6705,7 @@ def _bias_add_row[
     var bias_ptr = _make_ptr[dtype](bias_addr)
 
     @always_inline
-    @parameter
+    @__parameter
     @__copy_capture(out_ptr, bias_ptr)
     def func[width: Int, alignment: Int = 1](idx: StdCoord):
         var i = Int(idx[0].value())

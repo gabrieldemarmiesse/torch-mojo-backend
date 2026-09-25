@@ -8,7 +8,7 @@
 # import them without a cycle through the extension entry module.
 # ===----------------------------------------------------------------------=== #
 
-from std.gpu import block_idx, thread_idx
+from max.gpu import block_idx, thread_idx
 from std.sys.info import has_apple_gpu_accelerator
 
 # Aim for a few blocks per SM when choosing split-K factors (H100: 114 SMs).

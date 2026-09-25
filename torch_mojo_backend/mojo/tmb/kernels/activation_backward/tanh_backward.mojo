@@ -1,5 +1,5 @@
 from max.gpu.host import DeviceContext
-from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from std.sys.info import _has_sm_9x
 from tmb.kernels.common.op_utils import _enqueue_cached, _make_ptr

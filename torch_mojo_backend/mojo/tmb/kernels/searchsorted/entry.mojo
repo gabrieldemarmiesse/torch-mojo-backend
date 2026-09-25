@@ -11,7 +11,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_dim,
     block_idx,
@@ -216,7 +216,7 @@ def _dispatch_searchsorted[
     ctx: DeviceContext,
 ) raises:
     @always_inline
-    @parameter
+    @__parameter
     def _run[d1: Bool, sorter: Bool, upper: Bool]() raises:
         _searchsorted[dtype, out_dtype, d1, sorter, upper](
             out_addr,

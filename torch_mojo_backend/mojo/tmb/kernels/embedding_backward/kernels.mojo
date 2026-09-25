@@ -52,7 +52,7 @@ zeroes the complete output.
 from std.atomic import Atomic, Ordering
 from std.ffi import _get_global_or_null, external_call
 from max.gpu.sync import barrier
-from std.gpu import block_idx, grid_dim, thread_idx
+from max.gpu import block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceAttribute, DeviceContext
 from std.math import ceildiv
 from std.memory import AddressSpace, stack_allocation
@@ -126,7 +126,7 @@ def _device_scope() -> StaticString:
 def _atomic_add_f32(
     ptr: Pointer[Scalar[DType.float32], MutAnyOrigin], value: Float32
 ):
-    _ = Atomic[DType.float32, scope=_device_scope()].fetch_add[
+    _ = Atomic[Scalar[DType.float32], scope=_device_scope()].fetch_add[
         ordering=Ordering.RELAXED
     ](ptr, value)
 
@@ -283,7 +283,7 @@ def _count(
     while index < num_indices:
         var target = Int(indices[unsafe_offset=index])
         if target != padding_idx:
-            _ = Atomic[DType.int32, scope=_device_scope()].fetch_add[
+            _ = Atomic[Scalar[DType.int32], scope=_device_scope()].fetch_add[
                 ordering=Ordering.RELAXED
             ](counts.unsafe_offset(target), 1)
         index += stride
@@ -516,14 +516,16 @@ def _table_accum(
                 ]
             comptime for u in range(_TABLE_UNROLL):
                 if t[u] != padding_idx:
-                    _ = Atomic[DType.float32].fetch_add[
+                    _ = Atomic[Scalar[DType.float32]].fetch_add[
                         ordering=Ordering.RELAXED
                     ](table.unsafe_offset(t[u] * _TABLE_COLS + tx), v[u])
             row += _TABLE_UNROLL * _TABLE_ROWG
         while row < row_end:
             var t = Int(indices[unsafe_offset=row])
             if t != padding_idx:
-                _ = Atomic[DType.float32].fetch_add[ordering=Ordering.RELAXED](
+                _ = Atomic[Scalar[DType.float32]].fetch_add[
+                    ordering=Ordering.RELAXED
+                ](
                     table.unsafe_offset(t * _TABLE_COLS + tx),
                     grad_output[unsafe_offset=row * embedding_dim + col],
                 )

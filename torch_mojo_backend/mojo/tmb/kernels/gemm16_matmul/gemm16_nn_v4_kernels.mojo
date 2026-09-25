@@ -48,7 +48,7 @@ never selects them; `_v4_mma_tile` alone IS width-generic, because the
 float32 NT split-K route in gemm16_tn_v4_kernels.mojo shares it.
 """
 
-from std.gpu import (
+from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
     grid_dim,
@@ -67,7 +67,7 @@ from max.gpu.host import (
     FuncAttribute,
 )
 from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
+from max.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import (
     external_memory,
     fence_async_view_proxy,

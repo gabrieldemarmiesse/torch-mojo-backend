@@ -2,8 +2,8 @@
 
 from max.gpu.host import DeviceBuffer, DeviceContext
 from std.atomic import Atomic, Ordering
-from std.gpu import block_idx, grid_dim, thread_idx
-from std.gpu.intrinsics import mulhi
+from max.gpu import block_idx, grid_dim, thread_idx
+from max.gpu.intrinsics import mulhi
 from std.sys import (
     is_amd_gpu,
     is_nvidia_gpu,
@@ -427,7 +427,7 @@ def _scope() -> StaticString:
 
 @always_inline
 def _add[dt: DType](ptr: Pointer[Scalar[dt], MutAnyOrigin], value: Scalar[dt]):
-    _ = Atomic[dt, scope=_scope()].fetch_add[ordering=Ordering.RELAXED](
+    _ = Atomic[Scalar[dt], scope=_scope()].fetch_add[ordering=Ordering.RELAXED](
         ptr, value
     )
 
@@ -1009,7 +1009,7 @@ def _ps_add[
             var desired = (
                 (expected + value.cast[storage]()).cast[dt]().cast[storage]()
             )
-            if Atomic[storage].compare_exchange[
+            if Atomic[Scalar[storage]].compare_exchange[
                 success_ordering=Ordering.RELAXED,
                 failure_ordering=Ordering.RELAXED,
                 weak=True,
