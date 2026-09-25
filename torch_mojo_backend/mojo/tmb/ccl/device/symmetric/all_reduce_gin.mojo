@@ -1,3 +1,5 @@
+# Rewrite of: none (mojoccl-only: NCCL ships reduce_scatter_gin/all_gather_gin but no all-reduce one). Closest: https://github.com/NVIDIA/nccl/blob/master/src/device/symmetric/reduce_scatter_gin.cuh
+#
 # The pipelined multi-node allreduce as ONE kernel launch.
 #
 # Same schedule as the split path agents_docs/distributed.md describes -- K chunks,
@@ -19,13 +21,14 @@
 #     the launcher never asks for more blocks than multiprocessors.
 #   * the proxy request and the completion wait: block 0 / thread 0 stores
 #     into and spins on the same pinned mailbox the two one-thread kernels
-#     used, so `internode.mojo`'s progress thread is untouched.
+#     used, so `transport/net.mojo`'s progress thread is untouched.
 #   * the inbox credit: `MB_CONSUMED` is stored after the add has RUN, which
 #     is the fact the credit asserts (the split path could only say "the add
 #     is enqueued" and rely on stream order).
 
-from std.atomic import Atomic, Ordering
 from std.collections import Array
+from std.atomic import Atomic, Ordering
+from max.gpu.host import DeviceContext, DeviceStream
 from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
@@ -33,11 +36,27 @@ from max.gpu import (
     grid_dim,
     thread_idx,
 )
-from std.sys import size_of
 from std.utils import StaticTuple
-from max.gpu.host import DeviceContext, DeviceStream
+from std.sys import size_of
 
-from tmb.ccl.collectives_kernels import (
+from tmb.ccl.device.common import (
+    _cached_occupancy,
+    _enqueue_cached_dim,
+    abort_raised,
+    device_now_ns,
+    latch_arena_error,
+    publish_fault,
+    status_page,
+)
+from tmb.ccl.device.symmetric.all_reduce import _ag_finish_body, _rs_stage_body
+from tmb.ccl.device.symmetric.gin_scratch import _inbox_add_body
+from tmb.ccl.device.symmetric.primitives import (
+    _region_ptrs,
+    _shard_cnt,
+    _shard_off,
+    _shard_per,
+)
+from tmb.ccl.include.device import (
     ERR_FUSED_GRID,
     ERR_PROXY_WAIT,
     FAULT_NO_PEER,
@@ -46,25 +65,12 @@ from tmb.ccl.collectives_kernels import (
     PHASES_PER_GEN,
     _GFX942,
     _SIGNAL_BYTES,
-    _ag_finish_body,
     _align_up,
-    _cached_occupancy,
-    _enqueue_cached_dim,
-    _region_ptrs,
-    _rs_stage_body,
-    _shard_cnt,
-    _shard_off,
-    _shard_per,
-    abort_raised,
-    device_now_ns,
-    grid_barrier,
-    latch_arena_error,
     poison_offset,
-    publish_fault,
-    status_page,
 )
-from tmb.ccl.internode import EMPTY_SHARD_BYTES
-from tmb.ccl.internode_kernels import _inbox_add_body
+from tmb.ccl.include.nccl_device.lsa_barrier import grid_barrier
+from tmb.ccl.transport.net import EMPTY_SHARD_BYTES
+
 
 # Geometry of the fused kernel. Compile-time because the register budget
 # follows from it; the block caps below select the measured hardware defaults.

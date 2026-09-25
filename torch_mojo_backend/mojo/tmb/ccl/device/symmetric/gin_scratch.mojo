@@ -1,33 +1,34 @@
+# Rewrite of: https://github.com/NVIDIA/nccl/blob/master/src/device/symmetric/gin_scratch.h
+#   also:     https://github.com/NVIDIA/nccl/blob/master/src/include/nccl_device/gin/proxy/gin_proxy.h
+#
 # The three device kernels the inter-node hop needs on top of
-# collectives_kernels.mojo, which is untouched.
+# the intra-node kernels of device/symmetric/, which are untouched.
 #
 # None of them synchronizes with anything: stream order does it. Each runs
-# after the host callback that put the network data in place (internode.mojo)
+# after the host callback that put the network data in place (transport/net.mojo)
 # and before the intra-node collective that consumes the result, so there is
 # no flag protocol here and no peer pointer -- every address is inside this
 # rank's own region or its own user buffers.
 
 from std.atomic import Atomic, Ordering
-from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
-from tmb.ccl.collectives_kernels import device_now_ns
-from std.sys import size_of
-from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
+from std.utils import StaticTuple
+from std.sys import size_of
 
-from tmb.ccl.collectives_kernels import (
-    BLOCK,
-    ERR_PROXY_WAIT,
-    FAULT_NO_PEER,
-    MAX_WORLD,
+from tmb.ccl.device.common import (
     _POLL_ORDER,
-    _copy_bytes,
     _enqueue_cached,
     abort_raised,
+    device_now_ns,
     latch_arena_error,
     poll_acquire,
     poll_pause,
     publish_fault,
 )
+from tmb.ccl.device.symmetric.data_ops import _copy_bytes
+from tmb.ccl.include.device import BLOCK, ERR_PROXY_WAIT, FAULT_NO_PEER
+
 
 comptime _UNROLL = 4
 comptime _MAX_BLOCKS = 432
@@ -90,7 +91,7 @@ def _inbox_add_body[
     stride: Int,
 ):
     """`_inbox_add_kernel`'s body, shared with the fused inter-node kernel
-    (internode_fused.mojo), which runs it once per chunk on its own
+    (all_reduce_gin.mojo), which runs it once per chunk on its own
     grid-stride slice."""
     var nv = n // W
 
@@ -125,7 +126,7 @@ def _proxy_request_kernel(mailbox: Pointer[UInt64, MutAnyOrigin], seq: UInt64):
     thread is about to send -- is visible to the CPU that acquires it.
 
     One store and nothing else: the stopped-communicator guard lives on the
-    thread that acquires this store (`internode._proxy_main`, which says why
+    thread that acquires this store (`proxy._proxy_main`, which says why
     that is the stronger place), not in front of it, where each load of the
     pinned status page cost a PCIe round trip per exchange.
     """
@@ -166,7 +167,7 @@ def _proxy_wait_kernel(
     An already-latched fault leaves the same way an abort does -- it raises
     the same word (`publish_fault`) -- and for the same reason: after the
     first failure the progress thread stops honouring the mailbox
-    (`internode._proxy_main`), so every wait still queued behind it is
+    (`proxy._proxy_main`), so every wait still queued behind it is
     waiting for an exchange that will never be asked for, and waiting a full
     deadline each would turn one 60 s stall into as many, one per chunk.
 

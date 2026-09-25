@@ -1,3 +1,5 @@
+# Rewrite of: none (mojoccl-only: the project's env-var registry). Closest: https://github.com/NVIDIA/nccl/blob/master/src/param/param_registry.cc
+#
 # Every environment variable mojoccl reads, in one place.
 #
 # One constant per variable, named exactly like the variable, so a `getenv`

@@ -1,3 +1,5 @@
+# Rewrite of: https://github.com/NVIDIA/nccl/blob/master/src/device/all_reduce.h
+#
 # NVLS (NVSwitch multicast) allreduce: the one collective in this library
 # whose traffic goes through the switch's reduction engine instead of over
 # unicast NVLink.
@@ -9,7 +11,7 @@
 # all of them because this is library code:
 #
 #   * the counters live in the region's existing signal area (the first page,
-#     which collectives_kernels.mojo reserves) instead of a private header, so
+#     which include/device.mojo reserves) instead of a private header, so
 #     the unicast kernels and this one share one region;
 #   * they are UInt64, not UInt32 -- the prototype's u32 would wrap after
 #     ~10^8 calls, about a day of DDP;
@@ -25,7 +27,7 @@
 # all-gather -- 1.75x less at world 8 -- paid for with ~1.5x the HBM traffic,
 # which is why it only wins above `NVLS_MIN_BYTES` (48 MiB, measured).
 #
-# The region must be VMM memory bound to a multicast object (vmm.mojo); `mc`
+# The region must be VMM memory bound to a multicast object (transport/nvls.mojo); `mc`
 # is the multicast VA, which only `multimem.*` may touch, and `uc` is a plain
 # mapping of the same physical bytes, which is what the copies and the flag
 # spin use. Everything here is behind `NVLS_ARCH` (sm_90+, where `multimem`
@@ -33,45 +35,42 @@
 # up; AMD and pre-Hopper NVIDIA keep the unicast kernels.
 #
 # Builds for both targets:
-#   uv run --no-sync mojo build nvls_kernels.mojo --target-accelerator sm_90a
-#   uv run --no-sync mojo build nvls_kernels.mojo --target-accelerator gfx942
+#   uv run --no-sync mojo build device/all_reduce.mojo --target-accelerator sm_90a
+#   uv run --no-sync mojo build device/all_reduce.mojo --target-accelerator gfx942
 
-from std.atomic import Atomic, Ordering
-from max.gpu import (
-    MAX_THREADS_PER_BLOCK_METADATA,
-    block_idx,
-    global_idx,
-    grid_dim,
-    thread_idx,
-)
-from max.gpu.intrinsics import Scope
 from std.memory import AddressSpace, stack_allocation
-from std.sys import size_of
-from std.sys._assembly import inlined_assembly
-from std.sys.info import _has_sm_9x_or_newer
-from std.time import global_perf_counter_ns
-from std.utils import StaticTuple
-from max.gpu.host import DeviceContext, DeviceStream
+from std.atomic import Atomic, Ordering
 from max.gpu.memory import (
     Consistency,
     ReduceOp,
     multimem_ld_reduce,
     multimem_st,
 )
+from max.gpu.host import DeviceContext, DeviceStream
+from max.gpu import (
+    MAX_THREADS_PER_BLOCK_METADATA,
+    block_idx,
+    grid_dim,
+    thread_idx,
+)
+from max.gpu.intrinsics import Scope
+from std.utils import StaticTuple
+from std.sys.info import _has_sm_9x_or_newer
 from max.gpu.sync import barrier
+from std.time import global_perf_counter_ns
+from std.sys._assembly import inlined_assembly
+from std.sys import size_of
 
-from tmb.ccl.collectives_kernels import (
-    BLOCK,
-    FAULT_NO_PEER,
+from tmb.ccl.device.common import (
     _abort_raised,
     _enqueue_cached,
     abort_raised,
     latch_arena_error,
     publish_fault,
-    signal_bytes,
     spin_timeout_ns,
     status_page,
 )
+from tmb.ccl.include.device import BLOCK, FAULT_NO_PEER, signal_bytes
 
 
 comptime NVLS_ARCH = _has_sm_9x_or_newer()
@@ -81,7 +80,7 @@ none of it; `nvls_available()` is the runtime half of the same gate."""
 
 # ===-------------------------------------------------------------------=== #
 # Region geometry. The three counters live in the first page of the signal
-# area, which collectives_kernels.mojo holds free next to the error word at
+# area, which include/device.mojo holds free next to the error word at
 # offset 0 (its own flag matrix starts at 4096).
 # ===-------------------------------------------------------------------=== #
 
@@ -94,7 +93,7 @@ comptime RELEASE_OFF = 192
 
 comptime ERR_NVLS_SYNC = 6
 """Error code written to the region's error word on a barrier timeout;
-continues collectives_kernels.mojo's ERR_* numbering."""
+continues include/device.mojo's ERR_* numbering."""
 
 comptime NVLS_MIN_BYTES = 48 * 1024 * 1024
 """Below this the unicast push/reduce/pull kernels win and keep the traffic.
@@ -148,7 +147,7 @@ comptime _SPIN_CHECK = 4096
 
 def nvls_available() -> Bool:
     """Whether this build can emit `multimem` at all. The communicator also
-    has to have brought a multicast region up; see vmm.mojo."""
+    has to have brought a multicast region up; see transport/nvls.mojo."""
     return NVLS_ARCH
 
 

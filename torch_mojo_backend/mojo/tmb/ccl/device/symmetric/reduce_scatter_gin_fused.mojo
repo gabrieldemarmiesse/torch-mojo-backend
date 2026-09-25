@@ -1,6 +1,10 @@
+# Rewrite of: none (mojoccl-only: one-launch pipelined variant of the hierarchical reduce-scatter). Closest: https://github.com/NVIDIA/nccl/blob/master/src/device/symmetric/reduce_scatter_gin.cuh
+#
 # Hierarchical fp32 reduce-scatter, including every pipelined chunk, in one launch.
-from std.atomic import Atomic, Ordering
+
 from std.collections import Array
+from std.atomic import Atomic, Ordering
+from max.gpu.host import DeviceContext, DeviceStream
 from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
@@ -9,31 +13,34 @@ from max.gpu import (
     thread_idx,
 )
 from std.utils import StaticTuple
-from max.gpu.host import DeviceContext, DeviceStream
-from tmb.ccl.netutil import MAX_NODES
-from tmb.ccl.reduce_scatter.multinode import _rs_nodes_body
-from tmb.ccl.internode import WORK_SLOTS
-from tmb.ccl.internode_fused import (
-    _await_exchange,
-    _give_up,
-    _GRID_GRACE_NS,
-    FUSED_THREADS,
-)
-from tmb.ccl.collectives_kernels import (
-    MAX_WORLD,
-    MAX_BLOCKS,
-    PHASES_PER_GEN,
-    ERR_FUSED_GRID,
-    _SIGNAL_BYTES,
-    _align_up,
-    _region_ptrs,
+
+from tmb.ccl.device.common import (
     _cached_occupancy,
     _enqueue_cached_dim,
     device_now_ns,
-    grid_barrier,
     status_page,
+)
+from tmb.ccl.device.symmetric.all_reduce_gin import (
+    FUSED_THREADS,
+    _GRID_GRACE_NS,
+    _await_exchange,
+    _give_up,
+)
+from tmb.ccl.device.symmetric.primitives import _region_ptrs
+from tmb.ccl.device.symmetric.reduce_scatter_gin import _rs_nodes_body
+from tmb.ccl.include.device import (
+    ERR_FUSED_GRID,
+    MAX_BLOCKS,
+    MAX_WORLD,
+    PHASES_PER_GEN,
+    _SIGNAL_BYTES,
+    _align_up,
     poison_offset,
 )
+from tmb.ccl.include.nccl_device.lsa_barrier import grid_barrier
+from tmb.ccl.include.plugin.nccl_net import MAX_NODES
+from tmb.ccl.transport.net import WORK_SLOTS
+
 
 comptime RS_FUSED_THREADS = FUSED_THREADS
 """Threads per block, the allreduce's. 256 was measured and not taken: at

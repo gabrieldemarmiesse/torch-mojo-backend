@@ -1,34 +1,39 @@
+# Rewrite of: https://github.com/NVIDIA/nccl/blob/master/src/device/symmetric/reduce_scatter_gin.cuh
+#
 # Node-local partials for hierarchical reduce-scatter.
 # Compacted push slots precede the node outputs in the 2*cap staging arena.
+
 from std.collections import Array
-from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
 from max.gpu.host import DeviceContext, DeviceStream
-from std.sys import size_of
+from max.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
 from std.utils import StaticTuple
-from tmb.ccl.netutil import MAX_NODES
-from tmb.ccl.collectives_kernels import (
+from std.sys import size_of
+
+from tmb.ccl.device.common import (
+    _enqueue_cached,
+    device_now_ns,
+    spin_timeout_ns,
+)
+from tmb.ccl.device.symmetric.data_ops import _copy_span_flex, _share
+from tmb.ccl.device.symmetric.primitives import (
+    _check_common,
+    _peer_step,
+    _region_ptrs,
+)
+from tmb.ccl.device.symmetric.reduce_scatter import _rs_one, _rs_slot
+from tmb.ccl.include.device import (
     BLOCK,
-    MAX_WORLD,
     ERR_REDUCE_SCATTER_SYNC,
-    _SIGNAL_BYTES,
-    _UNROLL,
+    MAX_WORLD,
     _AR_BIG_BLOCKS,
     _AR_BIG_BYTES,
     _AR_MAX_BLOCKS,
-    _sync,
-    _peer_step,
-    _copy_span_flex,
-    _share,
-    _rs_slot,
-    _rs_one,
-    _enqueue_cached,
+    _SIGNAL_BYTES,
+    _UNROLL,
     _align_up,
-    _flag_target,
-    spin_timeout_ns,
-    device_now_ns,
-    _check_common,
-    _region_ptrs,
 )
+from tmb.ccl.include.nccl_device.lsa_barrier import _flag_target, _sync
+from tmb.ccl.include.plugin.nccl_net import MAX_NODES
 
 
 @__llvm_metadata(

@@ -1,10 +1,12 @@
+# Rewrite of: none (mojoccl-only: NCCL reaches libfabric only through the external aws-ofi-nccl net plugin, https://github.com/aws/aws-ofi-nccl). Closest: https://github.com/NVIDIA/nccl/blob/master/src/transport/net_ib/p2p.cc
+#
 # libfabric bindings for mojoccl's inter-node hop -- the second transport,
 # for fabrics that libibverbs cannot see. Written for and measured against
 # the HPE Slingshot `cxi` provider (Adastra/CINES MI300A nodes have four
 # /dev/cxi NICs and no /dev/infiniband at all), but nothing here is
 # cxi-specific beyond the provider preference.
 #
-# Same two calling conventions as `ibverbs.mojo`, for the same reason:
+# Same two calling conventions as `misc/ibvwrap.mojo`, for the same reason:
 #
 #  * control path -- real exported symbols (fi_getinfo, fi_freeinfo,
 #    fi_fabric, fi_version, fi_strerror), reached with
@@ -14,7 +16,7 @@
 #    inline` in <rdma/fi_*.h> and dispatch through the ops table hanging off
 #    the object: `ep->rma->writemsg`, `ep->msg->sendmsg`, `cq->ops->read`,
 #    `domain->mr->regattr`, `fid->ops->bind`. This file hand-writes those
-#    dereferences over raw byte offsets, exactly as ibverbs.mojo does for
+#    dereferences over raw byte offsets, exactly as misc/ibvwrap.mojo does for
 #    `qp->context->ops.post_send`.
 #
 # Every offset, size and constant below was dumped by
@@ -60,15 +62,23 @@
 
 from std.ffi import OwnedDLHandle
 from std.os import getenv
-from std.sys import size_of
 from std.time import perf_counter_ns, sleep
+from std.sys import size_of
 
 from tmb.ccl.env_vars import (
     MOJOCCL_FABRIC_DOMAIN,
     MOJOCCL_FABRIC_PROVIDER,
     MOJOCCL_LIBFABRIC,
 )
-from tmb.ccl.netutil import (
+from tmb.ccl.graph.topo import pci_pick
+from tmb.ccl.include.plugin.nccl_net import (
+    NC_FLUSH,
+    NC_OTHER,
+    NC_RECV,
+    NC_SEND,
+    NetCompletion,
+)
+from tmb.ccl.misc.utils import (
     P8,
     alloc_bytes,
     as_fn,
@@ -78,18 +88,13 @@ from tmb.ccl.netutil import (
     ld64,
     ldu32,
     ldu64,
-    pci_pick,
     read_c_string,
     st32,
     st64,
     stu32,
     stu64,
-    NC_FLUSH,
-    NC_OTHER,
-    NC_RECV,
-    NC_SEND,
-    NetCompletion,
 )
+
 
 # ---- struct sizes (fabric_abi.c) -----------------------------------------
 comptime SZ_FI_INFO = 120
@@ -818,7 +823,7 @@ def _info_prov_name(info: Int) -> String:
 
 def fabric_available() -> Bool:
     """True if libfabric opens and offers at least one RMA-capable RDM
-    provider. Used by the backend auto-selection in `internode.mojo`; the
+    provider. Used by the backend auto-selection in `transport/net.mojo`; the
     resources it opens are released before it returns.
     """
     try:
@@ -1391,7 +1396,7 @@ def fab_setup(
 # ===-------------------------------------------------------------------=== #
 #
 # Laid out inside the same fixed-size per-rank blob the verbs path uses (see
-# `IB_BLOB_BYTES` in internode.mojo); only one of the two transports is ever
+# `IB_BLOB_BYTES` in transport/net.mojo); only one of the two transports is ever
 # active in a job, so the two layouts do not have to coexist.
 #
 #   +0   u64 region base VA   (meaningful only under FI_MR_VIRT_ADDR)
