@@ -1248,8 +1248,6 @@ that only produce CPU tensors are unaffected and run normally, with
 Keep device work out of the dataset and in the main process.</p>
 <h2 id="not-supported">Not supported<a class="headerlink" href="#not-supported" title="Permanent link">&para;</a></h2>
 <ul>
-<li><code>torch.accelerator.get_device_capability()</code> raises
-  <code>RuntimeError: Backend doesn't support getting device capabilities.</code></li>
 <li><code>torch.amp.GradScaler</code> on Apple GPUs, see <a href="#mixed-precision">Mixed precision</a>.</li>
 <li>CUDA graphs (<code>torch.cuda.graph</code>, <code>CUDAGraph</code>, <code>make_graphed_callables</code>) have
   no equivalent.</li>
