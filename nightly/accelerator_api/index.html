@@ -1007,13 +1007,6 @@ same GPU. Tensors created with a hard-coded <code>"cuda"</code> cannot be combin
 with accelerator tensors, and copying between the two raises
 <code>NotImplementedError</code>. Take every device from <code>torch.accelerator</code>.</p>
 </div>
-<div class="admonition warning">
-<p class="admonition-title">Printing floating-point tensors</p>
-<p><code>print(t)</code> on a floating-point accelerator tensor currently raises
-<code>NotImplementedError</code>: PyTorch's tensor formatter calls <code>masked_select</code>,
-which the backend does not implement yet. Print <code>t.cpu()</code> instead.
-Integer and boolean tensors print directly.</p>
-</div>
 <h2 id="selecting-a-gpu">Selecting a GPU<a class="headerlink" href="#selecting-a-gpu" title="Permanent link">&para;</a></h2>
 <p>A device without an index means the current device, as with <code>"cuda"</code>.
 Select another one with <code>torch.accelerator.device_index(i)</code> (a context
