@@ -2,18 +2,18 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://gabrieldemarmiesse.github.io/torch-mojo-backend/stable/</loc>
-         <lastmod>2026-09-24</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://gabrieldemarmiesse.github.io/torch-mojo-backend/stable/accelerator_api/</loc>
-         <lastmod>2026-09-24</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://gabrieldemarmiesse.github.io/torch-mojo-backend/stable/distributed_training/</loc>
-         <lastmod>2026-09-24</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://gabrieldemarmiesse.github.io/torch-mojo-backend/stable/streams_and_events/</loc>
-         <lastmod>2026-09-24</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
 </urlset>
