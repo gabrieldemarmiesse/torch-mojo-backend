@@ -318,6 +318,37 @@ comptime UOP_GELU_TANH = 25
 comptime UOP_LOG2 = 26
 
 
+@always_inline
+def _unary_is_direct[op_code: Int]() -> Bool:
+    """RELU / ABS / NEG / SIGN: computed in the tensor dtype, integers too."""
+    return (
+        op_code == UOP_RELU
+        or op_code == UOP_ABS
+        or op_code == UOP_NEG
+        or op_code == UOP_SIGN
+    )
+
+
+@always_inline
+def _unary_float64_on[op_code: Int]() -> Bool:
+    """Whether `op_code` takes float64: the dtype gate admits it and the
+    float64 route of `_unary_elementwise` instantiates its kernel.
+
+    Both read this one list so they cannot drift apart: the float64 kernel of
+    an opcode outside it must not be built, because float64 acos, atanh, cos,
+    sin, sinh and tan have no GPU lowering (std.math: "libm operations are
+    only available on CPU targets", "DType.float64 is not supported for cos
+    on NVIDIA GPU"; LLVM on AMD: "Cannot select: f64 = fcos").
+    """
+    return (
+        _unary_is_direct[op_code]()
+        or op_code == UOP_LOG2
+        or op_code == UOP_RECIPROCAL
+        or op_code == UOP_CEIL
+        or op_code == UOP_FLOOR
+    )
+
+
 def _unary_contig_kernel[
     dtype: DType, op_code: Int
 ](
@@ -490,12 +521,7 @@ def _unary_elementwise[
     size: Int,
     ctx: DeviceContext,
 ) raises:
-    comptime is_direct = (
-        op_code == UOP_RELU
-        or op_code == UOP_ABS
-        or op_code == UOP_NEG
-        or op_code == UOP_SIGN
-    )
+    comptime is_direct = _unary_is_direct[op_code]()
     comptime if not is_direct and not dtype.is_floating_point():
         # Transcendentals / ceil / floor / gelu require a float dtype; the
         # Python side already gates on this, so this only ever fires as a
@@ -611,12 +637,13 @@ def _unary_elementwise[
                 ](Int(out_ptr), Int(in_ptr), size, ctx):
                     return
             comptime if (
-                op_code == UOP_LOG2 or dtype == DType.float64
+                op_code == UOP_LOG2
+                or (dtype == DType.float64 and _unary_float64_on[op_code]())
             ) and not has_apple_gpu_accelerator():
                 # Preserve log2's upstream scalar fallback, including
                 # float64; the existing unary ops keep their 4-wide route.
                 # Every float64 op the dtype gate admits lands here too
-                # (abs/neg/sign/relu, reciprocal): only Apple GPUs lack it.
+                # (`_unary_float64_on`): only Apple GPUs lack it.
                 _enqueue_cached[_unary_contig_kernel[dtype, op_code]](
                     ctx,
                     _gs_blocks(size),
@@ -1133,24 +1160,14 @@ def _unary_spec_into_go[op_code: Int](a_o: Arg, out_o: Arg) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
 
-    comptime is_direct = (
-        op_code == UOP_RELU
-        or op_code == UOP_ABS
-        or op_code == UOP_NEG
-        or op_code == UOP_SIGN
-    )
+    comptime is_direct = _unary_is_direct[op_code]()
     var supported = False
-    comptime if (
-        op_code == UOP_LOG2
-        or op_code == UOP_RECIPROCAL
-        or op_code == UOP_CEIL
-        or op_code == UOP_FLOOR
-    ):
+    comptime if is_direct:
+        supported = _dtype_supported[SPEC_UNARY_DTYPES](a.dtype)
+    elif _unary_float64_on[op_code]():
         supported = _dtype_supported[
             [DType.float16, DType.bfloat16, DType.float32, DType.float64]
         ](a.dtype)
-    elif is_direct:
-        supported = _dtype_supported[SPEC_UNARY_DTYPES](a.dtype)
     else:
         supported = _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype)
     if not supported:
