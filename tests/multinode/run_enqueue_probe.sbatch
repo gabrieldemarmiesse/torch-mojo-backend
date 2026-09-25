@@ -57,7 +57,7 @@ set_ccl() {  # $1 = vendor|mojo
 echo "=== ddp_buckets (GPT-2 XL) ==="
 set_ccl mojo
 BUCKLOG="$LOGDIR/mojoccl_probe_${SLURM_JOB_ID}_buckets.log"
-srun --nodes=1 --ntasks=1 --gres=gpu:8 bash -c "flock /tmp/gpu_lock_0.lock uv run --no-sync torchrun \
+srun --nodes=1 --ntasks=1 --gres=gpu:8 bash -c "uv run --no-sync torchrun \
     --standalone --nproc-per-node=1 \
     tests/multinode/ddp_buckets.py --nanogpt-path $NANOGPT $XL" \
   2>&1 | tee "$BUCKLOG" | grep -E "^RESULT|Error|Traceback"
@@ -72,7 +72,7 @@ run_enqueue() {  # $1 = ccl, $2 = leg
   echo "=== enqueue_bench ccl=$1 leg=$2 ==="
   set_ccl "$1"
   local log="$LOGDIR/mojoccl_probe_${SLURM_JOB_ID}_enqueue_${1}_leg${2}.log"
-  srun bash -c "flock /tmp/gpu_lock_0.lock uv run --no-sync torchrun \
+  srun bash -c "uv run --no-sync torchrun \
       --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d \
       --rdzv-endpoint=$MASTER_ADDR:29611 --rdzv-id=\$SLURM_JOB_ID-eq-$1-$2 \
       tests/multinode/enqueue_bench.py" \
@@ -89,7 +89,7 @@ run_buckets() {  # $1 = ccl
   echo "=== bucket_loop ccl=$1 ==="
   set_ccl "$1"
   local log="$LOGDIR/mojoccl_probe_${SLURM_JOB_ID}_bucketloop_${1}.log"
-  srun bash -c "BUCKETS=$BUCKETS STEPS=20 MM=1 flock /tmp/gpu_lock_0.lock \
+  srun bash -c "BUCKETS=$BUCKETS STEPS=20 MM=1 \
       uv run --no-sync torchrun \
       --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d \
       --rdzv-endpoint=$MASTER_ADDR:29612 --rdzv-id=\$SLURM_JOB_ID-bl-$1 \
@@ -104,7 +104,7 @@ run_buckets mojo
 echo "=== nanogpt_ddp GPT-2 XL, mojoccl, MOJOCCL_IB_TRACE=1 ==="
 set_ccl mojo
 TRLOG="$LOGDIR/mojoccl_probe_${SLURM_JOB_ID}_ibtrace.log"
-srun bash -c "MOJOCCL_IB_TRACE=1 flock /tmp/gpu_lock_0.lock uv run --no-sync torchrun \
+srun bash -c "MOJOCCL_IB_TRACE=1 uv run --no-sync torchrun \
     --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d \
     --rdzv-endpoint=$MASTER_ADDR:29613 --rdzv-id=\$SLURM_JOB_ID-tr \
     tests/multinode/rank_bind.py --device mojo --nanogpt-path $NANOGPT \
@@ -118,7 +118,7 @@ echo "=== ibtrace exit: ${PIPESTATUS[0]} ==="
 
 # --- broadcast burst (work-ring back-pressure) -----------------------------
 echo "=== ring_pressure (mojoccl) ==="
-srun bash -c "N=1500 MIB=4 MOJOCCL_IB_TRACE=1 flock /tmp/gpu_lock_0.lock \
+srun bash -c "N=1500 MIB=4 MOJOCCL_IB_TRACE=1 \
     uv run --no-sync torchrun \
     --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d \
     --rdzv-endpoint=$MASTER_ADDR:29614 --rdzv-id=\$SLURM_JOB_ID-rp \

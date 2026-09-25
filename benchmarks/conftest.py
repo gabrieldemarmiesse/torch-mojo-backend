@@ -11,7 +11,7 @@ marker taxonomy here.  Pass/fail and update rules live in
 bench_lib/check.py; measurement discipline in bench_lib/measure.py; the
 baseline file contract in bench_lib/baselines.py.
 
-Run it serially (no -n): every case takes the GPU flock and interleaves
+Run it serially (no -n), on an otherwise idle GPU: every case interleaves
 two legs on the device, so parallel workers would only fight each other.
 """
 

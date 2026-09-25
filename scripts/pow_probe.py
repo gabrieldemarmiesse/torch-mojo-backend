@@ -1,6 +1,6 @@
 """fp32 pow ulp probe: mojo device vs a float64 reference, plus candidate
 formulas evaluated on the CPU to identify which one the kernel matches, and a
-streamed 16M-element timing. Run under flock /tmp/gpu_lock_<gpu>.lock."""
+streamed 16M-element timing. Run on an idle GPU."""
 
 import time
 from collections.abc import Callable

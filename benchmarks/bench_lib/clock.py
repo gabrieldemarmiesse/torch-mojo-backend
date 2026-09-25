@@ -12,14 +12,13 @@ CUBLAS_WORKSPACE_CONFIG or extra warmup cannot help.  The driver is the
 DEVICE CLOCK POLICY the process happens to inherit: on a shared box, kernel
 engagements lock the core clock for long stretches (per AGENTS.md) and
 reset it later.  Reproduced exactly: an ambient 900MHz core-clock lock
-gives 787.6us, free-run gives ~612us — the two observed modes.  The GPU
-flock serializes device WORK, but clock policy is device-global state that
-outlives the flock, so each benchmark process samples whatever policy the
-co-tenant left behind, keeps it for its whole (short) life, and the
-within-run uncertainty estimate is blind to it by construction.
+gives 787.6us, free-run gives ~612us — the two observed modes.  Clock
+policy is device-global state that outlives the process that set it, so
+each benchmark process samples whatever policy the co-tenant left behind,
+keeps it for its whole (short) life, and the within-run uncertainty
+estimate is blind to it by construction.
 
-The fix: pin the core clock ourselves, inside the flock, for every timed
-region.  Pinned at 1395MHz the same leg reads 567-569us across fresh
+The fix: pin the core clock ourselves for every timed region.  Pinned at 1395MHz the same leg reads 567-569us across fresh
 processes under deliberately hostile ambient policy (900MHz lock, max-boost
 lock, free), i.e. 0.4% peak-to-peak versus 25% unpinned.  Two non-obvious
 properties of the pinned regime, both measured:
@@ -41,12 +40,12 @@ step -> 1395MHz on H100 PCIe) was validated on that card only, per the
 repo rule of naming where tuning constants were fitted; the plateau above
 suggests it travels, but a new card should get a quick probe-and-look.
 
-Co-tenancy contract: the pin is applied after taking the GPU flock and
-RESET before releasing it, so it can never distort a co-tenant's timed
-region — but the reset does mean any engagement-long ambient lock is gone
-afterwards.  That is the fleet convention working as intended: the fleet's
-own rule is "lock the clocks before taking reference numbers", i.e. per
-timed run, exactly what this module does.  Anyone relying on an ambient
+Co-tenancy contract: the suite runs only on an otherwise idle GPU
+(AGENTS.md), and the pin is RESET when each timed region ends — which does
+mean any engagement-long ambient lock is gone afterwards.  That is the
+fleet convention working as intended: the fleet's own rule is "lock the
+clocks before taking reference numbers", i.e. per timed run, exactly what
+this module does.  Anyone relying on an ambient
 lock surviving someone else's benchmark was already gambling.
 
 Pinning needs admin rights (root or CAP_SYS_ADMIN).  Where it is
@@ -67,8 +66,8 @@ from collections.abc import Iterator
 
 PIN_FRACTION = 0.8  # of max supported graphics clock; fitted on H100 PCIe
 
-# The suite, like gpu_lock(), addresses GPU 0. If the suite ever grows a
-# device axis, the index must travel with the flock path AND this -i.
+# The suite addresses GPU 0. If it ever grows a device axis, the index
+# must travel with this -i.
 _GPU_INDEX = 0
 
 
@@ -139,7 +138,7 @@ def pin_intact(mhz: int | None) -> bool:
     exactly the locked value as soon as the post-burst throttle tail decays
     (measured <=150ms; see above), while a lock that was removed or
     retargeted mid-measurement settles at the idle/boost/other-lock value
-    instead (co-tenants run nvidia-smi without taking the GPU flock —
+    instead (a co-tenant running nvidia-smi mid-run —
     observed once as a 4.3% stock leg excursion that survived every
     within-run check).  On a genuine policy change the caller must discard
     the measurement and retry.  When verification itself is impossible the
@@ -166,8 +165,8 @@ def pin_intact(mhz: int | None) -> bool:
 def pinned_clock(mhz: int | None) -> Iterator[None]:
     """Pin the core clock around a timed region; no-op when mhz is None.
 
-    Use INSIDE gpu_lock(): the pin is device-global state, and holding the
-    flock is what makes set-measure-reset atomic against co-tenants.
+    The pin is device-global state: run only on an otherwise idle GPU, so
+    no co-tenant's timed region sees it.
     """
     if mhz is None:
         yield

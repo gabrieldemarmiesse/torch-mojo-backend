@@ -30,7 +30,6 @@ from bench_lib.measure import (
     RATIO_NOISE_LIMIT_PCT,
     Measurement,
     NoDeviceKernels,
-    gpu_lock,
     iters_for_flops,
     measure,
 )
@@ -51,9 +50,9 @@ REGRESSION_THRESHOLD = 0.08
 # goes red: the observed noisy S7 episodes are transient throttle states
 # (S7-NN-bf16: one attempt at 3.1% uncertainty, the rerun clean at 0.3%),
 # and an intermittently red node trains people to ignore red.  The cooldown
-# happens OUTSIDE the GPU flock, so the card idles toward a steady state
-# and co-tenants are not starved while we wait.  Refusing after the
-# retries is still correct — better no number than a noisy baseline.
+# runs with the clock pin released, so the card idles toward a steady
+# state.  Refusing after the retries is still correct — better no number
+# than a noisy baseline.
 NOISE_RETRIES = 2
 NOISE_COOLDOWN_S = 30.0
 
@@ -146,13 +145,13 @@ class Bench:
         try:
             for attempt in range(1 + NOISE_RETRIES):
                 if attempt:
-                    # Cooldown with the flock RELEASED (see NOISE_COOLDOWN_S).
+                    # Cooldown with the clock pin RELEASED (see NOISE_COOLDOWN_S).
                     time.sleep(NOISE_COOLDOWN_S)
                 if hw.is_accelerator:
-                    # Pin the core clock inside the flock: ambient clock
-                    # policy left by co-tenants is what made the stock leg
-                    # bimodal between processes (see bench_lib/clock.py).
-                    with gpu_lock(), pinned_clock(hw.pinned_clock_mhz):
+                    # Pin the core clock: ambient clock policy left by
+                    # co-tenants is what made the stock leg bimodal between
+                    # processes (see bench_lib/clock.py).
+                    with pinned_clock(hw.pinned_clock_mhz):
                         result = measure(
                             ref_fn,
                             our_fn,
@@ -176,9 +175,9 @@ class Bench:
         if not held:
             pytest.fail(
                 "the GPU core-clock pin did not hold during measurement on "
-                f"any of {attempt + 1} attempts: something outside the GPU "
-                "flock is changing device clock policy mid-run (a co-tenant "
-                "engagement?); nothing was compared or recorded.",
+                f"any of {attempt + 1} attempts: something else is changing "
+                "device clock policy mid-run (another process on the GPU?); "
+                "nothing was compared or recorded.",
                 pytrace=False,
             )
         self._check(entry_key, result, attempts=attempt + 1)

@@ -45,10 +45,9 @@ hence a val-loss line, is printed once at step 40).
 
 Every leg is a single `torchrun` launch spanning both nodes
 (`--rdzv-backend=c10d`, `MASTER_ADDR` from `scontrol show hostnames`), run
-through `srun bash -c "... flock /tmp/gpu_lock_0.lock uv run --no-sync
-torchrun ..."` — `srun` puts one such shell on each node (`--ntasks-per-node=1`
-from the `#SBATCH` header), so the flock is local to that node's `/tmp` and
-guards that node's 8 GPUs against any other job touching them concurrently.
+through `srun bash -c "... uv run --no-sync torchrun ..."` — `srun` puts one
+such shell on each node (`--ntasks-per-node=1` from the `#SBATCH` header), and
+`--exclusive` keeps any other job off that node's 8 GPUs.
 `PYTHONPATH` is pinned to this worktree
 (`/home/gabriel/ddp_work/mojo_coll_mn`) so `ar_bench_gpt2.py`, which lives
 outside the repo under `/home/gabriel/ddp_work/mojo_collectives/`, resolves
@@ -238,11 +237,10 @@ J=<jobid> ENV_SH=$SCRATCHDIR/env.sh REPO=$SCRATCHDIR/checkout \
 ```
 
 `ENV_SH` is sourced on every node: the ROCm and libstdc++ setup, and
-`TORCH_MOJO_BACKEND_CACHE_DIR` on scratch. Each node's ranks run under that
-node's per-GPU flocks. The host libraries and `libmojoccl` build before the
-locks are taken, but eager kernels compile at first use, so warm the cache
-first. Ranks enter through `vmm_exit_entry.py`: the APU needs
-`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`, which segfaults in HIP's exit
+`TORCH_MOJO_BACKEND_CACHE_DIR` on scratch. The host libraries and
+`libmojoccl` build before torchrun starts, but eager kernels compile at first
+use, so warm the cache first. Ranks enter through `vmm_exit_entry.py`: the
+APU needs `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`, which segfaults in HIP's exit
 handlers. `fsdp_worker parity` gets `TMPDIR` on `LOGDIR`, since its DCP round
 trip needs a directory every node can see.
 

@@ -10,7 +10,6 @@ import torch
 from bench_lib.cases import DTYPES, both
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
-from bench_lib.measure import gpu_lock
 
 # N, C, H, W, K, pooled H, pooled W, sampling ratio.
 ALIGN_SHAPES = {
@@ -109,9 +108,8 @@ def test_roi_align(
     shape = ALIGN_SHAPES[shape_id]
     _, c, _, _, k, ph, pw, sampling = shape
     x, rois = _roi_inputs(shape, DTYPES[dtype_id])
-    with gpu_lock():
-        x_ref, x_our = both(x, hw, mojo_device)
-        r_ref, r_our = both(rois, hw, mojo_device)
+    x_ref, x_our = both(x, hw, mojo_device)
+    r_ref, r_our = both(rois, hw, mojo_device)
     bench.run(
         lambda: vision.ops.roi_align(x_ref, r_ref, (ph, pw), 1.0, sampling, True),
         lambda: vision.ops.roi_align(x_our, r_our, (ph, pw), 1.0, sampling, True),
@@ -136,9 +134,8 @@ def test_roi_align_backward(
     grad = torch.randn(
         k, c, ph, pw, dtype=DTYPES[dtype_id], generator=torch.Generator().manual_seed(1)
     )
-    with gpu_lock():
-        g_ref, g_our = both(grad, hw, mojo_device)
-        r_ref, r_our = both(rois, hw, mojo_device)
+    g_ref, g_our = both(grad, hw, mojo_device)
+    r_ref, r_our = both(rois, hw, mojo_device)
     bench.run(
         lambda: torch.ops.torchvision._roi_align_backward(
             g_ref, r_ref, 1.0, ph, pw, n, c, h, w, sampling, True
@@ -164,9 +161,8 @@ def test_roi_pool(
     shape = POOL_SHAPES[shape_id]
     _, c, _, _, k, ph, pw, _ = shape
     x, rois = _roi_inputs(shape, DTYPES[dtype_id])
-    with gpu_lock():
-        x_ref, x_our = both(x, hw, mojo_device)
-        r_ref, r_our = both(rois, hw, mojo_device)
+    x_ref, x_our = both(x, hw, mojo_device)
+    r_ref, r_our = both(rois, hw, mojo_device)
     bench.run(
         lambda: vision.ops.roi_pool(x_ref, r_ref, (ph, pw)),
         lambda: vision.ops.roi_pool(x_our, r_our, (ph, pw)),
@@ -191,12 +187,11 @@ def test_roi_pool_backward(
     grad = torch.randn(
         k, c, ph, pw, dtype=DTYPES[dtype_id], generator=torch.Generator().manual_seed(1)
     )
-    with gpu_lock():
-        x_ref, x_our = both(x, hw, mojo_device)
-        r_ref, r_our = both(rois, hw, mojo_device)
-        g_ref, g_our = both(grad, hw, mojo_device)
-        _, a_ref = torch.ops.torchvision.roi_pool(x_ref, r_ref, 1.0, ph, pw)
-        _, a_our = torch.ops.torchvision.roi_pool(x_our, r_our, 1.0, ph, pw)
+    x_ref, x_our = both(x, hw, mojo_device)
+    r_ref, r_our = both(rois, hw, mojo_device)
+    g_ref, g_our = both(grad, hw, mojo_device)
+    _, a_ref = torch.ops.torchvision.roi_pool(x_ref, r_ref, 1.0, ph, pw)
+    _, a_our = torch.ops.torchvision.roi_pool(x_our, r_our, 1.0, ph, pw)
     bench.run(
         lambda: torch.ops.torchvision._roi_pool_backward(
             g_ref, r_ref, a_ref, 1.0, ph, pw, n, c, h, w
@@ -225,9 +220,8 @@ def test_nms(
     sizes = torch.rand(k, 2, generator=generator) * 200 + 1
     boxes = torch.cat((starts, starts + sizes), dim=1).to(DTYPES[dtype_id])
     scores = torch.rand(k, generator=generator).to(DTYPES[dtype_id])
-    with gpu_lock():
-        b_ref, b_our = both(boxes, hw, mojo_device)
-        s_ref, s_our = both(scores, hw, mojo_device)
+    b_ref, b_our = both(boxes, hw, mojo_device)
+    s_ref, s_our = both(scores, hw, mojo_device)
     bench.run(
         lambda: vision.ops.nms(b_ref, s_ref, 0.5),
         lambda: vision.ops.nms(b_our, s_our, 0.5),
@@ -283,12 +277,11 @@ def _bench_ps(
         dtype=DTYPES[dtype_id],
         generator=torch.Generator().manual_seed(1),
     )
-    with gpu_lock():
-        x_ref, x_our = both(x, hw, mojo_device)
-        r_ref, r_our = both(rois, hw, mojo_device)
-        g_ref, g_our = both(grad, hw, mojo_device)
-        ref = _ps_call(kind, backward, x_ref, r_ref, g_ref, shape)
-        ours = _ps_call(kind, backward, x_our, r_our, g_our, shape)
+    x_ref, x_our = both(x, hw, mojo_device)
+    r_ref, r_our = both(rois, hw, mojo_device)
+    g_ref, g_our = both(grad, hw, mojo_device)
+    ref = _ps_call(kind, backward, x_ref, r_ref, g_ref, shape)
+    ours = _ps_call(kind, backward, x_our, r_our, g_our, shape)
     bench.run(ref, ours, flops=float(k * c * 32))
 
 
@@ -409,10 +402,9 @@ def _bench_deform(
 ):
     shape = DEFORM_SHAPES[shape_id]
     tensors = _deform_inputs(shape, DTYPES[dtype_id])
-    with gpu_lock():
-        pairs = [both(t, hw, mojo_device) for t in tensors]
-        ref = _deform_call(tuple(p[0] for p in pairs), shape, backward)
-        ours = _deform_call(tuple(p[1] for p in pairs), shape, backward)
+    pairs = [both(t, hw, mojo_device) for t in tensors]
+    ref = _deform_call(tuple(p[0] for p in pairs), shape, backward)
+    ours = _deform_call(tuple(p[1] for p in pairs), shape, backward)
     n, c, o, _, _, k, _, _, _, groups, _, _ = shape
     oh, ow = tensors[-1].shape[-2:]
     flops = 2 * n * o * oh * ow * (c // groups) * k * k

@@ -17,7 +17,7 @@ not a green suite. Never weaken a test to make it pass: a genuine AMD gap is
 recorded as a skip or decline that names the platform and the reason, a bug
 gets a fix in its own commit with a test, and everything else is reported.
 Read `AGENTS.md` first (house rules: `uv run`, type hints, terse comments,
-the eager-mode rules, `flock` around GPU work).
+the eager-mode rules, no benchmarking on a busy GPU).
 
 ## 1. Setup
 
@@ -48,7 +48,7 @@ uv run --no-sync python -c "import torch; print(torch.__version__)"   # must be 
   by the package (`compiler_env()`); keep `TMPDIR` local. Set
   `TORCH_MOJO_BACKEND_CACHE_DIR` to a scratch directory shared by your jobs so
   builds are done once. Never compile under the GPU lock.
-- Every GPU-touching command: `flock /tmp/gpu_lock_0.lock <command>` on the
+- Every GPU-touching command: `<command>` on the
   node. SLURM exposes GPUs through `ROCR_VISIBLE_DEVICES`; one `torchrun` per
   node with `--nproc-per-node` = GPUs per node, the package slices the
   variable per rank.
@@ -59,7 +59,7 @@ uv run --no-sync python -c "import torch; print(torch.__version__)"   # must be 
 
 ```bash
 uv run --no-sync mojo --print-supported-accelerators | grep -i gfx
-flock /tmp/gpu_lock_0.lock uv run --no-sync python -c "
+uv run --no-sync python -c "
 import time, torch
 from torch_mojo_backend import register_mojo_devices, get_accelerators
 t = time.time(); register_mojo_devices(); print('registered in %.1fs' % (time.time() - t))
@@ -115,7 +115,7 @@ for Metal's gaps; if AMD has a gap of its own, add the same kind of helper
 ## 3. The whole suite and the conformance tables
 
 ```bash
-flock /tmp/gpu_lock_0.lock uv run --no-sync pytest tests -q -p no:cacheprovider --ignore=tests/multinode   # ~50 min serial on H100
+uv run --no-sync pytest tests -q -p no:cacheprovider --ignore=tests/multinode   # ~50 min serial on H100
 ```
 
 Reference (H100, tree 8e964c4): 3587 passed, 287 skipped, 127 xfailed, 11
@@ -129,11 +129,11 @@ fail with "declared unsupported ... and it now PASSES" or the reverse; that
 is expected and is exactly what the regeneration fixes:
 
 ```bash
-flock /tmp/gpu_lock_0.lock uv run --no-sync python conformance/regenerate_known_unsupported.py --records $SCRATCH/records_amd -n 8 > regen_amd.log 2>&1
+uv run --no-sync python conformance/regenerate_known_unsupported.py --records $SCRATCH/records_amd -n 8 > regen_amd.log 2>&1
 uv run --no-sync python conformance/write_accelerator_delta.py regen_amd.log          # dry run: how many operators differ
 uv run --no-sync python conformance/write_accelerator_delta.py regen_amd.log --write   # _ACCELERATOR_DELTAS[<accelerator_key()>], "gfx942" on MI300A
 uv run --no-sync ruff format conformance/known_unsupported.py
-flock /tmp/gpu_lock_0.lock uv run --no-sync pytest conformance/test_opinfo.py -q -n 8 -p no:cacheprovider   # must be 0 failed
+uv run --no-sync pytest conformance/test_opinfo.py -q -n 8 -p no:cacheprovider   # must be 0 failed
 ```
 
 The regeneration refuses `--write` off the base accelerator on purpose;
@@ -149,8 +149,8 @@ needs a fix or an explicit decline.
 Single node, `N` = GPUs on the node (4 on an MI300A node):
 
 ```bash
-flock /tmp/gpu_lock_0.lock uv run --no-sync pytest tests/test_distributed.py -q -p no:cacheprovider          # H100 x2: 39 passed, 1 skipped
-flock /tmp/gpu_lock_0.lock uv run --no-sync torchrun --standalone --nproc-per-node=$N demo_scripts/nanogpt_ddp.py --device mojo --nanogpt-path <nanoGPT checkout> --data-dir <shakespeare> --batch-size 12 --block-size 1024 --max-iters 40 --log-interval 1 --eval-interval 0 --seed 1337
+uv run --no-sync pytest tests/test_distributed.py -q -p no:cacheprovider          # H100 x2: 39 passed, 1 skipped
+uv run --no-sync torchrun --standalone --nproc-per-node=$N demo_scripts/nanogpt_ddp.py --device mojo --nanogpt-path <nanoGPT checkout> --data-dir <shakespeare> --batch-size 12 --block-size 1024 --max-iters 40 --log-interval 1 --eval-interval 0 --seed 1337
 TORCH_MOJO_BACKEND_CCL=mojo  ...same two commands...    # the in-repo Mojo collectives over the NCCL C ABI
 ```
 
@@ -172,7 +172,7 @@ The Triton driver for the mojo device has a HIP variant that has never run
 
 ```bash
 uv pip install triton          # into the venv; no ROCm torch
-flock /tmp/gpu_lock_0.lock uv run --no-sync pytest tests/native/test_triton.py -q -p no:cacheprovider     # H100: 8 passed
+uv run --no-sync pytest tests/native/test_triton.py -q -p no:cacheprovider     # H100: 8 passed
 ```
 
 Then a package written against `torch.cuda`: `uv pip install liger-kernel`,
@@ -188,7 +188,7 @@ launch under `with torch.mojo.device(1):` on a second GPU.
 ## 6. TorchInductor (expected to need work)
 
 ```bash
-flock /tmp/gpu_lock_0.lock uv run --no-sync pytest tests/native/test_inductor.py -q -p no:cacheprovider     # H100: 8 passed
+uv run --no-sync pytest tests/native/test_inductor.py -q -p no:cacheprovider     # H100: 8 passed
 ```
 
 `torch_mojo_backend/inductor.py` registers the mojo Triton target as a
@@ -210,7 +210,7 @@ ROCm torch wheel, which means two HIP runtimes in one process (MAX's from
 refuses. In a **separate** venv with the ROCm torch wheel:
 
 ```bash
-PYTHONPATH=<checkout> flock /tmp/gpu_lock_0.lock <rocm-venv>/bin/python -m pytest tests/native/test_cuda_interop.py -q -p no:cacheprovider     # H100 CUDA venv: 28 passed
+PYTHONPATH=<checkout> <rocm-venv>/bin/python -m pytest tests/native/test_cuda_interop.py -q -p no:cacheprovider     # H100 CUDA venv: 28 passed
 ```
 
 The two facts to establish, even if the suite fails early: whether a

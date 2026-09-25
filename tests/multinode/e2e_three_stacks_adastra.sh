@@ -18,7 +18,7 @@ launch() { # launch CFG RDZV LOG ARGS...   -> one torchrun per node over the 2 n
     mojo_nccl)    PY=$S/venv-cpu/bin/python; DEV=mojo; ENV="PYTHONPATH=$W $RCCL_ENV";;
     mojo_mojoccl) PY=$S/venv-cpu/bin/python; DEV=mojo; ENV="PYTHONPATH=$W $MOJOCCL_ENV";;
   esac
-  srun --jobid=$J --overlap --nodes=2 --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=192 --mem=0 --label bash -c "source $S/env.sh; cd $W; env $ENV OMP_NUM_THREADS=4 flock /tmp/gpu_lock_0.lock $PY -u -m torch.distributed.run --nnodes=2 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=$MASTER:29851 --rdzv-id=$rdzv tests/multinode/rank_bind.py --device $DEV $*" > $log 2>&1
+  srun --jobid=$J --overlap --nodes=2 --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=192 --mem=0 --label bash -c "source $S/env.sh; cd $W; env $ENV OMP_NUM_THREADS=4 $PY -u -m torch.distributed.run --nnodes=2 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=$MASTER:29851 --rdzv-id=$rdzv tests/multinode/rank_bind.py --device $DEV $*" > $log 2>&1
 }
 COMMON0="--nanogpt-path $NANOGPT --data-dir $NANOGPT/data/shakespeare --log-interval 1 --seed 1337 --eval-interval 0"
 # 0. binding check + library map of one mojoccl rank (the "what is on the run path" evidence)

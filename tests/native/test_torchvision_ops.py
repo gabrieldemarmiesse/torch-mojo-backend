@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import atexit
-import fcntl
 import functools
 import io
 import math
@@ -1671,17 +1670,12 @@ def test_nms_noncontiguous(mojo_gpu: str, operand: str):
 def test_second_gpu(mojo_gpu: str):
     if getattr(torch, "mojo").device_count() < 3:
         pytest.skip("requires two GPUs (the final mojo device is CPU)")
-    with open("/tmp/gpu_lock_1.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            test_nms("mojo:1", torch.float32, 47, 0.5)
-            _check_roi("mojo:1", "align", torch.float32, 1.0, 2, True)
-            _check_roi("mojo:1", "pool", torch.float32, 1.0, 2, False)
-            _check_ps_roi("mojo:1", "align", torch.float32)
-            _check_ps_roi("mojo:1", "pool", torch.float32)
-            _check_deform("mojo:1", torch.float32, groups=2, offset_groups=3)
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    test_nms("mojo:1", torch.float32, 47, 0.5)
+    _check_roi("mojo:1", "align", torch.float32, 1.0, 2, True)
+    _check_roi("mojo:1", "pool", torch.float32, 1.0, 2, False)
+    _check_ps_roi("mojo:1", "align", torch.float32)
+    _check_ps_roi("mojo:1", "pool", torch.float32)
+    _check_deform("mojo:1", torch.float32, groups=2, offset_groups=3)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])

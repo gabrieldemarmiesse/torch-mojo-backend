@@ -20,11 +20,11 @@
 #            (default 4). LOGDIR (default $REPO/logs/worker_suites).
 #   PASSES   "multi single" (default), or one of them.
 #
-# One torchrun per node, every rank of a node under that node's per-GPU flocks
-# (/tmp/gpu_lock_<g>.lock), each rank through vmm_exit_entry.py (MAX's VMM
-# allocator, needed on the APU, segfaults at exit). The host libraries and libmojoccl build before the
-# locks are taken; eager kernel specializations compile at first use, so warm
-# TORCH_MOJO_BACKEND_CACHE_DIR first or they compile under the locks.
+# One torchrun per node, each rank through vmm_exit_entry.py (MAX's VMM
+# allocator, needed on the APU, segfaults at exit). The host libraries and
+# libmojoccl build before torchrun starts; eager kernel specializations compile
+# at first use, so warm TORCH_MOJO_BACKEND_CACHE_DIR first or they compile
+# inside the suites' time budget.
 # Prints one PASS/FAIL line per suite; each suite's full output is in LOGDIR.
 # Every requested suite runs; the exit status is nonzero if any of them failed
 # (a worker assertion, a crash or a timeout), so sbatch and callers see it.
@@ -41,21 +41,19 @@ NODES=$(scontrol show hostnames "$(squeue -h -j "$J" -o %N)")
 MASTER=$(echo "$NODES" | head -1)
 echo "=== job $J nodes $(echo $NODES) tree $(git -C "$REPO" log --oneline -1) ==="
 
-# The per-node command: build outside the locks, then torchrun under them.
+# The per-node command: build first, then torchrun.
 # SUITE_ENV: extra VAR=value words exported for this suite only.
 node_cmd() {  # $1 = nnodes, $2 = rdzv id, rest = worker script + args
   local nn=$1 id=$2; shift 2
   local rdzv="--standalone"
   [ "$nn" -gt 1 ] && rdzv="--nnodes=$nn --rdzv-backend=c10d --rdzv-endpoint=$MASTER:29871 --rdzv-id=$id"
-  local locks=""
-  for ((g = 0; g < NPROC; g++)); do locks+="flock /tmp/gpu_lock_$g.lock "; done
   cat <<EOF
 ${ENV_SH:+source $ENV_SH;} cd $REPO
 export TORCH_MOJO_BACKEND_CCL=mojo MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1
 export FI_CXI_DISABLE_EQ_HUGETLB=1 FI_CXI_DISABLE_CQ_HUGETLB=1 PYTHONUNBUFFERED=1
 export ROCR_VISIBLE_DEVICES=\$(seq -s, 0 $((NPROC - 1))) ${SUITE_ENV:-}
 ROCR_VISIBLE_DEVICES=0 uv run --no-sync python -c 'from torch_mojo_backend import native; native.build_shim(); native.build_backend(); from torch_mojo_backend.distributed.mojoccl_build import ensure_built; ensure_built()'
-exec $locks uv run --no-sync torchrun $rdzv --nproc-per-node=$NPROC tests/multinode/vmm_exit_entry.py $*
+exec uv run --no-sync torchrun $rdzv --nproc-per-node=$NPROC tests/multinode/vmm_exit_entry.py $*
 EOF
 }
 

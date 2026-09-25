@@ -27,7 +27,7 @@ Neither test is a check on the kernel's own logic (the soaks in
 against toolchain drift.
 
 Cross-compiles with ``mojo build --emit asm --target-accelerator sm_90a``
-(needs no GPU, never touches ``/tmp/gpu_lock_0.lock``) the same way
+(needs no GPU) the same way
 ``scripts/compare_kernel_asm.py`` does, and greps the emitted PTX. The SASS
 leg needs ``ptxas`` and ``nvdisasm`` -- also host-only tools, needing no
 device -- and skips when neither PATH nor the triton wheel provides them.

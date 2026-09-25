@@ -33,7 +33,7 @@ LOGS=/home/gabriel/ddp_work/logs
 DATA="--nanogpt-path $NANOGPT --data-dir $NANOGPT/data/shakespeare --log-interval 1 --seed 1337 --eval-interval 0 ${MODEL_ARGS:-}"
 
 echo "=== prewarm mojo kernels (1 rank) ==="
-srun -N1 -n1 bash -c "cd $W && env PYTHONPATH=$W TORCH_MOJO_BACKEND_CCL=mojo flock /tmp/gpu_lock_0.lock uv run --no-sync torchrun --nnodes=1 --nproc-per-node=1 --rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:29853 --rdzv-id=\$SLURM_JOB_ID-prewarm demo_scripts/nanogpt_ddp.py --device mojo $DATA --max-iters 3 --batch-size 2" > $LOGS/${TAG}_${SLURM_JOB_ID}_prewarm.log 2>&1
+srun -N1 -n1 bash -c "cd $W && env PYTHONPATH=$W TORCH_MOJO_BACKEND_CCL=mojo uv run --no-sync torchrun --nnodes=1 --nproc-per-node=1 --rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:29853 --rdzv-id=\$SLURM_JOB_ID-prewarm demo_scripts/nanogpt_ddp.py --device mojo $DATA --max-iters 3 --batch-size 2" > $LOGS/${TAG}_${SLURM_JOB_ID}_prewarm.log 2>&1
 echo "=== prewarm exit: $? ==="
 
 run_one() {  # BS index cfg
@@ -45,7 +45,7 @@ run_one() {  # BS index cfg
     warmup_mojoccl|mojo_mojoccl) TR="uv run --no-sync torchrun"; DEV=mojo; ENV="TORCH_MOJO_BACKEND_CCL=mojo";;
   esac
   echo "=== bs=$BS run $i cfg=$cfg ==="
-  srun bash -c "cd $W && env PYTHONPATH=$W $ENV flock /tmp/gpu_lock_0.lock $TR --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:29851 --rdzv-id=\$SLURM_JOB_ID-$BS-$i $W/tests/multinode/rank_bind.py --device $DEV $DATA --max-iters 30 --batch-size $BS" > $LOG 2>&1
+  srun bash -c "cd $W && env PYTHONPATH=$W $ENV $TR --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:29851 --rdzv-id=\$SLURM_JOB_ID-$BS-$i $W/tests/multinode/rank_bind.py --device $DEV $DATA --max-iters 30 --batch-size $BS" > $LOG 2>&1
   local rc=$?
   echo "=== bs=$BS run $i exit: $rc ==="
   return $rc

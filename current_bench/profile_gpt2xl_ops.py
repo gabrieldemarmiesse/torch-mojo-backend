@@ -10,13 +10,13 @@ its ops stay out of the profile; zero_grad(set_to_none=True) between profiled
 steps keeps each backward identical to a fresh training step's.
 
 Usage:
-    flock /tmp/gpu_lock_0.lock uv run --no-sync python \
+    uv run --no-sync python \
         current_bench/profile_gpt2xl_ops.py --device cuda --json-out /tmp/cuda.json
-    flock /tmp/gpu_lock_0.lock uv run --no-sync python \
+    uv run --no-sync python \
         current_bench/profile_gpt2xl_ops.py --device mojo --json-out /tmp/mojo.json
 
     # memory/fit probe only (exit 0 iff the batch runs full training steps)
-    flock /tmp/gpu_lock_0.lock uv run --no-sync python \
+    uv run --no-sync python \
         current_bench/profile_gpt2xl_ops.py --device cuda --batch-size 16 --probe
 
 Compare the two JSONs with compare_op_profiles.py.

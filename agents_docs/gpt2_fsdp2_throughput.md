@@ -169,8 +169,7 @@ accidentally importing another editable checkout.
 export CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=1
 export PYTHONPATH="$PWD"
 export TORCH_MOJO_BACKEND_CCL=vendor
-flock /tmp/gpu_lock_0.lock flock /tmp/gpu_lock_1.lock \
-  uv run --no-project --python /path/to/cu128-venv/bin/python \
+uv run --no-project --python /path/to/cu128-venv/bin/python \
   python -m torch.distributed.run --standalone --nproc-per-node=2 \
   demo_scripts/gpt2_fsdp2.py --model gpt2-xl --device cuda \
   --dtype bfloat16 --sequence-length 1024 --batch-size 1 \

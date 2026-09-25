@@ -22,7 +22,6 @@ import torch.nn.functional as F
 from bench_lib.cases import DTYPES, both, op_params, unit_interval
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
-from bench_lib.measure import gpu_lock
 
 SHAPES: dict[str, tuple[int, ...]] = {
     "C_16777216": (16777216,),
@@ -84,11 +83,10 @@ def test_unary(
     fn = UNARY_OPS[op_name]
     shape = SHAPES[shape_id]
     cpu = unit_interval(shape, DTYPES[dtype_id])
-    with gpu_lock():
-        x_ref, x_our = both(cpu, hw, mojo_device)
-        for value in (x_ref, x_our):
-            assert value.data_ptr() % (4 * cpu.element_size()) == 0
-        torch.testing.assert_close(fn(x_our).cpu(), fn(cpu))
+    x_ref, x_our = both(cpu, hw, mojo_device)
+    for value in (x_ref, x_our):
+        assert value.data_ptr() % (4 * cpu.element_size()) == 0
+    torch.testing.assert_close(fn(x_our).cpu(), fn(cpu))
     bench.run(lambda: fn(x_ref), lambda: fn(x_our), flops=float(x_ref.numel()))
 
 
@@ -108,15 +106,14 @@ def test_unary_unaligned(
     fn = UNARY_OPS[op_name]
     shape = SHAPES[shape_id]
     cpu = unit_interval(shape, DTYPES[dtype_id])
-    with gpu_lock():
-        # Slice after the device copy: copying a CPU view would realign it.
-        storage = torch.cat((torch.zeros(1, dtype=cpu.dtype), cpu.flatten()))
-        ref_storage, our_storage = both(storage, hw, mojo_device)
-        x_ref, x_our = (value[1:].view(shape) for value in (ref_storage, our_storage))
-        for value in (x_ref, x_our):
-            assert value.is_contiguous()
-            assert value.data_ptr() % (4 * cpu.element_size()) == cpu.element_size()
-        torch.testing.assert_close(fn(x_our).cpu(), fn(cpu))
+    # Slice after the device copy: copying a CPU view would realign it.
+    storage = torch.cat((torch.zeros(1, dtype=cpu.dtype), cpu.flatten()))
+    ref_storage, our_storage = both(storage, hw, mojo_device)
+    x_ref, x_our = (value[1:].view(shape) for value in (ref_storage, our_storage))
+    for value in (x_ref, x_our):
+        assert value.is_contiguous()
+        assert value.data_ptr() % (4 * cpu.element_size()) == cpu.element_size()
+    torch.testing.assert_close(fn(x_our).cpu(), fn(cpu))
     bench.run(lambda: fn(x_ref), lambda: fn(x_our), flops=float(cpu.numel()))
 
 
@@ -136,21 +133,18 @@ def test_gelu_tanh(
     # without renaming the existing default-GELU baseline entries.
     shape = SHAPES[shape_id.removesuffix("_tanh")]
     cpu = unit_interval(shape, DTYPES[dtype_id])
-    with gpu_lock():
-        if layout == "offset_1":
-            storage = torch.cat((torch.zeros(1, dtype=cpu.dtype), cpu.flatten()))
-            ref_storage, our_storage = both(storage, hw, mojo_device)
-            x_ref, x_our = (
-                value[1:].view(shape) for value in (ref_storage, our_storage)
-            )
-        else:
-            x_ref, x_our = both(cpu, hw, mojo_device)
-        for value in (x_ref, x_our):
-            expected_offset = cpu.element_size() if layout == "offset_1" else 0
-            assert value.data_ptr() % (4 * cpu.element_size()) == expected_offset
-        torch.testing.assert_close(
-            F.gelu(x_our, approximate="tanh").cpu(), F.gelu(cpu, approximate="tanh")
-        )
+    if layout == "offset_1":
+        storage = torch.cat((torch.zeros(1, dtype=cpu.dtype), cpu.flatten()))
+        ref_storage, our_storage = both(storage, hw, mojo_device)
+        x_ref, x_our = (value[1:].view(shape) for value in (ref_storage, our_storage))
+    else:
+        x_ref, x_our = both(cpu, hw, mojo_device)
+    for value in (x_ref, x_our):
+        expected_offset = cpu.element_size() if layout == "offset_1" else 0
+        assert value.data_ptr() % (4 * cpu.element_size()) == expected_offset
+    torch.testing.assert_close(
+        F.gelu(x_our, approximate="tanh").cpu(), F.gelu(cpu, approximate="tanh")
+    )
     bench.run(
         lambda: F.gelu(x_ref, approximate="tanh"),
         lambda: F.gelu(x_our, approximate="tanh"),

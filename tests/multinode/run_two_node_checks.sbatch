@@ -33,12 +33,8 @@
 # run without spending the job's time budget on the mojo legs.
 #
 # Every leg is one torchrun launch across both nodes (--nnodes=2
-# --nproc-per-node=8), guarded per node by `flock /tmp/gpu_lock_0.lock`
-# inside the srun'd command (srun runs one task per node; that task's
-# flock is local to that node's /tmp). `--exclusive` because that lock is
-# node-wide: sharing a node with another GPU job means every leg queues
-# behind it, and a job that spent its whole time budget waiting on the
-# lock rather than running was mistaken for a hang. Each leg's full output
+# --nproc-per-node=8, srun runs one task per node). `--exclusive` keeps
+# every other GPU job off both nodes for the whole run. Each leg's full output
 # goes to its own log under /home/gabriel/ddp_work/logs/; a filtered view (result
 # lines, per-rank OK/FAIL, step lines, errors) is echoed to this job's
 # main -o log, which is what tests/multinode/summarize.py reads.
@@ -88,7 +84,7 @@ run_worker() {  # $1 = ccl, $2 = mode, $3 = worker (default ddp_worker)
   echo "=== $worker ccl=$ccl mode=$mode (16 ranks) ==="
   set_ccl "$ccl"
   local log="$LOGDIR/mojoccl_2node_${SLURM_JOB_ID}_${worker}_${ccl}_${mode}.log"
-  srun bash -c "flock /tmp/gpu_lock_0.lock uv run --no-sync torchrun \
+  srun bash -c "uv run --no-sync torchrun \
       --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d \
       --rdzv-endpoint=$MASTER_ADDR:29601 --rdzv-id=\$SLURM_JOB_ID \
       tests/$worker.py $mode" \
@@ -104,7 +100,7 @@ run_bench() {  # $1 = ccl, $2 = leg number (label only)
   local dbg_prefix=""
   # Algo/protocol choices only need capturing on the real-NCCL legs.
   [ "$ccl" = "vendor" ] && dbg_prefix="NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TUNING"
-  srun bash -c "$dbg_prefix flock /tmp/gpu_lock_0.lock uv run --no-sync torchrun \
+  srun bash -c "$dbg_prefix uv run --no-sync torchrun \
       --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d \
       --rdzv-endpoint=$MASTER_ADDR:29602 --rdzv-id=\$SLURM_JOB_ID \
       /home/gabriel/ddp_work/mojo_collectives/ar_bench_gpt2.py" \
@@ -118,7 +114,7 @@ run_train() {  # $1 = ccl, $2 = leg number (label only)
   set_ccl "$ccl"
   local log="$LOGDIR/mojoccl_2node_${SLURM_JOB_ID}_nanogpt_${ccl}_leg${leg}.log"
   local common="--nanogpt-path $NANOGPT --data-dir $NANOGPT/data/shakespeare --log-interval 1 --eval-iters 10 --seed 1337 --max-iters 40 --eval-interval 40"
-  srun bash -c "flock /tmp/gpu_lock_0.lock uv run --no-sync torchrun \
+  srun bash -c "uv run --no-sync torchrun \
       --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d \
       --rdzv-endpoint=$MASTER_ADDR:29603 --rdzv-id=\$SLURM_JOB_ID \
       demo_scripts/nanogpt_ddp.py --device mojo $common" \

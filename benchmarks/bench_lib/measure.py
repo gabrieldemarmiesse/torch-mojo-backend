@@ -51,13 +51,11 @@ Rules this module enforces (they were learned painfully):
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
-import fcntl
 import math
 import statistics
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 
 from torch.profiler import ProfilerActivity, profile
 
@@ -120,17 +118,6 @@ class Measurement:
     bursts: int  # burst pairs actually sampled (adaptive, MIN..MAX)
     ours: LegTiming
     ref: LegTiming
-
-
-@contextlib.contextmanager
-def gpu_lock(index: int = 0) -> Iterator[None]:
-    """AGENTS.md rule: hold flock /tmp/gpu_lock_{index}.lock around GPU work."""
-    with open(f"/tmp/gpu_lock_{index}.lock", "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def _burst_us_kineto(

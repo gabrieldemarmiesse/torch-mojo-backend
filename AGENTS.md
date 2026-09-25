@@ -133,8 +133,9 @@ than 8% versus the recorded baseline, passes when this hardware has never
 been measured, and the whole suite skips cleanly when there is no
 accelerator. GPU **device time only** is measured (never wall time), the
 two legs are interleaved in ABBA order (ref,ours | ours,ref) so a monotonic
-clock ramp cancels to first order, every case is pre-warmed, and
-`/tmp/gpu_lock_0.lock` is flocked around GPU work.
+clock ramp cancels to first order, and every case is pre-warmed. Like
+any benchmark, run it only when the GPU is idle (see "One GPU, many
+agents" below).
 
 ```bash
 # Full suite (read-only: never writes baselines). Run serially, never -n.
@@ -500,8 +501,8 @@ memory-ordering-sensitive) and Sonnet 5 for easy kernels and mechanical work
 integration, conflict fixes). Never use Fable 5 for agents.
 
 When optimizing a kernel, you should make a harness for a subagent A to work on. The harness should include:
-- Unit tests for the kernels (outside the main test suite), the unit tests should acquire the flock `/tmp/gpu_lock_{gpu_id}.lock`.
-- A benchmark script in pure mojo, that measures the performance of the kernel on different input shapes (no more than 6), requiring at least one non-round/awkward shape (e.g. 357×789). The benchmark should lock the GPU frequency if possible. The benchmark should use a flock in /tmp/gpu_lock_{gpu_id}.lock to avoid using the gpu at the same time as other benchmarks. `ncu` or rocprof or equivalent should be given to the agent.
+- Unit tests for the kernels (outside the main test suite).
+- A benchmark script in pure mojo, that measures the performance of the kernel on different input shapes (no more than 6), requiring at least one non-round/awkward shape (e.g. 357×789). The benchmark should lock the GPU frequency if possible. The agent must only run it on an idle GPU (see "One GPU, many agents" below). `ncu` or rocprof or equivalent should be given to the agent.
 - The harness should only measure the total gpu time, not the wall time as the wall time can be worked on later on.
 - The harness should also include reference numbers, so roofline estimate, and the performance of stock pytorch on the same input shapes (device time too, not wall time).
 - The scope of the agent should be as limited as possible, for example, if writing a gemm, the agent should only take care of the TN variant, or NT but not all variants. It should only focus on one dtype. (if multiple dtypes are needed, we'll do the dance Agent A, Agent B for dtype1 and then Agent A Agent B for dtype2, etc..., with a bit of luck for dtype2, agent A can reuse the code of dtype1 and just change the dtype, which will be easy to integrate later by agent B by parametrizing the code).
@@ -528,10 +529,16 @@ Believe them before rediscovering them at GPU-hour prices.
 
 ### Measuring
 
-- One GPU, many agents: EVERY GPU-touching command (harness runs, `ncu`,
-  `pytest`, one-off probes) goes through `flock /tmp/gpu_lock_{gpu_id}.lock`.
-  Never compile under the lock — `mojo build` takes minutes and needs no GPU;
-  build first, then take the lock to run.
+- One GPU, many agents: never benchmark on a GPU that already has a
+  process running on it — another agent's tests or benchmark would skew
+  both measurements. Check right before every timed run (harness runs,
+  `ncu`, `benchmarks/`): `nvidia-smi --query-compute-apps=pid,process_name
+  --format=csv,noheader -i <gpu_id>` on NVIDIA, `amd-smi process -g
+  <gpu_id>` (or `rocm-smi --showpids`) on AMD, must list nothing. If it
+  is busy, wait and check again, or pick another idle GPU; do not start
+  the benchmark anyway. Correctness tests do not need an idle GPU. Build
+  first: `mojo build` takes minutes and needs no GPU, so do it before
+  checking, then run as soon as the GPU is free.
 - Lock the clocks before taking reference numbers (`nvidia-smi -lgc` on
   NVIDIA; pick a sustainable frequency below max so power throttling cannot
   bite mid-suite). Record the chosen clock next to the numbers, recompute the

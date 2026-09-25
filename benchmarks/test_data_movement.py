@@ -17,7 +17,6 @@ import torch
 from bench_lib.cases import DTYPES, both
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
-from bench_lib.measure import gpu_lock
 
 # (pieces, elements per piece).  The piece COUNT is a regime axis of its own:
 # CatN batches up to CAT_SEG_CAP inputs per launch, so 64 is the last count
@@ -423,10 +422,9 @@ def test_index_put(
     data = torch.zeros(shape, dtype=dtype)
     indices = torch.arange(count, dtype=torch.int64) * 2
     values = torch.randn((count, *shape[1:]), dtype=dtype)
-    with gpu_lock():
-        d_ref, d_our = both(data, hw, mojo_device)
-        i_ref, i_our = both(indices, hw, mojo_device)
-        v_ref, v_our = both(values, hw, mojo_device)
+    d_ref, d_our = both(data, hw, mojo_device)
+    i_ref, i_our = both(indices, hw, mojo_device)
+    v_ref, v_our = both(values, hw, mojo_device)
     bench.run(
         lambda: d_ref.index_put_((i_ref,), v_ref),
         lambda: d_our.index_put_((i_our,), v_our),
