@@ -41,6 +41,7 @@ enum TmbTag : int32_t {
   TMB_SCALAR_DOUBLE = 19,  // Scalar-typed argument: a = double bits
   TMB_SCALAR_BOOL = 20,    // Scalar-typed argument: a = 0/1
   TMB_STREAM = 21,         // torch.Stream argument: a = device index, b = stream id
+  TMB_STORAGE = 22,        // Storage argument: a = c10::Storage* (borrowed), b = nbytes, len = device index
 };
 
 typedef struct TmbValue {
@@ -213,6 +214,8 @@ int32_t tmb_as_strided(TmbTensor base, int64_t ndim, const int64_t* sizes,
 int32_t tmb_tensor_set_sizes_strides(TmbTensor t, int64_t ndim, const int64_t* sizes,
                                      const int64_t* strides, int64_t storage_offset);
 int32_t tmb_tensor_set_storage(TmbTensor t, TmbTensor source);
+// set_.source_Storage: `storage` is a TMB_STORAGE argument's c10::Storage*
+int32_t tmb_tensor_set_storage_object(TmbTensor t, void* storage);
 int32_t tmb_storage_resize(TmbTensor t, int64_t nbytes);
 // CPU tensors (for host round trips such as .item() and _local_scalar_dense)
 int32_t tmb_cpu_empty(int64_t ndim, const int64_t* sizes, int32_t dtype, TmbTensor* ret);

@@ -15,7 +15,13 @@ re-enter our own registration (infinite recursion) -- calling the
 *per-tensor* op name instead (`add_.Scalar`, `addcmul_`, ...) does not, and
 matches the exact semantics ATen's own slow kernels implement.
 
-`_fused_adamw_` / `_fused_adamw_.tensor_lr` are the one exception: they have
+GradScaler's two ops, `_amp_foreach_non_finite_check_and_unscale_` (a member
+of the same batched family) and `_amp_update_scale_` (one thread), have no
+CompositeExplicitAutograd registration either, so they take no sequential
+fallback: what the batched kernel cannot take goes through a contiguous
+temporary, and what no kernel supports is declined.
+
+`_fused_adamw_` / `_fused_adamw_.tensor_lr` are the same: they have
 no CompositeExplicitAutograd registration in ATen at all (see
 native_functions.yaml), so there is no equivalent sequential fallback to
 call into. Declining there really does mean NotImplementedError, matching
@@ -37,19 +43,23 @@ from std.utils import IndexList
 from tmb.backend.abi import (
     ST_FLOAT32,
     T,
+    is_dense,
     Value,
     Values,
     call_op,
     dtype_code,
     f64_bits,
+    new_like,
     new_tensor,
     own,
     Owned,
+    ret_ref,
     ret_tensor_list,
     unsupported,
     v_bool,
     v_dtype_or,
     v_f64,
+    v_int,
     v_scalar_is_bool,
     v_tensor,
     v_tensor_list,
@@ -63,6 +73,7 @@ from tmb.kernels.optimizer.foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
+from tmb.ops.common import copy_strided_into
 
 
 # --- the sequential per-tensor fallback ---------------------------------
@@ -818,29 +829,168 @@ def op_foreach_norm_scalar(
     ret_tensor_list(rets, 0, result)
 
 
-def _adamw_scalar_tensor(
-    v: Value, name: StaticString, device: Int
+def _scalar_f32_tensor(
+    v: Value, name: StaticString, device: Int, dtype: DType = DType.float32
 ) raises -> Int:
-    """A validated read-only scalar (`grad_scale`/`found_inf`): its device
-    pointer, or 0 for None."""
+    """A validated one-element device scalar (`grad_scale`/`found_inf`/...):
+    its device pointer, or 0 for None."""
     if v.tag == TAG_NONE:
         return 0
     var t = v_tensor(v)
     if (
         t.device != device
         or not t.on_mojo()
-        or t.dtype != DType.float32
+        or t.dtype != dtype
         or t.numel != 1
         or not t.contig
     ):
         raise Error(
             name,
-            (
-                " must be a contiguous scalar float32 tensor on the same mojo"
-                " device as the parameters"
-            ),
+            " must be a contiguous one-element ",
+            dtype,
+            " tensor on the same mojo device as the other operands",
         )
     return t.ptr
+
+
+# --- GradScaler (torch/amp/grad_scaler.py) ----------------------------------
+
+
+def _unscale_dtype_ok(t: T) raises -> Bool:
+    """The batched kernel's dtypes; Metal's fixed-arity arm is float32 only."""
+    if dev(t.device)[].api == "metal":
+        return t.dtype == DType.float32
+    return (
+        t.dtype == DType.float32
+        or t.dtype == DType.float16
+        or t.dtype == DType.bfloat16
+    )
+
+
+def _unscale_launch(tensors: List[T], inv_scale: T, found_inf: T) raises:
+    """One batched launch over same-dtype tensors whose elements are dense:
+    the math is elementwise, so any stride permutation of a dense tensor is
+    the same `numel` elements from its data pointer."""
+    var metadata = List[Int]()
+    for t in tensors:
+        metadata.append(t.ptr)
+        metadata.append(t.numel)
+    var aux = List[Int]()
+    aux.append(inv_scale.ptr)
+    aux.append(found_inf.ptr)
+    var dtype = tensors[0].dtype
+    var ctx = ctx_for(tensors[0].device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall("optimizer", "ForeachNonFiniteUnscale")
+    call.arg_dtype(0, dtype)
+    call.out_dtype(dtype)
+    call.tuple(metadata)
+    call.tuple(List[Int]())
+    call.tuple(aux)
+    call.int(dtype_code(dtype))
+    call.int(cp)
+    call.run()
+    for t in tensors:
+        t.bump_version()
+    _ = ctx
+
+
+# aten::_amp_foreach_non_finite_check_and_unscale_(Tensor(a!)[] self,
+#   Tensor(b!) found_inf, Tensor inv_scale) -> ()
+def op_amp_foreach_non_finite_check_and_unscale_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """ATen's CUDA semantics: found_inf = 1 if any element is inf/NaN, and
+    every element is multiplied by inv_scale unless it is exactly 1. One
+    launch when the list shares a dtype and every tensor is dense, as
+    GradScaler's per-(device, dtype) lists do; anything else goes tensor by
+    tensor, through a contiguous temporary when the tensor is not dense."""
+    var self_list = v_tensor_list(args[unsafe_offset=0])
+    var found_inf = v_tensor(args[unsafe_offset=1])
+    if len(self_list) == 0:
+        return
+    if not found_inf.on_mojo():
+        unsupported("found_inf is not on a mojo device")
+    var device = found_inf.device
+    _ = _scalar_f32_tensor(args[unsafe_offset=1], "found_inf", device)
+    _ = _scalar_f32_tensor(args[unsafe_offset=2], "inv_scale", device)
+    var inv_scale = v_tensor(args[unsafe_offset=2])
+    var batched = True
+    for t in self_list:
+        if not t.on_mojo() or t.device != device:
+            raise Error(
+                "_amp_foreach_non_finite_check_and_unscale_: every tensor"
+                " must be on found_inf's device"
+            )
+        if not t.dtype.is_floating_point():
+            raise Error(
+                "_amp_foreach_non_finite_check_and_unscale_ only supports"
+                " floating-point tensors"
+            )
+        if not _unscale_dtype_ok(t):
+            unsupported(
+                "_amp_foreach_non_finite_check_and_unscale_: dtype "
+                + String(t.dtype)
+                + " is not supported on this GPU"
+            )
+        if t.dtype != self_list[0].dtype or not is_dense(
+            t.shape, t.strides, t.rank
+        ):
+            batched = False
+    if batched:
+        _unscale_launch(self_list, inv_scale, found_inf)
+        found_inf.bump_version()
+        return
+    for t in self_list:
+        if t.numel == 0:
+            continue
+        var one = List[T]()
+        if is_dense(t.shape, t.strides, t.rank):
+            one.append(t.copy())
+            _unscale_launch(one, inv_scale, found_inf)
+            continue
+        var tmp = own(new_like(t))
+        copy_strided_into(tmp.t, t)
+        one.append(tmp.t.copy())
+        _unscale_launch(one, inv_scale, found_inf)
+        copy_strided_into(t, tmp.t)
+        t.bump_version()
+    found_inf.bump_version()
+
+
+# aten::_amp_update_scale_(Tensor(a!) self, Tensor(b!) growth_tracker,
+#   Tensor found_inf, float scale_growth_factor, float scale_backoff_factor,
+#   int growth_interval) -> Tensor(a!)
+def op_amp_update_scale_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var scale = v_tensor(args[unsafe_offset=0])
+    if not scale.on_mojo():
+        unsupported("_amp_update_scale_: the scale is not on a mojo device")
+    var device = scale.device
+    _ = _scalar_f32_tensor(args[unsafe_offset=0], "current_scale", device)
+    var tracker_ptr = _scalar_f32_tensor(
+        args[unsafe_offset=1], "growth_tracker", device, DType.int32
+    )
+    var found_inf_ptr = _scalar_f32_tensor(
+        args[unsafe_offset=2], "found_inf", device
+    )
+    var factors = List[Int]()
+    factors.append(Int(f64_bits(v_f64(args[unsafe_offset=3]))))
+    factors.append(Int(f64_bits(v_f64(args[unsafe_offset=4]))))
+    var ctx = ctx_for(device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall("optimizer", "AmpUpdateScale")
+    call.int(scale.ptr)
+    call.int(tracker_ptr)
+    call.int(found_inf_ptr)
+    call.tuple(factors)
+    call.int(v_int(args[unsafe_offset=5]))
+    call.int(cp)
+    call.run()
+    v_tensor(args[unsafe_offset=1]).bump_version()
+    ret_ref(rets, 0, scale)
+    _ = ctx
 
 
 def _fused_adamw_impl(args: Values, n_args: Int) raises:
@@ -975,7 +1125,7 @@ def _fused_adamw_impl(args: Values, n_args: Int) raises:
     if lr_v.tag == TAG_TENSOR or lr_v.tag == TAG_TENSOR_REF:
         var lr_t = v_tensor(lr_v)
         if lr_t.on_mojo():
-            lr_ptr = _adamw_scalar_tensor(lr_v, "lr", device)
+            lr_ptr = _scalar_f32_tensor(lr_v, "lr", device)
         else:
             if lr_t.numel != 1:
                 raise Error("tensor lr must be a scalar CPU or mojo tensor")
@@ -991,10 +1141,10 @@ def _fused_adamw_impl(args: Values, n_args: Int) raises:
     var beta2 = v_f64(args[unsafe_offset=8])
     var weight_decay = v_f64(args[unsafe_offset=9])
     var eps = v_f64(args[unsafe_offset=10])
-    var grad_scale_ptr = _adamw_scalar_tensor(
+    var grad_scale_ptr = _scalar_f32_tensor(
         args[unsafe_offset=13], "grad_scale", device
     )
-    var found_inf_ptr = _adamw_scalar_tensor(
+    var found_inf_ptr = _scalar_f32_tensor(
         args[unsafe_offset=14], "found_inf", device
     )
 
@@ -1056,6 +1206,11 @@ def op_fused_adamw_(
 
 
 def register_foreach(site: Site) raises:
+    impl[
+        op_amp_foreach_non_finite_check_and_unscale_,
+        "_amp_foreach_non_finite_check_and_unscale_",
+    ](site)
+    impl[op_amp_update_scale_, "_amp_update_scale_"](site)
     impl[op_foreach_copy_, "_foreach_copy_"](site)
     impl[op_foreach_add_scalar_, "_foreach_add_.Scalar"](site)
     impl[op_foreach_addcmul_scalar_, "_foreach_addcmul_.Scalar"](site)

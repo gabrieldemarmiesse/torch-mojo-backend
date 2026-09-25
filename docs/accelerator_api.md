@@ -167,11 +167,6 @@ to overlap copies with compute.
     with accelerator tensors, and copying between the two raises
     `NotImplementedError`. Take every device from `torch.accelerator`.
 
-!!! warning "Printing floating-point tensors"
-    `print(t)` on a floating-point accelerator tensor currently raises
-    `NotImplementedError`: PyTorch's tensor formatter calls `masked_select`,
-    which the backend does not implement yet. Print `t.cpu()` instead.
-    Integer and boolean tensors print directly.
 
 ## Selecting a GPU
 
@@ -262,11 +257,43 @@ print(logits.dtype, loss.dtype, model.weight.grad.dtype)
 
 Without a `dtype`, autocast uses `torch.float16`, the same default as CUDA.
 
-!!! warning "No `GradScaler` yet"
-    `torch.amp.GradScaler(device.type)` does not work on this backend: ops it
-    relies on are not implemented yet, and `scaler.step()` raises
-    `NotImplementedError`. Train with `dtype=torch.bfloat16`, which has the
-    range of `float32` and needs no loss scaling.
+With `torch.float16`, scale the loss with `torch.amp.GradScaler`, exactly
+as on CUDA:
+
+```python
+import torch
+import torch_mojo_backend
+
+torch_mojo_backend.register_mojo_devices()
+device = torch.accelerator.current_accelerator()
+
+model = torch.nn.Linear(16, 4).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), fused=True)
+scaler = torch.amp.GradScaler(device.type)
+x = torch.randn(8, 16, device=device)
+target = torch.randint(0, 4, (8,), device=device)
+
+for _ in range(3):
+    with torch.autocast(device.type, dtype=torch.float16):
+        loss = torch.nn.functional.cross_entropy(model(x), target)
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)  # optional: to clip or inspect gradients
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad()
+print(scaler.get_scale())  # 65536.0
+```
+
+The inf/NaN check, the unscaling and the scale update all run on the GPU,
+so `unscale_()` and `update()` do not synchronize with the host, and a fused
+optimizer (`fused=True`) skips the whole step on the GPU when the gradients
+overflowed. `bfloat16` has the range of `float32` and needs no scaler.
+
+!!! warning "No `GradScaler` on Apple GPUs"
+    `GradScaler.unscale_()` computes the inverse scale in `float64`, which
+    Apple GPUs do not have, so on those use `dtype=torch.bfloat16` without a
+    scaler.
 
 `torch.set_float32_matmul_precision("high")` (or `"medium"`) lets float32
 matmuls use TF32 tensor cores where the backend has a TF32 kernel, which is
@@ -381,30 +408,35 @@ device times there.
 
 ## Saving and loading
 
-!!! warning "Save CPU copies"
-    `torch.save` of an accelerator tensor, and `torch.load` with
-    `map_location` set to the accelerator, currently fail with
-    `NotImplementedError`, because a storage op PyTorch uses for them is not
-    implemented yet. Move tensors to the CPU to save them, and load on the
-    CPU:
+`torch.save` and `torch.load` work on accelerator tensors. A saved tensor
+records its device, so by default it loads back onto the accelerator, and
+`map_location` sends it anywhere else:
 
-    ```python
-    import torch
-    import torch_mojo_backend
+```python
+import torch
+import torch_mojo_backend
 
-    torch_mojo_backend.register_mojo_devices()
-    device = torch.accelerator.current_accelerator()
+torch_mojo_backend.register_mojo_devices()
+device = torch.accelerator.current_accelerator()
 
-    model = torch.nn.Linear(4, 2).to(device)
+model = torch.nn.Linear(4, 2).to(device)
+torch.save(model.state_dict(), "ckpt.pt")
 
-    # Save: copy the tensors to the CPU first.
-    torch.save({k: v.cpu() for k, v in model.state_dict().items()}, "ckpt.pt")
+restored = torch.nn.Linear(4, 2).to(device)
+restored.load_state_dict(torch.load("ckpt.pt", map_location=device))
+print(restored.weight.device)                              # mojo:0
 
-    # Load: read on the CPU; load_state_dict copies into the device parameters.
-    restored = torch.nn.Linear(4, 2).to(device)
-    restored.load_state_dict(torch.load("ckpt.pt", map_location="cpu"))
-    print(restored.weight.device)            # mojo:0
-    ```
+cpu_state = torch.load("ckpt.pt", map_location="cpu")      # CPU tensors
+```
+
+Views keep sharing their storage through a save and load. `torch.load`
+also takes `mmap=True`, and `map_location` a mapping such as
+`{"cpu": device}`.
+A checkpoint saved from the accelerator can only be loaded without
+`map_location` in a process that has called `register_mojo_devices()`, so
+pass `map_location="cpu"` to read it anywhere else, or save CPU copies
+(`{k: v.cpu() for k, v in model.state_dict().items()}`) when the file must
+load without the backend.
 
 ## Processes and `fork`
 
@@ -417,7 +449,7 @@ Keep device work out of the dataset and in the main process.
 
 ## Not supported
 
-- `torch.amp.GradScaler`, see [Mixed precision](#mixed-precision).
+- `torch.amp.GradScaler` on Apple GPUs, see [Mixed precision](#mixed-precision).
 - CUDA graphs (`torch.cuda.graph`, `CUDAGraph`, `make_graphed_callables`) have
   no equivalent.
 

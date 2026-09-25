@@ -18,8 +18,9 @@
 # for the full leg-by-leg description and RUN_MOJO=0/1 semantics.
 #
 # Three phases, in order:
-#   A. tests/ddp_worker.py collectives/ddp_parity/stress at 16 ranks, once
-#      per ccl.
+#   A. tests/ddp_worker.py collectives/ddp_parity/stress and
+#      tests/fsdp_worker.py reduce_scatter/fsdp_collectives_stress at 16
+#      ranks, once per ccl.
 #   B. ar_bench_gpt2.py (allreduce device-time bench) in ABBA order
 #      (vendor, mojo, mojo, vendor) so a thermal/clock ramp cancels to
 #      first order (see AGENTS.md "Benchmark harness notes").
@@ -82,17 +83,17 @@ set_ccl() {  # $1 = vendor|mojo
   fi
 }
 
-run_worker() {  # $1 = ccl, $2 = mode
-  local ccl=$1 mode=$2
-  echo "=== ddp_worker ccl=$ccl mode=$mode (16 ranks) ==="
+run_worker() {  # $1 = ccl, $2 = mode, $3 = worker (default ddp_worker)
+  local ccl=$1 mode=$2 worker=${3:-ddp_worker}
+  echo "=== $worker ccl=$ccl mode=$mode (16 ranks) ==="
   set_ccl "$ccl"
-  local log="$LOGDIR/mojoccl_2node_${SLURM_JOB_ID}_worker_${ccl}_${mode}.log"
+  local log="$LOGDIR/mojoccl_2node_${SLURM_JOB_ID}_${worker}_${ccl}_${mode}.log"
   srun bash -c "flock /tmp/gpu_lock_0.lock uv run --no-sync torchrun \
       --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d \
       --rdzv-endpoint=$MASTER_ADDR:29601 --rdzv-id=\$SLURM_JOB_ID \
-      tests/ddp_worker.py $mode" \
+      tests/$worker.py $mode" \
     2>&1 | tee "$log" | grep -iE "^\[rank|FAILURES|Error|Traceback"
-  echo "=== ddp_worker ccl=$ccl mode=$mode exit: ${PIPESTATUS[0]} ==="
+  echo "=== $worker ccl=$ccl mode=$mode exit: ${PIPESTATUS[0]} ==="
 }
 
 run_bench() {  # $1 = ccl, $2 = leg number (label only)
@@ -133,6 +134,12 @@ for ccl in vendor mojo; do
   fi
   for mode in collectives ddp_parity stress; do
     run_worker "$ccl" "$mode"
+  done
+  # The multi-node all-gather/reduce-scatter paths FSDP2 uses (split
+  # pipelined gathers, the hierarchical reduce-scatter) at FSDP2 sizes. Not
+  # `parity`: its DCP round trip wants a temp directory shared by the nodes.
+  for mode in reduce_scatter fsdp_collectives_stress; do
+    run_worker "$ccl" "$mode" fsdp_worker
   done
 done
 

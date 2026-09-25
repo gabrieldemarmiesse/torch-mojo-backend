@@ -32,8 +32,15 @@ noted):
         -I torch_mojo_backend/mojo -o /tmp/ib_bringup
     uv run --no-sync mojo build tests/multinode/selftest/ib_pipeline.mojo \
         -I torch_mojo_backend/mojo -o /tmp/ib_pipeline
+    # geometry_test checks the geometry of the accelerator it is built for
+    # (`comptime if _AMD`: the AMD bounds). With no
+    # --target-accelerator it checks the build host's default, which is
+    # not AMD on a GPU-less login node, so build it once per target.
     uv run --no-sync mojo build tests/multinode/selftest/geometry_test.mojo \
         -I torch_mojo_backend/mojo -o /tmp/geometry_test
+    uv run --no-sync mojo build tests/multinode/selftest/geometry_test.mojo \
+        --target-accelerator gfx942 \
+        -I torch_mojo_backend/mojo -o /tmp/geometry_test_gfx942
     uv run --no-sync mojo build tests/multinode/selftest/fd_exchange.mojo \
         -I torch_mojo_backend/mojo -o /tmp/fd_exchange
     uv run --no-sync mojo build tests/multinode/selftest/sock_deadline.mojo \

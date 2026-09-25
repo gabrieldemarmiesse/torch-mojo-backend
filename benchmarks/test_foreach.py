@@ -25,6 +25,10 @@ LISTS: dict[str, list[tuple[int, ...]]] = {
 }
 
 COVERS: dict[str, str] = {
+    "aten::_amp_foreach_non_finite_check_and_unscale_": (
+        "test_amp_non_finite_check_and_unscale_"
+    ),
+    "aten::_amp_update_scale_": "test_amp_update_scale_",
     "aten::_foreach_copy_": "test_foreach_copy_cast",
     "aten::_foreach_add_.Scalar": "test_foreach_add_",
     "aten::_foreach_addcmul_.Scalar": "test_foreach_addcmul_",
@@ -154,6 +158,48 @@ def _lists(
 
 def _total(shape_id: str) -> float:
     return float(sum(torch.Size(s).numel() for s in LISTS[shape_id]))
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", LISTS)
+@pytest.mark.bench_op("_amp_foreach_non_finite_check_and_unscale_")
+def test_amp_non_finite_check_and_unscale_(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """GradScaler.unscale_: finite grads, so every element is read and scaled."""
+    ((ref, our),) = _lists(shape_id, hw, mojo_device)
+    found_ref, found_our = both(torch.zeros(()), hw, mojo_device)
+    inv_ref, inv_our = both(torch.tensor(0.9999), hw, mojo_device)
+    bench.run(
+        lambda: torch._amp_foreach_non_finite_check_and_unscale_(
+            ref, found_ref, inv_ref
+        ),
+        lambda: torch._amp_foreach_non_finite_check_and_unscale_(
+            our, found_our, inv_our
+        ),
+        flops=_total(shape_id),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", ("S_scalar",))
+@pytest.mark.bench_op("_amp_update_scale_")
+def test_amp_update_scale_(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """GradScaler.update: one thread on three device scalars."""
+    scale_ref, scale_our = both(torch.tensor(65536.0), hw, mojo_device)
+    tracker_ref, tracker_our = both(torch.zeros((), dtype=torch.int32), hw, mojo_device)
+    found_ref, found_our = both(torch.zeros(()), hw, mojo_device)
+    bench.run(
+        lambda: torch._amp_update_scale_(
+            scale_ref, tracker_ref, found_ref, 2.0, 0.5, 2**30
+        ),
+        lambda: torch._amp_update_scale_(
+            scale_our, tracker_our, found_our, 2.0, 0.5, 2**30
+        ),
+        flops=1.0,
+    )
 
 
 @pytest.mark.parametrize("dtype_id", ("f32",))

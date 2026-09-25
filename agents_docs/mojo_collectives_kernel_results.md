@@ -678,28 +678,35 @@ loop, so every polling thread invalidates the whole cache on every iteration
 and throws the payload out of L2 for every block still working: 27 MiB
 measured 243 microseconds at 128 blocks and 465 at 1024 with that spelling.
 
-**Three cheaper spellings were tried. All three are given up, and the shipped
-barrier is the one that was there before this work.** They are recorded
-because the pattern is the same every time and it is the lesson of the
-engagement: each looked provably equivalent, and each broke only the *small*
-collectives, where a payload is a few hundred bytes instead of megabytes and
-therefore does not drain out of a cache on its own.
+**Three cheaper spellings were tried in this engagement and all three were
+given up; the barrier shipped on 2026-09-09 was the one that was there before
+this work.** The two release-side ones stay given up. The acquire-side one,
+a relaxed spin with one acquire fence after it, was re-adopted on gfx942 on
+2026-09-24 (PR #545), its fence moved out of the polling branch after
+review. Section 7 has why, and what the evidence does and
+does not show. The spellings are recorded because the pattern was the same
+every time and it was the lesson of the engagement: each looked provably
+equivalent, and each broke only the *small* collectives, where a payload is
+a few hundred bytes instead of megabytes and therefore does not drain out of
+a cache on its own.
 
 | spelling | 27 MiB allreduce | broadcast, 4 ranks | 1-element allreduce, 2 ranks |
 |---|---|---|---|
 | no release writeback at all (RCCL's `skip_fence`) | correct | **5 failures** | — |
 | release writeback moved after the barrier, into the `world` publishing threads | correct | correct | **fails** |
-| relaxed spin + one acquire fence after the wait | correct | correct | **2 failures in 13 runs** |
-| shipped: release fence in every thread, acquire load per iteration | correct | correct | 0 failures in 12 runs |
+| relaxed spin + one acquire fence after the wait (2026-09-09) | correct | correct | **2 failures in 13 runs** |
+| release fence in every thread, acquire load per iteration (shipped 2026-09-09; still every non-gfx942 target) | correct | correct | 0 failures in 12 runs |
+| gfx942 since PR #545: relaxed spin + `s_sleep(1)`, one acquire fence per wave after the polling branch | correct | correct | 0 failures; no directed repeat (section 7) |
 
 RCCL's `skip_fence` (`rccl:src/include/rccl_common.h:262-273`, on for cudaArch
 940 when the buffers are uncached) is sound for RCCL and not for us: our region
 *is* `hipDeviceMallocUncached`, but the mapping a peer writes **through** comes
 from `hipIpcOpenMemHandle` and does not carry that memory type, so a few bytes
 can still be sitting in the writer's cache when the flag lands. The third row
-is the one that hurts -- it is worth 75 microseconds at 168 MiB and its
-failure evidence is weak (Fisher p about 0.5 against the fourth row) -- and
-section 7 explains why it went anyway.
+is the one that hurt -- it is worth 75 microseconds at 168 MiB and its
+failure evidence is weak (Fisher p about 0.5 against the fourth row) --
+section 7 explains why it went on 2026-09-09 and why its fifth-row form came
+back.
 
 The one thing that did *not* have to be given up is the AMD `vmcnt(0)` drain
 that was already there: `fence[RELEASE]()` in every thread before the block
@@ -782,8 +789,10 @@ ceiling with no measurable overhead. On top of that this design pays the local
 gather copy (0.75 x message read and written locally, ~90 microseconds
 measured) and the barrier's whole-cache operations at the 912-block grid the
 large sizes want (measured: the same allreduce is 1221 microseconds at 912
-blocks with a cheapened barrier and 1335 with the shipped one; section 7 says
-why the cheap one was given up). Removing either needs a change this
+blocks with the relaxed-spin barrier and 1335 with the per-iteration acquire
+load shipped at the time; section 7 says why the relaxed spin was given up
+then and re-adopted since, and these 2026-09-09 tables were not re-measured
+with it). Removing either needs a change this
 engagement did not make: overlapping the gather copy with the second push
 behind a sub-chunk pipeline, or a barrier that is both demonstrably sound here
 and cheaper than one whole-cache operation per thread per sync.
@@ -848,8 +857,8 @@ every mode passed. With the acquire load restored: **0 failures in 12 runs**
 (`perf-work/flake.sh`, same node, same session).
 
 Neither sample proves anything on its own — Fisher's exact on 2/13 against
-0/12 is p ≈ 0.5. It is reverted anyway, and the reasoning is worth recording
-because it is the lesson of the day rather than a number:
+0/12 is p ≈ 0.5. It was reverted anyway on 2026-09-09, and the reasoning is
+worth recording because it was the lesson of the day rather than a number:
 
 * the one-shot kernel is **unchanged** by this work, so the only thing that
   could have introduced a failure under it is the barrier;
@@ -868,5 +877,60 @@ that harness, a harness problem rather than a result. So it is still unknown
 whether this is a pre-existing race that the cheap acquire merely made more
 likely. Settling it needs a few hundred runs of the 2-rank `collectives` mode
 on both trees with the before-tree harness fixed; the shipped tree at
-0/12 is not evidence of absence.
+0/12 is not evidence of absence. A later A/B with a working harness ran the
+pre-MI300A tree against the acquire-load tree: 0/20 on each. It shows the
+redesign did not bring the flake in; it says nothing about the relaxed spin,
+which neither tree had.
+
+**Update, 2026-09-24: the relaxed spin is back on gfx942, fence moved.**
+PR #545 re-adopted it for gfx942 only (every other target keeps the
+acquire load), with RCCL 2.22.3's `s_sleep(1)` between failed polls. The
+reason was a workload, not this benchmark: on 2 × 4 MI300A (GPT-2 XL FSDP2)
+the per-iteration invalidate evicts the L2 of the compute kernels running
+beside the collective, and the relaxed spin took the profiled communication
+busy time from 209.5 to 188.5 ms per step and the compute kernel sum from
+249 to 235 ms. End to end the gain was about 1%, inside the leg noise.
+`agents_docs/distributed.md` ("gfx942 waits acquire payloads once") has the
+ordering argument: a relaxed load that reads the release store, followed by
+an acquire fence, is the atomic-to-fence rule of the C++ and LLVM memory
+models. That is a proof, not the symmetry argument of 2026-09-09.
+
+A later code review then found why the symmetry argument was worse than
+unproven. In its first spelling the fence sat at the end of the `thread_idx.x < world`
+branch, right after the divergent spin loop. The loop leaves EXEC holding
+the lanes still waiting, which is 0 once every flag is seen, and LLVM's
+SILowerControlFlow, which treats a fence as not reading EXEC, dropped the
+loop's EXEC restore in front of it. So in the gfx942 assembly
+`buffer_inv sc0 sc1` ran with EXEC = 0 on every successful exit, whether
+the first poll succeeded or a later one did. It was an acquire only if the
+hardware ignores EXEC for a cache invalidate, and nothing verified that for
+CDNA3. If the 2026-09-09 spelling had its fence in the same place (its
+assembly was not kept), a success path with no acquire at all is a
+plausible cause of the 2/13, and would also explain why only one-element
+payloads failed. That is unverified. The review fix moved the fence after
+the branch closes. Every wave now issues it under its full mask, one
+invalidate per wave per barrier and still none in the spin. The gfx942
+assembly of the CCL entry shows all 309 barrier acquires after the EXEC
+restore and directly before `s_barrier`, against 0 of 305 in the first
+spelling's dump.
+
+What the correctness evidence shows, then:
+
+* **For the old spelling:** 2 failures in 13 runs of the 2-rank
+  one-element allreduce.
+* **For the first spelling's in-branch fence** (EXEC = 0): no failure in any
+  validation round of the 2 × 4 and 1 × 4 suites, one per commit. Since
+  the same PR the DDP `stress` mode runs one-element int64 allreduces in
+  every generation, with changing data and an exact integer reference.
+  None of this was a directed repeat of the 2-rank loop, so it bounds the
+  rate only loosely. It does not show the in-branch fence was sound.
+* **For the fence after the branch:** the soundness argument no longer
+  rests on the hardware ignoring EXEC. Its success path is the old
+  acquire load's last iteration, `global_load sc0 sc1; s_waitcnt;
+  buffer_inv sc0 sc1`, executed by a wave with a non-empty mask. The
+  2 × 4 and 1 × 4 suites passed with it, 20 of 20, one-element int64
+  generations included. That was one round, not a directed repeat.
+
+The combined samples settle nothing statistically. What changed is that
+the barrier no longer needs the untested assumption.
 

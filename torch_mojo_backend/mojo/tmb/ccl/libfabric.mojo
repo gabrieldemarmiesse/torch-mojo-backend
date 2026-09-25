@@ -73,6 +73,7 @@ from tmb.ccl.netutil import (
     alloc_bytes,
     as_fn,
     c_string,
+    free_bytes,
     ld32,
     ld64,
     ldu32,
@@ -215,6 +216,7 @@ comptime FI_READ: UInt64 = 1 << 8
 comptime FI_WRITE: UInt64 = 1 << 9
 comptime FI_RECV: UInt64 = 1 << 10
 comptime FI_SEND: UInt64 = 1 << 11
+comptime FI_TRANSMIT: UInt64 = FI_SEND  # fabric.h: `#define FI_TRANSMIT FI_SEND`
 comptime FI_REMOTE_READ: UInt64 = 1 << 12
 comptime FI_REMOTE_WRITE: UInt64 = 1 << 13
 comptime FI_REMOTE_CQ_DATA: UInt64 = 1 << 17
@@ -304,6 +306,10 @@ comptime CTX_SEQ_MASK = (1 << 40) - 1
 
 comptime EP_NAME_MAX = 80  # what `IB_BLOB_BYTES` leaves for an endpoint name
 comptime FLUSH_PAD_BYTES = 4096
+comptime FLUSH_EP_CAPS: UInt64 = FI_RMA | FI_READ
+"""All the flush endpoint does is initiate one RMA read. No FI_MSG, no
+receive and no remote access: it never receives, and the read's target is
+the data endpoint, which serves the region's MR."""
 comptime RECV_BUF_BYTES = 64
 # Completion-queue depth. Far above what can be outstanding (flow control
 # caps it at `nslots` exchanges, each worth two transmit completions and two
@@ -376,6 +382,11 @@ struct Fab(Movable):
 
     def freeinfo(self, info: Int) raises:
         _ = self.lib.get_function[NoneType]("fi_freeinfo")(info)
+
+    def dupinfo(self, info: Int) raises -> Int:
+        """`fi_dupinfo(info)`: a deep copy, freed with `freeinfo`; 0 if the
+        library could not allocate it."""
+        return Int(self.lib.get_function[Int64]("fi_dupinfo")(info))
 
     def fabric(self, attr: Int, out_fabric: P8) raises -> Int32:
         return self.lib.get_function[Int32]("fi_fabric")(
@@ -585,9 +596,11 @@ comptime EAGAIN_SPINS = 1_000_000
 struct FabricNet(Movable):
     """Everything the libfabric transport owns, per communicator.
 
-    One RDM endpoint, one completion queue for both directions, one address
-    vector holding this rank's own address (for the flush read) and one
-    entry per remote node. Two memory regions: the communicator's device
+    One RDM endpoint (two when the second comes up: it only issues the
+    flush read, `_flush_ep_open`), one completion queue for both
+    directions, one
+    address vector holding this rank's own address (for the flush read) and
+    one entry per remote node. Two memory regions: the communicator's device
     region, and a host scratch area holding the flush landing pad and the
     receive buffers.
     """
@@ -614,6 +627,10 @@ struct FabricNet(Movable):
     var my_name: Int  # EP_NAME_MAX scratch holding fi_getname's answer
     var virt_addr: Bool  # FI_MR_VIRT_ADDR: remote addresses are VAs, not offsets
     var need_endpoint_mr: Bool
+    var flush_ep: Int  # 0 if `_flush_ep_open` failed: the flush uses `ep`
+    var flush_mr: Int  # its landing pad's MR under FI_MR_ENDPOINT, or 0
+    var flush_desc: Int
+    var flush_info: Int  # `fi_dupinfo` copy flush_ep was opened from, or 0
     var hmem_iface: Int
     var recv_depth: Int
     var self_addr: UInt64
@@ -660,6 +677,10 @@ struct FabricNet(Movable):
         self.my_name = Int(alloc_bytes(EP_NAME_MAX))
         self.virt_addr = False
         self.need_endpoint_mr = False
+        self.flush_ep = 0
+        self.flush_mr = 0
+        self.flush_desc = 0
+        self.flush_info = 0
         self.hmem_iface = FI_HMEM_SYSTEM
         self.recv_depth = 0
         self.self_addr = FI_ADDR_UNSPEC
@@ -908,38 +929,140 @@ def _check(f: FabricNet, rc: Int, what: String) raises:
 
 
 def _reg_mr(
-    mut f: FabricNet, addr: Int, nbytes: Int, iface: Int, out_key: P8
+    mut f: FabricNet,
+    addr: Int,
+    nbytes: Int,
+    iface: Int,
+    out_key: P8,
+    ep: Int = 0,
+    access: UInt64 = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE,
 ) raises -> Int:
-    """One `fi_mr_regattr`, bound to the endpoint and enabled if the
-    provider asked for FI_MR_ENDPOINT. Returns the fid_mr, or 0."""
+    """One `fi_mr_regattr`, bound to the endpoint (`ep`, default the data
+    endpoint) and enabled if the provider asked for FI_MR_ENDPOINT. Returns
+    the fid_mr, or a negative libfabric error from the registration. A
+    failed bind or enable closes the MR before raising, so a caller that
+    catches the error has nothing to clean up."""
     var attr = alloc_bytes(SZ_FI_MR_ATTR)
     var iov = alloc_bytes(SZ_IOVEC)
     st64(iov, IOV_BASE, addr)
     st64(iov, IOV_LEN, nbytes)
     st64(attr, MRA_MR_IOV, Int(iov))
     st64(attr, MRA_IOV_COUNT, 1)
-    stu64(
-        attr,
-        MRA_ACCESS,
-        FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE,
-    )
+    stu64(attr, MRA_ACCESS, access)
     stu64(attr, MRA_OFFSET, 0)
     stu64(attr, MRA_REQUESTED_KEY, 0)
     st32(attr, MRA_IFACE, Int32(iface))
     var out = alloc_bytes(8)
     var rc = fi_mr_regattr(f.domain, attr, 0, out)
-    if rc != 0:
-        stu64(out_key, 0, 0)
-        return Int(rc)  # negative: a libfabric error, not a fid_mr
     var mr = ld64(out, 0)
-    if f.need_endpoint_mr:
+    free_bytes(out)
+    if rc == 0 and f.need_endpoint_mr:
         # FI_MR_ENDPOINT: the key is only valid once the MR is attached to
         # the endpoint that will serve it, and reading it before
         # `fi_mr_enable` gives FI_KEY_NOTAVAIL.
-        _check(f, Int(fi_bind(mr, f.ep, 0)), "fi_mr_bind")
-        _check(f, Int(fi_enable(mr)), "fi_mr_enable")
+        try:
+            _check(
+                f, Int(fi_bind(mr, ep if ep != 0 else f.ep, 0)), "fi_mr_bind"
+            )
+            _check(f, Int(fi_enable(mr)), "fi_mr_enable")
+        except e:
+            _ = fi_close(mr)
+            free_bytes(iov)
+            free_bytes(attr)
+            raise e
+    # Scratch of this call only: the provider copies the attributes, and the
+    # bind and enable above ran with them still live.
+    free_bytes(iov)
+    free_bytes(attr)
+    if rc != 0:
+        stu64(out_key, 0, 0)
+        return Int(rc)  # negative: a libfabric error, not a fid_mr
     stu64(out_key, 0, fi_mr_key(mr))
     return mr
+
+
+def _flush_ep_open(mut st: FabricNet) raises:
+    """Bring up the flush endpoint and, under FI_MR_ENDPOINT, its landing
+    pad's MR. On an error the caller runs `_flush_ep_close`, which undoes
+    whatever part of this ran, and the flush stays on the data endpoint.
+
+    On the data endpoint the flush read sits in the transmit queue behind
+    whatever was posted since -- the next exchange's multi-megabyte write --
+    so exchange e retires only once e+1's payload has gone out. The verbs
+    path keeps its flush on a separate QP for the same reason (NCCL's
+    gpuFlush QP). An optimization, never a requirement.
+
+    Same domain (so the same NIC and PCIe function, which is what makes its
+    read a flush of that NIC's earlier writes), same CQ and AV as the data
+    endpoint. It is opened from a copy of the data endpoint's `fi_info`
+    with the capabilities cut to `FLUSH_EP_CAPS` and none on the receive
+    side, and binds the CQ for transmit completions only: the endpoint
+    should cost the provider no receive resources at all.
+    """
+    var fi = st.fab.dupinfo(st.info)
+    if fi == 0:
+        raise Error("mojoccl: fi_dupinfo of the endpoint info returned NULL")
+    st.flush_info = fi
+    var fp = P8(unsafe_from_address=fi)
+    stu64(fp, INFO_CAPS, FLUSH_EP_CAPS)
+    var tx = ld64(fp, INFO_TX_ATTR)
+    if tx != 0:
+        stu64(P8(unsafe_from_address=tx), TXA_CAPS, FLUSH_EP_CAPS)
+    var rx = ld64(fp, INFO_RX_ATTR)
+    if rx != 0:
+        stu64(P8(unsafe_from_address=rx), RXA_CAPS, 0)
+    var o = alloc_bytes(8)
+    var rc = Int(fi_endpoint(st.domain, fi, o))
+    var ep = ld64(o, 0)
+    free_bytes(o)
+    _check(st, rc, "fi_endpoint(flush)")
+    st.flush_ep = ep
+    _check(
+        st,
+        Int(fi_bind(st.flush_ep, st.cq, FI_TRANSMIT)),
+        "fi_ep_bind(flush cq)",
+    )
+    _check(st, Int(fi_bind(st.flush_ep, st.av, 0)), "fi_ep_bind(flush av)")
+    _check(st, Int(fi_enable(st.flush_ep)), "fi_enable(flush)")
+    if st.need_endpoint_mr:
+        # The landing pad, registered again for the flush endpoint. Local
+        # access only: it is the destination of this endpoint's own read.
+        var keybuf = alloc_bytes(8)
+        try:
+            var fmr = _reg_mr(
+                st,
+                st.host,
+                FLUSH_PAD_BYTES,
+                FI_HMEM_SYSTEM,
+                keybuf,
+                st.flush_ep,
+                FI_READ,
+            )
+            if fmr <= 0:
+                _check(st, fmr, "fi_mr_regattr of the flush landing pad")
+            st.flush_mr = fmr
+            st.flush_desc = fi_mr_desc(st.flush_mr)
+        finally:
+            # Never sent: the pad is only this endpoint's own read target.
+            free_bytes(keybuf)
+
+
+def _flush_ep_close(mut f: FabricNet):
+    """Undo `_flush_ep_open`, whatever part of it ran, and point the flush
+    back at the data endpoint's landing pad. Zero-guarded: also part of
+    `fab_teardown`."""
+    _ = fi_close(f.flush_mr)
+    f.flush_mr = 0
+    _ = fi_close(f.flush_ep)
+    f.flush_ep = 0
+    if f.flush_info != 0:
+        try:
+            f.fab.freeinfo(f.flush_info)
+        except e:
+            # Best-effort; the pointer is dropped either way.
+            print("mojoccl: fi_freeinfo failed (ignored):", e)
+        f.flush_info = 0
+    f.flush_desc = f.host_desc
 
 
 def _fab_setup_once(
@@ -1118,6 +1241,22 @@ def _fab_setup_once(
             _check(st, hmr, "fi_mr_regattr of the host scratch")
         st.host_mr = hmr
         st.host_desc = fi_mr_desc(st.host_mr)
+        st.flush_desc = st.host_desc
+        try:
+            _flush_ep_open(st)
+        except e:
+            # Never fatal: the data endpoint flushes correctly, only later.
+            # A second endpoint is a second cxi address context, and the
+            # node memory pressure `_check` describes can deny it after the
+            # first one succeeded.
+            _flush_ep_close(st)
+            print(
+                (
+                    "mojoccl: flush endpoint unavailable, flushing on the"
+                    " data endpoint --"
+                ),
+                e,
+            )
 
         # ---- the communicator's region ---------------------------------
         # Ask the provider which accelerator interface can register this
@@ -1525,13 +1664,16 @@ def fab_post_flush(
     it, and on an MI300A "device memory" is host-attached HBM anyway, so the
     read stays: it costs about a microsecond and it is the difference
     between an argument and a guarantee. The flush is always enabled.
+
+    It goes on its own endpoint when one came up (`_flush_ep_open`;
+    measured in agents_docs/distributed.md).
     """
     for _ in range(EAGAIN_SPINS):
         var rc = fi_read(
-            f.ep,
+            f.flush_ep if f.flush_ep != 0 else f.ep,
             f.host,
             nbytes,
-            f.host_desc,
+            f.flush_desc,
             f.self_addr,
             UInt64(remote_off if not f.virt_addr else f.region + remote_off),
             f.mr_key,
@@ -1594,6 +1736,7 @@ def fab_describe(f: FabricNet) -> String:
         + String(f.addrlen)
         + " recv_depth="
         + String(f.recv_depth)
+        + (" flush_ep=own" if f.flush_ep != 0 else " flush_ep=data")
     )
 
 
@@ -1601,6 +1744,7 @@ def fab_teardown(mut f: FabricNet):
     """Close everything, in reverse order of creation and zero-guarded --
     this runs both on a live communicator's teardown and from `fab_setup`'s
     own failure path, where only some of it exists."""
+    _flush_ep_close(f)
     _ = fi_close(f.mr)
     f.mr = 0
     _ = fi_close(f.host_mr)

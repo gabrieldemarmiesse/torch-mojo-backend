@@ -471,8 +471,8 @@ def run_ddp_parity(failures: list[str]):
 
 def run_stress(failures: list[str]):
     """Many collectives back to back, mixed (including awkward) sizes:
-    allreduce/broadcast/all_gather run under every ccl; reduce/reduce_scatter/
-    all_to_all/gather/scatter/send-recv (mojoccl does not implement them) only
+    allreduce/broadcast/all_gather/reduce_scatter run under every ccl;
+    reduce/all_to_all/gather/scatter/send-recv (mojoccl does not implement them) only
     under vendor NCCL/RCCL.
     """
     rank = dist.get_rank()
@@ -481,13 +481,22 @@ def run_stress(failures: list[str]):
     sizes = [1, 3, 257, 1024, 1003, 4096, 65537]  # 1 elem, non-16B, several MiB
     rounds = 40
 
-    ok_allreduce = ok_broadcast = ok_allgather = True
+    ok_allreduce = ok_broadcast = ok_allgather = ok_reduce_scatter = True
+    ok_tiny_int64 = True
     for i in range(rounds):
         n = sizes[i % len(sizes)]
 
         t = torch.full((n,), float(rank + 1), device="mojo")
         dist.all_reduce(t)
         ok_allreduce = ok_allreduce and bool((t.cpu() == total).all())
+
+        # The historical AMD ordering flake involved exactly one int64.
+        # Change its value each generation so stale flags/payloads cannot pass.
+        tiny = torch.full((1,), rank + i, dtype=torch.int64, device="mojo")
+        dist.all_reduce(tiny)
+        ok_tiny_int64 = ok_tiny_int64 and tiny.cpu().item() == (
+            world * i + world * (world - 1) // 2
+        )
 
         root = i % world
         b = torch.full((n,), float(rank), device="mojo")
@@ -501,20 +510,43 @@ def run_stress(failures: list[str]):
             bool((flat.cpu()[r * n : (r + 1) * n] == float(r)).all())
             for r in range(world)
         )
+        # Changing values distinguish the current generation from stale
+        # staging/inbox data; an odd input offset exercises scalar tails.
+        base = torch.arange(world * n + 1, dtype=torch.float32) % 17
+        src = (base + rank + i).to("mojo")[1:]
+        out = torch.empty(n, device="mojo")
+        op = dist.ReduceOp.SUM if i % 2 else dist.ReduceOp.AVG
+        dist.reduce_scatter_tensor(out, src, op=op)
+        expected = (base[1:].reshape(world, n)[rank] + i) * world + world * (
+            world - 1
+        ) // 2
+        if op == dist.ReduceOp.AVG:
+            expected /= world
+        # AVG scales each contribution before summing (PreMulSum): exact only
+        # when 1/world is, i.e. for a power-of-two world.
+        exact = op == dist.ReduceOp.SUM or world & (world - 1) == 0
+        got = out.cpu()
+        ok_reduce_scatter = ok_reduce_scatter and (
+            bool((got == expected).all())
+            if exact
+            else torch.allclose(got, expected, rtol=1e-6, atol=1e-6)
+        )
     _check(failures, "stress.allreduce", ok_allreduce)
+    _check(failures, "stress.allreduce_tiny_int64", ok_tiny_int64)
     _check(failures, "stress.broadcast", ok_broadcast)
     _check(failures, "stress.allgather", ok_allgather)
+    _check(failures, "stress.reduce_scatter", ok_reduce_scatter)
 
     if _MOJO_CCL:
-        _skip(rank, "stress.reduce/reduce_scatter/all_to_all/gather/scatter/send_recv")
+        _skip(rank, "stress.reduce/all_to_all/gather/scatter/send_recv")
         dist.barrier()
         return
 
     full_rounds = 20
     with _tolerate_missing_ops(
-        rank, "stress.reduce/reduce_scatter/all_to_all/gather/scatter/send_recv"
+        rank, "stress.reduce/all_to_all/gather/scatter/send_recv"
     ):
-        ok_reduce = ok_reduce_scatter = ok_alltoall = True
+        ok_reduce = ok_alltoall = True
         ok_gather = ok_scatter = ok_send_recv = True
         for i in range(full_rounds):
             n = sizes[i % len(sizes)]
@@ -523,15 +555,6 @@ def run_stress(failures: list[str]):
             dist.reduce(r, dst=0)
             if rank == 0:
                 ok_reduce = ok_reduce and bool((r.cpu() == total).all())
-
-            src = torch.arange(world * n, dtype=torch.float32).to("mojo")
-            out = torch.zeros(n, device="mojo")
-            dist.reduce_scatter_tensor(out, src)
-            exp = (
-                torch.arange(world * n, dtype=torch.float32)[rank * n : (rank + 1) * n]
-                * world
-            )
-            ok_reduce_scatter = ok_reduce_scatter and bool((out.cpu() == exp).all())
 
             a_in = torch.full((n * world,), float(rank), device="mojo")
             a_out = torch.empty_like(a_in)
@@ -580,7 +603,6 @@ def run_stress(failures: list[str]):
                 )
 
         _check(failures, "stress.reduce", ok_reduce)
-        _check(failures, "stress.reduce_scatter", ok_reduce_scatter)
         _check(failures, "stress.all_to_all", ok_alltoall)
         _check(failures, "stress.gather", ok_gather)
         _check(failures, "stress.scatter", ok_scatter)

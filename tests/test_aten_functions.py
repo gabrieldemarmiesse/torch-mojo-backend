@@ -2070,6 +2070,27 @@ def test_aten_masked_fill__inplace_tensor(conf: Conf):
     check_outputs(fn, conf, [x, mask, value])
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+@pytest.mark.parametrize(
+    ("x_shape", "mask_shape"), [((3, 4), (3, 4)), ((3, 4), (4,)), ((), (5,))]
+)
+def test_aten_masked_select(
+    conf: Conf,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    x_shape: tuple[int, ...],
+    mask_shape: tuple[int, ...],
+):
+    call_checker.register("aten::masked_select")
+
+    def fn(x, mask):
+        return aten.masked_select(x, mask)
+
+    x = (torch.randn(x_shape) * 10).to(dtype)
+    mask = torch.randn(mask_shape) > 0
+    check_outputs(fn, conf, [x, mask])
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_aten_ceil_basic(conf: Conf, dtype: torch.dtype):
     """Test aten.ceil basic functionality with floating point numbers"""

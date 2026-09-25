@@ -28,7 +28,8 @@ this file.
 import pytest
 import torch
 
-from torch_mojo_backend import aten_functions, native
+from tests.native.conftest import skip_if_metal
+from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.testing import CallChecker
 
 pytestmark = pytest.mark.xdist_group(name="group_native_foreach")
@@ -716,6 +717,205 @@ def test_fused_adamw_optimizer_two_groups_matches_cpu(mojo_gpu: str):
             )
         assert mojo_state["step"].device == torch.device(mojo_gpu)
     _assert_ran("aten::_fused_adamw_")
+
+
+def _amp_grads(dtype: torch.dtype, *, poison: float | None) -> list[torch.Tensor]:
+    """CPU grads: an empty tensor, a misaligned view, and sizes around the
+    batched kernel's chunk and vector boundaries; `poison` lands in the last."""
+    base = torch.arange(65_541, dtype=torch.float32).mul(0.37).remainder(9.0).sub(4.5)
+    grads = [
+        base[:7].clone(),
+        base[1:1106].clone().reshape(17, 65),
+        base[:0].clone(),
+        base[3:30].clone().reshape(3, 3, 3),
+        base[2:65_541].clone(),
+    ]
+    if poison is not None:
+        grads[-1][40_000] = poison
+    return [g.to(dtype) for g in grads]
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["f32", "f16", "bf16"]
+)
+@pytest.mark.parametrize("inv_scale", [0.25, 1.0, 1.0 / 3.0])
+@pytest.mark.parametrize(
+    "poison", [None, float("inf"), float("-inf"), float("nan")], ids=str
+)
+def test_amp_foreach_non_finite_check_and_unscale_matches_cpu(
+    mojo_gpu: str, dtype: torch.dtype, inv_scale: float, poison: float | None
+):
+    if dtype != torch.float32:
+        skip_if_metal(mojo_gpu, "the Metal batched foreach arm is float32 only")
+    _watch("aten::_amp_foreach_non_finite_check_and_unscale_")
+    cpu = _amp_grads(dtype, poison=poison)
+    # Offset views put the batched kernel's vector body off a 16-byte boundary.
+    storage = [torch.empty(g.numel() + 1, dtype=dtype, device=mojo_gpu) for g in cpu]
+    ours = [s[1:].view(g.shape).copy_(g) for s, g in zip(storage, cpu, strict=True)]
+    cpu_found = torch.zeros(())
+    cpu_inv = torch.tensor(inv_scale)
+    found = cpu_found.to(mojo_gpu)
+    inv = cpu_inv.to(mojo_gpu)
+    versions = [g._version for g in ours]
+    torch._amp_foreach_non_finite_check_and_unscale_(cpu, cpu_found, cpu_inv)
+    torch._amp_foreach_non_finite_check_and_unscale_(ours, found, inv)
+    for expected, actual in zip(cpu, ours, strict=True):
+        torch.testing.assert_close(
+            actual.cpu(), expected, rtol=0, atol=0, equal_nan=True
+        )
+    assert found.item() == cpu_found.item() == (0.0 if poison is None else 1.0)
+    assert all(g._version > v for g, v in zip(ours, versions, strict=True))
+    _assert_ran("aten::_amp_foreach_non_finite_check_and_unscale_")
+
+
+def test_amp_unscale_mixed_dtypes_and_non_dense_fall_back(mojo_gpu: str):
+    """A non-dense view (through a contiguous temporary) and a list that mixes
+    dtypes (one launch per tensor) give the CPU result; found_inf already set
+    stays set."""
+    _watch("aten::_amp_foreach_non_finite_check_and_unscale_")
+    cpu_base = torch.arange(96, dtype=torch.float32).reshape(8, 12).sub(40.0)
+    cpu_base[5, 6] = float("inf")
+    cpu = [cpu_base.t()[::2, 1:], torch.linspace(-3, 3, 37), cpu_base[:, ::3]]
+    base = cpu_base.to(mojo_gpu)
+    ours = [base.t()[::2, 1:], cpu[1].to(mojo_gpu), base[:, ::3]]
+    if get_accelerators()[0].api != "metal":
+        cpu[1] = cpu[1].to(torch.bfloat16)
+        ours[1] = ours[1].to(torch.bfloat16)
+    cpu_found, cpu_inv = torch.zeros(()), torch.tensor(0.5)
+    found, inv = cpu_found.to(mojo_gpu), cpu_inv.to(mojo_gpu)
+    torch._amp_foreach_non_finite_check_and_unscale_(cpu, cpu_found, cpu_inv)
+    torch._amp_foreach_non_finite_check_and_unscale_(ours, found, inv)
+    torch.testing.assert_close(base.cpu(), cpu_base, rtol=0, atol=0)
+    torch.testing.assert_close(ours[1].cpu(), cpu[1], rtol=0, atol=0)
+    assert found.item() == 1.0
+
+    finite = [torch.ones(5, device=mojo_gpu)]
+    torch._amp_foreach_non_finite_check_and_unscale_(finite, found, inv)
+    assert found.item() == 1.0, "a set found_inf must never be cleared"
+    torch._amp_foreach_non_finite_check_and_unscale_([], found, inv)
+    _assert_ran("aten::_amp_foreach_non_finite_check_and_unscale_")
+
+
+def test_amp_unscale_rejects_bad_scalars(mojo_gpu: str):
+    grads = [torch.ones(3, device=mojo_gpu)]
+    with pytest.raises(RuntimeError, match="found_inf"):
+        torch._amp_foreach_non_finite_check_and_unscale_(
+            grads, torch.zeros(2, device=mojo_gpu), torch.ones((), device=mojo_gpu)
+        )
+    with pytest.raises(RuntimeError, match="inv_scale"):
+        torch._amp_foreach_non_finite_check_and_unscale_(
+            grads,
+            torch.zeros((), device=mojo_gpu),
+            torch.ones((), dtype=torch.float16, device=mojo_gpu),
+        )
+
+
+def test_amp_update_scale_matches_cpu(mojo_gpu: str):
+    """Every branch of the state machine against ATen's CPU kernel: growth
+    after `growth_interval` clean steps, backoff (and tracker reset) on inf,
+    and a growth that would overflow float32 leaving the scale unchanged."""
+    _watch("aten::_amp_update_scale_")
+    found_seq = [0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0]
+    for initial in (65536.0, 3.0e38, 0.1):
+        cpu_scale = torch.tensor(initial)
+        cpu_tracker = torch.zeros((), dtype=torch.int32)
+        scale = cpu_scale.to(mojo_gpu)
+        tracker = cpu_tracker.to(mojo_gpu)
+        for found_value in found_seq:
+            cpu_found = torch.tensor(float(found_value))
+            args = (2.0, 0.5, 3)
+            torch._amp_update_scale_(cpu_scale, cpu_tracker, cpu_found, *args)
+            version = tracker._version
+            returned = torch._amp_update_scale_(
+                scale, tracker, cpu_found.to(mojo_gpu), *args
+            )
+            assert returned.data_ptr() == scale.data_ptr()
+            assert tracker._version > version
+            assert scale.item() == cpu_scale.item()
+            assert tracker.item() == cpu_tracker.item()
+    _assert_ran("aten::_amp_update_scale_")
+
+
+def test_amp_update_scale_rejects_bad_tracker(mojo_gpu: str):
+    with pytest.raises(RuntimeError, match="growth_tracker"):
+        torch._amp_update_scale_(
+            torch.ones((), device=mojo_gpu),
+            torch.zeros((), device=mojo_gpu),  # float32, not int32
+            torch.zeros((), device=mojo_gpu),
+            2.0,
+            0.5,
+            10,
+        )
+
+
+def _grad_scaler_run(
+    device: str, fused: bool, steps: int
+) -> tuple[list[torch.Tensor], list[float]]:
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(16, 32), torch.nn.ReLU(), torch.nn.Linear(32, 4)
+    )
+    model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, fused=fused)
+    scaler = torch.amp.GradScaler(
+        torch.device(device).type, init_scale=2.0**10, growth_interval=2
+    )
+    x = torch.linspace(-1.0, 1.0, 8 * 16).reshape(8, 16).to(device)
+    target = torch.arange(8).remainder(4).to(device)
+    scales = []
+    for step in range(steps):
+        loss = torch.nn.functional.cross_entropy(model(x), target)
+        if step == 3:
+            loss = loss * float("inf")  # this step must be skipped, scale halved
+        scaler.scale(loss).backward()
+        if step % 2:
+            scaler.unscale_(optimizer)  # the explicit unscale-then-clip recipe
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        scales.append(scaler.get_scale())
+    return [p.detach().cpu() for p in model.parameters()], scales
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["foreach", "fused"])
+def test_grad_scaler_training_matches_cpu(mojo_gpu: str, fused: bool):
+    """torch.amp.GradScaler end to end, against the same run on CPU: growth,
+    an inf step that is skipped with backoff, explicit unscale_ + clipping,
+    and both the foreach and the fused AdamW routes."""
+    skip_if_metal(mojo_gpu, "GradScaler.unscale_ needs float64")
+    _watch("aten::_amp_update_scale_")
+    cpu_params, cpu_scales = _grad_scaler_run("cpu", fused, steps=8)
+    params, scales = _grad_scaler_run(mojo_gpu, fused, steps=8)
+    assert scales == cpu_scales
+    assert scales[3] == scales[2] / 2
+    for expected, actual in zip(cpu_params, params, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    _assert_ran("aten::_amp_update_scale_")
+    _assert_ran("aten::_amp_foreach_non_finite_check_and_unscale_")
+
+
+def test_grad_scaler_with_float16_autocast(mojo_gpu: str):
+    """The recipe from torch's AMP docs trains on the mojo device."""
+    skip_if_metal(mojo_gpu, "GradScaler.unscale_ needs float64")
+    device = torch.device(mojo_gpu)
+    torch.manual_seed(0)
+    model = torch.nn.Linear(16, 4).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.5)
+    scaler = torch.amp.GradScaler(device.type)
+    x = torch.randn(64, 16).to(device)
+    target = x[:, :4].argmax(dim=1)
+    losses = []
+    for _ in range(30):
+        with torch.autocast(device.type, dtype=torch.float16):
+            loss = torch.nn.functional.cross_entropy(model(x), target)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        losses.append(loss.item())
+    assert losses[-1] < 0.5 * losses[0]
+    assert scaler.get_scale() > 0
 
 
 def _foreach_lists(device: str) -> list[list[torch.Tensor]]:

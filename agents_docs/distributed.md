@@ -137,8 +137,8 @@ currently requires fp32 gradients. GPT-2 also passed five steps in this
 configuration (loss 11.028791 → 6.922672), as did GPT-2 XL
 (11.165338 → 4.369543). These
 are training smoke tests, not performance measurements or pretrained-model
-quality results. Runtime behavior on AMD and multi-node FSDP2 remains
-unvalidated; the MojoCCL addition also cross-compiles for gfx942.
+quality results. Multi-node FSDP2 on AMD is measured below ("GPT-2 XL
+FSDP2 on two MI300A nodes").
 
 The two-rank regression worker (`tests/fsdp_worker.py`) compares full
 gradients and AdamW updates against CPU PyTorch on uneven layer shapes,
@@ -172,6 +172,35 @@ This measures that explicit training configuration, without `torch.compile`
 or an optimizer tuning search.
 See [the two-H100 GPT-2 XL comparison](gpt2_fsdp2_throughput.md) for measured
 CUDA, Mojo + NCCL, and Mojo + MojoCCL throughput.
+
+### GPT-2 XL FSDP2 on two MI300A nodes
+
+Measured on 2026-09-24 on Adastra (job 5447705, a1029 + a1070): 2 nodes x 4
+MI300A (gfx942), Slingshot through libfabric cxi, 8 ranks, the demo's timed
+mode with `--model gpt2-xl --dtype bfloat16 --sequence-length 1024
+--batch-size 1 --benchmark --warmup 5 --steps 10 --windows 3`. Stock is torch
+2.9.1+rocm6.4 with its RCCL and the site's `aws-ofi-rccl` plugin (`--device
+cuda`); the mojo stacks use torch 2.11.0+cpu,
+`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` (without it four ranks per node
+are OOM-killed) and either the system RCCL 2.22.3 or MojoCCL, with no
+`MOJOCCL_*` variables. Every rank is NUMA-bound (`tests/multinode/rank_bind.py`).
+Five interleaved rounds (ABC CBA ABC CBA ABC); median of the 15 windows per
+stack:
+
+| Stack | Tokens/s | vs stock | Window range |
+|---|---:|---:|---:|
+| Stock torch ROCm + RCCL | 25,365 | 100% | 23,622-26,026 |
+| Torch Mojo + RCCL | 26,770 | 105.5% | 25,392-27,107 |
+| Torch Mojo + MojoCCL | 26,420 | 104.2% | 24,062-26,908 |
+
+Before the gfx942 GEMM and MojoCCL work that produced these numbers the same
+configuration measured 25.6k / 23.5k / 19.7k tokens/s: the mojo device's bf16
+GEMMs at 1024 rows (96 ms/step of kernels against hipBLASLt's 49, including a
+12 ms scalar fallback for the odd K = 50257 of the tied head's input
+gradient) and MojoCCL's unpipelined multi-node all-gather, 432-block gathers
+and L2-invalidating completion polls, which also slowed the GEMMs running
+beside them. Each window is 10 steps of ~0.3 s; a leg is noisy to about +-3%
+on this shared fabric, so compare interleaved series only.
 
 ## What works, what to avoid
 
@@ -1023,37 +1052,61 @@ is small: the region is `hipDeviceMallocUncached` yet reads out of it at full
 HBM rate (1434 GB/s measured, against 1453 for a normal buffer). The
 all-gather and the broadcast's gather half became pushes for the same reason.
 
-Two other gfx942 details are copied from RCCL and matter as much as the
-direction:
+**gfx942 waits acquire payloads once after observing completion.** The
+intra-node barrier and the inter-node proxy wait poll with a relaxed system
+atomic load, `s_sleep(1)` after a failed poll (RCCL 2.22.3's gfx942
+[`waitPeer`](https://github.com/ROCm/rccl/blob/e72b592201d626f16a03a7ba22502130a2846036/src/device/prims_simple.h#L92-L128)),
+and one system acquire fence on exit (`poll_acquire`). An acquire load on
+gfx942 includes `buffer_inv sc0 sc1`, and issuing it on every failed poll
+also invalidates the L2 of the compute running on other streams. Abort and
+status loads stay acquire; every producer still executes its system release
+fence before the block barrier, and flag publication is still a system
+release store (the release side cannot be weakened: `hipIpcOpenMemHandle`
+does not carry the uncached memory type, kernel_results §3 and §7).
 
-- **The barrier could not be made cheaper, and that is measured, not assumed.**
-  A release store lowers to `buffer_wbl2 sc0 sc1` and an acquire load to
-  `buffer_inv sc0 sc1`, both whole-cache operations, and the acquire sits
-  inside the spin loop — so the barrier costs more the larger the grid (27 MiB
-  measured 243 µs at 128 blocks and 465 at 1024). Three cheaper spellings were
-  tried and all three broke *small* collectives only, which is the trap: a
-  megabyte payload drains out of a cache on its own and a few hundred bytes do
-  not, so "the big benchmark still passes" says nothing. RCCL's own cheap
-  variant for gfx942 (`skip_fence`,
-  `rccl:src/include/rccl_common.h:262-273`) is among them: it is sound for
-  RCCL because its P2P buffers are uncached, and unsound here because the
-  mapping a peer writes *through* comes from `hipIpcOpenMemHandle`, which does
-  not carry the memory type. Details and the failure table are in
-  `agents_docs/mojo_collectives_kernel_results.md` §3 and §7.
-- **The grid caps are not H100's**, and the response to the grid is not
-  monotonic. See the sweeps in `agents_docs/mojo_collectives_kernel_results.md`.
+This is the atomic-to-fence rule
+([C++ atomics.fences p4](https://eel.is/c++draft/atomics.fences#4),
+[LLVM fence](https://llvm.org/docs/LangRef.html#fence-instruction)): a
+relaxed load L that reads the release store S, sequenced before the acquire
+fence F, makes S synchronize with F, so the payload writes before S happen
+before the reads after F. The fence runs even when the first poll succeeds.
+MAX 26.5 maps relaxed to LLVM monotonic, and Atomic and fence default to
+system scope. The fence sits after the polling branch has closed, so every
+wave issues it under its full EXEC mask; inside the branch the gfx942
+assembly issued it with EXEC = 0 (kernel_results §7 has that history). The
+proxy wait's single lane polls a uniform address, so its loop never narrows
+EXEC. The host publishes completion only after the receive arrivals, the
+sends and the NIC flush; a transport error may release the mailbox without
+data, with the communicator fault latched, as before.
 
-Everything above is behind `has_amd_gpu_accelerator()` at compile time, and
-the sm_90a device code is byte-identical to the tree before this work (97
-kernels, PTX compared with the mangling hash masked).
+Assembly ([LLVM gfx942 memory model](https://llvm.org/docs/AMDGPUUsage.html#memory-model-gfx942)):
+`global_load ... sc0 sc1` and `s_sleep 1` in the hot loop, `s_waitcnt` and
+`buffer_inv sc0 sc1` at the exit; every barrier acquire of the CCL entry
+follows the branch's `s_or_b64 exec` restore and directly precedes
+`s_barrier` (309 of 309). Only gfx942 takes this route; every other target
+keeps its acquire loads, and the sm_90a CCL kernels are unchanged (173 of
+173).
 
-**One known flake, unresolved.** A *one-element* int64 allreduce at **2 ranks**
-fails intermittently — 2 runs in 14 of `tests/ddp_worker.py collectives`;
-every 4-rank run of every mode passed. It is the smallest collective in the
-suite (one 8-byte store, one 8-byte load, one active thread) and the one-shot
-kernel under it is unchanged by the MI300A work, so the suspect is the
-barrier's cheapened acquire. Whether the pre-MI300A tree flakes the same way
-was not established. See `agents_docs/mojo_collectives_kernel_results.md` §7.
+Measured on **2 × 4 MI300A, Adastra job 5447705**, GPT-2 XL FSDP2,
+bf16 parameters, fp32 reduction, sequence 1024, batch 1/rank:
+
+| Measurement | Previous polling | Acquire once | Mojo + RCCL |
+|---|---:|---:|---:|
+| Profiled comm busy, ms/step | 209.5 | 188.5 | 142.9 |
+| Profiled compute kernel sum, ms/step | 249 | 235 | 211 |
+| Profiled GEMM sum, ms/step | 135 | 129.6 | 114 |
+| Block AG, streamed device µs | 926.6 | 887.2 | 641.7 |
+| Root AG, streamed device µs | 4285.4 | 4256.9 | 3228.4 |
+| Block RS AVG, streamed device µs | 954.0 | 951.3 | 1235.0 |
+
+Isolated timings: 30 queued calls, three bursts, eight ranks, ABBA legs
+(the previous-polling column is one reference leg); profiles are single
+diagnostic runs over three steps. End to end the change was about 1% in
+paired medians (19.96k/19.49k/20.66k/19.79k tokens/s, unchanged/acquire-once
+ABBA), inside the leg noise: it cuts device work and cache interference but
+does not close the gap to RCCL alone. Losses reproduced each
+implementation's pre-change trajectory, and the 2 × 4 and 1 × 4 worker
+suites passed.
 
 ### NVLS: the large sizes go through the switch
 
@@ -1229,24 +1282,82 @@ small kernel sums the N−1 inbox shards into the shard; the intra-node
 all-gather (`allgather_finish`) then pulls the globally reduced shards into
 the user output. AVG's 1/world is applied by the reduce-scatter to each input
 (NCCL's PreMulSum), so no node partial or inbox sum is ever an unscaled total
-in a half dtype. Broadcast uses the same RDMA path: the root's node fans
-out to its counterparts, then each node broadcasts locally. All-gather
-first gathers local contributions into a node block, then each rank sends
-only its own contribution to the same local rank on each remote node.
+in a half dtype. A reduce-scatter on such a communicator (FSDP2's gradient
+reduction) is its own hierarchical schedule, not this split allreduce: a
+node-local reduce (`reduce_scatter_nodes`) sums the local contributions into
+one aligned partial per node, each rank RDMA-writes every remote node's
+partial to its counterpart there, and `inbox_sum_out` adds the received
+partials to the local one in the caller's output. On
+MI300A that node-local reduce runs on RCCL's 24 multi-node MI300A channels
+(`RCCL_APU_NODE_CTAS`) instead of the allreduce's 128/912 (a discrete
+gfx942 keeps 128/912, see below; the split allreduce keeps them everywhere):
+the reduce-scatter is network-bound (15.4 MB/rank fp32 950 vs 951 µs at 128
+vs 24 blocks, 2 × 4 MI300A, job 5447705), and the freed CUs go to the
+backward's GEMMs -- GPT-2 XL FSDP2 ABBA legs 22.0k/22.8k -> 23.2k/23.2k
+tokens/s. Broadcast uses the same RDMA path: the root's node fans
+out to its counterparts, then each node broadcasts locally. In an
+all-gather each rank sends only its own contribution to the same local
+rank on each remote node.
 After the exchange, node-local all-gathers disseminate the received
 contributions, and placement follows the bootstrap global-rank table.
-On NVIDIA each local all-gather writes directly into the mapped global
-output slots, and its local staging supplies the RDMA send. Other targets
-place the local block while the network transfer runs. Staging is reused
-only after send completion. NVIDIA all-gather pipelines two chunks through
-separate existing arenas, overlapping a network exchange with the next local
-gather and the earlier remote gather. Messages at least
+Each local all-gather writes directly into the mapped global output slots,
+and its local staging supplies the RDMA send. Staging is reused only after
+send completion. All-gathers pipeline two chunks through separate existing
+arenas, overlapping a network exchange
+with the next local gather and the earlier remote gather.
+
+On AMD the local peers push into compact slots of each other's regions
+(see "AMD MI300A" above), so the RDMA source cannot be the slot the peers
+write: each rank stages its contribution into a separate slot after the
+`local_world-1` peer slots (`allgather_nic_stage_off`), together with its own output slice, releases
+it (every wave's system release fence, then the per-arena acq_rel arrival
+counter), and the last block to arrive release-stores the exchange into
+the proxy mailbox. The NIC therefore starts while the xGMI pushes still
+run, and the two node-block placement kernels and the separate proxy
+request of the older AMD schedule are gone (four launches per chunk instead
+of six on two nodes); that older schedule is deleted, so every AMD target
+takes this one. Multi-node MojoCCL on AMD GPUs other than MI300A is
+untested: they get the same push kernel and NIC slot, the single-node copy
+cap for the gathers (`_node_grids`) and unroll 4, none of it measured or
+run there. The staging bound becomes `local_world *
+align16(chunk) <= 2 * arena_cap` next to the inbox bound; at 4 ranks/node
+and the 64 MiB region the inbox (6,709,248 B) still binds. Measured on 2 × 4 MI300A (Adastra job 5447705, 8 ranks,
+streamed device time per call, ABBA; RCCL 2.22.3 through the same process
+group): XL block bf16 7.68 MB/rank 887 → 737 µs (RCCL 638), fp32 root
+41.0 MB/rank 4238 → 3038 µs (RCCL 3214), fp32 357×789+3 233 → 226 µs
+(RCCL 286).
+
+The MI300A gathers of that schedule then take RCCL's multi-node MI300A
+geometry instead of the single-node copy cap: 24 CTAs of 256 threads,
+two 16-byte vectors in flight per thread (`RCCL_APU_NODE_CTAS`,
+`AG_NODE_UNROLL`; RCCL 2.22.3 forces 24 channels on multi-node MI300A and
+unroll 2 on gfx94 parts with more than 80 CUs). Against the 432-block copy
+cap, 24 blocks is faster in isolation too: block 742 → 650 µs, root
+3034 → 2686 µs, 357×789+3 225 → 174 µs. It is not the fastest isolated
+grid, though: 96 blocks measured 599 / 2669 µs. 24 wins end to end
+(GPT-2 XL FSDP2 on those 8 ranks, ABBA legs, tokens/s): 432 blocks
+20.9k/20.7k, 96 blocks 22.0k/21.8k, 24 blocks 23.0k/22.8k, mojo+RCCL
+23.1k/22.1k. There the gathers run beside the compute stream, and every CU
+they hold is one the GEMMs do not get. Unroll 2 was measured only together
+with the 24-block grid.
+
+RCCL applies its 24-channel rule only to an APU
+(`hipDeviceAttributeDirectManagedMemAccessFromHost`, `init.cc:1339-1346`),
+and the discrete gfx942 parts (MI300X, MI325X) are the same ISA, so the
+24-block grids take RCCL's test at run time (`_node_grids`, ANDed over the
+ranks at init): a discrete gfx942 keeps the single-node copy cap for the
+gathers and the allreduce caps for the node reduce, unmeasured. Unroll 2 needs no such test: RCCL's
+unroll-2 rule covers MI300X too. The remaining isolated all-gather time
+is the network: 7.68 MB per NIC at about 16 GB/s, against RCCL's 13.4 MB
+per NIC at 21 GB/s; splitting each exchange into RCCL-sized 512 KiB
+writes did not change it (664 vs 653 µs). Messages at least
 `PIPE_SPLIT_UNIT * local_world` bytes per rank are split into two balanced
 chunks unless region capacity requires more. This threshold was measured on
-2×8 H100 and leaves smaller single-chunk gathers unchanged. Inbox credits
+2×8 H100 and leaves smaller single-chunk gathers unchanged; on 2 × 4 MI300A
+the two halves (RCCL's two slices per chunk) took the XL bf16 block from 601
+to 541 µs once the flush read had its own endpoint (below). Inbox credits
 follow each chunk's remote consumers; the source arena is reused only after
-its send and consumers complete. Broadcast and the other-target all-gather
-schedule remain unpipelined. Single-node
+its send and consumers complete. Broadcast remains unpipelined. Single-node
 communicators keep the fused intra-node path and never touch IB.
 
 Measured at 16 ranks (2x8 H100 SXM, InfiniBand, job 258050) through the
@@ -1663,6 +1774,34 @@ times, 14 x ~1.9 ms, is 2.5x the 10.6 ms the allreduce takes), so it does not
 serialise the pipeline. What is left is 1.33x over RCCL against a 5.2 ms wire
 floor (14 chunks x 9.36 MB shard / 25 GB/s), where RCCL sits at 1.36x the
 floor and mojoccl at 1.8x.
+
+**The flush read has its own endpoint.** Queued behind the data
+writes, the flush of exchange e waited for exchange e+1's payload, which the
+progress thread had already posted: e retired one exchange late, so the
+pipelined all-gather's remote gathers of chunk e could not overlap the
+network transfer of chunk e+1. A second endpoint on the same domain (same
+NIC and PCIe function, so its read still orders behind that NIC's earlier
+writes; same CQ and AV) issues only the flush -- the role of the verbs
+path's self-connected QP and NCCL's gpuFlush QP; RCCL on AMD flushes every
+512 KiB step (`net.cc`, `paths.cc` `ncclTopoNeedFlush`), so its flush never
+waits behind megabytes. The flush itself stays. Measured on 2 x 4 MI300A
+(job 5447705, streamed device time per call): XL bf16 block all-gather
+654 -> 601 us, fp32 root 2682 -> 2365 us; reduce-scatter unchanged (its
+exchanges are back to back on the wire either way).
+
+The second endpoint is an optimization and never fails a communicator:
+it asks for the least the read needs (an `fi_dupinfo` copy of the data
+endpoint's info cut to `FI_RMA | FI_READ`, transmit-only CQ binding, a
+local-read landing pad), and any failure while it comes up -- it is a second
+cxi address context, the allocation `_check` documents failing with
+-FI_ENOMEM under node memory pressure -- closes what was created, prints
+`mojoccl: flush endpoint unavailable, flushing on the data endpoint` and
+flushes on the data endpoint, correct and only later. It is not retried.
+`MOJOCCL_IB_TRACE=1`'s closing `mojoccl net:` line says which endpoint
+flushed (`flush_ep=own|data`). It is opened on every GPU: the serialisation
+is a property of a libfabric endpoint's transmit queue, not of the GPU. Only
+MI300A was measured; NVIDIA on libfabric (Slingshot GH200, EFA) is not
+(H100 here uses verbs, whose flush QP was always separate).
 
 **`fi_enable` returning `-FI_ENOMEM`: the node is out of contiguous kernel
 memory.** Several ranks of one node fail `ncclCommInitRank` with

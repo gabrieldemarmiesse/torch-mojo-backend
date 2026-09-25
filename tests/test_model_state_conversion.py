@@ -41,12 +41,6 @@ def test_module_to_mojo_preserves_tied_parameters(mojo_device):
     assert len(list(module.parameters())) == 1
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="op not ported yet: aten::set_.source_Storage (torch.load's tensor "
-    "rebuild path needs it to restore the original mojo storage before "
-    "map_location moves it to cpu)",
-)
 def test_mojo_tensor_checkpoint_loads_as_portable_cpu_tensor(mojo_device):
     expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     value = expected.to(mojo_device)

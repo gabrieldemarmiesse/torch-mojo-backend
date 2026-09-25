@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from tests.native.conftest import ran
+from tests.native.conftest import ran, skip_if_metal
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 
 
@@ -381,6 +381,26 @@ def test_max_and_min_full_reduction(mojo_device):
     torch.testing.assert_close(torch.min(xd).cpu(), torch.min(x))
     ints = torch.randint(-100, 100, (5, 9), dtype=torch.int64)
     torch.testing.assert_close(torch.max(ints.to(mojo_device)).cpu(), torch.max(ints))
+
+
+@pytest.mark.parametrize("shape", [(7,), (357, 789), (1 << 20,)])
+def test_extrema_float64(mojo_gpu, shape):
+    """amax/amin and full max/min select exactly in float64 (the warp fold
+    trades the bits as uint64): values 1 ulp apart and a NaN must survive."""
+    skip_if_metal(mojo_gpu, "Metal does not support float64")
+    x = torch.randn(shape, dtype=torch.float64)
+    x.view(-1)[len(x.view(-1)) // 2] = 1e300
+    x.view(-1)[-1] = math.nextafter(1e300, math.inf)
+    xd = x.to(mojo_gpu)
+    for fn in (torch.max, torch.min):
+        torch.testing.assert_close(fn(xd).cpu(), fn(x), rtol=0, atol=0)
+    dim = len(shape) - 1
+    for fn in (torch.amax, torch.amin):
+        want = fn(x, dim=dim)
+        torch.testing.assert_close(fn(xd, dim=dim).cpu(), want, rtol=0, atol=0)
+    x.view(-1)[0] = math.nan
+    assert torch.max(x.to(mojo_gpu)).isnan().item()
+    assert torch.min(x.to(mojo_gpu)).isnan().item()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

@@ -611,12 +611,12 @@ def _unary_elementwise[
                 ](Int(out_ptr), Int(in_ptr), size, ctx):
                     return
             comptime if (
-                op_code == UOP_LOG2 or (is_direct and dtype == DType.float64)
+                op_code == UOP_LOG2 or dtype == DType.float64
             ) and not has_apple_gpu_accelerator():
                 # Preserve log2's upstream scalar fallback, including
                 # float64; the existing unary ops keep their 4-wide route.
-                # float64 abs/neg/sign/relu land here too: the ops accept the
-                # dtype, and only Apple GPUs lack it.
+                # Every float64 op the dtype gate admits lands here too
+                # (abs/neg/sign/relu, reciprocal): only Apple GPUs lack it.
                 _enqueue_cached[_unary_contig_kernel[dtype, op_code]](
                     ctx,
                     _gs_blocks(size),
@@ -1140,7 +1140,12 @@ def _unary_spec_into_go[op_code: Int](a_o: Arg, out_o: Arg) raises:
         or op_code == UOP_SIGN
     )
     var supported = False
-    comptime if op_code == UOP_LOG2:
+    comptime if (
+        op_code == UOP_LOG2
+        or op_code == UOP_RECIPROCAL
+        or op_code == UOP_CEIL
+        or op_code == UOP_FLOOR
+    ):
         supported = _dtype_supported[
             [DType.float16, DType.bfloat16, DType.float32, DType.float64]
         ](a.dtype)

@@ -687,8 +687,7 @@ def test_standalone_storage_resize_and_lifetime(mojo_device: str):
         _settle(mojo_device)
         assert storage.nbytes() == size
         _assert_shared(mojo_device, base + size)
-        # Direct Storage indexing needs the unsupported set_.source_Storage
-        # overload. Sizes and the literal byte ledger are independent oracles.
+        # Sizes and the literal byte ledger are independent oracles.
     del storage
     _settle(mojo_device)
     _assert_shared(mojo_device, base)

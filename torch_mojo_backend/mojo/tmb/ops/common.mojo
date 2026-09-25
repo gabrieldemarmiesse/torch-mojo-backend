@@ -94,6 +94,21 @@ def copy_strided_into(dst: T, src: T) raises:
     _ = ctx
 
 
+def broadcast_shape(a: T, b: T) raises -> IndexList[MAX_RANK]:
+    """The broadcast of two shapes (leading-padded, so rank max(a, b))."""
+    var shape = IndexList[MAX_RANK](1)
+    for i in range(MAX_RANK):
+        var x = a.shape[i]
+        var y = b.shape[i]
+        if x == y or y == 1:
+            shape[i] = x
+        elif x == 1:
+            shape[i] = y
+        else:
+            raise Error("shapes are not broadcastable")
+    return shape
+
+
 def device_str(t: T) -> String:
     """`c10::Device::str()`: the lower-case device-type name plus an index
     when the tensor carries one. PrivateUse1 prints under the name torch was

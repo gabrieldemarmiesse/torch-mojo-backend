@@ -55,7 +55,7 @@ from std.gpu import (
 from std.gpu.primitives import warp
 from std.gpu.primitives.warp import shuffle_down
 from std.math import ceildiv, isnan, sqrt
-from std.memory import stack_allocation
+from std.memory import bitcast, stack_allocation
 from std.sys.info import has_accelerator, size_of
 from std.utils.numerics import max_or_inf, min_or_neg_inf
 from std.utils.static_tuple import StaticTuple
@@ -255,12 +255,23 @@ trait ReduceOp:
 # The accumulators. Four lines of algebra each; everything else is shared.
 # ---------------------------------------------------------------------------
 
-# Floating-point reductions accumulate in float32 (matching torch); integer
-# ones accumulate in their own dtype.
+# Floating-point reductions accumulate in float32 (matching torch), float64
+# in its own dtype; integer ones accumulate in their own dtype.
 comptime SCALAR_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
+    DType.int64,
+    DType.int32,
+]
+
+# amax / amin / max / min: selection is exact in any dtype, so these also
+# take float64 (torch's tensor printer reduces float64 with them).
+comptime EXTREMUM_DTYPES: List[DType] = [
+    DType.float32,
+    DType.float16,
+    DType.bfloat16,
+    DType.float64,
     DType.int64,
     DType.int32,
 ]
@@ -286,8 +297,9 @@ comptime TRUTHY_DTYPES: List[DType] = [
 
 @always_inline
 def _float_acc[in_dt: DType]() -> DType:
-    """float rows accumulate in float32; int rows in their own dtype."""
-    comptime if in_dt.is_floating_point():
+    """float rows accumulate in float32; float64 and int rows in their own
+    dtype."""
+    comptime if in_dt.is_floating_point() and in_dt != DType.float64:
         return DType.float32
     else:
         return in_dt
@@ -423,7 +435,7 @@ struct MaxOp(ReduceOp):
     """amax / max: selection, identity -inf, NaN PROPAGATED (torch's rule)."""
 
     comptime name = "max"
-    comptime dtypes = SCALAR_DTYPES
+    comptime dtypes = EXTREMUM_DTYPES
     comptime errors_on_empty_axis = True
 
     @staticmethod
@@ -469,7 +481,7 @@ struct MinOp(ReduceOp):
     """amin / min: the mirror of MaxOp, NaN equally propagated."""
 
     comptime name = "min"
-    comptime dtypes = SCALAR_DTYPES
+    comptime dtypes = EXTREMUM_DTYPES
     comptime errors_on_empty_axis = True
 
     @staticmethod
@@ -633,7 +645,27 @@ def _block_fold[
     ](x: SIMD[dtype, width], y: SIMD[dtype, width]) -> SIMD[dtype, width]:
         return Op.combine(x, y)
 
-    var lane_total = warp.reduce[shuffle_down, cb](v)
+    @always_inline
+    @parameter
+    def cb_bits[
+        dtype: DType, width: SIMDLength
+    ](x: SIMD[dtype, width], y: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return bitcast[dtype, width](
+            Op.combine(
+                bitcast[acc, width](x),
+                bitcast[acc, width](y),
+            )
+        )
+
+    var lane_total: Scalar[acc]
+    comptime if acc == DType.float64:
+        # The warp shuffle has no float64 variant, only 64-bit integers:
+        # the lanes trade the bits and combine them as float64.
+        lane_total = bitcast[acc, 1](
+            warp.reduce[shuffle_down, cb_bits](bitcast[DType.uint64, 1](v))
+        )
+    else:
+        lane_total = warp.reduce[shuffle_down, cb](v)
     comptime n_warps = threads // WARP_SIZE
     comptime if n_warps == 1:
         return lane_total

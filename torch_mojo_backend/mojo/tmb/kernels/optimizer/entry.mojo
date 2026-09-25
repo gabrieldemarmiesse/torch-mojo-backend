@@ -23,6 +23,7 @@ from tmb.kernels.common.op_utils import (
     _spec_dispatcher3,
     _spec_dispatcher4,
     _spec_dispatcher5,
+    _spec_dispatcher6,
     _spec_dispatcher8,
 )
 from tmb.kernels.optimizer.contract import (
@@ -32,6 +33,7 @@ from tmb.kernels.optimizer.contract import (
     empty_adamw_desc,
 )
 from tmb.kernels.optimizer.kernels import enqueue_fused_adamw_f32
+from tmb.kernels.optimizer.amp_kernels import enqueue_amp_update_scale
 from tmb.kernels.optimizer.foreach_clip_contract import (
     FOREACH_CHUNK_ELEMENTS,
     FOREACH_DESC_CAP,
@@ -50,6 +52,7 @@ from tmb.kernels.optimizer.foreach_batched_kernels import (
     FEW_LERP,
     FEW_MUL,
     FEW_MUL_TENSOR,
+    FEW_NONFINITE_UNSCALE,
     FEW_SQRT,
     ForeachEwDesc,
     _few_fields,
@@ -272,8 +275,9 @@ def _foreach_ew_go[
     * `scalars_obj` -- one FP32 scalar per tensor for mul/add/div/addc
       (`.Scalar` fills the same tuple with one repeated value that
       `.ScalarList` fills per tensor), or the two lerp weights.
-    * `aux_obj` -- ints: the lerp branch selector, or the address of the 0-d
-      device scalar `_foreach_mul_.Tensor` multiplies by.
+    * `aux_obj` -- ints: the lerp branch selector, the address of the 0-d
+      device scalar `_foreach_mul_.Tensor` multiplies by, or GradScaler's
+      (inv_scale, found_inf) device scalar addresses.
 
     Descriptors are packed `FEW_DESC_CAP` at a time; a longer list becomes
     several launches of the same compiled kernel. Nothing is allocated, read
@@ -310,6 +314,14 @@ def _foreach_ew_go[
         scalar_addr = _raw_tuple_int(aux_obj, 0)
         if scalar_addr == 0:
             raise Error("mojo foreach multiply scalar pointer must be nonzero")
+    var flag_addr = 0
+    comptime if op == FEW_NONFINITE_UNSCALE:
+        if _raw_tuple_len(aux_obj) != 2:
+            raise Error("mojo foreach unscale needs inv_scale and found_inf")
+        scalar_addr = _raw_tuple_int(aux_obj, 0)
+        flag_addr = _raw_tuple_int(aux_obj, 1)
+        if scalar_addr == 0 or flag_addr == 0:
+            raise Error("mojo foreach unscale scalar pointers must be nonzero")
 
     var ctx = _raw_ctx(device_context_ptr)
 
@@ -368,6 +380,7 @@ def _foreach_ew_go[
                         weight,
                         one_minus_weight,
                         low_branch,
+                        flag_addr,
                         ctx,
                     )
 
@@ -402,6 +415,27 @@ def _foreach_gather_scalars_go(
             in_addrs[slot] = in_addrs[0]
             slot += 1
         enqueue_foreach_gather_scalars_f32(out_addr, in_addrs, base, count, ctx)
+
+
+def _amp_update_scale_go(
+    scale_ptr_obj: Arg,
+    growth_tracker_ptr_obj: Arg,
+    found_inf_ptr_obj: Arg,
+    factors_obj: Arg,
+    growth_interval_obj: Arg,
+    device_context_ptr: Arg,
+) raises:
+    if _raw_tuple_len(factors_obj) != 2:
+        raise Error("amp update scale expects (growth, backoff) factors")
+    enqueue_amp_update_scale(
+        _raw_int(scale_ptr_obj),
+        _raw_int(growth_tracker_ptr_obj),
+        _raw_int(found_inf_ptr_obj),
+        _raw_tuple_f64(factors_obj, 0),
+        _raw_tuple_f64(factors_obj, 1),
+        _raw_int(growth_interval_obj),
+        _raw_ctx(device_context_ptr),
+    )
 
 
 comptime _FOREACH_EW_DOC = (
@@ -453,6 +487,16 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["ForeachAddcdiv"]():
             _spec_dispatcher5[_foreach_ew_go[FEW_ADDCDIV], "ForeachAddcdiv"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["ForeachNonFiniteUnscale"]():
+            _spec_dispatcher5[
+                _foreach_ew_go[FEW_NONFINITE_UNSCALE], "ForeachNonFiniteUnscale"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["AmpUpdateScale"]():
+            _spec_dispatcher6[_amp_update_scale_go, "AmpUpdateScale"](
                 argv, argc
             )
             return 0

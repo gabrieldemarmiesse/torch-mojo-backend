@@ -133,12 +133,213 @@ def check_reduce_scatter():
     print(f"rank={rank} reduce-scatter correctness OK", flush=True)
 
 
+def _stress_indices(count: int) -> torch.Tensor:
+    """Sample the whole shard, its ends, and both sides of regular boundaries."""
+    if count <= 4096:
+        return torch.arange(count)
+    spread = torch.arange(1024) * count // 1024
+    boundaries = torch.arange(16_384, count, 16_384)
+    return torch.unique(
+        torch.cat(
+            (
+                spread,
+                torch.arange(16),
+                torch.arange(count - 16, count),
+                boundaries - 1,
+                boundaries,
+                boundaries + 1,
+            )
+        ).clamp_max(count - 1)
+    )
+
+
+def _gather_reference(
+    pattern: torch.Tensor, world: int, step: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """What every rank's all-gather output holds when peer p sent pattern+p+step."""
+    peers = torch.arange(world, dtype=torch.float32)[:, None]
+    return (pattern[None, :] + peers + step).reshape(-1).to(dtype)
+
+
+def _check_inplace_all_gather(
+    count: int, dtype: torch.dtype, offset: int, pattern: torch.Tensor
+):
+    """FSDP2's layout: the input shard is a view of this rank's output slot.
+
+    `foreach_all_gather` copies the parameters into
+    `all_gather_output.narrow(0, rank * numel, numel)` and gathers from that
+    view, so the kernel's staging read and its write of the rank's own slot
+    alias. Every element is checked, which also covers the chunk
+    boundaries of whatever split the transport chose.
+    """
+    rank, world = dist.get_rank(), dist.get_world_size()
+    storage = torch.full(
+        (world * count + offset + 1,), -123, dtype=dtype, device="mojo"
+    )
+    output = storage[offset:-1]
+    mine = output[rank * count : (rank + 1) * count]
+    for generation in range(1, 4):
+        step = 100 + generation  # disjoint from the out-of-place values
+        output.fill_(-123)
+        mine.copy_((pattern + rank + step).to(dtype))
+        dist.all_gather_into_tensor(output, mine, async_op=True).wait()
+        torch.testing.assert_close(
+            output.cpu(), _gather_reference(pattern, world, step, dtype), rtol=0, atol=0
+        )
+    assert storage[offset - 1].cpu().item() == storage[-1].cpu().item() == -123
+
+
+def check_fsdp_collectives_stress():
+    """Reuse changing AG/RS payloads across generations and network inbox slots.
+
+    Full FSDP2-sized transfers run on the device. Most generations send only
+    deterministic samples to the CPU: four generations are queued before
+    checking, so validation does not synchronize each collective. The first
+    and last generation of each case are checked in full, every element of
+    both outputs, so every chunk boundary of the transport's split is
+    covered without this test having to know the split. Each case then runs
+    an in-place all-gather, FSDP2's own layout. Values and SUM references
+    are exact at any world size, AVG ones for a power-of-two world (see
+    `avg_rtol`).
+    """
+    rank, world = dist.get_rank(), dist.get_world_size()
+    # AVG scales each contribution by fp32(1/world) before summing (NCCL's
+    # PreMulSum) while the reference divides the exact sum: identical only
+    # when 1/world is exact, i.e. for a power-of-two world (as in
+    # ddp_worker's stress).  Otherwise allow the fp32 rounding of `world`
+    # scaled terms (well under 1e-4 at these magnitudes), far below the
+    # >= 1/world by which one stale or wrong-shard contribution moves a value.
+    exact_avg = world & (world - 1) == 0
+    avg_rtol, avg_atol = (0.0, 0.0) if exact_avg else (1e-5, 1e-4)
+    rounds = 12
+    full_generations = (1, rounds)
+    cases = (
+        (1, torch.float32),
+        (13, torch.bfloat16),
+        (357 * 789 + 3, torch.float32),
+        # 2,560,006 B per rank: above the balanced-split threshold at 4 local
+        # ranks (PIPE_SPLIT_UNIT * 4 = 2.56 MB) and not a multiple of 16, so
+        # the second chunk (1,279,990 B after 1,280,016) ends in a scalar
+        # tail and every rank but 0 has its output slot off a 16-byte
+        # boundary.
+        (1_280_003, torch.bfloat16),
+        (3_840_000, torch.bfloat16),  # XL block: 7.68 MB AG / 15.36 MB RS out.
+        (10_254_200, torch.float32),  # XL root: 41.02 MB per rank.
+    )
+    for count, dtype in cases:
+        # Small/awkward cases get misaligned bases; the large ones keep
+        # FSDP2's 16-byte-aligned bases, so their misalignment (if any) is the
+        # per-rank stride alone. Destination-dependent RS input catches
+        # wrong-shard reads.
+        offset = 1 if count < 1_000_000 else 8
+        indices = _stress_indices(count)
+        gather_indices = torch.cat([indices + peer * count for peer in range(world)])
+        device_indices = indices.to("mojo")
+        device_gather_indices = gather_indices.to("mojo")
+        pattern = (torch.arange(count, dtype=torch.int32) % 17 - 8).float()
+        ag_source_storage = torch.full(
+            (count + offset + 1,), -123, dtype=dtype, device="mojo"
+        )
+        ag_source = ag_source_storage[offset:-1]
+        ag_source.copy_((pattern + rank).to(dtype))
+        rs_source_storage = torch.full(
+            (world * count + offset + 1,), -123.0, device="mojo"
+        )
+        rs_source = rs_source_storage[offset:-1]
+        rs_source.copy_(
+            (pattern[None, :] + torch.arange(world)[:, None] + rank).reshape(-1)
+        )
+        ag_storage = torch.full(
+            (world * count + offset + 1,), -123, dtype=dtype, device="mojo"
+        )
+        rs_storage = torch.full((count + offset + 1,), -123.0, device="mojo")
+        ag_output, rs_output = ag_storage[offset:-1], rs_storage[offset:-1]
+        pending = []
+        for generation in range(1, rounds + 1):
+            ag_source.add_(1)
+            ag_output.fill_(-123)
+            dist.all_gather_into_tensor(ag_output, ag_source, async_op=True).wait()
+            if generation in full_generations:
+                torch.testing.assert_close(
+                    ag_output.cpu(),
+                    _gather_reference(pattern, world, generation, dtype),
+                    rtol=0,
+                    atol=0,
+                )
+            ag_sample = ag_output.index_select(0, device_gather_indices)
+            rs_source.add_(1)
+            rs_output.fill_(-123)
+            op = dist.ReduceOp.SUM if generation % 2 else dist.ReduceOp.AVG
+            dist.reduce_scatter_tensor(
+                rs_output, rs_source, op=op, async_op=True
+            ).wait()
+            if generation in full_generations:
+                expected_full = (pattern + rank + generation) * world + world * (
+                    world - 1
+                ) // 2
+                rtol = atol = 0.0
+                if op == dist.ReduceOp.AVG:
+                    expected_full /= world
+                    rtol, atol = avg_rtol, avg_atol
+                torch.testing.assert_close(
+                    rs_output.cpu(), expected_full, rtol=rtol, atol=atol
+                )
+            rs_sample = rs_output.index_select(0, device_indices)
+            pending.append((generation, op, ag_sample, rs_sample))
+            if len(pending) < 4:
+                continue
+            for step, reduction, gathered, scattered in pending:
+                expected_ag = torch.cat(
+                    [pattern[indices] + peer + step for peer in range(world)]
+                ).to(dtype)
+                expected_rs = (pattern[indices] + rank + step) * world + world * (
+                    world - 1
+                ) // 2
+                rtol = atol = 0.0
+                if reduction == dist.ReduceOp.AVG:
+                    expected_rs /= world
+                    rtol, atol = avg_rtol, avg_atol
+                torch.testing.assert_close(gathered.cpu(), expected_ag, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    scattered.cpu(), expected_rs, rtol=rtol, atol=atol
+                )
+            pending.clear()
+        # Source preservation is independent of output correctness.
+        torch.testing.assert_close(
+            ag_source.index_select(0, device_indices).cpu(),
+            (pattern[indices] + rank + rounds).to(dtype),
+            rtol=0,
+            atol=0,
+        )
+        expected_source = torch.cat(
+            [pattern[indices] + peer + rank + rounds for peer in range(world)]
+        )
+        torch.testing.assert_close(
+            rs_source.index_select(0, device_gather_indices).cpu(),
+            expected_source,
+            rtol=0,
+            atol=0,
+        )
+        for storage in (ag_source_storage, rs_source_storage, ag_storage, rs_storage):
+            assert storage[offset - 1].cpu().item() == storage[-1].cpu().item() == -123
+        _check_inplace_all_gather(count, dtype, offset, pattern)
+        print(
+            f"rank={rank} FSDP collectives stress count={count} dtype={dtype} "
+            f"generations={rounds} in-place OK",
+            flush=True,
+        )
+
+
 def main():
     register_mojo_devices()
     dist.init_process_group("mojo", timeout=datetime.timedelta(minutes=5))
     rank, world = dist.get_rank(), dist.get_world_size()
     if len(sys.argv) > 1 and sys.argv[1] == "reduce_scatter":
         check_reduce_scatter()
+        dist.destroy_process_group()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "fsdp_collectives_stress":
+        check_fsdp_collectives_stress()
         dist.destroy_process_group()
         return
     torch.manual_seed(123)

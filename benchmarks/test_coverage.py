@@ -128,6 +128,14 @@ SKIPPED_OPS: dict[str, str] = {
         "repoints a tensor at another's allocation in place: storage swap "
         "plus TensorImpl metadata, zero-copy and no kernel"
     ),
+    "aten::set_.source_Storage": (
+        "points a tensor at an existing Storage (torch.save / torch.load's "
+        "storage copies): storage swap plus TensorImpl metadata, no kernel"
+    ),
+    "aten::set_.source_Storage_storage_offset": (
+        "lays a tensor over an existing Storage (torch.load's tensor "
+        "rebuild): storage swap plus TensorImpl metadata, no kernel"
+    ),
     # -- dispatch decision, not compute -----------------------------------
     "aten::_fused_sdp_choice": (
         "returns which SDPA backend to use as an int; the attention kernel "

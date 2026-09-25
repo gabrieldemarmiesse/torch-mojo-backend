@@ -34,7 +34,6 @@ from std.gpu import (
     thread_idx,
 )
 from std.sys import size_of
-from std.sys.info import _accelerator_arch
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
 
@@ -45,6 +44,7 @@ from tmb.ccl.collectives_kernels import (
     MAX_BLOCKS,
     MAX_WORLD,
     PHASES_PER_GEN,
+    _GFX942,
     _SIGNAL_BYTES,
     _ag_finish_body,
     _align_up,
@@ -115,21 +115,16 @@ comptime _MB_ABORT_CHECK = 256
 PCIe reads, so this is what bounds how long an abort holds the stream (a
 few hundred microseconds), as `_proxy_wait_kernel` had it."""
 
-# The host pass uses the bare --target-accelerator name; device compilation
-# can use the target-qualified spelling. These are the same architecture.
-comptime _MI300A = (
-    _accelerator_arch() == "gfx942" or _accelerator_arch() == "amdgpu:gfx942"
-)
 # Fitted on 2x4 MI300A, GPT-2 XL, Adastra job 5417296 (2026-09-15):
 # full-model ABBA 16/64 -> 8/16 raised 125104.5 -> 128363.6 tokens/s
 # (+2.61%, -13.30 ms/step); 4/16 lost 1.16%. This is an architecture fit,
 # not a CU-count rule: 228 CUs alone does not explain the nonmonotonic sweep.
 # NVIDIA keeps the H100 fit, 16/64, byte-for-byte (jobs 250904/250995).
-comptime DEFAULT_FUSED_BLOCKS = 8 if _MI300A else 16
+comptime DEFAULT_FUSED_BLOCKS = 8 if _GFX942 else 16
 """Block cap, checked equal on every rank at init because the barriers are
 block-matched. See FUSED_THREADS for why the count is small."""
 
-comptime DEFAULT_FUSED_BIG_BLOCKS = 16 if _MI300A else 64
+comptime DEFAULT_FUSED_BIG_BLOCKS = 16 if _GFX942 else 64
 comptime DEFAULT_FUSED_BIG_MB = 128
 """Block cap for messages of at least `DEFAULT_FUSED_BIG_MB`. A message that large
 is DDP's last bucket (GPT-2 XL: 313 MiB, the tied embedding), which nothing

@@ -330,3 +330,81 @@ def test_linear_backward(
             ),
             flops=4.0 * m * n * k,
         )
+
+
+# Medium-row training and ragged leading dimensions. These focused bf16
+# cases complement the large-M campaign without multiplying every BMM and
+# float32 configuration by the same shapes.
+MEDIUM_BF16_MM_CASES = (
+    ("R1_1024x1600x4800", "NT", (1024, 1600, 4800)),
+    ("R2_1024x1600x1600", "NT", (1024, 1600, 1600)),
+    ("R3_1024x1600x6400", "NT", (1024, 1600, 6400)),
+    ("R4_1024x6400x1600", "NT", (1024, 6400, 1600)),
+    ("R5_1600x4800x1024", "TN", (1600, 4800, 1024)),
+    ("R6_1600x1600x1024", "TN", (1600, 1600, 1024)),
+    ("R7_1600x6400x1024", "TN", (1600, 6400, 1024)),
+    ("R8_6400x1600x1024", "TN", (6400, 1600, 1024)),
+    ("R9_1024x50257x1600", "NT", (1024, 50257, 1600)),
+    ("R10_1024x1600x50257", "NN", (1024, 1600, 50257)),
+    ("R11_50257x1600x1024", "TN", (50257, 1600, 1024)),
+    ("R12_512x768x8193", "NN", (512, 768, 8193)),
+    ("R13_1009x1592x4095", "NN", (1009, 1592, 4095)),
+)
+
+
+@pytest.mark.bench_op("mm")
+@pytest.mark.parametrize("dtype_id", ["bf16"])
+@pytest.mark.parametrize("shape_id,layout,dims", MEDIUM_BF16_MM_CASES)
+def test_mm_medium_rows(
+    shape_id: str,
+    layout: str,
+    dims: tuple[int, int, int],
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    m, n, k = dims
+    dtype, _ = DTYPES[dtype_id]
+    a_ref, b_ref = _operand_pair(layout, m, n, k, dtype, hw.stock_device)
+    a_our, b_our = _operand_pair(layout, m, n, k, dtype, mojo_device)
+    bench.run(
+        lambda: torch.mm(a_ref, b_ref),
+        lambda: torch.mm(a_our, b_our),
+        flops=2.0 * m * n * k,
+    )
+
+
+@pytest.mark.bench_op("addmm")
+@pytest.mark.parametrize("dtype_id", ["bf16"])
+@pytest.mark.parametrize("layout", ["NN"])
+@pytest.mark.parametrize(
+    "shape_id,dims",
+    [
+        ("R1_1024x4800x1600", (1024, 4800, 1600)),
+        ("R2_1024x1600x1600", (1024, 1600, 1600)),
+        ("R3_1024x6400x1600", (1024, 6400, 1600)),
+        ("R4_1024x1600x6400", (1024, 1600, 6400)),
+        ("R5_1009x1617x1599", (1009, 1617, 1599)),
+    ],
+)
+def test_addmm_medium_rows(
+    shape_id: str,
+    dims: tuple[int, int, int],
+    layout: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    m, n, k = dims
+    dtype, _ = DTYPES[dtype_id]
+    a_ref, b_ref = _operand_pair(layout, m, n, k, dtype, hw.stock_device)
+    a_our, b_our = _operand_pair(layout, m, n, k, dtype, mojo_device)
+    bias_ref = torch.randn(n, dtype=dtype, device=hw.stock_device)
+    bias_our = torch.randn(n, dtype=dtype, device=mojo_device)
+    bench.run(
+        lambda: torch.addmm(bias_ref, a_ref, b_ref),
+        lambda: torch.addmm(bias_our, a_our, b_our),
+        flops=2.0 * m * n * k,
+    )

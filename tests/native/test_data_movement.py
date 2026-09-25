@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.native.conftest import ran
+from tests.native.conftest import ran, skip_if_metal
 from tests.native.test_matmul import assert_ran
 from torch_mojo_backend import aten_functions, get_accelerators
 
@@ -2392,6 +2392,128 @@ def test_chunk_cat_mixed_precision_out(
 def test_nonzero_int_dtype(mojo_gpu):
     x = torch.tensor([1, 0, 3, 0, 5], dtype=torch.int64)
     torch.testing.assert_close(x.to(mojo_gpu).nonzero().cpu(), x.nonzero())
+
+
+# ---------------------------------------------------------------------------
+# masked_select (and printing, whose float formatter calls it)
+# ---------------------------------------------------------------------------
+
+_MASKED_SELECT_DTYPES = [
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+    torch.float64,
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.uint8,
+    torch.bool,
+]
+
+
+def _skip_float64_on_metal(device: str, dtype: torch.dtype):
+    if dtype == torch.float64:
+        skip_if_metal(device, "Apple GPUs have no float64")
+
+
+@pytest.mark.parametrize("dtype", _MASKED_SELECT_DTYPES)
+# (357, 789) spans many 1024-element tiles and ends on a partial one.
+@pytest.mark.parametrize("shape", [(7,), (3, 5), (357, 789), (2, 3, 4)])
+def test_masked_select(mojo_gpu, call_checker, dtype, shape):
+    _skip_float64_on_metal(mojo_gpu, dtype)
+    call_checker.register("aten::masked_select")
+    x = _fill(shape, dtype)
+    mask = (torch.arange(x.numel()) % 3 != 1).view(shape)
+    got = torch.masked_select(x.to(mojo_gpu), mask.to(mojo_gpu))
+    torch.testing.assert_close(got.cpu(), torch.masked_select(x, mask), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("x_shape", "mask_shape"),
+    [((4, 5), (5,)), ((4, 1), (4, 6)), ((1, 5), (3, 1)), ((), (4,)), ((4,), ())],
+)
+def test_masked_select_broadcast(mojo_gpu, x_shape, mask_shape):
+    x = _fill(x_shape, torch.float32) + 1.0
+    mask = _fill(mask_shape, torch.float32) > 0.004
+    got = torch.masked_select(x.to(mojo_gpu), mask.to(mojo_gpu))
+    torch.testing.assert_close(got.cpu(), torch.masked_select(x, mask), rtol=0, atol=0)
+
+
+def test_masked_select_strided_inputs(mojo_gpu):
+    """A transposed self and an offset mask view are read in logical order."""
+    x = _fill((6, 9), torch.float32)
+    mask = torch.arange(80).view(8, 10)[1:7, 1:] % 4 == 0
+    dx = x.to(mojo_gpu).t()
+    dmask = torch.arange(80).view(8, 10).to(mojo_gpu)[1:7, 1:].t() % 4 == 0
+    got = torch.masked_select(dx, dmask)
+    want = torch.masked_select(x.t(), mask.t())
+    torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fill", [False, True])
+@pytest.mark.parametrize("shape", [(0,), (3, 0), (2500,)])
+def test_masked_select_all_or_none(mojo_gpu, shape, fill):
+    x = _fill(shape, torch.float32)
+    mask = torch.full(shape, fill)
+    got = torch.masked_select(x.to(mojo_gpu), mask.to(mojo_gpu))
+    assert got.device == torch.device(mojo_gpu)
+    torch.testing.assert_close(got.cpu(), torch.masked_select(x, mask), rtol=0, atol=0)
+
+
+def test_masked_select_out(mojo_gpu, call_checker):
+    call_checker.register("aten::masked_select.out")
+    x = _fill((5, 7), torch.float32)
+    mask = x > 0.05
+    out = torch.empty(3, device=mojo_gpu)
+    ret = torch.masked_select(x.to(mojo_gpu), mask.to(mojo_gpu), out=out)
+    assert ret is out
+    torch.testing.assert_close(out.cpu(), torch.masked_select(x, mask), rtol=0, atol=0)
+
+
+def test_masked_select_rejects_a_non_bool_mask(mojo_gpu):
+    x = torch.ones(4, device=mojo_gpu)
+    mask = torch.tensor([1, 0, 1, 0], dtype=torch.uint8, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="expected BoolTensor for mask"):
+        torch.masked_select(x, mask)
+
+
+def _data_part(text: str) -> str:
+    """A tensor repr up to its last `]`: the formatted values, without the
+    `device=` / `dtype=` suffix, whose line wrapping depends on the device
+    name's length."""
+    if "]" in text:
+        return text[: text.rindex("]") + 1]
+    return re.split(r"[,)]", text)[0]  # a 0-dim tensor: "tensor(3.5000"
+
+
+_PRINT_CASES = {
+    "float32_1d": lambda: torch.tensor([1.5, -2.25, 0.0, 3.0]),
+    "float32_2d": lambda: _fill((3, 5), torch.float32) - 0.3,
+    "float32_0d": lambda: torch.tensor(3.5),
+    "float32_inf_nan": lambda: torch.tensor([float("inf"), float("nan"), -1.0, 0.0]),
+    "float32_int_mode": lambda: torch.tensor([1.0, 20.0, -300.0]),
+    "float32_sci_mode": lambda: torch.tensor([1e-8, 1.0, 1e9]),
+    "float32_all_zero": lambda: torch.zeros(4),
+    "float32_summarized": lambda: _fill((40, 50), torch.float32),
+    "float32_empty": lambda: torch.empty(0),
+    "bfloat16": lambda: _fill((2, 6), torch.bfloat16) - 0.5,
+    "float16": lambda: _fill((2, 6), torch.float16) + 7.0,
+    "float64": lambda: _fill((3, 4), torch.float64) * 1e5,
+    "int64": lambda: torch.arange(-3, 5),
+    "bool": lambda: torch.tensor([True, False, True]),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_PRINT_CASES))
+def test_print_matches_cpu(mojo_gpu, case):
+    x = _PRINT_CASES[case]()
+    _skip_float64_on_metal(mojo_gpu, x.dtype)
+    dev = x.to(mojo_gpu)
+    text = repr(dev)
+    assert f"device='{mojo_gpu}'" in text
+    assert _data_part(text) == _data_part(repr(x))
+    assert str(dev) == text
 
 
 # ---------------------------------------------------------------------------

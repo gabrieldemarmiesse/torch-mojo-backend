@@ -26,6 +26,7 @@ import json
 import math
 import os
 import statistics
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -117,6 +118,7 @@ def main():
     if args.benchmark:
         benchmark(args, model, optimizer, tokens, parameters)
         dist.destroy_process_group()
+        exit_past_vmm_teardown(args.device)
         return
     losses = []
     norms = []
@@ -167,6 +169,22 @@ def main():
         print("FSDP2 training OK", flush=True)
     dist.barrier()
     dist.destroy_process_group()
+    exit_past_vmm_teardown(args.device)
+
+
+def exit_past_vmm_teardown(device: str):
+    """Skip C exit handlers under MAX's VMM allocator (see nanogpt_ddp.py).
+
+    MAX's on-demand (VMM) device allocator is what makes an APU such as the
+    MI300A usable with one rank per GPU (agents_docs/distributed.md), but with MAX
+    26.5 + ROCm 6.4.3 the HSA runtime segfaults in its atexit teardown of the
+    VMM mappings, after Python has finished. Everything above has completed.
+    """
+    vmm = os.environ.get("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM", "").lower()
+    if device == "mojo" and vmm in ("1", "true", "yes", "on"):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 def benchmark(

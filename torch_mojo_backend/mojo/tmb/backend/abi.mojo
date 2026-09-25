@@ -37,6 +37,7 @@ comptime TAG_SCALAR_INT = 18
 comptime TAG_SCALAR_DOUBLE = 19
 comptime TAG_SCALAR_BOOL = 20
 comptime TAG_STREAM = 21
+comptime TAG_STORAGE = 22
 
 # --- torch ScalarType values (c10/core/ScalarType.h) ------------------------
 comptime ST_UINT8 = Int32(0)
@@ -453,6 +454,21 @@ def v_stream(v: Value) raises -> Tuple[Int, Int]:
     if v.tag != TAG_STREAM:
         raise Error("expected a Stream argument, got record tag ", v.tag)
     return (Int(v.a), Int(v.b))
+
+
+@fieldwise_init
+struct StorageArg(Copyable, Movable):
+    """A borrowed `Storage` argument (the arena keeps it alive for the call)."""
+
+    var addr: Int  # c10::Storage*
+    var nbytes: Int
+    var device: Int  # mojo device index, -1 for a storage on another device
+
+
+def v_storage(v: Value) raises -> StorageArg:
+    if v.tag != TAG_STORAGE:
+        raise Error("expected a Storage argument, got record tag ", v.tag)
+    return StorageArg(Int(v.a), Int(v.b), Int(v.len))
 
 
 def v_generator(v: Value) -> Int:

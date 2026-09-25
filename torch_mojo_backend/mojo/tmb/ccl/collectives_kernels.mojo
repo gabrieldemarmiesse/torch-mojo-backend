@@ -166,6 +166,7 @@ from std.sys import (
     size_of,
 )
 from std.sys import llvm_intrinsic
+from std.sys.info import _accelerator_arch
 from std.time import global_perf_counter_ns
 from std.utils import StaticTuple
 
@@ -179,6 +180,53 @@ comptime _AMD = has_amd_gpu_accelerator()
 """Whether this build targets AMD.  Every behavioural difference in this file
 is behind it, so the NVIDIA path is exactly what it was before the MI300A work
 (see the "Link direction" note in the module header)."""
+
+comptime _GFX942 = (
+    _accelerator_arch() == "gfx942" or _accelerator_arch() == "amdgpu:gfx942"
+)
+"""Whether this build targets gfx942, the one spelling of it in the CCL.
+
+The host pass uses the bare --target-accelerator name, while device
+compilation can use the target-qualified spelling; both are the same
+architecture. gfx942 covers the MI300A APU and the discrete MI300X and
+MI325X alike. The multi-node grid rule RCCL applies only to the APU is
+chosen at run time (`_node_grids` in entry.mojo), not here."""
+
+# gfx942 polls relaxed and acquires once (`poll_acquire`). MI300A, job
+# 5447705: FSDP2 comm busy 209.5 -> 188.5 ms/step (agents_docs/distributed.md).
+comptime _POLL_ORDER = Ordering.RELAXED if _GFX942 else Ordering.ACQUIRE
+
+
+@always_inline
+def poll_pause():
+    """RCCL 2.22.3's gfx942 waitPeer sleep (prims_simple.h); no other target."""
+    comptime if _GFX942:
+        llvm_intrinsic["llvm.amdgcn.s.sleep", NoneType, has_side_effect=True](
+            Int32(1)
+        )
+
+
+@always_inline
+def poll_acquire():
+    """Acquire the release observed by a successful relaxed flag poll.
+
+    The system-scope atomic read is sequenced before this system acquire
+    fence, so the release it reads synchronizes with the fence (the standard
+    atomic-to-fence rule). LLVM lowers gfx942's monotonic system load to
+    `global_load ... sc0 sc1`, and this fence to waitcnt + buffer_inv sc0 sc1.
+    The invalidate happens once, before consuming payload, instead of on
+    every failed poll while independent compute is using L2. Every polling
+    thread fences, including an already-satisfied flag, before the block
+    barrier passes the acquire to the payload-reading threads.
+
+    Call it where the wave has reconverged, never inside the branch that
+    polls: there the spin loop's exit leaves EXEC = 0 and the gfx942
+    invalidate ran with no lanes (agents_docs/mojo_collectives_kernel_results.md
+    section 7).
+    """
+    comptime if _GFX942:
+        fence[ordering=Ordering.ACQUIRE]()
+
 
 comptime MAX_WORLD = 8
 """Largest world size a single region can address (one flag column per rank)."""
@@ -737,20 +785,8 @@ def _sync(
     if Int(thread_idx.x) < world:
         var peer = Int(thread_idx.x)
         var bid = Int(block_idx.x) if row < 0 else row
-        # The acquire stays an acquire *load*, per iteration. Spinning on a
-        # relaxed load (still `sc0 sc1`, so it cannot read a stale flag) and
-        # invalidating once after the wait looks exactly as strong, is worth
-        # a lot -- it is the difference between 243 us and 465 us at 27 MiB
-        # when the grid is 1024 blocks, because `buffer_inv sc0 sc1` throws
-        # the payload out of L2 for every block still working -- and was
-        # measured to leave a one-element allreduce at 2 ranks failing 2 runs
-        # in 13, against 0 in 12 with this spelling. Neither sample proves
-        # anything on its own (Fisher p ~ 0.5), but there is no argument for
-        # why the cheap version is sound on this hardware, and two cheaper
-        # release spellings already turned out unsound here in exactly this
-        # way -- small payloads only. So: correctness, and the large messages
-        # pay for it. See agents_docs/mojo_collectives_kernel_results.md section 7
-        # for the experiment that would settle it.
+        # Only the acquire side is relaxed on gfx942 (`poll_acquire`); both
+        # releases stay, for the small-payload reason above.
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
             _flags(regions[peer].unsafe_offset(arena_off)).unsafe_offset(
                 bid * MAX_WORLD + rank
@@ -761,9 +797,8 @@ def _sync(
             bid * MAX_WORLD + peer
         )
         var spins = 0
-        while (
-            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mine) < target
-        ):
+        while Atomic[DType.uint64].load[ordering=_POLL_ORDER](mine) < target:
+            poll_pause()
             spins += 1
             if spins >= _SPIN_CHECK:
                 spins = 0
@@ -798,6 +833,7 @@ def _sync(
                     )
                     failed[unsafe_offset=0] = 1
                     break
+    poll_acquire()  # outside the polling branch on purpose
     barrier()
     return failed[unsafe_offset=0] == 0
 
@@ -2483,6 +2519,33 @@ def _allgather_rank[
 
 
 @always_inline
+def _ag_release_to_nic(
+    region: Pointer[UInt8, MutAnyOrigin],
+    mb_req: Pointer[UInt64, MutAnyOrigin],
+    seq: UInt64,
+):
+    """The last block to finish staging releases RDMA exchange `seq` to the
+    proxy (acq_rel arrivals, release mailbox store: `_allgather_body`)."""
+    comptime if _AMD:
+        # Like _sync, flush every wave before the block rendezvous;
+        # s_barrier alone does not drain AMD vector-memory stores.
+        fence[ordering=Ordering.RELEASE]()
+    barrier()
+    if thread_idx.x == 0:
+        var arrive = region.unsafe_offset(_AG_ARRIVE_OFFSET).unsafe_bitcast[
+            UInt64
+        ]()
+        var was = Atomic[DType.uint64].fetch_add[
+            ordering=Ordering.ACQUIRE_RELEASE
+        ](arrive, UInt64(1))
+        if Int(was) == Int(grid_dim.x) - 1:
+            Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
+                arrive, UInt64(0)
+            )
+            Atomic[DType.uint64].store[ordering=Ordering.RELEASE](mb_req, seq)
+
+
+@always_inline
 def _allgather_body[
     U: Int, MAPPED: Bool, GATED: Bool
 ](
@@ -2501,19 +2564,23 @@ def _allgather_body[
     seq: UInt64,
 ):
     """Local stage + peer gather -- already the unicast minimum: `nbytes` of
-    local copy and `(world-1)*nbytes` of peer reads per GPU.
+    local copy and `(world-1)*nbytes` of cross-link traffic per GPU (peer
+    reads on NVIDIA, peer writes on AMD -- see the branch below).
 
     Rank r's contribution lands at `out_ptr + r*stride_b`; `stride_b` is the
     output layout's true per-rank size, which differs from `nbytes` when the
     caller splits one rank's contribution across several calls.
 
-    `seq != 0` (mapped, NVIDIA): the staged contribution is also this
-    chunk's RDMA payload, and the last block to finish staging stores `seq`
-    into the proxy mailbox `mb_req`, so the NIC reads it while the peer pulls
-    run instead of after them. The arrival RMWs are release, the last one
-    acquire-release, so every block's stage stores are ordered before that
-    mailbox store; the counter is reset by the last arriver and the next
-    launch on this arena is stream-ordered behind this kernel.
+    `seq != 0` (mapped): the staged contribution is also this chunk's RDMA
+    payload, and the last block to finish staging stores `seq` into the
+    proxy mailbox `mb_req`, so the NIC reads it while the local peer copies
+    run instead of after them. Every arrival RMW is acquire-release, so the
+    last arriver's mailbox store is ordered after every block's stage
+    stores; the counter is reset by the last arriver and the next launch on
+    this arena is stream-ordered behind this kernel. On NVIDIA the stage is
+    the slot the peers pull from; on AMD, where the peers push into compact
+    slots of this region, it is a separate slot after them
+    (`allgather_nic_stage_off`).
     """
     var t0 = device_now_ns()
     var world = Int(world_i)
@@ -2524,6 +2591,14 @@ def _allgather_body[
     var out_stride = Int(stride_b)
     var stage_off = Int(stage_off_b)
 
+    # A GATED caller ran `rank_gate` ahead of the grid instead: every peer
+    # finished its previous stream work, which the AMD pushes rely on too.
+    comptime if not GATED:
+        if not _sync(
+            regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
+        ):
+            return
+
     comptime if _AMD:
         # Push instead of pull (module header, "Link direction"): my
         # contribution goes into every peer's slot for me and straight into my
@@ -2532,19 +2607,26 @@ def _allgather_body[
         # the staging is `(world-1) * nbytes` -- which is why
         # `allgather_max_bytes` chunks smaller here than on NVIDIA.
         var slot = (n + 15) // 16 * 16
-        if not _sync(
-            regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
-        ):
-            return
-        _copy_bytes[U](
-            out_ptr.unsafe_offset(
-                _allgather_rank[MAPPED](rank_at, rank) * out_stride
-            ),
-            in_ptr,
-            n,
-            tid,
-            stride,
+        var own_output = out_ptr.unsafe_offset(
+            _allgather_rank[MAPPED](rank_at, rank) * out_stride
         )
+        var nic = False
+        comptime if MAPPED:
+            nic = seq != 0
+        if nic:
+            _copy_bytes2[U](
+                regions[rank].unsafe_offset(
+                    stage_off + allgather_nic_stage_off(world, n)
+                ),
+                own_output,
+                in_ptr,
+                n,
+                tid,
+                stride,
+            )
+            _ag_release_to_nic(regions[rank], mb_req, seq)
+        else:
+            _copy_bytes[U](own_output, in_ptr, n, tid, stride)
         for i in range(1, world):
             var p = rank + _peer_step(i, world)
             if p >= world:
@@ -2585,13 +2667,6 @@ def _allgather_body[
             )
         return
 
-    # A GATED caller ran `_gate_kernel` ahead of the grid instead.
-    comptime if not GATED:
-        if not _sync(
-            regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
-        ):
-            return
-
     # One read of my contribution, two stores: my region (what the peers
     # read) and my own slice of the output.
     _copy_bytes2[U](
@@ -2606,23 +2681,7 @@ def _allgather_body[
     )
     comptime if MAPPED:
         if seq != 0:
-            barrier()
-            if thread_idx.x == 0:
-                var arrive = (
-                    regions[rank]
-                    .unsafe_offset(_AG_ARRIVE_OFFSET)
-                    .unsafe_bitcast[UInt64]()
-                )
-                var was = Atomic[DType.uint64].fetch_add[
-                    ordering=Ordering.ACQUIRE_RELEASE
-                ](arrive, UInt64(1))
-                if Int(was) == Int(grid_dim.x) - 1:
-                    Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
-                        arrive, UInt64(0)
-                    )
-                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                        mb_req, seq
-                    )
+            _ag_release_to_nic(regions[rank], mb_req, seq)
 
     if not _sync(
         regions, world, rank, ERR_ALLGATHER_SYNC, flag_base + 1, t0, timeout_ns
@@ -3740,19 +3799,36 @@ def broadcast(
     )
 
 
-def allgather_max_bytes(cap_bytes: Int, world: Int) -> Int:
+def allgather_max_bytes(
+    cap_bytes: Int, world: Int, nic_stage: Bool = False
+) -> Int:
     """Largest per-rank contribution one `allgather` call may carry.
 
     NVIDIA stages one message-sized buffer per rank in its own region and
     reads the peers', so `cap_bytes` is the bound and this is the identity.
     AMD pushes instead, which needs `world-1` message-sized slots inside the
-    `2*cap_bytes` arena; the caller chunks to that.
+    `2*cap_bytes` arena; the caller chunks to that. `nic_stage`: the call
+    also stages a multi-node exchange's RDMA source, one more slot on AMD
+    (`allgather_nic_stage_off`).
     """
     comptime if _AMD:
-        if world <= 2:
+        var slots = world if nic_stage else world - 1
+        if slots <= 1:
             return cap_bytes
-        return min(cap_bytes, (2 * cap_bytes // (world - 1)) // 16 * 16)
+        return min(cap_bytes, (2 * cap_bytes // slots) // 16 * 16)
     return cap_bytes
+
+
+@always_inline
+def allgather_nic_stage_off(world: Int, nbytes: Int) -> Int:
+    """Offset of a mapped all-gather's RDMA source from its stage. NVIDIA: 0,
+    the stage the peers pull from. AMD: past the `world-1` compact slots the
+    peers push into, which they may be writing while the NIC reads. The
+    kernel stages it and the host posts the read from it, so both use this.
+    """
+    comptime if _AMD:
+        return (world - 1) * _align_up(nbytes, 16)
+    return 0
 
 
 def allgather(
@@ -3838,7 +3914,9 @@ def allgather_mapped[
         return
     if nbytes_per_rank < 0:
         raise Error("collectives: nbytes_per_rank must be >= 0")
-    if nbytes_per_rank > allgather_max_bytes(cap_bytes, world):
+    if nbytes_per_rank > allgather_max_bytes(
+        cap_bytes, world, nic_stage=seq != 0
+    ):
         raise Error("collectives: allgather message exceeds cap_bytes")
     var stride = stride_bytes if stride_bytes >= 0 else nbytes_per_rank
     if stride < nbytes_per_rank:

@@ -43,6 +43,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     binary_promotion,
+    broadcast_shape,
     cast_to,
     contiguous,
     copy_strided_into,
@@ -131,20 +132,6 @@ def _ensure_out_shape(
 # ---------------------------------------------------------------------------
 
 
-def _cmp_broadcast_shape(a: T, b: T) raises -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    for i in range(MAX_RANK):
-        var x = a.shape[i]
-        var y = b.shape[i]
-        if x == y or y == 1:
-            shape[i] = x
-        elif x == 1:
-            shape[i] = y
-        else:
-            raise Error("shapes are not broadcastable")
-    return shape
-
-
 def _one_device(a: T, b: T) raises:
     """Both operands of a raw-pointer launch on the same mojo device.
 
@@ -183,7 +170,7 @@ def _compare_functional(op: StaticString, args: Values, rets: Values) raises:
     var stype = torch_dtype(dtype)
     var pa = cast_to(a, stype)
     var pb = cast_to(b, stype)
-    var shape = _cmp_broadcast_shape(pa, pb)
+    var shape = broadcast_shape(pa, pb)
     var rank = max(pa.rank, pb.rank)
     var out = own(new_tensor(shape, rank, ST_BOOL, a.device))
     _compare_spec(op, pa, pb, out.t)
@@ -204,7 +191,7 @@ def _compare_functional_out(
     var stype = torch_dtype(dtype)
     var pa = cast_to(a, stype)
     var pb = cast_to(b, stype)
-    var shape = _cmp_broadcast_shape(pa, pb)
+    var shape = broadcast_shape(pa, pb)
     var rank = max(pa.rank, pb.rank)
     if _prepare_out(out_arg, shape, rank, ST_BOOL, a.device):
         _compare_spec(op, pa, pb, out_arg)

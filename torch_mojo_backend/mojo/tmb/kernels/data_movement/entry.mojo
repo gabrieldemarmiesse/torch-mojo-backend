@@ -68,6 +68,10 @@ from tmb.kernels.common.op_utils import (
 )
 
 from tmb.kernels.data_movement.batched_copy import copy_batched
+from tmb.kernels.data_movement.masked_select import (
+    masked_select_compact_dispatcher,
+    masked_select_count_dispatcher,
+)
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
     NO_OP_COMPILED,
@@ -3971,6 +3975,12 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["MaskedFillScalar"]():
             _masked_fill_scalar_dispatcher(argv, argc)
+            return 0
+        comptime if _op_on["MaskedSelectCount"]():
+            masked_select_count_dispatcher(argv, argc)
+            return 0
+        comptime if _op_on["MaskedSelectCompact"]():
+            masked_select_compact_dispatcher(argv, argc)
             return 0
         comptime if _op_on["TileCopy"]():
             _tile_copy_dispatcher(argv, argc)

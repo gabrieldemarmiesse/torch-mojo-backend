@@ -97,6 +97,17 @@ def _require_float(op: String, dt: DType) raises:
         )
 
 
+def _require_float_or_f64(op: String, t: T) raises:
+    """The float dtypes plus float64, which Apple GPUs do not have:
+    reciprocal (GradScaler's inverse scale is float64) and ceil / floor
+    (torch's tensor printer ceils float64 values)."""
+    if t.dtype == DType.float64:
+        if dev(t.device)[].api == "metal":
+            unsupported(op + " float64 is unavailable on Apple GPUs")
+        return
+    _require_float(op, t.dtype)
+
+
 def _require_direct(op: String, dt: DType) raises:
     if not _is_spec_unary_dtype(dt):
         unsupported(op + ": dtype " + String(dt) + " is not supported")
@@ -533,10 +544,16 @@ def op_log2_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _ = source^
 
 
+def _reciprocal_check(t: T) raises:
+    """Floats and float64: GradScaler takes its inverse scale in float64."""
+    _require_float_or_f64("reciprocal", t)
+
+
 # aten::reciprocal(Tensor self) -> Tensor
 def op_reciprocal(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("ReciprocalSpec", t))
+    _reciprocal_check(t)
+    var out = own(_unary("elementwise", "ReciprocalSpec", t, t.dtype))
     ret_owned(rets, 0, out)
 
 
@@ -546,7 +563,8 @@ def op_reciprocal_out(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("ReciprocalSpec", t, dst)
+    _reciprocal_check(t)
+    _unary_out("elementwise", "ReciprocalSpec", t, dst, t.dtype)
     ret_ref(rets, 0, dst)
 
 
@@ -672,7 +690,7 @@ def op_tanh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # ---------------------------------------------------------------------------
 # ceil / floor: identity (as a fresh copy, functional semantics) on integer
-# dtypes, the float-only spec kernel otherwise — matches
+# dtypes, the float spec kernel (float64 included) otherwise — matches
 # aten_fast._int_unary_identity.
 # ---------------------------------------------------------------------------
 
@@ -690,7 +708,8 @@ def _int_identity(t: T) raises -> T:
 def _ceil_or_floor(op: String, t: T) raises -> T:
     if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         return _int_identity(t)
-    return _float_unary(op, t)
+    _require_float_or_f64(op, t)
+    return _unary("elementwise", op, t, t.dtype)
 
 
 def _ceil_or_floor_into(op: String, t: T, mut dst: T) raises:
@@ -708,7 +727,8 @@ def _ceil_or_floor_into(op: String, t: T, mut dst: T) raises:
             resize_out(dst, t.shape, t.rank)
         copy_strided_into(dst, t)
         return
-    _float_unary_out(op, t, dst)
+    _require_float_or_f64(op, t)
+    _unary_out("elementwise", op, t, dst, t.dtype)
 
 
 # aten::ceil(Tensor self) -> Tensor

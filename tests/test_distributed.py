@@ -422,7 +422,9 @@ def test_two_rank_nccl(mode: str, ccl: str):
 
 
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
-@pytest.mark.parametrize("mode", ["parity", "reduce_scatter"])
+@pytest.mark.parametrize(
+    "mode", ["parity", "reduce_scatter", "fsdp_collectives_stress"]
+)
 def test_two_rank_fsdp2(mode: str, ccl: str):
     if _gpu_count() < 2:
         pytest.skip("needs at least 2 GPUs")

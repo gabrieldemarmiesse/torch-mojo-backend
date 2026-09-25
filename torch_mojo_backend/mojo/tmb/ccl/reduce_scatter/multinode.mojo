@@ -297,8 +297,12 @@ def reduce_scatter_nodes[
     in_stride: Int,
     rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
     node_count: Int,
+    max_blocks: Int,
 ) raises:
-    """Reduce node-local contributions into node_count aligned output chunks."""
+    """Reduce node-local contributions into node_count aligned output chunks.
+
+    `max_blocks`: grid cap (`CommState.rs_node_blocks`); 0 keeps the
+    allreduce caps."""
     _check_common(rank, world, cap_bytes, generation)
     if count == 0:
         return
@@ -318,6 +322,8 @@ def reduce_scatter_nodes[
         _AR_BIG_BLOCKS if world * node_count * count * esize
         >= _AR_BIG_BYTES else _AR_MAX_BLOCKS
     )
+    if max_blocks > 0:
+        cap_blocks = max_blocks
     var blocks = min(cap_blocks, max(1, (count // W + 1 + BLOCK - 1) // BLOCK))
     if world == 8:
         _launch_rs_nodes[dtype, W, 8](

@@ -92,6 +92,7 @@ from tmb.ccl.driver import (
     alloc_region,
     close_handle,
     current_device_ordinal,
+    direct_managed_mem_access,
     free_host,
     free_region,
     get_handle,
@@ -134,10 +135,14 @@ from tmb.ccl.collectives_kernels import (
     STATUS_FAULT_WORD,
     STATUS_HOST_FAULT_WORD,
     STATUS_PAGE_BYTES,
+    _AMD,
+    _COPY_MAX_BLOCKS,
+    _GFX942,
     _shard_per,
     allgather,
     allgather_max_bytes,
     allgather_mapped,
+    allgather_nic_stage_off,
     allgather_finish,
     allreduce,
     broadcast,
@@ -183,7 +188,6 @@ from tmb.ccl.internode import (
     ib_teardown,
 )
 from tmb.ccl.internode_fused import (
-    _MI300A,
     FUSED_THREADS,
     check_fused_call,
     fused_big_block_cap,
@@ -197,7 +201,6 @@ from tmb.ccl.internode_kernels import (
     copy_bytes,
     inbox_add,
     inbox_sum_out,
-    place_blocks,
 )
 from tmb.ccl.reduce_scatter.fused import (
     RS_FUSED_BIG_BLOCKS,
@@ -345,16 +348,49 @@ vectors in flight measures the same isolated time as 96 x 4 on the XL sizes
 against 66.1-69.1k -- a latency-bound pull under the compute stream's HBM
 traffic loses far more from 6x fewer CTAs than the GEMMs gain from the
 freed SMs, and the compute stream waits on this gather."""
-comptime AG_NODE_UNROLL = 4
-"""16-byte vectors in flight per thread in those gathers; 8 measured
-66.1k tok/s against 67.3-67.6k at 96 blocks."""
+comptime AG_NODE_UNROLL = 2 if _GFX942 else 4
+"""16-byte vectors in flight per thread in those gathers. gfx942: RCCL's
+unroll for gfx94 parts with more than 80 CUs (rccl `src/init.cc:101-105`,
+NCCL_UNROLL_2; the generic kernel it launches there is the unroll-2 one).
+That rule covers MI300A and MI300X alike; a gfx942 part with 80 CUs or
+fewer would get RCCL's unroll 4 and gets 2 here, unmeasured. Unroll 2 was
+only measured together with the 24-block grid, never on its own.
+H100: 8 measured 66.1k tok/s against 67.3-67.6k at 96 blocks."""
+
+
+comptime RCCL_APU_NODE_CTAS = 24
+"""Grid of a multi-node collective's node-local kernels on an APU (MI300A):
+the all-gather's gathers and the reduce-scatter's node reduce. RCCL 2.22.3
+forces 24 channels (4 rings x 6, one 256-thread CTA each) on a gfx942 whose
+host accesses its managed memory directly (an APU) when there is more than
+one node (rccl `src/init.cc:1339-1346`, `src/device/device.h:74`).
+Measured on 2x4 MI300A, Adastra job 5447705, GPT-2 XL FSDP2 bf16, ABBA legs,
+tok/s: gathers at 432/96/24 blocks 20.9k/22.0k/23.0k (mojo+RCCL 23.1k), node
+reduce at 128 -> 24 blocks 22.0k -> 23.2k. In isolation 96 blocks is the
+faster gather (XL bf16 block 599 vs 650 us) and the reduce is network-bound
+(950 vs 951 us), so 24 wins end to end only: every CU a collective holds
+beside the compute stream is one the GEMMs lose. A discrete gfx942 (MI300X,
+MI325X) fails RCCL's test and keeps its caps; nothing was measured on one."""
+
+
+def _node_grids(apu: Bool) -> Tuple[Int, Int]:
+    """Grid caps of a multi-node all-gather's gathers and reduce-scatter's
+    node reduce (0: the allreduce caps), chosen once at init. `apu`: RCCL's
+    test, ANDed over the ranks in bootstrap round 2, since ranks on
+    different grids would block-match different slices of a collective.
+    Only gfx942 asks the question, as RCCL does."""
+    if apu:
+        return (RCCL_APU_NODE_CTAS, RCCL_APU_NODE_CTAS)
+    comptime if _AMD:
+        return (_COPY_MAX_BLOCKS, 0)  # the single-node copy cap
+    return (AG_NODE_BLOCKS, 0)
 
 
 # MI300A: 64 MiB supports four ranks/node without the large shared-memory
 # reservation conflict (Adastra 124M measurements in agents_docs/distributed.md),
 # and the GPT-2 XL five-round series at 0.9873x stock used it, job 5417296,
 # 2026-09-15. NVIDIA retains its H100 staging fit of 256 MiB.
-comptime DEFAULT_REGION_MB = 64 if _MI300A else 256
+comptime DEFAULT_REGION_MB = 64 if _GFX942 else 256
 comptime DEFAULT_BOOTSTRAP_TIMEOUT_S: Float64 = 120.0
 
 comptime DEFAULT_SOCKET_DIR = "/tmp"
@@ -555,6 +591,10 @@ struct CommState(Movable):
     var fused_resident: Int
     # `PIPE_SPLIT_UNIT`; checked equal on every rank at init.
     var split_unit: Int
+    # Grid caps of a multi-node all-gather's gathers and reduce-scatter's
+    # node reduce (`_node_grids`), the same on every rank.
+    var ag_node_blocks: Int
+    var rs_node_blocks: Int
     # Whether multi-node allreduces go through the one-launch fused kernel.
     # Requires the progress thread. A message exceeding the fused work-ring
     # capacity still takes the split schedule at launch time.
@@ -598,6 +638,8 @@ struct CommState(Movable):
         fused_big_bytes: Int,
         fused_resident: Int,
         split_unit: Int,
+        ag_node_blocks: Int,
+        rs_node_blocks: Int,
         fused: Bool,
         abort_host: Int,
         abort_dev: Int,
@@ -643,6 +685,8 @@ struct CommState(Movable):
         self.fused_big_bytes = fused_big_bytes
         self.fused_resident = fused_resident
         self.split_unit = split_unit
+        self.ag_node_blocks = ag_node_blocks
+        self.rs_node_blocks = rs_node_blocks
         self.fused = fused
         # Barriers the NVLS kernel has completed on this region. Its flag is a
         # single UInt64 counter that every GPU adds 1 to per barrier, so the
@@ -1431,6 +1475,9 @@ def _bootstrap(
         device_sms = 0
     if device_sms <= 0:
         device_sms = sm_count(lib, ordinal)
+    var apu = False
+    comptime if _GFX942:  # RCCL's multi-node APU rule is gfx942's
+        apu = direct_managed_mem_access(lib, ordinal)
     # A positive multiple of 4096 (the kernels' own precondition,
     # RESULTS.md section 9) is what keeps every per-chunk offset the
     # collectives form 16-byte aligned for every supported dtype.
@@ -1634,7 +1681,7 @@ def _bootstrap(
         # a per-rank `NVLS_MIN_BYTES` sends one rank into the multicast
         # counter barrier and another into the flag barrier, which is a hang.
         # Checking three integers here turns both into a message.
-        comptime CFG_BYTES = 88
+        comptime CFG_BYTES = 96
         comptime BLOB2 = HANDLE_BYTES + IB_BLOB_BYTES + CFG_BYTES
         var b2 = unsafe_alloc[UInt8](BLOB2)
         for i in range(BLOB2):
@@ -1674,8 +1721,16 @@ def _bootstrap(
         cfg[unsafe_offset=8] = Int64(FUSED_THREADS)
         cfg[unsafe_offset=9] = Int64(fused_resident)
         cfg[unsafe_offset=10] = Int64(device_sms)
+        # RCCL's APU test, which picks the multi-node grids (`_node_grids`).
+        # The query is rank-local and a rank whose driver call fails answers
+        # "discrete" alone, while ranks on different grids block-match
+        # different slices of a collective. So, like the NVLS column of round
+        # 1, every rank ANDs the column: one "discrete" answer puts the whole
+        # communicator on the discrete-GPU grids.
+        cfg[unsafe_offset=11] = Int64(1 if apu else 0)
         var t2 = unsafe_alloc[UInt8](BLOB2 * nranks)
         bootstrap_allgather(conn, _any(b2), BLOB2, _any(t2), timeout_s)
+        var not_apu_rank = -1
         for r in range(nranks):
             var rcfg = Pointer[Int64, MutAnyOrigin](
                 unsafe_from_address=Int(t2)
@@ -1683,6 +1738,8 @@ def _bootstrap(
                 + HANDLE_BYTES
                 + IB_BLOB_BYTES
             )
+            if rcfg[unsafe_offset=11] == 0 and not_apu_rank < 0:
+                not_apu_rank = r
             if (
                 rcfg[unsafe_offset=0] != cfg[unsafe_offset=0]
                 or rcfg[unsafe_offset=1] != cfg[unsafe_offset=1]
@@ -1753,6 +1810,18 @@ def _bootstrap(
                     + String(device_sms)
                     + "; the ranks of a node must run identical GPUs"
                 )
+        if apu and not_apu_rank >= 0:
+            apu = False
+            print(
+                "mojoccl: rank",
+                rank,
+                "is on an APU but rank",
+                not_apu_rank,
+                (
+                    "reported a discrete GPU (or could not query it); every"
+                    " rank uses the discrete-GPU collective grids"
+                ),
+            )
 
         # Same-node peers only: an IPC handle from another host is meaningless.
         regions[topo.my_local_rank] = base
@@ -1806,6 +1875,7 @@ def _bootstrap(
     for i in range(len(topo.rank_at)):
         rank_at.append(topo.rank_at[i])
     var nvls_grid = nvls_blocks(device_sms)
+    var node_grids = _node_grids(apu)
     var state = CommState(
         rank=rank,
         world=nranks,
@@ -1836,6 +1906,8 @@ def _bootstrap(
         fused_big_bytes=fused_big,
         fused_resident=fused_resident,
         split_unit=split_unit,
+        ag_node_blocks=node_grids[0],
+        rs_node_blocks=node_grids[1],
         fused=fused,
         abort_host=abort_host,
         abort_dev=abort_dev,
@@ -3078,16 +3150,21 @@ def _allgather_locked(
             )
             done += chunk
         return NCCL_SUCCESS
-    _allgather_multinode(
-        state, s, stream, Int(sendbuff), Int(recvbuff), per_rank_bytes
-    )
+    _allgather_multinode(state, s, Int(sendbuff), Int(recvbuff), per_rank_bytes)
     return NCCL_SUCCESS
 
 
 def allgather_mapped_max_bytes(
-    arena_cap: Int, inbox_group: Int, npeers: Int
+    arena_cap: Int, inbox_group: Int, npeers: Int, local_world: Int
 ) -> Int:
-    return min(arena_cap, inbox_group // npeers) // 16 * 16
+    return (
+        min(
+            allgather_max_bytes(arena_cap, local_world, nic_stage=True),
+            inbox_group // npeers,
+        )
+        // 16
+        * 16
+    )
 
 
 def _allgather_node_mapped(
@@ -3121,7 +3198,7 @@ def _allgather_node_mapped(
             state.generation,
             stride,
             ranks,
-            AG_NODE_BLOCKS,
+            state.ag_node_blocks,
             mb_req,
             seq,
         )
@@ -3139,7 +3216,7 @@ def _allgather_node_mapped(
         state.generation,
         stride,
         ranks,
-        AG_NODE_BLOCKS,
+        state.ag_node_blocks,
         mb_req,
         seq,
     )
@@ -3161,19 +3238,21 @@ def allgather_mapped_pipeline_plan(
     return Tuple(chunk, nchunks, min(2, min(narenas, min(nslots - 1, nchunks))))
 
 
-def _allgather_multinode_mapped(
+def _allgather_multinode(
     mut state: CommState,
     stream: DeviceStream,
-    raw_stream: Int64,
     sendbuff: Int,
     recvbuff: Int,
     per_rank_bytes: Int,
 ) raises:
+    """Exchange one contribution per NIC, disseminate on the receiving node.
+    The node-local gathers write straight into the mapped output slots and
+    stage the RDMA source; chunks pipeline through two arenas."""
     if per_rank_bytes == 0:
         return
     var npeers = ib_npeers(state.ib)
     var max_bytes = allgather_mapped_max_bytes(
-        state.arena_cap, _inbox_group_bytes(state), npeers
+        state.arena_cap, _inbox_group_bytes(state), npeers, state.local_world
     )
     var plan = allgather_mapped_pipeline_plan(
         per_rank_bytes,
@@ -3181,7 +3260,8 @@ def _allgather_multinode_mapped(
         state.narenas,
         state.nslots,
         # Measured on 2x8 H100: overlap large gathers, retain the passing
-        # single-chunk route below this node-scaled threshold.
+        # single-chunk route below this node-scaled threshold. 2x4 MI300A:
+        # agents_docs/distributed.md.
         PIPE_SPLIT_UNIT * state.local_world,
     )
     var chunk_bytes = plan[0]
@@ -3198,9 +3278,15 @@ def _allgather_multinode_mapped(
             var seq = ib_next_seq(state.ib)
             var slot_bytes = _align_up(count, 16)
             var inbox_base = _inbox_base(state, seq)
+            var send_stage = (
+                state.owned_base
+                + arena * state.arena_stride
+                + signal_bytes()
+                + allgather_nic_stage_off(state.local_world, count)
+            )
             ib_prepare_request(
                 state.ib,
-                state.owned_base + arena * state.arena_stride + signal_bytes(),
+                send_stage,
                 count,
                 inbox_base,
                 slot_bytes,
@@ -3268,145 +3354,6 @@ def _allgather_multinode_mapped(
                 )
                 slot += 1
             ib_note_consumed(state.ib, seq)
-
-
-def _allgather_multinode(
-    mut state: CommState,
-    stream: DeviceStream,
-    raw_stream: Int64,
-    sendbuff: Int,
-    recvbuff: Int,
-    per_rank_bytes: Int,
-) raises:
-    """Exchange one contribution per NIC, disseminate on the receiving node."""
-    comptime if has_nvidia_gpu_accelerator():
-        _allgather_multinode_mapped(
-            state, stream, raw_stream, sendbuff, recvbuff, per_rank_bytes
-        )
-        return
-    var lw = state.local_world
-    var npeers = ib_npeers(state.ib)
-    var block_stage = state.owned_base + _net_stage_off(state)
-    var max_bytes = (
-        min(
-            _net_stage_bytes(state) // lw,
-            min(
-                allgather_max_bytes(state.arena_cap, lw),
-                _inbox_group_bytes(state) // npeers,
-            ),
-        )
-        // 16
-        * 16
-    )
-    if max_bytes < 16:
-        raise Error("mojoccl: allgather staging cannot hold one vector")
-    var done = 0
-    var chunk_index = 0
-    var nchunks = (per_rank_bytes + max_bytes - 1) // max_bytes
-    while done < per_rank_bytes:
-        var chunk = min(max_bytes, per_rank_bytes - done)
-        state.generation += 1
-        allgather(
-            state.ctx,
-            stream,
-            state.local_rank,
-            lw,
-            _arena_regions(state, 0),
-            sendbuff + done,
-            block_stage,
-            chunk,
-            state.arena_cap,
-            state.generation,
-            stride_bytes=chunk,
-        )
-        var seq = ib_next_seq(state.ib)
-        var slot_bytes = _align_up(chunk, 16)
-        var inbox_base = _inbox_base(state, seq)
-        if npeers * slot_bytes > _inbox_group_bytes(state):
-            raise Error("mojoccl: allgather inbox does not fit")
-        ib_enqueue_request(
-            state.ib,
-            state.driver,
-            state.ctx,
-            stream,
-            Int(raw_stream),
-            block_stage + state.local_rank * chunk,
-            chunk,
-            inbox_base,
-            slot_bytes,
-            True,
-            npeers,
-            state.owned_base + inbox_base,
-            seq,
-            OP_ALLGATHER,
-            chunk_index,
-            nchunks,
-            chunk,
-        )
-        _place_node_block(
-            state,
-            stream,
-            recvbuff,
-            block_stage,
-            state.my_node,
-            chunk,
-            done,
-            per_rank_bytes,
-        )
-        # Completion includes sends: staging is now safe to overwrite.
-        ib_enqueue_wait(state.ib, state.ctx, stream, seq)
-        var slot = 0
-        for node in range(state.nnodes):
-            if node == state.my_node:
-                continue
-            state.generation += 1
-            allgather(
-                state.ctx,
-                stream,
-                state.local_rank,
-                lw,
-                _arena_regions(state, 0),
-                state.owned_base + inbox_base + slot * slot_bytes,
-                block_stage,
-                chunk,
-                state.arena_cap,
-                state.generation,
-                stride_bytes=chunk,
-            )
-            _place_node_block(
-                state,
-                stream,
-                recvbuff,
-                block_stage,
-                node,
-                chunk,
-                done,
-                per_rank_bytes,
-            )
-            slot += 1
-        ib_note_consumed(state.ib, seq)
-        done += chunk
-        chunk_index += 1
-
-
-def _place_node_block(
-    mut state: CommState,
-    stream: DeviceStream,
-    recvbuff: Int,
-    src: Int,
-    node: Int,
-    chunk: Int,
-    done: Int,
-    per_rank_bytes: Int,
-) raises:
-    var offs = StaticTuple[Int64, MAX_WORLD](fill=0)
-    for l in range(state.local_world):
-        offs[l] = Int64(
-            state.rank_at[node * state.local_world + l] * per_rank_bytes + done
-        )
-    place_blocks(
-        state.ctx, stream, recvbuff, src, offs, chunk, state.local_world
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -3912,6 +3859,7 @@ def _do_reduce_scatter_nodes[
                 count,
                 rank_ids,
                 state.nnodes,
+                state.rs_node_blocks,
             )
             var seq = ib_next_seq(state.ib)
             var inbox_base = _inbox_base(state, seq)

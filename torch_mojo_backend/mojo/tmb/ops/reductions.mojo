@@ -102,6 +102,17 @@ def _is_row_reduce(dt: DType) -> Bool:
     return _is_float3(dt) or dt == DType.int64 or dt == DType.int32
 
 
+def _check_extremum_dtype(a: T, op: StaticString) raises:
+    """reduce_skeleton EXTREMUM_DTYPES: amax/amin and full max/min; float64
+    is declined on Apple GPUs, which have none."""
+    if a.dtype == DType.float64:
+        if dev(a.device)[].api == "metal":
+            unsupported(String(op) + ": float64 is unavailable on Apple GPUs")
+        return
+    if not _is_row_reduce(a.dtype):
+        unsupported(String(op) + " of dtype " + String(a.dtype))
+
+
 def _is_truthy(dt: DType) -> Bool:
     """reduce_skeleton TRUTHY_DTYPES: the operand dtypes any()/all() accept."""
     return (
@@ -793,8 +804,7 @@ def _refuse_empty_extremum(op: StaticString, t: T, dims: List[Int]) raises:
 def _amax_amin(op: StaticString, args: Values, rets: Values) raises:
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
-    if not _is_row_reduce(a.dtype):
-        unsupported(String(op) + " of dtype " + String(a.dtype))
+    _check_extremum_dtype(a, op)
     var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
     if len(dims) == 0:
         unsupported("amax/amin with no reduce dim (a rank-0 operand)")
@@ -828,8 +838,7 @@ def _full_extremum(
     """max(Tensor) / min(Tensor): the values-only full reduction."""
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
-    if not _is_row_reduce(a.dtype):
-        unsupported(String(op) + " of dtype " + String(a.dtype))
+    _check_extremum_dtype(a, op)
     if a.rank == 0:
         unsupported("max()/min() of a rank-0 tensor")
     var dims = _trailing_dims(a.rank, a.rank)

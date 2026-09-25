@@ -1,5 +1,5 @@
 """Data-movement kernels: cat / stack / repeat / strided clone / tril /
-triu / arange / dtype cast.
+triu / arange / dtype cast / masked_select.
 
 clone is benchmarked on STRIDED inputs only: a contiguous clone is a
 device memcpy, which measure.py excludes from device time by design (the
@@ -93,6 +93,10 @@ COVERS: dict[str, str] = {
     "aten::_index_put_impl_": "test_index_put",
     "aten::reflection_pad2d": "test_reflection_pad2d",
     "aten::replication_pad2d": "test_replication_pad2d",
+    "aten::masked_select": "test_masked_select",
+    "aten::masked_select.out": (
+        "test_masked_select (same kernels, the result copied into out)"
+    ),
 }
 
 SKIPPED: dict[str, str] = {}
@@ -461,4 +465,28 @@ def test_replication_pad2d(
         lambda: torch.nn.functional.pad(x_ref, PAD2D_PADDING, mode="replicate"),
         lambda: torch.nn.functional.pad(x_our, PAD2D_PADDING, mode="replicate"),
         flops=_pad2d_out_numel(shape),
+    )
+
+
+MASKED_SELECT_SHAPES: dict[str, tuple[int, ...]] = {
+    "C_16777216": (16777216,),
+    "A_357x789": (357, 789),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", MASKED_SELECT_SHAPES)
+def test_masked_select(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    # Fixed 50% density under the seeded fixture, as for nonzero: the output
+    # size is identical on both legs and across runs. Device time only, so
+    # the host read of the per-tile counts is not measured.
+    shape = MASKED_SELECT_SHAPES[shape_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    m_ref, m_our = both(torch.rand(shape) < 0.5, hw, mojo_device)
+    bench.run(
+        lambda: torch.masked_select(x_ref, m_ref),
+        lambda: torch.masked_select(x_our, m_our),
+        flops=float(x_ref.numel()),
     )

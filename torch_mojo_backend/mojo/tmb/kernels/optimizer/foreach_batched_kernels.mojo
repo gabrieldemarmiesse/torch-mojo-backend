@@ -15,7 +15,8 @@ comptime-parametrized by
     bit-compatible with the per-tensor decomposition;
   * `op` -- which element math to apply: mul/add/div by a host scalar (one per
     tensor, so `.Scalar` and `.ScalarList` are the same code), multiply by a
-    device-resident scalar tensor, scalar lerp, addcmul, addcdiv, sqrt.
+    device-resident scalar tensor, scalar lerp, addcmul, addcdiv, sqrt, and
+    GradScaler's non-finite check and unscale.
 
 Every tensor is cut into `chunk_elements`-sized chunks and one block takes one
 chunk, with the descriptor's `chunk_end` a running prefix sum of chunk counts
@@ -44,6 +45,7 @@ from std.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, min
 from std.sys.info import has_apple_gpu_accelerator, size_of
+from std.utils.numerics import isfinite
 
 from tmb.kernels.optimizer.foreach_elementwise_kernels import (
     FEA_ADDCDIV,
@@ -56,6 +58,7 @@ from tmb.kernels.optimizer.foreach_elementwise_kernels import (
     enqueue_foreach_addc_f32,
     enqueue_foreach_lerp_f32,
     enqueue_foreach_mul_tensor_f32,
+    enqueue_foreach_nonfinite_unscale_f32,
     enqueue_foreach_scalar_f32,
     enqueue_foreach_sqrt_f32,
 )
@@ -77,6 +80,9 @@ comptime FEW_LERP = 4  # self = lerp(self, end, weight)
 comptime FEW_ADDCMUL = 5  # self += scalar[i] * (t1 * t2)
 comptime FEW_ADDCDIV = 6  # self += scalar[i] * (t1 / t2)
 comptime FEW_SQRT = 7  # out = sqrt(in), the one out-of-place member
+# *flag_addr = 1 if any self is non-finite; self *= *scalar_addr (an FP32 0-d
+# device tensor, whatever the list dtype) unless that scalar is exactly 1.
+comptime FEW_NONFINITE_UNSCALE = 8
 
 comptime FEW_THREADS = 256
 
@@ -117,7 +123,12 @@ comptime FEW_DESC_CAP = 64
 # written from, so the two cannot drift apart.
 comptime _FEW_SCALAR_FAMILY = [FEW_MUL, FEW_ADD, FEW_DIV]
 comptime _FEW_ADDC_FAMILY = [FEW_ADDCMUL, FEW_ADDCDIV]
-comptime _FEW_SOLO = [FEW_MUL_TENSOR, FEW_LERP, FEW_SQRT]
+comptime _FEW_SOLO = [
+    FEW_MUL_TENSOR,
+    FEW_LERP,
+    FEW_SQRT,
+    FEW_NONFINITE_UNSCALE,
+]
 
 
 @always_inline
@@ -128,7 +139,11 @@ def _few_addrs[op: Int]() -> Int:
     elif op == FEW_ADDCMUL or op == FEW_ADDCDIV:
         return 3
     elif (
-        op == FEW_MUL or op == FEW_ADD or op == FEW_DIV or op == FEW_MUL_TENSOR
+        op == FEW_MUL
+        or op == FEW_ADD
+        or op == FEW_DIV
+        or op == FEW_MUL_TENSOR
+        or op == FEW_NONFINITE_UNSCALE
     ):
         return 1
     else:
@@ -177,6 +192,8 @@ def _few_label[op: Int]() -> StaticString:
         return "addcdiv"
     elif op == FEW_SQRT:
         return "sqrt"
+    elif op == FEW_NONFINITE_UNSCALE:
+        return "nonfinite_check_unscale"
     else:
         # A wrong name here would be printed to users by CUPTI/Nsight and would
         # name the wrong algorithm, so this is a build error, not a default.
@@ -284,6 +301,7 @@ def _few_element[
     b_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     c_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    flag_ptr: Pointer[Float32, MutUntrackedOrigin],
     index: Int,
     scalar: Float32,
     weight: Float32,
@@ -308,6 +326,12 @@ def _few_element[
         result = a / scalar
     elif op == FEW_SQRT:
         result = ieee_sqrt(a)
+    elif op == FEW_NONFINITE_UNSCALE:
+        # ATen's AmpKernels.cu: every writer stores the same 1, so the race is
+        # benign and needs no atomic.
+        if not isfinite(a).reduce_and():
+            flag_ptr[] = 1.0
+        result = a if scalar == 1.0 else a * scalar
     elif op == FEW_LERP:
         # ATen's numerically stable branch pair, selected on the host exactly
         # like `fast_aten_lerp` does. The scale-and-add is written as one
@@ -357,6 +381,7 @@ def _foreach_ew_kernel[
     weight: Float32,
     one_minus_weight: Float32,
     low_branch_arg: Int64,
+    flag_addr_arg: Int64,
 ):
     """One block per chunk of the concatenation of the list."""
     # Int is not device-passable (host/device width mismatch); scalars cross
@@ -383,6 +408,9 @@ def _foreach_ew_kernel[
         scalar = _make_ptr[dtype](Int(scalar_addr_arg))[unsafe_offset=0].cast[
             DType.float32
         ]()
+    comptime if op == FEW_NONFINITE_UNSCALE:
+        scalar = _make_ptr[DType.float32](Int(scalar_addr_arg))[unsafe_offset=0]
+    var flag_ptr = _make_ptr[DType.float32](Int(flag_addr_arg))
 
     var a_ptr = _make_ptr[dtype](desc.addr0)
     var b_ptr = _make_ptr[dtype](desc.addr1)
@@ -417,6 +445,7 @@ def _foreach_ew_kernel[
                 b_ptr,
                 c_ptr,
                 out_ptr,
+                flag_ptr,
                 head,
                 scalar,
                 weight,
@@ -431,6 +460,7 @@ def _foreach_ew_kernel[
                 b_ptr,
                 c_ptr,
                 out_ptr,
+                flag_ptr,
                 index,
                 scalar,
                 weight,
@@ -445,6 +475,7 @@ def _foreach_ew_kernel[
                 b_ptr,
                 c_ptr,
                 out_ptr,
+                flag_ptr,
                 tail,
                 scalar,
                 weight,
@@ -460,6 +491,7 @@ def _foreach_ew_kernel[
                 b_ptr,
                 c_ptr,
                 out_ptr,
+                flag_ptr,
                 index,
                 scalar,
                 weight,
@@ -514,6 +546,7 @@ def _foreach_ew_enqueue_apple[
     weight: Float32,
     one_minus_weight: Float32,
     low_branch: Int,
+    flag_addr: Int,
     ctx: DeviceContext,
 ) raises:
     """Same descriptors, Metal's fixed-arity ABI: FOREACH_EW_SLOTS tensors per
@@ -611,6 +644,17 @@ def _foreach_ew_enqueue_apple[
                     ctx,
                 )
                 launched = True
+            comptime if op == FEW_NONFINITE_UNSCALE:
+                enqueue_foreach_nonfinite_unscale_f32(
+                    first_addrs,
+                    chunk_ends,
+                    numels,
+                    scalar_addr,
+                    flag_addr,
+                    group_chunks,
+                    ctx,
+                )
+                launched = True
             comptime if op == FEW_SQRT:
                 enqueue_foreach_sqrt_f32(
                     first_addrs,
@@ -645,6 +689,7 @@ def foreach_ew_enqueue[
     weight: Float32,
     one_minus_weight: Float32,
     low_branch: Int,
+    flag_addr: Int,
     ctx: DeviceContext,
 ) raises:
     # Checked on EVERY target, not just Apple: the Apple arms are the half of
@@ -665,6 +710,7 @@ def foreach_ew_enqueue[
             weight,
             one_minus_weight,
             low_branch,
+            flag_addr,
             ctx,
         )
     else:
@@ -682,4 +728,5 @@ def foreach_ew_enqueue[
             weight,
             one_minus_weight,
             Int64(low_branch),
+            Int64(flag_addr),
         )

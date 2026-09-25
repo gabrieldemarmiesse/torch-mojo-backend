@@ -31,6 +31,12 @@ def alloc_bytes(n: Int) -> P8:
 
 
 @always_inline
+def free_bytes(p: P8):
+    """Release a buffer from `alloc_bytes`."""
+    p.unsafe_free()
+
+
+@always_inline
 def st8(p: P8, off: Int, v: UInt8):
     p[unsafe_offset=off] = v
 

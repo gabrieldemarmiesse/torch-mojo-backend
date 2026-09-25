@@ -14,11 +14,17 @@ the multi-node design this job is meant to validate once it lands).
 
 One `sbatch` job, three phases, always in this order:
 
-**A. `tests/ddp_worker.py`, 16 ranks.** For each `ccl` in `vendor`, `mojo`:
-run modes `collectives`, `ddp_parity`, `stress` (one `torchrun
---nnodes=2 --nproc-per-node=8` launch per mode). `stress` is a no-op PASS
-under vendor NCCL (it self-skips — see `run_stress` in `ddp_worker.py`); it
-is mojoccl-specific regression coverage ported from the kernel harness.
+**A. `tests/ddp_worker.py` and `tests/fsdp_worker.py`, 16 ranks.** For each
+`ccl` in `vendor`, `mojo`: run the `ddp_worker` modes `collectives`,
+`ddp_parity`, `stress` and the `fsdp_worker` modes `reduce_scatter`,
+`fsdp_collectives_stress` (one `torchrun --nnodes=2 --nproc-per-node=8`
+launch per mode). `stress` is a no-op PASS under vendor NCCL (it self-skips —
+see `run_stress` in `ddp_worker.py`); it is mojoccl-specific regression
+coverage ported from the kernel harness. `fsdp_collectives_stress` is the
+multi-node all-gather and reduce-scatter at FSDP2 sizes, including the
+in-place all-gather FSDP2 issues; `test_distributed.py` only runs it on one
+node. `fsdp_worker parity` is left out: its DCP round trip wants a temp
+directory every node can see.
 
 **B. `ar_bench_gpt2.py` allreduce bench, ABBA order:** `vendor, mojo, mojo,
 vendor` — the AGENTS.md-documented ordering that cancels a thermal/clock
@@ -210,6 +216,35 @@ E2E_TAG=e2e_gpt2xl E2E_MODEL="nanoGPT GPT-2 XL (1.5B)" \
 Each batch size now starts with one discarded warm-up per stack, which doubles as the fit gate
 (a size whose warm-up fails on any stack is skipped), and a 1-rank mojo prewarm builds the
 kernel cache before the 16-rank runs race for it.
+
+## Worker suites on Adastra (2 x 4 MI300A, Slingshot)
+
+`run_worker_suites_adastra.sh` is phase A for the CINES Adastra MI300A
+partition, mojoccl only, with the multi-node probes added. It runs every
+`ddp_worker` mode (`collectives`, `stress`, `ddp_parity`, `stream_ordering`,
+`abort`) and every `fsdp_worker` mode (`reduce_scatter`,
+`fsdp_collectives_stress`, `parity`) first on `NNODES` (default 2) nodes x 4
+APUs, adding `ring_pressure.py` (N=1500), `small_region_probe.py`
+(`MOJOCCL_REGION_MB=1`) and `deadline_probe.py` (`MOJOCCL_IB_TIMEOUT_S=3`,
+once fused and once with `MOJOCCL_REGION_MB=1 --size-mib 129` for the split
+wait kernel), then all the worker modes again on one node. It prints one
+PASS/FAIL line per suite, keeps each suite's output under `LOGDIR`, and exits
+nonzero when any suite failed. Run it as a batch script or from a login node
+against an existing allocation:
+
+```bash
+J=<jobid> ENV_SH=$SCRATCHDIR/env.sh REPO=$SCRATCHDIR/checkout \
+    tests/multinode/run_worker_suites_adastra.sh
+```
+
+`ENV_SH` is sourced on every node: the ROCm and libstdc++ setup, and
+`TORCH_MOJO_BACKEND_CACHE_DIR` on scratch. Each node's ranks run under that
+node's per-GPU flocks. The host libraries and `libmojoccl` build before the
+locks are taken, but eager kernels compile at first use, so warm the cache
+first. Ranks enter through `vmm_exit_entry.py`: the APU needs
+`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`, which segfaults in HIP's exit
+handlers. `fsdp_worker parity` gets `TMPDIR` on `LOGDIR`, since its DCP round
+trip needs a directory every node can see.
 
 ## e2e_three_stacks on Adastra (2 x 4 MI300A, Slingshot)
 

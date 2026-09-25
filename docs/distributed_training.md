@@ -143,7 +143,7 @@ def main():
             if rank == 0:
                 print(f"step {step:3d}  loss {mean_loss.item():.4f}")
 
-    if rank == 0:  # torch.save needs CPU tensors
+    if rank == 0:  # CPU copies: the file then loads without the backend
         state = {k: v.cpu() for k, v in model.module.state_dict().items()}
         torch.save(state, "checkpoint.pt")
     dist.destroy_process_group()
@@ -182,8 +182,10 @@ The differences from a CUDA script:
    yourself. DDP's default `broadcast_buffers=True` works, and if your
    buffers never change (a causal mask, for example), passing
    `broadcast_buffers=False` saves one broadcast per forward pass.
-5. Checkpoints are saved from CPU copies, because calling `torch.save`
-   directly on accelerator tensors raises `NotImplementedError`.
+5. Checkpoints are saved from CPU copies so that they load on a machine
+   without the backend. `torch.save` of the accelerator tensors works too;
+   see [Saving and loading](accelerator_api.md#saving-and-loading). For
+   FSDP2 sharded state, use `torch.distributed.checkpoint`.
 
 To run the same file on stock CUDA, remove the `register_mojo_devices()`
 line: `current_accelerator()` is then `cuda`, the default backend is `nccl`,
@@ -362,6 +364,8 @@ over Slingshot).
 
 Limitations:
 
+- Across nodes on AMD, only MI300A has run them: multi-node Mojo collectives
+  on other AMD GPUs are untested.
 - `all_reduce`, `broadcast`, `all_gather`, `reduce_scatter`, `barrier` and
   the object collectives work. `reduce`, point-to-point, `all_to_all`,
   `gather` and `scatter` raise. See the [Collectives](#collectives) table.
@@ -464,12 +468,6 @@ Kernels compile the first time each one is used; see
 A tensor from another device, such as `cuda`, reached a collective. With a
 CUDA build of torch installed, check that the model and inputs went to
 `torch.accelerator.current_accelerator()`, not to a hard-coded `"cuda"`.
-
-### `NotImplementedError` from `torch.save`
-
-Mojo tensors can't be serialised directly. Copy them to the CPU first:
-`{k: v.cpu() for k, v in model.state_dict().items()}`. For FSDP2 sharded
-state, use `torch.distributed.checkpoint`, which works as it is.
 
 ### `Time stats are currently only collected for CPU and CUDA devices`
 

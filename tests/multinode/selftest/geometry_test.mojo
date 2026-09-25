@@ -9,7 +9,13 @@
 # of the shipped code and not of a copy of it.
 from std.sys import size_of
 
-from tmb.ccl.collectives_kernels import MAX_WORLD, shard_range, signal_bytes
+from tmb.ccl.collectives_kernels import (
+    MAX_WORLD,
+    _AMD,
+    allgather_nic_stage_off,
+    shard_range,
+    signal_bytes,
+)
 from tmb.ccl.internode import CREDIT_AREA_BYTES, CREDIT_SLOT_BYTES, MAX_NODES
 from tmb.ccl.reduce_scatter.fused import reduce_scatter_fused_plan
 from tmb.ccl.reduce_scatter.multinode import (
@@ -125,7 +131,10 @@ def main() raises:
                 bad,
             )
             var npeers = nnodes - 1
-            var ag_bytes = allgather_mapped_max_bytes(arena_cap, group, npeers)
+            # local_world 1 (no NIC-source slot); every local_world is below.
+            var ag_bytes = allgather_mapped_max_bytes(
+                arena_cap, group, npeers, 1
+            )
             _check(
                 ag_bytes > 0 and ag_bytes % 16 == 0, "mapped gather chunk", bad
             )
@@ -146,6 +155,27 @@ def main() raises:
             cases += 1
             for li in range(1, MAX_WORLD + 1):
                 var lw = li
+                var mapped_cap = allgather_mapped_max_bytes(
+                    arena_cap, group, npeers, lw
+                )
+                _check(
+                    mapped_cap > 0 and mapped_cap % 16 == 0,
+                    "mapped gather local-world chunk",
+                    bad,
+                )
+                comptime if _AMD:
+                    _check(
+                        lw * mapped_cap <= 2 * arena_cap,
+                        "mapped gather peer slots plus NIC source fit",
+                        bad,
+                    )
+                    _check(
+                        mapped_cap + 16 > arena_cap
+                        or lw * (mapped_cap + 16) > 2 * arena_cap
+                        or npeers * (mapped_cap + 16) > group,
+                        "mapped gather local-world maximal chunk",
+                        bad,
+                    )
                 var ag_counts = List[Int]()
                 ag_counts.append(1)
                 ag_counts.append(16)
@@ -153,15 +183,22 @@ def main() raises:
                 ag_counts.append(3_840_000)
                 ag_counts.append(20_512_400)
                 ag_counts.append(357 * 789 * 4)
-                ag_counts.append(ag_bytes - 1)
-                ag_counts.append(ag_bytes)
-                ag_counts.append(ag_bytes + 1)
-                ag_counts.append(ag_bytes * 600 + 1)
+                # 2x4 MI300A GPT-2 XL FSDP2: one bf16 block shard, the fp32 root shard.
+                ag_counts.append(7_680_000)
+                ag_counts.append(41_016_800)
+                # bf16 1,280,003 elements: above the split threshold at lw=4
+                # and not a multiple of 16 bytes (chunks of 1,280,016 and
+                # 1,279,990 B; fsdp_worker's stress runs it on hardware).
+                ag_counts.append(2_560_006)
+                ag_counts.append(mapped_cap - 1)
+                ag_counts.append(mapped_cap)
+                ag_counts.append(mapped_cap + 1)
+                ag_counts.append(mapped_cap * 600 + 1)
                 for ai in range(len(ag_counts)):
                     var count = ag_counts[ai]
                     var plan = allgather_mapped_pipeline_plan(
                         count,
-                        ag_bytes,
+                        mapped_cap,
                         narenas,
                         INBOX_SLOTS,
                         PIPE_SPLIT_UNIT * lw,
@@ -170,7 +207,7 @@ def main() raises:
                     var nchunks = plan[1]
                     var depth = plan[2]
                     _check(
-                        chunk <= ag_bytes and chunk % 16 == 0,
+                        chunk <= mapped_cap and chunk % 16 == 0,
                         "gather pipeline capacity/alignment",
                         bad,
                     )
@@ -187,7 +224,7 @@ def main() raises:
                         "gather pipeline depth/credit window",
                         bad,
                     )
-                    if count < PIPE_SPLIT_UNIT * lw and count <= ag_bytes:
+                    if count < PIPE_SPLIT_UNIT * lw and count <= mapped_cap:
                         _check(nchunks == 1, "gather small path unchanged", bad)
                     var completed = List[Int](length=depth, fill=-1)
                     var active = List[Int](length=depth, fill=-1)
@@ -207,6 +244,32 @@ def main() raises:
                                 "gather pipeline tail capacity",
                                 bad,
                             )
+                            comptime if _AMD:
+                                var slot = _align_up(size, 16)
+                                var nic_begin = allgather_nic_stage_off(
+                                    lw, size
+                                )
+                                _check(
+                                    nic_begin + slot <= 2 * arena_cap,
+                                    "gather NIC source tail bound",
+                                    bad,
+                                )
+                                for owner in range(lw):
+                                    for writer in range(lw):
+                                        if writer == owner:
+                                            continue
+                                        var peer_slot = (
+                                            writer if writer
+                                            < owner else writer - 1
+                                        )
+                                        _check(
+                                            (peer_slot + 1) * slot <= nic_begin,
+                                            (
+                                                "gather peer push excludes NIC"
+                                                " source"
+                                            ),
+                                            bad,
+                                        )
                         var j = k - (depth - 1)
                         if j >= 0:
                             _check(

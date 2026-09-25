@@ -715,6 +715,16 @@ int32_t tmb_tensor_set_storage(TmbTensor t, TmbTensor source) {
   }
 }
 
+int32_t tmb_tensor_set_storage_object(TmbTensor t, void* storage) {
+  try {
+    T(t).unsafeGetTensorImpl()->set_storage_keep_dtype(*static_cast<c10::Storage*>(storage));
+    return 0;
+  } catch (const std::exception& e) {
+    tmb_set_error(e.what());
+    return 1;
+  }
+}
+
 int32_t tmb_storage_resize(TmbTensor t, int64_t nbytes) {
   try {
     g_hooks_iface.resizePrivateUse1Bytes(T(t).storage(), static_cast<size_t>(nbytes));

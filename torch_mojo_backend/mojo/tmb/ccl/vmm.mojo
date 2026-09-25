@@ -47,6 +47,7 @@ from std.time import perf_counter_ns, sleep
 from std.utils import StaticTuple
 
 from tmb.ccl.collectives_kernels import MAX_WORLD
+from tmb.ccl.driver import device_attribute
 
 comptime LIBC = "libc.so.6"
 
@@ -106,18 +107,6 @@ def _cu(lib: OwnedDLHandle, rc: Int32, what: String) raises:
 
 def _align_up(x: Int, a: Int) -> Int:
     return (x + a - 1) // a * a
-
-
-def device_attribute(lib: OwnedDLHandle, attr: Int, ordinal: Int) raises -> Int:
-    """`cuDeviceGetAttribute`, or a negative driver rc. Never raises: every
-    caller here treats "could not ask" as "not supported"."""
-    var v: Int32 = -1
-    var rc = lib.get_function[Int32]("cuDeviceGetAttribute")(
-        Pointer(to=v), Int32(attr), Int32(ordinal)
-    )
-    if rc != 0:
-        return -Int(rc)
-    return Int(v)
 
 
 def sm_count(lib: OwnedDLHandle, ordinal: Int) -> Int:

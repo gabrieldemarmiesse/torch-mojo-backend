@@ -7,8 +7,9 @@ markdown report with three tables:
 
 - allreduce bench (``ar_bench_gpt2.py`` ``RESULT ...`` lines): per dtype and
   size, the vendor/mojo median device time and the mojo/vendor ratio.
-- ddp_worker checks (``=== ddp_worker ccl=... mode=... exit: N ===``): per
-  (ccl, mode) pass/fail, from the leg's exit code.
+- worker checks (``=== ddp_worker ccl=... mode=... exit: N ===``, and the
+  same for ``fsdp_worker``, whose modes are listed as ``fsdp_worker:<mode>``):
+  per (ccl, mode) pass/fail, from the leg's exit code.
 - nanoGPT DDP training (``=== nanogpt_ddp ccl=... leg=... ===`` plus the
   script's own ``step NNNNN | ...`` lines): per (ccl, leg) the last logged
   step's loss and tok/s, the val loss if an eval ran, and pass/fail.
@@ -23,7 +24,7 @@ import argparse
 import statistics
 import sys
 from pathlib import Path
-from re import Pattern, compile as re_compile
+from re import Match, Pattern, compile as re_compile
 
 _RESULT_RE: Pattern[str] = re_compile(
     r"^RESULT ccl=(?P<ccl>\S+) dtype=(?P<dtype>\S+) size_mib=\s*(?P<mib>\d+) "
@@ -31,11 +32,21 @@ _RESULT_RE: Pattern[str] = re_compile(
     r"busbw_gbs=\s*(?P<busbw>[\d.]+)"
 )
 _WORKER_HEADER_RE: Pattern[str] = re_compile(
-    r"^=== ddp_worker ccl=(?P<ccl>\S+) mode=(?P<mode>\S+) \(16 ranks\) ===$"
+    r"^=== (?P<worker>ddp|fsdp)_worker ccl=(?P<ccl>\S+) mode=(?P<mode>\S+) "
+    r"\(16 ranks\) ===$"
 )
 _WORKER_EXIT_RE: Pattern[str] = re_compile(
-    r"^=== ddp_worker ccl=(?P<ccl>\S+) mode=(?P<mode>\S+) exit: (?P<rc>\d+) ===$"
+    r"^=== (?P<worker>ddp|fsdp)_worker ccl=(?P<ccl>\S+) mode=(?P<mode>\S+) "
+    r"exit: (?P<rc>\d+) ===$"
 )
+
+
+def _worker_mode(m: Match[str]) -> str:
+    """ddp_worker modes keep their bare names; fsdp_worker's are prefixed."""
+    mode = m.group("mode")
+    return mode if m.group("worker") == "ddp" else f"fsdp_worker:{mode}"
+
+
 _TRAIN_HEADER_RE: Pattern[str] = re_compile(
     r"^=== nanogpt_ddp ccl=(?P<ccl>\S+) leg=(?P<leg>\S+) ===$"
 )
@@ -79,11 +90,11 @@ def parse(lines: list[str]) -> dict[str, object]:
 
         m = _WORKER_HEADER_RE.match(line)
         if m:
-            worker.setdefault((m.group("ccl"), m.group("mode")), None)
+            worker.setdefault((m.group("ccl"), _worker_mode(m)), None)
             continue
         m = _WORKER_EXIT_RE.match(line)
         if m:
-            worker[(m.group("ccl"), m.group("mode"))] = int(m.group("rc"))
+            worker[(m.group("ccl"), _worker_mode(m))] = int(m.group("rc"))
             continue
 
         m = _TRAIN_HEADER_RE.match(line)
@@ -172,7 +183,7 @@ def render_worker(worker: dict[WorkerKey, int | None]) -> str:
             f"| {ccl} | {mode} | {status} (rc={_fmt(rc, 'd') if rc is not None else 'N/A'}) |"
         )
     if len(lines) == 2:
-        lines.append("| _(no ddp_worker legs found)_ | | |")
+        lines.append("| _(no worker legs found)_ | | |")
     return "\n".join(lines)
 
 
@@ -212,7 +223,7 @@ def render(parsed: dict[str, object], source: str) -> str:
         )
     parts.append("## Allreduce bench (ar_bench_gpt2.py)\n")
     parts.append(render_bench(bench) + "\n")
-    parts.append("## ddp_worker checks (16 ranks)\n")
+    parts.append("## worker checks (16 ranks)\n")
     parts.append(render_worker(worker) + "\n")
     parts.append("## nanoGPT DDP training (40 steps)\n")
     parts.append(render_train(train) + "\n")

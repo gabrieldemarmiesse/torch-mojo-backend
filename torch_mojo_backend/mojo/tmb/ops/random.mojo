@@ -59,6 +59,7 @@ from tmb.backend.device import copy_d2d, copy_to_host, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK, _device_attr_cached
 from tmb.ops.common import (
+    broadcast_shape,
     cast_to,
     contiguous,
     copy_strided_into,
@@ -445,20 +446,6 @@ def _check_std_tensor(std: T) raises:
         raise Error("normal expects all elements of std >= 0.0")
 
 
-def _broadcast_shape(a: T, b: T) raises -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    for i in range(MAX_RANK):
-        var x = a.shape[i]
-        var y = b.shape[i]
-        if x == y or y == 1:
-            shape[i] = x
-        elif x == 1:
-            shape[i] = y
-        else:
-            raise Error("shapes are not broadcastable")
-    return shape
-
-
 # aten::normal.Tensor_float(Tensor mean, float std=1, *, Generator? generator=None) -> Tensor
 def op_normal_tensor_float(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -499,7 +486,7 @@ def op_normal_tensor_tensor(
     var std = v_tensor(args[unsafe_offset=1])
     _check_device_dtype(mean, "normal", True)
     _check_std_tensor(std)
-    var shape = _broadcast_shape(mean, std)
+    var shape = broadcast_shape(mean, std)
     var ret = own(
         new_tensor(shape, max(mean.rank, std.rank), mean.stype, mean.device)
     )
@@ -520,7 +507,7 @@ def op_normal_tensor_float_out(
     if not std >= 0.0:
         raise Error("normal expects std >= 0.0, but found std ", std)
     # normal_out_impl: shape = infer_size(mean, empty_like(out)).
-    resize_out(out, _broadcast_shape(mean, out), max(mean.rank, out.rank))
+    resize_out(out, broadcast_shape(mean, out), max(mean.rank, out.rank))
     _draw(out, "Normal", 0.0, std, 0, 0, v_generator(args[unsafe_offset=2]))
     _add_(out, mean)
     ret_ref(rets, 0, out)
@@ -553,7 +540,7 @@ def op_normal_tensor_tensor_out(
     var out = v_tensor(args[unsafe_offset=3])
     _check_device_dtype(out, "normal", True)
     _check_std_tensor(std)
-    resize_out(out, _broadcast_shape(mean, std), max(mean.rank, std.rank))
+    resize_out(out, broadcast_shape(mean, std), max(mean.rank, std.rank))
     _draw(out, "Normal", 0.0, 1.0, 0, 0, v_generator(args[unsafe_offset=2]))
     _mul_(out, std)
     _add_(out, mean)

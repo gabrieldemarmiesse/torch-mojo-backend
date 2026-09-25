@@ -60,6 +60,7 @@ struct Arena {
   std::vector<std::vector<at::Tensor>> tensors;
   std::vector<std::vector<const at::Tensor*>> tensor_ptrs;
   std::vector<std::unique_ptr<at::Generator>> generators;
+  std::vector<std::unique_ptr<c10::Storage>> storages;
 };
 
 inline int64_t double_bits(double d) { int64_t r; std::memcpy(&r, &d, 8); return r; }
@@ -79,7 +80,7 @@ enum Conv : uint8_t {
   CV_TENSOR, CV_INT, CV_SYMINT, CV_DOUBLE, CV_BOOL, CV_SCALAR, CV_DTYPE,
   CV_LAYOUT, CV_MEMORY_FORMAT, CV_DEVICE, CV_STRING, CV_STREAM,
   // from here on: the Arena kinds, see arena_kind()
-  CV_GENERATOR, CV_INT_LIST, CV_DOUBLE_LIST, CV_BOOL_LIST, CV_SCALAR_LIST,
+  CV_GENERATOR, CV_STORAGE, CV_INT_LIST, CV_DOUBLE_LIST, CV_BOOL_LIST, CV_SCALAR_LIST,
   CV_TENSOR_LIST, CV_OPT_TENSOR_LIST,
   CV_UNSUPPORTED,       // raised at conversion time, in argument order
   CV_UNSUPPORTED_LIST,  // a list whose element type we do not carry
@@ -104,6 +105,7 @@ uint8_t conv_of(const c10::TypePtr& type) {
     case c10::TypeKind::DeviceObjType: return CV_DEVICE;
     case c10::TypeKind::StringType: return CV_STRING;
     case c10::TypeKind::GeneratorType: return CV_GENERATOR;
+    case c10::TypeKind::StorageType: return CV_STORAGE;
     case c10::TypeKind::StreamObjType: return CV_STREAM;
     case c10::TypeKind::ListType: {
       const auto inner = type->castRaw<c10::ListType>()->getElementType();
@@ -258,6 +260,15 @@ void to_record(uint8_t conv, const c10::TypePtr& type, const c10::IValue& v, Tmb
       // boxed: the address must survive the vector growing
       arena->generators.push_back(std::make_unique<at::Generator>(v.toGenerator()));
       out.tag = TMB_GENERATOR; out.a = reinterpret_cast<int64_t>(arena->generators.back().get()); return;
+    case CV_STORAGE: {
+      // IValue hands a Storage out by value: box it so its address is stable
+      arena->storages.push_back(std::make_unique<c10::Storage>(v.toStorage()));
+      const c10::Storage& st = *arena->storages.back();
+      out.tag = TMB_STORAGE; out.a = reinterpret_cast<int64_t>(&st);
+      out.b = static_cast<int64_t>(st.nbytes());
+      out.len = st.device().type() == c10::DeviceType::PrivateUse1 ? st.device().index() : -1;
+      return;
+    }
     case CV_TENSOR_LIST: {
       arena->tensors.push_back(v.toTensorVector());
       auto& ts = arena->tensors.back();

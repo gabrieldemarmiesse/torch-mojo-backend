@@ -27,6 +27,7 @@ from std.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import min
 from std.sys.info import has_accelerator
+from std.utils.numerics import isfinite
 
 from tmb.kernels.common.op_utils import _enqueue_cached, ieee_sqrt
 
@@ -260,6 +261,52 @@ def _foreach_mul_tensor_kernel(
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
         values[unsafe_offset=index] = values[unsafe_offset=index] * scalar
+        index += FOREACH_EW_THREADS
+
+
+def _foreach_nonfinite_unscale_kernel(
+    p0: _MutPtr,
+    p1: _MutPtr,
+    p2: _MutPtr,
+    p3: _MutPtr,
+    p4: _MutPtr,
+    p5: _MutPtr,
+    p6: _MutPtr,
+    p7: _MutPtr,
+    inv_scale_ptr: _ImmutPtr,
+    found_inf_ptr: _MutPtr,
+    chunk_ends: _SlotInts,
+    numels: _SlotInts,
+):
+    """`aten::_amp_foreach_non_finite_check_and_unscale_`: in-place
+    x = x * inv_scale[0] (skipped when it is exactly 1), found_inf[0] = 1 if
+    any x is non-finite. Every writer stores the same 1: no atomic."""
+    var inv_scale = inv_scale_ptr[unsafe_offset=0]
+    var slot, begin = _slot_begin(chunk_ends, Int(block_idx.x))
+    var end = min(begin + FOREACH_EW_CHUNK, Int(numels[slot]))
+    var values = _pick_mut(slot, p0, p1, p2, p3, p4, p5, p6, p7)
+
+    var index = begin + Int(thread_idx.x) * _VEC
+    var stride = FOREACH_EW_THREADS * _VEC
+    while index + _VEC <= end:
+        var value = values.unsafe_load[width=_VEC, alignment=4](index)
+        if not isfinite(value).reduce_and():
+            found_inf_ptr[unsafe_offset=0] = 1.0
+        if inv_scale != 1.0:
+            value = value * inv_scale
+        values.unsafe_store[width=_VEC, alignment=4](index, value)
+        index += stride
+
+    # The chunk size is divisible by _VEC, so only a tensor's last chunk can
+    # need this scalar tail.
+    index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
+    while index < end:
+        var value = values[unsafe_offset=index]
+        if not isfinite(value):
+            found_inf_ptr[unsafe_offset=0] = 1.0
+        if inv_scale != 1.0:
+            value = value * inv_scale
+        values[unsafe_offset=index] = value
         index += FOREACH_EW_THREADS
 
 
@@ -548,6 +595,39 @@ def enqueue_foreach_mul_tensor_f32(
             _addr_ptr(addrs[6]),
             _addr_ptr(addrs[7]),
             _addr_ptr(scalar_addr).as_imm(),
+            _slot_ints(chunk_ends),
+            _slot_ints(numels),
+        )
+    else:
+        raise Error("no GPU accelerator available at compile time")
+
+
+def enqueue_foreach_nonfinite_unscale_f32(
+    addrs: InlineArray[Int, FOREACH_EW_SLOTS],
+    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
+    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    inv_scale_addr: Int,
+    found_inf_addr: Int,
+    total_chunks: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime if has_accelerator():
+        _enqueue_cached[_foreach_nonfinite_unscale_kernel](
+            ctx,
+            total_chunks,
+            1,
+            1,
+            FOREACH_EW_THREADS,
+            _addr_ptr(addrs[0]),
+            _addr_ptr(addrs[1]),
+            _addr_ptr(addrs[2]),
+            _addr_ptr(addrs[3]),
+            _addr_ptr(addrs[4]),
+            _addr_ptr(addrs[5]),
+            _addr_ptr(addrs[6]),
+            _addr_ptr(addrs[7]),
+            _addr_ptr(inv_scale_addr).as_imm(),
+            _addr_ptr(found_inf_addr),
             _slot_ints(chunk_ends),
             _slot_ints(numels),
         )
