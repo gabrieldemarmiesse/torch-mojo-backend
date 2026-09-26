@@ -830,6 +830,66 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape,dim,keepdim",
+    [
+        ((4099, 1031), 1, False),
+        ((5003, 37), 0, True),
+        ((357, 789), None, False),
+        ((4, 5, 6), [0, 2], False),
+    ],
+)
+def test_vector_norm_ord0_matches_torch(mojo_gpu, shape, dim, keepdim, dtype):
+    """ord=0: count of nonzero elements (a separate compiled spec, NormL0Op)."""
+    x = torch.randint(-2, 3, shape).to(dtype)  # includes exact zeros
+    ours = torch.linalg.vector_norm(
+        x.to(mojo_gpu), ord=0, dim=dim, keepdim=keepdim
+    ).cpu()
+    expected = torch.linalg.vector_norm(x, ord=0, dim=dim, keepdim=keepdim)
+    torch.testing.assert_close(ours, expected)
+
+
+def test_vector_norm_ord0_nan_counts_as_nonzero(mojo_gpu):
+    """Matches CUDA's `NormZeroOps`: an ordered `== 0` test, so NaN counts."""
+    x = torch.tensor([0.0, 1.0, float("nan"), 0.0, -3.0])
+    ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=0).cpu()
+    expected = torch.linalg.vector_norm(x, ord=0)
+    torch.testing.assert_close(ours, expected)
+
+
+def test_vector_norm_ord0_noncontiguous(mojo_gpu):
+    """A full reduction is permutation-invariant for a count, so it can't
+    catch a kernel that ignores strides; reduce one axis of a transpose
+    instead -- the wrong grouping would change per-row counts."""
+    contiguous = torch.randint(-2, 3, (5, 7)).float()
+    strided = contiguous.t()
+    assert not strided.is_contiguous()
+    expected = torch.linalg.vector_norm(strided, ord=0, dim=1)
+    # The transpose is taken ON the device (see test_vector_norm_out_and_
+    # strided_input): a strided host tensor cannot cross `_copy_from`.
+    device_strided = contiguous.to(mojo_gpu).t()
+    ours = torch.linalg.vector_norm(device_strided, ord=0, dim=1).cpu()
+    torch.testing.assert_close(ours, expected)
+
+
+def test_vector_norm_ord0_empty(mojo_gpu):
+    empty = torch.empty((0, 7), dtype=torch.float32).to(mojo_gpu)
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(empty, ord=0).cpu(), torch.tensor(0.0), rtol=0, atol=0
+    )
+
+
+def test_vector_norm_ord0_out_resizes(mojo_gpu):
+    """out= starts the wrong shape and must be resized (`resize_output`)."""
+    x = torch.randn(4, 5)
+    expected = torch.linalg.vector_norm(x, ord=0, dim=1)
+    out = torch.empty(1, device=mojo_gpu)
+    returned = torch.linalg.vector_norm(x.to(mojo_gpu), ord=0, dim=1, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+
 # ---------------------------------------------------------------------------
 # cumsum
 # ---------------------------------------------------------------------------

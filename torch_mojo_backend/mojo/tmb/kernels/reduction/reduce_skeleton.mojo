@@ -431,6 +431,51 @@ struct NormL2Op(ReduceOp):
         return sqrt(a).cast[out_dt]()
 
 
+struct NormL0Op(ReduceOp):
+    """linalg_vector_norm(ord=0): count of nonzero elements.
+
+    Map is an ORDERED `== 0` test (mirrors CUDA's `NormZeroOps`), so NaN
+    (NaN == 0 is false) counts as nonzero, same rule as `AnyOp`. Accumulates
+    in float, not int, matching CUDA's `acc_t` for this op: the count is a sum
+    of 0.0/1.0 finished with a plain cast, never a separate int->float
+    conversion.
+    """
+
+    comptime name = "norml0"
+    comptime dtypes = FLOAT_ONLY_DTYPES
+    comptime errors_on_empty_axis = False
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return DType.float32
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return in_dt
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](0)
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        return (~x.eq(SIMD[in_dt, width]())).cast[acc]()
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return a + b
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        return a.cast[out_dt]()
+
+
 struct MaxOp(ReduceOp):
     """amax / max: selection, identity -inf, NaN PROPAGATED (torch's rule)."""
 
