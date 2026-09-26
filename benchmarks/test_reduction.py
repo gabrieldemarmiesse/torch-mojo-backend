@@ -94,6 +94,7 @@ _SAME_KERNEL_OUT = (
 SKIPPED: dict[str, str] = {
     "aten::sum.IntList_out": _SAME_KERNEL_OUT,
     "aten::topk.values": _SAME_KERNEL_OUT,
+    "aten::min.unary_out": _SAME_KERNEL_OUT,
     "aten::sort.values_stable": _SAME_KERNEL_OUT,
     "aten::multinomial.out": _SAME_KERNEL_OUT,
     "aten::median.dim_values": _SAME_KERNEL_OUT,

@@ -458,6 +458,74 @@ def test_max_and_min_full_reduction(mojo_device):
     torch.testing.assert_close(torch.max(ints.to(mojo_device)).cpu(), torch.max(ints))
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64]
+)
+def test_min_unary_out(mojo_gpu, dtype):
+    """`torch.min(x, out=out)` dispatches to min.unary_out."""
+    if dtype.is_floating_point:
+        x = torch.randn(37, 41).to(dtype)
+    else:
+        x = torch.randint(-100, 100, (37, 41), dtype=dtype)
+    xd = x.to(mojo_gpu)
+    expected = torch.min(x)
+
+    out = torch.empty((), dtype=dtype, device=mojo_gpu)
+    returned = torch.min(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # non-contiguous input
+    strided = xd.t()
+    out2 = torch.empty((), dtype=dtype, device=mojo_gpu)
+    torch.min(strided, out=out2)
+    torch.testing.assert_close(out2.cpu(), torch.min(x.t()))
+
+
+def test_min_unary_out_propagates_nan(mojo_gpu):
+    x = torch.tensor([1.0, float("nan"), -7.0, 3.0])
+    out = torch.empty((), device=mojo_gpu)
+    torch.min(x.to(mojo_gpu), out=out)
+    assert out.cpu().isnan().item()
+
+
+def test_min_unary_out_resizes_a_mismatching_out(mojo_gpu):
+    """`resize_output` first: a non-scalar `out` is resized to `()`."""
+    x = torch.randn(37, 41)
+    out = torch.empty(5, 3, device=mojo_gpu)
+    returned = torch.min(x.to(mojo_gpu), out=out)
+    assert tuple(returned.shape) == ()
+    torch.testing.assert_close(returned.cpu(), torch.min(x))
+
+
+def test_min_unary_out_requires_an_exact_dtype_match(mojo_gpu):
+    """Unlike mean.out/any.out's safe_cast, min_all_kernel_impl's
+    make_reduction on stock CUDA refuses ANY dtype mismatch, even a safe
+    upcast (verified against stock CUDA torch: int64 -> float32 raises
+    "provided dtype must match dtype of result")."""
+    x = torch.randint(-100, 100, (9, 5), dtype=torch.int64)
+    with pytest.raises(RuntimeError):
+        torch.min(
+            x.to(mojo_gpu), out=torch.empty((), dtype=torch.float32, device=mojo_gpu)
+        )
+
+    y = torch.randn(9, 5)
+    with pytest.raises(RuntimeError):
+        torch.min(
+            y.to(mojo_gpu), out=torch.empty((), dtype=torch.int64, device=mojo_gpu)
+        )
+
+    out = torch.empty((), dtype=torch.int64, device=mojo_gpu)
+    torch.min(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.min(x))
+
+
+def test_min_unary_out_empty_input_errors(mojo_gpu):
+    out = torch.empty((), device=mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.min(torch.empty(0, device=mojo_gpu), out=out)
+
+
 @pytest.mark.parametrize("shape", [(7,), (357, 789), (1 << 20,)])
 def test_extrema_float64(mojo_gpu, shape):
     """amax/amin and full max/min select exactly in float64 (the warp fold
@@ -1018,6 +1086,10 @@ _EXPECTED_OVERLOADS = [
     ("aten::amin", lambda d: torch.amin(torch.randn(4, 5).to(d), dim=1)),
     ("aten::max", lambda d: torch.max(torch.randn(4, 5).to(d))),
     ("aten::min", lambda d: torch.min(torch.randn(4, 5).to(d))),
+    (
+        "aten::min.unary_out",
+        lambda d: torch.min(torch.randn(4, 5).to(d), out=torch.empty((), device=d)),
+    ),
     ("aten::min.dim", lambda d: torch.min(torch.randn(4, 5).to(d), dim=1)),
     (
         "aten::min.dim_min",

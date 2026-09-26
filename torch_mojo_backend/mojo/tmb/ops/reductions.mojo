@@ -915,17 +915,24 @@ def op_amax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_ref(rets, 0, out)
 
 
-def _full_extremum(
-    family: StaticString, op: StaticString, args: Values, rets: Values
-) raises:
-    """max(Tensor) / min(Tensor): the values-only full reduction."""
-    var a = v_tensor(args[unsafe_offset=0])
+def _full_extremum_dims(op: StaticString, a: T) raises -> List[Int]:
+    """Shared gate for max(Tensor)/min(Tensor) and min.unary_out: dtype,
+    rank and empty-reduce-dim checks, then every dim is reduced."""
     _require_mojo(a)
     _check_extremum_dtype(a, op)
     if a.rank == 0:
         unsupported("max()/min() of a rank-0 tensor")
     var dims = _trailing_dims(a.rank, a.rank)
     _refuse_empty_extremum(op, a, dims)
+    return dims^
+
+
+def _full_extremum(
+    family: StaticString, op: StaticString, args: Values, rets: Values
+) raises:
+    """max(Tensor) / min(Tensor): the values-only full reduction."""
+    var a = v_tensor(args[unsafe_offset=0])
+    var dims = _full_extremum_dims(op, a)
     var out = _scalar_reduction(family, op, a, dims, False, a.stype, False, 0.0)
     ret_owned(rets, 0, out)
 
@@ -938,6 +945,30 @@ def op_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::min(Tensor self) -> Tensor
 def op_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _full_extremum("reduction", "AminSpec", args, rets)
+
+
+# aten::min.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_min_unary_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=1])
+    _require_mojo(out)
+    var dims = _full_extremum_dims("AminSpec", a)
+    _scalar_reduction_out(
+        "reduction",
+        "AminSpec",
+        "aten::min.unary_out",
+        # CUDA's min_all_kernel_impl -> make_reduction requires an exact
+        # dtype match, unlike mean.out/any.out's safe_cast.
+        "exact",
+        a,
+        dims,
+        False,
+        a.stype,
+        out,
+    )
+    ret_ref(rets, 0, out)
 
 
 # ---------------------------------------------------------------------------
@@ -2058,6 +2089,7 @@ def register_reductions(site: Site) raises:
     impl[op_min, "min"](site)
     impl[op_min_dim, "min.dim"](site)
     impl[op_min_dim_min, "min.dim_min"](site)
+    impl[op_min_unary_out, "min.unary_out"](site)
     impl[op_nanmedian, "nanmedian"](site)
     impl[op_nanmedian_dim, "nanmedian.dim"](site)
     impl[op_nanmedian_dim_values, "nanmedian.dim_values"](site)
