@@ -102,6 +102,102 @@ def test_lerp_scalar_half(mojo_gpu, dtype):
     _close(x, xc, **_tol(dtype, 2))
 
 
+# C99 pow's special values (Annex F.9.4.4) and the saturating magnitudes, for
+# the float64 double-double core: an overflow in the product y * log|x| must
+# saturate to inf / 0, not become NaN in the double-double correction.
+_POW64 = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    0.5,
+    -0.5,
+    2.0,
+    -2.0,
+    3.0,
+    -3.0,
+    2.5,
+    -2.5,
+    10.0,
+    -10.0,
+    1e-300,
+    1e300,
+    -1e300,
+    5e-324,
+    1.7976931348623157e308,
+    -1.7976931348623157e308,
+    1e308,
+    -1e308,
+    9007199254740993.0,
+    -9007199254740991.0,
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+]
+
+
+def test_pow_float64_special_values_saturate(mojo_gpu):
+    skip_if_metal(mojo_gpu, "Metal has no float64")
+    base, expo = zip(*[(x, y) for x in _POW64 for y in _POW64])
+    x = torch.tensor(base, dtype=torch.float64)
+    y = torch.tensor(expo, dtype=torch.float64)
+    want = torch.pow(x, y)
+    with ran("aten::pow.Tensor_Tensor"):
+        got = torch.pow(x.to(mojo_gpu), y.to(mojo_gpu)).cpu()
+    # Within an ulp of CPU's std::pow on the finite results...
+    _close(got, want, rtol=2.3e-16, atol=0)
+    # ...and exact, sign included, on the infinities, zeros and NaNs.
+    special = ~torch.isfinite(want) | (want == 0)
+    assert torch.equal(got[special].isnan(), want[special].isnan())
+    same = special & ~want.isnan()
+    assert torch.equal(got[same], want[same])
+    assert torch.equal(got[same].signbit(), want[same].signbit())
+    # The tensor ** scalar route runs the same core.
+    for e in (1e308, -1e308, 1e300, -1e300, 3e20, -3e20):
+        with ran("aten::pow.Tensor_Scalar"):
+            got = torch.pow(x.to(mojo_gpu), e)
+        _close(got, torch.pow(x, e), rtol=2.3e-16, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA reference")
+def test_pow_float64_matches_cuda(mojo_gpu):
+    """Against stock CUDA torch's double pow: bit for bit on C99's special
+    values and the saturating exponents, within an ulp on a broad sample
+    (the double-double core is not CUDA's algorithm, and rounds a near-tie
+    the other way on ~0.03% of the elements)."""
+    skip_if_metal(mojo_gpu, "Metal has no float64")
+    big = torch.tensor(
+        [1e308, -1e308, 1e300, -1e300, 5e20, -5e20, 709.0, -745.0], dtype=torch.float64
+    )
+    table = torch.tensor(_POW64, dtype=torch.float64)
+    base, expo = zip(*[(x, y) for x in _POW64 for y in _POW64])
+    x = torch.cat([torch.tensor(base, dtype=torch.float64), table.repeat(len(big))])
+    y = torch.cat(
+        [torch.tensor(expo, dtype=torch.float64), big.repeat_interleave(len(table))]
+    )
+    want = torch.pow(x.cuda(), y.cuda()).cpu()
+    got = torch.pow(x.to(mojo_gpu), y.to(mojo_gpu)).cpu()
+    assert torch.equal(got.isnan(), want.isnan())
+    keep = ~want.isnan()
+    special = keep & (~torch.isfinite(want) | (want == 0))
+    assert torch.equal(got[special].view(torch.int64), want[special].view(torch.int64))
+    _close(got, want, rtol=2.3e-16, atol=0)
+
+    g = torch.Generator().manual_seed(12)
+    n = 1 << 18
+    x = torch.exp(torch.randn(n, dtype=torch.float64, generator=g) * 30)
+    x = torch.where(torch.rand(n, generator=g) < 0.2, -x, x)
+    y = torch.randn(n, dtype=torch.float64, generator=g) * 40
+    y = torch.where(torch.rand(n, generator=g) < 0.3, torch.round(y), y)
+    want = torch.pow(x.cuda(), y.cuda()).cpu()
+    got = torch.pow(x.to(mojo_gpu), y.to(mojo_gpu)).cpu()
+    assert torch.equal(got.isnan(), want.isnan())
+    keep = ~want.isnan()
+    ulps = (got[keep].view(torch.int64) - want[keep].view(torch.int64)).abs()
+    assert int(ulps.max()) <= 1
+    assert int((ulps != 0).sum()) < n // 1000
+
+
 # ---------------------------------------------------------------------------
 # gelu_backward (functional): accurate tanh mode, half types accepted
 # ---------------------------------------------------------------------------

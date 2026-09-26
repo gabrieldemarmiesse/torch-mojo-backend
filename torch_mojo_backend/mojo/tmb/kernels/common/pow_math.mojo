@@ -127,13 +127,17 @@ def _pow_f64_core(ax: Float64, y: Float64) -> Float64:
     var l = _two_sum(g[0], l_lo)
     # t = y * log(ax) in double-double.
     var t_hi = y * l[0]
+    # Saturate on the head, before the correction: once y * log(ax)
+    # overflows (pow(10, 1e308)), fma(y, l, -t_hi) is inf - inf = NaN. The
+    # head is within about an ulp of the double-double sum, far inside the
+    # thresholds' margin (exp overflows past 709.783 and is 0 below -745.134).
+    if t_hi > 709.8:
+        return inf[DType.float64]()
+    if t_hi < -745.2:
+        return 0.0
     var t_lo = fma(y, l[0], -t_hi) + y * l[1]
     var th = _add_rn(t_hi, t_lo)
     var tl = _add_rn(t_lo, -_add_rn(th, -t_hi))
-    if th > 709.8:
-        return inf[DType.float64]()
-    if th < -745.2:
-        return 0.0
     var r = nv_exp(th)
     return fma(r, tl, r)
 
