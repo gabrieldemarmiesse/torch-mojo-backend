@@ -1,5 +1,5 @@
-"""ATen ops: reductions (sum, mean, amax/amin, max/min, the arg-reductions,
-any/all, var, the L2 vector norm, cumsum, and sort/topk).
+"""ATen ops: reductions (sum, nansum, mean, amax/amin, max/min, the
+arg-reductions, any/all, var, the L2 vector norm, cumsum, and sort/topk).
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`), keeping
 its three decisions:
@@ -736,6 +736,89 @@ def op_sum_intlist_out(
         "reduction",
         "SumSpec",
         "aten::sum.IntList_out",
+        "safe_cast",
+        src.t,
+        dims,
+        v_bool_or(args[unsafe_offset=2], False),
+        src.t.stype,
+        out,
+    )
+    ret_ref(rets, 0, out)
+    _ = src^
+
+
+# ---------------------------------------------------------------------------
+# nansum
+# ---------------------------------------------------------------------------
+
+
+def _nansum_prep(
+    mut src: Operand, dtype_v: Value, dim_v: Value
+) raises -> List[Int]:
+    """Shared prep for both nansum overloads: dtype promotion, the dtype gate,
+    and the reduce-dim list.
+
+    Mirrors `sum`'s own promotion (`_promote` / `_is_sum_dtype`) exactly for
+    integral/bool inputs -- they carry no NaN, so nansum and sum must agree on
+    them -- except an explicit INTEGRAL `dtype=` on a FLOATING input: torch
+    zeroes NaN before that cast (`nan_to_num` then `sum`, ReduceOps.cpp), and
+    this backend has no `nan_to_num` kernel to do that ahead of `_promote`'s
+    plain cast, which would truncate NaN to an arbitrary integer instead.
+    Declined rather than risking a silently wrong value.
+    """
+    var want = _opt_dtype(dtype_v)
+    if want >= 0:
+        var target = max_dtype(want)
+        if src.t.dtype.is_floating_point() and not target.is_floating_point():
+            unsupported(
+                "nansum with dtype=" + String(target) + " from a floating input"
+            )
+        _promote(src, want)
+    elif not src.t.dtype.is_floating_point():
+        _promote(src, ST_INT64)
+    if not _is_sum_dtype(src.t.dtype):
+        unsupported("nansum of dtype " + String(src.t.dtype))
+    var dims = _reduce_dims(dim_v, src.t.rank, True)
+    if len(dims) == 0:
+        unsupported("nansum with no reduce dim (a rank-0 operand)")
+    return dims^
+
+
+# aten::nansum(Tensor self, int[1]? dim=None, bool keepdim=False, *,
+#   ScalarType? dtype=None) -> Tensor
+def op_nansum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    _require_mojo(a)
+    var src = _borrow(a)
+    var dims = _nansum_prep(src, args[unsafe_offset=3], args[unsafe_offset=1])
+    var keepdim = v_bool_or(args[unsafe_offset=2], False)
+    var out = _scalar_reduction(
+        "reduction",
+        "NanSumSpec",
+        src.t,
+        dims,
+        keepdim,
+        src.t.stype,
+        False,
+        0.0,
+    )
+    ret_owned(rets, 0, out)
+    _ = src^
+
+
+# aten::nansum.out(Tensor self, int[1]? dim=None, bool keepdim=False, *,
+#   ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+def op_nansum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=4])
+    _require_mojo(a)
+    _require_mojo(out)
+    var src = _borrow(a)
+    var dims = _nansum_prep(src, args[unsafe_offset=3], args[unsafe_offset=1])
+    _scalar_reduction_out(
+        "reduction",
+        "NanSumSpec",
+        "aten::nansum.out",
         "safe_cast",
         src.t,
         dims,
@@ -2061,6 +2144,8 @@ def register_reductions(site: Site) raises:
     impl[op_nanmedian, "nanmedian"](site)
     impl[op_nanmedian_dim, "nanmedian.dim"](site)
     impl[op_nanmedian_dim_values, "nanmedian.dim_values"](site)
+    impl[op_nansum, "nansum"](site)
+    impl[op_nansum_out, "nansum.out"](site)
     impl[op_sort_stable, "sort.stable"](site)
     impl[op_sort_values_stable, "sort.values_stable"](site)
     impl[op_sum, "sum"](site)

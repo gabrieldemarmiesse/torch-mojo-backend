@@ -1,9 +1,9 @@
 # ===----------------------------------------------------------------------=== #
 # One reduction skeleton, parametrized over the ACCUMULATOR.
 #
-# Every scalar-payload reduction this backend implements -- sum, mean, amax,
-# amin, max, min, the L2 vector norm, any and all -- is the same three moving
-# parts over the same geometry, and they used to be nine hand-written launches
+# Every scalar-payload reduction this backend implements -- sum, nansum, mean,
+# amax, amin, max, min, the L2 vector norm, any and all -- is the same three
+# moving parts over the same geometry, and they used to be nine hand-written launches
 # with three different launch policies between them. What actually differs
 # between two of them is four lines of algebra: the accumulator dtype, its
 # identity, how an input element maps into it, how two accumulators combine,
@@ -329,6 +329,52 @@ struct SumOp(ReduceOp):
         in_dt: DType, width: SIMDLength, //, acc: DType
     ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
         return x.cast[acc]()
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return a + b
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        return a.cast[out_dt]()
+
+
+struct NanSumOp(ReduceOp):
+    """nansum: sum with NaN mapped to 0 before it enters the accumulator.
+
+    Integral/bool inputs never carry a NaN, so this and `SumOp` agree there
+    exactly; only the map differs, and only for floating accumulators.
+    """
+
+    comptime name = "nansum"
+    comptime dtypes = SCALAR_DTYPES
+    comptime errors_on_empty_axis = False
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return _float_acc[in_dt]()
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return in_dt
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](0)
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        var v = x.cast[acc]()
+        comptime if acc.is_floating_point():
+            return isnan(v).select(SIMD[acc, width](0), v)
+        else:
+            return v
 
     @staticmethod
     def combine[
