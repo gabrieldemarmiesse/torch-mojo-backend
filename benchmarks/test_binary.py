@@ -116,7 +116,22 @@ COVERS: dict[str, str] = (
     }
 )
 
-SKIPPED: dict[str, str] = {}
+_OUT = (
+    "out-variant plumbing over an already-benchmarked functional impl "
+    "(computed straight into `out` when it has the result's dtype, shape and "
+    "a dense layout, else computed then copied into it)"
+)
+
+SKIPPED: dict[str, str] = {
+    "aten::bitwise_and.Scalar_out": _OUT,
+    "aten::bitwise_and.Tensor_out": _OUT,
+    "aten::bitwise_or.Scalar_out": _OUT,
+    "aten::bitwise_or.Tensor_out": _OUT,
+    "aten::bitwise_xor.Scalar_out": _OUT,
+    "aten::bitwise_xor.Tensor_out": _OUT,
+    "aten::remainder.Scalar_out": _OUT,
+    "aten::remainder.Tensor_out": _OUT,
+}
 
 
 def _pair(
