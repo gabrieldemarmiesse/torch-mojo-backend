@@ -80,6 +80,7 @@ def test_integer_pow(mojo_gpu, dtype):
     with ran("aten::pow.Tensor_Tensor"):
         _close(torch.pow(base.to(mojo_gpu), expo.to(mojo_gpu)), torch.pow(base, expo))
     _close(torch.pow(base.to(mojo_gpu), 3), torch.pow(base, 3))
+    _close(torch.pow(2, expo.to(mojo_gpu)), torch.pow(2, expo))
     if dtype != torch.uint8:
         neg = torch.tensor([-1, -2, -3, -1, 0], dtype=dtype)
         b = torch.tensor([1, -1, -1, 2, 5], dtype=dtype)
@@ -254,6 +255,46 @@ def test_pow_float64_matches_cuda(mojo_gpu):
     ulps = (got[keep].view(torch.int64) - want[keep].view(torch.int64)).abs()
     assert int(ulps.max()) <= 1
     assert int((ulps != 0).sum()) < n // 1000
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_lerp_tensor(mojo_gpu, dtype):
+    torch.manual_seed(5)
+    s = torch.randn(40, 3).to(dtype)
+    e = torch.randn(40, 3).to(dtype)
+    w = (torch.rand(40, 3) * 1.6 - 0.3).to(dtype)
+    with ran("aten::lerp.Tensor"):
+        actual = torch.lerp(s.to(mojo_gpu), e.to(mojo_gpu), w.to(mojo_gpu))
+    _close(actual, torch.lerp(s, e, w), **_tol(dtype, 2))
+    wb = w[:1]
+    _close(
+        torch.lerp(s.to(mojo_gpu), e.to(mojo_gpu), wb.to(mojo_gpu)),
+        torch.lerp(s, e, wb),
+        **_tol(dtype, 2),
+    )
+    x, x_cpu = s.to(mojo_gpu), s.clone()
+    x.lerp_(e.to(mojo_gpu), w.to(mojo_gpu))
+    x_cpu.lerp_(e, w)
+    _close(x, x_cpu, **_tol(dtype, 2))
+
+
+def test_lerp_tensor_out_and_promotion(mojo_gpu):
+    torch.manual_seed(6)
+    s, e, w = torch.randn(6), torch.randn(6), torch.rand(6)
+    out = torch.empty(6, device=mojo_gpu)
+    with ran("aten::lerp.Tensor_out"):
+        torch.lerp(s.to(mojo_gpu), e.to(mojo_gpu), w.to(mojo_gpu), out=out)
+    _close(out, torch.lerp(s, e, w))
+    # A 0-d weight of another float dtype promotes like a number.
+    w0 = torch.tensor(0.25, dtype=torch.float16)
+    _close(
+        torch.lerp(s.to(mojo_gpu), e.to(mojo_gpu), w0.to(mojo_gpu)),
+        torch.lerp(s, e, w0),
+    )
+    # A dimensioned weight: `out` must have the result dtype, no cast.
+    wide = torch.empty(6, dtype=torch.float64, device=mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.lerp(s.to(mojo_gpu), e.to(mojo_gpu), w.to(mojo_gpu), out=wide)
 
 
 # ---------------------------------------------------------------------------

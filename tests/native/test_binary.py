@@ -1484,6 +1484,7 @@ _OUT_OPS = [
     ("bitwise_and", torch.bitwise_and, torch.int32),
     ("bitwise_or", torch.bitwise_or, torch.int64),
     ("bitwise_xor", torch.bitwise_xor, torch.int32),
+    ("pow", torch.pow, torch.float32),
 ]
 
 
@@ -1538,6 +1539,15 @@ def test_binary_scalar_out_variants(mojo_device):
     with native_ran("aten::remainder.Scalar_out"):
         torch.remainder(f, 0.75, out=out)
     torch.testing.assert_close(out.cpu(), torch.remainder(f_cpu, 0.75))
+    out = torch.empty(7, device=mojo_device)
+    with native_ran("aten::pow.Tensor_Scalar_out"):
+        torch.pow(f.abs(), 1.5, out=out)
+    torch.testing.assert_close(out.cpu(), torch.pow(f_cpu.abs(), 1.5))
+    # The scalar-base overload: pow(Scalar self, Tensor exponent, *, out).
+    out = torch.empty(7, device=mojo_device)
+    with native_ran("aten::pow.Scalar_out"):
+        torch.pow(2.0, f, out=out)
+    torch.testing.assert_close(out.cpu(), torch.pow(2.0, f_cpu))
 
 
 def test_logical_or(mojo_device, call_checker):

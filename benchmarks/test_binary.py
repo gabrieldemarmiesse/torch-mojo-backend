@@ -100,6 +100,8 @@ COVERS: dict[str, str] = (
         "aten::lerp_.Scalar": "test_lerp_inplace",
         "aten::clamp": "test_clamp",
         "aten::clamp.Tensor": "test_clamp_tensor",
+        "aten::lerp.Tensor": "test_lerp_tensor",
+        "aten::pow.Scalar": "test_pow_scalar_base",
         "aten::addcdiv": "test_addcdiv",
         "aten::addcdiv.out": "test_addcdiv_inplace",
         "aten::addcdiv_": "test_addcdiv_inplace",
@@ -149,11 +151,15 @@ SKIPPED: dict[str, str] = {
     "aten::clamp_min.Tensor": _MAXMIN_BOUND,
     "aten::clamp_min.Tensor_out": _OUT,
     "aten::clamp_min.out": _OUT,
+    "aten::lerp.Tensor_out": _OUT,
     "aten::logical_and.out": _OUT,
     "aten::logical_or.out": _OUT,
     "aten::logical_xor.out": _OUT,
     "aten::maximum.out": _OUT,
     "aten::minimum.out": _OUT,
+    "aten::pow.Scalar_out": _OUT,
+    "aten::pow.Tensor_Scalar_out": _OUT,
+    "aten::pow.Tensor_Tensor_out": _OUT,
     "aten::remainder.Scalar_out": _OUT,
     "aten::remainder.Tensor_out": _OUT,
 }
@@ -492,6 +498,38 @@ def test_clamp_tensor(
         lambda: torch.clamp(a_ref, lo_ref, hi_ref),
         lambda: torch.clamp(a_our, lo_our, hi_our),
         flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("lerp.Tensor")
+def test_lerp_tensor(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    w_ref, w_our = both(
+        unit_interval(SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.lerp(a_ref, b_ref, w_ref),
+        lambda: torch.lerp(a_our, b_our, w_our),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("pow.Scalar")
+def test_pow_scalar_base(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.pow(2.5, x_ref),
+        lambda: torch.pow(2.5, x_our),
+        flops=float(x_ref.numel()),
     )
 
 
