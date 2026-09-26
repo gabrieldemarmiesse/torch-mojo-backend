@@ -1145,16 +1145,30 @@ def op_var_correction(
 
 
 # ---------------------------------------------------------------------------
-# linalg_vector_norm (ord=2 only: one pass, the root folded into the finalize)
+# linalg_vector_norm (ord in {1, 2}: one pass, the L2 root folded into the
+# finalize; other ords decline)
 # ---------------------------------------------------------------------------
 
 
-def _vector_norm_operand(ord_v: Value, dtype_v: Value, mut src: Operand) raises:
+def _vector_norm_op(
+    ord_v: Value, dtype_v: Value, mut src: Operand
+) raises -> StaticString:
     """The `ord` / `dtype=` gates shared by the functional and out= forms:
-    only the ord-2 one-pass accumulator exists, and `dtype=` selects the
-    accumulation type by casting first (clip_grad_norm_ asks for float32)."""
-    if v_scalar_is_bool(ord_v) or v_f64(ord_v) != 2.0:
-        unsupported("linalg_vector_norm with ord != 2")
+    picks the one-pass accumulator spec for `ord` (only 1 and 2 exist so
+    far -- other ords are one extra branch here each), and `dtype=` selects
+    the accumulation type by casting first (clip_grad_norm_ asks for
+    float32)."""
+    if v_scalar_is_bool(ord_v):
+        unsupported("linalg_vector_norm with ord != 1 or 2")
+    var ord_f = v_f64(ord_v)
+    var op: StaticString
+    if ord_f == 2.0:
+        op = "NormSpec"
+    elif ord_f == 1.0:
+        op = "NormL1Spec"
+    else:
+        unsupported("linalg_vector_norm with ord != 1 or 2")
+        op = ""
     var want = _opt_dtype(dtype_v)
     if want >= 0:
         if not _is_float3(max_dtype(want)):
@@ -1164,6 +1178,7 @@ def _vector_norm_operand(ord_v: Value, dtype_v: Value, mut src: Operand) raises:
         _promote(src, want)
     if not _is_float3(src.t.dtype):
         unsupported("linalg_vector_norm of dtype " + String(src.t.dtype))
+    return op
 
 
 # aten::linalg_vector_norm(Tensor self, Scalar ord=2, int[1]? dim=None,
@@ -1174,13 +1189,13 @@ def op_linalg_vector_norm(
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
     var src = _borrow(a)
-    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
+    var op = _vector_norm_op(args[unsafe_offset=1], args[unsafe_offset=4], src)
     var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
     if len(dims) == 0:
         unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
     var out = _scalar_reduction(
         "reduction",
-        "NormSpec",
+        op,
         src.t,
         dims,
         v_bool_or(args[unsafe_offset=3], False),
@@ -1202,13 +1217,13 @@ def op_linalg_vector_norm_out(
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
-    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
+    var op = _vector_norm_op(args[unsafe_offset=1], args[unsafe_offset=4], src)
     var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
     if len(dims) == 0:
         unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
     _scalar_reduction_out(
         "reduction",
-        "NormSpec",
+        op,
         "aten::linalg_vector_norm.out",
         "exact",
         src.t,

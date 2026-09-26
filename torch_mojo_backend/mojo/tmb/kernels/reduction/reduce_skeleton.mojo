@@ -431,6 +431,44 @@ struct NormL2Op(ReduceOp):
         return sqrt(a).cast[out_dt]()
 
 
+struct NormL1Op(ReduceOp):
+    """linalg_vector_norm(ord=1): sum of absolute values, no finalize root."""
+
+    comptime name = "norml1"
+    comptime dtypes = FLOAT_ONLY_DTYPES
+    comptime errors_on_empty_axis = False
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return DType.float32
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return in_dt
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](0)
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        return abs(x.cast[acc]())
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return a + b
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        return a.cast[out_dt]()
+
+
 struct MaxOp(ReduceOp):
     """amax / max: selection, identity -inf, NaN PROPAGATED (torch's rule)."""
 
