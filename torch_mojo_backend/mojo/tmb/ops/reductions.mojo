@@ -1,5 +1,5 @@
 """ATen ops: reductions (sum, mean, amax/amin, max/min, the arg-reductions,
-any/all, var, the L2 vector norm, cumsum, and sort/topk).
+any/all, count_nonzero, var, the L2 vector norm, cumsum, and sort/topk).
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`), keeping
 its three decisions:
@@ -1112,6 +1112,30 @@ def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 # ---------------------------------------------------------------------------
+# count_nonzero
+# ---------------------------------------------------------------------------
+
+
+# aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+def op_count_nonzero(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    _require_mojo(a)
+    if not _is_truthy(a.dtype):
+        unsupported("count_nonzero of dtype " + String(a.dtype))
+    # An explicit empty dim list reduces every dim (unlike any.dims/all.dims):
+    # `count_nonzero.default(self, dim=None)` redispatches here with `dim=[]`.
+    var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
+    if len(dims) == 0:
+        unsupported("count_nonzero with no reduce dim (a rank-0 operand)")
+    var out = _scalar_reduction(
+        "reduction", "CountNonzeroSpec", a, dims, False, ST_INT64, False, 0.0
+    )
+    ret_owned(rets, 0, out)
+
+
+# ---------------------------------------------------------------------------
 # var
 # ---------------------------------------------------------------------------
 
@@ -1959,6 +1983,7 @@ def register_reductions(site: Site) raises:
     impl[op_any_out, "any.out"](site)
     impl[op_argmax, "argmax"](site)
     impl[op_argmin, "argmin"](site)
+    impl[op_count_nonzero, "count_nonzero.dim_IntList"](site)
     impl[op_cumsum, "cumsum"](site)
     impl[op_kthvalue, "kthvalue"](site)
     impl[op_kthvalue_values, "kthvalue.values"](site)

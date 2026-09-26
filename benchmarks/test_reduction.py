@@ -71,6 +71,7 @@ COVERS: dict[str, str] = {
     "aten::any": "test_any (full-reduction case)",
     "aten::any.dim": "test_any (dim case)",
     "aten::any.dims": "test_any (same fast impl as .dim)",
+    "aten::count_nonzero.dim_IntList": "test_count_nonzero",
     "aten::min.dim": "test_min_dim",
     "aten::var.correction": "test_var",
     "aten::linalg_vector_norm": "test_vector_norm",
@@ -176,6 +177,26 @@ def test_min(
     )
     bench.run(
         lambda: torch.min(x_ref), lambda: torch.min(x_our), flops=float(x_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bool", "f32"))
+@pytest.mark.parametrize("shape_id", DIM_SHAPES)
+def test_count_nonzero(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape, dim = DIM_SHAPES[shape_id]
+    src = (
+        torch.rand(shape) < 0.5
+        if dtype_id == "bool"
+        else unit_interval(shape, DTYPES[dtype_id])
+    )
+    x_ref, x_our = both(src, hw, mojo_device)
+    d = 0 if dim is None else dim
+    bench.run(
+        lambda: torch.count_nonzero(x_ref, dim=d),
+        lambda: torch.count_nonzero(x_our, dim=d),
+        flops=float(x_ref.numel()),
     )
 
 

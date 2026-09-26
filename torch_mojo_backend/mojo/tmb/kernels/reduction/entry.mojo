@@ -59,6 +59,7 @@ from tmb.kernels.reduction.argreduce import _argreduce_spec_into
 from tmb.kernels.reduction.reduce_skeleton import (
     AllOp,
     AnyOp,
+    CountNonzeroOp,
     MaxOp,
     MinOp,
     NormL2Op,
@@ -1232,6 +1233,12 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["AllSpec"]():
             _spec_dispatcher4[
                 _rowred_spec_into_go[AllOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["CountNonzeroSpec"]():
+            _spec_dispatcher4[
+                _rowred_spec_into_go[CountNonzeroOp],
+                "a scalar-reduction spec op",
             ](argv, argc)
             return 0
         comptime if _op_on["NormSpec"]():

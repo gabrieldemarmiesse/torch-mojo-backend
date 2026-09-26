@@ -53,6 +53,7 @@ _REDUCE_OPS = {
     "norm": lambda t, **kw: torch.linalg.vector_norm(t, **kw),
     "all": lambda t, **kw: torch.all(t, **kw),
     "any": lambda t, **kw: torch.any(t, **kw),
+    "count_nonzero": lambda t, **kw: torch.count_nonzero(t, **kw),
 }
 
 
@@ -79,12 +80,12 @@ _REDUCE_OPS = {
 )
 def test_reduce_skeleton_layouts_match_cpu(mojo_gpu, shape, dim, op):
     fn = _REDUCE_OPS[op]
-    if op in ("all", "any"):
+    if op in ("all", "any", "count_nonzero"):
         x = torch.rand(shape) < 0.5
     else:
         x = torch.rand(shape) * 0.9 + 0.05
     ours = fn(x.to(mojo_gpu), dim=dim).cpu()
-    if op in ("all", "any"):
+    if op in ("all", "any", "count_nonzero"):
         torch.testing.assert_close(ours, fn(x, dim=dim))
     else:
         # fp64 reference on the same values: this measures the reduction
@@ -303,6 +304,83 @@ def test_sum_full_reduce_and_dtype_promotion(mojo_gpu):
     y = torch.tensor([[1.7, 2.7, 3.7, 0.2]])
     ours = torch.sum(y.to(mojo_gpu), dim=1, dtype=torch.float32)
     torch.testing.assert_close(ours.cpu(), torch.sum(y, dim=1, dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int64,
+        torch.int32,
+        torch.int16,
+        torch.int8,
+        torch.uint8,
+        torch.bool,
+    ],
+)
+def test_count_nonzero_dtypes(mojo_gpu, dtype):
+    """Every dtype the reduce_skeleton TRUTHY set accepts, output always
+    int64 (torch's count_nonzero.dim_IntList_out(self, dim, out=out) result
+    dtype)."""
+    if dtype is torch.bool:
+        x = torch.rand(6, 9) < 0.5
+    elif dtype.is_floating_point:
+        x = (torch.rand(6, 9) - 0.5).to(dtype)
+    elif dtype is torch.uint8:
+        x = torch.randint(0, 4, (6, 9), dtype=dtype)
+    else:
+        x = torch.randint(-3, 4, (6, 9), dtype=dtype)
+    xd = x.to(mojo_gpu)
+    for dim in (None, 0, 1, -1, (0, 1)):
+        got = torch.count_nonzero(xd, dim=dim)
+        expected = torch.count_nonzero(x, dim=dim)
+        assert got.dtype == torch.int64
+        torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_count_nonzero_empty_dim_list_reduces_all(mojo_gpu):
+    """`count_nonzero.dim_IntList(self, [])` reduces every dim (unlike
+    any.dims/all.dims, where an explicit empty list reduces nothing); this is
+    also what `count_nonzero(self, dim=None)` redispatches to."""
+    x = torch.randn(4, 5)
+    xd = x.to(mojo_gpu)
+    torch.testing.assert_close(
+        torch.ops.aten.count_nonzero.dim_IntList(xd, []).cpu(),
+        torch.ops.aten.count_nonzero.dim_IntList(x, []),
+    )
+    torch.testing.assert_close(torch.count_nonzero(xd).cpu(), torch.count_nonzero(x))
+
+
+def test_count_nonzero_nan_counts_as_nonzero(mojo_device):
+    """NaN is nonzero under the ordered `!=` test (matches any/all's rule)."""
+    x = torch.tensor([[1.0, 0.0, float("nan"), 0.0, float("nan")]])
+    torch.testing.assert_close(
+        torch.count_nonzero(x.to(mojo_device), dim=1).cpu(),
+        torch.count_nonzero(x, dim=1),
+    )
+
+
+def test_count_nonzero_noncontiguous_and_empty(mojo_device):
+    x = torch.randn(4, 6)
+    xd = x.to(mojo_device)
+    torch.testing.assert_close(
+        torch.count_nonzero(xd.t(), dim=0).cpu(), torch.count_nonzero(x.t(), dim=0)
+    )
+    e = torch.empty(0)
+    ed = e.to(mojo_device)
+    torch.testing.assert_close(
+        torch.count_nonzero(ed, dim=0).cpu(), torch.count_nonzero(e, dim=0)
+    )
+
+
+def test_count_nonzero_rejects_rank0(mojo_device):
+    """A rank-0 operand has no reduce dim; declined like sum/mean/amax are for
+    the same shape (see `_reduce_dims`'s empty-list-on-rank-0 case)."""
+    x = torch.tensor(5.0).to(mojo_device)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.count_nonzero.dim_IntList(x, [])
 
 
 @pytest.mark.parametrize("keepdim", [False, True])

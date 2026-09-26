@@ -2,13 +2,14 @@
 # One reduction skeleton, parametrized over the ACCUMULATOR.
 #
 # Every scalar-payload reduction this backend implements -- sum, mean, amax,
-# amin, max, min, the L2 vector norm, any and all -- is the same three moving
-# parts over the same geometry, and they used to be nine hand-written launches
-# with three different launch policies between them. What actually differs
-# between two of them is four lines of algebra: the accumulator dtype, its
-# identity, how an input element maps into it, how two accumulators combine,
-# and how a finished accumulator becomes an output element. `ReduceOp` is that
-# four-line interface and everything below is written once against it.
+# amin, max, min, the L2 vector norm, any, all and count_nonzero -- is the
+# same three moving parts over the same geometry, and they used to be nine
+# hand-written launches with three different launch policies between them.
+# What actually differs between two of them is four lines of algebra: the
+# accumulator dtype, its identity, how an input element maps into it, how two
+# accumulators combine, and how a finished accumulator becomes an output
+# element. `ReduceOp` is that four-line interface and everything below is
+# written once against it.
 #
 # GEOMETRY. The input is a contiguous buffer viewed as (outer, reduce, inner):
 # element (o, r, i) sits at `(o * reduce + r) * inner + i` and output (o, i) at
@@ -603,6 +604,49 @@ struct AllOp(ReduceOp):
         acc: DType, //, out_dt: DType
     ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
         return a.ne(Scalar[acc](0)).cast[out_dt]()
+
+
+struct CountNonzeroOp(ReduceOp):
+    """count_nonzero: sum of AnyOp/AllOp's nonzero test, int64 output.
+
+    NaN counts as nonzero (the same ordered-`!=`-to-true map). The
+    accumulator is int64 rather than any/all's int32 lane trick because the
+    output here IS the count, not a truthiness flag, and needs the range.
+    """
+
+    comptime name = "count_nonzero"
+    comptime dtypes = TRUTHY_DTYPES
+    comptime errors_on_empty_axis = False
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return DType.int64
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return DType.int64
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](0)
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        return (~x.eq(SIMD[in_dt, width]())).cast[acc]()
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return a + b
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        return a.cast[out_dt]()
 
 
 # ---------------------------------------------------------------------------
