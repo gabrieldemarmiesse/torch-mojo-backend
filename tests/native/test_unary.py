@@ -1398,3 +1398,43 @@ def test_inf_predicates_out(mojo_gpu: str, name: str):
     view = torch.zeros(2, len(_INF_VALUES), dtype=torch.bool, device=mojo_gpu)[1]
     fn(x_cpu.to(mojo_gpu), out=view)
     assert torch.equal(view.cpu(), want)
+
+
+# --------------------------------------------------------------------------
+# asin / atan / log10 / exp2 / expm1: the .out overloads and IEEE edges
+# --------------------------------------------------------------------------
+
+_ELEMENTARY_EDGES = [-2.0, -0.75, -1e-4, 0.0, 0.3, 0.9, 2.0, 89.0, 128.0]
+_ELEMENTARY_EDGES += [float("inf"), -float("inf"), float("nan")]
+
+
+@pytest.mark.parametrize("name", ["asin", "atan", "log10", "exp2", "expm1"])
+def test_elementary_unary_out(mojo_gpu: str, name: str):
+    fn = getattr(torch, name)
+    x_cpu = torch.tensor(_ELEMENTARY_EDGES)
+    x = x_cpu.to(mojo_gpu)
+    want = fn(x_cpu)
+
+    def close(actual: torch.Tensor, expected: torch.Tensor):
+        torch.testing.assert_close(
+            actual.cpu(), expected, rtol=2e-6, atol=1e-6, equal_nan=True
+        )
+
+    close(fn(x), want)
+    # An empty out is resized to the result.
+    out = torch.empty(0, device=mojo_gpu)
+    _reset_native_counts()
+    assert fn(x, out=out) is out
+    assert native.op_counts() == {f"aten::{name}.out": 1}
+    close(out, want)
+    # unary_float_op: the float result is cast into a narrower float out.
+    half = torch.empty(len(_ELEMENTARY_EDGES), dtype=torch.float16, device=mojo_gpu)
+    fn(x, out=half)
+    want_half = torch.empty(len(_ELEMENTARY_EDGES), dtype=torch.float16)
+    fn(x_cpu, out=want_half)
+    torch.testing.assert_close(half.cpu(), want_half, equal_nan=True)
+    # A strided out is written where it lives.
+    base = torch.zeros(2 * len(_ELEMENTARY_EDGES), device=mojo_gpu)
+    fn(x, out=base[::2])
+    close(base[::2], want)
+    assert not base[1::2].cpu().any()

@@ -20,7 +20,7 @@
 from std.math import exp2, fma, log2, sqrt
 from std.sys import llvm_intrinsic
 from std.sys._assembly import inlined_assembly
-from std.sys.info import is_apple_gpu, is_nvidia_gpu
+from std.sys.info import is_apple_gpu, is_gpu, is_nvidia_gpu
 
 from tmb.kernels.common.libdevice_port import (
     _f2i_rn,
@@ -146,6 +146,14 @@ def _lg2_approx_ftz(x: Float32) -> Float32:
 
 
 @always_inline
+def _host_exp2f(x: Float32) -> Float32:
+    """2^x on the host (the torch.compile graph on CPU): libm's exp2f through
+    `llvm.exp2`. The stdlib `exp2` clamps float32 to [-126, 126] and reads
+    NaN / inf as finite, so 2^128 came out as 2^126."""
+    return llvm_intrinsic["llvm.exp2", Float32, has_side_effect=False](x)
+
+
+@always_inline
 def _ex2_approx(x: Float32) -> Float32:
     comptime if is_nvidia_gpu():
         return inlined_assembly[
@@ -154,6 +162,8 @@ def _ex2_approx(x: Float32) -> Float32:
             constraints="=f,f",
             has_side_effect=False,
         ](x)
+    elif not is_gpu():
+        return _host_exp2f(x)
     else:
         return exp2(x)
 
@@ -167,6 +177,8 @@ def _ex2_approx_ftz(x: Float32) -> Float32:
             constraints="=f,f",
             has_side_effect=False,
         ](x)
+    elif not is_gpu():
+        return _host_exp2f(x)
     else:
         return exp2(x)
 
