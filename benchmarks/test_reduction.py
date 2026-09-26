@@ -92,6 +92,7 @@ _SAME_KERNEL_OUT = (
     "written straight into (or copied into) the caller's tensors"
 )
 SKIPPED: dict[str, str] = {
+    "aten::max.unary_out": _SAME_KERNEL_OUT,
     "aten::sum.IntList_out": _SAME_KERNEL_OUT,
     "aten::topk.values": _SAME_KERNEL_OUT,
     "aten::sort.values_stable": _SAME_KERNEL_OUT,

@@ -386,6 +386,19 @@ def test_out_variant_into_a_strided_destination(mojo_gpu):
     torch.testing.assert_close(storage[:, 1].cpu(), torch.zeros(4))
 
 
+def test_mean_out_declines_an_out_that_aliases_the_input(mojo_gpu):
+    """`out=x.reshape(-1)[x.numel():]` aliases `x`'s storage (a 0-element view
+    that would need to GROW to hold the result): `_scalar_reduction_out`
+    declines any aliasing `out=` outright rather than resizing it, since stock
+    CUDA has no one well-defined answer here (`torch.max(x, out=x)` -- a
+    different alias of the same helper's problem, tested alongside this one --
+    comes back silently WRONG on real CUDA, not merely a stale pointer)."""
+    x = torch.randn(3, 4, device=mojo_gpu)
+    out = x.reshape(-1)[x.numel() :]
+    with pytest.raises(NotImplementedError):
+        torch.mean(x, dim=1, out=out)
+
+
 # ---------------------------------------------------------------------------
 # amax / amin / max / min / min.dim
 # ---------------------------------------------------------------------------
@@ -456,6 +469,89 @@ def test_max_and_min_full_reduction(mojo_device):
     torch.testing.assert_close(torch.min(xd).cpu(), torch.min(x))
     ints = torch.randint(-100, 100, (5, 9), dtype=torch.int64)
     torch.testing.assert_close(torch.max(ints.to(mojo_device)).cpu(), torch.max(ints))
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int32]
+)
+@pytest.mark.parametrize("shape", [(37, 41), (357, 789), (128,)])
+def test_max_unary_out(mojo_device, shape, dtype):
+    """`max.unary_out`: the full-reduction `out=` overload (`aten::max`
+    itself has no `out=` form; torch routes `torch.max(x, out=t)` here)."""
+    if dtype.is_floating_point:
+        x = torch.randn(shape).to(dtype)
+    else:
+        x = torch.randint(-100, 100, shape, dtype=dtype)
+    xd = x.to(mojo_device)
+    out = torch.empty((), dtype=dtype, device=mojo_device)
+    returned = torch.max(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), torch.max(x))
+
+
+def test_max_unary_out_noncontiguous_and_wrongly_shaped_out(mojo_device):
+    x = torch.randn(6, 11)
+    xd = x.to(mojo_device)[:, ::2]
+    assert not xd.is_contiguous()
+    out = torch.empty(4, 4, device=mojo_device)  # wrong shape: resized to ()
+    torch.max(xd, out=out)
+    assert tuple(out.shape) == ()
+    torch.testing.assert_close(out.cpu(), torch.max(x[:, ::2]))
+
+
+def test_max_unary_out_propagates_nan(mojo_device):
+    x = torch.tensor([1.0, float("nan"), -7.0])
+    out = torch.empty((), device=mojo_device)
+    torch.max(x.to(mojo_device), out=out)
+    assert out.cpu().isnan().item()
+
+
+def test_max_unary_out_declines_an_out_that_aliases_the_input(mojo_gpu):
+    """`_scalar_reduction_out` refuses any `out=` sharing storage with the
+    input outright, rather than resizing it: stock CUDA has no one
+    well-defined answer to reproduce here. `out=x[x.numel():]` (a 0-element
+    view that would need to GROW) computes the right answer on real CUDA, but
+    `out=x` itself -- same tensor, needing to SHRINK from (6,) to () --
+    silently returns the WRONG value there (`resize_output` mutates `self`'s
+    own metadata before the reduction reads it), so there is no single
+    aliasing behavior worth special-casing; every aliasing `out=` declines."""
+    x = torch.randn(6, device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.max(x, out=x[x.numel() :])
+    with pytest.raises(NotImplementedError):
+        torch.max(x, out=x)
+
+
+def test_max_unary_out_requires_an_exact_dtype_match(mojo_gpu):
+    """Unlike mean.out/any.out's safe_cast, max_all_kernel_impl's
+    make_reduction on stock CUDA refuses ANY dtype mismatch, even a safe
+    upcast (verified against stock CUDA torch: int64 -> float32 raises
+    "provided dtype must match dtype of result")."""
+    x = torch.randint(-100, 100, (9, 5), dtype=torch.int64)
+    with pytest.raises(RuntimeError):
+        torch.max(
+            x.to(mojo_gpu), out=torch.empty((), dtype=torch.float32, device=mojo_gpu)
+        )
+
+    y = torch.randn(9, 5)
+    with pytest.raises(RuntimeError):
+        torch.max(
+            y.to(mojo_gpu), out=torch.empty((), dtype=torch.int64, device=mojo_gpu)
+        )
+
+    out = torch.empty((), dtype=torch.int64, device=mojo_gpu)
+    torch.max(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.max(x))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64])
+def test_max_unary_out_refuses_empty_input(mojo_device, dtype):
+    """Stock CUDA errors on this too (an internal assert in Reduce.cuh,
+    verified on an H100), just not cleanly; declining is the closest match."""
+    x = torch.empty((0, 5), dtype=dtype)
+    out = torch.empty((), dtype=dtype, device=mojo_device)
+    with pytest.raises(RuntimeError):
+        torch.max(x.to(mojo_device), out=out)
 
 
 @pytest.mark.parametrize("shape", [(7,), (357, 789), (1 << 20,)])
@@ -1017,6 +1113,10 @@ _EXPECTED_OVERLOADS = [
     ("aten::amax", lambda d: torch.amax(torch.randn(4, 5).to(d), dim=1)),
     ("aten::amin", lambda d: torch.amin(torch.randn(4, 5).to(d), dim=1)),
     ("aten::max", lambda d: torch.max(torch.randn(4, 5).to(d))),
+    (
+        "aten::max.unary_out",
+        lambda d: torch.max(torch.randn(4, 5).to(d), out=torch.empty((), device=d)),
+    ),
     ("aten::min", lambda d: torch.min(torch.randn(4, 5).to(d))),
     ("aten::min.dim", lambda d: torch.min(torch.randn(4, 5).to(d), dim=1)),
     (

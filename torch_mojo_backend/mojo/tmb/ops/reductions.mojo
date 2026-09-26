@@ -633,8 +633,22 @@ def _scalar_reduction_out(
     element count alone is not enough: the copy below reads the source
     through the destination's extents, so a (2,3) result poured into a (3,2)
     out would walk off the end of the source.
+
+    `out` ALIASING `a`'s storage is declined outright, before any resize is
+    even considered. Resizing an `out` that shares `a`'s storage is not one
+    well-defined case: the C++ resize hook can grow the shared allocation,
+    which reallocates the block `a`'s already-cached tensor info points at
+    (verified on stock CUDA torch: `torch.max(x, out=x[x.numel():])` is fine,
+    but `torch.max(x, out=x)` -- `resize_output` shrinking `self`'s own
+    metadata out from under the reduction that is about to read it -- comes
+    back with a silently WRONG answer on real CUDA, not merely a stale
+    pointer). Since stock CUDA has no single correct behavior here to
+    reproduce, every aliasing `out=` is refused instead of guessing.
     """
     _one_device(a, dst)
+    var a_storage = a.storage_ptr()
+    if a_storage != 0 and a_storage == dst.storage_ptr():
+        unsupported(String(op_name) + ": out= aliasing the input")
     _check_out_dtype(op_name, policy, max_dtype(out_stype), dst.dtype)
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
@@ -938,6 +952,41 @@ def op_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::min(Tensor self) -> Tensor
 def op_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _full_extremum("reduction", "AminSpec", args, rets)
+
+
+# aten::max.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_max_unary_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=1])
+    _require_mojo(a)
+    _require_mojo(out)
+    _check_extremum_dtype(a, "MaxSpec")
+    if a.rank == 0:
+        unsupported("max()/min() of a rank-0 tensor")
+    var dims = _trailing_dims(a.rank, a.rank)
+    # Stock CUDA does not special-case this: `max_unary_out`'s TensorIterator
+    # over zero elements trips an internal assert in Reduce.cuh (verified on
+    # an H100). Declining cleanly here matches "errors on empty" without
+    # reproducing that assert.
+    _refuse_empty_extremum("MaxSpec", a, dims)
+    _scalar_reduction_out(
+        "nn",
+        "MaxSpec",
+        "aten::max.unary_out",
+        # `make_reduction`'s TensorIterator requires the output dtype to
+        # equal the input's exactly (verified on real CUDA: an int64 input
+        # with a float32 out raises "provided dtype must match dtype of
+        # result"), unlike the ordinary `canCast` policy other out= ops use.
+        "exact",
+        a,
+        dims,
+        False,
+        a.stype,
+        out,
+    )
+    ret_ref(rets, 0, out)
 
 
 # ---------------------------------------------------------------------------
@@ -2049,6 +2098,7 @@ def register_reductions(site: Site) raises:
     impl[op_linalg_vector_norm, "linalg_vector_norm"](site)
     impl[op_linalg_vector_norm_out, "linalg_vector_norm.out"](site)
     impl[op_max, "max"](site)
+    impl[op_max_unary_out, "max.unary_out"](site)
     impl[op_mean, "mean"](site)
     impl[op_mean_dim, "mean.dim"](site)
     impl[op_mean_out, "mean.out"](site)
