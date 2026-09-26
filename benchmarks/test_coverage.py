@@ -198,6 +198,7 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::ne.Scalar_out": _OUT,
     "aten::ne.Tensor_out": _OUT,
     "aten::neg.out": _OUT,
+    "aten::prod.int_out": _OUT,
     "aten::reciprocal.out": _OUT,
     "aten::relu.out": _OUT,
     "aten::rsqrt.out": _OUT,

@@ -343,6 +343,50 @@ struct SumOp(ReduceOp):
         return a.cast[out_dt]()
 
 
+struct ProdOp(ReduceOp):
+    """prod: multiplicative, identity 1, NaN inherited through the multiply.
+
+    Same dtype set as `SumOp` -- torch promotes bool/sub-int64 integer prod to
+    int64 the same way it does sum, so int32 only reaches here on an explicit
+    `dtype=int32` request, which is declined on the host side (see
+    `_is_sum_dtype`).
+    """
+
+    comptime name = "prod"
+    comptime dtypes = SCALAR_DTYPES
+    comptime errors_on_empty_axis = False
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return _float_acc[in_dt]()
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return in_dt
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](1)
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        return x.cast[acc]()
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return a * b
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        return a.cast[out_dt]()
+
+
 struct MeanOp(ReduceOp):
     """mean: sum with the 1/n folded into the finalize.
 

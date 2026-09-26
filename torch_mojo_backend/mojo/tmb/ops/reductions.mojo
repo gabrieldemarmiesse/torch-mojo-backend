@@ -1360,6 +1360,106 @@ def op_cumsum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 # ---------------------------------------------------------------------------
+# prod
+# ---------------------------------------------------------------------------
+
+
+# aten::prod(Tensor self, *, ScalarType? dtype=None) -> Tensor
+def op_prod(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    _require_mojo(a)
+    if a.rank == 0:
+        unsupported("prod with no reduce dim (a rank-0 operand)")
+    var src = _borrow(a)
+    var want = _opt_dtype(args[unsafe_offset=1])
+    if want >= 0:
+        _promote(src, want)
+    elif not src.t.dtype.is_floating_point():
+        # torch promotes bool / sub-int64 integer prod to int64.
+        _promote(src, ST_INT64)
+    if not _is_sum_dtype(src.t.dtype):
+        unsupported("prod of dtype " + String(src.t.dtype))
+    var dims = _trailing_dims(src.t.rank, src.t.rank)
+    var out = _scalar_reduction(
+        "reduction",
+        "ProdSpec",
+        src.t,
+        dims,
+        False,
+        src.t.stype,
+        False,
+        0.0,
+    )
+    ret_owned(rets, 0, out)
+    _ = src^
+
+
+# aten::prod.dim_int(Tensor self, int dim, bool keepdim=False, *,
+#   ScalarType? dtype=None) -> Tensor
+def op_prod_dim_int(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    _require_mojo(a)
+    var src = _borrow(a)
+    var want = _opt_dtype(args[unsafe_offset=3])
+    if want >= 0:
+        _promote(src, want)
+    elif not src.t.dtype.is_floating_point():
+        _promote(src, ST_INT64)
+    if not _is_sum_dtype(src.t.dtype):
+        unsupported("prod of dtype " + String(src.t.dtype))
+    var dims = List[Int]()
+    dims.append(_norm_dim(v_int(args[unsafe_offset=1]), src.t.rank))
+    var out = _scalar_reduction(
+        "reduction",
+        "ProdSpec",
+        src.t,
+        dims,
+        v_bool_or(args[unsafe_offset=2], False),
+        src.t.stype,
+        False,
+        0.0,
+    )
+    ret_owned(rets, 0, out)
+    _ = src^
+
+
+# aten::prod.int_out(Tensor self, int dim, bool keepdim=False, *,
+#   ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+def op_prod_int_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=4])
+    _require_mojo(a)
+    _require_mojo(out)
+    var src = _borrow(a)
+    var want = _opt_dtype(args[unsafe_offset=3])
+    if want >= 0:
+        _promote(src, want)
+    elif not src.t.dtype.is_floating_point():
+        _promote(src, ST_INT64)
+    if not _is_sum_dtype(src.t.dtype):
+        unsupported("prod of dtype " + String(src.t.dtype))
+    var dims = List[Int]()
+    dims.append(_norm_dim(v_int(args[unsafe_offset=1]), src.t.rank))
+    _scalar_reduction_out(
+        "reduction",
+        "ProdSpec",
+        "aten::prod.int_out",
+        "safe_cast",
+        src.t,
+        dims,
+        v_bool_or(args[unsafe_offset=2], False),
+        src.t.stype,
+        out,
+    )
+    ret_ref(rets, 0, out)
+    _ = src^
+
+
+# ---------------------------------------------------------------------------
 # sort / topk: one segmented (key, index) sort behind both ops
 # (tmb/kernels/sort/entry.mojo).
 #
@@ -2061,6 +2161,9 @@ def register_reductions(site: Site) raises:
     impl[op_nanmedian, "nanmedian"](site)
     impl[op_nanmedian_dim, "nanmedian.dim"](site)
     impl[op_nanmedian_dim_values, "nanmedian.dim_values"](site)
+    impl[op_prod, "prod"](site)
+    impl[op_prod_dim_int, "prod.dim_int"](site)
+    impl[op_prod_int_out, "prod.int_out"](site)
     impl[op_sort_stable, "sort.stable"](site)
     impl[op_sort_values_stable, "sort.values_stable"](site)
     impl[op_sum, "sum"](site)

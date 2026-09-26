@@ -60,6 +60,8 @@ COVERS: dict[str, str] = {
     "aten::sum.dim_IntList": "test_sum (dim cases)",
     "aten::mean": "test_mean (full-reduction case)",
     "aten::mean.dim": "test_mean (dim cases)",
+    "aten::prod": "test_prod (full-reduction case)",
+    "aten::prod.dim_int": "test_prod (dim cases)",
     "aten::max": "test_max",
     "aten::min": "test_min",
     "aten::amax": "test_amax",
@@ -157,6 +159,26 @@ def test_mean(
         bench.run(
             lambda: torch.mean(x_ref, dim=dim),
             lambda: torch.mean(x_our, dim=dim),
+            flops=float(x_ref.numel()),
+        )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", DIM_SHAPES)
+def test_prod(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
+    if dim is None:
+        bench.run(
+            lambda: torch.prod(x_ref),
+            lambda: torch.prod(x_our),
+            flops=float(x_ref.numel()),
+        )
+    else:
+        bench.run(
+            lambda: torch.prod(x_ref, dim=dim),
+            lambda: torch.prod(x_our, dim=dim),
             flops=float(x_ref.numel()),
         )
 
