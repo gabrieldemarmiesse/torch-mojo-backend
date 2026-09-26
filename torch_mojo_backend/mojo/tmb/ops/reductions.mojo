@@ -840,19 +840,13 @@ def _refuse_empty_extremum(op: StaticString, t: T, dims: List[Int]) raises:
     reduction dim to have non-zero size") and so does the accumulator
     (`errors_on_empty_axis`). Declining on the host gives the caller the
     actionable NotImplementedError the old fast path gave, rather than the
-    kernel's own message. A reduction with no OUTPUTS is an error for nobody."""
-    var is_red = Array[Bool, MAX_RANK](fill=False)
+    kernel's own message. Torch refuses this EVEN WHEN THE OUTPUT ITSELF IS
+    EMPTY (e.g. amin(empty(0, 0), dim=1) still raises), so the output count
+    plays no part here."""
     var extent = 1
     for d in dims:
-        is_red[d] = True
         extent *= t.dim(d)
-    if extent != 0:
-        return
-    var outputs = 1
-    for d in range(t.rank):
-        if not is_red[d]:
-            outputs *= t.dim(d)
-    if outputs > 0:
+    if extent == 0:
         unsupported(
             String(op) + " over a reduce dim of size 0 (torch refuses it too)"
         )
@@ -889,23 +883,23 @@ def op_amin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _amax_amin("AminSpec", args, rets)
 
 
-# aten::amax.out(Tensor self, int[1] dim=[], bool keepdim=False, *,
-#   Tensor(a!) out) -> Tensor(a!)
-def op_amax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+def _amax_amin_out(
+    op: StaticString, op_name: StaticString, args: Values, rets: Values
+) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=3])
     _require_mojo(a)
     _require_mojo(out)
-    _check_extremum_dtype(a, "AmaxSpec")
+    _check_extremum_dtype(a, op)
     var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
     if len(dims) == 0:
-        unsupported("amax with no reduce dim (a rank-0 operand)")
-    _refuse_empty_extremum("AmaxSpec", a, dims)
+        unsupported("amax/amin with no reduce dim (a rank-0 operand)")
+    _refuse_empty_extremum(op, a, dims)
     _scalar_reduction_out(
         "reduction",
-        "AmaxSpec",
-        "aten::amax.out",
-        "exact",  # torch's amax meta: out dtype must equal input dtype
+        op,
+        op_name,
+        "exact",  # torch's amax/amin meta: out dtype must equal input dtype
         a,
         dims,
         v_bool_or(args[unsafe_offset=2], False),
@@ -913,6 +907,18 @@ def op_amax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         out,
     )
     ret_ref(rets, 0, out)
+
+
+# aten::amax.out(Tensor self, int[1] dim=[], bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_amax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _amax_amin_out("AmaxSpec", "aten::amax.out", args, rets)
+
+
+# aten::amin.out(Tensor self, int[1] dim=[], bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_amin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _amax_amin_out("AminSpec", "aten::amin.out", args, rets)
 
 
 def _full_extremum(
@@ -2037,6 +2043,7 @@ def register_reductions(site: Site) raises:
     impl[op_amax, "amax"](site)
     impl[op_amax_out, "amax.out"](site)
     impl[op_amin, "amin"](site)
+    impl[op_amin_out, "amin.out"](site)
     impl[op_any, "any"](site)
     impl[op_any_dim, "any.dim"](site)
     impl[op_any_dim, "any.dims"](site)

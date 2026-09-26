@@ -1192,9 +1192,10 @@ def _rowred_spec_into_go[
         inner = 1
     var outputs = outer * inner
     comptime if Op.errors_on_empty_axis:
-        # torch refuses this one; raising hands it back to Python, which
-        # declines and lets torch raise its own message.
-        if reduce_n == 0 and outputs > 0:
+        # torch refuses this one EVEN when the output itself is empty
+        # (e.g. amin(empty(0, 0), dim=1)); raising hands it back to Python,
+        # which declines and lets torch raise its own message.
+        if reduce_n == 0:
             raise Error("mojo spec reduce: empty reduce dim")
     var ctx = a.ctx()
     comptime for dt in Op.dtypes:
