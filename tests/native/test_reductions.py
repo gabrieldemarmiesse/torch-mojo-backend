@@ -51,6 +51,7 @@ _REDUCE_OPS = {
     "amax": lambda t, **kw: torch.amax(t, **kw),
     "amin": lambda t, **kw: torch.amin(t, **kw),
     "norm": lambda t, **kw: torch.linalg.vector_norm(t, **kw),
+    "norminf": lambda t, **kw: torch.linalg.vector_norm(t, ord=math.inf, **kw),
     "all": lambda t, **kw: torch.all(t, **kw),
     "any": lambda t, **kw: torch.any(t, **kw),
 }
@@ -753,6 +754,41 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
     torch.testing.assert_close(
         torch.linalg.vector_norm(empty).cpu(), torch.tensor(0.0), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_vector_norm_inf_matches_torch(mojo_gpu, dtype):
+    """ord=+inf: max of |x|, distinct from ord=2's sum of squares."""
+    x = (torch.randn(4099, 37) * 10).to(dtype)
+    expected = torch.linalg.vector_norm(x.double(), ord=math.inf, dim=1)
+    ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=math.inf, dim=1).cpu()
+    torch.testing.assert_close(ours.double(), expected, atol=1e-3, rtol=1e-3)
+
+
+def test_vector_norm_inf_with_an_accumulation_dtype(mojo_gpu):
+    cpu = torch.randn(4096, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(cpu, ord=math.inf, dtype=torch.float32)
+    got = torch.linalg.vector_norm(cpu.to(mojo_gpu), ord=math.inf, dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_vector_norm_inf_out_and_resize(mojo_gpu):
+    """A wrongly-shaped `out` is resized, same as every other scalar
+    reduction's out= path (`_scalar_reduction_out`)."""
+    x = torch.randn(5, 7)
+    expected = torch.linalg.vector_norm(x, ord=math.inf, dim=1)
+    out = torch.empty(0, device=mojo_gpu)
+    returned = torch.linalg.vector_norm(x.to(mojo_gpu), ord=math.inf, dim=1, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert tuple(out.shape) == (5,)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_vector_norm_ord_minus_inf_still_declined(mojo_gpu):
+    """-inf is a sibling PR's accumulator; only +inf is ours."""
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(torch.randn(4, 5).to(mojo_gpu), ord=-math.inf)
 
 
 # ---------------------------------------------------------------------------

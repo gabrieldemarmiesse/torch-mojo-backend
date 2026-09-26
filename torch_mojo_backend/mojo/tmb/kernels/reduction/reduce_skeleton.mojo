@@ -431,6 +431,54 @@ struct NormL2Op(ReduceOp):
         return sqrt(a).cast[out_dt]()
 
 
+struct NormInfOp(ReduceOp):
+    """linalg_vector_norm(ord=+inf): max of |x|, NaN PROPAGATED.
+
+    Identity 0 is valid for a max-of-abs (abs is never negative), and the
+    combine is MaxOp's NaN-propagating one -- `map` already turned any input
+    NaN into an accumulator NaN, so the same "b wins on greater-or-NaN" rule
+    carries it through. `errors_on_empty_axis = True` matches torch's
+    `linalg_vector_norm` meta check (LinearAlgebra.cpp): ord +inf (like ord
+    < 0) refuses an empty reduce dim because max-of-abs has no identity in
+    torch's own eyes, even though this accumulator's identity (0) would
+    happily answer 0.
+    """
+
+    comptime name = "norminf"
+    comptime dtypes = FLOAT_ONLY_DTYPES
+    comptime errors_on_empty_axis = True
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return DType.float32
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return in_dt
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](0)
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        return abs(x.cast[acc]())
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return (b.gt(a) | isnan(b)).select(b, a)
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        return a.cast[out_dt]()
+
+
 struct MaxOp(ReduceOp):
     """amax / max: selection, identity -inf, NaN PROPAGATED (torch's rule)."""
 

@@ -23,7 +23,7 @@ contiguity, device and dtype only, so no post-reduction reshape is needed even
 on the permuted route.
 """
 from std.utils import IndexList
-from std.utils.numerics import nan
+from std.utils.numerics import isinf, nan
 
 from tmb.backend.abi import (
     ST_BOOL,
@@ -1149,12 +1149,22 @@ def op_var_correction(
 # ---------------------------------------------------------------------------
 
 
-def _vector_norm_operand(ord_v: Value, dtype_v: Value, mut src: Operand) raises:
+def _vector_norm_operand(
+    ord_v: Value, dtype_v: Value, mut src: Operand
+) raises -> Bool:
     """The `ord` / `dtype=` gates shared by the functional and out= forms:
-    only the ord-2 one-pass accumulator exists, and `dtype=` selects the
-    accumulation type by casting first (clip_grad_norm_ asks for float32)."""
-    if v_scalar_is_bool(ord_v) or v_f64(ord_v) != 2.0:
+    ord 2 (NormL2Op) and ord +inf (NormInfOp) are the only accumulators that
+    exist; `dtype=` selects the accumulation type by casting first
+    (clip_grad_norm_ asks for float32). Returns whether ord is +inf, which
+    the caller uses to pick the spec op ("NormSpec" vs "NormInfSpec")."""
+    if v_scalar_is_bool(ord_v):
         unsupported("linalg_vector_norm with ord != 2")
+    var ord = v_f64(ord_v)
+    # -inf and finite ords other than 2 are sibling PRs' work; only +inf is
+    # ours to accept here.
+    var is_inf = ord > 0.0 and Bool(isinf(ord))
+    if ord != 2.0 and not is_inf:
+        unsupported("linalg_vector_norm with ord != 2 or +inf")
     var want = _opt_dtype(dtype_v)
     if want >= 0:
         if not _is_float3(max_dtype(want)):
@@ -1164,6 +1174,7 @@ def _vector_norm_operand(ord_v: Value, dtype_v: Value, mut src: Operand) raises:
         _promote(src, want)
     if not _is_float3(src.t.dtype):
         unsupported("linalg_vector_norm of dtype " + String(src.t.dtype))
+    return is_inf
 
 
 # aten::linalg_vector_norm(Tensor self, Scalar ord=2, int[1]? dim=None,
@@ -1174,13 +1185,16 @@ def op_linalg_vector_norm(
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
     var src = _borrow(a)
-    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
+    var is_inf = _vector_norm_operand(
+        args[unsafe_offset=1], args[unsafe_offset=4], src
+    )
     var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
     if len(dims) == 0:
         unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
+    var spec_op: StaticString = "NormInfSpec" if is_inf else "NormSpec"
     var out = _scalar_reduction(
         "reduction",
-        "NormSpec",
+        spec_op,
         src.t,
         dims,
         v_bool_or(args[unsafe_offset=3], False),
@@ -1202,13 +1216,16 @@ def op_linalg_vector_norm_out(
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
-    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
+    var is_inf = _vector_norm_operand(
+        args[unsafe_offset=1], args[unsafe_offset=4], src
+    )
     var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
     if len(dims) == 0:
         unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
+    var spec_op: StaticString = "NormInfSpec" if is_inf else "NormSpec"
     _scalar_reduction_out(
         "reduction",
-        "NormSpec",
+        spec_op,
         "aten::linalg_vector_norm.out",
         "exact",
         src.t,
