@@ -15,7 +15,12 @@ struct ElementwiseOp[kind: StaticString](ElementwiseUnaryMixedOp):
         out_dtype: DType,
         width: SIMDLength,
     ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
-        comptime if Self.kind == "isnan" or Self.kind == "logical_not":
+        comptime if (
+            Self.kind == "isinf"
+            or Self.kind == "isnan"
+            or Self.kind == "logical_not"
+            or Self.kind == "signbit"
+        ):
             comptime assert out_dtype == DType.bool, "expected boolean output"
             return elementwise_predicate[Self.kind](x).cast[out_dtype]()
         else:

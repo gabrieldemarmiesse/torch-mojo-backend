@@ -181,6 +181,7 @@ def elementwise(
         "floor",
         "gelu_none",
         "gelu_tanh",
+        "isinf",
         "isnan",
         "logical_not",
         "log",
@@ -210,6 +211,7 @@ def elementwise(
             "floor",
             "gelu_none",
             "gelu_tanh",
+            "isinf",
             "isnan",
             "logical_not",
             "neg",
@@ -222,7 +224,9 @@ def elementwise(
         # ATen unary_float_op promotes integer and bool inputs to the default
         # floating dtype, whereas ElementwiseUnaryOp preserves its input dtype.
         input = F.cast(input, dtype=torch_dtype_to_max(torch.get_default_dtype()))
-    output_dtype = DType.bool if kind in {"isnan", "logical_not"} else input.dtype
+    output_dtype = (
+        DType.bool if kind in {"isinf", "isnan", "logical_not"} else input.dtype
+    )
     return F.custom(
         name=f"elementwise_{kind}",
         device=input.device,
