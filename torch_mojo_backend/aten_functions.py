@@ -3419,26 +3419,22 @@ def aten_log2(input: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(input, "log2")
 
 
+def _truthy(x: MaxTensor) -> MaxTensor:
+    """`x != 0` as ATen's logical ops read a number: NaN is true. MAX's
+    `not_equal` is an ordered compare on CPU (NaN != 0 is False there), so
+    a floating operand also ORs in its NaN mask."""
+    if x.dtype == DType.bool:
+        return x
+    nonzero = F.not_equal(x, 0)
+    if not x.dtype.is_float():
+        return nonzero
+    return F.logical_or(nonzero, custom_mojo_ops.elementwise(x, "isnan"))
+
+
 # logical_and(Tensor self, Tensor other) -> Tensor
 @map_to(aten.logical_and)
 def aten_logical_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
-    """
-    Computes element-wise logical AND of two tensors.
-    Both inputs are converted to boolean first if they aren't already.
-    """
-    # Convert both inputs to boolean if they aren't already
-    if input.dtype != DType.bool:
-        input_bool = F.not_equal(input, 0)
-    else:
-        input_bool = input
-
-    if other.dtype != DType.bool:
-        other_bool = F.not_equal(other, 0)
-    else:
-        other_bool = other
-
-    # Apply logical and
-    return F.logical_and(input_bool, other_bool)
+    return F.logical_and(_truthy(input), _truthy(other))
 
 
 # logical_not(Tensor self) -> Tensor
@@ -3448,28 +3444,15 @@ def aten_logical_not(input: MaxTensor) -> MaxTensor:
 
 
 # logical_or(Tensor self, Tensor other) -> Tensor
+@map_to(aten.logical_or)
+def aten_logical_or(input: MaxTensor, other: MaxTensor) -> MaxTensor:
+    return F.logical_or(_truthy(input), _truthy(other))
 
 
 # logical_xor(Tensor self, Tensor other) -> Tensor
 @map_to(aten.logical_xor)
 def aten_logical_xor(input: MaxTensor, other: MaxTensor) -> MaxTensor:
-    """
-    Computes element-wise logical XOR of two tensors.
-    Both inputs are converted to boolean first if they aren't already.
-    """
-    # Convert both inputs to boolean if they aren't already
-    if input.dtype != DType.bool:
-        input_bool = F.not_equal(input, 0)
-    else:
-        input_bool = input
-
-    if other.dtype != DType.bool:
-        other_bool = F.not_equal(other, 0)
-    else:
-        other_bool = other
-
-    # Apply logical xor
-    return F.logical_xor(input_bool, other_bool)
+    return F.logical_xor(_truthy(input), _truthy(other))
 
 
 # lt.Scalar(Tensor self, Scalar other) -> Tensor

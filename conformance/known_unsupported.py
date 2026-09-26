@@ -251,7 +251,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "logaddexp2": ("float32", "bfloat16", "float16"),
     "logcumsumexp": ("float32", "bfloat16", "float16"),
     "logdet": ("float32",),
-    "logical_or": ("float32", "bfloat16", "float16", "int64", "bool"),
     "logit": ("float32", "bfloat16", "float16", "int64", "bool"),
     "logsumexp": ("float32", "bfloat16", "float16", "int64", "bool"),
     "lu": ("float32",),

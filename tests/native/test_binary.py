@@ -1475,6 +1475,11 @@ def test_add_above_last_level_cache(mojo_gpu):
 
 
 _OUT_OPS = [
+    ("logical_and", torch.logical_and, torch.float32),
+    ("logical_or", torch.logical_or, torch.float32),
+    ("logical_xor", torch.logical_xor, torch.float32),
+    ("maximum", torch.maximum, torch.float32),
+    ("minimum", torch.minimum, torch.float32),
     ("remainder", torch.remainder, torch.float32),
     ("bitwise_and", torch.bitwise_and, torch.int32),
     ("bitwise_or", torch.bitwise_or, torch.int64),
@@ -1506,6 +1511,19 @@ def test_binary_out_variants(mojo_device, name, fn, dtype, layout):
     torch.testing.assert_close(out.cpu(), expected)
 
 
+def test_binary_out_resizes_and_casts(mojo_device):
+    a_cpu, a = _both((3, 5), torch.float32, mojo_device)
+    b_cpu, b = _both((3, 5), torch.float32, mojo_device)
+    out = torch.empty(0, device=mojo_device)
+    torch.maximum(a, b, out=out)
+    torch.testing.assert_close(out.cpu(), torch.maximum(a_cpu, b_cpu))
+    mask = torch.empty((3, 5), dtype=torch.float32, device=mojo_device)
+    torch.logical_or(a > 0, b > 0, out=mask)
+    torch.testing.assert_close(
+        mask.cpu(), torch.logical_or(a_cpu > 0, b_cpu > 0).float()
+    )
+
+
 def test_binary_scalar_out_variants(mojo_device):
     a_cpu, a = _both((7,), torch.int64, mojo_device)
     for fn in (torch.bitwise_and, torch.bitwise_or, torch.bitwise_xor):
@@ -1522,8 +1540,28 @@ def test_binary_scalar_out_variants(mojo_device):
     torch.testing.assert_close(out.cpu(), torch.remainder(f_cpu, 0.75))
 
 
+def test_logical_or(mojo_device, call_checker):
+    call_checker.register("aten::logical_or")
+    a_cpu = torch.tensor([0.0, 1.0, 0.0, -2.0, float("nan")])
+    b_cpu = torch.tensor([0, 0, 3, 1, 0], dtype=torch.int64)
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(
+        torch.logical_or(a, a).cpu(), torch.logical_or(a_cpu, a_cpu)
+    )
+    torch.testing.assert_close(
+        torch.logical_or(b, b).cpu(), torch.logical_or(b_cpu, b_cpu)
+    )
+    torch.testing.assert_close(
+        torch.logical_or(a, b).cpu(), torch.logical_or(a_cpu, b_cpu)
+    )
+    x, x_cpu = a.clone(), a_cpu.clone()
+    x.logical_or_(a_cpu.flip(0).to(mojo_device))
+    x_cpu.logical_or_(a_cpu.flip(0))
+    torch.testing.assert_close(x.cpu(), x_cpu)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("fn", [torch.logical_and, torch.logical_xor])
+@pytest.mark.parametrize("fn", [torch.logical_and, torch.logical_or, torch.logical_xor])
 def test_logical_ops_read_nan_as_true(mojo_device, dtype, fn):
     """NaN is nonzero: fast-math must not fold `NaN != 0` to False."""
     a_cpu = torch.tensor(
