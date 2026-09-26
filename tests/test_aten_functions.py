@@ -5353,6 +5353,25 @@ def test_aten_rsub(conf: Conf, call_checker: CallChecker):
     check_outputs(fn, conf, [torch.randn(3, 4), torch.randn(4)])
 
 
+_INF_EDGES = [0.0, -0.0, 1.5, -2.0, 1e-40, float("inf"), float("-inf"), float("nan")]
+
+
+@pytest.mark.parametrize("name", ["isinf", "isposinf", "isneginf", "isfinite"])
+def test_aten_inf_predicates(conf: Conf, call_checker: CallChecker, name: str):
+    # isinf has an aten_functions twin; the other three are decomposed by
+    # the graph backend, so only the mojo device's own kernel counts.
+    if name == "isinf":
+        call_checker.register(aten_functions.aten_isinf)
+    else:
+        call_checker.register(f"aten::{name}")
+    op = getattr(aten, name)
+
+    def fn(x):
+        return op(x)
+
+    check_outputs(fn, conf, [torch.tensor(_INF_EDGES)])
+
+
 def test_aten_logical_and_bool_tensors(conf: Conf):
     """Test aten.logical_and with boolean tensors"""
 

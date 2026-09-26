@@ -164,6 +164,18 @@ struct ElementwiseGeluTanh(ElementwiseUnaryMixedOp):
         return Op.elementwise[dtype, out_dtype, width](x)
 
 
+@extensibility.register("elementwise_isinf")
+struct ElementwiseIsinf(ElementwiseUnaryMixedOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        out_dtype: DType,
+        width: SIMDLength,
+    ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+        comptime Op = ElementwiseOp["isinf"]
+        return Op.elementwise[dtype, out_dtype, width](x)
+
+
 @extensibility.register("elementwise_isnan")
 struct ElementwiseIsnan(ElementwiseUnaryMixedOp):
     @staticmethod

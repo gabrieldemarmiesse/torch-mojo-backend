@@ -42,6 +42,8 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "exp": torch.exp,
     "floor": torch.floor,
     "gelu": F.gelu,
+    "isfinite": torch.isfinite,
+    "isinf": torch.isinf,
     "isnan": torch.isnan,
     "isneginf": torch.isneginf,
     "isposinf": torch.isposinf,
@@ -79,7 +81,8 @@ _UNARY_OUT = (
     "straight into a fitting destination)"
 )
 SKIPPED: dict[str, str] = {
-    f"aten::{name}": _UNARY_OUT for name in ("isneginf.out", "isposinf.out")
+    f"aten::{name}": _UNARY_OUT
+    for name in ("isinf.out", "isneginf.out", "isposinf.out")
 }
 
 COVERS: dict[str, str] = {f"aten::{name}": "test_unary" for name in UNARY_OPS} | {

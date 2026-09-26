@@ -3213,6 +3213,9 @@ def aten_index_select(input: MaxTensor, dim: int, index: MaxTensor) -> MaxTensor
 
 
 # isinf(Tensor self) -> Tensor
+@map_to(aten.isinf)
+def aten_isinf(input: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(input, "isinf")
 
 
 # isin.Tensor_Tensor(Tensor elements, Tensor test_elements, *, bool assume_unique=False, bool invert=False) -> Tensor
