@@ -285,7 +285,15 @@ def _cross_device_comparison_skip_reason(op: OpInfo, dtype: torch.dtype) -> str 
 # conv2d lands up to 4.6e-5 from the float64 answer on these very samples.
 # Kept to the nodes that have shown it; not a general policy.
 _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
-    {("nn_functional_conv2d", torch.float32)}
+    {
+        ("nn_functional_conv2d", torch.float32),
+        # rsub with alpha on float16: CUDA's (and our) sub kernel computes
+        # other - alpha * self as one fma in float; CPU torch rounds
+        # alpha * self to float16 first, one or two ulps farther from the
+        # float64 answer (sample alpha=-3.125: CPU 2.4453, CUDA 2.4414,
+        # exact 2.4421).
+        ("rsub", torch.float16),
+    }
 )
 
 # Per-accelerator extensions to `_FP64_ANCHORED`, keyed like

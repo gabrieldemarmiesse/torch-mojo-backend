@@ -31,7 +31,9 @@ from tmb.backend.abi import (
     ST_INT8,
     ST_UINT8,
     T,
+    TAG_BOOL,
     TAG_NONE,
+    TAG_SCALAR_BOOL,
     TAG_SCALAR_INT,
     Value,
     bits_f64,
@@ -1196,9 +1198,38 @@ def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
     return True
 
 
+def _pw_is_bool_side(side: Side) -> Bool:
+    if side.is_t:
+        return side.t.value().stype == ST_BOOL
+    return side.s.value().is_bool
+
+
+def _pw_rsub_check(args: Values) raises:
+    """BinaryOps.cpp's sub_check and alpha_check (rsub is sub(other, self,
+    alpha)): no bool operand, no bool alpha (it would need a bool result,
+    which sub_check already refused)."""
+    var a = _pw_is_bool_side(_b_side(args[unsafe_offset=0]))
+    var b = _pw_is_bool_side(_b_side(args[unsafe_offset=1]))
+    if a and b:
+        raise Error(
+            "Subtraction, the `-` operator, with two bool tensors is not"
+            " supported. Use the `^` or `logical_xor()` operator instead."
+        )
+    if a or b:
+        raise Error(
+            "Subtraction, the `-` operator, with a bool tensor is not"
+            " supported. If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+    var alpha = args[unsafe_offset=2].tag
+    if alpha == TAG_SCALAR_BOOL or alpha == TAG_BOOL:
+        raise Error("Boolean alpha only supported for Boolean results.")
+
+
 # aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
 # aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
 def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_rsub_check(args)
     if not _pw_rsub_alpha(args, rets, -1):
         op_rsub(args, n_args, rets, n_rets)
 
@@ -1208,6 +1239,7 @@ def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_rsub_out_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    _pw_rsub_check(args)
     if not _pw_rsub_alpha(args, rets, 3):
         op_rsub_out(args, n_args, rets, n_rets)
 
@@ -2705,6 +2737,10 @@ def register_pointwise(site: Site) raises:
     impl[op_lerp_scalar__any, "lerp_.Scalar"](site)
     impl[op_lerp_tensor, "lerp.Tensor"](site)
     impl[op_lerp_tensor_out, "lerp.Tensor_out"](site)
+    impl[op_rsub_any, "rsub.Tensor"](site)
+    impl[op_rsub_any, "rsub.Scalar"](site)
+    impl[op_rsub_out_any, "rsub.Tensor_out"](site)
+    impl[op_rsub_out_any, "rsub.Scalar_out"](site)
     impl[op_pow_scalar_base, "pow.Scalar"](site)
     impl[op_pow_scalar_base_out, "pow.Scalar_out"](site)
     impl[op_pow_scalar_any, "pow.Tensor_Scalar"](site)

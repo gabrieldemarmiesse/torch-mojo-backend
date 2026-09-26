@@ -46,6 +46,9 @@ ARITH_OPS = {
     "sub.Tensor": torch.sub,
     "mul.Tensor": torch.mul,
     "div.Tensor": torch.div,
+    "rsub.Tensor": torch.rsub,
+    # b is unused: rsub.Scalar embeds the number in the one sub launch.
+    "rsub.Scalar": lambda a, b: torch.rsub(a, 2.0),
 }
 MINMAX_OPS = {"maximum": torch.maximum, "minimum": torch.minimum}
 COMPARE_OPS = {
@@ -162,6 +165,8 @@ SKIPPED: dict[str, str] = {
     "aten::pow.Tensor_Tensor_out": _OUT,
     "aten::remainder.Scalar_out": _OUT,
     "aten::remainder.Tensor_out": _OUT,
+    "aten::rsub.Scalar_out": _OUT,
+    "aten::rsub.Tensor_out": _OUT,
 }
 
 
