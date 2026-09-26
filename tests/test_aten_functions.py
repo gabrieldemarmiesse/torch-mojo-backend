@@ -5316,6 +5316,34 @@ def test_aten_log2(
     check_outputs(fn, conf, [data])
 
 
+def _compiled_matches_cpu(
+    fn: Callable[..., torch.Tensor],
+    inputs: Sequence[torch.Tensor],
+    *,
+    rtol: float | None = None,
+    atol: float | None = None,
+):
+    """torch.compile(backend=mojo_backend) on CPU tensors against eager CPU:
+    exercises the aten_functions twin, which `check_outputs(conf)` (eager on
+    the mojo device) never reaches."""
+    expected = fn(*inputs)
+    actual = torch.compile(fn, backend=mojo_backend, fullgraph=True)(*inputs)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64, torch.bool])
+def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dtype):
+    call_checker.register(aten_functions.aten_logical_or)
+
+    def fn(x, y):
+        return aten.logical_or(x, y)
+
+    x = torch.tensor([[1, 0, 2, -1], [0, 0, 1, 1]]).to(dtype)
+    y = torch.tensor([3, 0, 0, 0]).to(dtype)
+    check_outputs(fn, conf, [x, y])
+    _compiled_matches_cpu(fn, [x, y])
+
+
 def test_aten_logical_and_bool_tensors(conf: Conf):
     """Test aten.logical_and with boolean tensors"""
 

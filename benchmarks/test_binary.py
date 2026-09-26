@@ -61,7 +61,11 @@ BITWISE_OPS = {
     "bitwise_or": torch.bitwise_or,
     "bitwise_xor": torch.bitwise_xor,
 }
-LOGICAL_OPS = {"logical_and": torch.logical_and, "logical_xor": torch.logical_xor}
+LOGICAL_OPS = {
+    "logical_and": torch.logical_and,
+    "logical_or": torch.logical_or,
+    "logical_xor": torch.logical_xor,
+}
 
 COVERS: dict[str, str] = (
     {f"aten::{name}": "test_arith" for name in ARITH_OPS}
@@ -129,6 +133,11 @@ SKIPPED: dict[str, str] = {
     "aten::bitwise_or.Tensor_out": _OUT,
     "aten::bitwise_xor.Scalar_out": _OUT,
     "aten::bitwise_xor.Tensor_out": _OUT,
+    "aten::logical_and.out": _OUT,
+    "aten::logical_or.out": _OUT,
+    "aten::logical_xor.out": _OUT,
+    "aten::maximum.out": _OUT,
+    "aten::minimum.out": _OUT,
     "aten::remainder.Scalar_out": _OUT,
     "aten::remainder.Tensor_out": _OUT,
 }

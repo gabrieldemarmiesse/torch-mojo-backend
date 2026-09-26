@@ -3448,6 +3448,11 @@ def aten_logical_not(input: MaxTensor) -> MaxTensor:
 
 
 # logical_or(Tensor self, Tensor other) -> Tensor
+@map_to(aten.logical_or)
+def aten_logical_or(input: MaxTensor, other: MaxTensor) -> MaxTensor:
+    input_bool = input if input.dtype == DType.bool else F.not_equal(input, 0)
+    other_bool = other if other.dtype == DType.bool else F.not_equal(other, 0)
+    return F.logical_or(input_bool, other_bool)
 
 
 # logical_xor(Tensor self, Tensor other) -> Tensor
