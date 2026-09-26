@@ -832,13 +832,17 @@ def _trig_reduction_slowpath_d(
 
 @always_inline
 def nv_tan(a: Float64) -> Float64:
-    """`__nv_tan` (libdevice_ir/__nv_tan.ll). NVIDIA only: rcp.approx.ftz.f64.
+    """`__nv_tan` (libdevice_ir/__nv_tan.ll).
+
+    AMD GPUs run the same double algorithm with an IEEE division for the one
+    rcp.approx.ftz.f64 (then refined by the same Newton steps): LLVM has no
+    AMDGPU lowering for a float64 `llvm.sin` / `llvm.cos` ("Cannot select:
+    f64 = fsin"), and ROCm's own tan (ocml `__ocml_tan_f64`, what the
+    hipified jiterator strings call) is a double reduction plus polynomial of
+    the same accuracy. Apple GPUs have no float64 at all.
     """
-    comptime if not is_nvidia_gpu():
-        comptime if is_gpu():
-            return _std_sin(a) / _std_cos(a)
-        else:
-            return _std_tan(a)
+    comptime if not is_gpu():
+        return _std_tan(a)
 
     var z: Float64
     var i = Int32(0)
@@ -881,7 +885,11 @@ def nv_tan(a: Float64) -> Float64:
 
     if (i & Int32(1)) != Int32(0):
         var d = fma(u, z, -(r - z))
-        var r0 = _rcp_approx_ftz_d(r)
+        var r0: Float64
+        comptime if is_nvidia_gpu():
+            r0 = _rcp_approx_ftz_d(r)
+        else:
+            r0 = Float64(1.0) / r
         var nr = fma(-r, r0, Float64(1.0))
         nr = fma(nr, nr, nr)
         var rr = -fma(nr, r0, r0)

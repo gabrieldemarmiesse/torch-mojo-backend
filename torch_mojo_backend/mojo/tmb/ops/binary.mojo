@@ -19,6 +19,7 @@ predicates, temporaries) are private to this file only to keep the port
 conflict-free; they are generic and belong in tmb/ops/common.mojo.
 """
 from std.utils import IndexList
+from std.utils.numerics import nan
 
 from tmb.backend.abi import (
     DEVICE_TYPE_CPU,
@@ -1401,6 +1402,61 @@ def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+# aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
+# aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
+def op_rsub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """other - alpha * self: ATen's rsub is `sub(other, self, alpha)`, and so
+    is this (the scalar form embeds `other` in the one sub launch)."""
+    var lhs = _b_side(args[unsafe_offset=1])
+    var rhs = _b_side(args[unsafe_offset=0])
+    if v_f64(args[unsafe_offset=2]) == 1.0:
+        # `other - self` for a float tensor and a number: one launch.
+        var fast = _b_try_scalar("RsubScalarSpec", rhs, lhs, False, None)
+        if fast.__bool__():
+            _b_ret(rets, fast.value().copy())
+            return
+    var promoted = _rsub_promote(lhs, rhs)
+    if promoted:
+        rhs = _b_tside(promoted.value())
+    var r = _b_sub(lhs, rhs, args[unsafe_offset=2], None)
+    if promoted:
+        release(promoted.value().h)
+    _b_ret(rets, r^)
+
+
+def _rsub_promote(lhs: Side, rhs: Side) raises -> Optional[T]:
+    """`3.5 - int_tensor` is a float result in torch, which the sub cascade's
+    scalar embedding declines: the tensor is cast to the default float dtype
+    first (an owned temporary, None when no cast is needed)."""
+    if lhs.is_t or not rhs.is_t:
+        return None
+    var s = lhs.s.value().copy()
+    var t = rhs.t.value().copy()
+    if s.is_int or s.is_bool or _b_float3(t.stype) or t.stype == ST_FLOAT64:
+        return None
+    var casted = cast_for_copy(t, default_dtype())
+    if casted.h == t.h:
+        return None
+    return casted^
+
+
+# aten::rsub.Tensor_out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
+# aten::rsub.Scalar_out(Tensor self, Scalar other, Scalar alpha=1, *, Tensor(a!) out) -> Tensor(a!)
+def op_rsub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var lhs = _b_side(args[unsafe_offset=1])
+    var rhs = _b_side(args[unsafe_offset=0])
+    var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
+    _b_no_overlap_side(dest, lhs)
+    _b_no_overlap_side(dest, rhs)
+    var promoted = _rsub_promote(lhs, rhs)
+    if promoted:
+        rhs = _b_tside(promoted.value())
+    var r = _b_sub(lhs, rhs, args[unsafe_offset=2], Optional[T](dest.copy()))
+    if promoted:
+        release(promoted.value().h)
+    _b_store_out(rets, dest, r^)
+
+
 # aten::mul.Tensor(Tensor self, Tensor other) -> Tensor
 def op_mul_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if _b_fast_route("MulSpec", "MulScalarSpec", False, args, rets, 0):
@@ -1732,6 +1788,30 @@ def _b_simple(op: StaticString, args: Values, rets: Values) raises:
     )
 
 
+def _b_simple_out(
+    op: StaticString, args: Values, rets: Values, out_index: Int
+) raises:
+    """`out=` twin of `_b_simple`: the result is written straight into `out`
+    when it already has the result's dtype, shape and a dense layout, and
+    computed then copied (cast) into it otherwise."""
+    var lhs = _b_side(args[unsafe_offset=0])
+    var rhs = _b_side(args[unsafe_offset=1])
+    var dest = _b_out_tensor(
+        args[unsafe_offset=out_index], _b_device_of(lhs, rhs)
+    )
+    _b_no_overlap_side(dest, lhs)
+    _b_no_overlap_side(dest, rhs)
+    _b_store_out(
+        rets, dest, _b_binary(op, lhs, rhs, Int32(-1), Optional[T](dest.copy()))
+    )
+
+
+def _b_pow_float_base(lhs: Side) raises:
+    # The kernel raises on integers, which would leave the output unwritten.
+    if not lhs.is_t or not _b_is_floating(lhs.t.value().stype):
+        unsupported("pow.Tensor_Tensor on a tensor that is not float")
+
+
 # aten::pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
 def op_pow_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if _b_fast_route("", "PowScalarSpec", False, args, rets, 0):
@@ -1749,23 +1829,117 @@ def op_pow_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_ret(rets, _b_binary("PowSpec", lhs, rhs, Int32(-1), None))
 
 
+# aten::pow.Tensor_Scalar_out(Tensor self, Scalar exponent, *, Tensor(a!) out) -> Tensor(a!)
+def op_pow_scalar_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _b_fast_route(
+        "",
+        "PowScalarSpec",
+        False,
+        args,
+        rets,
+        _b_out_handle(args[unsafe_offset=2]),
+    ):
+        return
+    var lhs = _b_side(args[unsafe_offset=0])
+    var rhs = _b_side(args[unsafe_offset=1])
+    var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
+    _b_no_overlap_side(dest, lhs)
+    var r = _b_try_scalar(
+        "PowScalarSpec", lhs, rhs, False, Optional[T](dest.copy())
+    )
+    if r.__bool__():
+        _b_store_out(rets, dest, r.value().copy())
+        return
+    _b_store_out(
+        rets,
+        dest,
+        _b_binary("PowSpec", lhs, rhs, Int32(-1), Optional[T](dest.copy())),
+    )
+
+
 # aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
 def op_pow_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var lhs = _b_side(args[unsafe_offset=0])
-    # The kernel raises on integers, which would leave the output unwritten.
-    if not lhs.is_t or not _b_is_floating(lhs.t.value().stype):
-        unsupported("pow.Tensor_Tensor on a tensor that is not float")
+    _b_pow_float_base(_b_side(args[unsafe_offset=0]))
     _b_simple("PowSpec", args, rets)
+
+
+# aten::pow.Tensor_Tensor_out(Tensor self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)
+def op_pow_tensor_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_pow_float_base(_b_side(args[unsafe_offset=0]))
+    _b_simple_out("PowSpec", args, rets, 2)
+
+
+def _b_maxmin_res(
+    op: StaticString,
+    bool_op: StaticString,
+    lhs: Side,
+    rhs: Side,
+    dst: Optional[T],
+) raises -> Res:
+    """maximum/minimum. Two bool tensors are torch's `a || b` / `a && b`
+    (MaxMinElementwiseKernel.cu), which the logical kernels compute."""
+    if (
+        lhs.is_t
+        and rhs.is_t
+        and lhs.t.value().stype == ST_BOOL
+        and rhs.t.value().stype == ST_BOOL
+    ):
+        return _b_binary(bool_op, lhs, rhs, ST_BOOL, dst)
+    return _b_binary(op, lhs, rhs, Int32(-1), dst)
+
+
+def _b_maxmin(
+    op: StaticString, bool_op: StaticString, args: Values, dst: Optional[T]
+) raises -> Res:
+    return _b_maxmin_res(
+        op,
+        bool_op,
+        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=1]),
+        dst,
+    )
+
+
+def _b_maxmin_out(
+    op: StaticString,
+    bool_op: StaticString,
+    args: Values,
+    rets: Values,
+    out_index: Int,
+) raises:
+    var dest = _b_out_tensor(
+        args[unsafe_offset=out_index],
+        _b_device_of(
+            _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+        ),
+    )
+    _b_no_overlap_side(dest, _b_side(args[unsafe_offset=0]))
+    _b_no_overlap_side(dest, _b_side(args[unsafe_offset=1]))
+    _b_store_out(rets, dest, _b_maxmin(op, bool_op, args, dest.copy()))
 
 
 # aten::maximum(Tensor self, Tensor other) -> Tensor
 def op_maximum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_simple("MaximumSpec", args, rets)
+    _b_ret(rets, _b_maxmin("MaximumSpec", "LogicalOrSpec", args, None))
+
+
+# aten::maximum.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+def op_maximum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _b_maxmin_out("MaximumSpec", "LogicalOrSpec", args, rets, 2)
 
 
 # aten::minimum(Tensor self, Tensor other) -> Tensor
 def op_minimum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_simple("MinimumSpec", args, rets)
+    _b_ret(rets, _b_maxmin("MinimumSpec", "LogicalAndSpec", args, None))
+
+
+# aten::minimum.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+def op_minimum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _b_maxmin_out("MinimumSpec", "LogicalAndSpec", args, rets, 2)
 
 
 # aten::remainder.Tensor(Tensor self, Tensor other) -> Tensor
@@ -1774,6 +1948,14 @@ def op_minimum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_remainder(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # Divisor-signed remainder (Python/torch `%`), float and int dtypes.
     _b_simple("RemainderSpec", args, rets)
+
+
+# aten::remainder.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+# aten::remainder.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+def op_remainder_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_simple_out("RemainderSpec", args, rets, 2)
 
 
 # aten::floor_divide(Tensor self, Tensor other) -> Tensor
@@ -1808,16 +1990,38 @@ def op_bitwise_xor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_simple("BitwiseXorSpec", args, rets)
 
 
+# aten::bitwise_and.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+# aten::bitwise_and.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
+def op_bitwise_and_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_simple_out("BitwiseAndSpec", args, rets, 2)
+
+
+# aten::bitwise_or.Tensor_out / .Scalar_out
+def op_bitwise_or_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_simple_out("BitwiseOrSpec", args, rets, 2)
+
+
+# aten::bitwise_xor.Tensor_out / .Scalar_out
+def op_bitwise_xor_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_simple_out("BitwiseXorSpec", args, rets, 2)
+
+
 # ---------------------------------------------------------------------------
-# logical_and / logical_xor
+# logical_and / logical_or / logical_xor
 # ---------------------------------------------------------------------------
 
 
-def _b_logical(op: StaticString, args: Values, rets: Values) raises:
+def _b_logical_res(
+    op: StaticString, lhs: Side, rhs: Side, dst: Optional[T]
+) raises -> Res:
     """The promoted route when torch's promotion covers the pair, else each
     operand reduced to bool first (the old `_try_logical`)."""
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
     if lhs.is_t and rhs.is_t:
         var a = lhs.t.value().copy()
         var b = rhs.t.value().copy()
@@ -1832,13 +2036,37 @@ def _b_logical(op: StaticString, args: Values, rets: Values) raises:
             var ba = _b_cast(a, ST_BOOL)
             var bb = _b_cast(b, ST_BOOL)
             var res = _b_binary(
-                op, _b_tside(ba.t), _b_tside(bb.t), ST_BOOL, None
+                op, _b_tside(ba.t), _b_tside(bb.t), ST_BOOL, dst
             )
             _ = ba
             _ = bb
-            _b_ret(rets, res^)
-            return
-    _b_ret(rets, _b_binary(op, lhs, rhs, ST_BOOL, None))
+            return res^
+    return _b_binary(op, lhs, rhs, ST_BOOL, dst)
+
+
+def _b_logical(op: StaticString, args: Values, rets: Values) raises:
+    _b_ret(
+        rets,
+        _b_logical_res(
+            op,
+            _b_side(args[unsafe_offset=0]),
+            _b_side(args[unsafe_offset=1]),
+            None,
+        ),
+    )
+
+
+def _b_logical_out(op: StaticString, args: Values, rets: Values) raises:
+    """`out=` twin of `_b_logical`: the bool result, written straight into a
+    bool `out` or cast into any other dtype (torch's comparison iterator)."""
+    var lhs = _b_side(args[unsafe_offset=0])
+    var rhs = _b_side(args[unsafe_offset=1])
+    var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
+    _b_no_overlap_side(dest, lhs)
+    _b_no_overlap_side(dest, rhs)
+    _b_store_out(
+        rets, dest, _b_logical_res(op, lhs, rhs, Optional[T](dest.copy()))
+    )
 
 
 # aten::logical_and(Tensor self, Tensor other) -> Tensor
@@ -1846,9 +2074,35 @@ def op_logical_and(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_logical("LogicalAndSpec", args, rets)
 
 
+# aten::logical_and.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+def op_logical_and_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_logical_out("LogicalAndSpec", args, rets)
+
+
+# aten::logical_or(Tensor self, Tensor other) -> Tensor
+def op_logical_or(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _b_logical("LogicalOrSpec", args, rets)
+
+
+# aten::logical_or.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+def op_logical_or_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_logical_out("LogicalOrSpec", args, rets)
+
+
 # aten::logical_xor(Tensor self, Tensor other) -> Tensor
 def op_logical_xor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_logical("LogicalXorSpec", args, rets)
+
+
+# aten::logical_xor.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+def op_logical_xor_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_logical_out("LogicalXorSpec", args, rets)
 
 
 # ---------------------------------------------------------------------------
@@ -1870,36 +2124,120 @@ def _b_clamp_dtype(self_stype: Int32, lo: Value, hi: Value) -> Int32:
     return default_dtype()
 
 
-def _b_clamp(self: T, lo: Value, hi: Value) raises -> Res:
+def _b_is_nan_bound(v: Value) raises -> Bool:
+    if v_is_none(v) or _b_scalar_is_int(v):
+        return False
+    var f = v_f64(v)
+    return f != f
+
+
+def _b_clamp(
+    self: T,
+    lo: Value,
+    hi: Value,
+    dst: Optional[T] = None,
+    single_bound_op: Bool = False,
+) raises -> Res:
+    """clamp / clamp_min / clamp_max with Scalar bounds.
+
+    A NaN bound fills the result with NaN (ATen's clamp_out / clamp_min_out
+    / clamp_max_out), except for `clamp` given ONE bound: there the
+    clamp_min/max scalar kernel runs and its `::max(v, NaN)` keeps `v`
+    (measured on CUDA and CPU torch 2.11: `torch.clamp(x, min=nan)` is `x`).
+    `single_bound_op` is True for clamp_min / clamp_max.
+    """
     var has_min = not v_is_none(lo)
     var has_max = not v_is_none(hi)
     if not has_min and not has_max:
-        unsupported("clamp with neither min nor max")
+        raise Error(
+            "torch.clamp: At least one of 'min' or 'max' must not be None"
+        )
     var result_stype = _b_clamp_dtype(self.stype, lo, hi)
-    if not _b_bcast_dtype(result_stype) or result_stype == ST_FLOAT64:
+    if not _b_bcast_dtype(result_stype) or (
+        result_stype == ST_FLOAT64 and dev(self.device)[].api == "metal"
+    ):
         unsupported("clamp producing dtype " + String(result_stype))
+    var lo_nan = _b_is_nan_bound(lo)
+    var hi_nan = _b_is_nan_bound(hi)
+    if (lo_nan or hi_nan) and not single_bound_op and not (has_min and has_max):
+        # One NaN bound to clamp: the other side is open, the value is kept.
+        var kept = own(
+            new_tensor(self.shape, self.rank, result_stype, self.device)
+        )
+        var casted = _b_ready(self, result_stype, False)
+        _b_copy_into(kept.t, casted.t)
+        _ = casted
+        return Res(kept.take(), True)
+    if lo_nan or hi_nan:
+        # ATen's clamp_out: a NaN bound fills the whole result with NaN.
+        var filled = own(
+            new_tensor(self.shape, self.rank, result_stype, self.device)
+        )
+        if filled.t.numel > 0:
+            _b_fill_spec(filled.t, nan[DType.float64]())
+        return Res(filled.take(), True)
     var lo_v = v_f64(lo) if has_min else 0.0
     var hi_v = v_f64(hi) if has_max else 0.0
     var src = _b_ready(self, result_stype, True)
+    if dst:
+        var d = dst.value().copy()
+        # Flat kernel: out[i] from in[i], exact even when `d` is `self`.
+        if (
+            d.contig
+            and d.stype == result_stype
+            and d.device == self.device
+            and d.same_shape(src.t)
+        ):
+            _b_clamp_launch(d, src.t, lo_v, hi_v, has_min, has_max)
+            _ = src
+            return Res(d^, False)
     var out = own(new_like(src.t))
-    if out.t.numel > 0:
-        var ctx = ctx_for(self.device)
-        var call = KernelCall("logic", "ClampScalar")
-        call.arg_dtype(0, src.t.dtype)
-        call.out_dtype(out.t.dtype)
-        call.int(out.t.ptr)
-        call.int(src.t.ptr)
-        call.f64(lo_v)
-        call.f64(hi_v)
-        call.int(1 if has_min else 0)
-        call.int(1 if has_max else 0)
-        call.int(out.t.numel)
-        call.int(dtype_code(src.t.dtype))
-        call.int(ctx_ptr(ctx))
-        call.run()
-        _ = ctx
+    _b_clamp_launch(out.t, src.t, lo_v, hi_v, has_min, has_max)
     _ = src
     return Res(out.take(), True)
+
+
+def _b_clamp_launch(
+    dst: T, src: T, lo: Float64, hi: Float64, has_min: Bool, has_max: Bool
+) raises:
+    """logic ClampScalar over two contiguous tensors of one dtype."""
+    if dst.numel == 0:
+        return
+    var ctx = ctx_for(src.device)
+    var call = KernelCall("logic", "ClampScalar")
+    call.arg_dtype(0, src.dtype)
+    call.out_dtype(dst.dtype)
+    call.int(dst.ptr)
+    call.int(src.ptr)
+    call.f64(lo)
+    call.f64(hi)
+    call.int(1 if has_min else 0)
+    call.int(1 if has_max else 0)
+    call.int(dst.numel)
+    call.int(dtype_code(src.dtype))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+
+
+def _b_none() -> Value:
+    return Value(TAG_NONE, 0, 0, 0)
+
+
+def _b_clamp_out(
+    args: Values,
+    rets: Values,
+    lo: Value,
+    hi: Value,
+    out_index: Int,
+    single_bound_op: Bool,
+) raises:
+    var self = _b_self(args[unsafe_offset=0], "clamp")
+    var dest = _b_out_tensor(args[unsafe_offset=out_index], self.device)
+    _b_no_partial_overlap(dest, self)
+    _b_store_out(
+        rets, dest, _b_clamp(self, lo, hi, dest.copy(), single_bound_op)
+    )
 
 
 # aten::clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
@@ -1912,6 +2250,84 @@ def op_clamp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             args[unsafe_offset=2],
         ),
     )
+
+
+# aten::clamp.out(Tensor self, Scalar? min=None, Scalar? max=None, *, Tensor(a!) out) -> Tensor(a!)
+def op_clamp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _b_clamp_out(
+        args, rets, args[unsafe_offset=1], args[unsafe_offset=2], 3, False
+    )
+
+
+# aten::clamp_min(Tensor self, Scalar min) -> Tensor
+def op_clamp_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _b_ret(
+        rets,
+        _b_clamp(
+            _b_self(args[unsafe_offset=0], "clamp_min"),
+            args[unsafe_offset=1],
+            _b_none(),
+            None,
+            True,
+        ),
+    )
+
+
+# aten::clamp_min.out(Tensor self, Scalar min, *, Tensor(a!) out) -> Tensor(a!)
+def op_clamp_min_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_clamp_out(args, rets, args[unsafe_offset=1], _b_none(), 2, True)
+
+
+# aten::clamp_max(Tensor self, Scalar max) -> Tensor
+def op_clamp_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _b_ret(
+        rets,
+        _b_clamp(
+            _b_self(args[unsafe_offset=0], "clamp_max"),
+            _b_none(),
+            args[unsafe_offset=1],
+            None,
+            True,
+        ),
+    )
+
+
+# aten::clamp_max.out(Tensor self, Scalar max, *, Tensor(a!) out) -> Tensor(a!)
+def op_clamp_max_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_clamp_out(args, rets, _b_none(), args[unsafe_offset=1], 2, True)
+
+
+# aten::clamp_min.Tensor(Tensor self, Tensor min) -> Tensor
+# ATen's clamp_min_Tensor_out is maximum_stub; clamp_max's is minimum_stub.
+def op_clamp_min_tensor(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_ret(rets, _b_maxmin("MaximumSpec", "LogicalOrSpec", args, None))
+
+
+# aten::clamp_min.Tensor_out(Tensor self, Tensor min, *, Tensor(a!) out) -> Tensor(a!)
+def op_clamp_min_tensor_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_maxmin_out("MaximumSpec", "LogicalOrSpec", args, rets, 2)
+
+
+# aten::clamp_max.Tensor(Tensor self, Tensor max) -> Tensor
+def op_clamp_max_tensor(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_ret(rets, _b_maxmin("MinimumSpec", "LogicalAndSpec", args, None))
+
+
+# aten::clamp_max.Tensor_out(Tensor self, Tensor max, *, Tensor(a!) out) -> Tensor(a!)
+def op_clamp_max_tensor_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_maxmin_out("MinimumSpec", "LogicalAndSpec", args, rets, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -2168,11 +2584,6 @@ def _b_lerp(args: Values, dst: Optional[T] = None) raises -> Res:
     return res^
 
 
-# aten::lerp.Scalar(Tensor self, Tensor end, Scalar weight) -> Tensor
-def op_lerp_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_ret(rets, _b_lerp(args))
-
-
 # aten::lerp_.Scalar(Tensor(a!) self, Tensor end, Scalar weight) -> Tensor(a!)
 def op_lerp_scalar_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -2181,16 +2592,6 @@ def op_lerp_scalar_(
     _b_inplace_destination(dest)
     _b_inplace_operand(dest, v_tensor(args[unsafe_offset=1]))
     _b_store_inplace(rets, dest, _b_lerp(args, dest.copy()))
-
-
-# aten::lerp.Scalar_out(Tensor self, Tensor end, Scalar weight, *, Tensor(a!) out) -> Tensor(a!)
-def op_lerp_scalar_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var dest = _b_out_tensor(
-        args[unsafe_offset=3], v_tensor(args[unsafe_offset=0]).device
-    )
-    _b_store_out(rets, dest, _b_lerp(args, dest.copy()))
 
 
 # ---------------------------------------------------------------------------
@@ -2219,9 +2620,6 @@ def register_binary(site: Site) raises:
     impl[op_div_out_mode, "div.out_mode"](site)
     impl[op_floor_divide, "floor_divide"](site)
     impl[op_floor_divide, "floor_divide.Scalar"](site)
-    impl[op_lerp_scalar, "lerp.Scalar"](site)
-    impl[op_lerp_scalar_, "lerp_.Scalar"](site)
-    impl[op_lerp_scalar_out, "lerp.Scalar_out"](site)
     impl[op_logical_and, "logical_and"](site)
     impl[op_logical_xor, "logical_xor"](site)
     impl[op_maximum, "maximum"](site)
@@ -2230,8 +2628,6 @@ def register_binary(site: Site) raises:
     impl[op_mul_, "mul_.Tensor"](site)
     impl[op_mul_, "mul_.Scalar"](site)
     impl[op_mul_out, "mul.out"](site)
-    impl[op_pow_scalar, "pow.Tensor_Scalar"](site)
-    impl[op_pow_tensor, "pow.Tensor_Tensor"](site)
     impl[op_remainder, "remainder.Scalar"](site)
     impl[op_remainder, "remainder.Scalar_Tensor"](site)
     impl[op_remainder, "remainder.Tensor"](site)

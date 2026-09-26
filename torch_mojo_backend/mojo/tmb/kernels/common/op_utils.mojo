@@ -6,6 +6,7 @@
 # pointer that `device._device_context_ptr()` hands us on the Python side.
 # ===----------------------------------------------------------------------=== #
 
+from tmb.kernels.common.cuda_math import nv_fmodf
 from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.math_utils import custom_tan, ieee_sqrt
 
@@ -29,6 +30,7 @@ from std.sys.info import (
     _has_sm_9x,
     has_accelerator,
     has_apple_gpu_accelerator,
+    is_nvidia_gpu,
     simd_width_of,
     size_of,
 )
@@ -180,35 +182,96 @@ def _fmod_narrow_float_exact_scalar(
     return bitcast[DType.float32, 1](result_bits)
 
 
+def _fmod_f64_exact_scalar(x: Float64, y: Float64) -> Float64:
+    """Exact float64 `fmod(x, y)` (sign of `x`, C semantics): musl's `fmod`,
+    bit-serial long division on the 53-bit mantissas, so no quotient is
+    ever formed and the result is exact for every ratio (what CUDA's and
+    ROCm's double `::fmod` return). Not inlined, like the float32 twin."""
+    var ux = bitcast[DType.uint64, 1](x)
+    var uy = bitcast[DType.uint64, 1](y)
+    var ex = Int((ux >> UInt64(52)) & UInt64(0x7FF))
+    var ey = Int((uy >> UInt64(52)) & UInt64(0x7FF))
+    var sx = ux & UInt64(0x8000000000000000)
+    var ax = ux << UInt64(1)
+    var ay = uy << UInt64(1)
+    # A zero divisor, a NaN divisor, or a non-finite dividend: NaN.
+    if ay == UInt64(0) or ay > UInt64(0xFFE0000000000000) or ex == 0x7FF:
+        return bitcast[DType.float64, 1](UInt64(0x7FF8000000000000))
+    if ax <= ay:
+        if ax == ay:
+            return bitcast[DType.float64, 1](sx)
+        return x
+    # Normalize both mantissas (subnormals by hand).
+    var mx: UInt64
+    if ex == 0:
+        var i = ux << UInt64(12)
+        while (i >> UInt64(63)) == UInt64(0):
+            ex -= 1
+            i = i << UInt64(1)
+        mx = ux << UInt64(-ex + 1)
+    else:
+        mx = (ux & UInt64(0x000FFFFFFFFFFFFF)) | UInt64(0x0010000000000000)
+    var my: UInt64
+    if ey == 0:
+        var i = uy << UInt64(12)
+        while (i >> UInt64(63)) == UInt64(0):
+            ey -= 1
+            i = i << UInt64(1)
+        my = uy << UInt64(-ey + 1)
+    else:
+        my = (uy & UInt64(0x000FFFFFFFFFFFFF)) | UInt64(0x0010000000000000)
+    while ex > ey:
+        var d = mx - my
+        if (d >> UInt64(63)) == UInt64(0):
+            if d == UInt64(0):
+                return bitcast[DType.float64, 1](sx)
+            mx = d
+        mx = mx << UInt64(1)
+        ex -= 1
+    var d = mx - my
+    if (d >> UInt64(63)) == UInt64(0):
+        if d == UInt64(0):
+            return bitcast[DType.float64, 1](sx)
+        mx = d
+    while (mx >> UInt64(52)) == UInt64(0):
+        mx = mx << UInt64(1)
+        ex -= 1
+    if ex > 0:
+        mx = (mx - UInt64(0x0010000000000000)) | (UInt64(ex) << UInt64(52))
+    else:
+        mx = mx >> UInt64(-ex + 1)
+    return bitcast[DType.float64, 1](mx | sx)
+
+
+@always_inline
+def _fmod_float32(x: Float32, y: Float32) -> Float32:
+    """C's float `fmod`: libdevice's fmodf on NVIDIA (what `::fmod` runs in
+    the CUDA kernels), the exact long division elsewhere (both exact)."""
+    comptime if is_nvidia_gpu():
+        return nv_fmodf(x, y)
+    else:
+        return _fmod_narrow_float_exact_scalar(x, y)
+
+
 @always_inline
 def custom_remainder[
     dtype: DType, width: SIMDLength, //
 ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
     """Elementwise `a % b` with Python/torch semantics -- the result takes the
-    DIVISOR's sign -- exact for every dtype.
+    DIVISOR's sign -- as stock torch computes it on each GPU.
 
     Use this, not Mojo's `%`, wherever a remainder reaches a user-visible
-    result. `%` already follows the divisor's sign for both signed integers
-    and floats, but for the narrow floats (bf16, fp16) it also runs the whole
-    trunc/multiply/subtract decomposition at the operand's own precision,
-    which is not exact whenever `|a / b|` exceeds what that width's mantissa
-    -- or, after promoting to fp32, fp32's 24-bit mantissa -- can represent:
-    the quotient rounds across an integer boundary, or the remainder's low
-    bits are lost outright, or (for bf16 specifically, whose exponent field is
-    as wide as fp32's) the quotient overflows to +/-inf when the divisor is
-    near bf16's smallest normal value. Both narrow floats are therefore routed
-    through the bit-exact fp32 fmod above, plus the divisor-sign fixup that
-    `%` would have applied for us.
-
-    NOT yet routed, and wrong in exactly the same way: float32 and float64,
-    whose own `%` forms the same quotient at their own width. Measured on the
-    mojo device, `torch.remainder` of float32 `16.875` by `4.70197740329e-38`
-    returns `-inf` where CUDA and an fp64 reference both return `0.0`, and
-    `23456.0 % 1e-30` comes back `-1.9e-4` against a true `4.396e-31`. Routing
-    them here too is a correctness improvement that costs what the narrow
-    floats now cost -- roughly 3x the device time of `%` on an H100, measured
-    by `benchmarks/test_binary.py::test_remainder` -- so it is a deliberate
-    open question, not an oversight.
+    result. Mojo's float `%` is the textbook `a - trunc(a / b) * b`, which is
+    not exact whenever `|a / b|` exceeds what the mantissa can represent
+    (the quotient rounds across an integer boundary, the remainder's low bits
+    are lost, or a bf16 quotient overflows): float32 `16.875 % 4.7e-38` came
+    out `-inf`, `23456.0 % 1e-30` `-1.9e-4`. CUDA and ROCm
+    (BinaryRemainderKernel.cu) take the exact `::fmod` and add the divisor
+    when the signs differ: floats do that here (float32 for the half types,
+    rounded once), float64 through an exact double fmod. torch MPS computes
+    `x - y * floor(x / y)` in float (c10::metal::remainder), which is not
+    exact: Apple GPUs keep the exact form too. Integers keep Mojo's `%` (0
+    for a zero divisor, where CUDA's is undefined).
 
     Parameters:
         dtype: Element type of the input and output vector.
@@ -221,18 +284,35 @@ def custom_remainder[
     Returns:
         The elementwise remainder of `a` divided by `b`.
     """
-    comptime if dtype == DType.bfloat16 or dtype == DType.float16:
+    comptime if (
+        dtype == DType.bfloat16
+        or dtype == DType.float16
+        or dtype == DType.float32
+    ):
+        # BinaryRemainderKernel.cu: mod = ::fmod(a, b), then `mod += b` when
+        # it is nonzero and its sign differs from b's (in float, rounded
+        # once for the half types, as c10::Half arithmetic does).
         var af = a.cast[DType.float32]()
         var bf = b.cast[DType.float32]()
-        # `_fmod_narrow_float_exact_scalar` is inherently scalar (it
-        # manipulates one float32 bit pattern), so it runs once per lane --
-        # a compile-time-unrolled loop of 1 at width 1 (a strided kernel,
-        # the scalar tail of a vectorized one, a CPU closure).
+        # The fmods are inherently scalar (one float32 bit pattern), so they
+        # run once per lane -- a compile-time-unrolled loop of 1 at width 1
+        # (a strided kernel, the scalar tail of a vectorized one, a CPU
+        # closure).
         var fmod_val = SIMD[DType.float32, width]()
         comptime for lane in range(width):
-            fmod_val[lane] = _fmod_narrow_float_exact_scalar(af[lane], bf[lane])
-        var mask = (bf.lt(0) ^ af.lt(0)) & fmod_val.ne(0)
+            fmod_val[lane] = _fmod_float32(af[lane], bf[lane])
+        var mask = (bf.lt(0) ^ fmod_val.lt(0)) & fmod_val.ne(0)
         return (fmod_val + mask.select(bf, SIMD[DType.float32, width](0))).cast[
+            dtype
+        ]()
+    elif dtype == DType.float64:
+        var ad = a.cast[DType.float64]()
+        var bd = b.cast[DType.float64]()
+        var fmod_val = SIMD[DType.float64, width]()
+        comptime for lane in range(width):
+            fmod_val[lane] = _fmod_f64_exact_scalar(ad[lane], bd[lane])
+        var mask = (bd.lt(0) ^ fmod_val.lt(0)) & fmod_val.ne(0)
+        return (fmod_val + mask.select(bd, SIMD[DType.float64, width](0))).cast[
             dtype
         ]()
     else:

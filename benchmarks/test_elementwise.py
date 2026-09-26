@@ -43,6 +43,8 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "floor": torch.floor,
     "gelu": F.gelu,
     "isnan": torch.isnan,
+    "isneginf": torch.isneginf,
+    "isposinf": torch.isposinf,
     "log": torch.log,
     "log1p": torch.log1p,
     "log2": torch.log2,
@@ -72,7 +74,13 @@ def _operand(op_name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.
 
 # Registered elementwise ops NOT benchmarked here, and why.  Reconciled
 # against the live registration table by test_coverage.py.
-SKIPPED: dict[str, str] = {}
+_UNARY_OUT = (
+    "out= / in-place plumbing over the kernel test_unary measures (computed "
+    "straight into a fitting destination)"
+)
+SKIPPED: dict[str, str] = {
+    f"aten::{name}": _UNARY_OUT for name in ("isneginf.out", "isposinf.out")
+}
 
 COVERS: dict[str, str] = {f"aten::{name}": "test_unary" for name in UNARY_OPS} | {
     "aten::bitwise_not": "test_bitwise_not",

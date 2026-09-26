@@ -612,11 +612,17 @@ def test_gelu_backward_matches_cpu(mojo_gpu, approximate):
     torch.testing.assert_close(x.grad.cpu(), expected_grad, rtol=rtol, atol=atol)
 
 
-def test_gelu_backward_declines_float16(mojo_gpu):
-    x = torch.randn(3, 4, dtype=torch.float16).to(mojo_gpu).requires_grad_()
-    y = F.gelu(x)
-    with pytest.raises(NotImplementedError):
-        y.backward(torch.ones_like(y))
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+def test_gelu_backward_float16(mojo_gpu, approximate):
+    """float16 has no tuned activation_backward kernel; the pointwise route
+    runs the same GeluBackwardCUDAKernelImpl formula in float."""
+    x_cpu = torch.randn(3, 4, dtype=torch.float16)
+    x = x_cpu.to(mojo_gpu).requires_grad_()
+    F.gelu(x, approximate=approximate).backward(torch.ones_like(x))
+    x_cpu.requires_grad_()
+    F.gelu(x_cpu, approximate=approximate).backward(torch.ones_like(x_cpu))
+    assert x.grad is not None and x_cpu.grad is not None
+    torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=2e-3, atol=2e-3)
 
 
 def test_an_unregistered_op_raises_out_of_the_dispatcher(mojo_gpu):
@@ -1256,3 +1262,81 @@ def test_log2_out(mojo_gpu: str):
     result = torch.log2(data, out=out)
     assert result.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out.cpu(), torch.tensor([-1.0, 0.0, 1.0, 3.0]))
+
+
+# --------------------------------------------------------------------------
+# isposinf / isneginf: one bool-predicate kernel each
+# --------------------------------------------------------------------------
+
+_INF_VALUES = [
+    0.0,
+    -0.0,
+    1.0,
+    -2.5,
+    1e-40,
+    -1e-40,
+    3e38,
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+    -float("nan"),
+]
+
+_INF_PREDICATES = [("isposinf", torch.isposinf), ("isneginf", torch.isneginf)]
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.float64,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+        torch.bool,
+    ],
+)
+@pytest.mark.parametrize(
+    "name,fn", _INF_PREDICATES, ids=[p[0] for p in _INF_PREDICATES]
+)
+def test_inf_predicates(
+    mojo_gpu: str,
+    name: str,
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    dtype: torch.dtype,
+):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    if dtype.is_floating_point:
+        base = torch.tensor(_INF_VALUES, dtype=torch.float64).to(dtype)
+        # half overflow: 3e38 becomes +inf in float16, stays finite in bf16
+        x_cpu = torch.cat([base, torch.randn(37, dtype=torch.float64).to(dtype)])
+    elif dtype == torch.bool:
+        x_cpu = torch.tensor([True, False, True])
+    else:
+        x_cpu = torch.arange(0, 20, dtype=dtype)
+    x = x_cpu.to(mojo_gpu)
+    _reset_native_counts()
+    got = fn(x)
+    # One native op and nothing else: no abs / eq / ne / mul decomposition.
+    assert native.op_counts() == {f"aten::{name}": 1}
+    assert got.dtype == torch.bool
+    assert torch.equal(got.cpu(), fn(x_cpu))
+    # strided input
+    wide = torch.stack([x_cpu, x_cpu.flip(0)], 1)
+    assert torch.equal(fn(wide.to(mojo_gpu).t()).cpu(), fn(wide.t()))
+
+
+@pytest.mark.parametrize("name", ["isposinf", "isneginf"])
+def test_inf_predicates_out(mojo_gpu: str, name: str):
+    fn = getattr(torch, name)
+    x_cpu = torch.tensor(_INF_VALUES)
+    want = getattr(torch, name)(x_cpu)
+    out = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
+    fn(x_cpu.to(mojo_gpu), out=out)
+    assert torch.equal(out.cpu(), want)
+    view = torch.zeros(2, len(_INF_VALUES), dtype=torch.bool, device=mojo_gpu)[1]
+    fn(x_cpu.to(mojo_gpu), out=view)
+    assert torch.equal(view.cpu(), want)

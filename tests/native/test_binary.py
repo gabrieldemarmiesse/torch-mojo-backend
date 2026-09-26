@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from tests.native.conftest import skip_if_metal
-from torch_mojo_backend import aten_functions, native
+from torch_mojo_backend import aten_functions, get_accelerators, native
 
 
 @contextlib.contextmanager
@@ -1462,3 +1462,157 @@ def test_add_above_last_level_cache(mojo_gpu):
     right_cpu = torch.arange(n, dtype=torch.float32) % 733 - 366.0
     out = left_cpu.to(mojo_gpu) + right_cpu.to(mojo_gpu)
     torch.testing.assert_close(out.cpu(), left_cpu + right_cpu, rtol=0, atol=0)
+
+
+# --------------------------------------------------------------------------
+# NaN as true in the logical ops, bool maximum/minimum, NaN clamp bounds
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fn", [torch.logical_and, torch.logical_xor])
+def test_logical_ops_read_nan_as_true(mojo_device, dtype, fn):
+    """NaN is nonzero: fast-math must not fold `NaN != 0` to False."""
+    a_cpu = torch.tensor(
+        [0.0, 1.0, -0.0, -2.0, float("nan"), float("inf")], dtype=dtype
+    )
+    b_cpu = a_cpu.flip(0)
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(fn(a, b).cpu(), fn(a_cpu, b_cpu))
+
+
+def test_maximum_minimum_bool(mojo_device):
+    a_cpu = torch.tensor([True, False, True, False])
+    b_cpu = torch.tensor([True, True, False, False])
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(torch.maximum(a, b).cpu(), torch.maximum(a_cpu, b_cpu))
+    torch.testing.assert_close(torch.minimum(a, b).cpu(), torch.minimum(a_cpu, b_cpu))
+
+
+def test_clamp_nan_bound_fills_nan(mojo_device):
+    a_cpu, a = _both((6,), torch.float32, mojo_device)
+    nan = float("nan")
+    for lo, hi in ((nan, None), (None, nan), (0.0, nan), (nan, 1.0)):
+        torch.testing.assert_close(
+            torch.clamp(a, lo, hi).cpu(), torch.clamp(a_cpu, lo, hi), equal_nan=True
+        )
+
+
+# --------------------------------------------------------------------------
+# pow special values (C99 Annex F, what ::pow / ::powf return on CUDA)
+# --------------------------------------------------------------------------
+
+_POW_SPECIAL = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    0.5,
+    -0.5,
+    2.0,
+    -2.0,
+    3.0,
+    -3.0,
+    2.5,
+    -2.5,
+    1e-30,
+    1e30,
+    -1e30,
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+]
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
+)
+def test_pow_tensor_tensor_special_values(mojo_gpu, dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    base, exp = zip(*[(x, y) for x in _POW_SPECIAL for y in _POW_SPECIAL])
+    x_cpu = torch.tensor(base, dtype=torch.float64).to(dtype)
+    y_cpu = torch.tensor(exp, dtype=torch.float64).to(dtype)
+    # Reference in float64 (CPU half pow widens the same way), rounded once.
+    want = torch.pow(x_cpu.double(), y_cpu.double()).to(dtype)
+    with native_ran("aten::pow.Tensor_Tensor"):
+        got = torch.pow(x_cpu.to(mojo_gpu), y_cpu.to(mojo_gpu))
+    torch.testing.assert_close(got.cpu(), want, equal_nan=True, rtol=1e-6, atol=0)
+    # Large integral and non-integral exponents: no int32 wrap-around.
+    x_cpu = torch.tensor([1.0000001, 0.9999999, -1.0, 1.5, -1.5], dtype=torch.float64)
+    y_cpu = torch.tensor([3e9, 3e9, 3e9 + 1, -5e9, 7.0], dtype=torch.float64)
+    x_cpu, y_cpu = x_cpu.to(dtype), y_cpu.to(dtype)
+    want = torch.pow(x_cpu.double(), y_cpu.double()).to(dtype)
+    got = torch.pow(x_cpu.to(mojo_gpu), y_cpu.to(mojo_gpu))
+    torch.testing.assert_close(got.cpu(), want, equal_nan=True, rtol=2e-6, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "exponent", [float("inf"), float("-inf"), float("nan"), 2.5, -1.5, 7.0]
+)
+def test_pow_tensor_scalar_special_values(mojo_gpu, dtype, exponent):
+    x_cpu = torch.tensor(_POW_SPECIAL, dtype=torch.float64).to(dtype)
+    want = torch.pow(x_cpu.double(), exponent).to(dtype)
+    accelerators = list(get_accelerators())
+    if accelerators[int(mojo_gpu.rsplit(":", 1)[-1])].api == "metal":
+        # 1e30 ** -1.5 is a float32 subnormal, which Apple GPUs flush to
+        # zero (torch MPS's Metal pow too).
+        keep = ~((want != 0) & (want.abs() < torch.finfo(dtype).tiny))
+        x_cpu, want = x_cpu[keep], want[keep]
+    got = torch.pow(x_cpu.to(mojo_gpu), exponent)
+    torch.testing.assert_close(got.cpu(), want, equal_nan=True, rtol=1e-6, atol=0)
+    got = torch.pow(
+        x_cpu.to(mojo_gpu), torch.tensor(exponent, dtype=dtype).to(mojo_gpu)
+    )
+    torch.testing.assert_close(got.cpu(), want, equal_nan=True, rtol=1e-6, atol=0)
+
+
+# --------------------------------------------------------------------------
+# math parity with stock torch on the GPU (CUDA's kernels as the reference)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_remainder_is_exact_at_large_ratios(mojo_gpu, dtype):
+    """BinaryRemainderKernel.cu: ::fmod, then the divisor added when the
+    signs differ. fmod is exact, so the float64 remainder of the same
+    operands, rounded, is the answer; `a - b * floor(a / b)` loses it."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    a = torch.tensor([16.875, 23456.0, -23456.0, 1e30, -7.5, 5.0], dtype=dtype)
+    b = torch.tensor([4.70197740329e-38, 1e-30, 1e-30, 3.3, 2.0, -3.0], dtype=dtype)
+    got = torch.remainder(a.to(mojo_gpu), b.to(mojo_gpu)).cpu()
+    # math.fmod is exact, and an exact fmod of two floats is a float of the
+    # same format: the divisor-sign fixup is then the kernel's one addition.
+    fm = torch.tensor(
+        [math.fmod(x, y) for x, y in zip(a.tolist(), b.tolist())], dtype=dtype
+    )
+    want = torch.where((fm != 0) & ((fm < 0) != (b < 0)), fm + b, fm)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_pow_float64_special_exponents(mojo_gpu):
+    """PowKernel.cu turns exponents 2, 3, -2 into products and 0.5 / -1 into
+    sqrt / reciprocal before the full pow, for float64 too."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    torch.manual_seed(1)
+    x = torch.rand(513, dtype=torch.float64) * 7 + 0.01
+    xd = x.to(mojo_gpu)
+    for e, want in (
+        (2.0, x * x),
+        (3.0, x * x * x),
+        (-2.0, 1.0 / (x * x)),
+        (-1.0, 1.0 / x),
+    ):
+        with native_ran("aten::pow.Tensor_Scalar"):
+            got = torch.pow(xd, e)
+        torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
+    # sqrt: the GPU's double sqrt, an ulp from CPU torch's on a few elements
+    # (as stock torch CUDA's own pow(x, 0.5) is).
+    torch.testing.assert_close(
+        torch.pow(xd, 0.5).cpu(), torch.sqrt(x), rtol=2.3e-16, atol=0
+    )
+    # The full pow: within an ulp of the exact value (CUDA's double pow).
+    got = torch.pow(xd, 7.3).cpu()
+    torch.testing.assert_close(got, torch.pow(x, 7.3), rtol=4.5e-16, atol=0)

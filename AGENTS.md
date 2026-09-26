@@ -294,7 +294,8 @@ either implemented in Mojo or `NotImplementedError`.
 1. Write `op_<name>` in the matching
    `torch_mojo_backend/mojo/tmb/ops/<group>.mojo` — `core`, `unary`,
    `binary`, `compare`, `data_movement`, `factories`, `random`, `reductions`,
-   `matmul`, `nn`, `attention`, `foreach`; generic helpers shared by several groups go
+   `matmul`, `nn`, `attention`, `foreach`, `pointwise` (math and parameterized
+   activations with up to three operands); generic helpers shared by several groups go
    in `tmb/ops/common.mojo`. Read the arguments by schema position with the `v_*`
    helpers, build outputs with `new_tensor` / `new_like` / `view_strided`
    (never write into an input unless the schema says so), and set results with

@@ -22,10 +22,13 @@
 
 from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
-from std.math import ceildiv, erf, exp, tanh
+from std.math import ceildiv
 from std.os import abort
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator
 
+from tmb.kernels.common.cuda_math import nv_erff, nv_tanhf
+from tmb.kernels.common.libdevice_port import nv_expf
+from tmb.kernels.common.pointwise_math import _mul_rn
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
@@ -62,9 +65,19 @@ def _exact_grad[
 ](x: SIMD[DType.float32, width], g: SIMD[DType.float32, width]) -> SIMD[
     DType.float32, width
 ]:
-    var cdf = 0.5 * (1.0 + erf(x * _SQRT_HALF))
-    var pdf = _INV_SQRT_2PI * exp(-0.5 * (x * x))
-    return g * (cdf + x * pdf)
+    # GeluBackwardCUDAKernelImpl's erf branch with the libdevice erff / expf
+    # it calls (std.math's exp is ex2.approx on NVIDIA, a few ulp off).
+    var e = SIMD[DType.float32, width]()
+    var ex = SIMD[DType.float32, width]()
+    var arg = x * _SQRT_HALF
+    var sq = -0.5 * x * x
+    comptime for i in range(width):
+        e[i] = nv_erff(arg[i])
+        ex[i] = nv_expf(sq[i])
+    var cdf = 0.5 * (1.0 + e)
+    var pdf = ex * _INV_SQRT_2PI
+    # nvcc's contraction: fma(1 + erf, 0.5, x * pdf), x * pdf rounded.
+    return g * (cdf + _mul_rn(x, pdf))
 
 
 @always_inline
@@ -73,13 +86,20 @@ def _tanh_grad[
 ](x: SIMD[DType.float32, width], g: SIMD[DType.float32, width]) -> SIMD[
     DType.float32, width
 ]:
+    # GeluBackwardCUDAKernelImpl's tanh branch, operation for operation, with
+    # libdevice's tanhf: `tanh.approx.f32` (std.math.tanh on NVIDIA) is off by
+    # up to 2^-11 relative, which the cancellation in `0.5 * (1 + t) + ...`
+    # near x = -3 turned into ~6e-3 relative error in the gradient.
     var x2 = x * x
     var inner = _BETA * (x + _KAPPA * (x2 * x))
-    var t = tanh(inner)
-    var derivative = 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * _BETA * (
-        1.0 + 3.0 * _KAPPA * x2
-    )
-    return g * derivative
+    var t = SIMD[DType.float32, width]()
+    comptime for i in range(width):
+        t[i] = nv_tanhf(inner[i])
+    var left = 0.5 * x
+    var left_derivative = 0.5 * (1.0 + t)
+    var inner_derivative = _BETA * (1.0 + 3.0 * _KAPPA * x2)
+    var right_derivative = left * (1.0 - t * t) * inner_derivative
+    return g * (left_derivative + right_derivative)
 
 
 @__name("gelu_backward_exact")

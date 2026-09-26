@@ -24,8 +24,9 @@
 from std.os import abort
 from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
-from std.math import ceildiv, pow
+from std.math import ceildiv
 from std.memory import bitcast
+from std.utils.numerics import isnan
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
@@ -33,6 +34,7 @@ from std.utils import IndexList
 
 from tmb.kernels.common.div_math import floor_div, trunc_div
 from tmb.kernels.common.gpu_elementwise import elementwise
+from tmb.kernels.common.pow_math import torch_pow
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
@@ -108,6 +110,7 @@ comptime COP_GT = 4
 comptime COP_GE = 5
 comptime COP_LAND = 6
 comptime COP_LXOR = 7
+comptime COP_LOR = 8
 
 
 @always_inline
@@ -135,6 +138,8 @@ def _op_token[op_code: Int, is_cmp: Bool]() -> StaticString:
             return "logical_and"
         comptime if op_code == COP_LXOR:
             return "logical_xor"
+        comptime if op_code == COP_LOR:
+            return "logical_or"
     else:
         comptime if op_code == BOP_ADD:
             return "add"
@@ -242,6 +247,28 @@ def _add_f32_bf16_contig(
 
 
 @always_inline
+def _nonzero[
+    dtype: DType, width: Int
+](a: SIMD[dtype, width]) -> SIMD[DType.bool, width]:
+    """`a != 0` as torch's logical ops read it: NaN is nonzero.
+
+    Floats test their magnitude bits instead of comparing: the GPU build's
+    fast-math flags let LLVM assume no NaN and fold `NaN != 0` to False,
+    which made `logical_or(nan, 0)` False.
+    """
+    comptime if dtype.is_floating_point():
+        comptime bits = DType.uint64 if size_of[dtype]() == 8 else (
+            DType.uint32 if size_of[dtype]() == 4 else DType.uint16
+        )
+        comptime magnitude = ~(
+            Scalar[bits](1) << Scalar[bits](size_of[dtype]() * 8 - 1)
+        )
+        return (bitcast[bits, width](a) & magnitude).ne(0)
+    else:
+        return a.ne(SIMD[dtype, width](0))
+
+
+@always_inline
 def _bin_vec_op[
     dtype: DType,
     out_dtype: DType,
@@ -281,13 +308,17 @@ def _bin_vec_op[
             return a.gt(b).cast[out_dtype]()
         comptime if op_code == COP_GE:
             return a.ge(b).cast[out_dtype]()
-        comptime if op_code == COP_LAND or op_code == COP_LXOR:
+        comptime if (
+            op_code == COP_LAND or op_code == COP_LXOR or op_code == COP_LOR
+        ):
             # Logical ops test each operand for nonzero-ness, then combine.
             # Output is bool regardless of the (arbitrary) input dtype.
-            var la = a.ne(SIMD[dtype, width](0))
-            var lb = b.ne(SIMD[dtype, width](0))
+            var la = _nonzero(a)
+            var lb = _nonzero(b)
             comptime if op_code == COP_LAND:
                 return (la & lb).cast[out_dtype]()
+            elif op_code == COP_LOR:
+                return (la | lb).cast[out_dtype]()
             else:
                 return (la ^ lb).cast[out_dtype]()
     else:
@@ -300,10 +331,15 @@ def _bin_vec_op[
         comptime if op_code == BOP_DIV:
             comptime if dtype.is_floating_point():
                 return (a / b).cast[out_dtype]()
-        comptime if op_code == BOP_MAX:
-            return max(a, b).cast[out_dtype]()
-        comptime if op_code == BOP_MIN:
-            return min(a, b).cast[out_dtype]()
+        comptime if op_code == BOP_MAX or op_code == BOP_MIN:
+            var r = max(a, b) if op_code == BOP_MAX else min(a, b)
+            comptime if dtype.is_floating_point():
+                # MaxMinElementwiseKernel.cu propagates a NaN operand; the
+                # bit-based isnan survives the fast-math flags under which
+                # max/min may drop it.
+                r = isnan(b).select(b, r)
+                r = isnan(a).select(a, r)
+            return r.cast[out_dtype]()
         comptime if op_code == BOP_AND:
             comptime if not dtype.is_floating_point():
                 return (a & b).cast[out_dtype]()
@@ -337,22 +373,12 @@ def _bin_vec_op[
             else:
                 return trunc_div(a, b).cast[out_dtype]()
         comptime if op_code == BOP_POW:
-            # Float only (gated at the launcher); accumulate halves in
-            # float32 to match torch's numerics. float32 goes through
-            # float64: pow is exp(y * log x), and rounding that product in
-            # float32 costs |y log x| * 2^-24 relative in the result -- 16
-            # ulp at 1e7 on H100, up to 46 on MI300A -- where torch's CPU
-            # powf is correctly rounded. Not on Apple GPUs (no float64).
-            comptime if dtype == DType.float16 or dtype == DType.bfloat16:
-                return pow(
-                    a.cast[DType.float32](), b.cast[DType.float32]()
-                ).cast[out_dtype]()
-            elif dtype == DType.float32 and not has_apple_gpu_accelerator():
-                return pow(
-                    a.cast[DType.float64](), b.cast[DType.float64]()
-                ).cast[out_dtype]()
-            elif dtype.is_floating_point():
-                return pow(a, b).cast[out_dtype]()
+            # Float only (gated at the launcher). pow_math.torch_pow: C's
+            # special cases (infinite / NaN exponents, signed zeros, negative
+            # bases) around the CUDA float powf (float32 and the half types
+            # widened) or a double-double float64 core.
+            comptime if dtype.is_floating_point():
+                return torch_pow(a, b).cast[out_dtype]()
     return a.cast[out_dtype]()
 
 
@@ -969,11 +995,17 @@ def _clamp_scalar[
     @__copy_capture(out_ptr, in_ptr, lo_s, hi_s, has_min, has_max)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
-        var v = in_ptr[unsafe_offset=i]
+        var x = in_ptr[unsafe_offset=i]
+        var v = x
         if has_min != 0:
             v = max(v, lo_s)
         if has_max != 0:
             v = min(v, hi_s)
+        comptime if dtype.is_floating_point():
+            # clamp_scalar_kernel_impl returns a NaN value as is (max/min
+            # may drop it under the GPU build's fast-math flags; the
+            # bit-based isnan survives them).
+            v = isnan(x).select(x, v)
         out_ptr[unsafe_offset=i] = v
 
     _parallel_for[func](size, ctx)
@@ -1005,6 +1037,7 @@ def _clamp_scalar_go(
         DType.float32,
         DType.float16,
         DType.bfloat16,
+        DType.float64,
         DType.int8,
         DType.int16,
         DType.int32,
@@ -1779,6 +1812,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["LogicalXorSpec"]():
             _spec_dispatcher3[
                 _binary_spec_into_go[COP_LXOR, True], "a binary spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["LogicalOrSpec"]():
+            _spec_dispatcher3[
+                _binary_spec_into_go[COP_LOR, True], "a binary spec op"
             ](argv, argc)
             return 0
         comptime if _op_on["BitwiseNot"]():

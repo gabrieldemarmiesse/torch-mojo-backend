@@ -1,7 +1,7 @@
 """Ops composed from registered ops through the dispatcher (`call_op`), with
 fused routes for supported regimes: backward formulas ATen ships as per-backend
 kernels (threshold / sigmoid / tanh / batch norm / group norm / softmax
-backward), the signed-infinity tests, and out= overloads of ops whose
+backward) and out= overloads of ops whose
 functional form exists. Contiguous FP32 tanh backward has a fused Hopper
 route; other regimes retain the composed implementation without changing the
 registration."""
@@ -9,7 +9,6 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
-    ST_BOOL,
     ST_FLOAT32,
     T,
     TAG_BOOL,
@@ -52,10 +51,6 @@ from tmb.ops.common import (
     resize_out,
 )
 from tmb.backend.registry import Site, impl
-
-
-comptime NEG_INF_BITS: Int64 = -4503599627370496  # 0xFFF0000000000000
-comptime POS_INF_BITS: Int64 = 9218868437227405312  # 0x7FF0000000000000
 
 
 def _tensor_value(t: T) -> Value:
@@ -277,57 +272,6 @@ def op_tanh_backward_grad_input(
     )
     release(f.h)
     ret_ref(rets, 0, out)
-
-
-# aten::isneginf(Tensor self) -> Tensor / aten::isposinf(Tensor self) -> Tensor (+ .out):
-# eq.Scalar against the signed infinity (an integer tensor is never infinite:
-# eq against a double that no integer equals is all-false, like ATen).
-def _is_inf(args: Values, rets: Values, bits: Int64, with_out: Bool) raises:
-    var x = v_tensor(args[unsafe_offset=0])
-    var scalar = Value(TAG_SCALAR_DOUBLE, 0, bits, 0)
-    if with_out:
-        var out = v_tensor(args[unsafe_offset=1])
-        if not x.dtype.is_floating_point():
-            resize_out(out, x.shape, x.rank)
-            fill_value(out, 0.0)
-        else:
-            _dispatch_into(
-                "aten::eq",
-                "Scalar_out",
-                [_tensor_value(x), scalar.copy(), _tensor_value(out)],
-                out,
-            )
-        ret_ref(rets, 0, out)
-        return
-    if not x.dtype.is_floating_point():
-        var zeros = own(new_tensor(x.shape, x.rank, ST_BOOL, x.device))
-        fill_value(zeros.t, 0.0)
-        ret_owned(rets, 0, zeros)
-        return
-    var r = own(
-        _dispatch("aten::eq", "Scalar", [_tensor_value(x), scalar.copy()])
-    )
-    ret_owned(rets, 0, r)
-
-
-def op_isneginf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _is_inf(args, rets, NEG_INF_BITS, False)
-
-
-def op_isneginf_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _is_inf(args, rets, NEG_INF_BITS, True)
-
-
-def op_isposinf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _is_inf(args, rets, POS_INF_BITS, False)
-
-
-def op_isposinf_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _is_inf(args, rets, POS_INF_BITS, True)
 
 
 # ---------------------------------------------------------------------------
@@ -1093,10 +1037,6 @@ def register_composed(site: Site) raises:
     impl[op_sigmoid_backward_grad_input, "sigmoid_backward.grad_input"](site)
     impl[op_tanh_backward, "tanh_backward"](site)
     impl[op_tanh_backward_grad_input, "tanh_backward.grad_input"](site)
-    impl[op_isneginf, "isneginf"](site)
-    impl[op_isneginf_out, "isneginf.out"](site)
-    impl[op_isposinf, "isposinf"](site)
-    impl[op_isposinf_out, "isposinf.out"](site)
     impl[op_where_self_out, "where.self_out"](site)
     impl[op_native_batch_norm_backward, "native_batch_norm_backward"](site)
     impl[op_native_group_norm_backward, "native_group_norm_backward"](site)

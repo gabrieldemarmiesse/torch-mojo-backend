@@ -24,12 +24,15 @@
 from tmb.kernels.common.unary_math import (
     elementwise_predicate,
     elementwise_unary,
+    elementwise_unary_param,
+    is_rounding,
+    param_compute_dtype,
 )
 
 from std.os import abort
 from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
-from std.math import ceildiv, pow
+from std.math import ceildiv
 from std.sys.info import (
     has_accelerator,
     has_apple_gpu_accelerator,
@@ -65,6 +68,7 @@ from tmb.kernels.common.op_utils import (
     _raw_tuple_len,
     _spec_dispatcher2,
     _spec_dispatcher3,
+    _spec_dispatcher5,
     _spec_ptr,
 )
 
@@ -80,6 +84,7 @@ from tmb.kernels.common.variant_gates import (
 )
 from tmb.kernels.common.div_math import floor_div, trunc_div
 from tmb.kernels.common.math_utils import ieee_sqrt
+from tmb.kernels.common.pow_math import torch_pow
 from std.sys.info import _has_sm_9x
 
 
@@ -321,6 +326,94 @@ comptime UOP_GELU_NONE = 24
 comptime UOP_GELU_TANH = 25
 comptime UOP_LOG2 = 26
 comptime UOP_ACOSH = 27
+# The float-only ops whose math is a scalar port of torch's CUDA routine
+# (`unary_math.is_scalar_special`) or a rounding (`unary_math.is_rounding`):
+# opcode UOP_TABLE_BASE + i computes kind _TABLE_UOP_KINDS[i], and its spec op
+# is _TABLE_UOP_SPECS[i].
+comptime UOP_TABLE_BASE = 28
+comptime _TABLE_UOP_KINDS: List[StaticString] = [
+    "airy_ai",
+    "angle",
+    "asin",
+    "atan",
+    "bessel_j0",
+    "bessel_j1",
+    "bessel_y0",
+    "bessel_y1",
+    "digamma",
+    "entr",
+    "erfc",
+    "erfcx",
+    "erfinv",
+    "exp2",
+    "expm1",
+    "frac",
+    "i0",
+    "i0e",
+    "i1",
+    "i1e",
+    "lgamma",
+    "log10",
+    "log_ndtr",
+    "modified_bessel_i0",
+    "modified_bessel_i1",
+    "modified_bessel_k0",
+    "modified_bessel_k1",
+    "ndtri",
+    "round",
+    "scaled_modified_bessel_k0",
+    "scaled_modified_bessel_k1",
+    "sinc",
+    "spherical_bessel_j0",
+    "trunc",
+]
+comptime _TABLE_UOP_SPECS: List[StaticString] = [
+    "AiryAiSpec",
+    "AngleSpec",
+    "AsinSpec",
+    "AtanSpec",
+    "BesselJ0Spec",
+    "BesselJ1Spec",
+    "BesselY0Spec",
+    "BesselY1Spec",
+    "DigammaSpec",
+    "EntrSpec",
+    "ErfcSpec",
+    "ErfcxSpec",
+    "ErfinvSpec",
+    "Exp2Spec",
+    "Expm1Spec",
+    "FracSpec",
+    "I0Spec",
+    "I0eSpec",
+    "I1Spec",
+    "I1eSpec",
+    "LgammaSpec",
+    "Log10Spec",
+    "LogNdtrSpec",
+    "ModifiedBesselI0Spec",
+    "ModifiedBesselI1Spec",
+    "ModifiedBesselK0Spec",
+    "ModifiedBesselK1Spec",
+    "NdtriSpec",
+    "RoundSpec",
+    "ScaledModifiedBesselK0Spec",
+    "ScaledModifiedBesselK1Spec",
+    "SincSpec",
+    "SphericalBesselJ0Spec",
+    "TruncSpec",
+]
+
+
+@always_inline
+def _table_uop_kind[op_code: Int]() -> StaticString:
+    comptime assert (
+        op_code >= UOP_TABLE_BASE
+        and op_code < UOP_TABLE_BASE + len(_TABLE_UOP_KINDS)
+    ), "not a table opcode"
+    comptime kind = _TABLE_UOP_KINDS[op_code - UOP_TABLE_BASE]
+    return kind
+
 
 # Below this many elements the expensive half-precision bodies
 # (`is_expensive_half` in `_unary_elementwise`) run faster at W4 than at the
@@ -329,6 +422,88 @@ comptime UOP_ACOSH = 27
 # 4.1 us at W4, 4.7 us at W8); it sits above 357*789 = 281673, the awkward
 # shape of benchmarks/test_elementwise.py. Unmeasured on other GPUs.
 comptime _NARROW_TRANSCENDENTAL_THRESHOLD = 300000
+
+
+# The float32 scalar-port kinds below take 8 lanes per thread, two 16-byte
+# vectors, from `_WIDE_UNARY_MIN` elements up: for these heavy branchy
+# bodies two independent chains per thread beat twice the threads once the
+# grid fills the GPU. Chosen kind by kind with ncu on H100 PCIe at base
+# clocks, 16M uniform [0, 1) inputs, 4 -> 8 lanes (stock torch's vec4
+# kernel in brackets), in us: lgamma 106 -> 90 (87), erfc 83 -> 71 (70),
+# i0 128 -> 111 (109), i0e 117 -> 102 (97), i1 128 -> 112 (110), i1e 85 ->
+# 71 (71), sinc 79 -> 70 (70), log_ndtr 118 -> 102 (105), atan 75 -> 70
+# (68), ndtri 212 -> 199 (211), bessel_j0 77 -> 71 (68), bessel_y0 165 ->
+# 132 (123), bessel_y1 143 -> 125, modified_bessel_i0 128 -> 112 (110),
+# modified_bessel_i1 127 -> 111 (109), modified_bessel_k1 216 -> 200 (193),
+# scaled_modified_bessel_k0 215 -> 199 (188), scaled_modified_bessel_k1
+# 229 -> 214 (205), spherical_bessel_j0 85 -> 72 (72). expm1, entr,
+# digamma, erfinv, airy_ai, bessel_j1 and erfcx measured the same or
+# slower at 8 lanes and stay at 4. Below the threshold the 4-lane launch
+# keeps more threads in flight (small grids).
+comptime _WIDE_UNARY_MIN = 1 << 21
+
+
+@always_inline
+def _unary_heavy[op_code: Int]() -> Bool:
+    """Unary bodies expensive enough for gpu_elementwise's small-grid block
+    choice (`_policy_block`, 8-lane TINY launches): the scalar-port table
+    kinds and the transcendentals that measured faster with it (asinh,
+    atanh, cosh, erf, silu: benchmarks/, f16 / bf16 at 281673 elements, e.g.
+    atanh 1.15 -> 1.05x torch); cos, log, sqrt, reciprocal and the cheap
+    ones measured slower (log f16 0.82 -> 0.89x)."""
+    return (
+        op_code == UOP_ASINH
+        or op_code == UOP_ATANH
+        or op_code == UOP_COSH
+        or op_code == UOP_ERF
+        or op_code == UOP_SILU
+        or _table_special[op_code]()
+    )
+
+
+@always_inline
+def _param_heavy[kind: StaticString]() -> Bool:
+    return kind == "logit" or kind == "polygamma" or kind == "mvlgamma"
+
+
+@always_inline
+def _table_special[op_code: Int]() -> Bool:
+    """A table kind computed by a scalar port (not a rounding): on a half
+    dtype it joins `is_expensive_half` (digamma f16 281673 elements: 19.5
+    us at 8 lanes, torch 16.5; H100 PCIe, ncu base clocks)."""
+    comptime if op_code < UOP_TABLE_BASE:
+        return False
+    else:
+        return not is_rounding[_table_uop_kind[op_code]()]()
+
+
+@always_inline
+def _wide_unary_f32[dtype: DType, op_code: Int]() -> Bool:
+    comptime if dtype != DType.float32 or op_code < UOP_TABLE_BASE:
+        return False
+    else:
+        comptime kind = _table_uop_kind[op_code]()
+        return (
+            kind == "lgamma"
+            or kind == "erfc"
+            or kind == "i0"
+            or kind == "i0e"
+            or kind == "i1"
+            or kind == "i1e"
+            or kind == "sinc"
+            or kind == "log_ndtr"
+            or kind == "atan"
+            or kind == "ndtri"
+            or kind == "bessel_j0"
+            or kind == "bessel_y0"
+            or kind == "bessel_y1"
+            or kind == "modified_bessel_i0"
+            or kind == "modified_bessel_i1"
+            or kind == "modified_bessel_k1"
+            or kind == "scaled_modified_bessel_k0"
+            or kind == "scaled_modified_bessel_k1"
+            or kind == "spherical_bessel_j0"
+        )
 
 
 @always_inline
@@ -353,13 +528,17 @@ def _unary_float64_on[op_code: Int]() -> Bool:
     only available on CPU targets", "DType.float64 is not supported for cos
     on NVIDIA GPU"; LLVM on AMD: "Cannot select: f64 = fcos").
     """
-    return (
-        _unary_is_direct[op_code]()
-        or op_code == UOP_LOG2
-        or op_code == UOP_RECIPROCAL
-        or op_code == UOP_CEIL
-        or op_code == UOP_FLOOR
-    )
+    comptime if op_code >= UOP_TABLE_BASE:
+        # trunc / round / frac / angle are exact in float64.
+        return is_rounding[_table_uop_kind[op_code]()]()
+    else:
+        return (
+            _unary_is_direct[op_code]()
+            or op_code == UOP_LOG2
+            or op_code == UOP_RECIPROCAL
+            or op_code == UOP_CEIL
+            or op_code == UOP_FLOOR
+        )
 
 
 def _unary_contig_kernel[
@@ -441,6 +620,8 @@ def _unary_apply[
         return elementwise_unary["gelu_tanh"](a)
     elif op_code == UOP_LOG2:
         return elementwise_unary["log2"](a)
+    elif op_code >= UOP_TABLE_BASE:
+        return elementwise_unary[_table_uop_kind[op_code]()](a)
     else:
         comptime assert False, "unknown unary opcode"
 
@@ -583,10 +764,21 @@ def _unary_elementwise[
                     or op_code == UOP_LOG1P
                     or op_code == UOP_SINH
                     or op_code == UOP_TAN
+                    or _table_special[op_code]()
                 )
                 comptime if has_nvidia_gpu_accelerator():
                     comptime full_width = 16 // size_of[dtype]()
                     if (Int(out_ptr) | Int(in_ptr)) % 16 == 0:
+                        comptime if _wide_unary_f32[dtype, op_code]():
+                            if size >= _WIDE_UNARY_MIN:
+                                elementwise[
+                                    gpu_func,
+                                    simd_width=8,
+                                    target="gpu",
+                                    _trace_description="modular_unary",
+                                    _heavy=_unary_heavy[op_code](),
+                                ](Coord(size), ctx)
+                                return
                         comptime if is_expensive_half:
                             if size < _NARROW_TRANSCENDENTAL_THRESHOLD:
                                 elementwise[
@@ -594,6 +786,7 @@ def _unary_elementwise[
                                     simd_width=4,
                                     target="gpu",
                                     _trace_description="modular_unary",
+                                    _heavy=_unary_heavy[op_code](),
                                 ](Coord(size), ctx)
                                 return
                         elementwise[
@@ -601,6 +794,58 @@ def _unary_elementwise[
                             simd_width=full_width,
                             target="gpu",
                             _trace_description="modular_unary",
+                            _heavy=_unary_heavy[op_code](),
+                        ](Coord(size), ctx)
+                        return
+                    if (
+                        Int(out_ptr) % 16 == 0
+                        and Int(in_ptr) % (4 * size_of[dtype]()) != 0
+                    ):
+                        # An input view off the vector grid (a slice that
+                        # starts at an odd element): element-aligned loads,
+                        # still one W-lane body and one aligned vector
+                        # store per thread.
+                        @always_inline
+                        @__parameter
+                        @__copy_capture(out_ptr, in_ptr)
+                        def gpu_func_ua[
+                            width: Int, alignment: Int = 1
+                        ](idx: Coord):
+                            var i = Int(idx[0].value())
+                            comptime st_align = min(
+                                16, width * size_of[dtype]()
+                            )
+                            var a = in_ptr.unsafe_load[
+                                width=width, alignment=size_of[dtype]()
+                            ](i)
+                            out_ptr.unsafe_store[
+                                width=width, alignment=st_align
+                            ](i, _unary_apply[dtype, width, op_code](a))
+
+                        # 16 store bytes per thread from 300k elements up:
+                        # H100 PCIe, ncu base clocks, offset_1 16M: f16 neg
+                        # / exp2 / atan 37 / 40 / 47 us at 4 lanes, 33 / 33
+                        # / 40 at 8 (torch's unrolled kernel 39 / 40 / 59);
+                        # f32 is best at 4. Below, 4 lanes: the half-type
+                        # transcendentals ran 1.2-1.6x slower at 8
+                        # (benchmarks/, 281673 elements: digamma, rsqrt,
+                        # sinh, log1p) and the cheap bodies measured even.
+                        comptime if size_of[dtype]() == 2:
+                            if size < _NARROW_TRANSCENDENTAL_THRESHOLD:
+                                elementwise[
+                                    gpu_func_ua,
+                                    simd_width=4,
+                                    target="gpu",
+                                    _trace_description="modular_unary_ua",
+                                    _heavy=_unary_heavy[op_code](),
+                                ](Coord(size), ctx)
+                                return
+                        elementwise[
+                            gpu_func_ua,
+                            simd_width=16 // size_of[dtype](),
+                            target="gpu",
+                            _trace_description="modular_unary_ua",
+                            _heavy=_unary_heavy[op_code](),
                         ](Coord(size), ctx)
                         return
                 if (Int(out_ptr) | Int(in_ptr)) % (4 * size_of[dtype]()) == 0:
@@ -609,6 +854,7 @@ def _unary_elementwise[
                         simd_width=4,
                         target="gpu",
                         _trace_description="modular_unary",
+                        _heavy=_unary_heavy[op_code](),
                     ](Coord(size), ctx)
                     return
             comptime if (
@@ -703,6 +949,11 @@ def _unary_elementwise[
 
 comptime BUOP_ISNAN = 0
 comptime BUOP_LOGICAL_NOT = 1
+comptime BUOP_SIGNBIT = 2
+comptime BUOP_ISINF = 3
+comptime BUOP_ISFINITE = 4
+comptime BUOP_ISPOSINF = 5
+comptime BUOP_ISNEGINF = 6
 
 
 @always_inline
@@ -722,6 +973,16 @@ def _unary_bool_vec[
         # fast-math flags that would fold `a != a` to False; it also returns
         # all-False for integer dtypes.
         return elementwise_predicate["isnan"](a).cast[DType.uint8]()
+    elif op_code == BUOP_SIGNBIT:
+        return elementwise_predicate["signbit"](a).cast[DType.uint8]()
+    elif op_code == BUOP_ISINF:
+        return elementwise_predicate["isinf"](a).cast[DType.uint8]()
+    elif op_code == BUOP_ISFINITE:
+        return elementwise_predicate["isfinite"](a).cast[DType.uint8]()
+    elif op_code == BUOP_ISPOSINF:
+        return elementwise_predicate["isposinf"](a).cast[DType.uint8]()
+    elif op_code == BUOP_ISNEGINF:
+        return elementwise_predicate["isneginf"](a).cast[DType.uint8]()
     else:
         return elementwise_predicate["logical_not"](a).cast[DType.uint8]()
 
@@ -788,6 +1049,33 @@ def _unary_bool[
                         gpu_bool, simd_width=preferred_width, target="gpu"
                     ](Coord(size), ctx)
                     return
+                if (
+                    Int(out_ptr) % 8 == 0
+                    and Int(in_ptr) % (4 * size_of[dtype]()) != 0
+                ):
+                    # An input view off the vector grid: element-aligned
+                    # loads, one aligned bool vector store per thread (as
+                    # in `_unary_elementwise`'s `gpu_func_ua`).
+                    @always_inline
+                    @__parameter
+                    @__copy_capture(out_ptr, in_ptr)
+                    def gpu_bool_ua[width: Int, alignment: Int = 1](idx: Coord):
+                        var i = Int(idx[0].value())
+                        var a = in_ptr.unsafe_load[
+                            width=width, alignment=size_of[dtype]()
+                        ](i)
+                        out_ptr.unsafe_bitcast[UInt8]().unsafe_store[
+                            width=width, alignment=width
+                        ](i, _unary_bool_vec[dtype, op_code, width](a))
+
+                    # 8 lanes for 2-byte inputs, 4 for float32 (H100,
+                    # offset_1 signbit: f16 16M 33 -> 26 us at 8, torch
+                    # 36; f32 281674 elements 5.2 us at 4, 5.4 at 8).
+                    comptime ua_w = 8 if size_of[dtype]() <= 2 else 4
+                    elementwise[gpu_bool_ua, simd_width=ua_w, target="gpu"](
+                        Coord(size), ctx
+                    )
+                    return
             # Keep 64-bit inputs on the previous 16-byte/SIMD2 regime.
             comptime vector_width = min(4, 16 // size_of[dtype]())
             if (
@@ -815,6 +1103,9 @@ comptime SOP_POW = 2
 # scalar to the tensor's dtype first, and trunc there divides in bf16.
 comptime SOP_FLOORDIV = 3
 comptime SOP_TRUNCDIV = 4
+# rsub(Tensor, Scalar other) with alpha 1: other - self in opmath, one
+# rounding (the CUDA sub kernel's fma(-1, self, other)).
+comptime SOP_RSUB = 5
 
 
 @__name("scalar_mul_contig_f32_v4_peel")
@@ -844,6 +1135,44 @@ def _scalar_mul_peel_kernel(
     if tid < size - tail:
         var i = tail + tid
         dst[unsafe_offset=i] = src[unsafe_offset=i] * scalar
+
+
+comptime _POW_GENERAL = 0
+comptime _POW_SQUARE = 1
+comptime _POW_CUBE = 2
+comptime _POW_INV_SQUARE = 3
+comptime _POW_SQRT = 4
+comptime _POW_RSQRT = 5
+comptime _POW_RECIPROCAL = 6
+
+
+@always_inline
+def _pow_scalar_body[
+    dtype: DType, pk: Int, w: Int
+](a: SIMD[DType.float32, w], s: SIMD[DType.float32, w]) -> SIMD[dtype, w]:
+    """pow(a, s) for a scalar exponent, `pk` naming the special exponent
+    the host found (PowKernel.cu's pow_tensor_scalar_kernel_impl computes
+    those in scalar_t: each product rounded to the tensor dtype)."""
+    comptime f32 = DType.float32
+    comptime if pk == _POW_SQUARE:
+        return (a * a).cast[dtype]()
+    elif pk == _POW_CUBE:
+        var sq = (a * a).cast[dtype]().cast[f32]()
+        return (sq * a).cast[dtype]()
+    elif pk == _POW_INV_SQUARE:
+        # `1.0 / (base * base)`: a double quotient of the rounded square,
+        # which rounds to the IEEE float quotient.
+        var sq = (a * a).cast[dtype]().cast[f32]()
+        return (1 / sq).cast[dtype]()
+    elif pk == _POW_SQRT:
+        return elementwise_unary["sqrt"](a).cast[dtype]()
+    elif pk == _POW_RSQRT:
+        return elementwise_unary["rsqrt"](a).cast[dtype]()
+    elif pk == _POW_RECIPROCAL:
+        return elementwise_unary["reciprocal"](a).cast[dtype]()
+    else:
+        # pow_math.torch_pow, as in logic's BOP_POW: C's special cases.
+        return torch_pow(a, s).cast[dtype]()
 
 
 @always_inline
@@ -885,14 +1214,27 @@ def _scalar_elementwise[
                 )
                 return
 
+        # pow: PowKernel.cu converts the exponent to scalar_t
+        # (`exp_scalar.to<scalar_t>()`), so a half tensor's exponent is
+        # rounded to its dtype before the special-exponent tests and the pow
+        # (ROCm runs the same source). torch MPS passes it as a float
+        # (UnaryKernel.mm `pow_tensor_scalar_kernel`), unrounded.
+        var sv = scalar
+        comptime if (
+            op_code == SOP_POW
+            and not has_apple_gpu_accelerator()
+            and (dtype == DType.float16 or dtype == DType.bfloat16)
+        ):
+            sv = scalar.cast[dtype]().cast[DType.float32]()
+
         @always_inline
         @__parameter
-        @__copy_capture(out_ptr, in_ptr, scalar)
-        def body[width: Int, al: Int](i: Int):
+        @__copy_capture(out_ptr, in_ptr, sv)
+        def body[width: Int, al: Int, pk: Int](i: Int):
             var a = in_ptr.unsafe_load[width=width, alignment=al](i).cast[
                 DType.float32
             ]()
-            var s = SIMD[DType.float32, width](scalar)
+            var s = SIMD[DType.float32, width](sv)
             comptime if op_code == SOP_ADD:
                 out_ptr.unsafe_store[width=width, alignment=al](
                     i, (a + s).cast[dtype]()
@@ -910,49 +1252,246 @@ def _scalar_elementwise[
                     i, trunc_div(a, s).cast[dtype]()
                 )
             comptime if op_code == SOP_POW:
-                # float32 through float64, as in logic' BOP_POW (the
-                # float32 exp(y * log x) is up to 16 ulp off on H100)
-                comptime if dtype == DType.float32 and not has_apple_gpu_accelerator():
-                    out_ptr.unsafe_store[width=width, alignment=al](
-                        i,
-                        pow(
-                            a.cast[DType.float64](), s.cast[DType.float64]()
-                        ).cast[dtype](),
-                    )
-                else:
-                    out_ptr.unsafe_store[width=width, alignment=al](
-                        i, pow(a, s).cast[dtype]()
-                    )
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, _pow_scalar_body[dtype, pk](a, s)
+                )
+            comptime if op_code == SOP_RSUB:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, (s - a).cast[dtype]()
+                )
 
         # Element alignment only: the CPU lanes and the GPU scalar lanes may
         # start at any element (a bucket view starts wherever the previous
         # parameter ended).
         @always_inline
         @__parameter
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            body[width, size_of[dtype]()](Int(idx[0].value()))
+        def launch[pk: Int]() raises:
+            @always_inline
+            @__parameter
+            def func[width: Int, alignment: Int = 1](idx: Coord):
+                body[width, size_of[dtype](), pk](Int(idx[0].value()))
 
-        # 16-byte vectors, launched only once both bases proved aligned.
+            # 16-byte vectors once both bases proved aligned; the launcher's
+            # width-1 tail lanes are element-aligned only.
+            @always_inline
+            @__parameter
+            def func_vec[width: Int, alignment: Int = 1](idx: Coord):
+                comptime al = 16 if width > 1 else size_of[dtype]()
+                body[width, al, pk](Int(idx[0].value()))
+
+            # Every vector at 16-byte alignment: only launched when there
+            # is no tail (the route other GPUs keep).
+            @always_inline
+            @__parameter
+            def func_vec_no_tail[width: Int, alignment: Int = 1](idx: Coord):
+                body[width, 16, pk](Int(idx[0].value()))
+
+            comptime if has_accelerator():
+                # scalar lanes moved 1.5 TB/s on H100, vectors ~3.
+                comptime vec = 16 // size_of[dtype]()
+                var aligned = Int(out_ptr) % 16 == 0 and Int(in_ptr) % 16 == 0
+                comptime if has_nvidia_gpu_accelerator():
+                    # Sizes off the vector multiple vectorize too, their
+                    # tail lanes element-aligned (`func_vec`).
+                    if aligned:
+                        elementwise[func_vec, simd_width=vec, target="gpu"](
+                            Coord(size), ctx
+                        )
+                        return
+                else:
+                    if aligned and size % vec == 0:
+                        elementwise[
+                            func_vec_no_tail, simd_width=vec, target="gpu"
+                        ](Coord(size), ctx)
+                        return
+                elementwise[func, simd_width=1, target="gpu"](Coord(size), ctx)
+            else:
+                raise Error("no GPU accelerator available at compile time")
+
+        comptime if op_code == SOP_POW and has_apple_gpu_accelerator():
+            # UnaryKernel.mm's pow_tensor_scalar_kernel: 2 is `sqr`, -1 /
+            # -0.5 / 0.5 the reciprocal / rsqrt / sqrt kernels; the rest
+            # (3 and -2 included) runs the full float pow.
+            if sv == 2:
+                launch[_POW_SQUARE]()
+            elif sv == 0.5:
+                launch[_POW_SQRT]()
+            elif sv == -0.5:
+                launch[_POW_RSQRT]()
+            elif sv == -1:
+                launch[_POW_RECIPROCAL]()
+            else:
+                launch[_POW_GENERAL]()
+        elif op_code == SOP_POW:
+            # PowKernel.cu's pow_tensor_scalar_kernel (CUDA and ROCm):
+            # exponents 2, 3 and -2 are products, 0.5 / -0.5 / -1 the sqrt /
+            # rsqrt / reciprocal kernels; only the rest runs the full pow.
+            if sv == 2:
+                launch[_POW_SQUARE]()
+            elif sv == 3:
+                launch[_POW_CUBE]()
+            elif sv == -2:
+                launch[_POW_INV_SQUARE]()
+            elif sv == 0.5:
+                launch[_POW_SQRT]()
+            elif sv == -0.5:
+                launch[_POW_RSQRT]()
+            elif sv == -1:
+                launch[_POW_RECIPROCAL]()
+            else:
+                launch[_POW_GENERAL]()
+        else:
+            launch[_POW_GENERAL]()
+
+
+# ---------------------------------------------------------------------------
+# Unary ops with runtime scalar arguments (`unary_math.elementwise_unary_param`):
+# kind _PARAM_UOP_KINDS[i] is spec op _PARAM_UOP_SPECS[i], and takes three
+# float64 slots after its input spec (converted on the host to the kernel's
+# compute type, `unary_math.param_compute_dtype`). round_decimals and
+# nan_to_num are exact in any float dtype and take float64 too; the others
+# are float-only.
+# ---------------------------------------------------------------------------
+
+comptime _PARAM_UOP_KINDS: List[StaticString] = [
+    "logit",
+    "mvlgamma",
+    "nan_to_num",
+    "polygamma",
+    "round_decimals",
+]
+comptime _PARAM_UOP_SPECS: List[StaticString] = [
+    "LogitSpec",
+    "MvlgammaSpec",
+    "NanToNumSpec",
+    "PolygammaSpec",
+    "RoundDecimalsSpec",
+]
+
+
+@always_inline
+def _param_float64_on[index: Int]() -> Bool:
+    comptime kind = _PARAM_UOP_KINDS[index]
+    return kind == "nan_to_num" or kind == "round_decimals"
+
+
+@always_inline
+def _param_unary_elementwise[
+    dtype: DType, index: Int
+](
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    in_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    p0: Float64,
+    p1: Float64,
+    p2: Float64,
+    size: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime kind = _PARAM_UOP_KINDS[index]
+    comptime if not dtype.is_floating_point():
+        raise Error("parameterized unary ops require a floating point dtype")
+    else:
+        # Converted here, on the host: the kernel never sees a double unless
+        # the tensor is float64 (see `param_compute_dtype`).
+        comptime ct = param_compute_dtype[dtype]()
+        var q0 = p0.cast[ct]()
+        var q1 = p1.cast[ct]()
+        var q2 = p2.cast[ct]()
+
+        @always_inline
+        @__parameter
+        @__copy_capture(out_ptr, in_ptr, q0, q1, q2)
+        def body[width: Int, lal: Int, sal: Int](i: Int):
+            out_ptr.unsafe_store[width=width, alignment=sal](
+                i,
+                elementwise_unary_param[kind](
+                    in_ptr.unsafe_load[width=width, alignment=lal](i),
+                    q0,
+                    q1,
+                    q2,
+                ),
+            )
+
+        comptime esz = size_of[dtype]()
+
+        @always_inline
+        @__parameter
+        def func[width: Int, alignment: Int = 1](idx: Coord):
+            body[width, esz, esz](Int(idx[0].value()))
+
         @always_inline
         @__parameter
         def func_vec[width: Int, alignment: Int = 1](idx: Coord):
-            body[width, 16](Int(idx[0].value()))
+            body[width, 16, 16](Int(idx[0].value()))
+
+        # An input view off the vector grid: element-aligned loads, aligned
+        # vector stores.
+        @always_inline
+        @__parameter
+        def func_ua[width: Int, alignment: Int = 1](idx: Coord):
+            comptime al = 16 if width > 1 else esz
+            body[width, esz, al](Int(idx[0].value()))
 
         comptime if has_accelerator():
-            # 16-byte vectors when both bases allow them and there is no
-            # tail (a bucket view starts wherever the previous parameter
-            # ended): scalar lanes moved 1.5 TB/s on H100, vectors ~3.
             comptime vec = 16 // size_of[dtype]()
-            if (
-                Int(out_ptr) % 16 == 0
-                and Int(in_ptr) % 16 == 0
-                and size % vec == 0
-            ):
-                elementwise[func_vec, simd_width=vec, target="gpu"](
-                    Coord(size), ctx
-                )
+            if (Int(out_ptr) | Int(in_ptr)) % 16 == 0:
+                # polygamma / mvlgamma on a half dtype: a loop per element,
+                # so small launches keep more threads at 4 lanes (as the
+                # unary family's `is_expensive_half`; polygamma(2, x) f16
+                # 281673 elements: 1.18x torch at 8 lanes). NVIDIA only.
+                comptime if (
+                    has_nvidia_gpu_accelerator()
+                    and (kind == "polygamma" or kind == "mvlgamma")
+                    and (dtype == DType.float16 or dtype == DType.bfloat16)
+                ):
+                    if size < _NARROW_TRANSCENDENTAL_THRESHOLD:
+                        elementwise[
+                            func_vec,
+                            simd_width=4,
+                            target="gpu",
+                            _trace_description="modular_param_unary",
+                            _heavy=_param_heavy[kind](),
+                        ](Coord(size), ctx)
+                        return
+                elementwise[
+                    func_vec,
+                    simd_width=vec,
+                    target="gpu",
+                    _trace_description="modular_param_unary",
+                    _heavy=_param_heavy[kind](),
+                ](Coord(size), ctx)
             else:
-                elementwise[func, simd_width=1, target="gpu"](Coord(size), ctx)
+                comptime if has_nvidia_gpu_accelerator():
+                    if Int(out_ptr) % 16 == 0:
+                        comptime if (
+                            kind == "polygamma" or kind == "mvlgamma"
+                        ) and (
+                            dtype == DType.float16 or dtype == DType.bfloat16
+                        ):
+                            if size < _NARROW_TRANSCENDENTAL_THRESHOLD:
+                                elementwise[
+                                    func_ua,
+                                    simd_width=4,
+                                    target="gpu",
+                                    _trace_description="modular_param_unary_ua",
+                                    _heavy=_param_heavy[kind](),
+                                ](Coord(size), ctx)
+                                return
+                        elementwise[
+                            func_ua,
+                            simd_width=vec,
+                            target="gpu",
+                            _trace_description="modular_param_unary_ua",
+                            _heavy=_param_heavy[kind](),
+                        ](Coord(size), ctx)
+                        return
+                elementwise[
+                    func,
+                    simd_width=1,
+                    target="gpu",
+                    _trace_description="modular_param_unary",
+                    _heavy=_param_heavy[kind](),
+                ](Coord(size), ctx)
         else:
             raise Error("no GPU accelerator available at compile time")
 
@@ -1292,6 +1831,45 @@ def _scalar_spec_into_go[
                     )
 
 
+def _param_unary_spec_into_go[
+    index: Int
+](a_o: Arg, p0_o: Arg, p1_o: Arg, p2_o: Arg, out_o: Arg) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    var supported = False
+    comptime if _param_float64_on[index]():
+        supported = _dtype_supported[
+            [DType.float16, DType.bfloat16, DType.float32, DType.float64]
+        ](a.dtype)
+    else:
+        supported = _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype)
+    if not supported:
+        raise Error("mojo parameterized unary: unsupported dtype ", a.dtype)
+    var ctx = a.ctx()
+    _check_into(a, out, a.dtype)
+    var addr = out.ptr
+    if a.numel > 0:
+        if not a.contig:
+            raise Error("mojo parameterized unary: input must be contiguous")
+        comptime for dt in [
+            DType.float16,
+            DType.bfloat16,
+            DType.float32,
+            DType.float64,
+        ]:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _param_unary_elementwise[dt, index](
+                        _make_ptr[dt](addr),
+                        _make_ptr[dt](a.ptr),
+                        _raw_f64(p0_o),
+                        _raw_f64(p1_o),
+                        _raw_f64(p2_o),
+                        a.numel,
+                        ctx,
+                    )
+
+
 def _scalar_inplace_go[op_code: Int](a_o: Arg, scalar_o: Arg) raises:
     """`a op= scalar` for a contiguous float tensor, in place.
 
@@ -1553,6 +2131,12 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
                 _unary_spec_into_go[UOP_GELU_TANH], "a unary spec op"
             ](argv, argc)
             return 0
+        comptime for i in range(len(_TABLE_UOP_SPECS)):
+            comptime if _op_on[_TABLE_UOP_SPECS[i]]():
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_TABLE_BASE + i], "a unary spec op"
+                ](argv, argc)
+                return 0
         comptime if _op_on["IsNanSpec"]():
             _spec_dispatcher2[
                 _unary_bool_spec_into_go[BUOP_ISNAN],
@@ -1565,6 +2149,42 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
                 "a bool-output unary spec op",
             ](argv, argc)
             return 0
+        comptime if _op_on["SignbitSpec"]():
+            _spec_dispatcher2[
+                _unary_bool_spec_into_go[BUOP_SIGNBIT],
+                "a bool-output unary spec op",
+            ](argv, argc)
+            return 0
+        comptime if _op_on["IsInfSpec"]():
+            _spec_dispatcher2[
+                _unary_bool_spec_into_go[BUOP_ISINF],
+                "a bool-output unary spec op",
+            ](argv, argc)
+            return 0
+        comptime if _op_on["IsFiniteSpec"]():
+            _spec_dispatcher2[
+                _unary_bool_spec_into_go[BUOP_ISFINITE],
+                "a bool-output unary spec op",
+            ](argv, argc)
+            return 0
+        comptime if _op_on["IsPosInfSpec"]():
+            _spec_dispatcher2[
+                _unary_bool_spec_into_go[BUOP_ISPOSINF],
+                "a bool-output unary spec op",
+            ](argv, argc)
+            return 0
+        comptime if _op_on["IsNegInfSpec"]():
+            _spec_dispatcher2[
+                _unary_bool_spec_into_go[BUOP_ISNEGINF],
+                "a bool-output unary spec op",
+            ](argv, argc)
+            return 0
+        comptime for i in range(len(_PARAM_UOP_SPECS)):
+            comptime if _op_on[_PARAM_UOP_SPECS[i]]():
+                _spec_dispatcher5[
+                    _param_unary_spec_into_go[i], "a parameterized unary op"
+                ](argv, argc)
+                return 0
         comptime if _op_on["AddScalarSpec"]():
             _spec_dispatcher3[
                 _scalar_spec_into_go[SOP_ADD], "a float-scalar spec op"
@@ -1578,6 +2198,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["PowScalarSpec"]():
             _spec_dispatcher3[
                 _scalar_spec_into_go[SOP_POW], "a float-scalar spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["RsubScalarSpec"]():
+            _spec_dispatcher3[
+                _scalar_spec_into_go[SOP_RSUB], "a float-scalar spec op"
             ](argv, argc)
             return 0
         comptime if _op_on["FloorDivScalarSpec"]():

@@ -6,7 +6,9 @@ imports this instead:
         Coord(shape), ctx)                       # capturing-closure form
     elementwise[W, target="gpu"](func, shape, ctx)  # unified-closure form
 
-`func[width, alignment](idx: Coord)` is the caller's body. The NVIDIA GPU
+`func[width, alignment](idx: Coord)` is the caller's body; `_heavy=True`
+(an extension MAX's API does not have, ignored off the fast path) marks a
+body expensive enough to prefer smaller blocks (`_policy_block`). The NVIDIA GPU
 rank-1 path is replaced; everything else (CPU, AMD/Apple GPUs, rank > 1)
 forwards to MAX unchanged -- only NVIDIA (H100 PCIe, sm_90a) was measured,
 so nothing here may regress those other targets.
@@ -94,7 +96,7 @@ comptime _SMALL = 1
 comptime _BIG = 2
 
 
-def _policy_block[simd_width: Int, regime: Int]() -> Int:
+def _policy_block[simd_width: Int, regime: Int, heavy: Bool]() -> Int:
     comptime if simd_width <= 2:
         return 512 if regime == _TINY else 256
     elif simd_width <= 4:
@@ -103,7 +105,13 @@ def _policy_block[simd_width: Int, regime: Int]() -> Int:
         # ~80% was 0.2-0.6% slower at 512 threads, same output buffer).
         return 1024 if regime == _BIG else 256
     elif simd_width <= 8:
-        return 256
+        # A `heavy` body (the caller's call: transcendental or looping math)
+        # takes 128-thread blocks in TINY, the finer balance of a grid that
+        # does not fill the GPU; cheap bodies keep 256. benchmarks/, 2-byte
+        # dtypes at 281673 elements, 256 -> 128: mish bf16 1.22 -> 1.10x
+        # torch, hypot 1.20 -> 1.04, log_sigmoid 1.20 -> 1.09, atan2 1.06 ->
+        # 0.88; but neg / abs 0.98 -> 1.09, floor / trunc 1.02 -> 1.09.
+        return 128 if regime == _TINY and heavy else 256
     else:
         return 512 if regime == _BIG else 128
 
@@ -228,16 +236,17 @@ def _flat_launch[
     //,
     simd_width: Int,
     trace_description: StaticString,
+    heavy: Bool = False,
 ](func: FuncType, length: Int, ctx: DeviceContext) raises:
     if length <= 0:
         return
     var num_packed = length // simd_width
     var tail = length - num_packed * simd_width
-    comptime Bt = _policy_block[simd_width, _TINY]()
+    comptime Bt = _policy_block[simd_width, _TINY, heavy]()
     comptime Ut = _policy_unroll[simd_width, _TINY]()
-    comptime Bs = _policy_block[simd_width, _SMALL]()
+    comptime Bs = _policy_block[simd_width, _SMALL, heavy]()
     comptime Us = _policy_unroll[simd_width, _SMALL]()
-    comptime Bb = _policy_block[simd_width, _BIG]()
+    comptime Bb = _policy_block[simd_width, _BIG, heavy]()
     comptime Ub = _policy_unroll[simd_width, _BIG]()
     comptime max_tile = max(Bt * Ut, max(Bs * Us, Bb * Ub))
     comptime tiny_max = (
@@ -284,6 +293,7 @@ def elementwise[
     *,
     target: StaticString = "cpu",
     _trace_description: StaticString = "elementwise",
+    _heavy: Bool = False,
 ](shape: Coord, context: DeviceContext) raises:
     comptime if (
         _EAGER_BUILD
@@ -295,7 +305,7 @@ def elementwise[
         def func_unified[width: Int, alignment: Int = 1](indices: Coord) {}:
             func[width, alignment](indices)
 
-        _flat_launch[simd_width, _trace_description](
+        _flat_launch[simd_width, _trace_description, _heavy](
             func_unified, Int(shape.product()), context
         )
     else:
@@ -317,6 +327,7 @@ def elementwise[
     *,
     target: StaticString = "cpu",
     _trace_description: StaticString = "elementwise",
+    _heavy: Bool = False,
 ](func: FuncType, shape: Coord, context: DeviceContext) raises:
     comptime if (
         _EAGER_BUILD
@@ -324,7 +335,7 @@ def elementwise[
         and has_nvidia_gpu_accelerator()
         and shape.rank == 1
     ):
-        _flat_launch[simd_width, _trace_description](
+        _flat_launch[simd_width, _trace_description, _heavy](
             func, Int(shape.product()), context
         )
     else:

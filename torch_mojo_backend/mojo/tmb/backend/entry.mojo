@@ -27,6 +27,7 @@ from tmb.ops.foreach import register_foreach
 from tmb.ops.matmul import register_matmul
 from tmb.ops.nn import register_nn
 from tmb.ops.nms import register_nms
+from tmb.ops.pointwise import register_pointwise
 from tmb.ops.random import register_random
 from tmb.ops.reductions import register_reductions
 from tmb.ops.roi import register_roi
@@ -53,6 +54,7 @@ def _register_ops(lib: Int) raises:
     _group[register_reductions](lib)
     _group[register_matmul](lib)
     _group[register_nn](lib)
+    _group[register_pointwise](lib)
     _group[register_attention](lib)
     _group[register_foreach](lib)
 

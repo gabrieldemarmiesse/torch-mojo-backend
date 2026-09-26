@@ -225,10 +225,6 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::threshold_backward.grad_input": _COMPOSED,
     "aten::sigmoid_backward": _COMPOSED,
     "aten::sigmoid_backward.grad_input": _COMPOSED,
-    "aten::isneginf": _COMPOSED,
-    "aten::isneginf.out": _COMPOSED,
-    "aten::isposinf": _COMPOSED,
-    "aten::isposinf.out": _COMPOSED,
     # -- RNG transforms sharing the benchmarked Philox kernel ----------------
     "aten::random_": _RNG_TRANSFORM,
     "aten::random_.from": _RNG_TRANSFORM,
