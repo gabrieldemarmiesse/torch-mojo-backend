@@ -191,6 +191,7 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::lt.Tensor_out": _OUT,
     "aten::masked_fill.Scalar_out": _OUT,
     "aten::masked_fill.Tensor_out": _OUT,
+    "aten::mean.dtype_out": _OUT,
     "aten::mean.out": _OUT,
     "aten::min.dim_min": _OUT,
     "aten::mm.out": _OUT,

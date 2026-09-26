@@ -328,13 +328,115 @@ def test_sum_out_variant(mojo_gpu, keepdim):
     torch.testing.assert_close(resized.cpu(), x.sum(dim=1), rtol=2e-6, atol=2e-6)
 
 
-def test_sum_out_variant_declines_unsafe_cast(mojo_gpu):
-    """`safe_cast`: a float result poured into an integral out is refused,
-    matching sum.IntList_out's structured-kernel dtype check."""
+def test_sum_out_variant_into_int64_truncates_each_element_first(mojo_gpu):
+    """Verified against stock torch: a float result poured into an int64 out
+    with no `dtype=` is NOT a "sum then cast" -- torch truncates every
+    element to int64 first (`ScalarType dtype = result.scalar_type();`, used
+    as the reduction's own compute dtype), so this differs from
+    `x.sum(dim=1).to(int64)` whenever fractional parts would otherwise
+    accumulate before truncation."""
+    x = torch.tensor([[0.9, 0.9, 0.9]])
+    expected = x.to(torch.int64).sum(dim=1)
+    assert expected.item() != x.sum(dim=1).to(torch.int64).item()  # the two must differ
+    out = torch.empty(1, dtype=torch.int64, device=mojo_gpu)
+    torch.sum(x.to(mojo_gpu), dim=1, out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_sum_out_variant_computes_in_outs_dtype_for_int_input_too(mojo_gpu):
+    """`out`'s dtype is the compute dtype for ANY self, not just a floating
+    one: an int64 self summed into a float32 `out` casts each element to
+    float32 first, same as a float self does (test above). It must NOT
+    accumulate in int64 (self's own dtype) and cast the sum down afterward.
+    Verified on stock CUDA: [16777217, -16777216] (adjacent int64 values that
+    collapse to the same float32) sums to 0.0 in float32, not 1.0 from an
+    int64 sum cast down afterward."""
+    x = torch.tensor([16777217, -16777216], dtype=torch.int64)
+    xd = x.to(mojo_gpu)
+    assert x.sum().item() == 1  # int64 sum-then-cast would give 1.0, not 0.0
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.sum(xd, dim=0, out=out)
+    assert out.item() == 0.0
+
+
+def test_sum_out_variant_declines_dtypes_the_kernel_lacks(mojo_gpu):
+    """SumSpec only accumulates in float16/bfloat16/float32/int64
+    (`_is_sum_dtype`); bool/uint8 outs, which torch itself accepts for
+    sum.out, are declined rather than silently mishandled."""
     x = torch.randn(4, 5).to(mojo_gpu)
-    out = torch.empty(4, dtype=torch.int64, device=mojo_gpu)
-    with pytest.raises(RuntimeError, match="can't be cast"):
-        torch.sum(x, dim=1, out=out)
+    with pytest.raises(NotImplementedError):
+        torch.sum(x, dim=1, out=torch.empty(4, dtype=torch.bool, device=mojo_gpu))
+    with pytest.raises(NotImplementedError):
+        torch.sum(x, dim=1, out=torch.empty(4, dtype=torch.uint8, device=mojo_gpu))
+
+
+def test_sum_out_computes_in_outs_dtype(mojo_gpu):
+    """Same `_out_reduce_dtype`/`_promote_for_out_reduction` path as mean.out:
+    with no `dtype=`, sum.IntList_out accumulates in `out`'s own dtype, not
+    the input's (values picked so a float16 accumulation would round
+    differently than the float32 one torch actually does)."""
+    x = torch.tensor([1.0, 1.0009765625], dtype=torch.float16)
+    xd = x.to(mojo_gpu)
+    expected = x.float().sum(dim=0)
+    assert expected.item() != x.sum(dim=0).float().item()  # the two must differ
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.sum(xd, dim=0, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_sum_out_dtype_must_match_out_dtype(mojo_gpu):
+    """Same equality rule as mean.out: an explicit `dtype=` that disagrees
+    with `out`'s dtype raises, rather than silently using either one."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.sum(
+            x,
+            dim=1,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float16, device=mojo_gpu),
+        )
+
+
+def test_sum_rounds_each_element_to_the_target_dtype_first(mojo_gpu):
+    """`TORCH_IMPL_FUNC(sum_out)`'s CUDA path (`make_reduction_from_out_ty`)
+    builds its TensorIterator from `out`'s own dtype directly, so every
+    element is rounded to it BEFORE accumulating (`SumOp`'s own float32
+    `acc_dtype` then sums those already-rounded values). Verified on an
+    actual CUDA device: summing [1 + 2**-12, -1] with dtype=float16 rounds
+    1 + 2**-12 down to 1.0 first, giving exactly 0 -- not 2**-12 from summing
+    at full precision and rounding only the final scalar."""
+    x = torch.tensor([1.0 + 2**-12, -1.0])
+    xd = x.to(mojo_gpu)
+    assert (x.sum().half().item(), x.half().sum().item()) == (2**-12, 0.0)
+
+    out = torch.empty((), dtype=torch.float16, device=mojo_gpu)
+    torch.sum(xd, dim=0, dtype=torch.float16, out=out)
+    assert out.item() == 0.0
+
+    out2 = torch.empty((), dtype=torch.float16, device=mojo_gpu)
+    torch.sum(xd, dim=0, out=out2)  # dtype=None: same rule, dtype comes from `out`
+    assert out2.item() == 0.0
+
+
+def test_mean_rounds_each_element_to_the_target_dtype_first(mojo_gpu):
+    """Confirmed on an actual CUDA device (not CPU torch, whose `mean_out`
+    has a CPU-only `is_half_type` trick that avoids this): mean's CUDA path
+    is the exact same `make_reduction_from_out_ty` machinery as sum (above),
+    so it rounds every element to the target dtype BEFORE accumulating too --
+    `torch.mean(torch.tensor([1 + 2**-12, -1], device="cuda"),
+    dtype=torch.float16)` gives 0, not the CPU-only 2**-13. The mojo device
+    mirrors CUDA, not CPU."""
+    x = torch.tensor([1.0 + 2**-12, -1.0])
+    xd = x.to(mojo_gpu)
+    assert (x.mean().half().item(), x.half().mean().item()) == (2**-13, 0.0)
+
+    out = torch.empty((), dtype=torch.float16, device=mojo_gpu)
+    torch.mean(xd, dtype=torch.float16, out=out)  # -> mean.dtype_out
+    assert out.item() == 0.0
+
+    out2 = torch.empty((), dtype=torch.float16, device=mojo_gpu)
+    torch.mean(xd, dim=0, out=out2)  # dtype=None: same rule -> mean.out
+    assert out2.item() == 0.0
 
 
 @pytest.mark.parametrize("keepdim", [False, True])
@@ -372,6 +474,126 @@ def test_out_variant_resizes_a_mismatching_out(mojo_gpu):
     torch.mean(x.to(mojo_gpu), dim=2, out=transposed)
     assert tuple(transposed.shape) == (2, 3)
     torch.testing.assert_close(transposed.cpu(), x.mean(dim=2), rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_mean_dtype_out_full_reduce(mojo_gpu, dtype):
+    """`torch.mean(x, out=out)` with no `dim` dispatches to mean.dtype_out
+    (verified against stock torch's own overload resolution), always a full
+    reduce to a 0-d result regardless of input rank."""
+    x = torch.randn(4, 6, 5, dtype=dtype)
+    xd = x.to(mojo_gpu)
+    expected = x.mean()
+    out = torch.empty((), dtype=dtype, device=mojo_gpu)
+    returned = torch.mean(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected, rtol=2e-2, atol=2e-2)
+
+
+def test_mean_dtype_out_casts_before_reducing(mojo_gpu):
+    """`dtype=` promotes the input before reducing (only float16/bfloat16/
+    float32 are supported, same as mean()/mean.out/mean.dim). These two
+    values are picked so summing them AS float16 (cast-after-reduce, the bug)
+    rounds to a different float16-representable pair than summing them AS
+    float32 (cast-before-reduce, what torch does): a loose tolerance cannot
+    tell the two apart, so this uses an exact comparison."""
+    x = torch.tensor([1.0, 1.0009765625], dtype=torch.float16)
+    xd = x.to(mojo_gpu)
+    expected = x.mean(dtype=torch.float32)
+    assert expected.item() != x.half().mean().float().item()  # the two must differ
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.mean(xd, dtype=torch.float32, out=out)  # no dim -> mean.dtype_out
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_mean_dtype_out_resizes_a_mismatching_out(mojo_gpu):
+    """Non-scalar `out` is resized to the full-reduce (0-d) shape."""
+    x = torch.randn(3, 4)
+    out = torch.empty(3, 4, device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), out=out)
+    assert tuple(out.shape) == ()
+    torch.testing.assert_close(out.cpu(), x.mean())
+
+
+def test_mean_dtype_out_rejects_integer_input(mojo_gpu):
+    x = torch.randint(0, 10, (3, 4))
+    out = torch.empty((), device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.mean(x.to(mojo_gpu), out=out)
+
+
+def test_mean_out_computes_in_outs_dtype(mojo_gpu):
+    """With no `dtype=`, torch computes mean.out/mean.dtype_out in `out`'s
+    OWN dtype (`ReduceOps.cpp`: `ScalarType dtype = result.scalar_type();`),
+    not the input's: a float16 input poured into a float32 `out` must match
+    the float32-accumulated answer exactly, not a float16-rounded one poured
+    into fp32 (the values below are picked so the two differ)."""
+    x = torch.tensor([1.0, 1.0009765625], dtype=torch.float16)
+    xd = x.to(mojo_gpu)
+    expected = x.float().mean()
+    assert expected.item() != x.mean().float().item()  # the two must differ
+
+    out_dtype_out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.mean(xd, out=out_dtype_out)  # -> mean.dtype_out
+    torch.testing.assert_close(out_dtype_out.cpu(), expected, rtol=0, atol=0)
+
+    out_dim_out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.mean(xd, dim=0, out=out_dim_out)  # -> mean.out
+    torch.testing.assert_close(out_dim_out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_mean_out_declines_float64_out(mojo_gpu):
+    """No float64 kernel specialization exists; a float64 `out` is declined
+    cleanly instead of reaching the cast kernel with an unsupported pair."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.mean(x, dim=1, out=torch.empty(4, dtype=torch.float64, device=mojo_gpu))
+    with pytest.raises(NotImplementedError):
+        torch.mean(x, out=torch.empty((), dtype=torch.float64, device=mojo_gpu))
+
+
+def test_mean_out_dtype_must_match_out_dtype(mojo_gpu):
+    """torch requires an explicit `dtype=` to equal `out`'s dtype exactly and
+    raises otherwise ("Expected out tensor to have dtype X, but got dtype Y
+    instead"); it is not a safe-cast check."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.mean(
+            x,
+            dim=1,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float16, device=mojo_gpu),
+        )
+    with pytest.raises(RuntimeError):
+        torch.mean(
+            x,
+            dtype=torch.float32,
+            out=torch.empty((), dtype=torch.float16, device=mojo_gpu),
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.bool])
+def test_mean_out_explicit_dtype_bypasses_the_int_input_check(mojo_gpu, dtype):
+    """Verified on stock CUDA: an int/bool self with an explicit float
+    `dtype=` is valid (self is cast to it before reducing) -- mean only
+    requires self itself to be float/complex when `dtype=` is absent."""
+    x = (
+        torch.randint(0, 10, (4, 5), dtype=dtype)
+        if dtype is not torch.bool
+        else torch.randint(0, 2, (4, 5), dtype=dtype)
+    )
+    expected = x.float().mean(dim=0)
+    out = torch.empty(5, dtype=torch.float32, device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), dim=0, dtype=torch.float32, out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_mean_dtype_out_nan(mojo_gpu):
+    x = torch.randn(4, 6)
+    x[2, 3] = float("nan")
+    out = torch.empty((), device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), x.mean(), equal_nan=True)
 
 
 def test_out_variant_into_a_strided_destination(mojo_gpu):
@@ -1013,6 +1235,10 @@ _EXPECTED_OVERLOADS = [
         lambda d: torch.mean(
             torch.randn(4, 5).to(d), dim=1, out=torch.empty(4, device=d)
         ),
+    ),
+    (
+        "aten::mean.dtype_out",
+        lambda d: torch.mean(torch.randn(4, 5).to(d), out=torch.empty((), device=d)),
     ),
     ("aten::amax", lambda d: torch.amax(torch.randn(4, 5).to(d), dim=1)),
     ("aten::amin", lambda d: torch.amin(torch.randn(4, 5).to(d), dim=1)),

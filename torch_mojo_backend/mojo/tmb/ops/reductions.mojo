@@ -48,6 +48,7 @@ from tmb.backend.abi import (
     release,
     ret_owned,
     ret_ref,
+    torch_dtype,
     unsupported,
     v_bool_or,
     v_dtype_or,
@@ -651,6 +652,37 @@ def _scalar_reduction_out(
     _ = tmp^  # alive past the launch
 
 
+def _out_reduce_dtype(
+    dtype_v: Value, dst: T, op_name: StaticString
+) raises -> DType:
+    """The dtype an out= reduction with an optional `dtype=` computes and
+    rounds into: `dtype_v` if given -- which torch requires to equal `dst`'s
+    dtype exactly ("Expected out tensor to have dtype X, but got dtype Y
+    instead", the structured-kernel `set_output` check every `.out`/
+    `.dtype_out` reduction shares) -- otherwise `dst`'s own dtype
+    (ReduceOps.cpp: `ScalarType dtype = result.scalar_type();`, read
+    regardless of the input's own dtype). Callers still validate the
+    resolved dtype is one their op/kernel supports (mean/norm: float only;
+    sum: float or int64) and may override it for a dtype-less integer input
+    (sum's bool/sub-int64 -> int64 default)."""
+    var want = _opt_dtype(dtype_v)
+    if want < 0:
+        return dst.dtype
+    var target = max_dtype(want)
+    _check_out_dtype(op_name, "exact", target, dst.dtype)
+    return target
+
+
+def _promote_for_out_reduction(mut src: Operand, target: DType) raises:
+    """Cast `src` to `target` before reducing: both mean and sum round every
+    element to `target` first (their CUDA kernels build the reduction
+    directly from it), then accumulate in float32 via their own `acc_dtype`
+    -- mirroring CUDA, not CPU torch's separate half-precision-avoiding
+    `mean_out` path."""
+    if src.t.dtype != target:
+        _promote(src, torch_dtype(target))
+
+
 # ---------------------------------------------------------------------------
 # sum
 # ---------------------------------------------------------------------------
@@ -721,14 +753,16 @@ def op_sum_intlist_out(
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
-    var want = _opt_dtype(args[unsafe_offset=3])
-    if want >= 0:
-        _promote(src, want)
-    elif not src.t.dtype.is_floating_point():
-        # torch promotes bool / sub-int64 integer sums to int64.
-        _promote(src, ST_INT64)
-    if not _is_sum_dtype(src.t.dtype):
-        unsupported("sum of dtype " + String(src.t.dtype))
+    # `out` always exists here, so its dtype is the compute dtype for ANY
+    # self (float or int) with no explicit dtype= -- the bool/sub-int64 ->
+    # int64 default (`_sum`, above) only applies when there is no out tensor
+    # to take a dtype from.
+    var target = _out_reduce_dtype(
+        args[unsafe_offset=3], out, "aten::sum.IntList_out"
+    )
+    if not _is_sum_dtype(target):
+        unsupported("sum with dtype=" + String(target))
+    _promote_for_out_reduction(src, target)
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
     if len(dims) == 0:
         unsupported("sum with no reduce dim (a rank-0 operand)")
@@ -797,37 +831,77 @@ def op_mean_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
-# aten::mean.out(Tensor self, int[1]? dim, bool keepdim=False, *,
-#   ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
-def op_mean_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var out = v_tensor(args[unsafe_offset=4])
+def _mean_out(
+    a: T,
+    dim_v: Value,
+    keepdim: Bool,
+    dtype_v: Value,
+    op_name: StaticString,
+    mut dst: T,
+    rets: Values,
+) raises:
     _require_mojo(a)
-    _require_mojo(out)
+    _require_mojo(dst)
     var src = _borrow(a)
-    var want = _opt_dtype(args[unsafe_offset=3])
-    if want >= 0:
-        if not _is_float3(max_dtype(want)):
-            unsupported("mean with dtype=" + String(max_dtype(want)))
-        _promote(src, want)
-    if not _is_float3(src.t.dtype):
+    var target = _out_reduce_dtype(dtype_v, dst, op_name)
+    if _opt_dtype(dtype_v) < 0 and not _is_float3(src.t.dtype):
+        # No explicit dtype=: torch requires self itself to be float/complex.
+        # An explicit dtype= bypasses this -- self is cast to it below, so an
+        # int64 self with dtype=torch.float32 is valid.
         unsupported("mean of dtype " + String(src.t.dtype))
-    var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
+    if not _is_float3(target):
+        unsupported("mean with dtype=" + String(target))
+    _promote_for_out_reduction(src, target)
+    var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported("mean with no reduce dim (a rank-0 operand)")
     _scalar_reduction_out(
         "nn",
         "MeanSpec",
-        "aten::mean.out",
+        op_name,
         "safe_cast",
         src.t,
         dims,
-        v_bool_or(args[unsafe_offset=2], False),
+        keepdim,
         src.t.stype,
-        out,
+        dst,
     )
-    ret_ref(rets, 0, out)
+    ret_ref(rets, 0, dst)
     _ = src^
+
+
+# aten::mean.out(Tensor self, int[1]? dim, bool keepdim=False, *,
+#   ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+def op_mean_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var out = v_tensor(args[unsafe_offset=4])
+    _mean_out(
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        v_bool_or(args[unsafe_offset=2], False),
+        args[unsafe_offset=3],
+        "aten::mean.out",
+        out,
+        rets,
+    )
+
+
+# aten::mean.dtype_out(Tensor self, *, ScalarType? dtype=None,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_mean_dtype_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    # CompositeExplicitAutograd forwards to mean.out with dim=[] (full
+    # reduce), keepdim=False: aten/src/ATen/native/ReduceOps.cpp mean_dtype_out.
+    var out = v_tensor(args[unsafe_offset=2])
+    _mean_out(
+        v_tensor(args[unsafe_offset=0]),
+        Value(TAG_NONE, 0, 0, 0),
+        False,
+        args[unsafe_offset=1],
+        "aten::mean.dtype_out",
+        out,
+        rets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2051,6 +2125,7 @@ def register_reductions(site: Site) raises:
     impl[op_max, "max"](site)
     impl[op_mean, "mean"](site)
     impl[op_mean_dim, "mean.dim"](site)
+    impl[op_mean_dtype_out, "mean.dtype_out"](site)
     impl[op_mean_out, "mean.out"](site)
     impl[op_median, "median"](site)
     impl[op_median_dim, "median.dim"](site)
