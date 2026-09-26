@@ -1469,8 +1469,57 @@ def test_add_above_last_level_cache(mojo_gpu):
 
 
 # --------------------------------------------------------------------------
-# NaN as true in the logical ops, bool maximum/minimum, NaN clamp bounds
+# out= variants of the binary ops, logical_or, bool maximum/minimum and the
+# clamp_min / clamp_max family
 # --------------------------------------------------------------------------
+
+
+_OUT_OPS = [
+    ("remainder", torch.remainder, torch.float32),
+    ("bitwise_and", torch.bitwise_and, torch.int32),
+    ("bitwise_or", torch.bitwise_or, torch.int64),
+    ("bitwise_xor", torch.bitwise_xor, torch.int32),
+]
+
+
+@pytest.mark.parametrize("name,fn,dtype", _OUT_OPS, ids=[o[0] for o in _OUT_OPS])
+@pytest.mark.parametrize("layout", ["same", "broadcast", "strided_out"])
+def test_binary_out_variants(mojo_device, name, fn, dtype, layout):
+    a_cpu, a = _both((4, 6), dtype, mojo_device)
+    b_shape = (6,) if layout == "broadcast" else (4, 6)
+    b_cpu, b = _both(b_shape, dtype, mojo_device)
+    if name == "pow":
+        a_cpu, a = a_cpu.abs() + 0.5, a.abs() + 0.5
+    expected = fn(a_cpu, b_cpu)
+    if layout == "strided_out":
+        out_cpu = torch.empty((6, 4), dtype=expected.dtype)
+        out = out_cpu.to(mojo_device).t()
+    else:
+        out = torch.empty(expected.shape, dtype=expected.dtype, device=mojo_device)
+    with native_ran(
+        f"aten::{name}.out",
+        f"aten::{name}.Tensor_out",
+        f"aten::{name}.Tensor_Tensor_out",
+    ):
+        result = fn(a, b, out=out)
+    assert result is out
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_binary_scalar_out_variants(mojo_device):
+    a_cpu, a = _both((7,), torch.int64, mojo_device)
+    for fn in (torch.bitwise_and, torch.bitwise_or, torch.bitwise_xor):
+        out = torch.empty(7, dtype=torch.int64, device=mojo_device)
+        # The Scalar_out registration itself, not the CompositeImplicit
+        # fallback that wraps the scalar and calls Tensor_out.
+        with native_ran(f"aten::{fn.__name__}.Scalar_out"):
+            fn(a, 5, out=out)
+        torch.testing.assert_close(out.cpu(), fn(a_cpu, 5))
+    f_cpu, f = _both((7,), torch.float32, mojo_device)
+    out = torch.empty(7, device=mojo_device)
+    with native_ran("aten::remainder.Scalar_out"):
+        torch.remainder(f, 0.75, out=out)
+    torch.testing.assert_close(out.cpu(), torch.remainder(f_cpu, 0.75))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])

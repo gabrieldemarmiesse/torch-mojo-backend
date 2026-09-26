@@ -198,7 +198,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "index_reduce_mean": ("float32", "bfloat16", "float16", "int64"),
     "index_reduce_prod": ("float32", "bfloat16", "float16", "int64"),
     "inner": ("float32", "bfloat16", "float16", "int64"),
-    "isclose": ("float32", "bfloat16", "float16", "int64", "bool"),
     "isin": ("float32", "bfloat16", "float16"),
     "kthvalue": ("bfloat16", "int64"),
     "lcm": ("int64",),
