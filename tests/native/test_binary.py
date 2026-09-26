@@ -1580,6 +1580,31 @@ def test_maximum_minimum_bool(mojo_device):
     torch.testing.assert_close(torch.minimum(a, b).cpu(), torch.minimum(a_cpu, b_cpu))
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_clamp_min_max(mojo_device, dtype):
+    a_cpu, a = _both((5, 3), dtype, mojo_device, low=-9, high=9)
+    lo_cpu, lo = _both((3,), dtype, mojo_device, low=-3, high=0)
+    hi_cpu, hi = _both((5, 1), dtype, mojo_device, low=0, high=3)
+    with native_ran("aten::clamp_min"):
+        torch.testing.assert_close(a.clamp_min(0).cpu(), a_cpu.clamp_min(0))
+    with native_ran("aten::clamp_max"):
+        torch.testing.assert_close(a.clamp_max(1).cpu(), a_cpu.clamp_max(1))
+    with native_ran("aten::clamp_min.Tensor"):
+        torch.testing.assert_close(a.clamp_min(lo).cpu(), a_cpu.clamp_min(lo_cpu))
+    with native_ran("aten::clamp_max.Tensor"):
+        torch.testing.assert_close(a.clamp_max(hi).cpu(), a_cpu.clamp_max(hi_cpu))
+    out = torch.empty_like(a)
+    torch.clamp(a, min=-1, max=1, out=out)
+    torch.testing.assert_close(out.cpu(), torch.clamp(a_cpu, min=-1, max=1))
+    x, x_cpu = a.clone(), a_cpu.clone()
+    x.clamp_(min=0)
+    x_cpu.clamp_(min=0)
+    torch.testing.assert_close(x.cpu(), x_cpu)
+    x.clamp_max_(hi)
+    x_cpu.clamp_max_(hi_cpu)
+    torch.testing.assert_close(x.cpu(), x_cpu)
+
+
 def test_clamp_nan_bound_fills_nan(mojo_device):
     a_cpu, a = _both((6,), torch.float32, mojo_device)
     nan = float("nan")
@@ -1587,6 +1612,12 @@ def test_clamp_nan_bound_fills_nan(mojo_device):
         torch.testing.assert_close(
             torch.clamp(a, lo, hi).cpu(), torch.clamp(a_cpu, lo, hi), equal_nan=True
         )
+    torch.testing.assert_close(
+        a.clamp_min(nan).cpu(), a_cpu.clamp_min(nan), equal_nan=True
+    )
+    torch.testing.assert_close(
+        a.clamp_max(nan).cpu(), a_cpu.clamp_max(nan), equal_nan=True
+    )
 
 
 # --------------------------------------------------------------------------

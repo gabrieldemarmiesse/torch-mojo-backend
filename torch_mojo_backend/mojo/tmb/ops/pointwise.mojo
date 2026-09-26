@@ -2697,6 +2697,8 @@ def op_binary_cross_entropy_with_logits_out(
 
 
 def register_pointwise(site: Site) raises:
+    impl[op_clamp_tensor, "clamp.Tensor"](site)
+    impl[op_clamp_tensor_out, "clamp.Tensor_out"](site)
     impl[op_gelu_backward_any, "gelu_backward"](site)
     impl[op_lerp_scalar_any, "lerp.Scalar"](site)
     impl[op_lerp_scalar_out_any, "lerp.Scalar_out"](site)

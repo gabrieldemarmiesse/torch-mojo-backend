@@ -99,6 +99,7 @@ COVERS: dict[str, str] = (
         "aten::lerp.Scalar_out": "test_lerp_inplace",
         "aten::lerp_.Scalar": "test_lerp_inplace",
         "aten::clamp": "test_clamp",
+        "aten::clamp.Tensor": "test_clamp_tensor",
         "aten::addcdiv": "test_addcdiv",
         "aten::addcdiv.out": "test_addcdiv_inplace",
         "aten::addcdiv_": "test_addcdiv_inplace",
@@ -125,6 +126,11 @@ _OUT = (
     "(computed straight into `out` when it has the result's dtype, shape and "
     "a dense layout, else computed then copied into it)"
 )
+_CLAMP_SCALAR = "the ClampScalar kernel test_clamp measures, one bound disabled"
+_MAXMIN_BOUND = (
+    "ATen's clamp_{min,max}_Tensor_out is maximum_stub / minimum_stub: the "
+    "MaximumSpec / MinimumSpec kernels test_minmax measures"
+)
 
 SKIPPED: dict[str, str] = {
     "aten::bitwise_and.Scalar_out": _OUT,
@@ -133,6 +139,16 @@ SKIPPED: dict[str, str] = {
     "aten::bitwise_or.Tensor_out": _OUT,
     "aten::bitwise_xor.Scalar_out": _OUT,
     "aten::bitwise_xor.Tensor_out": _OUT,
+    "aten::clamp.Tensor_out": _OUT,
+    "aten::clamp.out": _OUT,
+    "aten::clamp_max": _CLAMP_SCALAR,
+    "aten::clamp_max.Tensor": _MAXMIN_BOUND,
+    "aten::clamp_max.Tensor_out": _OUT,
+    "aten::clamp_max.out": _OUT,
+    "aten::clamp_min": _CLAMP_SCALAR,
+    "aten::clamp_min.Tensor": _MAXMIN_BOUND,
+    "aten::clamp_min.Tensor_out": _OUT,
+    "aten::clamp_min.out": _OUT,
     "aten::logical_and.out": _OUT,
     "aten::logical_or.out": _OUT,
     "aten::logical_xor.out": _OUT,
@@ -458,6 +474,23 @@ def test_clamp(
     bench.run(
         lambda: torch.clamp(a_ref, 0.2, 0.8),
         lambda: torch.clamp(a_our, 0.2, 0.8),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("clamp.Tensor")
+def test_clamp_tensor(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    # The bounds are built once, outside the timed legs: only clamp is measured.
+    lo_ref, hi_ref = b_ref - 0.2, b_ref + 0.2
+    lo_our, hi_our = b_our - 0.2, b_our + 0.2
+    bench.run(
+        lambda: torch.clamp(a_ref, lo_ref, hi_ref),
+        lambda: torch.clamp(a_our, lo_our, hi_our),
         flops=float(a_ref.numel()),
     )
 

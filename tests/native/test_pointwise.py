@@ -300,3 +300,48 @@ def test_gelu_backward_functional(mojo_gpu, approximate, dtype):
         ).to(dtype),
         **tol,
     )
+
+
+# ---------------------------------------------------------------------------
+# clamp.Tensor: tensor-valued bounds, broadcasting, mixed dtypes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_clamp_tensor(mojo_gpu, dtype):
+    torch.manual_seed(6)
+    if dtype.is_floating_point:
+        x = torch.cat([torch.tensor(_SPECIAL), torch.randn(40) * 3]).to(dtype)
+    else:
+        x = torch.randint(-20, 20, (57,), dtype=dtype)
+    lo = (torch.arange(x.numel()) % 5 - 3).to(dtype)
+    hi = (torch.arange(x.numel()) % 4).to(dtype)
+    with ran("aten::clamp.Tensor"):
+        actual = torch.clamp(x.to(mojo_gpu), lo.to(mojo_gpu), hi.to(mojo_gpu))
+    _close(actual, torch.clamp(x, lo, hi))
+    _close(torch.clamp(x.to(mojo_gpu), min=lo.to(mojo_gpu)), torch.clamp(x, min=lo))
+    _close(torch.clamp(x.to(mojo_gpu), max=hi.to(mojo_gpu)), torch.clamp(x, max=hi))
+    out = torch.empty_like(x, device=mojo_gpu)
+    torch.clamp(x.to(mojo_gpu), lo.to(mojo_gpu), hi.to(mojo_gpu), out=out)
+    _close(out, torch.clamp(x, lo, hi))
+    if dtype.is_floating_point:
+        nan_lo = lo.clone()
+        nan_lo[3] = float("nan")
+        _close(
+            torch.clamp(x.to(mojo_gpu), nan_lo.to(mojo_gpu), hi.to(mojo_gpu)),
+            torch.clamp(x, nan_lo, hi),
+        )
+
+
+def test_clamp_tensor_mixed_dtypes(mojo_gpu):
+    x = torch.randn(5, 4)
+    lo = torch.randint(-1, 1, (5, 4), dtype=torch.int32)
+    hi = torch.randint(0, 2, (4,), dtype=torch.int64)
+    _close(torch.clamp(x.to(mojo_gpu), lo.to(mojo_gpu)), torch.clamp(x, lo))
+    _close(torch.clamp(x.to(mojo_gpu), None, hi.to(mojo_gpu)), torch.clamp(x, None, hi))
+    _close(
+        torch.clamp(x.to(mojo_gpu), lo.to(mojo_gpu), hi.to(mojo_gpu)),
+        torch.clamp(x, lo, hi),
+    )
+    xb = x.bfloat16()
+    _close(torch.clamp(xb.to(mojo_gpu), lo.to(mojo_gpu)), torch.clamp(xb, lo))

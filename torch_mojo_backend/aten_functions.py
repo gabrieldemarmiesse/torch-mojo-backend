@@ -2035,6 +2035,11 @@ def aten_clamp(
     Implements torch.clamp by clamping all elements in input to the range [min, max].
     Uses F.max and F.min to implement clamp as:
     clamp(x, min, max) = min(max(x, min), max)
+
+    ATen's clamp propagates NaN (a NaN input or bound gives NaN), whereas
+    MAX's max/min return the other operand, so a floating result also
+    selects NaN wherever an operand is NaN (hardsigmoid, which decomposes to
+    clamp, relies on it too).
     """
     result = input
 
@@ -2046,7 +2051,24 @@ def aten_clamp(
     if max is not None:
         result = F.min(result, max)
 
-    return result
+    if not result.dtype.is_float():
+        return result
+    nan_mask = None
+    for operand in (input, min, max):
+        if isinstance(operand, TensorValue | MaxEagerTensor):
+            if not operand.dtype.is_float():
+                continue
+            is_nan = custom_mojo_ops.elementwise(operand, "isnan")
+            nan_mask = is_nan if nan_mask is None else F.logical_or(nan_mask, is_nan)
+        elif isinstance(operand, float) and math.isnan(operand):
+            return F.broadcast_to(
+                F.constant(math.nan, dtype=result.dtype, device=result.device),
+                result.shape,
+            )
+    if nan_mask is None:
+        return result
+    nan = F.constant(math.nan, dtype=result.dtype, device=result.device)
+    return _where(nan_mask, nan, result)
 
 
 # clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor

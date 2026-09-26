@@ -3811,6 +3811,31 @@ def test_torch_clamp_tensor_bounds(device: str, tensor_shapes: tuple[int, ...]):
     check_functions_are_equivalent(fn, device, [a, min_tensor, mojo_tensor])
 
 
+def test_torch_clamp_propagates_nan(device: str):
+    """A NaN input or bound gives NaN (MAX's max/min alone drop it); the
+    clamp_min / clamp_max / hardsigmoid decompositions land on the same
+    twin. Compared with equal_nan, which check_functions_are_equivalent
+    does not pass."""
+    nan = float("nan")
+
+    def fn(x, lo, hi):
+        return (
+            torch.clamp(x, -0.5, 0.7),
+            torch.clamp_min(x, 0.0),
+            torch.clamp_max(x, 0.0),
+            torch.clamp(x, lo, hi),
+            F.hardsigmoid(x),
+        )
+
+    x = torch.tensor([nan, -4.0, 0.25, 4.0, 1.0])
+    lo = torch.tensor([0.0, nan, 0.0, 0.0, 0.0])
+    hi = torch.tensor([1.0, 1.0, 1.0, nan, 0.5])
+    inputs = [t.to(device) for t in (x, lo, hi)]
+    compiled = torch.compile(fn, backend=mojo_backend)(*inputs)
+    for got, expected in zip(compiled, fn(*inputs), strict=True):
+        torch.testing.assert_close(got, expected, equal_nan=True)
+
+
 def test_torch_clamp_edge_cases(conf: Conf):
     """Test torch.clamp edge cases with specific values."""
 
