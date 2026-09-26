@@ -1,8 +1,8 @@
 # ===----------------------------------------------------------------------=== #
 # Fast eager-mode reduction kernels for mojo_device.
 #
-# The scalar reductions -- sum / mean / amax / amin / max / min / L2 norm /
-# any / all -- are NOT written here: they are one accumulator apiece against
+# The scalar reductions -- sum / mean / amax / amin / max / min / L2 and
+# -inf norms / any / all -- are NOT written here: they are one accumulator apiece against
 # the generic skeleton in `reduce_skeleton.mojo`, which owns the geometry, the
 # split-the-reduce-axis launch policy and the workspace merge. This file keeps
 # what is not a scalar reduction: the variance moments (a two-slot payload with
@@ -62,6 +62,7 @@ from tmb.kernels.reduction.reduce_skeleton import (
     MaxOp,
     MinOp,
     NormL2Op,
+    NormNegInfOp,
     SumOp,
     _rowred_spec_into_go,
 )
@@ -1237,6 +1238,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["NormSpec"]():
             _spec_dispatcher4[
                 _rowred_spec_into_go[NormL2Op], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["NormNegInfSpec"]():
+            _spec_dispatcher4[
+                _rowred_spec_into_go[NormNegInfOp], "a scalar-reduction spec op"
             ](argv, argc)
             return 0
         comptime if _op_on["LogSoftmaxSpec"]():

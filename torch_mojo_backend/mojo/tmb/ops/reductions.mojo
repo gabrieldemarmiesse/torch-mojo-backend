@@ -1,5 +1,5 @@
 """ATen ops: reductions (sum, mean, amax/amin, max/min, the arg-reductions,
-any/all, var, the L2 vector norm, cumsum, and sort/topk).
+any/all, var, the vector norm (ord=2, ord=-inf), cumsum, and sort/topk).
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`), keeping
 its three decisions:
@@ -23,7 +23,7 @@ contiguity, device and dtype only, so no post-reduction reshape is needed even
 on the permuted route.
 """
 from std.utils import IndexList
-from std.utils.numerics import nan
+from std.utils.numerics import min_or_neg_inf, nan
 
 from tmb.backend.abi import (
     ST_BOOL,
@@ -1145,16 +1145,27 @@ def op_var_correction(
 
 
 # ---------------------------------------------------------------------------
-# linalg_vector_norm (ord=2 only: one pass, the root folded into the finalize)
+# linalg_vector_norm: ord=2 (sum of squares, one-pass) and ord=-inf (min of
+# |x|, one-pass) share everything but the accumulator; other ords decline.
 # ---------------------------------------------------------------------------
 
 
-def _vector_norm_operand(ord_v: Value, dtype_v: Value, mut src: Operand) raises:
-    """The `ord` / `dtype=` gates shared by the functional and out= forms:
-    only the ord-2 one-pass accumulator exists, and `dtype=` selects the
-    accumulation type by casting first (clip_grad_norm_ asks for float32)."""
-    if v_scalar_is_bool(ord_v) or v_f64(ord_v) != 2.0:
-        unsupported("linalg_vector_norm with ord != 2")
+def _vector_norm_spec(ord_v: Value) raises -> StaticString:
+    """Which one-pass accumulator `ord` selects; anything else declines."""
+    if v_scalar_is_bool(ord_v):
+        unsupported("linalg_vector_norm with ord != 2 and ord != -inf")
+    var ord_f = v_f64(ord_v)
+    if ord_f == 2.0:
+        return "NormSpec"
+    if ord_f == min_or_neg_inf[DType.float64]():
+        return "NormNegInfSpec"
+    unsupported("linalg_vector_norm with ord != 2 and ord != -inf")
+    return ""
+
+
+def _vector_norm_operand(dtype_v: Value, mut src: Operand) raises:
+    """The `dtype=` gate shared by every ord: it selects the accumulation
+    type by casting first (clip_grad_norm_ asks for float32)."""
     var want = _opt_dtype(dtype_v)
     if want >= 0:
         if not _is_float3(max_dtype(want)):
@@ -1173,14 +1184,19 @@ def op_linalg_vector_norm(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
+    var spec = _vector_norm_spec(args[unsafe_offset=1])
     var src = _borrow(a)
-    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
+    _vector_norm_operand(args[unsafe_offset=4], src)
     var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
     if len(dims) == 0:
         unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
+    if spec == "NormNegInfSpec":
+        # -inf has no identity: torch refuses a zero-length reduce dim (an
+        # empty output is still fine -- there is nothing to refuse for it).
+        _refuse_empty_extremum("linalg_vector_norm", src.t, dims)
     var out = _scalar_reduction(
         "reduction",
-        "NormSpec",
+        spec,
         src.t,
         dims,
         v_bool_or(args[unsafe_offset=3], False),
@@ -1201,14 +1217,17 @@ def op_linalg_vector_norm_out(
     var out = v_tensor(args[unsafe_offset=5])
     _require_mojo(a)
     _require_mojo(out)
+    var spec = _vector_norm_spec(args[unsafe_offset=1])
     var src = _borrow(a)
-    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
+    _vector_norm_operand(args[unsafe_offset=4], src)
     var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
     if len(dims) == 0:
         unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
+    if spec == "NormNegInfSpec":
+        _refuse_empty_extremum("linalg_vector_norm", src.t, dims)
     _scalar_reduction_out(
         "reduction",
-        "NormSpec",
+        spec,
         "aten::linalg_vector_norm.out",
         "exact",
         src.t,

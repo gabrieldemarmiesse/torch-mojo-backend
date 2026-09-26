@@ -51,6 +51,7 @@ _REDUCE_OPS = {
     "amax": lambda t, **kw: torch.amax(t, **kw),
     "amin": lambda t, **kw: torch.amin(t, **kw),
     "norm": lambda t, **kw: torch.linalg.vector_norm(t, **kw),
+    "norm_neginf": lambda t, **kw: torch.linalg.vector_norm(t, ord=float("-inf"), **kw),
     "all": lambda t, **kw: torch.all(t, **kw),
     "any": lambda t, **kw: torch.any(t, **kw),
 }
@@ -753,6 +754,96 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
     torch.testing.assert_close(
         torch.linalg.vector_norm(empty).cpu(), torch.tensor(0.0), rtol=0, atol=0
     )
+
+
+# ---------------------------------------------------------------------------
+# linalg_vector_norm(ord=-inf): min of |x|, NormNegInfOp
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape,dim",
+    [((4099, 1031), 1), ((5003, 37), 1), ((1031, 4099), 0), ((1 << 20,), 0)],
+)
+def test_vector_norm_neginf_matches_torch(mojo_gpu, shape, dim, dtype):
+    x = (torch.rand(shape) * 0.9 + 0.05).to(dtype)
+    ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=float("-inf"), dim=dim).cpu()
+    expected = torch.linalg.vector_norm(x.double(), ord=float("-inf"), dim=dim)
+    torch.testing.assert_close(ours.double(), expected, atol=0, rtol=1e-2)
+
+
+@pytest.mark.parametrize("keepdim", [True, False])
+@pytest.mark.parametrize("dims", [(0,), (1,), (0, 1), (-1,), None])
+def test_vector_norm_neginf_dims_and_keepdim(mojo_gpu, dims, keepdim):
+    x = torch.rand(5, 7) * 0.9 + 0.05
+    kwargs = {} if dims is None else {"dim": dims}
+    expected = torch.linalg.vector_norm(x, ord=float("-inf"), keepdim=keepdim, **kwargs)
+    ours = torch.linalg.vector_norm(
+        x.to(mojo_gpu), ord=float("-inf"), keepdim=keepdim, **kwargs
+    ).cpu()
+    torch.testing.assert_close(ours, expected)
+
+
+def test_vector_norm_neginf_noncontiguous(mojo_gpu):
+    contiguous = torch.linspace(-3.0, 4.0, 35).reshape(5, 7)
+    strided = contiguous.t()
+    assert not strided.is_contiguous()
+    expected = torch.linalg.vector_norm(strided, ord=float("-inf"))
+    device_strided = contiguous.to(mojo_gpu).t()
+    ours = torch.linalg.vector_norm(device_strided, ord=float("-inf")).cpu()
+    torch.testing.assert_close(ours, expected)
+
+
+def test_vector_norm_neginf_nan_propagates(mojo_gpu):
+    x = torch.tensor([1.0, float("nan"), 2.0])
+    expected = torch.linalg.vector_norm(x, ord=float("-inf"))
+    ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=float("-inf")).cpu()
+    torch.testing.assert_close(ours, expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vector_norm_neginf_with_an_accumulation_dtype(mojo_gpu, dtype):
+    cpu = torch.randn(4096, dtype=dtype)
+    expected = torch.linalg.vector_norm(cpu, float("-inf"), dtype=torch.float32)
+    got = torch.linalg.vector_norm(cpu.to(mojo_gpu), float("-inf"), dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+
+def test_vector_norm_neginf_out_resizes(mojo_gpu):
+    """A wrongly-shaped `out=` is resized, matching every ATen out= op."""
+    x = torch.rand(5, 7) * 0.9 + 0.05
+    expected = torch.linalg.vector_norm(x, ord=float("-inf"), dim=1)
+    out = torch.empty(1, dtype=torch.float32, device=mojo_gpu)  # wrong shape
+    returned = torch.linalg.vector_norm(
+        x.to(mojo_gpu), ord=float("-inf"), dim=1, out=out
+    )
+    assert returned.data_ptr() == out.data_ptr()
+    assert out.shape == (5,)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_vector_norm_neginf_empty_reduce_dim_declines(mojo_gpu):
+    """Unlike the L2 norm (identity 0), ord=-inf has no identity: torch
+    refuses a reduction over a zero-length axis, and so must we."""
+    x = torch.empty(3, 0).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x, ord=float("-inf"), dim=1)
+    # An empty OUTPUT is fine even with a zero-length axis elsewhere.
+    empty_out = torch.empty(0, 7).to(mojo_gpu)
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(empty_out, ord=float("-inf"), dim=1).cpu(),
+        torch.empty(0),
+    )
+
+
+@pytest.mark.parametrize("ord", [1, float("inf"), 0])
+def test_vector_norm_other_ords_still_decline(mojo_gpu, ord):
+    """ord=1 / inf / 0 are sibling agents' work, not this one's; must not be
+    silently misrouted to the L2 or -inf accumulator."""
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(torch.randn(4, 5).to(mojo_gpu), ord=ord)
 
 
 # ---------------------------------------------------------------------------
