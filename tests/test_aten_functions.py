@@ -5344,6 +5344,15 @@ def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dty
     _compiled_matches_cpu(fn, [x, y])
 
 
+def test_aten_rsub(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::rsub.Tensor", "aten::rsub.Scalar")
+
+    def fn(a, b):
+        return aten.rsub(a, b, alpha=2), aten.rsub(a, 1.5)
+
+    check_outputs(fn, conf, [torch.randn(3, 4), torch.randn(4)])
+
+
 def test_aten_logical_and_bool_tensors(conf: Conf):
     """Test aten.logical_and with boolean tensors"""
 

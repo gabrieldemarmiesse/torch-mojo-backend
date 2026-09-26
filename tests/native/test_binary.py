@@ -1621,6 +1621,80 @@ def test_clamp_nan_bound_fills_nan(mojo_device):
 
 
 # --------------------------------------------------------------------------
+# rsub: other - alpha * self as one sub launch
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64]
+)
+def test_rsub(mojo_gpu, dtype):
+    a_cpu, a = _both((4, 5), dtype, mojo_gpu)
+    b_cpu, b = _both((5,), dtype, mojo_gpu)
+    native.op_counting(True)
+    native.op_counts_reset()
+    got = torch.rsub(a, b)
+    assert native.op_counts() == {"aten::rsub.Tensor": 1}
+    torch.testing.assert_close(got.cpu(), torch.rsub(a_cpu, b_cpu))
+    native.op_counts_reset()
+    got = torch.rsub(a, 3)
+    assert native.op_counts() == {"aten::rsub.Scalar": 1}
+    torch.testing.assert_close(got.cpu(), torch.rsub(a_cpu, 3))
+    torch.testing.assert_close(
+        torch.rsub(a, b, alpha=2).cpu(), torch.rsub(a_cpu, b_cpu, alpha=2)
+    )
+    torch.testing.assert_close(
+        torch.rsub(a, 3, alpha=2).cpu(), torch.rsub(a_cpu, 3, alpha=2)
+    )
+    torch.testing.assert_close(
+        torch.rsub(a.t(), b[:, None]).cpu(), torch.rsub(a_cpu.t(), b_cpu[:, None])
+    )
+
+
+def test_rsub_promotion_and_out(mojo_gpu):
+    i_cpu = torch.arange(6)
+    i = i_cpu.to(mojo_gpu)
+    got = torch.rsub(i, 3.5)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), torch.rsub(i_cpu, 3.5))
+    f_cpu = torch.randn(6)
+    out = torch.empty(6, device=mojo_gpu)
+    torch.ops.aten.rsub.Tensor_out(f_cpu.to(mojo_gpu), f_cpu.to(mojo_gpu) * 2, out=out)
+    torch.testing.assert_close(out.cpu(), f_cpu)
+    torch.ops.aten.rsub.Scalar_out(f_cpu.to(mojo_gpu), 1.0, out=out)
+    torch.testing.assert_close(out.cpu(), 1.0 - f_cpu)
+
+
+def test_rsub_autograd(mojo_gpu):
+    a_cpu = torch.randn(3, 4, requires_grad=True)
+    b_cpu = torch.randn(3, 4, requires_grad=True)
+    a = a_cpu.detach().to(mojo_gpu).requires_grad_()
+    b = b_cpu.detach().to(mojo_gpu).requires_grad_()
+    (torch.rsub(a, b, alpha=3) * torch.rsub(a, 2.0)).sum().backward()
+    (torch.rsub(a_cpu, b_cpu, alpha=3) * torch.rsub(a_cpu, 2.0)).sum().backward()
+    assert a.grad is not None and b.grad is not None
+    torch.testing.assert_close(a.grad.cpu(), a_cpu.grad)
+    torch.testing.assert_close(b.grad.cpu(), b_cpu.grad)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_rsub_alpha_is_one_fused_step(mojo_gpu, dtype):
+    """CUDA's sub kernel computes other - alpha * self as one fma in float
+    (a Python-number other stays in float): no rounding of alpha * self to
+    the half dtype first, as the CPU kernel does."""
+    torch.manual_seed(0)
+    x = (torch.randn(257) * 8).to(dtype)
+    o = (torch.randn(257) * 8).to(dtype)
+    got = torch.rsub(x.to(mojo_gpu), o.to(mojo_gpu), alpha=-3.125).cpu()
+    want = (o.double() + 3.125 * x.double()).float().to(dtype)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    got = torch.rsub(x.to(mojo_gpu), 1.7, alpha=0.3).cpu()
+    alpha, other = torch.tensor([0.3, 1.7]).tolist()  # rounded to float
+    want = (other - alpha * x.double()).float().to(dtype)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+# --------------------------------------------------------------------------
 # pow special values (C99 Annex F, what ::pow / ::powf return on CUDA)
 # --------------------------------------------------------------------------
 
