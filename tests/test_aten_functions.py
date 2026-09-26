@@ -5372,6 +5372,80 @@ def test_aten_inf_predicates(conf: Conf, call_checker: CallChecker, name: str):
     check_outputs(fn, conf, [torch.tensor(_INF_EDGES)])
 
 
+# Unary math and special functions: (aten_functions twin, aten call, input).
+_SPECIAL_UNARY_CASES = [
+    ("asin", lambda x: aten.asin(x), [-1.0, -0.5, 0.0, 0.25, 1.0]),
+    ("atan", lambda x: aten.atan(x), [-50.0, -1.0, 0.0, 0.5, 3.0]),
+    ("exp2", lambda x: aten.exp2(x), [-100.0, -1.5, 0.0, 3.0, 60.0]),
+    ("expm1", lambda x: aten.expm1(x), [-20.0, -1e-4, 0.0, 1e-3, 5.0]),
+    ("log10", lambda x: aten.log10(x), [1e-3, 0.5, 1.0, 10.0, 1e5]),
+]
+
+
+# Float and double only in stock torch (AT_DISPATCH_FLOATING_TYPES).
+_NO_HALF_KERNEL: set[str] = set()
+
+
+# logit's bfloat16 reference would be CPU torch's reduced-precision path,
+# which differs from CUDA's (float compute, one rounding; what the device does).
+_SPECIAL_UNARY_PARAMS = [
+    pytest.param(name, fn, values, dtype, id=f"{name}-{i}-{str(dtype)[6:]}")
+    for i, (name, fn, values) in enumerate(_SPECIAL_UNARY_CASES)
+    for dtype in (torch.float32, torch.bfloat16)
+    if dtype == torch.float32 or name not in _NO_HALF_KERNEL | {"logit"}
+]
+
+
+@pytest.mark.parametrize("name,fn,values,dtype", _SPECIAL_UNARY_PARAMS)
+def test_aten_special_unary(
+    conf: Conf,
+    call_checker: CallChecker,
+    name: str,
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    values: list[float],
+    dtype: torch.dtype,
+):
+    call_checker.register(getattr(aten_functions, f"aten_{name}"))
+    check_outputs(fn, conf, [torch.tensor(values, dtype=dtype)])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_aten_special_unary_compiled_batch(dtype: torch.dtype, device: str):
+    """The torch.compile twins of every case above, in one graph (the shared
+    elementwise kinds, the polygamma binary op and the compositions), against
+    stock torch on the same device."""
+    checkers = []
+    for name, _, _ in _SPECIAL_UNARY_CASES:
+        checker = CallChecker()
+        checker.register(getattr(aten_functions, f"aten_{name}"))
+        checkers.append(checker)
+    # The graph follows CUDA's reduced-precision arithmetic on every device:
+    # logit in float with one rounding, round.decimals in the tensor dtype.
+    # CPU torch does neither, and stock CUDA has no half angle to compare to.
+    no_half = {"logit", "round"} if device == "cpu" else {"angle"}
+    cases = [
+        case
+        for case in _SPECIAL_UNARY_CASES
+        if dtype == torch.float32 or case[0] not in _NO_HALF_KERNEL | no_half
+    ]
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(case[1](x) for case in cases)
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    x = torch.linspace(0.05, 0.95, 64, dtype=torch.float32, device=device).to(dtype)
+    for case, result, expected in zip(cases, compiled(x), fn(x), strict=True):
+        torch.testing.assert_close(
+            result,
+            expected,
+            equal_nan=True,
+            msg=lambda message, name=case[0]: f"{name}: {message}",
+        )
+    called = [c for c, case in zip(checkers, _SPECIAL_UNARY_CASES) if case in cases]
+    for checker in called:
+        checker.check_was_called()
+
+
 def test_aten_logical_and_bool_tensors(conf: Conf):
     """Test aten.logical_and with boolean tensors"""
 

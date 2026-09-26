@@ -1798,6 +1798,9 @@ def aten_argmin(
 
 # as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)
 # asin(Tensor self) -> Tensor
+@map_to(aten.asin)
+def aten_asin(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "asin")
 
 
 # asinh(Tensor self) -> Tensor
@@ -1807,6 +1810,11 @@ def aten_asinh(x: MaxTensor) -> MaxTensor:
 
 
 # atan(Tensor self) -> Tensor
+@map_to(aten.atan)
+def aten_atan(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "atan")
+
+
 # atan2(Tensor self, Tensor other) -> Tensor
 # atan2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 
@@ -2807,6 +2815,12 @@ def aten_exp(input: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(input, "exp")
 
 
+# exp2(Tensor self) -> Tensor
+@map_to(aten.exp2)
+def aten_exp2(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "exp2")
+
+
 # expand(Tensor(a) self, SymInt[] size, *, bool implicit=False) -> Tensor(a)
 @map_to(aten.expand)
 def aten_expand(
@@ -2841,6 +2855,11 @@ def aten_expand(
 
 
 # expm1(Tensor self) -> Tensor
+@map_to(aten.expm1)
+def aten_expm1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "expm1")
+
+
 # fill.Scalar(Tensor self, Scalar value) -> Tensor
 @map_to(aten.fill)
 def aten_fill_scalar(input: MaxTensor, value: Scalar) -> MaxTensor:
@@ -3408,6 +3427,9 @@ def aten_log(input: MaxTensor) -> MaxTensor:
 
 
 # log10(Tensor self) -> Tensor
+@map_to(aten.log10)
+def aten_log10(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "log10")
 
 
 # log1p(Tensor self) -> Tensor
