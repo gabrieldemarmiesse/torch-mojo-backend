@@ -2686,8 +2686,14 @@ def register_pointwise(site: Site) raises:
     impl[op_lerp_scalar_any, "lerp.Scalar"](site)
     impl[op_lerp_scalar_out_any, "lerp.Scalar_out"](site)
     impl[op_lerp_scalar__any, "lerp_.Scalar"](site)
+    impl[op_lerp_tensor, "lerp.Tensor"](site)
+    impl[op_lerp_tensor_out, "lerp.Tensor_out"](site)
+    impl[op_pow_scalar_base, "pow.Scalar"](site)
+    impl[op_pow_scalar_base_out, "pow.Scalar_out"](site)
     impl[op_pow_scalar_any, "pow.Tensor_Scalar"](site)
+    impl[op_pow_scalar_out_any, "pow.Tensor_Scalar_out"](site)
     impl[op_pow_tensor_any, "pow.Tensor_Tensor"](site)
+    impl[op_pow_tensor_out_any, "pow.Tensor_Tensor_out"](site)
 
 
 comptime op_special_chebyshev_polynomial_t = op_poly[

@@ -200,7 +200,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "kthvalue": ("bfloat16", "int64"),
     "lcm": ("int64",),
     "ldexp": ("float32", "int64", "bool"),
-    "lerp": ("float32", "bfloat16", "float16"),
     "lgamma": ("float32", "bfloat16", "float16", "int64", "bool"),
     "linalg_cholesky": ("float32",),
     "linalg_cholesky_ex": ("float32",),

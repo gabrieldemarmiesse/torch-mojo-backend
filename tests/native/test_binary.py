@@ -1484,6 +1484,7 @@ _OUT_OPS = [
     ("bitwise_and", torch.bitwise_and, torch.int32),
     ("bitwise_or", torch.bitwise_or, torch.int64),
     ("bitwise_xor", torch.bitwise_xor, torch.int32),
+    ("pow", torch.pow, torch.float32),
 ]
 
 
@@ -1534,6 +1535,9 @@ def test_binary_scalar_out_variants(mojo_device):
     out = torch.empty(7, device=mojo_device)
     torch.remainder(f, 0.75, out=out)
     torch.testing.assert_close(out.cpu(), torch.remainder(f_cpu, 0.75))
+    out = torch.empty(7, device=mojo_device)
+    torch.pow(f.abs(), 1.5, out=out)
+    torch.testing.assert_close(out.cpu(), torch.pow(f_cpu.abs(), 1.5))
 
 
 def test_logical_or(mojo_device, call_checker):
