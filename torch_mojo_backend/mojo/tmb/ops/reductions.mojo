@@ -1155,6 +1155,28 @@ def op_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+# aten::any.all_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_any_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=1])
+    _require_mojo(a)
+    _require_mojo(out)
+    if not _is_truthy(a.dtype):
+        unsupported("any of dtype " + String(a.dtype))
+    _scalar_reduction_out(
+        "reduction",
+        "AnySpec",
+        "aten::any.all_out",
+        "bool_or_uint8",
+        a,
+        _reduce_dims(_none_value(), a.rank, False),
+        False,
+        ST_BOOL,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
 # aten::any.dim(Tensor self, int dim, bool keepdim=False) -> Tensor
 # aten::any.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor
 def op_any_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -1170,6 +1192,10 @@ def op_any_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::any.out(Tensor self, int dim, bool keepdim=False, *,
 #   Tensor(a!) out) -> Tensor(a!)
+# aten::any.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+# `_reduce_dims` reads the dim arg's Value tag (plain int for any.out, an
+# optional int list for any.dims_out), so one body serves both overloads.
 def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=3])
@@ -2038,8 +2064,10 @@ def register_reductions(site: Site) raises:
     impl[op_amax_out, "amax.out"](site)
     impl[op_amin, "amin"](site)
     impl[op_any, "any"](site)
+    impl[op_any_all_out, "any.all_out"](site)
     impl[op_any_dim, "any.dim"](site)
     impl[op_any_dim, "any.dims"](site)
+    impl[op_any_out, "any.dims_out"](site)
     impl[op_any_out, "any.out"](site)
     impl[op_argmax, "argmax"](site)
     impl[op_argmin, "argmin"](site)

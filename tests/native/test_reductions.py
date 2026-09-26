@@ -559,6 +559,99 @@ def test_any_out_accepts_a_uint8_destination(mojo_gpu):
         )
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.bool, torch.uint8, torch.int32, torch.float32, torch.float16]
+)
+def test_any_all_out_full_reduction(mojo_gpu, dtype):
+    """`any.all_out`: no dim/keepdim args, always reduces to a 0-d result.
+
+    The `out=` dtype is bool here on both sides, so the input-dtype-dependent
+    result-dtype rule (`aten::any` w/o `out` keeps a uint8 input as uint8)
+    does not come into play; that overload is unrelated to this one.
+    """
+    x = (torch.randn(5, 6) > 0.3).to(dtype)
+    xd = x.to(mojo_gpu)
+    out = torch.empty((), dtype=torch.bool, device=mojo_gpu)
+    expected = torch.empty((), dtype=torch.bool)
+    torch.any(x, out=expected)
+    returned = torch.any(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # non-contiguous input
+    xt = x.t()
+    torch.any(xt, out=expected)
+    torch.any(xt.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # all-False input, including the empty-tensor case (identity = False)
+    zeros = torch.zeros(4, 0, dtype=dtype)
+    torch.any(zeros, out=expected)
+    torch.any(zeros.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_any_all_out_uint8_destination_and_resize(mojo_gpu):
+    """bool-or-uint8 dtype policy and `resize_output` apply to all_out too."""
+    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    expected = torch.any(mask)
+    out = torch.empty(4, dtype=torch.uint8, device=mojo_gpu)  # wrong shape too
+    torch.any(mask.to(mojo_gpu), out=out)
+    assert tuple(out.shape) == ()
+    torch.testing.assert_close(out.cpu(), expected.to(torch.uint8))
+    with pytest.raises(RuntimeError):
+        torch.any(
+            mask.to(mojo_gpu), out=torch.empty((), dtype=torch.float32, device=mojo_gpu)
+        )
+
+
+def test_any_all_out_nan_is_truthy(mojo_gpu):
+    x = torch.zeros(2, 100)
+    x[1, 50] = float("nan")
+    out = torch.empty((), dtype=torch.bool, device=mojo_gpu)
+    torch.any(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.any(x))
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize("dims", [None, [0], [1], [0, 2], [-1, 0]])
+def test_any_dims_out(mojo_gpu, dims, keepdim):
+    """`any.dims_out`: optional int[] dim (None = full reduce), like
+    `any.dims` but writing into `out`."""
+    x = torch.randn(3, 4, 5) > 0
+    xd = x.to(mojo_gpu)
+    expected = torch.any(x, dim=dims, keepdim=keepdim)
+    out = torch.empty(expected.shape, dtype=torch.bool, device=mojo_gpu)
+    returned = torch.ops.aten.any.dims_out(xd, dims, keepdim, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # non-contiguous input
+    xt = x.transpose(0, 1)
+    expected_t = torch.any(xt, dim=dims, keepdim=keepdim)
+    out_t = torch.empty(expected_t.shape, dtype=torch.bool, device=mojo_gpu)
+    torch.ops.aten.any.dims_out(xt.to(mojo_gpu), dims, keepdim, out=out_t)
+    torch.testing.assert_close(out_t.cpu(), expected_t)
+
+
+def test_any_dims_out_uint8_destination_and_resize(mojo_gpu):
+    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    expected = torch.any(mask, dim=[1])
+    out = torch.empty(0, dtype=torch.uint8, device=mojo_gpu)  # wrong shape
+    torch.ops.aten.any.dims_out(mask.to(mojo_gpu), [1], False, out=out)
+    assert tuple(out.shape) == expected.shape
+    torch.testing.assert_close(out.cpu(), expected.to(torch.uint8))
+
+
+def test_any_dims_out_empty_dim_list_declines(mojo_gpu):
+    """An explicit empty dim list is declined, matching `any.dims`
+    (`test_unsupported_inputs_raise_not_implemented`)."""
+    mask = torch.randint(0, 2, (3, 4), dtype=torch.bool)
+    out = torch.empty(3, 4, dtype=torch.bool, device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.any.dims_out(mask.to(mojo_gpu), [], False, out=out)
+
+
 def test_var_default_overloads_decompose_to_var_correction(mojo_gpu):
     """`var(unbiased=True)` and `var.dim` are ATen composites over
     var.correction, which is the one we register."""
@@ -1039,6 +1132,18 @@ _EXPECTED_OVERLOADS = [
         "aten::any.out",
         lambda d: torch.any(
             _bools().to(d), dim=1, out=torch.empty(4, dtype=torch.bool, device=d)
+        ),
+    ),
+    (
+        "aten::any.all_out",
+        lambda d: torch.any(
+            _bools().to(d), out=torch.empty((), dtype=torch.bool, device=d)
+        ),
+    ),
+    (
+        "aten::any.dims_out",
+        lambda d: torch.ops.aten.any.dims_out(
+            _bools().to(d), [0, 1], out=torch.empty((), dtype=torch.bool, device=d)
         ),
     ),
     ("aten::var.correction", lambda d: torch.var(torch.randn(4, 5).to(d), dim=1)),
