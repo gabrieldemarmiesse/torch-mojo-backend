@@ -44,6 +44,7 @@ from tmb.ops.common import (
     cast_to,
     contiguous,
     copy_strided_into,
+    elementwise_direct,
     fill_value,
     resize_out,
 )
@@ -185,22 +186,12 @@ def _one_device(a: T, b: T) raises:
 
 
 def _unary_direct(
-    family: String, op: String, src_c: T, dst: T, out_dtype: DType
+    family: String, op: String, src_c: T, mut dst: T, out_dtype: DType
 ) raises:
     """dst[...] = f(src_c[...]); src_c must already be contiguous, dst must
-    already be the right shape/dtype/contiguity."""
-    _one_device(src_c, dst)
-    if src_c.numel == 0:
-        return
-    var ctx = ctx_for(dst.device)
-    var cp = ctx_ptr(ctx)
-    var call = KernelCall(family, op)
-    call.arg_dtype(0, src_c.dtype)
-    call.out_dtype(out_dtype)
-    call.spec(src_c.spec(cp))
-    call.spec(dst.spec(cp))
-    call.run()
-    _ = ctx
+    already be the right shape/dtype/contiguity. Shared with the vector-norm
+    size-one-reduce fast path (`common.elementwise_direct`)."""
+    elementwise_direct(family, op, src_c, dst, out_dtype)
 
 
 def _unary(family: String, op: String, t_in: T, out_dtype: DType) raises -> T:

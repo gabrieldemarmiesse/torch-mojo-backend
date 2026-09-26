@@ -149,6 +149,19 @@ def assert_no_overlap(written: T, other: T) raises:
         )
 
 
+def assert_no_internal_overlap(t: T) raises:
+    """`at::assert_no_internal_overlap`: an `out=` tensor may not alias
+    itself (e.g. a size-1 storage `.expand()`ed to more than one logical
+    element) -- distinct reduction results written to the same physical
+    address would silently collapse into whichever write lands last."""
+    if _repeats_elements(t):
+        raise Error(
+            "unsupported operation: more than one element of the written-to"
+            " tensor refers to a single memory location. Please clone() the"
+            " tensor before performing the operation."
+        )
+
+
 def check_out(dest: T, like: T) raises:
     """The dtype and device half of torch's generated `resize_out`
     (torchgen/dest/register_dispatch_key.py, `gen_resize_out_helper`).
@@ -400,6 +413,40 @@ def cast_to(t: T, stype: Int32) raises -> T:
     cast_into(out.t, src.t)
     _ = src^  # alive past the launch (its last use above is the pointer read)
     return out.take()
+
+
+def one_device(a: T, b: T) raises:
+    """Both operands of a raw-pointer launch on the same mojo device. A
+    pointer belonging to another device -- or to no mojo device at all --
+    would be dereferenced against the wrong context."""
+    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+        raise Error("expected every operand on the same mojo device")
+
+
+def elementwise_direct(
+    family: String,
+    op: String,
+    src_c: T,
+    mut dst: T,
+    out_dtype: DType,
+) raises:
+    """dst[...] = f(src_c[...]); src_c must already be contiguous, dst must
+    already be the right shape/dtype/contiguity. The one-TensorSpec-in/
+    one-out shape every direct unary op (abs, neg, sign, ...) and the
+    vector-norm size-one-reduce fast path (reductions.mojo's
+    `_vector_norm_abs*`, also a true 1:1 elementwise op) share."""
+    one_device(src_c, dst)
+    if src_c.numel == 0:
+        return
+    var ctx = ctx_for(dst.device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall(family, op)
+    call.arg_dtype(0, src_c.dtype)
+    call.out_dtype(out_dtype)
+    call.spec(src_c.spec(cp))
+    call.spec(dst.spec(cp))
+    call.run()
+    _ = ctx
 
 
 def philox_reserve(

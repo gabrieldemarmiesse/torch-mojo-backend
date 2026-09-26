@@ -109,6 +109,18 @@ SKIPPED: dict[str, str] = {
         "full-sort route test_median and test_sort measure"
     ),
     "aten::nanmedian": "aten::median's route with nanmedian.dim's select mode",
+    "aten::norm.Scalar": "legacy norm overload -> the same ord-2 vector_norm kernel",
+    "aten::norm.ScalarOpt_dtype": (
+        "legacy norm overload -> the same ord-2 vector_norm kernel"
+    ),
+    "aten::norm.ScalarOpt_dim": (
+        "legacy norm overload -> the same ord-2 vector_norm kernel"
+    ),
+    "aten::norm.ScalarOpt_dim_dtype": (
+        "legacy norm overload -> the same ord-2 vector_norm kernel"
+    ),
+    "aten::norm.out": _SAME_KERNEL_OUT,
+    "aten::norm.dtype_out": _SAME_KERNEL_OUT,
 }
 
 

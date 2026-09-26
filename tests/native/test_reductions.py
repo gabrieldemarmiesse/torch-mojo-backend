@@ -830,6 +830,241 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
     )
 
 
+def test_vector_norm_declines_non_floating_input(mojo_gpu):
+    """`TORCH_META_FUNC(linalg_vector_norm)` calls `checkFloatingOrComplex` on
+    the INPUT's own dtype unconditionally, before ever looking at `dtype=`:
+    an integer/bool input is rejected even though `dtype=float32` would make
+    the cast well-defined."""
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(torch.randint(0, 9, (4, 5)).to(mojo_gpu), dim=1)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            torch.randint(0, 9, (4, 5)).to(mojo_gpu), dim=1, dtype=torch.float32
+        )
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            (torch.randn(4, 5) > 0).to(mojo_gpu), dim=1, dtype=torch.float32
+        )
+
+
+@pytest.mark.parametrize(
+    "src_dtype,target_dtype",
+    [
+        (torch.float32, torch.float16),
+        (torch.float32, torch.bfloat16),
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+    ],
+)
+def test_vector_norm_declines_narrowing_dtype(mojo_gpu, src_dtype, target_dtype):
+    """`check_linalg_norm_dtype`'s `promoteTypes(self_dtype, dtype) == dtype`:
+    among these three floats, only same-dtype or a target of float32 widens;
+    every other pair narrows and torch rejects it."""
+    x = torch.randn(4, 5, dtype=src_dtype)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x.to(mojo_gpu), dim=1, dtype=target_dtype)
+
+
+def test_vector_norm_out_declines_non_floating_input(mojo_gpu):
+    out = torch.empty(4, device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            torch.randint(0, 9, (4, 5)).to(mojo_gpu), dim=1, out=out
+        )
+
+
+@pytest.mark.parametrize(
+    "shape,dim,keepdim",
+    [((1,), 0, False), ((1, 1), None, False), ((5, 1), 1, False), ((5, 1), 1, True)],
+)
+def test_vector_norm_reduce_over_size_one_dims_uses_abs(mojo_gpu, shape, dim, keepdim):
+    """torch's `is_reduce_over_1D_vector`: every REDUCED dim has extent 1
+    (a kept dim may be any size), so the reduction is exactly `abs()`, not
+    square-then-sqrt -- squaring 1e20 overflows float32 to inf even though
+    abs(1e20) is exact (`linalg_vector_norm_out` in ATen's LinearAlgebra.cpp)."""
+    x = torch.tensor([1e20, -1e20, 3.0, -1.0, 0.0][: shape[0]], dtype=torch.float32)
+    x = x.reshape(shape)
+    expected = torch.linalg.vector_norm(x, dim=dim, keepdim=keepdim)
+    assert torch.isfinite(
+        expected
+    ).all()  # sanity: the reference itself must not be inf
+    got = torch.linalg.vector_norm(x.to(mojo_gpu), dim=dim, keepdim=keepdim)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_reduce_over_size_one_dims_uses_abs(mojo_gpu):
+    """Same fix, reached through the legacy `norm.ScalarOpt_dim` overload."""
+    x = torch.tensor([[1e20], [-2.0], [3.0]], dtype=torch.float32)
+    expected = torch.linalg.vector_norm(x, dim=1)
+    got = torch.ops.aten.norm.ScalarOpt_dim(x.to(mojo_gpu), 2, [1], False)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_vector_norm_size_one_reduce_out_declines_aliasing_input(mojo_gpu):
+    """Any `out=` sharing storage with the input is declined outright, before
+    any resize is even considered -- not just when the current byte ranges
+    overlap. `resize_out` can reallocate a shared allocation to grow `dst`,
+    which would silently move the bytes `a`'s already-cached tensor info
+    still points at (see `_decline_aliasing_out`'s docstring); declining
+    every case uniformly avoids having to reason about which ones happen to
+    be safe. Covers: a genuinely shifted overlap, a same-tensor "in-place via
+    out=" call (`abs(x, out=x)` is fine on real torch, but this backend
+    declines it too rather than special-case it), and a same-storage `out=`
+    that merely reshapes the input (`x.squeeze(1)`, no resize needed and no
+    byte-range overlap either -- still declined, since it still shares
+    storage)."""
+    b = torch.arange(6, dtype=torch.float32).to(mojo_gpu)
+    inp = b[:-1].view(-1, 1)  # every reduced dim (dim=1) has extent 1
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(inp, dim=1, out=b[1:])
+
+    x = torch.tensor([[1e20], [-2.0], [3.0]], dtype=torch.float32).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x, dim=1, keepdim=True, out=x)
+
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x, dim=1, out=x.squeeze(1))
+
+
+def test_vector_norm_size_one_reduce_out_declines_wrong_dtype(mojo_gpu):
+    """Same `exact` out-dtype policy as the accumulator path (`_check_out_dtype`):
+    confirmed on stock CUDA torch that an integer `out=` for a float result is
+    rejected, not silently cast."""
+    x = torch.tensor([[1e20]], dtype=torch.float32).to(mojo_gpu)
+    out = torch.empty(1, dtype=torch.int64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.linalg.vector_norm(x, dim=1, out=out)
+
+
+def test_vector_norm_size_one_reduce_out_declines_aliasing_input_needing_resize(
+    mojo_gpu,
+):
+    """The hazard `_decline_aliasing_out` exists for: a same-storage `out=`
+    that does NOT currently overlap the input's bytes at all, but whose
+    resize (growing it in place) would reallocate the storage `a` also reads
+    through -- caught by the storage-identity check before resize is even
+    attempted, not by comparing byte ranges (which would find no overlap
+    here, before OR after resizing this particular pair of slices)."""
+    base = torch.arange(4, dtype=torch.float32).to(mojo_gpu)
+    inp = base[:3].view(3, 1)  # every reduced dim (dim=1) has extent 1
+    out = base[3:]  # 1 element; the result needs 3 -- same storage as inp
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(inp, dim=1, out=out)
+
+
+def test_vector_norm_size_one_reduce_out_declines_internal_overlap(mojo_gpu):
+    """An `out=` with more than one logical element sharing one physical
+    address (`.expand()`) must be declined, not silently collapse every
+    reduced row into whichever write happens to land last."""
+    x = torch.tensor([[1e20], [2.0], [3.0]], dtype=torch.float32).to(mojo_gpu)
+    out = torch.empty(1, device=mojo_gpu).expand(3)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.linalg.vector_norm(x, dim=1, out=out)
+
+
+def test_reduction_out_declines_internal_overlap(mojo_gpu):
+    """Same check, in the general (non size-one-reduce) `_scalar_reduction_out`
+    path every out= reduction shares -- stock CUDA torch actually tolerates
+    this for `sum.out` (every aliased position ends up holding whichever
+    result happened to be written last, which is never what the caller
+    wanted), so this backend is intentionally stricter here."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    out = torch.empty(1, device=mojo_gpu).expand(4)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.sum(x, dim=1, out=out)
+
+
+# ---------------------------------------------------------------------------
+# norm (legacy overloads): all route through the same ord-2 path as
+# linalg_vector_norm above, so these tests only need to check the schema
+# plumbing (p=None/2, dim=[]/None/single/multi, dtype=, out=), not the math.
+#
+# These call `torch.ops.aten.norm.*` directly rather than the public
+# `torch.norm`/`Tensor.norm`: on a strided PrivateUse1 tensor (ours),
+# `torch/functional.py`'s `norm()` always redirects to
+# `torch.linalg.vector_norm`/`matrix_norm`/`_VF.nuclear_norm` before the
+# dispatcher is ever reached (confirmed with the boxed-kernel counters --
+# `torch.norm(x.to(mojo_gpu), p=2, dim=1)` increments
+# `aten::linalg_vector_norm`, never any `aten::norm.*`), so no public API
+# reaches these overloads on this device.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("p", [None, 2, 2.0])
+def test_norm_scalar_defaults_to_p2_over_all_dims(mojo_gpu, p):
+    x = torch.randn(4, 5)
+    expected = torch.linalg.vector_norm(x)
+    if p is None:
+        got = torch.ops.aten.norm.Scalar(x.to(mojo_gpu))
+    else:
+        got = torch.ops.aten.norm.Scalar(x.to(mojo_gpu), p)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_scalaropt_dtype(mojo_gpu):
+    x = torch.randn(4, 5, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x, dtype=torch.float32)
+    got = torch.ops.aten.norm.ScalarOpt_dtype(x.to(mojo_gpu), None, dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+@pytest.mark.parametrize("dim", [None, 1, [0, 1], []])
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_norm_scalaropt_dim(mojo_gpu, dim, keepdim):
+    """An explicit empty dim list means "reduce every dim", same as dim=None,
+    unlike any.dims/all.dims."""
+    x = torch.randn(4, 5)
+    dim_arg = [] if dim is None else ([dim] if isinstance(dim, int) else dim)
+    expected = torch.linalg.vector_norm(
+        x, dim=(None if dim is None else dim), keepdim=keepdim
+    )
+    got = torch.ops.aten.norm.ScalarOpt_dim(x.to(mojo_gpu), 2, dim_arg, keepdim)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_scalaropt_dim_dtype(mojo_gpu):
+    x = torch.randn(4, 5, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x, dim=1, dtype=torch.float32)
+    got = torch.ops.aten.norm.ScalarOpt_dim_dtype(
+        x.to(mojo_gpu), None, [1], False, dtype=torch.float32
+    )
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_out_resizes_a_wrongly_shaped_out(mojo_gpu):
+    x = torch.randn(4, 5)
+    expected = torch.linalg.vector_norm(x, dim=1)
+    out = torch.empty(1, dtype=torch.float32, device=mojo_gpu)  # wrong shape
+    returned = torch.ops.aten.norm.out(x.to(mojo_gpu), 2, [1], False, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert out.shape == (4,)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_norm_dtype_out(mojo_gpu):
+    """float64 is out of scope: `_is_float3` (mean/var/L2-norm) never admits
+    it, same as `linalg_vector_norm`, so this exercises the accumulation-dtype
+    plumbing with float32 instead."""
+    x = torch.randn(4, 5, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x, dim=[0, 1], dtype=torch.float32)
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    returned = torch.ops.aten.norm.dtype_out(
+        x.to(mojo_gpu), None, [0, 1], False, dtype=torch.float32, out=out
+    )
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+
+def test_norm_declines_ord_other_than_2(mojo_gpu):
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.norm.Scalar(x, 1)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.norm.ScalarOpt_dim(x, float("inf"), [1], False)
+
+
 # ---------------------------------------------------------------------------
 # cumsum
 # ---------------------------------------------------------------------------
@@ -1050,6 +1285,45 @@ _EXPECTED_OVERLOADS = [
         "aten::linalg_vector_norm.out",
         lambda d: torch.linalg.vector_norm(
             torch.randn(4, 5).to(d), dim=1, out=torch.empty(4, device=d)
+        ),
+    ),
+    (
+        "aten::norm.Scalar",
+        lambda d: torch.ops.aten.norm.Scalar(torch.randn(4, 5).to(d)),
+    ),
+    (
+        "aten::norm.ScalarOpt_dtype",
+        lambda d: torch.ops.aten.norm.ScalarOpt_dtype(
+            torch.randn(4, 5).to(d), None, dtype=torch.float32
+        ),
+    ),
+    (
+        "aten::norm.ScalarOpt_dim",
+        lambda d: torch.ops.aten.norm.ScalarOpt_dim(
+            torch.randn(4, 5).to(d), 2, [1], False
+        ),
+    ),
+    (
+        "aten::norm.ScalarOpt_dim_dtype",
+        lambda d: torch.ops.aten.norm.ScalarOpt_dim_dtype(
+            torch.randn(4, 5).to(d), None, [1], False, dtype=torch.float32
+        ),
+    ),
+    (
+        "aten::norm.out",
+        lambda d: torch.ops.aten.norm.out(
+            torch.randn(4, 5).to(d), 2, [1], False, out=torch.empty(4, device=d)
+        ),
+    ),
+    (
+        "aten::norm.dtype_out",
+        lambda d: torch.ops.aten.norm.dtype_out(
+            torch.randn(4, 5).to(d),
+            None,
+            [1],
+            False,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float32, device=d),
         ),
     ),
     ("aten::cumsum", lambda d: torch.cumsum(torch.randn(4, 5).to(d), dim=1)),

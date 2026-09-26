@@ -62,12 +62,14 @@ from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    assert_no_internal_overlap,
     assert_no_overlap,
     cast_into,
     cast_to,
     check_out,
     contiguous,
     copy_strided_into,
+    elementwise_direct,
     fill_value,
     resize_out,
 )
@@ -614,6 +616,23 @@ def _shape_matches(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
     return True
 
 
+def _decline_aliasing_out(op_name: StaticString, a: T, dst: T) raises:
+    """`out=` sharing storage with the input is declined outright, before any
+    resize is even considered. Resizing an `out=` that shares `a`'s storage
+    is not one well-defined case: the resize hook can grow the shared
+    allocation, which reallocates the block `a`'s already-cached tensor info
+    points at -- verified on stock CUDA torch that this has no single
+    behavior worth reproducing: `torch.max(x, out=x[x.numel():])` is fine,
+    but `torch.max(x, out=x)` (`resize_output` shrinking `self`'s own
+    metadata out from under the reduction that is about to read it) comes
+    back with a silently WRONG answer on real CUDA, not merely a stale
+    pointer. Shared with the sibling out= overload fixes on other reduce ops
+    (see #565) so both land on the identical check."""
+    var a_storage = a.storage_ptr()
+    if a_storage != 0 and a_storage == dst.storage_ptr():
+        unsupported(String(op_name) + ": out= aliasing the input")
+
+
 def _scalar_reduction_out(
     family: StaticString,
     op: StaticString,
@@ -633,8 +652,18 @@ def _scalar_reduction_out(
     element count alone is not enough: the copy below reads the source
     through the destination's extents, so a (2,3) result poured into a (3,2)
     out would walk off the end of the source.
+
+    `assert_no_internal_overlap` (checked once here for every out= reduction,
+    after the resize decision since a resize that leaves the shape alone --
+    e.g. an already-right-shaped but `.expand()`ed `out=` -- is exactly the
+    case it must catch) declines an `out=` that repeats elements: several
+    logical output positions would alias one physical address, so distinct
+    reduction results written there would silently collapse into whichever
+    write lands last. `_decline_aliasing_out`, a separate concern, catches
+    `out=` sharing storage with the INPUT.
     """
     _one_device(a, dst)
+    _decline_aliasing_out(op_name, a, dst)
     _check_out_dtype(op_name, policy, max_dtype(out_stype), dst.dtype)
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
@@ -642,6 +671,7 @@ def _scalar_reduction_out(
     var numel = _shape_numel(shape, rank)
     if not _shape_matches(dst, shape, rank):
         resize_out(dst, shape, rank)
+    assert_no_internal_overlap(dst)
     if _out_ready(dst, a, out_stype, numel):
         _reduce_into(family, op, a, dims.copy(), keepdim, dst, False, 0.0)
         return
@@ -1228,25 +1258,173 @@ def op_var_correction(
 
 
 # ---------------------------------------------------------------------------
-# linalg_vector_norm (ord=2 only: one pass, the root folded into the finalize)
+# linalg_vector_norm / norm (ord=2 only: one pass, the root folded into the
+# finalize). `norm`'s six legacy overloads are torch's own redispatch onto
+# this op (`impl_func_norm` in ATen's ReduceOps.cpp: p=None -> 2, dim=[] ->
+# every dim), so they share every helper below with `linalg_vector_norm`.
 # ---------------------------------------------------------------------------
 
 
-def _vector_norm_operand(ord_v: Value, dtype_v: Value, mut src: Operand) raises:
-    """The `ord` / `dtype=` gates shared by the functional and out= forms:
-    only the ord-2 one-pass accumulator exists, and `dtype=` selects the
-    accumulation type by casting first (clip_grad_norm_ asks for float32)."""
-    if v_scalar_is_bool(ord_v) or v_f64(ord_v) != 2.0:
-        unsupported("linalg_vector_norm with ord != 2")
+def _vector_norm_operand(
+    op_label: StaticString, ord_v: Value, dtype_v: Value, mut src: Operand
+) raises:
+    """The `ord` / `dtype=` gates shared by every overload of both ops: only
+    the ord-2 one-pass accumulator exists, and `dtype=` selects the
+    accumulation type by casting first (clip_grad_norm_ asks for float32). A
+    missing `ord` (legacy `norm`'s `p=None`) means 2, same as torch's
+    `impl_func_norm`.
+
+    torch validates the INPUT's own dtype unconditionally
+    (`checkFloatingOrComplex` in `TORCH_META_FUNC(linalg_vector_norm)`)
+    before ever looking at `dtype=`, so an integer/bool input is declined
+    even when `dtype=float32` would make the cast well-defined; and `dtype=`
+    may only WIDEN (`check_linalg_norm_dtype`'s
+    `promoteTypes(self_dtype, dtype) == dtype`), so a float32 input with
+    `dtype=float16` is declined too. Restricted to the three floats this path
+    supports, "widen" means the same dtype or a target of float32.
+    """
+    if v_scalar_is_bool(ord_v) or v_f64_or(ord_v, 2.0) != 2.0:
+        unsupported(String(op_label) + " with ord != 2")
+    if not _is_float3(src.t.dtype):
+        unsupported(String(op_label) + " of dtype " + String(src.t.dtype))
     var want = _opt_dtype(dtype_v)
     if want >= 0:
-        if not _is_float3(max_dtype(want)):
+        var target = max_dtype(want)
+        if not _is_float3(target):
+            unsupported(String(op_label) + " with dtype=" + String(target))
+        if target != src.t.dtype and target != DType.float32:
             unsupported(
-                "linalg_vector_norm with dtype=" + String(max_dtype(want))
+                String(op_label)
+                + ": the dtype of the input ("
+                + String(src.t.dtype)
+                + ") can't convert without narrowing to dtype="
+                + String(target)
             )
         _promote(src, want)
-    if not _is_float3(src.t.dtype):
-        unsupported("linalg_vector_norm of dtype " + String(src.t.dtype))
+
+
+def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
+    """torch's `is_reduce_over_1D_vector`: every dim BEING REDUCED has extent
+    1 (a dim that is kept may be any size). Squaring a lone element can
+    overflow a magnitude the un-squared `abs` represents exactly (float32
+    1e20: `(1e20)**2` overflows to inf, `sqrt(inf)` stays inf), so torch
+    special-cases this to `abs()` instead of routing it through the
+    square-then-sqrt accumulator -- see `linalg_vector_norm_out` in ATen's
+    LinearAlgebra.cpp. (torch also special-cases `ord == 0` to `ne(0)`
+    there, but ord is always 2 on this path.)
+    """
+    for d in dims:
+        if a.dim(d) != 1:
+            return False
+    return True
+
+
+def _vector_norm_abs(a: T, dims: List[Int], keepdim: Bool) raises -> Owned:
+    """abs(a), reshaped to the reduced-and-squeezed (or kept-dims) output
+    shape; always a FRESH tensor, so this never reads and writes overlapping
+    memory regardless of what the caller does with the result."""
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    _reduced_shape(a, dims, keepdim, shape, rank)
+    var src_c = contiguous(a)
+    var out = own(new_tensor(shape, rank, a.stype, a.device))
+    elementwise_direct("elementwise", "AbsSpec", src_c, out.t, out.t.dtype)
+    if src_c.h != a.h:
+        release(src_c.h)
+    return out^
+
+
+def _vector_norm_abs_out(
+    op_name: StaticString, a: T, dims: List[Int], keepdim: Bool, mut dst: T
+) raises:
+    """Same policy as `_scalar_reduction_out`: dtype (`exact`), `out=`
+    aliasing the input declined outright before any resize
+    (`_decline_aliasing_out`), and `out=` repeating elements declined too
+    (`assert_no_internal_overlap`, after the resize decision).
+
+    The result is always computed into a FRESH tensor first (`_vector_norm_abs`,
+    never a direct launch into `dst`) and then copied in: with
+    `_decline_aliasing_out` already ruling out any shared storage between
+    `dst` and `a`, this is just the same "copy the result across" tail
+    `_scalar_reduction_out` uses.
+    """
+    _one_device(a, dst)
+    _decline_aliasing_out(op_name, a, dst)
+    _check_out_dtype(op_name, "exact", max_dtype(a.stype), dst.dtype)
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    _reduced_shape(a, dims, keepdim, shape, rank)
+    if not _shape_matches(dst, shape, rank):
+        resize_out(dst, shape, rank)
+    assert_no_internal_overlap(dst)
+    var result = _vector_norm_abs(a, dims, keepdim)
+    _copy_result_into(dst, result.t)
+    _ = result^
+
+
+def _vector_norm(
+    op_label: StaticString,
+    a: T,
+    ord_v: Value,
+    dim_v: Value,
+    keepdim: Bool,
+    dtype_v: Value,
+    rets: Values,
+) raises:
+    _require_mojo(a)
+    var src = _borrow(a)
+    _vector_norm_operand(op_label, ord_v, dtype_v, src)
+    var dims = _reduce_dims(dim_v, src.t.rank, True)
+    if len(dims) == 0:
+        unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
+    if _all_reduced_dims_size_one(src.t, dims):
+        var out = _vector_norm_abs(src.t, dims, keepdim)
+        ret_owned(rets, 0, out)
+        _ = src^
+        return
+    var out = _scalar_reduction(
+        "reduction", "NormSpec", src.t, dims, keepdim, src.t.stype, False, 0.0
+    )
+    ret_owned(rets, 0, out)
+    _ = src^
+
+
+def _vector_norm_out(
+    op_label: StaticString,
+    op_name: StaticString,
+    a: T,
+    ord_v: Value,
+    dim_v: Value,
+    keepdim: Bool,
+    dtype_v: Value,
+    mut out: T,
+    rets: Values,
+) raises:
+    _require_mojo(a)
+    _require_mojo(out)
+    var src = _borrow(a)
+    _vector_norm_operand(op_label, ord_v, dtype_v, src)
+    var dims = _reduce_dims(dim_v, src.t.rank, True)
+    if len(dims) == 0:
+        unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
+    if _all_reduced_dims_size_one(src.t, dims):
+        _vector_norm_abs_out(op_name, src.t, dims, keepdim, out)
+        ret_ref(rets, 0, out)
+        _ = src^
+        return
+    _scalar_reduction_out(
+        "reduction",
+        "NormSpec",
+        op_name,
+        "exact",
+        src.t,
+        dims,
+        keepdim,
+        src.t.stype,
+        out,
+    )
+    ret_ref(rets, 0, out)
+    _ = src^
 
 
 # aten::linalg_vector_norm(Tensor self, Scalar ord=2, int[1]? dim=None,
@@ -1254,25 +1432,15 @@ def _vector_norm_operand(ord_v: Value, dtype_v: Value, mut src: Operand) raises:
 def op_linalg_vector_norm(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    _require_mojo(a)
-    var src = _borrow(a)
-    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
-    var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
-    if len(dims) == 0:
-        unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
-    var out = _scalar_reduction(
-        "reduction",
-        "NormSpec",
-        src.t,
-        dims,
+    _vector_norm(
+        "linalg_vector_norm",
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
         v_bool_or(args[unsafe_offset=3], False),
-        src.t.stype,
-        False,
-        0.0,
+        args[unsafe_offset=4],
+        rets,
     )
-    ret_owned(rets, 0, out)
-    _ = src^
 
 
 # aten::linalg_vector_norm.out(Tensor self, Scalar ord=2, int[1]? dim=None,
@@ -1280,28 +1448,122 @@ def op_linalg_vector_norm(
 def op_linalg_vector_norm_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=5])
-    _require_mojo(a)
-    _require_mojo(out)
-    var src = _borrow(a)
-    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
-    var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
-    if len(dims) == 0:
-        unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
-    _scalar_reduction_out(
-        "reduction",
-        "NormSpec",
+    _vector_norm_out(
+        "linalg_vector_norm",
         "aten::linalg_vector_norm.out",
-        "exact",
-        src.t,
-        dims,
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
         v_bool_or(args[unsafe_offset=3], False),
-        src.t.stype,
+        args[unsafe_offset=4],
         out,
+        rets,
     )
-    ret_ref(rets, 0, out)
-    _ = src^
+
+
+# ---------------------------------------------------------------------------
+# norm (legacy overloads): all six redispatch to `linalg_vector_norm_out`
+# with `dim=[]` treated as "reduce every dim" and a missing `p` as 2 (see
+# `impl_func_norm` in ATen's ReduceOps.cpp) -- the same helpers as
+# `linalg_vector_norm` above, gated the same way.
+# ---------------------------------------------------------------------------
+
+
+# aten::norm.Scalar(Tensor self, Scalar p=2) -> Tensor
+def op_norm_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _vector_norm(
+        "norm",
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        _none_value(),
+        False,
+        _none_value(),
+        rets,
+    )
+
+
+# aten::norm.ScalarOpt_dtype(Tensor self, Scalar? p, *, ScalarType dtype) -> Tensor
+def op_norm_scalaropt_dtype(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _vector_norm(
+        "norm",
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        _none_value(),
+        False,
+        args[unsafe_offset=2],
+        rets,
+    )
+
+
+# aten::norm.ScalarOpt_dim(Tensor self, Scalar? p, int[1] dim, bool keepdim=False)
+#   -> Tensor
+def op_norm_scalaropt_dim(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _vector_norm(
+        "norm",
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        v_bool_or(args[unsafe_offset=3], False),
+        _none_value(),
+        rets,
+    )
+
+
+# aten::norm.ScalarOpt_dim_dtype(Tensor self, Scalar? p, int[1] dim, bool keepdim, *,
+#   ScalarType dtype) -> Tensor
+def op_norm_scalaropt_dim_dtype(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _vector_norm(
+        "norm",
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        v_bool_or(args[unsafe_offset=3], False),
+        args[unsafe_offset=4],
+        rets,
+    )
+
+
+# aten::norm.out(Tensor self, Scalar? p, int[1] dim, bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_norm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var out = v_tensor(args[unsafe_offset=4])
+    _vector_norm_out(
+        "norm",
+        "aten::norm.out",
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        v_bool_or(args[unsafe_offset=3], False),
+        _none_value(),
+        out,
+        rets,
+    )
+
+
+# aten::norm.dtype_out(Tensor self, Scalar? p, int[1] dim, bool keepdim, *,
+#   ScalarType dtype, Tensor(a!) out) -> Tensor(a!)
+def op_norm_dtype_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var out = v_tensor(args[unsafe_offset=5])
+    _vector_norm_out(
+        "norm",
+        "aten::norm.dtype_out",
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        v_bool_or(args[unsafe_offset=3], False),
+        args[unsafe_offset=4],
+        out,
+        rets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2061,6 +2323,12 @@ def register_reductions(site: Site) raises:
     impl[op_nanmedian, "nanmedian"](site)
     impl[op_nanmedian_dim, "nanmedian.dim"](site)
     impl[op_nanmedian_dim_values, "nanmedian.dim_values"](site)
+    impl[op_norm_dtype_out, "norm.dtype_out"](site)
+    impl[op_norm_out, "norm.out"](site)
+    impl[op_norm_scalar, "norm.Scalar"](site)
+    impl[op_norm_scalaropt_dim, "norm.ScalarOpt_dim"](site)
+    impl[op_norm_scalaropt_dim_dtype, "norm.ScalarOpt_dim_dtype"](site)
+    impl[op_norm_scalaropt_dtype, "norm.ScalarOpt_dtype"](site)
     impl[op_sort_stable, "sort.stable"](site)
     impl[op_sort_values_stable, "sort.values_stable"](site)
     impl[op_sum, "sum"](site)
