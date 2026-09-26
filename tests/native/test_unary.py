@@ -650,6 +650,44 @@ def test_isnan(mojo_gpu):
     assert y.cpu().tolist() == torch.isnan(x_cpu).tolist()
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int64,
+        torch.int8,
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+        torch.bool,
+    ],
+)
+@pytest.mark.parametrize("op", [torch.isposinf, torch.isneginf])
+def test_isposinf_isneginf_every_dtype(mojo_gpu, op, dtype):
+    """Every input dtype: an integral or bool tensor is never infinite."""
+    if dtype.is_floating_point:
+        x_cpu = torch.tensor(
+            [float("-inf"), -1.0, -0.0, 0.0, float("inf"), float("nan")]
+        ).to(dtype)
+    elif dtype == torch.bool:
+        x_cpu = torch.tensor([True, False, True])
+    else:
+        x_cpu = torch.tensor([0, 1, 7, 100], dtype=dtype)
+    x_cpu = x_cpu.reshape(-1, 1).expand(-1, 2)  # strided input
+    want = op(x_cpu)
+    got = op(x_cpu.to(mojo_gpu))
+    assert got.dtype == torch.bool
+    assert torch.equal(got.cpu(), want)
+    out = torch.ones(1, dtype=torch.bool, device=mojo_gpu)  # resized
+    assert op(x_cpu.to(mojo_gpu), out=out) is out
+    assert torch.equal(out.cpu(), want)
+    with pytest.raises(RuntimeError):
+        op(x_cpu.to(mojo_gpu), out=torch.empty(want.shape, device=mojo_gpu))
+
+
 def test_logical_not(mojo_gpu):
     x_cpu = torch.tensor([True, False, True, False])
     x = x_cpu.to(mojo_gpu)

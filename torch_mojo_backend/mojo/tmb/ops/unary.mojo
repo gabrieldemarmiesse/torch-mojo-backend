@@ -1869,10 +1869,40 @@ def op_isfinite(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+def _signed_inf(op: String, t: T) raises -> T:
+    """isposinf / isneginf: one kernel for a floating tensor; any other
+    dtype (every integer width, unsigned ones included, and bool) is never
+    infinite, so all-false without a kernel of its own."""
+    if t.dtype.is_floating_point():
+        return _bool_unary(op, t)
+    var out = own(
+        new_tensor(t.shape, t.rank, torch_dtype(DType.bool), t.device)
+    )
+    fill_value(out.t, 0.0)
+    return out.take()
+
+
+def _signed_inf_out(op: String, t: T, mut dst: T) raises:
+    if t.dtype.is_floating_point():
+        _bool_unary_out(op, t, dst)
+        return
+    _one_device(t, dst)
+    if dst.stype != torch_dtype(DType.bool):
+        raise Error(
+            "expected an out= tensor of dtype ",
+            torch_dtype(DType.bool),
+            ", got ",
+            dst.stype,
+        )
+    if not dst.same_shape(t):
+        resize_out(dst, t.shape, t.rank)
+    fill_value(dst, 0.0)
+
+
 # aten::isposinf(Tensor self) -> Tensor
 def op_isposinf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_bool_unary("IsPosInfSpec", t))
+    var out = own(_signed_inf("IsPosInfSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -1882,14 +1912,14 @@ def op_isposinf_out(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _bool_unary_out("IsPosInfSpec", t, dst)
+    _signed_inf_out("IsPosInfSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::isneginf(Tensor self) -> Tensor
 def op_isneginf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_bool_unary("IsNegInfSpec", t))
+    var out = own(_signed_inf("IsNegInfSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -1899,7 +1929,7 @@ def op_isneginf_out(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _bool_unary_out("IsNegInfSpec", t, dst)
+    _signed_inf_out("IsNegInfSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
