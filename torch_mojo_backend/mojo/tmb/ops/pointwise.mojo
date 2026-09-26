@@ -61,11 +61,15 @@ from tmb.ops.binary import (
     Scal,
     Side,
     _b_copy_into,
+    _b_inplace_destination,
+    _b_inplace_operand,
     _b_no_overlap_side,
     _b_no_partial_overlap,
     _b_ret,
+    _b_self,
     _b_side,
     _b_sside,
+    _b_store_inplace,
     _b_store_out,
     _b_tside,
     op_lerp_scalar_,
@@ -469,6 +473,22 @@ def _pw_out_of(v: Value, a: Side, b: Side, c: Side) raises -> T:
     return dest^
 
 
+def _pw_inplace_self(
+    args: Values, what: StaticString, n_operands: Int
+) raises -> T:
+    """`self` of an in-place op over args[0 .. n_operands), checked like
+    TensorIterator's in-place meta: an operand that would broadcast self to
+    a larger shape, or a self whose elements share memory, raises. An
+    in-place op never resizes self (only an `out=` does)."""
+    var self = _b_self(args[unsafe_offset=0], what)
+    _b_inplace_destination(self)
+    for i in range(1, n_operands):
+        var side = _b_side(args[unsafe_offset=i])
+        if side.is_t:
+            _b_inplace_operand(self, side.t.value())
+    return self^
+
+
 def _pw_math(
     kind: StaticString,
     policy: Int,
@@ -492,6 +512,31 @@ def _pw_math(
         rets,
         dest,
         _pw_run(kind, arity, a, b, c, compute, compute, params, dest),
+    )
+
+
+def _pw_math_inplace(
+    kind: StaticString,
+    policy: Int,
+    f64_ok: Bool,
+    arity: Int,
+    args: Values,
+    rets: Values,
+    params: SIMD[DType.float64, 4] = _p(),
+) raises:
+    """`op_(self, ...)` of a same-dtype math op over args[0 .. arity):
+    computed into self (straight into it when it is dense), never resizing
+    it."""
+    var self = _pw_inplace_self(args, kind, arity)
+    var a = _b_tside(self)
+    var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
+    var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
+    var common = _pw_result_type(a, b, c, arity)
+    var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
+    _b_store_inplace(
+        rets,
+        self,
+        _pw_run(kind, arity, a, b, c, compute, compute, params, self.copy()),
     )
 
 
@@ -750,9 +795,7 @@ def op_rshift_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def _pw_shift_inplace(kind: StaticString, args: Values, rets: Values) raises:
     """__ilshift__ / __irshift__: in place, into self's own dtype."""
-    var self = v_tensor(args[unsafe_offset=0])
-    if not self.on_mojo():
-        unsupported("an in-place shift of a tensor outside the mojo device")
+    var self = _pw_inplace_self(args, "an in-place shift", 2)
     var a = _b_tside(self)
     var b = _b_side(args[unsafe_offset=1])
     _b_no_overlap_side(self, b)
@@ -768,7 +811,7 @@ def _pw_shift_inplace(kind: StaticString, args: Values, rets: Values) raises:
     var res = _pw_run(
         kind, 2, a, b, _none_side(), compute, compute, _p(), self.copy()
     )
-    _b_store_out(rets, self, res^)
+    _b_store_inplace(rets, self, res^)
 
 
 # aten::__ilshift__.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
@@ -1015,9 +1058,11 @@ def op_pow_scalar_base_out(
     _pw_pow_scalar_base(args, rets, 2)
 
 
-def _pw_lerp_scalar(args: Values, rets: Values, out_index: Int) raises:
+def _pw_lerp_scalar(
+    args: Values, rets: Values, out_index: Int, in_place: Bool = False
+) raises:
     """lerp.Scalar: the weight is a parameter, converted to opmath like
-    Lerp.cu."""
+    Lerp.cu. `in_place` is lerp_ (self written, never resized)."""
     var start = _b_side(args[unsafe_offset=0])
     var end = _b_side(args[unsafe_offset=1])
     if start.is_t and end.is_t and start.t.value().stype != end.t.value().stype:
@@ -1027,16 +1072,22 @@ def _pw_lerp_scalar(args: Values, rets: Values, out_index: Int) raises:
             + " for `end` but got dtype "
             + String(end.t.value().stype)
         )
-    _pw_math(
-        "lerp_scalar",
-        P_FLOAT_ONLY,
-        True,
-        2,
-        args,
-        rets,
-        out_index,
-        _p(v_f64(args[unsafe_offset=2])),
-    )
+    var params = _p(v_f64(args[unsafe_offset=2]))
+    if in_place:
+        _pw_math_inplace(
+            "lerp_scalar", P_FLOAT_ONLY, True, 2, args, rets, params
+        )
+    else:
+        _pw_math(
+            "lerp_scalar",
+            P_FLOAT_ONLY,
+            True,
+            2,
+            args,
+            rets,
+            out_index,
+            params,
+        )
 
 
 # aten::lerp.Scalar(Tensor self, Tensor end, Scalar weight) -> Tensor
@@ -1072,7 +1123,7 @@ def op_lerp_scalar__any(
     if _is_f32_pair(args):
         op_lerp_scalar_(args, n_args, rets, n_rets)
     else:
-        _pw_lerp_scalar(args, rets, 0)
+        _pw_lerp_scalar(args, rets, -1, in_place=True)
 
 
 def _pw_int_side(side: Side) -> Bool:
@@ -1303,9 +1354,7 @@ def _pw_act_inplace(
     policy: Int = P_FLOAT_ONLY,
 ) raises:
     """`op_(self, ...)`: computed straight into self (flat, so exact)."""
-    var self = v_tensor(args[unsafe_offset=0])
-    if not self.on_mojo():
-        unsupported(String(kind) + "_ on a tensor outside the mojo device")
+    var self = _pw_inplace_self(args, kind, 1)
     var a = _b_tside(self)
     var compute = _pw_compute_dtype(kind, self.stype, policy, True)
     var res = _pw_run(
@@ -1908,6 +1957,7 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
         _ = held^
     var dest = Optional[T]()
     if in_place:
+        _b_inplace_destination(self)
         dest = self.copy()
     elif out_index >= 0:
         dest = _pw_out_of(
@@ -2091,8 +2141,10 @@ def op_ldexp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::ldexp_(Tensor(a!) self, Tensor other) -> Tensor(a!)
 def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """ATen's ldexp_ is ldexp_out(self, self, other): exact in place, since
-    the kernel is elementwise and dense (`_pw_run` writes self directly)."""
-    var self = v_tensor(args[unsafe_offset=0])
+    the kernel is elementwise and dense (`_pw_run` writes self directly).
+    Unlike ldexp_out, self is never resized: an `other` that broadcasts it
+    to a larger shape raises."""
+    var self = _pw_inplace_self(args, "ldexp_", 2)
     var a = _b_tside(self)
     var b = _b_side(args[unsafe_offset=1])
     _b_no_overlap_side(self, b)

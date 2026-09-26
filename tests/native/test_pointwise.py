@@ -102,6 +102,34 @@ def test_lerp_scalar_half(mojo_gpu, dtype):
     _close(x, xc, **_tol(dtype, 2))
 
 
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float16, torch.bfloat16])
+def test_lerp_scalar_inplace_never_resizes_self(mojo_gpu, dtype):
+    """lerp_ writes into self: a broadcast shape larger than self raises,
+    like torch, instead of resizing self (float32 keeps binary.mojo's route;
+    every other dtype is the pointwise one)."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal has no float64")
+    a = torch.randn(1, 3, dtype=dtype)
+    b = torch.randn(2, 3, dtype=dtype)
+    with pytest.raises(RuntimeError):
+        a.clone().lerp_(b, 0.5)
+    x = a.to(mojo_gpu)
+    with pytest.raises(RuntimeError):
+        x.lerp_(b.to(mojo_gpu), 0.5)
+    assert x.shape == (1, 3)
+    _close(x, a)
+    # A self whose elements share one memory location is rejected too.
+    e = torch.randn(1, 3, dtype=dtype).to(mojo_gpu).expand(2, 3)
+    with pytest.raises(RuntimeError):
+        e.lerp_(b.to(mojo_gpu), 0.5)
+    # Broadcasting `end` into a larger self still works.
+    y, yc = b.to(mojo_gpu), b.clone()
+    with ran("aten::lerp_.Scalar"):
+        y.lerp_(a.to(mojo_gpu), 0.25)
+    yc.lerp_(a, 0.25)
+    _close(y, yc, **_tol(dtype, 2))
+
+
 # C99 pow's special values (Annex F.9.4.4) and the saturating magnitudes, for
 # the float64 double-double core: an overflow in the product y * log|x| must
 # saturate to inf / 0, not become NaN in the double-double correction.
