@@ -5441,6 +5441,8 @@ _POINTWISE_BINARY_TWINS = [
     ("nextafter", aten.nextafter, torch.float32, "float"),
     ("bitwise_left_shift", aten.bitwise_left_shift, torch.int64, "shift"),
     ("bitwise_right_shift", aten.bitwise_right_shift, torch.int32, "shift"),
+    ("__lshift__", aten.__lshift__, torch.int64, "shift"),
+    ("__rshift__", aten.__rshift__, torch.int64, "shift"),
 ]
 
 

@@ -824,6 +824,20 @@ def aten_floordiv(x: MaxTensor, y: int | float | MaxTensor) -> MaxTensor:
     return operator.floordiv(x, y)
 
 
+# __lshift__.Scalar(Tensor self, Scalar other) -> Tensor
+# __lshift__.Tensor(Tensor self, Tensor other) -> Tensor
+@map_to(aten.__lshift__)
+def aten___lshift__(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
+    return _pointwise_binary(input, other, "lshift", promote_float=False)
+
+
+# __rshift__.Scalar(Tensor self, Scalar other) -> Tensor
+# __rshift__.Tensor(Tensor self, Tensor other) -> Tensor
+@map_to(aten.__rshift__)
+def aten___rshift__(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
+    return _pointwise_binary(input, other, "rshift", promote_float=False)
+
+
 # _local_scalar_dense(Tensor self) -> Scalar
 @map_to(aten._local_scalar_dense)
 def aten__local_scalar_dense(tensor: MaxTensor) -> Scalar:

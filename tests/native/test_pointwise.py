@@ -594,12 +594,18 @@ def test_gcd_lcm_shifts_fmod_int(mojo_gpu, dtype):
     shift = torch.randint(0, bits + 4, (200,)).to(dtype)
     if signed:
         shift[:3] = torch.tensor([-1, bits, bits - 1], dtype=dtype)
-    with ran("aten::bitwise_left_shift.Tensor"):
-        _close(
-            torch.bitwise_left_shift(a.to(mojo_gpu), shift.to(mojo_gpu)),
-            torch.bitwise_left_shift(a, shift),
-        )
+    with ran("aten::bitwise_left_shift.Tensor", "aten::__lshift__.Tensor"):
+        _close(a.to(mojo_gpu) << shift.to(mojo_gpu), a << shift)
+    _close(a.to(mojo_gpu) >> shift.to(mojo_gpu), a >> shift)
     _close(
-        torch.bitwise_right_shift(a.to(mojo_gpu), shift.to(mojo_gpu)),
-        torch.bitwise_right_shift(a, shift),
+        torch.bitwise_left_shift(a.to(mojo_gpu), shift.to(mojo_gpu)),
+        torch.bitwise_left_shift(a, shift),
     )
+    _close(a.to(mojo_gpu) << 3, a << 3)
+    _close(a.to(mojo_gpu) >> 2, a >> 2)
+    x, x_cpu = a.to(mojo_gpu), a.clone()
+    x <<= 1
+    x_cpu <<= 1
+    x >>= shift.to(mojo_gpu)
+    x_cpu >>= shift
+    _close(x, x_cpu)

@@ -2761,6 +2761,14 @@ def op_binary_cross_entropy_with_logits_out(
 
 
 def register_pointwise(site: Site) raises:
+    impl[op_ilshift, "__ilshift__.Scalar"](site)
+    impl[op_ilshift, "__ilshift__.Tensor"](site)
+    impl[op_irshift, "__irshift__.Scalar"](site)
+    impl[op_irshift, "__irshift__.Tensor"](site)
+    impl[op_lshift, "__lshift__.Scalar"](site)
+    impl[op_lshift, "__lshift__.Tensor"](site)
+    impl[op_rshift, "__rshift__.Scalar"](site)
+    impl[op_rshift, "__rshift__.Tensor"](site)
     impl[op_atan2, "atan2"](site)
     impl[op_atan2_out, "atan2.out"](site)
     impl[op_lshift, "bitwise_left_shift.Tensor"](site)
