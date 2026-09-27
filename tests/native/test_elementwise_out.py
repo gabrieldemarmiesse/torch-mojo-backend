@@ -27,7 +27,7 @@ hide a missing registration.
 
 import contextlib
 import zlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any, NoReturn
 
 import pytest
@@ -37,8 +37,12 @@ from torch_mojo_backend import get_accelerators, native
 
 # The elementwise overloads writing one caller-supplied output.
 OUT_OVERLOADS = [
+    "abs.out",
     "acos.out",
     "acosh.out",
+    "add.out",
+    "addcdiv.out",
+    "addcmul.out",
     "angle.out",
     "asin.out",
     "asinh.out",
@@ -51,11 +55,13 @@ OUT_OVERLOADS = [
     "bitwise_and.Scalar_out",
     "bitwise_and.Tensor_out",
     "bitwise_left_shift.Tensor_out",
+    "bitwise_not.out",
     "bitwise_or.Scalar_out",
     "bitwise_or.Tensor_out",
     "bitwise_right_shift.Tensor_out",
     "bitwise_xor.Scalar_out",
     "bitwise_xor.Tensor_out",
+    "ceil.out",
     "clamp.Tensor_out",
     "clamp.out",
     "clamp_max.Tensor_out",
@@ -68,6 +74,7 @@ OUT_OVERLOADS = [
     "cosh.out",
     "deg2rad.out",
     "div.out",
+    "div.out_mode",
     "elu.out",
     "elu_backward.grad_input",
     "erf.out",
@@ -76,11 +83,13 @@ OUT_OVERLOADS = [
     "exp.out",
     "exp2.out",
     "expm1.out",
+    "floor.out",
     "fmax.out",
     "fmin.out",
     "fmod.Scalar_out",
     "fmod.Tensor_out",
     "gcd.out",
+    "gelu.out",
     "gelu_backward.grad_input",
     "hardshrink.out",
     "hardshrink_backward.grad_input",
@@ -97,6 +106,8 @@ OUT_OVERLOADS = [
     "igammac.out",
     "isinf.out",
     "isnan.out",
+    "isneginf.out",
+    "isposinf.out",
     "lcm.out",
     "ldexp.out",
     "leaky_relu.out",
@@ -111,6 +122,7 @@ OUT_OVERLOADS = [
     "logaddexp.out",
     "logaddexp2.out",
     "logical_and.out",
+    "logical_not.out",
     "logical_or.out",
     "logical_xor.out",
     "maximum.out",
@@ -127,6 +139,7 @@ OUT_OVERLOADS = [
     "pow.Tensor_Tensor_out",
     "rad2deg.out",
     "reciprocal.out",
+    "relu.out",
     "remainder.Scalar_out",
     "remainder.Tensor_out",
     "rsqrt.out",
@@ -192,6 +205,7 @@ OUT_OVERLOADS = [
 _INT_OPS = {
     "bitwise_and",
     "bitwise_left_shift",
+    "bitwise_not",
     "bitwise_or",
     "bitwise_right_shift",
     "bitwise_xor",
@@ -201,7 +215,7 @@ _INT_OPS = {
 
 # Required non-tensor arguments, by name (anything with a default is left
 # to it). `reduction` 0 keeps the losses elementwise.
-_SCALARS: dict[str, float | int | bool] = {
+_SCALARS: dict[str, float | int | bool | str] = {
     "alpha": 1.0,
     "beta": 1.0,
     "delta": 1.0,
@@ -216,6 +230,7 @@ _SCALARS: dict[str, float | int | bool] = {
     "negative_slope": 0.01,
     "other": 0.75,
     "reduction": 0,
+    "rounding_mode": "floor",
     "scale": 1.0,
     "self_is_result": False,
     "threshold": 0.5,
@@ -275,7 +290,7 @@ def _make(name: str, arg: str, shape: tuple[int, ...], dtype: torch.dtype):
 
 def _cpu_args(
     name: str,
-    shapes: dict[str, tuple[int, ...]] | None = None,
+    shapes: Mapping[str, tuple[int, ...]] | None = None,
     dtype: torch.dtype | None = None,
 ) -> Kwargs:
     """CPU keyword arguments of `name` (the out argument left out): tensors
@@ -551,6 +566,8 @@ INPLACE_OVERLOADS = [
     "__ilshift__.Tensor",
     "__irshift__.Tensor",
     "add_.Tensor",
+    "addcdiv_.default",
+    "addcmul_.default",
     "deg2rad_.default",
     "hardsigmoid_.default",
     "hardswish_.default",
@@ -558,8 +575,10 @@ INPLACE_OVERLOADS = [
     "ldexp_.default",
     "leaky_relu_.default",
     "lerp_.Scalar",
+    "mul_.Scalar",
     "mul_.Tensor",
     "rad2deg_.default",
+    "relu_.default",
     "sub_.Tensor",
     "threshold_.default",
 ]
@@ -624,7 +643,8 @@ def test_inplace_never_resizes_and_casts_like_torch(mojo_gpu, name):
     _same_outcome(name, expected, args["self"])
     # A float16 self with float32 operands: cast into self (a float32
     # result can't be cast into an int64 self, which raises).
-    if len(tensors) > 1 and not name.startswith(("__i", "lerp_")):
+    # (addcmul_ / addcdiv_ decline operands of mixed dtypes altogether.)
+    if len(tensors) > 1 and not name.startswith(("__i", "lerp_", "addc")):
         for self_dtype in (torch.float16, torch.int64):
             mixed = dict(_inplace_args(name, {}))
             mixed["self"] = mixed["self"].to(self_dtype)
@@ -828,22 +848,139 @@ def test_integer_scalar_parameters_are_exact(mojo_gpu, op, dtype):
     assert torch.equal(fn(x.to(mojo_gpu)).cpu(), fn(x))
 
 
-def test_inplace_disjoint_strided_views_are_accepted(mojo_gpu):
+_B = 2**53
+# Integer Scalars past 2**53 (no exact float64): each must reach the kernel
+# as the int64 itself. (key: the registration the case needs.)
+_EXACT_INT_CASES = {
+    "threshold": (
+        "aten::threshold",
+        lambda t: torch.nn.functional.threshold(t, _B + 1, -7),
+    ),
+    "threshold_value": (
+        "aten::threshold",
+        lambda t: torch.nn.functional.threshold(t, 3, _B + 1),
+    ),
+    "hardtanh": (
+        "aten::hardtanh",
+        lambda t: torch.nn.functional.hardtanh(t, _B + 1, _B + 3),
+    ),
+    "clamp": ("aten::clamp", lambda t: torch.clamp(t, _B + 1, _B + 3)),
+    "fmod": ("aten::fmod.Scalar", lambda t: torch.fmod(t, _B + 1)),
+    "remainder": ("aten::remainder.Scalar", lambda t: torch.remainder(t, _B + 1)),
+    "rsub": ("aten::rsub.Scalar", lambda t: torch.rsub(t, _B + 1)),
+    "rsub_alpha": ("aten::rsub.Scalar", lambda t: torch.rsub(t, 1, alpha=_B + 1)),
+    "sub_alpha": ("aten::sub.Tensor", lambda t: torch.sub(t, 1, alpha=_B + 1)),
+    "add_alpha": ("aten::add.Tensor", lambda t: torch.add(t, t, alpha=_B + 1)),
+    "maximum_0d": ("aten::maximum", lambda t: torch.maximum(t, torch.tensor(_B + 1))),
+    "bitwise_and": ("aten::bitwise_and.Scalar", lambda t: torch.bitwise_and(t, _B + 1)),
+    "floor_divide": (
+        "aten::floor_divide.Scalar",
+        lambda t: torch.floor_divide(t, _B + 1),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_EXACT_INT_CASES))
+def test_int64_scalars_past_2_53_are_exact(mojo_gpu, case):
+    key, fn = _EXACT_INT_CASES[case]
+    if not _registered(key):
+        pytest.skip(f"{key} is not registered on the mojo device")
+    x = torch.tensor([_B, _B + 1, _B + 2, 5], dtype=torch.int64)
+    assert torch.equal(fn(x.to(mojo_gpu)).cpu(), fn(x))
+
+
+_OVERFLOW_CASES = {
+    "clamp_int32": ("aten::clamp", torch.int32, lambda t: t.clamp(0, 2**40)),
+    "clamp_min_int8": ("aten::clamp_min", torch.int8, lambda t: t.clamp_min(300)),
+    "threshold_int32": (
+        "aten::threshold",
+        torch.int32,
+        lambda t: torch.nn.functional.threshold(t, 2**40, 1),
+    ),
+    "hardtanh_int32": (
+        "aten::hardtanh",
+        torch.int32,
+        lambda t: torch.nn.functional.hardtanh(t, 0, 2**40),
+    ),
+    "sub_alpha_int8": (
+        "aten::sub.Tensor",
+        torch.int8,
+        lambda t: torch.sub(t, 1, alpha=300),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_OVERFLOW_CASES))
+def test_integer_scalar_overflow_raises_like_torch(mojo_gpu, case):
+    """`Scalar::to<scalar_t>()` refuses a value the dtype cannot hold."""
+    key, dtype, fn = _OVERFLOW_CASES[case]
+    if not _registered(key):
+        pytest.skip(f"{key} is not registered on the mojo device")
+    x = torch.tensor([1, 2, 3], dtype=dtype)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        fn(x)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        fn(x.to(mojo_gpu))
+
+
+@pytest.mark.parametrize("op", ["add_", "mul_", "sub_", "__irshift__", "__ilshift__"])
+def test_inplace_disjoint_strided_views_are_accepted(mojo_gpu, op):
     """`at::assert_no_partial_overlap` judges only non-overlapping-and-dense
-    views: interleaved `x[::2]` / `x[1::2]` are accepted (torch calls them
-    TooHard), a genuinely partial overlap raises."""
-    if not _registered("aten::__irshift__.Tensor"):
-        pytest.skip("__irshift__ is not registered on the mojo device")
-    cpu = torch.arange(1, 17, dtype=torch.int64) * 64
+    views: interleaved `x[::2]` / `x[1::2]` -- two views of ONE storage that
+    share no element -- are accepted (torch calls them TooHard), while a
+    genuinely partial overlap of one storage (`y[1:]` against `y[:-1]`)
+    raises."""
+    key = f"aten::{op}.Tensor"
+    if not _registered(key):
+        pytest.skip(f"{key} is not registered on the mojo device")
+    # Even slots large, odd slots small shift counts / factors.
+    cpu = torch.stack(
+        [torch.arange(1, 9, dtype=torch.int64) * 64, torch.arange(8) % 5], dim=1
+    ).flatten()
     x = cpu.to(mojo_gpu)
     a, b = x[::2], x[1::2]
-    a >>= b % 5
-    ca, cb = cpu[::2], cpu[1::2]
-    ca >>= cb % 5
+    assert a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+    native.op_counting(True)
+    before = native.op_count(key)
+    getattr(a, op)(b)
+    assert native.op_count(key) > before, f"{key} did not run natively"
+    getattr(cpu[::2], op)(cpu[1::2])
     assert torch.equal(x.cpu(), cpu)
     y = torch.arange(8, dtype=torch.int64, device=mojo_gpu)
     with pytest.raises(RuntimeError, match="single memory location"):
-        y[1:].__irshift__(y[:-1])
+        getattr(y[1:], op)(y[:-1])
+    assert torch.equal(y.cpu(), torch.arange(8))
+
+
+@pytest.mark.parametrize("name", _CASES)
+def test_independent_empty_out_is_not_an_input(mojo_gpu, name):
+    """Out/input identity is tensor identity (`TensorBase::is_same`), not a
+    data-pointer match: an independent empty `out` shares a null data
+    pointer with an empty input yet is a different tensor, so it is resized
+    to the broadcast shape like any other `out` --
+    `torch.add(torch.empty(0), torch.ones(2, 1), out=torch.empty(0))` is
+    (2, 0)."""
+    _registered_or_skip(name)
+    tensors = _tensor_args(name)
+    if len(tensors) < 2:
+        pytest.skip("one tensor input: nothing broadcasts past it")
+    shapes = {t: (0,) if i == 0 else (2, 1) for i, t in enumerate(tensors)}
+    kwargs = _cpu_args(name, shapes=shapes)
+    natural = _outcome(lambda: _cpu_result(name, kwargs))
+    if not isinstance(natural, torch.Tensor):
+        _torch_does_not_check(name)
+    cpu = _outcome(
+        lambda: _op(name)(
+            **kwargs, **{_out_name(name): torch.empty(0, dtype=natural.dtype)}
+        )
+    )
+    args = _to(kwargs, mojo_gpu)
+    out = torch.empty(0, dtype=natural.dtype, device=mojo_gpu)
+    with _ran(name):
+        ours = _outcome(lambda: _op(name)(**args, **{_out_name(name): out}))
+    _same_outcome(name, cpu, ours)
+    if isinstance(ours, torch.Tensor) and isinstance(cpu, torch.Tensor):
+        assert ours.shape == cpu.shape
 
 
 def test_inplace_casts_a_promoted_result_into_self(mojo_gpu):
