@@ -67,6 +67,7 @@ from tmb.ops.binary import (
     Res,
     Scal,
     Side,
+    _b_can_cast,
     _b_copy_into,
     _b_inplace_destination,
     _b_inplace_operand,
@@ -2470,13 +2471,25 @@ def _loss_reduction(v: Value) raises -> Int:
     return r
 
 
-def _loss_reduce(var res: Res, reduction: Int) raises -> Res:
-    """apply_loss_reduction: `mean()` / `sum()` over every element."""
+def _loss_reduce(
+    var res: Res, reduction: Int, out_st: Int32 = -1
+) raises -> Res:
+    """apply_loss_reduction: `mean()` / `sum()` over every element. With
+    `out_st` (an `out=` of another dtype) the reduction produces that dtype
+    itself, as ATen's `mean_out` / `sum_out(result, loss)` do: ten float16
+    squares of 100 sum to 100000 in a float32 `out`, not to float16 inf."""
     if reduction == REDUCTION_NONE or res.t.rank == 0:
         return res^
     if not res.owned:
         raise Error("internal: a reduced loss computed into its out=")
     var loss = own(res.t.copy())
+    if out_st >= 0 and out_st != loss.t.stype:
+        # sum_out / mean_out(result, loss) reduce in result's dtype: the
+        # loss is cast to it first (the reduction kernels keep one dtype).
+        var casted = own(cast_for_copy(loss.t, out_st))
+        _ = loss^
+        loss = casted^
+    var reduced_st = loss.t.stype
     var dims = List[Int]()
     for i in range(loss.t.rank):
         dims.append(i)
@@ -2485,7 +2498,7 @@ def _loss_reduce(var res: Res, reduction: Int) raises -> Res:
         if loss.t.dtype == DType.float64:
             unsupported("a float64 loss with reduction='mean'")
         out = _scalar_reduction(
-            "nn", "MeanSpec", loss.t, dims, False, loss.t.stype, False, 0.0
+            "nn", "MeanSpec", loss.t, dims, False, reduced_st, False, 0.0
         )
     else:
         out = _scalar_reduction(
@@ -2494,7 +2507,7 @@ def _loss_reduce(var res: Res, reduction: Int) raises -> Res:
             loss.t,
             dims,
             False,
-            loss.t.stype,
+            reduced_st,
             False,
             0.0,
         )
@@ -2513,21 +2526,43 @@ def _loss_forward(
     out_v: Optional[Value],
     rets: Values,
     weight: Optional[T] = None,
+    result_st: Int32 = -1,
+    round_p0: Bool = False,
 ) raises:
     """One loss kind over (a, b[, c]), times `weight` when given (its own
-    rounding, as `loss.mul_(weight)`), then the reduction."""
+    rounding, as `loss.mul_(weight)`), then the reduction.
+
+    `result_st` is the functional loss dtype (-1: the promoted common one;
+    huber allocates `empty_like(input)`). The loss kernels dispatch on
+    `iter.dtype()`, their OUTPUT's dtype: with reduction='none' an `out=`
+    is that output, so the kernel computes in out's dtype (inputs cast to
+    it); otherwise the loss is computed as the functional form does and
+    reduced straight into out's dtype (`mean_out` / `sum_out`). `round_p0`:
+    p0 is a Scalar read as `scalar_t` of that kernel dtype (beta, delta)."""
     if not a.is_t or not b.is_t:
         unsupported(String(kind) + " with a scalar operand")
     var common = _pw_result_type(a, b, c, arity)
-    var compute = _pw_compute_dtype(kind, common, P_FLOAT_ONLY, True)
+    var loss_st = common if result_st < 0 else result_st
     var dest = Optional[T]()
     if out_v:
         dest = _pw_out_of(out_v.value(), a, b, c)
+    var reduce_st = Int32(-1)
+    if dest:
+        var d = dest.value().stype
+        if reduction == REDUCTION_NONE:
+            if not weight and _pw_is_float(d) and _b_can_cast(loss_st, d):
+                loss_st = d
+        elif _pw_is_float(d) and _b_can_cast(loss_st, d):
+            reduce_st = d
+    var compute = _pw_compute_dtype(kind, loss_st, P_FLOAT_ONLY, True)
+    var p = params
+    if round_p0:
+        p[0] = _round_to(p[0], loss_st)
     var direct = (
         dest.copy() if reduction == REDUCTION_NONE
         and not weight else (Optional[T]())
     )
-    var res = _pw_run(kind, arity, a, b, c, compute, compute, params, direct)
+    var res = _pw_run(kind, arity, a, b, c, compute, loss_st, p, direct)
     if weight:
         var loss = res.t.copy()
         var w = _b_tside(weight.value())
@@ -2541,14 +2576,29 @@ def _loss_forward(
             w,
             _none_side(),
             compute,
-            compute,
+            loss_st,
             _p(1.0),
             target,
         )
         if res.owned:
             release(loss.h)
         res = weighted^
-    _pw_finish(rets, dest, _loss_reduce(res^, reduction), _pw_out_exact(kind))
+    _pw_finish(
+        rets,
+        dest,
+        _loss_reduce(res^, reduction, reduce_st),
+        _pw_out_exact(kind),
+    )
+
+
+def _loss_same_dtype(expected: Side, side: Side) raises:
+    """A TensorIterator with check_all_same_dtype (mse / huber backward)."""
+    var e = expected.t.value().stype
+    var got = side.t.value().stype
+    if got != e:
+        raise Error(
+            "Found dtype ", dtype_name(got), " but expected ", dtype_name(e)
+        )
 
 
 def _loss_backward(
@@ -2563,16 +2613,29 @@ def _loss_backward(
 ) raises:
     """(input, target, grad) through one backward kind; p0 = the norm and
     p1 = beta / delta, both rounded to scalar_t as `Scalar::to<scalar_t>`
-    and `scalar_t(double)` do."""
+    and `scalar_t(double)` do. scalar_t is the output's dtype (the kernels
+    dispatch on `iter.dtype()`): `self`'s for the functional form
+    (`zeros_like(self)`), the `grad_input`'s dtype for the out= form, into
+    which smooth_l1's iterator casts. mse and huber check that every
+    operand, grad_input included, has one dtype."""
     if not grad.is_t or not input.is_t or not target.is_t:
         unsupported(String(kind) + " with a scalar operand")
+    var same = kind == "mse_backward" or kind == "huber_backward"
+    if same:
+        _loss_same_dtype(input, target)
+        _loss_same_dtype(input, grad)
     var common = _pw_result_type(input, target, grad, 3)
-    var compute = _pw_compute_dtype(kind, common, P_FLOAT_ONLY, True)
     var out_st = input.t.value().stype
     var dest = Optional[T]()
     if out_v:
         dest = _pw_out_of(out_v.value(), input, target, grad)
-    var params = _p(_round_to(norm, compute), _round_to(p1, compute))
+        var d = dest.value().copy()
+        if same:
+            _loss_same_dtype(input, _b_tside(d))
+        elif _pw_is_float(d.stype) and _b_can_cast(common, d.stype):
+            out_st = d.stype
+    var compute = _pw_compute_dtype(kind, out_st, P_FLOAT_ONLY, True)
+    var params = _p(_round_to(norm, out_st), _round_to(p1, out_st))
     _pw_finish(
         rets,
         dest,
@@ -2650,20 +2713,19 @@ def op_mse_loss_backward_grad_input(
 
 def _smooth_l1(args: Values, rets: Values, out_v: Optional[Value]) raises:
     var beta = v_f64(args[unsafe_offset=3])
-    if beta < 0:
+    if not (beta >= 0):  # TORCH_CHECK(beta >= 0): NaN fails it too
         raise Error("smooth_l1_loss does not support negative values for beta.")
-    var a = _b_side(args[unsafe_offset=0])
-    var st = a.t.value().stype if a.is_t else ST_FLOAT32
     _loss_forward(
         "smooth_l1",
         2,
-        a,
+        _b_side(args[unsafe_offset=0]),
         _b_side(args[unsafe_offset=1]),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
-        _p(_round_to(beta, st)),
+        _p(beta),
         out_v,
         rets,
+        round_p0=True,
     )
 
 
@@ -2719,7 +2781,10 @@ def _huber(args: Values, rets: Values, out_v: Optional[Value]) raises:
             "huber_loss does not support non-positive values for delta."
         )
     var a = _b_side(args[unsafe_offset=0])
-    var st = a.t.value().stype if a.is_t else ST_FLOAT32
+    if not a.is_t:
+        unsupported("huber with a scalar operand")
+    # ATen's huber_loss allocates `empty_like(input)`: the loss is in the
+    # input's dtype (float16 input, float32 target: float16).
     _loss_forward(
         "huber",
         2,
@@ -2727,9 +2792,11 @@ def _huber(args: Values, rets: Values, out_v: Optional[Value]) raises:
         _b_side(args[unsafe_offset=1]),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
-        _p(_round_to(delta, st)),
+        _p(delta),
         out_v,
         rets,
+        result_st=a.t.value().stype,
+        round_p0=True,
     )
 
 
@@ -2970,12 +3037,27 @@ def register_pointwise(site: Site) raises:
     impl[op_deg2rad_out, "deg2rad.out"](site)
     impl[op_deg2rad_, "deg2rad_"](site)
     impl[op_gelu_backward_any, "gelu_backward"](site)
+    impl[op_huber_loss, "huber_loss"](site)
+    impl[op_huber_loss_out, "huber_loss.out"](site)
+    impl[op_huber_loss_backward, "huber_loss_backward"](site)
+    impl[op_huber_loss_backward_out, "huber_loss_backward.out"](site)
     impl[op_ldexp, "ldexp.Tensor"](site)
     impl[op_ldexp_out, "ldexp.out"](site)
     impl[op_ldexp_, "ldexp_"](site)
+    impl[op_mse_loss, "mse_loss"](site)
+    impl[op_mse_loss_out, "mse_loss.out"](site)
+    impl[op_mse_loss_backward, "mse_loss_backward"](site)
+    impl[op_mse_loss_backward_grad_input, "mse_loss_backward.grad_input"](site)
     impl[op_rad2deg, "rad2deg"](site)
     impl[op_rad2deg_out, "rad2deg.out"](site)
     impl[op_rad2deg_, "rad2deg_"](site)
+    impl[op_smooth_l1_loss, "smooth_l1_loss"](site)
+    impl[op_smooth_l1_loss_out, "smooth_l1_loss.out"](site)
+    impl[op_smooth_l1_loss_backward, "smooth_l1_loss_backward"](site)
+    impl[
+        op_smooth_l1_loss_backward_grad_input,
+        "smooth_l1_loss_backward.grad_input",
+    ](site)
     impl[op_gelu_backward_grad_input, "gelu_backward.grad_input"](site)
     impl[op_hardshrink, "hardshrink"](site)
     impl[op_hardshrink_out, "hardshrink.out"](site)

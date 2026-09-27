@@ -5657,6 +5657,40 @@ def test_aten_rsub_integral_promotes_before_alpha(call_checker: CallChecker):
     _compiled_matches_cpu(fn, [a, b])
 
 
+@pytest.mark.parametrize("reduction", [0, 1, 2])
+@pytest.mark.parametrize("name", ["mse_loss", "smooth_l1_loss", "huber_loss"])
+def test_aten_elementwise_losses(
+    conf: Conf, call_checker: CallChecker, name: str, reduction: int
+):
+    call_checker.register(f"aten::{name}")
+    op = getattr(aten, name)
+
+    def fn(x, t):
+        return op(x, t, reduction=reduction)
+
+    x = torch.rand(5, 6).clamp(0.01, 0.99)
+    t = torch.rand(5, 6)
+    check_outputs(fn, conf, [x, t], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "name", ["mse_loss_backward", "smooth_l1_loss_backward", "huber_loss_backward"]
+)
+def test_aten_elementwise_loss_backwards(
+    conf: Conf, call_checker: CallChecker, name: str
+):
+    call_checker.register(f"aten::{name}")
+    op = getattr(aten, name)
+    extra = [1.0] if name in ("smooth_l1_loss_backward", "huber_loss_backward") else []
+
+    def fn(g, x, t):
+        return op(g, x, t, 1, *extra)
+
+    x = torch.rand(5, 6).clamp(0.01, 0.99)
+    t = torch.rand(5, 6)
+    check_outputs(fn, conf, [torch.tensor(0.7), x, t], rtol=1e-5, atol=1e-5)
+
+
 _INF_EDGES = [0.0, -0.0, 1.5, -2.0, 1e-40, float("inf"), float("-inf"), float("nan")]
 
 
