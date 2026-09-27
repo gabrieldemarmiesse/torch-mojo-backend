@@ -99,6 +99,7 @@ from tmb.ops.common import (
     known_stype as _pw_known,
     promote_types,
     resize_out,
+    scalar_to_float,
     scalar_to_int,
 )
 from tmb.ops.random import _draw
@@ -1159,6 +1160,9 @@ def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
     var common = _pw_result_type(a, b, _none_side(), 2)
     if not _pw_is_float(common):
         return False
+    # `alpha.to<scalar_t>()`: a finite alpha past the result dtype's range
+    # raises, as ATen's checked conversion does.
+    alpha = scalar_to_float(args[unsafe_offset=2], common)
     var compute = _pw_compute_dtype("rsub_alpha", common, P_FLOAT, True)
     var dest = Optional[T]()
     if out_index >= 0:

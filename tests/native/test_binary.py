@@ -1769,6 +1769,32 @@ def test_rsub_checks_and_rank_promotion(mojo_gpu):
     torch.testing.assert_close(out, torch.rsub(one, 1.0001))
 
 
+@pytest.mark.parametrize(
+    ("dtype", "alpha", "ok_alpha"),
+    [
+        (torch.float32, 1e100, 1e6),
+        (torch.float16, 7e4, 6e4),
+        (torch.bfloat16, 1e100, 1e6),
+    ],
+)
+def test_rsub_alpha_overflowing_result_dtype(mojo_gpu, dtype, alpha, ok_alpha):
+    """A finite alpha past the result dtype's range raises, as CPU torch's
+    checked `alpha.to<scalar_t>()` does, instead of scaling by inf."""
+    x_cpu = torch.tensor([1.0], dtype=dtype)
+    x = x_cpu.to(mojo_gpu)
+    for other_cpu in (3, x_cpu):
+        other = other_cpu if isinstance(other_cpu, int) else other_cpu.to(mojo_gpu)
+        with pytest.raises(RuntimeError, match="without overflow") as cpu_err:
+            torch.rsub(x_cpu, other_cpu, alpha=alpha)
+        with pytest.raises(RuntimeError, match="without overflow") as err:
+            torch.rsub(x, other, alpha=alpha)
+        assert str(err.value).startswith(str(cpu_err.value).splitlines()[0])
+        torch.testing.assert_close(
+            torch.rsub(x, other, alpha=ok_alpha).cpu(),
+            torch.rsub(x_cpu, other_cpu, alpha=ok_alpha),
+        )
+
+
 def test_rsub_integral_promotes_before_alpha(mojo_gpu):
     """ATen promotes both operands before scaling self: int32 self times
     alpha = 2**30 against an int64 other must not wrap in int32 first."""
