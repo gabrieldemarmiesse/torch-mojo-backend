@@ -83,6 +83,7 @@ from tmb.ops.common import (
     fill_value,
     is_int_stype,
     resize_out,
+    scalar_to_float,
     scalar_to_int,
 )
 from tmb.ops.core import cast_for_copy
@@ -2426,9 +2427,10 @@ def _b_clamp(
 
 def _b_clamp_bound(v: Value, result_stype: Int32) raises -> Int:
     """A clamp bound as `_b_clamp_launch`'s raw slot."""
+    # `Scalar::to<scalar_t>()`: checked against the dtype (and exact for
+    # an integral one).
     if _b_is_floating(result_stype):
-        return Int(f64_bits(v_f64(v)))
-    # `Scalar::to<scalar_t>()`: exact, and checked against the dtype.
+        return Int(f64_bits(scalar_to_float(v, result_stype)))
     return scalar_to_int(v, result_stype)
 
 

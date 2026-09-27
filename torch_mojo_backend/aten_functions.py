@@ -2023,31 +2023,58 @@ def aten_ceil(input: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(input, "ceil")
 
 
-# clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
-# clamp.Tensor(Tensor self, Tensor? min=None, Tensor? max=None) -> Tensor
-@map_to(aten.clamp)
-def aten_clamp(
+def _clamp(
     input: MaxTensor,
-    min: MaxTensor | Scalar | None = None,
-    max: MaxTensor | Scalar | None = None,
+    min: MaxTensor | Scalar | None,
+    max: MaxTensor | Scalar | None,
+    nan_bound_fills: bool,
 ) -> MaxTensor:
-    """
-    Implements torch.clamp by clamping all elements in input to the range [min, max].
-    Uses F.max and F.min to implement clamp as:
-    clamp(x, min, max) = min(max(x, min), max)
+    """clamp / clamp_min / clamp_max: min(max(x, min), max), NaN as ATen.
 
-    ATen's clamp propagates NaN (a NaN input or bound gives NaN), whereas
-    MAX's max/min return the other operand, so a floating result also
-    selects NaN wherever an operand is NaN (hardsigmoid, which decomposes to
-    clamp, relies on it too).
+    A NaN in the input or in a Tensor bound gives NaN there, whereas MAX's
+    max/min return the other operand, so a floating result also selects NaN
+    wherever a tensor operand is NaN (hardsigmoid, which decomposes to
+    clamp, relies on it too). A NaN Scalar bound fills the whole result with
+    NaN for clamp_min / clamp_max (`nan_bound_fills`) and for clamp given
+    both bounds; clamp given ONE bound runs torch 2.11's clamp_min/max scalar
+    kernel, whose `std::max(v, NaN)` keeps `v` (`torch.clamp(x, min=nan)` is
+    `x`). A float Scalar bound promotes an integral input to the default
+    floating dtype, as `torch.result_type` does.
     """
+    scalar_bounds = [
+        b
+        for b in (min, max)
+        if b is not None and not isinstance(b, TensorValue | MaxEagerTensor)
+    ]
+    if not input.dtype.is_float() and any(isinstance(b, float) for b in scalar_bounds):
+        input = F.cast(input, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    tensor_bounds = [
+        b for b in (min, max) if isinstance(b, TensorValue | MaxEagerTensor)
+    ]
+    if tensor_bounds:
+        # clamp.Tensor / clamp_min.Tensor / clamp_max.Tensor promote every
+        # operand to one dtype (MAX's max/min refuse mixed dtypes).
+        common = max_dtype_to_torch(input.dtype)
+        for b in tensor_bounds:
+            common = torch.promote_types(common, max_dtype_to_torch(b.dtype))
+        dtype = torch_dtype_to_max(common)
+        if input.dtype != dtype:
+            input = F.cast(input, dtype=dtype)
+        if isinstance(min, TensorValue | MaxEagerTensor) and min.dtype != dtype:
+            min = F.cast(min, dtype=dtype)
+        if isinstance(max, TensorValue | MaxEagerTensor) and max.dtype != dtype:
+            max = F.cast(max, dtype=dtype)
+    if any(isinstance(b, float) and math.isnan(b) for b in scalar_bounds):
+        if nan_bound_fills or (min is not None and max is not None):
+            return F.broadcast_to(
+                F.constant(math.nan, dtype=input.dtype, device=input.device),
+                input.shape,
+            )
+        return input
+
     result = input
-
-    # Apply lower bound if min is provided
     if min is not None:
         result = F.max(result, min)
-
-    # Apply upper bound if max is provided
     if max is not None:
         result = F.min(result, max)
 
@@ -2060,15 +2087,39 @@ def aten_clamp(
                 continue
             is_nan = custom_mojo_ops.elementwise(operand, "isnan")
             nan_mask = is_nan if nan_mask is None else F.logical_or(nan_mask, is_nan)
-        elif isinstance(operand, float) and math.isnan(operand):
-            return F.broadcast_to(
-                F.constant(math.nan, dtype=result.dtype, device=result.device),
-                result.shape,
-            )
     if nan_mask is None:
         return result
     nan = F.constant(math.nan, dtype=result.dtype, device=result.device)
     return _where(nan_mask, nan, result)
+
+
+# clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
+# clamp.Tensor(Tensor self, Tensor? min=None, Tensor? max=None) -> Tensor
+@map_to(aten.clamp)
+def aten_clamp(
+    input: MaxTensor,
+    min: MaxTensor | Scalar | None = None,
+    max: MaxTensor | Scalar | None = None,
+) -> MaxTensor:
+    """torch.clamp: clamps every element of input into [min, max]."""
+    return _clamp(input, min, max, nan_bound_fills=False)
+
+
+# clamp_max(Tensor self, Scalar max) -> Tensor
+# clamp_max.Tensor(Tensor self, Tensor max) -> Tensor
+@map_to(aten.clamp_max)
+def aten_clamp_max(input: MaxTensor, max: MaxTensor | Scalar) -> MaxTensor:
+    """Its own twin rather than core ATen's `clamp(self, max=max)`
+    decomposition: a NaN Scalar bound fills here but not in clamp."""
+    return _clamp(input, None, max, nan_bound_fills=True)
+
+
+# clamp_min(Tensor self, Scalar min) -> Tensor
+# clamp_min.Tensor(Tensor self, Tensor min) -> Tensor
+@map_to(aten.clamp_min)
+def aten_clamp_min(input: MaxTensor, min: MaxTensor | Scalar) -> MaxTensor:
+    """See aten_clamp_max."""
+    return _clamp(input, min, None, nan_bound_fills=True)
 
 
 # clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor

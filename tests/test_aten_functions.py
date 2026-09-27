@@ -774,6 +774,45 @@ def kind_message(kind: str) -> Callable[[str], str]:
     return lambda message: f"{kind}: {message}"
 
 
+_NAN = float("nan")
+# case -> (fn(x, t), the twin it must reach)
+_CLAMP_NAN_CASES = {
+    "clamp_one_nan_min": (lambda x, t: torch.clamp(x, min=_NAN), "aten_clamp"),
+    "clamp_one_nan_max": (lambda x, t: torch.clamp(x, max=_NAN), "aten_clamp"),
+    "clamp_nan_and_bound": (lambda x, t: torch.clamp(x, _NAN, 3.0), "aten_clamp"),
+    "clamp_bound_and_nan": (lambda x, t: torch.clamp(x, 0.0, _NAN), "aten_clamp"),
+    "clamp_scalars": (lambda x, t: torch.clamp(x, -1.0, 1.5), "aten_clamp"),
+    "clamp_tensor_min": (lambda x, t: torch.clamp(x, min=t), "aten_clamp"),
+    "clamp_tensors": (lambda x, t: torch.clamp(x, t, t + 1), "aten_clamp"),
+    "clamp_min_nan": (lambda x, t: torch.clamp_min(x, _NAN), "aten_clamp_min"),
+    "clamp_min_tensor": (lambda x, t: torch.clamp_min(x, t), "aten_clamp_min"),
+    "clamp_max_nan": (lambda x, t: torch.clamp_max(x, _NAN), "aten_clamp_max"),
+    "clamp_max_tensor": (lambda x, t: torch.clamp_max(x, t), "aten_clamp_max"),
+}
+
+
+@pytest.mark.parametrize("case", list(_CLAMP_NAN_CASES))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_aten_clamp_nan_rules(
+    case: str, dtype: torch.dtype, device: str, call_checker: CallChecker
+):
+    """The compiled clamp / clamp_min / clamp_max match CPU torch 2.11 on
+    NaN: clamp_min / clamp_max and two-bound clamp fill a NaN Scalar bound,
+    one-bound clamp keeps x, a NaN in x or in a Tensor bound gives NaN there,
+    and a float bound promotes an integral x."""
+    fn, twin = _CLAMP_NAN_CASES[case]
+    call_checker.register(getattr(aten_functions, twin))
+    if dtype.is_floating_point:
+        x = torch.tensor([1.0, 2.0, _NAN, -5.0, 0.5], dtype=dtype)
+    else:
+        x = torch.tensor([1, 2, -3, 4, 0], dtype=dtype)
+    t = torch.tensor([_NAN, 0.0, 0.0, 0.0, 1.0])
+    expected = fn(x, t)
+    actual = torch.compile(fn, backend=mojo_backend)(x.to(device), t.to(device))
+    assert actual.dtype == expected.dtype
+    torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 def test_aten_shared_elementwise(dtype: torch.dtype, mode: str, device: str):

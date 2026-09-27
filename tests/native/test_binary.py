@@ -1620,6 +1620,79 @@ def test_clamp_nan_bound_fills_nan(mojo_device):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32])
+def test_clamp_nan_scalar_bound_rules(mojo_device, dtype):
+    """Every Scalar-bound overload with a NaN bound, a NaN in x, and an
+    integral x (promoted to float by the NaN bound), against CPU torch:
+    clamp_min / clamp_max and two-bound clamp fill NaN, one-bound clamp
+    keeps x (torch 2.11)."""
+    nan = float("nan")
+    if dtype.is_floating_point:
+        x_cpu = torch.tensor([1.0, 2.0, nan, -5.0], dtype=dtype)
+    else:
+        x_cpu = torch.tensor([1, 2, -3, 4], dtype=dtype)
+    x = x_cpu.to(mojo_device)
+    cases = [
+        lambda t, **kw: torch.clamp(t, min=nan, **kw),
+        lambda t, **kw: torch.clamp(t, max=nan, **kw),
+        lambda t, **kw: torch.clamp(t, nan, 3.0, **kw),
+        lambda t, **kw: torch.clamp(t, 0.0, nan, **kw),
+        lambda t, **kw: torch.clamp_min(t, nan, **kw),
+        lambda t, **kw: torch.clamp_max(t, nan, **kw),
+        lambda t, **kw: torch.clamp(t, -1.0, 1.5, **kw),
+    ]
+    for fn in cases:
+        expected = fn(x_cpu)
+        actual = fn(x).cpu()
+        assert actual.dtype == expected.dtype
+        torch.testing.assert_close(actual, expected, equal_nan=True)
+        if dtype.is_floating_point:
+            out = torch.empty_like(x)
+            fn(x, out=out)
+            torch.testing.assert_close(out.cpu(), expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_clamp_scalar_bound_overflow(mojo_device, dtype):
+    """A finite Scalar bound past the result dtype's range raises as c10's
+    checked conversion does, even on an empty tensor; inf and NaN bounds
+    are fine, and a NaN fill never converts the other bound."""
+    big = {torch.float16: 70000.0, torch.bfloat16: 1e39, torch.float32: 1e40}[dtype]
+    x_cpu = torch.tensor([1.0, -2.0, 3.0], dtype=dtype)
+    x = x_cpu.to(mojo_device)
+    raising = [
+        lambda t: torch.clamp_min(t, big),
+        lambda t: torch.clamp_max(t, -big),
+        lambda t: torch.clamp(t, big),
+        lambda t: torch.clamp(t, None, big),
+        lambda t: torch.clamp(t, -big, big),
+        lambda t: torch.clamp_min(t, big, out=torch.empty_like(t)),
+        lambda t: t.clone().clamp_(max=big),
+        lambda t: torch.clamp_min(t[:0], big),
+    ]
+    for fn in raising:
+        with pytest.raises(RuntimeError, match="without overflow"):
+            fn(x_cpu)
+        with pytest.raises(RuntimeError, match="without overflow"):
+            fn(x)
+    inf = float("inf")
+    fine = [
+        lambda t: torch.clamp_min(t, inf),
+        lambda t: torch.clamp_max(t, -inf),
+        lambda t: torch.clamp(t, -inf, inf),
+        lambda t: torch.clamp(t, float("nan"), big),
+    ]
+    for fn in fine:
+        torch.testing.assert_close(fn(x).cpu(), fn(x_cpu), equal_nan=True)
+    if dtype == torch.float32:
+        # An integral tensor with a float bound computes in float32.
+        xi_cpu = torch.tensor([1, 2], dtype=torch.int32)
+        with pytest.raises(RuntimeError, match="without overflow"):
+            torch.clamp(xi_cpu, big)
+        with pytest.raises(RuntimeError, match="without overflow"):
+            torch.clamp(xi_cpu.to(mojo_device), big)
+
+
 # --------------------------------------------------------------------------
 # pow special values (C99 Annex F, what ::pow / ::powf return on CUDA)
 # --------------------------------------------------------------------------

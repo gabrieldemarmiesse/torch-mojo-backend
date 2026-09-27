@@ -624,6 +624,31 @@ def scalar_to_int(v: Value, st: Int32) raises -> Int:
     return Int(f)
 
 
+def scalar_to_float(v: Value, st: Int32) raises -> Float64:
+    """An ATen Scalar as floating dtype `st`'s value, `scalar_to_int`'s twin
+    for a floating target (`Scalar::to<scalar_t>()`, c10's
+    checked_convert): a finite value beyond the type's range raises as
+    `c10::overflows` does, while inf and NaN pass. The result is the float64
+    the caller narrows into `st` (a float64 target never overflows)."""
+    var f = v_f64(v)
+    if st != ST_FLOAT16 and st != ST_BFLOAT16 and st != ST_FLOAT32:
+        return f
+    var top = 3.4028234663852886e38  # float32
+    var name = String("float")
+    if st == ST_FLOAT16:
+        top = 65504.0
+        name = "c10::Half"
+    elif st == ST_BFLOAT16:
+        top = 3.3895313892515355e38
+        name = "c10::BFloat16"
+    var finite = f - f == 0.0  # inf - inf and NaN - NaN are NaN
+    if finite and (f > top or f < -top):
+        raise Error(
+            "value cannot be converted to type ", name, " without overflow"
+        )
+    return f
+
+
 def known_stype(st: Int32) -> Bool:
     return is_float_stype(st) or is_int_stype(st) or st == ST_BOOL
 
