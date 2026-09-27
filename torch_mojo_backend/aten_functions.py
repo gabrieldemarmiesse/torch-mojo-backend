@@ -243,6 +243,51 @@ def _native_matmul(
     )
 
 
+def _pointwise_binary(
+    input: MaxTensor | Scalar,
+    other: MaxTensor | Scalar,
+    kind: Literal["atan2", "copysign", "fmod", "hypot"],
+    *,
+    promote_float: bool,
+) -> MaxTensor:
+    """A binary op of `tmb/kernels/common/pointwise_math` (the mojo device's
+    `tmb/ops/pointwise.mojo`): ATen's type promotion (integral results to
+    the default float for `promote_float` ops), then one broadcast custom op.
+    """
+    tensors = [x for x in (input, other) if isinstance(x, TensorValue | MaxEagerTensor)]
+    if not tensors:
+        raise NotImplementedError(f"{kind} of two scalars")
+    for x in (input, other):
+        if isinstance(x, Dim):
+            raise NotImplementedError(f"{kind} of a symbolic dimension")
+
+    def probe(x: MaxTensor | int | float) -> torch.Tensor | int | float:
+        if isinstance(x, TensorValue | MaxEagerTensor):
+            # Rank matters: a 0-d tensor promotes like a number.
+            return torch.empty(
+                (0,) * len(x.shape), dtype=max_dtype_to_torch(x.dtype), device="meta"
+            )
+        return x
+
+    result = torch.result_type(probe(input), probe(other))  # ty: ignore[invalid-argument-type]
+    if promote_float and not result.is_floating_point:
+        result = torch.get_default_dtype()
+    dtype = torch_dtype_to_max(result)
+    device = tensors[0].device
+
+    def operand(x: MaxTensor | Scalar) -> MaxTensor:
+        if isinstance(x, TensorValue | MaxEagerTensor):
+            return x if x.dtype == dtype else F.cast(x, dtype)
+        return _scalar_constant(x, dtype=dtype, device=device)
+
+    lhs = operand(input)
+    rhs = operand(other)
+    shape = find_broadcast_shape(lhs.shape, rhs.shape)
+    return custom_mojo_ops.pointwise_binary(
+        _broadcast_to(lhs, shape), _broadcast_to(rhs, shape), kind
+    )
+
+
 # Ops that need to be decomposed.
 DECOMPOSITION_TABLE = core_aten_decompositions()
 original_decomposition_table_size = len(DECOMPOSITION_TABLE)
@@ -1822,6 +1867,11 @@ def aten_atan(x: MaxTensor) -> MaxTensor:
 
 
 # atan2(Tensor self, Tensor other) -> Tensor
+@map_to(aten.atan2)
+def aten_atan2(input: MaxTensor, other: MaxTensor) -> MaxTensor:
+    return _pointwise_binary(input, other, "atan2", promote_float=True)
+
+
 # atan2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 
 
@@ -2556,6 +2606,13 @@ def aten_copy(
     return src
 
 
+# copysign.Scalar(Tensor self, Scalar other) -> Tensor
+# copysign.Tensor(Tensor self, Tensor other) -> Tensor
+@map_to(aten.copysign)
+def aten_copysign(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
+    return _pointwise_binary(input, other, "copysign", promote_float=True)
+
+
 # cos(Tensor self) -> Tensor
 @map_to(aten.cos)
 def aten_cos(x: MaxTensor) -> MaxTensor:
@@ -2914,6 +2971,9 @@ def aten_floor(input: MaxTensor) -> MaxTensor:
 
 # fmod.Scalar(Tensor self, Scalar other) -> Tensor
 # fmod.Tensor(Tensor self, Tensor other) -> Tensor
+@map_to(aten.fmod)
+def aten_fmod(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
+    return _pointwise_binary(input, other, "fmod", promote_float=False)
 
 
 # full(SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
@@ -3079,6 +3139,13 @@ def aten_gt(x: MaxTensor, y: int | float | MaxTensor) -> MaxTensor:
 
 
 # hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
+
+
+# hypot(Tensor self, Tensor other) -> Tensor
+@map_to(aten.hypot)
+def aten_hypot(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """sqrt(a^2 + b^2) without intermediate overflow."""
+    return _pointwise_binary(input, other, "hypot", promote_float=False)
 
 
 # index.Tensor(Tensor self, Tensor?[] indices) -> Tensor
