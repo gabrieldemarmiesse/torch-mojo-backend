@@ -3473,6 +3473,38 @@ def _register_special(site: Site) raises:
         op_special_chebyshev_polynomial_w_out,
         "special_chebyshev_polynomial_w.out",
     ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_t,
+        "special_shifted_chebyshev_polynomial_t",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_t_out,
+        "special_shifted_chebyshev_polynomial_t.out",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_u,
+        "special_shifted_chebyshev_polynomial_u",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_u_out,
+        "special_shifted_chebyshev_polynomial_u.out",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_v,
+        "special_shifted_chebyshev_polynomial_v",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_v_out,
+        "special_shifted_chebyshev_polynomial_v.out",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_w,
+        "special_shifted_chebyshev_polynomial_w",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_w_out,
+        "special_shifted_chebyshev_polynomial_w.out",
+    ](site)
     impl[op_special_xlog1py, "special_xlog1py"](site)
     impl[op_special_xlog1py_out, "special_xlog1py.out"](site)
     impl[op_special_zeta, "special_zeta"](site)

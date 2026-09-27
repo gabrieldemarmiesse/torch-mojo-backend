@@ -5431,6 +5431,30 @@ def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dty
 _POINTWISE_BINARY_TWINS = [
     ("heaviside", aten.heaviside, torch.float32, "heaviside"),
     (
+        "special_shifted_chebyshev_polynomial_t",
+        aten.special_shifted_chebyshev_polynomial_t,
+        torch.float32,
+        "shifted_poly",
+    ),
+    (
+        "special_shifted_chebyshev_polynomial_u",
+        aten.special_shifted_chebyshev_polynomial_u,
+        torch.float32,
+        "shifted_poly",
+    ),
+    (
+        "special_shifted_chebyshev_polynomial_v",
+        aten.special_shifted_chebyshev_polynomial_v,
+        torch.float32,
+        "shifted_poly",
+    ),
+    (
+        "special_shifted_chebyshev_polynomial_w",
+        aten.special_shifted_chebyshev_polynomial_w,
+        torch.float32,
+        "shifted_poly",
+    ),
+    (
         "special_chebyshev_polynomial_u",
         aten.special_chebyshev_polynomial_u,
         torch.float32,
@@ -5516,6 +5540,9 @@ def _pointwise_operands(domain: str, dtype: torch.dtype) -> list[torch.Tensor]:
         return [torch.rand(3, 5) * 4 + 1.1, torch.rand(5) + 0.5]
     if domain == "poly":
         return [torch.rand(3, 5) * 2 - 1, torch.randint(0, 6, (5,)).float()]
+    if domain == "shifted_poly":
+        # x in [0, 1]; n on both sides of the trigonometric route's n >= 6
+        return [torch.rand(3, 5), torch.tensor([0.0, 2.0, 5.0, 7.0, 12.0])]
     if domain == "poly_trig":
         # |x| < 1 and n >= 6: the Chebyshev kernels' trigonometric route
         return [torch.rand(3, 5) * 1.8 - 0.9, torch.randint(6, 13, (5,)).float()]
