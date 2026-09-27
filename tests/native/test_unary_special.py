@@ -1,11 +1,9 @@
 """Tests for the unary math and special functions of the native `unary` op
 group (torch_mojo_backend/mojo/tmb/ops/unary.mojo): asin/atan/erfc/erfinv/
-exp2/expm1/log10/lgamma/digamma/polygamma/mvlgamma/sinc/angle/frac/trunc/
-round/sgn/signbit/nan_to_num and the torch.special
-Bessel functions (bessel_j0/j1/y0/y1, modified_bessel_i0/i1/k0/k1,
-scaled_modified_bessel_k0/k1, spherical_bessel_j0), i0e/i1/i1e, airy_ai,
-entr, erfcx, log_ndtr and ndtri so far, whose kernels port the CUDA
-routines stock torch runs.
+exp2/expm1/log10/lgamma/digamma/polygamma/mvlgamma/i0/sinc/angle/frac/trunc/
+round/sgn/signbit/logit/nan_to_num and the torch.special functions whose
+kernels port the CUDA routines stock torch runs
+(kernels/common/cuda_math.mojo, kernels/common/special_math.mojo).
 
 Public torch API only, compared against CPU torch.
 """
@@ -51,6 +49,7 @@ _CASES: list[tuple[str, Callable[[torch.Tensor], torch.Tensor], float, float]] =
     ("erfinv", torch.erfinv, -1.0, 1.0),
     ("exp2", torch.exp2, -130.0, 130.0),
     ("expm1", torch.expm1, -20.0, 90.0),
+    ("i0", torch.i0, -30.0, 30.0),
     ("lgamma", torch.lgamma, -20.0, 50.0),
     ("log10", torch.log10, 0.0, 1e6),
     ("sinc", torch.sinc, -20.0, 20.0),
@@ -112,9 +111,10 @@ def _expected(fn: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor):
 # torch on the same machine (the `mps` device): c10::metal::digamma's float
 # reflection near the poles (2e-6 relative in float32, and 2e7 instead of
 # 1e30 at -1e-30 where 1 - x rounds to 1), c10::metal::log_gamma's NaN at
-# +-inf and inf at -1e-30, and round_decimals' rint(exp10(n) x) exp10(-n)
-# in float.
-_MPS_SEMANTICS = {"digamma", "lgamma"}
+# +-inf and inf at -1e-30, i0's half `::metal::exp` overflowing above
+# |x| ~ 11.09, logit's eps constants rounded to the tensor type, and
+# round_decimals' rint(exp10(n) x) exp10(-n) in float.
+_MPS_SEMANTICS = {"digamma", "i0", "lgamma"}
 
 
 def _reference(
@@ -301,6 +301,31 @@ def test_nan_to_num_overflowing_replacement(mojo_gpu: str):
     x = torch.tensor([float("nan"), float("inf")], dtype=torch.float16)
     actual = torch.nan_to_num(x.to(mojo_gpu), nan=1e6, posinf=1e10)
     assert torch.equal(actual.cpu(), torch.nan_to_num(x, nan=1e6, posinf=1e10))
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("eps", (None, 1e-6, 0.2))
+def test_logit(mojo_gpu: str, dtype: torch.dtype, eps: float | None):
+    x = torch.cat(
+        [
+            torch.rand(2000, dtype=torch.float64),
+            torch.tensor([0.0, 1.0, -0.1, 1.1, float("nan"), 1e-8, 1 - 1e-8]),
+        ]
+    ).to(dtype)
+    # logit_kernel_cuda computes in float and rounds once; CPU torch's
+    # reduced-precision path does not, so the reference goes through float.
+    # MPS rounds its eps constants to the tensor type (see _MPS_SEMANTICS).
+    if is_metal(mojo_gpu):
+        expected = torch.logit(x.to("mps"), eps).cpu()
+    else:
+        expected = torch.logit(x.float(), eps).to(dtype)
+    _reset_counts()
+    actual = torch.logit(x.to(mojo_gpu), eps)
+    assert _counted("logit")
+    torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
+    out = torch.empty_like(x).to(mojo_gpu)
+    torch.logit(x.to(mojo_gpu), eps, out=out)
+    torch.testing.assert_close(out.cpu(), expected, equal_nan=True)
 
 
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))

@@ -18,7 +18,7 @@
 # the bit pattern instead.
 #
 # Where the C++ template computes in the tensor's own type T (erfinv's
-# `y * y`, i0's `fabs` / `exp` / `sqrt` on T), `_rt[dtype]` rounds the float
+# `y * y`, i0's `exp` / `sqrt` on a half T), `_rt[dtype]` rounds the float
 # intermediate to that type, as the half / bfloat arithmetic does.
 # ===----------------------------------------------------------------------=== #
 
@@ -403,19 +403,25 @@ comptime _I0_B: Array[Float32, 25] = [
 
 @always_inline
 def mps_i0[dtype: DType](a: Float32) -> Float32:
-    """`c10::metal::i0` (fabs, exp and sqrt of x in the tensor type)."""
+    """`c10::metal::i0`. For half, `::metal::exp` / `sqrt` of the half x
+    return half (so exp overflows to inf above x ~ 11.09, as on MPS); Metal
+    has no bfloat overloads, so a bfloat x converts to float and nothing
+    rounds before the final cast (measured bit-equal to MPS on an Apple M4).
+    +-inf reaches the x > 8 branch's exp(inf) * c / sqrt(inf) = inf / inf:
+    NaN, as on MPS and CPU (selected here: the fast-math build would not
+    produce it)."""
     if is_nan_f(a):
         return a
     var x = _abs(a)
     if is_inf_f(x):
-        return _INF
+        return _NAN
+    comptime rt = DType.float16 if dtype == DType.float16 else DType.float32
     if x <= Float32(8.0):
         var y = (x / Float32(2.0)) - Float32(2.0)
-        return _rt[dtype](air_exp(x)) * _chbevl_f[_I0_A](y)
+        return _rt[rt](air_exp(x)) * _chbevl_f[_I0_A](y)
     return (
-        _rt[dtype](air_exp(x))
-        * _chbevl_f[_I0_B](Float32(32.0) / x - Float32(2.0))
-    ) / _rt[dtype](air_sqrt(x))
+        _rt[rt](air_exp(x)) * _chbevl_f[_I0_B](Float32(32.0) / x - Float32(2.0))
+    ) / _rt[rt](air_sqrt(x))
 
 
 @always_inline
@@ -712,16 +718,19 @@ def mps_round_decimals(x: Float32, decimals: Float32) -> Float32:
 
 
 @always_inline
-def mps_logit[dtype: DType](x: Float32, eps: Float32) -> Float32:
-    """`logit_mps_impl`: an MPSGraph in the tensor type -- clamp to
-    [eps, 1 - eps] when eps is given (lo applied last), then log(z / (1 - z)),
-    every step rounded to the tensor type. A negative eps is the schema's
-    None here, as in the CUDA kernel."""
+def mps_logit(x: Float32, eps: Float32, lo: Float32, hi: Float32) -> Float32:
+    """`logit_mps_impl`, an MPSGraph: when eps is given, clamp to [lo, hi]
+    (lo applied last), then log(z / (1 - z)). lo = eps and hi = 1 - lo are
+    graph constants of the input type, rounded to it on the host
+    (`_logit_bounds` in tmb/ops/unary.mojo); MPSGraph evaluates the fused
+    chain in float and rounds once. Measured on an Apple M4, half / bfloat16
+    results are bit-equal to that, not to per-step rounding, and a NaN input
+    clamps to lo. A negative eps is the schema's None here, as in the CUDA
+    kernel."""
     var z = x
     if not (eps < Float32(0.0)):
-        var lo = _rt[dtype](eps)
-        var hi = _rt[dtype](Float32(1.0) - lo)
         z = hi if x > hi else x
         z = lo if x < lo else z
-    var q = _rt[dtype](z / _rt[dtype](Float32(1.0) - z))
-    return air_log(q)
+        # Selected from the bits: the fast-math build folds NaN compares.
+        z = lo if is_nan_f(x) else z
+    return air_log(z / (Float32(1.0) - z))

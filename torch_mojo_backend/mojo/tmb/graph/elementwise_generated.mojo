@@ -356,6 +356,18 @@ struct ElementwiseGeluTanh(ElementwiseUnaryMixedOp):
         return Op.elementwise[dtype, out_dtype, width](x)
 
 
+@extensibility.register("elementwise_i0")
+struct ElementwiseI0(ElementwiseUnaryMixedOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        out_dtype: DType,
+        width: SIMDLength,
+    ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+        comptime Op = ElementwiseOp["i0"]
+        return Op.elementwise[dtype, out_dtype, width](x)
+
+
 @extensibility.register("elementwise_i0e")
 struct ElementwiseI0e(ElementwiseUnaryMixedOp):
     @staticmethod
@@ -497,6 +509,18 @@ struct ElementwiseLog2(ElementwiseUnaryMixedOp):
         width: SIMDLength,
     ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
         comptime Op = ElementwiseOp["log2"]
+        return Op.elementwise[dtype, out_dtype, width](x)
+
+
+@extensibility.register("elementwise_logit")
+struct ElementwiseLogit(ElementwiseUnaryMixedOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        out_dtype: DType,
+        width: SIMDLength,
+    ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+        comptime Op = ElementwiseOp["logit"]
         return Op.elementwise[dtype, out_dtype, width](x)
 
 

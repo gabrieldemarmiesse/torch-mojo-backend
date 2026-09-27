@@ -5,7 +5,7 @@ clamp.Tensor, rsub, deg2rad/rad2deg/ldexp/frexp and the binary math family
 bitwise_left_shift.Tensor, bitwise_right_shift.Tensor, logaddexp(2), xlogy,
 xlog1py, zeta, igamma/igammac, the special polynomials), and elu, hardtanh,
 leaky_relu, softplus, threshold, hardshrink, softshrink, hardsigmoid,
-hardswish, mish with their backwards so far.
+hardswish, mish, logsigmoid, rrelu with their backwards, and logit_backward.
 
 Everything is compared with the same computation on CPU torch through the
 public API, over edge values (signed zeros, infinities, NaN, huge, tiny,
@@ -1435,6 +1435,53 @@ def test_elu_intermediates(mojo_gpu, dtype):
     _close(torch.ops.aten.elu(x.to(mojo_gpu), *args), want)
 
 
+def _gelu_grad_input(
+    g: torch.Tensor, x: torch.Tensor, approximate: str
+) -> torch.Tensor:
+    """gelu_backward.grad_input: the pointwise route (the functional
+    gelu_backward is the dedicated activation_backward kernel)."""
+    out = torch.empty_like(x)
+    return torch.ops.aten.gelu_backward.grad_input(
+        g, x, approximate=approximate, grad_input=out
+    )
+
+
+_BACKWARD = [
+    ("silu_backward", lambda g, x: torch.ops.aten.silu_backward(g, x)),
+    ("mish_backward", lambda g, x: torch.ops.aten.mish_backward(g, x)),
+    ("hardswish_backward", lambda g, x: torch.ops.aten.hardswish_backward(g, x)),
+    ("hardsigmoid_backward", lambda g, x: torch.ops.aten.hardsigmoid_backward(g, x)),
+    ("logit_backward", lambda g, x: torch.ops.aten.logit_backward(g, x.sigmoid())),
+    (
+        "logit_backward_eps",
+        lambda g, x: torch.ops.aten.logit_backward(g, x.sigmoid(), 0.2),
+    ),
+    ("gelu_backward_none", lambda g, x: _gelu_grad_input(g, x, "none")),
+    ("gelu_backward_tanh", lambda g, x: _gelu_grad_input(g, x, "tanh")),
+    (
+        "log_sigmoid_backward",
+        lambda g, x: torch.ops.aten.log_sigmoid_backward(
+            g, x, torch.ops.aten.log_sigmoid_forward(x)[1]
+        ),
+    ),
+    (
+        "elu_backward_result",
+        lambda g, x: torch.ops.aten.elu_backward(g, 1.0, 1.0, 1.0, True, F.elu(x)),
+    ),
+    ("softshrink_backward", lambda g, x: torch.ops.aten.softshrink_backward(g, x, 0.4)),
+    ("hardshrink_backward", lambda g, x: torch.ops.aten.hardshrink_backward(g, x, 0.4)),
+]
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+@pytest.mark.parametrize("name,fn", _BACKWARD, ids=[b[0] for b in _BACKWARD])
+def test_backward_ops(mojo_gpu, name, fn, dtype):
+    torch.manual_seed(8)
+    x = torch.randn(301).to(dtype) * 4
+    g = torch.randn(301).to(dtype)
+    _close(fn(g.to(mojo_gpu), x.to(mojo_gpu)), fn(g, x), **_tol(dtype, 4))
+
+
 _F64_TOL = {"rtol": 1e-12, "atol": 1e-14}
 
 
@@ -1455,6 +1502,22 @@ def test_activation_float64(mojo_gpu, name, fn, op):
     _close(actual, want, **_F64_TOL)
 
 
+@pytest.mark.parametrize("name,fn", _BACKWARD, ids=[b[0] for b in _BACKWARD])
+def test_backward_ops_float64(mojo_gpu, name, fn):
+    skip_if_metal(mojo_gpu, "Metal has no float64")
+    torch.manual_seed(8)
+    x = torch.randn(301, dtype=torch.float64) * 4
+    g = torch.randn(301, dtype=torch.float64)
+    if name.startswith("logit"):
+        # The sigmoid of the case is taken on CPU (not an op of this test).
+        eps = 0.2 if name.endswith("eps") else None
+        s = x.sigmoid()
+        got = torch.ops.aten.logit_backward(g.to(mojo_gpu), s.to(mojo_gpu), eps)
+        _close(got, torch.ops.aten.logit_backward(g, s, eps), **_F64_TOL)
+        return
+    _close(fn(g.to(mojo_gpu), x.to(mojo_gpu)), fn(g, x), **_F64_TOL)
+
+
 def test_rrelu_training_float64(mojo_gpu):
     skip_if_metal(mojo_gpu, "Metal has no float64")
     x_cpu = torch.randn(1001, dtype=torch.float64) * 3
@@ -1466,6 +1529,24 @@ def test_rrelu_training_float64(mojo_gpu):
     assert (n[~neg] == 1).all()
     assert ((n[neg] >= 0.1) & (n[neg] <= 0.4)).all()
     _close(y, x_cpu * n, **_F64_TOL)
+
+
+def test_backward_grad_input_out_forms(mojo_gpu):
+    x = torch.randn(40) * 3
+    g = torch.randn(40)
+    gi = torch.empty(40, device=mojo_gpu)
+    torch.ops.aten.silu_backward.grad_input(
+        g.to(mojo_gpu), x.to(mojo_gpu), grad_input=gi
+    )
+    _close(gi, torch.ops.aten.silu_backward(g, x), **_tol(torch.float32, 3))
+    torch.ops.aten.gelu_backward.grad_input(
+        g.to(mojo_gpu), x.to(mojo_gpu), grad_input=gi
+    )
+    _close(gi, torch.ops.aten.gelu_backward(g, x), **_tol(torch.float32, 3))
+    torch.ops.aten.logit_backward.grad_input(
+        g.to(mojo_gpu), x.sigmoid().to(mojo_gpu), grad_input=gi
+    )
+    _close(gi, torch.ops.aten.logit_backward(g, x.sigmoid()), **_tol(torch.float32, 3))
 
 
 @pytest.mark.parametrize("dtype", FLOATS)

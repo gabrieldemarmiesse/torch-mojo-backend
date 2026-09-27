@@ -121,6 +121,7 @@ ACT_BACKWARD_OPS = {
     "log_sigmoid_backward": lambda g, x: torch.ops.aten.log_sigmoid_backward(
         g, x, torch.empty(0, device=x.device, dtype=x.dtype)
     ),
+    "logit_backward": torch.ops.aten.logit_backward,
     "mish_backward": torch.ops.aten.mish_backward,
     "silu_backward": torch.ops.aten.silu_backward,
     "softplus_backward": lambda g, x: torch.ops.aten.softplus_backward(g, x, 1.0, 20.0),
@@ -272,6 +273,7 @@ SKIPPED: dict[str, str] = {
     "aten::log_sigmoid_backward.grad_input": _OUT,
     "aten::logaddexp.out": _OUT,
     "aten::logaddexp2.out": _OUT,
+    "aten::logit_backward.grad_input": _OUT,
     "aten::logical_and.out": _OUT,
     "aten::logical_or.out": _OUT,
     "aten::logical_xor.out": _OUT,

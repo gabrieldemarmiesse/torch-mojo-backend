@@ -3342,6 +3342,8 @@ def register_pointwise(site: Site) raises:
     impl[op_logaddexp_out, "logaddexp.out"](site)
     impl[op_logaddexp2, "logaddexp2"](site)
     impl[op_logaddexp2_out, "logaddexp2.out"](site)
+    impl[op_logit_backward, "logit_backward"](site)
+    impl[op_logit_backward_grad_input, "logit_backward.grad_input"](site)
     impl[op_mish, "mish"](site)
     impl[op_mish_out, "mish.out"](site)
     impl[op_mish_backward, "mish_backward"](site)
