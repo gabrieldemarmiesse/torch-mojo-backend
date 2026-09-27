@@ -1401,6 +1401,46 @@ def test_inf_predicates_out(mojo_gpu: str, name: str):
 
 
 # --------------------------------------------------------------------------
+# special functions: the .out overloads (cast into a narrower float out,
+# resize, strided out)
+# --------------------------------------------------------------------------
+
+_SPECIAL_OUT = [
+    "bessel_j0",
+    "bessel_j1",
+    "bessel_y0",
+    "bessel_y1",
+    "spherical_bessel_j0",
+]
+
+
+@pytest.mark.parametrize("name", _SPECIAL_OUT)
+def test_special_unary_out(mojo_gpu: str, name: str):
+    fn = getattr(torch.special, name)
+    x_cpu = torch.tensor([0.1, 0.5, 1.5, 3.0, 7.0, 12.5])
+    x = x_cpu.to(mojo_gpu)
+    want = fn(x_cpu)
+    out = torch.empty(0, device=mojo_gpu)
+    _reset_native_counts()
+    assert fn(x, out=out) is out
+    assert native.op_counts() == {f"aten::special_{name}.out": 1}
+    torch.testing.assert_close(out.cpu(), want, rtol=1e-4, atol=1e-6)
+    # A float32 result is cast into a float16 / bfloat16 out.
+    for dtype in (torch.float16, torch.bfloat16):
+        narrow = torch.empty(6, dtype=dtype, device=mojo_gpu)
+        fn(x, out=narrow)
+        want_narrow = torch.empty(6, dtype=dtype)
+        fn(x_cpu, out=want_narrow)
+        torch.testing.assert_close(narrow.cpu(), want_narrow, rtol=1e-2, atol=1e-3)
+    base = torch.zeros(12, device=mojo_gpu)
+    fn(x, out=base[::2])
+    torch.testing.assert_close(base[::2].cpu(), want, rtol=1e-4, atol=1e-6)
+    assert not base[1::2].cpu().any()
+    with pytest.raises(RuntimeError, match="single memory location"):
+        fn(x, out=torch.empty(1, device=mojo_gpu).expand(6))
+
+
+# --------------------------------------------------------------------------
 # asin / atan / log10 / exp2 / expm1 / erfc / erfinv / sinc: the .out
 # overloads and IEEE edges
 # --------------------------------------------------------------------------

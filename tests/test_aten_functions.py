@@ -5874,11 +5874,26 @@ _SPECIAL_UNARY_CASES = [
     ("sgn", lambda x: aten.sgn(x), [-2.0, -0.0, 0.0, 3.0]),
     ("signbit", lambda x: aten.signbit(x), [-2.0, -0.0, 0.0, 3.0]),
     ("sinc", lambda x: aten.sinc(x), [-2.5, -0.1, 0.0, 0.5, 7.0]),
+    ("special_bessel_j0", lambda x: aten.special_bessel_j0(x), [-7.0, 0.0, 3.0, 9.0]),
+    ("special_bessel_j1", lambda x: aten.special_bessel_j1(x), [-7.0, 0.0, 3.0, 9.0]),
+    ("special_bessel_y0", lambda x: aten.special_bessel_y0(x), [0.5, 3.0, 9.0]),
+    ("special_bessel_y1", lambda x: aten.special_bessel_y1(x), [0.5, 3.0, 9.0]),
+    (
+        "special_spherical_bessel_j0",
+        lambda x: aten.special_spherical_bessel_j0(x),
+        [-7.0, 0.0, 0.25, 9.0],
+    ),
 ]
 
 
 # Float and double only in stock torch (AT_DISPATCH_FLOATING_TYPES).
-_NO_HALF_KERNEL: set[str] = set()
+_NO_HALF_KERNEL: set[str] = {
+    "special_bessel_j0",
+    "special_bessel_j1",
+    "special_bessel_y0",
+    "special_bessel_y1",
+    "special_spherical_bessel_j0",
+}
 
 
 # logit's bfloat16 reference would be CPU torch's reduced-precision path,

@@ -2138,6 +2138,18 @@ def register_unary(site: Site) raises:
     impl[op_sinc_out, "sinc.out"](site)
     impl[op_sinh, "sinh"](site)
     impl[op_sinh_out, "sinh.out"](site)
+    impl[op_special_bessel_j0, "special_bessel_j0"](site)
+    impl[op_special_bessel_j0_out, "special_bessel_j0.out"](site)
+    impl[op_special_bessel_j1, "special_bessel_j1"](site)
+    impl[op_special_bessel_j1_out, "special_bessel_j1.out"](site)
+    impl[op_special_bessel_y0, "special_bessel_y0"](site)
+    impl[op_special_bessel_y0_out, "special_bessel_y0.out"](site)
+    impl[op_special_bessel_y1, "special_bessel_y1"](site)
+    impl[op_special_bessel_y1_out, "special_bessel_y1.out"](site)
+    impl[op_special_spherical_bessel_j0, "special_spherical_bessel_j0"](site)
+    impl[op_special_spherical_bessel_j0_out, "special_spherical_bessel_j0.out"](
+        site
+    )
     impl[op_sqrt, "sqrt"](site)
     impl[op_sqrt_out, "sqrt.out"](site)
     impl[op_tan, "tan"](site)
