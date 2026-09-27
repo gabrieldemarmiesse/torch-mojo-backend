@@ -171,6 +171,7 @@ def elementwise(
         "abs",
         "acos",
         "acosh",
+        "angle",
         "asin",
         "asinh",
         "atan",
@@ -200,6 +201,7 @@ def elementwise(
         "rsqrt",
         "sigmoid",
         "sign",
+        "signbit",
         "silu",
         "sin",
         "sinc",
@@ -225,6 +227,7 @@ def elementwise(
             "neg",
             "relu",
             "sign",
+            "signbit",
             "silu",
         }
         and not input.dtype.is_float()
@@ -233,7 +236,9 @@ def elementwise(
         # floating dtype, whereas ElementwiseUnaryOp preserves its input dtype.
         input = F.cast(input, dtype=torch_dtype_to_max(torch.get_default_dtype()))
     output_dtype = (
-        DType.bool if kind in {"isinf", "isnan", "logical_not"} else input.dtype
+        DType.bool
+        if kind in {"isinf", "isnan", "logical_not", "signbit"}
+        else input.dtype
     )
     return F.custom(
         name=f"elementwise_{kind}",

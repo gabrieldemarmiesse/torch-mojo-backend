@@ -1280,6 +1280,12 @@ def aten_softmax(
     return x_exp / x_sum
 
 
+# angle(Tensor self) -> Tensor
+@map_to(aten.angle)
+def aten_angle(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "angle")
+
+
 # aten._log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor
 @map_to(aten._log_softmax)
 def aten__log_softmax(input: MaxTensor, dim: int, half_to_float: bool) -> MaxTensor:
@@ -4343,6 +4349,35 @@ def aten_ne(x: MaxTensor, y: MaxTensor | Scalar) -> MaxTensor:
     return operator.ne(x, y)
 
 
+# nan_to_num(Tensor self, float? nan=None, float? posinf=None, float? neginf=None) -> Tensor
+@map_to(aten.nan_to_num)
+def aten_nan_to_num(
+    x: MaxTensor,
+    nan: float | None = None,
+    posinf: float | None = None,
+    neginf: float | None = None,
+) -> MaxTensor:
+    if not x.dtype.is_float():
+        return x
+    big = {
+        DType.float16: torch.finfo(torch.float16).max,
+        DType.bfloat16: torch.finfo(torch.bfloat16).max,
+        DType.float32: torch.finfo(torch.float32).max,
+    }.get(x.dtype, torch.finfo(torch.float64).max)
+    inf = F.constant(float("inf"), dtype=x.dtype, device=x.device)
+
+    def const(value: float) -> MaxTensor:
+        return F.constant(value, dtype=x.dtype, device=x.device)
+
+    replaced = _where(x == inf, const(big if posinf is None else posinf), x)
+    replaced = _where(x == -inf, const(-big if neginf is None else neginf), replaced)
+    return _where(
+        custom_mojo_ops.elementwise(x, "isnan"),
+        const(0.0 if nan is None else nan),
+        replaced,
+    )
+
+
 # neg(Tensor self) -> Tensor
 @map_to(aten.neg)
 def aten_neg(x: MaxTensor) -> MaxTensor:
@@ -4676,10 +4711,22 @@ def aten_sigmoid(input: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(input, "sigmoid")
 
 
+# sgn(Tensor self) -> Tensor
+@map_to(aten.sgn)
+def aten_sgn(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "sign")
+
+
 # sign(Tensor self) -> Tensor
 @map_to(aten.sign)
 def aten_sign(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "sign")
+
+
+# signbit(Tensor self) -> Tensor
+@map_to(aten.signbit)
+def aten_signbit(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "signbit")
 
 
 # silu(Tensor self) -> Tensor
