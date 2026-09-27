@@ -2716,6 +2716,23 @@ def register_pointwise(site: Site) raises:
     impl[op_frexp_out, "frexp.Tensor_out"](site)
     impl[op_gcd, "gcd"](site)
     impl[op_gcd_out, "gcd.out"](site)
+    impl[op_binary_cross_entropy, "binary_cross_entropy"](site)
+    impl[op_binary_cross_entropy_out, "binary_cross_entropy.out"](site)
+    impl[op_binary_cross_entropy_backward, "binary_cross_entropy_backward"](
+        site
+    )
+    impl[
+        op_binary_cross_entropy_backward_grad_input,
+        "binary_cross_entropy_backward.grad_input",
+    ](site)
+    impl[
+        op_binary_cross_entropy_with_logits,
+        "binary_cross_entropy_with_logits",
+    ](site)
+    impl[
+        op_binary_cross_entropy_with_logits_out,
+        "binary_cross_entropy_with_logits.out",
+    ](site)
     impl[op_deg2rad, "deg2rad"](site)
     impl[op_deg2rad_out, "deg2rad.out"](site)
     impl[op_deg2rad_, "deg2rad_"](site)

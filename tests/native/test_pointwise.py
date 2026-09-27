@@ -1049,6 +1049,55 @@ def test_huber_loss(mojo_gpu, delta, reduction, dtype):
     _check_loss(mojo_gpu, fn, [x, y], dtype, "aten::huber_loss", grads=(0, 1))
 
 
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("reduction", _REDUCTIONS)
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_binary_cross_entropy(mojo_gpu, weighted, reduction, dtype):
+    torch.manual_seed(3)
+    x = torch.rand(4, 37).clamp(1e-3, 1 - 1e-3)
+    x[0, :4] = torch.tensor([0.0, 1.0, 1e-30, 1.0 - 1e-7])  # the -100 clamps
+    t = torch.rand(4, 37)
+    w = torch.rand(37) + 0.5 if weighted else None
+    fn = lambda a, b, c: F.binary_cross_entropy(a, b, weight=c, reduction=reduction)  # noqa: E731
+    _check_loss(
+        mojo_gpu,
+        fn,
+        [x, t, w],
+        dtype,
+        "aten::binary_cross_entropy",
+        grads=(0,),
+        tol=_loss_tol(dtype)
+        if dtype != torch.float32
+        else {"rtol": 1e-4, "atol": 1e-4},
+    )
+
+
+@pytest.mark.parametrize("pos_weighted", [False, True])
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("reduction", _REDUCTIONS)
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_binary_cross_entropy_with_logits(
+    mojo_gpu, pos_weighted, weighted, reduction, dtype
+):
+    torch.manual_seed(4)
+    x = torch.randn(3, 5, 11) * 4
+    x[0, 0, :4] = torch.tensor([30.0, -30.0, 0.0, 100.0])
+    t = torch.rand(3, 5, 11)
+    w = torch.rand(5, 11) + 0.5 if weighted else None
+    pw = torch.rand(11) * 3 if pos_weighted else None
+    fn = lambda a, b, c, d: F.binary_cross_entropy_with_logits(  # noqa: E731
+        a, b, weight=c, pos_weight=d, reduction=reduction
+    )
+    _check_loss(
+        mojo_gpu,
+        fn,
+        [x, t, w, pw],
+        dtype,
+        "aten::binary_cross_entropy_with_logits",
+        grads=(0, 1),
+    )
+
+
 def test_loss_out_and_edge_shapes(mojo_gpu):
     x, y = torch.randn(3, 4), torch.randn(3, 4)
     for reduction in (0, 1, 2):

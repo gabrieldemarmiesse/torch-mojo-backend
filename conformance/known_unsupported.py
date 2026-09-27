@@ -275,12 +275,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "nn_functional_avg_pool2d": ("float32", "bfloat16", "float16", "int64"),
     "nn_functional_avg_pool3d": ("float32", "int64"),
     "nn_functional_bilinear": ("int64",),
-    "nn_functional_binary_cross_entropy": ("float32", "bfloat16", "float16"),
-    "nn_functional_binary_cross_entropy_with_logits": (
-        "float32",
-        "bfloat16",
-        "float16",
-    ),
     "nn_functional_channel_shuffle": (
         "float32",
         "bfloat16",
