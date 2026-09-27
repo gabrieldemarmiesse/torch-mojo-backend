@@ -1,6 +1,8 @@
-from extensibility import ElementwiseUnaryMixedOp
+import extensibility
+from extensibility import ElementwiseBinaryOp, ElementwiseUnaryMixedOp
 
 from tmb.kernels.common.unary_math import (
+    elementwise_polygamma,
     elementwise_predicate,
     elementwise_unary,
 )
@@ -28,3 +30,17 @@ struct ElementwiseOp[kind: StaticString](ElementwiseUnaryMixedOp):
                 out_dtype == dtype
             ), "expected matching input/output dtypes"
             return elementwise_unary[Self.kind](x).cast[out_dtype]()
+
+
+@extensibility.register("polygamma")
+struct Polygamma(ElementwiseBinaryOp):
+    """The polygamma function of order n >= 2, with n as a (broadcast) float
+    operand; n = 0 and n = 1 take the digamma / trigamma elementwise kinds."""
+
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](n: SIMD[dtype, width], x: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        comptime assert dtype.is_floating_point(), "polygamma takes floats"
+        return elementwise_polygamma(n, x)

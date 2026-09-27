@@ -184,6 +184,7 @@ def elementwise(
         "ceil",
         "cos",
         "cosh",
+        "digamma",
         "entr",
         "erf",
         "erfc",
@@ -201,6 +202,7 @@ def elementwise(
         "i1e",
         "isinf",
         "isnan",
+        "lgamma",
         "log10",
         "log_ndtr",
         "logical_not",
@@ -230,6 +232,7 @@ def elementwise(
         "sqrt",
         "tan",
         "tanh",
+        "trigamma",
         "trunc",
     ],
 ) -> MaxTensor:
@@ -317,6 +320,12 @@ def pointwise_binary(
     as a fusible binary custom op. The operands share a dtype and a shape:
     promotion and broadcasting happen before the call."""
     return _same_type_binary(f"pointwise_{kind}", input, other)
+
+
+def polygamma(n: int, input: MaxTensor) -> MaxTensor:
+    """polygamma(n, x) for n >= 2 (`tmb/graph/elementwise.mojo`'s binary
+    `polygamma`, n broadcast as a float operand)."""
+    return _same_type_binary("polygamma", _scalar_to_tensor(input, n), input)
 
 
 def gelu_backward(

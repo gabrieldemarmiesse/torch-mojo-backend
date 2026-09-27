@@ -42,6 +42,7 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "cos": torch.cos,
     "cosh": torch.cosh,
     "deg2rad": torch.deg2rad,
+    "digamma": torch.digamma,
     "erf": torch.erf,
     "erfc": torch.erfc,
     "erfinv": torch.erfinv,
@@ -56,12 +57,15 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "isnan": torch.isnan,
     "isneginf": torch.isneginf,
     "isposinf": torch.isposinf,
+    "lgamma": torch.lgamma,
     "log": torch.log,
     "log10": torch.log10,
     "log1p": torch.log1p,
     "log2": torch.log2,
+    "mvlgamma": lambda x: torch.mvlgamma(x, 2),
     "nan_to_num": torch.nan_to_num,
     "neg": torch.neg,
+    "polygamma": lambda x: torch.polygamma(2, x),
     "rad2deg": torch.rad2deg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
@@ -87,7 +91,8 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
 }
 
 # Ops whose domain excludes unit_interval: its operand, shifted by this much.
-DOMAIN_SHIFT: dict[str, float] = {"acosh": 1.0}
+# mvlgamma(x, 2) needs x > 1/2.
+DOMAIN_SHIFT: dict[str, float] = {"acosh": 1.0, "mvlgamma": 1.0}
 
 
 def _operand(op_name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:

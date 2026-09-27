@@ -2841,6 +2841,12 @@ def aten_detach(input: MaxTensor) -> MaxTensor:
 # diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)
 
 
+# digamma(Tensor self) -> Tensor
+@map_to(aten.digamma)
+def aten_digamma(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "digamma")
+
+
 # div.Scalar(Tensor self, Scalar other) -> Tensor
 # div.Scalar_mode(Tensor self, Scalar other, *, str? rounding_mode) -> Tensor
 # div.Tensor(Tensor self, Tensor other) -> Tensor
@@ -3848,6 +3854,12 @@ def aten_leaky_relu(input: MaxTensor, negative_slope: float = 0.01) -> MaxTensor
     return result if result.dtype == dtype else F.cast(result, dtype)
 
 
+# lgamma(Tensor self) -> Tensor
+@map_to(aten.lgamma)
+def aten_lgamma(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "lgamma")
+
+
 # linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
 @map_to(aten.linear)
 def aten_linear(
@@ -4282,6 +4294,29 @@ def _batch_norm_batch_stats(input: MaxTensor) -> tuple[MaxTensor, MaxTensor]:
     for axis in reduce_axes:
         var = _reduce_mean(var, axis=axis)
     return mean, var
+
+
+# mvlgamma(Tensor self, int p) -> Tensor
+@map_to(aten.mvlgamma)
+def aten_mvlgamma(x: MaxTensor, p: int) -> MaxTensor:
+    """ATen's composition (UnaryOps.cpp): sum_j lgamma(x + (1 - p)/2 + j/2)
+    + p (p - 1) log(pi) / 4."""
+    if p < 1:
+        raise ValueError("p has to be greater than or equal to 1")
+    if not x.dtype.is_float():
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    # The terms in the tensor dtype, their sum accumulated in float (as
+    # ATen's sum reduction does for the half types), the constant added last.
+    acc = DType.float64 if x.dtype == DType.float64 else DType.float32
+    total = None
+    for j in range(p):
+        shift = F.constant((1 - p) / 2 + j / 2, dtype=x.dtype, device=x.device)
+        term = F.cast(custom_mojo_ops.elementwise(x + shift, "lgamma"), acc)
+        total = term if total is None else total + term
+    assert total is not None
+    total = F.cast(F.cast(total, x.dtype), acc)
+    constant = p * (p - 1) * math.log(math.pi) / 4
+    return F.cast(total + F.constant(constant, dtype=acc, device=x.device), x.dtype)
 
 
 # nanmedian(Tensor self) -> Tensor
@@ -4810,6 +4845,20 @@ def aten_ones_like(
 @map_to(aten.permute)
 def aten_permute(x: MaxTensor, dims: list[int]) -> MaxTensor:
     return F.permute(x, dims)
+
+
+# polygamma(int n, Tensor self) -> Tensor
+@map_to(aten.polygamma)
+def aten_polygamma(n: int, x: MaxTensor) -> MaxTensor:
+    if n < 0:
+        raise ValueError("polygamma(n, x) does not support negative n.")
+    if not x.dtype.is_float():
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    if n == 0:
+        return custom_mojo_ops.elementwise(x, "digamma")
+    if n == 1:
+        return custom_mojo_ops.elementwise(x, "trigamma")
+    return custom_mojo_ops.polygamma(n, x)
 
 
 # pow.Scalar(Scalar self, Tensor exponent) -> Tensor
