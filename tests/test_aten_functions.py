@@ -5431,6 +5431,52 @@ def test_aten_inf_predicates(conf: Conf, call_checker: CallChecker, name: str):
     check_outputs(fn, conf, [torch.tensor(_INF_EDGES)])
 
 
+def test_aten_isinf_ldexp_compiled(device: str):
+    checkers = []
+    for twin in (aten_functions.aten_isinf, aten_functions.aten_ldexp):
+        checker = CallChecker()
+        checker.register(twin)
+        checkers.append(checker)
+
+    def fn(
+        x: torch.Tensor, e: torch.Tensor, f: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        return aten.isinf(x), aten.ldexp(x, e), aten.ldexp(x, f)
+
+    # No subnormal operand: MAX's CPU graphs flush them to zero.
+    x = torch.tensor([v if v != 1e-40 else 1e-30 for v in _INF_EDGES], device=device)
+    e = torch.tensor([3, -2, 10, -150, 200, 1, -1, 0], device=device)
+    f = torch.tensor([0.5, 1.0, -3.0, 2.0, 1.0, 1.0, 0.0, 2.0], device=device)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for result, expected in zip(compiled(x, e, f), fn(x, e, f), strict=True):
+        torch.testing.assert_close(result, expected, equal_nan=True)
+    for checker in checkers:
+        checker.check_was_called()
+
+
+@pytest.mark.parametrize("name", ["deg2rad", "rad2deg"])
+def test_aten_deg2rad_rad2deg(conf: Conf, call_checker: CallChecker, name: str):
+    call_checker.register(f"aten::{name}")
+    op = getattr(aten, name)
+
+    def fn(x):
+        return op(x)
+
+    check_outputs(fn, conf, [torch.randn(4, 9) * 300])
+
+
+@pytest.mark.parametrize("edtype", [torch.int32, torch.float32])
+def test_aten_ldexp(conf: Conf, call_checker: CallChecker, edtype: torch.dtype):
+    call_checker.register(aten_functions.aten_ldexp)
+
+    def fn(x, e):
+        return aten.ldexp(x, e)
+
+    x = torch.randn(3, 7)
+    e = torch.randint(-20, 20, (7,)).to(edtype)
+    check_outputs(fn, conf, [x, e])
+
+
 # Unary math and special functions: (aten_functions twin, aten call, input).
 _SPECIAL_UNARY_CASES = [
     ("angle", lambda x: aten.angle(x), [-2.0, -0.0, 0.0, 3.0]),

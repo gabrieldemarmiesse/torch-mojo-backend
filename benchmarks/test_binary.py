@@ -128,7 +128,9 @@ COVERS: dict[str, str] = (
         "aten::lerp_.Scalar": "test_lerp_inplace",
         "aten::clamp": "test_clamp",
         "aten::clamp.Tensor": "test_clamp_tensor",
+        "aten::frexp.Tensor": "test_frexp",
         "aten::lerp.Tensor": "test_lerp_tensor",
+        "aten::ldexp.Tensor": "test_ldexp",
         "aten::pow.Scalar": "test_pow_scalar_base",
         "aten::addcdiv": "test_addcdiv",
         "aten::addcdiv.out": "test_addcdiv_inplace",
@@ -207,10 +209,13 @@ SKIPPED: dict[str, str] = {
     "aten::fmod.Scalar": _SCALAR_OPERAND,
     "aten::fmod.Scalar_out": _OUT,
     "aten::fmod.Tensor_out": _OUT,
+    "aten::frexp.Tensor_out": _OUT,
     "aten::gcd.out": _OUT,
     "aten::heaviside.out": _OUT,
     "aten::hypot.out": _OUT,
     "aten::lcm.out": _OUT,
+    "aten::ldexp.out": _OUT,
+    "aten::ldexp_": _OUT,
     "aten::lerp.Tensor_out": _OUT,
     "aten::logaddexp.out": _OUT,
     "aten::logaddexp2.out": _OUT,
@@ -636,6 +641,43 @@ def test_pow_scalar_base(
     bench.run(
         lambda: torch.pow(2.5, x_ref),
         lambda: torch.pow(2.5, x_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("frexp.Tensor")
+def test_frexp(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(
+        (torch.randn(shape) * 100).to(DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.frexp(x_ref),
+        lambda: torch.frexp(x_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("ldexp.Tensor")
+def test_ldexp(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """The integral-exponent route (::ldexp in self's dtype); exponents in
+    [-20, 20) keep every result normal."""
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    e_ref, e_our = both(
+        torch.randint(-20, 20, shape, dtype=torch.int32), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.ldexp(x_ref, e_ref),
+        lambda: torch.ldexp(x_our, e_our),
         flops=float(x_ref.numel()),
     )
 

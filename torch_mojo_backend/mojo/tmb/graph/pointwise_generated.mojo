@@ -116,6 +116,18 @@ struct PointwiseLcm(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_ldexp")
+struct PointwiseLdexp(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["ldexp", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_logaddexp")
 struct PointwiseLogaddexp(ElementwiseBinaryOp):
     @staticmethod

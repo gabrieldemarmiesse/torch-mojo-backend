@@ -264,6 +264,7 @@ def pointwise_binary(
         "heaviside",
         "hypot",
         "lcm",
+        "ldexp",
         "logaddexp",
         "logaddexp2",
         "lshift",

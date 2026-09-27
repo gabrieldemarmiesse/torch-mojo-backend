@@ -3498,6 +3498,29 @@ def aten_lcm(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
     return _pointwise_binary(input, other, "lcm", promote_float=False)
 
 
+# ldexp.Tensor(Tensor self, Tensor other) -> Tensor
+@map_to(aten.ldexp.Tensor)
+def aten_ldexp(input: MaxTensor, other: MaxTensor) -> MaxTensor:
+    """BinaryOps.cpp's ldexp: a floating self with an integral exponent is
+    ::ldexp in self's dtype (the mojo device's `ldexp` pointwise kind;
+    bfloat16 computed in float32, whose exponent range its mantissa cannot
+    index exactly); anything else is self * pow(2, other)."""
+    in_dtype = max_dtype_to_torch(input.dtype)
+    ex_dtype = max_dtype_to_torch(other.dtype)
+    if in_dtype.is_floating_point and not ex_dtype.is_floating_point:
+        compute = DType.float32 if input.dtype == DType.bfloat16 else input.dtype
+        shape = find_broadcast_shape(input.shape, other.shape)
+        lhs = _broadcast_to(F.cast(input, compute), shape)
+        rhs = _broadcast_to(F.cast(other, compute), shape)
+        result = custom_mojo_ops.pointwise_binary(lhs, rhs, "ldexp")
+        return result if compute == input.dtype else F.cast(result, input.dtype)
+    if in_dtype.is_floating_point and in_dtype != torch.float32:
+        # full({}, 2.0, self.dtype).pow(other)
+        base = _scalar_constant(2.0, dtype=input.dtype, device=input.device)
+        return aten_mul(input, aten_pow(base, other))
+    return aten_mul(input, aten_pow(2.0, other))
+
+
 # le.Scalar(Tensor self, Scalar other) -> Tensor
 # le.Tensor(Tensor self, Tensor other) -> Tensor
 @map_to(aten.le)

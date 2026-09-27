@@ -41,6 +41,7 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "ceil": torch.ceil,
     "cos": torch.cos,
     "cosh": torch.cosh,
+    "deg2rad": torch.deg2rad,
     "erf": torch.erf,
     "erfc": torch.erfc,
     "erfinv": torch.erfinv,
@@ -60,6 +61,7 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "log2": torch.log2,
     "nan_to_num": torch.nan_to_num,
     "neg": torch.neg,
+    "rad2deg": torch.rad2deg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
     "rsqrt": torch.rsqrt,
@@ -94,7 +96,15 @@ _UNARY_OUT = (
 )
 SKIPPED: dict[str, str] = {
     f"aten::{name}": _UNARY_OUT
-    for name in ("isinf.out", "isneginf.out", "isposinf.out")
+    for name in (
+        "deg2rad.out",
+        "deg2rad_",
+        "isinf.out",
+        "isneginf.out",
+        "isposinf.out",
+        "rad2deg.out",
+        "rad2deg_",
+    )
 }
 
 COVERS: dict[str, str] = {f"aten::{name}": "test_unary" for name in UNARY_OPS} | {
