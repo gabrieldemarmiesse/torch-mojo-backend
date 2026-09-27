@@ -473,9 +473,12 @@ def _zeta_pow(a: Float64, b: Float64) -> Float64:
 def _poly_n[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
     """`static_cast<int64_t>(n)` for the polynomial degree (truncation), in
     the operand's own float type (no float64 on Apple GPUs); NaN and
-    out-of-range degrees read as -1, which every polynomial maps to 0
-    (hermite does exactly this; the others would be UB in C++)."""
-    if isnan(n) or n >= 9.2e18 or n <= -9.2e18:
+    degrees outside int64's range (-2^63, 2^63) read as -1, which every
+    polynomial maps to 0 (hermite does exactly this; the others are UB in
+    C++, which x86's cvttsd2si turns into INT64_MIN, a negative degree).
+    The cutoff is 2^63 exactly: every float below it converts, so a degree
+    such as 9.21e18 keeps its value."""
+    if isnan(n) or n >= 9223372036854775808.0 or n <= -9223372036854775808.0:
         return -1
     return Int(n)
 

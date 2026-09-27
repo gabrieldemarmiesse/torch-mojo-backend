@@ -793,6 +793,33 @@ def test_special_polynomials_cpu_scalar_degree(mojo_gpu, name):
     _close(got, fn(i, deg))
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    ("name", "x"),
+    [
+        ("hermite_polynomial_h", 0.5),
+        ("hermite_polynomial_he", 0.5),
+        ("laguerre_polynomial_l", 0.0),
+        ("legendre_polynomial_p", 1.0),
+        ("legendre_polynomial_p", -1.0),
+    ],
+)
+def test_special_polynomials_huge_degree(mojo_gpu, name, x, dtype):
+    """Degrees near int64's edge: 9.21e18 is below 2^63, so it converts
+    (1 for legendre at +-1 and laguerre at 0, NaN past hermite's limit), and
+    the negatives give 0. The x values return before any recurrence loop.
+    A degree of 2^63 or more is UB in C++ (`static_cast<int64_t>`): x86
+    CPU torch gives INT64_MIN (0 here) but ARM and CUDA saturate, so it is
+    not compared."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    fn = getattr(torch.special, name)
+    n = torch.tensor([9.21e18, 2.0**62, -9.21e18, -(2.0**63)], dtype=dtype)
+    xs = torch.full_like(n, x)
+    got = fn(xs.to(mojo_gpu), n.to(mojo_gpu))
+    _close(got, fn(xs, n), rtol=0.0, atol=0.0)
+
+
 @pytest.mark.parametrize("name", _POLYS)
 def test_special_polynomials_float64(mojo_gpu, name):
     """float64 (CUDA dispatches it): the cos / acos branch has no std.math
