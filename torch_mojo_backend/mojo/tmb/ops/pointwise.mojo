@@ -2549,9 +2549,15 @@ def _loss_forward(
     var reduce_st = Int32(-1)
     if dest:
         var d = dest.value().stype
-        if reduction == REDUCTION_NONE:
+        if reduction == REDUCTION_NONE or kind == "huber":
+            # huber_loss_out runs its iterator on `out` for every reduction
+            # (then reduces `out` in place), so its kernel computes in out's
+            # dtype: float16 400 against a float32 target, delta 1000, sums
+            # to 80000 in a float32 `out`, not to float16 inf.
             if not weight and _pw_is_float(d) and _b_can_cast(loss_st, d):
                 loss_st = d
+                if reduction != REDUCTION_NONE:
+                    reduce_st = d
         elif _pw_is_float(d) and _b_can_cast(loss_st, d):
             reduce_st = d
     var compute = _pw_compute_dtype(kind, loss_st, P_FLOAT_ONLY, True)

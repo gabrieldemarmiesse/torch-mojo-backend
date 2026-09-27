@@ -1525,6 +1525,20 @@ def test_loss_out_and_edge_shapes(mojo_gpu):
         F.huber_loss(x.to(mojo_gpu), y.to(mojo_gpu), delta=0.0)
 
 
+@pytest.mark.parametrize("reduction", [1, 2])
+def test_huber_out_reduced_computes_in_out_dtype(mojo_gpu, reduction):
+    """huber_loss.out runs its kernel on `out` for every reduction, then
+    reduces it: float16 400 against a float32 target with delta 1000 is
+    80000 in a float32 `out`, as CPU torch computes, not float16 inf."""
+    aten = torch.ops.aten
+    h = torch.tensor([400.0, -300.0]).half()
+    f = torch.tensor([0.0, 0.0])
+    want = aten.huber_loss.out(h, f, reduction, 1000.0, out=torch.empty(()))
+    out = torch.empty((), device=mojo_gpu)
+    aten.huber_loss.out(h.to(mojo_gpu), f.to(mojo_gpu), reduction, 1000.0, out=out)
+    _close(out, want, **_loss_tol(torch.float32))
+
+
 def test_loss_dtype_rules(mojo_gpu):
     """The loss kernels compute in their output's dtype (`iter.dtype()`):
     huber's is `empty_like(input)`, an out='s its own, and a reduction
