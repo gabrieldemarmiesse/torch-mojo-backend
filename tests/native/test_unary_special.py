@@ -1,7 +1,8 @@
 """Tests for the unary math and special functions of the native `unary` op
 group (torch_mojo_backend/mojo/tmb/ops/unary.mojo): asin/atan/erfc/erfinv/
 exp2/expm1/log10/sinc/angle/sgn/signbit/nan_to_num and the torch.special
-Bessel functions (bessel_j0/j1/y0/y1, spherical_bessel_j0) so far, whose
+Bessel functions (bessel_j0/j1/y0/y1, modified_bessel_i0/i1/k0/k1,
+spherical_bessel_j0) so far, whose
 kernels port the CUDA routines stock torch runs.
 
 Public torch API only, compared against CPU torch.
@@ -53,6 +54,10 @@ _CASES: list[tuple[str, Callable[[torch.Tensor], torch.Tensor], float, float]] =
     ("special_bessel_j1", S.bessel_j1, -30.0, 30.0),
     ("special_bessel_y0", S.bessel_y0, 0.0, 30.0),
     ("special_bessel_y1", S.bessel_y1, 0.0, 30.0),
+    ("special_modified_bessel_i0", S.modified_bessel_i0, -30.0, 30.0),
+    ("special_modified_bessel_i1", S.modified_bessel_i1, -30.0, 30.0),
+    ("special_modified_bessel_k0", S.modified_bessel_k0, 0.0, 30.0),
+    ("special_modified_bessel_k1", S.modified_bessel_k1, 0.0, 30.0),
     ("special_spherical_bessel_j0", S.spherical_bessel_j0, -30.0, 30.0),
     ("angle", torch.angle, -5.0, 5.0),
     ("sgn", torch.sgn, -5.0, 5.0),

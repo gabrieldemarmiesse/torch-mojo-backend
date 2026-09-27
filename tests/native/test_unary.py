@@ -1411,6 +1411,10 @@ _SPECIAL_OUT = [
     "bessel_y0",
     "bessel_y1",
     "spherical_bessel_j0",
+    "modified_bessel_i0",
+    "modified_bessel_i1",
+    "modified_bessel_k0",
+    "modified_bessel_k1",
 ]
 
 
