@@ -5909,6 +5909,22 @@ def test_aten_polygamma_mvlgamma_compiled_edges(device: str):
     torch.compiler.reset()
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_aten_logit_compiled_eps_rounding(device: str, dtype: torch.dtype):
+    """eps rounds to float before `hi = 1 - eps` (logit_kernel_cuda): with
+    eps just above 2^-25, float32's 1 - eps ties to 1, so logit(1) is inf
+    (the double 1 - eps would round to a float below 1: 16.6355)."""
+    x = torch.tensor([1.0, 0.0, 0.5, 0.25], dtype=dtype)
+    compiled = torch.compile(
+        lambda t: aten.logit(t, 2.9802323e-8), backend=mojo_backend, fullgraph=True
+    )
+    torch.testing.assert_close(
+        compiled(x.to(device)).cpu(),
+        torch.logit(x.float() if dtype == torch.float16 else x, 2.9802323e-8).to(dtype),
+    )
+    torch.compiler.reset()
+
+
 def test_aten_ldexp_compiled_edges(device: str):
     """Integral self and exponent (a default-float result), non-finite float
     exponents, and a float16 self with a 0-d float64 exponent."""

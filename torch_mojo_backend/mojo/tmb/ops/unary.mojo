@@ -1605,7 +1605,7 @@ def op_logit_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var src = own_if_new(_promote(t), t)
     _require_float("logit", src.t.dtype)
     var b = _logit_bounds(eps, src.t.dtype)
-    _param_unary_out("LogitSpec", src.t, dst, eps, b[0], b[1])
+    _param_unary_out("LogitSpec", src.t, dst, eps, b[0], b[1], cast_ok=True)
     ret_ref(rets, 0, dst)
 
 

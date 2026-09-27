@@ -4012,6 +4012,10 @@ def aten_logit(x: MaxTensor, eps: float | None = None) -> MaxTensor:
         x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
         dtype = x.dtype
     xf = x if dtype in (DType.float32, DType.float64) else F.cast(x, DType.float32)
+    # `lo = eps_scalar.to<T_ACC>(); hi = T_ACC(1) - lo`: eps rounds to the
+    # compute type before the subtraction (float32 1 - 2^-25 ties to 1).
+    if xf.dtype == DType.float32:
+        eps = torch.tensor(eps, dtype=torch.float32).item()
     lo = F.constant(eps, dtype=xf.dtype, device=xf.device)
     hi = F.constant(1.0 - eps, dtype=xf.dtype, device=xf.device)
     z = _where(xf < lo, lo, _where(xf > hi, hi, xf))

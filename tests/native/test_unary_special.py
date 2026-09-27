@@ -328,6 +328,21 @@ def test_logit(mojo_gpu: str, dtype: torch.dtype, eps: float | None):
     torch.testing.assert_close(out.cpu(), expected, equal_nan=True)
 
 
+def test_logit_out_casts(mojo_gpu: str):
+    """logit.out (a unary_float_op iterator) casts the float32 result into a
+    float16 or float64 `out` and refuses an integer one."""
+    x = torch.linspace(0.02, 0.98, 12)
+    for dtype in (torch.float16, torch.float64):
+        out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+        torch.logit(x.to(mojo_gpu), 0.1, out=out)
+        assert out.dtype == dtype
+        want = torch.logit(x, 0.1, out=torch.empty(0, dtype=dtype))
+        torch.testing.assert_close(out.cpu(), want, rtol=2e-3, atol=1e-5)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        out = torch.empty(12, dtype=torch.int64, device=mojo_gpu)
+        torch.logit(x.to(mojo_gpu), out=out)
+
+
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
 @pytest.mark.parametrize("n", (0, 1, 2, 3, 4))
 def test_polygamma(mojo_gpu: str, dtype: torch.dtype, n: int):
