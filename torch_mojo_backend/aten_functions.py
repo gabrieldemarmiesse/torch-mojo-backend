@@ -2769,6 +2769,14 @@ def aten_div(
 
 
 # elu(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1) -> Tensor
+@map_to(aten.elu)
+def aten_elu(
+    input: MaxTensor, alpha: float = 1.0, scale: float = 1.0, input_scale: float = 1.0
+) -> MaxTensor:
+    """ActivationEluKernel.cu: x > 0 ? x * scale
+    : (exp(x * input_scale) - 1) * alpha * scale."""
+    negative = (F.exp(input * input_scale) - 1) * (alpha * scale)
+    return _where(input > 0, input * scale, negative)
 
 
 # embedding(Tensor weight, Tensor indices, SymInt padding_idx=-1, bool scale_grad_by_freq=False, bool sparse=False) -> Tensor
@@ -3207,6 +3215,12 @@ def aten_gt(x: MaxTensor, y: int | float | MaxTensor) -> MaxTensor:
 
 
 # hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
+@map_to(aten.hardtanh)
+def aten_hardtanh(
+    input: MaxTensor, min_val: float = -1.0, max_val: float = 1.0
+) -> MaxTensor:
+    """clamp(x, min_val, max_val), as ATen implements it."""
+    return F.min(F.max(input, min_val), max_val)
 
 
 # hypot(Tensor self, Tensor other) -> Tensor
@@ -3529,6 +3543,11 @@ def aten_le(input: MaxTensor, other: Scalar | MaxTensor) -> MaxTensor:
 
 
 # leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
+@map_to(aten.leaky_relu)
+def aten_leaky_relu(input: MaxTensor, negative_slope: float = 0.01) -> MaxTensor:
+    return _where(input > 0, input, input * negative_slope)
+
+
 # linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
 @map_to(aten.linear)
 def aten_linear(

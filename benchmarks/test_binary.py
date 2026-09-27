@@ -87,6 +87,17 @@ INT_MATH_OPS = {
     "gcd": torch.gcd,
     "lcm": torch.lcm,
 }
+# Activation backwards: (grad_output, input) of one shape.
+ACT_BACKWARD_OPS = {
+    "elu_backward": lambda g, x: torch.ops.aten.elu_backward(
+        g, 1.0, 1.0, 1.0, False, x
+    ),
+    "hardtanh_backward": lambda g, x: torch.ops.aten.hardtanh_backward(g, x, -0.5, 0.5),
+    "leaky_relu_backward": lambda g, x: torch.ops.aten.leaky_relu_backward(
+        g, x, 0.01, False
+    ),
+    "softplus_backward": lambda g, x: torch.ops.aten.softplus_backward(g, x, 1.0, 20.0),
+}
 LOGICAL_OPS = {
     "logical_and": torch.logical_and,
     "logical_or": torch.logical_or,
@@ -109,6 +120,7 @@ COVERS: dict[str, str] = (
     | {f"aten::{name}": "test_logical" for name in LOGICAL_OPS}
     | {f"aten::{name}": "test_binary_math" for name in MATH_OPS}
     | {f"aten::{name}": "test_int_math" for name in INT_MATH_OPS}
+    | {f"aten::{name}": "test_activation_backward" for name in ACT_BACKWARD_OPS}
     | {
         "aten::pow.Tensor_Scalar": "test_pow[Scalar]",
         "aten::pow.Tensor_Tensor": "test_pow[Tensor]",
@@ -204,6 +216,7 @@ SKIPPED: dict[str, str] = {
     "aten::copysign.Scalar": _SCALAR_OPERAND,
     "aten::copysign.Scalar_out": _OUT,
     "aten::copysign.out": _OUT,
+    "aten::elu_backward.grad_input": _OUT,
     "aten::fmax.out": _OUT,
     "aten::fmin.out": _OUT,
     "aten::fmod.Scalar": _SCALAR_OPERAND,
@@ -211,11 +224,13 @@ SKIPPED: dict[str, str] = {
     "aten::fmod.Tensor_out": _OUT,
     "aten::frexp.Tensor_out": _OUT,
     "aten::gcd.out": _OUT,
+    "aten::hardtanh_backward.grad_input": _OUT,
     "aten::heaviside.out": _OUT,
     "aten::hypot.out": _OUT,
     "aten::lcm.out": _OUT,
     "aten::ldexp.out": _OUT,
     "aten::ldexp_": _OUT,
+    "aten::leaky_relu_backward.grad_input": _OUT,
     "aten::lerp.Tensor_out": _OUT,
     "aten::logaddexp.out": _OUT,
     "aten::logaddexp2.out": _OUT,
@@ -232,6 +247,7 @@ SKIPPED: dict[str, str] = {
     "aten::remainder.Tensor_out": _OUT,
     "aten::rsub.Scalar_out": _OUT,
     "aten::rsub.Tensor_out": _OUT,
+    "aten::softplus_backward.grad_input": _OUT,
     "aten::special_xlog1py.out": _OUT,
     "aten::xlogy.OutTensor": _OUT,
 }
@@ -659,6 +675,24 @@ def test_frexp(
         lambda: torch.frexp(x_ref),
         lambda: torch.frexp(x_our),
         flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(ACT_BACKWARD_OPS))
+def test_activation_backward(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = ACT_BACKWARD_OPS[op_name]
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    bench.run(
+        lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
     )
 
 

@@ -5403,6 +5403,26 @@ def test_aten_pointwise_binary(
     _compiled_matches_cpu(fn, inputs, rtol=2e-5, atol=2e-5)
 
 
+_ACTIVATION_TWINS = [
+    ("elu", lambda x: aten.elu(x, 0.8, 1.2, 0.9)),
+    ("hardtanh", lambda x: aten.hardtanh(x, -0.5, 0.7)),
+    ("leaky_relu", lambda x: aten.leaky_relu(x, 0.1)),
+]
+
+
+@pytest.mark.parametrize(
+    "name,fn", _ACTIVATION_TWINS, ids=[t[0] for t in _ACTIVATION_TWINS]
+)
+def test_aten_pointwise_activation(
+    conf: Conf, call_checker: CallChecker, name: str, fn: Callable[..., torch.Tensor]
+):
+    call_checker.register(getattr(aten_functions, f"aten_{name}"))
+    torch.manual_seed(0)
+    x = torch.randn(4, 7) * 2
+    check_outputs(fn, conf, [x], rtol=1e-5, atol=1e-5)
+    _compiled_matches_cpu(fn, [x], rtol=1e-5, atol=1e-5)
+
+
 def test_aten_rsub(conf: Conf, call_checker: CallChecker):
     call_checker.register("aten::rsub.Tensor", "aten::rsub.Scalar")
 
