@@ -2907,37 +2907,119 @@ def _bce_decline_weight(
         )
 
 
+def _bce_paired(input: T, other: T, what: StaticString) raises -> T:
+    """Loss.cu's BCE iterators run over `squeeze(input)` and
+    `squeeze(other)`: the operands pair element by element once their
+    size-1 dims are dropped (`[[0.25], [0.5]]` against `[0, 1]` pairs 0.25
+    with 0 and 0.5 with 1, no broadcast), in input's shape. `other` viewed
+    with input's shape (itself when the shapes already agree); squeezed
+    shapes that still differ are declined."""
+    if other.same_shape(input):
+        return other.copy()
+    var dims = List[Int]()
+    for i in range(other.rank):
+        if other.dim(i) != 1:
+            dims.append(i)
+    var shape = input.shape
+    var strides = IndexList[MAX_RANK](0)
+    var pad = MAX_RANK - input.rank
+    var k = 0
+    var ok = True
+    for i in range(input.rank):
+        if input.dim(i) == 1:
+            continue
+        if k >= len(dims) or other.dim(dims[k]) != input.dim(i):
+            ok = False
+            break
+        strides[pad + i] = other.stride(dims[k])
+        k += 1
+    if not ok or k != len(dims):
+        unsupported(
+            String(what)
+            + " with input and target shapes that differ beyond size-1"
+            " dimensions"
+        )
+    return view_strided(other, shape, strides, input.rank, other.offset)
+
+
+def _pw_same_view(a: T, b: T) -> Bool:
+    """One view of one storage: same address, shape and strides."""
+    if a.ptr != b.ptr or a.rank != b.rank or not a.same_shape(b):
+        return False
+    for i in range(a.rank):
+        if a.stride(i) != b.stride(i):
+            return False
+    return True
+
+
 def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
     """Loss.cu binary_cross_entropy_out_cuda: input and target of one dtype,
     the loss in it (`loss.mul_(weight)` keeps it: a float32 weight on
     float16 inputs is a float16 loss), the weight never growing its shape."""
     var weight = _opt_weight(args[unsafe_offset=2])
     var input = _b_side(args[unsafe_offset=0])
-    var target = _b_side(args[unsafe_offset=1])
-    if not input.is_t or not target.is_t:
+    var raw_target = _b_side(args[unsafe_offset=1])
+    if not input.is_t or not raw_target.is_t:
         unsupported("binary_cross_entropy with a scalar operand")
-    _loss_same_dtype(input, target)
+    _loss_same_dtype(input, raw_target)
     var in_st = input.t.value().stype
     _bce_decline_weight(weight, in_st, "binary_cross_entropy")
+    var x = input.t.value().copy()
+    var paired = own_if_new(
+        _bce_paired(x, raw_target.t.value(), "binary_cross_entropy"),
+        raw_target.t.value(),
+    )
+    var target = _b_tside(paired.t)
+    var reduction = _loss_reduction(args[unsafe_offset=3])
+    # `out` that IS the weight: ATen writes the loss into it, then
+    # `loss.mul_(weight)` reads that loss back as the weight (loss^2).
+    var weight_is_out = False
+    if Bool(weight) and Bool(out_v):
+        var d = v_tensor(out_v.value())
+        var w = weight.value().copy()
+        if d.storage_ptr() != 0 and d.storage_ptr() == w.storage_ptr():
+            _b_no_partial_overlap(d, w)
+            weight_is_out = _pw_same_view(d, w)
+            if weight_is_out and reduction != REDUCTION_NONE:
+                unsupported(
+                    "binary_cross_entropy.out reducing into its own weight"
+                )
     # The weight rides as the third operand (the product is the kernel's
     # last rounding, like `loss.mul_(weight)`); 1 without one.
-    var c = _b_tside(weight.value()) if weight else _b_sside(
+    var fused = Bool(weight) and not weight_is_out
+    var c = _b_tside(weight.value()) if fused else _b_sside(
         Scal(1.0, 1, True, False)
     )
-    var base = _pw_broadcast(input, target, _none_side(), 2)
-    _loss_fits(base[0], base[1], input, target, c)
+    _loss_fits(x.shape, x.rank, input, target, c)
     _loss_forward(
         "bce",
         3,
         input,
         target,
         c,
-        _loss_reduction(args[unsafe_offset=3]),
+        reduction,
         _p(),
         out_v,
         rets,
         result_st=in_st,
     )
+    if weight_is_out:
+        var d = v_tensor(out_v.value())
+        var res = _pw_run(
+            "mul_scale",
+            2,
+            _b_tside(d),
+            _b_tside(d),
+            _none_side(),
+            in_st,
+            in_st,
+            _p(1.0),
+            d.copy(),
+        )
+        if res.owned:
+            copy_strided_into(d, res.t)
+            release(res.t.h)
+    _ = paired^
 
 
 # aten::binary_cross_entropy(Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean) -> Tensor
@@ -2960,11 +3042,20 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     gradient kernel when there is no weight, a second kind when there is."""
     var grad = _b_side(args[unsafe_offset=0])
     var input = _b_side(args[unsafe_offset=1])
-    var target = _b_side(args[unsafe_offset=2])
+    var raw_target = _b_side(args[unsafe_offset=2])
     var weight = _opt_weight(args[unsafe_offset=3])
     var reduction = _loss_reduction(args[unsafe_offset=4])
-    if not grad.is_t or not input.is_t or not target.is_t:
+    if not grad.is_t or not input.is_t or not raw_target.is_t:
         unsupported("binary_cross_entropy_backward with a scalar operand")
+    var paired = own_if_new(
+        _bce_paired(
+            input.t.value(),
+            raw_target.t.value(),
+            "binary_cross_entropy_backward",
+        ),
+        raw_target.t.value(),
+    )
+    var target = _b_tside(paired.t)
     # One dtype for every operand (grad_input's is checked as exact below),
     # and grad_input has self's shape: nothing may broadcast it larger.
     _loss_same_dtype(input, target)
@@ -2994,6 +3085,11 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
             # `grad_input.mul_(weight)`: its in-place meta refuses a weight
             # partially overlapping grad_input.
             _b_no_partial_overlap(dest.value(), weight.value())
+    # grad_input that IS the weight: ATen's `mul_(weight)` then reads the
+    # gradient it just wrote there (grad^2).
+    var weight_is_out = False
+    if Bool(weight) and Bool(dest):
+        weight_is_out = _pw_same_view(dest.value(), weight.value())
     var out_st = input.t.value().stype
     if not weight:
         _pw_finish(
@@ -3012,6 +3108,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
             ),
             _pw_out_exact("bce_backward"),
         )
+        _ = paired^
         return
     var gi = _pw_run(
         "bce_backward", 3, grad, input, target, compute, compute, _p(1.0), None
@@ -3020,7 +3117,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
         "mul_scale",
         2,
         _b_tside(gi.t),
-        _b_tside(weight.value()),
+        _b_tside(gi.t) if weight_is_out else _b_tside(weight.value()),
         _none_side(),
         compute,
         out_st,
@@ -3029,6 +3126,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     )
     release(gi.t.h)
     _pw_finish(rets, dest, res^, _pw_out_exact("bce_backward"))
+    _ = paired^
 
 
 # aten::binary_cross_entropy_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean) -> Tensor

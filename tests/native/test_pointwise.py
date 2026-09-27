@@ -1587,6 +1587,55 @@ def test_bce_weighted_same_dtype_rounding(mojo_gpu, reduction):
     _close(got, want, **_loss_tol(torch.float16))
 
 
+def test_bce_pairs_squeezed_operands(mojo_gpu):
+    """ATen's BCE iterators run over squeeze(input) and squeeze(target): a
+    [2, 1] input against a [2] target pairs element by element (no
+    broadcast to [2, 2]), in input's shape; other shape mismatches are
+    declined."""
+    aten = torch.ops.aten
+    d = mojo_gpu
+    x = torch.tensor([[0.25], [0.5]])
+    t = torch.tensor([0.0, 1.0])
+    g = torch.tensor([[1.0], [0.5]])
+    for reduction in (0, 1, 2):
+        want = aten.binary_cross_entropy(x, t, None, reduction)
+        got = aten.binary_cross_entropy(x.to(d), t.to(d), None, reduction)
+        assert got.shape == want.shape
+        _close(got, want, **_loss_tol(torch.float32))
+        want = aten.binary_cross_entropy(t, x, None, reduction)
+        _close(aten.binary_cross_entropy(t.to(d), x.to(d), None, reduction), want)
+    want = aten.binary_cross_entropy_backward(g, x, t, None, 0)
+    got = aten.binary_cross_entropy_backward(g.to(d), x.to(d), t.to(d), None, 0)
+    assert got.shape == want.shape
+    _close(got, want, **_loss_tol(torch.float32))
+    with pytest.raises(NotImplementedError):
+        aten.binary_cross_entropy(torch.tensor([0.3], device=d), t.to(d), None, 0)
+
+
+def test_bce_out_is_weight(mojo_gpu):
+    """`out` / `grad_input` that is the weight: ATen writes the loss there
+    first, so `mul_(weight)` reads it back (loss^2, grad^2)."""
+    aten = torch.ops.aten
+    d = mojo_gpu
+    x, t = torch.tensor([0.5, 0.25]), torch.tensor([0.0, 1.0])
+    w_cpu = torch.tensor([3.0, 2.0])
+    want = aten.binary_cross_entropy.out(x, t, w_cpu, 0, out=w_cpu)
+    w = torch.tensor([3.0, 2.0], device=d)
+    aten.binary_cross_entropy.out(x.to(d), t.to(d), w, 0, out=w)
+    _close(w, want, **_loss_tol(torch.float32))
+    g = torch.ones(2)
+    for reduction in (0, 1):
+        w_cpu = torch.tensor([3.0, 2.0])
+        want = aten.binary_cross_entropy_backward.grad_input(
+            g, x, t, w_cpu, reduction, grad_input=w_cpu
+        )
+        w = torch.tensor([3.0, 2.0], device=d)
+        aten.binary_cross_entropy_backward.grad_input(
+            g.to(d), x.to(d), t.to(d), w, reduction, grad_input=w
+        )
+        _close(w, want, **_loss_tol(torch.float32))
+
+
 def test_bce_backward_weight_overlapping_grad_input(mojo_gpu):
     """`grad_input.mul_(weight)` refuses a weight partially overlapping
     grad_input, as CPU torch does."""
