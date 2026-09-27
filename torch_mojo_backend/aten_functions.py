@@ -4358,7 +4358,11 @@ def aten_nan_to_num(
     neginf: float | None = None,
 ) -> MaxTensor:
     if not x.dtype.is_float():
-        return x
+        # Nothing to replace, but the result must not alias `x`: MAX folds
+        # an identity, x * 1, max(x, x) and where(c, x, x) back to the input
+        # buffer, while it cannot see through two opaque bitwise_not custom
+        # ops (~~x == x for every integer width and for bool).
+        return custom_mojo_ops.bitwise_not(custom_mojo_ops.bitwise_not(x))
     big = {
         DType.float16: torch.finfo(torch.float16).max,
         DType.bfloat16: torch.finfo(torch.bfloat16).max,

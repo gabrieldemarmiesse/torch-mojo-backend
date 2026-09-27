@@ -5554,6 +5554,23 @@ def test_aten_special_unary_compiled_batch(dtype: torch.dtype, device: str):
         checker.check_was_called()
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.uint8, torch.int64, torch.bool])
+def test_aten_nan_to_num_integral_compiled_is_a_copy(dtype: torch.dtype, device: str):
+    """nan_to_num of an integer or bool tensor changes nothing, yet eager
+    torch returns a new tensor: the compiled result must not alias the input
+    either, or writing into it would change the input."""
+    call_checker = CallChecker()
+    call_checker.register(aten_functions.aten_nan_to_num)
+    x = torch.tensor([3, 0, 1, 2], device=device).to(dtype)
+    before = x.clone()
+    got = torch.compile(torch.nan_to_num, backend=mojo_backend, fullgraph=True)(x)
+    call_checker.check_was_called()
+    torch.testing.assert_close(got, torch.nan_to_num(before))
+    assert got.data_ptr() != x.data_ptr()
+    got.zero_()
+    torch.testing.assert_close(x, before)
+
+
 def test_aten_logical_and_bool_tensors(conf: Conf):
     """Test aten.logical_and with boolean tensors"""
 
