@@ -1,6 +1,8 @@
 """Tests for the unary math and special functions of the native `unary` op
 group (torch_mojo_backend/mojo/tmb/ops/unary.mojo): asin/atan/erfc/erfinv/
-exp2/expm1/log10/sinc/angle/sgn/signbit/nan_to_num so far.
+exp2/expm1/log10/sinc/angle/sgn/signbit/nan_to_num and the torch.special
+Bessel functions (bessel_j0/j1/y0/y1, spherical_bessel_j0) so far, whose
+kernels port the CUDA routines stock torch runs.
 
 Public torch API only, compared against CPU torch.
 """
@@ -12,6 +14,8 @@ import torch
 
 from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import native
+
+S = torch.special
 
 _EDGES = [
     0.0,
@@ -45,6 +49,11 @@ _CASES: list[tuple[str, Callable[[torch.Tensor], torch.Tensor], float, float]] =
     ("expm1", torch.expm1, -20.0, 90.0),
     ("log10", torch.log10, 0.0, 1e6),
     ("sinc", torch.sinc, -20.0, 20.0),
+    ("special_bessel_j0", S.bessel_j0, -30.0, 30.0),
+    ("special_bessel_j1", S.bessel_j1, -30.0, 30.0),
+    ("special_bessel_y0", S.bessel_y0, 0.0, 30.0),
+    ("special_bessel_y1", S.bessel_y1, 0.0, 30.0),
+    ("special_spherical_bessel_j0", S.spherical_bessel_j0, -30.0, 30.0),
     ("angle", torch.angle, -5.0, 5.0),
     ("sgn", torch.sgn, -5.0, 5.0),
 ]

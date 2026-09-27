@@ -4975,6 +4975,36 @@ def aten_sort_stable(
     return _sort_impl(input, dim, descending)
 
 
+# special_bessel_j0(Tensor self) -> Tensor
+@map_to(aten.special_bessel_j0)
+def aten_special_bessel_j0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_j0")
+
+
+# special_bessel_j1(Tensor self) -> Tensor
+@map_to(aten.special_bessel_j1)
+def aten_special_bessel_j1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_j1")
+
+
+# special_bessel_y0(Tensor self) -> Tensor
+@map_to(aten.special_bessel_y0)
+def aten_special_bessel_y0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_y0")
+
+
+# special_bessel_y1(Tensor self) -> Tensor
+@map_to(aten.special_bessel_y1)
+def aten_special_bessel_y1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_y1")
+
+
+# special_spherical_bessel_j0(Tensor x) -> Tensor
+@map_to(aten.special_spherical_bessel_j0)
+def aten_special_spherical_bessel_j0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "spherical_bessel_j0")
+
+
 # split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]
 @map_to(aten.split_with_sizes)
 def aten_split_with_sizes(

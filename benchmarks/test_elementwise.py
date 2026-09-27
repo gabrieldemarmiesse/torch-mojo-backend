@@ -88,6 +88,30 @@ def _operand(op_name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.
     )
 
 
+def _check_matches_stock(
+    fn: Callable[[torch.Tensor], torch.Tensor], x_ref: torch.Tensor, x_our: torch.Tensor
+):
+    """Our result against the stock device's, whose kernels the mojo ones
+    follow. A dtype the stock device lacks skips the case, as `bench.run`
+    would."""
+    try:
+        want = fn(x_ref).cpu()
+    except NotImplementedError as exc:
+        pytest.skip(f"not supported on the stock device: {exc}")
+    torch.testing.assert_close(fn(x_our).cpu(), want)
+
+
+# Special functions stock torch implements for float32/float64 only
+# (AT_DISPATCH_FLOATING_TYPES): benchmarked in float32 alone.
+FLOAT32_ONLY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
+    "special_bessel_j0": torch.special.bessel_j0,
+    "special_bessel_j1": torch.special.bessel_j1,
+    "special_bessel_y0": torch.special.bessel_y0,
+    "special_bessel_y1": torch.special.bessel_y1,
+    "special_spherical_bessel_j0": torch.special.spherical_bessel_j0,
+}
+
+
 # Registered elementwise ops NOT benchmarked here, and why.  Reconciled
 # against the live registration table by test_coverage.py.
 _UNARY_OUT = (
@@ -107,11 +131,15 @@ SKIPPED: dict[str, str] = {
     )
 }
 
-COVERS: dict[str, str] = {f"aten::{name}": "test_unary" for name in UNARY_OPS} | {
-    "aten::bitwise_not": "test_bitwise_not",
-    "aten::logical_not": "test_logical_not",
-    "aten::sqrt.out": "test_sqrt_contiguous_out",
-}
+COVERS: dict[str, str] = (
+    {f"aten::{name}": "test_unary" for name in UNARY_OPS}
+    | {f"aten::{name}": "test_unary_float32_only" for name in FLOAT32_ONLY_OPS}
+    | {
+        "aten::bitwise_not": "test_bitwise_not",
+        "aten::logical_not": "test_logical_not",
+        "aten::sqrt.out": "test_sqrt_contiguous_out",
+    }
+)
 
 
 # The activations with scalar parameters of tmb/ops/pointwise.mojo, at
@@ -230,6 +258,24 @@ def test_unary_unaligned(
         assert value.data_ptr() % (4 * cpu.element_size()) == cpu.element_size()
     torch.testing.assert_close(fn(x_our).cpu(), fn(cpu))
     bench.run(lambda: fn(x_ref), lambda: fn(x_our), flops=float(cpu.numel()))
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(FLOAT32_ONLY_OPS))
+def test_unary_float32_only(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = FLOAT32_ONLY_OPS[op_name]
+    cpu = _operand(op_name, SHAPES[shape_id], DTYPES[dtype_id])
+    x_ref, x_our = both(cpu, hw, mojo_device)
+    _check_matches_stock(fn, x_ref, x_our)
+    bench.run(lambda: fn(x_ref), lambda: fn(x_our), flops=float(x_ref.numel()))
 
 
 @pytest.mark.bench_op("gelu")
