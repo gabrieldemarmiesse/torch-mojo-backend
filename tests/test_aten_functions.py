@@ -5608,6 +5608,15 @@ def test_aten_ldexp_compiled_large_float_exponent(device: str):
         torch.compiler.reset()
 
 
+def test_aten_ldexp_compiled_integral_self_huge_exponent(device: str):
+    """An integral self takes pow(2.0, e) in the default float: an int64
+    exponent of +-2**32 is inf / 0 there, not wrapped."""
+    x = torch.tensor([1, 1, -2], device=device)
+    e = torch.tensor([2**32, -(2**32), 5000], device=device)
+    got = torch.compile(aten.ldexp, backend=mojo_backend, fullgraph=True)(x, e)
+    torch.testing.assert_close(got, aten.ldexp(x, e))
+
+
 def test_aten_ldexp_compiled_pow_dtype(device: str):
     """The compiled _pow2 runs pow in ATen's pow dtype and rounds it to mul's
     rank-aware common dtype: float16 2^16 is inf against a float64 self,

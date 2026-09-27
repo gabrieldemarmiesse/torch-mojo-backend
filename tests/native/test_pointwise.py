@@ -890,6 +890,25 @@ def test_ldexp_large_float_exponent_tensor(mojo_gpu):
     )
 
 
+def test_ldexp_int64_exponent_wraps_to_int(mojo_gpu):
+    """An int64 exponent is converted to ::ldexp's int first (2**32 is 0),
+    for a device tensor, a CPU 0-d tensor and in place."""
+    x = torch.tensor([1.0, 0.5, -3.0])
+    e = torch.tensor([2**32, -(2**32), 2**32 + 3])
+    _close(
+        torch.ldexp(x.to(mojo_gpu), e.to(mojo_gpu)),
+        torch.ldexp(x, e),
+        rtol=0.0,
+        atol=0.0,
+    )
+    for v in (2**32, 2**32 + 3, -(2**33) - 1):
+        e0 = torch.tensor(v)
+        _close(torch.ldexp(x.to(mojo_gpu), e0), torch.ldexp(x, e0), rtol=0.0, atol=0.0)
+    y = x.to(mojo_gpu)
+    y.ldexp_(e.to(mojo_gpu))
+    _close(y, x.clone().ldexp_(e), rtol=0.0, atol=0.0)
+
+
 def test_ldexp_inplace_cpu_scalar_exponent(mojo_gpu):
     """ldexp_ takes an explicit CPU 0-d exponent, float or integral."""
     for e_cpu in (

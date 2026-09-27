@@ -3648,13 +3648,14 @@ def aten_ldexp(input: MaxTensor, other: MaxTensor) -> MaxTensor:
     mul_dtype = torch.mul(meta(in_dtype, len(input.shape)), meta(pow_dtype, rank)).dtype
     pow_max = torch_dtype_to_max(pow_dtype)
     base = _scalar_constant(2.0, dtype=pow_max, device=input.device)
+    # MAX's pow returns 1 for 2^(2^32), from a float exponent or an integer
+    # one converted to the default float (an integral self keeps it as is):
+    # clamp to +-1100, past which 2^e is inf / 0 in every floating dtype
+    # (float64's range ends at 2^1024, its subnormals at 2^-1074). NaN is
+    # patched below.
     exponent = F.cast(other, pow_max)
-    if other.dtype.is_float():
-        # MAX's pow returns 1 for 2^(2^32): clamp to +-1100, past which
-        # 2^e is inf / 0 in every floating dtype (float64's range ends at
-        # 2^1024, its subnormals at 2^-1074). NaN is patched below.
-        limit = _scalar_constant(1100.0, dtype=pow_max, device=input.device)
-        exponent = F.min(F.max(exponent, -limit), limit)
+    limit = _scalar_constant(1100.0, dtype=pow_max, device=input.device)
+    exponent = F.min(F.max(exponent, -limit), limit)
     pow2 = _pow2_nonfinite(aten_pow(base, exponent), other)
     mul_max = torch_dtype_to_max(mul_dtype)
     return aten_mul(F.cast(input, mul_max), F.cast(pow2, mul_max))

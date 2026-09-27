@@ -97,6 +97,7 @@ from tmb.ops.common import (
     is_float_stype as _pw_is_float,
     is_int_stype as _pw_is_int,
     known_stype as _pw_known,
+    cast_to,
     promote_types,
     resize_out,
     scalar_to_float,
@@ -2186,18 +2187,49 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
         and _pw_is_float(x.stype)
         and (not dest or dest.value().stype == x.stype)
     ):
-        # bfloat16 computes in float32: its 8-bit mantissa cannot carry
-        # every exponent that still changes the result.
-        var compute = ST_FLOAT32 if x.stype == ST_BFLOAT16 else x.stype
+        _pw_ldexp_int(rets, a, b, x.stype, dest)
+        return
+    _pw_ldexp_pow2(rets, a, b, e_st, e_rank, dest)
+
+
+def _pw_ldexp_int(
+    rets: Values, a: Side, b: Side, x_st: Int32, dest: Optional[T]
+) raises:
+    """`_ldexp_int_exponent`: ::ldexp(x, int e), the result in x's dtype.
+    An int64 exponent is converted to that `int` first, wrapping as the C++
+    conversion does (2**32 is 0); the kernel then reads it in the float
+    compute dtype. bfloat16 computes in float32: its 8-bit mantissa cannot
+    carry every exponent that still changes the result."""
+    var compute = ST_FLOAT32 if x_st == ST_BFLOAT16 else x_st
+    if b.is_t and b.t.value().stype == ST_INT64:
+        var wrapped = own_if_new(cast_to(b.t.value(), ST_INT32), b.t.value())
         _pw_finish(
             rets,
             dest,
             _pw_run(
-                "ldexp", 2, a, b, _none_side(), compute, x.stype, _p(), dest
+                "ldexp",
+                2,
+                a,
+                _b_tside(wrapped.t),
+                _none_side(),
+                compute,
+                x_st,
+                _p(),
+                dest,
             ),
         )
+        _ = wrapped^
         return
-    _pw_ldexp_pow2(rets, a, b, e_st, e_rank, dest)
+    var e = b.copy()
+    if not b.is_t and b.zero_st == ST_INT64:
+        # A CPU 0-d int64 exponent, wrapped on the host.
+        var v = ((b.s.value().i + 2147483648) & 4294967295) - 2147483648
+        e = _b_sside(Scal(Float64(v), v, True, False))
+    _pw_finish(
+        rets,
+        dest,
+        _pw_run("ldexp", 2, a, e, _none_side(), compute, x_st, _p(), dest),
+    )
 
 
 def _pw_ldexp_pow2(
@@ -2330,14 +2362,7 @@ def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         )
     var dest = Optional[T](self.copy())
     if _pw_is_int(e_st) or e_st == ST_BOOL:
-        var compute = ST_FLOAT32 if self.stype == ST_BFLOAT16 else self.stype
-        _pw_finish(
-            rets,
-            dest,
-            _pw_run(
-                "ldexp", 2, a, b, _none_side(), compute, self.stype, _p(), dest
-            ),
-        )
+        _pw_ldexp_int(rets, a, b, self.stype, dest)
         return
     _pw_ldexp_pow2(rets, a, b, e_st, e_rank, dest)
 
