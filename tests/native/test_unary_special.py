@@ -1,7 +1,7 @@
 """Tests for the unary math and special functions of the native `unary` op
 group (torch_mojo_backend/mojo/tmb/ops/unary.mojo): asin/atan/erfc/erfinv/
-exp2/expm1/log10/sinc/angle/frac/trunc/round/sgn/signbit/nan_to_num and the
-torch.special
+exp2/expm1/log10/lgamma/digamma/polygamma/mvlgamma/sinc/angle/frac/trunc/
+round/sgn/signbit/nan_to_num and the torch.special
 Bessel functions (bessel_j0/j1/y0/y1, modified_bessel_i0/i1/k0/k1,
 scaled_modified_bessel_k0/k1, spherical_bessel_j0), i0e/i1/i1e, airy_ai,
 entr, erfcx, log_ndtr and ndtri so far, whose kernels port the CUDA
@@ -46,10 +46,12 @@ _EDGES = [
 _CASES: list[tuple[str, Callable[[torch.Tensor], torch.Tensor], float, float]] = [
     ("asin", torch.asin, -1.0, 1.0),
     ("atan", torch.atan, -50.0, 50.0),
+    ("digamma", torch.digamma, -20.0, 50.0),
     ("erfc", torch.erfc, -5.0, 12.0),
     ("erfinv", torch.erfinv, -1.0, 1.0),
     ("exp2", torch.exp2, -130.0, 130.0),
     ("expm1", torch.expm1, -20.0, 90.0),
+    ("lgamma", torch.lgamma, -20.0, 50.0),
     ("log10", torch.log10, 0.0, 1e6),
     ("sinc", torch.sinc, -20.0, 20.0),
     ("special_airy_ai", S.airy_ai, -20.0, 20.0),
@@ -107,9 +109,12 @@ def _expected(fn: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor):
 
 # On Apple GPUs these ops port torch's MPS kernels, whose results differ
 # from CPU torch beyond the test tolerance, so the reference there is stock
-# torch on the same machine (the `mps` device): round_decimals'
-# rint(exp10(n) x) exp10(-n) in float.
-_MPS_SEMANTICS: set[str] = set()
+# torch on the same machine (the `mps` device): c10::metal::digamma's float
+# reflection near the poles (2e-6 relative in float32, and 2e7 instead of
+# 1e30 at -1e-30 where 1 - x rounds to 1), c10::metal::log_gamma's NaN at
+# +-inf and inf at -1e-30, and round_decimals' rint(exp10(n) x) exp10(-n)
+# in float.
+_MPS_SEMANTICS = {"digamma", "lgamma"}
 
 
 def _reference(
@@ -280,3 +285,43 @@ def test_nan_to_num_overflowing_replacement(mojo_gpu: str):
     x = torch.tensor([float("nan"), float("inf")], dtype=torch.float16)
     actual = torch.nan_to_num(x.to(mojo_gpu), nan=1e6, posinf=1e10)
     assert torch.equal(actual.cpu(), torch.nan_to_num(x, nan=1e6, posinf=1e10))
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("n", (0, 1, 2, 3, 4))
+def test_polygamma(mojo_gpu: str, dtype: torch.dtype, n: int):
+    # From n = 2 on, zeta's alternating sum cancels badly for negative x:
+    # CPU and CUDA torch themselves disagree there in the fourth digit.
+    x = _sample(-10.0 if n < 2 else 0.05, 30.0, dtype)
+    _reset_counts()
+    actual = torch.polygamma(n, x.to(mojo_gpu))
+    assert _counted("polygamma")
+    expected = torch.polygamma(n, x)
+    # Near the poles at the non-positive integers the result is huge and
+    # ill-conditioned in the input: compare the regular part tightly.
+    regular = (x.double() - x.double().round()).abs() > 0.05
+    tol = {"rtol": 2e-5, "atol": 1e-4} if dtype == torch.float32 else {}
+    torch.testing.assert_close(
+        actual.cpu()[regular], expected[regular], equal_nan=True, **tol
+    )
+    out = torch.empty_like(x).to(mojo_gpu)
+    torch.polygamma(n, x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), actual.cpu(), equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("p", (1, 2, 5))
+def test_mvlgamma(mojo_gpu: str, dtype: torch.dtype, p: int):
+    x = (torch.rand(500, dtype=torch.float64) * 20 + (p - 1) / 2 + 0.01).to(dtype)
+    _reset_counts()
+    actual = torch.mvlgamma(x.to(mojo_gpu), p)
+    assert _counted("mvlgamma")
+    torch.testing.assert_close(actual.cpu(), torch.mvlgamma(x, p))
+    out = torch.empty_like(x).to(mojo_gpu)
+    torch.mvlgamma(x.to(mojo_gpu), p, out=out)
+    torch.testing.assert_close(out.cpu(), torch.mvlgamma(x, p))
+
+
+def test_polygamma_rejects_negative_n(mojo_gpu: str):
+    with pytest.raises(RuntimeError):
+        torch.polygamma(-1, torch.ones(3).to(mojo_gpu))
