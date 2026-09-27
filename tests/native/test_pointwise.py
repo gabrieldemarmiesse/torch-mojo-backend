@@ -3,8 +3,9 @@
 clamp.Tensor, rsub, deg2rad/rad2deg/ldexp/frexp and the binary math family
 (atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter, gcd, lcm,
 bitwise_left_shift.Tensor, bitwise_right_shift.Tensor, logaddexp(2), xlogy,
-xlog1py), and elu, hardtanh, leaky_relu, softplus, threshold, hardshrink,
-softshrink, hardsigmoid, hardswish, mish with their backwards so far.
+xlog1py, zeta, igamma/igammac), and elu, hardtanh, leaky_relu, softplus,
+threshold, hardshrink, softshrink, hardsigmoid, hardswish, mish with their
+backwards so far.
 
 Everything is compared with the same computation on CPU torch through the
 public API, over edge values (signed zeros, infinities, NaN, huge, tiny,
@@ -421,6 +422,38 @@ def test_clamp_tensor_mixed_dtypes(mojo_gpu):
     _close(torch.clamp(xb.to(mojo_gpu), lo.to(mojo_gpu)), torch.clamp(xb, lo))
 
 
+@pytest.mark.parametrize("dtype", FLOATS)
+@pytest.mark.parametrize(
+    "name,fn", (("igamma", torch.igamma), ("igammac", torch.igammac))
+)
+def test_igamma(mojo_gpu, name, fn, dtype):
+    """Every regime of calc_igamma / calc_igammac: the boundaries (a or x at
+    0, inf, NaN, negative), the series and the continued fraction on either
+    side of x = a, and the uniform asymptotic expansion for large a ~ x."""
+    grid = [0.0, 1e-3, 0.3, 0.5, 0.75, 1.0, 1.05, 1.2, 2.5, 7.0, 19.0]
+    grid += [21.0, 24.0, 30.0, 150.0, 199.0, 210.0, 1000.0, 1040.0]
+    edges = [float("inf"), float("nan"), -1.0]
+    values = torch.tensor(grid + edges)
+    a = values[:, None].expand(-1, len(values)).to(dtype)
+    x = values[None, :].expand(len(values), -1).to(dtype)
+    expected = fn(a, x)
+    with ran(f"aten::{name}"):
+        actual = fn(a.to(mojo_gpu), x.to(mojo_gpu))
+    _close(actual, expected, **_tol(dtype, 8))
+    # Broadcast against a 0-d tensor, a strided out= and the in-place method.
+    x_row = x[3].contiguous()
+    scalar = torch.tensor(2.5, dtype=dtype)
+    _close(
+        fn(x_row.to(mojo_gpu), scalar.to(mojo_gpu)), fn(x_row, scalar), **_tol(dtype, 8)
+    )
+    out = torch.zeros(len(values), 2 * len(values), dtype=dtype).to(mojo_gpu)
+    fn(a.to(mojo_gpu), x.to(mojo_gpu), out=out[:, ::2])
+    _close(out[:, ::2], expected, **_tol(dtype, 8))
+    inplace = a.contiguous().to(mojo_gpu)
+    getattr(inplace, name + "_")(x.to(mojo_gpu))
+    _close(inplace, expected, **_tol(dtype, 8))
+
+
 # --------------------------------------------------------------------------
 # binary math: atan2, hypot, copysign, fmod (pointwise_math broadcast route)
 # --------------------------------------------------------------------------
@@ -658,6 +691,51 @@ def test_frexp(mojo_gpu, dtype):
     eo = torch.empty(0, dtype=torch.int32, device=mojo_gpu)
     torch.frexp(x.to(mojo_gpu), out=(mo, eo))
     _close(mo.cpu()[finite], m_cpu[finite], rtol=0.0, atol=0.0)
+
+
+def test_zeta(mojo_gpu):
+    x = torch.tensor([1.0, 0.5, 2.0, 3.5, 2.0, 4.0, 2.0, 1.5, 10.0])
+    q = torch.tensor([1.0, 1.0, 1.0, 2.0, -1.0, -2.5, 0.25, 30.0, 0.5])
+    torch.manual_seed(3)
+    x = torch.cat([x, torch.rand(100) * 6 + 1.01])
+    q = torch.cat([q, torch.rand(100) * 5 + 0.1])
+    with ran("aten::special_zeta"):
+        actual = torch.special.zeta(x.to(mojo_gpu), q.to(mojo_gpu))
+    _close(actual, torch.special.zeta(x, q), rtol=4e-6, atol=1e-6)
+    _close(
+        torch.special.zeta(x.to(mojo_gpu), 2.0),
+        torch.special.zeta(x, 2.0),
+        rtol=4e-6,
+        atol=1e-6,
+    )
+
+
+def test_float64_binary_math(mojo_gpu):
+    """atan2, hypot, logaddexp2 and zeta on float64 against CPU torch, edges
+    included: C99's signed zeros and infinities, 2^-1070 through logaddexp2's
+    exp2, zeta's NaN comparisons (zeta(1, NaN) = inf, zeta(NaN, 0) = inf)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x, y = _pairs(torch.float64)
+    for fn in (torch.atan2, torch.hypot):
+        _close(fn(x.to(mojo_gpu), y.to(mojo_gpu)), fn(x, y), rtol=4.5e-16, atol=0.0)
+    a = torch.tensor([0.0, -1070.0, 3.0, float("inf"), -float("inf"), 5.5])
+    b = torch.tensor([-1070.0, 0.0, 3.0, float("inf"), -float("inf"), -2.25])
+    a, b = a.double(), b.double()
+    _close(
+        torch.logaddexp2(a.to(mojo_gpu), b.to(mojo_gpu)),
+        torch.logaddexp2(a, b),
+        rtol=4.5e-16,
+        atol=0.0,
+    )
+    zx = torch.tensor([1.0, float("nan"), float("nan"), float("inf"), 2.0, 3.0])
+    zq = torch.tensor([float("nan"), 0.0, -1.0, 1.0, 1.0, -2.5])
+    zx, zq = zx.double(), zq.double()
+    _close(
+        torch.special.zeta(zx.to(mojo_gpu), zq.to(mojo_gpu)),
+        torch.special.zeta(zx, zq),
+        rtol=1e-15,
+        atol=0.0,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -255,6 +255,8 @@ def _pointwise_binary(
         "gcd",
         "heaviside",
         "hypot",
+        "igamma",
+        "igammac",
         "lcm",
         "logaddexp",
         "logaddexp2",
@@ -263,6 +265,7 @@ def _pointwise_binary(
         "rshift",
         "xlog1py",
         "xlogy",
+        "zeta",
     ],
     *,
     promote_float: bool,
@@ -3438,6 +3441,20 @@ def aten_hypot(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTenso
     return _pointwise_binary(input, other, "hypot", promote_float=False)
 
 
+# igamma(Tensor self, Tensor other) -> Tensor
+@map_to(aten.igamma)
+def aten_igamma(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """The regularized lower incomplete gamma function P(a, x)."""
+    return _pointwise_binary(input, other, "igamma", promote_float=True)
+
+
+# igammac(Tensor self, Tensor other) -> Tensor
+@map_to(aten.igammac)
+def aten_igammac(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """The regularized upper incomplete gamma function Q(a, x)."""
+    return _pointwise_binary(input, other, "igammac", promote_float=True)
+
+
 # index.Tensor(Tensor self, Tensor?[] indices) -> Tensor
 @map_to(aten.index)
 def aten_index(input: MaxTensor, indices: list[MaxTensor | None]) -> MaxTensor:
@@ -5318,6 +5335,14 @@ def aten_special_scaled_modified_bessel_k1(x: MaxTensor) -> MaxTensor:
 @map_to(aten.special_spherical_bessel_j0)
 def aten_special_spherical_bessel_j0(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "spherical_bessel_j0")
+
+
+# special_zeta(Tensor self, Tensor other) -> Tensor
+@map_to(aten.special_zeta)
+def aten_special_zeta(
+    input: MaxTensor | Scalar, other: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(input, other, "zeta", promote_float=True)
 
 
 # split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]

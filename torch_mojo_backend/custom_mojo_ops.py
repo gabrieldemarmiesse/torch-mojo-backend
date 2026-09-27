@@ -282,6 +282,8 @@ def pointwise_binary(
         "gcd",
         "heaviside",
         "hypot",
+        "igamma",
+        "igammac",
         "lcm",
         "ldexp",
         "logaddexp",
@@ -291,6 +293,7 @@ def pointwise_binary(
         "rshift",
         "xlog1py",
         "xlogy",
+        "zeta",
     ],
 ) -> MaxTensor:
     """The mojo device's pointwise math (`tmb/kernels/common/pointwise_math`)
