@@ -1543,52 +1543,60 @@ def test_binary_cross_entropy_with_logits(
     )
 
 
-@pytest.mark.parametrize("reduction", [0, 1, 2])
-def test_bce_wide_weights_are_not_narrowed(mojo_gpu, reduction):
-    """A float32 weight / pos_weight against float16 operands multiplies in
-    float32, as `loss.mul_(weight)` and the logits composite do, instead of
-    being read as float16 inf: 4.88e-4 * 1e5 is 48.8125 in float16."""
+def test_bce_mixed_dtypes_declined(mojo_gpu):
+    """Mixed-dtype operands CPU torch accepts are declined (NotImplementedError)
+    rather than approximated: a weight / pos_weight of another dtype than
+    the input, logits input and target of different dtypes, and a backward
+    weight of another dtype."""
     aten = torch.ops.aten
-    w = torch.tensor([100000.0, 2.0])
-    cases = [
-        (
-            lambda x, t, w: aten.binary_cross_entropy(x, t, w, reduction),
-            [
-                torch.tensor([0.99951171875, 0.25]).half(),
-                torch.tensor([1.0, 0.0]).half(),
-                w,
-            ],
-        ),
-        (
-            lambda x, t, w: aten.binary_cross_entropy_with_logits(
-                x, t, w, None, reduction
-            ),
-            [torch.tensor([8.0, -1.0]).half(), torch.tensor([1.0, 0.0]).half(), w],
-        ),
-        (
-            lambda x, t, w: aten.binary_cross_entropy_with_logits(
-                x, t, None, w, reduction
-            ),
-            [torch.tensor([8.0, -1.0]).half(), torch.tensor([1.0, 0.0]).half(), w],
-        ),
-        (
-            lambda g, x, t, w: aten.binary_cross_entropy_backward(
-                g, x, t, w, reduction
-            ),
-            [
-                torch.tensor([1.0, 1.0]).half(),
-                torch.tensor([0.50048828125, 0.25]).half(),
-                torch.tensor([0.5, 0.5]).half(),
-                w,
-            ],
-        ),
+    d = mojo_gpu
+    h = torch.tensor([0.3, 0.6]).half().to(d)
+    f = torch.tensor([2.0, 1.0], device=d)
+    calls = [
+        lambda: aten.binary_cross_entropy(h, h, f, 1),
+        lambda: aten.binary_cross_entropy_with_logits(h, f, None, None, 1),
+        lambda: aten.binary_cross_entropy_with_logits(f, h, None, None, 1),
+        lambda: aten.binary_cross_entropy_with_logits(h, h, f, None, 1),
+        lambda: aten.binary_cross_entropy_with_logits(h, h, None, f, 1),
+        lambda: aten.binary_cross_entropy_backward(torch.ones_like(h), h, h, f, 1),
     ]
-    for fn, inputs in cases:
-        want = fn(*inputs)
-        assert want.isfinite().all()
-        got = fn(*[t.to(mojo_gpu) for t in inputs])
-        assert got.dtype == want.dtype
-        _close(got, want, **_loss_tol(torch.float16))
+    for call in calls:
+        with pytest.raises(NotImplementedError):
+            call()
+
+
+@pytest.mark.parametrize("reduction", [0, 1, 2])
+def test_bce_weighted_same_dtype_rounding(mojo_gpu, reduction):
+    """Same-dtype weights round like ATen's separate steps: the backward's
+    `grad_input.mul_(weight)` is float16 inf before the mean divides it."""
+    aten = torch.ops.aten
+    g = torch.ones(2).half()
+    x = torch.tensor([0.5, 0.5]).half()
+    t = torch.zeros(2).half()
+    w = torch.tensor([40000.0, 40000.0]).half()
+    want = aten.binary_cross_entropy_backward(g, x, t, w, reduction)
+    got = aten.binary_cross_entropy_backward(
+        *[a.to(mojo_gpu) for a in (g, x, t, w)], reduction
+    )
+    _close(got, want, rtol=0.0, atol=0.0)
+    xs = torch.tensor([0.99951171875, 0.25]).half()
+    ts = torch.tensor([1.0, 0.0]).half()
+    ws = torch.tensor([60000.0, 2.0]).half()
+    want = aten.binary_cross_entropy(xs, ts, ws, reduction)
+    got = aten.binary_cross_entropy(*[a.to(mojo_gpu) for a in (xs, ts, ws)], reduction)
+    _close(got, want, **_loss_tol(torch.float16))
+
+
+def test_bce_backward_weight_overlapping_grad_input(mojo_gpu):
+    """`grad_input.mul_(weight)` refuses a weight partially overlapping
+    grad_input, as CPU torch does."""
+    aten = torch.ops.aten
+    s = torch.rand(5, device=mojo_gpu)
+    ones = torch.ones(4, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        aten.binary_cross_entropy_backward.grad_input(
+            ones, ones * 0.5, ones * 0, s[1:], 1, grad_input=s[:-1]
+        )
 
 
 def test_bce_logits_weight_overlapping_out(mojo_gpu):
@@ -1609,27 +1617,27 @@ def test_bce_logits_weight_overlapping_out(mojo_gpu):
 
 
 def test_bce_dtype_and_shape_rules(mojo_gpu):
-    """binary_cross_entropy: input and target of one dtype, the loss in it
-    (a float32 weight on float16 inputs stays float16); with logits the
-    loss has target's dtype. No weight may grow the loss's shape."""
+    """binary_cross_entropy: input and target of one dtype, the loss in it;
+    with logits the loss has target's dtype. No weight may grow the loss's
+    shape."""
     aten = torch.ops.aten
     d = mojo_gpu
     p = torch.tensor([0.3, 0.9, 0.5, 0.01])
     y = torch.tensor([1.0, 0.0, 0.5, 1.0])
     w = torch.tensor([2.0, 1.0, 0.5, 3.0])
-    ph, yh = p.half(), y.half()
-    got = aten.binary_cross_entropy(ph.to(d), yh.to(d), w.to(d), 0)
+    ph, yh, wh = p.half(), y.half(), w.half()
+    got = aten.binary_cross_entropy(ph.to(d), yh.to(d), wh.to(d), 0)
     assert got.dtype == torch.float16
-    _close(got, aten.binary_cross_entropy(ph, yh, w, 0), **_loss_tol(torch.float16))
+    _close(got, aten.binary_cross_entropy(ph, yh, wh, 0), **_loss_tol(torch.float16))
     with pytest.raises(RuntimeError, match="Found dtype"):
         aten.binary_cross_entropy(ph.to(d), y.to(d), None, 1)
-    for x_, t_, pw in ((p, yh, None), (ph, yh, w), (ph, y, None)):
+    for x_, t_, pw in ((ph, yh, None), (ph, yh, wh), (p, y, w)):
         want = aten.binary_cross_entropy_with_logits(x_, t_, None, pw, 1)
         got = aten.binary_cross_entropy_with_logits(
             x_.to(d), t_.to(d), None, None if pw is None else pw.to(d), 1
         )
         assert got.dtype == want.dtype == t_.dtype
-        _close(got, want, **_loss_tol(torch.float16))
+        _close(got, want, **_loss_tol(t_.dtype))
     half = torch.full((2, 1), 0.5, device=d)
     wide = torch.ones(2, 3, device=d)
     with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):

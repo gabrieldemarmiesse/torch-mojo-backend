@@ -2529,7 +2529,6 @@ def _loss_forward(
     weight: Optional[T] = None,
     result_st: Int32 = -1,
     round_p0: Bool = False,
-    wide_st: Int32 = -1,
 ) raises:
     """One loss kind over (a, b[, c]), times `weight` when given (its own
     rounding, as `loss.mul_(weight)`), then the reduction.
@@ -2541,10 +2540,7 @@ def _loss_forward(
     it); otherwise the loss is computed as the functional form does and
     reduced straight into out's dtype (`mean_out` / `sum_out`). `round_p0`:
     p0 is a Scalar read as `scalar_t` of that kernel dtype (beta, delta).
-    `wide_st`: an operand dtype the kernel must not narrow (a float32
-    pos_weight against float16 logits), computed in, rounded once to the
-    loss dtype. `weight` multiplies in the promoted dtype of the loss and
-    the weight, as `loss.mul_(weight)` does."""
+    `weight` has the loss dtype (the callers decline any other)."""
     if not a.is_t or not b.is_t:
         unsupported(String(kind) + " with a scalar operand")
     var common = _pw_result_type(a, b, c, arity)
@@ -2567,10 +2563,6 @@ def _loss_forward(
         elif _pw_is_float(d) and _b_can_cast(loss_st, d):
             reduce_st = d
     var compute = _pw_compute_dtype(kind, loss_st, P_FLOAT_ONLY, True)
-    if wide_st >= 0 and promote_types(compute, wide_st) != compute:
-        compute = _pw_compute_dtype(
-            kind, promote_types(compute, wide_st), P_FLOAT_ONLY, True
-        )
     var p = params
     if round_p0:
         p[0] = _round_to(p[0], loss_st)
@@ -2596,7 +2588,7 @@ def _loss_forward(
             _b_tside(loss),
             w,
             _none_side(),
-            _pw_weight_compute(compute, wt),
+            compute,
             loss_st,
             _p(1.0),
             target,
@@ -2617,14 +2609,6 @@ def _pw_same_storage(a: T, b: T) -> Bool:
     storage counts, overlapping or not)."""
     var storage = a.storage_ptr()
     return storage != 0 and storage == b.storage_ptr()
-
-
-def _pw_weight_compute(compute: Int32, weight: T) raises -> Int32:
-    """`loss.mul_(weight)`'s compute dtype: the loss's, promoted with the
-    weight's so a float32 weight is not narrowed to a float16 loss."""
-    return _pw_compute_dtype(
-        "mul_scale", promote_types(compute, weight.stype), P_FLOAT_ONLY, True
-    )
 
 
 def _loss_same_dtype(expected: Side, side: Side) raises:
@@ -2906,6 +2890,23 @@ def _loss_fits(
         )
 
 
+def _bce_decline_weight(
+    weight: Optional[T], st: Int32, what: StaticString
+) raises:
+    """A weight of another dtype than the loss: ATen rounds its mixed-dtype
+    intermediates at steps a fused kernel does not have, so it is declined
+    rather than approximated."""
+    if weight and weight.value().stype != st:
+        unsupported(
+            String(what)
+            + " with a weight of another dtype than the input ("
+            + dtype_name(weight.value().stype)
+            + " vs "
+            + dtype_name(st)
+            + ")"
+        )
+
+
 def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
     """Loss.cu binary_cross_entropy_out_cuda: input and target of one dtype,
     the loss in it (`loss.mul_(weight)` keeps it: a float32 weight on
@@ -2916,22 +2917,15 @@ def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
     if not input.is_t or not target.is_t:
         unsupported("binary_cross_entropy with a scalar operand")
     _loss_same_dtype(input, target)
-    # The weight rides as the third operand (the product is the kernel's
-    # last rounding, like `loss.mul_(weight)`); 1 without one. A weight
-    # wider than the loss dtype is its own multiply in the promoted dtype
-    # instead: fused, the kernel would narrow it (a float32 weight of 1e5
-    # is float16 inf).
     var in_st = input.t.value().stype
-    var fuse = not weight or (
-        promote_types(in_st, weight.value().stype) == in_st
-    )
+    _bce_decline_weight(weight, in_st, "binary_cross_entropy")
+    # The weight rides as the third operand (the product is the kernel's
+    # last rounding, like `loss.mul_(weight)`); 1 without one.
     var c = _b_tside(weight.value()) if weight else _b_sside(
         Scal(1.0, 1, True, False)
     )
     var base = _pw_broadcast(input, target, _none_side(), 2)
     _loss_fits(base[0], base[1], input, target, c)
-    if not fuse:
-        c = _b_sside(Scal(1.0, 1, True, False))
     _loss_forward(
         "bce",
         3,
@@ -2942,7 +2936,6 @@ def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
         _p(),
         out_v,
         rets,
-        Optional[T]() if fuse else weight.copy(),
         result_st=in_st,
     )
 
@@ -2976,6 +2969,9 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     # and grad_input has self's shape: nothing may broadcast it larger.
     _loss_same_dtype(input, target)
     _loss_same_dtype(input, grad)
+    _bce_decline_weight(
+        weight, input.t.value().stype, "binary_cross_entropy_backward"
+    )
     var shape = input.t.value().shape
     var rank = input.t.value().rank
     _loss_fits(shape, rank, grad, input, target)
@@ -2994,6 +2990,10 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     var dest = Optional[T]()
     if out_v:
         dest = _pw_out_of(out_v.value(), grad, input, target)
+        if weight:
+            # `grad_input.mul_(weight)`: its in-place meta refuses a weight
+            # partially overlapping grad_input.
+            _b_no_partial_overlap(dest.value(), weight.value())
     var out_st = input.t.value().stype
     if not weight:
         _pw_finish(
@@ -3022,7 +3022,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
         _b_tside(gi.t),
         _b_tside(weight.value()),
         _none_side(),
-        _pw_weight_compute(compute, weight.value()),
+        compute,
         out_st,
         _p(inv),
         dest,
@@ -3063,6 +3063,18 @@ def _bce_logits(args: Values, rets: Values, out_v: Optional[Value]) raises:
     # pos_weight, `log_sigmoid(input).mul_((pos_weight - 1) * target)` may
     # not grow input's shape either.
     var t = target.t.value().copy()
+    # Mixed dtypes promote through several separately rounded ATen steps
+    # (log_sigmoid, sub, mul, ...) that one fused kernel cannot reproduce:
+    # declined rather than approximated.
+    if input.t.value().stype != t.stype:
+        unsupported(
+            "binary_cross_entropy_with_logits with input and target of"
+            " different dtypes"
+        )
+    _bce_decline_weight(weight, t.stype, "binary_cross_entropy_with_logits")
+    _bce_decline_weight(
+        pos_weight, t.stype, "binary_cross_entropy_with_logits (pos_weight)"
+    )
     _loss_fits(t.shape, t.rank, input, target, c)
     if weight:
         _loss_fits(
@@ -3083,7 +3095,6 @@ def _bce_logits(args: Values, rets: Values, out_v: Optional[Value]) raises:
         rets,
         weight,
         result_st=t.stype,
-        wide_st=pos_weight.value().stype if pos_weight else Int32(-1),
     )
 
 
