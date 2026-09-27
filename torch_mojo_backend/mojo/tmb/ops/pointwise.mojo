@@ -2261,7 +2261,9 @@ def _pw_ldexp_pow2(
                 elif e - e != 0.0:
                     p2 = 0.0  # -inf
                 else:
-                    p2 = pow(Float64(2.0), e)
+                    # The host pow returns 1 for 2^(2^32) too: past +-1100,
+                    # 2^e is inf / 0 in every floating dtype anyway.
+                    p2 = pow(Float64(2.0), min(max(e, -1100.0), 1100.0))
                 var pow2 = _round_to(p2, compute)
                 _pw_finish(
                     rets,

@@ -5596,6 +5596,18 @@ def test_aten_ldexp_compiled_wide_int_exponent(device: str):
     torch.testing.assert_close(got, aten.ldexp(x, e))
 
 
+def test_aten_ldexp_compiled_large_float_exponent(device: str):
+    """Huge finite float exponents give inf / 0 (MAX's pow gave 1)."""
+    x = torch.tensor([1.0, 1.0, -2.0, 0.5], device=device)
+    for dtype in (torch.float64, torch.float32):
+        e = torch.tensor(
+            [2.0**32, -(2.0**32), 1e10, 1030.0], dtype=dtype, device=device
+        )
+        got = torch.compile(aten.ldexp, backend=mojo_backend, fullgraph=True)(x, e)
+        torch.testing.assert_close(got, aten.ldexp(x, e), equal_nan=True)
+        torch.compiler.reset()
+
+
 def test_aten_ldexp_compiled_pow_dtype(device: str):
     """The compiled _pow2 runs pow in ATen's pow dtype and rounds it to mul's
     rank-aware common dtype: float16 2^16 is inf against a float64 self,

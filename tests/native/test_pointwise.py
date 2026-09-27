@@ -860,6 +860,9 @@ def test_ldexp_cpu_float64_scalar_exponent(mojo_gpu):
         (torch.tensor([3.0, 0.0]), math.inf),
         (torch.tensor([3.0, -0.25]), -math.inf),
         (torch.tensor([3.0, 0.25]), math.nan),
+        (torch.tensor([1.0, -1.0]), 2.0**32),
+        (torch.tensor([1.0, -1.0]), -(2.0**32)),
+        (torch.tensor([1.0, -1.0]), 1100.5),
     ]:
         e_cpu = torch.tensor(e, dtype=torch.float64)
         _close(
@@ -872,6 +875,18 @@ def test_ldexp_cpu_float64_scalar_exponent(mojo_gpu):
     e_cpu = torch.tensor(15.999, dtype=torch.float64)
     _close(
         torch.ldexp(h.to(mojo_gpu), e_cpu), torch.ldexp(h, e_cpu), rtol=0.0, atol=0.0
+    )
+
+
+def test_ldexp_large_float_exponent_tensor(mojo_gpu):
+    """Huge finite float exponents are inf / 0, never wrapped like ints."""
+    x = torch.tensor([1.0, 1.0, -2.0, 0.5])
+    e = torch.tensor([2.0**32, -(2.0**32), 1e10, 1030.0])
+    _close(
+        torch.ldexp(x.to(mojo_gpu), e.to(mojo_gpu)),
+        torch.ldexp(x, e),
+        rtol=0.0,
+        atol=0.0,
     )
 
 
