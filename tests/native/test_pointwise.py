@@ -850,6 +850,41 @@ def test_ldexp_pow_rounds_to_mul_dtype(mojo_gpu):
     _close(got, want, rtol=0.0, atol=0.0)
 
 
+def test_ldexp_cpu_float64_scalar_exponent(mojo_gpu):
+    """A CPU 0-d float64 exponent: pow(2, e) in double, rounded to float32
+    only for the product (Apple GPUs run that pow on the host, like MPS)."""
+    for x_cpu, e in [
+        (torch.tensor([1.0, -1.0]), 127.999999),
+        (torch.tensor([0.5, 0.0]), 128.0),
+        (torch.tensor([3.0, 0.25]), -1.5),
+    ]:
+        e_cpu = torch.tensor(e, dtype=torch.float64)
+        _close(
+            torch.ldexp(x_cpu.to(mojo_gpu), e_cpu),
+            torch.ldexp(x_cpu, e_cpu),
+            rtol=0.0,
+            atol=0.0,
+        )
+    h = torch.tensor([1.0, -0.5]).half()
+    e_cpu = torch.tensor(15.999, dtype=torch.float64)
+    _close(
+        torch.ldexp(h.to(mojo_gpu), e_cpu), torch.ldexp(h, e_cpu), rtol=0.0, atol=0.0
+    )
+
+
+def test_frexp_out_partially_overlapping_input(mojo_gpu):
+    """An output that partially overlaps the input raises, as on CPU; the
+    same view is fine."""
+    x = torch.tensor([1.0, 2.0, 3.0, 4.0], device=mojo_gpu)
+    e = torch.empty(3, dtype=torch.int32, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.frexp(x[:-1], out=(x[1:], e))
+    x_cpu = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    want = torch.frexp(x_cpu)
+    torch.frexp(x, out=(x, torch.empty(4, dtype=torch.int32, device=mojo_gpu)))
+    _close(x, want.mantissa)
+
+
 def test_frexp_rejects_overlapping_out(mojo_gpu):
     x = torch.rand(3, device=mojo_gpu)
     exponent = torch.empty(3, dtype=torch.int32, device=mojo_gpu)

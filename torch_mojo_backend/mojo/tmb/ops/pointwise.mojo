@@ -870,6 +870,9 @@ def op_frexp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         )
     if expo.stype != ST_INT32:
         raise Error("torch.frexp() expects exponent to have int dtype")
+    # TensorIterator's meta: an output that partially overlaps self raises.
+    _b_no_partial_overlap(mant, self)
+    _b_no_partial_overlap(expo, self)
     var r = _pw_frexp(self)
     _pw_store_slot(rets, 0, mant, r[0].copy())
     _pw_store_slot(rets, 1, expo, r[1].copy())
@@ -2239,14 +2242,33 @@ def _pw_ldexp_pow2(
         # 2^127.999999 into 2^128 = inf in float32.
         kernel_compute = promote_types(promote_types(pdt, compute), ST_FLOAT32)
         narrow = compute
-        if kernel_compute == ST_FLOAT64:
-            # Metal has no double: a CPU 0-d float64 exponent's pow runs in
-            # float32 there, within a few ulps except right at float32's
-            # overflow edge.
+        if kernel_compute == ST_FLOAT64 and not b.is_t:
+            # Metal has no double, so a CPU 0-d float64 exponent's pow runs
+            # on the host, in double, and only its result is rounded to the
+            # common dtype, as stock MPS does (the pow of CPU operands runs
+            # on CPU; exec_binary_kernel in mps/OperationUtils.mm then
+            # converts the 0-d double to float before the mul).
             var ctx = ctx_for(x.device)
-            if ctx.api() == "metal":
-                kernel_compute = ST_FLOAT32
+            var metal = ctx.api() == "metal"
             _ = ctx
+            if metal:
+                var pow2 = _round_to(pow(Float64(2.0), b.s.value().f), compute)
+                _pw_finish(
+                    rets,
+                    dest,
+                    _pw_run(
+                        "scale",
+                        1,
+                        a,
+                        _none_side(),
+                        _none_side(),
+                        compute,
+                        compute,
+                        _p(pow2),
+                        dest,
+                    ),
+                )
+                return
     var params = _p(_pw_narrow_code(narrow, kernel_compute))
     _pw_finish(
         rets,
