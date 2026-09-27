@@ -190,6 +190,7 @@ void* tmb_tensor_storage_ctx(TmbTensor t);  // the allocation handle Mojo return
 int64_t tmb_tensor_storage_nbytes(TmbTensor t);
 int32_t tmb_tensor_is_contiguous(TmbTensor t);
 int32_t tmb_tensor_is_neg(TmbTensor t);
+int32_t tmb_tensor_is_wrapped_number(TmbTensor t);  // a Python number the arg parser wrapped in a 0-d CPU tensor
 int32_t tmb_tensor_requires_grad(TmbTensor t);
 void tmb_tensor_bump_version(TmbTensor t);
 int32_t tmb_float32_matmul_precision(void);  // torch.get_float32_matmul_precision: 0 highest, 1 high, 2 medium

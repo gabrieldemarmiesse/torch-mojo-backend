@@ -229,12 +229,16 @@ def test_non_contiguous_mixed_dtype(mojo_device):
 
 
 def test_unsupported_mix_declines(mojo_device):
-    """A promotion the port does not cover declines (NotImplementedError),
-    exactly where the old fast path returned NOT_HANDLED."""
-    _, a = _both((4,), torch.float32, mojo_device)
-    _, b = _both((4,), torch.int64, mojo_device)
+    """A promotion needing a cast the cast kernel lacks (int8 -> int16)
+    declines (NotImplementedError); one it has promotes like
+    `torch.result_type` (float32 + int64 is float32)."""
+    _, a = _both((4,), torch.int8, mojo_device)
+    _, b = _both((4,), torch.int16, mojo_device)
     with pytest.raises(NotImplementedError):
         a + b
+    a_cpu, a = _both((4,), torch.float32, mojo_device)
+    b_cpu, b = _both((4,), torch.int64, mojo_device)
+    torch.testing.assert_close((a + b).cpu(), a_cpu + b_cpu)
 
 
 def test_shape_mismatch_raises(mojo_device):

@@ -26,6 +26,8 @@ from tmb.backend.abi import (
     Values,
     default_dtype,
     dtype_code,
+    dtype_name,
+    is_dense,
     new_like,
     new_tensor,
     own,
@@ -45,6 +47,8 @@ from tmb.backend.abi import (
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.common import (
+    assert_no_internal_overlap,
+    can_cast,
     cast_to,
     contiguous,
     copy_strided_into,
@@ -54,6 +58,7 @@ from tmb.ops.common import (
     resize_out,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.core import cast_for_copy
 
 
 # ---------------------------------------------------------------------------
@@ -132,13 +137,9 @@ def _require_bool_spec(op: String, dt: DType) raises:
 
 
 def _dense_enough(t: T) -> Bool:
-    """A weak stand-in for `TensorImpl::is_non_overlapping_and_dense`: false
-    for a view that repeats elements, which is the case ATen's own overlap
-    check calls `TooHard` and declines to judge."""
-    for i in range(t.rank):
-        if t.stride(i) <= 0 and t.dim(i) > 1:
-            return False
-    return True
+    """`TensorImpl::is_non_overlapping_and_dense` (see binary.mojo's
+    `_b_dense_enough`): any other view is `TooHard` for ATen's check."""
+    return t.contig or is_dense(t.shape, t.strides, t.rank)
 
 
 def _no_partial_overlap(written: T, other: T) raises:
@@ -198,8 +199,33 @@ def _unary(family: String, op: String, t_in: T, out_dtype: DType) raises -> T:
     return out.take()
 
 
+def _out_prologue(t_in: T, mut dst: T, result_stype: Int32) raises:
+    """TensorIterator's `out=` meta for a one-input op whose `out` must have
+    the result dtype itself: same device, no internal overlap, no partial
+    overlap with the input, then the dtype and the resize (a correctly
+    shaped `out` keeps its own strides and storage offset)."""
+    one_device(t_in, dst)
+    assert_no_internal_overlap(dst)
+    _no_partial_overlap(dst, t_in)
+    if dst.stype != result_stype:
+        raise Error(
+            "Expected out tensor to have dtype ",
+            dtype_name(result_stype),
+            ", but got ",
+            dtype_name(dst.stype),
+            " instead",
+        )
+    if not dst.same_shape(t_in):
+        resize_out(dst, t_in.shape, t_in.rank)
+
+
 def _unary_out(
-    family: String, op: String, t_in: T, mut dst: T, out_dtype: DType
+    family: String,
+    op: String,
+    t_in: T,
+    mut dst: T,
+    out_dtype: DType,
+    cast_ok: Bool = False,
 ) raises:
     """The `.out` / in-place route: compute straight into dst when it is
     ready, else compute into a temporary and copy (also correct when dst
@@ -209,18 +235,37 @@ def _unary_out(
     op in ATen does (`resize_output`); without that the copy below would face
     a shape it cannot satisfy. A correctly shaped one keeps its own strides
     and storage offset, so `out=base[4:8]` writes where the caller asked.
+
+    `cast_ok` is the rule of the `unary_float_op` iterators (asin, exp,
+    sqrt, ...): the result is cast into an `out` of any dtype it `canCast`s
+    to. Without it (`unary_op`: abs, neg, sign; the bool predicates) the
+    `out` must have the result dtype.
     """
-    one_device(t_in, dst)
-    _no_partial_overlap(dst, t_in)
-    if dst.stype != torch_dtype(out_dtype):
+    var result_stype = torch_dtype(out_dtype)
+    if (
+        cast_ok
+        and dst.stype != result_stype
+        and can_cast(result_stype, dst.stype)
+    ):
+        one_device(t_in, dst)
+        assert_no_internal_overlap(dst)
+        _no_partial_overlap(dst, t_in)
+        if not dst.same_shape(t_in):
+            resize_out(dst, t_in.shape, t_in.rank)
+        var result = own(_unary(family, op, t_in, out_dtype))
+        var casted = own(cast_for_copy(result.t, dst.stype))
+        copy_strided_into(dst, casted.t)
+        _ = casted^  # alive past the launch
+        _ = result^
+        return
+    if cast_ok and dst.stype != result_stype:
         raise Error(
-            "expected an out= tensor of dtype ",
-            torch_dtype(out_dtype),
-            ", got ",
-            dst.stype,
+            "result type ",
+            dtype_name(result_stype),
+            " can't be cast to the desired output type ",
+            dtype_name(dst.stype),
         )
-    if not dst.same_shape(t_in):
-        resize_out(dst, t_in.shape, t_in.rank)
+    _out_prologue(t_in, dst, result_stype)
     var src = contiguous(t_in)
     if dst.contig:
         _unary_direct(family, op, src, dst, out_dtype)
@@ -242,7 +287,9 @@ def _float_unary(op: String, t: T) raises -> T:
 
 def _float_unary_out(op: String, t: T, mut dst: T) raises:
     _require_float(op, t.dtype)
-    _unary_out("elementwise", op, t, dst, t.dtype)
+    # silu is a `unary_op` structured kernel (the out dtype is self's); the
+    # rest are `unary_float_op`s, which cast.
+    _unary_out("elementwise", op, t, dst, t.dtype, op != "SiluSpec")
 
 
 def _direct_unary(op: String, t: T) raises -> T:
@@ -537,7 +584,7 @@ def op_log2_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
     var source = _log2_input(t)
-    _unary_out("elementwise", "Log2Spec", source.t, dst, source.t.dtype)
+    _unary_out("elementwise", "Log2Spec", source.t, dst, source.t.dtype, True)
     ret_ref(rets, 0, dst)
     _ = source^
 
@@ -562,7 +609,7 @@ def op_reciprocal_out(
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
     _reciprocal_check(t)
-    _unary_out("elementwise", "ReciprocalSpec", t, dst, t.dtype)
+    _unary_out("elementwise", "ReciprocalSpec", t, dst, t.dtype, True)
     ret_ref(rets, 0, dst)
 
 
@@ -1225,9 +1272,11 @@ def _float_or_f64_unary(op: String, t: T) raises -> T:
     return _unary("elementwise", op, t, t.dtype)
 
 
-def _float_or_f64_unary_out(op: String, t: T, mut dst: T) raises:
+def _float_or_f64_unary_out(
+    op: String, t: T, mut dst: T, cast_ok: Bool = False
+) raises:
     _require_float_or_f64(op, t)
-    _unary_out("elementwise", op, t, dst, t.dtype)
+    _unary_out("elementwise", op, t, dst, t.dtype, cast_ok)
 
 
 def _promote(t: T) raises -> T:
@@ -1246,11 +1295,13 @@ def _promoting_unary(op: String, t: T) raises -> T:
 
 
 def _promoting_unary_out(op: String, t: T, mut dst: T) raises:
+    # Every op here is a `unary_float_op`: its result casts into `out`.
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":
-        _float_or_f64_unary_out(op, src.t, dst)
+        _float_or_f64_unary_out(op, src.t, dst, True)
     else:
-        _float_unary_out(op, src.t, dst)
+        _require_float(op, src.t.dtype)
+        _unary_out("elementwise", op, src.t, dst, src.t.dtype, True)
 
 
 # aten::angle(Tensor self) -> Tensor
@@ -1354,11 +1405,7 @@ def op_signbit_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
     if t.dtype == DType.bool:
-        one_device(t, dst)
-        if dst.dtype != DType.bool:
-            raise Error("expected a bool out= tensor, got ", dst.stype)
-        if not dst.same_shape(t):
-            resize_out(dst, t.shape, t.rank)
+        _out_prologue(t, dst, torch_dtype(DType.bool))
         fill_value(dst, 0.0)
         ret_ref(rets, 0, dst)
         return
@@ -1410,14 +1457,7 @@ def _param_unary_out(
 ) raises:
     """`_unary_out` for the parameterized route (also the in-place one: dst
     may be t_in itself)."""
-    one_device(t_in, dst)
-    _no_partial_overlap(dst, t_in)
-    if dst.stype != t_in.stype:
-        raise Error(
-            "expected an out= tensor of dtype ", t_in.stype, ", got ", dst.stype
-        )
-    if not dst.same_shape(t_in):
-        resize_out(dst, t_in.shape, t_in.rank)
+    _out_prologue(t_in, dst, t_in.stype)
     var src = contiguous(t_in)
     if dst.contig:
         _param_direct(op, src, dst, p0, p1, p2)
@@ -1668,17 +1708,7 @@ def _ceil_or_floor(op: String, t: T) raises -> T:
 
 def _identity_into(t: T, mut dst: T) raises:
     """The `.out` form of `_int_identity`: dst = a copy of t's values."""
-    one_device(t, dst)
-    _no_partial_overlap(dst, t)
-    if dst.stype != t.stype:
-        raise Error(
-            "expected an out= tensor of dtype ",
-            t.stype,
-            ", got ",
-            dst.stype,
-        )
-    if not dst.same_shape(t):
-        resize_out(dst, t.shape, t.rank)
+    _out_prologue(t, dst, t.stype)
     copy_strided_into(dst, t)
 
 
@@ -1848,7 +1878,7 @@ def op_isnan_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::isinf(Tensor self) -> Tensor
 def op_isinf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_bool_unary("IsInfSpec", t))
+    var out = own(_inf_predicate("IsInfSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -1856,7 +1886,7 @@ def op_isinf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_isinf_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _bool_unary_out("IsInfSpec", t, dst)
+    _inf_predicate_out("IsInfSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
@@ -1865,44 +1895,36 @@ def op_isinf_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # is not differentiable, so one kernel here loses no gradient.
 def op_isfinite(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_bool_unary("IsFiniteSpec", t))
+    var out = own(_inf_predicate("IsFiniteSpec", t))
     ret_owned(rets, 0, out)
 
 
-def _signed_inf(op: String, t: T) raises -> T:
-    """isposinf / isneginf: one kernel for a floating tensor; any other
-    dtype (every integer width, unsigned ones included, and bool) is never
-    infinite, so all-false without a kernel of its own."""
+def _inf_predicate(op: String, t: T) raises -> T:
+    """isinf / isfinite / isposinf / isneginf: one kernel for a floating
+    tensor; any other dtype (every integer width, unsigned ones included,
+    and bool) is always finite and never infinite, so a fill without a
+    kernel of its own -- as ATen's composites give for any dtype."""
     if t.dtype.is_floating_point():
         return _bool_unary(op, t)
     var out = own(
         new_tensor(t.shape, t.rank, torch_dtype(DType.bool), t.device)
     )
-    fill_value(out.t, 0.0)
+    fill_value(out.t, 1.0 if op == "IsFiniteSpec" else 0.0)
     return out.take()
 
 
-def _signed_inf_out(op: String, t: T, mut dst: T) raises:
+def _inf_predicate_out(op: String, t: T, mut dst: T) raises:
     if t.dtype.is_floating_point():
         _bool_unary_out(op, t, dst)
         return
-    one_device(t, dst)
-    if dst.stype != torch_dtype(DType.bool):
-        raise Error(
-            "expected an out= tensor of dtype ",
-            torch_dtype(DType.bool),
-            ", got ",
-            dst.stype,
-        )
-    if not dst.same_shape(t):
-        resize_out(dst, t.shape, t.rank)
-    fill_value(dst, 0.0)
+    _out_prologue(t, dst, torch_dtype(DType.bool))
+    fill_value(dst, 1.0 if op == "IsFiniteSpec" else 0.0)
 
 
 # aten::isposinf(Tensor self) -> Tensor
 def op_isposinf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_signed_inf("IsPosInfSpec", t))
+    var out = own(_inf_predicate("IsPosInfSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -1912,14 +1934,14 @@ def op_isposinf_out(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _signed_inf_out("IsPosInfSpec", t, dst)
+    _inf_predicate_out("IsPosInfSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::isneginf(Tensor self) -> Tensor
 def op_isneginf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_signed_inf("IsNegInfSpec", t))
+    var out = own(_inf_predicate("IsNegInfSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -1929,7 +1951,7 @@ def op_isneginf_out(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _signed_inf_out("IsNegInfSpec", t, dst)
+    _inf_predicate_out("IsNegInfSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
@@ -1997,14 +2019,7 @@ def _bitwise_not_into(t_in: T, mut dst: T) raises:
         unsupported(
             "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
         )
-    one_device(t_in, dst)
-    _no_partial_overlap(dst, t_in)
-    if dst.stype != t_in.stype:
-        raise Error(
-            "expected an out= tensor of dtype ", t_in.stype, ", got ", dst.stype
-        )
-    if not dst.same_shape(t_in):
-        resize_out(dst, t_in.shape, t_in.rank)
+    _out_prologue(t_in, dst, t_in.stype)
     var src = contiguous(t_in)
     if dst.contig:
         _bitwise_not_kernel(src, dst)

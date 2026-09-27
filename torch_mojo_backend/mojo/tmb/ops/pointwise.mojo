@@ -35,6 +35,7 @@ from tmb.backend.abi import (
     Value,
     Values,
     default_dtype,
+    dtype_name,
     max_dtype,
     new_tensor,
     own,
@@ -64,8 +65,10 @@ from tmb.ops.binary import (
     _b_inplace_destination,
     _b_inplace_operand,
     _b_no_overlap_side,
+    _b_out_guard3,
     _b_no_partial_overlap,
     _b_ret,
+    _b_scalar_is_int,
     _b_self,
     _b_side,
     _b_sside,
@@ -80,7 +83,18 @@ from tmb.ops.binary import (
     op_rsub,
     op_rsub_out,
 )
-from tmb.ops.common import contiguous, copy_strided_into, resize_out
+from tmb.ops.common import (
+    ST_UNDEFINED,
+    assert_no_internal_overlap,
+    combine_categories as _pw_combine,
+    contiguous,
+    copy_strided_into,
+    is_float_stype as _pw_is_float,
+    is_int_stype as _pw_is_int,
+    known_stype as _pw_known,
+    promote_types,
+    resize_out,
+)
 from tmb.ops.random import _draw
 from tmb.ops.core import cast_for_copy
 from tmb.ops.reductions import _scalar_reduction
@@ -89,93 +103,6 @@ from tmb.ops.unary import op_gelu_backward
 # ---------------------------------------------------------------------------
 # type promotion
 # ---------------------------------------------------------------------------
-
-comptime ST_UNDEFINED = Int32(-1)
-
-
-def _pw_is_float(st: Int32) -> Bool:
-    return (
-        st == ST_FLOAT32
-        or st == ST_FLOAT16
-        or st == ST_BFLOAT16
-        or st == ST_FLOAT64
-    )
-
-
-def _pw_is_int(st: Int32) -> Bool:
-    return (
-        st == ST_UINT8
-        or st == ST_INT8
-        or st == ST_INT16
-        or st == ST_INT32
-        or st == ST_INT64
-    )
-
-
-def _pw_known(st: Int32) -> Bool:
-    return _pw_is_float(st) or _pw_is_int(st) or st == ST_BOOL
-
-
-def _pw_int_rank(st: Int32) -> Int:
-    if st == ST_INT8:
-        return 1
-    if st == ST_INT16:
-        return 2
-    if st == ST_INT32:
-        return 3
-    return 4
-
-
-def _pw_float_rank(st: Int32) -> Int:
-    if st == ST_FLOAT16 or st == ST_BFLOAT16:
-        return 1
-    if st == ST_FLOAT32:
-        return 2
-    return 3
-
-
-def promote_types(a: Int32, b: Int32) raises -> Int32:
-    """c10::promoteTypes over the dtypes the mojo device computes on."""
-    if a == ST_UNDEFINED:
-        return b
-    if b == ST_UNDEFINED or a == b:
-        return a
-    if not _pw_known(a) or not _pw_known(b):
-        unsupported(
-            "type promotion of dtypes " + String(a) + " and " + String(b)
-        )
-    if a == ST_BOOL:
-        return b
-    if b == ST_BOOL:
-        return a
-    if _pw_is_float(a) and _pw_is_float(b):
-        if (a == ST_FLOAT16 and b == ST_BFLOAT16) or (
-            a == ST_BFLOAT16 and b == ST_FLOAT16
-        ):
-            return ST_FLOAT32
-        return a if _pw_float_rank(a) > _pw_float_rank(b) else b
-    if _pw_is_float(a):
-        return a
-    if _pw_is_float(b):
-        return b
-    # both integral
-    if a == ST_UINT8 or b == ST_UINT8:
-        var other = b if a == ST_UINT8 else a
-        if other == ST_INT8:
-            return ST_INT16
-        return other
-    return a if _pw_int_rank(a) > _pw_int_rank(b) else b
-
-
-def _pw_combine(higher: Int32, lower: Int32) raises -> Int32:
-    """c10's combine_categories (the ResultTypeState fold)."""
-    if _pw_is_float(higher):
-        return higher
-    if higher == ST_BOOL or _pw_is_float(lower):
-        return promote_types(higher, lower)
-    if higher != ST_UNDEFINED:
-        return higher
-    return lower
 
 
 @fieldwise_init
@@ -195,6 +122,10 @@ def _pw_update(mut state: _TypeState, side: Side) raises:
             state.zero = promote_types(state.zero, t.stype)
         else:
             state.dim = promote_types(state.dim, t.stype)
+        return
+    if side.zero_st >= 0:
+        # An explicit 0-d CPU tensor (not a wrapped Python number).
+        state.zero = promote_types(state.zero, side.zero_st)
         return
     var s = side.s.value().copy()
     var st = ST_BOOL if s.is_bool else (
@@ -456,20 +387,59 @@ def _p(
     return SIMD[DType.float64, 4](p0, p1, p2, p3)
 
 
-def _pw_finish(rets: Values, dest: Optional[T], var res: Res) raises:
+def _pw_out_exact(kind: StaticString) -> Bool:
+    """Whether `kind`'s `out=` must already have the result dtype, where
+    every other kind's result is cast into any `out` it `canCast`s to.
+
+    Torch's rule per op (v2.14): the activations are structured kernels
+    over `build_unary_op`-style iterators (`check_all_same_dtype`), and
+    heaviside / the loss kernels (lerp.Tensor: see `_pw_lerp`) below set their output from
+    `self`'s options; threshold, the other backwards and the math ops are
+    TensorIterator binary/ternary ops that cast.
+    """
+    return (
+        kind == "elu"
+        or kind == "hardshrink"
+        or kind == "softshrink"
+        or kind == "hardsigmoid"
+        or kind == "hardswish"
+        or kind == "hardtanh"
+        or kind == "leaky_relu"
+        or kind == "softplus"
+        or kind == "mish"
+        or kind == "log_sigmoid"
+        or kind == "log_sigmoid_backward"
+        or kind == "heaviside"
+        or kind == "mse_backward"
+        or kind == "huber_backward"
+        or kind == "bce"
+        or kind == "bce_backward"
+        or kind == "bce_logits"
+    )
+
+
+def _pw_finish(
+    rets: Values, dest: Optional[T], var res: Res, exact_dtype: Bool = False
+) raises:
     if dest:
-        _b_store_out(rets, dest.value(), res^)
+        _b_store_out(rets, dest.value(), res^, exact_dtype)
     else:
         _b_ret(rets, res^)
 
 
 def _pw_out_of(v: Value, a: Side, b: Side, c: Side) raises -> T:
+    """The caller's `out=`, checked like TensorIterator's meta: no internal
+    overlap, no partial overlap with an input, and never resized when it is
+    one of the inputs (see `_b_out_guard`)."""
     var dest = v_tensor(v)
     if not dest.on_mojo():
         raise Error("expected `out` to be a mojo tensor")
-    _b_no_overlap_side(dest, a)
-    _b_no_overlap_side(dest, b)
-    _b_no_overlap_side(dest, c)
+    for k in range(3):
+        var side = a.copy() if k == 0 else (b.copy() if k == 1 else c.copy())
+        if side.is_t and side.t.value().device != dest.device:
+            raise Error("expected `out` and the inputs on the same mojo device")
+    assert_no_internal_overlap(dest)
+    _b_out_guard3(dest, a, b, c)
     return dest^
 
 
@@ -498,8 +468,11 @@ def _pw_math(
     rets: Values,
     out_index: Int,
     params: SIMD[DType.float64, 4] = _p(),
+    exact_dtype: Bool = False,
 ) raises:
-    """A math op over args[0 .. arity): promoted, computed, stored."""
+    """A math op over args[0 .. arity): promoted, computed, stored.
+    `exact_dtype` (or `_pw_out_exact(kind)`) demands an `out` of the result
+    dtype instead of casting into it."""
     var a = _b_side(args[unsafe_offset=0])
     var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
     var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
@@ -512,6 +485,7 @@ def _pw_math(
         rets,
         dest,
         _pw_run(kind, arity, a, b, c, compute, compute, params, dest),
+        exact_dtype or _pw_out_exact(kind),
     )
 
 
@@ -794,20 +768,14 @@ def op_rshift_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _pw_shift_inplace(kind: StaticString, args: Values, rets: Values) raises:
-    """__ilshift__ / __irshift__: in place, into self's own dtype."""
+    """__ilshift__ / __irshift__: computed in the promoted dtype, then cast
+    into self when that cast is category-safe (int8 `<<=` int64 is int8),
+    as TensorIterator does for any in-place op (`_b_store_inplace`)."""
     var self = _pw_inplace_self(args, "an in-place shift", 2)
     var a = _b_tside(self)
     var b = _b_side(args[unsafe_offset=1])
-    _b_no_overlap_side(self, b)
     var common = _pw_result_type(a, b, _none_side(), 2)
     var compute = _pw_compute_dtype(kind, common, P_INT, True)
-    if compute != self.stype:
-        raise Error(
-            "result type "
-            + String(compute)
-            + " can't be cast to the desired output type "
-            + String(self.stype)
-        )
     var res = _pw_run(
         kind, 2, a, b, _none_side(), compute, compute, _p(), self.copy()
     )
@@ -890,6 +858,7 @@ def _pw_store_slot(rets: Values, slot: Int, dest: T, var res: Res) raises:
     var held = own(res.t.copy())
     held.live = res.owned
     var d = dest.copy()
+    assert_no_internal_overlap(d)
     if not d.same_shape(held.t):
         resize_out(d, held.t.shape, held.t.rank)
     _b_copy_into(d, held.t)
@@ -910,18 +879,35 @@ def _pw_lerp(args: Values, rets: Values, out_index: Int) raises:
         if start.t.value().stype != end.t.value().stype:
             raise Error(
                 "expected dtype "
-                + String(start.t.value().stype)
+                + dtype_name(start.t.value().stype)
                 + " for `end` but got dtype "
-                + String(end.t.value().stype)
+                + dtype_name(end.t.value().stype)
             )
-        if weight.is_t and weight.t.value().stype != start.t.value().stype:
-            raise Error(
-                "expected dtype "
-                + String(start.t.value().stype)
-                + " for `weight` but got dtype "
-                + String(weight.t.value().stype)
-            )
-    _pw_math("lerp", P_FLOAT_ONLY, True, 3, args, rets, out_index)
+    # TORCH_META_FUNC(lerp_Tensor): a 0-dim weight is promoted with the
+    # other operands (and the result cast into `out`); any other weight must
+    # have self's dtype, and so must `out`.
+    var promote_weight = not weight.is_t or weight.t.value().rank == 0
+    if (
+        not promote_weight
+        and start.is_t
+        and weight.t.value().stype != start.t.value().stype
+    ):
+        raise Error(
+            "expected dtype "
+            + dtype_name(start.t.value().stype)
+            + " for `weight` but got dtype "
+            + dtype_name(weight.t.value().stype)
+        )
+    _pw_math(
+        "lerp",
+        P_FLOAT_ONLY,
+        True,
+        3,
+        args,
+        rets,
+        out_index,
+        exact_dtype=not promote_weight,
+    )
 
 
 # aten::lerp.Tensor(Tensor self, Tensor end, Tensor weight) -> Tensor
@@ -1183,6 +1169,7 @@ def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
                 _p(alpha),
                 dest,
             ),
+            True,  # rsub: `out` of the result dtype only
         )
     else:
         _pw_finish(
@@ -1199,6 +1186,7 @@ def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
                 _p(alpha, b.s.value().f),
                 dest,
             ),
+            True,  # rsub: `out` of the result dtype only
         )
     return True
 
@@ -1343,6 +1331,7 @@ def _pw_act(
         _pw_run(
             kind, arity, a, b, _none_side(), compute, compute, params, dest
         ),
+        _pw_out_exact(kind),
     )
 
 
@@ -1591,8 +1580,23 @@ def op_hardswish_backward(
     _pw_act("hardswish_backward", args, rets, 0, 1, -1, _p())
 
 
+def _int_exact_param(v: Value, st: Int32) raises -> Float64:
+    """A Scalar parameter of an op that applies it in scalar_t: on an
+    integer tensor it reaches the kernel as an int64 (`param_dtype`), from a
+    float64 slot, which holds every integer up to 2**53 exactly -- a larger
+    one is declined rather than rounded."""
+    var f = v_f64(v)
+    if _pw_is_int(st) and _b_scalar_is_int(v) and abs(f) > 9007199254740992.0:
+        unsupported("an integer parameter too large to pass exactly")
+    return f
+
+
 def _hardtanh_p(args: Values, i: Int) raises -> SIMD[DType.float64, 4]:
-    return _p(v_f64(args[unsafe_offset=i]), v_f64(args[unsafe_offset=i + 1]))
+    var st = _self_stype(args, 0)
+    return _p(
+        _int_exact_param(args[unsafe_offset=i], st),
+        _int_exact_param(args[unsafe_offset=i + 1], st),
+    )
 
 
 # aten::hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
@@ -1802,8 +1806,8 @@ def op_gelu_backward_any(
 def _threshold_p(args: Values) raises -> SIMD[DType.float64, 4]:
     var st = _self_stype(args, 0)
     return _p(
-        _round_to(v_f64(args[unsafe_offset=1]), st),
-        _round_to(v_f64(args[unsafe_offset=2]), st),
+        _round_to(_int_exact_param(args[unsafe_offset=1], st), st),
+        _round_to(_int_exact_param(args[unsafe_offset=2], st), st),
     )
 
 
@@ -2283,7 +2287,7 @@ def _loss_forward(
         if res.owned:
             release(loss.h)
         res = weighted^
-    _pw_finish(rets, dest, _loss_reduce(res^, reduction))
+    _pw_finish(rets, dest, _loss_reduce(res^, reduction), _pw_out_exact(kind))
 
 
 def _loss_backward(
@@ -2312,6 +2316,7 @@ def _loss_backward(
         rets,
         dest,
         _pw_run(kind, 3, input, target, grad, compute, out_st, params, dest),
+        _pw_out_exact(kind),
     )
 
 
@@ -2591,6 +2596,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
                 _p(inv),
                 dest,
             ),
+            _pw_out_exact("bce_backward"),
         )
         return
     var gi = _pw_run(
@@ -2608,7 +2614,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
         dest,
     )
     release(gi.t.h)
-    _pw_finish(rets, dest, res^)
+    _pw_finish(rets, dest, res^, _pw_out_exact("bce_backward"))
 
 
 # aten::binary_cross_entropy_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean) -> Tensor

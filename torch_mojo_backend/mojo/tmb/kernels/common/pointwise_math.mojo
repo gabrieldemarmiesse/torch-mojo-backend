@@ -74,8 +74,13 @@ def wide_dtype[dtype: DType]() -> DType:
 @always_inline
 def param_dtype[dtype: DType]() -> DType:
     """The dtype the scalar parameters travel in to the device: float64 only
-    for float64 operands (Metal has no double at all)."""
-    return wide_dtype[dtype]()
+    for float64 operands (Metal has no double at all); int64 for integer
+    operands, whose parameters (threshold, hardtanh's bounds) torch applies
+    in scalar_t -- a float32 would round 16777217 to 16777216."""
+    comptime if dtype.is_integral():
+        return DType.int64
+    else:
+        return wide_dtype[dtype]()
 
 
 # ---------------------------------------------------------------------------

@@ -48,6 +48,7 @@ from tmb.backend.abi import (
     Values,
     default_dtype,
     dtype_code,
+    dtype_name,
     f64_bits,
     is_dense,
     new_like,
@@ -61,6 +62,7 @@ from tmb.backend.abi import (
     strides_equal,
     unsupported,
     v_f64,
+    v_int,
     v_is_none,
     v_string,
     v_tensor,
@@ -68,7 +70,18 @@ from tmb.backend.abi import (
 from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import cast_to, contiguous, copy_strided_into, resize_out
+from tmb.ops.common import (
+    ST_UNDEFINED,
+    assert_no_internal_overlap,
+    combine_categories,
+    known_stype,
+    promote_types,
+    result_type,
+    cast_to,
+    contiguous,
+    copy_strided_into,
+    resize_out,
+)
 from tmb.ops.core import cast_for_copy
 from tmb.backend.registry import Site, impl
 from tmb.ops.foreach import _foreach_addc_launch, _foreach_lerp_launch
@@ -137,29 +150,24 @@ def _b_can_cast(src: Int32, dst: Int32) -> Bool:
     return _b_category(src) <= _b_category(dst)
 
 
-def _b_promote(a: Int32, b: Int32) -> Int32:
-    """The old `_binary_promotion`, as the promoted dtype (-1 = decline).
+def _b_promote(a: T, b: T) raises -> Int32:
+    """`torch.result_type(a, b)` for two mojo tensors (-1 = decline).
 
-    An operand whose dtype differs from the result is cast; the table covers
-    only the pairs the eager loops hit, everything else declines.
+    Rank-aware like torch: a dimensioned tensor outranks a 0-dim one of the
+    same category (`float16[3]` with `float32[]` is float16). Declines a
+    pair whose promotion needs a cast the data_movement cast kernel does not
+    have (int8 / int16 operands, say), which the callers report.
     """
-    if a == b:
-        return a
-    if a == ST_BOOL and _b_castable(b):
-        return b
-    if b == ST_BOOL and _b_castable(a):
-        return a
-    if (a == ST_INT32 and b == ST_INT64) or (a == ST_INT64 and b == ST_INT32):
-        return ST_INT64
-    if a == ST_FLOAT32 and (b == ST_FLOAT16 or b == ST_BFLOAT16):
-        return ST_FLOAT32
-    if b == ST_FLOAT32 and (a == ST_FLOAT16 or a == ST_BFLOAT16):
-        return ST_FLOAT32
-    if (a == ST_FLOAT16 and b == ST_BFLOAT16) or (
-        a == ST_BFLOAT16 and b == ST_FLOAT16
-    ):
-        return ST_FLOAT32
-    return Int32(-1)
+    if a.stype == b.stype:
+        return a.stype
+    if not known_stype(a.stype) or not known_stype(b.stype):
+        return Int32(-1)
+    var r = result_type(a, b)
+    if a.stype != r and not (_b_castable(a.stype) and _b_castable(r)):
+        return Int32(-1)
+    if b.stype != r and not (_b_castable(b.stype) and _b_castable(r)):
+        return Int32(-1)
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -231,14 +239,39 @@ struct Side(Copyable, Movable):
     var is_t: Bool
     var t: Optional[T]
     var s: Optional[Scal]
+    # The dtype of the explicit 0-d CPU tensor a Scalar side was read from
+    # (-1 for a Python number): it promotes as a 0-dim tensor, not a Scalar.
+    var zero_st: Int32
 
 
 def _b_tside(t: T) -> Side:
-    return Side(True, Optional[T](t.copy()), Optional[Scal]())
+    return Side(True, Optional[T](t.copy()), Optional[Scal](), Int32(-1))
 
 
 def _b_sside(s: Scal) -> Side:
-    return Side(False, Optional[T](), Optional[Scal](s.copy()))
+    return Side(False, Optional[T](), Optional[Scal](s.copy()), Int32(-1))
+
+
+def _b_side_result(t: T, side: Side) raises -> Int32:
+    """`torch.result_type(t, side)` for a tensor and a Scalar side: the
+    ResultTypeState fold over a dimensioned or 0-dim tensor, and a Python
+    number (the wrapped slot) or an explicit 0-d CPU tensor (the 0-dim
+    slot)."""
+    var dim = ST_UNDEFINED
+    var zero = ST_UNDEFINED
+    var wrapped = ST_UNDEFINED
+    if t.rank == 0:
+        zero = t.stype
+    else:
+        dim = t.stype
+    var s = side.s.value().copy()
+    if side.zero_st >= 0:
+        zero = promote_types(zero, side.zero_st)
+    else:
+        wrapped = ST_BOOL if s.is_bool else (
+            ST_INT64 if s.is_int else default_dtype()
+        )
+    return combine_categories(dim, combine_categories(zero, wrapped))
 
 
 def _b_side(v: Value) raises -> Side:
@@ -258,7 +291,10 @@ def _b_side(v: Value) raises -> Side:
         if t.on_mojo():
             return _b_tside(t)
         if t.device_type == DEVICE_TYPE_CPU and t.numel == 1 and t.rank == 0:
-            return _b_sside(_b_host_scalar(t))
+            var side = _b_sside(_b_host_scalar(t))
+            if not t.is_wrapped_number():
+                side.zero_st = t.stype
+            return side^
         unsupported("an operand that is neither a mojo tensor nor a scalar")
     if v.tag == TAG_COMPLEX:
         unsupported("complex scalars")
@@ -557,8 +593,14 @@ def _b_is_tensor_rec(v: Value) -> Bool:
 
 def _b_wrapped_number(t: T) -> Bool:
     """torch's *wrapped number*: the 0-d CPU tensor a python scalar becomes
-    where a schema says Tensor (see `_b_side`)."""
-    return t.device_type == DEVICE_TYPE_CPU and t.rank == 0 and t.numel == 1
+    where a schema says Tensor (see `_b_side`). An explicit 0-d CPU tensor
+    is not one: it promotes as a 0-dim tensor."""
+    return (
+        t.device_type == DEVICE_TYPE_CPU
+        and t.rank == 0
+        and t.numel == 1
+        and t.is_wrapped_number()
+    )
 
 
 def _b_rec_scalar(v: Value) raises -> MaybeScal:
@@ -841,7 +883,7 @@ def _b_binary(
         if a.device != b.device:
             raise Error("expected both operands on the same mojo device")
         device = a.device
-        var promoted = _b_promote(a.stype, b.stype)
+        var promoted = _b_promote(a, b)
         if promoted < 0:
             unsupported(
                 "no supported promotion for dtypes "
@@ -862,15 +904,15 @@ def _b_binary(
         var t = lhs.t.value().copy() if lhs.is_t else rhs.t.value().copy()
         var s = rhs.s.value().copy() if lhs.is_t else lhs.s.value().copy()
         device = t.device
-        dtype = t.stype
+        dtype = _b_side_result(t, rhs.copy() if lhs.is_t else lhs.copy())
         _b_op_dtype_ok(op, dtype, is_cmp)
         var fill = _b_scalar_tensor(_b_embed(s, dtype), dtype, device)
         if lhs.is_t:
-            a_h = _b_hold(t)
+            a_h = _b_ready(t, dtype, False)
             b_h = fill^
         else:
             a_h = fill^
-            b_h = _b_hold(t)
+            b_h = _b_ready(t, dtype, False)
     var shape = _b_broadcast(a_h.t, b_h.t)
     var rank = max(a_h.t.rank, b_h.t.rank)
     var result_stype = out_stype if out_stype >= 0 else dtype
@@ -920,6 +962,8 @@ def _b_try_scalar(
     var a = lhs.t.value().copy()
     if not _b_float3(a.stype):
         return None
+    if rhs.zero_st >= 0 and _b_side_result(a, rhs) != a.stype:
+        return None  # an explicit 0-d tensor promoting past `a`'s dtype
     var s = rhs.s.value().copy()
     if s.is_bool:
         return None
@@ -952,6 +996,8 @@ def _b_try_int_scalar(
     var a = lhs.t.value().copy()
     if not (a.stype == ST_INT32 or a.stype == ST_INT64):
         return None
+    if rhs.zero_st >= 0 and _b_side_result(a, rhs) != a.stype:
+        return None  # an explicit 0-d tensor promoting past `a`'s dtype
     var s = rhs.s.value().copy()
     if not s.is_int or s.is_bool:
         return None
@@ -1020,7 +1066,7 @@ def _b_alpha_as(alpha: Float64, lhs: Side, rhs: Side) raises -> Float64:
     matches both."""
     if not lhs.is_t or not rhs.is_t:
         return alpha
-    var result = _b_promote(lhs.t.value().stype, rhs.t.value().stype)
+    var result = _b_promote(lhs.t.value(), rhs.t.value())
     if result == ST_FLOAT16:
         return alpha.cast[DType.float16]().cast[DType.float64]()
     if result == ST_BFLOAT16:
@@ -1053,19 +1099,37 @@ def _b_ret(rets: Values, var r: Res) raises:
     ret_tensor(rets, 0, r.t)
 
 
-def _b_store_out(rets: Values, dest: T, var res: Res) raises:
+def _b_store_out(
+    rets: Values, dest: T, var res: Res, exact_dtype: Bool = False
+) raises:
     """Finish an `out=` variant: `res` is either `dest` itself (already
-    written) or a fresh result to copy — and cast — into it."""
+    written) or a fresh result to copy — and cast — into it.
+
+    The cast follows TensorIterator's `cast_common_dtype_to_outputs` +
+    `enforce_safe_casting_to_output`: any `out` dtype the result `canCast`
+    to. `exact_dtype` is the rule of the ops whose meta instead demands the
+    result dtype itself (a `check_all_same_dtype` iterator, or a structured
+    meta that sets the output's dtype from an input: clamp, rsub, the
+    activations, lerp.Tensor, heaviside, ...).
+    """
     if not res.owned:
         ret_ref(rets, 0, dest)
         return
     var held = own(res.t.copy())
+    if exact_dtype and held.t.stype != dest.stype:
+        raise Error(
+            "Expected out tensor to have dtype ",
+            dtype_name(held.t.stype),
+            ", but got ",
+            dtype_name(dest.stype),
+            " instead",
+        )
     if not _b_can_cast(held.t.stype, dest.stype):
         raise Error(
             "result type ",
-            held.t.stype,
+            dtype_name(held.t.stype),
             " can't be cast to the desired output type ",
-            dest.stype,
+            dtype_name(dest.stype),
         )
     var dst = dest.copy()
     if not dst.same_shape(held.t):
@@ -1093,19 +1157,43 @@ def _b_store_inplace(rets: Values, self: T, var res: Res) raises:
         ret_ref(rets, 0, self)
         return
     var held = own(res.t.copy())
-    if held.t.stype != self.stype or not self.same_shape(held.t):
-        unsupported("an in-place result that changes dtype or shape")
-    _b_copy_into(self, held.t)
+    if not self.same_shape(held.t):
+        raise Error(
+            "output with shape ",
+            _b_shape_list(self.shape, self.rank),
+            " doesn't match the broadcast shape ",
+            _b_shape_list(held.t.shape, held.t.rank),
+        )
+    if held.t.stype == self.stype:
+        _b_copy_into(self, held.t)
+    else:
+        # TensorIterator casts the result into self like any output, when
+        # the cast is category-safe: float16.add_(float32) is float16,
+        # int64.add_(float32) raises.
+        if not _b_can_cast(held.t.stype, self.stype):
+            raise Error(
+                "result type ",
+                dtype_name(held.t.stype),
+                " can't be cast to the desired output type ",
+                dtype_name(self.stype),
+            )
+        var casted = own(cast_for_copy(held.t, self.stype))
+        _b_copy_into(self, casted.t)
+        _ = casted^  # alive past the launch
     _ = held^  # alive past the launch
     ret_ref(rets, 0, self)
 
 
 def _b_out_tensor(v: Value, device: Int) raises -> T:
+    """The caller's `out=`: on the inputs' mojo device, and with no two
+    elements at one address (`at::assert_no_internal_overlap`, which every
+    TensorIterator op with `check_mem_overlap` runs)."""
     var out = v_tensor(v)
     if not out.on_mojo():
         raise Error("expected `out` to be a mojo tensor")
     if out.device != device:
         raise Error("expected `out` and the inputs on the same mojo device")
+    assert_no_internal_overlap(out)
     return out^
 
 
@@ -1119,14 +1207,12 @@ def _b_device_of(lhs: Side, rhs: Side) raises -> Int:
 
 
 def _b_dense_enough(t: T) -> Bool:
-    """A weak stand-in for `TensorImpl::is_non_overlapping_and_dense`: false
-    for a view that repeats elements (a broadcast stride of 0 over a real
-    extent), which is the case ATen's own overlap check calls `TooHard` and
-    declines to judge."""
-    for i in range(t.rank):
-        if t.stride(i) <= 0 and t.dim(i) > 1:
-            return False
-    return True
+    """`TensorImpl::is_non_overlapping_and_dense`: only then is the view's
+    memory exactly `[ptr, ptr + numel * itemsize)`. Anything else -- a
+    broadcast (stride 0) or a strided view such as `x[::2]` -- is what
+    ATen's overlap check calls `TooHard` and lets through, so disjoint
+    interleaved views (`x[::2] >>= x[1::2]`) are accepted as in torch."""
+    return t.contig or is_dense(t.shape, t.strides, t.rank)
 
 
 def _b_no_partial_overlap(written: T, other: T) raises:
@@ -1172,6 +1258,86 @@ def _b_no_overlap_side(written: T, side: Side) raises:
         _b_no_partial_overlap(written, side.t.value())
 
 
+def _b_same_view(a: T, b: T) -> Bool:
+    """`a` and `b` are the same view of the same memory -- how an `out=`
+    that IS one of the inputs looks from here (torch compares TensorImpls;
+    the boxed call hands the two records separately)."""
+    if a.h == b.h:
+        return True
+    return (
+        a.ptr == b.ptr
+        and a.stype == b.stype
+        and a.rank == b.rank
+        and a.same_shape(b)
+        and strides_equal(a.strides, b.strides, a.rank)
+    )
+
+
+def _b_shape_list(shape: IndexList[MAX_RANK], rank: Int) -> String:
+    var s = String("[")
+    for i in range(rank):
+        if i:
+            s += ", "
+        s += String(shape[MAX_RANK - rank + i])
+    return s + "]"
+
+
+def _b_out_guard(dest: T, a: Side, b: Side) raises:
+    """`_b_out_guard3` of a binary op."""
+    _b_out_guard3(dest, a, b, b)
+
+
+def _b_out_guard3(dest: T, a: Side, b: Side, c: Side) raises:
+    """TensorIterator's `out=` meta against the inputs, before anything is
+    written or resized:
+
+    * `at::assert_no_partial_overlap` against every tensor input;
+    * an `out` that is one of the inputs (`is_read_write`: how torch routes
+      `self.op_(other)` through `op.out(self, other, out=self)`) is never
+      resized -- a broadcast shape larger than it raises, as
+      `TensorIteratorBase::fast_set_up` / `mark_resize_outputs` do.
+
+    (`at::assert_no_internal_overlap` is `_b_out_tensor`'s.)
+    """
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    var read_write = False
+    for k in range(3):
+        var side = a.copy() if k == 0 else (b.copy() if k == 1 else c.copy())
+        if not side.is_t:
+            continue
+        var t = side.t.value().copy()
+        _b_no_partial_overlap(dest, t)
+        if _b_same_view(dest, t):
+            read_write = True
+        rank = max(rank, t.rank)
+        for i in range(MAX_RANK):
+            if shape[i] == 1:
+                shape[i] = t.shape[i]
+            elif t.shape[i] != 1 and t.shape[i] != shape[i]:
+                raise Error(
+                    "The size of tensor a (",
+                    shape[i],
+                    ") must match the size of tensor b (",
+                    t.shape[i],
+                    ") at non-singleton dimension ",
+                    i - (MAX_RANK - rank),
+                )
+    if not read_write:
+        return
+    var fits = dest.rank == rank
+    for i in range(MAX_RANK):
+        if dest.shape[i] != shape[i]:
+            fits = False
+    if not fits:
+        raise Error(
+            "output with shape ",
+            _b_shape_list(dest.shape, dest.rank),
+            " doesn't match the broadcast shape ",
+            _b_shape_list(shape, rank),
+        )
+
+
 def _b_self(v: Value, what: StaticString) raises -> T:
     var self = v_tensor(v)
     if not self.on_mojo():
@@ -1214,9 +1380,9 @@ def _b_add(
         if s.is_bool:
             unsupported("a bool scalar operand with alpha != 1")
         var v = s.f * alpha
-        return _b_add_routes(
-            lhs, _b_sside(Scal(v, Int(v), s.is_int and alpha_int, False)), dst
-        )
+        var scaled_s = _b_sside(Scal(v, Int(v), s.is_int and alpha_int, False))
+        scaled_s.zero_st = rhs.zero_st
+        return _b_add_routes(lhs, scaled_s^, dst)
     var scaled = _b_scale(rhs.t.value(), alpha, alpha_int)
     var res = _b_add_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
@@ -1247,9 +1413,9 @@ def _b_sub(
         if s.is_bool:
             unsupported("a bool scalar operand with alpha != 1")
         var v = s.f * alpha
-        return _b_sub_routes(
-            lhs, _b_sside(Scal(v, Int(v), s.is_int and alpha_int, False)), dst
-        )
+        var scaled_s = _b_sside(Scal(v, Int(v), s.is_int and alpha_int, False))
+        scaled_s.zero_st = rhs.zero_st
+        return _b_sub_routes(lhs, scaled_s^, dst)
     var scaled = _b_scale(rhs.t.value(), alpha, alpha_int)
     var res = _b_sub_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
@@ -1333,8 +1499,7 @@ def op_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
-    _b_no_overlap_side(dest, lhs)
-    _b_no_overlap_side(dest, rhs)
+    _b_out_guard(dest, lhs, rhs)
     _b_store_out(
         rets,
         dest,
@@ -1393,8 +1558,7 @@ def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
-    _b_no_overlap_side(dest, lhs)
-    _b_no_overlap_side(dest, rhs)
+    _b_out_guard(dest, lhs, rhs)
     _b_store_out(
         rets,
         dest,
@@ -1428,7 +1592,7 @@ def _rsub_promote(lhs: Side, rhs: Side) raises -> Optional[T]:
     """`3.5 - int_tensor` is a float result in torch, which the sub cascade's
     scalar embedding declines: the tensor is cast to the default float dtype
     first (an owned temporary, None when no cast is needed)."""
-    if lhs.is_t or not rhs.is_t:
+    if lhs.is_t or not rhs.is_t or lhs.zero_st >= 0:
         return None
     var s = lhs.s.value().copy()
     var t = rhs.t.value().copy()
@@ -1446,15 +1610,26 @@ def op_rsub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=1])
     var rhs = _b_side(args[unsafe_offset=0])
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
-    _b_no_overlap_side(dest, lhs)
-    _b_no_overlap_side(dest, rhs)
+    _b_out_guard(dest, lhs, rhs)
+    # rsub's out dtype is the result's own (sub's structured meta with
+    # `out` built from self): no cast into another dtype.
+    if v_f64(args[unsafe_offset=2]) == 1.0:
+        # The functional op's one launch, so `out=` rounds the same way
+        # (`other` stays in opmath instead of being embedded in self's
+        # dtype first: float16 self with other=1.0001).
+        var fast = _b_try_scalar(
+            "RsubScalarSpec", rhs, lhs, False, Optional[T](dest.copy())
+        )
+        if fast.__bool__():
+            _b_store_out(rets, dest, fast.value().copy(), exact_dtype=True)
+            return
     var promoted = _rsub_promote(lhs, rhs)
     if promoted:
         rhs = _b_tside(promoted.value())
     var r = _b_sub(lhs, rhs, args[unsafe_offset=2], Optional[T](dest.copy()))
     if promoted:
         release(promoted.value().h)
-    _b_store_out(rets, dest, r^)
+    _b_store_out(rets, dest, r^, exact_dtype=True)
 
 
 # aten::mul.Tensor(Tensor self, Tensor other) -> Tensor
@@ -1505,8 +1680,7 @@ def op_mul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
-    _b_no_overlap_side(dest, lhs)
-    _b_no_overlap_side(dest, rhs)
+    _b_out_guard(dest, lhs, rhs)
     _b_store_out(rets, dest, _b_mul(lhs, rhs, Optional[T](dest.copy())))
 
 
@@ -1519,7 +1693,7 @@ def _b_is_floating(st: Int32) -> Bool:
     return _b_float3(st) or st == ST_FLOAT64
 
 
-def _b_true_div_dtype(a_stype: Int32, rhs: Side) raises -> Int32:
+def _b_true_div_dtype(a: T, rhs: Side) raises -> Int32:
     """`torch.result_type` for TRUE division.
 
     ATen builds the divide iterator with `promote_integer_inputs_to_float`,
@@ -1529,6 +1703,7 @@ def _b_true_div_dtype(a_stype: Int32, rhs: Side) raises -> Int32:
     float16), and a float SCALAR against an integral tensor lands on the
     default dtype too (`torch.result_type(int_tensor, 0.5)`).
     """
+    var a_stype = a.stype
     var common = a_stype
     if rhs.is_t:
         var b_stype = rhs.t.value().stype
@@ -1539,7 +1714,7 @@ def _b_true_div_dtype(a_stype: Int32, rhs: Side) raises -> Int32:
         elif b_float and not a_float:
             common = b_stype
         elif a_float and b_float:
-            common = _b_promote(a_stype, b_stype)
+            common = _b_promote(a, rhs.t.value())
             if common < 0:
                 unsupported(
                     "no dtype promotion for "
@@ -1595,7 +1770,7 @@ def _b_rounding_div(
     if lhs.is_t and rhs.is_t:
         var a = lhs.t.value().copy()
         var b = rhs.t.value().copy()
-        var common = _b_promote(a.stype, b.stype)
+        var common = _b_promote(a, b)
         if b.numel == 1 and (common == ST_BFLOAT16 or common == ST_FLOAT16):
             return _b_binary("TruncDivOpmathSpec", lhs, rhs, Int32(-1), dst)
     return _b_binary("TruncDivSpec", lhs, rhs, Int32(-1), dst)
@@ -1616,7 +1791,7 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     if not lhs.is_t:
         unsupported("div with a scalar numerator")
     var a = lhs.t.value().copy()
-    var common = _b_true_div_dtype(a.stype, rhs)
+    var common = _b_true_div_dtype(a, rhs)
     # float64 included: DivSpec dispatches on logic SPEC_BCAST_DTYPES,
     # which has it, and the kernel only asks that the dtype be floating.
     if not _b_is_floating(common):
@@ -1747,8 +1922,7 @@ def op_div_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
-    _b_no_overlap_side(dest, lhs)
-    _b_no_overlap_side(dest, rhs)
+    _b_out_guard(dest, lhs, rhs)
     _b_store_out(
         rets, dest, _b_div(lhs, rhs, _b_no_mode(), Optional[T](dest.copy()))
     )
@@ -1761,8 +1935,7 @@ def op_div_out_mode(
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
-    _b_no_overlap_side(dest, lhs)
-    _b_no_overlap_side(dest, rhs)
+    _b_out_guard(dest, lhs, rhs)
     _b_store_out(
         rets,
         dest,
@@ -1799,8 +1972,7 @@ def _b_simple_out(
     var dest = _b_out_tensor(
         args[unsafe_offset=out_index], _b_device_of(lhs, rhs)
     )
-    _b_no_overlap_side(dest, lhs)
-    _b_no_overlap_side(dest, rhs)
+    _b_out_guard(dest, lhs, rhs)
     _b_store_out(
         rets, dest, _b_binary(op, lhs, rhs, Int32(-1), Optional[T](dest.copy()))
     )
@@ -1845,7 +2017,7 @@ def op_pow_scalar_out(
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
-    _b_no_overlap_side(dest, lhs)
+    _b_out_guard(dest, lhs, rhs)
     var r = _b_try_scalar(
         "PowScalarSpec", lhs, rhs, False, Optional[T](dest.copy())
     )
@@ -1917,8 +2089,9 @@ def _b_maxmin_out(
             _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
         ),
     )
-    _b_no_overlap_side(dest, _b_side(args[unsafe_offset=0]))
-    _b_no_overlap_side(dest, _b_side(args[unsafe_offset=1]))
+    _b_out_guard(
+        dest, _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+    )
     _b_store_out(rets, dest, _b_maxmin(op, bool_op, args, dest.copy()))
 
 
@@ -2025,7 +2198,7 @@ def _b_logical_res(
     if lhs.is_t and rhs.is_t:
         var a = lhs.t.value().copy()
         var b = rhs.t.value().copy()
-        if _b_promote(a.stype, b.stype) < 0:
+        if _b_promote(a, b) < 0:
             if not (_b_castable(a.stype) and _b_castable(b.stype)):
                 unsupported(
                     "a logical op on dtypes "
@@ -2062,8 +2235,7 @@ def _b_logical_out(op: StaticString, args: Values, rets: Values) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
-    _b_no_overlap_side(dest, lhs)
-    _b_no_overlap_side(dest, rhs)
+    _b_out_guard(dest, lhs, rhs)
     _b_store_out(
         rets, dest, _b_logical_res(op, lhs, rhs, Optional[T](dest.copy()))
     )
@@ -2119,9 +2291,17 @@ def _b_clamp_dtype(self_stype: Int32, lo: Value, hi: Value) -> Int32:
     var float_bound = (not v_is_none(lo) and not _b_scalar_is_int(lo)) or (
         not v_is_none(hi) and not _b_scalar_is_int(hi)
     )
-    if not float_bound or _b_is_floating(self_stype):
+    if _b_is_floating(self_stype):
         return self_stype
-    return default_dtype()
+    if float_bound:
+        return default_dtype()
+    if self_stype == ST_BOOL and (_b_int_bound(lo) or _b_int_bound(hi)):
+        return ST_INT64  # an int bound promotes a bool tensor to int64
+    return self_stype
+
+
+def _b_int_bound(v: Value) -> Bool:
+    return v.tag == TAG_SCALAR_INT or v.tag == TAG_INT
 
 
 def _b_is_nan_bound(v: Value) raises -> Bool:
@@ -2176,8 +2356,11 @@ def _b_clamp(
         if filled.t.numel > 0:
             _b_fill_spec(filled.t, nan[DType.float64]())
         return Res(filled.take(), True)
-    var lo_v = v_f64(lo) if has_min else 0.0
-    var hi_v = v_f64(hi) if has_max else 0.0
+    # The bounds travel as the kernel's raw slots: a float64's bits for a
+    # floating result, the integer itself for an integral one, so an int64
+    # bound past 2**53 stays exact (`clamp_min(int64, 2**53 + 1)`).
+    var lo_v = _b_clamp_bound(lo, result_stype) if has_min else 0
+    var hi_v = _b_clamp_bound(hi, result_stype) if has_max else 0
     var src = _b_ready(self, result_stype, True)
     if dst:
         var d = dst.value().copy()
@@ -2197,8 +2380,17 @@ def _b_clamp(
     return Res(out.take(), True)
 
 
+def _b_clamp_bound(v: Value, result_stype: Int32) raises -> Int:
+    """A clamp bound as `_b_clamp_launch`'s raw slot."""
+    if _b_is_floating(result_stype):
+        return Int(f64_bits(v_f64(v)))
+    if _b_scalar_is_int(v):
+        return v_int(v)
+    return Int(v_f64(v))
+
+
 def _b_clamp_launch(
-    dst: T, src: T, lo: Float64, hi: Float64, has_min: Bool, has_max: Bool
+    dst: T, src: T, lo: Int, hi: Int, has_min: Bool, has_max: Bool
 ) raises:
     """logic ClampScalar over two contiguous tensors of one dtype."""
     if dst.numel == 0:
@@ -2209,8 +2401,8 @@ def _b_clamp_launch(
     call.out_dtype(dst.dtype)
     call.int(dst.ptr)
     call.int(src.ptr)
-    call.f64(lo)
-    call.f64(hi)
+    call.int(lo)
+    call.int(hi)
     call.int(1 if has_min else 0)
     call.int(1 if has_max else 0)
     call.int(dst.numel)
@@ -2234,9 +2426,14 @@ def _b_clamp_out(
 ) raises:
     var self = _b_self(args[unsafe_offset=0], "clamp")
     var dest = _b_out_tensor(args[unsafe_offset=out_index], self.device)
-    _b_no_partial_overlap(dest, self)
+    _b_out_guard(dest, _b_tside(self), _b_tside(self))
+    # TORCH_META_FUNC(clamp) and clamp_min / clamp_max build a unary
+    # iterator: the out dtype is the result's own.
     _b_store_out(
-        rets, dest, _b_clamp(self, lo, hi, dest.copy(), single_bound_op)
+        rets,
+        dest,
+        _b_clamp(self, lo, hi, dest.copy(), single_bound_op),
+        exact_dtype=True,
     )
 
 
@@ -2496,6 +2693,12 @@ def op_addcmul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = _b_out_tensor(
         args[unsafe_offset=4], v_tensor(args[unsafe_offset=0]).device
     )
+    _b_out_guard3(
+        dest,
+        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=2]),
+    )
     _b_store_out(rets, dest, _b_addc("AddcmulBcast", args, True, dest.copy()))
 
 
@@ -2509,6 +2712,12 @@ def op_addcdiv(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_addcdiv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = _b_out_tensor(
         args[unsafe_offset=4], v_tensor(args[unsafe_offset=0]).device
+    )
+    _b_out_guard3(
+        dest,
+        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=2]),
     )
     _b_store_out(rets, dest, _b_addc("AddcdivBcast", args, False, dest.copy()))
 

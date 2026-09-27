@@ -22,8 +22,71 @@ def _scalar_to_tensor(input: MaxTensor, other: Scalar) -> MaxTensor:
     )
 
 
+# The custom ops whose Mojo math is a float32 port: `is_scalar_special` in
+# tmb/kernels/common/unary_math.mojo (scalar ports of the CUDA routines,
+# evaluated in float32 whatever the input dtype) and the pointwise kinds
+# whose eager op declines float64 (`f64_ok=False` in tmb/ops/pointwise.mojo).
+# A float64 graph must not reach them: its values would be float32 ones.
+# tests/test_float32_math_kinds.py keeps this list in sync with the Mojo.
+FLOAT32_MATH_OPS = frozenset(
+    {
+        "elementwise_airy_ai",
+        "elementwise_asin",
+        "elementwise_atan",
+        "elementwise_bessel_j0",
+        "elementwise_bessel_j1",
+        "elementwise_bessel_y0",
+        "elementwise_bessel_y1",
+        "elementwise_digamma",
+        "elementwise_entr",
+        "elementwise_erfc",
+        "elementwise_erfcx",
+        "elementwise_erfinv",
+        "elementwise_exp2",
+        "elementwise_expm1",
+        "elementwise_i0",
+        "elementwise_i0e",
+        "elementwise_i1",
+        "elementwise_i1e",
+        "elementwise_lgamma",
+        "elementwise_log10",
+        "elementwise_log_ndtr",
+        "elementwise_logit",
+        "elementwise_modified_bessel_i0",
+        "elementwise_modified_bessel_i1",
+        "elementwise_modified_bessel_k0",
+        "elementwise_modified_bessel_k1",
+        "elementwise_ndtri",
+        "elementwise_scaled_modified_bessel_k0",
+        "elementwise_scaled_modified_bessel_k1",
+        "elementwise_sinc",
+        "elementwise_spherical_bessel_j0",
+        "elementwise_trigamma",
+        "pointwise_igamma",
+        "pointwise_igammac",
+    }
+)
+
+
+def _refuse_float32_math(name: str, input: MaxTensor):
+    """Refuse a float64 computation of a float32-only custom op (an integer
+    input counts when the default dtype, which it promotes to, is float64),
+    rather than return float32-accurate values in a float64 tensor."""
+    if name not in FLOAT32_MATH_OPS:
+        return
+    promoted_f64 = (
+        not input.dtype.is_float() and torch.get_default_dtype() == torch.float64
+    )
+    if input.dtype == DType.float64 or promoted_f64:
+        raise NotImplementedError(
+            f"{name} computes in float32 on the mojo backend: float64 inputs "
+            "are not supported (they would silently lose precision)"
+        )
+
+
 def _same_type_binary(name: str, input: MaxTensor, other: MaxTensor) -> MaxTensor:
     """An ElementwiseBinaryOp over two operands of one dtype and shape."""
+    _refuse_float32_math(name, input)
     return F.custom(
         name=name,
         device=input.device,
@@ -138,6 +201,7 @@ def elementwise(
     ],
 ) -> MaxTensor:
     """Call shared unary math through MAX's fusible Mojo registrations."""
+    _refuse_float32_math(f"elementwise_{kind}", input)
     if (
         kind
         not in {

@@ -978,17 +978,26 @@ def _clamp_scalar[
 ](
     out_addr: Int,
     in_addr: Int,
-    lo: Float64,
-    hi: Float64,
+    lo: Int,
+    hi: Int,
     has_min: Int,
     has_max: Int,
     size: Int,
     ctx: DeviceContext,
 ) raises:
+    """`lo` / `hi` are the raw slots: a float64's bits for a floating
+    dtype, the integer itself for an integral one (an int64 bound past
+    2**53 has no exact float64)."""
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
-    var lo_s = lo.cast[dtype]()
-    var hi_s = hi.cast[dtype]()
+    var lo_s: Scalar[dtype]
+    var hi_s: Scalar[dtype]
+    comptime if dtype.is_floating_point():
+        lo_s = _raw_f64(lo).cast[dtype]()
+        hi_s = _raw_f64(hi).cast[dtype]()
+    else:
+        lo_s = Scalar[dtype](lo)
+        hi_s = Scalar[dtype](hi)
 
     @always_inline
     @__parameter
@@ -1025,8 +1034,8 @@ def _clamp_scalar_go(
     var dtype_val = _raw_dtype_int(dtype)
     var out_addr = _raw_int(out_ptr)
     var in_addr = _raw_int(in_ptr)
-    var lo_v = _raw_f64(lo)
-    var hi_v = _raw_f64(hi)
+    var lo_v = _raw_int(lo)
+    var hi_v = _raw_int(hi)
     var has_min_v = _raw_int(has_min)
     var has_max_v = _raw_int(has_max)
     var size = _raw_int(numel)
