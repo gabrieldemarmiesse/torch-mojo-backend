@@ -247,7 +247,18 @@ def _pointwise_binary(
     input: MaxTensor | Scalar,
     other: MaxTensor | Scalar,
     kind: Literal[
-        "atan2", "copysign", "fmax", "fmin", "fmod", "heaviside", "hypot", "nextafter"
+        "atan2",
+        "copysign",
+        "fmax",
+        "fmin",
+        "fmod",
+        "gcd",
+        "heaviside",
+        "hypot",
+        "lcm",
+        "lshift",
+        "nextafter",
+        "rshift",
     ],
     *,
     promote_float: bool,
@@ -1990,6 +2001,14 @@ def aten_bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.bitwise_and(input, other)
 
 
+# bitwise_left_shift.Tensor(Tensor self, Tensor other) -> Tensor
+@map_to(aten.bitwise_left_shift)
+def aten_bitwise_left_shift(
+    input: MaxTensor | Scalar, other: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(input, other, "lshift", promote_float=False)
+
+
 # bitwise_not(Tensor self) -> Tensor
 @map_to(aten.bitwise_not)
 def aten_bitwise_not(input: MaxTensor) -> MaxTensor:
@@ -2012,6 +2031,14 @@ def aten_bitwise_or(input: MaxTensor, other: MaxTensor) -> MaxTensor:
     other = _broadcast_to(other, final_shape)
 
     return custom_mojo_ops.bitwise_or(input, other)
+
+
+# bitwise_right_shift.Tensor(Tensor self, Tensor other) -> Tensor
+@map_to(aten.bitwise_right_shift)
+def aten_bitwise_right_shift(
+    input: MaxTensor | Scalar, other: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(input, other, "rshift", promote_float=False)
 
 
 # bitwise_xor.Scalar(Tensor self, Scalar other) -> Tensor
@@ -3189,6 +3216,13 @@ def _dim_coords(input: MaxTensor, dim: int, index: MaxTensor) -> MaxTensor:
     return F.stack(coords, axis=-1)
 
 
+# gcd(Tensor self, Tensor other) -> Tensor
+@map_to(aten.gcd)
+def aten_gcd(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """Euclid on the magnitudes (calc_gcd)."""
+    return _pointwise_binary(input, other, "gcd", promote_float=False)
+
+
 # ge.Scalar(Tensor self, Scalar other) -> Tensor
 # ge.Tensor(Tensor self, Tensor other) -> Tensor
 @map_to(aten.ge)
@@ -3548,6 +3582,13 @@ def aten_kthvalue(
             f"kthvalue(): selected number k out of range for dimension {axis}"
         )
     return _kth_smallest(self, k, axis, keepdim)
+
+
+# lcm(Tensor self, Tensor other) -> Tensor
+@map_to(aten.lcm)
+def aten_lcm(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """|a / gcd(a, b) * b|, 0 when both are 0."""
+    return _pointwise_binary(input, other, "lcm", promote_float=False)
 
 
 # le.Scalar(Tensor self, Scalar other) -> Tensor
