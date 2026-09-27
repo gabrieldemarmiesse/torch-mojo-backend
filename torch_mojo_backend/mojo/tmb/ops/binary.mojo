@@ -80,7 +80,10 @@ from tmb.ops.common import (
     cast_to,
     contiguous,
     copy_strided_into,
+    fill_value,
+    is_int_stype,
     resize_out,
+    scalar_to_int,
 )
 from tmb.ops.core import cast_for_copy
 from tmb.backend.registry import Site, impl
@@ -325,9 +328,9 @@ def _b_embed(s: Scal, st: Int32) raises -> Float64:
     if not _b_fillable(st):
         unsupported("a scalar operand against a tensor of dtype " + String(st))
     if s.is_int:
-        if abs(s.f) > MAX_EXACT_INT:
-            unsupported("an integer scalar too large to embed exactly")
-        if st == ST_BOOL and s.f != 0.0 and s.f != 1.0:
+        # An integer past 2**53 is exact in an integral fill
+        # (`_b_scalar_fill`) and rounds like torch's in a floating one.
+        if st == ST_BOOL and s.i != 0 and s.i != 1:
             unsupported("a non-boolean scalar against a bool tensor")
     elif not (_b_float3(st) or st == ST_FLOAT64):
         # A float scalar promotes an integer tensor to float in torch.
@@ -413,6 +416,22 @@ def _b_scalar_tensor(value: Float64, st: Int32, device: Int) raises -> Held:
         release(t.h)
         raise e
     return Held(t^, True)
+
+
+def _b_scalar_fill(s: Scal, st: Int32, device: Int) raises -> Held:
+    """`_b_scalar_tensor` of a Scalar operand in dtype `st`. An integer past
+    2**53 cannot ride the FillSpec kernel's float64 slot: it is stored
+    exactly from the int64 itself."""
+    var value = _b_embed(s, st)
+    if s.is_int and is_int_stype(st) and abs(s.i) > 9007199254740992:  # 2**53
+        var t = new_scalar(st, device)
+        try:
+            fill_value(t, Value(TAG_SCALAR_INT, 0, Int64(s.i), 0))
+        except e:
+            release(t.h)
+            raise e
+        return Held(t^, True)
+    return _b_scalar_tensor(value, st, device)
 
 
 def _b_copy_into(dst: T, src: T) raises:
@@ -906,7 +925,7 @@ def _b_binary(
         device = t.device
         dtype = _b_side_result(t, rhs.copy() if lhs.is_t else lhs.copy())
         _b_op_dtype_ok(op, dtype, is_cmp)
-        var fill = _b_scalar_tensor(_b_embed(s, dtype), dtype, device)
+        var fill = _b_scalar_fill(s, dtype, device)
         if lhs.is_t:
             a_h = _b_ready(t, dtype, False)
             b_h = fill^
@@ -1074,11 +1093,16 @@ def _b_alpha_as(alpha: Float64, lhs: Side, rhs: Side) raises -> Float64:
     return alpha
 
 
-def _b_scale(t: T, alpha: Float64, alpha_is_int: Bool) raises -> Held:
+def _b_scale(t: T, alpha: Float64, alpha_i: Optional[Int]) raises -> Held:
     """`t * alpha` as an owned temporary, in `t`'s own dtype (see
-    `_b_alpha_as` for the rounding this implies)."""
+    `_b_alpha_as` for the rounding this implies). `alpha_i` is an integer
+    alpha's exact value."""
     var side = _b_tside(t)
-    var a_side = _b_sside(Scal(alpha, Int(alpha), alpha_is_int, False))
+    var a_side = _b_sside(
+        Scal(alpha, alpha_i.value(), True, False) if alpha_i else Scal(
+            alpha, Int(alpha), False, False
+        )
+    )
     var scaled = _b_try_scalar("MulScalarSpec", side, a_side, False, None)
     if not scaled.__bool__():
         scaled = _b_try_int_scalar("MulScalarIntSpec", side, a_side, False)
@@ -1258,19 +1282,12 @@ def _b_no_overlap_side(written: T, side: Side) raises:
         _b_no_partial_overlap(written, side.t.value())
 
 
-def _b_same_view(a: T, b: T) -> Bool:
-    """`a` and `b` are the same view of the same memory -- how an `out=`
-    that IS one of the inputs looks from here (torch compares TensorImpls;
-    the boxed call hands the two records separately)."""
-    if a.h == b.h:
-        return True
-    return (
-        a.ptr == b.ptr
-        and a.stype == b.stype
-        and a.rank == b.rank
-        and a.same_shape(b)
-        and strides_equal(a.strides, b.strides, a.rank)
-    )
+def _b_same_tensor(a: T, b: T) -> Bool:
+    """`a` and `b` are the same tensor (`TensorBase::is_same`: one
+    TensorImpl) -- how an `out=` that IS one of the inputs looks from here.
+    The boxed call hands the two records separately, and pointer equality is
+    no substitute: independent empty tensors share a null data pointer."""
+    return a.h == b.h or a.impl() == b.impl()
 
 
 def _b_shape_list(shape: IndexList[MAX_RANK], rank: Int) -> String:
@@ -1308,7 +1325,7 @@ def _b_out_guard3(dest: T, a: Side, b: Side, c: Side) raises:
             continue
         var t = side.t.value().copy()
         _b_no_partial_overlap(dest, t)
-        if _b_same_view(dest, t):
+        if _b_same_tensor(dest, t):
             read_write = True
         rank = max(rank, t.rank)
         for i in range(MAX_RANK):
@@ -1363,12 +1380,41 @@ def _b_add_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
     return _b_binary("AddSpec", lhs, rhs, Int32(-1), dst)
 
 
+def _b_alpha_int(alpha_v: Value, lhs: Side, rhs: Side) raises -> Optional[Int]:
+    """An integer alpha, exact (never through a float), when the add/sub
+    computes in an integral dtype -- checked against that dtype as ATen's
+    `alpha.to<scalar_t>()` checks it (int8 `sub(x, 1, alpha=300)` raises).
+    None for a float alpha or a floating result."""
+    if not _b_scalar_is_int(alpha_v) or not (lhs.is_t or rhs.is_t):
+        return None
+    var common: Int32
+    if lhs.is_t and rhs.is_t:
+        common = _b_promote(lhs.t.value(), rhs.t.value())
+    elif lhs.is_t:
+        common = _b_side_result(lhs.t.value(), rhs)
+    else:
+        common = _b_side_result(rhs.t.value(), lhs)
+    if not is_int_stype(common):
+        return None
+    return scalar_to_int(alpha_v, common)
+
+
+def _b_scaled_scalar(s: Scal, alpha: Float64, alpha_i: Optional[Int]) -> Scal:
+    """A Scalar operand times alpha: exact (wrapping, as int64 math does)
+    when both are integers."""
+    if s.is_int and alpha_i:
+        var i = s.i * alpha_i.value()
+        return Scal(Float64(i), i, True, False)
+    var v = s.f * alpha
+    return Scal(v, Int(v), False, False)
+
+
 def _b_add(
     lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
 ) raises -> Res:
     """The `fast_aten_add` cascade."""
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
-    var alpha_int = _b_scalar_is_int(alpha_v)
+    var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
     if lhs.is_t and dev(lhs.t.value().device)[].api == "metal":
         var metal = _b_try_apple_add(lhs, rhs, alpha)
         if metal.__bool__():
@@ -1379,11 +1425,10 @@ def _b_add(
         var s = rhs.s.value().copy()
         if s.is_bool:
             unsupported("a bool scalar operand with alpha != 1")
-        var v = s.f * alpha
-        var scaled_s = _b_sside(Scal(v, Int(v), s.is_int and alpha_int, False))
+        var scaled_s = _b_sside(_b_scaled_scalar(s, alpha, alpha_i))
         scaled_s.zero_st = rhs.zero_st
         return _b_add_routes(lhs, scaled_s^, dst)
-    var scaled = _b_scale(rhs.t.value(), alpha, alpha_int)
+    var scaled = _b_scale(rhs.t.value(), alpha, alpha_i)
     var res = _b_add_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
     return res^
@@ -1405,18 +1450,17 @@ def _b_sub(
 ) raises -> Res:
     """The `fast_aten_sub` cascade."""
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
-    var alpha_int = _b_scalar_is_int(alpha_v)
+    var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
     if alpha == 1.0:
         return _b_sub_routes(lhs, rhs, dst)
     if not rhs.is_t:
         var s = rhs.s.value().copy()
         if s.is_bool:
             unsupported("a bool scalar operand with alpha != 1")
-        var v = s.f * alpha
-        var scaled_s = _b_sside(Scal(v, Int(v), s.is_int and alpha_int, False))
+        var scaled_s = _b_sside(_b_scaled_scalar(s, alpha, alpha_i))
         scaled_s.zero_st = rhs.zero_st
         return _b_sub_routes(lhs, scaled_s^, dst)
-    var scaled = _b_scale(rhs.t.value(), alpha, alpha_int)
+    var scaled = _b_scale(rhs.t.value(), alpha, alpha_i)
     var res = _b_sub_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
     return res^
@@ -2384,9 +2428,8 @@ def _b_clamp_bound(v: Value, result_stype: Int32) raises -> Int:
     """A clamp bound as `_b_clamp_launch`'s raw slot."""
     if _b_is_floating(result_stype):
         return Int(f64_bits(v_f64(v)))
-    if _b_scalar_is_int(v):
-        return v_int(v)
-    return Int(v_f64(v))
+    # `Scalar::to<scalar_t>()`: exact, and checked against the dtype.
+    return scalar_to_int(v, result_stype)
 
 
 def _b_clamp_launch(
@@ -2582,7 +2625,7 @@ def _b_addc(
             _b_no_partial_overlap(dest, a)
             _b_no_partial_overlap(dest, b)
             _b_no_partial_overlap(dest, c)
-            if dest.ptr == a.ptr and a.dtype == DType.float32:
+            if _b_same_tensor(dest, a) and a.dtype == DType.float32:
                 var selves = List[T]()
                 var firsts = List[T]()
                 var seconds = List[T]()
@@ -2752,7 +2795,7 @@ def _b_lerp(args: Values, dst: Optional[T] = None) raises -> Res:
         var dest = dst.value().copy()
         if (
             dest.stype == start.stype
-            and dest.ptr == start.ptr
+            and _b_same_tensor(dest, start)
             and dest.contig
             and start.contig
             and finish.contig

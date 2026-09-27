@@ -576,6 +576,52 @@ def is_int_stype(st: Int32) -> Bool:
     )
 
 
+def scalar_to_int(v: Value, st: Int32) raises -> Int:
+    """An ATen Scalar as integral dtype `st`'s value, never through a float
+    when it is an integer: `Scalar::to<scalar_t>()` (c10's checked_convert).
+    A float truncates. Out of range raises as c10 does, except that an
+    unsigned type takes a negative value down to minus its maximum (two's
+    complement wrap, `c10::overflows`); the result is the exact integer, which
+    the caller narrows into `st`."""
+    var lo = Int.MIN
+    var hi = Int.MAX
+    var name = String("int64_t")
+    if st == ST_INT8:
+        lo = -128
+        hi = 127
+        name = "int8_t"
+    elif st == ST_INT16:
+        lo = -32768
+        hi = 32767
+        name = "int16_t"
+    elif st == ST_INT32:
+        lo = -2147483648
+        hi = 2147483647
+        name = "int"
+    elif st == ST_UINT8:
+        lo = -255
+        hi = 255
+        name = "uint8_t"
+    if v_scalar_is_integral(v):
+        var i = v_int(v)
+        if i < lo or i > hi:
+            raise Error(
+                "value cannot be converted to type ", name, " without overflow"
+            )
+        return i
+    var f = v_f64(v)
+    # A float truncates toward zero: anything strictly inside (lo - 1,
+    # hi + 1) lands in range; int64's bounds are powers of two, exact.
+    var ok = f > Float64(lo) - 1.0 and f < Float64(hi) + 1.0
+    if st == ST_INT64:
+        ok = f >= -9223372036854775808.0 and f < 9223372036854775808.0
+    if not ok:
+        raise Error(
+            "value cannot be converted to type ", name, " without overflow"
+        )
+    return Int(f)
+
+
 def known_stype(st: Int32) -> Bool:
     return is_float_stype(st) or is_int_stype(st) or st == ST_BOOL
 

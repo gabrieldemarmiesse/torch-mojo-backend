@@ -33,6 +33,7 @@ from tmb.backend.abi import (
     T,
     TAG_NONE,
     Value,
+    bits_f64,
     Values,
     default_dtype,
     dtype_name,
@@ -68,7 +69,6 @@ from tmb.ops.binary import (
     _b_out_guard3,
     _b_no_partial_overlap,
     _b_ret,
-    _b_scalar_is_int,
     _b_self,
     _b_side,
     _b_sside,
@@ -94,6 +94,7 @@ from tmb.ops.common import (
     known_stype as _pw_known,
     promote_types,
     resize_out,
+    scalar_to_int,
 )
 from tmb.ops.random import _draw
 from tmb.ops.core import cast_for_copy
@@ -241,8 +242,11 @@ def _pw_flat(
 ) raises -> _Flat:
     if not side.is_t:
         var s = side.s.value().copy()
-        if s.is_int and abs(s.f) > 9007199254740992.0:
-            unsupported("an integer scalar too large to embed exactly")
+        if _pw_is_int(compute):
+            # An integer operand travels as its int64 bits in the float64
+            # slot (see `_host_value`), exact across int64.
+            var i = s.i if s.is_int else Int(s.f)
+            return _Flat(MODE_HOST, 0, bits_f64(Int64(i)))
         return _Flat(MODE_HOST, 0, s.f)
     var t = side.t.value().copy()
     var flat = _Flat(MODE_FULL, 0, 0.0)
@@ -1581,18 +1585,25 @@ def op_hardswish_backward(
 
 
 def _int_exact_param(v: Value, st: Int32) raises -> Float64:
-    """A Scalar parameter of an op that applies it in scalar_t: on an
-    integer tensor it reaches the kernel as an int64 (`param_dtype`), from a
-    float64 slot, which holds every integer up to 2**53 exactly -- a larger
-    one is declined rather than rounded."""
-    var f = v_f64(v)
-    if _pw_is_int(st) and _b_scalar_is_int(v) and abs(f) > 9007199254740992.0:
-        unsupported("an integer parameter too large to pass exactly")
-    return f
+    """A Scalar parameter of an op that applies it in scalar_t. On an
+    integer tensor it travels as the int64's bits in the float64 slot (the
+    kernel reads it back as `param_dtype`, int64): exact across int64, never
+    through a float, and checked against the dtype as
+    `Scalar::to<scalar_t>()` checks it."""
+    if _pw_is_int(st):
+        return bits_f64(Int64(scalar_to_int(v, st)))
+    return v_f64(v)
 
 
 def _hardtanh_p(args: Values, i: Int) raises -> SIMD[DType.float64, 4]:
     var st = _self_stype(args, 0)
+    if st == ST_UINT8 and (
+        v_f64(args[unsafe_offset=i]) < 0.0
+        or v_f64(args[unsafe_offset=i + 1]) < 0.0
+    ):
+        raise Error(
+            "cannot do hardtanh on an unsigned type with negative limits"
+        )
     return _p(
         _int_exact_param(args[unsafe_offset=i], st),
         _int_exact_param(args[unsafe_offset=i + 1], st),

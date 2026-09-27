@@ -624,6 +624,7 @@ void* tmb_tensor_storage_ctx(TmbTensor t) {
 int64_t tmb_tensor_storage_nbytes(TmbTensor t) { return static_cast<int64_t>(T(t).storage().nbytes()); }
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
 int32_t tmb_tensor_is_neg(TmbTensor t) { return T(t).is_neg(); }
+void* tmb_tensor_impl(TmbTensor t) { return T(t).unsafeGetTensorImpl(); }
 int32_t tmb_tensor_is_wrapped_number(TmbTensor t) { return T(t).unsafeGetTensorImpl()->is_wrapped_number(); }
 int32_t tmb_tensor_requires_grad(TmbTensor t) { return T(t).requires_grad(); }
 void tmb_tensor_bump_version(TmbTensor t) { T(t).unsafeGetTensorImpl()->bump_version(); }
