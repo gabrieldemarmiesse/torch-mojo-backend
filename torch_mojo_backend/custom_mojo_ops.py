@@ -64,6 +64,7 @@ FLOAT32_MATH_OPS = frozenset(
         "elementwise_trigamma",
         "pointwise_igamma",
         "pointwise_igammac",
+        "polygamma",
     }
 )
 
@@ -324,7 +325,11 @@ def pointwise_binary(
 
 def polygamma(n: int, input: MaxTensor) -> MaxTensor:
     """polygamma(n, x) for n >= 2 (`tmb/graph/elementwise.mojo`'s binary
-    `polygamma`, n broadcast as a float operand)."""
+    `polygamma`, n broadcast as a float operand). The kernel computes in
+    float32, so a half input goes through float32 unchanged in value: n
+    then stays exact up to 2^24, where bfloat16 would round 257 to 256."""
+    if input.dtype in (DType.float16, DType.bfloat16):
+        return F.cast(polygamma(n, F.cast(input, DType.float32)), input.dtype)
     return _same_type_binary("polygamma", _scalar_to_tensor(input, n), input)
 
 

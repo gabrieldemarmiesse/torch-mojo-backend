@@ -338,6 +338,41 @@ def test_mvlgamma(mojo_gpu: str, dtype: torch.dtype, p: int):
     torch.testing.assert_close(out.cpu(), torch.mvlgamma(x, p))
 
 
+@pytest.mark.parametrize("name", ("polygamma", "mvlgamma"))
+def test_polygamma_mvlgamma_out_casts(mojo_gpu: str, name: str):
+    """polygamma.out (a unary_float_op iterator) and mvlgamma.out (a `copy_`)
+    cast the float32 result into a float16 or float64 `out`, and refuse an
+    integer one."""
+    x = torch.linspace(1.1, 9.0, 12)
+
+    def call(t: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        if name == "polygamma":
+            return torch.polygamma(2, t, out=out)
+        return torch.mvlgamma(t, 2, out=out)
+
+    for dtype in (torch.float16, torch.float64):
+        want = call(x, torch.empty(0, dtype=dtype))
+        out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+        call(x.to(mojo_gpu), out)
+        assert out.dtype == dtype
+        torch.testing.assert_close(out.cpu(), want, rtol=2e-3, atol=1e-5)
+    strided = torch.zeros(24, dtype=torch.float16, device=mojo_gpu)[::2]
+    call(x.to(mojo_gpu), strided)
+    torch.testing.assert_close(
+        strided.cpu(), call(x, torch.empty(0, dtype=torch.float16))
+    )
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        call(x.to(mojo_gpu), torch.empty(12, dtype=torch.int64, device=mojo_gpu))
+
+
+def test_mvlgamma_rejects_bool(mojo_gpu: str):
+    with pytest.raises(RuntimeError, match="may not be a boolean tensor"):
+        torch.mvlgamma(torch.tensor([True, False]).to(mojo_gpu), 1)
+    out = torch.empty(2, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="may not be a boolean tensor"):
+        torch.mvlgamma(torch.tensor([True, False]).to(mojo_gpu), 1, out=out)
+
+
 def test_polygamma_rejects_negative_n(mojo_gpu: str):
     with pytest.raises(RuntimeError):
         torch.polygamma(-1, torch.ones(3).to(mojo_gpu))

@@ -4301,6 +4301,8 @@ def _batch_norm_batch_stats(input: MaxTensor) -> tuple[MaxTensor, MaxTensor]:
 def aten_mvlgamma(x: MaxTensor, p: int) -> MaxTensor:
     """ATen's composition (UnaryOps.cpp): sum_j lgamma(x + (1 - p)/2 + j/2)
     + p (p - 1) log(pi) / 4."""
+    if x.dtype == DType.bool:
+        raise ValueError("The input tensor may not be a boolean tensor.")
     if p < 1:
         raise ValueError("p has to be greater than or equal to 1")
     if not x.dtype.is_float():

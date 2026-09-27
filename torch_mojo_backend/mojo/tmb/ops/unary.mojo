@@ -1455,10 +1455,38 @@ def _param_unary(
 
 
 def _param_unary_out(
-    op: String, t_in: T, mut dst: T, p0: Float64, p1: Float64, p2: Float64
+    op: String,
+    t_in: T,
+    mut dst: T,
+    p0: Float64,
+    p1: Float64,
+    p2: Float64,
+    cast_ok: Bool = False,
 ) raises:
     """`_unary_out` for the parameterized route (also the in-place one: dst
-    may be t_in itself)."""
+    may be t_in itself). `cast_ok` is `_unary_out`'s: the unary_float_op
+    iterators (logit, polygamma) and mvlgamma's `copy_` cast the result into
+    an `out` of any dtype it `canCast`s to; round.decimals and nan_to_num
+    want the input dtype itself."""
+    if cast_ok and dst.stype != t_in.stype:
+        if not can_cast(t_in.stype, dst.stype):
+            raise Error(
+                "result type ",
+                dtype_name(t_in.stype),
+                " can't be cast to the desired output type ",
+                dtype_name(dst.stype),
+            )
+        one_device(t_in, dst)
+        assert_no_internal_overlap(dst)
+        _no_partial_overlap(dst, t_in)
+        if not dst.same_shape(t_in):
+            resize_out(dst, t_in.shape, t_in.rank)
+        var result = own(_param_unary(op, t_in, p0, p1, p2))
+        var casted = own(cast_for_copy(result.t, dst.stype))
+        copy_strided_into(dst, casted.t)
+        _ = casted^  # alive past the launch
+        _ = result^
+        return
     _out_prologue(t_in, dst, t_in.stype)
     var src = contiguous(t_in)
     if dst.contig:
@@ -1586,7 +1614,9 @@ def op_polygamma_out(
     var dst = v_tensor(args[unsafe_offset=2])
     var src = own_if_new(_promote(t), t)
     _polygamma_check(n, src.t)
-    _param_unary_out("PolygammaSpec", src.t, dst, Float64(n), 0.0, 0.0)
+    _param_unary_out(
+        "PolygammaSpec", src.t, dst, Float64(n), 0.0, 0.0, cast_ok=True
+    )
     ret_ref(rets, 0, dst)
 
 
@@ -1594,6 +1624,12 @@ def _mvlgamma_constant(p: Int) -> Float64:
     """The `add_(p * (p - 1) * log(pi) / 4)` of UnaryOps.cpp `mvlgamma`, in
     double on the host (the add kernel rounds it to float)."""
     return Float64(p) * Float64(p - 1) * 1.1447298858494002 / 4
+
+
+def _mvlgamma_no_bool(t: T) raises:
+    """UnaryOps.cpp `mvlgamma_check` refuses bool before any promotion."""
+    if t.dtype == DType.bool:
+        raise Error("The input tensor may not be a boolean tensor.")
 
 
 def _mvlgamma_check(p: Int, t: T) raises:
@@ -1608,6 +1644,7 @@ def _mvlgamma_check(p: Int, t: T) raises:
 def op_mvlgamma(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var p = v_int(args[unsafe_offset=1])
+    _mvlgamma_no_bool(t)
     var src = own_if_new(_promote(t), t)
     _mvlgamma_check(p, src.t)
     var out = own(
@@ -1625,10 +1662,17 @@ def op_mvlgamma_out(
     var t = v_tensor(args[unsafe_offset=0])
     var p = v_int(args[unsafe_offset=1])
     var dst = v_tensor(args[unsafe_offset=2])
+    _mvlgamma_no_bool(t)
     var src = own_if_new(_promote(t), t)
     _mvlgamma_check(p, src.t)
     _param_unary_out(
-        "MvlgammaSpec", src.t, dst, Float64(p), _mvlgamma_constant(p), 0.0
+        "MvlgammaSpec",
+        src.t,
+        dst,
+        Float64(p),
+        _mvlgamma_constant(p),
+        0.0,
+        cast_ok=True,
     )
     ret_ref(rets, 0, dst)
 

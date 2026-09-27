@@ -5861,6 +5861,35 @@ def test_aten_isinf_ldexp_compiled(device: str):
         checker.check_was_called()
 
 
+def test_aten_polygamma_mvlgamma_compiled_edges(device: str):
+    """polygamma's order past bfloat16's exact integers (257 would read as
+    256 in a bfloat16 operand: -inf instead of +inf), float64 refused rather
+    than computed in float32, and mvlgamma refusing bool, all against CPU
+    torch."""
+    x = torch.tensor([0.125, 0.5, 3.0], dtype=torch.bfloat16)
+    compiled = torch.compile(
+        lambda t: aten.polygamma(257, t), backend=mojo_backend, fullgraph=True
+    )
+    torch.testing.assert_close(
+        compiled(x.to(device)).cpu(), torch.polygamma(257, x), equal_nan=True
+    )
+    torch.compiler.reset()
+    x64 = torch.tensor([1e-50, 0.5], dtype=torch.float64, device=device)
+    compiled = torch.compile(
+        lambda t: aten.polygamma(2, t), backend=mojo_backend, fullgraph=True
+    )
+    with pytest.raises(Exception, match="float64 inputs are not supported"):
+        compiled(x64)
+    torch.compiler.reset()
+    b = torch.tensor([True, False], device=device)
+    compiled = torch.compile(
+        lambda t: aten.mvlgamma(t, 1), backend=mojo_backend, fullgraph=True
+    )
+    with pytest.raises(Exception, match="may not be a boolean tensor"):
+        compiled(b)
+    torch.compiler.reset()
+
+
 def test_aten_ldexp_compiled_edges(device: str):
     """Integral self and exponent (a default-float result), non-finite float
     exponents, and a float16 self with a 0-d float64 exponent."""
