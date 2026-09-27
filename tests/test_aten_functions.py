@@ -5541,6 +5541,16 @@ def test_aten_elu_compiled_intermediates(dtype: torch.dtype):
         _compiled_matches_cpu(lambda a: aten.elu(a, 1e4, 1.0, 1e-4), [x])
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_aten_leaky_relu_compiled_slope_in_opmath(dtype: torch.dtype):
+    """leaky_relu's slope stays in float32 opmath for the half dtypes: a
+    slope of 1e5 is not float16 inf, nor one of 1e-8 zero."""
+    x = torch.tensor([-1e-4, -2.0, 3.0]).to(dtype)
+    _compiled_matches_cpu(lambda a: aten.leaky_relu(a, 1e5), [x])
+    y = torch.tensor([-1e4, -3e4, 3.0]).to(dtype)
+    _compiled_matches_cpu(lambda a: aten.leaky_relu(a, 1e-8), [y])
+
+
 def test_aten_hardtanh_nan_bounds_compiled():
     """hardtanh is two-bound clamp: a NaN bound fills NaN."""
     nan = math.nan

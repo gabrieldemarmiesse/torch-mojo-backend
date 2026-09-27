@@ -3728,7 +3728,14 @@ def aten_le(input: MaxTensor, other: Scalar | MaxTensor) -> MaxTensor:
 # leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
 @map_to(aten.leaky_relu)
 def aten_leaky_relu(input: MaxTensor, negative_slope: float = 0.01) -> MaxTensor:
-    return _where(input > 0, input, input * negative_slope)
+    """x > 0 ? x : x * negative_slope, with the slope and the product in
+    opmath (float32 for the half dtypes): a float16 slope of 1e5 would be
+    inf, and one of 1e-8 zero."""
+    dtype = input.dtype
+    if dtype in (DType.float16, DType.bfloat16):
+        input = F.cast(input, DType.float32)
+    result = _where(input > 0, input, input * negative_slope)
+    return result if result.dtype == dtype else F.cast(result, dtype)
 
 
 # linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor

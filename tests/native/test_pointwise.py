@@ -1097,6 +1097,16 @@ def test_hardtanh_nan_bound(mojo_gpu, bounds):
     _close(inplace, want)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_leaky_relu_slope_in_opmath(mojo_gpu, dtype):
+    # Stock MPS holds the slope in the input dtype (ActivationKernel.metal:
+    # REGISTER_UNARY_ALPHA_OP(leaky_relu, half, half, half)), as Apple GPUs do.
+    skip_if_metal(mojo_gpu, "MPS keeps leaky_relu's slope in the input dtype")
+    for x, slope in [([-1e-4, -2.0, 3.0], 1e5), ([-1e4, -3e4, 3.0], 1e-8)]:
+        x_cpu = torch.tensor(x).to(dtype)
+        _close(F.leaky_relu(x_cpu.to(mojo_gpu), slope), F.leaky_relu(x_cpu, slope))
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64])
 def test_elu_intermediates(mojo_gpu, dtype):
     """elu's float opmath for the half dtypes and float64's large expm1."""
