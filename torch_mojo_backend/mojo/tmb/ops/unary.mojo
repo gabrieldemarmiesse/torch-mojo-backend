@@ -1886,7 +1886,7 @@ def _signed_inf_out(op: String, t: T, mut dst: T) raises:
     if t.dtype.is_floating_point():
         _bool_unary_out(op, t, dst)
         return
-    _one_device(t, dst)
+    one_device(t, dst)
     if dst.stype != torch_dtype(DType.bool):
         raise Error(
             "expected an out= tensor of dtype ",
