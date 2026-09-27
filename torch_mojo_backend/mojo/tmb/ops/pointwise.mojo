@@ -2783,6 +2783,10 @@ def register_pointwise(site: Site) raises:
     impl[op_heaviside_out, "heaviside.out"](site)
     impl[op_hypot, "hypot"](site)
     impl[op_hypot_out, "hypot.out"](site)
+    impl[op_igamma, "igamma"](site)
+    impl[op_igamma_out, "igamma.out"](site)
+    impl[op_igammac, "igammac"](site)
+    impl[op_igammac_out, "igammac.out"](site)
     impl[op_lcm, "lcm"](site)
     impl[op_lcm_out, "lcm.out"](site)
     impl[op_leaky_relu, "leaky_relu"](site)
@@ -2912,3 +2916,5 @@ comptime op_special_shifted_chebyshev_polynomial_w_out = op_poly[
 def _register_special(site: Site) raises:
     impl[op_special_xlog1py, "special_xlog1py"](site)
     impl[op_special_xlog1py_out, "special_xlog1py.out"](site)
+    impl[op_special_zeta, "special_zeta"](site)
+    impl[op_special_zeta_out, "special_zeta.out"](site)

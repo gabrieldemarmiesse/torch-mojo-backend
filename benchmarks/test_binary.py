@@ -153,6 +153,9 @@ COVERS: dict[str, str] = (
         "aten::lerp.Tensor": "test_lerp_tensor",
         "aten::ldexp.Tensor": "test_ldexp",
         "aten::pow.Scalar": "test_pow_scalar_base",
+        "aten::special_zeta": "test_zeta",
+        "aten::igamma": "test_igamma",
+        "aten::igammac": "test_igamma",
         "aten::addcdiv": "test_addcdiv",
         "aten::addcdiv.out": "test_addcdiv_inplace",
         "aten::addcdiv_": "test_addcdiv_inplace",
@@ -239,6 +242,8 @@ SKIPPED: dict[str, str] = {
     "aten::hardtanh_backward.grad_input": _OUT,
     "aten::heaviside.out": _OUT,
     "aten::hypot.out": _OUT,
+    "aten::igamma.out": _OUT,
+    "aten::igammac.out": _OUT,
     "aten::lcm.out": _OUT,
     "aten::ldexp.out": _OUT,
     "aten::ldexp_": _OUT,
@@ -264,6 +269,7 @@ SKIPPED: dict[str, str] = {
     "aten::softplus_backward.grad_input": _OUT,
     "aten::softshrink_backward.grad_input": _OUT,
     "aten::special_xlog1py.out": _OUT,
+    "aten::special_zeta.out": _OUT,
     "aten::xlogy.OutTensor": _OUT,
 }
 
@@ -728,6 +734,50 @@ def test_ldexp(
         lambda: torch.ldexp(x_ref, e_ref),
         lambda: torch.ldexp(x_our, e_our),
         flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("special_zeta")
+def test_zeta(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]) + 1.5, hw, mojo_device)
+    q_ref, q_our = both(unit_interval(shape, DTYPES[dtype_id]) + 0.5, hw, mojo_device)
+    bench.run(
+        lambda: torch.special.zeta(x_ref, q_ref),
+        lambda: torch.special.zeta(x_our, q_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+# Stock torch has float32/float64 kernels only (IGammaKernel.cu).
+IGAMMA_OPS = {"igamma": torch.igamma, "igammac": torch.igammac}
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(IGAMMA_OPS))
+def test_igamma(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """a in (0.5, 10.5) and x in (0.5, 10.5): the series, the continued
+    fraction and (a ~ x) the regimes between them."""
+    fn = IGAMMA_OPS[op_name]
+    shape = SHAPES[shape_id]
+    a = unit_interval(shape, DTYPES[dtype_id]) * 10 + 0.5
+    x = unit_interval(shape, DTYPES[dtype_id]).flip(-1) * 10 + 0.5
+    a_ref, a_our = both(a, hw, mojo_device)
+    x_ref, x_our = both(x, hw, mojo_device)
+    bench.run(
+        lambda: fn(a_ref, x_ref), lambda: fn(a_our, x_our), flops=float(a.numel())
     )
 
 

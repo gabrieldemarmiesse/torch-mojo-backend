@@ -167,8 +167,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "histogram": ("float32",),
     "histogramdd": ("float32",),
     "i0": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "igamma": ("float32", "bfloat16", "float16"),
-    "igammac": ("float32", "bfloat16", "float16"),
     "index_copy": ("float32", "bfloat16", "float16", "int64", "bool"),
     "index_fill": ("float32", "bfloat16", "float16", "int64", "bool"),
     "index_put": ("float32", "bfloat16", "float16", "int64", "bool"),
