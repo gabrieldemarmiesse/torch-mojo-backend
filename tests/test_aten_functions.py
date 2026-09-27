@@ -5588,6 +5588,32 @@ def test_aten_ldexp_compiled_edges(device: str):
     torch.testing.assert_close(compiled_half(h, e), aten.ldexp(h, e))
 
 
+def test_aten_ldexp_compiled_pow_dtype(device: str):
+    """The compiled _pow2 runs pow in ATen's pow dtype and rounds it to mul's
+    rank-aware common dtype: float16 2^16 is inf against a float64 self,
+    and a 0-d float64 2^128 is inf against a float32 self while 2^127.999999
+    stays finite."""
+
+    def fn(
+        d: torch.Tensor,
+        h: torch.Tensor,
+        x: torch.Tensor,
+        e: torch.Tensor,
+        n: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        return aten.ldexp(d, h), aten.ldexp(x, e), aten.ldexp(x, n)
+
+    d = torch.tensor([0.5, 0.0], dtype=torch.float64, device=device)
+    h = torch.tensor([16.0, 16.0], dtype=torch.float16, device=device)
+    x = torch.tensor([0.5, 0.0], device=device)
+    e = torch.tensor(128.0, dtype=torch.float64, device=device)
+    n = torch.tensor(127.999999, dtype=torch.float64, device=device)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for got, want in zip(compiled(d, h, x, e, n), fn(d, h, x, e, n), strict=True):
+        assert got.dtype == want.dtype
+        torch.testing.assert_close(got, want, equal_nan=True, rtol=0.0, atol=0.0)
+
+
 @pytest.mark.parametrize("name", ["deg2rad", "rad2deg"])
 def test_aten_deg2rad_rad2deg(conf: Conf, call_checker: CallChecker, name: str):
     call_checker.register(f"aten::{name}")

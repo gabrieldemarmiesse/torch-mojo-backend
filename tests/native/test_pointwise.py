@@ -820,6 +820,36 @@ def test_ldexp_zero_dim_float_exponent(mojo_gpu, dtype, edtype, where):
     _close(got, torch.ldexp(x, e), rtol=0.0, atol=0.0)
 
 
+def test_ldexp_pow_rounds_to_mul_dtype(mojo_gpu):
+    """_pow2 runs pow in its own dtype and mul casts that result to its
+    rank-aware common dtype: a 0-d float64 2^127.999999 stays finite in
+    float32 (the exponent is not read back as float32 128.0), a 0-d float64
+    2^128 is inf against a float32 self, in place too, and a float16
+    exponent of 16 is inf even against a float64 self."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    one = torch.tensor([1.0, -1.0])
+    near = torch.tensor(127.999999, dtype=torch.float64)
+    _close(
+        torch.ldexp(one.to(mojo_gpu), near.to(mojo_gpu)),
+        torch.ldexp(one, near),
+        rtol=0.0,
+        atol=0.0,
+    )
+    x = torch.tensor([0.5, 0.0])
+    e = torch.tensor(128.0, dtype=torch.float64)
+    want = torch.ldexp(x, e)
+    _close(torch.ldexp(x.to(mojo_gpu), e.to(mojo_gpu)), want, rtol=0.0, atol=0.0)
+    inplace = x.to(mojo_gpu)
+    inplace.ldexp_(e.to(mojo_gpu))
+    _close(inplace, x.clone().ldexp_(e), rtol=0.0, atol=0.0)
+    d = torch.tensor([0.5, 0.0], dtype=torch.float64)
+    h = torch.tensor([16.0, 16.0], dtype=torch.float16)
+    want = torch.ldexp(d, h)
+    got = torch.ldexp(d.to(mojo_gpu), h.to(mojo_gpu))
+    assert got.dtype == want.dtype
+    _close(got, want, rtol=0.0, atol=0.0)
+
+
 def test_frexp_rejects_overlapping_out(mojo_gpu):
     x = torch.rand(3, device=mojo_gpu)
     exponent = torch.empty(3, dtype=torch.int32, device=mojo_gpu)

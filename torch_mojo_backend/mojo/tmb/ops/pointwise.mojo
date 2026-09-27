@@ -2194,6 +2194,16 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
             ),
         )
         return
+    _pw_ldexp_pow2(rets, a, b, e_st, e_rank, dest)
+
+
+def _pw_ldexp_pow2(
+    rets: Values, a: Side, b: Side, e_st: Int32, e_rank: Int, dest: Optional[T]
+) raises:
+    """`self * _pow2(self, other)` as one `ldexp_pow2` launch: pow runs in
+    its own result dtype `pdt`, and mul's TensorIterator casts that result
+    to mul's rank-aware common dtype before the product."""
+    var x = a.t.value().copy()
     # _pow2: pow(2.0, other) for an integral or float32 self (a Python
     # float base: an integral exponent gives the default dtype), else
     # full({}, 2.0, self.dtype).pow(other), promoted as a 0-d tensor.
@@ -2220,14 +2230,23 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
         unsupported("ldexp on dtype " + String(compute))
     var kernel_compute = compute
     var narrow = pdt
-    if (compute == ST_FLOAT16 or compute == ST_BFLOAT16) and pdt != compute:
-        # A wider 0-d pow result against a half self: the exponent is not
-        # narrowed to the half dtype first (pow runs in pdt), and mul's
-        # TensorIterator casts the pow result to the half common dtype
-        # before the float opmath product. Reading the exponent as the half
-        # dtype instead turned 2^15.999 into 2^16 = inf in float16.
-        kernel_compute = ST_FLOAT32
+    if pdt != compute and promote_types(pdt, compute) != compute:
+        # A pow result wider than mul's common dtype (a 0-d float64 exponent
+        # against a float32 or half self): the exponent is not narrowed
+        # first, pow runs in pdt, and its result is rounded to the common
+        # dtype before the product. Reading the exponent as the narrower
+        # dtype instead turned 2^15.999 into 2^16 = inf in float16, and
+        # 2^127.999999 into 2^128 = inf in float32.
+        kernel_compute = promote_types(promote_types(pdt, compute), ST_FLOAT32)
         narrow = compute
+        if kernel_compute == ST_FLOAT64:
+            # Metal has no double: a CPU 0-d float64 exponent's pow runs in
+            # float32 there, within a few ulps except right at float32's
+            # overflow edge.
+            var ctx = ctx_for(x.device)
+            if ctx.api() == "metal":
+                kernel_compute = ST_FLOAT32
+            _ = ctx
     var params = _p(_pw_narrow_code(narrow, kernel_compute))
     _pw_finish(
         rets,
@@ -2284,25 +2303,7 @@ def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             ),
         )
         return
-    var pdt = e.stype
-    if self.stype != ST_FLOAT32 and e.rank == 0:
-        pdt = promote_types(self.stype, e.stype)
-    var compute = promote_types(self.stype, pdt)
-    _pw_finish(
-        rets,
-        dest,
-        _pw_run(
-            "ldexp_pow2",
-            2,
-            a,
-            b,
-            _none_side(),
-            compute,
-            compute,
-            _p(_pw_narrow_code(pdt, compute)),
-            dest,
-        ),
-    )
+    _pw_ldexp_pow2(rets, a, b, e.stype, e.rank, dest)
 
 
 # ---------------------------------------------------------------------------

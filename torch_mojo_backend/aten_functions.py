@@ -3625,24 +3625,28 @@ def aten_ldexp(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         rhs = _broadcast_to(F.cast(other, compute), shape)
         result = custom_mojo_ops.pointwise_binary(lhs, rhs, "ldexp")
         return result if compute == input.dtype else F.cast(result, input.dtype)
-    # The result dtype, rank-aware like ATen (a 0-d float64 exponent keeps a
-    # float16 self float16), read off ATen's own meta composite.
-    result_dtype = torch.ldexp(
-        torch.empty((0,) * len(input.shape), dtype=in_dtype, device="meta"),
-        torch.empty((0,) * len(other.shape), dtype=ex_dtype, device="meta"),
-    ).dtype
-    if not ex_dtype.is_floating_point:
-        # pow(2.0, int tensor) is a default-float tensor in ATen.
-        other = F.cast(other, torch_dtype_to_max(torch.get_default_dtype()))
+
+    # _pow2(self, other): pow(2.0, other) (a Python float base) for an
+    # integral or float32 self, else full({}, 2.0, self.dtype).pow(other),
+    # a 0-d tensor base that promotes rank-aware. pow runs in its own result
+    # dtype, and mul then casts that result to mul's rank-aware common
+    # dtype: a float16 exponent past 15 is inf even against a float64 self,
+    # and a 0-d float64 2^128 is inf against a float32 self. The dtypes are
+    # read off ATen's own meta kernels.
+    def meta(dtype: torch.dtype, rank: int) -> torch.Tensor:
+        return torch.empty((0,) * rank, dtype=dtype, device="meta")
+
+    rank = len(other.shape)
     if in_dtype.is_floating_point and in_dtype != torch.float32:
-        # full({}, 2.0, self.dtype).pow(other)
-        base = _scalar_constant(2.0, dtype=input.dtype, device=input.device)
-        pow2 = aten_pow(base, other)
+        pow_dtype = torch.pow(meta(in_dtype, 0), meta(ex_dtype, rank)).dtype
     else:
-        pow2 = aten_pow(2.0, other)
-    result = aten_mul(input, _pow2_nonfinite(pow2, other))
-    target = torch_dtype_to_max(result_dtype)
-    return result if result.dtype == target else F.cast(result, target)
+        pow_dtype = torch.pow(2.0, meta(ex_dtype, rank)).dtype
+    mul_dtype = torch.mul(meta(in_dtype, len(input.shape)), meta(pow_dtype, rank)).dtype
+    pow_max = torch_dtype_to_max(pow_dtype)
+    base = _scalar_constant(2.0, dtype=pow_max, device=input.device)
+    pow2 = _pow2_nonfinite(aten_pow(base, F.cast(other, pow_max)), other)
+    mul_max = torch_dtype_to_max(mul_dtype)
+    return aten_mul(F.cast(input, mul_max), F.cast(pow2, mul_max))
 
 
 def _pow2_nonfinite(pow2: MaxTensor, exponent: MaxTensor) -> MaxTensor:
