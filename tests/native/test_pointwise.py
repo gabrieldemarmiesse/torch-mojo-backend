@@ -3,10 +3,9 @@
 clamp.Tensor, rsub, deg2rad/rad2deg/ldexp/frexp and the binary math family
 (atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter, gcd, lcm,
 bitwise_left_shift.Tensor, bitwise_right_shift.Tensor, logaddexp(2), xlogy,
-xlog1py, zeta, igamma/igammac, the Chebyshev and shifted Chebyshev
-polynomials), and elu, hardtanh, leaky_relu, softplus, threshold,
-hardshrink, softshrink, hardsigmoid, hardswish, mish with their backwards so
-far.
+xlog1py, zeta, igamma/igammac, the special polynomials), and elu, hardtanh,
+leaky_relu, softplus, threshold, hardshrink, softshrink, hardsigmoid,
+hardswish, mish with their backwards so far.
 
 Everything is compared with the same computation on CPU torch through the
 public API, over edge values (signed zeros, infinities, NaN, huge, tiny,
@@ -720,6 +719,10 @@ _POLYS = [
     "shifted_chebyshev_polynomial_u",
     "shifted_chebyshev_polynomial_v",
     "shifted_chebyshev_polynomial_w",
+    "hermite_polynomial_h",
+    "hermite_polynomial_he",
+    "laguerre_polynomial_l",
+    "legendre_polynomial_p",
 ]
 
 
@@ -744,6 +747,50 @@ def test_special_polynomials(mojo_gpu, name):
     _close(
         got, torch.tensor([1.0, 0.0, float("nan"), float("nan")]), rtol=0.0, atol=0.0
     )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "hermite_polynomial_h",
+        "hermite_polynomial_he",
+        "laguerre_polynomial_l",
+        "legendre_polynomial_p",
+    ],
+)
+def test_special_polynomials_out(mojo_gpu, name):
+    """The out= overloads: resize, strided out, a cast into a float16 out,
+    overlap refused."""
+    fn = getattr(torch.special, name)
+    torch.manual_seed(6)
+    x_cpu, n_cpu = torch.rand(3, 4) * 2 - 1, torch.randint(0, 6, (3, 4)).float()
+    x, n = x_cpu.to(mojo_gpu), n_cpu.to(mojo_gpu)
+    want = fn(x_cpu, n_cpu)
+    out = torch.empty(0, device=mojo_gpu)
+    with ran(f"aten::special_{name}.out"):
+        fn(x, n, out=out)
+    _close(out, want, rtol=2e-5, atol=2e-5)
+    strided = torch.zeros(4, 3, device=mojo_gpu).t()
+    fn(x, n, out=strided)
+    _close(strided, want, rtol=2e-5, atol=2e-5)
+    half = torch.empty(3, 4, dtype=torch.float16, device=mojo_gpu)
+    fn(x, n, out=half)
+    _close(half, want.half(), **_tol(torch.float16, 2))
+    with pytest.raises(RuntimeError, match="single memory location"):
+        fn(x, n, out=torch.empty(1, device=mojo_gpu).expand(3, 4))
+
+
+@pytest.mark.parametrize("name", ["hermite_polynomial_h", "legendre_polynomial_p"])
+def test_special_polynomials_cpu_scalar_degree(mojo_gpu, name):
+    """An explicit CPU 0-d float64 degree promotes as a 0-dim tensor (an
+    int64 x gives float64), not as a wrapped Python number."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    fn = getattr(torch.special, name)
+    i = torch.tensor([0, 1, 2])
+    deg = torch.tensor(2.0, dtype=torch.float64)
+    got = fn(i.to(mojo_gpu), deg)
+    assert got.dtype == torch.float64
+    _close(got, fn(i, deg))
 
 
 @pytest.mark.parametrize("name", _POLYS)

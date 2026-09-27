@@ -5431,6 +5431,12 @@ def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dty
 _POINTWISE_BINARY_TWINS = [
     ("heaviside", aten.heaviside, torch.float32, "heaviside"),
     (
+        "special_hermite_polynomial_he",
+        aten.special_hermite_polynomial_he,
+        torch.float32,
+        "poly",
+    ),
+    (
         "special_shifted_chebyshev_polynomial_t",
         aten.special_shifted_chebyshev_polynomial_t,
         torch.float32,
@@ -5513,6 +5519,24 @@ _POINTWISE_BINARY_TWINS = [
     (
         "special_chebyshev_polynomial_t",
         aten.special_chebyshev_polynomial_t,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_hermite_polynomial_h",
+        aten.special_hermite_polynomial_h,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_legendre_polynomial_p",
+        aten.special_legendre_polynomial_p,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_laguerre_polynomial_l",
+        aten.special_laguerre_polynomial_l,
         torch.float32,
         "poly",
     ),

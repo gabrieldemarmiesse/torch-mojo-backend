@@ -140,6 +140,30 @@ struct PointwiseHeaviside(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_hermite_polynomial_h")
+struct PointwiseHermitePolynomialH(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["hermite_polynomial_h", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_hermite_polynomial_he")
+struct PointwiseHermitePolynomialHe(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["hermite_polynomial_he", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_hypot")
 struct PointwiseHypot(ElementwiseBinaryOp):
     @staticmethod
@@ -176,6 +200,18 @@ struct PointwiseIgammac(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_laguerre_polynomial_l")
+struct PointwiseLaguerrePolynomialL(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["laguerre_polynomial_l", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_lcm")
 struct PointwiseLcm(ElementwiseBinaryOp):
     @staticmethod
@@ -196,6 +232,18 @@ struct PointwiseLdexp(ElementwiseBinaryOp):
         width: SIMDLength,
     ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
         return pointwise["ldexp", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_legendre_polynomial_p")
+struct PointwiseLegendrePolynomialP(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["legendre_polynomial_p", dtype, dtype, width](
             lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
         )
 

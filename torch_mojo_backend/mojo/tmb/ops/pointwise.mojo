@@ -3473,6 +3473,31 @@ def _register_special(site: Site) raises:
         op_special_chebyshev_polynomial_w_out,
         "special_chebyshev_polynomial_w.out",
     ](site)
+    impl[op_special_hermite_polynomial_h, "special_hermite_polynomial_h"](site)
+    impl[
+        op_special_hermite_polynomial_h_out, "special_hermite_polynomial_h.out"
+    ](site)
+    impl[op_special_hermite_polynomial_he, "special_hermite_polynomial_he"](
+        site
+    )
+    impl[
+        op_special_hermite_polynomial_he_out,
+        "special_hermite_polynomial_he.out",
+    ](site)
+    impl[op_special_laguerre_polynomial_l, "special_laguerre_polynomial_l"](
+        site
+    )
+    impl[
+        op_special_laguerre_polynomial_l_out,
+        "special_laguerre_polynomial_l.out",
+    ](site)
+    impl[op_special_legendre_polynomial_p, "special_legendre_polynomial_p"](
+        site
+    )
+    impl[
+        op_special_legendre_polynomial_p_out,
+        "special_legendre_polynomial_p.out",
+    ](site)
     impl[
         op_special_shifted_chebyshev_polynomial_t,
         "special_shifted_chebyshev_polynomial_t",
