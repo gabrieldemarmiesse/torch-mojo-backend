@@ -1790,7 +1790,10 @@ def op_gelu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var approximate = v_string(args[unsafe_offset=1])
     var dst = v_tensor(args[unsafe_offset=2])
     var spec = _gelu_spec(approximate)
-    _float_unary_out(spec, t, dst)
+    # gelu is a `unary_op`-style structured kernel: the out dtype is self's
+    # (no cast, unlike the `unary_float_op`s).
+    _require_float(spec, t.dtype)
+    _unary_out("elementwise", spec, t, dst, t.dtype)
     ret_ref(rets, 0, dst)
 
 
@@ -1968,7 +1971,9 @@ def op_logical_not_out(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _bool_unary_out("LogicalNotSpec", t, dst)
+    # logical_not_out computes into an `out` of any dtype (0 / 1).
+    _require_bool_spec("LogicalNotSpec", t.dtype)
+    _unary_out("elementwise", "LogicalNotSpec", t, dst, DType.bool, True)
     ret_ref(rets, 0, dst)
 
 
