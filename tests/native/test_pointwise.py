@@ -960,3 +960,121 @@ def test_hardtanh_threshold_integers(mojo_gpu, dtype):
     _close(F.hardtanh(x.to(mojo_gpu), -3, 5), F.hardtanh(x, -3, 5))
     _close(F.relu6(x.to(mojo_gpu)), F.relu6(x))
     _close(F.threshold(x.to(mojo_gpu), 2, 7), F.threshold(x, 2, 7))
+
+
+# ---------------------------------------------------------------------------
+# elementwise losses: forward and backward for every reduction
+# ---------------------------------------------------------------------------
+
+_REDUCTIONS = ["none", "mean", "sum"]
+
+
+def _loss_tol(dtype: torch.dtype) -> dict[str, float]:
+    if dtype == torch.float32:
+        return {"rtol": 2e-5, "atol": 1e-5}
+    if dtype == torch.float16:
+        return {"rtol": 2e-3, "atol": 1e-3}
+    return {"rtol": 2e-2, "atol": 1e-2}
+
+
+def _check_loss(mojo_gpu, fn, inputs, dtype, op, grads=(0,), tol=None):
+    """Forward (one native `op`) and backward of `fn(*inputs)` against CPU."""
+    tol = tol or _loss_tol(dtype)
+    cpu = [t.detach().clone().to(dtype) if t is not None else None for t in inputs]
+    dev = [t.to(mojo_gpu) if t is not None else None for t in cpu]
+    for i in grads:
+        c, d = cpu[i], dev[i]
+        assert c is not None and d is not None
+        c.requires_grad_()
+        d.requires_grad_()
+    want = fn(*cpu)
+    native.op_counting(True)
+    native.op_counts_reset()
+    got = fn(*dev)
+    # A weight F.* expands to the input's shape is a view (as_strided), not
+    # a kernel: the loss itself must be one native op.
+    counts = {k: v for k, v in native.op_counts().items() if k != "aten::as_strided"}
+    assert counts == {op: 1}, native.op_counts()
+    assert got.shape == want.shape and got.dtype == want.dtype
+    _close(got, want.detach(), **tol)
+    if not grads:
+        return
+    seed = torch.randn(want.shape).to(dtype)
+    want.backward(seed)
+    got.backward(seed.to(mojo_gpu))
+    for i in grads:
+        c, d = cpu[i], dev[i]
+        assert c is not None and d is not None
+        _close(d.grad, c.grad, **tol)
+
+
+@pytest.mark.parametrize("reduction", _REDUCTIONS)
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_mse_loss(mojo_gpu, reduction, dtype):
+    torch.manual_seed(0)
+    x, y = torch.randn(7, 33), torch.randn(7, 33)
+    fn = lambda a, b: F.mse_loss(a, b, reduction=reduction)  # noqa: E731
+    _check_loss(mojo_gpu, fn, [x, y], dtype, "aten::mse_loss", grads=(0, 1))
+
+
+@pytest.mark.parametrize("beta", [1.0, 0.25, 0.0])
+@pytest.mark.parametrize("reduction", _REDUCTIONS)
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_smooth_l1_loss(mojo_gpu, beta, reduction, dtype):
+    torch.manual_seed(1)
+    x, y = torch.randn(5, 41), torch.randn(5, 41)
+    op = "aten::smooth_l1_loss"
+
+    def fn(a, b):
+        return torch.ops.aten.smooth_l1_loss(
+            a, b, ["none", "mean", "sum"].index(reduction), beta
+        )
+
+    if beta == 0.0:
+        # F.smooth_l1_loss sends beta=0 to l1_loss; the aten op itself takes
+        # it (its backward is 0/0 = NaN where x == target, like CUDA).
+        grads = ()
+    else:
+        grads = (0, 1)
+    _check_loss(mojo_gpu, fn, [x, y], dtype, op, grads=grads)
+
+
+@pytest.mark.parametrize("delta", [1.0, 0.3, 2.5])
+@pytest.mark.parametrize("reduction", _REDUCTIONS)
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_huber_loss(mojo_gpu, delta, reduction, dtype):
+    torch.manual_seed(2)
+    x, y = torch.randn(6, 29) * 2, torch.randn(6, 29)
+    fn = lambda a, b: F.huber_loss(a, b, reduction=reduction, delta=delta)  # noqa: E731
+    _check_loss(mojo_gpu, fn, [x, y], dtype, "aten::huber_loss", grads=(0, 1))
+
+
+def test_loss_out_and_edge_shapes(mojo_gpu):
+    x, y = torch.randn(3, 4), torch.randn(3, 4)
+    for reduction in (0, 1, 2):
+        out = torch.empty(0, device=mojo_gpu)
+        torch.ops.aten.mse_loss.out(x.to(mojo_gpu), y.to(mojo_gpu), reduction, out=out)
+        _close(
+            out, torch.ops.aten.mse_loss(x, y, reduction), **_loss_tol(torch.float32)
+        )
+        out = torch.empty(0, device=mojo_gpu)
+        torch.ops.aten.huber_loss.out(
+            x.to(mojo_gpu), y.to(mojo_gpu), reduction, 0.5, out=out
+        )
+        _close(
+            out,
+            torch.ops.aten.huber_loss(x, y, reduction, 0.5),
+            **_loss_tol(torch.float32),
+        )
+    # 0-d operands, broadcasting target, non-contiguous input
+    a, b = torch.tensor(1.5), torch.tensor(-0.25)
+    _close(F.mse_loss(a.to(mojo_gpu), b.to(mojo_gpu)), F.mse_loss(a, b))
+    xt = torch.randn(4, 3).t()
+    _close(
+        F.smooth_l1_loss(
+            xt.to(mojo_gpu), y[:1].to(mojo_gpu).expand(3, 4), reduction="none"
+        ),
+        F.smooth_l1_loss(xt, y[:1].expand(3, 4), reduction="none"),
+    )
+    with pytest.raises(RuntimeError, match="non-positive"):
+        F.huber_loss(x.to(mojo_gpu), y.to(mojo_gpu), delta=0.0)
