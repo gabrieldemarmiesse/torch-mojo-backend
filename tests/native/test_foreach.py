@@ -1287,16 +1287,13 @@ def test_foreach_mul_tensor_allows_a_full_self_alias(mojo_gpu: str):
     assert x._version == version + 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the self-overlap check is address-RANGE based, so it declines a "
-    "scalar living in a hole of the strided input even though no element is "
-    "both read and written. CPU torch runs it and answers "
-    "[2, 2, 6, 4, 10, 6]. Drop the marker when the check compares element "
-    "coverage rather than [min, max] addresses.",
-)
 def test_foreach_mul_tensor_allows_a_scalar_in_a_strided_hole(mojo_gpu: str):
-    """`base[1]` is not covered by `base[::2]`, so nothing overwrites it."""
+    """`base[1]` is not covered by `base[::2]`, so nothing overwrites it.
+
+    The foreach fast path declines (its self-overlap check compares address
+    ranges); the per-tensor `mul_` it falls back to follows torch's overlap
+    rule, which calls a non-dense output too hard to judge and runs it.
+    """
     base = torch.arange(1.0, 7.0, device=mojo_gpu)
     version = base._version
     torch._foreach_mul_([base[::2]], base[1])
