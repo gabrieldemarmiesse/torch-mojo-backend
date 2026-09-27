@@ -5430,6 +5430,48 @@ def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dty
 
 _POINTWISE_BINARY_TWINS = [
     ("heaviside", aten.heaviside, torch.float32, "heaviside"),
+    (
+        "special_chebyshev_polynomial_u",
+        aten.special_chebyshev_polynomial_u,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_chebyshev_polynomial_v",
+        aten.special_chebyshev_polynomial_v,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_chebyshev_polynomial_w",
+        aten.special_chebyshev_polynomial_w,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_chebyshev_polynomial_t",
+        aten.special_chebyshev_polynomial_t,
+        torch.float32,
+        "poly_trig",
+    ),
+    (
+        "special_chebyshev_polynomial_u",
+        aten.special_chebyshev_polynomial_u,
+        torch.float32,
+        "poly_trig",
+    ),
+    (
+        "special_chebyshev_polynomial_v",
+        aten.special_chebyshev_polynomial_v,
+        torch.float32,
+        "poly_trig",
+    ),
+    (
+        "special_chebyshev_polynomial_w",
+        aten.special_chebyshev_polynomial_w,
+        torch.float32,
+        "poly_trig",
+    ),
     ("atan2", aten.atan2, torch.float32, "float"),
     ("copysign", aten.copysign, torch.float32, "float"),
     ("fmax", aten.fmax, torch.float32, "float"),
@@ -5444,6 +5486,12 @@ _POINTWISE_BINARY_TWINS = [
     ("bitwise_right_shift", aten.bitwise_right_shift, torch.int32, "shift"),
     ("__lshift__", aten.__lshift__, torch.int64, "shift"),
     ("__rshift__", aten.__rshift__, torch.int64, "shift"),
+    (
+        "special_chebyshev_polynomial_t",
+        aten.special_chebyshev_polynomial_t,
+        torch.float32,
+        "poly",
+    ),
 ]
 
 
@@ -5468,6 +5516,9 @@ def _pointwise_operands(domain: str, dtype: torch.dtype) -> list[torch.Tensor]:
         return [torch.rand(3, 5) * 4 + 1.1, torch.rand(5) + 0.5]
     if domain == "poly":
         return [torch.rand(3, 5) * 2 - 1, torch.randint(0, 6, (5,)).float()]
+    if domain == "poly_trig":
+        # |x| < 1 and n >= 6: the Chebyshev kernels' trigonometric route
+        return [torch.rand(3, 5) * 1.8 - 0.9, torch.randint(6, 13, (5,)).float()]
     return [torch.randn(3, 5).to(dtype), torch.randn(5).to(dtype)]
 
 

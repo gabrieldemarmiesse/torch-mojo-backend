@@ -3,9 +3,9 @@
 clamp.Tensor, rsub, deg2rad/rad2deg/ldexp/frexp and the binary math family
 (atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter, gcd, lcm,
 bitwise_left_shift.Tensor, bitwise_right_shift.Tensor, logaddexp(2), xlogy,
-xlog1py, zeta, igamma/igammac), and elu, hardtanh, leaky_relu, softplus,
-threshold, hardshrink, softshrink, hardsigmoid, hardswish, mish with their
-backwards so far.
+xlog1py, zeta, igamma/igammac, the Chebyshev polynomials), and elu,
+hardtanh, leaky_relu, softplus, threshold, hardshrink, softshrink,
+hardsigmoid, hardswish, mish with their backwards so far.
 
 Everything is compared with the same computation on CPU torch through the
 public API, over edge values (signed zeros, infinities, NaN, huge, tiny,
@@ -708,6 +708,53 @@ def test_zeta(mojo_gpu):
         rtol=4e-6,
         atol=1e-6,
     )
+
+
+_POLYS = [
+    "chebyshev_polynomial_t",
+    "chebyshev_polynomial_u",
+    "chebyshev_polynomial_v",
+    "chebyshev_polynomial_w",
+]
+
+
+@pytest.mark.parametrize("name", _POLYS)
+def test_special_polynomials(mojo_gpu, name):
+    fn = getattr(torch.special, name)
+    torch.manual_seed(4)
+    x = torch.cat(
+        [torch.tensor([-1.0, 1.0, 0.0, 0.5, 2.0]), torch.rand(120) * 2.2 - 1.1]
+    )
+    n = torch.randint(-1, 14, (x.numel(),)).float()
+    n[:5] = torch.tensor([3.0, 4.0, 5.0, 9.0, 3.0])
+    with ran(f"aten::special_{name}"):
+        actual = fn(x.to(mojo_gpu), n.to(mojo_gpu))
+    # n > 6-8 takes cos(n acos x): a few float32 ulps of the argument.
+    _close(actual, fn(x, n), rtol=2e-5, atol=2e-5)
+    _close(fn(x.to(mojo_gpu), 3), fn(x, 3), rtol=2e-5, atol=2e-5)
+    # NaN x: CPU's loop reads garbage there; CUDA (and ours) gives the
+    # degree-0 constant, 0 for a negative degree, NaN otherwise.
+    nan_x = torch.full((4,), float("nan"), device=mojo_gpu)
+    got = fn(nan_x, torch.tensor([0.0, -1.0, 2.0, 7.0], device=mojo_gpu)).cpu()
+    _close(
+        got, torch.tensor([1.0, 0.0, float("nan"), float("nan")]), rtol=0.0, atol=0.0
+    )
+
+
+@pytest.mark.parametrize("name", _POLYS)
+def test_special_polynomials_float64(mojo_gpu, name):
+    """float64 (CUDA dispatches it): the cos / acos branch has no std.math
+    lowering on NVIDIA or AMD, so it takes fdlibm's double kernels."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    fn = getattr(torch.special, name)
+    torch.manual_seed(4)
+    x = torch.cat(
+        [torch.tensor([-1.0, 1.0, 0.0, 0.5, 2.0]), torch.rand(120) * 2.2 - 1.1]
+    ).double()
+    n = torch.randint(-1, 30, (x.numel(),)).double()
+    with ran(f"aten::special_{name}"):
+        actual = fn(x.to(mojo_gpu), n.to(mojo_gpu))
+    _close(actual, fn(x, n), rtol=1e-12, atol=1e-12)
 
 
 def test_float64_binary_math(mojo_gpu):

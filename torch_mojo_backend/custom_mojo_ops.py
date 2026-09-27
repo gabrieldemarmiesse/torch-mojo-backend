@@ -275,6 +275,10 @@ def pointwise_binary(
     other: MaxTensor,
     kind: Literal[
         "atan2",
+        "chebyshev_polynomial_t",
+        "chebyshev_polynomial_u",
+        "chebyshev_polynomial_v",
+        "chebyshev_polynomial_w",
         "copysign",
         "fmax",
         "fmin",

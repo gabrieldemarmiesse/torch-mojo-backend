@@ -20,6 +20,54 @@ struct PointwiseAtan2(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_chebyshev_polynomial_t")
+struct PointwiseChebyshevPolynomialT(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["chebyshev_polynomial_t", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_chebyshev_polynomial_u")
+struct PointwiseChebyshevPolynomialU(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["chebyshev_polynomial_u", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_chebyshev_polynomial_v")
+struct PointwiseChebyshevPolynomialV(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["chebyshev_polynomial_v", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_chebyshev_polynomial_w")
+struct PointwiseChebyshevPolynomialW(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["chebyshev_polynomial_w", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_copysign")
 struct PointwiseCopysign(ElementwiseBinaryOp):
     @staticmethod
