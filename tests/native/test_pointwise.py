@@ -1108,6 +1108,23 @@ def test_leaky_relu_slope_in_opmath(mojo_gpu, dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_activation_scalar_overflow_raises(mojo_gpu, dtype):
+    """A Scalar past float32's range raises as `Scalar::to<opmath_t>()`
+    does on CPU torch; float64 takes it."""
+    x = torch.tensor([-1.0, 2.0]).to(dtype)
+    for fn in (
+        lambda a: torch.ops.aten.elu(a, 1e40, 1.0, 1.0),
+        lambda a: torch.ops.aten.elu(a, 1.0, 1.0, 1e40),
+        lambda a: F.leaky_relu(a, 1e40),
+        lambda a: F.leaky_relu(a.clone(), 1e40, inplace=True),
+    ):
+        with pytest.raises(RuntimeError, match="without overflow"):
+            fn(x)
+        with pytest.raises(RuntimeError, match="without overflow"):
+            fn(x.to(mojo_gpu))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_elu_scalars_in_opmath(mojo_gpu, dtype):
     if dtype == torch.float16:
         # Stock MPS reads elu's scalars as half (ActivationKernel.metal:

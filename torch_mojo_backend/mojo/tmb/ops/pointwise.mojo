@@ -1437,11 +1437,20 @@ def _self_stype(args: Values, i: Int) raises -> Int32:
     return v_tensor(args[unsafe_offset=i]).stype
 
 
+def _opmath_scalar(v: Value, self_st: Int32) raises -> Float64:
+    """`Scalar::to<opmath_t>()`: a finite value past float32's range raises
+    for every dtype but float64 (whose opmath is double)."""
+    return scalar_to_float(
+        v, ST_FLOAT64 if self_st == ST_FLOAT64 else ST_FLOAT32
+    )
+
+
 def _elu_p(args: Values, first: Int) raises -> SIMD[DType.float64, 4]:
+    var st = _self_stype(args, 0)
     return _p(
-        v_f64(args[unsafe_offset=first]),
-        v_f64(args[unsafe_offset=first + 1]),
-        v_f64(args[unsafe_offset=first + 2]),
+        _opmath_scalar(args[unsafe_offset=first], st),
+        _opmath_scalar(args[unsafe_offset=first + 1], st),
+        _opmath_scalar(args[unsafe_offset=first + 2], st),
     )
 
 
@@ -1730,25 +1739,25 @@ def op_hardtanh_backward_grad_input(
     )
 
 
+def _leaky_p(args: Values) raises -> SIMD[DType.float64, 4]:
+    return _p(_opmath_scalar(args[unsafe_offset=1], _self_stype(args, 0)))
+
+
 # aten::leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
 def op_leaky_relu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_act(
-        "leaky_relu", args, rets, 0, -1, -1, _p(v_f64(args[unsafe_offset=1]))
-    )
+    _pw_act("leaky_relu", args, rets, 0, -1, -1, _leaky_p(args))
 
 
 # aten::leaky_relu.out(Tensor self, Scalar negative_slope=0.01, *, Tensor(a!) out) -> Tensor(a!)
 def op_leaky_relu_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_act(
-        "leaky_relu", args, rets, 0, -1, 2, _p(v_f64(args[unsafe_offset=1]))
-    )
+    _pw_act("leaky_relu", args, rets, 0, -1, 2, _leaky_p(args))
 
 
 # aten::leaky_relu_(Tensor(a!) self, Scalar negative_slope=0.01) -> Tensor(a!)
 def op_leaky_relu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_act_inplace("leaky_relu", args, rets, _p(v_f64(args[unsafe_offset=1])))
+    _pw_act_inplace("leaky_relu", args, rets, _leaky_p(args))
 
 
 def _leaky_backward_check(args: Values) raises:

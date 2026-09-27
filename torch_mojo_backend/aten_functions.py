@@ -2883,14 +2883,35 @@ def aten_elu(
     # opmath product (alpha = 1e-46 is float32 0, whatever scale is).
     opmath = torch.float64 if input.dtype == DType.float64 else torch.float32
 
-    def to_opmath(v: float) -> float:
-        return torch.tensor(v, dtype=opmath).item()
-
-    alpha, scale, input_scale = map(to_opmath, (alpha, scale, input_scale))
-    negcoef = to_opmath(alpha * scale)
-    negative = _expm1(input * input_scale) * negcoef
+    alpha, scale, input_scale = (
+        _scalar_to_opmath(v, opmath) for v in (alpha, scale, input_scale)
+    )
+    negcoef = torch.tensor(alpha * scale, dtype=opmath).item()
+    growth = _expm1(input * input_scale)
+    if negcoef == 0.0:
+        # MAX folds `t * 0` to 0, but inf * 0 and NaN * 0 are NaN.
+        nan = F.constant(math.nan, dtype=growth.dtype, device=growth.device)
+        zero = F.constant(0.0, dtype=growth.dtype, device=growth.device)
+        blown = F.logical_or(
+            custom_mojo_ops.elementwise(growth, "isinf"),
+            custom_mojo_ops.elementwise(growth, "isnan"),
+        )
+        negative = _where(blown, nan, zero)
+    else:
+        negative = growth * negcoef
     result = _where(input > 0, input * scale, negative)
     return result if result.dtype == dtype else F.cast(result, dtype)
+
+
+def _scalar_to_opmath(value: float, opmath: torch.dtype) -> float:
+    """`Scalar::to<opmath_t>()`: rounded to the opmath dtype, and a finite
+    value past float32's range raises (float64 never overflows)."""
+    if opmath == torch.float32 and math.isfinite(value):
+        if abs(value) > torch.finfo(torch.float32).max:
+            raise RuntimeError(
+                "value cannot be converted to type float without overflow"
+            )
+    return torch.tensor(value, dtype=opmath).item()
 
 
 def _expm1(x: MaxTensor) -> MaxTensor:
@@ -3743,6 +3764,9 @@ def aten_leaky_relu(input: MaxTensor, negative_slope: float = 0.01) -> MaxTensor
     dtype = input.dtype
     if dtype in (DType.float16, DType.bfloat16):
         input = F.cast(input, DType.float32)
+    if dtype.is_float():
+        opmath = torch.float64 if dtype == DType.float64 else torch.float32
+        negative_slope = _scalar_to_opmath(negative_slope, opmath)
     result = _where(input > 0, input, input * negative_slope)
     return result if result.dtype == dtype else F.cast(result, dtype)
 

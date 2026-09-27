@@ -5559,6 +5559,25 @@ def test_aten_elu_compiled_scalars_in_opmath(dtype: torch.dtype):
     _compiled_matches_cpu(lambda a: aten.elu(a, 1e-46, 1e38, -10.0), [x])
 
 
+def test_aten_elu_compiled_zero_coefficient_and_overflow():
+    """A coefficient rounding to 0 still gives NaN where expm1 overflows
+    (inf * 0), and a scalar past float32's range raises as ATen does."""
+    x = torch.tensor([-10.0, -0.5, 2.0])
+    _compiled_matches_cpu(lambda a: aten.elu(a, 1e-46, 1e38, -10.0), [x])
+    for dtype in (torch.float32, torch.float16):
+        xd = x.to(dtype)
+        for fn in (
+            lambda a: aten.elu(a, 1e40, 1.0, 1.0),
+            lambda a: aten.elu(a, 1.0, 1e40, 1.0),
+            lambda a: aten.leaky_relu(a, 1e40),
+        ):
+            with pytest.raises(RuntimeError, match="without overflow"):
+                fn(xd)
+            with pytest.raises(Exception, match="without overflow"):
+                torch.compile(fn, backend=mojo_backend, fullgraph=True)(xd)
+            torch.compiler.reset()
+
+
 def test_aten_hardtanh_nan_bounds_compiled():
     """hardtanh is two-bound clamp: a NaN bound fills NaN."""
     nan = math.nan
