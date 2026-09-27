@@ -2529,6 +2529,7 @@ def _loss_forward(
     weight: Optional[T] = None,
     result_st: Int32 = -1,
     round_p0: Bool = False,
+    wide_st: Int32 = -1,
 ) raises:
     """One loss kind over (a, b[, c]), times `weight` when given (its own
     rounding, as `loss.mul_(weight)`), then the reduction.
@@ -2539,7 +2540,11 @@ def _loss_forward(
     is that output, so the kernel computes in out's dtype (inputs cast to
     it); otherwise the loss is computed as the functional form does and
     reduced straight into out's dtype (`mean_out` / `sum_out`). `round_p0`:
-    p0 is a Scalar read as `scalar_t` of that kernel dtype (beta, delta)."""
+    p0 is a Scalar read as `scalar_t` of that kernel dtype (beta, delta).
+    `wide_st`: an operand dtype the kernel must not narrow (a float32
+    pos_weight against float16 logits), computed in, rounded once to the
+    loss dtype. `weight` multiplies in the promoted dtype of the loss and
+    the weight, as `loss.mul_(weight)` does."""
     if not a.is_t or not b.is_t:
         unsupported(String(kind) + " with a scalar operand")
     var common = _pw_result_type(a, b, c, arity)
@@ -2562,6 +2567,10 @@ def _loss_forward(
         elif _pw_is_float(d) and _b_can_cast(loss_st, d):
             reduce_st = d
     var compute = _pw_compute_dtype(kind, loss_st, P_FLOAT_ONLY, True)
+    if wide_st >= 0 and promote_types(compute, wide_st) != compute:
+        compute = _pw_compute_dtype(
+            kind, promote_types(compute, wide_st), P_FLOAT_ONLY, True
+        )
     var p = params
     if round_p0:
         p[0] = _round_to(p[0], loss_st)
@@ -2572,17 +2581,22 @@ def _loss_forward(
     var res = _pw_run(kind, arity, a, b, c, compute, loss_st, p, direct)
     if weight:
         var loss = res.t.copy()
-        var w = _b_tside(weight.value())
+        var wt = weight.value().copy()
+        var w = _b_tside(wt)
         var target = (
             dest.copy() if reduction == REDUCTION_NONE else Optional[T]()
         )
+        if target and _pw_same_storage(target.value(), wt):
+            # The weight shares memory with `out`: multiply into a fresh
+            # tensor and copy, as the composite's temporary does.
+            target = Optional[T]()
         var weighted = _pw_run(
             "mul_scale",
             2,
             _b_tside(loss),
             w,
             _none_side(),
-            compute,
+            _pw_weight_compute(compute, wt),
             loss_st,
             _p(1.0),
             target,
@@ -2595,6 +2609,21 @@ def _loss_forward(
         dest,
         _loss_reduce(res^, reduction, reduce_st),
         _pw_out_exact(kind),
+    )
+
+
+def _pw_same_storage(a: T, b: T) -> Bool:
+    """Whether two tensors view one storage (conservative: any shared
+    storage counts, overlapping or not)."""
+    var storage = a.storage_ptr()
+    return storage != 0 and storage == b.storage_ptr()
+
+
+def _pw_weight_compute(compute: Int32, weight: T) raises -> Int32:
+    """`loss.mul_(weight)`'s compute dtype: the loss's, promoted with the
+    weight's so a float32 weight is not narrowed to a float16 loss."""
+    return _pw_compute_dtype(
+        "mul_scale", promote_types(compute, weight.stype), P_FLOAT_ONLY, True
     )
 
 
@@ -2888,12 +2917,21 @@ def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
         unsupported("binary_cross_entropy with a scalar operand")
     _loss_same_dtype(input, target)
     # The weight rides as the third operand (the product is the kernel's
-    # last rounding, like `loss.mul_(weight)`); 1 without one.
+    # last rounding, like `loss.mul_(weight)`); 1 without one. A weight
+    # wider than the loss dtype is its own multiply in the promoted dtype
+    # instead: fused, the kernel would narrow it (a float32 weight of 1e5
+    # is float16 inf).
+    var in_st = input.t.value().stype
+    var fuse = not weight or (
+        promote_types(in_st, weight.value().stype) == in_st
+    )
     var c = _b_tside(weight.value()) if weight else _b_sside(
         Scal(1.0, 1, True, False)
     )
     var base = _pw_broadcast(input, target, _none_side(), 2)
     _loss_fits(base[0], base[1], input, target, c)
+    if not fuse:
+        c = _b_sside(Scal(1.0, 1, True, False))
     _loss_forward(
         "bce",
         3,
@@ -2904,7 +2942,8 @@ def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
         _p(),
         out_v,
         rets,
-        result_st=input.t.value().stype,
+        Optional[T]() if fuse else weight.copy(),
+        result_st=in_st,
     )
 
 
@@ -2983,7 +3022,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
         _b_tside(gi.t),
         _b_tside(weight.value()),
         _none_side(),
-        compute,
+        _pw_weight_compute(compute, weight.value()),
         out_st,
         _p(inv),
         dest,
@@ -3044,6 +3083,7 @@ def _bce_logits(args: Values, rets: Values, out_v: Optional[Value]) raises:
         rets,
         weight,
         result_st=t.stype,
+        wide_st=pos_weight.value().stype if pos_weight else Int32(-1),
     )
 
 

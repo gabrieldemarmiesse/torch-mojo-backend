@@ -1543,6 +1543,71 @@ def test_binary_cross_entropy_with_logits(
     )
 
 
+@pytest.mark.parametrize("reduction", [0, 1, 2])
+def test_bce_wide_weights_are_not_narrowed(mojo_gpu, reduction):
+    """A float32 weight / pos_weight against float16 operands multiplies in
+    float32, as `loss.mul_(weight)` and the logits composite do, instead of
+    being read as float16 inf: 4.88e-4 * 1e5 is 48.8125 in float16."""
+    aten = torch.ops.aten
+    w = torch.tensor([100000.0, 2.0])
+    cases = [
+        (
+            lambda x, t, w: aten.binary_cross_entropy(x, t, w, reduction),
+            [
+                torch.tensor([0.99951171875, 0.25]).half(),
+                torch.tensor([1.0, 0.0]).half(),
+                w,
+            ],
+        ),
+        (
+            lambda x, t, w: aten.binary_cross_entropy_with_logits(
+                x, t, w, None, reduction
+            ),
+            [torch.tensor([8.0, -1.0]).half(), torch.tensor([1.0, 0.0]).half(), w],
+        ),
+        (
+            lambda x, t, w: aten.binary_cross_entropy_with_logits(
+                x, t, None, w, reduction
+            ),
+            [torch.tensor([8.0, -1.0]).half(), torch.tensor([1.0, 0.0]).half(), w],
+        ),
+        (
+            lambda g, x, t, w: aten.binary_cross_entropy_backward(
+                g, x, t, w, reduction
+            ),
+            [
+                torch.tensor([1.0, 1.0]).half(),
+                torch.tensor([0.50048828125, 0.25]).half(),
+                torch.tensor([0.5, 0.5]).half(),
+                w,
+            ],
+        ),
+    ]
+    for fn, inputs in cases:
+        want = fn(*inputs)
+        assert want.isfinite().all()
+        got = fn(*[t.to(mojo_gpu) for t in inputs])
+        assert got.dtype == want.dtype
+        _close(got, want, **_loss_tol(torch.float16))
+
+
+def test_bce_logits_weight_overlapping_out(mojo_gpu):
+    """A weight sharing memory with `out` is read before `out` is written,
+    as the composite's temporary guarantees."""
+    aten = torch.ops.aten
+    x_cpu = torch.tensor([0.5, -1.0, 2.0])
+    t_cpu = torch.tensor([1.0, 0.0, 1.0])
+    storage_cpu = torch.tensor([0.3, 2.0, 0.5, 4.0])
+    want = aten.binary_cross_entropy_with_logits(
+        x_cpu, t_cpu, storage_cpu[1:].clone(), None, 0
+    )
+    storage = storage_cpu.to(mojo_gpu)
+    aten.binary_cross_entropy_with_logits.out(
+        x_cpu.to(mojo_gpu), t_cpu.to(mojo_gpu), storage[1:], None, 0, out=storage[:-1]
+    )
+    _close(storage[:-1], want, **_loss_tol(torch.float32))
+
+
 def test_bce_dtype_and_shape_rules(mojo_gpu):
     """binary_cross_entropy: input and target of one dtype, the loss in it
     (a float32 weight on float16 inputs stays float16); with logits the
