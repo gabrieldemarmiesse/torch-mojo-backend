@@ -87,6 +87,17 @@ INT_MATH_OPS = {
     "gcd": torch.gcd,
     "lcm": torch.lcm,
 }
+# (x, n) polynomials: x in (-1, 1) takes the recurrence below n = 7 and the
+# trigonometric form above; n = 5 and n = 9 time both regimes.
+POLY_OPS = {
+    f"special_{name}": getattr(torch.special, name)
+    for name in (
+        "chebyshev_polynomial_t",
+        "chebyshev_polynomial_u",
+        "chebyshev_polynomial_v",
+        "chebyshev_polynomial_w",
+    )
+}
 # Activation backwards: (grad_output, input) of one shape.
 ACT_BACKWARD_OPS = {
     "elu_backward": lambda g, x: torch.ops.aten.elu_backward(
@@ -129,6 +140,7 @@ COVERS: dict[str, str] = (
     | {f"aten::{name}": "test_logical" for name in LOGICAL_OPS}
     | {f"aten::{name}": "test_binary_math" for name in MATH_OPS}
     | {f"aten::{name}": "test_int_math" for name in INT_MATH_OPS}
+    | {f"aten::{name}": "test_special_polynomial" for name in POLY_OPS}
     | {f"aten::{name}": "test_activation_backward" for name in ACT_BACKWARD_OPS}
     | {
         "aten::pow.Tensor_Scalar": "test_pow[Scalar]",
@@ -268,6 +280,10 @@ SKIPPED: dict[str, str] = {
     "aten::silu_backward.grad_input": _OUT,
     "aten::softplus_backward.grad_input": _OUT,
     "aten::softshrink_backward.grad_input": _OUT,
+    "aten::special_chebyshev_polynomial_t.out": _OUT,
+    "aten::special_chebyshev_polynomial_u.out": _OUT,
+    "aten::special_chebyshev_polynomial_v.out": _OUT,
+    "aten::special_chebyshev_polynomial_w.out": _OUT,
     "aten::special_xlog1py.out": _OUT,
     "aten::special_zeta.out": _OUT,
     "aten::xlogy.OutTensor": _OUT,
@@ -734,6 +750,28 @@ def test_ldexp(
         lambda: torch.ldexp(x_ref, e_ref),
         lambda: torch.ldexp(x_our, e_our),
         flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", ("A_357x789_n5", "A_357x789_n9"))
+@pytest.mark.parametrize("op_name", op_params(POLY_OPS))
+def test_special_polynomial(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = POLY_OPS[op_name]
+    shape = SHAPES[shape_id.rsplit("_", 1)[0]]
+    degree = float(shape_id.rsplit("_n", 1)[1])
+    x = unit_interval(shape, DTYPES[dtype_id])
+    x_ref, x_our = both(x, hw, mojo_device)
+    n_ref, n_our = both(torch.full(shape, degree), hw, mojo_device)
+    bench.run(
+        lambda: fn(x_ref, n_ref), lambda: fn(x_our, n_our), flops=float(x.numel())
     )
 
 

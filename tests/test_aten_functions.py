@@ -5359,6 +5359,12 @@ _POINTWISE_BINARY_TWINS = [
     ("bitwise_right_shift", aten.bitwise_right_shift, torch.int32, "shift"),
     ("__lshift__", aten.__lshift__, torch.int64, "shift"),
     ("__rshift__", aten.__rshift__, torch.int64, "shift"),
+    (
+        "special_chebyshev_polynomial_t",
+        aten.special_chebyshev_polynomial_t,
+        torch.float32,
+        "poly",
+    ),
 ]
 
 

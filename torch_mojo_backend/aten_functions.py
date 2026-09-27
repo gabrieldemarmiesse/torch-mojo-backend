@@ -248,6 +248,10 @@ def _pointwise_binary(
     other: MaxTensor | Scalar,
     kind: Literal[
         "atan2",
+        "chebyshev_polynomial_t",
+        "chebyshev_polynomial_u",
+        "chebyshev_polynomial_v",
+        "chebyshev_polynomial_w",
         "copysign",
         "fmax",
         "fmin",
@@ -5020,6 +5024,38 @@ def aten_special_bessel_y0(x: MaxTensor) -> MaxTensor:
 @map_to(aten.special_bessel_y1)
 def aten_special_bessel_y1(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "bessel_y1")
+
+
+# special_chebyshev_polynomial_t(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_chebyshev_polynomial_t)
+def aten_special_chebyshev_polynomial_t(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "chebyshev_polynomial_t", promote_float=True)
+
+
+# special_chebyshev_polynomial_u(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_chebyshev_polynomial_u)
+def aten_special_chebyshev_polynomial_u(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "chebyshev_polynomial_u", promote_float=True)
+
+
+# special_chebyshev_polynomial_v(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_chebyshev_polynomial_v)
+def aten_special_chebyshev_polynomial_v(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "chebyshev_polynomial_v", promote_float=True)
+
+
+# special_chebyshev_polynomial_w(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_chebyshev_polynomial_w)
+def aten_special_chebyshev_polynomial_w(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "chebyshev_polynomial_w", promote_float=True)
 
 
 # special_entr(Tensor self) -> Tensor
