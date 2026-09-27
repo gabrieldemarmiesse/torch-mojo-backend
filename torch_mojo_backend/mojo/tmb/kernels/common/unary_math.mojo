@@ -667,7 +667,8 @@ def elementwise_unary_param[
       round_decimals_kernel_cuda computes in scalar_t: each step rounds. On
       Apple GPUs `round_decimals_functor`: rint(exp10(n) x) exp10(-n).
     * logit: p0 = eps, negative for None (logit_kernel_cuda, in float; on
-      Apple the MPSGraph of logit_mps_impl, in the tensor type).
+      Apple the MPSGraph of logit_mps_impl, whose clamp bounds lo = eps and
+      hi = 1 - lo, rounded to the tensor type, the host passes in p1 / p2).
     * polygamma: p0 = n (polygamma_kernel_cuda / UnaryKernel.mm, in float).
     * mvlgamma: p0 = p, p1 = p (p - 1) log(pi) / 4 (computed in double on the
       host, rounded to float). ATen composes it (UnaryOps.cpp `mvlgamma`):
@@ -718,8 +719,10 @@ def elementwise_unary_param[
         comptime if kind == "logit":
             var eps = rebind[Float32](p0)
             comptime if is_apple_gpu():
+                var lo = rebind[Float32](p1)
+                var hi = rebind[Float32](p2)
                 comptime for i in range(width):
-                    r[i] = mps_logit[dtype](xf[i], eps)
+                    r[i] = mps_logit(xf[i], eps, lo, hi)
             else:
                 comptime for i in range(width):
                     r[i] = logit_f(xf[i], eps)

@@ -52,6 +52,7 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "floor": torch.floor,
     "frac": torch.frac,
     "gelu": F.gelu,
+    "i0": torch.i0,
     "isfinite": torch.isfinite,
     "isinf": torch.isinf,
     "isnan": torch.isnan,
@@ -62,6 +63,7 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "log10": torch.log10,
     "log1p": torch.log1p,
     "log2": torch.log2,
+    "logit": torch.logit,
     "mvlgamma": lambda x: torch.mvlgamma(x, 2),
     "nan_to_num": torch.nan_to_num,
     "neg": torch.neg,
@@ -105,7 +107,7 @@ def _check_matches_stock(
     fn: Callable[[torch.Tensor], torch.Tensor], x_ref: torch.Tensor, x_our: torch.Tensor
 ):
     """Our result against the stock device's, whose kernels the mojo ones
-    follow (CPU torch computes round.decimals and i0e differently in
+    follow (CPU torch computes logit, round.decimals and i0e differently in
     float16 / bfloat16). A dtype the stock device lacks skips the case, as
     `bench.run` would."""
     try:

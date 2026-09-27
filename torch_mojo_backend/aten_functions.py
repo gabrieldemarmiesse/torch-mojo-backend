@@ -3273,6 +3273,12 @@ def aten_hypot(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTenso
     return _pointwise_binary(input, other, "hypot", promote_float=False)
 
 
+# i0(Tensor self) -> Tensor
+@map_to(aten.i0)
+def aten_i0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i0")
+
+
 # igamma(Tensor self, Tensor other) -> Tensor
 @map_to(aten.igamma)
 def aten_igamma(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
@@ -3765,6 +3771,24 @@ def aten_logical_xor(input: MaxTensor, other: MaxTensor) -> MaxTensor:
 
     # Apply logical xor
     return F.logical_xor(input_bool, other_bool)
+
+
+# logit(Tensor self, float? eps=None) -> Tensor
+@map_to(aten.logit)
+def aten_logit(x: MaxTensor, eps: float | None = None) -> MaxTensor:
+    if eps is None:
+        return custom_mojo_ops.elementwise(x, "logit")
+    # logit_kernel_cuda clamps in float (NaN passes through both compares).
+    dtype = x.dtype
+    if not dtype.is_float():
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+        dtype = x.dtype
+    xf = x if dtype in (DType.float32, DType.float64) else F.cast(x, DType.float32)
+    lo = F.constant(eps, dtype=xf.dtype, device=xf.device)
+    hi = F.constant(1.0 - eps, dtype=xf.dtype, device=xf.device)
+    z = _where(xf < lo, lo, _where(xf > hi, hi, xf))
+    out = custom_mojo_ops.elementwise(z, "logit")
+    return out if out.dtype == dtype else F.cast(out, dtype)
 
 
 # lt.Scalar(Tensor self, Scalar other) -> Tensor

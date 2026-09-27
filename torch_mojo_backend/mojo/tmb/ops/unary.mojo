@@ -1537,13 +1537,32 @@ def _logit_eps(v: Value) raises -> Float64:
     return v_f64(v)
 
 
+def _logit_bounds(eps: Float64, dtype: DType) -> Tuple[Float64, Float64]:
+    """logit_mps_impl's clamp bounds: lo = eps and hi = 1 - lo, each a graph
+    constant of the tensor type. Only the Apple kernel reads them (slots p1 /
+    p2); logit_kernel_cuda clamps to the float eps itself."""
+    var lo = _round_to_dtype(eps, dtype)
+    return (lo, _round_to_dtype(1.0 - lo, dtype))
+
+
+def _round_to_dtype(v: Float64, dtype: DType) -> Float64:
+    if dtype == DType.float16:
+        return v.cast[DType.float16]().cast[DType.float64]()
+    if dtype == DType.bfloat16:
+        return v.cast[DType.bfloat16]().cast[DType.float64]()
+    if dtype == DType.float32:
+        return v.cast[DType.float32]().cast[DType.float64]()
+    return v
+
+
 # aten::logit(Tensor self, float? eps=None) -> Tensor
 def op_logit(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var eps = _logit_eps(args[unsafe_offset=1])
     var src = own_if_new(_promote(t), t)
     _require_float("logit", src.t.dtype)
-    var out = own(_param_unary("LogitSpec", src.t, eps, 0.0, 0.0))
+    var b = _logit_bounds(eps, src.t.dtype)
+    var out = own(_param_unary("LogitSpec", src.t, eps, b[0], b[1]))
     ret_owned(rets, 0, out)
 
 
@@ -1554,7 +1573,8 @@ def op_logit_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dst = v_tensor(args[unsafe_offset=2])
     var src = own_if_new(_promote(t), t)
     _require_float("logit", src.t.dtype)
-    _param_unary_out("LogitSpec", src.t, dst, eps, 0.0, 0.0)
+    var b = _logit_bounds(eps, src.t.dtype)
+    _param_unary_out("LogitSpec", src.t, dst, eps, b[0], b[1])
     ret_ref(rets, 0, dst)
 
 
@@ -2110,6 +2130,8 @@ def register_unary(site: Site) raises:
     impl[op_floor_out, "floor.out"](site)
     impl[op_frac, "frac"](site)
     impl[op_frac_out, "frac.out"](site)
+    impl[op_i0, "i0"](site)
+    impl[op_i0_out, "i0.out"](site)
     impl[op_lgamma, "lgamma"](site)
     impl[op_lgamma_out, "lgamma.out"](site)
     impl[op_log, "log"](site)
@@ -2120,6 +2142,8 @@ def register_unary(site: Site) raises:
     impl[op_log1p_out, "log1p.out"](site)
     impl[op_log2, "log2"](site)
     impl[op_log2_out, "log2.out"](site)
+    impl[op_logit, "logit"](site)
+    impl[op_logit_out, "logit.out"](site)
     impl[op_mvlgamma, "mvlgamma"](site)
     impl[op_mvlgamma_out, "mvlgamma.out"](site)
     impl[op_nan_to_num, "nan_to_num"](site)
