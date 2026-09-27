@@ -2875,8 +2875,13 @@ def aten_elu(
     """ActivationEluKernel.cu: x > 0 ? x * scale
     : expm1(x * input_scale) * alpha * scale. expm1, not exp(x) - 1, which
     cancels to 0 near zero (bfloat16 -0.001 gave 0)."""
+    dtype = input.dtype
+    if dtype in (DType.float16, DType.bfloat16):
+        # The kernel's opmath: x * input_scale must not underflow in half.
+        input = F.cast(input, DType.float32)
     negative = _expm1(input * input_scale) * (alpha * scale)
-    return _where(input > 0, input * scale, negative)
+    result = _where(input > 0, input * scale, negative)
+    return result if result.dtype == dtype else F.cast(result, dtype)
 
 
 def _expm1(x: MaxTensor) -> MaxTensor:
@@ -2888,7 +2893,8 @@ def _expm1(x: MaxTensor) -> MaxTensor:
     # The shared exp / log kinds: MAX's own CPU exp reads NaN as +inf.
     u = custom_mojo_ops.elementwise(x, "exp")
     one = F.constant(1.0, dtype=x.dtype, device=x.device)
-    corrected = (u - one) * x / custom_mojo_ops.elementwise(u, "log")
+    # x / log(u) (about 1) first: (u - 1) * x overflows for u near max.
+    corrected = (u - one) * (x / custom_mojo_ops.elementwise(u, "log"))
     near_zero = _where(u == one, x, corrected)
     # u = 0 (x -> -inf) and u = inf keep the plain difference: -1 and inf
     # (isinf, not `u == inf`, which MAX's CPU compare answers True for NaN).

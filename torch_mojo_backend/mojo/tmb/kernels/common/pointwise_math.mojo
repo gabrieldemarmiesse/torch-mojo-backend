@@ -1788,8 +1788,12 @@ def _wide[
             r = a * min(max(a + 3, zero), SIMD[w, n](6)) * _one_sixth[w, n]()
         return isnan(a).select(a, r)
     elif kind == "hardtanh":
-        # hardtanh is clamp(x, min_val, max_val); NaN passes through.
-        var r = min(max(a, SIMD[w, n](p[0])), SIMD[w, n](p[1]))
+        # hardtanh is two-bound clamp(x, min_val, max_val): a NaN x passes
+        # through, and a NaN bound fills NaN (min/max would drop it).
+        var lo = SIMD[w, n](p[0])
+        var hi = SIMD[w, n](p[1])
+        var r = min(max(a, lo), hi)
+        r = (isnan(lo) | isnan(hi)).select(lo + hi, r)
         return isnan(a).select(a, r)
     elif kind == "leaky_relu":
         var r = a.gt(0).select(a, a * p[0])

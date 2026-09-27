@@ -1084,6 +1084,33 @@ def test_activation_in_place_and_out(mojo_gpu):
     _close(out, F.softplus(x_cpu), **_tol(torch.float32, 3))
 
 
+@pytest.mark.parametrize(
+    "bounds", [(math.nan, 1.0), (-1.0, math.nan), (math.nan, math.nan)]
+)
+def test_hardtanh_nan_bound(mojo_gpu, bounds):
+    """hardtanh is two-bound clamp: a NaN bound fills NaN, as CPU torch."""
+    x = torch.tensor([0.0, 2.0, -2.0, math.nan])
+    want = F.hardtanh(x, *bounds)
+    _close(F.hardtanh(x.to(mojo_gpu), *bounds), want)
+    inplace = x.to(mojo_gpu)
+    F.hardtanh(inplace, *bounds, inplace=True)
+    _close(inplace, want)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64])
+def test_elu_intermediates(mojo_gpu, dtype):
+    """elu's float opmath for the half dtypes and float64's large expm1."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+        x = torch.tensor([-705.0, -700.0, -1.0], dtype=dtype)
+        args = (1.0, 1.0, -1.0)
+    else:
+        x = torch.tensor([-1e-4, -3e-4, -2.0]).to(dtype)
+        args = (1e4, 1.0, 1e-4)
+    want = torch.ops.aten.elu(x, *args)
+    _close(torch.ops.aten.elu(x.to(mojo_gpu), *args), want)
+
+
 @pytest.mark.parametrize("dtype", [torch.int64, torch.int32])
 def test_hardtanh_threshold_integers(mojo_gpu, dtype):
     x = torch.arange(-8, 9, dtype=dtype)

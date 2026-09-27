@@ -5528,6 +5528,27 @@ def test_aten_activation_edges_compiled(dtype: torch.dtype):
     _compiled_matches_cpu(lambda a: aten.hardtanh(a, -1.5, 2.5), [i])
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64])
+def test_aten_elu_compiled_intermediates(dtype: torch.dtype):
+    """elu's intermediates: x * input_scale in float opmath for the half
+    dtypes (-1e-8 underflowed to 0 in float16), and float64's expm1 without
+    overflowing (u - 1) * x for expm1(705) = 1.5e306."""
+    if dtype == torch.float64:
+        x = torch.tensor([-705.0, -700.0, -1.0], dtype=dtype)
+        _compiled_matches_cpu(lambda a: aten.elu(a, 1.0, 1.0, -1.0), [x])
+    else:
+        x = torch.tensor([-1e-4, -3e-4, -2.0]).to(dtype)
+        _compiled_matches_cpu(lambda a: aten.elu(a, 1e4, 1.0, 1e-4), [x])
+
+
+def test_aten_hardtanh_nan_bounds_compiled():
+    """hardtanh is two-bound clamp: a NaN bound fills NaN."""
+    nan = math.nan
+    x = torch.tensor([0.0, 2.0, -2.0, nan])
+    _compiled_matches_cpu(lambda a: aten.hardtanh(a, nan, 1.0), [x])
+    _compiled_matches_cpu(lambda a: aten.hardtanh(a, -1.0, nan), [x])
+
+
 def test_aten_rsub(conf: Conf, call_checker: CallChecker):
     call_checker.register("aten::rsub.Tensor", "aten::rsub.Scalar")
 
