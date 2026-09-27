@@ -32,6 +32,7 @@ from tmb.backend.abi import (
     ST_UINT8,
     T,
     TAG_NONE,
+    TAG_SCALAR_INT,
     Value,
     bits_f64,
     Values,
@@ -1595,25 +1596,37 @@ def _int_exact_param(v: Value, st: Int32) raises -> Float64:
     return v_f64(v)
 
 
-def _hardtanh_p(args: Values, i: Int) raises -> SIMD[DType.float64, 4]:
+def _hardtanh_p(args: Values) raises -> SIMD[DType.float64, 4]:
+    """hardtanh's bounds (args 1, 2) in self's dtype. On an integer self
+    ATen's hardtanh_out first takes each as `toLong()` (a float truncates:
+    -0.5 is 0), refuses a negative one on uint8, and clamps with those
+    integers, which `Scalar::to<scalar_t>()` then checks against the dtype."""
     var st = _self_stype(args, 0)
-    if st == ST_UINT8 and (
-        v_f64(args[unsafe_offset=i]) < 0.0
-        or v_f64(args[unsafe_offset=i + 1]) < 0.0
-    ):
+    if not _pw_is_int(st):
+        return _p(v_f64(args[unsafe_offset=1]), v_f64(args[unsafe_offset=2]))
+    var lo = scalar_to_int(args[unsafe_offset=1], ST_INT64)
+    var hi = scalar_to_int(args[unsafe_offset=2], ST_INT64)
+    if st == ST_UINT8 and (lo < 0 or hi < 0):
         raise Error(
             "cannot do hardtanh on an unsigned type with negative limits"
         )
     return _p(
-        _int_exact_param(args[unsafe_offset=i], st),
-        _int_exact_param(args[unsafe_offset=i + 1], st),
+        _int_exact_param(Value(TAG_SCALAR_INT, 0, Int64(lo), 0), st),
+        _int_exact_param(Value(TAG_SCALAR_INT, 0, Int64(hi), 0), st),
     )
+
+
+def _hardtanh_backward_p(args: Values) raises -> SIMD[DType.float64, 4]:
+    """hardtanh_backward's bounds (args 2, 3): a floating binary op over
+    (grad_output, self), so they are applied in the promoted floating
+    dtype -- never encoded in grad_output's own (possibly integer) one."""
+    return _p(v_f64(args[unsafe_offset=2]), v_f64(args[unsafe_offset=3]))
 
 
 # aten::hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
 def op_hardtanh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _pw_act(
-        "hardtanh", args, rets, 0, -1, -1, _hardtanh_p(args, 1), True, P_NUMERIC
+        "hardtanh", args, rets, 0, -1, -1, _hardtanh_p(args), True, P_NUMERIC
     )
 
 
@@ -1622,27 +1635,27 @@ def op_hardtanh_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     _pw_act(
-        "hardtanh", args, rets, 0, -1, 3, _hardtanh_p(args, 1), True, P_NUMERIC
+        "hardtanh", args, rets, 0, -1, 3, _hardtanh_p(args), True, P_NUMERIC
     )
 
 
 # aten::hardtanh_(Tensor(a!) self, Scalar min_val=-1, Scalar max_val=1) -> Tensor(a!)
 def op_hardtanh_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_act_inplace("hardtanh", args, rets, _hardtanh_p(args, 1), P_NUMERIC)
+    _pw_act_inplace("hardtanh", args, rets, _hardtanh_p(args), P_NUMERIC)
 
 
 # aten::hardtanh_backward(Tensor grad_output, Tensor self, Scalar min_val, Scalar max_val) -> Tensor
 def op_hardtanh_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_act("hardtanh_backward", args, rets, 0, 1, -1, _hardtanh_p(args, 2))
+    _pw_act("hardtanh_backward", args, rets, 0, 1, -1, _hardtanh_backward_p(args))
 
 
 # aten::hardtanh_backward.grad_input(Tensor grad_output, Tensor self, Scalar min_val, Scalar max_val, *, Tensor(a!) grad_input) -> Tensor(a!)
 def op_hardtanh_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_act("hardtanh_backward", args, rets, 0, 1, 4, _hardtanh_p(args, 2))
+    _pw_act("hardtanh_backward", args, rets, 0, 1, 4, _hardtanh_backward_p(args))
 
 
 # aten::leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
