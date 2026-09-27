@@ -923,6 +923,87 @@ def test_integer_scalar_overflow_raises_like_torch(mojo_gpu, case):
         fn(x.to(mojo_gpu))
 
 
+_FLOAT_TO_INT_CASES = [
+    (torch.int8, -128.5),
+    (torch.int8, 127.5),
+    (torch.int8, -0.5),
+    (torch.int8, -128.0),
+    (torch.uint8, -2.0),
+    (torch.uint8, -0.5),
+    (torch.uint8, 127.5),
+    (torch.uint8, 255.5),
+    (torch.int32, 2147483647.5),
+    (torch.int32, -2147483648.0),
+    (torch.int8, float("nan")),
+    (torch.int8, float("inf")),
+]
+
+
+@pytest.mark.parametrize(("dtype", "value"), _FLOAT_TO_INT_CASES)
+def test_float_scalar_on_integer_dtype_converts_like_torch(mojo_gpu, dtype, value):
+    """A float Scalar applied in an integer scalar_t (threshold's threshold
+    and value) is refused outside the dtype's [lowest, max], NaN and inf
+    included, and truncated inside it -- c10's checked_convert."""
+    if not _registered("aten::threshold"):
+        pytest.skip("threshold is not registered on the mojo device")
+    x = torch.tensor([-3, 0, 1, 2, 100], dtype=dtype)
+    for fn in (
+        lambda t: torch.nn.functional.threshold(t, value, 1),
+        lambda t: torch.nn.functional.threshold(t, 0, value),
+    ):
+        _same_outcome(
+            "threshold", _outcome(lambda: fn(x)), _outcome(lambda: fn(x.to(mojo_gpu)))
+        )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "lo", "hi"),
+    [
+        (torch.uint8, -0.5, 3),
+        (torch.uint8, 0, 3.9),
+        (torch.uint8, -1, 3),
+        (torch.uint8, -1.0, 3),
+        (torch.uint8, 0, 300),
+        (torch.int8, -0.5, 3.9),
+        (torch.int8, -128.5, 3),
+        (torch.int32, -(2**40), 2**40),
+    ],
+)
+def test_hardtanh_integer_bounds_convert_like_torch(mojo_gpu, dtype, lo, hi):
+    """hardtanh_out on an integer self takes each bound as `toLong()` (a
+    float truncates: -0.5 is 0, which uint8 accepts), refuses a negative one
+    on uint8, and clamps with the integers, checked against the dtype."""
+    if not _registered("aten::hardtanh"):
+        pytest.skip("hardtanh is not registered on the mojo device")
+    x = torch.tensor([0, 1, 2, 5, 100], dtype=dtype)
+
+    def fn(t: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.hardtanh(t, lo, hi)
+
+    _same_outcome(
+        "hardtanh", _outcome(lambda: fn(x)), _outcome(lambda: fn(x.to(mojo_gpu)))
+    )
+
+
+@pytest.mark.parametrize("grad_dtype", [torch.int64, torch.int32, torch.float16])
+@pytest.mark.parametrize(("lo", "hi"), [(-1, 1), (-0.4, 0.4), (-1.0, 0.25)])
+def test_hardtanh_backward_bounds_in_the_promoted_dtype(mojo_gpu, grad_dtype, lo, hi):
+    """hardtanh_backward is a binary op over (grad_output, self): with an
+    integer grad_output and a float self the bounds apply in the promoted
+    float dtype, not in grad_output's (an int64 unit grad over [-0.5, 0,
+    0.5] with bounds (-1, 1) is [1, 1, 1])."""
+    if not _registered("aten::hardtanh_backward"):
+        pytest.skip("hardtanh_backward is not registered on the mojo device")
+    grad = torch.ones(5, dtype=grad_dtype)
+    x = torch.tensor([-0.5, 0.0, 0.5, -1.0, 0.3])
+    fn = torch.ops.aten.hardtanh_backward
+    cpu = _outcome(lambda: fn(grad, x, lo, hi))
+    ours = _outcome(lambda: fn(grad.to(mojo_gpu), x.to(mojo_gpu), lo, hi))
+    _same_outcome("hardtanh_backward", cpu, ours)
+    if isinstance(ours, torch.Tensor) and isinstance(cpu, torch.Tensor):
+        assert ours.dtype == cpu.dtype
+
+
 @pytest.mark.parametrize("op", ["add_", "mul_", "sub_", "__irshift__", "__ilshift__"])
 def test_inplace_disjoint_strided_views_are_accepted(mojo_gpu, op):
     """`at::assert_no_partial_overlap` judges only non-overlapping-and-dense
