@@ -3609,6 +3609,57 @@ def aten_lcm(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
     return _pointwise_binary(input, other, "lcm", promote_float=False)
 
 
+# ldexp.Tensor(Tensor self, Tensor other) -> Tensor
+@map_to(aten.ldexp.Tensor)
+def aten_ldexp(input: MaxTensor, other: MaxTensor) -> MaxTensor:
+    """BinaryOps.cpp's ldexp: a floating self with an integral exponent is
+    ::ldexp in self's dtype (the mojo device's `ldexp` pointwise kind;
+    bfloat16 computed in float32, whose exponent range its mantissa cannot
+    index exactly); anything else is self * pow(2, other)."""
+    in_dtype = max_dtype_to_torch(input.dtype)
+    ex_dtype = max_dtype_to_torch(other.dtype)
+    if in_dtype.is_floating_point and not ex_dtype.is_floating_point:
+        compute = DType.float32 if input.dtype == DType.bfloat16 else input.dtype
+        shape = find_broadcast_shape(input.shape, other.shape)
+        lhs = _broadcast_to(F.cast(input, compute), shape)
+        rhs = _broadcast_to(F.cast(other, compute), shape)
+        result = custom_mojo_ops.pointwise_binary(lhs, rhs, "ldexp")
+        return result if compute == input.dtype else F.cast(result, input.dtype)
+    # The result dtype, rank-aware like ATen (a 0-d float64 exponent keeps a
+    # float16 self float16), read off ATen's own meta composite.
+    result_dtype = torch.ldexp(
+        torch.empty((0,) * len(input.shape), dtype=in_dtype, device="meta"),
+        torch.empty((0,) * len(other.shape), dtype=ex_dtype, device="meta"),
+    ).dtype
+    if not ex_dtype.is_floating_point:
+        # pow(2.0, int tensor) is a default-float tensor in ATen.
+        other = F.cast(other, torch_dtype_to_max(torch.get_default_dtype()))
+    if in_dtype.is_floating_point and in_dtype != torch.float32:
+        # full({}, 2.0, self.dtype).pow(other)
+        base = _scalar_constant(2.0, dtype=input.dtype, device=input.device)
+        pow2 = aten_pow(base, other)
+    else:
+        pow2 = aten_pow(2.0, other)
+    result = aten_mul(input, _pow2_nonfinite(pow2, other))
+    target = torch_dtype_to_max(result_dtype)
+    return result if result.dtype == target else F.cast(result, target)
+
+
+def _pow2_nonfinite(pow2: MaxTensor, exponent: MaxTensor) -> MaxTensor:
+    """2^inf = inf, 2^-inf = 0 and 2^NaN = NaN: MAX's CPU pow returns 1 for
+    an infinite exponent and inf for a NaN one."""
+    if not exponent.dtype.is_float():
+        return pow2
+    exponent = F.cast(exponent, pow2.dtype)
+
+    def const(value: float) -> MaxTensor:
+        return F.constant(value, dtype=pow2.dtype, device=pow2.device)
+
+    pow2 = _where(exponent == math.inf, const(math.inf), pow2)
+    pow2 = _where(exponent == -math.inf, const(0.0), pow2)
+    return _where(custom_mojo_ops.elementwise(exponent, "isnan"), const(math.nan), pow2)
+
+
 # le.Scalar(Tensor self, Scalar other) -> Tensor
 # le.Tensor(Tensor self, Tensor other) -> Tensor
 @map_to(aten.le)

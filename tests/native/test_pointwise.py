@@ -637,3 +637,202 @@ def test_gcd_lcm_shifts_fmod_int(mojo_gpu, dtype):
     x >>= shift.to(mojo_gpu)
     x_cpu >>= shift
     _close(x, x_cpu)
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_frexp(mojo_gpu, dtype):
+    x = torch.tensor(_SPECIAL + [3.0, 0.25, -1000.0, 1e-38, 6e-39]).to(dtype)
+    x = torch.cat([x, torch.randn(100).to(dtype) * 100])
+    m_cpu, e_cpu = torch.frexp(x)
+    with ran("aten::frexp.Tensor", "aten::frexp.Tensor_out"):
+        m, e = torch.frexp(x.to(mojo_gpu))
+    finite = torch.isfinite(x)
+    _close(m.cpu()[finite], m_cpu[finite], rtol=0.0, atol=0.0)
+    _close(e.cpu()[finite], e_cpu[finite])
+    assert e.dtype == torch.int32
+    mo = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    eo = torch.empty(0, dtype=torch.int32, device=mojo_gpu)
+    torch.frexp(x.to(mojo_gpu), out=(mo, eo))
+    _close(mo.cpu()[finite], m_cpu[finite], rtol=0.0, atol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# deg2rad / rad2deg / ldexp: ATen composes them (empty + mul, pow + mul); one
+# pointwise kernel each here.
+# ---------------------------------------------------------------------------
+
+
+def _only(op: str):
+    """Exactly one native op, `op`, ran inside the block."""
+
+    @contextlib.contextmanager
+    def check():
+        native.op_counting(True)
+        native.op_counts_reset()
+        yield
+        assert native.op_counts() == {op: 1}, native.op_counts()
+
+    return check()
+
+
+@pytest.mark.parametrize("name", ["deg2rad", "rad2deg"])
+@pytest.mark.parametrize(
+    "dtype", [*FLOATS, torch.float64, torch.int64, torch.int32, torch.bool]
+)
+def test_deg2rad_rad2deg(mojo_gpu, name, dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    fn = getattr(torch, name)
+    if dtype.is_floating_point:
+        x = torch.cat([torch.tensor(_SPECIAL), torch.randn(200) * 400]).to(dtype)
+    elif dtype == torch.bool:
+        x = torch.tensor([True, False, True])
+    else:
+        x = torch.arange(-360, 360, 7).to(dtype)
+    xd = x.to(mojo_gpu)
+    with _only(f"aten::{name}"):
+        got = fn(xd)
+    want = fn(x)
+    assert got.dtype == want.dtype
+    _close(
+        got, want, **_tol(want.dtype if want.dtype != torch.float64 else torch.float32)
+    )
+    # strided, out= and in-place
+    m = x[: (x.numel() // 2) * 2].reshape(2, -1)
+    _close(fn(m.to(mojo_gpu).t()), fn(m.t()), **_tol(want.dtype))
+    if dtype.is_floating_point:
+        out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+        fn(x.to(mojo_gpu), out=out)
+        _close(out, want, **_tol(want.dtype))
+        y = x.clone().to(mojo_gpu)
+        getattr(y, name + "_")()
+        _close(y, want, **_tol(want.dtype))
+
+
+_LDEXP_X = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.5,
+    3.25,
+    1e-30,
+    -7e30,
+    1e-40,
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+]
+_LDEXP_E = [
+    0,
+    1,
+    -1,
+    5,
+    -5,
+    60,
+    -60,
+    127,
+    -126,
+    -149,
+    -150,
+    128,
+    200,
+    -200,
+    1000,
+    -1000,
+    100000,
+    -100000,
+]
+
+
+@pytest.mark.parametrize("dtype", [*FLOATS, torch.float64])
+@pytest.mark.parametrize("edtype", [torch.int64, torch.int32, torch.int8])
+def test_ldexp_int_exponent(mojo_gpu, dtype, edtype):
+    """The `_ldexp_int_exponent` route: ::ldexp(x, exp), exact (including
+    subnormal results, rounded once) and saturating."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    info = torch.iinfo(edtype)
+    xs, es = zip(
+        *[(x, e) for x in _LDEXP_X for e in _LDEXP_E if info.min <= e <= info.max]
+    )
+    x = torch.tensor(xs, dtype=torch.float64).to(dtype)
+    e = torch.tensor(es, dtype=edtype)
+    # CPU's ldexp kernel is std::ldexp(double(x), exp) rounded once: exactly
+    # what ::ldexp gives.
+    want = torch.ldexp(x, e)
+    if _flushes_subnormals(mojo_gpu):
+        # A subnormal operand or result is flushed on Apple GPUs (torch MPS,
+        # which multiplies by pow(2, e) instead, flushes it too).
+        keep = ~(_subnormal(x) | _subnormal(want))
+        x, e, want = x[keep], e[keep], want[keep]
+    xd, ed = x.to(mojo_gpu), e.to(mojo_gpu)
+    with _only("aten::ldexp.Tensor"):
+        got = torch.ldexp(xd, ed)
+    assert got.dtype == dtype
+    _close(got, want, rtol=0.0, atol=0.0)
+    # broadcasting, out= and in-place
+    x2 = torch.randn(4, 1).to(dtype)
+    e2 = torch.tensor([-3, 0, 7], dtype=edtype)
+    want2 = torch.ldexp(x2, e2)
+    _close(torch.ldexp(x2.to(mojo_gpu), e2.to(mojo_gpu)), want2, rtol=0.0, atol=0.0)
+    out = torch.empty(4, 3, dtype=dtype, device=mojo_gpu)
+    torch.ldexp(x2.to(mojo_gpu), e2.to(mojo_gpu), out=out)
+    _close(out, want2, rtol=0.0, atol=0.0)
+    y = x2.expand(4, 3).clone().to(mojo_gpu)
+    y.ldexp_(e2.to(mojo_gpu))
+    _close(y, want2, rtol=0.0, atol=0.0)
+
+
+def test_ldexp_general_route(mojo_gpu):
+    """Float exponents and integral self: self * pow(2, other), promoted."""
+    torch.manual_seed(3)
+    x = torch.randn(50)
+    e = (torch.randn(50) * 10).round()
+    for xs, es in [
+        (x, e),
+        (x, e.half()),
+        (x.half(), e.half()),
+        (x.bfloat16(), e),
+        (x.half(), e.bfloat16()),
+        (torch.arange(-5, 5), torch.arange(10)),
+        (torch.arange(-5, 5), torch.randn(10)),
+        (x, e * 0.3),
+    ]:
+        want = torch.ldexp(xs, es)
+        got = torch.ldexp(xs.to(mojo_gpu), es.to(mojo_gpu))
+        assert got.dtype == want.dtype, (xs.dtype, es.dtype)
+        _close(got, want, **_tol(want.dtype, 2))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("edtype", [torch.float64, torch.float32])
+@pytest.mark.parametrize("where", ["mojo", "cpu"])
+def test_ldexp_zero_dim_float_exponent(mojo_gpu, dtype, edtype, where):
+    """A 0-d exponent wider than a half self: pow(2, e) runs in e's dtype
+    (15.999 is not read back as float16 16.0, which overflowed to inf) and
+    is rounded to the half dtype before the product, as TensorIterator's
+    common-dtype cast does. An explicit CPU 0-d exponent is accepted too."""
+    if where == "mojo" and edtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor([1.0, -0.5, 3.0, 1e-3]).to(dtype)
+    e = torch.tensor(15.999, dtype=edtype)
+    got = torch.ldexp(x.to(mojo_gpu), e.to(mojo_gpu) if where == "mojo" else e)
+    _close(got, torch.ldexp(x, e), rtol=0.0, atol=0.0)
+
+
+def test_frexp_rejects_overlapping_out(mojo_gpu):
+    x = torch.rand(3, device=mojo_gpu)
+    exponent = torch.empty(3, dtype=torch.int32, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.frexp(x, out=(torch.empty(1, device=mojo_gpu).expand(3), exponent))
+
+
+def test_ldexp_autograd(mojo_gpu):
+    x_cpu = torch.randn(6, requires_grad=True)
+    e_cpu = torch.randn(6, requires_grad=True)
+    x = x_cpu.detach().to(mojo_gpu).requires_grad_()
+    e = e_cpu.detach().to(mojo_gpu).requires_grad_()
+    torch.ldexp(x, e).sum().backward()
+    torch.ldexp(x_cpu, e_cpu).sum().backward()
+    _close(x.grad, x_cpu.grad, **_tol(torch.float32, 4))
+    _close(e.grad, e_cpu.grad, **_tol(torch.float32, 4))

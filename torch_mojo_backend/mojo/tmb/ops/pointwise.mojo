@@ -2161,10 +2161,14 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     not: Apple GPUs keep the exact route.)"""
     var a = _b_side(args[unsafe_offset=0])
     var b = _b_side(args[unsafe_offset=1])
-    if not a.is_t or not b.is_t:
-        unsupported("ldexp with a scalar operand")
+    if not a.is_t:
+        unsupported("ldexp with a scalar self")
+    if not b.is_t and b.zero_st < 0:
+        unsupported("ldexp with a Python-number exponent")
     var x = a.t.value().copy()
-    var e = b.t.value().copy()
+    # An explicit CPU 0-d exponent is a rank-0 tensor of its own dtype.
+    var e_st = b.t.value().stype if b.is_t else b.zero_st
+    var e_rank = b.t.value().rank if b.is_t else 0
     var dest = Optional[T]()
     if out_index >= 0:
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
@@ -2173,7 +2177,7 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
             raise Error(
                 "ldexp can't be cast to the desired output type ", d.stype
             )
-    var e_integral = _pw_is_int(e.stype) or e.stype == ST_BOOL
+    var e_integral = _pw_is_int(e_st) or e_st == ST_BOOL
     if (
         e_integral
         and _pw_is_float(x.stype)
@@ -2194,12 +2198,12 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     # float base: an integral exponent gives the default dtype), else
     # full({}, 2.0, self.dtype).pow(other), promoted as a 0-d tensor.
     var pdt: Int32
-    if _pw_is_float(e.stype):
-        pdt = e.stype
+    if _pw_is_float(e_st):
+        pdt = e_st
         if not (_pw_is_int(x.stype) or x.stype == ST_BOOL) and (
-            x.stype != ST_FLOAT32 and e.rank == 0
+            x.stype != ST_FLOAT32 and e_rank == 0
         ):
-            pdt = promote_types(x.stype, e.stype)
+            pdt = promote_types(x.stype, e_st)
     elif _pw_is_int(x.stype) or x.stype == ST_BOOL or x.stype == ST_FLOAT32:
         pdt = default_dtype()
     else:
@@ -2207,19 +2211,37 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     # mul(self, pow2): the pow result has other's rank.
     var state = _TypeState(ST_UNDEFINED, ST_UNDEFINED, ST_UNDEFINED)
     _pw_update(state, a)
-    if e.rank == 0:
+    if e_rank == 0:
         state.zero = promote_types(state.zero, pdt)
     else:
         state.dim = promote_types(state.dim, pdt)
     var compute = _pw_combine(state.dim, _pw_combine(state.zero, state.wrapped))
     if not _pw_is_float(compute):
         unsupported("ldexp on dtype " + String(compute))
-    var params = _p(_pw_narrow_code(pdt, compute))
+    var kernel_compute = compute
+    var narrow = pdt
+    if (compute == ST_FLOAT16 or compute == ST_BFLOAT16) and pdt != compute:
+        # A wider 0-d pow result against a half self: the exponent is not
+        # narrowed to the half dtype first (pow runs in pdt), and mul's
+        # TensorIterator casts the pow result to the half common dtype
+        # before the float opmath product. Reading the exponent as the half
+        # dtype instead turned 2^15.999 into 2^16 = inf in float16.
+        kernel_compute = ST_FLOAT32
+        narrow = compute
+    var params = _p(_pw_narrow_code(narrow, kernel_compute))
     _pw_finish(
         rets,
         dest,
         _pw_run(
-            "ldexp_pow2", 2, a, b, _none_side(), compute, compute, params, dest
+            "ldexp_pow2",
+            2,
+            a,
+            b,
+            _none_side(),
+            kernel_compute,
+            compute,
+            params,
+            dest,
         ),
     )
 
@@ -2789,9 +2811,20 @@ def register_pointwise(site: Site) raises:
     impl[op_fmod, "fmod.Tensor"](site)
     impl[op_fmod_out, "fmod.Scalar_out"](site)
     impl[op_fmod_out, "fmod.Tensor_out"](site)
+    impl[op_frexp, "frexp.Tensor"](site)
+    impl[op_frexp_out, "frexp.Tensor_out"](site)
     impl[op_gcd, "gcd"](site)
     impl[op_gcd_out, "gcd.out"](site)
+    impl[op_deg2rad, "deg2rad"](site)
+    impl[op_deg2rad_out, "deg2rad.out"](site)
+    impl[op_deg2rad_, "deg2rad_"](site)
     impl[op_gelu_backward_any, "gelu_backward"](site)
+    impl[op_ldexp, "ldexp.Tensor"](site)
+    impl[op_ldexp_out, "ldexp.out"](site)
+    impl[op_ldexp_, "ldexp_"](site)
+    impl[op_rad2deg, "rad2deg"](site)
+    impl[op_rad2deg_out, "rad2deg.out"](site)
+    impl[op_rad2deg_, "rad2deg_"](site)
     impl[op_heaviside, "heaviside"](site)
     impl[op_heaviside_out, "heaviside.out"](site)
     impl[op_hypot, "hypot"](site)

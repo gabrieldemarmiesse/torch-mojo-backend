@@ -5541,6 +5541,76 @@ def test_aten_inf_predicates(conf: Conf, call_checker: CallChecker, name: str):
     check_outputs(fn, conf, [torch.tensor(_INF_EDGES)])
 
 
+def test_aten_isinf_ldexp_compiled(device: str):
+    checkers = []
+    for twin in (aten_functions.aten_isinf, aten_functions.aten_ldexp):
+        checker = CallChecker()
+        checker.register(twin)
+        checkers.append(checker)
+
+    def fn(
+        x: torch.Tensor, e: torch.Tensor, f: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        return aten.isinf(x), aten.ldexp(x, e), aten.ldexp(x, f)
+
+    # No subnormal operand: MAX's CPU graphs flush them to zero.
+    x = torch.tensor([v if v != 1e-40 else 1e-30 for v in _INF_EDGES], device=device)
+    e = torch.tensor([3, -2, 10, -150, 200, 1, -1, 0], device=device)
+    f = torch.tensor([0.5, 1.0, -3.0, 2.0, 1.0, 1.0, 0.0, 2.0], device=device)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for result, expected in zip(compiled(x, e, f), fn(x, e, f), strict=True):
+        torch.testing.assert_close(result, expected, equal_nan=True)
+    for checker in checkers:
+        checker.check_was_called()
+
+
+def test_aten_ldexp_compiled_edges(device: str):
+    """Integral self and exponent (a default-float result), non-finite float
+    exponents, and a float16 self with a 0-d float64 exponent."""
+    inf, nan = math.inf, math.nan
+
+    def fn(
+        i: torch.Tensor, j: torch.Tensor, x: torch.Tensor, f: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        return aten.ldexp(i, j), aten.ldexp(x, f)
+
+    i = torch.tensor([1, -3, 0, 5], device=device)
+    j = torch.tensor([2, 3, 7, -1], device=device)
+    x = torch.tensor([1.0, 0.0, -2.0, 3.0, nan, inf], device=device)
+    f = torch.tensor([inf, inf, -inf, nan, 1.0, -inf], device=device)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for result, expected in zip(compiled(i, j, x, f), fn(i, j, x, f), strict=True):
+        torch.testing.assert_close(result, expected, equal_nan=True)
+    torch.compiler.reset()
+    h = torch.tensor([1.0, -0.5], dtype=torch.float16, device=device)
+    e = torch.tensor(15.999, dtype=torch.float64, device=device)
+    compiled_half = torch.compile(aten.ldexp, backend=mojo_backend, fullgraph=True)
+    torch.testing.assert_close(compiled_half(h, e), aten.ldexp(h, e))
+
+
+@pytest.mark.parametrize("name", ["deg2rad", "rad2deg"])
+def test_aten_deg2rad_rad2deg(conf: Conf, call_checker: CallChecker, name: str):
+    call_checker.register(f"aten::{name}")
+    op = getattr(aten, name)
+
+    def fn(x):
+        return op(x)
+
+    check_outputs(fn, conf, [torch.randn(4, 9) * 300])
+
+
+@pytest.mark.parametrize("edtype", [torch.int32, torch.float32])
+def test_aten_ldexp(conf: Conf, call_checker: CallChecker, edtype: torch.dtype):
+    call_checker.register(aten_functions.aten_ldexp)
+
+    def fn(x, e):
+        return aten.ldexp(x, e)
+
+    x = torch.randn(3, 7)
+    e = torch.randint(-20, 20, (7,)).to(edtype)
+    check_outputs(fn, conf, [x, e])
+
+
 # Unary math and special functions: (aten_functions twin, aten call, input).
 _SPECIAL_UNARY_CASES = [
     ("angle", lambda x: aten.angle(x), [-2.0, -0.0, 0.0, 3.0]),
