@@ -245,9 +245,25 @@ def test_pow_float64_near_overflow_and_underflow(mojo_gpu):
     with ran("aten::pow.Tensor_Tensor"):
         got = torch.pow(x.to(mojo_gpu), y.to(mojo_gpu)).cpu()
     assert not got.isnan().any()
-    special = ~torch.isfinite(want) | (want == 0)
-    assert torch.equal(got[special], want[special])
-    finite = ~special
+    # Zeros and infinities are compared as masks, both ways: a result
+    # flushed to 0 (or saturated to inf) where the reference is finite and
+    # nonzero fails too. The reference for them is stock CUDA torch, not
+    # CPU: CUDA's double pow returns 0 once y * log|x| <= -745 (__nv_exp's
+    # cutoff), where the exact result still exceeds 2**-1075 down to
+    # -745.1332 and CPU's std::pow rounds it up to the smallest subnormal:
+    # pow(2.0, -1074.9) is 0 on CUDA and here, 5e-324 on CPU.
+    if torch.cuda.is_available() and torch.version.cuda:
+        edge = torch.pow(x.cuda(), y.cuda()).cpu()
+    else:
+        # No CUDA reference: CPU's, where the two libraries agree; in the
+        # band between the cutoffs, either 0 or CPU's 5e-324.
+        band = (want == 5e-324) & (y * torch.log(x) < -744.999)
+        assert ((got[band] == 0) | (got[band] == 5e-324)).all()
+        edge = torch.where(band, got, want)
+    assert torch.equal(got == 0, edge == 0)
+    assert torch.equal(got == math.inf, edge == math.inf)
+    assert torch.equal(got == -math.inf, edge == -math.inf)
+    finite = torch.isfinite(want) & (want != 0) & (got != 0)
     # Within an ulp; below 2**-1022 an ulp is the absolute 5e-324.
     _close(got[finite], want[finite], rtol=2.3e-16, atol=1e-323)
 
