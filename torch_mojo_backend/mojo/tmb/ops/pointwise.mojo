@@ -2748,9 +2748,21 @@ def op_binary_cross_entropy_with_logits_out(
 
 
 def register_pointwise(site: Site) raises:
+    impl[op_atan2, "atan2"](site)
+    impl[op_atan2_out, "atan2.out"](site)
     impl[op_clamp_tensor, "clamp.Tensor"](site)
     impl[op_clamp_tensor_out, "clamp.Tensor_out"](site)
+    impl[op_copysign, "copysign.Scalar"](site)
+    impl[op_copysign, "copysign.Tensor"](site)
+    impl[op_copysign_out, "copysign.Scalar_out"](site)
+    impl[op_copysign_out, "copysign.out"](site)
+    impl[op_fmod, "fmod.Scalar"](site)
+    impl[op_fmod, "fmod.Tensor"](site)
+    impl[op_fmod_out, "fmod.Scalar_out"](site)
+    impl[op_fmod_out, "fmod.Tensor_out"](site)
     impl[op_gelu_backward_any, "gelu_backward"](site)
+    impl[op_hypot, "hypot"](site)
+    impl[op_hypot_out, "hypot.out"](site)
     impl[op_lerp_scalar_any, "lerp.Scalar"](site)
     impl[op_lerp_scalar_out_any, "lerp.Scalar_out"](site)
     impl[op_lerp_scalar__any, "lerp_.Scalar"](site)

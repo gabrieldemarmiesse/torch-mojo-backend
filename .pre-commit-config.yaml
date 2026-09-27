@@ -30,4 +30,4 @@ repos:
       entry: uv run python scripts/generate_elementwise_ops.py --check
       language: system
       pass_filenames: false
-      files: (generate_elementwise_ops\.py|custom_mojo_ops\.py|elementwise_generated\.mojo)$
+      files: (generate_elementwise_ops\.py|custom_mojo_ops\.py|elementwise_generated\.mojo|pointwise_generated\.mojo)$

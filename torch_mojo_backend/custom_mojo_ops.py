@@ -251,6 +251,17 @@ def elementwise(
     )[0]
 
 
+def pointwise_binary(
+    input: MaxTensor,
+    other: MaxTensor,
+    kind: Literal["atan2", "copysign", "fmod", "hypot"],
+) -> MaxTensor:
+    """The mojo device's pointwise math (`tmb/kernels/common/pointwise_math`)
+    as a fusible binary custom op. The operands share a dtype and a shape:
+    promotion and broadcasting happen before the call."""
+    return _same_type_binary(f"pointwise_{kind}", input, other)
+
+
 def gelu_backward(
     grad_output: MaxTensor, input: MaxTensor, *, approximate: str = "none"
 ) -> MaxTensor:

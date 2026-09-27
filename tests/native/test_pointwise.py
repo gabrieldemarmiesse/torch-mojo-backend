@@ -1,5 +1,6 @@
-"""Pointwise math on the native mojo device (tmb/ops/pointwise.mojo): the
-pointwise routes of pow, lerp.Scalar and gelu_backward.
+"""Pointwise math on the native mojo device (tmb/ops/pointwise.mojo): pow,
+lerp (Scalar and Tensor), gelu_backward, clamp.Tensor, rsub and the binary
+math family (atan2, hypot, copysign, fmod so far).
 
 Everything is compared with the same computation on CPU torch through the
 public API, over edge values (signed zeros, infinities, NaN, huge, tiny,
@@ -7,13 +8,14 @@ denormals), broadcasting, strided operands, out= and in-place forms.
 """
 
 import contextlib
+import itertools
 import math
 
 import pytest
 import torch
 
 from tests.native.conftest import skip_if_metal
-from torch_mojo_backend import native
+from torch_mojo_backend import get_accelerators, native
 
 FLOATS = [torch.float32, torch.float16, torch.bfloat16]
 
@@ -57,6 +59,31 @@ def _tol(dtype: torch.dtype, ulps: float = 1.0) -> dict[str, float]:
     if dtype == torch.bfloat16:
         return {"rtol": 1.6e-2, "atol": 1e-5}
     return {"rtol": 0.0, "atol": 0.0}
+
+
+def _pairs(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """Every ordered pair of edge values, plus a random bulk."""
+    a, b = zip(*itertools.product(_SPECIAL, _SPECIAL))
+    torch.manual_seed(0)
+    ra = torch.randn(300) * 4
+    rb = torch.randn(300) * 4
+    x = torch.cat([torch.tensor(a), ra]).to(dtype)
+    y = torch.cat([torch.tensor(b), rb]).to(dtype)
+    return x, y
+
+
+def _flushes_subnormals(device: str) -> bool:
+    """Apple GPUs flush float32 (and bfloat16) subnormals to zero in float
+    arithmetic and compares, as torch MPS's own Metal kernels then do: a
+    subnormal operand or result cannot match CPU torch there."""
+    accelerators = list(get_accelerators())
+    idx = int(device.rsplit(":", 1)[-1])
+    return idx < len(accelerators) and accelerators[idx].api == "metal"
+
+
+def _subnormal(t: torch.Tensor) -> torch.Tensor:
+    tiny = torch.finfo(t.dtype).tiny
+    return (t != 0) & (t.abs() < tiny)
 
 
 def _close(
@@ -386,3 +413,81 @@ def test_clamp_tensor_mixed_dtypes(mojo_gpu):
     )
     xb = x.bfloat16()
     _close(torch.clamp(xb.to(mojo_gpu), lo.to(mojo_gpu)), torch.clamp(xb, lo))
+
+
+# --------------------------------------------------------------------------
+# binary math: atan2, hypot, copysign, fmod (pointwise_math broadcast route)
+# --------------------------------------------------------------------------
+
+
+# name, torch function, overload names, ulps of float32 tolerance
+_BINARY = [
+    ("atan2", torch.atan2, ("aten::atan2",), 2),
+    ("hypot", torch.hypot, ("aten::hypot",), 1),
+    ("copysign", torch.copysign, ("aten::copysign.Tensor",), 0),
+    ("fmod", torch.fmod, ("aten::fmod.Tensor",), 0),
+]
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+@pytest.mark.parametrize("name,fn,ops,ulps", _BINARY, ids=[b[0] for b in _BINARY])
+def test_binary_math_edges(mojo_gpu, name, fn, ops, ulps, dtype):
+    x, y = _pairs(dtype)
+    if name == "atan2" and _flushes_subnormals(mojo_gpu):
+        # These are Metal kernels in torch MPS too, which flush the same way.
+        keep = ~(_subnormal(x) | _subnormal(y))
+        x, y = x[keep], y[keep]
+    expected = fn(x, y)
+    if name == "fmod":
+        # CPU's vectorized fmod is x - trunc(x / y) * y, NaN once the quotient
+        # overflows (1e30 by 1e-30); CUDA's ::fmod, and ours, is exact, which
+        # is what float64 computes for these operands.
+        expected = fn(x.double(), y.double()).to(dtype)
+    with ran(*ops):
+        actual = fn(x.to(mojo_gpu), y.to(mojo_gpu))
+    assert actual.dtype == expected.dtype
+    _close(actual, expected, **_tol(dtype, ulps))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_binary_math_broadcast_scalar_strided_out(mojo_gpu, dtype):
+    torch.manual_seed(1)
+    a_cpu = torch.randn(6, 5).to(dtype)
+    b_cpu = torch.randn(5).to(dtype)
+    a, b = a_cpu.to(mojo_gpu), b_cpu.to(mojo_gpu)
+    for fn in (torch.atan2, torch.hypot, torch.copysign, torch.fmod):
+        _close(fn(a, b), fn(a_cpu, b_cpu), **_tol(dtype, 2))
+        _close(fn(a.t(), a.t()), fn(a_cpu.t(), a_cpu.t()), **_tol(dtype, 2))
+        col = a_cpu[:, :1]
+        _close(fn(a, col.to(mojo_gpu)), fn(a_cpu, col), **_tol(dtype, 2))
+        zero_d = torch.tensor(0.75, dtype=dtype)
+        _close(fn(a, zero_d.to(mojo_gpu)), fn(a_cpu, zero_d), **_tol(dtype, 2))
+        out = torch.empty(5, 6, dtype=dtype, device=mojo_gpu).t()
+        fn(a, b, out=out)
+        _close(out, fn(a_cpu, b_cpu), **_tol(dtype, 2))
+    # Python scalars: copysign.Scalar, fmod.Scalar
+    _close(torch.copysign(a, -1.0), torch.copysign(a_cpu, -1.0))
+    _close(torch.fmod(a, 0.7), torch.fmod(a_cpu, 0.7), **_tol(dtype))
+
+
+def test_binary_math_in_place(mojo_gpu):
+    a_cpu = torch.randn(4, 7)
+    b_cpu = torch.randn(4, 7)
+    for name in ("atan2_", "hypot_", "copysign_", "fmod_"):
+        x, x_cpu = a_cpu.clone().to(mojo_gpu), a_cpu.clone()
+        getattr(x, name)(b_cpu.to(mojo_gpu))
+        getattr(x_cpu, name)(b_cpu)
+        _close(x, x_cpu, **_tol(torch.float32, 2))
+
+
+def test_binary_math_int_promotion(mojo_gpu):
+    i = torch.arange(-6, 6)
+    j = torch.arange(1, 13)
+    for fn in (torch.atan2, torch.copysign):
+        expected = fn(i, j)
+        actual = fn(i.to(mojo_gpu), j.to(mojo_gpu))
+        assert actual.dtype == expected.dtype == torch.float32
+        _close(actual, expected, **_tol(torch.float32, 2))
+    _close(torch.fmod(i.to(mojo_gpu), j.to(mojo_gpu)), torch.fmod(i, j))
+    f = torch.randn(12)
+    _close(torch.atan2(i.to(mojo_gpu), f.to(mojo_gpu)), torch.atan2(i, f))

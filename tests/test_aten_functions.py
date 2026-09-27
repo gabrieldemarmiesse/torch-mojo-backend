@@ -5428,6 +5428,56 @@ def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dty
     _compiled_matches_cpu(fn, [x, y])
 
 
+_POINTWISE_BINARY_TWINS = [
+    ("atan2", aten.atan2, torch.float32, "float"),
+    ("copysign", aten.copysign, torch.float32, "float"),
+    ("fmod", aten.fmod, torch.float32, "float"),
+    ("hypot", aten.hypot, torch.float32, "float"),
+]
+
+
+def _pointwise_operands(domain: str, dtype: torch.dtype) -> list[torch.Tensor]:
+    torch.manual_seed(0)
+    if domain == "int":
+        return [
+            torch.randint(-20, 20, (3, 5)).to(dtype),
+            torch.randint(-20, 20, (5,)).to(dtype),
+        ]
+    if domain == "shift":
+        return [
+            torch.randint(-50, 50, (3, 5)).to(dtype),
+            torch.randint(0, 9, (5,)).to(dtype),
+        ]
+    if domain == "zeta":
+        return [torch.rand(3, 5) * 4 + 1.1, torch.rand(5) + 0.5]
+    if domain == "poly":
+        return [torch.rand(3, 5) * 2 - 1, torch.randint(0, 6, (5,)).float()]
+    return [torch.randn(3, 5).to(dtype), torch.randn(5).to(dtype)]
+
+
+@pytest.mark.parametrize(
+    "name,op,dtype,domain",
+    _POINTWISE_BINARY_TWINS,
+    ids=[t[0] for t in _POINTWISE_BINARY_TWINS],
+)
+def test_aten_pointwise_binary(
+    conf: Conf,
+    call_checker: CallChecker,
+    name: str,
+    op: Callable[..., torch.Tensor],
+    dtype: torch.dtype,
+    domain: str,
+):
+    call_checker.register(getattr(aten_functions, f"aten_{name}"))
+
+    def fn(x, y):
+        return op(x, y)
+
+    inputs = _pointwise_operands(domain, dtype)
+    check_outputs(fn, conf, inputs, rtol=2e-5, atol=2e-5)
+    _compiled_matches_cpu(fn, inputs, rtol=2e-5, atol=2e-5)
+
+
 def test_aten_rsub(conf: Conf, call_checker: CallChecker):
     call_checker.register("aten::rsub.Tensor", "aten::rsub.Scalar")
 

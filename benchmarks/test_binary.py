@@ -64,6 +64,15 @@ BITWISE_OPS = {
     "bitwise_or": torch.bitwise_or,
     "bitwise_xor": torch.bitwise_xor,
 }
+# The pointwise family (tmb/ops/pointwise.mojo): float binary math on
+# operands in unit_interval (inside every domain here: xlogy/xlog1py need
+# y > 0, fmod a nonzero divisor).
+MATH_OPS = {
+    "atan2": torch.atan2,
+    "copysign.Tensor": torch.copysign,
+    "fmod.Tensor": torch.fmod,
+    "hypot": torch.hypot,
+}
 LOGICAL_OPS = {
     "logical_and": torch.logical_and,
     "logical_or": torch.logical_or,
@@ -84,6 +93,7 @@ COVERS: dict[str, str] = (
         for variant in ("Scalar", "Tensor")
     }
     | {f"aten::{name}": "test_logical" for name in LOGICAL_OPS}
+    | {f"aten::{name}": "test_binary_math" for name in MATH_OPS}
     | {
         "aten::pow.Tensor_Scalar": "test_pow[Scalar]",
         "aten::pow.Tensor_Tensor": "test_pow[Tensor]",
@@ -136,8 +146,13 @@ _MAXMIN_BOUND = (
     "ATen's clamp_{min,max}_Tensor_out is maximum_stub / minimum_stub: the "
     "MaximumSpec / MinimumSpec kernels test_minmax measures"
 )
+_SCALAR_OPERAND = (
+    "the Tensor overload's kernel with the scalar passed by value in a slot "
+    "(no device operand read); nothing new to time"
+)
 
 SKIPPED: dict[str, str] = {
+    "aten::atan2.out": _OUT,
     "aten::bitwise_and.Scalar_out": _OUT,
     "aten::bitwise_and.Tensor_out": _OUT,
     "aten::bitwise_or.Scalar_out": _OUT,
@@ -154,6 +169,13 @@ SKIPPED: dict[str, str] = {
     "aten::clamp_min.Tensor": _MAXMIN_BOUND,
     "aten::clamp_min.Tensor_out": _OUT,
     "aten::clamp_min.out": _OUT,
+    "aten::copysign.Scalar": _SCALAR_OPERAND,
+    "aten::copysign.Scalar_out": _OUT,
+    "aten::copysign.out": _OUT,
+    "aten::fmod.Scalar": _SCALAR_OPERAND,
+    "aten::fmod.Scalar_out": _OUT,
+    "aten::fmod.Tensor_out": _OUT,
+    "aten::hypot.out": _OUT,
     "aten::lerp.Tensor_out": _OUT,
     "aten::logical_and.out": _OUT,
     "aten::logical_or.out": _OUT,
@@ -339,6 +361,24 @@ def test_logical(
     shape = SHAPES[shape_id]
     a_ref, a_our = both(torch.rand(shape) < 0.5, hw, mojo_device)
     b_ref, b_our = both(torch.rand(shape) < 0.5, hw, mojo_device)
+    bench.run(
+        lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(MATH_OPS))
+def test_binary_math(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = MATH_OPS[op_name]
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
     bench.run(
         lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
     )
