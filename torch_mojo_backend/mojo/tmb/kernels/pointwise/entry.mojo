@@ -262,13 +262,13 @@ def _wide_f32[kind: StaticString]() -> Bool:
 
 @always_inline
 def _host_value[dt: DType](v: Float64) -> Scalar[dt]:
-    """A host scalar in the operand dtype. An integer (not bool) operand's
-    slot holds the int64's bits (the ops layer's `_pw_flat`), narrowed here
-    with two's complement wrap as torch narrows a wrapped number; a bool one
-    is a float64 0 / 1."""
+    """A host scalar in the operand dtype. An integer or bool operand's slot
+    holds the int64's bits (the ops layer's `_pw_flat`; a bool travels as
+    the byte type here), narrowed with two's complement wrap as torch
+    narrows a wrapped number."""
     comptime if dt.is_floating_point():
         return v.cast[dt]()
-    elif dt.is_integral() and dt != DType.bool:
+    elif dt.is_integral():
         return bitcast[DType.int64](v).cast[dt]()
     else:
         return Scalar[dt](Int(v))
@@ -479,7 +479,7 @@ def _pointwise_go[kind: StaticString, arity: Int](argv: Argv, argc: Int) raises:
                             # MPS's kernels take these as scalar_t.
                             pd = pd.cast[dt]().cast[DType.float64]()
                         var params = pd.cast[pdt]()
-                        comptime if dt.is_integral() and dt != DType.bool:
+                        comptime if dt.is_integral():
                             # Integer parameters travel as the int64's bits
                             # (`_int_exact_param`): exact past 2**53.
                             params = rebind[SIMD[pdt, 4]](

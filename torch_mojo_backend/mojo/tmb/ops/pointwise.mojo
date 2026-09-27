@@ -242,9 +242,9 @@ def _pw_flat(
 ) raises -> _Flat:
     if not side.is_t:
         var s = side.s.value().copy()
-        if _pw_is_int(compute):
-            # An integer operand travels as its int64 bits in the float64
-            # slot (see `_host_value`), exact across int64.
+        if _pw_is_int(compute) or compute == ST_BOOL:
+            # An integer (or bool: 0 / 1) operand travels as its int64 bits
+            # in the float64 slot (see `_host_value`), exact across int64.
             var i = s.i if s.is_int else Int(s.f)
             return _Flat(MODE_HOST, 0, bits_f64(Int64(i)))
         return _Flat(MODE_HOST, 0, s.f)
