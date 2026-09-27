@@ -2868,6 +2868,32 @@ def aten_div(
 
 
 # elu(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1) -> Tensor
+@map_to(aten.elu)
+def aten_elu(
+    input: MaxTensor, alpha: float = 1.0, scale: float = 1.0, input_scale: float = 1.0
+) -> MaxTensor:
+    """ActivationEluKernel.cu: x > 0 ? x * scale
+    : expm1(x * input_scale) * alpha * scale. expm1, not exp(x) - 1, which
+    cancels to 0 near zero (bfloat16 -0.001 gave 0)."""
+    negative = _expm1(input * input_scale) * (alpha * scale)
+    return _where(input > 0, input * scale, negative)
+
+
+def _expm1(x: MaxTensor) -> MaxTensor:
+    """e^x - 1 without the cancellation near 0: the shared expm1 kind (float
+    math, which refuses float64), and Kahan's (u - 1) * x / log(u) with
+    u = e^x for float64."""
+    if x.dtype != DType.float64:
+        return custom_mojo_ops.elementwise(x, "expm1")
+    # The shared exp / log kinds: MAX's own CPU exp reads NaN as +inf.
+    u = custom_mojo_ops.elementwise(x, "exp")
+    one = F.constant(1.0, dtype=x.dtype, device=x.device)
+    corrected = (u - one) * x / custom_mojo_ops.elementwise(u, "log")
+    near_zero = _where(u == one, x, corrected)
+    # u = 0 (x -> -inf) and u = inf keep the plain difference: -1 and inf
+    # (isinf, not `u == inf`, which MAX's CPU compare answers True for NaN).
+    saturated = F.logical_or(u == 0.0, custom_mojo_ops.elementwise(u, "isinf"))
+    return _where(saturated, u - one, near_zero)
 
 
 # embedding(Tensor weight, Tensor indices, SymInt padding_idx=-1, bool scale_grad_by_freq=False, bool sparse=False) -> Tensor
@@ -3306,6 +3332,16 @@ def aten_gt(x: MaxTensor, y: int | float | MaxTensor) -> MaxTensor:
 
 
 # hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
+@map_to(aten.hardtanh)
+def aten_hardtanh(
+    input: MaxTensor, min_val: float = -1.0, max_val: float = 1.0
+) -> MaxTensor:
+    """clamp(x, min_val, max_val), as ATen implements it: NaN propagates
+    (aten_clamp), and an integral tensor takes the bounds truncated to its
+    own type (Scalar::to<int64_t>), not a float promotion."""
+    if not input.dtype.is_float():
+        return aten_clamp(input, int(min_val), int(max_val))
+    return aten_clamp(input, min_val, max_val)
 
 
 # heaviside(Tensor self, Tensor values) -> Tensor
@@ -3684,6 +3720,11 @@ def aten_le(input: MaxTensor, other: Scalar | MaxTensor) -> MaxTensor:
 
 
 # leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
+@map_to(aten.leaky_relu)
+def aten_leaky_relu(input: MaxTensor, negative_slope: float = 0.01) -> MaxTensor:
+    return _where(input > 0, input, input * negative_slope)
+
+
 # linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
 @map_to(aten.linear)
 def aten_linear(

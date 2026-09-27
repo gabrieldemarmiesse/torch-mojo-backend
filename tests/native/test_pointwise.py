@@ -14,6 +14,7 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import get_accelerators, native
@@ -951,3 +952,141 @@ def test_ldexp_autograd(mojo_gpu):
     torch.ldexp(x_cpu, e_cpu).sum().backward()
     _close(x.grad, x_cpu.grad, **_tol(torch.float32, 4))
     _close(e.grad, e_cpu.grad, **_tol(torch.float32, 4))
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_pow_scalar_base(mojo_gpu, dtype):
+    e = torch.cat([torch.tensor(_SPECIAL), torch.randn(50) * 3]).to(dtype)
+    for base in (2.0, 0.5, 1.0, 10.0, 0.0, -2.0):
+        with ran("aten::pow.Scalar"):
+            actual = torch.pow(base, e.to(mojo_gpu))
+        want = torch.pow(base, e)
+        if _flushes_subnormals(mojo_gpu):
+            # Apple GPUs flush subnormal operands and results (torch MPS's
+            # Metal pow as well).
+            keep = ~(_subnormal(e) | _subnormal(want))
+            actual, want = actual.cpu()[keep], want[keep]
+        _close(actual, want, **_tol(dtype, 2))
+    out = torch.empty_like(e, device=mojo_gpu)
+    torch.pow(3.0, e.to(mojo_gpu), out=out)
+    _close(out, torch.pow(3.0, e), **_tol(dtype, 2))
+
+
+# --------------------------------------------------------------------------
+# activations
+# --------------------------------------------------------------------------
+
+
+def _in(x: torch.Tensor, value: float) -> float:
+    """`value` rounded to x's dtype: CUDA's shrink/threshold kernels compare
+    against `value.to<scalar_t>()`, CPU's reduced-float ones against the
+    float value; passing the rounded value makes both agree."""
+    return torch.tensor(value, dtype=x.dtype).item()
+
+
+_ACT = [
+    ("elu", lambda x: F.elu(x), "aten::elu"),
+    ("elu_params", lambda x: torch.ops.aten.elu(x, 0.7, 1.3, 0.8), "aten::elu"),
+    ("selu", lambda x: F.selu(x), "aten::elu"),
+    ("celu", lambda x: F.celu(x, 1.5), "aten::elu"),
+    ("hardtanh", lambda x: F.hardtanh(x, -0.4, 1.7), "aten::hardtanh"),
+    ("relu6", lambda x: F.relu6(x), "aten::hardtanh"),
+    ("leaky_relu", lambda x: F.leaky_relu(x, 0.2), "aten::leaky_relu"),
+    ("softplus", lambda x: F.softplus(x), "aten::softplus"),
+    ("softplus_params", lambda x: F.softplus(x, 2.0, 3.0), "aten::softplus"),
+    ("threshold", lambda x: F.threshold(x, _in(x, 0.3), -2.0), "aten::threshold"),
+]
+
+
+def _act_input(dtype: torch.dtype) -> torch.Tensor:
+    torch.manual_seed(7)
+    edges = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            3.0,
+            -3.0,
+            0.3,
+            -0.3,
+            20.0,
+            25.0,
+            -20.0,
+            88.0,
+            -88.0,
+            1e-30,
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+        ]
+    )
+    return torch.cat([edges, torch.randn(200) * 4]).to(dtype)
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+@pytest.mark.parametrize("name,fn,op", _ACT, ids=[a[0] for a in _ACT])
+def test_activation_forward(mojo_gpu, name, fn, op, dtype):
+    x = _act_input(dtype)
+    with ran(op):
+        actual = fn(x.to(mojo_gpu))
+    _close(actual, fn(x), **_tol(dtype, 3))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("name,fn,op", _ACT, ids=[a[0] for a in _ACT])
+def test_activation_autograd(mojo_gpu, name, fn, op, dtype):
+    """forward + backward against CPU: the backward kernels (elu_backward,
+    hardtanh_backward, ...) run natively."""
+    x_cpu = _act_input(dtype)
+    x_cpu = x_cpu[torch.isfinite(x_cpu)].clone().requires_grad_()
+    x = x_cpu.detach().to(mojo_gpu).requires_grad_()
+    g = torch.randn(x_cpu.shape).to(dtype)
+    y_cpu = fn(x_cpu)
+    y_cpu.backward(g)
+    y = fn(x)
+    y.backward(g.to(mojo_gpu))
+    _close(y.detach(), y_cpu.detach(), **_tol(dtype, 3))
+    _close(x.grad, x_cpu.grad, **_tol(dtype, 3))
+
+
+def test_activation_single_native_ops(mojo_gpu):
+    """relu6 -> hardtanh, selu / celu -> elu: one native op each, forward
+    and backward."""
+    x = torch.randn(33, device=mojo_gpu, requires_grad=True)
+    cases = [
+        (F.relu6, "aten::hardtanh", "aten::hardtanh_backward"),
+        (F.selu, "aten::elu", "aten::elu_backward"),
+        (lambda t: F.celu(t, 0.5), "aten::elu", "aten::elu_backward"),
+    ]
+    for fn, fwd, bwd in cases:
+        native.op_counting(True)
+        f0, b0 = native.op_count(fwd), native.op_count(bwd)
+        y = fn(x)
+        assert native.op_count(fwd) == f0 + 1
+        y.sum().backward()
+        assert native.op_count(bwd) == b0 + 1
+        x.grad = None
+
+
+def test_activation_in_place_and_out(mojo_gpu):
+    x_cpu = _act_input(torch.float32)
+    for fn in (
+        lambda t: F.elu(t, inplace=True),
+        lambda t: F.hardtanh(t, inplace=True),
+        lambda t: F.leaky_relu(t, 0.1, inplace=True),
+        lambda t: F.threshold(t, 0.5, 1.0, inplace=True),
+    ):
+        x, xc = x_cpu.clone().to(mojo_gpu), x_cpu.clone()
+        fn(x)
+        fn(xc)
+        _close(x, xc, **_tol(torch.float32, 3))
+    out = torch.empty(0, device=mojo_gpu)
+    torch.ops.aten.softplus.out(x_cpu.to(mojo_gpu), 1.0, 20.0, out=out)
+    _close(out, F.softplus(x_cpu), **_tol(torch.float32, 3))
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.int32])
+def test_hardtanh_threshold_integers(mojo_gpu, dtype):
+    x = torch.arange(-8, 9, dtype=dtype)
+    _close(F.hardtanh(x.to(mojo_gpu), -3, 5), F.hardtanh(x, -3, 5))
+    _close(F.relu6(x.to(mojo_gpu)), F.relu6(x))
+    _close(F.threshold(x.to(mojo_gpu), 2, 7), F.threshold(x, 2, 7))
