@@ -249,6 +249,22 @@ def test_round_decimals(mojo_gpu: str, dtype: torch.dtype, decimals: int):
     torch.testing.assert_close(inplace.cpu(), expected, equal_nan=True)
 
 
+@pytest.mark.parametrize("decimals", (-25, -23, 23, 25, -300, 300))
+def test_round_decimals_large_float64(mojo_gpu: str, decimals: int):
+    """10^|decimals| past 10^22 is the C library's pow, as in torch: a loop
+    of `*= 10` drifts (10^25 read 9.999999999999999e24, so
+    round(5e24, decimals=-25) gave 1e25 instead of 0)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor(
+        [5e24, 1.5e25, -5e24, 4.9e22, 1e23, 5e-24, 5e-26, 1.25e-23, 3e299, 7e-301],
+        dtype=torch.float64,
+    )
+    actual = torch.round(x.to(mojo_gpu), decimals=decimals)
+    torch.testing.assert_close(
+        actual.cpu(), torch.round(x, decimals=decimals), rtol=0.0, atol=0.0
+    )
+
+
 @pytest.mark.parametrize(
     "dtype", (torch.float32, torch.float16, torch.bfloat16, torch.float64)
 )

@@ -18,6 +18,8 @@ isnan/logical_not accept the same broad set plus bool (bool read through its
 uint8 storage). Anything else declines with `unsupported(...)`, matching the
 old NOT_HANDLED convention.
 """
+from std.ffi import external_call
+
 from tmb.backend.abi import (
     Owned,
     ST_FLOAT64,
@@ -1479,9 +1481,10 @@ def _round_decimals_params(
     """
     _require_float_or_f64("round", t)
     var n = decimals if decimals >= 0 else -decimals
-    var ten_pow = Float64(1.0)
-    for _ in range(n):
-        ten_pow *= 10.0
+    # The C library's pow, the very call torch makes: a loop of `*= 10`
+    # drifts by ulps past 10^22 (10^25 came out 9.999999999999999e24, so
+    # round(5e24, decimals=-25) gave 1e25 instead of 0).
+    var ten_pow = external_call["pow", Float64](Float64(10.0), Float64(n))
     return (
         ten_pow,
         Float64(1.0) if decimals < 0 else Float64(0.0),
