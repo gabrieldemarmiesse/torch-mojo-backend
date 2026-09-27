@@ -1312,6 +1312,55 @@ def test_rrelu_noise_aliasing_self(mojo_gpu):
     _close(x, torch.tensor([0.25, 1.0, 0.25]), rtol=0.0, atol=0.0)
 
 
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_rrelu_in_place_negative_slope(mojo_gpu, dtype):
+    """In place, every slope reads the input as it was: a negative slope
+    turns x = -2 into 1, and the noise must still hold -0.5 (it read the
+    output's sign and saved 1). With `out` aliasing `noise`, the noise is
+    written last, as in the CUDA kernel."""
+    x_cpu = torch.tensor([-2.0, 3.0, -0.5])
+    want_x, want_n = x_cpu.clone(), torch.empty_like(x_cpu)
+    # CPU torch has no half rrelu; lower == upper makes the slope exact.
+    torch.ops.aten.rrelu_with_noise_(want_x, want_n, -0.5, -0.5, True)
+    x = x_cpu.to(dtype).to(mojo_gpu)
+    noise = torch.empty(3, dtype=dtype, device=mojo_gpu)
+    torch.ops.aten.rrelu_with_noise_(x, noise, -0.5, -0.5, True)
+    _close(x, want_x.to(dtype), rtol=0.0, atol=0.0)
+    _close(noise, want_n.to(dtype), rtol=0.0, atol=0.0)
+    shared = torch.empty(3, dtype=dtype, device=mojo_gpu)
+    torch.ops.aten.rrelu_with_noise.out(
+        x_cpu.to(dtype).to(mojo_gpu), shared, -0.5, -0.5, True, out=shared
+    )
+    _close(shared, want_n.to(dtype), rtol=0.0, atol=0.0)
+
+
+def test_rrelu_training_out_dtype_and_log_sigmoid_backward_dtypes(mojo_gpu):
+    """Training rrelu_with_noise.out writes scalar_t (no cast into another
+    dtype), and log_sigmoid_backward takes one dtype (no promotion), both
+    raising as CPU torch does."""
+    aten = torch.ops.aten
+    x_cpu = torch.tensor([-2.0, 3.0])
+    x = x_cpu.to(mojo_gpu)
+    out = torch.empty(2, dtype=torch.float16, device=mojo_gpu)
+    with pytest.raises(RuntimeError):
+        aten.rrelu_with_noise.out(
+            x_cpu, torch.empty(2), 0.1, 0.3, True, out=torch.empty(2).half()
+        )
+    with pytest.raises(RuntimeError):
+        aten.rrelu_with_noise.out(x, torch.empty_like(x), 0.1, 0.3, True, out=out)
+    buf_cpu = aten.log_sigmoid_forward(x_cpu)[1]
+    g_cpu = torch.ones(2, dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="Found dtype"):
+        aten.log_sigmoid_backward(g_cpu, x_cpu, buf_cpu)
+    buf = torch.empty(0, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Found dtype"):
+        aten.log_sigmoid_backward(g_cpu.to(mojo_gpu), x, buf)
+    with pytest.raises(RuntimeError, match="Found dtype"):
+        aten.log_sigmoid_backward.grad_input(
+            g_cpu.to(mojo_gpu), x, buf, grad_input=torch.empty(2, device=mojo_gpu)
+        )
+
+
 def test_activation_c_out_overloads(mojo_gpu):
     torch.manual_seed(4)
     g_cpu, x_cpu = torch.randn(3, 5), torch.randn(3, 5) * 3

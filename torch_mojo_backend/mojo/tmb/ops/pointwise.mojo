@@ -2012,11 +2012,23 @@ def op_log_sigmoid_forward_output(
     ret_ref(rets, 1, v_tensor(args[unsafe_offset=2]))
 
 
+def _log_sigmoid_backward_check(args: Values) raises:
+    """ATen builds log_sigmoid_backward's iterator with the default
+    check_all_same_dtype: grad_output must have self's dtype, no promotion."""
+    var grad = _pw_side_stype(_b_side(args[unsafe_offset=0]))
+    var self = _pw_side_stype(_b_side(args[unsafe_offset=1]))
+    if grad != self:
+        raise Error(
+            "Found dtype ", dtype_name(grad), " but expected ", dtype_name(self)
+        )
+
+
 # aten::log_sigmoid_backward(Tensor grad_output, Tensor self, Tensor buffer) -> Tensor
 def op_log_sigmoid_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     # The CUDA iterator's operand order: (self, grad_output); buffer unused.
+    _log_sigmoid_backward_check(args)
     _pw_act("log_sigmoid_backward", args, rets, 1, 0, -1, _p())
 
 
@@ -2024,6 +2036,7 @@ def op_log_sigmoid_backward(
 def op_log_sigmoid_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    _log_sigmoid_backward_check(args)
     _pw_act("log_sigmoid_backward", args, rets, 1, 0, 3, _p())
 
 
@@ -2084,7 +2097,12 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
         raise Error(
             "rrelu_with_noise: noise must match the input's dtype and shape"
         )
-    var draw = own(new_tensor(self.shape, self.rank, self.stype, self.device))
+    # The draw is curand's float (a double for float64), as the CUDA kernel
+    # reads it: drawn in a half dtype, a draw below 2^-25 would round to the
+    # 0 that the kernel reads back as uniform_'s folded 1. uniform_ draws a
+    # half tensor from the same float stream, so the offsets agree.
+    var draw_st = ST_FLOAT64 if self.stype == ST_FLOAT64 else ST_FLOAT32
+    var draw = own(new_tensor(self.shape, self.rank, draw_st, self.device))
     _draw(draw.t, "Uniform", 0.0, 1.0, 0, 0, v_generator(args[unsafe_offset=5]))
     var a = _b_tside(self)
     var b = _b_tside(draw.t)
@@ -2108,39 +2126,41 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
         dest = _pw_out_of(
             args[unsafe_offset=out_index], a, _none_side(), _none_side()
         )
-    # The output first, then the noise: `noise` may be `self` itself
-    # (rrelu_with_noise(x, x, ...)), and the CUDA kernel reads each input
-    # element before it writes that element's noise. In place, the output
-    # keeps every element's sign, so the noise predicate reads the same.
-    var res = _pw_run(
-        "rrelu_train",
-        2,
-        a,
-        b,
-        _none_side(),
-        self.stype,
-        self.stype,
-        params,
-        dest,
-    )
+    # Every slope comes from the input as it was: the noise into a fresh
+    # tensor first, then the output (which may be `self`, in place), then
+    # the noise into `noise`, last, as the CPU kernel writes each element's
+    # noise after its output (so `noise` aliasing `self` or `out` ends up
+    # holding the slopes). Computing in place first would flip the sign a
+    # negative slope reads (x = -2, slope -0.5: noise 1 instead of -0.5).
     var noise_res = _pw_run(
         "rrelu_noise",
         2,
         a,
         b,
         _none_side(),
-        self.stype,
+        draw_st,
         self.stype,
         params,
-        noise.copy(),
+        Optional[T](),
     )
-    if noise_res.owned:
-        # A non-dense noise: copy the dense result into it.
-        var held = own(noise_res.t.copy())
-        copy_strided_into(noise, held.t)
-        _ = held^
+    var held = own(noise_res.t.copy())
+    var res = _pw_run(
+        "rrelu_train",
+        2,
+        a,
+        b,
+        _none_side(),
+        draw_st,
+        self.stype,
+        params,
+        dest,
+    )
+    copy_strided_into(noise, held.t)
+    _ = held^
+    _ = noise_res^
     _ = draw^
-    _pw_finish(rets, dest, res^)
+    # The CUDA kernel writes `out` as scalar_t: no cast into another dtype.
+    _pw_finish(rets, dest, res^, True)
 
 
 # aten::rrelu_with_noise(Tensor self, Tensor(b!) noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor
