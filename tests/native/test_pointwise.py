@@ -1107,6 +1107,17 @@ def test_leaky_relu_slope_in_opmath(mojo_gpu, dtype):
         _close(F.leaky_relu(x_cpu.to(mojo_gpu), slope), F.leaky_relu(x_cpu, slope))
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_elu_scalars_in_opmath(mojo_gpu, dtype):
+    if dtype == torch.float16:
+        # Stock MPS reads elu's scalars as half (ActivationKernel.metal:
+        # REGISTER_UNARY_ALPHA_OP(elu, T, ELUParams_##T, T)), as Apple GPUs do.
+        skip_if_metal(mojo_gpu, "MPS keeps elu's scalars in the input dtype")
+    x = torch.tensor([-1.0, -0.5, 2.0]).to(dtype)
+    want = torch.ops.aten.elu(x, 1e-46, 1e38, -10.0)
+    _close(torch.ops.aten.elu(x.to(mojo_gpu), 1e-46, 1e38, -10.0), want)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64])
 def test_elu_intermediates(mojo_gpu, dtype):
     """elu's float opmath for the half dtypes and float64's large expm1."""

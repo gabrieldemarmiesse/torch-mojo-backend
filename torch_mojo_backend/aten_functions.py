@@ -2879,7 +2879,16 @@ def aten_elu(
     if dtype in (DType.float16, DType.bfloat16):
         # The kernel's opmath: x * input_scale must not underflow in half.
         input = F.cast(input, DType.float32)
-    negative = _expm1(input * input_scale) * (alpha * scale)
+    # Each Scalar is read as opmath_t, and negcoef = alpha * scale is an
+    # opmath product (alpha = 1e-46 is float32 0, whatever scale is).
+    opmath = torch.float64 if input.dtype == DType.float64 else torch.float32
+
+    def to_opmath(v: float) -> float:
+        return torch.tensor(v, dtype=opmath).item()
+
+    alpha, scale, input_scale = map(to_opmath, (alpha, scale, input_scale))
+    negcoef = to_opmath(alpha * scale)
+    negative = _expm1(input * input_scale) * negcoef
     result = _where(input > 0, input * scale, negative)
     return result if result.dtype == dtype else F.cast(result, dtype)
 

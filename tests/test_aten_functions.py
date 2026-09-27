@@ -5551,6 +5551,14 @@ def test_aten_leaky_relu_compiled_slope_in_opmath(dtype: torch.dtype):
     _compiled_matches_cpu(lambda a: aten.leaky_relu(a, 1e-8), [y])
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_aten_elu_compiled_scalars_in_opmath(dtype: torch.dtype):
+    """alpha, scale and input_scale are each read as opmath_t, and their
+    product rounds there: alpha = 1e-46 is float32 0, so the loss is 0."""
+    x = torch.tensor([-1.0, -0.5, 2.0]).to(dtype)
+    _compiled_matches_cpu(lambda a: aten.elu(a, 1e-46, 1e38, -10.0), [x])
+
+
 def test_aten_hardtanh_nan_bounds_compiled():
     """hardtanh is two-bound clamp: a NaN bound fills NaN."""
     nan = math.nan
