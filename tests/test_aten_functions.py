@@ -5972,8 +5972,11 @@ _SPECIAL_UNARY_CASES = [
     ("erfinv", lambda x: aten.erfinv(x), [-0.999, -0.5, 0.0, 0.3, 0.9]),
     ("exp2", lambda x: aten.exp2(x), [-100.0, -1.5, 0.0, 3.0, 60.0]),
     ("expm1", lambda x: aten.expm1(x), [-20.0, -1e-4, 0.0, 1e-3, 5.0]),
+    ("frac", lambda x: aten.frac(x), [-2.75, -0.5, 0.0, 1.25, 100.5]),
     ("log10", lambda x: aten.log10(x), [1e-3, 0.5, 1.0, 10.0, 1e5]),
     ("nan_to_num", lambda x: aten.nan_to_num(x, 0.5), [-1.0, 0.0, 2.0, 1e3, 3.0]),
+    ("round", lambda x: aten.round(x), [-2.5, -0.5, 0.5, 1.5, 2.4]),
+    ("round", lambda x: aten.round(x, decimals=2), [-2.555, 0.125, 1.005, 3.14159]),
     ("sgn", lambda x: aten.sgn(x), [-2.0, -0.0, 0.0, 3.0]),
     ("signbit", lambda x: aten.signbit(x), [-2.0, -0.0, 0.0, 3.0]),
     ("sinc", lambda x: aten.sinc(x), [-2.5, -0.1, 0.0, 0.5, 7.0]),
@@ -6024,6 +6027,7 @@ _SPECIAL_UNARY_CASES = [
         lambda x: aten.special_spherical_bessel_j0(x),
         [-7.0, 0.0, 0.25, 9.0],
     ),
+    ("trunc", lambda x: aten.trunc(x), [-2.5, -0.5, 0.5, 1.5, 2.4]),
 ]
 
 

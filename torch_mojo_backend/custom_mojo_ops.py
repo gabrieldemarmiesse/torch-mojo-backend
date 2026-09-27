@@ -193,6 +193,7 @@ def elementwise(
         "exp2",
         "expm1",
         "floor",
+        "frac",
         "gelu_none",
         "gelu_tanh",
         "i0e",
@@ -214,6 +215,7 @@ def elementwise(
         "neg",
         "reciprocal",
         "relu",
+        "round",
         "rsqrt",
         "scaled_modified_bessel_k0",
         "scaled_modified_bessel_k1",
@@ -228,6 +230,7 @@ def elementwise(
         "sqrt",
         "tan",
         "tanh",
+        "trunc",
     ],
 ) -> MaxTensor:
     """Call shared unary math through MAX's fusible Mojo registrations."""
@@ -245,9 +248,11 @@ def elementwise(
             "logical_not",
             "neg",
             "relu",
+            "round",
             "sign",
             "signbit",
             "silu",
+            "trunc",
         }
         and not input.dtype.is_float()
     ):

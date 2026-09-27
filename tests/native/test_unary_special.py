@@ -1,6 +1,7 @@
 """Tests for the unary math and special functions of the native `unary` op
 group (torch_mojo_backend/mojo/tmb/ops/unary.mojo): asin/atan/erfc/erfinv/
-exp2/expm1/log10/sinc/angle/sgn/signbit/nan_to_num and the torch.special
+exp2/expm1/log10/sinc/angle/frac/trunc/round/sgn/signbit/nan_to_num and the
+torch.special
 Bessel functions (bessel_j0/j1/y0/y1, modified_bessel_i0/i1/k0/k1,
 scaled_modified_bessel_k0/k1, spherical_bessel_j0), i0e/i1/i1e, airy_ai,
 entr, erfcx, log_ndtr and ndtri so far, whose kernels port the CUDA
@@ -14,7 +15,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from tests.native.conftest import skip_if_metal
+from tests.native.conftest import is_metal, skip_if_metal
 from torch_mojo_backend import native
 
 S = torch.special
@@ -71,6 +72,9 @@ _CASES: list[tuple[str, Callable[[torch.Tensor], torch.Tensor], float, float]] =
     ("special_scaled_modified_bessel_k1", S.scaled_modified_bessel_k1, 0.0, 30.0),
     ("special_spherical_bessel_j0", S.spherical_bessel_j0, -30.0, 30.0),
     ("angle", torch.angle, -5.0, 5.0),
+    ("frac", torch.frac, -100.0, 100.0),
+    ("trunc", torch.trunc, -100.0, 100.0),
+    ("round", torch.round, -100.0, 100.0),
     ("sgn", torch.sgn, -5.0, 5.0),
 ]
 _IDS = [case[0] for case in _CASES]
@@ -101,6 +105,21 @@ def _expected(fn: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor):
         return fn(x.float()).to(x.dtype)
 
 
+# On Apple GPUs these ops port torch's MPS kernels, whose results differ
+# from CPU torch beyond the test tolerance, so the reference there is stock
+# torch on the same machine (the `mps` device): round_decimals'
+# rint(exp10(n) x) exp10(-n) in float.
+_MPS_SEMANTICS: set[str] = set()
+
+
+def _reference(
+    device: str, op_name: str, fn: Callable[..., torch.Tensor], x: torch.Tensor
+) -> torch.Tensor:
+    if op_name in _MPS_SEMANTICS and is_metal(device):
+        return fn(x.to("mps")).cpu()
+    return _expected(fn, x)
+
+
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
 @pytest.mark.parametrize("op_name,fn,lo,hi", _CASES, ids=_IDS)
 def test_matches_cpu(
@@ -115,7 +134,8 @@ def test_matches_cpu(
     _reset_counts()
     actual = fn(x.to(mojo_gpu))
     assert _counted(op_name), f"aten::{op_name} did not run natively"
-    torch.testing.assert_close(actual.cpu(), _expected(fn, x), equal_nan=True)
+    expected = _reference(mojo_gpu, op_name, fn, x)
+    torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
 
 
 @pytest.mark.parametrize("op_name,fn,lo,hi", _CASES, ids=_IDS)
@@ -125,7 +145,7 @@ def test_layouts_out_and_inplace(
     """A transposed input, an unaligned (offset 1) input, out= into a
     strided view and the in-place method (which ATen routes to .out)."""
     x = _sample(lo, hi, torch.float32, n=15 * 17 - len(_EDGES)).reshape(15, 17)
-    expected = fn(x)
+    expected = _reference(mojo_gpu, op_name, fn, x)
     device = x.to(mojo_gpu)
     torch.testing.assert_close(fn(device.t()).cpu(), expected.t(), equal_nan=True)
     storage = torch.cat((torch.zeros(1), x.flatten())).to(mojo_gpu)
@@ -143,6 +163,13 @@ def test_layouts_out_and_inplace(
         torch.testing.assert_close(inplace.cpu(), expected, equal_nan=True)
 
 
+@pytest.mark.parametrize("fn", (torch.angle, torch.frac, torch.trunc, torch.round))
+def test_float64(mojo_gpu: str, fn: Callable[[torch.Tensor], torch.Tensor]):
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = _sample(-100.0, 100.0, torch.float64)
+    torch.testing.assert_close(fn(x.to(mojo_gpu)).cpu(), fn(x), equal_nan=True)
+
+
 def test_special_functions_decline_float64(mojo_gpu: str):
     x = torch.rand(8, dtype=torch.float64).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
@@ -150,7 +177,9 @@ def test_special_functions_decline_float64(mojo_gpu: str):
 
 
 @pytest.mark.parametrize("dtype", (torch.int8, torch.int32, torch.int64, torch.uint8))
-@pytest.mark.parametrize("fn", (torch.sgn, torch.signbit, torch.nan_to_num))
+@pytest.mark.parametrize(
+    "fn", (torch.trunc, torch.round, torch.sgn, torch.signbit, torch.nan_to_num)
+)
 def test_integer_inputs(
     mojo_gpu: str, fn: Callable[[torch.Tensor], torch.Tensor], dtype: torch.dtype
 ):
@@ -182,6 +211,42 @@ def test_signbit(mojo_gpu: str, dtype: torch.dtype):
     actual = torch.signbit(x.to(mojo_gpu))
     assert _counted("signbit")
     assert torch.equal(actual.cpu(), torch.signbit(x))
+
+
+def _round_decimals_reference(x: torch.Tensor, decimals: int) -> torch.Tensor:
+    """round_decimals_kernel_cuda: CPU torch for float32/float64; for the
+    half types CUDA's scalar_t arithmetic (each product and quotient rounds
+    to the dtype, 10^|decimals| too), which CPU torch does not reproduce."""
+    if x.dtype in (torch.float32, torch.float64):
+        return torch.round(x, decimals=decimals)
+    ten_pow = torch.tensor(10.0 ** abs(decimals)).to(x.dtype).float()
+    if decimals < 0:
+        q = (x.float() / ten_pow).to(x.dtype).float()
+        return (torch.round(q) * ten_pow).to(x.dtype)
+    q = (x.float() * ten_pow).to(x.dtype).float()
+    return (torch.round(q) / ten_pow).to(x.dtype)
+
+
+@pytest.mark.parametrize(
+    "dtype", (torch.float32, torch.float16, torch.bfloat16, torch.float64)
+)
+@pytest.mark.parametrize("decimals", (0, 1, 3, -1, -2))
+def test_round_decimals(mojo_gpu: str, dtype: torch.dtype, decimals: int):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = _sample(-500.0, 500.0, dtype)
+    if is_metal(mojo_gpu):  # MPS's round_decimals_functor, see _MPS_SEMANTICS
+        expected = torch.round(x.to("mps"), decimals=decimals).cpu()
+    else:
+        expected = _round_decimals_reference(x, decimals)
+    actual = torch.round(x.to(mojo_gpu), decimals=decimals)
+    torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
+    out = torch.empty_like(x).to(mojo_gpu)
+    torch.round(x.to(mojo_gpu), decimals=decimals, out=out)
+    torch.testing.assert_close(out.cpu(), expected, equal_nan=True)
+    inplace = x.to(mojo_gpu)
+    inplace.round_(decimals=decimals)
+    torch.testing.assert_close(inplace.cpu(), expected, equal_nan=True)
 
 
 @pytest.mark.parametrize(

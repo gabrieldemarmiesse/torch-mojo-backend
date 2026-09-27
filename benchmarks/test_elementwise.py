@@ -49,6 +49,7 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "exp2": torch.exp2,
     "expm1": torch.expm1,
     "floor": torch.floor,
+    "frac": torch.frac,
     "gelu": F.gelu,
     "isfinite": torch.isfinite,
     "isinf": torch.isinf,
@@ -64,6 +65,8 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "rad2deg": torch.rad2deg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
+    "round": torch.round,
+    "round.decimals": lambda x: torch.round(x, decimals=2),
     "rsqrt": torch.rsqrt,
     "sgn": torch.sgn,
     "sigmoid": torch.sigmoid,
@@ -80,6 +83,7 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "sqrt": torch.sqrt,
     "tan": torch.tan,
     "tanh": torch.tanh,
+    "trunc": torch.trunc,
 }
 
 # Ops whose domain excludes unit_interval: its operand, shifted by this much.
@@ -96,8 +100,9 @@ def _check_matches_stock(
     fn: Callable[[torch.Tensor], torch.Tensor], x_ref: torch.Tensor, x_our: torch.Tensor
 ):
     """Our result against the stock device's, whose kernels the mojo ones
-    follow (CPU torch computes i0e differently in float16 / bfloat16).
-    A dtype the stock device lacks skips the case, as `bench.run` would."""
+    follow (CPU torch computes round.decimals and i0e differently in
+    float16 / bfloat16). A dtype the stock device lacks skips the case, as
+    `bench.run` would."""
     try:
         want = fn(x_ref).cpu()
     except NotImplementedError as exc:
@@ -133,6 +138,11 @@ _UNARY_OUT = (
     "straight into a fitting destination)"
 )
 SKIPPED: dict[str, str] = {
+    "aten::round_.decimals": (
+        "in-place form of round.decimals: the same kernel, measured by"
+        " test_unary[round.decimals]"
+    )
+} | {
     f"aten::{name}": _UNARY_OUT
     for name in (
         "deg2rad.out",
