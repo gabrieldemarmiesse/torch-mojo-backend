@@ -2023,6 +2023,14 @@ def aten_ceil(input: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(input, "ceil")
 
 
+def _meta_probe(x: MaxTensor) -> torch.Tensor:
+    """An empty meta tensor of `x`'s dtype and rank, for asking torch its
+    result dtype: rank matters, a 0-d tensor promotes like a number."""
+    return torch.empty(
+        (0,) * len(x.shape), dtype=max_dtype_to_torch(x.dtype), device="meta"
+    )
+
+
 def _clamp(
     input: MaxTensor,
     min: MaxTensor | Scalar | None,
@@ -2048,16 +2056,15 @@ def _clamp(
     ]
     if not input.dtype.is_float() and any(isinstance(b, float) for b in scalar_bounds):
         input = F.cast(input, dtype=torch_dtype_to_max(torch.get_default_dtype()))
-    tensor_bounds = [
-        b for b in (min, max) if isinstance(b, TensorValue | MaxEagerTensor)
-    ]
-    if tensor_bounds:
+    if any(isinstance(b, TensorValue | MaxEagerTensor) for b in (min, max)):
         # clamp.Tensor / clamp_min.Tensor / clamp_max.Tensor promote every
-        # operand to one dtype (MAX's max/min refuse mixed dtypes).
-        common = max_dtype_to_torch(input.dtype)
-        for b in tensor_bounds:
-            common = torch.promote_types(common, max_dtype_to_torch(b.dtype))
-        dtype = torch_dtype_to_max(common)
+        # operand to one dtype (MAX's max/min refuse mixed dtypes), rank-aware
+        # like torch: a 0-d float32 bound leaves a float16 [n] input float16.
+        lo, hi = (
+            _meta_probe(b) if isinstance(b, TensorValue | MaxEagerTensor) else None
+            for b in (min, max)
+        )
+        dtype = torch_dtype_to_max(torch.clamp(_meta_probe(input), lo, hi).dtype)
         if input.dtype != dtype:
             input = F.cast(input, dtype=dtype)
         if isinstance(min, TensorValue | MaxEagerTensor) and min.dtype != dtype:
@@ -2070,7 +2077,10 @@ def _clamp(
                 F.constant(math.nan, dtype=input.dtype, device=input.device),
                 input.shape,
             )
-        return input
+        # A fresh tensor, as eager's is: a graph output that IS the input
+        # comes back as the input's own buffer (so do x * 1, max(x, x) and
+        # where(c, x, x), which MAX folds). A double negation is exact.
+        return F.negate(F.negate(input))
 
     result = input
     if min is not None:
@@ -2684,14 +2694,8 @@ def aten_div(
     assert not isinstance(other, Dim), "div takes no symbolic Dim divisor"
     other_is_tensor = isinstance(other, TensorValue | MaxEagerTensor)
 
-    def probe(x: MaxTensor) -> torch.Tensor:
-        # Rank matters: a 0-d tensor promotes like a number.
-        return torch.empty(
-            (0,) * len(x.shape), dtype=max_dtype_to_torch(x.dtype), device="meta"
-        )
-
     result_torch = torch.result_type(
-        probe(input), probe(other) if other_is_tensor else other
+        _meta_probe(input), _meta_probe(other) if other_is_tensor else other
     )
     if rounding_mode is None and not result_torch.is_floating_point:
         result_torch = torch.get_default_dtype()

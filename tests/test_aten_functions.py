@@ -813,6 +813,51 @@ def test_aten_clamp_nan_rules(
     torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
 
 
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x, lo, hi: torch.clamp_min(x, lo),
+        lambda x, lo, hi: torch.clamp_max(x, hi),
+        lambda x, lo, hi: torch.clamp(x, lo, hi),
+        lambda x, lo, hi: torch.clamp(x, min=lo),
+    ],
+    ids=["clamp_min", "clamp_max", "clamp", "clamp_min_only"],
+)
+def test_aten_clamp_zero_dim_bound_promotion(fn, device: str):
+    """A 0-d float32 Tensor bound promotes like a number (rank-aware
+    torch.result_type): a float16 [n] input stays float16, the bound
+    rounded to it (1.0001 -> 1)."""
+    x = torch.tensor([0.0, 2.0, -3.0], dtype=torch.float16)
+    lo = torch.tensor(1.0001)
+    hi = torch.tensor(1.9999)
+    expected = fn(x, lo, hi)
+    actual = torch.compile(fn, backend=mojo_backend)(
+        x.to(device), lo.to(device), hi.to(device)
+    )
+    assert actual.dtype == expected.dtype == torch.float16
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bound", ["min", "max"])
+def test_aten_clamp_single_nan_bound_is_a_fresh_tensor(bound: str, device: str):
+    """clamp with one NaN Scalar bound returns x's values in a NEW tensor,
+    as eager does: mutating the result leaves the input alone."""
+
+    def fn(x):
+        if bound == "min":
+            return torch.clamp(x, min=_NAN)
+        return torch.clamp(x, max=_NAN)
+
+    x_cpu = torch.tensor([1.0, 2.0, _NAN])
+    expected = fn(x_cpu)
+    x = x_cpu.to(device)
+    actual = torch.compile(fn, backend=mojo_backend)(x)
+    torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
+    assert actual.data_ptr() != x.data_ptr()
+    actual.add_(10)
+    torch.testing.assert_close(x.cpu(), x_cpu, equal_nan=True)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 def test_aten_shared_elementwise(dtype: torch.dtype, mode: str, device: str):
