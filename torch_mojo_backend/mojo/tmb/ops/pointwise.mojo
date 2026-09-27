@@ -76,6 +76,7 @@ from tmb.ops.binary import (
     _b_no_partial_overlap,
     _b_ret,
     _b_self,
+    _b_shape_list,
     _b_side,
     _b_sside,
     _b_store_inplace,
@@ -2547,7 +2548,7 @@ def _loss_forward(
     if out_v:
         dest = _pw_out_of(out_v.value(), a, b, c)
     var reduce_st = Int32(-1)
-    if dest:
+    if dest and not _pw_out_exact(kind):
         var d = dest.value().stype
         if reduction == REDUCTION_NONE or kind == "huber":
             # huber_loss_out runs its iterator on `out` for every reduction
@@ -2856,23 +2857,54 @@ def _opt_weight(v: Value) raises -> Optional[T]:
     return w^
 
 
+def _loss_fits(
+    shape: IndexList[MAX_RANK], rank: Int, a: Side, b: Side, c: Side
+) raises:
+    """An in-place step of ATen's loss (`loss.mul_(weight)`, `(1 -
+    target).mul_(input)`, ...): its operands may not broadcast the tensor it
+    writes, of `shape`, to a larger one."""
+    var bs = _pw_broadcast(a, b, c, 3)
+    var same = bs[1] == rank
+    for i in range(MAX_RANK):
+        if bs[0][i] != shape[i]:
+            same = False
+    if not same:
+        raise Error(
+            "output with shape ",
+            _b_shape_list(shape, rank),
+            " doesn't match the broadcast shape ",
+            _b_shape_list(bs[0], bs[1]),
+        )
+
+
 def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
+    """Loss.cu binary_cross_entropy_out_cuda: input and target of one dtype,
+    the loss in it (`loss.mul_(weight)` keeps it: a float32 weight on
+    float16 inputs is a float16 loss), the weight never growing its shape."""
     var weight = _opt_weight(args[unsafe_offset=2])
+    var input = _b_side(args[unsafe_offset=0])
+    var target = _b_side(args[unsafe_offset=1])
+    if not input.is_t or not target.is_t:
+        unsupported("binary_cross_entropy with a scalar operand")
+    _loss_same_dtype(input, target)
     # The weight rides as the third operand (the product is the kernel's
     # last rounding, like `loss.mul_(weight)`); 1 without one.
     var c = _b_tside(weight.value()) if weight else _b_sside(
         Scal(1.0, 1, True, False)
     )
+    var base = _pw_broadcast(input, target, _none_side(), 2)
+    _loss_fits(base[0], base[1], input, target, c)
     _loss_forward(
         "bce",
         3,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        input,
+        target,
         c,
         _loss_reduction(args[unsafe_offset=3]),
         _p(),
         out_v,
         rets,
+        result_st=input.t.value().stype,
     )
 
 
@@ -2901,6 +2933,15 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     var reduction = _loss_reduction(args[unsafe_offset=4])
     if not grad.is_t or not input.is_t or not target.is_t:
         unsupported("binary_cross_entropy_backward with a scalar operand")
+    # One dtype for every operand (grad_input's is checked as exact below),
+    # and grad_input has self's shape: nothing may broadcast it larger.
+    _loss_same_dtype(input, target)
+    _loss_same_dtype(input, grad)
+    var shape = input.t.value().shape
+    var rank = input.t.value().rank
+    _loss_fits(shape, rank, grad, input, target)
+    if weight:
+        _loss_fits(shape, rank, input, _b_tside(weight.value()), _none_side())
     var common = _pw_result_type(grad, input, target, 3)
     var compute = _pw_compute_dtype("bce_backward", common, P_FLOAT_ONLY, True)
     var inv = 1.0
@@ -2971,20 +3012,38 @@ def _bce_logits(args: Values, rets: Values, out_v: Optional[Value]) raises:
     its own derivatives.yaml formula."""
     var weight = _opt_weight(args[unsafe_offset=2])
     var pos_weight = _opt_weight(args[unsafe_offset=3])
+    var input = _b_side(args[unsafe_offset=0])
+    var target = _b_side(args[unsafe_offset=1])
+    if not input.is_t or not target.is_t:
+        unsupported("binary_cross_entropy_with_logits with a scalar operand")
     var c = _b_tside(pos_weight.value()) if pos_weight else _b_sside(
         Scal(1.0, 1, True, False)
     )
+    # `loss = (1 - target).mul_(input).sub_(log_sigmoid_input)`: the loss
+    # has target's dtype and shape, which no operand may grow; with a
+    # pos_weight, `log_sigmoid(input).mul_((pos_weight - 1) * target)` may
+    # not grow input's shape either.
+    var t = target.t.value().copy()
+    _loss_fits(t.shape, t.rank, input, target, c)
+    if weight:
+        _loss_fits(
+            t.shape, t.rank, target, _b_tside(weight.value()), _none_side()
+        )
+    if pos_weight:
+        var x = input.t.value().copy()
+        _loss_fits(x.shape, x.rank, input, target, c)
     _loss_forward(
         "bce_logits",
         3,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        input,
+        target,
         c,
         _loss_reduction(args[unsafe_offset=4]),
         _p(),
         out_v,
         rets,
         weight,
+        result_st=t.stype,
     )
 
 
@@ -3039,6 +3098,23 @@ def register_pointwise(site: Site) raises:
     impl[op_frexp_out, "frexp.Tensor_out"](site)
     impl[op_gcd, "gcd"](site)
     impl[op_gcd_out, "gcd.out"](site)
+    impl[op_binary_cross_entropy, "binary_cross_entropy"](site)
+    impl[op_binary_cross_entropy_out, "binary_cross_entropy.out"](site)
+    impl[op_binary_cross_entropy_backward, "binary_cross_entropy_backward"](
+        site
+    )
+    impl[
+        op_binary_cross_entropy_backward_grad_input,
+        "binary_cross_entropy_backward.grad_input",
+    ](site)
+    impl[
+        op_binary_cross_entropy_with_logits,
+        "binary_cross_entropy_with_logits",
+    ](site)
+    impl[
+        op_binary_cross_entropy_with_logits_out,
+        "binary_cross_entropy_with_logits.out",
+    ](site)
     impl[op_deg2rad, "deg2rad"](site)
     impl[op_deg2rad_out, "deg2rad.out"](site)
     impl[op_deg2rad_, "deg2rad_"](site)

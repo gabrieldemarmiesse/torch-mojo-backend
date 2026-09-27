@@ -10,10 +10,10 @@ it; its registered forms are the .output/.grad_input out-variants, which
 this call path lands on.  N12288xC50304 is the padded-vocab nanoGPT loss
 regime.
 
-The elementwise losses (mse, smooth_l1, huber so far) run with
-reduction='mean', the default a training loop reaches: one elementwise
-kernel plus the full mean reduction. Their backwards take the 0-d grad
-a mean hands down.
+The elementwise losses (mse, smooth_l1, huber, binary_cross_entropy and
+its logits form) run with reduction='mean', the default a training loop
+reaches: one elementwise kernel plus the full mean reduction. Their
+backwards take the 0-d grad a mean hands down.
 """
 
 from __future__ import annotations
@@ -35,12 +35,13 @@ NLL_SHAPES: dict[str, tuple[int, int]] = {
     "N4096xC1000": (4096, 1000),
 }
 
-# Operands in unit_interval: inside binary_cross_entropy's [0, 1] domain
-# too, once that op joins this group.
+# Operands in unit_interval: inside binary_cross_entropy's [0, 1] domain.
 LOSS_OPS = {
     "mse_loss": F.mse_loss,
     "smooth_l1_loss": lambda x, t: F.smooth_l1_loss(x, t, beta=0.5),
     "huber_loss": lambda x, t: F.huber_loss(x, t, delta=0.5),
+    "binary_cross_entropy": F.binary_cross_entropy,
+    "binary_cross_entropy_with_logits": F.binary_cross_entropy_with_logits,
 }
 # (grad, input, target) with the 0-d grad of reduction='mean' (1).
 LOSS_BACKWARD_OPS = {
@@ -50,6 +51,9 @@ LOSS_BACKWARD_OPS = {
     ),
     "huber_loss_backward": lambda g, x, t: torch.ops.aten.huber_loss_backward(
         g, x, t, 1, 0.5
+    ),
+    "binary_cross_entropy_backward": lambda g, x, t: (
+        torch.ops.aten.binary_cross_entropy_backward(g, x, t, None, 1)
     ),
 }
 
@@ -72,6 +76,9 @@ _LOSS_OUT = (
 SKIPPED: dict[str, str] = {
     f"aten::{name}": _LOSS_OUT
     for name in (
+        "binary_cross_entropy.out",
+        "binary_cross_entropy_backward.grad_input",
+        "binary_cross_entropy_with_logits.out",
         "huber_loss.out",
         "huber_loss_backward.out",
         "mse_loss.out",

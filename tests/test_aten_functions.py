@@ -5658,7 +5658,9 @@ def test_aten_rsub_integral_promotes_before_alpha(call_checker: CallChecker):
 
 
 @pytest.mark.parametrize("reduction", [0, 1, 2])
-@pytest.mark.parametrize("name", ["mse_loss", "smooth_l1_loss", "huber_loss"])
+@pytest.mark.parametrize(
+    "name", ["mse_loss", "smooth_l1_loss", "huber_loss", "binary_cross_entropy"]
+)
 def test_aten_elementwise_losses(
     conf: Conf, call_checker: CallChecker, name: str, reduction: int
 ):
@@ -5674,7 +5676,13 @@ def test_aten_elementwise_losses(
 
 
 @pytest.mark.parametrize(
-    "name", ["mse_loss_backward", "smooth_l1_loss_backward", "huber_loss_backward"]
+    "name",
+    [
+        "mse_loss_backward",
+        "smooth_l1_loss_backward",
+        "huber_loss_backward",
+        "binary_cross_entropy_backward",
+    ],
 )
 def test_aten_elementwise_loss_backwards(
     conf: Conf, call_checker: CallChecker, name: str
@@ -5684,11 +5692,28 @@ def test_aten_elementwise_loss_backwards(
     extra = [1.0] if name in ("smooth_l1_loss_backward", "huber_loss_backward") else []
 
     def fn(g, x, t):
+        if name == "binary_cross_entropy_backward":
+            return op(g, x, t, None, 1)
         return op(g, x, t, 1, *extra)
 
     x = torch.rand(5, 6).clamp(0.01, 0.99)
     t = torch.rand(5, 6)
     check_outputs(fn, conf, [torch.tensor(0.7), x, t], rtol=1e-5, atol=1e-5)
+
+
+def test_aten_binary_cross_entropy_with_logits(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::binary_cross_entropy_with_logits")
+
+    def fn(x, t, w, pw):
+        return aten.binary_cross_entropy_with_logits(x, t, w, pw, 1)
+
+    check_outputs(
+        fn,
+        conf,
+        [torch.randn(4, 5) * 3, torch.rand(4, 5), torch.rand(5), torch.rand(5) * 2],
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 _INF_EDGES = [0.0, -0.0, 1.5, -2.0, 1e-40, float("inf"), float("-inf"), float("nan")]

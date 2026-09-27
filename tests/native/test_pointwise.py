@@ -1494,6 +1494,125 @@ def test_huber_loss(mojo_gpu, delta, reduction, dtype):
     _check_loss(mojo_gpu, fn, [x, y], dtype, "aten::huber_loss", grads=(0, 1))
 
 
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("reduction", _REDUCTIONS)
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_binary_cross_entropy(mojo_gpu, weighted, reduction, dtype):
+    torch.manual_seed(3)
+    x = torch.rand(4, 37).clamp(1e-3, 1 - 1e-3)
+    x[0, :4] = torch.tensor([0.0, 1.0, 1e-30, 1.0 - 1e-7])  # the -100 clamps
+    t = torch.rand(4, 37)
+    w = torch.rand(37) + 0.5 if weighted else None
+    fn = lambda a, b, c: F.binary_cross_entropy(a, b, weight=c, reduction=reduction)  # noqa: E731
+    _check_loss(
+        mojo_gpu,
+        fn,
+        [x, t, w],
+        dtype,
+        "aten::binary_cross_entropy",
+        grads=(0,),
+        tol=_loss_tol(dtype)
+        if dtype != torch.float32
+        else {"rtol": 1e-4, "atol": 1e-4},
+    )
+
+
+@pytest.mark.parametrize("pos_weighted", [False, True])
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("reduction", _REDUCTIONS)
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_binary_cross_entropy_with_logits(
+    mojo_gpu, pos_weighted, weighted, reduction, dtype
+):
+    torch.manual_seed(4)
+    x = torch.randn(3, 5, 11) * 4
+    x[0, 0, :4] = torch.tensor([30.0, -30.0, 0.0, 100.0])
+    t = torch.rand(3, 5, 11)
+    w = torch.rand(5, 11) + 0.5 if weighted else None
+    pw = torch.rand(11) * 3 if pos_weighted else None
+    fn = lambda a, b, c, d: F.binary_cross_entropy_with_logits(  # noqa: E731
+        a, b, weight=c, pos_weight=d, reduction=reduction
+    )
+    _check_loss(
+        mojo_gpu,
+        fn,
+        [x, t, w, pw],
+        dtype,
+        "aten::binary_cross_entropy_with_logits",
+        grads=(0, 1),
+    )
+
+
+def test_bce_dtype_and_shape_rules(mojo_gpu):
+    """binary_cross_entropy: input and target of one dtype, the loss in it
+    (a float32 weight on float16 inputs stays float16); with logits the
+    loss has target's dtype. No weight may grow the loss's shape."""
+    aten = torch.ops.aten
+    d = mojo_gpu
+    p = torch.tensor([0.3, 0.9, 0.5, 0.01])
+    y = torch.tensor([1.0, 0.0, 0.5, 1.0])
+    w = torch.tensor([2.0, 1.0, 0.5, 3.0])
+    ph, yh = p.half(), y.half()
+    got = aten.binary_cross_entropy(ph.to(d), yh.to(d), w.to(d), 0)
+    assert got.dtype == torch.float16
+    _close(got, aten.binary_cross_entropy(ph, yh, w, 0), **_loss_tol(torch.float16))
+    with pytest.raises(RuntimeError, match="Found dtype"):
+        aten.binary_cross_entropy(ph.to(d), y.to(d), None, 1)
+    for x_, t_, pw in ((p, yh, None), (ph, yh, w), (ph, y, None)):
+        want = aten.binary_cross_entropy_with_logits(x_, t_, None, pw, 1)
+        got = aten.binary_cross_entropy_with_logits(
+            x_.to(d), t_.to(d), None, None if pw is None else pw.to(d), 1
+        )
+        assert got.dtype == want.dtype == t_.dtype
+        _close(got, want, **_loss_tol(torch.float16))
+    half = torch.full((2, 1), 0.5, device=d)
+    wide = torch.ones(2, 3, device=d)
+    with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+        aten.binary_cross_entropy(half, half, wide, 0)
+    with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+        aten.binary_cross_entropy_backward(half, half, half, wide, 0)
+    for w, pw in ((wide, None), (None, wide)):
+        with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+            aten.binary_cross_entropy_with_logits(half, half, w, pw, 0)
+
+
+def test_bce_out_overloads(mojo_gpu):
+    """The out= forms: resized from empty, written into a strided out, and
+    an out of another dtype refused (no cast)."""
+    aten = torch.ops.aten
+    d = mojo_gpu
+    torch.manual_seed(5)
+    p, y = torch.rand(3, 4) * 0.9 + 0.05, torch.rand(3, 4)
+    g = torch.randn(3, 4)
+    dev = [t.to(d) for t in (p, y)]
+    for reduction in (0, 1, 2):
+        out = torch.empty(0, device=d)
+        aten.binary_cross_entropy.out(*dev, None, reduction, out=out)
+        _close(out, aten.binary_cross_entropy(p, y, None, reduction))
+        out = torch.empty(0, device=d)
+        aten.binary_cross_entropy_with_logits.out(*dev, None, None, reduction, out=out)
+        _close(out, aten.binary_cross_entropy_with_logits(p, y, None, None, reduction))
+    strided = torch.zeros(4, 3, device=d).t()
+    aten.binary_cross_entropy.out(*dev, None, 0, out=strided)
+    _close(strided, aten.binary_cross_entropy(p, y, None, 0))
+    gi = torch.zeros(4, 3, device=d).t()
+    aten.binary_cross_entropy_backward.grad_input(g.to(d), *dev, None, 0, grad_input=gi)
+    _close(
+        gi,
+        aten.binary_cross_entropy_backward(g, p, y, None, 0),
+        **_tol(torch.float32, 4),
+    )
+    narrow = torch.empty(3, 4, dtype=torch.float16, device=d)
+    with pytest.raises(RuntimeError):
+        aten.binary_cross_entropy.out(*dev, None, 0, out=narrow)
+    with pytest.raises(RuntimeError):
+        aten.binary_cross_entropy_backward.grad_input(
+            g.to(d), *dev, None, 0, grad_input=narrow
+        )
+    with pytest.raises(RuntimeError):
+        aten.binary_cross_entropy_with_logits.out(*dev, None, None, 0, out=narrow)
+
+
 def test_loss_out_and_edge_shapes(mojo_gpu):
     x, y = torch.randn(3, 4), torch.randn(3, 4)
     for reduction in (0, 1, 2):
