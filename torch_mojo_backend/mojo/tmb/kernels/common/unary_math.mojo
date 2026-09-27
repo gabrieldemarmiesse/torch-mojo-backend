@@ -57,6 +57,7 @@ from tmb.kernels.common.mps_math import (
     mps_polygamma,
     mps_round_decimals,
     mps_sinc,
+    rint_even,
 )
 from tmb.kernels.common.special_math import (
     airy_ai_f,
@@ -334,9 +335,13 @@ def _rounding[
             a
         )
     elif kind == "round":
-        return llvm_intrinsic[
-            "llvm.roundeven", type_of(a), has_side_effect=False
-        ](a)
+        comptime if is_apple_gpu():
+            # `llvm.roundeven` crashes Apple's Metal shader compiler.
+            return rint_even(a)
+        else:
+            return llvm_intrinsic[
+                "llvm.roundeven", type_of(a), has_side_effect=False
+            ](a)
     elif kind == "frac":
         # `a - trunc(a)`: exact, and NaN / +-inf -> NaN as in ATen.
         return a - llvm_intrinsic[

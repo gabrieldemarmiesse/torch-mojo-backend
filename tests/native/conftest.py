@@ -38,10 +38,15 @@ def skip_if_metal(device: str, reason: str):
     names its own reason, and CUDA/ROCm runs are untouched because the index
     they check is never Metal.
     """
+    if is_metal(device):
+        pytest.skip(reason)
+
+
+def is_metal(device: str) -> bool:
+    """Whether the `mojo:<index>` device is an Apple GPU (Metal)."""
     idx = int(device.rsplit(":", 1)[-1])
     accelerators = list(get_accelerators())
-    if idx < len(accelerators) and accelerators[idx].api == "metal":
-        pytest.skip(reason)
+    return idx < len(accelerators) and accelerators[idx].api == "metal"
 
 
 @contextlib.contextmanager

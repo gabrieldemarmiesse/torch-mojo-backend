@@ -137,8 +137,31 @@ def _floor(x: Float32) -> Float32:
 
 
 @always_inline
+def rint_even[
+    dtype: DType, width: SIMDLength
+](a: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
+    """Metal's `rint` (round half to even) built from `llvm.trunc`.
+
+    `llvm.roundeven` crashes Apple's Metal shader compiler service
+    (XPC_ERROR_CONNECTION_INTERRUPTED at pipeline creation), so the tie rule
+    is spelled out: t = trunc(a) and d = a - t are exact; step away from zero
+    when |d| > 1/2, or when |d| == 1/2 and t is odd. An infinity gives
+    d = NaN, every comparison false, and stays itself; NaN stays NaN; the
+    sign of a zero result (-0.4 -> -0.0) is trunc's, as with rint.
+    """
+    comptime T = SIMD[dtype, width]
+    var t = llvm_intrinsic["llvm.trunc", T, has_side_effect=False](a)
+    var d = a - t
+    var ad = abs(d)
+    var h = t * T(0.5)
+    var odd = h.ne(llvm_intrinsic["llvm.trunc", T, has_side_effect=False](h))
+    var away = ad.gt(T(0.5)) | (ad.eq(T(0.5)) & odd)
+    return away.select(t + d.lt(T(0)).select(T(-1), T(1)), t)
+
+
+@always_inline
 def _rint(x: Float32) -> Float32:
-    return llvm_intrinsic["llvm.roundeven", Float32, has_side_effect=False](x)
+    return rint_even(x)
 
 
 @always_inline

@@ -3068,6 +3068,12 @@ def aten_fmod(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
     return _pointwise_binary(input, other, "fmod", promote_float=False)
 
 
+# frac(Tensor self) -> Tensor
+@map_to(aten.frac)
+def aten_frac(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "frac")
+
+
 # full(SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
 @map_to(aten.full)
 def aten_full(
@@ -4656,6 +4662,15 @@ def aten_relu_(tensor: MaxTensor) -> MaxTensor:
 
 # resize_(Tensor(a!) self, SymInt[] size, *, MemoryFormat? memory_format=None) -> Tensor(a!)
 # round(Tensor self) -> Tensor
+@map_to(aten.round)
+def aten_round(x: MaxTensor, decimals: int = 0) -> MaxTensor:
+    if decimals == 0 or not x.dtype.is_float():
+        return custom_mojo_ops.elementwise(x, "round")
+    # round_decimals_kernel_cuda, in the tensor dtype.
+    ten_pow = F.constant(10.0 ** abs(decimals), dtype=x.dtype, device=x.device)
+    if decimals < 0:
+        return custom_mojo_ops.elementwise(x / ten_pow, "round") * ten_pow
+    return custom_mojo_ops.elementwise(x * ten_pow, "round") / ten_pow
 
 
 # rrelu_with_noise(Tensor self, Tensor(b!) noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor
@@ -5344,6 +5359,9 @@ def aten_topk(
 
 
 # trunc(Tensor self) -> Tensor
+@map_to(aten.trunc)
+def aten_trunc(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "trunc")
 
 
 # unsqueeze(Tensor(a) self, int dim) -> Tensor(a)
