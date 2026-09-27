@@ -4999,6 +4999,24 @@ def aten_special_bessel_y1(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "bessel_y1")
 
 
+# special_i0e(Tensor self) -> Tensor
+@map_to(aten.special_i0e)
+def aten_special_i0e(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i0e")
+
+
+# special_i1(Tensor self) -> Tensor
+@map_to(aten.special_i1)
+def aten_special_i1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i1")
+
+
+# special_i1e(Tensor self) -> Tensor
+@map_to(aten.special_i1e)
+def aten_special_i1e(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i1e")
+
+
 # special_modified_bessel_i0(Tensor self) -> Tensor
 @map_to(aten.special_modified_bessel_i0)
 def aten_special_modified_bessel_i0(x: MaxTensor) -> MaxTensor:
@@ -5021,6 +5039,18 @@ def aten_special_modified_bessel_k0(x: MaxTensor) -> MaxTensor:
 @map_to(aten.special_modified_bessel_k1)
 def aten_special_modified_bessel_k1(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "modified_bessel_k1")
+
+
+# special_scaled_modified_bessel_k0(Tensor x) -> Tensor
+@map_to(aten.special_scaled_modified_bessel_k0)
+def aten_special_scaled_modified_bessel_k0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "scaled_modified_bessel_k0")
+
+
+# special_scaled_modified_bessel_k1(Tensor x) -> Tensor
+@map_to(aten.special_scaled_modified_bessel_k1)
+def aten_special_scaled_modified_bessel_k1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "scaled_modified_bessel_k1")
 
 
 # special_spherical_bessel_j0(Tensor x) -> Tensor

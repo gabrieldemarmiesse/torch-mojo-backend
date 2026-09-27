@@ -73,6 +73,9 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "sin": torch.sin,
     "sinc": torch.sinc,
     "sinh": torch.sinh,
+    "special_i0e": torch.special.i0e,
+    "special_i1": torch.special.i1,
+    "special_i1e": torch.special.i1e,
     "sqrt": torch.sqrt,
     "tan": torch.tan,
     "tanh": torch.tanh,
@@ -92,8 +95,8 @@ def _check_matches_stock(
     fn: Callable[[torch.Tensor], torch.Tensor], x_ref: torch.Tensor, x_our: torch.Tensor
 ):
     """Our result against the stock device's, whose kernels the mojo ones
-    follow. A dtype the stock device lacks skips the case, as `bench.run`
-    would."""
+    follow (CPU torch computes i0e differently in float16 / bfloat16).
+    A dtype the stock device lacks skips the case, as `bench.run` would."""
     try:
         want = fn(x_ref).cpu()
     except NotImplementedError as exc:
@@ -112,6 +115,8 @@ FLOAT32_ONLY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "special_modified_bessel_i1": torch.special.modified_bessel_i1,
     "special_modified_bessel_k0": torch.special.modified_bessel_k0,
     "special_modified_bessel_k1": torch.special.modified_bessel_k1,
+    "special_scaled_modified_bessel_k0": torch.special.scaled_modified_bessel_k0,
+    "special_scaled_modified_bessel_k1": torch.special.scaled_modified_bessel_k1,
     "special_spherical_bessel_j0": torch.special.spherical_bessel_j0,
 }
 
@@ -233,7 +238,7 @@ def test_unary(
     x_ref, x_our = both(cpu, hw, mojo_device)
     for value in (x_ref, x_our):
         assert value.data_ptr() % (4 * cpu.element_size()) == 0
-    torch.testing.assert_close(fn(x_our).cpu(), fn(cpu))
+    _check_matches_stock(fn, x_ref, x_our)
     bench.run(lambda: fn(x_ref), lambda: fn(x_our), flops=float(x_ref.numel()))
 
 
@@ -260,7 +265,7 @@ def test_unary_unaligned(
     for value in (x_ref, x_our):
         assert value.is_contiguous()
         assert value.data_ptr() % (4 * cpu.element_size()) == cpu.element_size()
-    torch.testing.assert_close(fn(x_our).cpu(), fn(cpu))
+    _check_matches_stock(fn, x_ref, x_our)
     bench.run(lambda: fn(x_ref), lambda: fn(x_our), flops=float(cpu.numel()))
 
 

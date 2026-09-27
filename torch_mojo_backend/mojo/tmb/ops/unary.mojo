@@ -2146,6 +2146,12 @@ def register_unary(site: Site) raises:
     impl[op_special_bessel_y0_out, "special_bessel_y0.out"](site)
     impl[op_special_bessel_y1, "special_bessel_y1"](site)
     impl[op_special_bessel_y1_out, "special_bessel_y1.out"](site)
+    impl[op_special_i0e, "special_i0e"](site)
+    impl[op_special_i0e_out, "special_i0e.out"](site)
+    impl[op_special_i1, "special_i1"](site)
+    impl[op_special_i1_out, "special_i1.out"](site)
+    impl[op_special_i1e, "special_i1e"](site)
+    impl[op_special_i1e_out, "special_i1e.out"](site)
     impl[op_special_modified_bessel_i0, "special_modified_bessel_i0"](site)
     impl[op_special_modified_bessel_i0_out, "special_modified_bessel_i0.out"](
         site
@@ -2162,6 +2168,22 @@ def register_unary(site: Site) raises:
     impl[op_special_modified_bessel_k1_out, "special_modified_bessel_k1.out"](
         site
     )
+    impl[
+        op_special_scaled_modified_bessel_k0,
+        "special_scaled_modified_bessel_k0",
+    ](site)
+    impl[
+        op_special_scaled_modified_bessel_k0_out,
+        "special_scaled_modified_bessel_k0.out",
+    ](site)
+    impl[
+        op_special_scaled_modified_bessel_k1,
+        "special_scaled_modified_bessel_k1",
+    ](site)
+    impl[
+        op_special_scaled_modified_bessel_k1_out,
+        "special_scaled_modified_bessel_k1.out",
+    ](site)
     impl[op_special_spherical_bessel_j0, "special_spherical_bessel_j0"](site)
     impl[op_special_spherical_bessel_j0_out, "special_spherical_bessel_j0.out"](
         site

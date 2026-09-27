@@ -5587,6 +5587,9 @@ _SPECIAL_UNARY_CASES = [
     ("special_bessel_j1", lambda x: aten.special_bessel_j1(x), [-7.0, 0.0, 3.0, 9.0]),
     ("special_bessel_y0", lambda x: aten.special_bessel_y0(x), [0.5, 3.0, 9.0]),
     ("special_bessel_y1", lambda x: aten.special_bessel_y1(x), [0.5, 3.0, 9.0]),
+    ("special_i0e", lambda x: aten.special_i0e(x), [-10.0, 0.0, 3.0, 9.0]),
+    ("special_i1", lambda x: aten.special_i1(x), [-10.0, 0.0, 3.0, 9.0]),
+    ("special_i1e", lambda x: aten.special_i1e(x), [-10.0, 0.0, 3.0, 9.0]),
     (
         "special_modified_bessel_i0",
         lambda x: aten.special_modified_bessel_i0(x),
@@ -5608,6 +5611,16 @@ _SPECIAL_UNARY_CASES = [
         [0.5, 1.5, 3.0, 9.0],
     ),
     (
+        "special_scaled_modified_bessel_k0",
+        lambda x: aten.special_scaled_modified_bessel_k0(x),
+        [0.5, 1.5, 3.0, 9.0],
+    ),
+    (
+        "special_scaled_modified_bessel_k1",
+        lambda x: aten.special_scaled_modified_bessel_k1(x),
+        [0.5, 1.5, 3.0, 9.0],
+    ),
+    (
         "special_spherical_bessel_j0",
         lambda x: aten.special_spherical_bessel_j0(x),
         [-7.0, 0.0, 0.25, 9.0],
@@ -5625,6 +5638,8 @@ _NO_HALF_KERNEL: set[str] = {
     "special_modified_bessel_i1",
     "special_modified_bessel_k0",
     "special_modified_bessel_k1",
+    "special_scaled_modified_bessel_k0",
+    "special_scaled_modified_bessel_k1",
     "special_spherical_bessel_j0",
 }
 
