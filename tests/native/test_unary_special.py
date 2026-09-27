@@ -382,6 +382,17 @@ def test_polygamma_large_order(mojo_gpu: str, dtype: torch.dtype, n: int):
     torch.testing.assert_close(got, expected, equal_nan=True, rtol=1e-4, atol=0.0)
 
 
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+def test_mvlgamma_rounds_offsets_in_dtype(mojo_gpu: str, dtype: torch.dtype):
+    """ATen's arange of offsets is in the tensor dtype, so each offset
+    rounds before the add: bfloat16 -129.5 is -130, and x = 130 at p = 260
+    reaches lgamma(0) = inf, where adding before rounding gives 76288."""
+    x = torch.tensor([130.0, 131.0, 257.5, 3000.0, 140.25], dtype=dtype)
+    torch.testing.assert_close(
+        torch.mvlgamma(x.to(mojo_gpu), 260).cpu(), torch.mvlgamma(x, 260)
+    )
+
+
 def test_mvlgamma_out_overlapping_input(mojo_gpu: str):
     """mvlgamma.out computes into a new tensor, then copies: an `out` that
     overlaps the input (x[1:] for x[:-1]) is allowed and reads the input

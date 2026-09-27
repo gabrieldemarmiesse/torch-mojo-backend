@@ -673,8 +673,8 @@ def elementwise_unary_param[
     * polygamma: p0 = n (polygamma_kernel_cuda / UnaryKernel.mm, in float).
     * mvlgamma: p0 = p, p1 = p (p - 1) log(pi) / 4 (computed in double on the
       host, rounded to float). ATen composes it (UnaryOps.cpp `mvlgamma`):
-      sum_j lgamma(x + (1 - p)/2 + j/2) + p1, the terms and the sum in the
-      tensor dtype, the sum accumulated in float in the order of CUDA's
+      sum_j lgamma(x + ((1 - p)/2 + j/2)) + p1, the offsets (an arange), the
+      arguments, the terms and the sum in the tensor dtype, the sum accumulated in float in the order of CUDA's
       reduce kernel.
     * nan_to_num: p0 / p1 / p2 replace NaN / +inf / -inf, each cast to the
       tensor dtype (nan_to_num_kernel_cuda; the MPS kernel is the same).
@@ -748,10 +748,16 @@ def elementwise_unary_param[
                 # then a halving tree over the 32 accumulators.
                 var acc = Array[Float32, 32](fill=Float32(0.0))
                 for j in range(p):
-                    var arg = _to_dtype_rounded[dtype](
+                    # `arange(-p/2 + 1/2, 1/2, 1/2)` in the tensor dtype
+                    # (each offset rounds: bfloat16 -129.5 is -130), then
+                    # `add(self)`, rounding again.
+                    var off = _to_dtype_rounded[dtype](
                         SIMD[DType.float32, 1](
-                            xf[i] + (start + Float32(j) * Float32(0.5))
+                            start + Float32(j) * Float32(0.5)
                         )
+                    )[0]
+                    var arg = _to_dtype_rounded[dtype](
+                        SIMD[DType.float32, 1](xf[i] + off)
                     )[0]
                     var lg: Float32
                     comptime if is_apple_gpu():

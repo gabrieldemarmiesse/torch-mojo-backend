@@ -10,6 +10,7 @@ import functools
 import itertools
 import math
 import operator
+import struct
 from collections.abc import Callable, Sequence
 from typing import Literal, TypeVar, cast
 
@@ -4296,6 +4297,24 @@ def _batch_norm_batch_stats(input: MaxTensor) -> tuple[MaxTensor, MaxTensor]:
     return mean, var
 
 
+def _round_to_dtype(value: float, dtype: DType) -> float:
+    """`value` rounded to nearest-even in a float16 / bfloat16 / float32
+    (float64 as is), as torch's cast does it (the half types through float)."""
+    if dtype == DType.float64:
+        return value
+    value = struct.unpack("<f", struct.pack("<f", value))[0]
+    if dtype == DType.float16:
+        try:
+            return struct.unpack("<e", struct.pack("<e", value))[0]
+        except OverflowError:  # past 65520: the cast gives an infinity
+            return math.copysign(math.inf, value)
+    if dtype == DType.bfloat16:
+        (bits,) = struct.unpack("<I", struct.pack("<f", value))
+        bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+        return struct.unpack("<f", struct.pack("<I", bits))[0]
+    return value
+
+
 # mvlgamma(Tensor self, int p) -> Tensor
 @map_to(aten.mvlgamma)
 def aten_mvlgamma(x: MaxTensor, p: int) -> MaxTensor:
@@ -4311,8 +4330,11 @@ def aten_mvlgamma(x: MaxTensor, p: int) -> MaxTensor:
     # ATen's sum reduction does for the half types), the constant added last.
     acc = DType.float64 if x.dtype == DType.float64 else DType.float32
     total = None
+    # ATen's `arange(-p/2 + 1/2, 1/2, 1/2)` in the tensor dtype: each offset
+    # rounds to nearest-even there (bfloat16 -129.5 is -130) before the add.
     for j in range(p):
-        shift = F.constant((1 - p) / 2 + j / 2, dtype=x.dtype, device=x.device)
+        offset = _round_to_dtype((1 - p) / 2 + j / 2, x.dtype)
+        shift = F.constant(offset, dtype=x.dtype, device=x.device)
         term = F.cast(custom_mojo_ops.elementwise(x + shift, "lgamma"), acc)
         total = term if total is None else total + term
     assert total is not None

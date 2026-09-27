@@ -5892,6 +5892,14 @@ def test_aten_polygamma_mvlgamma_compiled_edges(device: str):
     with pytest.raises(Exception, match="float64 inputs are not supported"):
         compiled(x64)
     torch.compiler.reset()
+    # mvlgamma's offsets round to the dtype before the add (bfloat16 -129.5
+    # is -130: lgamma(0) = inf at x = 130, p = 260).
+    xb = torch.tensor([130.0, 131.0, 257.5, 3000.0], dtype=torch.bfloat16)
+    compiled = torch.compile(
+        lambda t: aten.mvlgamma(t, 260), backend=mojo_backend, fullgraph=True
+    )
+    torch.testing.assert_close(compiled(xb.to(device)).cpu(), torch.mvlgamma(xb, 260))
+    torch.compiler.reset()
     b = torch.tensor([True, False], device=device)
     compiled = torch.compile(
         lambda t: aten.mvlgamma(t, 1), backend=mojo_backend, fullgraph=True
