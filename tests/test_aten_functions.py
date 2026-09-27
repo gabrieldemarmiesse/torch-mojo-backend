@@ -5407,6 +5407,10 @@ _ACTIVATION_TWINS = [
     ("elu", lambda x: aten.elu(x, 0.8, 1.2, 0.9)),
     ("hardtanh", lambda x: aten.hardtanh(x, -0.5, 0.7)),
     ("leaky_relu", lambda x: aten.leaky_relu(x, 0.1)),
+    (
+        "rrelu_with_noise",
+        lambda x: aten.rrelu_with_noise(x, torch.empty_like(x), 0.1, 0.3),
+    ),
     ("hardshrink_backward", lambda x: aten.hardshrink_backward(x * 2, x, 0.4)),
     ("softshrink_backward", lambda x: aten.softshrink_backward(x * 2, x, 0.4)),
 ]
@@ -5418,7 +5422,14 @@ _ACTIVATION_TWINS = [
 def test_aten_pointwise_activation(
     conf: Conf, call_checker: CallChecker, name: str, fn: Callable[..., torch.Tensor]
 ):
-    call_checker.register(getattr(aten_functions, f"aten_{name}"))
+    call_checker.register(
+        getattr(aten_functions, f"aten_{name}"),
+        *(
+            [aten_functions.aten_rrelu_with_noise_functional]
+            if name == "rrelu_with_noise"
+            else []
+        ),
+    )
     torch.manual_seed(0)
     x = torch.randn(4, 7) * 2
     check_outputs(fn, conf, [x], rtol=1e-5, atol=1e-5)

@@ -319,7 +319,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "nn_functional_layer_norm": ("float32", "bfloat16", "float16"),
     "nn_functional_linear": ("float32", "bfloat16", "float16", "int64"),
     "nn_functional_local_response_norm": ("int64",),
-    "nn_functional_logsigmoid": ("float32", "bfloat16", "float16"),
     "nn_functional_margin_ranking_loss": ("float32", "bfloat16", "float16", "int64"),
     "nn_functional_max_pool1d": ("float32", "bfloat16", "float16"),
     "nn_functional_max_pool2d": ("float32", "bfloat16", "float16", "int64"),
