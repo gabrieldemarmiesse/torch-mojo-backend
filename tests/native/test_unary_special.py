@@ -2,8 +2,8 @@
 group (torch_mojo_backend/mojo/tmb/ops/unary.mojo): asin/atan/erfc/erfinv/
 exp2/expm1/log10/sinc/angle/sgn/signbit/nan_to_num and the torch.special
 Bessel functions (bessel_j0/j1/y0/y1, modified_bessel_i0/i1/k0/k1,
-spherical_bessel_j0) so far, whose
-kernels port the CUDA routines stock torch runs.
+scaled_modified_bessel_k0/k1, spherical_bessel_j0) and i0e/i1/i1e so far,
+whose kernels port the CUDA routines stock torch runs.
 
 Public torch API only, compared against CPU torch.
 """
@@ -54,10 +54,15 @@ _CASES: list[tuple[str, Callable[[torch.Tensor], torch.Tensor], float, float]] =
     ("special_bessel_j1", S.bessel_j1, -30.0, 30.0),
     ("special_bessel_y0", S.bessel_y0, 0.0, 30.0),
     ("special_bessel_y1", S.bessel_y1, 0.0, 30.0),
+    ("special_i0e", S.i0e, -30.0, 30.0),
+    ("special_i1", S.i1, -30.0, 30.0),
+    ("special_i1e", S.i1e, -30.0, 30.0),
     ("special_modified_bessel_i0", S.modified_bessel_i0, -30.0, 30.0),
     ("special_modified_bessel_i1", S.modified_bessel_i1, -30.0, 30.0),
     ("special_modified_bessel_k0", S.modified_bessel_k0, 0.0, 30.0),
     ("special_modified_bessel_k1", S.modified_bessel_k1, 0.0, 30.0),
+    ("special_scaled_modified_bessel_k0", S.scaled_modified_bessel_k0, 0.0, 30.0),
+    ("special_scaled_modified_bessel_k1", S.scaled_modified_bessel_k1, 0.0, 30.0),
     ("special_spherical_bessel_j0", S.spherical_bessel_j0, -30.0, 30.0),
     ("angle", torch.angle, -5.0, 5.0),
     ("sgn", torch.sgn, -5.0, 5.0),
@@ -130,6 +135,12 @@ def test_layouts_out_and_inplace(
         inplace = device.clone()
         method(inplace)
         torch.testing.assert_close(inplace.cpu(), expected, equal_nan=True)
+
+
+def test_special_functions_decline_float64(mojo_gpu: str):
+    x = torch.rand(8, dtype=torch.float64).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        S.i0e(x)
 
 
 @pytest.mark.parametrize("dtype", (torch.int8, torch.int32, torch.int64, torch.uint8))

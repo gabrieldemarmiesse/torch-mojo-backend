@@ -1415,6 +1415,11 @@ _SPECIAL_OUT = [
     "modified_bessel_i1",
     "modified_bessel_k0",
     "modified_bessel_k1",
+    "i0e",
+    "i1",
+    "i1e",
+    "scaled_modified_bessel_k0",
+    "scaled_modified_bessel_k1",
 ]
 
 
