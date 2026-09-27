@@ -5578,6 +5578,25 @@ def test_aten_elu_compiled_zero_coefficient_and_overflow():
             torch.compiler.reset()
 
 
+def test_aten_activation_compiled_zero_and_subnormal_coefficients():
+    """A zero coefficient keeps inf * 0 = NaN and NaN * 0 = NaN (MAX folds
+    the product to 0); a subnormal one is refused explicitly."""
+    inf, nan = math.inf, math.nan
+    x = torch.tensor([-inf, inf, nan, -2.0, 3.0])
+    for slope in (0.0, 1e-46):
+        _compiled_matches_cpu(lambda a, s=slope: aten.leaky_relu(a, s), [x])
+    _compiled_matches_cpu(lambda a: aten.elu(a, 1.0, 1.0, 0.0), [x])
+    _compiled_matches_cpu(lambda a: aten.elu(a, 1.0, 0.0, 1.0), [x])
+    _compiled_matches_cpu(lambda a: aten.elu(a, 0.0, 1.0, 1.0), [x])
+    for fn in (
+        lambda a: aten.leaky_relu(a, 1e-40),
+        lambda a: aten.elu(a, 1.0, 1.0, 1e-40),
+    ):
+        with pytest.raises(Exception, match="subnormal"):
+            torch.compile(fn, backend=mojo_backend, fullgraph=True)(x)
+        torch.compiler.reset()
+
+
 def test_aten_hardtanh_nan_bounds_compiled():
     """hardtanh is two-bound clamp: a NaN bound fills NaN."""
     nan = math.nan

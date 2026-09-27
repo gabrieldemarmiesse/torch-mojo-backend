@@ -2887,20 +2887,33 @@ def aten_elu(
         _scalar_to_opmath(v, opmath) for v in (alpha, scale, input_scale)
     )
     negcoef = torch.tensor(alpha * scale, dtype=opmath).item()
-    growth = _expm1(input * input_scale)
-    if negcoef == 0.0:
-        # MAX folds `t * 0` to 0, but inf * 0 and NaN * 0 are NaN.
-        nan = F.constant(math.nan, dtype=growth.dtype, device=growth.device)
-        zero = F.constant(0.0, dtype=growth.dtype, device=growth.device)
-        blown = F.logical_or(
-            custom_mojo_ops.elementwise(growth, "isinf"),
-            custom_mojo_ops.elementwise(growth, "isnan"),
-        )
-        negative = _where(blown, nan, zero)
-    else:
-        negative = growth * negcoef
-    result = _where(input > 0, input * scale, negative)
+    growth = _expm1(_mul_coefficient(input, input_scale, opmath, "elu"))
+    negative = _mul_coefficient(growth, negcoef, opmath, "elu")
+    result = _where(input > 0, _mul_coefficient(input, scale, opmath, "elu"), negative)
     return result if result.dtype == dtype else F.cast(result, dtype)
+
+
+def _mul_coefficient(
+    t: MaxTensor, coefficient: float, opmath: torch.dtype, op: str
+) -> MaxTensor:
+    """`t * coefficient` for an opmath Scalar coefficient. MAX folds a
+    product with 0 to 0, but inf * 0 and NaN * 0 are NaN, so a zero
+    coefficient selects NaN there explicitly (the sign of the zero result
+    is not kept). A subnormal coefficient is refused: MAX's CPU runtime
+    flushes it to zero, so no product would match ATen's."""
+    if coefficient == 0.0:
+        nan = F.constant(math.nan, dtype=t.dtype, device=t.device)
+        zero = F.constant(0.0, dtype=t.dtype, device=t.device)
+        blown = F.logical_or(
+            custom_mojo_ops.elementwise(t, "isinf"),
+            custom_mojo_ops.elementwise(t, "isnan"),
+        )
+        return _where(blown, nan, zero)
+    if abs(coefficient) < torch.finfo(opmath).tiny:
+        raise NotImplementedError(
+            f"torch.compile {op} with a subnormal coefficient ({coefficient!r})"
+        )
+    return t * coefficient
 
 
 def _scalar_to_opmath(value: float, opmath: torch.dtype) -> float:
@@ -3767,7 +3780,10 @@ def aten_leaky_relu(input: MaxTensor, negative_slope: float = 0.01) -> MaxTensor
     if dtype.is_float():
         opmath = torch.float64 if dtype == DType.float64 else torch.float32
         negative_slope = _scalar_to_opmath(negative_slope, opmath)
-    result = _where(input > 0, input, input * negative_slope)
+        negative = _mul_coefficient(input, negative_slope, opmath, "leaky_relu")
+    else:
+        negative = input * negative_slope
+    result = _where(input > 0, input, negative)
     return result if result.dtype == dtype else F.cast(result, dtype)
 
 

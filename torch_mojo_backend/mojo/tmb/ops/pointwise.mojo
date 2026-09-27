@@ -1465,10 +1465,11 @@ def op_elu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _elu_backward_p(args: Values) raises -> SIMD[DType.float64, 4]:
+    var st = _self_stype(args, 0)
     return _p(
-        v_f64(args[unsafe_offset=1]),
-        v_f64(args[unsafe_offset=2]),
-        v_f64(args[unsafe_offset=3]),
+        _opmath_scalar(args[unsafe_offset=1], st),
+        _opmath_scalar(args[unsafe_offset=2], st),
+        _opmath_scalar(args[unsafe_offset=3], st),
         1.0 if v_bool(args[unsafe_offset=4]) else 0.0,
     )
 
@@ -1785,7 +1786,7 @@ def op_leaky_relu_backward(
         1,
         0,
         -1,
-        _p(v_f64(args[unsafe_offset=2])),
+        _p(_opmath_scalar(args[unsafe_offset=2], _self_stype(args, 0))),
     )
 
 
@@ -1801,12 +1802,17 @@ def op_leaky_relu_backward_grad_input(
         1,
         0,
         4,
-        _p(v_f64(args[unsafe_offset=2])),
+        _p(_opmath_scalar(args[unsafe_offset=2], _self_stype(args, 0))),
     )
 
 
 def _softplus_p(args: Values, i: Int) raises -> SIMD[DType.float64, 4]:
-    return _p(v_f64(args[unsafe_offset=i]), v_f64(args[unsafe_offset=i + 1]))
+    # `Scalar::to<opmath_t>()`: checked, like every activation's scalars.
+    var st = _self_stype(args, 0)
+    return _p(
+        _opmath_scalar(args[unsafe_offset=i], st),
+        _opmath_scalar(args[unsafe_offset=i + 1], st),
+    )
 
 
 # aten::softplus(Tensor self, Scalar beta=1, Scalar threshold=20) -> Tensor

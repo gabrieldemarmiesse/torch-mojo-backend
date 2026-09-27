@@ -1117,6 +1117,11 @@ def test_activation_scalar_overflow_raises(mojo_gpu, dtype):
         lambda a: torch.ops.aten.elu(a, 1.0, 1.0, 1e40),
         lambda a: F.leaky_relu(a, 1e40),
         lambda a: F.leaky_relu(a.clone(), 1e40, inplace=True),
+        lambda a: torch.ops.aten.softplus(a, 1e40, 20.0),
+        lambda a: torch.ops.aten.softplus(a, 1.0, 1e40),
+        lambda a: torch.ops.aten.softplus_backward(a, a, 1e40, 20.0),
+        lambda a: torch.ops.aten.elu_backward(a, 1e40, 1.0, 1.0, False, a),
+        lambda a: torch.ops.aten.leaky_relu_backward(a, a, 1e40, False),
     ):
         with pytest.raises(RuntimeError, match="without overflow"):
             fn(x)
