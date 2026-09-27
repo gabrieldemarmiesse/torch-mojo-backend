@@ -5588,6 +5588,14 @@ def test_aten_ldexp_compiled_edges(device: str):
     torch.testing.assert_close(compiled_half(h, e), aten.ldexp(h, e))
 
 
+def test_aten_ldexp_compiled_wide_int_exponent(device: str):
+    """An int64 exponent wraps to ::ldexp's int first: 2**32 is 0."""
+    x = torch.tensor([1.0, 0.5], device=device)
+    e = torch.tensor([2**32, 2**32 + 3], device=device)
+    got = torch.compile(aten.ldexp, backend=mojo_backend, fullgraph=True)(x, e)
+    torch.testing.assert_close(got, aten.ldexp(x, e))
+
+
 def test_aten_ldexp_compiled_pow_dtype(device: str):
     """The compiled _pow2 runs pow in ATen's pow dtype and rounds it to mul's
     rank-aware common dtype: float16 2^16 is inf against a float64 self,

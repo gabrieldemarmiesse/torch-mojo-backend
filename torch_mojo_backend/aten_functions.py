@@ -3622,6 +3622,10 @@ def aten_ldexp(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         compute = DType.float32 if input.dtype == DType.bfloat16 else input.dtype
         shape = find_broadcast_shape(input.shape, other.shape)
         lhs = _broadcast_to(F.cast(input, compute), shape)
+        if other.dtype in (DType.int64, DType.uint32, DType.uint64):
+            # ::ldexp takes an int: a wider exponent wraps to int32 first
+            # (2**32 is 0), as the C++ conversion does.
+            other = F.cast(other, DType.int32)
         rhs = _broadcast_to(F.cast(other, compute), shape)
         result = custom_mojo_ops.pointwise_binary(lhs, rhs, "ldexp")
         return result if compute == input.dtype else F.cast(result, input.dtype)

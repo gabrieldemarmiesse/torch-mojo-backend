@@ -2252,7 +2252,17 @@ def _pw_ldexp_pow2(
             var metal = ctx.api() == "metal"
             _ = ctx
             if metal:
-                var pow2 = _round_to(pow(Float64(2.0), b.s.value().f), compute)
+                # The host pow returns 1 for 2^+-inf and inf for 2^NaN:
+                # the non-finite exponents take CUDA's values explicitly.
+                var e = b.s.value().f
+                var p2: Float64
+                if e != e or (e - e != 0.0 and e > 0.0):
+                    p2 = e  # NaN, +inf
+                elif e - e != 0.0:
+                    p2 = 0.0  # -inf
+                else:
+                    p2 = pow(Float64(2.0), e)
+                var pow2 = _round_to(p2, compute)
                 _pw_finish(
                     rets,
                     dest,
@@ -2307,15 +2317,17 @@ def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = _b_tside(self)
     var b = _b_side(args[unsafe_offset=1])
     _b_no_overlap_side(self, b)
-    if not b.is_t:
-        unsupported("ldexp_ with a scalar exponent")
-    var e = b.t.value().copy()
+    if not b.is_t and b.zero_st < 0:
+        unsupported("ldexp_ with a Python-number exponent")
+    # An explicit CPU 0-d exponent is a rank-0 tensor of its own dtype.
+    var e_st = b.t.value().stype if b.is_t else b.zero_st
+    var e_rank = b.t.value().rank if b.is_t else 0
     if not _pw_is_float(self.stype):
         raise Error(
             "ldexp can't be cast to the desired output type ", self.stype
         )
     var dest = Optional[T](self.copy())
-    if _pw_is_int(e.stype) or e.stype == ST_BOOL:
+    if _pw_is_int(e_st) or e_st == ST_BOOL:
         var compute = ST_FLOAT32 if self.stype == ST_BFLOAT16 else self.stype
         _pw_finish(
             rets,
@@ -2325,7 +2337,7 @@ def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             ),
         )
         return
-    _pw_ldexp_pow2(rets, a, b, e.stype, e.rank, dest)
+    _pw_ldexp_pow2(rets, a, b, e_st, e_rank, dest)
 
 
 # ---------------------------------------------------------------------------

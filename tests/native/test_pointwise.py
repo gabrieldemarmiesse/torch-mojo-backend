@@ -857,6 +857,9 @@ def test_ldexp_cpu_float64_scalar_exponent(mojo_gpu):
         (torch.tensor([1.0, -1.0]), 127.999999),
         (torch.tensor([0.5, 0.0]), 128.0),
         (torch.tensor([3.0, 0.25]), -1.5),
+        (torch.tensor([3.0, 0.0]), math.inf),
+        (torch.tensor([3.0, -0.25]), -math.inf),
+        (torch.tensor([3.0, 0.25]), math.nan),
     ]:
         e_cpu = torch.tensor(e, dtype=torch.float64)
         _close(
@@ -870,6 +873,19 @@ def test_ldexp_cpu_float64_scalar_exponent(mojo_gpu):
     _close(
         torch.ldexp(h.to(mojo_gpu), e_cpu), torch.ldexp(h, e_cpu), rtol=0.0, atol=0.0
     )
+
+
+def test_ldexp_inplace_cpu_scalar_exponent(mojo_gpu):
+    """ldexp_ takes an explicit CPU 0-d exponent, float or integral."""
+    for e_cpu in (
+        torch.tensor(3.5, dtype=torch.float64),
+        torch.tensor(3),
+        torch.tensor(-2.25),
+    ):
+        x_cpu = torch.tensor([1.0, 0.5, -3.0])
+        x = x_cpu.to(mojo_gpu)
+        x.ldexp_(e_cpu)
+        _close(x, x_cpu.clone().ldexp_(e_cpu), rtol=0.0, atol=0.0)
 
 
 def test_frexp_out_partially_overlapping_input(mojo_gpu):
