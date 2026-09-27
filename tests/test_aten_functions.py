@@ -5437,6 +5437,23 @@ def test_aten_rsub(conf: Conf, call_checker: CallChecker):
     check_outputs(fn, conf, [torch.randn(3, 4), torch.randn(4)])
 
 
+def test_aten_rsub_integral_promotes_before_alpha(call_checker: CallChecker):
+    """The compiled rsub (sub with swapped operands) and add promote int32
+    to int64 before scaling by alpha = 2**30, as ATen does."""
+    call_checker.register(aten_functions.aten_sub, aten_functions.aten_add)
+
+    def fn(a, b):
+        return (
+            torch.rsub(a, b, alpha=2**30),
+            torch.sub(b, a, alpha=2**30),
+            torch.add(b, a, alpha=2**30),
+        )
+
+    a = torch.tensor([100, -7, 3], dtype=torch.int32)
+    b = torch.tensor([0, 5, 2**40], dtype=torch.int64)
+    _compiled_matches_cpu(fn, [a, b])
+
+
 def test_aten_logical_and_bool_tensors(conf: Conf):
     """Test aten.logical_and with boolean tensors"""
 

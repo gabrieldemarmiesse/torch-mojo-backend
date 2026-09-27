@@ -406,11 +406,33 @@ def type_promotion(
 
 
 def _scale_operand(
-    other: MaxTensor | int | float, alpha: Scalar
+    other: MaxTensor | int | float,
+    alpha: Scalar,
+    input: MaxTensor | int | float | None = None,
 ) -> MaxTensor | int | float:
     """`other * alpha` for add/sub's `alpha`; `other` is a Python number for
-    the Scalar overloads."""
+    the Scalar overloads. A tensor `other` is first cast to the result dtype
+    it shares with a tensor `input` (`torch.result_type`): ATen promotes
+    before scaling, so int32 `other` times alpha = 2**30 against an int64
+    `input` must not wrap in int32 (`type_promotion` leaves integer pairs
+    alone)."""
     if isinstance(other, TensorValue | MaxEagerTensor):
+        if (
+            isinstance(input, TensorValue | MaxEagerTensor)
+            and input.dtype != other.dtype
+        ):
+            common = torch_dtype_to_max(
+                torch.result_type(
+                    torch.empty(
+                        (1,) * min(input.rank, 1), dtype=max_dtype_to_torch(input.dtype)
+                    ),
+                    torch.empty(
+                        (1,) * min(other.rank, 1), dtype=max_dtype_to_torch(other.dtype)
+                    ),
+                )
+            )
+            if common != other.dtype:
+                other = F.cast(other, dtype=common)
         return aten_mul(other, alpha)
     assert not isinstance(alpha, Dim)  # a number times a Dim was never supported
     return other * alpha
@@ -1459,7 +1481,7 @@ def aten_add(
     # a Python number (the Scalar overload).
     assert isinstance(promoted_input, TensorValue | MaxEagerTensor)
     if alpha != 1:
-        promoted_other = _scale_operand(promoted_other, alpha)
+        promoted_other = _scale_operand(promoted_other, alpha, promoted_input)
     return promoted_input + promoted_other
 
 
@@ -4736,7 +4758,7 @@ def aten_sub(
 ) -> MaxTensor:
     promoted_input, other = type_promotion(input, other)
     if alpha != 1:
-        other = _scale_operand(other, alpha)
+        other = _scale_operand(other, alpha, promoted_input)
     result = promoted_input - other
     # At least one operand is a tensor (rsub decomposes to a number minus
     # a tensor, hence the widened `input`).

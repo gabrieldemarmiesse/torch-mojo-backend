@@ -1429,10 +1429,25 @@ def _b_add(
         var scaled_s = _b_sside(_b_scaled_scalar(s, alpha, alpha_i))
         scaled_s.zero_st = rhs.zero_st
         return _b_add_routes(lhs, scaled_s^, dst)
-    var scaled = _b_scale(rhs.t.value(), alpha, alpha_i)
+    var scaled = _b_scale_promoted(lhs, rhs.t.value(), alpha, alpha_i)
     var res = _b_add_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
     return res^
+
+
+def _b_scale_promoted(
+    lhs: Side, rhs: T, alpha: Float64, alpha_i: Optional[Int]
+) raises -> Held:
+    """`rhs * alpha` in the add/sub's result dtype: ATen promotes both
+    operands before its kernel scales `other`, so an int32 operand times
+    alpha = 2**30 against an int64 one must not wrap in int32 first."""
+    var common = _b_promote(lhs.t.value(), rhs) if lhs.is_t else (
+        _b_side_result(rhs, lhs)
+    )
+    if common < 0 or common == rhs.stype:
+        return _b_scale(rhs, alpha, alpha_i)
+    var promoted = _b_cast(rhs, common)
+    return _b_scale(promoted.t, alpha, alpha_i)
 
 
 def _b_sub_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
@@ -1461,7 +1476,7 @@ def _b_sub(
         var scaled_s = _b_sside(_b_scaled_scalar(s, alpha, alpha_i))
         scaled_s.zero_st = rhs.zero_st
         return _b_sub_routes(lhs, scaled_s^, dst)
-    var scaled = _b_scale(rhs.t.value(), alpha, alpha_i)
+    var scaled = _b_scale_promoted(lhs, rhs.t.value(), alpha, alpha_i)
     var res = _b_sub_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
     return res^

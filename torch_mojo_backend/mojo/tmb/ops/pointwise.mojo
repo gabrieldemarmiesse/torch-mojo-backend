@@ -32,8 +32,10 @@ from tmb.backend.abi import (
     ST_UINT8,
     T,
     TAG_BOOL,
+    TAG_DOUBLE,
     TAG_NONE,
     TAG_SCALAR_BOOL,
+    TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
     Value,
     bits_f64,
@@ -1207,7 +1209,8 @@ def _pw_is_bool_side(side: Side) -> Bool:
 def _pw_rsub_check(args: Values) raises:
     """BinaryOps.cpp's sub_check and alpha_check (rsub is sub(other, self,
     alpha)): no bool operand, no bool alpha (it would need a bool result,
-    which sub_check already refused)."""
+    which sub_check already refused), no floating alpha for an integral
+    result."""
     var a = _pw_is_bool_side(_b_side(args[unsafe_offset=0]))
     var b = _pw_is_bool_side(_b_side(args[unsafe_offset=1]))
     if a and b:
@@ -1224,6 +1227,18 @@ def _pw_rsub_check(args: Values) raises:
     var alpha = args[unsafe_offset=2].tag
     if alpha == TAG_SCALAR_BOOL or alpha == TAG_BOOL:
         raise Error("Boolean alpha only supported for Boolean results.")
+    if alpha == TAG_SCALAR_DOUBLE or alpha == TAG_DOUBLE:
+        var common = _pw_result_type(
+            _b_side(args[unsafe_offset=0]),
+            _b_side(args[unsafe_offset=1]),
+            _none_side(),
+            2,
+        )
+        if not _pw_is_float(common):
+            raise Error(
+                "For integral input tensors, argument alpha must not be a"
+                " floating point number."
+            )
 
 
 # aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor

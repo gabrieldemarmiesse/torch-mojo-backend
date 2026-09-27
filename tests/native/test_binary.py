@@ -1769,6 +1769,53 @@ def test_rsub_checks_and_rank_promotion(mojo_gpu):
     torch.testing.assert_close(out, torch.rsub(one, 1.0001))
 
 
+def test_rsub_integral_promotes_before_alpha(mojo_gpu):
+    """ATen promotes both operands before scaling self: int32 self times
+    alpha = 2**30 against an int64 other must not wrap in int32 first."""
+    i32_cpu = torch.tensor([100, -7, 3], dtype=torch.int32)
+    i64_cpu = torch.tensor([0, 5, 2**40], dtype=torch.int64)
+    i32, i64 = i32_cpu.to(mojo_gpu), i64_cpu.to(mojo_gpu)
+    alpha = 2**30
+    expected = torch.rsub(i32_cpu, i64_cpu, alpha=alpha)
+    torch.testing.assert_close(torch.rsub(i32, i64, alpha=alpha).cpu(), expected)
+    out = torch.empty(3, dtype=torch.int64, device=mojo_gpu)
+    torch.ops.aten.rsub.Tensor_out(i32, i64, alpha=alpha, out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+    # The same promotion order for sub / add, which rsub shares.
+    torch.testing.assert_close(
+        torch.sub(i64, i32, alpha=alpha).cpu(), torch.sub(i64_cpu, i32_cpu, alpha=alpha)
+    )
+    torch.testing.assert_close(
+        torch.add(i64, i32, alpha=alpha).cpu(), torch.add(i64_cpu, i32_cpu, alpha=alpha)
+    )
+
+
+def test_rsub_float_alpha_integral_result(mojo_gpu):
+    """ATen's alpha_check: a floating alpha is refused for an integral
+    result, in the functional and the out= overloads alike."""
+    i_cpu = torch.tensor([1, 2], dtype=torch.int32)
+    j_cpu = torch.tensor([3, 4], dtype=torch.int64)
+    i, j = i_cpu.to(mojo_gpu), j_cpu.to(mojo_gpu)
+    msg = "argument alpha must not be a floating point number"
+    cases = [
+        lambda a, b: torch.rsub(a, b, alpha=1.0),
+        lambda a, b: torch.rsub(a, 3, alpha=1.0),
+        lambda a, b: torch.ops.aten.rsub.Tensor_out(
+            a, b, alpha=2.0, out=torch.empty_like(b)
+        ),
+        lambda a, b: torch.ops.aten.rsub.Scalar_out(a, 3, 1.0, out=torch.empty_like(a)),
+    ]
+    for fn in cases:
+        with pytest.raises(RuntimeError, match=msg):
+            fn(i_cpu, j_cpu)
+        with pytest.raises(RuntimeError, match=msg):
+            fn(i, j)
+    # A float `other` makes the result floating: the float alpha is fine.
+    torch.testing.assert_close(
+        torch.rsub(i, 3.5, alpha=1.0).cpu(), torch.rsub(i_cpu, 3.5, alpha=1.0)
+    )
+
+
 def test_rsub_autograd(mojo_gpu):
     a_cpu = torch.randn(3, 4, requires_grad=True)
     b_cpu = torch.randn(3, 4, requires_grad=True)
