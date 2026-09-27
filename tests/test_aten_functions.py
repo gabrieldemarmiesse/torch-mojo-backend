@@ -5500,6 +5500,8 @@ _ACTIVATION_TWINS = [
     ("elu", lambda x: aten.elu(x, 0.8, 1.2, 0.9)),
     ("hardtanh", lambda x: aten.hardtanh(x, -0.5, 0.7)),
     ("leaky_relu", lambda x: aten.leaky_relu(x, 0.1)),
+    ("hardshrink_backward", lambda x: aten.hardshrink_backward(x * 2, x, 0.4)),
+    ("softshrink_backward", lambda x: aten.softshrink_backward(x * 2, x, 0.4)),
 ]
 
 
@@ -5603,6 +5605,19 @@ def test_aten_hardtanh_nan_bounds_compiled():
     x = torch.tensor([0.0, 2.0, -2.0, nan])
     _compiled_matches_cpu(lambda a: aten.hardtanh(a, nan, 1.0), [x])
     _compiled_matches_cpu(lambda a: aten.hardtanh(a, -1.0, nan), [x])
+
+
+@pytest.mark.parametrize("op", [aten.hardshrink_backward, aten.softshrink_backward])
+def test_aten_shrink_backward_promotes_compiled(op: Callable[..., torch.Tensor]):
+    """(grad, self) promote like the iterator: float32 grad with float64
+    self is float64, and float16 self 0.3 (0.30005) lies outside lambd 0.3."""
+    g = torch.tensor([1.0, 1.0, 1.0])
+    _compiled_matches_cpu(
+        lambda a, b: op(a, b, 0.5), [g, torch.tensor([0.7, 0.1, -0.6]).double()]
+    )
+    _compiled_matches_cpu(
+        lambda a, b: op(a, b, 0.3), [g, torch.tensor([0.3, 0.1, -0.3]).half()]
+    )
 
 
 def test_aten_rsub(conf: Conf, call_checker: CallChecker):

@@ -92,11 +92,16 @@ ACT_BACKWARD_OPS = {
     "elu_backward": lambda g, x: torch.ops.aten.elu_backward(
         g, 1.0, 1.0, 1.0, False, x
     ),
+    "hardshrink_backward": lambda g, x: torch.ops.aten.hardshrink_backward(g, x, 0.5),
+    "hardsigmoid_backward": torch.ops.aten.hardsigmoid_backward,
+    "hardswish_backward": torch.ops.aten.hardswish_backward,
     "hardtanh_backward": lambda g, x: torch.ops.aten.hardtanh_backward(g, x, -0.5, 0.5),
     "leaky_relu_backward": lambda g, x: torch.ops.aten.leaky_relu_backward(
         g, x, 0.01, False
     ),
+    "mish_backward": torch.ops.aten.mish_backward,
     "softplus_backward": lambda g, x: torch.ops.aten.softplus_backward(g, x, 1.0, 20.0),
+    "softshrink_backward": lambda g, x: torch.ops.aten.softshrink_backward(g, x, 0.5),
 }
 LOGICAL_OPS = {
     "logical_and": torch.logical_and,
@@ -224,6 +229,8 @@ SKIPPED: dict[str, str] = {
     "aten::fmod.Tensor_out": _OUT,
     "aten::frexp.Tensor_out": _OUT,
     "aten::gcd.out": _OUT,
+    "aten::hardshrink_backward.grad_input": _OUT,
+    "aten::hardsigmoid_backward.grad_input": _OUT,
     "aten::hardtanh_backward.grad_input": _OUT,
     "aten::heaviside.out": _OUT,
     "aten::hypot.out": _OUT,
@@ -248,6 +255,7 @@ SKIPPED: dict[str, str] = {
     "aten::rsub.Scalar_out": _OUT,
     "aten::rsub.Tensor_out": _OUT,
     "aten::softplus_backward.grad_input": _OUT,
+    "aten::softshrink_backward.grad_input": _OUT,
     "aten::special_xlog1py.out": _OUT,
     "aten::xlogy.OutTensor": _OUT,
 }

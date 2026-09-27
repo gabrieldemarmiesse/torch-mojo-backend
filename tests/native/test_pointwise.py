@@ -1,7 +1,10 @@
-"""Pointwise math on the native mojo device (tmb/ops/pointwise.mojo): pow,
-lerp (Scalar and Tensor), gelu_backward, clamp.Tensor, rsub and the binary
-math family (atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter,
-gcd, lcm, bitwise_left_shift.Tensor, bitwise_right_shift.Tensor so far).
+"""Pointwise math and parameterized activations on the native mojo device
+(tmb/ops/pointwise.mojo): pow, lerp (Scalar and Tensor), gelu_backward,
+clamp.Tensor, rsub, deg2rad/rad2deg/ldexp/frexp and the binary math family
+(atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter, gcd, lcm,
+bitwise_left_shift.Tensor, bitwise_right_shift.Tensor, logaddexp(2), xlogy,
+xlog1py), and elu, hardtanh, leaky_relu, softplus, threshold, hardshrink,
+softshrink, hardsigmoid, hardswish, mish with their backwards so far.
 
 Everything is compared with the same computation on CPU torch through the
 public API, over edge values (signed zeros, infinities, NaN, huge, tiny,
@@ -954,6 +957,65 @@ def test_ldexp_autograd(mojo_gpu):
     _close(e.grad, e_cpu.grad, **_tol(torch.float32, 4))
 
 
+# --------------------------------------------------------------------------
+# shrink / mish backward promotion, softshrink's lambd range, the forward
+# activations' out= overloads
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("op", ["hardshrink_backward", "softshrink_backward"])
+def test_shrink_backward_promotes(mojo_gpu, op):
+    fn = getattr(torch.ops.aten, op)
+    g = torch.tensor([1.0, 1.0, 1.0])
+    for x in (
+        torch.tensor([0.3, 0.1, -0.3]).half(),
+        torch.tensor([0.7, 0.1, -0.6]).double(),
+    ):
+        if x.dtype == torch.float64:
+            skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+        want = fn(g, x, 0.3)
+        got = fn(g.to(mojo_gpu), x.to(mojo_gpu), 0.3)
+        assert got.dtype == want.dtype
+        _close(got, want, rtol=0.0, atol=0.0)
+
+
+def test_mish_backward_keeps_self_dtype(mojo_gpu):
+    g = torch.tensor([1.0, -0.5, 2.0])
+    x = torch.tensor([0.3, -1.0, 4.0]).half()
+    want = torch.ops.aten.mish_backward(g, x)
+    got = torch.ops.aten.mish_backward(g.to(mojo_gpu), x.to(mojo_gpu))
+    assert got.dtype == want.dtype == torch.float16
+    _close(got, want, **_tol(torch.float16))
+
+
+@pytest.mark.parametrize("lambd", [float("nan"), float("inf"), -0.5, 1e6])
+def test_softshrink_lambd_range(mojo_gpu, lambd):
+    x = torch.tensor([1.0, -2.0]).half().to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="lambda must be in range"):
+        F.softshrink(x, lambd)
+    if lambd == 1e6:  # in range for float32
+        _close(F.softshrink(x.float(), lambd), F.softshrink(x.cpu().float(), lambd))
+
+
+@pytest.mark.parametrize(
+    "name", ["hardshrink", "softshrink", "hardsigmoid", "hardswish", "mish"]
+)
+def test_activation_b_out(mojo_gpu, name):
+    op = getattr(torch.ops.aten, name).out
+    x_cpu = torch.randn(4, 5) * 3
+    x = x_cpu.to(mojo_gpu)
+    want = getattr(torch.ops.aten, name)(x_cpu)
+    out = torch.empty(0, device=mojo_gpu)
+    with ran(f"aten::{name}.out"):
+        assert op(x, out=out) is out
+    _close(out, want, **_tol(torch.float32, 2))
+    strided = torch.zeros(5, 4, device=mojo_gpu).t()
+    op(x, out=strided)
+    _close(strided, want, **_tol(torch.float32, 2))
+    with pytest.raises(RuntimeError):
+        op(x, out=torch.empty(4, 5, dtype=torch.float16, device=mojo_gpu))
+
+
 @pytest.mark.parametrize("dtype", FLOATS)
 def test_pow_scalar_base(mojo_gpu, dtype):
     e = torch.cat([torch.tensor(_SPECIAL), torch.randn(50) * 3]).to(dtype)
@@ -994,6 +1056,11 @@ _ACT = [
     ("leaky_relu", lambda x: F.leaky_relu(x, 0.2), "aten::leaky_relu"),
     ("softplus", lambda x: F.softplus(x), "aten::softplus"),
     ("softplus_params", lambda x: F.softplus(x, 2.0, 3.0), "aten::softplus"),
+    ("hardshrink", lambda x: F.hardshrink(x, _in(x, 0.3)), "aten::hardshrink"),
+    ("softshrink", lambda x: F.softshrink(x, _in(x, 0.3)), "aten::softshrink"),
+    ("hardsigmoid", lambda x: F.hardsigmoid(x), "aten::hardsigmoid"),
+    ("hardswish", lambda x: F.hardswish(x), "aten::hardswish"),
+    ("mish", lambda x: F.mish(x), "aten::mish"),
     ("threshold", lambda x: F.threshold(x, _in(x, 0.3), -2.0), "aten::threshold"),
 ]
 
@@ -1073,7 +1140,10 @@ def test_activation_in_place_and_out(mojo_gpu):
         lambda t: F.elu(t, inplace=True),
         lambda t: F.hardtanh(t, inplace=True),
         lambda t: F.leaky_relu(t, 0.1, inplace=True),
+        lambda t: F.hardsigmoid(t, inplace=True),
+        lambda t: F.hardswish(t, inplace=True),
         lambda t: F.threshold(t, 0.5, 1.0, inplace=True),
+        lambda t: F.mish(t, inplace=True),
     ):
         x, xc = x_cpu.clone().to(mojo_gpu), x_cpu.clone()
         fn(x)
@@ -1152,6 +1222,26 @@ def test_elu_intermediates(mojo_gpu, dtype):
         args = (1e4, 1.0, 1e-4)
     want = torch.ops.aten.elu(x, *args)
     _close(torch.ops.aten.elu(x.to(mojo_gpu), *args), want)
+
+
+_F64_TOL = {"rtol": 1e-12, "atol": 1e-14}
+
+
+@pytest.mark.parametrize("name,fn,op", _ACT, ids=[a[0] for a in _ACT])
+def test_activation_float64(mojo_gpu, name, fn, op):
+    """float64 computes in double (opmath), with CUDA's constants: float's
+    1/6 in hardsigmoid / hardswish, as on CPU."""
+    skip_if_metal(mojo_gpu, "Metal has no float64")
+    x = _act_input(torch.float64)
+    with ran(op):
+        actual = fn(x.to(mojo_gpu))
+    want = fn(x)
+    if name in ("hardsigmoid", "hardswish"):
+        # CPU divides by 6; CUDA multiplies by float(1/6), which we follow.
+        one_sixth = torch.tensor(1.0 / 6.0, dtype=torch.float32).double()
+        r = (x + 3).clamp(0, 6) * one_sixth
+        want = r if name == "hardsigmoid" else x * (x + 3).clamp(0, 6) * one_sixth
+    _close(actual, want, **_F64_TOL)
 
 
 @pytest.mark.parametrize("dtype", [torch.int64, torch.int32])

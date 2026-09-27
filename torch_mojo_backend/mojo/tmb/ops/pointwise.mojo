@@ -1387,9 +1387,12 @@ def _pw_act(
     params: SIMD[DType.float64, 4],
     f64_ok: Bool = True,
     policy: Int = P_FLOAT_ONLY,
+    out_st: Int32 = -1,
 ) raises:
     """An activation (b_index < 0) or its backward: floating operands of one
-    dtype, operand a = args[a_index], b = args[b_index]."""
+    dtype, operand a = args[a_index], b = args[b_index]. The result is in
+    the compute dtype, or in `out_st` when given (a TensorIterator whose
+    output is allocated from one input's options)."""
     var a = _b_side(args[unsafe_offset=a_index])
     var arity = 1 if b_index < 0 else 2
     var b = _b_side(args[unsafe_offset=b_index]) if arity == 2 else _none_side()
@@ -1398,11 +1401,12 @@ def _pw_act(
     var dest = Optional[T]()
     if out_index >= 0:
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
+    var result_st = compute if out_st < 0 else out_st
     _pw_finish(
         rets,
         dest,
         _pw_run(
-            kind, arity, a, b, _none_side(), compute, compute, params, dest
+            kind, arity, a, b, _none_side(), compute, result_st, params, dest
         ),
         _pw_out_exact(kind),
     )
@@ -1506,6 +1510,46 @@ def _lambd_p(args: Values, i: Int, st: Int32) raises -> SIMD[DType.float64, 4]:
     return _p(_round_to(v_f64(args[unsafe_offset=i]), st))
 
 
+def _shrink_backward_p(args: Values) raises -> SIMD[DType.float64, 4]:
+    """lambd as `Scalar::to<scalar_t>` of the kernel's dtype: the promoted
+    (grad, self) dtype, not self's (float16 self 0.3 is 0.30005, outside a
+    float32 lambd of 0.3; a float16 lambd would round to 0.30005 too)."""
+    var common = _pw_result_type(
+        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=1]),
+        _none_side(),
+        2,
+    )
+    return _lambd_p(args, 2, common)
+
+
+def _float_max(st: Int32) -> Float64:
+    """std::numeric_limits<scalar_t>::max() of a floating dtype."""
+    if st == ST_FLOAT16:
+        return 65504.0
+    if st == ST_BFLOAT16:
+        return 3.3895313892515355e38
+    if st == ST_FLOAT32:
+        return 3.4028234663852886e38
+    return 1.7976931348623157e308
+
+
+def _softshrink_check(args: Values) raises:
+    """softshrink's meta: 0 <= lambd <= max of self's dtype (NaN fails)."""
+    var lambd = v_f64(args[unsafe_offset=1])
+    var st = _self_stype(args, 0)
+    var top = _float_max(st)
+    if not (lambd >= 0.0 and lambd <= top):
+        raise Error(
+            "lambda must be in range [0, ",
+            top,
+            "] for input dtype ",
+            dtype_name(st),
+            ", but found ",
+            lambd,
+        )
+
+
 # aten::hardshrink(Tensor self, Scalar lambd=0.5) -> Tensor
 def op_hardshrink(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _pw_act(
@@ -1536,12 +1580,7 @@ def op_hardshrink_out(
 
 # aten::softshrink(Tensor self, Scalar lambd=0.5) -> Tensor
 def op_softshrink(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if v_f64(args[unsafe_offset=1]) < 0:
-        raise Error(
-            "lambda must be greater or equal to 0, but found to be "
-            + String(v_f64(args[unsafe_offset=1]))
-            + "."
-        )
+    _softshrink_check(args)
     _pw_act(
         "softshrink",
         args,
@@ -1557,12 +1596,7 @@ def op_softshrink(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_softshrink_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if v_f64(args[unsafe_offset=1]) < 0:
-        raise Error(
-            "lambda must be greater or equal to 0, but found to be "
-            + String(v_f64(args[unsafe_offset=1]))
-            + "."
-        )
+    _softshrink_check(args)
     _pw_act(
         "softshrink",
         args,
@@ -1586,7 +1620,7 @@ def op_shrink_backward(
         0,
         1,
         -1,
-        _lambd_p(args, 2, _self_stype(args, 1)),
+        _shrink_backward_p(args),
     )
 
 
@@ -1602,7 +1636,7 @@ def op_shrink_backward_grad_input(
         0,
         1,
         3,
-        _lambd_p(args, 2, _self_stype(args, 1)),
+        _shrink_backward_p(args),
     )
 
 
@@ -1855,7 +1889,18 @@ def op_mish_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_mish_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_act("mish_backward", args, rets, 0, 1, -1, _p())
+    # ATen allocates grad_input from `self` (empty({0}, input.options())):
+    # computed in the promoted dtype, returned in self's.
+    _pw_act(
+        "mish_backward",
+        args,
+        rets,
+        0,
+        1,
+        -1,
+        _p(),
+        out_st=_self_stype(args, 1),
+    )
 
 
 # aten::silu_backward(Tensor grad_output, Tensor self) -> Tensor
@@ -2906,6 +2951,21 @@ def register_pointwise(site: Site) raises:
     impl[op_rad2deg, "rad2deg"](site)
     impl[op_rad2deg_out, "rad2deg.out"](site)
     impl[op_rad2deg_, "rad2deg_"](site)
+    impl[op_hardshrink, "hardshrink"](site)
+    impl[op_hardshrink_out, "hardshrink.out"](site)
+    impl[op_shrink_backward, "hardshrink_backward"](site)
+    impl[op_shrink_backward_grad_input, "hardshrink_backward.grad_input"](site)
+    impl[op_hardsigmoid, "hardsigmoid"](site)
+    impl[op_hardsigmoid_out, "hardsigmoid.out"](site)
+    impl[op_hardsigmoid_, "hardsigmoid_"](site)
+    impl[op_hardsigmoid_backward, "hardsigmoid_backward"](site)
+    impl[op_hardsigmoid_backward_grad_input, "hardsigmoid_backward.grad_input"](
+        site
+    )
+    impl[op_hardswish, "hardswish"](site)
+    impl[op_hardswish_out, "hardswish.out"](site)
+    impl[op_hardswish_, "hardswish_"](site)
+    impl[op_hardswish_backward, "hardswish_backward"](site)
     impl[op_hardtanh, "hardtanh"](site)
     impl[op_hardtanh_out, "hardtanh.out"](site)
     impl[op_hardtanh_, "hardtanh_"](site)
@@ -2933,6 +2993,9 @@ def register_pointwise(site: Site) raises:
     impl[op_logaddexp_out, "logaddexp.out"](site)
     impl[op_logaddexp2, "logaddexp2"](site)
     impl[op_logaddexp2_out, "logaddexp2.out"](site)
+    impl[op_mish, "mish"](site)
+    impl[op_mish_out, "mish.out"](site)
+    impl[op_mish_backward, "mish_backward"](site)
     impl[op_nextafter, "nextafter"](site)
     impl[op_nextafter_out, "nextafter.out"](site)
     impl[op_rsub_any, "rsub.Tensor"](site)
@@ -2949,6 +3012,10 @@ def register_pointwise(site: Site) raises:
     impl[op_softplus_out, "softplus.out"](site)
     impl[op_softplus_backward, "softplus_backward"](site)
     impl[op_softplus_backward_grad_input, "softplus_backward.grad_input"](site)
+    impl[op_softshrink, "softshrink"](site)
+    impl[op_softshrink_out, "softshrink.out"](site)
+    impl[op_shrink_backward, "softshrink_backward"](site)
+    impl[op_shrink_backward_grad_input, "softshrink_backward.grad_input"](site)
     _register_special(site)
     impl[op_threshold, "threshold"](site)
     impl[op_threshold_out, "threshold.out"](site)

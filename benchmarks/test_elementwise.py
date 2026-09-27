@@ -120,9 +120,14 @@ COVERS: dict[str, str] = {f"aten::{name}": "test_unary" for name in UNARY_OPS} |
 # so both sides of every kink are timed.
 ACTIVATION_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "elu": F.elu,
+    "hardshrink": lambda x: F.hardshrink(x, 0.2),
+    "hardsigmoid": F.hardsigmoid,
+    "hardswish": F.hardswish,
     "hardtanh": lambda x: F.hardtanh(x, -0.25, 0.25),
     "leaky_relu": F.leaky_relu,
+    "mish": F.mish,
     "softplus": F.softplus,
+    "softshrink": lambda x: F.softshrink(x, 0.2),
     "threshold": lambda x: F.threshold(x, 0.1, -1.0),
 }
 COVERS |= {f"aten::{name}": "test_activation" for name in ACTIVATION_OPS}
@@ -134,11 +139,18 @@ SKIPPED |= {
     f"aten::{name}": _ACT_OUT
     for name in (
         "elu.out",
+        "hardshrink.out",
+        "hardsigmoid.out",
+        "hardsigmoid_",
+        "hardswish.out",
+        "hardswish_",
         "hardtanh.out",
         "hardtanh_",
         "leaky_relu.out",
         "leaky_relu_",
+        "mish.out",
         "softplus.out",
+        "softshrink.out",
         "threshold.out",
         "threshold_",
     )
