@@ -258,10 +258,14 @@ def _pointwise_binary(
         "fmod",
         "gcd",
         "heaviside",
+        "hermite_polynomial_h",
+        "hermite_polynomial_he",
         "hypot",
         "igamma",
         "igammac",
+        "laguerre_polynomial_l",
         "lcm",
+        "legendre_polynomial_p",
         "logaddexp",
         "logaddexp2",
         "lshift",
@@ -5074,6 +5078,22 @@ def aten_special_erfcx(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "erfcx")
 
 
+# special_hermite_polynomial_h(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_hermite_polynomial_h)
+def aten_special_hermite_polynomial_h(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "hermite_polynomial_h", promote_float=True)
+
+
+# special_hermite_polynomial_he(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_hermite_polynomial_he)
+def aten_special_hermite_polynomial_he(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "hermite_polynomial_he", promote_float=True)
+
+
 # special_i0e(Tensor self) -> Tensor
 @map_to(aten.special_i0e)
 def aten_special_i0e(x: MaxTensor) -> MaxTensor:
@@ -5090,6 +5110,22 @@ def aten_special_i1(x: MaxTensor) -> MaxTensor:
 @map_to(aten.special_i1e)
 def aten_special_i1e(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "i1e")
+
+
+# special_laguerre_polynomial_l(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_laguerre_polynomial_l)
+def aten_special_laguerre_polynomial_l(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "laguerre_polynomial_l", promote_float=True)
+
+
+# special_legendre_polynomial_p(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_legendre_polynomial_p)
+def aten_special_legendre_polynomial_p(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "legendre_polynomial_p", promote_float=True)
 
 
 # special_log_ndtr(Tensor self) -> Tensor

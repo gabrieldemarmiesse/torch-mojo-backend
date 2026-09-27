@@ -3,10 +3,9 @@
 clamp.Tensor, rsub, deg2rad/rad2deg/ldexp/frexp and the binary math family
 (atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter, gcd, lcm,
 bitwise_left_shift.Tensor, bitwise_right_shift.Tensor, logaddexp(2), xlogy,
-xlog1py, zeta, igamma/igammac, the Chebyshev and shifted Chebyshev
-polynomials), and elu, hardtanh, leaky_relu, softplus, threshold,
-hardshrink, softshrink, hardsigmoid, hardswish, mish with their backwards so
-far.
+xlog1py, zeta, igamma/igammac, the special polynomials), and elu, hardtanh,
+leaky_relu, softplus, threshold, hardshrink, softshrink, hardsigmoid,
+hardswish, mish with their backwards so far.
 
 Everything is compared with the same computation on CPU torch through the
 public API, over edge values (signed zeros, infinities, NaN, huge, tiny,
@@ -647,6 +646,10 @@ _POLYS = [
     "shifted_chebyshev_polynomial_u",
     "shifted_chebyshev_polynomial_v",
     "shifted_chebyshev_polynomial_w",
+    "hermite_polynomial_h",
+    "hermite_polynomial_he",
+    "laguerre_polynomial_l",
+    "legendre_polynomial_p",
 ]
 
 

@@ -5365,6 +5365,24 @@ _POINTWISE_BINARY_TWINS = [
         torch.float32,
         "poly",
     ),
+    (
+        "special_hermite_polynomial_h",
+        aten.special_hermite_polynomial_h,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_legendre_polynomial_p",
+        aten.special_legendre_polynomial_p,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_laguerre_polynomial_l",
+        aten.special_laguerre_polynomial_l,
+        torch.float32,
+        "poly",
+    ),
 ]
 
 
