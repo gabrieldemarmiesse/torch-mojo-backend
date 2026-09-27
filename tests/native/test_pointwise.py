@@ -1,6 +1,7 @@
 """Pointwise math on the native mojo device (tmb/ops/pointwise.mojo): pow,
 lerp (Scalar and Tensor), gelu_backward, clamp.Tensor, rsub and the binary
-math family (atan2, hypot, copysign, fmod so far).
+math family (atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter
+so far).
 
 Everything is compared with the same computation on CPU torch through the
 public API, over edge values (signed zeros, infinities, NaN, huge, tiny,
@@ -425,13 +426,19 @@ _BINARY = [
     ("atan2", torch.atan2, ("aten::atan2",), 2),
     ("hypot", torch.hypot, ("aten::hypot",), 1),
     ("copysign", torch.copysign, ("aten::copysign.Tensor",), 0),
+    ("fmax", torch.fmax, ("aten::fmax",), 0),
+    ("fmin", torch.fmin, ("aten::fmin",), 0),
     ("fmod", torch.fmod, ("aten::fmod.Tensor",), 0),
+    ("nextafter", torch.nextafter, ("aten::nextafter",), 0),
+    ("heaviside", torch.heaviside, ("aten::heaviside",), 0),
 ]
 
 
 @pytest.mark.parametrize("dtype", FLOATS)
 @pytest.mark.parametrize("name,fn,ops,ulps", _BINARY, ids=[b[0] for b in _BINARY])
 def test_binary_math_edges(mojo_gpu, name, fn, ops, ulps, dtype):
+    if name == "nextafter" and not _cpu_has_nextafter(dtype):
+        pytest.skip(f"CPU torch has no {dtype} nextafter to compare with")
     x, y = _pairs(dtype)
     if name == "atan2" and _flushes_subnormals(mojo_gpu):
         # These are Metal kernels in torch MPS too, which flush the same way.
@@ -446,7 +453,46 @@ def test_binary_math_edges(mojo_gpu, name, fn, ops, ulps, dtype):
     with ran(*ops):
         actual = fn(x.to(mojo_gpu), y.to(mojo_gpu))
     assert actual.dtype == expected.dtype
-    _close(actual, expected, **_tol(dtype, ulps))
+    if name == "nextafter":
+        # One ulp away: any tolerance would accept the input unchanged.
+        if _flushes_subnormals(mojo_gpu):
+            # Apple GPUs flush subnormal operands and results to zero.
+            keep = ~(_subnormal(x) | _subnormal(y) | _subnormal(expected))
+            actual, expected = actual.cpu()[keep], expected[keep]
+        _close(actual, expected, rtol=0.0, atol=0.0)
+    else:
+        _close(actual, expected, **_tol(dtype, ulps))
+
+
+def _cpu_has_nextafter(dtype: torch.dtype) -> bool:
+    """Whether this CPU torch has a `dtype` nextafter (half types since 2.x)."""
+    try:
+        torch.nextafter(torch.ones(1, dtype=dtype), torch.zeros(1, dtype=dtype))
+    except RuntimeError:
+        return False
+    return True
+
+
+def test_nextafter_half_bits(mojo_gpu):
+    """No CPU half kernel: check the 16-bit patterns against the float32
+    ones rounded, which is exact for one ulp steps away from zero."""
+    for dtype in (torch.float16, torch.bfloat16):
+        x = torch.tensor([1.0, 1.0, -2.0, 0.0, 0.0, 3.0, float("nan")], dtype=dtype)
+        y = torch.tensor([2.0, 0.0, 0.0, 1.0, -1.0, 3.0, 1.0], dtype=dtype)
+        got = torch.nextafter(x.to(mojo_gpu), y.to(mojo_gpu)).cpu()
+        u = torch.int16
+        bits = x.view(u)
+        step = torch.where((y > x) ^ (x < 0), 1, -1).to(u)
+        want = (bits + step).view(dtype)
+        want[3] = torch.tensor(0x0001, dtype=u).view(dtype)
+        want[4] = torch.tensor(-32767, dtype=u).view(dtype)
+        want[5] = 3.0
+        want[6] = float("nan")
+        if dtype == torch.bfloat16 and _flushes_subnormals(mojo_gpu):
+            # The bfloat16 smallest subnormals (from +-0) are flushed to
+            # zero on Apple GPUs.
+            got, want = got[[0, 1, 2, 5, 6]], want[[0, 1, 2, 5, 6]]
+        _close(got, want, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
@@ -455,7 +501,7 @@ def test_binary_math_broadcast_scalar_strided_out(mojo_gpu, dtype):
     a_cpu = torch.randn(6, 5).to(dtype)
     b_cpu = torch.randn(5).to(dtype)
     a, b = a_cpu.to(mojo_gpu), b_cpu.to(mojo_gpu)
-    for fn in (torch.atan2, torch.hypot, torch.copysign, torch.fmod):
+    for fn in (torch.atan2, torch.hypot, torch.copysign, torch.fmod, torch.fmax):
         _close(fn(a, b), fn(a_cpu, b_cpu), **_tol(dtype, 2))
         _close(fn(a.t(), a.t()), fn(a_cpu.t(), a_cpu.t()), **_tol(dtype, 2))
         col = a_cpu[:, :1]
@@ -473,11 +519,14 @@ def test_binary_math_broadcast_scalar_strided_out(mojo_gpu, dtype):
 def test_binary_math_in_place(mojo_gpu):
     a_cpu = torch.randn(4, 7)
     b_cpu = torch.randn(4, 7)
-    for name in ("atan2_", "hypot_", "copysign_", "fmod_"):
+    for name in ("atan2_", "hypot_", "copysign_", "fmod_", "nextafter_"):
         x, x_cpu = a_cpu.clone().to(mojo_gpu), a_cpu.clone()
         getattr(x, name)(b_cpu.to(mojo_gpu))
         getattr(x_cpu, name)(b_cpu)
-        _close(x, x_cpu, **_tol(torch.float32, 2))
+        if name == "nextafter_":
+            _close(x, x_cpu, rtol=0.0, atol=0.0)
+        else:
+            _close(x, x_cpu, **_tol(torch.float32, 2))
 
 
 def test_binary_math_int_promotion(mojo_gpu):
@@ -488,6 +537,39 @@ def test_binary_math_int_promotion(mojo_gpu):
         actual = fn(i.to(mojo_gpu), j.to(mojo_gpu))
         assert actual.dtype == expected.dtype == torch.float32
         _close(actual, expected, **_tol(torch.float32, 2))
-    _close(torch.fmod(i.to(mojo_gpu), j.to(mojo_gpu)), torch.fmod(i, j))
+    for fn in (torch.fmax, torch.fmin, torch.fmod):
+        _close(fn(i.to(mojo_gpu), j.to(mojo_gpu)), fn(i, j))
     f = torch.randn(12)
     _close(torch.atan2(i.to(mojo_gpu), f.to(mojo_gpu)), torch.atan2(i, f))
+
+
+def test_heaviside_cpu_scalar_values(mojo_gpu):
+    # A CPU 0-d `values` is a tensor of its own dtype too, not a number.
+    with pytest.raises(RuntimeError, match="different dtypes"):
+        torch.heaviside(
+            torch.ones(3, dtype=torch.int64, device=mojo_gpu),
+            torch.tensor(2.0, dtype=torch.float64),
+        )
+    x = torch.tensor([-1.0, 0.0, 2.0])
+    half = torch.tensor(0.5)
+    _close(torch.heaviside(x.to(mojo_gpu), half), torch.heaviside(x, half))
+
+
+@pytest.mark.parametrize("dtype", [torch.bool, torch.int64, torch.float16])
+def test_heaviside_fmax_fmin_dtypes(mojo_gpu, dtype):
+    if dtype == torch.bool:
+        x = torch.tensor([True, False, True, False])
+        y = torch.tensor([True, True, False, False])
+    else:
+        x = torch.tensor([-2, 0, 0, 3, 5, -1]).to(dtype)
+        y = torch.tensor([7, 1, 0, -2, 5, 4]).to(dtype)
+    for fn in (torch.heaviside, torch.fmax, torch.fmin):
+        _close(fn(x.to(mojo_gpu), y.to(mojo_gpu)), fn(x, y))
+
+
+def test_heaviside_rejects_mixed_dtypes(mojo_gpu):
+    with pytest.raises(RuntimeError, match="different dtypes"):
+        torch.heaviside(
+            torch.ones(3, device=mojo_gpu),
+            torch.ones(3, dtype=torch.int64, device=mojo_gpu),
+        )

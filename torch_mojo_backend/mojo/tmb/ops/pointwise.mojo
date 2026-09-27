@@ -604,11 +604,24 @@ def op_lcm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _pw_math("lcm", P_INT, True, 2, args, rets, 2)
 
 
+def _pw_side_stype(side: Side) -> Int32:
+    """The dtype of an operand's tensor: a CPU 0-d tensor read back as a
+    Scalar keeps its own (a wrapped Python number is double / long / bool)."""
+    if side.is_t:
+        return side.t.value().stype
+    if side.zero_st >= 0:
+        return side.zero_st
+    if side.s.value().is_bool:
+        return ST_BOOL
+    return ST_INT64 if side.s.value().is_int else ST_FLOAT64
+
+
 def _pw_same_dtype(name: StaticString, args: Values) raises:
-    """heaviside's meta check: both tensors of one dtype."""
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
-    if a.is_t and b.is_t and a.t.value().stype != b.t.value().stype:
+    """heaviside's meta check: both tensors of one dtype, a CPU 0-d
+    `values` included."""
+    var a = _pw_side_stype(_b_side(args[unsafe_offset=0]))
+    var b = _pw_side_stype(_b_side(args[unsafe_offset=1]))
+    if a != b:
         raise Error(
             String(name)
             + " is not yet implemented for tensors with different dtypes."
@@ -2756,11 +2769,17 @@ def register_pointwise(site: Site) raises:
     impl[op_copysign, "copysign.Tensor"](site)
     impl[op_copysign_out, "copysign.Scalar_out"](site)
     impl[op_copysign_out, "copysign.out"](site)
+    impl[op_fmax, "fmax"](site)
+    impl[op_fmax_out, "fmax.out"](site)
+    impl[op_fmin, "fmin"](site)
+    impl[op_fmin_out, "fmin.out"](site)
     impl[op_fmod, "fmod.Scalar"](site)
     impl[op_fmod, "fmod.Tensor"](site)
     impl[op_fmod_out, "fmod.Scalar_out"](site)
     impl[op_fmod_out, "fmod.Tensor_out"](site)
     impl[op_gelu_backward_any, "gelu_backward"](site)
+    impl[op_heaviside, "heaviside"](site)
+    impl[op_heaviside_out, "heaviside.out"](site)
     impl[op_hypot, "hypot"](site)
     impl[op_hypot_out, "hypot.out"](site)
     impl[op_lerp_scalar_any, "lerp.Scalar"](site)
@@ -2768,6 +2787,8 @@ def register_pointwise(site: Site) raises:
     impl[op_lerp_scalar__any, "lerp_.Scalar"](site)
     impl[op_lerp_tensor, "lerp.Tensor"](site)
     impl[op_lerp_tensor_out, "lerp.Tensor_out"](site)
+    impl[op_nextafter, "nextafter"](site)
+    impl[op_nextafter_out, "nextafter.out"](site)
     impl[op_rsub_any, "rsub.Tensor"](site)
     impl[op_rsub_any, "rsub.Scalar"](site)
     impl[op_rsub_out_any, "rsub.Tensor_out"](site)

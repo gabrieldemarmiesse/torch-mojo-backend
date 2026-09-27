@@ -5429,10 +5429,14 @@ def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dty
 
 
 _POINTWISE_BINARY_TWINS = [
+    ("heaviside", aten.heaviside, torch.float32, "heaviside"),
     ("atan2", aten.atan2, torch.float32, "float"),
     ("copysign", aten.copysign, torch.float32, "float"),
+    ("fmax", aten.fmax, torch.float32, "float"),
+    ("fmin", aten.fmin, torch.int64, "int"),
     ("fmod", aten.fmod, torch.float32, "float"),
     ("hypot", aten.hypot, torch.float32, "float"),
+    ("nextafter", aten.nextafter, torch.float32, "float"),
 ]
 
 
@@ -5447,6 +5451,11 @@ def _pointwise_operands(domain: str, dtype: torch.dtype) -> list[torch.Tensor]:
         return [
             torch.randint(-50, 50, (3, 5)).to(dtype),
             torch.randint(0, 9, (5,)).to(dtype),
+        ]
+    if domain == "heaviside":
+        return [
+            torch.tensor([[-1.0, 0.0, 2.0, math.nan, 0.0]] * 3).to(dtype),
+            torch.tensor([0.5, 0.25, 7.0, 0.5, math.nan]).to(dtype),
         ]
     if domain == "zeta":
         return [torch.rand(3, 5) * 4 + 1.1, torch.rand(5) + 0.5]
@@ -5474,8 +5483,11 @@ def test_aten_pointwise_binary(
         return op(x, y)
 
     inputs = _pointwise_operands(domain, dtype)
-    check_outputs(fn, conf, inputs, rtol=2e-5, atol=2e-5)
-    _compiled_matches_cpu(fn, inputs, rtol=2e-5, atol=2e-5)
+    # nextafter is one ulp: a tolerance would accept the input unchanged.
+    tol = 0.0 if name == "nextafter" else 2e-5
+    if domain != "heaviside":  # check_outputs has no equal_nan for its NaN
+        check_outputs(fn, conf, inputs, rtol=tol, atol=tol)
+    _compiled_matches_cpu(fn, inputs, rtol=tol, atol=tol)
 
 
 def test_aten_rsub(conf: Conf, call_checker: CallChecker):
