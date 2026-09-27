@@ -388,11 +388,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "softmax_with_dtype": ("float32", "bfloat16", "float16", "int64", "bool"),
     "sort": ("bfloat16", "float16", "bool"),
     "sparse_sampled_addmm": ("float32",),
-    "special_airy_ai": ("float32", "int64", "bool"),
-    "special_entr": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "special_erfcx": ("float32", "int64", "bool"),
-    "special_log_ndtr": ("float32", "int64", "bool"),
-    "special_ndtri": ("float32", "int64", "bool"),
     "special_polygamma_special_polygamma_n_0": (
         "float32",
         "bfloat16",

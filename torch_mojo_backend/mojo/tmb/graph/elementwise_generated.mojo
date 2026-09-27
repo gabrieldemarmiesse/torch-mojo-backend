@@ -44,6 +44,18 @@ struct ElementwiseAcosh(ElementwiseUnaryMixedOp):
         return Op.elementwise[dtype, out_dtype, width](x)
 
 
+@extensibility.register("elementwise_airy_ai")
+struct ElementwiseAiryAi(ElementwiseUnaryMixedOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        out_dtype: DType,
+        width: SIMDLength,
+    ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+        comptime Op = ElementwiseOp["airy_ai"]
+        return Op.elementwise[dtype, out_dtype, width](x)
+
+
 @extensibility.register("elementwise_angle")
 struct ElementwiseAngle(ElementwiseUnaryMixedOp):
     @staticmethod
@@ -188,6 +200,18 @@ struct ElementwiseCosh(ElementwiseUnaryMixedOp):
         return Op.elementwise[dtype, out_dtype, width](x)
 
 
+@extensibility.register("elementwise_entr")
+struct ElementwiseEntr(ElementwiseUnaryMixedOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        out_dtype: DType,
+        width: SIMDLength,
+    ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+        comptime Op = ElementwiseOp["entr"]
+        return Op.elementwise[dtype, out_dtype, width](x)
+
+
 @extensibility.register("elementwise_erf")
 struct ElementwiseErf(ElementwiseUnaryMixedOp):
     @staticmethod
@@ -209,6 +233,18 @@ struct ElementwiseErfc(ElementwiseUnaryMixedOp):
         width: SIMDLength,
     ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
         comptime Op = ElementwiseOp["erfc"]
+        return Op.elementwise[dtype, out_dtype, width](x)
+
+
+@extensibility.register("elementwise_erfcx")
+struct ElementwiseErfcx(ElementwiseUnaryMixedOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        out_dtype: DType,
+        width: SIMDLength,
+    ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+        comptime Op = ElementwiseOp["erfcx"]
         return Op.elementwise[dtype, out_dtype, width](x)
 
 
@@ -356,6 +392,30 @@ struct ElementwiseIsnan(ElementwiseUnaryMixedOp):
         return Op.elementwise[dtype, out_dtype, width](x)
 
 
+@extensibility.register("elementwise_log10")
+struct ElementwiseLog10(ElementwiseUnaryMixedOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        out_dtype: DType,
+        width: SIMDLength,
+    ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+        comptime Op = ElementwiseOp["log10"]
+        return Op.elementwise[dtype, out_dtype, width](x)
+
+
+@extensibility.register("elementwise_log_ndtr")
+struct ElementwiseLogNdtr(ElementwiseUnaryMixedOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        out_dtype: DType,
+        width: SIMDLength,
+    ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+        comptime Op = ElementwiseOp["log_ndtr"]
+        return Op.elementwise[dtype, out_dtype, width](x)
+
+
 @extensibility.register("elementwise_logical_not")
 struct ElementwiseLogicalNot(ElementwiseUnaryMixedOp):
     @staticmethod
@@ -377,18 +437,6 @@ struct ElementwiseLog(ElementwiseUnaryMixedOp):
         width: SIMDLength,
     ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
         comptime Op = ElementwiseOp["log"]
-        return Op.elementwise[dtype, out_dtype, width](x)
-
-
-@extensibility.register("elementwise_log10")
-struct ElementwiseLog10(ElementwiseUnaryMixedOp):
-    @staticmethod
-    def elementwise[
-        dtype: DType,
-        out_dtype: DType,
-        width: SIMDLength,
-    ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
-        comptime Op = ElementwiseOp["log10"]
         return Op.elementwise[dtype, out_dtype, width](x)
 
 
@@ -461,6 +509,18 @@ struct ElementwiseModifiedBesselK1(ElementwiseUnaryMixedOp):
         width: SIMDLength,
     ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
         comptime Op = ElementwiseOp["modified_bessel_k1"]
+        return Op.elementwise[dtype, out_dtype, width](x)
+
+
+@extensibility.register("elementwise_ndtri")
+struct ElementwiseNdtri(ElementwiseUnaryMixedOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        out_dtype: DType,
+        width: SIMDLength,
+    ](x: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+        comptime Op = ElementwiseOp["ndtri"]
         return Op.elementwise[dtype, out_dtype, width](x)
 
 
