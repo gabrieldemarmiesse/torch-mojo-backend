@@ -139,6 +139,11 @@ def _pow_f64_core(ax: Float64, y: Float64) -> Float64:
     var th = _add_rn(t_hi, t_lo)
     var tl = _add_rn(t_lo, -_add_rn(th, -t_hi))
     var r = nv_exp(th)
+    # exp overflows from 709.7827 on, below the 709.8 cutoff above: then
+    # fma(inf, tl, inf) with a negative tail would be inf - inf = NaN
+    # (pow(2, 1024.003)). The underflow side needs no guard: fma(0, tl, 0) = 0.
+    if r == inf[DType.float64]():
+        return r
     return fma(r, tl, r)
 
 

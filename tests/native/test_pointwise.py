@@ -7,6 +7,7 @@ denormals), broadcasting, strided operands, out= and in-place forms.
 """
 
 import contextlib
+import math
 
 import pytest
 import torch
@@ -185,6 +186,35 @@ def test_pow_float64_special_values_saturate(mojo_gpu):
         with ran("aten::pow.Tensor_Scalar"):
             got = torch.pow(x.to(mojo_gpu), e)
         _close(got, torch.pow(x, e), rtol=2.3e-16, atol=0)
+
+
+def test_pow_float64_near_overflow_and_underflow(mojo_gpu):
+    """y * log|x| just past exp's overflow (709.78) or underflow (-745.13)
+    bounds: pow(2, 1024.003) is inf, never inf - inf = NaN from the
+    double-double correction of an exp that already overflowed."""
+    skip_if_metal(mojo_gpu, "Metal has no float64")
+    bases = torch.tensor([2.0, math.e, 10.0, 0.5, 1.0001, 123.456], dtype=torch.float64)
+    t = torch.cat(
+        [
+            torch.linspace(709.0, 710.5, 4001, dtype=torch.float64),
+            torch.linspace(-746.0, -744.0, 4001, dtype=torch.float64),
+        ]
+    )
+    x = bases.repeat_interleave(len(t))
+    y = t.repeat(len(bases)) / torch.log(x)
+    x = torch.cat([x, torch.tensor([2.0, 2.0, 2.0], dtype=torch.float64)])
+    y = torch.cat(
+        [y, torch.tensor([1024.003, 1023.9999, -1075.1], dtype=torch.float64)]
+    )
+    want = torch.pow(x, y)
+    with ran("aten::pow.Tensor_Tensor"):
+        got = torch.pow(x.to(mojo_gpu), y.to(mojo_gpu)).cpu()
+    assert not got.isnan().any()
+    special = ~torch.isfinite(want) | (want == 0)
+    assert torch.equal(got[special], want[special])
+    finite = ~special
+    # Within an ulp; below 2**-1022 an ulp is the absolute 5e-324.
+    _close(got[finite], want[finite], rtol=2.3e-16, atol=1e-323)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA reference")
