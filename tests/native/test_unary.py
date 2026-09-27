@@ -1420,6 +1420,11 @@ _SPECIAL_OUT = [
     "i1e",
     "scaled_modified_bessel_k0",
     "scaled_modified_bessel_k1",
+    "airy_ai",
+    "entr",
+    "erfcx",
+    "log_ndtr",
+    "ndtri",
 ]
 
 
@@ -1427,6 +1432,8 @@ _SPECIAL_OUT = [
 def test_special_unary_out(mojo_gpu: str, name: str):
     fn = getattr(torch.special, name)
     x_cpu = torch.tensor([0.1, 0.5, 1.5, 3.0, 7.0, 12.5])
+    if name == "ndtri":  # a probability
+        x_cpu = torch.tensor([1e-6, 0.05, 0.3, 0.5, 0.9, 0.999])
     x = x_cpu.to(mojo_gpu)
     want = fn(x_cpu)
     out = torch.empty(0, device=mojo_gpu)

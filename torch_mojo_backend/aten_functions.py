@@ -5206,6 +5206,12 @@ def aten_sort_stable(
     return _sort_impl(input, dim, descending)
 
 
+# special_airy_ai(Tensor x) -> Tensor
+@map_to(aten.special_airy_ai)
+def aten_special_airy_ai(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "airy_ai")
+
+
 # special_bessel_j0(Tensor self) -> Tensor
 @map_to(aten.special_bessel_j0)
 def aten_special_bessel_j0(x: MaxTensor) -> MaxTensor:
@@ -5230,6 +5236,18 @@ def aten_special_bessel_y1(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "bessel_y1")
 
 
+# special_entr(Tensor self) -> Tensor
+@map_to(aten.special_entr)
+def aten_special_entr(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "entr")
+
+
+# special_erfcx(Tensor self) -> Tensor
+@map_to(aten.special_erfcx)
+def aten_special_erfcx(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "erfcx")
+
+
 # special_i0e(Tensor self) -> Tensor
 @map_to(aten.special_i0e)
 def aten_special_i0e(x: MaxTensor) -> MaxTensor:
@@ -5246,6 +5264,12 @@ def aten_special_i1(x: MaxTensor) -> MaxTensor:
 @map_to(aten.special_i1e)
 def aten_special_i1e(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "i1e")
+
+
+# special_log_ndtr(Tensor self) -> Tensor
+@map_to(aten.special_log_ndtr)
+def aten_special_log_ndtr(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "log_ndtr")
 
 
 # special_modified_bessel_i0(Tensor self) -> Tensor
@@ -5270,6 +5294,12 @@ def aten_special_modified_bessel_k0(x: MaxTensor) -> MaxTensor:
 @map_to(aten.special_modified_bessel_k1)
 def aten_special_modified_bessel_k1(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "modified_bessel_k1")
+
+
+# special_ndtri(Tensor self) -> Tensor
+@map_to(aten.special_ndtri)
+def aten_special_ndtri(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "ndtri")
 
 
 # special_scaled_modified_bessel_k0(Tensor x) -> Tensor

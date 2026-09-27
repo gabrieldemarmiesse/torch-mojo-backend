@@ -2,8 +2,9 @@
 group (torch_mojo_backend/mojo/tmb/ops/unary.mojo): asin/atan/erfc/erfinv/
 exp2/expm1/log10/sinc/angle/sgn/signbit/nan_to_num and the torch.special
 Bessel functions (bessel_j0/j1/y0/y1, modified_bessel_i0/i1/k0/k1,
-scaled_modified_bessel_k0/k1, spherical_bessel_j0) and i0e/i1/i1e so far,
-whose kernels port the CUDA routines stock torch runs.
+scaled_modified_bessel_k0/k1, spherical_bessel_j0), i0e/i1/i1e, airy_ai,
+entr, erfcx, log_ndtr and ndtri so far, whose kernels port the CUDA
+routines stock torch runs.
 
 Public torch API only, compared against CPU torch.
 """
@@ -50,17 +51,22 @@ _CASES: list[tuple[str, Callable[[torch.Tensor], torch.Tensor], float, float]] =
     ("expm1", torch.expm1, -20.0, 90.0),
     ("log10", torch.log10, 0.0, 1e6),
     ("sinc", torch.sinc, -20.0, 20.0),
+    ("special_airy_ai", S.airy_ai, -20.0, 20.0),
     ("special_bessel_j0", S.bessel_j0, -30.0, 30.0),
     ("special_bessel_j1", S.bessel_j1, -30.0, 30.0),
     ("special_bessel_y0", S.bessel_y0, 0.0, 30.0),
     ("special_bessel_y1", S.bessel_y1, 0.0, 30.0),
+    ("special_entr", S.entr, -1.0, 20.0),
+    ("special_erfcx", S.erfcx, -10.0, 60.0),
     ("special_i0e", S.i0e, -30.0, 30.0),
     ("special_i1", S.i1, -30.0, 30.0),
     ("special_i1e", S.i1e, -30.0, 30.0),
+    ("special_log_ndtr", S.log_ndtr, -30.0, 10.0),
     ("special_modified_bessel_i0", S.modified_bessel_i0, -30.0, 30.0),
     ("special_modified_bessel_i1", S.modified_bessel_i1, -30.0, 30.0),
     ("special_modified_bessel_k0", S.modified_bessel_k0, 0.0, 30.0),
     ("special_modified_bessel_k1", S.modified_bessel_k1, 0.0, 30.0),
+    ("special_ndtri", S.ndtri, 0.0, 1.0),
     ("special_scaled_modified_bessel_k0", S.scaled_modified_bessel_k0, 0.0, 30.0),
     ("special_scaled_modified_bessel_k1", S.scaled_modified_bessel_k1, 0.0, 30.0),
     ("special_spherical_bessel_j0", S.spherical_bessel_j0, -30.0, 30.0),

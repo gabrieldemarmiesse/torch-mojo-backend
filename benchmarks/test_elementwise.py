@@ -73,6 +73,7 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "sin": torch.sin,
     "sinc": torch.sinc,
     "sinh": torch.sinh,
+    "special_entr": torch.special.entr,
     "special_i0e": torch.special.i0e,
     "special_i1": torch.special.i1,
     "special_i1e": torch.special.i1e,
@@ -107,14 +108,18 @@ def _check_matches_stock(
 # Special functions stock torch implements for float32/float64 only
 # (AT_DISPATCH_FLOATING_TYPES): benchmarked in float32 alone.
 FLOAT32_ONLY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
+    "special_airy_ai": torch.special.airy_ai,
     "special_bessel_j0": torch.special.bessel_j0,
     "special_bessel_j1": torch.special.bessel_j1,
     "special_bessel_y0": torch.special.bessel_y0,
     "special_bessel_y1": torch.special.bessel_y1,
+    "special_erfcx": torch.special.erfcx,
+    "special_log_ndtr": torch.special.log_ndtr,
     "special_modified_bessel_i0": torch.special.modified_bessel_i0,
     "special_modified_bessel_i1": torch.special.modified_bessel_i1,
     "special_modified_bessel_k0": torch.special.modified_bessel_k0,
     "special_modified_bessel_k1": torch.special.modified_bessel_k1,
+    "special_ndtri": torch.special.ndtri,
     "special_scaled_modified_bessel_k0": torch.special.scaled_modified_bessel_k0,
     "special_scaled_modified_bessel_k1": torch.special.scaled_modified_bessel_k1,
     "special_spherical_bessel_j0": torch.special.spherical_bessel_j0,
