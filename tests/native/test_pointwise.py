@@ -1062,6 +1062,12 @@ _ACT = [
     ("hardswish", lambda x: F.hardswish(x), "aten::hardswish"),
     ("mish", lambda x: F.mish(x), "aten::mish"),
     ("threshold", lambda x: F.threshold(x, _in(x, 0.3), -2.0), "aten::threshold"),
+    ("logsigmoid", lambda x: F.logsigmoid(x), "aten::log_sigmoid_forward"),
+    (
+        "rrelu_eval",
+        lambda x: F.rrelu(x, 0.1, 0.3, training=False),
+        "aten::rrelu_with_noise",
+    ),
 ]
 
 
@@ -1144,6 +1150,7 @@ def test_activation_in_place_and_out(mojo_gpu):
         lambda t: F.hardswish(t, inplace=True),
         lambda t: F.threshold(t, 0.5, 1.0, inplace=True),
         lambda t: F.mish(t, inplace=True),
+        lambda t: F.rrelu(t, inplace=True),
     ):
         x, xc = x_cpu.clone().to(mojo_gpu), x_cpu.clone()
         fn(x)
@@ -1242,6 +1249,105 @@ def test_activation_float64(mojo_gpu, name, fn, op):
         r = (x + 3).clamp(0, 6) * one_sixth
         want = r if name == "hardsigmoid" else x * (x + 3).clamp(0, 6) * one_sixth
     _close(actual, want, **_F64_TOL)
+
+
+def test_rrelu_training_float64(mojo_gpu):
+    skip_if_metal(mojo_gpu, "Metal has no float64")
+    x_cpu = torch.randn(1001, dtype=torch.float64) * 3
+    x = x_cpu.to(mojo_gpu)
+    noise = torch.empty_like(x)
+    y = torch.ops.aten.rrelu_with_noise(x, noise, 0.1, 0.4, True)
+    n = noise.cpu()
+    neg = x_cpu <= 0
+    assert (n[~neg] == 1).all()
+    assert ((n[neg] >= 0.1) & (n[neg] <= 0.4)).all()
+    _close(y, x_cpu * n, **_F64_TOL)
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+def test_rrelu_training(mojo_gpu, dtype):
+    """Training draws one slope per negative element into `noise`; the
+    output is x * noise, the backward grad * noise, and the draws follow the
+    device generator (same seed, same slopes)."""
+    lower, upper = 0.1, 0.4
+    x_cpu = (torch.randn(4097) * 3).to(dtype)
+    x_cpu[:3] = torch.tensor([0.0, -0.0, float("nan")])
+    torch.manual_seed(11)
+    x = x_cpu.to(mojo_gpu).requires_grad_()
+    noise = torch.empty_like(x).detach()
+    with ran("aten::rrelu_with_noise"):
+        y = torch.ops.aten.rrelu_with_noise(x, noise, lower, upper, True)
+    n = noise.cpu().float()
+    neg = x_cpu.float() <= 0
+    assert (n[~neg] == 1).all()
+    assert ((n[neg] >= lower - 1e-2) & (n[neg] <= upper + 1e-2)).all()
+    assert n[neg].std() > 0.05  # really random
+    _close(y.detach(), x_cpu * n.to(dtype), **_tol(dtype, 2))
+    y.backward(torch.ones_like(y))
+    _close(x.grad, n.to(dtype), **_tol(dtype, 2))
+    torch.manual_seed(11)
+    noise2 = torch.empty_like(noise)
+    torch.ops.aten.rrelu_with_noise(x.detach(), noise2, lower, upper, True)
+    _close(noise2, n.to(dtype), rtol=0.0, atol=0.0)
+    z = x.detach().clone()
+    F.rrelu(z, lower, upper, training=True, inplace=True)
+    assert z.dtype == dtype
+    # In place with an explicit noise: self becomes x * noise, noise the slopes.
+    z = x.detach().clone()
+    noise3 = torch.empty_like(noise)
+    with ran("aten::rrelu_with_noise_"):
+        torch.ops.aten.rrelu_with_noise_(z, noise3, lower, upper, True)
+    n3 = noise3.cpu().float()
+    assert (n3[~neg] == 1).all()
+    assert ((n3[neg] >= lower - 1e-2) & (n3[neg] <= upper + 1e-2)).all()
+    _close(z, x_cpu * n3.to(dtype), **_tol(dtype, 2))
+
+
+def test_rrelu_noise_aliasing_self(mojo_gpu):
+    """rrelu_with_noise(x, x, ...): each element is read before its noise is
+    written, as in the CUDA kernel (lower == upper pins the slope)."""
+    x = torch.tensor([-2.0, 3.0, -0.5], device=mojo_gpu)
+    y = torch.ops.aten.rrelu_with_noise(x, x, 0.25, 0.25, True)
+    _close(y, torch.tensor([-0.5, 3.0, -0.125]), rtol=0.0, atol=0.0)
+    _close(x, torch.tensor([0.25, 1.0, 0.25]), rtol=0.0, atol=0.0)
+
+
+def test_activation_c_out_overloads(mojo_gpu):
+    torch.manual_seed(4)
+    g_cpu, x_cpu = torch.randn(3, 5), torch.randn(3, 5) * 3
+    g, x = g_cpu.to(mojo_gpu), x_cpu.to(mojo_gpu)
+    aten = torch.ops.aten
+    tol = _tol(torch.float32, 4)
+    out = torch.empty(0, device=mojo_gpu)
+    buf = torch.empty(0, device=mojo_gpu)
+    with ran("aten::log_sigmoid_forward.output"):
+        aten.log_sigmoid_forward.output(x, output=out, buffer=buf)
+    _close(out, F.logsigmoid(x_cpu), **tol)
+    gi = torch.zeros(5, 3, device=mojo_gpu).t()  # strided destination
+    with ran("aten::log_sigmoid_backward.grad_input"):
+        aten.log_sigmoid_backward.grad_input(g, x, buf, grad_input=gi)
+    want = aten.log_sigmoid_backward(g_cpu, x_cpu, aten.log_sigmoid_forward(x_cpu)[1])
+    _close(gi, want, **tol)
+    gi = torch.empty(0, device=mojo_gpu)
+    with ran("aten::silu_backward.grad_input"):
+        aten.silu_backward.grad_input(g, x, grad_input=gi)
+    _close(gi, aten.silu_backward(g_cpu, x_cpu), **tol)
+    gi = torch.empty(0, device=mojo_gpu)
+    with ran("aten::gelu_backward.grad_input"):
+        aten.gelu_backward.grad_input(g, x, grad_input=gi)
+    _close(gi, aten.gelu_backward(g_cpu, x_cpu), **tol)
+    out = torch.empty(0, device=mojo_gpu)
+    noise = torch.empty_like(x)
+    with ran("aten::rrelu_with_noise.out"):
+        aten.rrelu_with_noise.out(x, noise, 0.2, 0.2, True, out=out)
+    _close(out, torch.where(x_cpu <= 0, x_cpu * 0.2, x_cpu), **tol)
+    # log_sigmoid: out must have self's dtype (no cast).
+    with pytest.raises(RuntimeError):
+        aten.log_sigmoid_forward.output(
+            x,
+            output=torch.empty(3, 5, dtype=torch.float16, device=mojo_gpu),
+            buffer=buf,
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.int64, torch.int32])

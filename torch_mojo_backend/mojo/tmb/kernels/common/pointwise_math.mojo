@@ -1950,8 +1950,14 @@ def _rrelu[
     and assigns it to scalar_t; x <= 0 ? x * r : x in scalar_t, noise r or 1.
     Metal has no double: the slope is one float32 fma there."""
     var r: SIMD[dtype, n]
+    # The draw comes from `uniform_`, which reverses curand's (0, 1] into
+    # [0, 1) by folding a 1 onto 0; RreluWithNoise.cu takes curand's value
+    # as is. A 0 can only be such a fold (curand never returns 0; a float16
+    # draw below 2^-25 rounding to 0 is the one, ~3e-8 likely, exception),
+    # so it is read back as the 1 CUDA sees: the slope is `upper`, not `lower`.
+    var u = b.eq(0).select(SIMD[dtype, n](1), b)
     comptime if is_apple_gpu():
-        var bf = b.cast[DType.float32]()
+        var bf = u.cast[DType.float32]()
         r = bf.fma(
             SIMD[DType.float32, n](p[1].cast[DType.float32]()),
             SIMD[DType.float32, n](p[0].cast[DType.float32]()),
@@ -1959,7 +1965,7 @@ def _rrelu[
     else:
         var lower = p[0].cast[DType.float64]() + p[2].cast[DType.float64]()
         var span = p[1].cast[DType.float64]() + p[3].cast[DType.float64]()
-        var rd = b.cast[DType.float64]().fma(
+        var rd = u.cast[DType.float64]().fma(
             SIMD[DType.float64, n](span), SIMD[DType.float64, n](lower)
         )
         # A double assigned to c10::Half / c10::BFloat16 goes through float.

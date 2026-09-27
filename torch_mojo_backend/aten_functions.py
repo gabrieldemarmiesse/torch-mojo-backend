@@ -4860,6 +4860,39 @@ def aten_relu_(tensor: MaxTensor) -> MaxTensor:
 # round(Tensor self) -> Tensor
 
 
+# rrelu_with_noise(Tensor self, Tensor(b!) noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor
+@map_to(aten.rrelu_with_noise)
+def aten_rrelu_with_noise(
+    input: MaxTensor,
+    noise: MaxTensor,
+    lower: float = 0.125,
+    upper: float = 1.0 / 3.0,
+    training: bool = False,
+    generator: torch.Generator | None = None,
+) -> MaxTensor:
+    """Eval mode only: leaky_relu with the mean slope."""
+    if training:
+        raise NotImplementedError("rrelu_with_noise in training mode")
+    return aten_leaky_relu(input, (lower + upper) / 2)
+
+
+# rrelu_with_noise_functional(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> (Tensor, Tensor noise_out)
+@map_to(aten.rrelu_with_noise_functional)
+def aten_rrelu_with_noise_functional(
+    input: MaxTensor,
+    noise: MaxTensor,
+    lower: float = 0.125,
+    upper: float = 1.0 / 3.0,
+    training: bool = False,
+    generator: torch.Generator | None = None,
+) -> tuple[MaxTensor, MaxTensor]:
+    """The functionalized rrelu_with_noise: eval mode leaves `noise` as is."""
+    return (
+        aten_rrelu_with_noise(input, noise, lower, upper, training, generator),
+        noise,
+    )
+
+
 # rsqrt(Tensor self) -> Tensor
 @map_to(aten.rsqrt)
 def aten_rsqrt(x: MaxTensor) -> MaxTensor:

@@ -2062,7 +2062,8 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
     exactly as `uniform_` does (same Philox offsets, same draw per index:
     ATen's rrelu kernel shares distribution_nullary_kernel's launch policy),
     then slope = draw * (upper - lower) + lower for x <= 0, written into
-    `noise` (1 elsewhere)."""
+    `noise` (1 elsewhere). uniform_'s fold of a 1 draw onto 0 is undone in
+    the kernel (`_rrelu`), since RreluWithNoise.cu keeps curand's 1."""
     _rrelu_check(args)
     var lower = v_f64(args[unsafe_offset=2])
     var upper = v_f64(args[unsafe_offset=3])
@@ -2099,6 +2100,29 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
             lower - lower.cast[DType.float32]().cast[DType.float64](),
             span - span.cast[DType.float32]().cast[DType.float64](),
         )
+    var dest = Optional[T]()
+    if in_place:
+        _b_inplace_destination(self)
+        dest = self.copy()
+    elif out_index >= 0:
+        dest = _pw_out_of(
+            args[unsafe_offset=out_index], a, _none_side(), _none_side()
+        )
+    # The output first, then the noise: `noise` may be `self` itself
+    # (rrelu_with_noise(x, x, ...)), and the CUDA kernel reads each input
+    # element before it writes that element's noise. In place, the output
+    # keeps every element's sign, so the noise predicate reads the same.
+    var res = _pw_run(
+        "rrelu_train",
+        2,
+        a,
+        b,
+        _none_side(),
+        self.stype,
+        self.stype,
+        params,
+        dest,
+    )
     var noise_res = _pw_run(
         "rrelu_noise",
         2,
@@ -2115,25 +2139,6 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
         var held = own(noise_res.t.copy())
         copy_strided_into(noise, held.t)
         _ = held^
-    var dest = Optional[T]()
-    if in_place:
-        _b_inplace_destination(self)
-        dest = self.copy()
-    elif out_index >= 0:
-        dest = _pw_out_of(
-            args[unsafe_offset=out_index], a, _none_side(), _none_side()
-        )
-    var res = _pw_run(
-        "rrelu_train",
-        2,
-        a,
-        b,
-        _none_side(),
-        self.stype,
-        self.stype,
-        params,
-        dest,
-    )
     _ = draw^
     _pw_finish(rets, dest, res^)
 
@@ -2951,6 +2956,7 @@ def register_pointwise(site: Site) raises:
     impl[op_rad2deg, "rad2deg"](site)
     impl[op_rad2deg_out, "rad2deg.out"](site)
     impl[op_rad2deg_, "rad2deg_"](site)
+    impl[op_gelu_backward_grad_input, "gelu_backward.grad_input"](site)
     impl[op_hardshrink, "hardshrink"](site)
     impl[op_hardshrink_out, "hardshrink.out"](site)
     impl[op_shrink_backward, "hardshrink_backward"](site)
@@ -2989,6 +2995,12 @@ def register_pointwise(site: Site) raises:
     impl[op_lerp_scalar__any, "lerp_.Scalar"](site)
     impl[op_lerp_tensor, "lerp.Tensor"](site)
     impl[op_lerp_tensor_out, "lerp.Tensor_out"](site)
+    impl[op_log_sigmoid_backward, "log_sigmoid_backward"](site)
+    impl[op_log_sigmoid_backward_grad_input, "log_sigmoid_backward.grad_input"](
+        site
+    )
+    impl[op_log_sigmoid_forward, "log_sigmoid_forward"](site)
+    impl[op_log_sigmoid_forward_output, "log_sigmoid_forward.output"](site)
     impl[op_logaddexp, "logaddexp"](site)
     impl[op_logaddexp_out, "logaddexp.out"](site)
     impl[op_logaddexp2, "logaddexp2"](site)
@@ -3008,6 +3020,11 @@ def register_pointwise(site: Site) raises:
     impl[op_pow_scalar_out_any, "pow.Tensor_Scalar_out"](site)
     impl[op_pow_tensor_any, "pow.Tensor_Tensor"](site)
     impl[op_pow_tensor_out_any, "pow.Tensor_Tensor_out"](site)
+    impl[op_rrelu_with_noise, "rrelu_with_noise"](site)
+    impl[op_rrelu_with_noise_out, "rrelu_with_noise.out"](site)
+    impl[op_rrelu_with_noise_, "rrelu_with_noise_"](site)
+    impl[op_silu_backward, "silu_backward"](site)
+    impl[op_silu_backward_grad_input, "silu_backward.grad_input"](site)
     impl[op_softplus, "softplus"](site)
     impl[op_softplus_out, "softplus.out"](site)
     impl[op_softplus_backward, "softplus_backward"](site)

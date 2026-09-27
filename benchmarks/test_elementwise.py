@@ -125,6 +125,7 @@ ACTIVATION_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "hardswish": F.hardswish,
     "hardtanh": lambda x: F.hardtanh(x, -0.25, 0.25),
     "leaky_relu": F.leaky_relu,
+    "log_sigmoid_forward": F.logsigmoid,
     "mish": F.mish,
     "softplus": F.softplus,
     "softshrink": lambda x: F.softshrink(x, 0.2),
@@ -148,11 +149,20 @@ SKIPPED |= {
         "hardtanh_",
         "leaky_relu.out",
         "leaky_relu_",
+        "log_sigmoid_forward.output",
         "mish.out",
+        "rrelu_with_noise.out",
+        "rrelu_with_noise_",
         "softplus.out",
         "softshrink.out",
         "threshold.out",
         "threshold_",
+    )
+} | {
+    "aten::rrelu_with_noise": (
+        "eval mode is the leaky_relu kernel test_activation measures; "
+        "training is uniform_ (test_inplace's test_uniform_) plus two of the "
+        "same pointwise launches"
     )
 }
 
