@@ -96,7 +96,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "addmv": ("float32", "bfloat16", "float16", "int64"),
     "addr": ("bool",),
     "all": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "allclose": ("float32", "bfloat16", "float16"),
     "amax": ("float32", "bfloat16", "float16", "int64", "bool"),
     "amin": ("float32", "bfloat16", "float16", "int64", "bool"),
     "aminmax": ("float32", "bfloat16", "float16", "int64", "bool"),
@@ -225,8 +224,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "log": ("int64", "bool"),
     "log1p": ("int64", "bool"),
     "log_softmax_with_dtype": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "logaddexp": ("float32", "bfloat16", "float16"),
-    "logaddexp2": ("float32", "bfloat16", "float16"),
     "logcumsumexp": ("float32", "bfloat16", "float16"),
     "logdet": ("float32",),
     "logit": ("float32", "bfloat16", "float16", "int64", "bool"),
@@ -241,7 +238,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "masked_cumprod": ("float32", "bfloat16", "float16", "int64"),
     "masked_cumsum": ("float32", "bfloat16", "float16", "int64"),
     "masked_fill": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "masked_logaddexp": ("float32", "bfloat16", "float16"),
     "masked_logsumexp": ("float32", "bfloat16", "float16", "int64"),
     "masked_mean": ("float32", "bfloat16", "float16"),
     "masked_norm": ("float32", "bfloat16", "float16"),
@@ -326,7 +322,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "nn_functional_interpolate_nearest": ("float32", "bfloat16", "float16"),
     "nn_functional_interpolate_nearest-exact": ("float32", "bfloat16", "float16"),
     "nn_functional_interpolate_trilinear": ("float32", "bfloat16", "float16"),
-    "nn_functional_kl_div": ("float32", "bfloat16", "float16"),
     "nn_functional_l1_loss": ("float32", "bfloat16", "float16"),
     "nn_functional_layer_norm": ("float32", "bfloat16", "float16"),
     "nn_functional_leaky_relu": ("float32", "bfloat16", "float16"),
@@ -435,7 +430,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "special_scaled_modified_bessel_k0": ("float32", "int64", "bool"),
     "special_scaled_modified_bessel_k1": ("float32", "int64", "bool"),
     "special_spherical_bessel_j0": ("float32", "int64", "bool"),
-    "special_xlog1py": ("float32", "bfloat16", "float16", "int64", "bool"),
     "sqrt": ("int64", "bool"),
     "square": ("bool",),
     "std": ("float32", "bfloat16", "float16"),
@@ -462,7 +456,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "var_mean_unbiased": ("float32", "bfloat16", "float16"),
     "vdot": ("float32", "bfloat16", "float16", "int64"),
     "view_as_complex": ("float32", "float16"),
-    "xlogy": ("float32", "bfloat16", "float16", "int64", "bool"),
 }
 # --- END GENERATED test_matches_cpu ---
 

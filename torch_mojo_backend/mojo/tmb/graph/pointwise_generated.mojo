@@ -116,6 +116,30 @@ struct PointwiseLcm(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_logaddexp")
+struct PointwiseLogaddexp(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["logaddexp", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_logaddexp2")
+struct PointwiseLogaddexp2(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["logaddexp2", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_lshift")
 struct PointwiseLshift(ElementwiseBinaryOp):
     @staticmethod
@@ -148,5 +172,29 @@ struct PointwiseRshift(ElementwiseBinaryOp):
         width: SIMDLength,
     ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
         return pointwise["rshift", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_xlog1py")
+struct PointwiseXlog1py(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["xlog1py", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_xlogy")
+struct PointwiseXlogy(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["xlogy", dtype, dtype, width](
             lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
         )

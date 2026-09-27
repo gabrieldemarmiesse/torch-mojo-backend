@@ -2803,6 +2803,10 @@ def register_pointwise(site: Site) raises:
     impl[op_lerp_scalar__any, "lerp_.Scalar"](site)
     impl[op_lerp_tensor, "lerp.Tensor"](site)
     impl[op_lerp_tensor_out, "lerp.Tensor_out"](site)
+    impl[op_logaddexp, "logaddexp"](site)
+    impl[op_logaddexp_out, "logaddexp.out"](site)
+    impl[op_logaddexp2, "logaddexp2"](site)
+    impl[op_logaddexp2_out, "logaddexp2.out"](site)
     impl[op_nextafter, "nextafter"](site)
     impl[op_nextafter_out, "nextafter.out"](site)
     impl[op_rsub_any, "rsub.Tensor"](site)
@@ -2815,6 +2819,9 @@ def register_pointwise(site: Site) raises:
     impl[op_pow_scalar_out_any, "pow.Tensor_Scalar_out"](site)
     impl[op_pow_tensor_any, "pow.Tensor_Tensor"](site)
     impl[op_pow_tensor_out_any, "pow.Tensor_Tensor_out"](site)
+    _register_special(site)
+    impl[op_xlogy, "xlogy.Tensor"](site)
+    impl[op_xlogy_out, "xlogy.OutTensor"](site)
 
 
 comptime op_special_chebyshev_polynomial_t = op_poly[
@@ -2881,3 +2888,8 @@ comptime op_special_shifted_chebyshev_polynomial_w = op_poly[
 comptime op_special_shifted_chebyshev_polynomial_w_out = op_poly[
     "shifted_chebyshev_polynomial_w", 2
 ]
+
+
+def _register_special(site: Site) raises:
+    impl[op_special_xlog1py, "special_xlog1py"](site)
+    impl[op_special_xlog1py_out, "special_xlog1py.out"](site)

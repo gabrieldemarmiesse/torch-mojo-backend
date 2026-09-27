@@ -431,7 +431,11 @@ _BINARY = [
     ("fmin", torch.fmin, ("aten::fmin",), 0),
     ("fmod", torch.fmod, ("aten::fmod.Tensor",), 0),
     ("nextafter", torch.nextafter, ("aten::nextafter",), 0),
+    ("logaddexp", torch.logaddexp, ("aten::logaddexp",), 2),
+    ("logaddexp2", torch.logaddexp2, ("aten::logaddexp2",), 2),
     ("heaviside", torch.heaviside, ("aten::heaviside",), 0),
+    ("xlogy", torch.xlogy, ("aten::xlogy.Tensor",), 2),
+    ("xlog1py", torch.special.xlog1py, ("aten::special_xlog1py",), 2),
 ]
 
 
@@ -441,7 +445,7 @@ def test_binary_math_edges(mojo_gpu, name, fn, ops, ulps, dtype):
     if name == "nextafter" and not _cpu_has_nextafter(dtype):
         pytest.skip(f"CPU torch has no {dtype} nextafter to compare with")
     x, y = _pairs(dtype)
-    if name == "atan2" and _flushes_subnormals(mojo_gpu):
+    if name in ("atan2", "xlogy", "xlog1py") and _flushes_subnormals(mojo_gpu):
         # These are Metal kernels in torch MPS too, which flush the same way.
         keep = ~(_subnormal(x) | _subnormal(y))
         x, y = x[keep], y[keep]
@@ -502,7 +506,17 @@ def test_binary_math_broadcast_scalar_strided_out(mojo_gpu, dtype):
     a_cpu = torch.randn(6, 5).to(dtype)
     b_cpu = torch.randn(5).to(dtype)
     a, b = a_cpu.to(mojo_gpu), b_cpu.to(mojo_gpu)
-    for fn in (torch.atan2, torch.hypot, torch.copysign, torch.fmod, torch.fmax):
+    for fn in (
+        torch.atan2,
+        torch.hypot,
+        torch.copysign,
+        torch.fmod,
+        torch.fmax,
+        torch.logaddexp,
+        torch.logaddexp2,
+        torch.xlogy,
+        torch.special.xlog1py,
+    ):
         _close(fn(a, b), fn(a_cpu, b_cpu), **_tol(dtype, 2))
         _close(fn(a.t(), a.t()), fn(a_cpu.t(), a_cpu.t()), **_tol(dtype, 2))
         col = a_cpu[:, :1]
@@ -512,15 +526,29 @@ def test_binary_math_broadcast_scalar_strided_out(mojo_gpu, dtype):
         out = torch.empty(5, 6, dtype=dtype, device=mojo_gpu).t()
         fn(a, b, out=out)
         _close(out, fn(a_cpu, b_cpu), **_tol(dtype, 2))
-    # Python scalars: copysign.Scalar, fmod.Scalar
+    # Python scalars: copysign.Scalar, fmod.Scalar, xlogy's wrapped number
     _close(torch.copysign(a, -1.0), torch.copysign(a_cpu, -1.0))
     _close(torch.fmod(a, 0.7), torch.fmod(a_cpu, 0.7), **_tol(dtype))
+    _close(torch.xlogy(a, 2.0), torch.xlogy(a_cpu, 2.0), **_tol(dtype, 2))
+    _close(torch.xlogy(2.0, b.abs()), torch.xlogy(2.0, b_cpu.abs()), **_tol(dtype, 2))
+
+
+@pytest.mark.parametrize(
+    "fn", [torch.logaddexp, torch.logaddexp2, torch.xlogy, torch.special.xlog1py]
+)
+def test_log_family_out_rejections(mojo_gpu, fn):
+    a = torch.rand(3, device=mojo_gpu)
+    b = torch.rand(3, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        fn(a, b, out=torch.empty(1, device=mojo_gpu).expand(3))
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        fn(a, b, out=torch.empty(3, dtype=torch.int64, device=mojo_gpu))
 
 
 def test_binary_math_in_place(mojo_gpu):
     a_cpu = torch.randn(4, 7)
     b_cpu = torch.randn(4, 7)
-    for name in ("atan2_", "hypot_", "copysign_", "fmod_", "nextafter_"):
+    for name in ("atan2_", "hypot_", "copysign_", "fmod_", "xlogy_", "nextafter_"):
         x, x_cpu = a_cpu.clone().to(mojo_gpu), a_cpu.clone()
         getattr(x, name)(b_cpu.to(mojo_gpu))
         getattr(x_cpu, name)(b_cpu)
@@ -533,7 +561,7 @@ def test_binary_math_in_place(mojo_gpu):
 def test_binary_math_int_promotion(mojo_gpu):
     i = torch.arange(-6, 6)
     j = torch.arange(1, 13)
-    for fn in (torch.atan2, torch.copysign):
+    for fn in (torch.atan2, torch.copysign, torch.xlogy):
         expected = fn(i, j)
         actual = fn(i.to(mojo_gpu), j.to(mojo_gpu))
         assert actual.dtype == expected.dtype == torch.float32

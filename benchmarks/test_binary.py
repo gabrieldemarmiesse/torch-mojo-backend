@@ -75,7 +75,11 @@ MATH_OPS = {
     "fmod.Tensor": torch.fmod,
     "heaviside": torch.heaviside,
     "hypot": torch.hypot,
+    "logaddexp": torch.logaddexp,
+    "logaddexp2": torch.logaddexp2,
     "nextafter": torch.nextafter,
+    "special_xlog1py": torch.special.xlog1py,
+    "xlogy.Tensor": torch.xlogy,
 }
 INT_MATH_OPS = {
     "bitwise_left_shift.Tensor": torch.bitwise_left_shift,
@@ -208,6 +212,8 @@ SKIPPED: dict[str, str] = {
     "aten::hypot.out": _OUT,
     "aten::lcm.out": _OUT,
     "aten::lerp.Tensor_out": _OUT,
+    "aten::logaddexp.out": _OUT,
+    "aten::logaddexp2.out": _OUT,
     "aten::logical_and.out": _OUT,
     "aten::logical_or.out": _OUT,
     "aten::logical_xor.out": _OUT,
@@ -221,6 +227,8 @@ SKIPPED: dict[str, str] = {
     "aten::remainder.Tensor_out": _OUT,
     "aten::rsub.Scalar_out": _OUT,
     "aten::rsub.Tensor_out": _OUT,
+    "aten::special_xlog1py.out": _OUT,
+    "aten::xlogy.OutTensor": _OUT,
 }
 
 
