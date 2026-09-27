@@ -161,8 +161,21 @@ _SCALAR_OPERAND = (
     "the Tensor overload's kernel with the scalar passed by value in a slot "
     "(no device operand read); nothing new to time"
 )
+_SHIFT_ALIAS = (
+    "the lshift/rshift kernels test_int_math measures through "
+    "bitwise_{left,right}_shift.Tensor (the Python operator spelling)"
+)
+_SHIFT_INPLACE = "in-place form of the same lshift/rshift launch, written into self"
 
 SKIPPED: dict[str, str] = {
+    "aten::__ilshift__.Scalar": _SHIFT_INPLACE,
+    "aten::__ilshift__.Tensor": _SHIFT_INPLACE,
+    "aten::__irshift__.Scalar": _SHIFT_INPLACE,
+    "aten::__irshift__.Tensor": _SHIFT_INPLACE,
+    "aten::__lshift__.Scalar": _SHIFT_ALIAS,
+    "aten::__lshift__.Tensor": _SHIFT_ALIAS,
+    "aten::__rshift__.Scalar": _SHIFT_ALIAS,
+    "aten::__rshift__.Tensor": _SHIFT_ALIAS,
     "aten::atan2.out": _OUT,
     "aten::bitwise_and.Scalar_out": _OUT,
     "aten::bitwise_and.Tensor_out": _OUT,
