@@ -1401,14 +1401,17 @@ def test_inf_predicates_out(mojo_gpu: str, name: str):
 
 
 # --------------------------------------------------------------------------
-# asin / atan / log10 / exp2 / expm1: the .out overloads and IEEE edges
+# asin / atan / log10 / exp2 / expm1 / erfc / erfinv / sinc: the .out
+# overloads and IEEE edges
 # --------------------------------------------------------------------------
 
 _ELEMENTARY_EDGES = [-2.0, -0.75, -1e-4, 0.0, 0.3, 0.9, 2.0, 89.0, 128.0]
 _ELEMENTARY_EDGES += [float("inf"), -float("inf"), float("nan")]
 
 
-@pytest.mark.parametrize("name", ["asin", "atan", "log10", "exp2", "expm1"])
+@pytest.mark.parametrize(
+    "name", ["asin", "atan", "log10", "exp2", "expm1", "erfc", "erfinv", "sinc"]
+)
 def test_elementary_unary_out(mojo_gpu: str, name: str):
     fn = getattr(torch, name)
     x_cpu = torch.tensor(_ELEMENTARY_EDGES)

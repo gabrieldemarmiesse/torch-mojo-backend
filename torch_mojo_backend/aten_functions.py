@@ -2908,6 +2908,18 @@ def aten_erf(input: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(input, "erf")
 
 
+# erfc(Tensor self) -> Tensor
+@map_to(aten.erfc)
+def aten_erfc(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "erfc")
+
+
+# erfinv(Tensor self) -> Tensor
+@map_to(aten.erfinv)
+def aten_erfinv(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "erfinv")
+
+
 # exp(Tensor self) -> Tensor
 @map_to(aten.exp)
 def aten_exp(input: MaxTensor) -> MaxTensor:
@@ -4680,6 +4692,12 @@ def aten_silu(input: MaxTensor) -> MaxTensor:
 @map_to(aten.sin)
 def aten_sin(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "sin")
+
+
+# sinc(Tensor self) -> Tensor
+@map_to(aten.sinc)
+def aten_sinc(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "sinc")
 
 
 # tan(Tensor self) -> Tensor
