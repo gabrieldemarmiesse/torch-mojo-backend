@@ -1648,14 +1648,18 @@ def op_hardtanh_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_hardtanh_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_act("hardtanh_backward", args, rets, 0, 1, -1, _hardtanh_backward_p(args))
+    _pw_act(
+        "hardtanh_backward", args, rets, 0, 1, -1, _hardtanh_backward_p(args)
+    )
 
 
 # aten::hardtanh_backward.grad_input(Tensor grad_output, Tensor self, Scalar min_val, Scalar max_val, *, Tensor(a!) grad_input) -> Tensor(a!)
 def op_hardtanh_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_act("hardtanh_backward", args, rets, 0, 1, 4, _hardtanh_backward_p(args))
+    _pw_act(
+        "hardtanh_backward", args, rets, 0, 1, 4, _hardtanh_backward_p(args)
+    )
 
 
 # aten::leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
