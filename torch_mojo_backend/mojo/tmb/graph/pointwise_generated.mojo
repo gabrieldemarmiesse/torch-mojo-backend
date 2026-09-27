@@ -32,6 +32,30 @@ struct PointwiseCopysign(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_fmax")
+struct PointwiseFmax(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["fmax", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_fmin")
+struct PointwiseFmin(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["fmin", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_fmod")
 struct PointwiseFmod(ElementwiseBinaryOp):
     @staticmethod
@@ -44,6 +68,18 @@ struct PointwiseFmod(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_heaviside")
+struct PointwiseHeaviside(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["heaviside", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_hypot")
 struct PointwiseHypot(ElementwiseBinaryOp):
     @staticmethod
@@ -52,5 +88,17 @@ struct PointwiseHypot(ElementwiseBinaryOp):
         width: SIMDLength,
     ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
         return pointwise["hypot", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_nextafter")
+struct PointwiseNextafter(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["nextafter", dtype, dtype, width](
             lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
         )

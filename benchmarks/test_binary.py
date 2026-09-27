@@ -70,8 +70,12 @@ BITWISE_OPS = {
 MATH_OPS = {
     "atan2": torch.atan2,
     "copysign.Tensor": torch.copysign,
+    "fmax": torch.fmax,
+    "fmin": torch.fmin,
     "fmod.Tensor": torch.fmod,
+    "heaviside": torch.heaviside,
     "hypot": torch.hypot,
+    "nextafter": torch.nextafter,
 }
 LOGICAL_OPS = {
     "logical_and": torch.logical_and,
@@ -172,9 +176,12 @@ SKIPPED: dict[str, str] = {
     "aten::copysign.Scalar": _SCALAR_OPERAND,
     "aten::copysign.Scalar_out": _OUT,
     "aten::copysign.out": _OUT,
+    "aten::fmax.out": _OUT,
+    "aten::fmin.out": _OUT,
     "aten::fmod.Scalar": _SCALAR_OPERAND,
     "aten::fmod.Scalar_out": _OUT,
     "aten::fmod.Tensor_out": _OUT,
+    "aten::heaviside.out": _OUT,
     "aten::hypot.out": _OUT,
     "aten::lerp.Tensor_out": _OUT,
     "aten::logical_and.out": _OUT,
@@ -182,6 +189,7 @@ SKIPPED: dict[str, str] = {
     "aten::logical_xor.out": _OUT,
     "aten::maximum.out": _OUT,
     "aten::minimum.out": _OUT,
+    "aten::nextafter.out": _OUT,
     "aten::pow.Scalar_out": _OUT,
     "aten::pow.Tensor_Scalar_out": _OUT,
     "aten::pow.Tensor_Tensor_out": _OUT,

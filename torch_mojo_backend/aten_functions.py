@@ -246,7 +246,9 @@ def _native_matmul(
 def _pointwise_binary(
     input: MaxTensor | Scalar,
     other: MaxTensor | Scalar,
-    kind: Literal["atan2", "copysign", "fmod", "hypot"],
+    kind: Literal[
+        "atan2", "copysign", "fmax", "fmin", "fmod", "heaviside", "hypot", "nextafter"
+    ],
     *,
     promote_float: bool,
 ) -> MaxTensor:
@@ -2969,6 +2971,20 @@ def aten_floor(input: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(input, "floor")
 
 
+# fmax(Tensor self, Tensor other) -> Tensor
+@map_to(aten.fmax)
+def aten_fmax(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """C's fmax for floats (a NaN operand yields the other), maximum else."""
+    return _pointwise_binary(input, other, "fmax", promote_float=False)
+
+
+# fmin(Tensor self, Tensor other) -> Tensor
+@map_to(aten.fmin)
+def aten_fmin(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """C's fmin for floats (a NaN operand yields the other), minimum else."""
+    return _pointwise_binary(input, other, "fmin", promote_float=False)
+
+
 # fmod.Scalar(Tensor self, Scalar other) -> Tensor
 # fmod.Tensor(Tensor self, Tensor other) -> Tensor
 @map_to(aten.fmod)
@@ -4310,6 +4326,13 @@ def aten_native_layer_norm(
 
 
 # native_layer_norm_backward(Tensor grad_out, Tensor input, SymInt[] normalized_shape, Tensor mean, Tensor rstd, Tensor? weight, Tensor? bias, bool[3] output_mask) -> (Tensor, Tensor, Tensor)
+
+
+# nextafter(Tensor self, Tensor other) -> Tensor
+@map_to(aten.nextafter)
+def aten_nextafter(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """The next representable value after self toward other."""
+    return _pointwise_binary(input, other, "nextafter", promote_float=False)
 
 
 # normal_(Tensor(a!) self, float mean=0, float std=1, *, Generator? generator=None) -> Tensor(a!)

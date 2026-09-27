@@ -254,7 +254,9 @@ def elementwise(
 def pointwise_binary(
     input: MaxTensor,
     other: MaxTensor,
-    kind: Literal["atan2", "copysign", "fmod", "hypot"],
+    kind: Literal[
+        "atan2", "copysign", "fmax", "fmin", "fmod", "heaviside", "hypot", "nextafter"
+    ],
 ) -> MaxTensor:
     """The mojo device's pointwise math (`tmb/kernels/common/pointwise_math`)
     as a fusible binary custom op. The operands share a dtype and a shape:

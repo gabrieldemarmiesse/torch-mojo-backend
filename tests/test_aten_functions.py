@@ -5347,8 +5347,11 @@ def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dty
 _POINTWISE_BINARY_TWINS = [
     ("atan2", aten.atan2, torch.float32, "float"),
     ("copysign", aten.copysign, torch.float32, "float"),
+    ("fmax", aten.fmax, torch.float32, "float"),
+    ("fmin", aten.fmin, torch.int64, "int"),
     ("fmod", aten.fmod, torch.float32, "float"),
     ("hypot", aten.hypot, torch.float32, "float"),
+    ("nextafter", aten.nextafter, torch.float32, "float"),
 ]
 
 
