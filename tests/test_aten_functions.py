@@ -5407,6 +5407,8 @@ _ACTIVATION_TWINS = [
     ("elu", lambda x: aten.elu(x, 0.8, 1.2, 0.9)),
     ("hardtanh", lambda x: aten.hardtanh(x, -0.5, 0.7)),
     ("leaky_relu", lambda x: aten.leaky_relu(x, 0.1)),
+    ("hardshrink_backward", lambda x: aten.hardshrink_backward(x * 2, x, 0.4)),
+    ("softshrink_backward", lambda x: aten.softshrink_backward(x * 2, x, 0.4)),
 ]
 
 

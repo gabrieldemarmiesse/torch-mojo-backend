@@ -1,7 +1,10 @@
-"""Pointwise math on the native mojo device (tmb/ops/pointwise.mojo): pow,
-lerp (Scalar and Tensor), gelu_backward, clamp.Tensor, rsub and the binary
-math family (atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter,
-gcd, lcm, bitwise_left_shift.Tensor, bitwise_right_shift.Tensor so far).
+"""Pointwise math and parameterized activations on the native mojo device
+(tmb/ops/pointwise.mojo): pow, lerp (Scalar and Tensor), gelu_backward,
+clamp.Tensor, rsub, deg2rad/rad2deg/ldexp/frexp and the binary math family
+(atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter, gcd, lcm,
+bitwise_left_shift.Tensor, bitwise_right_shift.Tensor, logaddexp(2), xlogy,
+xlog1py), and elu, hardtanh, leaky_relu, softplus, threshold, hardshrink,
+softshrink, hardsigmoid, hardswish, mish with their backwards so far.
 
 Everything is compared with the same computation on CPU torch through the
 public API, over edge values (signed zeros, infinities, NaN, huge, tiny,
@@ -783,6 +786,11 @@ _ACT = [
     ("leaky_relu", lambda x: F.leaky_relu(x, 0.2), "aten::leaky_relu"),
     ("softplus", lambda x: F.softplus(x), "aten::softplus"),
     ("softplus_params", lambda x: F.softplus(x, 2.0, 3.0), "aten::softplus"),
+    ("hardshrink", lambda x: F.hardshrink(x, _in(x, 0.3)), "aten::hardshrink"),
+    ("softshrink", lambda x: F.softshrink(x, _in(x, 0.3)), "aten::softshrink"),
+    ("hardsigmoid", lambda x: F.hardsigmoid(x), "aten::hardsigmoid"),
+    ("hardswish", lambda x: F.hardswish(x), "aten::hardswish"),
+    ("mish", lambda x: F.mish(x), "aten::mish"),
     ("threshold", lambda x: F.threshold(x, _in(x, 0.3), -2.0), "aten::threshold"),
 ]
 
@@ -862,7 +870,10 @@ def test_activation_in_place_and_out(mojo_gpu):
         lambda t: F.elu(t, inplace=True),
         lambda t: F.hardtanh(t, inplace=True),
         lambda t: F.leaky_relu(t, 0.1, inplace=True),
+        lambda t: F.hardsigmoid(t, inplace=True),
+        lambda t: F.hardswish(t, inplace=True),
         lambda t: F.threshold(t, 0.5, 1.0, inplace=True),
+        lambda t: F.mish(t, inplace=True),
     ):
         x, xc = x_cpu.clone().to(mojo_gpu), x_cpu.clone()
         fn(x)
@@ -871,6 +882,26 @@ def test_activation_in_place_and_out(mojo_gpu):
     out = torch.empty(0, device=mojo_gpu)
     torch.ops.aten.softplus.out(x_cpu.to(mojo_gpu), 1.0, 20.0, out=out)
     _close(out, F.softplus(x_cpu), **_tol(torch.float32, 3))
+
+
+_F64_TOL = {"rtol": 1e-12, "atol": 1e-14}
+
+
+@pytest.mark.parametrize("name,fn,op", _ACT, ids=[a[0] for a in _ACT])
+def test_activation_float64(mojo_gpu, name, fn, op):
+    """float64 computes in double (opmath), with CUDA's constants: float's
+    1/6 in hardsigmoid / hardswish, as on CPU."""
+    skip_if_metal(mojo_gpu, "Metal has no float64")
+    x = _act_input(torch.float64)
+    with ran(op):
+        actual = fn(x.to(mojo_gpu))
+    want = fn(x)
+    if name in ("hardsigmoid", "hardswish"):
+        # CPU divides by 6; CUDA multiplies by float(1/6), which we follow.
+        one_sixth = torch.tensor(1.0 / 6.0, dtype=torch.float32).double()
+        r = (x + 3).clamp(0, 6) * one_sixth
+        want = r if name == "hardsigmoid" else x * (x + 3).clamp(0, 6) * one_sixth
+    _close(actual, want, **_F64_TOL)
 
 
 @pytest.mark.parametrize("dtype", [torch.int64, torch.int32])

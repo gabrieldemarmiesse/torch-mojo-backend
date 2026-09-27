@@ -305,6 +305,14 @@ def _pointwise_binary(
     )
 
 
+def _shrink_backward(grad: MaxTensor, input: MaxTensor, lambd: float) -> MaxTensor:
+    """shrink_backward (ActivationSoftshrinkKernel.cu): grad outside
+    [-lambd, lambd], 0 inside; hardshrink and softshrink share it."""
+    inside = F.logical_and(input >= -lambd, input <= lambd)
+    zero = _scalar_constant(0.0, dtype=grad.dtype, device=grad.device)
+    return _where(inside, zero, grad)
+
+
 # Ops that need to be decomposed.
 DECOMPOSITION_TABLE = core_aten_decompositions()
 original_decomposition_table_size = len(DECOMPOSITION_TABLE)
@@ -3214,6 +3222,14 @@ def aten_gt(x: MaxTensor, y: int | float | MaxTensor) -> MaxTensor:
     return operator.gt(x, y)
 
 
+# hardshrink_backward(Tensor grad_out, Tensor self, Scalar lambd) -> Tensor
+@map_to(aten.hardshrink_backward)
+def aten_hardshrink_backward(
+    grad_out: MaxTensor, input: MaxTensor, lambd: float
+) -> MaxTensor:
+    return _shrink_backward(grad_out, input, lambd)
+
+
 # hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
 @map_to(aten.hardtanh)
 def aten_hardtanh(
@@ -4859,6 +4875,14 @@ def aten_sin(x: MaxTensor) -> MaxTensor:
 @map_to(aten.sinc)
 def aten_sinc(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "sinc")
+
+
+# softshrink_backward(Tensor grad_output, Tensor self, Scalar lambd) -> Tensor
+@map_to(aten.softshrink_backward)
+def aten_softshrink_backward(
+    grad_output: MaxTensor, input: MaxTensor, lambd: float
+) -> MaxTensor:
+    return _shrink_backward(grad_output, input, lambd)
 
 
 # tan(Tensor self) -> Tensor
