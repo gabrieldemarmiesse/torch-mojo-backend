@@ -31,7 +31,7 @@ def _pointwise_float32_kinds() -> set[str]:
 
 
 def test_float32_math_ops_match_the_mojo_sources():
-    # The graph's binary polygamma (tmb/graph/elementwise.mojo) runs
+    # The graph's polygamma (tmb/graph/elementwise.mojo) runs
     # `unary_math.elementwise_polygamma`, a float32 evaluation.
     expected = (
         {f"elementwise_{k}" for k in _scalar_special_kinds()}

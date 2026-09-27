@@ -55,6 +55,7 @@ from tmb.kernels.common.mps_math import (
     mps_log_gamma,
     mps_logit,
     mps_polygamma,
+    mps_polygamma_series,
     mps_round_decimals,
     mps_sinc,
     rint_even,
@@ -80,6 +81,7 @@ from tmb.kernels.common.special_math import (
     modified_bessel_k1_f,
     ndtri_f,
     polygamma_f,
+    polygamma_series_f,
     sinc_f,
     spherical_bessel_j0_f,
     trigamma_f,
@@ -724,12 +726,17 @@ def elementwise_unary_param[
                 comptime for i in range(width):
                     r[i] = logit_f(xf[i], eps)
         elif kind == "polygamma":
-            var n = Int(rebind[Float32](p0))
+            # The order's int32 in two exact float halves, then 0 for
+            # digamma / trigamma, else the order as a float, negated when
+            # even (see `polygamma_lane`).
+            var n = Int32(Int(rebind[Float32](p0))) * Int32(65536) + Int32(
+                Int(rebind[Float32](p1))
+            )
+            var nf = rebind[Float32](p2)
             comptime for i in range(width):
-                comptime if is_apple_gpu():
-                    r[i] = mps_polygamma(xf[i], n)
-                else:
-                    r[i] = polygamma_f(xf[i], n)
+                r[i] = polygamma_lane(
+                    xf[i], n, abs(nf), nf > Float32(0.0), nf != Float32(0.0)
+                )
         else:
             comptime assert kind == "mvlgamma", "unsupported param kind"
             var p = Int(rebind[Float32](p0))
@@ -766,13 +773,33 @@ def elementwise_unary_param[
 
 
 @always_inline
+def polygamma_lane(
+    x: Float32, n: Int32, nf: Float32, odd: Bool, series: Bool
+) -> Float32:
+    """polygamma(n, x) as each backend's kernel computes it. ATen picks
+    digamma / trigamma on the int64 order; `series` says it was 2 or more.
+    CUDA's series then takes an `int` (`n`, the order truncated to 32 bits;
+    0 or 1 itself when `series` is False), Apple's the int64 order itself
+    (`nf` = its float, `odd` its parity)."""
+    comptime if is_apple_gpu():
+        if series:
+            return mps_polygamma_series(x, nf, odd)
+        return mps_polygamma(x, Int(n))
+    else:
+        if series:
+            return polygamma_series_f(x, n)
+        return polygamma_f(x, Int(n))
+
+
+@always_inline
 def elementwise_polygamma[
-    dtype: DType, width: SIMDLength
-](n: SIMD[dtype, width], x: SIMD[dtype, width]) -> SIMD[dtype, width]:
-    """The polygamma function lane by lane, the order n read from a float
-    operand (the torch.compile graph's binary form of the op)."""
+    n: Int, series: Bool, dtype: DType, width: SIMDLength
+](x: SIMD[dtype, width]) -> SIMD[dtype, width]:
+    """The polygamma function lane by lane for the torch.compile graph, the
+    order `n` (the int64 order) a custom-op parameter: exact, where a float
+    operand of the input dtype would round it."""
     var xf = x.cast[DType.float32]()
     var r = SIMD[DType.float32, width]()
     comptime for i in range(width):
-        r[i] = polygamma_f(xf[i], Int(n[i]))
+        r[i] = polygamma_lane(xf[i], Int32(n), Float32(n), n % 2 != 0, series)
     return r.cast[dtype]()

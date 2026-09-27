@@ -365,6 +365,35 @@ def test_polygamma_mvlgamma_out_casts(mojo_gpu: str, name: str):
         call(x.to(mojo_gpu), torch.empty(12, dtype=torch.int64, device=mojo_gpu))
 
 
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("n", (257, 16777217, 2**31, 2**32, 2**32 + 1))
+def test_polygamma_large_order(mojo_gpu: str, dtype: torch.dtype, n: int):
+    """The order is exact (float32 would read 16777217 as 16777216, flipping
+    inf's sign) and truncated to an int as ATen's kernels take it: 2^32 is
+    the series at n = 0 (-inf), 2^32 + 1 at n = 1 (trigamma's values). On
+    Apple GPUs `c10::metal::polygamma` takes an int order of 0 to digamma,
+    so there the reference is torch MPS."""
+    x = torch.tensor([0.125, 0.5, 3.0], dtype=dtype)
+    got = torch.polygamma(n, x.to(mojo_gpu)).cpu()
+    if is_metal(mojo_gpu):
+        expected = torch.polygamma(n, x.to("mps")).cpu()
+    else:
+        expected = torch.polygamma(n, x)
+    torch.testing.assert_close(got, expected, equal_nan=True, rtol=1e-4, atol=0.0)
+
+
+def test_mvlgamma_out_overlapping_input(mojo_gpu: str):
+    """mvlgamma.out computes into a new tensor, then copies: an `out` that
+    overlaps the input (x[1:] for x[:-1]) is allowed and reads the input
+    before any write."""
+    x = torch.linspace(1.1, 9.0, 12)
+    want = x.clone()
+    torch.mvlgamma(want[:-1], 2, out=want[1:])
+    got = x.to(mojo_gpu)
+    torch.mvlgamma(got[:-1], 2, out=got[1:])
+    torch.testing.assert_close(got.cpu(), want)
+
+
 def test_mvlgamma_rejects_bool(mojo_gpu: str):
     with pytest.raises(RuntimeError, match="may not be a boolean tensor"):
         torch.mvlgamma(torch.tensor([True, False]).to(mojo_gpu), 1)

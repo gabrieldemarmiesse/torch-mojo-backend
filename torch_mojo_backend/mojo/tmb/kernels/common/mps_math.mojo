@@ -690,10 +690,18 @@ def mps_polygamma(x: Float32, n: Int) -> Float32:
         return mps_digamma(x)
     if n == 1:
         return mps_trigamma(x)
+    return mps_polygamma_series(x, Float32(n), n % 2 != 0)
+
+
+@always_inline
+def mps_polygamma_series(x: Float32, nf: Float32, odd: Bool) -> Float32:
+    """`c10::metal::polygamma` for an order of 2 or more, which keeps the
+    int64 order (measured on an Apple M4: 2^32 gives -inf, not digamma):
+    `nf` is `float n = order`, `odd` its parity; (-1)^(n+1) gamma(n + 1)
+    zeta(n + 1, x) in float."""
     if is_nan_f(x):
         return x
-    var nf = Float32(n)
-    var sgn = Float32(1.0) if n % 2 == 1 else Float32(-1.0)
+    var sgn = Float32(1.0) if odd else Float32(-1.0)
     return sgn * mps_gamma(nf + Float32(1.0)) * _mps_zeta(nf + Float32(1.0), x)
 
 

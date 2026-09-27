@@ -1595,13 +1595,30 @@ def _polygamma_check(n: Int, t: T) raises:
     _require_float("polygamma", t.dtype)
 
 
+def _polygamma_params(n: Int) -> Tuple[Float64, Float64, Float64]:
+    """The order as the kernels take it (`unary_math.polygamma_lane`): its
+    int32 truncation in two halves exact in float32 (the slots cross the
+    launch in float; the order itself would round past 2^24), then 0 for
+    digamma / trigamma (orders 0 and 1), else `float(n)` (Apple's series
+    reads the int64 order), negated when n is even."""
+    var n32 = Int(Int32(n)) if n >= 2 else n  # C's int conversion: wraps
+    var hi = n32 >> 16
+    var nf = Float64(Float32(n))  # int64 -> float in one rounding, as Metal
+    return (
+        Float64(hi),
+        Float64(n32 - hi * 65536),
+        Float64(0.0) if n < 2 else (nf if n % 2 != 0 else -nf),
+    )
+
+
 # aten::polygamma(int n, Tensor self) -> Tensor
 def op_polygamma(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var n = v_int(args[unsafe_offset=0])
     var t = v_tensor(args[unsafe_offset=1])
     var src = own_if_new(_promote(t), t)
     _polygamma_check(n, src.t)
-    var out = own(_param_unary("PolygammaSpec", src.t, Float64(n), 0.0, 0.0))
+    var p = _polygamma_params(n)
+    var out = own(_param_unary("PolygammaSpec", src.t, p[0], p[1], p[2]))
     ret_owned(rets, 0, out)
 
 
@@ -1614,8 +1631,9 @@ def op_polygamma_out(
     var dst = v_tensor(args[unsafe_offset=2])
     var src = own_if_new(_promote(t), t)
     _polygamma_check(n, src.t)
+    var p = _polygamma_params(n)
     _param_unary_out(
-        "PolygammaSpec", src.t, dst, Float64(n), 0.0, 0.0, cast_ok=True
+        "PolygammaSpec", src.t, dst, p[0], p[1], p[2], cast_ok=True
     )
     ret_ref(rets, 0, dst)
 
@@ -1663,17 +1681,32 @@ def op_mvlgamma_out(
     var p = v_int(args[unsafe_offset=1])
     var dst = v_tensor(args[unsafe_offset=2])
     _mvlgamma_no_bool(t)
+    one_device(t, dst)
     var src = own_if_new(_promote(t), t)
     _mvlgamma_check(p, src.t)
-    _param_unary_out(
-        "MvlgammaSpec",
-        src.t,
-        dst,
-        Float64(p),
-        _mvlgamma_constant(p),
-        0.0,
-        cast_ok=True,
+    # UnaryOps.cpp `mvlgamma_out` is not an iterator: it computes
+    # `self.mvlgamma(p)` into a new tensor, then `result.copy_(out)`. So an
+    # `out` overlapping the input (x[1:] for x[:-1]) is fine, and any dtype
+    # the result can cast to.
+    if not can_cast(src.t.stype, dst.stype):
+        raise Error(
+            "mvlgamma: result type ",
+            dtype_name(t.stype),
+            " can't be cast to the desired output type ",
+            dtype_name(src.t.stype),
+        )
+    var result = own(
+        _param_unary(
+            "MvlgammaSpec", src.t, Float64(p), _mvlgamma_constant(p), 0.0
+        )
     )
+    if not dst.same_shape(result.t):
+        resize_out(dst, result.t.shape, result.t.rank)
+    assert_no_internal_overlap(dst)
+    var casted = own_if_new(cast_for_copy(result.t, dst.stype), result.t)
+    copy_strided_into(dst, casted.t)
+    _ = casted^  # alive past the launch
+    _ = result^
     ret_ref(rets, 0, dst)
 
 

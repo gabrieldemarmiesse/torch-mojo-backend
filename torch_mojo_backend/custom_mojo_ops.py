@@ -324,13 +324,21 @@ def pointwise_binary(
 
 
 def polygamma(n: int, input: MaxTensor) -> MaxTensor:
-    """polygamma(n, x) for n >= 2 (`tmb/graph/elementwise.mojo`'s binary
-    `polygamma`, n broadcast as a float operand). The kernel computes in
-    float32, so a half input goes through float32 unchanged in value: n
-    then stays exact up to 2^24, where bfloat16 would round 257 to 256."""
-    if input.dtype in (DType.float16, DType.bfloat16):
-        return F.cast(polygamma(n, F.cast(input, DType.float32)), input.dtype)
-    return _same_type_binary("polygamma", _scalar_to_tensor(input, n), input)
+    """polygamma(n, x) for n >= 2 (`tmb/graph/elementwise.mojo`'s
+    `polygamma`). The order is a custom-op parameter, exact where a float
+    operand would round it; the kernel truncates it to 32 bits as CUDA's
+    `calc_polygamma(scalar_t x, int n)` does (Apple's keeps the int64)."""
+    _refuse_float32_math("polygamma", input)
+    return F.custom(
+        name="polygamma",
+        device=input.device,
+        values=[input],
+        out_types=[
+            TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
+        ],
+        parameters={"n": n},
+        custom_extensions=compiler.kernel_extension_paths(),
+    )[0]
 
 
 def gelu_backward(

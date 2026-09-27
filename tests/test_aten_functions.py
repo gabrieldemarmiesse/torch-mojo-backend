@@ -5862,18 +5862,29 @@ def test_aten_isinf_ldexp_compiled(device: str):
 
 
 def test_aten_polygamma_mvlgamma_compiled_edges(device: str):
-    """polygamma's order past bfloat16's exact integers (257 would read as
-    256 in a bfloat16 operand: -inf instead of +inf), float64 refused rather
+    """polygamma's order exact (257 would read as 256 in a bfloat16 operand,
+    16777217 as 16777216 in a float32 one: -inf instead of +inf) and
+    truncated to an int as ATen's kernels take it, float64 refused rather
     than computed in float32, and mvlgamma refusing bool, all against CPU
     torch."""
-    x = torch.tensor([0.125, 0.5, 3.0], dtype=torch.bfloat16)
-    compiled = torch.compile(
-        lambda t: aten.polygamma(257, t), backend=mojo_backend, fullgraph=True
-    )
-    torch.testing.assert_close(
-        compiled(x.to(device)).cpu(), torch.polygamma(257, x), equal_nan=True
-    )
-    torch.compiler.reset()
+    for dtype, n in (
+        (torch.bfloat16, 257),
+        (torch.float32, 16777217),
+        (torch.float32, 2**32),
+        (torch.float32, 2**32 + 1),
+    ):
+        x = torch.tensor([0.125, 0.5, 3.0], dtype=dtype)
+        compiled = torch.compile(
+            lambda t, n=n: aten.polygamma(n, t), backend=mojo_backend, fullgraph=True
+        )
+        torch.testing.assert_close(
+            compiled(x.to(device)).cpu(),
+            torch.polygamma(n, x),
+            equal_nan=True,
+            rtol=1e-4,
+            atol=0.0,
+        )
+        torch.compiler.reset()
     x64 = torch.tensor([1e-50, 0.5], dtype=torch.float64, device=device)
     compiled = torch.compile(
         lambda t: aten.polygamma(2, t), backend=mojo_backend, fullgraph=True
