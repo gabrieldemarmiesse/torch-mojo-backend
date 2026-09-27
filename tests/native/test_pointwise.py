@@ -1,7 +1,7 @@
 """Pointwise math on the native mojo device (tmb/ops/pointwise.mojo): pow,
 lerp (Scalar and Tensor), gelu_backward, clamp.Tensor, rsub and the binary
-math family (atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter
-so far).
+math family (atan2, hypot, copysign, fmod, fmax, fmin, heaviside, nextafter,
+gcd, lcm, bitwise_left_shift.Tensor, bitwise_right_shift.Tensor so far).
 
 Everything is compared with the same computation on CPU torch through the
 public API, over edge values (signed zeros, infinities, NaN, huge, tiny,
@@ -19,6 +19,7 @@ from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import get_accelerators, native
 
 FLOATS = [torch.float32, torch.float16, torch.bfloat16]
+INTS = [torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8]
 
 
 @contextlib.contextmanager
@@ -522,3 +523,32 @@ def test_heaviside_rejects_mixed_dtypes(mojo_gpu):
             torch.ones(3, device=mojo_gpu),
             torch.ones(3, dtype=torch.int64, device=mojo_gpu),
         )
+
+
+@pytest.mark.parametrize("dtype", INTS)
+def test_gcd_lcm_shifts_fmod_int(mojo_gpu, dtype):
+    torch.manual_seed(2)
+    signed = dtype != torch.uint8
+    lo = -60 if signed else 0
+    a = torch.randint(lo, 60, (200,), dtype=dtype)
+    b = torch.randint(lo, 60, (200,), dtype=dtype)
+    a[:4] = torch.tensor([0, 0, 12, 7], dtype=dtype)
+    b[:4] = torch.tensor([0, 5, 0, 7], dtype=dtype)
+    with ran("aten::gcd"):
+        _close(torch.gcd(a.to(mojo_gpu), b.to(mojo_gpu)), torch.gcd(a, b))
+    _close(torch.lcm(a.to(mojo_gpu), b.to(mojo_gpu)), torch.lcm(a, b))
+    nonzero = torch.where(b == 0, torch.ones_like(b), b)
+    _close(torch.fmod(a.to(mojo_gpu), nonzero.to(mojo_gpu)), torch.fmod(a, nonzero))
+    bits = torch.iinfo(dtype).bits
+    shift = torch.randint(0, bits + 4, (200,)).to(dtype)
+    if signed:
+        shift[:3] = torch.tensor([-1, bits, bits - 1], dtype=dtype)
+    with ran("aten::bitwise_left_shift.Tensor"):
+        _close(
+            torch.bitwise_left_shift(a.to(mojo_gpu), shift.to(mojo_gpu)),
+            torch.bitwise_left_shift(a, shift),
+        )
+    _close(
+        torch.bitwise_right_shift(a.to(mojo_gpu), shift.to(mojo_gpu)),
+        torch.bitwise_right_shift(a, shift),
+    )

@@ -77,6 +77,12 @@ MATH_OPS = {
     "hypot": torch.hypot,
     "nextafter": torch.nextafter,
 }
+INT_MATH_OPS = {
+    "bitwise_left_shift.Tensor": torch.bitwise_left_shift,
+    "bitwise_right_shift.Tensor": torch.bitwise_right_shift,
+    "gcd": torch.gcd,
+    "lcm": torch.lcm,
+}
 LOGICAL_OPS = {
     "logical_and": torch.logical_and,
     "logical_or": torch.logical_or,
@@ -98,6 +104,7 @@ COVERS: dict[str, str] = (
     }
     | {f"aten::{name}": "test_logical" for name in LOGICAL_OPS}
     | {f"aten::{name}": "test_binary_math" for name in MATH_OPS}
+    | {f"aten::{name}": "test_int_math" for name in INT_MATH_OPS}
     | {
         "aten::pow.Tensor_Scalar": "test_pow[Scalar]",
         "aten::pow.Tensor_Tensor": "test_pow[Tensor]",
@@ -159,8 +166,10 @@ SKIPPED: dict[str, str] = {
     "aten::atan2.out": _OUT,
     "aten::bitwise_and.Scalar_out": _OUT,
     "aten::bitwise_and.Tensor_out": _OUT,
+    "aten::bitwise_left_shift.Tensor_out": _OUT,
     "aten::bitwise_or.Scalar_out": _OUT,
     "aten::bitwise_or.Tensor_out": _OUT,
+    "aten::bitwise_right_shift.Tensor_out": _OUT,
     "aten::bitwise_xor.Scalar_out": _OUT,
     "aten::bitwise_xor.Tensor_out": _OUT,
     "aten::clamp.Tensor_out": _OUT,
@@ -181,8 +190,10 @@ SKIPPED: dict[str, str] = {
     "aten::fmod.Scalar": _SCALAR_OPERAND,
     "aten::fmod.Scalar_out": _OUT,
     "aten::fmod.Tensor_out": _OUT,
+    "aten::gcd.out": _OUT,
     "aten::heaviside.out": _OUT,
     "aten::hypot.out": _OUT,
+    "aten::lcm.out": _OUT,
     "aten::lerp.Tensor_out": _OUT,
     "aten::logical_and.out": _OUT,
     "aten::logical_or.out": _OUT,
@@ -387,6 +398,31 @@ def test_binary_math(
 ):
     fn = MATH_OPS[op_name]
     a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    bench.run(
+        lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("i32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(INT_MATH_OPS))
+def test_int_math(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = INT_MATH_OPS[op_name]
+    shape = SHAPES[shape_id]
+    high = 31 if "shift" in op_name else 1 << 20
+    a_ref, a_our = both(
+        torch.randint(1, 1 << 20, shape, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    b_ref, b_our = both(
+        torch.randint(1, high, shape, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
     bench.run(
         lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
     )

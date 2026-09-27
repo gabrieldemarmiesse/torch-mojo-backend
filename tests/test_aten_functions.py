@@ -5350,8 +5350,12 @@ _POINTWISE_BINARY_TWINS = [
     ("fmax", aten.fmax, torch.float32, "float"),
     ("fmin", aten.fmin, torch.int64, "int"),
     ("fmod", aten.fmod, torch.float32, "float"),
+    ("gcd", aten.gcd, torch.int64, "int"),
+    ("lcm", aten.lcm, torch.int32, "int"),
     ("hypot", aten.hypot, torch.float32, "float"),
     ("nextafter", aten.nextafter, torch.float32, "float"),
+    ("bitwise_left_shift", aten.bitwise_left_shift, torch.int64, "shift"),
+    ("bitwise_right_shift", aten.bitwise_right_shift, torch.int32, "shift"),
 ]
 
 

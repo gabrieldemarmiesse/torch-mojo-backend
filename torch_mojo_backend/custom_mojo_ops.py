@@ -255,7 +255,18 @@ def pointwise_binary(
     input: MaxTensor,
     other: MaxTensor,
     kind: Literal[
-        "atan2", "copysign", "fmax", "fmin", "fmod", "heaviside", "hypot", "nextafter"
+        "atan2",
+        "copysign",
+        "fmax",
+        "fmin",
+        "fmod",
+        "gcd",
+        "heaviside",
+        "hypot",
+        "lcm",
+        "lshift",
+        "nextafter",
+        "rshift",
     ],
 ) -> MaxTensor:
     """The mojo device's pointwise math (`tmb/kernels/common/pointwise_math`)
