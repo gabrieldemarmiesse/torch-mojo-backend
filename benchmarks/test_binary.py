@@ -96,6 +96,10 @@ POLY_OPS = {
         "chebyshev_polynomial_u",
         "chebyshev_polynomial_v",
         "chebyshev_polynomial_w",
+        "shifted_chebyshev_polynomial_t",
+        "shifted_chebyshev_polynomial_u",
+        "shifted_chebyshev_polynomial_v",
+        "shifted_chebyshev_polynomial_w",
     )
 }
 # Activation backwards: (grad_output, input) of one shape.
@@ -284,6 +288,10 @@ SKIPPED: dict[str, str] = {
     "aten::special_chebyshev_polynomial_u.out": _OUT,
     "aten::special_chebyshev_polynomial_v.out": _OUT,
     "aten::special_chebyshev_polynomial_w.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_t.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_u.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_v.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_w.out": _OUT,
     "aten::special_xlog1py.out": _OUT,
     "aten::special_zeta.out": _OUT,
     "aten::xlogy.OutTensor": _OUT,

@@ -260,6 +260,54 @@ struct PointwiseRshift(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_shifted_chebyshev_polynomial_t")
+struct PointwiseShiftedChebyshevPolynomialT(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["shifted_chebyshev_polynomial_t", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_shifted_chebyshev_polynomial_u")
+struct PointwiseShiftedChebyshevPolynomialU(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["shifted_chebyshev_polynomial_u", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_shifted_chebyshev_polynomial_v")
+struct PointwiseShiftedChebyshevPolynomialV(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["shifted_chebyshev_polynomial_v", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_shifted_chebyshev_polynomial_w")
+struct PointwiseShiftedChebyshevPolynomialW(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["shifted_chebyshev_polynomial_w", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_xlog1py")
 struct PointwiseXlog1py(ElementwiseBinaryOp):
     @staticmethod

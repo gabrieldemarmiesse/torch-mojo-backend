@@ -267,6 +267,10 @@ def _pointwise_binary(
         "lshift",
         "nextafter",
         "rshift",
+        "shifted_chebyshev_polynomial_t",
+        "shifted_chebyshev_polynomial_u",
+        "shifted_chebyshev_polynomial_v",
+        "shifted_chebyshev_polynomial_w",
         "xlog1py",
         "xlogy",
         "zeta",
@@ -5134,6 +5138,38 @@ def aten_special_scaled_modified_bessel_k0(x: MaxTensor) -> MaxTensor:
 @map_to(aten.special_scaled_modified_bessel_k1)
 def aten_special_scaled_modified_bessel_k1(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "scaled_modified_bessel_k1")
+
+
+# special_shifted_chebyshev_polynomial_t(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_shifted_chebyshev_polynomial_t)
+def aten_special_shifted_chebyshev_polynomial_t(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "shifted_chebyshev_polynomial_t", promote_float=True)
+
+
+# special_shifted_chebyshev_polynomial_u(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_shifted_chebyshev_polynomial_u)
+def aten_special_shifted_chebyshev_polynomial_u(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "shifted_chebyshev_polynomial_u", promote_float=True)
+
+
+# special_shifted_chebyshev_polynomial_v(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_shifted_chebyshev_polynomial_v)
+def aten_special_shifted_chebyshev_polynomial_v(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "shifted_chebyshev_polynomial_v", promote_float=True)
+
+
+# special_shifted_chebyshev_polynomial_w(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_shifted_chebyshev_polynomial_w)
+def aten_special_shifted_chebyshev_polynomial_w(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "shifted_chebyshev_polynomial_w", promote_float=True)
 
 
 # special_spherical_bessel_j0(Tensor x) -> Tensor
