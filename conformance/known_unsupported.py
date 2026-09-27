@@ -395,10 +395,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "special_i1": ("float32", "bfloat16", "float16", "int64", "bool"),
     "special_i1e": ("float32", "bfloat16", "float16", "int64", "bool"),
     "special_log_ndtr": ("float32", "int64", "bool"),
-    "special_modified_bessel_i0": ("float32", "int64", "bool"),
-    "special_modified_bessel_i1": ("float32", "int64", "bool"),
-    "special_modified_bessel_k0": ("float32", "int64", "bool"),
-    "special_modified_bessel_k1": ("float32", "int64", "bool"),
     "special_ndtri": ("float32", "int64", "bool"),
     "special_polygamma_special_polygamma_n_0": (
         "float32",
