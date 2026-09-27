@@ -5376,9 +5376,12 @@ def test_aten_inf_predicates(conf: Conf, call_checker: CallChecker, name: str):
 _SPECIAL_UNARY_CASES = [
     ("asin", lambda x: aten.asin(x), [-1.0, -0.5, 0.0, 0.25, 1.0]),
     ("atan", lambda x: aten.atan(x), [-50.0, -1.0, 0.0, 0.5, 3.0]),
+    ("erfc", lambda x: aten.erfc(x), [-3.0, -0.5, 0.0, 2.0, 9.0]),
+    ("erfinv", lambda x: aten.erfinv(x), [-0.999, -0.5, 0.0, 0.3, 0.9]),
     ("exp2", lambda x: aten.exp2(x), [-100.0, -1.5, 0.0, 3.0, 60.0]),
     ("expm1", lambda x: aten.expm1(x), [-20.0, -1e-4, 0.0, 1e-3, 5.0]),
     ("log10", lambda x: aten.log10(x), [1e-3, 0.5, 1.0, 10.0, 1e5]),
+    ("sinc", lambda x: aten.sinc(x), [-2.5, -0.1, 0.0, 0.5, 7.0]),
 ]
 
 
