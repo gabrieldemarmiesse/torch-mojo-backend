@@ -19,10 +19,12 @@ from std.utils import IndexList
 from tmb.backend.abi import (
     IntList,
     Owned,
+    ST_FLOAT32,
     ST_INT64,
     T,
     Values,
     alert_not_deterministic,
+    cpu_empty,
     new_tensor,
     own,
     own_if_new,
@@ -34,11 +36,14 @@ from tmb.backend.abi import (
     v_is_none,
     v_tensor,
 )
-from tmb.backend.device import ctx_for, ctx_ptr, dev
+from tmb.backend.device import copy_to_host, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    assert_no_internal_overlap,
+    cast_into,
     check_out,
+    check_out_as,
     contiguous,
     copy_strided_into,
     fill_value,
@@ -174,13 +179,46 @@ def _numel(sp: IndexList[3]) -> Int:
     return sp[0] * sp[1] * sp[2]
 
 
+def _alloc(
+    dest: Optional[T],
+    shape: IndexList[MAX_RANK],
+    rank: Int,
+    stype: Int32,
+    device: Int,
+    reads: List[T],
+) raises -> Owned:
+    """Where a kernel writes one result: a fresh tensor, or for an `out=`
+    the caller's tensor itself.
+
+    An `out` is resized to the result's shape first (`resize_output`) and
+    must not repeat elements (`assert_no_internal_overlap`). The kernel
+    then writes straight into it when it is contiguous and shares no
+    storage with an input the kernel reads; otherwise into a temporary that
+    `_store` copies across. The returned `Owned` is only live (released on
+    drop) when it is a fresh allocation.
+    """
+    if not dest:
+        return own(new_tensor(shape, rank, stype, device))
+    var d = dest.value().copy()
+    resize_out(d, shape, rank)
+    assert_no_internal_overlap(d)
+    var direct = d.contig and d.stype == stype
+    if direct and d.numel:
+        for r in reads:
+            if r.numel and r.storage_ptr() == d.storage_ptr():
+                direct = False
+    if direct:
+        var o = own(d^)
+        _ = o.take()  # the caller's tensor: never released here
+        return o^
+    return own(new_tensor(shape, rank, stype, device))
+
+
 def _store(rets: Values, i: Int, dest: T, var result: Owned) raises:
-    """Finish an `out=` variant: copy the fresh result into the caller's
-    tensor (resized when its shape differs) and hand that tensor back."""
-    var dst = dest.copy()
-    if not dst.same_shape(result.t):
-        resize_out(dst, result.t.shape, result.t.rank)
-    if result.t.numel:
+    """Finish an `out=` variant: hand the caller's tensor back, copying the
+    result into it when `_alloc` had to compute into a temporary."""
+    var dst = T(dest.h)  # `_alloc` may have resized it
+    if result.t.h != dest.h and result.t.numel:
         copy_strided_into(dst, result.t)
     _ = result^
     ret_ref(rets, i, dst)
@@ -350,8 +388,10 @@ struct Window(Copyable, Movable):
                 or (x.rank == 4 and valid and x.dim(3) != 0)
             ):
                 raise Error(
-                    "Expected 3D or 4D (batch mode) tensor with optional 0"
-                    " dim batch size for input, but got:",
+                    (
+                        "Expected 3D or 4D (batch mode) tensor with optional 0"
+                        " dim batch size for input, but got:"
+                    ),
                     _sizes(x),
                 )
         else:
@@ -367,8 +407,10 @@ struct Window(Copyable, Movable):
                 if x.dim(i) <= 0:
                     raise Error(
                         fn_name,
-                        ": Expected input's non-batch dimensions to have"
-                        " positive length, but input has a shape of ",
+                        (
+                            ": Expected input's non-batch dimensions to have"
+                            " positive length, but input has a shape of "
+                        ),
                         _sizes(x),
                         " and non-batch dimension ",
                         x.dim(i),
@@ -395,8 +437,10 @@ struct Window(Copyable, Movable):
         for i in range(3 - n, 3):
             if self.k[i] // 2 < self.p[i]:
                 raise Error(
-                    "pad should be smaller than or equal to half of kernel"
-                    " size, but got ",
+                    (
+                        "pad should be smaller than or equal to half of kernel"
+                        " size, but got "
+                    ),
                     self._fmt(self.p, n, "pad"),
                 )
         for i in range(3 - n, 3):
@@ -469,21 +513,31 @@ def _max_pool_check[
 
 
 def _outputs(
-    x: T, n: Int, outs: IndexList[3], with_indices: Bool
+    x: T,
+    n: Int,
+    outs: IndexList[3],
+    dest: Optional[T],
+    dest_indices: Optional[T],
 ) raises -> List[Owned]:
-    """The pooled output (and its int64 indices) of `x`."""
+    """The pooled output and its int64 indices of `x` (the caller's `out=`
+    tensors when given)."""
     var sh = _shape_with(x, n, outs)
     var r = List[Owned]()
-    r.append(own(new_tensor(sh[0], sh[1], x.stype, x.device)))
-    if with_indices:
-        r.append(own(new_tensor(sh[0], sh[1], ST_INT64, x.device)))
+    r.append(_alloc(dest, sh[0], sh[1], x.stype, x.device, [x.copy()]))
+    r.append(_alloc(dest_indices, sh[0], sh[1], ST_INT64, x.device, [x.copy()]))
     return r^
 
 
 def _max_pool[
     n: Int
-](x: T, w: Window, outs: IndexList[3]) raises -> List[Owned]:
-    var r = _outputs(x, n, outs, True)
+](
+    x: T,
+    w: Window,
+    outs: IndexList[3],
+    dest: Optional[T] = None,
+    dest_indices: Optional[T] = None,
+) raises -> List[Owned]:
+    var r = _outputs(x, n, outs, dest, dest_indices)
     if r[0].t.numel:
         var xc = own_if_new(contiguous(x), x)
         _launch(
@@ -547,13 +601,8 @@ def op_max_pool_with_indices_out[
     var outs = _max_pool_check[n](x, w, _max_pool_name[n]())
     _check_dtype(x, name)
     check_out(out, x)
-    if indices.stype != ST_INT64:
-        raise Error(
-            "Expected out tensor to have dtype long int, but got ",
-            indices.dtype,
-            " instead",
-        )
-    var r = _max_pool[n](x, w, outs)
+    check_out_as(indices, ST_INT64, x)
+    var r = _max_pool[n](x, w, outs, out.copy(), indices.copy())
     _store(rets, 1, indices, r.pop())
     _store(rets, 0, out, r.pop())
 
@@ -597,7 +646,9 @@ def _grad_matches(
             )
 
 
-def _max_pool_backward[n: Int](args: Values) raises -> Owned:
+def _max_pool_backward[
+    n: Int
+](args: Values, dest: Optional[T] = None) raises -> Owned:
     var grad = v_tensor(args[unsafe_offset=0])
     var x = v_tensor(args[unsafe_offset=1])
     var indices = v_tensor(args[unsafe_offset=7])
@@ -627,8 +678,16 @@ def _max_pool_backward[n: Int](args: Values) raises -> Owned:
     _same_device(x, indices, name)
     if indices.stype != ST_INT64:
         raise Error("indices must be an int64 tensor")
-    var gin = own(new_tensor(x.shape, x.rank, x.stype, x.device))
-    if gin.t.numel:
+    var gin = _alloc(
+        dest, x.shape, x.rank, x.stype, x.device, [grad.copy(), indices.copy()]
+    )
+    if n == 3:
+        # CUDA's max_pool3d backward scatters (atomics).
+        alert_not_deterministic(
+            "max_pool3d_with_indices_backward_out_cuda" if dest else "max_pool3d_with_indices_backward_cuda"
+        )
+        _scatter_backward(gin.t, grad, indices, x, _numel(outs), n)
+    elif gin.t.numel:
         var gc = own_if_new(contiguous(grad), grad)
         var ic = own_if_new(contiguous(indices), indices)
         _launch(
@@ -673,7 +732,48 @@ def op_max_pool_backward_out[
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor(args[unsafe_offset=8])
     check_out(dest, v_tensor(args[unsafe_offset=1]))
-    _store(rets, 0, dest, _max_pool_backward[n](args))
+    _store(rets, 0, dest, _max_pool_backward[n](args, dest.copy()))
+
+
+def _scatter_backward(
+    gin: T, grad: T, indices: T, x: T, out_plane: Int, n: Int
+) raises:
+    """grad_input = 0, then grad_input[plane][indices[i]] += grad[i] for every
+    grad_output element: CUDA's atomic max-pool backward, so an index
+    outside its output's window still receives its gradient. Accumulates in
+    float32 (float64) and casts once into a half `gin`."""
+    fill_value(gin, 0.0)
+    if gin.numel == 0 or grad.numel == 0:
+        return
+    var gc = own_if_new(contiguous(grad), grad)
+    var ic = own_if_new(contiguous(indices), indices)
+    var wide = x.dtype == DType.float32 or x.dtype == DType.float64
+    var ws = own(
+        new_tensor(
+            x.shape, x.rank, ST_FLOAT32, x.device
+        ) if not wide else gin.copy()
+    )
+    if wide:
+        _ = ws.take()  # `gin` itself: not ours to release
+    else:
+        fill_value(ws.t, 0.0)
+    var ctx = ctx_for(x.device)
+    var call = KernelCall("pool", "MaxPoolScatter")
+    call.arg_dtype(0, x.dtype)
+    call.int(ws.t.ptr)
+    call.int(gc.t.ptr)
+    call.int(ic.t.ptr)
+    call.int(grad.numel)
+    call.int(out_plane)
+    call.int(_numel(_in_spatial(x, n)))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    _ = gc^
+    _ = ic^
+    if not wide:
+        cast_into(gin, ws.t)
+    _ = ws^
 
 
 # ---------------------------------------------------------------------------
@@ -695,8 +795,10 @@ def _avg_check[
         raise Error("divisor must be not zero")
     if n == 2 and x.rank < 3:
         raise Error(
-            "Expected 3D or 4D (batch mode) tensor with optional 0 dim batch"
-            " size for input, but got:",
+            (
+                "Expected 3D or 4D (batch mode) tensor with optional 0 dim"
+                " batch size for input, but got:"
+            ),
             _sizes(x),
         )
     var ins = _in_spatial(x, n)
@@ -727,13 +829,13 @@ def _avg_args[
     return (w^, cip, div)
 
 
-def _avg_pool[n: Int](args: Values) raises -> Owned:
+def _avg_pool[n: Int](args: Values, dest: Optional[T] = None) raises -> Owned:
     var x = v_tensor(args[unsafe_offset=0])
     var a = _avg_args[n](args, 1)
     var outs = _avg_check[n](x, a[0], a[2])
     _check_dtype(x, _avg_name[n]())
     var sh = _shape_with(x, n, outs)
-    var out = own(new_tensor(sh[0], sh[1], x.stype, x.device))
+    var out = _alloc(dest, sh[0], sh[1], x.stype, x.device, [x.copy()])
     if out.t.numel:
         var xc = own_if_new(contiguous(x), x)
         _launch(
@@ -776,10 +878,12 @@ def op_avg_pool_out[
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor(args[unsafe_offset=7])
     check_out(dest, v_tensor(args[unsafe_offset=0]))
-    _store(rets, 0, dest, _avg_pool[n](args))
+    _store(rets, 0, dest, _avg_pool[n](args, dest.copy()))
 
 
-def _avg_pool_backward[n: Int](args: Values) raises -> Owned:
+def _avg_pool_backward[
+    n: Int
+](args: Values, dest: Optional[T] = None) raises -> Owned:
     var grad = v_tensor(args[unsafe_offset=0])
     var x = v_tensor(args[unsafe_offset=1])
     var a = _avg_args[n](args, 2)
@@ -794,7 +898,7 @@ def _avg_pool_backward[n: Int](args: Values) raises -> Owned:
             " for `gradOutput` but got dtype ",
             grad.dtype,
         )
-    var gin = own(new_tensor(x.shape, x.rank, x.stype, x.device))
+    var gin = _alloc(dest, x.shape, x.rank, x.stype, x.device, [grad.copy()])
     if gin.t.numel:
         var gc = own_if_new(contiguous(grad), grad)
         _launch(
@@ -837,7 +941,7 @@ def op_avg_pool_backward_out[
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor(args[unsafe_offset=8])
     check_out(dest, v_tensor(args[unsafe_offset=1]))
-    _store(rets, 0, dest, _avg_pool_backward[n](args))
+    _store(rets, 0, dest, _avg_pool_backward[n](args, dest.copy()))
 
 
 # ---------------------------------------------------------------------------
@@ -866,8 +970,10 @@ def _adaptive_size[
             if x.dim(i) <= 0:
                 raise Error(
                     name,
-                    "(): Expected input to have non-zero size for non-batch"
-                    " dimensions, but input has sizes ",
+                    (
+                        "(): Expected input to have non-zero size for non-batch"
+                        " dimensions, but input has sizes "
+                    ),
                     _sizes(x),
                     " with dimension ",
                     i,
@@ -890,12 +996,16 @@ def _adaptive_size[
                 "D tensor, but got ",
                 _sizes(x),
             )
-        for i in range(x.rank - n, x.rank):
+        # 2-D checks the spatial dims only; 3-D every non-batch dim, so a
+        # zero-channel batch raises (CUDA's adaptive_avg_pool3d templates).
+        for i in range(x.rank - n if n == 2 else 1, x.rank):
             if x.dim(i) <= 0:
                 raise Error(
                     name,
-                    "(): Expected input to have non-zero size for non-batch"
-                    " dimensions, but input has sizes ",
+                    (
+                        "(): Expected input to have non-zero size for non-batch"
+                        " dimensions, but input has sizes "
+                    ),
                     _sizes(x),
                     " with dimension ",
                     i,
@@ -927,12 +1037,14 @@ def _adaptive_geom(x: T, n: Int, outs: IndexList[3]) -> List[Int]:
     )
 
 
-def _adaptive_avg[n: Int](x: T, l: IntList) raises -> Owned:
+def _adaptive_avg[
+    n: Int
+](x: T, l: IntList, dest: Optional[T] = None) raises -> Owned:
     comptime name: StaticString = "adaptive_avg_pool2d" if n == 2 else "adaptive_avg_pool3d"
     var outs = _adaptive_size[n](x, l, name, False)
     _check_dtype(x, name)
     var sh = _shape_with(x, n, outs)
-    var out = own(new_tensor(sh[0], sh[1], x.stype, x.device))
+    var out = _alloc(dest, sh[0], sh[1], x.stype, x.device, [x.copy()])
     if out.t.numel:
         var xc = own_if_new(contiguous(x), x)
         _launch(
@@ -965,7 +1077,12 @@ def op_adaptive_avg_pool_out[
     var x = v_tensor(args[unsafe_offset=0])
     var dest = v_tensor(args[unsafe_offset=2])
     check_out(dest, x)
-    _store(rets, 0, dest, _adaptive_avg[n](x, IntList(args[unsafe_offset=1])))
+    _store(
+        rets,
+        0,
+        dest,
+        _adaptive_avg[n](x, IntList(args[unsafe_offset=1]), dest.copy()),
+    )
 
 
 def _adaptive_grad_check[
@@ -986,8 +1103,10 @@ def _adaptive_grad_check[
         if grad.dim(i) <= 0:
             raise Error(
                 name,
-                "(): Expected grad_output to have non-zero size for"
-                " non-batch dimensions, but grad_output has sizes ",
+                (
+                    "(): Expected grad_output to have non-zero size for"
+                    " non-batch dimensions, but grad_output has sizes "
+                ),
                 _sizes(grad),
                 " with dimension ",
                 i,
@@ -1020,11 +1139,13 @@ def _adaptive_grad_check[
     return _in_spatial(grad, n)
 
 
-def _adaptive_avg_backward[n: Int](grad: T, x: T) raises -> Owned:
+def _adaptive_avg_backward[
+    n: Int
+](grad: T, x: T, dest: Optional[T] = None) raises -> Owned:
     comptime name: StaticString = "adaptive_avg_pool2d_backward" if n == 2 else "adaptive_avg_pool3d_backward"
     var outs = _adaptive_grad_check[n](grad, x, name)
     _check_dtype(x, name)
-    var gin = own(new_tensor(x.shape, x.rank, x.stype, x.device))
+    var gin = _alloc(dest, x.shape, x.rank, x.stype, x.device, [grad.copy()])
     if gin.t.numel:
         var gc = own_if_new(contiguous(grad), grad)
         _launch(
@@ -1063,15 +1184,24 @@ def op_adaptive_avg_pool_backward_out[
         rets,
         0,
         dest,
-        _adaptive_avg_backward[n](v_tensor(args[unsafe_offset=0]), x),
+        _adaptive_avg_backward[n](
+            v_tensor(args[unsafe_offset=0]), x, dest.copy()
+        ),
     )
 
 
-def _adaptive_max[n: Int](x: T, l: IntList) raises -> List[Owned]:
+def _adaptive_max[
+    n: Int
+](
+    x: T,
+    l: IntList,
+    dest: Optional[T] = None,
+    dest_indices: Optional[T] = None,
+) raises -> List[Owned]:
     comptime name: StaticString = "adaptive_max_pool2d" if n == 2 else "adaptive_max_pool3d"
     var outs = _adaptive_size[n](x, l, name, True)
     _check_dtype(x, name)
-    var r = _outputs(x, n, outs, True)
+    var r = _outputs(x, n, outs, dest, dest_indices)
     if r[0].t.numel:
         var xc = own_if_new(contiguous(x), x)
         _launch(
@@ -1109,18 +1239,17 @@ def op_adaptive_max_pool_out[
     var out = v_tensor(args[unsafe_offset=2])
     var indices = v_tensor(args[unsafe_offset=3])
     check_out(out, x)
-    if indices.stype != ST_INT64:
-        raise Error(
-            "Expected out tensor to have dtype long int, but got ",
-            indices.dtype,
-            " instead",
-        )
-    var r = _adaptive_max[n](x, IntList(args[unsafe_offset=1]))
+    check_out_as(indices, ST_INT64, x)
+    var r = _adaptive_max[n](
+        x, IntList(args[unsafe_offset=1]), out.copy(), indices.copy()
+    )
     _store(rets, 1, indices, r.pop())
     _store(rets, 0, out, r.pop())
 
 
-def _adaptive_max_backward[n: Int](grad: T, x: T, indices: T) raises -> Owned:
+def _adaptive_max_backward[
+    n: Int
+](grad: T, x: T, indices: T, dest: Optional[T] = None) raises -> Owned:
     comptime name: StaticString = "adaptive_max_pool2d_backward" if n == 2 else "adaptive_max_pool3d_backward"
     if indices.rank != x.rank:
         raise Error(
@@ -1141,21 +1270,13 @@ def _adaptive_max_backward[n: Int](grad: T, x: T, indices: T) raises -> Owned:
         raise Error("indices must be an int64 tensor")
     _same_device(x, indices, name)
     _check_dtype(x, name)
-    var gin = own(new_tensor(x.shape, x.rank, x.stype, x.device))
-    if gin.t.numel:
-        var gc = own_if_new(contiguous(grad), grad)
-        var ic = own_if_new(contiguous(indices), indices)
-        _launch(
-            "AdaptiveMaxPoolBackward",
-            x.dtype,
-            gin.t.ptr,
-            gc.t.ptr,
-            ic.t.ptr,
-            _adaptive_geom(x, n, outs),
-            x.device,
-        )
-        _ = gc^
-        _ = ic^
+    var gin = _alloc(
+        dest, x.shape, x.rank, x.stype, x.device, [grad.copy(), indices.copy()]
+    )
+    comptime if n == 2:
+        # CUDA's adaptive max backwards scatter (the 2-D one with atomics).
+        alert_not_deterministic("adaptive_max_pool2d_backward_cuda")
+    _scatter_backward(gin.t, grad, indices, x, _numel(outs), n)
     return gin^
 
 
@@ -1185,7 +1306,10 @@ def op_adaptive_max_pool_backward_out[
         0,
         dest,
         _adaptive_max_backward[n](
-            v_tensor(args[unsafe_offset=0]), x, v_tensor(args[unsafe_offset=2])
+            v_tensor(args[unsafe_offset=0]),
+            x,
+            v_tensor(args[unsafe_offset=2]),
+            dest.copy(),
         ),
     )
 
@@ -1195,7 +1319,7 @@ def op_adaptive_max_pool_backward_out[
 # ---------------------------------------------------------------------------
 
 
-def _max_unpool[n: Int](args: Values) raises -> Owned:
+def _max_unpool[n: Int](args: Values, dest: Optional[T] = None) raises -> Owned:
     """MaxUnpooling.cu's forward: zero-filled output, then out[plane][idx]
     = input for every input element."""
     var x = v_tensor(args[unsafe_offset=0])
@@ -1216,8 +1340,10 @@ def _max_unpool[n: Int](args: Values) raises -> Owned:
         for i in range(1, x.rank):
             if x.dim(i) <= 0:
                 raise Error(
-                    "max_unpooling2d_forward_out_cuda(): Expected input to"
-                    " have non-zero size for non-batch dimensions, but got ",
+                    (
+                        "max_unpooling2d_forward_out_cuda(): Expected input to"
+                        " have non-zero size for non-batch dimensions, but got "
+                    ),
                     _sizes(x),
                     " with dimension ",
                     i,
@@ -1225,8 +1351,10 @@ def _max_unpool[n: Int](args: Values) raises -> Owned:
                 )
         if x.rank != 3 and x.rank != 4:
             raise Error(
-                "Input to max_unpooling2d should be a 3d or 4d Tensor, but got"
-                " tensor with dimension: ",
+                (
+                    "Input to max_unpooling2d should be a 3d or 4d Tensor, but"
+                    " got tensor with dimension: "
+                ),
                 x.rank,
             )
         if not x.same_shape(indices):
@@ -1238,15 +1366,19 @@ def _max_unpool[n: Int](args: Values) raises -> Owned:
             )
         if len(osize) != 2:
             raise Error(
-                "There should be exactly two elements (height, width) in"
-                " output_size, but got ",
+                (
+                    "There should be exactly two elements (height, width) in"
+                    " output_size, but got "
+                ),
                 len(osize),
                 " elements.",
             )
         if osize[0] < 0 or osize[1] < 0:
             raise Error(
-                "max_unpooling2d(): output_size must contain non-negative"
-                " spatial dimensions, but got output_size=(",
+                (
+                    "max_unpooling2d(): output_size must contain non-negative"
+                    " spatial dimensions, but got output_size=("
+                ),
                 osize[0],
                 ", ",
                 osize[1],
@@ -1257,28 +1389,36 @@ def _max_unpool[n: Int](args: Values) raises -> Owned:
         var padding = IntList(args[unsafe_offset=4])
         if x.rank != 4 and x.rank != 5:
             raise Error(
-                "Input to max_unpooling3d should be a 4d or 5d Tensor, but got"
-                " a tensor with dim ",
+                (
+                    "Input to max_unpooling3d should be a 4d or 5d Tensor, but"
+                    " got a tensor with dim "
+                ),
                 x.rank,
             )
         if len(osize) != 3:
             raise Error(
-                "There should be exactly three elements (depth, height, width)"
-                " in output_size, but got ",
+                (
+                    "There should be exactly three elements (depth, height,"
+                    " width) in output_size, but got "
+                ),
                 len(osize),
                 " elements.",
             )
         if len(stride) != 3:
             raise Error(
-                "There should be exactly three elements (depth, height, width)"
-                " in stride, but got: ",
+                (
+                    "There should be exactly three elements (depth, height,"
+                    " width) in stride, but got: "
+                ),
                 len(stride),
                 " elements.",
             )
         if len(padding) != 3:
             raise Error(
-                "There should be exactly three elements (depth, height, width)"
-                " in padding, but got: ",
+                (
+                    "There should be exactly three elements (depth, height,"
+                    " width) in padding, but got: "
+                ),
                 len(padding),
                 " elements.",
             )
@@ -1292,8 +1432,10 @@ def _max_unpool[n: Int](args: Values) raises -> Owned:
         for i in range(1, x.rank):
             if x.dim(i) <= 0:
                 raise Error(
-                    "max_unpooling3d_forward_out_cuda(): Expected input to"
-                    " have non-zero size for non-batch dimensions, but got ",
+                    (
+                        "max_unpooling3d_forward_out_cuda(): Expected input to"
+                        " have non-zero size for non-batch dimensions, but got "
+                    ),
                     _sizes(x),
                     " with dimension ",
                     i,
@@ -1312,13 +1454,21 @@ def _max_unpool[n: Int](args: Values) raises -> Owned:
     for i in range(n):
         outs[3 - n + i] = osize[i]
     var sh = _shape_with(x, n, outs)
-    var out = own(new_tensor(sh[0], sh[1], x.stype, x.device))
+    var out = _alloc(
+        dest, sh[0], sh[1], x.stype, x.device, [x.copy(), indices.copy()]
+    )
     if out.t.numel:
         fill_value(out.t, 0.0)
     if x.numel and out.t.numel:
         var xc = own_if_new(contiguous(x), x)
         var ic = own_if_new(contiguous(indices), indices)
         var ctx = ctx_for(x.device)
+        # [bad, index]: the kernel records an index outside the output
+        # plane there instead of writing it (CUDA device-asserts).
+        var two = IndexList[MAX_RANK](1)
+        two[MAX_RANK - 1] = 2
+        var flag = own(new_tensor(two, 1, ST_INT64, x.device))
+        fill_value(flag.t, 0.0)
         var call = KernelCall("pool", "MaxUnpool")
         call.arg_dtype(0, x.dtype)
         call.int(out.t.ptr)
@@ -1327,11 +1477,33 @@ def _max_unpool[n: Int](args: Values) raises -> Owned:
         call.int(x.numel)
         call.int(_numel(_in_spatial(x, n)))
         call.int(_numel(outs))
+        call.int(flag.t.ptr)
         call.int(ctx_ptr(ctx))
         call.run()
+        var host = own(cpu_empty(two, 1, ST_INT64))
+        copy_to_host(ctx, flag.t.ptr, host.t.ptr, 16)
+        var words = Pointer[Int64, MutUntrackedOrigin](
+            unsafe_from_address=host.t.ptr
+        )
+        var bad = words[unsafe_offset=0] != 0
+        var bad_index = Int(words[unsafe_offset=1])
+        _ = host^
+        _ = flag^
         _ = ctx
         _ = xc^
         _ = ic^
+        if bad:
+            # The CPU kernel's message (MaxUnpoolKernel.cpp).
+            var size = String(outs[3 - n])
+            for i in range(4 - n, 3):
+                size += "x" + String(outs[i])
+            raise Error(
+                "Found an invalid max index: ",
+                bad_index,
+                " (output volumes are of size ",
+                size,
+                ")",
+            )
     return out^
 
 
@@ -1351,7 +1523,7 @@ def op_max_unpool_out[
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor(args[unsafe_offset=3 if n == 2 else 5])
     check_out(dest, v_tensor(args[unsafe_offset=0]))
-    _store(rets, 0, dest, _max_unpool[n](args))
+    _store(rets, 0, dest, _max_unpool[n](args, dest.copy()))
 
 
 # ---------------------------------------------------------------------------
@@ -1449,7 +1621,7 @@ def _blocks(isz: Int, pad: Int, dil: Int, k: Int, s: Int) -> Int:
     return (isz + 2 * pad - (dil * (k - 1) + 1)) // s + 1
 
 
-def _im2col(args: Values) raises -> Owned:
+def _im2col(args: Values, dest: Optional[T] = None) raises -> Owned:
     var x = v_tensor(args[unsafe_offset=0])
     var k = _pair(IntList(args[unsafe_offset=1]), "kernel_size")
     var d = _pair(IntList(args[unsafe_offset=2]), "dilation")
@@ -1462,8 +1634,10 @@ def _im2col(args: Values) raises -> Owned:
         or (x.rank == 4 and valid and x.dim(3) != 0)
     ):
         raise Error(
-            "Expected 3D or 4D (batch mode) tensor with possibly 0 batch size"
-            " and other non-zero dimensions for input, but got: ",
+            (
+                "Expected 3D or 4D (batch mode) tensor with possibly 0 batch"
+                " size and other non-zero dimensions for input, but got: "
+            ),
             _sizes(x),
         )
     var in_h = x.dim(-2)
@@ -1504,7 +1678,7 @@ def _im2col(args: Values) raises -> Owned:
     if x.rank == 4:
         shape[MAX_RANK - 3] = batch
         rank = 3
-    var out = own(new_tensor(shape, rank, x.stype, x.device))
+    var out = _alloc(dest, shape, rank, x.stype, x.device, [x.copy()])
     if out.t.numel:
         var xc = own_if_new(contiguous(x), x)
         _launch(
@@ -1531,10 +1705,10 @@ def op_im2col(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_im2col_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor(args[unsafe_offset=5])
     check_out(dest, v_tensor(args[unsafe_offset=0]))
-    _store(rets, 0, dest, _im2col(args))
+    _store(rets, 0, dest, _im2col(args, dest.copy()))
 
 
-def _col2im(args: Values) raises -> Owned:
+def _col2im(args: Values, dest: Optional[T] = None) raises -> Owned:
     var x = v_tensor(args[unsafe_offset=0])
     var o = _pair(IntList(args[unsafe_offset=1]), "output_size")
     var k = _pair(IntList(args[unsafe_offset=2]), "kernel_size")
@@ -1547,16 +1721,20 @@ def _col2im(args: Values) raises -> Owned:
         or (x.rank == 3 and x.dim(1) != 0 and x.dim(2) != 0)
     ):
         raise Error(
-            "Expected 2D or 3D (batch mode) tensor for input with possibly 0"
-            " batch size and non-zero dimensions for input, but got: ",
+            (
+                "Expected 2D or 3D (batch mode) tensor for input with possibly"
+                " 0 batch size and non-zero dimensions for input, but got: "
+            ),
             _sizes(x),
         )
     var planes_in = x.dim(-2)
     var kk = k[0] * k[1]
     if planes_in % kk != 0:
         raise Error(
-            "Expected size of input's dimension 1 to be divisible by the"
-            " product of kernel_size, but got input.size(1)=",
+            (
+                "Expected size of input's dimension 1 to be divisible by the"
+                " product of kernel_size, but got input.size(1)="
+            ),
             planes_in,
             " and kernel_size=(",
             k[0],
@@ -1589,8 +1767,10 @@ def _col2im(args: Values) raises -> Owned:
             s[0],
             ", ",
             s[1],
-            "), expected size of input's dimension 2 to match the calculated"
-            " number of sliding blocks ",
+            (
+                "), expected size of input's dimension 2 to match the"
+                " calculated number of sliding blocks "
+            ),
             bh,
             " * ",
             bw,
@@ -1614,8 +1794,10 @@ def _col2im(args: Values) raises -> Owned:
         )
     if o[1] < 1 or o[0] < 1:
         raise Error(
-            "Expected output spatial size to be positive, but got:"
-            " output_size=(",
+            (
+                "Expected output spatial size to be positive, but got:"
+                " output_size=("
+            ),
             o[0],
             ", ",
             o[1],
@@ -1632,7 +1814,7 @@ def _col2im(args: Values) raises -> Owned:
     if x.rank == 3:
         shape[MAX_RANK - 4] = batch
         rank = 4
-    var out = own(new_tensor(shape, rank, x.stype, x.device))
+    var out = _alloc(dest, shape, rank, x.stype, x.device, [x.copy()])
     if out.t.numel:
         var xc = own_if_new(contiguous(x), x)
         _launch(
@@ -1659,7 +1841,7 @@ def op_col2im(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_col2im_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor(args[unsafe_offset=6])
     check_out(dest, v_tensor(args[unsafe_offset=0]))
-    _store(rets, 0, dest, _col2im(args))
+    _store(rets, 0, dest, _col2im(args, dest.copy()))
 
 
 # Per-rank instantiations, one name per registered overload.

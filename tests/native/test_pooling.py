@@ -377,7 +377,9 @@ def test_adaptive_avg_pool3d(mojo_device, dtype, output_size):
         )
     _close(got_g, want_g, torch.float32)
     out = torch.empty(0, dtype=dtype).to(mojo_device)
-    torch.ops.aten.adaptive_avg_pool3d.out(x.to(mojo_device), list(output_size), out=out)
+    torch.ops.aten.adaptive_avg_pool3d.out(
+        x.to(mojo_device), list(output_size), out=out
+    )
     _close(out, want.to(dtype), dtype)
 
 
@@ -451,7 +453,9 @@ def test_max_unpool2d(mojo_device, dtype):
     _close(got, want.to(dtype), dtype)
     # Unbatched, and the backward (a gather at the indices).
     want_g, got_g = _grad_pair(
-        lambda t: F.max_unpool2d(t, idx[0].to(t.device), (3, 3), (2, 2), (1, 1), (9, 8)),
+        lambda t: F.max_unpool2d(
+            t, idx[0].to(t.device), (3, 3), (2, 2), (1, 1), (9, 8)
+        ),
         pooled[0].float(),
         mojo_device,
     )
@@ -469,9 +473,16 @@ def test_max_unpool1d_3d(mojo_device):
     p3, i3 = F.max_pool3d(x3, 2, return_indices=True)
     with ran("aten::max_unpool3d"):
         got = F.max_unpool3d(
-            p3.to(mojo_device), i3.to(mojo_device), (2, 2, 2), None, (0, 0, 0), (6, 5, 7)
+            p3.to(mojo_device),
+            i3.to(mojo_device),
+            (2, 2, 2),
+            None,
+            (0, 0, 0),
+            (6, 5, 7),
         )
-    torch.testing.assert_close(got.cpu(), F.max_unpool3d(p3, i3, (2, 2, 2), None, (0, 0, 0), (6, 5, 7)))
+    torch.testing.assert_close(
+        got.cpu(), F.max_unpool3d(p3, i3, (2, 2, 2), None, (0, 0, 0), (6, 5, 7))
+    )
     out = torch.empty(0).to(mojo_device)
     torch.ops.aten.max_unpool2d.out(
         p.unsqueeze(2).to(mojo_device), i.unsqueeze(2).to(mojo_device), [1, 16], out=out
@@ -508,12 +519,16 @@ def test_unfold_fold(mojo_device, dtype, kernel, dilation, padding, stride):
     want = F.unfold(x, *args)
     torch.testing.assert_close(got.cpu(), want)
     # Unbatched input keeps no batch dim.
-    torch.testing.assert_close(F.unfold(x[0].to(mojo_device), *args).cpu(), F.unfold(x[0], *args))
+    torch.testing.assert_close(
+        F.unfold(x[0].to(mojo_device), *args).cpu(), F.unfold(x[0], *args)
+    )
     with ran("aten::col2im"):
         folded = F.fold(want.to(mojo_device), (9, 10), *args)
     if dtype == torch.bool:
         # CPU folds bool as a sum cast to bool: "any".
-        torch.testing.assert_close(folded.cpu(), F.fold(want.float(), (9, 10), *args) != 0)
+        torch.testing.assert_close(
+            folded.cpu(), F.fold(want.float(), (9, 10), *args) != 0
+        )
     else:
         _close(folded, F.fold(want.double(), (9, 10), *args).to(dtype), dtype)
 
@@ -527,7 +542,9 @@ def test_unfold_backward_is_fold(mojo_device):
 def test_fold_out_variants_and_errors(mojo_device):
     cols = torch.randn(2, 12, 16)
     out = torch.empty(0).to(mojo_device)
-    torch.ops.aten.col2im.out(cols.to(mojo_device), [5, 5], [2, 2], [1, 1], [0, 0], [1, 1], out=out)
+    torch.ops.aten.col2im.out(
+        cols.to(mojo_device), [5, 5], [2, 2], [1, 1], [0, 0], [1, 1], out=out
+    )
     torch.testing.assert_close(
         out.cpu(), torch.ops.aten.col2im(cols, [5, 5], [2, 2], [1, 1], [0, 0], [1, 1])
     )
@@ -537,3 +554,85 @@ def test_fold_out_variants_and_errors(mojo_device):
         F.fold(torch.randn(2, 12, 15).to(mojo_device), (5, 5), 2)
     with pytest.raises(RuntimeError, match="must be at least one"):
         F.unfold(torch.randn(1, 1, 2, 2).to(mojo_device), 3)
+
+
+# ---------------------------------------------------------------------------
+# out= contract and supplied indices
+# ---------------------------------------------------------------------------
+
+
+def test_out_is_written_in_place_when_it_can_be(mojo_device):
+    """A contiguous, right-shaped out= is computed into directly; a wrongly
+    shaped one is resized; a strided one still gets the right values."""
+    x = torch.randn(2, 3, 8, 8)
+    want = F.avg_pool2d(x, 2)
+    out = torch.empty(2, 3, 4, 4).to(mojo_device)
+    ptr = out.data_ptr()
+    torch.ops.aten.avg_pool2d.out(x.to(mojo_device), [2], out=out)
+    assert out.data_ptr() == ptr
+    torch.testing.assert_close(out.cpu(), want)
+    strided = torch.empty(2, 3, 4, 8).to(mojo_device)[..., ::2]
+    torch.ops.aten.avg_pool2d.out(x.to(mojo_device), [2], out=strided)
+    torch.testing.assert_close(strided.cpu(), want)
+
+
+def test_out_rejects_internal_overlap(mojo_device):
+    x = torch.randn(1, 1, 4, 4).to(mojo_device)
+    out = torch.empty(1).to(mojo_device).expand(1, 1, 2, 2)
+    with pytest.raises(RuntimeError, match="more than one element"):
+        torch.ops.aten.avg_pool2d.out(x, [2], out=out)
+
+
+def test_indices_out_wrong_device_or_dtype(mojo_device):
+    x = torch.randn(1, 1, 4, 4).to(mojo_device)
+    out = torch.empty(0).to(mojo_device)
+    with pytest.raises(RuntimeError, match="Expected out tensor to have device"):
+        torch.ops.aten.max_pool2d_with_indices.out(
+            x, [2], out=out, indices=torch.empty(0, dtype=torch.int64)
+        )
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        torch.ops.aten.adaptive_max_pool2d.out(
+            x, [2, 2], out=out, indices=torch.empty(0).to(mojo_device)
+        )
+
+
+def test_scatter_backwards_take_arbitrary_indices(mojo_device):
+    """The 3-D and adaptive max-pool backwards scatter to whatever index
+    they are given, as torch's CPU and CUDA kernels do."""
+    x = torch.randn(1, 1, 4, 4)
+    g = torch.ones(1, 1, 2, 2)
+    idx = torch.zeros(1, 1, 2, 2, dtype=torch.int64)
+    want = torch.ops.aten.adaptive_max_pool2d_backward(g, x, idx)
+    got = torch.ops.aten.adaptive_max_pool2d_backward(
+        g.to(mojo_device), x.to(mojo_device), idx.to(mojo_device)
+    )
+    torch.testing.assert_close(got.cpu(), want)
+    assert got.cpu()[0, 0, 0, 0] == 4
+    x3 = torch.randn(1, 2, 4, 4, 4)
+    g3 = torch.randn(1, 2, 2, 2, 2).half()
+    idx3 = torch.randint(0, 64, (1, 2, 2, 2, 2))
+    args = ([2] * 3, [2] * 3, [0] * 3, [1] * 3, False)
+    want = torch.ops.aten.max_pool3d_with_indices_backward(g3.float(), x3, *args, idx3)
+    got = torch.ops.aten.max_pool3d_with_indices_backward(
+        g3.to(mojo_device), x3.half().to(mojo_device), *args, idx3.to(mojo_device)
+    )
+    torch.testing.assert_close(got.cpu().float(), want, atol=2e-3, rtol=2e-3)
+
+
+def test_max_unpool_invalid_index_raises(mojo_device):
+    x = torch.randn(1, 1, 2, 2).to(mojo_device)
+    idx = torch.tensor([[[[0, 1], [2, 99]]]]).to(mojo_device)
+    with pytest.raises(RuntimeError, match="Found an invalid max index: 99"):
+        torch.ops.aten.max_unpool2d(x, idx, [4, 4])
+
+
+def test_adaptive_avg_pool3d_rejects_zero_channels(mojo_device):
+    with pytest.raises(RuntimeError, match="non-zero size for non-batch"):
+        torch.ops.aten._adaptive_avg_pool3d(
+            torch.randn(1, 0, 2, 2, 2).to(mojo_device), [1, 1, 1]
+        )
+    # 2-D checks only the spatial dims, like torch.
+    got = torch.ops.aten._adaptive_avg_pool2d(
+        torch.randn(1, 0, 2, 2).to(mojo_device), [1, 1]
+    )
+    assert tuple(got.shape) == (1, 0, 1, 1)

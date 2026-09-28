@@ -15,13 +15,19 @@
 # the window's first in-bounds element. Half inputs accumulate in float32,
 # float64 in float64.
 #
-# Every backward is a deterministic gather: one thread owns one input
-# element and sums the outputs whose window can hold it (the inverse window
-# range per dim), where CUDA scatters with atomics for the 3-D and adaptive
-# cases. No atomics anywhere, so the same code runs on Metal.
+# The average backwards and the 2-D max-pool backward are deterministic
+# gathers: one thread owns one input element and sums the outputs whose
+# window can hold it (the inverse window range per dim). For max pool 2-D
+# that is exactly CUDA's own backward (max_pool_backward_nchw), which also
+# ignores a saved index outside its output's window. The 3-D and adaptive
+# max-pool backwards scatter every grad_output element to its saved index,
+# as CUDA does, so arbitrary indices accumulate like torch's: relaxed
+# float32 (float64) atomics into a zeroed workspace the op casts back.
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.host import DeviceContext
+from std.atomic import Atomic, Ordering
+from std.sys import is_amd_gpu, is_nvidia_gpu
 from std.utils.coord import Coord
 from std.utils.index import IndexList
 from std.utils.numerics import min_or_neg_inf
@@ -255,7 +261,7 @@ def _max_pool[
 
 
 def _max_pool_backward[
-    dtype: DType, adaptive: Bool
+    dtype: DType
 ](
     gin_addr: Int, gout_addr: Int, idx_addr: Int, g: Geom, ctx: DeviceContext
 ) raises:
@@ -272,17 +278,9 @@ def _max_pool_backward[
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
         var x = _split_in(g, i)
-        var rd: Tuple[Int, Int]
-        var rh: Tuple[Int, Int]
-        var rw: Tuple[Int, Int]
-        comptime if adaptive:
-            rd = _adaptive_out_range(g, 0, x[1])
-            rh = _adaptive_out_range(g, 1, x[2])
-            rw = _adaptive_out_range(g, 2, x[3])
-        else:
-            rd = _max_out_range(g, 0, x[1])
-            rh = _max_out_range(g, 1, x[2])
-            rw = _max_out_range(g, 2, x[3])
+        var rd = _max_out_range(g, 0, x[1])
+        var rh = _max_out_range(g, 1, x[2])
+        var rw = _max_out_range(g, 2, x[3])
         var out_h = g[G_OUT + 1]
         var out_w = g[G_OUT + 2]
         var me = Int64((x[1] * g[G_IN + 1] + x[2]) * g[G_IN + 2] + x[3])
@@ -297,6 +295,54 @@ def _max_pool_backward[
         gin_ptr[unsafe_offset=i] = total.cast[dtype]()
 
     _parallel_for_dt[dtype, func](g[G_PLANES] * _in_plane(g), ctx)
+
+
+@always_inline
+def _scope() -> StaticString:
+    comptime if is_nvidia_gpu():
+        return "device"
+    elif is_amd_gpu():
+        return "agent"
+    else:
+        return ""
+
+
+def _max_pool_scatter[
+    dtype: DType
+](
+    ws_addr: Int,
+    gout_addr: Int,
+    idx_addr: Int,
+    count: Int,
+    out_plane: Int,
+    in_plane: Int,
+    ctx: DeviceContext,
+) raises:
+    """ws[plane][indices[i]] += grad_output[i] over every grad_output
+    element, in the accumulate dtype (CUDA's atomic max-pool backwards). An
+    index outside the input plane is skipped rather than written."""
+    comptime acc_t = _acc[dtype]()
+    var ws_ptr = _make_ptr[acc_t](ws_addr)
+    var gout_ptr = _make_ptr[dtype](gout_addr)
+    var idx_ptr = _make_ptr[DType.int64](idx_addr)
+
+    @always_inline
+    @__parameter
+    @__copy_capture(ws_ptr, gout_ptr, idx_ptr, out_plane, in_plane)
+    def func[width: Int, alignment: Int = 1](idx: Coord):
+        var i = Int(idx[0].value())
+        var target = Int(idx_ptr[unsafe_offset=i])
+        if target < 0 or target >= in_plane:
+            return
+        var at = (i // out_plane) * in_plane + target
+        _ = Atomic[Scalar[acc_t], scope=_scope()].fetch_add[
+            ordering=Ordering.RELAXED
+        ](
+            ws_ptr.unsafe_offset(at),
+            gout_ptr[unsafe_offset=i].cast[acc_t](),
+        )
+
+    _parallel_for_dt[dtype, func](count, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -437,8 +483,9 @@ def _avg_pool_backward[
 
 # ---------------------------------------------------------------------------
 # Max unpooling: out (zero-filled by the op) [plane][indices[i]] = in[i].
-# An index outside the output plane is skipped (CUDA device-asserts, the CPU
-# raises); duplicate indices race exactly as on CUDA.
+# An index outside the output plane is not written: the kernel records it in
+# `flag` ([1, index]) and the op raises the CPU's "Found an invalid max
+# index" (CUDA device-asserts). Duplicate indices race exactly as on CUDA.
 # ---------------------------------------------------------------------------
 
 
@@ -451,22 +498,27 @@ def _max_unpool[
     count: Int,
     in_plane: Int,
     out_plane: Int,
+    flag_addr: Int,
     ctx: DeviceContext,
 ) raises:
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
     var idx_ptr = _make_ptr[DType.int64](idx_addr)
+    var flag_ptr = _make_ptr[DType.int64](flag_addr)
 
     @always_inline
     @__parameter
-    @__copy_capture(out_ptr, in_ptr, idx_ptr, in_plane, out_plane)
+    @__copy_capture(out_ptr, in_ptr, idx_ptr, flag_ptr, in_plane, out_plane)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
-        var target = Int(idx_ptr[unsafe_offset=i])
-        if target >= 0 and target < out_plane:
+        var target = idx_ptr[unsafe_offset=i]
+        if target >= 0 and Int(target) < out_plane:
             out_ptr[
-                unsafe_offset=(i // in_plane) * out_plane + target
+                unsafe_offset=(i // in_plane) * out_plane + Int(target)
             ] = in_ptr[unsafe_offset=i]
+        else:
+            flag_ptr[unsafe_offset=1] = target
+            flag_ptr[unsafe_offset=0] = 1
 
     _parallel_for_dt[dtype, func](count, ctx)
 
@@ -586,11 +638,13 @@ def _col2im[
 # ---------------------------------------------------------------------------
 # C entry. Slots per op (pointers are data addresses, offset applied):
 #   MaxPool / AdaptiveMaxPool:          out, indices, input, geom, ctx
-#   MaxPoolBackward / Adaptive...:      grad_in, grad_out, indices, geom, ctx
+#   MaxPoolBackward (2-D gather):       grad_in, grad_out, indices, geom, ctx
+#   MaxPoolScatter:                     workspace, grad_out, indices, count,
+#                                       out_plane, in_plane, ctx
 #   AvgPool / AdaptiveAvgPool:          out, input, geom, ctx
 #   AvgPoolBackward / Adaptive...:      grad_in, grad_out, geom, ctx
 #   MaxUnpool:                          out, input, indices, count,
-#                                       in_plane, out_plane, ctx
+#                                       in_plane, out_plane, flag, ctx
 #   Im2col / Col2im:                    out, input, fold, ctx
 # ---------------------------------------------------------------------------
 
@@ -604,13 +658,23 @@ def _launch[dtype: DType](argv: Argv, argc: Int) raises:
             _geom(argv[unsafe_offset=3]),
             _raw_ctx(argv[unsafe_offset=4]),
         )
-    elif _op_on["MaxPoolBackward"]() or _op_on["AdaptiveMaxPoolBackward"]():
-        _max_pool_backward[dtype, _op_on["AdaptiveMaxPoolBackward"]()](
+    elif _op_on["MaxPoolBackward"]():
+        _max_pool_backward[dtype](
             _raw_int(argv[unsafe_offset=0]),
             _raw_int(argv[unsafe_offset=1]),
             _raw_int(argv[unsafe_offset=2]),
             _geom(argv[unsafe_offset=3]),
             _raw_ctx(argv[unsafe_offset=4]),
+        )
+    elif _op_on["MaxPoolScatter"]():
+        _max_pool_scatter[dtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=1]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_int(argv[unsafe_offset=4]),
+            _raw_int(argv[unsafe_offset=5]),
+            _raw_ctx(argv[unsafe_offset=6]),
         )
     elif _op_on["AvgPool"]() or _op_on["AdaptiveAvgPool"]():
         _avg_pool[dtype, _op_on["AdaptiveAvgPool"]()](
@@ -634,7 +698,8 @@ def _launch[dtype: DType](argv: Argv, argc: Int) raises:
             _raw_int(argv[unsafe_offset=3]),
             _raw_int(argv[unsafe_offset=4]),
             _raw_int(argv[unsafe_offset=5]),
-            _raw_ctx(argv[unsafe_offset=6]),
+            _raw_int(argv[unsafe_offset=6]),
+            _raw_ctx(argv[unsafe_offset=7]),
         )
     else:
         raise Error(NO_OP_COMPILED)

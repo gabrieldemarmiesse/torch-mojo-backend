@@ -214,10 +214,17 @@ def check_out(dest: T, like: T) raises:
     costs no launch, and a float result can never be silently truncated into
     an integer buffer nor copied across devices without ordering.
     """
-    if dest.stype != like.stype:
+    check_out_as(dest, like.stype, like)
+
+
+def check_out_as(dest: T, stype: Int32, like: T) raises:
+    """`check_out` for an `out=` whose dtype is not `like`'s (the int64
+    `indices` of the max pools): `dest` must hold `stype` and live on
+    `like`'s device."""
+    if dest.stype != stype:
         raise Error(
             "Expected out tensor to have dtype ",
-            dtype_name(like.stype),
+            dtype_name(stype),
             ", but got ",
             dtype_name(dest.stype),
             " instead",
