@@ -807,3 +807,121 @@ def test_native_dropout_backward_integral_grad_raises(mojo_gpu, dtype):
         torch.ops.aten.native_dropout_backward(
             grad.to(mojo_gpu), mask.to(mojo_gpu), 1.25
         )
+
+
+# ---------------------------------------------------------------------------
+# eye.out / eye.m_out, linspace.out / logspace.out, tril_indices /
+# triu_indices -- the functional forms are ATen composites that end here.
+# ---------------------------------------------------------------------------
+
+_RANGE_DTYPES = [
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.float64,
+    torch.int64,
+    torch.int32,
+    torch.int8,
+    torch.uint8,
+]
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.int64, torch.bool]
+)
+@pytest.mark.parametrize(("n", "m"), [(3, None), (3, 5), (5, 2), (0, 3), (1, 1)])
+def test_eye(mojo_gpu, dtype, n, m):
+    # torch.eye(n) itself resolves to eye.m_out; eye.out is reached directly.
+    ran = _op_count_delta("aten::eye.m_out")
+    args = (n,) if m is None else (n, m)
+    got = torch.eye(*args, dtype=dtype, device=mojo_gpu)
+    assert ran()
+    assert torch.equal(got.cpu(), torch.eye(*args, dtype=dtype))
+    if m is None:
+        ran_out = _op_count_delta("aten::eye.out")
+        out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+        torch.ops.aten.eye.out(n, out=out)
+        assert ran_out()
+        assert torch.equal(out.cpu(), torch.eye(n, dtype=dtype))
+    # An out= of another layout is written where it lives.
+    out = torch.full((6, 6), 7, dtype=dtype, device=mojo_gpu)[1::2, ::2]
+    torch.eye(3, 3, out=out)
+    assert torch.equal(out.cpu(), torch.eye(3, dtype=dtype))
+
+
+def test_eye_errors(mojo_gpu):
+    with pytest.raises(RuntimeError, match="n must be greater or equal to 0, got -1"):
+        torch.eye(-1, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="m must be greater or equal to 0, got -3"):
+        torch.eye(0, -3, device=mojo_gpu)
+
+
+@pytest.mark.parametrize("dtype", _RANGE_DTYPES)
+@pytest.mark.parametrize(
+    ("start", "end", "steps"),
+    [(0, 1, 5), (-3.7, 11.2, 17), (3, -10, 101), (2, 2, 1), (0, 5, 0), (1.5, 7, 2)],
+)
+def test_linspace(mojo_gpu, dtype, start, end, steps):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    if dtype == torch.uint8 and min(start, end) < 0:
+        pytest.skip("negative endpoints overflow uint8")
+    ran = _op_count_delta("aten::linspace.out")
+    got = torch.linspace(start, end, steps, dtype=dtype, device=mojo_gpu)
+    assert ran()
+    expected = torch.linspace(start, end, steps, dtype=dtype)
+    assert got.dtype == dtype and got.shape == expected.shape
+    torch.testing.assert_close(got.cpu(), expected, atol=1, rtol=0.01)
+    if steps > 1:
+        # Both endpoints are exact (the second half counts down from `end`).
+        assert got.cpu()[0].item() == expected[0].item()
+        assert got.cpu()[-1].item() == expected[-1].item()
+
+
+@pytest.mark.parametrize("dtype", _RANGE_DTYPES)
+@pytest.mark.parametrize(
+    ("start", "end", "steps", "base"),
+    [(0, 1, 5, 10.0), (-2, 3, 11, 2.0), (1, 0.5, 7, 3.0), (2, 2, 1, 10.0)],
+)
+def test_logspace(mojo_gpu, dtype, start, end, steps, base):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    if dtype == torch.uint8 and min(start, end) < 0:
+        pytest.skip("negative endpoints overflow uint8")
+    ran = _op_count_delta("aten::logspace.out")
+    got = torch.logspace(start, end, steps, base=base, dtype=dtype, device=mojo_gpu)
+    assert ran()
+    expected = torch.logspace(start, end, steps, base=base, dtype=dtype)
+    torch.testing.assert_close(got.cpu(), expected, atol=1, rtol=0.01)
+
+
+def test_linspace_out_and_errors(mojo_gpu):
+    out = torch.zeros(10, device=mojo_gpu)[::2]
+    torch.linspace(0, 4, 5, out=out)
+    assert out.cpu().tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    with pytest.raises(RuntimeError, match="number of steps must be non-negative"):
+        torch.linspace(0, 1, -1, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.linspace(0, 1000, 3, dtype=torch.int8, device=mojo_gpu)
+
+
+@pytest.mark.parametrize("upper", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize(
+    ("row", "col", "offset"),
+    [(4, 5, 0), (4, 5, -2), (3, 3, 2), (0, 3, 0), (5, 2, 1), (3, 4, -9)],
+)
+def test_tri_indices(mojo_gpu, upper, dtype, row, col, offset):
+    fn = torch.triu_indices if upper else torch.tril_indices
+    ran = _op_count_delta("aten::triu_indices" if upper else "aten::tril_indices")
+    got = fn(row, col, offset, dtype=dtype, device=mojo_gpu)
+    assert ran()
+    assert got.dtype == dtype
+    assert torch.equal(got.cpu(), fn(row, col, offset, dtype=dtype))
+
+
+def test_tri_indices_errors(mojo_gpu):
+    with pytest.raises(RuntimeError, match="row must be non-negative"):
+        torch.tril_indices(-1, 3, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="col must be non-negative"):
+        torch.triu_indices(3, -1, device=mojo_gpu)

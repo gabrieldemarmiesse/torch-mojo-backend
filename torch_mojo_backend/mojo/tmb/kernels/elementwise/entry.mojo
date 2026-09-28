@@ -32,7 +32,7 @@ from tmb.kernels.common.unary_math import (
 from std.os import abort
 from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
-from std.math import ceildiv
+from std.math import ceildiv, fma
 from std.sys.info import (
     has_accelerator,
     has_apple_gpu_accelerator,
@@ -84,7 +84,7 @@ from tmb.kernels.common.variant_gates import (
 )
 from tmb.kernels.common.div_math import floor_div, trunc_div
 from tmb.kernels.common.math_utils import ieee_sqrt
-from tmb.kernels.common.pow_math import torch_pow
+from tmb.kernels.common.pow_math import powf_c99, torch_pow
 from std.sys.info import _has_sm_9x
 
 
@@ -1696,6 +1696,182 @@ def _arange_dispatcher(argv: Argv, argc: Int) raises:
 
 
 # ---------------------------------------------------------------------------
+# Linspace: aten::linspace.out / aten::logspace.out, the arithmetic of
+# ATen's CUDA kernels (native/cuda/RangeFactories.cu `linspace_cuda_out`,
+# `logspace_cuda_out`): the first `steps / 2` elements count up from
+# `start`, the rest count down from `end`, so both endpoints are exact.
+#
+# The host rounds `start`, `end`, `step` (and `base`) the way ATen does
+# before the launch and passes them as float64 bit patterns, exactly
+# representable in the dtype the kernel computes in:
+#   * float32 / float64: `start + step * i` in the dtype, which nvcc
+#     contracts into one fma (`end - step * n` into fma(-step, n, end));
+#   * float16 / bfloat16: c10::Half / c10::BFloat16 arithmetic, where the
+#     index converts to the half type first and every operator widens to
+#     float and rounds its result back (no fma: each product is rounded);
+#   * integers: a float32 step and float32 arithmetic, truncated on store.
+# logspace raises `base` to that value: float `powf` for every dtype but
+# float64 (c10 half types and ints reach std::pow(float, float)).
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _linspace[
+    dtype: DType
+](
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    start: Float64,
+    end: Float64,
+    step: Float64,
+    steps: Int,
+    base: Float64,
+    is_log: Bool,
+    ctx: DeviceContext,
+) raises:
+    var halfway = steps // 2
+    comptime if dtype == DType.float16 or dtype == DType.bfloat16:
+        var s = start.cast[DType.float32]()
+        var e = end.cast[DType.float32]()
+        var st = step.cast[DType.float32]()
+        var b = base.cast[DType.float32]()
+
+        @always_inline
+        @__parameter
+        @__copy_capture(out_ptr, s, e, st, b, halfway, steps, is_log)
+        def half_fn[width: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            var v: Scalar[dtype]
+            if i < halfway:
+                var k = Scalar[DType.float32](i).cast[dtype]()
+                var p = (st * k.cast[DType.float32]()).cast[dtype]()
+                v = (s + p.cast[DType.float32]()).cast[dtype]()
+            else:
+                var k = Scalar[DType.float32](steps - i - 1).cast[dtype]()
+                var p = (st * k.cast[DType.float32]()).cast[dtype]()
+                v = (e - p.cast[DType.float32]()).cast[dtype]()
+            if is_log:
+                v = powf_c99(b, v.cast[DType.float32]()).cast[dtype]()
+            out_ptr[unsafe_offset=i] = v
+
+        comptime if has_accelerator():
+            elementwise[half_fn, simd_width=1, target="gpu"](Coord(steps), ctx)
+        else:
+            raise Error("no GPU accelerator available at compile time")
+    elif dtype == DType.float32:
+        var s = start.cast[DType.float32]()
+        var e = end.cast[DType.float32]()
+        var st = step.cast[DType.float32]()
+        var b = base.cast[DType.float32]()
+
+        @always_inline
+        @__parameter
+        @__copy_capture(out_ptr, s, e, st, b, halfway, steps, is_log)
+        def f32_fn[width: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            var v: Float32
+            if i < halfway:
+                v = fma(st, Float32(i), s)
+            else:
+                v = fma(-st, Float32(steps - i - 1), e)
+            if is_log:
+                v = powf_c99(b, v)
+            out_ptr[unsafe_offset=i] = v.cast[dtype]()
+
+        comptime if has_accelerator():
+            elementwise[f32_fn, simd_width=1, target="gpu"](Coord(steps), ctx)
+        else:
+            raise Error("no GPU accelerator available at compile time")
+    elif dtype == DType.float64:
+
+        @always_inline
+        @__parameter
+        @__copy_capture(out_ptr, start, end, step, base, halfway, steps, is_log)
+        def f64_fn[width: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            var v: Float64
+            if i < halfway:
+                v = fma(step, Float64(i), start)
+            else:
+                v = fma(-step, Float64(steps - i - 1), end)
+            if is_log:
+                v = torch_pow[DType.float64, 1](base, v)
+            out_ptr[unsafe_offset=i] = v.cast[dtype]()
+
+        comptime if has_apple_gpu_accelerator():
+            raise Error("float64 is not supported on Apple GPU")
+        elif has_accelerator():
+            elementwise[f64_fn, simd_width=1, target="gpu"](Coord(steps), ctx)
+        else:
+            raise Error("no GPU accelerator available at compile time")
+    else:
+        var s = start.cast[DType.float32]()
+        var e = end.cast[DType.float32]()
+        var st = step.cast[DType.float32]()
+        var b = base.cast[DType.float32]()
+
+        @always_inline
+        @__parameter
+        @__copy_capture(out_ptr, s, e, st, b, halfway, steps, is_log)
+        def int_fn[width: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            var v: Float32
+            if i < halfway:
+                v = fma(st, Float32(i), s)
+            else:
+                v = fma(-st, Float32(steps - i - 1), e)
+            if is_log:
+                v = powf_c99(b, v)
+            out_ptr[unsafe_offset=i] = v.cast[dtype]()
+
+        comptime if has_accelerator():
+            elementwise[int_fn, simd_width=1, target="gpu"](Coord(steps), ctx)
+        else:
+            raise Error("no GPU accelerator available at compile time")
+
+
+def _linspace_dispatcher(argv: Argv, argc: Int) raises:
+    """Linspace(out_ptr, start_f64, end_f64, step_f64, steps, base_f64,
+    is_log, dtype, ctx_ptr)."""
+    var args = argv
+    var out_addr = _raw_int(args[unsafe_offset=0])
+    var start = _raw_f64(args[unsafe_offset=1])
+    var end = _raw_f64(args[unsafe_offset=2])
+    var step = _raw_f64(args[unsafe_offset=3])
+    var steps = _raw_int(args[unsafe_offset=4])
+    var base = _raw_f64(args[unsafe_offset=5])
+    var is_log = _raw_int(args[unsafe_offset=6]) != 0
+    var dtype = _raw_dtype_int(args[unsafe_offset=7])
+    var ctx = _raw_ctx(args[unsafe_offset=8])
+    var handled = False
+    comptime for dt in [
+        DType.float32,
+        DType.float16,
+        DType.bfloat16,
+        DType.float64,
+        DType.int64,
+        DType.int32,
+        DType.int16,
+        DType.int8,
+        DType.uint8,
+    ]:
+        comptime if _dtype_out_on[0, dt]():
+            if dtype == dt:
+                _linspace[dt](
+                    _make_ptr[dt](out_addr),
+                    start,
+                    end,
+                    step,
+                    steps,
+                    base,
+                    is_log,
+                    ctx,
+                )
+                handled = True
+    if not handled:
+        raise Error("unsupported dtype for linspace: ", dtype)
+
+
+# ---------------------------------------------------------------------------
 # TensorSpec entries (agents_docs/tensor_spec_design.md): the whole op prologue —
 # input checks, output alloc, kernel launch — in one boundary call over
 # cached TensorSpecs, reusing the contiguous kernels above. Failed checks
@@ -2239,6 +2415,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["Arange"]():
             _arange_dispatcher(argv, argc)
+            return 0
+        comptime if _op_on["Linspace"]():
+            _linspace_dispatcher(argv, argc)
             return 0
         raise Error(NO_OP_COMPILED)
     except e:
