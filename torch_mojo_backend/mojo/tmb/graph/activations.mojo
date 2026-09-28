@@ -1,6 +1,12 @@
 import std.math as math
 import extensibility as compiler
-from extensibility import ElementwiseBinaryOp
+from extensibility import ElementwiseBinaryOp, InputTensor, OutputTensor
+from max.gpu.host import DeviceContext
+from std.sys.info import size_of
+from std.utils.coord import Coord
+
+from tmb.kernels.common.gpu_elementwise import elementwise
+from tmb.kernels.common.pointwise_math import param_dtype, pointwise
 
 
 @compiler.register("gelu_backward")
@@ -81,3 +87,55 @@ struct GeluBackwardTanhKernel(ElementwiseBinaryOp):
 
         # Total gradient
         return grad_out * (left_derivative + right_derivative)
+
+
+@compiler.register("native_glu_backward_b")
+struct NativeGluBackwardB:
+    """glu_backward's second gradient half, `(1 - sigmoid(b)) * sigmoid(b) *
+    grad * a`: the mojo device's own `glu_backward_b` pointwise kind over
+    three flat operands of one shape (the elementwise traits stop at two
+    inputs, so this is a plain custom op launching the shared launcher)."""
+
+    @staticmethod
+    def execute[
+        dtype: DType, //, target: StaticString
+    ](
+        output: OutputTensor[dtype=dtype, rank=1, ...],
+        grad: InputTensor[dtype=dtype, rank=1, ...],
+        a: InputTensor[dtype=dtype, rank=1, ...],
+        b: InputTensor[dtype=dtype, rank=1, ...],
+        ctx: DeviceContext,
+    ) raises:
+        comptime if target == "gpu":
+            var numel = output.dim_size(0)
+            if numel == 0:
+                return
+            var out_ptr = output.unsafe_ptr()
+            var g_ptr = grad.unsafe_ptr()
+            var a_ptr = a.unsafe_ptr()
+            var b_ptr = b.unsafe_ptr()
+
+            @always_inline
+            @__parameter
+            @__copy_capture(out_ptr, g_ptr, a_ptr, b_ptr)
+            def func[w: Int, alignment: Int = 1](idx: Coord):
+                var i = Int(idx[0].value())
+                out_ptr.store[width=w](
+                    i,
+                    pointwise["glu_backward_b", dtype, dtype, w](
+                        g_ptr.load[width=w](i),
+                        a_ptr.load[width=w](i),
+                        b_ptr.load[width=w](i),
+                        SIMD[param_dtype[dtype](), 4](0),
+                    ),
+                )
+
+            elementwise[
+                func,
+                simd_width=16 // size_of[dtype](),
+                target="gpu",
+                _trace_description="glu_backward_b",
+                _heavy=True,
+            ](Coord(numel), ctx)
+        else:
+            raise Error("native_glu_backward_b runs on an accelerator only")

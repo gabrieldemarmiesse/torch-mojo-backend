@@ -2075,6 +2075,10 @@ def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
         assert_no_internal_overlap(gi)
         if not gi.same_shape(self):
             resize_out(gi, self.shape, self.rank)
+        # TensorIterator's at::assert_no_partial_overlap against both inputs
+        # (`self=base[:8], grad_input=base[1:]` raises, as on CUDA).
+        _b_no_partial_overlap(gi, self)
+        _b_no_partial_overlap(gi, grad)
     var held = own(gi.copy())
     held.live = fresh  # a caller's grad_input is not ours to release
     var gi_a = own(_glu_half(gi, d, False))

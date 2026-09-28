@@ -3421,6 +3421,7 @@ def aten_gelu_backward(
 def aten_glu(input: MaxTensor, dim: int = -1) -> MaxTensor:
     """a * sigmoid(b) over the two halves along `dim`, one fused pointwise
     op (ActivationGluKernel.cu's glu_kernel, halves computed in float)."""
+    _glu_check_floating(input, "glu_cuda")
     a, b = _glu_halves(input, dim)
     return custom_mojo_ops.pointwise_binary(a, b, "glu")
 
@@ -3428,28 +3429,47 @@ def aten_glu(input: MaxTensor, dim: int = -1) -> MaxTensor:
 # glu_backward(Tensor grad_output, Tensor self, int dim) -> Tensor
 @map_to(aten.glu_backward)
 def aten_glu_backward(grad_output: MaxTensor, input: MaxTensor, dim: int) -> MaxTensor:
-    """glu_backward_kernel: sigmoid(b) * grad for the first half -- the
-    native kernel's own `glu_backward_a` kind -- and (1 - sigmoid(b)) *
-    sigmoid(b) * grad * a for the second, in opmath (float for the half
-    types), concatenated along `dim`.
-
-    The second half is a MAX composition rather than the native
-    `glu_backward_b` kind: it reads three operands, and MAX 26.5's
-    extensibility has no ternary elementwise trait (only Unary / Binary), so
-    reusing it would take a hand-launched custom op of its own.
-    """
+    """glu_backward_kernel, both halves on the mojo device's own pointwise
+    kinds: `glu_backward_a` (sigmoid(b) * grad) and `glu_backward_b` ((1 -
+    sigmoid(b)) * sigmoid(b) * grad * a, a three-operand custom op),
+    concatenated along `dim`."""
     if grad_output.dtype != input.dtype:
-        raise TypeError(f"Found dtype {grad_output.dtype} but expected {input.dtype}")
+        raise RuntimeError(
+            f"Found dtype {_scalar_type_name(grad_output.dtype)} but expected "
+            f"{_scalar_type_name(input.dtype)}"
+        )
+    _glu_check_floating(input, "glu_backward_cuda")
     a, b = _glu_halves(input, dim)
     grad_a = custom_mojo_ops.pointwise_binary(grad_output, b, "glu_backward_a")
-    wide = input.dtype in (DType.float16, DType.bfloat16)
-    if wide:
-        a, b, grad_output = (F.cast(x, DType.float32) for x in (a, b, grad_output))
-    sig = custom_mojo_ops.elementwise(b, "sigmoid")
-    grad_b = (1 - sig) * sig * grad_output * a
-    if wide:
-        grad_b = F.cast(grad_b, input.dtype)
+    shape = grad_output.shape
+    flat = [F.reshape(x, [-1]) for x in (grad_output, a, b)]
+    grad_b = F.reshape(custom_mojo_ops.native_glu_backward_b(*flat), shape)
     return F.concat([grad_a, grad_b], axis=dim)
+
+
+def _scalar_type_name(dtype: DType) -> str:
+    """How ATen names a ScalarType in its messages (`Long`, `Half`, ...)."""
+    return {
+        DType.float64: "Double",
+        DType.float32: "Float",
+        DType.float16: "Half",
+        DType.bfloat16: "BFloat16",
+        DType.int64: "Long",
+        DType.int32: "Int",
+        DType.int16: "Short",
+        DType.int8: "Char",
+        DType.uint8: "Byte",
+        DType.bool: "Bool",
+    }.get(dtype, str(dtype))
+
+
+def _glu_check_floating(input: MaxTensor, kernel: str):
+    """AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16): anything else raises
+    `"<kernel>" not implemented for '<type>'`."""
+    if input.dtype not in (DType.float64, DType.float32, DType.float16, DType.bfloat16):
+        raise RuntimeError(
+            f"\"{kernel}\" not implemented for '{_scalar_type_name(input.dtype)}'"
+        )
 
 
 def _glu_halves(input: MaxTensor, dim: int) -> tuple[MaxTensor, MaxTensor]:

@@ -2761,6 +2761,27 @@ def test_aten_glu(conf: Conf, call_checker: CallChecker, dtype: torch.dtype, dim
     check_outputs(fn, conf, [x], **tol)
 
 
+def test_aten_glu_integer_raises():
+    x = MaxEagerTensor.from_dlpack(torch.arange(8).reshape(2, 4))
+    with pytest.raises(RuntimeError, match="\"glu_cuda\" not implemented for 'Long'"):
+        aten_functions.aten_glu(x, -1)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_aten_glu_backward_dtypes(
+    conf: Conf, call_checker: CallChecker, dtype: torch.dtype
+):
+    call_checker.register(aten_functions.aten_glu_backward)
+
+    def fn(grad, x):
+        return aten.glu_backward(grad, x, -1)
+
+    x = (torch.randn(3, 5, 8) * 3).to(dtype)
+    grad = torch.randn(3, 5, 4).to(dtype)
+    tol = {"atol": 2e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {}
+    check_outputs(fn, conf, [grad, x], **tol)
+
+
 @pytest.mark.parametrize("dim", [0, 1])
 def test_aten_glu_backward(conf: Conf, call_checker: CallChecker, dim: int):
     call_checker.register(aten_functions.aten_glu_backward)

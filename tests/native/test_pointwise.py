@@ -1287,6 +1287,13 @@ def test_glu_errors(mojo_gpu):
         F.glu(torch.randn(3, 4).to(mojo_gpu), 2)
 
 
+def test_glu_backward_grad_input_partial_overlap_raises(mojo_gpu):
+    base = torch.randn(9).to(mojo_gpu)
+    grad = torch.randn(4).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.ops.aten.glu_backward.grad_input(grad, base[:8], 0, grad_input=base[1:])
+
+
 def test_glu_backward_dtype_mismatch_raises(mojo_gpu):
     x = torch.randn(4, 6).to(mojo_gpu)
     grad = torch.randn(4, 3, dtype=torch.float16).to(mojo_gpu)

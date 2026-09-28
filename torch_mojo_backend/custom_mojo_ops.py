@@ -427,6 +427,18 @@ def native_softmax_rows(x: MaxTensor) -> MaxTensor:
     )[0]
 
 
+def native_glu_backward_b(grad: MaxTensor, a: MaxTensor, b: MaxTensor) -> MaxTensor:
+    """glu_backward's second gradient half over three flat operands of one
+    shape: the eager `glu_backward_b` pointwise kind (tmb/graph/activations)."""
+    return F.custom(
+        name="native_glu_backward_b",
+        device=grad.device,
+        values=[grad, a, b],
+        out_types=[TensorType(dtype=grad.dtype, shape=grad.shape, device=grad.device)],
+        custom_extensions=compiler.kernel_extension_paths(),
+    )[0]
+
+
 def native_layer_norm(
     x: MaxTensor, weight: MaxTensor, bias: MaxTensor, eps: float
 ) -> tuple[MaxTensor, MaxTensor, MaxTensor]:
