@@ -45,6 +45,7 @@ from tmb.backend.abi import (
     dtype_name,
     index_error,
     max_dtype,
+    new_like,
     new_scalar,
     new_tensor,
     own,
@@ -2122,24 +2123,34 @@ def op_norm_dtype_out(
 def op_cumsum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
-    if a.numel == 0 or a.rank == 0:
-        unsupported("cumsum of an empty or rank-0 tensor")
     # CUDA uses block prefix sums; HIP and Metal use the portable per-line
     # route. Half dtypes and rank-2 dim 0 are validated on all three APIs.
     # Preserve the CPU device's existing trailing-dimension surface.
     var fast_ok = dev(a.device)[].api != "cpu"
+    # An empty or rank-0 operand needs no scan at all -- torch still wraps
+    # dim (0-d as if it were 1-d of size 1) and applies the usual dtype=
+    # / bool-int64 promotion, but the "result" is just that cast, so it is
+    # not limited to `_is_cumsum_dtype` (the CumsumSpec kernel's dtype set):
+    # any `is_cast_dtype` target (e.g. float64) is fine here.
+    var trivial = a.numel == 0 or a.rank == 0
     var src = _borrow(a)
     var want = _opt_dtype(args[unsafe_offset=2])
     if want >= 0:
-        if not _is_cumsum_dtype(max_dtype(want), fast_ok):
+        if not trivial and not _is_cumsum_dtype(max_dtype(want), fast_ok):
             unsupported("cumsum with dtype=" + String(max_dtype(want)))
         _promote(src, want)
     elif not src.t.dtype.is_floating_point():
         # torch promotes bool / sub-int64 integer cumsum to int64.
         _promote(src, ST_INT64)
+    var dim = _norm_dim(v_int(args[unsafe_offset=1]), src.t.rank)
+    if trivial:
+        var out = own(new_like(src.t))
+        copy_strided_into(out.t, src.t)
+        ret_owned(rets, 0, out)
+        _ = src^
+        return
     if not _is_cumsum_dtype(src.t.dtype, fast_ok):
         unsupported("cumsum of dtype " + String(src.t.dtype))
-    var dim = _norm_dim(v_int(args[unsafe_offset=1]), src.t.rank)
     var rank = src.t.rank
     if dim != rank - 1 and not (fast_ok and rank == 2 and dim == 0):
         unsupported(

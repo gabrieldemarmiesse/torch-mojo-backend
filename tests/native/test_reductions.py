@@ -3350,6 +3350,125 @@ def test_cumsum_declines_middle_dim_on_rank3(mojo_gpu):
 
 
 # ---------------------------------------------------------------------------
+# cumsum: rank-0 and empty operands. Neither needs an actual scan: torch
+# still wraps dim (0-d as 1-d of size 1) and applies dtype=/bool-int64
+# promotion, and the "result" is just that cast, so it isn't limited to the
+# CumsumSpec kernel's own dtype set or to a trailing dim.
+# ---------------------------------------------------------------------------
+
+_CUMSUM_TRIVIAL_DTYPES = [
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.float64,
+    torch.int32,
+    torch.int64,
+    torch.bool,
+    torch.uint8,
+]
+
+
+def _cumsum_promoted_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype in (torch.bool, torch.uint8, torch.int32):
+        return torch.int64
+    return dtype
+
+
+def _cumsum_trivial_input(dtype: torch.dtype, shape: tuple[int, ...]) -> torch.Tensor:
+    if dtype == torch.bool:
+        return torch.randint(0, 2, shape, dtype=dtype)
+    if dtype in (torch.int32, torch.int64, torch.uint8):
+        return torch.randint(0, 50, shape, dtype=dtype)
+    return torch.randn(shape).to(dtype)
+
+
+@pytest.mark.parametrize("dtype", _CUMSUM_TRIVIAL_DTYPES)
+@pytest.mark.parametrize("dim", [0, -1])
+def test_cumsum_rank0_matches_cpu(mojo_gpu, dim, dtype):
+    """Unlike the real scan, the trivial (self already the right dtype, no
+    dtype= cast needed) path is `copy_strided_into`, an itemsize-only
+    byte copy with no float64 arithmetic -- it works on Apple GPUs too,
+    unlike an actual cast (see `test_cumsum_rank0_dtype_kwarg` below)."""
+    x = _cumsum_trivial_input(dtype, ())
+    result = torch.cumsum(x.to(mojo_gpu), dim=dim)
+    expected = torch.cumsum(x, dim=dim)
+    assert result.shape == expected.shape == ()
+    assert result.dtype == expected.dtype == _cumsum_promoted_dtype(dtype)
+    torch.testing.assert_close(result.cpu(), expected)
+
+
+def test_cumsum_rank0_result_is_not_a_view(mojo_gpu):
+    """torch's cumsum always returns a fresh tensor, even for a 0-d input."""
+    x = torch.tensor(5.0)
+    result = torch.cumsum(x.to(mojo_gpu), dim=0)
+    result.add_(1.0)
+    assert x.item() == 5.0
+
+
+def test_cumsum_rank0_out_of_range_dim_declines(mojo_gpu):
+    x = torch.tensor(3.5)
+    with pytest.raises(IndexError):
+        torch.cumsum(x, dim=1)
+    with pytest.raises((IndexError, NotImplementedError)):
+        torch.cumsum(x.to(mojo_gpu), dim=1)
+
+
+def test_cumsum_rank0_dtype_kwarg(mojo_gpu):
+    x = torch.tensor(3.5)
+    if is_metal(mojo_gpu):
+        with pytest.raises(NotImplementedError):
+            torch.cumsum(x.to(mojo_gpu), dim=0, dtype=torch.float64)
+    else:
+        result = torch.cumsum(x.to(mojo_gpu), dim=0, dtype=torch.float64)
+        expected = torch.cumsum(x, dim=0, dtype=torch.float64)
+        assert result.dtype == torch.float64
+        torch.testing.assert_close(result.cpu(), expected)
+
+    y = torch.tensor(7, dtype=torch.int64)
+    result = torch.cumsum(y.to(mojo_gpu), dim=0, dtype=torch.int32)
+    expected = torch.cumsum(y, dim=0, dtype=torch.int32)
+    assert result.dtype == torch.int32
+    torch.testing.assert_close(result.cpu(), expected)
+
+
+_CUMSUM_EMPTY_SHAPES = [(0,), (3, 0), (0, 3)]
+
+
+@pytest.mark.parametrize("shape", _CUMSUM_EMPTY_SHAPES)
+@pytest.mark.parametrize("dtype", _CUMSUM_TRIVIAL_DTYPES)
+def test_cumsum_empty_matches_cpu(mojo_gpu, shape, dtype):
+    """Same byte-copy trivial path as `test_cumsum_rank0_matches_cpu` above,
+    so float64 works on Apple GPUs here too (numel==0 anyway, but the dtype
+    still has to round-trip through the tensor's metadata)."""
+    x = _cumsum_trivial_input(dtype, shape)
+    for dim in range(len(shape)):
+        result = torch.cumsum(x.to(mojo_gpu), dim=dim)
+        expected = torch.cumsum(x, dim=dim)
+        assert result.shape == expected.shape == shape
+        assert result.dtype == expected.dtype == _cumsum_promoted_dtype(dtype)
+        assert result.numel() == 0
+        assert result.cpu().shape == expected.shape
+
+
+@pytest.mark.parametrize("shape", _CUMSUM_EMPTY_SHAPES)
+def test_cumsum_empty_out_of_range_dim_declines(mojo_gpu, shape):
+    x = torch.randn(shape)
+    bad_dim = len(shape)
+    with pytest.raises(IndexError):
+        torch.cumsum(x, dim=bad_dim)
+    with pytest.raises((IndexError, NotImplementedError)):
+        torch.cumsum(x.to(mojo_gpu), dim=bad_dim)
+
+
+def test_cumsum_empty_dtype_kwarg(mojo_gpu):
+    x = torch.randn(3, 0, dtype=torch.float32)
+    result = torch.cumsum(x.to(mojo_gpu), dim=0, dtype=torch.int32)
+    expected = torch.cumsum(x, dim=0, dtype=torch.int32)
+    assert result.dtype == expected.dtype == torch.int32
+    assert result.shape == expected.shape == (3, 0)
+
+
+# ---------------------------------------------------------------------------
 # declines and dispatch
 # ---------------------------------------------------------------------------
 
