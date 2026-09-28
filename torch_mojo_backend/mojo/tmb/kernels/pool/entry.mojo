@@ -23,8 +23,9 @@
 # max-pool backwards scatter every grad_output element to its saved index,
 # as CUDA does, so arbitrary indices accumulate like torch's, with atomics
 # in the tensor's own dtype (CUDA's atomicAdd: a half accumulator rounds on
-# every add; 16-bit adds are a 32-bit compare-and-swap loop, which Metal has
-# too). The average backwards reproduce CUDA's per-kernel rounding (see
+# every add; 16-bit adds are a compare-and-swap loop on the 32-bit word
+# that holds them, or on Metal, where that loop never completes, on a
+# float32 word per element that the op casts back). The average backwards reproduce CUDA's per-kernel rounding (see
 # `_avg_pool_backward`).
 # ===----------------------------------------------------------------------=== #
 
@@ -32,13 +33,17 @@ from max.gpu.host import DeviceContext
 from std.atomic import Atomic, Ordering
 from std.memory import bitcast
 from std.sys import is_amd_gpu, is_nvidia_gpu, size_of
+from std.sys.info import has_apple_gpu_accelerator
 from std.utils.coord import Coord
 from std.utils.index import IndexList
 from std.utils.numerics import min_or_neg_inf
 
+from max.gpu import block_idx, grid_dim, thread_idx
+
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
+    _enqueue_cached,
     _make_ptr,
     _parallel_for_dt,
     _raw_ctx,
@@ -324,14 +329,17 @@ def _scope() -> StaticString:
 
 
 @always_inline
-def _atomic_add[dtype: DType](addr: Int, value: Scalar[dtype]):
-    """Relaxed `*addr += value` rounded in `dtype`, as CUDA's atomicAdd.
+def _atomic_add[
+    dtype: DType
+](ptr: Pointer[Scalar[dtype], MutAnyOrigin], value: Scalar[dtype]):
+    """Relaxed `*ptr += value` rounded in `dtype`, as CUDA's atomicAdd.
 
-    A 16-bit dtype has no portable atomic add (Metal has none at all), so it
-    swaps the aligned 32-bit word that holds it: the other half of the word
-    is carried over unchanged, and a concurrent update of it only makes the
-    swap retry."""
+    A 16-bit dtype (NVIDIA / AMD; Metal takes `_metal_half`'s float32 words
+    instead) swaps the aligned 32-bit word that holds it: the other half of
+    the word is carried over unchanged, and a concurrent update of it only
+    makes the swap retry."""
     comptime if size_of[Scalar[dtype]]() == 2:
+        var addr = Int(ptr)
         var word = Pointer[UInt32, MutAnyOrigin](unsafe_from_address=addr & ~3)
         var shift = UInt32((addr & 2) * 8)
         var expected = word[]
@@ -353,7 +361,63 @@ def _atomic_add[dtype: DType](addr: Int, value: Scalar[dtype]):
     else:
         _ = Atomic[Scalar[dtype], scope=_scope()].fetch_add[
             ordering=Ordering.RELAXED
-        ](Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=addr), value)
+        ](ptr, value)
+
+
+@always_inline
+def _metal_half[dtype: DType]() -> Bool:
+    """Whether the scatter goes through a float32 word per element: a 16-bit
+    dtype on an Apple GPU (Metal has no 16-bit atomics, and the 32-bit-word
+    swap of `_atomic_add` never completes there)."""
+    return has_apple_gpu_accelerator() and size_of[Scalar[dtype]]() == 2
+
+
+comptime SCATTER_BLOCK = 256
+
+
+@__name("max_pool_bwd_scatter_" + String(dtype))
+def _max_pool_scatter_kernel[
+    dtype: DType, storage: DType
+](
+    gin: Pointer[Scalar[storage], MutAnyOrigin],
+    gout: Pointer[Scalar[dtype], MutAnyOrigin],
+    indices: Pointer[Int64, MutAnyOrigin],
+    count: Int64,
+    out_plane: Int64,
+    in_plane: Int64,
+):
+    """A grid-stride kernel, not an elementwise closure: Metal's compiler
+    rejects atomics in the closure form (the ROI scatters launch the same
+    way)."""
+    var i = Int(block_idx.x) * SCATTER_BLOCK + Int(thread_idx.x)
+    var step = Int(grid_dim.x) * SCATTER_BLOCK
+    while i < Int(count):
+        var target = indices[unsafe_offset=i]
+        if target >= 0 and target < in_plane:
+            var at = (i // Int(out_plane)) * Int(in_plane) + Int(target)
+            var value = gout[unsafe_offset=i]
+            comptime if storage != dtype:
+                # One float32 word per half value, rounded to the half dtype
+                # on every add.
+                var word = gin.unsafe_offset(at)
+                var add = value.cast[storage]()
+                var expected = Scalar[storage](0)
+                while True:
+                    var desired = (expected + add).cast[dtype]().cast[storage]()
+                    if Atomic[Scalar[storage]].compare_exchange[
+                        success_ordering=Ordering.RELAXED,
+                        failure_ordering=Ordering.RELAXED,
+                        weak=True,
+                    ](word, expected, desired):
+                        break
+            else:
+                _atomic_add[dtype](
+                    rebind[Pointer[Scalar[dtype], MutAnyOrigin]](
+                        gin.unsafe_offset(at)
+                    ),
+                    value,
+                )
+        i += step
 
 
 def _max_pool_scatter[
@@ -370,25 +434,24 @@ def _max_pool_scatter[
     """gin[plane][indices[i]] += grad_output[i] over every grad_output
     element into the zeroed `gin`, atomically in `dtype` (CUDA's atomic
     max-pool backwards). An index outside the input plane is skipped rather
-    than written."""
-    var gout_ptr = _make_ptr[dtype](gout_addr)
-    var idx_ptr = _make_ptr[DType.int64](idx_addr)
-    comptime item_bytes = size_of[Scalar[dtype]]()
-
-    @always_inline
-    @__parameter
-    @__copy_capture(gin_addr, gout_ptr, idx_ptr, out_plane, in_plane)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        var target = Int(idx_ptr[unsafe_offset=i])
-        if target < 0 or target >= in_plane:
-            return
-        var at = (i // out_plane) * in_plane + target
-        _atomic_add[dtype](
-            gin_addr + at * item_bytes, gout_ptr[unsafe_offset=i]
-        )
-
-    _parallel_for_dt[dtype, func](count, ctx)
+    than written. Under `_metal_half`, `gin` is a zeroed float32 buffer, each
+    word holding one `dtype` value, rounded to `dtype` on every add (the
+    ROI kernels' Metal scatter)."""
+    comptime storage = DType.float32 if _metal_half[dtype]() else dtype
+    var blocks = min((count + SCATTER_BLOCK - 1) // SCATTER_BLOCK, 65535)
+    _enqueue_cached[_max_pool_scatter_kernel[dtype, storage]](
+        ctx,
+        blocks,
+        1,
+        1,
+        SCATTER_BLOCK,
+        Pointer[Scalar[storage], MutAnyOrigin](unsafe_from_address=gin_addr),
+        Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=gout_addr),
+        Pointer[Int64, MutAnyOrigin](unsafe_from_address=idx_addr),
+        Int64(count),
+        Int64(out_plane),
+        Int64(in_plane),
+    )
 
 
 # ---------------------------------------------------------------------------

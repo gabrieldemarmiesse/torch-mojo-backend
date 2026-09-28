@@ -19,6 +19,7 @@ from std.utils import IndexList
 from tmb.backend.abi import (
     IntList,
     Owned,
+    ST_FLOAT32,
     ST_INT64,
     T,
     Values,
@@ -40,6 +41,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     assert_no_internal_overlap,
+    cast_into,
     check_out,
     check_out_as,
     contiguous,
@@ -769,10 +771,26 @@ def _scatter_backward(
         return
     var gc = own_if_new(contiguous(_fresh(grad)), grad)
     var ic = own_if_new(contiguous(_fresh(indices)), indices)
+    # Metal has no 16-bit atomics: a half gin accumulates in a float32 word
+    # per element (each add still rounded to the half dtype; see the
+    # kernel's `_metal_half`), cast back once.
+    var metal_half = (
+        x.dtype == DType.float16 or x.dtype == DType.bfloat16
+    ) and dev(x.device)[].api == "metal"
+    var ws = own(
+        new_tensor(
+            gin.shape if metal_half else IndexList[MAX_RANK](1),
+            gin.rank if metal_half else 1,
+            ST_FLOAT32,
+            x.device,
+        )
+    )  # a placeholder word unless `metal_half`
+    if metal_half:
+        fill_value(ws.t, 0.0)
     var ctx = ctx_for(x.device)
     var call = KernelCall("pool", "MaxPoolScatter")
     call.arg_dtype(0, x.dtype)
-    call.int(gin.ptr)
+    call.int(ws.t.ptr if metal_half else gin.ptr)
     call.int(gc.t.ptr)
     call.int(ic.t.ptr)
     call.int(grad.numel)
@@ -783,6 +801,9 @@ def _scatter_backward(
     _ = ctx
     _ = gc^
     _ = ic^
+    if metal_half:
+        cast_into(gin, ws.t)
+    _ = ws^
 
 
 # ---------------------------------------------------------------------------
