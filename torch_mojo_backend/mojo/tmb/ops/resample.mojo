@@ -46,6 +46,7 @@ from tmb.ops.common import (
     assert_no_internal_overlap,
     assert_no_overlap,
     check_out,
+    fill_value,
     same_view,
     shares_storage,
     contiguous,
@@ -369,25 +370,30 @@ def _run_upsample[
 
 def _is_identity[
     MODE: Int, RANK: Int, BACKWARD: Bool
-](in_dims: List[Int], out_dims: List[Int]) -> Bool:
-    """CUDA's unchanged-size copy, per kernel: the host-side `copy_` of
-    upsample_nearest2d / _upsample_nearest_exact2d / upsample_bilinear2d
-    (forward and backward), the in-kernel "just copy" of the linear 1-d,
-    trilinear and bicubic kernels, and the antialiased backward's. The
-    nearest 1-d / 3-d kernels and the antialiased forward have none (an
-    explicit scale still moves their source index)."""
-    comptime if (
-        MODE == CUBIC
-        or MODE == LINEAR
-        or (MODE <= NEAREST_EXACT and RANK == 2)
-        or (MODE == BILINEAR_AA and BACKWARD)
-    ):
+](in_dims: List[Int], out_dims: List[Int], scales: List[Float64]) -> Bool:
+    """Whether CUDA copies the input unchanged, per kernel: the host-side
+    `copy_` of upsample_nearest2d / _upsample_nearest_exact2d /
+    upsample_bilinear2d (forward and backward), the in-kernel "just copy" of
+    the linear 1-d, trilinear and bicubic kernels, and the antialiased
+    backward's. The nearest 1-d / 3-d kernels have no shortcut, but at an
+    unchanged size with a unit scale their source index is the identity.
+    The antialiased forward has none."""
+    for k in range(RANK):
+        if in_dims[2 + k] != out_dims[2 + k]:
+            return False
+    comptime if MODE <= NEAREST_EXACT and RANK != 2:
         for k in range(RANK):
-            if in_dims[2 + k] != out_dims[2 + k]:
+            var n = in_dims[2 + k]
+            if (
+                _kernel_scale[MODE, BACKWARD](n, n, False, scales[k], False)
+                != 1.0
+            ):
                 return False
         return True
+    elif MODE == BILINEAR_AA:
+        return BACKWARD
     else:
-        return False
+        return True
 
 
 def op_upsample[
@@ -421,7 +427,7 @@ def op_upsample[
         )
     if not _up_dtype_ok[MODE](a):
         unsupported(String(name, ": dtype ", a.dtype))
-    var identity = _is_identity[MODE, RANK, False](in_dims, out_dims)
+    var identity = _is_identity[MODE, RANK, False](in_dims, out_dims, scales)
     var dst: T
     var how = DIRECT
     comptime if OUT:
@@ -485,7 +491,7 @@ def op_upsample_backward[
             )
     if not _up_dtype_ok[MODE](g):
         unsupported(String(name, ": dtype ", g.dtype))
-    var identity = _is_identity[MODE, RANK, True](in_dims, out_dims)
+    var identity = _is_identity[MODE, RANK, True](in_dims, out_dims, scales)
     var dst: T
     var how = DIRECT
     comptime if OUT:
@@ -496,6 +502,11 @@ def op_upsample_backward[
         how = d[1]
     else:
         dst = new_tensor(_shape(in_dims), RANK + 2, g.stype, g.device)
+    comptime if MODE >= LINEAR:
+        # These backwards zero grad_input before copying grad_output into
+        # it, so a grad_input that IS grad_output comes back zeroed.
+        if how == NO_OP and dst.numel > 0:
+            fill_value(dst, 0.0)
     if dst.numel > 0 and how != NO_OP:
         var src = own_if_new(contiguous(g), g)
         if identity:

@@ -376,7 +376,7 @@ def test_out_overlap_raises(mojo_device):
     with pytest.raises(RuntimeError, match="more than one element"):
         torch.ops.aten.replication_pad2d.out(x, [1, 1, 1, 1], out=expanded)
     with pytest.raises(RuntimeError, match="single memory location"):
-        torch.ops.aten.upsample_nearest1d.out(x[0], [4], None, out=x[0])
+        torch.ops.aten.upsample_nearest1d.out(x[0], [2], None, out=x[0][..., :2])
     # A partially overlapping dense view: the input's second half is the
     # start of the output.
     buf = torch.zeros(64, device=mojo_device)
@@ -426,3 +426,34 @@ def test_bicubic_backward_inf_grad_matches_cuda(mojo_device):
         [[[[float("nan"), float("nan")], [float("nan"), float("inf")]]]]
     )
     torch.testing.assert_close(got.cpu(), want, equal_nan=True)
+
+
+@pytest.mark.parametrize("op", ["upsample_nearest1d", "_upsample_nearest_exact1d"])
+def test_unchanged_size_nearest1d_out_is_the_input(mojo_device, op):
+    x = torch.randn(1, 2, 5)
+    xm = x.to(mojo_device)
+    res = getattr(torch.ops.aten, op).out(xm, [5], None, out=xm)
+    assert res is xm
+    torch.testing.assert_close(xm.cpu(), x, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("op", "extra"),
+    [
+        ("upsample_bilinear2d_backward", [False]),
+        ("upsample_bicubic2d_backward", [False]),
+        ("_upsample_bilinear2d_aa_backward", [False]),
+        ("upsample_nearest2d_backward", []),
+    ],
+)
+def test_backward_grad_input_is_grad_output(mojo_device, op, extra):
+    """CUDA zeroes grad_input before copying an unchanged-size grad_output
+    into it for the interpolating kernels (so an aliased call returns
+    zeros); nearest2d copies with no zeroing (a no-op)."""
+    g = torch.randn(1, 2, 3, 4) + 1
+    gm = g.to(mojo_device)
+    getattr(torch.ops.aten, op).grad_input(
+        gm, [3, 4], [1, 2, 3, 4], *extra, grad_input=gm
+    )
+    want = g if "nearest" in op else torch.zeros_like(g)
+    torch.testing.assert_close(gm.cpu(), want, atol=0, rtol=0)
