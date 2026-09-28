@@ -86,7 +86,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
         "int64",
         "bool",
     ),
-    "_upsample_bilinear2d_aa": ("float32",),
     "acos": ("int64", "bool"),
     "acosh": ("int64", "bool"),
     "add": ("bool",),
