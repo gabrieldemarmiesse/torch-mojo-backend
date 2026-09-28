@@ -357,14 +357,20 @@ def _upsample_fwd[
     comptime acc = _acc_dtype[dtype]()
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
-    var sd = scales[0]
-    var sh = scales[1]
-    var sw = scales[2]
+    # Rounded to the kernel's types on the host: a float64 value captured
+    # into the kernel would put doubles in the Metal IR even for float32
+    # (Metal has none; its compiler rejected -- or spun on -- it).
+    var sd = Scalar[acc](scales[0])
+    var sh = Scalar[acc](scales[1])
+    var sw = Scalar[acc](scales[2])
+    var nd = Float32(scales[0])
+    var nh = Float32(scales[1])
+    var nw = Float32(scales[2])
     var count = planes * g[3] * g[4] * g[5]
 
     @always_inline
     @__parameter
-    @__copy_capture(out_ptr, in_ptr, sd, sh, sw)
+    @__copy_capture(out_ptr, in_ptr, sd, sh, sw, nd, nh, nw)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var in_d = g[0]
         var in_h = g[1]
@@ -391,14 +397,14 @@ def _upsample_fwd[
 
         comptime if MODE <= 1:
             comptime exact = MODE == 1
-            var d = _nearest_src[exact](Float32(sd), od, in_d)
-            var h = _nearest_src[exact](Float32(sh), oh, in_h)
-            var w = _nearest_src[exact](Float32(sw), ow, in_w)
+            var d = _nearest_src[exact](nd, od, in_d)
+            var h = _nearest_src[exact](nh, oh, in_h)
+            var w = _nearest_src[exact](nw, ow, in_w)
             out_ptr[unsafe_offset=i] = in_ptr[
                 unsafe_offset=base + (d * in_h + h) * in_w + w
             ]
         elif MODE == 2:
-            var wr = _area_src[acc, False](Scalar[acc](sw), ow, align)
+            var wr = _area_src[acc, False](sw, ow, align)
             var w0 = Int(wr)
             var wp = 1 if w0 < in_w - 1 else 0
             var wl1 = wr - Scalar[acc](w0)
@@ -413,7 +419,7 @@ def _upsample_fwd[
             comptime if RANK == 1:
                 val = row(0, 0)
             else:
-                var hr = _area_src[acc, False](Scalar[acc](sh), oh, align)
+                var hr = _area_src[acc, False](sh, oh, align)
                 var h0 = Int(hr)
                 var hp = 1 if h0 < in_h - 1 else 0
                 var hl1 = hr - Scalar[acc](h0)
@@ -427,7 +433,7 @@ def _upsample_fwd[
                 comptime if RANK == 2:
                     val = plane2(0)
                 else:
-                    var dr = _area_src[acc, False](Scalar[acc](sd), od, align)
+                    var dr = _area_src[acc, False](sd, od, align)
                     var d0 = Int(dr)
                     var dp = 1 if d0 < in_d - 1 else 0
                     var dl1 = dr - Scalar[acc](d0)
@@ -438,8 +444,8 @@ def _upsample_fwd[
             # Antialiased bilinear (RANK 2): a weighted row sum along W per
             # input row of the span, each rounded to the dtype (CUDA's
             # scalar_t buffer), then the weighted sum of those along H.
-            var sh_a = Scalar[acc](sh)
-            var sw_a = Scalar[acc](sw)
+            var sh_a = sh
+            var sw_a = sw
             var xs = _aa_span[acc](ow, in_w, sw_a)
             var ys = _aa_span[acc](oh, in_h, sh_a)
             var xt = _aa_total[acc](xs, sw_a)
@@ -459,10 +465,10 @@ def _upsample_fwd[
         else:
             # Bicubic (RANK 2): four cubic row interpolations along W, then
             # one along H, over edge-clamped taps.
-            var xr = _area_src[acc, True](Scalar[acc](sw), ow, align)
+            var xr = _area_src[acc, True](sw, ow, align)
             var x0 = Int(floor(xr))
             var tx = xr - Scalar[acc](x0)
-            var yr = _area_src[acc, True](Scalar[acc](sh), oh, align)
+            var yr = _area_src[acc, True](sh, oh, align)
             var y0 = Int(floor(yr))
             var ty = yr - Scalar[acc](y0)
 
@@ -513,14 +519,20 @@ def _upsample_bwd[
     comptime acc = _acc_dtype[dtype]()
     var gin = _make_ptr[dtype](gin_addr)
     var gout = _make_ptr[dtype](gout_addr)
-    var sd = scales[0]
-    var sh = scales[1]
-    var sw = scales[2]
+    # Rounded to the kernel's types on the host: a float64 value captured
+    # into the kernel would put doubles in the Metal IR even for float32
+    # (Metal has none; its compiler rejected -- or spun on -- it).
+    var sd = Scalar[acc](scales[0])
+    var sh = Scalar[acc](scales[1])
+    var sw = Scalar[acc](scales[2])
+    var nd = Float32(scales[0])
+    var nh = Float32(scales[1])
+    var nw = Float32(scales[2])
     var count = planes * g[0] * g[1] * g[2]
 
     @always_inline
     @__parameter
-    @__copy_capture(gin, gout, sd, sh, sw)
+    @__copy_capture(gin, gout, sd, sh, sw, nd, nh, nw)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var in_d = g[0]
         var in_h = g[1]
@@ -542,20 +554,20 @@ def _upsample_bwd[
         comptime if MODE <= 1:
             # Nearest: the outputs reading input i are [bw(i), bw(i + 1)).
             comptime exact = MODE == 1
-            var d_lo = _nearest_bw_src[exact](Float32(sd), id, out_d)
-            var d_hi = _nearest_bw_src[exact](Float32(sd), id + 1, out_d)
-            var h_lo = _nearest_bw_src[exact](Float32(sh), ih, out_h)
-            var h_hi = _nearest_bw_src[exact](Float32(sh), ih + 1, out_h)
-            var w_lo = _nearest_bw_src[exact](Float32(sw), iw, out_w)
-            var w_hi = _nearest_bw_src[exact](Float32(sw), iw + 1, out_w)
+            var d_lo = _nearest_bw_src[exact](nd, id, out_d)
+            var d_hi = _nearest_bw_src[exact](nd, id + 1, out_d)
+            var h_lo = _nearest_bw_src[exact](nh, ih, out_h)
+            var h_hi = _nearest_bw_src[exact](nh, ih + 1, out_h)
+            var w_lo = _nearest_bw_src[exact](nw, iw, out_w)
+            var w_hi = _nearest_bw_src[exact](nw, iw + 1, out_w)
             for d in range(d_lo, d_hi):
                 for h in range(h_lo, h_hi):
                     var row = obase + (d * out_h + h) * out_w
                     for w in range(w_lo, w_hi):
                         total += gout[unsafe_offset=row + w].cast[acc]()
         elif MODE == 4:
-            var sh_a = Scalar[acc](sh)
-            var sw_a = Scalar[acc](sw)
+            var sh_a = sh
+            var sw_a = sw
             var h_lo = _aa_first_past[acc, True](ih, sh_a, in_h, out_h)
             var h_hi = _aa_first_past[acc, False](ih, sh_a, in_h, out_h)
             var w_lo = _aa_first_past[acc, True](iw, sw_a, in_w, out_w)
@@ -576,9 +588,9 @@ def _upsample_bwd[
                     )
         else:
             comptime cubic = MODE == 3
-            var sd_a = Scalar[acc](sd)
-            var sh_a = Scalar[acc](sh)
-            var sw_a = Scalar[acc](sw)
+            var sd_a = sd
+            var sh_a = sh
+            var sw_a = sw
             var dr = (0, 1)
             comptime if RANK == 3:
                 dr = _interp_range[acc, cubic](id, sd_a, in_d, out_d, align)
