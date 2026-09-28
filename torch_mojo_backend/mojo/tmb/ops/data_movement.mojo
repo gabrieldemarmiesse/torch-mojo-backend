@@ -1,7 +1,7 @@
 """ATen ops: data_movement group (see agents_docs/native_backend.md).
 
-clone / _to_copy / cat / stack / repeat / tril / triu / reflection_pad2d /
-replication_pad2d / select_scatter / scatter.src / scatter.value /
+clone / _to_copy / cat / stack / repeat / tril / triu / select_scatter /
+scatter.src / scatter.value /
 scatter_add / gather / index_select / index_add / index.Tensor /
 _index_put_impl_ / nonzero / masked_select(.out) / set_.source_Tensor /
 set_.source_Storage(_storage_offset) /
@@ -10,7 +10,7 @@ fast_aten_cat/stack/repeat/tril/triu/select_scatter/scatter_src/
 scatter_value/index/nonzero/clone, mojo_device/aten_ops/inplace.py's
 set_.source_Tensor, factories.py's empty_permuted and transfer.py's
 _to_copy. Kernel families: data_movement (CatN, NarrowCopyDst, TileCopy,
-RepeatTiled, TriangularCopy, Pad2D, GatherRows, GatherDim, ScatterDim,
+RepeatTiled, TriangularCopy, GatherRows, GatherDim, ScatterDim,
 ScatterAddDim, IndexPutRows, PermuteCopy, CastSpec, MaskedSelectCount,
 MaskedSelectCompact).
 
@@ -1460,96 +1460,6 @@ def op_triu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var diagonal = v_int_or(args[unsafe_offset=1], 0)
     var out = _triangular(t, diagonal, 1)
-    ret_owned(rets, 0, out)
-
-
-# ---------------------------------------------------------------------------
-# reflection_pad2d / replication_pad2d
-# ---------------------------------------------------------------------------
-
-
-def _pad2d(t: T, padding: IntList, reflect: Int) raises -> Owned:
-    """Pad the last two dims of a 3D (C, H, W) or 4D (N, C, H, W) input by
-    (left, right, top, bottom), mirroring (`reflect` != 0, the edge element
-    not repeated) or clamping to the nearest edge. Everything before the last
-    two dims is one flattened batch for the Pad2D kernel."""
-    var name = "reflection_pad2d" if reflect != 0 else "replication_pad2d"
-    if t.rank != 3 and t.rank != 4:
-        unsupported(String("aten::", name, " on a ", t.rank, "D input"))
-    if len(padding) != 4:
-        raise Error(name, ": padding size is expected to be 4")
-    var pad_l = padding[0]
-    var pad_r = padding[1]
-    var pad_t = padding[2]
-    var pad_b = padding[3]
-    if pad_l < 0 or pad_r < 0 or pad_t < 0 or pad_b < 0:
-        unsupported(String("aten::", name, " with negative padding (cropping)"))
-    var in_h = t.dim(-2)
-    var in_w = t.dim(-1)
-    if reflect != 0 and (
-        pad_l >= in_w or pad_r >= in_w or pad_t >= in_h or pad_b >= in_h
-    ):
-        raise Error(
-            (
-                "Padding size should be less than the corresponding input"
-                " dimension, but got: padding ("
-            ),
-            pad_l,
-            ", ",
-            pad_r,
-            ", ",
-            pad_t,
-            ", ",
-            pad_b,
-            ") at dimension 3 of input ",
-            t.rank,
-        )
-    var out_h = in_h + pad_t + pad_b
-    var out_w = in_w + pad_l + pad_r
-    var shape = t.shape
-    shape[MAX_RANK - 2] = out_h
-    shape[MAX_RANK - 1] = out_w
-    var out = own(new_tensor(shape, t.rank, t.stype, t.device))
-    if out.t.numel > 0 and t.numel > 0:
-        var src = contiguous(t)
-        var ctx = ctx_for(t.device)
-        var cp = ctx_ptr(ctx)
-        var call = KernelCall("data_movement", "Pad2D")
-        call.arg_dtype(0, t.dtype)
-        call.out_dtype(t.dtype)
-        call.int(out.t.ptr)
-        call.int(src.ptr)
-        call.int(t.numel // (in_h * in_w))
-        call.int(in_h)
-        call.int(in_w)
-        call.int(pad_l)
-        call.int(pad_r)
-        call.int(pad_t)
-        call.int(pad_b)
-        call.int(reflect)
-        call.int(t.itemsize)
-        call.int(cp)
-        call.run()
-        _ = ctx
-        release_if_new(src, t)
-    return out^
-
-
-# aten::reflection_pad2d(Tensor self, SymInt[4] padding) -> Tensor
-def op_reflection_pad2d(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = _pad2d(t, IntList(args[unsafe_offset=1]), 1)
-    ret_owned(rets, 0, out)
-
-
-# aten::replication_pad2d(Tensor self, SymInt[4] padding) -> Tensor
-def op_replication_pad2d(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = _pad2d(t, IntList(args[unsafe_offset=1]), 0)
     ret_owned(rets, 0, out)
 
 
@@ -3234,8 +3144,6 @@ def register_data_movement(site: Site) raises:
     impl[op_repeat, "repeat"](site)
     impl[op_tril, "tril"](site)
     impl[op_triu, "triu"](site)
-    impl[op_reflection_pad2d, "reflection_pad2d"](site)
-    impl[op_replication_pad2d, "replication_pad2d"](site)
     impl[op_select_scatter, "select_scatter"](site)
     impl[op_scatter_src, "scatter.src"](site)
     impl[op_scatter_src_, "scatter_.src"](site)

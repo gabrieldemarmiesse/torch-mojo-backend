@@ -3749,6 +3749,92 @@ def test_aten_reflection_pad2d_compile_rejects_padding_ge_input_dim():
         torch.compile(fn, backend=mojo_backend)(torch.randn(2, 3, 4, 4))
 
 
+# ---------------------------------------------------------------------------
+# reflection / replication padding of every rank and nearest / linear /
+# cubic upsampling (tmb/ops/resample.mojo on the mojo device; the compile
+# backend reaches them through torch's own decompositions, except the 2-d
+# pads and upsample_bilinear2d, which have twins above)
+# ---------------------------------------------------------------------------
+
+_RESAMPLE_PAD_CASES = [
+    ((2, 3, 7), (2, 3)),
+    ((2, 3, 6, 5), (1, 4, 0, 5)),
+    ((2, 2, 4, 5, 6), (1, 2, 3, 0, 2, 3)),
+]
+
+
+@pytest.mark.parametrize("mode", ["reflect", "replicate"])
+@pytest.mark.parametrize(("shape", "padding"), _RESAMPLE_PAD_CASES)
+def test_aten_pad_nd(
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    padding: tuple[int, ...],
+    call_checker: CallChecker,
+):
+    base = "reflection" if mode == "reflect" else "replication"
+    call_checker.register(f"aten::{base}_pad{len(padding) // 2}d")
+
+    def fn(x):
+        return torch.nn.functional.pad(x, padding, mode=mode)
+
+    check_outputs(fn, conf, [torch.randn(shape)])
+
+
+_RESAMPLE_UP_CASES = [
+    ("nearest", (2, 3, 5), {"size": (8,)}, "upsample_nearest1d"),
+    ("nearest", (2, 3, 5, 4, 3), {"size": (7, 2, 5)}, "upsample_nearest3d"),
+    ("nearest-exact", (2, 3, 5, 4), {"size": (3, 9)}, "_upsample_nearest_exact2d"),
+    ("linear", (2, 3, 5), {"scale_factor": 1.7}, "upsample_linear1d"),
+    ("bicubic", (2, 3, 5, 4), {"size": (7, 9)}, "upsample_bicubic2d"),
+    (
+        "trilinear",
+        (2, 3, 5, 4, 3),
+        {"size": (7, 2, 5), "align_corners": True},
+        "upsample_trilinear3d",
+    ),
+    (
+        "bilinear",
+        (2, 3, 10, 20),
+        {"size": (3, 7), "antialias": True},
+        "_upsample_bilinear2d_aa",
+    ),
+]
+
+
+@pytest.mark.parametrize(("mode", "shape", "kwargs", "op"), _RESAMPLE_UP_CASES)
+def test_aten_upsample_nd(
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    kwargs,
+    op: str,
+    call_checker: CallChecker,
+):
+    call_checker.register(f"aten::{op}")
+
+    def fn(x):
+        return torch.nn.functional.interpolate(x, mode=mode, **kwargs)
+
+    check_outputs(fn, conf, [torch.randn(shape)], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize(
+    ("mode", "shape", "kwargs"),
+    [(m, s, k) for m, s, k, _ in _RESAMPLE_UP_CASES if "antialias" not in k],
+)
+def test_aten_upsample_nd_compile(
+    conf: Conf, mode: str, shape: tuple[int, ...], kwargs
+):
+    """No twin: torch's decompositions lower these for the graph."""
+
+    def fn(x):
+        return torch.nn.functional.interpolate(x, mode=mode, **kwargs)
+
+    check_outputs(fn, conf, [torch.randn(shape)], atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(("shape", "dim"), [((64, 40), -1), ((4, 5, 64), 1)])
 def test_aten__log_softmax_backward_data_autograd(

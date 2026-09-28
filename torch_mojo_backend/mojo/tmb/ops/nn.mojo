@@ -1,7 +1,7 @@
 """ATen ops: nn group (see agents_docs/native_backend.md).
 
 Softmax family, normalization (layer / batch / group), NLL loss, embedding,
-2-D pooling and bilinear upsampling. Ported from the old Python fast path
+2-D pooling (upsampling lives in resample.mojo). Ported from the old Python fast path
 (`eager_kernels/aten_fast.py`): same dtype gating, same route cascade (which
 kernel for which dtype / layout / device), same output allocation and the same
 kernel slot lists.
@@ -1570,7 +1570,7 @@ def op_embedding_dense_backward(
 
 
 # ---------------------------------------------------------------------------
-# Pooling and bilinear upsampling (nn, NCHW)
+# Pooling (nn, NCHW)
 # ---------------------------------------------------------------------------
 
 
@@ -1745,120 +1745,6 @@ def op_adaptive_avg_pool2d(
     ret_owned(rets, 0, out)
 
 
-def _area_pixel_scale(
-    in_size: Int, out_size: Int, align_corners: Bool, scale: Float64
-) -> Float64:
-    """torch's `area_pixel_compute_scale` for one axis (scale <= 0 = unset)."""
-    if align_corners:
-        if out_size <= 1:
-            return 0.0
-        return Float64(in_size - 1) / Float64(out_size - 1)
-    if scale > 0.0:
-        return 1.0 / scale
-    return Float64(in_size) / Float64(out_size)
-
-
-# aten::upsample_bilinear2d(Tensor self, SymInt[2] output_size,
-#   bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
-def op_upsample_bilinear2d(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    _nchw(a, "upsample_bilinear2d")
-    var osize = _pair(IntList(args[unsafe_offset=1]), "output_size")
-    var align_corners = v_bool(args[unsafe_offset=2])
-    var scale_h = -1.0
-    var scale_w = -1.0
-    if not v_is_none(args[unsafe_offset=3]):
-        scale_h = v_f64(args[unsafe_offset=3])
-    if not v_is_none(args[unsafe_offset=4]):
-        scale_w = v_f64(args[unsafe_offset=4])
-    if osize[0] <= 0 or osize[1] <= 0:
-        unsupported("upsample_bilinear2d: empty output")
-    var in_h = a.dim(2)
-    var in_w = a.dim(3)
-    var ratio_h = _area_pixel_scale(in_h, osize[0], align_corners, scale_h)
-    var ratio_w = _area_pixel_scale(in_w, osize[1], align_corners, scale_w)
-    var shape = _pool_shape(a.dim(0), a.dim(1), osize[0], osize[1])
-    var am = _mat(a)
-    var out = own(new_tensor(shape, 4, a.stype, a.device))
-    var ctx = ctx_for(a.device)
-    var call = KernelCall("nn", "UpsampleBilinear2d")
-    call.arg_dtype(0, a.dtype)
-    call.out_dtype(out.t.dtype)
-    call.flag("ALIGN_CORNERS", 1 if align_corners else 0)
-    call.int(out.t.ptr)
-    call.int(am.t.ptr)
-    var params = List[Int]()
-    params.append(_f64_slot(ratio_h))
-    params.append(_f64_slot(ratio_w))
-    params.append(in_h)
-    params.append(in_w)
-    params.append(osize[0])
-    params.append(osize[1])
-    params.append(a.dim(0) * a.dim(1))
-    params.append(1 if align_corners else 0)
-    call.tuple(params)
-    call.int(dtype_code(a.dtype))
-    call.int(ctx_ptr(ctx))
-    call.run()
-    _ = am.t.ptr
-    _ = ctx
-    ret_owned(rets, 0, out)
-
-
-# aten::upsample_nearest2d(Tensor self, SymInt[2] output_size,
-#   float? scales_h=None, float? scales_w=None) -> Tensor
-def op_upsample_nearest2d(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    """`F.interpolate(mode="nearest")`: the `.vec` overload is composite over
-    this one. torch_mojo_backend has no `upsample_nearest2d_backward` yet, so
-    a backward through it declines there."""
-    var a = v_tensor(args[unsafe_offset=0])
-    _nchw(a, "upsample_nearest2d")
-    var osize = _pair(IntList(args[unsafe_offset=1]), "output_size")
-    if osize[0] <= 0 or osize[1] <= 0:
-        unsupported("upsample_nearest2d: empty output")
-    var in_h = a.dim(2)
-    var in_w = a.dim(3)
-    # torch's compute_scales_value: the given scale's reciprocal, else the
-    # size ratio.
-    var ratio_h = Float64(in_h) / Float64(osize[0])
-    var ratio_w = Float64(in_w) / Float64(osize[1])
-    if not v_is_none(args[unsafe_offset=2]):
-        var sh = v_f64(args[unsafe_offset=2])
-        if sh > 0.0:
-            ratio_h = 1.0 / sh
-    if not v_is_none(args[unsafe_offset=3]):
-        var sw = v_f64(args[unsafe_offset=3])
-        if sw > 0.0:
-            ratio_w = 1.0 / sw
-    var shape = _pool_shape(a.dim(0), a.dim(1), osize[0], osize[1])
-    var am = _mat(a)
-    var out = own(new_tensor(shape, 4, a.stype, a.device))
-    var ctx = ctx_for(a.device)
-    var call = KernelCall("nn", "UpsampleNearest2d")
-    call.arg_dtype(0, a.dtype)
-    call.int(out.t.ptr)
-    call.int(am.t.ptr)
-    var params = List[Int]()
-    params.append(_f64_slot(ratio_h))
-    params.append(_f64_slot(ratio_w))
-    params.append(in_h)
-    params.append(in_w)
-    params.append(osize[0])
-    params.append(osize[1])
-    params.append(a.dim(0) * a.dim(1))
-    call.tuple(params)
-    call.int(dtype_code(a.dtype))
-    call.int(ctx_ptr(ctx))
-    call.run()
-    _ = am.t.ptr
-    _ = ctx
-    ret_owned(rets, 0, out)
-
-
 def register_nn(site: Site) raises:
     impl[op_adaptive_avg_pool2d, "_adaptive_avg_pool2d"](site)
     impl[op_log_softmax, "_log_softmax"](site)
@@ -1877,5 +1763,3 @@ def register_nn(site: Site) raises:
     impl[op_native_layer_norm_backward, "native_layer_norm_backward"](site)
     impl[op_nll_loss_backward_grad_input, "nll_loss_backward.grad_input"](site)
     impl[op_nll_loss_forward_output, "nll_loss_forward.output"](site)
-    impl[op_upsample_bilinear2d, "upsample_bilinear2d"](site)
-    impl[op_upsample_nearest2d, "upsample_nearest2d"](site)

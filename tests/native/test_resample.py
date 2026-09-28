@@ -1,0 +1,315 @@
+"""Reflection / replication padding and nearest / linear / cubic upsampling
+on the mojo device (tmb/ops/resample.mojo), forward and backward, against
+CPU torch."""
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from tests.native.conftest import ran, skip_if_metal
+
+_FLOATS = [torch.float32, torch.float16, torch.bfloat16]
+
+
+def _tol(dtype: torch.dtype) -> tuple[float, float]:
+    """(atol, rtol) of a forward result."""
+    if dtype == torch.float16:
+        return 2e-3, 2e-3
+    if dtype == torch.bfloat16:
+        return 2e-2, 2e-2
+    if dtype == torch.float64:
+        return 1e-12, 1e-12
+    return 1e-5, 1e-5
+
+
+def _grad_tol(dtype: torch.dtype) -> tuple[float, float]:
+    """A gradient sums up to a few dozen terms; the half types round each
+    term on CPU (and on CUDA, whose scatter adds in the input dtype) where
+    this backend sums in float32 and rounds once."""
+    if dtype == torch.float16:
+        return 2e-2, 1e-2
+    if dtype == torch.bfloat16:
+        return 1.5e-1, 5e-2
+    if dtype == torch.float64:
+        return 1e-12, 1e-12
+    return 1e-5, 1e-5
+
+
+def _check_fwd_bwd(fn, x: torch.Tensor, device: str, op: str):
+    """fn on CPU vs on the device, value and input gradient, with the named
+    native forward op required to run."""
+    dtype = x.dtype
+    xc = x.clone().requires_grad_(True)
+    xm = x.to(device).requires_grad_(True)
+    with ran(op):
+        ym = fn(xm)
+    yc = fn(xc)
+    atol, rtol = _tol(dtype)
+    torch.testing.assert_close(ym.cpu(), yc, atol=atol, rtol=rtol)
+    g = torch.randn(yc.shape).to(dtype)
+    with ran(op + "_backward"):
+        ym.backward(g.to(device))
+    yc.backward(g)
+    assert xm.grad is not None and xc.grad is not None
+    atol, rtol = _grad_tol(dtype)
+    torch.testing.assert_close(xm.grad.cpu(), xc.grad, atol=atol, rtol=rtol)
+
+
+# ---------------------------------------------------------------------------
+# Padding
+# ---------------------------------------------------------------------------
+
+_PAD_CASES = [
+    # (shape, padding) -- 1-d, 2-d and 3-d, batched and not, asymmetric,
+    # zero on one side, the largest reflection (n - 1), negative (cropping).
+    ((2, 3, 7), (2, 3)),
+    ((3, 7), (0, 6)),
+    ((2, 3, 7), (-2, 3)),
+    ((2, 3, 6, 5), (1, 4, 0, 5)),
+    ((3, 6, 5), (4, 2, 3, 1)),
+    ((2, 3, 6, 5), (2, -1, -3, 2)),
+    ((2, 2, 4, 5, 6), (1, 2, 3, 0, 2, 3)),
+    ((2, 4, 5, 6), (5, 0, 1, 4, 3, 1)),
+    ((1, 2, 4, 5, 6), (-1, 2, 1, -2, 0, 1)),
+]
+
+
+def _pad_op(mode: str, rank: int) -> str:
+    base = "reflection" if mode == "reflect" else "replication"
+    return f"aten::{base}_pad{rank}d"
+
+
+@pytest.mark.parametrize("dtype", [*_FLOATS, torch.int64, torch.uint8])
+@pytest.mark.parametrize("mode", ["reflect", "replicate"])
+@pytest.mark.parametrize(("shape", "padding"), _PAD_CASES)
+def test_pad_forward(mojo_device, mode, shape, padding, dtype):
+    x = (torch.randn(shape) * 50).to(dtype)
+    with ran(_pad_op(mode, len(padding) // 2)):
+        got = F.pad(x.to(mojo_device), padding, mode=mode)
+    torch.testing.assert_close(got.cpu(), F.pad(x, padding, mode=mode), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", _FLOATS)
+@pytest.mark.parametrize("mode", ["reflect", "replicate"])
+@pytest.mark.parametrize(("shape", "padding"), _PAD_CASES)
+def test_pad_backward(mojo_device, mode, shape, padding, dtype):
+    x = torch.randn(shape).to(dtype)
+    _check_fwd_bwd(
+        lambda t: F.pad(t, padding, mode=mode),
+        x,
+        mojo_device,
+        _pad_op(mode, len(padding) // 2),
+    )
+
+
+@pytest.mark.parametrize("mode", ["reflect", "replicate"])
+def test_pad_float64(mojo_device, mode):
+    skip_if_metal(mojo_device, "Apple GPUs have no float64")
+    x = torch.randn(2, 3, 5, 6, dtype=torch.float64)
+    _check_fwd_bwd(
+        lambda t: F.pad(t, (2, 1, 4, 3), mode=mode), x, mojo_device, _pad_op(mode, 2)
+    )
+
+
+def test_replicate_pad_far_past_the_input(mojo_device):
+    """Replication has no upper bound: the edge rows sum many gradients."""
+    x = torch.randn(2, 3, 3, 2)
+    _check_fwd_bwd(
+        lambda t: F.pad(t, (9, 7, 11, 6), mode="replicate"),
+        x,
+        mojo_device,
+        "aten::replication_pad2d",
+    )
+
+
+@pytest.mark.parametrize("mode", ["reflect", "replicate"])
+def test_pad_strided_input(mojo_device, mode):
+    x = torch.randn(2, 3, 9, 8).transpose(-1, -2)
+    got = F.pad(x.to(mojo_device), (2, 3, 1, 4), mode=mode)
+    torch.testing.assert_close(got.cpu(), F.pad(x, (2, 3, 1, 4), mode=mode))
+
+
+def test_pad_empty_batch(mojo_device):
+    x = torch.randn(0, 3, 5)
+    got = F.pad(x.to(mojo_device), (2, 1), mode="reflect")
+    assert got.shape == (0, 3, 8)
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_pad_out_variants(mojo_device, contiguous):
+    x = torch.randn(2, 3, 4, 5)
+    want = torch.ops.aten.reflection_pad2d(x, [1, 2, 3, 0])
+    if contiguous:
+        out = torch.empty(0, device=mojo_device)
+    else:
+        out = torch.empty(2, 3, 9, 7, device=mojo_device).transpose(-1, -2)
+    with ran("aten::reflection_pad2d.out"):
+        res = torch.ops.aten.reflection_pad2d.out(
+            x.to(mojo_device), [1, 2, 3, 0], out=out
+        )
+    assert res is out
+    torch.testing.assert_close(out.cpu(), want)
+
+    g = torch.randn(want.shape)
+    want_grad = torch.ops.aten.replication_pad2d_backward(g, x, [1, 2, 3, 0])
+    grad_input = torch.empty(0, device=mojo_device)
+    with ran("aten::replication_pad2d_backward.grad_input"):
+        torch.ops.aten.replication_pad2d_backward.grad_input(
+            g.to(mojo_device), x.to(mojo_device), [1, 2, 3, 0], grad_input=grad_input
+        )
+    torch.testing.assert_close(grad_input.cpu(), want_grad)
+
+
+def test_reflection_pad_too_large_raises(mojo_device):
+    x = torch.randn(2, 3, 4).to(mojo_device)
+    with pytest.raises(RuntimeError, match="Padding size should be less than"):
+        F.pad(x, (4, 0), mode="reflect")
+
+
+def test_pad_bad_rank_raises(mojo_device):
+    x = torch.randn(2, 3, 4, 5, 6).to(mojo_device)
+    with pytest.raises(RuntimeError, match="Expected 2D or 3D"):
+        torch.ops.aten.replication_pad1d(x, [1, 1])
+
+
+# ---------------------------------------------------------------------------
+# Upsampling
+# ---------------------------------------------------------------------------
+
+_UP_CASES = [
+    # (mode, input shape, interpolate kwargs, native op)
+    ("nearest", (2, 3, 5), {"size": (8,)}, "upsample_nearest1d"),
+    ("nearest", (2, 3, 7), {"scale_factor": 0.6}, "upsample_nearest1d"),
+    ("nearest", (2, 3, 5, 4), {"size": (7, 9)}, "upsample_nearest2d"),
+    ("nearest", (1, 2, 5, 7), {"scale_factor": 1.7}, "upsample_nearest2d"),
+    ("nearest", (2, 3, 5, 4, 3), {"size": (7, 2, 5)}, "upsample_nearest3d"),
+    ("nearest-exact", (2, 3, 5), {"size": (8,)}, "_upsample_nearest_exact1d"),
+    ("nearest-exact", (2, 3, 5, 4), {"size": (3, 9)}, "_upsample_nearest_exact2d"),
+    (
+        "nearest-exact",
+        (2, 3, 4, 4, 4),
+        {"scale_factor": 1.7},
+        "_upsample_nearest_exact3d",
+    ),
+    ("linear", (2, 3, 5), {"size": (8,)}, "upsample_linear1d"),
+    ("linear", (2, 3, 9), {"size": (4,), "align_corners": True}, "upsample_linear1d"),
+    ("linear", (2, 3, 5), {"scale_factor": 1.7}, "upsample_linear1d"),
+    ("bilinear", (2, 3, 5, 4), {"size": (7, 9)}, "upsample_bilinear2d"),
+    (
+        "bilinear",
+        (2, 3, 5, 4),
+        {"size": (3, 9), "align_corners": True},
+        "upsample_bilinear2d",
+    ),
+    ("bilinear", (2, 3, 8, 8), {"scale_factor": 0.6}, "upsample_bilinear2d"),
+    ("bicubic", (2, 3, 5, 4), {"size": (7, 9)}, "upsample_bicubic2d"),
+    (
+        "bicubic",
+        (2, 3, 5, 4),
+        {"size": (3, 2), "align_corners": True},
+        "upsample_bicubic2d",
+    ),
+    ("bicubic", (2, 3, 4, 4), {"scale_factor": 1.7}, "upsample_bicubic2d"),
+    ("bicubic", (1, 2, 9, 7), {"size": (4, 3)}, "upsample_bicubic2d"),
+    ("trilinear", (2, 3, 5, 4, 3), {"size": (7, 2, 5)}, "upsample_trilinear3d"),
+    (
+        "trilinear",
+        (2, 3, 5, 4, 3),
+        {"size": (7, 2, 5), "align_corners": True},
+        "upsample_trilinear3d",
+    ),
+    ("trilinear", (1, 2, 4, 4, 4), {"scale_factor": 0.6}, "upsample_trilinear3d"),
+    # Same size: the copy special case of the 1-d / 3-d / cubic kernels.
+    ("linear", (2, 3, 5), {"size": (5,)}, "upsample_linear1d"),
+    ("bicubic", (2, 3, 5, 4), {"size": (5, 4)}, "upsample_bicubic2d"),
+]
+
+
+def _interp(mode: str, kwargs):
+    return lambda t: F.interpolate(t, mode=mode, **kwargs)
+
+
+@pytest.mark.parametrize("dtype", _FLOATS)
+@pytest.mark.parametrize(
+    ("mode", "shape", "kwargs", "op"),
+    _UP_CASES,
+    ids=[f"{m}-{s}-{k}" for m, s, k, _ in _UP_CASES],
+)
+def test_upsample_forward_backward(mojo_device, mode, shape, kwargs, op, dtype):
+    x = torch.randn(shape).to(dtype)
+    _check_fwd_bwd(_interp(mode, kwargs), x, mojo_device, "aten::" + op)
+
+
+@pytest.mark.parametrize(
+    ("mode", "shape", "kwargs", "op"),
+    _UP_CASES,
+    ids=[f"{m}-{s}-{k}" for m, s, k, _ in _UP_CASES],
+)
+def test_upsample_float64(mojo_device, mode, shape, kwargs, op):
+    skip_if_metal(mojo_device, "Apple GPUs have no float64")
+    x = torch.randn(shape, dtype=torch.float64)
+    _check_fwd_bwd(_interp(mode, kwargs), x, mojo_device, "aten::" + op)
+
+
+@pytest.mark.parametrize("mode", ["nearest", "nearest-exact"])
+def test_upsample_nearest_is_a_gather(mojo_device, mode):
+    """Nearest copies elements: bit-identical, uint8 included."""
+    for dtype in (torch.float32, torch.bfloat16, torch.uint8):
+        x = (torch.randn(2, 3, 5, 7) * 50).to(dtype)
+        got = F.interpolate(x.to(mojo_device), size=(9, 4), mode=mode)
+        torch.testing.assert_close(
+            got.cpu(), F.interpolate(x, size=(9, 4), mode=mode), atol=0, rtol=0
+        )
+
+
+def test_upsample_strided_input(mojo_device):
+    x = torch.randn(2, 3, 6, 5).transpose(-1, -2)
+    got = F.interpolate(x.to(mojo_device), size=(9, 4), mode="bicubic")
+    torch.testing.assert_close(
+        got.cpu(), F.interpolate(x, size=(9, 4), mode="bicubic"), atol=1e-5, rtol=1e-5
+    )
+
+
+def test_upsample_empty_batch(mojo_device):
+    x = torch.randn(0, 3, 5, 4)
+    got = F.interpolate(x.to(mojo_device), size=(7, 9), mode="bilinear")
+    assert got.shape == (0, 3, 7, 9)
+
+
+def test_upsample_explicit_scales(mojo_device):
+    """A scale that disagrees with the sizes is what the source index uses."""
+    x = torch.randn(1, 2, 4, 5)
+    want = torch.ops.aten.upsample_bicubic2d(x, [8, 10], False, 2.5, 1.5)
+    got = torch.ops.aten.upsample_bicubic2d(x.to(mojo_device), [8, 10], False, 2.5, 1.5)
+    torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+    want = torch.ops.aten.upsample_linear1d(x[0], [8], False, 3.0)
+    got = torch.ops.aten.upsample_linear1d(x[0].to(mojo_device), [8], False, 3.0)
+    torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+
+
+def test_upsample_out_variants(mojo_device):
+    x = torch.randn(2, 3, 4, 5)
+    want = torch.ops.aten.upsample_trilinear3d(x[None], [3, 7, 2], True)
+    out = torch.empty(0, device=mojo_device)
+    with ran("aten::upsample_trilinear3d.out"):
+        torch.ops.aten.upsample_trilinear3d.out(
+            x[None].to(mojo_device), [3, 7, 2], True, out=out
+        )
+    torch.testing.assert_close(out.cpu(), want, atol=1e-5, rtol=1e-5)
+
+    g = torch.randn(2, 3, 9, 7)
+    want_grad = torch.ops.aten.upsample_nearest2d_backward(g, [9, 7], [2, 3, 4, 5])
+    grad_input = torch.empty(2, 3, 5, 4, device=mojo_device).transpose(-1, -2)
+    with ran("aten::upsample_nearest2d_backward.grad_input"):
+        torch.ops.aten.upsample_nearest2d_backward.grad_input(
+            g.to(mojo_device), [9, 7], [2, 3, 4, 5], grad_input=grad_input
+        )
+    torch.testing.assert_close(grad_input.cpu(), want_grad)
+
+
+def test_upsample_bad_output_size_raises(mojo_device):
+    x = torch.randn(2, 3, 4, 5).to(mojo_device)
+    with pytest.raises(RuntimeError, match="Input and output sizes should be greater"):
+        torch.ops.aten.upsample_bilinear2d(x, [0, 3], False)
+    with pytest.raises(RuntimeError, match="It is expected output_size equals to 2"):
+        torch.ops.aten.upsample_nearest2d(x, [3])

@@ -12,9 +12,11 @@ loops) — the mojo leg builds the tensor on the mojo device directly.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
-from bench_lib.cases import DTYPES, both
+from bench_lib.cases import DTYPES, both, op_params
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
@@ -75,6 +77,30 @@ PAD2D_SHAPES: dict[str, tuple[int, int, int, int]] = {
 # Asymmetric on every side (left, right, top, bottom) -- the normal case for
 # F.pad's 4-tuple, not just the symmetric special case.
 PAD2D_PADDING = (3, 5, 2, 4)
+# The 1-d and 3-d pads, and every pad's backward (called directly, a
+# gather over grad_output). Each rank's shapes keep every side above the
+# largest pad of that rank, again with one awkward shape.
+PAD1D_SHAPES: dict[str, tuple[int, ...]] = {
+    "S_32x64x4096": (32, 64, 4096),
+    "S_16x3x357789": (16, 3, 357789),
+}
+PAD1D_PADDING: tuple[int, ...] = (3, 5)
+PAD3D_SHAPES: dict[str, tuple[int, ...]] = {
+    "S_4x32x32x64x64": (4, 32, 32, 64, 64),
+    "S_2x3x37x57x89": (2, 3, 37, 57, 89),
+}
+PAD3D_PADDING: tuple[int, ...] = (3, 5, 2, 4, 1, 2)
+PAD_BY_RANK = {
+    1: (PAD1D_SHAPES, PAD1D_PADDING),
+    2: (PAD2D_SHAPES, PAD2D_PADDING),
+    3: (PAD3D_SHAPES, PAD3D_PADDING),
+}
+PAD_MODES = {"reflection": "reflect", "replication": "replicate"}
+PAD1D_OPS = {"reflection_pad1d": 1, "replication_pad1d": 1}
+PAD3D_OPS = {"reflection_pad3d": 3, "replication_pad3d": 3}
+PAD1D_BACKWARD_OPS = {f"{m}_pad1d_backward": 1 for m in PAD_MODES}
+PAD2D_BACKWARD_OPS = {f"{m}_pad2d_backward": 2 for m in PAD_MODES}
+PAD3D_BACKWARD_OPS = {f"{m}_pad3d_backward": 3 for m in PAD_MODES}
 
 COVERS: dict[str, str] = {
     "aten::split_with_sizes_copy.out": "test_split_copy_rows",
@@ -92,6 +118,11 @@ COVERS: dict[str, str] = {
     "aten::_index_put_impl_": "test_index_put",
     "aten::reflection_pad2d": "test_reflection_pad2d",
     "aten::replication_pad2d": "test_replication_pad2d",
+    **{f"aten::{name}": "test_pad1d" for name in PAD1D_OPS},
+    **{f"aten::{name}": "test_pad3d" for name in PAD3D_OPS},
+    **{f"aten::{name}": "test_pad1d_backward" for name in PAD1D_BACKWARD_OPS},
+    **{f"aten::{name}": "test_pad2d_backward" for name in PAD2D_BACKWARD_OPS},
+    **{f"aten::{name}": "test_pad3d_backward" for name in PAD3D_BACKWARD_OPS},
     "aten::masked_select": "test_masked_select",
     "aten::masked_select.out": (
         "test_masked_select (same kernels, the result copied into out)"
@@ -145,6 +176,17 @@ SKIPPED: dict[str, str] = {
         "benchmarked in their own families"
     ),
     "aten::vdot": "dot for the real dtypes: mul + sum, both benchmarked",
+
+
+_PAD_OUT = (
+    "out-variant plumbing over an already-benchmarked functional impl: the "
+    "same resample kernel, written into the caller's tensor"
+)
+SKIPPED: dict[str, str] = {
+    f"aten::{m}_pad{r}d{suffix}": _PAD_OUT
+    for m in PAD_MODES
+    for r in (1, 2, 3)
+    for suffix in (".out", "_backward.grad_input")
 }
 
 
@@ -511,6 +553,132 @@ def test_replication_pad2d(
         lambda: torch.nn.functional.pad(x_our, PAD2D_PADDING, mode="replicate"),
         flops=_pad2d_out_numel(shape),
     )
+
+
+def _pad_fn(name: str) -> tuple[str, int]:
+    """(F.pad mode, rank) of a `<mode>_pad<r>d[_backward]` op name."""
+    base, rest = name.split("_pad", 1)
+    return PAD_MODES[base], int(rest[0])
+
+
+def _pad_out_shape(shape: tuple[int, ...], padding: tuple[int, ...]) -> list[int]:
+    """F.pad's output shape: pairs (lo, hi) run from the last dim."""
+    out = list(shape)
+    for k in range(len(padding) // 2):
+        out[-1 - k] += padding[2 * k] + padding[2 * k + 1]
+    return out
+
+
+def _bench_pad(
+    name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    mode, rank = _pad_fn(name)
+    shapes, padding = PAD_BY_RANK[rank]
+    shape = shapes[shape_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.nn.functional.pad(x_ref, padding, mode=mode),
+        lambda: torch.nn.functional.pad(x_our, padding, mode=mode),
+        flops=float(math.prod(_pad_out_shape(shape, padding))),
+    )
+
+
+def _bench_pad_backward(
+    name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _, rank = _pad_fn(name)
+    shapes, padding = PAD_BY_RANK[rank]
+    shape = shapes[shape_id]
+    op = getattr(torch.ops.aten, name)
+    out_shape = _pad_out_shape(shape, padding)
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=dtype), hw, mojo_device)
+    g_ref, g_our = both(torch.randn(out_shape, dtype=dtype), hw, mojo_device)
+    bench.run(
+        lambda: op(g_ref, x_ref, list(padding)),
+        lambda: op(g_our, x_our, list(padding)),
+        flops=float(math.prod(out_shape)),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD1D_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(PAD1D_OPS))
+def test_pad1d(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _bench_pad(op_name, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD3D_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(PAD3D_OPS))
+def test_pad3d(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _bench_pad(op_name, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD1D_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(PAD1D_BACKWARD_OPS))
+def test_pad1d_backward(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _bench_pad_backward(op_name, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD2D_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(PAD2D_BACKWARD_OPS))
+def test_pad2d_backward(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _bench_pad_backward(op_name, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD3D_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(PAD3D_BACKWARD_OPS))
+def test_pad3d_backward(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _bench_pad_backward(op_name, shape_id, dtype_id, bench, hw, mojo_device)
 
 
 MASKED_SELECT_SHAPES: dict[str, tuple[int, ...]] = {

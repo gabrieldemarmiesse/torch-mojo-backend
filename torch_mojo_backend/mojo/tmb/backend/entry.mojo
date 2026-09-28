@@ -31,6 +31,7 @@ from tmb.ops.nms import register_nms
 from tmb.ops.pointwise import register_pointwise
 from tmb.ops.random import register_random
 from tmb.ops.reductions import register_reductions
+from tmb.ops.resample import register_resample
 from tmb.ops.roi import register_roi
 from tmb.ops.unary import register_unary
 from tmb.backend.pg import pg_vtable
@@ -59,6 +60,7 @@ def _register_ops(lib: Int) raises:
     _group[register_pointwise](lib)
     _group[register_attention](lib)
     _group[register_foreach](lib)
+    _group[register_resample](lib)
 
 
 def _register_detection(lib: Int) raises:
