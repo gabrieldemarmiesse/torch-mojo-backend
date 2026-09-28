@@ -1873,6 +1873,18 @@ def _wide[
         else:
             t = _tanh(_log1p(_exp(b)))
         return a * (t + b * s * (1 - t * t))
+    elif kind == "glu":
+        # ActivationGluKernel.cu's glu_kernel: a * (1 / (1 + exp(-b))) in
+        # opmath (a = first half, b = second half).
+        return a * (1 / (1 + _exp(-b)))
+    elif kind == "glu_backward_a":
+        # glu_backward_kernel's first half: sigmoid(b) * grad (a = grad).
+        return (1 / (1 + _exp(-b))) * a
+    elif kind == "glu_backward_b":
+        # glu_backward_kernel's second half: (1 - sigmoid(b)) * sigmoid(b) *
+        # grad * a, left to right (a = grad, b = first half, c = second).
+        var sig = 1 / (1 + _exp(-c))
+        return (1 - sig) * sig * a * b
     elif kind == "silu_backward":
         var s = _sigmoid(b)
         comptime if is_apple_gpu():

@@ -9,6 +9,8 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    ST_BFLOAT16,
+    ST_FLOAT16,
     ST_FLOAT32,
     T,
     TAG_BOOL,
@@ -1004,10 +1006,10 @@ def op_softmax_backward_data(
             "_softmax_backward_data: grad_output and output must match in"
             " shape and dtype"
         )
-    if target != grad.stype:
-        # `half_to_float`: the forward's input was half and its output float,
-        # so the gradient would have to come back narrowed. `_softmax` itself
-        # declines that route, so nothing here can produce it.
+    var half_target = target == ST_FLOAT16 or target == ST_BFLOAT16
+    if target != grad.stype and not (grad.stype == ST_FLOAT32 and half_target):
+        # `half_to_float` (a half forward input, a float output) is the one
+        # mismatch ATen allows: the gradient comes back narrowed to the half.
         unsupported(
             "_softmax_backward_data with an input_dtype different from the"
             " gradient's"
@@ -1019,12 +1021,22 @@ def op_softmax_backward_data(
         unsupported("_softmax_backward_data dim out of range")
     var dims = List[Int64](capacity=1)
     dims.append(Int64(dim + rank if dim < 0 else dim))
-    var g = _hold(grad)
-    var o = _hold(out)
+    # The CUDA kernel (SoftMax.cu, cunn_SoftMaxBackward) accumulates in
+    # float and rounds once into the half result: do the same, not three
+    # roundings to half.
+    var work = grad.stype
+    if work == ST_FLOAT16 or work == ST_BFLOAT16:
+        work = ST_FLOAT32
+    var g = _as_dtype(grad, work)
+    var o = _as_dtype(out, work)
     var prod = _mul(g, o)
     var total = _sum_dims(prod, dims, True)
     var diff = _sub(g, total)
     var gi = _mul(o, diff)
+    if gi.t.stype != target:
+        var narrowed = _as_dtype(gi.t, target)
+        ret_owned(rets, 0, narrowed)
+        return
     ret_owned(rets, 0, gi)
 
 

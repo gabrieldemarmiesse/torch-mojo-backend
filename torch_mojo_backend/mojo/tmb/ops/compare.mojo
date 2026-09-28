@@ -53,6 +53,7 @@ from tmb.ops.common import (
     scalar_embed,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.core import cast_for_copy
 
 
 def _release_if_new(t: T, orig: T):
@@ -161,6 +162,28 @@ def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
     _ = ctx
 
 
+def _cast_into_out(
+    mut out_arg: T,
+    res: T,
+    shape: IndexList[MAX_RANK],
+    rank: Int,
+    device: Int,
+) raises:
+    """A comparison's `out=` of a non-bool dtype: TensorIterator's
+    comparison ops (`build_borrowing_comparison_op`) cast the bool result
+    into an `out` of any dtype (`torch.eq(x, 0.5, out=float_t)` is 0./1.),
+    which is also how the in-place `x.eq_(0.5)` on a float `x` works. `res`
+    is the bool result, computed apart so an `out` aliasing an operand is
+    only written once every element has been read."""
+    if not out_arg.on_mojo() or out_arg.device != device:
+        raise Error("expected the out= tensor on the operands' mojo device")
+    if not _shape_eq(out_arg, shape):
+        resize_out(out_arg, shape, rank)
+    var casted = own(cast_for_copy(res, out_arg.stype))
+    copy_strided_into(out_arg, casted.t)
+    _ = casted^  # alive past the launch
+
+
 def _compare_functional(op: StaticString, args: Values, rets: Values) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var b = v_tensor(args[unsafe_offset=1])
@@ -193,7 +216,12 @@ def _compare_functional_out(
     var pb = cast_to(b, stype)
     var shape = broadcast_shape(pa, pb)
     var rank = max(pa.rank, pb.rank)
-    if _prepare_out(out_arg, shape, rank, ST_BOOL, a.device):
+    if out_arg.stype != ST_BOOL:
+        var res = own(new_tensor(shape, rank, ST_BOOL, a.device))
+        _compare_spec(op, pa, pb, res.t)
+        _cast_into_out(out_arg, res.t, shape, rank, a.device)
+        _ = res^  # alive past the launch
+    elif _prepare_out(out_arg, shape, rank, ST_BOOL, a.device):
         _compare_spec(op, pa, pb, out_arg)
     else:
         var tmp = own(new_tensor(shape, rank, ST_BOOL, a.device))
@@ -226,7 +254,13 @@ def _compare_scalar_out(op: StaticString, args: Values, rets: Values) raises:
     var value = scalar_embed(args[unsafe_offset=1], a.dtype)
     var fill = own(new_scalar(a.stype, a.device))
     fill_value(fill.t, value)
-    if _prepare_out(out_arg, a.shape, a.rank, ST_BOOL, a.device):
+    if out_arg.stype != ST_BOOL:
+        var res = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
+        _compare_spec(op, a, fill.t, res.t)
+        _ = fill^  # alive past the launch
+        _cast_into_out(out_arg, res.t, a.shape, a.rank, a.device)
+        _ = res^  # alive past the launch
+    elif _prepare_out(out_arg, a.shape, a.rank, ST_BOOL, a.device):
         _compare_spec(op, a, fill.t, out_arg)
         _ = fill^  # alive past the launch
     else:

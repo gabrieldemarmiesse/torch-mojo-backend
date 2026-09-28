@@ -12,8 +12,9 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from tests.native.conftest import ran
+from tests.native.conftest import ran, skip_if_metal
 from torch_mojo_backend import aten_functions, register_mojo_devices
 from torch_mojo_backend.testing import CallChecker
 
@@ -108,6 +109,29 @@ def test_softmax_with_dtype_argument(mojo_device):
         torch.softmax(x, -1, dtype=torch.float32),
         atol=1e-5,
         rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("fn", [torch.softmax, torch.log_softmax])
+@pytest.mark.parametrize("src", [torch.float32, torch.float16, torch.int64])
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_softmax_float64_dtype(mojo_device, fn, src, dim):
+    """`dtype=torch.float64` computes in double (the float64 row kernel)."""
+    skip_if_metal(mojo_device, "float64 is not supported on Apple GPU")
+    torch.manual_seed(2)
+    x = (torch.randn(5, 7, 300) * 20).to(src)
+    if src.is_floating_point:
+        x[0, 0, 0] = -float("inf")
+    got = fn(x.to(mojo_device), dim, dtype=torch.float64)
+    assert got.dtype == torch.float64
+    torch.testing.assert_close(got.cpu(), fn(x, dim, dtype=torch.float64))
+    # A float64 input straight in, rows longer than the block, a softmin.
+    y = torch.randn(3, 2000, dtype=torch.float64)
+    torch.testing.assert_close(fn(y.to(mojo_device), 1).cpu(), fn(y, 1))
+    torch.testing.assert_close(
+        F.softmin(x.to(mojo_device), dim, dtype=torch.float64).cpu(),
+        F.softmin(x, dim, dtype=torch.float64),
+        equal_nan=True,  # -x holds +inf: its slice is NaN on both sides
     )
 
 

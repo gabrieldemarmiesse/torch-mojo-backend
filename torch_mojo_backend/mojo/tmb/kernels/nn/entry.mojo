@@ -70,6 +70,7 @@ from tmb.kernels.reduction.reduce_skeleton import (
 from tmb.kernels.nn.softmax_rows_kernels import (
     _softmax_rows,
     _softmax_rows_dropout_go,
+    softmax_rows_f64,
 )
 from layout import TileTensor, row_major
 from tmb.kernels.random.dropout_kernels import _philox4x32_10
@@ -1685,6 +1686,24 @@ def _softmax_spec_into_go(a_o: Arg, out_o: Arg) raises:
         )
 
 
+def _softmax_f64_spec_into_go(a_o: Arg, out_o: Arg, log_o: Arg) raises:
+    """float64 softmax (log_o != 0: log-softmax) over the trailing dim of a
+    contiguous operand into a same-shape float64 output: the `dtype=`
+    route of softmax / log_softmax. The other dtypes stay on `SoftmaxSpec`
+    / the reduction family's `LogSoftmaxSpec`."""
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    if a.dtype != DType.float64 or a.rank < 1 or a.numel == 0:
+        raise Error("mojo spec softmax_f64: a non-empty float64 input")
+    if not a.contig:
+        raise Error("mojo spec softmax_f64: input must be contiguous")
+    _check_into(a, out, a.dtype)
+    var cols = a.shape[MAX_RANK - 1]
+    softmax_rows_f64(
+        out.ptr, a.ptr, a.numel // cols, cols, _raw_int(log_o) != 0, a.ctx()
+    )
+
+
 def _attn_decode_spec_into_go(
     q_o: Arg,
     k_o: Arg,
@@ -1808,6 +1827,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["SoftmaxSpec"]():
             _spec_dispatcher2[_softmax_spec_into_go, "SoftmaxSpec"](argv, argc)
+            return 0
+        comptime if _op_on["SoftmaxF64Spec"]():
+            _spec_dispatcher3[_softmax_f64_spec_into_go, "SoftmaxF64Spec"](
+                argv, argc
+            )
             return 0
         comptime if _op_on["AttnDecodeSpec"]():
             _spec_dispatcher5[_attn_decode_spec_into_go, "AttnDecodeSpec"](

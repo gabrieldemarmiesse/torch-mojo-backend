@@ -27,6 +27,7 @@ from tmb.backend.abi import (
     T,
     TAG_BOOL_LIST,
     TAG_NONE,
+    TAG_SCALAR_BOOL,
     TAG_SCALAR_INT,
     TAG_TENSOR,
     UNSUPPORTED_PREFIX,
@@ -1121,6 +1122,10 @@ def _call_1(
     return out^
 
 
+def _bool_scalar(b: Bool) -> Value:
+    return Value(TAG_SCALAR_BOOL, 0, Int64(1) if b else Int64(0), 0)
+
+
 def _tensor_arg(t: T) -> Value:
     return Value(TAG_TENSOR, 0, Int64(t.h), 0)
 
@@ -1674,6 +1679,16 @@ def op_addr(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var vec2 = v_tensor(args[unsafe_offset=2])
     var beta = args[unsafe_offset=3].copy()
     var alpha = args[unsafe_offset=4].copy()
+    if (
+        self.dtype == DType.bool
+        and vec1.dtype == DType.bool
+        and vec2.dtype == DType.bool
+    ):
+        # A bool addr is `(beta and self) or (alpha and vec1 and vec2)`
+        # (addr_kernel's bool branch): beta and alpha taken as bools, so the
+        # composite's products stay bool instead of promoting to int64.
+        beta = _bool_scalar(v_f64(beta) != 0.0)
+        alpha = _bool_scalar(v_f64(alpha) != 0.0)
     if not v_scalar_is_bool(beta) and not v_scalar_is_bool(alpha):
         var fast = _addr_fast(self, vec1, vec2, v_f64(beta), v_f64(alpha))
         if fast:

@@ -876,6 +876,15 @@ def _b_op_dtype_ok(op: StaticString, st: Int32, is_cmp: Bool) raises:
             unsupported(String(op) + " requires an integer dtype")
 
 
+def _b_bool_add_as_or(op: StaticString, dtype: Int32) -> StaticString:
+    """A bool add is a logical or (CUDA's add kernel on bool computes
+    `a + alpha * b` in bool, alpha true here: `_b_add` only reaches the
+    routes with alpha 1)."""
+    if op == "AddSpec" and dtype == ST_BOOL:
+        return "BitwiseOrSpec"
+    return op
+
+
 def _b_binary(
     op: StaticString,
     lhs: Side,
@@ -891,6 +900,7 @@ def _b_binary(
     written directly instead of allocating (the `out=` variants).
     """
     var is_cmp = out_stype == ST_BOOL
+    var kop: StaticString
     if not lhs.is_t and not rhs.is_t:
         unsupported("two scalar operands")
     var a_h: Held
@@ -912,7 +922,8 @@ def _b_binary(
                 + String(b.stype)
             )
         dtype = promoted
-        _b_op_dtype_ok(op, dtype, is_cmp)
+        kop = _b_bool_add_as_or(op, dtype)
+        _b_op_dtype_ok(kop, dtype, is_cmp)
         # Above rank 4 the spec entry takes a flat pass: equal shapes and
         # contiguous operands only.
         var flat = a.rank > 4 or b.rank > 4
@@ -925,7 +936,8 @@ def _b_binary(
         var s = rhs.s.value().copy() if lhs.is_t else lhs.s.value().copy()
         device = t.device
         dtype = _b_side_result(t, rhs.copy() if lhs.is_t else lhs.copy())
-        _b_op_dtype_ok(op, dtype, is_cmp)
+        kop = _b_bool_add_as_or(op, dtype)
+        _b_op_dtype_ok(kop, dtype, is_cmp)
         var fill = _b_scalar_fill(s, dtype, device)
         if lhs.is_t:
             a_h = _b_ready(t, dtype, False)
@@ -951,12 +963,12 @@ def _b_binary(
         ):
             # Nothing broadcast and everything dense: writing out[i] from
             # a[i]/b[i] stays exact even when `out` aliases an operand.
-            _b_binary_spec(op, a_h.t, b_h.t, o)
+            _b_binary_spec(kop, a_h.t, b_h.t, o)
             _ = a_h
             _ = b_h
             return Res(o^, False)
     var out = own(new_tensor(shape, rank, result_stype, device))
-    _b_binary_spec(op, a_h.t, b_h.t, out.t)
+    _b_binary_spec(kop, a_h.t, b_h.t, out.t)
     _ = a_h
     _ = b_h
     return Res(out.take(), True)
@@ -1410,10 +1422,42 @@ def _b_scaled_scalar(s: Scal, alpha: Float64, alpha_i: Optional[Int]) -> Scal:
     return Scal(v, Int(v), False, False)
 
 
+def _b_bool_result(lhs: Side, rhs: Side) raises -> Bool:
+    """Whether the operands promote to bool (`torch.result_type`)."""
+    if lhs.is_t and rhs.is_t:
+        return _b_promote(lhs.t.value(), rhs.t.value()) == ST_BOOL
+    if lhs.is_t:
+        return _b_side_result(lhs.t.value(), rhs) == ST_BOOL
+    if rhs.is_t:
+        return _b_side_result(rhs.t.value(), lhs) == ST_BOOL
+    return False
+
+
+def _b_bool_add(
+    lhs: Side, rhs: Side, alpha: Bool, dst: Optional[T]
+) raises -> Res:
+    """A bool add: `lhs or (alpha and rhs)`, alpha converted to bool as the
+    CUDA add kernel's `alpha.to<bool>()` does. A false alpha still
+    broadcasts against `rhs`, so it is `lhs or (rhs and false)`."""
+    if alpha:
+        return _b_add_routes(lhs, rhs, dst)
+    var false_side = _b_sside(Scal(0.0, 0, True, True))
+    if not rhs.is_t:
+        return _b_add_routes(lhs, false_side^, dst)
+    var zeroed = _b_binary("BitwiseAndSpec", rhs, false_side^, Int32(-1), None)
+    var held = own(zeroed.t.copy())
+    held.live = zeroed.owned
+    var res = _b_add_routes(lhs, _b_tside(held.t), dst)
+    _ = held^  # alive past the launch
+    return res^
+
+
 def _b_add(
     lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
 ) raises -> Res:
     """The `fast_aten_add` cascade."""
+    if _b_bool_result(lhs, rhs):
+        return _b_bool_add(lhs, rhs, v_f64(alpha_v) != 0.0, dst)
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
     if lhs.is_t and dev(lhs.t.value().device)[].api == "metal":

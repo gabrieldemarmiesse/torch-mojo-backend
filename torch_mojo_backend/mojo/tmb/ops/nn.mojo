@@ -49,7 +49,7 @@ from tmb.backend.abi import (
     v_is_none,
     v_tensor,
 )
-from tmb.backend.device import ctx_for, ctx_ptr
+from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK, _f64_slot
 from tmb.ops.common import (
@@ -225,6 +225,27 @@ def _spec_unary(family: String, op: String, src: T, dst: T) raises:
     _ = ctx
 
 
+def _softmax_launch(
+    family: String, op: String, log_variant: Bool, src: T, dst: T
+) raises:
+    """One trailing-dim (log-)softmax launch; the float64 kernel takes the
+    variant as a flag, the others are one op per variant."""
+    if op != "SoftmaxF64Spec":
+        _spec_unary(family, op, src, dst)
+        return
+    _one_device(src, dst)
+    var ctx = ctx_for(dst.device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall(family, op)
+    call.arg_dtype(0, src.dtype)
+    call.out_dtype(dst.dtype)
+    call.spec(src.spec(cp))
+    call.spec(dst.spec(cp))
+    call.int(1 if log_variant else 0)
+    call.run()
+    _ = ctx
+
+
 def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
     """`aten::_softmax` / `aten::_log_softmax`.
 
@@ -240,7 +261,11 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
     var dim = v_int(args[unsafe_offset=1])
     var half_to_float = v_bool(args[unsafe_offset=2])
     _require_mojo(self, "softmax")
-    if not _is_float(self.dtype):
+    if self.dtype == DType.float64:
+        # `softmax(x, d, dtype=torch.float64)` casts before it gets here.
+        if dev(self.device)[].api == "metal":
+            unsupported("softmax float64 is unavailable on Apple GPUs")
+    elif not _is_float(self.dtype):
         unsupported("softmax of dtype " + String(self.dtype))
     var work_stype = self.stype
     if half_to_float:
@@ -275,7 +300,9 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
         dim += rank
     var family = String("nn")
     var op = String("SoftmaxSpec")
-    if log_variant:
+    if work.t.dtype == DType.float64:
+        op = String("SoftmaxF64Spec")
+    elif log_variant:
         family = String("reduction")
         op = String("LogSoftmaxSpec")
     if dim == rank - 1:
@@ -283,7 +310,7 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
         var out = own(
             new_tensor(work.t.shape, rank, work.t.stype, work.t.device)
         )
-        _spec_unary(family, op, src.t, out.t)
+        _softmax_launch(family, op, log_variant, src.t, out.t)
         _ = work.t.ptr  # src may borrow work's storage; keep it past the call
         ret_owned(rets, 0, out)
         return
@@ -292,7 +319,7 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
     var view = own(view_strided(work.t, vshape, vstrides, rank, work.t.offset))
     var src = _mat(view.t)
     var tmp = own(new_tensor(vshape, rank, work.t.stype, work.t.device))
-    _spec_unary(family, op, src.t, tmp.t)
+    _softmax_launch(family, op, log_variant, src.t, tmp.t)
     # ATen hands back a contiguous result, so the second swap is a strided
     # write into a fresh contiguous output rather than a returned view.
     var out = own(new_tensor(work.t.shape, rank, work.t.stype, work.t.device))

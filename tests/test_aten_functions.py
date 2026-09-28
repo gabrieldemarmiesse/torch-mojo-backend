@@ -2748,6 +2748,31 @@ def test_aten_gelu_backward_3d_tensor(conf: Conf, dtype: torch.dtype):
         check_outputs(fn, conf, [grad_output, x])
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dim", [0, -1])
+def test_aten_glu(conf: Conf, call_checker: CallChecker, dtype: torch.dtype, dim: int):
+    call_checker.register(aten_functions.aten_glu)
+
+    def fn(x):
+        return aten.glu(x, dim)
+
+    x = (torch.randn(4, 6) * 3).to(dtype)
+    tol = {"atol": 1e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {}
+    check_outputs(fn, conf, [x], **tol)
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_aten_glu_backward(conf: Conf, call_checker: CallChecker, dim: int):
+    call_checker.register(aten_functions.aten_glu_backward)
+
+    def fn(grad, x):
+        return aten.glu_backward(grad, x, dim)
+
+    x = torch.randn(4, 6) * 3
+    grad = torch.randn(2, 6) if dim == 0 else torch.randn(4, 3)
+    check_outputs(fn, conf, [grad, x])
+
+
 def test_aten_gelu_backward_tanh_approx(conf: Conf):
     """Test aten.gelu_backward with tanh approximation"""
 

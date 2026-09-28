@@ -3416,6 +3416,56 @@ def aten_gelu_backward(
     return custom_mojo_ops.gelu_backward(grad_output, input, approximate=approximate)
 
 
+# glu(Tensor self, int dim=-1) -> Tensor
+@map_to(aten.glu)
+def aten_glu(input: MaxTensor, dim: int = -1) -> MaxTensor:
+    """a * sigmoid(b) over the two halves along `dim`, one fused pointwise
+    op (ActivationGluKernel.cu's glu_kernel, halves computed in float)."""
+    a, b = _glu_halves(input, dim)
+    return custom_mojo_ops.pointwise_binary(a, b, "glu")
+
+
+# glu_backward(Tensor grad_output, Tensor self, int dim) -> Tensor
+@map_to(aten.glu_backward)
+def aten_glu_backward(grad_output: MaxTensor, input: MaxTensor, dim: int) -> MaxTensor:
+    """glu_backward_kernel: sigmoid(b) * grad for the first half, (1 -
+    sigmoid(b)) * sigmoid(b) * grad * a for the second, in opmath (float for
+    the half types), concatenated along `dim`."""
+    a, b = _glu_halves(input, dim)
+    wide = input.dtype in (DType.float16, DType.bfloat16)
+    if wide:
+        a, b, grad_output = (F.cast(x, DType.float32) for x in (a, b, grad_output))
+    sig = custom_mojo_ops.elementwise(b, "sigmoid")
+    grad_a = sig * grad_output
+    grad_b = (1 - sig) * sig * grad_output * a
+    result = F.concat([grad_a, grad_b], axis=dim)
+    return F.cast(result, input.dtype) if wide else result
+
+
+def _glu_halves(input: MaxTensor, dim: int) -> tuple[MaxTensor, MaxTensor]:
+    """GatedLinearUnit's checks and the two halves along `dim`."""
+    rank = len(input.shape)
+    if rank == 0:
+        raise ValueError(
+            "glu does not support scalars because halving size must be even"
+        )
+    if not -rank <= dim < rank:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of [{-rank}, {rank - 1}], "
+            f"but got {dim})"
+        )
+    dim = dim % rank
+    size = input.shape[dim]
+    if not isinstance(size, StaticDim):
+        raise NotImplementedError("glu over a symbolic dimension")
+    n = int(size)
+    if n % 2 != 0:
+        raise ValueError(
+            f"Halving dimension must be even, but dimension {dim} is size {n}"
+        )
+    return aten_slice(input, dim, 0, n // 2), aten_slice(input, dim, n // 2, n)
+
+
 # grid_sampler_2d(Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners) -> Tensor
 
 

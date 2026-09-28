@@ -108,6 +108,50 @@ def test_compare_out_tensor_and_scalar(mojo_gpu: str, call_checker: CallChecker)
     torch.testing.assert_close(out3.cpu(), torch.tensor([True, False, True]))
 
 
+@pytest.mark.parametrize("name", list(_COMPARE_OPS))
+@pytest.mark.parametrize(
+    "out_dtype", [torch.float32, torch.float16, torch.int32, torch.int64]
+)
+def test_compare_out_non_bool(mojo_device: str, name: str, out_dtype: torch.dtype):
+    """A comparison casts its bool result into an `out` of any dtype."""
+    fn = _COMPARE_OPS[name][0]
+    a = torch.tensor([[1.0, 2.0, 3.0], [4.0, 2.0, -6.0]])
+    b = torch.tensor([2.0, 2.0, 3.0])
+    for other in (b, 2.0):
+        other_dev = other.to(mojo_device) if isinstance(other, torch.Tensor) else other
+        expected = fn(a, other, out=torch.empty(0, dtype=out_dtype))
+        # A wrong-shape `out` is resized...
+        out = torch.empty(0, dtype=out_dtype, device=mojo_device)
+        assert fn(a.to(mojo_device), other_dev, out=out) is out
+        assert out.dtype == out_dtype
+        torch.testing.assert_close(out.cpu(), expected)
+        # ...a non-contiguous one of the right shape is written through its strides.
+        base = torch.full((3, 2), 7, dtype=out_dtype, device=mojo_device)
+        strided = base.t()
+        fn(a.to(mojo_device), other_dev, out=strided)
+        torch.testing.assert_close(strided.cpu(), expected)
+
+
+@pytest.mark.parametrize("name", list(_COMPARE_OPS))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_compare_inplace_non_bool(mojo_device: str, name: str, dtype: torch.dtype):
+    """`x.eq_(y)` on a non-bool `x` stores 0 / 1 in x's own dtype."""
+    x = torch.tensor([[0.0, 1.0, 2.0], [2.0, -1.0, 5.0]]).to(dtype)
+    y = torch.tensor([2.0, 1.0, 0.0]).to(dtype)
+    for other in (y, 2):
+        other_dev = other.to(mojo_device) if isinstance(other, torch.Tensor) else other
+        expected = getattr(x.clone(), name + "_")(other)
+        got = x.to(mojo_device)
+        assert getattr(got, name + "_")(other_dev) is got
+        assert got.dtype == dtype
+        torch.testing.assert_close(got.cpu(), expected)
+    # A non-contiguous self is written in place through its strides.
+    expected = getattr(x.t().clone(), name + "_")(1)
+    got = x.to(mojo_device).t()
+    getattr(got, name + "_")(1)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
 def test_compare_device_mismatch_raises(mojo_gpu: str):
     a = torch.tensor([1.0]).to(mojo_gpu)
     with pytest.raises(RuntimeError):

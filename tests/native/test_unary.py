@@ -1294,6 +1294,73 @@ def test_log2_integral_promotion(mojo_gpu: str, dtype: torch.dtype):
     torch.testing.assert_close(result.cpu(), torch.log2(data))
 
 
+# unary_float_ops: an integral or bool input computes in the default float
+# dtype (TensorIterator's `promote_integer_inputs_to_float`).
+_PROMOTING_FLOAT_OPS = [
+    "acos",
+    "acosh",
+    "asinh",
+    "atanh",
+    "cos",
+    "cosh",
+    "erf",
+    "exp",
+    "log",
+    "log1p",
+    "reciprocal",
+    "rsqrt",
+    "sigmoid",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
+]
+
+
+@pytest.mark.parametrize("name", _PROMOTING_FLOAT_OPS)
+@pytest.mark.parametrize("dtype", [torch.int64, torch.int32, torch.uint8, torch.bool])
+def test_unary_float_op_integral_promotion(
+    mojo_gpu: str, name: str, dtype: torch.dtype
+):
+    fn = getattr(torch, name)
+    data = torch.tensor([[0, 1, 2], [3, 7, 1]], dtype=dtype)
+    for x in (data, data.t()):  # contiguous and not
+        result = fn(x.to(mojo_gpu))
+        expected = fn(x)
+        assert result.dtype == expected.dtype == torch.get_default_dtype()
+        torch.testing.assert_close(result.cpu(), expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("name", ["sqrt", "exp", "reciprocal", "sigmoid"])
+def test_unary_float_op_integral_out_and_inplace(mojo_gpu: str, name: str):
+    fn = getattr(torch, name)
+    data = torch.tensor([0, 1, 4, 9])
+    # The float result is cast into an `out` of another float dtype...
+    out = torch.empty(0, dtype=torch.float16, device=mojo_gpu)
+    assert fn(data.to(mojo_gpu), out=out) is out
+    torch.testing.assert_close(
+        out.cpu(), fn(data, out=torch.empty(0, dtype=torch.float16))
+    )
+    # ...but never narrowed back into the integer input itself.
+    with pytest.raises(RuntimeError, match="can't be cast to the desired output type"):
+        getattr(data.to(mojo_gpu), name + "_")()
+
+
+def test_sign_bool(mojo_gpu: str):
+    data = torch.tensor([[True, False], [False, True]])
+    result = torch.sign(data.to(mojo_gpu))
+    assert result.dtype == torch.bool
+    torch.testing.assert_close(result.cpu(), torch.sign(data))
+    torch.testing.assert_close(torch.sign(data.t().to(mojo_gpu)).cpu(), data.t())
+    out = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
+    assert torch.sign(data.to(mojo_gpu), out=out) is out
+    torch.testing.assert_close(out.cpu(), data)
+    inplace = data.to(mojo_gpu)
+    inplace.sign_()
+    torch.testing.assert_close(inplace.cpu(), data)
+
+
 def test_log2_out(mojo_gpu: str):
     data = torch.tensor([0.5, 1, 2, 8]).to(mojo_gpu)
     out = torch.empty(4).to(mojo_gpu)

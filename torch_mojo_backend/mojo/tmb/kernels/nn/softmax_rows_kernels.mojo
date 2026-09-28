@@ -19,6 +19,8 @@ from max.gpu import (
 )
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
+from max.gpu.sync import barrier
+from std.memory import AddressSpace, stack_allocation
 from max.gpu.primitives import warp
 from std.math import (
     ceildiv,
@@ -42,6 +44,7 @@ from layout import (
 )
 from nn.softmax import softmax_inline
 
+from tmb.kernels.common.libdevice_port import nv_exp, nv_log
 from tmb.kernels.random.dropout_kernels import _philox4x32_10
 from tmb.kernels.common.op_utils import (
     Arg,
@@ -943,3 +946,140 @@ def _softmax_rows[
         )
     else:
         raise Error("no GPU accelerator available at compile time")
+
+
+# ---------------------------------------------------------------------------
+# float64 row softmax / log-softmax: cunn_SoftMaxForward's three passes in
+# double (SoftMax.cu, accscalar_t = double): the row max, the sum of
+# exp(x - max), then exp(x - max) / sum (softmax) or x - max - log(sum)
+# (log-softmax). libdevice's exp / log ported (`nv_exp` / `nv_log`), since
+# std.math's float64 exp does not lower on every GPU. One block per row,
+# grid-stride over rows; plain scalar loads (float64 is the `dtype=`
+# argument's route, `softmax(x, d, dtype=torch.float64)`, not a hot path).
+# ---------------------------------------------------------------------------
+
+comptime _SM_F64_THREADS = 256
+
+
+@always_inline
+def _exp_f64(x: Float64) -> Float64:
+    """exp in double, 0 at -inf (the libdevice port returns NaN there)."""
+    if x == min_or_neg_inf[DType.float64]():
+        return 0.0
+    return nv_exp(x)
+
+
+@always_inline
+def _block_reduce_f64[is_max: Bool](tid: Int, v: Float64) -> Float64:
+    """The block's max (or sum) of `v`, every thread gets it: a shared-memory
+    tree (the warp-shuffle `block.sum` does not instantiate for float64)."""
+    var red = stack_allocation[
+        _SM_F64_THREADS, DType.float64, address_space=AddressSpace.SHARED
+    ]()
+    red[unsafe_offset=tid] = v
+    barrier()
+    var stride = _SM_F64_THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            var o = red[unsafe_offset=tid + stride]
+            comptime if is_max:
+                red[unsafe_offset=tid] = max(red[unsafe_offset=tid], o)
+            else:
+                red[unsafe_offset=tid] = red[unsafe_offset=tid] + o
+        barrier()
+        stride //= 2
+    var r = red[unsafe_offset=0]
+    barrier()  # every thread has read it before the next reduction writes
+    return r
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_SM_F64_THREADS))
+)
+@__name(t"softmax_rows_f64_log{log}")
+def _softmax_rows_f64_kernel[
+    log: Bool
+](
+    out_ptr: Pointer[Scalar[DType.float64], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[DType.float64], ImmutAnyOrigin],
+    rows_arg: Int64,
+    cols_arg: Int64,
+):
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var tid = Int(thread_idx.x)
+    var row = Int(block_idx.x)
+    while row < rows:
+        var base = row * cols
+        var m = min_or_neg_inf[DType.float64]()
+        var j = tid
+        while j < cols:
+            m = max(m, in_ptr[unsafe_offset=base + j])
+            j += _SM_F64_THREADS
+        var bm = _block_reduce_f64[True](tid, m)
+        var s = Float64(0)
+        j = tid
+        while j < cols:
+            s += _exp_f64(in_ptr[unsafe_offset=base + j] - bm)
+            j += _SM_F64_THREADS
+        var bs = _block_reduce_f64[False](tid, s)
+        comptime if log:
+            var ls = nv_log(bs)
+            j = tid
+            while j < cols:
+                out_ptr[unsafe_offset=base + j] = (
+                    in_ptr[unsafe_offset=base + j] - bm - ls
+                )
+                j += _SM_F64_THREADS
+        else:
+            j = tid
+            while j < cols:
+                out_ptr[unsafe_offset=base + j] = (
+                    _exp_f64(in_ptr[unsafe_offset=base + j] - bm) / bs
+                )
+                j += _SM_F64_THREADS
+        row += Int(grid_dim.x)
+
+
+def softmax_rows_f64(
+    out_addr: Int,
+    in_addr: Int,
+    rows: Int,
+    cols: Int,
+    log: Bool,
+    ctx: DeviceContext,
+) raises:
+    """Softmax (or log-softmax) over the rows of a contiguous (rows, cols)
+    float64 matrix, cols >= 1. GPUs with float64 only."""
+    comptime if has_accelerator() and not has_apple_gpu_accelerator():
+        var out_ptr = _make_ptr[DType.float64](out_addr).as_unsafe_any_origin()
+        var in_ptr = (
+            _make_ptr[DType.float64](in_addr).as_unsafe_any_origin().as_imm()
+        )
+        var grid = min(rows, 32768)
+        if log:
+            _enqueue_cached[_softmax_rows_f64_kernel[True]](
+                ctx,
+                grid,
+                1,
+                1,
+                _SM_F64_THREADS,
+                out_ptr,
+                in_ptr,
+                Int64(rows),
+                Int64(cols),
+            )
+        else:
+            _enqueue_cached[_softmax_rows_f64_kernel[False]](
+                ctx,
+                grid,
+                1,
+                1,
+                _SM_F64_THREADS,
+                out_ptr,
+                in_ptr,
+                Int64(rows),
+                Int64(cols),
+            )
+    else:
+        raise Error("float64 softmax needs a GPU with float64 arithmetic")

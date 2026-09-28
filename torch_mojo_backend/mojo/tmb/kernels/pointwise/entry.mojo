@@ -118,6 +118,8 @@ comptime KINDS_2 = [
     "gcd",
     "gelu_backward_none",
     "gelu_backward_tanh",
+    "glu",
+    "glu_backward_a",
     "hardsigmoid_backward",
     "hardswish_backward",
     "hardtanh_backward",
@@ -168,6 +170,7 @@ comptime KINDS_3 = [
     "bce_backward",
     "bce_logits",
     "clamp",
+    "glu_backward_b",
     "huber_backward",
     "lerp",
     "mse_backward",
@@ -189,6 +192,9 @@ def _heavy_kind[kind: StaticString]() -> Bool:
         or kind == "elu_backward"
         or kind == "mish_backward"
         or kind == "silu_backward"
+        or kind == "glu"
+        or kind == "glu_backward_a"
+        or kind == "glu_backward_b"
         or kind == "softplus_backward"
         or kind == "log_sigmoid_backward"
         or kind == "gelu_backward_none"

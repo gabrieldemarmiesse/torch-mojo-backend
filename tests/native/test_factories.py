@@ -796,3 +796,17 @@ def test_multinomial_argument_errors(mojo_gpu):
         torch.multinomial(torch.rand(2, 2, 2).to(mojo_gpu), 1)
     with pytest.raises(RuntimeError, match="floating-point dtypes"):
         torch.multinomial(torch.ones(3, dtype=torch.int64).to(mojo_gpu), 1)
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.bool])
+def test_native_dropout_backward_integral_grad(mojo_gpu, dtype):
+    """CPU's `grad_output * mask * scale`: an integral or bool gradient comes
+    back in the default float dtype."""
+    grad = torch.tensor([[1, 0, 3], [4, 5, 0]]).to(dtype)
+    mask = torch.tensor([[True, False, True], [False, True, True]])
+    want = torch.ops.aten.native_dropout_backward(grad, mask, 1.25)
+    got = torch.ops.aten.native_dropout_backward(
+        grad.to(mojo_gpu), mask.to(mojo_gpu), 1.25
+    )
+    assert got.dtype == want.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), want)

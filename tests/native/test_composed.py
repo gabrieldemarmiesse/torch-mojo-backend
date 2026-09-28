@@ -622,3 +622,28 @@ def test_softmax_backward(mojo_gpu, dim):
         torch.softmax(ours, dim=dim).backward(grad.to(mojo_gpu))
     assert ours.grad is not None
     torch.testing.assert_close(ours.grad.cpu(), ref.grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dim", [0, -1])
+def test_softmax_backward_half(mojo_gpu, dtype, dim):
+    """A half gradient accumulates in float and rounds once, as CUDA's
+    softmax backward kernel does."""
+    torch.manual_seed(6)
+    out = torch.softmax(torch.randn(6, 50) * 3, dim).to(dtype)
+    grad = torch.randn(6, 50).to(dtype)
+    want = torch.ops.aten._softmax_backward_data(
+        grad.float(), out.float(), dim, torch.float32
+    ).to(dtype)
+    with assert_ran("aten::_softmax_backward_data"):
+        got = torch.ops.aten._softmax_backward_data(
+            grad.to(mojo_gpu), out.to(mojo_gpu), dim, dtype
+        )
+    assert got.dtype == dtype
+    torch.testing.assert_close(got.cpu(), want, atol=1e-3, rtol=1e-2)
+    # half_to_float's backward: a float gradient narrowed to the half input.
+    got = torch.ops.aten._softmax_backward_data(
+        grad.float().to(mojo_gpu), out.float().to(mojo_gpu), dim, dtype
+    )
+    assert got.dtype == dtype
+    torch.testing.assert_close(got.cpu(), want, atol=1e-3, rtol=1e-2)
