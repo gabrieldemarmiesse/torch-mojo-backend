@@ -1,7 +1,7 @@
 # ===----------------------------------------------------------------------=== #
 # Fast eager-mode NN kernels for mojo_device: batch norm (inference),
 # layer norm, row softmax (with optional causal mask), spatial mean,
-# max pool (with indices), embedding gather, and boolean all-reduce.
+# embedding gather, and boolean all-reduce.
 #
 # Same architecture as elementwise.mojo: Python-visible functions get raw
 # integer pointers (tensor `._ptr`, offset pre-applied) plus dtype ints and
@@ -44,7 +44,7 @@ from std.sys.info import (
 )
 from std.utils.coord import Coord
 from std.utils.index import IndexList
-from std.utils.numerics import min_finite, min_or_neg_inf
+from std.utils.numerics import min_finite
 from std.utils.static_tuple import StaticTuple
 
 from tmb.kernels.common.gpu_elementwise import elementwise
@@ -512,123 +512,6 @@ def _attn_decode[
         raise Error("no GPU accelerator available at compile time")
 
 
-# ---------------------------------------------------------------------------
-# Max pool 2D over NCHW contiguous input, with indices (torch semantics:
-# index of the max within the flattened H*W input plane, int64).
-# `planes` is N * C; one parallel task per output element.
-# ---------------------------------------------------------------------------
-
-
-@always_inline
-def _max_pool2d[
-    dtype: DType
-](
-    out_addr: Int,
-    idx_addr: Int,
-    in_addr: Int,
-    in_h: Int,
-    in_w: Int,
-    out_h: Int,
-    out_w: Int,
-    kh: Int,
-    kw: Int,
-    stride_h: Int,
-    stride_w: Int,
-    pad_h: Int,
-    pad_w: Int,
-    dil_h: Int,
-    dil_w: Int,
-    planes: Int,
-    ctx: DeviceContext,
-) raises:
-    var out_ptr = _make_ptr[dtype](out_addr)
-    var idx_ptr = _make_ptr[DType.int64](idx_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-
-    @always_inline
-    @__parameter
-    @__copy_capture(out_ptr, idx_ptr, in_ptr)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        var ow = i % out_w
-        var oh = (i // out_w) % out_h
-        var plane = i // (out_w * out_h)
-        var in_base = plane * in_h * in_w
-        var best = min_or_neg_inf[dtype]()
-        var best_idx = 0
-        for fh in range(kh):
-            var ih = oh * stride_h - pad_h + fh * dil_h
-            if ih < 0 or ih >= in_h:
-                continue
-            for fw in range(kw):
-                var iw = ow * stride_w - pad_w + fw * dil_w
-                if iw < 0 or iw >= in_w:
-                    continue
-                var v = in_ptr[unsafe_offset=in_base + ih * in_w + iw]
-                if v > best:
-                    best = v
-                    best_idx = ih * in_w + iw
-        out_ptr[unsafe_offset=i] = best
-        idx_ptr[unsafe_offset=i] = Int64(best_idx)
-
-    _parallel_for[func](planes * out_h * out_w, ctx)
-
-
-def _max_pool2d_go(
-    out_ptr_obj: Arg,
-    idx_ptr_obj: Arg,
-    in_ptr_obj: Arg,
-    params: Arg,
-    dtype_obj: Arg,
-    device_context_ptr: Arg,
-) raises:
-    var dtype = _raw_dtype_int(dtype_obj)
-    var out_addr = _raw_int(out_ptr_obj)
-    var idx_addr = _raw_int(idx_ptr_obj)
-    var in_addr = _raw_int(in_ptr_obj)
-    var in_h = _raw_tuple_int(params, 0)
-    var in_w = _raw_tuple_int(params, 1)
-    var out_h = _raw_tuple_int(params, 2)
-    var out_w = _raw_tuple_int(params, 3)
-    var kh = _raw_tuple_int(params, 4)
-    var kw = _raw_tuple_int(params, 5)
-    var stride_h = _raw_tuple_int(params, 6)
-    var stride_w = _raw_tuple_int(params, 7)
-    var pad_h = _raw_tuple_int(params, 8)
-    var pad_w = _raw_tuple_int(params, 9)
-    var dil_h = _raw_tuple_int(params, 10)
-    var dil_w = _raw_tuple_int(params, 11)
-    var planes = _raw_tuple_int(params, 12)
-    var ctx = _raw_ctx(device_context_ptr)
-
-    var handled = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if dtype == dt:
-                _max_pool2d[dt](
-                    out_addr,
-                    idx_addr,
-                    in_addr,
-                    in_h,
-                    in_w,
-                    out_h,
-                    out_w,
-                    kh,
-                    kw,
-                    stride_h,
-                    stride_w,
-                    pad_h,
-                    pad_w,
-                    dil_h,
-                    dil_w,
-                    planes,
-                    ctx,
-                )
-                handled = True
-    if not handled:
-        raise Error("unsupported dtype for fast max_pool2d: " + String(dtype))
-
-
 @always_inline
 def _gather0_data_dispatch[
     idx_dtype: DType
@@ -933,221 +816,6 @@ def _cumsum_outer_into[
 
 
 # ---------------------------------------------------------------------------
-# Average pool 2D over NCHW contiguous input (torch semantics). The window at
-# output (oh, ow) covers input rows [oh*sh - ph, ...) intersected with the real
-# input; the divisor honors count_include_pad / divisor_override exactly as
-# aten's cpu_avg_pool2d does. ceil_mode is handled Python-side (only False is
-# passed here). One parallel task per output element (CPU and GPU).
-# ---------------------------------------------------------------------------
-
-
-@always_inline
-def _avg_pool2d[
-    dtype: DType
-](
-    out_addr: Int,
-    in_addr: Int,
-    in_h: Int,
-    in_w: Int,
-    out_h: Int,
-    out_w: Int,
-    kh: Int,
-    kw: Int,
-    stride_h: Int,
-    stride_w: Int,
-    pad_h: Int,
-    pad_w: Int,
-    count_include_pad: Int,
-    divisor_override: Int,
-    planes: Int,
-    ctx: DeviceContext,
-) raises:
-    var out_ptr = _make_ptr[dtype](out_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-
-    @always_inline
-    @__parameter
-    @__copy_capture(out_ptr, in_ptr)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        var ow = i % out_w
-        var oh = (i // out_w) % out_h
-        var plane = i // (out_w * out_h)
-        var in_base = plane * in_h * in_w
-
-        # Window in (possibly padded) coordinates; pool_size uses the padded
-        # extent (before clamping to the real input), matching torch.
-        var ih0 = oh * stride_h - pad_h
-        var iw0 = ow * stride_w - pad_w
-        var ih1 = min(ih0 + kh, in_h + pad_h)
-        var iw1 = min(iw0 + kw, in_w + pad_w)
-        var pool_size = (ih1 - ih0) * (iw1 - iw0)
-        ih0 = max(ih0, 0)
-        iw0 = max(iw0, 0)
-        ih1 = min(ih1, in_h)
-        iw1 = min(iw1, in_w)
-
-        if ih0 >= ih1 or iw0 >= iw1:
-            # Window entirely in padding: torch leaves the output at 0.
-            out_ptr[unsafe_offset=i] = Scalar[dtype](0)
-        else:
-            var divide_factor: Int
-            if divisor_override != 0:
-                divide_factor = divisor_override
-            elif count_include_pad != 0:
-                divide_factor = pool_size
-            else:
-                divide_factor = (ih1 - ih0) * (iw1 - iw0)
-            var total = Float32(0)
-            for ih in range(ih0, ih1):
-                var row = in_base + ih * in_w
-                for iw in range(iw0, iw1):
-                    total += in_ptr[unsafe_offset=row + iw].cast[
-                        DType.float32
-                    ]()
-            out_ptr[unsafe_offset=i] = (total / Float32(divide_factor)).cast[
-                dtype
-            ]()
-
-    _parallel_for[func](planes * out_h * out_w, ctx)
-
-
-def _avg_pool2d_go(
-    out_ptr_obj: Arg,
-    in_ptr_obj: Arg,
-    params: Arg,
-    dtype_obj: Arg,
-    device_context_ptr: Arg,
-) raises:
-    var dtype = _raw_dtype_int(dtype_obj)
-    var out_addr = _raw_int(out_ptr_obj)
-    var in_addr = _raw_int(in_ptr_obj)
-    var in_h = _raw_tuple_int(params, 0)
-    var in_w = _raw_tuple_int(params, 1)
-    var out_h = _raw_tuple_int(params, 2)
-    var out_w = _raw_tuple_int(params, 3)
-    var kh = _raw_tuple_int(params, 4)
-    var kw = _raw_tuple_int(params, 5)
-    var stride_h = _raw_tuple_int(params, 6)
-    var stride_w = _raw_tuple_int(params, 7)
-    var pad_h = _raw_tuple_int(params, 8)
-    var pad_w = _raw_tuple_int(params, 9)
-    var count_include_pad = _raw_tuple_int(params, 10)
-    var divisor_override = _raw_tuple_int(params, 11)
-    var planes = _raw_tuple_int(params, 12)
-    var ctx = _raw_ctx(device_context_ptr)
-
-    var handled = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if dtype == dt:
-                _avg_pool2d[dt](
-                    out_addr,
-                    in_addr,
-                    in_h,
-                    in_w,
-                    out_h,
-                    out_w,
-                    kh,
-                    kw,
-                    stride_h,
-                    stride_w,
-                    pad_h,
-                    pad_w,
-                    count_include_pad,
-                    divisor_override,
-                    planes,
-                    ctx,
-                )
-                handled = True
-    if not handled:
-        raise Error("unsupported dtype for fast avg_pool2d: " + String(dtype))
-
-
-# ---------------------------------------------------------------------------
-# Adaptive average pool 2D over NCHW contiguous input. For output cell
-# (oh, ow) the input window is [start(oh), end(oh)) x [start(ow), end(ow))
-# with torch's integer start/end index formulas; the divisor is the window
-# area (no padding). One parallel task per output element (CPU and GPU).
-# ---------------------------------------------------------------------------
-
-
-@always_inline
-def _adaptive_avg_pool2d[
-    dtype: DType
-](
-    out_addr: Int,
-    in_addr: Int,
-    in_h: Int,
-    in_w: Int,
-    out_h: Int,
-    out_w: Int,
-    planes: Int,
-    ctx: DeviceContext,
-) raises:
-    var out_ptr = _make_ptr[dtype](out_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-
-    @always_inline
-    @__parameter
-    @__copy_capture(out_ptr, in_ptr)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        var ow = i % out_w
-        var oh = (i // out_w) % out_h
-        var plane = i // (out_w * out_h)
-        var in_base = plane * in_h * in_w
-
-        # start_index(a, b, c) = (a // b) * c + ((a % b) * c) // b
-        # end_index(a, b, c)   = 1 + ((a + 1) * c - 1) // b
-        var ih0 = (oh // out_h) * in_h + ((oh % out_h) * in_h) // out_h
-        var ih1 = 1 + ((oh + 1) * in_h - 1) // out_h
-        var iw0 = (ow // out_w) * in_w + ((ow % out_w) * in_w) // out_w
-        var iw1 = 1 + ((ow + 1) * in_w - 1) // out_w
-        var area = (ih1 - ih0) * (iw1 - iw0)
-
-        var total = Float32(0)
-        for ih in range(ih0, ih1):
-            var row = in_base + ih * in_w
-            for iw in range(iw0, iw1):
-                total += in_ptr[unsafe_offset=row + iw].cast[DType.float32]()
-        out_ptr[unsafe_offset=i] = (total / Float32(area)).cast[dtype]()
-
-    _parallel_for[func](planes * out_h * out_w, ctx)
-
-
-def _adaptive_avg_pool2d_go(
-    out_ptr_obj: Arg,
-    in_ptr_obj: Arg,
-    params: Arg,
-    dtype_obj: Arg,
-    device_context_ptr: Arg,
-) raises:
-    var dtype = _raw_dtype_int(dtype_obj)
-    var out_addr = _raw_int(out_ptr_obj)
-    var in_addr = _raw_int(in_ptr_obj)
-    var in_h = _raw_tuple_int(params, 0)
-    var in_w = _raw_tuple_int(params, 1)
-    var out_h = _raw_tuple_int(params, 2)
-    var out_w = _raw_tuple_int(params, 3)
-    var planes = _raw_tuple_int(params, 4)
-    var ctx = _raw_ctx(device_context_ptr)
-
-    var handled = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if dtype == dt:
-                _adaptive_avg_pool2d[dt](
-                    out_addr, in_addr, in_h, in_w, out_h, out_w, planes, ctx
-                )
-                handled = True
-    if not handled:
-        raise Error(
-            "unsupported dtype for fast adaptive_avg_pool2d: " + String(dtype)
-        )
-
-
-# ---------------------------------------------------------------------------
 # METH_FASTCALL wrappers: raw CPython argument unpacking (no owning
 # PythonObject per argument). Argument types are guaranteed by the internal
 # Python callers; raise sites are unsupported-dtype guards gated upstream.
@@ -1202,40 +870,6 @@ def _softmax_rows_dropout_dispatcher(argv: Argv, argc: Int) raises:
         args[unsafe_offset=12],
         args[unsafe_offset=13],
         args[unsafe_offset=14],
-    )
-
-
-def _max_pool2d_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _max_pool2d_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
-
-
-def _avg_pool2d_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _avg_pool2d_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-    )
-
-
-def _adaptive_avg_pool2d_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _adaptive_avg_pool2d_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
     )
 
 
@@ -1605,15 +1239,6 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["SoftmaxRowsDropoutF32"]():
             _softmax_rows_dropout_dispatcher(argv, argc)
-            return 0
-        comptime if _op_on["MaxPool2dWithIndices"]():
-            _max_pool2d_dispatcher(argv, argc)
-            return 0
-        comptime if _op_on["AvgPool2d"]():
-            _avg_pool2d_dispatcher(argv, argc)
-            return 0
-        comptime if _op_on["AdaptiveAvgPool2d"]():
-            _adaptive_avg_pool2d_dispatcher(argv, argc)
             return 0
         comptime if _op_on["Gather0"]():
             _gather0_dispatcher(argv, argc)

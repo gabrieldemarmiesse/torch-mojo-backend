@@ -3,7 +3,9 @@
 Driven through the public functional entry points (F.conv2d,
 F.max_pool2d, F.interpolate, ...), which reach the registered aten ops:
 convolution, convolution_backward (called directly), max_pool2d_with_indices (max_pool2d is composite over it),
-_adaptive_avg_pool2d, avg_pool2d, upsample_bilinear2d, upsample_nearest2d.
+_adaptive_avg_pool2d, avg_pool2d, upsample_bilinear2d, upsample_nearest2d,
+the 3-D and adaptive-max pools, max_unpool and im2col / col2im
+(F.unfold / F.fold). The pooling backwards are called as aten ops.
 The other upsampling ops (1-d, 3-d, nearest-exact, bicubic, antialiased
 bilinear) and every upsampling backward are called directly as aten ops,
 one test per spatial rank with the op as a parametrize axis.
@@ -56,6 +58,21 @@ ADAPTIVE_SHAPES: dict[str, tuple[int, int, int, int, int]] = {
 POOL_SHAPES: dict[str, tuple[int, int, int, int, int, int, int]] = {
     "N32xC64x112x112_k2s2": (32, 64, 112, 112, 2, 2, 0),
     "N8xC256x28x28_k3s2": (8, 256, 28, 28, 3, 2, 1),
+}
+# (N, C, D, H, W, kernel, stride, padding); one awkward volume on purpose.
+POOL3D_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int]] = {
+    "N4xC32x16x28x28_k2s2": (4, 32, 16, 28, 28, 2, 2, 0),
+    "N2xC16x9x21x33_k3s2": (2, 16, 9, 21, 33, 3, 2, 1),
+}
+# (N, C, D, H, W, output)
+ADAPTIVE3D_SHAPES: dict[str, tuple[int, int, int, int, int, int]] = {
+    "N4xC64x8x28x28_o4": (4, 64, 8, 28, 28, 4),
+    "N2xC32x9x21x33_o5": (2, 32, 9, 21, 33, 5),
+}
+# (N, C, H, W, kernel, stride, padding) for F.unfold / F.fold.
+FOLD_SHAPES: dict[str, tuple[int, int, int, int, int, int, int]] = {
+    "N8xC64x56x56_k3s1": (8, 64, 56, 56, 3, 1, 1),
+    "N4xC32x37x53_k4s2": (4, 32, 37, 53, 4, 2, 1),
 }
 # (N, C, H, W)
 UPSAMPLE_SHAPES: dict[str, tuple[int, int, int, int]] = {
@@ -114,22 +131,70 @@ COVERS: dict[str, str] = {
     "aten::upsample_bilinear2d": "test_upsample_bilinear2d",
     "aten::upsample_nearest2d": "test_upsample_nearest2d",
     **{f"aten::{name}": test for test, ops in _UPSAMPLE_TESTS.items() for name in ops},
+    "aten::max_pool2d_with_indices_backward": "test_max_pool2d_backward",
+    "aten::avg_pool2d_backward": "test_avg_pool2d_backward",
+    "aten::_adaptive_avg_pool2d_backward": "test_adaptive_avg_pool2d_backward",
+    "aten::adaptive_max_pool2d": "test_adaptive_max_pool2d",
+    "aten::adaptive_max_pool2d_backward": "test_adaptive_max_pool2d_backward",
+    "aten::max_pool3d_with_indices": "test_max_pool3d",
+    "aten::max_pool3d_with_indices_backward": "test_max_pool3d_backward",
+    "aten::avg_pool3d": "test_avg_pool3d",
+    "aten::avg_pool3d_backward": "test_avg_pool3d_backward",
+    "aten::_adaptive_avg_pool3d": "test_adaptive_avg_pool3d",
+    "aten::_adaptive_avg_pool3d_backward": "test_adaptive_avg_pool3d_backward",
+    "aten::adaptive_max_pool3d": "test_adaptive_max_pool3d",
+    "aten::adaptive_max_pool3d_backward": "test_adaptive_max_pool3d_backward",
+    "aten::max_unpool2d": "test_max_unpool2d",
+    "aten::max_unpool3d": "test_max_unpool3d",
+    "aten::im2col": "test_im2col (F.unfold)",
+    "aten::col2im": "test_col2im (F.fold)",
 }
 
 _UPSAMPLE_OUT = (
     "out-variant plumbing over an already-benchmarked functional impl: the "
     "same resample kernel, written into the caller's tensor"
 )
+
+_OUT = (
+    "out-variant plumbing over the benchmarked functional op (compute, then "
+    "copy into the caller's tensor)"
+)
 SKIPPED: dict[str, str] = {
-    f"aten::{name}{suffix}": _UPSAMPLE_OUT
-    for name in (
-        "upsample_nearest2d",
-        "upsample_bilinear2d",
-        *UPSAMPLE1D_OPS,
-        *UPSAMPLE2D_OPS,
-        *UPSAMPLE3D_OPS,
-    )
-    for suffix in (".out", "_backward.grad_input")
+    **{
+        f"aten::{name}{suffix}": _UPSAMPLE_OUT
+        for name in (
+            "upsample_nearest2d",
+            "upsample_bilinear2d",
+            *UPSAMPLE1D_OPS,
+            *UPSAMPLE2D_OPS,
+            *UPSAMPLE3D_OPS,
+        )
+        for suffix in (".out", "_backward.grad_input")
+    },
+    **{
+        name: _OUT
+        for name in (
+            "aten::adaptive_avg_pool2d.out",
+            "aten::adaptive_avg_pool3d.out",
+            "aten::adaptive_avg_pool3d_backward.grad_input",
+            "aten::adaptive_max_pool2d.out",
+            "aten::adaptive_max_pool2d_backward.grad_input",
+            "aten::adaptive_max_pool3d.out",
+            "aten::adaptive_max_pool3d_backward.grad_input",
+            "aten::avg_pool2d.out",
+            "aten::avg_pool2d_backward.grad_input",
+            "aten::avg_pool3d.out",
+            "aten::avg_pool3d_backward.grad_input",
+            "aten::col2im.out",
+            "aten::im2col.out",
+            "aten::max_pool2d_with_indices.out",
+            "aten::max_pool2d_with_indices_backward.grad_input",
+            "aten::max_pool3d_with_indices.out",
+            "aten::max_pool3d_with_indices_backward.grad_input",
+            "aten::max_unpool2d.out",
+            "aten::max_unpool3d.out",
+        )
+    },
 }
 
 
@@ -433,3 +498,348 @@ def test_upsample3d_backward(
     mojo_device: torch.device,
 ):
     _bench_upsample(op_name, 3, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+# ---------------------------------------------------------------------------
+# Pooling backwards, 3-D and adaptive-max pools, unpooling, unfold / fold
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", POOL_SHAPES)
+@pytest.mark.bench_op("max_pool2d_with_indices_backward")
+def test_max_pool2d_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w, k, stride, pad = POOL_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    out_ref, idx_ref = F.max_pool2d(x_ref, k, stride, pad, return_indices=True)
+    out_our, idx_our = F.max_pool2d(x_our, k, stride, pad, return_indices=True)
+    g_ref, g_our = both(
+        torch.randn(out_ref.shape, dtype=out_ref.dtype), hw, mojo_device
+    )
+    tail = ([k, k], [stride, stride], [pad, pad], [1, 1], False)
+    bench.run(
+        lambda: torch.ops.aten.max_pool2d_with_indices_backward(
+            g_ref, x_ref, *tail, idx_ref
+        ),
+        lambda: torch.ops.aten.max_pool2d_with_indices_backward(
+            g_our, x_our, *tail, idx_our
+        ),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", POOL_SHAPES)
+@pytest.mark.bench_op("avg_pool2d_backward")
+def test_avg_pool2d_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w, k, stride, pad = POOL_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    out_shape = F.avg_pool2d(x_ref, k, stride, pad).shape
+    g_ref, g_our = both(torch.randn(out_shape, dtype=x_ref.dtype), hw, mojo_device)
+    tail = ([k, k], [stride, stride], [pad, pad], False, True, None)
+    bench.run(
+        lambda: torch.ops.aten.avg_pool2d_backward(g_ref, x_ref, *tail),
+        lambda: torch.ops.aten.avg_pool2d_backward(g_our, x_our, *tail),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", ADAPTIVE_SHAPES)
+@pytest.mark.bench_op("_adaptive_avg_pool2d_backward")
+def test_adaptive_avg_pool2d_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w, out = ADAPTIVE_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    g_ref, g_our = both(
+        torch.randn(n, c, out, out, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.ops.aten._adaptive_avg_pool2d_backward(g_ref, x_ref),
+        lambda: torch.ops.aten._adaptive_avg_pool2d_backward(g_our, x_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", ADAPTIVE_SHAPES)
+@pytest.mark.bench_op("adaptive_max_pool2d")
+def test_adaptive_max_pool2d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w, out = ADAPTIVE_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: F.adaptive_max_pool2d(x_ref, (out, out)),
+        lambda: F.adaptive_max_pool2d(x_our, (out, out)),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", ADAPTIVE_SHAPES)
+@pytest.mark.bench_op("adaptive_max_pool2d_backward")
+def test_adaptive_max_pool2d_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w, out = ADAPTIVE_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    _, idx_ref = F.adaptive_max_pool2d(x_ref, (out, out), return_indices=True)
+    _, idx_our = F.adaptive_max_pool2d(x_our, (out, out), return_indices=True)
+    g_ref, g_our = both(
+        torch.randn(n, c, out, out, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.ops.aten.adaptive_max_pool2d_backward(g_ref, x_ref, idx_ref),
+        lambda: torch.ops.aten.adaptive_max_pool2d_backward(g_our, x_our, idx_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", POOL3D_SHAPES)
+@pytest.mark.bench_op("max_pool3d_with_indices")
+def test_max_pool3d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, k, stride, pad = POOL3D_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, d, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: F.max_pool3d(x_ref, k, stride, pad),
+        lambda: F.max_pool3d(x_our, k, stride, pad),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", POOL3D_SHAPES)
+@pytest.mark.bench_op("max_pool3d_with_indices_backward")
+def test_max_pool3d_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, k, stride, pad = POOL3D_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, d, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    out_ref, idx_ref = F.max_pool3d(x_ref, k, stride, pad, return_indices=True)
+    _, idx_our = F.max_pool3d(x_our, k, stride, pad, return_indices=True)
+    g_ref, g_our = both(
+        torch.randn(out_ref.shape, dtype=out_ref.dtype), hw, mojo_device
+    )
+    tail = ([k] * 3, [stride] * 3, [pad] * 3, [1, 1, 1], False)
+    bench.run(
+        lambda: torch.ops.aten.max_pool3d_with_indices_backward(
+            g_ref, x_ref, *tail, idx_ref
+        ),
+        lambda: torch.ops.aten.max_pool3d_with_indices_backward(
+            g_our, x_our, *tail, idx_our
+        ),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", POOL3D_SHAPES)
+@pytest.mark.bench_op("avg_pool3d")
+def test_avg_pool3d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, k, stride, pad = POOL3D_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, d, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: F.avg_pool3d(x_ref, k, stride, pad),
+        lambda: F.avg_pool3d(x_our, k, stride, pad),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", POOL3D_SHAPES)
+@pytest.mark.bench_op("avg_pool3d_backward")
+def test_avg_pool3d_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, k, stride, pad = POOL3D_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, d, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    out_shape = F.avg_pool3d(x_ref, k, stride, pad).shape
+    g_ref, g_our = both(torch.randn(out_shape, dtype=x_ref.dtype), hw, mojo_device)
+    tail = ([k] * 3, [stride] * 3, [pad] * 3, False, True, None)
+    bench.run(
+        lambda: torch.ops.aten.avg_pool3d_backward(g_ref, x_ref, *tail),
+        lambda: torch.ops.aten.avg_pool3d_backward(g_our, x_our, *tail),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", ADAPTIVE3D_SHAPES)
+@pytest.mark.bench_op("_adaptive_avg_pool3d")
+def test_adaptive_avg_pool3d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, out = ADAPTIVE3D_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, d, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: F.adaptive_avg_pool3d(x_ref, out),
+        lambda: F.adaptive_avg_pool3d(x_our, out),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", ADAPTIVE3D_SHAPES)
+@pytest.mark.bench_op("_adaptive_avg_pool3d_backward")
+def test_adaptive_avg_pool3d_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, out = ADAPTIVE3D_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, d, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    g_ref, g_our = both(
+        torch.randn(n, c, out, out, out, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.ops.aten._adaptive_avg_pool3d_backward(g_ref, x_ref),
+        lambda: torch.ops.aten._adaptive_avg_pool3d_backward(g_our, x_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", ADAPTIVE3D_SHAPES)
+@pytest.mark.bench_op("adaptive_max_pool3d")
+def test_adaptive_max_pool3d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, out = ADAPTIVE3D_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, d, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: F.adaptive_max_pool3d(x_ref, out),
+        lambda: F.adaptive_max_pool3d(x_our, out),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", ADAPTIVE3D_SHAPES)
+@pytest.mark.bench_op("adaptive_max_pool3d_backward")
+def test_adaptive_max_pool3d_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, out = ADAPTIVE3D_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, d, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    _, idx_ref = F.adaptive_max_pool3d(x_ref, out, return_indices=True)
+    _, idx_our = F.adaptive_max_pool3d(x_our, out, return_indices=True)
+    g_ref, g_our = both(
+        torch.randn(n, c, out, out, out, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.ops.aten.adaptive_max_pool3d_backward(g_ref, x_ref, idx_ref),
+        lambda: torch.ops.aten.adaptive_max_pool3d_backward(g_our, x_our, idx_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", POOL_SHAPES)
+@pytest.mark.bench_op("max_unpool2d")
+def test_max_unpool2d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w, k, stride, pad = POOL_SHAPES[shape_id]
+    x = torch.randn(n, c, h, w, dtype=DTYPES[dtype_id])
+    pooled, idx = F.max_pool2d(x, k, stride, pad, return_indices=True)
+    p_ref, p_our = both(pooled, hw, mojo_device)
+    i_ref, i_our = both(idx, hw, mojo_device)
+    bench.run(
+        lambda: F.max_unpool2d(
+            p_ref, i_ref, (k, k), (stride, stride), (pad, pad), (h, w)
+        ),
+        lambda: F.max_unpool2d(
+            p_our, i_our, (k, k), (stride, stride), (pad, pad), (h, w)
+        ),
+        flops=float(x.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", POOL3D_SHAPES)
+@pytest.mark.bench_op("max_unpool3d")
+def test_max_unpool3d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, k, stride, pad = POOL3D_SHAPES[shape_id]
+    x = torch.randn(n, c, d, h, w, dtype=DTYPES[dtype_id])
+    pooled, idx = F.max_pool3d(x.float(), k, stride, pad, return_indices=True)
+    pooled = pooled.to(x.dtype)
+    p_ref, p_our = both(pooled, hw, mojo_device)
+    i_ref, i_our = both(idx, hw, mojo_device)
+    size = (d, h, w)
+    bench.run(
+        lambda: F.max_unpool3d(p_ref, i_ref, (k,) * 3, (stride,) * 3, (pad,) * 3, size),
+        lambda: F.max_unpool3d(p_our, i_our, (k,) * 3, (stride,) * 3, (pad,) * 3, size),
+        flops=float(x.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", FOLD_SHAPES)
+@pytest.mark.bench_op("im2col")
+def test_im2col(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w, k, stride, pad = FOLD_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: F.unfold(x_ref, k, padding=pad, stride=stride),
+        lambda: F.unfold(x_our, k, padding=pad, stride=stride),
+        flops=float(x_ref.numel() * k * k),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", FOLD_SHAPES)
+@pytest.mark.bench_op("col2im")
+def test_col2im(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w, k, stride, pad = FOLD_SHAPES[shape_id]
+    cols = F.unfold(
+        torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), k, padding=pad, stride=stride
+    )
+    c_ref, c_our = both(cols, hw, mojo_device)
+    bench.run(
+        lambda: F.fold(c_ref, (h, w), k, padding=pad, stride=stride),
+        lambda: F.fold(c_our, (h, w), k, padding=pad, stride=stride),
+        flops=float(cols.numel()),
+    )
