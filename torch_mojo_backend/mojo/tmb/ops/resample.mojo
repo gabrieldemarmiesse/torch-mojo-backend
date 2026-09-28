@@ -505,8 +505,13 @@ def op_upsample_backward[
     comptime if MODE >= LINEAR:
         # These backwards zero grad_input before copying grad_output into
         # it, so a grad_input that IS grad_output comes back zeroed.
+        # Only bilinear2d copies from grad_output itself; the linear 1-d,
+        # trilinear, bicubic and antialiased backwards read a
+        # `.contiguous()` of it, which for a strided grad_output is a copy
+        # made before the zeroing -- the values survive there.
         if how == NO_OP and dst.numel > 0:
-            fill_value(dst, 0.0)
+            if (MODE == LINEAR and RANK == 2) or g.contig:
+                fill_value(dst, 0.0)
     if dst.numel > 0 and how != NO_OP:
         var src = own_if_new(contiguous(g), g)
         if identity:

@@ -142,7 +142,8 @@ def test_pad_out_variants(mojo_device, contiguous):
     if contiguous:
         out = torch.empty(0, device=mojo_device)
     else:
-        out = torch.empty(2, 3, 9, 7, device=mojo_device).transpose(-1, -2)
+        out = torch.empty(2, 3, 8, 7, device=mojo_device).transpose(-1, -2)
+        assert out.shape == want.shape and not out.is_contiguous()
     with ran("aten::reflection_pad2d.out"):
         res = torch.ops.aten.reflection_pad2d.out(
             x.to(mojo_device), [1, 2, 3, 0], out=out
@@ -456,4 +457,31 @@ def test_backward_grad_input_is_grad_output(mojo_device, op, extra):
         gm, [3, 4], [1, 2, 3, 4], *extra, grad_input=gm
     )
     want = g if "nearest" in op else torch.zeros_like(g)
+    torch.testing.assert_close(gm.cpu(), want, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("op", "extra", "survives"),
+    [
+        ("upsample_linear1d_backward", [False], True),
+        ("upsample_bicubic2d_backward", [False], True),
+        ("_upsample_bilinear2d_aa_backward", [False], True),
+        ("upsample_bilinear2d_backward", [False], False),
+    ],
+)
+def test_backward_strided_grad_input_is_grad_output(mojo_device, op, extra, survives):
+    """With a strided aliased grad_output, the kernels that read a
+    `.contiguous()` copy of it keep its values; bilinear2d copies from the
+    zeroed tensor itself and returns zeros."""
+    if "linear1d" in op:
+        base = torch.randn(1, 2, 5, 2) + 1
+        g, osize, isize = base[..., 0], [5], [1, 2, 5]
+    else:
+        base = torch.randn(1, 2, 4, 3) + 1
+        g, osize, isize = base.transpose(-1, -2), [3, 4], [1, 2, 3, 4]
+    gm = base.to(mojo_device)
+    gm = gm[..., 0] if "linear1d" in op else gm.transpose(-1, -2)
+    assert not gm.is_contiguous()
+    getattr(torch.ops.aten, op).grad_input(gm, osize, isize, *extra, grad_input=gm)
+    want = g if survives else torch.zeros_like(g)
     torch.testing.assert_close(gm.cpu(), want, atol=0, rtol=0)
