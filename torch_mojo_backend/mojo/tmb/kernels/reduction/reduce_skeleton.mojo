@@ -77,7 +77,7 @@ from tmb.kernels.common.op_utils import (
     _spec_ptr,
     _vec16_phase,
 )
-from tmb.kernels.common.pow_math import powf_c99
+from tmb.kernels.common.pow_math import pow_c99
 from tmb.kernels.common.variant_gates import _dtype_arg_on, _dtype_supported
 
 
@@ -257,23 +257,34 @@ trait ReduceOp:
         ...
 
     # The skeleton calls only the two `_arg` forms below, with the runtime
-    # argument of the launch (the general vector norm's ord; 0 otherwise).
-    # Float32, never Float64: Apple GPUs have no double, and a double kernel
-    # parameter there stalls the build of every op of the family.
-    # Their defaults drop it, so an op without one writes `map` / `finish`
-    # alone and compiles to the same code as before the argument existed.
+    # argument of the launch (the general vector norm's ord; 0 otherwise),
+    # typed by `_arg_dtype`. Their defaults drop it, so an op without one
+    # writes `map` / `finish` alone and compiles to the same code as before
+    # the argument existed.
 
     @staticmethod
     def map_arg[
         in_dt: DType, width: SIMDLength, //, acc: DType
-    ](x: SIMD[in_dt, width], arg: Float32) -> SIMD[acc, width]:
+    ](x: SIMD[in_dt, width], arg: Scalar[_arg_dtype[acc]()]) -> SIMD[
+        acc, width
+    ]:
         return Self.map[acc=acc](x)
 
     @staticmethod
     def finish_arg[
         acc: DType, //, out_dt: DType
-    ](a: Scalar[acc], n: Int, arg: Float32) -> Scalar[out_dt]:
+    ](a: Scalar[acc], n: Int, arg: Scalar[_arg_dtype[acc]()]) -> Scalar[out_dt]:
         return Self.finish[out_dt=out_dt](a, n)
+
+
+@always_inline
+def _arg_dtype[acc: DType]() -> DType:
+    """The runtime argument's dtype: float64 only for a float64 accumulator.
+
+    Apple GPUs have no double, and a double kernel parameter there stalls the
+    build of every op of the family; float64 specializations are never built
+    for them, so every kernel they do build keeps a Float32 argument."""
+    return DType.float64 if acc == DType.float64 else DType.float32
 
 
 # ---------------------------------------------------------------------------
@@ -304,29 +315,14 @@ comptime EXTREMUM_DTYPES: List[DType] = [
     DType.int32,
 ]
 
-# mean and the vector-norm accumulators (ord 0/1/2/+-inf); NOT var's (its own
-# moments kernel, entry.mojo's FLOAT_DTYPES, has no float64 specialization)
-# and NOT NormPOp's (below): op level declines float64 on Apple GPUs, as
-# above.
+# mean and the vector-norm accumulators; NOT var's (its own moments kernel,
+# entry.mojo's FLOAT_DTYPES, has no float64 specialization): op level
+# declines float64 on Apple GPUs, as above.
 comptime FLOAT_ONLY_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
     DType.float64,
-]
-
-# NormPOp (ord=p, any p outside {0, 1, 2, +-inf}): its accumulator is a plain
-# float32 -- `map_arg`/`finish_arg` take `arg` (ord) as a runtime Float32, not
-# a comptime-dtype pair -- so a float64 self would silently compute in less
-# precision than the input asked for. Verified on real CUDA that the two
-# answers differ (a p-norm over 2e5 elements near 1.0), so this is declined
-# outright on EVERY device, not just Apple's: `_decline_normp_float64`
-# (reductions.mojo) keeps it out of `NormPOp.dtypes` from ever being reached,
-# not merely from being compiled here.
-comptime NORMP_DTYPES: List[DType] = [
-    DType.float32,
-    DType.float16,
-    DType.bfloat16,
 ]
 
 comptime TRUTHY_DTYPES: List[DType] = [
@@ -755,20 +751,20 @@ struct NormL0Op(ReduceOp):
 struct NormPOp(ReduceOp):
     """linalg_vector_norm(ord=p) for any other p: sum of |x|^p, then ^(1/p).
 
-    CUDA's `NormOps`: p is cast to the float accumulator once, each element
-    is `powf(|x|, p)` and the root is `powf(acc, 1.0f / p)`, both through
-    `powf_c99` (CUDA's own powf on NVIDIA). A negative p is refused on an
-    empty reduce dim by the host; with elements, |0|^p = inf and the root of
-    inf is 0, as in torch.
+    CUDA's `NormOps`: p is cast to the accumulator (float, double for a
+    float64 operand) once, each element is `pow(|x|, p)` and the root is
+    `pow(acc, 1 / p)`, both through `pow_c99` (CUDA's own powf on NVIDIA for
+    float). A negative p is refused on an empty reduce dim by the host;
+    with elements, |0|^p = inf and the root of inf is 0, as in torch.
     """
 
     comptime name = "normp"
-    comptime dtypes = NORMP_DTYPES
+    comptime dtypes = FLOAT_ONLY_DTYPES
     comptime errors_on_empty_axis = False
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
@@ -787,12 +783,13 @@ struct NormPOp(ReduceOp):
     @staticmethod
     def map_arg[
         in_dt: DType, width: SIMDLength, //, acc: DType
-    ](x: SIMD[in_dt, width], arg: Float32) -> SIMD[acc, width]:
-        comptime assert acc == DType.float32
+    ](x: SIMD[in_dt, width], arg: Scalar[_arg_dtype[acc]()]) -> SIMD[
+        acc, width
+    ]:
         var ax = abs(x.cast[acc]())
         var r = SIMD[acc, width]()
         comptime for i in range(width):
-            r[i] = powf_c99(ax[i].cast[DType.float32](), arg).cast[acc]()
+            r[i] = pow_c99(ax[i], arg.cast[acc]())
         return r
 
     @staticmethod
@@ -810,14 +807,13 @@ struct NormPOp(ReduceOp):
     @staticmethod
     def finish_arg[
         acc: DType, //, out_dt: DType
-    ](a: Scalar[acc], n: Int, arg: Float32) -> Scalar[out_dt]:
-        comptime assert acc == DType.float32
+    ](a: Scalar[acc], n: Int, arg: Scalar[_arg_dtype[acc]()]) -> Scalar[out_dt]:
         # CUDA fills an empty input's output with 0 instead of reducing
         # (`norm_kernel_cuda`); only p = NaN tells that from pow(0, 1/p).
         if n == 0:
             return 0
-        var root = Float32(1.0) / arg
-        return powf_c99(a.cast[DType.float32](), root).cast[out_dt]()
+        var root = Scalar[acc](1.0) / arg.cast[acc]()
+        return pow_c99(a, root).cast[out_dt]()
 
 
 struct MaxOp(ReduceOp):
@@ -1138,7 +1134,7 @@ def _scan_contig[
     vec_start: Int,
     tail_start: Int,
     lane: Int,
-    arg: Float32,
+    arg: Scalar[_arg_dtype[acc]()],
 ) -> Scalar[acc]:
     """One lane's share of a contiguous shard, over a `lanes`-wide group.
 
@@ -1195,7 +1191,7 @@ def _reduce_contig_kernel[
     cols_arg: Int64,
     outputs_arg: Int64,
     splits_arg: Int64,
-    arg: Float32,
+    arg: Scalar[_arg_dtype[Op.acc_dtype[dtype]()]()],
 ):
     """A `lanes`-wide group walks its shard of one row with 16-byte vector
     loads and folds the accumulator; grid is (row group, split).
@@ -1297,7 +1293,7 @@ def _reduce_strided_kernel[
     inner_arg: Int64,
     outputs_arg: Int64,
     splits_arg: Int64,
-    arg: Float32,
+    arg: Scalar[_arg_dtype[Op.acc_dtype[dtype]()]()],
 ):
     """One thread per output column, walking down the reduced axis with stride
     `inner`.
@@ -1360,7 +1356,7 @@ def _reduce_merge_thread_kernel[
     outputs_arg: Int64,
     splits_arg: Int64,
     reduce_arg: Int64,
-    arg: Float32,
+    arg: Scalar[_arg_dtype[Op.acc_dtype[dtype]()]()],
 ):
     """Many outputs: one thread each. The workspace is split-major, so the
     threads of a warp read consecutive addresses at every step."""
@@ -1390,7 +1386,7 @@ def _reduce_merge_block_kernel[
     outputs_arg: Int64,
     splits_arg: Int64,
     reduce_arg: Int64,
-    arg: Float32,
+    arg: Scalar[_arg_dtype[Op.acc_dtype[dtype]()]()],
 ):
     """Few outputs (the full-reduction end of the range): one block each,
     because a single thread walking hundreds of partials would serialize the
@@ -1450,12 +1446,13 @@ def _reduce_generic[
     reduce_n: Int,
     inner: Int,
     ctx: DeviceContext,
-    arg: Float32 = 0.0,
+    arg: Float64 = 0.0,
 ) raises:
     """Reduce `in` viewed as (outer, reduce_n, inner) into `outer * inner`
     contiguous outputs, with `Op`'s algebra and runtime argument."""
     comptime acc = Op.acc_dtype[dtype]()
     comptime out_dt = Op.out_dtype[dtype]()
+    var karg = Scalar[_arg_dtype[acc]()](arg)
     var out_ptr = _make_ptr[out_dt](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
     var outputs = outer * inner
@@ -1507,7 +1504,7 @@ def _reduce_generic[
                         Int64(reduce_n),
                         Int64(outputs),
                         Int64(1),
-                        arg,
+                        karg,
                     )
                     return
                 _enqueue_cached[_reduce_contig_kernel[Op, dtype, RED_THREADS]](
@@ -1522,7 +1519,7 @@ def _reduce_generic[
                     Int64(reduce_n),
                     Int64(outputs),
                     Int64(1),
-                    arg,
+                    karg,
                 )
             else:
                 _enqueue_cached[_reduce_strided_kernel[Op, dtype]](
@@ -1538,7 +1535,7 @@ def _reduce_generic[
                     Int64(inner),
                     Int64(outputs),
                     Int64(1),
-                    arg,
+                    karg,
                 )
             return
 
@@ -1562,7 +1559,7 @@ def _reduce_generic[
                 Int64(reduce_n),
                 Int64(outputs),
                 Int64(splits),
-                arg,
+                karg,
             )
         else:
             _enqueue_cached[_reduce_strided_kernel[Op, dtype]](
@@ -1578,7 +1575,7 @@ def _reduce_generic[
                 Int64(inner),
                 Int64(outputs),
                 Int64(splits),
-                arg,
+                karg,
             )
 
         # Few outputs cannot keep the device busy one thread each, so they get
@@ -1596,7 +1593,7 @@ def _reduce_generic[
                 Int64(outputs),
                 Int64(splits),
                 Int64(reduce_n),
-                arg,
+                karg,
             )
         else:
             _enqueue_cached[_reduce_merge_thread_kernel[Op, dtype]](
@@ -1610,7 +1607,7 @@ def _reduce_generic[
                 Int64(outputs),
                 Int64(splits),
                 Int64(reduce_n),
-                arg,
+                karg,
             )
         # Dropping `ws` schedules a stream-ordered free after the kernels.
         _ = ws^
@@ -1634,14 +1631,12 @@ def _rowred_arg_spec_into_go[
 ](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, arg_o: Arg, out_o: Arg,) raises:
     """`_rowred_spec_into_go` with the op's runtime argument in the slot
     before the output (the general vector norm's ord)."""
-    _rowred_spec_into[Op](
-        a_o, rdims_t, keepdim_o, out_o, Float32(_raw_f64(arg_o))
-    )
+    _rowred_spec_into[Op](a_o, rdims_t, keepdim_o, out_o, _raw_f64(arg_o))
 
 
 def _rowred_spec_into[
     Op: ReduceOp
-](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, out_o: Arg, arg: Float32) raises:
+](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, out_o: Arg, arg: Float64) raises:
     """TensorSpec entry for one scalar reduction (agents_docs/tensor_spec_design.md).
 
     The caller (`_reduce_into` in ops/reductions.mojo) owns dtype promotion

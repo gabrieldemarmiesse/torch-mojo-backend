@@ -2552,21 +2552,6 @@ def test_norm_dtype_out_float64(mojo_gpu):
         torch.linalg.vector_norm(x64.to(mojo_gpu), dim=0, dtype=torch.float32)
 
 
-def test_norm_general_p_declines_float64(mojo_gpu):
-    """NormPOp (any ord outside {0, 1, 2, +-inf}) keeps a plain float32
-    accumulator, unlike the dedicated-ord accumulators, which all use
-    `_float_acc` and so admit float64: a float64 self, or `dtype=
-    torch.float64` on another float input, would silently compute in less
-    precision than asked for (verified on real CUDA that this measurably
-    differs), so both are declined -- on every device, not just Apple's."""
-    x64 = torch.randn(4, 5, dtype=torch.float64).to(mojo_gpu)
-    with pytest.raises(NotImplementedError):
-        torch.linalg.vector_norm(x64, ord=3, dim=1)
-    x32 = torch.randn(4, 5, dtype=torch.float32).to(mojo_gpu)
-    with pytest.raises(NotImplementedError):
-        torch.linalg.vector_norm(x32, ord=3, dim=1, dtype=torch.float64)
-
-
 def test_norm_general_p(mojo_gpu):
     x = torch.randn(4, 5)
     d = x.to(mojo_gpu)
@@ -2611,15 +2596,23 @@ _GENERAL_P = [3, 0.5, 1.5, -1, -2, 4]
 
 
 @pytest.mark.parametrize("p", _GENERAL_P)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16]
+)
 @pytest.mark.parametrize(
     "dim,keepdim", [(None, False), (1, False), (0, True), ((0, -1), False), (-1, True)]
 )
 def test_vector_norm_general_p_matches_torch(mojo_gpu, p, dtype, dim, keepdim):
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     x = (torch.randn(6, 357, 79) * 2).to(dtype)
     ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=p, dim=dim, keepdim=keepdim)
     assert ours.dtype == dtype
-    if dtype is torch.float32:
+    if dtype is torch.float64:
+        # Stock CUDA agrees with CPU to 1e-14 here.
+        expected = torch.linalg.vector_norm(x, ord=p, dim=dim, keepdim=keepdim)
+        torch.testing.assert_close(ours.cpu(), expected, rtol=1e-12, atol=0)
+    elif dtype is torch.float32:
         # fp64 reference: CPU and CUDA float32 already differ by ~3e-5 here
         # (p=-2, where the elements nearest 0 dominate the sum).
         expected = torch.linalg.vector_norm(x.double(), ord=p, dim=dim, keepdim=keepdim)
@@ -2644,9 +2637,13 @@ def test_vector_norm_general_p_noncontiguous_and_split(mojo_gpu, p):
 
 
 @pytest.mark.parametrize("p", [*_GENERAL_P, float("nan")])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16]
+)
 def test_vector_norm_general_p_nonfinite_and_zeros(mojo_gpu, p, dtype):
     """|0|^p = inf for p < 0 (so the norm is 0), inf and NaN go through pow."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     nan, inf = float("nan"), float("inf")
     x = torch.tensor(
         [
@@ -2661,18 +2658,22 @@ def test_vector_norm_general_p_nonfinite_and_zeros(mojo_gpu, p, dtype):
         ],
         dtype=dtype,
     )
+    rtol = 1e-14 if dtype is torch.float64 else 1e-5
     for dim in (0, 1):
         ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=p, dim=dim).cpu()
         expected = torch.linalg.vector_norm(x, ord=p, dim=dim)
-        torch.testing.assert_close(ours, expected, equal_nan=True, rtol=1e-5, atol=0)
+        torch.testing.assert_close(ours, expected, equal_nan=True, rtol=rtol, atol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("p", [*_GENERAL_P, float("nan")])
-def test_vector_norm_general_p_empty(mojo_gpu, p):
+def test_vector_norm_general_p_empty(mojo_gpu, p, dtype):
     """torch refuses p < 0 over an empty reduce dim (no identity); otherwise
     an empty input gives 0, even for p = NaN."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     for shape, dim in (((3, 0), 1), ((3, 0), None), ((0, 5), 1), ((3, 0), 0)):
-        x = torch.empty(shape)
+        x = torch.empty(shape, dtype=dtype)
         try:
             expected = torch.linalg.vector_norm(x, ord=p, dim=dim)
         except RuntimeError:
@@ -2692,16 +2693,45 @@ def test_vector_norm_general_p_size_one_reduce_is_abs(mojo_gpu, p):
 
 
 @pytest.mark.parametrize("p", _GENERAL_P)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_vector_norm_general_p_with_an_accumulation_dtype(mojo_gpu, p, dtype):
+@pytest.mark.parametrize(
+    "dtype,acc",
+    [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float64),
+        (torch.float16, torch.float64),
+        (torch.bfloat16, torch.float64),
+    ],
+)
+def test_vector_norm_general_p_with_an_accumulation_dtype(mojo_gpu, p, dtype, acc):
+    if acc is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     x = torch.randn(64, 257).to(dtype)
-    got = torch.linalg.vector_norm(x.to(mojo_gpu), p, dim=1, dtype=torch.float32)
-    assert got.dtype == torch.float32
+    got = torch.linalg.vector_norm(x.to(mojo_gpu), p, dim=1, dtype=acc)
+    assert got.dtype == acc
     torch.testing.assert_close(
         got.cpu(),
-        torch.linalg.vector_norm(x, p, dim=1, dtype=torch.float32),
-        rtol=1e-5,
+        torch.linalg.vector_norm(x, p, dim=1, dtype=acc),
+        rtol=1e-12 if acc is torch.float64 else 1e-5,
         atol=0,
+    )
+
+
+@pytest.mark.parametrize("p", [3, 0.5, -2])
+def test_vector_norm_general_p_float64_accumulates_in_double(mojo_gpu, p):
+    """Increments of 1e-9 on 1.0 are below float32's resolution, so only a
+    double accumulator reproduces torch here (verified on stock CUDA)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = 1 + 1e-9 * torch.arange(200000, dtype=torch.float64)
+    expected = torch.linalg.vector_norm(x, p)
+    as_f32 = torch.linalg.vector_norm(x.float(), p).double()
+    assert not torch.allclose(as_f32, expected, rtol=1e-9, atol=0)
+    ours = torch.linalg.vector_norm(x.to(mojo_gpu), p).cpu()
+    torch.testing.assert_close(ours, expected, rtol=1e-13, atol=0)
+    base = x.reshape(400, 500).t()  # non-contiguous, strided reduce
+    ours = torch.linalg.vector_norm(base.to(mojo_gpu), p, dim=0).cpu()
+    torch.testing.assert_close(
+        ours, torch.linalg.vector_norm(base, p, dim=0), rtol=1e-13, atol=0
     )
 
 
@@ -2719,6 +2749,30 @@ def test_vector_norm_general_p_out_resizes(mojo_gpu, p):
         wide[:, 0].cpu(), torch.linalg.vector_norm(x, ord=p, dim=1)
     )
     assert (wide[:, 1].cpu() == 0).all()
+
+
+@pytest.mark.parametrize("p", _GENERAL_P)
+def test_vector_norm_general_p_float64_out(mojo_gpu, p):
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.randn(5, 7)
+    out = torch.empty(1, dtype=torch.float64, device=mojo_gpu)  # wrong shape
+    returned = torch.linalg.vector_norm(
+        x.to(mojo_gpu), ord=p, dim=1, dtype=torch.float64, out=out
+    )
+    assert returned.data_ptr() == out.data_ptr() and out.shape == (5,)
+    expected = torch.linalg.vector_norm(x, ord=p, dim=1, dtype=torch.float64)
+    torch.testing.assert_close(out.cpu(), expected, rtol=1e-14, atol=0)
+    x64 = x.double()
+    out = torch.empty(3, dtype=torch.float64, device=mojo_gpu)
+    torch.ops.aten.norm.out(x64.to(mojo_gpu), p, [0, 1], True, out=out)
+    assert out.shape == (1, 1)
+    torch.testing.assert_close(
+        out.cpu(), torch.linalg.vector_norm(x64, p, keepdim=True), rtol=1e-14, atol=0
+    )
+    with pytest.raises(RuntimeError):  # float64 result into a float32 out=
+        torch.linalg.vector_norm(
+            x64.to(mojo_gpu), ord=p, dim=1, out=torch.empty(5, device=mojo_gpu)
+        )
 
 
 def test_vector_norm_general_p_declines_integer_input(mojo_gpu):

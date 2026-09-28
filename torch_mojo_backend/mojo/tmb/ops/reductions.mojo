@@ -1762,26 +1762,6 @@ def _vector_norm_spec(ord_v: Value) raises -> StaticString:
     return "NormPSpec"
 
 
-def _decline_normp_float64(
-    op: StaticString, op_label: StaticString, src_dtype: DType, dtype_v: Value
-) raises:
-    """NormPOp (general ord=p) has a fixed float32 accumulator, so a float64
-    self or `dtype=torch.float64` would silently compute in less precision
-    than asked for; declined on every device, before `_vector_norm_operand`
-    promotes anything."""
-    if op != "NormPSpec":
-        return
-    if src_dtype == DType.float64:
-        unsupported(
-            String(op_label) + " of dtype float64 with a general ord (p)"
-        )
-    var want = _opt_dtype(dtype_v)
-    if want >= 0 and max_dtype(want) == DType.float64:
-        unsupported(
-            String(op_label) + " with dtype=float64 and a general ord (p)"
-        )
-
-
 def _vector_norm_operand(
     op_label: StaticString, dtype_v: Value, mut src: Operand
 ) raises:
@@ -1896,7 +1876,6 @@ def _vector_norm(
     _require_mojo(a)
     var op = _vector_norm_spec(ord_v)
     var src = _borrow(a)
-    _decline_normp_float64(op, op_label, src.t.dtype, dtype_v)
     _vector_norm_operand(op_label, dtype_v, src)
     _decline_metal_float64(src.t, op_label)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
@@ -1944,7 +1923,6 @@ def _vector_norm_out(
     _require_mojo(out)
     var op = _vector_norm_spec(ord_v)
     var src = _borrow(a)
-    _decline_normp_float64(op, op_label, src.t.dtype, dtype_v)
     _vector_norm_operand(op_label, dtype_v, src)
     _decline_metal_float64(src.t, op_label)
     var dims = _reduce_dims(dim_v, src.t.rank, True)

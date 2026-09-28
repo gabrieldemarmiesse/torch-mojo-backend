@@ -238,3 +238,10 @@ def powf_c99(a: Float32, b: Float32) -> Float32:
     """Scalar float `pow(a, b)`: the same special cases and core as
     `torch_pow` (on NVIDIA the CUDA math library's powf, bit for bit)."""
     return _pow_scalar[DType.float32](a, b)
+
+
+@always_inline
+def pow_c99[w: DType](a: Scalar[w], b: Scalar[w]) -> Scalar[w]:
+    """`powf_c99`, or for float64 the C99 double `pow` (`_pow_f64_core`)."""
+    comptime assert w == DType.float32 or w == DType.float64
+    return _pow_scalar[w](a, b)
