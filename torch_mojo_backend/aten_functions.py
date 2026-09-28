@@ -4151,6 +4151,15 @@ def _linspace_graph(
         device if device is not None else torch.get_default_device()
     )
     compute = DType.float64 if out_dtype == DType.float64 else DType.float32
+    if dtype is not None and not dtype.is_floating_point and dtype != torch.bool:
+        # `Scalar::to<scalar_t>()` converts the endpoints before any
+        # arithmetic: a float truncates, an integer wraps into an unsigned
+        # type (-1 -> 255 for uint8), as the eager kernel does.
+        bits = torch.iinfo(dtype).bits
+        unsigned = torch.iinfo(dtype).min == 0
+        start, end = (
+            (int(v) % (1 << bits)) if unsigned else int(v) for v in (start, end)
+        )
     if steps <= 1:
         value = float(start) if base is None else float(base) ** float(start)
         return _broadcast_to(

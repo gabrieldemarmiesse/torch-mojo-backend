@@ -319,6 +319,9 @@ def test_index_fill_scalar_conversions(mojo_device):
     )
     with pytest.raises(RuntimeError, match="Expected dtype int64 for index"):
         x.to(mojo_device).index_fill(0, di.int(), 1)
+    u = torch.zeros(3, 4, dtype=torch.uint8, device=mojo_device)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        u.index_fill(1, di, 256.0)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -359,6 +362,15 @@ def test_index_copy_scalar_and_errors(mojo_device):
         d.index_copy(0, two[:1], torch.ones(1, 5, device=mojo_device))
     with pytest.raises(RuntimeError, match="index out of range"):
         d.index_copy(0, two[:1] + 3, torch.ones(1, 4, device=mojo_device))
+    # out= partially overlapping self is refused (copy_'s partial-overlap
+    # check); out= being self itself is fine.
+    base = torch.zeros(5, 4, device=mojo_device)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.index_copy(
+            base[:-1], 0, two[:1], torch.ones(1, 4, device=mojo_device), out=base[1:]
+        )
+    torch.index_copy(base, 0, two[:1], torch.ones(1, 4, device=mojo_device), out=base)
+    assert base.cpu()[0].tolist() == [1.0] * 4
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +409,14 @@ def test_masked_scatter_strided_broadcast_and_errors(mojo_device):
         d.masked_scatter_(dm.to(torch.uint8), ds)
     with pytest.raises(RuntimeError, match="same dtypes"):
         d.masked_scatter_(dm, ds.to(torch.float16))
+    # Fewer source elements than selected positions raises, empty source
+    # included; an all-false mask with an empty source is a no-op.
+    with pytest.raises(RuntimeError, match="Number of elements of source"):
+        d.masked_scatter_(dm, ds.flatten()[: int(mask.sum()) - 1])
+    with pytest.raises(RuntimeError, match="Number of elements of source"):
+        d.masked_scatter_(dm, torch.empty(0, device=mojo_device))
+    none = torch.zeros_like(dm)
+    _check(d.clone().masked_scatter_(none, torch.empty(0, device=mojo_device)), x)
 
 
 # ---------------------------------------------------------------------------
@@ -431,3 +451,10 @@ def test_repeat_interleave_errors(mojo_device):
         torch.repeat_interleave(torch.tensor([1, -1], device=mojo_device))
     with pytest.raises(RuntimeError, match="1D vector"):
         torch.repeat_interleave(torch.ones(2, 2, dtype=torch.int64, device=mojo_device))
+    r = torch.tensor([1, 2], device=mojo_device)
+    with pytest.raises(RuntimeError, match="output_size"):
+        torch.repeat_interleave(r, output_size=2)
+    with pytest.raises(RuntimeError, match="repeats can not be negative"):
+        torch.repeat_interleave(
+            torch.tensor([3, -1], device=mojo_device), output_size=2
+        )

@@ -785,6 +785,15 @@ def test_masked_fill_value_tensor_elsewhere(mojo_device: str):
         )
     with pytest.raises(RuntimeError, match="without overflow"):
         x.to(mojo_device).masked_fill(mask.to(mojo_device), 1j)
+    u = torch.zeros(3, 4, dtype=torch.uint8, device=mojo_device)
+    for bad in (256.0, -1.0, 256, -256, float("nan")):
+        with pytest.raises(RuntimeError, match="without overflow"):
+            u.masked_fill(mask.to(mojo_device), bad)
+    # An integer Scalar wraps into uint8 (-1 -> 255), a float truncates.
+    got = u.masked_fill(mask.to(mojo_device), -1)
+    assert torch.equal(got.cpu(), u.cpu().masked_fill(mask, -1))
+    got = u.masked_fill(mask.to(mojo_device), 2.9)
+    assert torch.equal(got.cpu(), u.cpu().masked_fill(mask, 2.9))
 
 
 # ---------------------------------------------------------------------------

@@ -180,6 +180,34 @@ def _wrap_dim(dim: Int, rank: Int) raises -> Int:
     return d
 
 
+def _read_int_at(t: T, element: Int) raises -> Int:
+    """Element `element` of the contiguous 1-D integer tensor `t`, read back
+    to the host (one sync)."""
+    var one = own(
+        view_strided(
+            t,
+            IndexList[MAX_RANK](1),
+            IndexList[MAX_RANK](0),
+            0,
+            t.offset + element,
+        )
+    )
+    var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(one.t)], 1)
+    _ = one^  # its handle was read by the call
+    return v_int(r[0])
+
+
+def _same_view(a: T, b: T) -> Bool:
+    """`a` and `b` describe exactly the same elements (ATen's `is_same` up
+    to the TensorImpl: same data pointer, shape and strides)."""
+    if a.ptr != b.ptr or a.rank != b.rank:
+        return False
+    for i in range(a.rank):
+        if a.dim(i) != b.dim(i) or a.stride(i) != b.stride(i):
+            return False
+    return True
+
+
 def _same_device(a: T, b: T) -> Bool:
     return a.device_type == b.device_type and a.device == b.device
 
@@ -501,8 +529,11 @@ def op_channel_shuffle(
 # take / put_ -- ATen's `take_out` / `put_` (native/TensorAdvancedIndexing.cpp)
 # over the flattened tensor. Negative indices wrap once, as the CUDA kernels
 # do. take gathers through GatherDim, which clamps a still out-of-range index
-# (the family's policy: a report costs a device sync); put_ scatters through
-# ScatterDim / ScatterAddDim, which skip it and raise afterwards.
+# exactly as index_select / gather / embedding do here (the family's policy:
+# no bounds report, which would cost a device sync per call). Known gap:
+# CUDA device-asserts and CPU raises IndexError on such an index. put_
+# scatters through ScatterDim / ScatterAddDim, which skip it and raise
+# afterwards.
 # ---------------------------------------------------------------------------
 
 
@@ -919,7 +950,10 @@ def op_index_copy_out(
     assert_no_internal_overlap(out)
     assert_no_overlap(out, index)
     assert_no_overlap(out, source)
-    if out.h != a.h:
+    if not _same_view(out, a):
+        # `result.copy_(self)`: copy_'s assert_no_partial_overlap -- the
+        # identical view is fine, any other shared memory is not.
+        assert_no_overlap(out, a)
         copy_strided_into(out, a)
     _index_copy_into(out, dim, index, source)
     ret_ref(rets, 0, out)
@@ -1011,7 +1045,7 @@ def op_masked_scatter_(
                 i - (MAX_RANK - a.rank),
                 ".",
             )
-    if a.numel == 0 or source.numel == 0:
+    if a.numel == 0:
         ret_ref(rets, 0, a)
         return
     var n = a.numel
@@ -1034,6 +1068,17 @@ def op_masked_scatter_(
         )
     )
     _ = m_flat^
+    # The number of selected elements, read back (one sync): too few source
+    # elements is an error, as on CPU (CUDA device-asserts).
+    var count = _read_int_at(csum.t, n - 1)
+    if count > source.numel:
+        raise Error(
+            "masked_scatter_: Number of elements of source < number of ones"
+            " in mask"
+        )
+    if count == 0:
+        ret_ref(rets, 0, a)
+        return
     var pos = own(
         _call1(
             "aten::sub",
@@ -1105,29 +1150,31 @@ def op_repeat_interleave_tensor(
             "aten::cumsum", "", [tensor_arg(repeats), int_arg(0), none_arg()]
         )
     )
-    var total: Int
+    # The total and the negativity check are read back even with
+    # `output_size` (two syncs): a wrong `output_size` or a negative repeat
+    # raises instead of truncating (CUDA device-asserts the former).
+    var total = _read_int_at(csum.t, repeats.numel - 1)
+    var mn = own(_call1("aten::min", "", [tensor_arg(repeats)]))
+    var r2 = call_op("aten::_local_scalar_dense", "", [tensor_arg(mn.t)], 1)
+    _ = mn^  # its handle was read by the call
+    if v_int(r2[0]) < 0:
+        raise Error("repeats can not be negative")
     if not v_is_none(args[unsafe_offset=1]):
-        total = v_int(args[unsafe_offset=1])
-    else:
-        var last = own(
-            view_strided(
-                csum.t,
-                IndexList[MAX_RANK](1),
-                IndexList[MAX_RANK](0),
-                0,
-                csum.t.offset + repeats.numel - 1,
+        var output_size = v_int(args[unsafe_offset=1])
+        if output_size != total:
+            raise Error(
+                (
+                    "Invalid input! In `repeat_interleave`, the `output_size`"
+                    " argument ("
+                ),
+                output_size,
+                (
+                    ") must be the same as the sum of the elements in the"
+                    " `repeats` tensor ("
+                ),
+                total,
+                ").",
             )
-        )
-        var r = call_op(
-            "aten::_local_scalar_dense", "", [tensor_arg(last.t)], 1
-        )
-        total = v_int(r[0])
-        _ = last^
-        var mn = own(_call1("aten::min", "", [tensor_arg(repeats)]))
-        var r2 = call_op("aten::_local_scalar_dense", "", [tensor_arg(mn.t)], 1)
-        _ = mn^  # its handle was read by the call
-        if v_int(r2[0]) < 0:
-            raise Error("repeats can not be negative")
     var shape = IndexList[MAX_RANK](1)
     shape[MAX_RANK - 1] = total
     if total <= 0:

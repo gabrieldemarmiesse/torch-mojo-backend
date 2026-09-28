@@ -58,6 +58,8 @@ from tmb.ops.common import (
     promoted_pair,
     resize_out,
     scalar_embed,
+    scalar_to_float,
+    scalar_to_int,
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.core import cast_for_copy
@@ -734,10 +736,12 @@ def _c10_name(dt: DType) -> String:
 
 
 def scalar_as_fill(v: Value, dtype: DType) raises -> Float64:
-    """`Scalar::to<scalar_t>()` for a fill value: a bool destination takes
-    the scalar's truth, an integer one truncates a floating scalar, and a
-    complex scalar into a real type is the overflow error ATen raises.
-    Everything else is `scalar_embed` (exactness checks included)."""
+    """`Scalar::to<scalar_t>()` for a fill value (c10's checked_convert): a
+    bool destination takes the scalar's truth; an integer one goes through
+    `scalar_to_int` (range-checked, a float truncates, an integer wraps into
+    uint8) and a floating one through `scalar_to_float`; a complex scalar
+    into a real type is the overflow error ATen raises. The result is
+    exactly representable as a Float64 or declined."""
     if v.tag == TAG_COMPLEX:
         raise Error(
             "value cannot be converted to type ",
@@ -746,11 +750,16 @@ def scalar_as_fill(v: Value, dtype: DType) raises -> Float64:
         )
     if dtype == DType.bool:
         return 1.0 if v_f64(v) != 0.0 else 0.0
-    if dtype.is_integral() and not v_scalar_is_integral(v):
-        var x = v_f64(v)
-        if x != x or abs(x) > 9007199254740992.0:
+    var st = torch_dtype(dtype)
+    if dtype.is_integral():
+        var i = scalar_to_int(v, st)
+        if dtype == DType.uint8:
+            i = i & 0xFF
+        if abs(i) > 9007199254740992:
             unsupported("scalar magnitude exceeds the exact float64 range")
-        return Float64(Int(x))
+        return Float64(i)
+    if dtype.is_floating_point():
+        return scalar_to_float(v, st)
     return scalar_embed(v, dtype)
 
 
