@@ -2184,6 +2184,173 @@ def test_aten_masked_fill__inplace_tensor(conf: Conf):
     check_outputs(fn, conf, [x, mask, value])
 
 
+def test_aten_masked_fill_broadcasts_self(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_masked_fill)
+
+    def fn(x, mask):
+        return aten.masked_fill(x, mask, 3.0)
+
+    check_outputs(fn, conf, [torch.randn(5), torch.randn(4, 5) > 0])
+
+
+@pytest.mark.parametrize("dims", [[0], [1, 2], [-1]])
+def test_aten_flip(conf: Conf, call_checker: CallChecker, dims: list[int]):
+    call_checker.register(aten_functions.aten_flip)
+
+    def fn(x):
+        return aten.flip(x, dims)
+
+    check_outputs(fn, conf, [torch.randn(3, 4, 5)])
+
+
+def test_aten_roll(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::roll")
+
+    def fn(x):
+        return torch.roll(x, (1, -2), (0, 2))
+
+    check_outputs(fn, conf, [torch.randn(3, 4, 5)])
+
+
+def test_aten_diagonal_trace(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_diagonal, "aten::trace")
+
+    def fn(x):
+        return torch.trace(x)
+
+    check_outputs(fn, conf, [torch.randn(4, 6)], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(("dim", "size", "step"), [(0, 2, 1), (1, 3, 2), (-1, 5, 1)])
+def test_aten_unfold(
+    conf: Conf, call_checker: CallChecker, dim: int, size: int, step: int
+):
+    call_checker.register(aten_functions.aten_unfold)
+
+    def fn(x):
+        return aten.unfold(x, dim, size, step) * 1
+
+    check_outputs(fn, conf, [torch.randn(4, 6, 5)])
+
+
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_aten_put(conf: Conf, call_checker: CallChecker, accumulate: bool):
+    call_checker.register(aten_functions.aten_put, "aten::put_")
+
+    def fn(x, index, source):
+        return aten.put(x, index, source, accumulate)
+
+    index = torch.tensor([3, -2, 7])
+    check_outputs(fn, conf, [torch.randn(4, 5), index, torch.randn(3)])
+
+
+def test_aten_take(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::take")
+
+    def fn(x, index):
+        return torch.take(x, index)
+
+    check_outputs(fn, conf, [torch.randn(4, 5), torch.tensor([[0, -1], [7, 19]])])
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_aten_index_fill(conf: Conf, call_checker: CallChecker, dim: int):
+    call_checker.register(
+        aten_functions.aten_index_fill, "aten::index_fill_.int_Scalar"
+    )
+
+    def fn(x, index):
+        return aten.index_fill(x, dim, index, -1.5)
+
+    check_outputs(fn, conf, [torch.randn(4, 5), torch.tensor([0, -1])])
+
+
+def test_aten_index_copy(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::index_copy")
+
+    def fn(x, index, source):
+        return torch.index_copy(x, 1, index, source)
+
+    check_outputs(
+        fn, conf, [torch.randn(4, 5), torch.tensor([4, 0]), torch.randn(4, 2)]
+    )
+
+
+def test_aten_masked_scatter(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_masked_scatter, "aten::masked_scatter_")
+
+    def fn(x, mask, source):
+        return aten.masked_scatter(x, mask, source)
+
+    check_outputs(fn, conf, [torch.randn(4, 5), torch.randn(4, 5) > 0, torch.randn(20)])
+
+
+def test_aten_channel_shuffle(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::channel_shuffle")
+
+    def fn(x):
+        return torch.nn.functional.channel_shuffle(x, 3)
+
+    check_outputs(fn, conf, [torch.randn(2, 6, 3, 3)])
+
+
+def test_aten_repeat_interleave_tensor(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::repeat_interleave.Tensor")
+
+    def fn(x, repeats):
+        return torch.repeat_interleave(x, repeats, dim=0)
+
+    check_outputs(fn, conf, [torch.randn(4, 3), torch.tensor([1, 0, 3, 2])])
+
+
+@pytest.mark.parametrize("op", ["dot", "vdot"])
+def test_aten_dot_vdot(conf: Conf, call_checker: CallChecker, op: str):
+    call_checker.register(f"aten::{op}")
+
+    def fn(a, b):
+        return getattr(torch, op)(a, b)
+
+    check_outputs(fn, conf, [torch.randn(33), torch.randn(33)], rtol=1e-4, atol=1e-4)
+
+
+def test_aten_linspace_logspace(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_linspace, aten_functions.aten_logspace)
+
+    def fn(x, device):
+        return (
+            torch.linspace(-2.5, 7, 9, device=device) + x,
+            torch.logspace(0, 2, 9, base=3.0, device=device) + x,
+        )
+
+    check_outputs(fn, conf, [torch.randn(9)], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("upper", [False, True])
+def test_aten_tri_indices(conf: Conf, call_checker: CallChecker, upper: bool):
+    call_checker.register(
+        aten_functions.aten_tril_indices, aten_functions.aten_triu_indices
+    )
+
+    def fn(x, device):
+        make = torch.triu_indices if upper else torch.tril_indices
+        return make(4, 5, -1, device=device) + x
+
+    check_outputs(fn, conf, [torch.tensor(1)])
+
+
+def test_aten_eye_and_equal(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::eye.m_out")
+
+    def fn(x, device):
+        return torch.eye(3, 4, device=device) + x
+
+    check_outputs(fn, conf, [torch.randn(3, 4)])
+    x = torch.randn(3, 4)
+    d = x.to(conf.device)
+    assert torch.equal(d, x.clone().to(conf.device))
+    assert not torch.equal(d, (x + 1).to(conf.device))
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
 @pytest.mark.parametrize(
     ("x_shape", "mask_shape"), [((3, 4), (3, 4)), ((3, 4), (4,)), ((), (5,))]

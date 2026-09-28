@@ -24,6 +24,7 @@ from tmb.ops.data_movement import register_data_movement
 from tmb.ops.deform_conv import register_deform_conv
 from tmb.ops.factories import register_factories
 from tmb.ops.foreach import register_foreach
+from tmb.ops.indexing import register_indexing
 from tmb.ops.matmul import register_matmul
 from tmb.ops.nn import register_nn
 from tmb.ops.nms import register_nms
@@ -50,6 +51,7 @@ def _register_ops(lib: Int) raises:
     _group[register_compare](lib)
     _group[register_data_movement](lib)
     _group[register_factories](lib)
+    _group[register_indexing](lib)
     _group[register_random](lib)
     _group[register_reductions](lib)
     _group[register_matmul](lib)

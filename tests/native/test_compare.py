@@ -735,3 +735,88 @@ def test_binary_add_degenerate_shapes(mojo_device: str, shape):
     out = cpu.to(mojo_device) + cpu.to(mojo_device)
     assert out.shape == cpu.shape
     torch.testing.assert_close(out.cpu(), cpu + cpu)
+
+
+# ---------------------------------------------------------------------------
+# masked_fill: broadcasting self, scalar conversion, a CPU / other-dtype
+# value tensor
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.int64, torch.bool]
+)
+def test_masked_fill_broadcasts_self(mojo_device: str, dtype: torch.dtype):
+    x = (torch.randn(5) * 10).to(dtype)
+    mask = torch.randn(4, 5) > 0
+    value = torch.tensor(1, dtype=dtype)
+    for v in (7, value):
+        got = x.to(mojo_device).masked_fill(
+            mask.to(mojo_device), v if isinstance(v, int) else v.to(mojo_device)
+        )
+        assert got.shape == (4, 5)
+        assert torch.equal(got.cpu(), x.masked_fill(mask, v))
+
+
+@pytest.mark.parametrize("dtype", [torch.bool, torch.int64, torch.float16])
+def test_masked_fill_scalar_conversion(mojo_device: str, dtype: torch.dtype):
+    x = (torch.randn(3, 4) * 10).to(dtype)
+    mask = torch.randn(3, 4) > 0
+    for value in (10, 2.5, -3, 0):
+        got = x.to(mojo_device).masked_fill(mask.to(mojo_device), value)
+        assert torch.equal(got.cpu(), x.masked_fill(mask, value))
+    inplace = x.to(mojo_device)
+    inplace.masked_fill_(mask.to(mojo_device), 10)
+    assert torch.equal(inplace.cpu(), x.masked_fill(mask, 10))
+
+
+def test_masked_fill_value_tensor_elsewhere(mojo_device: str):
+    x = torch.randn(3, 4)
+    mask = torch.randn(3, 4) > 0
+    cpu_value = torch.tensor(-2.5)
+    got = x.to(mojo_device).masked_fill(mask.to(mojo_device), cpu_value)
+    assert torch.equal(got.cpu(), x.masked_fill(mask, cpu_value))
+    int_value = torch.tensor(3, device=mojo_device)
+    got = x.to(mojo_device).masked_fill(mask.to(mojo_device), int_value)
+    assert torch.equal(got.cpu(), x.masked_fill(mask, torch.tensor(3)))
+    with pytest.raises(RuntimeError, match="0-dimensional value tensor"):
+        x.to(mojo_device).masked_fill(
+            mask.to(mojo_device), torch.ones(1, device=mojo_device)
+        )
+    with pytest.raises(RuntimeError, match="without overflow"):
+        x.to(mojo_device).masked_fill(mask.to(mojo_device), 1j)
+
+
+# ---------------------------------------------------------------------------
+# equal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.int64, torch.bool]
+)
+def test_equal(mojo_device: str, dtype: torch.dtype):
+    call_checker = CallChecker()
+    call_checker.register("aten::equal")
+    x = (torch.randn(4, 5) * 10).to(dtype)
+    d = x.to(mojo_device)
+    assert torch.equal(d, x.clone().to(mojo_device))
+    assert torch.equal(d, d)
+    assert torch.equal(d, d.t().contiguous().t())
+    assert not torch.equal(d, d.flip(0)) or torch.equal(x, x.flip(0))
+    assert not torch.equal(d, d[:3])
+    assert torch.equal(d[:0], d[:0].clone())
+    call_checker.check_was_called()
+
+
+def test_equal_nan_and_promotion(mojo_device: str):
+    n = torch.tensor([float("nan"), 1.0])
+    d = n.to(mojo_device)
+    # CUDA's `cuda_equal`: the same view short-circuits to True (CPU's
+    # compares, and says False); a copy compares NaN != NaN.
+    assert torch.equal(d, d)
+    assert not torch.equal(d, d.clone())
+    i = torch.tensor([1, 2])
+    assert torch.equal(i.to(mojo_device), i.int().to(mojo_device)) == torch.equal(
+        i, i.int()
+    )

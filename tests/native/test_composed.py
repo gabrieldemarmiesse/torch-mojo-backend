@@ -681,3 +681,66 @@ def test_softmax_backward_half_to_float(mojo_gpu):
         torch.ops.aten._softmax_backward_data(
             grad.to(mojo_gpu), out.to(mojo_gpu), -1, torch.bfloat16
         )
+
+
+# ---------------------------------------------------------------------------
+# trace / dot / vdot (and inner, a composite over dot)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.bool]
+)
+@pytest.mark.parametrize("shape", [(7, 9), (9, 7), (5, 5), (0, 3)])
+def test_trace(mojo_gpu, dtype, shape):
+    x = (torch.randn(shape) * 10).to(dtype)
+    with assert_ran("aten::trace"):
+        got = torch.trace(x.to(mojo_gpu))
+    # CUDA's `trace_cuda` is `diagonal().sum()` for every dtype (CPU's trace
+    # has no half/bool kernel).
+    expected = x.diagonal().sum()
+    assert got.dtype == expected.dtype
+    torch.testing.assert_close(got.cpu(), expected, rtol=1e-2, atol=1e-2)
+    got_t = torch.trace(x.to(mojo_gpu).t()).cpu()
+    torch.testing.assert_close(got_t, x.t().diagonal().sum(), rtol=1e-2, atol=1e-2)
+    with pytest.raises(RuntimeError, match="expected a matrix"):
+        torch.trace(torch.zeros(2, 2, 2, device=mojo_gpu))
+
+
+@pytest.mark.parametrize("op", ["dot", "vdot", "inner"])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int32]
+)
+def test_dot(mojo_gpu, op, dtype):
+    fn = getattr(torch, op)
+    g = torch.Generator().manual_seed(0)
+    a = (torch.randn(37, generator=g) * 4).to(dtype)
+    b = (torch.randn(37, generator=g) * 4).to(dtype)
+    with assert_ran("aten::vdot" if op == "vdot" else "aten::dot"):
+        got = fn(a.to(mojo_gpu), b.to(mojo_gpu))
+    expected = fn(a.double(), b.double()).to(dtype)
+    assert got.dtype == dtype
+    tol = (
+        0 if not dtype.is_floating_point else (1e-4 if dtype == torch.float32 else 1e-2)
+    )
+    torch.testing.assert_close(got.cpu(), expected, rtol=tol, atol=tol)
+    # Strided operands.
+    s = torch.randn(4, 37, generator=g).to(dtype).to(mojo_gpu)
+    torch.testing.assert_close(
+        fn(s[1], s[2]).cpu(),
+        fn(s[1].cpu().double(), s[2].cpu().double()).to(dtype),
+        rtol=tol or 1e-2,
+        atol=tol or 1e-2,
+    )
+
+
+def test_dot_errors(mojo_gpu):
+    a = torch.ones(3, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="1D tensors expected"):
+        torch.dot(torch.ones(1, 1, device=mojo_gpu), a)
+    with pytest.raises(RuntimeError, match="expected both vectors to have same dtype"):
+        torch.dot(a, a.half())
+    with pytest.raises(RuntimeError, match="inconsistent tensor size"):
+        torch.dot(torch.ones(9, device=mojo_gpu), a)
+    with pytest.raises(RuntimeError, match="not implemented for 'Bool'"):
+        torch.dot(a.bool(), a.bool())

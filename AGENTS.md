@@ -293,7 +293,9 @@ either implemented in Mojo or `NotImplementedError`.
 
 1. Write `op_<name>` in the matching
    `torch_mojo_backend/mojo/tmb/ops/<group>.mojo` — `core`, `unary`,
-   `binary`, `compare`, `data_movement`, `factories`, `random`, `reductions`,
+   `binary`, `compare`, `data_movement`, `indexing` (flip/roll/take/put/
+   index_fill/index_copy/masked_scatter and other reorderings composed from
+   existing kernels), `factories`, `random`, `reductions`,
    `matmul`, `nn`, `attention`, `foreach`, `pointwise` (math and parameterized
    activations with up to three operands); generic helpers shared by several groups go
    in `tmb/ops/common.mojo`. Read the arguments by schema position with the `v_*`

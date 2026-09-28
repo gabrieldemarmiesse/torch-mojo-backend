@@ -2840,6 +2840,33 @@ def aten_detach(input: MaxTensor) -> MaxTensor:
 
 
 # diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)
+@map_to(aten.diagonal)
+def aten_diagonal(
+    input: MaxTensor, offset: int = 0, dim1: int = 0, dim2: int = 1
+) -> MaxTensor:
+    """``input[..., i, i + offset]`` over ``dim1``/``dim2``, as a new last
+    axis (the graph has no views: this is the copy a view would read).
+
+    The two axes move to the end and flatten, so element ``(i, i + offset)``
+    sits at ``i * n2 + i + offset`` and one ``F.gather`` picks the diagonal.
+    Static extents only: the diagonal's length is computed here.
+    """
+    rank = len(input.shape)
+    dim1, dim2 = dim1 % rank, dim2 % rank
+    if dim1 == dim2:
+        raise ValueError("diagonal dimensions cannot be identical")
+    n1, n2 = int(input.shape[dim1]), int(input.shape[dim2])
+    rest = [a for a in range(rank) if a not in (dim1, dim2)]
+    moved = F.permute(input, [*rest, dim1, dim2])
+    flat = F.reshape(moved, [*(input.shape[a] for a in rest), n1 * n2])
+    first_row = max(0, -offset)
+    length = max(0, min(n1 - first_row, n2 - first_row - offset))
+    if length == 0:
+        zero = F.constant(0, dtype=input.dtype, device=input.device)
+        return _broadcast_to(zero, [*(input.shape[a] for a in rest), 0])
+    positions = [(first_row + i) * (n2 + 1) + offset for i in range(length)]
+    index = F.constant(positions, dtype=DType.int64, device=input.device)
+    return F.gather(flat, index, axis=len(rest))
 
 
 # digamma(Tensor self) -> Tensor
@@ -3222,6 +3249,23 @@ def aten_fill__scalar(input: MaxTensor, value: Scalar) -> MaxTensor:
 
 
 # flip(Tensor self, int[] dims) -> Tensor
+@map_to(aten.flip)
+def aten_flip(input: MaxTensor, dims: list[int]) -> MaxTensor:
+    """Each listed axis read backwards: an ``F.gather`` with the reversed
+    iota ``n - 1, ..., 0`` along it (static extents)."""
+    rank = len(input.shape)
+    result = input
+    for dim in sorted({d % max(rank, 1) for d in dims}):
+        if rank == 0:
+            break
+        n = int(input.shape[dim])
+        if n <= 1:
+            continue
+        index = F.constant(
+            list(range(n - 1, -1, -1)), dtype=DType.int64, device=input.device
+        )
+        result = F.gather(result, index, axis=dim)
+    return result
 
 
 # floor(Tensor self) -> Tensor
@@ -3720,6 +3764,35 @@ def aten_index_add(
     return aten_scatter_add(input, dim, index, source)
 
 
+# index_fill.int_Scalar(Tensor self, int dim, Tensor index, Scalar value) -> Tensor
+# index_fill.int_Tensor(Tensor self, int dim, Tensor index, Tensor value) -> Tensor
+@map_to(aten.index_fill)
+def aten_index_fill(
+    input: MaxTensor, dim: int, index: MaxTensor, value: Scalar | MaxTensor
+) -> MaxTensor:
+    """``input`` with every slice ``index`` names along ``dim`` set to
+    ``value``: a (size, len(index)) equality table against the iota,
+    reduced to a per-slice hit mask and selected with ``_where``. Negative
+    indices wrap once, as ATen's index_fill kernels do."""
+    rank = len(input.shape)
+    axis = dim % max(rank, 1)
+    n = 1 if rank == 0 else int(input.shape[axis])
+    idx = F.reshape(index, [1, -1])
+    zero = F.constant(0, dtype=idx.dtype, device=idx.device)
+    size = F.constant(n, dtype=idx.dtype, device=idx.device)
+    idx = _where(idx < zero, idx + size, idx)
+    iota = F.reshape(F.arange(0, n, 1, dtype=idx.dtype, device=idx.device), [n, 1])
+    hits = F.sum(F.cast(iota == idx, DType.int32), axis=1)
+    mask_shape = [n if a == axis else 1 for a in range(rank)]
+    none = F.constant(0, dtype=DType.int32, device=idx.device)
+    mask = F.reshape(hits > none, mask_shape)
+    if isinstance(value, MaxTensor):
+        fill = F.cast(value, input.dtype)
+    else:
+        fill = _scalar_constant(value, dtype=input.dtype, device=input.device)
+    return _where(mask, _broadcast_to(fill, input.shape), input)
+
+
 # index_put(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor
 @map_to(aten.index_put.default)
 def aten_index_put(
@@ -4055,6 +4128,81 @@ def aten_lift_fresh_copy(input: MaxTensor) -> MaxTensor:
     return input
 
 
+def _linspace_graph(
+    start: Scalar,
+    end: Scalar,
+    steps: int,
+    base: float | None,
+    dtype: torch.dtype | None,
+    device: torch.device | None,
+) -> MaxTensor:
+    """linspace (logspace when ``base`` is given) the way ATen's kernels
+    count: the first ``steps // 2`` elements up from ``start``, the rest down
+    from ``end``, so both endpoints are exact; float32 arithmetic (float64
+    for a float64 result), cast to the result dtype at the end."""
+    if isinstance(start, MaxTensor) or isinstance(end, MaxTensor):
+        raise NotImplementedError("linspace/logspace with tensor endpoints")
+    if steps < 0:
+        raise ValueError("number of steps must be non-negative")
+    out_dtype = torch_dtype_to_max(
+        dtype if dtype is not None else torch.get_default_dtype()
+    )
+    max_device = torch_device_to_max_device(
+        device if device is not None else torch.get_default_device()
+    )
+    compute = DType.float64 if out_dtype == DType.float64 else DType.float32
+    if steps <= 1:
+        value = float(start) if base is None else float(base) ** float(start)
+        return _broadcast_to(
+            F.constant(value, dtype=out_dtype, device=max_device), [steps]
+        )
+    iota = F.arange(0, steps, 1, dtype=compute, device=max_device)
+    step = (float(end) - float(start)) / (steps - 1)
+    rising = F.constant(float(start), dtype=compute, device=max_device) + iota * step
+    falling = (
+        F.constant(float(end), dtype=compute, device=max_device)
+        - (F.constant(float(steps - 1), dtype=compute, device=max_device) - iota) * step
+    )
+    half = F.constant(float(steps // 2), dtype=compute, device=max_device)
+    values = _where(iota < half, rising, falling)
+    if base is not None:
+        values = F.pow(
+            F.constant(float(base), dtype=compute, device=max_device), values
+        )
+    return F.cast(values, out_dtype)
+
+
+# linspace(Scalar start, Scalar end, int steps, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+@map_to(aten.linspace)
+def aten_linspace(
+    start: Scalar,
+    end: Scalar,
+    steps: int,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> MaxTensor:
+    return _linspace_graph(start, end, steps, None, dtype, device)
+
+
+# logspace(Scalar start, Scalar end, int steps, float base=10.0, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+@map_to(aten.logspace)
+def aten_logspace(
+    start: Scalar,
+    end: Scalar,
+    steps: int,
+    base: float = 10.0,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> MaxTensor:
+    return _linspace_graph(start, end, steps, base, dtype, device)
+
+
 # log(Tensor self) -> Tensor
 @map_to(aten.log)
 def aten_log(input: MaxTensor) -> MaxTensor:
@@ -4145,6 +4293,53 @@ def aten_lt(input: MaxTensor, other: Scalar | MaxTensor) -> MaxTensor:
 
 
 # masked_scatter(Tensor self, Tensor mask, Tensor source) -> Tensor
+@map_to(aten.masked_scatter)
+def aten_masked_scatter(
+    input: MaxTensor, mask: MaxTensor, source: MaxTensor
+) -> MaxTensor:
+    """The i-th selected element (row-major) takes ``source``'s i-th: the
+    mask's inclusive prefix sum minus one is that i, gathered (clamped into
+    range where unselected) and kept only where the mask is set."""
+    shape = list(
+        torch.broadcast_shapes(
+            tuple(int(d) for d in input.shape), tuple(int(d) for d in mask.shape)
+        )
+    )
+    numel = math.prod(shape)
+    count = math.prod(int(d) for d in source.shape)
+    base = _broadcast_to(input, shape)
+    if numel == 0 or count == 0:
+        return base
+    flat_mask = F.reshape(_broadcast_to(mask, shape), [numel])
+    position = F.cumsum(F.cast(flat_mask, DType.int64), axis=0)
+    one = F.constant(1, dtype=DType.int64, device=position.device)
+    last = F.constant(count, dtype=DType.int64, device=position.device)
+    position = (
+        _where(position < one, one, _where(position > last, last, position)) - one
+    )
+    picked = F.gather(F.reshape(source, [count]), position, axis=0)
+    return F.reshape(_where(flat_mask, picked, F.reshape(base, [numel])), shape)
+
+
+# put(Tensor self, Tensor index, Tensor source, bool accumulate=False) -> Tensor
+@map_to(aten.put)
+def aten_put(
+    input: MaxTensor, index: MaxTensor, source: MaxTensor, accumulate: bool = False
+) -> MaxTensor:
+    """``input.flatten()[index] = source`` (``+=`` when ``accumulate``),
+    negative indices wrapped once as ATen's put kernels do, through the
+    ``_nd`` scatters (the axis-based ones have no GPU kernel)."""
+    numel = 1
+    for d in input.shape:
+        numel *= int(d)
+    flat = F.reshape(input, [numel])
+    idx = F.reshape(index, [-1])
+    zero = F.constant(0, dtype=idx.dtype, device=idx.device)
+    size = F.constant(numel, dtype=idx.dtype, device=idx.device)
+    idx = _where(idx < zero, idx + size, idx)
+    updates = F.reshape(source, [-1])
+    scatter = F.scatter_nd_add if accumulate else F.scatter_nd
+    return F.reshape(scatter(flat, updates, F.unsqueeze(idx, -1)), input.shape)
 
 
 # max.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
@@ -5165,6 +5360,7 @@ def aten_scalar_tensor(
     dtype: torch.dtype | None = None,
     layout: torch.layout | None = None,
     device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> MaxTensor:
     if dtype is None:
         dtype = torch.float32
@@ -5810,6 +6006,32 @@ def aten_trunc(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "trunc")
 
 
+# unfold(Tensor(a) self, int dimension, int size, int step) -> Tensor(a)
+@map_to(aten.unfold)
+def aten_unfold(input: MaxTensor, dimension: int, size: int, step: int) -> MaxTensor:
+    """Every window of ``size`` elements ``step`` apart along ``dimension``,
+    as a new last axis: one ``F.gather`` with the (windows, size) index
+    ``w * step + k``, then the window axis moved to the end."""
+    rank = len(input.shape)
+    if rank == 0:
+        return F.reshape(input, [1]) if size == 1 else _broadcast_to(input, [0])
+    dim = dimension % rank
+    n = int(input.shape[dim])
+    windows = (n - size) // step + 1
+    if size == 0:
+        shape = [*input.shape[:dim], windows, *input.shape[dim + 1 :], 0]
+        zero = F.constant(0, dtype=input.dtype, device=input.device)
+        return _broadcast_to(zero, shape)
+    index = F.constant(
+        [[w * step + k for k in range(size)] for w in range(windows)],
+        dtype=DType.int64,
+        device=input.device,
+    )
+    gathered = F.gather(input, index, axis=dim)
+    order = [a for a in range(rank + 1) if a != dim + 1] + [dim + 1]
+    return F.permute(gathered, order)
+
+
 # unsqueeze(Tensor(a) self, int dim) -> Tensor(a)
 @map_to(aten.unsqueeze)
 def aten_unsqueeze(tensor: MaxTensor, dim: int) -> MaxTensor:
@@ -5901,6 +6123,62 @@ def aten_where(input: MaxTensor, condition: MaxTensor, other: MaxTensor) -> MaxT
 @map_to(aten.stack)
 def aten_stack(tensors: list[MaxTensor], dim: int = 0) -> MaxTensor:
     return F.stack(tensors, axis=dim)
+
+
+def _tri_indices_constant(
+    row: int,
+    col: int,
+    offset: int,
+    upper: bool,
+    dtype: torch.dtype | None,
+    device: torch.device | None,
+) -> MaxTensor:
+    """The (2, N) row-major coordinates of the lower (upper) triangle,
+    computed here from the static arguments and embedded as a constant."""
+    rows: list[int] = []
+    cols: list[int] = []
+    for i in range(row):
+        lo, hi = (max(0, i + offset), col) if upper else (0, min(col, i + offset + 1))
+        for j in range(lo, hi):
+            rows.append(i)
+            cols.append(j)
+    max_dtype = torch_dtype_to_max(dtype if dtype is not None else torch.int64)
+    max_device = torch_device_to_max_device(
+        device if device is not None else torch.get_default_device()
+    )
+    if not rows:
+        return _broadcast_to(F.constant(0, dtype=max_dtype, device=max_device), [2, 0])
+    return F.constant([rows, cols], dtype=max_dtype, device=max_device)
+
+
+# tril_indices(int row, int col, int offset=0, *, ScalarType? dtype=long, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+@map_to(aten.tril_indices)
+def aten_tril_indices(
+    row: int,
+    col: int,
+    offset: int = 0,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> MaxTensor:
+    return _tri_indices_constant(row, col, offset, False, dtype, device)
+
+
+# triu_indices(int row, int col, int offset=0, *, ScalarType? dtype=long, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+@map_to(aten.triu_indices)
+def aten_triu_indices(
+    row: int,
+    col: int,
+    offset: int = 0,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> MaxTensor:
+    return _tri_indices_constant(row, col, offset, True, dtype, device)
 
 
 # tril(Tensor self, int diagonal=0) -> Tensor
