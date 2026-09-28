@@ -2761,6 +2761,44 @@ def test_aten_glu(conf: Conf, call_checker: CallChecker, dtype: torch.dtype, dim
     check_outputs(fn, conf, [x], **tol)
 
 
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_aten_glu_backward_on_the_graph_path(
+    cuda_available: bool, call_checker: CallChecker, mode: str, dtype: torch.dtype
+):
+    """The graph twin -- whose second half is the `native_glu_backward_b`
+    custom op -- on a GPU: through torch.compile, and on MAX eager tensors
+    (the MAX eager interpreter, MAX_USE_EAGER_INTERPRETER=1)."""
+    if not cuda_available:
+        pytest.skip("the native graph ops are accelerator routes")
+    call_checker.register(aten_functions.aten_glu_backward)
+    x = (torch.randn(4, 6, 8, device="cuda") * 3).to(dtype)
+    grad = torch.randn(4, 6, 4, device="cuda").to(dtype)
+
+    def fn(g: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return aten.glu_backward(g, t, -1)
+
+    if mode == "compile":
+        got = torch.compile(fn, backend=mojo_backend, fullgraph=True)(grad, x)
+    else:
+        with F.lazy():
+            out = aten_functions.aten_glu_backward(
+                MaxEagerTensor.from_dlpack(grad), MaxEagerTensor.from_dlpack(x), -1
+            )
+        got = torch.from_dlpack(out)
+    want = fn(grad.float(), x.float()).to(dtype)
+    tol = {"atol": 2e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {}
+    torch.testing.assert_close(got, want, **tol)
+
+
+def test_aten_glu_backward_empty_integer_is_not_an_error():
+    """CUDA returns before its dtype dispatch on an empty iterator."""
+    x = MaxEagerTensor.from_dlpack(torch.zeros(0, 4, dtype=torch.int64))
+    grad = MaxEagerTensor.from_dlpack(torch.zeros(0, 2, dtype=torch.int64))
+    out = aten_functions.aten_glu_backward(grad, x, -1)
+    assert tuple(int(d) for d in out.shape) == (0, 4)
+
+
 def test_aten_glu_integer_raises():
     x = MaxEagerTensor.from_dlpack(torch.arange(8).reshape(2, 4))
     with pytest.raises(RuntimeError, match="\"glu_cuda\" not implemented for 'Long'"):

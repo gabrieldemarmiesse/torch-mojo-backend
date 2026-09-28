@@ -1294,6 +1294,14 @@ def test_glu_backward_grad_input_partial_overlap_raises(mojo_gpu):
         torch.ops.aten.glu_backward.grad_input(grad, base[:8], 0, grad_input=base[1:])
 
 
+def test_glu_backward_empty_integer(mojo_gpu):
+    """CUDA returns before its dtype dispatch on an empty iterator."""
+    x = torch.zeros(0, 4, dtype=torch.int64)
+    grad = torch.zeros(0, 2, dtype=torch.int64)
+    got = torch.ops.aten.glu_backward(grad.to(mojo_gpu), x.to(mojo_gpu), -1)
+    assert got.shape == (0, 4) and got.dtype == torch.int64
+
+
 def test_glu_backward_dtype_mismatch_raises(mojo_gpu):
     x = torch.randn(4, 6).to(mojo_gpu)
     grad = torch.randn(4, 3, dtype=torch.float16).to(mojo_gpu)

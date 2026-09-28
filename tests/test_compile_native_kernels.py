@@ -21,7 +21,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch._dynamo import mark_dynamic
 
-from torch_mojo_backend import custom_mojo_ops, mojo_backend
+from torch_mojo_backend import aten_functions, custom_mojo_ops, mojo_backend
+from torch_mojo_backend.testing import CallChecker
 from torch_mojo_backend.types import MaxTensor
 
 _F = TypeVar("_F", bound=Callable[..., object])
@@ -213,6 +214,48 @@ def test_softmax_half_to_float(gpu: str):
         out = compiled(fn)(x)
     assert out.dtype == torch.float32
     torch.testing.assert_close(out, fn(x), **FP32)
+    assert spy.call_count == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dim", [0, -1])
+def test_glu_backward(
+    gpu: str, call_checker: CallChecker, dtype: torch.dtype, dim: int
+):
+    """Both gradient halves take the eager pointwise kinds: `glu_backward_a`
+    through the binary custom op, `glu_backward_b` through the three-input
+    `native_glu_backward_b`."""
+    call_checker.register(aten_functions.aten_glu_backward)
+
+    def fn(grad, x):
+        return torch.ops.aten.glu_backward(grad, x, dim)
+
+    x = (torch.randn(4, 6, 8, device=gpu) * 3).to(dtype)
+    grad_shape = (2, 6, 8) if dim == 0 else (4, 6, 4)
+    grad = torch.randn(grad_shape, device=gpu).to(dtype)
+    with routed_through("native_glu_backward_b") as spy:
+        out = compiled(fn)(grad, x)
+    want = fn(grad.float(), x.float()).to(dtype)
+    torch.testing.assert_close(out, want, **(BF16 if dtype == torch.bfloat16 else FP32))
+    assert spy.call_count == 1
+
+
+def test_glu_through_autograd(gpu: str, call_checker: CallChecker):
+    """F.glu's forward and backward under compile, both graph twins."""
+    call_checker.register(aten_functions.aten_glu, aten_functions.aten_glu_backward)
+
+    def fn(x):
+        return F.glu(x, -1)
+
+    x = torch.randn(5, 10, device=gpu, requires_grad=True)
+    grad = torch.randn(5, 5, device=gpu)
+    with routed_through("native_glu_backward_b") as spy:
+        compiled(fn)(x).backward(grad)
+    assert x.grad is not None
+    got = x.grad
+    ref = x.detach().clone().requires_grad_(True)
+    fn(ref).backward(grad)
+    torch.testing.assert_close(got, ref.grad, **FP32)
     assert spy.call_count == 1
 
 

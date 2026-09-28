@@ -3438,8 +3438,13 @@ def aten_glu_backward(grad_output: MaxTensor, input: MaxTensor, dim: int) -> Max
             f"Found dtype {_scalar_type_name(grad_output.dtype)} but expected "
             f"{_scalar_type_name(input.dtype)}"
         )
-    _glu_check_floating(input, "glu_backward_cuda")
     a, b = _glu_halves(input, dim)
+    if any(isinstance(d, StaticDim) and int(d) == 0 for d in input.shape):
+        # glu_backward_cuda_out returns before its dtype dispatch when the
+        # iterator is empty: an empty integer input is not an error. The
+        # (empty) gradient of the input's shape.
+        return F.concat([grad_output, grad_output], axis=dim)
+    _glu_check_floating(input, "glu_backward_cuda")
     grad_a = custom_mojo_ops.pointwise_binary(grad_output, b, "glu_backward_a")
     shape = grad_output.shape
     flat = [F.reshape(x, [-1]) for x in (grad_output, a, b)]

@@ -2027,7 +2027,10 @@ def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
             " but expected ",
             _scalar_type_name(self.dtype),
         )
-    var compute = _pw_compute_dtype(
+    # glu_backward_cuda_out returns before its dtype dispatch when the
+    # iterator is empty: an empty integer input is not an error (every
+    # launch below is then a no-op).
+    var compute = self.stype if self.numel == 0 else _pw_compute_dtype(
         "glu_backward", self.stype, P_FLOAT_ONLY, True
     )
     var sg = _b_tside(grad)

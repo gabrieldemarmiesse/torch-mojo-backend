@@ -91,7 +91,7 @@ struct GeluBackwardTanhKernel(ElementwiseBinaryOp):
 
 @compiler.register("native_glu_backward_b")
 struct NativeGluBackwardB:
-    """glu_backward's second gradient half, `(1 - sigmoid(b)) * sigmoid(b) *
+    """The second gradient half of glu_backward, `(1 - sigmoid(b)) * sigmoid(b) *
     grad * a`: the mojo device's own `glu_backward_b` pointwise kind over
     three flat operands of one shape (the elementwise traits stop at two
     inputs, so this is a plain custom op launching the shared launcher)."""
@@ -120,12 +120,12 @@ struct NativeGluBackwardB:
             @__copy_capture(out_ptr, g_ptr, a_ptr, b_ptr)
             def func[w: Int, alignment: Int = 1](idx: Coord):
                 var i = Int(idx[0].value())
-                out_ptr.store[width=w](
+                out_ptr.unsafe_store[width=w](
                     i,
                     pointwise["glu_backward_b", dtype, dtype, w](
-                        g_ptr.load[width=w](i),
-                        a_ptr.load[width=w](i),
-                        b_ptr.load[width=w](i),
+                        g_ptr.unsafe_load[width=w](i),
+                        a_ptr.unsafe_load[width=w](i),
+                        b_ptr.unsafe_load[width=w](i),
                         SIMD[param_dtype[dtype](), 4](0),
                     ),
                 )
