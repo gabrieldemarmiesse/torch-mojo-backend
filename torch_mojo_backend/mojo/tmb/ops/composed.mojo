@@ -989,8 +989,11 @@ def op_native_group_norm_backward(
 def op_softmax_backward_data(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    """`out * (grad - sum(grad * out, dim, keepdim=True))`, ATen's formula
-    (SoftMax.cpp `softmax_backward_cpu_out`)."""
+    """SoftMax.cu's softmax_backward_cuda_out: `tmp = grad * output` in the
+    gradient's dtype (a half product is rounded to half), then
+    SoftMaxBackwardEpilogue `tmp - output * sum(tmp, dim)` with the sum and
+    the epilogue in float (accscalar_t), rounded once to the result dtype.
+    """
     var grad = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=1])
     var dim = v_int(args[unsafe_offset=2])
@@ -1006,13 +1009,13 @@ def op_softmax_backward_data(
             "_softmax_backward_data: grad_output and output must match in"
             " shape and dtype"
         )
-    var half_target = target == ST_FLOAT16 or target == ST_BFLOAT16
-    if target != grad.stype and not (grad.stype == ST_FLOAT32 and half_target):
-        # `half_to_float` (a half forward input, a float output) is the one
-        # mismatch ATen allows: the gradient comes back narrowed to the half.
-        unsupported(
-            "_softmax_backward_data with an input_dtype different from the"
-            " gradient's"
+    if target != grad.stype and not (
+        grad.stype == ST_FLOAT32 and target == ST_FLOAT16
+    ):
+        # `half_to_float` is the one mismatch CUDA allows, float16 only.
+        raise Error(
+            "expected input and grad types to match, or input to be at::Half"
+            " and grad to be at::Float"
         )
     var rank = out.rank
     if rank == 0:
@@ -1021,18 +1024,17 @@ def op_softmax_backward_data(
         unsupported("_softmax_backward_data dim out of range")
     var dims = List[Int64](capacity=1)
     dims.append(Int64(dim + rank if dim < 0 else dim))
-    # The CUDA kernel (SoftMax.cu, cunn_SoftMaxBackward) accumulates in
-    # float and rounds once into the half result: do the same, not three
-    # roundings to half.
-    var work = grad.stype
-    if work == ST_FLOAT16 or work == ST_BFLOAT16:
-        work = ST_FLOAT32
-    var g = _as_dtype(grad, work)
-    var o = _as_dtype(out, work)
-    var prod = _mul(g, o)
-    var total = _sum_dims(prod, dims, True)
-    var diff = _sub(g, total)
-    var gi = _mul(o, diff)
+    var g = _hold(grad)
+    var o = _hold(out)
+    var tmp = _mul(g, o)  # rounded to the gradient's dtype, as CUDA's is
+    var acc = grad.stype
+    if acc == ST_FLOAT16 or acc == ST_BFLOAT16:
+        acc = ST_FLOAT32
+    var tmp_acc = _as_dtype(tmp.t, acc)
+    var o_acc = _as_dtype(out, acc)
+    var total = _sum_dims(tmp_acc, dims, True)
+    var scaled = _mul(o_acc, total)
+    var gi = _sub(tmp_acc, scaled)
     if gi.t.stype != target:
         var narrowed = _as_dtype(gi.t, target)
         ret_owned(rets, 0, narrowed)

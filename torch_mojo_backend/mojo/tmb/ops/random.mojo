@@ -21,7 +21,6 @@ from max.gpu.host import DeviceAttribute
 
 from tmb.backend.abi import (
     Owned,
-    TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
     TAG_TENSOR,
     ST_BOOL,
@@ -38,7 +37,6 @@ from tmb.backend.abi import (
     call_op,
     int_arg,
     contiguous_strides,
-    f64_bits,
     new_like,
     new_scalar,
     new_strided,
@@ -48,7 +46,6 @@ from tmb.backend.abi import (
     retain,
     ret_owned,
     ret_ref,
-    tensor_arg,
     unsupported,
     v_bool_or,
     v_f64,
@@ -1152,27 +1149,18 @@ def op_native_dropout_backward(
     var grad = v_tensor(args[unsafe_offset=0])
     var keep = v_tensor(args[unsafe_offset=1])
     var scale = v_f64(args[unsafe_offset=2])
-    if (
-        not _dropout_dtype_ok(grad.dtype)
-        and keep.dtype == DType.bool
-        and keep.device == grad.device
-    ):
-        # An integer or bool gradient: CPU's `grad_output * mask * scale`
-        # (Dropout.cpp), which promotes to the default float dtype through
-        # the double scale. CUDA's kernel dispatches on floats only.
-        var masked = call_op(
-            "aten::mul", "Tensor", [tensor_arg(grad), tensor_arg(keep)], 1
+    if keep.dtype != DType.bool:
+        raise Error(
+            "Mask should be Bool Scalar Type", _scalar_type_name(keep.dtype)
         )
-        var scaled = call_op(
-            "aten::mul",
-            "Scalar",
-            [masked[0], Value(TAG_SCALAR_DOUBLE, 0, f64_bits(scale), 0)],
-            1,
+    if not _dropout_dtype_ok(grad.dtype):
+        # Dropout.cu's dropout_backward_cuda dispatches on the floating
+        # types only (CPU's `grad * mask * scale` takes any dtype).
+        raise Error(
+            '"masked_scale" not implemented for \'',
+            _scalar_type_name(grad.dtype),
+            "'",
         )
-        _ = masked^  # alive past the call that reads it
-        var result = own(scaled.take_tensor(0))
-        ret_owned(rets, 0, result)
-        return
     if (
         not _dropout_dtype_ok(grad.dtype)
         or keep.dtype != DType.bool

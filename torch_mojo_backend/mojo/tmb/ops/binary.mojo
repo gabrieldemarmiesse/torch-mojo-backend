@@ -1457,6 +1457,12 @@ def _b_add(
 ) raises -> Res:
     """The `fast_aten_add` cascade."""
     if _b_bool_result(lhs, rhs):
+        if alpha_v.tag == TAG_SCALAR_DOUBLE or alpha_v.tag == TAG_DOUBLE:
+            # BinaryOps.h alpha_check: a bool result is integral.
+            raise Error(
+                "For integral input tensors, argument alpha must not be a"
+                " floating point number."
+            )
         return _b_bool_add(lhs, rhs, v_f64(alpha_v) != 0.0, dst)
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)

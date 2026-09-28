@@ -26,8 +26,10 @@ from tmb.backend.abi import (
     Owned,
     T,
     TAG_BOOL_LIST,
+    TAG_DOUBLE,
     TAG_NONE,
     TAG_SCALAR_BOOL,
+    TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
     TAG_TENSOR,
     UNSUPPORTED_PREFIX,
@@ -1122,6 +1124,15 @@ def _call_1(
     return out^
 
 
+def _addr_integral_scalar(v: Value, name: StaticString) raises:
+    if v.tag == TAG_SCALAR_DOUBLE or v.tag == TAG_DOUBLE:
+        raise Error(
+            "For integral input tensors, argument ",
+            name,
+            " must not be a floating point number.",
+        )
+
+
 def _bool_scalar(b: Bool) -> Value:
     return Value(TAG_SCALAR_BOOL, 0, Int64(1) if b else Int64(0), 0)
 
@@ -1687,6 +1698,9 @@ def op_addr(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # A bool addr is `(beta and self) or (alpha and vec1 and vec2)`
         # (addr_kernel's bool branch): beta and alpha taken as bools, so the
         # composite's products stay bool instead of promoting to int64.
+        # check_addr_scalar: a bool result is integral, so no float scalar.
+        _addr_integral_scalar(beta, "beta")
+        _addr_integral_scalar(alpha, "alpha")
         beta = _bool_scalar(v_f64(beta) != 0.0)
         alpha = _bool_scalar(v_f64(alpha) != 0.0)
     if not v_scalar_is_bool(beta) and not v_scalar_is_bool(alpha):

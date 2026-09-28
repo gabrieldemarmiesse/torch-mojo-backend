@@ -140,6 +140,18 @@ struct PointwiseGlu(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_glu_backward_a")
+struct PointwiseGluBackwardA(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["glu_backward_a", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_heaviside")
 struct PointwiseHeaviside(ElementwiseBinaryOp):
     @staticmethod

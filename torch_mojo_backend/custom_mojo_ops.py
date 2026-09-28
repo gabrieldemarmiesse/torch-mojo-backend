@@ -296,6 +296,7 @@ def pointwise_binary(
         "fmod",
         "gcd",
         "glu",
+        "glu_backward_a",
         "heaviside",
         "hermite_polynomial_h",
         "hermite_polynomial_he",

@@ -42,6 +42,7 @@ from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    assert_no_internal_overlap,
     binary_promotion,
     broadcast_shape,
     cast_to,
@@ -54,6 +55,7 @@ from tmb.ops.common import (
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.core import cast_for_copy
+from tmb.ops.binary import _b_out_guard, _b_tside
 
 
 def _release_if_new(t: T, orig: T):
@@ -64,10 +66,13 @@ def _release_if_new(t: T, orig: T):
         release(t.h)
 
 
-def _shape_eq(t: T, shape: IndexList[MAX_RANK]) -> Bool:
+def _shape_eq(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
     """Whether t's padded shape exactly equals `shape` (both MAX_RANK-wide,
-    leading-padded with 1s): the eligibility check for writing an out=
-    kernel result directly into `t`."""
+    leading-padded with 1s) at `rank`: the eligibility check for writing an
+    out= kernel result directly into `t`. The rank matters: a [1] `out` of a
+    0-d result is resized to 0-d."""
+    if t.rank != rank:
+        return False
     for i in range(MAX_RANK):
         if t.shape[i] != shape[i]:
             return False
@@ -98,7 +103,7 @@ def _prepare_out(
         raise Error(
             "expected an out= tensor of dtype ", stype, ", got ", out_arg.stype
         )
-    if not _shape_eq(out_arg, shape):
+    if not _shape_eq(out_arg, shape, rank):
         resize_out(out_arg, shape, rank)
         return True
     return out_arg.contig
@@ -120,7 +125,7 @@ def _ensure_out_shape(
         raise Error(
             "expected an out= tensor of dtype ", stype, ", got ", out_arg.stype
         )
-    if not _shape_eq(out_arg, shape):
+    if not _shape_eq(out_arg, shape, rank):
         resize_out(out_arg, shape, rank)
 
 
@@ -162,6 +167,17 @@ def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
     _ = ctx
 
 
+def _compare_out_guard(out_arg: T, a: T, b: T) raises:
+    """TensorIterator's `out=` meta (the #606 contract every other `out=`
+    path runs): no internal overlap in `out`, no partial overlap with an
+    input, and an `out` that IS an input (the in-place `x.eq_(y)`) never
+    resized -- a broadcast shape larger than it raises."""
+    if not out_arg.on_mojo():
+        raise Error("expected the out= tensor on the operands' mojo device")
+    assert_no_internal_overlap(out_arg)
+    _b_out_guard(out_arg, _b_tside(a), _b_tside(b))
+
+
 def _cast_into_out(
     mut out_arg: T,
     res: T,
@@ -177,7 +193,7 @@ def _cast_into_out(
     only written once every element has been read."""
     if not out_arg.on_mojo() or out_arg.device != device:
         raise Error("expected the out= tensor on the operands' mojo device")
-    if not _shape_eq(out_arg, shape):
+    if not _shape_eq(out_arg, shape, rank):
         resize_out(out_arg, shape, rank)
     var casted = own(cast_for_copy(res, out_arg.stype))
     copy_strided_into(out_arg, casted.t)
@@ -210,6 +226,7 @@ def _compare_functional_out(
     var out_arg = v_tensor(args[unsafe_offset=2])
     if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
         raise Error("expected both operands on the same mojo device")
+    _compare_out_guard(out_arg, a, b)
     var dtype = binary_promotion(a, b)
     var stype = torch_dtype(dtype)
     var pa = cast_to(a, stype)
@@ -251,6 +268,7 @@ def _compare_scalar_out(op: StaticString, args: Values, rets: Values) raises:
     if not a.on_mojo():
         raise Error("expected the mojo device")
     var out_arg = v_tensor(args[unsafe_offset=2])
+    _compare_out_guard(out_arg, a, a)
     var value = scalar_embed(args[unsafe_offset=1], a.dtype)
     var fill = own(new_scalar(a.stype, a.device))
     fill_value(fill.t, value)

@@ -799,14 +799,11 @@ def test_multinomial_argument_errors(mojo_gpu):
 
 
 @pytest.mark.parametrize("dtype", [torch.int64, torch.bool])
-def test_native_dropout_backward_integral_grad(mojo_gpu, dtype):
-    """CPU's `grad_output * mask * scale`: an integral or bool gradient comes
-    back in the default float dtype."""
+def test_native_dropout_backward_integral_grad_raises(mojo_gpu, dtype):
+    """CUDA's dropout_backward dispatches on floating gradients only."""
     grad = torch.tensor([[1, 0, 3], [4, 5, 0]]).to(dtype)
     mask = torch.tensor([[True, False, True], [False, True, True]])
-    want = torch.ops.aten.native_dropout_backward(grad, mask, 1.25)
-    got = torch.ops.aten.native_dropout_backward(
-        grad.to(mojo_gpu), mask.to(mojo_gpu), 1.25
-    )
-    assert got.dtype == want.dtype == torch.float32
-    torch.testing.assert_close(got.cpu(), want)
+    with pytest.raises(RuntimeError, match='"masked_scale" not implemented'):
+        torch.ops.aten.native_dropout_backward(
+            grad.to(mojo_gpu), mask.to(mojo_gpu), 1.25
+        )

@@ -3428,18 +3428,28 @@ def aten_glu(input: MaxTensor, dim: int = -1) -> MaxTensor:
 # glu_backward(Tensor grad_output, Tensor self, int dim) -> Tensor
 @map_to(aten.glu_backward)
 def aten_glu_backward(grad_output: MaxTensor, input: MaxTensor, dim: int) -> MaxTensor:
-    """glu_backward_kernel: sigmoid(b) * grad for the first half, (1 -
-    sigmoid(b)) * sigmoid(b) * grad * a for the second, in opmath (float for
-    the half types), concatenated along `dim`."""
+    """glu_backward_kernel: sigmoid(b) * grad for the first half -- the
+    native kernel's own `glu_backward_a` kind -- and (1 - sigmoid(b)) *
+    sigmoid(b) * grad * a for the second, in opmath (float for the half
+    types), concatenated along `dim`.
+
+    The second half is a MAX composition rather than the native
+    `glu_backward_b` kind: it reads three operands, and MAX 26.5's
+    extensibility has no ternary elementwise trait (only Unary / Binary), so
+    reusing it would take a hand-launched custom op of its own.
+    """
+    if grad_output.dtype != input.dtype:
+        raise TypeError(f"Found dtype {grad_output.dtype} but expected {input.dtype}")
     a, b = _glu_halves(input, dim)
+    grad_a = custom_mojo_ops.pointwise_binary(grad_output, b, "glu_backward_a")
     wide = input.dtype in (DType.float16, DType.bfloat16)
     if wide:
         a, b, grad_output = (F.cast(x, DType.float32) for x in (a, b, grad_output))
     sig = custom_mojo_ops.elementwise(b, "sigmoid")
-    grad_a = sig * grad_output
     grad_b = (1 - sig) * sig * grad_output * a
-    result = F.concat([grad_a, grad_b], axis=dim)
-    return F.cast(result, input.dtype) if wide else result
+    if wide:
+        grad_b = F.cast(grad_b, input.dtype)
+    return F.concat([grad_a, grad_b], axis=dim)
 
 
 def _glu_halves(input: MaxTensor, dim: int) -> tuple[MaxTensor, MaxTensor]:

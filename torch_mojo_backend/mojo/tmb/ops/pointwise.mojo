@@ -106,6 +106,7 @@ from tmb.ops.common import (
     scalar_to_int,
 )
 from tmb.ops.random import _draw
+from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.core import cast_for_copy
 from tmb.ops.reductions import _scalar_reduction
 from tmb.ops.unary import op_gelu_backward
@@ -1978,7 +1979,7 @@ def _glu(args: Values, rets: Values, out_index: Int) raises:
     var d = _glu_dim(
         self,
         v_int(args[unsafe_offset=1]),
-        "glu does not support scalars because halving size must be even",
+        "glu does not support 0-dimensional tensors",
     )
     var a = own(_glu_half(self, d, False))
     var b = own(_glu_half(self, d, True))
@@ -2017,11 +2018,17 @@ def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
             " does not match the halved input shape ",
             _b_shape_list(a.t.shape, a.t.rank),
         )
+    if grad.stype != self.stype:
+        # glu_backward_cuda_out's TensorIterator checks every operand has
+        # one dtype (check_all_same_dtype); no promotion.
+        raise Error(
+            "Found dtype ",
+            _scalar_type_name(grad.dtype),
+            " but expected ",
+            _scalar_type_name(self.dtype),
+        )
     var compute = _pw_compute_dtype(
-        "glu_backward",
-        promote_types(grad.stype, self.stype),
-        P_FLOAT_ONLY,
-        True,
+        "glu_backward", self.stype, P_FLOAT_ONLY, True
     )
     var sg = _b_tside(grad)
     var ga = own(
@@ -2060,11 +2067,10 @@ def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
             raise Error("expected `grad_input` on the inputs' mojo device")
         if gi.stype != compute:
             raise Error(
-                "Expected out tensor to have dtype ",
-                dtype_name(compute),
-                ", but got ",
-                dtype_name(gi.stype),
-                " instead",
+                "Found dtype ",
+                _scalar_type_name(gi.dtype),
+                " but expected ",
+                _scalar_type_name(self.dtype),
             )
         assert_no_internal_overlap(gi)
         if not gi.same_shape(self):

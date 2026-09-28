@@ -75,6 +75,9 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "_batch_norm_with_update": ("float32", "bfloat16", "float16"),
     "_segment_reduce_lengths": ("float32", "bfloat16", "float16"),
     "_segment_reduce_offsets": ("float32", "bfloat16", "float16"),
+    # Matches CUDA, not CPU: SoftMax.cu rounds `grad * output` to the half
+    # dtype before its float reduction; CPU's kernel keeps it in float.
+    "_softmax_backward_data": ("bfloat16", "float16"),
     "_unsafe_masked_index": ("float32", "bfloat16", "float16", "int64", "bool"),
     "_unsafe_masked_index_put_accumulate": (
         "float32",
@@ -235,6 +238,9 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "nanmean": ("float32", "bfloat16", "float16"),
     "nanquantile": ("float32",),
     "nansum": ("float32", "bfloat16", "float16", "int64", "bool"),
+    # CUDA's dropout_backward dispatches on floating grads only ("masked_scale"
+    # not implemented for 'Long'); CPU computes grad * mask * scale for any.
+    "native_dropout_backward": ("int64", "bool"),
     "native_layer_norm": ("float32", "bfloat16", "float16"),
     "nn_functional_adaptive_avg_pool1d": ("float32", "bfloat16", "float16"),
     "nn_functional_adaptive_avg_pool2d": ("float32", "bfloat16", "float16"),

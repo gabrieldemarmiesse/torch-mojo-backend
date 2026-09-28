@@ -1430,6 +1430,15 @@ def test_addr_bool(mojo_device):
         )
 
 
+def test_addr_bool_float_scalar_raises(mojo_device):
+    b = torch.tensor([[True, False], [False, True]]).to(mojo_device)
+    v = torch.tensor([True, False]).to(mojo_device)
+    with pytest.raises(RuntimeError, match="argument beta must not be a floating"):
+        torch.addr(b, v, v, beta=0.5)
+    with pytest.raises(RuntimeError, match="argument alpha must not be a floating"):
+        torch.addr(b, v, v, alpha=0.5)
+
+
 def test_addr_default_beta_alpha(mojo_device):
     self_ = torch.randn(4, 6)
     vec1 = torch.randn(4)

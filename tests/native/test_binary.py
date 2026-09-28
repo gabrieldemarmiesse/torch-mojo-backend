@@ -1618,6 +1618,17 @@ def test_add_bool(mojo_device):
     torch.testing.assert_close(wide.cpu(), (a_cpu + b_cpu).float())
 
 
+def test_add_bool_float_alpha_raises(mojo_device):
+    a = torch.tensor([True, False]).to(mojo_device)
+    with pytest.raises(RuntimeError, match="argument alpha must not be a floating"):
+        torch.add(a, a, alpha=0.5)
+    # An integer alpha is a bool: 0 keeps a, anything else ors b in.
+    torch.testing.assert_close(torch.add(a, a.logical_not(), alpha=0).cpu(), a.cpu())
+    torch.testing.assert_close(
+        torch.add(a, a.logical_not(), alpha=2).cpu(), torch.tensor([True, True])
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.int64, torch.bool])
 def test_rdiv_integral(mojo_device, dtype):
     """`3 / t` is `t.reciprocal() * 3`, a float result for integral t."""

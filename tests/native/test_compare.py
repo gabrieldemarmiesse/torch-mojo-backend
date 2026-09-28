@@ -152,6 +152,35 @@ def test_compare_inplace_non_bool(mojo_device: str, name: str, dtype: torch.dtyp
     torch.testing.assert_close(got.cpu(), expected)
 
 
+def test_compare_out_contract(mojo_device: str):
+    """TensorIterator's `out=` meta, bool and non-bool `out` alike."""
+    a = torch.tensor([1.0, 2.0, 3.0]).to(mojo_device)
+    for dtype in (torch.bool, torch.float32):
+        # An expanded `out` overlaps itself.
+        expanded = torch.zeros(1, dtype=dtype, device=mojo_device).expand(3)
+        with pytest.raises(RuntimeError, match="single memory location"):
+            torch.eq(a, 2.0, out=expanded)
+    # In place, broadcasting may not enlarge self.
+    x = torch.tensor([1.0, 2.0, 3.0]).to(mojo_device)
+    with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+        x.eq_(torch.ones(2, 3, device=mojo_device))
+    # An `out` partially overlapping an input.
+    base = torch.tensor([1.0, 2.0, 3.0, 4.0]).to(mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.lt(base[:3], 2.5, out=base[1:])
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bool, torch.float32])
+def test_compare_out_resized_to_zero_dim(mojo_device: str, out_dtype: torch.dtype):
+    """A 0-d result resizes a [1] `out` to 0-d (the rank matters)."""
+    x = torch.tensor(2.0)
+    out = torch.zeros(1, dtype=out_dtype, device=mojo_device)
+    torch.eq(x.to(mojo_device), 2.0, out=out)
+    expected = torch.eq(x, 2.0, out=torch.zeros(1, dtype=out_dtype))
+    assert out.shape == expected.shape == torch.Size([])
+    torch.testing.assert_close(out.cpu(), expected)
+
+
 def test_compare_device_mismatch_raises(mojo_gpu: str):
     a = torch.tensor([1.0]).to(mojo_gpu)
     with pytest.raises(RuntimeError):
