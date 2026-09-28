@@ -358,6 +358,10 @@ def test_index_fill_scalar_conversions(mojo_device):
     u = torch.zeros(3, 4, dtype=torch.uint8, device=mojo_device)
     with pytest.raises(RuntimeError, match="without overflow"):
         u.index_fill(1, di, 256.0)
+    # The value is range-checked even when nothing is filled.
+    for target, index in [(u, di[:0]), (u[:0], di)]:
+        with pytest.raises(RuntimeError, match="without overflow"):
+            target.clone().index_fill_(1, index, 256)
     # An empty filled dimension rejects every index; an empty other one is a
     # no-op.
     e = torch.empty(0, 3, device=mojo_device)

@@ -785,6 +785,9 @@ def test_masked_fill_value_tensor_elsewhere(mojo_device: str):
         )
     with pytest.raises(RuntimeError, match="without overflow"):
         x.to(mojo_device).masked_fill(mask.to(mojo_device), 1j)
+    # A complex scalar with a zero imaginary part fills its real part.
+    got = x.to(mojo_device).masked_fill(mask.to(mojo_device), 2.5 + 0j)
+    assert torch.equal(got.cpu(), x.masked_fill(mask, 2.5 + 0j))
     u = torch.zeros(3, 4, dtype=torch.uint8, device=mojo_device)
     for bad in (256.0, -1.0, 256, -256, float("nan")):
         with pytest.raises(RuntimeError, match="without overflow"):

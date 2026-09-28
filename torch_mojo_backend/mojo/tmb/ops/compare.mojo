@@ -14,9 +14,11 @@ the old `_bcast_meta`'s `rank > 4: return None`).
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    bits_f64,
     Owned,
     T,
     TAG_COMPLEX,
+    TAG_SCALAR_DOUBLE,
     Value,
     Values,
     ST_BOOL,
@@ -743,11 +745,15 @@ def scalar_as_fill(v: Value, dtype: DType) raises -> Float64:
     into a real type is the overflow error ATen raises. The result is
     exactly representable as a Float64 or declined."""
     if v.tag == TAG_COMPLEX:
-        raise Error(
-            "value cannot be converted to type ",
-            _c10_name(dtype),
-            " without overflow",
-        )
+        # c10::overflows<real, complex>: a nonzero imaginary part overflows,
+        # otherwise the real part converts like a double Scalar.
+        if bits_f64(v.b) != 0.0:
+            raise Error(
+                "value cannot be converted to type ",
+                _c10_name(dtype),
+                " without overflow",
+            )
+        return scalar_as_fill(Value(TAG_SCALAR_DOUBLE, 0, v.a, 0), dtype)
     if dtype == DType.bool:
         return 1.0 if v_f64(v) != 0.0 else 0.0
     var st = torch_dtype(dtype)

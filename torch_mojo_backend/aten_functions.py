@@ -6005,8 +6005,8 @@ def _tri_indices_constant(
 ) -> MaxTensor:
     """The (2, N) row-major coordinates of the lower (upper) triangle,
     computed here from the static arguments and embedded as a constant."""
-    rows: list[int] = []
-    cols: list[int] = []
+    rows = []
+    cols = []
     for i in range(row):
         lo, hi = (max(0, i + offset), col) if upper else (0, min(col, i + offset + 1))
         for j in range(lo, hi):

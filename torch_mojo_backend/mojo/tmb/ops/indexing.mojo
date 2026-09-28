@@ -728,6 +728,9 @@ def _index_fill(a: T, dim_in: Int, index: T, value_v: Value) raises:
         raise Error("Index has to be a vector/scalar")
     if not _same_device(a, index):
         unsupported("index_fill_ with the index on a different device")
+    # The value converts (and is range-checked) before any early return, as
+    # ATen's `source.to<scalar_t>()` does even for an empty fill.
+    var value = scalar_as_fill(value_v, a.dtype)
     if index.numel == 0:
         return
     if a.rank > 0 and a.dim(dim) == 0:
@@ -748,7 +751,6 @@ def _index_fill(a: T, dim_in: Int, index: T, value_v: Value) raises:
         unsupported("index_fill_ of rank greater than 4")
     if not _is_scatter_dtype(a.dtype):
         unsupported("index_fill_ of dtype " + String(a.dtype))
-    var value = scalar_as_fill(value_v, a.dtype)
     var dim_size = 1 if a.rank == 0 else a.dim(dim)
     var idx = _wrapped_index(index, dim_size)
     var dims = _dims_of(a)
