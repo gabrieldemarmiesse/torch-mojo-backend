@@ -376,7 +376,7 @@ def test_out_overlap_raises(mojo_device):
     with pytest.raises(RuntimeError, match="more than one element"):
         torch.ops.aten.replication_pad2d.out(x, [1, 1, 1, 1], out=expanded)
     with pytest.raises(RuntimeError, match="single memory location"):
-        torch.ops.aten.upsample_nearest2d.out(x, [4, 4], None, None, out=x)
+        torch.ops.aten.upsample_nearest1d.out(x[0], [4], None, out=x[0])
     # A partially overlapping dense view: the input's second half is the
     # start of the output.
     buf = torch.zeros(64, device=mojo_device)
@@ -384,3 +384,45 @@ def test_out_overlap_raises(mojo_device):
         torch.ops.aten.reflection_pad2d.out(
             buf[:16].view(1, 1, 4, 4), [1, 1, 1, 1], out=buf[8:44].view(1, 1, 6, 6)
         )
+
+
+def test_unchanged_size_out_is_the_input(mojo_device):
+    """CUDA's unchanged-size shortcut is `out.copy_(input)`: with `out` the
+    input itself it is a no-op, not an overlap error."""
+    x = torch.randn(1, 1, 4, 4)
+    xm = x.to(mojo_device)
+    res = torch.ops.aten.upsample_nearest2d.out(xm, [4, 4], None, None, out=xm)
+    assert res is xm
+    torch.testing.assert_close(xm.cpu(), x, atol=0, rtol=0)
+
+
+def test_bilinear2d_unchanged_size_copies_despite_the_scale(mojo_device):
+    """upsample_bilinear2d copies an unchanged-size input whatever the scale."""
+    x = torch.randn(1, 2, 4, 5)
+    got = torch.ops.aten.upsample_bilinear2d(x.to(mojo_device), [4, 5], False, 3.0, 1.5)
+    torch.testing.assert_close(got.cpu(), x, atol=0, rtol=0)
+
+
+def test_out_sharing_storage_is_resized_after_the_kernel(mojo_device):
+    """An empty `out` over the input's storage is resized (possibly moving
+    the storage) only after the input was read."""
+    buf = torch.arange(16.0)
+    want = F.pad(buf.view(1, 1, 4, 4), (1, 1, 1, 1), mode="replicate")
+    bm = buf.to(mojo_device)
+    out = bm[16:16]
+    torch.ops.aten.replication_pad2d.out(bm.view(1, 1, 4, 4), [1, 1, 1, 1], out=out)
+    torch.testing.assert_close(out.cpu(), want, atol=0, rtol=0)
+
+
+def test_bicubic_backward_inf_grad_matches_cuda(mojo_device):
+    """CUDA scatters every (output, tap) product: an inf gradient meets
+    coefficients of both signs and zeros, giving [[nan, nan], [nan, inf]]."""
+    g = torch.zeros(1, 1, 3, 3)
+    g[0, 0, 0, 0] = float("inf")
+    got = torch.ops.aten.upsample_bicubic2d_backward(
+        g.to(mojo_device), [3, 3], [1, 1, 2, 2], False
+    )
+    want = torch.tensor(
+        [[[[float("nan"), float("nan")], [float("nan"), float("inf")]]]]
+    )
+    torch.testing.assert_close(got.cpu(), want, equal_nan=True)

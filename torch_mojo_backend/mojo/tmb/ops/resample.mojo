@@ -46,6 +46,8 @@ from tmb.ops.common import (
     assert_no_internal_overlap,
     assert_no_overlap,
     check_out,
+    same_view,
+    shares_storage,
     contiguous,
     copy_strided_into,
     resize_out,
@@ -99,18 +101,32 @@ def _require_mojo(t: T, what: String) raises:
         unsupported(what + ": operand is not on the mojo device")
 
 
+comptime DIRECT = 0  # the kernel writes the caller's tensor
+comptime COPY_BACK = 1  # into a fresh tensor, then copied into the caller's
+comptime RESIZE_COPY = 2  # fresh tensor, then the caller's is resized + copied
+comptime NO_OP = 3  # the caller's tensor already holds the result
+
+
 def _dest(
-    args: Values, i: Int, like: T, dims: List[Int], inputs: List[T]
-) raises -> Tuple[T, Bool]:
-    """The tensor an `out=` / `grad_input=` overload writes: the caller's
-    (resized when its shape differs) when it is contiguous, else a fresh one
-    to copy back (second field True)."""
+    args: Values,
+    i: Int,
+    like: T,
+    dims: List[Int],
+    inputs: List[T],
+    identity: Bool,
+) raises -> Tuple[T, Int]:
+    """The tensor an `out=` / `grad_input=` overload writes, and how the
+    result reaches the caller's tensor (DIRECT / COPY_BACK / RESIZE_COPY /
+    NO_OP).
+
+    `identity`: the op copies its input unchanged (CUDA's `output.copy_(input)`
+    shortcut), so an `out` that IS that input view is a no-op, as on CUDA.
+    Any other overlap with an input raises before anything is written. An
+    `out` that must be resized while it shares storage with an input is
+    resized only after the kernel ran into a fresh tensor: the resize may
+    reallocate the storage the input's pointer still addresses."""
     var dst = v_tensor(args[unsafe_offset=i])
     check_out(dst, like)
-    # Aliasing is checked on the caller's view before any resize: a resize
-    # may move the storage an input still points into.
-    for k in range(len(inputs)):
-        assert_no_overlap(dst, inputs[k])
     var shape = _shape(dims)
     var matches = dst.rank == len(dims)
     if matches:
@@ -118,25 +134,44 @@ def _dest(
             if dst.dim(k) != dims[k]:
                 matches = False
                 break
+    if matches and identity and same_view(dst, inputs[0]):
+        return (dst^, NO_OP)
+    for k in range(len(inputs)):
+        assert_no_overlap(dst, inputs[k])
     if not matches:
+        for k in range(len(inputs)):
+            if shares_storage(dst, inputs[k]):
+                return (
+                    new_tensor(shape, len(dims), dst.stype, dst.device),
+                    RESIZE_COPY,
+                )
         resize_out(dst, shape, len(dims))
-        return (dst^, False)
+        return (dst^, DIRECT)
     assert_no_internal_overlap(dst)
     if dst.contig:
-        return (dst^, False)
-    return (new_tensor(shape, len(dims), dst.stype, dst.device), True)
+        return (dst^, DIRECT)
+    return (new_tensor(shape, len(dims), dst.stype, dst.device), COPY_BACK)
 
 
 def _finish[
     OUT: Bool
-](rets: Values, var res: T, fresh: Bool, args: Values, out_index: Int) raises:
+](
+    rets: Values,
+    var res: T,
+    how: Int,
+    args: Values,
+    out_index: Int,
+    dims: List[Int],
+) raises:
     """Hand `res` back: owned for the functional overload, else copied into
-    the caller's tensor (when it could not be written directly) and returned
-    by reference."""
+    the caller's tensor (resized first when `how` says so) and returned by
+    reference."""
     comptime if OUT:
         var dst = v_tensor(args[unsafe_offset=out_index])
-        if fresh:
+        if how == COPY_BACK or how == RESIZE_COPY:
             var tmp = own(res^)
+            if how == RESIZE_COPY:
+                resize_out(dst, _shape(dims), len(dims))
             copy_strided_into(dst, tmp.t)
             _ = tmp^
         ret_ref(rets, 0, dst)
@@ -335,13 +370,16 @@ def _run_upsample[
 def _is_identity[
     MODE: Int, RANK: Int, BACKWARD: Bool
 ](in_dims: List[Int], out_dims: List[Int]) -> Bool:
-    """CUDA's "special case: just copy" of the linear 1-d / 3-d and bicubic
-    kernels and of the antialiased backward (the bilinear 2-d kernels have
-    none: they interpolate even there, which only matters when an explicit
-    scale disagrees with the sizes, or for an inf beside a zero weight)."""
+    """CUDA's unchanged-size copy, per kernel: the host-side `copy_` of
+    upsample_nearest2d / _upsample_nearest_exact2d / upsample_bilinear2d
+    (forward and backward), the in-kernel "just copy" of the linear 1-d,
+    trilinear and bicubic kernels, and the antialiased backward's. The
+    nearest 1-d / 3-d kernels and the antialiased forward have none (an
+    explicit scale still moves their source index)."""
     comptime if (
         MODE == CUBIC
-        or (MODE == LINEAR and RANK != 2)
+        or MODE == LINEAR
+        or (MODE <= NEAREST_EXACT and RANK == 2)
         or (MODE == BILINEAR_AA and BACKWARD)
     ):
         for k in range(RANK):
@@ -383,25 +421,27 @@ def op_upsample[
         )
     if not _up_dtype_ok[MODE](a):
         unsupported(String(name, ": dtype ", a.dtype))
+    var identity = _is_identity[MODE, RANK, False](in_dims, out_dims)
     var dst: T
-    var fresh: Bool
+    var how = DIRECT
     comptime if OUT:
-        var d = _dest(args, first_scale + RANK, a, out_dims, [a.copy()])
+        var d = _dest(
+            args, first_scale + RANK, a, out_dims, [a.copy()], identity
+        )
         dst = d[0].copy()
-        fresh = d[1]
+        how = d[1]
     else:
         dst = new_tensor(_shape(out_dims), RANK + 2, a.stype, a.device)
-        fresh = True
-    if dst.numel > 0:
+    if dst.numel > 0 and how != NO_OP:
         var src = own_if_new(contiguous(a), a)
-        if _is_identity[MODE, RANK, False](in_dims, out_dims):
+        if identity:
             copy_strided_into(dst, src.t)
         else:
             _run_upsample[MODE, RANK, False](
                 dst, src.t, in_dims, out_dims, align, scales
             )
         _ = src^
-    _finish[OUT](rets, dst^, fresh, args, first_scale + RANK)
+    _finish[OUT](rets, dst^, how, args, first_scale + RANK, out_dims)
 
 
 def op_upsample_backward[
@@ -445,25 +485,27 @@ def op_upsample_backward[
             )
     if not _up_dtype_ok[MODE](g):
         unsupported(String(name, ": dtype ", g.dtype))
+    var identity = _is_identity[MODE, RANK, True](in_dims, out_dims)
     var dst: T
-    var fresh: Bool
+    var how = DIRECT
     comptime if OUT:
-        var d = _dest(args, first_scale + RANK, g, in_dims, [g.copy()])
+        var d = _dest(
+            args, first_scale + RANK, g, in_dims, [g.copy()], identity
+        )
         dst = d[0].copy()
-        fresh = d[1]
+        how = d[1]
     else:
         dst = new_tensor(_shape(in_dims), RANK + 2, g.stype, g.device)
-        fresh = True
-    if dst.numel > 0:
+    if dst.numel > 0 and how != NO_OP:
         var src = own_if_new(contiguous(g), g)
-        if _is_identity[MODE, RANK, True](in_dims, out_dims):
+        if identity:
             copy_strided_into(dst, src.t)
         else:
             _run_upsample[MODE, RANK, True](
                 dst, src.t, in_dims, out_dims, align, scales
             )
         _ = src^
-    _finish[OUT](rets, dst^, fresh, args, first_scale + RANK)
+    _finish[OUT](rets, dst^, how, args, first_scale + RANK, in_dims)
 
 
 # ---------------------------------------------------------------------------
@@ -656,20 +698,24 @@ def op_pad[
     var in_dims = List[Int]()
     for k in range(a.rank):
         in_dims.append(a.dim(k))
+    # All-zero padding copies the input unchanged.
+    var identity = True
+    for k in range(len(padding)):
+        if padding[k] != 0:
+            identity = False
     var dst: T
-    var fresh: Bool
+    var how = DIRECT
     comptime if OUT:
-        var d = _dest(args, 2, a, out_dims, [a.copy()])
+        var d = _dest(args, 2, a, out_dims, [a.copy()], identity)
         dst = d[0].copy()
-        fresh = d[1]
+        how = d[1]
     else:
         dst = new_tensor(_shape(out_dims), a.rank, a.stype, a.device)
-        fresh = True
-    if dst.numel > 0:
+    if dst.numel > 0 and how != NO_OP:
         var src = own_if_new(contiguous(a), a)
         _run_pad[REFLECT, RANK, False](dst, src.t, in_dims, out_dims, padding)
         _ = src^
-    _finish[OUT](rets, dst^, fresh, args, 2)
+    _finish[OUT](rets, dst^, how, args, 2, out_dims)
 
 
 def op_pad_backward[
@@ -730,20 +776,19 @@ def op_pad_backward[
     if a.stype != g.stype:
         unsupported(String(name, ": grad_output and self dtypes differ"))
     var dst: T
-    var fresh: Bool
+    var how = DIRECT
     comptime if OUT:
         # `self` is only read for its shape, so it may alias grad_input.
-        var d = _dest(args, 3, g, in_dims, [g.copy()])
+        var d = _dest(args, 3, g, in_dims, [g.copy()], False)
         dst = d[0].copy()
-        fresh = d[1]
+        how = d[1]
     else:
         dst = new_tensor(_shape(in_dims), a.rank, g.stype, g.device)
-        fresh = True
     if dst.numel > 0:
         var src = own_if_new(contiguous(g), g)
         _run_pad[REFLECT, RANK, True](dst, src.t, in_dims, out_dims, padding)
         _ = src^
-    _finish[OUT](rets, dst^, fresh, args, 3)
+    _finish[OUT](rets, dst^, how, args, 3, in_dims)
 
 
 def register_resample(site: Site) raises:
