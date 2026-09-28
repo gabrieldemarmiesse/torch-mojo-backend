@@ -153,6 +153,10 @@ COVERS |= {
     "aten::eye.out": "test_eye (torch.eye(n) resolves to eye.m_out; same fills)",
 }
 
+_PAD_OUT = (
+    "out-variant plumbing over an already-benchmarked functional impl: the "
+    "same resample kernel, written into the caller's tensor"
+)
 SKIPPED: dict[str, str] = {
     "aten::unfold": "pure view/metadata op: a storage-sharing as_strided, no kernel",
     "aten::tril_indices": (
@@ -176,17 +180,12 @@ SKIPPED: dict[str, str] = {
         "benchmarked in their own families"
     ),
     "aten::vdot": "dot for the real dtypes: mul + sum, both benchmarked",
-
-
-_PAD_OUT = (
-    "out-variant plumbing over an already-benchmarked functional impl: the "
-    "same resample kernel, written into the caller's tensor"
-)
-SKIPPED: dict[str, str] = {
-    f"aten::{m}_pad{r}d{suffix}": _PAD_OUT
-    for m in PAD_MODES
-    for r in (1, 2, 3)
-    for suffix in (".out", "_backward.grad_input")
+    **{
+        f"aten::{m}_pad{r}d{suffix}": _PAD_OUT
+        for m in PAD_MODES
+        for r in (1, 2, 3)
+        for suffix in (".out", "_backward.grad_input")
+    },
 }
 
 
