@@ -67,6 +67,7 @@ from tmb.ops.binary import (
     Res,
     Scal,
     Side,
+    _b_can_cast,
     _b_copy_into,
     _b_inplace_destination,
     _b_inplace_operand,
@@ -75,6 +76,7 @@ from tmb.ops.binary import (
     _b_no_partial_overlap,
     _b_ret,
     _b_self,
+    _b_shape_list,
     _b_side,
     _b_sside,
     _b_store_inplace,
@@ -97,6 +99,7 @@ from tmb.ops.common import (
     is_float_stype as _pw_is_float,
     is_int_stype as _pw_is_int,
     known_stype as _pw_known,
+    cast_to,
     promote_types,
     resize_out,
     scalar_to_float,
@@ -870,6 +873,9 @@ def op_frexp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         )
     if expo.stype != ST_INT32:
         raise Error("torch.frexp() expects exponent to have int dtype")
+    # TensorIterator's meta: an output that partially overlaps self raises.
+    _b_no_partial_overlap(mant, self)
+    _b_no_partial_overlap(expo, self)
     var r = _pw_frexp(self)
     _pw_store_slot(rets, 0, mant, r[0].copy())
     _pw_store_slot(rets, 1, expo, r[1].copy())
@@ -1383,9 +1389,12 @@ def _pw_act(
     params: SIMD[DType.float64, 4],
     f64_ok: Bool = True,
     policy: Int = P_FLOAT_ONLY,
+    out_st: Int32 = -1,
 ) raises:
     """An activation (b_index < 0) or its backward: floating operands of one
-    dtype, operand a = args[a_index], b = args[b_index]."""
+    dtype, operand a = args[a_index], b = args[b_index]. The result is in
+    the compute dtype, or in `out_st` when given (a TensorIterator whose
+    output is allocated from one input's options)."""
     var a = _b_side(args[unsafe_offset=a_index])
     var arity = 1 if b_index < 0 else 2
     var b = _b_side(args[unsafe_offset=b_index]) if arity == 2 else _none_side()
@@ -1394,11 +1403,12 @@ def _pw_act(
     var dest = Optional[T]()
     if out_index >= 0:
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
+    var result_st = compute if out_st < 0 else out_st
     _pw_finish(
         rets,
         dest,
         _pw_run(
-            kind, arity, a, b, _none_side(), compute, compute, params, dest
+            kind, arity, a, b, _none_side(), compute, result_st, params, dest
         ),
         _pw_out_exact(kind),
     )
@@ -1433,11 +1443,20 @@ def _self_stype(args: Values, i: Int) raises -> Int32:
     return v_tensor(args[unsafe_offset=i]).stype
 
 
+def _opmath_scalar(v: Value, self_st: Int32) raises -> Float64:
+    """`Scalar::to<opmath_t>()`: a finite value past float32's range raises
+    for every dtype but float64 (whose opmath is double)."""
+    return scalar_to_float(
+        v, ST_FLOAT64 if self_st == ST_FLOAT64 else ST_FLOAT32
+    )
+
+
 def _elu_p(args: Values, first: Int) raises -> SIMD[DType.float64, 4]:
+    var st = _self_stype(args, 0)
     return _p(
-        v_f64(args[unsafe_offset=first]),
-        v_f64(args[unsafe_offset=first + 1]),
-        v_f64(args[unsafe_offset=first + 2]),
+        _opmath_scalar(args[unsafe_offset=first], st),
+        _opmath_scalar(args[unsafe_offset=first + 1], st),
+        _opmath_scalar(args[unsafe_offset=first + 2], st),
     )
 
 
@@ -1452,10 +1471,11 @@ def op_elu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _elu_backward_p(args: Values) raises -> SIMD[DType.float64, 4]:
+    var st = _self_stype(args, 0)
     return _p(
-        v_f64(args[unsafe_offset=1]),
-        v_f64(args[unsafe_offset=2]),
-        v_f64(args[unsafe_offset=3]),
+        _opmath_scalar(args[unsafe_offset=1], st),
+        _opmath_scalar(args[unsafe_offset=2], st),
+        _opmath_scalar(args[unsafe_offset=3], st),
         1.0 if v_bool(args[unsafe_offset=4]) else 0.0,
     )
 
@@ -1492,6 +1512,46 @@ def _lambd_p(args: Values, i: Int, st: Int32) raises -> SIMD[DType.float64, 4]:
     return _p(_round_to(v_f64(args[unsafe_offset=i]), st))
 
 
+def _shrink_backward_p(args: Values) raises -> SIMD[DType.float64, 4]:
+    """lambd as `Scalar::to<scalar_t>` of the kernel's dtype: the promoted
+    (grad, self) dtype, not self's (float16 self 0.3 is 0.30005, outside a
+    float32 lambd of 0.3; a float16 lambd would round to 0.30005 too)."""
+    var common = _pw_result_type(
+        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=1]),
+        _none_side(),
+        2,
+    )
+    return _lambd_p(args, 2, common)
+
+
+def _float_max(st: Int32) -> Float64:
+    """std::numeric_limits<scalar_t>::max() of a floating dtype."""
+    if st == ST_FLOAT16:
+        return 65504.0
+    if st == ST_BFLOAT16:
+        return 3.3895313892515355e38
+    if st == ST_FLOAT32:
+        return 3.4028234663852886e38
+    return 1.7976931348623157e308
+
+
+def _softshrink_check(args: Values) raises:
+    """softshrink's meta: 0 <= lambd <= max of self's dtype (NaN fails)."""
+    var lambd = v_f64(args[unsafe_offset=1])
+    var st = _self_stype(args, 0)
+    var top = _float_max(st)
+    if not (lambd >= 0.0 and lambd <= top):
+        raise Error(
+            "lambda must be in range [0, ",
+            top,
+            "] for input dtype ",
+            dtype_name(st),
+            ", but found ",
+            lambd,
+        )
+
+
 # aten::hardshrink(Tensor self, Scalar lambd=0.5) -> Tensor
 def op_hardshrink(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _pw_act(
@@ -1522,12 +1582,7 @@ def op_hardshrink_out(
 
 # aten::softshrink(Tensor self, Scalar lambd=0.5) -> Tensor
 def op_softshrink(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if v_f64(args[unsafe_offset=1]) < 0:
-        raise Error(
-            "lambda must be greater or equal to 0, but found to be "
-            + String(v_f64(args[unsafe_offset=1]))
-            + "."
-        )
+    _softshrink_check(args)
     _pw_act(
         "softshrink",
         args,
@@ -1543,12 +1598,7 @@ def op_softshrink(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_softshrink_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if v_f64(args[unsafe_offset=1]) < 0:
-        raise Error(
-            "lambda must be greater or equal to 0, but found to be "
-            + String(v_f64(args[unsafe_offset=1]))
-            + "."
-        )
+    _softshrink_check(args)
     _pw_act(
         "softshrink",
         args,
@@ -1572,7 +1622,7 @@ def op_shrink_backward(
         0,
         1,
         -1,
-        _lambd_p(args, 2, _self_stype(args, 1)),
+        _shrink_backward_p(args),
     )
 
 
@@ -1588,7 +1638,7 @@ def op_shrink_backward_grad_input(
         0,
         1,
         3,
-        _lambd_p(args, 2, _self_stype(args, 1)),
+        _shrink_backward_p(args),
     )
 
 
@@ -1726,25 +1776,25 @@ def op_hardtanh_backward_grad_input(
     )
 
 
+def _leaky_p(args: Values) raises -> SIMD[DType.float64, 4]:
+    return _p(_opmath_scalar(args[unsafe_offset=1], _self_stype(args, 0)))
+
+
 # aten::leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
 def op_leaky_relu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_act(
-        "leaky_relu", args, rets, 0, -1, -1, _p(v_f64(args[unsafe_offset=1]))
-    )
+    _pw_act("leaky_relu", args, rets, 0, -1, -1, _leaky_p(args))
 
 
 # aten::leaky_relu.out(Tensor self, Scalar negative_slope=0.01, *, Tensor(a!) out) -> Tensor(a!)
 def op_leaky_relu_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_act(
-        "leaky_relu", args, rets, 0, -1, 2, _p(v_f64(args[unsafe_offset=1]))
-    )
+    _pw_act("leaky_relu", args, rets, 0, -1, 2, _leaky_p(args))
 
 
 # aten::leaky_relu_(Tensor(a!) self, Scalar negative_slope=0.01) -> Tensor(a!)
 def op_leaky_relu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_act_inplace("leaky_relu", args, rets, _p(v_f64(args[unsafe_offset=1])))
+    _pw_act_inplace("leaky_relu", args, rets, _leaky_p(args))
 
 
 def _leaky_backward_check(args: Values) raises:
@@ -1772,7 +1822,7 @@ def op_leaky_relu_backward(
         1,
         0,
         -1,
-        _p(v_f64(args[unsafe_offset=2])),
+        _p(_opmath_scalar(args[unsafe_offset=2], _self_stype(args, 0))),
     )
 
 
@@ -1788,12 +1838,17 @@ def op_leaky_relu_backward_grad_input(
         1,
         0,
         4,
-        _p(v_f64(args[unsafe_offset=2])),
+        _p(_opmath_scalar(args[unsafe_offset=2], _self_stype(args, 0))),
     )
 
 
 def _softplus_p(args: Values, i: Int) raises -> SIMD[DType.float64, 4]:
-    return _p(v_f64(args[unsafe_offset=i]), v_f64(args[unsafe_offset=i + 1]))
+    # `Scalar::to<opmath_t>()`: checked, like every activation's scalars.
+    var st = _self_stype(args, 0)
+    return _p(
+        _opmath_scalar(args[unsafe_offset=i], st),
+        _opmath_scalar(args[unsafe_offset=i + 1], st),
+    )
 
 
 # aten::softplus(Tensor self, Scalar beta=1, Scalar threshold=20) -> Tensor
@@ -1836,7 +1891,18 @@ def op_mish_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_mish_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_act("mish_backward", args, rets, 0, 1, -1, _p())
+    # ATen allocates grad_input from `self` (empty({0}, input.options())):
+    # computed in the promoted dtype, returned in self's.
+    _pw_act(
+        "mish_backward",
+        args,
+        rets,
+        0,
+        1,
+        -1,
+        _p(),
+        out_st=_self_stype(args, 1),
+    )
 
 
 # aten::silu_backward(Tensor grad_output, Tensor self) -> Tensor
@@ -1948,11 +2014,23 @@ def op_log_sigmoid_forward_output(
     ret_ref(rets, 1, v_tensor(args[unsafe_offset=2]))
 
 
+def _log_sigmoid_backward_check(args: Values) raises:
+    """ATen builds log_sigmoid_backward's iterator with the default
+    check_all_same_dtype: grad_output must have self's dtype, no promotion."""
+    var grad = _pw_side_stype(_b_side(args[unsafe_offset=0]))
+    var self = _pw_side_stype(_b_side(args[unsafe_offset=1]))
+    if grad != self:
+        raise Error(
+            "Found dtype ", dtype_name(grad), " but expected ", dtype_name(self)
+        )
+
+
 # aten::log_sigmoid_backward(Tensor grad_output, Tensor self, Tensor buffer) -> Tensor
 def op_log_sigmoid_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     # The CUDA iterator's operand order: (self, grad_output); buffer unused.
+    _log_sigmoid_backward_check(args)
     _pw_act("log_sigmoid_backward", args, rets, 1, 0, -1, _p())
 
 
@@ -1960,6 +2038,7 @@ def op_log_sigmoid_backward(
 def op_log_sigmoid_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    _log_sigmoid_backward_check(args)
     _pw_act("log_sigmoid_backward", args, rets, 1, 0, 3, _p())
 
 
@@ -1998,7 +2077,8 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
     exactly as `uniform_` does (same Philox offsets, same draw per index:
     ATen's rrelu kernel shares distribution_nullary_kernel's launch policy),
     then slope = draw * (upper - lower) + lower for x <= 0, written into
-    `noise` (1 elsewhere)."""
+    `noise` (1 elsewhere). uniform_'s fold of a 1 draw onto 0 is undone in
+    the kernel (`_rrelu`), since RreluWithNoise.cu keeps curand's 1."""
     _rrelu_check(args)
     var lower = v_f64(args[unsafe_offset=2])
     var upper = v_f64(args[unsafe_offset=3])
@@ -2019,7 +2099,12 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
         raise Error(
             "rrelu_with_noise: noise must match the input's dtype and shape"
         )
-    var draw = own(new_tensor(self.shape, self.rank, self.stype, self.device))
+    # The draw is curand's float (a double for float64), as the CUDA kernel
+    # reads it: drawn in a half dtype, a draw below 2^-25 would round to the
+    # 0 that the kernel reads back as uniform_'s folded 1. uniform_ draws a
+    # half tensor from the same float stream, so the offsets agree.
+    var draw_st = ST_FLOAT64 if self.stype == ST_FLOAT64 else ST_FLOAT32
+    var draw = own(new_tensor(self.shape, self.rank, draw_st, self.device))
     _draw(draw.t, "Uniform", 0.0, 1.0, 0, 0, v_generator(args[unsafe_offset=5]))
     var a = _b_tside(self)
     var b = _b_tside(draw.t)
@@ -2035,22 +2120,6 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
             lower - lower.cast[DType.float32]().cast[DType.float64](),
             span - span.cast[DType.float32]().cast[DType.float64](),
         )
-    var noise_res = _pw_run(
-        "rrelu_noise",
-        2,
-        a,
-        b,
-        _none_side(),
-        self.stype,
-        self.stype,
-        params,
-        noise.copy(),
-    )
-    if noise_res.owned:
-        # A non-dense noise: copy the dense result into it.
-        var held = own(noise_res.t.copy())
-        copy_strided_into(noise, held.t)
-        _ = held^
     var dest = Optional[T]()
     if in_place:
         _b_inplace_destination(self)
@@ -2059,19 +2128,41 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
         dest = _pw_out_of(
             args[unsafe_offset=out_index], a, _none_side(), _none_side()
         )
+    # Every slope comes from the input as it was: the noise into a fresh
+    # tensor first, then the output (which may be `self`, in place), then
+    # the noise into `noise`, last, as the CPU kernel writes each element's
+    # noise after its output (so `noise` aliasing `self` or `out` ends up
+    # holding the slopes). Computing in place first would flip the sign a
+    # negative slope reads (x = -2, slope -0.5: noise 1 instead of -0.5).
+    var noise_res = _pw_run(
+        "rrelu_noise",
+        2,
+        a,
+        b,
+        _none_side(),
+        draw_st,
+        self.stype,
+        params,
+        Optional[T](),
+    )
+    var held = own(noise_res.t.copy())
     var res = _pw_run(
         "rrelu_train",
         2,
         a,
         b,
         _none_side(),
-        self.stype,
+        draw_st,
         self.stype,
         params,
         dest,
     )
+    copy_strided_into(noise, held.t)
+    _ = held^
+    _ = noise_res^
     _ = draw^
-    _pw_finish(rets, dest, res^)
+    # The CUDA kernel writes `out` as scalar_t: no cast into another dtype.
+    _pw_finish(rets, dest, res^, True)
 
 
 # aten::rrelu_with_noise(Tensor self, Tensor(b!) noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor
@@ -2161,10 +2252,14 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     not: Apple GPUs keep the exact route.)"""
     var a = _b_side(args[unsafe_offset=0])
     var b = _b_side(args[unsafe_offset=1])
-    if not a.is_t or not b.is_t:
-        unsupported("ldexp with a scalar operand")
+    if not a.is_t:
+        unsupported("ldexp with a scalar self")
+    if not b.is_t and b.zero_st < 0:
+        unsupported("ldexp with a Python-number exponent")
     var x = a.t.value().copy()
-    var e = b.t.value().copy()
+    # An explicit CPU 0-d exponent is a rank-0 tensor of its own dtype.
+    var e_st = b.t.value().stype if b.is_t else b.zero_st
+    var e_rank = b.t.value().rank if b.is_t else 0
     var dest = Optional[T]()
     if out_index >= 0:
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
@@ -2173,33 +2268,74 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
             raise Error(
                 "ldexp can't be cast to the desired output type ", d.stype
             )
-    var e_integral = _pw_is_int(e.stype) or e.stype == ST_BOOL
+    var e_integral = _pw_is_int(e_st) or e_st == ST_BOOL
     if (
         e_integral
         and _pw_is_float(x.stype)
         and (not dest or dest.value().stype == x.stype)
     ):
-        # bfloat16 computes in float32: its 8-bit mantissa cannot carry
-        # every exponent that still changes the result.
-        var compute = ST_FLOAT32 if x.stype == ST_BFLOAT16 else x.stype
+        _pw_ldexp_int(rets, a, b, x.stype, dest)
+        return
+    _pw_ldexp_pow2(rets, a, b, e_st, e_rank, dest)
+
+
+def _pw_ldexp_int(
+    rets: Values, a: Side, b: Side, x_st: Int32, dest: Optional[T]
+) raises:
+    """`_ldexp_int_exponent`: ::ldexp(x, int e), the result in x's dtype.
+    An int64 exponent is converted to that `int` first, wrapping as the C++
+    conversion does (2**32 is 0); the kernel then reads it in the float
+    compute dtype. bfloat16 computes in float32: its 8-bit mantissa cannot
+    carry every exponent that still changes the result."""
+    var compute = ST_FLOAT32 if x_st == ST_BFLOAT16 else x_st
+    if b.is_t and b.t.value().stype == ST_INT64:
+        var wrapped = own_if_new(cast_to(b.t.value(), ST_INT32), b.t.value())
         _pw_finish(
             rets,
             dest,
             _pw_run(
-                "ldexp", 2, a, b, _none_side(), compute, x.stype, _p(), dest
+                "ldexp",
+                2,
+                a,
+                _b_tside(wrapped.t),
+                _none_side(),
+                compute,
+                x_st,
+                _p(),
+                dest,
             ),
         )
+        _ = wrapped^
         return
+    var e = b.copy()
+    if not b.is_t and b.zero_st == ST_INT64:
+        # A CPU 0-d int64 exponent, wrapped on the host.
+        var v = ((b.s.value().i + 2147483648) & 4294967295) - 2147483648
+        e = _b_sside(Scal(Float64(v), v, True, False))
+    _pw_finish(
+        rets,
+        dest,
+        _pw_run("ldexp", 2, a, e, _none_side(), compute, x_st, _p(), dest),
+    )
+
+
+def _pw_ldexp_pow2(
+    rets: Values, a: Side, b: Side, e_st: Int32, e_rank: Int, dest: Optional[T]
+) raises:
+    """`self * _pow2(self, other)` as one `ldexp_pow2` launch: pow runs in
+    its own result dtype `pdt`, and mul's TensorIterator casts that result
+    to mul's rank-aware common dtype before the product."""
+    var x = a.t.value().copy()
     # _pow2: pow(2.0, other) for an integral or float32 self (a Python
     # float base: an integral exponent gives the default dtype), else
     # full({}, 2.0, self.dtype).pow(other), promoted as a 0-d tensor.
     var pdt: Int32
-    if _pw_is_float(e.stype):
-        pdt = e.stype
+    if _pw_is_float(e_st):
+        pdt = e_st
         if not (_pw_is_int(x.stype) or x.stype == ST_BOOL) and (
-            x.stype != ST_FLOAT32 and e.rank == 0
+            x.stype != ST_FLOAT32 and e_rank == 0
         ):
-            pdt = promote_types(x.stype, e.stype)
+            pdt = promote_types(x.stype, e_st)
     elif _pw_is_int(x.stype) or x.stype == ST_BOOL or x.stype == ST_FLOAT32:
         pdt = default_dtype()
     else:
@@ -2207,19 +2343,77 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     # mul(self, pow2): the pow result has other's rank.
     var state = _TypeState(ST_UNDEFINED, ST_UNDEFINED, ST_UNDEFINED)
     _pw_update(state, a)
-    if e.rank == 0:
+    if e_rank == 0:
         state.zero = promote_types(state.zero, pdt)
     else:
         state.dim = promote_types(state.dim, pdt)
     var compute = _pw_combine(state.dim, _pw_combine(state.zero, state.wrapped))
     if not _pw_is_float(compute):
         unsupported("ldexp on dtype " + String(compute))
-    var params = _p(_pw_narrow_code(pdt, compute))
+    var kernel_compute = compute
+    var narrow = pdt
+    if pdt != compute and promote_types(pdt, compute) != compute:
+        # A pow result wider than mul's common dtype (a 0-d float64 exponent
+        # against a float32 or half self): the exponent is not narrowed
+        # first, pow runs in pdt, and its result is rounded to the common
+        # dtype before the product. Reading the exponent as the narrower
+        # dtype instead turned 2^15.999 into 2^16 = inf in float16, and
+        # 2^127.999999 into 2^128 = inf in float32.
+        kernel_compute = promote_types(promote_types(pdt, compute), ST_FLOAT32)
+        narrow = compute
+        if kernel_compute == ST_FLOAT64 and not b.is_t:
+            # Metal has no double, so a CPU 0-d float64 exponent's pow runs
+            # on the host, in double, and only its result is rounded to the
+            # common dtype, as stock MPS does (the pow of CPU operands runs
+            # on CPU; exec_binary_kernel in mps/OperationUtils.mm then
+            # converts the 0-d double to float before the mul).
+            var ctx = ctx_for(x.device)
+            var metal = ctx.api() == "metal"
+            _ = ctx
+            if metal:
+                # The host pow returns 1 for 2^+-inf and inf for 2^NaN:
+                # the non-finite exponents take CUDA's values explicitly.
+                var e = b.s.value().f
+                var p2: Float64
+                if e != e or (e - e != 0.0 and e > 0.0):
+                    p2 = e  # NaN, +inf
+                elif e - e != 0.0:
+                    p2 = 0.0  # -inf
+                else:
+                    # The host pow returns 1 for 2^(2^32) too: past +-1100,
+                    # 2^e is inf / 0 in every floating dtype anyway.
+                    p2 = pow(Float64(2.0), min(max(e, -1100.0), 1100.0))
+                var pow2 = _round_to(p2, compute)
+                _pw_finish(
+                    rets,
+                    dest,
+                    _pw_run(
+                        "scale",
+                        1,
+                        a,
+                        _none_side(),
+                        _none_side(),
+                        compute,
+                        compute,
+                        _p(pow2),
+                        dest,
+                    ),
+                )
+                return
+    var params = _p(_pw_narrow_code(narrow, kernel_compute))
     _pw_finish(
         rets,
         dest,
         _pw_run(
-            "ldexp_pow2", 2, a, b, _none_side(), compute, compute, params, dest
+            "ldexp_pow2",
+            2,
+            a,
+            b,
+            _none_side(),
+            kernel_compute,
+            compute,
+            params,
+            dest,
         ),
     )
 
@@ -2244,43 +2438,20 @@ def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = _b_tside(self)
     var b = _b_side(args[unsafe_offset=1])
     _b_no_overlap_side(self, b)
-    if not b.is_t:
-        unsupported("ldexp_ with a scalar exponent")
-    var e = b.t.value().copy()
+    if not b.is_t and b.zero_st < 0:
+        unsupported("ldexp_ with a Python-number exponent")
+    # An explicit CPU 0-d exponent is a rank-0 tensor of its own dtype.
+    var e_st = b.t.value().stype if b.is_t else b.zero_st
+    var e_rank = b.t.value().rank if b.is_t else 0
     if not _pw_is_float(self.stype):
         raise Error(
             "ldexp can't be cast to the desired output type ", self.stype
         )
     var dest = Optional[T](self.copy())
-    if _pw_is_int(e.stype) or e.stype == ST_BOOL:
-        var compute = ST_FLOAT32 if self.stype == ST_BFLOAT16 else self.stype
-        _pw_finish(
-            rets,
-            dest,
-            _pw_run(
-                "ldexp", 2, a, b, _none_side(), compute, self.stype, _p(), dest
-            ),
-        )
+    if _pw_is_int(e_st) or e_st == ST_BOOL:
+        _pw_ldexp_int(rets, a, b, self.stype, dest)
         return
-    var pdt = e.stype
-    if self.stype != ST_FLOAT32 and e.rank == 0:
-        pdt = promote_types(self.stype, e.stype)
-    var compute = promote_types(self.stype, pdt)
-    _pw_finish(
-        rets,
-        dest,
-        _pw_run(
-            "ldexp_pow2",
-            2,
-            a,
-            b,
-            _none_side(),
-            compute,
-            compute,
-            _p(_pw_narrow_code(pdt, compute)),
-            dest,
-        ),
-    )
+    _pw_ldexp_pow2(rets, a, b, e_st, e_rank, dest)
 
 
 # ---------------------------------------------------------------------------
@@ -2301,13 +2472,25 @@ def _loss_reduction(v: Value) raises -> Int:
     return r
 
 
-def _loss_reduce(var res: Res, reduction: Int) raises -> Res:
-    """apply_loss_reduction: `mean()` / `sum()` over every element."""
+def _loss_reduce(
+    var res: Res, reduction: Int, out_st: Int32 = -1
+) raises -> Res:
+    """apply_loss_reduction: `mean()` / `sum()` over every element. With
+    `out_st` (an `out=` of another dtype) the reduction produces that dtype
+    itself, as ATen's `mean_out` / `sum_out(result, loss)` do: ten float16
+    squares of 100 sum to 100000 in a float32 `out`, not to float16 inf."""
     if reduction == REDUCTION_NONE or res.t.rank == 0:
         return res^
     if not res.owned:
         raise Error("internal: a reduced loss computed into its out=")
     var loss = own(res.t.copy())
+    if out_st >= 0 and out_st != loss.t.stype:
+        # sum_out / mean_out(result, loss) reduce in result's dtype: the
+        # loss is cast to it first (the reduction kernels keep one dtype).
+        var casted = own(cast_for_copy(loss.t, out_st))
+        _ = loss^
+        loss = casted^
+    var reduced_st = loss.t.stype
     var dims = List[Int]()
     for i in range(loss.t.rank):
         dims.append(i)
@@ -2316,7 +2499,7 @@ def _loss_reduce(var res: Res, reduction: Int) raises -> Res:
         if loss.t.dtype == DType.float64:
             unsupported("a float64 loss with reduction='mean'")
         out = _scalar_reduction(
-            "nn", "MeanSpec", loss.t, dims, False, loss.t.stype, False, 0.0
+            "nn", "MeanSpec", loss.t, dims, False, reduced_st, False, 0.0
         )
     else:
         out = _scalar_reduction(
@@ -2325,7 +2508,7 @@ def _loss_reduce(var res: Res, reduction: Int) raises -> Res:
             loss.t,
             dims,
             False,
-            loss.t.stype,
+            reduced_st,
             False,
             0.0,
         )
@@ -2344,27 +2527,61 @@ def _loss_forward(
     out_v: Optional[Value],
     rets: Values,
     weight: Optional[T] = None,
+    result_st: Int32 = -1,
+    round_p0: Bool = False,
 ) raises:
     """One loss kind over (a, b[, c]), times `weight` when given (its own
-    rounding, as `loss.mul_(weight)`), then the reduction."""
+    rounding, as `loss.mul_(weight)`), then the reduction.
+
+    `result_st` is the functional loss dtype (-1: the promoted common one;
+    huber allocates `empty_like(input)`). The loss kernels dispatch on
+    `iter.dtype()`, their OUTPUT's dtype: with reduction='none' an `out=`
+    is that output, so the kernel computes in out's dtype (inputs cast to
+    it); otherwise the loss is computed as the functional form does and
+    reduced straight into out's dtype (`mean_out` / `sum_out`). `round_p0`:
+    p0 is a Scalar read as `scalar_t` of that kernel dtype (beta, delta).
+    `weight` has the loss dtype (the callers decline any other)."""
     if not a.is_t or not b.is_t:
         unsupported(String(kind) + " with a scalar operand")
     var common = _pw_result_type(a, b, c, arity)
-    var compute = _pw_compute_dtype(kind, common, P_FLOAT_ONLY, True)
+    var loss_st = common if result_st < 0 else result_st
     var dest = Optional[T]()
     if out_v:
         dest = _pw_out_of(out_v.value(), a, b, c)
+    var reduce_st = Int32(-1)
+    if dest and not _pw_out_exact(kind):
+        var d = dest.value().stype
+        if reduction == REDUCTION_NONE or kind == "huber":
+            # huber_loss_out runs its iterator on `out` for every reduction
+            # (then reduces `out` in place), so its kernel computes in out's
+            # dtype: float16 400 against a float32 target, delta 1000, sums
+            # to 80000 in a float32 `out`, not to float16 inf.
+            if not weight and _pw_is_float(d) and _b_can_cast(loss_st, d):
+                loss_st = d
+                if reduction != REDUCTION_NONE:
+                    reduce_st = d
+        elif _pw_is_float(d) and _b_can_cast(loss_st, d):
+            reduce_st = d
+    var compute = _pw_compute_dtype(kind, loss_st, P_FLOAT_ONLY, True)
+    var p = params
+    if round_p0:
+        p[0] = _round_to(p[0], loss_st)
     var direct = (
         dest.copy() if reduction == REDUCTION_NONE
         and not weight else (Optional[T]())
     )
-    var res = _pw_run(kind, arity, a, b, c, compute, compute, params, direct)
+    var res = _pw_run(kind, arity, a, b, c, compute, loss_st, p, direct)
     if weight:
         var loss = res.t.copy()
-        var w = _b_tside(weight.value())
+        var wt = weight.value().copy()
+        var w = _b_tside(wt)
         var target = (
             dest.copy() if reduction == REDUCTION_NONE else Optional[T]()
         )
+        if target and _pw_same_storage(target.value(), wt):
+            # The weight shares memory with `out`: multiply into a fresh
+            # tensor and copy, as the composite's temporary does.
+            target = Optional[T]()
         var weighted = _pw_run(
             "mul_scale",
             2,
@@ -2372,14 +2589,36 @@ def _loss_forward(
             w,
             _none_side(),
             compute,
-            compute,
+            loss_st,
             _p(1.0),
             target,
         )
         if res.owned:
             release(loss.h)
         res = weighted^
-    _pw_finish(rets, dest, _loss_reduce(res^, reduction), _pw_out_exact(kind))
+    _pw_finish(
+        rets,
+        dest,
+        _loss_reduce(res^, reduction, reduce_st),
+        _pw_out_exact(kind),
+    )
+
+
+def _pw_same_storage(a: T, b: T) -> Bool:
+    """Whether two tensors view one storage (conservative: any shared
+    storage counts, overlapping or not)."""
+    var storage = a.storage_ptr()
+    return storage != 0 and storage == b.storage_ptr()
+
+
+def _loss_same_dtype(expected: Side, side: Side) raises:
+    """A TensorIterator with check_all_same_dtype (mse / huber backward)."""
+    var e = expected.t.value().stype
+    var got = side.t.value().stype
+    if got != e:
+        raise Error(
+            "Found dtype ", dtype_name(got), " but expected ", dtype_name(e)
+        )
 
 
 def _loss_backward(
@@ -2394,16 +2633,29 @@ def _loss_backward(
 ) raises:
     """(input, target, grad) through one backward kind; p0 = the norm and
     p1 = beta / delta, both rounded to scalar_t as `Scalar::to<scalar_t>`
-    and `scalar_t(double)` do."""
+    and `scalar_t(double)` do. scalar_t is the output's dtype (the kernels
+    dispatch on `iter.dtype()`): `self`'s for the functional form
+    (`zeros_like(self)`), the `grad_input`'s dtype for the out= form, into
+    which smooth_l1's iterator casts. mse and huber check that every
+    operand, grad_input included, has one dtype."""
     if not grad.is_t or not input.is_t or not target.is_t:
         unsupported(String(kind) + " with a scalar operand")
+    var same = kind == "mse_backward" or kind == "huber_backward"
+    if same:
+        _loss_same_dtype(input, target)
+        _loss_same_dtype(input, grad)
     var common = _pw_result_type(input, target, grad, 3)
-    var compute = _pw_compute_dtype(kind, common, P_FLOAT_ONLY, True)
     var out_st = input.t.value().stype
     var dest = Optional[T]()
     if out_v:
         dest = _pw_out_of(out_v.value(), input, target, grad)
-    var params = _p(_round_to(norm, compute), _round_to(p1, compute))
+        var d = dest.value().copy()
+        if same:
+            _loss_same_dtype(input, _b_tside(d))
+        elif _pw_is_float(d.stype) and _b_can_cast(common, d.stype):
+            out_st = d.stype
+    var compute = _pw_compute_dtype(kind, out_st, P_FLOAT_ONLY, True)
+    var params = _p(_round_to(norm, out_st), _round_to(p1, out_st))
     _pw_finish(
         rets,
         dest,
@@ -2481,20 +2733,19 @@ def op_mse_loss_backward_grad_input(
 
 def _smooth_l1(args: Values, rets: Values, out_v: Optional[Value]) raises:
     var beta = v_f64(args[unsafe_offset=3])
-    if beta < 0:
+    if not (beta >= 0):  # TORCH_CHECK(beta >= 0): NaN fails it too
         raise Error("smooth_l1_loss does not support negative values for beta.")
-    var a = _b_side(args[unsafe_offset=0])
-    var st = a.t.value().stype if a.is_t else ST_FLOAT32
     _loss_forward(
         "smooth_l1",
         2,
-        a,
+        _b_side(args[unsafe_offset=0]),
         _b_side(args[unsafe_offset=1]),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
-        _p(_round_to(beta, st)),
+        _p(beta),
         out_v,
         rets,
+        round_p0=True,
     )
 
 
@@ -2550,7 +2801,10 @@ def _huber(args: Values, rets: Values, out_v: Optional[Value]) raises:
             "huber_loss does not support non-positive values for delta."
         )
     var a = _b_side(args[unsafe_offset=0])
-    var st = a.t.value().stype if a.is_t else ST_FLOAT32
+    if not a.is_t:
+        unsupported("huber with a scalar operand")
+    # ATen's huber_loss allocates `empty_like(input)`: the loss is in the
+    # input's dtype (float16 input, float32 target: float16).
     _loss_forward(
         "huber",
         2,
@@ -2558,9 +2812,11 @@ def _huber(args: Values, rets: Values, out_v: Optional[Value]) raises:
         _b_side(args[unsafe_offset=1]),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
-        _p(_round_to(delta, st)),
+        _p(delta),
         out_v,
         rets,
+        result_st=a.t.value().stype,
+        round_p0=True,
     )
 
 
@@ -2614,24 +2870,156 @@ def _opt_weight(v: Value) raises -> Optional[T]:
     return w^
 
 
+def _loss_fits(
+    shape: IndexList[MAX_RANK], rank: Int, a: Side, b: Side, c: Side
+) raises:
+    """An in-place step of ATen's loss (`loss.mul_(weight)`, `(1 -
+    target).mul_(input)`, ...): its operands may not broadcast the tensor it
+    writes, of `shape`, to a larger one."""
+    var bs = _pw_broadcast(a, b, c, 3)
+    var same = bs[1] == rank
+    for i in range(MAX_RANK):
+        if bs[0][i] != shape[i]:
+            same = False
+    if not same:
+        raise Error(
+            "output with shape ",
+            _b_shape_list(shape, rank),
+            " doesn't match the broadcast shape ",
+            _b_shape_list(bs[0], bs[1]),
+        )
+
+
+def _bce_decline_weight(
+    weight: Optional[T], st: Int32, what: StaticString
+) raises:
+    """A weight of another dtype than the loss: ATen rounds its mixed-dtype
+    intermediates at steps a fused kernel does not have, so it is declined
+    rather than approximated."""
+    if weight and weight.value().stype != st:
+        unsupported(
+            String(what)
+            + " with a weight of another dtype than the input ("
+            + dtype_name(weight.value().stype)
+            + " vs "
+            + dtype_name(st)
+            + ")"
+        )
+
+
+def _bce_paired(input: T, other: T, what: StaticString) raises -> T:
+    """Loss.cu's BCE iterators run over `squeeze(input)` and
+    `squeeze(other)`: the operands pair element by element once their
+    size-1 dims are dropped (`[[0.25], [0.5]]` against `[0, 1]` pairs 0.25
+    with 0 and 0.5 with 1, no broadcast), in input's shape. `other` viewed
+    with input's shape (itself when the shapes already agree); squeezed
+    shapes that still differ are declined."""
+    if other.same_shape(input):
+        return other.copy()
+    var dims = List[Int]()
+    for i in range(other.rank):
+        if other.dim(i) != 1:
+            dims.append(i)
+    var shape = input.shape
+    var strides = IndexList[MAX_RANK](0)
+    var pad = MAX_RANK - input.rank
+    var k = 0
+    var ok = True
+    for i in range(input.rank):
+        if input.dim(i) == 1:
+            continue
+        if k >= len(dims) or other.dim(dims[k]) != input.dim(i):
+            ok = False
+            break
+        strides[pad + i] = other.stride(dims[k])
+        k += 1
+    if not ok or k != len(dims):
+        unsupported(
+            String(what)
+            + " with input and target shapes that differ beyond size-1"
+            " dimensions"
+        )
+    return view_strided(other, shape, strides, input.rank, other.offset)
+
+
+def _pw_same_view(a: T, b: T) -> Bool:
+    """One view of one storage: same address, shape and strides."""
+    if a.ptr != b.ptr or a.rank != b.rank or not a.same_shape(b):
+        return False
+    for i in range(a.rank):
+        if a.stride(i) != b.stride(i):
+            return False
+    return True
+
+
 def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
+    """Loss.cu binary_cross_entropy_out_cuda: input and target of one dtype,
+    the loss in it (`loss.mul_(weight)` keeps it: a float32 weight on
+    float16 inputs is a float16 loss), the weight never growing its shape."""
     var weight = _opt_weight(args[unsafe_offset=2])
+    var input = _b_side(args[unsafe_offset=0])
+    var raw_target = _b_side(args[unsafe_offset=1])
+    if not input.is_t or not raw_target.is_t:
+        unsupported("binary_cross_entropy with a scalar operand")
+    _loss_same_dtype(input, raw_target)
+    var in_st = input.t.value().stype
+    _bce_decline_weight(weight, in_st, "binary_cross_entropy")
+    var x = input.t.value().copy()
+    var paired = own_if_new(
+        _bce_paired(x, raw_target.t.value(), "binary_cross_entropy"),
+        raw_target.t.value(),
+    )
+    var target = _b_tside(paired.t)
+    var reduction = _loss_reduction(args[unsafe_offset=3])
+    # `out` that IS the weight: ATen writes the loss into it, then
+    # `loss.mul_(weight)` reads that loss back as the weight (loss^2).
+    var weight_is_out = False
+    if Bool(weight) and Bool(out_v):
+        var d = v_tensor(out_v.value())
+        var w = weight.value().copy()
+        if d.storage_ptr() != 0 and d.storage_ptr() == w.storage_ptr():
+            _b_no_partial_overlap(d, w)
+            weight_is_out = _pw_same_view(d, w)
+            if weight_is_out and reduction != REDUCTION_NONE:
+                unsupported(
+                    "binary_cross_entropy.out reducing into its own weight"
+                )
     # The weight rides as the third operand (the product is the kernel's
     # last rounding, like `loss.mul_(weight)`); 1 without one.
-    var c = _b_tside(weight.value()) if weight else _b_sside(
+    var fused = Bool(weight) and not weight_is_out
+    var c = _b_tside(weight.value()) if fused else _b_sside(
         Scal(1.0, 1, True, False)
     )
+    _loss_fits(x.shape, x.rank, input, target, c)
     _loss_forward(
         "bce",
         3,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        input,
+        target,
         c,
-        _loss_reduction(args[unsafe_offset=3]),
+        reduction,
         _p(),
         out_v,
         rets,
+        result_st=in_st,
     )
+    if weight_is_out:
+        var d = v_tensor(out_v.value())
+        var res = _pw_run(
+            "mul_scale",
+            2,
+            _b_tside(d),
+            _b_tside(d),
+            _none_side(),
+            in_st,
+            in_st,
+            _p(1.0),
+            d.copy(),
+        )
+        if res.owned:
+            copy_strided_into(d, res.t)
+            release(res.t.h)
+    _ = paired^
 
 
 # aten::binary_cross_entropy(Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean) -> Tensor
@@ -2654,11 +3042,32 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     gradient kernel when there is no weight, a second kind when there is."""
     var grad = _b_side(args[unsafe_offset=0])
     var input = _b_side(args[unsafe_offset=1])
-    var target = _b_side(args[unsafe_offset=2])
+    var raw_target = _b_side(args[unsafe_offset=2])
     var weight = _opt_weight(args[unsafe_offset=3])
     var reduction = _loss_reduction(args[unsafe_offset=4])
-    if not grad.is_t or not input.is_t or not target.is_t:
+    if not grad.is_t or not input.is_t or not raw_target.is_t:
         unsupported("binary_cross_entropy_backward with a scalar operand")
+    var paired = own_if_new(
+        _bce_paired(
+            input.t.value(),
+            raw_target.t.value(),
+            "binary_cross_entropy_backward",
+        ),
+        raw_target.t.value(),
+    )
+    var target = _b_tside(paired.t)
+    # One dtype for every operand (grad_input's is checked as exact below),
+    # and grad_input has self's shape: nothing may broadcast it larger.
+    _loss_same_dtype(input, target)
+    _loss_same_dtype(input, grad)
+    _bce_decline_weight(
+        weight, input.t.value().stype, "binary_cross_entropy_backward"
+    )
+    var shape = input.t.value().shape
+    var rank = input.t.value().rank
+    _loss_fits(shape, rank, grad, input, target)
+    if weight:
+        _loss_fits(shape, rank, input, _b_tside(weight.value()), _none_side())
     var common = _pw_result_type(grad, input, target, 3)
     var compute = _pw_compute_dtype("bce_backward", common, P_FLOAT_ONLY, True)
     var inv = 1.0
@@ -2672,6 +3081,15 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     var dest = Optional[T]()
     if out_v:
         dest = _pw_out_of(out_v.value(), grad, input, target)
+        if weight:
+            # `grad_input.mul_(weight)`: its in-place meta refuses a weight
+            # partially overlapping grad_input.
+            _b_no_partial_overlap(dest.value(), weight.value())
+    # grad_input that IS the weight: ATen's `mul_(weight)` then reads the
+    # gradient it just wrote there (grad^2).
+    var weight_is_out = False
+    if Bool(weight) and Bool(dest):
+        weight_is_out = _pw_same_view(dest.value(), weight.value())
     var out_st = input.t.value().stype
     if not weight:
         _pw_finish(
@@ -2690,6 +3108,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
             ),
             _pw_out_exact("bce_backward"),
         )
+        _ = paired^
         return
     var gi = _pw_run(
         "bce_backward", 3, grad, input, target, compute, compute, _p(1.0), None
@@ -2698,7 +3117,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
         "mul_scale",
         2,
         _b_tside(gi.t),
-        _b_tside(weight.value()),
+        _b_tside(gi.t) if weight_is_out else _b_tside(weight.value()),
         _none_side(),
         compute,
         out_st,
@@ -2707,6 +3126,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     )
     release(gi.t.h)
     _pw_finish(rets, dest, res^, _pw_out_exact("bce_backward"))
+    _ = paired^
 
 
 # aten::binary_cross_entropy_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean) -> Tensor
@@ -2729,20 +3149,50 @@ def _bce_logits(args: Values, rets: Values, out_v: Optional[Value]) raises:
     its own derivatives.yaml formula."""
     var weight = _opt_weight(args[unsafe_offset=2])
     var pos_weight = _opt_weight(args[unsafe_offset=3])
+    var input = _b_side(args[unsafe_offset=0])
+    var target = _b_side(args[unsafe_offset=1])
+    if not input.is_t or not target.is_t:
+        unsupported("binary_cross_entropy_with_logits with a scalar operand")
     var c = _b_tside(pos_weight.value()) if pos_weight else _b_sside(
         Scal(1.0, 1, True, False)
     )
+    # `loss = (1 - target).mul_(input).sub_(log_sigmoid_input)`: the loss
+    # has target's dtype and shape, which no operand may grow; with a
+    # pos_weight, `log_sigmoid(input).mul_((pos_weight - 1) * target)` may
+    # not grow input's shape either.
+    var t = target.t.value().copy()
+    # Mixed dtypes promote through several separately rounded ATen steps
+    # (log_sigmoid, sub, mul, ...) that one fused kernel cannot reproduce:
+    # declined rather than approximated.
+    if input.t.value().stype != t.stype:
+        unsupported(
+            "binary_cross_entropy_with_logits with input and target of"
+            " different dtypes"
+        )
+    _bce_decline_weight(weight, t.stype, "binary_cross_entropy_with_logits")
+    _bce_decline_weight(
+        pos_weight, t.stype, "binary_cross_entropy_with_logits (pos_weight)"
+    )
+    _loss_fits(t.shape, t.rank, input, target, c)
+    if weight:
+        _loss_fits(
+            t.shape, t.rank, target, _b_tside(weight.value()), _none_side()
+        )
+    if pos_weight:
+        var x = input.t.value().copy()
+        _loss_fits(x.shape, x.rank, input, target, c)
     _loss_forward(
         "bce_logits",
         3,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        input,
+        target,
         c,
         _loss_reduction(args[unsafe_offset=4]),
         _p(),
         out_v,
         rets,
         weight,
+        result_st=t.stype,
     )
 
 
@@ -2781,6 +3231,10 @@ def register_pointwise(site: Site) raises:
     impl[op_copysign, "copysign.Tensor"](site)
     impl[op_copysign_out, "copysign.Scalar_out"](site)
     impl[op_copysign_out, "copysign.out"](site)
+    impl[op_elu, "elu"](site)
+    impl[op_elu_out, "elu.out"](site)
+    impl[op_elu_backward, "elu_backward"](site)
+    impl[op_elu_backward_grad_input, "elu_backward.grad_input"](site)
     impl[op_fmax, "fmax"](site)
     impl[op_fmax_out, "fmax.out"](site)
     impl[op_fmin, "fmin"](site)
@@ -2789,24 +3243,110 @@ def register_pointwise(site: Site) raises:
     impl[op_fmod, "fmod.Tensor"](site)
     impl[op_fmod_out, "fmod.Scalar_out"](site)
     impl[op_fmod_out, "fmod.Tensor_out"](site)
+    impl[op_frexp, "frexp.Tensor"](site)
+    impl[op_frexp_out, "frexp.Tensor_out"](site)
     impl[op_gcd, "gcd"](site)
     impl[op_gcd_out, "gcd.out"](site)
+    impl[op_binary_cross_entropy, "binary_cross_entropy"](site)
+    impl[op_binary_cross_entropy_out, "binary_cross_entropy.out"](site)
+    impl[op_binary_cross_entropy_backward, "binary_cross_entropy_backward"](
+        site
+    )
+    impl[
+        op_binary_cross_entropy_backward_grad_input,
+        "binary_cross_entropy_backward.grad_input",
+    ](site)
+    impl[
+        op_binary_cross_entropy_with_logits,
+        "binary_cross_entropy_with_logits",
+    ](site)
+    impl[
+        op_binary_cross_entropy_with_logits_out,
+        "binary_cross_entropy_with_logits.out",
+    ](site)
+    impl[op_deg2rad, "deg2rad"](site)
+    impl[op_deg2rad_out, "deg2rad.out"](site)
+    impl[op_deg2rad_, "deg2rad_"](site)
     impl[op_gelu_backward_any, "gelu_backward"](site)
+    impl[op_huber_loss, "huber_loss"](site)
+    impl[op_huber_loss_out, "huber_loss.out"](site)
+    impl[op_huber_loss_backward, "huber_loss_backward"](site)
+    impl[op_huber_loss_backward_out, "huber_loss_backward.out"](site)
+    impl[op_ldexp, "ldexp.Tensor"](site)
+    impl[op_ldexp_out, "ldexp.out"](site)
+    impl[op_ldexp_, "ldexp_"](site)
+    impl[op_mse_loss, "mse_loss"](site)
+    impl[op_mse_loss_out, "mse_loss.out"](site)
+    impl[op_mse_loss_backward, "mse_loss_backward"](site)
+    impl[op_mse_loss_backward_grad_input, "mse_loss_backward.grad_input"](site)
+    impl[op_rad2deg, "rad2deg"](site)
+    impl[op_rad2deg_out, "rad2deg.out"](site)
+    impl[op_rad2deg_, "rad2deg_"](site)
+    impl[op_smooth_l1_loss, "smooth_l1_loss"](site)
+    impl[op_smooth_l1_loss_out, "smooth_l1_loss.out"](site)
+    impl[op_smooth_l1_loss_backward, "smooth_l1_loss_backward"](site)
+    impl[
+        op_smooth_l1_loss_backward_grad_input,
+        "smooth_l1_loss_backward.grad_input",
+    ](site)
+    impl[op_gelu_backward_grad_input, "gelu_backward.grad_input"](site)
+    impl[op_hardshrink, "hardshrink"](site)
+    impl[op_hardshrink_out, "hardshrink.out"](site)
+    impl[op_shrink_backward, "hardshrink_backward"](site)
+    impl[op_shrink_backward_grad_input, "hardshrink_backward.grad_input"](site)
+    impl[op_hardsigmoid, "hardsigmoid"](site)
+    impl[op_hardsigmoid_out, "hardsigmoid.out"](site)
+    impl[op_hardsigmoid_, "hardsigmoid_"](site)
+    impl[op_hardsigmoid_backward, "hardsigmoid_backward"](site)
+    impl[op_hardsigmoid_backward_grad_input, "hardsigmoid_backward.grad_input"](
+        site
+    )
+    impl[op_hardswish, "hardswish"](site)
+    impl[op_hardswish_out, "hardswish.out"](site)
+    impl[op_hardswish_, "hardswish_"](site)
+    impl[op_hardswish_backward, "hardswish_backward"](site)
+    impl[op_hardtanh, "hardtanh"](site)
+    impl[op_hardtanh_out, "hardtanh.out"](site)
+    impl[op_hardtanh_, "hardtanh_"](site)
+    impl[op_hardtanh_backward, "hardtanh_backward"](site)
+    impl[op_hardtanh_backward_grad_input, "hardtanh_backward.grad_input"](site)
     impl[op_heaviside, "heaviside"](site)
     impl[op_heaviside_out, "heaviside.out"](site)
     impl[op_hypot, "hypot"](site)
     impl[op_hypot_out, "hypot.out"](site)
+    impl[op_igamma, "igamma"](site)
+    impl[op_igamma_out, "igamma.out"](site)
+    impl[op_igammac, "igammac"](site)
+    impl[op_igammac_out, "igammac.out"](site)
     impl[op_lcm, "lcm"](site)
     impl[op_lcm_out, "lcm.out"](site)
+    impl[op_leaky_relu, "leaky_relu"](site)
+    impl[op_leaky_relu_out, "leaky_relu.out"](site)
+    impl[op_leaky_relu_, "leaky_relu_"](site)
+    impl[op_leaky_relu_backward, "leaky_relu_backward"](site)
+    impl[op_leaky_relu_backward_grad_input, "leaky_relu_backward.grad_input"](
+        site
+    )
     impl[op_lerp_scalar_any, "lerp.Scalar"](site)
     impl[op_lerp_scalar_out_any, "lerp.Scalar_out"](site)
     impl[op_lerp_scalar__any, "lerp_.Scalar"](site)
     impl[op_lerp_tensor, "lerp.Tensor"](site)
     impl[op_lerp_tensor_out, "lerp.Tensor_out"](site)
+    impl[op_log_sigmoid_backward, "log_sigmoid_backward"](site)
+    impl[op_log_sigmoid_backward_grad_input, "log_sigmoid_backward.grad_input"](
+        site
+    )
+    impl[op_log_sigmoid_forward, "log_sigmoid_forward"](site)
+    impl[op_log_sigmoid_forward_output, "log_sigmoid_forward.output"](site)
     impl[op_logaddexp, "logaddexp"](site)
     impl[op_logaddexp_out, "logaddexp.out"](site)
     impl[op_logaddexp2, "logaddexp2"](site)
     impl[op_logaddexp2_out, "logaddexp2.out"](site)
+    impl[op_logit_backward, "logit_backward"](site)
+    impl[op_logit_backward_grad_input, "logit_backward.grad_input"](site)
+    impl[op_mish, "mish"](site)
+    impl[op_mish_out, "mish.out"](site)
+    impl[op_mish_backward, "mish_backward"](site)
     impl[op_nextafter, "nextafter"](site)
     impl[op_nextafter_out, "nextafter.out"](site)
     impl[op_rsub_any, "rsub.Tensor"](site)
@@ -2819,7 +3359,23 @@ def register_pointwise(site: Site) raises:
     impl[op_pow_scalar_out_any, "pow.Tensor_Scalar_out"](site)
     impl[op_pow_tensor_any, "pow.Tensor_Tensor"](site)
     impl[op_pow_tensor_out_any, "pow.Tensor_Tensor_out"](site)
+    impl[op_rrelu_with_noise, "rrelu_with_noise"](site)
+    impl[op_rrelu_with_noise_out, "rrelu_with_noise.out"](site)
+    impl[op_rrelu_with_noise_, "rrelu_with_noise_"](site)
+    impl[op_silu_backward, "silu_backward"](site)
+    impl[op_silu_backward_grad_input, "silu_backward.grad_input"](site)
+    impl[op_softplus, "softplus"](site)
+    impl[op_softplus_out, "softplus.out"](site)
+    impl[op_softplus_backward, "softplus_backward"](site)
+    impl[op_softplus_backward_grad_input, "softplus_backward.grad_input"](site)
+    impl[op_softshrink, "softshrink"](site)
+    impl[op_softshrink_out, "softshrink.out"](site)
+    impl[op_shrink_backward, "softshrink_backward"](site)
+    impl[op_shrink_backward_grad_input, "softshrink_backward.grad_input"](site)
     _register_special(site)
+    impl[op_threshold, "threshold"](site)
+    impl[op_threshold_out, "threshold.out"](site)
+    impl[op_threshold_, "threshold_"](site)
     impl[op_xlogy, "xlogy.Tensor"](site)
     impl[op_xlogy_out, "xlogy.OutTensor"](site)
 
@@ -2891,5 +3447,92 @@ comptime op_special_shifted_chebyshev_polynomial_w_out = op_poly[
 
 
 def _register_special(site: Site) raises:
+    impl[op_special_chebyshev_polynomial_t, "special_chebyshev_polynomial_t"](
+        site
+    )
+    impl[
+        op_special_chebyshev_polynomial_t_out,
+        "special_chebyshev_polynomial_t.out",
+    ](site)
+    impl[op_special_chebyshev_polynomial_u, "special_chebyshev_polynomial_u"](
+        site
+    )
+    impl[
+        op_special_chebyshev_polynomial_u_out,
+        "special_chebyshev_polynomial_u.out",
+    ](site)
+    impl[op_special_chebyshev_polynomial_v, "special_chebyshev_polynomial_v"](
+        site
+    )
+    impl[
+        op_special_chebyshev_polynomial_v_out,
+        "special_chebyshev_polynomial_v.out",
+    ](site)
+    impl[op_special_chebyshev_polynomial_w, "special_chebyshev_polynomial_w"](
+        site
+    )
+    impl[
+        op_special_chebyshev_polynomial_w_out,
+        "special_chebyshev_polynomial_w.out",
+    ](site)
+    impl[op_special_hermite_polynomial_h, "special_hermite_polynomial_h"](site)
+    impl[
+        op_special_hermite_polynomial_h_out, "special_hermite_polynomial_h.out"
+    ](site)
+    impl[op_special_hermite_polynomial_he, "special_hermite_polynomial_he"](
+        site
+    )
+    impl[
+        op_special_hermite_polynomial_he_out,
+        "special_hermite_polynomial_he.out",
+    ](site)
+    impl[op_special_laguerre_polynomial_l, "special_laguerre_polynomial_l"](
+        site
+    )
+    impl[
+        op_special_laguerre_polynomial_l_out,
+        "special_laguerre_polynomial_l.out",
+    ](site)
+    impl[op_special_legendre_polynomial_p, "special_legendre_polynomial_p"](
+        site
+    )
+    impl[
+        op_special_legendre_polynomial_p_out,
+        "special_legendre_polynomial_p.out",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_t,
+        "special_shifted_chebyshev_polynomial_t",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_t_out,
+        "special_shifted_chebyshev_polynomial_t.out",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_u,
+        "special_shifted_chebyshev_polynomial_u",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_u_out,
+        "special_shifted_chebyshev_polynomial_u.out",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_v,
+        "special_shifted_chebyshev_polynomial_v",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_v_out,
+        "special_shifted_chebyshev_polynomial_v.out",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_w,
+        "special_shifted_chebyshev_polynomial_w",
+    ](site)
+    impl[
+        op_special_shifted_chebyshev_polynomial_w_out,
+        "special_shifted_chebyshev_polynomial_w.out",
+    ](site)
     impl[op_special_xlog1py, "special_xlog1py"](site)
     impl[op_special_xlog1py_out, "special_xlog1py.out"](site)
+    impl[op_special_zeta, "special_zeta"](site)
+    impl[op_special_zeta_out, "special_zeta.out"](site)

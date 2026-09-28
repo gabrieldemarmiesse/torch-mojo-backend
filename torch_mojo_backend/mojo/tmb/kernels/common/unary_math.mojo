@@ -55,8 +55,10 @@ from tmb.kernels.common.mps_math import (
     mps_log_gamma,
     mps_logit,
     mps_polygamma,
+    mps_polygamma_series,
     mps_round_decimals,
     mps_sinc,
+    rint_even,
 )
 from tmb.kernels.common.special_math import (
     airy_ai_f,
@@ -79,6 +81,7 @@ from tmb.kernels.common.special_math import (
     modified_bessel_k1_f,
     ndtri_f,
     polygamma_f,
+    polygamma_series_f,
     sinc_f,
     spherical_bessel_j0_f,
     trigamma_f,
@@ -334,9 +337,13 @@ def _rounding[
             a
         )
     elif kind == "round":
-        return llvm_intrinsic[
-            "llvm.roundeven", type_of(a), has_side_effect=False
-        ](a)
+        comptime if is_apple_gpu():
+            # `llvm.roundeven` crashes Apple's Metal shader compiler.
+            return rint_even(a)
+        else:
+            return llvm_intrinsic[
+                "llvm.roundeven", type_of(a), has_side_effect=False
+            ](a)
     elif kind == "frac":
         # `a - trunc(a)`: exact, and NaN / +-inf -> NaN as in ATen.
         return a - llvm_intrinsic[
@@ -662,12 +669,13 @@ def elementwise_unary_param[
       round_decimals_kernel_cuda computes in scalar_t: each step rounds. On
       Apple GPUs `round_decimals_functor`: rint(exp10(n) x) exp10(-n).
     * logit: p0 = eps, negative for None (logit_kernel_cuda, in float; on
-      Apple the MPSGraph of logit_mps_impl, in the tensor type).
+      Apple the MPSGraph of logit_mps_impl, whose clamp bounds lo = eps and
+      hi = 1 - lo, rounded to the tensor type, the host passes in p1 / p2).
     * polygamma: p0 = n (polygamma_kernel_cuda / UnaryKernel.mm, in float).
     * mvlgamma: p0 = p, p1 = p (p - 1) log(pi) / 4 (computed in double on the
       host, rounded to float). ATen composes it (UnaryOps.cpp `mvlgamma`):
-      sum_j lgamma(x + (1 - p)/2 + j/2) + p1, the terms and the sum in the
-      tensor dtype, the sum accumulated in float in the order of CUDA's
+      sum_j lgamma(x + ((1 - p)/2 + j/2)) + p1, the offsets (an arange), the
+      arguments, the terms and the sum in the tensor dtype, the sum accumulated in float in the order of CUDA's
       reduce kernel.
     * nan_to_num: p0 / p1 / p2 replace NaN / +inf / -inf, each cast to the
       tensor dtype (nan_to_num_kernel_cuda; the MPS kernel is the same).
@@ -713,18 +721,25 @@ def elementwise_unary_param[
         comptime if kind == "logit":
             var eps = rebind[Float32](p0)
             comptime if is_apple_gpu():
+                var lo = rebind[Float32](p1)
+                var hi = rebind[Float32](p2)
                 comptime for i in range(width):
-                    r[i] = mps_logit[dtype](xf[i], eps)
+                    r[i] = mps_logit(xf[i], eps, lo, hi)
             else:
                 comptime for i in range(width):
                     r[i] = logit_f(xf[i], eps)
         elif kind == "polygamma":
-            var n = Int(rebind[Float32](p0))
+            # The order's int32 in two exact float halves, then 0 for
+            # digamma / trigamma, else the order as a float, negated when
+            # even (see `polygamma_lane`).
+            var n = Int32(Int(rebind[Float32](p0))) * Int32(65536) + Int32(
+                Int(rebind[Float32](p1))
+            )
+            var nf = rebind[Float32](p2)
             comptime for i in range(width):
-                comptime if is_apple_gpu():
-                    r[i] = mps_polygamma(xf[i], n)
-                else:
-                    r[i] = polygamma_f(xf[i], n)
+                r[i] = polygamma_lane(
+                    xf[i], n, abs(nf), nf > Float32(0.0), nf != Float32(0.0)
+                )
         else:
             comptime assert kind == "mvlgamma", "unsupported param kind"
             var p = Int(rebind[Float32](p0))
@@ -736,10 +751,16 @@ def elementwise_unary_param[
                 # then a halving tree over the 32 accumulators.
                 var acc = Array[Float32, 32](fill=Float32(0.0))
                 for j in range(p):
-                    var arg = _to_dtype_rounded[dtype](
+                    # `arange(-p/2 + 1/2, 1/2, 1/2)` in the tensor dtype
+                    # (each offset rounds: bfloat16 -129.5 is -130), then
+                    # `add(self)`, rounding again.
+                    var off = _to_dtype_rounded[dtype](
                         SIMD[DType.float32, 1](
-                            xf[i] + (start + Float32(j) * Float32(0.5))
+                            start + Float32(j) * Float32(0.5)
                         )
+                    )[0]
+                    var arg = _to_dtype_rounded[dtype](
+                        SIMD[DType.float32, 1](xf[i] + off)
                     )[0]
                     var lg: Float32
                     comptime if is_apple_gpu():
@@ -761,13 +782,33 @@ def elementwise_unary_param[
 
 
 @always_inline
+def polygamma_lane(
+    x: Float32, n: Int32, nf: Float32, odd: Bool, series: Bool
+) -> Float32:
+    """polygamma(n, x) as each backend's kernel computes it. ATen picks
+    digamma / trigamma on the int64 order; `series` says it was 2 or more.
+    CUDA's series then takes an `int` (`n`, the order truncated to 32 bits;
+    0 or 1 itself when `series` is False), Apple's the int64 order itself
+    (`nf` = its float, `odd` its parity)."""
+    comptime if is_apple_gpu():
+        if series:
+            return mps_polygamma_series(x, nf, odd)
+        return mps_polygamma(x, Int(n))
+    else:
+        if series:
+            return polygamma_series_f(x, n)
+        return polygamma_f(x, Int(n))
+
+
+@always_inline
 def elementwise_polygamma[
-    dtype: DType, width: SIMDLength
-](n: SIMD[dtype, width], x: SIMD[dtype, width]) -> SIMD[dtype, width]:
-    """The polygamma function lane by lane, the order n read from a float
-    operand (the torch.compile graph's binary form of the op)."""
+    n: Int, series: Bool, dtype: DType, width: SIMDLength
+](x: SIMD[dtype, width]) -> SIMD[dtype, width]:
+    """The polygamma function lane by lane for the torch.compile graph, the
+    order `n` (the int64 order) a custom-op parameter: exact, where a float
+    operand of the input dtype would round it."""
     var xf = x.cast[DType.float32]()
     var r = SIMD[DType.float32, width]()
     comptime for i in range(width):
-        r[i] = polygamma_f(xf[i], Int(n[i]))
+        r[i] = polygamma_lane(xf[i], Int32(n), Float32(n), n % 2 != 0, series)
     return r.cast[dtype]()

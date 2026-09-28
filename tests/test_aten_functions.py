@@ -5430,6 +5430,78 @@ def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dty
 
 _POINTWISE_BINARY_TWINS = [
     ("heaviside", aten.heaviside, torch.float32, "heaviside"),
+    (
+        "special_hermite_polynomial_he",
+        aten.special_hermite_polynomial_he,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_shifted_chebyshev_polynomial_t",
+        aten.special_shifted_chebyshev_polynomial_t,
+        torch.float32,
+        "shifted_poly",
+    ),
+    (
+        "special_shifted_chebyshev_polynomial_u",
+        aten.special_shifted_chebyshev_polynomial_u,
+        torch.float32,
+        "shifted_poly",
+    ),
+    (
+        "special_shifted_chebyshev_polynomial_v",
+        aten.special_shifted_chebyshev_polynomial_v,
+        torch.float32,
+        "shifted_poly",
+    ),
+    (
+        "special_shifted_chebyshev_polynomial_w",
+        aten.special_shifted_chebyshev_polynomial_w,
+        torch.float32,
+        "shifted_poly",
+    ),
+    (
+        "special_chebyshev_polynomial_u",
+        aten.special_chebyshev_polynomial_u,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_chebyshev_polynomial_v",
+        aten.special_chebyshev_polynomial_v,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_chebyshev_polynomial_w",
+        aten.special_chebyshev_polynomial_w,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_chebyshev_polynomial_t",
+        aten.special_chebyshev_polynomial_t,
+        torch.float32,
+        "poly_trig",
+    ),
+    (
+        "special_chebyshev_polynomial_u",
+        aten.special_chebyshev_polynomial_u,
+        torch.float32,
+        "poly_trig",
+    ),
+    (
+        "special_chebyshev_polynomial_v",
+        aten.special_chebyshev_polynomial_v,
+        torch.float32,
+        "poly_trig",
+    ),
+    (
+        "special_chebyshev_polynomial_w",
+        aten.special_chebyshev_polynomial_w,
+        torch.float32,
+        "poly_trig",
+    ),
     ("atan2", aten.atan2, torch.float32, "float"),
     ("copysign", aten.copysign, torch.float32, "float"),
     ("fmax", aten.fmax, torch.float32, "float"),
@@ -5439,10 +5511,35 @@ _POINTWISE_BINARY_TWINS = [
     ("lcm", aten.lcm, torch.int32, "int"),
     ("hypot", aten.hypot, torch.float32, "float"),
     ("nextafter", aten.nextafter, torch.float32, "float"),
+    ("special_zeta", aten.special_zeta, torch.float32, "zeta"),
     ("bitwise_left_shift", aten.bitwise_left_shift, torch.int64, "shift"),
     ("bitwise_right_shift", aten.bitwise_right_shift, torch.int32, "shift"),
     ("__lshift__", aten.__lshift__, torch.int64, "shift"),
     ("__rshift__", aten.__rshift__, torch.int64, "shift"),
+    (
+        "special_chebyshev_polynomial_t",
+        aten.special_chebyshev_polynomial_t,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_hermite_polynomial_h",
+        aten.special_hermite_polynomial_h,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_legendre_polynomial_p",
+        aten.special_legendre_polynomial_p,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_laguerre_polynomial_l",
+        aten.special_laguerre_polynomial_l,
+        torch.float32,
+        "poly",
+    ),
 ]
 
 
@@ -5467,6 +5564,12 @@ def _pointwise_operands(domain: str, dtype: torch.dtype) -> list[torch.Tensor]:
         return [torch.rand(3, 5) * 4 + 1.1, torch.rand(5) + 0.5]
     if domain == "poly":
         return [torch.rand(3, 5) * 2 - 1, torch.randint(0, 6, (5,)).float()]
+    if domain == "shifted_poly":
+        # x in [0, 1]; n on both sides of the trigonometric route's n >= 6
+        return [torch.rand(3, 5), torch.tensor([0.0, 2.0, 5.0, 7.0, 12.0])]
+    if domain == "poly_trig":
+        # |x| < 1 and n >= 6: the Chebyshev kernels' trigonometric route
+        return [torch.rand(3, 5) * 1.8 - 0.9, torch.randint(6, 13, (5,)).float()]
     return [torch.randn(3, 5).to(dtype), torch.randn(5).to(dtype)]
 
 
@@ -5496,6 +5599,141 @@ def test_aten_pointwise_binary(
     _compiled_matches_cpu(fn, inputs, rtol=tol, atol=tol)
 
 
+_ACTIVATION_TWINS = [
+    ("elu", lambda x: aten.elu(x, 0.8, 1.2, 0.9)),
+    ("hardtanh", lambda x: aten.hardtanh(x, -0.5, 0.7)),
+    ("leaky_relu", lambda x: aten.leaky_relu(x, 0.1)),
+    (
+        "rrelu_with_noise",
+        lambda x: aten.rrelu_with_noise(x, torch.empty_like(x), 0.1, 0.3),
+    ),
+    ("hardshrink_backward", lambda x: aten.hardshrink_backward(x * 2, x, 0.4)),
+    ("softshrink_backward", lambda x: aten.softshrink_backward(x * 2, x, 0.4)),
+]
+
+
+@pytest.mark.parametrize(
+    "name,fn", _ACTIVATION_TWINS, ids=[t[0] for t in _ACTIVATION_TWINS]
+)
+def test_aten_pointwise_activation(
+    conf: Conf, call_checker: CallChecker, name: str, fn: Callable[..., torch.Tensor]
+):
+    call_checker.register(
+        getattr(aten_functions, f"aten_{name}"),
+        *(
+            [aten_functions.aten_rrelu_with_noise_functional]
+            if name == "rrelu_with_noise"
+            else []
+        ),
+    )
+    torch.manual_seed(0)
+    x = torch.randn(4, 7) * 2
+    check_outputs(fn, conf, [x], rtol=1e-5, atol=1e-5)
+    _compiled_matches_cpu(fn, [x], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float64])
+def test_aten_activation_edges_compiled(dtype: torch.dtype):
+    """elu near zero (expm1, not exp - 1), hardtanh's NaN, and hardtanh of
+    an integral tensor with float bounds (truncated, not promoted)."""
+    nan = math.nan
+    x = torch.tensor([-1e-3, -1e-4, -1e-7, 0.5, -3.0, nan]).to(dtype)
+    _compiled_matches_cpu(lambda a: aten.elu(a), [x], rtol=1e-5, atol=0.0)
+    _compiled_matches_cpu(lambda a: aten.hardtanh(a, -0.5, 0.7), [x])
+    i = torch.tensor([5, -5, 0, 2, -1])
+    _compiled_matches_cpu(lambda a: aten.hardtanh(a, -1.5, 2.5), [i])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64])
+def test_aten_elu_compiled_intermediates(dtype: torch.dtype):
+    """elu's intermediates: x * input_scale in float opmath for the half
+    dtypes (-1e-8 underflowed to 0 in float16), and float64's expm1 without
+    overflowing (u - 1) * x for expm1(705) = 1.5e306."""
+    if dtype == torch.float64:
+        x = torch.tensor([-705.0, -700.0, -1.0], dtype=dtype)
+        _compiled_matches_cpu(lambda a: aten.elu(a, 1.0, 1.0, -1.0), [x])
+    else:
+        x = torch.tensor([-1e-4, -3e-4, -2.0]).to(dtype)
+        _compiled_matches_cpu(lambda a: aten.elu(a, 1e4, 1.0, 1e-4), [x])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_aten_leaky_relu_compiled_slope_in_opmath(dtype: torch.dtype):
+    """leaky_relu's slope stays in float32 opmath for the half dtypes: a
+    slope of 1e5 is not float16 inf, nor one of 1e-8 zero."""
+    x = torch.tensor([-1e-4, -2.0, 3.0]).to(dtype)
+    _compiled_matches_cpu(lambda a: aten.leaky_relu(a, 1e5), [x])
+    y = torch.tensor([-1e4, -3e4, 3.0]).to(dtype)
+    _compiled_matches_cpu(lambda a: aten.leaky_relu(a, 1e-8), [y])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_aten_elu_compiled_scalars_in_opmath(dtype: torch.dtype):
+    """alpha, scale and input_scale are each read as opmath_t, and their
+    product rounds there: alpha = 1e-46 is float32 0, so the loss is 0."""
+    x = torch.tensor([-1.0, -0.5, 2.0]).to(dtype)
+    _compiled_matches_cpu(lambda a: aten.elu(a, 1e-46, 1e38, -10.0), [x])
+
+
+def test_aten_elu_compiled_zero_coefficient_and_overflow():
+    """A coefficient rounding to 0 still gives NaN where expm1 overflows
+    (inf * 0), and a scalar past float32's range raises as ATen does."""
+    x = torch.tensor([-10.0, -0.5, 2.0])
+    _compiled_matches_cpu(lambda a: aten.elu(a, 1e-46, 1e38, -10.0), [x])
+    for dtype in (torch.float32, torch.float16):
+        xd = x.to(dtype)
+        for fn in (
+            lambda a: aten.elu(a, 1e40, 1.0, 1.0),
+            lambda a: aten.elu(a, 1.0, 1e40, 1.0),
+            lambda a: aten.leaky_relu(a, 1e40),
+        ):
+            with pytest.raises(RuntimeError, match="without overflow"):
+                fn(xd)
+            with pytest.raises(Exception, match="without overflow"):
+                torch.compile(fn, backend=mojo_backend, fullgraph=True)(xd)
+            torch.compiler.reset()
+
+
+def test_aten_activation_compiled_zero_and_subnormal_coefficients():
+    """A zero coefficient keeps inf * 0 = NaN and NaN * 0 = NaN (MAX folds
+    the product to 0); a subnormal one is refused explicitly."""
+    inf, nan = math.inf, math.nan
+    x = torch.tensor([-inf, inf, nan, -2.0, 3.0])
+    for slope in (0.0, 1e-46):
+        _compiled_matches_cpu(lambda a, s=slope: aten.leaky_relu(a, s), [x])
+    _compiled_matches_cpu(lambda a: aten.elu(a, 1.0, 1.0, 0.0), [x])
+    _compiled_matches_cpu(lambda a: aten.elu(a, 1.0, 0.0, 1.0), [x])
+    _compiled_matches_cpu(lambda a: aten.elu(a, 0.0, 1.0, 1.0), [x])
+    for fn in (
+        lambda a: aten.leaky_relu(a, 1e-40),
+        lambda a: aten.elu(a, 1.0, 1.0, 1e-40),
+    ):
+        with pytest.raises(Exception, match="subnormal"):
+            torch.compile(fn, backend=mojo_backend, fullgraph=True)(x)
+        torch.compiler.reset()
+
+
+def test_aten_hardtanh_nan_bounds_compiled():
+    """hardtanh is two-bound clamp: a NaN bound fills NaN."""
+    nan = math.nan
+    x = torch.tensor([0.0, 2.0, -2.0, nan])
+    _compiled_matches_cpu(lambda a: aten.hardtanh(a, nan, 1.0), [x])
+    _compiled_matches_cpu(lambda a: aten.hardtanh(a, -1.0, nan), [x])
+
+
+@pytest.mark.parametrize("op", [aten.hardshrink_backward, aten.softshrink_backward])
+def test_aten_shrink_backward_promotes_compiled(op: Callable[..., torch.Tensor]):
+    """(grad, self) promote like the iterator: float32 grad with float64
+    self is float64, and float16 self 0.3 (0.30005) lies outside lambd 0.3."""
+    g = torch.tensor([1.0, 1.0, 1.0])
+    _compiled_matches_cpu(
+        lambda a, b: op(a, b, 0.5), [g, torch.tensor([0.7, 0.1, -0.6]).double()]
+    )
+    _compiled_matches_cpu(
+        lambda a, b: op(a, b, 0.3), [g, torch.tensor([0.3, 0.1, -0.3]).half()]
+    )
+
+
 def test_aten_rsub(conf: Conf, call_checker: CallChecker):
     call_checker.register("aten::rsub.Tensor", "aten::rsub.Scalar")
 
@@ -5522,6 +5760,65 @@ def test_aten_rsub_integral_promotes_before_alpha(call_checker: CallChecker):
     _compiled_matches_cpu(fn, [a, b])
 
 
+@pytest.mark.parametrize("reduction", [0, 1, 2])
+@pytest.mark.parametrize(
+    "name", ["mse_loss", "smooth_l1_loss", "huber_loss", "binary_cross_entropy"]
+)
+def test_aten_elementwise_losses(
+    conf: Conf, call_checker: CallChecker, name: str, reduction: int
+):
+    call_checker.register(f"aten::{name}")
+    op = getattr(aten, name)
+
+    def fn(x, t):
+        return op(x, t, reduction=reduction)
+
+    x = torch.rand(5, 6).clamp(0.01, 0.99)
+    t = torch.rand(5, 6)
+    check_outputs(fn, conf, [x, t], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "mse_loss_backward",
+        "smooth_l1_loss_backward",
+        "huber_loss_backward",
+        "binary_cross_entropy_backward",
+    ],
+)
+def test_aten_elementwise_loss_backwards(
+    conf: Conf, call_checker: CallChecker, name: str
+):
+    call_checker.register(f"aten::{name}")
+    op = getattr(aten, name)
+    extra = [1.0] if name in ("smooth_l1_loss_backward", "huber_loss_backward") else []
+
+    def fn(g, x, t):
+        if name == "binary_cross_entropy_backward":
+            return op(g, x, t, None, 1)
+        return op(g, x, t, 1, *extra)
+
+    x = torch.rand(5, 6).clamp(0.01, 0.99)
+    t = torch.rand(5, 6)
+    check_outputs(fn, conf, [torch.tensor(0.7), x, t], rtol=1e-5, atol=1e-5)
+
+
+def test_aten_binary_cross_entropy_with_logits(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::binary_cross_entropy_with_logits")
+
+    def fn(x, t, w, pw):
+        return aten.binary_cross_entropy_with_logits(x, t, w, pw, 1)
+
+    check_outputs(
+        fn,
+        conf,
+        [torch.randn(4, 5) * 3, torch.rand(4, 5), torch.rand(5), torch.rand(5) * 2],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
 _INF_EDGES = [0.0, -0.0, 1.5, -2.0, 1e-40, float("inf"), float("-inf"), float("nan")]
 
 
@@ -5541,25 +5838,287 @@ def test_aten_inf_predicates(conf: Conf, call_checker: CallChecker, name: str):
     check_outputs(fn, conf, [torch.tensor(_INF_EDGES)])
 
 
+def test_aten_isinf_ldexp_compiled(device: str):
+    checkers = []
+    for twin in (aten_functions.aten_isinf, aten_functions.aten_ldexp):
+        checker = CallChecker()
+        checker.register(twin)
+        checkers.append(checker)
+
+    def fn(
+        x: torch.Tensor, e: torch.Tensor, f: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        return aten.isinf(x), aten.ldexp(x, e), aten.ldexp(x, f)
+
+    # No subnormal operand: MAX's CPU graphs flush them to zero.
+    x = torch.tensor([v if v != 1e-40 else 1e-30 for v in _INF_EDGES], device=device)
+    e = torch.tensor([3, -2, 10, -150, 200, 1, -1, 0], device=device)
+    f = torch.tensor([0.5, 1.0, -3.0, 2.0, 1.0, 1.0, 0.0, 2.0], device=device)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for result, expected in zip(compiled(x, e, f), fn(x, e, f), strict=True):
+        torch.testing.assert_close(result, expected, equal_nan=True)
+    for checker in checkers:
+        checker.check_was_called()
+
+
+def test_aten_polygamma_mvlgamma_compiled_edges(device: str):
+    """polygamma's order exact (257 would read as 256 in a bfloat16 operand,
+    16777217 as 16777216 in a float32 one: -inf instead of +inf) and
+    truncated to an int as ATen's kernels take it, float64 refused rather
+    than computed in float32, and mvlgamma refusing bool, all against CPU
+    torch."""
+    for dtype, n in (
+        (torch.bfloat16, 257),
+        (torch.float32, 16777217),
+        (torch.float32, 2**32),
+        (torch.float32, 2**32 + 1),
+    ):
+        x = torch.tensor([0.125, 0.5, 3.0], dtype=dtype)
+        compiled = torch.compile(
+            lambda t, n=n: aten.polygamma(n, t), backend=mojo_backend, fullgraph=True
+        )
+        torch.testing.assert_close(
+            compiled(x.to(device)).cpu(),
+            torch.polygamma(n, x),
+            equal_nan=True,
+            rtol=1e-4,
+            atol=0.0,
+        )
+        torch.compiler.reset()
+    x64 = torch.tensor([1e-50, 0.5], dtype=torch.float64, device=device)
+    compiled = torch.compile(
+        lambda t: aten.polygamma(2, t), backend=mojo_backend, fullgraph=True
+    )
+    with pytest.raises(Exception, match="float64 inputs are not supported"):
+        compiled(x64)
+    torch.compiler.reset()
+    # mvlgamma's offsets round to the dtype before the add (bfloat16 -129.5
+    # is -130: lgamma(0) = inf at x = 130, p = 260).
+    xb = torch.tensor([130.0, 131.0, 257.5, 3000.0], dtype=torch.bfloat16)
+    compiled = torch.compile(
+        lambda t: aten.mvlgamma(t, 260), backend=mojo_backend, fullgraph=True
+    )
+    torch.testing.assert_close(compiled(xb.to(device)).cpu(), torch.mvlgamma(xb, 260))
+    torch.compiler.reset()
+    b = torch.tensor([True, False], device=device)
+    compiled = torch.compile(
+        lambda t: aten.mvlgamma(t, 1), backend=mojo_backend, fullgraph=True
+    )
+    with pytest.raises(Exception, match="may not be a boolean tensor"):
+        compiled(b)
+    torch.compiler.reset()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_aten_logit_compiled_eps_rounding(device: str, dtype: torch.dtype):
+    """eps rounds to float before `hi = 1 - eps` (logit_kernel_cuda): with
+    eps just above 2^-25, float32's 1 - eps ties to 1, so logit(1) is inf
+    (the double 1 - eps would round to a float below 1: 16.6355)."""
+    x = torch.tensor([1.0, 0.0, 0.5, 0.25], dtype=dtype)
+    compiled = torch.compile(
+        lambda t: aten.logit(t, 2.9802323e-8), backend=mojo_backend, fullgraph=True
+    )
+    torch.testing.assert_close(
+        compiled(x.to(device)).cpu(),
+        torch.logit(x.float() if dtype == torch.float16 else x, 2.9802323e-8).to(dtype),
+    )
+    torch.compiler.reset()
+
+
+def test_aten_ldexp_compiled_edges(device: str):
+    """Integral self and exponent (a default-float result), non-finite float
+    exponents, and a float16 self with a 0-d float64 exponent."""
+    inf, nan = math.inf, math.nan
+
+    def fn(
+        i: torch.Tensor, j: torch.Tensor, x: torch.Tensor, f: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        return aten.ldexp(i, j), aten.ldexp(x, f)
+
+    i = torch.tensor([1, -3, 0, 5], device=device)
+    j = torch.tensor([2, 3, 7, -1], device=device)
+    x = torch.tensor([1.0, 0.0, -2.0, 3.0, nan, inf], device=device)
+    f = torch.tensor([inf, inf, -inf, nan, 1.0, -inf], device=device)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for result, expected in zip(compiled(i, j, x, f), fn(i, j, x, f), strict=True):
+        torch.testing.assert_close(result, expected, equal_nan=True)
+    torch.compiler.reset()
+    h = torch.tensor([1.0, -0.5], dtype=torch.float16, device=device)
+    e = torch.tensor(15.999, dtype=torch.float64, device=device)
+    compiled_half = torch.compile(aten.ldexp, backend=mojo_backend, fullgraph=True)
+    torch.testing.assert_close(compiled_half(h, e), aten.ldexp(h, e))
+
+
+def test_aten_ldexp_compiled_wide_int_exponent(device: str):
+    """An int64 exponent wraps to ::ldexp's int first: 2**32 is 0."""
+    x = torch.tensor([1.0, 0.5], device=device)
+    e = torch.tensor([2**32, 2**32 + 3], device=device)
+    got = torch.compile(aten.ldexp, backend=mojo_backend, fullgraph=True)(x, e)
+    torch.testing.assert_close(got, aten.ldexp(x, e))
+
+
+def test_aten_ldexp_compiled_large_float_exponent(device: str):
+    """Huge finite float exponents give inf / 0 (MAX's pow gave 1)."""
+    x = torch.tensor([1.0, 1.0, -2.0, 0.5], device=device)
+    for dtype in (torch.float64, torch.float32):
+        e = torch.tensor(
+            [2.0**32, -(2.0**32), 1e10, 1030.0], dtype=dtype, device=device
+        )
+        got = torch.compile(aten.ldexp, backend=mojo_backend, fullgraph=True)(x, e)
+        torch.testing.assert_close(got, aten.ldexp(x, e), equal_nan=True)
+        torch.compiler.reset()
+
+
+def test_aten_ldexp_compiled_integral_self_huge_exponent(device: str):
+    """An integral self takes pow(2.0, e) in the default float: an int64
+    exponent of +-2**32 is inf / 0 there, not wrapped."""
+    x = torch.tensor([1, 1, -2], device=device)
+    e = torch.tensor([2**32, -(2**32), 5000], device=device)
+    got = torch.compile(aten.ldexp, backend=mojo_backend, fullgraph=True)(x, e)
+    torch.testing.assert_close(got, aten.ldexp(x, e))
+
+
+def test_aten_ldexp_compiled_pow_dtype(device: str):
+    """The compiled _pow2 runs pow in ATen's pow dtype and rounds it to mul's
+    rank-aware common dtype: float16 2^16 is inf against a float64 self,
+    and a 0-d float64 2^128 is inf against a float32 self while 2^127.999999
+    stays finite."""
+
+    def fn(
+        d: torch.Tensor,
+        h: torch.Tensor,
+        x: torch.Tensor,
+        e: torch.Tensor,
+        n: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        return aten.ldexp(d, h), aten.ldexp(x, e), aten.ldexp(x, n)
+
+    d = torch.tensor([0.5, 0.0], dtype=torch.float64, device=device)
+    h = torch.tensor([16.0, 16.0], dtype=torch.float16, device=device)
+    x = torch.tensor([0.5, 0.0], device=device)
+    e = torch.tensor(128.0, dtype=torch.float64, device=device)
+    n = torch.tensor(127.999999, dtype=torch.float64, device=device)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for got, want in zip(compiled(d, h, x, e, n), fn(d, h, x, e, n), strict=True):
+        assert got.dtype == want.dtype
+        torch.testing.assert_close(got, want, equal_nan=True, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("name", ["deg2rad", "rad2deg"])
+def test_aten_deg2rad_rad2deg(conf: Conf, call_checker: CallChecker, name: str):
+    call_checker.register(f"aten::{name}")
+    op = getattr(aten, name)
+
+    def fn(x):
+        return op(x)
+
+    check_outputs(fn, conf, [torch.randn(4, 9) * 300])
+
+
+@pytest.mark.parametrize("edtype", [torch.int32, torch.float32])
+def test_aten_ldexp(conf: Conf, call_checker: CallChecker, edtype: torch.dtype):
+    call_checker.register(aten_functions.aten_ldexp)
+
+    def fn(x, e):
+        return aten.ldexp(x, e)
+
+    x = torch.randn(3, 7)
+    e = torch.randint(-20, 20, (7,)).to(edtype)
+    check_outputs(fn, conf, [x, e])
+
+
 # Unary math and special functions: (aten_functions twin, aten call, input).
 _SPECIAL_UNARY_CASES = [
     ("angle", lambda x: aten.angle(x), [-2.0, -0.0, 0.0, 3.0]),
     ("asin", lambda x: aten.asin(x), [-1.0, -0.5, 0.0, 0.25, 1.0]),
     ("atan", lambda x: aten.atan(x), [-50.0, -1.0, 0.0, 0.5, 3.0]),
+    ("digamma", lambda x: aten.digamma(x), [-2.5, -0.5, 0.25, 1.0, 12.0]),
     ("erfc", lambda x: aten.erfc(x), [-3.0, -0.5, 0.0, 2.0, 9.0]),
     ("erfinv", lambda x: aten.erfinv(x), [-0.999, -0.5, 0.0, 0.3, 0.9]),
     ("exp2", lambda x: aten.exp2(x), [-100.0, -1.5, 0.0, 3.0, 60.0]),
     ("expm1", lambda x: aten.expm1(x), [-20.0, -1e-4, 0.0, 1e-3, 5.0]),
+    ("frac", lambda x: aten.frac(x), [-2.75, -0.5, 0.0, 1.25, 100.5]),
+    ("i0", lambda x: aten.i0(x), [-10.0, -1.0, 0.0, 3.0, 9.0]),
+    ("lgamma", lambda x: aten.lgamma(x), [-2.5, 0.3, 1.0, 2.5, 40.0]),
     ("log10", lambda x: aten.log10(x), [1e-3, 0.5, 1.0, 10.0, 1e5]),
+    ("logit", lambda x: aten.logit(x, 0.01), [0.0, 0.005, 0.25, 0.5, 0.999]),
+    ("mvlgamma", lambda x: aten.mvlgamma(x, 3), [1.5, 2.0, 3.25, 7.0, 20.0]),
     ("nan_to_num", lambda x: aten.nan_to_num(x, 0.5), [-1.0, 0.0, 2.0, 1e3, 3.0]),
+    ("polygamma", lambda x: aten.polygamma(3, x), [0.25, 1.0, 2.5, 7.0, 30.0]),
+    ("round", lambda x: aten.round(x), [-2.5, -0.5, 0.5, 1.5, 2.4]),
+    ("round", lambda x: aten.round(x, decimals=2), [-2.555, 0.125, 1.005, 3.14159]),
     ("sgn", lambda x: aten.sgn(x), [-2.0, -0.0, 0.0, 3.0]),
     ("signbit", lambda x: aten.signbit(x), [-2.0, -0.0, 0.0, 3.0]),
     ("sinc", lambda x: aten.sinc(x), [-2.5, -0.1, 0.0, 0.5, 7.0]),
+    ("special_airy_ai", lambda x: aten.special_airy_ai(x), [-5.0, -1.0, 0.0, 3.0]),
+    ("special_bessel_j0", lambda x: aten.special_bessel_j0(x), [-7.0, 0.0, 3.0, 9.0]),
+    ("special_bessel_j1", lambda x: aten.special_bessel_j1(x), [-7.0, 0.0, 3.0, 9.0]),
+    ("special_bessel_y0", lambda x: aten.special_bessel_y0(x), [0.5, 3.0, 9.0]),
+    ("special_bessel_y1", lambda x: aten.special_bessel_y1(x), [0.5, 3.0, 9.0]),
+    ("special_entr", lambda x: aten.special_entr(x), [-1.0, 0.0, 0.5, 3.0]),
+    ("special_erfcx", lambda x: aten.special_erfcx(x), [-3.0, 0.0, 2.0, 70.0]),
+    ("special_i0e", lambda x: aten.special_i0e(x), [-10.0, 0.0, 3.0, 9.0]),
+    ("special_i1", lambda x: aten.special_i1(x), [-10.0, 0.0, 3.0, 9.0]),
+    ("special_i1e", lambda x: aten.special_i1e(x), [-10.0, 0.0, 3.0, 9.0]),
+    ("special_log_ndtr", lambda x: aten.special_log_ndtr(x), [-20.0, -2.0, 0.0, 3.0]),
+    (
+        "special_modified_bessel_i0",
+        lambda x: aten.special_modified_bessel_i0(x),
+        [-10.0, 0.0, 3.0, 9.0],
+    ),
+    (
+        "special_modified_bessel_i1",
+        lambda x: aten.special_modified_bessel_i1(x),
+        [-10.0, 0.0, 3.0, 9.0],
+    ),
+    (
+        "special_modified_bessel_k0",
+        lambda x: aten.special_modified_bessel_k0(x),
+        [0.5, 1.5, 3.0, 9.0],
+    ),
+    (
+        "special_modified_bessel_k1",
+        lambda x: aten.special_modified_bessel_k1(x),
+        [0.5, 1.5, 3.0, 9.0],
+    ),
+    ("special_ndtri", lambda x: aten.special_ndtri(x), [0.01, 0.2, 0.5, 0.95]),
+    (
+        "special_scaled_modified_bessel_k0",
+        lambda x: aten.special_scaled_modified_bessel_k0(x),
+        [0.5, 1.5, 3.0, 9.0],
+    ),
+    (
+        "special_scaled_modified_bessel_k1",
+        lambda x: aten.special_scaled_modified_bessel_k1(x),
+        [0.5, 1.5, 3.0, 9.0],
+    ),
+    (
+        "special_spherical_bessel_j0",
+        lambda x: aten.special_spherical_bessel_j0(x),
+        [-7.0, 0.0, 0.25, 9.0],
+    ),
+    ("trunc", lambda x: aten.trunc(x), [-2.5, -0.5, 0.5, 1.5, 2.4]),
 ]
 
 
 # Float and double only in stock torch (AT_DISPATCH_FLOATING_TYPES).
-_NO_HALF_KERNEL: set[str] = set()
+_NO_HALF_KERNEL: set[str] = {
+    "special_airy_ai",
+    "special_bessel_j0",
+    "special_bessel_j1",
+    "special_bessel_y0",
+    "special_bessel_y1",
+    "special_erfcx",
+    "special_log_ndtr",
+    "special_modified_bessel_i0",
+    "special_modified_bessel_i1",
+    "special_modified_bessel_k0",
+    "special_modified_bessel_k1",
+    "special_ndtri",
+    "special_scaled_modified_bessel_k0",
+    "special_scaled_modified_bessel_k1",
+    "special_spherical_bessel_j0",
+}
 
 
 # logit's bfloat16 reference would be CPU torch's reduced-precision path,
@@ -5637,6 +6196,38 @@ def test_aten_nan_to_num_integral_compiled_is_a_copy(dtype: torch.dtype, device:
     assert got.data_ptr() != x.data_ptr()
     got.zero_()
     torch.testing.assert_close(x, before)
+
+
+@pytest.mark.parametrize("name", ["igamma", "igammac"])
+def test_aten_igamma(conf: Conf, call_checker: CallChecker, name: str):
+    call_checker.register(getattr(aten_functions, f"aten_{name}"))
+    op = getattr(aten, name)
+
+    def fn(a, x):
+        return op(a, x)
+
+    a = torch.tensor([0.5, 1.0, 2.5, 30.0, 150.0, 3.0])
+    x = torch.tensor([0.25, 1.5, 2.5, 29.0, 160.0, 0.0])
+    check_outputs(fn, conf, [a, x])
+
+
+def test_aten_igamma_compiled(device: str):
+    checkers = []
+    for name in ("igamma", "igammac"):
+        checker = CallChecker()
+        checker.register(getattr(aten_functions, f"aten_{name}"))
+        checkers.append(checker)
+
+    def fn(a: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return aten.igamma(a, x), aten.igammac(a, x), aten.igamma(a, x[:1])
+
+    a = torch.linspace(0.1, 40.0, 64, device=device)
+    x = torch.linspace(35.0, 0.05, 64, device=device)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for result, expected in zip(compiled(a, x), fn(a, x), strict=True):
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+    for checker in checkers:
+        checker.check_was_called()
 
 
 def test_aten_logical_and_bool_tensors(conf: Conf):

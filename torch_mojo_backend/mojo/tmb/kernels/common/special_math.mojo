@@ -356,16 +356,28 @@ def zeta_f(x: Float32, q: Float32) -> Float32:
 
 @always_inline
 def polygamma_f(x: Float32, n: Int) -> Float32:
-    """`polygamma_kernel_cuda`: digamma, trigamma, then
-    (-1)^(n+1) n! zeta(n + 1, x) from n = 2 on (`polygamma_string`)."""
+    """`polygamma_kernel_cuda` for an order that fits an int: digamma,
+    trigamma, then `polygamma_series_f` from n = 2 on."""
     if n == 0:
         return digamma_f(x)
     if n == 1:
         return trigamma_f(x)
+    return polygamma_series_f(x, Int32(n))
+
+
+@always_inline
+def polygamma_series_f(x: Float32, n: Int32) -> Float32:
+    """`polygamma_string`: (-1)^(n+1) n! zeta(n + 1, x), with the `int n`
+    the kernel receives (the int64 order truncated to 32 bits; C's `n % 2`
+    is truthy for any odd n, negative included; `n + 1` wraps)."""
     var one = Float32(1.0)
-    var sign = one if n % 2 == 1 else -one
+    var sign = one if n % 2 != 0 else -one
     var nf = Float32(n)
-    return sign * _libm_expf(nv_lgammaf(nf + one)) * zeta_f(Float32(n + 1), x)
+    return (
+        sign
+        * _libm_expf(nv_lgammaf(nf + one))
+        * zeta_f(Float32(n + Int32(1)), x)
+    )
 
 
 # --------------------------------------------------------------------------- #

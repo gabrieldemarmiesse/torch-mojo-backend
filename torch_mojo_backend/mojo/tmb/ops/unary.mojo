@@ -18,6 +18,8 @@ isnan/logical_not accept the same broad set plus bool (bool read through its
 uint8 storage). Anything else declines with `unsupported(...)`, matching the
 old NOT_HANDLED convention.
 """
+from std.ffi import external_call
+
 from tmb.backend.abi import (
     Owned,
     ST_FLOAT64,
@@ -1453,10 +1455,38 @@ def _param_unary(
 
 
 def _param_unary_out(
-    op: String, t_in: T, mut dst: T, p0: Float64, p1: Float64, p2: Float64
+    op: String,
+    t_in: T,
+    mut dst: T,
+    p0: Float64,
+    p1: Float64,
+    p2: Float64,
+    cast_ok: Bool = False,
 ) raises:
     """`_unary_out` for the parameterized route (also the in-place one: dst
-    may be t_in itself)."""
+    may be t_in itself). `cast_ok` is `_unary_out`'s: the unary_float_op
+    iterators (logit, polygamma) and mvlgamma's `copy_` cast the result into
+    an `out` of any dtype it `canCast`s to; round.decimals and nan_to_num
+    want the input dtype itself."""
+    if cast_ok and dst.stype != t_in.stype:
+        if not can_cast(t_in.stype, dst.stype):
+            raise Error(
+                "result type ",
+                dtype_name(t_in.stype),
+                " can't be cast to the desired output type ",
+                dtype_name(dst.stype),
+            )
+        one_device(t_in, dst)
+        assert_no_internal_overlap(dst)
+        _no_partial_overlap(dst, t_in)
+        if not dst.same_shape(t_in):
+            resize_out(dst, t_in.shape, t_in.rank)
+        var result = own(_param_unary(op, t_in, p0, p1, p2))
+        var casted = own(cast_for_copy(result.t, dst.stype))
+        copy_strided_into(dst, casted.t)
+        _ = casted^  # alive past the launch
+        _ = result^
+        return
     _out_prologue(t_in, dst, t_in.stype)
     var src = contiguous(t_in)
     if dst.contig:
@@ -1479,9 +1509,10 @@ def _round_decimals_params(
     """
     _require_float_or_f64("round", t)
     var n = decimals if decimals >= 0 else -decimals
-    var ten_pow = Float64(1.0)
-    for _ in range(n):
-        ten_pow *= 10.0
+    # The C library's pow, the very call torch makes: a loop of `*= 10`
+    # drifts by ulps past 10^22 (10^25 came out 9.999999999999999e24, so
+    # round(5e24, decimals=-25) gave 1e25 instead of 0).
+    var ten_pow = external_call["pow", Float64](Float64(10.0), Float64(n))
     return (
         ten_pow,
         Float64(1.0) if decimals < 0 else Float64(0.0),
@@ -1537,13 +1568,32 @@ def _logit_eps(v: Value) raises -> Float64:
     return v_f64(v)
 
 
+def _logit_bounds(eps: Float64, dtype: DType) -> Tuple[Float64, Float64]:
+    """logit_mps_impl's clamp bounds: lo = eps and hi = 1 - lo, each a graph
+    constant of the tensor type. Only the Apple kernel reads them (slots p1 /
+    p2); logit_kernel_cuda clamps to the float eps itself."""
+    var lo = _round_to_dtype(eps, dtype)
+    return (lo, _round_to_dtype(1.0 - lo, dtype))
+
+
+def _round_to_dtype(v: Float64, dtype: DType) -> Float64:
+    if dtype == DType.float16:
+        return v.cast[DType.float16]().cast[DType.float64]()
+    if dtype == DType.bfloat16:
+        return v.cast[DType.bfloat16]().cast[DType.float64]()
+    if dtype == DType.float32:
+        return v.cast[DType.float32]().cast[DType.float64]()
+    return v
+
+
 # aten::logit(Tensor self, float? eps=None) -> Tensor
 def op_logit(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var eps = _logit_eps(args[unsafe_offset=1])
     var src = own_if_new(_promote(t), t)
     _require_float("logit", src.t.dtype)
-    var out = own(_param_unary("LogitSpec", src.t, eps, 0.0, 0.0))
+    var b = _logit_bounds(eps, src.t.dtype)
+    var out = own(_param_unary("LogitSpec", src.t, eps, b[0], b[1]))
     ret_owned(rets, 0, out)
 
 
@@ -1554,7 +1604,8 @@ def op_logit_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dst = v_tensor(args[unsafe_offset=2])
     var src = own_if_new(_promote(t), t)
     _require_float("logit", src.t.dtype)
-    _param_unary_out("LogitSpec", src.t, dst, eps, 0.0, 0.0)
+    var b = _logit_bounds(eps, src.t.dtype)
+    _param_unary_out("LogitSpec", src.t, dst, eps, b[0], b[1], cast_ok=True)
     ret_ref(rets, 0, dst)
 
 
@@ -1564,13 +1615,30 @@ def _polygamma_check(n: Int, t: T) raises:
     _require_float("polygamma", t.dtype)
 
 
+def _polygamma_params(n: Int) -> Tuple[Float64, Float64, Float64]:
+    """The order as the kernels take it (`unary_math.polygamma_lane`): its
+    int32 truncation in two halves exact in float32 (the slots cross the
+    launch in float; the order itself would round past 2^24), then 0 for
+    digamma / trigamma (orders 0 and 1), else `float(n)` (Apple's series
+    reads the int64 order), negated when n is even."""
+    var n32 = Int(Int32(n)) if n >= 2 else n  # C's int conversion: wraps
+    var hi = n32 >> 16
+    var nf = Float64(Float32(n))  # int64 -> float in one rounding, as Metal
+    return (
+        Float64(hi),
+        Float64(n32 - hi * 65536),
+        Float64(0.0) if n < 2 else (nf if n % 2 != 0 else -nf),
+    )
+
+
 # aten::polygamma(int n, Tensor self) -> Tensor
 def op_polygamma(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var n = v_int(args[unsafe_offset=0])
     var t = v_tensor(args[unsafe_offset=1])
     var src = own_if_new(_promote(t), t)
     _polygamma_check(n, src.t)
-    var out = own(_param_unary("PolygammaSpec", src.t, Float64(n), 0.0, 0.0))
+    var p = _polygamma_params(n)
+    var out = own(_param_unary("PolygammaSpec", src.t, p[0], p[1], p[2]))
     ret_owned(rets, 0, out)
 
 
@@ -1583,7 +1651,10 @@ def op_polygamma_out(
     var dst = v_tensor(args[unsafe_offset=2])
     var src = own_if_new(_promote(t), t)
     _polygamma_check(n, src.t)
-    _param_unary_out("PolygammaSpec", src.t, dst, Float64(n), 0.0, 0.0)
+    var p = _polygamma_params(n)
+    _param_unary_out(
+        "PolygammaSpec", src.t, dst, p[0], p[1], p[2], cast_ok=True
+    )
     ret_ref(rets, 0, dst)
 
 
@@ -1591,6 +1662,12 @@ def _mvlgamma_constant(p: Int) -> Float64:
     """The `add_(p * (p - 1) * log(pi) / 4)` of UnaryOps.cpp `mvlgamma`, in
     double on the host (the add kernel rounds it to float)."""
     return Float64(p) * Float64(p - 1) * 1.1447298858494002 / 4
+
+
+def _mvlgamma_no_bool(t: T) raises:
+    """UnaryOps.cpp `mvlgamma_check` refuses bool before any promotion."""
+    if t.dtype == DType.bool:
+        raise Error("The input tensor may not be a boolean tensor.")
 
 
 def _mvlgamma_check(p: Int, t: T) raises:
@@ -1605,6 +1682,7 @@ def _mvlgamma_check(p: Int, t: T) raises:
 def op_mvlgamma(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var p = v_int(args[unsafe_offset=1])
+    _mvlgamma_no_bool(t)
     var src = own_if_new(_promote(t), t)
     _mvlgamma_check(p, src.t)
     var out = own(
@@ -1622,11 +1700,33 @@ def op_mvlgamma_out(
     var t = v_tensor(args[unsafe_offset=0])
     var p = v_int(args[unsafe_offset=1])
     var dst = v_tensor(args[unsafe_offset=2])
+    _mvlgamma_no_bool(t)
+    one_device(t, dst)
     var src = own_if_new(_promote(t), t)
     _mvlgamma_check(p, src.t)
-    _param_unary_out(
-        "MvlgammaSpec", src.t, dst, Float64(p), _mvlgamma_constant(p), 0.0
+    # UnaryOps.cpp `mvlgamma_out` is not an iterator: it computes
+    # `self.mvlgamma(p)` into a new tensor, then `result.copy_(out)`. So an
+    # `out` overlapping the input (x[1:] for x[:-1]) is fine, and any dtype
+    # the result can cast to.
+    if not can_cast(src.t.stype, dst.stype):
+        raise Error(
+            "mvlgamma: result type ",
+            dtype_name(t.stype),
+            " can't be cast to the desired output type ",
+            dtype_name(src.t.stype),
+        )
+    var result = own(
+        _param_unary(
+            "MvlgammaSpec", src.t, Float64(p), _mvlgamma_constant(p), 0.0
+        )
     )
+    if not dst.same_shape(result.t):
+        resize_out(dst, result.t.shape, result.t.rank)
+    assert_no_internal_overlap(dst)
+    var casted = own_if_new(cast_for_copy(result.t, dst.stype), result.t)
+    copy_strided_into(dst, casted.t)
+    _ = casted^  # alive past the launch
+    _ = result^
     ret_ref(rets, 0, dst)
 
 
@@ -2092,6 +2192,8 @@ def register_unary(site: Site) raises:
     impl[op_cos_out, "cos.out"](site)
     impl[op_cosh, "cosh"](site)
     impl[op_cosh_out, "cosh.out"](site)
+    impl[op_digamma, "digamma"](site)
+    impl[op_digamma_out, "digamma.out"](site)
     impl[op_erf, "erf"](site)
     impl[op_erf_out, "erf.out"](site)
     impl[op_erfc, "erfc"](site)
@@ -2106,6 +2208,12 @@ def register_unary(site: Site) raises:
     impl[op_expm1_out, "expm1.out"](site)
     impl[op_floor, "floor"](site)
     impl[op_floor_out, "floor.out"](site)
+    impl[op_frac, "frac"](site)
+    impl[op_frac_out, "frac.out"](site)
+    impl[op_i0, "i0"](site)
+    impl[op_i0_out, "i0.out"](site)
+    impl[op_lgamma, "lgamma"](site)
+    impl[op_lgamma_out, "lgamma.out"](site)
     impl[op_log, "log"](site)
     impl[op_log_out, "log.out"](site)
     impl[op_log10, "log10"](site)
@@ -2114,12 +2222,23 @@ def register_unary(site: Site) raises:
     impl[op_log1p_out, "log1p.out"](site)
     impl[op_log2, "log2"](site)
     impl[op_log2_out, "log2.out"](site)
+    impl[op_logit, "logit"](site)
+    impl[op_logit_out, "logit.out"](site)
+    impl[op_mvlgamma, "mvlgamma"](site)
+    impl[op_mvlgamma_out, "mvlgamma.out"](site)
     impl[op_nan_to_num, "nan_to_num"](site)
     impl[op_nan_to_num_out, "nan_to_num.out"](site)
     impl[op_neg, "neg"](site)
     impl[op_neg_out, "neg.out"](site)
+    impl[op_polygamma, "polygamma"](site)
+    impl[op_polygamma_out, "polygamma.out"](site)
     impl[op_reciprocal, "reciprocal"](site)
     impl[op_reciprocal_out, "reciprocal.out"](site)
+    impl[op_round, "round"](site)
+    impl[op_round_decimals, "round.decimals"](site)
+    impl[op_round_decimals_out, "round.decimals_out"](site)
+    impl[op_round_out, "round.out"](site)
+    impl[op_round__decimals, "round_.decimals"](site)
     impl[op_rsqrt, "rsqrt"](site)
     impl[op_rsqrt_out, "rsqrt.out"](site)
     impl[op_sgn, "sgn"](site)
@@ -2138,12 +2257,74 @@ def register_unary(site: Site) raises:
     impl[op_sinc_out, "sinc.out"](site)
     impl[op_sinh, "sinh"](site)
     impl[op_sinh_out, "sinh.out"](site)
+    impl[op_special_airy_ai, "special_airy_ai"](site)
+    impl[op_special_airy_ai_out, "special_airy_ai.out"](site)
+    impl[op_special_bessel_j0, "special_bessel_j0"](site)
+    impl[op_special_bessel_j0_out, "special_bessel_j0.out"](site)
+    impl[op_special_bessel_j1, "special_bessel_j1"](site)
+    impl[op_special_bessel_j1_out, "special_bessel_j1.out"](site)
+    impl[op_special_bessel_y0, "special_bessel_y0"](site)
+    impl[op_special_bessel_y0_out, "special_bessel_y0.out"](site)
+    impl[op_special_bessel_y1, "special_bessel_y1"](site)
+    impl[op_special_bessel_y1_out, "special_bessel_y1.out"](site)
+    impl[op_special_entr, "special_entr"](site)
+    impl[op_special_entr_out, "special_entr.out"](site)
+    impl[op_special_erfcx, "special_erfcx"](site)
+    impl[op_special_erfcx_out, "special_erfcx.out"](site)
+    impl[op_special_i0e, "special_i0e"](site)
+    impl[op_special_i0e_out, "special_i0e.out"](site)
+    impl[op_special_i1, "special_i1"](site)
+    impl[op_special_i1_out, "special_i1.out"](site)
+    impl[op_special_i1e, "special_i1e"](site)
+    impl[op_special_i1e_out, "special_i1e.out"](site)
+    impl[op_special_log_ndtr, "special_log_ndtr"](site)
+    impl[op_special_log_ndtr_out, "special_log_ndtr.out"](site)
+    impl[op_special_modified_bessel_i0, "special_modified_bessel_i0"](site)
+    impl[op_special_modified_bessel_i0_out, "special_modified_bessel_i0.out"](
+        site
+    )
+    impl[op_special_modified_bessel_i1, "special_modified_bessel_i1"](site)
+    impl[op_special_modified_bessel_i1_out, "special_modified_bessel_i1.out"](
+        site
+    )
+    impl[op_special_modified_bessel_k0, "special_modified_bessel_k0"](site)
+    impl[op_special_modified_bessel_k0_out, "special_modified_bessel_k0.out"](
+        site
+    )
+    impl[op_special_modified_bessel_k1, "special_modified_bessel_k1"](site)
+    impl[op_special_modified_bessel_k1_out, "special_modified_bessel_k1.out"](
+        site
+    )
+    impl[op_special_ndtri, "special_ndtri"](site)
+    impl[op_special_ndtri_out, "special_ndtri.out"](site)
+    impl[
+        op_special_scaled_modified_bessel_k0,
+        "special_scaled_modified_bessel_k0",
+    ](site)
+    impl[
+        op_special_scaled_modified_bessel_k0_out,
+        "special_scaled_modified_bessel_k0.out",
+    ](site)
+    impl[
+        op_special_scaled_modified_bessel_k1,
+        "special_scaled_modified_bessel_k1",
+    ](site)
+    impl[
+        op_special_scaled_modified_bessel_k1_out,
+        "special_scaled_modified_bessel_k1.out",
+    ](site)
+    impl[op_special_spherical_bessel_j0, "special_spherical_bessel_j0"](site)
+    impl[op_special_spherical_bessel_j0_out, "special_spherical_bessel_j0.out"](
+        site
+    )
     impl[op_sqrt, "sqrt"](site)
     impl[op_sqrt_out, "sqrt.out"](site)
     impl[op_tan, "tan"](site)
     impl[op_tan_out, "tan.out"](site)
     impl[op_tanh, "tanh"](site)
     impl[op_tanh_out, "tanh.out"](site)
+    impl[op_trunc_out, "trunc.out"](site)
+    impl[op_trunc, "trunc"](site)
     impl[op_relu, "relu"](site)
     impl[op_relu_out, "relu.out"](site)
     impl[op_relu_, "relu_"](site)

@@ -473,9 +473,12 @@ def _zeta_pow(a: Float64, b: Float64) -> Float64:
 def _poly_n[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
     """`static_cast<int64_t>(n)` for the polynomial degree (truncation), in
     the operand's own float type (no float64 on Apple GPUs); NaN and
-    out-of-range degrees read as -1, which every polynomial maps to 0
-    (hermite does exactly this; the others would be UB in C++)."""
-    if isnan(n) or n >= 9.2e18 or n <= -9.2e18:
+    degrees outside int64's range (-2^63, 2^63) read as -1, which every
+    polynomial maps to 0 (hermite does exactly this; the others are UB in
+    C++, which x86's cvttsd2si turns into INT64_MIN, a negative degree).
+    The cutoff is 2^63 exactly: every float below it converts, so a degree
+    such as 9.21e18 keeps its value."""
+    if isnan(n) or n >= 9223372036854775808.0 or n <= -9223372036854775808.0:
         return -1
     return Int(n)
 
@@ -1788,8 +1791,12 @@ def _wide[
             r = a * min(max(a + 3, zero), SIMD[w, n](6)) * _one_sixth[w, n]()
         return isnan(a).select(a, r)
     elif kind == "hardtanh":
-        # hardtanh is clamp(x, min_val, max_val); NaN passes through.
-        var r = min(max(a, SIMD[w, n](p[0])), SIMD[w, n](p[1]))
+        # hardtanh is two-bound clamp(x, min_val, max_val): a NaN x passes
+        # through, and a NaN bound fills NaN (min/max would drop it).
+        var lo = SIMD[w, n](p[0])
+        var hi = SIMD[w, n](p[1])
+        var r = min(max(a, lo), hi)
+        r = (isnan(lo) | isnan(hi)).select(lo + hi, r)
         return isnan(a).select(a, r)
     elif kind == "leaky_relu":
         var r = a.gt(0).select(a, a * p[0])
@@ -1935,7 +1942,7 @@ def _erf[
 
 @always_inline
 def _rrelu[
-    kind: StaticString, dtype: DType, n: Int
+    kind: StaticString, dtype: DType, out_dtype: DType, n: Int
 ](
     a: SIMD[dtype, n], b: SIMD[dtype, n], p: SIMD[param_dtype[dtype](), 4]
 ) -> SIMD[dtype, n] where dtype.is_floating_point():
@@ -1944,30 +1951,43 @@ def _rrelu[
     in two floats for float32 and the half types. CUDA computes the slope
     `r * range + lower` in double (range and lower are doubles; one DFMA)
     and assigns it to scalar_t; x <= 0 ? x * r : x in scalar_t, noise r or 1.
-    Metal has no double: the slope is one float32 fma there."""
+    Metal has no double: the slope is one float32 fma there. b is curand's
+    float draw (double for float64): dtype is float32 for a half
+    `out_dtype`, the scalar_t the slope is rounded to."""
     var r: SIMD[dtype, n]
+    # The draw comes from `uniform_`, which reverses curand's (0, 1] into
+    # [0, 1) by folding a 1 onto 0; RreluWithNoise.cu takes curand's value
+    # as is. A 0 can only be such a fold (curand never returns 0, and the
+    # draw is a float, never a half that could underflow), so it is read
+    # back as the 1 CUDA sees: the slope is `upper`, not `lower`.
+    var u = b.eq(0).select(SIMD[dtype, n](1), b)
     comptime if is_apple_gpu():
-        var bf = b.cast[DType.float32]()
-        r = bf.fma(
-            SIMD[DType.float32, n](p[1].cast[DType.float32]()),
-            SIMD[DType.float32, n](p[0].cast[DType.float32]()),
-        ).cast[dtype]()
+        var bf = u.cast[DType.float32]()
+        r = (
+            bf.fma(
+                SIMD[DType.float32, n](p[1].cast[DType.float32]()),
+                SIMD[DType.float32, n](p[0].cast[DType.float32]()),
+            )
+            .cast[out_dtype]()
+            .cast[dtype]()
+        )
     else:
         var lower = p[0].cast[DType.float64]() + p[2].cast[DType.float64]()
         var span = p[1].cast[DType.float64]() + p[3].cast[DType.float64]()
-        var rd = b.cast[DType.float64]().fma(
+        var rd = u.cast[DType.float64]().fma(
             SIMD[DType.float64, n](span), SIMD[DType.float64, n](lower)
         )
         # A double assigned to c10::Half / c10::BFloat16 goes through float.
-        comptime if dtype == DType.float64:
+        comptime if out_dtype == DType.float64:
             r = rd.cast[dtype]()
         else:
-            r = rd.cast[DType.float32]().cast[dtype]()
+            r = rd.cast[DType.float32]().cast[out_dtype]().cast[dtype]()
     var keep = a.le(0) & ~isnan(a)
     comptime if kind == "rrelu_noise":
         return keep.select(r, SIMD[dtype, n](1))
     else:
         comptime w = wide_dtype[dtype]()
+        # The product rounds once, to out_dtype, by the caller's cast.
         return keep.select((a.cast[w]() * r.cast[w]()).cast[dtype](), a)
 
 
@@ -1999,7 +2019,7 @@ def pointwise[
         )
     elif kind == "rrelu_train" or kind == "rrelu_noise":
         comptime assert dtype.is_floating_point(), "rrelu takes floats"
-        return _rrelu[kind](a, b, p).cast[out_dtype]()
+        return _rrelu[kind, out_dtype=out_dtype](a, b, p).cast[out_dtype]()
     elif is_native_kind[kind]():
         return _native[kind](a, b, c).cast[out_dtype]()
     elif is_scalar_t_kind[kind]():

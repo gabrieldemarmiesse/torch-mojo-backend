@@ -31,9 +31,13 @@ def _pointwise_float32_kinds() -> set[str]:
 
 
 def test_float32_math_ops_match_the_mojo_sources():
-    expected = {f"elementwise_{k}" for k in _scalar_special_kinds()} | {
-        f"pointwise_{k}" for k in _pointwise_float32_kinds()
-    }
+    # The graph's polygamma (tmb/graph/elementwise.mojo) runs
+    # `unary_math.elementwise_polygamma`, a float32 evaluation.
+    expected = (
+        {f"elementwise_{k}" for k in _scalar_special_kinds()}
+        | {f"pointwise_{k}" for k in _pointwise_float32_kinds()}
+        | {"polygamma"}
+    )
     assert custom_mojo_ops.FLOAT32_MATH_OPS == expected
 
 

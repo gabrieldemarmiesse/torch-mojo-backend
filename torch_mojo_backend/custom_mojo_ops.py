@@ -64,6 +64,7 @@ FLOAT32_MATH_OPS = frozenset(
         "elementwise_trigamma",
         "pointwise_igamma",
         "pointwise_igammac",
+        "polygamma",
     }
 )
 
@@ -171,34 +172,58 @@ def elementwise(
         "abs",
         "acos",
         "acosh",
+        "airy_ai",
         "angle",
         "asin",
         "asinh",
         "atan",
         "atanh",
+        "bessel_j0",
+        "bessel_j1",
+        "bessel_y0",
+        "bessel_y1",
         "ceil",
         "cos",
         "cosh",
+        "digamma",
+        "entr",
         "erf",
         "erfc",
+        "erfcx",
         "erfinv",
         "exp",
         "exp2",
         "expm1",
         "floor",
+        "frac",
         "gelu_none",
         "gelu_tanh",
+        "i0",
+        "i0e",
+        "i1",
+        "i1e",
         "isinf",
         "isnan",
+        "lgamma",
+        "log10",
+        "log_ndtr",
         "logical_not",
         "log",
-        "log10",
         "log1p",
         "log2",
+        "logit",
+        "modified_bessel_i0",
+        "modified_bessel_i1",
+        "modified_bessel_k0",
+        "modified_bessel_k1",
+        "ndtri",
         "neg",
         "reciprocal",
         "relu",
+        "round",
         "rsqrt",
+        "scaled_modified_bessel_k0",
+        "scaled_modified_bessel_k1",
         "sigmoid",
         "sign",
         "signbit",
@@ -206,9 +231,12 @@ def elementwise(
         "sin",
         "sinc",
         "sinh",
+        "spherical_bessel_j0",
         "sqrt",
         "tan",
         "tanh",
+        "trigamma",
+        "trunc",
     ],
 ) -> MaxTensor:
     """Call shared unary math through MAX's fusible Mojo registrations."""
@@ -226,9 +254,11 @@ def elementwise(
             "logical_not",
             "neg",
             "relu",
+            "round",
             "sign",
             "signbit",
             "silu",
+            "trunc",
         }
         and not input.dtype.is_float()
     ):
@@ -256,27 +286,61 @@ def pointwise_binary(
     other: MaxTensor,
     kind: Literal[
         "atan2",
+        "chebyshev_polynomial_t",
+        "chebyshev_polynomial_u",
+        "chebyshev_polynomial_v",
+        "chebyshev_polynomial_w",
         "copysign",
         "fmax",
         "fmin",
         "fmod",
         "gcd",
         "heaviside",
+        "hermite_polynomial_h",
+        "hermite_polynomial_he",
         "hypot",
+        "igamma",
+        "igammac",
+        "laguerre_polynomial_l",
         "lcm",
+        "ldexp",
+        "legendre_polynomial_p",
         "logaddexp",
         "logaddexp2",
         "lshift",
         "nextafter",
         "rshift",
+        "shifted_chebyshev_polynomial_t",
+        "shifted_chebyshev_polynomial_u",
+        "shifted_chebyshev_polynomial_v",
+        "shifted_chebyshev_polynomial_w",
         "xlog1py",
         "xlogy",
+        "zeta",
     ],
 ) -> MaxTensor:
     """The mojo device's pointwise math (`tmb/kernels/common/pointwise_math`)
     as a fusible binary custom op. The operands share a dtype and a shape:
     promotion and broadcasting happen before the call."""
     return _same_type_binary(f"pointwise_{kind}", input, other)
+
+
+def polygamma(n: int, input: MaxTensor) -> MaxTensor:
+    """polygamma(n, x) for n >= 2 (`tmb/graph/elementwise.mojo`'s
+    `polygamma`). The order is a custom-op parameter, exact where a float
+    operand would round it; the kernel truncates it to 32 bits as CUDA's
+    `calc_polygamma(scalar_t x, int n)` does (Apple's keeps the int64)."""
+    _refuse_float32_math("polygamma", input)
+    return F.custom(
+        name="polygamma",
+        device=input.device,
+        values=[input],
+        out_types=[
+            TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
+        ],
+        parameters={"n": n},
+        custom_extensions=compiler.kernel_extension_paths(),
+    )[0]
 
 
 def gelu_backward(

@@ -87,6 +87,46 @@ INT_MATH_OPS = {
     "gcd": torch.gcd,
     "lcm": torch.lcm,
 }
+# (x, n) polynomials: x in (-1, 1) takes the recurrence below n = 7 and the
+# trigonometric form above; n = 5 and n = 9 time both regimes.
+POLY_OPS = {
+    f"special_{name}": getattr(torch.special, name)
+    for name in (
+        "chebyshev_polynomial_t",
+        "chebyshev_polynomial_u",
+        "chebyshev_polynomial_v",
+        "chebyshev_polynomial_w",
+        "hermite_polynomial_h",
+        "hermite_polynomial_he",
+        "laguerre_polynomial_l",
+        "legendre_polynomial_p",
+        "shifted_chebyshev_polynomial_t",
+        "shifted_chebyshev_polynomial_u",
+        "shifted_chebyshev_polynomial_v",
+        "shifted_chebyshev_polynomial_w",
+    )
+}
+# Activation backwards: (grad_output, input) of one shape.
+ACT_BACKWARD_OPS = {
+    "elu_backward": lambda g, x: torch.ops.aten.elu_backward(
+        g, 1.0, 1.0, 1.0, False, x
+    ),
+    "hardshrink_backward": lambda g, x: torch.ops.aten.hardshrink_backward(g, x, 0.5),
+    "hardsigmoid_backward": torch.ops.aten.hardsigmoid_backward,
+    "hardswish_backward": torch.ops.aten.hardswish_backward,
+    "hardtanh_backward": lambda g, x: torch.ops.aten.hardtanh_backward(g, x, -0.5, 0.5),
+    "leaky_relu_backward": lambda g, x: torch.ops.aten.leaky_relu_backward(
+        g, x, 0.01, False
+    ),
+    "log_sigmoid_backward": lambda g, x: torch.ops.aten.log_sigmoid_backward(
+        g, x, torch.empty(0, device=x.device, dtype=x.dtype)
+    ),
+    "logit_backward": torch.ops.aten.logit_backward,
+    "mish_backward": torch.ops.aten.mish_backward,
+    "silu_backward": torch.ops.aten.silu_backward,
+    "softplus_backward": lambda g, x: torch.ops.aten.softplus_backward(g, x, 1.0, 20.0),
+    "softshrink_backward": lambda g, x: torch.ops.aten.softshrink_backward(g, x, 0.5),
+}
 LOGICAL_OPS = {
     "logical_and": torch.logical_and,
     "logical_or": torch.logical_or,
@@ -109,6 +149,8 @@ COVERS: dict[str, str] = (
     | {f"aten::{name}": "test_logical" for name in LOGICAL_OPS}
     | {f"aten::{name}": "test_binary_math" for name in MATH_OPS}
     | {f"aten::{name}": "test_int_math" for name in INT_MATH_OPS}
+    | {f"aten::{name}": "test_special_polynomial" for name in POLY_OPS}
+    | {f"aten::{name}": "test_activation_backward" for name in ACT_BACKWARD_OPS}
     | {
         "aten::pow.Tensor_Scalar": "test_pow[Scalar]",
         "aten::pow.Tensor_Tensor": "test_pow[Tensor]",
@@ -128,8 +170,13 @@ COVERS: dict[str, str] = (
         "aten::lerp_.Scalar": "test_lerp_inplace",
         "aten::clamp": "test_clamp",
         "aten::clamp.Tensor": "test_clamp_tensor",
+        "aten::frexp.Tensor": "test_frexp",
         "aten::lerp.Tensor": "test_lerp_tensor",
+        "aten::ldexp.Tensor": "test_ldexp",
         "aten::pow.Scalar": "test_pow_scalar_base",
+        "aten::special_zeta": "test_zeta",
+        "aten::igamma": "test_igamma",
+        "aten::igammac": "test_igamma",
         "aten::addcdiv": "test_addcdiv",
         "aten::addcdiv.out": "test_addcdiv_inplace",
         "aten::addcdiv_": "test_addcdiv_inplace",
@@ -202,18 +249,31 @@ SKIPPED: dict[str, str] = {
     "aten::copysign.Scalar": _SCALAR_OPERAND,
     "aten::copysign.Scalar_out": _OUT,
     "aten::copysign.out": _OUT,
+    "aten::elu_backward.grad_input": _OUT,
     "aten::fmax.out": _OUT,
     "aten::fmin.out": _OUT,
     "aten::fmod.Scalar": _SCALAR_OPERAND,
     "aten::fmod.Scalar_out": _OUT,
     "aten::fmod.Tensor_out": _OUT,
+    "aten::frexp.Tensor_out": _OUT,
     "aten::gcd.out": _OUT,
+    "aten::gelu_backward.grad_input": _OUT,
+    "aten::hardshrink_backward.grad_input": _OUT,
+    "aten::hardsigmoid_backward.grad_input": _OUT,
+    "aten::hardtanh_backward.grad_input": _OUT,
     "aten::heaviside.out": _OUT,
     "aten::hypot.out": _OUT,
+    "aten::igamma.out": _OUT,
+    "aten::igammac.out": _OUT,
     "aten::lcm.out": _OUT,
+    "aten::ldexp.out": _OUT,
+    "aten::ldexp_": _OUT,
+    "aten::leaky_relu_backward.grad_input": _OUT,
     "aten::lerp.Tensor_out": _OUT,
+    "aten::log_sigmoid_backward.grad_input": _OUT,
     "aten::logaddexp.out": _OUT,
     "aten::logaddexp2.out": _OUT,
+    "aten::logit_backward.grad_input": _OUT,
     "aten::logical_and.out": _OUT,
     "aten::logical_or.out": _OUT,
     "aten::logical_xor.out": _OUT,
@@ -227,7 +287,23 @@ SKIPPED: dict[str, str] = {
     "aten::remainder.Tensor_out": _OUT,
     "aten::rsub.Scalar_out": _OUT,
     "aten::rsub.Tensor_out": _OUT,
+    "aten::silu_backward.grad_input": _OUT,
+    "aten::softplus_backward.grad_input": _OUT,
+    "aten::softshrink_backward.grad_input": _OUT,
+    "aten::special_chebyshev_polynomial_t.out": _OUT,
+    "aten::special_chebyshev_polynomial_u.out": _OUT,
+    "aten::special_chebyshev_polynomial_v.out": _OUT,
+    "aten::special_chebyshev_polynomial_w.out": _OUT,
+    "aten::special_hermite_polynomial_h.out": _OUT,
+    "aten::special_hermite_polynomial_he.out": _OUT,
+    "aten::special_laguerre_polynomial_l.out": _OUT,
+    "aten::special_legendre_polynomial_p.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_t.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_u.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_v.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_w.out": _OUT,
     "aten::special_xlog1py.out": _OUT,
+    "aten::special_zeta.out": _OUT,
     "aten::xlogy.OutTensor": _OUT,
 }
 
@@ -640,6 +716,127 @@ def test_pow_scalar_base(
         lambda: torch.pow(2.5, x_ref),
         lambda: torch.pow(2.5, x_our),
         flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("frexp.Tensor")
+def test_frexp(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(
+        (torch.randn(shape) * 100).to(DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.frexp(x_ref),
+        lambda: torch.frexp(x_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(ACT_BACKWARD_OPS))
+def test_activation_backward(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = ACT_BACKWARD_OPS[op_name]
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    bench.run(
+        lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("ldexp.Tensor")
+def test_ldexp(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """The integral-exponent route (::ldexp in self's dtype); exponents in
+    [-20, 20) keep every result normal."""
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    e_ref, e_our = both(
+        torch.randint(-20, 20, shape, dtype=torch.int32), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.ldexp(x_ref, e_ref),
+        lambda: torch.ldexp(x_our, e_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", ("A_357x789_n5", "A_357x789_n9"))
+@pytest.mark.parametrize("op_name", op_params(POLY_OPS))
+def test_special_polynomial(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = POLY_OPS[op_name]
+    shape = SHAPES[shape_id.rsplit("_", 1)[0]]
+    degree = float(shape_id.rsplit("_n", 1)[1])
+    x = unit_interval(shape, DTYPES[dtype_id])
+    x_ref, x_our = both(x, hw, mojo_device)
+    n_ref, n_our = both(torch.full(shape, degree), hw, mojo_device)
+    bench.run(
+        lambda: fn(x_ref, n_ref), lambda: fn(x_our, n_our), flops=float(x.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("special_zeta")
+def test_zeta(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]) + 1.5, hw, mojo_device)
+    q_ref, q_our = both(unit_interval(shape, DTYPES[dtype_id]) + 0.5, hw, mojo_device)
+    bench.run(
+        lambda: torch.special.zeta(x_ref, q_ref),
+        lambda: torch.special.zeta(x_our, q_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+# Stock torch has float32/float64 kernels only (IGammaKernel.cu).
+IGAMMA_OPS = {"igamma": torch.igamma, "igammac": torch.igammac}
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(IGAMMA_OPS))
+def test_igamma(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """a in (0.5, 10.5) and x in (0.5, 10.5): the series, the continued
+    fraction and (a ~ x) the regimes between them."""
+    fn = IGAMMA_OPS[op_name]
+    shape = SHAPES[shape_id]
+    a = unit_interval(shape, DTYPES[dtype_id]) * 10 + 0.5
+    x = unit_interval(shape, DTYPES[dtype_id]).flip(-1) * 10 + 0.5
+    a_ref, a_our = both(a, hw, mojo_device)
+    x_ref, x_our = both(x, hw, mojo_device)
+    bench.run(
+        lambda: fn(a_ref, x_ref), lambda: fn(a_our, x_our), flops=float(a.numel())
     )
 
 

@@ -10,6 +10,7 @@ import functools
 import itertools
 import math
 import operator
+import struct
 from collections.abc import Callable, Sequence
 from typing import Literal, TypeVar, cast
 
@@ -248,21 +249,36 @@ def _pointwise_binary(
     other: MaxTensor | Scalar,
     kind: Literal[
         "atan2",
+        "chebyshev_polynomial_t",
+        "chebyshev_polynomial_u",
+        "chebyshev_polynomial_v",
+        "chebyshev_polynomial_w",
         "copysign",
         "fmax",
         "fmin",
         "fmod",
         "gcd",
         "heaviside",
+        "hermite_polynomial_h",
+        "hermite_polynomial_he",
         "hypot",
+        "igamma",
+        "igammac",
+        "laguerre_polynomial_l",
         "lcm",
+        "legendre_polynomial_p",
         "logaddexp",
         "logaddexp2",
         "lshift",
         "nextafter",
         "rshift",
+        "shifted_chebyshev_polynomial_t",
+        "shifted_chebyshev_polynomial_u",
+        "shifted_chebyshev_polynomial_v",
+        "shifted_chebyshev_polynomial_w",
         "xlog1py",
         "xlogy",
+        "zeta",
     ],
     *,
     promote_float: bool,
@@ -303,6 +319,24 @@ def _pointwise_binary(
     return custom_mojo_ops.pointwise_binary(
         _broadcast_to(lhs, shape), _broadcast_to(rhs, shape), kind
     )
+
+
+def _shrink_backward(grad: MaxTensor, input: MaxTensor, lambd: float) -> MaxTensor:
+    """shrink_backward (ActivationSoftshrinkKernel.cu): grad outside
+    [-lambd, lambd], 0 inside; hardshrink and softshrink share it. The
+    iterator promotes (grad, self), rank-aware, and compares in that dtype."""
+
+    def probe(x: MaxTensor) -> torch.Tensor:
+        return torch.empty(
+            (0,) * len(x.shape), dtype=max_dtype_to_torch(x.dtype), device="meta"
+        )
+
+    common = torch_dtype_to_max(torch.result_type(probe(grad), probe(input)))
+    grad = grad if grad.dtype == common else F.cast(grad, common)
+    input = input if input.dtype == common else F.cast(input, common)
+    inside = F.logical_and(input >= -lambd, input <= lambd)
+    zero = _scalar_constant(0.0, dtype=common, device=grad.device)
+    return _where(inside, zero, grad)
 
 
 # Ops that need to be decomposed.
@@ -2808,6 +2842,12 @@ def aten_detach(input: MaxTensor) -> MaxTensor:
 # diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)
 
 
+# digamma(Tensor self) -> Tensor
+@map_to(aten.digamma)
+def aten_digamma(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "digamma")
+
+
 # div.Scalar(Tensor self, Scalar other) -> Tensor
 # div.Scalar_mode(Tensor self, Scalar other, *, str? rounding_mode) -> Tensor
 # div.Tensor(Tensor self, Tensor other) -> Tensor
@@ -2868,6 +2908,81 @@ def aten_div(
 
 
 # elu(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1) -> Tensor
+@map_to(aten.elu)
+def aten_elu(
+    input: MaxTensor, alpha: float = 1.0, scale: float = 1.0, input_scale: float = 1.0
+) -> MaxTensor:
+    """ActivationEluKernel.cu: x > 0 ? x * scale
+    : expm1(x * input_scale) * alpha * scale. expm1, not exp(x) - 1, which
+    cancels to 0 near zero (bfloat16 -0.001 gave 0)."""
+    dtype = input.dtype
+    if dtype in (DType.float16, DType.bfloat16):
+        # The kernel's opmath: x * input_scale must not underflow in half.
+        input = F.cast(input, DType.float32)
+    # Each Scalar is read as opmath_t, and negcoef = alpha * scale is an
+    # opmath product (alpha = 1e-46 is float32 0, whatever scale is).
+    opmath = torch.float64 if input.dtype == DType.float64 else torch.float32
+
+    alpha, scale, input_scale = (
+        _scalar_to_opmath(v, opmath) for v in (alpha, scale, input_scale)
+    )
+    negcoef = torch.tensor(alpha * scale, dtype=opmath).item()
+    growth = _expm1(_mul_coefficient(input, input_scale, opmath, "elu"))
+    negative = _mul_coefficient(growth, negcoef, opmath, "elu")
+    result = _where(input > 0, _mul_coefficient(input, scale, opmath, "elu"), negative)
+    return result if result.dtype == dtype else F.cast(result, dtype)
+
+
+def _mul_coefficient(
+    t: MaxTensor, coefficient: float, opmath: torch.dtype, op: str
+) -> MaxTensor:
+    """`t * coefficient` for an opmath Scalar coefficient. MAX folds a
+    product with 0 to 0, but inf * 0 and NaN * 0 are NaN, so a zero
+    coefficient selects NaN there explicitly (the sign of the zero result
+    is not kept). A subnormal coefficient is refused: MAX's CPU runtime
+    flushes it to zero, so no product would match ATen's."""
+    if coefficient == 0.0:
+        nan = F.constant(math.nan, dtype=t.dtype, device=t.device)
+        zero = F.constant(0.0, dtype=t.dtype, device=t.device)
+        blown = F.logical_or(
+            custom_mojo_ops.elementwise(t, "isinf"),
+            custom_mojo_ops.elementwise(t, "isnan"),
+        )
+        return _where(blown, nan, zero)
+    if abs(coefficient) < torch.finfo(opmath).tiny:
+        raise NotImplementedError(
+            f"torch.compile {op} with a subnormal coefficient ({coefficient!r})"
+        )
+    return t * coefficient
+
+
+def _scalar_to_opmath(value: float, opmath: torch.dtype) -> float:
+    """`Scalar::to<opmath_t>()`: rounded to the opmath dtype, and a finite
+    value past float32's range raises (float64 never overflows)."""
+    if opmath == torch.float32 and math.isfinite(value):
+        if abs(value) > torch.finfo(torch.float32).max:
+            raise RuntimeError(
+                "value cannot be converted to type float without overflow"
+            )
+    return torch.tensor(value, dtype=opmath).item()
+
+
+def _expm1(x: MaxTensor) -> MaxTensor:
+    """e^x - 1 without the cancellation near 0: the shared expm1 kind (float
+    math, which refuses float64), and Kahan's (u - 1) * x / log(u) with
+    u = e^x for float64."""
+    if x.dtype != DType.float64:
+        return custom_mojo_ops.elementwise(x, "expm1")
+    # The shared exp / log kinds: MAX's own CPU exp reads NaN as +inf.
+    u = custom_mojo_ops.elementwise(x, "exp")
+    one = F.constant(1.0, dtype=x.dtype, device=x.device)
+    # x / log(u) (about 1) first: (u - 1) * x overflows for u near max.
+    corrected = (u - one) * (x / custom_mojo_ops.elementwise(u, "log"))
+    near_zero = _where(u == one, x, corrected)
+    # u = 0 (x -> -inf) and u = inf keep the plain difference: -1 and inf
+    # (isinf, not `u == inf`, which MAX's CPU compare answers True for NaN).
+    saturated = F.logical_or(u == 0.0, custom_mojo_ops.elementwise(u, "isinf"))
+    return _where(saturated, u - one, near_zero)
 
 
 # embedding(Tensor weight, Tensor indices, SymInt padding_idx=-1, bool scale_grad_by_freq=False, bool sparse=False) -> Tensor
@@ -3136,6 +3251,12 @@ def aten_fmod(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
     return _pointwise_binary(input, other, "fmod", promote_float=False)
 
 
+# frac(Tensor self) -> Tensor
+@map_to(aten.frac)
+def aten_frac(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "frac")
+
+
 # full(SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
 @map_to(aten.full)
 def aten_full(
@@ -3305,7 +3426,25 @@ def aten_gt(x: MaxTensor, y: int | float | MaxTensor) -> MaxTensor:
     return operator.gt(x, y)
 
 
+# hardshrink_backward(Tensor grad_out, Tensor self, Scalar lambd) -> Tensor
+@map_to(aten.hardshrink_backward)
+def aten_hardshrink_backward(
+    grad_out: MaxTensor, input: MaxTensor, lambd: float
+) -> MaxTensor:
+    return _shrink_backward(grad_out, input, lambd)
+
+
 # hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
+@map_to(aten.hardtanh)
+def aten_hardtanh(
+    input: MaxTensor, min_val: float = -1.0, max_val: float = 1.0
+) -> MaxTensor:
+    """clamp(x, min_val, max_val), as ATen implements it: NaN propagates
+    (aten_clamp), and an integral tensor takes the bounds truncated to its
+    own type (Scalar::to<int64_t>), not a float promotion."""
+    if not input.dtype.is_float():
+        return aten_clamp(input, int(min_val), int(max_val))
+    return aten_clamp(input, min_val, max_val)
 
 
 # heaviside(Tensor self, Tensor values) -> Tensor
@@ -3325,6 +3464,26 @@ def aten_heaviside(input: MaxTensor, values: MaxTensor) -> MaxTensor:
 def aten_hypot(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
     """sqrt(a^2 + b^2) without intermediate overflow."""
     return _pointwise_binary(input, other, "hypot", promote_float=False)
+
+
+# i0(Tensor self) -> Tensor
+@map_to(aten.i0)
+def aten_i0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i0")
+
+
+# igamma(Tensor self, Tensor other) -> Tensor
+@map_to(aten.igamma)
+def aten_igamma(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """The regularized lower incomplete gamma function P(a, x)."""
+    return _pointwise_binary(input, other, "igamma", promote_float=True)
+
+
+# igammac(Tensor self, Tensor other) -> Tensor
+@map_to(aten.igammac)
+def aten_igammac(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """The regularized upper incomplete gamma function Q(a, x)."""
+    return _pointwise_binary(input, other, "igammac", promote_float=True)
 
 
 # index.Tensor(Tensor self, Tensor?[] indices) -> Tensor
@@ -3609,6 +3768,73 @@ def aten_lcm(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
     return _pointwise_binary(input, other, "lcm", promote_float=False)
 
 
+# ldexp.Tensor(Tensor self, Tensor other) -> Tensor
+@map_to(aten.ldexp.Tensor)
+def aten_ldexp(input: MaxTensor, other: MaxTensor) -> MaxTensor:
+    """BinaryOps.cpp's ldexp: a floating self with an integral exponent is
+    ::ldexp in self's dtype (the mojo device's `ldexp` pointwise kind;
+    bfloat16 computed in float32, whose exponent range its mantissa cannot
+    index exactly); anything else is self * pow(2, other)."""
+    in_dtype = max_dtype_to_torch(input.dtype)
+    ex_dtype = max_dtype_to_torch(other.dtype)
+    if in_dtype.is_floating_point and not ex_dtype.is_floating_point:
+        compute = DType.float32 if input.dtype == DType.bfloat16 else input.dtype
+        shape = find_broadcast_shape(input.shape, other.shape)
+        lhs = _broadcast_to(F.cast(input, compute), shape)
+        if other.dtype in (DType.int64, DType.uint32, DType.uint64):
+            # ::ldexp takes an int: a wider exponent wraps to int32 first
+            # (2**32 is 0), as the C++ conversion does.
+            other = F.cast(other, DType.int32)
+        rhs = _broadcast_to(F.cast(other, compute), shape)
+        result = custom_mojo_ops.pointwise_binary(lhs, rhs, "ldexp")
+        return result if compute == input.dtype else F.cast(result, input.dtype)
+
+    # _pow2(self, other): pow(2.0, other) (a Python float base) for an
+    # integral or float32 self, else full({}, 2.0, self.dtype).pow(other),
+    # a 0-d tensor base that promotes rank-aware. pow runs in its own result
+    # dtype, and mul then casts that result to mul's rank-aware common
+    # dtype: a float16 exponent past 15 is inf even against a float64 self,
+    # and a 0-d float64 2^128 is inf against a float32 self. The dtypes are
+    # read off ATen's own meta kernels.
+    def meta(dtype: torch.dtype, rank: int) -> torch.Tensor:
+        return torch.empty((0,) * rank, dtype=dtype, device="meta")
+
+    rank = len(other.shape)
+    if in_dtype.is_floating_point and in_dtype != torch.float32:
+        pow_dtype = torch.pow(meta(in_dtype, 0), meta(ex_dtype, rank)).dtype
+    else:
+        pow_dtype = torch.pow(2.0, meta(ex_dtype, rank)).dtype
+    mul_dtype = torch.mul(meta(in_dtype, len(input.shape)), meta(pow_dtype, rank)).dtype
+    pow_max = torch_dtype_to_max(pow_dtype)
+    base = _scalar_constant(2.0, dtype=pow_max, device=input.device)
+    # MAX's pow returns 1 for 2^(2^32), from a float exponent or an integer
+    # one converted to the default float (an integral self keeps it as is):
+    # clamp to +-1100, past which 2^e is inf / 0 in every floating dtype
+    # (float64's range ends at 2^1024, its subnormals at 2^-1074). NaN is
+    # patched below.
+    exponent = F.cast(other, pow_max)
+    limit = _scalar_constant(1100.0, dtype=pow_max, device=input.device)
+    exponent = F.min(F.max(exponent, -limit), limit)
+    pow2 = _pow2_nonfinite(aten_pow(base, exponent), other)
+    mul_max = torch_dtype_to_max(mul_dtype)
+    return aten_mul(F.cast(input, mul_max), F.cast(pow2, mul_max))
+
+
+def _pow2_nonfinite(pow2: MaxTensor, exponent: MaxTensor) -> MaxTensor:
+    """2^inf = inf, 2^-inf = 0 and 2^NaN = NaN: MAX's CPU pow returns 1 for
+    an infinite exponent and inf for a NaN one."""
+    if not exponent.dtype.is_float():
+        return pow2
+    exponent = F.cast(exponent, pow2.dtype)
+
+    def const(value: float) -> MaxTensor:
+        return F.constant(value, dtype=pow2.dtype, device=pow2.device)
+
+    pow2 = _where(exponent == math.inf, const(math.inf), pow2)
+    pow2 = _where(exponent == -math.inf, const(0.0), pow2)
+    return _where(custom_mojo_ops.elementwise(exponent, "isnan"), const(math.nan), pow2)
+
+
 # le.Scalar(Tensor self, Scalar other) -> Tensor
 # le.Tensor(Tensor self, Tensor other) -> Tensor
 @map_to(aten.le)
@@ -3617,6 +3843,30 @@ def aten_le(input: MaxTensor, other: Scalar | MaxTensor) -> MaxTensor:
 
 
 # leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
+@map_to(aten.leaky_relu)
+def aten_leaky_relu(input: MaxTensor, negative_slope: float = 0.01) -> MaxTensor:
+    """x > 0 ? x : x * negative_slope, with the slope and the product in
+    opmath (float32 for the half dtypes): a float16 slope of 1e5 would be
+    inf, and one of 1e-8 zero."""
+    dtype = input.dtype
+    if dtype in (DType.float16, DType.bfloat16):
+        input = F.cast(input, DType.float32)
+    if dtype.is_float():
+        opmath = torch.float64 if dtype == DType.float64 else torch.float32
+        negative_slope = _scalar_to_opmath(negative_slope, opmath)
+        negative = _mul_coefficient(input, negative_slope, opmath, "leaky_relu")
+    else:
+        negative = input * negative_slope
+    result = _where(input > 0, input, negative)
+    return result if result.dtype == dtype else F.cast(result, dtype)
+
+
+# lgamma(Tensor self) -> Tensor
+@map_to(aten.lgamma)
+def aten_lgamma(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "lgamma")
+
+
 # linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
 @map_to(aten.linear)
 def aten_linear(
@@ -3749,6 +3999,28 @@ def aten_logical_or(input: MaxTensor, other: MaxTensor) -> MaxTensor:
 @map_to(aten.logical_xor)
 def aten_logical_xor(input: MaxTensor, other: MaxTensor) -> MaxTensor:
     return F.logical_xor(_truthy(input), _truthy(other))
+
+
+# logit(Tensor self, float? eps=None) -> Tensor
+@map_to(aten.logit)
+def aten_logit(x: MaxTensor, eps: float | None = None) -> MaxTensor:
+    if eps is None:
+        return custom_mojo_ops.elementwise(x, "logit")
+    # logit_kernel_cuda clamps in float (NaN passes through both compares).
+    dtype = x.dtype
+    if not dtype.is_float():
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+        dtype = x.dtype
+    xf = x if dtype in (DType.float32, DType.float64) else F.cast(x, DType.float32)
+    # `lo = eps_scalar.to<T_ACC>(); hi = T_ACC(1) - lo`: eps rounds to the
+    # compute type before the subtraction (float32 1 - 2^-25 ties to 1).
+    if xf.dtype == DType.float32:
+        eps = torch.tensor(eps, dtype=torch.float32).item()
+    lo = F.constant(eps, dtype=xf.dtype, device=xf.device)
+    hi = F.constant(1.0 - eps, dtype=xf.dtype, device=xf.device)
+    z = _where(xf < lo, lo, _where(xf > hi, hi, xf))
+    out = custom_mojo_ops.elementwise(z, "logit")
+    return out if out.dtype == dtype else F.cast(out, dtype)
 
 
 # lt.Scalar(Tensor self, Scalar other) -> Tensor
@@ -4051,6 +4323,52 @@ def _batch_norm_batch_stats(input: MaxTensor) -> tuple[MaxTensor, MaxTensor]:
     for axis in reduce_axes:
         var = _reduce_mean(var, axis=axis)
     return mean, var
+
+
+def _round_to_dtype(value: float, dtype: DType) -> float:
+    """`value` rounded to nearest-even in a float16 / bfloat16 / float32
+    (float64 as is), as torch's cast does it (the half types through float)."""
+    if dtype == DType.float64:
+        return value
+    value = struct.unpack("<f", struct.pack("<f", value))[0]
+    if dtype == DType.float16:
+        try:
+            return struct.unpack("<e", struct.pack("<e", value))[0]
+        except OverflowError:  # past 65520: the cast gives an infinity
+            return math.copysign(math.inf, value)
+    if dtype == DType.bfloat16:
+        (bits,) = struct.unpack("<I", struct.pack("<f", value))
+        bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+        return struct.unpack("<f", struct.pack("<I", bits))[0]
+    return value
+
+
+# mvlgamma(Tensor self, int p) -> Tensor
+@map_to(aten.mvlgamma)
+def aten_mvlgamma(x: MaxTensor, p: int) -> MaxTensor:
+    """ATen's composition (UnaryOps.cpp): sum_j lgamma(x + (1 - p)/2 + j/2)
+    + p (p - 1) log(pi) / 4."""
+    if x.dtype == DType.bool:
+        raise ValueError("The input tensor may not be a boolean tensor.")
+    if p < 1:
+        raise ValueError("p has to be greater than or equal to 1")
+    if not x.dtype.is_float():
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    # The terms in the tensor dtype, their sum accumulated in float (as
+    # ATen's sum reduction does for the half types), the constant added last.
+    acc = DType.float64 if x.dtype == DType.float64 else DType.float32
+    total = None
+    # ATen's `arange(-p/2 + 1/2, 1/2, 1/2)` in the tensor dtype: each offset
+    # rounds to nearest-even there (bfloat16 -129.5 is -130) before the add.
+    for j in range(p):
+        offset = _round_to_dtype((1 - p) / 2 + j / 2, x.dtype)
+        shift = F.constant(offset, dtype=x.dtype, device=x.device)
+        term = F.cast(custom_mojo_ops.elementwise(x + shift, "lgamma"), acc)
+        total = term if total is None else total + term
+    assert total is not None
+    total = F.cast(F.cast(total, x.dtype), acc)
+    constant = p * (p - 1) * math.log(math.pi) / 4
+    return F.cast(total + F.constant(constant, dtype=acc, device=x.device), x.dtype)
 
 
 # nanmedian(Tensor self) -> Tensor
@@ -4581,6 +4899,20 @@ def aten_permute(x: MaxTensor, dims: list[int]) -> MaxTensor:
     return F.permute(x, dims)
 
 
+# polygamma(int n, Tensor self) -> Tensor
+@map_to(aten.polygamma)
+def aten_polygamma(n: int, x: MaxTensor) -> MaxTensor:
+    if n < 0:
+        raise ValueError("polygamma(n, x) does not support negative n.")
+    if not x.dtype.is_float():
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    if n == 0:
+        return custom_mojo_ops.elementwise(x, "digamma")
+    if n == 1:
+        return custom_mojo_ops.elementwise(x, "trigamma")
+    return custom_mojo_ops.polygamma(n, x)
+
+
 # pow.Scalar(Scalar self, Tensor exponent) -> Tensor
 # pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
 # pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
@@ -4662,6 +4994,48 @@ def aten_relu_(tensor: MaxTensor) -> MaxTensor:
 
 # resize_(Tensor(a!) self, SymInt[] size, *, MemoryFormat? memory_format=None) -> Tensor(a!)
 # round(Tensor self) -> Tensor
+@map_to(aten.round)
+def aten_round(x: MaxTensor, decimals: int = 0) -> MaxTensor:
+    if decimals == 0 or not x.dtype.is_float():
+        return custom_mojo_ops.elementwise(x, "round")
+    # round_decimals_kernel_cuda, in the tensor dtype.
+    ten_pow = F.constant(10.0 ** abs(decimals), dtype=x.dtype, device=x.device)
+    if decimals < 0:
+        return custom_mojo_ops.elementwise(x / ten_pow, "round") * ten_pow
+    return custom_mojo_ops.elementwise(x * ten_pow, "round") / ten_pow
+
+
+# rrelu_with_noise(Tensor self, Tensor(b!) noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> Tensor
+@map_to(aten.rrelu_with_noise)
+def aten_rrelu_with_noise(
+    input: MaxTensor,
+    noise: MaxTensor,
+    lower: float = 0.125,
+    upper: float = 1.0 / 3.0,
+    training: bool = False,
+    generator: torch.Generator | None = None,
+) -> MaxTensor:
+    """Eval mode only: leaky_relu with the mean slope."""
+    if training:
+        raise NotImplementedError("rrelu_with_noise in training mode")
+    return aten_leaky_relu(input, (lower + upper) / 2)
+
+
+# rrelu_with_noise_functional(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.3333333333333333, bool training=False, Generator? generator=None) -> (Tensor, Tensor noise_out)
+@map_to(aten.rrelu_with_noise_functional)
+def aten_rrelu_with_noise_functional(
+    input: MaxTensor,
+    noise: MaxTensor,
+    lower: float = 0.125,
+    upper: float = 1.0 / 3.0,
+    training: bool = False,
+    generator: torch.Generator | None = None,
+) -> tuple[MaxTensor, MaxTensor]:
+    """The functionalized rrelu_with_noise: eval mode leaves `noise` as is."""
+    return (
+        aten_rrelu_with_noise(input, noise, lower, upper, training, generator),
+        noise,
+    )
 
 
 # rsqrt(Tensor self) -> Tensor
@@ -4912,6 +5286,14 @@ def aten_sinc(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "sinc")
 
 
+# softshrink_backward(Tensor grad_output, Tensor self, Scalar lambd) -> Tensor
+@map_to(aten.softshrink_backward)
+def aten_softshrink_backward(
+    grad_output: MaxTensor, input: MaxTensor, lambd: float
+) -> MaxTensor:
+    return _shrink_backward(grad_output, input, lambd)
+
+
 # tan(Tensor self) -> Tensor
 @map_to(aten.tan)
 def aten_tan(x: MaxTensor) -> MaxTensor:
@@ -4967,6 +5349,224 @@ def aten_sort_stable(
     # for, so it is a correct answer to `stable=True` and to `stable=None`.
     del stable
     return _sort_impl(input, dim, descending)
+
+
+# special_airy_ai(Tensor x) -> Tensor
+@map_to(aten.special_airy_ai)
+def aten_special_airy_ai(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "airy_ai")
+
+
+# special_bessel_j0(Tensor self) -> Tensor
+@map_to(aten.special_bessel_j0)
+def aten_special_bessel_j0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_j0")
+
+
+# special_bessel_j1(Tensor self) -> Tensor
+@map_to(aten.special_bessel_j1)
+def aten_special_bessel_j1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_j1")
+
+
+# special_bessel_y0(Tensor self) -> Tensor
+@map_to(aten.special_bessel_y0)
+def aten_special_bessel_y0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_y0")
+
+
+# special_bessel_y1(Tensor self) -> Tensor
+@map_to(aten.special_bessel_y1)
+def aten_special_bessel_y1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_y1")
+
+
+# special_chebyshev_polynomial_t(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_chebyshev_polynomial_t)
+def aten_special_chebyshev_polynomial_t(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "chebyshev_polynomial_t", promote_float=True)
+
+
+# special_chebyshev_polynomial_u(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_chebyshev_polynomial_u)
+def aten_special_chebyshev_polynomial_u(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "chebyshev_polynomial_u", promote_float=True)
+
+
+# special_chebyshev_polynomial_v(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_chebyshev_polynomial_v)
+def aten_special_chebyshev_polynomial_v(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "chebyshev_polynomial_v", promote_float=True)
+
+
+# special_chebyshev_polynomial_w(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_chebyshev_polynomial_w)
+def aten_special_chebyshev_polynomial_w(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "chebyshev_polynomial_w", promote_float=True)
+
+
+# special_entr(Tensor self) -> Tensor
+@map_to(aten.special_entr)
+def aten_special_entr(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "entr")
+
+
+# special_erfcx(Tensor self) -> Tensor
+@map_to(aten.special_erfcx)
+def aten_special_erfcx(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "erfcx")
+
+
+# special_hermite_polynomial_h(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_hermite_polynomial_h)
+def aten_special_hermite_polynomial_h(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "hermite_polynomial_h", promote_float=True)
+
+
+# special_hermite_polynomial_he(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_hermite_polynomial_he)
+def aten_special_hermite_polynomial_he(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "hermite_polynomial_he", promote_float=True)
+
+
+# special_i0e(Tensor self) -> Tensor
+@map_to(aten.special_i0e)
+def aten_special_i0e(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i0e")
+
+
+# special_i1(Tensor self) -> Tensor
+@map_to(aten.special_i1)
+def aten_special_i1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i1")
+
+
+# special_i1e(Tensor self) -> Tensor
+@map_to(aten.special_i1e)
+def aten_special_i1e(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i1e")
+
+
+# special_laguerre_polynomial_l(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_laguerre_polynomial_l)
+def aten_special_laguerre_polynomial_l(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "laguerre_polynomial_l", promote_float=True)
+
+
+# special_legendre_polynomial_p(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_legendre_polynomial_p)
+def aten_special_legendre_polynomial_p(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "legendre_polynomial_p", promote_float=True)
+
+
+# special_log_ndtr(Tensor self) -> Tensor
+@map_to(aten.special_log_ndtr)
+def aten_special_log_ndtr(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "log_ndtr")
+
+
+# special_modified_bessel_i0(Tensor self) -> Tensor
+@map_to(aten.special_modified_bessel_i0)
+def aten_special_modified_bessel_i0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "modified_bessel_i0")
+
+
+# special_modified_bessel_i1(Tensor self) -> Tensor
+@map_to(aten.special_modified_bessel_i1)
+def aten_special_modified_bessel_i1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "modified_bessel_i1")
+
+
+# special_modified_bessel_k0(Tensor self) -> Tensor
+@map_to(aten.special_modified_bessel_k0)
+def aten_special_modified_bessel_k0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "modified_bessel_k0")
+
+
+# special_modified_bessel_k1(Tensor self) -> Tensor
+@map_to(aten.special_modified_bessel_k1)
+def aten_special_modified_bessel_k1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "modified_bessel_k1")
+
+
+# special_ndtri(Tensor self) -> Tensor
+@map_to(aten.special_ndtri)
+def aten_special_ndtri(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "ndtri")
+
+
+# special_scaled_modified_bessel_k0(Tensor x) -> Tensor
+@map_to(aten.special_scaled_modified_bessel_k0)
+def aten_special_scaled_modified_bessel_k0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "scaled_modified_bessel_k0")
+
+
+# special_scaled_modified_bessel_k1(Tensor x) -> Tensor
+@map_to(aten.special_scaled_modified_bessel_k1)
+def aten_special_scaled_modified_bessel_k1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "scaled_modified_bessel_k1")
+
+
+# special_shifted_chebyshev_polynomial_t(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_shifted_chebyshev_polynomial_t)
+def aten_special_shifted_chebyshev_polynomial_t(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "shifted_chebyshev_polynomial_t", promote_float=True)
+
+
+# special_shifted_chebyshev_polynomial_u(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_shifted_chebyshev_polynomial_u)
+def aten_special_shifted_chebyshev_polynomial_u(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "shifted_chebyshev_polynomial_u", promote_float=True)
+
+
+# special_shifted_chebyshev_polynomial_v(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_shifted_chebyshev_polynomial_v)
+def aten_special_shifted_chebyshev_polynomial_v(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "shifted_chebyshev_polynomial_v", promote_float=True)
+
+
+# special_shifted_chebyshev_polynomial_w(Tensor x, Tensor n) -> Tensor
+@map_to(aten.special_shifted_chebyshev_polynomial_w)
+def aten_special_shifted_chebyshev_polynomial_w(
+    x: MaxTensor | Scalar, n: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(x, n, "shifted_chebyshev_polynomial_w", promote_float=True)
+
+
+# special_spherical_bessel_j0(Tensor x) -> Tensor
+@map_to(aten.special_spherical_bessel_j0)
+def aten_special_spherical_bessel_j0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "spherical_bessel_j0")
+
+
+# special_zeta(Tensor self, Tensor other) -> Tensor
+@map_to(aten.special_zeta)
+def aten_special_zeta(
+    input: MaxTensor | Scalar, other: MaxTensor | Scalar
+) -> MaxTensor:
+    return _pointwise_binary(input, other, "zeta", promote_float=True)
 
 
 # split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]
@@ -5091,6 +5691,9 @@ def aten_topk(
 
 
 # trunc(Tensor self) -> Tensor
+@map_to(aten.trunc)
+def aten_trunc(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "trunc")
 
 
 # unsqueeze(Tensor(a) self, int dim) -> Tensor(a)
