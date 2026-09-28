@@ -197,6 +197,7 @@ def _alloc(
     stype: Int32,
     device: Int,
     reads: List[T],
+    force_temp: Bool = False,
 ) raises -> Owned:
     """Where a kernel writes one result: a fresh tensor, or for an `out=`
     the caller's tensor itself.
@@ -220,12 +221,19 @@ def _alloc(
             aliased = True
     resize_out(d, shape, rank)
     assert_no_internal_overlap(d)
-    var direct = d.contig and d.stype == stype and not aliased
+    var direct = (
+        d.contig and d.stype == stype and not aliased and not force_temp
+    )
     if direct:
         var o = own(d^)
         _ = o.take()  # the caller's tensor: never released here
         return o^
     return own(new_tensor(shape, rank, stype, device))
+
+
+def _shares_storage(a: T, b: T) -> Bool:
+    """Whether two tensors are views of one (non-empty) storage."""
+    return a.storage_ptr() != 0 and a.storage_ptr() == b.storage_ptr()
 
 
 def _fresh(t: T) raises -> T:
@@ -546,9 +554,20 @@ def _outputs(
     """The pooled output and its int64 indices of `x` (the caller's `out=`
     tensors when given)."""
     var sh = _shape_with(x, n, outs)
+    # Resizing one `out=` can move a storage the other shares (`out` and
+    # `indices` two views of one buffer), so when they share one, both
+    # compute into temporaries; and every pointer is taken after the last
+    # resize (the outputs' here, the input's by `_fresh` at the launch).
+    var both = False
+    if dest.__bool__() and dest_indices.__bool__():
+        both = _shares_storage(dest.value(), dest_indices.value())
     var r = List[Owned]()
-    r.append(_alloc(dest, sh[0], sh[1], x.stype, x.device, [x.copy()]))
-    r.append(_alloc(dest_indices, sh[0], sh[1], ST_INT64, x.device, [x.copy()]))
+    r.append(_alloc(dest, sh[0], sh[1], x.stype, x.device, [x.copy()], both))
+    r.append(
+        _alloc(dest_indices, sh[0], sh[1], ST_INT64, x.device, [x.copy()], both)
+    )
+    if dest.__bool__() and not r[0].live:
+        r[0].t = T(r[0].t.h)  # the caller's `out`, re-read after both resizes
     return r^
 
 

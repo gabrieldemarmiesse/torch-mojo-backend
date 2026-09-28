@@ -755,3 +755,88 @@ def test_max_unpool_integer_dtypes(mojo_device, dtype):
     )
     got = torch.ops.aten.max_unpool2d(x.to(mojo_device), idx.to(mojo_device), [8, 8])
     torch.testing.assert_close(got.cpu(), want)
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_out_and_indices_share_a_storage(mojo_device, adaptive):
+    """`indices` past `out` in one buffer: resizing it moves the storage
+    `out` lives in, as the CPU accepts."""
+    x = torch.randn(1, 1, 4, 4)
+    buf = torch.zeros(4).to(mojo_device)
+    out = buf.view(1, 1, 2, 2)
+    indices = buf.view(torch.int64)[2:]
+    if adaptive:
+        want, want_idx = torch.ops.aten.adaptive_max_pool2d(x, [2, 2])
+        torch.ops.aten.adaptive_max_pool2d.out(
+            x.to(mojo_device), [2, 2], out=out, indices=indices
+        )
+    else:
+        want, want_idx = torch.ops.aten.max_pool2d_with_indices(x, [2])
+        torch.ops.aten.max_pool2d_with_indices.out(
+            x.to(mojo_device), [2], out=out, indices=indices
+        )
+    torch.testing.assert_close(out.cpu(), want)
+    torch.testing.assert_close(indices.cpu(), want_idx)
+
+
+def _cuda_avg_pool3d_backward(g, in_shape, k, s, p, cip, divisor):
+    """AveragePool3d.cu's backward in the dtype: stride 1 and no padding
+    sums every window's grad in float and scales by 1 / divisor once;
+    otherwise each window adds `dtype(float(grad) / divisor)` to its inputs
+    in the dtype, windows in output order."""
+    dt = g.dtype
+    isz = in_shape[-3:]
+    gin = torch.zeros(in_shape, dtype=dt)
+    stride1 = s == [1, 1, 1] and p == [0, 0, 0]
+    wide = torch.zeros(in_shape, dtype=torch.float32)
+    for out in itertools.product(*[range(o) for o in g.shape[-3:]]):
+        wins, sizes, clamped = [], 1, 1
+        for d in range(3):
+            b = out[d] * s[d] - p[d]
+            e = min(b + k[d], isz[d] + p[d])
+            sizes *= e - b
+            b, e = max(b, 0), min(e, isz[d])
+            clamped *= max(e - b, 0)
+            wins.append(slice(b, e))
+        if clamped == 0:
+            continue
+        div = divisor or (sizes if cip else clamped)
+        v = g[(..., *out)]
+        sl = (..., *wins)
+        if stride1:
+            wide[sl] += v.float()[..., None, None, None]
+        else:
+            delta = (v.float() / div).to(dt).float()[..., None, None, None]
+            gin[sl] = (gin[sl].float() + delta).to(dt)
+    if stride1:
+        div = divisor or k[0] * k[1] * k[2]
+        gin = (wide * (1.0 / div)).to(dt)
+    return gin
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("k", "s", "p", "cip", "divisor"),
+    [
+        ([2, 2, 2], [1, 1, 1], [0, 0, 0], True, None),
+        ([3, 2, 2], [1, 1, 1], [0, 0, 0], True, 5),
+        ([3, 3, 3], [2, 1, 2], [1, 1, 0], False, None),
+        ([2, 3, 2], [1, 2, 1], [1, 1, 1], True, None),
+        ([3, 3, 3], [3, 3, 3], [1, 1, 1], True, 7),
+    ],
+)
+def test_avg_pool3d_backward_rounds_like_cuda(
+    mojo_device, dtype, k, s, p, cip, divisor
+):
+    torch.manual_seed(0)
+    in_shape = (2, 2, 5, 6, 7)
+    x = torch.randn(in_shape).to(dtype)
+    out_shape = F.avg_pool3d(
+        x.float(), k, s, p, count_include_pad=cip, divisor_override=divisor
+    ).shape
+    g = (torch.randn(out_shape) * 30).to(dtype)
+    got = torch.ops.aten.avg_pool3d_backward(
+        g.to(mojo_device), x.to(mojo_device), k, s, p, False, cip, divisor
+    ).cpu()
+    want = _cuda_avg_pool3d_backward(g, in_shape, k, s, p, cip, divisor)
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
