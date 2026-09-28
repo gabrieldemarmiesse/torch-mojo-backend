@@ -48,6 +48,7 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     resize_out,
+    shares_storage,
 )
 from tmb.backend.registry import Site, impl
 
@@ -217,7 +218,7 @@ def _alloc(
     # pointer, `_repoint`), after which the pointers no longer compare.
     var aliased = False
     for r in reads:
-        if d.storage_ptr() != 0 and r.storage_ptr() == d.storage_ptr():
+        if shares_storage(d, r):
             aliased = True
     resize_out(d, shape, rank)
     assert_no_internal_overlap(d)
@@ -229,11 +230,6 @@ def _alloc(
         _ = o.take()  # the caller's tensor: never released here
         return o^
     return own(new_tensor(shape, rank, stype, device))
-
-
-def _shares_storage(a: T, b: T) -> Bool:
-    """Whether two tensors are views of one (non-empty) storage."""
-    return a.storage_ptr() != 0 and a.storage_ptr() == b.storage_ptr()
 
 
 def _fresh(t: T) raises -> T:
@@ -560,7 +556,7 @@ def _outputs(
     # resize (the outputs' here, the input's by `_fresh` at the launch).
     var both = False
     if dest.__bool__() and dest_indices.__bool__():
-        both = _shares_storage(dest.value(), dest_indices.value())
+        both = shares_storage(dest.value(), dest_indices.value())
     var r = List[Owned]()
     r.append(_alloc(dest, sh[0], sh[1], x.stype, x.device, [x.copy()], both))
     r.append(
