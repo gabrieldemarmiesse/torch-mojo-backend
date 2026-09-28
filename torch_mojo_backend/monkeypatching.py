@@ -23,8 +23,11 @@ from functools import wraps
 from typing import TYPE_CHECKING
 
 import torch
+import torch._tensor_str
 import torch.distributed.distributed_c10d as c10d
 import torch.utils._triton
+
+from torch_mojo_backend.native import device_module
 
 if TYPE_CHECKING:
     # Optional Triton dependency: its wheels are unavailable on macOS.
@@ -114,6 +117,34 @@ def stage_mojo_checkpoint_tensors():
     functools.update_wrapper(initialize, original)
     initialize._torch_mojo_backend = True  # ty: ignore[unresolved-attribute] -- idempotent patch marker
     filesystem._OverlappingCpuLoader.__init__ = initialize
+
+
+def print_apple_gpu_tensors_from_the_host():
+    """Tensor printing assumes a float64-capable device.
+
+    ``torch/_tensor_str.py``'s ``_Formatter`` runs ``isfinite``, ``abs`` and
+    ``min``/``max`` on the device, in float64 (``tensor_totype``), falling
+    back to float32 only for a hardcoded list (MPS, fp64-less XPU, MAIA).
+    Apple GPUs have no float64, so ``repr`` of any float tensor on a mojo
+    Metal device raised. Format a host copy there instead, as torch already
+    does for XLA/lazy/IPU/MTIA tensors; the ``device=`` suffix is computed by
+    the caller before this runs, so it still names the mojo device.
+    """
+    original = torch._tensor_str._tensor_str
+    if getattr(original, "_torch_mojo_backend", False):
+        return
+
+    @wraps(original)
+    def _tensor_str(self: torch.Tensor, indent: int) -> str:
+        if (
+            self.device.type == "mojo"
+            and device_module.get_device_properties(self.device).api == "metal"
+        ):
+            self = self.cpu()
+        return original(self, indent)
+
+    _tensor_str._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
+    torch._tensor_str._tensor_str = _tensor_str  # ty: ignore[invalid-assignment]
 
 
 def fix_batch_isend_irecv_for_python_process_groups():

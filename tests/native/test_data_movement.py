@@ -2416,16 +2416,10 @@ _MASKED_SELECT_DTYPES = [
 ]
 
 
-def _skip_float64_on_metal(device: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(device, "Apple GPUs have no float64")
-
-
 @pytest.mark.parametrize("dtype", _MASKED_SELECT_DTYPES)
 # (357, 789) spans many 1024-element tiles and ends on a partial one.
 @pytest.mark.parametrize("shape", [(7,), (3, 5), (357, 789), (2, 3, 4)])
 def test_masked_select(mojo_gpu, call_checker, dtype, shape):
-    _skip_float64_on_metal(mojo_gpu, dtype)
     call_checker.register("aten::masked_select")
     x = _fill(shape, dtype)
     mask = (torch.arange(x.numel()) % 3 != 1).view(shape)
@@ -2512,7 +2506,6 @@ _PRINT_CASES = {
 @pytest.mark.parametrize("case", sorted(_PRINT_CASES))
 def test_print_matches_cpu(mojo_gpu, case):
     x = _PRINT_CASES[case]()
-    _skip_float64_on_metal(mojo_gpu, x.dtype)
     dev = x.to(mojo_gpu)
     text = repr(dev)
     assert f"device='{mojo_gpu}'" in text
