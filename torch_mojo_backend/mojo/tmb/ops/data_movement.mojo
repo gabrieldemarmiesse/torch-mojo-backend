@@ -107,6 +107,7 @@ from tmb.ops.common import (
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.core import (
+    _device_copy,
     cast_for_copy,
     copy_between_devices,
     record_tensor_stream,
@@ -1260,14 +1261,9 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # to the front of `base`.
     if not out.same_shape(result.t):
         resize_out(out, result.t.shape, result.t.rank)
-    if result.t.dtype == out.dtype:
-        copy_strided_into(out, result.t)
-    elif out.contig:
-        cast_into(out, result.t)
-    else:
-        var converted = own(cast_to(result.t, out.stype))
-        copy_strided_into(out, converted.t)
-        _ = converted^
+    # copy_'s route: pairs the device cast lacks (int8/int16, float64 on
+    # Apple GPUs) convert on the host.
+    _device_copy(out, result.t)
     _ = result^  # alive past the launch
     ret_ref(rets, 0, out)
 
