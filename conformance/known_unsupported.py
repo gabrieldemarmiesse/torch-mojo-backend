@@ -241,7 +241,7 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "nn_functional_avg_pool2d": ("int64",),
     "nn_functional_avg_pool3d": ("int64",),
     "nn_functional_bilinear": ("int64",),
-    "nn_functional_conv1d": ("float32", "bfloat16", "float16", "int64"),
+    "nn_functional_conv1d": ("int64",),
     "nn_functional_conv2d": ("int64",),
     "nn_functional_conv_transpose1d": ("float32", "bfloat16", "float16", "int64"),
     "nn_functional_conv_transpose2d": ("float32", "bfloat16", "float16", "int64"),
