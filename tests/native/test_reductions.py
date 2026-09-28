@@ -560,9 +560,12 @@ def test_count_nonzero_rank0(mojo_device, dim):
 def test_count_nonzero_rank0_out_of_range_dim_raises(mojo_device):
     x = torch.tensor(5.0)
     xd = x.to(mojo_device)
-    with pytest.raises(IndexError):
+    match = (
+        "Dimension out of range \\(expected to be in range of \\[-1, 0\\], but got 1\\)"
+    )
+    with pytest.raises(IndexError, match=match):
         torch.count_nonzero(x, dim=1)
-    with pytest.raises((IndexError, NotImplementedError)):
+    with pytest.raises(IndexError, match=match):
         torch.count_nonzero(xd, dim=1)
 
 
@@ -2881,9 +2884,12 @@ def test_reduce_skeleton_rank0_matches_torch(mojo_gpu, op, dim, keepdim):
 def test_reduce_skeleton_rank0_out_of_range_dim_declines(mojo_gpu, op):
     fn = _REDUCE_OPS[op]
     x = torch.tensor(True) if op in ("all", "any") else torch.tensor(-3.5)
-    with pytest.raises(IndexError):
+    match = (
+        "Dimension out of range \\(expected to be in range of \\[-1, 0\\], but got 1\\)"
+    )
+    with pytest.raises(IndexError, match=match):
         fn(x, dim=1)
-    with pytest.raises((IndexError, NotImplementedError)):
+    with pytest.raises(IndexError, match=match):
         fn(x.to(mojo_gpu), dim=1)
 
 
@@ -2895,10 +2901,137 @@ def test_reduce_skeleton_rank0_duplicate_dim_declines(mojo_gpu, op, dims):
     refusal (confirmed on real CUDA: "dim 0 appears multiple times")."""
     fn = _REDUCE_OPS[op]
     x = torch.tensor(True) if op in ("all", "any") else torch.tensor(-3.5)
-    with pytest.raises(RuntimeError):
+    match = "dim 0 appears multiple times in the list of dims"
+    with pytest.raises(RuntimeError, match=match):
         fn(x, dim=dims)
-    with pytest.raises((RuntimeError, NotImplementedError)):
+    with pytest.raises(RuntimeError, match=match):
         fn(x.to(mojo_gpu), dim=dims)
+
+
+@pytest.mark.parametrize("op", _RANK0_GENERIC_OPS)
+@pytest.mark.parametrize("dim", [5, -5])
+def test_reduce_skeleton_rank2_out_of_range_int_dim_declines(mojo_gpu, op, dim):
+    """Rank-2 counterpart of the rank-0 test above: range is [-2, 1]."""
+    fn = _REDUCE_OPS[op]
+    x = (
+        torch.tensor([[True, False], [False, True]])
+        if op in ("all", "any")
+        else torch.randn(2, 3)
+    )
+    match = (
+        r"Dimension out of range \(expected to be in range of \[-2, 1\], but got "
+        + str(dim)
+        + r"\)"
+    )
+    with pytest.raises(IndexError, match=match):
+        fn(x, dim=dim)
+    with pytest.raises(IndexError, match=match):
+        fn(x.to(mojo_gpu), dim=dim)
+
+
+@pytest.mark.parametrize("op", _RANK0_GENERIC_OPS)
+def test_reduce_skeleton_rank2_out_of_range_dim_in_list_declines(mojo_gpu, op):
+    fn = _REDUCE_OPS[op]
+    x = (
+        torch.tensor([[True, False], [False, True]])
+        if op in ("all", "any")
+        else torch.randn(2, 3)
+    )
+    match = (
+        r"Dimension out of range \(expected to be in range of \[-2, 1\], but got 5\)"
+    )
+    with pytest.raises(IndexError, match=match):
+        fn(x, dim=[0, 5])
+    with pytest.raises(IndexError, match=match):
+        fn(x.to(mojo_gpu), dim=[0, 5])
+
+
+@pytest.mark.parametrize("op", _RANK0_GENERIC_OPS)
+@pytest.mark.parametrize("dims", [[0, 0], [1, -1], [0, -2]])
+def test_reduce_skeleton_rank2_duplicate_dim_declines(mojo_gpu, op, dims):
+    """`[1, -1]` and `[0, -2]` are aliases of the same normalized dim on a
+    rank-2 operand, same as a literal repeat."""
+    fn = _REDUCE_OPS[op]
+    x = (
+        torch.tensor([[True, False], [False, True]])
+        if op in ("all", "any")
+        else torch.randn(2, 3)
+    )
+    norm = dims[0] if dims[0] >= 0 else dims[0] + 2
+    match = f"dim {norm} appears multiple times in the list of dims"
+    with pytest.raises(RuntimeError, match=match):
+        fn(x, dim=dims)
+    with pytest.raises(RuntimeError, match=match):
+        fn(x.to(mojo_gpu), dim=dims)
+
+
+@pytest.mark.parametrize("dim", [5, -5])
+def test_prod_and_count_nonzero_rank2_out_of_range_dim_declines(mojo_gpu, dim):
+    """`prod`/`count_nonzero` take their own path (`_RANK0_GENERIC_OPS`
+    excludes them for unrelated keepdim/signature reasons) but share
+    `_reduce_dims`/`_norm_dim`, so the same IndexError applies."""
+    x = torch.randn(2, 3)
+    match = (
+        r"Dimension out of range \(expected to be in range of \[-2, 1\], but got "
+        + str(dim)
+        + r"\)"
+    )
+    with pytest.raises(IndexError, match=match):
+        torch.prod(x, dim=dim)
+    with pytest.raises(IndexError, match=match):
+        torch.prod(x.to(mojo_gpu), dim=dim)
+    with pytest.raises(IndexError, match=match):
+        torch.count_nonzero(x, dim=dim)
+    with pytest.raises(IndexError, match=match):
+        torch.count_nonzero(x.to(mojo_gpu), dim=dim)
+
+
+def test_count_nonzero_rank2_duplicate_dim_declines(mojo_gpu):
+    x = torch.randn(2, 3)
+    match = "dim 0 appears multiple times in the list of dims"
+    with pytest.raises(RuntimeError, match=match):
+        torch.count_nonzero(x, dim=[0, -2])
+    with pytest.raises(RuntimeError, match=match):
+        torch.count_nonzero(x.to(mojo_gpu), dim=[0, -2])
+
+
+def test_var_rank2_out_of_range_and_duplicate_dim_declines(mojo_gpu):
+    x = torch.randn(2, 3)
+    match_oor = (
+        r"Dimension out of range \(expected to be in range of \[-2, 1\], but got 5\)"
+    )
+    with pytest.raises(IndexError, match=match_oor):
+        torch.var(x, dim=5)
+    with pytest.raises(IndexError, match=match_oor):
+        torch.var(x.to(mojo_gpu), dim=5)
+    match_dup = "dim 0 appears multiple times in the list of dims"
+    with pytest.raises(RuntimeError, match=match_dup):
+        torch.var(x, dim=[0, -2])
+    with pytest.raises(RuntimeError, match=match_dup):
+        torch.var(x.to(mojo_gpu), dim=[0, -2])
+
+
+@pytest.mark.parametrize("fn", [torch.argmax, torch.argmin])
+def test_argreduce_rank2_out_of_range_dim_declines(mojo_gpu, fn):
+    x = torch.randn(2, 3)
+    match = (
+        r"Dimension out of range \(expected to be in range of \[-2, 1\], but got 5\)"
+    )
+    with pytest.raises(IndexError, match=match):
+        fn(x, dim=5)
+    with pytest.raises(IndexError, match=match):
+        fn(x.to(mojo_gpu), dim=5)
+
+
+def test_min_dim_rank2_out_of_range_dim_declines(mojo_gpu):
+    x = torch.randn(2, 3)
+    match = (
+        r"Dimension out of range \(expected to be in range of \[-2, 1\], but got 5\)"
+    )
+    with pytest.raises(IndexError, match=match):
+        torch.min(x, dim=5)
+    with pytest.raises(IndexError, match=match):
+        torch.min(x.to(mojo_gpu), dim=5)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int32, torch.bool])
@@ -2939,9 +3072,12 @@ def test_prod_rank0(mojo_gpu):
         torch.testing.assert_close(
             torch.prod(xd, dim=dim).cpu(), torch.prod(x, dim=dim)
         )
-    with pytest.raises(IndexError):
+    match = (
+        "Dimension out of range \\(expected to be in range of \\[-1, 0\\], but got 1\\)"
+    )
+    with pytest.raises(IndexError, match=match):
         torch.prod(x, dim=1)
-    with pytest.raises((IndexError, NotImplementedError)):
+    with pytest.raises(IndexError, match=match):
         torch.prod(xd, dim=1)
 
 
@@ -2989,9 +3125,12 @@ def test_min_dim_rank0(mojo_gpu, dim):
 
 def test_min_dim_rank0_out_of_range_declines(mojo_gpu):
     x = torch.tensor(2.5)
-    with pytest.raises(IndexError):
+    match = (
+        "Dimension out of range \\(expected to be in range of \\[-1, 0\\], but got 1\\)"
+    )
+    with pytest.raises(IndexError, match=match):
         torch.min(x, dim=1)
-    with pytest.raises((IndexError, NotImplementedError)):
+    with pytest.raises(IndexError, match=match):
         torch.min(x.to(mojo_gpu), dim=1)
 
 
@@ -3014,9 +3153,12 @@ def test_argreduce_rank0(mojo_gpu, dim, keepdim):
 
 def test_argreduce_rank0_out_of_range_declines(mojo_gpu):
     x = torch.tensor(2.5)
-    with pytest.raises(IndexError):
+    match = (
+        "Dimension out of range \\(expected to be in range of \\[-1, 0\\], but got 1\\)"
+    )
+    with pytest.raises(IndexError, match=match):
         torch.argmax(x, dim=1)
-    with pytest.raises((IndexError, NotImplementedError)):
+    with pytest.raises(IndexError, match=match):
         torch.argmax(x.to(mojo_gpu), dim=1)
 
 
@@ -3034,9 +3176,12 @@ def test_var_correction_rank0(mojo_gpu, correction):
 
 def test_var_correction_rank0_out_of_range_declines(mojo_gpu):
     x = torch.tensor(2.5)
-    with pytest.raises(IndexError):
+    match = (
+        "Dimension out of range \\(expected to be in range of \\[-1, 0\\], but got 1\\)"
+    )
+    with pytest.raises(IndexError, match=match):
         torch.var(x, dim=1)
-    with pytest.raises((IndexError, NotImplementedError)):
+    with pytest.raises(IndexError, match=match):
         torch.var(x.to(mojo_gpu), dim=1)
 
 
@@ -3180,6 +3325,20 @@ def test_cumsum_noncontiguous_input_materializes_correctly(mojo_gpu):
     result = torch.cumsum(base.to(mojo_gpu).t(), dim=1).cpu().double()
     expected = torch.cumsum(x.double(), dim=1)
     torch.testing.assert_close(result, expected, rtol=2e-3, atol=1e-2)
+
+
+@pytest.mark.parametrize("dim", [5, -5])
+def test_cumsum_rank2_out_of_range_dim_declines(mojo_gpu, dim):
+    x = torch.randn(4, 5)
+    match = (
+        r"Dimension out of range \(expected to be in range of \[-2, 1\], but got "
+        + str(dim)
+        + r"\)"
+    )
+    with pytest.raises(IndexError, match=match):
+        torch.cumsum(x, dim=dim)
+    with pytest.raises(IndexError, match=match):
+        torch.cumsum(x.to(mojo_gpu), dim=dim)
 
 
 def test_cumsum_declines_middle_dim_on_rank3(mojo_gpu):
@@ -3738,9 +3897,9 @@ def test_sort_and_topk_errors(mojo_gpu):
         torch.topk(x, 7)
     with pytest.raises(RuntimeError, match="selected index k out of range"):
         torch.topk(x, -1)
-    with pytest.raises((IndexError, RuntimeError), match="Dimension out of range"):
+    with pytest.raises(IndexError, match="Dimension out of range"):
         torch.topk(x, 2, dim=2)
-    with pytest.raises((IndexError, RuntimeError), match="Dimension out of range"):
+    with pytest.raises(IndexError, match="Dimension out of range"):
         torch.sort(x, dim=-3)
     with pytest.raises(RuntimeError, match="dtype"):
         torch.sort(
@@ -3962,7 +4121,7 @@ def test_median_and_kthvalue_errors(mojo_gpu):
         torch.kthvalue(device, 5, 1)
     with pytest.raises(RuntimeError, match="k out of range"):
         torch.kthvalue(device, 0, 1)
-    with pytest.raises((IndexError, RuntimeError), match="out of range"):
+    with pytest.raises(IndexError, match="out of range"):
         torch.median(device, 2)
     with pytest.raises((IndexError, RuntimeError), match="non-zero size"):
         torch.median(torch.empty(2, 0).to(mojo_gpu), 1)

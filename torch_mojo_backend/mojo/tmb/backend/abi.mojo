@@ -287,11 +287,18 @@ def dtype_name(stype: Int32) -> String:
 
 # --- errors -------------------------------------------------------------------
 comptime UNSUPPORTED_PREFIX = "[unsupported] "
+comptime INDEX_ERROR_PREFIX = "[index_error] "
 
 
 def unsupported(msg: String) raises:
     """Decline the call: reported to torch as NotImplementedError (rc 2)."""
     raise Error(UNSUPPORTED_PREFIX + msg)
+
+
+def index_error(msg: String) raises:
+    """Reported to torch as IndexError (rc 3), matching stock CUDA's dim
+    checks (`c10::IndexError` via `TORCH_CHECK_INDEX`)."""
+    raise Error(INDEX_ERROR_PREFIX + msg)
 
 
 def shim_error() -> String:
@@ -1182,7 +1189,8 @@ def op_entry[
     n_rets: Int32,
 ) abi("C") -> Int32:
     """The boxed-kernel signature (tmb.h TmbKernelFn) around one Mojo op.
-    rc 1 = RuntimeError, 2 = NotImplementedError (a declined call)."""
+    rc 1 = RuntimeError, 2 = NotImplementedError (a declined call),
+    3 = IndexError (an out-of-range dim, matching stock CUDA)."""
     try:
         op(args, Int(n_args), rets, Int(n_rets))
         return 0
@@ -1193,6 +1201,11 @@ def op_entry[
                 String(msg[byte = UNSUPPORTED_PREFIX.byte_length() :])
             )
             return 2
+        if msg.startswith(INDEX_ERROR_PREFIX):
+            set_shim_error(
+                String(msg[byte = INDEX_ERROR_PREFIX.byte_length() :])
+            )
+            return 3
         set_shim_error(msg)
         return 1
 
@@ -1299,8 +1312,9 @@ def call_op_raw(
     composite: the records are the same ones a kernel gets, tensor arguments
     are borrowed and tensor results come back as owned handles. Dispatch is on
     the arguments, so an op must never call *itself* this way. A declining
-    kernel comes back as `unsupported` (rc 2) and keeps that prefix, so a
-    caller with another route can tell it apart from a real failure.
+    kernel comes back as `unsupported` (rc 2) or `index_error` (rc 3) and
+    keeps that prefix, so a caller with another route can tell it apart from
+    a real failure.
     """
     var o = String(op)
     var ov = String(overload)
@@ -1314,6 +1328,8 @@ def call_op_raw(
     )
     if rc == 2:
         unsupported(shim_error())
+    if rc == 3:
+        index_error(shim_error())
     if rc != 0:
         raise Error(op, ": ", shim_error())
 

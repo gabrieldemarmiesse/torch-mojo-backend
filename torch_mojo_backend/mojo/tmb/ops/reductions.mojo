@@ -43,6 +43,7 @@ from tmb.backend.abi import (
     dtype_code,
     dtype_itemsize,
     dtype_name,
+    index_error,
     max_dtype,
     new_scalar,
     new_tensor,
@@ -257,15 +258,28 @@ def _promote(mut op: Operand, stype: Int32) raises:
 # ---------------------------------------------------------------------------
 
 
+def _dim_range_message(d: Int, ndim: Int) -> String:
+    """torch's own wording, verbatim (`maybe_wrap_dim_slow`, WrapDimMinimal.cpp).
+    """
+    return (
+        "Dimension out of range (expected to be in range of ["
+        + String(-ndim)
+        + ", "
+        + String(ndim - 1)
+        + "], but got "
+        + String(d)
+        + ")"
+    )
+
+
 def _norm_dim(d: Int, rank: Int) raises -> Int:
     """torch's `maybe_wrap_dim`, including its 0-d exception: a rank-0
     operand is wrapped as if it were a 1-d tensor of size 1, so dim 0 / -1
-    are valid (and normalize to 0) while anything else is out of range."""
+    are valid (and normalize to 0) while anything else is out of range.
+    Raises IndexError, matching stock CUDA (`TORCH_CHECK_INDEX`)."""
     var ndim = max(rank, 1)
     if d < -ndim or d >= ndim:
-        unsupported(
-            "reduce dim " + String(d) + " out of range for rank " + String(rank)
-        )
+        index_error(_dim_range_message(d, ndim))
     return d + ndim if d < 0 else d
 
 
@@ -301,19 +315,24 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
         return dims^
     if rank == 0:
         # Every valid entry normalizes to the same (only) dim, 0: a second
-        # one is necessarily a duplicate, same as torch's own refusal.
+        # one is necessarily a duplicate, same as torch's own refusal
+        # (plain RuntimeError, matching `dim_list_to_bitset`'s TORCH_CHECK).
         var seen0 = False
         for i in range(len(given)):
             _ = _norm_dim(given[i], rank)
             if seen0:
-                unsupported("duplicate reduce dim 0")
+                raise Error("dim 0 appears multiple times in the list of dims")
             seen0 = True
         return dims^
     var seen = Array[Bool, MAX_RANK](fill=False)
     for i in range(len(given)):
         var d = _norm_dim(given[i], rank)
         if seen[d]:
-            unsupported("duplicate reduce dim " + String(d))
+            raise Error(
+                "dim "
+                + String(d)
+                + " appears multiple times in the list of dims"
+            )
         seen[d] = True
     for d in range(rank):
         if seen[d]:
@@ -2303,18 +2322,7 @@ def _sort_kernel_dtype(a: T, op: StaticString) raises -> DType:
 
 def _sort_dim(a: T, dim: Int) raises -> Int:
     """ATen's `maybe_wrap_dim` for sort/topk: a 0-d tensor has one dim."""
-    var ndim = max(a.rank, 1)
-    if dim < -ndim or dim >= ndim:
-        raise Error(
-            "Dimension out of range (expected to be in range of [",
-            -ndim,
-            ", ",
-            ndim - 1,
-            "], but got ",
-            dim,
-            ")",
-        )
-    return dim + ndim if dim < 0 else dim
+    return _norm_dim(dim, a.rank)
 
 
 def _selected_shape(a: T, dim: Int, k: Int) -> IndexList[MAX_RANK]:

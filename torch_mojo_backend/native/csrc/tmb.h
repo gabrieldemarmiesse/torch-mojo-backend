@@ -56,8 +56,9 @@ typedef void* TmbGenerator;  // at::Generator*
 typedef void* TmbLibrary;    // torch::Library*
 typedef void* TmbEvent;      // backend event object (opaque to torch)
 
-// Return 0 on success, 1 for a RuntimeError, 2 for NotImplementedError; the
-// message comes from the last tmb_set_error() on this thread.
+// Return 0 on success, 1 for a RuntimeError, 2 for NotImplementedError, 3 for
+// an IndexError; the message comes from the last tmb_set_error() on this
+// thread.
 typedef int32_t (*TmbKernelFn)(void* ctx, const char* op, const char* overload,
                                const TmbValue* args, int32_t n_args,
                                TmbValue* rets, int32_t n_rets);
