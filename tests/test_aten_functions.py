@@ -1,5 +1,6 @@
 import math
 from collections.abc import Callable, Sequence
+from unittest import mock
 
 import pytest
 import torch
@@ -16,7 +17,12 @@ from torch.ops import aten  # ty: ignore[unresolved-import]
 
 from tests.conftest import Tolerance, matmul_tolerance, require_cuda_autograd
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
-from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
+from torch_mojo_backend import (
+    aten_functions,
+    custom_mojo_ops,
+    mojo_backend,
+    register_mojo_devices,
+)
 from torch_mojo_backend.testing import (
     CallChecker,
     Conf,
@@ -2178,6 +2184,171 @@ def test_aten_masked_fill__inplace_tensor(conf: Conf):
     check_outputs(fn, conf, [x, mask, value])
 
 
+def test_aten_masked_fill_broadcasts_self(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_masked_fill)
+
+    def fn(x, mask):
+        return aten.masked_fill(x, mask, 3.0)
+
+    check_outputs(fn, conf, [torch.randn(5), torch.randn(4, 5) > 0])
+
+
+@pytest.mark.parametrize("dims", [[0], [1, 2], [-1]])
+def test_aten_flip(conf: Conf, call_checker: CallChecker, dims: list[int]):
+    call_checker.register(aten_functions.aten_flip)
+
+    def fn(x):
+        return aten.flip(x, dims)
+
+    check_outputs(fn, conf, [torch.randn(3, 4, 5)])
+
+
+def test_aten_roll(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::roll")
+
+    def fn(x):
+        return torch.roll(x, (1, -2), (0, 2))
+
+    check_outputs(fn, conf, [torch.randn(3, 4, 5)])
+
+
+def test_aten_diagonal_trace(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_diagonal, "aten::trace")
+
+    def fn(x):
+        return torch.trace(x)
+
+    check_outputs(fn, conf, [torch.randn(4, 6)], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(("dim", "size", "step"), [(0, 2, 1), (1, 3, 2), (-1, 5, 1)])
+def test_aten_unfold(
+    conf: Conf, call_checker: CallChecker, dim: int, size: int, step: int
+):
+    call_checker.register(aten_functions.aten_unfold)
+
+    def fn(x):
+        return aten.unfold(x, dim, size, step) * 1
+
+    check_outputs(fn, conf, [torch.randn(4, 6, 5)])
+
+
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_aten_put(conf: Conf, call_checker: CallChecker, accumulate: bool):
+    call_checker.register(aten_functions.aten_put, "aten::put_")
+
+    def fn(x, index, source):
+        return aten.put(x, index, source, accumulate)
+
+    index = torch.tensor([3, -2, 7])
+    check_outputs(fn, conf, [torch.randn(4, 5), index, torch.randn(3)])
+
+
+def test_aten_take(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::take")
+
+    def fn(x, index):
+        return torch.take(x, index)
+
+    check_outputs(fn, conf, [torch.randn(4, 5), torch.tensor([[0, -1], [7, 19]])])
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_aten_index_fill(conf: Conf, call_checker: CallChecker, dim: int):
+    call_checker.register("aten::index_fill_.int_Scalar")
+
+    def fn(x, index):
+        return aten.index_fill(x, dim, index, -1.5)
+
+    check_outputs(fn, conf, [torch.randn(4, 5), torch.tensor([0, -1])])
+
+
+def test_aten_index_copy(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::index_copy")
+
+    def fn(x, index, source):
+        return torch.index_copy(x, 1, index, source)
+
+    check_outputs(
+        fn, conf, [torch.randn(4, 5), torch.tensor([4, 0]), torch.randn(4, 2)]
+    )
+
+
+def test_aten_masked_scatter(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::masked_scatter_")
+
+    def fn(x, mask, source):
+        return aten.masked_scatter(x, mask, source)
+
+    check_outputs(fn, conf, [torch.randn(4, 5), torch.randn(4, 5) > 0, torch.randn(20)])
+
+
+def test_aten_channel_shuffle(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::channel_shuffle")
+
+    def fn(x):
+        return torch.nn.functional.channel_shuffle(x, 3)
+
+    check_outputs(fn, conf, [torch.randn(2, 6, 3, 3)])
+
+
+def test_aten_repeat_interleave_tensor(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::repeat_interleave.Tensor")
+
+    def fn(x, repeats):
+        return torch.repeat_interleave(x, repeats, dim=0)
+
+    check_outputs(fn, conf, [torch.randn(4, 3), torch.tensor([1, 0, 3, 2])])
+
+
+@pytest.mark.parametrize("op", ["dot", "vdot"])
+def test_aten_dot_vdot(conf: Conf, call_checker: CallChecker, op: str):
+    call_checker.register(f"aten::{op}")
+
+    def fn(a, b):
+        return getattr(torch, op)(a, b)
+
+    check_outputs(fn, conf, [torch.randn(33), torch.randn(33)], rtol=1e-4, atol=1e-4)
+
+
+def test_aten_linspace_logspace(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::linspace.out", "aten::logspace.out")
+
+    def fn(x, device):
+        return (
+            torch.linspace(-2.5, 7, 9, device=device) + x,
+            torch.logspace(0, 2, 9, base=3.0, device=device) + x,
+        )
+
+    check_outputs(fn, conf, [torch.randn(9)], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("upper", [False, True])
+def test_aten_tri_indices(conf: Conf, call_checker: CallChecker, upper: bool):
+    call_checker.register(
+        aten_functions.aten_tril_indices, aten_functions.aten_triu_indices
+    )
+
+    def fn(x, device):
+        make = torch.triu_indices if upper else torch.tril_indices
+        return make(4, 5, -1, device=device) + x
+
+    check_outputs(fn, conf, [torch.tensor(1)])
+
+
+def test_aten_eye_and_equal(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::eye.m_out")
+
+    def fn(x, device):
+        return torch.eye(3, 4, device=device) + x
+
+    check_outputs(fn, conf, [torch.randn(3, 4)])
+    x = torch.randn(3, 4)
+    d = x.to(conf.device)
+    assert torch.equal(d, x.clone().to(conf.device))
+    assert not torch.equal(d, (x + 1).to(conf.device))
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
 @pytest.mark.parametrize(
     ("x_shape", "mask_shape"), [((3, 4), (3, 4)), ((3, 4), (4,)), ((), (5,))]
@@ -2746,6 +2917,119 @@ def test_aten_gelu_backward_3d_tensor(conf: Conf, dtype: torch.dtype):
         check_outputs(fn, conf, [grad_output, x], atol=1e-2, rtol=5e-2)
     else:
         check_outputs(fn, conf, [grad_output, x])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dim", [0, -1])
+def test_aten_glu(conf: Conf, call_checker: CallChecker, dtype: torch.dtype, dim: int):
+    call_checker.register(aten_functions.aten_glu)
+
+    def fn(x):
+        return aten.glu(x, dim)
+
+    x = (torch.randn(4, 6) * 3).to(dtype)
+    tol = {"atol": 1e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {}
+    check_outputs(fn, conf, [x], **tol)
+
+
+@pytest.fixture(
+    params=[
+        ("cpu", torch.float32),  # MAX's CPU target: no bfloat16 math
+        ("cuda", torch.float32),
+        ("cuda", torch.bfloat16),
+    ],
+    ids=["cpu-float32", "cuda-float32", "cuda-bfloat16"],
+)
+def glu_graph_case(
+    request: pytest.FixtureRequest, cuda_available: bool
+) -> tuple[str, torch.dtype]:
+    """Skips before `call_checker` is set up (its teardown would fail)."""
+    if request.param[0] == "cuda" and not cuda_available:
+        pytest.skip("no CUDA device")
+    return request.param
+
+
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+def test_aten_glu_backward_on_the_graph_path(
+    glu_graph_case: tuple[str, torch.dtype], call_checker: CallChecker, mode: str
+):
+    """The graph twin through torch.compile and on MAX eager tensors (the MAX
+    eager interpreter, MAX_USE_EAGER_INTERPRETER=1). On a GPU its second half
+    is the `native_glu_backward_b` custom op; on the CPU, a MAX composition
+    (the custom op runs on accelerators only)."""
+    graph_device, dtype = glu_graph_case
+    call_checker.register(aten_functions.aten_glu_backward)
+    x = (torch.randn(4, 6, 8, device=graph_device) * 3).to(dtype)
+    grad = torch.randn(4, 6, 4, device=graph_device).to(dtype)
+
+    def fn(g: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return aten.glu_backward(g, t, -1)
+
+    original = custom_mojo_ops.native_glu_backward_b
+    with mock.patch.object(
+        custom_mojo_ops, "native_glu_backward_b", wraps=original
+    ) as spy:
+        if mode == "compile":
+            got = torch.compile(fn, backend=mojo_backend, fullgraph=True)(grad, x)
+        else:
+            with F.lazy():
+                out = aten_functions.aten_glu_backward(
+                    MaxEagerTensor.from_dlpack(grad), MaxEagerTensor.from_dlpack(x), -1
+                )
+            got = torch.from_dlpack(out)
+    assert spy.call_count == (1 if graph_device == "cuda" else 0)
+    want = fn(grad.float(), x.float()).to(dtype)
+    tol = {"atol": 2e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {}
+    torch.testing.assert_close(got, want, **tol)
+
+
+def test_aten_glu_backward_empty_checks_the_grad_shape():
+    """CUDA checks the gradient's shape before its empty early return."""
+    x = MaxEagerTensor.from_dlpack(torch.zeros(0, 4))
+    grad = MaxEagerTensor.from_dlpack(torch.zeros(0, 3))
+    with pytest.raises(RuntimeError, match="grad_output.sizes"):
+        aten_functions.aten_glu_backward(grad, x, -1)
+
+
+def test_aten_glu_backward_empty_integer_is_not_an_error():
+    """CUDA returns before its dtype dispatch on an empty iterator."""
+    x = MaxEagerTensor.from_dlpack(torch.zeros(0, 4, dtype=torch.int64))
+    grad = MaxEagerTensor.from_dlpack(torch.zeros(0, 2, dtype=torch.int64))
+    out = aten_functions.aten_glu_backward(grad, x, -1)
+    assert tuple(int(d) for d in out.shape) == (0, 4)
+
+
+def test_aten_glu_integer_raises():
+    x = MaxEagerTensor.from_dlpack(torch.arange(8).reshape(2, 4))
+    with pytest.raises(RuntimeError, match="\"glu_cuda\" not implemented for 'Long'"):
+        aten_functions.aten_glu(x, -1)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_aten_glu_backward_dtypes(
+    conf: Conf, call_checker: CallChecker, dtype: torch.dtype
+):
+    call_checker.register(aten_functions.aten_glu_backward)
+
+    def fn(grad, x):
+        return aten.glu_backward(grad, x, -1)
+
+    x = (torch.randn(3, 5, 8) * 3).to(dtype)
+    grad = torch.randn(3, 5, 4).to(dtype)
+    tol = {"atol": 2e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {}
+    check_outputs(fn, conf, [grad, x], **tol)
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_aten_glu_backward(conf: Conf, call_checker: CallChecker, dim: int):
+    call_checker.register(aten_functions.aten_glu_backward)
+
+    def fn(grad, x):
+        return aten.glu_backward(grad, x, dim)
+
+    x = torch.randn(4, 6) * 3
+    grad = torch.randn(2, 6) if dim == 0 else torch.randn(4, 3)
+    check_outputs(fn, conf, [grad, x])
 
 
 def test_aten_gelu_backward_tanh_approx(conf: Conf):
@@ -3463,6 +3747,92 @@ def test_aten_reflection_pad2d_compile_rejects_padding_ge_input_dim():
 
     with pytest.raises(RuntimeError, match="Padding size should be less than"):
         torch.compile(fn, backend=mojo_backend)(torch.randn(2, 3, 4, 4))
+
+
+# ---------------------------------------------------------------------------
+# reflection / replication padding of every rank and nearest / linear /
+# cubic upsampling (tmb/ops/resample.mojo on the mojo device; the compile
+# backend reaches them through torch's own decompositions, except the 2-d
+# pads and upsample_bilinear2d, which have twins above)
+# ---------------------------------------------------------------------------
+
+_RESAMPLE_PAD_CASES = [
+    ((2, 3, 7), (2, 3)),
+    ((2, 3, 6, 5), (1, 4, 0, 5)),
+    ((2, 2, 4, 5, 6), (1, 2, 3, 0, 2, 3)),
+]
+
+
+@pytest.mark.parametrize("mode", ["reflect", "replicate"])
+@pytest.mark.parametrize(("shape", "padding"), _RESAMPLE_PAD_CASES)
+def test_aten_pad_nd(
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    padding: tuple[int, ...],
+    call_checker: CallChecker,
+):
+    base = "reflection" if mode == "reflect" else "replication"
+    call_checker.register(f"aten::{base}_pad{len(padding) // 2}d")
+
+    def fn(x):
+        return torch.nn.functional.pad(x, padding, mode=mode)
+
+    check_outputs(fn, conf, [torch.randn(shape)])
+
+
+_RESAMPLE_UP_CASES = [
+    ("nearest", (2, 3, 5), {"size": (8,)}, "upsample_nearest1d"),
+    ("nearest", (2, 3, 5, 4, 3), {"size": (7, 2, 5)}, "upsample_nearest3d"),
+    ("nearest-exact", (2, 3, 5, 4), {"size": (3, 9)}, "_upsample_nearest_exact2d"),
+    ("linear", (2, 3, 5), {"scale_factor": 1.7}, "upsample_linear1d"),
+    ("bicubic", (2, 3, 5, 4), {"size": (7, 9)}, "upsample_bicubic2d"),
+    (
+        "trilinear",
+        (2, 3, 5, 4, 3),
+        {"size": (7, 2, 5), "align_corners": True},
+        "upsample_trilinear3d",
+    ),
+    (
+        "bilinear",
+        (2, 3, 10, 20),
+        {"size": (3, 7), "antialias": True},
+        "_upsample_bilinear2d_aa",
+    ),
+]
+
+
+@pytest.mark.parametrize(("mode", "shape", "kwargs", "op"), _RESAMPLE_UP_CASES)
+def test_aten_upsample_nd(
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    kwargs,
+    op: str,
+    call_checker: CallChecker,
+):
+    call_checker.register(f"aten::{op}")
+
+    def fn(x):
+        return torch.nn.functional.interpolate(x, mode=mode, **kwargs)
+
+    check_outputs(fn, conf, [torch.randn(shape)], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize(
+    ("mode", "shape", "kwargs"),
+    [(m, s, k) for m, s, k, _ in _RESAMPLE_UP_CASES if "antialias" not in k],
+)
+def test_aten_upsample_nd_compile(
+    conf: Conf, mode: str, shape: tuple[int, ...], kwargs
+):
+    """No twin: torch's decompositions lower these for the graph."""
+
+    def fn(x):
+        return torch.nn.functional.interpolate(x, mode=mode, **kwargs)
+
+    check_outputs(fn, conf, [torch.randn(shape)], atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

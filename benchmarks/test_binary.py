@@ -111,6 +111,10 @@ ACT_BACKWARD_OPS = {
     "elu_backward": lambda g, x: torch.ops.aten.elu_backward(
         g, 1.0, 1.0, 1.0, False, x
     ),
+    # glu_backward: `x` halved along its (even) last dim, `g` of the half shape.
+    "glu_backward": lambda g, x: torch.ops.aten.glu_backward(
+        g[..., : x.shape[-1] // 2], x[..., : x.shape[-1] // 2 * 2], -1
+    ),
     "hardshrink_backward": lambda g, x: torch.ops.aten.hardshrink_backward(g, x, 0.5),
     "hardsigmoid_backward": torch.ops.aten.hardsigmoid_backward,
     "hardswish_backward": torch.ops.aten.hardswish_backward,
@@ -258,6 +262,7 @@ SKIPPED: dict[str, str] = {
     "aten::frexp.Tensor_out": _OUT,
     "aten::gcd.out": _OUT,
     "aten::gelu_backward.grad_input": _OUT,
+    "aten::glu_backward.grad_input": _OUT,
     "aten::hardshrink_backward.grad_input": _OUT,
     "aten::hardsigmoid_backward.grad_input": _OUT,
     "aten::hardtanh_backward.grad_input": _OUT,

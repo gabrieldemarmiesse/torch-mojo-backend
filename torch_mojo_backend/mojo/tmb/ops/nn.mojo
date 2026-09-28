@@ -1,7 +1,7 @@
 """ATen ops: nn group (see agents_docs/native_backend.md).
 
 Softmax family, normalization (layer / batch / group), NLL loss, embedding,
-2-D pooling and bilinear upsampling. Ported from the old Python fast path
+pooling lives in pooling.mojo, upsampling in resample.mojo. Ported from the old Python fast path
 (`eager_kernels/aten_fast.py`): same dtype gating, same route cascade (which
 kernel for which dtype / layout / device), same output allocation and the same
 kernel slot lists.
@@ -49,7 +49,7 @@ from tmb.backend.abi import (
     v_is_none,
     v_tensor,
 )
-from tmb.backend.device import ctx_for, ctx_ptr
+from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK, _f64_slot
 from tmb.ops.common import (
@@ -106,14 +106,6 @@ def _bool_list(v: Value) raises -> List[Bool]:
     for i in range(Int(v.len)):
         out.append(p[unsafe_offset=i] != 0)
     return out^
-
-
-def _pair(l: IntList, what: StaticString) raises -> Tuple[Int, Int]:
-    if len(l) == 1:
-        return (l[0], l[0])
-    if len(l) == 2:
-        return (l[0], l[1])
-    raise Error(what, " must have one or two entries, got ", len(l))
 
 
 struct Held(Movable):
@@ -225,6 +217,27 @@ def _spec_unary(family: String, op: String, src: T, dst: T) raises:
     _ = ctx
 
 
+def _softmax_launch(
+    family: String, op: String, log_variant: Bool, src: T, dst: T
+) raises:
+    """One trailing-dim (log-)softmax launch; the float64 kernel takes the
+    variant as a flag, the others are one op per variant."""
+    if op != "SoftmaxF64Spec":
+        _spec_unary(family, op, src, dst)
+        return
+    _one_device(src, dst)
+    var ctx = ctx_for(dst.device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall(family, op)
+    call.arg_dtype(0, src.dtype)
+    call.out_dtype(dst.dtype)
+    call.spec(src.spec(cp))
+    call.spec(dst.spec(cp))
+    call.int(1 if log_variant else 0)
+    call.run()
+    _ = ctx
+
+
 def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
     """`aten::_softmax` / `aten::_log_softmax`.
 
@@ -240,7 +253,11 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
     var dim = v_int(args[unsafe_offset=1])
     var half_to_float = v_bool(args[unsafe_offset=2])
     _require_mojo(self, "softmax")
-    if not _is_float(self.dtype):
+    if self.dtype == DType.float64:
+        # `softmax(x, d, dtype=torch.float64)` casts before it gets here.
+        if dev(self.device)[].api == "metal":
+            unsupported("softmax float64 is unavailable on Apple GPUs")
+    elif not _is_float(self.dtype):
         unsupported("softmax of dtype " + String(self.dtype))
     var work_stype = self.stype
     if half_to_float:
@@ -275,7 +292,9 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
         dim += rank
     var family = String("nn")
     var op = String("SoftmaxSpec")
-    if log_variant:
+    if work.t.dtype == DType.float64:
+        op = String("SoftmaxF64Spec")
+    elif log_variant:
         family = String("reduction")
         op = String("LogSoftmaxSpec")
     if dim == rank - 1:
@@ -283,7 +302,7 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
         var out = own(
             new_tensor(work.t.shape, rank, work.t.stype, work.t.device)
         )
-        _spec_unary(family, op, src.t, out.t)
+        _softmax_launch(family, op, log_variant, src.t, out.t)
         _ = work.t.ptr  # src may borrow work's storage; keep it past the call
         ret_owned(rets, 0, out)
         return
@@ -292,7 +311,7 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
     var view = own(view_strided(work.t, vshape, vstrides, rank, work.t.offset))
     var src = _mat(view.t)
     var tmp = own(new_tensor(vshape, rank, work.t.stype, work.t.device))
-    _spec_unary(family, op, src.t, tmp.t)
+    _softmax_launch(family, op, log_variant, src.t, tmp.t)
     # ATen hands back a contiguous result, so the second swap is a strided
     # write into a fresh contiguous output rather than a returned view.
     var out = own(new_tensor(work.t.shape, rank, work.t.stype, work.t.device))
@@ -1542,313 +1561,18 @@ def op_embedding_dense_backward(
     ret_owned(rets, 0, out)
 
 
-# ---------------------------------------------------------------------------
-# Pooling and bilinear upsampling (nn, NCHW)
-# ---------------------------------------------------------------------------
-
-
-def _nchw(t: T, what: StaticString) raises:
-    _require_mojo(t, what)
-    if t.numel == 0 or not _is_float(t.dtype) or t.rank != 4:
-        unsupported(String(what) + " covers a non-empty float NCHW tensor")
-
-
-def _pool_shape(n: Int, c: Int, h: Int, w: Int) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - 4] = n
-    shape[MAX_RANK - 3] = c
-    shape[MAX_RANK - 2] = h
-    shape[MAX_RANK - 1] = w
-    return shape
-
-
-# aten::max_pool2d_with_indices(Tensor self, int[2] kernel_size,
-#   int[2] stride=[], int[2] padding=0, int[2] dilation=1,
-#   bool ceil_mode=False) -> (Tensor, Tensor)
-def op_max_pool2d_with_indices(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    _nchw(a, "max_pool2d")
-    var kernel = IntList(args[unsafe_offset=1])
-    var stride = IntList(args[unsafe_offset=2])
-    var k = _pair(kernel, "kernel_size")
-    var s = k
-    if len(stride) > 0:
-        s = _pair(stride, "stride")
-    var p = _pair(IntList(args[unsafe_offset=3]), "padding")
-    var d = _pair(IntList(args[unsafe_offset=4]), "dilation")
-    if v_bool(args[unsafe_offset=5]):
-        unsupported("max_pool2d with ceil_mode=True")
-    var in_h = a.dim(2)
-    var in_w = a.dim(3)
-    var out_h = (in_h + 2 * p[0] - (d[0] * (k[0] - 1) + 1)) // s[0] + 1
-    var out_w = (in_w + 2 * p[1] - (d[1] * (k[1] - 1) + 1)) // s[1] + 1
-    if out_h <= 0 or out_w <= 0:
-        unsupported("max_pool2d: empty output")
-    var planes = a.dim(0) * a.dim(1)
-    var shape = _pool_shape(a.dim(0), a.dim(1), out_h, out_w)
-    var am = _mat(a)
-    var out = own(new_tensor(shape, 4, a.stype, a.device))
-    var idx = own(new_tensor(shape, 4, ST_INT64, a.device))
-    var ctx = ctx_for(a.device)
-    var call = KernelCall("nn", "MaxPool2dWithIndices")
-    call.arg_dtype(0, a.dtype)
-    call.out_dtype_i(0, out.t.dtype)
-    call.out_dtype_i(1, DType.int64)
-    call.int(out.t.ptr)
-    call.int(idx.t.ptr)
-    call.int(am.t.ptr)
-    var params = List[Int]()
-    params.append(in_h)
-    params.append(in_w)
-    params.append(out_h)
-    params.append(out_w)
-    params.append(k[0])
-    params.append(k[1])
-    params.append(s[0])
-    params.append(s[1])
-    params.append(p[0])
-    params.append(p[1])
-    params.append(d[0])
-    params.append(d[1])
-    params.append(planes)
-    call.tuple(params)
-    call.int(dtype_code(a.dtype))
-    call.int(ctx_ptr(ctx))
-    call.run()
-    _ = am.t.ptr
-    _ = ctx
-    ret_owned(rets, 0, out)
-    ret_owned(rets, 1, idx)
-
-
-# aten::avg_pool2d(Tensor self, int[2] kernel_size, int[2] stride=[],
-#   int[2] padding=0, bool ceil_mode=False, bool count_include_pad=True,
-#   int? divisor_override=None) -> Tensor
-def op_avg_pool2d(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    _nchw(a, "avg_pool2d")
-    var kernel = IntList(args[unsafe_offset=1])
-    var stride = IntList(args[unsafe_offset=2])
-    var k = _pair(kernel, "kernel_size")
-    var s = k
-    if len(stride) > 0:
-        s = _pair(stride, "stride")
-    var p = _pair(IntList(args[unsafe_offset=3]), "padding")
-    if v_bool(args[unsafe_offset=4]):
-        unsupported("avg_pool2d with ceil_mode=True")
-    var count_include_pad = v_bool(args[unsafe_offset=5])
-    var has_div = not v_is_none(args[unsafe_offset=6])
-    var div = 0
-    if has_div:
-        div = v_int(args[unsafe_offset=6])
-    if has_div and div == 0:
-        raise Error("avg_pool2d: divisor_override must not be zero")
-    var in_h = a.dim(2)
-    var in_w = a.dim(3)
-    var out_h = (in_h + 2 * p[0] - k[0]) // s[0] + 1
-    var out_w = (in_w + 2 * p[1] - k[1]) // s[1] + 1
-    if out_h <= 0 or out_w <= 0:
-        unsupported("avg_pool2d: empty output")
-    var shape = _pool_shape(a.dim(0), a.dim(1), out_h, out_w)
-    var am = _mat(a)
-    var out = own(new_tensor(shape, 4, a.stype, a.device))
-    var ctx = ctx_for(a.device)
-    var call = KernelCall("nn", "AvgPool2d")
-    call.arg_dtype(0, a.dtype)
-    call.out_dtype(out.t.dtype)
-    call.flag("COUNT_INCLUDE_PAD", 1 if count_include_pad else 0)
-    call.flag("HAS_DIVISOR_OVERRIDE", 1 if has_div else 0)
-    call.int(out.t.ptr)
-    call.int(am.t.ptr)
-    var params = List[Int]()
-    params.append(in_h)
-    params.append(in_w)
-    params.append(out_h)
-    params.append(out_w)
-    params.append(k[0])
-    params.append(k[1])
-    params.append(s[0])
-    params.append(s[1])
-    params.append(p[0])
-    params.append(p[1])
-    params.append(1 if count_include_pad else 0)
-    params.append(div)
-    params.append(a.dim(0) * a.dim(1))
-    call.tuple(params)
-    call.int(dtype_code(a.dtype))
-    call.int(ctx_ptr(ctx))
-    call.run()
-    _ = am.t.ptr
-    _ = ctx
-    ret_owned(rets, 0, out)
-
-
-# aten::_adaptive_avg_pool2d(Tensor self, SymInt[2] output_size) -> Tensor
-def op_adaptive_avg_pool2d(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    _nchw(a, "_adaptive_avg_pool2d")
-    var osize = _pair(IntList(args[unsafe_offset=1]), "output_size")
-    if osize[0] <= 0 or osize[1] <= 0:
-        unsupported("_adaptive_avg_pool2d: empty output")
-    var shape = _pool_shape(a.dim(0), a.dim(1), osize[0], osize[1])
-    var am = _mat(a)
-    var out = own(new_tensor(shape, 4, a.stype, a.device))
-    var ctx = ctx_for(a.device)
-    var call = KernelCall("nn", "AdaptiveAvgPool2d")
-    call.arg_dtype(0, a.dtype)
-    call.out_dtype(out.t.dtype)
-    call.int(out.t.ptr)
-    call.int(am.t.ptr)
-    var params = List[Int]()
-    params.append(a.dim(2))
-    params.append(a.dim(3))
-    params.append(osize[0])
-    params.append(osize[1])
-    params.append(a.dim(0) * a.dim(1))
-    call.tuple(params)
-    call.int(dtype_code(a.dtype))
-    call.int(ctx_ptr(ctx))
-    call.run()
-    _ = am.t.ptr
-    _ = ctx
-    ret_owned(rets, 0, out)
-
-
-def _area_pixel_scale(
-    in_size: Int, out_size: Int, align_corners: Bool, scale: Float64
-) -> Float64:
-    """torch's `area_pixel_compute_scale` for one axis (scale <= 0 = unset)."""
-    if align_corners:
-        if out_size <= 1:
-            return 0.0
-        return Float64(in_size - 1) / Float64(out_size - 1)
-    if scale > 0.0:
-        return 1.0 / scale
-    return Float64(in_size) / Float64(out_size)
-
-
-# aten::upsample_bilinear2d(Tensor self, SymInt[2] output_size,
-#   bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
-def op_upsample_bilinear2d(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    _nchw(a, "upsample_bilinear2d")
-    var osize = _pair(IntList(args[unsafe_offset=1]), "output_size")
-    var align_corners = v_bool(args[unsafe_offset=2])
-    var scale_h = -1.0
-    var scale_w = -1.0
-    if not v_is_none(args[unsafe_offset=3]):
-        scale_h = v_f64(args[unsafe_offset=3])
-    if not v_is_none(args[unsafe_offset=4]):
-        scale_w = v_f64(args[unsafe_offset=4])
-    if osize[0] <= 0 or osize[1] <= 0:
-        unsupported("upsample_bilinear2d: empty output")
-    var in_h = a.dim(2)
-    var in_w = a.dim(3)
-    var ratio_h = _area_pixel_scale(in_h, osize[0], align_corners, scale_h)
-    var ratio_w = _area_pixel_scale(in_w, osize[1], align_corners, scale_w)
-    var shape = _pool_shape(a.dim(0), a.dim(1), osize[0], osize[1])
-    var am = _mat(a)
-    var out = own(new_tensor(shape, 4, a.stype, a.device))
-    var ctx = ctx_for(a.device)
-    var call = KernelCall("nn", "UpsampleBilinear2d")
-    call.arg_dtype(0, a.dtype)
-    call.out_dtype(out.t.dtype)
-    call.flag("ALIGN_CORNERS", 1 if align_corners else 0)
-    call.int(out.t.ptr)
-    call.int(am.t.ptr)
-    var params = List[Int]()
-    params.append(_f64_slot(ratio_h))
-    params.append(_f64_slot(ratio_w))
-    params.append(in_h)
-    params.append(in_w)
-    params.append(osize[0])
-    params.append(osize[1])
-    params.append(a.dim(0) * a.dim(1))
-    params.append(1 if align_corners else 0)
-    call.tuple(params)
-    call.int(dtype_code(a.dtype))
-    call.int(ctx_ptr(ctx))
-    call.run()
-    _ = am.t.ptr
-    _ = ctx
-    ret_owned(rets, 0, out)
-
-
-# aten::upsample_nearest2d(Tensor self, SymInt[2] output_size,
-#   float? scales_h=None, float? scales_w=None) -> Tensor
-def op_upsample_nearest2d(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    """`F.interpolate(mode="nearest")`: the `.vec` overload is composite over
-    this one. torch_mojo_backend has no `upsample_nearest2d_backward` yet, so
-    a backward through it declines there."""
-    var a = v_tensor(args[unsafe_offset=0])
-    _nchw(a, "upsample_nearest2d")
-    var osize = _pair(IntList(args[unsafe_offset=1]), "output_size")
-    if osize[0] <= 0 or osize[1] <= 0:
-        unsupported("upsample_nearest2d: empty output")
-    var in_h = a.dim(2)
-    var in_w = a.dim(3)
-    # torch's compute_scales_value: the given scale's reciprocal, else the
-    # size ratio.
-    var ratio_h = Float64(in_h) / Float64(osize[0])
-    var ratio_w = Float64(in_w) / Float64(osize[1])
-    if not v_is_none(args[unsafe_offset=2]):
-        var sh = v_f64(args[unsafe_offset=2])
-        if sh > 0.0:
-            ratio_h = 1.0 / sh
-    if not v_is_none(args[unsafe_offset=3]):
-        var sw = v_f64(args[unsafe_offset=3])
-        if sw > 0.0:
-            ratio_w = 1.0 / sw
-    var shape = _pool_shape(a.dim(0), a.dim(1), osize[0], osize[1])
-    var am = _mat(a)
-    var out = own(new_tensor(shape, 4, a.stype, a.device))
-    var ctx = ctx_for(a.device)
-    var call = KernelCall("nn", "UpsampleNearest2d")
-    call.arg_dtype(0, a.dtype)
-    call.int(out.t.ptr)
-    call.int(am.t.ptr)
-    var params = List[Int]()
-    params.append(_f64_slot(ratio_h))
-    params.append(_f64_slot(ratio_w))
-    params.append(in_h)
-    params.append(in_w)
-    params.append(osize[0])
-    params.append(osize[1])
-    params.append(a.dim(0) * a.dim(1))
-    call.tuple(params)
-    call.int(dtype_code(a.dtype))
-    call.int(ctx_ptr(ctx))
-    call.run()
-    _ = am.t.ptr
-    _ = ctx
-    ret_owned(rets, 0, out)
-
-
 def register_nn(site: Site) raises:
-    impl[op_adaptive_avg_pool2d, "_adaptive_avg_pool2d"](site)
     impl[op_log_softmax, "_log_softmax"](site)
     impl[op_log_softmax_backward_data, "_log_softmax_backward_data"](site)
     impl[
         op_batch_norm_legit_no_training, "_native_batch_norm_legit_no_training"
     ](site)
     impl[op_softmax, "_softmax"](site)
-    impl[op_avg_pool2d, "avg_pool2d"](site)
     impl[op_embedding, "embedding"](site)
     impl[op_embedding_dense_backward, "embedding_dense_backward"](site)
-    impl[op_max_pool2d_with_indices, "max_pool2d_with_indices"](site)
     impl[op_native_batch_norm, "native_batch_norm"](site)
     impl[op_native_group_norm, "native_group_norm"](site)
     impl[op_native_layer_norm, "native_layer_norm"](site)
     impl[op_native_layer_norm_backward, "native_layer_norm_backward"](site)
     impl[op_nll_loss_backward_grad_input, "nll_loss_backward.grad_input"](site)
     impl[op_nll_loss_forward_output, "nll_loss_forward.output"](site)
-    impl[op_upsample_bilinear2d, "upsample_bilinear2d"](site)
-    impl[op_upsample_nearest2d, "upsample_nearest2d"](site)

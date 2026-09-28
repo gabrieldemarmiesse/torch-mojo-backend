@@ -2840,6 +2840,33 @@ def aten_detach(input: MaxTensor) -> MaxTensor:
 
 
 # diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)
+@map_to(aten.diagonal)
+def aten_diagonal(
+    input: MaxTensor, offset: int = 0, dim1: int = 0, dim2: int = 1
+) -> MaxTensor:
+    """``input[..., i, i + offset]`` over ``dim1``/``dim2``, as a new last
+    axis (the graph has no views: this is the copy a view would read).
+
+    The two axes move to the end and flatten, so element ``(i, i + offset)``
+    sits at ``i * n2 + i + offset`` and one ``F.gather`` picks the diagonal.
+    Static extents only: the diagonal's length is computed here.
+    """
+    rank = len(input.shape)
+    dim1, dim2 = dim1 % rank, dim2 % rank
+    if dim1 == dim2:
+        raise ValueError("diagonal dimensions cannot be identical")
+    n1, n2 = int(input.shape[dim1]), int(input.shape[dim2])
+    rest = [a for a in range(rank) if a not in (dim1, dim2)]
+    moved = F.permute(input, [*rest, dim1, dim2])
+    flat = F.reshape(moved, [*(input.shape[a] for a in rest), n1 * n2])
+    first_row = max(0, -offset)
+    length = max(0, min(n1 - first_row, n2 - first_row - offset))
+    if length == 0:
+        zero = F.constant(0, dtype=input.dtype, device=input.device)
+        return _broadcast_to(zero, [*(input.shape[a] for a in rest), 0])
+    positions = [(first_row + i) * (n2 + 1) + offset for i in range(length)]
+    index = F.constant(positions, dtype=DType.int64, device=input.device)
+    return F.gather(flat, index, axis=len(rest))
 
 
 # digamma(Tensor self) -> Tensor
@@ -3222,6 +3249,23 @@ def aten_fill__scalar(input: MaxTensor, value: Scalar) -> MaxTensor:
 
 
 # flip(Tensor self, int[] dims) -> Tensor
+@map_to(aten.flip)
+def aten_flip(input: MaxTensor, dims: list[int]) -> MaxTensor:
+    """Each listed axis read backwards: an ``F.gather`` with the reversed
+    iota ``n - 1, ..., 0`` along it (static extents)."""
+    rank = len(input.shape)
+    result = input
+    for dim in sorted({d % max(rank, 1) for d in dims}):
+        if rank == 0:
+            break
+        n = int(input.shape[dim])
+        if n <= 1:
+            continue
+        index = F.constant(
+            list(range(n - 1, -1, -1)), dtype=DType.int64, device=input.device
+        )
+        result = F.gather(result, index, axis=dim)
+    return result
 
 
 # floor(Tensor self) -> Tensor
@@ -3414,6 +3458,120 @@ def aten_gelu_backward(
         )
 
     return custom_mojo_ops.gelu_backward(grad_output, input, approximate=approximate)
+
+
+# glu(Tensor self, int dim=-1) -> Tensor
+@map_to(aten.glu)
+def aten_glu(input: MaxTensor, dim: int = -1) -> MaxTensor:
+    """a * sigmoid(b) over the two halves along `dim`, one fused pointwise
+    op (ActivationGluKernel.cu's glu_kernel, halves computed in float)."""
+    _glu_check_floating(input, "glu_cuda")
+    a, b = _glu_halves(input, dim)
+    return custom_mojo_ops.pointwise_binary(a, b, "glu")
+
+
+# glu_backward(Tensor grad_output, Tensor self, int dim) -> Tensor
+@map_to(aten.glu_backward)
+def aten_glu_backward(grad_output: MaxTensor, input: MaxTensor, dim: int) -> MaxTensor:
+    """glu_backward_kernel, both halves on the mojo device's own pointwise
+    kinds: `glu_backward_a` (sigmoid(b) * grad, a fusible binary op) and, on
+    one GPU, `glu_backward_b` ((1 - sigmoid(b)) * sigmoid(b) * grad * a, a
+    three-operand custom op; a MAX composition elsewhere), concatenated
+    along `dim`."""
+    if grad_output.dtype != input.dtype:
+        raise RuntimeError(
+            f"Found dtype {_scalar_type_name(grad_output.dtype)} but expected "
+            f"{_scalar_type_name(input.dtype)}"
+        )
+    a, b = _glu_halves(input, dim)
+    if not _same_static_shape(grad_output, a):
+        # glu_backward_cuda_out's TORCH_CHECK, before its empty early return.
+        raise RuntimeError(
+            "Expected grad_output.sizes() == IntArrayRef{iter_shape} to be true, "
+            "but got false."
+        )
+    if any(isinstance(d, StaticDim) and int(d) == 0 for d in input.shape):
+        # glu_backward_cuda_out returns before its dtype dispatch when the
+        # iterator is empty: an empty integer input is not an error. The
+        # (empty) gradient of the input's shape.
+        return F.concat([grad_output, grad_output], axis=dim)
+    _glu_check_floating(input, "glu_backward_cuda")
+    grad_a = custom_mojo_ops.pointwise_binary(grad_output, b, "glu_backward_a")
+    if _native_kernel_operands(grad_output, input):
+        shape = grad_output.shape
+        flat = [F.reshape(x, [-1]) for x in (grad_output, a, b)]
+        grad_b = F.reshape(custom_mojo_ops.native_glu_backward_b(*flat), shape)
+    else:
+        # Off the GPU (or with the native kernels switched off): the same
+        # math as a MAX composition, in float for the half types.
+        wide = input.dtype in (DType.float16, DType.bfloat16)
+        g, a32, b32 = grad_output, a, b
+        if wide:
+            g, a32, b32 = (F.cast(x, DType.float32) for x in (g, a, b))
+        sig = custom_mojo_ops.elementwise(b32, "sigmoid")
+        grad_b = (1 - sig) * sig * g * a32
+        if wide:
+            grad_b = F.cast(grad_b, input.dtype)
+    return F.concat([grad_a, grad_b], axis=dim)
+
+
+def _same_static_shape(x: MaxTensor, y: MaxTensor) -> bool:
+    """False only for shapes that provably differ (a symbolic dim matches)."""
+    if len(x.shape) != len(y.shape):
+        return False
+    return all(
+        not (isinstance(p, StaticDim) and isinstance(q, StaticDim)) or int(p) == int(q)
+        for p, q in zip(x.shape, y.shape, strict=True)
+    )
+
+
+def _scalar_type_name(dtype: DType) -> str:
+    """How ATen names a ScalarType in its messages (`Long`, `Half`, ...)."""
+    return {
+        DType.float64: "Double",
+        DType.float32: "Float",
+        DType.float16: "Half",
+        DType.bfloat16: "BFloat16",
+        DType.int64: "Long",
+        DType.int32: "Int",
+        DType.int16: "Short",
+        DType.int8: "Char",
+        DType.uint8: "Byte",
+        DType.bool: "Bool",
+    }.get(dtype, str(dtype))
+
+
+def _glu_check_floating(input: MaxTensor, kernel: str):
+    """AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16): anything else raises
+    `"<kernel>" not implemented for '<type>'`."""
+    if input.dtype not in (DType.float64, DType.float32, DType.float16, DType.bfloat16):
+        raise RuntimeError(
+            f"\"{kernel}\" not implemented for '{_scalar_type_name(input.dtype)}'"
+        )
+
+
+def _glu_halves(input: MaxTensor, dim: int) -> tuple[MaxTensor, MaxTensor]:
+    """GatedLinearUnit's checks and the two halves along `dim`."""
+    rank = len(input.shape)
+    if rank == 0:
+        raise ValueError(
+            "glu does not support scalars because halving size must be even"
+        )
+    if not -rank <= dim < rank:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of [{-rank}, {rank - 1}], "
+            f"but got {dim})"
+        )
+    dim = dim % rank
+    size = input.shape[dim]
+    if not isinstance(size, StaticDim):
+        raise NotImplementedError("glu over a symbolic dimension")
+    n = int(size)
+    if n % 2 != 0:
+        raise ValueError(
+            f"Halving dimension must be even, but dimension {dim} is size {n}"
+        )
+    return aten_slice(input, dim, 0, n // 2), aten_slice(input, dim, n // 2, n)
 
 
 # grid_sampler_2d(Tensor input, Tensor grid, int interpolation_mode, int padding_mode, bool align_corners) -> Tensor
@@ -4031,6 +4189,27 @@ def aten_lt(input: MaxTensor, other: Scalar | MaxTensor) -> MaxTensor:
 
 
 # masked_scatter(Tensor self, Tensor mask, Tensor source) -> Tensor
+
+
+# put(Tensor self, Tensor index, Tensor source, bool accumulate=False) -> Tensor
+@map_to(aten.put)
+def aten_put(
+    input: MaxTensor, index: MaxTensor, source: MaxTensor, accumulate: bool = False
+) -> MaxTensor:
+    """``input.flatten()[index] = source`` (``+=`` when ``accumulate``),
+    negative indices wrapped once as ATen's put kernels do, through the
+    ``_nd`` scatters (the axis-based ones have no GPU kernel)."""
+    numel = 1
+    for d in input.shape:
+        numel *= int(d)
+    flat = F.reshape(input, [numel])
+    idx = F.reshape(index, [-1])
+    zero = F.constant(0, dtype=idx.dtype, device=idx.device)
+    size = F.constant(numel, dtype=idx.dtype, device=idx.device)
+    idx = _where(idx < zero, idx + size, idx)
+    updates = F.reshape(source, [-1])
+    scatter = F.scatter_nd_add if accumulate else F.scatter_nd
+    return F.reshape(scatter(flat, updates, F.unsqueeze(idx, -1)), input.shape)
 
 
 # max.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
@@ -5051,6 +5230,7 @@ def aten_scalar_tensor(
     dtype: torch.dtype | None = None,
     layout: torch.layout | None = None,
     device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> MaxTensor:
     if dtype is None:
         dtype = torch.float32
@@ -5696,6 +5876,32 @@ def aten_trunc(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "trunc")
 
 
+# unfold(Tensor(a) self, int dimension, int size, int step) -> Tensor(a)
+@map_to(aten.unfold)
+def aten_unfold(input: MaxTensor, dimension: int, size: int, step: int) -> MaxTensor:
+    """Every window of ``size`` elements ``step`` apart along ``dimension``,
+    as a new last axis: one ``F.gather`` with the (windows, size) index
+    ``w * step + k``, then the window axis moved to the end."""
+    rank = len(input.shape)
+    if rank == 0:
+        return F.reshape(input, [1]) if size == 1 else _broadcast_to(input, [0])
+    dim = dimension % rank
+    n = int(input.shape[dim])
+    windows = (n - size) // step + 1
+    if size == 0:
+        shape = [*input.shape[:dim], windows, *input.shape[dim + 1 :], 0]
+        zero = F.constant(0, dtype=input.dtype, device=input.device)
+        return _broadcast_to(zero, shape)
+    index = F.constant(
+        [[w * step + k for k in range(size)] for w in range(windows)],
+        dtype=DType.int64,
+        device=input.device,
+    )
+    gathered = F.gather(input, index, axis=dim)
+    order = [a for a in range(rank + 1) if a != dim + 1] + [dim + 1]
+    return F.permute(gathered, order)
+
+
 # unsqueeze(Tensor(a) self, int dim) -> Tensor(a)
 @map_to(aten.unsqueeze)
 def aten_unsqueeze(tensor: MaxTensor, dim: int) -> MaxTensor:
@@ -5787,6 +5993,62 @@ def aten_where(input: MaxTensor, condition: MaxTensor, other: MaxTensor) -> MaxT
 @map_to(aten.stack)
 def aten_stack(tensors: list[MaxTensor], dim: int = 0) -> MaxTensor:
     return F.stack(tensors, axis=dim)
+
+
+def _tri_indices_constant(
+    row: int,
+    col: int,
+    offset: int,
+    upper: bool,
+    dtype: torch.dtype | None,
+    device: torch.device | None,
+) -> MaxTensor:
+    """The (2, N) row-major coordinates of the lower (upper) triangle,
+    computed here from the static arguments and embedded as a constant."""
+    rows = []
+    cols = []
+    for i in range(row):
+        lo, hi = (max(0, i + offset), col) if upper else (0, min(col, i + offset + 1))
+        for j in range(lo, hi):
+            rows.append(i)
+            cols.append(j)
+    max_dtype = torch_dtype_to_max(dtype if dtype is not None else torch.int64)
+    max_device = torch_device_to_max_device(
+        device if device is not None else torch.get_default_device()
+    )
+    if not rows:
+        return _broadcast_to(F.constant(0, dtype=max_dtype, device=max_device), [2, 0])
+    return F.constant([rows, cols], dtype=max_dtype, device=max_device)
+
+
+# tril_indices(int row, int col, int offset=0, *, ScalarType? dtype=long, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+@map_to(aten.tril_indices)
+def aten_tril_indices(
+    row: int,
+    col: int,
+    offset: int = 0,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> MaxTensor:
+    return _tri_indices_constant(row, col, offset, False, dtype, device)
+
+
+# triu_indices(int row, int col, int offset=0, *, ScalarType? dtype=long, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
+@map_to(aten.triu_indices)
+def aten_triu_indices(
+    row: int,
+    col: int,
+    offset: int = 0,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> MaxTensor:
+    return _tri_indices_constant(row, col, offset, True, dtype, device)
 
 
 # tril(Tensor self, int diagonal=0) -> Tensor

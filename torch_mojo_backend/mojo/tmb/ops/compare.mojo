@@ -14,8 +14,11 @@ the old `_bcast_meta`'s `rank > 4: return None`).
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    bits_f64,
     Owned,
     T,
+    TAG_COMPLEX,
+    TAG_SCALAR_DOUBLE,
     Value,
     Values,
     ST_BOOL,
@@ -27,11 +30,15 @@ from tmb.backend.abi import (
     new_tensor,
     own,
     release,
+    ret_bool,
     ret_owned,
     ret_ref,
+    tensor_arg,
     torch_dtype,
     unsupported,
     v_bool_or,
+    v_f64,
+    v_int,
     v_is_none,
     v_opt_tensor,
     v_scalar_is_integral,
@@ -42,8 +49,10 @@ from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    assert_no_internal_overlap,
     binary_promotion,
     broadcast_shape,
+    call_op,
     cast_to,
     contiguous,
     copy_strided_into,
@@ -51,8 +60,12 @@ from tmb.ops.common import (
     promoted_pair,
     resize_out,
     scalar_embed,
+    scalar_to_float,
+    scalar_to_int,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.core import cast_for_copy
+from tmb.ops.binary import _b_out_guard, _b_tside
 
 
 def _release_if_new(t: T, orig: T):
@@ -63,10 +76,13 @@ def _release_if_new(t: T, orig: T):
         release(t.h)
 
 
-def _shape_eq(t: T, shape: IndexList[MAX_RANK]) -> Bool:
+def _shape_eq(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
     """Whether t's padded shape exactly equals `shape` (both MAX_RANK-wide,
-    leading-padded with 1s): the eligibility check for writing an out=
-    kernel result directly into `t`."""
+    leading-padded with 1s) at `rank`: the eligibility check for writing an
+    out= kernel result directly into `t`. The rank matters: a [1] `out` of a
+    0-d result is resized to 0-d."""
+    if t.rank != rank:
+        return False
     for i in range(MAX_RANK):
         if t.shape[i] != shape[i]:
             return False
@@ -97,7 +113,7 @@ def _prepare_out(
         raise Error(
             "expected an out= tensor of dtype ", stype, ", got ", out_arg.stype
         )
-    if not _shape_eq(out_arg, shape):
+    if not _shape_eq(out_arg, shape, rank):
         resize_out(out_arg, shape, rank)
         return True
     return out_arg.contig
@@ -119,7 +135,7 @@ def _ensure_out_shape(
         raise Error(
             "expected an out= tensor of dtype ", stype, ", got ", out_arg.stype
         )
-    if not _shape_eq(out_arg, shape):
+    if not _shape_eq(out_arg, shape, rank):
         resize_out(out_arg, shape, rank)
 
 
@@ -161,6 +177,39 @@ def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
     _ = ctx
 
 
+def _compare_out_guard(out_arg: T, a: T, b: T) raises:
+    """TensorIterator's `out=` meta (the #606 contract every other `out=`
+    path runs): no internal overlap in `out`, no partial overlap with an
+    input, and an `out` that IS an input (the in-place `x.eq_(y)`) never
+    resized -- a broadcast shape larger than it raises."""
+    if not out_arg.on_mojo():
+        raise Error("expected the out= tensor on the operands' mojo device")
+    assert_no_internal_overlap(out_arg)
+    _b_out_guard(out_arg, _b_tside(a), _b_tside(b))
+
+
+def _cast_into_out(
+    mut out_arg: T,
+    res: T,
+    shape: IndexList[MAX_RANK],
+    rank: Int,
+    device: Int,
+) raises:
+    """A comparison's `out=` of a non-bool dtype: TensorIterator's
+    comparison ops (`build_borrowing_comparison_op`) cast the bool result
+    into an `out` of any dtype (`torch.eq(x, 0.5, out=float_t)` is 0./1.),
+    which is also how the in-place `x.eq_(0.5)` on a float `x` works. `res`
+    is the bool result, computed apart so an `out` aliasing an operand is
+    only written once every element has been read."""
+    if not out_arg.on_mojo() or out_arg.device != device:
+        raise Error("expected the out= tensor on the operands' mojo device")
+    if not _shape_eq(out_arg, shape, rank):
+        resize_out(out_arg, shape, rank)
+    var casted = own(cast_for_copy(res, out_arg.stype))
+    copy_strided_into(out_arg, casted.t)
+    _ = casted^  # alive past the launch
+
+
 def _compare_functional(op: StaticString, args: Values, rets: Values) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var b = v_tensor(args[unsafe_offset=1])
@@ -187,13 +236,19 @@ def _compare_functional_out(
     var out_arg = v_tensor(args[unsafe_offset=2])
     if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
         raise Error("expected both operands on the same mojo device")
+    _compare_out_guard(out_arg, a, b)
     var dtype = binary_promotion(a, b)
     var stype = torch_dtype(dtype)
     var pa = cast_to(a, stype)
     var pb = cast_to(b, stype)
     var shape = broadcast_shape(pa, pb)
     var rank = max(pa.rank, pb.rank)
-    if _prepare_out(out_arg, shape, rank, ST_BOOL, a.device):
+    if out_arg.stype != ST_BOOL:
+        var res = own(new_tensor(shape, rank, ST_BOOL, a.device))
+        _compare_spec(op, pa, pb, res.t)
+        _cast_into_out(out_arg, res.t, shape, rank, a.device)
+        _ = res^  # alive past the launch
+    elif _prepare_out(out_arg, shape, rank, ST_BOOL, a.device):
         _compare_spec(op, pa, pb, out_arg)
     else:
         var tmp = own(new_tensor(shape, rank, ST_BOOL, a.device))
@@ -223,10 +278,17 @@ def _compare_scalar_out(op: StaticString, args: Values, rets: Values) raises:
     if not a.on_mojo():
         raise Error("expected the mojo device")
     var out_arg = v_tensor(args[unsafe_offset=2])
+    _compare_out_guard(out_arg, a, a)
     var value = scalar_embed(args[unsafe_offset=1], a.dtype)
     var fill = own(new_scalar(a.stype, a.device))
     fill_value(fill.t, value)
-    if _prepare_out(out_arg, a.shape, a.rank, ST_BOOL, a.device):
+    if out_arg.stype != ST_BOOL:
+        var res = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
+        _compare_spec(op, a, fill.t, res.t)
+        _ = fill^  # alive past the launch
+        _cast_into_out(out_arg, res.t, a.shape, a.rank, a.device)
+        _ = res^  # alive past the launch
+    elif _prepare_out(out_arg, a.shape, a.rank, ST_BOOL, a.device):
         _compare_spec(op, a, fill.t, out_arg)
         _ = fill^  # alive past the launch
     else:
@@ -652,20 +714,112 @@ def _masked_fill_where(mask: T, value: T, a: T, dst: T) raises:
     _where_select(mask, mask_s, value, value_s, a, a.strides, dst)
 
 
+def _c10_name(dt: DType) -> String:
+    """The C++ type `c10::checked_convert` names in its overflow error."""
+    if dt == DType.float32:
+        return "float"
+    if dt == DType.float64:
+        return "double"
+    if dt == DType.float16:
+        return "c10::Half"
+    if dt == DType.bfloat16:
+        return "c10::BFloat16"
+    if dt == DType.bool:
+        return "bool"
+    if dt == DType.int64:
+        return "int64_t"
+    if dt == DType.int32:
+        return "int"
+    if dt == DType.int16:
+        return "int16_t"
+    if dt == DType.int8:
+        return "int8_t"
+    return "uint8_t"
+
+
+def scalar_as_fill(v: Value, dtype: DType) raises -> Float64:
+    """`Scalar::to<scalar_t>()` for a fill value (c10's checked_convert): a
+    bool destination takes the scalar's truth; an integer one goes through
+    `scalar_to_int` (range-checked, a float truncates, an integer wraps into
+    uint8) and a floating one through `scalar_to_float`; a complex scalar
+    into a real type is the overflow error ATen raises. The result is
+    exactly representable as a Float64 or declined."""
+    if v.tag == TAG_COMPLEX:
+        # c10::overflows<real, complex>: a nonzero imaginary part overflows,
+        # otherwise the real part converts like a double Scalar.
+        if bits_f64(v.b) != 0.0:
+            raise Error(
+                "value cannot be converted to type ",
+                _c10_name(dtype),
+                " without overflow",
+            )
+        return scalar_as_fill(Value(TAG_SCALAR_DOUBLE, 0, v.a, 0), dtype)
+    if dtype == DType.bool:
+        return 1.0 if v_f64(v) != 0.0 else 0.0
+    var st = torch_dtype(dtype)
+    if dtype.is_integral():
+        var i = scalar_to_int(v, st)
+        if dtype == DType.uint8:
+            i = i & 0xFF
+        if abs(i) > 9007199254740992:
+            unsupported("scalar magnitude exceeds the exact float64 range")
+        return Float64(i)
+    if dtype.is_floating_point():
+        return scalar_to_float(v, st)
+    return scalar_embed(v, dtype)
+
+
 def _masked_fill_scalar_dispatch(
     mask: T, a: T, value_arg: Value, dst: T
 ) raises:
+    var value = scalar_as_fill(value_arg, a.dtype)
     if dst.numel == 0:
         return
     if _is_masked_fill_scalar_dtype(a.dtype) and mask.rank <= 4 and a.rank <= 4:
-        var fast_value = scalar_embed(value_arg, a.dtype)
-        _masked_fill_scalar_launch(mask, a, fast_value, dst)
+        _masked_fill_scalar_launch(mask, a, value, dst)
         return
-    var value = scalar_embed(value_arg, a.dtype)
     var fill = own(new_scalar(a.stype, a.device))
     fill_value(fill.t, value)
     _masked_fill_where(mask, fill.t, a, dst)
     _ = fill^  # alive past the launch
+
+
+def _prepare_out_checked(
+    mut out_arg: T,
+    shape: IndexList[MAX_RANK],
+    rank: Int,
+    stype: Int32,
+    device: Int,
+) raises -> Bool:
+    """`_prepare_out`, then copy_'s `assert_no_internal_overlap` on the
+    resized `out` (an expanded `out` would collapse distinct results)."""
+    var direct = _prepare_out(out_arg, shape, rank, stype, device)
+    assert_no_internal_overlap(out_arg)
+    return direct
+
+
+def _shares_storage(dest: T, t: T) -> Bool:
+    """`dest` and `t` live in one storage (resizing `dest` can move `t`)."""
+    var sp = dest.storage_ptr()
+    return sp != 0 and sp == t.storage_ptr()
+
+
+def _masked_fill_expanded(a: T, mask: T) raises -> T:
+    """`expand_outplace(mask, self)`'s self: the out-of-place masked_fill
+    result has the broadcast shape of self and mask, so self is read through
+    a 0-stride view over the dims it broadcasts along (a kernel-only view:
+    it keeps self's handle)."""
+    var shape = broadcast_shape(a, mask)
+    var v = a.copy()
+    v.strides = _bcast_strides(a, shape)
+    v.shape = shape
+    v.rank = max(a.rank, mask.rank)
+    var n = 1
+    for i in range(MAX_RANK):
+        n *= shape[i]
+    v.numel = n
+    v.contig = False
+    return v^
 
 
 # aten::masked_fill.Scalar(Tensor self, Tensor mask, Scalar value) -> Tensor
@@ -675,8 +829,9 @@ def op_masked_fill_scalar(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     _masked_fill_validate(a, mask)
-    var out = own(new_like(a))
-    _masked_fill_scalar_dispatch(mask, a, args[unsafe_offset=2], out.t)
+    var ae = _masked_fill_expanded(a, mask)
+    var out = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
+    _masked_fill_scalar_dispatch(mask, ae, args[unsafe_offset=2], out.t)
     ret_owned(rets, 0, out)
 
 
@@ -688,11 +843,23 @@ def op_masked_fill_scalar_out(
     var mask = v_tensor(args[unsafe_offset=1])
     var out_arg = v_tensor(args[unsafe_offset=3])
     _masked_fill_validate(a, mask)
-    if _prepare_out(out_arg, a.shape, a.rank, a.stype, a.device):
-        _masked_fill_scalar_dispatch(mask, a, args[unsafe_offset=2], out_arg)
+    var ae = _masked_fill_expanded(a, mask)
+    if _shares_storage(out_arg, a) or _shares_storage(out_arg, mask):
+        # The autogenerated out= overload's order: the functional result
+        # first, then resize + copy. A resize of an `out` sharing storage
+        # with an input may move that storage, so nothing reads an input
+        # pointer after it.
+        var res = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
+        _masked_fill_scalar_dispatch(mask, ae, args[unsafe_offset=2], res.t)
+        _ensure_out_shape(out_arg, ae.shape, ae.rank, a.stype, a.device)
+        assert_no_internal_overlap(out_arg)
+        copy_strided_into(out_arg, res.t)
+        _ = res^  # alive past the launch
+    elif _prepare_out_checked(out_arg, ae.shape, ae.rank, a.stype, a.device):
+        _masked_fill_scalar_dispatch(mask, ae, args[unsafe_offset=2], out_arg)
     else:
-        var tmp = own(new_like(a))
-        _masked_fill_scalar_dispatch(mask, a, args[unsafe_offset=2], tmp.t)
+        var tmp = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
+        _masked_fill_scalar_dispatch(mask, ae, args[unsafe_offset=2], tmp.t)
         copy_strided_into(out_arg, tmp.t)
         _ = tmp^  # alive past the launch
     ret_ref(rets, 0, out_arg)
@@ -717,7 +884,7 @@ def op_masked_fill__scalar(
     ret_ref(rets, 0, a)
 
 
-def _masked_fill_tensor_value(a: T, value_arg: Value) raises -> T:
+def _masked_fill_check_value(value_arg: Value) raises -> T:
     var val = v_tensor(value_arg)
     if val.rank != 0:
         raise Error(
@@ -728,9 +895,19 @@ def _masked_fill_tensor_value(a: T, value_arg: Value) raises -> T:
             val.rank,
             " dimension(s).",
         )
-    if val.dtype != a.dtype or val.device != a.device:
-        unsupported("masked_fill.Tensor: value dtype/device mismatch")
     return val^
+
+
+def _value_is_direct(a: T, val: T) -> Bool:
+    """A 0-d value of self's dtype on self's device is read in place by the
+    kernel; any other one (a CPU scalar tensor, another dtype) goes through
+    `value.item()` like ATen's masked_fill does."""
+    return val.dtype == a.dtype and val.on_mojo() and val.device == a.device
+
+
+def _value_item(val: T) raises -> Value:
+    var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(val)], 1)
+    return r[0]
 
 
 # aten::masked_fill.Tensor(Tensor self, Tensor mask, Tensor value) -> Tensor
@@ -740,10 +917,21 @@ def op_masked_fill_tensor(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     _masked_fill_validate(a, mask)
-    var val = _masked_fill_tensor_value(a, args[unsafe_offset=2])
-    var out = own(new_like(a))
-    _masked_fill_where(mask, val, a, out.t)
+    var val = _masked_fill_check_value(args[unsafe_offset=2])
+    var ae = _masked_fill_expanded(a, mask)
+    var out = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
+    if _value_is_direct(a, val):
+        _masked_fill_where(mask, val, ae, out.t)
+    else:
+        _masked_fill_scalar_dispatch(mask, ae, _value_item(val), out.t)
     ret_owned(rets, 0, out)
+
+
+def _masked_fill_value_into(mask: T, a: T, val: T, dst: T) raises:
+    if _value_is_direct(a, val):
+        _masked_fill_where(mask, val, a, dst)
+    else:
+        _masked_fill_scalar_dispatch(mask, a, _value_item(val), dst)
 
 
 # aten::masked_fill.Tensor_out(Tensor self, Tensor mask, Tensor value, *, Tensor(a!) out) -> Tensor(a!)
@@ -754,12 +942,25 @@ def op_masked_fill_tensor_out(
     var mask = v_tensor(args[unsafe_offset=1])
     var out_arg = v_tensor(args[unsafe_offset=3])
     _masked_fill_validate(a, mask)
-    var val = _masked_fill_tensor_value(a, args[unsafe_offset=2])
-    if _prepare_out(out_arg, a.shape, a.rank, a.stype, a.device):
-        _masked_fill_where(mask, val, a, out_arg)
+    var val = _masked_fill_check_value(args[unsafe_offset=2])
+    var ae = _masked_fill_expanded(a, mask)
+    if (
+        _shares_storage(out_arg, a)
+        or _shares_storage(out_arg, mask)
+        or _shares_storage(out_arg, val)
+    ):
+        # Result first, then resize + copy (see op_masked_fill_scalar_out).
+        var res = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
+        _masked_fill_value_into(mask, ae, val, res.t)
+        _ensure_out_shape(out_arg, ae.shape, ae.rank, a.stype, a.device)
+        assert_no_internal_overlap(out_arg)
+        copy_strided_into(out_arg, res.t)
+        _ = res^  # alive past the launch
+    elif _prepare_out_checked(out_arg, ae.shape, ae.rank, a.stype, a.device):
+        _masked_fill_value_into(mask, ae, val, out_arg)
     else:
-        var tmp = own(new_like(a))
-        _masked_fill_where(mask, val, a, tmp.t)
+        var tmp = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
+        _masked_fill_value_into(mask, ae, val, tmp.t)
         copy_strided_into(out_arg, tmp.t)
         _ = tmp^  # alive past the launch
     ret_ref(rets, 0, out_arg)
@@ -772,15 +973,55 @@ def op_masked_fill__tensor(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     _masked_fill_validate(a, mask)
-    var val = _masked_fill_tensor_value(a, args[unsafe_offset=2])
+    var val = _masked_fill_check_value(args[unsafe_offset=2])
     if a.contig:
-        _masked_fill_where(mask, val, a, a)
+        _masked_fill_value_into(mask, a, val, a)
     else:
         var tmp = own(new_like(a))
-        _masked_fill_where(mask, val, a, tmp.t)
+        _masked_fill_value_into(mask, a, val, tmp.t)
         copy_strided_into(a, tmp.t)
         _ = tmp^  # alive past the launch
     ret_ref(rets, 0, a)
+
+
+# ---------------------------------------------------------------------------
+# equal -- ATen's `cuda_equal` (native/cuda/Equal.cpp): different shapes are
+# unequal, empty tensors equal, an identical view of one storage equal
+# without a launch; otherwise `eq(self, other).all()` read back to the host
+# (the op returns a host bool, so that one sync is inherent).
+# ---------------------------------------------------------------------------
+
+
+# aten::equal(Tensor self, Tensor other) -> bool
+def op_equal(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    if not a.same_shape(b):
+        ret_bool(rets, 0, False)
+        return
+    if a.numel == 0:
+        ret_bool(rets, 0, True)
+        return
+    var same_view = (
+        a.storage_ptr() != 0
+        and a.storage_ptr() == b.storage_ptr()
+        and a.offset == b.offset
+        and a.stype == b.stype
+        and a.contig == b.contig
+    )
+    if same_view:
+        for i in range(a.rank):
+            if a.stride(i) != b.stride(i):
+                same_view = False
+    if same_view:
+        ret_bool(rets, 0, True)
+        return
+    var eq = call_op("aten::eq", "Tensor", [tensor_arg(a), tensor_arg(b)], 1)
+    var all = call_op("aten::all", "", [eq[0]], 1)
+    _ = eq^  # its handle was read by `all`
+    var item = call_op("aten::_local_scalar_dense", "", [all[0]], 1)
+    _ = all^
+    ret_bool(rets, 0, v_f64(item[0]) != 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1297,6 +1538,7 @@ def register_compare(site: Site) raises:
     impl[op_masked_fill_tensor_out, "masked_fill.Tensor_out"](site)
     impl[op_masked_fill__scalar, "masked_fill_.Scalar"](site)
     impl[op_masked_fill__tensor, "masked_fill_.Tensor"](site)
+    impl[op_equal, "equal"](site)
     impl[op_searchsorted_tensor, "searchsorted.Tensor"](site)
     impl[op_searchsorted_tensor_out, "searchsorted.Tensor_out"](site)
     impl[op_searchsorted_scalar, "searchsorted.Scalar"](site)

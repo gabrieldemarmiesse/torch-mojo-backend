@@ -179,6 +179,9 @@ COVERS: dict[str, str] = (
 # so both sides of every kink are timed.
 ACTIVATION_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "elu": F.elu,
+    # glu halves the last dim, which must be even: A_357x789 drops its last
+    # column (a view; both legs read the same strided operand).
+    "glu": lambda x: F.glu(x[..., : x.shape[-1] // 2 * 2]),
     "hardshrink": lambda x: F.hardshrink(x, 0.2),
     "hardsigmoid": F.hardsigmoid,
     "hardswish": F.hardswish,
@@ -199,6 +202,7 @@ SKIPPED |= {
     f"aten::{name}": _ACT_OUT
     for name in (
         "elu.out",
+        "glu.out",
         "hardshrink.out",
         "hardsigmoid.out",
         "hardsigmoid_",

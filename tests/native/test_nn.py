@@ -1,5 +1,5 @@
 """Native-backend nn ops: softmax family, normalization, NLL loss, embedding,
-2-D pooling and bilinear upsampling.
+and bilinear / nearest upsampling (pooling: test_pooling.py).
 
 Everything here goes through public torch APIs on the mojo device and is
 compared against the same call on CPU torch. The ops are exercised through
@@ -12,8 +12,9 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from tests.native.conftest import ran
+from tests.native.conftest import ran, skip_if_metal
 from torch_mojo_backend import aten_functions, register_mojo_devices
 from torch_mojo_backend.testing import CallChecker
 
@@ -108,6 +109,29 @@ def test_softmax_with_dtype_argument(mojo_device):
         torch.softmax(x, -1, dtype=torch.float32),
         atol=1e-5,
         rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("fn", [torch.softmax, torch.log_softmax])
+@pytest.mark.parametrize("src", [torch.float32, torch.float16, torch.int64])
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_softmax_float64_dtype(mojo_device, fn, src, dim):
+    """`dtype=torch.float64` computes in double (the float64 row kernel)."""
+    skip_if_metal(mojo_device, "float64 is not supported on Apple GPU")
+    torch.manual_seed(2)
+    x = (torch.randn(5, 7, 300) * 20).to(src)
+    if src.is_floating_point:
+        x[0, 0, 0] = -float("inf")
+    got = fn(x.to(mojo_device), dim, dtype=torch.float64)
+    assert got.dtype == torch.float64
+    torch.testing.assert_close(got.cpu(), fn(x, dim, dtype=torch.float64))
+    # A float64 input straight in, rows longer than the block, a softmin.
+    y = torch.randn(3, 2000, dtype=torch.float64)
+    torch.testing.assert_close(fn(y.to(mojo_device), 1).cpu(), fn(y, 1))
+    torch.testing.assert_close(
+        F.softmin(x.to(mojo_device), dim, dtype=torch.float64).cpu(),
+        F.softmin(x, dim, dtype=torch.float64),
+        equal_nan=True,  # -x holds +inf: its slice is NaN on both sides
     )
 
 
@@ -783,90 +807,6 @@ def test_embedding_dense_backward_declines_scale_grad_by_freq(mojo_gpu):
     idx = torch.tensor([0, 1, 1], dtype=torch.int64).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
         torch.ops.aten.embedding_dense_backward(grad, idx, 4, -1, True)
-
-
-# ---------------------------------------------------------------------------
-# Pooling
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("kernel", "stride", "padding", "dilation"),
-    [(2, None, 0, 1), (3, 2, 1, 1), ((2, 3), (2, 1), (1, 1), 1), (2, 2, 0, 2)],
-)
-def test_max_pool2d(
-    mojo_device, call_checker: CallChecker, kernel, stride, padding, dilation
-):
-    call_checker.register(aten_functions.aten_max_pool2d_with_indices)
-    x = torch.randn(2, 3, 9, 11)
-    want, want_idx = torch.nn.functional.max_pool2d(
-        x, kernel, stride, padding, dilation, return_indices=True
-    )
-    got, got_idx = torch.nn.functional.max_pool2d(
-        x.to(mojo_device), kernel, stride, padding, dilation, return_indices=True
-    )
-    torch.testing.assert_close(got.cpu(), want)
-    torch.testing.assert_close(got_idx.cpu(), want_idx)
-
-
-def test_max_pool2d_ceil_mode_declines(mojo_device):
-    x = torch.randn(1, 1, 5, 5).to(mojo_device)
-    with pytest.raises(NotImplementedError):
-        torch.nn.functional.max_pool2d(x, 2, 2, 0, 1, ceil_mode=True)
-
-
-@pytest.mark.parametrize(
-    ("kernel", "stride", "padding", "count_include_pad", "divisor_override"),
-    [
-        (2, None, 0, True, None),
-        (3, 2, 1, True, None),
-        (3, 2, 1, False, None),
-        ((2, 3), (2, 1), 0, True, 5),
-    ],
-)
-def test_avg_pool2d(
-    mojo_device,
-    call_checker: CallChecker,
-    kernel,
-    stride,
-    padding,
-    count_include_pad,
-    divisor_override,
-):
-    call_checker.register(aten_functions.aten_avg_pool2d)
-    x = torch.randn(2, 3, 8, 10)
-    want = torch.nn.functional.avg_pool2d(
-        x,
-        kernel,
-        stride,
-        padding,
-        count_include_pad=count_include_pad,
-        divisor_override=divisor_override,
-    )
-    got = torch.nn.functional.avg_pool2d(
-        x.to(mojo_device),
-        kernel,
-        stride,
-        padding,
-        count_include_pad=count_include_pad,
-        divisor_override=divisor_override,
-    )
-    torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
-
-
-@pytest.mark.parametrize("output_size", [(1, 1), (3, 3), (2, 5), (7, 7)])
-def test_adaptive_avg_pool2d(mojo_device, call_checker: CallChecker, output_size):
-    """Called through the aten op, not `F.adaptive_avg_pool2d`: ATen's
-    composite rewrites a (1, 1) output into `mean.dim`, which belongs to the
-    reductions group."""
-    call_checker.register(aten_functions.aten__adaptive_avg_pool2d)
-    x = torch.randn(2, 4, 7, 9)
-    torch.testing.assert_close(
-        torch.ops.aten._adaptive_avg_pool2d(x.to(mojo_device), list(output_size)).cpu(),
-        torch.ops.aten._adaptive_avg_pool2d(x, list(output_size)),
-        atol=1e-5,
-        rtol=1e-5,
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -293,6 +293,15 @@ _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
         # float64 answer (sample alpha=-3.125: CPU 2.4453, CUDA 2.4414,
         # exact 2.4421).
         ("rsub", torch.float16),
+        # 3-D adaptive average pooling in half precision (also reached by
+        # interpolate(mode="area") on 5-D input): CUDA's (and our) kernel
+        # sums the window in float and rounds once; CPU torch's result is
+        # measurably farther from float64 (bf16 (8, 8, 8, 8) -> (5, 7, 4):
+        # CPU max error 0.036, ours 0.016).
+        ("nn_functional_adaptive_avg_pool3d", torch.bfloat16),
+        ("nn_functional_adaptive_avg_pool3d", torch.float16),
+        ("nn_functional_interpolate_area", torch.bfloat16),
+        ("nn_functional_interpolate_area", torch.float16),
     }
 )
 

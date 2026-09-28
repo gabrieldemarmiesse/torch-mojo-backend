@@ -106,6 +106,7 @@ from tmb.ops.common import (
     scalar_to_int,
 )
 from tmb.ops.random import _draw
+from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.core import cast_for_copy
 from tmb.ops.reductions import _scalar_reduction
 from tmb.ops.unary import op_gelu_backward
@@ -1337,11 +1338,22 @@ def _pw_pow_f64_scalar(
     return True
 
 
+def _pw_int_scalar_pow(args: Values) raises -> Bool:
+    """An integral result of pow.Tensor_Scalar: an integer tensor, or a bool
+    one (`torch.square(bool_t)` is `pow(bool_t, 2)`, which promotes to int64),
+    to a non-bool integer exponent."""
+    var base = _b_side(args[unsafe_offset=0])
+    if not base.is_t or not _pw_int_side(_b_side(args[unsafe_offset=1])):
+        return False
+    var st = base.t.value().stype
+    return _pw_is_int(st) or st == ST_BOOL
+
+
 # aten::pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
 def op_pow_scalar_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if _pw_both_int(args):
+    if _pw_int_scalar_pow(args):
         _pw_ipow(args, rets, -1, True)
     elif not _pw_pow_f64_scalar(args, rets, -1):
         op_pow_scalar(args, n_args, rets, n_rets)
@@ -1351,7 +1363,7 @@ def op_pow_scalar_any(
 def op_pow_scalar_out_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if _pw_both_int(args):
+    if _pw_int_scalar_pow(args):
         _pw_ipow(args, rets, 2, True)
     elif not _pw_pow_f64_scalar(args, rets, 2):
         op_pow_scalar_out(args, n_args, rets, n_rets)
@@ -1917,6 +1929,198 @@ def op_silu_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     _pw_act("silu_backward", args, rets, 0, 1, 2, _p())
+
+
+# ---------------------------------------------------------------------------
+# glu and its backward (ActivationGluKernel.cu): the two halves of `self`
+# along `dim` are zero-copy views, the math is the pointwise family's.
+# ---------------------------------------------------------------------------
+
+
+def _glu_dim(t: T, dim: Int, scalar_msg: StaticString) raises -> Int:
+    """GatedLinearUnit's checks: a dimensioned tensor, `dim` wrapped into
+    range, an even size to halve. The wrapped dim."""
+    if t.rank == 0:
+        raise Error(scalar_msg)
+    if dim < -t.rank or dim >= t.rank:
+        raise Error(
+            "Dimension out of range (expected to be in range of [",
+            -t.rank,
+            ", ",
+            t.rank - 1,
+            "], but got ",
+            dim,
+            ")",
+        )
+    var d = dim + t.rank if dim < 0 else dim
+    var n = t.shape[MAX_RANK - t.rank + d]
+    if n % 2 != 0:
+        raise Error(
+            "Halving dimension must be even, but dimension ",
+            d,
+            " is size ",
+            n,
+        )
+    return d
+
+
+def _glu_half(t: T, d: Int, second: Bool) raises -> T:
+    """`t.narrow(d, 0 or n/2, n/2)`: a view over t's storage."""
+    var p = MAX_RANK - t.rank + d
+    var shape = t.shape
+    var half = shape[p] // 2
+    shape[p] = half
+    var offset = t.offset + (half * t.strides[p] if second else 0)
+    return view_strided(t, shape, t.strides, t.rank, offset)
+
+
+def _glu(args: Values, rets: Values, out_index: Int) raises:
+    var self = _b_self(args[unsafe_offset=0], "glu")
+    var d = _glu_dim(
+        self,
+        v_int(args[unsafe_offset=1]),
+        "glu does not support 0-dimensional tensors",
+    )
+    var a = own(_glu_half(self, d, False))
+    var b = own(_glu_half(self, d, True))
+    var sa = _b_tside(a.t)
+    var sb = _b_tside(b.t)
+    var compute = _pw_compute_dtype("glu", self.stype, P_FLOAT_ONLY, True)
+    var dest = Optional[T]()
+    if out_index >= 0:
+        dest = _pw_out_of(args[unsafe_offset=out_index], sa, sb, _none_side())
+    _pw_finish(
+        rets,
+        dest,
+        _pw_run("glu", 2, sa, sb, _none_side(), compute, compute, _p(), dest),
+    )
+    _ = a^  # alive past the launch
+    _ = b^
+
+
+def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
+    """glu_backward_cuda_out: grad_input's first half is sigmoid(b) * grad,
+    its second (1 - sigmoid(b)) * sigmoid(b) * grad * a, each one pointwise
+    launch into a fresh buffer copied into its half of grad_input."""
+    var grad = v_tensor(args[unsafe_offset=0])
+    var self = _b_self(args[unsafe_offset=1], "glu_backward")
+    var d = _glu_dim(
+        self,
+        v_int(args[unsafe_offset=2]),
+        "glu does not support 0-dimensional tensors",
+    )
+    var a = own(_glu_half(self, d, False))
+    var b = own(_glu_half(self, d, True))
+    if not grad.same_shape(a.t):
+        raise Error(
+            "glu_backward: grad_output of shape ",
+            _b_shape_list(grad.shape, grad.rank),
+            " does not match the halved input shape ",
+            _b_shape_list(a.t.shape, a.t.rank),
+        )
+    if grad.stype != self.stype:
+        # glu_backward_cuda_out's TensorIterator checks every operand has
+        # one dtype (check_all_same_dtype); no promotion.
+        raise Error(
+            "Found dtype ",
+            _scalar_type_name(grad.dtype),
+            " but expected ",
+            _scalar_type_name(self.dtype),
+        )
+    # glu_backward_cuda_out returns before its dtype dispatch when the
+    # iterator is empty: an empty integer input is not an error (every
+    # launch below is then a no-op).
+    var compute = self.stype if self.numel == 0 else _pw_compute_dtype(
+        "glu_backward", self.stype, P_FLOAT_ONLY, True
+    )
+    var sg = _b_tside(grad)
+    var ga = own(
+        _pw_run(
+            "glu_backward_a",
+            2,
+            sg,
+            _b_tside(b.t),
+            _none_side(),
+            compute,
+            compute,
+            _p(),
+            None,
+        ).t.copy()
+    )
+    var gb = own(
+        _pw_run(
+            "glu_backward_b",
+            3,
+            sg,
+            _b_tside(a.t),
+            _b_tside(b.t),
+            compute,
+            compute,
+            _p(),
+            None,
+        ).t.copy()
+    )
+    var gi: T
+    var fresh = out_index < 0
+    if fresh:
+        gi = new_tensor(self.shape, self.rank, compute, self.device)
+    else:
+        gi = v_tensor(args[unsafe_offset=out_index])
+        if not gi.on_mojo() or gi.device != self.device:
+            raise Error("expected `grad_input` on the inputs' mojo device")
+        if gi.stype != compute:
+            raise Error(
+                "Found dtype ",
+                _scalar_type_name(gi.dtype),
+                " but expected ",
+                _scalar_type_name(self.dtype),
+            )
+        assert_no_internal_overlap(gi)
+        if not gi.same_shape(self):
+            resize_out(gi, self.shape, self.rank)
+        # TensorIterator's at::assert_no_partial_overlap against both inputs
+        # (`self=base[:8], grad_input=base[1:]` raises, as on CUDA).
+        _b_no_partial_overlap(gi, self)
+        _b_no_partial_overlap(gi, grad)
+    var held = own(gi.copy())
+    held.live = fresh  # a caller's grad_input is not ours to release
+    var gi_a = own(_glu_half(gi, d, False))
+    var gi_b = own(_glu_half(gi, d, True))
+    copy_strided_into(gi_a.t, ga.t)
+    copy_strided_into(gi_b.t, gb.t)
+    _ = ga^  # alive past the copies
+    _ = gb^
+    _ = a^
+    _ = b^
+    if fresh:
+        ret_tensor(rets, 0, held.take())
+    else:
+        held.live = False
+        ret_ref(rets, 0, gi)
+
+
+# aten::glu(Tensor self, int dim=-1) -> Tensor
+def op_glu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _glu(args, rets, -1)
+
+
+# aten::glu.out(Tensor self, int dim=-1, *, Tensor(a!) out) -> Tensor(a!)
+def op_glu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _glu(args, rets, 2)
+
+
+# aten::glu_backward(Tensor grad_output, Tensor self, int dim) -> Tensor
+def op_glu_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _glu_backward(args, rets, -1)
+
+
+# aten::glu_backward.grad_input(Tensor grad_output, Tensor self, int dim, *, Tensor(a!) grad_input) -> Tensor(a!)
+def op_glu_backward_grad_input(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _glu_backward(args, rets, 3)
 
 
 # aten::gelu_backward.grad_input(Tensor grad_output, Tensor self, *, str approximate='none', Tensor(a!) grad_input) -> Tensor(a!)
@@ -3362,6 +3566,10 @@ def register_pointwise(site: Site) raises:
     impl[op_rrelu_with_noise, "rrelu_with_noise"](site)
     impl[op_rrelu_with_noise_out, "rrelu_with_noise.out"](site)
     impl[op_rrelu_with_noise_, "rrelu_with_noise_"](site)
+    impl[op_glu, "glu"](site)
+    impl[op_glu_out, "glu.out"](site)
+    impl[op_glu_backward, "glu_backward"](site)
+    impl[op_glu_backward_grad_input, "glu_backward.grad_input"](site)
     impl[op_silu_backward, "silu_backward"](site)
     impl[op_silu_backward_grad_input, "silu_backward.grad_input"](site)
     impl[op_softplus, "softplus"](site)

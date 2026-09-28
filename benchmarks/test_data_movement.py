@@ -12,9 +12,11 @@ loops) — the mojo leg builds the tensor on the mojo device directly.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
-from bench_lib.cases import DTYPES, both
+from bench_lib.cases import DTYPES, both, op_params
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
@@ -75,6 +77,30 @@ PAD2D_SHAPES: dict[str, tuple[int, int, int, int]] = {
 # Asymmetric on every side (left, right, top, bottom) -- the normal case for
 # F.pad's 4-tuple, not just the symmetric special case.
 PAD2D_PADDING = (3, 5, 2, 4)
+# The 1-d and 3-d pads, and every pad's backward (called directly, a
+# gather over grad_output). Each rank's shapes keep every side above the
+# largest pad of that rank, again with one awkward shape.
+PAD1D_SHAPES: dict[str, tuple[int, ...]] = {
+    "S_32x64x4096": (32, 64, 4096),
+    "S_16x3x357789": (16, 3, 357789),
+}
+PAD1D_PADDING: tuple[int, ...] = (3, 5)
+PAD3D_SHAPES: dict[str, tuple[int, ...]] = {
+    "S_4x32x32x64x64": (4, 32, 32, 64, 64),
+    "S_2x3x37x57x89": (2, 3, 37, 57, 89),
+}
+PAD3D_PADDING: tuple[int, ...] = (3, 5, 2, 4, 1, 2)
+PAD_BY_RANK = {
+    1: (PAD1D_SHAPES, PAD1D_PADDING),
+    2: (PAD2D_SHAPES, PAD2D_PADDING),
+    3: (PAD3D_SHAPES, PAD3D_PADDING),
+}
+PAD_MODES = {"reflection": "reflect", "replication": "replicate"}
+PAD1D_OPS = {"reflection_pad1d": 1, "replication_pad1d": 1}
+PAD3D_OPS = {"reflection_pad3d": 3, "replication_pad3d": 3}
+PAD1D_BACKWARD_OPS = {f"{m}_pad1d_backward": 1 for m in PAD_MODES}
+PAD2D_BACKWARD_OPS = {f"{m}_pad2d_backward": 2 for m in PAD_MODES}
+PAD3D_BACKWARD_OPS = {f"{m}_pad3d_backward": 3 for m in PAD_MODES}
 
 COVERS: dict[str, str] = {
     "aten::split_with_sizes_copy.out": "test_split_copy_rows",
@@ -92,13 +118,75 @@ COVERS: dict[str, str] = {
     "aten::_index_put_impl_": "test_index_put",
     "aten::reflection_pad2d": "test_reflection_pad2d",
     "aten::replication_pad2d": "test_replication_pad2d",
+    **{f"aten::{name}": "test_pad1d" for name in PAD1D_OPS},
+    **{f"aten::{name}": "test_pad3d" for name in PAD3D_OPS},
+    **{f"aten::{name}": "test_pad1d_backward" for name in PAD1D_BACKWARD_OPS},
+    **{f"aten::{name}": "test_pad2d_backward" for name in PAD2D_BACKWARD_OPS},
+    **{f"aten::{name}": "test_pad3d_backward" for name in PAD3D_BACKWARD_OPS},
     "aten::masked_select": "test_masked_select",
     "aten::masked_select.out": (
         "test_masked_select (same kernels, the result copied into out)"
     ),
 }
 
-SKIPPED: dict[str, str] = {}
+# The indexing group (tmb/ops/indexing.mojo) and the range factories.
+COVERS |= {
+    "aten::flip": "test_flip",
+    "aten::roll": "test_roll",
+    "aten::channel_shuffle": "test_channel_shuffle",
+    "aten::take": "test_take",
+    "aten::take.out": "test_take (same gather, into the caller's out)",
+    "aten::put_": "test_put",
+    "aten::index_fill_.int_Scalar": "test_index_fill",
+    "aten::index_fill_.int_Tensor": (
+        "test_index_fill (the same scatter after one read of the 0-d value)"
+    ),
+    "aten::index_copy": "test_index_copy",
+    "aten::index_copy_": "test_index_copy (the same scatter, into self)",
+    "aten::index_copy.out": "test_index_copy (a copy of self, then the same scatter)",
+    "aten::masked_scatter_": "test_masked_scatter",
+    "aten::repeat_interleave.Tensor": "test_repeat_interleave",
+    "aten::unfold_backward": "test_unfold_backward",
+    "aten::linspace.out": "test_linspace",
+    "aten::logspace.out": "test_logspace",
+    "aten::eye.m_out": "test_eye",
+    "aten::eye.out": "test_eye (torch.eye(n) resolves to eye.m_out; same fills)",
+}
+
+_PAD_OUT = (
+    "out-variant plumbing over an already-benchmarked functional impl: the "
+    "same resample kernel, written into the caller's tensor"
+)
+SKIPPED: dict[str, str] = {
+    "aten::unfold": "pure view/metadata op: a storage-sharing as_strided, no kernel",
+    "aten::tril_indices": (
+        "no device kernel: the coordinates are written by a host loop and "
+        "uploaded with one H2D memcpy, which device time excludes"
+    ),
+    "aten::triu_indices": (
+        "no device kernel: the coordinates are written by a host loop and "
+        "uploaded with one H2D memcpy, which device time excludes"
+    ),
+    "aten::equal": (
+        "eq + all + a host read through the dispatcher: the kernels are the "
+        "benchmarked eq.Tensor and all, the rest is the sync"
+    ),
+    "aten::trace": (
+        "a strided diagonal view summed by the registered sum reduction, "
+        "benchmarked in test_reduction"
+    ),
+    "aten::dot": (
+        "mul + sum through the dispatcher (float32 for the half types), both "
+        "benchmarked in their own families"
+    ),
+    "aten::vdot": "dot for the real dtypes: mul + sum, both benchmarked",
+    **{
+        f"aten::{m}_pad{r}d{suffix}": _PAD_OUT
+        for m in PAD_MODES
+        for r in (1, 2, 3)
+        for suffix in (".out", "_backward.grad_input")
+    },
+}
 
 
 SPLIT_COPY_SHAPES = {
@@ -466,6 +554,132 @@ def test_replication_pad2d(
     )
 
 
+def _pad_fn(name: str) -> tuple[str, int]:
+    """(F.pad mode, rank) of a `<mode>_pad<r>d[_backward]` op name."""
+    base, rest = name.split("_pad", 1)
+    return PAD_MODES[base], int(rest[0])
+
+
+def _pad_out_shape(shape: tuple[int, ...], padding: tuple[int, ...]) -> list[int]:
+    """F.pad's output shape: pairs (lo, hi) run from the last dim."""
+    out = list(shape)
+    for k in range(len(padding) // 2):
+        out[-1 - k] += padding[2 * k] + padding[2 * k + 1]
+    return out
+
+
+def _bench_pad(
+    name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    mode, rank = _pad_fn(name)
+    shapes, padding = PAD_BY_RANK[rank]
+    shape = shapes[shape_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.nn.functional.pad(x_ref, padding, mode=mode),
+        lambda: torch.nn.functional.pad(x_our, padding, mode=mode),
+        flops=float(math.prod(_pad_out_shape(shape, padding))),
+    )
+
+
+def _bench_pad_backward(
+    name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _, rank = _pad_fn(name)
+    shapes, padding = PAD_BY_RANK[rank]
+    shape = shapes[shape_id]
+    op = getattr(torch.ops.aten, name)
+    out_shape = _pad_out_shape(shape, padding)
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=dtype), hw, mojo_device)
+    g_ref, g_our = both(torch.randn(out_shape, dtype=dtype), hw, mojo_device)
+    bench.run(
+        lambda: op(g_ref, x_ref, list(padding)),
+        lambda: op(g_our, x_our, list(padding)),
+        flops=float(math.prod(out_shape)),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD1D_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(PAD1D_OPS))
+def test_pad1d(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _bench_pad(op_name, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD3D_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(PAD3D_OPS))
+def test_pad3d(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _bench_pad(op_name, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD1D_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(PAD1D_BACKWARD_OPS))
+def test_pad1d_backward(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _bench_pad_backward(op_name, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD2D_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(PAD2D_BACKWARD_OPS))
+def test_pad2d_backward(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _bench_pad_backward(op_name, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD3D_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(PAD3D_BACKWARD_OPS))
+def test_pad3d_backward(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    _bench_pad_backward(op_name, shape_id, dtype_id, bench, hw, mojo_device)
+
+
 MASKED_SELECT_SHAPES: dict[str, tuple[int, ...]] = {
     "C_16777216": (16777216,),
     "A_357x789": (357, 789),
@@ -487,4 +701,269 @@ def test_masked_select(
         lambda: torch.masked_select(x_ref, m_ref),
         lambda: torch.masked_select(x_our, m_our),
         flops=float(x_ref.numel()),
+    )
+
+
+# ---------------------------------------------------------------------------
+# The indexing group: flip / roll / channel_shuffle are strided copies,
+# take / put_ / index_fill_ / index_copy the gather and scatter kernels,
+# masked_scatter_ and repeat_interleave compositions around cumsum.
+# ---------------------------------------------------------------------------
+
+INDEXING_SHAPES: dict[str, tuple[int, int]] = {
+    "S_4096x4096": (4096, 4096),
+    "A_357x789": (357, 789),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", INDEXING_SHAPES)
+@pytest.mark.parametrize("layout", ("dim0", "dim1", "both"))
+def test_flip(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    dims = {"dim0": (0,), "dim1": (1,), "both": (0, 1)}[layout]
+    shape = INDEXING_SHAPES[shape_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.flip(x_ref, dims),
+        lambda: torch.flip(x_our, dims),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", INDEXING_SHAPES)
+@pytest.mark.parametrize("layout", ("dim1", "both", "flat"))
+def test_roll(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    shape = INDEXING_SHAPES[shape_id]
+    args = {"dim1": ((37,), (1,)), "both": ((5, 37), (0, 1)), "flat": ((12345,), ())}
+    shifts, dims = args[layout]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.roll(x_ref, shifts, dims),
+        lambda: torch.roll(x_our, shifts, dims),
+        flops=float(x_ref.numel()),
+    )
+
+
+CHANNEL_SHUFFLE_SHAPES: dict[str, tuple[tuple[int, int, int, int], int]] = {
+    "S_32x256x28x28_g4": ((32, 256, 28, 28), 4),
+    "A_8x116x19x23_g2": ((8, 116, 19, 23), 2),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", CHANNEL_SHUFFLE_SHAPES)
+def test_channel_shuffle(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape, groups = CHANNEL_SHUFFLE_SHAPES[shape_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.nn.functional.channel_shuffle(x_ref, groups),
+        lambda: torch.nn.functional.channel_shuffle(x_our, groups),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", INDEXING_SHAPES)
+def test_take(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = INDEXING_SHAPES[shape_id]
+    numel = shape[0] * shape[1]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    i_ref, i_our = both(torch.randint(-numel, numel, (numel // 2,)), hw, mojo_device)
+    bench.run(
+        lambda: torch.take(x_ref, i_ref),
+        lambda: torch.take(x_our, i_our),
+        flops=float(i_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", INDEXING_SHAPES)
+@pytest.mark.parametrize("layout", ("set", "accumulate"))
+def test_put(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    shape = INDEXING_SHAPES[shape_id]
+    numel = shape[0] * shape[1]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=dtype), hw, mojo_device)
+    i_ref, i_our = both(torch.randperm(numel)[: numel // 2], hw, mojo_device)
+    s_ref, s_our = both(torch.randn(numel // 2, dtype=dtype), hw, mojo_device)
+    acc = layout == "accumulate"
+    bench.run(
+        lambda: x_ref.put_(i_ref, s_ref, accumulate=acc),
+        lambda: x_our.put_(i_our, s_our, accumulate=acc),
+        flops=float(i_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", INDEXING_SHAPES)
+@pytest.mark.parametrize("layout", ("dim0", "dim1"))
+def test_index_fill(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    dim = 0 if layout == "dim0" else 1
+    shape = INDEXING_SHAPES[shape_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    idx = torch.randperm(shape[dim])[: shape[dim] // 3]
+    i_ref, i_our = both(idx, hw, mojo_device)
+    bench.run(
+        lambda: x_ref.index_fill_(dim, i_ref, -1.0),
+        lambda: x_our.index_fill_(dim, i_our, -1.0),
+        flops=float(idx.numel() * x_ref.numel() // shape[dim]),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", INDEXING_SHAPES)
+@pytest.mark.parametrize("layout", ("dim0", "dim1"))
+def test_index_copy(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    dim = 0 if layout == "dim0" else 1
+    shape = INDEXING_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=dtype), hw, mojo_device)
+    idx = torch.randperm(shape[dim])[: shape[dim] // 3]
+    src_shape = list(shape)
+    src_shape[dim] = idx.numel()
+    i_ref, i_our = both(idx, hw, mojo_device)
+    s_ref, s_our = both(torch.randn(src_shape, dtype=dtype), hw, mojo_device)
+    bench.run(
+        lambda: x_ref.index_copy_(dim, i_ref, s_ref),
+        lambda: x_our.index_copy_(dim, i_our, s_our),
+        flops=float(s_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", INDEXING_SHAPES)
+def test_masked_scatter(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = INDEXING_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=dtype), hw, mojo_device)
+    m_ref, m_our = both(torch.rand(shape) < 0.5, hw, mojo_device)
+    s_ref, s_our = both(torch.randn(shape, dtype=dtype), hw, mojo_device)
+    bench.run(
+        lambda: x_ref.masked_scatter_(m_ref, s_ref),
+        lambda: x_our.masked_scatter_(m_our, s_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+REPEAT_INTERLEAVE_SHAPES: dict[str, int] = {"N_65536": 65536, "N_789": 789}
+
+
+@pytest.mark.parametrize("dtype_id", ("i64",))
+@pytest.mark.parametrize("shape_id", REPEAT_INTERLEAVE_SHAPES)
+def test_repeat_interleave(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    # `output_size` given: no host read of the total on either leg.
+    repeats = torch.randint(0, 8, (REPEAT_INTERLEAVE_SHAPES[shape_id],))
+    total = int(repeats.sum())
+    r_ref, r_our = both(repeats.to(DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.repeat_interleave(r_ref, output_size=total),
+        lambda: torch.repeat_interleave(r_our, output_size=total),
+        flops=float(total),
+    )
+
+
+UNFOLD_SHAPES: dict[str, tuple[int, int, int]] = {
+    "S_16x65536_k8s1": (16, 65536, 8),
+    "A_357x789_k5s1": (357, 789, 5),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", UNFOLD_SHAPES)
+def test_unfold_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    rows, cols, size = UNFOLD_SHAPES[shape_id]
+    grad_shape = (rows, cols - size + 1, size)
+    g_ref, g_our = both(
+        torch.randn(grad_shape, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.ops.aten.unfold_backward(g_ref, [rows, cols], 1, size, 1),
+        lambda: torch.ops.aten.unfold_backward(g_our, [rows, cols], 1, size, 1),
+        flops=float(g_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32", "bf16", "i64"))
+@pytest.mark.parametrize("shape_id", (f"N_{ARANGE_N}",))
+def test_linspace(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    dtype = DTYPES[dtype_id]
+    bench.run(
+        lambda: torch.linspace(-3, 1000, ARANGE_N, dtype=dtype, device=hw.stock_device),
+        lambda: torch.linspace(-3, 1000, ARANGE_N, dtype=dtype, device=mojo_device),
+        flops=float(ARANGE_N),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32", "bf16"))
+@pytest.mark.parametrize("shape_id", (f"N_{ARANGE_N}",))
+def test_logspace(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    dtype = DTYPES[dtype_id]
+    bench.run(
+        lambda: torch.logspace(-3, 3, ARANGE_N, dtype=dtype, device=hw.stock_device),
+        lambda: torch.logspace(-3, 3, ARANGE_N, dtype=dtype, device=mojo_device),
+        flops=float(ARANGE_N),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32", "bf16"))
+@pytest.mark.parametrize("shape_id", ("S_4096x4096", "A_357x789"))
+def test_eye(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, m = INDEXING_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    bench.run(
+        lambda: torch.eye(n, m, dtype=dtype, device=hw.stock_device),
+        lambda: torch.eye(n, m, dtype=dtype, device=mojo_device),
+        flops=float(n * m),
     )

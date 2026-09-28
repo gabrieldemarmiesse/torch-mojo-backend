@@ -108,6 +108,79 @@ def test_compare_out_tensor_and_scalar(mojo_gpu: str, call_checker: CallChecker)
     torch.testing.assert_close(out3.cpu(), torch.tensor([True, False, True]))
 
 
+@pytest.mark.parametrize("name", list(_COMPARE_OPS))
+@pytest.mark.parametrize(
+    "out_dtype", [torch.float32, torch.float16, torch.int32, torch.int64]
+)
+def test_compare_out_non_bool(mojo_device: str, name: str, out_dtype: torch.dtype):
+    """A comparison casts its bool result into an `out` of any dtype."""
+    fn = _COMPARE_OPS[name][0]
+    a = torch.tensor([[1.0, 2.0, 3.0], [4.0, 2.0, -6.0]])
+    b = torch.tensor([2.0, 2.0, 3.0])
+    for other in (b, 2.0):
+        other_dev = other.to(mojo_device) if isinstance(other, torch.Tensor) else other
+        expected = fn(a, other, out=torch.empty(0, dtype=out_dtype))
+        # A wrong-shape `out` is resized...
+        out = torch.empty(0, dtype=out_dtype, device=mojo_device)
+        assert fn(a.to(mojo_device), other_dev, out=out) is out
+        assert out.dtype == out_dtype
+        torch.testing.assert_close(out.cpu(), expected)
+        # ...a non-contiguous one of the right shape is written through its strides.
+        base = torch.full((3, 2), 7, dtype=out_dtype, device=mojo_device)
+        strided = base.t()
+        fn(a.to(mojo_device), other_dev, out=strided)
+        torch.testing.assert_close(strided.cpu(), expected)
+
+
+@pytest.mark.parametrize("name", list(_COMPARE_OPS))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_compare_inplace_non_bool(mojo_device: str, name: str, dtype: torch.dtype):
+    """`x.eq_(y)` on a non-bool `x` stores 0 / 1 in x's own dtype."""
+    x = torch.tensor([[0.0, 1.0, 2.0], [2.0, -1.0, 5.0]]).to(dtype)
+    y = torch.tensor([2.0, 1.0, 0.0]).to(dtype)
+    for other in (y, 2):
+        other_dev = other.to(mojo_device) if isinstance(other, torch.Tensor) else other
+        expected = getattr(x.clone(), name + "_")(other)
+        got = x.to(mojo_device)
+        assert getattr(got, name + "_")(other_dev) is got
+        assert got.dtype == dtype
+        torch.testing.assert_close(got.cpu(), expected)
+    # A non-contiguous self is written in place through its strides.
+    expected = getattr(x.t().clone(), name + "_")(1)
+    got = x.to(mojo_device).t()
+    getattr(got, name + "_")(1)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_compare_out_contract(mojo_device: str):
+    """TensorIterator's `out=` meta, bool and non-bool `out` alike."""
+    a = torch.tensor([1.0, 2.0, 3.0]).to(mojo_device)
+    for dtype in (torch.bool, torch.float32):
+        # An expanded `out` overlaps itself.
+        expanded = torch.zeros(1, dtype=dtype, device=mojo_device).expand(3)
+        with pytest.raises(RuntimeError, match="single memory location"):
+            torch.eq(a, 2.0, out=expanded)
+    # In place, broadcasting may not enlarge self.
+    x = torch.tensor([1.0, 2.0, 3.0]).to(mojo_device)
+    with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+        x.eq_(torch.ones(2, 3, device=mojo_device))
+    # An `out` partially overlapping an input.
+    base = torch.tensor([1.0, 2.0, 3.0, 4.0]).to(mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.lt(base[:3], 2.5, out=base[1:])
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bool, torch.float32])
+def test_compare_out_resized_to_zero_dim(mojo_device: str, out_dtype: torch.dtype):
+    """A 0-d result resizes a [1] `out` to 0-d (the rank matters)."""
+    x = torch.tensor(2.0)
+    out = torch.zeros(1, dtype=out_dtype, device=mojo_device)
+    torch.eq(x.to(mojo_device), 2.0, out=out)
+    expected = torch.eq(x, 2.0, out=torch.zeros(1, dtype=out_dtype))
+    assert out.shape == expected.shape == torch.Size([])
+    torch.testing.assert_close(out.cpu(), expected)
+
+
 def test_compare_device_mismatch_raises(mojo_gpu: str):
     a = torch.tensor([1.0]).to(mojo_gpu)
     with pytest.raises(RuntimeError):
@@ -662,3 +735,124 @@ def test_binary_add_degenerate_shapes(mojo_device: str, shape):
     out = cpu.to(mojo_device) + cpu.to(mojo_device)
     assert out.shape == cpu.shape
     torch.testing.assert_close(out.cpu(), cpu + cpu)
+
+
+# ---------------------------------------------------------------------------
+# masked_fill: broadcasting self, scalar conversion, a CPU / other-dtype
+# value tensor
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.int64, torch.bool]
+)
+def test_masked_fill_broadcasts_self(mojo_device: str, dtype: torch.dtype):
+    x = (torch.randn(5) * 10).to(dtype)
+    mask = torch.randn(4, 5) > 0
+    value = torch.tensor(1, dtype=dtype)
+    for v in (7, value):
+        got = x.to(mojo_device).masked_fill(
+            mask.to(mojo_device), v if isinstance(v, int) else v.to(mojo_device)
+        )
+        assert got.shape == (4, 5)
+        assert torch.equal(got.cpu(), x.masked_fill(mask, v))
+
+
+@pytest.mark.parametrize("dtype", [torch.bool, torch.int64, torch.float16])
+def test_masked_fill_scalar_conversion(mojo_device: str, dtype: torch.dtype):
+    x = (torch.randn(3, 4) * 10).to(dtype)
+    mask = torch.randn(3, 4) > 0
+    for value in (10, 2.5, -3, 0):
+        got = x.to(mojo_device).masked_fill(mask.to(mojo_device), value)
+        assert torch.equal(got.cpu(), x.masked_fill(mask, value))
+    inplace = x.to(mojo_device)
+    inplace.masked_fill_(mask.to(mojo_device), 10)
+    assert torch.equal(inplace.cpu(), x.masked_fill(mask, 10))
+
+
+def test_masked_fill_value_tensor_elsewhere(mojo_device: str):
+    x = torch.randn(3, 4)
+    mask = torch.randn(3, 4) > 0
+    cpu_value = torch.tensor(-2.5)
+    got = x.to(mojo_device).masked_fill(mask.to(mojo_device), cpu_value)
+    assert torch.equal(got.cpu(), x.masked_fill(mask, cpu_value))
+    int_value = torch.tensor(3, device=mojo_device)
+    got = x.to(mojo_device).masked_fill(mask.to(mojo_device), int_value)
+    assert torch.equal(got.cpu(), x.masked_fill(mask, torch.tensor(3)))
+    with pytest.raises(RuntimeError, match="0-dimensional value tensor"):
+        x.to(mojo_device).masked_fill(
+            mask.to(mojo_device), torch.ones(1, device=mojo_device)
+        )
+    with pytest.raises(RuntimeError, match="without overflow"):
+        x.to(mojo_device).masked_fill(mask.to(mojo_device), 1j)
+    # A complex scalar with a zero imaginary part fills its real part.
+    got = x.to(mojo_device).masked_fill(mask.to(mojo_device), 2.5 + 0j)
+    assert torch.equal(got.cpu(), x.masked_fill(mask, 2.5 + 0j))
+    u = torch.zeros(3, 4, dtype=torch.uint8, device=mojo_device)
+    for bad in (256.0, -1.0, 256, -256, float("nan")):
+        with pytest.raises(RuntimeError, match="without overflow"):
+            u.masked_fill(mask.to(mojo_device), bad)
+    # An integer Scalar wraps into uint8 (-1 -> 255), a float truncates.
+    got = u.masked_fill(mask.to(mojo_device), -1)
+    assert torch.equal(got.cpu(), u.cpu().masked_fill(mask, -1))
+    got = u.masked_fill(mask.to(mojo_device), 2.9)
+    assert torch.equal(got.cpu(), u.cpu().masked_fill(mask, 2.9))
+
+
+# ---------------------------------------------------------------------------
+# equal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.int64, torch.bool]
+)
+def test_equal(mojo_device: str, dtype: torch.dtype):
+    call_checker = CallChecker()
+    call_checker.register("aten::equal")
+    x = (torch.randn(4, 5) * 10).to(dtype)
+    d = x.to(mojo_device)
+    assert torch.equal(d, x.clone().to(mojo_device))
+    assert torch.equal(d, d)
+    assert torch.equal(d, d.t().contiguous().t())
+    assert not torch.equal(d, d.flip(0)) or torch.equal(x, x.flip(0))
+    assert not torch.equal(d, d[:3])
+    assert torch.equal(d[:0], d[:0].clone())
+    call_checker.check_was_called()
+
+
+def test_equal_nan_and_promotion(mojo_device: str):
+    n = torch.tensor([float("nan"), 1.0])
+    d = n.to(mojo_device)
+    # CUDA's `cuda_equal`: the same view short-circuits to True (CPU's
+    # compares, and says False); a copy compares NaN != NaN.
+    assert torch.equal(d, d)
+    assert not torch.equal(d, d.clone())
+    i = torch.tensor([1, 2])
+    assert torch.equal(i.to(mojo_device), i.int().to(mojo_device)) == torch.equal(
+        i, i.int()
+    )
+
+
+def test_masked_fill_out_aliasing_an_input(mojo_device: str):
+    """out= sharing storage with self (or the mask) and needing a resize:
+    the result is computed before the resize can move that storage."""
+    mask = torch.randn(4, 5) > 0
+    for value in (7.0, torch.tensor(7.0)):
+        x = torch.randn(5)
+        d = x.to(mojo_device)
+        if isinstance(value, torch.Tensor):
+            v = value.to(mojo_device)
+            op = torch.ops.aten.masked_fill.Tensor_out
+        else:
+            v = value
+            op = torch.ops.aten.masked_fill.Scalar_out
+        got = op(d, mask.to(mojo_device), v, out=d)
+        assert got.shape == (4, 5)
+        assert torch.equal(d.cpu(), x.masked_fill(mask, value))
+        # out= an empty view of self's storage: resizing it grows that storage.
+        base = torch.randn(5)
+        db = base.to(mojo_device)
+        out = db[:0]
+        op(db, mask.to(mojo_device), v, out=out)
+        assert torch.equal(out.cpu(), base.masked_fill(mask, value))

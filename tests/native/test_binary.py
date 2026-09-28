@@ -1590,6 +1590,55 @@ def test_maximum_minimum_bool(mojo_device):
     torch.testing.assert_close(torch.minimum(a, b).cpu(), torch.minimum(a_cpu, b_cpu))
 
 
+def test_add_bool(mojo_device):
+    """bool + bool is a logical or, and stays bool (CUDA's add kernel on bool)."""
+    a_cpu = torch.tensor([[True, False, True, False], [False, False, True, True]])
+    b_cpu = torch.tensor([True, True, False, False])
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    for got, expected in (
+        (a + b, a_cpu + b_cpu),  # broadcast
+        (b + a, b_cpu + a_cpu),
+        (a + a, a_cpu + a_cpu),
+        (a.t() + a.t(), a_cpu.t() + a_cpu.t()),  # non-contiguous
+        (a + True, a_cpu + True),
+        (False + a, False + a_cpu),  # __radd__
+        (a + torch.tensor(True).to(mojo_device), a_cpu + torch.tensor(True)),
+    ):
+        assert got.dtype == torch.bool
+        torch.testing.assert_close(got.cpu(), expected)
+    out = torch.empty(0, dtype=torch.bool, device=mojo_device)
+    assert torch.add(a, b, out=out) is out
+    torch.testing.assert_close(out.cpu(), a_cpu + b_cpu)
+    inplace = a.clone()
+    inplace += b
+    torch.testing.assert_close(inplace.cpu(), a_cpu + b_cpu)
+    # A bool result cast into a wider `out`.
+    wide = torch.empty(0, dtype=torch.float32, device=mojo_device)
+    torch.add(a, b, out=wide)
+    torch.testing.assert_close(wide.cpu(), (a_cpu + b_cpu).float())
+
+
+def test_add_bool_float_alpha_raises(mojo_device):
+    a = torch.tensor([True, False]).to(mojo_device)
+    with pytest.raises(RuntimeError, match="argument alpha must not be a floating"):
+        torch.add(a, a, alpha=0.5)
+    # An integer alpha is a bool: 0 keeps a, anything else ors b in.
+    torch.testing.assert_close(torch.add(a, a.logical_not(), alpha=0).cpu(), a.cpu())
+    torch.testing.assert_close(
+        torch.add(a, a.logical_not(), alpha=2).cpu(), torch.tensor([True, True])
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.bool])
+def test_rdiv_integral(mojo_device, dtype):
+    """`3 / t` is `t.reciprocal() * 3`, a float result for integral t."""
+    x_cpu = torch.tensor([[1, 2], [0, 5]]).to(dtype)
+    got = 3 / x_cpu.to(mojo_device)
+    expected = 3 / x_cpu
+    assert got.dtype == expected.dtype
+    torch.testing.assert_close(got.cpu(), expected)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
 def test_clamp_min_max(mojo_device, dtype):
     a_cpu, a = _both((5, 3), dtype, mojo_device, low=-9, high=9)

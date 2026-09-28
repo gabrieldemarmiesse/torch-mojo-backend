@@ -1149,6 +1149,18 @@ def op_native_dropout_backward(
     var grad = v_tensor(args[unsafe_offset=0])
     var keep = v_tensor(args[unsafe_offset=1])
     var scale = v_f64(args[unsafe_offset=2])
+    if keep.dtype != DType.bool:
+        raise Error(
+            "Mask should be Bool Scalar Type", _scalar_type_name(keep.dtype)
+        )
+    if not _dropout_dtype_ok(grad.dtype):
+        # Dropout.cu's dropout_backward_cuda dispatches on the floating
+        # types only (CPU's `grad * mask * scale` takes any dtype).
+        raise Error(
+            '"masked_scale" not implemented for \'',
+            _scalar_type_name(grad.dtype),
+            "'",
+        )
     if (
         not _dropout_dtype_ok(grad.dtype)
         or keep.dtype != DType.bool

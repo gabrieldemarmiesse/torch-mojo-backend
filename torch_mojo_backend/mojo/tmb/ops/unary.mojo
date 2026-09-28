@@ -353,6 +353,12 @@ def op_neg_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::sign(Tensor self) -> Tensor
 def op_sign(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
+    if t.dtype == DType.bool:
+        # UnarySignKernels.cu's sign_kernel_cuda: the identity on bool.
+        var out = own(new_like(t))
+        copy_strided_into(out.t, t)
+        ret_owned(rets, 0, out)
+        return
     var out = own(_direct_unary("SignSpec", t))
     ret_owned(rets, 0, out)
 
@@ -361,6 +367,12 @@ def op_sign(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_sign_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
+    if t.dtype == DType.bool:
+        _out_prologue(t, dst, t.stype)
+        if dst.h != t.h:
+            copy_strided_into(dst, t)
+        ret_ref(rets, 0, dst)
+        return
     _direct_unary_out("SignSpec", t, dst)
     ret_ref(rets, 0, dst)
 
@@ -401,14 +413,16 @@ def op_relu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 # ---------------------------------------------------------------------------
-# Transcendental / float-only unary ops.
+# Transcendental unary ops: `unary_float_op`s, so an integer or bool input
+# computes in the default float dtype (`_promote`), float32/float16/bfloat16
+# otherwise.
 # ---------------------------------------------------------------------------
 
 
 # aten::acos(Tensor self) -> Tensor
 def op_acos(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("AcosSpec", t))
+    var out = own(_promoting_unary("AcosSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -416,14 +430,14 @@ def op_acos(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_acos_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("AcosSpec", t, dst)
+    _promoting_unary_out("AcosSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::acosh(Tensor self) -> Tensor
 def op_acosh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("AcoshSpec", t))
+    var out = own(_promoting_unary("AcoshSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -431,14 +445,14 @@ def op_acosh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_acosh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("AcoshSpec", t, dst)
+    _promoting_unary_out("AcoshSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::asinh(Tensor self) -> Tensor
 def op_asinh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("AsinhSpec", t))
+    var out = own(_promoting_unary("AsinhSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -446,14 +460,14 @@ def op_asinh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_asinh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("AsinhSpec", t, dst)
+    _promoting_unary_out("AsinhSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::atanh(Tensor self) -> Tensor
 def op_atanh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("AtanhSpec", t))
+    var out = own(_promoting_unary("AtanhSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -461,14 +475,14 @@ def op_atanh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_atanh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("AtanhSpec", t, dst)
+    _promoting_unary_out("AtanhSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::cos(Tensor self) -> Tensor
 def op_cos(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("CosSpec", t))
+    var out = own(_promoting_unary("CosSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -476,14 +490,14 @@ def op_cos(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_cos_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("CosSpec", t, dst)
+    _promoting_unary_out("CosSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::cosh(Tensor self) -> Tensor
 def op_cosh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("CoshSpec", t))
+    var out = own(_promoting_unary("CoshSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -491,14 +505,14 @@ def op_cosh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_cosh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("CoshSpec", t, dst)
+    _promoting_unary_out("CoshSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::erf(Tensor self) -> Tensor
 def op_erf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("ErfSpec", t))
+    var out = own(_promoting_unary("ErfSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -506,14 +520,14 @@ def op_erf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_erf_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("ErfSpec", t, dst)
+    _promoting_unary_out("ErfSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::exp(Tensor self) -> Tensor
 def op_exp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("ExpSpec", t))
+    var out = own(_promoting_unary("ExpSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -521,14 +535,14 @@ def op_exp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_exp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("ExpSpec", t, dst)
+    _promoting_unary_out("ExpSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::log(Tensor self) -> Tensor
 def op_log(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("LogSpec", t))
+    var out = own(_promoting_unary("LogSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -536,14 +550,14 @@ def op_log(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_log_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("LogSpec", t, dst)
+    _promoting_unary_out("LogSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::log1p(Tensor self) -> Tensor
 def op_log1p(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("Log1pSpec", t))
+    var out = own(_promoting_unary("Log1pSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -551,7 +565,7 @@ def op_log1p(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_log1p_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("Log1pSpec", t, dst)
+    _promoting_unary_out("Log1pSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
@@ -599,9 +613,11 @@ def _reciprocal_check(t: T) raises:
 # aten::reciprocal(Tensor self) -> Tensor
 def op_reciprocal(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    _reciprocal_check(t)
-    var out = own(_unary("elementwise", "ReciprocalSpec", t, t.dtype))
+    var src = own_if_new(_promote(t), t)
+    _reciprocal_check(src.t)
+    var out = own(_unary("elementwise", "ReciprocalSpec", src.t, src.t.dtype))
     ret_owned(rets, 0, out)
+    _ = src^
 
 
 # aten::reciprocal.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
@@ -610,15 +626,17 @@ def op_reciprocal_out(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _reciprocal_check(t)
-    _unary_out("elementwise", "ReciprocalSpec", t, dst, t.dtype, True)
+    var src = own_if_new(_promote(t), t)
+    _reciprocal_check(src.t)
+    _unary_out("elementwise", "ReciprocalSpec", src.t, dst, src.t.dtype, True)
+    _ = src^
     ret_ref(rets, 0, dst)
 
 
 # aten::rsqrt(Tensor self) -> Tensor
 def op_rsqrt(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("RsqrtSpec", t))
+    var out = own(_promoting_unary("RsqrtSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -626,14 +644,14 @@ def op_rsqrt(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_rsqrt_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("RsqrtSpec", t, dst)
+    _promoting_unary_out("RsqrtSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::sigmoid(Tensor self) -> Tensor
 def op_sigmoid(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("SigmoidSpec", t))
+    var out = own(_promoting_unary("SigmoidSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -641,7 +659,7 @@ def op_sigmoid(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_sigmoid_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("SigmoidSpec", t, dst)
+    _promoting_unary_out("SigmoidSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
@@ -663,7 +681,7 @@ def op_silu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::sin(Tensor self) -> Tensor
 def op_sin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("SinSpec", t))
+    var out = own(_promoting_unary("SinSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -671,14 +689,14 @@ def op_sin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_sin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("SinSpec", t, dst)
+    _promoting_unary_out("SinSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::sinh(Tensor self) -> Tensor
 def op_sinh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("SinhSpec", t))
+    var out = own(_promoting_unary("SinhSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -686,14 +704,14 @@ def op_sinh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_sinh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("SinhSpec", t, dst)
+    _promoting_unary_out("SinhSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::sqrt(Tensor self) -> Tensor
 def op_sqrt(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("SqrtSpec", t))
+    var out = own(_promoting_unary("SqrtSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -701,14 +719,14 @@ def op_sqrt(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_sqrt_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("SqrtSpec", t, dst)
+    _promoting_unary_out("SqrtSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::tan(Tensor self) -> Tensor
 def op_tan(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("TanSpec", t))
+    var out = own(_promoting_unary("TanSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -716,14 +734,14 @@ def op_tan(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_tan_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("TanSpec", t, dst)
+    _promoting_unary_out("TanSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
 # aten::tanh(Tensor self) -> Tensor
 def op_tanh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("TanhSpec", t))
+    var out = own(_promoting_unary("TanhSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -731,7 +749,7 @@ def op_tanh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_tanh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("TanhSpec", t, dst)
+    _promoting_unary_out("TanhSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 

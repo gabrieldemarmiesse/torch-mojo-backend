@@ -159,6 +159,27 @@ def assert_no_overlap(written: T, other: T) raises:
         )
 
 
+def shares_storage(a: T, b: T) -> Bool:
+    """Whether `a` and `b` view one storage, overlapping or not. An `out=`
+    that shares storage with an input must not be resized before the kernel
+    has read that input: `resize_out` may reallocate the storage and leave the
+    input's cached data pointer dangling. Compute into a fresh tensor, then
+    resize and copy (see `tmb/ops/resample.mojo`'s `_dest`)."""
+    var s = a.storage_ptr()
+    return s != 0 and s == b.storage_ptr()
+
+
+def same_view(a: T, b: T) -> Bool:
+    """Whether `a` and `b` address exactly the same elements in the same
+    order (same data pointer, shape and strides)."""
+    if a.ptr != b.ptr or a.stype != b.stype or not a.same_shape(b):
+        return False
+    for i in range(a.rank):
+        if a.dim(i) > 1 and a.stride(i) != b.stride(i):
+            return False
+    return True
+
+
 def assert_no_internal_overlap(t: T) raises:
     """`at::assert_no_internal_overlap`: an `out=` tensor may not alias
     itself (e.g. a size-1 storage `.expand()`ed to more than one logical
@@ -193,10 +214,17 @@ def check_out(dest: T, like: T) raises:
     costs no launch, and a float result can never be silently truncated into
     an integer buffer nor copied across devices without ordering.
     """
-    if dest.stype != like.stype:
+    check_out_as(dest, like.stype, like)
+
+
+def check_out_as(dest: T, stype: Int32, like: T) raises:
+    """`check_out` for an `out=` whose dtype is not `like`'s (the int64
+    `indices` of the max pools): `dest` must hold `stype` and live on
+    `like`'s device."""
+    if dest.stype != stype:
         raise Error(
             "Expected out tensor to have dtype ",
-            dtype_name(like.stype),
+            dtype_name(stype),
             ", but got ",
             dtype_name(dest.stype),
             " instead",

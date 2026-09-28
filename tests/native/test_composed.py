@@ -622,3 +622,130 @@ def test_softmax_backward(mojo_gpu, dim):
         torch.softmax(ours, dim=dim).backward(grad.to(mojo_gpu))
     assert ours.grad is not None
     torch.testing.assert_close(ours.grad.cpu(), ref.grad, atol=1e-5, rtol=1e-5)
+
+
+def _softmax_backward_cuda(
+    grad: torch.Tensor, out: torch.Tensor, dim: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """SoftMax.cu's softmax_backward_cuda_out, rounding for rounding: `tmp =
+    grad * out` in the gradient's dtype, then `tmp - out * sum(tmp)` in float
+    (accscalar_t), rounded once to `dtype`."""
+    tmp = (grad * out).float()
+    total = tmp.sum(dim, keepdim=True)
+    return (tmp - out.float() * total).to(dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dim", [0, -1])
+def test_softmax_backward_half(mojo_gpu, dtype, dim):
+    """The half product `grad * out` is rounded before the float reduction,
+    as CUDA's is."""
+    torch.manual_seed(6)
+    out = torch.softmax(torch.randn(6, 50) * 3, dim).to(dtype)
+    grad = torch.randn(6, 50).to(dtype)
+    want = _softmax_backward_cuda(grad, out, dim, dtype)
+    with assert_ran("aten::_softmax_backward_data"):
+        got = torch.ops.aten._softmax_backward_data(
+            grad.to(mojo_gpu), out.to(mojo_gpu), dim, dtype
+        )
+    assert got.dtype == dtype
+    torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=2e-3)
+
+
+def test_softmax_backward_half_rounds_the_product(mojo_gpu):
+    """bf16 output [0.7, 0.3], grad [3, 3]: in exact math the gradient is 0,
+    but CUDA rounds grad * out to bf16 first and gets about +-0.001175."""
+    out = torch.tensor([0.7, 0.3], dtype=torch.bfloat16)
+    grad = torch.tensor([3.0, 3.0], dtype=torch.bfloat16)
+    want = _softmax_backward_cuda(grad, out, 0, torch.bfloat16)
+    assert want.abs().max() > 1e-3
+    got = torch.ops.aten._softmax_backward_data(
+        grad.to(mojo_gpu), out.to(mojo_gpu), 0, torch.bfloat16
+    )
+    torch.testing.assert_close(got.cpu(), want, atol=0, rtol=0)
+
+
+def test_softmax_backward_half_to_float(mojo_gpu):
+    """half_to_float's backward: a float gradient narrowed to float16, the
+    only mismatch CUDA accepts."""
+    torch.manual_seed(7)
+    out = torch.softmax(torch.randn(4, 30), -1)
+    grad = torch.randn(4, 30)
+    want = _softmax_backward_cuda(grad, out, -1, torch.float16)
+    got = torch.ops.aten._softmax_backward_data(
+        grad.to(mojo_gpu), out.to(mojo_gpu), -1, torch.float16
+    )
+    assert got.dtype == torch.float16
+    torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=2e-3)
+    with pytest.raises(RuntimeError, match="input to be at::Half"):
+        torch.ops.aten._softmax_backward_data(
+            grad.to(mojo_gpu), out.to(mojo_gpu), -1, torch.bfloat16
+        )
+
+
+# ---------------------------------------------------------------------------
+# trace / dot / vdot (and inner, a composite over dot)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.bool]
+)
+@pytest.mark.parametrize("shape", [(7, 9), (9, 7), (5, 5), (0, 3)])
+def test_trace(mojo_gpu, dtype, shape):
+    x = (torch.randn(shape) * 10).to(dtype)
+    with assert_ran("aten::trace"):
+        got = torch.trace(x.to(mojo_gpu))
+    # CUDA's `trace_cuda` is `diagonal().sum()` for every dtype (CPU's trace
+    # has no half/bool kernel).
+    expected = x.diagonal().sum()
+    assert got.dtype == expected.dtype
+    torch.testing.assert_close(got.cpu(), expected, rtol=1e-2, atol=1e-2)
+    got_t = torch.trace(x.to(mojo_gpu).t()).cpu()
+    torch.testing.assert_close(got_t, x.t().diagonal().sum(), rtol=1e-2, atol=1e-2)
+    with pytest.raises(RuntimeError, match="expected a matrix"):
+        torch.trace(torch.zeros(2, 2, 2, device=mojo_gpu))
+
+
+@pytest.mark.parametrize("op", ["dot", "vdot", "inner"])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int32]
+)
+def test_dot(mojo_gpu, op, dtype):
+    fn = getattr(torch, op)
+    g = torch.Generator().manual_seed(0)
+    a = (torch.randn(37, generator=g) * 4).to(dtype)
+    b = (torch.randn(37, generator=g) * 4).to(dtype)
+    with assert_ran("aten::vdot" if op == "vdot" else "aten::dot"):
+        got = fn(a.to(mojo_gpu), b.to(mojo_gpu))
+    expected = fn(a.double(), b.double()).to(dtype)
+    assert got.dtype == dtype
+    tol = (
+        0 if not dtype.is_floating_point else (1e-4 if dtype == torch.float32 else 1e-2)
+    )
+    torch.testing.assert_close(got.cpu(), expected, rtol=tol, atol=tol)
+    # Strided operands: columns of a row-major matrix (stride 4) and a
+    # reversed-step slice.
+    s = (torch.randn(37, 4, generator=g) * 4).to(dtype).to(mojo_gpu)
+    u, v = s[:, 1], s[:, 3]
+    assert not u.is_contiguous() and not v.is_contiguous()
+    if op == "inner" and dtype == torch.int32:
+        return  # strided int32 inner decomposes to an int32 sum, not ours
+    torch.testing.assert_close(
+        fn(u, v).cpu(),
+        fn(u.cpu().double(), v.cpu().double()).to(dtype),
+        rtol=tol or 1e-2,
+        atol=tol or 1e-2,
+    )
+
+
+def test_dot_errors(mojo_gpu):
+    a = torch.ones(3, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="1D tensors expected"):
+        torch.dot(torch.ones(1, 1, device=mojo_gpu), a)
+    with pytest.raises(RuntimeError, match="expected both vectors to have same dtype"):
+        torch.dot(a, a.half())
+    with pytest.raises(RuntimeError, match="inconsistent tensor size"):
+        torch.dot(torch.ones(9, device=mojo_gpu), a)
+    with pytest.raises(RuntimeError, match="not implemented for 'Bool'"):
+        torch.dot(a.bool(), a.bool())

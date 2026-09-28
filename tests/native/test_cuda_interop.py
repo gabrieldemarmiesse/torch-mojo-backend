@@ -242,29 +242,30 @@ def test_call_cuda_needs_a_mojo_tensor():
 
 
 def test_fallback_runs_an_op_the_mojo_device_lacks(gpu):
-    """`aten::take` has no mojo kernel: without the fallback it raises, with
+    """`aten::histc` has no mojo kernel: without the fallback it raises, with
     it the CUDA kernel runs on the mojo tensors."""
     x = torch.randn(8, 5, device=gpu)
-    idx = torch.tensor([0, 3, 3, 7], device=gpu)
     with pytest.raises(NotImplementedError):
-        torch.take(x, idx)
+        torch.histc(x, bins=4, min=-2, max=2)
     with cuda_interop.cuda_fallback():
-        out = torch.take(x, idx)
+        out = torch.histc(x, bins=4, min=-2, max=2)
     assert out.device.type == "mojo"
-    torch.testing.assert_close(out.cpu(), torch.take(x.cpu(), idx.cpu()))
+    torch.testing.assert_close(out.cpu(), torch.histc(x.cpu(), bins=4, min=-2, max=2))
 
 
 def test_fallback_carries_autograd(gpu):
-    """`take` has no mojo kernel in either direction: forward and backward
-    (`put_`) both go through CUDA, on an autograd graph that never leaves
+    """`grid_sampler_2d` has no mojo kernel in either direction: forward and
+    backward both go through CUDA, on an autograd graph that never leaves
     mojo tensors."""
     torch.manual_seed(0)
-    x = torch.randn(8, 5, device=gpu, requires_grad=True)
-    idx = torch.tensor([0, 3, 3, 7], device=gpu)
+    x = torch.randn(1, 2, 4, 5, device=gpu, requires_grad=True)
+    grid = torch.rand(1, 3, 3, 2, device=gpu) * 2 - 1
     with cuda_interop.cuda_fallback():
-        torch.take(x, idx).sum().backward()
+        torch.nn.functional.grid_sample(x, grid, align_corners=False).sum().backward()
     xc = x.detach().cpu().requires_grad_()
-    torch.take(xc, idx.cpu()).sum().backward()
+    torch.nn.functional.grid_sample(
+        xc, grid.cpu(), align_corners=False
+    ).sum().backward()
     assert x.grad is not None and xc.grad is not None
     torch.testing.assert_close(x.grad.cpu(), xc.grad)
 
@@ -315,11 +316,10 @@ def test_fallback_is_only_a_fallback(gpu):
 
 def test_the_fallback_goes_away_with_its_block(gpu):
     x = torch.randn(8, 5, device=gpu)
-    idx = torch.tensor([0, 3], device=gpu)
     with cuda_interop.cuda_fallback():
-        torch.take(x, idx)
+        torch.histc(x, bins=4)
     with pytest.raises(NotImplementedError):
-        torch.take(x, idx)
+        torch.histc(x, bins=4)
 
 
 def test_enable_cuda_fallback_lasts_for_the_process(gpu, tmp_path):
@@ -335,9 +335,10 @@ def test_enable_cuda_fallback_lasts_for_the_process(gpu, tmp_path):
         "cuda_interop.enable_cuda_fallback()\n"
         "cuda_interop.enable_cuda_fallback()  # idempotent\n"
         "gc.collect()\n"
-        "x = torch.randn(8, 5, device='mojo:0', requires_grad=True)\n"
-        "idx = torch.tensor([0, 3], device='mojo:0')\n"
-        "torch.take(x, idx).sum().backward()\n"
+        "x = torch.randn(1, 2, 4, 5, device='mojo:0', requires_grad=True)\n"
+        "grid = torch.rand(1, 3, 3, 2, device='mojo:0') * 2 - 1\n"
+        "torch.nn.functional.grid_sample(x, grid, align_corners=False)"
+        ".sum().backward()\n"
         "w = torch.randn(4, 3, 3, 3, device='mojo:0', requires_grad=True)\n"
         "a = torch.randn(2, 3, 16, 16, device='mojo:0', requires_grad=True)\n"
         "torch.nn.functional.conv2d(a, w, padding=1).sum().backward()\n"

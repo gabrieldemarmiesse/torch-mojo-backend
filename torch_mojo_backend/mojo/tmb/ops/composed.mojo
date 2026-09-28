@@ -9,16 +9,22 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    ST_BFLOAT16,
+    ST_FLOAT16,
     ST_FLOAT32,
     T,
     TAG_BOOL,
     TAG_BOOL_LIST,
     TAG_DOUBLE,
+    TAG_DTYPE,
     TAG_INT_LIST,
     TAG_NONE,
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
     TAG_TENSOR,
+    ST_FLOAT16,
+    ST_BFLOAT16,
+    ST_INT64,
     Value,
     Values,
     contiguous_strides,
@@ -26,6 +32,7 @@ from tmb.backend.abi import (
     new_like,
     new_tensor,
     own,
+    own_if_new,
     release,
     retain,
     ret_owned,
@@ -47,9 +54,11 @@ from tmb.ops.common import (
     call_op,
     cast_to,
     copy_strided_into,
+    device_str,
     fill_value,
     resize_out,
 )
+from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 
 
@@ -987,8 +996,11 @@ def op_native_group_norm_backward(
 def op_softmax_backward_data(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    """`out * (grad - sum(grad * out, dim, keepdim=True))`, ATen's formula
-    (SoftMax.cpp `softmax_backward_cpu_out`)."""
+    """SoftMax.cu's softmax_backward_cuda_out: `tmp = grad * output` in the
+    gradient's dtype (a half product is rounded to half), then
+    SoftMaxBackwardEpilogue `tmp - output * sum(tmp, dim)` with the sum and
+    the epilogue in float (accscalar_t), rounded once to the result dtype.
+    """
     var grad = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=1])
     var dim = v_int(args[unsafe_offset=2])
@@ -1004,13 +1016,13 @@ def op_softmax_backward_data(
             "_softmax_backward_data: grad_output and output must match in"
             " shape and dtype"
         )
-    if target != grad.stype:
-        # `half_to_float`: the forward's input was half and its output float,
-        # so the gradient would have to come back narrowed. `_softmax` itself
-        # declines that route, so nothing here can produce it.
-        unsupported(
-            "_softmax_backward_data with an input_dtype different from the"
-            " gradient's"
+    if target != grad.stype and not (
+        grad.stype == ST_FLOAT32 and target == ST_FLOAT16
+    ):
+        # `half_to_float` is the one mismatch CUDA allows, float16 only.
+        raise Error(
+            "expected input and grad types to match, or input to be at::Half"
+            " and grad to be at::Float"
         )
     var rank = out.rank
     if rank == 0:
@@ -1021,11 +1033,145 @@ def op_softmax_backward_data(
     dims.append(Int64(dim + rank if dim < 0 else dim))
     var g = _hold(grad)
     var o = _hold(out)
-    var prod = _mul(g, o)
-    var total = _sum_dims(prod, dims, True)
-    var diff = _sub(g, total)
-    var gi = _mul(o, diff)
+    var tmp = _mul(g, o)  # rounded to the gradient's dtype, as CUDA's is
+    var acc = grad.stype
+    if acc == ST_FLOAT16 or acc == ST_BFLOAT16:
+        acc = ST_FLOAT32
+    var tmp_acc = _as_dtype(tmp.t, acc)
+    var o_acc = _as_dtype(out, acc)
+    var total = _sum_dims(tmp_acc, dims, True)
+    var scaled = _mul(o_acc, total)
+    var gi = _sub(tmp_acc, scaled)
+    if gi.t.stype != target:
+        var narrowed = _as_dtype(gi.t, target)
+        ret_owned(rets, 0, narrowed)
+        return
     ret_owned(rets, 0, gi)
+
+
+# ---------------------------------------------------------------------------
+# trace -- ATen's `trace_cuda` (native/cuda/TriangularOps.cu):
+# `self.diagonal().sum()`, the diagonal a storage-sharing view and the sum
+# the registered reduction (integers and bool accumulate into int64).
+# ---------------------------------------------------------------------------
+
+
+# aten::trace(Tensor self) -> Tensor
+def op_trace(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    if a.rank != 2:
+        raise Error(
+            "trace: expected a matrix, but got tensor with dim ", a.rank
+        )
+    var shape = IndexList[MAX_RANK](1)
+    var strides = IndexList[MAX_RANK](0)
+    shape[MAX_RANK - 1] = min(a.dim(0), a.dim(1))
+    strides[MAX_RANK - 1] = a.stride(0) + a.stride(1)
+    var diag = own(view_strided(a, shape, strides, 1, a.offset))
+    var r = own(
+        _dispatch(
+            "aten::sum", "", [_tensor_value(diag.t), Value(TAG_NONE, 0, 0, 0)]
+        )
+    )
+    _ = diag^  # read by the sum
+    ret_owned(rets, 0, r)
+
+
+# ---------------------------------------------------------------------------
+# dot / vdot (real dtypes) -- ATen's `dot_cuda` / `vdot_cuda`
+# (native/cuda/Blas.cpp; vdot of a real tensor is dot): cuBLAS there, the
+# product and the registered sum here. The half types multiply and sum in
+# float32 and round once, as cuBLAS's float-compute dot does; the integer
+# dtypes (which only the CPU implements upstream) keep theirs.
+# ---------------------------------------------------------------------------
+
+
+def _dot(args: Values, rets: Values) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    if a.rank != 1 or b.rank != 1:
+        raise Error(
+            "1D tensors expected, but got ",
+            a.rank,
+            "D and ",
+            b.rank,
+            "D tensors",
+        )
+    if a.stype != b.stype:
+        raise Error(
+            "dot : expected both vectors to have same dtype, but found ",
+            _scalar_type_name(a.dtype),
+            " and ",
+            _scalar_type_name(b.dtype),
+        )
+    if a.numel != b.numel:
+        raise Error(
+            "inconsistent tensor size, expected tensor [",
+            a.numel,
+            "] and src [",
+            b.numel,
+            "] to have the same number of elements, but got ",
+            a.numel,
+            " and ",
+            b.numel,
+            " elements respectively",
+        )
+    if a.device_type != b.device_type or a.device != b.device:
+        raise Error(
+            "Expected all tensors to be on the same device. Found: ",
+            device_str(a),
+            ", ",
+            device_str(b),
+        )
+    if a.dtype == DType.bool:
+        raise Error("\"dot\" not implemented for 'Bool'")
+    var half = a.stype == ST_FLOAT16 or a.stype == ST_BFLOAT16
+    var fa = own_if_new(cast_to(a, ST_FLOAT32) if half else a.copy(), a)
+    var fb = own_if_new(cast_to(b, ST_FLOAT32) if half else b.copy(), b)
+    var prod = own(
+        _dispatch(
+            "aten::mul", "Tensor", [_tensor_value(fa.t), _tensor_value(fb.t)]
+        )
+    )
+    _ = fa^  # read by the product
+    _ = fb^
+    var acc = _dot_acc_stype(a)
+    var total = own(
+        _dispatch(
+            "aten::sum",
+            "",
+            [_tensor_value(prod.t), Value(TAG_DTYPE, 0, Int64(acc), 0)],
+        )
+    )
+    _ = prod^  # read by the sum
+    if acc != a.stype:
+        var r = own_if_new(cast_to(total.t, a.stype), total.t)
+        _ = total^  # read by the cast
+        ret_owned(rets, 0, r)
+        return
+    ret_owned(rets, 0, total)
+
+
+def _dot_acc_stype(a: T) -> Int32:
+    """The dtype dot sums in: float32 for the half types (cuBLAS's float
+    compute), int64 for the narrower integers (the sum kernel's integer
+    accumulator; the cast back wraps exactly like an int32 accumulation),
+    `a`'s own otherwise."""
+    if a.stype == ST_FLOAT16 or a.stype == ST_BFLOAT16:
+        return ST_FLOAT32
+    if a.dtype.is_integral():
+        return ST_INT64
+    return a.stype
+
+
+# aten::dot(Tensor self, Tensor tensor) -> Tensor
+def op_dot(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _dot(args, rets)
+
+
+# aten::vdot(Tensor self, Tensor other) -> Tensor
+def op_vdot(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _dot(args, rets)
 
 
 def register_composed(site: Site) raises:
@@ -1041,3 +1187,6 @@ def register_composed(site: Site) raises:
     impl[op_native_batch_norm_backward, "native_batch_norm_backward"](site)
     impl[op_native_group_norm_backward, "native_group_norm_backward"](site)
     impl[op_softmax_backward_data, "_softmax_backward_data"](site)
+    impl[op_trace, "trace"](site)
+    impl[op_dot, "dot"](site)
+    impl[op_vdot, "vdot"](site)

@@ -105,6 +105,26 @@ def _close(
     )
 
 
+def test_bool_pow_and_square(mojo_gpu):
+    """A bool tensor to an integer power promotes to int64 (`square` is
+    `pow(x, 2)`); a float exponent to the default float dtype."""
+    x = torch.tensor([[True, False, True], [False, False, True]])
+    for got, want in (
+        (torch.square(x.to(mojo_gpu)), torch.square(x)),
+        (torch.square(x.t().to(mojo_gpu)), torch.square(x.t())),
+        (torch.pow(x.to(mojo_gpu), 3), torch.pow(x, 3)),
+        (torch.pow(x.to(mojo_gpu), 0), torch.pow(x, 0)),
+        (torch.pow(x.to(mojo_gpu), 2.5), torch.pow(x, 2.5)),
+    ):
+        assert got.dtype == want.dtype
+        _close(got, want)
+    out = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+    assert torch.pow(x.to(mojo_gpu), 2, out=out) is out
+    _close(out, torch.pow(x, 2))
+    with pytest.raises(RuntimeError, match="negative integer powers"):
+        torch.pow(x.to(mojo_gpu), -1)
+
+
 @pytest.mark.parametrize("dtype", [torch.int64, torch.int32, torch.uint8])
 def test_integer_pow(mojo_gpu, dtype):
     torch.manual_seed(9)
@@ -1234,6 +1254,85 @@ def test_activation_b_out(mojo_gpu, name):
     _close(strided, want, **_tol(torch.float32, 2))
     with pytest.raises(RuntimeError):
         op(x, out=torch.empty(4, 5, dtype=torch.float16, device=mojo_gpu))
+
+
+# --------------------------------------------------------------------------
+# glu / glu_backward
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_glu(mojo_gpu, dtype, dim):
+    torch.manual_seed(3)
+    x = torch.cat([torch.tensor(_SPECIAL[:16]), torch.randn(80) * 4]).reshape(4, 6, 4)
+    x = x.to(dtype)
+    with ran("aten::glu"):
+        got = F.glu(x.to(mojo_gpu), dim)
+    _close(got, F.glu(x, dim), **_tol(dtype, 4))
+    # A non-contiguous input and an `out=` of another float dtype.
+    xt = x.transpose(0, 2)
+    _close(F.glu(xt.to(mojo_gpu), dim), F.glu(xt, dim), **_tol(dtype, 4))
+    out = torch.empty(0, device=mojo_gpu)
+    assert torch.ops.aten.glu.out(x.to(mojo_gpu), dim, out=out) is out
+    _close(out, F.glu(x, dim).float(), **_tol(dtype, 4))
+
+
+def test_glu_errors(mojo_gpu):
+    with pytest.raises(RuntimeError, match="Halving dimension must be even"):
+        F.glu(torch.randn(3, 5).to(mojo_gpu), -1)
+    with pytest.raises(RuntimeError, match="glu does not support scalars"):
+        F.glu(torch.randn(()).to(mojo_gpu))
+    with pytest.raises(Exception, match="Dimension out of range"):
+        F.glu(torch.randn(3, 4).to(mojo_gpu), 2)
+
+
+def test_glu_backward_grad_input_partial_overlap_raises(mojo_gpu):
+    base = torch.randn(9).to(mojo_gpu)
+    grad = torch.randn(4).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.ops.aten.glu_backward.grad_input(grad, base[:8], 0, grad_input=base[1:])
+
+
+def test_glu_backward_empty_integer(mojo_gpu):
+    """CUDA returns before its dtype dispatch on an empty iterator."""
+    x = torch.zeros(0, 4, dtype=torch.int64)
+    grad = torch.zeros(0, 2, dtype=torch.int64)
+    got = torch.ops.aten.glu_backward(grad.to(mojo_gpu), x.to(mojo_gpu), -1)
+    assert got.shape == (0, 4) and got.dtype == torch.int64
+
+
+def test_glu_backward_dtype_mismatch_raises(mojo_gpu):
+    x = torch.randn(4, 6).to(mojo_gpu)
+    grad = torch.randn(4, 3, dtype=torch.float16).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="Found dtype Half but expected Float"):
+        torch.ops.aten.glu_backward(grad, x, -1)
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+@pytest.mark.parametrize("dim", [0, 2, -1])
+def test_glu_backward(mojo_gpu, dtype, dim):
+    torch.manual_seed(4)
+    x = (torch.randn(4, 6, 8) * 3).to(dtype)
+    # CUDA's kernel computes in float and rounds once; CPU's half kernel
+    # rounds its intermediates, so the reference is the float math rounded.
+    ref = x.detach().float().clone().requires_grad_(True)
+    out = F.glu(ref, dim)
+    grad = torch.randn_like(out).to(dtype)
+    out.backward(grad.float())
+    assert ref.grad is not None
+    want = ref.grad.to(dtype)
+    ours = x.to(mojo_gpu).requires_grad_(True)
+    with ran("aten::glu_backward"):
+        F.glu(ours, dim).backward(grad.to(mojo_gpu))
+    assert ours.grad is not None
+    _close(ours.grad, want, **_tol(dtype, 8))
+    # The grad_input overload writes through a non-contiguous destination.
+    dest = torch.empty(x.shape[::-1], dtype=dtype, device=mojo_gpu).permute(2, 1, 0)
+    torch.ops.aten.glu_backward.grad_input(
+        grad.to(mojo_gpu), x.to(mojo_gpu), dim, grad_input=dest
+    )
+    _close(dest, want, **_tol(dtype, 8))
 
 
 @pytest.mark.parametrize("dtype", FLOATS)

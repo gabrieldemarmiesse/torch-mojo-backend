@@ -1411,6 +1411,34 @@ def test_addr(mojo_device, dtype):
     )
 
 
+def test_addr_bool(mojo_device):
+    """bool addr is `self or (vec1 and vec2)`, through the bool add."""
+    self_ = torch.tensor([[True, False, False], [False, False, True]])
+    vec1 = torch.tensor([True, False])
+    vec2 = torch.tensor([False, True, True])
+    for beta, alpha in ((True, True), (False, True)):
+        got = torch.addr(
+            self_.to(mojo_device),
+            vec1.to(mojo_device),
+            vec2.to(mojo_device),
+            beta=beta,
+            alpha=alpha,
+        )
+        assert got.dtype == torch.bool
+        torch.testing.assert_close(
+            got.cpu(), torch.addr(self_, vec1, vec2, beta=beta, alpha=alpha)
+        )
+
+
+def test_addr_bool_float_scalar_raises(mojo_device):
+    b = torch.tensor([[True, False], [False, True]]).to(mojo_device)
+    v = torch.tensor([True, False]).to(mojo_device)
+    with pytest.raises(RuntimeError, match="argument beta must not be a floating"):
+        torch.addr(b, v, v, beta=0.5)
+    with pytest.raises(RuntimeError, match="argument alpha must not be a floating"):
+        torch.addr(b, v, v, alpha=0.5)
+
+
 def test_addr_default_beta_alpha(mojo_device):
     self_ = torch.randn(4, 6)
     vec1 = torch.randn(4)
