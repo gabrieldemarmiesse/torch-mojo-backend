@@ -1771,6 +1771,8 @@ def test_index_select_backward(mojo_gpu):
 )
 def test_scatter_add(mojo_gpu, shape, dim, dtype):
     """Every target collides many times: a plain scatter would fail."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
     x = _small_ints(shape, dtype)
     index_shape = tuple(max(1, s - 1) for s in shape)
     index = torch.randint(0, min(3, shape[dim]), index_shape)
@@ -1824,6 +1826,8 @@ def test_scatter_add_rejects_bad_indices(mojo_gpu):
     ("shape", "dim"), [((37, 53), 0), ((37, 53), -1), ((5, 7, 9), 1), ((3, 5, 4, 7), 2)]
 )
 def test_index_add(mojo_gpu, shape, dim, dtype, idx_dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
     x = _small_ints(shape, dtype)
     index = torch.randint(0, shape[dim], (23,), dtype=idx_dtype)
     index[:4] = index[4]  # duplicates accumulate

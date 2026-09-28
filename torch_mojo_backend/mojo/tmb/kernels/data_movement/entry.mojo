@@ -22,7 +22,7 @@ from std.collections import Array
 from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
-from std.sys import is_amd_gpu, is_nvidia_gpu
+from std.sys import is_amd_gpu, is_apple_gpu, is_nvidia_gpu
 from std.sys.info import (
     has_accelerator,
     has_apple_gpu_accelerator,
@@ -123,6 +123,53 @@ def _atomic_scope() -> StaticString:
         return "agent"
     else:
         return ""
+
+
+@always_inline
+def _atomic_add[
+    dtype: DType
+](ptr: Pointer[Scalar[dtype], MutUntrackedOrigin], value: Scalar[dtype]):
+    """Relaxed atomic `ptr[] += value`. Apple GPUs only have 32-bit atomics:
+    int64 adds its two halves with an explicit carry (exact once the launch
+    ends; nothing reads the target mid-launch), and a 16-bit float CASes the
+    aligned 32-bit word holding it (Metal has a single queue, so no other
+    kernel writes the neighbouring half meanwhile)."""
+    comptime if is_apple_gpu() and dtype == DType.int64:
+        var words = ptr.unsafe_bitcast[Scalar[DType.uint32]]()
+        var v = bitcast[DType.uint64](value)
+        var lo = v.cast[DType.uint32]()
+        var old = Atomic[Scalar[DType.uint32]].fetch_add[
+            ordering=Ordering.RELAXED
+        ](words, lo)
+        var carry = UInt32(1) if old + lo < old else UInt32(0)
+        _ = Atomic[Scalar[DType.uint32]].fetch_add[ordering=Ordering.RELAXED](
+            words.unsafe_offset(1), (v >> 32).cast[DType.uint32]() + carry
+        )
+    elif is_apple_gpu() and size_of[dtype]() == 2:
+        # Rebuilding a pointer from an integer address hangs the launch on
+        # Metal: step back one element to reach an odd half's word instead.
+        var high = Int(ptr) & 2 != 0
+        var word = (ptr.unsafe_offset(-1) if high else ptr).unsafe_bitcast[
+            Scalar[DType.uint32]
+        ]()
+        var shift = UInt32(16) if high else UInt32(0)
+        var expected = word[]
+        while True:
+            var half = bitcast[dtype]((expected >> shift).cast[DType.uint16]())
+            var bits = bitcast[DType.uint16](half + value).cast[DType.uint32]()
+            var desired = (expected & ~(UInt32(0xFFFF) << shift)) | (
+                bits << shift
+            )
+            if Atomic[Scalar[DType.uint32]].compare_exchange[
+                success_ordering=Ordering.RELAXED,
+                failure_ordering=Ordering.RELAXED,
+                weak=True,
+            ](word, expected, desired):
+                break
+    else:
+        _ = Atomic[Scalar[dtype], scope=_atomic_scope()].fetch_add[
+            ordering=Ordering.RELAXED
+        ](ptr, value)
 
 
 # ---------------------------------------------------------------------------
@@ -3474,9 +3521,7 @@ def _scatter_dim[
             # Colliding targets sum, in an unspecified order (torch's CUDA
             # scatter_add is atomic too). Relaxed is enough: nothing else in
             # the launch reads `out`.
-            _ = Atomic[Scalar[dtype], scope=_atomic_scope()].fetch_add[
-                ordering=Ordering.RELAXED
-            ](
+            _atomic_add(
                 out_ptr.unsafe_offset(out_off),
                 src_ptr[
                     unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3

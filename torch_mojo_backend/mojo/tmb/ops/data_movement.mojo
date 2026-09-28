@@ -1804,7 +1804,7 @@ def _scatter_validate(
     var ctx = ctx_for(a.device)
     var metal = ctx.api() == "metal"
     _ = ctx
-    if metal and (a.dtype == DType.float64 or (accumulate and a.itemsize == 2)):
+    if metal and a.dtype == DType.float64:
         unsupported(
             "aten::" + what + " of " + String(a.dtype) + " on Apple GPU"
         )
@@ -2311,7 +2311,7 @@ def _index_add_into(
     var ctx = ctx_for(a.device)
     var metal = ctx.api() == "metal"
     _ = ctx
-    if metal and (a.dtype == DType.float64 or a.itemsize == 2):
+    if metal and a.dtype == DType.float64:
         unsupported("aten::index_add of " + String(a.dtype) + " on Apple GPU")
     if source.numel == 0:
         return
@@ -2737,10 +2737,6 @@ def op_index_put_impl_(
     var ctx = ctx_for(target.device)
     if target.dtype == DType.float64 and ctx.api() == "metal":
         unsupported("_index_put_impl_: float64 is not supported on Apple GPU")
-    if accumulate and target.itemsize == 2 and ctx.api() == "metal":
-        unsupported(
-            "_index_put_impl_: 16-bit accumulate is not supported on Apple GPU"
-        )
     var pad4 = 4 - target.rank
     var params = List[Int](capacity=18)
     for d in range(4):
