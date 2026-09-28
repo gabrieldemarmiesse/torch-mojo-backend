@@ -724,11 +724,16 @@ def test_dot(mojo_gpu, op, dtype):
         0 if not dtype.is_floating_point else (1e-4 if dtype == torch.float32 else 1e-2)
     )
     torch.testing.assert_close(got.cpu(), expected, rtol=tol, atol=tol)
-    # Strided operands.
-    s = torch.randn(4, 37, generator=g).to(dtype).to(mojo_gpu)
+    # Strided operands: columns of a row-major matrix (stride 4) and a
+    # reversed-step slice.
+    s = (torch.randn(37, 4, generator=g) * 4).to(dtype).to(mojo_gpu)
+    u, v = s[:, 1], s[:, 3]
+    assert not u.is_contiguous() and not v.is_contiguous()
+    if op == "inner" and dtype == torch.int32:
+        return  # strided int32 inner decomposes to an int32 sum, not ours
     torch.testing.assert_close(
-        fn(s[1], s[2]).cpu(),
-        fn(s[1].cpu().double(), s[2].cpu().double()).to(dtype),
+        fn(u, v).cpu(),
+        fn(u.cpu().double(), v.cpu().double()).to(dtype),
         rtol=tol or 1e-2,
         atol=tol or 1e-2,
     )

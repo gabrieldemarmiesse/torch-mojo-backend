@@ -2277,7 +2277,7 @@ def test_aten_index_copy(conf: Conf, call_checker: CallChecker):
 
 
 def test_aten_masked_scatter(conf: Conf, call_checker: CallChecker):
-    call_checker.register(aten_functions.aten_masked_scatter, "aten::masked_scatter_")
+    call_checker.register("aten::masked_scatter_")
 
     def fn(x, mask, source):
         return aten.masked_scatter(x, mask, source)
@@ -2314,7 +2314,7 @@ def test_aten_dot_vdot(conf: Conf, call_checker: CallChecker, op: str):
 
 
 def test_aten_linspace_logspace(conf: Conf, call_checker: CallChecker):
-    call_checker.register(aten_functions.aten_linspace, aten_functions.aten_logspace)
+    call_checker.register("aten::linspace.out", "aten::logspace.out")
 
     def fn(x, device):
         return (

@@ -61,6 +61,7 @@ from tmb.ops.common import (
     assert_no_internal_overlap,
     assert_no_overlap,
     call_op,
+    check_out,
     contiguous,
     copy_strided_into,
     fill_value,
@@ -602,6 +603,10 @@ def op_take_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     assert_no_overlap(out, index)
     assert_no_overlap(out, a)
     resize_out(out, index.shape, index.rank)
+    # The resize may have moved a storage `out` shares with an input:
+    # re-read their pointers before any kernel reads them.
+    a = T(a.h)
+    index = T(index.h)
     if out.contig:
         _take_into(out, a, index)
     else:
@@ -891,7 +896,22 @@ def _list_str(xs: List[Int]) -> String:
 
 def _index_copy_into(dest: T, dim: Int, index: T, source: T) raises:
     """Scatter `source` into `dest` (already holding self's values)."""
-    if index.numel == 0 or dest.numel == 0:
+    if index.numel == 0:
+        return
+    if dest.rank > 0 and dest.dim(dim) == 0:
+        # Every index is out of bounds for an empty dimension (CPU reports
+        # the first one; read back only in this degenerate case).
+        var idx = own_if_new(contiguous(index), index)
+        var first = _read_int_at(_flat(idx.t), 0)
+        _ = idx^
+        raise Error(
+            "index_copy_(): index ",
+            first,
+            " is out of bounds for dimension ",
+            dim,
+            " with size 0",
+        )
+    if dest.numel == 0:
         return
     if dest.rank > 4:
         unsupported("index_copy of rank greater than 4")
@@ -938,15 +958,14 @@ def op_index_copy_out(
     var source = v_tensor(args[unsafe_offset=3])
     var out = v_tensor(args[unsafe_offset=4])
     var dim = _index_copy_check(a, v_int(args[unsafe_offset=1]), index, source)
-    if out.stype != a.stype:
-        raise Error(
-            "Expected out tensor to have dtype ",
-            _scalar_type_name(a.dtype),
-            ", but got ",
-            _scalar_type_name(out.dtype),
-            " instead",
-        )
+    check_out(out, a)
+    # The structured meta's order: resize first, then the overlap checks. The
+    # resize may move a storage `out` shares with an input, so every input
+    # is re-read after it.
     resize_out(out, a.shape, a.rank)
+    a = T(a.h)
+    index = T(index.h)
+    source = T(source.h)
     assert_no_internal_overlap(out)
     assert_no_overlap(out, index)
     assert_no_overlap(out, source)

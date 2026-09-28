@@ -234,6 +234,11 @@ def test_take_out_and_errors(mojo_device):
         torch.take(flat, di, out=flat[:3])
     with pytest.raises(RuntimeError, match="tried to take from an empty tensor"):
         torch.take(torch.zeros(0, device=mojo_device), di)
+    # out= an empty view of self's storage: the resize grows that storage.
+    base = x.flatten().to(mojo_device)
+    out = base[:0]
+    torch.take(base, di, out=out)
+    _check(out, torch.take(x.flatten(), idx))
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -371,6 +376,15 @@ def test_index_copy_scalar_and_errors(mojo_device):
         )
     torch.index_copy(base, 0, two[:1], torch.ones(1, 4, device=mojo_device), out=base)
     assert base.cpu()[0].tolist() == [1.0] * 4
+    # out= on another device is refused before any kernel runs.
+    with pytest.raises(RuntimeError, match="Expected out tensor to have device"):
+        torch.index_copy(
+            d, 0, two[:1], torch.ones(1, 4, device=mojo_device), out=torch.empty(3, 4)
+        )
+    # An empty destination dimension rejects every index.
+    empty = torch.zeros(0, 3, device=mojo_device)
+    with pytest.raises(RuntimeError, match="out of bounds for dimension 0 with size 0"):
+        empty.index_copy(0, two[:1], torch.ones(1, 3, device=mojo_device))
 
 
 # ---------------------------------------------------------------------------

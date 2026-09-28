@@ -4128,90 +4128,6 @@ def aten_lift_fresh_copy(input: MaxTensor) -> MaxTensor:
     return input
 
 
-def _linspace_graph(
-    start: Scalar,
-    end: Scalar,
-    steps: int,
-    base: float | None,
-    dtype: torch.dtype | None,
-    device: torch.device | None,
-) -> MaxTensor:
-    """linspace (logspace when ``base`` is given) the way ATen's kernels
-    count: the first ``steps // 2`` elements up from ``start``, the rest down
-    from ``end``, so both endpoints are exact; float32 arithmetic (float64
-    for a float64 result), cast to the result dtype at the end."""
-    if isinstance(start, MaxTensor) or isinstance(end, MaxTensor):
-        raise NotImplementedError("linspace/logspace with tensor endpoints")
-    if steps < 0:
-        raise ValueError("number of steps must be non-negative")
-    out_dtype = torch_dtype_to_max(
-        dtype if dtype is not None else torch.get_default_dtype()
-    )
-    max_device = torch_device_to_max_device(
-        device if device is not None else torch.get_default_device()
-    )
-    compute = DType.float64 if out_dtype == DType.float64 else DType.float32
-    if dtype is not None and not dtype.is_floating_point and dtype != torch.bool:
-        # `Scalar::to<scalar_t>()` converts the endpoints before any
-        # arithmetic: a float truncates, an integer wraps into an unsigned
-        # type (-1 -> 255 for uint8), as the eager kernel does.
-        bits = torch.iinfo(dtype).bits
-        unsigned = torch.iinfo(dtype).min == 0
-        start, end = (
-            (int(v) % (1 << bits)) if unsigned else int(v) for v in (start, end)
-        )
-    if steps <= 1:
-        value = float(start) if base is None else float(base) ** float(start)
-        return _broadcast_to(
-            F.constant(value, dtype=out_dtype, device=max_device), [steps]
-        )
-    iota = F.arange(0, steps, 1, dtype=compute, device=max_device)
-    step = (float(end) - float(start)) / (steps - 1)
-    rising = F.constant(float(start), dtype=compute, device=max_device) + iota * step
-    falling = (
-        F.constant(float(end), dtype=compute, device=max_device)
-        - (F.constant(float(steps - 1), dtype=compute, device=max_device) - iota) * step
-    )
-    half = F.constant(float(steps // 2), dtype=compute, device=max_device)
-    values = _where(iota < half, rising, falling)
-    if base is not None:
-        values = F.pow(
-            F.constant(float(base), dtype=compute, device=max_device), values
-        )
-    return F.cast(values, out_dtype)
-
-
-# linspace(Scalar start, Scalar end, int steps, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
-@map_to(aten.linspace)
-def aten_linspace(
-    start: Scalar,
-    end: Scalar,
-    steps: int,
-    *,
-    dtype: torch.dtype | None = None,
-    layout: torch.layout | None = None,
-    device: torch.device | None = None,
-    pin_memory: bool | None = None,
-) -> MaxTensor:
-    return _linspace_graph(start, end, steps, None, dtype, device)
-
-
-# logspace(Scalar start, Scalar end, int steps, float base=10.0, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
-@map_to(aten.logspace)
-def aten_logspace(
-    start: Scalar,
-    end: Scalar,
-    steps: int,
-    base: float = 10.0,
-    *,
-    dtype: torch.dtype | None = None,
-    layout: torch.layout | None = None,
-    device: torch.device | None = None,
-    pin_memory: bool | None = None,
-) -> MaxTensor:
-    return _linspace_graph(start, end, steps, base, dtype, device)
-
-
 # log(Tensor self) -> Tensor
 @map_to(aten.log)
 def aten_log(input: MaxTensor) -> MaxTensor:
@@ -4302,32 +4218,6 @@ def aten_lt(input: MaxTensor, other: Scalar | MaxTensor) -> MaxTensor:
 
 
 # masked_scatter(Tensor self, Tensor mask, Tensor source) -> Tensor
-@map_to(aten.masked_scatter)
-def aten_masked_scatter(
-    input: MaxTensor, mask: MaxTensor, source: MaxTensor
-) -> MaxTensor:
-    """The i-th selected element (row-major) takes ``source``'s i-th: the
-    mask's inclusive prefix sum minus one is that i, gathered (clamped into
-    range where unselected) and kept only where the mask is set."""
-    shape = list(
-        torch.broadcast_shapes(
-            tuple(int(d) for d in input.shape), tuple(int(d) for d in mask.shape)
-        )
-    )
-    numel = math.prod(shape)
-    count = math.prod(int(d) for d in source.shape)
-    base = _broadcast_to(input, shape)
-    if numel == 0 or count == 0:
-        return base
-    flat_mask = F.reshape(_broadcast_to(mask, shape), [numel])
-    position = F.cumsum(F.cast(flat_mask, DType.int64), axis=0)
-    one = F.constant(1, dtype=DType.int64, device=position.device)
-    last = F.constant(count, dtype=DType.int64, device=position.device)
-    position = (
-        _where(position < one, one, _where(position > last, last, position)) - one
-    )
-    picked = F.gather(F.reshape(source, [count]), position, axis=0)
-    return F.reshape(_where(flat_mask, picked, F.reshape(base, [numel])), shape)
 
 
 # put(Tensor self, Tensor index, Tensor source, bool accumulate=False) -> Tensor

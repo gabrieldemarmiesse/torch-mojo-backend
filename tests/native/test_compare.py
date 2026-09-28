@@ -829,3 +829,27 @@ def test_equal_nan_and_promotion(mojo_device: str):
     assert torch.equal(i.to(mojo_device), i.int().to(mojo_device)) == torch.equal(
         i, i.int()
     )
+
+
+def test_masked_fill_out_aliasing_an_input(mojo_device: str):
+    """out= sharing storage with self (or the mask) and needing a resize:
+    the result is computed before the resize can move that storage."""
+    mask = torch.randn(4, 5) > 0
+    for value in (7.0, torch.tensor(7.0)):
+        x = torch.randn(5)
+        d = x.to(mojo_device)
+        if isinstance(value, torch.Tensor):
+            v = value.to(mojo_device)
+            op = torch.ops.aten.masked_fill.Tensor_out
+        else:
+            v = value
+            op = torch.ops.aten.masked_fill.Scalar_out
+        got = op(d, mask.to(mojo_device), v, out=d)
+        assert got.shape == (4, 5)
+        assert torch.equal(d.cpu(), x.masked_fill(mask, value))
+        # out= an empty view of self's storage: resizing it grows that storage.
+        base = torch.randn(5)
+        db = base.to(mojo_device)
+        out = db[:0]
+        op(db, mask.to(mojo_device), v, out=out)
+        assert torch.equal(out.cpu(), base.masked_fill(mask, value))
