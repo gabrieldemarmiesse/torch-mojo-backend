@@ -45,7 +45,13 @@ from tmb.backend.abi import (
 from tmb.backend.device import copy_from_host, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import call_op, copy_strided_into, fill_value, resize_out
+from tmb.ops.common import (
+    assert_no_internal_overlap,
+    call_op,
+    copy_strided_into,
+    fill_value,
+    resize_out,
+)
 from tmb.ops.data_movement import _resolve_device, _scalar_type_name
 from tmb.backend.registry import Site, impl
 
@@ -265,6 +271,7 @@ def _eye_into(mut out_t: T, n: Int, m: Int) raises:
     shape[MAX_RANK - 2] = n
     shape[MAX_RANK - 1] = m
     resize_out(out_t, shape, 2)
+    assert_no_internal_overlap(out_t)
     if out_t.numel == 0:
         return
     fill_value(out_t, 0.0)
@@ -520,6 +527,7 @@ def _range_out(
         var shape = IndexList[MAX_RANK](1)
         shape[MAX_RANK - 1] = steps
         resize_out(out_t, shape, 1)
+    assert_no_internal_overlap(out_t)
     if steps == 0:
         return
     if out_t.dtype == DType.float64 and dev(out_t.device)[].api == "metal":

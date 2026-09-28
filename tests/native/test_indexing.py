@@ -219,6 +219,37 @@ def test_take(mojo_device, dtype):
     _check(torch.take(x.to(mojo_device), empty.to(mojo_device)), torch.take(x, empty))
 
 
+def test_out_overloads_reject_internal_overlap(mojo_device):
+    """Every out= of this batch refuses an out whose elements alias each
+    other (copy_'s / the structured kernels' assert_no_internal_overlap)."""
+
+    def expanded(*shape: int) -> torch.Tensor:
+        return torch.empty(1, device=mojo_device).expand(*shape)
+
+    d = torch.randn(3, 4, device=mojo_device)
+    mask = torch.randn(3, 4, device=mojo_device) > 0
+    i = torch.tensor([0, 2], device=mojo_device)
+    src = torch.ones(2, 4, device=mojo_device)
+    value = torch.tensor(1.0, device=mojo_device)
+    cases = [
+        lambda: torch.linspace(0, 1, 3, out=expanded(3)),
+        lambda: torch.logspace(0, 1, 3, out=expanded(3)),
+        lambda: torch.eye(3, out=expanded(3, 3)),
+        lambda: torch.eye(3, 4, out=expanded(3, 4)),
+        lambda: torch.take(d, i, out=expanded(2)),
+        lambda: torch.index_copy(d, 0, i, src, out=expanded(3, 4)),
+        lambda: torch.ops.aten.masked_fill.Scalar_out(d, mask, 1.0, out=expanded(3, 4)),
+        lambda: torch.ops.aten.masked_fill.Tensor_out(
+            d, mask, value, out=expanded(3, 4)
+        ),
+    ]
+    for case in cases:
+        with pytest.raises(
+            RuntimeError, match="more than one element of the written-to"
+        ):
+            case()
+
+
 def test_take_out_and_errors(mojo_device):
     x = _make((3, 4), torch.float32)
     idx = torch.tensor([1, -1, 5])
@@ -327,6 +358,12 @@ def test_index_fill_scalar_conversions(mojo_device):
     u = torch.zeros(3, 4, dtype=torch.uint8, device=mojo_device)
     with pytest.raises(RuntimeError, match="without overflow"):
         u.index_fill(1, di, 256.0)
+    # An empty filled dimension rejects every index; an empty other one is a
+    # no-op.
+    e = torch.empty(0, 3, device=mojo_device)
+    with pytest.raises(RuntimeError, match="out of bounds for dimension 0 with size 0"):
+        e.index_fill(0, torch.tensor([0], device=mojo_device), 2)
+    assert e.index_fill(1, torch.tensor([0], device=mojo_device), 2).shape == (0, 3)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -381,6 +418,10 @@ def test_index_copy_scalar_and_errors(mojo_device):
         torch.index_copy(
             d, 0, two[:1], torch.ones(1, 4, device=mojo_device), out=torch.empty(3, 4)
         )
+    # A scalar self bounds-checks every index (index 1 of a size-1 dim).
+    scalar = torch.tensor(1.0, device=mojo_device)
+    with pytest.raises(RuntimeError, match="index out of range"):
+        scalar.index_copy(0, two, torch.tensor([5.0, 6.0], device=mojo_device))
     # An empty destination dimension rejects every index.
     empty = torch.zeros(0, 3, device=mojo_device)
     with pytest.raises(RuntimeError, match="out of bounds for dimension 0 with size 0"):

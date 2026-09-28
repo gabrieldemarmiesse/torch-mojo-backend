@@ -2255,9 +2255,7 @@ def test_aten_take(conf: Conf, call_checker: CallChecker):
 
 @pytest.mark.parametrize("dim", [0, 1])
 def test_aten_index_fill(conf: Conf, call_checker: CallChecker, dim: int):
-    call_checker.register(
-        aten_functions.aten_index_fill, "aten::index_fill_.int_Scalar"
-    )
+    call_checker.register("aten::index_fill_.int_Scalar")
 
     def fn(x, index):
         return aten.index_fill(x, dim, index, -1.5)

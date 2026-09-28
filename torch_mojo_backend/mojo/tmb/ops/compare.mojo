@@ -778,6 +778,20 @@ def _masked_fill_scalar_dispatch(
     _ = fill^  # alive past the launch
 
 
+def _prepare_out_checked(
+    mut out_arg: T,
+    shape: IndexList[MAX_RANK],
+    rank: Int,
+    stype: Int32,
+    device: Int,
+) raises -> Bool:
+    """`_prepare_out`, then copy_'s `assert_no_internal_overlap` on the
+    resized `out` (an expanded `out` would collapse distinct results)."""
+    var direct = _prepare_out(out_arg, shape, rank, stype, device)
+    assert_no_internal_overlap(out_arg)
+    return direct
+
+
 def _shares_storage(dest: T, t: T) -> Bool:
     """`dest` and `t` live in one storage (resizing `dest` can move `t`)."""
     var sp = dest.storage_ptr()
@@ -832,9 +846,10 @@ def op_masked_fill_scalar_out(
         var res = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
         _masked_fill_scalar_dispatch(mask, ae, args[unsafe_offset=2], res.t)
         _ensure_out_shape(out_arg, ae.shape, ae.rank, a.stype, a.device)
+        assert_no_internal_overlap(out_arg)
         copy_strided_into(out_arg, res.t)
         _ = res^  # alive past the launch
-    elif _prepare_out(out_arg, ae.shape, ae.rank, a.stype, a.device):
+    elif _prepare_out_checked(out_arg, ae.shape, ae.rank, a.stype, a.device):
         _masked_fill_scalar_dispatch(mask, ae, args[unsafe_offset=2], out_arg)
     else:
         var tmp = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
@@ -932,9 +947,10 @@ def op_masked_fill_tensor_out(
         var res = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
         _masked_fill_value_into(mask, ae, val, res.t)
         _ensure_out_shape(out_arg, ae.shape, ae.rank, a.stype, a.device)
+        assert_no_internal_overlap(out_arg)
         copy_strided_into(out_arg, res.t)
         _ = res^  # alive past the launch
-    elif _prepare_out(out_arg, ae.shape, ae.rank, a.stype, a.device):
+    elif _prepare_out_checked(out_arg, ae.shape, ae.rank, a.stype, a.device):
         _masked_fill_value_into(mask, ae, val, out_arg)
     else:
         var tmp = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))

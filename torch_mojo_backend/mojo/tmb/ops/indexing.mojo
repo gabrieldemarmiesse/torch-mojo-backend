@@ -728,7 +728,21 @@ def _index_fill(a: T, dim_in: Int, index: T, value_v: Value) raises:
         raise Error("Index has to be a vector/scalar")
     if not _same_device(a, index):
         unsupported("index_fill_ with the index on a different device")
-    if index.numel == 0 or a.numel == 0:
+    if index.numel == 0:
+        return
+    if a.rank > 0 and a.dim(dim) == 0:
+        # Every index is out of bounds for an empty dimension.
+        var idx0 = own_if_new(contiguous(index), index)
+        var first = _read_int_at(_flat(idx0.t), 0)
+        _ = idx0^
+        raise Error(
+            "index_fill_(): index ",
+            first,
+            " is out of bounds for dimension ",
+            dim,
+            " with size 0",
+        )
+    if a.numel == 0:
         return
     if a.rank > 4:
         unsupported("index_fill_ of rank greater than 4")
@@ -918,17 +932,20 @@ def _index_copy_into(dest: T, dim: Int, index: T, source: T) raises:
     if not _is_scatter_dtype(dest.dtype):
         unsupported("index_copy of dtype " + String(dest.dtype))
     var dim_size = 1 if dest.rank == 0 else dest.dim(dim)
-    # The index space is source's shape; a 0-d source (or self) is (1,).
-    var dims = _dims_of(source) if source.rank != 0 else _dims_of(dest)
-    if source.rank == 0 or dest.rank == 0:
-        dims = [1]
-    var rank = len(dims)
+    # The index space is source's shape. A 0-d self reads as shape (1,) and
+    # takes one element per index (a 1-D source of index's length, so every
+    # index is bounds-checked); a 0-d source is one element.
+    var dims = _dims_of(source)
     var src_strides = _strides_of(source)
-    if source.rank == 0 or dest.rank == 0:
-        src_strides = [0]
     var dst_strides = _strides_of(dest)
     if dest.rank == 0:
+        dims = [index.numel]
+        src_strides = [source.stride(0) if source.rank == 1 else 0]
         dst_strides = [0]
+    elif source.rank == 0:
+        dims = [1]
+        src_strides = [0]
+    var rank = len(dims)
     var idx = own_if_new(contiguous(index), index)
     _scatter_launch(
         dest,

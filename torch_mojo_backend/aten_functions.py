@@ -3764,35 +3764,6 @@ def aten_index_add(
     return aten_scatter_add(input, dim, index, source)
 
 
-# index_fill.int_Scalar(Tensor self, int dim, Tensor index, Scalar value) -> Tensor
-# index_fill.int_Tensor(Tensor self, int dim, Tensor index, Tensor value) -> Tensor
-@map_to(aten.index_fill)
-def aten_index_fill(
-    input: MaxTensor, dim: int, index: MaxTensor, value: Scalar | MaxTensor
-) -> MaxTensor:
-    """``input`` with every slice ``index`` names along ``dim`` set to
-    ``value``: a (size, len(index)) equality table against the iota,
-    reduced to a per-slice hit mask and selected with ``_where``. Negative
-    indices wrap once, as ATen's index_fill kernels do."""
-    rank = len(input.shape)
-    axis = dim % max(rank, 1)
-    n = 1 if rank == 0 else int(input.shape[axis])
-    idx = F.reshape(index, [1, -1])
-    zero = F.constant(0, dtype=idx.dtype, device=idx.device)
-    size = F.constant(n, dtype=idx.dtype, device=idx.device)
-    idx = _where(idx < zero, idx + size, idx)
-    iota = F.reshape(F.arange(0, n, 1, dtype=idx.dtype, device=idx.device), [n, 1])
-    hits = F.sum(F.cast(iota == idx, DType.int32), axis=1)
-    mask_shape = [n if a == axis else 1 for a in range(rank)]
-    none = F.constant(0, dtype=DType.int32, device=idx.device)
-    mask = F.reshape(hits > none, mask_shape)
-    if isinstance(value, MaxTensor):
-        fill = F.cast(value, input.dtype)
-    else:
-        fill = _scalar_constant(value, dtype=input.dtype, device=input.device)
-    return _where(mask, _broadcast_to(fill, input.shape), input)
-
-
 # index_put(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor
 @map_to(aten.index_put.default)
 def aten_index_put(
