@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch._dynamo import mark_dynamic
 
+from tests.conftest import require_cuda_autograd
 from torch_mojo_backend import aten_functions, custom_mojo_ops, mojo_backend
 from torch_mojo_backend.testing import CallChecker
 from torch_mojo_backend.types import MaxTensor
@@ -240,8 +241,18 @@ def test_glu_backward(
     assert spy.call_count == 1
 
 
-def test_glu_through_autograd(gpu: str, call_checker: CallChecker):
+@pytest.fixture
+def autograd_gpu(gpu: str) -> str:
+    """`gpu`, in a process where CUDA autograd still works (a registered mojo
+    device breaks it: see `require_cuda_autograd`). A fixture so the skip
+    comes before `call_checker` is set up."""
+    require_cuda_autograd(gpu)
+    return gpu
+
+
+def test_glu_through_autograd(autograd_gpu: str, call_checker: CallChecker):
     """F.glu's forward and backward under compile, both graph twins."""
+    gpu = autograd_gpu
     call_checker.register(aten_functions.aten_glu, aten_functions.aten_glu_backward)
 
     def fn(x):

@@ -3430,15 +3430,22 @@ def aten_glu(input: MaxTensor, dim: int = -1) -> MaxTensor:
 @map_to(aten.glu_backward)
 def aten_glu_backward(grad_output: MaxTensor, input: MaxTensor, dim: int) -> MaxTensor:
     """glu_backward_kernel, both halves on the mojo device's own pointwise
-    kinds: `glu_backward_a` (sigmoid(b) * grad) and `glu_backward_b` ((1 -
-    sigmoid(b)) * sigmoid(b) * grad * a, a three-operand custom op),
-    concatenated along `dim`."""
+    kinds: `glu_backward_a` (sigmoid(b) * grad, a fusible binary op) and, on
+    one GPU, `glu_backward_b` ((1 - sigmoid(b)) * sigmoid(b) * grad * a, a
+    three-operand custom op; a MAX composition elsewhere), concatenated
+    along `dim`."""
     if grad_output.dtype != input.dtype:
         raise RuntimeError(
             f"Found dtype {_scalar_type_name(grad_output.dtype)} but expected "
             f"{_scalar_type_name(input.dtype)}"
         )
     a, b = _glu_halves(input, dim)
+    if not _same_static_shape(grad_output, a):
+        # glu_backward_cuda_out's TORCH_CHECK, before its empty early return.
+        raise RuntimeError(
+            "Expected grad_output.sizes() == IntArrayRef{iter_shape} to be true, "
+            "but got false."
+        )
     if any(isinstance(d, StaticDim) and int(d) == 0 for d in input.shape):
         # glu_backward_cuda_out returns before its dtype dispatch when the
         # iterator is empty: an empty integer input is not an error. The
@@ -3446,10 +3453,32 @@ def aten_glu_backward(grad_output: MaxTensor, input: MaxTensor, dim: int) -> Max
         return F.concat([grad_output, grad_output], axis=dim)
     _glu_check_floating(input, "glu_backward_cuda")
     grad_a = custom_mojo_ops.pointwise_binary(grad_output, b, "glu_backward_a")
-    shape = grad_output.shape
-    flat = [F.reshape(x, [-1]) for x in (grad_output, a, b)]
-    grad_b = F.reshape(custom_mojo_ops.native_glu_backward_b(*flat), shape)
+    if _native_kernel_operands(grad_output, input):
+        shape = grad_output.shape
+        flat = [F.reshape(x, [-1]) for x in (grad_output, a, b)]
+        grad_b = F.reshape(custom_mojo_ops.native_glu_backward_b(*flat), shape)
+    else:
+        # Off the GPU (or with the native kernels switched off): the same
+        # math as a MAX composition, in float for the half types.
+        wide = input.dtype in (DType.float16, DType.bfloat16)
+        g, a32, b32 = grad_output, a, b
+        if wide:
+            g, a32, b32 = (F.cast(x, DType.float32) for x in (g, a, b))
+        sig = custom_mojo_ops.elementwise(b32, "sigmoid")
+        grad_b = (1 - sig) * sig * g * a32
+        if wide:
+            grad_b = F.cast(grad_b, input.dtype)
     return F.concat([grad_a, grad_b], axis=dim)
+
+
+def _same_static_shape(x: MaxTensor, y: MaxTensor) -> bool:
+    """False only for shapes that provably differ (a symbolic dim matches)."""
+    if len(x.shape) != len(y.shape):
+        return False
+    return all(
+        not (isinstance(p, StaticDim) and isinstance(q, StaticDim)) or int(p) == int(q)
+        for p, q in zip(x.shape, y.shape, strict=True)
+    )
 
 
 def _scalar_type_name(dtype: DType) -> str:

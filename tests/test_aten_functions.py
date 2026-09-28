@@ -1,5 +1,6 @@
 import math
 from collections.abc import Callable, Sequence
+from unittest import mock
 
 import pytest
 import torch
@@ -16,7 +17,12 @@ from torch.ops import aten  # ty: ignore[unresolved-import]
 
 from tests.conftest import Tolerance, matmul_tolerance, require_cuda_autograd
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
-from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
+from torch_mojo_backend import (
+    aten_functions,
+    custom_mojo_ops,
+    mojo_backend,
+    register_mojo_devices,
+)
 from torch_mojo_backend.testing import (
     CallChecker,
     Conf,
@@ -2761,40 +2767,63 @@ def test_aten_glu(conf: Conf, call_checker: CallChecker, dtype: torch.dtype, dim
     check_outputs(fn, conf, [x], **tol)
 
 
-@pytest.fixture
-def cuda_gpu(cuda_available: bool) -> str:
+@pytest.fixture(
+    params=[
+        ("cpu", torch.float32),  # MAX's CPU target: no bfloat16 math
+        ("cuda", torch.float32),
+        ("cuda", torch.bfloat16),
+    ],
+    ids=["cpu-float32", "cuda-float32", "cuda-bfloat16"],
+)
+def glu_graph_case(
+    request: pytest.FixtureRequest, cuda_available: bool
+) -> tuple[str, torch.dtype]:
     """Skips before `call_checker` is set up (its teardown would fail)."""
-    if not cuda_available:
-        pytest.skip("the native graph ops are accelerator routes")
-    return "cuda"
+    if request.param[0] == "cuda" and not cuda_available:
+        pytest.skip("no CUDA device")
+    return request.param
 
 
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_aten_glu_backward_on_the_graph_path(
-    cuda_gpu: str, call_checker: CallChecker, mode: str, dtype: torch.dtype
+    glu_graph_case: tuple[str, torch.dtype], call_checker: CallChecker, mode: str
 ):
-    """The graph twin -- whose second half is the `native_glu_backward_b`
-    custom op -- on a GPU: through torch.compile, and on MAX eager tensors
-    (the MAX eager interpreter, MAX_USE_EAGER_INTERPRETER=1)."""
+    """The graph twin through torch.compile and on MAX eager tensors (the MAX
+    eager interpreter, MAX_USE_EAGER_INTERPRETER=1). On a GPU its second half
+    is the `native_glu_backward_b` custom op; on the CPU, a MAX composition
+    (the custom op runs on accelerators only)."""
+    graph_device, dtype = glu_graph_case
     call_checker.register(aten_functions.aten_glu_backward)
-    x = (torch.randn(4, 6, 8, device=cuda_gpu) * 3).to(dtype)
-    grad = torch.randn(4, 6, 4, device=cuda_gpu).to(dtype)
+    x = (torch.randn(4, 6, 8, device=graph_device) * 3).to(dtype)
+    grad = torch.randn(4, 6, 4, device=graph_device).to(dtype)
 
     def fn(g: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return aten.glu_backward(g, t, -1)
 
-    if mode == "compile":
-        got = torch.compile(fn, backend=mojo_backend, fullgraph=True)(grad, x)
-    else:
-        with F.lazy():
-            out = aten_functions.aten_glu_backward(
-                MaxEagerTensor.from_dlpack(grad), MaxEagerTensor.from_dlpack(x), -1
-            )
-        got = torch.from_dlpack(out)
+    original = custom_mojo_ops.native_glu_backward_b
+    with mock.patch.object(
+        custom_mojo_ops, "native_glu_backward_b", wraps=original
+    ) as spy:
+        if mode == "compile":
+            got = torch.compile(fn, backend=mojo_backend, fullgraph=True)(grad, x)
+        else:
+            with F.lazy():
+                out = aten_functions.aten_glu_backward(
+                    MaxEagerTensor.from_dlpack(grad), MaxEagerTensor.from_dlpack(x), -1
+                )
+            got = torch.from_dlpack(out)
+    assert spy.call_count == (1 if graph_device == "cuda" else 0)
     want = fn(grad.float(), x.float()).to(dtype)
     tol = {"atol": 2e-2, "rtol": 2e-2} if dtype == torch.bfloat16 else {}
     torch.testing.assert_close(got, want, **tol)
+
+
+def test_aten_glu_backward_empty_checks_the_grad_shape():
+    """CUDA checks the gradient's shape before its empty early return."""
+    x = MaxEagerTensor.from_dlpack(torch.zeros(0, 4))
+    grad = MaxEagerTensor.from_dlpack(torch.zeros(0, 3))
+    with pytest.raises(RuntimeError, match="grad_output.sizes"):
+        aten_functions.aten_glu_backward(grad, x, -1)
 
 
 def test_aten_glu_backward_empty_integer_is_not_an_error():
