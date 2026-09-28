@@ -7,6 +7,9 @@ compared against the same call on CPU torch. Backwards run through autograd
 (the input's `.grad`), which reaches the aten backward ops natively.
 """
 
+import itertools
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -596,6 +599,20 @@ def test_indices_out_wrong_device_or_dtype(mojo_device):
         )
 
 
+def _scatter_reference(g, idx, in_shape, n):
+    """CUDA's atomic max-pool backward, one add at a time in the dtype."""
+    flat_g = g.reshape(-1, math.prod(g.shape[-n:]))
+    flat_i = idx.reshape(flat_g.shape)
+    in_plane = math.prod(in_shape[-n:])
+    out = torch.zeros(flat_g.shape[0], in_plane, dtype=g.dtype)
+    for j in range(flat_g.shape[1]):
+        rows = torch.arange(flat_g.shape[0])
+        out[rows, flat_i[:, j]] = (
+            out[rows, flat_i[:, j]].float() + flat_g[:, j].float()
+        ).to(g.dtype)
+    return out.reshape(in_shape)
+
+
 def test_scatter_backwards_take_arbitrary_indices(mojo_device):
     """The 3-D and adaptive max-pool backwards scatter to whatever index
     they are given, as torch's CPU and CUDA kernels do."""
@@ -608,15 +625,90 @@ def test_scatter_backwards_take_arbitrary_indices(mojo_device):
     )
     torch.testing.assert_close(got.cpu(), want)
     assert got.cpu()[0, 0, 0, 0] == 4
-    x3 = torch.randn(1, 2, 4, 4, 4)
+    x3 = torch.randn(1, 2, 4, 4, 4).half()
     g3 = torch.randn(1, 2, 2, 2, 2).half()
     idx3 = torch.randint(0, 64, (1, 2, 2, 2, 2))
     args = ([2] * 3, [2] * 3, [0] * 3, [1] * 3, False)
-    want = torch.ops.aten.max_pool3d_with_indices_backward(g3.float(), x3, *args, idx3)
     got = torch.ops.aten.max_pool3d_with_indices_backward(
-        g3.to(mojo_device), x3.half().to(mojo_device), *args, idx3.to(mojo_device)
+        g3.to(mojo_device), x3.to(mojo_device), *args, idx3.to(mojo_device)
     )
-    torch.testing.assert_close(got.cpu().float(), want, atol=2e-3, rtol=2e-3)
+    want = _scatter_reference(g3, idx3, x3.shape, 3)
+    torch.testing.assert_close(got.cpu(), want, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "size", "want"),
+    [(torch.bfloat16, 32, 256.0), (torch.float16, 64, 2048.0)],
+)
+def test_scatter_backward_accumulates_in_dtype(mojo_device, dtype, size, want):
+    """CUDA's atomicAdd rounds a half accumulator on every add: every unit
+    gradient of a (size, size) adaptive max pool landing on one input
+    saturates where a float accumulator would not (bf16 1024 -> 256,
+    fp16 4096 -> 2048)."""
+    x = torch.zeros(1, 1, 1, 1, dtype=dtype)
+    g = torch.ones(1, 1, size, size, dtype=dtype)
+    idx = torch.zeros(1, 1, size, size, dtype=torch.int64)
+    got = torch.ops.aten.adaptive_max_pool2d_backward(
+        g.to(mojo_device), x.to(mojo_device), idx.to(mojo_device)
+    )
+    assert got.cpu().item() == want
+
+
+def _cuda_adaptive_avg_backward(g: torch.Tensor, in_shape) -> torch.Tensor:
+    """AdaptiveAveragePooling{,3d}.cu's backward, adds in output order, each
+    rounded in the dtype. 2-D: grad / kW / kH in the dtype. 3-D: grad / kT /
+    kH / kW in the dtype when a size does not divide, else one float
+    division rounded to the dtype."""
+    dt = g.dtype
+    n = 3 if len(in_shape) == 5 else 2
+    isz = in_shape[-n:]
+    osz = g.shape[-n:]
+
+    def window(o, os_, is_):
+        return (o * is_) // os_, -((-(o + 1) * is_) // os_)
+
+    divisible = all(i % o == 0 for i, o in zip(isz, osz))
+    gin = torch.zeros(in_shape, dtype=dt)
+    for out in itertools.product(*[range(o) for o in osz]):
+        wins = [window(o, os_, is_) for o, os_, is_ in zip(out, osz, isz)]
+        ks = [e - b for b, e in wins]
+        v = g[(..., *out)]
+        if n == 2:
+            delta = ((v.float() / ks[1]).to(dt).float() / ks[0]).to(dt)
+        elif not divisible:
+            delta = v
+            for k in ks:
+                delta = (delta.float() / k).to(dt)
+        else:
+            delta = (v.float() / (ks[0] * ks[1] * ks[2])).to(dt)
+        sl = (..., *[slice(b, e) for b, e in wins])
+        gin[sl] = (gin[sl].float() + delta.float()[(...,) + (None,) * n]).to(dt)
+    return gin
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("in_shape", "out_size"),
+    [
+        ((2, 3, 7, 9), (3, 4)),
+        ((2, 3, 8, 8), (4, 2)),
+        ((2, 2, 5, 6, 7), (2, 3, 4)),
+        ((2, 2, 4, 6, 8), (2, 3, 4)),
+    ],
+)
+def test_adaptive_avg_backward_rounds_like_cuda(mojo_device, dtype, in_shape, out_size):
+    torch.manual_seed(0)
+    g = (torch.randn(*in_shape[: -len(out_size)], *out_size) * 30).to(dtype)
+    x = torch.randn(in_shape).to(dtype)
+    op = (
+        torch.ops.aten._adaptive_avg_pool2d_backward
+        if len(out_size) == 2
+        else torch.ops.aten._adaptive_avg_pool3d_backward
+    )
+    got = op(g.to(mojo_device), x.to(mojo_device)).cpu()
+    torch.testing.assert_close(
+        got, _cuda_adaptive_avg_backward(g, in_shape), atol=0, rtol=0
+    )
 
 
 def test_max_unpool_invalid_index_raises(mojo_device):
@@ -636,3 +728,30 @@ def test_adaptive_avg_pool3d_rejects_zero_channels(mojo_device):
         torch.randn(1, 0, 2, 2).to(mojo_device), [1, 1]
     )
     assert tuple(got.shape) == (1, 0, 1, 1)
+
+
+def test_out_growing_the_inputs_storage(mojo_device):
+    """An out= past the end of the input's own storage is resized, which
+    moves that storage: the input must be read from where it now lives."""
+    x = torch.randn(2, 3, 8, 8)
+    want = F.avg_pool2d(x, 2)
+    xd = x.to(mojo_device)
+    out = xd.flatten()[xd.numel() :]
+    torch.ops.aten.avg_pool2d.out(xd, [2], out=out)
+    torch.testing.assert_close(out.cpu(), want)
+    torch.testing.assert_close(xd.cpu(), x)
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.int32, torch.uint8])
+def test_max_unpool_integer_dtypes(mojo_device, dtype):
+    """CUDA unpools every non-bool type (CPU torch only floats), so the
+    reference is the scatter it amounts to."""
+    x = torch.randint(0, 100, (2, 3, 4, 4)).to(dtype)
+    idx = torch.randperm(64)[:16].reshape(1, 1, 4, 4).expand(2, 3, 4, 4).contiguous()
+    want = (
+        torch.zeros(6, 64, dtype=dtype)
+        .scatter_(1, idx.reshape(6, 16), x.reshape(6, 16))
+        .reshape(2, 3, 8, 8)
+    )
+    got = torch.ops.aten.max_unpool2d(x.to(mojo_device), idx.to(mojo_device), [8, 8])
+    torch.testing.assert_close(got.cpu(), want)

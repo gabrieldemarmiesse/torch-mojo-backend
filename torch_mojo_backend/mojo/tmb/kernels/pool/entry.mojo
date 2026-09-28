@@ -21,13 +21,17 @@
 # that is exactly CUDA's own backward (max_pool_backward_nchw), which also
 # ignores a saved index outside its output's window. The 3-D and adaptive
 # max-pool backwards scatter every grad_output element to its saved index,
-# as CUDA does, so arbitrary indices accumulate like torch's: relaxed
-# float32 (float64) atomics into a zeroed workspace the op casts back.
+# as CUDA does, so arbitrary indices accumulate like torch's, with atomics
+# in the tensor's own dtype (CUDA's atomicAdd: a half accumulator rounds on
+# every add; 16-bit adds are a 32-bit compare-and-swap loop, which Metal has
+# too). The average backwards reproduce CUDA's per-kernel rounding (see
+# `_avg_pool_backward`).
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.host import DeviceContext
 from std.atomic import Atomic, Ordering
-from std.sys import is_amd_gpu, is_nvidia_gpu
+from std.memory import bitcast
+from std.sys import is_amd_gpu, is_nvidia_gpu, size_of
 from std.utils.coord import Coord
 from std.utils.index import IndexList
 from std.utils.numerics import min_or_neg_inf
@@ -55,6 +59,18 @@ comptime POOL_DTYPES = [
     DType.float16,
     DType.bfloat16,
     DType.float64,
+]
+# max_unpool moves every non-bool type (CUDA's AT_DISPATCH_ALL_TYPES_AND2).
+comptime UNPOOL_DTYPES = [
+    DType.float32,
+    DType.float16,
+    DType.bfloat16,
+    DType.float64,
+    DType.uint8,
+    DType.int8,
+    DType.int16,
+    DType.int32,
+    DType.int64,
 ]
 # im2col / col2im also move bool (CUDA's Im2Col.cu / Col2Im.cu dispatch it).
 comptime FOLD_DTYPES = [
@@ -307,10 +323,43 @@ def _scope() -> StaticString:
         return ""
 
 
+@always_inline
+def _atomic_add[dtype: DType](addr: Int, value: Scalar[dtype]):
+    """Relaxed `*addr += value` rounded in `dtype`, as CUDA's atomicAdd.
+
+    A 16-bit dtype has no portable atomic add (Metal has none at all), so it
+    swaps the aligned 32-bit word that holds it: the other half of the word
+    is carried over unchanged, and a concurrent update of it only makes the
+    swap retry."""
+    comptime if size_of[Scalar[dtype]]() == 2:
+        var word = Pointer[UInt32, MutAnyOrigin](unsafe_from_address=addr & ~3)
+        var shift = UInt32((addr & 2) * 8)
+        var expected = word[]
+        while True:
+            var bits = UInt16((expected >> shift) & 0xFFFF)
+            var sum = (
+                bitcast[dtype](bits).cast[DType.float32]()
+                + value.cast[DType.float32]()
+            ).cast[dtype]()
+            var desired = (expected & ~(UInt32(0xFFFF) << shift)) | (
+                UInt32(bitcast[DType.uint16](sum)) << shift
+            )
+            if Atomic[UInt32, scope=_scope()].compare_exchange[
+                success_ordering=Ordering.RELAXED,
+                failure_ordering=Ordering.RELAXED,
+                weak=True,
+            ](word, expected, desired):
+                return
+    else:
+        _ = Atomic[Scalar[dtype], scope=_scope()].fetch_add[
+            ordering=Ordering.RELAXED
+        ](Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=addr), value)
+
+
 def _max_pool_scatter[
     dtype: DType
 ](
-    ws_addr: Int,
+    gin_addr: Int,
     gout_addr: Int,
     idx_addr: Int,
     count: Int,
@@ -318,28 +367,25 @@ def _max_pool_scatter[
     in_plane: Int,
     ctx: DeviceContext,
 ) raises:
-    """ws[plane][indices[i]] += grad_output[i] over every grad_output
-    element, in the accumulate dtype (CUDA's atomic max-pool backwards). An
-    index outside the input plane is skipped rather than written."""
-    comptime acc_t = _acc[dtype]()
-    var ws_ptr = _make_ptr[acc_t](ws_addr)
+    """gin[plane][indices[i]] += grad_output[i] over every grad_output
+    element into the zeroed `gin`, atomically in `dtype` (CUDA's atomic
+    max-pool backwards). An index outside the input plane is skipped rather
+    than written."""
     var gout_ptr = _make_ptr[dtype](gout_addr)
     var idx_ptr = _make_ptr[DType.int64](idx_addr)
+    comptime item_bytes = size_of[Scalar[dtype]]()
 
     @always_inline
     @__parameter
-    @__copy_capture(ws_ptr, gout_ptr, idx_ptr, out_plane, in_plane)
+    @__copy_capture(gin_addr, gout_ptr, idx_ptr, out_plane, in_plane)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
         var target = Int(idx_ptr[unsafe_offset=i])
         if target < 0 or target >= in_plane:
             return
         var at = (i // out_plane) * in_plane + target
-        _ = Atomic[Scalar[acc_t], scope=_scope()].fetch_add[
-            ordering=Ordering.RELAXED
-        ](
-            ws_ptr.unsafe_offset(at),
-            gout_ptr[unsafe_offset=i].cast[acc_t](),
+        _atomic_add[dtype](
+            gin_addr + at * item_bytes, gout_ptr[unsafe_offset=i]
         )
 
     _parallel_for_dt[dtype, func](count, ctx)
@@ -429,9 +475,39 @@ def _avg_pool[
     _parallel_for_dt[dtype, func](g[G_PLANES] * _out_plane(g), ctx)
 
 
+@always_inline
+def _div_t[dtype: DType](a: Scalar[dtype], b: Int) -> Scalar[dtype]:
+    """`scalar_t / int` in c10: the int converts to `scalar_t`, and a half
+    quotient rounds to half."""
+    comptime acc_t = _acc[dtype]()
+    return (a.cast[acc_t]() / Scalar[dtype](b).cast[acc_t]()).cast[dtype]()
+
+
+@always_inline
+def _add_t[dtype: DType](a: Scalar[dtype], b: Scalar[dtype]) -> Scalar[dtype]:
+    """`scalar_t += scalar_t` (a half sum rounds to half)."""
+    comptime acc_t = _acc[dtype]()
+    return (a.cast[acc_t]() + b.cast[acc_t]()).cast[dtype]()
+
+
 def _avg_pool_backward[
     dtype: DType, adaptive: Bool
 ](gin_addr: Int, gout_addr: Int, g: Geom, ctx: DeviceContext) raises:
+    """Gather per input element, rounding the way CUDA's kernel for the
+    same case does (a half accumulator in place of its atomicAdd, summed in
+    one fixed order):
+
+    * avg_pool2d (AveragePool2d.cu): float sum of `grad / divisor`, each
+      quotient a `scalar_t / int`, rounded once.
+    * avg_pool3d (AveragePool3d.cu): stride 1 and no padding, a float sum
+      scaled by `1 / divisor`, rounded once; otherwise each
+      `scalar_t(float(grad) / divisor)` added in `scalar_t`.
+    * adaptive 2-D (AdaptiveAveragePooling.cu, always atomic): each
+      `grad / kW / kH` in `scalar_t`, added in `scalar_t`.
+    * adaptive 3-D (AdaptiveAveragePooling3d.cu): when a size does not
+      divide, each `grad / kT / kH / kW` in `scalar_t`; otherwise each
+      `scalar_t(float(grad) / (kT * kH * kW))`; added in `scalar_t`.
+    """
     var gin_ptr = _make_ptr[dtype](gin_addr)
     var gout_ptr = _make_ptr[dtype](gout_addr)
     comptime acc_t = _acc[dtype]()
@@ -453,30 +529,82 @@ def _avg_pool_backward[
             rd = _avg_out_range(g, 0, x[1])
             rh = _avg_out_range(g, 1, x[2])
             rw = _avg_out_range(g, 2, x[3])
+        var three = g[G_3D] != 0
+        var stride1 = (
+            g[G_S] == 1
+            and g[G_S + 1] == 1
+            and g[G_S + 2] == 1
+            and g[G_P] == 0
+            and g[G_P + 1] == 0
+            and g[G_P + 2] == 0
+        )
+        var divisible = (
+            g[G_IN] % g[G_OUT] == 0
+            and g[G_IN + 1] % g[G_OUT + 1] == 0
+            and g[G_IN + 2] % g[G_OUT + 2] == 0
+        )
         var out_h = g[G_OUT + 1]
         var out_w = g[G_OUT + 2]
         var base = x[0] * _out_plane(g)
-        var total = Scalar[acc_t](0)
+        var wide = Scalar[acc_t](0)  # float accumulator
+        var narrow = Scalar[dtype](0)  # scalar_t accumulator
         for od in range(rd[0], rd[1]):
             for oh in range(rh[0], rh[1]):
                 var row = base + (od * out_h + oh) * out_w
                 for ow in range(rw[0], rw[1]):
-                    var v = gout_ptr[unsafe_offset=row + ow].cast[acc_t]()
+                    var v = gout_ptr[unsafe_offset=row + ow]
                     comptime if adaptive:
                         var ad = _adaptive_window(g, 0, od)
                         var ah = _adaptive_window(g, 1, oh)
                         var aw = _adaptive_window(g, 2, ow)
-                        total += _adaptive_scale(
-                            v, g, ad[1] - ad[0], ah[1] - ah[0], aw[1] - aw[0]
-                        )
+                        var kt = ad[1] - ad[0]
+                        var kh = ah[1] - ah[0]
+                        var kw = aw[1] - aw[0]
+                        var delta: Scalar[dtype]
+                        if not three:
+                            delta = _div_t(_div_t(v, kw), kh)
+                        elif not divisible:
+                            delta = _div_t(_div_t(_div_t(v, kt), kh), kw)
+                        else:
+                            delta = (
+                                v.cast[acc_t]() / Scalar[acc_t](kt * kh * kw)
+                            ).cast[dtype]()
+                        narrow = _add_t(narrow, delta)
                     else:
                         var wd = _avg_window(g, 0, od)
                         var wh = _avg_window(g, 1, oh)
                         var ww = _avg_window(g, 2, ow)
                         if wd[0] >= wd[1] or wh[0] >= wh[1] or ww[0] >= ww[1]:
                             continue
-                        total += v / Scalar[acc_t](_avg_divisor(g, wd, wh, ww))
-        gin_ptr[unsafe_offset=i] = total.cast[dtype]()
+                        var div = _avg_divisor(g, wd, wh, ww)
+                        if not three:
+                            wide += _div_t(v, div).cast[acc_t]()
+                        elif stride1:
+                            wide += v.cast[acc_t]()
+                        else:
+                            narrow = _add_t(
+                                narrow,
+                                (v.cast[acc_t]() / Scalar[acc_t](div)).cast[
+                                    dtype
+                                ](),
+                            )
+        var result: Scalar[dtype]
+        comptime if adaptive:
+            result = narrow
+        else:
+            if not three:
+                result = wide.cast[dtype]()
+            elif stride1:
+                # Every window is whole: one divisor for all of them.
+                var div = g[G_DIV] if g[G_DIV] != 0 else (
+                    g[G_K] * g[G_K + 1] * g[G_K + 2]
+                )
+                result = (wide * (Scalar[acc_t](1) / Scalar[acc_t](div))).cast[
+                    dtype
+                ]()
+            else:
+                result = narrow
+        gin_ptr[unsafe_offset=i] = result
 
     _parallel_for_dt[dtype, func](g[G_PLANES] * _in_plane(g), ctx)
 
@@ -731,6 +859,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             comptime for dt in FOLD_DTYPES:
                 comptime if _dtype_arg_on[0, dt]():
                     _launch_fold[dt](argv, argc)
+                    return 0
+        elif _op_on["MaxUnpool"]():
+            comptime for dt in UNPOOL_DTYPES:
+                comptime if _dtype_arg_on[0, dt]():
+                    _launch[dt](argv, argc)
                     return 0
         else:
             comptime for dt in POOL_DTYPES:

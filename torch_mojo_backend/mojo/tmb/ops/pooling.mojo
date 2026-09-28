@@ -19,7 +19,6 @@ from std.utils import IndexList
 from tmb.backend.abi import (
     IntList,
     Owned,
-    ST_FLOAT32,
     ST_INT64,
     T,
     Values,
@@ -41,7 +40,6 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     assert_no_internal_overlap,
-    cast_into,
     check_out,
     check_out_as,
     contiguous,
@@ -75,7 +73,9 @@ def _trunc_div(a: Int, b: Int) -> Int:
     return q
 
 
-def _check_dtype(t: T, what: String, allow_bool: Bool = False) raises:
+def _check_dtype(
+    t: T, what: String, allow_bool: Bool = False, allow_int: Bool = False
+) raises:
     if not t.on_mojo():
         unsupported(what + " expects a mojo tensor")
     var dt = t.dtype
@@ -87,9 +87,18 @@ def _check_dtype(t: T, what: String, allow_bool: Bool = False) raises:
     )
     if allow_bool and dt == DType.bool:
         ok = True
+    if allow_int and (
+        dt == DType.uint8
+        or dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
+    ):
+        ok = True
     if not ok:
         # CUDA dispatches these ops over the floating types only (AT_DISPATCH
-        # _FLOATING_TYPES_AND2(Half, BFloat16), plus bool for im2col/col2im).
+        # _FLOATING_TYPES_AND2(Half, BFloat16), plus bool for im2col/col2im
+        # and every integer type for max_unpool).
         unsupported(what + " of dtype " + String(dt))
     if dt == DType.float64 and dev(t.device)[].api == "metal":
         unsupported(what + ": float64 is unavailable on Apple GPUs")
@@ -200,18 +209,31 @@ def _alloc(
     if not dest:
         return own(new_tensor(shape, rank, stype, device))
     var d = dest.value().copy()
+    # Aliasing is decided BEFORE the resize: growing `out` can move a
+    # storage it shares with an input (the caller then re-reads the input's
+    # pointer, `_repoint`), after which the pointers no longer compare.
+    var aliased = False
+    for r in reads:
+        if d.storage_ptr() != 0 and r.storage_ptr() == d.storage_ptr():
+            aliased = True
     resize_out(d, shape, rank)
     assert_no_internal_overlap(d)
-    var direct = d.contig and d.stype == stype
-    if direct and d.numel:
-        for r in reads:
-            if r.numel and r.storage_ptr() == d.storage_ptr():
-                direct = False
+    var direct = d.contig and d.stype == stype and not aliased
     if direct:
         var o = own(d^)
         _ = o.take()  # the caller's tensor: never released here
         return o^
     return own(new_tensor(shape, rank, stype, device))
+
+
+def _fresh(t: T) raises -> T:
+    """`t` with its data pointer re-read, for an input read after `_alloc`:
+    resizing an `out=` that shares `t`'s storage can move that storage's
+    data. The geometry already read stays valid, since a storage never
+    shrinks."""
+    var f = t.copy()
+    f.ptr = T(t.h).ptr
+    return f^
 
 
 def _store(rets: Values, i: Int, dest: T, var result: Owned) raises:
@@ -539,7 +561,7 @@ def _max_pool[
 ) raises -> List[Owned]:
     var r = _outputs(x, n, outs, dest, dest_indices)
     if r[0].t.numel:
-        var xc = own_if_new(contiguous(x), x)
+        var xc = own_if_new(contiguous(_fresh(x)), x)
         _launch(
             "MaxPool",
             x.dtype,
@@ -688,8 +710,8 @@ def _max_pool_backward[
         )
         _scatter_backward(gin.t, grad, indices, x, _numel(outs), n)
     elif gin.t.numel:
-        var gc = own_if_new(contiguous(grad), grad)
-        var ic = own_if_new(contiguous(indices), indices)
+        var gc = own_if_new(contiguous(_fresh(grad)), grad)
+        var ic = own_if_new(contiguous(_fresh(indices)), indices)
         _launch(
             "MaxPoolBackward",
             x.dtype,
@@ -739,28 +761,18 @@ def _scatter_backward(
     gin: T, grad: T, indices: T, x: T, out_plane: Int, n: Int
 ) raises:
     """grad_input = 0, then grad_input[plane][indices[i]] += grad[i] for every
-    grad_output element: CUDA's atomic max-pool backward, so an index
-    outside its output's window still receives its gradient. Accumulates in
-    float32 (float64) and casts once into a half `gin`."""
+    grad_output element, atomically in the dtype: CUDA's atomic max-pool
+    backward, so an index outside its output's window still receives its
+    gradient, and a half accumulator rounds on every add."""
     fill_value(gin, 0.0)
     if gin.numel == 0 or grad.numel == 0:
         return
-    var gc = own_if_new(contiguous(grad), grad)
-    var ic = own_if_new(contiguous(indices), indices)
-    var wide = x.dtype == DType.float32 or x.dtype == DType.float64
-    var ws = own(
-        new_tensor(
-            x.shape, x.rank, ST_FLOAT32, x.device
-        ) if not wide else gin.copy()
-    )
-    if wide:
-        _ = ws.take()  # `gin` itself: not ours to release
-    else:
-        fill_value(ws.t, 0.0)
+    var gc = own_if_new(contiguous(_fresh(grad)), grad)
+    var ic = own_if_new(contiguous(_fresh(indices)), indices)
     var ctx = ctx_for(x.device)
     var call = KernelCall("pool", "MaxPoolScatter")
     call.arg_dtype(0, x.dtype)
-    call.int(ws.t.ptr)
+    call.int(gin.ptr)
     call.int(gc.t.ptr)
     call.int(ic.t.ptr)
     call.int(grad.numel)
@@ -771,9 +783,6 @@ def _scatter_backward(
     _ = ctx
     _ = gc^
     _ = ic^
-    if not wide:
-        cast_into(gin, ws.t)
-    _ = ws^
 
 
 # ---------------------------------------------------------------------------
@@ -837,7 +846,7 @@ def _avg_pool[n: Int](args: Values, dest: Optional[T] = None) raises -> Owned:
     var sh = _shape_with(x, n, outs)
     var out = _alloc(dest, sh[0], sh[1], x.stype, x.device, [x.copy()])
     if out.t.numel:
-        var xc = own_if_new(contiguous(x), x)
+        var xc = own_if_new(contiguous(_fresh(x)), x)
         _launch(
             "AvgPool",
             x.dtype,
@@ -900,7 +909,7 @@ def _avg_pool_backward[
         )
     var gin = _alloc(dest, x.shape, x.rank, x.stype, x.device, [grad.copy()])
     if gin.t.numel:
-        var gc = own_if_new(contiguous(grad), grad)
+        var gc = own_if_new(contiguous(_fresh(grad)), grad)
         _launch(
             "AvgPoolBackward",
             x.dtype,
@@ -1046,7 +1055,7 @@ def _adaptive_avg[
     var sh = _shape_with(x, n, outs)
     var out = _alloc(dest, sh[0], sh[1], x.stype, x.device, [x.copy()])
     if out.t.numel:
-        var xc = own_if_new(contiguous(x), x)
+        var xc = own_if_new(contiguous(_fresh(x)), x)
         _launch(
             "AdaptiveAvgPool",
             x.dtype,
@@ -1147,7 +1156,7 @@ def _adaptive_avg_backward[
     _check_dtype(x, name)
     var gin = _alloc(dest, x.shape, x.rank, x.stype, x.device, [grad.copy()])
     if gin.t.numel:
-        var gc = own_if_new(contiguous(grad), grad)
+        var gc = own_if_new(contiguous(_fresh(grad)), grad)
         _launch(
             "AdaptiveAvgPoolBackward",
             x.dtype,
@@ -1203,7 +1212,7 @@ def _adaptive_max[
     _check_dtype(x, name)
     var r = _outputs(x, n, outs, dest, dest_indices)
     if r[0].t.numel:
-        var xc = own_if_new(contiguous(x), x)
+        var xc = own_if_new(contiguous(_fresh(x)), x)
         _launch(
             "AdaptiveMaxPool",
             x.dtype,
@@ -1449,7 +1458,8 @@ def _max_unpool[n: Int](args: Values, dest: Optional[T] = None) raises -> Owned:
                     "max_unpooling3d(): output_size must contain non-negative"
                     " spatial dimensions"
                 )
-    _check_dtype(x, "max_unpool" + String(n) + "d")
+    # CUDA's AT_DISPATCH_ALL_TYPES_AND2(Half, BFloat16).
+    _check_dtype(x, "max_unpool" + String(n) + "d", allow_int=True)
     var outs = IndexList[3](1)
     for i in range(n):
         outs[3 - n + i] = osize[i]
@@ -1460,8 +1470,8 @@ def _max_unpool[n: Int](args: Values, dest: Optional[T] = None) raises -> Owned:
     if out.t.numel:
         fill_value(out.t, 0.0)
     if x.numel and out.t.numel:
-        var xc = own_if_new(contiguous(x), x)
-        var ic = own_if_new(contiguous(indices), indices)
+        var xc = own_if_new(contiguous(_fresh(x)), x)
+        var ic = own_if_new(contiguous(_fresh(indices)), indices)
         var ctx = ctx_for(x.device)
         # [bad, index]: the kernel records an index outside the output
         # plane there instead of writing it (CUDA device-asserts).
@@ -1680,7 +1690,7 @@ def _im2col(args: Values, dest: Optional[T] = None) raises -> Owned:
         rank = 3
     var out = _alloc(dest, shape, rank, x.stype, x.device, [x.copy()])
     if out.t.numel:
-        var xc = own_if_new(contiguous(x), x)
+        var xc = own_if_new(contiguous(_fresh(x)), x)
         _launch(
             "Im2col",
             x.dtype,
@@ -1816,7 +1826,7 @@ def _col2im(args: Values, dest: Optional[T] = None) raises -> Owned:
         rank = 4
     var out = _alloc(dest, shape, rank, x.stype, x.device, [x.copy()])
     if out.t.numel:
-        var xc = own_if_new(contiguous(x), x)
+        var xc = own_if_new(contiguous(_fresh(x)), x)
         _launch(
             "Col2im",
             x.dtype,
