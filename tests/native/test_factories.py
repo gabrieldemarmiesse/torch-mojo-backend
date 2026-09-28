@@ -8,7 +8,9 @@ Public torch API only, per the porting brief: no `aten_fast`,
 """
 
 import re
+from fractions import Fraction
 
+import numpy as np
 import pytest
 import torch
 
@@ -856,26 +858,116 @@ def test_eye_errors(mojo_gpu):
         torch.eye(0, -3, device=mojo_gpu)
 
 
+def _round_f32(x: Fraction) -> float:
+    """`x` correctly rounded to float32 (nearest, ties to even): one
+    rounding, as a hardware fma does."""
+    guess = float(np.float32(float(x)))
+    candidates = {guess}
+    for direction in (-np.inf, np.inf):
+        candidates.add(float(np.nextafter(np.float32(guess), np.float32(direction))))
+    return min(
+        candidates,
+        key=lambda c: (abs(Fraction(c) - x), int(np.float32(c).view(np.uint32)) & 1),
+    )
+
+
+def _cuda_linspace(
+    start: float, end: float, steps: int, dtype: torch.dtype
+) -> list[float]:
+    """ATen's `linspace_cuda_out` (native/cuda/RangeFactories.cu) evaluated
+    exactly on the host: the first `steps // 2` elements count up from
+    `start`, the rest down from `end`; float32/float64 contract each
+    `a + step * i` into one fma, the half types round every c10 operator,
+    integers use a float32 step and truncate."""
+    half = steps // 2
+    n = steps - 1
+    if dtype in (torch.float16, torch.bfloat16):
+
+        def r(x: float) -> float:
+            return torch.tensor(x, dtype=torch.float32).to(dtype).item()
+
+        s, e = r(start), r(end)
+        step = r(r(e - s) / r(float(n)))
+        out = []
+        for i in range(steps):
+            if i < half:
+                out.append(r(s + r(step * r(float(i)))))
+            else:
+                out.append(r(e - r(step * r(float(n - i)))))
+        return out
+    if dtype == torch.float64:
+        step = (end - start) / n
+        return [
+            float(Fraction(start) + Fraction(step) * i)
+            if i < half
+            else float(Fraction(end) - Fraction(step) * (n - i))
+            for i in range(steps)
+        ]
+    if dtype == torch.float32:
+        s, e = _round_f32(Fraction(start)), _round_f32(Fraction(end))
+        step = _round_f32(Fraction(e - s) / n)
+    else:
+        info = torch.iinfo(dtype)
+        s = int(start) % 256 if dtype == torch.uint8 else int(start)
+        e = int(end) % 256 if dtype == torch.uint8 else int(end)
+        assert info.min <= s <= info.max and info.min <= e <= info.max
+        s, e = float(np.float32(s)), float(np.float32(e))
+        step = _round_f32(Fraction(_round_f32(Fraction(e) - Fraction(s))) / n)
+    out = []
+    for i in range(steps):
+        if i < half:
+            value = _round_f32(Fraction(s) + Fraction(step) * i)
+        else:
+            value = _round_f32(Fraction(e) - Fraction(step) * (n - i))
+        out.append(value if dtype == torch.float32 else float(int(value)))
+    return out
+
+
 @pytest.mark.parametrize("dtype", _RANGE_DTYPES)
 @pytest.mark.parametrize(
     ("start", "end", "steps"),
-    [(0, 1, 5), (-3.7, 11.2, 17), (3, -10, 101), (2, 2, 1), (0, 5, 0), (1.5, 7, 2)],
+    [
+        (0, 1, 5),
+        (-3.7, 11.2, 17),
+        (3, -10, 101),
+        (0, 100, 3001),
+        (2, 2, 1),
+        (0, 5, 0),
+        (1.5, 7, 2),
+        (-1, 1, 3),
+    ],
 )
 def test_linspace(mojo_gpu, dtype, start, end, steps):
     if dtype == torch.float64:
         skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
-    if dtype == torch.uint8 and min(start, end) < 0:
-        pytest.skip("negative endpoints overflow uint8")
+    if not dtype.is_floating_point and (
+        isinstance(start, float) and start < 0 and dtype == torch.uint8
+    ):
+        pytest.skip("a negative float endpoint overflows uint8 (checked below)")
+    if dtype in (torch.int8, torch.uint8) and max(abs(start), abs(end)) > 127:
+        pytest.skip(
+            "out of the dtype's range (checked in test_linspace_out_and_errors)"
+        )
     ran = _op_count_delta("aten::linspace.out")
     got = torch.linspace(start, end, steps, dtype=dtype, device=mojo_gpu)
     assert ran()
-    expected = torch.linspace(start, end, steps, dtype=dtype)
-    assert got.dtype == dtype and got.shape == expected.shape
-    torch.testing.assert_close(got.cpu(), expected, atol=1, rtol=0.01)
-    if steps > 1:
-        # Both endpoints are exact (the second half counts down from `end`).
-        assert got.cpu()[0].item() == expected[0].item()
-        assert got.cpu()[-1].item() == expected[-1].item()
+    assert got.dtype == dtype and got.shape == (steps,)
+    if steps == 1:
+        expected = torch.linspace(start, end, steps, dtype=dtype)
+    else:
+        expected = torch.tensor(
+            _cuda_linspace(start, end, steps, dtype), dtype=torch.float64
+        ).to(dtype)
+    assert torch.equal(got.cpu(), expected), (got.cpu(), expected)
+
+
+def test_linspace_unsigned_wraps_negative_integers(mojo_gpu):
+    """An integral Scalar converts to uint8 modulo 256 (c10::overflows lets
+    -255..-1 through), as on CPU and CUDA."""
+    got = torch.linspace(-1, 1, 3, dtype=torch.uint8, device=mojo_gpu)
+    assert got.cpu().tolist() == [255, 128, 1]
+    got = torch.linspace(-1, 2.5, 4, dtype=torch.uint8, device=mojo_gpu)
+    assert got.cpu().tolist() == torch.linspace(-1, 2.5, 4, dtype=torch.uint8).tolist()
 
 
 @pytest.mark.parametrize("dtype", _RANGE_DTYPES)
@@ -887,12 +979,65 @@ def test_logspace(mojo_gpu, dtype, start, end, steps, base):
     if dtype == torch.float64:
         skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
     if dtype == torch.uint8 and min(start, end) < 0:
-        pytest.skip("negative endpoints overflow uint8")
+        pytest.skip(
+            "a negative float exponent is fine, a negative endpoint is not tested here"
+        )
     ran = _op_count_delta("aten::logspace.out")
     got = torch.logspace(start, end, steps, base=base, dtype=dtype, device=mojo_gpu)
     assert ran()
-    expected = torch.logspace(start, end, steps, base=base, dtype=dtype)
-    torch.testing.assert_close(got.cpu(), expected, atol=1, rtol=0.01)
+    if steps == 1:
+        assert torch.equal(
+            got.cpu(), torch.logspace(start, end, steps, base=base, dtype=dtype)
+        )
+        return
+    # The exponents are linspace's exact values (`_cuda_linspace`); the power
+    # is float `powf` (float64 `pow`), within an ulp of the correctly rounded
+    # value, so the half and float types get one ulp of their dtype.
+    if dtype.is_floating_point:
+        exponents = _cuda_linspace(start, end, steps, dtype)
+    else:
+        # Integers: the endpoints convert to the integer type first and the
+        # exponents are float32 (`static_cast<float>(end - start)` step).
+        exponents = _cuda_linspace(int(start), int(end), steps, torch.float32)
+    power = torch.tensor([base**x for x in exponents], dtype=torch.float64)
+    if dtype.is_floating_point:
+        tol = {
+            torch.float64: 1e-15,
+            torch.float32: 2.4e-7,
+            torch.float16: 9.8e-4,
+            torch.bfloat16: 7.9e-3,
+        }[dtype]
+        torch.testing.assert_close(
+            got.cpu().double(), power.to(dtype).double(), rtol=tol, atol=0
+        )
+    else:
+        # powf, then truncation toward zero: the truncated value may land one
+        # below an exactly integral power when powf rounds down.
+        expected = power.floor()
+        diff = expected - got.cpu().double()
+        assert ((diff == 0) | ((diff == 1) & (power == power.round()))).all(), (
+            got,
+            power,
+        )
+
+
+def test_range_one_step_and_empty(mojo_gpu):
+    """steps 0 and 1 take effect before the dtype dispatch (bool included),
+    and the one-step value goes through fill's conversion check."""
+    for fn, args in [
+        (torch.linspace, (0, 1, 0)),
+        (torch.linspace, (1, 1, 1)),
+        (torch.linspace, (0, 1, 1)),
+        (torch.logspace, (0, 1, 1)),
+    ]:
+        got = fn(*args, dtype=torch.bool, device=mojo_gpu)
+        assert torch.equal(got.cpu(), fn(*args, dtype=torch.bool))
+    got = torch.logspace(-1, 0, 1, dtype=torch.uint8, device=mojo_gpu)
+    assert got.cpu().tolist() == [0]
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.logspace(3, 1, 1, dtype=torch.uint8, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="not implemented for 'Bool'"):
+        torch.linspace(0, 1, 3, dtype=torch.bool, device=mojo_gpu)
 
 
 def test_linspace_out_and_errors(mojo_gpu):
@@ -901,8 +1046,14 @@ def test_linspace_out_and_errors(mojo_gpu):
     assert out.cpu().tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
     with pytest.raises(RuntimeError, match="number of steps must be non-negative"):
         torch.linspace(0, 1, -1, device=mojo_gpu)
-    with pytest.raises(RuntimeError, match="without overflow"):
-        torch.linspace(0, 1000, 3, dtype=torch.int8, device=mojo_gpu)
+    for start, end, dtype in [
+        (0, 1000, torch.int8),
+        (-300, 1, torch.uint8),
+        (-1.0, 1, torch.uint8),
+        (0, 1e6, torch.float16),
+    ]:
+        with pytest.raises(RuntimeError, match="without overflow"):
+            torch.linspace(start, end, 3, dtype=dtype, device=mojo_gpu)
 
 
 @pytest.mark.parametrize("upper", [False, True])

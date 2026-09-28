@@ -37,6 +37,7 @@ from tmb.backend.abi import (
     v_f64,
     v_int,
     v_is_none,
+    v_scalar_is_bool,
     v_scalar_is_integral,
     v_tensor,
     TAG_TENSOR,
@@ -303,12 +304,17 @@ def _round_to[dt: DType](x: Float32) -> Float64:
     return x.cast[dt]().cast[DType.float64]()
 
 
-def _scalar_to_int(v: Value) raises -> Int:
-    """`Scalar::to<int64_t>()`: an integral Scalar as is, a floating one
-    truncated toward zero."""
-    if v_scalar_is_integral(v):
-        return v_int(v)
-    return Int(v_f64(v))
+def _scalar_to_int(v: Value, dt: DType) raises -> Int:
+    """`Scalar::to<scalar_t>()` for an integer `dt`, after
+    `_check_convertible`: an integral Scalar converts modulo 2^bits (a
+    negative one into uint8 wraps, -1 -> 255), a floating one truncates
+    toward zero."""
+    if not v_scalar_is_integral(v):
+        return Int(v_f64(v))
+    var x = v_int(v)
+    if dt == DType.uint8:
+        return x & 0xFF
+    return x
 
 
 def _linspace_params(
@@ -361,8 +367,8 @@ def _linspace_params(
         return (s, e, st)
     # Integers: `scalar_t` endpoints, a float32 step. linspace subtracts in
     # float, logspace in the integer type (the two CUDA kernels differ).
-    var si = _scalar_to_int(start_v)
-    var ei = _scalar_to_int(end_v)
+    var si = _scalar_to_int(start_v, dt)
+    var ei = _scalar_to_int(end_v, dt)
     var step: Float32
     if is_log:
         step = Float32(ei - si) / Float32(den)
@@ -396,43 +402,80 @@ def _c10_type_name(dt: DType) -> String:
     return "uint8_t"
 
 
-def _check_convertible(v: Value, dt: DType) raises:
-    """`Scalar::to<scalar_t>()`'s overflow check (c10::checked_convert):
-    a finite value outside the destination's range is an error."""
-    if dt == DType.float64:
-        return
-    var lo: Float64
-    var hi: Float64
+def _overflow_error(dt: DType) -> Error:
+    return Error(
+        "value cannot be converted to type ",
+        _c10_type_name(dt),
+        " without overflow",
+    )
+
+
+def _float_limits(dt: DType) -> Float64:
+    """The largest finite value of the floating `dt`."""
     if dt == DType.float16:
-        hi = 65504.0
-        lo = -hi
-    elif dt == DType.bfloat16 or dt == DType.float32:
-        hi = 3.4028234663852886e38
-        lo = -hi
-    elif dt == DType.int64:
-        if v_scalar_is_integral(v):
+        return 65504.0
+    if dt == DType.bfloat16:
+        return 3.3895313892515355e38
+    if dt == DType.float32:
+        return 3.4028234663852886e38
+    return 1.7976931348623157e308
+
+
+def _int_limits(dt: DType) -> Tuple[Int, Int]:
+    if dt == DType.int8:
+        return (-128, 127)
+    if dt == DType.uint8:
+        return (0, 255)
+    if dt == DType.int16:
+        return (-32768, 32767)
+    if dt == DType.int32:
+        return (-2147483648, 2147483647)
+    return (-9223372036854775808, 9223372036854775807)
+
+
+def _check_float_convertible(x: Float64, dt: DType) raises:
+    """`c10::overflows<scalar_t, double>`: into a floating type, infinities
+    and NaN pass and a finite value past the largest one fails; into an
+    integer type, NaN, infinities and anything outside [lowest, max + 1)
+    fail."""
+    if dt == DType.bool:
+        return
+    if dt.is_floating_point():
+        if x != x or not _is_finite(x):
             return
-        hi = 9223372036854775807.0
-        lo = -9223372036854775808.0
-    elif dt == DType.int32:
-        hi = 2147483647.0
-        lo = -2147483648.0
-    elif dt == DType.int16:
-        hi = 32767.0
-        lo = -32768.0
-    elif dt == DType.int8:
-        hi = 127.0
-        lo = -128.0
-    else:
-        hi = 255.0
-        lo = 0.0
-    var x = v_f64(v)
-    if _is_finite(x) and (x < lo or x > hi):
-        raise Error(
-            "value cannot be converted to type ",
-            _c10_type_name(dt),
-            " without overflow",
-        )
+        if abs(x) > _float_limits(dt):
+            raise _overflow_error(dt)
+        return
+    if x != x or not _is_finite(x):
+        raise _overflow_error(dt)
+    var lim = _int_limits(dt)
+    if x < Float64(lim[0]) or x >= Float64(lim[1]) + 1.0:
+        raise _overflow_error(dt)
+
+
+def _check_convertible(v: Value, dt: DType) raises:
+    """`Scalar::to<scalar_t>()`'s overflow check (c10::checked_convert and
+    `c10::overflows`). A bool Scalar never overflows; an integral one into
+    an unsigned type may be negative down to -max (two's complement wrap:
+    -1 -> 255), into any other type it must lie in the type's range; a
+    floating one follows `_check_float_convertible`."""
+    if dt == DType.bool or v_scalar_is_bool(v):
+        return
+    if not v_scalar_is_integral(v):
+        _check_float_convertible(v_f64(v), dt)
+        return
+    var x = v_int(v)
+    if dt.is_floating_point():
+        if abs(Float64(x)) > _float_limits(dt):
+            raise _overflow_error(dt)
+        return
+    var lim = _int_limits(dt)
+    if dt == DType.uint8:
+        if x > lim[1] or x < -lim[1]:
+            raise _overflow_error(dt)
+        return
+    if x < lim[0] or x > lim[1]:
+        raise _overflow_error(dt)
 
 
 def _is_linspace_dtype(dt: DType) -> Bool:
@@ -477,6 +520,22 @@ def _range_out(
         var shape = IndexList[MAX_RANK](1)
         shape[MAX_RANK - 1] = steps
         resize_out(out_t, shape, 1)
+    if steps == 0:
+        return
+    if out_t.dtype == DType.float64 and dev(out_t.device)[].api == "metal":
+        unsupported(name + ".out: float64 is not supported on Apple GPU")
+    if steps == 1:
+        # `r.fill_(start)` / `r.fill_(pow(base, start))`: before any dtype
+        # dispatch, so every dtype (bool included) takes a one-step range,
+        # and fill's own conversion check applies to the value it fills.
+        if is_log:
+            var value = pow(base, v_f64(start_v))
+            _check_float_convertible(value, out_t.dtype)
+            fill_value(out_t, value)
+        else:
+            _check_convertible(start_v, out_t.dtype)
+            fill_value(out_t, start_v.copy())
+        return
     if not _is_linspace_dtype(out_t.dtype):
         if out_t.dtype == DType.bool:
             raise Error(
@@ -487,13 +546,8 @@ def _range_out(
                 "'",
             )
         unsupported(name + ".out of dtype " + String(out_t.dtype))
-    if out_t.dtype == DType.float64 and dev(out_t.device)[].api == "metal":
-        unsupported(name + ".out: float64 is not supported on Apple GPU")
-    if steps == 0:
-        return
     _check_convertible(start_v, out_t.dtype)
-    if steps > 1:
-        _check_convertible(end_v, out_t.dtype)
+    _check_convertible(end_v, out_t.dtype)
     if out_t.contig:
         _range_fill(out_t, start_v, end_v, steps, base, is_log)
     else:
@@ -511,13 +565,7 @@ def _range_fill(
     base: Float64,
     is_log: Bool,
 ) raises:
-    """`target` (contiguous, `steps` elements, steps >= 1) = the range."""
-    if steps == 1:
-        if is_log:
-            fill_value(target, pow(base, v_f64(start_v)))
-        else:
-            fill_value(target, start_v.copy())
-        return
+    """`target` (contiguous, `steps` >= 2 elements) = the range."""
     var b = base
     if target.dtype == DType.float32 or target.dtype.is_integral():
         b = base.cast[DType.float32]().cast[DType.float64]()
