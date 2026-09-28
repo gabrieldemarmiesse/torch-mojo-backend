@@ -123,8 +123,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "dist": ("float32", "bfloat16", "float16"),
     "einsum": ("int64",),
     "equal": ("float32", "bfloat16", "float16", "int64", "bool"),
-
-
     "erf": ("int64", "bool"),
     "exp": ("int64", "bool"),
     "fft_fft": ("float32", "int64", "bool"),
@@ -315,8 +313,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "resize_as_": ("float32", "bfloat16", "float16", "int64", "bool"),
     "roll": ("float32", "bfloat16", "float16", "int64", "bool"),
     "rot90": ("float32", "bfloat16", "float16", "int64", "bool"),
-
-
     "rsqrt": ("int64", "bool"),
     "scatter": ("float32", "bfloat16", "float16", "int64", "bool"),
     "scatter_reduce_amax": ("float32", "bfloat16", "float16", "int64", "bool"),
@@ -335,9 +331,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "sum_to_size": ("float32", "bfloat16", "float16", "int64", "bool"),
     "svd": ("float32",),
     "take": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "tensordot": ("float32", "bfloat16", "float16", "int64"),
-
-
     "tan": ("int64", "bool"),
     "tanh": ("int64", "bool"),
     "tensordot": ("int64",),
