@@ -54,6 +54,7 @@ from tmb.backend.abi import (
     v_tensor,
     view_strided,
 )
+from tmb.backend.device import ctx_for
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
@@ -135,7 +136,9 @@ def _wrapped_index(index: T, n: Int) raises -> Owned:
     wrapped by `n` (`idx < 0 ? idx + n : idx`, what ATen's take/put/
     index_fill kernels do); anything still out of range stays so, for the
     kernel's own bounds handling."""
-    var neg = own(_call1("aten::lt", "Scalar", [tensor_arg(index), _scalar_int(0)]))
+    var neg = own(
+        _call1("aten::lt", "Scalar", [tensor_arg(index), _scalar_int(0)])
+    )
     var w = own(
         _call1(
             "aten::add",
@@ -155,8 +158,10 @@ def _wrap_dim(dim: Int, rank: Int) raises -> Int:
     """`maybe_wrap_dim` (scalars wrap as rank 1)."""
     if rank == 0 and dim != 0 and dim != -1:
         raise Error(
-            "Dimension out of range (expected to be in range of [-1, 0], but"
-            " got ",
+            (
+                "Dimension out of range (expected to be in range of [-1, 0],"
+                " but got "
+            ),
             dim,
             ")",
         )
@@ -206,7 +211,9 @@ def op_flip(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     for i in range(len(dims)):
         var d = _wrap_dim(dims[i], a.rank)
         if flipped[d]:
-            raise Error("dim ", d, " appears multiple times in the list of dims")
+            raise Error(
+                "dim ", d, " appears multiple times in the list of dims"
+            )
         flipped[d] = True
     var out = own(new_like(a))
     if a.numel > 0:
@@ -365,7 +372,9 @@ def op_unfold_backward(
     var step = v_int(args[unsafe_offset=4])
     var rank = len(sizes)
     if rank + 1 > MAX_RANK:
-        unsupported("unfold_backward: the gradient rank exceeds the device limit")
+        unsupported(
+            "unfold_backward: the gradient rank exceeds the device limit"
+        )
     var shape = IndexList[MAX_RANK](1)
     for i in range(rank):
         shape[MAX_RANK - rank + i] = sizes[i]
@@ -391,7 +400,9 @@ def op_unfold_backward(
         for i in range(rank):
             vshape.append(count if i == d else sizes[i])
             ostrides.append(od * step * groups if i == d else out.t.stride(i))
-            gstrides.append(grad.stride(i) * groups if i == d else grad.stride(i))
+            gstrides.append(
+                grad.stride(i) * groups if i == d else grad.stride(i)
+            )
         vshape.append(size)
         ostrides.append(od)
         gstrides.append(grad.stride(rank))
@@ -410,7 +421,9 @@ def op_unfold_backward(
             ostr[pad + i] = ostrides[i]
             gstr[pad + i] = gstrides[i]
         var ov = own(
-            view_strided(out.t, oshape, ostr, rank + 1, out.t.offset + r * step * od)
+            view_strided(
+                out.t, oshape, ostr, rank + 1, out.t.offset + r * step * od
+            )
         )
         var gv = own(
             view_strided(
@@ -475,9 +488,7 @@ def op_channel_shuffle(
         var r = a.numel // (n * c)
         var src = own_if_new(contiguous(a), a)
         # out[n, i, j, r] = in[n, j, i, r] over (N, C/g, g, R).
-        var sv = _raw_view(
-            src.t, [n, cg, groups, r], [c * r, r, cg * r, 1], 0
-        )
+        var sv = _raw_view(src.t, [n, cg, groups, r], [c * r, r, cg * r, 1], 0)
         var dv = _raw_view(
             out.t, [n, cg, groups, r], [c * r, groups * r, r, 1], 0
         )
@@ -503,8 +514,10 @@ def _take_checks(a: T, index: T, dest: T) raises:
         )
     if a.stype != dest.stype:
         raise Error(
-            "take(): self and out expected to have the same dtype, but got"
-            " self.dtype = ",
+            (
+                "take(): self and out expected to have the same dtype, but got"
+                " self.dtype = "
+            ),
             _scalar_type_name(a.dtype),
             " and dest.dtype = ",
             _scalar_type_name(dest.dtype),
@@ -581,8 +594,10 @@ def op_put_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         )
     if a.stype != source.stype:
         raise Error(
-            "put_(): self and source expected to have the same dtype, but got"
-            " self.dtype = ",
+            (
+                "put_(): self and source expected to have the same dtype, but"
+                " got self.dtype = "
+            ),
             _scalar_type_name(a.dtype),
             " and source.dtype = ",
             _scalar_type_name(source.dtype),
@@ -617,6 +632,15 @@ def op_put_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             + String(a.dtype)
             + " (no atomic add for it on the device)"
         )
+    if accumulate and a.itemsize != 4 and a.dtype != DType.bool:
+        var ctx = ctx_for(a.device)
+        var metal = ctx.api() == "metal"
+        _ = ctx
+        if metal:
+            # Apple GPUs have no 16- or 64-bit atomic add.
+            unsupported(
+                "put_(accumulate=True) of " + String(a.dtype) + " on Apple GPU"
+            )
     var idx = _wrapped_index(index, a.numel)
     var src = own_if_new(contiguous(source), source)
     var tmp = own_if_new(contiguous(a), a)
@@ -732,7 +756,10 @@ def op_index_fill__int_tensor(
     # device tensor, like ATen).
     var item = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
     _index_fill(
-        a, v_int(args[unsafe_offset=1]), v_tensor(args[unsafe_offset=2]), item[0]
+        a,
+        v_int(args[unsafe_offset=1]),
+        v_tensor(args[unsafe_offset=2]),
+        item[0],
     )
     ret_ref(rets, 0, a)
 
@@ -911,9 +938,7 @@ def op_index_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 # aten::index_copy_(Tensor(a!) self, int dim, Tensor index, Tensor source) -> Tensor(a!)
-def op_index_copy_(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
+def op_index_copy_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var index = v_tensor(args[unsafe_offset=2])
     var source = v_tensor(args[unsafe_offset=3])
@@ -954,8 +979,10 @@ def op_masked_scatter_(
         )
     if mask.dtype != DType.bool:
         raise Error(
-            "masked_scatter_ only supports boolean masks, but got mask with"
-            " dtype ",
+            (
+                "masked_scatter_ only supports boolean masks, but got mask with"
+                " dtype "
+            ),
             _scalar_type_name(mask.dtype),
         )
     if not _same_device(a, mask) or not _same_device(a, source):
@@ -1002,7 +1029,9 @@ def op_masked_scatter_(
     flat_strides[MAX_RANK - 1] = 1
     var m_flat = own(view_strided(m.t, flat_shape, flat_strides, 1, 0))
     var csum = own(
-        _call1("aten::cumsum", "", [tensor_arg(m_flat.t), int_arg(0), none_arg()])
+        _call1(
+            "aten::cumsum", "", [tensor_arg(m_flat.t), int_arg(0), none_arg()]
+        )
     )
     _ = m_flat^
     var pos = own(
@@ -1089,7 +1118,9 @@ def op_repeat_interleave_tensor(
                 csum.t.offset + repeats.numel - 1,
             )
         )
-        var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(last.t)], 1)
+        var r = call_op(
+            "aten::_local_scalar_dense", "", [tensor_arg(last.t)], 1
+        )
         total = v_int(r[0])
         _ = last^
         var mn = own(_call1("aten::min", "", [tensor_arg(repeats)]))

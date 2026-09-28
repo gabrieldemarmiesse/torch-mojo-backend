@@ -11,7 +11,7 @@ CPU torch; `ran` confirms the native kernel is what ran.
 import pytest
 import torch
 
-from tests.native.conftest import ran
+from tests.native.conftest import is_metal, ran
 
 DTYPES = [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.bool]
 
@@ -147,14 +147,22 @@ def test_unfold_is_a_view(mojo_device):
 
 @pytest.mark.parametrize(
     ("shape", "dim", "size", "step"),
-    [((10,), 0, 4, 3), ((10,), 0, 3, 3), ((3, 11, 2), 1, 4, 1), ((3, 11, 2), -2, 5, 2), ((), 0, 1, 1)],
+    [
+        ((10,), 0, 4, 3),
+        ((10,), 0, 3, 3),
+        ((3, 11, 2), 1, 4, 1),
+        ((3, 11, 2), -2, 5, 2),
+        ((), 0, 1, 1),
+    ],
 )
 def test_unfold_backward(mojo_device, shape, dim, size, step):
     x = torch.randn(shape)
     grad = torch.randn(x.unfold(dim, size, step).shape)
     expected = torch.ops.aten.unfold_backward(grad, list(shape), dim, size, step)
     with ran("aten::unfold_backward"):
-        got = torch.ops.aten.unfold_backward(grad.to(mojo_device), list(shape), dim, size, step)
+        got = torch.ops.aten.unfold_backward(
+            grad.to(mojo_device), list(shape), dim, size, step
+        )
     torch.testing.assert_close(got.cpu(), expected)
     d = x.to(mojo_device).requires_grad_()
     d.unfold(dim, size, step).backward(grad.to(mojo_device))
@@ -231,6 +239,19 @@ def test_take_out_and_errors(mojo_device):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("accumulate", [False, True])
 def test_put(mojo_device, dtype, accumulate):
+    if (
+        accumulate
+        and is_metal(mojo_device)
+        and dtype not in (torch.float32, torch.bool)
+    ):
+        # Apple GPUs have no 16- or 64-bit atomic add: declined.
+        with pytest.raises(NotImplementedError, match="Apple GPU"):
+            torch.zeros(4, dtype=dtype, device=mojo_device).put_(
+                torch.tensor([0], device=mojo_device),
+                torch.ones(1, dtype=dtype, device=mojo_device),
+                accumulate=True,
+            )
+        return
     x = _make((4, 5), dtype)
     idx = torch.tensor([3, -2, 7, 19])
     src = _make((2, 2), dtype, seed=1)
@@ -292,7 +313,10 @@ def test_index_fill_scalar_conversions(mojo_device):
     _check(x.to(mojo_device).index_fill(1, di, 2.7), x.index_fill(1, idx, 2.7))
     s = torch.tensor(5.0)
     i0 = torch.tensor(0)
-    _check(s.to(mojo_device).index_fill(0, i0.to(mojo_device), -1.0), s.index_fill(0, i0, -1.0))
+    _check(
+        s.to(mojo_device).index_fill(0, i0.to(mojo_device), -1.0),
+        s.index_fill(0, i0, -1.0),
+    )
     with pytest.raises(RuntimeError, match="Expected dtype int64 for index"):
         x.to(mojo_device).index_fill(0, di.int(), 1)
 
@@ -349,7 +373,9 @@ def test_masked_scatter(mojo_device, dtype, mask_shape):
     mask = torch.randn(mask_shape, generator=torch.Generator().manual_seed(2)) > 0
     src = _make((200,), dtype, seed=1)
     with ran("aten::masked_scatter_"):
-        got = x.to(mojo_device).masked_scatter(mask.to(mojo_device), src.to(mojo_device))
+        got = x.to(mojo_device).masked_scatter(
+            mask.to(mojo_device), src.to(mojo_device)
+        )
     _check(got, x.masked_scatter(mask, src))
 
 
@@ -363,7 +389,9 @@ def test_masked_scatter_strided_broadcast_and_errors(mojo_device):
     _check(dt, x.clone().transpose(0, 2).masked_scatter_(mask.transpose(0, 2), src))
     # The out-of-place form broadcasts self against the mask.
     small = _make((6,), torch.float32)
-    _check(small.to(mojo_device).masked_scatter(dm, ds), small.masked_scatter(mask, src))
+    _check(
+        small.to(mojo_device).masked_scatter(dm, ds), small.masked_scatter(mask, src)
+    )
     d = x.to(mojo_device)
     with pytest.raises(RuntimeError, match="only supports boolean masks"):
         d.masked_scatter_(dm.to(torch.uint8), ds)
