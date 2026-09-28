@@ -219,6 +219,18 @@ _UP_CASES = [
         "upsample_trilinear3d",
     ),
     ("trilinear", (1, 2, 4, 4, 4), {"scale_factor": 0.6}, "upsample_trilinear3d"),
+    (
+        "bilinear",
+        (2, 3, 10, 20),
+        {"size": (3, 7), "antialias": True},
+        "_upsample_bilinear2d_aa",
+    ),
+    (
+        "bilinear",
+        (1, 2, 5, 6),
+        {"scale_factor": (1.7, 0.9), "antialias": True},
+        "_upsample_bilinear2d_aa",
+    ),
     # Same size: the copy special case of the 1-d / 3-d / cubic kernels.
     ("linear", (2, 3, 5), {"size": (5,)}, "upsample_linear1d"),
     ("bicubic", (2, 3, 5, 4), {"size": (5, 4)}, "upsample_bicubic2d"),
@@ -236,6 +248,11 @@ def _interp(mode: str, kwargs):
     ids=[f"{m}-{s}-{k}" for m, s, k, _ in _UP_CASES],
 )
 def test_upsample_forward_backward(mojo_device, mode, shape, kwargs, op, dtype):
+    if kwargs.get("antialias") and dtype != torch.float32:
+        pytest.skip(
+            "CPU torch has no half antialiased kernel to compare against "
+            "(CUDA parity of the half types is checked by hand)"
+        )
     x = torch.randn(shape).to(dtype)
     _check_fwd_bwd(_interp(mode, kwargs), x, mojo_device, "aten::" + op)
 
@@ -313,3 +330,57 @@ def test_upsample_bad_output_size_raises(mojo_device):
         torch.ops.aten.upsample_bilinear2d(x, [0, 3], False)
     with pytest.raises(RuntimeError, match="It is expected output_size equals to 2"):
         torch.ops.aten.upsample_nearest2d(x, [3])
+
+
+@pytest.mark.parametrize("mode", ["nearest", "nearest-exact"])
+def test_upsample_nearest2d_keeps_an_unresized_axis(mojo_device, mode):
+    """upsample_nearest2d copies an axis whose size does not change, whatever
+    its scale: rows stay rows here although 1.4 would duplicate row 0."""
+    x = torch.arange(6.0).reshape(1, 1, 2, 3)
+    got = F.interpolate(x.to(mojo_device), scale_factor=(1.4, 2), mode=mode)
+    want = F.interpolate(x, scale_factor=(1.4, 2), mode=mode)
+    torch.testing.assert_close(got.cpu(), want, atol=0, rtol=0)
+
+
+def test_upsample_backward_zero_weight_tap_of_inf_is_nan(mojo_device):
+    """CUDA scatters `0 * grad` for a zero-weight tap: NaN for an inf grad."""
+    g = torch.zeros(1, 1, 3, 3)
+    g[0, 0, 0, 0] = float("inf")
+    want = torch.ops.aten.upsample_bilinear2d_backward(g, [3, 3], [1, 1, 2, 2], False)
+    got = torch.ops.aten.upsample_bilinear2d_backward(
+        g.to(mojo_device), [3, 3], [1, 1, 2, 2], False
+    )
+    torch.testing.assert_close(got.cpu(), want, equal_nan=True)
+
+
+def test_upsample_nearest_backward_uint8(mojo_device):
+    """CUDA sums a uint8 gradient in int64 and wraps it back to uint8."""
+    g = (torch.arange(36).reshape(1, 1, 6, 6) * 9).to(torch.uint8)
+    want = torch.ops.aten.upsample_nearest2d_backward(g.double(), [6, 6], [1, 1, 4, 4])
+    got = torch.ops.aten.upsample_nearest2d_backward(
+        g.to(mojo_device), [6, 6], [1, 1, 4, 4]
+    )
+    torch.testing.assert_close(got.cpu(), want.long().to(torch.uint8))
+
+
+def test_reflection_pad_backward_checks_the_padding(mojo_device):
+    x = torch.randn(1, 3).to(mojo_device)
+    g = torch.randn(1, 7).to(mojo_device)
+    with pytest.raises(RuntimeError, match="Padding size should be less than"):
+        torch.ops.aten.reflection_pad1d_backward(g, x, [3, 1])
+
+
+def test_out_overlap_raises(mojo_device):
+    x = torch.randn(1, 1, 4, 4).to(mojo_device)
+    expanded = torch.empty(1, 1, 1, 1, device=mojo_device).expand(1, 1, 6, 6)
+    with pytest.raises(RuntimeError, match="more than one element"):
+        torch.ops.aten.replication_pad2d.out(x, [1, 1, 1, 1], out=expanded)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.ops.aten.upsample_nearest2d.out(x, [4, 4], None, None, out=x)
+    # A partially overlapping dense view: the input's second half is the
+    # start of the output.
+    buf = torch.zeros(64, device=mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.ops.aten.reflection_pad2d.out(
+            buf[:16].view(1, 1, 4, 4), [1, 1, 1, 1], out=buf[8:44].view(1, 1, 6, 6)
+        )

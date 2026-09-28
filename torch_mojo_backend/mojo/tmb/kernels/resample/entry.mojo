@@ -71,9 +71,12 @@ comptime _NEAREST_DTYPES = [
 
 @always_inline
 def _acc_dtype[dtype: DType]() -> DType:
-    """ATen's `acc_type<scalar_t, /*is_cuda=*/true>` for the float types."""
+    """ATen's `acc_type<scalar_t, /*is_cuda=*/true>`: float64 for double,
+    int64 for uint8 (nearest backward), float32 otherwise."""
     comptime if dtype == DType.float64:
         return DType.float64
+    elif dtype == DType.uint8:
+        return DType.int64
     else:
         return DType.float32
 
@@ -224,28 +227,36 @@ def _interp_range[
 @always_inline
 def _interp_weight[
     acc: DType, cubic: Bool
-](o: Int, i: Int, scale: Scalar[acc], in_size: Int, align: Bool) -> Scalar[acc]:
+](o: Int, i: Int, scale: Scalar[acc], in_size: Int, align: Bool) -> Tuple[
+    Scalar[acc], Bool
+]:
     """The total weight output `o` gives input `i` along one axis (taps that
-    clamp onto the same input add up, as CUDA's scattered adds do)."""
+    clamp onto the same input add up, as CUDA's scattered adds do), and
+    whether one of those taps has weight exactly 0: CUDA still adds
+    `0 * grad` for it, which is NaN for an infinite grad."""
     var real = _area_src[acc, cubic](scale, o, align)
+    var w = Scalar[acc](0)
+    var zero_tap = False
     comptime if cubic:
         var base = Int(floor(real))
         var t = real - Scalar[acc](base)
-        var w = Scalar[acc](0)
         for k in range(4):
             if max(min(base - 1 + k, in_size - 1), 0) == i:
-                w += _cubic_coeff[acc](t, k)
-        return w
+                var c = _cubic_coeff[acc](t, k)
+                w += c
+                zero_tap = zero_tap or c == 0
     else:
         var base = Int(real)
         var p = 1 if base < in_size - 1 else 0
         var l1 = real - Scalar[acc](base)
-        var w = Scalar[acc](0)
+        var l0 = Scalar[acc](1) - l1
         if base == i:
-            w += Scalar[acc](1) - l1
+            w += l0
+            zero_tap = l0 == 0
         if base + p == i:
             w += l1
-        return w
+            zero_tap = zero_tap or l1 == 0
+    return (w, zero_tap)
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +411,14 @@ def _upsample_fwd[
             var d = _nearest_src[exact](nd, od, in_d)
             var h = _nearest_src[exact](nh, oh, in_h)
             var w = _nearest_src[exact](nw, ow, in_w)
+            comptime if RANK == 2:
+                # upsample_nearest2d_out_frame's per-axis shortcut: an axis
+                # that keeps its size is copied whatever the scale says (the
+                # 1-d / 3-d kernels and every backward have none).
+                if in_h == out_h:
+                    h = oh
+                if in_w == out_w:
+                    w = ow
             out_ptr[unsafe_offset=i] = in_ptr[
                 unsafe_offset=base + (d * in_h + h) * in_w + w
             ]
@@ -598,31 +617,28 @@ def _upsample_bwd[
             comptime if RANK >= 2:
                 hr = _interp_range[acc, cubic](ih, sh_a, in_h, out_h, align)
             var wr = _interp_range[acc, cubic](iw, sw_a, in_w, out_w, align)
+            # Every output of the ranges reads input i; a zero-weight tap
+            # still contributes `0 * grad` on CUDA (NaN for an inf grad).
             for d in range(dr[0], dr[1]):
-                var wd = Scalar[acc](1)
+                var wd = (Scalar[acc](1), False)
                 comptime if RANK == 3:
                     wd = _interp_weight[acc, cubic](d, id, sd_a, in_d, align)
-                if wd == 0:
-                    continue
                 for h in range(hr[0], hr[1]):
                     var wh = wd
                     comptime if RANK >= 2:
-                        wh = wd * _interp_weight[acc, cubic](
+                        var e = _interp_weight[acc, cubic](
                             h, ih, sh_a, in_h, align
                         )
-                    if wh == 0:
-                        continue
+                        wh = (wd[0] * e[0], wd[1] or e[1])
                     var row = obase + (d * out_h + h) * out_w
                     for w in range(wr[0], wr[1]):
                         var ww = _interp_weight[acc, cubic](
                             w, iw, sw_a, in_w, align
                         )
-                        if ww != 0:
-                            total = fma(
-                                wh * ww,
-                                gout[unsafe_offset=row + w].cast[acc](),
-                                total,
-                            )
+                        var g = gout[unsafe_offset=row + w].cast[acc]()
+                        total = fma(wh[0] * ww[0], g, total)
+                        if wh[1] or ww[1]:
+                            total += Scalar[acc](0) * g
         gin[unsafe_offset=i] = total.cast[dtype]()
 
     _parallel_for_dt[dtype, func](count, ctx)
@@ -811,7 +827,7 @@ def _upsample_dispatcher[backward: Bool](argv: Argv, argc: Int) raises:
     var s = _scales(argv[unsafe_offset=4])
     var align = _raw_int(argv[unsafe_offset=5])
     var ctx = _raw_ctx(argv[unsafe_offset=6])
-    # uint8 only reaches here for nearest forward (the op declines the rest).
+    # uint8 only reaches here for nearest (the op declines the rest).
     comptime for dt in _NEAREST_DTYPES:
         comptime if _dtype_arg_on[0, dt]():
             comptime if backward:

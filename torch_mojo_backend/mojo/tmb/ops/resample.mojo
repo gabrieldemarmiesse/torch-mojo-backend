@@ -43,6 +43,8 @@ from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK, _f64_slot
 from tmb.ops.common import (
+    assert_no_internal_overlap,
+    assert_no_overlap,
     check_out,
     contiguous,
     copy_strided_into,
@@ -98,13 +100,17 @@ def _require_mojo(t: T, what: String) raises:
 
 
 def _dest(
-    args: Values, i: Int, like: T, dims: List[Int]
+    args: Values, i: Int, like: T, dims: List[Int], inputs: List[T]
 ) raises -> Tuple[T, Bool]:
     """The tensor an `out=` / `grad_input=` overload writes: the caller's
     (resized when its shape differs) when it is contiguous, else a fresh one
     to copy back (second field True)."""
     var dst = v_tensor(args[unsafe_offset=i])
     check_out(dst, like)
+    # Aliasing is checked on the caller's view before any resize: a resize
+    # may move the storage an input still points into.
+    for k in range(len(inputs)):
+        assert_no_overlap(dst, inputs[k])
     var shape = _shape(dims)
     var matches = dst.rank == len(dims)
     if matches:
@@ -115,6 +121,7 @@ def _dest(
     if not matches:
         resize_out(dst, shape, len(dims))
         return (dst^, False)
+    assert_no_internal_overlap(dst)
     if dst.contig:
         return (dst^, False)
     return (new_tensor(shape, len(dims), dst.stype, dst.device), True)
@@ -379,7 +386,7 @@ def op_upsample[
     var dst: T
     var fresh: Bool
     comptime if OUT:
-        var d = _dest(args, first_scale + RANK, a, out_dims)
+        var d = _dest(args, first_scale + RANK, a, out_dims, [a.copy()])
         dst = d[0].copy()
         fresh = d[1]
     else:
@@ -436,12 +443,12 @@ def op_upsample_backward[
                 ") = ",
                 g.dim(k),
             )
-    if not is_floating(g.stype):
+    if not _up_dtype_ok[MODE](g):
         unsupported(String(name, ": dtype ", g.dtype))
     var dst: T
     var fresh: Bool
     comptime if OUT:
-        var d = _dest(args, first_scale + RANK, g, in_dims)
+        var d = _dest(args, first_scale + RANK, g, in_dims, [g.copy()])
         dst = d[0].copy()
         fresh = d[1]
     else:
@@ -469,6 +476,40 @@ def _pad_name[REFLECT: Bool, RANK: Int]() -> String:
         return String("reflection_pad", RANK, "d")
     else:
         return String("replication_pad", RANK, "d")
+
+
+def _reflect_check[RANK: Int](t: T, padding: IntList) raises:
+    """Reflection's `pad < input size` check, per padded dim (the meta
+    functions of the forward and of the backward)."""
+    var lead = t.rank - RANK
+    for k in range(RANK):
+        # padding pairs run from the last dim: (left, right, top, ...)
+        var axis = RANK - 1 - k
+        var n = t.dim(lead + axis)
+        var lo = padding[2 * k]
+        var hi = padding[2 * k + 1]
+        if lo >= n or hi >= n:
+            var prefix = String()
+            comptime if RANK != 2:
+                prefix = String(
+                    "Argument ",
+                    _pick(3 - RANK + axis, "#8", "#6", "#4"),
+                    ": ",
+                )
+            raise Error(
+                prefix,
+                (
+                    "Padding size should be less than the corresponding"
+                    " input dimension, but got: padding ("
+                ),
+                lo,
+                ", ",
+                hi,
+                ") at dimension ",
+                lead + axis,
+                " of input ",
+                _sizes_str(t),
+            )
 
 
 def _pad_geom[
@@ -507,34 +548,7 @@ def _pad_geom[
         )
     var lead = t.rank - RANK
     comptime if REFLECT:
-        for k in range(RANK):
-            # padding pairs run from the last dim: (left, right, top, ...)
-            var axis = RANK - 1 - k
-            var n = t.dim(lead + axis)
-            var lo = padding[2 * k]
-            var hi = padding[2 * k + 1]
-            if lo >= n or hi >= n:
-                var prefix = String()
-                comptime if RANK != 2:
-                    prefix = String(
-                        "Argument ",
-                        _pick(3 - RANK + axis, "#8", "#6", "#4"),
-                        ": ",
-                    )
-                raise Error(
-                    prefix,
-                    (
-                        "Padding size should be less than the corresponding"
-                        " input dimension, but got: padding ("
-                    ),
-                    lo,
-                    ", ",
-                    hi,
-                    ") at dimension ",
-                    lead + axis,
-                    " of input ",
-                    _sizes_str(t),
-                )
+        _reflect_check[RANK](t, padding)
     var dims = List[Int]()
     for k in range(lead):
         dims.append(t.dim(k))
@@ -645,7 +659,7 @@ def op_pad[
     var dst: T
     var fresh: Bool
     comptime if OUT:
-        var d = _dest(args, 2, a, out_dims)
+        var d = _dest(args, 2, a, out_dims, [a.copy()])
         dst = d[0].copy()
         fresh = d[1]
     else:
@@ -673,6 +687,8 @@ def op_pad_backward[
         raise Error("padding size is expected to be ", 2 * RANK)
     if a.rank != RANK + 1 and a.rank != RANK + 2:
         unsupported(String(name, ": input of rank ", a.rank))
+    comptime if REFLECT:
+        _reflect_check[RANK](a, padding)
     var lead = a.rank - RANK
     if g.rank != a.rank:
         raise Error(
@@ -716,7 +732,8 @@ def op_pad_backward[
     var dst: T
     var fresh: Bool
     comptime if OUT:
-        var d = _dest(args, 3, g, in_dims)
+        # `self` is only read for its shape, so it may alias grad_input.
+        var d = _dest(args, 3, g, in_dims, [g.copy()])
         dst = d[0].copy()
         fresh = d[1]
     else:
