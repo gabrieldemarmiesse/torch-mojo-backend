@@ -2761,19 +2761,25 @@ def test_aten_glu(conf: Conf, call_checker: CallChecker, dtype: torch.dtype, dim
     check_outputs(fn, conf, [x], **tol)
 
 
+@pytest.fixture
+def cuda_gpu(cuda_available: bool) -> str:
+    """Skips before `call_checker` is set up (its teardown would fail)."""
+    if not cuda_available:
+        pytest.skip("the native graph ops are accelerator routes")
+    return "cuda"
+
+
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_aten_glu_backward_on_the_graph_path(
-    cuda_available: bool, call_checker: CallChecker, mode: str, dtype: torch.dtype
+    cuda_gpu: str, call_checker: CallChecker, mode: str, dtype: torch.dtype
 ):
     """The graph twin -- whose second half is the `native_glu_backward_b`
     custom op -- on a GPU: through torch.compile, and on MAX eager tensors
     (the MAX eager interpreter, MAX_USE_EAGER_INTERPRETER=1)."""
-    if not cuda_available:
-        pytest.skip("the native graph ops are accelerator routes")
     call_checker.register(aten_functions.aten_glu_backward)
-    x = (torch.randn(4, 6, 8, device="cuda") * 3).to(dtype)
-    grad = torch.randn(4, 6, 4, device="cuda").to(dtype)
+    x = (torch.randn(4, 6, 8, device=cuda_gpu) * 3).to(dtype)
+    grad = torch.randn(4, 6, 4, device=cuda_gpu).to(dtype)
 
     def fn(g: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return aten.glu_backward(g, t, -1)
