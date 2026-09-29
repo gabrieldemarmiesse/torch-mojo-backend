@@ -2031,7 +2031,12 @@ def _prelu[
     product is one scalar_t multiplication (rounded once); a NaN self takes
     the non-positive branch (`input > 0` is false)."""
     comptime w = wide_dtype[dtype]()
-    var pos = a.gt(0) & ~isnan(a)
+    # `input > 0` on the bits: a subnormal input is positive (Apple GPUs
+    # flush it in a float compare), NaN is not.
+    comptime u = _uint_of[dtype]()
+    comptime sign = Scalar[u](1) << Scalar[u](size_of[dtype]() * 8 - 1)
+    var bits = bitcast[u, n](a)
+    var pos = bits.lt(sign) & bits.ne(0) & ~isnan(a)
     comptime if kind == "prelu":
         return pos.select(a, (b.cast[w]() * a.cast[w]()).cast[dtype]())
     elif kind == "prelu_backward_input":
@@ -2088,6 +2093,13 @@ def _isclose[
     var close = a.eq(b)
     comptime if dtype.is_floating_point():
         comptime w = wide_dtype[dtype]()
+        # Equality on the bits (+0 == -0, NaN never): subnormals compare
+        # exactly on Apple GPUs too, which flush them in a float compare.
+        comptime u = _uint_of[dtype]()
+        comptime mag = ~(Scalar[u](1) << Scalar[u](size_of[dtype]() * 8 - 1))
+        var ba = bitcast[u, n](a)
+        var bb = bitcast[u, n](b)
+        close = (ba.eq(bb) & ~isnan(a)) | ((ba & mag).eq(0) & (bb & mag).eq(0))
         if p[2] != 0:
             close = close | (isnan(a) & isnan(b))
         if p[3] == 0:

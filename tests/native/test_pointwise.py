@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import skip_if_metal
+from tests.native.conftest import is_metal, skip_if_metal
 from torch_mojo_backend import get_accelerators, native
 
 FLOATS = [torch.float32, torch.float16, torch.bfloat16]
@@ -2274,6 +2274,9 @@ def test_prelu_forward_and_backward(mojo_gpu, dtype):
     _f64_or_skip(mojo_gpu, dtype)
     torch.manual_seed(0)
     edge = torch.tensor(_SPECIAL)
+    if dtype == torch.bfloat16 and is_metal(mojo_gpu):
+        # Apple GPUs carry bfloat16 through float and flush its subnormals.
+        edge = edge[edge.abs() != 1e-40]
     x = torch.cat([edge, torch.randn(3 * 7 * 5 - len(edge))]).reshape(3, 7, 5)
     for w in (torch.randn(7) * 3, torch.tensor([0.25])):
         xc = x.to(dtype).clone().requires_grad_()
@@ -2417,8 +2420,13 @@ def test_isclose_floats_match_cpu(mojo_gpu, dtype, equal_nan, tol):
     _f64_or_skip(mojo_gpu, dtype)
     torch.manual_seed(3)
     r = torch.randn(400)
-    a = torch.cat([torch.tensor(_ISCLOSE_A), r]).to(dtype)
-    b = torch.cat([torch.tensor(_ISCLOSE_B), r + torch.randn(400) * 1e-3]).to(dtype)
+    edge_a, edge_b = _ISCLOSE_A, _ISCLOSE_B
+    if is_metal(mojo_gpu) and tol != (0.0, 0.0):
+        # Apple GPUs flush a subnormal difference to 0 (as MPS does); only
+        # the equality itself is exact there.
+        edge_a, edge_b = edge_a[:-1], edge_b[:-1]
+    a = torch.cat([torch.tensor(edge_a), r]).to(dtype)
+    b = torch.cat([torch.tensor(edge_b), r + torch.randn(400) * 1e-3]).to(dtype)
     rtol, atol = tol
     with ran("aten::isclose"):
         got = torch.isclose(a.to(mojo_gpu), b.to(mojo_gpu), rtol, atol, equal_nan)
