@@ -1068,22 +1068,39 @@ def _fused_check_device(
     return t.ptr
 
 
+@always_inline
+def _read_as_f64[dt: DType](addr: Int) -> Float64:
+    return Pointer[Scalar[dt], MutUntrackedOrigin](
+        unsafe_from_address=addr
+    )[].cast[DType.float64]()
+
+
 def _fused_cpu_lr(lr: T) raises -> Float64:
-    """`lr.item<double>()` of a CPU tensor lr."""
+    """`lr.item<double>()` of a CPU tensor lr, whatever its real dtype."""
     if lr.numel != 1:
         raise Error(
             "a Tensor with ",
             lr.numel,
             " elements cannot be converted to Scalar",
         )
-    if lr.dtype == DType.float32:
-        return Float64(
-            Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=lr.ptr)[]
-        )
-    if lr.dtype == DType.float64:
-        return Pointer[Float64, MutUntrackedOrigin](
-            unsafe_from_address=lr.ptr
-        )[]
+    comptime for dt in [
+        DType.float32,
+        DType.float64,
+        DType.float16,
+        DType.bfloat16,
+        DType.int64,
+        DType.int32,
+        DType.int16,
+        DType.int8,
+        DType.uint8,
+        DType.uint16,
+        DType.uint32,
+        DType.uint64,
+    ]:
+        if lr.dtype == dt:
+            return _read_as_f64[dt](lr.ptr)
+    if lr.dtype == DType.bool:
+        return 1.0 if _read_as_f64[DType.uint8](lr.ptr) != 0 else 0.0
     unsupported(
         "fused optimizers: a CPU lr tensor of dtype " + String(lr.dtype)
     )
@@ -1097,6 +1114,7 @@ def _fused_optimizer(
     layout_msg: String,
     lists: List[List[T]],
     steps: List[T],
+    needs_steps: Bool,
     lr_v: Value,
     var hyper: List[Float64],
     flags: Int,
@@ -1122,7 +1140,9 @@ def _fused_optimizer(
                 " and ",
                 len(lists[i]),
             )
-    if len(steps) != 0 and len(steps) != count:
+    # Adam and Adagrad read one step per tensor: an empty or short
+    # state_steps list is a length mismatch like any other.
+    if (needs_steps or len(steps) != 0) and len(steps) != count:
         raise Error(
             "Tensor lists must have the same number of tensors, got ",
             count,
@@ -1283,6 +1303,7 @@ def _fused_adam_family(args: Values, adamw: Bool) raises:
         ),
         lists,
         v_tensor_list(args[unsafe_offset=5]),
+        True,
         lr_v,
         hyper^,
         (_FO_AMSGRAD if amsgrad else 0) | (_FO_MAXIMIZE if maximize else 0),
@@ -1370,6 +1391,7 @@ def op_fused_sgd_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         layout_msg,
         lists,
         List[T](),
+        False,
         lr_v,
         hyper^,
         flags,
@@ -1412,6 +1434,7 @@ def op_fused_adagrad_(
         ),
         lists,
         steps,
+        True,
         lr_v,
         hyper^,
         _FO_MAXIMIZE if v_bool(args[unsafe_offset=8]) else 0,

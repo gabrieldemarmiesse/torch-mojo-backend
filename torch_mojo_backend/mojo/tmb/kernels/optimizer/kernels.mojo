@@ -173,9 +173,17 @@ def _fused_opt_elements[
     var g = _ld[pdt, ot, width](grads, index)
     var maximize = (flags & FO_MAXIMIZE) != 0
 
+    # Every operand is loaded before anything is stored, and the stores run
+    # in the functor's order (param, grad, then the states in list order;
+    # the mixed-precision Adam functor stores grad last): when two lists
+    # alias, the one CUDA writes last wins here too.
     comptime if algo == FUSED_ADAM or algo == FUSED_ADAMW:
+        var amsgrad = (flags & FO_AMSGRAD) != 0
         var m = _ld[sdt, ot, width](state0, index)
         var v = _ld[sdt, ot, width](state1, index)
+        var mx = V(0)
+        if amsgrad:
+            mx = _ld[sdt, ot, width](state2, index)
         if has_grad_scale:
             g = g / c.grad_scale
         var grad_to_store = g
@@ -191,41 +199,52 @@ def _fused_opt_elements[
         v = fma(V(c.k2), v, fma(V(-c.k2), gg, gg))
         var step_size = c.k0 / c.k5
         var denom: V
-        if (flags & FO_AMSGRAD) != 0:
-            var mx = _ld[sdt, ot, width](state2, index)
+        if amsgrad:
             # std::max(a, b) is `a < b ? b : a`: a NaN `a` stays.
             mx = mx.lt(v).select(v, mx)
-            _st[sdt, ot, width](state2, index, mx)
             denom = ieee_sqrt(mx) / c.k6 + c.k4
         else:
             denom = ieee_sqrt(v) / c.k6 + c.k4
         p -= step_size * m / denom
         _st[pdt, ot, width](params, index, p)
-        if has_grad_scale:
-            _st[pdt, ot, width](grads, index, grad_to_store)
+        comptime if sdt == pdt:
+            if has_grad_scale:
+                _st[pdt, ot, width](grads, index, grad_to_store)
         _st[sdt, ot, width](state0, index, m)
         _st[sdt, ot, width](state1, index, v)
+        if amsgrad:
+            _st[sdt, ot, width](state2, index, mx)
+        comptime if sdt != pdt:
+            if has_grad_scale:
+                _st[pdt, ot, width](grads, index, grad_to_store)
     elif algo == FUSED_SGD:
+        var has_momentum = (flags & FO_MOMENTUM) != 0
+        var first_step = (flags & FO_FIRST_STEP) != 0
+        var buf = V(0)
+        if has_momentum and not first_step:
+            buf = _ld[sdt, ot, width](state0, index)
         if has_grad_scale:
             g = g / c.grad_scale
-            _st[pdt, ot, width](grads, index, g)
+        var grad_to_store = g
         if maximize:
             g = -g
         if c.k1 != 0:
             g += c.k1 * p
-        if (flags & FO_MOMENTUM) != 0:
-            var buf: V
-            if (flags & FO_FIRST_STEP) != 0:
+        if has_momentum:
+            if first_step:
                 buf = g
             else:
-                buf = c.k2 * _ld[sdt, ot, width](state0, index) + (1 - c.k3) * g
-            _st[sdt, ot, width](state0, index, buf)
+                buf = c.k2 * buf + (1 - c.k3) * g
             if (flags & FO_NESTEROV) != 0:
                 g = g + c.k2 * buf
             else:
                 g = buf
         p -= c.k0 * g
         _st[pdt, ot, width](params, index, p)
+        if has_grad_scale:
+            _st[pdt, ot, width](grads, index, grad_to_store)
+        if has_momentum:
+            _st[sdt, ot, width](state0, index, buf)
     elif algo == FUSED_ADAGRAD:
         var state_sum = _ld[sdt, ot, width](state0, index)
         if has_grad_scale:
