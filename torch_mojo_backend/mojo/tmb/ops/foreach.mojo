@@ -1,6 +1,6 @@
 """ATen ops: foreach group (see agents_docs/native_backend.md).
 
-Every `_foreach_*_` / `_fused_adamw_` op below tries ONE batched kernel
+Every `_foreach_*_` op below tries ONE batched kernel
 launch (the `optimizer` family, ported host-side from
 `eager_kernels/aten_fast.py`) when its homogeneous-dtype / contiguous /
 no-aliasing preconditions hold, and otherwise falls back to ATen's own
@@ -21,11 +21,10 @@ CompositeExplicitAutograd registration either, so they take no sequential
 fallback: what the batched kernel cannot take goes through a contiguous
 temporary, and what no kernel supports is declined.
 
-`_fused_adamw_` / `_fused_adamw_.tensor_lr` are the same: they have
-no CompositeExplicitAutograd registration in ATen at all (see
-native_functions.yaml), so there is no equivalent sequential fallback to
-call into. Declining there really does mean NotImplementedError, matching
-the old `_register_fast` (no-fallback) binding exactly.
+The fused optimizers (`_fused_{adam,adamw,sgd,adagrad}_`, what
+torch.optim runs with `fused=True`) are the same: no CompositeExplicitAutograd
+registration, so no sequential fallback. They validate like stock CUDA and
+raise its errors; see their section below.
 
 `_foreach_div_.ScalarList` and `_foreach_addcdiv_.ScalarList` are NOT
 registered here: there is no batched kernel for them, and with no
@@ -74,6 +73,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
 from tmb.ops.common import copy_strided_into
+from tmb.ops.data_movement import _scalar_type_name
 
 
 # --- the sequential per-tensor fallback ---------------------------------
@@ -993,216 +993,432 @@ def op_amp_update_scale_(
     _ = ctx
 
 
-def _fused_adamw_impl(args: Values, n_args: Int) raises:
-    var parameters = v_tensor_list(args[unsafe_offset=0])
-    var grads = v_tensor_list(args[unsafe_offset=1])
-    var exp_avgs = v_tensor_list(args[unsafe_offset=2])
-    var exp_avg_sqs = v_tensor_list(args[unsafe_offset=3])
-    var max_exp_avg_sqs = v_tensor_list(args[unsafe_offset=4])
-    var state_steps = v_tensor_list(args[unsafe_offset=5])
-    var amsgrad = v_bool(args[unsafe_offset=11])
-    var maximize = v_bool(args[unsafe_offset=12])
+# --- fused optimizers (torch.optim's fused=True) ----------------------------
+#
+# `_fused_{adam,adamw,sgd,adagrad}_` have no CompositeExplicitAutograd
+# registration (native_functions.yaml), so there is no sequential fallback:
+# what the kernel cannot take raises, with the message stock CUDA raises
+# (aten/src/ATen/native/cuda/Fused*Kernel.cu). Their autogen functional and
+# `.out` variants are CompositeExplicitAutograd over these in-place ones.
 
-    var tensor_count = len(parameters)
-    if (
-        len(grads) != tensor_count
-        or len(exp_avgs) != tensor_count
-        or len(exp_avg_sqs) != tensor_count
-        or len(state_steps) != tensor_count
-    ):
+
+# `flags` bits, as tmb/kernels/optimizer/kernels.mojo reads them.
+comptime _FO_AMSGRAD = 1
+comptime _FO_MAXIMIZE = 2
+comptime _FO_NESTEROV = 4
+comptime _FO_FIRST_STEP = 8
+comptime _FO_MOMENTUM = 16
+
+
+def _fused_same_sizes_and_strides(p: T, t: T) -> Bool:
+    """`_check_tensors_share_sizes_and_strides`: a size-1 dim's stride is
+    free."""
+    if p.rank != t.rank:
+        return False
+    for i in range(p.rank):
+        if p.dim(i) != t.dim(i):
+            return False
+        if p.dim(i) != 1 and p.stride(i) != t.stride(i):
+            return False
+    return True
+
+
+def _fused_fast_path_ok(
+    lists: List[List[T]], skip_cross_list_dtype: Bool
+) -> Bool:
+    """ATen's `check_fast_path_restrictions` (ForeachUtils.h): one device,
+    non-overlapping and dense, one dtype per list (and across lists unless
+    `skip_cross_list_dtype`), and every list laid out like the first. Dense
+    tensors sharing strides are walked in storage order, as flat arrays."""
+    var first = lists[0][0].copy()
+    for i in range(len(lists)):
+        if len(lists[i]) == 0:
+            continue
+        var list_dtype = lists[i][0].dtype
+        for j in range(len(lists[i])):
+            var t = lists[i][j].copy()
+            if (
+                not t.on_mojo()
+                or t.device != first.device
+                or not is_dense(t.shape, t.strides, t.rank)
+                or t.dtype != list_dtype
+                or (not skip_cross_list_dtype and t.dtype != first.dtype)
+            ):
+                return False
+            if i > 0 and not _fused_same_sizes_and_strides(lists[0][j], t):
+                return False
+    return True
+
+
+def _fused_check_device(
+    t: T, name: StaticString, device: Int, dtype: DType = DType.float32
+) raises -> Int:
+    """A device scalar the kernel dereferences (grad_scale, found_inf, a
+    device lr): stock CUDA's same-device check, then its `data_ptr<float>`
+    dtype check. Its first element's address."""
+    if not t.on_mojo() or t.device != device:
+        raise Error(name, " must be on the same GPU device as the params")
+    if t.dtype != dtype:
         raise Error(
-            "fused AdamW tensor lists must have the same length as parameters"
+            "expected scalar type Float but found ",
+            _scalar_type_name(t.dtype),
         )
-    if amsgrad:
-        if len(max_exp_avg_sqs) != tensor_count:
-            raise Error(
-                "max_exp_avg_sqs must have the same length as parameters"
-            )
-    elif len(max_exp_avg_sqs) != 0:
-        raise Error("max_exp_avg_sqs must be empty when amsgrad is False")
-    if tensor_count == 0:
-        return
+    if t.numel < 1:
+        raise Error(name, " must have at least one element")
+    return t.ptr
 
-    var first = parameters[0].copy()
-    if not first.on_mojo():
-        unsupported("fused AdamW: parameters are not on a mojo device")
+
+def _fused_cpu_lr(lr: T) raises -> Float64:
+    """`lr.item<double>()` of a CPU tensor lr."""
+    if lr.numel != 1:
+        raise Error(
+            "a Tensor with ",
+            lr.numel,
+            " elements cannot be converted to Scalar",
+        )
+    if lr.dtype == DType.float32:
+        return Float64(
+            Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=lr.ptr)[]
+        )
+    if lr.dtype == DType.float64:
+        return Pointer[Float64, MutUntrackedOrigin](
+            unsafe_from_address=lr.ptr
+        )[]
+    unsupported(
+        "fused optimizers: a CPU lr tensor of dtype " + String(lr.dtype)
+    )
+    return 0.0
+
+
+def _fused_optimizer(
+    op: String,
+    kernel_name: String,
+    mixed_label: String,
+    layout_msg: String,
+    lists: List[List[T]],
+    steps: List[T],
+    lr_v: Value,
+    var hyper: List[Float64],
+    flags: Int,
+    grad_scale_v: Value,
+    found_inf_v: Value,
+    mutated: List[List[T]],
+) raises:
+    """Validate like stock CUDA, then one batched launch.
+
+    `lists` is what the fast-path check covers: params, grads, then the
+    state lists the kernel reads (their order is the kernel's state0..2).
+    `hyper[0]` is overwritten with the float lr when `lr_v` is a tensor on
+    the CPU. `mutated` is every `Tensor(x!)[]` argument, for the version
+    counters.
+    """
+    var params = lists[0].copy()
+    var count = len(params)
+    for i in range(1, len(lists)):
+        if len(lists[i]) != count:
+            raise Error(
+                "Tensor lists must have the same number of tensors, got ",
+                count,
+                " and ",
+                len(lists[i]),
+            )
+    if len(steps) != 0 and len(steps) != count:
+        raise Error(
+            "Tensor lists must have the same number of tensors, got ",
+            count,
+            " and ",
+            len(steps),
+        )
+    if count == 0:
+        return
+    var first = params[0].copy()
     var device = first.device
 
-    var metadata = List[Int]()
-    for i in range(tensor_count):
-        var p = parameters[i].copy()
-        if (
-            not p.on_mojo()
-            or p.device != device
-            or p.dtype != DType.float32
-            or not p.contig
-        ):
-            raise Error(
-                (
-                    "fused AdamW tensors must have the same dtype, device,"
-                    " shape, and numel; contiguous float32 is required (invalid"
-                    " tensor index "
-                ),
-                i,
-                ")",
-            )
-        var g = grads[i].copy()
-        var ea = exp_avgs[i].copy()
-        var eas = exp_avg_sqs[i].copy()
-        if (
-            not g.on_mojo()
-            or g.device != device
-            or g.dtype != DType.float32
-            or not g.contig
-            or not g.same_shape(p)
-            or not ea.on_mojo()
-            or ea.device != device
-            or ea.dtype != DType.float32
-            or not ea.contig
-            or not ea.same_shape(p)
-            or not eas.on_mojo()
-            or eas.device != device
-            or eas.dtype != DType.float32
-            or not eas.contig
-            or not eas.same_shape(p)
-        ):
-            raise Error(
-                (
-                    "fused AdamW tensors must have the same dtype, device,"
-                    " shape, and numel; contiguous float32 is required (invalid"
-                    " tensor index "
-                ),
-                i,
-                ")",
-            )
-        var max_eas_ptr = 0
-        if amsgrad:
-            var meas = max_exp_avg_sqs[i].copy()
-            if (
-                not meas.on_mojo()
-                or meas.device != device
-                or meas.dtype != DType.float32
-                or not meas.contig
-                or not meas.same_shape(p)
-            ):
+    # A CPU lr tensor is `lr.item<double>()`: the float-lr overload.
+    var lr_ptr = 0
+    var lr_is_tensor = lr_v.tag == TAG_TENSOR or lr_v.tag == TAG_TENSOR_REF
+    var lr_t = Optional[T](None)
+    if lr_is_tensor:
+        var t = v_tensor(lr_v)
+        if t.on_cpu():
+            hyper[0] = _fused_cpu_lr(t)
+        else:
+            lr_t = t^
+    var grad_scale_ptr = 0
+    var found_inf_ptr = 0
+    if grad_scale_v.tag != TAG_NONE:
+        grad_scale_ptr = _fused_check_device(
+            v_tensor(grad_scale_v), "grad_scale", device
+        )
+    if found_inf_v.tag != TAG_NONE:
+        found_inf_ptr = _fused_check_device(
+            v_tensor(found_inf_v), "found_inf", device
+        )
+    if lr_t:
+        lr_ptr = _fused_check_device(lr_t.value(), "lr", device)
+
+    var mixed = (
+        mixed_label != ""
+        and len(lists) > 2
+        and first.dtype != lists[2][0].dtype
+    )
+    if not _fused_fast_path_ok(lists, mixed):
+        raise Error(layout_msg)
+    var state_dtype = first.dtype
+    if mixed:
+        # validate_mixed_precision_dtypes (fused_adam_utils.cuh): float32
+        # params and grads, bfloat16 states.
+        var what = List[String]()
+        what.append("params")
+        what.append("grads")
+        what.append("optimizer states")
+        what.append("optimizer states")
+        what.append("max_exp_avg_sqs")
+        for i in range(len(lists)):
+            var want = DType.float32 if i < 2 else DType.bfloat16
+            var got = lists[i][0].dtype
+            if got != want:
                 raise Error(
-                    (
-                        "fused AdamW tensors must have the same dtype, device,"
-                        " shape, and numel; contiguous float32 is required"
-                        " (invalid tensor index "
-                    ),
-                    i,
-                    ")",
+                    mixed_label,
+                    " requires ",
+                    "float32 " if i < 2 else "bfloat16 ",
+                    what[i],
+                    ", got ",
+                    _scalar_type_name(got),
                 )
-            max_eas_ptr = meas.ptr
-        var step = state_steps[i].copy()
+        state_dtype = DType.bfloat16
+    elif (
+        first.dtype != DType.float32
+        and first.dtype != DType.float16
+        and first.dtype != DType.bfloat16
+        and first.dtype != DType.float64
+    ):
+        raise Error(
+            '"',
+            kernel_name,
+            "\" not implemented for '",
+            _scalar_type_name(first.dtype),
+            "'",
+        )
+    if first.dtype == DType.float64 and dev(device)[].api == "metal":
+        unsupported("fused optimizers: Apple GPUs have no float64")
+
+    for i in range(len(steps)):
+        var step = steps[i].copy()
         if (
             not step.on_mojo()
             or step.device != device
             or step.dtype != DType.float32
-            or step.numel != 1
-            or not step.contig
+            or step.numel < 1
         ):
             raise Error(
                 (
-                    "fused AdamW state_steps must be contiguous scalar float32"
-                    " tensors on the parameter device (invalid index "
+                    "fused optimizer state_steps must be float32 tensors on the"
+                    " params' device (invalid index "
                 ),
                 i,
                 ")",
             )
-        metadata.append(p.ptr)
-        metadata.append(g.ptr)
-        metadata.append(ea.ptr)
-        metadata.append(eas.ptr)
-        metadata.append(max_eas_ptr)
-        metadata.append(step.ptr)
-        metadata.append(p.numel)
 
-    var lr_v = args[unsafe_offset=6].copy()
-    var lr_scalar = 0.0
-    var lr_ptr = 0
-    if lr_v.tag == TAG_TENSOR or lr_v.tag == TAG_TENSOR_REF:
-        var lr_t = v_tensor(lr_v)
-        if lr_t.on_mojo():
-            lr_ptr = _scalar_f32_tensor(lr_v, "lr", device)
-        else:
-            if lr_t.numel != 1:
-                raise Error("tensor lr must be a scalar CPU or mojo tensor")
-            lr_scalar = Float64(
-                Pointer[Float32, MutUntrackedOrigin](
-                    unsafe_from_address=lr_t.ptr
-                )[]
-            )
-    else:
-        lr_scalar = v_f64(lr_v)
-
-    var beta1 = v_f64(args[unsafe_offset=7])
-    var beta2 = v_f64(args[unsafe_offset=8])
-    var weight_decay = v_f64(args[unsafe_offset=9])
-    var eps = v_f64(args[unsafe_offset=10])
-    var grad_scale_ptr = _scalar_f32_tensor(
-        args[unsafe_offset=13], "grad_scale", device
-    )
-    var found_inf_ptr = _scalar_f32_tensor(
-        args[unsafe_offset=14], "found_inf", device
-    )
-
-    var flags_int = (1 if amsgrad else 0) | ((1 if maximize else 0) << 1)
-    var scalars = List[Int]()
-    scalars.append(Int(f64_bits(lr_scalar)))
-    scalars.append(Int(f64_bits(beta1)))
-    scalars.append(Int(f64_bits(beta2)))
-    scalars.append(Int(f64_bits(weight_decay)))
-    scalars.append(Int(f64_bits(eps)))
+    var metadata = List[Int](capacity=count * 7)
+    for j in range(count):
+        metadata.append(lists[0][j].ptr)
+        metadata.append(lists[1][j].ptr)
+        for s in range(3):
+            metadata.append(lists[2 + s][j].ptr if 2 + s < len(lists) else 0)
+        metadata.append(steps[j].ptr if len(steps) != 0 else 0)
+        metadata.append(lists[0][j].numel)
+    var scalars = List[Int](capacity=5)
+    for i in range(5):
+        scalars.append(Int(f64_bits(hyper[i] if i < len(hyper) else 0.0)))
 
     var ctx = ctx_for(device)
     var cp = ctx_ptr(ctx)
-    var call = KernelCall("optimizer", "FusedAdamW")
-    call.arg_dtype(0, DType.float32)
-    call.arg_dtype(1, DType.float32)
-    call.arg_dtype(2, DType.float32)
-    call.arg_dtype(3, DType.float32)
-    call.arg_dtype(4, DType.float32)
-    call.out_dtype(DType.float32)
-    call.flag("AMSGRAD", 1 if amsgrad else 0)
-    call.flag("MAXIMIZE", 1 if maximize else 0)
-    call.flag("TENSOR_LR", 1 if lr_ptr != 0 else 0)
-    call.flag("GRAD_SCALE", 1 if grad_scale_ptr != 0 else 0)
-    call.flag("FOUND_INF", 1 if found_inf_ptr != 0 else 0)
+    var call = KernelCall("optimizer", op)
+    call.arg_dtype(0, first.dtype)
+    call.arg_dtype(1, state_dtype)
     call.tuple(metadata)
     call.tuple(scalars)
-    call.int(0)
-    call.int(flags_int)
+    call.int(flags)
     call.int(lr_ptr)
     call.int(grad_scale_ptr)
     call.int(found_inf_ptr)
     call.int(cp)
     call.run()
-    # Every list the kernel writes: `grads` too, which it overwrites with
-    # the unscaled gradient when grad_scale is given.
-    for t in parameters:
-        t.bump_version()
-    for t in grads:
-        t.bump_version()
-    for t in exp_avgs:
-        t.bump_version()
-    for t in exp_avg_sqs:
-        t.bump_version()
-    for t in max_exp_avg_sqs:
-        t.bump_version()
     _ = ctx
+    for group in mutated:
+        for t in group:
+            t.bump_version()
 
 
-# aten::_fused_adamw_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs,
+def _fused_adam_family(args: Values, adamw: Bool) raises:
+    var amsgrad = v_bool(args[unsafe_offset=11])
+    var maximize = v_bool(args[unsafe_offset=12])
+    var lists = List[List[T]]()
+    for i in range(4):
+        lists.append(v_tensor_list(args[unsafe_offset=i]))
+    var max_exp_avg_sqs = v_tensor_list(args[unsafe_offset=4])
+    if amsgrad:
+        lists.append(max_exp_avg_sqs.copy())
+    var hyper = List[Float64]()
+    var lr_v = args[unsafe_offset=6].copy()
+    hyper.append(
+        0.0 if lr_v.tag == TAG_TENSOR
+        or lr_v.tag == TAG_TENSOR_REF else v_f64(lr_v)
+    )
+    for i in range(7, 11):
+        hyper.append(v_f64(args[unsafe_offset=i]))
+    var mutated = lists.copy()
+    if not amsgrad:
+        mutated.append(max_exp_avg_sqs^)
+    _fused_optimizer(
+        "FusedAdamW" if adamw else "FusedAdam",
+        ("fused_adamw_kernel_cuda" if adamw else "fused_adam_kernel_cuda"),
+        (
+            "Mixed-precision fused AdamW" if adamw else "Mixed-precision fused Adam"
+        ),
+        "params, grads, exp_avgs, exp_avg_sqs, and max_exp_avg_sqs must have same dtype, device, and layout" if amsgrad else (
+            "params, grads, exp_avgs, and exp_avg_sqs must have same dtype,"
+            " device, and layout"
+        ),
+        lists,
+        v_tensor_list(args[unsafe_offset=5]),
+        lr_v,
+        hyper^,
+        (_FO_AMSGRAD if amsgrad else 0) | (_FO_MAXIMIZE if maximize else 0),
+        args[unsafe_offset=13],
+        args[unsafe_offset=14],
+        mutated,
+    )
+
+
+# aten::_fused_adam_(Tensor(a!)[] self, Tensor(b!)[] grads, Tensor(c!)[] exp_avgs,
 #   Tensor(d!)[] exp_avg_sqs, Tensor(e!)[] max_exp_avg_sqs, Tensor[] state_steps, *,
 #   float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad,
 #   bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+# aten::_fused_adam_.tensor_lr(..., Tensor lr, ...) -> ()
+def op_fused_adam_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _fused_adam_family(args, False)
+
+
+# aten::_fused_adamw_(...same as _fused_adam_...) -> ()
 # aten::_fused_adamw_.tensor_lr(..., Tensor lr, ...) -> ()
 def op_fused_adamw_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _fused_adamw_impl(args, n_args)
+    _fused_adam_family(args, True)
+
+
+# aten::_fused_sgd_(Tensor(a!)[] self, Tensor(b!)[] grads,
+#   Tensor(c!)[] momentum_buffer_list, *, float weight_decay, float momentum,
+#   float lr, float dampening, bool nesterov, bool maximize, bool is_first_step,
+#   Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+# aten::_fused_sgd_.tensor_lr(..., Tensor lr, ...) -> ()
+def op_fused_sgd_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var lists = List[List[T]]()
+    lists.append(v_tensor_list(args[unsafe_offset=0]))
+    lists.append(v_tensor_list(args[unsafe_offset=1]))
+    var buffers = v_tensor_list(args[unsafe_offset=2])
+    var weight_decay = v_f64(args[unsafe_offset=3])
+    var momentum = v_f64(args[unsafe_offset=4])
+    var lr_v = args[unsafe_offset=5].copy()
+    var dampening = v_f64(args[unsafe_offset=6])
+    var nesterov = v_bool(args[unsafe_offset=7])
+    var maximize = v_bool(args[unsafe_offset=8])
+    var is_first_step = v_bool(args[unsafe_offset=9])
+    var has_momentum = len(buffers) != 0
+    var layout_msg: String
+    if has_momentum:
+        if not momentum > 0:
+            raise Error("Check failed: momentum > 0 (", momentum, " vs. 0). ")
+        lists.append(buffers.copy())
+        layout_msg = (
+            "Expected at::native::check_fast_path_restrictions( {params,"
+            " grads, momentum_buffer_list}) to be true, but got false."
+        )
+    else:
+        if momentum != 0:
+            raise Error("Check failed: momentum == 0 (", momentum, " vs. 0). ")
+        layout_msg = (
+            "Expected at::native::check_fast_path_restrictions({params,"
+            " grads}) to be true, but got false."
+        )
+    var hyper = List[Float64]()
+    hyper.append(
+        0.0 if lr_v.tag == TAG_TENSOR
+        or lr_v.tag == TAG_TENSOR_REF else v_f64(lr_v)
+    )
+    hyper.append(weight_decay)
+    hyper.append(momentum)
+    hyper.append(dampening)
+    hyper.append(0.0)
+    var flags = (
+        (_FO_MAXIMIZE if maximize else 0)
+        | (_FO_NESTEROV if nesterov else 0)
+        | (_FO_FIRST_STEP if is_first_step and has_momentum else 0)
+        | (_FO_MOMENTUM if has_momentum else 0)
+    )
+    var mutated = lists.copy()
+    if not has_momentum:
+        mutated.append(buffers^)
+    _fused_optimizer(
+        "FusedSgd",
+        (
+            "fused_sgd_with_momentum_kernel_cuda" if has_momentum else "fused_sgd_kernel_cuda"
+        ),
+        "",
+        layout_msg,
+        lists,
+        List[T](),
+        lr_v,
+        hyper^,
+        flags,
+        args[unsafe_offset=10],
+        args[unsafe_offset=11],
+        mutated,
+    )
+
+
+# aten::_fused_adagrad_(Tensor(a!)[] self, Tensor(b!)[] grads,
+#   Tensor(c!)[] state_sums, Tensor(d!)[] state_steps, *, float lr,
+#   float lr_decay, float weight_decay, float eps, bool maximize,
+#   Tensor? grad_scale=None, Tensor? found_inf=None) -> ()
+# aten::_fused_adagrad_.tensor_lr(..., Tensor lr, ...) -> ()
+def op_fused_adagrad_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var lists = List[List[T]]()
+    for i in range(3):
+        lists.append(v_tensor_list(args[unsafe_offset=i]))
+    var steps = v_tensor_list(args[unsafe_offset=3])
+    var lr_v = args[unsafe_offset=4].copy()
+    var hyper = List[Float64]()
+    hyper.append(
+        0.0 if lr_v.tag == TAG_TENSOR
+        or lr_v.tag == TAG_TENSOR_REF else v_f64(lr_v)
+    )
+    for i in range(5, 8):
+        hyper.append(v_f64(args[unsafe_offset=i]))
+    hyper.append(0.0)
+    var mutated = lists.copy()
+    mutated.append(steps.copy())
+    _fused_optimizer(
+        "FusedAdagrad",
+        "fused_adagrad_kernel_cuda",
+        "",
+        (
+            "params, grads, and state_sums must have same dtype, device, and"
+            " layout"
+        ),
+        lists,
+        steps,
+        lr_v,
+        hyper^,
+        _FO_MAXIMIZE if v_bool(args[unsafe_offset=8]) else 0,
+        args[unsafe_offset=9],
+        args[unsafe_offset=10],
+        mutated,
+    )
 
 
 def register_foreach(site: Site) raises:
@@ -1219,8 +1435,14 @@ def register_foreach(site: Site) raises:
     impl[op_foreach_mul_tensor_, "_foreach_mul_.Tensor"](site)
     impl[op_foreach_norm_scalar, "_foreach_norm.Scalar"](site)
     impl[op_foreach_sqrt, "_foreach_sqrt"](site)
+    impl[op_fused_adam_, "_fused_adam_"](site)
+    impl[op_fused_adam_, "_fused_adam_.tensor_lr"](site)
     impl[op_fused_adamw_, "_fused_adamw_"](site)
     impl[op_fused_adamw_, "_fused_adamw_.tensor_lr"](site)
+    impl[op_fused_sgd_, "_fused_sgd_"](site)
+    impl[op_fused_sgd_, "_fused_sgd_.tensor_lr"](site)
+    impl[op_fused_adagrad_, "_fused_adagrad_"](site)
+    impl[op_fused_adagrad_, "_fused_adagrad_.tensor_lr"](site)
     # _foreach_div_.ScalarList / _foreach_addcdiv_.ScalarList: intentionally
     # unregistered -- see the module docstring (Scalar[] cannot be marshalled
     # by the current C++ shim).
