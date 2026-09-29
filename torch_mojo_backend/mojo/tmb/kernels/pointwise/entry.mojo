@@ -105,12 +105,14 @@ comptime KINDS_1 = [
     "threshold",
 ]
 comptime KINDS_2 = [
+    "add_relu",
     "atan2",
     "chebyshev_polynomial_t",
     "chebyshev_polynomial_u",
     "chebyshev_polynomial_v",
     "chebyshev_polynomial_w",
     "copysign",
+    "dirichlet",
     "elu_backward",
     "fmax",
     "fmin",
@@ -126,10 +128,12 @@ comptime KINDS_2 = [
     "heaviside",
     "hermite_polynomial_h",
     "hermite_polynomial_he",
+    "huber",
     "hypot",
     "igamma",
     "igammac",
     "ipow",
+    "isclose",
     "laguerre_polynomial_l",
     "lcm",
     "ldexp",
@@ -142,13 +146,14 @@ comptime KINDS_2 = [
     "logaddexp2",
     "logit_backward",
     "lshift",
-    "huber",
+    "masked_scale",
     "maximum",
     "minimum",
     "mish_backward",
     "mse",
     "mul_scale",
     "nextafter",
+    "prelu",
     "rrelu_noise",
     "rrelu_train",
     "rshift",
@@ -161,6 +166,7 @@ comptime KINDS_2 = [
     "silu_backward",
     "smooth_l1",
     "softplus_backward",
+    "standard_gamma_grad",
     "xlog1py",
     "xlogy",
     "zeta",
@@ -170,10 +176,13 @@ comptime KINDS_3 = [
     "bce_backward",
     "bce_logits",
     "clamp",
+    "dirichlet_grad",
     "glu_backward_b",
     "huber_backward",
     "lerp",
     "mse_backward",
+    "prelu_backward_input",
+    "prelu_backward_weight",
     "smooth_l1_backward",
 ]
 
@@ -223,6 +232,8 @@ def _heavy_kind[kind: StaticString]() -> Bool:
         or kind == "fmin"
         or kind == "lerp"
         or kind == "lerp_scalar"
+        or kind == "standard_gamma_grad"
+        or kind == "dirichlet_grad"
         or is_polynomial[kind]()
     )
 

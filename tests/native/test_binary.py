@@ -2038,3 +2038,49 @@ def test_pow_float64_special_exponents(mojo_gpu):
     # The full pow: within an ulp of the exact value (CUDA's double pow).
     got = torch.pow(xd, 7.3).cpu()
     torch.testing.assert_close(got, torch.pow(x, 7.3), rtol=4.5e-16, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.int64, torch.int32, torch.float32, torch.float16]
+)
+def test_floor_divide_out_and_inplace(mojo_gpu, dtype):
+    """floor_divide.out and floor_divide_.Tensor: the floor division of
+    div(rounding_mode="floor"), into a resized, a strided and a dtype-cast
+    out, and in place."""
+    torch.manual_seed(0)
+    a = torch.randint(-20, 20, (6, 5)).to(dtype)
+    b = torch.tensor([3, -4, 7, 2, -1]).to(dtype)
+    want = torch.floor_divide(a, b)
+    ad, bd = a.to(mojo_gpu), b.to(mojo_gpu)
+    out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    torch.floor_divide(ad, bd, out=out)
+    assert torch.equal(out.cpu(), want)
+    strided = torch.zeros(5, 6, dtype=dtype, device=mojo_gpu).t()
+    torch.floor_divide(ad, bd, out=strided)
+    assert torch.equal(strided.cpu(), want)
+    wide = torch.empty(
+        6,
+        5,
+        dtype=torch.float64 if dtype.is_floating_point else torch.float32,
+        device=mojo_gpu,
+    )
+    if dtype.is_floating_point and wide.dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal has no float64")
+    torch.floor_divide(ad, bd, out=wide)
+    assert torch.equal(wide.cpu(), want.to(wide.dtype))
+    x = ad.clone()
+    x.floor_divide_(bd)
+    assert torch.equal(x.cpu(), want)
+    x = ad.clone()
+    x.floor_divide_(3)
+    assert torch.equal(x.cpu(), torch.floor_divide(a, 3))
+
+
+def test_floor_divide_out_errors(mojo_gpu):
+    a = torch.ones(3, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.floor_divide(a, a, out=torch.empty(3, dtype=torch.long, device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="ZeroDivisionError"):
+        torch.ones(3, dtype=torch.long, device=mojo_gpu).floor_divide_(0)
+    with pytest.raises(RuntimeError):
+        a.clone().floor_divide_(torch.ones(2, 3, device=mojo_gpu))

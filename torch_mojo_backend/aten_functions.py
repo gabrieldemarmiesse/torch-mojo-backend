@@ -1091,6 +1091,28 @@ def aten__native_batch_norm_legit_no_training(
 # _pdist_forward(Tensor self, float p=2) -> Tensor
 
 
+# _prelu_kernel(Tensor self, Tensor weight) -> Tensor
+@map_to(aten._prelu_kernel)
+def aten__prelu_kernel(self: MaxTensor, weight: MaxTensor) -> MaxTensor:
+    """ActivationPreluKernel.cu: self > 0 ? self : weight * self, the
+    product one scalar_t multiplication (rounded once)."""
+    return _where(self > 0, self, weight * self)
+
+
+# _prelu_kernel_backward(Tensor grad_output, Tensor self, Tensor weight) -> (Tensor, Tensor)
+@map_to(aten._prelu_kernel_backward)
+def aten__prelu_kernel_backward(
+    grad_output: MaxTensor, self: MaxTensor, weight: MaxTensor
+) -> tuple[MaxTensor, MaxTensor]:
+    """Both gradients of the broadcast shape (prelu's composite backward
+    reduces grad_weight to the weight's shape)."""
+    positive = self > 0
+    grad_input = _where(positive, grad_output, weight * grad_output)
+    zero = F.constant(0, dtype=self.dtype, device=self.device)
+    grad_weight = _where(positive, zero, self * grad_output)
+    return grad_input, grad_weight
+
+
 # _scaled_dot_product_attention_math(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0.0, bool is_causal=False, Tensor? dropout_mask=None, *, float? scale=None, bool enable_gqa=False) -> (Tensor, Tensor)
 @map_to(aten._scaled_dot_product_attention_math)
 def aten__scaled_dot_product_attention_math(

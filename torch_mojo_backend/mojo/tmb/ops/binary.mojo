@@ -2257,6 +2257,36 @@ def op_floor_divide(
     )
 
 
+# aten::floor_divide.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+def op_floor_divide_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """floor_divide_out: `div_floor_stub` over a binary_op TensorIterator,
+    the route div.out_mode(rounding_mode="floor") takes."""
+    var lhs = _b_side(args[unsafe_offset=0])
+    var rhs = _b_side(args[unsafe_offset=1])
+    var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
+    _b_out_guard(dest, lhs, rhs)
+    _b_store_out(
+        rets, dest, _b_rounding_div(True, lhs, rhs, Optional[T](dest.copy()))
+    )
+
+
+# aten::floor_divide_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+def op_floor_divide_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var self = _b_self(args[unsafe_offset=0], "floor_divide_")
+    var rhs = _b_side(args[unsafe_offset=1])
+    _b_inplace_destination(self)
+    if rhs.is_t:
+        _b_inplace_operand(self, rhs.t.value())
+    _b_no_overlap_side(self, rhs)
+    _b_store_inplace(
+        rets, self, _b_rounding_div(True, _b_tside(self), rhs, None)
+    )
+
+
 # aten::bitwise_and.Scalar(Tensor self, Scalar other) -> Tensor
 # aten::bitwise_and.Tensor(Tensor self, Tensor other) -> Tensor
 def op_bitwise_and(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -2954,6 +2984,8 @@ def register_binary(site: Site) raises:
     impl[op_div_out_mode, "div.out_mode"](site)
     impl[op_floor_divide, "floor_divide"](site)
     impl[op_floor_divide, "floor_divide.Scalar"](site)
+    impl[op_floor_divide_out, "floor_divide.out"](site)
+    impl[op_floor_divide_, "floor_divide_.Tensor"](site)
     impl[op_logical_and, "logical_and"](site)
     impl[op_logical_and_out, "logical_and.out"](site)
     impl[op_logical_or, "logical_or"](site)

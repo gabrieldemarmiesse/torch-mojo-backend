@@ -80,6 +80,10 @@ MATH_OPS = {
     "nextafter": torch.nextafter,
     "special_xlog1py": torch.special.xlog1py,
     "xlogy.Tensor": torch.xlogy,
+    # isclose: one kernel here, ATen's composite (~6 kernels) on stock CUDA.
+    "isclose": lambda a, b: torch.isclose(a, b, 1e-2, 1e-3),
+    "_prelu_kernel": torch.ops.aten._prelu_kernel,
+    "_standard_gamma_grad": torch.ops.aten._standard_gamma_grad,
 }
 INT_MATH_OPS = {
     "bitwise_left_shift.Tensor": torch.bitwise_left_shift,
@@ -130,6 +134,10 @@ ACT_BACKWARD_OPS = {
     "silu_backward": torch.ops.aten.silu_backward,
     "softplus_backward": lambda g, x: torch.ops.aten.softplus_backward(g, x, 1.0, 20.0),
     "softshrink_backward": lambda g, x: torch.ops.aten.softshrink_backward(g, x, 0.5),
+    # Both gradients, of the full shape (weight = x, one per element).
+    "_prelu_kernel_backward": lambda g, x: torch.ops.aten._prelu_kernel_backward(
+        g, x, x
+    ),
 }
 LOGICAL_OPS = {
     "logical_and": torch.logical_and,
@@ -222,7 +230,24 @@ _SHIFT_ALIAS = (
 )
 _SHIFT_INPLACE = "in-place form of the same lshift/rshift launch, written into self"
 
+_NO_CUDA_ADD_RELU = (
+    "CPU-only upstream (stock CUDA has no _add_relu kernel), so there is no "
+    "reference leg; the pointwise launch test_binary_math measures"
+)
 SKIPPED: dict[str, str] = {
+    "aten::_add_relu.Tensor": _NO_CUDA_ADD_RELU,
+    "aten::_add_relu.Scalar": _NO_CUDA_ADD_RELU,
+    "aten::_add_relu.out": _NO_CUDA_ADD_RELU,
+    "aten::_add_relu_.Tensor": _NO_CUDA_ADD_RELU,
+    "aten::_add_relu_.Scalar": _NO_CUDA_ADD_RELU,
+    "aten::_dirichlet_grad": (
+        "the three-operand form of test_binary_math's _standard_gamma_grad "
+        "launch (same pointwise family, same digamma-based math)"
+    ),
+    "aten::floor_divide.out": _OUT,
+    "aten::floor_divide_.Tensor": (
+        "in-place form of the FloorDivSpec launch test_floor_divide measures"
+    ),
     "aten::__ilshift__.Scalar": _SHIFT_INPLACE,
     "aten::__ilshift__.Tensor": _SHIFT_INPLACE,
     "aten::__irshift__.Scalar": _SHIFT_INPLACE,

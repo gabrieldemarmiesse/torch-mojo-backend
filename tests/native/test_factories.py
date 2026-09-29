@@ -7,6 +7,7 @@ Public torch API only, per the porting brief: no `aten_fast`,
 `TorchMojoTensor`, or `_ctx_ptr` internals.
 """
 
+import math
 import re
 from fractions import Fraction
 
@@ -1076,3 +1077,310 @@ def test_tri_indices_errors(mojo_gpu):
         torch.tril_indices(-1, 3, device=mojo_gpu)
     with pytest.raises(RuntimeError, match="col must be non-negative"):
         torch.triu_indices(3, -1, device=mojo_gpu)
+
+
+# ---------------------------------------------------------------------------
+# bernoulli.out, _fused_dropout, _fill_mem_eff_dropout_mask_
+# ---------------------------------------------------------------------------
+
+
+def test_bernoulli_out_is_bernoulli_tensor(mojo_gpu):
+    """bernoulli.out = out.resize_(p.shape).bernoulli_(p): the same draw as
+    the functional form from the same generator state, any out dtype."""
+    torch.manual_seed(0)
+    p = torch.rand(33, 7).to(mojo_gpu)
+    gen = torch.Generator(device=mojo_gpu)
+    gen.manual_seed(123)
+    want = torch.bernoulli(p, generator=gen).cpu()
+    for dtype in (torch.float32, torch.int64, torch.bool, torch.float16):
+        gen.manual_seed(123)
+        out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+        torch.bernoulli(p, generator=gen, out=out)
+        assert out.shape == p.shape and out.dtype == dtype
+        assert torch.equal(out.cpu().float(), want)
+    # A correctly shaped strided out is written where it lives.
+    gen.manual_seed(123)
+    base = torch.full((7, 33), 5.0, device=mojo_gpu)
+    torch.bernoulli(p, generator=gen, out=base.t())
+    assert torch.equal(base.t().cpu(), want)
+    # p = 0 / 1 are exact; the frequency of 0.3 is.
+    q = torch.tensor([0.0, 1.0, 0.3]).repeat_interleave(20000).to(mojo_gpu)
+    out = torch.empty(0, device=mojo_gpu)
+    torch.bernoulli(q, out=out)
+    r = out.cpu().reshape(3, -1)
+    assert r[0].sum() == 0 and r[1].sum() == 20000
+    assert abs(r[2].mean().item() - 0.3) < 0.015
+
+
+def test_bernoulli_out_errors_and_aliasing(mojo_gpu):
+    x = torch.rand(1, device=mojo_gpu).expand(6)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.bernoulli(torch.rand(6, device=mojo_gpu), out=x)
+    with pytest.raises(RuntimeError, match="floating type"):
+        torch.bernoulli(
+            torch.ones(3, dtype=torch.long, device=mojo_gpu),
+            out=torch.empty(3, device=mojo_gpu),
+        )
+    # out shares storage with p and needs a resize: p is read first.
+    base = torch.tensor([1.0, 1.0, 0.0, 0.0]).to(mojo_gpu)
+    p = base[:2]
+    torch.bernoulli(p, out=base)
+    assert base.cpu().tolist() == [1.0, 1.0]
+
+
+def test_fused_dropout_matches_native_dropout(mojo_gpu):
+    """_fused_dropout(x, keep) is dropout_cuda<uint8_t> with p = keep: the
+    same draws as native_dropout(x, 1 - keep) from the same state, the mask
+    as uint8."""
+    torch.manual_seed(1)
+    for x in (torch.randn(4097), torch.randn(8, 9).t(), torch.randn(3, 5)):
+        xd = x.to(mojo_gpu)
+        device_module.manual_seed_all(99)
+        out, mask = torch.ops.aten._fused_dropout(xd, 0.75)
+        after = device_module.get_rng_state(xd.device)
+        device_module.manual_seed_all(99)
+        nout, nmask = torch.ops.aten.native_dropout(xd, 0.25, True)
+        assert mask.dtype == torch.uint8
+        assert torch.equal(mask.cpu(), nmask.cpu().to(torch.uint8))
+        assert torch.equal(out.cpu(), nout.cpu())
+        assert torch.equal(device_module.get_rng_state(xd.device), after)
+    gen = torch.Generator(device=mojo_gpu)
+    gen.manual_seed(5)
+    a = torch.ops.aten._fused_dropout(xd, 0.5, gen)
+    gen.manual_seed(5)
+    b = torch.ops.aten._fused_dropout(xd, 0.5, gen)
+    assert torch.equal(a[1].cpu(), b[1].cpu())
+    e, em = torch.ops.aten._fused_dropout(torch.empty(0, 3, device=mojo_gpu), 0.5)
+    assert e.shape == (0, 3) and em.dtype == torch.uint8
+    with pytest.raises(RuntimeError, match='"fused_dropout" not implemented'):
+        torch.ops.aten._fused_dropout(
+            torch.ones(3, dtype=torch.long, device=mojo_gpu), 0.5
+        )
+
+
+def _philox_uniform(seed: int, positions: np.ndarray) -> np.ndarray:
+    """curand_uniform of word `p` of subsequence 0 of Philox4x32-10(seed),
+    in numpy: the reference for _fill_mem_eff_dropout_mask_."""
+    m0, m1 = np.uint64(0xD2511F53), np.uint64(0xCD9E8D57)
+    w0, w1 = np.uint32(0x9E3779B9), np.uint32(0xBB67AE85)
+    ctr = positions.astype(np.uint64) >> np.uint64(2)
+    c0 = (ctr & np.uint64(0xFFFFFFFF)).astype(np.uint32)
+    c1 = (ctr >> np.uint64(32)).astype(np.uint32)
+    c2 = np.zeros_like(c0)
+    c3 = np.zeros_like(c0)
+    k0 = np.full_like(c0, seed & 0xFFFFFFFF)
+    k1 = np.full_like(c0, (seed >> 32) & 0xFFFFFFFF)
+    for _ in range(10):
+        p0 = m0 * c0.astype(np.uint64)
+        p1 = m1 * c2.astype(np.uint64)
+        hi0, lo0 = (p0 >> np.uint64(32)).astype(np.uint32), p0.astype(np.uint32)
+        hi1, lo1 = (p1 >> np.uint64(32)).astype(np.uint32), p1.astype(np.uint32)
+        c0, c1, c2, c3 = hi1 ^ c1 ^ k0, lo1, hi0 ^ c3 ^ k1, lo0
+        k0 = k0 + w0
+        k1 = k1 + w1
+    words = np.stack([c0, c1, c2, c3])[positions % 4, np.arange(len(positions))]
+    inv = np.float32(2.3283064e-10)
+    return words.astype(np.float32) * inv + inv / np.float32(2)
+
+
+@pytest.mark.parametrize("offset", [0, 4, 7])
+def test_fill_mem_eff_dropout_mask_is_the_philox_stream(mojo_gpu, offset):
+    """Element L is curand_uniform of word offset + L of subsequence 0: the
+    values CUDA's rand_uniform_kernel writes, bit for bit (n_keys = 5 is
+    not a multiple of 4, so rows start mid-block)."""
+    seed = (1 << 40) + 12345
+    t = torch.full((2, 3, 4, 5), -1.0, device=mojo_gpu)
+    with np.errstate(over="ignore"):
+        want = _philox_uniform(seed, np.arange(t.numel()) + offset)
+    out = torch.ops.aten._fill_mem_eff_dropout_mask_(t, 0.3, seed, offset)
+    assert out is t
+    got = t.cpu().numpy().reshape(-1)
+    assert np.array_equal(got, want)
+    with pytest.raises(RuntimeError, match="is_contiguous"):
+        torch.ops.aten._fill_mem_eff_dropout_mask_(t.transpose(2, 3), 0.1, 1, 0)
+    with pytest.raises(RuntimeError, match="Float"):
+        torch.ops.aten._fill_mem_eff_dropout_mask_(t.half(), 0.1, 1, 0)
+
+
+# ---------------------------------------------------------------------------
+# poisson / _standard_gamma / binomial: distribution checks with fixed seeds
+# ---------------------------------------------------------------------------
+
+_N = 200_000
+
+
+def _moments(x: torch.Tensor) -> tuple[float, float]:
+    x = x.double()
+    return x.mean().item(), x.var().item()
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
+)
+@pytest.mark.parametrize("rate", [0.0, 0.3, 4.0, 9.99, 10.0, 37.5, 1e4])
+def test_poisson_moments(mojo_gpu, dtype, rate):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal has no float64")
+    if dtype != torch.float32 and rate == 1e4:
+        pytest.skip("1e4 is not exact in the half dtypes' samples")
+    torch.manual_seed(2)
+    lam = torch.full((_N,), rate, dtype=dtype, device=mojo_gpu)
+    x = torch.poisson(lam).cpu()
+    assert x.dtype == dtype
+    assert (x >= 0).all() and torch.equal(x, x.round())
+    mean, var = _moments(x)
+    if rate == 0.0:
+        assert mean == 0.0 and var == 0.0
+        return
+    se = math.sqrt(rate / _N)
+    assert abs(mean - rate) < 6 * se + 1e-3 * rate
+    assert abs(var - rate) < 0.05 * rate
+
+
+def test_poisson_seeding_generator_and_errors(mojo_gpu):
+    lam = torch.rand(1000, device=mojo_gpu) * 20
+    torch.manual_seed(3)
+    a = torch.poisson(lam)
+    torch.manual_seed(3)
+    b = torch.poisson(lam)
+    assert torch.equal(a.cpu(), b.cpu())
+    c = torch.poisson(lam)
+    assert not torch.equal(a.cpu(), c.cpu())
+    gen = torch.Generator(device=mojo_gpu)
+    gen.manual_seed(4)
+    d = torch.poisson(lam, gen)
+    gen.manual_seed(4)
+    assert torch.equal(d.cpu(), torch.poisson(lam, gen).cpu())
+    # per element rates, broadcast shape kept, strided input
+    lam2 = torch.tensor([[1.0, 50.0]]).expand(50000, 2).to(mojo_gpu)
+    m = torch.poisson(lam2.t()).cpu().double().mean(dim=1)
+    assert abs(m[0] - 1.0) < 0.03 and abs(m[1] - 50.0) < 0.2
+    assert torch.poisson(torch.empty(0, 2, device=mojo_gpu)).shape == (0, 2)
+    for bad in (-1.0, float("nan")):
+        with pytest.raises(RuntimeError, match="invalid Poisson rate"):
+            torch.poisson(torch.tensor([1.0, bad], device=mojo_gpu))
+    with pytest.raises(RuntimeError, match='"poisson_cuda" not implemented'):
+        torch.poisson(torch.ones(3, dtype=torch.long, device=mojo_gpu))
+    assert torch.poisson(torch.tensor([float("inf")], device=mojo_gpu)).item() == float(
+        "inf"
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
+)
+@pytest.mark.parametrize("alpha", [1e-3, 0.2, 1.0, 3.7, 50.0, 1e6])
+def test_standard_gamma_moments(mojo_gpu, dtype, alpha):
+    """Gamma(alpha, 1): mean alpha, variance alpha; samples positive (at
+    least the dtype's smallest normal, CUDA's clamp)."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal has no float64")
+    if alpha == 1e6 and dtype not in (torch.float32, torch.float64):
+        pytest.skip("1e6 overflows float16; bfloat16 spacing there dwarfs sd 1e3")
+    torch.manual_seed(5)
+    a = torch.full((_N,), alpha, dtype=dtype, device=mojo_gpu)
+    x = torch._standard_gamma(a).cpu()
+    assert x.dtype == dtype
+    assert (x >= torch.finfo(dtype).tiny).all() and torch.isfinite(x).all()
+    mean, var = _moments(x)
+    a_q = torch.tensor(alpha, dtype=dtype).double().item()  # alpha as stored
+    rel = 0.02 if dtype in (torch.float32, torch.float64) else 0.03
+    if alpha < 0.01:
+        # Most mass below the smallest normal of the half types: only the
+        # mean of the float types is meaningful.
+        if dtype in (torch.float32, torch.float64):
+            assert mean < 0.01
+        return
+    assert abs(mean - a_q) < 6 * math.sqrt(a_q / _N) + rel * 0.1 * a_q
+    assert abs(var - a_q) < 0.06 * a_q
+
+
+def test_standard_gamma_edges_and_errors(mojo_gpu):
+    x = torch._standard_gamma(
+        torch.tensor([0.0, float("nan"), float("inf")], device=mojo_gpu)
+    ).cpu()
+    assert x[0] == 0 and math.isnan(x[1]) and x[2] == float("inf")
+    with pytest.raises(RuntimeError, match='"gamma_cuda" not implemented'):
+        torch._standard_gamma(torch.ones(2, dtype=torch.long, device=mojo_gpu))
+    torch.manual_seed(6)
+    a = (
+        torch.distributions.Gamma(
+            torch.full((_N,), 2.0, device=mojo_gpu),
+            torch.full((_N,), 4.0, device=mojo_gpu),
+        )
+        .sample()
+        .cpu()
+    )
+    assert abs(a.double().mean().item() - 0.5) < 0.01
+    d = torch.distributions.Dirichlet(torch.tensor([1.0, 2.0, 3.0], device=mojo_gpu))
+    s = d.sample((20000,)).cpu().double()
+    torch.testing.assert_close(s.sum(-1), torch.ones(20000, dtype=torch.float64))
+    torch.testing.assert_close(
+        s.mean(0),
+        torch.tensor([1 / 6, 2 / 6, 3 / 6], dtype=torch.float64),
+        atol=0.01,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
+)
+@pytest.mark.parametrize(
+    "count,prob",
+    [
+        (0.0, 0.5),
+        (10.0, 0.0),
+        (10.0, 1.0),
+        (7.0, 0.3),
+        (40.0, 0.2),
+        (100.0, 0.5),
+        (60.0, 0.9),
+        (1000.0, 0.97),
+    ],
+)
+def test_binomial_moments(mojo_gpu, dtype, count, prob):
+    """Inversion (count * p < 10) and BTRS, both tails of p, the p = 0 / 1
+    and count = 0 edges."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal has no float64")
+    torch.manual_seed(7)
+    c = torch.full((_N,), count, dtype=dtype, device=mojo_gpu)
+    p = torch.full((_N,), prob, dtype=dtype, device=mojo_gpu)
+    x = torch.binomial(c, p).cpu()
+    assert x.dtype == dtype
+    assert (x >= 0).all() and (x <= count).all() and torch.equal(x, x.round())
+    p_q = torch.tensor(prob, dtype=dtype).double().item()
+    mean, var = _moments(x)
+    want_mean, want_var = count * p_q, count * p_q * (1 - p_q)
+    if want_var == 0:
+        assert mean == want_mean and var == 0
+        return
+    assert abs(mean - want_mean) < 6 * math.sqrt(want_var / _N) + 1e-3
+    assert abs(var - want_var) < 0.05 * want_var
+
+
+def test_binomial_broadcast_seed_and_errors(mojo_gpu):
+    count = torch.tensor([5.0, 50.0, 500.0], device=mojo_gpu)
+    prob = torch.full((20000, 1), 0.4, device=mojo_gpu)
+    torch.manual_seed(8)
+    x = torch.binomial(count.expand(20000, 3), prob.expand(20000, 3))
+    torch.manual_seed(8)
+    y = torch.binomial(count.expand(20000, 3), prob.expand(20000, 3))
+    assert torch.equal(x.cpu(), y.cpu())
+    m = x.cpu().double().mean(0)
+    torch.testing.assert_close(
+        m, torch.tensor([2.0, 20.0, 200.0], dtype=torch.float64), rtol=0.02, atol=0.05
+    )
+    assert torch.binomial(count[:1].expand(4, 3), prob[:4]).shape == (4, 3)
+    with pytest.raises(RuntimeError, match="floating-point dtypes for count"):
+        torch.binomial(torch.ones(3, dtype=torch.long, device=mojo_gpu), count)
+    with pytest.raises(RuntimeError, match="floating-point dtypes for prob"):
+        torch.binomial(count, torch.ones(3, dtype=torch.long, device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="Found dtype Double but expected Float"):
+        torch.binomial(count, count.double())
+    nan = torch.binomial(
+        torch.tensor([float("nan"), 3.0], device=mojo_gpu),
+        torch.tensor([0.5, float("nan")], device=mojo_gpu),
+    )
+    assert nan.isnan().all()

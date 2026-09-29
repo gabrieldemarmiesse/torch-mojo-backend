@@ -57,7 +57,7 @@ from tmb.kernels.common.libdevice_port import (
 )
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
-from tmb.kernels.common.pow_math import torch_pow
+from tmb.kernels.common.pow_math import pow_c99, torch_pow
 from tmb.kernels.common.special_math import igamma_f, igammac_f, zeta_f
 
 
@@ -1732,6 +1732,10 @@ def _wide[
         comptime if kind == "rsub_alpha_scalar":
             other = SIMD[w, n](p[1])
         return SIMD[w, n](-p[0]).fma(a, other)
+    elif kind == "masked_scale":
+        # Dropout.cu's masked_scale_kernel: (float)mask * src * scale, a =
+        # src, b = the uint8 mask (exact in every float dtype), p0 = scale.
+        return (b * a) * p[0]
     elif kind == "scale":
         # deg2rad / rad2deg: `mul_out(result, self, wrapped_scalar_tensor(c))`,
         # the constant rounded to opmath like any CPU-scalar operand of mul.
@@ -2003,6 +2007,539 @@ def _rrelu[
         return keep.select((a.cast[w]() * r.cast[w]()).cast[dtype](), a)
 
 
+# ---------------------------------------------------------------------------
+# prelu, add_relu, masked_scale, isclose and the gamma / Dirichlet
+# reparameterized gradients
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _slog[w: DType](x: Scalar[w]) -> Scalar[w]:
+    return _log[w, 1](x)[0]
+
+
+@always_inline
+def _sexp[w: DType](x: Scalar[w]) -> Scalar[w]:
+    return _exp[w, 1](x)[0]
+
+
+@always_inline
+def _prelu[
+    kind: StaticString, dtype: DType, n: Int
+](a: SIMD[dtype, n], b: SIMD[dtype, n], c: SIMD[dtype, n]) -> SIMD[dtype, n]:
+    """ActivationPreluKernel.cu, a = self, b = weight, c = grad. Each
+    product is one scalar_t multiplication (rounded once); a NaN self takes
+    the non-positive branch (`input > 0` is false)."""
+    comptime w = wide_dtype[dtype]()
+    var pos = a.gt(0) & ~isnan(a)
+    comptime if kind == "prelu":
+        return pos.select(a, (b.cast[w]() * a.cast[w]()).cast[dtype]())
+    elif kind == "prelu_backward_input":
+        return pos.select(c, (b.cast[w]() * c.cast[w]()).cast[dtype]())
+    else:  # prelu_backward_weight
+        return pos.select(
+            SIMD[dtype, n](0), (a.cast[w]() * c.cast[w]()).cast[dtype]()
+        )
+
+
+@always_inline
+def _add_relu[
+    dtype: DType, n: Int
+](
+    a: SIMD[dtype, n], b: SIMD[dtype, n], p: SIMD[param_dtype[dtype](), 4]
+) -> SIMD[dtype, n]:
+    """BinaryOpsKernel.cpp's add_clamp_kernel (CPU only: CUDA has no
+    `_add_relu`): clamp(a + alpha * b, 0, max finite) in scalar_t, the product
+    fused into the add as its vectorized path's `fmadd` does. A NaN sum
+    stays NaN (that path's clamp_min); integers wrap."""
+    comptime if dtype.is_floating_point():
+        var s = b.fma(SIMD[dtype, n](p[0].cast[dtype]()), a)
+        s = (s.lt(0) & ~isnan(s)).select(SIMD[dtype, n](0), s)
+        # The upper bound is the dtype's largest finite value: +inf clamps.
+        comptime top = Scalar[dtype].MAX_FINITE
+        return (s.gt(top) & ~isnan(s)).select(SIMD[dtype, n](top), s)
+    else:
+        var s = a + SIMD[dtype, n](p[0].cast[dtype]()) * b
+        return s.lt(0).select(SIMD[dtype, n](0), s)
+
+
+@always_inline
+def _isclose[
+    dtype: DType, n: Int
+](
+    a: SIMD[dtype, n], b: SIMD[dtype, n], p: SIMD[param_dtype[dtype](), 4]
+) -> SIMD[DType.bool, n]:
+    """TensorCompare.cpp's CompositeImplicit isclose in one pass, with the
+    roundings of the kernels it composes on CUDA:
+
+        close = a == b  [| isnan(a) & isnan(b)]            (self's dtype)
+        allowed = atol + |rtol * b|   actual = |a - b|
+        close |= isfinite(actual) & (actual <= allowed)
+
+    Floating operands: every tensor op of the second line is rounded to the
+    operand dtype, its rtol / atol cast to opmath (float, double for
+    float64) as a CPU scalar operand is. Integer and bool operands: the
+    difference and tolerance are the default float dtype's (float32), each
+    operand converted to it.
+
+    p = (rtol, atol, equal_nan, tolerance_on); for integer operands the
+    first two are float32 bit patterns in the int64 slots.
+    """
+    var close = a.eq(b)
+    comptime if dtype.is_floating_point():
+        comptime w = wide_dtype[dtype]()
+        if p[2] != 0:
+            close = close | (isnan(a) & isnan(b))
+        if p[3] == 0:
+            return close
+        var fence = False
+        var rtol = SIMD[w, n](p[0].cast[w]())
+        var atol = SIMD[w, n](p[1].cast[w]())
+        var y = b.cast[w]()
+        var allowed = _st_round[dtype](
+            atol + abs(_st_round[dtype](rtol * y, fence)), fence
+        )
+        var actual = abs(_st_round[dtype](a.cast[w]() - y, fence))
+        var finite = ~isnan(actual) & ~isinf(actual)
+        return close | (finite & actual.le(allowed))
+    else:
+        if p[3] == 0:
+            return close
+        var rtol = SIMD[DType.float32, n](
+            bitcast[DType.float32](p[0].cast[DType.uint32]())
+        )
+        var atol = SIMD[DType.float32, n](
+            bitcast[DType.float32](p[1].cast[DType.uint32]())
+        )
+        var x = a.cast[DType.float32]()
+        var y = b.cast[DType.float32]()
+        var allowed = atol + abs(rtol * y)
+        var actual = abs(x - y)
+        var finite = ~isnan(actual) & ~isinf(actual)
+        return close | (finite & actual.le(allowed))
+
+
+@always_inline
+def _tan_w[w: DType](x: Scalar[w]) -> Scalar[w]:
+    """tan as sin / cos: libdevice's sinf / cosf on NVIDIA, fdlibm's for
+    float64, std.math elsewhere (digamma's reflection, negative x only)."""
+    comptime if w == DType.float64:
+        var sc = _sincos_f64(x.cast[DType.float64]())
+        return (sc[0] / sc[1]).cast[w]()
+    elif is_nvidia_gpu():
+        var xf = x.cast[DType.float32]()
+        return (nv_sinf(xf) / nv_cosf(xf)).cast[w]()
+    else:
+        var xf = x.cast[DType.float32]()
+        return (sin(xf) / cos(xf)).cast[w]()
+
+
+@always_inline
+def _digamma_one[w: DType](x_in: Scalar[w]) -> Scalar[w]:
+    """Distributions.h's `digamma_one` (Cephes), in the accumulate type."""
+    comptime PSI_10 = Scalar[w](2.25175258906672110764)
+    comptime PI = Scalar[w](3.14159265358979323846)
+    var x = x_in
+    if x == 0:
+        return inf[w]()
+    var additional_summand = Scalar[w](0)
+    if x < 0:
+        if x == floor(x):
+            return inf[w]()
+        additional_summand = -PI / _tan_w(PI * x)
+        x = 1 - x
+    var result = Scalar[w](0)
+    # `while (x < 10)`, bounded: x >= 1 here, so at most 10 steps, and a
+    # NaN cannot spin it under the no-NaN flags.
+    for _ in range(11):
+        if not (x < 10):
+            break
+        result -= 1 / x
+        x += 1
+    if x == 10:
+        return result + PSI_10 + additional_summand
+    comptime A = [
+        8.33333333333333333333e-2,
+        -2.10927960927960927961e-2,
+        7.57575757575757575758e-3,
+        -4.16666666666666666667e-3,
+        3.96825396825396825397e-3,
+        -8.33333333333333333333e-3,
+        8.33333333333333333333e-2,
+    ]
+    var y = Scalar[w](0)
+    if x < Scalar[w](1.0e17):
+        var z = 1 / (x * x)
+        comptime a0 = A[0]
+        var poly = Scalar[w](a0)
+        comptime for i in range(1, 7):
+            comptime ai = A[i]
+            poly = poly * z + Scalar[w](ai)
+        y = z * poly
+    return (
+        result + _slog[w](x) - (Scalar[w](0.5) / x) - y + (additional_summand)
+    )
+
+
+@always_inline
+def _standard_gamma_grad_one[
+    w: DType
+](alpha: Scalar[w], x: Scalar[w]) -> Scalar[w]:
+    """Distributions.h's `standard_gamma_grad_one`: the reparameterized
+    gradient -(d/dalpha cdf(x; alpha)) / pdf(x; alpha), in the accumulate
+    type."""
+    comptime V = SIMD[w, 1]
+    if x < Scalar[w](0.8):
+        # Taylor series expansion for small x.
+        var numer = Scalar[w](1)
+        var denom = alpha
+        var series1 = numer / denom
+        var series2 = numer / (denom * denom)
+        comptime for i in range(1, 6):
+            numer *= -x / Scalar[w](i)
+            denom += 1
+            series1 += numer / denom
+            series2 += numer / (denom * denom)
+        var pow_x_alpha = pow_c99[w](x, alpha)
+        var gamma_pdf = pow_c99[w](x, alpha - 1) * _sexp[w](-x)
+        var gamma_cdf = pow_x_alpha * series1
+        var gamma_cdf_alpha = (
+            _slog[w](x) - _digamma_one[w](alpha)
+        ) * gamma_cdf - pow_x_alpha * series2
+        var result = -gamma_cdf_alpha / gamma_pdf
+        return Scalar[w](0) if isnan(result) else result
+    if alpha > 8:
+        # Rice saddle point expansion for large alpha.
+        if Scalar[w](0.9) * alpha <= x and x <= Scalar[w](1.1) * alpha:
+            var numer_1 = 1 + 24 * alpha * (1 + 12 * alpha)
+            var numer_2 = (
+                1440 * (alpha * alpha)
+                + 6 * x * (53 - 120 * x)
+                - 65 * x * x / alpha
+                + alpha * (107 + 3600 * x)
+            )
+            var denom = 1244160 * (alpha * alpha) * (alpha * alpha)
+            return numer_1 * numer_2 / denom
+        var denom = ieee_sqrt(8 * alpha)
+        var term2 = denom / (alpha - x)
+        var term3 = pow_c99[w](
+            x - alpha - alpha * _slog[w](x / alpha), Scalar[w](-1.5)
+        )
+        var term23 = term2 - term3 if x < alpha else term2 + term3
+        var term1 = _slog[w](x / alpha) * term23 - ieee_sqrt(2 / alpha) * (
+            alpha + x
+        ) / ((alpha - x) * (alpha - x))
+        var stirling = 1 + 1 / (12 * alpha) * (1 + 1 / (24 * alpha))
+        var numer = x * term1
+        return -stirling * numer / denom
+    # Bivariate rational approximation to the reparameterized gradient.
+    var u = _slog[w](x / alpha)
+    var v = _slog[w](alpha)
+    comptime C = [
+        [
+            0.16009398,
+            -0.094634809,
+            0.025146376,
+            -0.0030648343,
+            1.0,
+            0.32668115,
+            0.10406089,
+            0.0014179084,
+        ],
+        [
+            0.53487893,
+            0.1298071,
+            0.065735949,
+            -0.0015649758,
+            0.16639465,
+            0.020070113,
+            -0.0035938915,
+            -0.00058392623,
+        ],
+        [
+            0.040121004,
+            -0.0065914022,
+            -0.0026286047,
+            -0.0013441777,
+            0.017050642,
+            -0.0021309326,
+            0.00085092367,
+            -1.5247877e-07,
+        ],
+    ]
+    var coef_v = SIMD[w, 8]()
+    comptime for i in range(8):
+        comptime c0 = C[0][i]
+        comptime c1 = C[1][i]
+        comptime c2 = C[2][i]
+        coef_v[i] = Scalar[w](c0) + u * (Scalar[w](c1) + u * Scalar[w](c2))
+    var pp = coef_v[0] + v * (coef_v[1] + v * (coef_v[2] + v * coef_v[3]))
+    var q = coef_v[4] + v * (coef_v[5] + v * (coef_v[6] + v * coef_v[7]))
+    return _sexp[w](pp / q)
+
+
+@always_inline
+def _beta_grad_alpha_small[
+    w: DType
+](x: Scalar[w], alpha: Scalar[w], beta: Scalar[w]) -> Scalar[w]:
+    var factor = (
+        _digamma_one[w](alpha) - _digamma_one[w](alpha + beta) - _slog[w](x)
+    )
+    var numer = Scalar[w](1)
+    var series = numer / alpha * (factor + 1 / alpha)
+    comptime for i in range(1, 11):
+        var ci = Scalar[w](i)
+        numer *= (ci - beta) * x / ci
+        var denom = alpha + ci
+        series += numer / denom * (factor + 1 / denom)
+    var result = x * pow_c99[w](1 - x, -beta) * series
+    return Scalar[w](0) if isnan(result) else result
+
+
+@always_inline
+def _beta_grad_beta_small[
+    w: DType
+](x: Scalar[w], alpha: Scalar[w], beta: Scalar[w]) -> Scalar[w]:
+    var factor = _digamma_one[w](alpha + beta) - _digamma_one[w](beta)
+    var numer = Scalar[w](1)
+    var betas = Scalar[w](1)
+    var dbetas = Scalar[w](0)
+    var series = factor / alpha
+    comptime for i in range(1, 9):
+        var ci = Scalar[w](i)
+        numer *= -x / ci
+        dbetas = dbetas * (beta - ci) + betas
+        betas = betas * (beta - ci)
+        series += numer / (alpha + ci) * (dbetas + factor * betas)
+    var result = -pow_c99[w](1 - x, 1 - beta) * series
+    return Scalar[w](0) if isnan(result) else result
+
+
+@always_inline
+def _beta_grad_alpha_mid[
+    w: DType
+](x: Scalar[w], alpha: Scalar[w], beta: Scalar[w]) -> Scalar[w]:
+    comptime V = SIMD[w, 1]
+    var total = alpha + beta
+    var mean = alpha / total
+    var std = ieee_sqrt(alpha * beta / (total + 1)) / total
+    if mean - Scalar[w](0.1) * std <= x and x <= mean + Scalar[w](0.1) * std:
+        # Avoid the singularity at x = mean.
+        var poly = 47 * x * (beta * beta) * (beta * beta) + alpha * (
+            (43 + 20 * (16 + 27 * beta) * x) * (beta * beta) * beta
+            + alpha
+            * (
+                3 * (59 + 180 * beta - 90 * x) * (beta * beta)
+                + alpha
+                * (
+                    (453 + 1620 * beta * (1 - x) - 455 * x) * beta
+                    + alpha * (8 * (1 - x) * (135 * beta - 11))
+                )
+            )
+        )
+        var prefactor_num = (1 + 12 * alpha) * (1 + 12 * beta) / (total * total)
+        var prefactor_den = (
+            12960 * alpha * alpha * alpha * beta * beta * (1 + 12 * total)
+        )
+        return prefactor_num / (1 - x) * poly / prefactor_den
+    var prefactor = -x / ieee_sqrt(2 * alpha * beta / total)
+    var stirling = (
+        (1 + 1 / (12 * alpha) + 1 / (288 * alpha * alpha))
+        * (1 + 1 / (12 * beta) + 1 / (288 * beta * beta))
+        / (1 + 1 / (12 * total) + 1 / (288 * total * total))
+    )
+    var term1_num = (
+        2 * (alpha * alpha) * (x - 1)
+        + alpha * beta * (x - 1)
+        - x * (beta * beta)
+    )
+    var axbx = alpha * (x - 1) + beta * x
+    var term1_den = (
+        ieee_sqrt(2 * alpha / beta)
+        * pow_c99[w](total, Scalar[w](1.5))
+        * axbx
+        * axbx
+    )
+    var term1 = term1_num / term1_den
+    var term2 = Scalar[w](0.5) * _slog[w](alpha / (total * x))
+    var term3_num = ieee_sqrt(8 * alpha * beta / total)
+    var term3_den = beta * x + alpha * (x - 1)
+    var term3 = term3_num / term3_den
+    var term4_base = beta * _slog[w](beta / (total * (1 - x))) + alpha * _slog[
+        w
+    ](alpha / (total * x))
+    var term4 = pow_c99[w](term4_base, Scalar[w](-1.5))
+    var term1234 = term1 + term2 * (term3 + (term4 if x < mean else -term4))
+    return stirling * prefactor * term1234
+
+
+@always_inline
+def _dirichlet_grad_one[
+    w: DType
+](x: Scalar[w], alpha: Scalar[w], total: Scalar[w]) -> Scalar[w]:
+    """Distributions.h's `dirichlet_grad_one` (float32 / float64 only, as
+    its CUDA dispatch): a scaled reparameterized gradient of Beta(alpha,
+    total - alpha)."""
+    comptime V = SIMD[w, 1]
+    var beta = total - alpha
+    var boundary = total * x * (1 - x)
+    if x <= Scalar[w](0.5) and boundary < Scalar[w](2.5):
+        return _beta_grad_alpha_small[w](x, alpha, beta)
+    if x >= Scalar[w](0.5) and boundary < Scalar[w](0.75):
+        return -_beta_grad_beta_small[w](1 - x, beta, alpha)
+    if alpha > 6 and beta > 6:
+        return _beta_grad_alpha_mid[w](x, alpha, beta)
+    # c[2][3][3][4], flattened.
+    comptime C = [
+        1.003668233,
+        -0.01061107488,
+        -0.0657888334,
+        0.01201642863,
+        0.6336835991,
+        -0.3557432599,
+        0.05486251648,
+        -0.001465281033,
+        -0.03276231906,
+        0.004474107445,
+        0.002429354597,
+        -0.0001557569013,
+        0.221950385,
+        -0.3187676331,
+        0.01799915743,
+        0.01074823814,
+        -0.2951249643,
+        0.06219954479,
+        0.01535556598,
+        0.001550077057,
+        0.02155310298,
+        0.004170831599,
+        0.001292462449,
+        6.976601077e-05,
+        -0.05980841433,
+        0.008441916499,
+        0.01085618172,
+        0.002319392565,
+        0.02911413504,
+        0.01400243777,
+        -0.002721828457,
+        0.000751041181,
+        0.005900514878,
+        -0.001936558688,
+        -9.495446725e-06,
+        5.385558597e-05,
+        1.0,
+        -0.02924021934,
+        -0.04438342661,
+        0.007285809825,
+        0.6357567472,
+        -0.3473456711,
+        0.05454656494,
+        -0.002407477521,
+        -0.03301322327,
+        0.004845219414,
+        0.00231480583,
+        -0.0002307248149,
+        0.5925320577,
+        -0.1757678135,
+        0.01505928619,
+        0.000564515273,
+        0.1014815858,
+        -0.06589186703,
+        0.01272886114,
+        -0.0007316646956,
+        -0.007258481865,
+        0.001096195486,
+        0.0003934994223,
+        -4.12701925e-05,
+        0.06469649321,
+        -0.0236701437,
+        0.002902096474,
+        -5.896963079e-05,
+        0.001925008108,
+        -0.002869809258,
+        0.0008000589141,
+        -6.063713228e-05,
+        -0.0003477407336,
+        6.959756487e-05,
+        1.097287507e-05,
+        -1.650964693e-06,
+    ]
+    var u = _slog[w](x)
+    var a = _slog[w](alpha) - u
+    var b = _slog[w](total) - a
+    var pow_u = SIMD[w, 4](1, u, u * u, 0)
+    var pow_a = SIMD[w, 4](1, a, a * a, 0)
+    var p = Scalar[w](0)
+    var q = Scalar[w](0)
+    comptime for i in range(3):
+        comptime for j in range(3):
+            var ua = pow_u[i] * pow_a[j]
+            comptime k0 = (i * 3 + j) * 4
+            comptime p0 = C[k0]
+            comptime p1 = C[k0 + 1]
+            comptime p2 = C[k0 + 2]
+            comptime p3 = C[k0 + 3]
+            comptime q0 = C[36 + k0]
+            comptime q1 = C[36 + k0 + 1]
+            comptime q2 = C[36 + k0 + 2]
+            comptime q3 = C[36 + k0 + 3]
+            p += ua * (
+                Scalar[w](p0)
+                + b * (Scalar[w](p1) + b * (Scalar[w](p2) + b * Scalar[w](p3)))
+            )
+            q += ua * (
+                Scalar[w](q0)
+                + b * (Scalar[w](q1) + b * (Scalar[w](q2) + b * Scalar[w](q3)))
+            )
+    var approx = x * (_digamma_one[w](total) - _digamma_one[w](alpha)) / beta
+    return p / q * approx
+
+
+@always_inline
+def _dirichlet_ratio[
+    dtype: DType, n: Int
+](a: SIMD[dtype, n], b: SIMD[dtype, n]) -> SIMD[dtype, n]:
+    """Distributions.cu's launch_dirichlet_kernel: gamma / gamma_sum in
+    scalar_t, clamped to [smallest normal, 1 - epsilon] (NaN passes)."""
+    comptime w = wide_dtype[dtype]()
+    var r = (a.cast[w]() / b.cast[w]()).cast[dtype]()
+    var lo: Scalar[dtype]
+    var hi: Scalar[dtype]
+    comptime if dtype == DType.float16:
+        lo = Scalar[dtype](6.103515625e-05)
+        hi = Scalar[dtype](1.0 - 0.0009765625)
+    elif dtype == DType.bfloat16:
+        lo = Scalar[dtype](1.1754943508222875e-38)
+        hi = Scalar[dtype](1.0 - 0.0078125)
+    elif dtype == DType.float32:
+        lo = Scalar[dtype](1.1754943508222875e-38)
+        hi = Scalar[dtype](1.0 - 1.1920928955078125e-07)
+    else:
+        lo = Scalar[dtype](2.2250738585072014e-308)
+        hi = Scalar[dtype](1.0 - 2.220446049250313e-16)
+    var keep = ~isnan(r)
+    r = (keep & r.lt(lo)).select(SIMD[dtype, n](lo), r)
+    return (keep & r.gt(hi)).select(SIMD[dtype, n](hi), r)
+
+
+@always_inline
+def _gamma_grads[
+    kind: StaticString, dtype: DType, n: Int
+](a: SIMD[dtype, n], b: SIMD[dtype, n], c: SIMD[dtype, n]) -> SIMD[dtype, n]:
+    comptime w = wide_dtype[dtype]()
+    var r = SIMD[dtype, n]()
+    comptime for i in range(n):
+        comptime if kind == "standard_gamma_grad":
+            r[i] = _standard_gamma_grad_one[w](
+                a[i].cast[w](), b[i].cast[w]()
+            ).cast[dtype]()
+        else:
+            r[i] = _dirichlet_grad_one[w](
+                a[i].cast[w](), b[i].cast[w](), c[i].cast[w]()
+            ).cast[dtype]()
+    return r
+
+
 @always_inline
 def pointwise[
     kind: StaticString, dtype: DType, out_dtype: DType, n: Int
@@ -2032,6 +2569,23 @@ def pointwise[
     elif kind == "rrelu_train" or kind == "rrelu_noise":
         comptime assert dtype.is_floating_point(), "rrelu takes floats"
         return _rrelu[kind, out_dtype=out_dtype](a, b, p).cast[out_dtype]()
+    elif kind == "isclose":
+        return _isclose(a, b, p).cast[out_dtype]()
+    elif kind == "dirichlet":
+        comptime assert dtype.is_floating_point(), "dirichlet takes floats"
+        return _dirichlet_ratio(a, b).cast[out_dtype]()
+    elif kind == "add_relu":
+        return _add_relu(a, b, p).cast[out_dtype]()
+    elif (
+        kind == "prelu"
+        or kind == "prelu_backward_input"
+        or kind == "prelu_backward_weight"
+    ):
+        comptime assert dtype.is_floating_point(), "prelu takes floats"
+        return _prelu[kind](a, b, c).cast[out_dtype]()
+    elif kind == "standard_gamma_grad" or kind == "dirichlet_grad":
+        comptime assert dtype.is_floating_point(), "gamma grads take floats"
+        return _gamma_grads[kind](a, b, c).cast[out_dtype]()
     elif is_native_kind[kind]():
         return _native[kind](a, b, c).cast[out_dtype]()
     elif is_scalar_t_kind[kind]():

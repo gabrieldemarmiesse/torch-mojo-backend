@@ -4,6 +4,7 @@
 
 from tmb.kernels.random.dropout_kernels import (
     I64x8,
+    enqueue_mem_eff_dropout_mask,
     enqueue_native_dropout,
     enqueue_native_dropout_backward,
 )
@@ -15,6 +16,7 @@ from tmb.kernels.common.op_utils import (
     _raw_int,
     _raw_tuple_int,
     _raw_tuple_len,
+    _spec_dispatcher5,
     _spec_dispatcher6,
     _spec_dispatcher16,
 )
@@ -121,6 +123,22 @@ def _native_dropout_backward_go(
         )
 
 
+def _mem_eff_mask_go(
+    dst_obj: Arg,
+    numel_obj: Arg,
+    seed_obj: Arg,
+    offset_obj: Arg,
+    ctx_obj: Arg,
+) raises:
+    enqueue_mem_eff_dropout_mask(
+        _raw_ctx(ctx_obj),
+        _raw_int(dst_obj),
+        _raw_int(numel_obj),
+        UInt64(_raw_int(seed_obj)),
+        UInt64(_raw_int(offset_obj)),
+    )
+
+
 @export
 def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     try:
@@ -131,6 +149,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             _spec_dispatcher6[
                 _native_dropout_backward_go, "NativeDropoutBackward"
             ](argv, argc)
+            return 0
+        comptime if _op_on["FillMemEffDropoutMask"]():
+            _spec_dispatcher5[_mem_eff_mask_go, "FillMemEffDropoutMask"](
+                argv, argc
+            )
             return 0
         raise Error(NO_OP_COMPILED)
     except e:

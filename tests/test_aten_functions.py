@@ -7593,3 +7593,30 @@ def test_aten__unsafe_view_dtypes(
 
     x = torch.randn(2, 3, 4, dtype=dtype)
     check_outputs(fn, conf, [x])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_aten__prelu_kernel(conf: Conf, call_checker: CallChecker, dtype: torch.dtype):
+    call_checker.register(aten_functions.aten__prelu_kernel)
+
+    def fn(x, w):
+        return aten._prelu_kernel(x, w)
+
+    x = torch.tensor([[-2.0, -0.0, 0.0, 3.0], [-3.0, -1.5, 1.0, -7.0]]).to(dtype)
+    w = torch.tensor([[0.25], [-1.5]]).to(dtype)
+    check_outputs(fn, conf, [x, w])
+    _compiled_matches_cpu(fn, [x, w])
+
+
+def test_aten__prelu_kernel_backward(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten__prelu_kernel_backward)
+
+    def fn(g, x, w):
+        return aten._prelu_kernel_backward(g, x, w)
+
+    torch.manual_seed(0)
+    x = torch.randn(3, 4, 5)
+    w = torch.randn(4, 1)
+    g = torch.randn(3, 4, 5)
+    check_outputs(fn, conf, [g, x, w])
+    _compiled_matches_cpu(fn, [g, x, w])

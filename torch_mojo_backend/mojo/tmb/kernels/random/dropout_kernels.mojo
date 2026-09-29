@@ -317,3 +317,63 @@ def enqueue_native_dropout_backward[
                 Int64(numel),
                 scale.cast[ACC](),
             )
+
+
+# ---------------------------------------------------------------------------
+# _fill_mem_eff_dropout_mask_ (transformers/cuda/attention.cu's
+# rand_uniform_kernel): element L of the contiguous float32 tensor is
+# `curand_uniform` of word `offset + L` of subsequence 0 of `seed`'s stream.
+# CUDA gives every (batch, head, query) row one thread that `curand_init`s at
+# `offset + L` of its row's first element and walks forward; a word stream is
+# position-addressed, so that is word `offset + L` for every L, whichever
+# thread writes it (row tails past n_keys included).
+# ---------------------------------------------------------------------------
+
+
+@__name("mem_eff_dropout_mask_philox_uniform")
+def _mem_eff_mask_kernel(
+    dst: Pointer[Float32, MutAnyOrigin],
+    numel_arg: Int64,
+    seed: UInt64,
+    offset: UInt64,
+):
+    var numel = Int(numel_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    var key = curand_key(seed)
+    while i < numel:
+        var pos = offset + UInt64(i)
+        var words = curand4(curand_ctr(pos, 0), key, 0)
+        var u = curand_uniform4(words)
+        var lane = Int(pos & 3)
+        var v = u[0]
+        comptime for j in range(1, 4):
+            if lane == j:
+                v = u[j]
+        dst[unsafe_offset=i] = v
+        i += stride
+
+
+def enqueue_mem_eff_dropout_mask(
+    ctx: DeviceContext,
+    dst_addr: Int,
+    numel: Int,
+    seed: UInt64,
+    offset: UInt64,
+) raises:
+    if numel <= 0:
+        return
+    comptime if not has_accelerator():
+        raise Error("no GPU accelerator available at compile time")
+    else:
+        _enqueue_cached[_mem_eff_mask_kernel](
+            ctx,
+            min((numel + BLOCK - 1) // BLOCK, 65535),
+            1,
+            1,
+            BLOCK,
+            _make_ptr[DType.float32](dst_addr).as_unsafe_any_origin(),
+            Int64(numel),
+            seed,
+            offset,
+        )

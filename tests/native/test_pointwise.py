@@ -2253,3 +2253,317 @@ def test_loss_backward_grad_input(mojo_gpu, op, extra):
     out = torch.empty(0, device=mojo_gpu)
     aten.smooth_l1_loss.out(x.to(mojo_gpu), y.to(mojo_gpu), 0, 0.5, out=out)
     _close(out, aten.smooth_l1_loss(x, y, 0, 0.5), **_loss_tol(torch.float32))
+
+
+# ---------------------------------------------------------------------------
+# prelu, _add_relu, isclose, _masked_scale, _standard_gamma_grad,
+# _dirichlet_grad
+# ---------------------------------------------------------------------------
+
+
+def _f64_or_skip(mojo_gpu, dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal has no float64")
+
+
+@pytest.mark.parametrize("dtype", [*FLOATS, torch.float64])
+def test_prelu_forward_and_backward(mojo_gpu, dtype):
+    """F.prelu reaches _prelu_kernel / _prelu_kernel_backward: per channel
+    and one shared weight, edge inputs (NaN takes the weight branch, -0 and
+    +0 alike), compared with CPU torch bit for bit (one rounded product)."""
+    _f64_or_skip(mojo_gpu, dtype)
+    torch.manual_seed(0)
+    edge = torch.tensor(_SPECIAL)
+    x = torch.cat([edge, torch.randn(3 * 7 * 5 - len(edge))]).reshape(3, 7, 5)
+    for w in (torch.randn(7) * 3, torch.tensor([0.25])):
+        xc = x.to(dtype).clone().requires_grad_()
+        wc = w.to(dtype).clone().requires_grad_()
+        xd = x.to(dtype).to(mojo_gpu).requires_grad_()
+        wd = w.to(dtype).to(mojo_gpu).requires_grad_()
+        with ran("aten::_prelu_kernel"):
+            yd = F.prelu(xd, wd)
+        yc = F.prelu(xc, wc)
+        _close(yd, yc.detach(), rtol=0, atol=0)
+        g = torch.randn(3, 7, 5).to(dtype)
+        with ran("aten::_prelu_kernel_backward"):
+            yd.backward(g.to(mojo_gpu))
+        yc.backward(g)
+        _close(xd.grad, xc.grad, rtol=0, atol=0)
+        # grad_weight is a reduction of the per-element products.
+        _close(wd.grad, wc.grad, **_tol(dtype, 8.0))
+
+
+def test_prelu_kernel_non_contiguous_and_errors(mojo_gpu):
+    aten = torch.ops.aten
+    torch.manual_seed(1)
+    x = torch.randn(6, 4).t()
+    w = torch.randn(6)[::2].reshape(1, 3)[:, :1].expand(1, 6)
+    _close(aten._prelu_kernel(x.to(mojo_gpu), w.to(mojo_gpu)), aten._prelu_kernel(x, w))
+    with pytest.raises(RuntimeError, match="Found dtype Half but expected Float"):
+        aten._prelu_kernel(x.to(mojo_gpu), w.half().to(mojo_gpu))
+    with pytest.raises(RuntimeError, match='"prelu_cuda" not implemented'):
+        aten._prelu_kernel(
+            torch.ones(3, dtype=torch.long, device=mojo_gpu),
+            torch.ones(1, dtype=torch.long, device=mojo_gpu),
+        )
+    empty = torch.empty(0, 3, device=mojo_gpu)
+    assert aten._prelu_kernel(empty, torch.ones(3, device=mojo_gpu)).shape == (0, 3)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.int64, torch.int32, torch.int8]
+)
+def test_add_relu_matches_cpu(mojo_gpu, dtype):
+    """_add_relu (CPU-only upstream: CUDA has no kernel): clamp(a + alpha *
+    b, 0) in scalar_t, every overload."""
+    _f64_or_skip(mojo_gpu, dtype)
+    aten = torch.ops.aten
+    torch.manual_seed(2)
+    if dtype.is_floating_point:
+        a = torch.cat([torch.tensor(_SPECIAL[:-1]), torch.randn(20)]).to(dtype)
+        b = torch.randn(a.numel()).to(dtype)
+        alpha = 1.5
+    else:
+        a = torch.randint(-50, 50, (37,), dtype=dtype)
+        b = torch.randint(-50, 50, (37,), dtype=dtype)
+        alpha = 2
+    ad, bd = a.to(mojo_gpu), b.to(mojo_gpu)
+    with ran("aten::_add_relu.Tensor"):
+        got = aten._add_relu(ad, bd, alpha=alpha)
+    _close(got, aten._add_relu(a, b, alpha=alpha))
+    _close(aten._add_relu(ad, 3, alpha), aten._add_relu(a, 3, alpha))
+    _close(aten._add_relu(ad, bd[:1]), aten._add_relu(a, b[:1]))
+    out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    aten._add_relu.out(ad, bd, alpha=alpha, out=out)
+    _close(out, aten._add_relu(a, b, alpha=alpha))
+    inplace = ad.clone()
+    aten._add_relu_(inplace, bd, alpha=alpha)
+    _close(inplace, aten._add_relu(a, b, alpha=alpha))
+    inplace = ad.clone()
+    aten._add_relu_.Scalar(inplace, 2, alpha)
+    _close(inplace, aten._add_relu(a, 2, alpha))
+
+
+def test_add_relu_nan_wrap_and_errors(mojo_gpu):
+    aten = torch.ops.aten
+    a = torch.tensor([float("nan"), -1.0, 2.0, -0.0])
+    got = aten._add_relu(a.to(mojo_gpu), torch.ones(4, device=mojo_gpu))
+    _close(got, torch.tensor([float("nan"), 0.0, 3.0, 1.0]))
+    i8 = torch.tensor([100, -100, 50], dtype=torch.int8)
+    j8 = torch.tensor([100, 20, 1], dtype=torch.int8)
+    _close(aten._add_relu(i8.to(mojo_gpu), j8.to(mojo_gpu)), aten._add_relu(i8, j8))
+    # int32 + float promotes; the check is on self's dtype.
+    i32 = torch.ones(3, dtype=torch.int32)
+    _close(
+        aten._add_relu(i32.to(mojo_gpu), torch.ones(3, device=mojo_gpu)),
+        aten._add_relu(i32, torch.ones(3)),
+    )
+    for bad in (torch.float16, torch.bfloat16, torch.uint8, torch.bool):
+        t = torch.ones(3, dtype=bad, device=mojo_gpu)
+        with pytest.raises(RuntimeError, match="Unsupported datatype for add_relu"):
+            aten._add_relu(t, t)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        aten._add_relu_(
+            torch.ones(3, dtype=torch.int32, device=mojo_gpu),
+            torch.ones(3, device=mojo_gpu),
+        )
+    with pytest.raises(RuntimeError, match="without overflow"):
+        aten._add_relu(i8.to(mojo_gpu), j8.to(mojo_gpu), alpha=300)
+
+
+_ISCLOSE_A = [
+    1.0,
+    1.0001,
+    1.1,
+    float("nan"),
+    float("inf"),
+    -float("inf"),
+    0.0,
+    1e-9,
+    60000.0,
+    float("inf"),
+    3.0,
+    5.0,
+    -0.0,
+    1e-40,
+]
+_ISCLOSE_B = [
+    1.0,
+    1.0,
+    1.0,
+    float("nan"),
+    float("inf"),
+    float("inf"),
+    -0.0,
+    0.0,
+    -60000.0,
+    1.0,
+    float("nan"),
+    5.004,
+    1e-40,
+    0.0,
+]
+
+
+@pytest.mark.parametrize("dtype", [*FLOATS, torch.float64])
+@pytest.mark.parametrize("equal_nan", [False, True])
+@pytest.mark.parametrize(
+    "tol", [(1e-5, 1e-8), (1e-3, 1e-5), (0.0, 0.0), (0.0, 0.5), (2.0, 0.0)]
+)
+def test_isclose_floats_match_cpu(mojo_gpu, dtype, equal_nan, tol):
+    """One kernel with the roundings of the composite's kernels: half
+    tolerances and differences rounded to the dtype (60000 - -60000 is inf
+    in float16, so never close), NaN / inf only through equality."""
+    _f64_or_skip(mojo_gpu, dtype)
+    torch.manual_seed(3)
+    r = torch.randn(400)
+    a = torch.cat([torch.tensor(_ISCLOSE_A), r]).to(dtype)
+    b = torch.cat([torch.tensor(_ISCLOSE_B), r + torch.randn(400) * 1e-3]).to(dtype)
+    rtol, atol = tol
+    with ran("aten::isclose"):
+        got = torch.isclose(a.to(mojo_gpu), b.to(mojo_gpu), rtol, atol, equal_nan)
+    assert got.dtype == torch.bool
+    assert torch.equal(got.cpu(), torch.isclose(a, b, rtol, atol, equal_nan))
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8, torch.bool],
+)
+def test_isclose_integers_and_bool(mojo_gpu, dtype):
+    """Equality in the dtype itself, the tolerance in float32."""
+    torch.manual_seed(4)
+    a = torch.randint(0, 6, (200,)).to(dtype)
+    b = torch.randint(0, 6, (200,)).to(dtype)
+    for rtol, atol in ((1e-5, 1e-8), (0.3, 0.5), (0.0, 0.0), (0.0, 1.0)):
+        got = torch.isclose(a.to(mojo_gpu), b.to(mojo_gpu), rtol, atol)
+        assert torch.equal(got.cpu(), torch.isclose(a, b, rtol, atol))
+    if dtype == torch.int64:
+        # Exact int64 equality, where the float32 difference would be 0.
+        big = torch.tensor([2**40, 2**40 + 1])
+        same = torch.tensor([2**40, 2**40])
+        got = torch.isclose(big.to(mojo_gpu), same.to(mojo_gpu), 0.0, 0.0)
+        assert got.cpu().tolist() == [True, False]
+
+
+def test_isclose_broadcast_strided_and_errors(mojo_gpu):
+    torch.manual_seed(5)
+    a = torch.randn(3, 1)
+    b = torch.randn(4, 3).t()[:, :4]
+    got = torch.isclose(a.to(mojo_gpu), b.to(mojo_gpu), atol=0.7)
+    assert torch.equal(got.cpu(), torch.isclose(a, b, atol=0.7))
+    x = torch.ones(3, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Float did not match Half"):
+        torch.isclose(x, x.half())
+    with pytest.raises(RuntimeError, match="rtol must be greater"):
+        torch.isclose(x, x, rtol=-1.0)
+    with pytest.raises(RuntimeError, match="atol must be greater"):
+        torch.isclose(x, x, atol=float("nan"))
+    assert torch.isclose(x[:0], x[:0]).shape == (0,)
+    assert torch.allclose(x, x.clone())
+
+
+@pytest.mark.parametrize("dtype", [*FLOATS, torch.float64])
+def test_masked_scale(mojo_gpu, dtype):
+    """_masked_scale: (float)mask * x * scale over a uint8 mask (any byte
+    value counts), rounded once."""
+    _f64_or_skip(mojo_gpu, dtype)
+    torch.manual_seed(6)
+    x = torch.randn(4, 5).to(dtype)
+    m = torch.randint(0, 3, (4, 5), dtype=torch.uint8)
+    got = torch.ops.aten._masked_scale(x.to(mojo_gpu), m.to(mojo_gpu), 1.7)
+    acc = torch.float64 if dtype == torch.float64 else torch.float32
+    want = (m.to(acc) * x.to(acc) * torch.tensor(1.7, dtype=acc)).to(dtype)
+    _close(got, want, rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="mask should be torch.uint8"):
+        torch.ops.aten._masked_scale(x.to(mojo_gpu), m.bool().to(mojo_gpu), 2.0)
+
+
+_GAMMA_ALPHA = [0.05, 0.3, 0.9, 1.0, 2.5, 5.0, 7.9, 9.0, 12.0, 50.0, 400.0]
+_GAMMA_X = [1e-3, 0.05, 0.3, 0.79, 0.81, 1.5, 4.0, 9.2, 11.0, 30.0, 380.0, 1e-6]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_standard_gamma_grad_matches_cpu(mojo_gpu, dtype):
+    """Every branch of standard_gamma_grad_one: the small-x series, the
+    large-alpha saddle point (both inside and outside 0.9..1.1 alpha) and
+    the rational approximation."""
+    _f64_or_skip(mojo_gpu, dtype)
+    # CUDA computes float32 in float (CPU in double): where x**alpha
+    # underflows float, the series' 0 / 0 is CUDA's NaN -> 0, checked below.
+    pairs = [
+        (a, x)
+        for a, x in itertools.product(_GAMMA_ALPHA, _GAMMA_X)
+        if x >= 0.8 or a * math.log(x) > -60
+    ]
+    a, x = zip(*pairs)
+    alpha = torch.tensor(a, dtype=dtype)
+    xs = torch.tensor(x, dtype=dtype)
+    got = torch.ops.aten._standard_gamma_grad(alpha.to(mojo_gpu), xs.to(mojo_gpu))
+    want = torch.ops.aten._standard_gamma_grad(alpha, xs)
+    tol = (
+        {"rtol": 2e-4, "atol": 1e-6}
+        if dtype == torch.float32
+        else {"rtol": 1e-9, "atol": 1e-12}
+    )
+    _close(got, want, **tol)
+    if dtype == torch.float32:
+        tiny = torch.ops.aten._standard_gamma_grad(
+            torch.tensor([9.0, 50.0], device=mojo_gpu),
+            torch.tensor([1e-6, 0.05], device=mojo_gpu),
+        )
+        assert tiny.cpu().tolist() == [0.0, 0.0]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_standard_gamma_grad_half(mojo_gpu, dtype):
+    """CUDA computes the half dtypes in float and rounds once (CPU has no
+    half kernel): compared with the float64 result."""
+    alpha = torch.tensor([0.5, 1.0, 2.5, 9.0, 20.0, 3.0])
+    xs = torch.tensor([0.3, 1.5, 2.0, 9.5, 30.0, 0.9])
+    got = torch.ops.aten._standard_gamma_grad(
+        alpha.to(dtype).to(mojo_gpu), xs.to(dtype).to(mojo_gpu)
+    )
+    want = torch.ops.aten._standard_gamma_grad(
+        alpha.to(dtype).double(), xs.to(dtype).double()
+    )
+    _close(
+        got.double(), want, rtol=2e-2 if dtype == torch.bfloat16 else 2e-3, atol=1e-4
+    )
+    with pytest.raises(RuntimeError, match="Found dtype"):
+        torch.ops.aten._standard_gamma_grad(
+            alpha.to(mojo_gpu), xs.to(dtype).to(mojo_gpu)
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_dirichlet_grad_matches_cpu(mojo_gpu, dtype):
+    """dirichlet_grad_one's four regimes: x near 0, x near 1, alpha and
+    beta both large, and the rational correction."""
+    _f64_or_skip(mojo_gpu, dtype)
+    x = torch.tensor([0.1, 0.5, 0.9, 0.3, 0.6, 0.99, 0.01, 0.45, 0.4, 0.95, 0.2])
+    alpha = torch.tensor([0.5, 2.0, 3.0, 7.0, 10.0, 1.0, 0.2, 4.0, 8.0, 30.0, 0.7])
+    total = torch.tensor([1.0, 5.0, 4.0, 15.0, 20.0, 3.0, 1.0, 9.0, 20.0, 31.0, 2.0])
+    args = [t.to(dtype) for t in (x, alpha, total)]
+    got = torch.ops.aten._dirichlet_grad(*[t.to(mojo_gpu) for t in args])
+    want = torch.ops.aten._dirichlet_grad(*args)
+    tol = (
+        {"rtol": 2e-4, "atol": 1e-6}
+        if dtype == torch.float32
+        else {"rtol": 1e-9, "atol": 1e-12}
+    )
+    _close(got, want, **tol)
+    h = torch.ones(2, dtype=torch.float16, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match='"_dirichlet_grad_cuda" not implemented'):
+        torch.ops.aten._dirichlet_grad(h, h, h)
+
+
+def test_dirichlet_rsample_backward(mojo_gpu):
+    """The public use: Dirichlet / Gamma rsample gradients on the device
+    (gamma sampled on the device, gradients by _standard_gamma_grad and
+    _dirichlet_grad)."""
+    torch.manual_seed(7)
+    conc = torch.tensor([0.5, 2.0, 5.0], device=mojo_gpu, requires_grad=True)
+    s = torch.distributions.Gamma(conc, torch.ones(3, device=mojo_gpu)).rsample((64,))
+    s.sum().backward()
+    assert conc.grad is not None and torch.isfinite(conc.grad).all()
