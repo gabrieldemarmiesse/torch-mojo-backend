@@ -1261,9 +1261,15 @@ def test_poisson_seeding_generator_and_errors(mojo_gpu):
             torch.poisson(torch.tensor([1.0, bad], device=mojo_gpu))
     with pytest.raises(RuntimeError, match='"poisson_cuda" not implemented'):
         torch.poisson(torch.ones(3, dtype=torch.long, device=mojo_gpu))
-    assert torch.poisson(torch.tensor([float("inf")], device=mojo_gpu)).item() == float(
-        "inf"
-    )
+    # CUDA's curand_poisson is a uint32 sampler: an infinite rate saturates
+    # at UINT32_MAX, then converts to the output dtype.
+    inf = torch.tensor([float("inf")], device=mojo_gpu)
+    assert torch.poisson(inf).item() == float(torch.tensor(4294967295.0).float())
+    if not _metal(mojo_gpu):
+        assert torch.poisson(inf.double()).item() == 4294967295.0
+    # An empty self returns before its probabilities are read.
+    empty = torch.empty(0, device=mojo_gpu)
+    assert empty.bernoulli_(torch.tensor(2.0, device=mojo_gpu)) is empty
 
 
 @pytest.mark.parametrize(

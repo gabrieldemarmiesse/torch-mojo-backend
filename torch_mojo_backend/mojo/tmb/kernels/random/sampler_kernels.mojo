@@ -209,7 +209,9 @@ def _poisson(
     if isnan(lam) or lam < 0:
         return nan[w]()
     if isinf(lam):
-        return lam
+        # curand_poisson returns an unsigned int: the conversion of an
+        # infinite (or out-of-range) draw saturates at UINT32_MAX.
+        return V(4294967295.0)
     if lam >= 10:
         # Transformed rejection method (Hoermann, 1993).
         var slam = ieee_sqrt(lam)

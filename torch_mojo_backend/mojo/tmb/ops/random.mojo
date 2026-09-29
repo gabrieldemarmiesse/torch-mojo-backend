@@ -705,9 +705,11 @@ def _bernoulli_tensor_into(t: T, p_in: T, generator: Int) raises:
         )
     if p_in.device != t.device:
         unsupported("bernoulli_.Tensor with p on another device")
-    _check_probabilities(p_in)
     if t.numel == 0:
+        # CPU and CUDA alike return an empty self before any value is read
+        # (empty(0).bernoulli_(tensor(2.)) is empty(0)).
         return
+    _check_probabilities(p_in)
     for i in range(t.rank):
         if t.dim(i) > 1 and t.stride(i) == 0:
             raise Error(

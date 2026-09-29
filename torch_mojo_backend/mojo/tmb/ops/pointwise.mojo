@@ -41,6 +41,7 @@ from tmb.backend.abi import (
     Value,
     bits_f64,
     call_op,
+    f64_bits,
     Values,
     default_dtype,
     dtype_name,
@@ -3523,9 +3524,11 @@ def _add_relu_check(self_st: Int32, common: Int32) raises:
         )
 
 
-def _add_relu_max(self_st: Int32, compute: Int32) -> Float64:
+def _add_relu_max(self_st: Int32, compute: Int32) raises -> Float64:
     """add_relu_impl's `max_val`: the largest value of SELF's dtype, as the
-    computation dtype's parameter (`Scalar::to<scalar_t>()`)."""
+    computation dtype's parameter through the range-checked
+    `Scalar::to<scalar_t>()` (a 0-d int64 self over an int8 tensor computes
+    in int8, where int64's max overflows and raises)."""
     var top_i = 0
     var top_f = 0.0
     if self_st == ST_INT8:
@@ -3541,9 +3544,17 @@ def _add_relu_max(self_st: Int32, compute: Int32) -> Float64:
     else:
         top_f = 1.7976931348623157e308
     if _pw_is_int(compute):
-        return bits_f64(Int64(top_i))
+        return bits_f64(
+            Int64(
+                scalar_to_int(
+                    Value(TAG_SCALAR_INT, 0, Int64(top_i), 0), compute
+                )
+            )
+        )
     if top_f != 0.0:
-        return top_f
+        return scalar_to_float(
+            Value(TAG_SCALAR_DOUBLE, 0, f64_bits(top_f), 0), compute
+        )
     return Float64(top_i)
 
 

@@ -2586,6 +2586,13 @@ def test_add_relu_clamps_at_self_dtype_max(mojo_gpu):
     got = aten._add_relu(a.to(mojo_gpu), b.to(mojo_gpu))
     assert got.dtype == torch.int16
     assert torch.equal(got.cpu(), aten._add_relu(a, b))
+    # A 0-d int64 self over an int8 tensor computes in int8, where int64's
+    # max does not fit.
+    with pytest.raises(RuntimeError, match="without overflow"):
+        aten._add_relu(
+            torch.tensor(5, device=mojo_gpu),
+            torch.ones(3, dtype=torch.int8, device=mojo_gpu),
+        )
     f = torch.tensor([3e38, -1.0])
     d = torch.tensor([3e38, 0.5], dtype=torch.float64)
     skip_if_metal(mojo_gpu, "Metal has no float64")
