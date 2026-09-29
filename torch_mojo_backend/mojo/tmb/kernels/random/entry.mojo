@@ -22,6 +22,13 @@ from tmb.kernels.random.distribution_kernels import (
     enqueue_bernoulli_tensor,
     enqueue_distribution,
 )
+from tmb.kernels.random.sampler_kernels import (
+    SAMPLE_BINOMIAL,
+    SAMPLE_GAMMA,
+    SAMPLE_POISSON,
+    enqueue_prob_check,
+    enqueue_sampler,
+)
 from tmb.kernels.random.multinomial_kernels import (
     enqueue_multinomial_check,
     enqueue_multinomial_draw,
@@ -35,7 +42,9 @@ from tmb.kernels.common.op_utils import (
     _raw_int,
     _raw_tuple_int,
     _raw_tuple_len,
+    _spec_dispatcher4,
     _spec_dispatcher6,
+    _spec_dispatcher10,
     _spec_dispatcher12,
     _spec_dispatcher15,
     _spec_dispatcher16,
@@ -339,6 +348,65 @@ def _multinomial_draw_go(
         raise Error("unsupported dtype for multinomial: ", dtype)
 
 
+# poisson / _standard_gamma / binomial: ATen's floating dispatch with the
+# half types (AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16)).
+comptime SAMPLER_DTYPES = [
+    DType.float32,
+    DType.bfloat16,
+    DType.float16,
+    DType.float64,
+]
+
+
+def _sampler_go[
+    KIND: Int
+](
+    dst_obj: Arg,
+    a_obj: Arg,
+    b_obj: Arg,
+    flag_obj: Arg,
+    numel_obj: Arg,
+    seed_lo_obj: Arg,
+    seed_hi_obj: Arg,
+    offset_lo_obj: Arg,
+    offset_hi_obj: Arg,
+    ctx_obj: Arg,
+) raises:
+    var handled = False
+    comptime for dt in SAMPLER_DTYPES:
+        comptime if _dtype_out_on[0, dt]():
+            enqueue_sampler[dt, KIND](
+                _raw_ctx(ctx_obj),
+                _raw_int(dst_obj),
+                _raw_int(a_obj),
+                _raw_int(b_obj),
+                _raw_int(flag_obj),
+                _raw_int(numel_obj),
+                _join_u64(_raw_int(seed_lo_obj), _raw_int(seed_hi_obj)),
+                _join_u64(_raw_int(offset_lo_obj), _raw_int(offset_hi_obj)),
+            )
+            handled = True
+    if not handled:
+        raise Error("sampler: no dtype compiled into this module")
+
+
+def _prob_check_go(
+    p_obj: Arg, flag_obj: Arg, numel_obj: Arg, ctx_obj: Arg
+) raises:
+    var handled = False
+    comptime for dt in PROB_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            enqueue_prob_check[dt](
+                _raw_ctx(ctx_obj),
+                _raw_int(p_obj),
+                _raw_int(flag_obj),
+                _raw_int(numel_obj),
+            )
+            handled = True
+    if not handled:
+        raise Error("prob check: no dtype compiled into this module")
+
+
 @export
 def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     try:
@@ -404,6 +472,22 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["MultinomialDraw"]():
             _spec_dispatcher12[_multinomial_draw_go, "MultinomialDraw"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["ProbCheck"]():
+            _spec_dispatcher4[_prob_check_go, "ProbCheck"](argv, argc)
+            return 0
+        comptime if _op_on["Poisson"]():
+            _spec_dispatcher10[_sampler_go[SAMPLE_POISSON], "Poisson"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["Gamma"]():
+            _spec_dispatcher10[_sampler_go[SAMPLE_GAMMA], "Gamma"](argv, argc)
+            return 0
+        comptime if _op_on["Binomial"]():
+            _spec_dispatcher10[_sampler_go[SAMPLE_BINOMIAL], "Binomial"](
                 argv, argc
             )
             return 0

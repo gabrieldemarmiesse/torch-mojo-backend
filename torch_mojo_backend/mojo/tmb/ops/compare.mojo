@@ -1504,7 +1504,49 @@ def op_bucketize_scalar_out(
     ret_ref(rets, 0, out_arg)
 
 
+# ---------------------------------------------------------------------------
+# _assert_async: TensorCompare.cpp's CPU form (a synchronous check). CUDA
+# launches a device assert instead, which aborts the context; raising from a
+# 1-element readback is the recoverable equivalent.
+# ---------------------------------------------------------------------------
+
+
+def _assert_nonzero(t: T, msg: String) raises:
+    if t.numel == 0:
+        raise Error("Boolean value of Tensor with no values is ambiguous")
+    if t.numel > 1:
+        raise Error(
+            "Boolean value of Tensor with more than one value is ambiguous"
+        )
+    var item = call_op("aten::_local_scalar_dense", "", [tensor_arg(t)], 1)
+    if not (v_f64(item[0]) != 0.0):
+        raise Error(msg)
+
+
+# aten::_assert_async(Tensor self) -> ()
+def op_assert_async(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _assert_nonzero(
+        v_tensor(args[unsafe_offset=0]),
+        "Expected Tensor with single nonzero value, but got zero",
+    )
+
+
+# aten::_assert_async.msg(Tensor self, str assert_msg) -> ()
+def op_assert_async_msg(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var msg = v_string(args[unsafe_offset=1])
+    _assert_nonzero(
+        v_tensor(args[unsafe_offset=0]),
+        msg if msg.byte_length() > 0 else String("Assertion is failed"),
+    )
+
+
 def register_compare(site: Site) raises:
+    impl[op_assert_async, "_assert_async"](site)
+    impl[op_assert_async_msg, "_assert_async.msg"](site)
     impl[op_eq_tensor, "eq.Tensor"](site)
     impl[op_eq_tensor_out, "eq.Tensor_out"](site)
     impl[op_eq_scalar, "eq.Scalar"](site)

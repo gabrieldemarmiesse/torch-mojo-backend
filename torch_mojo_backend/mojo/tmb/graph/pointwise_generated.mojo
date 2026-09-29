@@ -320,6 +320,18 @@ struct PointwiseNextafter(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_prelu")
+struct PointwisePrelu(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["prelu", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_rshift")
 struct PointwiseRshift(ElementwiseBinaryOp):
     @staticmethod

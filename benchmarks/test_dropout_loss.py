@@ -61,6 +61,7 @@ COVERS: dict[str, str] = (
     {
         "aten::native_dropout": "test_dropout",
         "aten::native_dropout_backward": "test_dropout_backward",
+        "aten::_masked_scale": "test_masked_scale",
         "aten::nll_loss_forward.output": "test_nll_loss",
         "aten::nll_loss_backward.grad_input": "test_nll_loss_backward",
     }
@@ -74,6 +75,22 @@ _LOSS_OUT = (
     "and copied)"
 )
 SKIPPED: dict[str, str] = {
+    "aten::_fused_dropout": (
+        "the NativeDropout kernel test_dropout measures, with a uint8 mask "
+        "and an explicit generator"
+    ),
+    "aten::_sample_dirichlet": (
+        "test_sampler's _standard_gamma draw, a sum over the last dim and "
+        "one pointwise ratio"
+    ),
+    "aten::bernoulli.out": (
+        "out.resize_ + the BernoulliTensor kernel bernoulli_.Tensor launches"
+    ),
+    "aten::_fill_mem_eff_dropout_mask_": (
+        "a testing hook of memory-efficient attention (upstream: 'only used "
+        "for testing, not much attention is paid to performance')"
+    ),
+} | {
     f"aten::{name}": _LOSS_OUT
     for name in (
         "binary_cross_entropy.out",
@@ -117,6 +134,55 @@ def test_dropout_backward(
         lambda: torch.ops.aten.native_dropout_backward(g_ref, mask_ref, 2.0),
         lambda: torch.ops.aten.native_dropout_backward(g_our, mask_our, 2.0),
         flops=float(g_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", DROPOUT_SHAPES)
+@pytest.mark.bench_op("_masked_scale")
+def test_masked_scale(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = DROPOUT_SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    m_ref, m_our = both((torch.rand(shape) < 0.5).to(torch.uint8), hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten._masked_scale(x_ref, m_ref, 2.0),
+        lambda: torch.ops.aten._masked_scale(x_our, m_our, 2.0),
+        flops=float(x_ref.numel()),
+    )
+
+
+# Rejection samplers: parameters where every regime's loop is short
+# (poisson's PTRS above 10, gamma's Marsaglia-Tsang, binomial's BTRS).
+# (scale of the first operand, the call)
+SAMPLER_OPS = {
+    "poisson": (40.0, lambda a, b: torch.poisson(a)),
+    "_standard_gamma": (4.0, lambda a, b: torch._standard_gamma(a)),
+    "binomial": (100.0, torch.binomial),
+}
+COVERS |= {f"aten::{name}": "test_sampler" for name in SAMPLER_OPS}
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", DROPOUT_SHAPES)
+@pytest.mark.parametrize("op_name", op_params(SAMPLER_OPS))
+def test_sampler(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """The draws differ between legs (each backend its own stream) but the
+    expected work per element is the same distribution's."""
+    scale, fn = SAMPLER_OPS[op_name]
+    shape = DROPOUT_SHAPES[shape_id]
+    a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]) * scale, hw, mojo_device)
+    b_ref, b_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
     )
 
 

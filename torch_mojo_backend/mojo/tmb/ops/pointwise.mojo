@@ -32,6 +32,7 @@ from tmb.backend.abi import (
     ST_UINT8,
     T,
     TAG_BOOL,
+    TAG_INT_LIST,
     TAG_DOUBLE,
     TAG_NONE,
     TAG_SCALAR_BOOL,
@@ -39,6 +40,8 @@ from tmb.backend.abi import (
     TAG_SCALAR_INT,
     Value,
     bits_f64,
+    call_op,
+    f64_bits,
     Values,
     default_dtype,
     dtype_name,
@@ -48,7 +51,9 @@ from tmb.backend.abi import (
     own_if_new,
     release,
     ret_ref,
+    ret_owned,
     ret_tensor,
+    tensor_arg,
     unsupported,
     v_bool,
     v_f64,
@@ -105,7 +110,7 @@ from tmb.ops.common import (
     scalar_to_float,
     scalar_to_int,
 )
-from tmb.ops.random import _draw
+from tmb.ops.random import _draw, _sample, _sampler_dtype_check
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.core import cast_for_copy
 from tmb.ops.reductions import _scalar_reduction
@@ -3414,7 +3419,389 @@ def op_binary_cross_entropy_with_logits_out(
     _bce_logits(args, rets, args[unsafe_offset=5].copy())
 
 
+# ---------------------------------------------------------------------------
+# prelu, _add_relu, isclose, _masked_scale and the gamma / Dirichlet
+# gradients: one pointwise kind each (prelu's backward: two).
+# ---------------------------------------------------------------------------
+
+
+def _pw_same_dtypes(args: Values, n: Int) raises -> Int32:
+    """TensorIterator's `check_all_same_dtype` over args[0 .. n): the
+    common dtype, or CPU torch's "Found dtype X but expected Y"."""
+    var first = _pw_side_stype(_b_side(args[unsafe_offset=0]))
+    for i in range(1, n):
+        var st = _pw_side_stype(_b_side(args[unsafe_offset=i]))
+        if st != first:
+            raise Error(
+                "Found dtype ",
+                _scalar_type_name(max_dtype(st)),
+                " but expected ",
+                _scalar_type_name(max_dtype(first)),
+            )
+    return first
+
+
+def _pw_floating_dispatch(name: StaticString, st: Int32, half_ok: Bool) raises:
+    """ATen's AT_DISPATCH_FLOATING_TYPES(_AND2(Half, BFloat16)) refusal."""
+    var ok = st == ST_FLOAT32 or st == ST_FLOAT64
+    if half_ok:
+        ok = ok or st == ST_FLOAT16 or st == ST_BFLOAT16
+    if not ok:
+        raise Error(
+            '"',
+            name,
+            "\" not implemented for '",
+            _scalar_type_name(max_dtype(st)),
+            "'",
+        )
+
+
+def _pw_fixed(
+    kind: StaticString,
+    arity: Int,
+    args: Values,
+    first: Int,
+    st: Int32,
+    params: SIMD[DType.float64, 4],
+) raises -> Res:
+    """`kind` over args[first .. first + arity), all of dtype `st`, into a
+    fresh tensor of their broadcast shape."""
+    var a = _b_side(args[unsafe_offset=first])
+    var b = (
+        _b_side(args[unsafe_offset=first + 1]) if arity >= 2 else _none_side()
+    )
+    var c = (
+        _b_side(args[unsafe_offset=first + 2]) if arity >= 3 else _none_side()
+    )
+    return _pw_run(kind, arity, a, b, c, st, st, params, None)
+
+
+# aten::_prelu_kernel(Tensor self, Tensor weight) -> Tensor
+def op_prelu_kernel(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var st = _pw_same_dtypes(args, 2)
+    _pw_floating_dispatch("prelu_cuda", st, True)
+    _b_ret(rets, _pw_fixed("prelu", 2, args, 0, st, _p()))
+
+
+# aten::_prelu_kernel_backward(Tensor grad_output, Tensor self, Tensor weight) -> (Tensor, Tensor)
+def op_prelu_kernel_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """ActivationPreluKernel.cu's prelu_backward_kernel: both gradients of
+    the broadcast shape (prelu's composite backward reduces grad_weight to
+    the weight's shape afterwards)."""
+    var st = _pw_same_dtypes(args, 3)
+    _pw_floating_dispatch("prelu_backward_cuda", st, True)
+    var g = _b_side(args[unsafe_offset=0])
+    var x = _b_side(args[unsafe_offset=1])
+    var w = _b_side(args[unsafe_offset=2])
+    var gi = _pw_run("prelu_backward_input", 3, x, w, g, st, st, _p(), None)
+    var gw = _pw_run("prelu_backward_weight", 3, x, w, g, st, st, _p(), None)
+    ret_tensor(rets, 0, gi.t)
+    ret_tensor(rets, 1, gw.t)
+
+
+def _add_relu_check(self_st: Int32, common: Int32) raises:
+    """add_relu_impl's own dtype check (on self) and its
+    AT_DISPATCH_ALL_TYPES (on the common dtype); CPU is the only reference,
+    CUDA has no `_add_relu`."""
+    if not (
+        self_st == ST_INT32
+        or self_st == ST_INT64
+        or self_st == ST_INT16
+        or self_st == ST_INT8
+        or self_st == ST_FLOAT32
+        or self_st == ST_FLOAT64
+    ):
+        raise Error("Unsupported datatype for add_relu:", dtype_name(self_st))
+    if common == ST_FLOAT16 or common == ST_BFLOAT16 or common == ST_BOOL:
+        raise Error(
+            '"add_clamp_cpu" not implemented for \'',
+            _scalar_type_name(max_dtype(common)),
+            "'",
+        )
+
+
+def _add_relu_max(self_st: Int32, compute: Int32) raises -> Float64:
+    """add_relu_impl's `max_val`: the largest value of SELF's dtype, as the
+    computation dtype's parameter through the range-checked
+    `Scalar::to<scalar_t>()` (a 0-d int64 self over an int8 tensor computes
+    in int8, where int64's max overflows and raises)."""
+    var top_i = 0
+    var top_f = 0.0
+    if self_st == ST_INT8:
+        top_i = 127
+    elif self_st == ST_INT16:
+        top_i = 32767
+    elif self_st == ST_INT32:
+        top_i = 2147483647
+    elif self_st == ST_INT64:
+        top_i = 9223372036854775807
+    elif self_st == ST_FLOAT32:
+        top_f = 3.4028234663852886e38
+    else:
+        top_f = 1.7976931348623157e308
+    if _pw_is_int(compute):
+        return bits_f64(
+            Int64(
+                scalar_to_int(
+                    Value(TAG_SCALAR_INT, 0, Int64(top_i), 0), compute
+                )
+            )
+        )
+    if top_f != 0.0:
+        return scalar_to_float(
+            Value(TAG_SCALAR_DOUBLE, 0, f64_bits(top_f), 0), compute
+        )
+    return Float64(top_i)
+
+
+def _add_relu(args: Values, rets: Values, out_index: Int, inplace: Bool) raises:
+    var a: Side
+    if inplace:
+        a = _b_tside(_pw_inplace_self(args, "_add_relu_", 2))
+    else:
+        a = _b_side(args[unsafe_offset=0])
+    var b = _b_side(args[unsafe_offset=1])
+    var c = _none_side()
+    var common = _pw_result_type(a, b, c, 2)
+    _add_relu_check(_pw_side_stype(a), common)
+    var compute = _pw_compute_dtype("add_relu", common, P_NUMERIC, True)
+    var params = _p(
+        _int_exact_param(args[unsafe_offset=2], compute),
+        _add_relu_max(_pw_side_stype(a), compute),
+    )
+    if inplace:
+        var self = a.t.value().copy()
+        _b_store_inplace(
+            rets,
+            self,
+            _pw_run(
+                "add_relu", 2, a, b, c, compute, compute, params, self.copy()
+            ),
+        )
+        return
+    var dest = Optional[T]()
+    if out_index >= 0:
+        dest = _pw_out_of(args[unsafe_offset=out_index], a, b, c)
+    _pw_finish(
+        rets,
+        dest,
+        _pw_run("add_relu", 2, a, b, c, compute, compute, params, dest),
+    )
+
+
+# aten::_add_relu.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
+# aten::_add_relu.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
+def op_add_relu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _add_relu(args, rets, -1, False)
+
+
+# aten::_add_relu.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
+def op_add_relu_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _add_relu(args, rets, 3, False)
+
+
+# aten::_add_relu_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
+# aten::_add_relu_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)
+def op_add_relu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _add_relu(args, rets, -1, True)
+
+
+def _f32_bits_param(v: Float64) -> Float64:
+    """A float32 value as its bit pattern in an integer kind's int64 slot."""
+    return bits_f64(Int64(Int(Float32(v).to_bits[DType.uint32]())))
+
+
+# aten::isclose(Tensor self, Tensor other, float rtol=1e-05, float atol=1e-08, bool equal_nan=False) -> Tensor
+# CompositeImplicitAutograd upstream (eq, isnan, sub, mul, abs, add, le,
+# isfinite, and/or: about six kernels on CUDA); its bool output is not
+# differentiable, so one kernel here loses no gradient.
+def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = _b_side(args[unsafe_offset=0])
+    var b = _b_side(args[unsafe_offset=1])
+    var st = _pw_side_stype(a)
+    var other_st = _pw_side_stype(b)
+    if st != other_st:
+        raise Error(
+            _scalar_type_name(max_dtype(st)),
+            " did not match ",
+            _scalar_type_name(max_dtype(other_st)),
+        )
+    var rtol = v_f64(args[unsafe_offset=2])
+    var atol = v_f64(args[unsafe_offset=3])
+    var equal_nan = v_bool(args[unsafe_offset=4])
+    if not (rtol >= 0):
+        raise Error(
+            "rtol must be greater than or equal to zero, but got ", rtol
+        )
+    if not (atol >= 0):
+        raise Error(
+            "atol must be greater than or equal to zero, but got ", atol
+        )
+    if not (_pw_is_float(st) or _pw_is_int(st) or st == ST_BOOL):
+        unsupported("isclose on dtype " + dtype_name(st))
+    var tol_on = 0.0 if (rtol == 0 and atol == 0) else 1.0
+    if _pw_is_float(st):
+        var params = _p(rtol, atol, 1.0 if equal_nan else 0.0, tol_on)
+        _b_ret(
+            rets,
+            _pw_run(
+                "isclose", 2, a, b, _none_side(), st, ST_BOOL, params, None
+            ),
+        )
+        return
+    # Integer and bool operands: equality in their own dtype; the tolerance
+    # test in the default float dtype D (`cast_other = other.to(D)`, and
+    # self - cast_other promotes self to D as well).
+    var d = default_dtype()
+    var zero_tol = _p(bits_f64(Int64(0)), bits_f64(Int64(0)), 0.0, 0.0)
+    if tol_on == 0 or d == ST_FLOAT32:
+        var params = _p(
+            _f32_bits_param(rtol),
+            _f32_bits_param(atol),
+            bits_f64(Int64(0)),
+            bits_f64(Int64(1 if tol_on != 0 else 0)),
+        )
+        _b_ret(
+            rets,
+            _pw_run(
+                "isclose", 2, a, b, _none_side(), st, ST_BOOL, params, None
+            ),
+        )
+        return
+    # Another default dtype: equality on the integers OR the floating test on
+    # both operands cast to D (the float kernel's own rounding in D).
+    var eq = _pw_run(
+        "isclose", 2, a, b, _none_side(), st, ST_BOOL, zero_tol, None
+    )
+    var held_eq = own(eq.t.copy())
+    var fl = _pw_run(
+        "isclose",
+        2,
+        a,
+        b,
+        _none_side(),
+        d,
+        ST_BOOL,
+        _p(rtol, atol, 0.0, 2.0),
+        None,
+    )
+    _ = call_op(
+        "aten::logical_or_",
+        "",
+        [tensor_arg(fl.t), tensor_arg(held_eq.t)],
+        1,
+    )
+    _ = held_eq^
+    _b_ret(rets, fl^)
+
+
+# aten::_masked_scale(Tensor self, Tensor mask, float scale) -> Tensor
+def op_masked_scale(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """Dropout.cu's masked_scale_cuda: `(float)mask * self * scale` over a
+    uint8 mask, into a tensor of their broadcast shape."""
+    var self = v_tensor(args[unsafe_offset=0])
+    var mask = v_tensor(args[unsafe_offset=1])
+    if mask.stype != ST_UINT8:
+        raise Error("mask should be torch.uint8 dtype")
+    _pw_floating_dispatch("masked_scale", self.stype, True)
+    var scale = v_f64(args[unsafe_offset=2])
+    # TensorIterator resizes the fresh `empty_like(self)` output to the
+    # broadcast of self and mask (self (1, 3), mask (4, 3): (4, 3)).
+    var res = _pw_run(
+        "masked_scale",
+        2,
+        _b_tside(self),
+        _b_tside(mask),
+        _none_side(),
+        self.stype,
+        self.stype,
+        _p(scale),
+        None,
+    )
+    _b_ret(rets, res^)
+
+
+# aten::_standard_gamma_grad(Tensor self, Tensor output) -> Tensor
+def op_standard_gamma_grad(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var st = _pw_same_dtypes(args, 2)
+    _pw_floating_dispatch("_standard_gamma_grad_cuda", st, True)
+    _b_ret(rets, _pw_fixed("standard_gamma_grad", 2, args, 0, st, _p()))
+
+
+# aten::_dirichlet_grad(Tensor x, Tensor alpha, Tensor total) -> Tensor
+def op_dirichlet_grad(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var st = _pw_same_dtypes(args, 3)
+    _pw_floating_dispatch("_dirichlet_grad_cuda", st, False)
+    _b_ret(rets, _pw_fixed("dirichlet_grad", 3, args, 0, st, _p()))
+
+
+# aten::_sample_dirichlet(Tensor self, Generator? generator=None) -> Tensor
+def op_sample_dirichlet(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """Distributions.cpp's _s_dirichlet_cuda: Gamma(alpha) draws, their sum
+    over the last dim, then launch_dirichlet_kernel's clamped ratio."""
+    var alpha = v_tensor(args[unsafe_offset=0])
+    _sampler_dtype_check("dirichlet_cuda", alpha)
+    var g = _sample(
+        "Gamma", 10, alpha, None, v_generator(args[unsafe_offset=1])
+    )
+    if g.t.numel > 0:
+        var dims = List[Int64]()
+        dims.append(Int64(-1))
+        var sums = call_op(
+            "aten::sum",
+            "dim_IntList",
+            [
+                tensor_arg(g.t),
+                Value(TAG_INT_LIST, Int32(1), Int64(Int(dims.unsafe_ptr())), 0),
+                Value(TAG_BOOL, 0, Int64(1), 0),
+                Value(TAG_NONE, 0, 0, 0),
+            ],
+            1,
+        )
+        _ = dims^
+        var total = own(sums.take_tensor(0))
+        _ = _pw_run(
+            "dirichlet",
+            2,
+            _b_tside(g.t),
+            _b_tside(total.t),
+            _none_side(),
+            g.t.stype,
+            g.t.stype,
+            _p(),
+            Optional[T](g.t.copy()),
+        )
+        _ = total^
+    ret_owned(rets, 0, g)
+
+
 def register_pointwise(site: Site) raises:
+    impl[op_sample_dirichlet, "_sample_dirichlet"](site)
+    impl[op_prelu_kernel, "_prelu_kernel"](site)
+    impl[op_prelu_kernel_backward, "_prelu_kernel_backward"](site)
+    impl[op_add_relu, "_add_relu.Tensor"](site)
+    impl[op_add_relu, "_add_relu.Scalar"](site)
+    impl[op_add_relu_out, "_add_relu.out"](site)
+    impl[op_add_relu_, "_add_relu_.Tensor"](site)
+    impl[op_add_relu_, "_add_relu_.Scalar"](site)
+    impl[op_isclose, "isclose"](site)
+    impl[op_masked_scale, "_masked_scale"](site)
+    impl[op_standard_gamma_grad, "_standard_gamma_grad"](site)
+    impl[op_dirichlet_grad, "_dirichlet_grad"](site)
     impl[op_ilshift, "__ilshift__.Scalar"](site)
     impl[op_ilshift, "__ilshift__.Tensor"](site)
     impl[op_irshift, "__irshift__.Scalar"](site)

@@ -1,4 +1,4 @@
-"""Native `_foreach_*` / `_fused_adamw_` ops (`tmb/ops/foreach.mojo`).
+"""Native `_foreach_*` / fused-optimizer ops (`tmb/ops/foreach.mojo`).
 
 Migrated from `tests/test_eager_optimizer_ops.py` (deleted): only the tests
 that exercise ops this group registers. That file also covered `lerp.Scalar`,
@@ -28,7 +28,7 @@ this file.
 import pytest
 import torch
 
-from tests.native.conftest import skip_if_metal
+from tests.native.conftest import ran, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.testing import CallChecker
 
@@ -636,7 +636,7 @@ def test_fused_adamw_validates_every_tensor_before_write(mojo_gpu: str):
     mutable = (parameters, grads, exp_avgs, exp_avg_sqs)
     snapshot = [[t.cpu().clone() for t in group] for group in mutable]
 
-    with pytest.raises(RuntimeError, match="same dtype, device, shape"):
+    with pytest.raises(RuntimeError, match="same dtype, device, and layout"):
         torch.ops.aten._fused_adamw_.default(
             parameters,
             grads,
@@ -1301,3 +1301,943 @@ def test_foreach_mul_tensor_allows_a_scalar_in_a_strided_hole(mojo_gpu: str):
         base.cpu(), torch.tensor([2.0, 2.0, 6.0, 4.0, 10.0, 6.0])
     )
     assert base._version == version + 1
+
+
+# --- fused optimizers: _fused_{adam,adamw,sgd,adagrad}_ -----------------------
+
+_FUSED_DTYPES = {
+    "f32": torch.float32,
+    "f16": torch.float16,
+    "bf16": torch.bfloat16,
+    "f64": torch.float64,
+}
+# (shape, transpose): empty, 0-d, 1-d, a tensor longer than one vector step
+# with a scalar tail, and a transposed (dense, non-contiguous) one.
+_FUSED_SHAPES = (
+    ((0,), False),
+    ((), False),
+    ((7,), False),
+    ((17, 65), False),
+    ((9, 13), True),
+)
+
+
+def _fused_tolerance(dtype: torch.dtype) -> tuple[float | None, float | None]:
+    """(rtol, atol); None, None is torch.testing's per-dtype default: about
+    one ulp of a half type."""
+    if dtype == torch.float64:
+        return 1e-12, 1e-14
+    if dtype == torch.float32:
+        return 4e-6, 4e-7
+    return None, None
+
+
+def _fused_values(
+    shape: tuple[int, ...],
+    transpose: bool,
+    dtype: torch.dtype,
+    *,
+    scale: float,
+    offset: float,
+    positive: bool = False,
+) -> torch.Tensor:
+    """Deterministic, nonuniform values (no RNG); `transpose` stores the
+    tensor transposed, so it is dense but not contiguous."""
+    stored = shape[::-1] if transpose else shape
+    numel = torch.empty(stored).numel()
+    x = torch.arange(numel, dtype=torch.float64).mul(scale).add(offset)
+    x = x.sin().mul(0.5).add(offset) if not positive else x.cos().abs().add(0.05)
+    x = x.to(dtype).reshape(stored)
+    return x.t() if transpose else x
+
+
+def _fused_lists(
+    name: str, n_lists: int, dtype: torch.dtype, state_dtype: torch.dtype | None = None
+) -> list[list[torch.Tensor]]:
+    """params, grads, then `n_lists - 2` state lists (the squared-gradient
+    accumulators -- Adam's exp_avg_sqs and max_exp_avg_sqs, Adagrad's
+    state_sums -- kept positive)."""
+    state_dtype = state_dtype or dtype
+    first_positive = 2 if "adagrad" in name else 3
+    lists = []
+    for k in range(n_lists):
+        dt = dtype if k < 2 else state_dtype
+        lists.append(
+            [
+                _fused_values(
+                    shape,
+                    t,
+                    dt,
+                    scale=0.37 + 0.11 * k,
+                    offset=0.2 * k - 0.3 + 0.05 * i,
+                    positive=k >= first_positive,
+                )
+                for i, (shape, t) in enumerate(_FUSED_SHAPES)
+            ]
+        )
+    return lists
+
+
+def _fused_steps(device: str) -> list[torch.Tensor]:
+    return [torch.tensor(float(s), device=device) for s in (1, 3, 5, 11, 17)]
+
+
+def _to(lists: list[list[torch.Tensor]], device: str) -> list[list[torch.Tensor]]:
+    # clone() keeps the transposed layout (preserve_format on a dense tensor).
+    return [[t.clone().to(device) for t in group] for group in lists]
+
+
+def _assert_lists_close(actual, expected, dtype: torch.dtype, exact: bool = False):
+    rtol, atol = (0.0, 0.0) if exact else _fused_tolerance(dtype)
+    for a_group, e_group in zip(actual, expected, strict=True):
+        for a, e in zip(a_group, e_group, strict=True):
+            assert a.stride() == e.stride() or a.numel() <= 1
+            torch.testing.assert_close(a.cpu(), e.cpu(), rtol=rtol, atol=atol)
+
+
+def _call_fused(name: str, lists, steps, device: str, **kwargs):
+    # torch.<op>, not torch.ops.aten.<op>: the overload packet would take a
+    # 0-d tensor lr as a float and never reach `.tensor_lr`.
+    fn = getattr(torch, name)
+    if name in ("_fused_adam_", "_fused_adamw_"):
+        params, grads, avgs, sqs = lists[:4]
+        maxs = lists[4] if len(lists) > 4 else []
+        return fn(params, grads, avgs, sqs, maxs, steps, **kwargs)
+    if name == "_fused_sgd_":
+        return fn(lists[0], lists[1], lists[2] if len(lists) > 2 else [], **kwargs)
+    return fn(lists[0], lists[1], lists[2], steps, **kwargs)
+
+
+# (op, number of tensor lists, kwargs): every flag the kernels branch on.
+_FUSED_CASES = [
+    (
+        "_fused_adam_",
+        4,
+        dict(
+            lr=0.025,
+            beta1=0.8,
+            beta2=0.95,
+            weight_decay=0.1,
+            eps=1e-8,
+            amsgrad=False,
+            maximize=False,
+        ),
+    ),
+    (
+        "_fused_adam_",
+        5,
+        dict(
+            lr=0.01,
+            beta1=0.9,
+            beta2=0.999,
+            weight_decay=0.0,
+            eps=1e-6,
+            amsgrad=True,
+            maximize=True,
+        ),
+    ),
+    (
+        "_fused_adamw_",
+        4,
+        dict(
+            lr=0.025,
+            beta1=0.8,
+            beta2=0.95,
+            weight_decay=0.1,
+            eps=1e-8,
+            amsgrad=False,
+            maximize=True,
+        ),
+    ),
+    (
+        "_fused_adamw_",
+        5,
+        dict(
+            lr=0.01,
+            beta1=0.9,
+            beta2=0.99,
+            weight_decay=0.02,
+            eps=1e-8,
+            amsgrad=True,
+            maximize=False,
+        ),
+    ),
+    (
+        "_fused_sgd_",
+        2,
+        dict(
+            weight_decay=0.1,
+            momentum=0.0,
+            lr=0.05,
+            dampening=0.0,
+            nesterov=False,
+            maximize=True,
+            is_first_step=False,
+        ),
+    ),
+    (
+        "_fused_sgd_",
+        3,
+        dict(
+            weight_decay=0.0,
+            momentum=0.9,
+            lr=0.05,
+            dampening=0.1,
+            nesterov=False,
+            maximize=False,
+            is_first_step=False,
+        ),
+    ),
+    (
+        "_fused_sgd_",
+        3,
+        dict(
+            weight_decay=0.01,
+            momentum=0.8,
+            lr=0.05,
+            dampening=0.0,
+            nesterov=True,
+            maximize=False,
+            is_first_step=True,
+        ),
+    ),
+    (
+        "_fused_adagrad_",
+        3,
+        dict(lr=0.05, lr_decay=0.01, weight_decay=0.1, eps=1e-10, maximize=False),
+    ),
+    (
+        "_fused_adagrad_",
+        3,
+        dict(lr=0.05, lr_decay=0.0, weight_decay=0.0, eps=1e-10, maximize=True),
+    ),
+]
+_FUSED_CASE_IDS = [
+    "adam",
+    "adam-amsgrad-max",
+    "adamw-max",
+    "adamw-amsgrad",
+    "sgd-nomomentum",
+    "sgd-momentum",
+    "sgd-nesterov-first",
+    "adagrad",
+    "adagrad-max",
+]
+
+
+@pytest.mark.parametrize("dtype_id", list(_FUSED_DTYPES))
+@pytest.mark.parametrize(
+    ("name", "n_lists", "kwargs"), _FUSED_CASES, ids=_FUSED_CASE_IDS
+)
+def test_fused_optimizer_matches_cpu(
+    mojo_gpu: str,
+    name: str,
+    n_lists: int,
+    kwargs: dict[str, float | bool],
+    dtype_id: str,
+):
+    dtype = _FUSED_DTYPES[dtype_id]
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    lists = _fused_lists(name, n_lists, dtype)
+    mojo = _to(lists, mojo_gpu)
+    # Half types: CUDA computes in float from the stored values and rounds
+    # each result once on store, which is the float32 op on the widened
+    # values, rounded. (CPU's own reduced-precision fused SGD is not a usable
+    # reference: its vectorized loop leaves the params unchanged.)
+    reduced = dtype in (torch.float16, torch.bfloat16)
+    cpu = [[t.float() if reduced else t.clone() for t in group] for group in lists]
+    with ran(f"aten::{name}"):
+        assert (
+            _call_fused(name, mojo, _fused_steps(mojo_gpu), mojo_gpu, **kwargs) is None
+        )
+    _call_fused(name, cpu, _fused_steps("cpu"), "cpu", **kwargs)
+    _assert_lists_close(mojo, [[t.to(dtype) for t in group] for group in cpu], dtype)
+
+
+@pytest.mark.parametrize("found_inf", [0.0, 1.0])
+@pytest.mark.parametrize(
+    ("name", "n_lists", "kwargs"), _FUSED_CASES, ids=_FUSED_CASE_IDS
+)
+def test_fused_optimizer_grad_scale_found_inf_and_tensor_lr(
+    mojo_gpu: str,
+    name: str,
+    n_lists: int,
+    kwargs: dict[str, float | bool],
+    found_inf: float,
+):
+    """GradScaler's fused path: grads are unscaled in place (and written
+    back), found_inf == 1 skips every write; lr is a device tensor (the
+    `.tensor_lr` overload), then a CPU tensor (read as a float)."""
+    lists = _fused_lists(name, n_lists, torch.float32)
+    kwargs = dict(kwargs)
+    lr = kwargs.pop("lr")
+    for lr_device in (mojo_gpu, "cpu"):
+        cpu, mojo = _to(lists, "cpu"), _to(lists, mojo_gpu)
+        with ran(f"aten::{name}.tensor_lr"):
+            _call_fused(
+                name,
+                mojo,
+                _fused_steps(mojo_gpu),
+                mojo_gpu,
+                lr=torch.tensor(lr, device=lr_device),
+                grad_scale=torch.tensor(4.0, device=mojo_gpu),
+                found_inf=torch.tensor(found_inf, device=mojo_gpu),
+                **kwargs,
+            )
+        _call_fused(
+            name,
+            cpu,
+            _fused_steps("cpu"),
+            "cpu",
+            lr=torch.tensor(lr),
+            grad_scale=torch.tensor(4.0),
+            found_inf=torch.tensor(found_inf),
+            **kwargs,
+        )
+        _assert_lists_close(mojo, cpu, torch.float32)
+        if found_inf == 1.0:
+            _assert_lists_close(mojo, lists, torch.float32, exact=True)
+
+
+@pytest.mark.parametrize(
+    ("name", "n_lists", "kwargs"), _FUSED_CASES, ids=_FUSED_CASE_IDS
+)
+def test_fused_optimizer_functional_and_out_variants(
+    mojo_gpu: str, name: str, n_lists: int, kwargs: dict[str, float | bool]
+):
+    """The autogen `_fused_*` (functional) and `.out` overloads compose over
+    the in-place kernel."""
+    lists = _fused_lists(name, n_lists, torch.float32)
+    cpu, mojo = _to(lists, "cpu"), _to(lists, mojo_gpu)
+    functional = name.rstrip("_")
+    fn = getattr(torch.ops.aten, functional)
+
+    def call(ls, device):
+        steps = _fused_steps(device)
+        if name in ("_fused_adam_", "_fused_adamw_"):
+            maxs = ls[4] if len(ls) > 4 else []
+            return fn(ls[0], ls[1], ls[2], ls[3], maxs, steps, **kwargs)
+        if name == "_fused_sgd_":
+            return fn(ls[0], ls[1], ls[2] if len(ls) > 2 else [], **kwargs)
+        return fn(ls[0], ls[1], ls[2], steps, **kwargs)
+
+    expected = call(cpu, "cpu")
+    with ran(f"aten::{name}"):
+        actual = call(mojo, mojo_gpu)
+    for a_group, e_group in zip(actual, expected, strict=True):
+        for a, e in zip(a_group, e_group, strict=True):
+            rtol, atol = _fused_tolerance(torch.float32)
+            torch.testing.assert_close(a.cpu(), e, rtol=rtol, atol=atol)
+    # The functional form leaves its inputs alone.
+    _assert_lists_close(mojo, lists, torch.float32, exact=True)
+
+
+@pytest.mark.parametrize("out_mode", ["fresh", "alias_self"])
+@pytest.mark.parametrize(
+    ("name", "n_lists", "kwargs"), _FUSED_CASES, ids=_FUSED_CASE_IDS
+)
+def test_fused_optimizer_out_variants(
+    mojo_gpu: str,
+    name: str,
+    n_lists: int,
+    kwargs: dict[str, float | bool],
+    out_mode: str,
+):
+    """The autogen `.out` (and `.tensor_lr_out`) overloads: `self` is read
+    only, the state lists are updated in place, the new params land in the
+    caller's `out` tensors (their storage kept), and `out` may be `self`
+    itself."""
+    lists = _fused_lists(name, n_lists, torch.float32)
+    packet = getattr(torch.ops.aten, name.rstrip("_"))
+    kwargs = dict(kwargs)
+    lr = kwargs.pop("lr")
+    results = {}
+    for device in ("cpu", mojo_gpu):
+        ls = _to(lists, device)
+        if out_mode == "alias_self":
+            out = ls[0]
+        else:
+            out = [torch.full_like(t, 7.0) for t in ls[0]]
+        ptrs = [t.data_ptr() for t in out]
+        steps = _fused_steps(device)
+        for overload, lr_value in (("out", lr), ("tensor_lr_out", torch.tensor(lr))):
+            fn = getattr(packet, overload)
+            if name in ("_fused_adam_", "_fused_adamw_"):
+                maxs = ls[4] if len(ls) > 4 else []
+                args = (ls[0], ls[1], ls[2], ls[3], maxs, steps)
+            elif name == "_fused_sgd_":
+                args = (ls[0], ls[1], ls[2] if len(ls) > 2 else [])
+            else:
+                args = (ls[0], ls[1], ls[2], steps)
+            if device == "cpu":
+                fn(*args, lr=lr_value, out=out, **kwargs)
+            else:
+                with ran(f"aten::{name}", f"aten::{name}.tensor_lr"):
+                    fn(*args, lr=lr_value, out=out, **kwargs)
+        assert [t.data_ptr() for t in out] == ptrs
+        results[device] = (ls, out)
+    (cpu_ls, cpu_out), (mojo_ls, mojo_out) = results["cpu"], results[mojo_gpu]
+    _assert_lists_close([mojo_out], [cpu_out], torch.float32)
+    _assert_lists_close(mojo_ls, cpu_ls, torch.float32)
+    if out_mode == "fresh":
+        # `self` is not written by the out= form.
+        _assert_lists_close([mojo_ls[0]], [lists[0]], torch.float32, exact=True)
+
+
+def _alias_pairs(n_lists: int) -> list[tuple[int, int]]:
+    return [(i, j) for i in range(n_lists) for j in range(i + 1, n_lists)]
+
+
+_ALIAS_CASES = [
+    (name, n_lists, kwargs, pair)
+    for (name, n_lists, kwargs), case_id in zip(
+        _FUSED_CASES, _FUSED_CASE_IDS, strict=True
+    )
+    if case_id in ("adam-amsgrad-max", "adamw-amsgrad", "sgd-momentum", "adagrad")
+    for pair in _alias_pairs(n_lists)
+]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs stock CUDA")
+@pytest.mark.parametrize(("name", "n_lists", "kwargs", "pair"), _ALIAS_CASES)
+def test_fused_optimizer_aliased_lists_match_stock_cuda(
+    mojo_gpu: str,
+    name: str,
+    n_lists: int,
+    kwargs: dict[str, float | bool],
+    pair: tuple[int, int],
+):
+    """Every pair of tensor lists passed as the same tensors: the functor
+    loads every operand before storing any, and stores in its fixed order,
+    so the list CUDA writes last is what survives."""
+    lists = _fused_lists(name, n_lists, torch.float32)
+    lists[pair[1]] = lists[pair[0]]
+    out = {}
+    for device in ("cuda", mojo_gpu):
+        ls = [[t.clone().to(device) for t in group] for group in lists]
+        ls[pair[1]] = ls[pair[0]]
+        _call_fused(
+            name,
+            ls,
+            _fused_steps(device),
+            device,
+            grad_scale=torch.tensor(4.0, device=device),
+            **kwargs,
+        )
+        out[device] = ls
+    # Aliasing a gradient with a sum of squares can take a square root of a
+    # negative sum: NaN on both sides.
+    rtol, atol = _fused_tolerance(torch.float32)
+    for a_group, e_group in zip(out[mojo_gpu], out["cuda"], strict=True):
+        for a, e in zip(a_group, e_group, strict=True):
+            torch.testing.assert_close(
+                a.cpu(), e.cpu(), rtol=rtol, atol=atol, equal_nan=True
+            )
+
+
+def test_fused_optimizer_aliased_lists_keep_the_last_store(mojo_gpu: str):
+    """The same, CUDA-free, on two hand-computed cases."""
+    # AMSGrad with max_exp_avg_sqs == exp_avg_sqs: exp_avg_sq decays to 5,
+    # the max (10) is stored after it and survives.
+    sq = [torch.full((5,), 10.0, device=mojo_gpu)]
+    params = [torch.ones(5, device=mojo_gpu)]
+    _call_fused(
+        "_fused_adam_",
+        [
+            params,
+            [torch.zeros(5, device=mojo_gpu)],
+            [torch.zeros(5, device=mojo_gpu)],
+            sq,
+            sq,
+        ],
+        [torch.tensor(1.0, device=mojo_gpu)],
+        mojo_gpu,
+        lr=0.1,
+        beta1=0.9,
+        beta2=0.5,
+        weight_decay=0.0,
+        eps=1e-8,
+        amsgrad=True,
+        maximize=False,
+    )
+    assert torch.equal(sq[0].cpu(), torch.full((5,), 10.0))
+    # SGD with grads == momentum buffers and grad_scale: the momentum update
+    # reads the buffer as loaded (2), not the unscaled grad stored first
+    # (0.5); the buffer (0.9 * 2 + 0.5) is stored last.
+    shared = [torch.full((5,), 2.0, device=mojo_gpu)]
+    params = [torch.ones(5, device=mojo_gpu)]
+    torch._fused_sgd_(
+        params,
+        shared,
+        shared,
+        weight_decay=0.0,
+        momentum=0.9,
+        lr=0.1,
+        dampening=0.0,
+        nesterov=False,
+        maximize=False,
+        is_first_step=False,
+        grad_scale=torch.tensor(4.0, device=mojo_gpu),
+    )
+    torch.testing.assert_close(shared[0].cpu(), torch.full((5,), 2.3))
+    torch.testing.assert_close(params[0].cpu(), torch.full((5,), 1 - 0.1 * 2.3))
+
+
+@pytest.mark.parametrize("name", ["_fused_adam_", "_fused_adamw_", "_fused_adagrad_"])
+def test_fused_optimizer_requires_one_step_per_tensor(mojo_gpu: str, name: str):
+    """An empty (or short) state_steps list is refused before any launch:
+    the kernel reads one step per tensor."""
+    n_lists = 3 if name == "_fused_adagrad_" else 4
+    lists = _to(_fused_lists(name, n_lists, torch.float32), mojo_gpu)
+    kwargs = (
+        dict(lr=0.1, lr_decay=0.0, weight_decay=0.0, eps=1e-10, maximize=False)
+        if name == "_fused_adagrad_"
+        else dict(
+            lr=0.1,
+            beta1=0.9,
+            beta2=0.99,
+            weight_decay=0.0,
+            eps=1e-8,
+            amsgrad=False,
+            maximize=False,
+        )
+    )
+    for steps in ([], _fused_steps(mojo_gpu)[:2]):
+        with pytest.raises(RuntimeError, match="same number of tensors"):
+            _call_fused(name, lists, steps, mojo_gpu, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "lr",
+    [
+        torch.tensor(0.05, dtype=torch.float16),
+        torch.tensor(0.05, dtype=torch.bfloat16),
+        torch.tensor(1, dtype=torch.int64),
+        torch.tensor(True),
+        torch.tensor(0.05, dtype=torch.float64),
+    ],
+    ids=["f16", "bf16", "int64", "bool", "f64"],
+)
+def test_fused_optimizer_cpu_lr_of_any_dtype(mojo_gpu: str, lr: torch.Tensor):
+    """A CPU lr tensor is `lr.item<double>()`, whatever its dtype."""
+    lists = _fused_lists("_fused_sgd_", 2, torch.float32)
+    cpu, mojo = _to(lists, "cpu"), _to(lists, mojo_gpu)
+    kwargs = dict(
+        weight_decay=0.0,
+        momentum=0.0,
+        dampening=0.0,
+        nesterov=False,
+        maximize=False,
+        is_first_step=False,
+    )
+    _call_fused("_fused_sgd_", mojo, [], mojo_gpu, lr=lr, **kwargs)
+    _call_fused("_fused_sgd_", cpu, [], "cpu", lr=lr.item(), **kwargs)
+    _assert_lists_close(mojo, cpu, torch.float32)
+
+
+def _bf16_round(x: torch.Tensor) -> torch.Tensor:
+    return x.to(torch.bfloat16).to(torch.float32)
+
+
+def _fma32(a, b, c) -> torch.Tensor:
+    """float32 fma: the double product of two floats is exact."""
+    return (
+        torch.as_tensor(a, dtype=torch.float64) * torch.as_tensor(b).double()
+        + torch.as_tensor(c).double()
+    ).float()
+
+
+@pytest.mark.parametrize("amsgrad", [False, True])
+@pytest.mark.parametrize("name", ["_fused_adam_", "_fused_adamw_"])
+def test_fused_adam_mixed_precision_matches_cuda_math(
+    mojo_gpu: str, name: str, amsgrad: bool
+):
+    """float32 params and grads with bfloat16 states (CUDA's
+    FusedAdamMathFunctorMP; CPU has no such mode): bias corrections in
+    double, the update in float32, states rounded to bfloat16 on store."""
+    lists = _fused_lists(name, 5 if amsgrad else 4, torch.float32, torch.bfloat16)
+    mojo = _to(lists, mojo_gpu)
+    steps = [3.0, 1.0, 5.0, 11.0, 17.0]
+    lr, beta1, beta2, wd, eps = 0.02, 0.85, 0.97, 0.1, 1e-8
+    with ran(f"aten::{name}"):
+        _call_fused(
+            name,
+            mojo,
+            [torch.tensor(s, device=mojo_gpu) for s in steps],
+            mojo_gpu,
+            lr=lr,
+            beta1=beta1,
+            beta2=beta2,
+            weight_decay=wd,
+            eps=eps,
+            amsgrad=amsgrad,
+            maximize=False,
+        )
+    f = torch.float32
+    for i, step in enumerate(steps):
+        p, g = lists[0][i].float(), lists[1][i].float()
+        m, v = lists[2][i].float(), lists[3][i].float()
+        bc1 = torch.tensor(1 - beta1**step, dtype=f)
+        bc2s = torch.tensor((1 - beta2**step) ** 0.5, dtype=f)
+        b1, b2 = torch.tensor(beta1, dtype=f), torch.tensor(beta2, dtype=f)
+        if name == "_fused_adam_":
+            g = g + p * torch.tensor(wd, dtype=f)
+        else:
+            p = p - torch.tensor(lr, dtype=f) * torch.tensor(wd, dtype=f) * p
+        m = _fma32(b1, m, _fma32(-b1, g, g))
+        v = _fma32(b2, v, _fma32(-b2, g * g, g * g))
+        denom_src = v
+        if amsgrad:
+            mx = torch.maximum(lists[4][i].float(), v)
+            denom_src = mx
+            torch.testing.assert_close(mojo[4][i].cpu().float(), _bf16_round(mx))
+        denom = denom_src.sqrt() / bc2s + torch.tensor(eps, dtype=f)
+        p = p - (torch.tensor(lr, dtype=f) / bc1) * m / denom
+        torch.testing.assert_close(mojo[0][i].cpu(), p, rtol=4e-6, atol=4e-7)
+        assert mojo[2][i].dtype == torch.bfloat16
+        torch.testing.assert_close(mojo[2][i].cpu().float(), _bf16_round(m))
+        torch.testing.assert_close(mojo[3][i].cpu().float(), _bf16_round(v))
+
+
+def _torch_at_least(major: int, minor: int) -> bool:
+    version = torch.__version__.split("+")[0].split(".")
+    return (int(version[0]), int(version[1])) >= (major, minor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs stock CUDA")
+@pytest.mark.parametrize("dtype_id", ["f32", "f16", "bf16", "f64", "f32-bf16"])
+@pytest.mark.parametrize(
+    ("name", "n_lists", "kwargs"), _FUSED_CASES, ids=_FUSED_CASE_IDS
+)
+def test_fused_optimizer_matches_stock_cuda(
+    mojo_gpu: str,
+    name: str,
+    n_lists: int,
+    kwargs: dict[str, float | bool],
+    dtype_id: str,
+):
+    """Against stock torch's own CUDA kernels. Not bit for bit: nvcc contracts
+    `grad + param * weight_decay` and SGD's momentum update into an fma in
+    some ILP lanes and code paths and not in others (read off the sm_90 SASS
+    of FusedAdamMathFunctor<float, 4, ORIGINAL>: lane 0 of the unscaled path
+    is a mul then an add, lanes 1-3 an fma), so a result can sit an ulp or so
+    away where that choice differs."""
+    if dtype_id == "f32-bf16":
+        if name not in ("_fused_adam_", "_fused_adamw_"):
+            pytest.skip("mixed precision is an Adam/AdamW mode")
+        if not _torch_at_least(2, 14):
+            pytest.skip("stock torch has mixed-precision fused Adam from 2.14")
+        lists = _fused_lists(name, n_lists, torch.float32, torch.bfloat16)
+    else:
+        lists = _fused_lists(name, n_lists, _FUSED_DTYPES[dtype_id])
+    for scaled in (False, True):
+        extra = {}
+        if scaled:
+            extra = dict(grad_scale=4.0, found_inf=0.0)
+        cuda, mojo = _to(lists, "cuda"), _to(lists, mojo_gpu)
+        for device, ls in (("cuda", cuda), (mojo_gpu, mojo)):
+            _call_fused(
+                name,
+                ls,
+                _fused_steps(device),
+                device,
+                **kwargs,
+                **{k: torch.tensor(v, device=device) for k, v in extra.items()},
+            )
+        for a_group, e_group in zip(mojo, cuda, strict=True):
+            for a, e in zip(a_group, e_group, strict=True):
+                if e.numel() == 0:
+                    continue
+                eps = torch.finfo(a.dtype).eps
+                scale = e.abs().max().item()
+                torch.testing.assert_close(
+                    a.cpu(), e.cpu(), rtol=4 * eps, atol=4 * eps * scale
+                )
+
+
+def test_fused_optimizer_errors_match_cuda(mojo_gpu: str):
+    params = [torch.ones(3, device=mojo_gpu), torch.ones(4, device=mojo_gpu)]
+    grads = [torch.ones_like(p) for p in params]
+    steps = [torch.tensor(1.0, device=mojo_gpu) for _ in params]
+    adam = dict(
+        lr=0.1,
+        beta1=0.9,
+        beta2=0.99,
+        weight_decay=0.0,
+        eps=1e-8,
+        amsgrad=False,
+        maximize=False,
+    )
+
+    # A dtype mismatch across lists, and a non-dense tensor.
+    with pytest.raises(RuntimeError, match="must have same dtype, device, and layout"):
+        _call_fused(
+            "_fused_adam_",
+            [params, [g.half() for g in grads], params, params],
+            steps,
+            mojo_gpu,
+            **adam,
+        )
+    # float32 params with other states is the mixed-precision mode, which
+    # takes bfloat16 states only.
+    with pytest.raises(
+        RuntimeError,
+        match="Mixed-precision fused Adam requires bfloat16 optimizer states, got Half",
+    ):
+        halves = [p.half() for p in params]
+        _call_fused(
+            "_fused_adam_", [params, grads, halves, halves], steps, mojo_gpu, **adam
+        )
+    strided = [torch.ones(6, device=mojo_gpu)[::2], torch.ones(4, device=mojo_gpu)]
+    with pytest.raises(RuntimeError, match="must have same dtype, device, and layout"):
+        _call_fused(
+            "_fused_adamw_", [strided, grads, params, params], steps, mojo_gpu, **adam
+        )
+    # Mixed precision is float32 params with bfloat16 states only.
+    halves = [p.half() for p in params]
+    with pytest.raises(
+        RuntimeError,
+        match="Mixed-precision fused Adam requires float32 params, got Half",
+    ):
+        _call_fused(
+            "_fused_adam_",
+            [halves, [g.half() for g in grads], params, params],
+            steps,
+            mojo_gpu,
+            **adam,
+        )
+    # Integer params: the dispatch has no such kernel.
+    ints = [p.int() for p in params]
+    with pytest.raises(
+        RuntimeError, match="\"fused_adagrad_kernel_cuda\" not implemented for 'Int'"
+    ):
+        torch._fused_adagrad_(
+            ints,
+            [p.int() for p in params],
+            [p.int() for p in params],
+            steps,
+            lr=0.1,
+            lr_decay=0.0,
+            weight_decay=0.0,
+            eps=1e-10,
+            maximize=False,
+        )
+    with pytest.raises(RuntimeError, match="found_inf must be on the same GPU"):
+        torch._fused_adagrad_(
+            params,
+            grads,
+            [torch.zeros_like(p) for p in params],
+            steps,
+            lr=torch.tensor(0.1, device=mojo_gpu),
+            lr_decay=0.0,
+            weight_decay=0.0,
+            eps=1e-10,
+            maximize=False,
+            found_inf=torch.tensor(0.0),
+        )
+    with pytest.raises(RuntimeError, match="grad_scale must be on the same GPU"):
+        torch._fused_sgd_(
+            params,
+            grads,
+            [],
+            weight_decay=0.0,
+            momentum=0.0,
+            lr=0.1,
+            dampening=0.0,
+            nesterov=False,
+            maximize=False,
+            is_first_step=False,
+            grad_scale=torch.tensor(1.0),
+        )
+    with pytest.raises(RuntimeError, match=r"momentum > 0"):
+        torch._fused_sgd_(
+            params,
+            grads,
+            [torch.zeros_like(p) for p in params],
+            weight_decay=0.0,
+            momentum=0.0,
+            lr=0.1,
+            dampening=0.0,
+            nesterov=False,
+            maximize=False,
+            is_first_step=False,
+        )
+    with pytest.raises(RuntimeError, match=r"momentum == 0"):
+        torch._fused_sgd_(
+            params,
+            grads,
+            [],
+            weight_decay=0.0,
+            momentum=0.9,
+            lr=0.1,
+            dampening=0.0,
+            nesterov=False,
+            maximize=False,
+            is_first_step=False,
+        )
+
+
+def _optimizer_run(
+    device: str, make, dtype: torch.dtype, steps: int, scaler: bool = False
+) -> tuple[list[torch.Tensor], dict[int, dict[str, torch.Tensor]]]:
+    initial = [
+        torch.linspace(-1.0, 1.0, 31, dtype=torch.float64),
+        torch.linspace(0.5, -0.75, 35, dtype=torch.float64).reshape(5, 7),
+        torch.linspace(0.1, 0.3, 12, dtype=torch.float64).reshape(4, 3).t(),
+    ]
+    # On the CPU, reduced-precision runs are emulated the way CUDA computes
+    # them: float32 math on the stored values, every result rounded to `dtype`
+    # after each step (CPU's own reduced-precision fused SGD is broken).
+    emulate = device == "cpu" and dtype in (torch.float16, torch.bfloat16)
+    work = torch.float32 if emulate else dtype
+    params = [torch.nn.Parameter(v.to(dtype).to(work).to(device)) for v in initial]
+    optimizer = make(params)
+    grad_scaler = None
+    if scaler:
+        grad_scaler = torch.amp.GradScaler(
+            torch.device(device).type, init_scale=2.0**8, growth_interval=2
+        )
+        grad_scaler.scale(torch.ones((), device=device))  # its lazy init
+    for step in range(steps):
+        for index, p in enumerate(params):
+            # Bounded away from -weight_decay * param: a gradient that the
+            # decay cancels to ~0 makes Adagrad's g / sqrt(g * g) ill-posed.
+            grad = torch.linspace(
+                0.15 + step * 0.03, 0.45 - index * 0.02, p.numel(), dtype=torch.float64
+            )
+            if grad_scaler is not None:
+                grad = grad * grad_scaler.get_scale()
+                if step == 2:
+                    grad[0] = float("inf")  # a skipped step
+            grad = grad.reshape(p.shape).to(dtype).to(work)
+            p.grad = torch.empty_like(p).copy_(grad)  # the param's layout
+        if grad_scaler is not None:
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+        else:
+            optimizer.step()
+        if emulate:
+            with torch.no_grad():
+                for p in params:
+                    p.copy_(p.to(dtype))
+                    for key, value in optimizer.state[p].items():
+                        if key != "step" and isinstance(value, torch.Tensor):
+                            value.copy_(value.to(dtype))
+    state = {
+        i: {
+            k: v.to(dtype) if emulate and k != "step" else v
+            for k, v in optimizer.state[p].items()
+        }
+        for i, p in enumerate(params)
+    }
+    return [p.detach().cpu().to(dtype) for p in params], state
+
+
+_OPTIMIZERS = {
+    "adam-amsgrad-wd-max": (
+        lambda ps: torch.optim.Adam(
+            ps,
+            lr=0.02,
+            betas=(0.8, 0.95),
+            weight_decay=0.1,
+            amsgrad=True,
+            maximize=True,
+            fused=True,
+        ),
+        "aten::_fused_adam_",
+    ),
+    "adamw": (
+        lambda ps: torch.optim.AdamW(
+            ps, lr=0.02, betas=(0.8, 0.95), weight_decay=0.1, fused=True
+        ),
+        "aten::_fused_adamw_",
+    ),
+    "sgd-nesterov": (
+        lambda ps: torch.optim.SGD(
+            ps, lr=0.05, momentum=0.9, nesterov=True, weight_decay=0.01, fused=True
+        ),
+        "aten::_fused_sgd_",
+    ),
+    "sgd-dampening-max": (
+        lambda ps: torch.optim.SGD(
+            ps, lr=0.05, momentum=0.5, dampening=0.2, maximize=True, fused=True
+        ),
+        "aten::_fused_sgd_",
+    ),
+    "sgd-plain": (
+        lambda ps: torch.optim.SGD(ps, lr=0.05, fused=True),
+        "aten::_fused_sgd_",
+    ),
+    "adagrad": (
+        lambda ps: torch.optim.Adagrad(
+            ps, lr=0.05, lr_decay=0.01, weight_decay=0.1, fused=True
+        ),
+        "aten::_fused_adagrad_",
+    ),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ["f32", "f16", "bf16"])
+@pytest.mark.parametrize("opt_id", list(_OPTIMIZERS))
+def test_fused_torch_optim_matches_cpu(mojo_gpu: str, opt_id: str, dtype_id: str):
+    """`torch.optim.*(fused=True)` end to end over several steps, against the
+    same optimizer's fused CPU kernels."""
+    make, op_name = _OPTIMIZERS[opt_id]
+    dtype = _FUSED_DTYPES[dtype_id]
+    with ran(op_name):
+        params, state = _optimizer_run(mojo_gpu, make, dtype, steps=4)
+    cpu_params, cpu_state = _optimizer_run("cpu", make, dtype, steps=4)
+    rtol, atol = _fused_tolerance(dtype)
+    if dtype != torch.float32:
+        rtol, atol = 2 * torch.finfo(dtype).eps, 1e-5
+    for actual, expected in zip(params, cpu_params, strict=True):
+        assert actual.stride() == expected.stride()
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    for i, s in state.items():
+        for key, value in s.items():
+            assert value.device == torch.device(mojo_gpu)
+            torch.testing.assert_close(
+                value.cpu(), cpu_state[i][key], rtol=rtol, atol=atol
+            )
+
+
+@pytest.mark.parametrize("opt_id", ["adam-amsgrad-wd-max", "sgd-nesterov", "adagrad"])
+def test_fused_torch_optim_with_grad_scaler_matches_cpu(mojo_gpu: str, opt_id: str):
+    """GradScaler hands fused optimizers grad_scale/found_inf (no host sync):
+    the unscale happens in the kernel, an inf step is skipped."""
+    skip_if_metal(mojo_gpu, "GradScaler needs float64")
+    make, op_name = _OPTIMIZERS[opt_id]
+    with ran(op_name):
+        params, _ = _optimizer_run(mojo_gpu, make, torch.float32, steps=5, scaler=True)
+    cpu_params, _ = _optimizer_run("cpu", make, torch.float32, steps=5, scaler=True)
+    rtol, atol = _fused_tolerance(torch.float32)
+    for actual, expected in zip(params, cpu_params, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs stock CUDA")
+@pytest.mark.parametrize(
+    ("name", "n_lists", "kwargs"), _FUSED_CASES, ids=_FUSED_CASE_IDS
+)
+def test_fused_optimizer_nonfinite_matches_stock_cuda(
+    mojo_gpu: str, name: str, n_lists: int, kwargs: dict[str, float | bool]
+):
+    """NaN / inf in every operand propagate as on CUDA (amsgrad's
+    `std::max` keeps a NaN running max, 0 * inf is NaN, ...)."""
+    nan, inf = float("nan"), float("inf")
+    rows = [
+        [1.0, 1.0, 1.0, 1.0, 1.0, nan, 0.0, 1.0],
+        [nan, inf, -inf, 0.0, 1.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, nan, 0.0, 0.0, inf, 0.0],
+        [0.0, 0.0, 0.0, 0.0, nan, 0.0, 0.0, 0.1],
+        [nan, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, nan],
+    ]
+    out = {}
+    for device in ("cuda", mojo_gpu):
+        lists = [[torch.tensor(row, device=device)] for row in rows[:n_lists]]
+        steps = [torch.tensor(2.0, device=device)]
+        _call_fused(name, lists, steps, device, **kwargs)
+        out[device] = lists
+    for a, e in zip(out[mojo_gpu], out["cuda"], strict=True):
+        torch.testing.assert_close(a[0].cpu(), e[0].cpu(), equal_nan=True)

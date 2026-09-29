@@ -28,6 +28,7 @@ from tmb.backend.abi import (
     ST_FLOAT64,
     ST_INT32,
     ST_INT64,
+    ST_UINT8,
     T,
     Value,
     Values,
@@ -35,6 +36,7 @@ from tmb.backend.abi import (
     cpu_empty,
     dtype_code,
     call_op,
+    index_error,
     int_arg,
     contiguous_strides,
     new_like,
@@ -54,11 +56,13 @@ from tmb.backend.abi import (
     v_int,
     v_is_none,
     v_tensor,
+    view_strided,
 )
 from tmb.backend.device import copy_d2d, copy_to_host, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK, _device_attr_cached
 from tmb.ops.common import (
+    assert_no_internal_overlap,
     broadcast_shape,
     cast_to,
     contiguous,
@@ -66,6 +70,7 @@ from tmb.ops.common import (
     fill_value,
     philox_reserve,
     resize_out,
+    shares_storage,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
@@ -617,8 +622,81 @@ def op_bernoulli_tensor(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var p_in = v_tensor(args[unsafe_offset=1])
-    var generator = v_generator(args[unsafe_offset=2])
+    _bernoulli_tensor_into(
+        t, v_tensor(args[unsafe_offset=1]), v_generator(args[unsafe_offset=2])
+    )
+    ret_ref(rets, 0, t)
+
+
+# aten::bernoulli.out(Tensor self, *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)
+def op_bernoulli_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """Distributions.cpp's bernoulli_out: `out.resize_(self.sizes())`, then
+    `out.bernoulli_(self)` -- self is the probability tensor."""
+    var p = v_tensor(args[unsafe_offset=0])
+    var generator = v_generator(args[unsafe_offset=1])
+    var out = v_tensor(args[unsafe_offset=2])
+    if not out.on_mojo() or out.device != p.device:
+        raise Error("expected `out` on the probabilities' mojo device")
+    _check_device_dtype(out, "bernoulli_", False)
+    if not _is_floating(p.dtype):
+        raise Error(
+            "expected probabilities tensor to have floating type, got ",
+            String(p.dtype),
+        )
+    if not out.same_shape(p) and shares_storage(out, p):
+        # A resize may reallocate the storage p reads from: draw into a
+        # fresh tensor first, then resize and copy.
+        var tmp = own(new_tensor(p.shape, p.rank, out.stype, p.device))
+        _bernoulli_tensor_into(tmp.t, p, generator)
+        resize_out(out, p.shape, p.rank)
+        copy_strided_into(out, tmp.t)
+        _ = tmp^
+        ret_ref(rets, 0, out)
+        return
+    resize_out(out, p.shape, p.rank)
+    assert_no_internal_overlap(out)
+    _bernoulli_tensor_into(out, p, generator)
+    ret_ref(rets, 0, out)
+
+
+def _check_probabilities(p_in: T) raises:
+    """bernoulli_tensor's value check, `0 <= p <= 1` for every element (NaN
+    fails): CPU raises it; CUDA device-asserts, which aborts the context.
+    Raised like CPU, from one flag the device sets and a 4-byte readback."""
+    if p_in.numel == 0:
+        return
+    var st = ST_FLOAT64 if p_in.stype == ST_FLOAT64 else ST_FLOAT32
+    var pc = own_if_new(cast_to(p_in, st), p_in)
+    var dense = own_if_new(contiguous(pc.t), pc.t)
+    var flag = own(new_tensor(IndexList[MAX_RANK](1), 0, ST_INT32, p_in.device))
+    fill_value(flag.t, 0.0)
+    var ctx = ctx_for(p_in.device)
+    var call = KernelCall("random", "ProbCheck")
+    call.arg_dtype(0, dense.t.dtype)
+    call.int(dense.t.ptr)
+    call.int(flag.t.ptr)
+    call.int(dense.t.numel)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    _ = dense^
+    _ = pc^
+    var bad = call_op(
+        "aten::_local_scalar_dense", "", [_tensor_value(flag.t)], 1
+    )
+    _ = flag^
+    if v_int(bad[0]) != 0:
+        raise Error(
+            "Expected p_in >= 0 && p_in <= 1 to be true, but got false.  (Could"
+            " this error message be improved?  If so, please report an"
+            " enhancement request to PyTorch.)"
+        )
+
+
+def _bernoulli_tensor_into(t: T, p_in: T, generator: Int) raises:
+    """`t.bernoulli_(p_in)`: bernoulli_tensor_cuda_kernel's draw."""
     _check_device_dtype(t, "bernoulli_", False)
     if not _is_floating(p_in.dtype):
         raise Error(
@@ -628,8 +706,10 @@ def op_bernoulli_tensor(
     if p_in.device != t.device:
         unsupported("bernoulli_.Tensor with p on another device")
     if t.numel == 0:
-        ret_ref(rets, 0, t)
+        # CPU and CUDA alike return an empty self before any value is read
+        # (empty(0).bernoulli_(tensor(2.)) is empty(0)).
         return
+    _check_probabilities(p_in)
     for i in range(t.rank):
         if t.dim(i) > 1 and t.stride(i) == 0:
             raise Error(
@@ -740,7 +820,6 @@ def op_bernoulli_tensor(
         copy_strided_into(t, dst.t)
     _ = dst^
     _ = p^  # alive past the launch
-    ret_ref(rets, 0, t)
 
 
 # ---------------------------------------------------------------------------
@@ -1090,14 +1169,51 @@ def op_native_dropout(
         ret_owned(rets, 0, output)
         ret_owned(rets, 1, mask)
         return
+    _dropout_cuda(a, 1.0 - p, 0, ST_BOOL, rets)
+
+
+# aten::_fused_dropout(Tensor self, float p, Generator? generator=None) -> (Tensor, Tensor)
+def op_fused_dropout(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """Dropout.cu's fused_dropout_cuda: `dropout_cuda<uint8_t>` with `p` the
+    KEEP probability, an explicit generator, no range check and no
+    shortcut (p = 0 keeps nothing and scales by 1 / 0, as on CUDA)."""
+    var a = v_tensor(args[unsafe_offset=0])
+    if not _dropout_dtype_ok(a.dtype):
+        raise Error(
+            '"fused_dropout" not implemented for \'',
+            _scalar_type_name(a.dtype),
+            "'",
+        )
+    if a.dtype == DType.float64 and dev(a.device)[].api == "metal":
+        unsupported("_fused_dropout of dtype float64 on Apple GPU")
+    var keep = v_f64(args[unsafe_offset=1])
+    var generator = v_generator(args[unsafe_offset=2])
+    if a.numel == 0:
+        # `self.clone()` and an empty mask.
+        var output = own(new_like(a))
+        var mask = own(new_tensor(a.shape, a.rank, ST_UINT8, a.device))
+        ret_owned(rets, 0, output)
+        ret_owned(rets, 1, mask)
+        return
+    _dropout_cuda(a, keep, generator, ST_UINT8, rets)
+
+
+def _dropout_cuda(
+    a: T, keep: Float64, generator: Int, mask_st: Int32, rets: Values
+) raises:
+    """Dropout.cu's `dropout_cuda<mask_t>` over a non-empty floating `a`:
+    (output, mask) into rets 0 and 1. The mask is one 0/1 byte per element
+    whether it is bool (native_dropout) or uint8 (_fused_dropout)."""
     # empty_like preserves a dense layout; anything else comes out contiguous.
     var dense = _is_dense(a)
     var output = own(
         new_strided(a.shape, a.strides, a.rank, a.stype, a.device)
     ) if dense else own(new_like(a))
     var mask = own(
-        new_strided(a.shape, a.strides, a.rank, ST_BOOL, a.device)
-    ) if dense else own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
+        new_strided(a.shape, a.strides, a.rank, mask_st, a.device)
+    ) if dense else own(new_tensor(a.shape, a.rank, mask_st, a.device))
     # get_vector_size: alignment of the input pointer, capped at 16 bytes,
     # halved until it divides numel.
     var vec = 1
@@ -1112,7 +1228,7 @@ def op_native_dropout(
             vec //= 2
     var grid = _grid(a.device, a.numel)
     var seed_offset = philox_reserve(
-        0, a.device, _counter_offset(a.numel, grid, 4)
+        generator, a.device, _counter_offset(a.numel, grid, 4)
     )
     var in_ls = _logical_lists(a)
     var out_ls = _logical_lists(output.t)
@@ -1130,7 +1246,7 @@ def op_native_dropout(
     call.tuple(out_ls[1])
     call.int(vec)
     call.int(grid)
-    call.f64(1.0 - p)
+    call.f64(keep)
     call.int(Int(seed_offset[0] & 0xFFFFFFFF))
     call.int(Int((seed_offset[0] >> 32) & 0xFFFFFFFF))
     call.int(Int(seed_offset[1] & 0xFFFFFFFF))
@@ -1415,6 +1531,215 @@ def op_multinomial_out(
     ret_ref(rets, 0, out)
 
 
+# ---------------------------------------------------------------------------
+# _fill_mem_eff_dropout_mask_ (transformers/cuda/attention.cu): the uniform
+# draws the memory-efficient attention kernel keeps for an explicit
+# (seed, offset), bit-identical to CUDA's rand_uniform_kernel.
+# ---------------------------------------------------------------------------
+
+
+# aten::_fill_mem_eff_dropout_mask_(Tensor(a!) self, float dropout_p, int seed, int offset) -> Tensor(a!)
+def op_fill_mem_eff_dropout_mask_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    if not t.contig:
+        raise Error(
+            "Expected self.is_contiguous() to be true, but got false.  (Could"
+            " this error message be improved?  If so, please report an"
+            " enhancement request to PyTorch.)"
+        )
+    if t.dtype != DType.float32:
+        raise Error(
+            "Expected self.dtype() == at::ScalarType::Float to be true, but"
+            " got false.  (Could this error message be improved?  If so,"
+            " please report an enhancement request to PyTorch.)"
+        )
+    if t.rank < 4:
+        index_error(
+            "Dimension out of range (expected to be in range of ["
+            + String(-max(t.rank, 1))
+            + ", "
+            + String(max(t.rank, 1) - 1)
+            + "], but got 3)"
+        )
+    var seed = v_int(args[unsafe_offset=2])
+    var offset = v_int(args[unsafe_offset=3])
+    if t.numel > 0:
+        var ctx = ctx_for(t.device)
+        var call = KernelCall("dropout", "FillMemEffDropoutMask")
+        call.int(t.ptr)
+        call.int(t.numel)
+        call.int(seed)
+        call.int(offset)
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+    ret_ref(rets, 0, t)
+
+
+# ---------------------------------------------------------------------------
+# poisson / _standard_gamma / binomial: one rejection sampler per element
+# (tmb/kernels/random/sampler_kernels.mojo). Same distribution and generator
+# advance as stock CUDA, not its bits (its kernels key the stream by thread).
+# ---------------------------------------------------------------------------
+
+
+def _sampler_dtype_check(name: StaticString, t: T) raises:
+    """AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16) of the CUDA kernel."""
+    if not _dropout_dtype_ok(t.dtype):
+        raise Error(
+            '"',
+            name,
+            "\" not implemented for '",
+            _scalar_type_name(t.dtype),
+            "'",
+        )
+    if t.dtype == DType.float64 and dev(t.device)[].api == "metal":
+        unsupported(String(name) + " of dtype float64 on Apple GPU")
+
+
+def _expanded_dense(
+    t: T, shape: IndexList[MAX_RANK], rank: Int
+) raises -> Owned:
+    """`t` broadcast to `shape` as a dense contiguous tensor (a fresh copy
+    unless it already is exactly that)."""
+    if t.contig and t.rank == rank:
+        var same = True
+        for i in range(MAX_RANK):
+            if t.shape[i] != shape[i]:
+                same = False
+        if same:
+            return own(T(retain(t)))
+    var strides = IndexList[MAX_RANK](0)
+    for i in range(MAX_RANK):
+        strides[i] = 0 if t.shape[i] == 1 else t.strides[i]
+    var view = own(view_strided(t, shape, strides, rank, t.offset))
+    var dense = own(new_tensor(shape, rank, t.stype, t.device))
+    copy_strided_into(dense.t, view.t)
+    _ = view^
+    return dense^
+
+
+def _sample(
+    op: StaticString,
+    increment: Int,
+    a: T,
+    b: Optional[T],
+    generator: Int,
+) raises -> Owned:
+    """Run sampler `op` over `a` (and `b`, broadcast together) into a fresh
+    tensor of their broadcast shape and dtype."""
+    var shape = a.shape
+    var rank = a.rank
+    if b:
+        var bt = b.value().copy()
+        if bt.stype != a.stype:
+            raise Error(
+                "Found dtype ",
+                _scalar_type_name(bt.dtype),
+                " but expected ",
+                _scalar_type_name(a.dtype),
+            )
+        if not bt.on_mojo() or bt.device != a.device:
+            raise Error("expected every operand on the same mojo device")
+        shape = broadcast_shape(a, bt)
+        rank = max(a.rank, bt.rank)
+    var out = own(new_tensor(shape, rank, a.stype, a.device))
+    # CUDA reserves the generator's counters before it looks at numel: an
+    # empty draw still advances the stream.
+    var seed_offset = philox_reserve(generator, a.device, increment)
+    if out.t.numel == 0:
+        return out^
+    var ea = _expanded_dense(a, shape, rank)
+    var eb = _expanded_dense(b.value(), shape, rank) if b else own(T(retain(a)))
+    var poisson = op == "Poisson"
+    var flag = own(
+        new_tensor(IndexList[MAX_RANK](1), 0, ST_INT32, a.device)
+    ) if poisson else own(T(retain(a)))
+    if poisson:
+        fill_value(flag.t, 0.0)
+    var ctx = ctx_for(a.device)
+    var call = KernelCall("random", String(op))
+    call.out_dtype(a.dtype)
+    call.int(out.t.ptr)
+    call.int(ea.t.ptr)
+    call.int(eb.t.ptr)
+    call.int(flag.t.ptr if poisson else 0)
+    call.int(out.t.numel)
+    call.int(Int(seed_offset[0] & 0xFFFFFFFF))
+    call.int(Int((seed_offset[0] >> 32) & 0xFFFFFFFF))
+    call.int(Int(seed_offset[1] & 0xFFFFFFFF))
+    call.int(Int((seed_offset[1] >> 32) & 0xFFFFFFFF))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    _ = ea^
+    _ = eb^
+    if poisson:
+        # CUDA device-asserts a negative (or NaN) rate; CPU raises. Raise
+        # like CPU, from a 4-byte readback.
+        var ok = call_op(
+            "aten::_local_scalar_dense", "", [_tensor_value(flag.t)], 1
+        )
+        if v_int(ok[0]) != 0:
+            raise Error(
+                "invalid Poisson rate, expected rate to be non-negative"
+            )
+    _ = flag^
+    return out^
+
+
+# aten::poisson(Tensor self, Generator? generator=None) -> Tensor
+def op_poisson(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var rate = v_tensor(args[unsafe_offset=0])
+    _sampler_dtype_check("poisson_cuda", rate)
+    var out = _sample(
+        "Poisson", 20, rate, None, v_generator(args[unsafe_offset=1])
+    )
+    ret_owned(rets, 0, out)
+
+
+# aten::_standard_gamma(Tensor self, Generator? generator=None) -> Tensor
+def op_standard_gamma(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var alpha = v_tensor(args[unsafe_offset=0])
+    _sampler_dtype_check("gamma_cuda", alpha)
+    var out = _sample(
+        "Gamma", 10, alpha, None, v_generator(args[unsafe_offset=1])
+    )
+    ret_owned(rets, 0, out)
+
+
+# aten::binomial(Tensor count, Tensor prob, Generator? generator=None) -> Tensor
+def op_binomial(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """Distributions.cpp's _s_binomial_cuda. Its dtype checks are
+    TORCH_CHECK_VALUE (a ValueError); the shim reports every raised Error as
+    a RuntimeError, so here the message matches and the class does not."""
+    var count = v_tensor(args[unsafe_offset=0])
+    var prob = v_tensor(args[unsafe_offset=1])
+    if not _is_floating(count.dtype):
+        raise Error(
+            "binomial only supports floating-point dtypes for count, got: ",
+            _scalar_type_name(count.dtype),
+        )
+    if not _is_floating(prob.dtype):
+        raise Error(
+            "binomial only supports floating-point dtypes for prob, got: ",
+            _scalar_type_name(prob.dtype),
+        )
+    _sampler_dtype_check("binomial_cuda", count)
+    var out = _sample(
+        "Binomial",
+        42,
+        count,
+        Optional[T](prob.copy()),
+        v_generator(args[unsafe_offset=2]),
+    )
+    ret_owned(rets, 0, out)
+
+
 def register_random(site: Site) raises:
     impl[op_uniform_, "uniform_"](site)
     impl[op_normal_, "normal_"](site)
@@ -1430,6 +1755,12 @@ def register_random(site: Site) raises:
     impl[op_geometric_, "geometric_"](site)
     impl[op_bernoulli_float, "bernoulli_.float"](site)
     impl[op_bernoulli_tensor, "bernoulli_.Tensor"](site)
+    impl[op_bernoulli_out, "bernoulli.out"](site)
+    impl[op_fused_dropout, "_fused_dropout"](site)
+    impl[op_fill_mem_eff_dropout_mask_, "_fill_mem_eff_dropout_mask_"](site)
+    impl[op_poisson, "poisson"](site)
+    impl[op_standard_gamma, "_standard_gamma"](site)
+    impl[op_binomial, "binomial"](site)
     impl[op_random_from, "random_.from"](site)
     impl[op_random_to, "random_.to"](site)
     impl[op_random_, "random_"](site)

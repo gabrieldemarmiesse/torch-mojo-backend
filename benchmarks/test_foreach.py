@@ -41,6 +41,18 @@ COVERS: dict[str, str] = {
     "aten::_fused_adamw_.tensor_lr": (
         "test_fused_adamw (same fast impl; lr-as-tensor plumbing only)"
     ),
+    "aten::_fused_adam_": "test_fused_adam",
+    "aten::_fused_adam_.tensor_lr": (
+        "test_fused_adam (same fast impl; lr-as-tensor plumbing only)"
+    ),
+    "aten::_fused_sgd_": "test_fused_sgd",
+    "aten::_fused_sgd_.tensor_lr": (
+        "test_fused_sgd (same fast impl; lr-as-tensor plumbing only)"
+    ),
+    "aten::_fused_adagrad_": "test_fused_adagrad",
+    "aten::_fused_adagrad_.tensor_lr": (
+        "test_fused_adagrad (same fast impl; lr-as-tensor plumbing only)"
+    ),
 }
 
 SKIPPED: dict[str, str] = {}
@@ -380,5 +392,106 @@ def test_fused_adamw(
     bench.run(
         lambda: step(params_ref, grads_ref, avg_ref, sq_ref, steps_ref),
         lambda: step(params_our, grads_our, avg_our, sq_our, steps_our),
+        flops=_total(shape_id),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", LISTS)
+@pytest.mark.bench_op("_fused_adam_")
+def test_fused_adam(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """Adam with amsgrad: the widest member of the fused-optimizer kernel
+    (five lists read, four written)."""
+    lists = _lists(shape_id, hw, mojo_device, count=5)
+    steps_cpu = [torch.tensor(1.0) for _ in lists[0][0]]
+    steps_ref = [s.to(hw.stock_device) for s in steps_cpu]
+    steps_our = [s.to(mojo_device) for s in steps_cpu]
+
+    def step(tensors: list[list[torch.Tensor]], steps: list[torch.Tensor]):
+        params, grads, avgs, sqs, maxs = tensors
+        torch._fused_adam_(
+            params,
+            grads,
+            avgs,
+            sqs,
+            maxs,
+            steps,
+            lr=1e-3,
+            beta1=0.9,
+            beta2=0.999,
+            weight_decay=0.01,
+            eps=1e-8,
+            amsgrad=True,
+            maximize=False,
+        )
+
+    bench.run(
+        lambda: step([ref for ref, _ in lists], steps_ref),
+        lambda: step([our for _, our in lists], steps_our),
+        flops=_total(shape_id),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", LISTS)
+@pytest.mark.bench_op("_fused_sgd_")
+def test_fused_sgd(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """SGD with momentum and weight decay (params, grads, momentum buffers)."""
+    lists = _lists(shape_id, hw, mojo_device, count=3)
+
+    def step(tensors: list[list[torch.Tensor]]):
+        torch._fused_sgd_(
+            *tensors,
+            weight_decay=1e-4,
+            momentum=0.9,
+            lr=1e-3,
+            dampening=0.0,
+            nesterov=False,
+            maximize=False,
+            is_first_step=False,
+        )
+
+    bench.run(
+        lambda: step([ref for ref, _ in lists]),
+        lambda: step([our for _, our in lists]),
+        flops=_total(shape_id),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", LISTS)
+@pytest.mark.bench_op("_fused_adagrad_")
+def test_fused_adagrad(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """Adagrad (params, grads, state sums; its lr arithmetic is double)."""
+    if hw.stock_device == "mps":
+        pytest.skip("stock MPS has no fused Adagrad kernel")
+    lists = _lists(shape_id, hw, mojo_device, count=3)
+    steps_cpu = [torch.tensor(1.0) for _ in lists[0][0]]
+    steps_ref = [s.to(hw.stock_device) for s in steps_cpu]
+    steps_our = [s.to(mojo_device) for s in steps_cpu]
+
+    def step(tensors: list[list[torch.Tensor]], steps: list[torch.Tensor]):
+        params, grads, sums = tensors
+        torch._fused_adagrad_(
+            params,
+            grads,
+            sums,
+            steps,
+            lr=1e-2,
+            lr_decay=0.0,
+            weight_decay=1e-4,
+            eps=1e-10,
+            maximize=False,
+        )
+
+    bench.run(
+        lambda: step([ref for ref, _ in lists], steps_ref),
+        lambda: step([our for _, our in lists], steps_our),
         flops=_total(shape_id),
     )

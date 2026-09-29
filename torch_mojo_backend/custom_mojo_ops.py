@@ -311,6 +311,7 @@ def pointwise_binary(
         "logaddexp2",
         "lshift",
         "nextafter",
+        "prelu",
         "rshift",
         "shifted_chebyshev_polynomial_t",
         "shifted_chebyshev_polynomial_u",

@@ -35,6 +35,7 @@ from tmb.backend.abi import (
     own,
     own_if_new,
     release,
+    retain,
     ret_owned,
     ret_ref,
     torch_dtype,
@@ -58,6 +59,8 @@ from tmb.ops.common import (
     fill_value,
     one_device,
     resize_out,
+    same_view,
+    shares_storage,
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.core import cast_for_copy
@@ -347,6 +350,27 @@ def op_neg_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
     _direct_unary_out("NegSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::conj_physical.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_conj_physical_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """conj_physical_out on a real tensor: UnaryComplexKernels.cu's
+    conj_kernel is a copy for every non-complex dtype (the complex dtypes
+    never reach a mojo tensor)."""
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    var src = own(T(retain(t)))
+    if not dst.same_shape(t) and shares_storage(dst, t):
+        # The resize below may reallocate the storage `t` reads from.
+        src = own(new_like(t))
+        copy_strided_into(src.t, t)
+    _out_prologue(t, dst, t.stype)
+    if not same_view(dst, src.t):
+        copy_strided_into(dst, src.t)
+    _ = src^
     ret_ref(rets, 0, dst)
 
 
@@ -2248,6 +2272,7 @@ def register_unary(site: Site) raises:
     impl[op_nan_to_num_out, "nan_to_num.out"](site)
     impl[op_neg, "neg"](site)
     impl[op_neg_out, "neg.out"](site)
+    impl[op_conj_physical_out, "conj_physical.out"](site)
     impl[op_polygamma, "polygamma"](site)
     impl[op_polygamma_out, "polygamma.out"](site)
     impl[op_reciprocal, "reciprocal"](site)

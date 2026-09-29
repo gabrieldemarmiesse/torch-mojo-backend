@@ -1564,3 +1564,33 @@ def test_elementary_unary_out(mojo_gpu: str, name: str):
     fn(x, out=base[::2])
     close(base[::2], want)
     assert not base[1::2].cpu().any()
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.int64, torch.bool]
+)
+def test_conj_physical_out_copies_real_tensors(mojo_gpu, dtype):
+    torch.manual_seed(0)
+    x = (torch.randn(4, 6) * 5).to(dtype)
+    xd = x.to(mojo_gpu)
+    out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    torch.conj_physical(xd, out=out)
+    assert torch.equal(out.cpu(), x)
+    strided = torch.zeros(6, 4, dtype=dtype, device=mojo_gpu).t()
+    torch.conj_physical(xd[:, ::1], out=strided)
+    assert torch.equal(strided.cpu(), x)
+    torch.conj_physical(xd, out=xd)  # out is the input itself
+    assert torch.equal(xd.cpu(), x)
+    # A partial overlap raises before any resize, as on CPU.
+    base = torch.arange(8, device=mojo_gpu).to(dtype)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.conj_physical(base[:4], out=base)
+    # out shares storage without overlapping and needs a resize: the input
+    # is read before the storage can move.
+    base = torch.arange(8, device=mojo_gpu).to(dtype)
+    torch.conj_physical(base[4:], out=base[:2])
+    assert torch.equal(base[:4].cpu(), torch.arange(4, 8).to(dtype))
+    with pytest.raises(RuntimeError, match="dtype"):
+        torch.conj_physical(
+            xd, out=torch.empty(4, 6, dtype=torch.float64, device=mojo_gpu)
+        )

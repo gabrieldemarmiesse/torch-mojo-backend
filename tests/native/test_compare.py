@@ -856,3 +856,27 @@ def test_masked_fill_out_aliasing_an_input(mojo_device: str):
         out = db[:0]
         op(db, mask.to(mojo_device), v, out=out)
         assert torch.equal(out.cpu(), base.masked_fill(mask, value))
+
+
+def test_assert_async(mojo_gpu):
+    """_assert_async (and .msg): a synchronous check, like CPU's (CUDA's is
+    a device assert that aborts the context)."""
+    aten = torch.ops.aten
+    for ok in (
+        torch.tensor(1.0),
+        torch.tensor([True]),
+        torch.tensor(-3),
+        torch.tensor(float("nan")),
+    ):
+        aten._assert_async(ok.to(mojo_gpu))
+        aten._assert_async.msg(ok.to(mojo_gpu), "never")
+    with pytest.raises(RuntimeError, match="single nonzero value, but got zero"):
+        aten._assert_async(torch.tensor(0.0, device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="boom"):
+        aten._assert_async.msg(torch.tensor(False, device=mojo_gpu), "boom")
+    with pytest.raises(RuntimeError, match="Assertion is failed"):
+        aten._assert_async.msg(torch.tensor(0, device=mojo_gpu), "")
+    with pytest.raises(RuntimeError, match="with no values is ambiguous"):
+        aten._assert_async(torch.ones(0, device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="more than one value is ambiguous"):
+        aten._assert_async(torch.ones(2, device=mojo_gpu))
