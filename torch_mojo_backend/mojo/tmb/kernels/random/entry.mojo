@@ -26,6 +26,7 @@ from tmb.kernels.random.sampler_kernels import (
     SAMPLE_BINOMIAL,
     SAMPLE_GAMMA,
     SAMPLE_POISSON,
+    enqueue_prob_check,
     enqueue_sampler,
 )
 from tmb.kernels.random.multinomial_kernels import (
@@ -41,6 +42,7 @@ from tmb.kernels.common.op_utils import (
     _raw_int,
     _raw_tuple_int,
     _raw_tuple_len,
+    _spec_dispatcher4,
     _spec_dispatcher6,
     _spec_dispatcher10,
     _spec_dispatcher12,
@@ -388,6 +390,23 @@ def _sampler_go[
         raise Error("sampler: no dtype compiled into this module")
 
 
+def _prob_check_go(
+    p_obj: Arg, flag_obj: Arg, numel_obj: Arg, ctx_obj: Arg
+) raises:
+    var handled = False
+    comptime for dt in PROB_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            enqueue_prob_check[dt](
+                _raw_ctx(ctx_obj),
+                _raw_int(p_obj),
+                _raw_int(flag_obj),
+                _raw_int(numel_obj),
+            )
+            handled = True
+    if not handled:
+        raise Error("prob check: no dtype compiled into this module")
+
+
 @export
 def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     try:
@@ -455,6 +474,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             _spec_dispatcher12[_multinomial_draw_go, "MultinomialDraw"](
                 argv, argc
             )
+            return 0
+        comptime if _op_on["ProbCheck"]():
+            _spec_dispatcher4[_prob_check_go, "ProbCheck"](argv, argc)
             return 0
         comptime if _op_on["Poisson"]():
             _spec_dispatcher10[_sampler_go[SAMPLE_POISSON], "Poisson"](

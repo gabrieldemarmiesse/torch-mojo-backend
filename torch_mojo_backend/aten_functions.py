@@ -1095,8 +1095,12 @@ def aten__native_batch_norm_legit_no_training(
 @map_to(aten._prelu_kernel)
 def aten__prelu_kernel(self: MaxTensor, weight: MaxTensor) -> MaxTensor:
     """ActivationPreluKernel.cu: self > 0 ? self : weight * self, the
-    product one scalar_t multiplication (rounded once)."""
-    return _where(self > 0, self, weight * self)
+    product one scalar_t multiplication (rounded once) -- the mojo device's
+    own `prelu` pointwise kind, as a fusible custom op."""
+    shape = find_broadcast_shape(self.shape, weight.shape)
+    return custom_mojo_ops.pointwise_binary(
+        _broadcast_to(self, shape), _broadcast_to(weight, shape), "prelu"
+    )
 
 
 # _prelu_kernel_backward(Tensor grad_output, Tensor self, Tensor weight) -> (Tensor, Tensor)
@@ -1104,12 +1108,20 @@ def aten__prelu_kernel(self: MaxTensor, weight: MaxTensor) -> MaxTensor:
 def aten__prelu_kernel_backward(
     grad_output: MaxTensor, self: MaxTensor, weight: MaxTensor
 ) -> tuple[MaxTensor, MaxTensor]:
-    """Both gradients of the broadcast shape (prelu's composite backward
-    reduces grad_weight to the weight's shape)."""
-    positive = self > 0
-    grad_input = _where(positive, grad_output, weight * grad_output)
+    """Both gradients of the broadcast shape of all three operands (prelu's
+    composite backward reduces grad_weight to the weight's shape). Composed
+    from MAX ops: the pointwise custom ops take two operands and this kind
+    three."""
+    shape = find_broadcast_shape(
+        find_broadcast_shape(grad_output.shape, self.shape), weight.shape
+    )
+    g = _broadcast_to(grad_output, shape)
+    x = _broadcast_to(self, shape)
+    w = _broadcast_to(weight, shape)
+    positive = x > 0
+    grad_input = _where(positive, g, w * g)
     zero = F.constant(0, dtype=self.dtype, device=self.device)
-    grad_weight = _where(positive, zero, self * grad_output)
+    grad_weight = _where(positive, _broadcast_to(zero, shape), x * g)
     return grad_input, grad_weight
 
 

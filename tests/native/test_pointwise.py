@@ -2575,3 +2575,51 @@ def test_dirichlet_rsample_backward(mojo_gpu):
     s = torch.distributions.Gamma(conc, torch.ones(3, device=mojo_gpu)).rsample((64,))
     s.sum().backward()
     assert conc.grad is not None and torch.isfinite(conc.grad).all()
+
+
+def test_add_relu_clamps_at_self_dtype_max(mojo_gpu):
+    """add_relu_impl's max_val is SELF's dtype max, applied in the promoted
+    dtype: int8 100 + int16 100 is 127."""
+    aten = torch.ops.aten
+    a = torch.tensor([100, -100, 20], dtype=torch.int8)
+    b = torch.tensor([100, 3, 200], dtype=torch.int16)
+    got = aten._add_relu(a.to(mojo_gpu), b.to(mojo_gpu))
+    assert got.dtype == torch.int16
+    assert torch.equal(got.cpu(), aten._add_relu(a, b))
+    f = torch.tensor([3e38, -1.0])
+    d = torch.tensor([3e38, 0.5], dtype=torch.float64)
+    skip_if_metal(mojo_gpu, "Metal has no float64")
+    got = aten._add_relu(f.to(mojo_gpu), d.to(mojo_gpu))
+    assert torch.equal(got.cpu(), aten._add_relu(f, d))
+
+
+def test_masked_scale_broadcasts_like_tensor_iterator(mojo_gpu):
+    x = torch.randn(1, 3)
+    m = torch.randint(0, 2, (4, 3), dtype=torch.uint8)
+    got = torch.ops.aten._masked_scale(x.to(mojo_gpu), m.to(mojo_gpu), 2.0)
+    assert got.shape == (4, 3)
+    _close(got, m.float() * x * 2.0, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("default", [torch.float64, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.int64, torch.uint8, torch.bool])
+def test_isclose_integers_under_another_default_dtype(mojo_gpu, default, dtype):
+    """The integer tolerance test runs in the DEFAULT float dtype."""
+    if default == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal has no float64")
+    torch.manual_seed(8)
+    a = torch.randint(0, 200, (300,)).to(dtype)
+    b = torch.randint(0, 200, (300,)).to(dtype)
+    before = torch.get_default_dtype()
+    torch.set_default_dtype(default)
+    try:
+        for rtol, atol in ((0.0, 0.0), (1e-5, 1e-8), (0.01, 0.5), (0.0, 3.0)):
+            got = torch.isclose(a.to(mojo_gpu), b.to(mojo_gpu), rtol, atol)
+            assert torch.equal(got.cpu(), torch.isclose(a, b, rtol, atol))
+        if dtype == torch.int64:
+            big = torch.tensor([2**60, 2**60 + 1])
+            same = torch.tensor([2**60, 2**60])
+            got = torch.isclose(big.to(mojo_gpu), same.to(mojo_gpu), 0.0, 1e-3)
+            assert torch.equal(got.cpu(), torch.isclose(big, same, 0.0, 1e-3))
+    finally:
+        torch.set_default_dtype(before)

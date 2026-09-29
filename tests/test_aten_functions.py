@@ -7620,3 +7620,13 @@ def test_aten__prelu_kernel_backward(conf: Conf, call_checker: CallChecker):
     g = torch.randn(3, 4, 5)
     check_outputs(fn, conf, [g, x, w])
     _compiled_matches_cpu(fn, [g, x, w])
+
+
+def test_aten__prelu_kernel_backward_broadcasts_weight():
+    """grad_weight takes the broadcast of all three operands: input and grad
+    (1, 3) with a (4, 3) weight give (4, 3) gradients."""
+    torch.manual_seed(1)
+    g, x, w = torch.randn(1, 3), torch.randn(1, 3), torch.randn(4, 3)
+    _compiled_matches_cpu(
+        lambda a, b, c: aten._prelu_kernel_backward(a, b, c), [g, x, w]
+    )

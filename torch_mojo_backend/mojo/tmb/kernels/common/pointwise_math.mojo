@@ -2054,18 +2054,20 @@ def _add_relu[
     a: SIMD[dtype, n], b: SIMD[dtype, n], p: SIMD[param_dtype[dtype](), 4]
 ) -> SIMD[dtype, n]:
     """BinaryOpsKernel.cpp's add_clamp_kernel (CPU only: CUDA has no
-    `_add_relu`): clamp(a + alpha * b, 0, max finite) in scalar_t, the product
-    fused into the add as its vectorized path's `fmadd` does. A NaN sum
-    stays NaN (that path's clamp_min); integers wrap."""
+    `_add_relu`): clamp(a + alpha * b, 0, max) in scalar_t, the product
+    fused into the add as its vectorized path's `fmadd` does. p0 = alpha,
+    p1 = max: the largest value of SELF's dtype (add_relu_impl), converted
+    to the computation dtype, so int8 + int16 clamps at 127. A NaN sum stays
+    NaN (the vectorized path's clamp_min); integers wrap."""
+    var top = SIMD[dtype, n](p[1].cast[dtype]())
     comptime if dtype.is_floating_point():
         var s = b.fma(SIMD[dtype, n](p[0].cast[dtype]()), a)
         s = (s.lt(0) & ~isnan(s)).select(SIMD[dtype, n](0), s)
-        # The upper bound is the dtype's largest finite value: +inf clamps.
-        comptime top = Scalar[dtype].MAX_FINITE
-        return (s.gt(top) & ~isnan(s)).select(SIMD[dtype, n](top), s)
+        return (s.gt(top) & ~isnan(s)).select(top, s)
     else:
         var s = a + SIMD[dtype, n](p[0].cast[dtype]()) * b
-        return s.lt(0).select(SIMD[dtype, n](0), s)
+        s = s.lt(0).select(SIMD[dtype, n](0), s)
+        return s.gt(top).select(top, s)
 
 
 @always_inline
@@ -2088,7 +2090,8 @@ def _isclose[
     operand converted to it.
 
     p = (rtol, atol, equal_nan, tolerance_on); for integer operands the
-    first two are float32 bit patterns in the int64 slots.
+    first two are float32 bit patterns in the int64 slots. tolerance_on = 2
+    runs the tolerance test alone (no equality term).
     """
     var close = a.eq(b)
     comptime if dtype.is_floating_point():
@@ -2104,6 +2107,10 @@ def _isclose[
             close = close | (isnan(a) & isnan(b))
         if p[3] == 0:
             return close
+        if p[3] == 2:
+            # The tolerance test alone: integer operands cast to the default
+            # dtype, whose equality the caller took on the integers.
+            close = SIMD[DType.bool, n](fill=False)
         var fence = False
         var rtol = SIMD[w, n](p[0].cast[w]())
         var atol = SIMD[w, n](p[1].cast[w]())

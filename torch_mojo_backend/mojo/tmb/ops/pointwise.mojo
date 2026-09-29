@@ -3523,6 +3523,30 @@ def _add_relu_check(self_st: Int32, common: Int32) raises:
         )
 
 
+def _add_relu_max(self_st: Int32, compute: Int32) -> Float64:
+    """add_relu_impl's `max_val`: the largest value of SELF's dtype, as the
+    computation dtype's parameter (`Scalar::to<scalar_t>()`)."""
+    var top_i = 0
+    var top_f = 0.0
+    if self_st == ST_INT8:
+        top_i = 127
+    elif self_st == ST_INT16:
+        top_i = 32767
+    elif self_st == ST_INT32:
+        top_i = 2147483647
+    elif self_st == ST_INT64:
+        top_i = 9223372036854775807
+    elif self_st == ST_FLOAT32:
+        top_f = 3.4028234663852886e38
+    else:
+        top_f = 1.7976931348623157e308
+    if _pw_is_int(compute):
+        return bits_f64(Int64(top_i))
+    if top_f != 0.0:
+        return top_f
+    return Float64(top_i)
+
+
 def _add_relu(args: Values, rets: Values, out_index: Int, inplace: Bool) raises:
     var a: Side
     if inplace:
@@ -3534,7 +3558,10 @@ def _add_relu(args: Values, rets: Values, out_index: Int, inplace: Bool) raises:
     var common = _pw_result_type(a, b, c, 2)
     _add_relu_check(_pw_side_stype(a), common)
     var compute = _pw_compute_dtype("add_relu", common, P_NUMERIC, True)
-    var params = _p(_int_exact_param(args[unsafe_offset=2], compute))
+    var params = _p(
+        _int_exact_param(args[unsafe_offset=2], compute),
+        _add_relu_max(_pw_side_stype(a), compute),
+    )
     if inplace:
         var self = a.t.value().copy()
         _b_store_inplace(
@@ -3608,25 +3635,59 @@ def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not (_pw_is_float(st) or _pw_is_int(st) or st == ST_BOOL):
         unsupported("isclose on dtype " + dtype_name(st))
     var tol_on = 0.0 if (rtol == 0 and atol == 0) else 1.0
-    var params: SIMD[DType.float64, 4]
     if _pw_is_float(st):
-        params = _p(rtol, atol, 1.0 if equal_nan else 0.0, tol_on)
-    else:
-        if default_dtype() != ST_FLOAT32:
-            unsupported(
-                "isclose of integer tensors under a default dtype other than"
-                " float32"
-            )
-        params = _p(
+        var params = _p(rtol, atol, 1.0 if equal_nan else 0.0, tol_on)
+        _b_ret(
+            rets,
+            _pw_run(
+                "isclose", 2, a, b, _none_side(), st, ST_BOOL, params, None
+            ),
+        )
+        return
+    # Integer and bool operands: equality in their own dtype; the tolerance
+    # test in the default float dtype D (`cast_other = other.to(D)`, and
+    # self - cast_other promotes self to D as well).
+    var d = default_dtype()
+    var zero_tol = _p(bits_f64(Int64(0)), bits_f64(Int64(0)), 0.0, 0.0)
+    if tol_on == 0 or d == ST_FLOAT32:
+        var params = _p(
             _f32_bits_param(rtol),
             _f32_bits_param(atol),
             bits_f64(Int64(0)),
             bits_f64(Int64(1 if tol_on != 0 else 0)),
         )
-    _b_ret(
-        rets,
-        _pw_run("isclose", 2, a, b, _none_side(), st, ST_BOOL, params, None),
+        _b_ret(
+            rets,
+            _pw_run(
+                "isclose", 2, a, b, _none_side(), st, ST_BOOL, params, None
+            ),
+        )
+        return
+    # Another default dtype: equality on the integers OR the floating test on
+    # both operands cast to D (the float kernel's own rounding in D).
+    var eq = _pw_run(
+        "isclose", 2, a, b, _none_side(), st, ST_BOOL, zero_tol, None
     )
+    var held_eq = own(eq.t.copy())
+    var fl = _pw_run(
+        "isclose",
+        2,
+        a,
+        b,
+        _none_side(),
+        d,
+        ST_BOOL,
+        _p(rtol, atol, 0.0, 2.0),
+        None,
+    )
+    _ = call_op(
+        "aten::logical_or_",
+        "",
+        [tensor_arg(fl.t), tensor_arg(held_eq.t)],
+        1,
+    )
+    _ = held_eq^
+    _b_ret(rets, fl^)
 
 
 # aten::_masked_scale(Tensor self, Tensor mask, float scale) -> Tensor
@@ -3634,13 +3695,15 @@ def op_masked_scale(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     """Dropout.cu's masked_scale_cuda: `(float)mask * self * scale` over a
-    uint8 mask, into a tensor of self's shape."""
+    uint8 mask, into a tensor of their broadcast shape."""
     var self = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     if mask.stype != ST_UINT8:
         raise Error("mask should be torch.uint8 dtype")
     _pw_floating_dispatch("masked_scale", self.stype, True)
     var scale = v_f64(args[unsafe_offset=2])
+    # TensorIterator resizes the fresh `empty_like(self)` output to the
+    # broadcast of self and mask (self (1, 3), mask (4, 3): (4, 3)).
     var res = _pw_run(
         "masked_scale",
         2,
@@ -3652,14 +3715,6 @@ def op_masked_scale(
         _p(scale),
         None,
     )
-    if not self.same_shape(res.t):
-        var held = own(res.t.copy())
-        raise Error(
-            "output with shape ",
-            _b_shape_list(self.shape, self.rank),
-            " doesn't match the broadcast shape ",
-            _b_shape_list(held.t.shape, held.t.rank),
-        )
     _b_ret(rets, res^)
 
 

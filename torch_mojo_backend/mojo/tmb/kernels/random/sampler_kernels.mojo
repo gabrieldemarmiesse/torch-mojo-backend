@@ -260,7 +260,8 @@ def _gamma[
     var scale = V(1)
     if alpha < 1:
         if alpha == 0:
-            return Scalar[dtype](0)
+            # sample_gamma returns 0; the kernel's clamp still applies.
+            return _clamp_min_normal(Scalar[dtype](0))
         scale *= pow_c99[w](1 - s.uniform().cast[w](), 1 / alpha)
         alpha += 1
     var d = alpha - V(1.0 / 3.0)
@@ -285,7 +286,13 @@ def _gamma[
         if _log(u) < V(0.5) * xx + d * (1 - v + _log(v)):
             sample = scale * d * v
             break
-    var r = sample.cast[dtype]()
+    return _clamp_min_normal(sample.cast[dtype]())
+
+
+@always_inline
+def _clamp_min_normal[dtype: DType](r: Scalar[dtype]) -> Scalar[dtype]:
+    """gamma_cuda_kernel's `(min_value > sample) ? min_value : sample`, with
+    min_value the dtype's smallest normal (a NaN sample passes)."""
     if isnan(r):
         return r
     var min_value: Scalar[dtype]
@@ -394,12 +401,15 @@ def _binomial[
     dtype: DType
 ](count: Scalar[dtype], prob: Scalar[dtype], mut s: _Stream) -> Scalar[dtype]:
     """Distributions.h's `sample_binomial`."""
+    # The deterministic boundaries first, with C++'s NaN comparisons (false):
+    # (count = 0, prob = NaN) and (count = NaN, prob = 0) are 0, (NaN, 1)
+    # is NaN.
+    if (count <= 0 and not isnan(count)) or (prob <= 0 and not isnan(prob)):
+        return Scalar[dtype](0)
+    if prob >= 1 and not isnan(prob):
+        return count
     if isnan(count) or isnan(prob):
         return nan[dtype]()
-    if count <= 0 or prob <= 0:
-        return Scalar[dtype](0)
-    if prob >= 1:
-        return count
     if isinf(count):
         return count
     if prob <= Scalar[dtype](0.5):
@@ -480,4 +490,48 @@ def enqueue_sampler[
                 Int64(numel),
                 seed,
                 offset,
+            )
+
+
+@__name(t"prob_range_check_{dtype}")
+def _prob_check_kernel[
+    dtype: DType
+](
+    p: Pointer[Scalar[dtype], MutAnyOrigin],
+    flag: Pointer[Int32, MutAnyOrigin],
+    numel_arg: Int64,
+):
+    var numel = Int(numel_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while i < numel:
+        var v = p[unsafe_offset=i]
+        if isnan(v) or v < 0 or v > 1:
+            # Every writer stores the same 1: no atomic needed.
+            flag[unsafe_offset=0] = 1
+        i += stride
+
+
+def enqueue_prob_check[
+    dtype: DType
+](ctx: DeviceContext, p_addr: Int, flag_addr: Int, numel: Int) raises:
+    """Flag any probability outside [0, 1] (NaN included): the value check
+    bernoulli_.Tensor makes (CPU raises, CUDA device-asserts)."""
+    if numel <= 0:
+        return
+    comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
+        raise Error("float64 is not supported on Apple GPU")
+    else:
+        comptime if not has_accelerator():
+            raise Error("no GPU accelerator available at compile time")
+        else:
+            _enqueue_cached[_prob_check_kernel[dtype]](
+                ctx,
+                min((numel + BLOCK - 1) // BLOCK, 65535),
+                1,
+                1,
+                BLOCK,
+                _make_ptr[dtype](p_addr).as_unsafe_any_origin(),
+                _make_ptr[DType.int32](flag_addr).as_unsafe_any_origin(),
+                Int64(numel),
             )

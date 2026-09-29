@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.native.conftest import skip_if_metal
+from tests.native.conftest import is_metal as _metal, skip_if_metal
 from torch_mojo_backend import aten_functions, native
 from torch_mojo_backend.native import device_module
 
@@ -1299,7 +1299,12 @@ def test_standard_gamma_edges_and_errors(mojo_gpu):
     x = torch._standard_gamma(
         torch.tensor([0.0, float("nan"), float("inf")], device=mojo_gpu)
     ).cpu()
-    assert x[0] == 0 and math.isnan(x[1]) and x[2] == float("inf")
+    # alpha = 0 samples 0, which CUDA's kernel clamps to the smallest normal.
+    assert x[0] == torch.finfo(torch.float32).tiny
+    assert math.isnan(x[1]) and x[2] == float("inf")
+    # So an all-zero Dirichlet concentration gives 1 / k, not 0 / 0.
+    d0 = torch._sample_dirichlet(torch.zeros(2, 4, device=mojo_gpu)).cpu()
+    torch.testing.assert_close(d0, torch.full((2, 4), 0.25))
     with pytest.raises(RuntimeError, match='"gamma_cuda" not implemented'):
         torch._standard_gamma(torch.ones(2, dtype=torch.long, device=mojo_gpu))
     torch.manual_seed(6)
@@ -1384,3 +1389,40 @@ def test_binomial_broadcast_seed_and_errors(mojo_gpu):
         torch.tensor([0.5, float("nan")], device=mojo_gpu),
     )
     assert nan.isnan().all()
+
+
+def test_empty_samplers_advance_the_generator(mojo_gpu):
+    """CUDA reserves the Philox counters before it looks at numel: a draw
+    after an empty one comes from the advanced stream."""
+    lam = torch.full((64,), 5.0, device=mojo_gpu)
+    empty = torch.empty(0, device=mojo_gpu)
+    for fn in (torch.poisson, torch._standard_gamma, lambda t: torch.binomial(t, t)):
+        device_module.manual_seed_all(11)
+        before = device_module.get_rng_state(lam.device)
+        fn(empty)
+        assert not torch.equal(device_module.get_rng_state(lam.device), before)
+
+
+def test_binomial_boundaries_before_nan(mojo_gpu):
+    """sample_binomial's `count <= 0 || prob <= 0` and `prob >= 1` come
+    before its NaN case: (0, NaN) and (NaN, 0) are 0, (NaN, 1) is NaN."""
+    nan = float("nan")
+    c = torch.tensor([0.0, nan, nan, 4.0], device=mojo_gpu)
+    p = torch.tensor([nan, 0.0, 1.0, nan], device=mojo_gpu)
+    got = torch.binomial(c, p).cpu()
+    assert got[0] == 0 and got[1] == 0 and got[2].isnan() and got[3].isnan()
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, float("nan")])
+def test_bernoulli_rejects_probabilities_outside_0_1(mojo_gpu, bad):
+    p = torch.tensor([0.5, bad, 0.2], device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Expected p_in >= 0 && p_in <= 1"):
+        torch.bernoulli(p, out=torch.empty(3, device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="Expected p_in >= 0 && p_in <= 1"):
+        torch.empty(3, device=mojo_gpu).bernoulli_(p)
+    ok = torch.tensor(
+        [0.0, 1.0],
+        dtype=torch.float64 if not _metal(mojo_gpu) else torch.float32,
+        device=mojo_gpu,
+    )
+    assert torch.bernoulli(ok).cpu().tolist() == [0.0, 1.0]

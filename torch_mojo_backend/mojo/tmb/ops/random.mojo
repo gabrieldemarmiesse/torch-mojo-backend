@@ -661,6 +661,40 @@ def op_bernoulli_out(
     ret_ref(rets, 0, out)
 
 
+def _check_probabilities(p_in: T) raises:
+    """bernoulli_tensor's value check, `0 <= p <= 1` for every element (NaN
+    fails): CPU raises it; CUDA device-asserts, which aborts the context.
+    Raised like CPU, from one flag the device sets and a 4-byte readback."""
+    if p_in.numel == 0:
+        return
+    var st = ST_FLOAT64 if p_in.stype == ST_FLOAT64 else ST_FLOAT32
+    var pc = own_if_new(cast_to(p_in, st), p_in)
+    var dense = own_if_new(contiguous(pc.t), pc.t)
+    var flag = own(new_tensor(IndexList[MAX_RANK](1), 0, ST_INT32, p_in.device))
+    fill_value(flag.t, 0.0)
+    var ctx = ctx_for(p_in.device)
+    var call = KernelCall("random", "ProbCheck")
+    call.arg_dtype(0, dense.t.dtype)
+    call.int(dense.t.ptr)
+    call.int(flag.t.ptr)
+    call.int(dense.t.numel)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    _ = dense^
+    _ = pc^
+    var bad = call_op(
+        "aten::_local_scalar_dense", "", [_tensor_value(flag.t)], 1
+    )
+    _ = flag^
+    if v_int(bad[0]) != 0:
+        raise Error(
+            "Expected p_in >= 0 && p_in <= 1 to be true, but got false.  (Could"
+            " this error message be improved?  If so, please report an"
+            " enhancement request to PyTorch.)"
+        )
+
+
 def _bernoulli_tensor_into(t: T, p_in: T, generator: Int) raises:
     """`t.bernoulli_(p_in)`: bernoulli_tensor_cuda_kernel's draw."""
     _check_device_dtype(t, "bernoulli_", False)
@@ -671,6 +705,7 @@ def _bernoulli_tensor_into(t: T, p_in: T, generator: Int) raises:
         )
     if p_in.device != t.device:
         unsupported("bernoulli_.Tensor with p on another device")
+    _check_probabilities(p_in)
     if t.numel == 0:
         return
     for i in range(t.rank):
@@ -1609,6 +1644,9 @@ def _sample(
         shape = broadcast_shape(a, bt)
         rank = max(a.rank, bt.rank)
     var out = own(new_tensor(shape, rank, a.stype, a.device))
+    # CUDA reserves the generator's counters before it looks at numel: an
+    # empty draw still advances the stream.
+    var seed_offset = philox_reserve(generator, a.device, increment)
     if out.t.numel == 0:
         return out^
     var ea = _expanded_dense(a, shape, rank)
@@ -1619,7 +1657,6 @@ def _sample(
     ) if poisson else own(T(retain(a)))
     if poisson:
         fill_value(flag.t, 0.0)
-    var seed_offset = philox_reserve(generator, a.device, increment)
     var ctx = ctx_for(a.device)
     var call = KernelCall("random", String(op))
     call.out_dtype(a.dtype)
