@@ -990,10 +990,9 @@ def test_scatter_int64_scalar_is_exact(mojo_device, reduce):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("reduce", ["sum", "mean"])
 def test_scatter_reduce_sum_is_ordered_and_deterministic(mojo_device, dtype, reduce):
-    """Under deterministic algorithms a floating sum takes the sorted route (`_scatter_via_index_put`): the
-    same answer every run, each slot summed in index order, so it matches
-    CPU even where atomics would round differently; and it is allowed
-    under torch.use_deterministic_algorithms."""
+    """Under deterministic algorithms a floating sum takes the sorted route
+    (`_scatter_via_index_put`): the same answer every run, and allowed under
+    torch.use_deterministic_algorithms."""
     g = torch.Generator().manual_seed(7)
     x = torch.randn(20, 9, generator=g).to(dtype)
     src = (torch.randn(300, 9, generator=g) * 100).to(dtype)
@@ -1013,9 +1012,15 @@ def test_scatter_reduce_sum_is_ordered_and_deterministic(mojo_device, dtype, red
         )
     finally:
         torch.use_deterministic_algorithms(before)
-    _check(first, expected)
-    _check(second, expected)
-    _check(legacy, x.scatter(0, index, src, reduce="add"))
+    # Run to run identical; CUDA's stride-1 index_put sums each run with 32
+    # lanes and a tree, so float32 can differ from CPU's sequential sum in
+    # the last bits.
+    assert torch.equal(first.cpu(), second.cpu())
+    tol = {"rtol": 1e-5, "atol": 1e-3} if dtype == torch.float32 else {}
+    torch.testing.assert_close(first.cpu(), expected, **tol)
+    torch.testing.assert_close(
+        legacy.cpu(), x.scatter(0, index, src, reduce="add"), **tol
+    )
 
 
 def test_scatter_reduce_nondeterministic_alerts(mojo_device):
@@ -1201,9 +1206,14 @@ def test_scatter_add_and_index_add_in_place_overlap_and_determinism(mojo_device)
         ia = x.to(mojo_device).index_add(0, rows.to(mojo_device), src.to(mojo_device))
     finally:
         torch.use_deterministic_algorithms(before)
-    # Ordered sums: exactly CPU's sequential order.
-    _check(sa, x.scatter_add(0, idx, src))
-    _check(ia, x.index_add(0, rows, src))
+    # CUDA's index_put orders (a 32-lane tree for width-1 slices): close to
+    # CPU's sequential sums, identical run to run.
+    torch.testing.assert_close(
+        sa.cpu(), x.scatter_add(0, idx, src), rtol=1e-5, atol=1e-3
+    )
+    torch.testing.assert_close(
+        ia.cpu(), x.index_add(0, rows, src), rtol=1e-5, atol=1e-3
+    )
 
 
 def test_unique_dim_many_columns(mojo_device):
@@ -1221,3 +1231,113 @@ def test_unique_dim_many_columns(mojo_device):
             strict=True,
         ):
             _check(g_, e)
+
+
+def _unique_rows_reference(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """unique(dim=0) with a strict total order: rows sorted lexicographically
+    with NaN after every number (ties by position), and NaN never equal to
+    anything, so a row holding one is its own group. CPU's comparator-based
+    sort is no strict weak order with NaN and can split equal rows."""
+    rows = x.tolist()
+
+    def key(i: int) -> tuple[object, ...]:
+        return (tuple((v != v, 0.0 if v != v else v) for v in rows[i]), i)
+
+    order = sorted(range(len(rows)), key=key)
+    values: list[list[float]] = []
+    inverse = [0] * len(rows)
+    counts: list[int] = []
+    for pos, i in enumerate(order):
+        prev = rows[order[pos - 1]] if pos else None
+        same = prev is not None and all(
+            a == b for a, b in zip(prev, rows[i], strict=True)
+        )
+        if not same:
+            values.append(rows[i])
+            counts.append(0)
+        inverse[i] = len(values) - 1
+        counts[-1] += 1
+    return (
+        torch.tensor(values, dtype=x.dtype).reshape(-1, x.shape[1]),
+        torch.tensor(inverse),
+        torch.tensor(counts),
+    )
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_unique_dim_nan_signed_zero_duplicates_stress(mojo_device, seed):
+    """Rows with NaN, -0.0 / 0.0 (equal) and many duplicates: every row
+    lands in exactly one merge slot, on every run."""
+    g = torch.Generator().manual_seed(seed)
+    choices = torch.tensor([float("nan"), -0.0, 0.0, 1.0, -2.5])
+    x = choices[torch.randint(0, 5, (97, 2), generator=g)]
+    x[5] = x[11]
+    expected = _unique_rows_reference(x)
+    for _ in range(3):
+        got = torch.unique(
+            x.to(mojo_device), dim=0, return_inverse=True, return_counts=True
+        )
+        torch.testing.assert_close(
+            got[0].cpu(), expected[0], equal_nan=True, rtol=0, atol=0
+        )
+        _check(got[1], expected[1])
+        _check(got[2], expected[2])
+    small = torch.tensor([[1.0], [float("nan")], [0.0], [2.0]])
+    got = torch.unique(
+        small.to(mojo_device), dim=0, return_inverse=True, return_counts=True
+    )
+    expected = _unique_rows_reference(small)
+    assert expected[2].tolist() == [1, 1, 1, 1]  # the NaN row is kept
+    torch.testing.assert_close(
+        got[0].cpu(), expected[0], equal_nan=True, rtol=0, atol=0
+    )
+    _check(got[1], expected[1])
+    _check(got[2], expected[2])
+
+
+def test_put_alerts_in_deterministic_mode(mojo_device):
+    before = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        for accumulate in (False, True):
+            with pytest.raises(RuntimeError, match="put_"):
+                torch.zeros(4, device=mojo_device).put_(
+                    torch.tensor([0], device=mojo_device),
+                    torch.ones(1, device=mojo_device),
+                    accumulate=accumulate,
+                )
+    finally:
+        torch.use_deterministic_algorithms(before)
+
+
+@pytest.mark.parametrize("width", [1, 8, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_deterministic_index_add_rounds_like_cuda(mojo_device, width, dtype):
+    """CUDA's deterministic index_put: a slice wider than a warp rounds into
+    the dtype after every addition (1024 bfloat16 ones saturate at 256);
+    narrower slices sum the run in float and add it once (1024)."""
+    z = torch.zeros(2, width, dtype=dtype)
+    idx = torch.zeros(1024, dtype=torch.long)
+    ones = torch.ones(1024, width, dtype=dtype)
+    if width > 32:
+        expected_value = torch.zeros(1, dtype=dtype)
+        for _ in range(1024):
+            expected_value += 1
+        expected_value = expected_value.item()
+    else:
+        expected_value = 1024.0
+    before = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        got = z.to(mojo_device).index_add(0, idx.to(mojo_device), ones.to(mojo_device))
+        # Expanded on the device: `.to()` would materialize the stride-0 view.
+        expanded = idx.to(mojo_device).view(-1, 1).expand(1024, width)
+        sa = z.to(mojo_device).scatter_add(0, expanded, ones.to(mojo_device))
+    finally:
+        torch.use_deterministic_algorithms(before)
+    expected = torch.zeros(2, width, dtype=dtype)
+    expected[0] = expected_value
+    _check(got, expected)
+    _check(sa, expected)

@@ -107,6 +107,7 @@ from tmb.ops.data_movement import (
     _scatter_into,
     _scatter_launch,
     _scatter_validate,
+    index_put_slice,
     scatter_add_sorted,
     scatter_scalar,
     _strides_of,
@@ -656,6 +657,9 @@ def op_put_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var index = v_tensor(args[unsafe_offset=1])
     var source = v_tensor(args[unsafe_offset=2])
     var accumulate = v_bool(args[unsafe_offset=3])
+    # put_ (TensorAdvancedIndexing.cpp) alerts on a CUDA tensor whether it
+    # accumulates (atomics) or not (duplicate indices race).
+    alert_not_deterministic("put_")
     if index.dtype != DType.int64:
         raise Error(
             "put_(): Expected a long tensor for index, but got ",
@@ -1346,6 +1350,7 @@ def _reduce_launch(
     ordered: Bool = False,
     int_value: Optional[Int] = None,
     sorted_sums: Bool = False,
+    slice_size: Int = 1,
 ) raises:
     """Reduce src (or the scalar `value`) into `target`, which holds self's
     values, over the index space `dims` (int64 `idx` read through
@@ -1394,9 +1399,7 @@ def _reduce_launch(
     # default is dtype atomics: a half sum and count saturate together).
     var by_sort = sorted_sums and floating and deterministic_algorithms()
     if add and src and by_sort and not ordered:
-        # A floating sum takes the sorted, ordered route CUDA takes under
-        # deterministic algorithms (`_scatter_via_index_put`), always: the
-        # result does not depend on the atomics' interleaving.
+        # The sorted, ordered route of `_scatter_via_index_put`.
         scatter_add_sorted(
             target,
             idx,
@@ -1407,6 +1410,7 @@ def _reduce_launch(
             dim,
             dim_size,
             what,
+            slice_size,
         )
     else:
         _scatter_launch(
@@ -1453,6 +1457,7 @@ def _reduce_launch(
             dim,
             dim_size,
             what,
+            slice_size,
         )
         _ = one^
     else:
@@ -1520,6 +1525,7 @@ def _scatter_reduce_into(
         what,
         int_value=ivalue,
         sorted_sums=True,
+        slice_size=index_put_slice(target, index, dim),
     )
     _ = idx_c^
     _ = idx64^
@@ -1579,8 +1585,8 @@ def _scatter_reduce_op(
     if red != 0:
         _reduce_dtype_check(a, red, what)
         # CUDA's alerts: prod always; the legacy add / multiply kernel
-        # unless a floating add took the deterministic index_put route
-        # (which this backend always takes).
+        # unless a floating add takes the deterministic index_put route
+        # (which it does whenever deterministic algorithms are on).
         if not is_scalar:
             if red == _RED_PROD and new_options:
                 alert_not_deterministic("scatter_reduce_cuda_prod_")

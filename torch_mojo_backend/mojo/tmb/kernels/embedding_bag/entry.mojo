@@ -14,9 +14,7 @@
 # check_arguments; the bounds are clamped so neither is ever followed).
 # ===----------------------------------------------------------------------=== #
 
-from std.atomic import Atomic, Ordering
 from std.math import pow
-from std.sys import is_amd_gpu, is_nvidia_gpu
 from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_dim,
@@ -598,135 +596,6 @@ def _sorted_backward_go(
         raise Error("EmbeddingBagBackwardSorted: unsupported dtype ", dtype)
 
 
-# ---------------------------------------------------------------------------
-# EmbeddingBagBackwardAtomic: the sum / mean weight gradient by atomics, the
-# default (nondeterministic) route, as CUDA's fused
-# compute_grad_weight_atomic_accumulate: one thread per (index, feature)
-# adds `grad[bag] (/ bag_size) * per_sample_weight / count` into an
-# accumulator-dtype buffer (float for the half types; the op casts it).
-# ---------------------------------------------------------------------------
-
-
-@__name(t"embedding_bag_bwd_atomic_{dtype}_t{GS_THREADS}")
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GS_THREADS))
-)
-def _embedding_bag_backward_atomic_kernel[
-    dtype: DType
-](
-    grad_weight: Pointer[Scalar[_acc_dtype[dtype]()], MutAnyOrigin],
-    grad: Pointer[Scalar[dtype], MutAnyOrigin],
-    indices: Pointer[Int64, MutAnyOrigin],
-    offset2bag: Pointer[Int64, MutAnyOrigin],
-    bag_size: Pointer[Int64, MutAnyOrigin],
-    psw: Pointer[Scalar[dtype], MutAnyOrigin],
-    counts: Pointer[Int64, MutAnyOrigin],
-    num_indices: Int64,
-    feature_size: Int64,
-    mode_mean: Int64,
-    has_psw: Int64,
-    psw_stride: Int64,
-    has_counts: Int64,
-    padding_idx: Int64,
-):
-    comptime acc_t = _acc_dtype[dtype]()
-    var features = Int(feature_size)
-    var total = Int(num_indices) * features
-    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
-    var step = Int(grid_dim.x) * Int(block_dim.x)
-    while i < total:
-        var e = i // features
-        var feature = i - e * features
-        var row = Int(indices[unsafe_offset=e])
-        if row != Int(padding_idx):
-            var bag = Int(offset2bag[unsafe_offset=e])
-            var g = grad[unsafe_offset=bag * features + feature].cast[acc_t]()
-            if mode_mean != 0:
-                g /= Scalar[acc_t](Int(bag_size[unsafe_offset=bag]))
-            if has_psw != 0:
-                g *= psw[unsafe_offset=e * Int(psw_stride)].cast[acc_t]()
-            if has_counts != 0:
-                g /= Scalar[acc_t](Int(counts[unsafe_offset=row]))
-            _ = Atomic[Scalar[acc_t], scope=_atomic_scope()].fetch_add[
-                ordering=Ordering.RELAXED
-            ](grad_weight.unsafe_offset(row * features + feature), g)
-        i += step
-
-
-def _embedding_bag_backward_atomic_go(
-    grad_weight_o: Arg,
-    grad_o: Arg,
-    indices_o: Arg,
-    offset2bag_o: Arg,
-    bag_size_o: Arg,
-    psw_o: Arg,
-    counts_o: Arg,
-    # (num_indices, feature_size, mode_mean, has_psw, psw_stride,
-    #  has_counts, padding_idx)
-    params: Arg,
-    dtype_o: Arg,
-    ctx_o: Arg,
-) raises:
-    var dtype = _raw_dtype_int(dtype_o)
-    var ctx = _raw_ctx(ctx_o)
-    var n = _raw_tuple_int(params, 0)
-    var feature_size = _raw_tuple_int(params, 1)
-    var handled = False
-    comptime for dt in BAG_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if dtype == dt:
-                handled = True
-                comptime if not has_accelerator():
-                    raise Error("no GPU accelerator available at compile time")
-                elif dt == DType.float64 and has_apple_gpu_accelerator():
-                    raise Error("float64 is not supported on Apple GPU")
-                else:
-                    comptime acc_t = _acc_dtype[dt]()
-                    _enqueue_cached[_embedding_bag_backward_atomic_kernel[dt]](
-                        ctx,
-                        _gs_blocks(n * feature_size),
-                        1,
-                        1,
-                        GS_THREADS,
-                        _make_ptr[acc_t](
-                            _raw_int(grad_weight_o)
-                        ).as_unsafe_any_origin(),
-                        _make_ptr[dt](_raw_int(grad_o)).as_unsafe_any_origin(),
-                        _make_ptr[DType.int64](
-                            _raw_int(indices_o)
-                        ).as_unsafe_any_origin(),
-                        _make_ptr[DType.int64](
-                            _raw_int(offset2bag_o)
-                        ).as_unsafe_any_origin(),
-                        _make_ptr[DType.int64](
-                            _raw_int(bag_size_o)
-                        ).as_unsafe_any_origin(),
-                        _make_ptr[dt](_raw_int(psw_o)).as_unsafe_any_origin(),
-                        _make_ptr[DType.int64](
-                            _raw_int(counts_o)
-                        ).as_unsafe_any_origin(),
-                        Int64(n),
-                        Int64(feature_size),
-                        Int64(_raw_tuple_int(params, 2)),
-                        Int64(_raw_tuple_int(params, 3)),
-                        Int64(_raw_tuple_int(params, 4)),
-                        Int64(_raw_tuple_int(params, 5)),
-                        Int64(_raw_tuple_int(params, 6)),
-                    )
-    if not handled:
-        raise Error("EmbeddingBagBackwardAtomic: unsupported dtype ", dtype)
-
-
-@always_inline
-def _atomic_scope() -> StaticString:
-    comptime if is_nvidia_gpu():
-        return "device"
-    elif is_amd_gpu():
-        return "agent"
-    else:
-        return ""
-
-
 @export
 def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     """C entry of this family: one kernel per build (see `OP`).
@@ -741,11 +610,6 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["EmbeddingBagBackwardSorted"]():
             _spec_dispatcher4[
                 _sorted_backward_go, "EmbeddingBagBackwardSorted"
-            ](argv, argc)
-            return 0
-        comptime if _op_on["EmbeddingBagBackwardAtomic"]():
-            _spec_dispatcher10[
-                _embedding_bag_backward_atomic_go, "EmbeddingBagBackwardAtomic"
             ](argv, argc)
             return 0
         comptime if _op_on["EmbeddingRenorm"]():

@@ -3739,6 +3739,66 @@ def _scatter_dim[
                 else:
                     out_ptr[unsafe_offset=out_off] = v
 
+    # The plain scatter / scatter_add launch (no reduction, no ordering, a
+    # scalar only for a plain store) keeps its own lean body: the hot path
+    # of scatter_add / index_add / index_put(accumulate) and scatter.
+    var plain_total = d0 * d1 * d2 * d3
+    var is_store_value = is_value != 0
+
+    @always_inline
+    @__parameter
+    @__copy_capture(
+        out_ptr, index_ptr, src_ptr, err_ptr, has_err, scalar, is_store_value
+    )
+    def plain[width: Int, alignment: Int = 1](coord: Coord):
+        var i = Int(coord[0].value())
+        var i3 = i % d3
+        var rest = i // d3
+        var i2 = rest % d2
+        rest = rest // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        var target = Int(
+            index_ptr[unsafe_offset=i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3]
+        )
+        if target < 0 or target >= dim_size:
+            if has_err:
+                err_ptr[] = 1
+            return
+        var out_off = i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3
+        if dim_padded == 0:
+            out_off += (target - i0) * os0
+        elif dim_padded == 1:
+            out_off += (target - i1) * os1
+        elif dim_padded == 2:
+            out_off += (target - i2) * os2
+        else:
+            out_off += (target - i3) * os3
+        comptime if accumulate and dtype == DType.bool:
+            var v = src_ptr[
+                unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
+            ]
+            if v != Scalar[dtype](0):
+                out_ptr[unsafe_offset=out_off] = v
+        elif accumulate:
+            _atomic_add(
+                out_ptr.unsafe_offset(out_off),
+                src_ptr[
+                    unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
+                ],
+            )
+        else:
+            if is_store_value:
+                out_ptr[unsafe_offset=out_off] = scalar
+            else:
+                out_ptr[unsafe_offset=out_off] = src_ptr[
+                    unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
+                ]
+
+    comptime if not rmw:
+        if not ordered and not (accumulate and use_scalar):
+            _parallel_for_dt[dtype, plain](plain_total, ctx)
+            return
     _parallel_for_dt[dtype, func](1 if serial else total, ctx)
 
 
@@ -3960,8 +4020,9 @@ def _gather_rows_dispatcher(argv: Argv, argc: Int) raises:
 #                     [0, dim_size)) and its offset in `src`
 #   (a stable sort of the targets, through the dispatcher)
 #   SortedSegmentAdd  one thread per run of equal targets adds the run's
-#                     values to `out` in index-space order, accumulating in
-#                     the dtype's opmath type (index_put's sorted kernel).
+#                     values to `out` in index-space order, in the order and
+#                     with the rounding of index_put's sorted kernel for the
+#                     slice width (see `mode` in the body).
 #
 # The geometry tuple is ScatterDim's (rank-4 padded extents and strides).
 # ---------------------------------------------------------------------------
@@ -4066,7 +4127,7 @@ def _sorted_segment_add_go(
     perm_o: Arg,
     srcoff_o: Arg,
     src_o: Arg,
-    params: Arg,  # (n, is_value)
+    params: Arg,  # (n, is_value, mode: 0 stride-1 / 1 small / 2 wide)
     value_o: Arg,
     dtype_o: Arg,
     ctx_o: Arg,
@@ -4075,6 +4136,7 @@ def _sorted_segment_add_go(
     var ctx = _raw_ctx(ctx_o)
     var n = _raw_tuple_int(params, 0)
     var is_value = _raw_tuple_int(params, 1) != 0
+    var mode = _raw_tuple_int(params, 2)
     var value = _raw_f64(value_o)
     var tgt = _make_ptr[DType.int64](_raw_int(tgt_o))
     var perm = _make_ptr[DType.int64](_raw_int(perm_o))
@@ -4097,28 +4159,76 @@ def _sorted_segment_add_go(
                 @always_inline
                 @__parameter
                 @__copy_capture(
-                    out, src, scalar, tgt, perm, srcoff, is_value, n
+                    out, src, scalar, tgt, perm, srcoff, is_value, n, mode
                 )
                 def func[width: Int, alignment: Int = 1](coord: Coord):
                     var i = Int(coord[0].value())
                     var t = tgt[unsafe_offset=i]
                     if t < 0 or (i > 0 and tgt[unsafe_offset=i - 1] == t):
                         return
-                    var acc = out[unsafe_offset=Int(t)].cast[acc_t]()
+                    # index_put's sorted kernels, by slice width (`mode`):
+                    # 2, wider than a warp (indexing_backward_kernel): round
+                    # into the dtype after every addition; 1, up to a warp
+                    # (_small_stride): sum the run in opmath from 0 and add
+                    # it to self once; 0, width 1 (_stride_1): the same, but
+                    # the run's first 32 * floor(len / 32) values are summed
+                    # by 32 lanes and a shuffle-down tree, the rest after.
                     var j = i
-                    while j < n and tgt[unsafe_offset=j] == t:
-                        var v = scalar
-                        if not is_value:
-                            v = src[
-                                unsafe_offset=Int(
-                                    srcoff[
-                                        unsafe_offset=Int(perm[unsafe_offset=j])
-                                    ]
-                                )
-                            ]
-                        acc += v.cast[acc_t]()
+                    var stop = i
+                    while stop < n and tgt[unsafe_offset=stop] == t:
+                        stop += 1
+
+                    @always_inline
+                    @__parameter
+                    def value_at(k: Int) -> Scalar[acc_t]:
+                        if is_value:
+                            return scalar.cast[acc_t]()
+                        return src[
+                            unsafe_offset=Int(
+                                srcoff[unsafe_offset=Int(perm[unsafe_offset=k])]
+                            )
+                        ].cast[acc_t]()
+
+                    if mode == 2:
+                        while j < stop:
+                            out[unsafe_offset=Int(t)] = (
+                                out[unsafe_offset=Int(t)].cast[acc_t]()
+                                + value_at(j)
+                            ).cast[dt]()
+                            j += 1
+                        return
+                    var acc = Scalar[acc_t](0)
+                    if mode == 0:
+                        var passes = (stop - i) // 32
+                        if passes > 0:
+                            var lanes = Array[Scalar[acc_t], 32](
+                                fill=Scalar[acc_t](0)
+                            )
+                            var prev = Array[Scalar[acc_t], 32](
+                                fill=Scalar[acc_t](0)
+                            )
+                            for p in range(passes):
+                                for lane in range(32):
+                                    lanes[lane] += value_at(i + p * 32 + lane)
+                            var offset = 16
+                            while offset > 0:
+                                for lane in range(32):
+                                    prev[lane] = lanes[lane]
+                                for lane in range(32):
+                                    var other = lane + offset
+                                    lanes[lane] = prev[lane] + (
+                                        prev[other] if other
+                                        < 32 else prev[lane]
+                                    )
+                                offset //= 2
+                            acc = lanes[0]
+                        j = i + passes * 32
+                    while j < stop:
+                        acc += value_at(j)
                         j += 1
-                    out[unsafe_offset=Int(t)] = acc.cast[dt]()
+                    out[unsafe_offset=Int(t)] = (
+                        out[unsafe_offset=Int(t)].cast[acc_t]() + acc
+                    ).cast[dt]()
 
                 _parallel_for_dt[dt, func](n, ctx)
     if not handled:
