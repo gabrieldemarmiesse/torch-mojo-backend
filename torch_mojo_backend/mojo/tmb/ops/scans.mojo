@@ -79,6 +79,8 @@ def _scan_into(op: StaticString, src: T, dim: Int, dst: T, idx_ptr: Int) raises:
     shape and dtype), plus int64 indices at `idx_ptr` for cummax / cummin."""
     if src.numel == 0:
         return
+    if dev(dst.device)[].api == "cpu":
+        unsupported("the scan kernels need a GPU (MAX's CPU device has none)")
     var g = _geometry(src, dim)
     var kdt = _kernel_dtype(src.dtype)
     var ctx = ctx_for(dst.device)
@@ -113,27 +115,22 @@ def _is_sum_scan_dtype(dt: DType) -> Bool:
     )
 
 
-def _nn_cumsum_ok(src: T, dim: Int) -> Bool:
-    """The nn family's block-prefix-sum regimes (`_cumsum_spec_into_go`):
-    the trailing dim, or dim 0 of a rank-2 operand, of a contiguous operand
-    of CUMSUM_DTYPES, on a GPU."""
-    var dt = src.dtype
-    if not (
-        dt == DType.float32
-        or dt == DType.bfloat16
-        or dt == DType.float16
-        or dt == DType.int32
-        or dt == DType.int64
-    ):
-        return False
+def _nn_cumsum_ok(src: T, dim: Int) raises -> Bool:
+    """The nn family's block-prefix-sum regimes (`_cumsum_spec_into_go`) of a
+    contiguous operand: the trailing dim of float32/int32/int64 everywhere
+    (MAX's CPU device included), and on a GPU also bf16/f16 and dim 0 of a
+    rank-2 operand -- the surface `op_cumsum` had before the scan family
+    existed, so no call that used to run moves to another route."""
     if not src.contig or src.rank < 1:
         return False
-    try:
-        if dev(src.device)[].api == "cpu":
-            return False
-    except:
+    var gpu = dev(src.device)[].api != "cpu"
+    var dt = src.dtype
+    var ok_dtype = dt == DType.float32 or dt == DType.int32 or dt == DType.int64
+    if gpu and (dt == DType.bfloat16 or dt == DType.float16):
+        ok_dtype = True
+    if not ok_dtype:
         return False
-    return dim == src.rank - 1 or (src.rank == 2 and dim == 0)
+    return dim == src.rank - 1 or (gpu and src.rank == 2 and dim == 0)
 
 
 def _cumsum_nn_into(src: T, dim: Int, dst: T) raises:
@@ -160,34 +157,49 @@ def _cum_result(
     """`impl_func_cum_ops`: the scan of `a.to(res_st)` along `dim_in` as a
     fresh contiguous tensor of `a`'s shape and dtype `res_st`."""
     var dim = _norm_dim(dim_in, a.rank)
-    var out = own(new_tensor(a.shape, a.rank, res_st, a.device))
     var rdt = max_dtype(res_st)
     if a.numel == 0:
-        return out^
+        return own(new_tensor(a.shape, a.rank, res_st, a.device))
+    var metal = dev(a.device)[].api == "metal"
+    if metal and rdt == DType.float64 and a.stype != res_st:
+        unsupported(String(what) + ": float64 is unavailable on Apple GPUs")
     if a.rank == 0:
         if a.stype != res_st:
-            _decline_metal_f64(out.t, what)
             _decline_metal_f64(a, what)
+        var out = own(new_tensor(a.shape, a.rank, res_st, a.device))
         var c = own(_cast_any(a, res_st))
         copy_strided_into(out.t, c.t)
         _ = c^  # alive past the launch
         return out^
-    if not _is_sum_scan_dtype(rdt):
+    # The 8/16-bit integer results scan in int64 and narrow at the end: + and
+    # * modulo 2**8 / 2**16 agree with CUDA's wrapping scan in the narrow
+    # dtype, once the operand itself was converted to it first.
+    var narrow = rdt == DType.int8 or rdt == DType.int16 or rdt == DType.uint8
+    if not narrow and not _is_sum_scan_dtype(rdt):
         unsupported(String(what) + " into dtype " + String(rdt))
-    _decline_metal_f64(out.t, what)
+    if metal and rdt == DType.float64:
+        unsupported(String(what) + ": float64 is unavailable on Apple GPUs")
     _decline_metal_f64(a, what)
     var src = own(_cast_any(a, res_st))
+    if narrow:
+        var wide = own(_cast_any(src.t, ST_INT64))
+        src = wide^
     var dense = own_if_new(contiguous(src.t), src.t)
+    var work = own(new_tensor(a.shape, a.rank, dense.t.stype, a.device))
     if is_sum and _nn_cumsum_ok(dense.t, dim):
-        _cumsum_nn_into(dense.t, dim, out.t)
+        _cumsum_nn_into(dense.t, dim, work.t)
     else:
         var op: StaticString = "ScanProd"
         if is_sum:
             op = "ScanSum"
-        _scan_into(op, dense.t, dim, out.t, 0)
+        _scan_into(op, dense.t, dim, work.t, 0)
     _ = dense^  # alive past the launch
     _ = src^
-    return out^
+    if not narrow:
+        return work^
+    var r = own(_cast_any(work.t, res_st))
+    _ = work^  # alive past the conversion
+    return r^
 
 
 def _cum_default_stype(a: T, dtype_st: Int32) -> Int32:
@@ -233,6 +245,7 @@ def _cum_inplace(
     """`cumsum_` / `cumprod_`: the result dtype is the operand's, and a
     different `dtype=` is the structured in-place dtype error."""
     var a = v_tensor(args[unsafe_offset=0])
+    assert_no_internal_overlap(a)
     var st = v_dtype_or(args[unsafe_offset=2], -1)
     if st >= 0 and st != a.stype:
         raise Error(
@@ -293,6 +306,14 @@ def _logcumsumexp_result(a: T, dim_in: Int) raises -> Owned:
     """`_logcumsumexp_out_cuda`: a 0-d operand is copied, an empty one has
     nothing to scan; CUDA dispatches floating dtypes only."""
     var dim = _norm_dim(dim_in, a.rank)
+    var out = own(new_tensor(a.shape, a.rank, a.stype, a.device))
+    # CUDA's shortcuts run before its floating-dtype dispatch: a 0-d operand
+    # is copied (`fill_(self)`) and an empty one zeroed, whatever its dtype.
+    if a.rank == 0:
+        copy_strided_into(out.t, a)
+        return out^
+    if a.numel == 0:
+        return out^
     if not a.dtype.is_floating_point():
         raise Error(
             '"logcumsumexp_cuda" not implemented for \'',
@@ -300,12 +321,6 @@ def _logcumsumexp_result(a: T, dim_in: Int) raises -> Owned:
             "'",
         )
     _decline_metal_f64(a, "logcumsumexp")
-    var out = own(new_tensor(a.shape, a.rank, a.stype, a.device))
-    if a.numel == 0:
-        return out^
-    if a.rank == 0:
-        copy_strided_into(out.t, a)
-        return out^
     var dense = own_if_new(contiguous(a), a)
     _scan_into("ScanLogSumExp", dense.t, dim, out.t, 0)
     _ = dense^  # alive past the launch
@@ -389,6 +404,8 @@ def _cum_extremum_helper(args: Values, op: StaticString) raises:
     _decline_metal_f64(a, op)
     if a.numel == 0:
         return
+    assert_no_internal_overlap(values)
+    assert_no_internal_overlap(indices)
     var dense = own_if_new(contiguous(a), a)
     var tv = own(new_tensor(a.shape, a.rank, a.stype, a.device))
     var ti = own(new_tensor(a.shape, a.rank, ST_INT64, a.device))

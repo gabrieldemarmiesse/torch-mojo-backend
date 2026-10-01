@@ -68,15 +68,30 @@ def test_mode_scalar_size_one_empty_and_out(mojo_gpu):
 
 
 def test_mode_long_rows(mojo_gpu):
-    """CPU's index is whichever its unstable std::sort leaves last; CUDA's
-    (and ours) is the largest index holding the mode."""
+    """Rows past 2048 take CUDA's thrust fallback: the SMALLEST index holding
+    the mode (CPU's is whichever its unstable std::sort leaves last)."""
     x = torch.randint(0, 50, (3, 5000))
     v, i = torch.mode(x.to(mojo_gpu), 1)
     ref_v, _ = torch.mode(x, 1)
     torch.testing.assert_close(v.cpu(), ref_v)
     for r in range(3):
         hits = (x[r] == ref_v[r]).nonzero().flatten()
-        assert i[r].item() == hits.max().item()
+        assert i[r].item() == hits.min().item()
+
+
+def test_mode_row_length_picks_cudas_tie_rule(mojo_gpu):
+    """Up to 2048 elements CUDA's fused kernel reports the largest index of
+    the mode, beyond it the thrust fallback the smallest."""
+    short = torch.zeros(2048, dtype=torch.bool)
+    _, i = torch.mode(short.to(mojo_gpu), 0)
+    assert i.item() == 2047
+    long = torch.zeros(5000, dtype=torch.bool)
+    v, i = torch.mode(long.to(mojo_gpu), 0)
+    assert v.item() is False and i.item() == 0
+    # The fallback's bool rule: true only on a strict majority.
+    half = torch.cat([torch.ones(2500), torch.zeros(2500)]).bool()
+    v, i = torch.mode(half.to(mojo_gpu), 0)
+    assert v.item() is False and i.item() == 2500
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +123,26 @@ def test_histc_matches_cpu(mojo_gpu, dtype, bins, lo, hi):
         b = ((xi - lo) * bins).div(hi - lo, rounding_mode="floor").clamp(0, bins - 1)
         ref = torch.bincount(b[inside], minlength=bins).to(dtype)
         torch.testing.assert_close(got.cpu(), ref)
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.uint8])
+def test_histc_narrow_integers(mojo_gpu, dtype):
+    x = torch.randint(0, 100, (500,)).to(dtype)
+    got = torch.histc(x.to(mojo_gpu), 7, 10, 80)
+    xi = x.long()
+    inside = (xi >= 10) & (xi <= 80)
+    b = ((xi - 10) * 7).div(70, rounding_mode="floor").clamp(0, 6)
+    ref = torch.bincount(b[inside], minlength=7).to(dtype)
+    assert got.dtype == dtype
+    torch.testing.assert_close(got.cpu(), ref)
+
+
+def test_histc_int64_bounds_stay_exact(mojo_gpu):
+    """int64 bounds never round through a double: 2**53 + 2 in
+    [2**53 + 1, 2**53 + 4] with 2 bins is bin 0."""
+    x = torch.tensor([2**53 + 2], dtype=torch.int64)
+    got = torch.histc(x.to(mojo_gpu), 2, 2**53 + 1, 2**53 + 4)
+    assert got.cpu().tolist() == [1, 0]
 
 
 def test_histc_edges_nan_and_errors(mojo_gpu):
@@ -252,6 +287,8 @@ def test_renorm_matches_cpu(mojo_gpu, dtype, p, dim, maxnorm):
 
 
 def test_renorm_inplace_out_and_errors(mojo_gpu):
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.ones(1, 4, device=mojo_gpu).expand(3, 4).renorm_(2, 0, 1.0)
     x = torch.randn(3, 4)
     y = x.to(mojo_gpu)
     y.renorm_(2, 0, 1.0)
@@ -338,6 +375,22 @@ def test_fused_rms_norm_backward_matches_autograd(mojo_gpu, dtype, with_weight):
     torch.testing.assert_close(dx.cpu().float(), xi.grad, atol=atol, rtol=rtol)
     if with_weight:
         torch.testing.assert_close(dw.cpu().float(), wi.grad, atol=atol, rtol=rtol)
+    else:
+        assert dw is None
+
+
+def test_fused_rms_norm_backward_masked_gradients_are_undefined(mojo_gpu):
+    x = torch.randn(4, 8, device=mojo_gpu)
+    rstd = torch.ones(4, 1, device=mojo_gpu)
+    w = torch.randn(8, device=mojo_gpu)
+    dx, dw = torch.ops.aten._fused_rms_norm_backward(
+        torch.randn(4, 8, device=mojo_gpu), x, [8], rstd, w, [False, True]
+    )
+    assert dx is None and dw is not None
+    dx, dw = torch.ops.aten._fused_rms_norm_backward(
+        torch.randn(4, 8, device=mojo_gpu), x, [8], rstd, w, [True, False]
+    )
+    assert dx is not None and dw is None
 
 
 # ---------------------------------------------------------------------------

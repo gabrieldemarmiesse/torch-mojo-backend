@@ -627,7 +627,14 @@ def _isin_scalar_tensor(el: Value, te: T, invert: Bool) raises -> Owned:
     if _scalar_type_of(el) == "Bool":
         raise Error("Unsupported input type encountered for isin(): Bool")
     _isin_check_dtype(te.dtype)
-    var eq = call_op("aten::eq", "Scalar", [tensor_arg(te), el.copy()], 1)
+    # ATen wraps the scalar as a 0-d tensor: a float element against integer
+    # test elements compares in the default float dtype (result_type of an
+    # integer tensor and a wrapped double), not in the integers.
+    var tc = own_if_new(te.copy(), te)
+    if not v_scalar_is_integral(el) and not te.dtype.is_floating_point():
+        tc = own(cast_to(te, default_dtype()))
+    var eq = call_op("aten::eq", "Scalar", [tensor_arg(tc.t), el.copy()], 1)
+    _ = tc^  # alive past the call that reads it
     var eq_t = own(eq.take_tensor(0))
     var any = call_op("aten::any", "", [tensor_arg(eq_t.t)], 1)
     _ = eq_t^  # alive past the call that reads it

@@ -214,6 +214,9 @@ def _read_scalar_int(t: Owned) raises -> Int:
 # ---------------------------------------------------------------------------
 
 
+comptime MODE_FUSED_MAX_ROW = 2048
+
+
 def _mode_into(a: T, dim: Int, values: T, indices: T) raises:
     """Along the normalized `dim` of `a` into the fresh contiguous `values`
     / `indices` (whose element order is the row order of `a` with `dim`
@@ -249,6 +252,13 @@ def _mode_into(a: T, dim: Int, values: T, indices: T) raises:
     call.int(si.t.ptr)
     call.int(rows)
     call.int(n)
+    # TensorModeKernel.cpp: rows up to 2 * MAX_BLOCK_SIZE (1024 threads on
+    # CUDA, 256 on ROCm) take the fused kernel (largest index of the mode),
+    # longer ones the thrust fallback (smallest index).
+    var fused_max = MODE_FUSED_MAX_ROW
+    if dev(a.device)[].api == "hip":
+        fused_max = 512
+    call.int(1 if n > fused_max else 0)
     call.int(dtype_code(kdt))
     call.int(ctx_ptr(ctx))
     call.run()
@@ -350,49 +360,31 @@ def _aminmax_host(a: T) raises -> Tuple[Float64, Float64]:
     return (_read_scalar_f64(mn), _read_scalar_f64(mx))
 
 
-def _histc_counts(a: T, nbins: Int, lo: Float64, hi: Float64) raises -> Owned:
+def _histc_counts_float(
+    a: T, nbins: Int, lo: Float64, hi: Float64
+) raises -> Owned:
     """CUDA's `getBin` and atomic counts as a composition: elements in
-    [lo, hi] (NaN never) land in `int((x - lo) * nbins / (hi - lo))`, the
-    top edge folded into the last bin; the arithmetic is the input's float
-    type (float32 / float64) or int64 for integers."""
+    [lo, hi] (NaN never) land in `int((x - lo) * nbins / (hi - lo))` in the
+    input's float type, the top edge folded into the last bin."""
     var out = _zeros(_shape1(nbins), 1, a.stype, a.device)
     if a.numel == 0:
         return out^
     var flat = own_if_new(contiguous(a), a)
     var x = _view(flat.t, _shape1(a.numel), 1)
-    var bins: Owned
-    if a.dtype.is_floating_point():
-        var d = _call("aten::sub", "Scalar", [_t(x.t), _dbl(lo), _sint(1)])
-        var p = _call("aten::mul", "Scalar", [_t(d.t), _sint(nbins)])
-        var width: Float64
-        if a.dtype == DType.float32:
-            width = Float64(Float32(hi) - Float32(lo))
-        else:
-            width = hi - lo
-        var q = _call("aten::div", "Scalar", [_t(p.t), _dbl(width)])
-        bins = _cast(q.t, ST_INT64)
-        _ = d^  # every temporary outlives the calls that read it
-        _ = p^
-        _ = q^
+    var d = _call("aten::sub", "Scalar", [_t(x.t), _dbl(lo), _sint(1)])
+    var p = _call("aten::mul", "Scalar", [_t(d.t), _sint(nbins)])
+    var width: Float64
+    if a.dtype == DType.float32:
+        width = Float64(Float32(hi) - Float32(lo))
     else:
-        var xi = _cast(x.t, ST_INT64)
-        var d = _call(
-            "aten::sub", "Scalar", [_t(xi.t), _sint(Int(lo)), _sint(1)]
-        )
-        var p = _call("aten::mul", "Scalar", [_t(d.t), _sint(nbins)])
-        bins = _call(
-            "aten::floor_divide", "Scalar", [_t(p.t), _sint(Int(hi) - Int(lo))]
-        )
-        _ = xi^
-        _ = d^
-        _ = p^
+        width = hi - lo
+    var q = _call("aten::div", "Scalar", [_t(p.t), _dbl(width)])
+    var bins = _cast(q.t, ST_INT64)
     var clamped = _call(
         "aten::clamp", "", [_t(bins.t), _sint(0), _sint(nbins - 1)]
     )
-    var lo_v = _sint(Int(lo)) if not a.dtype.is_floating_point() else _dbl(lo)
-    var hi_v = _sint(Int(hi)) if not a.dtype.is_floating_point() else _dbl(hi)
-    var ge = _call("aten::ge", "Scalar", [_t(x.t), lo_v^])
-    var le = _call("aten::le", "Scalar", [_t(x.t), hi_v^])
+    var ge = _call("aten::ge", "Scalar", [_t(x.t), _dbl(lo)])
+    var le = _call("aten::le", "Scalar", [_t(x.t), _dbl(hi)])
     var inside = _call("aten::logical_and", "", [_t(ge.t), _t(le.t)])
     var weights = _cast(inside.t, a.stype)
     _ = call_op(
@@ -403,6 +395,9 @@ def _histc_counts(a: T, nbins: Int, lo: Float64, hi: Float64) raises -> Owned:
     )
     _ = flat^  # every temporary outlives the calls that read it
     _ = x^
+    _ = d^
+    _ = p^
+    _ = q^
     _ = bins^
     _ = clamped^
     _ = ge^
@@ -412,18 +407,65 @@ def _histc_counts(a: T, nbins: Int, lo: Float64, hi: Float64) raises -> Owned:
     return out^
 
 
+def _histc_counts_int(a: T, nbins: Int, lo: Int, hi: Int) raises -> Owned:
+    """The integer `getBin`: `(x - lo) * nbins / (hi - lo)` in int64 (CUDA's
+    bounds_t), never through a float, so bounds past 2**53 stay exact. The
+    counts accumulate in int64 and convert to the input dtype at the end
+    (CUDA adds into the narrow dtype directly; the wrap is the same)."""
+    var counts = _zeros(_shape1(nbins), 1, ST_INT64, a.device)
+    if a.numel > 0:
+        var flat = own_if_new(contiguous(a), a)
+        var x = _view(flat.t, _shape1(a.numel), 1)
+        var xi = _cast(x.t, ST_INT64)
+        var d = _call("aten::sub", "Scalar", [_t(xi.t), _sint(lo), _sint(1)])
+        var p = _call("aten::mul", "Scalar", [_t(d.t), _sint(nbins)])
+        var bins = _call(
+            "aten::floor_divide", "Scalar", [_t(p.t), _sint(hi - lo)]
+        )
+        var clamped = _call(
+            "aten::clamp", "", [_t(bins.t), _sint(0), _sint(nbins - 1)]
+        )
+        # 0-d int64 bounds, not Scalars: the compare kernels embed a Scalar
+        # through a double, which is inexact past 2**53.
+        var lo_t = own(new_scalar(ST_INT64, a.device))
+        fill_value(lo_t.t, _sint(lo))
+        var hi_t = own(new_scalar(ST_INT64, a.device))
+        fill_value(hi_t.t, _sint(hi))
+        var ge = _call("aten::ge", "Tensor", [_t(xi.t), _t(lo_t.t)])
+        var le = _call("aten::le", "Tensor", [_t(xi.t), _t(hi_t.t)])
+        _ = lo_t^  # alive past the calls that read them
+        _ = hi_t^
+        var inside = _call("aten::logical_and", "", [_t(ge.t), _t(le.t)])
+        var weights = _cast(inside.t, ST_INT64)
+        _ = call_op(
+            "aten::index_add_",
+            "",
+            [_t(counts.t), int_arg(0), _t(clamped.t), _t(weights.t), _sint(1)],
+            1,
+        )
+        _ = flat^  # every temporary outlives the calls that read it
+        _ = x^
+        _ = xi^
+        _ = d^
+        _ = p^
+        _ = bins^
+        _ = clamped^
+        _ = ge^
+        _ = le^
+        _ = inside^
+        _ = weights^
+    var out = _cast(counts.t, a.stype)
+    _ = counts^
+    return out^
+
+
 def _histc(a: T, nbins: Int, min_v: Value, max_v: Value) raises -> Owned:
     if not a.on_mojo():
         raise Error("expected a tensor on the mojo device")
     if a.dtype == DType.float16:
         raise Error("HalfTensor is not supported")
     var dt = a.dtype
-    if not (
-        dt == DType.float32
-        or dt == DType.float64
-        or dt == DType.int64
-        or dt == DType.int32
-    ):
+    if not (dt == DType.float32 or dt == DType.float64 or _is_index_int(dt)):
         raise Error(
             '"histc" not implemented for \'', _scalar_type_name(dt), "'"
         )
@@ -432,18 +474,30 @@ def _histc(a: T, nbins: Int, min_v: Value, max_v: Value) raises -> Owned:
         alert_not_deterministic("_histc_cuda with floating point input")
     if nbins <= 0:
         raise Error("bins must be > 0")
-    var lo: Float64
-    var hi: Float64
-    if dt.is_floating_point():
-        # bounds_t is float for float32 (Scalar::to<float> is checked).
-        lo = scalar_to_float(min_v, a.stype)
-        hi = scalar_to_float(max_v, a.stype)
-        if dt == DType.float32:
-            lo = Float64(Float32(lo))
-            hi = Float64(Float32(hi))
-    else:
-        lo = Float64(scalar_to_int(min_v, ST_INT64))
-        hi = Float64(scalar_to_int(max_v, ST_INT64))
+    if not dt.is_floating_point():
+        # bounds_t is int64 for every integer input.
+        var ilo = scalar_to_int(min_v, ST_INT64)
+        var ihi = scalar_to_int(max_v, ST_INT64)
+        if ilo == ihi and a.numel > 0:
+            var r = call_op(
+                "aten::aminmax", "", [_t(a), none_arg(), bool_arg(False)], 2
+            )
+            var mn = own(r.take_tensor(0))
+            var mx = own(r.take_tensor(1))
+            ilo = _read_scalar_int(mn)
+            ihi = _read_scalar_int(mx)
+        if ilo == ihi:
+            ilo -= 1
+            ihi += 1
+        if not (ilo < ihi):
+            raise Error("max must be larger than min")
+        return _histc_counts_int(a, nbins, ilo, ihi)
+    # bounds_t is float for float32 (Scalar::to<float> is checked).
+    var lo = scalar_to_float(min_v, a.stype)
+    var hi = scalar_to_float(max_v, a.stype)
+    if dt == DType.float32:
+        lo = Float64(Float32(lo))
+        hi = Float64(Float32(hi))
     if lo == hi and a.numel > 0:
         var mm = _aminmax_host(a)
         lo = mm[0]
@@ -464,7 +518,7 @@ def _histc(a: T, nbins: Int, min_v: Value, max_v: Value) raises -> Owned:
         )
     if not (lo < hi):
         raise Error("max must be larger than min")
-    return _histc_counts(a, nbins, lo, hi)
+    return _histc_counts_float(a, nbins, lo, hi)
 
 
 # aten::histc(Tensor self, int bins=100, Scalar min=0, Scalar max=0) -> Tensor
@@ -492,6 +546,7 @@ def op_histc_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # `_histc_out_cuda`: resize_output + copy_ (which converts).
     if not out.same_shape(res.t):
         resize_out(out, res.t.shape, 1)
+    assert_no_internal_overlap(out)
     var conv = _cast(res.t, out.stype)
     _ = res^  # alive past the cast
     copy_strided_into(out, conv.t)
@@ -1065,6 +1120,8 @@ def _hist_into_outs(
         resize_out(hist_out, res[0].t.shape, res[0].t.rank)
     if not edges_out.same_shape(res[1].t):
         resize_out(edges_out, res[1].t.shape, res[1].t.rank)
+    assert_no_internal_overlap(hist_out)
+    assert_no_internal_overlap(edges_out)
     copy_strided_into(hist_out, res[0].t)
     copy_strided_into(edges_out, res[1].t)
 
@@ -1296,6 +1353,7 @@ def op_renorm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 #   -> Tensor(a!)
 def op_renorm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
+    assert_no_internal_overlap(a)
     var res = _renorm(
         a,
         args[unsafe_offset=1],
@@ -1559,7 +1617,7 @@ def op__fused_rms_norm_backward(
         _ = term1^
         _ = dxf^
     else:
-        dx = _empty_like_result(x.stype, x.device)
+        dx = _empty_like_result(x.stype, x.device)  # released, never returned
     var dw: Owned
     if want_dw and has_w:
         var w = v_tensor(args[unsafe_offset=4])
@@ -1580,15 +1638,20 @@ def op__fused_rms_norm_backward(
         _ = b1^
         _ = b2^
     else:
-        var wst = x.stype
-        if has_w:
-            wst = v_tensor(args[unsafe_offset=4]).stype
-        dw = _empty_like_result(wst, x.device)
+        dw = _empty_like_result(x.stype, x.device)
     _ = xf^
     _ = dyf^
     _ = rf^
-    ret_owned(rets, 0, dx)
-    ret_owned(rets, 1, dw)
+    # A masked-off (or weightless) gradient is an undefined Tensor: a None
+    # record for a `Tensor` result (shim_dispatch.cpp `from_record`).
+    if want_dx:
+        ret_owned(rets, 0, dx)
+    else:
+        rets[unsafe_offset=0] = none_arg()
+    if want_dw and has_w:
+        ret_owned(rets, 1, dw)
+    else:
+        rets[unsafe_offset=1] = none_arg()
 
 
 # ---------------------------------------------------------------------------

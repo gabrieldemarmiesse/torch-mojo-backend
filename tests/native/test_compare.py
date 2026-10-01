@@ -250,6 +250,14 @@ def test_isin_float_and_mixed_dtypes(mojo_gpu: str):
     )
 
 
+def test_isin_float_scalar_against_integers(mojo_gpu: str):
+    t = torch.tensor([1, 2, 3])
+    for el in (2.0, 2.5):
+        torch.testing.assert_close(
+            torch.isin(el, t.to(mojo_gpu)).cpu(), torch.isin(el, t)
+        )
+
+
 def test_isin_unsupported_dtype_raises(mojo_gpu: str):
     elements = torch.tensor([1, 2], dtype=torch.uint8).to(mojo_gpu)
     test_elements = torch.tensor([1], dtype=torch.uint8).to(mojo_gpu)

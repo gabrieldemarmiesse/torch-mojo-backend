@@ -24,6 +24,7 @@ the original dim positions). The kernels validate the output by element count,
 contiguity, device and dtype only, so no post-reduction reshape is needed even
 on the permuted route.
 """
+from std.math import sqrt
 from std.utils import IndexList
 from std.utils.numerics import max_or_inf, min_or_neg_inf, nan
 
@@ -34,9 +35,11 @@ from tmb.backend.abi import (
     ST_FLOAT32,
     ST_UINT8,
     ST_UINT64,
+    TAG_BOOL,
     TAG_INT,
     TAG_INT_LIST,
     TAG_NONE,
+    TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
     IntList,
     Owned,
@@ -47,6 +50,7 @@ from tmb.backend.abi import (
     dtype_code,
     dtype_itemsize,
     dtype_name,
+    f64_bits,
     index_error,
     max_dtype,
     new_like,
@@ -1950,6 +1954,164 @@ def _flat_if_scalar(mut src: Operand, mut dims: List[Int]) raises:
     dims.append(0)
 
 
+def _var_mean_into(
+    a: T,
+    var dims: List[Int],
+    keepdim: Bool,
+    correction: Float64,
+    dst: T,
+    mean_dst: T,
+) raises:
+    """VarMeanSpec: the variance and the mean of one Welford-style pass
+    (`_reduce_into`'s slots plus the mean's spec)."""
+    one_device(a, dst)
+    var src = _ready_operand(a, dims, False)
+    var ctx = ctx_for(dst.device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall("reduction", "VarMeanSpec")
+    call.arg_dtype(0, src.t.dtype)
+    call.out_dtype(dst.dtype)
+    call.spec(src.t.spec(cp))
+    call.tuple(dims)
+    call.int(1 if keepdim else 0)
+    call.f64(correction)
+    call.spec(dst.spec(cp))
+    call.spec(mean_dst.spec(cp))
+    call.run()
+    _ = ctx
+    _ = src^
+
+
+def _int64_list(dims: List[Int]) -> List[Int64]:
+    var out = List[Int64]()
+    for d in dims:
+        out.append(Int64(d))
+    return out^
+
+
+def _dims_value(dims: List[Int64]) -> Value:
+    """An `int[]` record over `dims` (keep `dims` alive across the call)."""
+    return Value(
+        TAG_INT_LIST, Int32(len(dims)), Int64(Int(dims.unsafe_ptr())), 0
+    )
+
+
+def _moments_f64(
+    a: T,
+    dims: List[Int],
+    keepdim: Bool,
+    correction: Float64,
+    take_sqrt: Bool,
+    want_mean: Bool,
+) raises -> Tuple[Owned, Owned]:
+    """float64 var/std(_mean), composed from the float64 mean/sum kernels as
+    a two-pass `sum((x - mean)^2) / max(n - correction, 0)` in double (the
+    moments kernel accumulates in float32 and has no float64 form)."""
+    _decline_metal_float64(a, "std/var")
+    var d64 = _int64_list(dims)
+    var n = 1
+    for d in dims:
+        n *= a.dim(d)
+    var mean_k = call_op(
+        "aten::mean",
+        "dim",
+        [
+            tensor_arg(a),
+            _dims_value(d64),
+            Value(TAG_BOOL, 0, 1, 0),
+            Value(TAG_NONE, 0, 0, 0),
+        ],
+        1,
+    )
+    var mk = own(mean_k.take_tensor(0))
+    var diff = call_op(
+        "aten::sub",
+        "Tensor",
+        [tensor_arg(a), tensor_arg(mk.t), Value(TAG_SCALAR_INT, 0, 1, 0)],
+        1,
+    )
+    var dt = own(diff.take_tensor(0))
+    var sq = call_op(
+        "aten::mul", "Tensor", [tensor_arg(dt.t), tensor_arg(dt.t)], 1
+    )
+    var st = own(sq.take_tensor(0))
+    var ss = call_op(
+        "aten::sum",
+        "dim_IntList",
+        [
+            tensor_arg(st.t),
+            _dims_value(d64),
+            Value(TAG_BOOL, 0, Int64(1) if keepdim else Int64(0), 0),
+            Value(TAG_NONE, 0, 0, 0),
+        ],
+        1,
+    )
+    var sst = own(ss.take_tensor(0))
+    var divisor = max(Float64(n) - correction, 0.0)
+    var var_t: Owned
+    if take_sqrt:
+        # sqrt(ss / divisor) as ||x - mean||_2 / sqrt(divisor): the float64
+        # vector norm takes the root on the device (this device has no
+        # float64 sqrt kernel); within an ulp of the direct form.
+        var nr = call_op(
+            "aten::linalg_vector_norm",
+            "",
+            [
+                tensor_arg(dt.t),
+                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(2.0), 0),
+                _dims_value(d64),
+                Value(TAG_BOOL, 0, Int64(1) if keepdim else Int64(0), 0),
+                Value(TAG_NONE, 0, 0, 0),
+            ],
+            1,
+        )
+        var nt = own(nr.take_tensor(0))
+        var sr = call_op(
+            "aten::div",
+            "Scalar",
+            [
+                tensor_arg(nt.t),
+                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(sqrt(divisor)), 0),
+            ],
+            1,
+        )
+        var_t = own(sr.take_tensor(0))
+        _ = nt^  # alive past the call that reads it
+    else:
+        var vr = call_op(
+            "aten::div",
+            "Scalar",
+            [
+                tensor_arg(sst.t),
+                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(divisor), 0),
+            ],
+            1,
+        )
+        var_t = own(vr.take_tensor(0))
+    var mean_t: Owned
+    if want_mean:
+        var mr = call_op(
+            "aten::mean",
+            "dim",
+            [
+                tensor_arg(a),
+                _dims_value(d64),
+                Value(TAG_BOOL, 0, Int64(1) if keepdim else Int64(0), 0),
+                Value(TAG_NONE, 0, 0, 0),
+            ],
+            1,
+        )
+        mean_t = own(mr.take_tensor(0))
+    else:
+        mean_t = own(new_tensor(IndexList[MAX_RANK](0), 1, a.stype, a.device))
+    _ = mk^  # every temporary outlives the calls that read it
+    _ = dt^
+    _ = st^
+    _ = sst^
+    _ = d64^
+    return (var_t^, mean_t^)
+
+
 def _moments_into(
     a: T,
     dims: List[Int],
@@ -1967,14 +2129,15 @@ def _moments_into(
 
     `a` is first cast to `res_st` (make_reduction's in_dtype = out_dtype;
     half -> float32 is exact, so CUDA's mixed-precision special case agrees).
-    std computes the variance in float32 and rounds once after the root, as
-    CUDA's Welford `project(take_sqrt)` does: a half operand is widened
-    first, which is exact. An empty operand gives NaN (ATen's trivial
-    reduction)."""
-    if a.dtype == DType.float64 or max_dtype(res_st) == DType.float64:
-        unsupported("std/var of float64 (the moments kernel has no float64)")
-    if not _is_float3(max_dtype(res_st)):
-        unsupported("std/var into dtype " + String(max_dtype(res_st)))
+    The variance and the mean come out of ONE moments pass (the mean is the
+    pass's shift plus the mean deviation, so it cannot overflow where a sum
+    would). std computes the variance in float32 and rounds once after the
+    root, as CUDA's Welford `project(take_sqrt)` does: a half operand is
+    widened first, which is exact. An empty operand gives NaN (ATen's
+    trivial reduction)."""
+    var rdt = max_dtype(res_st)
+    if not _is_float3(rdt) and rdt != DType.float64:
+        unsupported("std/var into dtype " + String(rdt))
     var var_out = own(new_tensor(shape, rank, res_st, a.device))
     var mean_out = own(
         new_tensor(shape, rank, res_st, a.device) if want_mean else new_tensor(
@@ -1988,46 +2151,58 @@ def _moments_into(
         return (var_out^, mean_out^)
     var src = _borrow(a)
     if src.t.stype != res_st:
+        _decline_metal_float64_dtype(rdt, src.t, "std/var")
         src.replace(cast_to(src.t, res_st), True)
     var rdims = dims.copy()
+    if rdt == DType.float64:
+        var all = rdims.copy()
+        if src.t.rank > 0 and len(all) == 0:
+            all = _trailing_dims(src.t.rank, src.t.rank)
+        var r = _moments_f64(
+            src.t, all, keepdim, correction, take_sqrt, want_mean
+        )
+        copy_strided_into(var_out.t, r[0].t)
+        if want_mean:
+            copy_strided_into(mean_out.t, r[1].t)
+        _ = r^  # alive past the copies
+        _ = src^
+        return (var_out^, mean_out^)
     var kd = keepdim and src.t.rank != 0
     _flat_if_scalar(src, rdims)
-    if want_mean:
-        _reduce_into(
-            "nn", "MeanSpec", src.t, rdims.copy(), kd, mean_out.t, False, 0.0
+    var work_st = ST_FLOAT32 if take_sqrt else res_st
+    var wide = own_if_new(cast_to(src.t, work_st), src.t)
+    var vt = own(new_tensor(shape, rank, work_st, a.device))
+    var mt = own(
+        new_tensor(shape, rank, work_st, a.device) if want_mean else new_tensor(
+            IndexList[MAX_RANK](0), 1, work_st, a.device
         )
-    if not take_sqrt:
+    )
+    if want_mean:
+        _var_mean_into(wide.t, rdims.copy(), kd, correction, vt.t, mt.t)
+    else:
         _reduce_into(
             "reduction",
             "VarSpec",
-            src.t,
+            wide.t,
             rdims.copy(),
             kd,
-            var_out.t,
+            vt.t,
             True,
             correction,
         )
-        _ = src^  # alive past the launches
-        return (var_out^, mean_out^)
-    # std: the variance in float32, one rounding after the root.
-    var wide = own_if_new(cast_to(src.t, ST_FLOAT32), src.t)
-    _ = src^  # alive past the cast (and the mean launch above)
-    var moments = own(new_tensor(shape, rank, ST_FLOAT32, a.device))
-    _reduce_into(
-        "reduction",
-        "VarSpec",
-        wide.t,
-        rdims.copy(),
-        kd,
-        moments.t,
-        True,
-        correction,
-    )
     _ = wide^  # alive past the launch
-    var root = own(_std_sqrt(moments.t))
-    _ = moments^
-    cast_into(var_out.t, root.t)
-    _ = root^  # alive past the launch
+    _ = src^
+    if take_sqrt:
+        var root = own(_std_sqrt(vt.t))
+        _ = vt^  # alive past the call that reads it
+        vt = root^
+    if work_st == res_st:
+        return (vt^, mt^)
+    cast_into(var_out.t, vt.t)
+    if want_mean:
+        cast_into(mean_out.t, mt.t)
+    _ = vt^  # alive past the launches
+    _ = mt^
     return (var_out^, mean_out^)
 
 
