@@ -177,7 +177,7 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "matmul": ("float32", "bfloat16", "float16", "int64"),
     "matrix_exp": ("float32", "bfloat16", "float16"),
     "mm": ("float32", "bfloat16", "float16", "int64"),
-    "mode": ("bfloat16", "float16", "int64", "bool"),
+    "mode": ("bfloat16", "int64", "bool"),
     "mv": ("float32", "bfloat16", "float16", "int64"),
     "nanmean": ("float32", "bfloat16", "float16"),
     "nanquantile": ("float32",),
@@ -239,6 +239,7 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "triangular_solve": ("float32",),
     "unique_consecutive": ("float32", "bfloat16", "float16", "int64", "bool"),
     "view_as_complex": ("float32", "float16"),
+    "logcumsumexp": ("float16",),
 }
 # --- END GENERATED test_matches_cpu ---
 

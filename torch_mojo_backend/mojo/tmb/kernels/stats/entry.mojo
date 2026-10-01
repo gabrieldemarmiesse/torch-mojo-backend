@@ -42,7 +42,7 @@ from tmb.kernels.common.op_utils import (
     _raw_f64,
     _raw_int,
     _spec_dispatcher7,
-    _spec_dispatcher8,
+    _spec_dispatcher9,
     _spec_dispatcher13,
 )
 from tmb.kernels.common.variant_gates import (
@@ -162,13 +162,18 @@ def _mode_runs_kernel[
     sorted_i: Pointer[Scalar[DType.int64], ImmutAnyOrigin],
     rows_arg: Int64,
     n_arg: Int64,
+    first_arg: Int64,
 ):
     """One thread per sorted row. A run ends where the next value differs
     (`!=`, so every NaN is a run of its own, as CUDA's segment flags are);
-    the first longest run wins (the smallest value), and the stable sort
-    leaves its largest original index last."""
+    the first longest run wins (the smallest value). The stable sort orders
+    a run by original index, so its last element is the LARGEST index of the
+    mode (CUDA's fused kernel, rows up to 2048) and its first the SMALLEST
+    (`first_arg`: CUDA's thrust fallback for longer rows, `thrust::find` on
+    the stably sorted row)."""
     var rows = Int(rows_arg)
     var n = Int(n_arg)
+    var first = Int(first_arg) != 0
     var r = Int(block_idx.x) * STATS_THREADS + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * STATS_THREADS
     while r < rows:
@@ -189,8 +194,9 @@ def _mode_runs_kernel[
                     best_len = run
                     best_end = j
                 run = 0
+        var pick = best_end - best_len + 1 if first else best_end
         out_v[unsafe_offset=r] = sorted_v[unsafe_offset=base + best_end]
-        out_i[unsafe_offset=r] = sorted_i[unsafe_offset=base + best_end]
+        out_i[unsafe_offset=r] = sorted_i[unsafe_offset=base + pick]
         r += stride
 
 
@@ -418,11 +424,12 @@ def _mode_dispatch(
     si_o: Arg,
     rows_o: Arg,
     n_o: Arg,
+    first_o: Arg,
     dtype_o: Arg,
     ctx_o: Arg,
 ) raises:
     """Slots: values out, indices out, sorted values, sorted indices, rows,
-    n, dtype code, context."""
+    n, whether to report the first index of the mode, dtype code, context."""
     var dtype = _raw_dtype_int(dtype_o)
     var rows = _raw_int(rows_o)
     var n = _raw_int(n_o)
@@ -452,6 +459,7 @@ def _mode_dispatch(
                         .as_imm(),
                         Int64(rows),
                         Int64(n),
+                        Int64(_raw_int(first_o)),
                     )
                     return
         raise Error("mojo mode: unsupported dtype ", dtype)
@@ -632,7 +640,7 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     """
     try:
         comptime if _op_on["ModeRuns"]():
-            _spec_dispatcher8[_mode_dispatch, "ModeRuns"](argv, argc)
+            _spec_dispatcher9[_mode_dispatch, "ModeRuns"](argv, argc)
             return 0
         comptime if _op_on["SegmentReduce"]():
             _spec_dispatcher13[_segment_go, "SegmentReduce"](argv, argc)

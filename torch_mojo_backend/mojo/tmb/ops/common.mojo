@@ -440,6 +440,8 @@ def is_cast_dtype(dt: DType) -> Bool:
         or dt == DType.float64
         or dt == DType.int64
         or dt == DType.int32
+        or dt == DType.int16
+        or dt == DType.int8
         or dt == DType.uint8
         or dt == DType.bool
     )

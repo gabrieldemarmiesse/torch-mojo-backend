@@ -3531,10 +3531,8 @@ def test_cumsum_empty_dtype_kwarg(mojo_gpu):
 def test_unsupported_inputs_raise_not_implemented(mojo_gpu):
     """Eager has no graph fallback: every gate the old fast path answered with
     NOT_HANDLED is an actionable NotImplementedError here."""
-    with pytest.raises(NotImplementedError):
-        # int8/int16 promote to int64 through a cast the cast kernel does not
-        # dispatch on (same gap sum.IntList_out/cumsum document elsewhere).
-        torch.tensor(3, dtype=torch.int8).to(mojo_gpu).sum()
+    # int8/int16 promote to int64 through the device cast kernel.
+    assert torch.tensor(3, dtype=torch.int8).to(mojo_gpu).sum().item() == 3
     with pytest.raises(NotImplementedError):
         torch.mean(torch.randint(0, 4, (3, 4), dtype=torch.int64).to(mojo_gpu), dim=1)
     # An empty reduce dim is torch's own IndexError, not a decline.
@@ -4302,3 +4300,41 @@ def test_median_and_kthvalue_errors(mojo_gpu):
         torch.median(torch.empty(2, 0).to(mojo_gpu), 1)
     with pytest.raises(RuntimeError, match="not implemented for 'Bool'"):
         torch.median(torch.tensor([True, False]).to(mojo_gpu), 0)
+
+
+@pytest.mark.parametrize("op", [torch.var_mean, torch.std_mean])
+@pytest.mark.parametrize("dim", [None, 0, 1])
+def test_var_mean_takes_the_mean_from_the_moments_pass(mojo_gpu, op, dim):
+    """The mean of [3e38, 3e38] is 3e38: a sum / n would overflow to inf."""
+    x = torch.full((4, 2), 3e38)
+    v, m = op(x.to(mojo_gpu), dim=dim)
+    rv, rm = op(x, dim=dim)
+    torch.testing.assert_close(m.cpu(), rm)
+    torch.testing.assert_close(v.cpu(), rv)
+    y = torch.randn(64, 257)
+    v, m = op(y.to(mojo_gpu), dim=dim)
+    rv, rm = op(y, dim=dim)
+    torch.testing.assert_close(m.cpu(), rm, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(v.cpu(), rv, atol=1e-5, rtol=1e-4)
+
+
+def test_var_mean_split_reduction_mean(mojo_gpu):
+    """A full reduction long enough to split across blocks: the mean comes
+    out of the merge."""
+    x = torch.randn(1 << 20) + 5.0
+    v, m = torch.var_mean(x.to(mojo_gpu))
+    rv, rm = torch.var_mean(x.double())
+    torch.testing.assert_close(m.cpu().double(), rm, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(v.cpu().double(), rv, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("op", [torch.var, torch.std])
+@pytest.mark.parametrize("dim", [None, 1, (0, 2)])
+def test_std_var_float64(mojo_gpu, op, dim):
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.randn(3, 5, 7, dtype=torch.float64)
+    torch.testing.assert_close(op(x.to(mojo_gpu), dim=dim).cpu(), op(x, dim=dim))
+    v, m = torch.var_mean(x.to(mojo_gpu), dim=dim, correction=0)
+    rv, rm = torch.var_mean(x, dim=dim, correction=0)
+    torch.testing.assert_close(v.cpu(), rv)
+    torch.testing.assert_close(m.cpu(), rm)

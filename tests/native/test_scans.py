@@ -103,6 +103,13 @@ def test_cum_inplace_method(mojo_gpu, op):
 
 
 @pytest.mark.parametrize("op", [torch.cumsum, torch.cumprod])
+def test_cum_inplace_refuses_internal_overlap(mojo_gpu, op):
+    name = op.__name__ + "_"
+    with pytest.raises(RuntimeError, match="single memory location"):
+        getattr(torch.ones(1, device=mojo_gpu).expand(3), name)(0)
+
+
+@pytest.mark.parametrize("op", [torch.cumsum, torch.cumprod])
 def test_cum_zero_dim_and_empty(mojo_gpu, op):
     s = torch.tensor(3.5)
     torch.testing.assert_close(op(s.to(mojo_gpu), 0).cpu(), op(s, 0))
@@ -236,3 +243,37 @@ def test_cummax_cummin_out_and_noncontiguous(mojo_gpu, op):
     s = torch.tensor(2.0)
     rv, ri = op(s.to(mojo_gpu), 0)
     assert rv.item() == 2.0 and ri.item() == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_half_cumprod_keeps_cudas_overflow(mojo_gpu, dtype):
+    """CUDA's scan keeps the running product in the element dtype: once it
+    overflows to inf it stays inf (a float32 running value would come back
+    down to 32768)."""
+    x = torch.tensor([[256.0, 256.0], [256.0, 256.0], [0.5, 0.5]], dtype=dtype)
+    got = torch.cumprod(x.to(mojo_gpu), 0).cpu().float()
+    if dtype == torch.float16:
+        assert got[:, 0].tolist() == [256.0, float("inf"), float("inf")]
+    # bfloat16 does not overflow there; it must match the dtype-rounded scan.
+    ref = x.clone()
+    for r in range(1, 3):
+        ref[r] = ref[r - 1] * x[r]
+    torch.testing.assert_close(got, ref.float())
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.uint8, torch.int16])
+@pytest.mark.parametrize("op", [torch.cumsum, torch.cumprod])
+def test_cum_into_narrow_integer_dtype(mojo_gpu, op, dtype):
+    x = torch.randint(-5, 50, (4, 9))
+    got = op(x.to(mojo_gpu), 1, dtype=dtype)
+    assert got.dtype == dtype
+    torch.testing.assert_close(got.cpu(), op(x, 1, dtype=dtype))
+
+
+def test_logcumsumexp_integer_scalar_and_empty(mojo_gpu):
+    s = torch.tensor(5)
+    got = torch.logcumsumexp(s.to(mojo_gpu), 0)
+    assert got.dtype == torch.int64 and got.item() == 5
+    e = torch.empty(0, 3, dtype=torch.int64)
+    got = torch.logcumsumexp(e.to(mojo_gpu), 1)
+    assert got.shape == (0, 3) and got.dtype == torch.int64

@@ -2290,6 +2290,8 @@ comptime CAST_DTYPES = [
     DType.float64,
     DType.int64,
     DType.int32,
+    DType.int16,
+    DType.int8,
     DType.uint8,
     DType.bool,
 ]

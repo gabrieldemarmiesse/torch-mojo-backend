@@ -20,12 +20,19 @@
 #                         shared memory (Hillis-Steele) and threaded together by
 #                         a running carry.
 #
-# ACCUMULATION. Floating operands accumulate in float32 (float64 in float64)
-# and round once per output element, as the nn family's cumsum and CPU torch
-# do; integers accumulate in their own dtype (int64 wraps like torch). CUDA's
-# `scan_dim` keeps its running value in the element dtype and combines in a
-# tree; a sequential half-precision running value would drift further from the
-# exact answer than either, so the float32 accumulator is the faithful choice.
+# FOLLOW-UP (performance): a long scan dim over FEW lines still runs one block
+# (or one thread) per line, e.g. `cumprod(randn(10**6))` is a single block
+# walking 4000 tiles. The nn family's three-pass workspace scan does this for
+# cumsum; generalizing it to `ScanOp` (chunk totals -> scan of the totals ->
+# re-scan seeded with each chunk's prefix) is the fix.
+#
+# ACCUMULATION. Every combine computes in float32 for the half dtypes
+# (float64 in float64; integers in their own dtype, int64 wrapping like
+# torch). cumprod and logcumsumexp then round the running value to the
+# element dtype after every combine, as CUDA's `scan_dim<scalar_t>` keeps it
+# (that is what makes a half cumprod that overflows stay inf). cumsum keeps the
+# float32 running value and rounds once per output, like the nn family's
+# block prefix sums it complements.
 # cummax / cummin only select, so they run in the operand's own dtype.
 #
 # TIES AND NaN. cummax / cummin follow ATen's `scan_dim_with_indices` (and CPU's
@@ -132,6 +139,9 @@ trait ScanOp:
     comptime name: StaticString
     comptime dtypes: List[DType]
     comptime with_index: Bool
+    comptime rounds: Bool
+    """Does CUDA keep the running value in the element dtype (rounding a
+    half/bfloat16 value after every combine)?"""
 
     @staticmethod
     def acc_dtype[dt: DType]() -> DType:
@@ -154,6 +164,7 @@ struct SumScan(ScanOp):
     comptime name = "sum"
     comptime dtypes = SUM_DTYPES
     comptime with_index = False
+    comptime rounds = False
 
     @staticmethod
     def acc_dtype[dt: DType]() -> DType:
@@ -176,6 +187,7 @@ struct ProdScan(ScanOp):
     comptime name = "prod"
     comptime dtypes = SUM_DTYPES
     comptime with_index = False
+    comptime rounds = True
 
     @staticmethod
     def acc_dtype[dt: DType]() -> DType:
@@ -217,6 +229,7 @@ struct LogSumExpScan(ScanOp):
     comptime name = "logsumexp"
     comptime dtypes = FLOAT_DTYPES
     comptime with_index = False
+    comptime rounds = True
 
     @staticmethod
     def acc_dtype[dt: DType]() -> DType:
@@ -262,6 +275,7 @@ struct MaxScan(ScanOp):
     comptime name = "max"
     comptime dtypes = SELECT_DTYPES
     comptime with_index = True
+    comptime rounds = False
 
     @staticmethod
     def acc_dtype[dt: DType]() -> DType:
@@ -287,6 +301,7 @@ struct MinScan(ScanOp):
     comptime name = "min"
     comptime dtypes = SELECT_DTYPES
     comptime with_index = True
+    comptime rounds = False
 
     @staticmethod
     def acc_dtype[dt: DType]() -> DType:
@@ -310,18 +325,24 @@ struct MinScan(ScanOp):
 
 @always_inline
 def _merge[
-    Op: ScanOp, acc: DType
+    Op: ScanOp, dtype: DType, acc: DType
 ](a_v: Scalar[acc], a_i: Int64, b_v: Scalar[acc], b_i: Int64) -> Tuple[
     Scalar[acc], Int64
 ]:
     """(earlier a) then (later b): a value scan combines, a selecting scan
-    keeps whichever element wins together with its index."""
+    keeps whichever element wins together with its index. A rounding scan
+    (`Op.rounds`) stores every combined value in the element dtype, as
+    CUDA's `scan_dim<scalar_t>` does: a half cumprod that overflows to inf
+    stays inf."""
     comptime if Op.with_index:
         if Op.take_later[acc](a_v, b_v):
             return (b_v, b_i)
         return (a_v, a_i)
     else:
-        return (Op.combine[acc](a_v, b_v), a_i)
+        var c = Op.combine[acc](a_v, b_v)
+        comptime if Op.rounds and dtype != acc:
+            c = c.cast[dtype]().cast[acc]()
+        return (c, a_i)
 
 
 @__llvm_metadata(
@@ -354,7 +375,7 @@ def _scan_lines_kernel[
         for r in range(n):
             var off = base + r * inner
             var x = in_ptr[unsafe_offset=off].cast[acc]()
-            var m = _merge[Op, acc](v, vi, x, Int64(r))
+            var m = _merge[Op, dtype, acc](v, vi, x, Int64(r))
             v = m[0]
             vi = m[1]
             out_ptr[unsafe_offset=off] = v.cast[dtype]()
@@ -409,7 +430,7 @@ def _scan_rows_kernel[
                 var cv = sv[unsafe_offset=tid]
                 var ci = si[unsafe_offset=tid]
                 if tid >= off:
-                    var m = _merge[Op, acc](
+                    var m = _merge[Op, dtype, acc](
                         sv[unsafe_offset=tid - off],
                         si[unsafe_offset=tid - off],
                         cv,
@@ -422,14 +443,14 @@ def _scan_rows_kernel[
                 si[unsafe_offset=tid] = ci
                 barrier()
                 off *= 2
-            var r = _merge[Op, acc](
+            var r = _merge[Op, dtype, acc](
                 carry_v, carry_i, sv[unsafe_offset=tid], si[unsafe_offset=tid]
             )
             if j < n:
                 out_ptr[unsafe_offset=base + j] = r[0].cast[dtype]()
                 comptime if Op.with_index:
                     idx_ptr[unsafe_offset=base + j] = r[1]
-            var c = _merge[Op, acc](
+            var c = _merge[Op, dtype, acc](
                 carry_v,
                 carry_i,
                 sv[unsafe_offset=SCAN_THREADS - 1],

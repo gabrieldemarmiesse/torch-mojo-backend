@@ -96,6 +96,7 @@ from tmb.kernels.common.op_utils import (
     _spec_dispatcher2,
     _spec_dispatcher4,
     _spec_dispatcher5,
+    _spec_dispatcher6,
     _spec_ptr,
     _vec16_phase,
 )
@@ -219,6 +220,24 @@ def _moment_finish[
 
 
 @always_inline
+def _moment_mean[
+    dtype: DType
+](
+    mean_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    o: Int,
+    shift: Float32,
+    s: Float32,
+    n: Int,
+):
+    """var_mean / std_mean's mean, out of the same pass: the shift plus the
+    mean deviation from it. Never a plain sum / n, which overflows float32 on
+    data near its range (`[3e38, 3e38]` has mean 3e38, not inf). A null
+    pointer (var / std alone) writes nothing."""
+    if Int(mean_ptr) != 0:
+        mean_ptr[unsafe_offset=o] = (shift + s / Float32(n)).cast[dtype]()
+
+
+@always_inline
 def _moment_flag_repass[
     dtype: DType
 ](
@@ -251,6 +270,28 @@ def _moment_flag_repass[
 
 
 @always_inline
+def _moment_shift[
+    dtype: DType
+](
+    ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    o: Int,
+    meta: Int,
+    reduce_n: Int,
+    inner: Int,
+    repass: Int,
+) -> Float32:
+    """The shift the split partials of output `o` were taken about: the
+    slice's first element, or on the re-pass the accurate mean the first
+    merge recorded."""
+    if repass != 0:
+        return ws_ptr[unsafe_offset=meta + o]
+    return in_ptr[unsafe_offset=_moment_slice_base(o, reduce_n, inner)].cast[
+        DType.float32
+    ]()
+
+
+@always_inline
 def _moment_slice_base(o: Int, reduce_n: Int, inner: Int) -> Int:
     """Flat index of the first element of output `o`'s reduced slice.
 
@@ -267,6 +308,7 @@ def _moments_contig_kernel[
     dtype: DType
 ](
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    mean_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
     in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     cols_arg: Int64,
@@ -357,6 +399,7 @@ def _moments_contig_kernel[
     # the whole block agrees, and a second read about the now-known accurate
     # mean removes the cancellation entirely.
     if fused and _moment_cancels(bs, bq, cols):
+        shift = shift + bs / Float32(cols)
         _moments_scan_contig[V=V, vec_align=vec_align, threads=MOMENT_THREADS](
             in_ptr,
             start,
@@ -366,7 +409,7 @@ def _moments_contig_kernel[
             vec_start,
             tail_start,
             tid,
-            shift + bs / Float32(cols),
+            shift,
             s_t,
             q_t,
         )
@@ -378,6 +421,7 @@ def _moments_contig_kernel[
             out_ptr[unsafe_offset=row] = _moment_finish[dtype](
                 bs, bq, cols, correction
             )
+            _moment_mean[dtype](mean_ptr, row, shift, bs, cols)
         else:
             ws_ptr[unsafe_offset=split * outputs + row] = bs
             ws_ptr[unsafe_offset=(splits + split) * outputs + row] = bq
@@ -391,6 +435,7 @@ def _moments_strided_kernel[
     dtype: DType
 ](
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    mean_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
     in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     reduce_arg: Int64,
@@ -470,6 +515,7 @@ def _moments_strided_kernel[
         out_ptr[unsafe_offset=out_index] = _moment_finish[dtype](
             s, q, reduce_n, correction
         )
+        _moment_mean[dtype](mean_ptr, out_index, shift, s, reduce_n)
     else:
         ws_ptr[unsafe_offset=split * outputs + out_index] = s
         ws_ptr[unsafe_offset=(splits + split) * outputs + out_index] = q
@@ -483,6 +529,7 @@ def _moments_merge_thread_kernel[
     dtype: DType
 ](
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    mean_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
     in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     outputs_arg: Int64,
@@ -519,6 +566,15 @@ def _moments_merge_thread_kernel[
         s += ws_ptr[unsafe_offset=k * outputs + o]
         q += ws_ptr[unsafe_offset=(splits + k) * outputs + o]
     out_ptr[unsafe_offset=o] = _moment_finish[dtype](s, q, reduce_n, correction)
+    _moment_mean[dtype](
+        mean_ptr,
+        o,
+        _moment_shift[dtype](
+            ws_ptr, in_ptr, o, meta, reduce_n, Int(inner_arg), Int(repass_arg)
+        ),
+        s,
+        reduce_n,
+    )
     if Int(repass_arg) == 0:
         _moment_flag_repass[dtype](
             ws_ptr, in_ptr, o, outputs, meta, reduce_n, Int(inner_arg), s, q
@@ -533,6 +589,7 @@ def _moments_merge_block_kernel[
     dtype: DType
 ](
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    mean_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
     in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     outputs_arg: Int64,
@@ -568,6 +625,21 @@ def _moments_merge_block_kernel[
     if tid == 0:
         out_ptr[unsafe_offset=o] = _moment_finish[dtype](
             bs, bq, reduce_n, correction
+        )
+        _moment_mean[dtype](
+            mean_ptr,
+            o,
+            _moment_shift[dtype](
+                ws_ptr,
+                in_ptr,
+                o,
+                meta,
+                reduce_n,
+                Int(inner_arg),
+                Int(repass_arg),
+            ),
+            bs,
+            reduce_n,
         )
         if Int(repass_arg) == 0:
             _moment_flag_repass[dtype](
@@ -609,6 +681,7 @@ def _var_moments[
     dtype: DType
 ](
     out_addr: Int,
+    mean_addr: Int,
     in_addr: Int,
     outer: Int,
     reduce_n: Int,
@@ -626,6 +699,7 @@ def _var_moments[
         comptime sm_count = ctx.default_device_info.sm_count
         var target = MOMENT_BLOCKS_PER_SM * sm_count
         var mout = out_ptr.as_unsafe_any_origin()
+        var mmean = _make_ptr[dtype](mean_addr).as_unsafe_any_origin()
         var min_ = in_ptr.as_unsafe_any_origin().as_imm()
 
         var base_blocks = outputs
@@ -652,6 +726,7 @@ def _var_moments[
                     1,
                     MOMENT_THREADS,
                     mout,
+                    mmean,
                     no_ws,
                     min_,
                     Int64(reduce_n),
@@ -668,6 +743,7 @@ def _var_moments[
                     1,
                     MOMENT_THREADS,
                     mout,
+                    mmean,
                     no_ws,
                     min_,
                     Int64(reduce_n),
@@ -703,6 +779,7 @@ def _var_moments[
                     1,
                     MOMENT_THREADS,
                     mout,
+                    mmean,
                     ws_ptr,
                     min_,
                     Int64(reduce_n),
@@ -719,6 +796,7 @@ def _var_moments[
                     1,
                     MOMENT_THREADS,
                     mout,
+                    mmean,
                     ws_ptr,
                     min_,
                     Int64(reduce_n),
@@ -740,6 +818,7 @@ def _var_moments[
                     1,
                     MOMENT_THREADS,
                     mout,
+                    mmean,
                     ws_ptr,
                     min_,
                     Int64(outputs),
@@ -757,6 +836,7 @@ def _var_moments[
                     1,
                     MOMENT_THREADS,
                     mout,
+                    mmean,
                     ws_ptr,
                     min_,
                     Int64(outputs),
@@ -1151,6 +1231,38 @@ def _var_spec_into_go(
     corr_o: Arg,
     out_o: Arg,
 ) raises:
+    _var_spec_into(a_o, rdims_t, keepdim_o, corr_o, out_o, 0)
+
+
+def _var_mean_spec_into_go(
+    a_o: Arg,
+    rdims_t: Arg,
+    keepdim_o: Arg,
+    corr_o: Arg,
+    out_o: Arg,
+    mean_o: Arg,
+) raises:
+    """var_mean / std_mean: the variance and the mean out of one pass."""
+    ref mean = _spec_ptr(mean_o)[]
+    ref out = _spec_ptr(out_o)[]
+    if (
+        mean.numel != out.numel
+        or not mean.contig
+        or mean.dtype != out.dtype
+        or mean.ctx_ptr != out.ctx_ptr
+    ):
+        raise Error("mojo spec var_mean: mean buffer mismatch")
+    _var_spec_into(a_o, rdims_t, keepdim_o, corr_o, out_o, mean.ptr)
+
+
+def _var_spec_into(
+    a_o: Arg,
+    rdims_t: Arg,
+    keepdim_o: Arg,
+    corr_o: Arg,
+    out_o: Arg,
+    mean_addr: Int,
+) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
     # List[DType](...) wrap: op_utils.FLOAT_DTYPES is an rc1 Array literal and
@@ -1192,7 +1304,14 @@ def _var_spec_into_go(
             comptime if _dtype_arg_on[0, dt]():
                 if a.dtype == dt:
                     _var_moments[dt](
-                        addr, a.ptr, outer, reduce_n, inner, correction, ctx
+                        addr,
+                        mean_addr,
+                        a.ptr,
+                        outer,
+                        reduce_n,
+                        inner,
+                        correction,
+                        ctx,
                     )
 
 
@@ -1268,6 +1387,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["VarSpec"]():
             _spec_dispatcher5[_var_spec_into_go, "VarSpec"](argv, argc)
+            return 0
+        comptime if _op_on["VarMeanSpec"]():
+            _spec_dispatcher6[_var_mean_spec_into_go, "VarMeanSpec"](argv, argc)
             return 0
         comptime if _op_on["AnySpec"]():
             _spec_dispatcher4[
