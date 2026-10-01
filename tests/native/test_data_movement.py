@@ -2308,12 +2308,13 @@ def test_cat_cast_fallbacks(mojo_gpu, kind):
             expected.shape
         )
     elif kind == "overlap":
-        # Existing temporary route safely reads BF16 views before writing
-        # overlapping FP32 output. Preserve that backend behavior.
+        # A dense input overlapping the out: cat's meta raises, as on CUDA.
         out = torch.empty_like(expected, device=mojo_gpu, dtype=dtype)
         source = out.view(torch.bfloat16).reshape(-1)[:48].view(3, 16)
         source.copy_(torch.cat(hosts, 1).to(mojo_gpu))
-        parts = [source]
+        with pytest.raises(RuntimeError, match="single memory location"):
+            torch.cat([source], 1, out=out)
+        return
     else:
         out = torch.empty_like(expected, device=mojo_gpu, dtype=dtype)
     torch.cat(parts, 1, out=out)
@@ -3234,3 +3235,13 @@ def test_index_put_declined_inputs(mojo_gpu: str, case: str):
     with pytest.raises(NotImplementedError):
         data.index_put_((indices.to(mojo_gpu),), values)
     torch.testing.assert_close(data.cpu(), torch.zeros(3, 4))
+
+
+def test_cat_out_partial_overlap_raises(mojo_device):
+    """cat's meta checks the out against every input (TensorShape.cpp)."""
+    x = torch.arange(10.0, device=mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.cat([x[2:5], x[5:7]], out=x[:5])
+    # A disjoint out of the same storage is fine.
+    torch.cat([x[0:2], x[2:4]], out=x[5:9])
+    assert x.cpu()[5:9].tolist() == [0.0, 1.0, 2.0, 3.0]
