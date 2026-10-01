@@ -3245,3 +3245,26 @@ def test_cat_out_partial_overlap_raises(mojo_device):
     # A disjoint out of the same storage is fine.
     torch.cat([x[0:2], x[2:4]], out=x[5:9])
     assert x.cpu()[5:9].tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_cat_out_resized_overlap_raises(mojo_device):
+    """cat's meta resizes the out (same storage) and then checks overlap."""
+    x = torch.arange(10.0, device=mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.cat([x[:3], x[3:5]], out=x[:2])
+    assert x.cpu().tolist() == list(range(10))
+
+
+def test_cat_gather_index_select_index_put_out_overlap(mojo_device):
+    x = torch.arange(10.0, device=mojo_device)
+    for out in (x[:4], x[:0]):
+        with pytest.raises(RuntimeError, match="single memory location"):
+            torch.cat([x[2:5], x[5:7]], out=out)
+    a = torch.arange(12.0, device=mojo_device).view(3, 4)
+    i = torch.zeros(3, 4, dtype=torch.long, device=mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.gather(a, 0, i, out=a)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.index_select(a, 0, torch.tensor([0, 1, 2], device=mojo_device), out=a)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        a.index_put_((torch.tensor([0, 1, 2], device=mojo_device),), a)
