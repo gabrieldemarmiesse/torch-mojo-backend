@@ -2282,7 +2282,8 @@ def test_convolution_errors_match_torch(mojo_device, call, match):
     w = torch.randn(4, 3, 3, 3, device=mojo_device)
     with pytest.raises(RuntimeError, match=match):
         call(x, w)
-    with pytest.raises(RuntimeError, match=match):
+    # CPU raises too (its wording differs across torch versions for some).
+    with pytest.raises(RuntimeError):
         call(x.cpu(), w.cpu())
 
 
