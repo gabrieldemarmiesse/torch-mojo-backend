@@ -190,6 +190,7 @@ void* tmb_tensor_storage_data_ptr(TmbTensor t);
 void* tmb_tensor_storage_ctx(TmbTensor t);  // the allocation handle Mojo returned from alloc (NULL if not ours)
 int64_t tmb_tensor_storage_nbytes(TmbTensor t);
 void* tmb_tensor_storage_impl(TmbTensor t);  // the StorageImpl: two tensors share a storage iff these match
+int32_t tmb_tensor_storage_resizable(TmbTensor t);  // c10::StorageImpl::resizable() (false for DLPack imports)
 int32_t tmb_tensor_is_contiguous(TmbTensor t);
 int32_t tmb_tensor_is_neg(TmbTensor t);
 void* tmb_tensor_impl(TmbTensor t);  // the TensorImpl: two arguments are the same tensor iff these match
@@ -233,6 +234,7 @@ int32_t tmb_rng_manual_seed(int32_t device, uint64_t seed);  // device -1: all d
 int32_t tmb_rng_get_state(int32_t device, uint8_t* out16);
 int32_t tmb_rng_set_state(int32_t device, const uint8_t* in16);
 int32_t tmb_default_dtype(void);
+int32_t tmb_deterministic_fill_uninitialized(void);  // use_deterministic_algorithms && fill_uninitialized_memory
 int32_t tmb_alert_not_deterministic(const char* caller);
 // test support: per-schema conversion plans built since process start
 int64_t tmb_plan_builds(void);

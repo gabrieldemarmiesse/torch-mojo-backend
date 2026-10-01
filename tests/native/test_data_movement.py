@@ -1200,6 +1200,10 @@ def test_to_copy_between_mojo_and_cuda(mojo_gpu, kwargs):
     torch.testing.assert_close(
         x.cuda().transpose(1, 2).to(mojo_gpu).cpu(), x.transpose(1, 2)
     )
+    # A bare device type resolves to the current mojo device.
+    bare = torch.ops.aten._to_copy(x.cuda(), device=torch.device(mojo_gpu).type)
+    assert bare.device == torch.device(mojo_gpu)
+    torch.testing.assert_close(bare.cpu(), x, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -2681,6 +2685,44 @@ def test_resize_errors_match_cpu(mojo_gpu, size, memory_format, message):
     for device in ("cpu", mojo_gpu):
         with pytest.raises(RuntimeError, match=message):
             torch.empty(3, device=device).resize_(*size, memory_format=memory_format)
+
+
+def test_resize_refuses_a_storage_that_is_not_resizable(mojo_gpu):
+    imported = torch.from_dlpack(torch.arange(4.0).to(mojo_gpu))
+    assert not imported.untyped_storage().resizable()
+    with pytest.raises(
+        RuntimeError, match="Trying to resize storage that is not resizable"
+    ):
+        imported.resize_(100)
+    imported.resize_(2)  # shrinking reallocates nothing
+    assert imported.cpu().tolist() == [0.0, 1.0]
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.uint8,
+        torch.int64,
+        torch.bool,
+    ],
+)
+def test_resize_fills_new_memory_when_deterministic(mojo_gpu, dtype):
+    def grown(device):
+        t = torch.zeros(5, dtype=dtype, device=device)[1:3]
+        t.resize_(2, 3)
+        return t.untyped_storage().nbytes(), t.cpu()
+
+    torch.use_deterministic_algorithms(True)
+    try:
+        got, want = grown(mojo_gpu), grown("cpu")
+    finally:
+        torch.use_deterministic_algorithms(False)
+    assert got[0] == want[0]
+    torch.testing.assert_close(got[1], want[1], equal_nan=True, rtol=0, atol=0)
 
 
 def test_resize_as_(mojo_gpu):

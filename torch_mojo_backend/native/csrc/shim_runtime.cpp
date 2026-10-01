@@ -623,6 +623,7 @@ void* tmb_tensor_storage_ctx(TmbTensor t) {
 }
 int64_t tmb_tensor_storage_nbytes(TmbTensor t) { return static_cast<int64_t>(T(t).storage().nbytes()); }
 void* tmb_tensor_storage_impl(TmbTensor t) { return T(t).storage().unsafeGetStorageImpl(); }
+int32_t tmb_tensor_storage_resizable(TmbTensor t) { return T(t).storage().resizable() ? 1 : 0; }
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
 int32_t tmb_tensor_is_neg(TmbTensor t) { return T(t).is_neg(); }
 void* tmb_tensor_impl(TmbTensor t) { return T(t).unsafeGetTensorImpl(); }
@@ -823,6 +824,10 @@ int32_t tmb_rng_set_state(int32_t device, const uint8_t* in16) {
     tmb_set_error(e.what());
     return 1;
   }
+}
+
+int32_t tmb_deterministic_fill_uninitialized(void) {
+  return at::globalContext().deterministicAlgorithms() && at::globalContext().deterministicFillUninitializedMemory();
 }
 
 int32_t tmb_default_dtype(void) { return static_cast<int32_t>(c10::typeMetaToScalarType(c10::get_default_dtype())); }

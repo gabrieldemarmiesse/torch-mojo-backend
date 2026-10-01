@@ -22,6 +22,7 @@ did, via `cpu_empty` + `copy_to_host` + a plain host loop + `copy_from_host`.
 from std.ffi import external_call
 from std.memory import unsafe_memcpy
 from std.utils import IndexList
+from std.utils.numerics import nan
 
 from tmb.backend.abi import (
     DEVICE_TYPE_CPU,
@@ -108,6 +109,7 @@ from tmb.ops.common import (
     copy_strided_into,
     release_if_new,
     resize_out,
+    resize_storage_bytes,
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.core import (
@@ -775,9 +777,13 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
                 1,
             )
             var host = own(on_host.take_tensor(0))
+            var index = v_device_index(dev_v)
             var up = own(
                 _upload_from_cpu(
-                    host.t, host.t.stype, v_device_index(dev_v), non_blocking
+                    host.t,
+                    host.t.stype,
+                    index if index >= 0 else current_device(),
+                    non_blocking,
                 )
             )
             _ = host^  # read by the upload above
@@ -3114,15 +3120,6 @@ def op_is_set_to(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 comptime _INT64_MAX = 9223372036854775807
 
 
-def _sizes_list_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
-    var s = String("[")
-    for i in range(rank):
-        if i:
-            s += ", "
-        s += String(shape[MAX_RANK - rank + i])
-    return s + "]"
-
-
 # aten::resize_(Tensor(a!) self, SymInt[] size, *,
 #   MemoryFormat? memory_format=None) -> Tensor(a!)
 def op_resize_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -3140,46 +3137,28 @@ def op_resize_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     for i in range(rank):
         shape[MAX_RANK - rank + i] = sizes[i]
     var offset = self_t.offset
-    var same = self_t.rank == rank
-    if same:
-        for i in range(rank):
-            if self_t.dim(i) != sizes[i]:
-                same = False
-                break
-    if not same:
-        # c10's safe_compute_numel (a negative extent is a huge uint64),
-        # then computeStorageNbytesContiguous.
-        var numel = 1
-        var overflow = False
-        var has_zero = False
-        for i in range(rank):
-            var e = sizes[i]
-            if e == 0:
-                has_zero = True
-            elif e < 0 or numel > _INT64_MAX // e:
-                overflow = True
-            else:
-                numel *= e
-        if has_zero:
-            numel = 0
-        elif overflow:
-            raise Error("numel: integer multiplication overflow")
-        if numel > (_INT64_MAX // self_t.itemsize) - offset:
-            raise Error(
-                "Storage size calculation overflowed with sizes=",
-                _sizes_list_str(shape, rank),
-            )
-        var nbytes = (numel + offset) * self_t.itemsize
-        if numel > 0 and nbytes > self_t.storage_nbytes():
-            check(
-                external_call["tmb_storage_resize", Int32](
-                    self_t.h, Int64(nbytes)
-                ),
-                "tmb_storage_resize",
-            )
-        set_sizes_strides(
-            self_t, shape, contiguous_strides(shape, rank), rank, offset
+    var old_nbytes = self_t.storage_nbytes()
+    # c10's safe_compute_numel (a negative extent is a huge uint64), then
+    # computeStorageNbytesContiguous -- checked before anything changes.
+    var numel = 1
+    var overflow = False
+    var has_zero = False
+    for i in range(rank):
+        var e = sizes[i]
+        if e == 0:
+            has_zero = True
+        elif e < 0 or numel > _INT64_MAX // e:
+            overflow = True
+        else:
+            numel *= e
+    if not has_zero and overflow:
+        raise Error("numel: integer multiplication overflow")
+    if not has_zero and numel > (_INT64_MAX // self_t.itemsize) - offset:
+        raise Error(
+            "Storage size calculation overflowed with sizes=", _sizes_str(sizes)
         )
+    var t = self_t.copy()
+    resize_out(t, shape, rank)
     var mf_v = args[unsafe_offset=2].copy()
     if mf_v.tag != TAG_NONE:
         var mf = v_memory_format_or(mf_v, MEMORY_FORMAT_PRESERVE)
@@ -3192,7 +3171,51 @@ def op_resize_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             rank,
             offset,
         )
+    if external_call["tmb_deterministic_fill_uninitialized", Int32]() != 0:
+        _fill_resize_deterministic(self_t, old_nbytes)
     ret_ref(rets, 0, self_t)
+
+
+def _fill_resize_deterministic(t: T, old_nbytes: Int) raises:
+    """ResizeCommon.h's `fill_resize_deterministic_`: the elements a resize
+    added to the storage get NaN (floating) or the dtype's max (integral,
+    bool), as `fill_empty_deterministic_` fills a fresh `empty`."""
+    var old_numel = old_nbytes // t.itemsize
+    var new_numel = t.storage_nbytes() // t.itemsize
+    if new_numel <= old_numel:
+        return
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = new_numel - old_numel
+    var tail = own(
+        view_strided(t, shape, contiguous_strides(shape, 1), 1, old_numel)
+    )
+    if t.dtype.is_floating_point():
+        fill_value(tail.t, Float64(nan[DType.float64]()))
+    else:
+        fill_value(tail.t, Value(TAG_SCALAR_INT, 0, _int_max_bits(t.dtype), 0))
+    _ = tail^
+
+
+def _int_max_bits(dt: DType) -> Int64:
+    """`std::numeric_limits<scalar_t>::max()`, as the bits an integral fill
+    stores (uint64's max is all ones, i.e. -1)."""
+    if dt == DType.bool:
+        return 1
+    if dt == DType.uint8:
+        return 255
+    if dt == DType.int8:
+        return 127
+    if dt == DType.int16:
+        return 32767
+    if dt == DType.uint16:
+        return 65535
+    if dt == DType.int32:
+        return 2147483647
+    if dt == DType.uint32:
+        return 4294967295
+    if dt == DType.uint64:
+        return -1
+    return 9223372036854775807
 
 
 def _set_storage(
@@ -3232,10 +3255,7 @@ def _set_storage(
     )
     var nbytes = (offset + needed + 1) * self_t.itemsize if numel > 0 else 0
     if nbytes > source.nbytes:
-        check(
-            external_call["tmb_storage_resize", Int32](self_t.h, Int64(nbytes)),
-            "tmb_storage_resize",
-        )
+        resize_storage_bytes(self_t, nbytes)
     set_sizes_strides(self_t, shape, strides, rank, offset)
 
 

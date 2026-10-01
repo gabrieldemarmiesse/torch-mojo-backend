@@ -100,7 +100,7 @@ def _prepare_out(
     """Get `out_arg` ready to receive a `shape`/`stype` result: raises if
     its dtype doesn't match (fixed per op, never promoted -- matches torch's
     own strict out= dtype check), resizes it in place if its shape doesn't
-    (`resize_out`: no `aten::resize_` kernel exists to do this for us), and
+    (`resize_out`: a boxed kernel gets no resize before dispatch), and
     reports whether the (now correctly shaped) tensor is contiguous.
 
     False means the caller must compute into a temporary and

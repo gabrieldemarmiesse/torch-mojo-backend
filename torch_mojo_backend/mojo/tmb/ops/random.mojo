@@ -40,6 +40,8 @@ from tmb.backend.abi import (
     index_error,
     int_arg,
     contiguous_strides,
+    dense_strides_like,
+    is_dense,
     new_like,
     new_scalar,
     new_strided,
@@ -1819,7 +1821,15 @@ def op_philox_key_split(
 
 
 def _philox_fold_in(key: T, data: UInt64, data_addr: Int, rets: Values) raises:
-    var out = own(new_like(key))
+    # CUDA's `at::empty_like(key)` (preserve_format), written in memory order
+    # from the contiguous keys: a transposed key gets a transposed output whose
+    # bytes are laid out as the contiguous result's, exactly as on CUDA.
+    var strides = key.strides if is_dense(
+        key.shape, key.strides, key.rank
+    ) else dense_strides_like(key.shape, key.strides, key.rank)
+    var out = own(
+        new_strided(key.shape, strides, key.rank, key.stype, key.device)
+    )
     var num_keys = key.numel // 2
     if num_keys > 0:
         var src = own_if_new(contiguous(key), key)
@@ -1944,6 +1954,9 @@ def _philox_distribution(
     if self_t.numel == 0:
         ret_ref(rets, 0, self_t)
         return
+    # CUDA fills a contiguous copy, then `self.copy_(output)`, which refuses a
+    # self whose elements share memory (an expanded tensor).
+    assert_no_internal_overlap(self_t)
     if not (
         dt == DType.float32
         or dt == DType.float16
