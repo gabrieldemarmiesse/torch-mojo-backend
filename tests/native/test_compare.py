@@ -236,6 +236,29 @@ def test_isin_out(mojo_gpu: str, call_checker: CallChecker):
     torch.testing.assert_close(out.cpu(), torch.tensor([False, True, False, True]))
 
 
+@pytest.mark.parametrize("n", [1, 50])
+def test_isin_scalar_compares_in_the_promoted_dtype(mojo_gpu: str, n: int):
+    """isin(Scalar, Tensor) wraps the scalar as a float64 (int64) tensor, so
+    CUDA compares in promote_types(float64, test dtype): a scalar that is not
+    exactly one of the test dtype's values matches nothing (the results
+    below are CUDA's, for both of its isin kernels)."""
+    d = mojo_gpu
+    i32 = torch.full((n,), 3, dtype=torch.int32, device=d)
+    cases = [
+        (torch.isin(1 + 1e-8, torch.ones(n, device=d)), False),
+        (torch.isin(1 + 1e-4, torch.ones(n, dtype=torch.float16, device=d)), False),
+        (torch.isin(1e300, torch.full((n,), float("inf"), device=d)), False),
+        (torch.isin(3.0000001, i32), False),
+        (torch.isin(3 + 2**40, i32), False),
+        (torch.isin(3.0, i32), True),
+        (torch.isin(1.0, torch.ones(n, device=d), invert=True), False),
+        (torch.isin(1 + 1e-8, torch.ones(n, device=d), invert=True), True),
+    ]
+    for got, want in cases:
+        assert got.device.type == torch.device(d).type
+        assert got.item() is want
+
+
 def test_isin_float_and_mixed_dtypes(mojo_gpu: str):
     elements = torch.tensor([1.0, 2.0, float("nan"), -0.0])
     test_elements = torch.tensor([1.0, float("nan"), 0.0])

@@ -347,6 +347,17 @@ def test_weight_norm_interface_one_dim(mojo_gpu, dtype):
     torch.testing.assert_close(gg.cpu().float(), rg, atol=atol, rtol=rtol)
 
 
+def test_weight_norm_interface_norm_overflows_like_cuda(mojo_gpu):
+    """WeightNorm.cu sums squares in float32 without rescaling: the norm of
+    1e20 overflows to inf and the weight is 0 (linalg_vector_norm would
+    give 1e20 and 1)."""
+    v = torch.tensor([[1e20]])
+    g = torch.tensor([[1.0]])
+    w, norm = torch._weight_norm_interface(v.to(mojo_gpu), g.to(mojo_gpu), 0)
+    assert w.cpu().tolist() == [[0.0]]
+    assert norm.cpu().tolist() == [[float("inf")]]
+
+
 def test_weight_norm_through_nn_utils_backward(mojo_gpu):
     torch.manual_seed(0)
     lin = torch.nn.Linear(5, 4)

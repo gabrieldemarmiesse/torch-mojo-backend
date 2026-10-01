@@ -4403,6 +4403,41 @@ def test_var_mean_welford_geometries(mojo_gpu, dtype, shape, dims):
         assert v.dtype == dtype and m.dtype == dtype
 
 
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+@pytest.mark.parametrize(
+    ("shape", "where", "dim", "correction"),
+    [
+        ((1, 2), (0, 0), 0, 0),  # columns of one element
+        ((2, 4), (0, 0), 0, 1),  # the column kernel's tail
+        ((1, 64), (0, 5), 0, 0),
+        ((9, 2), (4, 1), 0, 1),
+        ((3, 7), (1, 2), 1, 0),  # rows
+    ],
+)
+def test_welford_inf_and_nan_like_cuda(mojo_gpu, bad, shape, where, dim, correction):
+    """`WelfordOps::reduce` takes m2 from x - mean, so a lone inf (or NaN)
+    gives a NaN variance -- also where a slice holds one element. The
+    float64 var / std alone take the same kernels."""
+    x = torch.arange(1.0, 1 + shape[0] * shape[1]).reshape(shape)
+    x[where] = bad
+    for dtype in (torch.float32, torch.float64):
+        if dtype == torch.float64 and is_metal(mojo_gpu):
+            continue  # no float64 on Apple GPUs
+        xd = x.to(dtype)
+        ref = torch.var_mean(xd, dim=dim, correction=correction)
+        for op in (torch.var_mean, torch.std_mean):
+            got = op(xd.to(mojo_gpu), dim=dim, correction=correction)
+            want = op(xd, dim=dim, correction=correction)
+            for g, w in zip(got, want, strict=True):
+                torch.testing.assert_close(g.cpu(), w, equal_nan=True)
+        for op in (torch.var, torch.std):
+            got = op(xd.to(mojo_gpu), dim=dim, correction=correction)
+            torch.testing.assert_close(
+                got.cpu(), op(xd, dim=dim, correction=correction), equal_nan=True
+            )
+        assert ref[0].isnan().any()
+
+
 @pytest.mark.parametrize(
     ("dtype", "big"),
     [(torch.float64, 1e308), (torch.float32, 3e38), (torch.float16, 60000.0)],

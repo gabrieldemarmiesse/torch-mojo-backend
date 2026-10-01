@@ -323,8 +323,11 @@ struct Loader(Movable):
         """Write the closure to a unique temp dir (marker last) and rename it
         to `dest`; returns the root to build from. `locked`: we hold the
         snapshot lock, so an incomplete `dest` is ours to replace."""
-        # Temp dirs of an interrupted install, old enough that no live
-        # installer (locked or not) can still be writing them.
+        # Temp dirs of an interrupted install: old enough that no installer
+        # can still be writing them, and named (`.tmp<pid>-<ns>`) after a
+        # process that is gone -- a live one may be building from its copy
+        # (the fallback below), however old. The directory is per-user, so
+        # `kill -0` can probe every pid in it.
         var slash = dest.rfind("/")
         _ = run_command(
             "find '"
@@ -333,7 +336,8 @@ struct Loader(Movable):
             + String(dest[byte = slash + 1 :])
             + ".tmp*' -mmin +"
             + String(SNAPSHOT_TMP_MAX_AGE_MIN)
-            + " -exec rm -rf {} + 2>/dev/null; true"
+            + " 2>/dev/null | while read -r d; do p=${d##*.tmp}; p=${p%%-*};"
+            + ' kill -0 "$p" 2>/dev/null || rm -rf "$d"; done; true'
         )
         var uniq = (
             String(external_call["getpid", Int32]())
