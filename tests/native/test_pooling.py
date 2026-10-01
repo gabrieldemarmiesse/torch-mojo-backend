@@ -438,6 +438,252 @@ def test_interpolate_area(mojo_device):
 
 
 # ---------------------------------------------------------------------------
+# Fractional max pooling and the indices-free max_pool2d_backward
+# ---------------------------------------------------------------------------
+
+
+def _frac(n: int):
+    return F.fractional_max_pool2d if n == 2 else F.fractional_max_pool3d
+
+
+def _frac_reference(n: int, x: torch.Tensor, k, out, samples: torch.Tensor):
+    """CPU torch's result, in float32 for the half types: CPU builds the
+    window sequence in the dtype itself (half arithmetic), CUDA -- and this
+    backend -- in float (`acc_type`); the max of half values is exact in
+    float32."""
+    if x.dtype in (torch.float16, torch.bfloat16):
+        y, idx = _frac(n)(
+            x.float(),
+            k,
+            output_size=out,
+            return_indices=True,
+            _random_samples=samples.float(),
+        )
+        return y.to(x.dtype), idx
+    return _frac(n)(x, k, output_size=out, return_indices=True, _random_samples=samples)
+
+
+_FRAC_CASES = [
+    # (n, input shape, kernel, output size): batched and unbatched, a window
+    # as large as the input, an output of one, awkward sizes.
+    (2, (2, 3, 11, 9), (3, 2), (5, 6)),
+    (2, (4, 10, 10), 2, (7, 1)),
+    (2, (1, 2, 7, 7), 7, 1),
+    (2, (3, 5, 37, 23), (4, 3), (13, 17)),
+    (3, (2, 2, 9, 8, 7), (2, 3, 2), (4, 3, 5)),
+    (3, (3, 6, 6, 6), 3, (3, 2, 1)),
+]
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+@pytest.mark.parametrize(("n", "shape", "kernel", "out"), _FRAC_CASES)
+def test_fractional_max_pool(mojo_device, dtype, n, shape, kernel, out):
+    _skip_f64(mojo_device, dtype)
+    torch.manual_seed(0)
+    x = torch.randn(shape).to(dtype)
+    batch = shape[0] if len(shape) == n + 2 else 1
+    channels = shape[-n - 1]
+    samples = torch.rand(batch, channels, n).to(dtype)
+    want, want_idx = _frac_reference(n, x, kernel, out, samples)
+    with ran(f"aten::fractional_max_pool{n}d"):
+        got, got_idx = _frac(n)(
+            x.to(mojo_device),
+            kernel,
+            output_size=out,
+            return_indices=True,
+            _random_samples=samples.to(mojo_device),
+        )
+    torch.testing.assert_close(got_idx.cpu(), want_idx)
+    torch.testing.assert_close(got.cpu(), want, atol=0, rtol=0)
+    # Backward through autograd: the gradient lands on the saved indices.
+    g = torch.randn(want.shape).to(dtype)
+    xd = x.to(mojo_device).requires_grad_(True)
+    with ran(f"aten::fractional_max_pool{n}d_backward"):
+        _frac(n)(
+            xd, kernel, output_size=out, _random_samples=samples.to(mojo_device)
+        ).backward(g.to(mojo_device))
+    planes = math.prod(shape[:-n])
+    flat = want_idx.reshape(planes, -1)
+    want_g = torch.zeros(planes, math.prod(shape[-n:]), dtype=torch.float64)
+    want_g.scatter_add_(1, flat, g.double().reshape(flat.shape))
+    assert xd.grad is not None
+    _close(xd.grad, want_g.reshape(shape).to(dtype), dtype)
+
+
+def test_fractional_max_pool_nan_wins(mojo_device):
+    """`val > max || isnan(val)`, like the other max pools."""
+    x = torch.randn(1, 1, 8, 8)
+    x[0, 0, 0, 0] = float("nan")
+    x[0, 0, 5, 6] = float("nan")
+    samples = torch.rand(1, 1, 2)
+    want, want_idx = F.fractional_max_pool2d(
+        x, 3, output_size=4, return_indices=True, _random_samples=samples
+    )
+    got, got_idx = F.fractional_max_pool2d(
+        x.to(mojo_device),
+        3,
+        output_size=4,
+        return_indices=True,
+        _random_samples=samples.to(mojo_device),
+    )
+    torch.testing.assert_close(got.cpu(), want, equal_nan=True)
+    torch.testing.assert_close(got_idx.cpu(), want_idx)
+
+
+def test_fractional_max_pool_out_variants(mojo_device):
+    x = torch.randn(2, 3, 10, 9)
+    samples = torch.rand(2, 3, 2)
+    want, want_idx = torch.ops.aten.fractional_max_pool2d(x, [3, 2], [4, 5], samples)
+    out = torch.empty(0, device=mojo_device)
+    idx = torch.empty(0, dtype=torch.long, device=mojo_device)
+    with ran("aten::fractional_max_pool2d.output"):
+        torch.ops.aten.fractional_max_pool2d.output(
+            x.to(mojo_device),
+            [3, 2],
+            [4, 5],
+            samples.to(mojo_device),
+            output=out,
+            indices=idx,
+        )
+    torch.testing.assert_close(out.cpu(), want, atol=0, rtol=0)
+    torch.testing.assert_close(idx.cpu(), want_idx)
+    g = torch.randn(want.shape)
+    want_g = torch.ops.aten.fractional_max_pool2d_backward(
+        g, x, [3, 2], [4, 5], want_idx
+    )
+    gin = torch.empty(2, 3, 9, 10, device=mojo_device).transpose(-1, -2)
+    with ran("aten::fractional_max_pool2d_backward.grad_input"):
+        torch.ops.aten.fractional_max_pool2d_backward.grad_input(
+            g.to(mojo_device), x.to(mojo_device), [3, 2], [4, 5], idx, grad_input=gin
+        )
+    torch.testing.assert_close(gin.cpu(), want_g)
+
+    x3 = torch.randn(3, 7, 6, 8)
+    s3 = torch.rand(1, 3, 3)
+    want3, want3_idx = torch.ops.aten.fractional_max_pool3d(
+        x3, [2, 2, 3], [3, 4, 2], s3
+    )
+    out3 = torch.empty(0, device=mojo_device)
+    idx3 = torch.empty(0, dtype=torch.long, device=mojo_device)
+    torch.ops.aten.fractional_max_pool3d.output(
+        x3.to(mojo_device),
+        [2, 2, 3],
+        [3, 4, 2],
+        s3.to(mojo_device),
+        output=out3,
+        indices=idx3,
+    )
+    torch.testing.assert_close(out3.cpu(), want3, atol=0, rtol=0)
+    torch.testing.assert_close(idx3.cpu(), want3_idx)
+    g3 = torch.randn(want3.shape)
+    want3_g = torch.ops.aten.fractional_max_pool3d_backward(
+        g3, x3, [2, 2, 3], [3, 4, 2], want3_idx
+    )
+    gin3 = torch.empty(0, device=mojo_device)
+    with ran("aten::fractional_max_pool3d_backward.grad_input"):
+        torch.ops.aten.fractional_max_pool3d_backward.grad_input(
+            g3.to(mojo_device),
+            x3.to(mojo_device),
+            [2, 2, 3],
+            [3, 4, 2],
+            idx3,
+            grad_input=gin3,
+        )
+    torch.testing.assert_close(gin3.cpu(), want3_g)
+
+
+@pytest.mark.parametrize(
+    ("args", "match"),
+    [
+        (((1, 2, 6, 6), [7, 2], [1, 2], (1, 2, 2)), "pool height 7 too large"),
+        (((1, 2, 6, 6), [2, 2], [3, 6], (1, 2, 2)), "pool width 2 too large"),
+        (
+            ((1, 2, 6, 6), [0, 2], [3, 3], (1, 2, 2)),
+            "kernel size should be greater than zero",
+        ),
+        (((2, 2, 6, 6), [2, 2], [3, 3], (1, 2, 2)), r"size\(0\) no less then"),
+        (
+            ((1, 2, 6, 6), [2, 2], [3, 3], (1, 3, 2)),
+            r"size\(1\) equals to input channel",
+        ),
+        (((1, 2, 6, 6), [2, 2], [3, 3], (1, 2, 3)), r"size\(2\) equals to 2; got 3"),
+        (
+            ((1, 2, 6, 6), [2, 2], [3, 3], (1, 2)),
+            "Expect _random_samples to have 3 dimensions",
+        ),
+        (((2, 6, 6), [2], [3, 3], (1, 2, 2)), "kernel_size must either be"),
+        (((1, 2, 0, 6), [2, 2], [3, 3], (1, 2, 2)), "non-zero size for non-batch"),
+    ],
+)
+def test_fractional_max_pool2d_rejects_bad_arguments(mojo_device, args, match):
+    shape, k, out, sshape = args
+    x = torch.randn(shape).to(mojo_device)
+    s = torch.rand(sshape).to(mojo_device)
+    with pytest.raises(RuntimeError, match=match):
+        torch.ops.aten.fractional_max_pool2d(x, k, out, s)
+
+
+def test_fractional_max_pool_rejects_bad_samples_dtype_and_3d_sizes(mojo_device):
+    x = torch.randn(1, 2, 6, 6, 6).to(mojo_device)
+    s = torch.rand(1, 2, 3).to(mojo_device)
+    with pytest.raises(RuntimeError, match="same dtype as input"):
+        torch.ops.aten.fractional_max_pool3d(x, [2, 2, 2], [3, 3, 3], s.double())
+    # 3-D asks out + pool - 1 < in strictly.
+    with pytest.raises(
+        RuntimeError, match="pool time 2 too large relative to input time 6"
+    ):
+        torch.ops.aten.fractional_max_pool3d(x, [2, 2, 2], [5, 3, 3], s)
+
+
+def test_fractional_max_pool_backward_follows_the_determinism_policy(mojo_device):
+    x = torch.randn(1, 2, 6, 6).to(mojo_device)
+    s = torch.rand(1, 2, 2).to(mojo_device)
+    y, idx = torch.ops.aten.fractional_max_pool2d(x, [2, 2], [3, 3], s)
+    torch.use_deterministic_algorithms(True)
+    try:
+        with pytest.raises(RuntimeError, match="does not have a deterministic"):
+            torch.ops.aten.fractional_max_pool2d_backward(y, x, [2, 2], [3, 3], idx)
+    finally:
+        torch.use_deterministic_algorithms(False)
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+@pytest.mark.parametrize(
+    ("kernel", "stride", "padding", "dilation", "ceil_mode"),
+    [((3, 2), (2, 2), (1, 1), (1, 1), False), (3, 2, 1, 2, True), (2, [], 0, 1, False)],
+)
+def test_max_pool2d_backward_without_indices(
+    mojo_device, dtype, kernel, stride, padding, dilation, ceil_mode
+):
+    """aten::max_pool2d_backward (an MPS-only kernel upstream) recomputes the
+    argmax from `self`: the same gradient as the indexed backward."""
+    _skip_f64(mojo_device, dtype)
+    as2 = lambda v: [v, v] if isinstance(v, int) else list(v)  # noqa: E731
+    args = (
+        as2(kernel),
+        as2(stride) if stride != [] else [],
+        as2(padding),
+        as2(dilation),
+        ceil_mode,
+    )
+    x = torch.randn(2, 3, 9, 8).to(dtype)
+    y, idx = torch.ops.aten.max_pool2d_with_indices(x, *args)
+    g = torch.randn(y.shape).to(dtype)
+    want = torch.ops.aten.max_pool2d_with_indices_backward(g, x, *args, idx)
+    with ran("aten::max_pool2d_backward"):
+        got = torch.ops.aten.max_pool2d_backward(
+            g.to(mojo_device), x.to(mojo_device), *args
+        )
+    _close(got, want, dtype)
+    out = torch.empty(0, dtype=dtype, device=mojo_device)
+    with ran("aten::max_pool2d_backward.out"):
+        torch.ops.aten.max_pool2d_backward.out(
+            g.to(mojo_device), x.to(mojo_device), *args, out=out
+        )
+    _close(out, want, dtype)
+
+
+# ---------------------------------------------------------------------------
 # Max unpooling
 # ---------------------------------------------------------------------------
 
