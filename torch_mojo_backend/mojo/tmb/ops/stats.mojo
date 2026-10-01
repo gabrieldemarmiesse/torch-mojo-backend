@@ -1397,6 +1397,19 @@ def _as_keep(t: T, v: T, dim: Int) raises -> Owned:
     return r^
 
 
+def _as_column(t: T) raises -> Owned:
+    """A 0-/1-d `t` viewed as (numel, 1) (contiguous first); any other `t`
+    as itself."""
+    if t.rank > 1:
+        return own(T(retain(t)))
+    var dense = own_if_new(contiguous(t), t)
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 2] = t.numel
+    var r = _view(dense.t, shape, 2)
+    _ = dense^
+    return r^
+
+
 # aten::_weight_norm_interface(Tensor v, Tensor g, int dim=0)
 #   -> (Tensor, Tensor)
 def op__weight_norm_interface(
@@ -1412,6 +1425,14 @@ def op__weight_norm_interface(
             "'",
         )
     _decline_metal_f64(v, "_weight_norm_interface")
+    # A 0-/1-d weight has no other dim: every element is its own slice
+    # (CUDA's first-dim kernel with rowSize 1), so read it as (n, 1).
+    var v_shape = v.shape
+    var v_rank = v.rank
+    var vcol = _as_column(v)
+    v = vcol.t.copy()
+    if v_rank <= 1:
+        dim = 0
     var acc = _acc_stype(g.stype)
     var vf = _cast(v, acc)
     var dims = _other_dims(v.rank, dim)
@@ -1427,7 +1448,10 @@ def op__weight_norm_interface(
     var gk = _as_keep(gf.t, v, dim)
     var gv = _mul(gk.t, vf.t)
     var wf = _mul(gv.t, rnorm.t)
-    var w = _cast(wf.t, v.stype)
+    var w2 = _cast(wf.t, v.stype)
+    var w = _view(w2.t, v_shape, v_rank)
+    _ = w2^
+    _ = vcol^
     var norms = own(new_tensor(g.shape, g.rank, acc, g.device))
     var nview = _view(norm.t, g.shape, g.rank)
     copy_strided_into(norms.t, nview.t)
@@ -1462,6 +1486,14 @@ def op__weight_norm_interface_backward(
     if dim != 0 and dim != v.rank - 1:
         raise Error("fused kernels can only be applied for first or last dim")
     _decline_metal_f64(v, "_weight_norm_interface_backward")
+    var v_shape = v.shape
+    var v_rank = v.rank
+    var vcol = _as_column(v)
+    var gwcol = _as_column(gw)
+    v = vcol.t.copy()
+    gw = gwcol.t.copy()
+    if v_rank <= 1:
+        dim = 0
     var acc = _acc_stype(v.stype)
     var gwf = _cast(gw, acc)
     var vf = _cast(v, acc)
@@ -1490,7 +1522,11 @@ def op__weight_norm_interface_backward(
     var gf = _cast(g, acc)
     var gk = _as_keep(gf.t, v, dim)
     var gvf = _mul(gk.t, diff.t)
-    var grad_v = _cast(gvf.t, v.stype)
+    var gv2 = _cast(gvf.t, v.stype)
+    var grad_v = _view(gv2.t, v_shape, v_rank)
+    _ = gv2^
+    _ = vcol^
+    _ = gwcol^
     _ = gwf^  # every temporary outlives the calls that read it
     _ = vf^
     _ = prod^

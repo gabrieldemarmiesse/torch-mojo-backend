@@ -46,6 +46,9 @@ comptime PACKAGE = "tmb"
 # Written last into a source snapshot (`Loader.snapshot`): its presence says
 # the snapshot is complete.
 comptime SNAPSHOT_MARKER = ".snapshot-complete"
+# How long a snapshot install waits for another process installing the same
+# one (a copy of a few dozen source files: milliseconds in practice).
+comptime SNAPSHOT_LOCK_TIMEOUT_MS = 120_000
 comptime KERNELS = "tmb/kernels"
 
 
@@ -256,25 +259,72 @@ struct Loader(Movable):
         var dest = base + "/" + family + "-" + h
         if self._snapshot_complete(dest, ft[0]):
             return (dest, h)
-        # Written to a temp dir, completion marker last, then renamed into
-        # place: a reader never sees a half-written snapshot. One that TMPDIR
-        # aging has thinned since (a file or the marker gone) is replaced.
-        var tmp = dest + ".tmp" + String(perf_counter_ns())
-        for f in ft[0]:
-            var rel = String(f[byte = self.root.byte_length() :])
-            var target = tmp + rel
-            makedirs(String(target[byte = : target.rfind("/")]), exist_ok=True)
-            Path(target).write_text(ft[1][f])
-        Path(tmp + "/" + SNAPSHOT_MARKER).write_text(h)
-        if isdir(dest) and not self._snapshot_complete(dest, ft[0]):
-            _ = run_command("rm -rf '" + dest + "'")
-        var r = external_call["rename", Int32](
-            tmp.as_c_string_span().ptr(), dest.as_c_string_span().ptr()
+        # Install (or repair) under a per-snapshot lock, re-checking inside
+        # it: two processes that both found the snapshot missing or thinned
+        # by TMPDIR aging then take turns, and the second sees the first's
+        # complete copy instead of deleting it. The copy is written to a
+        # unique temp dir, completion marker last, then renamed into place,
+        # so nobody ever reads a half-written snapshot.
+        var lock_path = dest + ".lock"
+        var fd = external_call["creat", Int32](
+            lock_path.as_c_string_span().ptr(), Int32(0o644)
         )
-        if r != 0:  # another process installed the same snapshot first
-            _ = run_command("rm -rf '" + tmp + "'")
+        if fd < 0:
+            raise Error("could not create the snapshot lock ", lock_path)
+        var waited_ms = 0
+        while (
+            external_call["flock", Int32](fd, Int32(2 | 4)) != 0
+        ):  # LOCK_EX | LOCK_NB
+            if waited_ms >= SNAPSHOT_LOCK_TIMEOUT_MS:
+                _ = external_call["close", Int32](fd)
+                raise Error(
+                    "timed out waiting for the source snapshot lock ",
+                    lock_path,
+                )
+            _ = external_call["usleep", Int32](UInt32(10_000))
+            waited_ms += 10
+        try:
             if not self._snapshot_complete(dest, ft[0]):
-                raise Error("could not install the source snapshot ", dest)
+                # Under the lock nobody else writes this snapshot: temp and
+                # stale dirs left by an interrupted install are garbage.
+                _ = run_command(
+                    "rm -rf '" + dest + "'.tmp* '" + dest + "'.stale*"
+                )
+                var uniq = (
+                    String(external_call["getpid", Int32]())
+                    + "-"
+                    + String(perf_counter_ns())
+                )
+                var tmp = dest + ".tmp" + uniq
+                for f in ft[0]:
+                    var rel = String(f[byte = self.root.byte_length() :])
+                    var target = tmp + rel
+                    makedirs(
+                        String(target[byte = : target.rfind("/")]),
+                        exist_ok=True,
+                    )
+                    Path(target).write_text(ft[1][f])
+                Path(tmp + "/" + SNAPSHOT_MARKER).write_text(h)
+                if isdir(dest):
+                    # Incomplete, and nobody else can be installing it (we
+                    # hold the lock): move it aside before deleting, so the
+                    # rename below never targets a non-empty directory.
+                    var stale = dest + ".stale" + uniq
+                    _ = external_call["rename", Int32](
+                        dest.as_c_string_span().ptr(),
+                        stale.as_c_string_span().ptr(),
+                    )
+                    _ = run_command("rm -rf '" + stale + "'")
+                var r = external_call["rename", Int32](
+                    tmp.as_c_string_span().ptr(), dest.as_c_string_span().ptr()
+                )
+                if r != 0:
+                    # Should not happen under the lock; build from our own
+                    # complete copy rather than fail.
+                    return (tmp, h)
+        finally:
+            _ = external_call["flock", Int32](fd, Int32(8))  # LOCK_UN
+            _ = external_call["close", Int32](fd)
         return (dest, h)
 
     def _snapshot_complete(self, dest: String, files: List[String]) -> Bool:

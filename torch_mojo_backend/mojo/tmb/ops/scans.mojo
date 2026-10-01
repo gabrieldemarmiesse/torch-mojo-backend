@@ -92,6 +92,14 @@ def _scan_into(op: StaticString, src: T, dim: Int, dst: T, idx_ptr: Int) raises:
     call.int(g[0])
     call.int(g[1])
     call.int(g[2])
+    # ScanUtils.cuh `scan_dim`: cub when the scan dim holds every element,
+    # the innermost kernel when it is the last dim, the outer one otherwise.
+    var route = 2
+    if src.numel == g[1]:
+        route = 0
+    elif src.rank == 0 or dim == src.rank - 1:
+        route = 1
+    call.int(route)
     call.int(dtype_code(kdt))
     call.int(ctx_ptr(ctx))
     call.run()

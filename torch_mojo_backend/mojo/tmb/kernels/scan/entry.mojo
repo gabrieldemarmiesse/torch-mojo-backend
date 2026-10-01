@@ -58,7 +58,7 @@ from max.gpu.host import DeviceContext
 from max.gpu.sync import barrier
 from std.math import ceildiv
 from std.memory import stack_allocation
-from std.sys.info import has_accelerator
+from std.sys.info import has_accelerator, size_of
 from std.utils.numerics import isinf, isnan, max_finite, max_or_inf
 from std.utils.numerics import min_finite, min_or_neg_inf
 from std.utils.static_tuple import StaticTuple
@@ -78,7 +78,7 @@ from tmb.kernels.common.op_utils import (
     _raw_ctx,
     _raw_dtype_int,
     _raw_int,
-    _spec_dispatcher8,
+    _spec_dispatcher9,
 )
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
@@ -89,6 +89,11 @@ from tmb.kernels.common.variant_gates import (
 )
 
 comptime SCAN_THREADS = 256
+
+# ScanUtils.cuh `scan_dim`'s three routes (mirrored in tmb/ops/scans.mojo).
+comptime ROUTE_1D = 0
+comptime ROUTE_INNERMOST = 1
+comptime ROUTE_OUTER = 2
 
 # A row shorter than this is scanned by one thread: a 256-thread block would
 # leave most of its lanes idle on the only tile it has.
@@ -548,10 +553,14 @@ def _scan_rows_sklansky_kernel[
             barrier()
             for m in range(log_x + 1):
                 if exists:
-                    var sz = 1 << m
-                    var a = ((tx >> m) << (m + 1)) | sz
-                    var ti = a + (tx % sz)
-                    var si = a - 1
+                    # 32-bit index math with a mask for `tx % 2^m`: the
+                    # 64-bit modulo was most of the step's cost.
+                    var mu = UInt32(m)
+                    var t32 = UInt32(tx)
+                    var sz = UInt32(1) << mu
+                    var a = ((t32 >> mu) << (mu + 1)) | sz
+                    var ti = Int(a + (t32 & (sz - 1)))
+                    var si = Int(a - 1)
                     smem[unsafe_offset=off + ti] = _merge[Op, dtype, acc](
                         smem[unsafe_offset=off + si],
                         Int64(-1),
@@ -580,119 +589,308 @@ def _scan_rows_sklansky_kernel[
 comptime CUB_THREADS = 128
 comptime CUB_ITEMS = 30
 comptime CUB_WARPS = CUB_THREADS // 32
+comptime CUB_TILE = CUB_THREADS * CUB_ITEMS
+
+# The tile-prefix pass: one block; up to CUB_SEQ_TILES tiles their prefixes
+# are taken in order by one thread (cub's look-back resolved in order, what
+# makes the result bit-exact against CUDA), past it in parallel chunks (cub's
+# decoupled look-back associates them by timing there anyway).
+comptime CUB_PREFIX_THREADS = 1024
+comptime CUB_SEQ_TILES = 64
 
 
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(CUB_THREADS))
-)
-@__name(t"scan_1d_cub_order_{Op.name}_{dtype}")
-def _scan_1d_cub_kernel[
-    Op: ScanOp, dtype: DType
-](
-    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
-    n_arg: Int64,
-):
-    """A 1-D half/bf16 scan in the combine order of the cub DeviceScan CUDA
-    runs for it (ScanUtils.cuh `scan_dim` -> `cuda::cub::inclusive_scan`),
-    every combine rounded to the element dtype: tiles of 128 threads x 30
-    blocked items; each thread reduces its items in order, the thread
-    aggregates are scanned Kogge-Stone within each warp and the warp
-    aggregates in order across the block (BLOCK_SCAN_WARP_SCANS), the tile
-    prefix is the previous tiles' inclusive total (the look-back resolved in
-    order), and each thread finally rescans its items seeded with its
-    exclusive prefix. One block walks the tiles in order. Measured bit-exact
-    against CUDA up to 10**4 elements; past a few tens of tiles cub's
-    decoupled look-back can associate the earlier tiles' aggregates
-    differently, which this in-order prefix does not reproduce."""
-    comptime acc = Op.acc_dtype[dtype]()
-    var n = Int(n_arg)
-    var tid = Int(thread_idx.x)
-    var lane = tid % 32
-    var warp = tid // 32
+@always_inline
+def _cub_block_prefix[
+    Op: ScanOp, dtype: DType, acc: DType
+](agg: Scalar[acc], tid: Int) -> Tuple[Scalar[acc], Bool, Scalar[acc]]:
+    """cub's BLOCK_SCAN_WARP_SCANS over one aggregate per thread: Kogge-Stone
+    inside each warp (shfl_up 1..16), the warp totals combined in order. Every
+    thread gets (its exclusive prefix, whether it has one, the block total)."""
     var aggs = stack_allocation[
         CUB_THREADS, acc, address_space=AddressSpace.SHARED
     ]()
     var warp_tot = stack_allocation[
         CUB_WARPS, acc, address_space=AddressSpace.SHARED
     ]()
-    var tile_prefix = Op.identity[acc]()
-    var first_tile = True
-    var tile0 = 0
-    while tile0 < n:
-        var base = tile0 + tid * CUB_ITEMS
-        var cnt = max(0, min(CUB_ITEMS, n - base))
-        # Thread aggregate, in order.
-        var agg = Op.identity[acc]()
-        for k in range(cnt):
-            var x = in_ptr[unsafe_offset=base + k].cast[acc]()
-            if k == 0:
-                agg = x
-            else:
-                agg = _merge[Op, dtype, acc](agg, Int64(-1), x, Int64(-1))[0]
-        aggs[unsafe_offset=tid] = agg
+    var lane = tid % 32
+    var warp = tid // 32
+    aggs[unsafe_offset=tid] = agg
+    barrier()
+    var v = agg
+    var off = 1
+    while off < 32:
+        var other = aggs[unsafe_offset=tid - off] if lane >= off else v
         barrier()
-        # Warp inclusive scan (shfl_up 1, 2, 4, 8, 16).
-        var v = agg
-        var off = 1
-        while off < 32:
-            var other = aggs[unsafe_offset=tid - off] if lane >= off else v
-            barrier()
-            if lane >= off:
-                v = _merge[Op, dtype, acc](other, Int64(-1), v, Int64(-1))[0]
-            aggs[unsafe_offset=tid] = v
-            barrier()
-            off *= 2
-        if lane == 31:
-            warp_tot[unsafe_offset=warp] = v
+        if lane >= off:
+            v = _merge[Op, dtype, acc](other, Int64(-1), v, Int64(-1))[0]
+        aggs[unsafe_offset=tid] = v
         barrier()
-        # Exclusive within the warp: the previous lane's inclusive value.
-        var excl = aggs[unsafe_offset=tid - 1] if lane > 0 else v
-        var has_excl = lane > 0
-        # Warp prefix: earlier warps' totals, in order.
-        if warp > 0:
-            var wp = warp_tot[unsafe_offset=0]
-            for w in range(1, warp):
-                wp = _merge[Op, dtype, acc](
-                    wp, Int64(-1), warp_tot[unsafe_offset=w], Int64(-1)
-                )[0]
-            if has_excl:
-                excl = _merge[Op, dtype, acc](wp, Int64(-1), excl, Int64(-1))[0]
-            else:
-                excl = wp
-            has_excl = True
-        var block_tot = warp_tot[unsafe_offset=0]
-        for w in range(1, CUB_WARPS):
-            block_tot = _merge[Op, dtype, acc](
-                block_tot, Int64(-1), warp_tot[unsafe_offset=w], Int64(-1)
+        off *= 2
+    if lane == 31:
+        warp_tot[unsafe_offset=warp] = v
+    barrier()
+    var excl = aggs[unsafe_offset=tid - 1] if lane > 0 else v
+    var has_excl = lane > 0
+    if warp > 0:
+        var wp = warp_tot[unsafe_offset=0]
+        for w in range(1, warp):
+            wp = _merge[Op, dtype, acc](
+                wp, Int64(-1), warp_tot[unsafe_offset=w], Int64(-1)
             )[0]
-        # The tile prefix (previous tiles' inclusive total).
-        if not first_tile:
-            if has_excl:
-                excl = _merge[Op, dtype, acc](
-                    tile_prefix, Int64(-1), excl, Int64(-1)
-                )[0]
-            else:
-                excl = tile_prefix
-            has_excl = True
-        # Rescan the thread's items from its exclusive prefix.
-        var run = excl
-        for k in range(cnt):
-            var x = in_ptr[unsafe_offset=base + k].cast[acc]()
-            if k == 0 and not has_excl:
-                run = x
-            else:
-                run = _merge[Op, dtype, acc](run, Int64(-1), x, Int64(-1))[0]
-            out_ptr[unsafe_offset=base + k] = run.cast[dtype]()
-        if first_tile:
-            tile_prefix = block_tot
+        if has_excl:
+            excl = _merge[Op, dtype, acc](wp, Int64(-1), excl, Int64(-1))[0]
         else:
-            tile_prefix = _merge[Op, dtype, acc](
-                tile_prefix, Int64(-1), block_tot, Int64(-1)
+            excl = wp
+        has_excl = True
+    var block_tot = warp_tot[unsafe_offset=0]
+    for w in range(1, CUB_WARPS):
+        block_tot = _merge[Op, dtype, acc](
+            block_tot, Int64(-1), warp_tot[unsafe_offset=w], Int64(-1)
+        )[0]
+    barrier()  # the shared slots are reused by the next call
+    return (excl, has_excl, block_tot)
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(CUB_THREADS))
+)
+@__name(t"scan_1d_cub_tile_agg_{Op.name}_{dtype}")
+def _scan_1d_tile_agg_kernel[
+    Op: ScanOp, dtype: DType
+](
+    ws_ptr: Pointer[Scalar[Op.acc_dtype[dtype]()], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    n_arg: Int64,
+):
+    """Pass 1: every tile's aggregate (cub's block total), in parallel."""
+    comptime acc = Op.acc_dtype[dtype]()
+    var n = Int(n_arg)
+    var tid = Int(thread_idx.x)
+    var t = Int(block_idx.x)
+    var t0 = t * CUB_TILE
+    var w = min(CUB_TILE, n - t0)
+    var tile = stack_allocation[
+        CUB_TILE, acc, address_space=AddressSpace.SHARED
+    ]()
+    # The tile, coalesced (cub's warp-transposed load), into shared memory:
+    # 16-byte vectors, all issued before any is used, when the tile is full
+    # and aligned (the scalar loop otherwise).
+    comptime V = 16 // size_of[dtype]()
+    comptime NVEC = CUB_TILE // V
+    if w == CUB_TILE and (Int(in_ptr) + t0 * size_of[dtype]()) % 16 == 0:
+        comptime for j in range(ceildiv(NVEC, CUB_THREADS)):
+            var vi = j * CUB_THREADS + tid
+            if vi < NVEC:
+                var vv = in_ptr.unsafe_load[width=V, alignment=16](
+                    t0 + vi * V
+                ).cast[acc]()
+                comptime for e in range(V):
+                    tile[unsafe_offset=vi * V + e] = vv[e]
+    else:
+        for k in range(tid, CUB_TILE, CUB_THREADS):
+            tile[unsafe_offset=k] = (
+                in_ptr[unsafe_offset=t0 + k].cast[acc]() if k
+                < w else Op.identity[acc]()
+            )
+    barrier()
+    var cnt = max(0, min(CUB_ITEMS, w - tid * CUB_ITEMS))
+    # The thread's 30 blocked items, reduced in order, from registers (the
+    # tail past `w` is the identity, which every combine passes through
+    # exactly, so a full unrolled chain equals cub's `cnt`-long one).
+    var items = SIMD[acc, 32](Op.identity[acc]())
+    comptime for k in range(CUB_ITEMS):
+        items[k] = tile[unsafe_offset=tid * CUB_ITEMS + k]
+    var agg = items[0]
+    comptime for k in range(1, CUB_ITEMS):
+        agg = _merge[Op, dtype, acc](agg, Int64(-1), items[k], Int64(-1))[0]
+    var r = _cub_block_prefix[Op, dtype, acc](agg, tid)
+    if tid == 0:
+        ws_ptr[unsafe_offset=t] = r[2]
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32(CUB_PREFIX_THREADS)
+    )
+)
+@__name(t"scan_1d_cub_tile_prefix_{Op.name}_{dtype}")
+def _scan_1d_tile_prefix_kernel[
+    Op: ScanOp, dtype: DType
+](
+    ws_ptr: Pointer[Scalar[Op.acc_dtype[dtype]()], MutAnyOrigin],
+    tiles_arg: Int64,
+):
+    """Pass 2: the tile aggregates at ws[0, tiles) -> the exclusive tile
+    prefixes at ws[tiles + i] (i >= 1; tile 0 has none)."""
+    comptime acc = Op.acc_dtype[dtype]()
+    var tiles = Int(tiles_arg)
+    var tid = Int(thread_idx.x)
+    if tiles <= CUB_SEQ_TILES:
+        if tid == 0:
+            var p = ws_ptr[unsafe_offset=0]
+            for i in range(1, tiles):
+                ws_ptr[unsafe_offset=tiles + i] = p
+                p = _merge[Op, dtype, acc](
+                    p, Int64(-1), ws_ptr[unsafe_offset=i], Int64(-1)
+                )[0]
+        return
+    var part = stack_allocation[
+        CUB_PREFIX_THREADS, acc, address_space=AddressSpace.SHARED
+    ]()
+    var chunk = ceildiv(tiles, CUB_PREFIX_THREADS)
+    var lo = min(tid * chunk, tiles)
+    var hi = min(lo + chunk, tiles)
+    var tot = Op.identity[acc]()
+    for i in range(lo, hi):
+        tot = (
+            ws_ptr[unsafe_offset=i] if i
+            == lo else _merge[Op, dtype, acc](
+                tot, Int64(-1), ws_ptr[unsafe_offset=i], Int64(-1)
             )[0]
-        first_tile = False
+        )
+    part[unsafe_offset=tid] = tot
+    barrier()
+    var off = 1
+    var v = tot
+    while off < CUB_PREFIX_THREADS:
+        var other = part[unsafe_offset=tid - off] if tid >= off else v
         barrier()
-        tile0 += CUB_THREADS * CUB_ITEMS
+        if tid >= off:
+            v = _merge[Op, dtype, acc](other, Int64(-1), v, Int64(-1))[0]
+        part[unsafe_offset=tid] = v
+        barrier()
+        off *= 2
+    # Chunks before this one, then this chunk's tiles in order.
+    var has = tid > 0 and lo > 0
+    var p = part[unsafe_offset=tid - 1] if tid > 0 else Op.identity[acc]()
+    for i in range(lo, hi):
+        if has:
+            ws_ptr[unsafe_offset=tiles + i] = p
+            p = _merge[Op, dtype, acc](
+                p, Int64(-1), ws_ptr[unsafe_offset=i], Int64(-1)
+            )[0]
+        else:
+            p = ws_ptr[unsafe_offset=i]
+            has = True
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(CUB_THREADS))
+)
+@__name(t"scan_1d_cub_tile_scan_{Op.name}_{dtype}")
+def _scan_1d_tile_scan_kernel[
+    Op: ScanOp, dtype: DType
+](
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[Op.acc_dtype[dtype]()], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    n_arg: Int64,
+    tiles_arg: Int64,
+):
+    """Pass 3: every tile rescanned in parallel, each thread's 30 items in
+    order from its exclusive prefix (tile prefix, then the block's
+    warp-scan prefix), stored back coalesced."""
+    comptime acc = Op.acc_dtype[dtype]()
+    var n = Int(n_arg)
+    var tiles = Int(tiles_arg)
+    var tid = Int(thread_idx.x)
+    var t = Int(block_idx.x)
+    var t0 = t * CUB_TILE
+    var w = min(CUB_TILE, n - t0)
+    var tile = stack_allocation[
+        CUB_TILE, acc, address_space=AddressSpace.SHARED
+    ]()
+    # The tile, coalesced (cub's warp-transposed load), into shared memory:
+    # 16-byte vectors, all issued before any is used, when the tile is full
+    # and aligned (the scalar loop otherwise).
+    comptime V = 16 // size_of[dtype]()
+    comptime NVEC = CUB_TILE // V
+    if w == CUB_TILE and (Int(in_ptr) + t0 * size_of[dtype]()) % 16 == 0:
+        comptime for j in range(ceildiv(NVEC, CUB_THREADS)):
+            var vi = j * CUB_THREADS + tid
+            if vi < NVEC:
+                var vv = in_ptr.unsafe_load[width=V, alignment=16](
+                    t0 + vi * V
+                ).cast[acc]()
+                comptime for e in range(V):
+                    tile[unsafe_offset=vi * V + e] = vv[e]
+    else:
+        for k in range(tid, CUB_TILE, CUB_THREADS):
+            tile[unsafe_offset=k] = (
+                in_ptr[unsafe_offset=t0 + k].cast[acc]() if k
+                < w else Op.identity[acc]()
+            )
+    barrier()
+    var cnt = max(0, min(CUB_ITEMS, w - tid * CUB_ITEMS))
+    # The thread's 30 blocked items, reduced in order, from registers (the
+    # tail past `w` is the identity, which every combine passes through
+    # exactly, so a full unrolled chain equals cub's `cnt`-long one).
+    var items = SIMD[acc, 32](Op.identity[acc]())
+    comptime for k in range(CUB_ITEMS):
+        items[k] = tile[unsafe_offset=tid * CUB_ITEMS + k]
+    var agg = items[0]
+    comptime for k in range(1, CUB_ITEMS):
+        agg = _merge[Op, dtype, acc](agg, Int64(-1), items[k], Int64(-1))[0]
+    var r = _cub_block_prefix[Op, dtype, acc](agg, tid)
+    var excl = r[0]
+    var has_excl = r[1]
+    if t > 0:
+        var tp = ws_ptr[unsafe_offset=tiles + t]
+        excl = _merge[Op, dtype, acc](tp, Int64(-1), excl, Int64(-1))[
+            0
+        ] if has_excl else tp
+        has_excl = True
+    var run = excl if has_excl else Op.identity[acc]()
+    comptime for k in range(CUB_ITEMS):
+        run = _merge[Op, dtype, acc](run, Int64(-1), items[k], Int64(-1))[0]
+        tile[unsafe_offset=tid * CUB_ITEMS + k] = run
+    _ = cnt
+    barrier()
+    if w == CUB_TILE and (Int(out_ptr) + t0 * size_of[dtype]()) % 16 == 0:
+        comptime for j in range(ceildiv(NVEC, CUB_THREADS)):
+            var vi = j * CUB_THREADS + tid
+            if vi < NVEC:
+                var vv = SIMD[dtype, V]()
+                comptime for e in range(V):
+                    vv[e] = tile[unsafe_offset=vi * V + e].cast[dtype]()
+                out_ptr.unsafe_store[alignment=16](t0 + vi * V, vv)
+    else:
+        for k in range(tid, w, CUB_THREADS):
+            out_ptr[unsafe_offset=t0 + k] = tile[unsafe_offset=k].cast[dtype]()
+
+
+@always_inline
+def _scan_1d_cub[
+    Op: ScanOp, dtype: DType
+](
+    dst: Pointer[Scalar[dtype], MutAnyOrigin],
+    inp: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    n: Int,
+    ctx: DeviceContext,
+) raises:
+    """A 1-D half/bf16 scan in the combine order of the cub DeviceScan CUDA
+    runs for it (ScanUtils.cuh `scan_dim` -> `cuda::cub::inclusive_scan`),
+    every combine rounded to the element dtype: tiles of 128 threads x 30
+    blocked items, three passes (tile aggregates; tile prefixes; per-tile
+    rescan). Bit-exact against CUDA while the tile prefixes are taken in
+    order (up to CUB_SEQ_TILES tiles, ~245k elements); past it cub's
+    decoupled look-back associates them by timing, and so do we, in
+    parallel chunks."""
+    comptime acc = Op.acc_dtype[dtype]()
+    var tiles = ceildiv(n, CUB_TILE)
+    var ws = ctx.enqueue_create_buffer[acc](2 * tiles)
+    var ws_ptr = ws.unsafe_ptr().as_unsafe_any_origin()
+    _enqueue_cached[_scan_1d_tile_agg_kernel[Op, dtype]](
+        ctx, tiles, 1, 1, CUB_THREADS, ws_ptr, inp, Int64(n)
+    )
+    if tiles > 1:
+        _enqueue_cached[_scan_1d_tile_prefix_kernel[Op, dtype]](
+            ctx, 1, 1, 1, CUB_PREFIX_THREADS, ws_ptr, Int64(tiles)
+        )
+    _enqueue_cached[_scan_1d_tile_scan_kernel[Op, dtype]](
+        ctx, tiles, 1, 1, CUB_THREADS, dst, ws_ptr, inp, Int64(n), Int64(tiles)
+    )
+    _ = ws^  # a stream-ordered free after the kernels
 
 
 @always_inline
@@ -705,8 +903,14 @@ def _scan[
     outer: Int,
     n: Int,
     inner: Int,
+    route: Int,
     ctx: DeviceContext,
 ) raises:
+    """`route` is the path ScanUtils.cuh `scan_dim` takes for this tensor:
+    ROUTE_1D when the scan dim holds every element (cub), ROUTE_INNERMOST
+    when it is the tensor's last dim, ROUTE_OUTER otherwise -- decided on the
+    dims, not on the geometry (a trailing size-1 dim makes `inner == 1`
+    without making the scan dim the last one)."""
     var out = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
     var idx = _make_ptr[DType.int64](idx_addr).as_unsafe_any_origin()
     var inp = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_imm()
@@ -716,16 +920,13 @@ def _scan[
         comptime if not Op.with_index and Op.rounds and (
             dtype == DType.float16 or dtype == DType.bfloat16
         ):
-            if outer == 1 and inner == 1:
-                _enqueue_cached[_scan_1d_cub_kernel[Op, dtype]](
-                    ctx, 1, 1, 1, CUB_THREADS, out, inp, Int64(n)
-                )
+            if route == ROUTE_1D:
+                _scan_1d_cub[Op, dtype](out, inp, n, ctx)
                 return
         comptime if not Op.with_index:
-            if inner == 1:
+            if route != ROUTE_OUTER and inner == 1:
                 # CUDA's innermost-dim scan (also standing in for its cub
-                # route of a 1-D scan, whose decoupled look-back order is
-                # not reproduced).
+                # route of a 1-D scan of a dtype that does not round).
                 var log_x = _cuda_log_threads_x(outer, n)
                 var ny = CUDA_SCAN_THREADS >> log_x
                 _enqueue_cached_2d[_scan_rows_sklansky_kernel[Op, dtype]](
@@ -742,7 +943,7 @@ def _scan[
                     Int64(log_x),
                 )
                 return
-        if inner == 1 and n >= SCAN_ROW_BLOCK_MIN:
+        if Op.with_index and inner == 1 and n >= SCAN_ROW_BLOCK_MIN:
             _enqueue_cached[_scan_rows_kernel[Op, dtype]](
                 ctx,
                 min(outer, SCAN_MAX_BLOCKS),
@@ -781,11 +982,13 @@ def _scan_go[
     outer_o: Arg,
     n_o: Arg,
     inner_o: Arg,
+    route_o: Arg,
     dtype_o: Arg,
     ctx_o: Arg,
 ) raises:
     """Slots: output, indices (0 unless cummax / cummin), operand, outer, n,
-    inner, the operand's dtype code, the device context."""
+    inner, CUDA's route (`_scan`), the operand's dtype code, the device
+    context."""
     var dtype = _raw_dtype_int(dtype_o)
     var outer = _raw_int(outer_o)
     var n = _raw_int(n_o)
@@ -805,6 +1008,7 @@ def _scan_go[
                     outer,
                     n,
                     inner,
+                    _raw_int(route_o),
                     _raw_ctx(ctx_o),
                 )
                 return
@@ -818,21 +1022,21 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     """
     try:
         comptime if _op_on["ScanSum"]():
-            _spec_dispatcher8[_scan_go[SumScan], "ScanSum"](argv, argc)
+            _spec_dispatcher9[_scan_go[SumScan], "ScanSum"](argv, argc)
             return 0
         comptime if _op_on["ScanProd"]():
-            _spec_dispatcher8[_scan_go[ProdScan], "ScanProd"](argv, argc)
+            _spec_dispatcher9[_scan_go[ProdScan], "ScanProd"](argv, argc)
             return 0
         comptime if _op_on["ScanLogSumExp"]():
-            _spec_dispatcher8[_scan_go[LogSumExpScan], "ScanLogSumExp"](
+            _spec_dispatcher9[_scan_go[LogSumExpScan], "ScanLogSumExp"](
                 argv, argc
             )
             return 0
         comptime if _op_on["ScanMax"]():
-            _spec_dispatcher8[_scan_go[MaxScan], "ScanMax"](argv, argc)
+            _spec_dispatcher9[_scan_go[MaxScan], "ScanMax"](argv, argc)
             return 0
         comptime if _op_on["ScanMin"]():
-            _spec_dispatcher8[_scan_go[MinScan], "ScanMin"](argv, argc)
+            _spec_dispatcher9[_scan_go[MinScan], "ScanMin"](argv, argc)
             return 0
         raise Error(NO_OP_COMPILED)
     except e:

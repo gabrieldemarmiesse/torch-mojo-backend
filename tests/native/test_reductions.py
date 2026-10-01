@@ -4343,3 +4343,26 @@ def test_std_var_float64(mojo_gpu, op, dim):
     rv, rm = torch.var_mean(x, dim=dim, correction=0)
     torch.testing.assert_close(v.cpu(), rv)
     torch.testing.assert_close(m.cpu(), rm)
+
+
+def test_float64_moments_do_not_overflow(mojo_gpu):
+    """CUDA's float64 Welford: `[1e308, 1e308]` has variance 0 and mean
+    1e308 (a sum-based mean overflows to inf)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor([1e308, 1e308], dtype=torch.float64)
+    for op in (torch.var_mean, torch.std_mean):
+        v, m = op(x.to(mojo_gpu))
+        assert v.item() == 0.0 and m.item() == 1e308
+    assert torch.var(x.to(mojo_gpu)).item() == 0.0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_var_mean_of_one_infinite_element(mojo_gpu, dtype):
+    """One element is its own mean, infinite or not (CUDA keeps mean=inf,
+    variance NaN)."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor([float("inf")], dtype=dtype)
+    for correction in (0, 1):
+        v, m = torch.var_mean(x.to(mojo_gpu), correction=correction)
+        assert m.item() == float("inf") and math.isnan(v.item())

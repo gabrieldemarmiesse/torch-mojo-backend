@@ -47,6 +47,7 @@ from tmb.backend.abi import (
     Value,
     Values,
     call_op,
+    contiguous_strides,
     dtype_code,
     dtype_itemsize,
     dtype_name,
@@ -1996,120 +1997,160 @@ def _dims_value(dims: List[Int64]) -> Value:
     )
 
 
+def _f64_call(
+    op: String, overload: String, var args: List[Value]
+) raises -> Owned:
+    var r = call_op(op, overload, args^, 1)
+    return own(r.take_tensor(0))
+
+
+def _f64_bool(b: Bool) -> Value:
+    return Value(TAG_BOOL, 0, Int64(1) if b else Int64(0), 0)
+
+
 def _moments_f64(
     a: T,
     dims: List[Int],
-    keepdim: Bool,
     correction: Float64,
     take_sqrt: Bool,
     want_mean: Bool,
+    shape: IndexList[MAX_RANK],
+    rank: Int,
 ) raises -> Tuple[Owned, Owned]:
-    """float64 var/std(_mean), composed from the float64 mean/sum kernels as
-    a two-pass `sum((x - mean)^2) / max(n - correction, 0)` in double (the
-    moments kernel accumulates in float32 and has no float64 form)."""
+    """float64 var/std(_mean) of `a` over `dims`, composed from float64
+    kernels with the moments kernel's own shift: every slice is centred on
+    its FIRST element before anything is summed, so the mean is `shift +
+    mean(x - shift)` and never a plain sum that overflows (`[1e308, 1e308]`
+    has mean 1e308 and variance 0, as CUDA's Welford gives). Results come
+    back in the reduced `shape`."""
     _decline_metal_float64(a, "std/var")
     var d64 = _int64_list(dims)
     var n = 1
     for d in dims:
         n *= a.dim(d)
-    var mean_k = call_op(
+    # The first element of every slice: `a` with each reduce dim cut to
+    # its index 0 (same strides, same offset), broadcastable against `a`.
+    var sshape = a.shape
+    for d in dims:
+        sshape[MAX_RANK - a.rank + d] = 1
+    var shift = own(view_strided(a, sshape, a.strides, a.rank, a.offset))
+    var d0 = _f64_call(
+        "aten::sub",
+        "Tensor",
+        [tensor_arg(a), tensor_arg(shift.t), Value(TAG_SCALAR_INT, 0, 1, 0)],
+    )
+    var m0 = _f64_call(
         "aten::mean",
         "dim",
         [
-            tensor_arg(a),
+            tensor_arg(d0.t),
             _dims_value(d64),
-            Value(TAG_BOOL, 0, 1, 0),
+            _f64_bool(True),
             Value(TAG_NONE, 0, 0, 0),
         ],
-        1,
     )
-    var mk = own(mean_k.take_tensor(0))
-    var diff = call_op(
+    var dev_t = _f64_call(
         "aten::sub",
         "Tensor",
-        [tensor_arg(a), tensor_arg(mk.t), Value(TAG_SCALAR_INT, 0, 1, 0)],
-        1,
+        [tensor_arg(d0.t), tensor_arg(m0.t), Value(TAG_SCALAR_INT, 0, 1, 0)],
     )
-    var dt = own(diff.take_tensor(0))
-    var sq = call_op(
-        "aten::mul", "Tensor", [tensor_arg(dt.t), tensor_arg(dt.t)], 1
-    )
-    var st = own(sq.take_tensor(0))
-    var ss = call_op(
-        "aten::sum",
-        "dim_IntList",
-        [
-            tensor_arg(st.t),
-            _dims_value(d64),
-            Value(TAG_BOOL, 0, Int64(1) if keepdim else Int64(0), 0),
-            Value(TAG_NONE, 0, 0, 0),
-        ],
-        1,
-    )
-    var sst = own(ss.take_tensor(0))
     var divisor = max(Float64(n) - correction, 0.0)
-    var var_t: Owned
+    var var_k: Owned
     if take_sqrt:
         # sqrt(ss / divisor) as ||x - mean||_2 / sqrt(divisor): the float64
-        # vector norm takes the root on the device (this device has no
-        # float64 sqrt kernel); within an ulp of the direct form.
-        var nr = call_op(
+        # vector norm takes the root on the device (no float64 sqrt kernel).
+        var nt = _f64_call(
             "aten::linalg_vector_norm",
             "",
             [
-                tensor_arg(dt.t),
+                tensor_arg(dev_t.t),
                 Value(TAG_SCALAR_DOUBLE, 0, f64_bits(2.0), 0),
                 _dims_value(d64),
-                Value(TAG_BOOL, 0, Int64(1) if keepdim else Int64(0), 0),
+                _f64_bool(True),
                 Value(TAG_NONE, 0, 0, 0),
             ],
-            1,
         )
-        var nt = own(nr.take_tensor(0))
-        var sr = call_op(
+        var_k = _f64_call(
             "aten::div",
             "Scalar",
             [
                 tensor_arg(nt.t),
                 Value(TAG_SCALAR_DOUBLE, 0, f64_bits(sqrt(divisor)), 0),
             ],
-            1,
         )
-        var_t = own(sr.take_tensor(0))
         _ = nt^  # alive past the call that reads it
     else:
-        var vr = call_op(
+        var sq = _f64_call(
+            "aten::mul", "Tensor", [tensor_arg(dev_t.t), tensor_arg(dev_t.t)]
+        )
+        var ss = _f64_call(
+            "aten::sum",
+            "dim_IntList",
+            [
+                tensor_arg(sq.t),
+                _dims_value(d64),
+                _f64_bool(True),
+                Value(TAG_NONE, 0, 0, 0),
+            ],
+        )
+        var_k = _f64_call(
             "aten::div",
             "Scalar",
             [
-                tensor_arg(sst.t),
+                tensor_arg(ss.t),
                 Value(TAG_SCALAR_DOUBLE, 0, f64_bits(divisor), 0),
             ],
-            1,
         )
-        var_t = own(vr.take_tensor(0))
-    var mean_t: Owned
+        _ = sq^  # alive past the calls that read them
+        _ = ss^
+    var var_out = own(new_tensor(shape, rank, a.stype, a.device))
+    var var_v = own(
+        view_strided(
+            var_k.t,
+            shape,
+            contiguous_strides(shape, rank),
+            rank,
+            var_k.t.offset,
+        )
+    )
+    copy_strided_into(var_out.t, var_v.t)
+    _ = var_v^  # alive past the copy
+    var mean_out: Owned
     if want_mean:
-        var mr = call_op(
-            "aten::mean",
-            "dim",
-            [
-                tensor_arg(a),
-                _dims_value(d64),
-                Value(TAG_BOOL, 0, Int64(1) if keepdim else Int64(0), 0),
-                Value(TAG_NONE, 0, 0, 0),
-            ],
-            1,
+        # One element IS its mean (Welford's first update), infinite ones
+        # included: shift + (x - shift) would be inf - inf = NaN there.
+        var mk: Owned
+        if n == 1:
+            mk = own(new_tensor(sshape, a.rank, a.stype, a.device))
+            copy_strided_into(mk.t, shift.t)
+        else:
+            mk = _f64_call(
+                "aten::add",
+                "Tensor",
+                [
+                    tensor_arg(shift.t),
+                    tensor_arg(m0.t),
+                    Value(TAG_SCALAR_INT, 0, 1, 0),
+                ],
+            )
+        mean_out = own(new_tensor(shape, rank, a.stype, a.device))
+        var mean_v = own(
+            view_strided(
+                mk.t, shape, contiguous_strides(shape, rank), rank, mk.t.offset
+            )
         )
-        mean_t = own(mr.take_tensor(0))
+        copy_strided_into(mean_out.t, mean_v.t)
+        _ = mean_v^  # alive past the copy
+        _ = mk^
     else:
-        mean_t = own(new_tensor(IndexList[MAX_RANK](0), 1, a.stype, a.device))
-    _ = mk^  # every temporary outlives the calls that read it
-    _ = dt^
-    _ = st^
-    _ = sst^
+        mean_out = own(new_tensor(IndexList[MAX_RANK](0), 1, a.stype, a.device))
+    _ = shift^  # every temporary outlives the calls that read it
+    _ = d0^
+    _ = m0^
+    _ = dev_t^
+    _ = var_k^
     _ = d64^
-    return (var_t^, mean_t^)
+    return (var_out^, mean_out^)
 
 
 def _moments_into(
@@ -2155,7 +2196,7 @@ def _moments_into(
         if src.t.rank > 0 and len(all) == 0:
             all = _trailing_dims(src.t.rank, src.t.rank)
         var r = _moments_f64(
-            src.t, all, keepdim, correction, take_sqrt, want_mean
+            src.t, all, correction, take_sqrt, want_mean, shape, rank
         )
         _ = src^  # alive past the launches
         return r^
