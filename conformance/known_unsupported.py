@@ -164,7 +164,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "lu": ("float32",),
     "lu_solve": ("float32",),
     "lu_unpack": ("float32",),
-    "masked_cumprod": ("float32", "bfloat16", "float16", "int64"),
     "matrix_exp": ("float32", "bfloat16", "float16"),
     "mode": ("bfloat16", "int64", "bool"),
     "nanmean": ("float32", "bfloat16", "float16"),
@@ -223,6 +222,7 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "view_as_complex": ("float32", "float16"),
     "logcumsumexp": ("float16",),
     "cumsum": ("bfloat16", "float16"),
+    "masked_cumsum": ("bfloat16", "float16"),
 }
 # --- END GENERATED test_matches_cpu ---
 

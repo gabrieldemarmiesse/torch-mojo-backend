@@ -4366,3 +4366,58 @@ def test_var_mean_of_one_infinite_element(mojo_gpu, dtype):
     for correction in (0, 1):
         v, m = torch.var_mean(x.to(mojo_gpu), correction=correction)
         assert m.item() == float("inf") and math.isnan(v.item())
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
+)
+@pytest.mark.parametrize(
+    ("shape", "dims"),
+    [
+        ((1 << 20,), None),  # one row split across many blocks, then merged
+        ((3, 357_789), (1,)),  # split rows, length off the vector width
+        ((1000, 128), (1,)),  # short rows: several rows per warp
+        ((77, 6), (1,)),  # rows shorter than a vector
+        ((8, 7, 33, 5), (0, 2, 3)),  # NCHW stats: segments off the width
+        ((4, 6, 16, 16), (0, 2, 3)),  # NCHW stats: 16-byte segments
+        ((5, 3, 4), (0, 2)),
+        ((6, 9, 70), (1,)),  # strided reduce axis (columns)
+        ((2, 3000, 40), (1,)),  # strided axis, split across blocks
+        ((5, 3, 4), (1, 0)),  # non-adjacent order: copied first
+        ((4, 5, 6, 7), (1, 3)),  # interleaved: copied first
+    ],
+)
+def test_var_mean_welford_geometries(mojo_gpu, dtype, shape, dims):
+    """Every Welford route (contiguous rows, split rows, segmented rows,
+    strided columns, permuted copy) against a float64 CPU reference."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    torch.manual_seed(len(shape))
+    x = (torch.randn(shape) * 3 + 5).to(dtype)
+    ref_v, ref_m = torch.var_mean(x.double(), dim=dims, correction=1)
+    for op, ref in ((torch.var_mean, ref_v), (torch.std_mean, ref_v.sqrt())):
+        v, m = op(x.to(mojo_gpu), dim=dims, correction=1)
+        tol = {torch.float16: 2e-3, torch.bfloat16: 1.6e-2}.get(dtype, 1e-5)
+        torch.testing.assert_close(v.cpu().double(), ref, rtol=tol, atol=tol)
+        torch.testing.assert_close(m.cpu().double(), ref_m, rtol=tol, atol=tol)
+        assert v.dtype == dtype and m.dtype == dtype
+
+
+@pytest.mark.parametrize(
+    ("dtype", "big"),
+    [(torch.float64, 1e308), (torch.float32, 3e38), (torch.float16, 60000.0)],
+)
+def test_var_mean_is_welford_and_does_not_overflow(mojo_gpu, dtype, big):
+    """CUDA's WelfordOps: the mean of [0, big, big] is 2 * big / 3 in every
+    dtype (a sum-then-divide mean overflows)."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor([0.0, big, big], dtype=dtype)
+    for op in (torch.var_mean, torch.std_mean):
+        _, m = op(x.to(mojo_gpu))
+        torch.testing.assert_close(
+            m.cpu().double(),
+            torch.tensor(big / 3 * 2, dtype=torch.float64),
+            rtol=1e-3,
+            atol=0,
+        )

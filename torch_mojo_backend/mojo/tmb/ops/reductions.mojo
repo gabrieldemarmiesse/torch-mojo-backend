@@ -24,7 +24,6 @@ the original dim positions). The kernels validate the output by element count,
 contiguity, device and dtype only, so no post-reduction reshape is needed even
 on the permuted route.
 """
-from std.math import sqrt
 from std.utils import IndexList
 from std.utils.numerics import max_or_inf, min_or_neg_inf, nan
 
@@ -1955,202 +1954,73 @@ def _flat_if_scalar(mut src: Operand, mut dims: List[Int]) raises:
     dims.append(0)
 
 
-def _var_mean_into(
-    a: T,
-    var dims: List[Int],
-    keepdim: Bool,
-    correction: Float64,
-    dst: T,
-    mean_dst: T,
-) raises:
-    """VarMeanSpec: the variance and the mean of one Welford-style pass
-    (`_reduce_into`'s slots plus the mean's spec)."""
-    one_device(a, dst)
-    var src = _ready_operand(a, dims, False)
-    var ctx = ctx_for(dst.device)
-    var cp = ctx_ptr(ctx)
-    var call = KernelCall("reduction", "VarMeanSpec")
-    call.arg_dtype(0, src.t.dtype)
-    call.out_dtype(dst.dtype)
-    call.spec(src.t.spec(cp))
-    call.tuple(dims)
-    call.int(1 if keepdim else 0)
-    call.f64(correction)
-    call.spec(dst.spec(cp))
-    call.spec(mean_dst.spec(cp))
-    call.run()
-    _ = ctx
-    _ = src^
-
-
-def _int64_list(dims: List[Int]) -> List[Int64]:
-    var out = List[Int64]()
-    for d in dims:
-        out.append(Int64(d))
-    return out^
-
-
-def _dims_value(dims: List[Int64]) -> Value:
-    """An `int[]` record over `dims` (keep `dims` alive across the call)."""
-    return Value(
-        TAG_INT_LIST, Int32(len(dims)), Int64(Int(dims.unsafe_ptr())), 0
-    )
-
-
-def _f64_call(
-    op: String, overload: String, var args: List[Value]
-) raises -> Owned:
-    var r = call_op(op, overload, args^, 1)
-    return own(r.take_tensor(0))
-
-
-def _f64_bool(b: Bool) -> Value:
-    return Value(TAG_BOOL, 0, Int64(1) if b else Int64(0), 0)
-
-
-def _moments_f64(
+def _welford_into(
     a: T,
     dims: List[Int],
     correction: Float64,
     take_sqrt: Bool,
-    want_mean: Bool,
-    shape: IndexList[MAX_RANK],
-    rank: Int,
-) raises -> Tuple[Owned, Owned]:
-    """float64 var/std(_mean) of `a` over `dims`, composed from float64
-    kernels with the moments kernel's own shift: every slice is centred on
-    its FIRST element before anything is summed, so the mean is `shift +
-    mean(x - shift)` and never a plain sum that overflows (`[1e308, 1e308]`
-    has mean 1e308 and variance 0, as CUDA's Welford gives). Results come
-    back in the reduced `shape`."""
-    _decline_metal_float64(a, "std/var")
-    var d64 = _int64_list(dims)
+    dst: T,
+    mean_dst: Int,
+) raises:
+    """stats Welford: var (or std) into the contiguous `dst` and, at
+    `mean_dst` (0 for none), the mean -- CUDA's `WelfordOps` element updates
+    and Chan merges, so neither ever overflows where CUDA's do not. A
+    contiguous input is read in place when its reduce dims are adjacent
+    ((outer, n, inner)) or a leading and a trailing group around the kept
+    ones (NCHW over (0, 2, 3): rows of segments); anything else is first
+    copied with the reduce dims trailing."""
+    one_device(a, dst)
     var n = 1
+    var red = List[Bool](length=a.rank, fill=False)
     for d in dims:
         n *= a.dim(d)
-    # The first element of every slice: `a` with each reduce dim cut to
-    # its index 0 (same strides, same offset), broadcastable against `a`.
-    var sshape = a.shape
+        red[d] = True
+    var src = _borrow(a)
+    var lo = a.rank
+    var hi = -1
     for d in dims:
-        sshape[MAX_RANK - a.rank + d] = 1
-    var shift = own(view_strided(a, sshape, a.strides, a.rank, a.offset))
-    var d0 = _f64_call(
-        "aten::sub",
-        "Tensor",
-        [tensor_arg(a), tensor_arg(shift.t), Value(TAG_SCALAR_INT, 0, 1, 0)],
+        lo = min(lo, d)
+        hi = max(hi, d)
+    var adjacent = len(dims) == 0 or hi - lo + 1 == len(dims)
+    # Leading reduce group [0, p), kept [p, q), trailing reduce group [q, rank).
+    var p = 0
+    while p < a.rank and red[p]:
+        p += 1
+    var q = a.rank
+    while q > p and red[q - 1]:
+        q -= 1
+    var split_groups = (
+        not adjacent and p > 0 and q < a.rank and len(dims) == p + a.rank - q
     )
-    var m0 = _f64_call(
-        "aten::mean",
-        "dim",
-        [
-            tensor_arg(d0.t),
-            _dims_value(d64),
-            _f64_bool(True),
-            Value(TAG_NONE, 0, 0, 0),
-        ],
-    )
-    var dev_t = _f64_call(
-        "aten::sub",
-        "Tensor",
-        [tensor_arg(d0.t), tensor_arg(m0.t), Value(TAG_SCALAR_INT, 0, 1, 0)],
-    )
-    var divisor = max(Float64(n) - correction, 0.0)
-    var var_k: Owned
-    if take_sqrt:
-        # sqrt(ss / divisor) as ||x - mean||_2 / sqrt(divisor): the float64
-        # vector norm takes the root on the device (no float64 sqrt kernel).
-        var nt = _f64_call(
-            "aten::linalg_vector_norm",
-            "",
-            [
-                tensor_arg(dev_t.t),
-                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(2.0), 0),
-                _dims_value(d64),
-                _f64_bool(True),
-                Value(TAG_NONE, 0, 0, 0),
-            ],
-        )
-        var_k = _f64_call(
-            "aten::div",
-            "Scalar",
-            [
-                tensor_arg(nt.t),
-                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(sqrt(divisor)), 0),
-            ],
-        )
-        _ = nt^  # alive past the call that reads it
-    else:
-        var sq = _f64_call(
-            "aten::mul", "Tensor", [tensor_arg(dev_t.t), tensor_arg(dev_t.t)]
-        )
-        var ss = _f64_call(
-            "aten::sum",
-            "dim_IntList",
-            [
-                tensor_arg(sq.t),
-                _dims_value(d64),
-                _f64_bool(True),
-                Value(TAG_NONE, 0, 0, 0),
-            ],
-        )
-        var_k = _f64_call(
-            "aten::div",
-            "Scalar",
-            [
-                tensor_arg(ss.t),
-                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(divisor), 0),
-            ],
-        )
-        _ = sq^  # alive past the calls that read them
-        _ = ss^
-    var var_out = own(new_tensor(shape, rank, a.stype, a.device))
-    var var_v = own(
-        view_strided(
-            var_k.t,
-            shape,
-            contiguous_strides(shape, rank),
-            rank,
-            var_k.t.offset,
-        )
-    )
-    copy_strided_into(var_out.t, var_v.t)
-    _ = var_v^  # alive past the copy
-    var mean_out: Owned
-    if want_mean:
-        # One element IS its mean (Welford's first update), infinite ones
-        # included: shift + (x - shift) would be inf - inf = NaN there.
-        var mk: Owned
-        if n == 1:
-            mk = own(new_tensor(sshape, a.rank, a.stype, a.device))
-            copy_strided_into(mk.t, shift.t)
-        else:
-            mk = _f64_call(
-                "aten::add",
-                "Tensor",
-                [
-                    tensor_arg(shift.t),
-                    tensor_arg(m0.t),
-                    Value(TAG_SCALAR_INT, 0, 1, 0),
-                ],
-            )
-        mean_out = own(new_tensor(shape, rank, a.stype, a.device))
-        var mean_v = own(
-            view_strided(
-                mk.t, shape, contiguous_strides(shape, rank), rank, mk.t.offset
-            )
-        )
-        copy_strided_into(mean_out.t, mean_v.t)
-        _ = mean_v^  # alive past the copy
-        _ = mk^
-    else:
-        mean_out = own(new_tensor(IndexList[MAX_RANK](0), 1, a.stype, a.device))
-    _ = shift^  # every temporary outlives the calls that read it
-    _ = d0^
-    _ = m0^
-    _ = dev_t^
-    _ = var_k^
-    _ = d64^
-    return (var_out^, mean_out^)
+    var inner = 1
+    var seg = n
+    if a.contig and adjacent and len(dims) > 0:
+        for k in range(hi + 1, a.rank):
+            inner *= a.dim(k)
+    elif a.contig and split_groups and n < (1 << 31):
+        seg = 1
+        for k in range(q, a.rank):
+            seg *= a.dim(k)
+    elif not (a.contig and adjacent):
+        src.replace(_permuted_contiguous(a, dims), True)
+    var outer = a.numel // (n * inner) if n * inner > 0 else 0
+    var ctx = ctx_for(dst.device)
+    var call = KernelCall("stats", "Welford")
+    call.arg_dtype(0, src.t.dtype)
+    call.int(dst.ptr)
+    call.int(mean_dst)
+    call.int(src.t.ptr)
+    call.int(outer)
+    call.int(n)
+    call.int(inner)
+    call.int(seg)
+    call.f64(correction)
+    call.int(1 if take_sqrt else 0)
+    call.int(dtype_code(src.t.dtype))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    _ = src^  # alive past the launch
 
 
 def _moments_into(
@@ -2170,12 +2040,12 @@ def _moments_into(
 
     `a` is first cast to `res_st` (make_reduction's in_dtype = out_dtype;
     half -> float32 is exact, so CUDA's mixed-precision special case agrees).
-    The variance and the mean come out of ONE moments pass (the mean is the
-    pass's shift plus the mean deviation, so it cannot overflow where a sum
-    would). std computes the variance in float32 and rounds once after the
-    root, as CUDA's Welford `project(take_sqrt)` does: a half operand is
-    widened first, which is exact. An empty operand gives NaN (ATen's
-    trivial reduction)."""
+    var_mean / std_mean and float64 take CUDA's own algorithm, the Welford
+    kernel (stats family): the variance and the mean of one pass, neither a
+    sum that can overflow where CUDA's do not. var / std alone keep the
+    shifted-moments kernel; std computes the variance in float32 and rounds
+    once after the root, as CUDA's Welford `project(take_sqrt)` does. An
+    empty operand gives NaN (ATen's trivial reduction)."""
     var rdt = max_dtype(res_st)
     if not _is_float3(rdt) and rdt != DType.float64:
         unsupported("std/var into dtype " + String(rdt))
@@ -2191,34 +2061,41 @@ def _moments_into(
         _decline_metal_float64_dtype(rdt, src.t, "std/var")
         src.replace(cast_to(src.t, res_st), True)
     var rdims = dims.copy()
-    if rdt == DType.float64:
+    if want_mean or rdt == DType.float64:
+        # var_mean / std_mean (and float64, which the shifted moments kernel
+        # lacks): CUDA's Welford, in one kernel, root and rounding included.
+        _decline_metal_float64(src.t, "std/var")
         var all = rdims.copy()
         if src.t.rank > 0 and len(all) == 0:
             all = _trailing_dims(src.t.rank, src.t.rank)
-        var r = _moments_f64(
-            src.t, all, correction, take_sqrt, want_mean, shape, rank
+        var vt = own(new_tensor(shape, rank, res_st, a.device))
+        var mt = _mean_slot(want_mean, shape, rank, res_st, a.device)
+        _welford_into(
+            src.t,
+            all,
+            correction,
+            take_sqrt,
+            vt.t,
+            mt.t.ptr if want_mean else 0,
         )
-        _ = src^  # alive past the launches
-        return r^
+        _ = src^  # alive past the launch
+        return (vt^, mt^)
     var kd = keepdim and src.t.rank != 0
     _flat_if_scalar(src, rdims)
     var work_st = ST_FLOAT32 if take_sqrt else res_st
     var wide = own_if_new(cast_to(src.t, work_st), src.t)
     var vt = own(new_tensor(shape, rank, work_st, a.device))
-    var mt = _mean_slot(want_mean, shape, rank, work_st, a.device)
-    if want_mean:
-        _var_mean_into(wide.t, rdims.copy(), kd, correction, vt.t, mt.t)
-    else:
-        _reduce_into(
-            "reduction",
-            "VarSpec",
-            wide.t,
-            rdims.copy(),
-            kd,
-            vt.t,
-            True,
-            correction,
-        )
+    var mt = _mean_slot(False, shape, rank, work_st, a.device)
+    _reduce_into(
+        "reduction",
+        "VarSpec",
+        wide.t,
+        rdims.copy(),
+        kd,
+        vt.t,
+        True,
+        correction,
+    )
     _ = wide^  # alive past the launch
     _ = src^
     if take_sqrt:
@@ -2229,10 +2106,8 @@ def _moments_into(
         return (vt^, mt^)
     # std of a half operand: the float32 results, rounded once.
     var var_out = own(new_tensor(shape, rank, res_st, a.device))
-    var mean_out = _mean_slot(want_mean, shape, rank, res_st, a.device)
+    var mean_out = _mean_slot(False, shape, rank, res_st, a.device)
     cast_into(var_out.t, vt.t)
-    if want_mean:
-        cast_into(mean_out.t, mt.t)
     _ = vt^  # alive past the launches
     _ = mt^
     return (var_out^, mean_out^)

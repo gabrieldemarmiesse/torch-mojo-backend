@@ -9,7 +9,7 @@ keeps the entry pointer.
 """
 from std.builtin.sort import sort
 from std.collections import Dict
-from std.ffi import OwnedDLHandle, external_call
+from std.ffi import OwnedDLHandle, external_call, get_errno
 from std.os import getenv, makedirs
 from std.os.path import exists, isdir
 from std.pathlib import Path
@@ -49,6 +49,25 @@ comptime SNAPSHOT_MARKER = ".snapshot-complete"
 # How long a snapshot install waits for another process installing the same
 # one (a copy of a few dozen source files: milliseconds in practice).
 comptime SNAPSHOT_LOCK_TIMEOUT_MS = 120_000
+# A snapshot temp dir older than this is an interrupted install's leftover.
+comptime SNAPSHOT_TMP_MAX_AGE_MIN = 60
+# errno of a busy LOCK_NB flock (EWOULDBLOCK == EAGAIN).
+comptime _EWOULDBLOCK = 35 if CompilationTarget.is_macos() else 11
+
+
+def _open_lock_cloexec(path: String) -> Int32:
+    """A read-only, close-on-exec fd on `path`, created if missing (-1 on
+    failure): the build subprocesses must not inherit the lock."""
+    var p = String(path)
+    comptime O_CREAT = 0x200 if CompilationTarget.is_macos() else 0o100
+    comptime O_CLOEXEC = 0x1000000 if CompilationTarget.is_macos() else 0x80000
+    return external_call["open", Int32, num_fixed_args=2](
+        p.as_c_string_span().ptr(),
+        Int32(O_CREAT | O_CLOEXEC),
+        Int32(0o644),
+    )  # O_RDONLY: flock needs no write access
+
+
 comptime KERNELS = "tmb/kernels"
 
 
@@ -264,68 +283,92 @@ struct Loader(Movable):
         # by TMPDIR aging then take turns, and the second sees the first's
         # complete copy instead of deleting it. The copy is written to a
         # unique temp dir, completion marker last, then renamed into place,
-        # so nobody ever reads a half-written snapshot.
-        var lock_path = dest + ".lock"
-        var fd = external_call["creat", Int32](
-            lock_path.as_c_string_span().ptr(), Int32(0o644)
-        )
+        # so nobody ever reads a half-written snapshot. A filesystem that
+        # refuses the lock outright (not merely busy) gets the same install
+        # without it.
+        var fd = _open_lock_cloexec(dest + ".lock")
         if fd < 0:
-            raise Error("could not create the snapshot lock ", lock_path)
+            return self._install_snapshot(dest, h, ft[0], ft[1], False)
         var waited_ms = 0
         while (
             external_call["flock", Int32](fd, Int32(2 | 4)) != 0
         ):  # LOCK_EX | LOCK_NB
+            if get_errno().value != Int32(_EWOULDBLOCK):
+                _ = external_call["close", Int32](fd)
+                return self._install_snapshot(dest, h, ft[0], ft[1], False)
             if waited_ms >= SNAPSHOT_LOCK_TIMEOUT_MS:
                 _ = external_call["close", Int32](fd)
                 raise Error(
                     "timed out waiting for the source snapshot lock ",
-                    lock_path,
+                    dest + ".lock",
                 )
             _ = external_call["usleep", Int32](UInt32(10_000))
             waited_ms += 10
         try:
             if not self._snapshot_complete(dest, ft[0]):
-                # Under the lock nobody else writes this snapshot: temp and
-                # stale dirs left by an interrupted install are garbage.
-                _ = run_command(
-                    "rm -rf '" + dest + "'.tmp* '" + dest + "'.stale*"
-                )
-                var uniq = (
-                    String(external_call["getpid", Int32]())
-                    + "-"
-                    + String(perf_counter_ns())
-                )
-                var tmp = dest + ".tmp" + uniq
-                for f in ft[0]:
-                    var rel = String(f[byte = self.root.byte_length() :])
-                    var target = tmp + rel
-                    makedirs(
-                        String(target[byte = : target.rfind("/")]),
-                        exist_ok=True,
-                    )
-                    Path(target).write_text(ft[1][f])
-                Path(tmp + "/" + SNAPSHOT_MARKER).write_text(h)
-                if isdir(dest):
-                    # Incomplete, and nobody else can be installing it (we
-                    # hold the lock): move it aside before deleting, so the
-                    # rename below never targets a non-empty directory.
-                    var stale = dest + ".stale" + uniq
-                    _ = external_call["rename", Int32](
-                        dest.as_c_string_span().ptr(),
-                        stale.as_c_string_span().ptr(),
-                    )
-                    _ = run_command("rm -rf '" + stale + "'")
-                var r = external_call["rename", Int32](
-                    tmp.as_c_string_span().ptr(), dest.as_c_string_span().ptr()
-                )
-                if r != 0:
-                    # Should not happen under the lock; build from our own
-                    # complete copy rather than fail.
-                    return (tmp, h)
+                return self._install_snapshot(dest, h, ft[0], ft[1], True)
         finally:
             _ = external_call["flock", Int32](fd, Int32(8))  # LOCK_UN
             _ = external_call["close", Int32](fd)
         return (dest, h)
+
+    def _install_snapshot(
+        self,
+        dest: String,
+        h: String,
+        files: List[String],
+        texts: Dict[String, String],
+        locked: Bool,
+    ) raises -> Tuple[String, String]:
+        """Write the closure to a unique temp dir (marker last) and rename it
+        to `dest`; returns the root to build from. `locked`: we hold the
+        snapshot lock, so an incomplete `dest` is ours to replace."""
+        # Temp dirs of an interrupted install, old enough that no live
+        # installer (locked or not) can still be writing them.
+        var slash = dest.rfind("/")
+        _ = run_command(
+            "find '"
+            + String(dest[byte=:slash])
+            + "' -maxdepth 1 -name '"
+            + String(dest[byte = slash + 1 :])
+            + ".tmp*' -mmin +"
+            + String(SNAPSHOT_TMP_MAX_AGE_MIN)
+            + " -exec rm -rf {} + 2>/dev/null; true"
+        )
+        var uniq = (
+            String(external_call["getpid", Int32]())
+            + "-"
+            + String(perf_counter_ns())
+        )
+        var tmp = dest + ".tmp" + uniq
+        for f in files:
+            var rel = String(f[byte = self.root.byte_length() :])
+            var target = tmp + rel
+            makedirs(String(target[byte = : target.rfind("/")]), exist_ok=True)
+            Path(target).write_text(texts[f])
+        Path(tmp + "/" + SNAPSHOT_MARKER).write_text(h)
+        if locked and isdir(dest):
+            # Incomplete, and nobody else can be installing it (we hold the
+            # lock): move it aside before deleting, so the rename below never
+            # targets a non-empty directory.
+            var stale = dest + ".stale" + uniq
+            var live = String(dest)
+            _ = external_call["rename", Int32](
+                live.as_c_string_span().ptr(), stale.as_c_string_span().ptr()
+            )
+            _ = run_command("rm -rf '" + stale + "'")
+        var d = String(dest)
+        var r = external_call["rename", Int32](
+            tmp.as_c_string_span().ptr(), d.as_c_string_span().ptr()
+        )
+        if r == 0:
+            return (dest, h)
+        if self._snapshot_complete(dest, files):
+            # Lock-free: another process installed it first.
+            _ = run_command("rm -rf '" + tmp + "'")
+            return (dest, h)
+        # Build from our own complete copy rather than fail.
+        return (tmp, h)
 
     def _snapshot_complete(self, dest: String, files: List[String]) -> Bool:
         """A snapshot is reusable only if its marker and every source of the
