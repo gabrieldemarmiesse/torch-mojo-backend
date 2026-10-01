@@ -212,9 +212,9 @@ def _moment_finish[
     var m2 = q - s * s / nf
     if m2 < 0:  # a few ulps below zero on a constant slice; nan passes through
         m2 = Float32(0)
-    var divisor = nf - correction
-    if divisor < 0:
-        divisor = Float32(0)
+    # CUDA's `nf > correction ? nf - correction : 0` (a NaN correction
+    # divides by 0).
+    var divisor = nf - correction if nf > correction else Float32(0)
     return (m2 / divisor).cast[dtype]()
 
 

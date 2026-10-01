@@ -259,6 +259,17 @@ def test_isin_scalar_compares_in_the_promoted_dtype(mojo_gpu: str, n: int):
         assert got.item() is want
 
 
+def test_integer_scalar_past_2_53_compares_exactly(mojo_gpu: str):
+    """An int scalar against an integer tensor travels as int64 bits."""
+    big = 2**53 + 1
+    t = torch.tensor([big, 3], device=mojo_gpu)
+    assert torch.isin(big, t).item() is True
+    assert torch.isin(2**53, t).item() is False
+    assert torch.eq(t, big).cpu().tolist() == [True, False]
+    assert torch.ne(t, big).cpu().tolist() == [False, True]
+    assert torch.isin(t, big).cpu().tolist() == [True, False]
+
+
 def test_isin_float_and_mixed_dtypes(mojo_gpu: str):
     elements = torch.tensor([1.0, 2.0, float("nan"), -0.0])
     test_elements = torch.tensor([1.0, float("nan"), 0.0])

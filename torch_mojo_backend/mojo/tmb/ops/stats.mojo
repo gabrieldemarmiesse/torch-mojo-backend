@@ -1436,20 +1436,29 @@ def op__weight_norm_interface(
     var acc = _acc_stype(g.stype)
     var vf = _cast(v, acc)
     var dims = _other_dims(v.rank, dim)
-    # norms = sqrt(sum v^2) per slice in the accumulate type, exactly as
-    # WeightNorm.cu forms it: no rescaling (linalg_vector_norm's), so a
-    # float32 sum of squares that overflows gives an inf norm and a zero
-    # weight, as on CUDA.
-    var sq = _mul(vf.t, vf.t)
-    var ss = _call(
-        "aten::sum",
-        "dim_IntList",
-        [_t(sq.t), _ilist(dims), bool_arg(True), none_arg()],
-    )
+    # norms = sqrt(sum v^2) per slice in the accumulate type, as
+    # WeightNorm.cu forms it. linalg_vector_norm's L2 reduce is that plain
+    # sum of squares (no rescaling), except for torch's own shortcut when
+    # every reduced dim has extent 1 (abs(v), which cannot overflow): there
+    # square v and take the root directly, so a float32 1e20 gives an inf
+    # norm and a zero weight, as on CUDA.
+    var slice_len = vf.t.numel // vf.t.dim(dim) if vf.t.dim(dim) > 0 else 0
+    var norm: Owned
+    if slice_len == 1:
+        var sq = _mul(vf.t, vf.t)
+        # aten::sqrt has no float64 kernel; pow(x, 0.5) is PowKernel.cu's
+        # sqrt special case (`_pw_pow_f64_scalar`), the same rounded root.
+        norm = _call(
+            "aten::pow", "Tensor_Scalar", [_t(sq.t), _dbl(0.5)]
+        ) if sq.t.stype == ST_FLOAT64 else _call("aten::sqrt", "", [_t(sq.t)])
+        _ = sq^  # alive past the call that reads it
+    else:
+        norm = _call(
+            "aten::linalg_vector_norm",
+            "",
+            [_t(vf.t), _dbl(2.0), _ilist(dims), bool_arg(True), none_arg()],
+        )
     _ = dims
-    _ = sq^  # alive past the call that reads it
-    var norm = _call("aten::sqrt", "", [_t(ss.t)])
-    _ = ss^  # alive past the call that reads it
     var rnorm = _reciprocal(norm.t)
     var gf = _cast(g, acc)
     var gk = _as_keep(gf.t, v, dim)

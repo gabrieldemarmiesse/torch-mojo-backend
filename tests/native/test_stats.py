@@ -358,6 +358,16 @@ def test_weight_norm_interface_norm_overflows_like_cuda(mojo_gpu):
     assert norm.cpu().tolist() == [[float("inf")]]
 
 
+def test_weight_norm_interface_float64(mojo_gpu):
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    v = torch.tensor([[3.0], [4.0]], dtype=torch.float64)
+    g = torch.tensor([[1.0], [2.0]], dtype=torch.float64)
+    w, norm = torch._weight_norm_interface(v.to(mojo_gpu), g.to(mojo_gpu), 0)
+    assert w.cpu().tolist() == [[1.0], [2.0]]
+    assert norm.cpu().tolist() == [[3.0], [4.0]]
+    assert w.dtype == norm.dtype == torch.float64
+
+
 def test_weight_norm_through_nn_utils_backward(mojo_gpu):
     torch.manual_seed(0)
     lin = torch.nn.Linear(5, 4)
