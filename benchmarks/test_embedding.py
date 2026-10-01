@@ -80,6 +80,7 @@ COVERS: dict[str, str] = {
     ),
     "aten::index_reduce": "test_index_reduce",
     "aten::_embedding_bag_forward_only": "test_embedding_bag",
+    "aten::_embedding_bag_dense_backward": "test_embedding_bag_backward",
 }
 
 _SAME_KERNEL_OUT = (
@@ -121,16 +122,12 @@ SKIPPED: dict[str, str] = {
     "aten::_embedding_bag_backward": (
         "argument checks, then _embedding_bag_dense_backward"
     ),
-    "aten::_embedding_bag_dense_backward": (
-        "index_select / mul / div / index_add (or scatter_add for max) "
-        "through the dispatcher, each benchmarked: no kernel of its own"
-    ),
     "aten::_embedding_bag_per_sample_weights_backward": (
         "index_select / mul / sum through the dispatcher, each benchmarked"
     ),
     "aten::embedding_renorm_": (
-        "a host dedup of the indices (one read) and a per-row rescale kernel; "
-        "the read dominates"
+        "test_unique's sort and group passes on the indices, then a per-row "
+        "rescale kernel; two small reads dominate"
     ),
 }
 
@@ -439,5 +436,38 @@ def test_embedding_bag(
     bench.run(
         lambda: F.embedding_bag(i_ref, w_ref, o_ref, mode=layout),
         lambda: F.embedding_bag(i_our, w_our, o_our, mode=layout),
+        flops=float(bags * length * dim),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", EMB_BAG_SHAPES)
+@pytest.mark.parametrize("layout", ("sum", "mean"))
+@pytest.mark.bench_op("_embedding_bag_dense_backward")
+def test_embedding_bag_backward(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """The sorted, deterministic weight gradient of sum / mean bags."""
+    vocab, dim, bags, length = EMB_BAG_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    i_ref, i_our = both(torch.randint(0, vocab, (bags * length,)), hw, mojo_device)
+    o2b_ref, o2b_our = both(
+        torch.arange(bags).repeat_interleave(length), hw, mojo_device
+    )
+    bs_ref, bs_our = both(torch.full((bags,), length), hw, mojo_device)
+    g_ref, g_our = both(torch.randn(bags, dim, dtype=dtype), hw, mojo_device)
+    mode = 0 if layout == "sum" else 1
+    bench.run(
+        lambda: torch.ops.aten._embedding_bag_dense_backward(
+            g_ref, i_ref, o2b_ref, bs_ref, bs_ref, vocab, False, mode, None, -1
+        ),
+        lambda: torch.ops.aten._embedding_bag_dense_backward(
+            g_our, i_our, o2b_our, bs_our, bs_our, vocab, False, mode, None, -1
+        ),
         flops=float(bags * length * dim),
     )

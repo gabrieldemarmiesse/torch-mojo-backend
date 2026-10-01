@@ -114,12 +114,21 @@ def _arange_needs_host_fallback(
     if dt == DType.float64 and dev(device)[].api == "metal":
         return True
     if (
-        abs(v_f64(start_v)) > _MAX_EXACT_F64_INT
-        or abs(v_f64(end_v)) > _MAX_EXACT_F64_INT
-        or abs(v_f64(step_v)) > _MAX_EXACT_F64_INT
+        _beyond_exact_f64(start_v)
+        or _beyond_exact_f64(end_v)
+        or _beyond_exact_f64(step_v)
     ):
         return True
     return False
+
+
+def _beyond_exact_f64(v: Value) raises -> Bool:
+    """Whether `v` cannot cross into the kernel as a double exactly. An
+    integer is compared as an integer: 2**53 + 1 reads back from a double
+    as 2**53, which would pass a double comparison."""
+    if v_scalar_is_integral(v):
+        return abs(v_int(v)) > Int(_MAX_EXACT_F64_INT)
+    return abs(v_f64(v)) > _MAX_EXACT_F64_INT
 
 
 def _arange_numel(start_v: Value, end_v: Value, step_v: Value) raises -> Int:

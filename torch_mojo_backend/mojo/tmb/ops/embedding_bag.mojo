@@ -8,15 +8,17 @@
 * _embedding_bag_backward -- ATen's generic `_embedding_bag_backward_symint`
   (native/EmbeddingBag.cpp): index promotion, offset2bag rebuilt when the
   forward did not return one, then the dense backward.
-* _embedding_bag_dense_backward / _embedding_bag_per_sample_weights_backward
-  -- compositions of ops this device already runs: sum / mean gather the
-  bag gradient of every index (index_select), scale it (per-sample weight,
-  bag size, frequency) in the accumulator dtype and index_add it into the
-  weight gradient; max scatter_adds into the rows max_indices names. The
-  float sums are atomic (CUDA sorts and segment-reduces instead), so they
-  can differ from CUDA in the last bits.
-* embedding_renorm_ -- the indices are made unique on the host (one read,
-  CUDA reads none), then `EmbeddingRenorm` rescales each row in place.
+* _embedding_bag_dense_backward -- sum / mean: a stable sort of the indices,
+  then `EmbeddingBagBackwardSorted`, CUDA's deterministic two-pass segment
+  sum (one thread per weight row and feature, CUDA's summation order); max
+  scatter_adds into the rows max_indices names (atomic, alerting like
+  CUDA's embedding_bag_backward_cuda_max).
+* _embedding_bag_per_sample_weights_backward -- index_select / mul / sum:
+  each product rounded to the dtype, summed in the accumulator, as CUDA.
+* embedding_renorm_ -- the indices are wrapped and made unique on the
+  device (the unique group's sort route, one read of the count), then
+  `EmbeddingRenorm` rescales each row in place and flags an index out of
+  range (one more read; CUDA device-asserts instead).
 """
 from std.utils import IndexList
 
@@ -62,6 +64,7 @@ from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import call_op, cast_to, contiguous, fill_value
 from tmb.ops.data_movement import _scalar_type_name
+from tmb.ops.unique import unique_flat
 
 comptime _MODE_SUM = 0
 comptime _MODE_MEAN = 1
@@ -167,13 +170,28 @@ def _check_bag_dtype(t: T, what: String) raises:
         unsupported("aten::" + what + " of float64 on Apple GPU")
 
 
-def _read_flag(flag: T) raises -> Int:
+def _read_flags(flag: T) raises -> List[Bool]:
+    """The int32 flags of a launch, read back (one blocking copy)."""
     var host = own(cpu_empty(flag.shape, 1, ST_INT32))
     var ctx = ctx_for(flag.device)
-    copy_to_host(ctx, flag.ptr, host.t.ptr, 4)
+    copy_to_host(ctx, flag.ptr, host.t.ptr, flag.numel * 4)
+    _ = ctx
+    var p = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=host.t.ptr)
+    var out = List[Bool]()
+    for i in range(flag.numel):
+        out.append(p[unsafe_offset=i] != 0)
+    _ = host^
+    return out^
+
+
+def _read_int(t: T, i: Int) raises -> Int:
+    """Element `i` of the contiguous int64 device tensor `t`."""
+    var host = own(cpu_empty(_vec(1), 1, ST_INT64))
+    var ctx = ctx_for(t.device)
+    copy_to_host(ctx, t.ptr + i * 8, host.t.ptr, 8)
     _ = ctx
     var v = Int(
-        Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=host.t.ptr)[]
+        Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=host.t.ptr)[]
     )
     _ = host^
     return v
@@ -271,7 +289,7 @@ def op_embedding_bag(
         )
     )
     if num_bags * features > 0:
-        var flag = _zeros(_vec(1), 1, ST_INT32, device)
+        var flag = _zeros(_vec(4), 1, ST_INT32, device)
         var ctx = ctx_for(device)
         var call = KernelCall("embedding_bag", "EmbeddingBagForward")
         call.arg_dtype(0, weight.dtype)
@@ -296,21 +314,38 @@ def op_embedding_bag(
                 weight.dim(0),
                 psw_stride,
                 1 if has_psw else 0,
+                offsets.dim(0),
             ]
         )
         call.int(dtype_code(weight.dtype))
         call.int(ctx_ptr(ctx))
         call.run()
         _ = ctx
-        var bad = _read_flag(flag.t)
+        var bad = _read_flags(flag.t)
         _ = flag^
-        if bad == 1:
+        # check_arguments' order (EmbeddingBag.cpp), then the kernel's.
+        if bad[3]:
+            raise Error(
+                (
+                    "offsets[0] has to be 0, i.e., the first sequence in the"
+                    " mini-batch has to start from position 0. However, got "
+                ),
+                _read_int(offs.t, 0),
+            )
+        if bad[2]:
+            raise Error(
+                "offsets[-1] can not be greater than input's length ",
+                num_indices,
+                " but got offsets[-1] of ",
+                _read_int(offs.t, offs.t.numel - 1),
+            )
+        if bad[0]:
             index_error(
                 "Invalid input index in EmbeddingBag: index out of range [0, "
                 + String(weight.dim(0))
                 + ")"
             )
-        if bad == 2:
+        if bad[1]:
             raise Error("embedding_bag: offsets must be non-decreasing")
     _ = idx^
     _ = offs^
@@ -375,11 +410,12 @@ def op_embedding_bag_backward(
     var indices_in = v_tensor(args[unsafe_offset=1])
     var offsets_in = v_tensor(args[unsafe_offset=2])
     var offset2bag = v_tensor(args[unsafe_offset=3])
+    # Checked before the promotion casts, which would launder a float.
+    _check_index_dtype(indices_in, "indices", 1, "embedding_bag")
+    _check_index_dtype(offsets_in, "offsets", 1, "embedding_bag")
     var st = _index_stype(indices_in, offsets_in)
     var indices = own_if_new(cast_to(indices_in, st), indices_in)
     var offsets = own_if_new(cast_to(offsets_in, st), offsets_in)
-    _check_index_dtype(indices.t, "indices", 1, "embedding_bag")
-    _check_index_dtype(offsets.t, "offsets", 1, "embedding_bag")
     if not indices.t.contig or not offsets.t.contig:
         raise Error(
             "Expected contiguous tensor, but got non-contiguous tensor for"
@@ -418,10 +454,6 @@ def op_embedding_bag_backward(
     _ = indices^
     _ = offsets^
     ret_owned(rets, 0, out)
-
-
-def _unsqueeze1(t: T) raises -> Owned:
-    return _op("aten::unsqueeze", "", [_t(t), _int(1)])
 
 
 # aten::_embedding_bag_dense_backward(Tensor grad, Tensor indices,
@@ -497,84 +529,75 @@ def op_embedding_bag_dense_backward(
         raise Error(
             "embedding_bag: per_sample_weights only supported with mode='sum'"
         )
-    var acc = _acc_stype(grad)
-    if indices.numel == 0:
-        var z = _zeros(_mat(num_weights, features), 2, grad.stype, device)
-        ret_owned(rets, 0, z)
+    var gw = own(new_tensor(_mat(num_weights, features), 2, grad.stype, device))
+    if indices.numel == 0 or gw.t.numel == 0:
+        fill_value(gw.t, 0.0)
+        ret_owned(rets, 0, gw)
         return
-    var g = own_if_new(cast_to(grad, acc), grad)
-    var rows = _op("aten::index_select", "", [_t(g.t), _int(0), _t(offset2bag)])
+    # Stable sort of the indices (CUDA's radix_sort_pairs), then the
+    # deterministic per-row sum of EmbeddingBagBackwardSorted.
+    var idx = _as_int64(indices)
+    var r = call_op(
+        "aten::sort",
+        "stable",
+        [
+            _t(idx.t),
+            Value(TAG_BOOL, 0, 1, 0),
+            _int(0),
+            Value(TAG_BOOL, 0, 0, 0),
+        ],
+        2,
+    )
+    var sorted = own(r.take_tensor(0))
+    var perm = own(r.take_tensor(1))
+    var o2b = _as_int64(offset2bag)
+    var bs = _as_int64(bag_size)
+    var g = own_if_new(contiguous(grad), grad)
+    var psw_ptr = 0
+    var psw_stride = 0
     if psw:
-        var w = own_if_new(cast_to(psw.value(), acc), psw.value())
-        var w2 = _unsqueeze1(w.t)
-        var scaled = _op("aten::mul", "Tensor", [_t(rows.t), _t(w2.t)])
-        _ = rows^  # alive until the call above has read it
-        rows = scaled^
-        _ = w2^
-        _ = w^
-    if mode == _MODE_MEAN:
-        var bs = _op(
-            "aten::index_select", "", [_t(bag_size), _int(0), _t(offset2bag)]
-        )
-        var bsf = own_if_new(cast_to(bs.t, acc), bs.t)
-        var bs2 = _unsqueeze1(bsf.t)
-        var averaged = _op("aten::div", "Tensor", [_t(rows.t), _t(bs2.t)])
-        _ = rows^
-        rows = averaged^
-        _ = bs2^
-        _ = bsf^
-        _ = bs^
-    if scale_grad_by_freq:
-        var counts = _zeros(_vec(num_weights), 1, acc, device)
-        var ones = own(new_tensor(_vec(indices.numel), 1, acc, device))
-        fill_value(ones.t, 1.0)
-        var c = _op(
-            "aten::index_add",
-            "",
-            [_t(counts.t), _int(0), _t(indices), _t(ones.t), _scalar(1)],
-        )
-        var per = _op("aten::index_select", "", [_t(c.t), _int(0), _t(indices)])
-        var per2 = _unsqueeze1(per.t)
-        var freq = _op("aten::div", "Tensor", [_t(rows.t), _t(per2.t)])
-        _ = rows^
-        rows = freq^
-        _ = per2^
-        _ = per^
-        _ = c^
-        _ = ones^
-        _ = counts^
-    # padding_idx rows land in a spare row that is dropped afterwards.
-    var target = indices.copy()
-    var remapped = Optional[Owned](None)
-    if padding_idx >= 0:
-        var pad = _op("aten::eq", "Scalar", [_t(indices), _scalar(padding_idx)])
-        remapped = _op(
-            "aten::masked_fill",
-            "Scalar",
-            [_t(indices), _t(pad.t), _scalar(num_weights)],
-        )
-        target = remapped.value().t.copy()
-        _ = pad^
-    var gw = _zeros(_mat(num_weights + 1, features), 2, acc, device)
-    var summed = _op(
-        "aten::index_add",
-        "",
-        [_t(gw.t), _int(0), _t(target), _t(rows.t), _scalar(1)],
+        if psw.value().dtype != grad.dtype:
+            raise Error(
+                "expected scalar type ",
+                _scalar_type_name(grad.dtype),
+                " but found ",
+                _scalar_type_name(psw.value().dtype),
+            )
+        psw_ptr = psw.value().ptr
+        psw_stride = psw.value().stride(0)
+    var ctx = ctx_for(device)
+    var call = KernelCall("embedding_bag", "EmbeddingBagBackwardSorted")
+    call.arg_dtype(0, grad.dtype)
+    call.int(gw.t.ptr)
+    call.int(g.t.ptr)
+    call.int(sorted.t.ptr)
+    call.int(perm.t.ptr)
+    call.int(o2b.t.ptr)
+    call.int(bs.t.ptr)
+    call.int(psw_ptr)
+    call.tuple(
+        [
+            indices.numel,
+            num_weights,
+            features,
+            1 if mode == _MODE_MEAN else 0,
+            1 if psw else 0,
+            psw_stride,
+            1 if scale_grad_by_freq else 0,
+            padding_idx,
+        ]
     )
-    var top = _op(
-        "aten::narrow", "", [_t(summed.t), _int(0), _int(0), _int(num_weights)]
-    )
-    _ = summed^
-    _ = gw^
-    _ = remapped^
-    _ = rows^
+    call.int(dtype_code(grad.dtype))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
     _ = g^
-    if acc == grad.stype:
-        ret_owned(rets, 0, top)  # a leading narrow: contiguous
-        return
-    var res = own(cast_to(top.t, grad.stype))
-    _ = top^
-    ret_owned(rets, 0, res)
+    _ = bs^
+    _ = o2b^
+    _ = perm^
+    _ = sorted^
+    _ = idx^
+    ret_owned(rets, 0, gw)
 
 
 # aten::_embedding_bag_per_sample_weights_backward(Tensor grad, Tensor weight,
@@ -601,11 +624,13 @@ def op_embedding_bag_per_sample_weights_backward(
         ret_owned(rets, 0, e)
         return
     var acc = _acc_stype(grad)
-    var g = own_if_new(cast_to(grad, acc), grad)
-    var w = own_if_new(cast_to(weight, acc), weight)
-    var gr = _op("aten::index_select", "", [_t(g.t), _int(0), _t(offset2bag)])
-    var wr = _op("aten::index_select", "", [_t(w.t), _int(0), _t(indices)])
-    var prod = _op("aten::mul", "Tensor", [_t(gr.t), _t(wr.t)])
+    # CUDA's kernel does `result += grad[..] * weight[..]` with scalar_t
+    # operands: each product is rounded to the dtype (a half product can
+    # overflow to inf), then summed in the accumulator.
+    var gr = _op("aten::index_select", "", [_t(grad), _int(0), _t(offset2bag)])
+    var wr = _op("aten::index_select", "", [_t(weight), _int(0), _t(indices)])
+    var prod_dt = _op("aten::mul", "Tensor", [_t(gr.t), _t(wr.t)])
+    var prod = own_if_new(cast_to(prod_dt.t, acc), prod_dt.t)
     var dims = List[Int64]()
     dims.append(Int64(1))
     var s = _op(
@@ -628,10 +653,9 @@ def op_embedding_bag_per_sample_weights_backward(
         _ = s^  # alive until the call above has read it
         s = masked^
     _ = prod^
+    _ = prod_dt^
     _ = wr^
     _ = gr^
-    _ = w^
-    _ = g^
     if acc == grad.stype:
         ret_owned(rets, 0, s)
         return
@@ -673,39 +697,33 @@ def op_embedding_renorm_(
     if indices.numel == 0:
         ret_ref(rets, 0, t)
         return
-    # Wrap, range-check and deduplicate on the host: two threads renorming
-    # one row would race (CUDA sorts and uniques on the device).
-    var idx = _as_int64(indices)
-    var n = idx.t.numel
-    var host = own(cpu_empty(idx.t.shape, idx.t.rank, ST_INT64))
-    var ctx = ctx_for(t.device)
-    copy_to_host(ctx, idx.t.ptr, host.t.ptr, n * 8)
-    _ = idx^
-    var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=host.t.ptr)
+    # Wrap the negative indices (embedding_renorm_wrap_indices_kernel),
+    # then deduplicate on the device: two threads renorming one row would
+    # race. An index outside [-W, W) stays outside [0, W) and is reported by
+    # the kernel.
     var num_weights = t.dim(0)
-    var seen = List[Bool](capacity=num_weights)
-    for _ in range(num_weights):
-        seen.append(False)
-    var count = 0
-    for i in range(n):
-        var r = Int(p[unsafe_offset=i])
-        if r < -num_weights or r >= num_weights:
-            index_error("embedding_renorm_: index out of bounds")
-        if r < 0:
-            r += num_weights
-        if not seen[r]:
-            seen[r] = True
-            p[unsafe_offset=count] = Int64(r)  # compacted in place
-            count += 1
-    var dev_rows = own(new_tensor(_vec(count), 1, ST_INT64, t.device))
-    copy_from_host(t.device, ctx, dev_rows.t.ptr, host.t.ptr, count * 8)
-    _ = host^
+    var idx = _as_int64(indices)
+    var neg = _op("aten::lt", "Scalar", [_t(idx.t), _scalar(0)])
+    var wrapped = _op(
+        "aten::add",
+        "Tensor",
+        [_t(idx.t), _t(neg.t), _scalar(num_weights)],
+    )
+    _ = neg^
+    _ = idx^
+    var u = unique_flat(wrapped.t, False, False, False)
+    _ = wrapped^
+    var dev_rows = own(u[0].take())
+    var ctx = ctx_for(t.device)
     if t.dim(1) > 0:
+        var flag = _zeros(_vec(1), 1, ST_INT32, t.device)
         var call = KernelCall("embedding_bag", "EmbeddingRenorm")
         call.arg_dtype(0, t.dtype)
         call.int(t.ptr)
         call.int(dev_rows.t.ptr)
+        call.int(flag.t.ptr)
         call.int(dev_rows.t.numel)
+        call.int(num_weights)
         call.int(t.dim(1))
         call.int(t.stride(0))
         call.int(t.stride(1))
@@ -714,6 +732,10 @@ def op_embedding_renorm_(
         call.int(dtype_code(t.dtype))
         call.int(ctx_ptr(ctx))
         call.run()
+        if _read_flags(flag.t)[0]:
+            index_error("embedding_renorm_: index out of bounds")
+        _ = flag^
+    _ = u^
     _ = dev_rows^
     _ = ctx
     ret_ref(rets, 0, t)

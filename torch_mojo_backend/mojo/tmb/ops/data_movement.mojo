@@ -30,6 +30,7 @@ from tmb.backend.abi import (
     ST_INT32,
     ST_INT64,
     TAG_NONE,
+    TAG_INT,
     TAG_INT_LIST,
     TAG_BOOL,
     TAG_SCALAR_DOUBLE,
@@ -94,6 +95,11 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    assert_no_internal_overlap,
+    assert_no_overlap,
+    is_int_stype,
+    scalar_to_float,
+    scalar_to_int,
     broadcast_shape,
     check_out,
     is_cast_dtype_on,
@@ -1640,6 +1646,7 @@ def _scatter_launch(
     rop: Int = 0,
     identity: Bool = False,
     ordered: Bool = False,
+    int_value: Optional[Int] = None,
 ) raises:
     """One ScatterDim / ScatterAddDim launch over the rank-<=4 index space
     `dims` (every stride list has its length), then the bad-index report.
@@ -1647,7 +1654,8 @@ def _scatter_launch(
     ScatterReduceDim read-modify-write; `identity` writes that reduction's
     identity instead of src / `value` (`include_self=False`). `ordered`
     walks `dim` in index order per thread, without atomics (the index must
-    be broadcast off `dim`; see the kernel).
+    be broadcast off `dim`; see the kernel). `int_value` carries an integer
+    dtype's scalar exactly (`value` is a double).
 
     The kernel skips a write whose index falls outside [0, dim_size) and
     raises an int32 flag; the read back is one 4-byte D2H, after which a bad
@@ -1691,6 +1699,8 @@ def _scatter_launch(
     call.int(ctx_ptr(ctx))
     call.int(rop)
     call.int(1 if ordered else 0)
+    call.int(1 if int_value else 0)
+    call.int(int_value.value() if int_value else 0)
     call.run()
     var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
     copy_to_host(ctx, flag.t.ptr, host_flag.t.ptr, 4)
@@ -1713,6 +1723,103 @@ def _scatter_launch(
             ),
             dim_size,
         )
+
+
+def scatter_add_sorted(
+    target: T,
+    index: T,
+    idx_strides: List[Int],
+    src: T,
+    src_strides: List[Int],
+    dims: List[Int],
+    dim: Int,
+    dim_size: Int,
+    what: String,
+) raises:
+    """`target[...] += src[...]` like `_scatter_launch(accumulate=True)`, but
+    ordered and deterministic: the targets are stably sorted and every run
+    of equal targets is summed in index-space order (data_movement
+    ScatterTargets + SortedSegmentAdd; ATen's `_scatter_via_index_put`).
+    Floating dtypes only."""
+    var total = 1
+    for d in dims:
+        total *= d
+    if total == 0:
+        return
+    var pad = 4 - len(dims)
+    var params = _pad4(dims, 1)
+    params += _pad4(_strides_of(target), 0)
+    params += _pad4(src_strides, 0)
+    params += _pad4(idx_strides, 0)
+    params.append(dim + pad)
+    params.append(dim_size)
+    var ctx = ctx_for(target.device)
+    var flat = IndexList[MAX_RANK](1)
+    flat[MAX_RANK - 1] = total
+    var tgt = own(new_tensor(flat, 1, ST_INT64, target.device))
+    var srcoff = own(new_tensor(flat, 1, ST_INT64, target.device))
+    var flag = own(
+        new_tensor(IndexList[MAX_RANK](1), 1, ST_INT32, target.device)
+    )
+    fill_value(flag.t, 0.0)
+    var tc = KernelCall("data_movement", "ScatterTargets")
+    tc.int(tgt.t.ptr)
+    tc.int(srcoff.t.ptr)
+    tc.int(index.ptr)
+    tc.tuple(params)
+    tc.int(flag.t.ptr)
+    tc.int(ctx_ptr(ctx))
+    tc.run()
+    var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
+    copy_to_host(ctx, flag.t.ptr, host_flag.t.ptr, 4)
+    var bad_index = (
+        Pointer[Int32, MutUntrackedOrigin](
+            unsafe_from_address=host_flag.t.ptr
+        )[]
+        != 0
+    )
+    _ = host_flag^
+    _ = flag^
+    if bad_index:
+        raise Error(
+            "index out of range in aten::",
+            what,
+            (
+                ": every index must be in [0, self.size(dim)) with"
+                " self.size(dim) = "
+            ),
+            dim_size,
+        )
+    var r = call_op(
+        "aten::sort",
+        "stable",
+        [
+            tensor_arg(tgt.t),
+            Value(TAG_BOOL, 0, 1, 0),
+            Value(TAG_INT, 0, 0, 0),
+            Value(TAG_BOOL, 0, 0, 0),
+        ],
+        2,
+    )
+    var sorted = own(r.take_tensor(0))
+    var perm = own(r.take_tensor(1))
+    var sc = KernelCall("data_movement", "SortedSegmentAdd")
+    sc.arg_dtype(0, target.dtype)
+    sc.int(target.ptr)
+    sc.int(sorted.t.ptr)
+    sc.int(perm.t.ptr)
+    sc.int(srcoff.t.ptr)
+    sc.int(src.ptr)
+    sc.tuple([total, 0])
+    sc.f64(0.0)
+    sc.int(dtype_code(target.dtype))
+    sc.int(ctx_ptr(ctx))
+    sc.run()
+    _ = perm^
+    _ = sorted^
+    _ = srcoff^
+    _ = tgt^
+    _ = ctx
 
 
 def _dim_or1(t: T, d: Int) -> Int:
@@ -1790,9 +1897,10 @@ def _scatter_into(
     value: Float64,
     is_value: Bool,
     accumulate: Bool,
+    int_value: Optional[Int] = None,
 ) raises:
     """Scatter into `target` (shaped like self, any strides), which already
-    holds self's values."""
+    holds self's values. `int_value`: an integer dtype's scalar, exact."""
     var idx64 = own_if_new(cast_to(index, ST_INT64), index)
     var idx_c = own_if_new(contiguous(idx64.t), idx64.t)
     var src_ptr = target.ptr
@@ -1820,6 +1928,7 @@ def _scatter_into(
         value,
         accumulate,
         String("scatter_add") if accumulate else String("scatter"),
+        int_value=int_value,
     )
     _ = idx_c^
     _ = idx64^
@@ -1832,13 +1941,35 @@ def _scatter_common(
     src: Optional[T],
     value: Float64,
     is_value: Bool,
+    int_value: Optional[Int] = None,
 ) raises -> Owned:
     var dim = _scatter_validate(a, dim_in, index, src, False)
     var out = own(_materialize_contiguous(a))
     _scatter_into(
-        out.t, dim, _dim_or1(a, dim), index, src, value, is_value, False
+        out.t,
+        dim,
+        _dim_or1(a, dim),
+        index,
+        src,
+        value,
+        is_value,
+        False,
+        int_value,
     )
     return out^
+
+
+def scatter_scalar(a: T, v: Value) raises -> Tuple[Float64, Optional[Int]]:
+    """A Scalar as `a`'s dtype will hold it, range-checked like
+    `Scalar::to<scalar_t>()`: the double for the kernel's float path, and
+    the exact integer for an integral dtype (a double rounds int64 values
+    beyond 2**53)."""
+    if is_int_stype(a.stype):
+        var i = scalar_to_int(v, a.stype)
+        return (Float64(i), Optional[Int](i))
+    if a.dtype == DType.bool:
+        return (1.0 if v_f64(v) != 0.0 else 0.0, Optional[Int](None))
+    return (scalar_to_float(v, a.stype), Optional[Int](None))
 
 
 # aten::scatter.src(Tensor self, int dim, Tensor index, Tensor src) -> Tensor
@@ -1864,6 +1995,10 @@ def op_scatter_src_(
     var dim = _scatter_validate(
         a, v_int(args[unsafe_offset=1]), index, src.copy(), False
     )
+    # scatter_meta_impl's overlap checks: the output is self.
+    assert_no_internal_overlap(a)
+    assert_no_overlap(a, index)
+    assert_no_overlap(a, src)
     _scatter_into(a, dim, _dim_or1(a, dim), index, src^, 0.0, False, False)
     ret_ref(rets, 0, a)
 
@@ -1892,10 +2027,8 @@ def op_scatter_value(
     var a = v_tensor(args[unsafe_offset=0])
     var dim = v_int(args[unsafe_offset=1])
     var index = v_tensor(args[unsafe_offset=2])
-    var value = v_f64(args[unsafe_offset=3])
-    if a.dtype == DType.bool:
-        value = 1.0 if value != 0.0 else 0.0
-    var out = _scatter_common(a, dim, index, None, value, True)
+    var value = scatter_scalar(a, args[unsafe_offset=3])
+    var out = _scatter_common(a, dim, index, None, value[0], True, value[1])
     ret_owned(rets, 0, out)
 
 
