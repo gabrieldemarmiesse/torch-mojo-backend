@@ -28,6 +28,7 @@ from tmb.backend.abi import (
     new_like,
     new_scalar,
     new_tensor,
+    none_arg,
     own,
     release,
     ret_bool,
@@ -1544,9 +1545,32 @@ def op_assert_async_msg(
     )
 
 
+# aten::_functional_assert_async.msg(Tensor self, str assert_msg,
+#   Tensor dep_token) -> Tensor
+def op_functional_assert_async_msg(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """ATen's CPU kernel (the only one upstream has): `_assert_async.msg`,
+    then a fresh copy of the dependency token."""
+    var msg = v_string(args[unsafe_offset=1])
+    _assert_nonzero(
+        v_tensor(args[unsafe_offset=0]),
+        msg if msg.byte_length() > 0 else String("Assertion is failed"),
+    )
+    var token = call_op(
+        "aten::clone",
+        "",
+        [tensor_arg(v_tensor(args[unsafe_offset=2])), none_arg()],
+        1,
+    )
+    var out = own(token.take_tensor(0))
+    ret_owned(rets, 0, out)
+
+
 def register_compare(site: Site) raises:
     impl[op_assert_async, "_assert_async"](site)
     impl[op_assert_async_msg, "_assert_async.msg"](site)
+    impl[op_functional_assert_async_msg, "_functional_assert_async.msg"](site)
     impl[op_eq_tensor, "eq.Tensor"](site)
     impl[op_eq_tensor_out, "eq.Tensor_out"](site)
     impl[op_eq_scalar, "eq.Scalar"](site)

@@ -2582,6 +2582,152 @@ def test_set_source_tensor_keeps_its_own_dtype(mojo_gpu):
     assert destination.cpu().tolist() == [0, 1065353216, 1073741824, 1077936128]
 
 
+def test_set_without_source_empties_the_tensor(mojo_gpu):
+    t = torch.arange(4, dtype=torch.float16).to(mojo_gpu)
+    old = t.untyped_storage().data_ptr()
+    assert torch.ops.aten.set_.default(t) is t
+    assert (t.shape, t.stride(), t.storage_offset(), t.dtype) == (
+        (0,),
+        (1,),
+        0,
+        torch.float16,
+    )
+    assert t.untyped_storage().nbytes() == 0
+    assert t.untyped_storage().data_ptr() != old or old == 0
+
+
+def test_is_set_to_matches_cpu(mojo_gpu):
+    def probe(base):
+        z = base.view(4)
+        e = base.new_empty(0)
+        return [
+            z.is_set_to(z),
+            z.is_set_to(z[1:]),
+            z[1:].is_set_to(z[1:]),
+            z.is_set_to(z.view(2, 2)),
+            z.view(2, 2).t().is_set_to(z.view(2, 2).t()),
+            z.is_set_to(z.clone()),
+            e.is_set_to(e),
+            e.is_set_to(e.view(0)),
+            e.is_set_to(base.new_empty(0)),
+        ]
+
+    assert probe(torch.empty(2, 2).to(mojo_gpu)) == probe(torch.empty(2, 2))
+
+
+# ---------------------------------------------------------------------------
+# resize_ / resize_as_
+# ---------------------------------------------------------------------------
+
+
+def _resized(t, size, memory_format=None):
+    t.resize_(size, memory_format=memory_format)
+    return t.shape, t.stride(), t.storage_offset(), t.untyped_storage().nbytes()
+
+
+@pytest.mark.parametrize(
+    ("make", "size", "memory_format"),
+    [
+        (lambda d: torch.zeros(4, device=d), (2, 3), None),
+        (lambda d: torch.zeros(4, device=d), (2,), None),
+        (lambda d: torch.zeros(4, device=d), (0,), None),
+        (lambda d: torch.zeros(0, device=d), (3, 5), None),
+        (lambda d: torch.zeros((), device=d), (), None),
+        (lambda d: torch.zeros(5, device=d)[2:], (6,), None),
+        (lambda d: torch.zeros(2, 3, 4, device=d), (2, 3, 4, 5), torch.channels_last),
+        (
+            lambda d: torch.zeros(2, 3, 4, 5, 6, device=d),
+            (2, 3, 4, 5, 6),
+            torch.channels_last_3d,
+        ),
+        (lambda d: torch.zeros(2, 3, device=d).t(), (3, 2), None),
+        (lambda d: torch.zeros(2, 3, device=d).t(), (3, 2), torch.contiguous_format),
+        (lambda d: torch.zeros(2, 3, device=d), (0, -1), None),
+    ],
+)
+def test_resize_matches_cpu(mojo_gpu, make, size, memory_format):
+    assert _resized(make(mojo_gpu), size, memory_format=memory_format) == _resized(
+        make("cpu"), size, memory_format=memory_format
+    )
+
+
+def test_resize_keeps_the_bytes(mojo_gpu):
+    x = torch.arange(6, dtype=torch.float32)
+    t = x.to(mojo_gpu)
+    t.resize_(4, 5)
+    assert t.cpu().flatten()[:6].tolist() == x.tolist()
+    view = torch.arange(5.0).to(mojo_gpu)[2:]
+    view.resize_(6)
+    assert view.cpu()[:3].tolist() == [2.0, 3.0, 4.0]
+    t.resize_(2)
+    assert t.cpu().tolist() == [0.0, 1.0]
+
+
+@pytest.mark.parametrize(
+    ("size", "memory_format", "message"),
+    [
+        (
+            (2, 3),
+            torch.channels_last,
+            "required rank 4 tensor to use channels_last format",
+        ),
+        ((2, 3), torch.preserve_format, "Unsupported memory formatPreserve"),
+        ((-1,), None, "numel: integer multiplication overflow"),
+        ((2**40, 2**40), None, "numel: integer multiplication overflow"),
+        ((2**62,), None, "Storage size calculation overflowed"),
+    ],
+)
+def test_resize_errors_match_cpu(mojo_gpu, size, memory_format, message):
+    for device in ("cpu", mojo_gpu):
+        with pytest.raises(RuntimeError, match=message):
+            torch.empty(3, device=device).resize_(*size, memory_format=memory_format)
+
+
+def test_resize_as_(mojo_gpu):
+    t = torch.empty(3, device=mojo_gpu)
+    t.resize_as_(torch.empty(2, 3, 4, 5).to(memory_format=torch.channels_last))
+    assert (t.shape, t.stride()) == ((2, 3, 4, 5), (60, 20, 5, 1))
+    t.resize_as_(
+        torch.empty(2, 3, 4, 5).to(memory_format=torch.channels_last),
+        memory_format=torch.preserve_format,
+    )
+    assert t.stride() == (60, 1, 15, 3)
+
+
+def test_copy_from_and_resize(mojo_gpu):
+    src = torch.arange(6.0).view(2, 3)
+    dst = torch.empty(0, device=mojo_gpu)
+    out = torch.ops.aten._copy_from_and_resize(src, dst)
+    assert out is dst
+    torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
+    dst16 = torch.empty(7, dtype=torch.float16, device=mojo_gpu)
+    torch.ops.aten._copy_from_and_resize(src.t(), dst16)
+    torch.testing.assert_close(dst16.cpu(), src.t().half(), rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# from_file
+# ---------------------------------------------------------------------------
+
+
+def test_from_file(mojo_gpu, tmp_path):
+    path = tmp_path / "data.bin"
+    path.write_bytes(torch.arange(10, dtype=torch.float32).numpy().tobytes())
+    for size, dtype, shared in [
+        (10, torch.float32, None),
+        (4, torch.int32, False),
+        (0, torch.float16, None),
+    ]:
+        got = torch.from_file(
+            str(path), shared=shared, size=size, dtype=dtype, device=mojo_gpu
+        )
+        want = torch.from_file(str(path), shared=shared, size=size, dtype=dtype)
+        assert got.device == torch.device(mojo_gpu)
+        assert torch.equal(got.cpu(), want)
+    with pytest.raises(NotImplementedError, match="shared=True"):
+        torch.from_file(str(path), shared=True, size=2, device=mojo_gpu)
+
+
 # ---------------------------------------------------------------------------
 # empty_permuted
 # ---------------------------------------------------------------------------

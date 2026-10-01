@@ -880,3 +880,28 @@ def test_assert_async(mojo_gpu):
         aten._assert_async(torch.ones(0, device=mojo_gpu))
     with pytest.raises(RuntimeError, match="more than one value is ambiguous"):
         aten._assert_async(torch.ones(2, device=mojo_gpu))
+
+
+def test_functional_assert_async_and_dep_token(mojo_gpu):
+    """ATen has CPU kernels only (CUDA raises NotImplementedError); the mojo
+    device runs them the same way."""
+    aten = torch.ops.aten
+    token = aten._make_dep_token(device=mojo_gpu)
+    reference = aten._make_dep_token()
+    assert (token.shape, token.dtype, token.device) == (
+        reference.shape,
+        reference.dtype,
+        torch.device(mojo_gpu),
+    )
+    assert aten._make_dep_token(dtype=torch.int64, device=mojo_gpu).dtype == torch.int64
+    out = aten._functional_assert_async.msg(
+        torch.tensor(True, device=mojo_gpu), "never", token
+    )
+    assert out.device == token.device and out.shape == token.shape
+    assert out.data_ptr() != token.data_ptr()
+    with pytest.raises(RuntimeError, match="boom"):
+        aten._functional_assert_async.msg(
+            torch.tensor(0, device=mojo_gpu), "boom", token
+        )
+    with pytest.raises(RuntimeError, match="Assertion is failed"):
+        aten._functional_assert_async.msg(torch.tensor(0.0, device=mojo_gpu), "", token)

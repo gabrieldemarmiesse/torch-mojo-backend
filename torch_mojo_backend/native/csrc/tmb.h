@@ -189,6 +189,7 @@ int32_t tmb_tensor_is_privateuse1(TmbTensor t);
 void* tmb_tensor_storage_data_ptr(TmbTensor t);
 void* tmb_tensor_storage_ctx(TmbTensor t);  // the allocation handle Mojo returned from alloc (NULL if not ours)
 int64_t tmb_tensor_storage_nbytes(TmbTensor t);
+void* tmb_tensor_storage_impl(TmbTensor t);  // the StorageImpl: two tensors share a storage iff these match
 int32_t tmb_tensor_is_contiguous(TmbTensor t);
 int32_t tmb_tensor_is_neg(TmbTensor t);
 void* tmb_tensor_impl(TmbTensor t);  // the TensorImpl: two arguments are the same tensor iff these match
