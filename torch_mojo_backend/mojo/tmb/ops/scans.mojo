@@ -127,7 +127,7 @@ def _nn_cumsum_ok(src: T, dim: Int) raises -> Bool:
     """The nn family's block-prefix-sum regimes (`_cumsum_spec_into_go`) of a
     contiguous float32/int32/int64 operand: the trailing dim everywhere
     (MAX's CPU device included), and on a GPU also dim 0 of a rank-2
-    operand, a GPU 1-D float32 scan excepted. bf16/f16 never take it: its float32 running sum rounds once,
+    operand. bf16/f16 never take it: its float32 running sum rounds once,
     where CUDA's `scan_dim<scalar_t>` rounds the half sum after every
     addition (`ones(4096)` saturates at 2048 in half) -- the scan family
     reproduces that."""
@@ -137,10 +137,6 @@ def _nn_cumsum_ok(src: T, dim: Int) raises -> Bool:
     if not (dt == DType.float32 or dt == DType.int32 or dt == DType.int64):
         return False
     var gpu = dev(src.device)[].api != "cpu"
-    if gpu and dt == DType.float32 and src.numel == src.dim(dim):
-        # CUDA's 1-D route is cub, which seeds with the first element
-        # (-0.0 stays -0.0) and adds in tile order: the scan family's.
-        return False
     return dim == src.rank - 1 or (gpu and src.rank == 2 and dim == 0)
 
 
