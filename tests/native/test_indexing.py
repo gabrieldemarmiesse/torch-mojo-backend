@@ -1143,3 +1143,34 @@ def test_fill_tensor_overflow(mojo_device):
     # A same-device value is a copy_: it converts without a check.
     x.fill_(torch.tensor(300, device=mojo_device))
     _check(x, torch.full((3,), 300).to(torch.int8))
+
+
+@pytest.mark.parametrize(
+    ("dtype", "n"),
+    [(torch.bfloat16, 1024), (torch.float16, 4096), (torch.float16, 3000)],
+)
+@pytest.mark.parametrize("include_self", [True, False])
+def test_mean_counts_do_not_saturate_against_the_sum(
+    mojo_device, dtype, n, include_self
+):
+    """CUDA-faithful references (checked against stock CUDA 2.11).
+    scatter_reduce mean takes the deterministic index_put route for the sum
+    AND the count (`count.scatter_add_`): both accumulate in float and are
+    stored once, so n ones average to 1. index_reduce adds both with dtype
+    atomics: sum and count saturate together (256 for bfloat16, 2048 for
+    float16), also 1."""
+    x = torch.zeros(1, dtype=dtype)
+    idx = torch.zeros(n, dtype=torch.long)
+    ones = torch.ones(n, dtype=dtype)
+    d = x.to(mojo_device)
+    got = d.scatter_reduce(
+        0, idx.to(mojo_device), ones.to(mojo_device), "mean", include_self=include_self
+    )
+    _check(got, torch.ones(1, dtype=dtype))
+    got = d.index_reduce(
+        0, idx.to(mojo_device), ones.to(mojo_device), "mean", include_self=include_self
+    )
+    _check(got, torch.ones(1, dtype=dtype))
+    # The sorted sum itself is float-accumulated (exact here).
+    got = d.scatter_reduce(0, idx.to(mojo_device), ones.to(mojo_device), "sum")
+    _check(got, torch.full((1,), float(n)).to(dtype))

@@ -1344,11 +1344,20 @@ def _reduce_launch(
     what: String,
     ordered: Bool = False,
     int_value: Optional[Int] = None,
+    sorted_sums: Bool = False,
 ) raises:
     """Reduce src (or the scalar `value`) into `target`, which holds self's
     values, over the index space `dims` (int64 `idx` read through
     `idx_strides`). The bad-index report of `_scatter_launch` applies.
-    `ordered` reduces each slot in index order (`_scatter_launch`)."""
+    `ordered` reduces each slot in index order (`_scatter_launch`).
+
+    `sorted_sums` (scatter_reduce / scatter): a floating sum, and a mean's
+    sum and count, take the sorted route, which accumulates in the opmath
+    type and stores the dtype once -- CUDA's deterministic
+    `_scatter_via_index_put` for both (`count.scatter_add_` included).
+    Without it (index_reduce) both are atomic adds in the dtype, as CUDA's
+    index_reduce and `counts.index_add_`: a half sum and its count saturate
+    together (1024 bfloat16 ones sum and count to 256, mean 1)."""
     var src_ptr = target.ptr
     var src_dtype = target.dtype
     var src_strides = List[Int]()
@@ -1379,7 +1388,8 @@ def _reduce_launch(
             rop,
             not add,
         )
-    if add and src and target.dtype.is_floating_point() and not ordered:
+    var floating = target.dtype.is_floating_point()
+    if add and src and floating and sorted_sums and not ordered:
         # A floating sum takes the sorted, ordered route CUDA takes under
         # deterministic algorithms (`_scatter_via_index_put`), always: the
         # result does not depend on the atomics' interleaving.
@@ -1419,27 +1429,49 @@ def _reduce_launch(
         return
     var counts = own(new_like(target))
     fill_value(counts.t, 1.0 if include_self else 0.0)
-    _scatter_launch(
-        counts.t,
-        _strides_of(counts.t),
-        idx,
-        idx_strides,
-        counts.t.ptr,
-        counts.t.dtype,
-        src_strides,
-        dims,
-        dim,
-        dim_size,
-        True,
-        1.0,
-        True,
-        what,
-    )
+    if floating and sorted_sums:
+        var one = own(
+            new_tensor(
+                IndexList[MAX_RANK](1), 1, counts.t.stype, counts.t.device
+            )
+        )
+        fill_value(one.t, 1.0)
+        var zero_strides = List[Int]()
+        for _ in range(len(dims)):
+            zero_strides.append(0)
+        scatter_add_sorted(
+            counts.t,
+            idx,
+            idx_strides,
+            one.t,
+            zero_strides,
+            dims,
+            dim,
+            dim_size,
+            what,
+        )
+        _ = one^
+    else:
+        _scatter_launch(
+            counts.t,
+            _strides_of(counts.t),
+            idx,
+            idx_strides,
+            counts.t.ptr,
+            counts.t.dtype,
+            src_strides,
+            dims,
+            dim,
+            dim_size,
+            True,
+            1.0,
+            True,
+            what,
+        )
     # count.masked_fill_(count == 0, 1): a count is never negative.
     var safe = own(
         _call1("aten::clamp_min", "", [tensor_arg(counts.t), _scalar_int(1)])
     )
-    var floating = target.dtype.is_floating_point()
     var r = call_op(
         String("aten::div") if floating else String("aten::floor_divide"),
         String("Tensor") if floating else String(""),
@@ -1483,6 +1515,7 @@ def _scatter_reduce_into(
         include_self,
         what,
         int_value=ivalue,
+        sorted_sums=True,
     )
     _ = idx_c^
     _ = idx64^
