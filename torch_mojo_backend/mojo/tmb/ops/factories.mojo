@@ -40,9 +40,12 @@ from tmb.backend.abi import (
     v_scalar_is_bool,
     v_scalar_is_integral,
     v_tensor,
+    TAG_BOOL,
+    TAG_INT,
+    TAG_NONE,
     TAG_TENSOR,
 )
-from tmb.backend.device import copy_from_host, ctx_for, ctx_ptr, dev
+from tmb.backend.device import copy_d2d, copy_from_host, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
@@ -695,8 +698,190 @@ def op_triu_indices(
     _tri_indices(args, rets, True)
 
 
+# ---------------------------------------------------------------------------
+# range.out -- ATen's `range_cuda_out` (native/cuda/RangeFactories.cu): the
+# end is inclusive and the length is `int64((end - start) / step + 1)`
+# computed in the dtype's GPU accumulator (float for float32 and the half
+# types, double for float64, int64 for integers), then the Arange kernel.
+# ---------------------------------------------------------------------------
+
+
+def _range_size(
+    start_v: Value, end_v: Value, step_v: Value, dt: DType
+) raises -> Int:
+    # arange_check_bounds (RangeUtils.h), checked in double.
+    var dstart = v_f64(start_v)
+    var dend = v_f64(end_v)
+    var dstep = v_f64(step_v)
+    if dstep == 0.0:
+        raise Error("step must be nonzero")
+    if not (_is_finite(dstart) and _is_finite(dend)):
+        raise Error("unsupported range: ", dstart, " -> ", dend)
+    if not (
+        (dstep > 0.0 and dend >= dstart) or (dstep < 0.0 and dend <= dstart)
+    ):
+        raise Error("upper bound and lower bound inconsistent with step sign")
+    if dt.is_integral():
+        # Scalar::to<int64_t>() truncates a floating scalar.
+        var istart = v_int(start_v) if v_scalar_is_integral(start_v) else Int(
+            dstart
+        )
+        var iend = v_int(end_v) if v_scalar_is_integral(end_v) else Int(dend)
+        var istep = v_int(step_v) if v_scalar_is_integral(step_v) else Int(
+            dstep
+        )
+        if istep == 0:
+            raise Error("step must be nonzero")
+        var q = (iend - istart) // istep
+        if q < 0 and q * istep != iend - istart:
+            q += 1  # C++ division truncates toward zero
+        return q + 1
+    if dt == DType.float64:
+        return Int((dend - dstart) / dstep + 1.0)
+    var fstart = Float32(dstart)
+    var fend = Float32(dend)
+    var fstep = Float32(dstep)
+    return Int((fend - fstart) / fstep + Float32(1.0))
+
+
+# aten::range.out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out)
+#   -> Tensor(a!)
+def op_range_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var start_v = args[unsafe_offset=0].copy()
+    var end_v = args[unsafe_offset=1].copy()
+    var step_v = args[unsafe_offset=2].copy()
+    var out_t = v_tensor(args[unsafe_offset=3])
+    if (
+        not _is_arange_kernel_dtype(out_t.dtype)
+        or out_t.dtype == DType.bfloat16
+    ):
+        # range_cuda_out dispatches ALL_TYPES and Half: no bool, no bfloat16.
+        raise Error(
+            '"range_cuda" not implemented for \'',
+            _scalar_type_name(out_t.dtype),
+            "'",
+        )
+    var size = _range_size(start_v, end_v, step_v, out_t.dtype)
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = size
+    if out_t.numel != size:
+        resize_out(out_t, shape, 1)
+    if size == 0:
+        ret_ref(rets, 0, out_t)
+        return
+    if _arange_needs_host_fallback(
+        start_v, end_v, step_v, out_t.dtype, out_t.device
+    ):
+        var cpu = own(cpu_empty(out_t.shape, out_t.rank, out_t.stype))
+        var call_args = List[Value](capacity=4)
+        call_args.append(start_v.copy())
+        call_args.append(end_v.copy())
+        call_args.append(step_v.copy())
+        call_args.append(Value(TAG_TENSOR, 0, Int64(cpu.t.h), 0))
+        _ = call_op("aten::range", "out", call_args^, 1)
+        _copy_cpu_into(out_t, cpu.t)
+        _ = cpu^
+        ret_ref(rets, 0, out_t)
+        return
+    var start = v_f64(start_v)
+    var step = v_f64(step_v)
+    if out_t.contig:
+        _arange_fill(out_t, start, step)
+    else:
+        var tmp = own(new_like(out_t))
+        _arange_fill(tmp.t, start, step)
+        copy_strided_into(out_t, tmp.t)
+        _ = tmp^  # alive past the launch
+    ret_ref(rets, 0, out_t)
+
+
+# ---------------------------------------------------------------------------
+# randperm.generator_out -- ATen's `randperm_out_cuda` (native/cuda/
+# Randperm.cu) sorts `arange(n)` by random keys drawn from the generator.
+# Here the keys are always full 64-bit `random_` draws, sorted stably: two
+# keys collide with probability about n^2 / 2^65, so no island reshuffle is
+# needed (CUDA narrows the keys to as few bits as keep the collision odds
+# under 10% and reshuffles the islands). The permutation is therefore
+# uniform, but not CUDA's for the same seed.
+# ---------------------------------------------------------------------------
+
+
+# aten::randperm.generator_out(SymInt n, *, Generator? generator,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_randperm_generator_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var n = v_int(args[unsafe_offset=0])
+    var out_t = v_tensor(args[unsafe_offset=2])
+    if n < 0:
+        raise Error("n must be non-negative, got", n)
+    # check_supported_max_int_with_precision (TensorFactories.h)
+    if out_t.dtype == DType.float16 and n > 2049:
+        raise Error("n cannot be greater than 2049 for Half type.")
+    if out_t.dtype == DType.float32 and n > (1 << 24) + 1:
+        raise Error("n cannot be greater than 2^24+1 for Float type.")
+    if out_t.dtype == DType.float64 and n > (1 << 53) + 1:
+        raise Error("n cannot be greater than 2^53+1 for Double type.")
+    if out_t.dtype == DType.bfloat16 or out_t.dtype == DType.bool:
+        raise Error(
+            '"randperm_out_cuda" not implemented for \'',
+            _scalar_type_name(out_t.dtype),
+            "'",
+        )
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = n
+    resize_out(out_t, shape, 1)
+    if n == 0:
+        ret_ref(rets, 0, out_t)
+        return
+    var keys = own(new_tensor(shape, 1, ST_INT64, out_t.device))
+    _ = call_op(
+        "aten::random_",
+        "from",
+        [
+            Value(TAG_TENSOR, 0, Int64(keys.t.h), 0),
+            Value(TAG_INT, 0, Int64.MIN, 0),
+            Value(TAG_NONE, 0, 0, 0),
+            args[unsafe_offset=1].copy(),
+        ],
+        1,
+    )
+    var sorted = call_op(
+        "aten::sort",
+        "stable",
+        [
+            Value(TAG_TENSOR, 0, Int64(keys.t.h), 0),
+            Value(TAG_BOOL, 0, 1, 0),
+            Value(TAG_INT, 0, 0, 0),
+            Value(TAG_BOOL, 0, 0, 0),
+        ],
+        2,
+    )
+    var perm = own(sorted.take_tensor(1))
+    _ = keys^
+    if out_t.dtype == DType.int64 and out_t.contig:
+        var ctx = ctx_for(out_t.device)
+        copy_d2d(ctx, out_t.ptr, perm.t.ptr, n * 8)
+        _ = ctx
+    else:
+        _ = call_op(
+            "aten::copy_",
+            "",
+            [
+                Value(TAG_TENSOR, 0, Int64(out_t.h), 0),
+                Value(TAG_TENSOR, 0, Int64(perm.t.h), 0),
+                Value(TAG_BOOL, 0, 0, 0),
+            ],
+            1,
+        )
+    _ = perm^
+    ret_ref(rets, 0, out_t)
+
+
 def register_factories(site: Site) raises:
     impl[op_arange_start_out, "arange.start_out"](site)
+    impl[op_range_out, "range.out"](site)
+    impl[op_randperm_generator_out, "randperm.generator_out"](site)
     impl[op_eye_out, "eye.out"](site)
     impl[op_eye_m_out, "eye.m_out"](site)
     impl[op_linspace_out, "linspace.out"](site)

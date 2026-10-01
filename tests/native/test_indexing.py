@@ -517,3 +517,359 @@ def test_repeat_interleave_errors(mojo_device):
         torch.repeat_interleave(
             torch.tensor([3, -1], device=mojo_device), output_size=2
         )
+
+
+# ---------------------------------------------------------------------------
+# scatter(reduce=) / scatter_reduce / index_reduce
+# ---------------------------------------------------------------------------
+
+REDUCE_DTYPES = [
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.bool,
+]
+
+
+def _small(shape: tuple[int, ...], dtype: torch.dtype, seed: int = 0) -> torch.Tensor:
+    """Small integers (exact in every dtype, products included): duplicate
+    indices then reduce to the same value in any order."""
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randint(-2, 3, shape, generator=g)
+    if dtype == torch.bool:
+        return x > 0
+    return x.to(dtype)
+
+
+@pytest.mark.parametrize("dtype", REDUCE_DTYPES)
+@pytest.mark.parametrize("reduce", ["sum", "prod", "mean", "amax", "amin"])
+@pytest.mark.parametrize("include_self", [True, False])
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_scatter_reduce(mojo_device, dtype, reduce, include_self, dim):
+    if dtype == torch.bool and reduce == "mean":
+        pytest.skip("mean of bool is declined (CUDA has no bool scatter_reduce)")
+    x = _small((5, 7, 3), dtype, 1)
+    src = _small((5, 7, 3), dtype, 2)
+    g = torch.Generator().manual_seed(3)
+    # Many collisions: every target is hit several times.
+    index = torch.randint(0, x.shape[dim], (4, 6, 3), generator=g)
+    expected = x.scatter_reduce(dim, index, src, reduce, include_self=include_self)
+    with ran("aten::scatter_reduce.two"):
+        got = x.to(mojo_device).scatter_reduce(
+            dim,
+            index.to(mojo_device),
+            src.to(mojo_device),
+            reduce,
+            include_self=include_self,
+        )
+    _check(got, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("reduce", ["amax", "amin", "prod", "sum"])
+def test_scatter_reduce_nan_inf_and_float_values(mojo_device, dtype, reduce):
+    x = torch.tensor([1.5, -0.0, float("inf"), 2.0, -3.0, 0.0], dtype=dtype)
+    src = torch.tensor(
+        [float("nan"), 4.0, -float("inf"), 0.5, 2.0, -2.0, 1.0, 3.0], dtype=dtype
+    )
+    index = torch.tensor([0, 0, 2, 3, 3, 4, 5, 5])
+    for include_self in (True, False):
+        expected = x.scatter_reduce(0, index, src, reduce, include_self=include_self)
+        got = x.to(mojo_device).scatter_reduce(
+            0,
+            index.to(mojo_device),
+            src.to(mojo_device),
+            reduce,
+            include_self=include_self,
+        )
+        torch.testing.assert_close(got.cpu(), expected, equal_nan=True)
+
+
+def test_scatter_reduce_out_in_place_and_edges(mojo_device):
+    x = _small((4, 5), torch.float32)
+    src = _small((4, 5), torch.float32, 1)
+    index = torch.tensor([[0, 1, 2, 3, 0], [3, 2, 1, 0, 0]])
+    expected = x.scatter_reduce(0, index, src, "amax", include_self=False)
+    d = x.to(mojo_device)
+    # A non-contiguous out of the right shape is written where it lives.
+    base = torch.zeros(5, 4, device=mojo_device)
+    out = base.t()
+    with ran("aten::scatter_reduce.two_out"):
+        torch.scatter_reduce(
+            d,
+            0,
+            index.to(mojo_device),
+            src.to(mojo_device),
+            "amax",
+            include_self=False,
+            out=out,
+        )
+    _check(out, expected)
+    # A wrongly sized out is resized.
+    out = torch.empty(0, device=mojo_device)
+    torch.scatter_reduce(
+        d,
+        0,
+        index.to(mojo_device),
+        src.to(mojo_device),
+        "amax",
+        include_self=False,
+        out=out,
+    )
+    _check(out, expected)
+    # In place.
+    y = x.to(mojo_device)
+    with ran("aten::scatter_reduce_.two"):
+        y.scatter_reduce_(
+            0, index.to(mojo_device), src.to(mojo_device), "amax", include_self=False
+        )
+    _check(y, expected)
+    # int32 index, empty index, 0-d tensors.
+    i32 = index.to(torch.int32)
+    _check(
+        d.scatter_reduce(0, i32.to(mojo_device), src.to(mojo_device), "sum"),
+        x.scatter_reduce(0, i32, src, "sum"),
+    )
+    empty = torch.empty(0, 5, dtype=torch.int64)
+    _check(
+        d.scatter_reduce(0, empty.to(mojo_device), src.to(mojo_device), "prod"),
+        x.scatter_reduce(0, empty, src, "prod"),
+    )
+    s = torch.tensor(3.0)
+    zero = torch.tensor(0)
+    _check(
+        s.to(mojo_device).scatter_reduce(
+            0, zero.to(mojo_device), torch.tensor(5.0).to(mojo_device), "amax"
+        ),
+        s.scatter_reduce(0, zero, torch.tensor(5.0), "amax"),
+    )
+
+
+def test_scatter_reduce_errors(mojo_device):
+    d = torch.zeros(3, 4, device=mojo_device)
+    src = torch.ones(3, 4, device=mojo_device)
+    index = torch.zeros(3, 4, dtype=torch.int64, device=mojo_device)
+    with pytest.raises(RuntimeError, match="reduce argument must be either sum"):
+        d.scatter_reduce(0, index, src, "max_")
+    with pytest.raises(
+        RuntimeError, match="reduce argument must be either add or multiply"
+    ):
+        d.scatter(0, index, src, reduce="sum")
+    bad = index.clone()
+    bad[1, 2] = 3
+    with pytest.raises(RuntimeError, match="index out of range"):
+        d.scatter_reduce(0, bad, src, "prod")
+    with pytest.raises(
+        RuntimeError, match="Expected self.dtype to be equal to src.dtype"
+    ):
+        d.scatter_reduce(0, index, src.half(), "sum")
+    with pytest.raises(RuntimeError, match="int32/int64"):
+        d.scatter_reduce(0, index.float(), src, "sum")
+
+
+@pytest.mark.parametrize("dtype", REDUCE_DTYPES)
+@pytest.mark.parametrize("reduce", ["add", "multiply"])
+def test_scatter_legacy_reduce(mojo_device, dtype, reduce):
+    x = _small((5, 6), dtype)
+    src = _small((5, 6), dtype, 1)
+    index = torch.randint(0, 5, (4, 6), generator=torch.Generator().manual_seed(1))
+    d = x.to(mojo_device)
+    di = index.to(mojo_device)
+    with ran("aten::scatter.reduce"):
+        got = d.scatter(0, di, src.to(mojo_device), reduce=reduce)
+    _check(got, x.scatter(0, index, src, reduce=reduce))
+    value = True if dtype == torch.bool else 2
+    with ran("aten::scatter.value_reduce"):
+        got = d.scatter(1, di[:, :3], value, reduce=reduce)
+    _check(got, x.scatter(1, index[:, :3], value, reduce=reduce))
+    y = x.to(mojo_device)
+    y.scatter_(0, di, src.to(mojo_device), reduce=reduce)
+    _check(y, x.scatter(0, index, src, reduce=reduce))
+    y = x.to(mojo_device)
+    y.scatter_(0, di, value, reduce=reduce)
+    _check(y, x.scatter(0, index, value, reduce=reduce))
+    out = torch.empty(0, dtype=dtype, device=mojo_device)
+    torch.scatter(d, 0, di, src.to(mojo_device), reduce=reduce, out=out)
+    _check(out, x.scatter(0, index, src, reduce=reduce))
+    out = torch.empty(0, dtype=dtype, device=mojo_device)
+    torch.scatter(d, 0, di, value, reduce=reduce, out=out)
+    _check(out, x.scatter(0, index, value, reduce=reduce))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_scatter_value_in_place_and_out(mojo_device, dtype):
+    x = _make((4, 5), dtype)
+    index = torch.tensor([[0, 1, 2, 3, 0], [3, 2, 1, 0, 1]])
+    value = False if dtype == torch.bool else -3
+    y = x.to(mojo_device)
+    with ran("aten::scatter_.value"):
+        y.scatter_(0, index.to(mojo_device), value)
+    _check(y, x.scatter(0, index, value))
+    out = torch.empty(2, 2, dtype=dtype, device=mojo_device)
+    with ran("aten::scatter.value_out"):
+        torch.scatter(x.to(mojo_device), 0, index.to(mojo_device), value, out=out)
+    _check(out, x.scatter(0, index, value))
+    with pytest.raises(RuntimeError, match="value cannot be converted"):
+        torch.zeros(3, dtype=torch.int8, device=mojo_device).scatter_(
+            0, torch.tensor([0], device=mojo_device), 300
+        )
+
+
+def test_one_hot(mojo_device):
+    labels = torch.tensor([[0, 3], [2, 1], [3, 3]])
+    with ran("aten::scatter_.value", "aten::scatter.value_out", "aten::scatter.value"):
+        got = torch.nn.functional.one_hot(labels.to(mojo_device), 5)
+    _check(got, torch.nn.functional.one_hot(labels, 5))
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64]
+)
+@pytest.mark.parametrize("reduce", ["prod", "mean", "amax", "amin"])
+@pytest.mark.parametrize("include_self", [True, False])
+@pytest.mark.parametrize("n_index", [6, 40])
+def test_index_reduce(mojo_device, dtype, reduce, include_self, n_index):
+    """6 indices take the ordered small-index route (CUDA's
+    indexFuncSmallIndex: each slot reduced in index order, so even rounded
+    floats match CPU); 40 take the atomic one (exact values only)."""
+    g = torch.Generator().manual_seed(4)
+    x = _small((5, 6, 3), dtype, 5)
+    index = torch.randint(0, 6, (n_index,), generator=g)
+    if n_index <= 16 and dtype != torch.int64:
+        source = (torch.randn(5, n_index, 3, generator=g) * 3).to(dtype)
+    else:
+        source = _small((5, n_index, 3), dtype, 6)
+    expected = x.index_reduce(1, index, source, reduce, include_self=include_self)
+    with ran("aten::index_reduce"):
+        got = x.to(mojo_device).index_reduce(
+            1,
+            index.to(mojo_device),
+            source.to(mojo_device),
+            reduce,
+            include_self=include_self,
+        )
+    _check(got, expected)
+
+
+def test_index_reduce_out_in_place_and_errors(mojo_device):
+    x = torch.randn(4, 3)
+    source = torch.randn(5, 3)
+    index = torch.tensor([0, 3, 0, 1, 3], dtype=torch.int32)
+    expected = x.index_reduce(0, index, source, "amax")
+    y = x.to(mojo_device)
+    with ran("aten::index_reduce_"):
+        y.index_reduce_(0, index.to(mojo_device), source.to(mojo_device), "amax")
+    _check(y, expected)
+    out = torch.empty(0, device=mojo_device)
+    with ran("aten::index_reduce.out"):
+        torch.index_reduce(
+            x.to(mojo_device),
+            0,
+            index.to(mojo_device),
+            source.to(mojo_device),
+            "amax",
+            out=out,
+        )
+    _check(out, expected)
+    d = x.to(mojo_device)
+    with pytest.raises(RuntimeError, match="Expected reduce to be one of"):
+        d.index_reduce(0, index.to(mojo_device), source.to(mojo_device), "sum")
+    with pytest.raises(IndexError, match="Index is supposed to be a vector"):
+        d.index_reduce(
+            0, index.reshape(1, 5).to(mojo_device), source.to(mojo_device), "prod"
+        )
+    with pytest.raises(RuntimeError, match="should be equal to source.size"):
+        d.index_reduce(0, index[:3].to(mojo_device), source.to(mojo_device), "prod")
+    with pytest.raises(RuntimeError, match="index out of range"):
+        d.index_reduce(
+            0,
+            torch.tensor([0, 1, 9, 1, 2], device=mojo_device),
+            source.to(mojo_device),
+            "prod",
+        )
+
+
+# ---------------------------------------------------------------------------
+# nonzero.out / nonzero_static / index.Tensor_out / narrow_copy.out /
+# fill_.Tensor
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_nonzero_out_and_static(mojo_device, dtype):
+    x = _make((3, 4), dtype)
+    x[1] = 0
+    out = torch.empty(7, 1, dtype=torch.int64, device=mojo_device)
+    with ran("aten::nonzero.out"):
+        torch.nonzero(x.to(mojo_device), out=out)
+    _check(out, torch.nonzero(x))
+    for size in (0, 3, 20):
+        with ran("aten::nonzero_static"):
+            got = torch.nonzero_static(x.to(mojo_device), size=size, fill_value=-4)
+        _check(got, torch.nonzero_static(x, size=size, fill_value=-4))
+    out = torch.empty(0, dtype=torch.int64, device=mojo_device)
+    torch.nonzero_static(x.to(mojo_device), size=5, out=out)
+    _check(out, torch.nonzero_static(x, size=5))
+    s = torch.tensor(2.0)
+    _check(
+        torch.nonzero_static(s.to(mojo_device), size=2), torch.nonzero_static(s, size=2)
+    )
+    with pytest.raises(RuntimeError, match="non-negative"):
+        torch.nonzero_static(x.to(mojo_device), size=-1)
+    with pytest.raises(RuntimeError, match="scalar type Long"):
+        torch.nonzero(x.to(mojo_device), out=torch.empty(0, device=mojo_device))
+
+
+def test_index_tensor_out(mojo_device):
+    x = _make((5, 4), torch.float32)
+    idx = torch.tensor([3, 0, 3])
+    out = torch.empty(0, device=mojo_device)
+    with ran("aten::index.Tensor_out"):
+        torch.ops.aten.index.Tensor_out(
+            x.to(mojo_device), [idx.to(mojo_device)], out=out
+        )
+    _check(out, x[idx])
+    out = torch.empty(0, device=mojo_device)
+    mask = torch.tensor([True, False, True, False, True])
+    torch.ops.aten.index.Tensor_out(x.to(mojo_device), [mask.to(mojo_device)], out=out)
+    _check(out, x[mask])
+    with pytest.raises(RuntimeError, match="dtype"):
+        torch.ops.aten.index.Tensor_out(
+            x.to(mojo_device),
+            [idx.to(mojo_device)],
+            out=torch.empty(0, dtype=torch.int64, device=mojo_device),
+        )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_narrow_copy_out(mojo_device, dtype):
+    x = _make((4, 6), dtype)
+    out = torch.empty(0, dtype=dtype, device=mojo_device)
+    with ran("aten::narrow_copy.out"):
+        torch.ops.aten.narrow_copy.out(x.to(mojo_device), 1, 2, 3, out=out)
+    _check(out, x.narrow(1, 2, 3))
+    out = torch.empty(0, dtype=dtype, device=mojo_device)
+    torch.ops.aten.narrow_copy.out(x.to(mojo_device), 0, -2, 2, out=out)
+    _check(out, x.narrow(0, -2, 2))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_fill_tensor(mojo_device, dtype):
+    x = _make((3, 4), dtype)
+    for value in (torch.tensor(2.5), torch.tensor(-3), torch.tensor(True)):
+        for where in ("cpu", mojo_device):
+            y = x.to(mojo_device)
+            with ran("aten::fill_.Tensor"):
+                y.fill_(value.to(where))
+            _check(y, x.clone().fill_(value))
+    # Strided self, and a value aliasing self.
+    y = x.to(mojo_device).t()
+    y.fill_(torch.tensor(1))
+    _check(y, x.t().clone().fill_(1))
+    y = x.to(mojo_device)
+    y.fill_(y[1, 2])
+    _check(y, x.clone().fill_(x[1, 2].item()))
+    with pytest.raises(RuntimeError, match="0-dimension value tensor"):
+        x.to(mojo_device).fill_(torch.ones(2))

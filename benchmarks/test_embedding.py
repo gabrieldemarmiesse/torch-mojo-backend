@@ -74,6 +74,11 @@ COVERS: dict[str, str] = {
     "aten::scatter.value": "test_scatter_value",
     "aten::scatter_add": "test_scatter_add",
     "aten::select_scatter": "test_select_scatter",
+    "aten::scatter_reduce.two": "test_scatter_reduce",
+    "aten::scatter.reduce": (
+        "test_scatter_reduce (reduce='add'/'multiply' are its sum/prod launches)"
+    ),
+    "aten::index_reduce": "test_index_reduce",
 }
 
 _SAME_KERNEL_OUT = (
@@ -95,6 +100,19 @@ SKIPPED: dict[str, str] = {
     "aten::scatter_.src": _SAME_KERNEL_INPLACE,
     "aten::scatter_add.out": _SAME_KERNEL_OUT,
     "aten::scatter_add_": _SAME_KERNEL_INPLACE,
+    "aten::scatter.value_out": _SAME_KERNEL_OUT,
+    "aten::scatter_.value": _SAME_KERNEL_INPLACE,
+    "aten::scatter.reduce_out": _SAME_KERNEL_OUT,
+    "aten::scatter_.reduce": _SAME_KERNEL_INPLACE,
+    "aten::scatter.value_reduce": (
+        "scatter.reduce with a scalar in place of src: the same launch"
+    ),
+    "aten::scatter.value_reduce_out": _SAME_KERNEL_OUT,
+    "aten::scatter_.value_reduce": _SAME_KERNEL_INPLACE,
+    "aten::scatter_reduce.two_out": _SAME_KERNEL_OUT,
+    "aten::scatter_reduce_.two": _SAME_KERNEL_INPLACE,
+    "aten::index_reduce.out": _SAME_KERNEL_OUT,
+    "aten::index_reduce_": _SAME_KERNEL_INPLACE,
 }
 
 
@@ -309,4 +327,66 @@ def test_select_scatter(
         lambda: torch.select_scatter(x_ref, s_ref, 0, outer // 2),
         lambda: torch.select_scatter(x_our, s_our, 0, outer // 2),
         flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", DIM_INDEX_SHAPES)
+@pytest.mark.parametrize("layout", ("sum", "prod", "amax", "mean_noself"))
+def test_scatter_reduce(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """scatter_add's geometry with each reduction: sum is the atomic add,
+    prod / amax the compare-and-swap loop, and mean without self adds the
+    identity fill, a count scatter and a division."""
+    rows, cols, dim = DIM_INDEX_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    reduce = layout.removesuffix("_noself")
+    include_self = not layout.endswith("_noself")
+    x_ref, x_our = both(torch.randn(rows, cols, dtype=dtype), hw, mojo_device)
+    src_ref, src_our = both(torch.randn(rows, cols, dtype=dtype), hw, mojo_device)
+    idx_ref, idx_our = both(
+        torch.randint(0, (rows, cols)[dim], (rows, cols)), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.scatter_reduce(
+            x_ref, dim, idx_ref, src_ref, reduce, include_self=include_self
+        ),
+        lambda: torch.scatter_reduce(
+            x_our, dim, idx_our, src_our, reduce, include_self=include_self
+        ),
+        flops=float(rows * cols),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SELECT_SHAPES)
+@pytest.mark.parametrize("layout", ("amax", "mean"))
+def test_index_reduce(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """index_add's geometry with a reduction (more than 16 indices: the
+    atomic route)."""
+    rows, cols, selected, dim = SELECT_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(rows, cols, dtype=dtype), hw, mojo_device)
+    source_shape = (selected, cols) if dim == 0 else (rows, selected)
+    s_ref, s_our = both(torch.randn(source_shape, dtype=dtype), hw, mojo_device)
+    idx_ref, idx_our = both(
+        torch.randint(0, (rows, cols)[dim], (selected,)), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.index_reduce(x_ref, dim, idx_ref, s_ref, layout),
+        lambda: torch.index_reduce(x_our, dim, idx_our, s_our, layout),
+        flops=float(selected * (cols if dim == 0 else rows)),
     )

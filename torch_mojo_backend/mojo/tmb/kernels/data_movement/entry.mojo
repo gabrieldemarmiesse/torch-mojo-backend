@@ -172,6 +172,125 @@ def _atomic_add[
         ](ptr, value)
 
 
+# Read-modify-write reductions of ScatterReduceDim (its `rop` slot), numbered
+# after ATen's ReductionType (SUM rides the atomic add above, MEAN is a SUM
+# plus a count on the op side).
+comptime ROP_PROD = 2
+comptime ROP_MAX = 3
+comptime ROP_MIN = 4
+
+
+@always_inline
+def _rop_apply[
+    dtype: DType
+](rop: Int, cur: Scalar[dtype], v: Scalar[dtype]) -> Scalar[dtype]:
+    """`cur (op) v` the way ATen's CUDA atomics compute it (Atomic.h): a
+    product in the dtype, and `safe_max` / `safe_min`, which let a NaN on
+    either side win."""
+    comptime if dtype == DType.bool:
+        if rop == ROP_MAX:
+            return cur if Bool(cur) else v
+        return v if Bool(cur) else cur
+    else:
+        if rop == ROP_PROD:
+            return cur * v
+        comptime if dtype.is_floating_point():
+            if cur != cur:
+                return cur
+            if v != v:
+                return v
+        if rop == ROP_MAX:
+            return cur if cur >= v else v
+        return cur if cur <= v else v
+
+
+@always_inline
+def _rop_identity[dtype: DType](rop: Int) -> Scalar[dtype]:
+    """The value `include_self=False` starts a scattered-to slot from
+    (`scatter_reduce_exclude_self_helper`): 1 for prod, -inf / lowest for
+    amax, +inf / max for amin, 0 for sum and mean."""
+    comptime if dtype == DType.bool:
+        if rop == ROP_PROD or rop == ROP_MIN:
+            return Scalar[dtype](1)
+        return Scalar[dtype](0)
+    else:
+        if rop == ROP_PROD:
+            return Scalar[dtype](1)
+        if rop == ROP_MAX:
+            return Scalar[dtype].MIN
+        if rop == ROP_MIN:
+            return Scalar[dtype].MAX
+        return Scalar[dtype](0)
+
+
+@always_inline
+def _atomic_rmw[
+    dtype: DType
+](
+    rop: Int,
+    ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    value: Scalar[dtype],
+):
+    """Relaxed atomic `ptr[] = ptr[] (rop) value` by compare-and-swap, the
+    way ATen's `gpuAtomicMul` / `gpuAtomicMax` / `gpuAtomicMin` do it (the
+    comparison is on the bits, so a NaN cannot spin the loop). A 16-bit
+    dtype swaps the aligned 32-bit word holding it (ATen's `AtomicFPOp`);
+    bool needs no swap: colliding AND / OR writers store the same value.
+    64-bit dtypes on an Apple GPU never come here (no 64-bit atomics: that
+    launch runs serially instead, see `_scatter_dim`)."""
+    comptime if dtype == DType.bool:
+        if rop == ROP_MAX:
+            if Bool(value):
+                ptr[] = value
+        elif not Bool(value):
+            ptr[] = value
+    elif size_of[dtype]() == 2:
+        # Step back one element to reach an odd half's word: rebuilding a
+        # pointer from an integer address hangs the launch on Metal.
+        var high = Int(ptr) & 2 != 0
+        var word = (ptr.unsafe_offset(-1) if high else ptr).unsafe_bitcast[
+            Scalar[DType.uint32]
+        ]()
+        var shift = UInt32(16) if high else UInt32(0)
+        var expected = word[]
+        while True:
+            var cur = bitcast[dtype]((expected >> shift).cast[DType.uint16]())
+            var bits = bitcast[DType.uint16](_rop_apply(rop, cur, value)).cast[
+                DType.uint32
+            ]()
+            var desired = (expected & ~(UInt32(0xFFFF) << shift)) | (
+                bits << shift
+            )
+            if desired == expected:
+                break
+            if Atomic[
+                Scalar[DType.uint32], scope=_atomic_scope()
+            ].compare_exchange[
+                success_ordering=Ordering.RELAXED,
+                failure_ordering=Ordering.RELAXED,
+                weak=True,
+            ](
+                word, expected, desired
+            ):
+                break
+    else:
+        comptime U = DType.uint32 if size_of[dtype]() == 4 else DType.uint64
+        var word = ptr.unsafe_bitcast[Scalar[U]]()
+        var expected = word[]
+        while True:
+            var desired = bitcast[U](
+                _rop_apply(rop, bitcast[dtype](expected), value)
+            )
+            if desired == expected:
+                break
+            if Atomic[Scalar[U], scope=_atomic_scope()].compare_exchange[
+                success_ordering=Ordering.RELAXED,
+                failure_ordering=Ordering.RELAXED,
+                weak=True,
+            ](word, expected, desired):
+                break
+
+
 # ---------------------------------------------------------------------------
 # Permute copy: materialize an arbitrary permutation of a contiguous tensor
 # of rank <= 4. The Python side pads the *output* shape to 4 dims with
@@ -3435,6 +3554,8 @@ def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
 # with leading 0). Last-write-wins on duplicate targets, like torch.
 # ScatterAddDim is the same body with `accumulate=True`: the write becomes a
 # relaxed atomic add (aten::scatter_add / index_add / index_put accumulate).
+# ScatterReduceDim (`rmw=True`) applies a `ROP_*` product / max / min by
+# compare-and-swap instead (scatter_reduce, scatter(reduce=), index_reduce).
 #
 # An index outside `[0, dim_size)` would write arbitrary device memory: the
 # write is skipped and, when `err_addr` is non-zero, an int32 flag there is
@@ -3445,7 +3566,7 @@ def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
 
 @always_inline
 def _scatter_dim[
-    dtype: DType, accumulate: Bool = False
+    dtype: DType, accumulate: Bool = False, rmw: Bool = False
 ](
     out_addr: Int,
     index_addr: Int,
@@ -3471,77 +3592,150 @@ def _scatter_dim[
     err_addr: Int,
     is_value: Int,
     value: Float64,
+    rop: Int,
+    ordered: Bool,
     ctx: DeviceContext,
 ) raises:
+    """`is_value`: 0 reads src, 1 writes the scalar `value`, 2 writes the
+    identity of `rop` (the `include_self=False` initialization). `rmw`
+    (ScatterReduceDim) applies `rop` atomically instead of storing."""
     var out_ptr = _make_ptr[dtype](out_addr)
     var index_ptr = _make_ptr[DType.int64](index_addr)
     var src_ptr = _make_ptr[dtype](src_addr)
     var err_ptr = _make_ptr[DType.int32](err_addr)
     var has_err = err_addr != 0
     var scalar = value.cast[dtype]()
-    var total = d0 * d1 * d2 * d3
+    if is_value == 2:
+        scalar = _rop_identity[dtype](rop)
+    var use_scalar = is_value != 0
+    # `ordered`: one thread per coordinate off `dim_padded`, walking that
+    # dim in index order with a plain read-modify-write -- ATen's
+    # `indexFuncSmallIndex` (index_add / index_reduce with <= 16 indices),
+    # whose per-slot order is the index order. The index must be broadcast
+    # (stride 0) off `dim_padded`, so no two threads share a target.
+    var e0 = 1 if ordered and dim_padded == 0 else d0
+    var e1 = 1 if ordered and dim_padded == 1 else d1
+    var e2 = 1 if ordered and dim_padded == 2 else d2
+    var e3 = 1 if ordered and dim_padded == 3 else d3
+    var n_k = 1
+    if ordered:
+        n_k = (d0 * d1 * d2 * d3) // max(e0 * e1 * e2 * e3, 1)
+    var total = e0 * e1 * e2 * e3
+    # Apple GPUs have no 64-bit atomics: a 64-bit read-modify-write runs as
+    # one thread walking the whole index space (exact, and the only order a
+    # plain read-modify-write is safe in).
+    comptime serial_ok = rmw and size_of[dtype]() == 8
+    var serial = serial_ok and not ordered and ctx.api() == "metal"
 
     @always_inline
     @__parameter
-    @__copy_capture(out_ptr, index_ptr, src_ptr, err_ptr, has_err, scalar)
+    @__copy_capture(
+        out_ptr,
+        index_ptr,
+        src_ptr,
+        err_ptr,
+        has_err,
+        scalar,
+        use_scalar,
+        serial,
+        ordered,
+        e0,
+        e1,
+        e2,
+        e3,
+        n_k,
+        total,
+    )
     def func[width: Int, alignment: Int = 1](coord: Coord):
-        var i = Int(coord[0].value())
-        var i3 = i % d3
-        var rest = i // d3
-        var i2 = rest % d2
-        rest = rest // d2
-        var i1 = rest % d1
-        var i0 = rest // d1
-        var target = Int(
-            index_ptr[unsafe_offset=i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3]
-        )
-        if target < 0 or target >= dim_size:
-            # Out of range: skip the write, report it if the caller asked.
-            # Every writer stores the same 1, so the race is benign.
-            if has_err:
-                err_ptr[] = 1
-            return
-        var out_off = i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3
-        # Replace the coordinate along `dim_padded` with the scatter target.
-        if dim_padded == 0:
-            out_off += (target - i0) * os0
-        elif dim_padded == 1:
-            out_off += (target - i1) * os1
-        elif dim_padded == 2:
-            out_off += (target - i2) * os2
-        else:
-            out_off += (target - i3) * os3
-        comptime if accumulate and dtype == DType.bool:
-            # A bool sum saturates at True: every colliding writer stores the
-            # same value, so no read-modify-write is needed.
-            var v = src_ptr[
-                unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
-            ]
-            if v != Scalar[dtype](0):
-                out_ptr[unsafe_offset=out_off] = v
-        elif accumulate:
-            # Colliding targets sum, in an unspecified order (torch's CUDA
-            # scatter_add is atomic too). Relaxed is enough: nothing else in
-            # the launch reads `out`.
-            _atomic_add(
-                out_ptr.unsafe_offset(out_off),
-                src_ptr[
-                    unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
-                ],
-            )
-        else:
-            if is_value != 0:
-                out_ptr[unsafe_offset=out_off] = scalar
-            else:
-                out_ptr[unsafe_offset=out_off] = src_ptr[
-                    unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
-                ]
+        var first = Int(coord[0].value())
+        var stop = first + 1
+        if serial:
+            first = 0
+            stop = total
+        for t in range(first, stop):
+            var j3 = t % e3
+            var rest = t // e3
+            var j2 = rest % e2
+            rest = rest // e2
+            var j1 = rest % e1
+            var j0 = rest // e1
+            for k in range(n_k):
+                var i0 = j0
+                var i1 = j1
+                var i2 = j2
+                var i3 = j3
+                if ordered:
+                    if dim_padded == 0:
+                        i0 = k
+                    elif dim_padded == 1:
+                        i1 = k
+                    elif dim_padded == 2:
+                        i2 = k
+                    else:
+                        i3 = k
+                var target = Int(
+                    index_ptr[
+                        unsafe_offset=i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3
+                    ]
+                )
+                if target < 0 or target >= dim_size:
+                    # Out of range: skip the write, report it if the caller
+                    # asked. Every writer stores the same 1, so the race is
+                    # benign.
+                    if has_err:
+                        err_ptr[] = 1
+                    continue
+                var out_off = i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3
+                # Replace the coordinate along `dim_padded` with the target.
+                if dim_padded == 0:
+                    out_off += (target - i0) * os0
+                elif dim_padded == 1:
+                    out_off += (target - i1) * os1
+                elif dim_padded == 2:
+                    out_off += (target - i2) * os2
+                else:
+                    out_off += (target - i3) * os3
+                var v = scalar
+                if not use_scalar:
+                    v = src_ptr[
+                        unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
+                    ]
+                comptime if rmw:
+                    comptime if is_apple_gpu() and size_of[dtype]() == 8:
+                        out_ptr[unsafe_offset=out_off] = _rop_apply(
+                            rop, out_ptr[unsafe_offset=out_off], v
+                        )
+                    else:
+                        if ordered:
+                            out_ptr[unsafe_offset=out_off] = _rop_apply(
+                                rop, out_ptr[unsafe_offset=out_off], v
+                            )
+                        else:
+                            _atomic_rmw(rop, out_ptr.unsafe_offset(out_off), v)
+                elif accumulate and dtype == DType.bool:
+                    # A bool sum saturates at True: every colliding writer
+                    # stores the same value, so no read-modify-write is
+                    # needed.
+                    if v != Scalar[dtype](0):
+                        out_ptr[unsafe_offset=out_off] = v
+                elif accumulate:
+                    if ordered:
+                        out_ptr[unsafe_offset=out_off] = (
+                            out_ptr[unsafe_offset=out_off] + v
+                        )
+                    else:
+                        # Colliding targets sum, in an unspecified order
+                        # (torch's CUDA scatter_add is atomic too). Relaxed
+                        # is enough: nothing else in the launch reads `out`.
+                        _atomic_add(out_ptr.unsafe_offset(out_off), v)
+                else:
+                    out_ptr[unsafe_offset=out_off] = v
 
-    _parallel_for_dt[dtype, func](total, ctx)
+    _parallel_for_dt[dtype, func](1 if serial else total, ctx)
 
 
 def _scatter_dim_go[
-    accumulate: Bool = False
+    accumulate: Bool = False, rmw: Bool = False
 ](
     out_ptr: Arg,
     index_ptr: Arg,
@@ -3553,6 +3747,8 @@ def _scatter_dim_go[
     value_o: Arg,
     dtype_o: Arg,
     ctx_ptr: Arg,
+    rop_o: Arg,
+    ordered_o: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var index_addr = _raw_int(index_ptr)
@@ -3580,14 +3776,16 @@ def _scatter_dim_go[
     var value = _raw_f64(value_o)
     var dtype = _raw_dtype_int(dtype_o)
     var ctx = _raw_ctx(ctx_ptr)
+    var rop = _raw_int(rop_o)
+    var ordered = _raw_int(ordered_o) != 0
 
     var handled = False
     comptime for dt in SCATTER_DTYPES:
         comptime if _dtype_arg_on[0, dt]() and (
-            not accumulate or _atomic_add_ok[dt]()
+            not (accumulate or rmw) or _atomic_add_ok[dt]()
         ):
             if dtype == dt:
-                _scatter_dim[dt, accumulate](
+                _scatter_dim[dt, accumulate, rmw](
                     out_addr,
                     index_addr,
                     src_addr,
@@ -3612,6 +3810,8 @@ def _scatter_dim_go[
                     err_addr,
                     is_value,
                     value,
+                    rop,
+                    ordered,
                     ctx,
                 )
                 handled = True
@@ -3736,10 +3936,12 @@ def _gather_rows_dispatcher(argv: Argv, argc: Int) raises:
 
 
 def _scatter_dim_dispatcher[
-    accumulate: Bool = False
+    accumulate: Bool = False, rmw: Bool = False
 ](argv: Argv, argc: Int) raises:
+    """Slots 0-8 as `_scatter_dim_go` names them; slot 9, the reduction of
+    ScatterReduceDim (`ROP_*`), and slot 10, `ordered`, are optional (0)."""
     var args = argv
-    _scatter_dim_go[accumulate](
+    _scatter_dim_go[accumulate, rmw](
         args[unsafe_offset=0],
         args[unsafe_offset=1],
         args[unsafe_offset=2],
@@ -3749,6 +3951,8 @@ def _scatter_dim_dispatcher[
         args[unsafe_offset=6],
         args[unsafe_offset=7],
         args[unsafe_offset=8],
+        args[unsafe_offset=9] if argc > 9 else Arg(0),
+        args[unsafe_offset=10] if argc > 10 else Arg(0),
     )
 
 
@@ -3909,6 +4113,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["ScatterAddDim"]():
             _scatter_dim_dispatcher[accumulate=True](argv, argc)
+            return 0
+        comptime if _op_on["ScatterReduceDim"]():
+            _scatter_dim_dispatcher[rmw=True](argv, argc)
             return 0
         raise Error(NO_OP_COMPILED)
     except e:
