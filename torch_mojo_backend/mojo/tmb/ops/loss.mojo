@@ -519,8 +519,11 @@ def _nll_forward(
         tw.finish(rets, 1)
         return
     var ctx = ctx_for(input.device)
-    var err = _err_flag(input.device)
     if _nll_fast_f32(a, reduction, a.weight_ptr() != 0):
+        # CUDA device-asserts on a bad target asynchronously. This hot path
+        # (cross_entropy in every f32 training step) skips the check rather
+        # than pay a sync per call, as before; a sticky device-error flag
+        # checked at existing sync points is the follow-up.
         var call = KernelCall("loss", "NllLossForwardF32")
         call.arg_dtype(0, input.dtype)
         call.arg_dtype(1, a.target.t.dtype)
@@ -536,7 +539,6 @@ def _nll_forward(
         call.int(reduction)
         call.int(ignore_index)
         call.int(ctx_ptr(ctx))
-        call.int(err.t.ptr)
         call.run()
     else:
         var scratch = own(new_tensor(_shape1(1), 1, input.stype, input.device))
@@ -549,6 +551,7 @@ def _nll_forward(
                     _shape1(2 * bps * a.batch), 1, input.stype, input.device
                 )
             )
+        var err = _err_flag(input.device)
         var call = KernelCall("loss", "Nll")
         call.arg_dtype(0, input.dtype)
         call.arg_dtype(1, a.target.t.dtype)
@@ -562,9 +565,9 @@ def _nll_forward(
         call.tuple(_nll_params(a, reduction, ignore_index))
         call.int(ctx_ptr(ctx))
         call.run()
+        _raise_bad_target(err.t)
         _ = scratch^
-    _raise_bad_target(err.t)
-    _ = err^
+        _ = err^
     _ = ctx
     _ = a^
     out.finish(rets, 0)
@@ -679,8 +682,11 @@ def _nll_backward(
     var grad = Dense(v_tensor(args[unsafe_offset=0]))
     var tw = Dense(v_tensor(args[unsafe_offset=6]))
     var ctx = ctx_for(input.device)
-    var err = _err_flag(input.device)
     if _nll_fast_f32(a, reduction, a.weight_ptr() != 0):
+        # CUDA device-asserts on a bad target asynchronously. This hot path
+        # (cross_entropy in every f32 training step) skips the check rather
+        # than pay a sync per call, as before; a sticky device-error flag
+        # checked at existing sync points is the follow-up.
         var call = KernelCall("loss", "NllLossBackwardF32")
         call.arg_dtype(0, grad.t.dtype)
         call.arg_dtype(1, a.target.t.dtype)
@@ -696,10 +702,10 @@ def _nll_backward(
         call.int(reduction)
         call.int(ignore_index)
         call.int(ctx_ptr(ctx))
-        call.int(err.t.ptr)
         call.run()
     else:
         fill_value(gi.t, 0.0)
+        var err = _err_flag(input.device)
         var call = KernelCall("loss", "NllBackward")
         call.arg_dtype(0, input.dtype)
         call.arg_dtype(1, a.target.t.dtype)
@@ -712,8 +718,8 @@ def _nll_backward(
         call.tuple(_nll_params(a, reduction, ignore_index))
         call.int(ctx_ptr(ctx))
         call.run()
-    _raise_bad_target(err.t)
-    _ = err^
+        _raise_bad_target(err.t)
+        _ = err^
     _ = ctx
     _ = grad^
     _ = tw^
