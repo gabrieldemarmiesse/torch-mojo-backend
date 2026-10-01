@@ -298,12 +298,12 @@ def test_conv2d_trains_natively_under_the_fallback(gpu):
 def test_a_registered_op_that_declines_does_not_reach_the_fallback(gpu):
     """The boundary of the design: the dispatcher picks a fallback only where
     no kernel is registered, so an op the backend registers and then declines
-    at run time (here `aten::convolution` with transposed=True) still raises.
+    at run time (here `aten::convolution` of int64 operands) still raises.
     """
-    x = torch.randn(2, 3, 8, 8, device=gpu)
-    w = torch.randn(3, 4, 3, 3, device=gpu)
+    x = torch.ones(2, 3, 8, 8, device=gpu, dtype=torch.int64)
+    w = torch.ones(4, 3, 3, 3, device=gpu, dtype=torch.int64)
     with cuda_interop.cuda_fallback(), pytest.raises(NotImplementedError):
-        torch.nn.functional.conv_transpose2d(x, w, stride=2)
+        torch.nn.functional.conv2d(x, w)
 
 
 def test_fallback_is_only_a_fallback(gpu):
