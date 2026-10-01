@@ -405,6 +405,23 @@ _FP64_ANCHORED = _FP64_ANCHORED | _FP64_ANCHORED_BY_ACCELERATOR.get(
 )
 
 
+def _is_async_download(op: OpInfo, sample: SampleInput, result: object) -> bool:
+    """Whether this call asked for a `non_blocking=True` copy to the host.
+
+    `non_blocking` is a keyword for most ops; `Tensor.to`'s samples pass it
+    positionally, as the first bool of every overload (`to(device, dtype,
+    non_blocking, copy)`, `to(dtype, ...)`, `to(other, ...)`).
+    """
+    if not isinstance(result, torch.Tensor) or result.device.type != "cpu":
+        return False
+    if sample.kwargs.get("non_blocking") is True:
+        return True
+    if op.name == "to":
+        flags = [a for a in sample.args if isinstance(a, bool)]
+        return bool(flags) and flags[0]
+    return False
+
+
 def _to_float64(sample: SampleInput) -> SampleInput:
     return sample.transform(lambda t: t.double() if t.is_floating_point() else t)
 
@@ -456,10 +473,12 @@ class TestOpInfoConformance(TestCase):
                 placement = placements[index]
             moved = _to_device(sample, device, placement)
             actual = op(moved.input, *moved.args, **moved.kwargs)
-            # A `non_blocking=True` download (`to`'s samples) hands back a
-            # host tensor whose copy is still in flight; reading it before a
-            # sync is a race on any accelerator, CUDA included.
-            torch.accelerator.synchronize()
+            if _is_async_download(op, moved, actual):
+                # The host tensor's copy is still in flight: reading it
+                # before a sync is a race on any accelerator, CUDA included.
+                # Every other result is read through `.cpu()`, which orders
+                # itself, so a missing dependency elsewhere still shows.
+                torch.accelerator.synchronize()
             expected = op(sample.input, *sample.args, **sample.kwargs)
             if (
                 (op.formatted_name, dtype) in _FP64_ANCHORED

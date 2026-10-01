@@ -244,12 +244,25 @@ def check_out_as(dest: T, stype: Int32, like: T) raises:
         )
 
 
+def resize_storage_bytes(t: T, nbytes: Int) raises:
+    """`resize_bytes_cuda`: reallocate `t`'s storage to `nbytes`, keeping the
+    bytes up to the smaller size -- refused for a storage that is not
+    resizable (a DLPack import, a `from_blob` view), as CUDA refuses it."""
+    if external_call["tmb_tensor_storage_resizable", Int32](t.h) == 0:
+        raise Error("Trying to resize storage that is not resizable")
+    check(
+        external_call["tmb_storage_resize", Int32](t.h, Int64(nbytes)),
+        "tmb_storage_resize",
+    )
+
+
 def resize_out(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
     """torch's `resize_output` for a caller's `out=` tensor, in place.
 
-    A backend with no `aten::resize_` kernel of its own gets no resize
-    before dispatch, so every `out=` op here does this itself. Two halves,
-    both of `at::native::resize_impl`:
+    Boxed kernels get no resize before dispatch, so every `out=` op here
+    does this itself; `aten::resize_` (tmb/ops/data_movement.mojo) is this
+    too, after its argument checks. Two halves, both of
+    `at::native::resize_impl`:
 
     * **An `out` that already has this logical shape is left alone** --
       strides and storage offset included. `out=base[4:8]` or a transposed
@@ -282,11 +295,9 @@ def resize_out(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
         numel *= shape[MAX_RANK - rank + i]
     var offset = t.offset
     var nbytes = (offset + numel) * t.itemsize
-    if nbytes > t.storage_nbytes():
-        check(
-            external_call["tmb_storage_resize", Int32](t.h, Int64(nbytes)),
-            "tmb_storage_resize",
-        )
+    # `maybe_resize_storage_cuda`: an empty result never touches the storage.
+    if numel > 0 and nbytes > t.storage_nbytes():
+        resize_storage_bytes(t, nbytes)
     set_sizes_strides(t, shape, contiguous_strides(shape, rank), rank, offset)
     t = T(t.h)
 

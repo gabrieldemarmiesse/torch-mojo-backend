@@ -69,6 +69,9 @@ def _cases(device: str) -> dict[str, torch.Tensor]:
         "fold_tensor": A._philox_key_fold_in.Tensor(
             k, torch.tensor([2**63 + 5], dtype=torch.uint64, device=device)
         ),
+        # empty_like(key) keeps the transposed layout; CUDA writes it in
+        # memory order from the contiguous keys.
+        "fold_transposed": A._philox_key_fold_in(k.transpose(0, 1), 3),
     }
     keyed = {
         "one_key_1000": ((1000,), k[0, 0]),
@@ -113,6 +116,7 @@ _GOLDEN = {
     "split_one_key": "9b525649e99f2298",
     "fold_neg": "7dceda1408759043",
     "fold_tensor": "e98672ad7d851119",
+    "fold_transposed": "f18bd814ba817ff2",
     "uniform_one_key_1000_float32": "93305a185911a754",
     "normal_one_key_1000_float32": "db58e2cd270caea4",
     "stdnormal_one_key_1000_float32": "80071b261ea9778d",
@@ -216,6 +220,7 @@ def test_matches_live_cuda(mojo_gpu):
         pytest.skip("needs a CUDA build of torch >= 2.13")
     got = _cases(mojo_gpu)
     want = _cases("cuda")
+    assert all(got[n].stride() == want[n].stride() for n in got)
     wrong = [
         name
         for name in got
@@ -253,12 +258,33 @@ def test_keys_match_cpu(mojo_gpu):
     for got, want in [
         (A._philox_key_split(km, 4), A._philox_key_split(k, 4)),
         (A._philox_key_fold_in(km, 123), A._philox_key_fold_in(k, 123)),
-        (
-            A._philox_key_fold_in(km.transpose(0, 1), 9),
-            A._philox_key_fold_in(k.transpose(0, 1), 9),
-        ),
     ]:
         assert torch.equal(got.cpu().view(torch.int64), want.view(torch.int64))
+    # A transposed key: CPU allocates a contiguous output, CUDA (and we) an
+    # `empty_like` one written in memory order -- the same bytes.
+    got = A._philox_key_fold_in(km.transpose(0, 1), 9).cpu()
+    want = A._philox_key_fold_in(k.transpose(0, 1), 9)
+    assert torch.equal(
+        got.as_strided(want.shape, want.stride()).view(torch.int64),
+        want.view(torch.int64),
+    )
+
+
+def test_fold_in_keeps_the_key_layout(mojo_gpu):
+    k = _keys().to(mojo_gpu).transpose(0, 1)
+    out = A._philox_key_fold_in(k, 3)
+    assert out.stride() == k.stride()
+    sliced = _keys().to(mojo_gpu)[:, ::2]
+    assert A._philox_key_fold_in(sliced, 3).is_contiguous()
+
+
+@pytest.mark.parametrize("op", [A._philox_uniform_, A._philox_normal_])
+def test_rejects_an_overlapping_self(mojo_gpu, op):
+    k = _keys().to(mojo_gpu)
+    expanded = torch.empty(1, device=mojo_gpu).expand(5)
+    with pytest.raises(RuntimeError, match="more than one element of the written-to"):
+        op(expanded, k[0, 0])
+    op(torch.empty(0, device=mojo_gpu).expand(0), k[0, 0])
 
 
 def test_noncontiguous_self_and_empty(mojo_gpu):
