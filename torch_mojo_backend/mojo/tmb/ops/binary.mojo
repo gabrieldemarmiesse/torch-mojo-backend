@@ -102,11 +102,14 @@ def _b_float3(st: Int32) -> Bool:
 
 
 def _b_castable(st: Int32) -> Bool:
-    """data_movement CAST_DTYPES (the old `_CAST_DTYPES`)."""
+    """data_movement CAST_DTYPES (the old `_CAST_DTYPES`), float64 aside:
+    the callers' float64 routes are their own."""
     return (
         _b_float3(st)
         or st == ST_INT64
         or st == ST_INT32
+        or st == ST_INT16
+        or st == ST_INT8
         or st == ST_UINT8
         or st == ST_BOOL
     )

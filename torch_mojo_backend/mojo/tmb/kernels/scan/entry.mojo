@@ -28,13 +28,18 @@
 #
 # ACCUMULATION. Every combine computes in float32 for the half dtypes
 # (float64 in float64; integers in their own dtype, int64 wrapping like
-# torch). cumprod and logcumsumexp then round the running value to the
-# element dtype after every combine, as CUDA's `scan_dim<scalar_t>` keeps it
-# (that is what makes a half cumprod that overflows stay inf). cumsum keeps the
-# float32 running value and rounds once per output, like the nn family's
-# block prefix sums it complements.
-# cummax / cummin only select, so they run in the operand's own dtype.
-#
+# torch), and the value scans (cumsum, cumprod, logcumsumexp) store every
+# combined value in the element dtype, as CUDA's `scan_dim<scalar_t>` keeps it
+# in all three of its routes (ScanUtils.cuh: the outer-dim kernel's running
+# `scalar_t acc`, the innermost kernel's `scalar_t` shared tile, cub's
+# accumulator of `std::plus<scalar_t>`): a half cumsum of ones saturates at
+# 2048, a half cumprod that overflows stays inf. The orders are CUDA's too:
+# the outer dim runs one sequential line per thread (`_scan_lines_kernel`),
+# the innermost dim the same Sklansky tiles with the carry folded into each
+# tile's first element (`_scan_rows_sklansky_kernel`); a 1-D half/bf16 scan,
+# which CUDA hands to cub, follows cub's tile structure
+# (`_scan_1d_cub_kernel`).
+
 # TIES AND NaN. cummax / cummin follow ATen's `scan_dim_with_indices` (and CPU's
 # `cummax_cummin_helper`): a later element replaces the running extremum when
 # it is NaN, or when the running value is not NaN and the new one compares
@@ -68,6 +73,7 @@ from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
     _enqueue_cached,
+    _enqueue_cached_2d,
     _make_ptr,
     _raw_ctx,
     _raw_dtype_int,
@@ -164,7 +170,7 @@ struct SumScan(ScanOp):
     comptime name = "sum"
     comptime dtypes = SUM_DTYPES
     comptime with_index = False
-    comptime rounds = False
+    comptime rounds = True
 
     @staticmethod
     def acc_dtype[dt: DType]() -> DType:
@@ -465,6 +471,230 @@ def _scan_rows_kernel[
         row += Int(grid_dim.x)
 
 
+comptime CUDA_SCAN_THREADS = 512
+
+
+@always_inline
+def _cuda_log_threads_x(num_rows: Int, row_size: Int) -> Int:
+    """ScanUtils.cuh `get_log_num_threads_x_inner_scan<uint32_t>`, its
+    unsigned wrap-around included (a negative `9 + diff` clamps to 9)."""
+    var lx = UInt32(0)
+    var ly = UInt32(0)
+    while (UInt32(1) << lx) < UInt32(row_size):
+        lx += 1
+    while (UInt32(1) << ly) < UInt32(num_rows):
+        ly += 1
+    var diff = lx - ly  # uint32 arithmetic, as in ATen
+    var l = (UInt32(9) + diff) / UInt32(2)
+    return Int(min(max(l, UInt32(4)), UInt32(9)))
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32(CUDA_SCAN_THREADS)
+    )
+)
+@__name(t"scan_rows_sklansky_{Op.name}_{dtype}")
+def _scan_rows_sklansky_kernel[
+    Op: ScanOp, dtype: DType
+](
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    rows_arg: Int64,
+    n_arg: Int64,
+    log_x_arg: Int64,
+):
+    """ScanUtils.cuh `tensor_kernel_scan_innermost_dim_impl`, step for step:
+    block (2^log_x, 512 / 2^log_x), one row per y-lane, tiles of 2 * 2^log_x
+    elements scanned by the Sklansky network after the previous tiles' total
+    is folded into the tile's FIRST element. With `Op.rounds` every combine
+    stores the element dtype, so a half scan rounds exactly where CUDA's
+    `scan_dim<scalar_t>` does."""
+    comptime acc = Op.acc_dtype[dtype]()
+    var rows = Int(rows_arg)
+    var n = Int(n_arg)
+    var log_x = Int(log_x_arg)
+    var nx = 1 << log_x
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var ny = CUDA_SCAN_THREADS // nx
+    var smem = stack_allocation[
+        2 * CUDA_SCAN_THREADS, acc, address_space=AddressSpace.SHARED
+    ]()
+    var off = ty * 2 * nx
+    var block_row = Int(block_idx.x) * ny
+    while block_row < rows:
+        var row = block_row + ty
+        var exists = row < rows
+        var total = Op.identity[acc]()
+        var base = row * n
+        var col0 = 0
+        while col0 < n:
+            var c1 = col0 + tx
+            var c2 = col0 + nx + tx
+            if exists:
+                smem[unsafe_offset=off + tx] = (
+                    in_ptr[unsafe_offset=base + c1].cast[acc]() if c1
+                    < n else Op.identity[acc]()
+                )
+                smem[unsafe_offset=off + nx + tx] = (
+                    in_ptr[unsafe_offset=base + c2].cast[acc]() if c2
+                    < n else Op.identity[acc]()
+                )
+                if tx == 0:
+                    smem[unsafe_offset=off + 0] = _merge[Op, dtype, acc](
+                        total, Int64(-1), smem[unsafe_offset=off + 0], Int64(-1)
+                    )[0]
+            barrier()
+            for m in range(log_x + 1):
+                if exists:
+                    var sz = 1 << m
+                    var a = ((tx >> m) << (m + 1)) | sz
+                    var ti = a + (tx % sz)
+                    var si = a - 1
+                    smem[unsafe_offset=off + ti] = _merge[Op, dtype, acc](
+                        smem[unsafe_offset=off + si],
+                        Int64(-1),
+                        smem[unsafe_offset=off + ti],
+                        Int64(-1),
+                    )[0]
+                barrier()
+            if exists:
+                if c1 < n:
+                    out_ptr[unsafe_offset=base + c1] = smem[
+                        unsafe_offset=off + tx
+                    ].cast[dtype]()
+                if c2 < n:
+                    out_ptr[unsafe_offset=base + c2] = smem[
+                        unsafe_offset=off + nx + tx
+                    ].cast[dtype]()
+            total = smem[unsafe_offset=off + 2 * nx - 1]
+            barrier()
+            col0 += 2 * nx
+        block_row += ny * Int(grid_dim.x)
+
+
+# cub's DeviceScan agent for a 2-byte accumulator (c10::Half / BFloat16 are
+# not cub "primitive" types, so sm90 takes the default tuning: 128 threads x
+# 15 nominal 4-byte items, scaled by MemBoundScaling to 30 items of 2 bytes).
+comptime CUB_THREADS = 128
+comptime CUB_ITEMS = 30
+comptime CUB_WARPS = CUB_THREADS // 32
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(CUB_THREADS))
+)
+@__name(t"scan_1d_cub_order_{Op.name}_{dtype}")
+def _scan_1d_cub_kernel[
+    Op: ScanOp, dtype: DType
+](
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    n_arg: Int64,
+):
+    """A 1-D half/bf16 scan in the combine order of the cub DeviceScan CUDA
+    runs for it (ScanUtils.cuh `scan_dim` -> `cuda::cub::inclusive_scan`),
+    every combine rounded to the element dtype: tiles of 128 threads x 30
+    blocked items; each thread reduces its items in order, the thread
+    aggregates are scanned Kogge-Stone within each warp and the warp
+    aggregates in order across the block (BLOCK_SCAN_WARP_SCANS), the tile
+    prefix is the previous tiles' inclusive total (the look-back resolved in
+    order), and each thread finally rescans its items seeded with its
+    exclusive prefix. One block walks the tiles in order. Measured bit-exact
+    against CUDA up to 10**4 elements; past a few tens of tiles cub's
+    decoupled look-back can associate the earlier tiles' aggregates
+    differently, which this in-order prefix does not reproduce."""
+    comptime acc = Op.acc_dtype[dtype]()
+    var n = Int(n_arg)
+    var tid = Int(thread_idx.x)
+    var lane = tid % 32
+    var warp = tid // 32
+    var aggs = stack_allocation[
+        CUB_THREADS, acc, address_space=AddressSpace.SHARED
+    ]()
+    var warp_tot = stack_allocation[
+        CUB_WARPS, acc, address_space=AddressSpace.SHARED
+    ]()
+    var tile_prefix = Op.identity[acc]()
+    var first_tile = True
+    var tile0 = 0
+    while tile0 < n:
+        var base = tile0 + tid * CUB_ITEMS
+        var cnt = max(0, min(CUB_ITEMS, n - base))
+        # Thread aggregate, in order.
+        var agg = Op.identity[acc]()
+        for k in range(cnt):
+            var x = in_ptr[unsafe_offset=base + k].cast[acc]()
+            if k == 0:
+                agg = x
+            else:
+                agg = _merge[Op, dtype, acc](agg, Int64(-1), x, Int64(-1))[0]
+        aggs[unsafe_offset=tid] = agg
+        barrier()
+        # Warp inclusive scan (shfl_up 1, 2, 4, 8, 16).
+        var v = agg
+        var off = 1
+        while off < 32:
+            var other = aggs[unsafe_offset=tid - off] if lane >= off else v
+            barrier()
+            if lane >= off:
+                v = _merge[Op, dtype, acc](other, Int64(-1), v, Int64(-1))[0]
+            aggs[unsafe_offset=tid] = v
+            barrier()
+            off *= 2
+        if lane == 31:
+            warp_tot[unsafe_offset=warp] = v
+        barrier()
+        # Exclusive within the warp: the previous lane's inclusive value.
+        var excl = aggs[unsafe_offset=tid - 1] if lane > 0 else v
+        var has_excl = lane > 0
+        # Warp prefix: earlier warps' totals, in order.
+        if warp > 0:
+            var wp = warp_tot[unsafe_offset=0]
+            for w in range(1, warp):
+                wp = _merge[Op, dtype, acc](
+                    wp, Int64(-1), warp_tot[unsafe_offset=w], Int64(-1)
+                )[0]
+            if has_excl:
+                excl = _merge[Op, dtype, acc](wp, Int64(-1), excl, Int64(-1))[0]
+            else:
+                excl = wp
+            has_excl = True
+        var block_tot = warp_tot[unsafe_offset=0]
+        for w in range(1, CUB_WARPS):
+            block_tot = _merge[Op, dtype, acc](
+                block_tot, Int64(-1), warp_tot[unsafe_offset=w], Int64(-1)
+            )[0]
+        # The tile prefix (previous tiles' inclusive total).
+        if not first_tile:
+            if has_excl:
+                excl = _merge[Op, dtype, acc](
+                    tile_prefix, Int64(-1), excl, Int64(-1)
+                )[0]
+            else:
+                excl = tile_prefix
+            has_excl = True
+        # Rescan the thread's items from its exclusive prefix.
+        var run = excl
+        for k in range(cnt):
+            var x = in_ptr[unsafe_offset=base + k].cast[acc]()
+            if k == 0 and not has_excl:
+                run = x
+            else:
+                run = _merge[Op, dtype, acc](run, Int64(-1), x, Int64(-1))[0]
+            out_ptr[unsafe_offset=base + k] = run.cast[dtype]()
+        if first_tile:
+            tile_prefix = block_tot
+        else:
+            tile_prefix = _merge[Op, dtype, acc](
+                tile_prefix, Int64(-1), block_tot, Int64(-1)
+            )[0]
+        first_tile = False
+        barrier()
+        tile0 += CUB_THREADS * CUB_ITEMS
+
+
 @always_inline
 def _scan[
     Op: ScanOp, dtype: DType
@@ -483,6 +713,35 @@ def _scan[
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
     else:
+        comptime if not Op.with_index and Op.rounds and (
+            dtype == DType.float16 or dtype == DType.bfloat16
+        ):
+            if outer == 1 and inner == 1:
+                _enqueue_cached[_scan_1d_cub_kernel[Op, dtype]](
+                    ctx, 1, 1, 1, CUB_THREADS, out, inp, Int64(n)
+                )
+                return
+        comptime if not Op.with_index:
+            if inner == 1:
+                # CUDA's innermost-dim scan (also standing in for its cub
+                # route of a 1-D scan, whose decoupled look-back order is
+                # not reproduced).
+                var log_x = _cuda_log_threads_x(outer, n)
+                var ny = CUDA_SCAN_THREADS >> log_x
+                _enqueue_cached_2d[_scan_rows_sklansky_kernel[Op, dtype]](
+                    ctx,
+                    min(ceildiv(outer, ny), SCAN_MAX_BLOCKS),
+                    1,
+                    1,
+                    1 << log_x,
+                    ny,
+                    out,
+                    inp,
+                    Int64(outer),
+                    Int64(n),
+                    Int64(log_x),
+                )
+                return
         if inner == 1 and n >= SCAN_ROW_BLOCK_MIN:
             _enqueue_cached[_scan_rows_kernel[Op, dtype]](
                 ctx,

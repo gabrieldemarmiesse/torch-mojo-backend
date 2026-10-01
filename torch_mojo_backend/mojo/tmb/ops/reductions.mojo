@@ -2138,17 +2138,13 @@ def _moments_into(
     var rdt = max_dtype(res_st)
     if not _is_float3(rdt) and rdt != DType.float64:
         unsupported("std/var into dtype " + String(rdt))
-    var var_out = own(new_tensor(shape, rank, res_st, a.device))
-    var mean_out = own(
-        new_tensor(shape, rank, res_st, a.device) if want_mean else new_tensor(
-            IndexList[MAX_RANK](0), 1, res_st, a.device
-        )
-    )
     if a.numel == 0:
-        fill_value(var_out.t, nan[DType.float64]())
+        var var_e = own(new_tensor(shape, rank, res_st, a.device))
+        fill_value(var_e.t, nan[DType.float64]())
+        var mean_e = _mean_slot(want_mean, shape, rank, res_st, a.device)
         if want_mean:
-            fill_value(mean_out.t, nan[DType.float64]())
-        return (var_out^, mean_out^)
+            fill_value(mean_e.t, nan[DType.float64]())
+        return (var_e^, mean_e^)
     var src = _borrow(a)
     if src.t.stype != res_st:
         _decline_metal_float64_dtype(rdt, src.t, "std/var")
@@ -2161,22 +2157,14 @@ def _moments_into(
         var r = _moments_f64(
             src.t, all, keepdim, correction, take_sqrt, want_mean
         )
-        copy_strided_into(var_out.t, r[0].t)
-        if want_mean:
-            copy_strided_into(mean_out.t, r[1].t)
-        _ = r^  # alive past the copies
-        _ = src^
-        return (var_out^, mean_out^)
+        _ = src^  # alive past the launches
+        return r^
     var kd = keepdim and src.t.rank != 0
     _flat_if_scalar(src, rdims)
     var work_st = ST_FLOAT32 if take_sqrt else res_st
     var wide = own_if_new(cast_to(src.t, work_st), src.t)
     var vt = own(new_tensor(shape, rank, work_st, a.device))
-    var mt = own(
-        new_tensor(shape, rank, work_st, a.device) if want_mean else new_tensor(
-            IndexList[MAX_RANK](0), 1, work_st, a.device
-        )
-    )
+    var mt = _mean_slot(want_mean, shape, rank, work_st, a.device)
     if want_mean:
         _var_mean_into(wide.t, rdims.copy(), kd, correction, vt.t, mt.t)
     else:
@@ -2198,12 +2186,28 @@ def _moments_into(
         vt = root^
     if work_st == res_st:
         return (vt^, mt^)
+    # std of a half operand: the float32 results, rounded once.
+    var var_out = own(new_tensor(shape, rank, res_st, a.device))
+    var mean_out = _mean_slot(want_mean, shape, rank, res_st, a.device)
     cast_into(var_out.t, vt.t)
     if want_mean:
         cast_into(mean_out.t, mt.t)
     _ = vt^  # alive past the launches
     _ = mt^
     return (var_out^, mean_out^)
+
+
+def _mean_slot(
+    want_mean: Bool,
+    shape: IndexList[MAX_RANK],
+    rank: Int,
+    st: Int32,
+    device: Int,
+) raises -> Owned:
+    """The mean result, or a 0-element placeholder without `want_mean`."""
+    if want_mean:
+        return own(new_tensor(shape, rank, st, device))
+    return own(new_tensor(IndexList[MAX_RANK](0), 1, st, device))
 
 
 def _std_sqrt(t: T) raises -> T:

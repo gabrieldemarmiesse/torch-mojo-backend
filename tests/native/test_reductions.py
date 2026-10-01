@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tests.native.conftest import is_metal, ran, skip_if_metal
+from tests.native.test_scans import cuda_lowp_cumsum
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 
 
@@ -3287,8 +3288,10 @@ def test_cumsum_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
     expected = torch.cumsum(x, dim=dim)
     assert result.dtype == expected.dtype
     if dtype.is_floating_point:
+        # CUDA's half running sum rounds after every addition; CPU's float
+        # one rounds once, so the reference is CUDA's order, bit-exact.
         torch.testing.assert_close(
-            result.cpu(), expected, rtol=_CUMSUM_LOWP_RTOL, atol=_CUMSUM_LOWP_ATOL
+            result.cpu(), cuda_lowp_cumsum(x, dim), rtol=0, atol=0
         )
     else:
         torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
@@ -3309,8 +3312,10 @@ def test_cumsum_workspace_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
     expected = torch.cumsum(x, dim=dim)
     assert result.dtype == expected.dtype
     if dtype.is_floating_point:
+        # CUDA's half running sum rounds after every addition; CPU's float
+        # one rounds once, so the reference is CUDA's order, bit-exact.
         torch.testing.assert_close(
-            result.cpu(), expected, rtol=_CUMSUM_LOWP_RTOL, atol=_CUMSUM_LOWP_ATOL
+            result.cpu(), cuda_lowp_cumsum(x, dim), rtol=0, atol=0
         )
     else:
         torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)

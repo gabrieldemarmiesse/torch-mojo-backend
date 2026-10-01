@@ -117,19 +117,18 @@ def _is_sum_scan_dtype(dt: DType) -> Bool:
 
 def _nn_cumsum_ok(src: T, dim: Int) raises -> Bool:
     """The nn family's block-prefix-sum regimes (`_cumsum_spec_into_go`) of a
-    contiguous operand: the trailing dim of float32/int32/int64 everywhere
-    (MAX's CPU device included), and on a GPU also bf16/f16 and dim 0 of a
-    rank-2 operand -- the surface `op_cumsum` had before the scan family
-    existed, so no call that used to run moves to another route."""
+    contiguous float32/int32/int64 operand: the trailing dim everywhere
+    (MAX's CPU device included), and on a GPU also dim 0 of a rank-2
+    operand. bf16/f16 never take it: its float32 running sum rounds once,
+    where CUDA's `scan_dim<scalar_t>` rounds the half sum after every
+    addition (`ones(4096)` saturates at 2048 in half) -- the scan family
+    reproduces that."""
     if not src.contig or src.rank < 1:
         return False
-    var gpu = dev(src.device)[].api != "cpu"
     var dt = src.dtype
-    var ok_dtype = dt == DType.float32 or dt == DType.int32 or dt == DType.int64
-    if gpu and (dt == DType.bfloat16 or dt == DType.float16):
-        ok_dtype = True
-    if not ok_dtype:
+    if not (dt == DType.float32 or dt == DType.int32 or dt == DType.int64):
         return False
+    var gpu = dev(src.device)[].api != "cpu"
     return dim == src.rank - 1 or (gpu and src.rank == 2 and dim == 0)
 
 
