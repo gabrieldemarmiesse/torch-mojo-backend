@@ -971,10 +971,15 @@ def _efficient_forward(
     var fa4 = _fa4_plan(
         q, k, v, False, dropout_p, is_causal, False, allow_any_seqlen=True
     )
-    var fused = _fused_fa_plan(q, k, v, False, dropout_p, False)
-    if fa4.ok or fused.ok:
-        var pair = _flash_forward(q, k, v, is_causal, dropout_p, scale)
+    var pair: Tuple[T, T]
+    if fa4.ok:
+        pair = _fa4_forward(q, k, v, fa4, scale)
         release(pair[1].h)  # the flash LSE is not part of this schema
+        return pair[0].copy()
+    var fused = _fused_fa_plan(q, k, v, False, dropout_p, False)
+    if fused.ok:
+        pair = _fused_fa_forward(q, k, v, fused, is_causal, scale)
+        release(pair[1].h)
         return pair[0].copy()
     var math = _math_plan(q, k, v, False, dropout_p, is_causal, False)
     if math.ok:
@@ -1270,6 +1275,24 @@ def _math_lse_forward(
 ) raises -> Tuple[T, T]:
     """(out, lse): out (B, H, L, Ev) dense in q's dtype, lse (B, H, L)
     float32, a fully masked row's lse following `masked_lse`."""
+    if k.dim(2) == 0:
+        # No keys: every row is fully masked (CUDA's flash returns 0 and
+        # +inf; the row reductions below would have nothing to reduce).
+        var zo = own(
+            _alloc(q.device, q.stype, [q.dim(0), q.dim(1), q.dim(2), v.dim(3)])
+        )
+        fill_value(zo.t, 0.0)
+        var zl = own(
+            _alloc(q.device, ST_FLOAT32, [q.dim(0), q.dim(1), q.dim(2)])
+        )
+        fill_value(
+            zl.t,
+            _POS_INF if masked_lse
+            == LSE_MASKED_FLASH else (
+                0.0 if masked_lse == LSE_MASKED_EFFICIENT else _NEG_INF
+            ),
+        )
+        return (zo.take(), zl.take())
     var acc = _acc_stype(q)
     var pr = _math_probs(q, k, bias, causal_off, scale, acc)
     var p = own(pr[0].copy())
@@ -1337,6 +1360,20 @@ def _math_lse_backward(
     """(dq, dk, dv, dbias): dense, in each input's dtype; dbias has `bias`'s
     shape and dtype, and is q itself (a dummy the caller must not return)
     when not wanted."""
+    if k.dim(2) == 0:
+        # No keys: the output is constant 0, so every gradient is 0.
+        var zq = own(_alloc(q.device, q.stype, q.logical_shape()))
+        fill_value(zq.t, 0.0)
+        var zk = own(_alloc(k.device, k.stype, k.logical_shape()))
+        var zv = own(_alloc(v.device, v.stype, v.logical_shape()))
+        var zb = _borrowed(q)
+        if want_bias_grad and bias:
+            zb = own(
+                _alloc(
+                    q.device, bias.value().stype, bias.value().logical_shape()
+                )
+            )
+        return (zq.take(), zk.take(), zv.take(), zb.take())
     var acc = _acc_stype(q)
     var pr = _math_probs(q, k, bias, causal_off, scale, acc)
     var p = own(pr[0].copy())
@@ -1428,6 +1465,18 @@ def _causal_off(
     return kv_len - q_len if bottom_right else 0
 
 
+def _fused_alignment_ok(
+    q: T, k: T, is_causal: Bool, bottom_right: Bool
+) -> Bool:
+    """Whether the fused flash kernels' causal mask is the one asked for.
+
+    Every fused kernel (FA4 and the gfx942 MFMA/baseline kernels, forward
+    and backward) masks top-left: query `q` attends keys `0 ..= q`. A
+    bottom-right request (CUDA's own flash ops) is the same mask only when
+    L == S; otherwise it must take the math route."""
+    return not (is_causal and bottom_right and q.dim(2) != k.dim(2))
+
+
 def _flash_any_forward(
     q: T,
     k: T,
@@ -1438,12 +1487,15 @@ def _flash_any_forward(
 ) raises -> Tuple[T, T]:
     """(out (B, H, L, D), lse (B, H, L) float32) from a fused flash kernel
     when one takes the inputs, else from the math route."""
-    var fa4 = _fa4_plan(
-        q, k, v, False, 0.0, is_causal, False, allow_any_seqlen=True
-    )
-    var fused = _fused_fa_plan(q, k, v, False, 0.0, False)
-    if fa4.ok or fused.ok:
-        return _flash_forward(q, k, v, is_causal, 0.0, scale)
+    if _fused_alignment_ok(q, k, is_causal, bottom_right):
+        var fa4 = _fa4_plan(
+            q, k, v, False, 0.0, is_causal, False, allow_any_seqlen=True
+        )
+        if fa4.ok:
+            return _fa4_forward(q, k, v, fa4, scale)
+        var fused = _fused_fa_plan(q, k, v, False, 0.0, False)
+        if fused.ok:
+            return _fused_fa_forward(q, k, v, fused, is_causal, scale)
     _math_check(q, k, v, "flash attention")
     return _math_lse_forward(
         q,
@@ -1470,13 +1522,14 @@ def _flash_any_backward(
     """Gradients from the fused flash backward that matches the forward's
     kernel, else from the math route (which recomputes the probabilities,
     so it is right whichever route ran the forward)."""
+    var aligned = _fused_alignment_ok(q, k, is_causal, bottom_right)
     # No `allow_any_seqlen` here: a partial last tile in the backward tile
     # machinery would be a silently wrong gradient, so such shapes take the
     # math route instead.
     var fa4 = _fa4_plan(
         q, k, v, False, 0.0, is_causal, False, allow_any_seqlen=False
     )
-    if fa4.ok:
+    if aligned and fa4.ok:
         if o.stype != q.stype or not o.same_shape(q):
             unsupported("flash attention backward: out does not match query")
         if (
@@ -1489,7 +1542,7 @@ def _flash_any_backward(
             unsupported("flash attention backward: logsumexp has a bad shape")
         return _fa4_backward(q, k, v, o, lse, grad, fa4, scale)
     var fused = _fused_fa_plan(q, k, v, False, 0.0, False)
-    if fused.ok:
+    if aligned and fused.ok:
         return _fused_fa_backward(
             grad, q, k, v, o, lse, fused, is_causal, scale
         )
@@ -2208,6 +2261,8 @@ def _cudnn_forward(
     dropout_p: Float64,
     is_causal: Bool,
     scale_v: Value,
+    max_q: Int,
+    max_k: Int,
     rets: Values,
 ) raises:
     """cuDNN's forward contract on the math route: causal from the top left,
@@ -2244,8 +2299,8 @@ def _cudnn_forward(
     _ = lse^
     _ret_undefined(rets, 2)
     _ret_undefined(rets, 3)
-    ret_int(rets, 4, q.dim(2))
-    ret_int(rets, 5, k.dim(2))
+    ret_int(rets, 4, max_q)
+    ret_int(rets, 5, max_k)
     var ph = _philox_pair(q.device)
     var seed = own(ph[0].copy())
     var offset = own(ph[1].copy())
@@ -2272,6 +2327,8 @@ def op_cudnn_attention(
         v_f64(args[unsafe_offset=5]),
         v_bool(args[unsafe_offset=6]),
         args[unsafe_offset=8],
+        v_tensor(args[unsafe_offset=0]).dim(2),
+        v_tensor(args[unsafe_offset=1]).dim(2),
         rets,
     )
 
@@ -2301,6 +2358,8 @@ def op_cudnn_attention_forward(
         v_f64(args[unsafe_offset=9]),
         v_bool(args[unsafe_offset=10]),
         args[unsafe_offset=12],
+        v_int(args[unsafe_offset=6]),
+        v_int(args[unsafe_offset=7]),
         rets,
     )
 

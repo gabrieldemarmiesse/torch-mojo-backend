@@ -42,7 +42,6 @@ from tmb.ops.attention import (
     _as,
     _d_binary,
     _d_masked_fill,
-    _d_masked_fill_,
     _d_matmul,
     _d_mul_scalar_,
     _d_sum,
@@ -304,8 +303,7 @@ def _masked_softmax(
     scores: T, mask: T, mask_type: Optional[Int]
 ) raises -> Owned:
     """`_masked_softmax(scores, mask, dim=-1, mask_type)` on (B, H, T, T)
-    scores: a True mask entry hides the key. Fully hidden rows come out 0,
-    what CUDA's fused masked softmax produces."""
+    scores: a True mask entry hides the key."""
     var m = _as(mask, ST_BOOL)
     if not mask_type:
         raise Error("Mask Type should be defined")
@@ -360,10 +358,11 @@ def _masked_softmax(
             String(ss[byte = 1 : ss.byte_length() - 1]),
             "]",
         )
+    # A fully hidden row comes out NaN (softmax over -inf), as on CUDA and
+    # CPU alike, and the NaN reaches that row of the output too.
     var filled = _d_masked_fill(scores, me.t, _NEG_INF)
     var p = _softmax_last(filled.t)
     _ = filled^
-    _d_masked_fill_(p.t, me.t, 0.0)
     _ = me^
     _ = m^
     return p^
@@ -411,6 +410,37 @@ def _check_mha(
         )
     if num_head <= 0 or d % num_head != 0:
         raise Error("`embed_dim` must divide evenly by `num_heads`")
+
+
+def _sdpa_is_fused(query: T, num_head: Int, dh: Int) raises -> Bool:
+    """CUDA's gate on its SDPA path: `select_sdp_backend` over the
+    (B, NH, T, DH) head views of the input must pick a fused backend; a math
+    choice keeps the explicit bmm/softmax path below."""
+    var b = query.dim(0)
+    var t = query.dim(1)
+    var view = _view_at(
+        query,
+        [b, num_head, t, dh],
+        [
+            query.stride(0),
+            dh * query.stride(2),
+            query.stride(1),
+            query.stride(2),
+        ],
+        query.offset,
+    )
+    var c = _Call("aten::_fused_sdp_choice", "")
+    c.t(view.t)
+    c.t(view.t)
+    c.t(view.t)
+    c.none()
+    c.f(0.0)
+    c.b(False)
+    c.none()
+    c.b(False)
+    var r = c.run(1)
+    _ = view^
+    return Int(r[0].a) != 0  # SDPBackend::math
 
 
 def _mha_fast(
@@ -500,6 +530,7 @@ def _native_mha(
         and not need_weights
         and not mask
         and query.numel > 0
+        and _sdpa_is_fused(query, num_head, dh)
     ):
         var proj = _mha_fast(
             query, d, num_head, qkv_weight, qkv_bias, proj_weight, proj_bias

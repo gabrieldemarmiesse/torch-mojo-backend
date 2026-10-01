@@ -775,3 +775,29 @@ def test_cudnn_attention_rejects_float32_like_cuda(mojo_gpu):
         RuntimeError, match="only supports float16 and bfloat16, got Float"
     ):
         aten._scaled_dot_product_cudnn_attention(q, k, v, None, False)
+
+
+def test_flash_and_efficient_attention_without_keys(mojo_gpu):
+    """An empty key/value sequence: output 0, logsumexp +inf for flash (what
+    CUDA returns) and 0 for the memory-efficient layout; zero gradients."""
+    q = torch.randn(1, 3, 2, 8, dtype=torch.float16, device=mojo_gpu)
+    kv = torch.randn(1, 0, 2, 8, dtype=torch.float16, device=mojo_gpu)
+    q.requires_grad_()
+    out, lse = aten._flash_attention_forward(
+        q, kv, kv, None, None, 3, 0, 0.0, False, False
+    )[:2]
+    assert out.shape == (1, 3, 2, 8) and (out.cpu() == 0).all()
+    assert lse.shape == (1, 2, 3) and (lse.cpu() == torch.inf).all()
+    out.sum().backward()
+    assert (_grad(q).cpu() == 0).all()
+    out, lse = aten._efficient_attention_forward(
+        q.detach(), kv, kv, None, None, None, None, None, 0.0, 0, True
+    )[:2]
+    assert (out.cpu() == 0).all() and (lse[..., :3].cpu() == 0).all()
+
+
+def test_cudnn_attention_forward_returns_the_given_max_lengths(mojo_gpu):
+    _, _, _, q, k, v = _qkv(mojo_gpu, torch.float16, 1, 2, 6, 9, 16)
+    with torch.no_grad():
+        res = aten._cudnn_attention_forward(q, k, v, None, None, None, 11, 13, True)
+    assert (res[4], res[5]) == (11, 13)

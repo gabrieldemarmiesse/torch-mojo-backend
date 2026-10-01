@@ -69,8 +69,17 @@ def test_mha_self_attention_matches_cpu(mojo_gpu, need_weights, average):
         assert wd is None
 
 
+def want_nan_rows(q, k, v, e, h, ws, mask, mask_type) -> bool:
+    """The CPU reference really has NaN rows (so the case tests them)."""
+    out = aten._native_multi_head_attention(
+        q, k, v, e, h, *ws, mask, False, True, mask_type
+    )
+    return bool(out[0].isnan().any())
+
+
 @pytest.mark.parametrize(
-    "mask_kind", ["none", "src_mask", "key_padding", "full_bool", "full_float"]
+    "mask_kind",
+    ["none", "src_mask", "key_padding", "full_bool", "full_float", "dead_rows"],
 )
 @pytest.mark.parametrize("attention", ["self", "cross", "separate"])
 def test_native_mha_matches_cpu(mojo_gpu, mask_kind, attention):
@@ -94,10 +103,16 @@ def test_native_mha_matches_cpu(mojo_gpu, mask_kind, attention):
     elif mask_kind == "full_float":
         mask, mask_type = (torch.rand(b, h, t, t) > 0.7).float(), 2
         mask[..., 0] = 0.0
+    elif mask_kind == "dead_rows":
+        # Fully masked rows: NaN weights and NaN output rows, on CUDA and CPU.
+        mask, mask_type = torch.zeros(t, t, dtype=torch.bool), 0
+        mask[2] = True
     dev = {id(x): x.to(mojo_gpu), id(y): y.to(mojo_gpu), id(z): z.to(mojo_gpu)}
     qd, kd, vd = dev[id(q)], dev[id(k)], dev[id(v)]
     wd = [w.to(mojo_gpu) for w in ws]
     md = None if mask is None else mask.to(mojo_gpu)
+    if mask_kind == "dead_rows":
+        assert want_nan_rows(q, k, v, e, h, ws, mask, mask_type)
     for need_weights, average in ((False, True), (True, True), (True, False)):
         want = aten._native_multi_head_attention(
             q, k, v, e, h, *ws, mask, need_weights, average, mask_type
@@ -106,9 +121,13 @@ def test_native_mha_matches_cpu(mojo_gpu, mask_kind, attention):
             got = aten._native_multi_head_attention(
                 qd, kd, vd, e, h, *wd, md, need_weights, average, mask_type
             )
-        torch.testing.assert_close(got[0].cpu(), want[0], atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(
+            got[0].cpu(), want[0], atol=1e-5, rtol=1e-4, equal_nan=True
+        )
         if need_weights:
-            torch.testing.assert_close(got[1].cpu(), want[1], atol=1e-5, rtol=1e-4)
+            torch.testing.assert_close(
+                got[1].cpu(), want[1], atol=1e-5, rtol=1e-4, equal_nan=True
+            )
         else:
             assert got[1] is None
 
