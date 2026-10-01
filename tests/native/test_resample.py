@@ -386,20 +386,21 @@ def test_out_overlap_follows_torch(mojo_device):
         torch.ops.aten.upsample_nearest2d.out(xm, [6, 6], None, None, out=expanded)
     # A strided (non-dense) out is TooHard for ATen's overlap check: allowed.
     torch.ops.aten.upsample_nearest1d.out(xm[0], [2], None, out=xm[0][..., :2])
-    # A partially overlapping dense out: accepted, input read first.
+    # A partially overlapping dense out: accepted. The kernel reads the
+    # input while writing the out (a race on CUDA too), so only what does
+    # not depend on that order is checked: the shape, and the storage
+    # outside the out left untouched.
     for op, extra in (
         (torch.ops.aten.reflection_pad2d.out, ([1, 1, 1, 1],)),
         (torch.ops.aten.upsample_nearest2d.out, ([6, 6], None, None)),
     ):
         buf = torch.arange(64.0)
-        ref = buf.clone()
-        src = ref[:16].view(1, 1, 4, 4).clone()
-        res = torch.empty(1, 1, 6, 6)
-        op(src, *extra, out=res)
-        ref[8:44] = res.reshape(-1)
         dev = buf.to(mojo_device)
-        op(dev[:16].view(1, 1, 4, 4), *extra, out=dev[8:44].view(1, 1, 6, 6))
-        torch.testing.assert_close(dev.cpu(), ref, atol=0, rtol=0)
+        res = op(dev[:16].view(1, 1, 4, 4), *extra, out=dev[8:44].view(1, 1, 6, 6))
+        assert res.shape == (1, 1, 6, 6) and res.dtype == torch.float32
+        got = dev.cpu()
+        torch.testing.assert_close(got[:8], buf[:8], atol=0, rtol=0)
+        torch.testing.assert_close(got[44:], buf[44:], atol=0, rtol=0)
 
 
 def test_same_size_upsample_out_partial_overlap_raises(mojo_device):
