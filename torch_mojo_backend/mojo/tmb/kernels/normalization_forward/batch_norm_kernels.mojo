@@ -130,25 +130,16 @@ def _bn_scale_shift[
         shift = beta_ptr[unsafe_offset=c].cast[DType.float32]()
 
 
-@always_inline
-def _cl_suffix[out_cl: Bool]() -> StaticString:
-    comptime if out_cl:
-        return "_cl"
-    else:
-        return ""
-
-
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BN_THREADS))
 )
-@__name(t"batch_norm_elemwise_{dtype}_{from_invstd}_v{V}{_cl_suffix[out_cl]()}")
+@__name(t"batch_norm_elemwise_{dtype}_{from_invstd}_v{V}")
 def _bn_elementwise_kernel[
     dtype: DType,
     pdtype: DType,
     sdtype: DType,
     V: Int,
     from_invstd: Bool,
-    out_cl: Bool = False,
 ](
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
@@ -228,16 +219,9 @@ def _bn_elementwise_kernel[
         var x = in_ptr.unsafe_load[width=V, alignment=align](at).cast[
             DType.float32
         ]()
-        var y = ((x - mean) * scale + shift).cast[dtype]()
-        comptime if out_cl:
-            # A channels-last output (V == 1): element (n, c, s) of the
-            # contiguous input lands at (n * inner + s) * channels + c.
-            var n = plane // channels
-            out_ptr.unsafe_store[width=V, alignment=align](
-                (n * inner_slots + slot) * channels + plane - n * channels, y
-            )
-        else:
-            out_ptr.unsafe_store[width=V, alignment=align](at, y)
+        out_ptr.unsafe_store[width=V, alignment=align](
+            at, ((x - mean) * scale + shift).cast[dtype]()
+        )
         plane += plane_stride
 
 
@@ -730,11 +714,9 @@ def enqueue_batch_norm_elementwise[
     ctx: DeviceContext,
     save_mean_addr: Int = 0,
     save_invstd_addr: Int = 0,
-    out_cl: Bool = False,
 ) raises:
     """`out = (x - mean[c]) * invstd[c] * gamma[c] + beta[c]` over an NC...
-    contiguous tensor, `inner` being the product of the dims after C; with
-    `out_cl` the output is written channels-last (unvectorized)."""
+    contiguous tensor, `inner` being the product of the dims after C."""
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
     var out_ptr = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
@@ -755,31 +737,6 @@ def enqueue_batch_norm_elementwise[
     comptime V = 16 // size_of[dtype]()
     # A plane starts at `plane * inner`, so `inner % V == 0` plus a 16-byte
     # aligned base is what makes every plane's vectors land on a boundary.
-    if out_cl:
-        _enqueue_cached[
-            _bn_elementwise_kernel[dtype, pdtype, sdtype, 1, from_invstd, True]
-        ](
-            ctx,
-            ceildiv(inner, BN_THREADS),
-            max(1, min(planes, _MAX_GRID)),
-            1,
-            BN_THREADS,
-            out_ptr,
-            in_ptr,
-            mean_ptr,
-            var_ptr,
-            gamma_ptr,
-            beta_ptr,
-            save_mean_ptr,
-            save_invstd_ptr,
-            eps,
-            Int64(inner),
-            Int64(channels),
-            Int64(planes),
-            Int64(hw),
-            Int64(hb),
-        )
-        return
     var vectorized = (
         _vec16_phase[dtype](in_addr) == 0
         and _vec16_phase[dtype](out_addr) == 0
@@ -833,6 +790,176 @@ def enqueue_batch_norm_elementwise[
         Int64(slots),
         Int64(channels),
         Int64(planes),
+        Int64(hw),
+        Int64(hb),
+    )
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BN_THREADS))
+)
+@__name(t"batch_norm_elemwise_nhwc_{dtype}_{from_invstd}_v{V}")
+def _bn_elementwise_nhwc_kernel[
+    dtype: DType,
+    pdtype: DType,
+    sdtype: DType,
+    V: Int,
+    from_invstd: Bool,
+](
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    mean_ptr: Pointer[Scalar[sdtype], ImmutAnyOrigin],
+    var_ptr: Pointer[Scalar[sdtype], ImmutAnyOrigin],
+    gamma_ptr: Pointer[Scalar[pdtype], ImmutAnyOrigin],
+    beta_ptr: Pointer[Scalar[pdtype], ImmutAnyOrigin],
+    save_mean_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
+    save_invstd_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
+    eps: Float32,
+    slots_arg: Int64,
+    channels_arg: Int64,
+    has_weight_arg: Int64,
+    has_bias_arg: Int64,
+):
+    """The channels-last (NHWC / NDHWC) pass: input and output both dense
+    channels-last, walked in their physical order like CUDA's
+    `batch_norm_transform_input_channels_last_kernel`, the channel of an
+    element being `i % C`. Each thread owns V consecutive elements (one
+    16-byte vector when `C % V == 0` and the bases are aligned, so a vector
+    never straddles two pixels), loads and stores are coalesced. The
+    inference route also emits the saved statistics (the first C elements'
+    threads), as the NCHW kernel does."""
+    var slots = Int(slots_arg)
+    var channels = Int(channels_arg)
+    var has_weight = Int(has_weight_arg) != 0
+    var has_bias = Int(has_bias_arg) != 0
+    comptime align = V * size_of[dtype]()
+    var slot = Int(block_idx.x) * BN_THREADS + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * BN_THREADS
+    while slot < slots:
+        var at = slot * V
+        var c0 = at % channels
+        var x = in_ptr.unsafe_load[width=V, alignment=align](at).cast[
+            DType.float32
+        ]()
+        var y = SIMD[DType.float32, V]()
+        comptime for k in range(V):
+            var mean = Float32(0)
+            var scale = Float32(0)
+            var shift = Float32(0)
+            _bn_scale_shift[from_invstd=from_invstd](
+                mean_ptr,
+                var_ptr,
+                gamma_ptr,
+                beta_ptr,
+                c0 + k,
+                eps,
+                has_weight,
+                has_bias,
+                mean,
+                scale,
+                shift,
+            )
+            y[k] = (x[k] - mean) * scale + shift
+            comptime if not from_invstd:
+                if at + k < channels:
+                    var c = c0 + k
+                    save_mean_ptr[unsafe_offset=c] = mean_ptr[unsafe_offset=c]
+                    save_invstd_ptr[unsafe_offset=c] = (
+                        1.0
+                        / ieee_sqrt(
+                            var_ptr[unsafe_offset=c].cast[DType.float32]() + eps
+                        )
+                    ).cast[sdtype]()
+        out_ptr.unsafe_store[width=V, alignment=align](at, y.cast[dtype]())
+        slot += stride
+
+
+def enqueue_batch_norm_elementwise_nhwc[
+    dtype: DType, pdtype: DType, sdtype: DType, from_invstd: Bool
+](
+    out_addr: Int,
+    in_addr: Int,
+    mean_addr: Int,
+    var_addr: Int,
+    gamma_addr: Int,
+    beta_addr: Int,
+    eps: Float32,
+    channels: Int,
+    numel: Int,
+    has_weight: Bool,
+    has_bias: Bool,
+    ctx: DeviceContext,
+    save_mean_addr: Int = 0,
+    save_invstd_addr: Int = 0,
+) raises:
+    """`enqueue_batch_norm_elementwise` for a dense channels-last input and
+    output (same strides): one flat pass in memory order."""
+    comptime if not has_accelerator():
+        raise Error("no GPU accelerator available at compile time")
+    var out_ptr = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
+    var in_ptr = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_imm()
+    var mean_ptr = _make_ptr[sdtype](mean_addr).as_unsafe_any_origin().as_imm()
+    var var_ptr = _make_ptr[sdtype](var_addr).as_unsafe_any_origin().as_imm()
+    var gamma_ptr = (
+        _make_ptr[pdtype](gamma_addr).as_unsafe_any_origin().as_imm()
+    )
+    var beta_ptr = _make_ptr[pdtype](beta_addr).as_unsafe_any_origin().as_imm()
+    var save_mean_ptr = _make_ptr[sdtype](save_mean_addr).as_unsafe_any_origin()
+    var save_invstd_ptr = _make_ptr[sdtype](
+        save_invstd_addr
+    ).as_unsafe_any_origin()
+    var hw = 1 if has_weight else 0
+    var hb = 1 if has_bias else 0
+    comptime V = 16 // size_of[dtype]()
+    var vectorized = (
+        _vec16_phase[dtype](in_addr) == 0
+        and _vec16_phase[dtype](out_addr) == 0
+        and channels % V == 0
+    )
+    if vectorized:
+        var slots = numel // V
+        _enqueue_cached[
+            _bn_elementwise_nhwc_kernel[dtype, pdtype, sdtype, V, from_invstd]
+        ](
+            ctx,
+            max(1, min(ceildiv(slots, BN_THREADS), _MAX_GRID)),
+            1,
+            1,
+            BN_THREADS,
+            out_ptr,
+            in_ptr,
+            mean_ptr,
+            var_ptr,
+            gamma_ptr,
+            beta_ptr,
+            save_mean_ptr,
+            save_invstd_ptr,
+            eps,
+            Int64(slots),
+            Int64(channels),
+            Int64(hw),
+            Int64(hb),
+        )
+        return
+    _enqueue_cached[
+        _bn_elementwise_nhwc_kernel[dtype, pdtype, sdtype, 1, from_invstd]
+    ](
+        ctx,
+        max(1, min(ceildiv(numel, BN_THREADS), _MAX_GRID)),
+        1,
+        1,
+        BN_THREADS,
+        out_ptr,
+        in_ptr,
+        mean_ptr,
+        var_ptr,
+        gamma_ptr,
+        beta_ptr,
+        save_mean_ptr,
+        save_invstd_ptr,
+        eps,
+        Int64(numel),
+        Int64(channels),
         Int64(hw),
         Int64(hb),
     )

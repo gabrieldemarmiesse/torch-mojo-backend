@@ -203,6 +203,45 @@ def test_batch_norm_inference(
     )
 
 
+def _bn_operands_nhwc(
+    shape_id: str, dtype_id: str, hw: Hardware, mojo: torch.device
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """`_bn_operands` with the activation channels-last (NHWC), the layout
+    a channels-last conv net hands batch norm."""
+    refs, ours = _bn_operands(shape_id, dtype_id, hw, mojo)
+    refs[0] = refs[0].to(memory_format=torch.channels_last)
+    ours[0] = ours[0].to(memory_format=torch.channels_last)
+    return refs, ours
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", BN_SHAPES)
+@pytest.mark.bench_op("native_batch_norm")
+def test_batch_norm_nhwc(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    refs, ours = _bn_operands_nhwc(shape_id, dtype_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten.native_batch_norm(*refs, True, 0.1, 1e-5),
+        lambda: torch.ops.aten.native_batch_norm(*ours, True, 0.1, 1e-5),
+        flops=float(refs[0].numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", BN_SHAPES)
+@pytest.mark.bench_op("_native_batch_norm_legit_no_training")
+def test_batch_norm_inference_nhwc(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    refs, ours = _bn_operands_nhwc(shape_id, dtype_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten._native_batch_norm_legit_no_training(*refs, 0.1, 1e-5),
+        lambda: torch.ops.aten._native_batch_norm_legit_no_training(*ours, 0.1, 1e-5),
+        flops=float(refs[0].numel()),
+    )
+
+
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", GN_SHAPES)
 @pytest.mark.bench_op("native_group_norm")

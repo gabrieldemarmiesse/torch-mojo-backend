@@ -1317,8 +1317,9 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     var planes = a.dim(0) * channels
     if inner <= 0 or planes <= 0:
         unsupported("batch norm geometry must be positive")
-    var am = _mat(a)
     var out_cl = is_channels_last_layout(a)
+    # A channels-last input is read where it lies (the NHWC pass).
+    var am = Held(a.copy(), False) if out_cl else _mat(a)
     var out = own(_bn_out_alloc(a, out_cl))
     var save_mean = own(_channel_vec(channels, mean.stype, a.device))
     var save_invstd = own(_channel_vec(channels, mean.stype, a.device))
@@ -1508,7 +1509,8 @@ def _bn_training(args: Values, rets: Values) raises:
     params.append(1 if has_w else 0)
     params.append(1 if has_b else 0)
     params.append(1 if has_mean else 0)
-    params.append(1 if out_cl else 0)
+    # The NHWC elementwise pass reads the channels-last input itself.
+    params.append(a.ptr if out_cl else 0)
     call.tuple(params)
     call.int(ctx_ptr(ctx))
     call.run()

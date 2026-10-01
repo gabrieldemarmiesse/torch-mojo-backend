@@ -24,6 +24,7 @@ from std.os import abort
 
 from tmb.kernels.normalization_forward.batch_norm_kernels import (
     enqueue_batch_norm_elementwise,
+    enqueue_batch_norm_elementwise_nhwc,
     enqueue_batch_norm_stats,
 )
 from tmb.kernels.normalization_forward.kernels import (
@@ -219,8 +220,8 @@ def _batch_norm_infer_go(
     # the elementwise kernel emits them from the prologue it already runs.
     var save_mean_addr = _raw_tuple_int(params, 6)
     var save_invstd_addr = _raw_tuple_int(params, 7)
-    # Optional ninth slot: write the output channels-last.
-    var out_cl = _raw_tuple_len(params) > 8 and _raw_tuple_int(params, 8) != 0
+    # Optional ninth slot: input and output are dense channels-last.
+    var nhwc = _raw_tuple_len(params) > 8 and _raw_tuple_int(params, 8) != 0
     if channels <= 0 or inner <= 0 or planes <= 0:
         raise Error("batch norm geometry must be positive")
     if out_addr == 0 or in_addr == 0 or mean_addr == 0 or var_addr == 0:
@@ -241,24 +242,41 @@ def _batch_norm_infer_go(
                     and _dtype_arg_on[2, pt]()
                 ):
                     handled = True
-                    enqueue_batch_norm_elementwise[dt, pt, st, False](
-                        out_addr,
-                        in_addr,
-                        mean_addr,
-                        var_addr,
-                        weight_addr,
-                        bias_addr,
-                        eps,
-                        channels,
-                        inner,
-                        planes,
-                        has_weight,
-                        has_bias,
-                        ctx,
-                        save_mean_addr,
-                        save_invstd_addr,
-                        out_cl,
-                    )
+                    if nhwc:
+                        enqueue_batch_norm_elementwise_nhwc[dt, pt, st, False](
+                            out_addr,
+                            in_addr,
+                            mean_addr,
+                            var_addr,
+                            weight_addr,
+                            bias_addr,
+                            eps,
+                            channels,
+                            inner * planes,
+                            has_weight,
+                            has_bias,
+                            ctx,
+                            save_mean_addr,
+                            save_invstd_addr,
+                        )
+                    else:
+                        enqueue_batch_norm_elementwise[dt, pt, st, False](
+                            out_addr,
+                            in_addr,
+                            mean_addr,
+                            var_addr,
+                            weight_addr,
+                            bias_addr,
+                            eps,
+                            channels,
+                            inner,
+                            planes,
+                            has_weight,
+                            has_bias,
+                            ctx,
+                            save_mean_addr,
+                            save_invstd_addr,
+                        )
     if not handled:
         raise Error("unsupported dtype combination for batch norm inference")
 
@@ -294,8 +312,11 @@ def _batch_norm_train_go(
     var has_weight = _raw_tuple_int(params, 5) != 0
     var has_bias = _raw_tuple_int(params, 6) != 0
     var has_running = _raw_tuple_int(params, 7) != 0
-    # Optional ninth slot: write the output channels-last.
-    var out_cl = _raw_tuple_len(params) > 8 and _raw_tuple_int(params, 8) != 0
+    # Optional ninth slot: the dense channels-last input the elementwise
+    # pass reads (output channels-last too), 0 for NCHW.
+    var nhwc_in_addr = (
+        _raw_tuple_int(params, 8) if _raw_tuple_len(params) > 8 else 0
+    )
     if channels <= 0 or runs <= 0 or hxw <= 0:
         raise Error("batch norm geometry must be positive")
     if out_addr == 0 or in_addr == 0:
@@ -335,24 +356,44 @@ def _batch_norm_train_go(
                     # The saved statistics are float32 whatever the input is
                     # (ATen's `acc_type`), and the second one is already the
                     # inverse standard deviation.
-                    enqueue_batch_norm_elementwise[dt, pt, DType.float32, True](
-                        out_addr,
-                        in_addr,
-                        save_mean_addr,
-                        save_invstd_addr,
-                        weight_addr,
-                        bias_addr,
-                        eps,
-                        channels,
-                        hxw,
-                        runs * channels,
-                        has_weight,
-                        has_bias,
-                        ctx,
-                        0,
-                        0,
-                        out_cl,
-                    )
+                    if nhwc_in_addr != 0:
+                        # The statistics read the contiguous copy; the
+                        # elementwise pass reads the channels-last input
+                        # where it lies and writes channels-last.
+                        enqueue_batch_norm_elementwise_nhwc[
+                            dt, pt, DType.float32, True
+                        ](
+                            out_addr,
+                            nhwc_in_addr,
+                            save_mean_addr,
+                            save_invstd_addr,
+                            weight_addr,
+                            bias_addr,
+                            eps,
+                            channels,
+                            hxw * runs * channels,
+                            has_weight,
+                            has_bias,
+                            ctx,
+                        )
+                    else:
+                        enqueue_batch_norm_elementwise[
+                            dt, pt, DType.float32, True
+                        ](
+                            out_addr,
+                            in_addr,
+                            save_mean_addr,
+                            save_invstd_addr,
+                            weight_addr,
+                            bias_addr,
+                            eps,
+                            channels,
+                            hxw,
+                            runs * channels,
+                            has_weight,
+                            has_bias,
+                            ctx,
+                        )
     if not handled:
         raise Error("unsupported dtype combination for batch norm training")
 
