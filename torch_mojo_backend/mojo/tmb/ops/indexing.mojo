@@ -107,6 +107,7 @@ from tmb.ops.data_movement import (
     _materialize_contiguous,
     _scatter_into,
     _scatter_launch,
+    _copy_self_into_out,
     _scatter_validate,
     check_self_copy,
     index_put_slice,
@@ -1602,26 +1603,27 @@ def _scatter_reduce_op(
         # copies self in after the resize.
         _check_out_of(out, a, index, src)
         check_self_copy(out, a)
-        if same_view(out, a):
-            _scatter_red_or_fill(
-                out, a, dim, index, src, value, ivalue, red, include_self, what
-            )
-        else:
-            var res = own(_materialize_contiguous(a))
-            _scatter_red_or_fill(
-                res.t,
-                a,
-                dim,
-                index,
-                src,
-                value,
-                ivalue,
-                red,
-                include_self,
-                what,
-            )
-            _write_result(out, res.t, what)
-            _ = res^
+        # ATen's sequence on the caller's tensor: resize, copy self in
+        # unless the out IS self, then scatter -- re-reading every input
+        # after the resize, which may have moved a storage they share.
+        _copy_self_into_out(out, a, what)
+        var a2 = T(a.h)
+        var index2 = T(index.h)
+        var src2 = Optional[T](None)
+        if src:
+            src2 = T(src.value().h)
+        _scatter_red_or_fill(
+            out,
+            a2,
+            dim,
+            index2,
+            src2,
+            value,
+            ivalue,
+            red,
+            include_self,
+            what,
+        )
         ret_ref(rets, 0, out)
         return
     if in_place:
@@ -1924,13 +1926,18 @@ def _index_reduce_op(
         assert_no_overlap(post, index)
         assert_no_overlap(post, source)
         check_self_copy(out, a)
-        if same_view(out, a):
-            _index_reduce_into(out, a, dim, index, source, red, include_self)
-        else:
-            var res = own(_materialize_contiguous(a))
-            _index_reduce_into(res.t, a, dim, index, source, red, include_self)
-            _write_result(out, res.t, "index_reduce")
-            _ = res^
+        # ATen's sequence on the caller's tensor: resize, copy self in
+        # unless the out IS self, then reduce, re-reading the inputs.
+        _copy_self_into_out(out, a, "index_reduce")
+        _index_reduce_into(
+            out,
+            T(a.h),
+            dim,
+            T(index.h),
+            T(source.h),
+            red,
+            include_self,
+        )
         ret_ref(rets, 0, out)
         return
     if in_place:

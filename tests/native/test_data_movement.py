@@ -3290,3 +3290,123 @@ _OVERLAP_ROWS.update(_OVERLAP_ROWS_MORE)
 @pytest.mark.parametrize("row", list(_OVERLAP_ROWS_MORE))
 def test_overlap_order_table_more(mojo_device, row):
     test_overlap_order_table(mojo_device, row)
+
+
+# Aliasing outs that pass the checks: ATen's literal sequence (resize, copy
+# self in / zero, then the kernel) on the caller's tensor. Expected values
+# recorded from stock CUDA torch 2.11.
+def _t(d: str, v: list[float] | list[int]) -> torch.Tensor:
+    return torch.tensor(v, device=d)
+
+
+def _alias_scatter_reduce(d: str) -> torch.Tensor:
+    src = _t(d, [2.0, 3.0])
+    torch.scatter_reduce(
+        torch.zeros(2, device=d), 0, _t(d, [0, 1]), src, "sum", out=src[:0]
+    )
+    return src
+
+
+def _alias_scatter_reduce_two_out(d: str) -> torch.Tensor:
+    x = torch.arange(100.0, 105.0, device=d)
+    torch.scatter_reduce(x[2:4] * 0 + 101, 0, _t(d, [0, 1]), x[2:4], "sum", out=x[:0])
+    return x
+
+
+def _alias_bilinear_bwd(d: str) -> torch.Tensor:
+    g = torch.ones(1, 1, 2, 2, device=d)
+    _A.upsample_bilinear2d_backward.grad_input(
+        g, [2, 2], [1, 1, 2, 2], False, None, None, grad_input=g.flatten()[:0]
+    )
+    return g
+
+
+def _alias_scatter_add(d: str) -> torch.Tensor:
+    src = _t(d, [2.0, 3.0])
+    torch.scatter_add(torch.zeros(2, device=d), 0, _t(d, [0, 1]), src, out=src[:0])
+    return src
+
+
+def _alias_scatter_src(d: str) -> torch.Tensor:
+    src = _t(d, [2.0, 3.0])
+    torch.scatter(torch.zeros(2, device=d), 0, _t(d, [1, 0]), src, out=src[:0])
+    return src
+
+
+def _alias_gather(d: str) -> torch.Tensor:
+    x = torch.arange(6.0, device=d)
+    torch.gather(x[3:6], 0, _t(d, [2, 1, 0]), out=x[:0])
+    return x
+
+
+def _alias_index_select(d: str) -> torch.Tensor:
+    x = torch.arange(6.0, device=d)
+    torch.index_select(x[1:4], 0, _t(d, [2, 1, 0]), out=x[:0])
+    return x
+
+
+def _alias_cat(d: str) -> torch.Tensor:
+    x = torch.arange(8.0, device=d)
+    torch.cat([x[::2][:2], x[1::2][:2]], out=x[:0])
+    return x
+
+
+def _alias_linear1d_bwd(d: str) -> torch.Tensor:
+    g = torch.ones(1, 1, 4, device=d)
+    _A.upsample_linear1d_backward.grad_input(
+        g, [4], [1, 1, 4], False, None, grad_input=g.flatten()[:0]
+    )
+    return g
+
+
+def _alias_pad_bwd(d: str) -> torch.Tensor:
+    g = torch.ones(1, 1, 4, 4, device=d)
+    _A.reflection_pad2d_backward.grad_input(
+        g, torch.empty(1, 1, 4, 4, device=d), [0, 0, 0, 0], grad_input=g.flatten()[:0]
+    )
+    return g
+
+
+def _alias_nearest2d_bwd_same(d: str) -> torch.Tensor:
+    g = torch.arange(4.0, device=d).view(1, 1, 2, 2)
+    _A.upsample_nearest2d_backward.grad_input(
+        g, [2, 2], [1, 1, 2, 2], None, None, grad_input=g.flatten()[:0]
+    )
+    return g
+
+
+def _alias_nearest1d(d: str) -> torch.Tensor:
+    b = torch.arange(32.0, device=d)
+    _A.upsample_nearest1d.out(b[:8].view(1, 1, 8), [16], None, out=b[:0])
+    return b
+
+
+_ALIASING_ROWS = {
+    "scatter_reduce_copies_self_first": (_alias_scatter_reduce, [0.0, 0.0]),
+    "scatter_reduce_two_out_reads_src_after_copy": (
+        _alias_scatter_reduce_two_out,
+        [203.0, 204.0, 102.0, 103.0, 104.0],
+    ),
+    "bilinear2d_bwd_zeroes_then_copies": (_alias_bilinear_bwd, [0.0] * 4),
+    "scatter_add_out": (_alias_scatter_add, [0.0, 0.0]),
+    "scatter_src_out": (_alias_scatter_src, [0.0, 0.0]),
+    "gather_out": (_alias_gather, [5.0, 4.0, 3.0, 3.0, 4.0, 5.0]),
+    "index_select_small_index_in_order": (
+        _alias_index_select,
+        [3.0, 2.0, 2.0, 3.0, 4.0, 5.0],
+    ),
+    "cat_inputs_in_order": (_alias_cat, [0.0, 2.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+    "linear1d_bwd_zeroes_aliased_grad": (_alias_linear1d_bwd, [0.0] * 4),
+    "reflection_pad_bwd_zeroes_aliased_grad": (_alias_pad_bwd, [0.0] * 16),
+    "nearest2d_bwd_same_size_copy": (_alias_nearest2d_bwd_same, [0.0, 1.0, 2.0, 3.0]),
+    "nearest1d_reads_after_resize": (
+        _alias_nearest1d,
+        [float(v // 2) for v in range(16)] + [float(v) for v in range(16, 32)],
+    ),
+}
+
+
+@pytest.mark.parametrize("row", list(_ALIASING_ROWS))
+def test_aliasing_out_follows_aten_sequence(mojo_device, row):
+    fn, expected = _ALIASING_ROWS[row]
+    assert fn(mojo_device).cpu().flatten().tolist() == expected
