@@ -177,10 +177,10 @@ def test_out_overloads(mojo_gpu):
     assert aten._cdist_forward.out(d(a), d(b), 3.0, None, out=out) is out
     torch.testing.assert_close(out.cpu(), dist)
     grad = torch.randn(3, 5)
-    out = torch.empty(3, 4, dtype=torch.float64, device=mojo_gpu)
+    out = torch.empty(3, 4, dtype=torch.float16, device=mojo_gpu)
     aten._cdist_backward.out(d(grad), d(a), d(b), 3.0, d(dist), out=out)
     torch.testing.assert_close(
-        out.cpu(), aten._cdist_backward(grad, a, b, 3.0, dist).double()
+        out.cpu(), aten._cdist_backward(grad, a, b, 3.0, dist).half()
     )
     pd = aten._pdist_forward(b, 1.0)
     out = torch.empty(0, device=mojo_gpu)
