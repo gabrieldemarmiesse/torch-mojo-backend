@@ -52,6 +52,7 @@ from tmb.backend.abi import (
     call_op,
     tensor_arg,
     bool_arg,
+    none_arg,
     new_like_dtype,
     new_scalar,
     view_strided,
@@ -141,6 +142,29 @@ def op_empty_memory_format(
             rank,
             stype,
             device,
+        ),
+    )
+
+
+# aten::_make_dep_token(*, ScalarType? dtype=None, Layout? layout=None,
+#   Device? device=None, bool? pin_memory=None,
+#   MemoryFormat? memory_format=None) -> Tensor
+def op_make_dep_token(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """ATen's CPU kernel (the only one upstream has): `at::empty({}, ...)`,
+    a 0-d placeholder that orders `_functional_assert_async` calls."""
+    if v_bool_or(args[unsafe_offset=3], False):
+        raise Error("Only dense CPU tensors can be pinned")
+    var stype = v_dtype_or(args[unsafe_offset=0], default_dtype())
+    var device = _target_device(args[unsafe_offset=2])
+    var shape = IndexList[MAX_RANK](1)
+    var mf = v_memory_format_or(args[unsafe_offset=4], MEMORY_FORMAT_CONTIGUOUS)
+    ret_tensor(
+        rets,
+        0,
+        new_strided(
+            shape, strides_for_memory_format(shape, 0, mf), 0, stype, device
         ),
     )
 
@@ -636,10 +660,35 @@ def _aten_view(site: Site, name: StaticString) raises:
     )
 
 
+# aten::_copy_from_and_resize(Tensor self, Tensor dst) -> Tensor
+def op_copy_from_and_resize(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """What a CPU fallback uses to write a result back (MPS's kernel):
+    `dst.resize_as_(self)`, then `dst.copy_(self)`."""
+    var src = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _ = call_op(
+        "aten::resize_as_",
+        "",
+        [tensor_arg(dst), tensor_arg(src), none_arg()],
+        1,
+    )
+    _ = call_op(
+        "aten::copy_",
+        "",
+        [tensor_arg(dst), tensor_arg(src), bool_arg(False)],
+        1,
+    )
+    ret_ref(rets, 0, dst)
+
+
 def register_core(site: Site) raises:
     impl[op_empty_memory_format, "empty.memory_format"](site)
     impl[op_empty_strided, "empty_strided"](site)
     impl[op_copy_from, "_copy_from"](site)
+    impl[op_copy_from_and_resize, "_copy_from_and_resize"](site)
+    impl[op_make_dep_token, "_make_dep_token"](site)
     # The four metadata-only views are ATen's own kernels, registered through
     # the shim (`_unsafe_view` is CompositeExplicitAutograd upstream and would
     # work unregistered, but the test suite counts native calls per op).

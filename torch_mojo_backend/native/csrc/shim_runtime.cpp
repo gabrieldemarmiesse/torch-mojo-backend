@@ -622,6 +622,7 @@ void* tmb_tensor_storage_ctx(TmbTensor t) {
   return dp.get_deleter() == &MojoAllocator::deleter ? dp.get_context() : nullptr;
 }
 int64_t tmb_tensor_storage_nbytes(TmbTensor t) { return static_cast<int64_t>(T(t).storage().nbytes()); }
+void* tmb_tensor_storage_impl(TmbTensor t) { return T(t).storage().unsafeGetStorageImpl(); }
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
 int32_t tmb_tensor_is_neg(TmbTensor t) { return T(t).is_neg(); }
 void* tmb_tensor_impl(TmbTensor t) { return T(t).unsafeGetTensorImpl(); }

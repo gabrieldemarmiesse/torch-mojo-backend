@@ -242,8 +242,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "qr": ("float32",),
     "quantile": ("float32",),
     "renorm": ("float32", "bfloat16", "float16"),
-    "resize_": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "resize_as_": ("float32", "bfloat16", "float16", "int64", "bool"),
     "scatter": ("float32", "bfloat16", "float16", "int64", "bool"),
     "scatter_reduce_amax": ("float32", "bfloat16", "float16", "int64", "bool"),
     "scatter_reduce_amin": ("float32", "bfloat16", "float16", "int64", "bool"),

@@ -60,6 +60,7 @@ from tmb.backend.abi import (
     own,
     own_if_new,
     release,
+    ret_bool,
     ret_owned,
     ret_ref,
     set_sizes_strides,
@@ -637,6 +638,42 @@ def _upload_from_cpu(
         _ = casted
     _ = contiguous_cpu
     return out^
+
+
+# aten::from_file(str filename, bool? shared=None, int? size=0, *,
+#   ScalarType? dtype=None, Layout? layout=None, Device? device=None,
+#   bool? pin_memory=None) -> Tensor
+def op_from_file(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """Upstream has only a CPU kernel: read the file there, then upload.
+    `shared=True` maps the file into host memory so writes reach it; a device
+    copy cannot keep that promise, so it is declined."""
+    if v_bool_or(args[unsafe_offset=1], False):
+        unsupported(
+            "from_file: shared=True maps the file into host memory, which"
+            " the mojo device cannot share"
+        )
+    if v_bool_or(args[unsafe_offset=6], False):
+        raise Error("Only dense CPU tensors can be pinned")
+    var index = v_device_index(args[unsafe_offset=5])
+    var target = index if index >= 0 else current_device()
+    var read = call_op(
+        "aten::from_file",
+        "",
+        [
+            args[unsafe_offset=0].copy(),
+            bool_arg(False),
+            args[unsafe_offset=2].copy(),
+            args[unsafe_offset=3].copy(),
+            args[unsafe_offset=4].copy(),
+            Value(TAG_DEVICE, 0, Int64(DEVICE_TYPE_CPU), -1),
+            none_arg(),
+        ],
+        1,
+    )
+    var host = own(read.take_tensor(0))
+    var out = own(_upload_from_cpu(host.t, host.t.stype, target, False))
+    _ = host^  # read by the upload above
+    ret_owned(rets, 0, out)
 
 
 # aten::_to_copy(Tensor self, *, ScalarType? dtype=None, Layout? layout=None,
@@ -3037,6 +3074,127 @@ def op_set_source_tensor(
     ret_ref(rets, 0, self_t)
 
 
+# aten::set_(Tensor(a!) self) -> Tensor(a!)
+def op_set_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """ATen's `set_cuda_`: a fresh zero-byte storage on self's device, sizes
+    [0], strides [1], offset 0; the dtype is kept."""
+    var self_t = v_tensor(args[unsafe_offset=0])
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = 0
+    var fresh = own(new_tensor(shape, 1, self_t.stype, self_t.device))
+    check(
+        external_call["tmb_tensor_set_storage", Int32](self_t.h, fresh.t.h),
+        "tmb_tensor_set_storage",
+    )
+    _ = fresh^
+    set_sizes_strides(self_t, shape, contiguous_strides(shape, 1), 1, 0)
+    ret_ref(rets, 0, self_t)
+
+
+# aten::is_set_to(Tensor self, Tensor tensor) -> bool
+def op_is_set_to(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """TensorProperties.cpp: the same StorageImpl, storage offset, sizes and
+    strides."""
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var same = (
+        external_call["tmb_tensor_storage_impl", Int](a.h)
+        == external_call["tmb_tensor_storage_impl", Int](b.h)
+        and a.offset == b.offset
+        and a.rank == b.rank
+    )
+    if same:
+        for d in range(a.rank):
+            if a.dim(d) != b.dim(d) or a.stride(d) != b.stride(d):
+                same = False
+                break
+    ret_bool(rets, 0, same)
+
+
+comptime _INT64_MAX = 9223372036854775807
+
+
+def _sizes_list_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
+    var s = String("[")
+    for i in range(rank):
+        if i:
+            s += ", "
+        s += String(shape[MAX_RANK - rank + i])
+    return s + "]"
+
+
+# aten::resize_(Tensor(a!) self, SymInt[] size, *,
+#   MemoryFormat? memory_format=None) -> Tensor(a!)
+def op_resize_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """ATen's `resize_cuda_` (cuda/Resize.cpp, Resize.h): a new shape keeps
+    the storage offset and takes contiguous strides, growing the storage
+    (bytes kept up to the old size) only when the elements reach past its
+    end; an unchanged shape keeps its strides. A memory format then restrides
+    (`empty_tensor_restride`)."""
+    var self_t = v_tensor(args[unsafe_offset=0])
+    var sizes = IntList(args[unsafe_offset=1])
+    var rank = len(sizes)
+    if rank > MAX_RANK:
+        unsupported("resize_: rank above the mojo device limit")
+    var shape = IndexList[MAX_RANK](1)
+    for i in range(rank):
+        shape[MAX_RANK - rank + i] = sizes[i]
+    var offset = self_t.offset
+    var same = self_t.rank == rank
+    if same:
+        for i in range(rank):
+            if self_t.dim(i) != sizes[i]:
+                same = False
+                break
+    if not same:
+        # c10's safe_compute_numel (a negative extent is a huge uint64),
+        # then computeStorageNbytesContiguous.
+        var numel = 1
+        var overflow = False
+        var has_zero = False
+        for i in range(rank):
+            var e = sizes[i]
+            if e == 0:
+                has_zero = True
+            elif e < 0 or numel > _INT64_MAX // e:
+                overflow = True
+            else:
+                numel *= e
+        if has_zero:
+            numel = 0
+        elif overflow:
+            raise Error("numel: integer multiplication overflow")
+        if numel > (_INT64_MAX // self_t.itemsize) - offset:
+            raise Error(
+                "Storage size calculation overflowed with sizes=",
+                _sizes_list_str(shape, rank),
+            )
+        var nbytes = (numel + offset) * self_t.itemsize
+        if numel > 0 and nbytes > self_t.storage_nbytes():
+            check(
+                external_call["tmb_storage_resize", Int32](
+                    self_t.h, Int64(nbytes)
+                ),
+                "tmb_storage_resize",
+            )
+        set_sizes_strides(
+            self_t, shape, contiguous_strides(shape, rank), rank, offset
+        )
+    var mf_v = args[unsafe_offset=2].copy()
+    if mf_v.tag != TAG_NONE:
+        var mf = v_memory_format_or(mf_v, MEMORY_FORMAT_PRESERVE)
+        if mf == MEMORY_FORMAT_PRESERVE:
+            raise Error("Unsupported memory formatPreserve")
+        set_sizes_strides(
+            self_t,
+            shape,
+            strides_for_memory_format(shape, rank, mf),
+            rank,
+            offset,
+        )
+    ret_ref(rets, 0, self_t)
+
+
 def _set_storage(
     self_t: T,
     source: StorageArg,
@@ -3233,6 +3391,10 @@ def register_data_movement(site: Site) raises:
     impl[op_masked_select, "masked_select"](site)
     impl[op_masked_select_out, "masked_select.out"](site)
     impl[op_set_source_tensor, "set_.source_Tensor"](site)
+    impl[op_set_, "set_"](site)
+    impl[op_is_set_to, "is_set_to"](site)
+    impl[op_resize_, "resize_"](site)
+    impl[op_from_file, "from_file"](site)
     impl[op_set_source_storage, "set_.source_Storage"](site)
     impl[op_set_source_storage_offset, "set_.source_Storage_storage_offset"](
         site
