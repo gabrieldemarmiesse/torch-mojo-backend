@@ -8,8 +8,10 @@
 # comparison. Indices and offsets arrive as int64 (the op promotes them);
 # offset2bag, bag_size and max_indices are written as int64.
 #
-# An index outside [0, numRows) is skipped and raises the int32 flag at
-# `err` (CUDA device-asserts), which the op reads back and raises.
+# Four int32 flags at `err`, read back and raised by the op: [0] an index
+# outside [0, numRows) (skipped; CUDA device-asserts), [1] decreasing
+# offsets, [2] offsets[-1] > len(indices), [3] offsets[0] != 0 (CPU's
+# check_arguments; the bounds are clamped so neither is ever followed).
 # ===----------------------------------------------------------------------=== #
 
 from std.math import pow
@@ -94,19 +96,33 @@ def _embedding_bag_kernel[
     num_rows: Int64,
     psw_stride: Int64,
     has_psw: Int64,
+    num_offsets: Int64,
 ):
     comptime acc_t = _acc_dtype[dtype]()
     var features = Int(feature_size)
     var total = Int(num_bags) * features
+    var n = Int(num_indices)
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var step = Int(grid_dim.x) * Int(block_dim.x)
+    if i == 0 and num_offsets > 0:
+        # check_arguments (EmbeddingBag.cpp) on the raw offsets.
+        if offsets[unsafe_offset=0] != 0:
+            err[unsafe_offset=3] = 1
+        if offsets[unsafe_offset=Int(num_offsets) - 1] > num_indices:
+            err[unsafe_offset=2] = 1
     while i < total:
         var bag = i // features
         var feature = i - bag * features
+        # Every bound clamped into [0, n]: a bad offset is reported, never
+        # followed out of `indices` / `offset2bag`.
         var begin = 0 if bag == 0 else Int(offsets[unsafe_offset=bag])
-        var end = Int(num_indices)
+        var end = n
         if bag < Int(num_bags) - 1:
             end = Int(offsets[unsafe_offset=bag + 1])
+        if end < begin:
+            err[unsafe_offset=1] = 1
+        begin = min(max(begin, 0), n)
+        end = min(max(end, begin), n)
         var col = feature * Int(weight_stride1)
         var count = 0
         if mode == MODE_MAX:
@@ -115,7 +131,7 @@ def _embedding_bag_kernel[
             for emb in range(begin, end):
                 var word = Int(indices[unsafe_offset=emb])
                 if word < 0 or word >= Int(num_rows):
-                    err[] = 1
+                    err[unsafe_offset=0] = 1
                     continue
                 var pad = word == Int(padding_idx)
                 var v = weight[unsafe_offset=word * Int(weight_stride0) + col]
@@ -134,7 +150,7 @@ def _embedding_bag_kernel[
             for emb in range(begin, end):
                 var word = Int(indices[unsafe_offset=emb])
                 if word < 0 or word >= Int(num_rows):
-                    err[] = 1
+                    err[unsafe_offset=0] = 1
                     continue
                 var pad = word == Int(padding_idx)
                 var v = weight[unsafe_offset=word * Int(weight_stride0) + col]
@@ -156,8 +172,6 @@ def _embedding_bag_kernel[
             if mode == MODE_MEAN and count != 0:
                 acc = acc / Scalar[acc_t](count)
             output[unsafe_offset=i] = acc.cast[dtype]()
-        if end < begin:
-            err[] = 2
         bag_size[unsafe_offset=bag] = Int64(count)
         i += step
 
@@ -173,7 +187,7 @@ def _embedding_bag_go(
     weight_o: Arg,
     err_o: Arg,
     # (num_indices, num_bags, feature_size, weight_stride0, weight_stride1,
-    #  mode, padding_idx, num_rows, psw_stride, has_psw)
+    #  mode, padding_idx, num_rows, psw_stride, has_psw, num_offsets)
     params: Arg,
     dtype_o: Arg,
     ctx_o: Arg,
@@ -233,6 +247,7 @@ def _embedding_bag_go(
                         Int64(_raw_tuple_int(params, 7)),
                         Int64(_raw_tuple_int(params, 8)),
                         Int64(_raw_tuple_int(params, 9)),
+                        Int64(_raw_tuple_int(params, 10)),
                     )
     if not handled:
         raise Error("EmbeddingBagForward: unsupported dtype ", dtype)
@@ -240,7 +255,8 @@ def _embedding_bag_go(
 
 # ---------------------------------------------------------------------------
 # EmbeddingRenorm: ATen's `renorm_kernel` (native/cuda/Embedding.cu) with one
-# thread per (already unique, in-range) row instead of one block: the row's
+# thread per (already unique, wrapped) row instead of one block -- a row
+# outside [0, num_weights) is skipped and raises the int32 flag `err`: the row's
 # p-norm in the accumulator dtype (|x| for p=1, x*x for p=2, pow(x, p)
 # otherwise -- no abs, as upstream), and when it exceeds max_norm the row
 # is scaled by `max_norm / (norm + 1e-7)` rounded to the dtype first.
@@ -256,7 +272,9 @@ def _embedding_renorm_kernel[
 ](
     weights: Pointer[Scalar[dtype], MutAnyOrigin],
     rows: Pointer[Int64, MutAnyOrigin],
+    err: Pointer[Int32, MutAnyOrigin],
     num_rows: Int64,
+    num_weights: Int64,
     dim: Int64,
     stride0: Int64,
     stride1: Int64,
@@ -267,7 +285,12 @@ def _embedding_renorm_kernel[
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var step = Int(grid_dim.x) * Int(block_dim.x)
     while i < Int(num_rows):
-        var base = Int(rows[unsafe_offset=i]) * Int(stride0)
+        var row = rows[unsafe_offset=i]
+        if row < 0 or row >= num_weights:
+            err[] = 1  # CUDA device-asserts; the op raises
+            i += step
+            continue
+        var base = Int(row) * Int(stride0)
         var v = Scalar[acc_t](0)
         for k in range(Int(dim)):
             var x = weights[unsafe_offset=base + k * Int(stride1)].cast[acc_t]()
@@ -279,17 +302,36 @@ def _embedding_renorm_kernel[
                 v += pow(x, norm_type)
         var norm = pow(v, Scalar[acc_t](1) / norm_type)
         if norm > max_norm:
-            var factor = (max_norm / (norm + Scalar[acc_t](1e-7))).cast[dtype]()
-            for k in range(Int(dim)):
-                var at = base + k * Int(stride1)
-                weights[unsafe_offset=at] = weights[unsafe_offset=at] * factor
+            # `max_norm / (norm + 1e-7)`: the double literal promotes the
+            # quotient to double on CUDA (Metal has no double: float there).
+            comptime if has_apple_gpu_accelerator():
+                var factor = (max_norm / (norm + Scalar[acc_t](1e-7))).cast[
+                    dtype
+                ]()
+                for k in range(Int(dim)):
+                    var at = base + k * Int(stride1)
+                    weights[unsafe_offset=at] = (
+                        weights[unsafe_offset=at] * factor
+                    )
+            else:
+                var factor = (
+                    max_norm.cast[DType.float64]()
+                    / (norm.cast[DType.float64]() + 1e-7)
+                ).cast[dtype]()
+                for k in range(Int(dim)):
+                    var at = base + k * Int(stride1)
+                    weights[unsafe_offset=at] = (
+                        weights[unsafe_offset=at] * factor
+                    )
         i += step
 
 
 def _embedding_renorm_go(
     weights_o: Arg,
     rows_o: Arg,
+    err_o: Arg,
     num_rows_o: Arg,
+    num_weights_o: Arg,
     dim_o: Arg,
     stride0_o: Arg,
     stride1_o: Arg,
@@ -324,7 +366,11 @@ def _embedding_renorm_go(
                         _make_ptr[DType.int64](
                             _raw_int(rows_o)
                         ).as_unsafe_any_origin(),
+                        _make_ptr[DType.int32](
+                            _raw_int(err_o)
+                        ).as_unsafe_any_origin(),
                         Int64(num_rows),
+                        Int64(_raw_int(num_weights_o)),
                         Int64(_raw_int(dim_o)),
                         Int64(_raw_int(stride0_o)),
                         Int64(_raw_int(stride1_o)),
@@ -333,6 +379,169 @@ def _embedding_renorm_go(
                     )
     if not handled:
         raise Error("EmbeddingRenorm: unsupported dtype ", dtype)
+
+
+# ---------------------------------------------------------------------------
+# EmbeddingBagBackwardSorted: the sum / mean weight gradient of
+# `embedding_bag_backward_cuda_sum_avg` (native/cuda/EmbeddingBag.cu +
+# EmbeddingBackwardKernel.cu), deterministic as CUDA's two-pass route: the
+# indices are stably sorted beforehand (`sorted`, with `perm` the original
+# positions), and one thread per (weight row, feature) finds its row's run by
+# binary search and sums it in CUDA's order -- partial sums of
+# NROWS_PER_THREAD consecutive entries (compute_grad_weight_bags), then the
+# partials in order (sum_and_scatter). Each entry adds
+# `grad[bag] (/ bag_size) * (1 / count) * per_sample_weight` in the
+# accumulator dtype; padding_idx and untouched rows stay 0.
+# ---------------------------------------------------------------------------
+
+comptime NROWS_PER_THREAD = 10
+
+
+@__name(t"embedding_bag_bwd_sorted_{dtype}_t{GS_THREADS}")
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GS_THREADS))
+)
+def _embedding_bag_backward_kernel[
+    dtype: DType
+](
+    grad_weight: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad: Pointer[Scalar[dtype], MutAnyOrigin],
+    sorted: Pointer[Int64, MutAnyOrigin],
+    perm: Pointer[Int64, MutAnyOrigin],
+    offset2bag: Pointer[Int64, MutAnyOrigin],
+    bag_size: Pointer[Int64, MutAnyOrigin],
+    psw: Pointer[Scalar[dtype], MutAnyOrigin],
+    num_indices: Int64,
+    num_weights: Int64,
+    feature_size: Int64,
+    mode_mean: Int64,
+    has_psw: Int64,
+    psw_stride: Int64,
+    scale_by_freq: Int64,
+    padding_idx: Int64,
+):
+    comptime acc_t = _acc_dtype[dtype]()
+    var features = Int(feature_size)
+    var n = Int(num_indices)
+    var total = Int(num_weights) * features
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var step = Int(grid_dim.x) * Int(block_dim.x)
+    while i < total:
+        var row = i // features
+        var feature = i - row * features
+        var result = Scalar[acc_t](0)
+        if row != Int(padding_idx):
+            # [lo, hi): the run of `row` in the sorted indices.
+            var lo = 0
+            var hi = n
+            while lo < hi:
+                var mid = (lo + hi) >> 1
+                if Int(sorted[unsafe_offset=mid]) < row:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            var first = lo
+            hi = n
+            while lo < hi:
+                var mid = (lo + hi) >> 1
+                if Int(sorted[unsafe_offset=mid]) <= row:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            var last = lo
+            var freq = Scalar[acc_t](1)
+            if scale_by_freq != 0:
+                # CUDA's `1.0 / count` is a double quotient; Metal has no
+                # double, so it divides in the accumulator there.
+                comptime if has_apple_gpu_accelerator():
+                    freq = Scalar[acc_t](1) / Scalar[acc_t](last - first)
+                else:
+                    freq = (1.0 / Float64(last - first)).cast[acc_t]()
+            var start = first
+            while start < last:
+                var partial = Scalar[acc_t](0)
+                for k in range(start, min(start + NROWS_PER_THREAD, last)):
+                    var orig = Int(perm[unsafe_offset=k])
+                    var bag = Int(offset2bag[unsafe_offset=orig])
+                    var scale = freq
+                    if has_psw != 0:
+                        scale *= psw[unsafe_offset=orig * Int(psw_stride)].cast[
+                            acc_t
+                        ]()
+                    var g = grad[unsafe_offset=bag * features + feature].cast[
+                        acc_t
+                    ]()
+                    if mode_mean != 0:
+                        g /= Scalar[acc_t](Int(bag_size[unsafe_offset=bag]))
+                    partial = g.fma(scale, partial)
+                result += partial
+                start += NROWS_PER_THREAD
+        grad_weight[unsafe_offset=i] = result.cast[dtype]()
+        i += step
+
+
+def _embedding_bag_backward_go(
+    grad_weight_o: Arg,
+    grad_o: Arg,
+    sorted_o: Arg,
+    perm_o: Arg,
+    offset2bag_o: Arg,
+    bag_size_o: Arg,
+    psw_o: Arg,
+    # (num_indices, num_weights, feature_size, mode_mean, has_psw,
+    #  psw_stride, scale_by_freq, padding_idx)
+    params: Arg,
+    dtype_o: Arg,
+    ctx_o: Arg,
+) raises:
+    var dtype = _raw_dtype_int(dtype_o)
+    var ctx = _raw_ctx(ctx_o)
+    var num_weights = _raw_tuple_int(params, 1)
+    var feature_size = _raw_tuple_int(params, 2)
+    var handled = False
+    comptime for dt in BAG_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                handled = True
+                comptime if not has_accelerator():
+                    raise Error("no GPU accelerator available at compile time")
+                elif dt == DType.float64 and has_apple_gpu_accelerator():
+                    raise Error("float64 is not supported on Apple GPU")
+                else:
+                    _enqueue_cached[_embedding_bag_backward_kernel[dt]](
+                        ctx,
+                        _gs_blocks(num_weights * feature_size),
+                        1,
+                        1,
+                        GS_THREADS,
+                        _make_ptr[dt](
+                            _raw_int(grad_weight_o)
+                        ).as_unsafe_any_origin(),
+                        _make_ptr[dt](_raw_int(grad_o)).as_unsafe_any_origin(),
+                        _make_ptr[DType.int64](
+                            _raw_int(sorted_o)
+                        ).as_unsafe_any_origin(),
+                        _make_ptr[DType.int64](
+                            _raw_int(perm_o)
+                        ).as_unsafe_any_origin(),
+                        _make_ptr[DType.int64](
+                            _raw_int(offset2bag_o)
+                        ).as_unsafe_any_origin(),
+                        _make_ptr[DType.int64](
+                            _raw_int(bag_size_o)
+                        ).as_unsafe_any_origin(),
+                        _make_ptr[dt](_raw_int(psw_o)).as_unsafe_any_origin(),
+                        Int64(_raw_tuple_int(params, 0)),
+                        Int64(num_weights),
+                        Int64(feature_size),
+                        Int64(_raw_tuple_int(params, 3)),
+                        Int64(_raw_tuple_int(params, 4)),
+                        Int64(_raw_tuple_int(params, 5)),
+                        Int64(_raw_tuple_int(params, 6)),
+                        Int64(_raw_tuple_int(params, 7)),
+                    )
+    if not handled:
+        raise Error("EmbeddingBagBackwardSorted: unsupported dtype ", dtype)
 
 
 @export
@@ -346,8 +555,13 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
                 argv, argc
             )
             return 0
+        comptime if _op_on["EmbeddingBagBackwardSorted"]():
+            _spec_dispatcher10[
+                _embedding_bag_backward_go, "EmbeddingBagBackwardSorted"
+            ](argv, argc)
+            return 0
         comptime if _op_on["EmbeddingRenorm"]():
-            _spec_dispatcher10[_embedding_renorm_go, "EmbeddingRenorm"](
+            _spec_dispatcher12[_embedding_renorm_go, "EmbeddingRenorm"](
                 argv, argc
             )
             return 0

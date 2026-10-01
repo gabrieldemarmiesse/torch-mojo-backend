@@ -145,6 +145,7 @@ COVERS |= {
     "aten::index_copy_": "test_index_copy (the same scatter, into self)",
     "aten::index_copy.out": "test_index_copy (a copy of self, then the same scatter)",
     "aten::masked_scatter_": "test_masked_scatter",
+    "aten::_unique2": "test_unique",
     "aten::repeat_interleave.Tensor": "test_repeat_interleave",
     "aten::unfold_backward": "test_unfold_backward",
     "aten::linspace.out": "test_linspace",
@@ -204,19 +205,15 @@ SKIPPED: dict[str, str] = {
     "aten::narrow_copy.out": (
         "a narrow view's strided copy (test_copy_row_strided's kernel), copied into out"
     ),
-    **{
-        f"aten::{name}": (
-            "data-dependent output: a host round trip through the CPU kernel "
-            "of the same op, no device kernel"
-        )
-        for name in (
-            "_unique",
-            "_unique2",
-            "unique_dim",
-            "unique_consecutive",
-            "unique_dim_consecutive",
-        )
-    },
+    "aten::_unique": "test_unique's kernels without the counts",
+    "aten::unique_dim": (
+        "one stable sort per column plus test_unique's group passes: the "
+        "sorts dominate, and they are the reductions suite's"
+    ),
+    "aten::unique_consecutive": "test_unique's group passes without the sort",
+    "aten::unique_dim_consecutive": (
+        "test_unique's group passes over rows, then index_select"
+    ),
     "aten::fill_.Tensor": (
         "a one-element read of the value, then fill_.Scalar's fill kernel"
     ),
@@ -1006,4 +1003,27 @@ def test_eye(
         lambda: torch.eye(n, m, dtype=dtype, device=hw.stock_device),
         lambda: torch.eye(n, m, dtype=dtype, device=mojo_device),
         flops=float(n * m),
+    )
+
+
+UNIQUE_SHAPES: dict[str, tuple[int, int]] = {
+    "N_16777216_K1000000": (16_777_216, 1_000_000),
+    "N_357789_K97": (357_789, 97),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("i64", "f32"))
+@pytest.mark.parametrize("shape_id", UNIQUE_SHAPES)
+@pytest.mark.bench_op("_unique2")
+def test_unique(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """Sorted unique with inverse and counts: the sort, the group passes and
+    the one read of the group count, on both legs."""
+    n, k = UNIQUE_SHAPES[shape_id]
+    x_ref, x_our = both(torch.randint(0, k, (n,)).to(DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.unique(x_ref, return_inverse=True, return_counts=True),
+        lambda: torch.unique(x_our, return_inverse=True, return_counts=True),
+        flops=float(n),
     )

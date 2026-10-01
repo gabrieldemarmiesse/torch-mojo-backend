@@ -277,3 +277,83 @@ def test_embedding_bag_backward_rebuilds_offset2bag(mojo_device):
         torch.ops.aten._embedding_bag_backward(
             grad.to(mojo_device), *dev_args[:8], True, None
         )
+
+
+def test_embedding_bag_bad_offsets(mojo_device):
+    """CPU's check_arguments errors; the kernel clamps every bound, so a bad
+    offset is reported and never followed out of the index buffers."""
+    weight = torch.randn(5, 3, device=mojo_device)
+    idx = torch.tensor([0, 1, 2], device=mojo_device)
+    with pytest.raises(RuntimeError, match="offsets\\[0\\] has to be 0"):
+        F.embedding_bag(idx, weight, torch.tensor([1, 2], device=mojo_device))
+    with pytest.raises(
+        RuntimeError, match="offsets\\[-1\\] can not be greater than input's length 3"
+    ):
+        F.embedding_bag(idx, weight, torch.tensor([0, 9], device=mojo_device))
+    with pytest.raises(RuntimeError, match="offsets\\[-1\\] can not be greater"):
+        F.embedding_bag(
+            idx,
+            weight,
+            torch.tensor([0, 1, 4], device=mojo_device),
+            include_last_offset=True,
+        )
+    with pytest.raises(RuntimeError, match="non-decreasing"):
+        F.embedding_bag(idx, weight, torch.tensor([0, -5], device=mojo_device))
+    with pytest.raises(RuntimeError, match="non-decreasing"):
+        F.embedding_bag(idx, weight, torch.tensor([0, 2, 1], device=mojo_device))
+    with pytest.raises(RuntimeError, match="Long, Int"):
+        torch.ops.aten._embedding_bag_backward(
+            torch.ones(2, 3, device=mojo_device),
+            idx.float(),
+            torch.tensor([0, 1], device=mojo_device),
+            torch.empty(0, device=mojo_device).long(),
+            torch.tensor([1, 2], device=mojo_device),
+            torch.empty(0, device=mojo_device).long(),
+            5,
+            False,
+            0,
+            False,
+            None,
+        )
+
+
+def test_per_sample_weights_backward_rounds_half_products(mojo_device):
+    """CUDA multiplies grad and weight in the dtype: a half product beyond
+    65504 overflows to inf before the float sum, so +inf + -inf is NaN."""
+    grad = torch.tensor([[300.0, 300.0]], dtype=torch.float16)
+    weight = torch.tensor([[300.0, -300.0]], dtype=torch.float16)
+    i = torch.tensor([0])
+    got = torch.ops.aten._embedding_bag_per_sample_weights_backward(
+        grad.to(mojo_device),
+        weight.to(mojo_device),
+        i.to(mojo_device),
+        i.to(mojo_device),
+        i.to(mojo_device),
+        0,
+        -1,
+    )
+    # CUDA-faithful reference: products rounded to half, summed in float.
+    expected = (grad * weight).float().sum(1).half()
+    assert torch.isnan(expected).all()
+    torch.testing.assert_close(got.cpu(), expected, equal_nan=True)
+
+
+def test_embedding_bag_backward_is_deterministic(mojo_device):
+    g = torch.Generator().manual_seed(9)
+    weight = torch.randn(40, 16, generator=g)
+    indices = torch.randint(0, 40, (2000,), generator=g)
+    offsets = torch.arange(0, 2000, 20)
+    grad = torch.randn(100, 16, generator=g) * 1000
+    grads = []
+    before = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        for _ in range(2):
+            w = weight.to(mojo_device).requires_grad_(True)
+            F.embedding_bag(
+                indices.to(mojo_device), w, offsets.to(mojo_device)
+            ).backward(grad.to(mojo_device))
+            grads.append(_grad(w))
+    finally:
+        torch.use_deterministic_algorithms(before)
+    assert torch.equal(grads[0], grads[1])

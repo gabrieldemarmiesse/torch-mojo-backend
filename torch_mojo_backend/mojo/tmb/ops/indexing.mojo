@@ -106,6 +106,8 @@ from tmb.ops.data_movement import (
     _scatter_into,
     _scatter_launch,
     _scatter_validate,
+    scatter_add_sorted,
+    scatter_scalar,
     _strides_of,
 )
 from tmb.ops.factories import _arange_fill
@@ -1328,15 +1330,6 @@ def _reduce_dtype_check(a: T, red: Int, what: String) raises:
         unsupported("aten::" + what + " mean of a bool tensor")
 
 
-def _scalar_value(a: T, v: Value) raises -> Float64:
-    """A Scalar `value` as `a`'s dtype will hold it (range-checked)."""
-    if is_int_stype(a.stype):
-        return Float64(scalar_to_int(v, a.stype))
-    if a.dtype == DType.bool:
-        return 1.0 if v_f64(v) != 0.0 else 0.0
-    return scalar_to_float(v, a.stype)
-
-
 def _reduce_launch(
     target: T,
     dim_size: Int,
@@ -1350,6 +1343,7 @@ def _reduce_launch(
     include_self: Bool,
     what: String,
     ordered: Bool = False,
+    int_value: Optional[Int] = None,
 ) raises:
     """Reduce src (or the scalar `value`) into `target`, which holds self's
     values, over the index space `dims` (int64 `idx` read through
@@ -1385,25 +1379,42 @@ def _reduce_launch(
             rop,
             not add,
         )
-    _scatter_launch(
-        target,
-        _strides_of(target),
-        idx,
-        idx_strides,
-        src_ptr,
-        src_dtype,
-        src_strides,
-        dims,
-        dim,
-        dim_size,
-        not src,
-        value,
-        add,
-        what,
-        rop,
-        False,
-        ordered,
-    )
+    if add and src and target.dtype.is_floating_point() and not ordered:
+        # A floating sum takes the sorted, ordered route CUDA takes under
+        # deterministic algorithms (`_scatter_via_index_put`), always: the
+        # result does not depend on the atomics' interleaving.
+        scatter_add_sorted(
+            target,
+            idx,
+            idx_strides,
+            src.value(),
+            src_strides,
+            dims,
+            dim,
+            dim_size,
+            what,
+        )
+    else:
+        _scatter_launch(
+            target,
+            _strides_of(target),
+            idx,
+            idx_strides,
+            src_ptr,
+            src_dtype,
+            src_strides,
+            dims,
+            dim,
+            dim_size,
+            not src,
+            value,
+            add,
+            what,
+            rop,
+            False,
+            ordered,
+            int_value,
+        )
     if red != _RED_MEAN:
         return
     var counts = own(new_like(target))
@@ -1449,6 +1460,7 @@ def _scatter_reduce_into(
     index: T,
     src: Optional[T],
     value: Float64,
+    ivalue: Optional[Int],
     red: Int,
     include_self: Bool,
     what: String,
@@ -1470,6 +1482,7 @@ def _scatter_reduce_into(
         red,
         include_self,
         what,
+        int_value=ivalue,
     )
     _ = idx_c^
     _ = idx64^
@@ -1512,8 +1525,11 @@ def _scatter_reduce_op(
     var index = v_tensor(args[unsafe_offset=2])
     var src = Optional[T](None)
     var value = 0.0
+    var ivalue = Optional[Int](None)
     if is_scalar:
-        value = _scalar_value(a, args[unsafe_offset=src_pos])
+        var sv = scatter_scalar(a, args[unsafe_offset=src_pos])
+        value = sv[0]
+        ivalue = sv[1]
     else:
         src = v_tensor(args[unsafe_offset=src_pos])
     var red = 0
@@ -1525,33 +1541,55 @@ def _scatter_reduce_op(
     var dim = _scatter_validate(a, dim_in, index, src, False)
     if red != 0:
         _reduce_dtype_check(a, red, what)
-        if not is_scalar and (red == _RED_PROD or not new_options):
-            alert_not_deterministic("scatter_reduce_cuda_kernel")
+        # CUDA's alerts: prod always; the legacy add / multiply kernel
+        # unless a floating add took the deterministic index_put route
+        # (which this backend always takes).
+        if not is_scalar:
+            if red == _RED_PROD and new_options:
+                alert_not_deterministic("scatter_reduce_cuda_prod_")
+            elif not new_options and (
+                red == _RED_PROD or not a.dtype.is_floating_point()
+            ):
+                alert_not_deterministic("scatter_reduce_cuda_kernel")
     if out_pos >= 0:
         var out = v_tensor(args[unsafe_offset=out_pos])
         _check_out_of(out, a, index, src)
         if same_view(out, a):
             _scatter_red_or_fill(
-                out, a, dim, index, src, value, red, include_self, what
+                out, a, dim, index, src, value, ivalue, red, include_self, what
             )
         else:
             var res = own(_materialize_contiguous(a))
             _scatter_red_or_fill(
-                res.t, a, dim, index, src, value, red, include_self, what
+                res.t,
+                a,
+                dim,
+                index,
+                src,
+                value,
+                ivalue,
+                red,
+                include_self,
+                what,
             )
             _write_result(out, res.t, what)
             _ = res^
         ret_ref(rets, 0, out)
         return
     if in_place:
+        # scatter_meta_impl's overlap checks: the output is self.
+        assert_no_internal_overlap(a)
+        assert_no_overlap(a, index)
+        if src:
+            assert_no_overlap(a, src.value())
         _scatter_red_or_fill(
-            a, a, dim, index, src, value, red, include_self, what
+            a, a, dim, index, src, value, ivalue, red, include_self, what
         )
         ret_ref(rets, 0, a)
         return
     var res = own(_materialize_contiguous(a))
     _scatter_red_or_fill(
-        res.t, a, dim, index, src, value, red, include_self, what
+        res.t, a, dim, index, src, value, ivalue, red, include_self, what
     )
     ret_owned(rets, 0, res)
 
@@ -1563,17 +1601,26 @@ def _scatter_red_or_fill(
     index: T,
     src: Optional[T],
     value: Float64,
+    ivalue: Optional[Int],
     red: Int,
     include_self: Bool,
     what: String,
 ) raises:
     if red == 0:
         _scatter_into(
-            target, dim, _dim_or1(a, dim), index, src, value, not src, False
+            target,
+            dim,
+            _dim_or1(a, dim),
+            index,
+            src,
+            value,
+            not src,
+            False,
+            ivalue,
         )
     else:
         _scatter_reduce_into(
-            target, a, dim, index, src, value, red, include_self, what
+            target, a, dim, index, src, value, ivalue, red, include_self, what
         )
 
 
@@ -1835,6 +1882,10 @@ def _index_reduce_op(
         ret_ref(rets, 0, out)
         return
     if in_place:
+        # index_func_meta_impl's overlap checks: the output is self.
+        assert_no_internal_overlap(a)
+        assert_no_overlap(a, index)
+        assert_no_overlap(a, source)
         _index_reduce_into(a, a, dim, index, source, red, include_self)
         ret_ref(rets, 0, a)
         return
@@ -2024,124 +2075,16 @@ def op_fill__tensor(
     # where CUDA copies on the stream), then filled with fill_.Scalar's
     # conversion rules. Reading it first also covers a value aliasing self.
     var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+    if not value.on_mojo():
+        # A value on another device goes through `fill_(Scalar)`, whose
+        # `Scalar::to<scalar_t>()` raises on overflow; a same-device value
+        # is a `copy_`, which converts without a check.
+        if is_int_stype(t.stype):
+            _ = scalar_to_int(r[0], t.stype)
+        elif t.dtype.is_floating_point():
+            _ = scalar_to_float(r[0], t.stype)
     fill_value(t, r[0])
     ret_ref(rets, 0, t)
-
-
-# ---------------------------------------------------------------------------
-# _unique / _unique2 / unique_dim / unique_consecutive /
-# unique_dim_consecutive -- data-dependent output sizes, so the input
-# round-trips through the host like nonzero's: it is downloaded once, the
-# CPU kernel of the same op computes every output (always sorted: CUDA
-# ignores `sorted=False` too), and the outputs are uploaded. One blocking
-# read per call, as on CUDA, which reads the unique count back as well.
-# Outputs the call did not ask for (inverse / counts) are CPU's, which can
-# differ in shape from CUDA's (the Python API drops them).
-# ---------------------------------------------------------------------------
-
-
-def _to_host(t: T) raises -> Owned:
-    """A contiguous CPU copy of the mojo tensor `t` (blocking)."""
-    var c = own_if_new(contiguous(t), t)
-    var host = own(cpu_empty(c.t.shape, c.t.rank, c.t.stype))
-    if c.t.numel > 0:
-        var ctx = ctx_for(c.t.device)
-        copy_to_host(ctx, c.t.ptr, host.t.ptr, c.t.numel * c.t.itemsize)
-        _ = ctx
-    _ = c^
-    return host^
-
-
-def _to_device(host: T, device: Int) raises -> Owned:
-    """`host` (a CPU tensor) as a fresh contiguous tensor on `device`."""
-    var src = host.copy()
-    var made = Optional[Owned](None)
-    if not host.contig:
-        made = own(
-            _call1(
-                "aten::contiguous",
-                "",
-                [tensor_arg(host), Value(TAG_MEMORY_FORMAT, 0, 0, 0)],
-            )
-        )
-        src = made.value().t.copy()
-    var out = own(new_tensor(src.shape, src.rank, src.stype, device))
-    if out.t.numel > 0:
-        copy_from_host(
-            device,
-            ctx_for(device),
-            out.t.ptr,
-            src.ptr,
-            out.t.numel * out.t.itemsize,
-        )
-    _ = made^
-    return out^
-
-
-def _unique_on_host(
-    args: Values,
-    n_args: Int,
-    rets: Values,
-    n_rets: Int,
-    op: StaticString,
-    overload: StaticString,
-    sorted_pos: Int,
-) raises:
-    """Run `op` on a host copy of args[0] (the other arguments as given,
-    `sorted` forced True), then upload its `n_rets` tensors."""
-    var t = v_tensor(args[unsafe_offset=0])
-    if t.dtype == DType.float64 and ctx_for(t.device).api() == "metal":
-        unsupported("aten::" + String(op) + " of float64 on Apple GPU")
-    var host = _to_host(t)
-    var call_args = List[Value](capacity=n_args)
-    call_args.append(tensor_arg(host.t))
-    for i in range(1, n_args):
-        if i == sorted_pos:
-            call_args.append(bool_arg(True))
-        else:
-            call_args.append(args[unsafe_offset=i].copy())
-    var r = call_op(String("aten::") + op, String(overload), call_args^, n_rets)
-    for i in range(n_rets):
-        var h = own(r.take_tensor(i))
-        var d = _to_device(h.t, t.device)
-        ret_owned(rets, i, d)
-        _ = h^
-    _ = host^
-
-
-# aten::_unique(Tensor self, bool sorted=True, bool return_inverse=False)
-#   -> (Tensor, Tensor)
-def op_unique(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _unique_on_host(args, n_args, rets, 2, "_unique", "", 1)
-
-
-# aten::_unique2(Tensor self, bool sorted=True, bool return_inverse=False,
-#   bool return_counts=False) -> (Tensor, Tensor, Tensor)
-def op_unique2(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _unique_on_host(args, n_args, rets, 3, "_unique2", "", 1)
-
-
-# aten::unique_dim(Tensor self, int dim, bool sorted=True,
-#   bool return_inverse=False, bool return_counts=False)
-#   -> (Tensor, Tensor, Tensor)
-def op_unique_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _unique_on_host(args, n_args, rets, 3, "unique_dim", "", 2)
-
-
-# aten::unique_consecutive(Tensor self, bool return_inverse=False,
-#   bool return_counts=False, int? dim=None) -> (Tensor, Tensor, Tensor)
-def op_unique_consecutive(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _unique_on_host(args, n_args, rets, 3, "unique_consecutive", "", -1)
-
-
-# aten::unique_dim_consecutive(Tensor self, int dim, bool return_inverse=False,
-#   bool return_counts=False) -> (Tensor, Tensor, Tensor)
-def op_unique_dim_consecutive(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _unique_on_host(args, n_args, rets, 3, "unique_dim_consecutive", "", -1)
 
 
 def register_indexing(site: Site) raises:
@@ -2180,8 +2123,3 @@ def register_indexing(site: Site) raises:
     impl[op_index_tensor_out, "index.Tensor_out"](site)
     impl[op_narrow_copy_out, "narrow_copy.out"](site)
     impl[op_fill__tensor, "fill_.Tensor"](site)
-    impl[op_unique, "_unique"](site)
-    impl[op_unique2, "_unique2"](site)
-    impl[op_unique_dim, "unique_dim"](site)
-    impl[op_unique_consecutive, "unique_consecutive"](site)
-    impl[op_unique_dim_consecutive, "unique_dim_consecutive"](site)

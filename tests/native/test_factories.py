@@ -1509,3 +1509,10 @@ def test_randperm_generator_out_and_errors(mojo_gpu):
         torch.randperm(-1, out=out)
     with pytest.raises(RuntimeError, match="2049 for Half"):
         torch.randperm(3000, dtype=torch.float16, device=mojo_gpu)
+
+
+@pytest.mark.filterwarnings("ignore:torch.range is deprecated")
+def test_range_out_beyond_exact_double(mojo_gpu):
+    out = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+    torch.range(2**53 + 1, 2**53 + 3, 1, out=out)
+    assert out.cpu().tolist() == [2**53 + 1, 2**53 + 2, 2**53 + 3]

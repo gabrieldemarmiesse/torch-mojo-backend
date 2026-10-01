@@ -943,3 +943,203 @@ def test_unique_edges(mojo_device):
     _check(torch.unique_consecutive(y.to(mojo_device)), torch.unique_consecutive(y))
     with pytest.raises(IndexError, match="Dimension out of range"):
         torch.unique(torch.ones(2, 3).to(mojo_device), dim=4)
+
+
+# ---------------------------------------------------------------------------
+# review follow-ups: overlap, exact integer scalars, determinism, unique raw
+# outputs, fill_ overflow
+# ---------------------------------------------------------------------------
+
+
+def test_in_place_scatter_and_index_reduce_reject_overlap(mojo_device):
+    a = torch.arange(8.0, device=mojo_device)
+    idx = torch.tensor([0, 1], device=mojo_device)
+    for call in (
+        lambda: a.scatter_reduce_(0, idx, a[2:4], "sum"),
+        lambda: a.scatter_(0, idx, a[2:4], reduce="add"),
+        lambda: a.scatter_(0, idx, a[2:4]),
+        lambda: a.index_reduce_(0, idx, a[2:4], "amax"),
+    ):
+        with pytest.raises(RuntimeError, match="refer to a single memory location"):
+            call()
+    expanded = torch.zeros(1, device=mojo_device).expand(4)
+    with pytest.raises(RuntimeError, match="more than one element"):
+        expanded.scatter_(0, torch.tensor([0], device=mojo_device), 1.0)
+    with pytest.raises(RuntimeError, match="more than one element"):
+        expanded.index_reduce_(
+            0,
+            torch.tensor([0], device=mojo_device),
+            torch.ones(1, device=mojo_device),
+            "prod",
+        )
+
+
+@pytest.mark.parametrize("reduce", [None, "add", "multiply"])
+def test_scatter_int64_scalar_is_exact(mojo_device, reduce):
+    big = 2**53 + 1
+    x = torch.ones(3, dtype=torch.int64)
+    idx = torch.tensor([2])
+    kwargs = {} if reduce is None else {"reduce": reduce}
+    expected = x.scatter(0, idx, big, **kwargs)
+    _check(x.to(mojo_device).scatter(0, idx.to(mojo_device), big, **kwargs), expected)
+    y = x.to(mojo_device)
+    y.scatter_(0, idx.to(mojo_device), big, **kwargs)
+    _check(y, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("reduce", ["sum", "mean"])
+def test_scatter_reduce_sum_is_ordered_and_deterministic(mojo_device, dtype, reduce):
+    """A floating sum takes the sorted route (`_scatter_via_index_put`): the
+    same answer every run, each slot summed in index order, so it matches
+    CPU even where atomics would round differently; and it is allowed
+    under torch.use_deterministic_algorithms."""
+    g = torch.Generator().manual_seed(7)
+    x = torch.randn(20, 9, generator=g).to(dtype)
+    src = (torch.randn(300, 9, generator=g) * 100).to(dtype)
+    index = torch.randint(0, 20, (300, 9), generator=g)
+    expected = x.scatter_reduce(0, index, src, reduce)
+    before = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        first = x.to(mojo_device).scatter_reduce(
+            0, index.to(mojo_device), src.to(mojo_device), reduce
+        )
+        second = x.to(mojo_device).scatter_reduce(
+            0, index.to(mojo_device), src.to(mojo_device), reduce
+        )
+        legacy = x.to(mojo_device).scatter(
+            0, index.to(mojo_device), src.to(mojo_device), reduce="add"
+        )
+    finally:
+        torch.use_deterministic_algorithms(before)
+    _check(first, expected)
+    _check(second, expected)
+    _check(legacy, x.scatter(0, index, src, reduce="add"))
+
+
+def test_scatter_reduce_nondeterministic_alerts(mojo_device):
+    """CUDA alerts for prod, and for the legacy kernel's multiply and integer
+    add."""
+    d = torch.zeros(3, device=mojo_device)
+    i = torch.tensor([0], device=mojo_device)
+    before = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        with pytest.raises(RuntimeError, match="scatter_reduce_cuda_prod_"):
+            d.scatter_reduce(0, i, torch.ones(1, device=mojo_device), "prod")
+        with pytest.raises(RuntimeError, match="scatter_reduce_cuda_kernel"):
+            d.long().scatter(
+                0, i, torch.ones(1, dtype=torch.long, device=mojo_device), reduce="add"
+            )
+        with pytest.raises(RuntimeError, match="scatter_reduce_cuda_kernel"):
+            d.scatter(0, i, torch.ones(1, device=mojo_device), reduce="multiply")
+        # amax / amin are order-independent: no alert.
+        d.scatter_reduce(0, i, torch.ones(1, device=mojo_device), "amax")
+    finally:
+        torch.use_deterministic_algorithms(before)
+
+
+def _unique_reference(
+    op: str, x: torch.Tensor, *args: object
+) -> tuple[torch.Tensor, ...]:
+    """CPU torch's outputs, with CUDA's conventions where they differ:
+    outputs not asked for are empty (CPU fills them for the dim ops), and
+    `sorted=False` sorts (the flat CPU op hashes)."""
+    a = torch.ops.aten
+    if op == "_unique2":
+        return a._unique2(x, True, *args[1:])
+    if op == "_unique":
+        return a._unique(x, True, *args[1:])
+    out = tuple(getattr(a, op)(x, *args))
+    inverse, counts = (args[-2], args[-1])
+    empty = torch.empty(0, dtype=torch.int64)
+    return (out[0], out[1] if inverse else empty, out[2] if counts else empty)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.int64, torch.int8, torch.bool]
+)
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize("counts", [False, True])
+def test_unique_raw_aten_outputs(mojo_device, dtype, inverse, counts):
+    g = torch.Generator().manual_seed(3)
+    x = torch.randint(0, 3, (9, 4), generator=g).to(dtype)
+    x[4] = x[1]
+    a = torch.ops.aten
+    d = x.to(mojo_device)
+    cases = [
+        (
+            "unique_dim",
+            (0, True, inverse, counts),
+            lambda: a.unique_dim(d, 0, True, inverse, counts),
+        ),
+        (
+            "unique_dim",
+            (1, True, inverse, counts),
+            lambda: a.unique_dim(d, 1, True, inverse, counts),
+        ),
+        (
+            "unique_dim_consecutive",
+            (0, inverse, counts),
+            lambda: a.unique_dim_consecutive(d, 0, inverse, counts),
+        ),
+        (
+            "unique_dim_consecutive",
+            (-1, inverse, counts),
+            lambda: a.unique_dim_consecutive(d, -1, inverse, counts),
+        ),
+    ]
+    for op, args, run in cases:
+        with ran(f"aten::{op}"):
+            got = run()
+        for g_, e in zip(got, _unique_reference(op, x, *args), strict=True):
+            _check(g_, e)
+    with ran("aten::_unique2"):
+        got = a._unique2(d, False, inverse, counts)
+    expected = a._unique2(x, True, inverse, counts)
+    _check(got[0], expected[0])
+    if inverse:
+        _check(got[1], expected[1])
+    else:
+        assert got[1].numel() == 0
+    if counts or dtype == torch.bool:
+        # CUDA's bool route always counts.
+        _check(got[2], torch.ops.aten._unique2(x, True, False, True)[2])
+    else:
+        assert got[2].numel() == 0
+    got = a.unique_consecutive(d, inverse, counts, None)
+    expected = a.unique_consecutive(x, inverse, counts, None)
+    for g_, e in zip(got, expected, strict=True):
+        _check(g_, e)
+
+
+def test_unique_signed_zero_follows_cuda(mojo_device):
+    """A run keeps its first element, or its last when counts are asked for
+    (cub's run_length_encode)."""
+    x = torch.tensor([-0.0, 0.0, 1.0])
+    a = torch.ops.aten
+    d = x.to(mojo_device)
+    assert torch.signbit(a._unique2(d, True, False, False)[0].cpu()[0])
+    assert not torch.signbit(a._unique2(d, True, False, True)[0].cpu()[0])
+    assert torch.signbit(a.unique_consecutive(d, False, False, None)[0].cpu()[0])
+    assert not torch.signbit(a.unique_consecutive(d, False, True, None)[0].cpu()[0])
+
+
+def test_unique_dim_errors(mojo_device):
+    a = torch.ops.aten
+    with pytest.raises(IndexError, match="tensor has no dimensions"):
+        a.unique_dim(torch.tensor(3.0, device=mojo_device), 0)
+    with pytest.raises(RuntimeError, match="0 sized dimensions"):
+        a.unique_dim(torch.ones(2, 0, device=mojo_device), 0)
+    out = a.unique_dim(torch.ones(0, 3, device=mojo_device), 0)
+    assert out[0].shape == (0, 3)
+
+
+def test_fill_tensor_overflow(mojo_device):
+    x = torch.zeros(3, dtype=torch.int8, device=mojo_device)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        x.fill_(torch.tensor(300))
+    # A same-device value is a copy_: it converts without a check.
+    x.fill_(torch.tensor(300, device=mojo_device))
+    _check(x, torch.full((3,), 300).to(torch.int8))

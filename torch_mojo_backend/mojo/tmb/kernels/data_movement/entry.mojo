@@ -62,6 +62,8 @@ from tmb.kernels.common.op_utils import (
     _raw_tuple_len,
     _scratch_contig,
     _spec_dispatcher3,
+    _spec_dispatcher6,
+    _spec_dispatcher9,
     _spec_ptr,
     _t2d_tile,
     _transpose2d_kernel,
@@ -3594,6 +3596,8 @@ def _scatter_dim[
     value: Float64,
     rop: Int,
     ordered: Bool,
+    has_int: Bool,
+    int_value: Int,
     ctx: DeviceContext,
 ) raises:
     """`is_value`: 0 reads src, 1 writes the scalar `value`, 2 writes the
@@ -3605,6 +3609,10 @@ def _scatter_dim[
     var err_ptr = _make_ptr[DType.int32](err_addr)
     var has_err = err_addr != 0
     var scalar = value.cast[dtype]()
+    comptime if dtype.is_integral():
+        # An integer scalar arrives exactly, not through a double.
+        if has_int:
+            scalar = Scalar[dtype](int_value)
     if is_value == 2:
         scalar = _rop_identity[dtype](rop)
     var use_scalar = is_value != 0
@@ -3749,6 +3757,8 @@ def _scatter_dim_go[
     ctx_ptr: Arg,
     rop_o: Arg,
     ordered_o: Arg,
+    has_int_o: Arg,
+    int_value_o: Arg,
 ) raises:
     var out_addr = _raw_int(out_ptr)
     var index_addr = _raw_int(index_ptr)
@@ -3778,6 +3788,8 @@ def _scatter_dim_go[
     var ctx = _raw_ctx(ctx_ptr)
     var rop = _raw_int(rop_o)
     var ordered = _raw_int(ordered_o) != 0
+    var has_int = _raw_int(has_int_o) != 0
+    var int_value = _raw_int(int_value_o)
 
     var handled = False
     comptime for dt in SCATTER_DTYPES:
@@ -3812,6 +3824,8 @@ def _scatter_dim_go[
                     value,
                     rop,
                     ordered,
+                    has_int,
+                    int_value,
                     ctx,
                 )
                 handled = True
@@ -3935,11 +3949,188 @@ def _gather_rows_dispatcher(argv: Argv, argc: Int) raises:
     )
 
 
+# ---------------------------------------------------------------------------
+# The deterministic scatter-add of ATen's `_scatter_via_index_put`
+# (native/TensorAdvancedIndexing.cpp), what CUDA runs for a floating
+# scatter_reduce sum / mean or scatter(reduce="add") under
+# torch.use_deterministic_algorithms(True):
+#
+#   ScatterTargets    every index-space element's target offset in `out`
+#                     (-1 and the int32 error flag for an index outside
+#                     [0, dim_size)) and its offset in `src`
+#   (a stable sort of the targets, through the dispatcher)
+#   SortedSegmentAdd  one thread per run of equal targets adds the run's
+#                     values to `out` in index-space order, accumulating in
+#                     the dtype's opmath type (index_put's sorted kernel).
+#
+# The geometry tuple is ScatterDim's (rank-4 padded extents and strides).
+# ---------------------------------------------------------------------------
+
+
+def _scatter_targets_go(
+    tgt_o: Arg, srcoff_o: Arg, index_o: Arg, params: Arg, err_o: Arg, ctx_o: Arg
+) raises:
+    var tgt = _make_ptr[DType.int64](_raw_int(tgt_o))
+    var srcoff = _make_ptr[DType.int64](_raw_int(srcoff_o))
+    var index_ptr = _make_ptr[DType.int64](_raw_int(index_o))
+    var err_ptr = _make_ptr[DType.int32](_raw_int(err_o))
+    var d0 = _raw_tuple_int(params, 0)
+    var d1 = _raw_tuple_int(params, 1)
+    var d2 = _raw_tuple_int(params, 2)
+    var d3 = _raw_tuple_int(params, 3)
+    var os0 = _raw_tuple_int(params, 4)
+    var os1 = _raw_tuple_int(params, 5)
+    var os2 = _raw_tuple_int(params, 6)
+    var os3 = _raw_tuple_int(params, 7)
+    var ss0 = _raw_tuple_int(params, 8)
+    var ss1 = _raw_tuple_int(params, 9)
+    var ss2 = _raw_tuple_int(params, 10)
+    var ss3 = _raw_tuple_int(params, 11)
+    var xs0 = _raw_tuple_int(params, 12)
+    var xs1 = _raw_tuple_int(params, 13)
+    var xs2 = _raw_tuple_int(params, 14)
+    var xs3 = _raw_tuple_int(params, 15)
+    var dim_padded = _raw_tuple_int(params, 16)
+    var dim_size = _raw_tuple_int(params, 17)
+    var ctx = _raw_ctx(ctx_o)
+
+    @always_inline
+    @__parameter
+    @__copy_capture(
+        tgt,
+        srcoff,
+        index_ptr,
+        err_ptr,
+        d0,
+        d1,
+        d2,
+        d3,
+        os0,
+        os1,
+        os2,
+        os3,
+        ss0,
+        ss1,
+        ss2,
+        ss3,
+        xs0,
+        xs1,
+        xs2,
+        xs3,
+        dim_padded,
+        dim_size,
+    )
+    def func[width: Int, alignment: Int = 1](coord: Coord):
+        var i = Int(coord[0].value())
+        var i3 = i % d3
+        var rest = i // d3
+        var i2 = rest % d2
+        rest = rest // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        var target = Int(
+            index_ptr[unsafe_offset=i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3]
+        )
+        srcoff[unsafe_offset=i] = Int64(
+            i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
+        )
+        if target < 0 or target >= dim_size:
+            err_ptr[] = 1
+            tgt[unsafe_offset=i] = -1
+            return
+        var out_off = i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3
+        if dim_padded == 0:
+            out_off += (target - i0) * os0
+        elif dim_padded == 1:
+            out_off += (target - i1) * os1
+        elif dim_padded == 2:
+            out_off += (target - i2) * os2
+        else:
+            out_off += (target - i3) * os3
+        tgt[unsafe_offset=i] = Int64(out_off)
+
+    _parallel_for_dt[DType.int64, func](d0 * d1 * d2 * d3, ctx)
+
+
+@always_inline
+def _opmath[dtype: DType]() -> DType:
+    comptime if dtype == DType.float16 or dtype == DType.bfloat16:
+        return DType.float32
+    else:
+        return dtype
+
+
+def _sorted_segment_add_go(
+    out_o: Arg,
+    tgt_o: Arg,
+    perm_o: Arg,
+    srcoff_o: Arg,
+    src_o: Arg,
+    params: Arg,  # (n, is_value)
+    value_o: Arg,
+    dtype_o: Arg,
+    ctx_o: Arg,
+) raises:
+    var dtype = _raw_dtype_int(dtype_o)
+    var ctx = _raw_ctx(ctx_o)
+    var n = _raw_tuple_int(params, 0)
+    var is_value = _raw_tuple_int(params, 1) != 0
+    var value = _raw_f64(value_o)
+    var tgt = _make_ptr[DType.int64](_raw_int(tgt_o))
+    var perm = _make_ptr[DType.int64](_raw_int(perm_o))
+    var srcoff = _make_ptr[DType.int64](_raw_int(srcoff_o))
+    var handled = False
+    comptime for dt in [
+        DType.float32,
+        DType.float16,
+        DType.bfloat16,
+        DType.float64,
+    ]:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                handled = True
+                comptime acc_t = _opmath[dt]()
+                var out = _make_ptr[dt](_raw_int(out_o))
+                var src = _make_ptr[dt](_raw_int(src_o))
+                var scalar = value.cast[dt]()
+
+                @always_inline
+                @__parameter
+                @__copy_capture(
+                    out, src, scalar, tgt, perm, srcoff, is_value, n
+                )
+                def func[width: Int, alignment: Int = 1](coord: Coord):
+                    var i = Int(coord[0].value())
+                    var t = tgt[unsafe_offset=i]
+                    if t < 0 or (i > 0 and tgt[unsafe_offset=i - 1] == t):
+                        return
+                    var acc = out[unsafe_offset=Int(t)].cast[acc_t]()
+                    var j = i
+                    while j < n and tgt[unsafe_offset=j] == t:
+                        var v = scalar
+                        if not is_value:
+                            v = src[
+                                unsafe_offset=Int(
+                                    srcoff[
+                                        unsafe_offset=Int(perm[unsafe_offset=j])
+                                    ]
+                                )
+                            ]
+                        acc += v.cast[acc_t]()
+                        j += 1
+                    out[unsafe_offset=Int(t)] = acc.cast[dt]()
+
+                _parallel_for_dt[dt, func](n, ctx)
+    if not handled:
+        raise Error("SortedSegmentAdd: unsupported dtype ", dtype)
+
+
 def _scatter_dim_dispatcher[
     accumulate: Bool = False, rmw: Bool = False
 ](argv: Argv, argc: Int) raises:
     """Slots 0-8 as `_scatter_dim_go` names them; slot 9, the reduction of
-    ScatterReduceDim (`ROP_*`), and slot 10, `ordered`, are optional (0)."""
+    ScatterReduceDim (`ROP_*`), slot 10, `ordered`, and slots 11-12, an
+    exact integer scalar (has_int, value), are optional (0)."""
     var args = argv
     _scatter_dim_go[accumulate, rmw](
         args[unsafe_offset=0],
@@ -3953,6 +4144,8 @@ def _scatter_dim_dispatcher[
         args[unsafe_offset=8],
         args[unsafe_offset=9] if argc > 9 else Arg(0),
         args[unsafe_offset=10] if argc > 10 else Arg(0),
+        args[unsafe_offset=11] if argc > 11 else Arg(0),
+        args[unsafe_offset=12] if argc > 12 else Arg(0),
     )
 
 
@@ -4113,6 +4306,14 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["ScatterAddDim"]():
             _scatter_dim_dispatcher[accumulate=True](argv, argc)
+            return 0
+        comptime if _op_on["ScatterTargets"]():
+            _spec_dispatcher6[_scatter_targets_go, "ScatterTargets"](argv, argc)
+            return 0
+        comptime if _op_on["SortedSegmentAdd"]():
+            _spec_dispatcher9[_sorted_segment_add_go, "SortedSegmentAdd"](
+                argv, argc
+            )
             return 0
         comptime if _op_on["ScatterReduceDim"]():
             _scatter_dim_dispatcher[rmw=True](argv, argc)

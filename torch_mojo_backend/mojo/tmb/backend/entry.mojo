@@ -42,6 +42,7 @@ from tmb.ops.scans import register_scans
 from tmb.ops.stats import register_stats
 from tmb.ops.transformer import register_transformer
 from tmb.ops.unary import register_unary
+from tmb.ops.unique import register_unique
 from tmb.backend.pg import pg_vtable
 from tmb.backend.registry import Lib, RegisterFn, Site
 
@@ -61,6 +62,7 @@ def _register_ops(lib: Int) raises:
     _group[register_data_movement](lib)
     _group[register_factories](lib)
     _group[register_indexing](lib)
+    _group[register_unique](lib)
     _group[register_random](lib)
     _group[register_reductions](lib)
     _group[register_scans](lib)
