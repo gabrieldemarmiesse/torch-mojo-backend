@@ -34,6 +34,17 @@ CONV1D_SHAPES: dict[str, tuple[int, int, int, int, int, int, int]] = {
     "N4xC80xL3000_K384k3s1": (4, 80, 3000, 384, 3, 1, 1),
     "N8xC256xL357_K512k5s2": (8, 256, 357, 512, 5, 2, 2),
 }
+# (N, C_in, H, W, C_out, kernel, stride, padding, output_padding): a
+# transposed convolution is col2im(weight^T @ x), the conv data gradient.
+CONV_T_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int, int]] = {
+    "N16xC128x28x28_K64k4s2": (16, 128, 28, 28, 64, 4, 2, 1, 0),
+    "N4xC64x37x29_K32k3s2op1": (4, 64, 37, 29, 32, 3, 2, 1, 1),
+}
+# (N, C_in, D, H, W, C_out, kernel, stride, padding): the volumetric im2col.
+CONV3D_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int, int]] = {
+    "N4xC32x16x28x28_K64k3s1": (4, 32, 16, 28, 28, 64, 3, 1, 1),
+    "N2xC16x9x21x33_K24k3s2": (2, 16, 9, 21, 33, 24, 3, 2, 1),
+}
 # conv2d backward: the two forward geometries plus an awkward mid-network
 # shape and the deepest ResNet stage, where K = C*KH*KW outgrows N*OH*OW.
 CONV_BACKWARD_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int]] = {
@@ -121,7 +132,9 @@ _UPSAMPLE_TESTS = {
 }
 
 COVERS: dict[str, str] = {
-    "aten::convolution": "test_conv2d, test_conv1d (rank 3)",
+    "aten::convolution": (
+        "test_conv2d, test_conv1d (rank 3), test_conv_transpose2d, test_conv3d"
+    ),
     "aten::convolution_backward": "test_conv2d_backward",
     "aten::_adaptive_avg_pool2d": "test_adaptive_avg_pool2d",
     "aten::avg_pool2d": "test_avg_pool2d",
@@ -159,7 +172,35 @@ _OUT = (
     "out-variant plumbing over the benchmarked functional op (compute, then "
     "copy into the caller's tensor)"
 )
+_CONV_ENTRY = (
+    "a backend-specific convolution entry point (fixed groups / dilation / "
+    "transposition): the same im2col + GEMM route as aten::convolution, which "
+    "test_conv2d, test_conv3d and test_conv_transpose2d measure"
+)
 SKIPPED: dict[str, str] = {
+    **{
+        f"aten::{name}": _CONV_ENTRY
+        for name in (
+            "_conv_depthwise2d",
+            "_conv_depthwise2d.out",
+            "conv_depthwise3d",
+            "conv_depthwise3d.out",
+            "_slow_conv2d_forward",
+            "_slow_conv2d_forward.output",
+            "_slow_conv2d_backward.output_mask",
+            "_slow_conv2d_backward.grad_input",
+            "slow_conv3d_forward",
+            "slow_conv3d_forward.output",
+            "slow_conv_dilated2d",
+            "slow_conv_dilated2d.out",
+            "slow_conv_dilated3d",
+            "slow_conv_dilated3d.out",
+            "slow_conv_transpose2d",
+            "slow_conv_transpose2d.out",
+            "slow_conv_transpose3d",
+            "slow_conv_transpose3d.out",
+        )
+    },
     **{
         f"aten::{name}{suffix}": _UPSAMPLE_OUT
         for name in (
@@ -283,6 +324,49 @@ def test_conv1d(
     bench.run(
         lambda: F.conv1d(x_ref, w_ref, b_ref, stride, pad),
         lambda: F.conv1d(x_our, w_our, b_our, stride, pad),
+        flops=flops,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", CONV_T_SHAPES)
+@pytest.mark.bench_op("convolution")
+def test_conv_transpose2d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c_in, h, w, c_out, k, stride, pad, opad = CONV_T_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(n, c_in, h, w, dtype=dtype), hw, mojo_device)
+    w_ref, w_our = both(
+        torch.randn(c_in, c_out, k, k, dtype=dtype) * 0.1, hw, mojo_device
+    )
+    b_ref, b_our = both(torch.randn(c_out, dtype=dtype), hw, mojo_device)
+    flops = 2.0 * n * c_in * h * w * c_out * k * k
+    bench.run(
+        lambda: F.conv_transpose2d(x_ref, w_ref, b_ref, stride, pad, opad),
+        lambda: F.conv_transpose2d(x_our, w_our, b_our, stride, pad, opad),
+        flops=flops,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", CONV3D_SHAPES)
+@pytest.mark.bench_op("convolution")
+def test_conv3d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c_in, d, h, w, c_out, k, stride, pad = CONV3D_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(n, c_in, d, h, w, dtype=dtype), hw, mojo_device)
+    w_ref, w_our = both(
+        torch.randn(c_out, c_in, k, k, k, dtype=dtype) * 0.1, hw, mojo_device
+    )
+    b_ref, b_our = both(torch.randn(c_out, dtype=dtype), hw, mojo_device)
+    outs = [(e + 2 * pad - k) // stride + 1 for e in (d, h, w)]
+    flops = 2.0 * n * c_out * math.prod(outs) * c_in * k**3
+    bench.run(
+        lambda: F.conv3d(x_ref, w_ref, b_ref, stride, pad),
+        lambda: F.conv3d(x_our, w_our, b_our, stride, pad),
         flops=flops,
     )
 

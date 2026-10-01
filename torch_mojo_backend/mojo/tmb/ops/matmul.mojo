@@ -45,6 +45,7 @@ from tmb.backend.abi import (
     UNSUPPORTED_PREFIX,
     Value,
     Values,
+    ST_FLOAT32,
     bits_f64,
     call_op,
     contiguous_strides,
@@ -3897,54 +3898,102 @@ def op_addr(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # --- aten::convolution --------------------------------------------------------
 
 
-def _pair(xs: IntList) raises -> List[Int]:
-    """int[1] or int[2] as (h, w); empty when it is neither."""
-    var out = List[Int]()
-    if len(xs) == 1:
-        out.append(xs[0])
-        out.append(xs[0])
-    elif len(xs) == 2:
-        out.append(xs[0])
-        out.append(xs[1])
-    return out^
+def _list_str(xs: List[Int]) -> String:
+    """`[a, b, c]`, the way c10 streams an IntArrayRef."""
+    var s = String("[")
+    for i in range(len(xs)):
+        if i:
+            s += ", "
+        s += String(xs[i])
+    return s + "]"
+
+
+def _expand_param(
+    xs: List[Int], name: StaticString, dims: Int
+) raises -> List[Int]:
+    """`expand_param_if_needed` (ATen native/utils/ParamUtils.h): one value
+    stands for every spatial dimension, otherwise there must be one each."""
+    if len(xs) == 1 and dims != 1:
+        var out = List[Int]()
+        for _ in range(dims):
+            out.append(xs[0])
+        return out^
+    if len(xs) != dims:
+        raise Error(
+            "expected ",
+            name,
+            " to be a single integer value or a list of ",
+            dims,
+            " values to match the convolution dimensions, but got ",
+            name,
+            "=",
+            _list_str(xs),
+        )
+    return xs.copy()
 
 
 @fieldwise_init
 struct ConvGeom(Copyable, ImplicitlyCopyable, Movable):
-    """The geometry of one non-transposed convolution, as the 2-D path sees
-    it: a rank-3 (conv1d) operand has in_h = kh = out_h = 1 and stride 1,
-    padding 0, dilation 1 on that unit H axis."""
+    """The geometry of one NON-transposed convolution, the shape every kernel
+    here works in: `spatial` axes (1, 2 or 3) of an (N, C, [D,] [H,] W) input
+    and a (K, C/groups, [KD,] [KH,] KW) filter. Missing axes are unit axes
+    (extent 1, stride 1, padding 0, dilation 1): a rank-3 (conv1d) operand is
+    the planar path with in_h = kh = out_h = 1, a planar one the volumetric
+    path with in_d = kd = out_d = 1, so one set of fields serves all three.
 
-    var conv1d: Bool
+    A transposed convolution is run as the adjoint of the convolution whose
+    INPUT is its output: for that one `c` is its output channels, `out_c` its
+    input channels, `in_*` its output extents and `out_*` its input extents
+    (see `_conv_transpose_geometry`)."""
+
+    var spatial: Int
     var n: Int
     var c: Int
+    var in_d: Int
     var in_h: Int
     var in_w: Int
     var out_c: Int
     var c_per_group: Int
     var groups: Int
+    var kd: Int
     var kh: Int
     var kw: Int
+    var sd: Int
     var sh: Int
     var sw: Int
+    var pd: Int
     var ph: Int
     var pw: Int
+    var dd: Int
     var dh: Int
     var dw: Int
+    var out_d: Int
     var out_h: Int
     var out_w: Int
 
+    def vol(self) -> Bool:
+        """A volumetric (conv3d) geometry: its patch kernels carry a depth
+        axis."""
+        return self.spatial == 3
+
     def cols(self) -> Int:
         """Output pixels per sample: the im2col matrix's column count."""
-        return self.out_h * self.out_w
+        return self.out_d * self.out_h * self.out_w
+
+    def in_plane(self) -> Int:
+        """Input pixels per sample and channel."""
+        return self.in_d * self.in_h * self.in_w
+
+    def taps(self) -> Int:
+        return self.kd * self.kh * self.kw
 
     def ckk(self) -> Int:
-        """Patch rows over every group: C * KH * KW."""
-        return self.c * self.kh * self.kw
+        """Patch rows over every group: C * KD * KH * KW."""
+        return self.c * self.taps()
 
     def crs_g(self) -> Int:
         """Patch rows of one group (the weight's row length)."""
-        return self.c_per_group * self.kh * self.kw
+        return self.c_per_group * self.taps()
 
     def oc_g(self) -> Int:
         return self.out_c // self.groups
@@ -3953,28 +4002,43 @@ struct ConvGeom(Copyable, ImplicitlyCopyable, Movable):
         """A 1x1 stride-1 unpadded conv: the NCHW input already is the
         (C, H*W) patch matrix of each sample."""
         return (
-            self.kh == 1
+            self.kd == 1
+            and self.kh == 1
             and self.kw == 1
+            and self.sd == 1
             and self.sh == 1
             and self.sw == 1
+            and self.pd == 0
             and self.ph == 0
             and self.pw == 0
-            and self.dh == 1
-            and self.dw == 1
         )
 
-    def output_shape(self) -> List[Int]:
+    def _shape(self, ch: Int, d: Int, h: Int, w: Int) -> List[Int]:
         var out = List[Int]()
         out.append(self.n)
-        out.append(self.out_c)
-        if not self.conv1d:
-            out.append(self.out_h)
-        out.append(self.out_w)
+        out.append(ch)
+        if self.spatial == 3:
+            out.append(d)
+        if self.spatial >= 2:
+            out.append(h)
+        out.append(w)
         return out^
+
+    def output_shape(self) -> List[Int]:
+        return self._shape(self.out_c, self.out_d, self.out_h, self.out_w)
+
+    def input_shape(self) -> List[Int]:
+        return self._shape(self.c, self.in_d, self.in_h, self.in_w)
+
+    def patch_op(self, base: StaticString) -> String:
+        """The conv family's patch kernel `base`, volumetric when needed."""
+        if self.vol():
+            return String(base) + "3d"
+        return String(base)
 
     def patch_params(self) -> List[Int]:
         """The conv family's im2col / col2im params tuple."""
-        return [
+        var out: List[Int] = [
             self.in_h,
             self.in_w,
             self.out_h,
@@ -3990,92 +4054,323 @@ struct ConvGeom(Copyable, ImplicitlyCopyable, Movable):
             self.c,
             self.n,
         ]
+        if self.vol():
+            out.append(self.in_d)
+            out.append(self.out_d)
+            out.append(self.kd)
+            out.append(self.sd)
+            out.append(self.pd)
+            out.append(self.dd)
+        return out^
 
 
-def _conv_geometry(
-    input: T,
+@fieldwise_init
+struct ConvArgs(Copyable, Movable):
+    """The stride/padding/dilation/output_padding lists of one convolution,
+    expanded to one value per spatial axis (`_convolution`'s ConvParams)."""
+
+    var stride: List[Int]
+    var padding: List[Int]
+    var dilation: List[Int]
+    var output_padding: List[Int]
+    var transposed: Bool
+    var groups: Int
+
+
+def _conv_args(
     weight: T,
-    stride: IntList,
-    padding: IntList,
-    dilation: IntList,
+    stride: List[Int],
+    padding: List[Int],
+    dilation: List[Int],
     transposed: Bool,
+    output_padding: List[Int],
     groups: Int,
-) raises -> Optional[ConvGeom]:
-    """What the im2col + GEMM path supports, or None: a non-transposed rank-3
-    or rank-4 float convolution of non-empty operands on one device."""
-    if transposed or groups < 1:
-        return None
-    if input.stype != weight.stype or not _is_float(input.dtype):
-        return None
-    if input.device != weight.device:
-        return None
-    # Rank 3 (conv1d) is the 2-D path with a unit H axis: a contiguous
-    # (N, C, L) input / (K, C, S) weight already has the memory layout of
-    # (N, C, 1, L) / (K, C, 1, S), so it runs with in_h = kh = 1 and the one
-    # stride/padding/dilation on W, then returns (N, K, out_w).
-    var conv1d = input.rank == 3
-    if input.rank != weight.rank or (input.rank != 4 and not conv1d):
-        return None
-    var strides = _pair(stride)
-    var pads = _pair(padding)
-    var dils = _pair(dilation)
-    if conv1d:
-        if len(stride) != 1 or len(padding) != 1 or len(dilation) != 1:
-            return None
-        # H is the unit axis: kernel 1, stride 1, no padding, no dilation.
-        strides[0] = 1
-        pads[0] = 0
-        dils[0] = 1
-    if len(strides) != 2 or len(pads) != 2 or len(dils) != 2:
-        return None
-    var n = input.dim(0)
-    var c = input.dim(1)
-    var in_h = 1 if conv1d else input.dim(2)
-    var in_w = input.dim(input.rank - 1)
-    if n == 0 or c == 0 or in_h == 0 or in_w == 0:
-        return None
-    var out_c = weight.dim(0)
-    var c_per_group = weight.dim(1)
-    var kh = 1 if conv1d else weight.dim(2)
-    var kw = weight.dim(weight.rank - 1)
-    var sh = strides[0]
-    var sw = strides[1]
-    var ph = pads[0]
-    var pw = pads[1]
-    var dh = dils[0]
-    var dw = dils[1]
-    if sh <= 0 or sw <= 0 or dh <= 0 or dw <= 0:
-        return None
-    var out_h = (in_h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
-    var out_w = (in_w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
-    if c_per_group * groups != c or out_h <= 0 or out_w <= 0:
-        return None
-    if out_c % groups != 0:
-        return None
-    return ConvGeom(
-        conv1d,
-        n,
-        c,
-        in_h,
-        in_w,
-        out_c,
-        c_per_group,
+) raises -> ConvArgs:
+    """`at::_convolution`'s argument checks, in its order and with its
+    messages (ATen native/Convolution.cpp)."""
+    var dims = weight.rank - 2
+    if dims <= 0:
+        raise Error("weight should have at least three dimensions")
+    if groups <= 0:
+        raise Error("non-positive groups is not supported")
+    return ConvArgs(
+        _expand_param(stride, "stride", dims),
+        _expand_param(padding, "padding", dims),
+        _expand_param(dilation, "dilation", dims),
+        _expand_param(output_padding, "output_padding", dims),
+        transposed,
         groups,
-        kh,
-        kw,
-        sh,
-        sw,
-        ph,
-        pw,
-        dh,
-        dw,
-        out_h,
-        out_w,
+    )
+
+
+def _check_conv_shapes(
+    input: T, weight: T, bias: Optional[T], p: ConvArgs
+) raises:
+    """`check_shape_forward` and `check_input_same_type_as_parameters`
+    (ATen native/Convolution.cpp), messages included."""
+    var w_sizes = weight.logical_shape()
+    var in_sizes = input.logical_shape()
+    var k = input.rank
+    var groups = p.groups
+    for i in range(len(p.padding)):
+        if p.padding[i] < 0:
+            raise Error("negative padding is not supported")
+    for i in range(len(p.output_padding)):
+        if p.output_padding[i] < 0:
+            raise Error("negative output_padding is not supported")
+    for i in range(len(p.stride)):
+        if p.stride[i] <= 0:
+            raise Error("non-positive stride is not supported")
+    for i in range(len(p.dilation)):
+        if p.dilation[i] < 0:
+            raise Error("dilation should be greater than zero")
+    if weight.rank != k:
+        raise Error(
+            "Expected ",
+            weight.rank,
+            "-dimensional input for ",
+            weight.rank,
+            "-dimensional weight ",
+            _list_str(w_sizes),
+            ", but got ",
+            k,
+            "-dimensional input of size ",
+            _list_str(in_sizes),
+            " instead",
+        )
+    if w_sizes[0] < groups:
+        raise Error(
+            "Given groups=",
+            groups,
+            ", expected weight to be at least ",
+            groups,
+            " at dimension 0, but got weight of size ",
+            _list_str(w_sizes),
+            " instead",
+        )
+    if w_sizes[0] % groups != 0:
+        raise Error(
+            "Given groups=",
+            groups,
+            ", expected weight to be divisible by ",
+            groups,
+            " at dimension 0, but got weight of size [",
+            _list_str(w_sizes),
+            "] instead",
+        )
+    if not p.transposed:
+        if in_sizes[1] != w_sizes[1] * groups:
+            raise Error(
+                "Given groups=",
+                groups,
+                ", weight of size ",
+                _list_str(w_sizes),
+                ", expected input",
+                _list_str(in_sizes),
+                " to have ",
+                w_sizes[1] * groups,
+                " channels, but got ",
+                in_sizes[1],
+                " channels instead",
+            )
+        if bias:
+            var b = bias.value().copy()
+            if b.rank != 1 or b.dim(0) != w_sizes[0]:
+                raise Error(
+                    "Given weight of size ",
+                    _list_str(w_sizes),
+                    ", expected bias to be 1-dimensional with ",
+                    w_sizes[0],
+                    " elements, but got bias of size ",
+                    _list_str(b.logical_shape()),
+                    " instead",
+                )
+        var fits = True
+        var in_s = String()
+        var k_s = String()
+        for i in range(2, k):
+            var padded = in_sizes[i] + 2 * p.padding[i - 2]
+            var kernel = p.dilation[i - 2] * (w_sizes[i] - 1) + 1
+            if padded < kernel:
+                fits = False
+            if i > 2:
+                in_s += " x "
+                k_s += " x "
+            in_s += String(padded)
+            k_s += String(kernel)
+        if not fits:
+            raise Error(
+                "Calculated padded input size per channel: (",
+                in_s,
+                "). Kernel size: (",
+                k_s,
+                "). Kernel size can't be greater than actual input size",
+            )
+    else:
+        if in_sizes[1] != w_sizes[0]:
+            raise Error(
+                "Given transposed=1, weight of size ",
+                _list_str(w_sizes),
+                ", expected input",
+                _list_str(in_sizes),
+                " to have ",
+                w_sizes[0],
+                " channels, but got ",
+                in_sizes[1],
+                " channels instead",
+            )
+        if bias:
+            var b = bias.value().copy()
+            if b.rank != 1 or b.dim(0) != w_sizes[1] * groups:
+                raise Error(
+                    "Given transposed=1, weight of size ",
+                    _list_str(w_sizes),
+                    ", expected bias to be 1-dimensional with ",
+                    w_sizes[1] * groups,
+                    " elements, but got bias of size ",
+                    _list_str(b.logical_shape()),
+                    " instead",
+                )
+    if input.stype != weight.stype or input.device != weight.device:
+        raise Error(
+            "Input type (",
+            dtype_name(input.stype),
+            ") and weight type (",
+            dtype_name(weight.stype),
+            ") should be the same",
+        )
+    if bias and (
+        bias.value().stype != input.stype or bias.value().device != input.device
+    ):
+        raise Error(
+            "Input type (",
+            dtype_name(input.stype),
+            ") and bias type (",
+            dtype_name(bias.value().stype),
+            ") should be the same",
+        )
+
+
+def _unit_pad(xs: List[Int], spatial: Int, unit: Int) -> List[Int]:
+    """A per-axis list of `spatial` values as (d, h, w), unit axes first."""
+    var out = List[Int]()
+    for _ in range(3 - spatial):
+        out.append(unit)
+    for x in xs:
+        out.append(x)
+    return out^
+
+
+def _spatial_dims(t: T) -> List[Int]:
+    """t's spatial extents (every dim after N, C) as (d, h, w)."""
+    var xs = List[Int]()
+    for i in range(2, t.rank):
+        xs.append(t.dim(i))
+    return _unit_pad(xs, t.rank - 2, 1)
+
+
+def _conv_geometry(input: T, weight: T, p: ConvArgs) raises -> ConvGeom:
+    """The geometry of a checked convolution (`_check_conv_shapes`), whether
+    transposed or not; see ConvGeom for the transposed reading."""
+    var spatial = input.rank - 2
+    var st = _unit_pad(p.stride, spatial, 1)
+    var pad = _unit_pad(p.padding, spatial, 0)
+    var dil = _unit_pad(p.dilation, spatial, 1)
+    var kern = _spatial_dims(weight)
+    var x = _spatial_dims(input)
+    var n = input.dim(0)
+    if not p.transposed:
+        var out = List[Int]()
+        for i in range(3):
+            out.append(
+                (x[i] + 2 * pad[i] - (dil[i] * (kern[i] - 1) + 1)) // st[i] + 1
+            )
+        return ConvGeom(
+            spatial,
+            n,
+            input.dim(1),
+            x[0],
+            x[1],
+            x[2],
+            weight.dim(0),
+            weight.dim(1),
+            p.groups,
+            kern[0],
+            kern[1],
+            kern[2],
+            st[0],
+            st[1],
+            st[2],
+            pad[0],
+            pad[1],
+            pad[2],
+            dil[0],
+            dil[1],
+            dil[2],
+            out[0],
+            out[1],
+            out[2],
+        )
+    # Transposed: its output extent (`conv_input_size`) is the adjoint
+    # convolution's input; its input is that convolution's output.
+    var opad = _unit_pad(p.output_padding, spatial, 0)
+    var big = List[Int]()
+    for i in range(3):
+        big.append(
+            (x[i] - 1) * st[i]
+            - 2 * pad[i]
+            + dil[i] * (kern[i] - 1)
+            + opad[i]
+            + 1
+        )
+    return ConvGeom(
+        spatial,
+        n,
+        weight.dim(1) * p.groups,
+        big[0],
+        big[1],
+        big[2],
+        weight.dim(0),
+        weight.dim(1),
+        p.groups,
+        kern[0],
+        kern[1],
+        kern[2],
+        st[0],
+        st[1],
+        st[2],
+        pad[0],
+        pad[1],
+        pad[2],
+        dil[0],
+        dil[1],
+        dil[2],
+        x[0],
+        x[1],
+        x[2],
+    )
+
+
+def _conv_runs_here(input: T, g: ConvGeom) -> Bool:
+    """What the im2col + GEMM path computes: float operands on the mojo
+    device, every extent positive (`_conv_empty` handles the rest)."""
+    return (
+        _is_float(input.dtype)
+        and input.on_mojo()
+        and g.n > 0
+        and g.c > 0
+        and g.out_c > 0
+        and g.in_d > 0
+        and g.in_h > 0
+        and g.in_w > 0
+        and g.out_d > 0
+        and g.out_h > 0
+        and g.out_w > 0
     )
 
 
 def _conv_patches(
-    op: StaticString,
+    op: String,
     dst_ptr: Int,
     src_ptr: Int,
     g: ConvGeom,
@@ -4083,8 +4378,9 @@ def _conv_patches(
     cp: Int,
 ) raises:
     """One conv-family patch kernel: Im2col / Im2colPatchMajor (image ->
-    columns) or Col2im (patch-major columns -> image)."""
-    var call = KernelCall("conv", String(op))
+    columns) or Col2im (patch-major columns -> image), with a `3d` suffix for
+    a volumetric geometry."""
+    var call = KernelCall("conv", op)
     call.arg_dtype(0, dtype)
     call.out_dtype(dtype)
     call.int(dst_ptr)
@@ -4095,35 +4391,32 @@ def _conv_patches(
     call.run()
 
 
-def _conv_forward(
-    input: T,
-    weight: T,
-    bias: Optional[T],
-    stride: IntList,
-    padding: IntList,
-    dilation: IntList,
-    transposed: Bool,
-    groups: Int,
-) raises -> Optional[T]:
-    """Batched im2col + the pure-Mojo GEMM, with torch's (K, C, R, S) weight
-    used as-is and an NCHW output — no layout permutes, no cuDNN. Grouped
-    convolutions slice the channel-major im2col rows and the weights per group
-    with element offsets."""
-    var geom = _conv_geometry(
-        input, weight, stride, padding, dilation, transposed, groups
-    )
-    if not geom:
-        return None
-    var g = geom.value()
-    if bias:
-        if (
-            bias.value().stype != input.stype
-            or bias.value().rank != 1
-            or bias.value().dim(0) != g.out_c
-            or bias.value().device != input.device
-        ):
-            return None
+def _bias_add_channels(dst: T, bias: T, channels: Int, plane: Int) raises:
+    """dst (N, channels, plane...) += bias[channel], in place."""
+    var ctx = ctx_for(dst.device)
+    var cp = ctx_ptr(ctx)
+    var bt = Tmp(bias)
+    var ba = KernelCall("conv", "BiasAddChan")
+    ba.arg_dtype(0, dst.dtype)
+    ba.arg_dtype(1, bt.t.dtype)
+    ba.out_dtype(dst.dtype)
+    ba.int(dst.ptr)
+    ba.int(bt.t.ptr)
+    ba.tuple([plane, channels, dst.numel])
+    ba.int(dtype_code(dst.dtype))
+    ba.int(cp)
+    ba.run()
+    _ = bt^
+    _ = ctx
 
+
+def _conv_forward_geom(
+    input: T, weight: T, bias: Optional[T], g: ConvGeom
+) raises -> T:
+    """Batched im2col + the pure-Mojo GEMM, with torch's (K, C, [KD,] KH, KW)
+    weight used as-is and an N-channel-first output -- no layout permutes, no
+    cuDNN. Grouped convolutions slice the channel-major im2col rows and the
+    weights per group with element offsets. `input` has `g.input_shape()`."""
     var n = g.n
     var c = g.c
     var out_c = g.out_c
@@ -4141,11 +4434,13 @@ def _conv_forward(
         # Anything but a 1x1 stride-1 conv builds the patch matrix; for that
         # one case the NCHW input already is the col matrix.
         col = own(_new([n, ckk, cols], input.stype, device))
-        _conv_patches("Im2col", col.t.ptr, a.t.ptr, g, input.dtype, cp)
+        _conv_patches(
+            g.patch_op("Im2col"), col.t.ptr, a.t.ptr, g, input.dtype, cp
+        )
         col_ptr = col.t.ptr
 
     var out = own(_new(g.output_shape(), input.stype, device))
-    if groups == 1:
+    if g.groups == 1:
         var mm = KernelCall("matmul", "Bmm")
         mm.arg_dtype(0, weight.dtype)
         mm.arg_dtype(1, input.dtype)
@@ -4167,9 +4462,9 @@ def _conv_forward(
         # (crs_g, cols) slice; one offset GEMM per (sample, group).
         var crs_g = g.crs_g()
         var oc_g = g.oc_g()
-        var kk = g.kh * g.kw
+        var kk = g.taps()
         for s in range(n):
-            for gi in range(groups):
+            for gi in range(g.groups):
                 var mm = KernelCall("matmul", "Matmul")
                 mm.arg_dtype(0, weight.dtype)
                 mm.arg_dtype(1, input.dtype)
@@ -4193,23 +4488,108 @@ def _conv_forward(
                 mm.int(cp)
                 mm.run()
     if bias:
-        var bt = Tmp(bias.value())
-        var ba = KernelCall("conv", "BiasAddChan")
-        ba.arg_dtype(0, input.dtype)
-        ba.arg_dtype(1, bt.t.dtype)
-        ba.out_dtype(input.dtype)
-        ba.int(out.t.ptr)
-        ba.int(bt.t.ptr)
-        ba.tuple([cols, out_c, n * out_c * cols])
-        ba.int(dtype_code(input.dtype))
-        ba.int(cp)
-        ba.run()
-        _ = bt^
+        _bias_add_channels(out.t, bias.value(), out_c, cols)
     _ = ctx
     _ = a^
     _ = w^
     _ = col^
     return out.take()
+
+
+def _conv_transpose_forward(
+    input: T, weight: T, bias: Optional[T], g: ConvGeom
+) raises -> T:
+    """A transposed convolution is the data gradient of the convolution `g`
+    whose output has the transposed input's shape: col2im(weight^T @ x), the
+    same GEMM and col2im as `_conv_grad_input`, plus the bias.
+
+    A 16-bit transposed convolution runs in float32 and rounds once at the
+    end, as cuDNN's does (CUDA's default route): rounding the GEMM's columns
+    to the 16-bit type before col2im sums them, then the bias after, would
+    round two and three times."""
+    if input.stype != ST_FLOAT32:
+        var x32 = own_if_new(cast_to(input, ST_FLOAT32), input)
+        var w32 = own_if_new(cast_to(weight, ST_FLOAT32), weight)
+        var b32 = Optional[T](None)
+        var b_held = own(_empty_result(ST_FLOAT32, input.device))
+        if bias:
+            b_held = own(cast_to(bias.value(), ST_FLOAT32))
+            b32 = Optional[T](b_held.t.copy())
+        var r32 = own(_conv_transpose_forward(x32.t, w32.t, b32, g))
+        _ = x32^
+        _ = w32^
+        _ = b_held^
+        var out = cast_to(r32.t, input.stype)
+        _ = r32^
+        return out^
+    var ctx = ctx_for(input.device)
+    var cp = ctx_ptr(ctx)
+    var x3 = _channel_major(input, g.n, g.out_c, g.cols())
+    var x = own(_view(x3.t, [g.out_c, g.n * g.cols()]))
+    _ = x3^
+    var out = own(_conv_grad_input(weight, x.t, g, cp, g.input_shape()))
+    _ = x^
+    if bias:
+        _bias_add_channels(out.t, bias.value(), g.c, g.in_plane())
+    _ = ctx
+    return out.take()
+
+
+def _run_conv(input: T, weight: T, bias: Optional[T], p: ConvArgs) raises -> T:
+    """A checked convolution of a batched input, transposed or not."""
+    var g = _conv_geometry(input, weight, p)
+    var out_shape = g.input_shape() if p.transposed else g.output_shape()
+    for i in range(len(out_shape)):
+        if out_shape[i] < 0:
+            raise Error(
+                "Trying to create tensor with negative dimension ",
+                out_shape[i],
+                ": ",
+                _list_str(out_shape),
+            )
+    if not _is_float(input.dtype) or not input.on_mojo():
+        unsupported("convolution of " + dtype_name(input.stype) + " operands")
+    if input.dim(0) == 0 or input.dim(1) == 0:
+        # ATen's `ConvBackend::Empty`: no products at all. A zero-channel
+        # input gives an EMPTY output (its `input.view(-1) * weight` has no
+        # elements, then takes the output's shape with zero channels).
+        if input.dim(1) == 0:
+            out_shape[1] = 0
+        return _zeros(out_shape, input.stype, input.device)
+    if input.numel == 0:
+        raise Error(
+            (
+                "Only zero batch or zero channel inputs are supported, but got"
+                " input shape: "
+            ),
+            _list_str(input.logical_shape()),
+        )
+    if not _conv_runs_here(input, g):
+        # An empty output extent (a transposed conv of a degenerate size).
+        return _zeros(out_shape, input.stype, input.device)
+    if p.transposed:
+        return _conv_transpose_forward(input, weight, bias, g)
+    return _conv_forward_geom(input, weight, bias, g)
+
+
+def _conv_from_args(
+    input: T,
+    weight: T,
+    bias: Optional[T],
+    stride: List[Int],
+    padding: List[Int],
+    dilation: List[Int],
+    transposed: Bool,
+    output_padding: List[Int],
+    groups: Int,
+) raises -> T:
+    """`at::_convolution` for a batched input: argument and shape checks with
+    torch's messages, then the im2col + GEMM route."""
+    var p = _conv_args(
+        weight, stride, padding, dilation, transposed, output_padding, groups
+    )
+    _check_conv_shapes(input, weight, bias, p)
+    return _run_conv(input, weight, bias, p)
 
 
 # aten::convolution(Tensor input, Tensor weight, Tensor? bias, SymInt[] stride,
@@ -4219,19 +4599,18 @@ def op_convolution(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var input = v_tensor(args[unsafe_offset=0])
     var weight = v_tensor(args[unsafe_offset=1])
     var bias = _opt_tensor_arg(args[unsafe_offset=2])
-    var out = _conv_forward(
+    var out = _conv_from_args(
         input,
         weight,
         bias,
-        IntList(args[unsafe_offset=3]),
-        IntList(args[unsafe_offset=4]),
-        IntList(args[unsafe_offset=5]),
+        IntList(args[unsafe_offset=3]).to_list(),
+        IntList(args[unsafe_offset=4]).to_list(),
+        IntList(args[unsafe_offset=5]).to_list(),
         v_bool(args[unsafe_offset=6]),
+        IntList(args[unsafe_offset=7]).to_list(),
         v_int(args[unsafe_offset=8]),
     )
-    if not out:
-        unsupported("aten::convolution with these operands")
-    ret_tensor(rets, 0, out.value())
+    ret_tensor(rets, 0, out)
 
 
 # --- aten::convolution_backward -----------------------------------------------
@@ -4249,31 +4628,37 @@ def op_convolution(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # no per-sample partials to reduce afterwards. The only data movement beyond
 # the forward's is one permuting copy of grad_output (skipped when N == 1)
 # and col2im, im2col's adjoint.
+#
+# A transposed convolution swaps the roles: with `g` the convolution whose
+# input is the transposed output (ConvGeom), its input gradient is that
+# convolution's forward of grad_output, its weight gradient the weight
+# gradient of `g` with the transposed input as `g`'s output gradient.
 
 
-def _grad_output_patch_major(grad: T, g: ConvGeom) raises -> Owned:
-    """grad_output as a contiguous (K, N, OH*OW) buffer: its sample axis moved
-    inside the channel axis, so it reads as the (K, N*OH*OW) GEMM operand.
-    For N == 1 that already is NCHW's layout, and a contiguous grad_output is
-    used where it lies."""
-    if g.n == 1:
-        return own_if_new(contiguous(grad), grad)
-    var out = own(_new([g.out_c, g.n, g.cols()], grad.stype, grad.device))
-    # A (N, K, [OH,] OW) view of that buffer, strided so the copy lands each
-    # element at its patch-major place, whatever grad_output's own layout.
-    var dims = g.output_shape()
+def _channel_major(t: T, n: Int, ch: Int, plane: Int) raises -> Owned:
+    """An (N, ch, spatial...) tensor as a contiguous (ch, N, plane) buffer:
+    its sample axis moved inside the channel axis, so it reads as the
+    (ch, N*plane) GEMM operand. For N == 1 that already is NCHW's layout, and
+    a contiguous `t` is used where it lies."""
+    if n == 1:
+        return own_if_new(contiguous(t), t)
+    var out = own(_new([ch, n, plane], t.stype, t.device))
+    # An (N, ch, spatial...) view of that buffer, strided so the copy lands
+    # each element at its channel-major place, whatever t's own layout.
+    var dims = t.logical_shape()
     var shape = _index_list(dims)
     var strides = IndexList[MAX_RANK](0)
     var pad = MAX_RANK - len(dims)
-    strides[pad] = g.cols()
-    strides[pad + 1] = g.n * g.cols()
-    if not g.conv1d:
-        strides[pad + 2] = g.out_w
-    strides[MAX_RANK - 1] = 1
+    strides[pad] = plane
+    strides[pad + 1] = n * plane
+    var inner = 1
+    for i in range(len(dims) - 1, 1, -1):
+        strides[pad + i] = inner
+        inner *= dims[i]
     var permuted = own(
         view_strided(out.t, shape, strides, len(dims), out.t.offset)
     )
-    copy_strided_into(permuted.t, grad)
+    copy_strided_into(permuted.t, t)
     _ = permuted^
     return out^
 
@@ -4313,7 +4698,12 @@ def _conv_grad_weight(
     else:
         cols_t = own(_new([g.ckk(), rows], input.stype, input.device))
         _conv_patches(
-            "Im2colPatchMajor", cols_t.t.ptr, x.t.ptr, g, input.dtype, cp
+            g.patch_op("Im2colPatchMajor"),
+            cols_t.t.ptr,
+            x.t.ptr,
+            g,
+            input.dtype,
+            cp,
         )
     var oc_g = g.oc_g()
     var crs_g = g.crs_g()
@@ -4381,9 +4771,137 @@ def _conv_grad_input(
         _ = dcol^
         return dx.take()
     var dx = own(_new(input_shape, weight.stype, weight.device))
-    _conv_patches("Col2im", dx.t.ptr, dcol.t.ptr, g, weight.dtype, cp)
+    _conv_patches(
+        g.patch_op("Col2im"), dx.t.ptr, dcol.t.ptr, g, weight.dtype, cp
+    )
     _ = dcol^
     return dx.take()
+
+
+def _conv_backward(
+    grad: T,
+    input: T,
+    weight: T,
+    p: ConvArgs,
+    mask: List[Bool],
+    mut grad_input: Owned,
+    mut grad_weight: Owned,
+    mut grad_bias: Owned,
+) raises:
+    """The three gradients of a batched convolution, each only when `mask`
+    asks for it (the others stay empty placeholders)."""
+    var g = _conv_geometry(input, weight, p)
+    var bias_ch = g.c if p.transposed else g.out_c
+    if input.dim(0) == 0 or input.dim(1) == 0:
+        # ATen's `ConvBackend::Empty`: every gradient is zeros.
+        if mask[0]:
+            grad_input = own(
+                _zeros(input.logical_shape(), input.stype, input.device)
+            )
+        if mask[1]:
+            grad_weight = own(
+                _zeros(weight.logical_shape(), input.stype, input.device)
+            )
+        if mask[2]:
+            grad_bias = own(_zeros([bias_ch], input.stype, input.device))
+        return
+    # `g.output_shape()` is what flows out of the convolution `g`: grad_output
+    # for an ordinary conv, the input for a transposed one.
+    var expected = g.input_shape() if p.transposed else g.output_shape()
+    if grad.stype != input.stype or grad.device != input.device:
+        raise Error(
+            "convolution_backward: grad_output must have the input's dtype"
+            " and device"
+        )
+    if grad.rank != len(expected):
+        raise Error(
+            "Expected grad_output to have ", len(expected), " dimensions"
+        )
+    for i in range(grad.rank):
+        if grad.dim(i) != expected[i]:
+            raise Error(
+                "Expected grad_output of size ",
+                _list_str(expected),
+                ", but got ",
+                _list_str(grad.logical_shape()),
+            )
+    if not _is_float(input.dtype) or not input.on_mojo():
+        unsupported(
+            "convolution_backward of " + dtype_name(input.stype) + " operands"
+        )
+    if not _conv_runs_here(input, g):
+        # Something is empty: every gradient is zeros of its shape.
+        if mask[0]:
+            grad_input = own(
+                _zeros(input.logical_shape(), input.stype, input.device)
+            )
+        if mask[1]:
+            grad_weight = own(
+                _zeros(weight.logical_shape(), input.stype, input.device)
+            )
+        if mask[2]:
+            grad_bias = own(_zeros([bias_ch], input.stype, input.device))
+        return
+
+    var ctx = ctx_for(input.device)
+    var cp = ctx_ptr(ctx)
+    if not p.transposed:
+        # All three gradients read grad_output as (K, N*cols); the bias
+        # gradient is then a trailing-axis sum the reduction kernels take in
+        # place.
+        var go3 = _channel_major(grad, g.n, g.out_c, g.cols())
+        var go = own(_view(go3.t, [g.out_c, g.n * g.cols()]))
+        _ = go3^  # `go` holds its own reference to the storage
+        if mask[0]:
+            grad_input = own(
+                _conv_grad_input(weight, go.t, g, cp, input.logical_shape())
+            )
+        if mask[1]:
+            grad_weight = own(
+                _conv_grad_weight(input, go.t, g, cp, weight.logical_shape())
+            )
+        if mask[2]:
+            grad_bias = own(_sum_dims(go.t, [1], g.out_c))
+        _ = go^
+    else:
+        if mask[0]:
+            grad_input = own(_conv_forward_geom(grad, weight, None, g))
+        if mask[1]:
+            var x3 = _channel_major(input, g.n, g.out_c, g.cols())
+            var x = own(_view(x3.t, [g.out_c, g.n * g.cols()]))
+            _ = x3^
+            grad_weight = own(
+                _conv_grad_weight(grad, x.t, g, cp, weight.logical_shape())
+            )
+            _ = x^
+        if mask[2]:
+            var go3 = _channel_major(grad, g.n, g.c, g.in_plane())
+            var go = own(_view(go3.t, [g.c, g.n * g.in_plane()]))
+            _ = go3^
+            grad_bias = own(_sum_dims(go.t, [1], g.c))
+            _ = go^
+    _ = ctx
+
+
+def _ret_grads(
+    rets: Values,
+    mask: List[Bool],
+    mut grad_input: Owned,
+    mut grad_weight: Owned,
+    mut grad_bias: Owned,
+):
+    if mask[0]:
+        ret_owned(rets, 0, grad_input)
+    else:
+        _ret_undefined(rets, 0)
+    if mask[1]:
+        ret_owned(rets, 1, grad_weight)
+    else:
+        _ret_undefined(rets, 1)
+    if mask[2]:
+        ret_owned(rets, 2, grad_bias)
+    else:
+        _ret_undefined(rets, 2)
 
 
 # aten::convolution_backward(Tensor grad_output, Tensor input, Tensor weight,
@@ -4397,77 +4915,473 @@ def op_convolution_backward(
     var input = v_tensor(args[unsafe_offset=1])
     var weight = v_tensor(args[unsafe_offset=2])
     var mask = _bool_list(args[unsafe_offset=10])
-    # The forward's own gate: whatever `aten::convolution` ran here (a
-    # non-transposed rank-3/4 float conv) has a backward, and a transposed
-    # conv never gets this far because its forward declines too.
-    var geom = _conv_geometry(
-        input,
+    if len(mask) != 3:
+        raise Error("convolution_backward: output_mask must have 3 entries")
+    var p = _conv_args(
         weight,
-        IntList(args[unsafe_offset=4]),
-        IntList(args[unsafe_offset=5]),
-        IntList(args[unsafe_offset=6]),
+        IntList(args[unsafe_offset=4]).to_list(),
+        IntList(args[unsafe_offset=5]).to_list(),
+        IntList(args[unsafe_offset=6]).to_list(),
         v_bool(args[unsafe_offset=7]),
+        IntList(args[unsafe_offset=8]).to_list(),
         v_int(args[unsafe_offset=9]),
     )
-    if len(mask) != 3 or not geom:
-        unsupported("aten::convolution_backward with these operands")
-    if not mask[0] and not mask[1] and not mask[2]:
-        for i in range(3):
-            _ret_undefined(rets, i)
-        return
-    var g = geom.value()
-    var expected = g.output_shape()
-    if (
-        grad.stype != input.stype
-        or grad.device != input.device
-        or not grad.on_mojo()
-        or grad.rank != len(expected)
-    ):
-        unsupported("aten::convolution_backward: grad_output does not match")
-    for i in range(grad.rank):
-        if grad.dim(i) != expected[i]:
-            unsupported(
-                "aten::convolution_backward: grad_output has the wrong shape"
-            )
-    if g.out_c == 0:
-        unsupported("aten::convolution_backward with no output channels")
-
-    var ctx = ctx_for(input.device)
-    var cp = ctx_ptr(ctx)
-    # All three gradients read grad_output as (K, N*cols); the bias gradient
-    # is then a trailing-axis sum the reduction kernels take in place.
-    var go3 = _grad_output_patch_major(grad, g)
-    var go = own(_view(go3.t, [g.out_c, g.n * g.cols()]))
-    _ = go3^  # `go` holds its own reference to the storage
-
+    _check_conv_shapes(input, weight, None, p)
     var grad_input = own(_empty_result(input.stype, input.device))
-    if mask[0]:
-        grad_input = own(
-            _conv_grad_input(weight, go.t, g, cp, input.logical_shape())
-        )
     var grad_weight = own(_empty_result(input.stype, input.device))
-    if mask[1]:
-        grad_weight = own(
-            _conv_grad_weight(input, go.t, g, cp, weight.logical_shape())
-        )
     var grad_bias = own(_empty_result(input.stype, input.device))
-    if mask[2]:
-        grad_bias = own(_sum_dims(go.t, [1], g.out_c))
-    _ = go^
-    _ = ctx
+    if mask[0] or mask[1] or mask[2]:
+        _conv_backward(
+            grad, input, weight, p, mask, grad_input, grad_weight, grad_bias
+        )
+    _ret_grads(rets, mask, grad_input, grad_weight, grad_bias)
 
-    if mask[0]:
-        ret_owned(rets, 0, grad_input)
+
+# --- the backend-specific convolution entry points ------------------------------
+#
+# `at::_convolution` picks one of these per backend (CUDA's depthwise, the
+# THNN "slow" im2col kernels, the naive dilated/transposed ones); a caller can
+# also reach them directly. Each is the same convolution with fixed
+# groups/dilation/transposition, so they all run the route above.
+
+
+def _unsqueeze0(t: T) raises -> T:
+    """`t` as (1, *t.shape): an owned handle."""
+    var held = own_if_new(contiguous(t), t)
+    var dims: List[Int] = [1]
+    for i in range(t.rank):
+        dims.append(t.dim(i))
+    var v = _view(held.t, dims)
+    _ = held^
+    return v^
+
+
+def _unbatch(var t: T) raises -> T:
+    """The (1, C, spatial...) result of an unbatched input, as (C, ...)."""
+    var held = own(t^)
+    var dims = held.t.logical_shape()
+    _ = dims.pop(0)
+    var out = _view(held.t, dims)
+    _ = held^
+    return out^
+
+
+def _check_kernel_size(weight: T, kernel_size: List[Int], spatial: Int) raises:
+    if len(kernel_size) != spatial:
+        raise Error(
+            "expected kernel_size to have ",
+            spatial,
+            " elements, but got ",
+            _list_str(kernel_size),
+        )
+    for i in range(spatial):
+        if weight.rank != spatial + 2 or weight.dim(i + 2) != kernel_size[i]:
+            raise Error(
+                "expected weight of kernel size ",
+                _list_str(kernel_size),
+                ", but got weight of size ",
+                _list_str(weight.logical_shape()),
+            )
+
+
+comptime _UNBATCHED_REJECT = 0
+comptime _UNBATCHED_KEEP = 1
+comptime _UNBATCHED_SQUEEZE = 2
+
+
+def _entry_conv(
+    args: Values,
+    spatial: Int,
+    name: StaticString,
+    has_dilation: Bool,
+    transposed: Bool,
+    depthwise: Bool,
+    unbatched_rule: Int,
+) raises -> T:
+    """The shared body of every `(self, weight, kernel_size, bias, stride,
+    padding[, output_padding][, dilation])` entry point."""
+    var input = v_tensor(args[unsafe_offset=0])
+    var weight = v_tensor(args[unsafe_offset=1])
+    var kernel_size = IntList(args[unsafe_offset=2]).to_list()
+    var bias = _opt_tensor_arg(args[unsafe_offset=3])
+    var stride = IntList(args[unsafe_offset=4]).to_list()
+    var padding = IntList(args[unsafe_offset=5]).to_list()
+    var output_padding = List[Int]()
+    var dilation: List[Int] = [1]
+    var next = 6
+    if transposed:
+        output_padding = IntList(args[unsafe_offset=6]).to_list()
+        next = 7
     else:
-        _ret_undefined(rets, 0)
-    if mask[1]:
-        ret_owned(rets, 1, grad_weight)
-    else:
-        _ret_undefined(rets, 1)
-    if mask[2]:
-        ret_owned(rets, 2, grad_bias)
-    else:
-        _ret_undefined(rets, 2)
+        output_padding.append(0)
+    if has_dilation:
+        dilation = IntList(args[unsafe_offset=next]).to_list()
+    _check_kernel_size(weight, kernel_size, spatial)
+    # An unbatched (C, spatial...) input runs as (1, C, ...). What comes
+    # back differs per kernel, as upstream's do (`unbatched`): REJECT it
+    # (THNN 2-D/3-D, CUDA's depthwise 2-D), KEEP the unit batch axis
+    # (slow_conv_transpose2d's structured meta, CUDA's depthwise 3-D) or
+    # SQUEEZE it back out (the dilated kernels, slow_conv_transpose3d).
+    if unbatched_rule == _UNBATCHED_REJECT and input.rank != spatial + 2:
+        raise Error(
+            "Expected ",
+            spatial + 2,
+            "D input tensor, but got ",
+            _list_str(input.logical_shape()),
+        )
+    var unbatched = input.rank == spatial + 1
+    if not unbatched and input.rank != spatial + 2:
+        raise Error(
+            "Expected ",
+            spatial + 1,
+            "D (unbatched) or ",
+            spatial + 2,
+            "D (batched) input to ",
+            name,
+            ", but got input of size: ",
+            _list_str(input.logical_shape()),
+        )
+    var held = own(_empty_result(input.stype, input.device))
+    var x = input.copy()
+    if unbatched:
+        held = own(_unsqueeze0(input))
+        x = held.t.copy()
+    var groups = 1
+    if depthwise:
+        # The depthwise kernels' filter is (C * multiplier, 1, k...): one
+        # group per input channel.
+        if weight.dim(1) != 1:
+            raise Error(
+                "Depthwise weight should have in_channels=1, got ",
+                weight.dim(1),
+            )
+        groups = x.dim(1)
+        if groups <= 0 or weight.dim(0) % groups != 0:
+            raise Error(
+                (
+                    "Depthwise out channels should be a multiple of in"
+                    " channels, got "
+                ),
+                weight.dim(0),
+                " and ",
+                groups,
+            )
+    var out = _conv_from_args(
+        x,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+    )
+    _ = held^
+    if unbatched and unbatched_rule == _UNBATCHED_SQUEEZE:
+        return _unbatch(out^)
+    return out^
+
+
+def _out_dest(args: Values, slot: Int) raises -> T:
+    """The caller's `out=` tensor, checked against the input before any
+    kernel runs."""
+    var dest = v_tensor(args[unsafe_offset=slot])
+    check_out(dest, v_tensor(args[unsafe_offset=0]))
+    return dest^
+
+
+# aten::_conv_depthwise2d(Tensor self, Tensor weight, SymInt[2] kernel_size,
+#   Tensor? bias, SymInt[2] stride, SymInt[2] padding, SymInt[2] dilation)
+def op_conv_depthwise2d(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    ret_tensor(
+        rets,
+        0,
+        _entry_conv(
+            args, 2, "conv_depthwise2d", True, False, True, _UNBATCHED_REJECT
+        ),
+    )
+
+
+def op_conv_depthwise2d_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _out_dest(args, 7)
+    var r = _entry_conv(
+        args, 2, "conv_depthwise2d", True, False, True, _UNBATCHED_REJECT
+    )
+    _store_out(rets, dest, r^)
+
+
+# aten::conv_depthwise3d(Tensor self, Tensor weight, SymInt[3] kernel_size,
+#   Tensor? bias, SymInt[3] stride, SymInt[3] padding, SymInt[3] dilation)
+def op_conv_depthwise3d(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    ret_tensor(
+        rets,
+        0,
+        _entry_conv(
+            args, 3, "conv_depthwise3d", True, False, True, _UNBATCHED_KEEP
+        ),
+    )
+
+
+def op_conv_depthwise3d_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _out_dest(args, 7)
+    var r = _entry_conv(
+        args, 3, "conv_depthwise3d", True, False, True, _UNBATCHED_KEEP
+    )
+    _store_out(rets, dest, r^)
+
+
+# aten::_slow_conv2d_forward(Tensor self, Tensor weight, SymInt[2] kernel_size,
+#   Tensor? bias, SymInt[2] stride, SymInt[2] padding) -> Tensor
+def op_slow_conv2d_forward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    ret_tensor(
+        rets,
+        0,
+        _entry_conv(
+            args, 2, "slow_conv2d", False, False, False, _UNBATCHED_REJECT
+        ),
+    )
+
+
+def op_slow_conv2d_forward_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _out_dest(args, 6)
+    var r = _entry_conv(
+        args, 2, "slow_conv2d", False, False, False, _UNBATCHED_REJECT
+    )
+    _store_out(rets, dest, r^)
+
+
+# aten::slow_conv3d_forward(Tensor self, Tensor weight, SymInt[3] kernel_size,
+#   Tensor? bias, SymInt[3] stride, SymInt[3] padding) -> Tensor
+def op_slow_conv3d_forward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    ret_tensor(
+        rets,
+        0,
+        _entry_conv(
+            args, 3, "slow_conv3d", False, False, False, _UNBATCHED_REJECT
+        ),
+    )
+
+
+def op_slow_conv3d_forward_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _out_dest(args, 6)
+    var r = _entry_conv(
+        args, 3, "slow_conv3d", False, False, False, _UNBATCHED_REJECT
+    )
+    _store_out(rets, dest, r^)
+
+
+# aten::slow_conv_dilated2d(Tensor self, Tensor weight, SymInt[2] kernel_size,
+#   Tensor? bias=None, SymInt[2] stride=1, SymInt[2] padding=0,
+#   SymInt[2] dilation=1) -> Tensor
+def op_slow_conv_dilated2d(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    ret_tensor(
+        rets,
+        0,
+        _entry_conv(
+            args,
+            2,
+            "slow_conv_dilated2d",
+            True,
+            False,
+            False,
+            _UNBATCHED_SQUEEZE,
+        ),
+    )
+
+
+def op_slow_conv_dilated2d_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _out_dest(args, 7)
+    var r = _entry_conv(
+        args, 2, "slow_conv_dilated2d", True, False, False, _UNBATCHED_SQUEEZE
+    )
+    _store_out(rets, dest, r^)
+
+
+# aten::slow_conv_dilated3d -- slow_conv_dilated2d with three spatial axes.
+def op_slow_conv_dilated3d(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    ret_tensor(
+        rets,
+        0,
+        _entry_conv(
+            args,
+            3,
+            "slow_conv_dilated3d",
+            True,
+            False,
+            False,
+            _UNBATCHED_SQUEEZE,
+        ),
+    )
+
+
+def op_slow_conv_dilated3d_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _out_dest(args, 7)
+    var r = _entry_conv(
+        args, 3, "slow_conv_dilated3d", True, False, False, _UNBATCHED_SQUEEZE
+    )
+    _store_out(rets, dest, r^)
+
+
+# aten::slow_conv_transpose2d(Tensor self, Tensor weight,
+#   SymInt[2] kernel_size, Tensor? bias=None, SymInt[2] stride=1,
+#   SymInt[2] padding=0, SymInt[2] output_padding=0, SymInt[2] dilation=1)
+def op_slow_conv_transpose2d(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    ret_tensor(
+        rets,
+        0,
+        _entry_conv(
+            args, 2, "slow_conv_transpose2d", True, True, False, _UNBATCHED_KEEP
+        ),
+    )
+
+
+def op_slow_conv_transpose2d_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _out_dest(args, 8)
+    var r = _entry_conv(
+        args, 2, "slow_conv_transpose2d", True, True, False, _UNBATCHED_KEEP
+    )
+    _store_out(rets, dest, r^)
+
+
+# aten::slow_conv_transpose3d -- slow_conv_transpose2d with three spatial axes.
+def op_slow_conv_transpose3d(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    ret_tensor(
+        rets,
+        0,
+        _entry_conv(
+            args,
+            3,
+            "slow_conv_transpose3d",
+            True,
+            True,
+            False,
+            _UNBATCHED_SQUEEZE,
+        ),
+    )
+
+
+def op_slow_conv_transpose3d_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _out_dest(args, 8)
+    var r = _entry_conv(
+        args, 3, "slow_conv_transpose3d", True, True, False, _UNBATCHED_SQUEEZE
+    )
+    _store_out(rets, dest, r^)
+
+
+def _slow_conv2d_grads(
+    args: Values,
+    mask: List[Bool],
+    mut gi: Owned,
+    mut gw: Owned,
+    mut gb: Owned,
+) raises:
+    """The three gradients of `_slow_conv2d_forward` (groups 1, dilation 1)."""
+    var grad = v_tensor(args[unsafe_offset=0])
+    var input = v_tensor(args[unsafe_offset=1])
+    var weight = v_tensor(args[unsafe_offset=2])
+    var kernel_size = IntList(args[unsafe_offset=3]).to_list()
+    _check_kernel_size(weight, kernel_size, 2)
+    var p = _conv_args(
+        weight,
+        IntList(args[unsafe_offset=4]).to_list(),
+        IntList(args[unsafe_offset=5]).to_list(),
+        [1],
+        False,
+        [0],
+        1,
+    )
+    if input.rank != 4:
+        raise Error(
+            "Expected 4D input tensor, but got ",
+            _list_str(input.logical_shape()),
+        )
+    _check_conv_shapes(input, weight, None, p)
+    if mask[0] or mask[1] or mask[2]:
+        _conv_backward(grad, input, weight, p, mask, gi, gw, gb)
+
+
+# aten::_slow_conv2d_backward.output_mask(Tensor grad_output, Tensor self,
+#   Tensor weight, SymInt[2] kernel_size, SymInt[2] stride, SymInt[2] padding,
+#   bool[3] output_mask) -> (Tensor grad_input, Tensor grad_weight,
+#   Tensor grad_bias)
+def op_slow_conv2d_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var mask = _bool_list(args[unsafe_offset=6])
+    if len(mask) != 3:
+        raise Error("_slow_conv2d_backward: output_mask must have 3 entries")
+    var input = v_tensor(args[unsafe_offset=1])
+    var gi = own(_empty_result(input.stype, input.device))
+    var gw = own(_empty_result(input.stype, input.device))
+    var gb = own(_empty_result(input.stype, input.device))
+    _slow_conv2d_grads(args, mask, gi, gw, gb)
+    _ret_grads(rets, mask, gi, gw, gb)
+
+
+# aten::_slow_conv2d_backward.grad_input(Tensor grad_output, Tensor self,
+#   Tensor weight, SymInt[2] kernel_size, SymInt[2] stride, SymInt[2] padding,
+#   *, Tensor(a!) grad_input, Tensor(b!) grad_weight, Tensor(c!) grad_bias)
+#   -> (Tensor(a!), Tensor(b!), Tensor(c!))
+# Every output is computed: an out= overload has no mask (CUDA skips an
+# UNDEFINED out, which a Python caller cannot pass).
+def op_slow_conv2d_backward_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var input = v_tensor(args[unsafe_offset=1])
+    var outs = List[T]()
+    for i in range(3):
+        var d = v_tensor(args[unsafe_offset=6 + i])
+        check_out(d, input)
+        outs.append(d^)
+    var gi = own(_empty_result(input.stype, input.device))
+    var gw = own(_empty_result(input.stype, input.device))
+    var gb = own(_empty_result(input.stype, input.device))
+    _slow_conv2d_grads(args, [True, True, True], gi, gw, gb)
+    for i in range(3):
+        var dst = outs[i].copy()
+        var src = gi.t.copy() if i == 0 else (
+            gw.t.copy() if i == 1 else gb.t.copy()
+        )
+        if not dst.same_shape(src):
+            resize_out(dst, src.shape, src.rank)
+        copy_strided_into(dst, src)
+        ret_ref(rets, i, dst)
+    _ = gi^
+    _ = gw^
+    _ = gb^
 
 
 def register_matmul(site: Site) raises:
@@ -4501,6 +5415,24 @@ def register_matmul(site: Site) raises:
     impl[op_weight_int8pack_mm, "_weight_int8pack_mm"](site)
     impl[op_convolution, "convolution"](site)
     impl[op_convolution_backward, "convolution_backward"](site)
+    impl[op_conv_depthwise2d, "_conv_depthwise2d"](site)
+    impl[op_conv_depthwise2d_out, "_conv_depthwise2d.out"](site)
+    impl[op_conv_depthwise3d, "conv_depthwise3d"](site)
+    impl[op_conv_depthwise3d_out, "conv_depthwise3d.out"](site)
+    impl[op_slow_conv2d_forward, "_slow_conv2d_forward"](site)
+    impl[op_slow_conv2d_forward_out, "_slow_conv2d_forward.output"](site)
+    impl[op_slow_conv2d_backward, "_slow_conv2d_backward.output_mask"](site)
+    impl[op_slow_conv2d_backward_out, "_slow_conv2d_backward.grad_input"](site)
+    impl[op_slow_conv3d_forward, "slow_conv3d_forward"](site)
+    impl[op_slow_conv3d_forward_out, "slow_conv3d_forward.output"](site)
+    impl[op_slow_conv_dilated2d, "slow_conv_dilated2d"](site)
+    impl[op_slow_conv_dilated2d_out, "slow_conv_dilated2d.out"](site)
+    impl[op_slow_conv_dilated3d, "slow_conv_dilated3d"](site)
+    impl[op_slow_conv_dilated3d_out, "slow_conv_dilated3d.out"](site)
+    impl[op_slow_conv_transpose2d, "slow_conv_transpose2d"](site)
+    impl[op_slow_conv_transpose2d_out, "slow_conv_transpose2d.out"](site)
+    impl[op_slow_conv_transpose3d, "slow_conv_transpose3d"](site)
+    impl[op_slow_conv_transpose3d_out, "slow_conv_transpose3d.out"](site)
     impl[op_linear, "linear"](site)
     impl[op_linear_backward, "linear_backward"](site)
     impl[op_mm, "mm"](site)

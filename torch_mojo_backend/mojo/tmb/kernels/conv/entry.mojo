@@ -49,7 +49,7 @@ from tmb.kernels.common.variant_gates import (
 
 @always_inline
 def _im2col[
-    dtype: DType, patch_major: Bool = False
+    dtype: DType, patch_major: Bool = False, vol: Bool = False
 ](
     out_addr: Int,
     in_addr: Int,
@@ -67,42 +67,173 @@ def _im2col[
     dil_w: Int,
     channels: Int,
     batch: Int,
+    depth: Depth,
     ctx: DeviceContext,
 ) raises:
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
+    # The depth axis as plain Ints copied into the closure: a struct
+    # argument is a host reference, which the device must never read.
+    var in_d = depth.in_d
+    var out_d = depth.out_d
+    var kd = depth.kd
+    var sd = depth.sd
+    var pd = depth.pd
+    var dd = depth.dd
 
     @always_inline
     @__parameter
-    @__copy_capture(out_ptr, in_ptr)
+    @__copy_capture(out_ptr, in_ptr, in_d, out_d, kd, sd, pd, dd)
     def func[width: Int, alignment: Int = 1](idx: StdCoord):
         var i = Int(idx[0].value())
-        var cols = out_h * out_w
-        var crs = channels * kh * kw
-        var s: Int
-        var r: Int
-        comptime if patch_major:
-            r = i // (batch * cols)
-            s = (i // cols) % batch
+        comptime if vol:
+            # The volumetric patch: rows (c, fd, fh, fw), columns (od, oh,
+            # ow), the planar code below with one more axis on each side.
+            var cols = out_d * out_h * out_w
+            var taps = kd * kh * kw
+            var s: Int
+            var r: Int
+            comptime if patch_major:
+                r = i // (batch * cols)
+                s = (i // cols) % batch
+            else:
+                s = i // (channels * taps * cols)
+                r = (i // cols) % (channels * taps)
+            var j = i % cols
+            var fw = r % kw
+            var fh = (r // kw) % kh
+            var fd = (r // (kw * kh)) % kd
+            var c = r // taps
+            var ow = j % out_w
+            var oh = (j // out_w) % out_h
+            var od = j // (out_w * out_h)
+            var id = od * sd - pd + fd * dd
+            var ih = oh * stride_h - pad_h + fh * dil_h
+            var iw = ow * stride_w - pad_w + fw * dil_w
+            if (
+                id < 0
+                or id >= in_d
+                or ih < 0
+                or ih >= in_h
+                or iw < 0
+                or iw >= in_w
+            ):
+                out_ptr[unsafe_offset=i] = Scalar[dtype](0)
+            else:
+                out_ptr[unsafe_offset=i] = in_ptr[
+                    unsafe_offset=(((s * channels + c) * in_d + id) * in_h + ih)
+                    * in_w
+                    + iw
+                ]
         else:
-            s = i // (crs * cols)
-            r = (i // cols) % crs
-        var j = i % cols
-        var fw = r % kw
-        var fh = (r // kw) % kh
-        var c = r // (kw * kh)
-        var oh = j // out_w
-        var ow = j % out_w
-        var ih = oh * stride_h - pad_h + fh * dil_h
-        var iw = ow * stride_w - pad_w + fw * dil_w
-        if ih < 0 or ih >= in_h or iw < 0 or iw >= in_w:
-            out_ptr[unsafe_offset=i] = Scalar[dtype](0)
-        else:
-            out_ptr[unsafe_offset=i] = in_ptr[
-                unsafe_offset=((s * channels + c) * in_h + ih) * in_w + iw
-            ]
+            var cols = out_h * out_w
+            var crs = channels * kh * kw
+            var s: Int
+            var r: Int
+            comptime if patch_major:
+                r = i // (batch * cols)
+                s = (i // cols) % batch
+            else:
+                s = i // (crs * cols)
+                r = (i // cols) % crs
+            var j = i % cols
+            var fw = r % kw
+            var fh = (r // kw) % kh
+            var c = r // (kw * kh)
+            var oh = j // out_w
+            var ow = j % out_w
+            var ih = oh * stride_h - pad_h + fh * dil_h
+            var iw = ow * stride_w - pad_w + fw * dil_w
+            if ih < 0 or ih >= in_h or iw < 0 or iw >= in_w:
+                out_ptr[unsafe_offset=i] = Scalar[dtype](0)
+            else:
+                out_ptr[unsafe_offset=i] = in_ptr[
+                    unsafe_offset=((s * channels + c) * in_h + ih) * in_w + iw
+                ]
 
-    _parallel_for[func](batch * channels * kh * kw * out_h * out_w, ctx)
+    _parallel_for[func](
+        batch * channels * kh * kw * out_h * out_w * kd * out_d,
+        ctx,
+    )
+
+
+@fieldwise_init
+struct Depth(Copyable, ImplicitlyCopyable, Movable, RegisterPassable):
+    """The depth axis of a volumetric (conv3d) patch: input and output
+    extents, kernel taps, stride, padding and dilation. A planar build passes
+    the unit axis (1, 1, 1, 1, 0, 1)."""
+
+    var in_d: Int
+    var out_d: Int
+    var kd: Int
+    var sd: Int
+    var pd: Int
+    var dd: Int
+
+
+@always_inline
+def _col2im_vol_pixel[
+    dtype: DType
+](
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    in_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    i: Int,
+    in_h: Int,
+    in_w: Int,
+    out_h: Int,
+    out_w: Int,
+    kh: Int,
+    kw: Int,
+    stride_h: Int,
+    stride_w: Int,
+    pad_h: Int,
+    pad_w: Int,
+    dil_h: Int,
+    dil_w: Int,
+    channels: Int,
+    batch: Int,
+    depth: Depth,
+):
+    """col2im of one input voxel `i` of an (N, C, D, H, W) image: the planar
+    gather below with the depth taps as one more loop."""
+    var cols = depth.out_d * out_h * out_w
+    var row_len = batch * cols
+    var iw = i % in_w
+    var ih = (i // in_w) % in_h
+    var id = (i // (in_w * in_h)) % depth.in_d
+    var c = (i // (in_w * in_h * depth.in_d)) % channels
+    var s = i // (in_w * in_h * depth.in_d * channels)
+    var sample_base = s * cols
+    var acc = Scalar[DType.float32](0)
+    for fd in range(depth.kd):
+        var td = id + depth.pd - fd * depth.dd
+        if td < 0 or td % depth.sd != 0:
+            continue
+        var od = td // depth.sd
+        if od >= depth.out_d:
+            continue
+        for fh in range(kh):
+            var th = ih + pad_h - fh * dil_h
+            if th < 0 or th % stride_h != 0:
+                continue
+            var oh = th // stride_h
+            if oh >= out_h:
+                continue
+            var tap_row = ((c * depth.kd + fd) * kh + fh) * kw
+            for fw in range(kw):
+                var tw = iw + pad_w - fw * dil_w
+                if tw < 0 or tw % stride_w != 0:
+                    continue
+                var ow = tw // stride_w
+                if ow >= out_w:
+                    continue
+                acc += in_ptr[
+                    unsafe_offset=(tap_row + fw) * row_len
+                    + sample_base
+                    + (od * out_h + oh) * out_w
+                    + ow
+                ].cast[DType.float32]()
+    out_ptr[unsafe_offset=i] = acc.cast[dtype]()
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +259,7 @@ def _im2col[
 
 @always_inline
 def _col2im[
-    dtype: DType
+    dtype: DType, vol: Bool = False
 ](
     out_addr: Int,
     in_addr: Int,
@@ -146,16 +277,47 @@ def _col2im[
     dil_w: Int,
     channels: Int,
     batch: Int,
+    depth: Depth,
     ctx: DeviceContext,
 ) raises:
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
+    # The depth axis as plain Ints copied into the closure: a struct
+    # argument is a host reference, which the device must never read.
+    var in_d = depth.in_d
+    var out_d = depth.out_d
+    var kd = depth.kd
+    var sd = depth.sd
+    var pd = depth.pd
+    var dd = depth.dd
 
     @always_inline
     @__parameter
-    @__copy_capture(out_ptr, in_ptr)
+    @__copy_capture(out_ptr, in_ptr, in_d, out_d, kd, sd, pd, dd)
     def func[width: Int, alignment: Int = 1](idx: StdCoord):
         var i = Int(idx[0].value())
+        comptime if vol:
+            _col2im_vol_pixel[dtype](
+                out_ptr,
+                in_ptr,
+                i,
+                in_h,
+                in_w,
+                out_h,
+                out_w,
+                kh,
+                kw,
+                stride_h,
+                stride_w,
+                pad_h,
+                pad_w,
+                dil_h,
+                dil_w,
+                channels,
+                batch,
+                Depth(in_d, out_d, kd, sd, pd, dd),
+            )
+            return
         var cols = out_h * out_w
         # One patch-major row is (batch, out_h * out_w) long.
         var row_len = batch * cols
@@ -188,7 +350,7 @@ def _col2im[
                 ].cast[DType.float32]()
         out_ptr[unsafe_offset=i] = acc.cast[dtype]()
 
-    _parallel_for[func](batch * channels * in_h * in_w, ctx)
+    _parallel_for[func](batch * channels * in_h * in_w * in_d, ctx)
 
 
 comptime _IM2COL = 0
@@ -197,12 +359,14 @@ comptime _COL2IM = 2
 
 
 def _im2col_go[
-    kind: Int
+    kind: Int, vol: Bool = False
 ](
     col_ptr: Arg,
     in_ptr: Arg,
     # (in_h, in_w, out_h, out_w, kh, kw, stride_h, stride_w, pad_h, pad_w,
-    #  dil_h, dil_w, channels, batch); batch defaults to 1 when omitted.
+    #  dil_h, dil_w, channels, batch); batch defaults to 1 when omitted. A
+    # volumetric build (`vol`) reads the depth axis after them: (in_d, out_d,
+    # kd, stride_d, pad_d, dil_d).
     # For _COL2IM the two pointers keep their im2col roles: `col_ptr` is the
     # IMAGE written and `in_ptr` the patch-major columns read.
     params: Arg,
@@ -226,6 +390,16 @@ def _im2col_go[
     var dil_w = _raw_tuple_int(params, 11)
     var channels = _raw_tuple_int(params, 12)
     var batch = _raw_tuple_int(params, 13) if _raw_tuple_len(params) > 13 else 1
+    var depth = Depth(1, 1, 1, 1, 0, 1)
+    comptime if vol:
+        depth = Depth(
+            _raw_tuple_int(params, 14),
+            _raw_tuple_int(params, 15),
+            _raw_tuple_int(params, 16),
+            _raw_tuple_int(params, 17),
+            _raw_tuple_int(params, 18),
+            _raw_tuple_int(params, 19),
+        )
     var ctx = _raw_ctx(device_context_ptr)
 
     var handled = False
@@ -233,7 +407,7 @@ def _im2col_go[
         comptime if _dtype_arg_on[0, dt]():
             if dtype == dt:
                 comptime if kind == _COL2IM:
-                    _col2im[dt](
+                    _col2im[dt, vol](
                         out_addr,
                         in_addr,
                         in_h,
@@ -250,10 +424,11 @@ def _im2col_go[
                         dil_w,
                         channels,
                         batch,
+                        depth,
                         ctx,
                     )
                 else:
-                    _im2col[dt, kind == _IM2COL_PATCH_MAJOR](
+                    _im2col[dt, kind == _IM2COL_PATCH_MAJOR, vol](
                         out_addr,
                         in_addr,
                         in_h,
@@ -270,6 +445,7 @@ def _im2col_go[
                         dil_w,
                         channels,
                         batch,
+                        depth,
                         ctx,
                     )
                 handled = True
@@ -277,9 +453,11 @@ def _im2col_go[
         raise Error("unsupported dtype for fast im2col: " + String(dtype))
 
 
-def _im2col_dispatcher[kind: Int](argv: Argv, argc: Int) raises:
+def _im2col_dispatcher[
+    kind: Int, vol: Bool = False
+](argv: Argv, argc: Int) raises:
     var args = argv
-    _im2col_go[kind](
+    _im2col_go[kind, vol](
         args[unsafe_offset=0],
         args[unsafe_offset=1],
         args[unsafe_offset=2],
@@ -378,6 +556,15 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["Col2im"]():
             _im2col_dispatcher[_COL2IM](argv, argc)
+            return 0
+        comptime if _op_on["Im2col3d"]():
+            _im2col_dispatcher[_IM2COL, True](argv, argc)
+            return 0
+        comptime if _op_on["Im2colPatchMajor3d"]():
+            _im2col_dispatcher[_IM2COL_PATCH_MAJOR, True](argv, argc)
+            return 0
+        comptime if _op_on["Col2im3d"]():
+            _im2col_dispatcher[_COL2IM, True](argv, argc)
             return 0
         comptime if _op_on["BiasAddChan"]():
             _bias_add_chan_dispatcher(argv, argc)

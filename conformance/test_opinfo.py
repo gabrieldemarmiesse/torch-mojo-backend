@@ -287,6 +287,15 @@ def _cross_device_comparison_skip_reason(op: OpInfo, dtype: torch.dtype) -> str 
 _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
     {
         ("nn_functional_conv2d", torch.float32),
+        # conv_transpose in half precision: cuDNN (CUDA's route) and we
+        # accumulate the whole output pixel in float and round once; CPU
+        # torch rounds the GEMM's columns to the 16-bit type before col2im
+        # sums them, so its result is the one farther from float64.
+        *(
+            (f"nn_functional_conv_transpose{k}d", dtype)
+            for k in (1, 2, 3)
+            for dtype in (torch.bfloat16, torch.float16)
+        ),
         # rsub with alpha on float16: CUDA's (and our) sub kernel computes
         # other - alpha * self as one fma in float; CPU torch rounds
         # alpha * self to float16 first, one or two ulps farther from the

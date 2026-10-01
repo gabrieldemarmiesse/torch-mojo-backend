@@ -19,6 +19,7 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tests.native.conftest import is_metal, side_stream_or_skip, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
@@ -2148,20 +2149,297 @@ def test_conv1d_non_contiguous_input_and_module(mojo_device):
     torch.testing.assert_close(got.cpu(), ref, atol=1e-4, rtol=1e-3)
 
 
-def test_conv1d_transposed_declines(mojo_device):
-    x = torch.randn(1, 3, 8).to(mojo_device)
-    w = torch.randn(3, 2, 3).to(mojo_device)
-    with pytest.raises(NotImplementedError):
-        torch.nn.functional.conv_transpose1d(x, w)
+# Transposed convolutions run as the data gradient of the convolution whose
+# input is their output (col2im of weight^T @ x); 3-D ones take the
+# volumetric im2col/col2im. (in_c, out_c, spatial, kernel, stride, padding,
+# output_padding, dilation, groups): odd extents, output_padding below the
+# stride and (the dilation-only case) at or above it.
+_CONV_T_CASES = {
+    "1d": (3, 4, (9,), (3,), 2, 0, 1, 1, 1),
+    "2d": (4, 6, (5, 7), (3, 3), 2, 1, 1, 1, 2),
+    "2d_rect": (3, 5, (6, 5), (3, 2), (2, 1), (1, 0), (1, 0), (1, 2), 1),
+    "2d_opad_from_dilation": (2, 3, (5, 5), (3, 3), 1, 1, 1, 2, 1),
+    "2d_pointwise": (3, 5, (5, 5), (1, 1), 1, 0, 0, 1, 1),
+    "2d_depthwise": (4, 4, (6, 6), (3, 3), 2, 1, 0, 1, 4),
+    "3d": (4, 4, (4, 5, 3), (2, 3, 2), 2, 1, 1, 1, 2),
+    "3d_dilated": (2, 3, (3, 4, 4), (2, 2, 3), (1, 2, 1), (0, 1, 1), 0, (2, 1, 1), 1),
+}
 
 
-def test_conv_transposed_declines(mojo_device):
-    """The transposed forward has no kernel here: it must raise, not produce
-    a plain convolution."""
-    x = torch.randn(1, 3, 8, 8).to(mojo_device)
-    w = torch.randn(3, 2, 3, 3).to(mojo_device)
-    with pytest.raises(NotImplementedError):
-        torch.nn.functional.conv_transpose2d(x, w)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("case", _CONV_T_CASES)
+def test_conv_transpose_trains(mojo_device, case, dtype):
+    """conv_transpose{1,2,3}d forward and every gradient against float64 CPU,
+    through aten::convolution / convolution_backward with transposed=True."""
+    in_c, out_c, spatial, kernel, stride, padding, opad, dilation, groups = (
+        _CONV_T_CASES[case]
+    )
+    fn = {1: F.conv_transpose1d, 2: F.conv_transpose2d, 3: F.conv_transpose3d}[
+        len(spatial)
+    ]
+    gen = torch.Generator().manual_seed(0)
+    x = torch.randn(2, in_c, *spatial, generator=gen).to(dtype)
+    w = torch.randn(in_c, out_c // groups, *kernel, generator=gen).to(dtype)
+    b = torch.randn(out_c, generator=gen).to(dtype)
+    args = (stride, padding, opad, groups, dilation)
+
+    def run(device, dt):
+        ts = [t.to(device=device, dtype=dt).requires_grad_() for t in (x, w, b)]
+        out = fn(ts[0], ts[1], ts[2], *args)
+        out.backward(torch.linspace(-1, 1, out.numel()).reshape(out.shape).to(out))
+        return [out.detach()] + [t.grad for t in ts]
+
+    ref = run("cpu", torch.float64)
+    with assert_ran("aten::convolution", "aten::convolution_backward"):
+        got = run(mojo_device, dtype)
+    tol = 1e-4 if dtype == torch.float32 else 6e-2
+    for g, r in zip(got, ref, strict=True):
+        assert g.dtype == dtype and g.shape == r.shape
+        torch.testing.assert_close(g.cpu().double(), r, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"stride": 2, "padding": 1},
+        {"stride": (2, 1, 1), "padding": (1, 0, 2), "dilation": (1, 2, 1)},
+        {"groups": 2},
+        {"groups": 4, "padding": 1},
+    ],
+    ids=str,
+)
+def test_conv3d_trains(mojo_device, kwargs, dtype):
+    """conv3d forward and backward: the volumetric im2col/col2im under the
+    same GEMMs as conv2d."""
+    gen = torch.Generator().manual_seed(1)
+    groups = kwargs.get("groups", 1)
+    x = torch.randn(2, 4, 5, 7, 6, generator=gen).to(dtype)
+    w = torch.randn(6 if groups != 4 else 8, 4 // groups, 3, 2, 3, generator=gen)
+    w = w.to(dtype)
+    b = torch.randn(w.shape[0], generator=gen).to(dtype)
+
+    def run(device, dt):
+        ts = [t.to(device=device, dtype=dt).requires_grad_() for t in (x, w, b)]
+        out = F.conv3d(ts[0], ts[1], ts[2], **kwargs)
+        out.backward(torch.linspace(-1, 1, out.numel()).reshape(out.shape).to(out))
+        return [out.detach()] + [t.grad for t in ts]
+
+    ref = run("cpu", torch.float64)
+    with assert_ran("aten::convolution", "aten::convolution_backward"):
+        got = run(mojo_device, dtype)
+    tol = 1e-4 if dtype == torch.float32 else 3e-2
+    for g, r in zip(got, ref, strict=True):
+        torch.testing.assert_close(g.cpu().double(), r, atol=tol, rtol=tol)
+
+
+def test_conv_empty_batch_and_channels(mojo_device):
+    """No products at all: the output is the bias broadcast (or zeros) and
+    every gradient zeros, as on CPU."""
+    for x, w, b in [
+        (torch.randn(0, 3, 5, 5), torch.randn(4, 3, 3, 3), torch.randn(4)),
+        (torch.randn(2, 0, 5, 5), torch.randn(4, 0, 3, 3), torch.randn(4)),
+    ]:
+        ts = [t.to(mojo_device).requires_grad_() for t in (x, w, b)]
+        got = F.conv2d(ts[0], ts[1], ts[2])
+        got.sum().backward()
+        ref_ts = [t.clone().requires_grad_() for t in (x, w, b)]
+        ref = F.conv2d(ref_ts[0], ref_ts[1], ref_ts[2])
+        ref.sum().backward()
+        torch.testing.assert_close(got.detach().cpu(), ref.detach())
+        for g, r in zip(ts, ref_ts, strict=True):
+            assert g.grad is not None
+            torch.testing.assert_close(g.grad.cpu(), r.grad)
+
+
+@pytest.mark.parametrize(
+    "call,match",
+    [
+        (lambda x, w: F.conv2d(x, w, stride=-1), "non-positive stride"),
+        (lambda x, w: F.conv2d(x, w, padding=-1), "negative padding"),
+        (lambda x, w: F.conv2d(x, w, groups=3), "expected weight to be divisible"),
+        (lambda x, w: F.conv2d(x[:, :2], w), "to have 3 channels, but got 2"),
+        (lambda x, w: F.conv2d(x[..., :2, :2], w), "Kernel size can't be greater"),
+        (lambda x, w: F.conv2d(x, w, torch.randn(3).to(x)), "expected bias to be"),
+        (lambda x, w: F.conv2d(x, w.half()), "should be the same"),
+        (
+            lambda x, w: torch.ops.aten.convolution(
+                x, w, None, [1, 1, 1], [0], [1], False, [0], 1
+            ),
+            "expected stride to be a single integer value or a list of 2",
+        ),
+        (
+            lambda x, w: F.conv_transpose2d(x, w.transpose(0, 1)[:2]),
+            "Given transposed=1, weight of size",
+        ),
+    ],
+)
+def test_convolution_errors_match_torch(mojo_device, call, match):
+    """aten::convolution is registered directly, so `_convolution`'s argument
+    and shape checks are ours to make: same RuntimeError, same message."""
+    x = torch.randn(2, 3, 6, 6, device=mojo_device)
+    w = torch.randn(4, 3, 3, 3, device=mojo_device)
+    with pytest.raises(RuntimeError, match=match):
+        call(x, w)
+    with pytest.raises(RuntimeError, match=match):
+        call(x.cpu(), w.cpu())
+
+
+# --- the backend-specific convolution entry points -----------------------------
+
+
+def _entry_cases():
+    gen = torch.Generator().manual_seed(2)
+
+    def r(*s):
+        return torch.randn(*s, generator=gen)
+
+    x2, x3 = r(2, 3, 9, 8), r(2, 3, 5, 6, 7)
+    return [
+        (
+            "_conv_depthwise2d",
+            (x2, r(6, 1, 3, 3), [3, 3], r(6), [2, 1], [1, 1], [2, 1]),
+            lambda x, w, k, b, s, p, d: F.conv2d(x, w, b, s, p, d, x.shape[1]),
+        ),
+        (
+            "conv_depthwise3d",
+            (x3, r(3, 1, 2, 3, 3), [2, 3, 3], None, [1, 2, 1], [1, 1, 0], [1, 1, 2]),
+            lambda x, w, k, b, s, p, d: F.conv3d(x, w, b, s, p, d, x.shape[1]),
+        ),
+        (
+            "_slow_conv2d_forward",
+            (x2, r(5, 3, 3, 2), [3, 2], r(5), [2, 1], [1, 0]),
+            None,
+        ),
+        (
+            "slow_conv3d_forward",
+            (x3, r(4, 3, 2, 3, 2), [2, 3, 2], r(4), [1, 2, 1], [0, 1, 1]),
+            None,
+        ),
+        (
+            "slow_conv_dilated2d",
+            (x2, r(5, 3, 3, 3), [3, 3], None, [1, 2], [2, 1], [2, 1]),
+            None,
+        ),
+        (
+            "slow_conv_dilated3d",
+            (x3, r(4, 3, 2, 2, 3), [2, 2, 3], r(4), [1, 1, 1], [1, 0, 1], [2, 1, 1]),
+            None,
+        ),
+        (
+            "slow_conv_transpose2d",
+            (x2, r(3, 4, 3, 2), [3, 2], r(4), [2, 1], [1, 0], [1, 0], [1, 2]),
+            None,
+        ),
+        (
+            "slow_conv_transpose3d",
+            (
+                x3,
+                r(3, 2, 2, 2, 3),
+                [2, 2, 3],
+                r(2),
+                [2, 1, 2],
+                [0, 1, 1],
+                [1, 0, 1],
+                [1, 2, 1],
+            ),
+            None,
+        ),
+    ]
+
+
+_UNBATCHED = {
+    "_conv_depthwise2d": "reject",
+    "conv_depthwise3d": "keep",
+    "_slow_conv2d_forward": "reject",
+    "slow_conv3d_forward": "reject",
+    "slow_conv_dilated2d": "squeeze",
+    "slow_conv_dilated3d": "squeeze",
+    "slow_conv_transpose2d": "keep",
+    "slow_conv_transpose3d": "squeeze",
+}
+
+
+def _on(device, args):
+    return [a.to(device) if isinstance(a, torch.Tensor) else a for a in args]
+
+
+@pytest.mark.parametrize(
+    "name,args,ref_fn", _entry_cases(), ids=lambda v: v if isinstance(v, str) else ""
+)
+def test_conv_entry_points(mojo_device, name, args, ref_fn):
+    """Each entry point is the convolution of its fixed groups/dilation/
+    transposition: forward, its out= overload and an unbatched input."""
+    op = getattr(torch.ops.aten, name)
+    # The depthwise kernels are CUDA-only upstream: their reference is the
+    # grouped convolution they compute.
+    ref = ref_fn(*args) if ref_fn else op(*args)
+    with assert_ran(f"aten::{name}"):
+        got = op(*_on(mojo_device, args))
+    torch.testing.assert_close(got.cpu(), ref, atol=1e-4, rtol=1e-4)
+    out = torch.empty(3, device=mojo_device)
+    with assert_ran(
+        f"aten::{name}.out" if hasattr(op, "out") else f"aten::{name}.output"
+    ):
+        (op.out if hasattr(op, "out") else op.output)(
+            *_on(mojo_device, args),
+            **{("out" if hasattr(op, "out") else "output"): out},
+        )
+    torch.testing.assert_close(out.cpu(), ref, atol=1e-4, rtol=1e-4)
+    # An unbatched input: rejected, or computed with the batch axis kept or
+    # squeezed back out, per upstream kernel (CUDA's, or CPU's where only CPU
+    # has one).
+    unbatched = _on(mojo_device, [args[0][0], *args[1:]])
+    rule = _UNBATCHED[name]
+    if rule == "reject":
+        with pytest.raises(RuntimeError, match="input tensor"):
+            op(*unbatched)
+    else:
+        want = ref[:1] if rule == "keep" else ref[0]
+        torch.testing.assert_close(op(*unbatched).cpu(), want, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "mask", [[True, True, True], [True, False, True], [False, True, False]], ids=str
+)
+def test_slow_conv2d_backward(mojo_device, mask):
+    gen = torch.Generator().manual_seed(3)
+    x = torch.randn(2, 3, 9, 8, generator=gen)
+    w = torch.randn(5, 3, 3, 2, generator=gen)
+    go = torch.randn(2, 5, 5, 9, generator=gen)
+    args = ([3, 2], [2, 1], [1, 1])
+    ref = torch.ops.aten._slow_conv2d_backward(go, x, w, *args, [True] * 3)
+    with assert_ran("aten::_slow_conv2d_backward.output_mask"):
+        got = torch.ops.aten._slow_conv2d_backward(
+            *_on(mojo_device, (go, x, w)), *args, mask
+        )
+    for g, r, m in zip(got, ref, mask, strict=True):
+        if not m:
+            assert g is None
+            continue
+        torch.testing.assert_close(g.cpu(), r, atol=1e-4, rtol=1e-4)
+    outs = [torch.empty(0, device=mojo_device) for _ in range(3)]
+    with assert_ran("aten::_slow_conv2d_backward.grad_input"):
+        torch.ops.aten._slow_conv2d_backward.grad_input(
+            *_on(mojo_device, (go, x, w)),
+            *args,
+            grad_input=outs[0],
+            grad_weight=outs[1],
+            grad_bias=outs[2],
+        )
+    for g, r in zip(outs, ref, strict=True):
+        torch.testing.assert_close(g.cpu(), r, atol=1e-4, rtol=1e-4)
+
+
+def test_conv_entry_point_out_checks_dtype(mojo_device):
+    x = torch.randn(1, 3, 6, 6, device=mojo_device)
+    w = torch.randn(4, 3, 3, 3, device=mojo_device)
+    out = torch.empty(0, device=mojo_device, dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        torch.ops.aten.slow_conv_dilated2d.out(
+            x, w, [3, 3], None, [1, 1], [0, 0], [1, 1], out=out
+        )
 
 
 # --- convolution_backward -----------------------------------------------------
@@ -2309,16 +2587,6 @@ def test_convolution_backward_strided_operands(mojo_device):
         got = torch.ops.aten.convolution_backward(go_m, x_m, w_m, *rest, [True] * 3)
     for g, r in zip(got, ref, strict=True):
         torch.testing.assert_close(g.cpu().double(), r, atol=1e-4, rtol=1e-4)
-
-
-def test_convolution_backward_transposed_declines(mojo_device):
-    x = torch.randn(1, 3, 8, 8).to(mojo_device)
-    w = torch.randn(3, 2, 3, 3).to(mojo_device)
-    go = torch.randn(1, 2, 10, 10).to(mojo_device)
-    with pytest.raises(NotImplementedError):
-        torch.ops.aten.convolution_backward(
-            go, x, w, [2], [1, 1], [0, 0], [1, 1], True, [0, 0], 1, [True] * 3
-        )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -2762,6 +3030,7 @@ _SLOT_STABILITY_PROGRAM = """
 import os, time
 os.environ.setdefault("MODULAR_TELEMETRY_ENABLED", "0")
 import torch
+import torch.nn.functional as F
 from torch_mojo_backend import register_mojo_devices
 
 register_mojo_devices()
