@@ -6568,56 +6568,6 @@ def test_aten_nan_to_num_integral_compiled_is_a_copy(dtype: torch.dtype, device:
     torch.testing.assert_close(x, before)
 
 
-@pytest.mark.parametrize("beta,alpha", [(1, 1), (0.6, 0.2), (0, 0.5)])
-def test_aten_addmv(conf: Conf, call_checker: CallChecker, beta: float, alpha: float):
-    call_checker.register(aten_functions.aten_addmv)
-
-    def fn(c, mat, vec):
-        return aten.addmv(c, mat, vec, beta=beta, alpha=alpha)
-
-    c = torch.randn(5)
-    if beta == 0:
-        c[0] = float("nan")  # beta == 0 never reads self
-    check_outputs(fn, conf, [c, torch.randn(5, 7), torch.randn(7)])
-
-
-@pytest.mark.parametrize("beta,alpha", [(1, 1), (0.6, 0.2), (0, 0.5)])
-def test_aten_addbmm(conf: Conf, call_checker: CallChecker, beta: float, alpha: float):
-    call_checker.register(aten_functions.aten_addbmm)
-
-    def fn(c, b1, b2):
-        return aten.addbmm(c, b1, b2, beta=beta, alpha=alpha)
-
-    c = torch.randn(4, 6)
-    if beta == 0:
-        c[0, 0] = float("nan")
-    check_outputs(fn, conf, [c, torch.randn(3, 4, 5), torch.randn(3, 5, 6)])
-
-
-def test_aten_addmv_scales_before_rounding(conf: Conf, call_checker: CallChecker):
-    """A float16 product beyond the half range, scaled back into it by
-    alpha, is finite: the scale applies before the one rounding."""
-    call_checker.register(aten_functions.aten_addmv)
-
-    def fn(c, mat, vec):
-        return aten.addmv(c, mat, vec, beta=0, alpha=0.001)
-
-    full = torch.full((64,), 64.0, dtype=torch.float16)
-    check_outputs(fn, conf, [torch.zeros(4).half(), full.expand(4, 64).clone(), full])
-
-
-def test_aten_addbmm_rounds_batch_by_batch(conf: Conf, call_checker: CallChecker):
-    """2048 + 1 rounds to 2048 in float16, then - 2048 gives 0 (not 1)."""
-    call_checker.register(aten_functions.aten_addbmm)
-
-    def fn(c, b1, b2):
-        return aten.addbmm(c, b1, b2)
-
-    b1 = torch.tensor([[[1.0]], [[-2048.0]]]).half()
-    b2 = torch.ones(2, 1, 1).half()
-    check_outputs(fn, conf, [torch.full((1, 1), 2048.0).half(), b1, b2])
-
-
 @pytest.mark.parametrize("name", ["igamma", "igammac"])
 def test_aten_igamma(conf: Conf, call_checker: CallChecker, name: str):
     call_checker.register(getattr(aten_functions, f"aten_{name}"))

@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.native.conftest import side_stream_or_skip, skip_if_metal
+from tests.native.conftest import is_metal, side_stream_or_skip, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.testing import CallChecker
@@ -533,6 +533,17 @@ def test_linear_bias_broadcasts_like_torch(mojo_gpu):
     torch.testing.assert_close(
         got.cpu(), torch.nn.functional.linear(x, w, bias), atol=1e-5, rtol=1e-5
     )
+    # `add_` in place: a float64 bias does not promote the float32 output,
+    # and a bias that would enlarge the output raises.
+    dev_x, dev_w = x.to(mojo_gpu), w.to(mojo_gpu)
+    if not is_metal(mojo_gpu):  # no float64 on Apple GPUs
+        wide = torch.nn.functional.linear(dev_x, dev_w, bias.double().to(mojo_gpu))
+        assert wide.dtype == torch.float32
+        torch.testing.assert_close(wide.cpu(), got.cpu(), atol=1e-5, rtol=1e-5)
+    with pytest.raises(RuntimeError):
+        torch.nn.functional.linear(
+            dev_x[:, 0], dev_w, torch.randn(2, 2, 5, device=mojo_gpu)
+        )
 
 
 def test_addmm_activation_empty_reduction_skips_the_activation(mojo_gpu):
