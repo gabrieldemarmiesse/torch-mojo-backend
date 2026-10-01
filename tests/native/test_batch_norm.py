@@ -631,3 +631,25 @@ def test_batch_norm_channels_last_outputs(mojo_device, training):
         [True, True, True],
     )[0]
     assert gi.stride() == xcl.stride()
+
+
+def test_batch_norm_stats_large_constant_channel(mojo_device):
+    """CUDA's Welford reduction: a channel of 65536 copies of 1000.1 has
+    zero variance (naive float32 sums would lose it to cancellation)."""
+    x = torch.full((1, 2, 256, 256), 1000.1)
+    mean, invstd = aten.batch_norm_stats(x.to(mojo_device), 1e-5)
+    _close(mean, torch.full((2,), 1000.1))
+    _close(invstd, torch.full((2,), 1e-5).rsqrt())
+
+
+def test_batch_norm_elemt_mixed_parameter_dtypes(mojo_device):
+    """CUDA's TensorIterator route reads each parameter in its own dtype
+    into a float32 computation: a float32 bias is not rounded to half."""
+    x = torch.full((5, 3, 4), -100.0, dtype=torch.half).transpose(0, 2)
+    w = torch.ones(3, dtype=torch.half)
+    b = torch.full((3,), 100.01)
+    got = aten.batch_norm_elemt(
+        *_to(mojo_device, x, w, b, torch.zeros(3), torch.ones(3)), 1e-5
+    )
+    want = torch.full(x.shape, 100.01 - 100.0).half()
+    torch.testing.assert_close(got.cpu(), want)

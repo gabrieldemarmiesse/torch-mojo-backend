@@ -10,8 +10,8 @@ Normalization.cuh and Normalization.cu at v2.14.0) in the accumulation dtype
 `acc_type` -- float32 for half inputs, float64 for float64 -- with the same
 operation order in every elementwise expression:
 
-  * statistics: mean and the BIASED variance per channel (two passes here,
-    Welford there: equal up to rounding), `InvStd` = 0 when `var == 0 and
+  * statistics: Welford mean and BIASED variance per channel (per-thread
+    passes merged pairwise, as CUDA's kernel), `InvStd` = 0 when `var == 0 and
     eps == 0`, else `1 / sqrt(var + eps)` with `var + eps` formed in double
     as CUDA's `T + double` is (in float32 on Apple GPUs, which have no
     double);
@@ -78,7 +78,7 @@ def _stats_kernel[
     momentum: Scalar[_acc[rdtype]()],
     bessel: Scalar[_acc[rdtype]()],
 ):
-    """One block per channel: mean, then the biased variance about it, then
+    """One block per channel: Welford mean and biased variance, then
     `InvStd` (batch_norm_stats) or the variance plus the running update
     (batch_norm_update_stats)."""
     comptime acc_t = _acc[dtype]()
@@ -87,32 +87,64 @@ def _stats_kernel[
     var count = Int(batch_arg) * hxw
     var c = Int(block_idx.x)
     var tid = Int(thread_idx.x)
-    var s = Scalar[acc_t](0)
+    # batch_norm_collect_statistics_kernel: a Welford pass per thread,
+    # then the pairwise Welford merge across the block (CUDA merges by
+    # warp shuffles; here a shared-memory tree, the same merge formula).
+    var avg = Scalar[acc_t](0)
+    var m2_t = Scalar[acc_t](0)
+    var n_t = 0
     var j = tid
     while j < count:
         var n = j // hxw
-        s += in_ptr[unsafe_offset=(n * channels + c) * hxw + j - n * hxw].cast[
-            acc_t
-        ]()
+        var v = in_ptr[
+            unsafe_offset=(n * channels + c) * hxw + j - n * hxw
+        ].cast[acc_t]()
+        var d1 = v - avg
+        n_t += 1
+        avg += d1 / Scalar[acc_t](n_t)
+        m2_t += d1 * (v - avg)
         j += BN_SYNC_THREADS
-    var total = block_sum[acc_t, BN_SYNC_THREADS](s)
-    # An empty channel: Welford's mean stays 0, its variance is 0 / 0.
-    var mean = total / Scalar[acc_t](count) if count > 0 else Scalar[acc_t](0)
-    var q = Scalar[acc_t](0)
-    j = tid
-    while j < count:
-        var n = j // hxw
-        var d = (
-            in_ptr[unsafe_offset=(n * channels + c) * hxw + j - n * hxw].cast[
-                acc_t
-            ]()
-            - mean
-        )
-        q += d * d
-        j += BN_SYNC_THREADS
-    var m2 = block_sum[acc_t, BN_SYNC_THREADS](q)
+    var sh_avg = stack_allocation[
+        BN_SYNC_THREADS, acc_t, address_space=AddressSpace.SHARED
+    ]()
+    var sh_m2 = stack_allocation[
+        BN_SYNC_THREADS, acc_t, address_space=AddressSpace.SHARED
+    ]()
+    var sh_n = stack_allocation[
+        BN_SYNC_THREADS, DType.int64, address_space=AddressSpace.SHARED
+    ]()
+    sh_avg[unsafe_offset=tid] = avg
+    sh_m2[unsafe_offset=tid] = m2_t
+    sh_n[unsafe_offset=tid] = Int64(n_t)
+    barrier()
+    var stride = BN_SYNC_THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            var n_a = Int(sh_n[unsafe_offset=tid])
+            var n_b = Int(sh_n[unsafe_offset=tid + stride])
+            var avg_a = sh_avg[unsafe_offset=tid]
+            var avg_b = sh_avg[unsafe_offset=tid + stride]
+            var factor = Scalar[acc_t](1) / Scalar[acc_t](max(1, n_a + n_b))
+            var delta = avg_a - avg_b
+            sh_m2[unsafe_offset=tid] = (
+                sh_m2[unsafe_offset=tid]
+                + sh_m2[unsafe_offset=tid + stride]
+                + delta
+                * delta
+                * Scalar[acc_t](n_a)
+                * Scalar[acc_t](n_b)
+                * factor
+            )
+            sh_avg[unsafe_offset=tid] = (
+                Scalar[acc_t](n_a) * avg_a + Scalar[acc_t](n_b) * avg_b
+            ) * factor
+            sh_n[unsafe_offset=tid] = Int64(n_a + n_b)
+        barrier()
+        stride //= 2
     if tid != 0:
         return
+    var mean = sh_avg[unsafe_offset=0]
+    var m2 = sh_m2[unsafe_offset=0]
     var var_ = m2 / Scalar[acc_t](count)
     mean_ptr[unsafe_offset=c] = mean
     var mode = Int(invstd_arg)

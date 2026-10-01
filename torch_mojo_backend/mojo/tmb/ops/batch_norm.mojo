@@ -473,21 +473,21 @@ def _elemt(args: Values) raises -> Owned:
     var invstd = _as_stype(
         _channel_vec(args, 4, a, p.c, "invstd"), mean.t.stype
     )
-    var pdtype = a.dtype
+    # Every route computes in the accumulation dtype with each parameter
+    # read in its own dtype (the typed routes' checks above require one
+    # dtype; the TensorIterator route mixes them), so both are handed to the
+    # kernel converted to that dtype -- exact, nothing is rounded down.
+    var acc = _acc_of(a.stype)
+    var pdtype = max_dtype(acc)
     var w_ptr = 0
     var b_ptr = 0
     var w: Optional[Dense] = None
     var b: Optional[Dense] = None
     if _opt(args, 1):
-        w = _channel_vec(args, 1, a, p.c, "weight")
-        pdtype = w.value().t.dtype
+        w = _as_stype(_channel_vec(args, 1, a, p.c, "weight"), acc)
         w_ptr = w.value().t.ptr
     if _opt(args, 2):
-        var bd = _channel_vec(args, 2, a, p.c, "bias")
-        if w:
-            bd = _as_stype(bd^, w.value().t.stype)
-        else:
-            pdtype = bd.t.dtype
+        var bd = _as_stype(_channel_vec(args, 2, a, p.c, "bias"), acc)
         b_ptr = bd.t.ptr
         b = bd^
     var out = own(new_tensor(a.shape, a.rank, a.stype, a.device))
