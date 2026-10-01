@@ -1645,24 +1645,50 @@ def aten_addbmm(
     beta: Scalar = 1.0,
     alpha: Scalar = 1.0,
 ) -> MaxTensor:
-    # beta * input + alpha * sum_i batch1[i] @ batch2[i]
-    product = F.squeeze(_reduce_sum(operator.matmul(batch1, batch2), axis=0), axis=0)
-    return _blas_scale_add(input, product, beta, alpha)
+    # ATen's addbmm_impl_: one addmm_ per batch (beta on the first, 1 after),
+    # each rounded to the dtype, so the result rounds where torch's does.
+    batches = batch1.shape[0]
+    if not isinstance(batches, StaticDim):
+        raise NotImplementedError(
+            f"addbmm needs a statically known batch count, got {batches}"
+        )
+    shape = [batch1.shape[1], batch2.shape[2]]
+    if int(batches) == 0:
+        zero = _scalar_constant(0, dtype=input.dtype, device=input.device)
+        if beta == 0:
+            return _broadcast_to(zero, shape)
+        return _broadcast_to(operator.mul(input, beta), shape)
+    acc = _blas_finish(input, _blas_product(batch1[0], batch2[0], alpha), beta)
+    for i in range(1, int(batches)):
+        acc = _blas_finish(acc, _blas_product(batch1[i], batch2[i], alpha), 1)
+    return acc
 
 
-def _blas_scale_add(
-    input: MaxTensor, product: MaxTensor, beta: Scalar, alpha: Scalar
-) -> MaxTensor:
-    """`beta * input + alpha * product` for the addmv / addbmm family:
-    beta == 0 never reads input, so a NaN there does not propagate (the
-    BLAS contract torch documents)."""
-    if alpha != 1:
-        product = operator.mul(product, alpha)
-    if beta == 0:
-        return product
-    if beta != 1:
-        input = operator.mul(input, beta)
-    return operator.add(input, product)
+def _blas_wide(dtype: DType) -> DType:
+    """cuBLAS's compute type: float for the half types, else the dtype."""
+    return DType.float32 if dtype in (DType.float16, DType.bfloat16) else dtype
+
+
+def _blas_product(a: MaxTensor, b: MaxTensor, alpha: Scalar) -> MaxTensor:
+    """`alpha * (a @ b)` in the compute type (unrounded). alpha == 0 never
+    reads a or b, as BLAS promises: a NaN there does not propagate."""
+    wide = _blas_wide(a.dtype)
+    if alpha == 0:
+        zero = _scalar_constant(0, dtype=wide, device=a.device)
+        return _broadcast_to(zero, [*a.shape[:-1], b.shape[-1]])
+    product = operator.matmul(F.cast(a, wide), F.cast(b, wide))
+    return product if alpha == 1 else operator.mul(product, alpha)
+
+
+def _blas_finish(input: MaxTensor, product: MaxTensor, beta: Scalar) -> MaxTensor:
+    """`beta * input + product` in the compute type, rounded once to the
+    input's dtype. beta == 0 never reads input."""
+    if beta != 0:
+        scaled = F.cast(input, product.dtype)
+        if beta != 1:
+            scaled = operator.mul(scaled, beta)
+        product = operator.add(scaled, product)
+    return F.cast(product, input.dtype)
 
 
 # addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
@@ -1742,9 +1768,14 @@ def aten_addmv(
     beta: Scalar = 1.0,
     alpha: Scalar = 1.0,
 ) -> MaxTensor:
-    # beta * input + alpha * (mat @ vec), the vector as a one-column matrix
-    product = F.squeeze(operator.matmul(mat, F.unsqueeze(vec, axis=-1)), axis=-1)
-    return _blas_scale_add(input, product, beta, alpha)
+    # beta * input + alpha * (mat @ vec), the vector as a one-column matrix;
+    # the gemv takes alpha and beta in scalar_t (rounded to a half dtype).
+    if mat.dtype in (DType.float16, DType.bfloat16):
+        half = torch.float16 if mat.dtype == DType.float16 else torch.bfloat16
+        alpha = torch.tensor(float(alpha)).to(half).item()
+        beta = torch.tensor(float(beta)).to(half).item()
+    product = F.squeeze(_blas_product(mat, F.unsqueeze(vec, axis=-1), alpha), axis=-1)
+    return _blas_finish(input, product, beta)
 
 
 # alias(Tensor(a) self) -> Tensor(a)

@@ -6594,6 +6594,30 @@ def test_aten_addbmm(conf: Conf, call_checker: CallChecker, beta: float, alpha: 
     check_outputs(fn, conf, [c, torch.randn(3, 4, 5), torch.randn(3, 5, 6)])
 
 
+def test_aten_addmv_scales_before_rounding(conf: Conf, call_checker: CallChecker):
+    """A float16 product beyond the half range, scaled back into it by
+    alpha, is finite: the scale applies before the one rounding."""
+    call_checker.register(aten_functions.aten_addmv)
+
+    def fn(c, mat, vec):
+        return aten.addmv(c, mat, vec, beta=0, alpha=0.001)
+
+    full = torch.full((64,), 64.0, dtype=torch.float16)
+    check_outputs(fn, conf, [torch.zeros(4).half(), full.expand(4, 64).clone(), full])
+
+
+def test_aten_addbmm_rounds_batch_by_batch(conf: Conf, call_checker: CallChecker):
+    """2048 + 1 rounds to 2048 in float16, then - 2048 gives 0 (not 1)."""
+    call_checker.register(aten_functions.aten_addbmm)
+
+    def fn(c, b1, b2):
+        return aten.addbmm(c, b1, b2)
+
+    b1 = torch.tensor([[[1.0]], [[-2048.0]]]).half()
+    b2 = torch.ones(2, 1, 1).half()
+    check_outputs(fn, conf, [torch.full((1, 1), 2048.0).half(), b1, b2])
+
+
 @pytest.mark.parametrize("name", ["igamma", "igammac"])
 def test_aten_igamma(conf: Conf, call_checker: CallChecker, name: str):
     call_checker.register(getattr(aten_functions, f"aten_{name}"))
