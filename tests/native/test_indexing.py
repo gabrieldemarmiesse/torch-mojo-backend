@@ -990,7 +990,7 @@ def test_scatter_int64_scalar_is_exact(mojo_device, reduce):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("reduce", ["sum", "mean"])
 def test_scatter_reduce_sum_is_ordered_and_deterministic(mojo_device, dtype, reduce):
-    """A floating sum takes the sorted route (`_scatter_via_index_put`): the
+    """Under deterministic algorithms a floating sum takes the sorted route (`_scatter_via_index_put`): the
     same answer every run, each slot summed in index order, so it matches
     CPU even where atomics would round differently; and it is allowed
     under torch.use_deterministic_algorithms."""
@@ -1150,27 +1150,74 @@ def test_fill_tensor_overflow(mojo_device):
     [(torch.bfloat16, 1024), (torch.float16, 4096), (torch.float16, 3000)],
 )
 @pytest.mark.parametrize("include_self", [True, False])
+@pytest.mark.parametrize("deterministic", [False, True])
 def test_mean_counts_do_not_saturate_against_the_sum(
-    mojo_device, dtype, n, include_self
+    mojo_device, dtype, n, include_self, deterministic
 ):
-    """CUDA-faithful references (checked against stock CUDA 2.11).
-    scatter_reduce mean takes the deterministic index_put route for the sum
-    AND the count (`count.scatter_add_`): both accumulate in float and are
-    stored once, so n ones average to 1. index_reduce adds both with dtype
-    atomics: sum and count saturate together (256 for bfloat16, 2048 for
-    float16), also 1."""
+    """CUDA-faithful references (checked against stock CUDA 2.11). By
+    default CUDA adds the sum and the count with dtype atomics: both
+    saturate together (256 for bfloat16, 2048 for float16), so n ones
+    average to 1. Under deterministic algorithms scatter_reduce takes the
+    index_put route for the sum AND the count: both accumulate in float and
+    are stored once, also 1."""
     x = torch.zeros(1, dtype=dtype)
-    idx = torch.zeros(n, dtype=torch.long)
-    ones = torch.ones(n, dtype=dtype)
+    idx = torch.zeros(n, dtype=torch.long).to(mojo_device)
+    ones = torch.ones(n, dtype=dtype).to(mojo_device)
     d = x.to(mojo_device)
-    got = d.scatter_reduce(
-        0, idx.to(mojo_device), ones.to(mojo_device), "mean", include_self=include_self
-    )
+    saturated = torch.zeros(1, dtype=dtype)
+    for _ in range(n):
+        saturated += 1  # one rounding per add, like a dtype atomic
+    expected_sum = torch.full((1,), float(n)).to(dtype) if deterministic else saturated
+    before = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(deterministic)
+    try:
+        mean = d.scatter_reduce(0, idx, ones, "mean", include_self=include_self)
+        total = d.scatter_reduce(0, idx, ones, "sum")
+    finally:
+        torch.use_deterministic_algorithms(before)
+    _check(mean, torch.ones(1, dtype=dtype))
+    _check(total, expected_sum)
+    # index_reduce is always the atomic route (it alerts in deterministic
+    # mode, like CUDA).
+    got = d.index_reduce(0, idx, ones, "mean", include_self=include_self)
     _check(got, torch.ones(1, dtype=dtype))
-    got = d.index_reduce(
-        0, idx.to(mojo_device), ones.to(mojo_device), "mean", include_self=include_self
-    )
-    _check(got, torch.ones(1, dtype=dtype))
-    # The sorted sum itself is float-accumulated (exact here).
-    got = d.scatter_reduce(0, idx.to(mojo_device), ones.to(mojo_device), "sum")
-    _check(got, torch.full((1,), float(n)).to(dtype))
+
+
+def test_scatter_add_and_index_add_in_place_overlap_and_determinism(mojo_device):
+    a = torch.arange(6.0, device=mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        a.scatter_add_(0, torch.tensor([0, 1], device=mojo_device), a[:2])
+    with pytest.raises(RuntimeError, match="single memory location"):
+        a.index_add_(0, torch.tensor([0, 1], device=mojo_device), a[2:4])
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn(30, 5, generator=g)
+    src = torch.randn(400, 5, generator=g) * 100
+    idx = torch.randint(0, 30, (400, 5), generator=g)
+    rows = torch.randint(0, 30, (400,), generator=g)
+    before = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        sa = x.to(mojo_device).scatter_add(0, idx.to(mojo_device), src.to(mojo_device))
+        ia = x.to(mojo_device).index_add(0, rows.to(mojo_device), src.to(mojo_device))
+    finally:
+        torch.use_deterministic_algorithms(before)
+    # Ordered sums: exactly CPU's sequential order.
+    _check(sa, x.scatter_add(0, idx, src))
+    _check(ia, x.index_add(0, rows, src))
+
+
+def test_unique_dim_many_columns(mojo_device):
+    """One merge sort of the rows, whatever their width."""
+    g = torch.Generator().manual_seed(5)
+    x = torch.randint(0, 2, (6, 20000), generator=g)
+    x[3] = x[0]
+    for dim in (0, 1):
+        got = torch.unique(
+            x.to(mojo_device), dim=dim, return_inverse=True, return_counts=True
+        )
+        for g_, e in zip(
+            got,
+            torch.unique(x, dim=dim, return_inverse=True, return_counts=True),
+            strict=True,
+        ):
+            _check(g_, e)

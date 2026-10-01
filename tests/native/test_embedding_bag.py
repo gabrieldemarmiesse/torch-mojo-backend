@@ -357,3 +357,40 @@ def test_embedding_bag_backward_is_deterministic(mojo_device):
     finally:
         torch.use_deterministic_algorithms(before)
     assert torch.equal(grads[0], grads[1])
+
+
+def test_embedding_renorm_validates_every_index_first(mojo_device):
+    w = torch.full((10, 3), 5.0, device=mojo_device)
+    with pytest.raises(IndexError, match="out of bounds"):
+        torch.embedding_renorm_(w, torch.tensor([0, 99], device=mojo_device), 1.0, 2.0)
+    # Nothing was renormed: row 0 is untouched.
+    torch.testing.assert_close(w.cpu(), torch.full((10, 3), 5.0))
+
+
+@pytest.mark.parametrize("mode", ["sum", "mean"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_embedding_bag_backward_default_route(mojo_device, mode, dtype):
+    """The default (atomic) route agrees with the deterministic one."""
+    g = torch.Generator().manual_seed(11)
+    weight = torch.randn(30, 8, generator=g).to(dtype)
+    indices = torch.randint(0, 30, (500,), generator=g)
+    offsets = torch.arange(0, 500, 25)
+    grad = torch.randn(20, 8, generator=g).to(dtype)
+    grads = []
+    before = torch.are_deterministic_algorithms_enabled()
+    try:
+        for det in (False, True):
+            torch.use_deterministic_algorithms(det)
+            w = weight.to(mojo_device).requires_grad_(True)
+            F.embedding_bag(
+                indices.to(mojo_device),
+                w,
+                offsets.to(mojo_device),
+                mode=mode,
+                scale_grad_by_freq=True,
+                padding_idx=3,
+            ).backward(grad.to(mojo_device))
+            grads.append(_grad(w))
+    finally:
+        torch.use_deterministic_algorithms(before)
+    _close(grads[0], grads[1], dtype)

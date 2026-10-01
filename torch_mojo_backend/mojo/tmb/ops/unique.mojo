@@ -2,8 +2,8 @@
 
 _unique / _unique2 / unique_consecutive / unique_dim /
 unique_dim_consecutive, on the device like ATen's native/cuda/UniqueCub.cu
-and Unique.cu: a stable sort (the reductions group's sort.stable; rows sort
-lexicographically by one stable sort per column, last column first), then
+and Unique.cu: a stable sort (the reductions group's sort.stable; rows by
+the unique family's lexicographic merge sort of row indices), then
 the `unique` kernel family's adjacent difference, a cumsum of it (the group
 of every row), and one pass that writes each group's representative, the
 inverse indices and the run starts the counts come from. The output length
@@ -16,9 +16,9 @@ run_length_encode), which is visible for -0.0 / 0.0 runs; NaN never equals
 anything; outputs the caller did not ask for are empty, except the flat
 ops' inverse of an empty input, which has the input's shape, and a bool
 input's counts, which CUDA always returns. (Where CUDA returns an undefined
-inverse for bool, this returns an empty one.) Rows holding NaN sort as
-torch.sort orders them; CUDA's comparator-based row sort leaves their order
-undefined.
+inverse for bool, this returns an empty one.) Rows compare with CUDA's
+row comparator (`<` / `>`, so NaN ties with everything), but this merge
+sort is stable where thrust's need not be: NaN rows can group differently.
 """
 from std.utils import IndexList
 
@@ -197,6 +197,66 @@ def _groups(
     return g^
 
 
+struct RunBounds(Movable):
+    """For a sorted 1-D sequence: the run of every position (`gid`), and the
+    first and last position of every run (`first[g]`, `last[g]`); buffers of
+    the sequence's length, valid up to the run count, never read back."""
+
+    var gid: Owned
+    var first: Owned
+    var last: Owned
+
+    def __init__(out self, var gid: Owned, var first: Owned, var last: Owned):
+        self.gid = gid^
+        self.first = first^
+        self.last = last^
+
+
+def run_bounds(sorted: T) raises -> RunBounds:
+    """`RunBounds` of the contiguous 1-D `sorted` (no host read)."""
+    var n = sorted.numel
+    var device = sorted.device
+    var ctx = ctx_for(device)
+    var marks = _empty(n, ST_INT64, device)
+    var mc = KernelCall("unique", "UniqueMarks")
+    mc.arg_dtype(0, sorted.dtype)
+    mc.int(marks.t.ptr)
+    mc.int(sorted.ptr)
+    mc.int(0)
+    mc.tuple([n, 1])
+    mc.int(dtype_code(sorted.dtype))
+    mc.int(ctx_ptr(ctx))
+    mc.run()
+    var gid = _op(
+        "aten::cumsum",
+        "",
+        [tensor_arg(marks.t), _int(0), Value(0, 0, 0, 0)],
+    )
+    _ = marks^
+    var first = _empty(n, ST_INT64, device)
+    var last = _empty(n, ST_INT64, device)
+    for take_last in range(2):
+        var sc = KernelCall("unique", "UniqueSelect")
+        sc.arg_dtype(0, sorted.dtype)
+        sc.tuple(
+            [
+                0,
+                last.t.ptr if take_last else 0,
+                0,
+                0 if take_last else first.t.ptr,
+                sorted.ptr,
+                0,
+                gid.t.ptr,
+            ]
+        )
+        sc.tuple([take_last, n, 1])
+        sc.int(dtype_code(sorted.dtype))
+        sc.int(ctx_ptr(ctx))
+        sc.run()
+    _ = ctx
+    return RunBounds(gid^, first^, last^)
+
+
 def _check_dtype(t: T, what: String) raises:
     var dt = t.dtype
     if not (
@@ -343,7 +403,6 @@ def unique_rows(
     )
     var perm = Optional[Owned](None)
     if not consecutive:
-        # Lexicographic order: stable sorts by each column, last first.
         var order = _empty(num_inp, ST_INT64, device)
         _ = call_op(
             "aten::arange",
@@ -356,26 +415,27 @@ def unique_rows(
             ],
             1,
         )
-        for k in range(inner - 1, -1, -1):
-            var col = _op(
-                "aten::select", "int", [tensor_arg(flat.t), _int(1), _int(k)]
-            )
-            var keys = _op(
-                "aten::index_select",
-                "",
-                [tensor_arg(col.t), _int(0), tensor_arg(order.t)],
-            )
-            var p = _stable_sort_perm(keys.t)
-            var next = _op(
-                "aten::index_select",
-                "",
-                [tensor_arg(order.t), _int(0), tensor_arg(p.t)],
-            )
-            _ = p^
-            _ = keys^
-            _ = col^
-            _ = order^
-            order = next^
+        # One stable merge sort of the row indices by lexicographic row
+        # order (CUDA sorts them with a row comparator): log2(n) passes.
+        var other = _empty(num_inp, ST_INT64, device)
+        var ctx = ctx_for(device)
+        var width = 1
+        while width < num_inp:
+            var mc = KernelCall("unique", "RowMergePass")
+            mc.arg_dtype(0, flat.t.dtype)
+            mc.int(other.t.ptr)
+            mc.int(order.t.ptr)
+            mc.int(flat.t.ptr)
+            mc.tuple([num_inp, inner, width])
+            mc.int(dtype_code(flat.t.dtype))
+            mc.int(ctx_ptr(ctx))
+            mc.run()
+            var tmp = order^
+            order = other^
+            other = tmp^
+            width *= 2
+        _ = other^
+        _ = ctx
         perm = order^
     var perm_t = Optional[T](None)
     if perm:
