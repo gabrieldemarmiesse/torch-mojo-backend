@@ -65,6 +65,7 @@ from tmb.backend.abi import (
     v_f64,
     v_int,
     v_scalar_is_bool,
+    v_scalar_is_integral,
     v_tensor,
     view_strided,
 )
@@ -88,6 +89,7 @@ from tmb.ops.common import (
     is_int_stype,
     promote_types,
     resize_out,
+    result_type,
     same_view,
     scalar_to_float,
     scalar_to_int,
@@ -1453,6 +1455,20 @@ def _round_to(c: _Coef, st: Int32) -> _Coef:
     return _Coef(c.f.cast[DType.bfloat16]().cast[DType.float64](), 0, False)
 
 
+def _mul_scalar(v: Value, st: Int32) raises -> _Coef:
+    """beta as `result.mul_(beta)` applies it: a wrapped double (unchecked)
+    on a floating result; on an integer one a floating Scalar promotes the
+    product to the default float, which the in-place result cannot hold."""
+    if is_int_stype(st):
+        if not v_scalar_is_integral(v):
+            raise Error(
+                "result type Float can't be cast to the desired output type ",
+                _scalar_type_name(max_dtype(st)),
+            )
+        return _Coef(0.0, v_int(v), True)
+    return _Coef(v_f64(v), 0, False)
+
+
 def _raw_zero(v: Value) raises -> Bool:
     """`scalar.toComplexDouble() == 0`: no range check, nothing converted."""
     return v_f64(v) == 0.0
@@ -1551,6 +1567,7 @@ def _blas(
     out_stype: Int32,
     dims: List[Int],
     dst: Optional[T],
+    gemv: Bool = False,
 ) raises -> Res:
     """`beta * addend + alpha * (a @ b)` of shape `dims` (the product's own
     shape, or addmv's `[m]` view of its `[m, 1]`), stored as `out_stype`:
@@ -1563,12 +1580,17 @@ def _blas(
         compute = ST_FLOAT32
     if not use_addend and (alpha.one() or k == 0):
         compute = out_stype  # the bare product: no epilogue
-    # alpha == 0: BLAS never reads A or B (a NaN there does not propagate),
-    # the result is `beta * addend`.
+    # alpha == 0, as stock CUDA behaves (measured, torch 2.14 / H100): the
+    # float32 / float64 GEMMs and addmv's gemv never read A or B (a NaN
+    # there does not propagate, the result is `beta * addend`); the float16
+    # / bfloat16 GEMMs (cublasGemmEx, float compute) still form the product,
+    # so `0 * NaN` (or `0 * inf`) is NaN.
+    var half = a.stype == ST_FLOAT16 or a.stype == ST_BFLOAT16
+    var skip = alpha.zero() and (gemv or not half)
     var product = own(
-        _zeros(
-            _product_dims(a, b), compute, a.device
-        ) if alpha.zero() else _product(a, b, compute)
+        _zeros(_product_dims(a, b), compute, a.device) if skip else _product(
+            a, b, compute
+        )
     )
     if not _has_dims(product.t, dims):
         var shaped = _view(product.t, dims)
@@ -1676,6 +1698,7 @@ def _blas_out(
     dims: List[Int],
     dest: Optional[T],
     activation: Int = ACT_NONE,
+    gemv: Bool = False,
 ) raises:
     """`_blas` into a fresh result or the caller's `dest`.
 
@@ -1689,7 +1712,7 @@ def _blas_out(
         _hand_back(
             rets,
             None,
-            _blas(addend, a, b, alpha, beta, out_stype, dims, None),
+            _blas(addend, a, b, alpha, beta, out_stype, dims, None, gemv),
             dims,
             activation,
         )
@@ -1701,6 +1724,7 @@ def _blas_out(
             shared = shared or shares_storage(d, addend.value())
         if not shared:
             resize_out(d, _index_list(dims), len(dims))
+    _dest_overlap(Optional[T](d.copy()), dims)
     var direct = _has_dims(d, dims)
     if direct and addend:
         var s = addend.value().copy()
@@ -1710,16 +1734,25 @@ def _blas_out(
     _hand_back(
         rets,
         Optional[T](d.copy()),
-        _blas(addend, a, b, alpha, beta, out_stype, dims, target),
+        _blas(addend, a, b, alpha, beta, out_stype, dims, target, gemv),
         dims,
         activation,
     )
 
 
 def _check_dest(dest: T, stype: Int32, like: T) raises:
-    """An `out=`: the result's dtype and device, never aliasing itself."""
+    """An `out=`: the result's dtype and device (its self-aliasing is
+    checked by `_dest_overlap` once any resize has happened)."""
     check_out_as(dest, stype, like)
-    assert_no_internal_overlap(dest)
+
+
+def _dest_overlap(dest: Optional[T], dims: List[Int]) raises:
+    """`assert_no_internal_overlap` of the tensor written, as the structured
+    kernels run it: after the meta's resize, so only a destination that
+    already has the result's shape (and will be written as it lies) can
+    alias itself. An in-place self always has it."""
+    if dest and _has_dims(dest.value(), dims):
+        assert_no_internal_overlap(dest.value())
 
 
 def _float_out_dtype_ok(in_st: Int32, out_dtype: Int32) -> Bool:
@@ -1866,7 +1899,6 @@ def op_mm_dtype_out(
         )
     _same_shape_out(dest, a, b)
     _check_same_device([dest.copy(), a.copy(), b.copy()])
-    assert_no_internal_overlap(dest)
     _blas_out(
         rets,
         None,
@@ -2007,7 +2039,6 @@ def op_bmm_dtype_out(
             "out_dtype must be the same as the dtype of the provided out tensor"
         )
     _check_same_device([dest.copy(), a.copy(), b.copy()])
-    assert_no_internal_overlap(dest)
     _blas_out(
         rets,
         None,
@@ -2091,9 +2122,15 @@ def _addmm_run(
         # CUDA's k == 0 shortcut returns `beta * self` before the epilogue
         # that would apply _addmm_activation's relu / gelu.
         act = ACT_NONE
+    _dest_overlap(dest, dims)
+    # The bias-fused GEMM routes take a bias vector (`self` of rank 1); any
+    # other self is the cuBLAS epilogue's `C`, added in the compute type
+    # before the one rounding (a half product past the dtype's range can
+    # come back into it), which those routes' separate add would not do.
     if (
         alpha.one()
         and beta.one()
+        and self.rank == 1
         and out_stype == mat1.stype
         and self.stype == mat1.stype
         and _is_float(mat1.dtype)
@@ -2170,7 +2207,6 @@ def op_addmm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var mat2 = v_tensor(args[unsafe_offset=2])
     _addmm_meta(self, mat1, mat2, False)
     _check_inplace(self, [mat1.dim(0), mat2.dim(1)])
-    assert_no_internal_overlap(self)
     _addmm_run(
         rets,
         self,
@@ -2239,7 +2275,6 @@ def op_addmm_dtype_out(
             "out_dtype must be the same as the dtype of the provided out tensor"
         )
     _addmm_dtype_self(self, mat1, out_dtype)
-    assert_no_internal_overlap(dest)
     _addmm_run(
         rets,
         self,
@@ -2335,11 +2370,7 @@ def _baddbmm_run(
             alpha = _coef(alpha_v, b1.stype)
             beta = _coef(beta_v, b1.stype)
         elif not _raw_zero(beta_v):
-            # `result.mul_(beta)`: the Scalar as a wrapped double, unchecked.
-            if is_int_stype(b1.stype):
-                beta = _Coef(0.0, v_int(beta_v), True)
-            else:
-                beta = _Coef(v_f64(beta_v), 0, False)
+            beta = _mul_scalar(beta_v, b1.stype)
     _blas_out(
         rets,
         Optional[T](self.copy()),
@@ -2499,7 +2530,6 @@ def op_baddbmm_dtype_out(
         raise Error(
             "out_dtype must be the same as the dtype of the provided out tensor"
         )
-    assert_no_internal_overlap(dest)
     _baddbmm_run(
         rets,
         self,
@@ -2597,15 +2627,12 @@ def _addbmm_run(
     var m = b1.dim(1)
     var k = b1.dim(2)
     var n = b2.dim(2)
+    _dest_overlap(dest, dims)
     var alpha = _unit(b1.stype, 0)
     var beta = alpha
     if nb == 0:
-        # `result.mul_(beta)`: the Scalar as a wrapped double, unchecked.
         if m * n > 0 and not _raw_zero(beta_v):
-            if is_int_stype(b1.stype):
-                beta = _Coef(0.0, v_int(beta_v), True)
-            else:
-                beta = _Coef(v_f64(beta_v), 0, False)
+            beta = _mul_scalar(beta_v, self.stype)
     else:
         # The first batch's addmm_ (its k == 0 shortcut included).
         var coefs = _coefs(alpha_v, beta_v, b1.stype, self.stype, m * n, k)
@@ -2728,8 +2755,6 @@ def op_addbmm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # self is computed fresh, then resized to the result and written; a
     # self already of the result's shape is accumulated in place.
     var dims = _addbmm_checks(self, b1, b2)
-    if _has_dims(self, dims):
-        assert_no_internal_overlap(self)
     _addbmm_run(
         rets,
         self,
@@ -2817,6 +2842,7 @@ def _addmv_run(
         vec.stype,
         [mat.dim(0)],
         dest,
+        gemv=True,
     )
     _ = col^
 
@@ -2867,7 +2893,6 @@ def op_addmv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var vec = v_tensor(args[unsafe_offset=2])
     _addmv_meta(self, mat, vec)
     _check_inplace(self, [mat.dim(0)])
-    assert_no_internal_overlap(self)
     _addmv_run(
         rets,
         self,
@@ -3337,26 +3362,51 @@ def _linear_vector(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
 
 # aten::linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
 def op_linear(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """ATen's `linear` (Linear.cpp), branch for branch: a 2-D input with a
+    bias is `addmm(bias, input, weight.t())`; a bias that is a contiguous
+    vector (after squeezing) over a contiguous input is the same addmm on
+    the flattened input; everything else is `matmul(input, weight.t())`
+    followed by `output.add_(bias)`. The bias-fused GEMM routes serve the
+    addmm branches whose bias is a vector, and the bias-free product."""
     var a = v_tensor(args[unsafe_offset=0])
     var w = v_tensor(args[unsafe_offset=1])
     var bias = _opt_tensor_arg(args[unsafe_offset=2])
-    var out = _linear_route(a, w, bias)
-    if out:
-        ret_tensor(rets, 0, out.value())
-        return
-    var vec = _linear_vector(a, w, bias)
-    if vec:
-        ret_tensor(rets, 0, vec.value())
-        return
-    _linear_general(rets, a, w, bias)
+    if a.rank == 0 or w.rank == 0:
+        raise Error(
+            "both arguments to linear need to be at least 1D, but they are ",
+            a.rank,
+            "D and ",
+            w.rank,
+            "D",
+        )
+    var addmm_branch = False
+    if bias:
+        var b = bias.value().copy()
+        var squeezed = 0
+        for i in range(b.rank):
+            if b.dim(i) != 1:
+                squeezed += 1
+        var fusable = (b.rank == 1 or squeezed == 1) and b.contig
+        addmm_branch = a.rank == 2 or (fusable and a.contig)
+    if not bias or (addmm_branch and bias.value().rank == 1):
+        var out = _linear_route(a, w, bias)
+        if out:
+            ret_tensor(rets, 0, out.value())
+            return
+        var vec = _linear_vector(a, w, bias)
+        if vec:
+            ret_tensor(rets, 0, vec.value())
+            return
+    _linear_general(rets, a, w, bias, addmm_branch)
 
 
-def _linear_general(rets: Values, a: T, w: T, bias: Optional[T]) raises:
-    """`input @ weight.T + bias` for what the fused routes decline (an empty
-    input, integer dtypes): the leading dims flattened into the BLAS
-    family's GEMM + epilogue, then viewed back."""
-    if a.rank == 0 or w.rank != 2:
-        unsupported("aten::linear with these operands")
+def _linear_general(
+    rets: Values, a: T, w: T, bias: Optional[T], addmm_branch: Bool
+) raises:
+    """The branches the fused routes decline, through the BLAS family's
+    GEMM + epilogue on the input flattened to `[rows, k]`, viewed back."""
+    if w.rank != 2:
+        unsupported("aten::linear with a weight of rank " + String(w.rank))
     var k = a.dim(a.rank - 1)
     var n = w.dim(0)
     var lead = _leading_dims(a)
@@ -3382,24 +3432,20 @@ def _linear_general(rets: Values, a: T, w: T, bias: Optional[T]) raises:
         )
     var ts: List[T] = [a.copy(), w.copy()]
     var dims: List[Int] = [rows, n]
-    # A bias of rank > 1 broadcasts against the unflattened output: ATen's
-    # `matmul(input, weight.t()).add_(bias)`, the add after the product.
-    var late_bias = Optional[T]()
-    var fused_bias = Optional[T]()
-    if bias and bias.value().rank > 1:
-        late_bias = bias.value().copy()
-    elif bias:
-        fused_bias = bias.value().copy()
-    if fused_bias:
-        if bias.value().stype != a.stype:
+    var addend = Optional[T]()
+    if addmm_branch:
+        # addmm's ADDMM_META and expand_size, on the flattened input
+        var b = bias.value().copy()
+        if b.stype != w.stype:
             raise Error(
                 "self and mat2 must have the same dtype, but got ",
-                _scalar_type_name(bias.value().dtype),
+                _scalar_type_name(b.dtype),
                 " and ",
                 _scalar_type_name(w.dtype),
             )
-        _check_expand(bias.value(), dims, "addmm")
-        ts.append(bias.value().copy())
+        _check_expand(b, dims, "addmm")
+        ts.append(b.copy())
+        addend = b^
     _check_same_device(ts)
     var dense = own_if_new(contiguous(a), a)
     var a2 = own(_view(dense.t, [rows, k]))
@@ -3411,7 +3457,7 @@ def _linear_general(rets: Values, a: T, w: T, bias: Optional[T]) raises:
     wstrides[MAX_RANK - 1] = w.stride(0)
     var wt = own(view_strided(w, wshape, wstrides, 2, w.offset))
     var one = _unit(a.stype, 1)
-    var res = _blas(fused_bias, a2.t, wt.t, one, one, a.stype, dims, None)
+    var res = _blas(addend, a2.t, wt.t, one, one, a.stype, dims, None)
     _ = a2^
     _ = wt^
     _ = dense^
@@ -3420,17 +3466,13 @@ def _linear_general(rets: Values, a: T, w: T, bias: Optional[T]) raises:
     shape.append(n)
     var shaped = own(_view(flat.t, shape))
     _ = flat^
-    if late_bias:
-        if (
-            late_bias.value().device != a.device
-            or not late_bias.value().on_mojo()
-        ):
-            _check_same_device([a.copy(), late_bias.value().copy()])
-        # `output.add_(bias)`: in place, so the output keeps its dtype and
-        # shape (a bias that would enlarge it raises).
-        # The sum is computed in the promoted dtype, then cast back.
-        var bias_t = late_bias.value().copy()
-        var common = promote_types(shaped.t.stype, bias_t.stype)
+    if bias and not addmm_branch:
+        # `output.add_(bias)`: in place, so the output keeps its shape (a
+        # bias that would enlarge it raises) and dtype -- the sum is formed
+        # in `result_type(output, bias)` (a 0-d bias does not promote a
+        # dimensioned output) and cast back.
+        var bias_t = bias.value().copy()
+        var common = result_type(shaped.t, bias_t)
         if not can_cast(common, shaped.t.stype):
             raise Error(
                 "result type ",
@@ -3439,22 +3481,23 @@ def _linear_general(rets: Values, a: T, w: T, bias: Optional[T]) raises:
                 _scalar_type_name(shaped.t.dtype),
             )
         var acc = own_if_new(cast_to(shaped.t, common), shaped.t)
+        # TensorIterator computes in `common`, the operands cast to it.
+        var bias_c = own_if_new(cast_to(bias_t, common), bias_t)
         var added = call_op(
             "aten::add_",
             "Tensor",
             [
                 tensor_arg(acc.t),
-                tensor_arg(bias_t),
+                tensor_arg(bias_c.t),
                 Value(TAG_SCALAR_INT, 0, 1, 0),
             ],
             1,
         )
         _ = added^
+        _ = bias_c^
         if acc.t.h != shaped.t.h:
             cast_into(shaped.t, acc.t)
         _ = acc^
-        ret_owned(rets, 0, shaped)
-        return
     ret_owned(rets, 0, shaped)
 
 
