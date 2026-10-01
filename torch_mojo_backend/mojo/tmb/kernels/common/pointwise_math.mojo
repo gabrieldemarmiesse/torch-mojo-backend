@@ -1889,6 +1889,16 @@ def _wide[
         # grad * a, left to right (a = grad, b = first half, c = second).
         var sig = 1 / (1 + _exp(-c))
         return (1 - sig) * sig * a * b
+    elif kind == "glu_jvp_res":
+        # glu_jvp_kernel's second term, res * (db - sig_b * db), kept in
+        # opmath for `glu_jvp` (a = res, b = b, c = db).
+        var sig = 1 / (1 + _exp(-b))
+        return a * (c - sig * c)
+    elif kind == "glu_jvp":
+        # glu_jvp_kernel: da * sig_b + res * (db - sig_b * db), the second
+        # term arriving from `glu_jvp_res` (a = da, b = b, c = that term).
+        var sig = 1 / (1 + _exp(-b))
+        return a * sig + c
     elif kind == "silu_backward":
         var s = _sigmoid(b)
         comptime if is_apple_gpu():

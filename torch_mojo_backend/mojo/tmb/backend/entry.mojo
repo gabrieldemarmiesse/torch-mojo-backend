@@ -24,6 +24,7 @@ from tmb.ops.core import register_core
 from tmb.ops.data_movement import register_data_movement
 from tmb.ops.deform_conv import register_deform_conv
 from tmb.ops.embedding_bag import register_embedding_bag
+from tmb.ops.distance import register_distance
 from tmb.ops.factories import register_factories
 from tmb.ops.foreach import register_foreach
 from tmb.ops.indexing import register_indexing
@@ -79,6 +80,7 @@ def _register_ops(lib: Int) raises:
     _group[register_transformer](lib)
     _group[register_foreach](lib)
     _group[register_resample](lib)
+    _group[register_distance](lib)
 
 
 def _register_detection(lib: Int) raises:
