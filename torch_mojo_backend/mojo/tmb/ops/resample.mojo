@@ -1,7 +1,8 @@
 """ATen ops: resample group (see agents_docs/native_backend.md).
 
 Reflection / replication padding (1-d, 2-d, 3-d) and nearest, nearest-exact,
-linear, bilinear, bicubic, trilinear and antialiased bilinear upsampling,
+linear, bilinear, bicubic, trilinear and antialiased bilinear / bicubic /
+lanczos upsampling,
 each with its `.out` overload, its backward and the backward's
 `.grad_input` overload -- the ops behind `F.pad(mode="reflect" |
 "replicate")` and `F.interpolate`. The `.vec`
@@ -80,6 +81,8 @@ comptime NEAREST_EXACT = 1
 comptime LINEAR = 2
 comptime CUBIC = 3
 comptime BILINEAR_AA = 4
+comptime BICUBIC_AA = 5
+comptime LANCZOS_AA = 6
 
 
 def _sizes_str(t: T) -> String:
@@ -204,6 +207,10 @@ def _up_name[MODE: Int, RANK: Int]() -> String:
         return String("upsample_bicubic2d")
     elif MODE == BILINEAR_AA:
         return String("_upsample_bilinear2d_aa")
+    elif MODE == BICUBIC_AA:
+        return String("_upsample_bicubic2d_aa")
+    elif MODE == LANCZOS_AA:
+        return String("_upsample_lanczos2d_aa")
     else:
         comptime if RANK == 1:
             return String("upsample_linear1d")
@@ -419,7 +426,9 @@ def _is_identity[
     the linear 1-d, trilinear and bicubic kernels, and the antialiased
     backward's. The nearest 1-d / 3-d kernels have no shortcut, but at an
     unchanged size with a unit scale their source index is the identity.
-    The antialiased forward has none."""
+    The antialiased CUDA forward has none; lanczos, a CPU-only kernel,
+    copies in its forward (upsample_separable_Nd_kernel_impl) and not in its
+    backward."""
     for k in range(RANK):
         if in_dims[2 + k] != out_dims[2 + k]:
             return False
@@ -432,7 +441,9 @@ def _is_identity[
             ):
                 return False
         return True
-    elif MODE == BILINEAR_AA:
+    elif MODE == LANCZOS_AA:
+        return not BACKWARD
+    elif MODE >= BILINEAR_AA:
         return BACKWARD
     else:
         return True
@@ -1412,6 +1423,28 @@ def register_resample(site: Site) raises:
     impl[
         op_upsample_backward[BILINEAR_AA, 2, True],
         "_upsample_bilinear2d_aa_backward.grad_input",
+    ](site)
+    impl[op_upsample[BICUBIC_AA, 2, False], "_upsample_bicubic2d_aa"](site)
+    impl[op_upsample[BICUBIC_AA, 2, True], "_upsample_bicubic2d_aa.out"](site)
+    impl[
+        op_upsample_backward[BICUBIC_AA, 2, False],
+        "_upsample_bicubic2d_aa_backward",
+    ](site)
+    impl[
+        op_upsample_backward[BICUBIC_AA, 2, True],
+        "_upsample_bicubic2d_aa_backward.grad_input",
+    ](site)
+    # Lanczos is in torch from 2.14: on an older torch these register
+    # against a schema that never appears, and are never called.
+    impl[op_upsample[LANCZOS_AA, 2, False], "_upsample_lanczos2d_aa"](site)
+    impl[op_upsample[LANCZOS_AA, 2, True], "_upsample_lanczos2d_aa.out"](site)
+    impl[
+        op_upsample_backward[LANCZOS_AA, 2, False],
+        "_upsample_lanczos2d_aa_backward",
+    ](site)
+    impl[
+        op_upsample_backward[LANCZOS_AA, 2, True],
+        "_upsample_lanczos2d_aa_backward.grad_input",
     ](site)
     impl[op_pad[True, 1, False], "reflection_pad1d"](site)
     impl[op_pad[True, 1, True], "reflection_pad1d.out"](site)

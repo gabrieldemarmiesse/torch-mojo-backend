@@ -232,6 +232,24 @@ _UP_CASES = [
         {"scale_factor": (1.7, 0.9), "antialias": True},
         "_upsample_bilinear2d_aa",
     ),
+    (
+        "bicubic",
+        (2, 3, 10, 20),
+        {"size": (3, 7), "antialias": True},
+        "_upsample_bicubic2d_aa",
+    ),
+    (
+        "bicubic",
+        (1, 2, 5, 6),
+        {"scale_factor": (1.7, 0.9), "antialias": True},
+        "_upsample_bicubic2d_aa",
+    ),
+    (
+        "bicubic",
+        (1, 2, 13, 11),
+        {"size": (4, 17), "align_corners": True, "antialias": True},
+        "_upsample_bicubic2d_aa",
+    ),
     # Same size: the copy special case of the 1-d / 3-d / cubic kernels.
     ("linear", (2, 3, 5), {"size": (5,)}, "upsample_linear1d"),
     ("bicubic", (2, 3, 5, 4), {"size": (5, 4)}, "upsample_bicubic2d"),
@@ -267,6 +285,76 @@ def test_upsample_float64(mojo_device, mode, shape, kwargs, op):
     skip_if_metal(mojo_device, "Apple GPUs have no float64")
     x = torch.randn(shape, dtype=torch.float64)
     _check_fwd_bwd(_interp(mode, kwargs), x, mojo_device, "aten::" + op)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mode", ["bilinear", "bicubic"])
+def test_upsample_antialias_half(mojo_device, mode, dtype):
+    """CPU torch has no half antialiased kernel: compare with its float32
+    result, rounded (the weights and the row pass round to the dtype on the
+    device, as on CUDA)."""
+    x = torch.randn(2, 3, 19, 11).to(dtype)
+    want = F.interpolate(x.float(), size=(6, 13), mode=mode, antialias=True)
+    with ran(f"aten::_upsample_{mode}2d_aa"):
+        got = F.interpolate(x.to(mojo_device), size=(6, 13), mode=mode, antialias=True)
+    atol, rtol = _grad_tol(dtype)
+    torch.testing.assert_close(got.cpu().float(), want, atol=atol, rtol=rtol)
+
+
+_HAS_LANCZOS = hasattr(torch.ops.aten, "_upsample_lanczos2d_aa")
+
+
+@pytest.mark.skipif(not _HAS_LANCZOS, reason="lanczos interpolation is torch 2.14+")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    ("shape", "kwargs"),
+    [
+        ((2, 3, 10, 20), {"size": (3, 7)}),
+        ((1, 2, 5, 6), {"size": (9, 5)}),
+        ((1, 2, 13, 11), {"size": (4, 17), "align_corners": True}),
+        ((1, 1, 6, 7), {"size": (6, 3)}),  # an unchanged axis is skipped
+        ((1, 2, 8, 9), {"scale_factor": (2.0, 0.5)}),
+    ],
+)
+def test_upsample_lanczos(mojo_device, shape, kwargs, dtype):
+    """Lanczos-3 (CPU-only upstream): forward and backward against CPU."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_device, "Apple GPUs have no float64")
+    x = torch.randn(shape, dtype=dtype)
+    _check_fwd_bwd(
+        lambda t: F.interpolate(t, mode="lanczos", antialias=True, **kwargs),
+        x,
+        mojo_device,
+        "aten::_upsample_lanczos2d_aa",
+    )
+
+
+@pytest.mark.skipif(not _HAS_LANCZOS, reason="lanczos interpolation is torch 2.14+")
+def test_upsample_lanczos_same_size_copies(mojo_device):
+    x = torch.randn(1, 2, 5, 6)
+    got = torch.ops.aten._upsample_lanczos2d_aa(x.to(mojo_device), [5, 6], False)
+    torch.testing.assert_close(got.cpu(), x, atol=0, rtol=0)
+
+
+def test_upsample_aa_out_variants(mojo_device):
+    x = torch.randn(2, 3, 9, 8)
+    want = torch.ops.aten._upsample_bicubic2d_aa(x, [4, 5], False)
+    out = torch.empty(0, device=mojo_device)
+    with ran("aten::_upsample_bicubic2d_aa.out"):
+        torch.ops.aten._upsample_bicubic2d_aa.out(
+            x.to(mojo_device), [4, 5], False, out=out
+        )
+    torch.testing.assert_close(out.cpu(), want, atol=1e-5, rtol=1e-5)
+    g = torch.randn(2, 3, 4, 5)
+    want_g = torch.ops.aten._upsample_bicubic2d_aa_backward(
+        g, [4, 5], [2, 3, 9, 8], False
+    )
+    gin = torch.empty(2, 3, 8, 9, device=mojo_device).transpose(-1, -2)
+    with ran("aten::_upsample_bicubic2d_aa_backward.grad_input"):
+        torch.ops.aten._upsample_bicubic2d_aa_backward.grad_input(
+            g.to(mojo_device), [4, 5], [2, 3, 9, 8], False, grad_input=gin
+        )
+    torch.testing.assert_close(gin.cpu(), want_g, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("mode", ["nearest", "nearest-exact"])

@@ -323,6 +323,18 @@ _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
             )
             for dtype in (torch.bfloat16, torch.float16)
         ),
+        # interpolate(mode="bicubic" | "linear" | "trilinear") in half
+        # precision: our kernels are bit-identical to CUDA's (checked on
+        # every OpInfo sample), which interpolate in float and round once;
+        # CPU torch rounds intermediate products to the half dtype and lands
+        # farther from float64 (bf16 bicubic (2, 3, 4, 4) x1.7: CPU max
+        # error 0.046, CUDA / ours 0.028).
+        ("nn_functional_interpolate_bicubic", torch.bfloat16),
+        ("nn_functional_interpolate_bicubic", torch.float16),
+        ("nn_functional_interpolate_linear", torch.bfloat16),
+        ("nn_functional_interpolate_linear", torch.float16),
+        ("nn_functional_interpolate_trilinear", torch.bfloat16),
+        ("nn_functional_interpolate_trilinear", torch.float16),
     }
 )
 
