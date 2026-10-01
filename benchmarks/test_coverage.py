@@ -123,6 +123,10 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::empty_permuted": _ALLOC,
     # -- alloc + fill -----------------------------------------------------
     "aten::zero_": _FILL + " (delegates to fill_)",
+    "aten::fill_.Tensor": (
+        "fill_ with a 0-d tensor value: a broadcast copy_ (test_data_movement's "
+        "strided copy) or, for a host value, fill_.Scalar's fill kernel"
+    ),
     "aten::fill.Scalar": _FILL,
     # -- transfers / sync -------------------------------------------------
     "aten::_local_scalar_dense": (
