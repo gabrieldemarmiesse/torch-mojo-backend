@@ -24,6 +24,7 @@ from tmb.backend.abi import (
     Value,
     Values,
     ST_BOOL,
+    ST_FLOAT64,
     default_dtype,
     dtype_code,
     dtype_name,
@@ -38,6 +39,7 @@ from tmb.backend.abi import (
     ret_bool,
     ret_owned,
     ret_ref,
+    int_arg,
     tensor_arg,
     torch_dtype,
     unsupported,
@@ -620,25 +622,83 @@ def op_isin_tensor_scalar_out(
     ret_ref(rets, 0, out_arg)
 
 
+def _float_holds(dt: DType, x: Float64) -> Bool:
+    """Is `x` exactly a value of the float dtype `dt` (NaN counts: it
+    compares unequal either way)?"""
+    comptime for fdt in [DType.float16, DType.bfloat16, DType.float32]:
+        if dt == fdt:
+            var r = Scalar[fdt](x).cast[DType.float64]()
+            return r == x or x != x
+    return True  # float64
+
+
+def _int_range(dt: DType) -> Tuple[Float64, Float64]:
+    comptime for idt in [
+        DType.int8,
+        DType.uint8,
+        DType.int16,
+        DType.int32,
+        DType.int64,
+    ]:
+        if dt == idt:
+            return (
+                Float64(Scalar[idt].MIN_FINITE),
+                Float64(Scalar[idt].MAX_FINITE),
+            )
+    return (Float64(0), Float64(1))  # bool
+
+
 def _isin_scalar_tensor(el: Value, te: T, invert: Bool) raises -> Owned:
-    """The scalar as a 0-d member test: any(test_elements == element)."""
+    """The scalar as a 0-d member test: any(test_elements == element).
+
+    ATen wraps the scalar into a 0-d float64 (int64) tensor that its isin
+    kernels treat as an ordinary operand, so the comparison runs in
+    promote_types(float64 or int64, test dtype) -- not in the test dtype,
+    as `eq.Scalar`'s wrapped number would: `isin(1 + 1e-8, float32 [1])` is
+    False. Comparing in the test dtype is the same test once the scalar is
+    known to be one of its values exactly; a scalar no test value can equal
+    finds nothing."""
     if not te.on_mojo():
         raise Error("expected a tensor on the mojo device")
     if _scalar_type_of(el) == "Bool":
         raise Error("Unsupported input type encountered for isin(): Bool")
     _isin_check_dtype(te.dtype)
-    # ATen wraps the scalar as a 0-d tensor: a float element against integer
-    # test elements compares in the default float dtype (result_type of an
-    # integer tensor and a wrapped double), not in the integers.
     var tc = own_if_new(te.copy(), te)
-    if not v_scalar_is_integral(el) and not te.dtype.is_floating_point():
-        tc = own(cast_to(te, default_dtype()))
-    var eq = call_op("aten::eq", "Scalar", [tensor_arg(tc.t), el.copy()], 1)
+    var test = el.copy()
+    var possible = True
+    var x = v_f64(el)
+    if te.dtype.is_floating_point():
+        # An integer scalar promotes to the float test dtype (int64 tensor
+        # with a float32 tensor is float32): its rounding is torch's too.
+        if not v_scalar_is_integral(el):
+            possible = _float_holds(te.dtype, x)
+    else:
+        var rng = _int_range(te.dtype)
+        if v_scalar_is_integral(el):
+            # int64 comparison: a scalar outside the dtype matches nothing.
+            var v = v_int(el)
+            possible = Float64(v) >= rng[0] and Float64(v) <= rng[1]
+        elif te.dtype == DType.int64 and abs(x) >= 9007199254740992.0:
+            # Past 2**53 several int64 values round to the same double.
+            tc = own(cast_to(te, ST_FLOAT64))
+        else:
+            # float64 comparison: only an integral double in range matches.
+            possible = x == x.__floor__() and x >= rng[0] and x <= rng[1]
+            # (any integer stands in when nothing can match)
+            test = int_arg(Int(x) if possible else 0)
+    var eq = call_op("aten::eq", "Scalar", [tensor_arg(tc.t), test^], 1)
     _ = tc^  # alive past the call that reads it
     var eq_t = own(eq.take_tensor(0))
     var any = call_op("aten::any", "", [tensor_arg(eq_t.t)], 1)
     _ = eq_t^  # alive past the call that reads it
     var found = own(any.take_tensor(0))
+    if not possible:
+        # A 0-d False on the device: a bool never differs from itself.
+        var none = call_op(
+            "aten::ne", "Tensor", [tensor_arg(found.t), tensor_arg(found.t)], 1
+        )
+        _ = found^  # alive past the call that reads it
+        found = own(none.take_tensor(0))
     if not invert:
         return found^
     var r = call_op("aten::logical_not", "", [tensor_arg(found.t)], 1)

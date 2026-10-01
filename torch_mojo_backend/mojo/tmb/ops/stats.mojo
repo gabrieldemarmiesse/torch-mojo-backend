@@ -1436,13 +1436,20 @@ def op__weight_norm_interface(
     var acc = _acc_stype(g.stype)
     var vf = _cast(v, acc)
     var dims = _other_dims(v.rank, dim)
-    # norms = sqrt(sum v^2) per slice, kept in the accumulate type.
-    var norm = _call(
-        "aten::linalg_vector_norm",
-        "",
-        [_t(vf.t), _dbl(2.0), _ilist(dims), bool_arg(True), none_arg()],
+    # norms = sqrt(sum v^2) per slice in the accumulate type, exactly as
+    # WeightNorm.cu forms it: no rescaling (linalg_vector_norm's), so a
+    # float32 sum of squares that overflows gives an inf norm and a zero
+    # weight, as on CUDA.
+    var sq = _mul(vf.t, vf.t)
+    var ss = _call(
+        "aten::sum",
+        "dim_IntList",
+        [_t(sq.t), _ilist(dims), bool_arg(True), none_arg()],
     )
     _ = dims
+    _ = sq^  # alive past the call that reads it
+    var norm = _call("aten::sqrt", "", [_t(ss.t)])
+    _ = ss^  # alive past the call that reads it
     var rnorm = _reciprocal(norm.t)
     var gf = _cast(g, acc)
     var gk = _as_keep(gf.t, v, dim)

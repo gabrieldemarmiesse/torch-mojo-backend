@@ -902,8 +902,11 @@ def _welford_cols_kernel[
     comptime for u in range(1, ILP):
         _welford_combine[acc](tm, tq, tn, mean[u], m2[u], nf[u])
     while live and r < r1:
-        var x = in_ptr[unsafe_offset=base + r * inner].cast[acc]()
-        _welford_combine[acc](tm, tq, tn, x, Scalar[acc](0), Scalar[acc](1))
+        # `WelfordOps::reduce`, not a merge of a seeded singleton: its m2
+        # comes from x - mean, which makes an inf or NaN element's m2 NaN.
+        _welford_update[acc](
+            in_ptr[unsafe_offset=base + r * inner].cast[acc](), tm, tq, tn
+        )
         r += lanes
     var sm = stack_allocation[
         WELFORD_THREADS, acc, address_space=AddressSpace.SHARED
