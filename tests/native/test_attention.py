@@ -801,3 +801,40 @@ def test_cudnn_attention_forward_returns_the_given_max_lengths(mojo_gpu):
     with torch.no_grad():
         res = aten._cudnn_attention_forward(q, k, v, None, None, None, 11, 13, True)
     assert (res[4], res[5]) == (11, 13)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("lengths", [(5, 9), (9, 5), (130, 200)])
+@pytest.mark.parametrize("train", [False, True])
+def test_public_causal_sdpa_non_square_is_top_left(mojo_gpu, dtype, lengths, train):
+    """`F.scaled_dot_product_attention(is_causal=True)` with L != S is
+    TOP-LEFT aligned, whichever backend `_fused_sdp_choice` picks. A FLASH
+    choice reaches `_scaled_dot_product_flash_attention_for_cpu` (ATen calls
+    the CUDA-layout op, whose CUDA semantics are bottom-right, only for
+    CUDA/XPU tensors), and every fused kernel masks top-left."""
+    lq, lk = lengths
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, dtype, 1, 2, lq, lk, 64)
+    native.op_counting(True)
+    cuda_op = "aten::_scaled_dot_product_flash_attention"
+    before = native.op_count(cuda_op)
+    if train:
+        for t in (qr, kr, vr, q, k, v):
+            t.requires_grad_()
+    choice = aten._fused_sdp_choice(q, k, v, None, 0.0, True)
+    with torch.set_grad_enabled(train):
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    assert native.op_count(cuda_op) == before, (
+        f"choice {choice} reached the bottom-right CUDA-layout op"
+    )
+    want = F.scaled_dot_product_attention(qr, kr, vr, is_causal=True)
+    tol = _tol(dtype)
+    torch.testing.assert_close(out.cpu().float(), want.detach(), atol=tol, rtol=tol)
+    if train:
+        g = torch.randn(want.shape, generator=torch.Generator().manual_seed(1))
+        out.backward(g.to(dtype).to(mojo_gpu))
+        want.backward(g)
+        gt = _grad_tol(dtype)
+        for got, ref in ((q, qr), (k, kr), (v, vr)):
+            torch.testing.assert_close(
+                _grad(got).cpu().float(), _grad(ref), atol=gt, rtol=gt
+            )
