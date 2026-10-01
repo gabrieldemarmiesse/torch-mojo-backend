@@ -7267,6 +7267,228 @@ def test_aten_var_correction_zero_no_dim(conf: Conf, call_checker: CallChecker):
     check_outputs(fn, conf, [x])
 
 
+@pytest.mark.parametrize("correction", [0, 1])
+@pytest.mark.parametrize("dim", [None, 1, (0, 2)])
+def test_aten_std(conf: Conf, call_checker: CallChecker, correction: int, dim):
+    call_checker.register("aten::std.correction")
+
+    def fn(x):
+        return torch.std(x, dim=dim, correction=correction)
+
+    check_outputs(fn, conf, [torch.randn(3, 4, 5)])
+
+
+@pytest.mark.parametrize("op", [torch.var_mean, torch.std_mean])
+def test_aten_var_std_mean(conf: Conf, call_checker: CallChecker, op):
+    call_checker.register("aten::var_mean.correction", "aten::std_mean.correction")
+
+    def fn(x):
+        return op(x, dim=1, keepdim=True)
+
+    check_outputs(fn, conf, [torch.randn(3, 4, 5)])
+
+
+def test_aten_var_correction_out(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::var.correction_out", "aten::std.correction_out")
+
+    def fn(x):
+        a = torch.empty(0, device=x.device)
+        b = torch.empty(0, device=x.device)
+        torch.var(x, 0, out=a)
+        torch.std(x, 1, correction=0, out=b)
+        return a, b
+
+    check_outputs(fn, conf, [torch.randn(4, 6)])
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_aten_max_dim(conf: Conf, call_checker: CallChecker, dim: int, keepdim: bool):
+    call_checker.register("aten::max.dim")
+
+    def fn(x):
+        return torch.max(x, dim, keepdim)
+
+    check_outputs(fn, conf, [torch.randn(4, 6, 3)])
+
+
+def test_aten_max_dim_max(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::max.dim_max")
+
+    def fn(x):
+        v = torch.empty(0, device=x.device)
+        i = torch.empty(0, dtype=torch.int64, device=x.device)
+        torch.max(x, 1, out=(v, i))
+        return v, i
+
+    check_outputs(fn, conf, [torch.randn(4, 6)])
+
+
+@pytest.mark.parametrize("dim", [None, 0, 1])
+def test_aten_aminmax(conf: Conf, call_checker: CallChecker, dim):
+    call_checker.register("aten::aminmax")
+
+    def fn(x):
+        return torch.aminmax(x, dim=dim)
+
+    check_outputs(fn, conf, [torch.randn(5, 7)])
+
+
+@pytest.mark.parametrize("op", [torch.argmax, torch.argmin])
+def test_aten_argmax_argmin_out(conf: Conf, call_checker: CallChecker, op):
+    call_checker.register("aten::argmax.out", "aten::argmin.out")
+
+    def fn(x):
+        out = torch.empty(0, dtype=torch.int64, device=x.device)
+        op(x, 1, out=out)
+        return out
+
+    check_outputs(fn, conf, [torch.randn(5, 7)])
+
+
+@pytest.mark.parametrize("dim", [0, 1, 2])
+def test_aten_cumprod(conf: Conf, call_checker: CallChecker, dim: int):
+    call_checker.register("aten::cumprod")
+
+    def fn(x):
+        return torch.cumprod(x, dim)
+
+    check_outputs(fn, conf, [torch.rand(3, 4, 5) + 0.5])
+
+
+@pytest.mark.parametrize("dim", [0, 1, 2])
+def test_aten_cumsum_any_dim(conf: Conf, call_checker: CallChecker, dim: int):
+    call_checker.register(aten_functions.aten_cumsum, "aten::cumsum.out")
+
+    def fn(x):
+        return torch.cumsum(x, dim)
+
+    check_outputs(fn, conf, [torch.randn(3, 4, 5)])
+
+
+@pytest.mark.parametrize("op", [torch.cummax, torch.cummin])
+def test_aten_cummax_cummin(conf: Conf, call_checker: CallChecker, op):
+    call_checker.register("aten::_cummax_helper", "aten::_cummin_helper")
+
+    def fn(x):
+        return op(x, 1)
+
+    check_outputs(fn, conf, [torch.randint(0, 4, (3, 9)).float()])
+
+
+def test_aten_logcumsumexp(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::_logcumsumexp")
+
+    def fn(x):
+        return torch.logcumsumexp(x, 1)
+
+    check_outputs(fn, conf, [torch.randn(3, 9)])
+
+
+def test_aten_mode(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::mode")
+
+    def fn(x):
+        return torch.mode(x, 1)
+
+    check_outputs(fn, conf, [torch.randint(0, 3, (4, 9)).float()])
+
+
+def test_aten_renorm(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::renorm")
+
+    def fn(x):
+        return torch.renorm(x, 2, 0, 1.0)
+
+    check_outputs(fn, conf, [torch.randn(4, 6)])
+
+
+def test_aten_hash_tensor(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::hash_tensor")
+
+    def fn(x):
+        return torch.hash_tensor(x, [1])
+
+    check_outputs(fn, conf, [torch.randn(4, 6)])
+
+
+def test_aten_histc(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::histc")
+
+    def fn(x):
+        return torch.histc(x, 10, -2.0, 2.0)
+
+    check_outputs(fn, conf, [torch.randn(500)])
+
+
+def test_aten_bincount(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::bincount")
+
+    def fn(x):
+        return torch.bincount(x, minlength=12)
+
+    check_outputs(fn, conf, [torch.randint(0, 10, (100,))])
+
+
+def test_aten_histogram(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::histogram.bin_ct")
+
+    def fn(x):
+        return torch.histogram(x, 7)
+
+    check_outputs(fn, conf, [torch.randn(300)])
+
+
+@pytest.mark.parametrize("variant", ["tensor_scalar", "scalar_tensor"])
+def test_aten_isin_scalar(conf: Conf, call_checker: CallChecker, variant: str):
+    call_checker.register("aten::isin.Tensor_Scalar", "aten::isin.Scalar_Tensor")
+
+    def fn(x):
+        if variant == "tensor_scalar":
+            return torch.isin(x, 2.0)
+        return torch.isin(2.0, x)
+
+    check_outputs(fn, conf, [torch.randint(0, 4, (10,)).float()])
+
+
+def test_aten_isin_float(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_isin)
+
+    def fn(x, t):
+        return torch.isin(x, t)
+
+    check_outputs(
+        fn, conf, [torch.randint(0, 5, (20,)).float(), torch.tensor([1.0, 3.0])]
+    )
+
+
+def test_aten_segment_reduce(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::segment_reduce")
+
+    def fn(x, lengths):
+        return torch.segment_reduce(x, "max", lengths=lengths)
+
+    check_outputs(fn, conf, [torch.randn(6, 2), torch.tensor([2, 1, 3])])
+
+
+def test_aten_weight_norm_interface(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::_weight_norm_interface")
+
+    def fn(v, g):
+        return torch._weight_norm_interface(v, g, 0)
+
+    check_outputs(fn, conf, [torch.randn(5, 3), torch.randn(5, 1)])
+
+
+def test_aten_compute_linear_combination(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::_compute_linear_combination")
+
+    def fn(x, c):
+        return torch.ops.aten._compute_linear_combination(x, c)
+
+    check_outputs(fn, conf, [torch.randn(4, 3, 2), torch.randn(5, 4)])
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("shape", [(5,), (3, 4), (2, 3, 4)])
 def test_aten_silu(

@@ -37,6 +37,8 @@ from tmb.ops.reductions import register_reductions
 from tmb.ops.resample import register_resample
 from tmb.ops.rnn import register_rnn
 from tmb.ops.roi import register_roi
+from tmb.ops.scans import register_scans
+from tmb.ops.stats import register_stats
 from tmb.ops.transformer import register_transformer
 from tmb.ops.unary import register_unary
 from tmb.backend.pg import pg_vtable
@@ -60,6 +62,8 @@ def _register_ops(lib: Int) raises:
     _group[register_indexing](lib)
     _group[register_random](lib)
     _group[register_reductions](lib)
+    _group[register_scans](lib)
+    _group[register_stats](lib)
     _group[register_matmul](lib)
     _group[register_nn](lib)
     _group[register_loss](lib)

@@ -3395,12 +3395,13 @@ def test_cumsum_rank2_out_of_range_dim_declines(mojo_gpu, dim):
         torch.cumsum(x.to(mojo_gpu), dim=dim)
 
 
-def test_cumsum_declines_middle_dim_on_rank3(mojo_gpu):
-    """rank>=3 non-trailing dims are out of this kernel family's scope and must
-    raise, not silently compute the wrong axis."""
-    x = torch.randn(4, 5, 6).to(mojo_gpu)
-    with pytest.raises(NotImplementedError):
-        torch.cumsum(x, dim=1)
+def test_cumsum_middle_dim_on_rank3(mojo_gpu):
+    """rank>=3 non-trailing dims run on the scan family (tmb/ops/scans.mojo)
+    and must scan the right axis."""
+    x = torch.randn(4, 5, 6)
+    torch.testing.assert_close(
+        torch.cumsum(x.to(mojo_gpu), dim=1).cpu(), torch.cumsum(x, dim=1)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3536,8 +3537,9 @@ def test_unsupported_inputs_raise_not_implemented(mojo_gpu):
         torch.tensor(3, dtype=torch.int8).to(mojo_gpu).sum()
     with pytest.raises(NotImplementedError):
         torch.mean(torch.randint(0, 4, (3, 4), dtype=torch.int64).to(mojo_gpu), dim=1)
-    with pytest.raises(NotImplementedError):
-        torch.argmax(torch.empty(0, 4).to(mojo_gpu), dim=1)
+    # An empty reduce dim is torch's own IndexError, not a decline.
+    with pytest.raises(IndexError, match="non-zero size"):
+        torch.argmax(torch.empty(0, 4).to(mojo_gpu), dim=0)
     with pytest.raises(NotImplementedError):
         torch.ops.aten.any.dims((torch.randn(3, 4) > 0).to(mojo_gpu), [])
 

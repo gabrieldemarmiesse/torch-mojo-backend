@@ -236,11 +236,27 @@ def test_isin_out(mojo_gpu: str, call_checker: CallChecker):
     torch.testing.assert_close(out.cpu(), torch.tensor([False, True, False, True]))
 
 
+def test_isin_float_and_mixed_dtypes(mojo_gpu: str):
+    elements = torch.tensor([1.0, 2.0, float("nan"), -0.0])
+    test_elements = torch.tensor([1.0, float("nan"), 0.0])
+    torch.testing.assert_close(
+        torch.isin(elements.to(mojo_gpu), test_elements.to(mojo_gpu)).cpu(),
+        torch.isin(elements, test_elements),
+    )
+    ints = torch.tensor([1, 2, 3])
+    torch.testing.assert_close(
+        torch.isin(ints.to(mojo_gpu), test_elements.to(mojo_gpu)).cpu(),
+        torch.isin(ints, test_elements),
+    )
+
+
 def test_isin_unsupported_dtype_raises(mojo_gpu: str):
-    elements = torch.tensor([1.0, 2.0]).to(mojo_gpu)
-    test_elements = torch.tensor([1.0]).to(mojo_gpu)
+    elements = torch.tensor([1, 2], dtype=torch.uint8).to(mojo_gpu)
+    test_elements = torch.tensor([1], dtype=torch.uint8).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
         torch.isin(elements, test_elements)
+    with pytest.raises(RuntimeError, match="Unsupported input type"):
+        torch.isin(elements.bool(), test_elements.bool())
 
 
 # ---------------------------------------------------------------------------

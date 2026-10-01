@@ -55,6 +55,7 @@ from max.gpu import (
 )
 from max.gpu.primitives import warp
 from max.gpu.primitives.warp import shuffle_down
+from std.bit import count_leading_zeros
 from std.math import ceildiv, isnan, sqrt
 from std.memory import bitcast, stack_allocation
 from std.sys.info import has_accelerator, size_of
@@ -1036,6 +1037,104 @@ struct CountNonzeroOp(ReduceOp):
         dtype: DType, width: SIMDLength
     ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
         return a + b
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        return a.cast[out_dt]()
+
+
+# hash_tensor's operands: AT_DISPATCH_ALL_TYPES_AND3(Half, BFloat16, Bool).
+comptime XOR_DTYPES: List[DType] = [
+    DType.float32,
+    DType.float16,
+    DType.bfloat16,
+    DType.float64,
+    DType.int64,
+    DType.int32,
+    DType.int16,
+    DType.int8,
+    DType.uint8,
+    DType.bool,
+]
+
+
+@always_inline
+def _f32_as_f64_bits(x: Float32) -> UInt64:
+    """The bit pattern of `Float64(x)`, built with integer arithmetic only:
+    Apple GPUs have no double, and a double anywhere in a Metal kernel stalls
+    its build. Exact for every float32 (a subnormal is renormalized); a NaN
+    keeps its payload with the quiet bit set, as x86's cvtss2sd does."""
+    var b = bitcast[DType.uint32, 1](x)
+    var sign = (b >> 31).cast[DType.uint64]() << 63
+    var e = ((b >> 23) & 0xFF).cast[DType.uint64]()
+    var m = (b & 0x7FFFFF).cast[DType.uint64]()
+    if e == 0xFF:
+        var q = m << 29
+        if m != 0:
+            q |= UInt64(1) << 51
+        return sign | (UInt64(0x7FF) << 52) | q
+    if e == 0:
+        if m == 0:
+            return sign
+        # value = m * 2^-149, m < 2^23: normalize on the top set bit p.
+        var p = 63 - Int(count_leading_zeros(m))
+        var e64 = UInt64(p - 149 + 1023)
+        var m64 = (m << UInt64(52 - p)) & ((UInt64(1) << 52) - 1)
+        return sign | (e64 << 52) | m64
+    return sign | ((e + 896) << 52) | (m << 29)
+
+
+@always_inline
+def _hash_bits[in_dt: DType](x: Scalar[in_dt]) -> UInt64:
+    """One element as CUDA's `xor_sum_functor` sees it: a floating value
+    upcast to double and read as its bits, an integer sign-extended to 64
+    bits, a bool as 0 / 1."""
+    comptime if in_dt == DType.float64:
+        return bitcast[DType.uint64, 1](x)
+    elif in_dt.is_floating_point():
+        return _f32_as_f64_bits(x.cast[DType.float32]())
+    elif in_dt == DType.bool or in_dt == DType.uint8:
+        return x.cast[DType.uint64]()
+    else:
+        return bitcast[DType.uint64, 1](x.cast[DType.int64]())
+
+
+struct XorSumOp(ReduceOp):
+    """hash_tensor (mode 0): XOR of every element's 64-bit pattern, identity
+    0, uint64 output (ReduceSumProdKernel.cu `xor_sum_functor`)."""
+
+    comptime name = "xor_sum"
+    comptime dtypes = XOR_DTYPES
+    comptime errors_on_empty_axis = False
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return DType.uint64
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return DType.uint64
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](0)
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        var r = SIMD[acc, width]()
+        comptime for i in range(width):
+            r[i] = _hash_bits[in_dt](x[i]).cast[acc]()
+        return r
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return a ^ b
 
     @staticmethod
     def finish[

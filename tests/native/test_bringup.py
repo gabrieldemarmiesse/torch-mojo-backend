@@ -82,6 +82,23 @@ def test_fill_keeps_the_scalar_tag(mojo_device, contiguous: bool):
     assert not torch.signbit(f.cpu()).any(), f.cpu()
 
 
+def test_fill_with_a_zero_dim_tensor(mojo_device):
+    """`fill_.Tensor`: a 0-d device value broadcasts and converts like
+    `copy_`, a host value fills as its Scalar, anything else is refused."""
+    t = torch.empty(3, 2, dtype=torch.float32, device=mojo_device)[:, 1]
+    t.fill_(torch.tensor(2.5, device=mojo_device))
+    assert t.cpu().tolist() == [2.5] * 3
+    t.fill_(torch.tensor(7, dtype=torch.int64, device=mojo_device))
+    assert t.cpu().tolist() == [7.0] * 3
+    t.fill_(torch.tensor(-1.25))
+    assert t.cpu().tolist() == [-1.25] * 3
+    i = torch.empty(4, dtype=torch.int64, device=mojo_device)
+    i.fill_(torch.tensor(9.75, device=mojo_device))
+    assert i.cpu().tolist() == [9] * 4
+    with pytest.raises(RuntimeError, match="0-dimension value tensor"):
+        t.fill_(torch.ones(1, device=mojo_device))
+
+
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_fill_keeps_int64_bits_past_2_53(mojo_gpu: str, contiguous: bool):
     """An integer Scalar reaches an int64 destination exactly; a Float64
