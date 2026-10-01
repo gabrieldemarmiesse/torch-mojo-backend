@@ -26,6 +26,11 @@ _HOPPER_ONLY = "the FA4 kernels are compiled for sm_90a"
 _GFX942_ONLY = "the fused MFMA flash kernels are compiled for gfx942"
 
 
+def _grad(t: torch.Tensor) -> torch.Tensor:
+    assert t.grad is not None
+    return t.grad
+
+
 def _counted(name: str) -> int:
     return native.op_count(f"aten::{name}")
 
@@ -169,16 +174,22 @@ def test_flash_attention_backward(mojo_gpu, counting, head_dim):
     for got, want in ((q, qr), (k, kr), (v, vr)):
         assert got.grad is not None and want.grad is not None
         torch.testing.assert_close(
-            got.grad.contiguous().cpu().float(), want.grad, atol=6e-2, rtol=6e-2
+            _grad(got).contiguous().cpu().float(), _grad(want), atol=6e-2, rtol=6e-2
         )
 
 
-def test_flash_attention_declines_float32(mojo_gpu, counting):
-    if _arch(mojo_gpu) == "gfx942":
-        pytest.skip("the fused gfx942 route serves float32 (baseline kernels)")
-    _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 1, 128, 128, 64)
-    with pytest.raises(NotImplementedError):
-        aten._scaled_dot_product_flash_attention(q, k, v, 0.0, True)
+def test_flash_attention_float32_takes_the_math_route(mojo_gpu, counting):
+    """No fused kernel takes float32 (outside gfx942), so the flash op runs
+    the math route -- with a real logsumexp the backward can use."""
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 2, 24, 24, 16)
+    out, lse = aten._scaled_dot_product_flash_attention(q, k, v, 0.0, True)[:2]
+    expected = F.scaled_dot_product_attention(qr, kr, vr, is_causal=True)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-5, rtol=1e-5)
+    scores = (qr @ kr.transpose(-1, -2)) / 4
+    scores = scores.masked_fill(
+        ~torch.ones(24, 24, dtype=torch.bool).tril(), -torch.inf
+    )
+    torch.testing.assert_close(lse.cpu(), torch.logsumexp(scores, -1))
 
 
 def test_flash_attention_declines_dropout(mojo_gpu, counting):
@@ -187,18 +198,24 @@ def test_flash_attention_declines_dropout(mojo_gpu, counting):
         aten._scaled_dot_product_flash_attention(q, k, v, 0.5, True)
 
 
-def test_flash_attention_backward_refuses_partial_tail(mojo_gpu, counting):
-    """The backward tile machinery is unproven on a partial last tile, so an
-    odd seqlen that the BHSD forward accepts must fail loudly here rather
-    than produce a silently wrong gradient."""
+def test_flash_attention_backward_partial_tail_takes_the_math_route(mojo_gpu, counting):
+    """The FA4 backward tile machinery is unproven on a partial last tile,
+    so an odd seqlen that the BHSD forward accepts gets its gradient from
+    the math route (which recomputes the probabilities) instead."""
     if _arch(mojo_gpu) != "sm_90a":
         pytest.skip(_HOPPER_ONLY)
-    _, _, _, q, k, v = _qkv(mojo_gpu, torch.bfloat16, 1, 2, 200, 200, 64)
-    for t in (q, k, v):
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, torch.bfloat16, 1, 2, 200, 200, 64)
+    for t in (qr, kr, vr, q, k, v):
         t.requires_grad_()
     out = aten._scaled_dot_product_flash_attention(q, k, v, 0.0, True)[0]
-    with pytest.raises(NotImplementedError):
-        out.backward(torch.ones_like(out))
+    out.backward(torch.ones_like(out))
+    F.scaled_dot_product_attention(qr, kr, vr, is_causal=True).backward(
+        torch.ones_like(qr)
+    )
+    for got, want in ((q, qr), (k, kr), (v, vr)):
+        torch.testing.assert_close(
+            _grad(got).cpu().float(), _grad(want), atol=6e-2, rtol=6e-2
+        )
 
 
 @pytest.mark.parametrize("is_causal", [False, True])
@@ -228,7 +245,7 @@ def test_fused_flash_backward_partial_tail_gfx942(
     for got, want in ((q, qr), (k, kr), (v, vr)):
         assert got.grad is not None and want.grad is not None
         torch.testing.assert_close(
-            got.grad.contiguous().cpu().float(), want.grad, atol=tol, rtol=tol
+            _grad(got).contiguous().cpu().float(), _grad(want), atol=tol, rtol=tol
         )
 
 
@@ -286,27 +303,41 @@ def test_efficient_attention_custom_scale(mojo_device, counting):
     )
 
 
-def test_efficient_attention_refuses_grad(mojo_gpu, counting):
-    """Its ATen backward op has no kernel here, and a raise from inside the
-    autograd engine is a far worse failure than one from the forward."""
-    _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 1, 8, 8, 8)
-    q.requires_grad_()
-    with pytest.raises(NotImplementedError, match="torch.no_grad"):
-        aten._scaled_dot_product_efficient_attention(q, k, v, None, True, 0.0, False)
+def test_efficient_attention_trains(mojo_gpu, counting):
+    """A grad-requiring call records `_scaled_dot_product_efficient_attention
+    _backward`, which runs the math route (it recomputes the probabilities,
+    so it needs no logsumexp from the forward)."""
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 2, 8, 8, 8)
+    for t in (qr, kr, vr, q, k, v):
+        t.requires_grad_()
+    for compute_lse in (False, True):
+        out = aten._scaled_dot_product_efficient_attention(
+            q, k, v, None, compute_lse, 0.0, True
+        )[0]
+        out.sum().backward()
+    assert _counted("_scaled_dot_product_efficient_attention_backward") == 2
+    F.scaled_dot_product_attention(qr, kr, vr, is_causal=True).sum().backward()
+    for got, want in ((q, qr), (k, kr), (v, vr)):
+        torch.testing.assert_close(
+            _grad(got).cpu(), 2 * _grad(want), atol=1e-5, rtol=1e-5
+        )
 
 
-def test_efficient_attention_declines_compute_log_sumexp(mojo_gpu, counting):
-    """No route here produces an LSE, and the only consumer is a backward op
-    this backend has no kernel for: returning zeros would hand a silently
-    wrong saved value to a backward that cannot run anyway."""
-    _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 1, 8, 8, 8)
-    with torch.no_grad(), pytest.raises(NotImplementedError, match="log-sum-exp"):
-        aten._scaled_dot_product_efficient_attention(q, k, v, None, True, 0.0, False)
+def test_efficient_attention_compute_log_sumexp(mojo_gpu, counting):
+    """CUDA's memory-efficient layout: (B, H, ceil(L / 32) * 32), padded with
+    +inf; (B, H, 0) when not asked for."""
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 2, 5, 7, 8)
     with torch.no_grad():
         lse = aten._scaled_dot_product_efficient_attention(
+            q, k, v, None, True, 0.0, False
+        )[1]
+        none = aten._scaled_dot_product_efficient_attention(
             q, k, v, None, False, 0.0, False
         )[1]
-    assert lse.numel() == 0
+    assert lse.shape == (1, 2, 32) and none.shape == (1, 2, 0)
+    want = torch.logsumexp((qr @ kr.transpose(-1, -2)) / 8**0.5, -1)
+    torch.testing.assert_close(lse[..., :5].cpu(), want)
+    assert torch.isinf(lse[..., 5:]).all() and (lse[..., 5:] > 0).all()
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -332,11 +363,28 @@ def test_math_attention_does_not_overflow_reduced_precision(mojo_gpu, dtype):
     )
 
 
-def test_efficient_attention_declines_bias(mojo_gpu, counting):
-    _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 1, 8, 8, 8)
-    bias = torch.zeros(1, 1, 8, 8, device=mojo_gpu)
-    with torch.no_grad(), pytest.raises(NotImplementedError):
-        aten._scaled_dot_product_efficient_attention(q, k, v, bias, False, 0.0, False)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_efficient_attention_bias_and_its_gradient(mojo_gpu, counting, dtype):
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, dtype, 2, 2, 6, 9, 8)
+    gen = torch.Generator().manual_seed(5)
+    br = torch.randn(2, 1, 6, 9, generator=gen).to(dtype).float()
+    b = br.to(dtype).to(mojo_gpu)
+    for t in (qr, kr, vr, br, q, k, v, b):
+        t.requires_grad_()
+    out = aten._scaled_dot_product_efficient_attention(q, k, v, b, True, 0.0, False)[0]
+    want = F.scaled_dot_product_attention(qr, kr, vr, attn_mask=br)
+    torch.testing.assert_close(
+        out.cpu().float(), want, atol=_tol(dtype), rtol=_tol(dtype)
+    )
+    g = torch.randn(want.shape, generator=gen)
+    out.backward(g.to(dtype).to(mojo_gpu))
+    want.backward(g)
+    tol = _grad_tol(dtype)
+    for got, ref in ((q, qr), (k, kr), (v, vr), (b, br)):
+        assert _grad(got).shape == _grad(ref).shape
+        torch.testing.assert_close(
+            _grad(got).cpu().float(), _grad(ref), atol=tol, rtol=tol
+        )
 
 
 # --------------------------------------------------------------------------
@@ -442,8 +490,8 @@ def test_sdpa_enable_gqa_trains_through_math(mojo_gpu):
     ).sum().backward()
     for got, want in ((q, qr), (k, kr), (v, vr)):
         assert got.grad is not None and want.grad is not None
-        assert got.grad.shape == want.grad.shape
-        torch.testing.assert_close(got.grad.cpu(), want.grad, atol=1e-4, rtol=1e-4)
+        assert _grad(got).shape == _grad(want).shape
+        torch.testing.assert_close(_grad(got).cpu(), _grad(want), atol=1e-4, rtol=1e-4)
 
 
 def test_sdpa_enable_gqa_indivisible_heads_raise(mojo_gpu):
@@ -473,8 +521,8 @@ def test_fused_sdp_choice_efficient_for_inference(mojo_gpu, counting):
 
 
 def test_fused_sdp_choice_math_when_grad_is_needed(mojo_gpu, counting):
-    """`_scaled_dot_product_efficient_attention` is inference-only here, so a
-    grad-requiring call must be sent to the differentiable decomposition."""
+    """Training goes to the differentiable decomposition: the efficient op's
+    backward here is that same decomposition, so it would buy nothing."""
     _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 2, 8, 8, 8)
     q.requires_grad_()
     # gfx942's fused flash route has a float32 backward; nothing else does.
@@ -540,3 +588,190 @@ def test_public_sdpa_takes_the_supported_route_and_trains(mojo_gpu: str):
     assert q.grad is not None and ref_q.grad is not None
     torch.testing.assert_close(out.cpu().float(), ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(q.grad.cpu().float(), ref_q.grad, atol=5e-2, rtol=5e-2)
+
+
+# --------------------------------------------------------------------------
+# The (B, S, H, D)-layout CUDA entry points and cuDNN's: the math route
+# whenever no fused kernel takes the inputs. Expected values (layouts,
+# causal alignment, fully masked rows) were measured on stock CUDA torch.
+# --------------------------------------------------------------------------
+
+
+def _ref_attention(qr, kr, vr, bias=None, offset=None):
+    """(out, lse) in float64; `offset` is the causal diagonal (key j is
+    visible to query i iff j <= i + offset)."""
+    s = (qr.double() @ kr.double().transpose(-1, -2)) / qr.shape[-1] ** 0.5
+    if bias is not None:
+        s = s + bias.double()
+    if offset is not None:
+        keep = torch.ones(s.shape[-2], s.shape[-1], dtype=torch.bool).tril(offset)
+        s = s.masked_fill(~keep, -torch.inf)
+    lse = torch.logsumexp(s.detach(), -1)
+    # A fully masked row attends to nothing: output 0 and no gradient (a
+    # plain softmax would put NaN there and spread it through the GEMMs).
+    dead = (lse == -torch.inf).unsqueeze(-1)
+    p = torch.softmax(s.masked_fill(dead, 0.0), -1).masked_fill(dead, 0.0)
+    return p @ vr.double(), lse
+
+
+def _bshd(*ts):
+    return [t.transpose(1, 2) for t in ts]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("lengths", [(5, 7), (7, 5)])
+def test_flash_attention_forward_bshd(mojo_gpu, counting, dtype, is_causal, lengths):
+    """CUDA's flash kernels align the causal mask bottom-right; a fully
+    masked query row (L > S) has output 0 and logsumexp +inf."""
+    lq, lk = lengths
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, dtype, 2, 3, lq, lk, 16)
+    for t in (qr, kr, vr, q, k, v):
+        t.requires_grad_()
+    out, lse, rng, unused, debug = aten._flash_attention_forward(
+        *_bshd(q, k, v), None, None, lq, lk, 0.0, is_causal, False
+    )
+    assert out.shape == (2, lq, 3, 16) and out.is_contiguous()
+    assert lse.shape == (2, 3, lq) and lse.dtype == torch.float32
+    assert rng.shape == (2,) and rng.dtype == torch.uint64 and debug.numel() == 0
+    want, want_lse = _ref_attention(qr, kr, vr, offset=lk - lq if is_causal else None)
+    tol = _tol(dtype)
+    torch.testing.assert_close(
+        out.transpose(1, 2).cpu().double(), want, atol=tol, rtol=tol
+    )
+    torch.testing.assert_close(
+        lse.cpu().double(),
+        want_lse.masked_fill(want_lse == -torch.inf, torch.inf),
+        atol=tol,
+        rtol=tol,
+    )
+    g = torch.randn(want.shape, generator=torch.Generator().manual_seed(9))
+    out.backward(g.transpose(1, 2).to(dtype).to(mojo_gpu))
+    assert _counted("_flash_attention_backward") == 1
+    want.backward(g.double())
+    gt = _grad_tol(dtype)
+    for got, ref in ((q, qr), (k, kr), (v, vr)):
+        torch.testing.assert_close(
+            _grad(got).cpu().double(), _grad(ref).double(), atol=gt, rtol=gt
+        )
+
+
+def test_flash_attention_forward_no_dropout_inplace(mojo_gpu, counting):
+    if not hasattr(aten, "_flash_attention_forward_no_dropout_inplace"):
+        pytest.skip("this torch predates _flash_attention_forward_no_dropout_inplace")
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, torch.float16, 1, 2, 6, 6, 8)
+    out = torch.empty(1, 6, 2, 8, dtype=torch.float16, device=mojo_gpu)
+    lse = aten._flash_attention_forward_no_dropout_inplace(
+        out, *_bshd(q, k, v), None, None, 6, 6, 0.0, True, False
+    )
+    want, want_lse = _ref_attention(qr, kr, vr, offset=0)
+    torch.testing.assert_close(
+        out.transpose(1, 2).cpu().double(), want, atol=5e-3, rtol=5e-3
+    )
+    torch.testing.assert_close(lse.cpu().double(), want_lse, atol=5e-3, rtol=5e-3)
+
+
+def test_flash_attention_forward_declines_varlen_and_windows(mojo_gpu):
+    _, _, _, q, k, v = _qkv(mojo_gpu, torch.float16, 1, 2, 6, 6, 8)
+    cu = torch.tensor([0, 6], dtype=torch.int32, device=mojo_gpu)
+    with pytest.raises(NotImplementedError, match="varlen"):
+        aten._flash_attention_forward(*_bshd(q, k, v), cu, cu, 6, 6, 0.0, False, False)
+    with pytest.raises(NotImplementedError, match="sliding window"):
+        aten._flash_attention_forward(
+            *_bshd(q, k, v), None, None, 6, 6, 0.0, False, False, window_size_left=2
+        )
+    with pytest.raises(NotImplementedError, match="dropout"):
+        aten._flash_attention_forward(
+            *_bshd(q, k, v), None, None, 6, 6, 0.5, False, False
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("mask_type", [0, 1, 2])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_efficient_attention_forward_bmhk(
+    mojo_gpu, counting, dtype, mask_type, with_bias
+):
+    """custom_mask_type 1 is causal from the top left, 2 from the bottom
+    right; a fully masked row (an all -inf bias row) has output 0 and
+    logsumexp 0."""
+    lq, lk = 5, 8
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, dtype, 2, 2, lq, lk, 8)
+    br = b = None
+    if with_bias:
+        br = torch.randn(2, 2, lq, lk, generator=torch.Generator().manual_seed(4))
+        br[0, 1, 2] = -torch.inf
+        br = br.to(dtype).float().requires_grad_()
+        b = br.detach().to(dtype).to(mojo_gpu).requires_grad_()
+    for t in (qr, kr, vr, q, k, v):
+        t.requires_grad_()
+    out, lse, seed, offset, mq, mk = aten._efficient_attention_forward(
+        *_bshd(q, k, v), b, None, None, None, None, 0.0, mask_type, True
+    )
+    assert (mq, mk) == (lq, lk) and out.shape == (2, lq, 2, 8)
+    assert lse.shape == (2, 2, 32)
+    off = {0: None, 1: 0, 2: lk - lq}[mask_type]
+    want, want_lse = _ref_attention(qr, kr, vr, br, off)
+    tol = _tol(dtype)
+    torch.testing.assert_close(
+        out.transpose(1, 2).cpu().double(), want, atol=tol, rtol=tol
+    )
+    torch.testing.assert_close(
+        lse[..., :lq].cpu().double(),
+        want_lse.masked_fill(want_lse == -torch.inf, 0.0),
+        atol=tol,
+        rtol=tol,
+    )
+    g = torch.randn(want.shape, generator=torch.Generator().manual_seed(8))
+    out.backward(g.transpose(1, 2).to(dtype).to(mojo_gpu))
+    assert _counted("_efficient_attention_backward") == 1
+    want.backward(g.double())
+    gt = _grad_tol(dtype)
+    pairs = [(q, qr), (k, kr), (v, vr)] + ([(b, br)] if with_bias else [])
+    for got, ref in pairs:
+        torch.testing.assert_close(
+            _grad(got).cpu().double(), _grad(ref).double(), atol=gt, rtol=gt
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_cudnn_attention(mojo_gpu, counting, dtype, is_causal):
+    """cuDNN's contract: logsumexp (B, H, L, 1) float32 when asked for, else
+    undefined, like the cumulative-sequence tensors and the debug mask."""
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, dtype, 1, 2, 6, 9, 16)
+    br = torch.randn(6, 9, generator=torch.Generator().manual_seed(3)).to(dtype).float()
+    for t in (qr, kr, vr, q, k, v):
+        t.requires_grad_()
+    res = aten._scaled_dot_product_cudnn_attention(
+        q, k, v, br.to(dtype).to(mojo_gpu), True, 0.0, is_causal
+    )
+    out, lse = res[0], res[1]
+    assert res[2] is None and res[3] is None and res[8] is None
+    assert (res[4], res[5]) == (6, 9) and lse.shape == (1, 2, 6, 1)
+    want, want_lse = _ref_attention(qr, kr, vr, br, 0 if is_causal else None)
+    tol = _tol(dtype)
+    torch.testing.assert_close(out.cpu().double(), want, atol=tol, rtol=tol)
+    torch.testing.assert_close(lse[..., 0].cpu().double(), want_lse, atol=tol, rtol=tol)
+    out.backward(torch.ones_like(out))
+    assert _counted("_scaled_dot_product_cudnn_attention_backward") == 1
+    want.backward(torch.ones_like(want))
+    gt = _grad_tol(dtype)
+    for got, ref in ((q, qr), (k, kr), (v, vr)):
+        torch.testing.assert_close(
+            _grad(got).cpu().double(), _grad(ref).double(), atol=gt, rtol=gt
+        )
+    with torch.no_grad():
+        assert aten._scaled_dot_product_cudnn_attention(q, k, v, None, False)[1] is None
+        fwd = aten._cudnn_attention_forward(q, k, v, None, None, None, 6, 9, True)
+    torch.testing.assert_close(
+        fwd[0].cpu().double(), _ref_attention(qr, kr, vr)[0], atol=tol, rtol=tol
+    )
+
+
+def test_cudnn_attention_rejects_float32_like_cuda(mojo_gpu):
+    _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 2, 6, 6, 16)
+    with pytest.raises(
+        RuntimeError, match="only supports float16 and bfloat16, got Float"
+    ):
+        aten._scaled_dot_product_cudnn_attention(q, k, v, None, False)

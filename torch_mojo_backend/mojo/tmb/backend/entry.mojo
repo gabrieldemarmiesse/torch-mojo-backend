@@ -33,7 +33,9 @@ from tmb.ops.pooling import register_pooling
 from tmb.ops.random import register_random
 from tmb.ops.reductions import register_reductions
 from tmb.ops.resample import register_resample
+from tmb.ops.rnn import register_rnn
 from tmb.ops.roi import register_roi
+from tmb.ops.transformer import register_transformer
 from tmb.ops.unary import register_unary
 from tmb.backend.pg import pg_vtable
 from tmb.backend.registry import Lib, RegisterFn, Site
@@ -61,6 +63,8 @@ def _register_ops(lib: Int) raises:
     _group[register_pooling](lib)
     _group[register_pointwise](lib)
     _group[register_attention](lib)
+    _group[register_rnn](lib)
+    _group[register_transformer](lib)
     _group[register_foreach](lib)
     _group[register_resample](lib)
 
