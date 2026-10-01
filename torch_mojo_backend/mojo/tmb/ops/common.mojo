@@ -143,30 +143,69 @@ def _repeats_elements(t: T) -> Bool:
     return False
 
 
+comptime OVERLAP_NO = 0
+comptime OVERLAP_FULL = 1
+comptime OVERLAP_PARTIAL = 2
+comptime OVERLAP_TOO_HARD = 3
+
+comptime _OVERLAP_MESSAGE = (
+    "unsupported operation: some elements of the input tensor and the"
+    " written-to tensor refer to a single memory location. Please clone()"
+    " the tensor before performing the operation."
+)
+
+
+def _dense(t: T) -> Bool:
+    """`TensorImpl::is_non_overlapping_and_dense_or_false`."""
+    return t.contig or is_dense(t.shape, t.strides, t.rank)
+
+
+def overlap_status(a: T, b: T) -> Int:
+    """`at::get_overlap_status` (ATen/MemoryOverlap.cpp), in its order: the
+    same TensorImpl is FULL; an empty side is NO; a side that is not
+    non-overlapping-and-dense (a broadcast, a strided view such as `x[::2]`)
+    is TOO_HARD; different storages are NO; otherwise the dense byte ranges
+    decide FULL / PARTIAL / NO."""
+    if a.impl() == b.impl():
+        return OVERLAP_FULL
+    if a.numel == 0 or b.numel == 0:
+        return OVERLAP_NO
+    if not _dense(a) or not _dense(b):
+        return OVERLAP_TOO_HARD
+    var storage = a.storage_ptr()
+    if storage == 0 or storage != b.storage_ptr():
+        return OVERLAP_NO
+    var a_end = a.ptr + a.numel * a.itemsize
+    var b_end = b.ptr + b.numel * b.itemsize
+    if a.ptr == b.ptr and a_end == b_end:
+        if a.rank == b.rank:
+            var same = True
+            for i in range(a.rank):
+                if a.stride(i) != b.stride(i):
+                    same = False
+            if same:
+                return OVERLAP_FULL
+        return OVERLAP_PARTIAL
+    if a.ptr < b_end and b.ptr < a_end:
+        return OVERLAP_PARTIAL
+    return OVERLAP_NO
+
+
 def assert_no_overlap(written: T, other: T) raises:
-    """`at::assert_no_overlap` (ATen/MemoryOverlap.cpp): an `out=` tensor
-    sharing memory with an input -- the identical view included -- raises
-    before anything is written. As `get_overlap_status` decides it: a view
-    that is not non-overlapping-and-dense (a broadcast, or a strided view
-    such as `x[::2]`) is `TooHard` and lets the call through, so disjoint
-    interleaved views (`x[::2]` vs `x[1::2]`) are accepted, as in torch."""
-    if written.numel == 0 or other.numel == 0:
-        return
-    var storage = written.storage_ptr()
-    if storage == 0 or storage != other.storage_ptr():
-        return
-    if not (
-        written.contig or is_dense(written.shape, written.strides, written.rank)
-    ) or not (other.contig or is_dense(other.shape, other.strides, other.rank)):
-        return
-    var a_end = written.ptr + written.numel * written.itemsize
-    var b_end = other.ptr + other.numel * other.itemsize
-    if written.ptr < b_end and other.ptr < a_end:
-        raise Error(
-            "unsupported operation: some elements of the input tensor and the"
-            " written-to tensor refer to a single memory location. Please"
-            " clone() the tensor before performing the operation."
-        )
+    """`at::assert_no_overlap`: the written tensor may not share any memory
+    with an input, the same tensor included (FULL or PARTIAL raises);
+    TOO_HARD lets the call through, as in torch, so disjoint interleaved
+    views (`x[::2]` written from `x[1::2]`) are accepted."""
+    var status = overlap_status(written, other)
+    if status == OVERLAP_FULL or status == OVERLAP_PARTIAL:
+        raise Error(_OVERLAP_MESSAGE)
+
+
+def assert_no_partial_overlap(written: T, other: T) raises:
+    """`at::assert_no_partial_overlap`: only PARTIAL raises (the same view
+    is fine for an in-place elementwise op)."""
+    if overlap_status(written, other) == OVERLAP_PARTIAL:
+        raise Error(_OVERLAP_MESSAGE)
 
 
 def shares_storage(a: T, b: T) -> Bool:

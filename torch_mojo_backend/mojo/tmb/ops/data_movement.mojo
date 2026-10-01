@@ -1253,6 +1253,22 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         unsupported("aten::cat.out of only legacy-empty tensors")
     var rank = real[0].rank
     var dim = dim_in + rank if dim_in < 0 else dim_in
+    # cat's meta (TensorShape.cpp) checks the out against every input once
+    # its shape is set; an out already of that shape is checked here, before
+    # anything is written (a resized out is fresh storage).
+    if dim >= 0 and dim < rank and out.rank == rank:
+        var shaped = True
+        var along = 0
+        for x in real:
+            if x.rank == rank:
+                along += x.dim(dim)
+        for d in range(rank):
+            if out.dim(d) != (along if d == dim else real[0].dim(d)):
+                shaped = False
+        if shaped:
+            assert_no_internal_overlap(out)
+            for x in all_tensors:
+                assert_no_overlap(out, x)
     if _cat_out_batched(real, dim, out):
         ret_ref(rets, 0, out)
         return

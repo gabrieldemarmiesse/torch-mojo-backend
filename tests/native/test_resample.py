@@ -371,21 +371,35 @@ def test_reflection_pad_backward_checks_the_padding(mojo_device):
         torch.ops.aten.reflection_pad1d_backward(g, x, [3, 1])
 
 
-def test_out_overlap_raises(mojo_device):
-    x = torch.randn(1, 1, 4, 4).to(mojo_device)
+def test_out_overlap_follows_torch(mojo_device):
+    """torch's pad and upsample kernels check no overlap with the input
+    (upsample's out still refuses internal overlap). An overlapping out gets
+    the result computed as if the input were read first."""
+    x = torch.randn(1, 1, 4, 4)
+    xm = x.to(mojo_device)
+    # Pad: an expanded out is accepted (torch writes it racily; the values
+    # are not checked).
     expanded = torch.empty(1, 1, 1, 1, device=mojo_device).expand(1, 1, 6, 6)
+    torch.ops.aten.replication_pad2d.out(xm, [1, 1, 1, 1], out=expanded)
+    # Upsample: an expanded out still raises.
     with pytest.raises(RuntimeError, match="more than one element"):
-        torch.ops.aten.replication_pad2d.out(x, [1, 1, 1, 1], out=expanded)
-    # A strided (non-dense) out is TooHard for ATen's overlap check: allowed,
-    # as in stock torch.
-    torch.ops.aten.upsample_nearest1d.out(x[0], [2], None, out=x[0][..., :2])
-    # A partially overlapping dense view: the input's second half is the
-    # start of the output.
-    buf = torch.zeros(64, device=mojo_device)
-    with pytest.raises(RuntimeError, match="single memory location"):
-        torch.ops.aten.reflection_pad2d.out(
-            buf[:16].view(1, 1, 4, 4), [1, 1, 1, 1], out=buf[8:44].view(1, 1, 6, 6)
-        )
+        torch.ops.aten.upsample_nearest2d.out(xm, [6, 6], None, None, out=expanded)
+    # A strided (non-dense) out is TooHard for ATen's overlap check: allowed.
+    torch.ops.aten.upsample_nearest1d.out(xm[0], [2], None, out=xm[0][..., :2])
+    # A partially overlapping dense out: accepted, input read first.
+    for op, extra in (
+        (torch.ops.aten.reflection_pad2d.out, ([1, 1, 1, 1],)),
+        (torch.ops.aten.upsample_nearest2d.out, ([6, 6], None, None)),
+    ):
+        buf = torch.arange(64.0)
+        ref = buf.clone()
+        src = ref[:16].view(1, 1, 4, 4).clone()
+        res = torch.empty(1, 1, 6, 6)
+        op(src, *extra, out=res)
+        ref[8:44] = res.reshape(-1)
+        dev = buf.to(mojo_device)
+        op(dev[:16].view(1, 1, 4, 4), *extra, out=dev[8:44].view(1, 1, 6, 6))
+        torch.testing.assert_close(dev.cpu(), ref, atol=0, rtol=0)
 
 
 def test_unchanged_size_out_is_the_input(mojo_device):

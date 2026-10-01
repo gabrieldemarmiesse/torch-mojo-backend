@@ -1447,3 +1447,32 @@ def test_deterministic_index_add_float32_order_is_cuda_s(mojo_device, width):
         )
         assert got[0, c].item() == expected
     assert torch.equal(got[1], base[1])
+
+
+def test_in_place_self_aliasing_strided_views_raise(mojo_device):
+    """The same tensor as self and source is FULL overlap whatever its
+    layout (get_overlap_status checks TensorImpl identity first)."""
+
+    def strided() -> torch.Tensor:
+        return torch.arange(10.0, device=mojo_device)[::2]
+
+    rev = torch.arange(4, -1, -1, device=mojo_device)
+    calls = [
+        lambda a: a.scatter_add_(0, rev, a),
+        lambda a: a.index_add_(0, rev, a),
+        lambda a: a.scatter_(0, rev, a),
+        lambda a: a.scatter_reduce_(0, rev, a, "sum"),
+        lambda a: a.index_reduce_(0, rev, a, "amax"),
+        lambda a: a.index_copy_(0, rev, a),
+        lambda a: a.put_(rev, a),
+    ]
+    for call in calls:
+        a = strided()
+        with pytest.raises(RuntimeError, match="single memory location"):
+            call(a)
+    # An out= that IS the source (not self) is FULL overlap too.
+    src = strided()
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.scatter_reduce(
+            torch.zeros(5, device=mojo_device), 0, rev, src, "sum", out=src
+        )

@@ -43,8 +43,10 @@ from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK, _f64_slot
 from tmb.ops.common import (
+    OVERLAP_FULL,
+    OVERLAP_PARTIAL,
     assert_no_internal_overlap,
-    assert_no_overlap,
+    overlap_status,
     check_out,
     fill_value,
     same_view,
@@ -115,6 +117,7 @@ def _dest(
     dims: List[Int],
     inputs: List[T],
     identity: Bool,
+    internal_check: Bool = True,
 ) raises -> Tuple[T, Int]:
     """The tensor an `out=` / `grad_input=` overload writes, and how the
     result reaches the caller's tensor (DIRECT / COPY_BACK / RESIZE_COPY /
@@ -122,10 +125,14 @@ def _dest(
 
     `identity`: the op copies its input unchanged (CUDA's `output.copy_(input)`
     shortcut), so an `out` that IS that input view is a no-op, as on CUDA.
-    Any other overlap with an input raises before anything is written. An
-    `out` that must be resized while it shares storage with an input is
-    resized only after the kernel ran into a fresh tensor: the resize may
-    reallocate the storage the input's pointer still addresses."""
+    torch's upsample and pad kernels run no overlap check against their
+    input, so an `out` overlapping it does not raise: the result is computed
+    into a fresh tensor and copied back (the input is read before anything
+    is written). `internal_check`: upsample's out still refuses internal
+    overlap (an expanded out), pad's does not. An `out` that must be resized
+    while it shares storage with an input is resized only after the kernel
+    ran into a fresh tensor: the resize may reallocate the storage the
+    input's pointer still addresses."""
     var dst = v_tensor(args[unsafe_offset=i])
     check_out(dst, like)
     var shape = _shape(dims)
@@ -137,8 +144,11 @@ def _dest(
                 break
     if matches and identity and same_view(dst, inputs[0]):
         return (dst^, NO_OP)
+    var overlaps = False
     for k in range(len(inputs)):
-        assert_no_overlap(dst, inputs[k])
+        var status = overlap_status(dst, inputs[k])
+        if status == OVERLAP_FULL or status == OVERLAP_PARTIAL:
+            overlaps = True
     if not matches:
         for k in range(len(inputs)):
             if shares_storage(dst, inputs[k]):
@@ -148,8 +158,9 @@ def _dest(
                 )
         resize_out(dst, shape, len(dims))
         return (dst^, DIRECT)
-    assert_no_internal_overlap(dst)
-    if dst.contig:
+    if internal_check:
+        assert_no_internal_overlap(dst)
+    if dst.contig and not overlaps:
         return (dst^, DIRECT)
     return (new_tensor(shape, len(dims), dst.stype, dst.device), COPY_BACK)
 
@@ -722,7 +733,7 @@ def op_pad[
     var dst: T
     var how = DIRECT
     comptime if OUT:
-        var d = _dest(args, 2, a, out_dims, [a.copy()], identity)
+        var d = _dest(args, 2, a, out_dims, [a.copy()], identity, False)
         dst = d[0].copy()
         how = d[1]
     else:
@@ -795,7 +806,7 @@ def op_pad_backward[
     var how = DIRECT
     comptime if OUT:
         # `self` is only read for its shape, so it may alias grad_input.
-        var d = _dest(args, 3, g, in_dims, [g.copy()], False)
+        var d = _dest(args, 3, g, in_dims, [g.copy()], False, False)
         dst = d[0].copy()
         how = d[1]
     else:

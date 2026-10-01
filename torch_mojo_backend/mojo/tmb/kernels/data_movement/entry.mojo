@@ -25,6 +25,7 @@ from max.gpu.host import DeviceContext
 from std.sys import is_amd_gpu, is_apple_gpu, is_nvidia_gpu
 from std.sys.info import (
     has_accelerator,
+    has_amd_gpu_accelerator,
     has_apple_gpu_accelerator,
     has_nvidia_gpu_accelerator,
     size_of,
@@ -4119,6 +4120,11 @@ def _opmath[dtype: DType]() -> DType:
         return dtype
 
 
+# The lane tree of index_put's stride-1 kernel: a 32-lane warp on NVIDIA
+# (and Apple), a 64-lane wavefront on AMD.
+comptime _MAX_LANES = 64 if has_amd_gpu_accelerator() else 32
+
+
 def _sorted_segment_add_go(
     out_o: Arg,
     tgt_o: Arg,
@@ -4135,7 +4141,7 @@ def _sorted_segment_add_go(
     var n = _raw_tuple_int(params, 0)
     var is_value = _raw_tuple_int(params, 1) != 0
     var mode = _raw_tuple_int(params, 2)
-    var warp = min(_raw_tuple_int(params, 3), 64)
+    var warp = min(_raw_tuple_int(params, 3), _MAX_LANES)
     var value = _raw_f64(value_o)
     var tgt = _make_ptr[DType.int64](_raw_int(tgt_o))
     var perm = _make_ptr[DType.int64](_raw_int(perm_o))
@@ -4201,10 +4207,10 @@ def _sorted_segment_add_go(
                     if mode == 0:
                         var passes = (stop - i) // warp
                         if passes > 0:
-                            var lanes = Array[Scalar[acc_t], 64](
+                            var lanes = Array[Scalar[acc_t], _MAX_LANES](
                                 fill=Scalar[acc_t](0)
                             )
-                            var prev = Array[Scalar[acc_t], 64](
+                            var prev = Array[Scalar[acc_t], _MAX_LANES](
                                 fill=Scalar[acc_t](0)
                             )
                             for p in range(passes):
