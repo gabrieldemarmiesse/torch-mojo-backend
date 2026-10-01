@@ -2175,23 +2175,6 @@ def _glu_narrow(t: T, d: Int, start: Int, length: Int) raises -> T:
     )
 
 
-def _glu_broadcasts_to(t: T, target: T) raises:
-    """TensorIterator over an output of `target`'s shape: every input
-    broadcasts to it."""
-    var ok = t.rank <= target.rank
-    if ok:
-        for i in range(MAX_RANK):
-            if t.shape[i] != target.shape[i] and t.shape[i] != 1:
-                ok = False
-    if not ok:
-        raise Error(
-            "output with shape ",
-            _b_shape_list(target.shape, target.rank),
-            " doesn't match the broadcast shape ",
-            _b_shape_list(t.shape, t.rank),
-        )
-
-
 def _glu_jvp(args: Values) raises -> Owned:
     """GatedLinearUnit.cpp's glu_jvp over ActivationGluKernel.cu's
     glu_jvp_kernel: da * sig_b + res * (db - sig_b * db) in opmath, rounded
@@ -2224,8 +2207,8 @@ def _glu_jvp(args: Values) raises -> Owned:
                 " but expected ",
                 _scalar_type_name(glu.dtype),
             )
-    _glu_broadcasts_to(b.t, glu)
-    _glu_broadcasts_to(da.t, glu)
+    # The result takes the broadcast shape of glu, b, da and db, as the
+    # TensorIterator over `empty_like(glu)` resizes its output to.
     if not _pw_is_float(glu.stype):
         raise Error(
             '"glu_cuda" not implemented for \'',
@@ -2333,13 +2316,16 @@ def _glu_backward_jvp(args: Values) raises -> Owned:
             "Sizes of tensors must match except in dimension ",
             d,
         )
+    # The halves take the broadcast length along `dim`, which is not
+    # grad_glu's when it broadcasts against dgrad_glu.
     var shape = dgxa.t.shape
     var p = MAX_RANK - dgxa.t.rank + d
-    shape[p] = 2 * shape[p]
+    var half_len = shape[p]
+    shape[p] = 2 * half_len
     var out = own(new_tensor(shape, dgxa.t.rank, st, dgxa.t.device))
     var halves = [dgxa.t.copy(), dgxb.t.copy()]
     for k in range(2):
-        var half = own(_glu_narrow(out.t, d, k * n, n))
+        var half = own(_glu_narrow(out.t, d, k * half_len, half_len))
         var src = own(cast_to(halves[k], st)) if halves[
             k
         ].stype != st else _glu_bjvp_view(halves[k])

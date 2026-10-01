@@ -4001,6 +4001,8 @@ struct ConvGeom(Copyable, ImplicitlyCopyable, Movable):
     def one_by_one(self) -> Bool:
         """A 1x1 stride-1 unpadded conv: the NCHW input already is the
         (C, H*W) patch matrix of each sample."""
+        # The extents must match too: a transposed conv's output_padding
+        # makes its (adjoint) input larger than its output.
         return (
             self.kd == 1
             and self.kh == 1
@@ -4011,6 +4013,9 @@ struct ConvGeom(Copyable, ImplicitlyCopyable, Movable):
             and self.pd == 0
             and self.ph == 0
             and self.pw == 0
+            and self.in_d == self.out_d
+            and self.in_h == self.out_h
+            and self.in_w == self.out_w
         )
 
     def _shape(self, ch: Int, d: Int, h: Int, w: Int) -> List[Int]:
@@ -4101,6 +4106,48 @@ def _conv_args(
         transposed,
         groups,
     )
+
+
+def _axes_str(name: StaticString, xs: List[Int]) -> String:
+    """` name_height: a name_width: b` (with `name_depth` for three axes), the
+    way CUDA's THNN shape checks print a per-axis parameter. A 1-D
+    convolution runs as 2-D with a unit height, as ATen views it."""
+    var full = _unit_pad(xs, len(xs), 1 if name != "output_padding" else 0)
+    var out = String()
+    if len(xs) == 3:
+        out += " " + String(name) + "_depth: " + String(full[0])
+    out += " " + String(name) + "_height: " + String(full[1])
+    out += " " + String(name) + "_width: " + String(full[2])
+    return out
+
+
+def _check_conv_backend(input: T, p: ConvArgs) raises:
+    """What `_convolution`'s backend selection and CUDA's kernels reject
+    after `check_shape_forward`: more than three spatial axes, a zero
+    dilation, an output_padding no smaller than the stride or the dilation."""
+    if input.rank > 5:
+        raise Error("unsupported ConvNd parameters")
+    for i in range(len(p.dilation)):
+        if p.dilation[i] == 0:
+            raise Error(
+                "dilation should be greater than zero, but got",
+                _axes_str("dilation", p.dilation),
+            )
+    if p.transposed:
+        for i in range(len(p.output_padding)):
+            if (
+                p.output_padding[i] >= p.stride[i]
+                and p.output_padding[i] >= p.dilation[i]
+            ):
+                raise Error(
+                    (
+                        "output padding must be smaller than either stride or"
+                        " dilation, but got"
+                    ),
+                    _axes_str("output_padding", p.output_padding),
+                    _axes_str("stride", p.stride),
+                    _axes_str("dilation", p.dilation),
+                )
 
 
 def _check_conv_shapes(
@@ -4589,6 +4636,7 @@ def _conv_from_args(
         weight, stride, padding, dilation, transposed, output_padding, groups
     )
     _check_conv_shapes(input, weight, bias, p)
+    _check_conv_backend(input, p)
     return _run_conv(input, weight, bias, p)
 
 
@@ -4927,6 +4975,7 @@ def op_convolution_backward(
         v_int(args[unsafe_offset=9]),
     )
     _check_conv_shapes(input, weight, None, p)
+    _check_conv_backend(input, p)
     var grad_input = own(_empty_result(input.stype, input.device))
     var grad_weight = own(_empty_result(input.stype, input.device))
     var grad_bias = own(_empty_result(input.stype, input.device))
@@ -5329,6 +5378,7 @@ def _slow_conv2d_grads(
             _list_str(input.logical_shape()),
         )
     _check_conv_shapes(input, weight, None, p)
+    _check_conv_backend(input, p)
     if mask[0] or mask[1] or mask[2]:
         _conv_backward(grad, input, weight, p, mask, gi, gw, gb)
 

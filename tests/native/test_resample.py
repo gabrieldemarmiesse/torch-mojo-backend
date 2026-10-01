@@ -881,7 +881,7 @@ def test_grid_sample_out_variants(mojo_device):
         go, x, grid, 0, 1, False, [True, True]
     )
     out0 = torch.empty(2, 3, 5, 4, device=mojo_device).transpose(-1, -2)
-    out1 = torch.empty(0, device=mojo_device, dtype=torch.float16)
+    out1 = torch.empty(0, device=mojo_device)
     with ran("aten::grid_sampler_2d_backward.out"):
         torch.ops.aten.grid_sampler_2d_backward.out(
             go.to(mojo_device),
@@ -895,4 +895,14 @@ def test_grid_sample_out_variants(mojo_device):
             out1=out1,
         )
     torch.testing.assert_close(out0.cpu(), want_bw[0], atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(out1.cpu(), want_bw[1].half(), atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(out1.cpu(), want_bw[1], atol=1e-5, rtol=1e-5)
+    # The generated `copy_arg`: the exact result dtype, no cast; and an out
+    # that overlaps itself is refused.
+    args = (x.to(mojo_device), grid.to(mojo_device), 1, 2, True)
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        torch.ops.aten.grid_sampler_2d.out(
+            *args, out=torch.empty(0, device=mojo_device, dtype=torch.float16)
+        )
+    overlapping = torch.empty(1, device=mojo_device).expand(want.shape)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.ops.aten.grid_sampler_2d.out(*args, out=overlapping)

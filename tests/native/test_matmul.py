@@ -2253,9 +2253,52 @@ def test_conv_empty_batch_and_channels(mojo_device):
             torch.testing.assert_close(g.grad.cpu(), r.grad)
 
 
+def test_conv_transpose_pointwise_with_output_padding(mojo_device):
+    """stride 1, dilation 2, output_padding 1, batch 1: a 1x1 transposed conv
+    whose output is LARGER than its input, so the no-im2col shortcut must not
+    apply; forward and every gradient."""
+    gen = torch.Generator().manual_seed(4)
+    x = torch.randn(1, 3, 5, 4, generator=gen)
+    w = torch.randn(3, 2, 1, 1, generator=gen)
+    args = (None, 1, 0, 1, 1, 2)
+
+    def run(device):
+        xs = x.to(device).requires_grad_()
+        ws = w.to(device).requires_grad_()
+        out = F.conv_transpose2d(xs, ws, *args)
+        out.backward(torch.ones_like(out))
+        return [out.detach(), xs.grad, ws.grad]
+
+    for g, r in zip(run(mojo_device), run("cpu"), strict=True):
+        assert g is not None and r is not None
+        torch.testing.assert_close(g.cpu(), r, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize(
     "call,match",
     [
+        (
+            lambda x, w: torch.ops.aten.convolution(
+                x.new_ones(1, 1, 2, 2, 2, 2),
+                w.new_ones(1, 1, 1, 1, 1, 1),
+                None,
+                [1],
+                [0],
+                [1],
+                False,
+                [0],
+                1,
+            ),
+            "unsupported ConvNd parameters",
+        ),
+        (
+            lambda x, w: F.conv2d(x, w, dilation=0),
+            "dilation should be greater than zero",
+        ),
+        (
+            lambda x, w: F.conv_transpose2d(x, w.transpose(0, 1), output_padding=1),
+            "output padding must be smaller than either stride or dilation",
+        ),
         (lambda x, w: F.conv2d(x, w, stride=-1), "non-positive stride"),
         (lambda x, w: F.conv2d(x, w, padding=-1), "negative padding"),
         (lambda x, w: F.conv2d(x, w, groups=3), "expected weight to be divisible"),
