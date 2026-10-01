@@ -311,6 +311,18 @@ _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
         ("nn_functional_adaptive_avg_pool3d", torch.float16),
         ("nn_functional_interpolate_area", torch.bfloat16),
         ("nn_functional_interpolate_area", torch.float16),
+        # grid_sample in half precision: CUDA's (and our) forward computes
+        # the source index and the blend in float and rounds once; CPU torch
+        # works in the 16-bit type itself, farther from float64.
+        *(
+            (name, dtype)
+            for name in (
+                "grid_sampler_2d",
+                "grid_sampler_3d",
+                "nn_functional_grid_sample",
+            )
+            for dtype in (torch.bfloat16, torch.float16)
+        ),
     }
 )
 

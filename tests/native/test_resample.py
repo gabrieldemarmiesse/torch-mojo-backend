@@ -518,3 +518,293 @@ def test_backward_strided_grad_input_is_grad_output(mojo_device, op, extra, surv
     getattr(torch.ops.aten, op).grad_input(gm, osize, isize, *extra, grad_input=gm)
     want = g if survives else torch.zeros_like(g)
     torch.testing.assert_close(gm.cpu(), want, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# grid_sampler_2d / grid_sampler_3d (F.grid_sample)
+# ---------------------------------------------------------------------------
+
+_GRID_MODES_2D = ["bilinear", "nearest", "bicubic"]
+_GRID_PADS = ["zeros", "border", "reflection"]
+
+
+def _grid_inputs(shape, out_spatial, dtype, spread=1.4, seed=0):
+    """An input and a grid reaching past [-1, 1] by `spread`, in `dtype`."""
+    gen = torch.Generator().manual_seed(seed)
+    x = torch.randn(shape, generator=gen).to(dtype)
+    rank = len(shape) - 2
+    grid = (torch.rand(shape[0], *out_spatial, rank, generator=gen) * 2 - 1) * spread
+    return x, grid.to(dtype)
+
+
+def _exact_grid(shape, out_spatial, align, seed=0):
+    """A grid whose source coordinates are a quarter off a pixel (some
+    outside the image), with every value exact in bfloat16 for the extents
+    the tests use (W = 8 unaligned, W = 9 aligned, likewise H and D): the
+    CUDA backward computes the source index in the 16-bit type itself, so
+    only such a grid has one answer to compare a float64 reference with."""
+    gen = torch.Generator().manual_seed(seed)
+    rank = len(shape) - 2
+    sizes = list(reversed(shape[2:]))  # x, y, z extents
+    coords = []
+    for k in range(rank):
+        n = sizes[k]
+        pix = torch.randint(-2, n + 2, (shape[0], *out_spatial), generator=gen)
+        frac = torch.where(torch.rand(pix.shape, generator=gen) < 0.5, 0.25, 0.75)
+        ix = pix + frac
+        coords.append(ix * 2 / (n - 1) - 1 if align else (2 * ix + 1) / n - 1)
+    return torch.stack(coords, -1)
+
+
+def _grid_check(x, grid, device, mode, pad, align, fwd_tol, grad_tol):
+    """Forward value and both gradients on the device against CPU float64
+    (the CUDA kernels compute half forwards in float32 and half backwards
+    in the 16-bit type; a float64 reference bounds both)."""
+    op = "aten::grid_sampler_2d" if x.dim() == 4 else "aten::grid_sampler_3d"
+    x, grid = x.detach(), grid.detach()
+    xm = x.to(device).requires_grad_(True)
+    gm = grid.to(device).requires_grad_(True)
+    xc = x.double().clone().requires_grad_(True)
+    gc = grid.double().clone().requires_grad_(True)
+    kw = dict(mode=mode, padding_mode=pad, align_corners=align)
+    with ran(op):
+        ym = F.grid_sample(xm, gm, **kw)
+    yc = F.grid_sample(xc, gc, **kw)
+    assert ym.dtype == x.dtype
+    torch.testing.assert_close(ym.cpu().double(), yc, atol=fwd_tol, rtol=fwd_tol)
+    go = torch.randn(yc.shape, generator=torch.Generator().manual_seed(1))
+    go = go.to(x.dtype)
+    with ran(op + "_backward"):
+        ym.backward(go.to(device))
+    yc.backward(go.double())
+    torch.testing.assert_close(
+        xm.grad.cpu().double(), xc.grad, atol=grad_tol, rtol=grad_tol
+    )
+    torch.testing.assert_close(
+        gm.grad.cpu().double(), gc.grad, atol=grad_tol * 10, rtol=grad_tol * 10
+    )
+
+
+_GRID_TOL = {
+    torch.float32: (1e-5, 1e-4),
+    torch.float16: (4e-3, 3e-2),
+    torch.bfloat16: (3e-2, 2.5e-1),
+}
+
+
+@pytest.mark.parametrize("dtype", _FLOATS)
+@pytest.mark.parametrize("align", [False, True])
+@pytest.mark.parametrize("pad", _GRID_PADS)
+@pytest.mark.parametrize("mode", _GRID_MODES_2D)
+def test_grid_sample_2d(mojo_device, mode, pad, align, dtype):
+    n = 9 if align else 8
+    x, grid = _grid_inputs((2, 3, n, n), (4, 6), dtype)
+    if dtype != torch.float32:
+        grid = _exact_grid(x.shape, (4, 6), align).to(dtype)
+    fwd, grad = _GRID_TOL[dtype]
+    if mode == "bicubic":
+        fwd, grad = fwd * 4, grad * 4
+    _grid_check(x, grid, mojo_device, mode, pad, align, fwd, grad)
+
+
+@pytest.mark.parametrize("dtype", _FLOATS)
+@pytest.mark.parametrize("align", [False, True])
+@pytest.mark.parametrize("pad", _GRID_PADS)
+@pytest.mark.parametrize("mode", ["bilinear", "nearest"])
+def test_grid_sample_3d(mojo_device, mode, pad, align, dtype):
+    shape = (2, 3, 5, 9, 9) if align else (2, 3, 4, 8, 8)
+    x, grid = _grid_inputs(shape, (3, 4, 2), dtype)
+    if dtype != torch.float32:
+        grid = _exact_grid(x.shape, (3, 4, 2), align).to(dtype)
+    fwd, grad = _GRID_TOL[dtype]
+    _grid_check(x, grid, mojo_device, mode, pad, align, fwd, grad)
+
+
+@pytest.mark.parametrize("mode", _GRID_MODES_2D)
+def test_grid_sample_float64(mojo_device, mode):
+    skip_if_metal(mojo_device, "Apple GPUs have no float64")
+    x, grid = _grid_inputs((2, 3, 6, 5), (7, 3), torch.float64, spread=3.0)
+    for pad in _GRID_PADS:
+        _grid_check(x, grid, mojo_device, mode, pad, False, 1e-12, 1e-11)
+    if mode != "bicubic":
+        x, grid = _grid_inputs((1, 2, 3, 4, 5), (2, 3, 4), torch.float64, spread=3.0)
+        _grid_check(x, grid, mojo_device, mode, "reflection", True, 1e-12, 1e-11)
+
+
+def test_grid_sample_far_coordinates(mojo_device):
+    """Grid values many spans away: the reflection's fmod / flip count and
+    the border clip; a nearest tap at exact half-way points rounds to
+    even, as nearbyint does."""
+    x, _ = _grid_inputs((1, 2, 4, 5), (1, 1), torch.float32)
+    grid = torch.tensor([[[[37.3, -11.9], [-123.6, 4.2], [0.25, -0.375], [1e6, -7.5]]]])
+    for mode in _GRID_MODES_2D:
+        for pad in _GRID_PADS:
+            for align in (False, True):
+                _grid_check(x, grid, mojo_device, mode, pad, align, 1e-4, 1e-3)
+
+
+def test_grid_sample_nonfinite_grid_samples_zero(mojo_device):
+    """NaN / inf coordinates fall outside every image (CUDA's
+    safe_downgrade_to_int_range) under zero padding."""
+    x = torch.randn(1, 2, 3, 3)
+    grid = torch.tensor(
+        [[[[float("nan"), 0.0], [float("inf"), 0.0], [0.0, -float("inf")]]]]
+    )
+    for mode in _GRID_MODES_2D:
+        y = F.grid_sample(
+            x.to(mojo_device), grid.to(mojo_device), mode=mode, align_corners=False
+        )
+        if mode == "bicubic":
+            # bicubic's unnormalized NaN poisons its weights
+            continue
+        assert torch.equal(y.cpu(), torch.zeros(1, 2, 1, 3))
+
+
+def test_grid_sample_strided_operands(mojo_device):
+    x, grid = _grid_inputs((3, 4, 6, 8), (5, 7), torch.float32)
+    xs = x.to(mojo_device).transpose(2, 3).contiguous().transpose(2, 3)[:, ::2]
+    gs = grid.to(mojo_device).permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+    assert not xs.is_contiguous() and not gs.is_contiguous()
+    for mode in _GRID_MODES_2D:
+        want = F.grid_sample(x[:, ::2], grid, mode=mode, align_corners=False)
+        got = F.grid_sample(xs, gs, mode=mode, align_corners=False)
+        torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+        go = torch.randn(want.shape)
+        want_bw = torch.ops.aten.grid_sampler_2d_backward(
+            go, x[:, ::2], grid, _GRID_MODES_2D.index(mode), 0, False, [True, True]
+        )
+        got_bw = torch.ops.aten.grid_sampler_2d_backward(
+            go.to(mojo_device).transpose(2, 3).contiguous().transpose(2, 3),
+            xs,
+            gs,
+            _GRID_MODES_2D.index(mode),
+            0,
+            False,
+            [True, True],
+        )
+        for g, w in zip(got_bw, want_bw):
+            torch.testing.assert_close(g.cpu(), w, atol=1e-4, rtol=1e-4)
+
+
+def test_grid_sample_backward_output_mask(mojo_device):
+    x, grid = _grid_inputs((2, 3, 5, 4), (3, 3), torch.float32)
+    go = torch.randn(2, 3, 3, 3)
+    with ran("aten::grid_sampler_2d_backward"):
+        gi, gg = torch.ops.aten.grid_sampler_2d_backward(
+            go.to(mojo_device),
+            x.to(mojo_device),
+            grid.to(mojo_device),
+            0,
+            0,
+            False,
+            [False, True],
+        )
+    assert gi is None
+    want = torch.ops.aten.grid_sampler_2d_backward(
+        go, x, grid, 0, 0, False, [True, True]
+    )
+    torch.testing.assert_close(gg.cpu(), want[1], atol=1e-5, rtol=1e-5)
+    # Only the grid requires grad: F.grid_sample's autograd asks for it alone.
+    gm = grid.to(mojo_device).requires_grad_(True)
+    F.grid_sample(x.to(mojo_device), gm, align_corners=False).backward(
+        go.to(mojo_device)
+    )
+    torch.testing.assert_close(gm.grad.cpu(), want[1], atol=1e-5, rtol=1e-5)
+
+
+def test_grid_sample_empty(mojo_device):
+    for shape, spatial in [
+        ((0, 3, 4, 5), (2, 3)),
+        ((2, 0, 4, 5), (2, 3)),
+        ((2, 3, 4, 5), (0, 3)),
+    ]:
+        x, grid = _grid_inputs(shape, spatial, torch.float32)
+        _grid_check(x, grid, mojo_device, "bilinear", "zeros", False, 0, 0)
+    x, grid = _grid_inputs((2, 3, 4, 5, 2), (0, 3, 1), torch.float32)
+    _grid_check(x, grid, mojo_device, "bilinear", "border", False, 0, 0)
+
+
+def test_grid_sample_errors(mojo_device):
+    x = torch.randn(2, 3, 4, 5, device=mojo_device)
+    grid = torch.zeros(2, 3, 3, 2, device=mojo_device)
+    with pytest.raises(RuntimeError, match="same batch size"):
+        torch.grid_sampler(x, grid[:1], 0, 0, False)
+    with pytest.raises(RuntimeError, match="to have size 2 in last dimension"):
+        torch.grid_sampler(x, torch.zeros(2, 3, 3, 3, device=mojo_device), 0, 0, False)
+    with pytest.raises(RuntimeError, match="non-empty spatial dimensions"):
+        torch.grid_sampler(x[:, :, :0], grid, 0, 0, False)
+    with pytest.raises(RuntimeError, match="expected 4D input and grid"):
+        torch.ops.aten.grid_sampler_2d(
+            x[None], torch.zeros(1, 2, 3, 3, 3, device=mojo_device), 0, 0, False
+        )
+    x5 = torch.randn(2, 3, 4, 5, 6, device=mojo_device)
+    g5 = torch.zeros(2, 1, 2, 2, 3, device=mojo_device)
+    with pytest.raises(RuntimeError, match="bicubic interpolation only supports 4D"):
+        torch.ops.aten.grid_sampler_3d(x5, g5, 2, 0, False)
+    with pytest.raises(
+        RuntimeError, match="expected input and grid to be on same device"
+    ):
+        torch.ops.aten.grid_sampler_2d(x, grid.cpu(), 0, 0, False)
+    with pytest.raises(RuntimeError, match="expected scalar type Float but found Half"):
+        torch.ops.aten.grid_sampler_2d(x, grid.half(), 0, 0, False)
+    with pytest.raises(NotImplementedError, match="not implemented for 'Long'"):
+        torch.ops.aten.grid_sampler_2d(x.long(), grid.long(), 0, 0, False)
+    with pytest.raises(RuntimeError, match="expected grad_output to have sizes"):
+        torch.ops.aten.grid_sampler_2d_backward(
+            torch.zeros(2, 3, 3, 4, device=mojo_device),
+            x,
+            grid,
+            0,
+            0,
+            False,
+            [True, True],
+        )
+
+
+def test_grid_sample_backward_alerts_nondeterminism(mojo_device):
+    x, grid = _grid_inputs((1, 2, 4, 4), (2, 2), torch.float32)
+    xm = x.to(mojo_device).requires_grad_(True)
+    y = F.grid_sample(xm, grid.to(mojo_device), align_corners=False)
+    with _deterministic():
+        with pytest.raises(RuntimeError, match="grid_sampler_2d_backward_cuda"):
+            y.sum().backward()
+
+
+class _deterministic:
+    def __enter__(self):
+        self.prev = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+
+    def __exit__(self, *exc):
+        torch.use_deterministic_algorithms(self.prev)
+
+
+def test_grid_sample_out_variants(mojo_device):
+    x, grid = _grid_inputs((2, 3, 4, 5), (3, 2), torch.float32)
+    want = torch.ops.aten.grid_sampler_2d(x, grid, 1, 2, True)
+    out = torch.empty(0, device=mojo_device)
+    with ran("aten::grid_sampler_2d.out"):
+        torch.ops.aten.grid_sampler_2d.out(
+            x.to(mojo_device), grid.to(mojo_device), 1, 2, True, out=out
+        )
+    torch.testing.assert_close(out.cpu(), want)
+    go = torch.randn(want.shape)
+    want_bw = torch.ops.aten.grid_sampler_2d_backward(
+        go, x, grid, 0, 1, False, [True, True]
+    )
+    out0 = torch.empty(2, 3, 5, 4, device=mojo_device).transpose(-1, -2)
+    out1 = torch.empty(0, device=mojo_device, dtype=torch.float16)
+    with ran("aten::grid_sampler_2d_backward.out"):
+        torch.ops.aten.grid_sampler_2d_backward.out(
+            go.to(mojo_device),
+            x.to(mojo_device),
+            grid.to(mojo_device),
+            0,
+            1,
+            False,
+            [True, True],
+            out0=out0,
+            out1=out1,
+        )
+    torch.testing.assert_close(out0.cpu(), want_bw[0], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out1.cpu(), want_bw[1].half(), atol=1e-3, rtol=1e-3)

@@ -122,6 +122,16 @@ UPSAMPLE2D_BACKWARD_OPS = {
     for name in ("upsample_nearest2d", "upsample_bilinear2d", *UPSAMPLE2D_OPS)
 }
 UPSAMPLE3D_BACKWARD_OPS = {f"{name}_backward": 3 for name in UPSAMPLE3D_OPS}
+# grid_sampler: (N, C, H, W) input, (oH, oW) grid; (N, C, D, H, W) input,
+# (oD, oH, oW) grid. One awkward shape each.
+GRID2D_SHAPES: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
+    "N8xC64x56x56_o56x56": ((8, 64, 56, 56), (56, 56)),
+    "N2xC3x257x311_o199x173": ((2, 3, 257, 311), (199, 173)),
+}
+GRID3D_SHAPES: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
+    "N2xC16x16x32x32_o16x32x32": ((2, 16, 16, 32, 32), (16, 32, 32)),
+    "N1xC3x13x27x35_o9x21x17": ((1, 3, 13, 27, 35), (9, 21, 17)),
+}
 _UPSAMPLE_TESTS = {
     "test_upsample1d": UPSAMPLE1D_OPS,
     "test_upsample2d": UPSAMPLE2D_OPS,
@@ -161,6 +171,10 @@ COVERS: dict[str, str] = {
     "aten::max_unpool3d": "test_max_unpool3d",
     "aten::im2col": "test_im2col (F.unfold)",
     "aten::col2im": "test_col2im (F.fold)",
+    "aten::grid_sampler_2d": "test_grid_sampler (rank 2)",
+    "aten::grid_sampler_3d": "test_grid_sampler (rank 3)",
+    "aten::grid_sampler_2d_backward": "test_grid_sampler_backward (rank 2)",
+    "aten::grid_sampler_3d_backward": "test_grid_sampler_backward (rank 3)",
 }
 
 _UPSAMPLE_OUT = (
@@ -234,6 +248,10 @@ SKIPPED: dict[str, str] = {
             "aten::max_pool3d_with_indices_backward.grad_input",
             "aten::max_unpool2d.out",
             "aten::max_unpool3d.out",
+            "aten::grid_sampler_2d.out",
+            "aten::grid_sampler_3d.out",
+            "aten::grid_sampler_2d_backward.out",
+            "aten::grid_sampler_3d_backward.out",
         )
     },
 }
@@ -926,4 +944,60 @@ def test_col2im(
         lambda: F.fold(c_ref, (h, w), k, padding=pad, stride=stride),
         lambda: F.fold(c_our, (h, w), k, padding=pad, stride=stride),
         flops=float(cols.numel()),
+    )
+
+
+def _grid_operands(
+    shape_id: str, dtype_id: str
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """The input, a grid reaching slightly past [-1, 1] (so the zero padding
+    is exercised) and the spatial rank, from either shape table."""
+    shapes = GRID2D_SHAPES if shape_id in GRID2D_SHAPES else GRID3D_SHAPES
+    in_shape, out_spatial = shapes[shape_id]
+    rank = len(in_shape) - 2
+    dtype = DTYPES[dtype_id]
+    x = torch.randn(in_shape, dtype=dtype)
+    grid = (torch.rand(in_shape[0], *out_spatial, rank) * 2.2 - 1.1).to(dtype)
+    return x, grid, rank
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", [*GRID2D_SHAPES, *GRID3D_SHAPES])
+def test_grid_sampler(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """Bilinear, zero padding, align_corners=False (F.grid_sample's default)."""
+    x, grid, rank = _grid_operands(shape_id, dtype_id)
+    op = torch.ops.aten.grid_sampler_2d if rank == 2 else torch.ops.aten.grid_sampler_3d
+    x_ref, x_our = both(x, hw, mojo_device)
+    g_ref, g_our = both(grid, hw, mojo_device)
+    out_numel = x.shape[0] * x.shape[1] * math.prod(grid.shape[1:-1])
+    bench.run(
+        lambda: op(x_ref, g_ref, 0, 0, False),
+        lambda: op(x_our, g_our, 0, 0, False),
+        flops=float(out_numel) * 2.0 * 2**rank,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", [*GRID2D_SHAPES, *GRID3D_SHAPES])
+def test_grid_sampler_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """Both gradients (input and grid), bilinear, zero padding."""
+    x, grid, rank = _grid_operands(shape_id, dtype_id)
+    op = (
+        torch.ops.aten.grid_sampler_2d_backward
+        if rank == 2
+        else torch.ops.aten.grid_sampler_3d_backward
+    )
+    out_shape = [x.shape[0], x.shape[1], *grid.shape[1:-1]]
+    gout = torch.randn(out_shape, dtype=x.dtype)
+    x_ref, x_our = both(x, hw, mojo_device)
+    g_ref, g_our = both(grid, hw, mojo_device)
+    o_ref, o_our = both(gout, hw, mojo_device)
+    bench.run(
+        lambda: op(o_ref, x_ref, g_ref, 0, 0, False, [True, True]),
+        lambda: op(o_our, x_our, g_our, 0, 0, False, [True, True]),
+        flops=float(gout.numel()) * 4.0 * 2**rank,
     )

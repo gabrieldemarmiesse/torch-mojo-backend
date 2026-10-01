@@ -19,6 +19,7 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from torch_mojo_backend import cuda_interop
 
@@ -256,18 +257,16 @@ def test_fallback_runs_an_op_the_mojo_device_lacks(gpu):
 
 
 def test_fallback_carries_autograd(gpu):
-    """`grid_sampler_2d` has no mojo kernel in either direction: forward and
-    backward both go through CUDA, on an autograd graph that never leaves
-    mojo tensors."""
+    """`multilabel_margin_loss_forward` has no mojo kernel in either
+    direction: forward and backward both go through CUDA, on an autograd
+    graph that never leaves mojo tensors."""
     torch.manual_seed(0)
-    x = torch.randn(1, 2, 4, 5, device=gpu, requires_grad=True)
-    grid = torch.rand(1, 3, 3, 2, device=gpu) * 2 - 1
+    x = torch.randn(3, 5, device=gpu, requires_grad=True)
+    target = torch.tensor([[3, 0, -1, 1, 0], [1, 2, 4, -1, 0], [0, -1, 2, 2, 2]])
     with cuda_interop.cuda_fallback():
-        torch.nn.functional.grid_sample(x, grid, align_corners=False).sum().backward()
+        F.multilabel_margin_loss(x, target.to(gpu)).backward()
     xc = x.detach().cpu().requires_grad_()
-    torch.nn.functional.grid_sample(
-        xc, grid.cpu(), align_corners=False
-    ).sum().backward()
+    F.multilabel_margin_loss(xc, target).backward()
     assert x.grad is not None and xc.grad is not None
     torch.testing.assert_close(x.grad.cpu(), xc.grad)
 
@@ -337,10 +336,9 @@ def test_enable_cuda_fallback_lasts_for_the_process(gpu, tmp_path):
         "cuda_interop.enable_cuda_fallback()\n"
         "cuda_interop.enable_cuda_fallback()  # idempotent\n"
         "gc.collect()\n"
-        "x = torch.randn(1, 2, 4, 5, device='mojo:0', requires_grad=True)\n"
-        "grid = torch.rand(1, 3, 3, 2, device='mojo:0') * 2 - 1\n"
-        "torch.nn.functional.grid_sample(x, grid, align_corners=False)"
-        ".sum().backward()\n"
+        "x = torch.randn(3, 5, device='mojo:0', requires_grad=True)\n"
+        "t = torch.tensor([[3, 0, -1, 1, 0]] * 3, device='mojo:0')\n"
+        "torch.nn.functional.multilabel_margin_loss(x, t).backward()\n"
         "w = torch.randn(4, 3, 3, 3, device='mojo:0', requires_grad=True)\n"
         "a = torch.randn(2, 3, 16, 16, device='mojo:0', requires_grad=True)\n"
         "torch.nn.functional.conv2d(a, w, padding=1).sum().backward()\n"
