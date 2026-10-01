@@ -75,6 +75,8 @@ from tmb.ops.binary import Res, _b_tside
 from tmb.ops.common import (
     assert_no_internal_overlap,
     call_op_raw,
+    can_cast,
+    cast_into,
     cast_to,
     check_out,
     check_out_as,
@@ -84,6 +86,7 @@ from tmb.ops.common import (
     fill_value,
     is_float_stype,
     is_int_stype,
+    promote_types,
     resize_out,
     same_view,
     scalar_to_float,
@@ -3423,9 +3426,34 @@ def _linear_general(rets: Values, a: T, w: T, bias: Optional[T]) raises:
             or not late_bias.value().on_mojo()
         ):
             _check_same_device([a.copy(), late_bias.value().copy()])
-        var biased = own(_add_or_raise(shaped.t, late_bias.value()))
-        _ = shaped^
-        ret_owned(rets, 0, biased)
+        # `output.add_(bias)`: in place, so the output keeps its dtype and
+        # shape (a bias that would enlarge it raises).
+        # The sum is computed in the promoted dtype, then cast back.
+        var bias_t = late_bias.value().copy()
+        var common = promote_types(shaped.t.stype, bias_t.stype)
+        if not can_cast(common, shaped.t.stype):
+            raise Error(
+                "result type ",
+                _scalar_type_name(max_dtype(common)),
+                " can't be cast to the desired output type ",
+                _scalar_type_name(shaped.t.dtype),
+            )
+        var acc = own_if_new(cast_to(shaped.t, common), shaped.t)
+        var added = call_op(
+            "aten::add_",
+            "Tensor",
+            [
+                tensor_arg(acc.t),
+                tensor_arg(bias_t),
+                Value(TAG_SCALAR_INT, 0, 1, 0),
+            ],
+            1,
+        )
+        _ = added^
+        if acc.t.h != shaped.t.h:
+            cast_into(shaped.t, acc.t)
+        _ = acc^
+        ret_owned(rets, 0, shaped)
         return
     ret_owned(rets, 0, shaped)
 
