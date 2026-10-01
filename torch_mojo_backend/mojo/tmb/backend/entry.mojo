@@ -16,6 +16,7 @@ from tmb.backend.abi import set_shim_error
 from tmb.backend.device import hooks_table, init_backend
 from tmb.backend.kernel_call import init_loader
 from tmb.ops.attention import register_attention
+from tmb.ops.batch_norm import register_batch_norm
 from tmb.ops.binary import register_binary
 from tmb.ops.compare import register_compare
 from tmb.ops.composed import register_composed
@@ -25,6 +26,7 @@ from tmb.ops.deform_conv import register_deform_conv
 from tmb.ops.factories import register_factories
 from tmb.ops.foreach import register_foreach
 from tmb.ops.indexing import register_indexing
+from tmb.ops.loss import register_loss
 from tmb.ops.matmul import register_matmul
 from tmb.ops.nn import register_nn
 from tmb.ops.nms import register_nms
@@ -60,6 +62,8 @@ def _register_ops(lib: Int) raises:
     _group[register_reductions](lib)
     _group[register_matmul](lib)
     _group[register_nn](lib)
+    _group[register_loss](lib)
+    _group[register_batch_norm](lib)
     _group[register_pooling](lib)
     _group[register_pointwise](lib)
     _group[register_attention](lib)

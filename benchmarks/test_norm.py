@@ -1,5 +1,5 @@
 """Normalization benchmarks: layer norm (fwd/bwd), batch norm (training
-and inference forms), group norm.
+and inference forms), SyncBatchNorm's building blocks, group norm.
 
 Driven via torch.ops.aten so the registered entry point is pinned; the
 backward gets its mean/rstd from a single un-timed forward call.  Batch
@@ -37,9 +37,38 @@ COVERS: dict[str, str] = {
     "aten::_native_batch_norm_legit_no_training": "test_batch_norm_inference",
     "aten::native_group_norm": "test_group_norm",
     "aten::native_group_norm_backward": "test_group_norm_backward",
+    "aten::batch_norm_stats": "test_batch_norm_stats",
+    "aten::batch_norm_update_stats": "test_batch_norm_update_stats",
+    "aten::batch_norm_elemt": "test_batch_norm_elemt",
+    "aten::batch_norm_gather_stats_with_counts": "test_batch_norm_gather_stats",
+    "aten::batch_norm_backward_reduce": "test_batch_norm_backward_reduce",
+    "aten::batch_norm_backward_elemt": "test_batch_norm_backward_elemt",
 }
 
-SKIPPED: dict[str, str] = {}
+_BN_ALIAS = (
+    "native_batch_norm's own route under another schema (tmb/ops/"
+    "batch_norm.mojo dispatches to it, as Normalization.cu's non-cuDNN path "
+    "does): the kernels test_batch_norm / test_batch_norm_backward measure"
+)
+_BN_OUT = (
+    "out= plumbing over the functional overload the batch-norm benchmarks "
+    "measure (computed fresh, then resized and copied)"
+)
+SKIPPED: dict[str, str] = {
+    "aten::_native_batch_norm_legit": _BN_ALIAS,
+    "aten::_native_batch_norm_legit.no_stats": _BN_ALIAS,
+    "aten::_batch_norm_with_update": _BN_ALIAS,
+    "aten::batch_norm_backward": _BN_ALIAS,
+    "aten::native_batch_norm.out": _BN_OUT,
+    "aten::_native_batch_norm_legit.out": _BN_OUT,
+    "aten::_native_batch_norm_legit.no_stats_out": _BN_OUT,
+    "aten::_batch_norm_with_update.out": _BN_OUT,
+    "aten::batch_norm_elemt.out": _BN_OUT,
+    "aten::batch_norm_gather_stats": (
+        "batch_norm_gather_stats_with_counts (test_batch_norm_gather_stats) "
+        "with a filled counts vector"
+    ),
+}
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -174,6 +203,57 @@ def test_batch_norm_inference(
     )
 
 
+def _bn_operands_nhwc(
+    shape_id: str, dtype_id: str, hw: Hardware, mojo: torch.device
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """`_bn_operands` with the activation channels-last (NHWC), the layout
+    a channels-last conv net hands batch norm."""
+    refs, ours = _bn_operands(shape_id, dtype_id, hw, mojo)
+    refs[0] = refs[0].to(memory_format=torch.channels_last)
+    ours[0] = ours[0].to(memory_format=torch.channels_last)
+    return refs, ours
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", BN_SHAPES)
+@pytest.mark.bench_op("native_batch_norm")
+@pytest.mark.parametrize("layout", ("channels_last",))
+def test_batch_norm_nhwc(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    refs, ours = _bn_operands_nhwc(shape_id, dtype_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten.native_batch_norm(*refs, True, 0.1, 1e-5),
+        lambda: torch.ops.aten.native_batch_norm(*ours, True, 0.1, 1e-5),
+        flops=float(refs[0].numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", BN_SHAPES)
+@pytest.mark.bench_op("_native_batch_norm_legit_no_training")
+@pytest.mark.parametrize("layout", ("channels_last",))
+def test_batch_norm_inference_nhwc(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    refs, ours = _bn_operands_nhwc(shape_id, dtype_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten._native_batch_norm_legit_no_training(*refs, 0.1, 1e-5),
+        lambda: torch.ops.aten._native_batch_norm_legit_no_training(*ours, 0.1, 1e-5),
+        flops=float(refs[0].numel()),
+    )
+
+
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", GN_SHAPES)
 @pytest.mark.bench_op("native_group_norm")
@@ -223,4 +303,173 @@ def test_group_norm_backward(
             g_our, x_our, mean_our, rstd_our, w_our, n, c, h * w, groups, mask
         ),
         flops=float(x_ref.numel()),
+    )
+
+
+# ---------------------------------------------------------------------------
+# SyncBatchNorm building blocks: the same activation shapes, the statistics
+# as the float32 vectors the per-replica forward produces.
+# ---------------------------------------------------------------------------
+
+# Replicas merged by batch_norm_gather_stats*, as in an 8-GPU DDP job.
+WORLD = 8
+
+
+def _sync_operands(
+    shape_id: str, dtype_id: str, hw: Hardware, mojo: torch.device
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    n, c, h, w = BN_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    host = {
+        "x": torch.randn(n, c, h, w, dtype=dtype),
+        "g": torch.randn(n, c, h, w, dtype=dtype),
+        "mean": torch.randn(c),
+        "invstd": torch.rand(c) + 0.5,
+        "weight": torch.randn(c),
+        "bias": torch.randn(c),
+        "sum_dy": torch.randn(c),
+        "sum_dy_xmu": torch.randn(c),
+        "running_mean": torch.zeros(c, dtype=dtype),
+        "running_var": torch.ones(c, dtype=dtype),
+        "means": torch.randn(WORLD, c),
+        "invstds": torch.rand(WORLD, c) + 0.5,
+        "counts": torch.full((WORLD,), float(n * h * w), dtype=dtype),
+        "count": torch.full((WORLD,), n * h * w, dtype=torch.int32),
+    }
+    refs: dict[str, torch.Tensor] = {}
+    ours: dict[str, torch.Tensor] = {}
+    for key, tensor in host.items():
+        refs[key], ours[key] = both(tensor, hw, mojo)
+    return refs, ours
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", BN_SHAPES)
+@pytest.mark.bench_op("batch_norm_stats")
+def test_batch_norm_stats(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    r, o = _sync_operands(shape_id, dtype_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten.batch_norm_stats(r["x"], 1e-5),
+        lambda: torch.ops.aten.batch_norm_stats(o["x"], 1e-5),
+        flops=float(r["x"].numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", BN_SHAPES)
+@pytest.mark.bench_op("batch_norm_update_stats")
+def test_batch_norm_update_stats(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    r, o = _sync_operands(shape_id, dtype_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten.batch_norm_update_stats(
+            r["x"], r["running_mean"], r["running_var"], 0.1
+        ),
+        lambda: torch.ops.aten.batch_norm_update_stats(
+            o["x"], o["running_mean"], o["running_var"], 0.1
+        ),
+        flops=float(r["x"].numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", BN_SHAPES)
+@pytest.mark.bench_op("batch_norm_elemt")
+def test_batch_norm_elemt(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    r, o = _sync_operands(shape_id, dtype_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten.batch_norm_elemt(
+            r["x"], r["weight"], r["bias"], r["mean"], r["invstd"], 1e-5
+        ),
+        lambda: torch.ops.aten.batch_norm_elemt(
+            o["x"], o["weight"], o["bias"], o["mean"], o["invstd"], 1e-5
+        ),
+        flops=float(r["x"].numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", BN_SHAPES)
+@pytest.mark.bench_op("batch_norm_gather_stats_with_counts")
+def test_batch_norm_gather_stats(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    r, o = _sync_operands(shape_id, dtype_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten.batch_norm_gather_stats_with_counts(
+            r["x"],
+            r["means"],
+            r["invstds"],
+            r["running_mean"],
+            r["running_var"],
+            0.1,
+            1e-5,
+            r["counts"],
+        ),
+        lambda: torch.ops.aten.batch_norm_gather_stats_with_counts(
+            o["x"],
+            o["means"],
+            o["invstds"],
+            o["running_mean"],
+            o["running_var"],
+            0.1,
+            1e-5,
+            o["counts"],
+        ),
+        flops=float(r["means"].numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", BN_SHAPES)
+@pytest.mark.bench_op("batch_norm_backward_reduce")
+def test_batch_norm_backward_reduce(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    r, o = _sync_operands(shape_id, dtype_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten.batch_norm_backward_reduce(
+            r["g"], r["x"], r["mean"], r["invstd"], r["weight"], True, True, True
+        ),
+        lambda: torch.ops.aten.batch_norm_backward_reduce(
+            o["g"], o["x"], o["mean"], o["invstd"], o["weight"], True, True, True
+        ),
+        flops=float(r["x"].numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", BN_SHAPES)
+@pytest.mark.bench_op("batch_norm_backward_elemt")
+def test_batch_norm_backward_elemt(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    r, o = _sync_operands(shape_id, dtype_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten.batch_norm_backward_elemt(
+            r["g"],
+            r["x"],
+            r["mean"],
+            r["invstd"],
+            r["weight"],
+            r["sum_dy"],
+            r["sum_dy_xmu"],
+            r["count"],
+        ),
+        lambda: torch.ops.aten.batch_norm_backward_elemt(
+            o["g"],
+            o["x"],
+            o["mean"],
+            o["invstd"],
+            o["weight"],
+            o["sum_dy"],
+            o["sum_dy_xmu"],
+            o["count"],
+        ),
+        flops=float(r["x"].numel()),
     )

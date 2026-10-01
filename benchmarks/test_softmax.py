@@ -36,7 +36,24 @@ COVERS: dict[str, str] = {
     "aten::tanh_backward.grad_input": "test_tanh_backward_f32",
 }
 
-SKIPPED: dict[str, str] = {}
+_SOFTMAX_OUT = (
+    "out= plumbing over the functional softmax op this module (or "
+    "_softmax_backward_data's composed route) measures"
+)
+SKIPPED: dict[str, str] = {
+    "aten::_softmax.out": _SOFTMAX_OUT,
+    "aten::_log_softmax.out": _SOFTMAX_OUT,
+    "aten::_softmax_backward_data.out": _SOFTMAX_OUT,
+    "aten::_log_softmax_backward_data.out": _SOFTMAX_OUT,
+    "aten::_masked_softmax": (
+        "masked_fill.Scalar then the _softmax test_softmax measures (CUDA's "
+        "fallback route; tmb/ops/nn.mojo composes it)"
+    ),
+    "aten::_masked_softmax_backward": (
+        "masked_fill.Scalar around _softmax_backward_data's composed route "
+        "(CUDA's fallback route)"
+    ),
+}
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))

@@ -171,6 +171,158 @@ def test_log_softmax_backward_offset_view(mojo_gpu):
     torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_softmax_out_overloads(mojo_device, dtype):
+    x = torch.randn(4, 6).to(dtype)
+    atol, rtol = _tol(dtype)
+    for name, dim in [("_softmax", 1), ("_log_softmax", 0)]:
+        want = getattr(torch.ops.aten, name)(x, dim, False)
+        out = torch.empty(1, device=mojo_device, dtype=dtype)
+        with ran(f"aten::{name}.out"):
+            r = getattr(torch.ops.aten, name).out(
+                x.to(mojo_device), dim, False, out=out
+            )
+        assert r is out and out.shape == want.shape
+        torch.testing.assert_close(out.cpu(), want, atol=atol, rtol=rtol)
+        # A strided out of the right shape is written where it lives.
+        base = torch.zeros(6, 4, device=mojo_device, dtype=dtype)
+        getattr(torch.ops.aten, name).out(x.to(mojo_device), dim, False, out=base.t())
+        torch.testing.assert_close(base.t().cpu(), want, atol=atol, rtol=rtol)
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        torch.ops.aten._softmax.out(
+            x.to(mojo_device),
+            1,
+            False,
+            out=torch.empty(4, 6, dtype=torch.float64, device=mojo_device),
+        )
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_softmax_backward_data_out_overloads(mojo_gpu, dtype):
+    x = torch.randn(3, 5)
+    grad = torch.randn(3, 5).to(dtype)
+    atol, rtol = _tol(dtype)
+    for name, fwd in [
+        ("_softmax_backward_data", torch.softmax),
+        ("_log_softmax_backward_data", torch.log_softmax),
+    ]:
+        y = fwd(x, 1).to(dtype)
+        want = getattr(torch.ops.aten, name)(grad, y, 1, dtype)
+        out = torch.empty(0, device=mojo_gpu, dtype=dtype)
+        with ran(f"aten::{name}.out"):
+            getattr(torch.ops.aten, name).out(
+                grad.to(mojo_gpu),
+                y.to(mojo_gpu),
+                1,
+                dtype,
+                **{"grad_input" if name == "_softmax_backward_data" else "out": out},
+            )
+        torch.testing.assert_close(out.cpu(), want, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("value", [float("-inf"), float("nan"), 2.5])
+def test_softmax_rank0_non_finite(mojo_device, value):
+    """CUDA views a 0-d input as `[1]`: -inf and NaN propagate as NaN."""
+    x = torch.tensor(value)
+    for fn in [torch.softmax, torch.log_softmax]:
+        torch.testing.assert_close(
+            fn(x.to(mojo_device), 0).cpu(), fn(x, 0), equal_nan=True
+        )
+
+
+def test_masked_softmax_backward_masked_inf_grad(mojo_gpu):
+    """CUDA's persistent kernel reduces only the unmasked positions: an inf
+    gradient under the mask does not leak NaN into the row."""
+    out = torch.tensor([[0.0, 0.25, 0.75]])
+    grad = torch.tensor([[float("inf"), 1.0, 2.0]])
+    mask = torch.tensor([[True, False, False]])
+    got = torch.ops.aten._masked_softmax_backward(
+        grad.to(mojo_gpu), out.to(mojo_gpu), mask.to(mojo_gpu), -1
+    )
+    torch.testing.assert_close(got.cpu(), torch.tensor([[0.0, -0.1875, 0.1875]]))
+
+
+def test_masked_softmax_odd_heads_noncontiguous_mask(mojo_device):
+    """A non-contiguous key-padding mask takes CUDA's fallback, which has
+    no even-head restriction."""
+    x = torch.randn(2, 3, 4, 4)
+    full = torch.rand(4, 2) > 0.5
+    mask = full.t()  # [2, 4], not contiguous
+    got = torch.ops.aten._masked_softmax(x.to(mojo_device), mask.to(mojo_device), -1, 1)
+    want = _masked_softmax_reference(x, mask.reshape(2, 1, 1, 4), -1)
+    torch.testing.assert_close(got.cpu(), want, equal_nan=True)
+
+
+def _masked_softmax_reference(x, mask, dim):
+    return torch.softmax(x.masked_fill(mask, float("-inf")), dim)
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_masked_softmax_mask_types(mojo_device, dtype):
+    x = torch.randn(2, 4, 3, 3).to(dtype)
+    atol, rtol = _tol(dtype)
+    full = torch.rand(2, 4, 3, 3) > 0.5
+    full[0, 0, 0] = True  # a fully masked row: NaN, as on CUDA
+    key_padding = torch.tensor([[False, True, False], [True, False, False]])
+    square = torch.rand(3, 3) > 0.6
+    cases = [
+        (full, 2, full),
+        (full, 1, full),  # same-shape mask accepted whatever its type
+        (key_padding, 1, key_padding.view(2, 1, 1, 3)),
+        (square, 0, square),
+    ]
+    for mask, mask_type, bmask in cases:
+        want = _masked_softmax_reference(x.float(), bmask, -1).to(dtype)
+        with ran("aten::_masked_softmax"):
+            got = torch.ops.aten._masked_softmax(
+                x.to(mojo_device), mask.to(mojo_device), -1, mask_type
+            )
+        torch.testing.assert_close(
+            got.cpu(), want, atol=atol, rtol=rtol, equal_nan=True
+        )
+    # a non-trailing dim with a same-shape mask
+    got = torch.ops.aten._masked_softmax(x.to(mojo_device), full.to(mojo_device), 1, 2)
+    want = _masked_softmax_reference(x.float(), full, 1).to(dtype)
+    torch.testing.assert_close(got.cpu(), want, atol=atol, rtol=rtol, equal_nan=True)
+
+
+def test_masked_softmax_errors(mojo_device):
+    d = mojo_device
+    x = torch.randn(2, 3, 4, 4, device=d)
+    m = torch.zeros(2, 3, 4, 4, dtype=torch.bool, device=d)
+    with pytest.raises(RuntimeError, match="Mask should be a boolean tensor"):
+        torch.ops.aten._masked_softmax(x, m.float(), None, 2)
+    with pytest.raises(RuntimeError, match="Mask Type should be defined"):
+        torch.ops.aten._masked_softmax(x, m, None, None)
+    with pytest.raises(RuntimeError, match="Mask Type should be 0"):
+        torch.ops.aten._masked_softmax(x, m, None, 3)
+    with pytest.raises(
+        RuntimeError, match=r"Mask shape should match input. mask: \[4\] input"
+    ):
+        torch.ops.aten._masked_softmax(x, m[0, 0, 0], None, 2)
+    with pytest.raises(RuntimeError, match="Only support when num_heads is even"):
+        torch.ops.aten._masked_softmax(
+            x, torch.zeros(2, 4, dtype=torch.bool, device=d), None, 1
+        )
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_masked_softmax_backward(mojo_gpu, dtype):
+    x = torch.randn(3, 5)
+    mask = torch.rand(3, 5) > 0.5
+    mask[1] = True
+    y = _masked_softmax_reference(x, mask, -1).nan_to_num(0.0).to(dtype)
+    grad = torch.randn(3, 5).to(dtype)
+    want = torch.ops.aten._masked_softmax_backward(grad, y, mask, -1)
+    with ran("aten::_masked_softmax_backward"):
+        got = torch.ops.aten._masked_softmax_backward(
+            grad.to(mojo_gpu), y.to(mojo_gpu), mask.to(mojo_gpu), -1
+        )
+    atol, rtol = _tol(dtype)
+    torch.testing.assert_close(got.cpu(), want, atol=atol, rtol=rtol)
+    assert (got.cpu()[mask] == 0).all()
+
+
 # ---------------------------------------------------------------------------
 # Layer norm
 # ---------------------------------------------------------------------------

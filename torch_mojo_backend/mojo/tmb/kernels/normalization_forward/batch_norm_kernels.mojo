@@ -313,6 +313,7 @@ def _bn_finalize[
     count: Int,
     eps: Float32,
     momentum: Float32,
+    bessel: Float32,
     has_running: Bool,
 ):
     """ATen's rules, verbatim: the BIASED variance normalizes the output while
@@ -330,9 +331,9 @@ def _bn_finalize[
             keep * run_mean_ptr[unsafe_offset=c].cast[DType.float32]()
             + momentum * mean
         ).cast[sdtype]()
-        var unbiased = biased
-        if count > 1:
-            unbiased = m2 / (nf - 1.0)
+        # CUDA's `var * static_cast<acc_t>(double(N) / double(N - 1))`, the
+        # factor formed on the host: one sample gives 0 * inf, NaN.
+        var unbiased = biased * bessel
         run_var_ptr[unsafe_offset=c] = (
             keep * run_var_ptr[unsafe_offset=c].cast[DType.float32]()
             + momentum * unbiased
@@ -356,6 +357,7 @@ def _bn_moments_fused_kernel[
     hxw_arg: Int64,
     eps: Float32,
     momentum: Float32,
+    bessel: Float32,
     has_running_arg: Int64,
 ):
     """One block per channel, no workspace and no second launch: the block
@@ -398,6 +400,7 @@ def _bn_moments_fused_kernel[
             count,
             eps,
             momentum,
+            bessel,
             Int(has_running_arg) != 0,
         )
 
@@ -493,6 +496,7 @@ def _bn_merge_kernel[
     hxw_arg: Int64,
     eps: Float32,
     momentum: Float32,
+    bessel: Float32,
     has_running_arg: Int64,
     finalize_arg: Int64,
 ):
@@ -548,6 +552,7 @@ def _bn_merge_kernel[
         count,
         eps,
         momentum,
+        bessel,
         Int(has_running_arg) != 0,
     )
 
@@ -603,6 +608,7 @@ def enqueue_batch_norm_stats[
     var run_mean_ptr = _make_ptr[sdtype](run_mean_addr).as_unsafe_any_origin()
     var run_var_ptr = _make_ptr[sdtype](run_var_addr).as_unsafe_any_origin()
     var count = runs * hxw
+    var bessel = Float32(Float64(count) / Float64(count - 1))
 
     comptime V = 16 // size_of[dtype]()
     var splits = _bn_splits(
@@ -630,6 +636,7 @@ def enqueue_batch_norm_stats[
             Int64(hxw),
             eps,
             momentum,
+            bessel,
             Int64(1 if has_running else 0),
         )
         return
@@ -681,6 +688,7 @@ def enqueue_batch_norm_stats[
             Int64(hxw),
             eps,
             momentum,
+            bessel,
             Int64(1 if has_running else 0),
             Int64(repass),
         )
@@ -782,6 +790,205 @@ def enqueue_batch_norm_elementwise[
         Int64(slots),
         Int64(channels),
         Int64(planes),
+        Int64(hw),
+        Int64(hb),
+    )
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BN_THREADS))
+)
+@__name(t"batch_norm_elemwise_nhwc_{dtype}_{from_invstd}_v{V}")
+def _bn_elementwise_nhwc_kernel[
+    dtype: DType,
+    pdtype: DType,
+    sdtype: DType,
+    V: Int,
+    from_invstd: Bool,
+](
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    mean_ptr: Pointer[Scalar[sdtype], ImmutAnyOrigin],
+    var_ptr: Pointer[Scalar[sdtype], ImmutAnyOrigin],
+    gamma_ptr: Pointer[Scalar[pdtype], ImmutAnyOrigin],
+    beta_ptr: Pointer[Scalar[pdtype], ImmutAnyOrigin],
+    save_mean_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
+    save_invstd_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
+    eps: Float32,
+    rows_arg: Int64,
+    channels_arg: Int64,
+    bx_arg: Int64,
+    has_weight_arg: Int64,
+    has_bias_arg: Int64,
+):
+    """The channels-last (NHWC / NDHWC) pass over the dense `[rows, C]`
+    matrix both input and output are, on a 2-D (row, channel) thread grid
+    like CUDA's `batch_norm_transform_input_channels_last_kernel`: the
+    block's threads are `bx` channel lanes by `BN_THREADS / bx` rows, each
+    lane owning V consecutive channels (one 16-byte vector when `C % V ==
+    0` and the bases are aligned). A lane forms its V channels' coefficients
+    once, then walks rows; consecutive lanes and rows are consecutive
+    addresses, so loads and stores are coalesced. The inference route also
+    emits the saved statistics (the first row's lanes), as the NCHW kernel
+    does."""
+    var rows = Int(rows_arg)
+    var channels = Int(channels_arg)
+    var bx = Int(bx_arg)
+    var by = BN_THREADS // bx
+    var has_weight = Int(has_weight_arg) != 0
+    var has_bias = Int(has_bias_arg) != 0
+    comptime align = V * size_of[dtype]()
+    var tid = Int(thread_idx.x)
+    var lane = Int(block_idx.x) * bx + tid % bx
+    var c0 = lane * V
+    if c0 >= channels:
+        return
+    var mean = SIMD[DType.float32, V]()
+    var scale = SIMD[DType.float32, V]()
+    var shift = SIMD[DType.float32, V]()
+    comptime for k in range(V):
+        var m = Float32(0)
+        var sc = Float32(0)
+        var sh = Float32(0)
+        _bn_scale_shift[from_invstd=from_invstd](
+            mean_ptr,
+            var_ptr,
+            gamma_ptr,
+            beta_ptr,
+            c0 + k,
+            eps,
+            has_weight,
+            has_bias,
+            m,
+            sc,
+            sh,
+        )
+        mean[k] = m
+        scale[k] = sc
+        shift[k] = sh
+    var row = Int(block_idx.y) * by + tid // bx
+    comptime if not from_invstd:
+        if row == 0:
+            comptime for k in range(V):
+                var c = c0 + k
+                save_mean_ptr[unsafe_offset=c] = mean_ptr[unsafe_offset=c]
+                save_invstd_ptr[unsafe_offset=c] = (
+                    1.0
+                    / ieee_sqrt(
+                        var_ptr[unsafe_offset=c].cast[DType.float32]() + eps
+                    )
+                ).cast[sdtype]()
+    var row_stride = Int(grid_dim.y) * by
+    while row < rows:
+        var at = row * channels + c0
+        var x = in_ptr.unsafe_load[width=V, alignment=align](at).cast[
+            DType.float32
+        ]()
+        out_ptr.unsafe_store[width=V, alignment=align](
+            at, ((x - mean) * scale + shift).cast[dtype]()
+        )
+        row += row_stride
+
+
+def _nhwc_lanes(lanes: Int) -> Int:
+    """Channel lanes per block: the next power of two covering `lanes`, at
+    most a whole block."""
+    var bx = 1
+    while bx < lanes and bx < BN_THREADS:
+        bx *= 2
+    return bx
+
+
+def enqueue_batch_norm_elementwise_nhwc[
+    dtype: DType, pdtype: DType, sdtype: DType, from_invstd: Bool
+](
+    out_addr: Int,
+    in_addr: Int,
+    mean_addr: Int,
+    var_addr: Int,
+    gamma_addr: Int,
+    beta_addr: Int,
+    eps: Float32,
+    channels: Int,
+    numel: Int,
+    has_weight: Bool,
+    has_bias: Bool,
+    ctx: DeviceContext,
+    save_mean_addr: Int = 0,
+    save_invstd_addr: Int = 0,
+) raises:
+    """`enqueue_batch_norm_elementwise` for a dense channels-last input and
+    output (same strides): one flat pass in memory order."""
+    comptime if not has_accelerator():
+        raise Error("no GPU accelerator available at compile time")
+    var out_ptr = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
+    var in_ptr = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_imm()
+    var mean_ptr = _make_ptr[sdtype](mean_addr).as_unsafe_any_origin().as_imm()
+    var var_ptr = _make_ptr[sdtype](var_addr).as_unsafe_any_origin().as_imm()
+    var gamma_ptr = (
+        _make_ptr[pdtype](gamma_addr).as_unsafe_any_origin().as_imm()
+    )
+    var beta_ptr = _make_ptr[pdtype](beta_addr).as_unsafe_any_origin().as_imm()
+    var save_mean_ptr = _make_ptr[sdtype](save_mean_addr).as_unsafe_any_origin()
+    var save_invstd_ptr = _make_ptr[sdtype](
+        save_invstd_addr
+    ).as_unsafe_any_origin()
+    var hw = 1 if has_weight else 0
+    var hb = 1 if has_bias else 0
+    comptime V = 16 // size_of[dtype]()
+    var rows = numel // channels
+    var vectorized = (
+        _vec16_phase[dtype](in_addr) == 0
+        and _vec16_phase[dtype](out_addr) == 0
+        and channels % V == 0
+    )
+    if vectorized:
+        var bx = _nhwc_lanes(channels // V)
+        _enqueue_cached[
+            _bn_elementwise_nhwc_kernel[dtype, pdtype, sdtype, V, from_invstd]
+        ](
+            ctx,
+            ceildiv(channels // V, bx),
+            max(1, min(ceildiv(rows, BN_THREADS // bx), _MAX_GRID)),
+            1,
+            BN_THREADS,
+            out_ptr,
+            in_ptr,
+            mean_ptr,
+            var_ptr,
+            gamma_ptr,
+            beta_ptr,
+            save_mean_ptr,
+            save_invstd_ptr,
+            eps,
+            Int64(rows),
+            Int64(channels),
+            Int64(bx),
+            Int64(hw),
+            Int64(hb),
+        )
+        return
+    var bx = _nhwc_lanes(channels)
+    _enqueue_cached[
+        _bn_elementwise_nhwc_kernel[dtype, pdtype, sdtype, 1, from_invstd]
+    ](
+        ctx,
+        ceildiv(channels, bx),
+        max(1, min(ceildiv(rows, BN_THREADS // bx), _MAX_GRID)),
+        1,
+        BN_THREADS,
+        out_ptr,
+        in_ptr,
+        mean_ptr,
+        var_ptr,
+        gamma_ptr,
+        beta_ptr,
+        save_mean_ptr,
+        save_invstd_ptr,
+        eps,
+        Int64(rows),
+        Int64(channels),
+        Int64(bx),
         Int64(hw),
         Int64(hb),
     )

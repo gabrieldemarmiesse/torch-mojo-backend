@@ -18,9 +18,13 @@ from tmb.backend.abi import (
     ST_INT64,
     ST_INT8,
     ST_UINT8,
+    Owned,
     T,
     Value,
+    Values,
+    _channels_last_strides,
     check,
+    is_dense,
     Results,
     call_op,
     call_op_raw,
@@ -32,6 +36,7 @@ from tmb.backend.abi import (
     max_dtype,
     new_like,
     new_like_dtype,
+    new_strided,
     new_tensor,
     own,
     own_if_new,
@@ -875,3 +880,68 @@ def release_if_new(result: T, original: T):
     covers the raising paths too; reach for that one in new code."""
     if result.h != original.h:
         release(result.h)
+
+
+def forward_args(args: Values, n: Int) -> List[Value]:
+    """The first `n` argument records, copied: what an `out=` overload hands
+    its functional overload through `call_op` (same schema prefix)."""
+    var out = List[Value](capacity=max(n, 1))
+    for i in range(n):
+        out.append(args[unsafe_offset=i].copy())
+    return out^
+
+
+def store_out(mut dst: T, var src: T) raises:
+    """Copy a FRESH functional result (owned, released here) into a caller's
+    `out=` tensor: torch's `resize_output` then a strided copy.
+
+    The result is computed before `dst` is touched, so an `out` that shares
+    storage with an input is only resized after every input was read. The
+    caller ran `check_out_as` on `dst` before computing."""
+    var held = own(src^)
+    assert_no_internal_overlap(dst)
+    resize_out(dst, held.t.shape, held.t.rank)
+    copy_strided_into(dst, held.t)
+
+
+def is_channels_last_layout(t: T) -> Bool:
+    """`suggest_memory_format() != Contiguous` for the dense layouts that
+    matter here: a rank-4/5 tensor laid out channels-last (NHWC / NDHWC)
+    that is not also plain contiguous."""
+    if t.contig or (t.rank != 4 and t.rank != 5):
+        return False
+    var want = _channels_last_strides(t.shape, t.rank)
+    for i in range(t.rank):
+        if t.dim(i) > 1 and t.stride(i) != want[MAX_RANK - t.rank + i]:
+            return False
+    return True
+
+
+def like_layout(var r: Owned, like: T, any_dense: Bool = False) raises -> Owned:
+    """A fresh contiguous result `r` re-laid-out like `like` (the op's
+    input): channels-last when `like` is (`suggest_memory_format`), or --
+    `any_dense` -- with `like`'s own strides whenever `like` is dense
+    (`empty_like`). Same values; `r` is released. A no-op, no copy, for a
+    contiguous `like`."""
+    if like.contig or not r.t.same_shape(like):
+        return r^
+    var strides: IndexList[MAX_RANK]
+    if any_dense and is_dense(like.shape, like.strides, like.rank):
+        strides = like.strides
+    elif is_channels_last_layout(like):
+        strides = _channels_last_strides(like.shape, like.rank)
+    else:
+        return r^
+    var same = True
+    for i in range(like.rank):
+        var k = MAX_RANK - like.rank + i
+        if like.shape[k] > 1 and r.t.strides[k] != strides[k]:
+            same = False
+    if same:
+        return r^  # already laid out so: nothing to copy
+    var out = own(
+        new_strided(like.shape, strides, like.rank, r.t.stype, r.t.device)
+    )
+    copy_strided_into(out.t, r.t)
+    _ = r^
+    return out^
