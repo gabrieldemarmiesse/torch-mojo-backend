@@ -604,6 +604,44 @@ def op_fill_scalar_(
     ret_ref(rets, 0, t)
 
 
+# aten::fill_.Tensor(Tensor(a!) self, Tensor value) -> Tensor(a!)
+def op_fill_tensor_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """`fill_` with a 0-d tensor value: a host value fills as its Scalar
+    (CUDA's `value.item()` route); a device value is broadcast and copied,
+    converting to self's dtype like `copy_`."""
+    var t = v_tensor(args[unsafe_offset=0])
+    var value = v_tensor(args[unsafe_offset=1])
+    if value.rank != 0:
+        raise Error(
+            "fill_ only supports 0-dimension value tensor but got tensor with ",
+            value.rank,
+            " dimensions.",
+        )
+    if t.numel == 0:
+        ret_ref(rets, 0, t)
+        return
+    if not value.on_mojo():
+        var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+        fill_value(t, r[0])
+        ret_ref(rets, 0, t)
+        return
+    var expanded = own(
+        view_strided(
+            value, t.shape, IndexList[MAX_RANK](0), t.rank, value.offset
+        )
+    )
+    _ = call_op(
+        "aten::copy_",
+        "",
+        [tensor_arg(t), tensor_arg(expanded.t), bool_arg(False)],
+        1,
+    )
+    _ = expanded^  # alive past the copy
+    ret_ref(rets, 0, t)
+
+
 # aten::zero_(Tensor(a!) self) -> Tensor(a!)
 def op_zero_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
@@ -649,5 +687,6 @@ def register_core(site: Site) raises:
     _aten_view(site, "as_strided")
     impl[op_local_scalar_dense, "_local_scalar_dense"](site)
     impl[op_fill_scalar_, "fill_.Scalar"](site)
+    impl[op_fill_tensor_, "fill_.Tensor"](site)
     impl[op_zero_, "zero_"](site)
     impl[op_record_stream, "record_stream"](site)

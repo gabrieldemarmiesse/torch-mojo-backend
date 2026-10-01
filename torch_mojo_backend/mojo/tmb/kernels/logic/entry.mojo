@@ -933,7 +933,14 @@ def _isin_go(
     var ctx = _raw_ctx(ctx_ptr)
 
     var handled = False
-    comptime for dt in [DType.int64, DType.int32]:
+    comptime for dt in [
+        DType.int64,
+        DType.int32,
+        DType.float32,
+        DType.float16,
+        DType.bfloat16,
+        DType.float64,
+    ]:
         comptime if _dtype_arg_on[0, dt]():
             if dtype_val == dt:
                 _isin[dt](
