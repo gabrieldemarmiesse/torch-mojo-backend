@@ -37,10 +37,11 @@ Invariants any replacement must keep:
   lane then computes `exp(-inf - -inf)` = nan, which poisons the whole row
   through the block reduction. That defect has been shipped twice in this
   repository; the harness's NaN counter exists because of it.
-* `is_causal` masks strictly above the diagonal aligned to the BOTTOM right, so
+* `is_causal` masks strictly above the diagonal aligned to the TOP left, so
   query row `q` attends to key indices `0 ..= q`, whatever `seq_kv` is. That is
-  PyTorch's convention for `is_causal=True` and it matters when
-  `seq_kv != seq_q`.
+  `F.scaled_dot_product_attention`'s convention for `is_causal=True` and it
+  matters when `seq_kv != seq_q` (CUDA's own flash ops align bottom-right;
+  tmb/ops/attention.mojo sends those cases to the math route).
 
 ## Why the score tile is computed transposed
 
@@ -323,7 +324,7 @@ def _flash_attention_fwd_baseline[
         d += THREADS
     barrier()
 
-    # Bottom-right aligned causal mask, PyTorch's `is_causal=True` convention.
+    # Top-left aligned causal mask, PyTorch's `is_causal=True` convention.
     var limit = seq_kv
     if causal != 0:
         limit = min(seq_kv, qi + 1)

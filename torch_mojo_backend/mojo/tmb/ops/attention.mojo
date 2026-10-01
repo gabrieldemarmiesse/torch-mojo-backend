@@ -28,44 +28,58 @@ ordinary aten ops this backend already implements and differentiates itself.
 from std.ffi import external_call
 from std.math import sqrt
 from std.utils import IndexList
+from std.utils.numerics import inf
 
 from tmb.backend.abi import (
+    ST_BOOL,
     ST_FLOAT32,
+    ST_FLOAT64,
     ST_INT64,
     ST_UINT64,
     Owned,
+    Results,
     T,
     Value,
     Values,
     dtype_code,
+    f64_bits,
     new_tensor,
     own,
     release,
+    retain,
     ret_int,
     ret_owned,
     unsupported,
     v_bool,
     v_f64,
+    v_int,
     v_is_none,
     v_opt_tensor,
     v_tensor,
     view_strided,
     TAG_BOOL,
+    TAG_DOUBLE,
     TAG_INT,
+    TAG_INT_LIST,
+    TAG_STRING,
     TAG_NONE,
+    TAG_SCALAR_DOUBLE,
     TAG_TENSOR,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    call_op,
     cast_to,
     copy_strided_into,
     fill_value,
     release_if_new,
+    shape_str,
 )
+from tmb.ops.composed import _bool_list
 from tmb.backend.registry import Site, impl
-from tmb.ops.data_movement import _batched_copy_run
+from tmb.ops.data_movement import _batched_copy_run, _scalar_type_name
 from tmb.ops.foreach import _batch_copy_dtype, _batched_copy_device
 
 # at::SDPBackend (ATen/SDPBackend.h): what `_fused_sdp_choice` returns.
@@ -957,10 +971,15 @@ def _efficient_forward(
     var fa4 = _fa4_plan(
         q, k, v, False, dropout_p, is_causal, False, allow_any_seqlen=True
     )
-    var fused = _fused_fa_plan(q, k, v, False, dropout_p, False)
-    if fa4.ok or fused.ok:
-        var pair = _flash_forward(q, k, v, is_causal, dropout_p, scale)
+    var pair: Tuple[T, T]
+    if fa4.ok:
+        pair = _fa4_forward(q, k, v, fa4, scale)
         release(pair[1].h)  # the flash LSE is not part of this schema
+        return pair[0].copy()
+    var fused = _fused_fa_plan(q, k, v, False, dropout_p, False)
+    if fused.ok:
+        pair = _fused_fa_forward(q, k, v, fused, is_causal, scale)
+        release(pair[1].h)
         return pair[0].copy()
     var math = _math_plan(q, k, v, False, dropout_p, is_causal, False)
     if math.ok:
@@ -970,6 +989,647 @@ def _efficient_forward(
         " covers them"
     )
     raise Error("unreachable")
+
+
+# ===========================================================================
+# The math route with a log-sum-exp: every fused-attention entry point whose
+# inputs no fused kernel takes (an attention bias, a non-causal flash call,
+# float32, an odd head_dim, a requested logsumexp, a backward), composed
+# from ops this device implements through the dispatcher.
+#
+# Scores, softmax and both GEMMs run in float32 (float64 for float64
+# inputs) and round once at the end, the precision the fused kernels keep.
+# The backward recomputes the probabilities from q/k/bias rather than
+# reading the forward's logsumexp, so it does not depend on which route,
+# or which entry point's logsumexp layout, produced the forward.
+# ===========================================================================
+
+comptime _POS_INF = inf[DType.float64]()
+comptime _NEG_INF = -inf[DType.float64]()
+
+# How a fully masked query row reports its logsumexp (its output is 0 in
+# every backend): what each CUDA backend returns, measured on an H100.
+comptime LSE_MASKED_FLASH = 0  # +inf
+comptime LSE_MASKED_EFFICIENT = 1  # 0
+comptime LSE_MASKED_CUDNN = 2  # -inf
+
+# Causal alignment, `causal_off` below: no mask, or key j visible to query i
+# iff j <= i + offset (top-left: 0; bottom-right: S - L).
+comptime NO_CAUSAL = -(1 << 62)
+
+
+struct _Call(Movable):
+    """One aten op through the dispatcher, arguments in schema order."""
+
+    var op: String
+    var overload: String
+    var vals: List[Value]
+    var lists: List[List[Int64]]  # int[] arguments, alive across the call
+
+    def __init__(out self, op: StaticString, overload: StaticString):
+        self.op = String(op)
+        self.overload = String(overload)
+        self.vals = List[Value]()
+        self.lists = List[List[Int64]]()
+
+    def t(mut self, x: T):
+        self.vals.append(Value(TAG_TENSOR, 0, Int64(x.h), 0))
+
+    def i(mut self, x: Int):
+        self.vals.append(Value(TAG_INT, 0, Int64(x), 0))
+
+    def b(mut self, x: Bool):
+        self.vals.append(Value(TAG_BOOL, 0, Int64(1) if x else Int64(0), 0))
+
+    def s(mut self, x: Float64):
+        """A `Scalar` argument."""
+        self.vals.append(Value(TAG_SCALAR_DOUBLE, 0, f64_bits(x), 0))
+
+    def f(mut self, x: Float64):
+        """A `float` argument."""
+        self.vals.append(Value(TAG_DOUBLE, 0, f64_bits(x), 0))
+
+    def str(mut self, x: StaticString):
+        """A `str` argument (static storage, so it outlives the call)."""
+        self.vals.append(
+            Value(
+                TAG_STRING,
+                Int32(x.byte_length()),
+                Int64(Int(x.unsafe_ptr())),
+                0,
+            )
+        )
+
+    def ot(mut self, x: Optional[T]):
+        """A `Tensor?` argument."""
+        if x:
+            self.t(x.value())
+        else:
+            self.none()
+
+    def none(mut self):
+        self.vals.append(Value(TAG_NONE, 0, 0, 0))
+
+    def ints(mut self, xs: List[Int]):
+        var l = List[Int64](capacity=max(len(xs), 1))
+        for x in xs:
+            l.append(Int64(x))
+        var addr = Int(l.unsafe_ptr())
+        self.lists.append(l^)  # moves the List, not its heap buffer
+        self.vals.append(Value(TAG_INT_LIST, Int32(len(xs)), Int64(addr), 0))
+
+    def run(mut self, n_rets: Int) raises -> Results:
+        return call_op(self.op, self.overload, self.vals.copy(), n_rets)
+
+    def one(mut self) raises -> Owned:
+        var r = self.run(1)
+        return own(r.take_tensor(0))
+
+
+def _d_unary(op: StaticString, x: T) raises -> Owned:
+    var c = _Call(op, "")
+    c.t(x)
+    return c.one()
+
+
+def _d_binary(op: StaticString, a: T, b: T) raises -> Owned:
+    """`add`/`sub`/`mul`/`div` .Tensor (alpha 1 where the schema has one)."""
+    var c = _Call(op, "Tensor")
+    c.t(a)
+    c.t(b)
+    if op == "aten::add" or op == "aten::sub":
+        c.s(1.0)
+    return c.one()
+
+
+def _d_inplace(op: StaticString, overload: StaticString, a: T, b: T) raises:
+    """`add_`/`sub_` .Tensor with alpha 1, or `masked_fill_` style calls
+    whose second operand is a tensor and third is absent."""
+    var c = _Call(op, overload)
+    c.t(a)
+    c.t(b)
+    c.s(1.0)
+    _ = c.run(1)
+
+
+def _d_mul_scalar_(a: T, s: Float64) raises:
+    var c = _Call("aten::mul_", "Scalar")
+    c.t(a)
+    c.s(s)
+    _ = c.run(1)
+
+
+def _d_matmul(a: T, b: T) raises -> Owned:
+    var c = _Call("aten::matmul", "")
+    c.t(a)
+    c.t(b)
+    return c.one()
+
+
+def _d_sum(x: T, dims: List[Int], keepdim: Bool) raises -> Owned:
+    var c = _Call("aten::sum", "dim_IntList")
+    c.t(x)
+    c.ints(dims)
+    c.b(keepdim)
+    c.none()
+    return c.one()
+
+
+def _d_amax_last(x: T) raises -> Owned:
+    var c = _Call("aten::amax", "")
+    c.t(x)
+    c.ints([-1])
+    c.b(True)
+    return c.one()
+
+
+def _d_eq(x: T, s: Float64) raises -> Owned:
+    var c = _Call("aten::eq", "Scalar")
+    c.t(x)
+    c.s(s)
+    return c.one()
+
+
+def _d_masked_fill(x: T, mask: T, s: Float64) raises -> Owned:
+    var c = _Call("aten::masked_fill", "Scalar")
+    c.t(x)
+    c.t(mask)
+    c.s(s)
+    return c.one()
+
+
+def _d_masked_fill_(x: T, mask: T, s: Float64) raises:
+    var c = _Call("aten::masked_fill_", "Scalar")
+    c.t(x)
+    c.t(mask)
+    c.s(s)
+    _ = c.run(1)
+
+
+def _d_triu(x: T, diagonal: Int) raises -> Owned:
+    var c = _Call("aten::triu", "")
+    c.t(x)
+    c.i(diagonal)
+    return c.one()
+
+
+def _swap_last(t: T) raises -> Owned:
+    """`t.transpose(-2, -1)` as a view (a fresh handle on `t`'s storage)."""
+    var dims = t.logical_shape()
+    var strides = List[Int](capacity=t.rank)
+    for i in range(t.rank):
+        strides.append(t.stride(i))
+    var r = t.rank
+    var d = dims[r - 1]
+    dims[r - 1] = dims[r - 2]
+    dims[r - 2] = d
+    var s = strides[r - 1]
+    strides[r - 1] = strides[r - 2]
+    strides[r - 2] = s
+    return own(_view(t, dims, strides))
+
+
+def _swap_12(t: T) raises -> Owned:
+    """`t.transpose(1, 2)` of a 4-D tensor as a view: (B, S, H, D) <->
+    (B, H, S, D)."""
+    return own(
+        _view(
+            t,
+            [t.dim(0), t.dim(2), t.dim(1), t.dim(3)],
+            [t.stride(0), t.stride(2), t.stride(1), t.stride(3)],
+        )
+    )
+
+
+def _as(t: T, stype: Int32) raises -> Owned:
+    """`t` in `stype` as an owned handle (a new reference when it already
+    is: `cast_to` hands the input itself back then)."""
+    if t.stype == stype:
+        return own(T(retain(t)))
+    return own(cast_to(t, stype))
+
+
+def _acc_stype(t: T) -> Int32:
+    return ST_FLOAT64 if t.dtype == DType.float64 else ST_FLOAT32
+
+
+def _math_probs(
+    q: T,
+    k: T,
+    bias: Optional[T],
+    causal_off: Int,
+    scale: Float64,
+    acc: Int32,
+) raises -> Tuple[T, T]:
+    """(P, lse): the softmax probabilities (B, H, L, S) and the row
+    logsumexp (B, H, L, 1), both in `acc`. A fully masked row has P = 0 and
+    lse = -inf."""
+    var qa = _as(q, acc)
+    var ka = _as(k, acc)
+    var kt = _swap_last(ka.t)
+    var s = _d_matmul(qa.t, kt.t)
+    _ = kt^
+    _ = ka^
+    _ = qa^
+    _d_mul_scalar_(s.t, scale)
+    if bias:
+        _d_inplace("aten::add_", "Tensor", s.t, bias.value())
+    if causal_off != NO_CAUSAL:
+        var ones = own(_alloc(q.device, ST_BOOL, [q.dim(2), k.dim(2)]))
+        fill_value(ones.t, 1.0)
+        var hidden = _d_triu(ones.t, causal_off + 1)
+        _d_masked_fill_(s.t, hidden.t, _NEG_INF)
+        _ = hidden^
+        _ = ones^
+    var m = _d_amax_last(s.t)
+    var m_inf = _d_eq(m.t, _NEG_INF)
+    var m_safe = _d_masked_fill(m.t, m_inf.t, 0.0)
+    _ = m_inf^
+    _ = m^
+    var e = _d_binary("aten::sub", s.t, m_safe.t)
+    _ = s^
+    var e2 = _d_unary("aten::exp", e.t)
+    _ = e^
+    var z = _d_sum(e2.t, [-1], True)
+    var z0 = _d_eq(z.t, 0.0)
+    var z_safe = _d_masked_fill(z.t, z0.t, 1.0)
+    _ = z0^
+    var p = _d_binary("aten::div", e2.t, z_safe.t)
+    _ = z_safe^
+    _ = e2^
+    var lse = _d_unary("aten::log", z.t)
+    _ = z^
+    _d_inplace("aten::add_", "Tensor", lse.t, m_safe.t)
+    _ = m_safe^
+    return (p.take(), lse.take())
+
+
+def _math_lse_forward(
+    q: T,
+    k: T,
+    v: T,
+    bias: Optional[T],
+    causal_off: Int,
+    scale: Float64,
+    masked_lse: Int,
+) raises -> Tuple[T, T]:
+    """(out, lse): out (B, H, L, Ev) dense in q's dtype, lse (B, H, L)
+    float32, a fully masked row's lse following `masked_lse`."""
+    if k.dim(2) == 0:
+        # No keys: every row is fully masked (CUDA's flash returns 0 and
+        # +inf; the row reductions below would have nothing to reduce).
+        var zo = own(
+            _alloc(q.device, q.stype, [q.dim(0), q.dim(1), q.dim(2), v.dim(3)])
+        )
+        fill_value(zo.t, 0.0)
+        var zl = own(
+            _alloc(q.device, ST_FLOAT32, [q.dim(0), q.dim(1), q.dim(2)])
+        )
+        fill_value(
+            zl.t,
+            _POS_INF if masked_lse
+            == LSE_MASKED_FLASH else (
+                0.0 if masked_lse == LSE_MASKED_EFFICIENT else _NEG_INF
+            ),
+        )
+        return (zo.take(), zl.take())
+    var acc = _acc_stype(q)
+    var pr = _math_probs(q, k, bias, causal_off, scale, acc)
+    var p = own(pr[0].copy())
+    var lse4 = own(pr[1].copy())
+    var va = _as(v, acc)
+    var o = _d_matmul(p.t, va.t)
+    _ = va^
+    _ = p^
+    var out = _as(o.t, q.stype)
+    _ = o^
+    var lse32 = _as(lse4.t, ST_FLOAT32)
+    _ = lse4^
+    if masked_lse != LSE_MASKED_CUDNN:
+        var masked = _d_eq(lse32.t, _NEG_INF)
+        _d_masked_fill_(
+            lse32.t,
+            masked.t,
+            _POS_INF if masked_lse == LSE_MASKED_FLASH else 0.0,
+        )
+        _ = masked^
+    var lse = own(
+        _view(
+            lse32.t,
+            [q.dim(0), q.dim(1), q.dim(2)],
+            [lse32.t.stride(0), lse32.t.stride(1), lse32.t.stride(2)],
+        )
+    )
+    _ = lse32^
+    var od = _materialize(out^)
+    return (od.take(), lse.take())
+
+
+def _reduce_to(x: T, shape: List[Int]) raises -> Owned:
+    """`x` summed down to `shape`, which broadcasts to `x`'s shape."""
+    var cur = own(T(retain(x)))
+    var lead = x.rank - len(shape)
+    if lead > 0:
+        var dims = List[Int]()
+        for i in range(lead):
+            dims.append(i)
+        var summed = _d_sum(cur.t, dims, False)
+        _ = cur^  # alive across the call that reads it
+        cur = summed^
+    var ones = List[Int]()
+    for i in range(len(shape)):
+        if shape[i] == 1 and cur.t.dim(i) != 1:
+            ones.append(i)
+    if len(ones) > 0:
+        var kept = _d_sum(cur.t, ones, True)
+        _ = cur^
+        cur = kept^
+    return cur^
+
+
+def _math_lse_backward(
+    grad: T,
+    q: T,
+    k: T,
+    v: T,
+    bias: Optional[T],
+    causal_off: Int,
+    scale: Float64,
+    want_bias_grad: Bool,
+) raises -> Tuple[T, T, T, T]:
+    """(dq, dk, dv, dbias): dense, in each input's dtype; dbias has `bias`'s
+    shape and dtype, and is q itself (a dummy the caller must not return)
+    when not wanted."""
+    if k.dim(2) == 0:
+        # No keys: the output is constant 0, so every gradient is 0.
+        var zq = own(_alloc(q.device, q.stype, q.logical_shape()))
+        fill_value(zq.t, 0.0)
+        var zk = own(_alloc(k.device, k.stype, k.logical_shape()))
+        var zv = own(_alloc(v.device, v.stype, v.logical_shape()))
+        var zb = _borrowed(q)
+        if want_bias_grad and bias:
+            zb = own(
+                _alloc(
+                    q.device, bias.value().stype, bias.value().logical_shape()
+                )
+            )
+        return (zq.take(), zk.take(), zv.take(), zb.take())
+    var acc = _acc_stype(q)
+    var pr = _math_probs(q, k, bias, causal_off, scale, acc)
+    var p = own(pr[0].copy())
+    _ = own(pr[1].copy())
+    var ga = _as(grad, acc)
+    var va = _as(v, acc)
+    var pt = _swap_last(p.t)
+    var dv = _d_matmul(pt.t, ga.t)
+    _ = pt^
+    var vt = _swap_last(va.t)
+    var dp = _d_matmul(ga.t, vt.t)
+    _ = vt^
+    _ = va^
+    _ = ga^
+    var pdp = _d_binary("aten::mul", p.t, dp.t)
+    var delta = _d_sum(pdp.t, [-1], True)
+    _ = pdp^
+    _d_inplace("aten::sub_", "Tensor", dp.t, delta.t)
+    _ = delta^
+    var ds = _d_binary("aten::mul", p.t, dp.t)
+    _ = dp^
+    _ = p^
+    var dbias = _borrowed(q)
+    if want_bias_grad and bias:
+        var bshape = bias.value().logical_shape()
+        var red = _reduce_to(ds.t, bshape)
+        dbias = _materialize(_as(red.t, bias.value().stype))
+        _ = red^
+    # Out of place: `dbias` may alias `ds` (same shape and dtype).
+    var sc = _Call("aten::mul", "Scalar")
+    sc.t(ds.t)
+    sc.s(scale)
+    var dss = sc.one()
+    _ = ds^  # read through its handle by the call above
+    var ka = _as(k, acc)
+    var dq = _d_matmul(dss.t, ka.t)
+    _ = ka^
+    var qa = _as(q, acc)
+    var dst = _swap_last(dss.t)
+    var dk = _d_matmul(dst.t, qa.t)
+    _ = dst^
+    _ = qa^
+    _ = dss^
+    var dq_o = _materialize(_as(dq.t, q.stype))
+    var dk_o = _materialize(_as(dk.t, k.stype))
+    var dv_o = _materialize(_as(dv.t, v.stype))
+    _ = dq^
+    _ = dk^
+    _ = dv^
+    return (dq_o.take(), dk_o.take(), dv_o.take(), dbias.take())
+
+
+def _math_check(q: T, k: T, v: T, what: StaticString) raises:
+    """The inputs the math route takes: (B, H, L, E) / (B, H, S, E) /
+    (B, H, S, Ev) floating tensors of one dtype on one device."""
+    if q.rank != 4 or k.rank != 4 or v.rank != 4:
+        unsupported(String(what, " expects 4-D query/key/value"))
+    if not _same_device(q, k, v):
+        unsupported(String(what, ": query/key/value on different devices"))
+    if k.stype != q.stype or v.stype != q.stype:
+        raise Error(
+            what,
+            ": expected query, key and value to have the same dtype",
+        )
+    if not _is_float(q) and q.dtype != DType.float64:
+        raise Error(
+            what,
+            ": expected a floating point query, got ",
+            _scalar_type_name(q.dtype),
+        )
+    if q.dtype == DType.float64 and _api(q.device) == "metal":
+        unsupported(String(what, " in float64: Apple GPUs have no float64"))
+    if k.dim(1) != q.dim(1) or v.dim(1) != q.dim(1):
+        unsupported(String(what, " with grouped-query (fewer K/V heads)"))
+    if (
+        k.dim(0) != q.dim(0)
+        or v.dim(0) != q.dim(0)
+        or k.dim(3) != q.dim(3)
+        or v.dim(2) != k.dim(2)
+    ):
+        raise Error(what, ": query/key/value shapes do not match")
+
+
+def _causal_off(
+    is_causal: Bool, bottom_right: Bool, q_len: Int, kv_len: Int
+) -> Int:
+    if not is_causal:
+        return NO_CAUSAL
+    return kv_len - q_len if bottom_right else 0
+
+
+def _fused_alignment_ok(
+    q: T, k: T, is_causal: Bool, bottom_right: Bool
+) -> Bool:
+    """Whether the fused flash kernels' causal mask is the one asked for.
+
+    Every fused kernel (FA4 and the gfx942 MFMA/baseline kernels, forward
+    and backward) masks top-left: query `q` attends keys `0 ..= q`. A
+    bottom-right request (CUDA's own flash ops) is the same mask only when
+    L == S; otherwise it must take the math route."""
+    return not (is_causal and bottom_right and q.dim(2) != k.dim(2))
+
+
+def _flash_any_forward(
+    q: T,
+    k: T,
+    v: T,
+    is_causal: Bool,
+    scale: Float64,
+    bottom_right: Bool,
+) raises -> Tuple[T, T]:
+    """(out (B, H, L, D), lse (B, H, L) float32) from a fused flash kernel
+    when one takes the inputs, else from the math route."""
+    if _fused_alignment_ok(q, k, is_causal, bottom_right):
+        var fa4 = _fa4_plan(
+            q, k, v, False, 0.0, is_causal, False, allow_any_seqlen=True
+        )
+        if fa4.ok:
+            return _fa4_forward(q, k, v, fa4, scale)
+        var fused = _fused_fa_plan(q, k, v, False, 0.0, False)
+        if fused.ok:
+            return _fused_fa_forward(q, k, v, fused, is_causal, scale)
+    _math_check(q, k, v, "flash attention")
+    return _math_lse_forward(
+        q,
+        k,
+        v,
+        None,
+        _causal_off(is_causal, bottom_right, q.dim(2), k.dim(2)),
+        scale,
+        LSE_MASKED_FLASH,
+    )
+
+
+def _flash_any_backward(
+    grad: T,
+    q: T,
+    k: T,
+    v: T,
+    o: T,
+    lse: T,
+    is_causal: Bool,
+    scale: Float64,
+    bottom_right: Bool,
+) raises -> Tuple[T, T, T]:
+    """Gradients from the fused flash backward that matches the forward's
+    kernel, else from the math route (which recomputes the probabilities,
+    so it is right whichever route ran the forward)."""
+    var aligned = _fused_alignment_ok(q, k, is_causal, bottom_right)
+    # No `allow_any_seqlen` here: a partial last tile in the backward tile
+    # machinery would be a silently wrong gradient, so such shapes take the
+    # math route instead.
+    var fa4 = _fa4_plan(
+        q, k, v, False, 0.0, is_causal, False, allow_any_seqlen=False
+    )
+    if aligned and fa4.ok:
+        if o.stype != q.stype or not o.same_shape(q):
+            unsupported("flash attention backward: out does not match query")
+        if (
+            lse.dtype != DType.float32
+            or lse.rank != 3
+            or lse.dim(0) != fa4.batch
+            or lse.dim(1) != fa4.heads
+            or lse.dim(2) != fa4.seqlen
+        ):
+            unsupported("flash attention backward: logsumexp has a bad shape")
+        return _fa4_backward(q, k, v, o, lse, grad, fa4, scale)
+    var fused = _fused_fa_plan(q, k, v, False, 0.0, False)
+    if aligned and fused.ok:
+        return _fused_fa_backward(
+            grad, q, k, v, o, lse, fused, is_causal, scale
+        )
+    _math_check(q, k, v, "flash attention backward")
+    var g = _math_lse_backward(
+        grad,
+        q,
+        k,
+        v,
+        None,
+        _causal_off(is_causal, bottom_right, q.dim(2), k.dim(2)),
+        scale,
+        False,
+    )
+    return (g[0].copy(), g[1].copy(), g[2].copy())
+
+
+def _ret_undefined(rets: Values, i: Int):
+    """An undefined at::Tensor result (a None record in a Tensor slot)."""
+    rets[unsafe_offset=i] = Value(TAG_NONE, 0, 0, 0)
+
+
+def _philox_pair(device: Int) raises -> Tuple[T, T]:
+    """The 0-dim int64 seed/offset pair of a dropout-free call: unobserved,
+    zero-filled so nothing reads uninitialized memory."""
+    var seed = own(_alloc(device, ST_INT64, List[Int]()))
+    var offset = own(_alloc(device, ST_INT64, List[Int]()))
+    fill_value(seed.t, 0.0)
+    fill_value(offset.t, 0.0)
+    return (seed.take(), offset.take())
+
+
+def _efficient_lse(lse: T, compute: Bool) raises -> Owned:
+    """The memory-efficient kernels' logsumexp: (B, H, ceil(L / 32) * 32)
+    float32, the padding +inf, or (B, H, 0) when not computed."""
+    var b = lse.dim(0)
+    var h = lse.dim(1)
+    var l = lse.dim(2)
+    if not compute:
+        return own(_alloc(lse.device, ST_FLOAT32, [b, h, 0]))
+    var lp = (l + 31) // 32 * 32
+    var out = own(_alloc(lse.device, ST_FLOAT32, [b, h, lp]))
+    fill_value(out.t, _POS_INF)
+    var head = own(_view(out.t, [b, h, l], [h * lp, lp, 1]))
+    copy_strided_into(head.t, lse)
+    _ = head^
+    return out^
+
+
+def _bshd_dense(t_bhsd: T) raises -> Owned:
+    """A (B, H, S, D) result as the dense (B, S, H, D) tensor the CUDA
+    (B, S, H, D)-layout entry points return."""
+    var b = t_bhsd.dim(0)
+    var h = t_bhsd.dim(1)
+    var s = t_bhsd.dim(2)
+    var d = t_bhsd.dim(3)
+    var out = own(_alloc(t_bhsd.device, t_bhsd.stype, [b, s, h, d]))
+    var view = _swap_12(out.t)
+    copy_strided_into(view.t, t_bhsd)
+    _ = view^
+    return out^
+
+
+def _no_varlen(v: Value, what: StaticString) raises:
+    """Decline a defined, non-empty cumulative-sequence (ragged batch)
+    argument: the nested-tensor layout has no kernel here."""
+    var t = v_opt_tensor(v)
+    if t and t.value().numel > 0:
+        unsupported(String(what, " with cumulative sequence lengths (varlen)"))
+
+
+def _no_window(v: Value, what: StaticString) raises:
+    if not v_is_none(v) and v_int(v) != -1:
+        unsupported(String(what, " with a sliding window"))
+
+
+def _no_tensor(v: Value, what: String) raises:
+    if v_opt_tensor(v):
+        unsupported(what)
+
+
+def _cudnn_dtype(q: T) raises:
+    if q.dtype != DType.float16 and q.dtype != DType.bfloat16:
+        raise Error(
+            "cuDNN attention only supports float16 and bfloat16, got ",
+            _scalar_type_name(q.dtype),
+        )
 
 
 # ===========================================================================
@@ -1041,9 +1701,9 @@ def op_fused_sdp_choice(
     if fa4.ok or fused.ok:
         ret_int(rets, 0, SDP_FLASH)
         return
-    # `_scaled_dot_product_efficient_attention` has an ATen autograd formula
-    # whose backward op has no kernel here, so it is offered for inference
-    # only; training falls back to the differentiable math decomposition.
+    # Training stays on the differentiable math decomposition: the efficient
+    # op's backward here is that same decomposition run in float32 (the math
+    # route below), so routing training through it would buy nothing.
     if not needs_grad:
         var math = _math_plan(
             q, k, v, has_mask, dropout_p, is_causal, enable_gqa
@@ -1060,9 +1720,11 @@ def op_fused_sdp_choice(
 #   -> (Tensor output, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k,
 #       SymInt max_q, SymInt max_k, Tensor rng_state, Tensor unused,
 #       Tensor debug_attn_mask)
-def op_flash_attention(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
+def _flash_attention_impl[
+    bottom_right: Bool
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`bottom_right`: the causal mask's alignment when L != S -- CUDA's
+    flash kernels align it bottom-right, the CPU overload top-left."""
     var q = v_tensor(args[unsafe_offset=0])
     var k = v_tensor(args[unsafe_offset=1])
     var v = v_tensor(args[unsafe_offset=2])
@@ -1075,7 +1737,7 @@ def op_flash_attention(
     if q.rank != 4:
         unsupported("flash attention expects 4-D query/key/value")
     var scale = _scale_of(args[unsafe_offset=6], q.dim(3))
-    var pair = _flash_forward(q, k, v, is_causal, dropout_p, scale)
+    var pair = _flash_any_forward(q, k, v, is_causal, scale, bottom_right)
     var out = own(pair[0].copy())
     var lse = own(pair[1].copy())
 
@@ -1103,15 +1765,21 @@ def op_flash_attention(
     ret_owned(rets, 8, debug)
 
 
+def op_flash_attention(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _flash_attention_impl[True](args, n_args, rets, n_rets)
+
+
 # aten::_scaled_dot_product_flash_attention_backward(Tensor grad_out,
 #   Tensor query, Tensor key, Tensor value, Tensor out, Tensor logsumexp,
 #   Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k,
 #   float dropout_p, bool is_causal, Tensor philox_seed,
 #   Tensor philox_offset, *, float? scale=None)
 #   -> (Tensor grad_query, Tensor grad_key, Tensor grad_value)
-def op_flash_attention_backward(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
+def _flash_attention_backward_impl[
+    bottom_right: Bool
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """`cum_seq_q`/`cum_seq_k`/`philox_*` are deliberately not read: only this
     backend's own forward can produce a flash result here, it always returns
     them empty (the nested-tensor ragged layout has no kernel), and dropout
@@ -1131,43 +1799,21 @@ def op_flash_attention_backward(
     var scale = _scale_of(args[unsafe_offset=14], q.dim(3))
     if grad.stype != q.stype or not grad.same_shape(q):
         unsupported("flash attention backward: grad_out does not match query")
-
-    # No `allow_any_seqlen` here: this IS the backward tile machinery, and a
-    # partial last tile would be a silently wrong gradient. A forward that
-    # reached an odd seqlen through the BHSD route therefore fails loudly
-    # here rather than producing one.
-    var fa4 = _fa4_plan(
-        q, k, v, False, dropout_p, is_causal, False, allow_any_seqlen=False
+    var g = _flash_any_backward(
+        grad, q, k, v, out, lse, is_causal, scale, bottom_right
     )
-    if fa4.ok:
-        if out.stype != q.stype or not out.same_shape(q):
-            unsupported("flash attention backward: out does not match query")
-        if (
-            lse.dtype != DType.float32
-            or lse.rank != 3
-            or lse.dim(0) != fa4.batch
-            or lse.dim(1) != fa4.heads
-            or lse.dim(2) != fa4.seqlen
-        ):
-            unsupported("flash attention backward: logsumexp has a bad shape")
-        var g = _fa4_backward(q, k, v, out, lse, grad, fa4, scale)
-        var dq = own(g[0].copy())
-        var dk = own(g[1].copy())
-        var dv = own(g[2].copy())
-        ret_owned(rets, 0, dq)
-        ret_owned(rets, 1, dk)
-        ret_owned(rets, 2, dv)
-        return
-    var fused = _fused_fa_plan(q, k, v, False, dropout_p, False)
-    if not fused.ok:
-        unsupported("no fused flash-attention backward for these inputs")
-    var g = _fused_fa_backward(grad, q, k, v, out, lse, fused, is_causal, scale)
     var dq = own(g[0].copy())
     var dk = own(g[1].copy())
     var dv = own(g[2].copy())
     ret_owned(rets, 0, dq)
     ret_owned(rets, 1, dk)
     ret_owned(rets, 2, dv)
+
+
+def op_flash_attention_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _flash_attention_backward_impl[True](args, n_args, rets, n_rets)
 
 
 # aten::_scaled_dot_product_efficient_attention(Tensor query, Tensor key,
@@ -1178,18 +1824,14 @@ def op_flash_attention_backward(
 def op_efficient_attention(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    """The fused inference forward: FA4, the fused gfx942 kernels, the decode
-    kernel, or the bmm + fused-causal-softmax + bmm decomposition.
+    """The fused inference cascade -- FA4, the fused gfx942 kernels, the
+    decode kernel, or the bmm + fused-causal-softmax + bmm decomposition --
+    when there is no bias and no log-sum-exp to return; the math route with
+    a log-sum-exp otherwise.
 
-    `compute_log_sumexp=True` is declined: none of the routes below produces
-    a log-sum-exp (only the flash kernels do, through
-    `aten::_scaled_dot_product_flash_attention`), and the only consumer is
-    `_scaled_dot_product_efficient_attention_backward`, which this backend
-    has no kernel for -- so returning a zero tensor would hand a silently
-    wrong saved value to a backward that cannot run anyway. With
-    `compute_log_sumexp=False` the second result is the empty tensor ATen's
-    own CUDA path returns. A grad-requiring call is refused here, in the
-    forward, where the traceback still names the op.
+    A grad-requiring call needs no log-sum-exp from here: its backward
+    (`_scaled_dot_product_efficient_attention_backward` below) recomputes
+    the probabilities.
     """
     var q = v_tensor(args[unsafe_offset=0])
     var k = v_tensor(args[unsafe_offset=1])
@@ -1198,30 +1840,35 @@ def op_efficient_attention(
     var compute_lse = v_bool(args[unsafe_offset=4])
     var dropout_p = v_f64(args[unsafe_offset=5])
     var is_causal = v_bool(args[unsafe_offset=6])
-    if _needs_grad(q, k, v):
-        unsupported(
-            "aten::_scaled_dot_product_efficient_attention would record an"
-            " autograd node (aten::_scaled_dot_product_efficient_attention_"
-            "backward) that the mojo device does not implement. The forward"
-            " itself is supported: run it under torch.no_grad() /"
-            " torch.inference_mode(), or let F.scaled_dot_product_attention"
-            " pick the differentiable math decomposition."
-        )
-    if bias:
-        unsupported("efficient attention with an attention bias")
     if dropout_p != 0.0:
         unsupported("efficient attention with dropout")
-    if compute_lse:
-        unsupported(
-            "aten::_scaled_dot_product_efficient_attention with"
-            " compute_log_sumexp=True: none of the fused routes on this"
-            " device produces a log-sum-exp."
-            " aten::_scaled_dot_product_flash_attention does, on the inputs"
-            " its kernels take."
-        )
     if q.rank != 4:
         unsupported("efficient attention expects 4-D query/key/value")
     var scale = _scale_of(args[unsafe_offset=7], q.dim(3))
+
+    if bias or compute_lse:
+        _math_check(q, k, v, "efficient attention")
+        var pair = _math_lse_forward(
+            q,
+            k,
+            v,
+            bias,
+            _causal_off(is_causal, False, q.dim(2), k.dim(2)),
+            scale,
+            LSE_MASKED_EFFICIENT,
+        )
+        var mout = own(pair[0].copy())
+        var mlse = own(pair[1].copy())
+        var plse = _efficient_lse(mlse.t, compute_lse)
+        _ = mlse^
+        var mph = _philox_pair(q.device)
+        var mseed = own(mph[0].copy())
+        var moff = own(mph[1].copy())
+        ret_owned(rets, 0, mout)
+        ret_owned(rets, 1, plse)
+        ret_owned(rets, 2, mseed)
+        ret_owned(rets, 3, moff)
+        return
 
     # Grouped-query K/V (what `_fused_sdp_choice` sends here for
     # `enable_gqa=True`): repeat them up to Q's heads, then run the ordinary
@@ -1247,14 +1894,517 @@ def op_efficient_attention(
     _ = ke
     _ = ve
     var lse = own(_alloc(q.device, ST_FLOAT32, [q.dim(0), q.dim(1), 0]))
-    var seed = own(_alloc(q.device, ST_INT64, List[Int]()))
-    var offset = own(_alloc(q.device, ST_INT64, List[Int]()))
-    fill_value(seed.t, 0.0)
-    fill_value(offset.t, 0.0)
+    var ph = _philox_pair(q.device)
+    var seed = own(ph[0].copy())
+    var offset = own(ph[1].copy())
     ret_owned(rets, 0, out)
     ret_owned(rets, 1, lse)
     ret_owned(rets, 2, seed)
     ret_owned(rets, 3, offset)
+
+
+# aten::_scaled_dot_product_efficient_attention_backward(Tensor grad_out_,
+#   Tensor query, Tensor key, Tensor value, Tensor attn_bias, Tensor out,
+#   Tensor logsumexp, Tensor philox_seed, Tensor philox_offset,
+#   float dropout_p, bool[4] grad_input_mask, bool is_causal=False, *,
+#   float? scale=None) -> (Tensor, Tensor, Tensor, Tensor)
+def op_efficient_attention_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var grad = v_tensor(args[unsafe_offset=0])
+    var q = v_tensor(args[unsafe_offset=1])
+    var k = v_tensor(args[unsafe_offset=2])
+    var v = v_tensor(args[unsafe_offset=3])
+    var bias = v_opt_tensor(args[unsafe_offset=4])
+    var dropout_p = v_f64(args[unsafe_offset=9])
+    var mask = _bool_list(args[unsafe_offset=10])
+    var is_causal = v_bool(args[unsafe_offset=11])
+    if dropout_p != 0.0:
+        unsupported("efficient attention backward with dropout")
+    _math_check(q, k, v, "efficient attention backward")
+    var scale = _scale_of(args[unsafe_offset=12], q.dim(3))
+    var want_bias = Bool(bias) and len(mask) > 3 and mask[3]
+    var g = _math_lse_backward(
+        grad,
+        q,
+        k,
+        v,
+        bias,
+        _causal_off(is_causal, False, q.dim(2), k.dim(2)),
+        scale,
+        want_bias,
+    )
+    var dq = own(g[0].copy())
+    var dk = own(g[1].copy())
+    var dv = own(g[2].copy())
+    ret_owned(rets, 0, dq)
+    ret_owned(rets, 1, dk)
+    ret_owned(rets, 2, dv)
+    if want_bias:
+        var db = own(g[3].copy())
+        ret_owned(rets, 3, db)
+    else:
+        _ret_undefined(rets, 3)
+
+
+# aten::_efficient_attention_forward(Tensor query, Tensor key, Tensor value,
+#   Tensor? bias, Tensor? cu_seqlens_q, Tensor? cu_seqlens_k,
+#   SymInt? max_seqlen_q, SymInt? max_seqlen_k, float dropout_p,
+#   int custom_mask_type, bool compute_log_sumexp=False, *,
+#   float? scale=None, Tensor? seqlen_k=None, int? window_size=None)
+#   -> (Tensor output, Tensor logsumexp, Tensor philox_seed,
+#       Tensor philox_offset, SymInt max_seqlen_batch_q,
+#       SymInt max_seqlen_batch_k)
+def op_efficient_attention_forward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """The (B, M, H, K)-layout memory-efficient forward, on the math route.
+    `custom_mask_type` 1 is causal from the top left, 2 from the bottom
+    right."""
+    comptime W = "_efficient_attention_forward"
+    var q_in = v_tensor(args[unsafe_offset=0])
+    var k_in = v_tensor(args[unsafe_offset=1])
+    var v_in = v_tensor(args[unsafe_offset=2])
+    var bias = v_opt_tensor(args[unsafe_offset=3])
+    _no_varlen(args[unsafe_offset=4], W)
+    _no_varlen(args[unsafe_offset=5], W)
+    var dropout_p = v_f64(args[unsafe_offset=8])
+    var mask_type = v_int(args[unsafe_offset=9])
+    var compute_lse = v_bool(args[unsafe_offset=10])
+    if n_args > 12:
+        _no_tensor(args[unsafe_offset=12], W + " with seqlen_k")
+    if n_args > 13 and not v_is_none(args[unsafe_offset=13]):
+        unsupported(W + " with a sliding window")
+    if dropout_p != 0.0:
+        unsupported(W + " with dropout")
+    if mask_type < 0 or mask_type > 2:
+        raise Error(W + ": unsupported custom_mask_type ", mask_type)
+    if q_in.rank != 4 or k_in.rank != 4 or v_in.rank != 4:
+        unsupported(W + " expects 4-D query/key/value")
+    var q = _swap_12(q_in)
+    var k = _swap_12(k_in)
+    var v = _swap_12(v_in)
+    _math_check(q.t, k.t, v.t, W)
+    var scale = _scale_of(args[unsafe_offset=11], q.t.dim(3))
+    var off = NO_CAUSAL
+    if mask_type != 0:
+        off = _causal_off(True, mask_type == 2, q.t.dim(2), k.t.dim(2))
+    var pair = _math_lse_forward(
+        q.t, k.t, v.t, bias, off, scale, LSE_MASKED_EFFICIENT
+    )
+    _ = q^  # the views are read through their handles above
+    _ = k^
+    _ = v^
+    var out_bhsd = own(pair[0].copy())
+    var lse = own(pair[1].copy())
+    var out = _bshd_dense(out_bhsd.t)
+    _ = out_bhsd^
+    var plse = _efficient_lse(lse.t, compute_lse)
+    _ = lse^
+    var ph = _philox_pair(q_in.device)
+    var seed = own(ph[0].copy())
+    var offset = own(ph[1].copy())
+    ret_owned(rets, 0, out)
+    ret_owned(rets, 1, plse)
+    ret_owned(rets, 2, seed)
+    ret_owned(rets, 3, offset)
+    ret_int(rets, 4, q_in.dim(1))
+    ret_int(rets, 5, k_in.dim(1))
+
+
+# aten::_efficient_attention_backward(Tensor grad_out_, Tensor query,
+#   Tensor key, Tensor value, Tensor? bias, Tensor out,
+#   Tensor? cu_seqlens_q, Tensor? cu_seqlens_k, SymInt max_seqlen_q,
+#   SymInt max_seqlen_k, Tensor logsumexp, float dropout_p,
+#   Tensor philox_seed, Tensor philox_offset, int custom_mask_type,
+#   bool bias_requires_grad, *, float? scale=None, int? num_splits_key=None,
+#   int? window_size=None, bool shared_storage_dqdkdv=False)
+#   -> (Tensor, Tensor, Tensor, Tensor)
+def op_efficient_attention_backward_bmhk(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    comptime W = "_efficient_attention_backward"
+    var grad_in = v_tensor(args[unsafe_offset=0])
+    var q_in = v_tensor(args[unsafe_offset=1])
+    var k_in = v_tensor(args[unsafe_offset=2])
+    var v_in = v_tensor(args[unsafe_offset=3])
+    var bias = v_opt_tensor(args[unsafe_offset=4])
+    _no_varlen(args[unsafe_offset=6], W)
+    _no_varlen(args[unsafe_offset=7], W)
+    var dropout_p = v_f64(args[unsafe_offset=11])
+    var mask_type = v_int(args[unsafe_offset=14])
+    var bias_grad = v_bool(args[unsafe_offset=15])
+    if n_args > 18 and not v_is_none(args[unsafe_offset=18]):
+        unsupported(W + " with a sliding window")
+    if dropout_p != 0.0:
+        unsupported(W + " with dropout")
+    if mask_type < 0 or mask_type > 2:
+        raise Error(W + ": unsupported custom_mask_type ", mask_type)
+    if q_in.rank != 4 or k_in.rank != 4 or v_in.rank != 4 or grad_in.rank != 4:
+        unsupported(W + " expects 4-D query/key/value")
+    var grad = _swap_12(grad_in)
+    var q = _swap_12(q_in)
+    var k = _swap_12(k_in)
+    var v = _swap_12(v_in)
+    _math_check(q.t, k.t, v.t, W)
+    var scale = _scale_of(args[unsafe_offset=16], q.t.dim(3))
+    var off = NO_CAUSAL
+    if mask_type != 0:
+        off = _causal_off(True, mask_type == 2, q.t.dim(2), k.t.dim(2))
+    var want_bias = Bool(bias) and bias_grad
+    var g = _math_lse_backward(
+        grad.t, q.t, k.t, v.t, bias, off, scale, want_bias
+    )
+    _ = grad^  # the views are read through their handles above
+    _ = q^
+    _ = k^
+    _ = v^
+    var dq_b = own(g[0].copy())
+    var dk_b = own(g[1].copy())
+    var dv_b = own(g[2].copy())
+    var dq = _bshd_dense(dq_b.t)
+    var dk = _bshd_dense(dk_b.t)
+    var dv = _bshd_dense(dv_b.t)
+    _ = dq_b^
+    _ = dk_b^
+    _ = dv_b^
+    ret_owned(rets, 0, dq)
+    ret_owned(rets, 1, dk)
+    ret_owned(rets, 2, dv)
+    if want_bias:
+        var db = own(g[3].copy())
+        ret_owned(rets, 3, db)
+    else:
+        _ret_undefined(rets, 3)
+
+
+# aten::_flash_attention_forward(Tensor query, Tensor key, Tensor value,
+#   Tensor? cum_seq_q, Tensor? cum_seq_k, SymInt max_q, SymInt max_k,
+#   float dropout_p, bool is_causal, bool return_debug_mask, *,
+#   float? scale=None, SymInt? window_size_left=None,
+#   SymInt? window_size_right=None, Tensor? seqused_k=None,
+#   Tensor? alibi_slopes=None, Tensor? block_table=None,
+#   int? num_splits=None)
+#   -> (Tensor output, Tensor softmax_logsumexp, Tensor rng_state,
+#       Tensor unused, Tensor debug_attn_mask)
+def _flash_forward_bshd(
+    args: Values, n_args: Int, base: Int, what: StaticString
+) raises -> Tuple[T, T]:
+    """The (B, S, H, D)-layout flash forward whose schema starts at argument
+    `base`: (output (B, L, H, D) dense, lse (B, H, L) float32)."""
+    var q_in = v_tensor(args[unsafe_offset=base])
+    var k_in = v_tensor(args[unsafe_offset=base + 1])
+    var v_in = v_tensor(args[unsafe_offset=base + 2])
+    _no_varlen(args[unsafe_offset=base + 3], what)
+    _no_varlen(args[unsafe_offset=base + 4], what)
+    var dropout_p = v_f64(args[unsafe_offset=base + 7])
+    var is_causal = v_bool(args[unsafe_offset=base + 8])
+    if v_bool(args[unsafe_offset=base + 9]):
+        unsupported(String(what, " with return_debug_mask=True"))
+    # The trailing optional arguments vary across torch releases (2.11 has
+    # no block_table / num_splits): read only those this schema has.
+    if n_args > base + 11:
+        _no_window(args[unsafe_offset=base + 11], what)
+    if n_args > base + 12:
+        _no_window(args[unsafe_offset=base + 12], what)
+    if n_args > base + 13:
+        _no_tensor(
+            args[unsafe_offset=base + 13], String(what, " with seqused_k")
+        )
+    if n_args > base + 14:
+        _no_tensor(args[unsafe_offset=base + 14], String(what, " with ALiBi"))
+    if n_args > base + 15:
+        _no_tensor(
+            args[unsafe_offset=base + 15], String(what, " with a block table")
+        )
+    if dropout_p != 0.0:
+        unsupported(String(what, " with dropout"))
+    if q_in.rank != 4 or k_in.rank != 4 or v_in.rank != 4:
+        unsupported(String(what, " expects 4-D query/key/value"))
+    var q = _swap_12(q_in)
+    var k = _swap_12(k_in)
+    var v = _swap_12(v_in)
+    var scale = _scale_of(args[unsafe_offset=base + 10], q.t.dim(3))
+    var pair = _flash_any_forward(q.t, k.t, v.t, is_causal, scale, True)
+    _ = q^  # the views are read through their handles above
+    _ = k^
+    _ = v^
+    var out_bhsd = own(pair[0].copy())
+    var lse = own(pair[1].copy())
+    var out = _bshd_dense(out_bhsd.t)
+    _ = out_bhsd^
+    return (out.take(), lse.take())
+
+
+def op_flash_attention_forward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var q = v_tensor(args[unsafe_offset=0])
+    var pair = _flash_forward_bshd(args, n_args, 0, "_flash_attention_forward")
+    var out = own(pair[0].copy())
+    var lse = own(pair[1].copy())
+    var rng_state = own(_alloc(q.device, ST_UINT64, [2]))
+    var unused = own(_alloc(q.device, ST_UINT64, List[Int]()))
+    var debug = own(_alloc(q.device, q.stype, [0]))
+    fill_value(rng_state.t, 0.0)
+    fill_value(unused.t, 0.0)
+    ret_owned(rets, 0, out)
+    ret_owned(rets, 1, lse)
+    ret_owned(rets, 2, rng_state)
+    ret_owned(rets, 3, unused)
+    ret_owned(rets, 4, debug)
+
+
+# aten::_flash_attention_forward_no_dropout_inplace(Tensor(a!) out,
+#   Tensor query, Tensor key, Tensor value, <_flash_attention_forward's
+#   remaining arguments>) -> Tensor softmax_logsumexp
+def op_flash_attention_forward_no_dropout_inplace(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dst = v_tensor(args[unsafe_offset=0])
+    if v_f64(args[unsafe_offset=8]) != 0.0:
+        raise Error(
+            "_flash_attention_forward_no_dropout_inplace: dropout_p must be 0"
+        )
+    var pair = _flash_forward_bshd(
+        args, n_args, 1, "_flash_attention_forward_no_dropout_inplace"
+    )
+    var out = own(pair[0].copy())
+    var lse = own(pair[1].copy())
+    if not dst.same_shape(out.t) or dst.stype != out.t.stype:
+        raise Error(
+            (
+                "_flash_attention_forward_no_dropout_inplace: out must have the"
+                " query's shape and dtype, got "
+            ),
+            shape_str(dst),
+        )
+    if not dst.on_mojo() or dst.device != out.t.device:
+        raise Error(
+            "_flash_attention_forward_no_dropout_inplace: out must be on the"
+            " query's device"
+        )
+    copy_strided_into(dst, out.t)
+    _ = out^
+    dst.bump_version()
+    ret_owned(rets, 0, lse)
+
+
+# aten::_flash_attention_backward(Tensor grad_out, Tensor query, Tensor key,
+#   Tensor value, Tensor out, Tensor logsumexp, Tensor cum_seq_q,
+#   Tensor cum_seq_k, SymInt max_q, SymInt max_k, float dropout_p,
+#   bool is_causal, Tensor rng_state, Tensor unused, *, float? scale=None,
+#   SymInt? window_size_left=None, SymInt? window_size_right=None)
+#   -> (Tensor, Tensor, Tensor)
+def op_flash_attention_backward_bshd(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    comptime W = "_flash_attention_backward"
+    var grad_in = v_tensor(args[unsafe_offset=0])
+    var q_in = v_tensor(args[unsafe_offset=1])
+    var k_in = v_tensor(args[unsafe_offset=2])
+    var v_in = v_tensor(args[unsafe_offset=3])
+    var out_in = v_tensor(args[unsafe_offset=4])
+    var lse = v_tensor(args[unsafe_offset=5])
+    _no_varlen(args[unsafe_offset=6], W)
+    _no_varlen(args[unsafe_offset=7], W)
+    var dropout_p = v_f64(args[unsafe_offset=10])
+    var is_causal = v_bool(args[unsafe_offset=11])
+    if n_args > 15:
+        _no_window(args[unsafe_offset=15], W)
+    if n_args > 16:
+        _no_window(args[unsafe_offset=16], W)
+    if dropout_p != 0.0:
+        unsupported(W + " with dropout")
+    if (
+        q_in.rank != 4
+        or k_in.rank != 4
+        or v_in.rank != 4
+        or grad_in.rank != 4
+        or out_in.rank != 4
+    ):
+        unsupported(W + " expects 4-D query/key/value")
+    var grad = _swap_12(grad_in)
+    var q = _swap_12(q_in)
+    var k = _swap_12(k_in)
+    var v = _swap_12(v_in)
+    var out = _swap_12(out_in)
+    var scale = _scale_of(args[unsafe_offset=14], q.t.dim(3))
+    var g = _flash_any_backward(
+        grad.t, q.t, k.t, v.t, out.t, lse, is_causal, scale, True
+    )
+    _ = grad^  # the views are read through their handles above
+    _ = q^
+    _ = k^
+    _ = v^
+    _ = out^
+    var dq_b = own(g[0].copy())
+    var dk_b = own(g[1].copy())
+    var dv_b = own(g[2].copy())
+    var dq = _bshd_dense(dq_b.t)
+    var dk = _bshd_dense(dk_b.t)
+    var dv = _bshd_dense(dv_b.t)
+    _ = dq_b^
+    _ = dk_b^
+    _ = dv_b^
+    ret_owned(rets, 0, dq)
+    ret_owned(rets, 1, dk)
+    ret_owned(rets, 2, dv)
+
+
+def _cudnn_forward(
+    q: T,
+    k: T,
+    v: T,
+    bias: Optional[T],
+    compute_lse: Bool,
+    dropout_p: Float64,
+    is_causal: Bool,
+    scale_v: Value,
+    max_q: Int,
+    max_k: Int,
+    rets: Values,
+) raises:
+    """cuDNN's forward contract on the math route: causal from the top left,
+    the logsumexp (B, H, L, 1) float32 (a fully masked row's -inf), the
+    cumulative-sequence tensors and debug mask undefined."""
+    if dropout_p != 0.0:
+        unsupported("cuDNN attention with dropout")
+    _math_check(q, k, v, "cuDNN attention")
+    _cudnn_dtype(q)
+    var scale = _scale_of(scale_v, q.dim(3))
+    var pair = _math_lse_forward(
+        q,
+        k,
+        v,
+        bias,
+        _causal_off(is_causal, False, q.dim(2), k.dim(2)),
+        scale,
+        LSE_MASKED_CUDNN,
+    )
+    var out = own(pair[0].copy())
+    var lse = own(pair[1].copy())
+    ret_owned(rets, 0, out)
+    if compute_lse:
+        var lse4 = own(
+            _view(
+                lse.t,
+                [q.dim(0), q.dim(1), q.dim(2), 1],
+                [q.dim(1) * q.dim(2), q.dim(2), 1, 1],
+            )
+        )
+        ret_owned(rets, 1, lse4)
+    else:
+        _ret_undefined(rets, 1)
+    _ = lse^
+    _ret_undefined(rets, 2)
+    _ret_undefined(rets, 3)
+    ret_int(rets, 4, max_q)
+    ret_int(rets, 5, max_k)
+    var ph = _philox_pair(q.device)
+    var seed = own(ph[0].copy())
+    var offset = own(ph[1].copy())
+    ret_owned(rets, 6, seed)
+    ret_owned(rets, 7, offset)
+    _ret_undefined(rets, 8)
+
+
+# aten::_scaled_dot_product_cudnn_attention(Tensor query, Tensor key,
+#   Tensor value, Tensor? attn_bias, bool compute_log_sumexp,
+#   float dropout_p=0.0, bool is_causal=False, bool return_debug_mask=False,
+#   *, float? scale=None) -> (Tensor output, Tensor logsumexp,
+#   Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k,
+#   Tensor philox_seed, Tensor philox_offset, Tensor debug_attn_mask)
+def op_cudnn_attention(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _cudnn_forward(
+        v_tensor(args[unsafe_offset=0]),
+        v_tensor(args[unsafe_offset=1]),
+        v_tensor(args[unsafe_offset=2]),
+        v_opt_tensor(args[unsafe_offset=3]),
+        v_bool(args[unsafe_offset=4]),
+        v_f64(args[unsafe_offset=5]),
+        v_bool(args[unsafe_offset=6]),
+        args[unsafe_offset=8],
+        v_tensor(args[unsafe_offset=0]).dim(2),
+        v_tensor(args[unsafe_offset=1]).dim(2),
+        rets,
+    )
+
+
+# aten::_cudnn_attention_forward(Tensor query, Tensor key, Tensor value,
+#   Tensor? attn_bias, Tensor? cum_seq_q, Tensor? cum_seq_k, SymInt max_q,
+#   SymInt max_k, bool compute_log_sumexp, float dropout_p=0.0,
+#   bool is_causal=False, bool return_debug_mask=False, *,
+#   float? scale=None, Tensor? seqused_k=None, Tensor? block_table=None)
+#   -> (the 9-tuple above)
+def op_cudnn_attention_forward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    comptime W = "_cudnn_attention_forward"
+    _no_varlen(args[unsafe_offset=4], W)
+    _no_varlen(args[unsafe_offset=5], W)
+    if n_args > 13:  # torch >= 2.12
+        _no_tensor(args[unsafe_offset=13], W + " with seqused_k")
+    if n_args > 14:
+        _no_tensor(args[unsafe_offset=14], W + " with a block table")
+    _cudnn_forward(
+        v_tensor(args[unsafe_offset=0]),
+        v_tensor(args[unsafe_offset=1]),
+        v_tensor(args[unsafe_offset=2]),
+        v_opt_tensor(args[unsafe_offset=3]),
+        v_bool(args[unsafe_offset=8]),
+        v_f64(args[unsafe_offset=9]),
+        v_bool(args[unsafe_offset=10]),
+        args[unsafe_offset=12],
+        v_int(args[unsafe_offset=6]),
+        v_int(args[unsafe_offset=7]),
+        rets,
+    )
+
+
+# aten::_scaled_dot_product_cudnn_attention_backward(Tensor grad_out,
+#   Tensor query, Tensor key, Tensor value, Tensor out, Tensor logsumexp,
+#   Tensor philox_seed, Tensor philox_offset, Tensor attn_bias,
+#   Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k,
+#   float dropout_p, bool is_causal, *, float? scale=None)
+#   -> (Tensor, Tensor, Tensor)
+# (`_cudnn_attention_backward` has the same schema.)
+def op_cudnn_attention_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    comptime W = "cuDNN attention backward"
+    var grad = v_tensor(args[unsafe_offset=0])
+    var q = v_tensor(args[unsafe_offset=1])
+    var k = v_tensor(args[unsafe_offset=2])
+    var v = v_tensor(args[unsafe_offset=3])
+    var bias = v_opt_tensor(args[unsafe_offset=8])
+    _no_varlen(args[unsafe_offset=9], W)
+    _no_varlen(args[unsafe_offset=10], W)
+    var dropout_p = v_f64(args[unsafe_offset=13])
+    var is_causal = v_bool(args[unsafe_offset=14])
+    if dropout_p != 0.0:
+        unsupported(W + " with dropout")
+    _math_check(q, k, v, W)
+    _cudnn_dtype(q)
+    var scale = _scale_of(args[unsafe_offset=15], q.dim(3))
+    var g = _math_lse_backward(
+        grad,
+        q,
+        k,
+        v,
+        bias,
+        _causal_off(is_causal, False, q.dim(2), k.dim(2)),
+        scale,
+        False,
+    )
+    var dq = own(g[0].copy())
+    var dk = own(g[1].copy())
+    var dv = own(g[2].copy())
+    ret_owned(rets, 0, dq)
+    ret_owned(rets, 1, dk)
+    ret_owned(rets, 2, dv)
 
 
 # aten::_scaled_dot_product_flash_attention_for_cpu(Tensor query, Tensor key,
@@ -1275,7 +2425,7 @@ def op_flash_attention_for_cpu(
     fargs[5] = Value(TAG_BOOL, 0, 0, 0)  # return_debug_mask
     fargs[6] = args[unsafe_offset=6].copy()
     var frets = Array[Value, 9](fill=Value(TAG_NONE, 0, 0, 0))
-    op_flash_attention(
+    _flash_attention_impl[False](
         Values(unsafe_from_address=Int(fargs.unsafe_ptr())),
         7,
         Values(unsafe_from_address=Int(frets.unsafe_ptr())),
@@ -1308,7 +2458,7 @@ def op_flash_attention_for_cpu_backward(
     fargs[10] = args[unsafe_offset=6].copy()
     fargs[11] = args[unsafe_offset=7].copy()
     fargs[14] = args[unsafe_offset=9].copy()
-    op_flash_attention_backward(
+    _flash_attention_backward_impl[False](
         Values(unsafe_from_address=Int(fargs.unsafe_ptr())), 15, rets, n_rets
     )
     _ = fargs
@@ -1332,3 +2482,24 @@ def register_attention(site: Site) raises:
         "_scaled_dot_product_flash_attention_backward",
     ](site)
     impl[op_fused_sdp_choice, "_fused_sdp_choice"](site)
+    impl[
+        op_efficient_attention_backward,
+        "_scaled_dot_product_efficient_attention_backward",
+    ](site)
+    impl[op_efficient_attention_forward, "_efficient_attention_forward"](site)
+    impl[op_efficient_attention_backward_bmhk, "_efficient_attention_backward"](
+        site
+    )
+    impl[op_flash_attention_forward, "_flash_attention_forward"](site)
+    impl[
+        op_flash_attention_forward_no_dropout_inplace,
+        "_flash_attention_forward_no_dropout_inplace",
+    ](site)
+    impl[op_flash_attention_backward_bshd, "_flash_attention_backward"](site)
+    impl[op_cudnn_attention, "_scaled_dot_product_cudnn_attention"](site)
+    impl[
+        op_cudnn_attention_backward,
+        "_scaled_dot_product_cudnn_attention_backward",
+    ](site)
+    impl[op_cudnn_attention_forward, "_cudnn_attention_forward"](site)
+    impl[op_cudnn_attention_backward, "_cudnn_attention_backward"](site)

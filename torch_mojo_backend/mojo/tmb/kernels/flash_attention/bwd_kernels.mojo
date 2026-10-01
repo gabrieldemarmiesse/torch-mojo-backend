@@ -60,7 +60,7 @@ which is why `softmax_lse` is an argument.
   `exp(-inf - -inf)` = nan, which poisons a whole row through a reduction. That
   defect has shipped three times in this repository. `-Float32.MAX` fails the
   same way, since `Float32.MAX` is inf.
-* `is_causal` masks strictly above the diagonal aligned to the BOTTOM right, so
+* `is_causal` masks strictly above the diagonal aligned to the TOP left, so
   query row `q` attends key indices `0 ..= q`, whatever `seq_kv` is --
   PyTorch's TOP-LEFT alignment. Equivalently, key `j` is attended by query
   rows `j ..< seq_q`.
