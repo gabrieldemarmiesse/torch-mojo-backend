@@ -689,10 +689,12 @@ def op_masked_softmax(
 def op_masked_softmax_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    """SoftMax.cu `masked_softmax_backward_cuda`: the softmax backward of
-    `output.masked_fill(mask, 0)` with the masked positions' gradient forced
-    to exactly zero, as its persistent kernel writes them (the fallback's
-    `0 * grad` agrees except for a non-finite grad there)."""
+    """SoftMax.cu `masked_softmax_backward_cuda`, both routes: the
+    persistent kernel's (rows of up to 1024 elements over the last dim) sum
+    of `grad * output` over the unmasked positions only, masked positions
+    written as exactly 0; and the fallback's `_softmax_backward_data(grad,
+    output.masked_fill(mask, 0))`, where a non-finite masked grad gives
+    NaN."""
     var grad = v_tensor(args[unsafe_offset=0])
     var output = v_tensor(args[unsafe_offset=1])
     var mask = v_tensor(args[unsafe_offset=2])

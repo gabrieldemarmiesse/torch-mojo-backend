@@ -24,6 +24,7 @@ from tmb.backend.abi import (
     Values,
     _channels_last_strides,
     check,
+    is_dense,
     Results,
     call_op,
     call_op_raw,
@@ -916,20 +917,23 @@ def is_channels_last_layout(t: T) -> Bool:
     return True
 
 
-def like_layout(var r: Owned, like: T) raises -> Owned:
-    """A fresh contiguous result `r` re-laid-out channels-last when `like`
-    (the op's input) is, as torch's `empty_like` / `suggest_memory_format`
-    allocations are. Same values; `r` is released."""
-    if not is_channels_last_layout(like) or not r.t.same_shape(like):
+def like_layout(var r: Owned, like: T, any_dense: Bool = False) raises -> Owned:
+    """A fresh contiguous result `r` re-laid-out like `like` (the op's
+    input): channels-last when `like` is (`suggest_memory_format`), or --
+    `any_dense` -- with `like`'s own strides whenever `like` is dense
+    (`empty_like`). Same values; `r` is released. A no-op, no copy, for a
+    contiguous `like`."""
+    if like.contig or not r.t.same_shape(like):
+        return r^
+    var strides: IndexList[MAX_RANK]
+    if any_dense and is_dense(like.shape, like.strides, like.rank):
+        strides = like.strides
+    elif is_channels_last_layout(like):
+        strides = _channels_last_strides(like.shape, like.rank)
+    else:
         return r^
     var out = own(
-        new_strided(
-            like.shape,
-            _channels_last_strides(like.shape, like.rank),
-            like.rank,
-            r.t.stype,
-            r.t.device,
-        )
+        new_strided(like.shape, strides, like.rank, r.t.stype, r.t.device)
     )
     copy_strided_into(out.t, r.t)
     _ = r^

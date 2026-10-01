@@ -45,6 +45,24 @@ comptime EPS_T = (
 )
 
 
+# `layout` bits of the kernels below (shifted left by L_FLAGS_SHIFT inside
+# the backward-reduce kernels' `flags`): which operand is laid out channels-last
+# (dense NHWC / NDHWC) instead of contiguous NCHW. Every operand is dense in
+# one of the two, so its element (n, c, s) -- s the flattened spatial index --
+# is found without a stride table.
+comptime L_INPUT = 1
+comptime L_GRAD = 2
+comptime L_OUT = 4
+comptime L_FLAGS_SHIFT = 4
+
+
+@always_inline
+def _off(cl: Bool, n: Int, c: Int, s: Int, channels: Int, hxw: Int) -> Int:
+    if cl:
+        return (n * hxw + s) * channels + c
+    return (n * channels + c) * hxw + s
+
+
 @always_inline
 def _acc[dtype: DType]() -> DType:
     """torch's `acc_type<scalar_t, /*is_cuda=*/true>`."""
@@ -77,6 +95,7 @@ def _stats_kernel[
     eps: Scalar[EPS_T],
     momentum: Scalar[_acc[rdtype]()],
     bessel: Scalar[_acc[rdtype]()],
+    layout_arg: Int64,
 ):
     """One block per channel: Welford mean and biased variance, then
     `InvStd` (batch_norm_stats) or the variance plus the running update
@@ -90,6 +109,7 @@ def _stats_kernel[
     # batch_norm_collect_statistics_kernel: a Welford pass per thread,
     # then the pairwise Welford merge across the block (CUDA merges by
     # warp shuffles; here a shared-memory tree, the same merge formula).
+    var in_cl = (Int(layout_arg) & L_INPUT) != 0
     var avg = Scalar[acc_t](0)
     var m2_t = Scalar[acc_t](0)
     var n_t = 0
@@ -97,7 +117,7 @@ def _stats_kernel[
     while j < count:
         var n = j // hxw
         var v = in_ptr[
-            unsafe_offset=(n * channels + c) * hxw + j - n * hxw
+            unsafe_offset=_off(in_cl, n, c, j - n * hxw, channels, hxw)
         ].cast[acc_t]()
         var d1 = v - avg
         n_t += 1
@@ -186,6 +206,7 @@ def bn_stats[
     has_running: Bool,
     eps: Float64,
     momentum: Float64,
+    layout: Int,
     ctx: DeviceContext,
 ) raises:
     """`mode` 0: the biased variance (batch_norm_update_stats), 1: InvStd
@@ -215,6 +236,7 @@ def bn_stats[
         Scalar[EPS_T](eps),
         Scalar[racc](momentum),
         Scalar[racc](bessel),
+        Int64(layout),
     )
 
 
@@ -230,6 +252,7 @@ def bn_elemt[
     channels: Int,
     hxw: Int,
     numel: Int,
+    layout: Int,
     ctx: DeviceContext,
 ) raises:
     """batch_norm_transform_input_kernel (train): `gamma * (x - mean) *
@@ -243,15 +266,30 @@ def bn_elemt[
     var s_ptr = _make_ptr[sdtype](invstd_addr)
     var has_w = weight_addr != 0
     var has_b = bias_addr != 0
+    var in_cl = (layout & L_INPUT) != 0
+    var out_cl = (layout & L_OUT) != 0
 
     @always_inline
     @__parameter
     @__copy_capture(
-        out_ptr, in_ptr, w_ptr, b_ptr, m_ptr, s_ptr, has_w, has_b, channels, hxw
+        out_ptr,
+        in_ptr,
+        w_ptr,
+        b_ptr,
+        m_ptr,
+        s_ptr,
+        has_w,
+        has_b,
+        channels,
+        hxw,
+        in_cl,
+        out_cl,
     )
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
         var c = (i // hxw) % channels
+        var n = i // (hxw * channels)
+        var sp = i % hxw
         var gamma = w_ptr[unsafe_offset=c].cast[acc_t]() if has_w else Scalar[
             acc_t
         ](1)
@@ -260,10 +298,12 @@ def bn_elemt[
         ](0)
         var mean = m_ptr[unsafe_offset=c].cast[acc_t]()
         var invstd = s_ptr[unsafe_offset=c].cast[acc_t]()
-        var x = in_ptr[unsafe_offset=i].cast[acc_t]()
-        out_ptr[unsafe_offset=i] = (gamma * (x - mean) * invstd + beta).cast[
-            dtype
+        var x = in_ptr[unsafe_offset=_off(in_cl, n, c, sp, channels, hxw)].cast[
+            acc_t
         ]()
+        out_ptr[unsafe_offset=_off(out_cl, n, c, sp, channels, hxw)] = (
+            gamma * (x - mean) * invstd + beta
+        ).cast[dtype]()
 
     _parallel_for_dt[dtype, func](numel, ctx)
 
@@ -391,13 +431,23 @@ def _backward_reduce_kernel[
     var round_prod = (Int(flags_arg) & 8) != 0
     var sum_dy = Scalar[acc_t](0)
     var dot = Scalar[acc_t](0)
+    var layout = Int(flags_arg) >> L_FLAGS_SHIFT
+    var in_cl = (layout & L_INPUT) != 0
+    var g_cl = (layout & L_GRAD) != 0
     var j = tid
     while j < count:
         var n = j // hxw
-        var at = (n * channels + c) * hxw + j - n * hxw
-        var g = go_ptr[unsafe_offset=at].cast[acc_t]()
+        var sp = j - n * hxw
+        var g = go_ptr[unsafe_offset=_off(g_cl, n, c, sp, channels, hxw)].cast[
+            acc_t
+        ]()
         sum_dy += g
-        var prod = g * (in_ptr[unsafe_offset=at].cast[acc_t]() - mean)
+        var prod = g * (
+            in_ptr[unsafe_offset=_off(in_cl, n, c, sp, channels, hxw)].cast[
+                acc_t
+            ]()
+            - mean
+        )
         if round_prod:
             # GradOp builds `Float2<scalar_t, acc_t>(g, g * c)`: the product
             # is rounded through the input dtype before it is accumulated.
@@ -486,12 +536,21 @@ def _backward_reduce_cuda_order_kernel[
     if tid < active:
         var tx = tid % bx
         var n = tid // bx
+        var layout = Int(flags_arg) >> L_FLAGS_SHIFT
+        var in_cl = (layout & L_INPUT) != 0
+        var g_cl = (layout & L_GRAD) != 0
         while n < batch:
-            var base = (n * channels + c) * hxw
             var x = tx
             while x < hxw:
-                var g = go_ptr[unsafe_offset=base + x].cast[acc_t]()
-                var cc = in_ptr[unsafe_offset=base + x].cast[acc_t]() - mean
+                var g = go_ptr[
+                    unsafe_offset=_off(g_cl, n, c, x, channels, hxw)
+                ].cast[acc_t]()
+                var cc = (
+                    in_ptr[
+                        unsafe_offset=_off(in_cl, n, c, x, channels, hxw)
+                    ].cast[acc_t]()
+                    - mean
+                )
                 # Float2(scalar_t g, scalar_t g * c)
                 v1 += _round_through[dtype](g)
                 v2 += _round_through[dtype](g * cc)
@@ -649,6 +708,7 @@ def bn_backward_elemt[
     channels: Int,
     hxw: Int,
     numel: Int,
+    layout: Int,
     ctx: DeviceContext,
 ) raises:
     """batch_norm_backward_elemt_kernel_impl, with `norm_fct = 1 / sum(count)`
@@ -664,6 +724,9 @@ def bn_backward_elemt[
     var xmu_ptr = _make_ptr[sdtype](sum_dy_xmu_addr)
     var cnt_ptr = _make_ptr[DType.int32](count_addr)
     var has_w = weight_addr != 0
+    var in_cl = (layout & L_INPUT) != 0
+    var g_cl = (layout & L_GRAD) != 0
+    var out_cl = (layout & L_OUT) != 0
 
     @always_inline
     @__parameter
@@ -681,10 +744,15 @@ def bn_backward_elemt[
         world,
         channels,
         hxw,
+        in_cl,
+        g_cl,
+        out_cl,
     )
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
         var c = (i // hxw) % channels
+        var n = i // (hxw * channels)
+        var sp = i % hxw
         var total = 0
         for k in range(world):
             total += Int(cnt_ptr[unsafe_offset=k])
@@ -702,9 +770,13 @@ def bn_backward_elemt[
             * xmu_ptr[unsafe_offset=c].cast[acc_t]()
             * norm
         )
-        var g = go_ptr[unsafe_offset=i].cast[acc_t]()
-        var x = in_ptr[unsafe_offset=i].cast[acc_t]()
-        gi_ptr[unsafe_offset=i] = (
+        var g = go_ptr[unsafe_offset=_off(g_cl, n, c, sp, channels, hxw)].cast[
+            acc_t
+        ]()
+        var x = in_ptr[unsafe_offset=_off(in_cl, n, c, sp, channels, hxw)].cast[
+            acc_t
+        ]()
+        gi_ptr[unsafe_offset=_off(out_cl, n, c, sp, channels, hxw)] = (
             (g - m_dy_c - (x - m_c) * factor_1_c) * factor_2_c
         ).cast[dtype]()
 

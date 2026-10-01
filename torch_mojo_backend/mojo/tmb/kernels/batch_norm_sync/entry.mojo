@@ -1,10 +1,11 @@
 # C entry of SyncBatchNorm's building blocks (kernels: kernels.mojo).
 # Slots, all pointers 0 when absent:
 #   BnStats           mean, var_or_invstd, running_mean, running_var, input,
-#                     params (C, N, HxW, mode, has_running), eps, momentum,
+#                     params (C, N, HxW, mode, has_running, layout), eps,
+#                     momentum,
 #                     ctx                     DTYPE_ARG_0 input, 1 running
 #   BnElemt           out, input, weight, bias, mean, invstd,
-#                     params (C, HxW, numel), ctx
+#                     params (C, HxW, numel, layout), ctx
 #                                             DTYPE_ARG_0 input, 1 stats,
 #                                             2 affine
 #   BnGather          save_mean, save_invstd, mean, invstd, running_mean,
@@ -16,7 +17,7 @@
 #                                             2 weight
 #   BnBackwardElemt   grad_input, grad_out, input, mean, invstd, weight,
 #                     sum_dy, sum_dy_xmu, count (int32), params (world, C,
-#                     HxW, numel), ctx        DTYPE_ARG_0 input, 1 stats,
+#                     HxW, numel, layout), ctx        DTYPE_ARG_0 input, 1 stats,
 #                                             2 weight
 
 from tmb.kernels.batch_norm_sync.kernels import (
@@ -70,6 +71,7 @@ def _go2[d0: DType, d1: DType](argv: Argv) raises:
             _raw_tuple_int(p, 4) != 0,
             _raw_f64(argv[unsafe_offset=6]),
             _raw_f64(argv[unsafe_offset=7]),
+            _raw_tuple_int(p, 5),
             _raw_ctx(argv[unsafe_offset=8]),
         )
     elif _op_on["BnGather"]():
@@ -105,6 +107,7 @@ def _go3[d0: DType, d1: DType, d2: DType](argv: Argv) raises:
             _raw_tuple_int(p, 0),
             _raw_tuple_int(p, 1),
             _raw_tuple_int(p, 2),
+            _raw_tuple_int(p, 3),
             _raw_ctx(argv[unsafe_offset=7]),
         )
     elif _op_on["BnBackwardReduce"]():
@@ -140,6 +143,7 @@ def _go3[d0: DType, d1: DType, d2: DType](argv: Argv) raises:
             _raw_tuple_int(p, 1),
             _raw_tuple_int(p, 2),
             _raw_tuple_int(p, 3),
+            _raw_tuple_int(p, 4),
             _raw_ctx(argv[unsafe_offset=10]),
         )
     else:

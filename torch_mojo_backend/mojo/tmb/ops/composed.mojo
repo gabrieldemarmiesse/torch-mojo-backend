@@ -395,18 +395,27 @@ def _div_scalar(a: Owned, v: Float64) raises -> Owned:
     )
 
 
-def _pow_neg_half(a: Owned) raises -> Owned:
-    """`rsqrt` of a float64 tensor (no float64 rsqrt kernel here)."""
-    return own(
-        _dispatch(
-            "aten::pow",
-            "Tensor_Scalar",
-            [
-                _tensor_value(a.t),
-                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(-0.5), 0),
-            ],
+def _inv_sqrt(a: Owned) raises -> Owned:
+    """`1 / sqrt(a)`, as batch_norm_backward_kernel forms the evaluation
+    invstd (`static_cast<acc_t>(1) / device_sqrt(var + eps)`). float64 has
+    no sqrt kernel here, so its square root is `pow(a, 0.5)`."""
+    var root: Owned
+    if a.t.stype == ST_FLOAT64:
+        root = own(
+            _dispatch(
+                "aten::pow",
+                "Tensor_Scalar",
+                [
+                    _tensor_value(a.t),
+                    Value(TAG_SCALAR_DOUBLE, 0, f64_bits(0.5), 0),
+                ],
+            )
         )
-    )
+    else:
+        root = own(_dispatch("aten::sqrt", "", [_tensor_value(a.t)]))
+    var inv = own(_dispatch("aten::reciprocal", "", [_tensor_value(root.t)]))
+    _ = root^
+    return inv^
 
 
 def _rsqrt(a: Owned) raises -> Owned:
@@ -532,13 +541,18 @@ def _planes_view(t: T) raises -> Owned:
     return _view_as(c, shape, 3)
 
 
-def _shaped_like(gi: Owned, out_like: T) raises -> Owned:
-    """`gi` (an `[N, C, HxW]` result) in the dtype and shape of `out_like`."""
+def _shaped_like(gi: Owned, out_like: T, keep_cl: Bool) raises -> Owned:
+    """`gi` (an `[N, C, HxW]` result) in the dtype and shape of `out_like`,
+    channels-last when `out_like` is and `keep_cl` (CUDA's training route
+    allocates `empty_like(input)`; its evaluation one a contiguous
+    `at::empty`)."""
     var res = _cast(gi, out_like.stype)
-    if res.t.rank == out_like.rank:
-        return like_layout(res^, out_like)
-    var dense = _dense(res)
-    return like_layout(_view_as(dense, out_like.shape, out_like.rank), out_like)
+    if res.t.rank != out_like.rank:
+        var dense = _dense(res)
+        res = _view_as(dense, out_like.shape, out_like.rank)
+    if not keep_cl:
+        return res^
+    return like_layout(res^, out_like)
 
 
 def _filled_channels(
@@ -650,11 +664,11 @@ def _bn_backward(
             var coef = _mul(gw_n, factor)
             var projected = _channel_affine(xhat, zeros, coef, zeros, ones)
             var gi = _sub(debiased, projected)
-            var shaped = _shaped_like(gi, out_like)
+            var shaped = _shaped_like(gi, out_like, True)
             ret_owned(rets, 0, shaped)
         else:
             var gi = _channel_affine(grad, zeros, factor, zeros, ones)
-            var shaped = _shaped_like(gi, out_like)
+            var shaped = _shaped_like(gi, out_like, False)
             ret_owned(rets, 0, shaped)
     else:
         rets[unsafe_offset=0] = Value(TAG_NONE, 0, 0, 0)
@@ -715,9 +729,7 @@ def _bn_stats_then_backward(
     var mean = _bn_channel_vec(args[unsafe_offset=3], c, cst)
     var var_t = _bn_channel_vec(args[unsafe_offset=4], c, cst)
     var shifted = _add_scalar(var_t, eps)
-    var invstd = _rsqrt(shifted) if cst != ST_FLOAT64 else _pow_neg_half(
-        shifted
-    )
+    var invstd = _inv_sqrt(shifted)
     _bn_backward(
         args, rets, grad, a, out_like, mean, invstd, False, cst, pst, mask
     )

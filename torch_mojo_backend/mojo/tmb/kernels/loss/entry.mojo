@@ -28,10 +28,10 @@
 # a storage offset), so the vector regime is gated on the runtime pointer and
 # the Int64 target loads use element alignment.
 #
-# Supported contract: non-ignore targets must lie in [0, classes). Out-of-
-# range targets are skipped like ignore_index rather than trapped: Mojo has
-# no asynchronous device-side assert that would not poison the shared device
-# context, and these kernels never synchronize to check on the host.
+# Supported contract: a non-ignore target outside [0, classes) is skipped
+# (no write) and raises the int64 flag at the last slot (`err`, see
+# nll_kernels._valid), which the op reads back and turns into CPU torch's
+# IndexError -- CUDA's device-side assert, made reportable.
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.sync import barrier
@@ -63,6 +63,7 @@ from tmb.kernels.common.variant_gates import (
     _tmb_entry_error,
 )
 from tmb.kernels.loss.nll_kernels import (
+    _valid,
     P_BATCH,
     P_CLASSES,
     P_IGNORE,
@@ -118,6 +119,7 @@ def _nll_forward_none(
     rows_arg: Int64,
     classes_arg: Int64,
     ignore_index_arg: Int64,
+    err: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
@@ -131,7 +133,7 @@ def _nll_forward_none(
     while row < rows:
         var t = Int(target[unsafe_offset=row])
         var loss = Float32(0.0)
-        if t != ignore_index and t >= 0 and t < classes:
+        if _valid(t, ignore_index, classes, err):
             loss = -log_probs[unsafe_offset=row * classes + t]
         output[unsafe_offset=row] = loss
         row += stride
@@ -146,6 +148,7 @@ def _nll_forward_mean(
     rows_arg: Int64,
     classes_arg: Int64,
     ignore_index_arg: Int64,
+    err: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
@@ -165,14 +168,14 @@ def _nll_forward_mean(
         var tv = target.unsafe_load[width=_MEAN_ILP, alignment=8](r)
         comptime for lane in range(_MEAN_ILP):
             var t = Int(tv[lane])
-            if t != ignore_index and t >= 0 and t < classes:
+            if _valid(t, ignore_index, classes, err):
                 acc[lane] += log_probs[unsafe_offset=(r + lane) * classes + t]
                 count[lane] += 1.0
         base += _MEAN_CHUNK
     var row = base + tid
     while row < rows:
         var t = Int(target[unsafe_offset=row])
-        if t != ignore_index and t >= 0 and t < classes:
+        if _valid(t, ignore_index, classes, err):
             acc[0] += log_probs[unsafe_offset=row * classes + t]
             count[0] += 1.0
         row += _MEAN_BLOCK
@@ -195,6 +198,7 @@ def _nll_forward_mean_partial(
     rows_arg: Int64,
     classes_arg: Int64,
     ignore_index_arg: Int64,
+    err: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
@@ -207,7 +211,7 @@ def _nll_forward_mean_partial(
     var stride = Int(grid_dim.x) * _PARTIAL_BLOCK
     while row < rows:
         var t = Int(target[unsafe_offset=row])
-        if t != ignore_index and t >= 0 and t < classes:
+        if _valid(t, ignore_index, classes, err):
             acc += log_probs[unsafe_offset=row * classes + t]
             count += 1.0
         row += stride
@@ -252,6 +256,7 @@ def _nll_forward_sum(
     rows_arg: Int64,
     classes_arg: Int64,
     ignore_index_arg: Int64,
+    err: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
@@ -270,7 +275,7 @@ def _nll_forward_sum(
         var loss = Float32(0.0)
         if row < rows:
             var t = Int(target[unsafe_offset=row])
-            if t != ignore_index and t >= 0 and t < classes:
+            if _valid(t, ignore_index, classes, err):
                 loss = -log_probs[unsafe_offset=row * classes + t]
                 count += 1.0
         losses[unsafe_offset=tid] = loss
@@ -300,6 +305,7 @@ def _nll_backward_vec4(
     classes_arg: Int64,
     reduction_arg: Int64,
     ignore_index_arg: Int64,
+    err: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
@@ -323,7 +329,7 @@ def _nll_backward_vec4(
     var row = Int(block_idx.y)
     while row < rows:
         var t = Int(target[unsafe_offset=row])
-        var valid = t != ignore_index and t >= 0 and t < classes
+        var valid = _valid(t, ignore_index, classes, err)
         var grad = Float32(0.0)
         if valid:
             grad = -(
@@ -356,6 +362,7 @@ def _nll_backward_scalar(
     classes_arg: Int64,
     reduction_arg: Int64,
     ignore_index_arg: Int64,
+    err: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
@@ -373,7 +380,7 @@ def _nll_backward_scalar(
     var row = Int(block_idx.x) * (_BWD_BLOCK // WARP_SIZE) + Int(warp_id())
     while row < rows:
         var t = Int(target[unsafe_offset=row])
-        var valid = t != ignore_index and t >= 0 and t < classes
+        var valid = _valid(t, ignore_index, classes, err)
         var grad = Float32(0.0)
         if valid:
             grad = -(
@@ -399,6 +406,7 @@ def enqueue_nll_forward_f32(
     reduction: Int,
     ignore_index: Int,
     ctx: DeviceContext,
+    err: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ) raises:
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
@@ -418,6 +426,7 @@ def enqueue_nll_forward_f32(
                 Int64(rows),
                 Int64(classes),
                 Int64(ignore_index),
+                err,
             )
         elif reduction == 1:
             if rows <= _MEAN_SINGLE_MAX_ROWS:
@@ -434,6 +443,7 @@ def enqueue_nll_forward_f32(
                     Int64(rows),
                     Int64(classes),
                     Int64(ignore_index),
+                    err,
                 )
             else:
                 var grid = min(ceildiv(rows, _PARTIAL_BLOCK), 1024)
@@ -451,6 +461,7 @@ def enqueue_nll_forward_f32(
                     Int64(rows),
                     Int64(classes),
                     Int64(ignore_index),
+                    err,
                 )
                 _enqueue_cached[_nll_forward_mean_final](
                     ctx,
@@ -480,6 +491,7 @@ def enqueue_nll_forward_f32(
                 Int64(rows),
                 Int64(classes),
                 Int64(ignore_index),
+                err,
             )
         else:
             raise Error("reduction must be 0, 1, or 2")
@@ -495,6 +507,7 @@ def enqueue_nll_backward_f32(
     reduction: Int,
     ignore_index: Int,
     ctx: DeviceContext,
+    err: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ) raises:
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
@@ -521,6 +534,7 @@ def enqueue_nll_backward_f32(
                 Int64(classes),
                 Int64(reduction),
                 Int64(ignore_index),
+                err,
             )
         else:
             var grid = min(ceildiv(rows, _BWD_BLOCK // WARP_SIZE), 8192)
@@ -538,6 +552,7 @@ def enqueue_nll_backward_f32(
                 Int64(classes),
                 Int64(reduction),
                 Int64(ignore_index),
+                err,
             )
 
 
@@ -556,6 +571,7 @@ def _nll_forward_go(
     reduction_obj: Arg,
     ignore_index_obj: Arg,
     device_context_ptr: Arg,
+    err_obj: Arg,
 ) raises:
     var output = _make_ptr[DType.float32](
         _raw_int(output_ptr_obj)
@@ -580,6 +596,7 @@ def _nll_forward_go(
         _raw_int(reduction_obj),
         _raw_int(ignore_index_obj),
         ctx,
+        _make_ptr[DType.int64](_raw_int(err_obj)).as_unsafe_any_origin(),
     )
 
 
@@ -593,6 +610,7 @@ def _nll_backward_go(
     reduction_obj: Arg,
     ignore_index_obj: Arg,
     device_context_ptr: Arg,
+    err_obj: Arg,
 ) raises:
     var grad_input = _make_ptr[DType.float32](
         _raw_int(grad_input_ptr_obj)
@@ -617,6 +635,7 @@ def _nll_backward_go(
         _raw_int(reduction_obj),
         _raw_int(ignore_index_obj),
         ctx,
+        _make_ptr[DType.int64](_raw_int(err_obj)).as_unsafe_any_origin(),
     )
 
 
@@ -632,6 +651,7 @@ def _nll_forward_dispatcher(argv: Argv, argc: Int) raises:
         args[unsafe_offset=6],
         args[unsafe_offset=7],
         args[unsafe_offset=8],
+        args[unsafe_offset=9],
     )
 
 
@@ -647,6 +667,7 @@ def _nll_backward_dispatcher(argv: Argv, argc: Int) raises:
         args[unsafe_offset=6],
         args[unsafe_offset=7],
         args[unsafe_offset=8],
+        args[unsafe_offset=9],
     )
 
 

@@ -28,7 +28,9 @@ from tmb.backend.abi import (
     bool_arg,
     f64_bits,
     index_error,
+    _channels_last_strides,
     max_dtype,
+    new_strided,
     new_tensor,
     none_arg,
     own,
@@ -248,10 +250,12 @@ def op_batch_norm_backward(
 
 
 struct Planes(Movable):
-    """A batch-norm operand as the contiguous `[N, C, HxW]` the kernels
-    read."""
+    """A batch-norm operand as the dense `[N, C, HxW]` the kernels read:
+    contiguous NCHW (a copy when needed), or a channels-last input read
+    where it lies (`cl`)."""
 
     var dense: Dense
+    var cl: Bool
     var n: Int
     var c: Int
     var hxw: Int
@@ -265,12 +269,38 @@ struct Planes(Movable):
                 + String(max(t.rank, 1) - 1)
                 + "], but got 1)"
             )
-        self.dense = Dense(t)
+        self.cl = is_channels_last_layout(t)
+        if self.cl:
+            self.dense = Dense(t, True)
+        else:
+            self.dense = Dense(t)
         self.n = t.dim(0)
         self.c = t.dim(1)
         self.hxw = 1
         for i in range(2, t.rank):
             self.hxw *= t.dim(i)
+
+
+comptime L_INPUT = 1
+comptime L_GRAD = 2
+comptime L_OUT = 4
+comptime L_FLAGS_SHIFT = 4  # kernels/batch_norm_sync/kernels.mojo's layout bits
+
+
+def _out_like(p: Planes, a: T) raises -> Owned:
+    """The output the kernels write in `p`'s layout: channels-last for a
+    channels-last input (CUDA's `empty_like`), else contiguous."""
+    if p.cl:
+        return own(
+            new_strided(
+                a.shape,
+                _channels_last_strides(a.shape, a.rank),
+                a.rank,
+                a.stype,
+                a.device,
+            )
+        )
+    return own(new_tensor(a.shape, a.rank, a.stype, a.device))
 
 
 def _opt(args: Values, i: Int) -> Bool:
@@ -310,6 +340,7 @@ def _stats_launch(
     params.append(p.hxw)
     params.append(mode)
     params.append(1 if running else 0)
+    params.append(L_INPUT if p.cl else 0)
     call.tuple(params)
     call.f64(eps)
     call.f64(momentum)
@@ -490,7 +521,7 @@ def _elemt(args: Values) raises -> Owned:
         var bd = _as_stype(_channel_vec(args, 2, a, p.c, "bias"), acc)
         b_ptr = bd.t.ptr
         b = bd^
-    var out = own(new_tensor(a.shape, a.rank, a.stype, a.device))
+    var out = _out_like(p, a)
     if a.numel > 0:
         var ctx = ctx_for(a.device)
         var call = KernelCall("batch_norm_sync", "BnElemt")
@@ -507,6 +538,7 @@ def _elemt(args: Values) raises -> Owned:
         params.append(p.c)
         params.append(p.hxw)
         params.append(a.numel)
+        params.append((L_INPUT | L_OUT) if p.cl else 0)
         call.tuple(params)
         call.int(ctx_ptr(ctx))
         call.run()
@@ -516,7 +548,8 @@ def _elemt(args: Values) raises -> Owned:
     _ = invstd^
     _ = w^
     _ = b^
-    return like_layout(out^, a)
+    # `empty_like(self)`: a dense permuted input keeps its strides.
+    return like_layout(out^, a, True)
 
 
 # aten::batch_norm_elemt(Tensor input, Tensor? weight, Tensor? bias,
@@ -766,6 +799,8 @@ def op_batch_norm_backward_reduce(
         flags = 1
     if not cl:
         flags |= 8
+    var layout = (L_INPUT if p.cl else 0) | (L_GRAD if g.cl else 0)
+    flags |= layout << L_FLAGS_SHIFT
     var sum_dy = _vec(p.c, mean_t.stype, a.device)
     var sum_dy_xmu = _vec(p.c, mean_t.stype, a.device)
     var gw = _vec(wlen, wstype, a.device)
@@ -879,7 +914,12 @@ def op_batch_norm_backward_elemt(
         w = _channel_vec(args, 4, a, p.c, "weight")
         wdtype = w.value().t.dtype
         w_ptr = w.value().t.ptr
+    # CUDA's channels-last route (both operands channels-last) allocates
+    # `empty_like(input)`, the other one a contiguous result.
+    var out_cl = p.cl and g.cl
     var gi = own(new_tensor(a.shape, a.rank, a.stype, a.device))
+    if out_cl:
+        gi = _out_like(p, a)
     if a.numel > 0:
         var ctx = ctx_for(a.device)
         var call = KernelCall("batch_norm_sync", "BnBackwardElemt")
@@ -900,6 +940,11 @@ def op_batch_norm_backward_elemt(
         params.append(p.c)
         params.append(p.hxw)
         params.append(a.numel)
+        params.append(
+            (L_INPUT if p.cl else 0)
+            | (L_GRAD if g.cl else 0)
+            | (L_OUT if out_cl else 0)
+        )
         call.tuple(params)
         call.int(ctx_ptr(ctx))
         call.run()
@@ -912,8 +957,7 @@ def op_batch_norm_backward_elemt(
     _ = sum_dy_xmu^
     _ = cnt^
     _ = w^
-    var gl = like_layout(gi^, a)
-    ret_owned(rets, 0, gl)
+    ret_owned(rets, 0, gi)
 
 
 # ---------------------------------------------------------------------------
@@ -933,11 +977,13 @@ def _elemt_launch(
     mean: T,
     invstd: T,
 ) raises:
+    """BnElemt with `dst` laid out as `p` is (see `_out_like`); the affine
+    parameters arrive in the accumulation dtype."""
     var ctx = ctx_for(a.device)
     var call = KernelCall("batch_norm_sync", "BnElemt")
     call.arg_dtype(0, a.dtype)
     call.arg_dtype(1, mean.dtype)
-    call.arg_dtype(2, w.dtype if has_w else (b.dtype if has_b else a.dtype))
+    call.arg_dtype(2, mean.dtype)
     call.int(dst.ptr)
     call.int(p.dense.t.ptr)
     call.int(w.ptr if has_w else 0)
@@ -948,13 +994,97 @@ def _elemt_launch(
     params.append(p.c)
     params.append(p.hxw)
     params.append(a.numel)
+    params.append((L_INPUT | L_OUT) if p.cl else 0)
     call.tuple(params)
     call.int(ctx_ptr(ctx))
     call.run()
     _ = ctx
 
 
-def _bn_f64(
+def _expect_scalar(t: T, stype: Int32) raises:
+    """`const_data_ptr<scalar_t>()`'s check."""
+    if t.stype != stype:
+        raise Error(
+            "expected scalar type ",
+            _scalar_type_name(max_dtype(stype)),
+            " but found ",
+            _scalar_type_name(t.dtype),
+        )
+
+
+def _affine_checks(a: T, args: Values) raises:
+    """batch_norm_elementwise's typed reads of weight and bias, per route:
+    contiguous (`batch_norm_elemt_cuda_template`, `stat_scalar_t` the
+    accumulation dtype when the first defined parameter's dtype differs from
+    the input's), channels-last (`batch_norm_elemt_channels_last_cuda_
+    template`: `acc_t` pointers when the weight's -- else the bias's --
+    dtype differs from the input's, `scalar_t` ones otherwise), or the
+    TensorIterator route, which converts whatever it is given."""
+    var has_w = _opt(args, 1)
+    var has_b = _opt(args, 2)
+    if not has_w and not has_b:
+        return
+    var first = v_tensor(args[unsafe_offset=1 if has_w else 2])
+    var mixed = first.stype != a.stype
+    var want = _acc_of(a.stype) if mixed else a.stype
+    if a.contig and not _uses_channels_last(a):
+        if has_w:
+            _expect_type(v_tensor(args[unsafe_offset=1]), want, "weight")
+        if has_b:
+            _expect_type(v_tensor(args[unsafe_offset=2]), want, "bias")
+    elif _uses_channels_last(a):
+        if has_w:
+            _expect_scalar(v_tensor(args[unsafe_offset=1]), want)
+        if has_b:
+            _expect_scalar(v_tensor(args[unsafe_offset=2]), want)
+
+
+def _invstd_of(rv: T, eps: Float64, acc: Int32) raises -> Owned:
+    """batch_norm_calc_invstd: `rsqrt(var + eps)` in the running variance's
+    accumulation dtype, stored in `acc`."""
+    var racc = _acc_of(rv.stype)
+    var v = own(T(retain(rv)))
+    if rv.stype != racc:
+        v = own(cast_to(rv, racc))
+    var shifted_r = call_op(
+        String("aten::add"),
+        String("Scalar"),
+        [
+            tensor_arg(v.t),
+            Value(TAG_SCALAR_DOUBLE, 0, f64_bits(eps), 0),
+            Value(TAG_SCALAR_INT, 0, 1, 0),
+        ],
+        1,
+    )
+    var shifted = own(shifted_r.take_tensor(0))
+    _ = v^
+    var inv: Owned
+    if racc == ST_FLOAT64:
+        # No float64 rsqrt kernel here; `pow(-0.5)` is one.
+        var r = call_op(
+            String("aten::pow"),
+            String("Tensor_Scalar"),
+            [
+                tensor_arg(shifted.t),
+                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(-0.5), 0),
+            ],
+            1,
+        )
+        inv = own(r.take_tensor(0))
+    else:
+        var r = call_op(
+            String("aten::rsqrt"), String(""), [tensor_arg(shifted.t)], 1
+        )
+        inv = own(r.take_tensor(0))
+    _ = shifted^
+    if inv.t.stype == acc:
+        return inv^
+    var c = own(cast_to(inv.t, acc))
+    _ = inv^
+    return c^
+
+
+def _bn_sync(
     args: Values,
     rets: Values,
     rm_i: Int,
@@ -962,13 +1092,16 @@ def _bn_f64(
     eps_i: Int,
     mom_i: Int,
 ) raises:
-    """batch_norm_cuda for a float64 input: training statistics with the
-    running update and `rsqrt(var + eps)` (batch_norm_update_stats_and_invert
-    / batch_norm_calc_invstd), or the running statistics copied and inverted,
-    then batch_norm_elementwise."""
+    """batch_norm_cuda on the batch_norm_sync kernels, for a float64 input
+    (the normalization_forward kernels are float32 throughout) or a
+    channels-last one (read and written where it lies, no relayout copy):
+    Welford statistics with the running update and `rsqrt(var + eps)`
+    (batch_norm_update_stats_and_invert / batch_norm_calc_invstd), or the
+    running statistics copied and inverted, then batch_norm_elementwise."""
     var a = v_tensor(args[unsafe_offset=0])
     _loss_float(a)
     var p = Planes(a)
+    var acc = _acc_of(a.stype)
     var eps = v_f64(args[unsafe_offset=eps_i])
     var momentum = v_f64(args[unsafe_offset=mom_i]) if mom_i >= 0 else 0.0
     var has_rm = _opt(args, rm_i)
@@ -977,34 +1110,22 @@ def _bn_f64(
             "running_mean and running_var must either both be None or neither"
             " be None"
         )
+    _affine_checks(a, args)
     var has_w = _opt(args, 1)
     var has_b = _opt(args, 2)
-    var w = v_tensor(args[unsafe_offset=1]) if has_w else a.copy()
-    var b = v_tensor(args[unsafe_offset=2]) if has_b else a.copy()
-    # batch_norm_elementwise's routes read weight and bias as typed
-    # pointers, except the TensorIterator one (neither contiguous nor
-    # channels-last), which converts them.
-    if a.contig and not _uses_channels_last(a):
-        if has_w:
-            _expect_type(w, ST_FLOAT64, "weight")
-        if has_b:
-            _expect_type(b, ST_FLOAT64, "bias")
-    elif _uses_channels_last(a):
-        if has_w:
-            _expect_dtype(w, a)
-        if has_b:
-            _expect_dtype(b, a)
+    var w = a.copy()
+    var b = a.copy()
     var wd = Optional[Dense](None)
     var bd = Optional[Dense](None)
     if has_w:
-        wd = _as_stype(_channel_vec(args, 1, a, p.c, "weight"), ST_FLOAT64)
+        wd = _as_stype(_channel_vec(args, 1, a, p.c, "weight"), acc)
         w = wd.value().t.copy()
     if has_b:
-        bd = _as_stype(_channel_vec(args, 2, a, p.c, "bias"), ST_FLOAT64)
+        bd = _as_stype(_channel_vec(args, 2, a, p.c, "bias"), acc)
         b = bd.value().t.copy()
-    var out = own(new_tensor(a.shape, a.rank, a.stype, a.device))
-    var mean = _vec(p.c, ST_FLOAT64, a.device)
-    var invstd = _vec(p.c, ST_FLOAT64, a.device)
+    var out = _out_like(p, a)
+    var mean = _vec(p.c, acc, a.device)
+    var invstd = _vec(p.c, acc, a.device)
     if training:
         var running: Optional[Tuple[T, T]] = None
         if has_rm:
@@ -1012,6 +1133,7 @@ def _bn_f64(
             var rv = v_tensor(args[unsafe_offset=rm_i + 1])
             _same_device(a, rm)
             _same_device(a, rv)
+            _loss_float(rm)
             _expect_dtype(rv, rm)
             if (
                 not rm.contig
@@ -1032,39 +1154,12 @@ def _bn_f64(
             )
         var rm = _channel_vec(args, rm_i, a, p.c, "running_mean")
         var rv = _channel_vec(args, rm_i + 1, a, p.c, "running_var")
-        # `save_mean.copy_(running_mean)` into a fresh float64 vector.
-        if rm.t.stype == ST_FLOAT64:
+        # `save_mean.copy_(running_mean)` into a fresh acc_type vector.
+        if rm.t.stype == acc:
             copy_strided_into(mean.t, rm.t)
         else:
-            mean = own(cast_to(rm.t, ST_FLOAT64))
-        var rv64 = own(T(retain(rv.t)))
-        if rv.t.stype != ST_FLOAT64:
-            rv64 = own(cast_to(rv.t, ST_FLOAT64))
-        var shifted_r = call_op(
-            String("aten::add"),
-            String("Scalar"),
-            [
-                tensor_arg(rv64.t),
-                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(eps), 0),
-                Value(TAG_SCALAR_INT, 0, 1, 0),
-            ],
-            1,
-        )
-        var shifted = own(shifted_r.take_tensor(0))
-        _ = rv64^
-        # `rsqrt(var + eps)` (batch_norm_calc_invstd); float64 rsqrt is not
-        # a kernel here, `pow(-0.5)` is.
-        var inv_r = call_op(
-            String("aten::pow"),
-            String("Tensor_Scalar"),
-            [
-                tensor_arg(shifted.t),
-                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(-0.5), 0),
-            ],
-            1,
-        )
-        _ = shifted^
-        invstd = own(inv_r.take_tensor(0))
+            mean = own(cast_to(rm.t, acc))
+        invstd = _invstd_of(rv.t, eps, acc)
         _ = rm^
         _ = rv^
     if a.numel > 0:
@@ -1072,19 +1167,29 @@ def _bn_f64(
     _ = p^
     _ = wd^
     _ = bd^
-    ret_owned(rets, 0, out)
+    # `empty_like(self)`: any other dense permutation keeps its strides.
+    var res = like_layout(out^, a, True)
+    ret_owned(rets, 0, res)
     ret_owned(rets, 1, mean)
     ret_owned(rets, 2, invstd)
 
 
+def _sync_route(a: T) raises -> Bool:
+    """float64, or a channels-last input of any float dtype."""
+    return a.on_mojo() and (
+        a.dtype == DType.float64 or is_channels_last_layout(a)
+    )
+
+
 def _relayout_ret0(rets: Values, a: T) raises:
-    """Result 0 (a fresh contiguous output) in `a`'s channels-last layout
-    when `a` has one: CUDA allocates it with `empty_like(input)`."""
-    if not is_channels_last_layout(a):
+    """Result 0 (a fresh contiguous output) with `a`'s strides when `a` is
+    a dense permutation: CUDA allocates it with `empty_like(input)`. A
+    contiguous input costs nothing."""
+    if a.contig:
         return
     var cur = own(T(Int(rets[unsafe_offset=0].a)))
     rets[unsafe_offset=0] = none_arg()
-    var o = like_layout(cur^, a)
+    var o = like_layout(cur^, a, True)
     ret_owned(rets, 0, o)
 
 
@@ -1093,10 +1198,10 @@ def op_native_batch_norm_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
-    if a.dtype == DType.float64:
-        _bn_f64(args, rets, 3, v_bool(args[unsafe_offset=5]), 7, 6)
-    else:
-        op_native_batch_norm(args, n_args, rets, n_rets)
+    if _sync_route(a):
+        _bn_sync(args, rets, 3, v_bool(args[unsafe_offset=5]), 7, 6)
+        return
+    op_native_batch_norm(args, n_args, rets, n_rets)
     _relayout_ret0(rets, a)
 
 
@@ -1107,10 +1212,10 @@ def op_batch_norm_legit_no_training_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
-    if a.dtype == DType.float64:
-        _bn_f64(args, rets, 3, False, 6, -1)
-    else:
-        op_batch_norm_legit_no_training(args, n_args, rets, n_rets)
+    if _sync_route(a):
+        _bn_sync(args, rets, 3, False, 6, -1)
+        return
+    op_batch_norm_legit_no_training(args, n_args, rets, n_rets)
     _relayout_ret0(rets, a)
 
 

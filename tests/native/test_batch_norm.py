@@ -630,7 +630,9 @@ def test_batch_norm_channels_last_outputs(mojo_device, training):
         1e-5,
         [True, True, True],
     )[0]
-    assert gi.stride() == xcl.stride()
+    # CUDA's training route allocates `empty_like(input)`, its evaluation
+    # one a contiguous tensor.
+    assert gi.stride() == (xcl.stride() if training else g.contiguous().stride())
 
 
 def test_batch_norm_stats_large_constant_channel(mojo_device):
@@ -653,3 +655,42 @@ def test_batch_norm_elemt_mixed_parameter_dtypes(mojo_device):
     )
     want = torch.full(x.shape, 100.01 - 100.0).half()
     torch.testing.assert_close(got.cpu(), want)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("training", [True, False])
+def test_batch_norm_channels_last_matches_contiguous(mojo_device, dtype, training):
+    """The channels-last route (read and written in place) gives the values
+    of the contiguous one, running statistics included."""
+    x, w, b, rm, rv = _bn_inputs((3, 4, 5, 6), dtype)
+    w32, b32 = w.float(), b.float()
+    rm1, rv1 = _to(mojo_device, rm.float(), rv.float())
+    rm2, rv2 = _to(mojo_device, rm.float(), rv.float())
+    xd = x.to(mojo_device)
+    want = aten.native_batch_norm(
+        xd, *_to(mojo_device, w32, b32), rm1, rv1, training, 0.1, 1e-5
+    )
+    got = aten.native_batch_norm(
+        xd.to(memory_format=torch.channels_last),
+        *_to(mojo_device, w32, b32),
+        rm2,
+        rv2,
+        training,
+        0.1,
+        1e-5,
+    )
+    assert got[0].is_contiguous(memory_format=torch.channels_last)
+    for g_, w_ in zip(got, want):
+        _close(g_.contiguous(), w_.cpu(), dtype)
+    _close(rm2, rm1.cpu())
+    _close(rv2, rv1.cpu())
+
+
+def test_batch_norm_dense_permuted_input_keeps_strides(mojo_device):
+    """`empty_like(self)`: any dense permutation keeps its strides."""
+    x, w, b, rm, rv = _bn_inputs((3, 4, 5, 6), torch.float32)
+    xp = x.permute(3, 1, 0, 2).contiguous().permute(2, 1, 3, 0)
+    got = aten.native_batch_norm(*_to(mojo_device, xp, w, b, rm, rv), False, 0.1, 1e-5)
+    assert got[0].stride() == xp.stride()
+    want = aten.native_batch_norm(x, w, b, rm, rv, False, 0.1, 1e-5)
+    _close(got[0], want[0])
