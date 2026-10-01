@@ -376,8 +376,9 @@ def test_out_overlap_raises(mojo_device):
     expanded = torch.empty(1, 1, 1, 1, device=mojo_device).expand(1, 1, 6, 6)
     with pytest.raises(RuntimeError, match="more than one element"):
         torch.ops.aten.replication_pad2d.out(x, [1, 1, 1, 1], out=expanded)
-    with pytest.raises(RuntimeError, match="single memory location"):
-        torch.ops.aten.upsample_nearest1d.out(x[0], [2], None, out=x[0][..., :2])
+    # A strided (non-dense) out is TooHard for ATen's overlap check: allowed,
+    # as in stock torch.
+    torch.ops.aten.upsample_nearest1d.out(x[0], [2], None, out=x[0][..., :2])
     # A partially overlapping dense view: the input's second half is the
     # start of the output.
     buf = torch.zeros(64, device=mojo_device)

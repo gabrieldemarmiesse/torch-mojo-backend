@@ -4127,7 +4127,7 @@ def _sorted_segment_add_go(
     perm_o: Arg,
     srcoff_o: Arg,
     src_o: Arg,
-    params: Arg,  # (n, is_value, mode: 0 stride-1 / 1 small / 2 wide)
+    params: Arg,  # (n, is_value, mode: 0 stride-1 / 1 small / 2 wide, warp)
     value_o: Arg,
     dtype_o: Arg,
     ctx_o: Arg,
@@ -4137,6 +4137,7 @@ def _sorted_segment_add_go(
     var n = _raw_tuple_int(params, 0)
     var is_value = _raw_tuple_int(params, 1) != 0
     var mode = _raw_tuple_int(params, 2)
+    var warp = min(_raw_tuple_int(params, 3), 64)
     var value = _raw_f64(value_o)
     var tgt = _make_ptr[DType.int64](_raw_int(tgt_o))
     var perm = _make_ptr[DType.int64](_raw_int(perm_o))
@@ -4159,7 +4160,7 @@ def _sorted_segment_add_go(
                 @always_inline
                 @__parameter
                 @__copy_capture(
-                    out, src, scalar, tgt, perm, srcoff, is_value, n, mode
+                    out, src, scalar, tgt, perm, srcoff, is_value, n, mode, warp
                 )
                 def func[width: Int, alignment: Int = 1](coord: Coord):
                     var i = Int(coord[0].value())
@@ -4171,8 +4172,9 @@ def _sorted_segment_add_go(
                     # into the dtype after every addition; 1, up to a warp
                     # (_small_stride): sum the run in opmath from 0 and add
                     # it to self once; 0, width 1 (_stride_1): the same, but
-                    # the run's first 32 * floor(len / 32) values are summed
-                    # by 32 lanes and a shuffle-down tree, the rest after.
+                    # the run's first warp * floor(len / warp) values are
+                    # summed by `warp` lanes and a shuffle-down tree, the
+                    # rest after (`warp`: 32 on CUDA, 64 on ROCm).
                     var j = i
                     var stop = i
                     while stop < n and tgt[unsafe_offset=stop] == t:
@@ -4199,30 +4201,30 @@ def _sorted_segment_add_go(
                         return
                     var acc = Scalar[acc_t](0)
                     if mode == 0:
-                        var passes = (stop - i) // 32
+                        var passes = (stop - i) // warp
                         if passes > 0:
-                            var lanes = Array[Scalar[acc_t], 32](
+                            var lanes = Array[Scalar[acc_t], 64](
                                 fill=Scalar[acc_t](0)
                             )
-                            var prev = Array[Scalar[acc_t], 32](
+                            var prev = Array[Scalar[acc_t], 64](
                                 fill=Scalar[acc_t](0)
                             )
                             for p in range(passes):
-                                for lane in range(32):
-                                    lanes[lane] += value_at(i + p * 32 + lane)
-                            var offset = 16
+                                for lane in range(warp):
+                                    lanes[lane] += value_at(i + p * warp + lane)
+                            var offset = warp // 2
                             while offset > 0:
-                                for lane in range(32):
+                                for lane in range(warp):
                                     prev[lane] = lanes[lane]
-                                for lane in range(32):
+                                for lane in range(warp):
                                     var other = lane + offset
                                     lanes[lane] = prev[lane] + (
                                         prev[other] if other
-                                        < 32 else prev[lane]
+                                        < warp else prev[lane]
                                     )
                                 offset //= 2
                             acc = lanes[0]
-                        j = i + passes * 32
+                        j = i + passes * warp
                     while j < stop:
                         acc += value_at(j)
                         j += 1
