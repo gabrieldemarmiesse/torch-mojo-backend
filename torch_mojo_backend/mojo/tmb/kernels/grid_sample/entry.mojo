@@ -107,7 +107,18 @@ def _acc[dt: DType]() -> DType:
 def _r[dt: DType](x: Scalar[_acc[dt]()]) -> Scalar[_acc[dt]()]:
     """The rounding a `scalar_t` operator applies to its float result:
     c10::Half / c10::BFloat16 compute in float and store the 16-bit type."""
-    comptime if dt == DType.float16 or dt == DType.bfloat16:
+    comptime if dt == DType.bfloat16:
+        # Round to nearest even on the float32 bits rather than through a
+        # bfloat16 cast: Metal's lowering folds an int -> float32 -> bfloat16
+        # chain into a wrong conversion (8 came back as 65536).
+        var bits = rebind[Float32](x).to_bits[DType.uint32]()
+        if (bits & UInt32(0x7FFFFFFF)) > UInt32(0x7F800000):
+            return x  # NaN
+        bits = (bits + UInt32(0x7FFF) + ((bits >> 16) & UInt32(1))) & UInt32(
+            0xFFFF0000
+        )
+        return rebind[Scalar[_acc[dt]()]](Float32(from_bits=bits))
+    elif dt == DType.float16:
         return x.cast[dt]().cast[_acc[dt]()]()
     else:
         return x
@@ -226,12 +237,20 @@ def _reflect[
 @always_inline
 def _safe_downgrade[A: DType](x: Scalar[A]) -> Scalar[A]:
     """safe_downgrade_to_int_range: -100 (out of bounds) for anything an int
-    cannot hold. `INT_MAX - 1` converts to the comparison's float type."""
-    if (
-        x > Scalar[A](2147483646)
-        or x < Scalar[A](-2147483648.0)
-        or not (abs(x) < Scalar[A].MAX_FINITE * 2)
-    ):
+    cannot hold. `INT_MAX - 1` converts to the comparison's float type.
+    Finiteness is read off the exponent bits: the GPU builds' fast-math
+    flags may fold a float test against infinity or NaN (seen on Metal,
+    where every coordinate then read as out of range)."""
+    var finite: Bool
+    comptime if A == DType.float64:
+        finite = (x.to_bits[DType.uint64]() & UInt64(0x7FF0000000000000)) != (
+            UInt64(0x7FF0000000000000)
+        )
+    else:
+        finite = (x.to_bits[DType.uint32]() & UInt32(0x7F800000)) != UInt32(
+            0x7F800000
+        )
+    if not finite or x > Scalar[A](2147483646) or x < Scalar[A](-2147483648.0):
         return Scalar[A](-100.0)
     return x
 
@@ -571,9 +590,9 @@ def _forward_2d[
             var ty = iy - fy
             # get_value_bounded<scalar_t>: the coordinates become scalar_t.
             var offs = Array[Int, 16](fill=-1)
-            for i in range(4):
+            comptime for i in range(4):
                 var yy = _r[dt](fy - 1 + Scalar[A](i))
-                for j in range(4):
+                comptime for j in range(4):
                     var xx = _r[dt](fx - 1 + Scalar[A](j))
                     offs[i * 4 + j] = _bounded_offset[dt](
                         xx, yy, W, H, sW, sH, pad, align
@@ -581,9 +600,9 @@ def _forward_2d[
             for c in range(C):
                 var base = inp + c * sC
                 var rows = Array[Scalar[A], 4](fill=0)
-                for i in range(4):
+                comptime for i in range(4):
                     var v = Array[Scalar[A], 4](fill=0)
-                    for j in range(4):
+                    comptime for j in range(4):
                         var o = offs[i * 4 + j]
                         if o >= 0:
                             v[j] = input[unsafe_offset=base + o].cast[A]()
@@ -664,7 +683,7 @@ def _forward_3d[
             # tnw, tne, tsw, tse, bnw, bne, bsw, bse (CUDA's order)
             var wt = Array[Scalar[A], 8](fill=0)
             var off = Array[Int, 8](fill=-1)
-            for k in range(8):
+            comptime for k in range(8):
                 var xb = k & 1
                 var yb = (k >> 1) & 1
                 var zb = (k >> 2) & 1
@@ -681,7 +700,7 @@ def _forward_3d[
             for c in range(C):
                 var base = inp + c * sC
                 var acc = Scalar[A](0)
-                for k in range(8):
+                comptime for k in range(8):
                     if off[k] >= 0:
                         acc = fma(
                             input[unsafe_offset=base + off[k]].cast[A](),
@@ -906,7 +925,7 @@ def _backward_2d[
             var yc = Array[Scalar[A], 4](fill=0)
             var xg = Array[Scalar[A], 4](fill=0)
             var yg = Array[Scalar[A], 4](fill=0)
-            for k in range(4):
+            comptime for k in range(4):
                 xc[k] = _s_coeff[dt](tx, k)
                 yc[k] = _s_coeff[dt](ty, k)
                 xg[k] = _s_coeff_grad[dt](tx, k)
@@ -916,9 +935,9 @@ def _backward_2d[
             # grad_input are addressed with their own strides.
             var in_off = Array[Int, 16](fill=-1)
             var gi_off = Array[Int, 16](fill=-1)
-            for i in range(4):
+            comptime for i in range(4):
                 var xx = _r[dt](_r[dt](fx - 1) + Scalar[A](i))
-                for j in range(4):
+                comptime for j in range(4):
                     var yy = _r[dt](_r[dt](fy - 1) + Scalar[A](j))
                     in_off[i * 4 + j] = _bounded_offset[dt](
                         xx, yy, W, H, sW, sH, pad, align
@@ -930,8 +949,8 @@ def _backward_2d[
                 var go_v = grad_out[unsafe_offset=gout + c * oC].cast[A]()
                 var base = inp + c * sC
                 var gbase = gin + c * iC
-                for i in range(4):
-                    for j in range(4):
+                comptime for i in range(4):
+                    comptime for j in range(4):
                         if need_in and gi_off[i * 4 + j] >= 0:
                             _scatter[dt](
                                 grad_in,
@@ -1045,7 +1064,7 @@ def _backward_3d[
             var wt = Array[Scalar[A], 8](fill=0)
             var in_off = Array[Int, 8](fill=-1)
             var gi_off = Array[Int, 8](fill=-1)
-            for k in range(8):
+            comptime for k in range(8):
                 var xb = k & 1
                 var yb = (k >> 1) & 1
                 var zb = (k >> 2) & 1
@@ -1062,7 +1081,7 @@ def _backward_3d[
             for c in range(C):
                 var go_v = grad_out[unsafe_offset=gout + c * oC].cast[A]()
                 if need_in:
-                    for k in range(8):
+                    comptime for k in range(8):
                         if gi_off[k] >= 0:
                             _scatter[dt](
                                 grad_in,
@@ -1070,23 +1089,22 @@ def _backward_3d[
                                 _r[dt](wt[k] * go_v),
                             )
                 var base = inp + c * sC
-                for k in range(8):
-                    if in_off[k] < 0:
-                        continue
-                    var v = input[unsafe_offset=base + in_off[k]].cast[A]()
-                    var xb = k & 1
-                    var yb = (k >> 1) & 1
-                    var zb = (k >> 2) & 1
-                    var wx = dx0 if xb else dx1
-                    var wy = dy0 if yb else dy1
-                    var wz = dz0 if zb else dz1
-                    # d/dix of the corner weight: +-(y weight)(z weight).
-                    var tx = _r[dt](_r[dt](_r[dt](v * wy) * wz) * go_v)
-                    var ty = _r[dt](_r[dt](_r[dt](v * wx) * wz) * go_v)
-                    var tz = _r[dt](_r[dt](_r[dt](v * wx) * wy) * go_v)
-                    gx = _r[dt](gx + tx) if xb else _r[dt](gx - tx)
-                    gy = _r[dt](gy + ty) if yb else _r[dt](gy - ty)
-                    gz = _r[dt](gz + tz) if zb else _r[dt](gz - tz)
+                comptime for k in range(8):
+                    if in_off[k] >= 0:
+                        var v = input[unsafe_offset=base + in_off[k]].cast[A]()
+                        var xb = k & 1
+                        var yb = (k >> 1) & 1
+                        var zb = (k >> 2) & 1
+                        var wx = dx0 if xb else dx1
+                        var wy = dy0 if yb else dy1
+                        var wz = dz0 if zb else dz1
+                        # d/dix of the corner weight: +-(y weight)(z weight).
+                        var tx = _r[dt](_r[dt](_r[dt](v * wy) * wz) * go_v)
+                        var ty = _r[dt](_r[dt](_r[dt](v * wx) * wz) * go_v)
+                        var tz = _r[dt](_r[dt](_r[dt](v * wx) * wy) * go_v)
+                        gx = _r[dt](gx + tx) if xb else _r[dt](gx - tx)
+                        gy = _r[dt](gy + ty) if yb else _r[dt](gy - ty)
+                        gz = _r[dt](gz + tz) if zb else _r[dt](gz - tz)
         else:
             if need_in:
                 var xn = _to_int(_nearbyint[A](ix))
