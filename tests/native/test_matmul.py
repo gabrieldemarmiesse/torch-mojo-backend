@@ -612,8 +612,19 @@ def test_self_partially_overlapping_out_raises(mojo_gpu):
     mat, vec = torch.randn(3, 4, device=mojo_gpu), torch.randn(4, device=mojo_gpu)
     with pytest.raises(RuntimeError, match="refer to a single memory location"):
         torch.addmv(base[:3], mat, vec, out=base[1:4])
+    with pytest.raises(RuntimeError, match="refer to a single memory location"):
+        # resized to [3] in place first, then overlapping self
+        torch.addmv(base[:3], mat, vec, out=base[1:2])
     torch.addmv(base[:3], mat, vec, beta=0, out=base[1:4])
     torch.addmv(base[1:2], mat, vec, out=base[0:3])
+    flat = torch.randn(8, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="refer to a single memory location"):
+        torch.addbmm(
+            flat[:6].view(2, 3),
+            torch.randn(2, 2, 4, device=mojo_gpu),
+            torch.randn(2, 4, 3, device=mojo_gpu),
+            out=flat[1:7].view(2, 3),
+        )
     b3 = torch.randn(3, 4, 3, device=mojo_gpu)
     with pytest.raises(RuntimeError, match="refer to a single memory location"):
         torch.baddbmm(

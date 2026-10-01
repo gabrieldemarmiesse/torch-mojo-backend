@@ -1749,15 +1749,24 @@ def _check_dest(dest: T, stype: Int32, like: T) raises:
 def _self_partial_overlap(dest: T, self: T, dims: List[Int]) raises:
     """`result.copy_(self.expand(dims))`'s `assert_no_partial_overlap`: a
     self that broadcasts (a stride-0 dimension) is ATen's `TooHard` case
-    and passes; checked once `dest` has the result's shape."""
-    if not _has_dims(dest, dims):
-        return
+    and passes. The result is checked as the meta's resize leaves it: a
+    `dest` of another shape is re-laid out contiguously at its own storage
+    offset (same storage), and that is the geometry compared."""
     var r = len(dims)
     for i in range(r):
         var d = i - (r - self.rank)
         if dims[i] > 1 and (d < 0 or self.dim(d) == 1):
             return
-    _b_no_partial_overlap(dest, self)
+    if _has_dims(dest, dims):
+        _b_no_partial_overlap(dest, self)
+        return
+    var resized = dest.copy()
+    resized.rank = r
+    resized.shape = _index_list(dims)
+    resized.strides = contiguous_strides(resized.shape, r)
+    resized.numel = _prod(dims)
+    resized.contig = True
+    _b_no_partial_overlap(resized, self)
 
 
 def _dest_overlap(dest: Optional[T], dims: List[Int]) raises:
@@ -2137,14 +2146,14 @@ def _addmm_run(
         # that would apply _addmm_activation's relu / gelu.
         act = ACT_NONE
     _dest_overlap(dest, dims)
-    # The bias-fused GEMM routes take a bias vector (`self` of rank 1); any
-    # other self is the cuBLAS epilogue's `C`, added in the compute type
-    # before the one rounding (a half product past the dtype's range can
-    # come back into it), which those routes' separate add would not do.
+    # The unit-scaled call keeps the GEMM routes (a bias vector fused, any
+    # other self added after the tensor-core product: two roundings, the
+    # routes' long-standing speed). What they decline takes the cuBLAS-style
+    # epilogue below, which adds self in the compute type before the one
+    # rounding.
     if (
         alpha.one()
         and beta.one()
-        and self.rank == 1
         and out_stype == mat1.stype
         and self.stype == mat1.stype
         and _is_float(mat1.dtype)
@@ -2650,6 +2659,9 @@ def _addbmm_run(
     var k = b1.dim(2)
     var n = b2.dim(2)
     _dest_overlap(dest, dims)
+    if dest and not _raw_zero(beta_v):
+        # addbmm_impl_'s `result.copy_(self)` (skipped when they are one).
+        _self_partial_overlap(dest.value(), self, dims)
     # `result.copy_(self)`: self cast into the result's dtype first.
     var rst = dest.value().stype if dest else self.stype
     var cast_self = own_if_new(cast_to(self, rst), self)
@@ -3450,7 +3462,21 @@ def op_linear(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
                 squeezed += 1
         var fusable = (b.rank == 1 or squeezed == 1) and b.contig
         addmm_branch = a.rank == 2 or (fusable and a.contig)
-    if not bias or (addmm_branch and bias.value().rank == 1):
+    # The GEMM routes (bias-free, a fused bias vector, or the tensor-core
+    # product plus a same-dtype broadcast add, as they always ran) serve any
+    # bias they can add without promoting or enlarging the output; what they
+    # decline takes the ATen-shaped branches below.
+    var fast = not bias
+    if bias:
+        var b = bias.value().copy()
+        fast = b.stype == a.stype and b.rank <= a.rank
+        if fast and w.rank == 2:
+            for i in range(b.rank):
+                var od = a.rank - b.rank + i
+                var want = w.dim(0) if od == a.rank - 1 else a.dim(od)
+                if b.dim(i) != 1 and b.dim(i) != want:
+                    fast = False
+    if fast:
         var out = _linear_route(a, w, bias)
         if out:
             ret_tensor(rets, 0, out.value())
