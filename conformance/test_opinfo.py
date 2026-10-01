@@ -338,6 +338,9 @@ _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
                 "nn_functional_batch_norm",
                 "nn_functional_conv2d",
                 "nn_functional_instance_norm",
+                # one f16 ulp (1.8e-4 on 0.08): Metal's linear rounds the
+                # product before its bias add, where CPU's addmm rounds once.
+                "nn_functional_linear",
             )
             for dtype in (torch.bfloat16, torch.float16)
         }
