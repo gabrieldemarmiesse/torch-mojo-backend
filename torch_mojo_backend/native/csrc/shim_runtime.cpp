@@ -638,6 +638,7 @@ int32_t tmb_float32_matmul_precision(void) {
   return static_cast<int32_t>(at::globalContext().float32MatmulPrecision());
 }
 int32_t tmb_grad_enabled(void) { return c10::GradMode::is_enabled() ? 1 : 0; }
+int32_t tmb_deterministic_algorithms(void) { return at::globalContext().deterministicAlgorithms() ? 1 : 0; }
 int32_t tmb_cuda_is_pinned_ptr(const void* ptr) {
   return at::globalContext().isPinnedPtr(ptr, c10::DeviceType::CUDA) ? 1 : 0;
 }

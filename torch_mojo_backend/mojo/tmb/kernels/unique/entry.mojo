@@ -286,6 +286,121 @@ def _counts_go(
         )
 
 
+# ---------------------------------------------------------------------------
+# RowMergePass: one pass of a stable bottom-up merge sort of row indices by
+# lexicographic row order (unique_dim_cuda_template's thrust::sort
+# comparator: the first element where `<` or `>` holds decides; NaN, which
+# satisfies neither, compares equal). Runs of `width` sorted rows are merged
+# pairwise: each row finds its rank in the partner run by binary search
+# (lower bound from the left run, upper bound from the right, so equal rows
+# keep their order) and is written straight to its merged position.
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _row_less[
+    dtype: DType
+](data: Pointer[Scalar[dtype], MutAnyOrigin], a: Int, b: Int, w: Int) -> Bool:
+    for k in range(w):
+        var x = data[unsafe_offset=a * w + k]
+        var y = data[unsafe_offset=b * w + k]
+        if x < y:
+            return True
+        if x > y:
+            return False
+    return False
+
+
+@__name(t"unique_row_merge_{dtype}_t{GS_THREADS}")
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GS_THREADS))
+)
+def _row_merge_kernel[
+    dtype: DType
+](
+    out_perm: Pointer[Int64, MutAnyOrigin],
+    in_perm: Pointer[Int64, MutAnyOrigin],
+    data: Pointer[Scalar[dtype], MutAnyOrigin],
+    n_arg: Int64,
+    inner: Int64,
+    width_arg: Int64,
+):
+    var n = Int(n_arg)
+    var w = Int(inner)
+    var width = Int(width_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var step = Int(grid_dim.x) * Int(block_dim.x)
+    while i < n:
+        var run = i // width
+        var left_start = (run - (run & 1)) * width
+        var right_start = left_start + width
+        var right_stop = min(right_start + width, n)
+        var me = Int(in_perm[unsafe_offset=i])
+        var dest: Int
+        if run & 1 == 0:
+            # Left run: rows of the right run strictly less than me.
+            var lo = right_start
+            var hi = right_stop
+            while lo < hi:
+                var mid = (lo + hi) >> 1
+                if _row_less(data, Int(in_perm[unsafe_offset=mid]), me, w):
+                    lo = mid + 1
+                else:
+                    hi = mid
+            dest = i + (lo - right_start)
+        else:
+            # Right run: rows of the left run not greater than me.
+            var lo = left_start
+            var hi = right_start
+            while lo < hi:
+                var mid = (lo + hi) >> 1
+                if not _row_less(data, me, Int(in_perm[unsafe_offset=mid]), w):
+                    lo = mid + 1
+                else:
+                    hi = mid
+            dest = left_start + (i - right_start) + (lo - left_start)
+        out_perm[unsafe_offset=dest] = Int64(me)
+        i += step
+
+
+def _row_merge_go(
+    out_o: Arg,
+    in_o: Arg,
+    data_o: Arg,
+    params: Arg,  # (n, inner, width)
+    dtype_o: Arg,
+    ctx_o: Arg,
+) raises:
+    var dtype = _raw_dtype_int(dtype_o)
+    var ctx = _raw_ctx(ctx_o)
+    var n = _raw_tuple_int(params, 0)
+    var handled = False
+    comptime for dt in UNIQUE_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                handled = True
+                comptime if not has_accelerator():
+                    raise Error("no GPU accelerator available at compile time")
+                elif dt == DType.float64 and has_apple_gpu_accelerator():
+                    raise Error("float64 is not supported on Apple GPU")
+                else:
+                    _enqueue_cached[_row_merge_kernel[dt]](
+                        ctx,
+                        _gs_blocks(n),
+                        1,
+                        1,
+                        GS_THREADS,
+                        _ptr[DType.int64](out_o),
+                        _ptr[DType.int64](in_o),
+                        _ptr[dt](data_o),
+                        Int64(n),
+                        Int64(_raw_tuple_int(params, 1)),
+                        Int64(_raw_tuple_int(params, 2)),
+                    )
+    if not handled:
+        raise Error("RowMergePass: unsupported dtype ", dtype)
+
+
 @export
 def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     """C entry of this family: one kernel per build (see `OP`).
@@ -297,6 +412,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["UniqueSelect"]():
             _spec_dispatcher4[_select_go, "UniqueSelect"](argv, argc)
+            return 0
+        comptime if _op_on["RowMergePass"]():
+            _spec_dispatcher6[_row_merge_go, "RowMergePass"](argv, argc)
             return 0
         comptime if _op_on["UniqueCounts"]():
             _spec_dispatcher5[_counts_go, "UniqueCounts"](argv, argc)

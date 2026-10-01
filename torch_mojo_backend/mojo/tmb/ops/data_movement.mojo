@@ -40,6 +40,7 @@ from tmb.backend.abi import (
     IntList,
     Owned,
     StorageArg,
+    deterministic_algorithms,
     dtype_name,
     T,
     Value,
@@ -2024,23 +2025,42 @@ def _scatter_into(
         src_ptr = src.value().ptr
         src_dtype = src.value().dtype
         src_strides = _strides_of(src.value())
-    _scatter_launch(
-        target,
-        _strides_of(target),
-        idx_c.t,
-        _strides_of(idx_c.t),
-        src_ptr,
-        src_dtype,
-        src_strides,
-        _dims_of(idx_c.t),
-        dim,
-        dim_size,
-        is_value,
-        value,
-        accumulate,
-        String("scatter_add") if accumulate else String("scatter"),
-        int_value=int_value,
-    )
+    if (
+        accumulate
+        and src
+        and target.dtype.is_floating_point()
+        and deterministic_algorithms()
+    ):
+        # CUDA's deterministic scatter_add: `_scatter_via_index_put`.
+        scatter_add_sorted(
+            target,
+            idx_c.t,
+            _strides_of(idx_c.t),
+            src.value(),
+            src_strides,
+            _dims_of(idx_c.t),
+            dim,
+            dim_size,
+            "scatter_add",
+        )
+    else:
+        _scatter_launch(
+            target,
+            _strides_of(target),
+            idx_c.t,
+            _strides_of(idx_c.t),
+            src_ptr,
+            src_dtype,
+            src_strides,
+            _dims_of(idx_c.t),
+            dim,
+            dim_size,
+            is_value,
+            value,
+            accumulate,
+            String("scatter_add") if accumulate else String("scatter"),
+            int_value=int_value,
+        )
     _ = idx_c^
     _ = idx64^
 
@@ -2449,6 +2469,10 @@ def op_scatter_add_(
     var index = v_tensor(args[unsafe_offset=2])
     var src = v_tensor(args[unsafe_offset=3])
     var dim = _scatter_add_check(a, v_int(args[unsafe_offset=1]), index, src)
+    # scatter_meta_impl's overlap checks: the output is self.
+    assert_no_internal_overlap(a)
+    assert_no_overlap(a, index)
+    assert_no_overlap(a, src)
     _scatter_into(a, dim, _dim_or1(a, dim), index, src^, 0.0, False, True)
     ret_ref(rets, 0, a)
 
@@ -2546,22 +2570,36 @@ def _index_add_into(
     var idx_strides = List[Int](capacity=rank)
     for d in range(rank):
         idx_strides.append(idx_stride if d == dim else 0)
-    _scatter_launch(
-        target,
-        _strides_of(target),
-        idx.t,
-        idx_strides,
-        src.ptr,
-        src.dtype,
-        _strides_of(src),
-        _dims_of(src),
-        dim,
-        _dim_or1(a, dim),
-        False,
-        0.0,
-        True,
-        "index_add",
-    )
+    if target.dtype.is_floating_point() and deterministic_algorithms():
+        # CUDA's deterministic index_add: index_put_(accumulate=True).
+        scatter_add_sorted(
+            target,
+            idx.t,
+            idx_strides,
+            src,
+            _strides_of(src),
+            _dims_of(src),
+            dim,
+            _dim_or1(a, dim),
+            "index_add",
+        )
+    else:
+        _scatter_launch(
+            target,
+            _strides_of(target),
+            idx.t,
+            idx_strides,
+            src.ptr,
+            src.dtype,
+            _strides_of(src),
+            _dims_of(src),
+            dim,
+            _dim_or1(a, dim),
+            False,
+            0.0,
+            True,
+            "index_add",
+        )
     _ = idx^
     _ = scaled^
 
@@ -2586,6 +2624,10 @@ def op_index_add(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 #   Scalar alpha=1) -> Tensor(a!)
 def op_index_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
+    # index_func_meta_impl's overlap checks: the output is self.
+    assert_no_internal_overlap(a)
+    assert_no_overlap(a, v_tensor(args[unsafe_offset=2]))
+    assert_no_overlap(a, v_tensor(args[unsafe_offset=3]))
     _index_add_into(
         a,
         a,

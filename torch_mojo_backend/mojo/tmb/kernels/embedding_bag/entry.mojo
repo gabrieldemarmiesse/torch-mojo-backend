@@ -14,7 +14,9 @@
 # check_arguments; the bounds are clamped so neither is ever followed).
 # ===----------------------------------------------------------------------=== #
 
+from std.atomic import Atomic, Ordering
 from std.math import pow
+from std.sys import is_amd_gpu, is_nvidia_gpu
 from max.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_dim,
@@ -37,6 +39,7 @@ from tmb.kernels.common.op_utils import (
     _raw_f64,
     _raw_int,
     _raw_tuple_int,
+    _spec_dispatcher4,
     _spec_dispatcher10,
     _spec_dispatcher12,
 )
@@ -382,122 +385,153 @@ def _embedding_renorm_go(
 
 
 # ---------------------------------------------------------------------------
-# EmbeddingBagBackwardSorted: the sum / mean weight gradient of
-# `embedding_bag_backward_cuda_sum_avg` (native/cuda/EmbeddingBag.cu +
-# EmbeddingBackwardKernel.cu), deterministic as CUDA's two-pass route: the
-# indices are stably sorted beforehand (`sorted`, with `perm` the original
-# positions), and one thread per (weight row, feature) finds its row's run by
-# binary search and sums it in CUDA's order -- partial sums of
-# NROWS_PER_THREAD consecutive entries (compute_grad_weight_bags), then the
-# partials in order (sum_and_scatter). Each entry adds
-# `grad[bag] (/ bag_size) * (1 / count) * per_sample_weight` in the
-# accumulator dtype; padding_idx and untouched rows stay 0.
+# The sum / mean weight gradient under deterministic algorithms: CUDA's
+# two-pass `embedding_bag_backward_cuda_sum_avg` (EmbeddingBag.cu +
+# EmbeddingBackwardKernel.cu). The op stably sorts the indices (`sorted`,
+# `perm` the original positions) and finds every run of equal indices
+# (the unique family: `run_start` / `run_last` of each position's run), then
+#
+#   EmbeddingBagPartials    one thread per (chunk of NROWS_PER_THREAD
+#                           consecutive entries of a run, feature) sums the
+#                           chunk (compute_grad_weight_bags): each entry adds
+#                           `grad[bag] (/ bag_size) * (1 / count) *
+#                           per_sample_weight` in the accumulator dtype
+#   EmbeddingBagSegmentSum  one thread per (run, feature) adds its chunks
+#                           in order (sum_and_scatter) and stores the row;
+#                           padding_idx and untouched rows stay 0.
+#
+# Positions that start no chunk / run return at once, so no thread visits
+# an untouched weight row.
 # ---------------------------------------------------------------------------
 
 comptime NROWS_PER_THREAD = 10
 
 
-@__name(t"embedding_bag_bwd_sorted_{dtype}_t{GS_THREADS}")
+@__name(t"embedding_bag_bwd_partials_{dtype}_t{GS_THREADS}")
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GS_THREADS))
 )
-def _embedding_bag_backward_kernel[
+def _partials_kernel[
     dtype: DType
 ](
-    grad_weight: Pointer[Scalar[dtype], MutAnyOrigin],
+    partials: Pointer[Scalar[_acc_dtype[dtype]()], MutAnyOrigin],
     grad: Pointer[Scalar[dtype], MutAnyOrigin],
-    sorted: Pointer[Int64, MutAnyOrigin],
     perm: Pointer[Int64, MutAnyOrigin],
+    gid: Pointer[Int64, MutAnyOrigin],
+    run_start: Pointer[Int64, MutAnyOrigin],
+    run_last: Pointer[Int64, MutAnyOrigin],
     offset2bag: Pointer[Int64, MutAnyOrigin],
     bag_size: Pointer[Int64, MutAnyOrigin],
     psw: Pointer[Scalar[dtype], MutAnyOrigin],
     num_indices: Int64,
-    num_weights: Int64,
     feature_size: Int64,
     mode_mean: Int64,
     has_psw: Int64,
     psw_stride: Int64,
     scale_by_freq: Int64,
-    padding_idx: Int64,
 ):
     comptime acc_t = _acc_dtype[dtype]()
     var features = Int(feature_size)
-    var n = Int(num_indices)
-    var total = Int(num_weights) * features
+    var total = Int(num_indices) * features
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var step = Int(grid_dim.x) * Int(block_dim.x)
     while i < total:
-        var row = i // features
-        var feature = i - row * features
-        var result = Scalar[acc_t](0)
-        if row != Int(padding_idx):
-            # [lo, hi): the run of `row` in the sorted indices.
-            var lo = 0
-            var hi = n
-            while lo < hi:
-                var mid = (lo + hi) >> 1
-                if Int(sorted[unsafe_offset=mid]) < row:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            var first = lo
-            hi = n
-            while lo < hi:
-                var mid = (lo + hi) >> 1
-                if Int(sorted[unsafe_offset=mid]) <= row:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            var last = lo
+        var pos = i // features
+        var feature = i - pos * features
+        var g_id = Int(gid[unsafe_offset=pos])
+        var first = Int(run_start[unsafe_offset=g_id])
+        if (pos - first) % NROWS_PER_THREAD == 0:
+            var stop = Int(run_last[unsafe_offset=g_id]) + 1
             var freq = Scalar[acc_t](1)
             if scale_by_freq != 0:
                 # CUDA's `1.0 / count` is a double quotient; Metal has no
                 # double, so it divides in the accumulator there.
                 comptime if has_apple_gpu_accelerator():
-                    freq = Scalar[acc_t](1) / Scalar[acc_t](last - first)
+                    freq = Scalar[acc_t](1) / Scalar[acc_t](stop - first)
                 else:
-                    freq = (1.0 / Float64(last - first)).cast[acc_t]()
-            var start = first
-            while start < last:
-                var partial = Scalar[acc_t](0)
-                for k in range(start, min(start + NROWS_PER_THREAD, last)):
-                    var orig = Int(perm[unsafe_offset=k])
-                    var bag = Int(offset2bag[unsafe_offset=orig])
-                    var scale = freq
-                    if has_psw != 0:
-                        scale *= psw[unsafe_offset=orig * Int(psw_stride)].cast[
-                            acc_t
-                        ]()
-                    var g = grad[unsafe_offset=bag * features + feature].cast[
+                    freq = (1.0 / Float64(stop - first)).cast[acc_t]()
+            var partial = Scalar[acc_t](0)
+            for k in range(pos, min(pos + NROWS_PER_THREAD, stop)):
+                var orig = Int(perm[unsafe_offset=k])
+                var bag = Int(offset2bag[unsafe_offset=orig])
+                var scale = freq
+                if has_psw != 0:
+                    scale *= psw[unsafe_offset=orig * Int(psw_stride)].cast[
                         acc_t
                     ]()
-                    if mode_mean != 0:
-                        g /= Scalar[acc_t](Int(bag_size[unsafe_offset=bag]))
-                    partial = g.fma(scale, partial)
-                result += partial
-                start += NROWS_PER_THREAD
-        grad_weight[unsafe_offset=i] = result.cast[dtype]()
+                var g = grad[unsafe_offset=bag * features + feature].cast[
+                    acc_t
+                ]()
+                if mode_mean != 0:
+                    g /= Scalar[acc_t](Int(bag_size[unsafe_offset=bag]))
+                partial = g.fma(scale, partial)
+            partials[unsafe_offset=i] = partial
         i += step
 
 
-def _embedding_bag_backward_go(
-    grad_weight_o: Arg,
-    grad_o: Arg,
-    sorted_o: Arg,
-    perm_o: Arg,
-    offset2bag_o: Arg,
-    bag_size_o: Arg,
-    psw_o: Arg,
-    # (num_indices, num_weights, feature_size, mode_mean, has_psw,
-    #  psw_stride, scale_by_freq, padding_idx)
+@__name(t"embedding_bag_bwd_segment_sum_{dtype}_t{GS_THREADS}")
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GS_THREADS))
+)
+def _segment_sum_kernel[
+    dtype: DType
+](
+    grad_weight: Pointer[Scalar[dtype], MutAnyOrigin],
+    partials: Pointer[Scalar[_acc_dtype[dtype]()], MutAnyOrigin],
+    sorted: Pointer[Int64, MutAnyOrigin],
+    gid: Pointer[Int64, MutAnyOrigin],
+    run_start: Pointer[Int64, MutAnyOrigin],
+    run_last: Pointer[Int64, MutAnyOrigin],
+    num_indices: Int64,
+    feature_size: Int64,
+    padding_idx: Int64,
+):
+    comptime acc_t = _acc_dtype[dtype]()
+    var features = Int(feature_size)
+    var total = Int(num_indices) * features
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var step = Int(grid_dim.x) * Int(block_dim.x)
+    while i < total:
+        var pos = i // features
+        var feature = i - pos * features
+        var g_id = Int(gid[unsafe_offset=pos])
+        var row = Int(sorted[unsafe_offset=pos])
+        if Int(run_start[unsafe_offset=g_id]) == pos and row != Int(
+            padding_idx
+        ):
+            var stop = Int(run_last[unsafe_offset=g_id]) + 1
+            var result = Scalar[acc_t](0)
+            var k = pos
+            while k < stop:
+                result += partials[unsafe_offset=k * features + feature]
+                k += NROWS_PER_THREAD
+            grad_weight[unsafe_offset=row * features + feature] = result.cast[
+                dtype
+            ]()
+        i += step
+
+
+def _p64(ptrs: Arg, k: Int) -> Pointer[Int64, MutAnyOrigin]:
+    return _make_ptr[DType.int64](
+        _raw_tuple_int(ptrs, k)
+    ).as_unsafe_any_origin()
+
+
+def _sorted_backward_go(
+    ptrs: Arg,
+    # (grad_weight, partials, grad, sorted, perm, gid, run_start, run_last,
+    #  offset2bag, bag_size, psw)
     params: Arg,
+    # (num_indices, feature_size, mode_mean, has_psw, psw_stride,
+    #  scale_by_freq, padding_idx, phase: 0 partials / 1 segment sum)
     dtype_o: Arg,
     ctx_o: Arg,
 ) raises:
     var dtype = _raw_dtype_int(dtype_o)
     var ctx = _raw_ctx(ctx_o)
-    var num_weights = _raw_tuple_int(params, 1)
-    var feature_size = _raw_tuple_int(params, 2)
+    var n = _raw_tuple_int(params, 0)
+    var f = _raw_tuple_int(params, 1)
+    var phase = _raw_tuple_int(params, 7)
     var handled = False
     comptime for dt in BAG_DTYPES:
         comptime if _dtype_arg_on[0, dt]():
@@ -508,21 +542,158 @@ def _embedding_bag_backward_go(
                 elif dt == DType.float64 and has_apple_gpu_accelerator():
                     raise Error("float64 is not supported on Apple GPU")
                 else:
-                    _enqueue_cached[_embedding_bag_backward_kernel[dt]](
+                    comptime acc_t = _acc_dtype[dt]()
+
+                    if phase == 0:
+                        _enqueue_cached[_partials_kernel[dt]](
+                            ctx,
+                            _gs_blocks(n * f),
+                            1,
+                            1,
+                            GS_THREADS,
+                            _make_ptr[acc_t](
+                                _raw_tuple_int(ptrs, 1)
+                            ).as_unsafe_any_origin(),
+                            _make_ptr[dt](
+                                _raw_tuple_int(ptrs, 2)
+                            ).as_unsafe_any_origin(),
+                            _p64(ptrs, 4),
+                            _p64(ptrs, 5),
+                            _p64(ptrs, 6),
+                            _p64(ptrs, 7),
+                            _p64(ptrs, 8),
+                            _p64(ptrs, 9),
+                            _make_ptr[dt](
+                                _raw_tuple_int(ptrs, 10)
+                            ).as_unsafe_any_origin(),
+                            Int64(n),
+                            Int64(f),
+                            Int64(_raw_tuple_int(params, 2)),
+                            Int64(_raw_tuple_int(params, 3)),
+                            Int64(_raw_tuple_int(params, 4)),
+                            Int64(_raw_tuple_int(params, 5)),
+                        )
+                    else:
+                        _enqueue_cached[_segment_sum_kernel[dt]](
+                            ctx,
+                            _gs_blocks(n * f),
+                            1,
+                            1,
+                            GS_THREADS,
+                            _make_ptr[dt](
+                                _raw_tuple_int(ptrs, 0)
+                            ).as_unsafe_any_origin(),
+                            _make_ptr[acc_t](
+                                _raw_tuple_int(ptrs, 1)
+                            ).as_unsafe_any_origin(),
+                            _p64(ptrs, 3),
+                            _p64(ptrs, 5),
+                            _p64(ptrs, 6),
+                            _p64(ptrs, 7),
+                            Int64(n),
+                            Int64(f),
+                            Int64(_raw_tuple_int(params, 6)),
+                        )
+    if not handled:
+        raise Error("EmbeddingBagBackwardSorted: unsupported dtype ", dtype)
+
+
+# ---------------------------------------------------------------------------
+# EmbeddingBagBackwardAtomic: the sum / mean weight gradient by atomics, the
+# default (nondeterministic) route, as CUDA's fused
+# compute_grad_weight_atomic_accumulate: one thread per (index, feature)
+# adds `grad[bag] (/ bag_size) * per_sample_weight / count` into an
+# accumulator-dtype buffer (float for the half types; the op casts it).
+# ---------------------------------------------------------------------------
+
+
+@__name(t"embedding_bag_bwd_atomic_{dtype}_t{GS_THREADS}")
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GS_THREADS))
+)
+def _embedding_bag_backward_atomic_kernel[
+    dtype: DType
+](
+    grad_weight: Pointer[Scalar[_acc_dtype[dtype]()], MutAnyOrigin],
+    grad: Pointer[Scalar[dtype], MutAnyOrigin],
+    indices: Pointer[Int64, MutAnyOrigin],
+    offset2bag: Pointer[Int64, MutAnyOrigin],
+    bag_size: Pointer[Int64, MutAnyOrigin],
+    psw: Pointer[Scalar[dtype], MutAnyOrigin],
+    counts: Pointer[Int64, MutAnyOrigin],
+    num_indices: Int64,
+    feature_size: Int64,
+    mode_mean: Int64,
+    has_psw: Int64,
+    psw_stride: Int64,
+    has_counts: Int64,
+    padding_idx: Int64,
+):
+    comptime acc_t = _acc_dtype[dtype]()
+    var features = Int(feature_size)
+    var total = Int(num_indices) * features
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var step = Int(grid_dim.x) * Int(block_dim.x)
+    while i < total:
+        var e = i // features
+        var feature = i - e * features
+        var row = Int(indices[unsafe_offset=e])
+        if row != Int(padding_idx):
+            var bag = Int(offset2bag[unsafe_offset=e])
+            var g = grad[unsafe_offset=bag * features + feature].cast[acc_t]()
+            if mode_mean != 0:
+                g /= Scalar[acc_t](Int(bag_size[unsafe_offset=bag]))
+            if has_psw != 0:
+                g *= psw[unsafe_offset=e * Int(psw_stride)].cast[acc_t]()
+            if has_counts != 0:
+                g /= Scalar[acc_t](Int(counts[unsafe_offset=row]))
+            _ = Atomic[Scalar[acc_t], scope=_atomic_scope()].fetch_add[
+                ordering=Ordering.RELAXED
+            ](grad_weight.unsafe_offset(row * features + feature), g)
+        i += step
+
+
+def _embedding_bag_backward_atomic_go(
+    grad_weight_o: Arg,
+    grad_o: Arg,
+    indices_o: Arg,
+    offset2bag_o: Arg,
+    bag_size_o: Arg,
+    psw_o: Arg,
+    counts_o: Arg,
+    # (num_indices, feature_size, mode_mean, has_psw, psw_stride,
+    #  has_counts, padding_idx)
+    params: Arg,
+    dtype_o: Arg,
+    ctx_o: Arg,
+) raises:
+    var dtype = _raw_dtype_int(dtype_o)
+    var ctx = _raw_ctx(ctx_o)
+    var n = _raw_tuple_int(params, 0)
+    var feature_size = _raw_tuple_int(params, 1)
+    var handled = False
+    comptime for dt in BAG_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                handled = True
+                comptime if not has_accelerator():
+                    raise Error("no GPU accelerator available at compile time")
+                elif dt == DType.float64 and has_apple_gpu_accelerator():
+                    raise Error("float64 is not supported on Apple GPU")
+                else:
+                    comptime acc_t = _acc_dtype[dt]()
+                    _enqueue_cached[_embedding_bag_backward_atomic_kernel[dt]](
                         ctx,
-                        _gs_blocks(num_weights * feature_size),
+                        _gs_blocks(n * feature_size),
                         1,
                         1,
                         GS_THREADS,
-                        _make_ptr[dt](
+                        _make_ptr[acc_t](
                             _raw_int(grad_weight_o)
                         ).as_unsafe_any_origin(),
                         _make_ptr[dt](_raw_int(grad_o)).as_unsafe_any_origin(),
                         _make_ptr[DType.int64](
-                            _raw_int(sorted_o)
-                        ).as_unsafe_any_origin(),
-                        _make_ptr[DType.int64](
-                            _raw_int(perm_o)
+                            _raw_int(indices_o)
                         ).as_unsafe_any_origin(),
                         _make_ptr[DType.int64](
                             _raw_int(offset2bag_o)
@@ -531,17 +702,29 @@ def _embedding_bag_backward_go(
                             _raw_int(bag_size_o)
                         ).as_unsafe_any_origin(),
                         _make_ptr[dt](_raw_int(psw_o)).as_unsafe_any_origin(),
-                        Int64(_raw_tuple_int(params, 0)),
-                        Int64(num_weights),
+                        _make_ptr[DType.int64](
+                            _raw_int(counts_o)
+                        ).as_unsafe_any_origin(),
+                        Int64(n),
                         Int64(feature_size),
+                        Int64(_raw_tuple_int(params, 2)),
                         Int64(_raw_tuple_int(params, 3)),
                         Int64(_raw_tuple_int(params, 4)),
                         Int64(_raw_tuple_int(params, 5)),
                         Int64(_raw_tuple_int(params, 6)),
-                        Int64(_raw_tuple_int(params, 7)),
                     )
     if not handled:
-        raise Error("EmbeddingBagBackwardSorted: unsupported dtype ", dtype)
+        raise Error("EmbeddingBagBackwardAtomic: unsupported dtype ", dtype)
+
+
+@always_inline
+def _atomic_scope() -> StaticString:
+    comptime if is_nvidia_gpu():
+        return "device"
+    elif is_amd_gpu():
+        return "agent"
+    else:
+        return ""
 
 
 @export
@@ -556,8 +739,13 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             )
             return 0
         comptime if _op_on["EmbeddingBagBackwardSorted"]():
+            _spec_dispatcher4[
+                _sorted_backward_go, "EmbeddingBagBackwardSorted"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["EmbeddingBagBackwardAtomic"]():
             _spec_dispatcher10[
-                _embedding_bag_backward_go, "EmbeddingBagBackwardSorted"
+                _embedding_bag_backward_atomic_go, "EmbeddingBagBackwardAtomic"
             ](argv, argc)
             return 0
         comptime if _op_on["EmbeddingRenorm"]():

@@ -56,6 +56,7 @@ from tmb.backend.abi import (
     ret_owned,
     ret_ref,
     alert_not_deterministic,
+    deterministic_algorithms,
     index_error,
     tensor_arg,
     unsupported,
@@ -1351,13 +1352,13 @@ def _reduce_launch(
     `idx_strides`). The bad-index report of `_scatter_launch` applies.
     `ordered` reduces each slot in index order (`_scatter_launch`).
 
-    `sorted_sums` (scatter_reduce / scatter): a floating sum, and a mean's
-    sum and count, take the sorted route, which accumulates in the opmath
-    type and stores the dtype once -- CUDA's deterministic
-    `_scatter_via_index_put` for both (`count.scatter_add_` included).
-    Without it (index_reduce) both are atomic adds in the dtype, as CUDA's
-    index_reduce and `counts.index_add_`: a half sum and its count saturate
-    together (1024 bfloat16 ones sum and count to 256, mean 1)."""
+    `sorted_sums` (scatter_reduce / scatter), under deterministic
+    algorithms: a floating sum, and a mean's sum and count, take the sorted
+    route, which accumulates in the opmath type and stores the dtype once
+    -- CUDA's `_scatter_via_index_put` for both (`count.scatter_add_`
+    included). Otherwise both are atomic adds in the dtype, as CUDA's
+    default kernels: a half sum and its count saturate together (1024
+    bfloat16 ones sum and count to 256, mean 1)."""
     var src_ptr = target.ptr
     var src_dtype = target.dtype
     var src_strides = List[Int]()
@@ -1389,7 +1390,10 @@ def _reduce_launch(
             not add,
         )
     var floating = target.dtype.is_floating_point()
-    if add and src and floating and sorted_sums and not ordered:
+    # CUDA's deterministic route only under deterministic algorithms (its
+    # default is dtype atomics: a half sum and count saturate together).
+    var by_sort = sorted_sums and floating and deterministic_algorithms()
+    if add and src and by_sort and not ordered:
         # A floating sum takes the sorted, ordered route CUDA takes under
         # deterministic algorithms (`_scatter_via_index_put`), always: the
         # result does not depend on the atomics' interleaving.
@@ -1429,7 +1433,7 @@ def _reduce_launch(
         return
     var counts = own(new_like(target))
     fill_value(counts.t, 1.0 if include_self else 0.0)
-    if floating and sorted_sums:
+    if by_sort:
         var one = own(
             new_tensor(
                 IndexList[MAX_RANK](1), 1, counts.t.stype, counts.t.device

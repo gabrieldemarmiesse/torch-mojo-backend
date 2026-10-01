@@ -8,17 +8,20 @@
 * _embedding_bag_backward -- ATen's generic `_embedding_bag_backward_symint`
   (native/EmbeddingBag.cpp): index promotion, offset2bag rebuilt when the
   forward did not return one, then the dense backward.
-* _embedding_bag_dense_backward -- sum / mean: a stable sort of the indices,
-  then `EmbeddingBagBackwardSorted`, CUDA's deterministic two-pass segment
-  sum (one thread per weight row and feature, CUDA's summation order); max
+* _embedding_bag_dense_backward -- sum / mean: by default
+  `EmbeddingBagBackwardAtomic` (atomics into an accumulator-dtype buffer,
+  CUDA's fused atomic route); under deterministic algorithms a stable sort
+  of the indices, their runs, then `EmbeddingBagBackwardSorted`, CUDA's
+  chunked two-pass segment sum in CUDA's summation order; max
   scatter_adds into the rows max_indices names (atomic, alerting like
   CUDA's embedding_bag_backward_cuda_max).
 * _embedding_bag_per_sample_weights_backward -- index_select / mul / sum:
   each product rounded to the dtype, summed in the accumulator, as CUDA.
 * embedding_renorm_ -- the indices are wrapped and made unique on the
   device (the unique group's sort route, one read of the count), then
-  `EmbeddingRenorm` rescales each row in place and flags an index out of
-  range (one more read; CUDA device-asserts instead).
+  the ends of the sorted unique rows are read to reject an index out of
+  range before any row changes (CUDA device-asserts instead), then
+  `EmbeddingRenorm` rescales each row in place.
 """
 from std.utils import IndexList
 
@@ -38,6 +41,7 @@ from tmb.backend.abi import (
     Values,
     alert_not_deterministic,
     cpu_empty,
+    deterministic_algorithms,
     dtype_code,
     index_error,
     new_tensor,
@@ -62,9 +66,9 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import call_op, cast_to, contiguous, fill_value
+from tmb.ops.common import call_op, cast_into, cast_to, contiguous, fill_value
 from tmb.ops.data_movement import _scalar_type_name
-from tmb.ops.unique import unique_flat
+from tmb.ops.unique import run_bounds, unique_flat
 
 comptime _MODE_SUM = 0
 comptime _MODE_MEAN = 1
@@ -534,22 +538,8 @@ def op_embedding_bag_dense_backward(
         fill_value(gw.t, 0.0)
         ret_owned(rets, 0, gw)
         return
-    # Stable sort of the indices (CUDA's radix_sort_pairs), then the
-    # deterministic per-row sum of EmbeddingBagBackwardSorted.
+    var n = indices.numel
     var idx = _as_int64(indices)
-    var r = call_op(
-        "aten::sort",
-        "stable",
-        [
-            _t(idx.t),
-            Value(TAG_BOOL, 0, 1, 0),
-            _int(0),
-            Value(TAG_BOOL, 0, 0, 0),
-        ],
-        2,
-    )
-    var sorted = own(r.take_tensor(0))
-    var perm = own(r.take_tensor(1))
     var o2b = _as_int64(offset2bag)
     var bs = _as_int64(bag_size)
     var g = own_if_new(contiguous(grad), grad)
@@ -565,32 +555,118 @@ def op_embedding_bag_dense_backward(
             )
         psw_ptr = psw.value().ptr
         psw_stride = psw.value().stride(0)
+    var mean = 1 if mode == _MODE_MEAN else 0
     var ctx = ctx_for(device)
-    var call = KernelCall("embedding_bag", "EmbeddingBagBackwardSorted")
-    call.arg_dtype(0, grad.dtype)
-    call.int(gw.t.ptr)
-    call.int(g.t.ptr)
-    call.int(sorted.t.ptr)
-    call.int(perm.t.ptr)
-    call.int(o2b.t.ptr)
-    call.int(bs.t.ptr)
-    call.int(psw_ptr)
-    call.tuple(
+    if not deterministic_algorithms():
+        # The default route: atomics into an accumulator-dtype buffer.
+        var acc = _acc_stype(grad)
+        var buf = _zeros(_mat(num_weights, features), 2, acc, device)
+        var counts = Optional[Owned](None)
+        if scale_grad_by_freq:
+            var z = _zeros(_vec(num_weights), 1, ST_INT64, device)
+            var ones = own(new_tensor(_vec(n), 1, ST_INT64, device))
+            fill_value(ones.t, 1.0)
+            counts = _op(
+                "aten::index_add",
+                "",
+                [_t(z.t), _int(0), _t(idx.t), _t(ones.t), _scalar(1)],
+            )
+            _ = ones^
+            _ = z^
+        var call = KernelCall("embedding_bag", "EmbeddingBagBackwardAtomic")
+        call.arg_dtype(0, grad.dtype)
+        call.int(buf.t.ptr)
+        call.int(g.t.ptr)
+        call.int(idx.t.ptr)
+        call.int(o2b.t.ptr)
+        call.int(bs.t.ptr)
+        call.int(psw_ptr)
+        call.int(counts.value().t.ptr if counts else 0)
+        call.tuple(
+            [
+                n,
+                features,
+                mean,
+                1 if psw else 0,
+                psw_stride,
+                1 if scale_grad_by_freq else 0,
+                padding_idx,
+            ]
+        )
+        call.int(dtype_code(grad.dtype))
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = counts^
+        if acc == grad.stype:
+            _ = gw^
+            ret_owned(rets, 0, buf)
+        else:
+            cast_into(gw.t, buf.t)
+            _ = buf^
+            ret_owned(rets, 0, gw)
+        _ = g^
+        _ = bs^
+        _ = o2b^
+        _ = idx^
+        _ = ctx
+        return
+    # Deterministic: a stable sort of the indices (CUDA's
+    # radix_sort_pairs), the runs of equal indices (the unique family), then
+    # CUDA's chunked two-pass segment sum.
+    fill_value(gw.t, 0.0)
+    var r = call_op(
+        "aten::sort",
+        "stable",
         [
-            indices.numel,
-            num_weights,
-            features,
-            1 if mode == _MODE_MEAN else 0,
-            1 if psw else 0,
-            psw_stride,
-            1 if scale_grad_by_freq else 0,
-            padding_idx,
-        ]
+            _t(idx.t),
+            Value(TAG_BOOL, 0, 1, 0),
+            _int(0),
+            Value(TAG_BOOL, 0, 0, 0),
+        ],
+        2,
     )
-    call.int(dtype_code(grad.dtype))
-    call.int(ctx_ptr(ctx))
-    call.run()
+    var sorted = own(r.take_tensor(0))
+    var perm = own(r.take_tensor(1))
+    var runs = run_bounds(sorted.t)
+    var partials = own(
+        new_tensor(_mat(n, features), 2, _acc_stype(grad), device)
+    )
+    for phase in range(2):
+        var call = KernelCall("embedding_bag", "EmbeddingBagBackwardSorted")
+        call.arg_dtype(0, grad.dtype)
+        call.tuple(
+            [
+                gw.t.ptr,
+                partials.t.ptr,
+                g.t.ptr,
+                sorted.t.ptr,
+                perm.t.ptr,
+                runs.gid.t.ptr,
+                runs.first.t.ptr,
+                runs.last.t.ptr,
+                o2b.t.ptr,
+                bs.t.ptr,
+                psw_ptr,
+            ]
+        )
+        call.tuple(
+            [
+                n,
+                features,
+                mean,
+                1 if psw else 0,
+                psw_stride,
+                1 if scale_grad_by_freq else 0,
+                padding_idx,
+                phase,
+            ]
+        )
+        call.int(dtype_code(grad.dtype))
+        call.int(ctx_ptr(ctx))
+        call.run()
     _ = ctx
+    _ = partials^
+    _ = runs^
     _ = g^
     _ = bs^
     _ = o2b^
@@ -714,15 +790,24 @@ def op_embedding_renorm_(
     var u = unique_flat(wrapped.t, False, False, False)
     _ = wrapped^
     var dev_rows = own(u[0].take())
+    # Every index is validated before any row is touched: the unique rows
+    # are sorted, so their ends are the extremes (two small reads).
+    var m = dev_rows.t.numel
+    if (
+        _read_int(dev_rows.t, 0) < 0
+        or _read_int(dev_rows.t, m - 1) >= num_weights
+    ):
+        index_error("embedding_renorm_: index out of bounds")
     var ctx = ctx_for(t.device)
     if t.dim(1) > 0:
+        # The kernel's own bounds flag is a guard only: never set here.
         var flag = _zeros(_vec(1), 1, ST_INT32, t.device)
         var call = KernelCall("embedding_bag", "EmbeddingRenorm")
         call.arg_dtype(0, t.dtype)
         call.int(t.ptr)
         call.int(dev_rows.t.ptr)
         call.int(flag.t.ptr)
-        call.int(dev_rows.t.numel)
+        call.int(m)
         call.int(num_weights)
         call.int(t.dim(1))
         call.int(t.stride(0))
@@ -732,8 +817,6 @@ def op_embedding_renorm_(
         call.int(dtype_code(t.dtype))
         call.int(ctx_ptr(ctx))
         call.run()
-        if _read_flags(flag.t)[0]:
-            index_error("embedding_renorm_: index out of bounds")
         _ = flag^
     _ = u^
     _ = dev_rows^
