@@ -32,6 +32,7 @@ from tmb.backend.abi import (
     dtype_code,
     dtype_itemsize,
     dtype_name,
+    is_dense,
     f64_bits,
     max_dtype,
     new_like,
@@ -143,16 +144,20 @@ def _repeats_elements(t: T) -> Bool:
 
 
 def assert_no_overlap(written: T, other: T) raises:
-    """`at::assert_no_overlap`: an `out=` tensor sharing any memory with an
-    input -- the identical view included -- raises before anything is
-    written. A view that repeats elements is what ATen's check calls
-    `TooHard` and lets through, and so does this one."""
+    """`at::assert_no_overlap` (ATen/MemoryOverlap.cpp): an `out=` tensor
+    sharing memory with an input -- the identical view included -- raises
+    before anything is written. As `get_overlap_status` decides it: a view
+    that is not non-overlapping-and-dense (a broadcast, or a strided view
+    such as `x[::2]`) is `TooHard` and lets the call through, so disjoint
+    interleaved views (`x[::2]` vs `x[1::2]`) are accepted, as in torch."""
     if written.numel == 0 or other.numel == 0:
         return
     var storage = written.storage_ptr()
     if storage == 0 or storage != other.storage_ptr():
         return
-    if _repeats_elements(written) or _repeats_elements(other):
+    if not (
+        written.contig or is_dense(written.shape, written.strides, written.rank)
+    ) or not (other.contig or is_dense(other.shape, other.strides, other.rank)):
         return
     var a_end = written.ptr + written.numel * written.itemsize
     var b_end = other.ptr + other.numel * other.itemsize

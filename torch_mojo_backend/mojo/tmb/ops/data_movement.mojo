@@ -1726,12 +1726,15 @@ def _scatter_launch(
         )
 
 
-# CUDA's warp size: index_put's sorted route rounds per addition for slices
-# wider than this (indexing_backward_kernel vs _small_stride / _stride_1).
-comptime _INDEX_PUT_WARP = 32
+def _index_put_warp(device: Int) raises -> Int:
+    """The warp of index_put's sorted route on this accelerator (32 on
+    CUDA, 64 on ROCm): it rounds per addition for slices wider than this
+    (indexing_backward_kernel vs _small_stride / _stride_1) and sums
+    width-1 runs with that many lanes."""
+    return 64 if ctx_for(device).api() == "hip" else 32
 
 
-def index_put_slice(target: T, index: T, dim: Int) raises -> Int:
+def index_put_slice(target: T, index: T, dim: Int) -> Int:
     """The `sliceSize` CUDA's deterministic `_scatter_via_index_put` hands
     index_put: the extent after `dim` when self is 1-D or the index is
     broadcast (stride 0) off `dim` (it indexes `dim` alone), else 1 (every
@@ -1839,10 +1842,9 @@ def scatter_add_sorted(
     sc.int(perm.t.ptr)
     sc.int(srcoff.t.ptr)
     sc.int(src.ptr)
-    var mode = 2 if slice_size > _INDEX_PUT_WARP else (
-        1 if slice_size > 1 else 0
-    )
-    sc.tuple([total, 0, mode])
+    var warp = _index_put_warp(target.device)
+    var mode = 2 if slice_size > warp else (1 if slice_size > 1 else 0)
+    sc.tuple([total, 0, mode, warp])
     sc.f64(0.0)
     sc.int(dtype_code(target.dtype))
     sc.int(ctx_ptr(ctx))
@@ -2822,8 +2824,11 @@ def op_index_put_impl_(
     var present = v_opt_tensor_list_present(args[unsafe_offset=1])
     var indices = v_tensor_list(args[unsafe_offset=1])
     var values = v_tensor(args[unsafe_offset=2])
-    # accumulate=True sums colliding writes with ScatterAddDim's atomics
-    # (unspecified order, like torch's CUDA index_put_ with accumulate).
+    # accumulate=True sums colliding writes with ScatterAddDim's atomics, in
+    # an unspecified order. CUDA's index_put_ with accumulate always takes
+    # its sorted route (`index_put_with_sort_kernel`, deterministic, with the
+    # per-slice-width rounding of `scatter_add_sorted`); matching it would
+    # put a sort on this hot path, so it is left as a known difference.
     var accumulate = v_bool(args[unsafe_offset=3])
     if (
         len(indices) == 1

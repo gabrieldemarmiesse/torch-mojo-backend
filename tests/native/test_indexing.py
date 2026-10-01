@@ -8,6 +8,7 @@ repeat_interleave self overloads). Public torch API only, compared against
 CPU torch; `ran` confirms the native kernel is what ran.
 """
 
+import numpy as np
 import pytest
 import torch
 
@@ -1341,3 +1342,108 @@ def test_deterministic_index_add_rounds_like_cuda(mojo_device, width, dtype):
     expected[0] = expected_value
     _check(got, expected)
     _check(sa, expected)
+
+
+def test_in_place_ops_accept_disjoint_strided_views(mojo_device):
+    """ATen's overlap check calls an interleaved view TooHard and lets it
+    through: x[::2] written from x[1::2] is valid."""
+    calls = [
+        lambda b, i: b[::2].scatter_add_(0, i, b[1::2]),
+        lambda b, i: b[::2].index_add_(0, i, b[1::2]),
+        lambda b, i: b[::2].scatter_(0, i, b[1::2]),
+        lambda b, i: b[::2].scatter_reduce_(0, i, b[1::2], "amax"),
+        lambda b, i: b[::2].index_reduce_(0, i, b[1::2], "prod"),
+    ]
+    for call in calls:
+        expected = torch.arange(10.0)
+        call(expected, torch.arange(5))
+        got = torch.arange(10.0, device=mojo_device)
+        call(got, torch.arange(5, device=mojo_device))
+        _check(got, expected)
+
+
+def test_fill_tensor_value_devices_and_overlap(mojo_device):
+    with pytest.raises(RuntimeError, match="more than one element"):
+        torch.zeros(1, device=mojo_device).expand(3).fill_(
+            torch.tensor(2.0, device=mojo_device)
+        )
+    x = torch.zeros(1, device=mojo_device).expand(3)
+    x.fill_(torch.tensor(2.0))  # a CPU value is fill_(Scalar): allowed
+    assert x.cpu().tolist() == [2.0, 2.0, 2.0]
+
+
+@pytest.mark.skipif(
+    len(
+        [
+            a
+            for a in __import__("torch_mojo_backend").get_accelerators()
+            if a.label != "cpu"
+        ]
+    )
+    < 2,
+    reason="needs two mojo GPUs",
+)
+def test_fill_tensor_value_on_another_gpu_is_range_checked():
+    x = torch.zeros(3, dtype=torch.int8, device="mojo:0")
+    with pytest.raises(RuntimeError, match="without overflow"):
+        x.fill_(torch.tensor(300, device="mojo:1"))
+
+
+def _index_put_sum_reference(values: list[float], start: float, width: int) -> float:
+    """CUDA's sorted index_put accumulation of one float32 run into `start`:
+    width 1 sums 32 lanes and a shuffle-down tree (indexing_backward_kernel_
+    stride_1), widths up to 32 sum sequentially from 0 (_small_stride); both
+    then add the sum to `start` once."""
+    f = np.float32
+    acc = f(0)
+    j = 0
+    if width == 1:
+        passes = len(values) // 32
+        if passes:
+            lanes = [f(0)] * 32
+            for p in range(passes):
+                for lane in range(32):
+                    lanes[lane] = f(lanes[lane] + f(values[p * 32 + lane]))
+            offset = 16
+            while offset:
+                lanes = [
+                    f(
+                        lanes[lane]
+                        + (lanes[lane + offset] if lane + offset < 32 else lanes[lane])
+                    )
+                    for lane in range(32)
+                ]
+                offset //= 2
+            acc = lanes[0]
+        j = passes * 32
+    for v in values[j:]:
+        acc = f(acc + f(v))
+    return float(f(f(start) + acc))
+
+
+@pytest.mark.parametrize("width", [1, 8])
+def test_deterministic_index_add_float32_order_is_cuda_s(mojo_device, width):
+    """Random float32 values pin the summation order, not just the rounding."""
+    if is_metal(mojo_device):
+        pytest.skip("the lane tree is CUDA's warp (Metal has no warp-size rule here)")
+    g = torch.Generator().manual_seed(2)
+    n = 1000
+    base = torch.randn(2, width, generator=g)
+    src = torch.randn(n, width, generator=g) * 7
+    idx = torch.zeros(n, dtype=torch.long)
+    before = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        got = (
+            base.to(mojo_device)
+            .index_add(0, idx.to(mojo_device), src.to(mojo_device))
+            .cpu()
+        )
+    finally:
+        torch.use_deterministic_algorithms(before)
+    for c in range(width):
+        expected = _index_put_sum_reference(
+            src[:, c].tolist(), base[0, c].item(), width
+        )
+        assert got[0, c].item() == expected
+    assert torch.equal(got[1], base[1])
