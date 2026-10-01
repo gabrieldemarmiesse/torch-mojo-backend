@@ -217,8 +217,14 @@ def _bn_operands_nhwc(
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", BN_SHAPES)
 @pytest.mark.bench_op("native_batch_norm")
+@pytest.mark.parametrize("layout", ("channels_last",))
 def test_batch_norm_nhwc(
-    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
 ):
     refs, ours = _bn_operands_nhwc(shape_id, dtype_id, hw, mojo_device)
     bench.run(
@@ -231,8 +237,14 @@ def test_batch_norm_nhwc(
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", BN_SHAPES)
 @pytest.mark.bench_op("_native_batch_norm_legit_no_training")
+@pytest.mark.parametrize("layout", ("channels_last",))
 def test_batch_norm_inference_nhwc(
-    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
 ):
     refs, ours = _bn_operands_nhwc(shape_id, dtype_id, hw, mojo_device)
     bench.run(
