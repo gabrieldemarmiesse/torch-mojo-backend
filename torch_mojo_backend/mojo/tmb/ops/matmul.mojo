@@ -72,7 +72,7 @@ from tmb.backend.abi import (
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall, loader
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.binary import Res, _b_tside
+from tmb.ops.binary import Res, _b_no_partial_overlap, _b_tside
 from tmb.ops.common import (
     assert_no_internal_overlap,
     call_op_raw,
@@ -1746,6 +1746,20 @@ def _check_dest(dest: T, stype: Int32, like: T) raises:
     check_out_as(dest, stype, like)
 
 
+def _self_partial_overlap(dest: T, self: T, dims: List[Int]) raises:
+    """`result.copy_(self.expand(dims))`'s `assert_no_partial_overlap`: a
+    self that broadcasts (a stride-0 dimension) is ATen's `TooHard` case
+    and passes; checked once `dest` has the result's shape."""
+    if not _has_dims(dest, dims):
+        return
+    var r = len(dims)
+    for i in range(r):
+        var d = i - (r - self.rank)
+        if dims[i] > 1 and (d < 0 or self.dim(d) == 1):
+            return
+    _b_no_partial_overlap(dest, self)
+
+
 def _dest_overlap(dest: Optional[T], dims: List[Int]) raises:
     """`assert_no_internal_overlap` of the tensor written, as the structured
     kernels run it: after the meta's resize, so only a destination that
@@ -2361,6 +2375,9 @@ def _baddbmm_run(
     ts.append(b1.copy())
     ts.append(b2.copy())
     _check_same_device(ts)
+    if dest and not _raw_zero(beta_v):
+        # the meta's `result.copy_(self)`
+        _self_partial_overlap(dest.value(), self, dims)
     var zero = _unit(b1.stype, 0)
     var alpha = zero
     var beta = zero
@@ -2546,8 +2563,11 @@ def op_baddbmm_dtype_out(
 # --- aten::addbmm -------------------------------------------------------------
 
 
-def _addbmm_checks(self: T, b1: T, b2: T) raises -> List[Int]:
-    """addbmm_impl_ (LinearAlgebra.cpp) and the addmm_ it runs per batch."""
+def _addbmm_checks(self: T, b1: T, b2: T, result_st: Int32) raises -> List[Int]:
+    """addbmm_impl_ (LinearAlgebra.cpp) and the addmm_ it runs per batch
+    into `result` (self's dtype for the functional form, the caller's `out`
+    otherwise): only a batch's addmm_ compares dtypes, so an empty batch
+    list takes any, and self is merely copied (cast) into the result."""
     if b1.rank != 3:
         raise Error("batch1 must be a 3D tensor")
     if b2.rank != 3:
@@ -2573,10 +2593,12 @@ def _addbmm_checks(self: T, b1: T, b2: T) raises -> List[Int]:
         )
     var dims: List[Int] = [b1.dim(1), b2.dim(2)]
     _check_expand(self, dims, "addbmm_out")
-    if self.stype != b2.stype:
+    if b1.dim(0) == 0:
+        return dims^
+    if result_st != b2.stype:
         raise Error(
             "self and mat2 must have the same dtype, but got ",
-            _scalar_type_name(self.dtype),
+            _scalar_type_name(max_dtype(result_st)),
             " and ",
             _scalar_type_name(b2.dtype),
         )
@@ -2628,21 +2650,25 @@ def _addbmm_run(
     var k = b1.dim(2)
     var n = b2.dim(2)
     _dest_overlap(dest, dims)
-    var alpha = _unit(b1.stype, 0)
+    # `result.copy_(self)`: self cast into the result's dtype first.
+    var rst = dest.value().stype if dest else self.stype
+    var cast_self = own_if_new(cast_to(self, rst), self)
+    var addend = Optional[T](cast_self.t.copy())
+    var alpha = _unit(rst, 0)
     var beta = alpha
     if nb == 0:
         if m * n > 0 and not _raw_zero(beta_v):
-            beta = _mul_scalar(beta_v, self.stype)
+            beta = _mul_scalar(beta_v, rst)
     else:
         # The first batch's addmm_ (its k == 0 shortcut included).
-        var coefs = _coefs(alpha_v, beta_v, b1.stype, self.stype, m * n, k)
+        var coefs = _coefs(alpha_v, beta_v, b1.stype, rst, m * n, k)
         alpha = coefs[0]
         beta = coefs[1]
     if nb > 0 and not is_int_stype(b1.stype):
         var a0 = own(_batch_matrix(b1, 0))
         var c0 = own(_batch_matrix(b2, 0))
         var first = _blas(
-            Optional[T](self.copy()),
+            addend,
             a0.t,
             c0.t,
             alpha,
@@ -2671,6 +2697,7 @@ def _addbmm_run(
                 _ = ai^
                 _ = ci^
         _hand_back(rets, dest, Res(acc.take(), True), dims, ACT_NONE)
+        _ = cast_self^
         return
     # batch1 as [m, B, k] (a permuted view), made dense, then [m, B*k].
     var pshape = IndexList[MAX_RANK](1)
@@ -2688,12 +2715,12 @@ def _addbmm_run(
     var b2v = own(_view(b_dense.t, [nb * k, n]))
     _blas_out(
         rets,
-        Optional[T](self.copy()),
+        addend,
         a2.t,
         b2v.t,
         alpha,
         beta,
-        b1.stype,
+        rst,
         dims,
         dest,
     )
@@ -2702,6 +2729,7 @@ def _addbmm_run(
     _ = a_dense^
     _ = b_dense^
     _ = perm^
+    _ = cast_self^
 
 
 # aten::addbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1,
@@ -2710,7 +2738,7 @@ def op_addbmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = v_tensor(args[unsafe_offset=0])
     var b1 = v_tensor(args[unsafe_offset=1])
     var b2 = v_tensor(args[unsafe_offset=2])
-    var dims = _addbmm_checks(self, b1, b2)
+    var dims = _addbmm_checks(self, b1, b2, self.stype)
     _addbmm_run(
         rets,
         self,
@@ -2731,8 +2759,7 @@ def op_addbmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var b1 = v_tensor(args[unsafe_offset=1])
     var b2 = v_tensor(args[unsafe_offset=2])
     var dest = v_tensor(args[unsafe_offset=5])
-    var dims = _addbmm_checks(self, b1, b2)
-    _check_dest(dest, self.stype, self)  # `result.resize_as_(self)`
+    var dims = _addbmm_checks(self, b1, b2, dest.stype)
     _addbmm_run(
         rets,
         self,
@@ -2754,7 +2781,7 @@ def op_addbmm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # Composite in ATen (`addbmm_out(self, ..., self)`): a broadcastable
     # self is computed fresh, then resized to the result and written; a
     # self already of the result's shape is accumulated in place.
-    var dims = _addbmm_checks(self, b1, b2)
+    var dims = _addbmm_checks(self, b1, b2, self.stype)
     _addbmm_run(
         rets,
         self,
@@ -2829,6 +2856,36 @@ def _addmv_run(
     strides[MAX_RANK - 2] = vec.stride(0)
     strides[MAX_RANK - 1] = 1
     var col = own(view_strided(vec, shape, strides, 2, vec.offset))
+    var beta_zero = _raw_zero(beta_v)
+    if dest and not beta_zero:
+        # `copy_(result, self_)` / `mul_out(result, self, beta)` assert the
+        # self being read does not partially overlap the result.
+        _self_partial_overlap(dest.value(), self, [mat.dim(0)])
+    if mat.numel == 0 and not beta_zero:
+        # addmv_out_cuda's empty-matrix shortcut: `mul_out(result, self,
+        # scalar_tensor(beta, self.scalar_type()))` -- the result takes
+        # self's own (unexpanded) shape.
+        var coefs0 = _coefs(alpha_v, beta_v, mat.stype, self.stype, 1, 0)
+        var sdims = self.logical_shape()
+        _dest_overlap(dest, sdims)
+        var none = _none_side()
+        var compute = self.stype
+        if is_float_stype(compute) and compute != ST_FLOAT64:
+            compute = ST_FLOAT32
+        var res = _pw_run(
+            "blas_scale",
+            1,
+            _b_tside(self),
+            none,
+            none.copy(),
+            compute,
+            self.stype,
+            _p(coefs0[1].param()),
+            None,
+        )
+        _hand_back(rets, dest, res^, sdims, ACT_NONE)
+        _ = col^
+        return
     var coefs = _coefs(
         alpha_v, beta_v, mat.stype, self.stype, mat.dim(0), mat.numel, True
     )
@@ -3035,7 +3092,7 @@ def op_weight_int8pack_mm(
     var m = x.dim(0)
     var n = w.dim(0)
     var k = x.dim(1)
-    if m == 0 or n == 0 or k == 0:
+    if m == 0 or n == 0:
         var r = own(_zeros([m, n], x.stype, x.device))
         ret_owned(rets, 0, r)
         return
@@ -3054,7 +3111,12 @@ def op_weight_int8pack_mm(
             None,
         ).t.copy()
     )
-    var p = _spec_matmul("MatmulSpec", x32.t, w32.t, None, 1)
+    # k == 0: a zero accumulator, still scaled (a NaN / inf scale gives NaN).
+    var p: Optional[T]
+    if k == 0:
+        p = Optional[T](_zeros([m, n], ST_FLOAT32, x.device))
+    else:
+        p = _spec_matmul("MatmulSpec", x32.t, w32.t, None, 1)
     _ = x32^
     _ = w32^
     if not p:
