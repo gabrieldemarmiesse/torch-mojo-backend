@@ -761,3 +761,35 @@ def test_batch_norm_elemt_mixed_statistic_dtypes(mojo_device):
     )
     want = torch.full(x.shape, 100.0 * 1.0001 - 100.0).half()
     torch.testing.assert_close(got.cpu(), want)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("offset", [0, 16, 3])
+def test_batch_norm_channels_last_c16_storage_offset(mojo_device, dtype, offset):
+    """C = 16 takes the vectorized NHWC pass for every dtype (v4 / v8) when
+    the base is aligned, the scalar one otherwise; inference also emits the
+    saved statistics from that pass."""
+    x, w, b, rm, rv = _bn_inputs((3, 16, 5, 7), dtype)
+    xcl = _cl(x)
+    base = torch.zeros(offset + xcl.numel(), dtype=dtype)
+    xo = base.as_strided(xcl.shape, xcl.stride(), offset)
+    xo.copy_(xcl)
+    w32, b32 = w.float(), b.float()
+    rm32, rv32 = rm.float(), rv.float()
+    want = aten.native_batch_norm(xcl.float(), w32, b32, rm32, rv32, False, 0.1, 1e-5)
+    xd = base.to(mojo_device).as_strided(xcl.shape, xcl.stride(), offset)
+    got = aten.native_batch_norm(
+        xd, *_to(mojo_device, w32, b32, rm32, rv32), False, 0.1, 1e-5
+    )
+    assert got[0].stride() == xcl.stride()
+    _close(got[0], want[0].to(dtype), dtype)
+    _close(got[1], rm32)
+    _close(got[2], (rv32 + 1e-5).rsqrt())
+    rmd, rvd = _to(mojo_device, rm32.clone(), rv32.clone())
+    want_t = aten.native_batch_norm(
+        xcl.float(), w32, b32, rm32.clone(), rv32.clone(), True, 0.1, 1e-5
+    )
+    got_t = aten.native_batch_norm(
+        xd, *_to(mojo_device, w32, b32), rmd, rvd, True, 0.1, 1e-5
+    )
+    _close(got_t[0], want_t[0].to(dtype), dtype)

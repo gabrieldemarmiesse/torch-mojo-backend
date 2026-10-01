@@ -25,6 +25,7 @@ from tmb.backend.abi import (
     TAG_BOOL_LIST,
     TAG_DTYPE,
     TAG_INT_LIST,
+    TAG_MEMORY_FORMAT,
     TAG_NONE,
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
@@ -1369,6 +1370,32 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     ret_owned(rets, 2, save_invstd)
 
 
+def _nchw_copy(a: T, channels: Int, hxw: Int) raises -> Held:
+    """A dense channels-last `a` copied to contiguous NCHW for the
+    statistics kernels. Viewed as `[N, C, HxW]` with strides
+    `(N-stride, 1, C)` the copy is a batched 2-D transpose, which the
+    strided-copy family runs as a tiled transpose; the rank-4 view would take
+    the generic element-at-a-time copy."""
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 3] = a.dim(0)
+    shape[MAX_RANK - 2] = channels
+    shape[MAX_RANK - 1] = hxw
+    var strides = IndexList[MAX_RANK](0)
+    strides[MAX_RANK - 3] = a.stride(0)
+    strides[MAX_RANK - 2] = 1
+    strides[MAX_RANK - 1] = channels
+    var src = own(view_strided(a, shape, strides, 3, a.offset))
+    # Through aten::clone, whose contiguous copy picks the tiled transpose.
+    var r = call_op(
+        String("aten::clone"),
+        String(""),
+        [tensor_arg(src.t), Value(TAG_MEMORY_FORMAT, 0, 0, 0)],
+        1,
+    )
+    _ = src^
+    return Held(r.take_tensor(0), True)
+
+
 def _bn_out_alloc(a: T, out_cl: Bool) raises -> T:
     """The batch-norm output, laid out as CUDA's `empty_like(input)` for a
     channels-last input (the elementwise kernel writes it in place), else
@@ -1476,8 +1503,8 @@ def _bn_training(args: Values, rets: Values) raises:
     for i in range(2, a.rank):
         hxw *= a.dim(i)
     var runs = a.dim(0)
-    var am = _mat(a)
     var out_cl = is_channels_last_layout(a)
+    var am = _nchw_copy(a, channels, hxw) if out_cl else _mat(a)
     var out = own(_bn_out_alloc(a, out_cl))
     var save_mean = own(_channel_vec(channels, ST_FLOAT32, a.device))
     var save_invstd = own(_channel_vec(channels, ST_FLOAT32, a.device))
