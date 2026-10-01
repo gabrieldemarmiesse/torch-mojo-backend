@@ -450,6 +450,10 @@ class TestOpInfoConformance(TestCase):
                 placement = placements[index]
             moved = _to_device(sample, device, placement)
             actual = op(moved.input, *moved.args, **moved.kwargs)
+            # A `non_blocking=True` download (`to`'s samples) hands back a
+            # host tensor whose copy is still in flight; reading it before a
+            # sync is a race on any accelerator, CUDA included.
+            torch.accelerator.synchronize()
             expected = op(sample.input, *sample.args, **sample.kwargs)
             if (
                 (op.formatted_name, dtype) in _FP64_ANCHORED

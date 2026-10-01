@@ -30,6 +30,7 @@ from tmb.backend.abi import (
     ST_INT32,
     ST_INT64,
     TAG_NONE,
+    TAG_DEVICE,
     TAG_INT_LIST,
     TAG_BOOL,
     TAG_SCALAR_DOUBLE,
@@ -66,6 +67,8 @@ from tmb.backend.abi import (
     strides_for_memory_format,
     unsupported,
     tensor_arg,
+    bool_arg,
+    none_arg,
     v_bool,
     v_device_index,
     v_bool_or,
@@ -517,6 +520,19 @@ def _download_to_cpu(
     return out.take()
 
 
+def _download_to_cpu_as(
+    t: T, stype: Int32, want: IndexList[MAX_RANK]
+) raises -> T:
+    """`t` cast to `stype` and laid out in `want`'s order, on the host
+    (blocking)."""
+    var staged = own(_to_copy_same_device(t, stype, want))
+    var host = own(_download_to_cpu(staged.t))
+    _ = staged^
+    if not strides_equal(want, contiguous_strides(t.shape, t.rank), t.rank):
+        set_sizes_strides(host.t, t.shape, want, t.rank, 0)
+    return host.take()
+
+
 def _upload_cross_device(t: T, target_device: Int) raises -> T:
     var out = own(new_tensor(t.shape, t.rank, t.stype, target_device))
     copy_between_devices(out.t, t)
@@ -648,9 +664,33 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         and dev_type != DEVICE_TYPE_CPU
         and dev_type != DEVICE_TYPE_PRIVATEUSE1
     ):
-        unsupported(
-            "aten::_to_copy to a device type this backend does not know"
+        # Another backend's device (`cuda` on a CUDA wheel): the
+        # PrivateUse1 key outranks it, so a mojo -> cuda move lands here.
+        # Bounce through the host: our own download, then that backend's
+        # `_to_copy` from the CPU.
+        if not t.on_mojo():
+            unsupported(
+                "aten::_to_copy to a device type this backend does not know"
+            )
+        var on_host = own(_download_to_cpu_as(t, stype, want))
+        var moved = call_op(
+            "aten::_to_copy",
+            "",
+            [
+                tensor_arg(on_host.t),
+                none_arg(),
+                layout^,
+                dev_v^,
+                args[unsafe_offset=4].copy(),
+                args[unsafe_offset=5].copy(),
+                args[unsafe_offset=6].copy(),
+            ],
+            1,
         )
+        _ = on_host^  # read by the call above
+        var foreign = own(moved.take_tensor(0))
+        ret_owned(rets, 0, foreign)
+        return
 
     if (
         t.on_mojo()
@@ -678,7 +718,35 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # key) -- so a plain `cpu_tensor.to(mojo_device)` lands here just
         # like a same-device dtype cast does.
         if not t.on_cpu():
-            unsupported("aten::_to_copy from a non-cpu, non-mojo device")
+            # Another backend's tensor (`cuda` on a CUDA wheel) moving onto
+            # the mojo device: that backend's `_to_copy` brings it to the
+            # host (cast and laid out there), then one upload.
+            if dev_type != DEVICE_TYPE_PRIVATEUSE1:
+                unsupported("aten::_to_copy from a non-cpu, non-mojo device")
+            var on_host = call_op(
+                "aten::_to_copy",
+                "",
+                [
+                    tensor_arg(t),
+                    args[unsafe_offset=1].copy(),
+                    layout^,
+                    Value(TAG_DEVICE, 0, Int64(DEVICE_TYPE_CPU), -1),
+                    none_arg(),
+                    bool_arg(False),
+                    args[unsafe_offset=6].copy(),
+                ],
+                1,
+            )
+            var host = own(on_host.take_tensor(0))
+            var up = own(
+                _upload_from_cpu(
+                    host.t, host.t.stype, v_device_index(dev_v), non_blocking
+                )
+            )
+            _ = host^  # read by the upload above
+            var landed = own(_relayout_owned(up^, want))
+            ret_owned(rets, 0, landed)
+            return
         if dev_type != DEVICE_TYPE_PRIVATEUSE1:
             raise Error(
                 "aten::_to_copy: self is a cpu tensor with no mojo target"
