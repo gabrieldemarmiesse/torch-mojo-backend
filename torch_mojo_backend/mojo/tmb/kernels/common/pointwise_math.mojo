@@ -2560,6 +2560,40 @@ def _gamma_grads[
 
 
 @always_inline
+def _blas_epilogue[
+    kind: StaticString, dtype: DType, n: Int
+](
+    a: SIMD[dtype, n], b: SIMD[dtype, n], p: SIMD[param_dtype[dtype](), 4]
+) -> SIMD[
+    DType.float64 if dtype
+    == DType.float64 else (dtype if dtype.is_integral() else DType.float32),
+    n,
+]:
+    """The BLAS epilogue of the addmm family (tmb/ops/matmul.mojo): `a` is
+    the GEMM product, `b` the addend, p0 = alpha, p1 = beta.
+
+    blas_scale: alpha * a (beta == 0: the addend is never read, so a NaN or
+    inf in it does not propagate, as cuBLAS's beta == 0 promises).
+    blas_axpby: alpha * a + beta * b, cuBLAS's `alpha * acc + beta * C` in the
+    compute type (float for float/half, double for double), rounded once by
+    the caller's cast. Integer dtypes compute in scalar_t like CPU torch's
+    gemm (wrapping)."""
+    comptime w = DType.float64 if dtype == DType.float64 else (
+        dtype if dtype.is_integral() else DType.float32
+    )
+    comptime if dtype.is_integral():
+        var r = a.cast[w]() * SIMD[w, n](p[0].cast[w]())
+        comptime if kind == "blas_axpby":
+            r = r + b.cast[w]() * SIMD[w, n](p[1].cast[w]())
+        return r
+    else:
+        var r = a.cast[w]() * SIMD[w, n](p[0].cast[w]())
+        comptime if kind == "blas_axpby":
+            r = SIMD[w, n](p[1].cast[w]()).fma(b.cast[w](), r)
+        return r
+
+
+@always_inline
 def pointwise[
     kind: StaticString, dtype: DType, out_dtype: DType, n: Int
 ](
@@ -2595,6 +2629,25 @@ def pointwise[
         return _dirichlet_ratio(a, b).cast[out_dtype]()
     elif kind == "add_relu":
         return _add_relu(a, b, p).cast[out_dtype]()
+    elif kind == "int4_nibble":
+        # aten::_weight_int4pack_mm's unpacking (tmb/ops/matmul.mojo): a is
+        # a packed byte, b is 0 for its high nibble (the even k) and 1 for
+        # its low one.
+        comptime assert dtype.is_integral(), "int4_nibble unpacks bytes"
+        var hi = a >> 4
+        var lo = a & SIMD[dtype, n](15)
+        return b.eq(0).select(hi, lo).cast[out_dtype]()
+    elif kind == "int4_dequant":
+        # tinygemm's dequantization (cuda/int4mm.cu): (q - 8) * scale +
+        # zero as one fma, rounded once to the activation dtype.
+        comptime w = DType.float64 if dtype == DType.float64 else DType.float32
+        return (a.cast[w]() - 8).fma(b.cast[w](), c.cast[w]()).cast[out_dtype]()
+    elif kind == "widen":
+        # A plain conversion for dtype pairs the cast kernel does not build
+        # (int8 -> float32 for aten::_weight_int8pack_mm): exact widening.
+        return a.cast[out_dtype]()
+    elif kind == "blas_scale" or kind == "blas_axpby":
+        return _blas_epilogue[kind](a, b, p).cast[out_dtype]()
     elif (
         kind == "prelu"
         or kind == "prelu_backward_input"

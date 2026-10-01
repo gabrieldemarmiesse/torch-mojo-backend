@@ -294,13 +294,24 @@ def test_mm_degenerate_dims(mojo_device, dtype):
         torch.testing.assert_close(got, (ra @ rb).to(dtype), atol=5e-2, rtol=5e-2)
 
 
-def test_mm_unsupported_dtype_raises(mojo_device):
-    """Integer matmul has no kernel in this family: the op declines, and the
-    decline reaches python as NotImplementedError (never a wrong answer)."""
-    a = torch.arange(6, dtype=torch.int64).reshape(2, 3).to(mojo_device)
-    b = torch.arange(6, dtype=torch.int64).reshape(3, 2).to(mojo_device)
-    with pytest.raises(NotImplementedError):
-        torch.mm(a, b)
+@pytest.mark.parametrize("dtype", [torch.int64, torch.int32, torch.int8, torch.uint8])
+def test_mm_integer_dtypes_are_exact(mojo_device, dtype):
+    """CPU torch's integer mm / bmm: an integer accumulator, wrapping like
+    the CPU's (int8 products overflow the int8 result on purpose)."""
+    generator = torch.Generator().manual_seed(0)
+    hi = 100 if dtype in (torch.int8, torch.uint8) else 1000
+    a = torch.randint(0, hi, (37, 53), dtype=dtype, generator=generator)
+    b = torch.randint(0, hi, (53, 29), dtype=dtype, generator=generator)
+    with assert_ran("aten::mm"):
+        got = torch.mm(a.to(mojo_device), b.to(mojo_device)).cpu()
+    assert torch.equal(got, torch.mm(a, b))
+    a3 = torch.randint(0, hi, (3, 17, 9), dtype=dtype, generator=generator)
+    b3 = torch.randint(0, hi, (3, 9, 33), dtype=dtype, generator=generator)
+    got3 = torch.bmm(
+        a3.to(mojo_device),
+        b3.to(mojo_device).transpose(1, 2).contiguous().transpose(1, 2),
+    )
+    assert torch.equal(got3.cpu(), torch.bmm(a3, b3))
 
 
 # --- bmm ----------------------------------------------------------------------
@@ -396,16 +407,296 @@ def test_addr_half_is_bit_identical_to_cpu(mojo_gpu: str, dtype, beta, alpha):
     assert torch.equal(got.cpu(), torch.addr(a, b, c, beta=beta, alpha=alpha))
 
 
-def test_addmm_scaled_declines(mojo_device):
-    """beta/alpha scaling is not implemented by this family; the decline is a
-    NotImplementedError, not a silently dropped scale."""
-    bias = torch.randn(8).to(mojo_device)
-    a = torch.randn(4, 6).to(mojo_device)
-    b = torch.randn(6, 8).to(mojo_device)
-    with pytest.raises(NotImplementedError):
-        torch.addmm(bias, a, b, beta=0.5)
-    with pytest.raises(NotImplementedError):
-        torch.addmm(bias, a, b, alpha=2.0)
+# --- the BLAS family: alpha / beta, out=, in-place, .dtype, empty -----------
+
+
+def _cuda_like(beta, c, alpha, product64, dtype):
+    """cuBLAS's `alpha * acc + beta * C` in float32 (double for double) from
+    an exactly accumulated product, rounded once to `dtype`."""
+    w = torch.float64 if dtype == torch.float64 else torch.float32
+    acc = product64.to(w)
+    res = alpha * acc
+    if beta != 0:
+        res = res + beta * c.to(w)
+    return res.to(dtype)
+
+
+def _close(got: torch.Tensor, ref: torch.Tensor):
+    """One ulp of the result dtype (summation order), else fp32 accuracy."""
+    if got.dtype in (torch.float16, torch.bfloat16):
+        torch.testing.assert_close(got.cpu(), ref, atol=1e-2, rtol=1e-2)
+    else:
+        torch.testing.assert_close(got.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+
+BLAS_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
+BLAS_SCALES = [(1, 1), (0.6, 0.2), (0, 0.5), (0.5, 0), (2, -1.5)]
+
+
+@pytest.mark.parametrize("dtype", BLAS_DTYPES)
+@pytest.mark.parametrize("beta,alpha", BLAS_SCALES)
+@pytest.mark.parametrize("self_shape", [(29,), (19, 29), (1,), (), (19, 1)])
+def test_addmm_alpha_beta(mojo_device, dtype, beta, alpha, self_shape):
+    generator = torch.Generator().manual_seed(1)
+    c = torch.randn(self_shape, generator=generator).to(dtype)
+    a = torch.randn(19, 37, generator=generator).to(dtype)
+    b = torch.randn(37, 29, generator=generator).to(dtype)
+    ref = _cuda_like(beta, c, alpha, a.double() @ b.double(), dtype)
+    dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
+    with assert_ran("aten::addmm"):
+        got = torch.addmm(dc, da, db, beta=beta, alpha=alpha)
+    _close(got, ref)
+    out = torch.empty(0, dtype=dtype, device=mojo_device)
+    assert torch.addmm(dc, da, db, beta=beta, alpha=alpha, out=out) is out
+    _close(out, ref)
+    # a transposed, offset out: written where it lives, never re-laid out
+    base = torch.zeros(2, 29, 19, dtype=dtype, device=mojo_device)
+    view = base[1].t()
+    torch.addmm(dc, da, db, beta=beta, alpha=alpha, out=view)
+    _close(view, ref)
+    assert base[0].abs().sum().item() == 0
+    if self_shape == (19, 29):
+        inplace = dc.clone()
+        assert inplace.addmm_(da, db, beta=beta, alpha=alpha) is inplace
+        _close(inplace, ref)
+
+
+def test_addmm_beta_zero_ignores_nan_and_alpha_scales_before_rounding(mojo_gpu):
+    """beta == 0: self is never read (a NaN there does not propagate). A
+    half product scaled by a small alpha is formed in float32 and rounded
+    once, so a product beyond float16's range still lands in range."""
+    c = torch.full((4, 8), float("nan"))
+    a = torch.full((4, 64), 64.0, dtype=torch.float16)
+    b = torch.full((64, 8), 64.0, dtype=torch.float16)
+    got = torch.addmm(
+        c.half().to(mojo_gpu), a.to(mojo_gpu), b.to(mojo_gpu), beta=0, alpha=1e-3
+    )
+    assert torch.equal(got.cpu(), torch.full((4, 8), 262.144).half())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_addmm_empty_reduction_is_beta_self(mojo_device, dtype):
+    """k == 0: CUDA's shortcut multiplies self by beta stored in self's
+    dtype, whatever alpha is; beta == 0 gives zeros."""
+    c = torch.randn(5, 7).to(dtype)
+    a = torch.randn(5, 0).to(dtype)
+    b = torch.randn(0, 7).to(dtype)
+    dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
+    got = torch.addmm(dc, da, db, beta=0.3, alpha=float("inf"))
+    beta = torch.tensor(0.3).to(dtype).float()
+    assert torch.equal(got.cpu(), (c.float() * beta).to(dtype))
+    zeros = torch.addmm(dc.fill_(float("nan")), da, db, beta=0)
+    assert torch.equal(zeros.cpu(), torch.zeros(5, 7, dtype=dtype))
+    assert torch.addmm(dc[:0], da[:0], db).shape == (0, 7)
+
+
+@pytest.mark.parametrize("dtype", BLAS_DTYPES)
+@pytest.mark.parametrize("beta,alpha", BLAS_SCALES)
+def test_baddbmm(mojo_device, dtype, beta, alpha):
+    generator = torch.Generator().manual_seed(2)
+    c = torch.randn(3, 1, 21, generator=generator).to(dtype)
+    a = torch.randn(3, 11, 17, generator=generator).to(dtype)
+    b = torch.randn(3, 21, 17, generator=generator).to(dtype).transpose(1, 2)
+    ref = _cuda_like(beta, c, alpha, torch.bmm(a.double(), b.double()), dtype)
+    dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
+    with assert_ran("aten::baddbmm"):
+        got = torch.baddbmm(dc, da, db, beta=beta, alpha=alpha)
+    _close(got, ref)
+    out = torch.empty(3, 11, 21, dtype=dtype, device=mojo_device)
+    assert torch.baddbmm(dc, da, db, beta=beta, alpha=alpha, out=out) is out
+    _close(out, ref)
+    full = dc.expand(3, 11, 21).contiguous()
+    assert full.baddbmm_(da, db, beta=beta, alpha=alpha) is full
+    _close(full, ref)
+
+
+@pytest.mark.parametrize("dtype", BLAS_DTYPES)
+@pytest.mark.parametrize("beta,alpha", BLAS_SCALES)
+def test_addbmm_accumulates_batch_by_batch(mojo_device, dtype, beta, alpha):
+    """addbmm_impl_: one addmm_ per batch, so a half result rounds after
+    every batch exactly where CPU and CUDA torch round it."""
+    generator = torch.Generator().manual_seed(3)
+    c = torch.randn(13, generator=generator).to(dtype)
+    a = torch.randn(4, 9, 15, generator=generator).to(dtype)
+    b = torch.randn(4, 15, 13, generator=generator).to(dtype)
+    acc = _cuda_like(beta, c.expand(9, 13), alpha, a[0].double() @ b[0].double(), dtype)
+    for i in range(1, 4):
+        acc = _cuda_like(1, acc, alpha, a[i].double() @ b[i].double(), dtype)
+    dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
+    with assert_ran("aten::addbmm"):
+        got = torch.addbmm(dc, da, db, beta=beta, alpha=alpha)
+    _close(got, acc)
+    out = torch.empty(1, dtype=dtype, device=mojo_device)
+    torch.addbmm(dc, da, db, beta=beta, alpha=alpha, out=out)
+    _close(out, acc)
+    full = dc.expand(9, 13).contiguous()
+    assert full.addbmm_(da, db, beta=beta, alpha=alpha) is full
+    _close(full, acc)
+    # no batches at all: beta * self
+    empty = torch.addbmm(dc, da[:0], db[:0], beta=beta, alpha=alpha)
+    _close(empty, (beta * c.float()).expand(9, 13).to(dtype))
+
+
+@pytest.mark.parametrize("dtype", BLAS_DTYPES)
+@pytest.mark.parametrize("beta,alpha", BLAS_SCALES)
+def test_addmv(mojo_device, dtype, beta, alpha):
+    """addmv's gemv takes alpha and beta in scalar_t (rounded to the half
+    dtype first); vec may be strided."""
+    generator = torch.Generator().manual_seed(4)
+    c = torch.randn(23, generator=generator).to(dtype)
+    mat = torch.randn(23, 41, generator=generator).to(dtype)
+    vec = torch.randn(82, generator=generator).to(dtype)[::2]
+    al = torch.tensor(alpha).to(dtype).item()
+    be = torch.tensor(beta).to(dtype).item()
+    ref = _cuda_like(be, c, al, mat.double() @ vec.double(), dtype)
+    dc, dm, dv = c.to(mojo_device), mat.to(mojo_device), vec.to(mojo_device)
+    with assert_ran("aten::addmv"):
+        got = torch.addmv(dc, dm, dv, beta=beta, alpha=alpha)
+    _close(got, ref)
+    out = torch.empty(0, dtype=dtype, device=mojo_device)
+    assert torch.addmv(dc, dm, dv, beta=beta, alpha=alpha, out=out) is out
+    _close(out, ref)
+    inplace = dc.clone()
+    assert inplace.addmv_(dm, dv, beta=beta, alpha=alpha) is inplace
+    _close(inplace, ref)
+    one = torch.addmv(dc[:1], dm, dv, beta=beta, alpha=alpha)
+    _close(
+        one, _cuda_like(be, c[:1].expand(23), al, mat.double() @ vec.double(), dtype)
+    )
+    # matmul / mv of a matrix and a vector reach addmv
+    _close(dm @ dv, (mat.double() @ vec.double()).to(dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_dtype_overloads_return_float32(mojo_gpu, dtype):
+    """mm / bmm / addmm / baddbmm `.dtype`: half operands, a float32 result
+    accumulated and rounded in float32 (no intermediate half rounding)."""
+    generator = torch.Generator().manual_seed(5)
+    a = torch.randn(2, 33, 70, generator=generator).to(dtype)
+    b = torch.randn(2, 70, 27, generator=generator).to(dtype)
+    c = torch.randn(27, generator=generator)
+    da, db, dc = a.to(mojo_gpu), b.to(mojo_gpu), c.to(mojo_gpu)
+    f32 = torch.float32
+    ref = torch.bmm(a.double(), b.double())
+    got = torch.mm(da[0], db[0], out_dtype=f32)
+    assert got.dtype == f32
+    torch.testing.assert_close(got.cpu(), ref[0].float())
+    torch.testing.assert_close(torch.bmm(da, db, out_dtype=f32).cpu(), ref.float())
+    got = torch.addmm(dc, da[0], db[0], out_dtype=f32, beta=0.5, alpha=2)
+    torch.testing.assert_close(got.cpu(), (0.5 * c.double() + 2 * ref[0]).float())
+    got = torch.baddbmm(dc.expand(2, 33, 27), da, db, out_dtype=f32, beta=0.5, alpha=2)
+    torch.testing.assert_close(got.cpu(), (0.5 * c.double() + 2 * ref).float())
+    out = torch.empty(33, 27, device=mojo_gpu)
+    assert torch.mm(da[0], db[0], out_dtype=f32, out=out) is out
+    torch.testing.assert_close(out.cpu(), ref[0].float())
+    with pytest.raises(RuntimeError, match="out_dtype must be the same as input dtype"):
+        torch.mm(da[0], db[0], out_dtype=torch.float64)
+    same = torch.mm(da[0], db[0], out_dtype=dtype)
+    assert same.dtype == dtype
+
+
+def test_addmm_activation(mojo_gpu):
+    generator = torch.Generator().manual_seed(6)
+    c = torch.randn(16, generator=generator)
+    a = torch.randn(8, 24, generator=generator)
+    b = torch.randn(24, 16, generator=generator)
+    da, db, dc = a.to(mojo_gpu), b.to(mojo_gpu), c.to(mojo_gpu)
+    lin = torch.addmm(c, a, b, beta=0.5, alpha=2)
+    relu = torch.ops.aten._addmm_activation(dc, da, db, beta=0.5, alpha=2)
+    torch.testing.assert_close(relu.cpu(), torch.relu(lin), atol=1e-4, rtol=1e-4)
+    gelu = torch.ops.aten._addmm_activation(dc, da, db, use_gelu=True)
+    ref = torch.nn.functional.gelu(torch.addmm(c, a, b), approximate="tanh")
+    torch.testing.assert_close(gelu.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+
+def test_int_mm(mojo_gpu):
+    generator = torch.Generator().manual_seed(7)
+    a = torch.randint(-128, 128, (33, 72), dtype=torch.int8, generator=generator)
+    b = torch.randint(-128, 128, (72, 24), dtype=torch.int8, generator=generator)
+    ref = a.int() @ b.int()
+    got = torch._int_mm(a.to(mojo_gpu), b.to(mojo_gpu).t().contiguous().t())
+    assert got.dtype == torch.int32
+    assert torch.equal(got.cpu(), ref)
+    out = torch.empty(33, 24, dtype=torch.int32, device=mojo_gpu)
+    assert torch._int_mm(a.to(mojo_gpu), b.to(mojo_gpu), out=out) is out
+    assert torch.equal(out.cpu(), ref)
+    with pytest.raises(RuntimeError, match="greater than 16"):
+        torch._int_mm(a[:16].to(mojo_gpu), b.to(mojo_gpu))
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        torch._int_mm(a[:, :71].to(mojo_gpu), b[:71].to(mojo_gpu))
+
+
+@pytest.mark.parametrize("dtype", BLAS_DTYPES)
+def test_weight_int8pack_mm(mojo_gpu, dtype):
+    """int8mm.cu: x and w widened to float32, `x @ w.T * scale` in float32,
+    rounded once to x's dtype."""
+    generator = torch.Generator().manual_seed(8)
+    x = torch.randn(7, 64, generator=generator).to(dtype)
+    w = torch.randint(-128, 128, (40, 64), dtype=torch.int8, generator=generator)
+    scales = torch.rand(40, generator=generator).to(dtype)
+    ref = ((x.double() @ w.double().t()) * scales.double()).float().to(dtype)
+    got = torch.ops.aten._weight_int8pack_mm(
+        x.to(mojo_gpu), w.to(mojo_gpu), scales.to(mojo_gpu)
+    )
+    assert got.dtype == dtype
+    _close(got, ref)
+
+
+@pytest.mark.parametrize("dtype", BLAS_DTYPES)
+@pytest.mark.parametrize("inner_k_tiles,group", [(2, 32), (8, 128)])
+def test_weight_int4pack_mm(mojo_gpu, dtype, inner_k_tiles, group):
+    """The gpt-fast / torchao int4 path: pack the `[n, k / 2]` uint8 weight
+    (even k in the high nibble), then `x @ dequant(w).T` with tinygemm's
+    `(q - 8) * scale + zero` per group of k."""
+    generator = torch.Generator().manual_seed(9)
+    n, k, m = 20, 256, 5  # n not a multiple of 8: the packed rows are padded
+    q = torch.randint(0, 16, (n, k), dtype=torch.int32, generator=generator)
+    w_uint8 = (q[:, ::2] << 4 | q[:, 1::2]).to(torch.uint8)
+    n_pad = 24
+    sz = torch.randn(k // group, n_pad, 2, generator=generator).to(dtype)
+    x = torch.randn(m, k, generator=generator).to(dtype)
+    packed = torch.ops.aten._convert_weight_to_int4pack(
+        w_uint8.to(mojo_gpu), inner_k_tiles
+    )
+    assert packed.shape == (3, k // (inner_k_tiles * 16), 32, inner_k_tiles // 2)
+    assert packed.dtype == torch.int32
+    got = torch.ops.aten._weight_int4pack_mm(
+        x.to(mojo_gpu), packed, group, sz.to(mojo_gpu)
+    )
+    assert got.shape == (m, n_pad) and got.dtype == dtype
+    qp = torch.zeros(n_pad, k)
+    qp[:n] = q.float()
+    scale = sz[..., 0].float().t().repeat_interleave(group, dim=1)
+    zero = sz[..., 1].float().t().repeat_interleave(group, dim=1)
+    deq = ((qp - 8) * scale + zero).to(dtype)
+    ref = (x.double() @ deq.double().t()).to(dtype)
+    _close(got, ref)
+
+
+def test_blas_errors_match_torch(mojo_gpu):
+    a = torch.randn(3, 4, device=mojo_gpu)
+    b = torch.randn(5, 6, device=mojo_gpu)
+    with pytest.raises(
+        RuntimeError, match=r"shapes cannot be multiplied \(3x4 and 5x6\)"
+    ):
+        torch.mm(a, b)
+    with pytest.raises(
+        RuntimeError, match="expected mat1 and mat2 to have the same dtype"
+    ):
+        torch.mm(a, b[:4, :4].half())
+    with pytest.raises(RuntimeError, match="must match the existing size"):
+        torch.addmm(torch.randn(5, device=mojo_gpu), a, b[:4])
+    with pytest.raises(RuntimeError, match="batch1 must be a 3D tensor"):
+        torch.bmm(a, b)
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        torch.addmv(torch.randn(3, device=mojo_gpu), a, torch.randn(5, device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="Incompatible matrix sizes for bmm"):
+        torch.addbmm(a, a.expand(2, 3, 4), a.expand(2, 3, 4))
+    with pytest.raises(RuntimeError, match="Bad in-place call"):
+        torch.randn(3, 1, device=mojo_gpu).addmm_(a, b[:4])
+    # beta == 0: CUDA never reads (nor expands) self
+    got = torch.addmm(torch.randn(5, device=mojo_gpu), a, b[:4], beta=0)
+    assert got.shape == (3, 6)
 
 
 @pytest.fixture

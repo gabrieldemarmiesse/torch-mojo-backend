@@ -1635,6 +1635,36 @@ def aten_add(
     return promoted_input + promoted_other
 
 
+# addbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor
+@map_to(aten.addbmm)
+def aten_addbmm(
+    input: MaxTensor,
+    batch1: MaxTensor,
+    batch2: MaxTensor,
+    *,
+    beta: Scalar = 1.0,
+    alpha: Scalar = 1.0,
+) -> MaxTensor:
+    # beta * input + alpha * sum_i batch1[i] @ batch2[i]
+    product = F.squeeze(_reduce_sum(operator.matmul(batch1, batch2), axis=0), axis=0)
+    return _blas_scale_add(input, product, beta, alpha)
+
+
+def _blas_scale_add(
+    input: MaxTensor, product: MaxTensor, beta: Scalar, alpha: Scalar
+) -> MaxTensor:
+    """`beta * input + alpha * product` for the addmv / addbmm family:
+    beta == 0 never reads input, so a NaN there does not propagate (the
+    BLAS contract torch documents)."""
+    if alpha != 1:
+        product = operator.mul(product, alpha)
+    if beta == 0:
+        return product
+    if beta != 1:
+        input = operator.mul(input, beta)
+    return operator.add(input, product)
+
+
 # addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
 @map_to(aten.addcdiv)
 def aten_addcdiv(
@@ -1700,6 +1730,21 @@ def aten_addmm(
         scaled_input = input
 
     return operator.add(scaled_input, matmul_result)
+
+
+# addmv(Tensor self, Tensor mat, Tensor vec, *, Scalar beta=1, Scalar alpha=1) -> Tensor
+@map_to(aten.addmv)
+def aten_addmv(
+    input: MaxTensor,
+    mat: MaxTensor,
+    vec: MaxTensor,
+    *,
+    beta: Scalar = 1.0,
+    alpha: Scalar = 1.0,
+) -> MaxTensor:
+    # beta * input + alpha * (mat @ vec), the vector as a one-column matrix
+    product = F.squeeze(operator.matmul(mat, F.unsqueeze(vec, axis=-1)), axis=-1)
+    return _blas_scale_add(input, product, beta, alpha)
 
 
 # alias(Tensor(a) self) -> Tensor(a)

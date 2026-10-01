@@ -349,10 +349,13 @@ _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
     # express and CPU-only CI never sees.
     "sm_90a": frozenset(
         {
+            ("__rmatmul__", torch.float32),
             ("__rpow__", torch.float32),
+            ("addbmm", torch.float32),
             ("addr", torch.bfloat16),
             ("addr", torch.float16),
             ("bmm", torch.float32),
+            ("matmul", torch.float32),
             ("log_softmax", torch.bfloat16),
             ("log_softmax", torch.float16),
             ("masked_log_softmax", torch.bfloat16),

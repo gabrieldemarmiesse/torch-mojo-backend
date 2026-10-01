@@ -125,6 +125,7 @@ from tmb.kernels.common.op_utils import (
     _raw_tuple_int,
     _raw_tuple_len,
     _scratch_contig,
+    _spec_dispatcher3,
     _spec_dispatcher4,
     _spec_dispatcher5,
     _spec_dispatcher6,
@@ -135,6 +136,7 @@ from tmb.kernels.common.variant_gates import (
     ErrBuf,
     NO_OP_COMPILED,
     _dtype_arg_on,
+    _dtype_out_on,
     _dtype_supported,
     _op_on,
     _tmb_entry_error,
@@ -175,8 +177,9 @@ def _gemm_tiled_kernel[
     TM: Int,
     TN: Int,
     transpose_b: Bool,
+    out_dtype: DType = dtype,
 ](
-    c_base: Pointer[Scalar[dtype], MutAnyOrigin],
+    c_base: Pointer[Scalar[out_dtype], MutAnyOrigin],
     a_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
     b_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
     m_arg: Int64,
@@ -230,7 +233,16 @@ def _gemm_tiled_kernel[
     var tn0 = (tid % (BN // TN)) * TN
     var tm0 = (tid // (BN // TN)) * TM
 
-    comptime acc_dtype = DType.float64 if dtype == DType.float64 else DType.float32
+    # Integer operands (the IntMmSpec route) accumulate in the integer type
+    # torch's own kernels do: int32 for an int32 (or narrower) result, int64
+    # for int64; wrap-around is the same modular arithmetic either way.
+    comptime acc_dtype = (
+        (
+            DType.int64 if out_dtype == DType.int64 else DType.int32
+        ) if out_dtype.is_integral() else (
+            DType.float64 if dtype == DType.float64 else DType.float32
+        )
+    )
     var acc = Array[SIMD[acc_dtype, TN], TM](fill=SIMD[acc_dtype, TN](0))
 
     for kt in range(k_start, k_end, BK):
@@ -279,14 +291,17 @@ def _gemm_tiled_kernel[
                 acc_dtype
             ]()
             comptime for i in range(TM):
-                acc[i] = b_frag.fma(SIMD[acc_dtype, TN](a_frag[i]), acc[i])
+                comptime if acc_dtype.is_integral():
+                    acc[i] = b_frag * SIMD[acc_dtype, TN](a_frag[i]) + acc[i]
+                else:
+                    acc[i] = b_frag.fma(SIMD[acc_dtype, TN](a_frag[i]), acc[i])
 
         barrier()
 
     comptime for i in range(TM):
         var row = bm + tm0 + i
         if row < m:
-            var out = acc[i].cast[dtype]()
+            var out = acc[i].cast[out_dtype]()
             if bn + tn0 + TN <= n:
                 c_ptr.unsafe_store(row * n + bn + tn0, out)
             else:
@@ -7423,6 +7438,80 @@ def _bmm_spec_into_go(a_o: Arg, b_o: Arg, tb_o: Arg, out_o: Arg) raises:
     oshape[MAX_RANK - 1] = n
 
 
+# Integer GEMM (aten::_int_mm, and mm / bmm / the addmm family on integer
+# dtypes): the tiled kernel above with an integer accumulator. Operands are
+# dense row-major `[batch, m, k] @ [batch, k, n] -> [batch, m, n]` (rank 2
+# is batch 1); int8 -> int32 is `_int_mm`, every other pair is same-dtype.
+comptime INT_GEMM_DTYPES = [
+    DType.int8,
+    DType.int16,
+    DType.int32,
+    DType.int64,
+    DType.uint8,
+]
+
+
+def _int_mm_spec_go(a_o: Arg, b_o: Arg, out_o: Arg) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref b = _spec_ptr(b_o)[]
+    ref out = _spec_ptr(out_o)[]
+    if a.dtype != b.dtype:
+        raise Error("mojo int mm: operand dtypes differ")
+    if a.ctx_ptr != b.ctx_ptr or out.ctx_ptr != a.ctx_ptr:
+        raise Error("mojo int mm: operands on different devices")
+    if not a.contig or not b.contig or not out.contig:
+        raise Error("mojo int mm: operands must be contiguous")
+    if a.rank != b.rank or a.rank != out.rank or a.rank < 2 or a.rank > 3:
+        raise Error("mojo int mm: bad ranks")
+    var batch = a.shape[MAX_RANK - 3] if a.rank == 3 else 1
+    var m = a.shape[MAX_RANK - 2]
+    var k = a.shape[MAX_RANK - 1]
+    var n = b.shape[MAX_RANK - 1]
+    if (
+        b.shape[MAX_RANK - 2] != k
+        or (a.rank == 3 and b.shape[MAX_RANK - 3] != batch)
+        or out.numel != batch * m * n
+    ):
+        raise Error("mojo int mm: shape mismatch")
+    if batch == 0 or m == 0 or n == 0 or k == 0:
+        raise Error("mojo int mm: zero-sized dim")
+    var ctx = a.ctx()
+    var handled = False
+    comptime for dt in INT_GEMM_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            comptime for odt in INT_GEMM_DTYPES:
+                comptime if _dtype_out_on[0, odt]() and (
+                    odt == dt or (dt == DType.int8 and odt == DType.int32)
+                ):
+                    if a.dtype == dt and out.dtype == odt:
+                        _enqueue_cached[
+                            _gemm_tiled_kernel[dt, 32, 32, 16, 2, 2, False, odt]
+                        ](
+                            ctx,
+                            ceildiv(n, 32),
+                            ceildiv(m, 32),
+                            batch,
+                            256,
+                            _make_ptr[odt](out.ptr).as_unsafe_any_origin(),
+                            _make_ptr[dt](a.ptr)
+                            .as_unsafe_any_origin()
+                            .as_imm(),
+                            _make_ptr[dt](b.ptr)
+                            .as_unsafe_any_origin()
+                            .as_imm(),
+                            Int64(m),
+                            Int64(n),
+                            Int64(k),
+                            Int64(m * k),
+                            Int64(1),
+                        )
+                        handled = True
+    if not handled:
+        raise Error(
+            "mojo int mm: dtype pair ", a.dtype, " -> ", out.dtype, " not built"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -7444,6 +7533,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["BmmSpec"]():
             _spec_dispatcher4[_bmm_spec_into_go, "BmmSpec"](argv, argc)
+            return 0
+        comptime if _op_on["IntMmSpec"]():
+            _spec_dispatcher3[_int_mm_spec_go, "IntMmSpec"](argv, argc)
             return 0
         comptime if _op_on["Matmul"]():
             _matmul_dispatcher(argv, argc)
