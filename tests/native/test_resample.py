@@ -748,6 +748,33 @@ def test_grid_sample_nonfinite_grid_samples_zero(mojo_device):
         assert torch.equal(y.cpu(), torch.zeros(1, 2, 1, 3))
 
 
+@pytest.mark.parametrize("pad", ["border", "reflection"])
+@pytest.mark.parametrize("mode", ["bilinear", "nearest"])
+def test_grid_sample_nan_grid_clips_to_the_origin(mojo_device, mode, pad):
+    """CUDA's clip_coordinates is fmin/fmax, which drop a NaN: a NaN
+    coordinate under border / reflection padding samples pixel 0 (CPU's
+    std::min/max keeps the other bound, so CPU is not the reference)."""
+    x = torch.randn(1, 2, 3, 4)
+    grid = torch.full((1, 1, 2, 2), float("nan"))
+    grid[0, 0, 1] = torch.tensor([float("nan"), -1.0])
+    y = F.grid_sample(
+        x.to(mojo_device),
+        grid.to(mojo_device),
+        mode=mode,
+        padding_mode=pad,
+        align_corners=True,
+    ).cpu()
+    torch.testing.assert_close(y[..., 0], x[:, :, 0, 0][..., None])
+    torch.testing.assert_close(y[..., 1], x[:, :, 0, 0][..., None])
+
+
+def test_grid_sample_mojo_grid_with_cpu_input_raises(mojo_device):
+    x = torch.randn(1, 2, 3, 4)
+    grid = torch.zeros(1, 2, 2, 2, device=mojo_device)
+    with pytest.raises(RuntimeError, match="expected input and grid to be on same"):
+        torch.ops.aten.grid_sampler_2d(x, grid, 0, 0, False)
+
+
 def test_grid_sample_strided_operands(mojo_device):
     x, grid = _grid_inputs((3, 4, 6, 8), (5, 7), torch.float32)
     xs = x.to(mojo_device).transpose(2, 3).contiguous().transpose(2, 3)[:, ::2]
@@ -906,3 +933,14 @@ def test_grid_sample_out_variants(mojo_device):
     overlapping = torch.empty(1, device=mojo_device).expand(want.shape)
     with pytest.raises(RuntimeError, match="unsupported operation"):
         torch.ops.aten.grid_sampler_2d.out(*args, out=overlapping)
+
+
+@pytest.mark.parametrize("op", ["_upsample_bilinear2d_aa", "_upsample_bicubic2d_aa"])
+def test_upsample_aa_keeps_channels_last(mojo_device, op):
+    """The antialiased meta allocates in the input's suggested format."""
+    x = torch.randn(2, 3, 9, 8).to(memory_format=torch.channels_last)
+    fn = getattr(torch.ops.aten, op)
+    want = fn(x, [5, 6], False)
+    got = fn(x.to(mojo_device), [5, 6], False)
+    assert got.stride() == want.stride()
+    torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)

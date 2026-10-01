@@ -635,6 +635,17 @@ def test_fractional_max_pool_rejects_bad_samples_dtype_and_3d_sizes(mojo_device)
         torch.ops.aten.fractional_max_pool3d(x, [2, 2, 2], [5, 3, 3], s)
 
 
+def test_fractional_max_pool3d_backward_rejects_more_planes_than_self(mojo_device):
+    """A grad with more batches than `self` would scatter past grad_input."""
+    x = torch.randn(1, 2, 5, 5, 5, device=mojo_device)
+    grad = torch.randn(4, 2, 2, 2, 2, device=mojo_device)
+    idx = torch.zeros(4, 2, 2, 2, 2, dtype=torch.int64, device=mojo_device)
+    with pytest.raises(RuntimeError, match="gradOutput sizes unexpected"):
+        torch.ops.aten.fractional_max_pool3d_backward(
+            grad, x, [2, 2, 2], [2, 2, 2], idx
+        )
+
+
 def test_fractional_max_pool_backward_follows_the_determinism_policy(mojo_device):
     x = torch.randn(1, 2, 6, 6).to(mojo_device)
     s = torch.rand(1, 2, 2).to(mojo_device)

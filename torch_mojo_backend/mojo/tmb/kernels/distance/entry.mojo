@@ -265,7 +265,7 @@ def _dist_fwd_kernel[
 
 
 # ---------------------------------------------------------------------------
-# Backward: one thread per gradient element
+# Backward: one thread per (gradient element, slice of x2's rows)
 # ---------------------------------------------------------------------------
 
 
@@ -286,16 +286,27 @@ def _cdist_bwd_kernel[
     r1_arg: Int64,
     r2_arg: Int64,
     m_arg: Int64,
+    slices_arg: Int64,
 ):
     """grad_x1[l, i, c] = sum_j backward(x1[l, i, c] - x2[l, j, c],
     grad[l, i, j], dist[l, i, j]): cdist_backward_kernel_cuda_impl's buffer
-    (B, r2, r1, m) summed over its r2 axis."""
+    (B, r2, r1, m) summed over its r2 axis.
+
+    With `slices` > 1 the r2 axis is cut into that many contiguous slices
+    and each thread sums one slice of one element into `gx_ptr[s * total +
+    e]`, a workspace `_cdist_bwd_sum` then reduces in slice order: a small
+    x1 against a long x2 (few elements, many rows) still fills the GPU, as
+    CUDA's 2-D grid over (r2, r1 * m) does."""
     var r1 = Int(r1_arg)
     var r2 = Int(r2_arg)
     var m = Int(m_arg)
+    var slices = Int(slices_arg)
     var total = Int(batch_arg) * r1 * m
-    var e = Int(block_idx.x) * _THREADS + Int(thread_idx.x)
-    while e < total:
+    var chunk = (r2 + slices - 1) // slices
+    var t = Int(block_idx.x) * _THREADS + Int(thread_idx.x)
+    while t < total * slices:
+        var e = t % total
+        var sl = t // total
         var c = e % m
         var row = e // m  # l * r1 + i
         var l = row // r1
@@ -303,13 +314,39 @@ def _cdist_bwd_kernel[
         var acc = Scalar[dt](0)
         var x2_base = l * r2 * m + c
         var g_base = row * r2
-        for j in range(r2):
+        var j_end = min(r2, (sl + 1) * chunk)
+        for j in range(sl * chunk, j_end):
             acc += _backward[dt, norm](
                 xi - x2_ptr[unsafe_offset=x2_base + j * m],
                 grad_ptr[unsafe_offset=g_base + j],
                 dist_ptr[unsafe_offset=g_base + j],
                 p,
             )
+        gx_ptr[unsafe_offset=t] = acc
+        t += Int(grid_dim.x) * _THREADS
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_THREADS))
+)
+@__name(t"cdist_bwd_slice_sum_{dt}")
+def _cdist_bwd_sum[
+    dt: DType
+](
+    gx_ptr: Pointer[Scalar[dt], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[dt], MutAnyOrigin],
+    total_arg: Int64,
+    slices_arg: Int64,
+):
+    """gx[e] = sum over slices of the workspace, in slice order
+    (deterministic)."""
+    var total = Int(total_arg)
+    var slices = Int(slices_arg)
+    var e = Int(block_idx.x) * _THREADS + Int(thread_idx.x)
+    while e < total:
+        var acc = Scalar[dt](0)
+        for sl in range(slices):
+            acc += ws_ptr[unsafe_offset=sl * total + e]
         gx_ptr[unsafe_offset=e] = acc
         e += Int(grid_dim.x) * _THREADS
 
@@ -428,13 +465,18 @@ def _cdist_bwd[
     var batch = _raw_int(argv[unsafe_offset=7])
     var r1 = _raw_int(argv[unsafe_offset=8])
     var m = _raw_int(argv[unsafe_offset=10])
+    var ws = _raw_int(argv[unsafe_offset=12])
+    var slices = _raw_int(argv[unsafe_offset=13])
+    var total = batch * r1 * m
+    var gx = _ptr[dt](argv[unsafe_offset=0])
+    var dst = gx if slices == 1 else _make_ptr[dt](ws).as_unsafe_any_origin()
     _enqueue_cached[_cdist_bwd_kernel[dt, norm]](
         ctx,
-        _blocks((batch * r1 * m + _THREADS - 1) // _THREADS),
+        _blocks((total * slices + _THREADS - 1) // _THREADS),
         1,
         1,
         _THREADS,
-        _ptr[dt](argv[unsafe_offset=0]),
+        dst,
         _ptr[dt](argv[unsafe_offset=1]),
         _ptr[dt](argv[unsafe_offset=2]),
         _ptr[dt](argv[unsafe_offset=3]),
@@ -444,14 +486,27 @@ def _cdist_bwd[
         Int64(r1),
         Int64(_raw_int(argv[unsafe_offset=9])),
         Int64(m),
+        Int64(slices),
     )
+    if slices > 1:
+        _enqueue_cached[_cdist_bwd_sum[dt]](
+            ctx,
+            _blocks((total + _THREADS - 1) // _THREADS),
+            1,
+            1,
+            _THREADS,
+            gx,
+            dst,
+            Int64(total),
+            Int64(slices),
+        )
 
 
 def _cdist_bwd_dispatch[dt: DType](argv: Argv, argc: Int) raises:
     """Slots: grad_x1, grad, x1, x2, dist, p (f64), norm, batch, r1, r2, m,
-    ctx."""
-    if argc != 12:
-        raise Error("CdistBackward: expected 12 arguments, got ", argc)
+    ctx, workspace (slices * batch * r1 * m elements, or 0), slices."""
+    if argc != 14:
+        raise Error("CdistBackward: expected 14 arguments, got ", argc)
     var p = Scalar[dt](_raw_f64(argv[unsafe_offset=5]))
     var norm = _raw_int(argv[unsafe_offset=6])
     var ctx = _raw_ctx(argv[unsafe_offset=11])

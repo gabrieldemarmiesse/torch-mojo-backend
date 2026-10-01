@@ -1662,6 +1662,18 @@ def _fractional_max_pool_backward[
                 "fractional_max_pool2d_backward(): indices sizes unexpected"
             )
     else:
+        # CUDA checks only the pooled extents and would scatter past
+        # gradInput for a grad with more batches or planes than `self`; the
+        # leading dims are checked here so that cannot happen.
+        var lead_ok = grad.rank == x.rank
+        for i in range(x.rank - 3):
+            if lead_ok and grad.dim(i) != x.dim(i):
+                lead_ok = False
+        if not lead_ok:
+            raise Error(
+                "fractional_max_pool3d_backward_out_cuda_template(): "
+                "gradOutput sizes unexpected"
+            )
         var labels = ["time", "height", "width"]
         for i in range(3):
             var d = x.rank - 3 + i

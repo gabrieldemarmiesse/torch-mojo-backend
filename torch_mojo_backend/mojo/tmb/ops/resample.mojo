@@ -37,8 +37,11 @@ from tmb.backend.abi import (
     alert_not_deterministic,
     index_error,
     is_floating,
+    _channels_last_strides,
     new_like,
+    new_strided,
     new_tensor,
+    release,
     own,
     own_if_new,
     ret_owned,
@@ -518,8 +521,36 @@ def op_upsample[
                 dst, src.t, identity, in_dims, out_dims, align, scales
             )
             _ = src^
+        comptime if MODE >= BILINEAR_AA:
+            # The antialiased kernels' meta allocates the output in the
+            # input's `suggest_memory_format()`: channels_last stays
+            # channels_last.
+            if _suggests_channels_last(a):
+                var cl = new_strided(
+                    dst.shape,
+                    _channels_last_strides(dst.shape, dst.rank),
+                    dst.rank,
+                    dst.stype,
+                    dst.device,
+                )
+                copy_strided_into(cl, dst)
+                release(dst.h)
+                dst = cl^
         var o = own(dst^)
         ret_owned(rets, 0, o)
+
+
+def _suggests_channels_last(t: T) -> Bool:
+    """c10's `suggest_memory_format` == ChannelsLast for a rank-4 tensor:
+    not contiguous, and strided like NHWC (size-1 dims carry no stride)."""
+    if t.rank != 4 or t.contig:
+        return False
+    var want = _channels_last_strides(t.shape, 4)
+    for i in range(4):
+        var p = MAX_RANK - 4 + i
+        if t.shape[p] > 1 and t.strides[p] != want[p]:
+            return False
+    return True
 
 
 def op_upsample_backward[
@@ -970,8 +1001,6 @@ def _grid_check[
 ](input: T, grid: T, interp: Int, pad: Int, name: String) raises:
     """check_grid_sampler_common + check_grid_sampler_{2,3}d, then the mode
     and dtype gates of the CUDA launcher."""
-    if not input.on_mojo():
-        unsupported(name + ": input is not on the mojo device")
     if input.device_type != grid.device_type or input.device != grid.device:
         raise Error(
             (
@@ -982,6 +1011,8 @@ def _grid_check[
             " and grid is on ",
             device_str(grid),
         )
+    if not input.on_mojo():
+        unsupported(name + ": input is not on the mojo device")
     if input.rank == 0 or grid.rank == 0:
         index_error("dimension specified as 0 but tensor has no dimensions")
     if input.dim(0) != grid.dim(0):

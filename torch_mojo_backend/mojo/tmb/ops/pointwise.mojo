@@ -20,6 +20,8 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    is_dense,
+    new_strided,
     ST_BFLOAT16,
     ST_BOOL,
     ST_FLOAT16,
@@ -2244,7 +2246,21 @@ def _glu_jvp(args: Values) raises -> Owned:
     _ = res_term^
     _ = b^
     _ = da^
-    return own(out.t.copy())  # a fresh tensor (no `out=` passed above)
+    var fresh = own(out.t.copy())  # a fresh tensor (no `out=` passed above)
+    # `empty_like(glu)` preserves a dense glu's strides (channels_last, a
+    # transpose); the iterator keeps them when no broadcast resizes it.
+    if (
+        not glu.contig
+        and fresh.t.same_shape(glu)
+        and is_dense(glu.shape, glu.strides, glu.rank)
+    ):
+        var kept = own(
+            new_strided(glu.shape, glu.strides, glu.rank, glu.stype, glu.device)
+        )
+        copy_strided_into(kept.t, fresh.t)
+        _ = fresh^
+        return kept^
+    return fresh^
 
 
 def _glu_bjvp_bin(name: StaticString, a: Owned, b: Owned) raises -> Owned:

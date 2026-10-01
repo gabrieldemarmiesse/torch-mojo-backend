@@ -348,3 +348,28 @@ def test_glu_backward_jvp_broadcasts(mojo_gpu):
     got = aten.glu_backward_jvp(*[t.to(mojo_gpu) for t in (gx, gg, x, dgg, dx)], 1)
     assert got.shape == want.shape
     torch.testing.assert_close(got.cpu(), want)
+
+
+def test_glu_jvp_keeps_glu_strides(mojo_gpu):
+    """`empty_like(glu)`: a channels_last glu gives a channels_last result."""
+    x = torch.randn(2, 8, 5, 6).to(memory_format=torch.channels_last)
+    glu = aten.glu(x, 1)
+    want = aten.glu_jvp(glu, x, x, 1)
+    got = aten.glu_jvp(glu.to(mojo_gpu), x.to(mojo_gpu), x.to(mojo_gpu), 1)
+    assert got.stride() == want.stride()
+    torch.testing.assert_close(got.cpu(), want)
+
+
+@pytest.mark.parametrize("p", [1.0, 1.5, 2.0, 3.0, float("inf")])
+def test_cdist_backward_few_rows_against_many(mojo_gpu, p):
+    """A small x1 against a long x2: the row sum runs in slices plus a
+    reduction kernel (the sliced route), and matches CPU."""
+    torch.manual_seed(10)
+    x1, x2 = torch.randn(2, 3), torch.randn(5000, 3)
+    dist = aten._cdist_forward(x1, x2, p, 2)
+    grad = torch.randn_like(dist)
+    want = aten._cdist_backward(grad, x1, x2, p, dist)
+    got = aten._cdist_backward(
+        *[t.to(mojo_gpu) for t in (grad, x1, x2)], p, dist.to(mojo_gpu)
+    )
+    torch.testing.assert_close(got.cpu(), want, atol=1e-3, rtol=1e-4)

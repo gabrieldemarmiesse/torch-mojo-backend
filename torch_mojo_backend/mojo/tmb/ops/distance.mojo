@@ -418,6 +418,20 @@ def _cdist_backward(args: Values) raises -> Owned:
     var e2 = _expanded_dense(x2, batch)
     var g = _dense(grad)
     var d = _dense(dist)
+    # Few gradient elements against many x2 rows: split the row sum into
+    # slices summed by a second kernel, so the launch still fills the GPU
+    # (CUDA runs a 2-D grid over (r2, r1 * m) then reduces). Aim at ~2^17
+    # threads, each over >= 16 rows, at most 1024 slices to sum.
+    var total = product * r1 * c1
+    var slices = 1
+    if total > 0:
+        slices = min((131072 + total - 1) // total, (r2 + 15) // 16, 1024)
+        slices = max(slices, 1)
+    var ws = own(new_tensor(_shape_of([], 1, 1), 2, x1.stype, x1.device))
+    if slices > 1:
+        ws = own(
+            new_tensor(_shape_of([], slices, total), 2, x1.stype, x1.device)
+        )
     var ctx = ctx_for(x1.device)
     var call = KernelCall("distance", "CdistBackward")
     call.arg_dtype(0, x1.dtype)
@@ -433,8 +447,11 @@ def _cdist_backward(args: Values) raises -> Owned:
     call.int(r2)
     call.int(c1)
     call.int(ctx_ptr(ctx))
+    call.int(ws.t.ptr)
+    call.int(slices)
     call.run()
     _ = ctx
+    _ = ws^
     _ = e1^
     _ = e2^
     _ = g^
