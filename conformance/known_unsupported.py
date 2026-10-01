@@ -168,7 +168,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "linalg_svdvals": ("float32",),
     "linalg_tensorinv": ("float32",),
     "linalg_tensorsolve": ("float32",),
-    "linalg_vander": ("float32", "int64"),
     "logdet": ("float32",),
     "lu": ("float32",),
     "lu_solve": ("float32",),
@@ -241,6 +240,8 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "logcumsumexp": ("float16",),
     "cumsum": ("bfloat16", "float16"),
     "masked_cumsum": ("bfloat16", "float16"),
+    # Matches CUDA, not CPU: CUDA's half cumsum rounds every addition (scan_dim<scalar_t>); bit-equal to stock CUDA on every sample.
+    "cumulative_trapezoid": ("float16",),
 }
 # --- END GENERATED test_matches_cpu ---
 
