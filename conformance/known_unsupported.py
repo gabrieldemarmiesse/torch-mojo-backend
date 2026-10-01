@@ -206,7 +206,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "to_sparse": ("float32", "bfloat16", "float16", "int64", "bool"),
     "topk": ("bfloat16", "int64"),
     "triangular_solve": ("float32",),
-    "unique_consecutive": ("float32", "bfloat16", "float16", "int64", "bool"),
     "view_as_complex": ("float32", "float16"),
     "logcumsumexp": ("float16",),
     "cumsum": ("bfloat16", "float16"),

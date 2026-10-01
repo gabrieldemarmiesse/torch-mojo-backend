@@ -41,10 +41,12 @@ from tmb.backend.abi import (
     ST_BOOL,
     ST_INT64,
     T,
+    TAG_MEMORY_FORMAT,
     TAG_SCALAR_INT,
     Value,
     Values,
     bool_arg,
+    cpu_empty,
     int_arg,
     new_like,
     new_tensor,
@@ -66,7 +68,12 @@ from tmb.backend.abi import (
     v_tensor_list,
     view_strided,
 )
-from tmb.backend.device import copy_d2d, ctx_for
+from tmb.backend.device import (
+    copy_d2d,
+    copy_from_host,
+    copy_to_host,
+    ctx_for,
+)
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
@@ -2021,6 +2028,122 @@ def op_fill__tensor(
     ret_ref(rets, 0, t)
 
 
+# ---------------------------------------------------------------------------
+# _unique / _unique2 / unique_dim / unique_consecutive /
+# unique_dim_consecutive -- data-dependent output sizes, so the input
+# round-trips through the host like nonzero's: it is downloaded once, the
+# CPU kernel of the same op computes every output (always sorted: CUDA
+# ignores `sorted=False` too), and the outputs are uploaded. One blocking
+# read per call, as on CUDA, which reads the unique count back as well.
+# Outputs the call did not ask for (inverse / counts) are CPU's, which can
+# differ in shape from CUDA's (the Python API drops them).
+# ---------------------------------------------------------------------------
+
+
+def _to_host(t: T) raises -> Owned:
+    """A contiguous CPU copy of the mojo tensor `t` (blocking)."""
+    var c = own_if_new(contiguous(t), t)
+    var host = own(cpu_empty(c.t.shape, c.t.rank, c.t.stype))
+    if c.t.numel > 0:
+        var ctx = ctx_for(c.t.device)
+        copy_to_host(ctx, c.t.ptr, host.t.ptr, c.t.numel * c.t.itemsize)
+        _ = ctx
+    _ = c^
+    return host^
+
+
+def _to_device(host: T, device: Int) raises -> Owned:
+    """`host` (a CPU tensor) as a fresh contiguous tensor on `device`."""
+    var src = host.copy()
+    var made = Optional[Owned](None)
+    if not host.contig:
+        made = own(
+            _call1(
+                "aten::contiguous",
+                "",
+                [tensor_arg(host), Value(TAG_MEMORY_FORMAT, 0, 0, 0)],
+            )
+        )
+        src = made.value().t.copy()
+    var out = own(new_tensor(src.shape, src.rank, src.stype, device))
+    if out.t.numel > 0:
+        copy_from_host(
+            device,
+            ctx_for(device),
+            out.t.ptr,
+            src.ptr,
+            out.t.numel * out.t.itemsize,
+        )
+    _ = made^
+    return out^
+
+
+def _unique_on_host(
+    args: Values,
+    n_args: Int,
+    rets: Values,
+    n_rets: Int,
+    op: StaticString,
+    overload: StaticString,
+    sorted_pos: Int,
+) raises:
+    """Run `op` on a host copy of args[0] (the other arguments as given,
+    `sorted` forced True), then upload its `n_rets` tensors."""
+    var t = v_tensor(args[unsafe_offset=0])
+    if t.dtype == DType.float64 and ctx_for(t.device).api() == "metal":
+        unsupported("aten::" + String(op) + " of float64 on Apple GPU")
+    var host = _to_host(t)
+    var call_args = List[Value](capacity=n_args)
+    call_args.append(tensor_arg(host.t))
+    for i in range(1, n_args):
+        if i == sorted_pos:
+            call_args.append(bool_arg(True))
+        else:
+            call_args.append(args[unsafe_offset=i].copy())
+    var r = call_op(String("aten::") + op, String(overload), call_args^, n_rets)
+    for i in range(n_rets):
+        var h = own(r.take_tensor(i))
+        var d = _to_device(h.t, t.device)
+        ret_owned(rets, i, d)
+        _ = h^
+    _ = host^
+
+
+# aten::_unique(Tensor self, bool sorted=True, bool return_inverse=False)
+#   -> (Tensor, Tensor)
+def op_unique(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _unique_on_host(args, n_args, rets, 2, "_unique", "", 1)
+
+
+# aten::_unique2(Tensor self, bool sorted=True, bool return_inverse=False,
+#   bool return_counts=False) -> (Tensor, Tensor, Tensor)
+def op_unique2(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _unique_on_host(args, n_args, rets, 3, "_unique2", "", 1)
+
+
+# aten::unique_dim(Tensor self, int dim, bool sorted=True,
+#   bool return_inverse=False, bool return_counts=False)
+#   -> (Tensor, Tensor, Tensor)
+def op_unique_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _unique_on_host(args, n_args, rets, 3, "unique_dim", "", 2)
+
+
+# aten::unique_consecutive(Tensor self, bool return_inverse=False,
+#   bool return_counts=False, int? dim=None) -> (Tensor, Tensor, Tensor)
+def op_unique_consecutive(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _unique_on_host(args, n_args, rets, 3, "unique_consecutive", "", -1)
+
+
+# aten::unique_dim_consecutive(Tensor self, int dim, bool return_inverse=False,
+#   bool return_counts=False) -> (Tensor, Tensor, Tensor)
+def op_unique_dim_consecutive(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _unique_on_host(args, n_args, rets, 3, "unique_dim_consecutive", "", -1)
+
+
 def register_indexing(site: Site) raises:
     impl[op_flip, "flip"](site)
     impl[op_roll, "roll"](site)
@@ -2057,3 +2180,8 @@ def register_indexing(site: Site) raises:
     impl[op_index_tensor_out, "index.Tensor_out"](site)
     impl[op_narrow_copy_out, "narrow_copy.out"](site)
     impl[op_fill__tensor, "fill_.Tensor"](site)
+    impl[op_unique, "_unique"](site)
+    impl[op_unique2, "_unique2"](site)
+    impl[op_unique_dim, "unique_dim"](site)
+    impl[op_unique_consecutive, "unique_consecutive"](site)
+    impl[op_unique_dim_consecutive, "unique_dim_consecutive"](site)
