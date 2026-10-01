@@ -694,3 +694,22 @@ def test_batch_norm_dense_permuted_input_keeps_strides(mojo_device):
     assert got[0].stride() == xp.stride()
     want = aten.native_batch_norm(x, w, b, rm, rv, False, 0.1, 1e-5)
     _close(got[0], want[0])
+
+
+def test_batch_norm_elemt_mixed_statistic_dtypes(mojo_device):
+    """Each statistic is read in its own dtype: a float32 invstd next to a
+    half mean is not rounded to half (CUDA's TensorIterator route)."""
+    x = torch.full((5, 3, 4), 100.0, dtype=torch.half).transpose(0, 2)
+    got = aten.batch_norm_elemt(
+        *_to(
+            mojo_device,
+            x,
+            torch.ones(3, dtype=torch.half),
+            torch.full((3,), -100.0),
+            torch.zeros(3, dtype=torch.half),
+            torch.full((3,), 1.0001),
+        ),
+        1e-5,
+    )
+    want = torch.full(x.shape, 100.0 * 1.0001 - 100.0).half()
+    torch.testing.assert_close(got.cpu(), want)

@@ -500,9 +500,15 @@ def _elemt(args: Values) raises -> Owned:
             _expect_type(v_tensor(args[unsafe_offset=2]), stat, "bias")
         _expect_type(v_tensor(args[unsafe_offset=3]), _acc_of(stat), "mean")
         _expect_type(v_tensor(args[unsafe_offset=4]), _acc_of(stat), "invstd")
-    var mean = _channel_vec(args, 3, a, p.c, "mean")
+    # Every route reads each statistic in its own dtype into an acc_type
+    # computation (the typed routes' checks above pin the dtypes; the
+    # TensorIterator one converts each operand on its own), so each is
+    # handed to the kernel converted -- exactly -- to the accumulation dtype.
+    var mean = _as_stype(
+        _channel_vec(args, 3, a, p.c, "mean"), _acc_of(a.stype)
+    )
     var invstd = _as_stype(
-        _channel_vec(args, 4, a, p.c, "invstd"), mean.t.stype
+        _channel_vec(args, 4, a, p.c, "invstd"), _acc_of(a.stype)
     )
     # Every route computes in the accumulation dtype with each parameter
     # read in its own dtype (the typed routes' checks above require one
@@ -778,6 +784,11 @@ def op_batch_norm_backward_reduce(
         _expect_type(invstd_t, _acc_of(stat), "invstd")
         if input_g:
             _expect_type(mean_t, _acc_of(stat), "sum_dy")
+    else:
+        # batch_norm_backward_reduce_cuda_channels_last_template reads both
+        # statistics as `accscalar_t` pointers.
+        _expect_scalar(mean_t, _acc_of(a.stype))
+        _expect_scalar(invstd_t, _acc_of(a.stype))
     var g = Planes(grad)
     var mean = _channel_vec(args, 2, a, p.c, "mean")
     var invstd = _as_stype(
@@ -893,14 +904,14 @@ def op_batch_norm_backward_elemt(
         _expect_type(v_tensor(args[unsafe_offset=5]), sacc, "sum_dy")
         _expect_type(v_tensor(args[unsafe_offset=6]), sacc, "sum_dy_xmu")
     var g = Planes(grad)
-    var mean = _channel_vec(args, 2, a, p.c, "mean")
-    var invstd = _channel_vec(args, 3, a, p.c, "invstd")
-    var sum_dy = _as_stype(
-        _channel_vec(args, 5, a, p.c, "sum_dy"), mean.t.stype
-    )
-    var sum_dy_xmu = _as_stype(
-        _channel_vec(args, 6, a, p.c, "sum_dy_xmu"), mean.t.stype
-    )
+    # Each statistic and the weight converted on its own -- exactly -- to
+    # the accumulation dtype the kernel computes in (the typed route's
+    # checks above pin their dtypes; the channels-last one converts).
+    var acc = _acc_of(a.stype)
+    var mean = _as_stype(_channel_vec(args, 2, a, p.c, "mean"), acc)
+    var invstd = _as_stype(_channel_vec(args, 3, a, p.c, "invstd"), acc)
+    var sum_dy = _as_stype(_channel_vec(args, 5, a, p.c, "sum_dy"), acc)
+    var sum_dy_xmu = _as_stype(_channel_vec(args, 6, a, p.c, "sum_dy_xmu"), acc)
     if count.stype != ST_INT32:
         raise Error(
             "expected scalar type Int but found ",
@@ -911,7 +922,7 @@ def op_batch_norm_backward_elemt(
     var wdtype = mean.t.dtype
     var w_ptr = 0
     if _opt(args, 4):
-        w = _channel_vec(args, 4, a, p.c, "weight")
+        w = _as_stype(_channel_vec(args, 4, a, p.c, "weight"), acc)
         wdtype = w.value().t.dtype
         w_ptr = w.value().t.ptr
     # CUDA's channels-last route (both operands channels-last) allocates
