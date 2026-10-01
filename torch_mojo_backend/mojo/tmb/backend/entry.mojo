@@ -23,6 +23,7 @@ from tmb.ops.composed import register_composed
 from tmb.ops.core import register_core
 from tmb.ops.data_movement import register_data_movement
 from tmb.ops.deform_conv import register_deform_conv
+from tmb.ops.embedding_bag import register_embedding_bag
 from tmb.ops.factories import register_factories
 from tmb.ops.foreach import register_foreach
 from tmb.ops.indexing import register_indexing
@@ -68,6 +69,7 @@ def _register_ops(lib: Int) raises:
     _group[register_nn](lib)
     _group[register_loss](lib)
     _group[register_batch_norm](lib)
+    _group[register_embedding_bag](lib)
     _group[register_pooling](lib)
     _group[register_pointwise](lib)
     _group[register_attention](lib)
